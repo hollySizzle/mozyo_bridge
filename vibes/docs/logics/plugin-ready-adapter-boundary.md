@@ -1853,20 +1853,34 @@ Three contracts follow, and they are deliberately separate:
    version), because path pinning alone cannot see an in-place rewrite and version pinning
    alone cannot see the split. A same-version reinstall is a *match*, not a drift —
    nothing the lane runs changed.
-3. **A split lane is fenced at the send, and is never healthy residency.** The action-time
-   `evaluate_update_authority` preflight runs inside the shared pre-send gate
-   (`admit_receiver_startup_or_die`), immediately after the startup screen is found clear
-   and before the first injection. A **positively demonstrated** wrong binary — `split`
-   or `drifted` — refuses the send with `receiver_update_authority_split`, zero-send, and
-   the refusal is ledgered like every other terminal outcome.
+3. **A split lane must be fenced at the send, and must never be healthy residency.**
 
-   `unknown` deliberately does **not** refuse a send, and the asymmetry is the point.
-   Once the F2 proxy was removed, `unknown` became the honest verdict for any host whose
-   package-manager prefix nobody has positively resolved; refusing every such send would
-   take the whole workspace offline to guard against a possibility, which is not
-   fail-closed but a different outage. It is still withheld where it matters most: a
-   **re-launch** requires the strict predicate, because re-launch is the exact moment the
-   #14741 loop re-armed itself.
+   **Status — NOT YET IN FORCE (Redmine #14741 review j#96060 F1/F2).** This clause states
+   the contract, not the current behavior, and the distinction is recorded here because
+   two consecutive rounds of this issue described the fence as wired when it was not. What
+   exists today: `admit_receiver_startup_or_die` *accepts* the updater-target probe and the
+   bound/observed executable identity and evaluates the authority; what does **not** exist:
+   its only production caller (`application/commands.py`) supplies none of them, so every
+   production send evaluates to `unknown` with no probe. Nothing consumes
+   `admits_relaunch`, so no re-launch or self-heal path is fenced at all. Treat the
+   paragraphs below as the target contract until a round lands that measures the
+   production caller itself.
+
+   The intended contract: the action-time preflight runs inside the shared pre-send gate,
+   immediately after the startup screen is found clear and before the first injection, and
+   a wrong binary refuses the send with `receiver_update_authority_split`, zero-send and
+   ledgered.
+
+   **The unresolved precondition.** `unknown` must fail closed (j#94469 Acceptance 2,
+   j#95741 F1, accepted in j#96040), but with no positive updater-target resolver
+   `unknown` is the verdict for *every* host, so fencing on it takes the whole workspace
+   offline. The resolver is therefore the precondition, and it is blocked on a trust
+   boundary this document itself draws: the profile schema fail-closed forbids a profile
+   from carrying an argv, so "ask npm where it writes" cannot be declared as provider
+   data, and putting the provider→package-manager mapping in a consumer module violates
+   the rule that a provider-specific string never belongs there. That question is open
+   (#14741 design consultation); until it is answered the honest description of this
+   surface is "classifier and seam exist, fence is not in force".
 
    The `startup_health` classifier gains `provider_update_authority_split`,
    `provider_executable_binding_drift`, and `provider_update_authority_unverified` in the
