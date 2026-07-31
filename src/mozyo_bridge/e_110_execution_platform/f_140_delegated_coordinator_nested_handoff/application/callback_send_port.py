@@ -62,8 +62,8 @@ def _default_runner(argv: list) -> "tuple[int, str]":
     return proc.returncode, proc.stdout
 
 
-def _parse_outcome(stdout: str) -> Optional["tuple[str, str]"]:
-    """Extract ``(status, reason)`` from the handoff ``DeliveryOutcome`` JSON, or ``None``.
+def _parse_outcome(stdout: str) -> Optional["tuple[str, str, str]"]:
+    """Extract ``(status, reason, injection_stage)`` from the handoff ``DeliveryOutcome`` JSON.
 
     The handoff ``--record-format json`` path prints ``outcome.to_json()``. Scan the output for
     a JSON object carrying both ``status`` and ``reason`` (tolerant of surrounding lines). Any
@@ -78,7 +78,14 @@ def _parse_outcome(stdout: str) -> Optional["tuple[str, str]"]:
         except ValueError:
             continue
         if isinstance(obj, dict) and "status" in obj and "reason" in obj:
-            return str(obj["status"]), str(obj["reason"])
+            # Redmine #14232 review j#95333 F1: carry the producer's own injection-stage token
+            # when the payload has one, so the retry decision reuses the classification the
+            # sender made with full context instead of re-deriving it from two tokens.
+            stage = obj.get("injection_stage")
+            stage_token = (
+                str(stage.get("stage") or "") if isinstance(stage, dict) else ""
+            )
+            return str(obj["status"]), str(obj["reason"]), stage_token
     return None
 
 
@@ -164,7 +171,11 @@ class HandoffCallbackSendPort:
         parsed = _parse_outcome(stdout)
         if parsed is not None:
             return HandoffDeliveryResult(
-                parsed[0], parsed[1], persist_ok=persist_ok, persist_reason=persist_reason
+                parsed[0],
+                parsed[1],
+                persist_ok=persist_ok,
+                persist_reason=persist_reason,
+                injection_stage=parsed[2],
             )
         # No parseable structured outcome: fail safe. A clean rc still cannot confirm a
         # turn-start, so treat it as uncertain (no auto-retry); a nonzero rc is likewise

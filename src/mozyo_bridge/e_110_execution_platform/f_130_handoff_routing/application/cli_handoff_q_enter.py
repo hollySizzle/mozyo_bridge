@@ -145,15 +145,25 @@ def configure_q_enter_parser(parser_: argparse.ArgumentParser) -> None:
     )
 
 
+#: The exit code a front-door ``blocked`` terminal returns when the rail itself exited 0
+#: (Redmine #14232 review j#95333 F2). Matches ``die``'s code so every non-delivered front-door
+#: terminal — the plan fail-closes, a transport block, and an unconfirmed submission — is one
+#: shell-visible failure class.
+FRONT_DOOR_BLOCKED_EXIT_CODE = 1
+
+
 def _emit_submit_outcome(outcome: SubmitOutcome, *, record_format: str) -> None:
     """Emit the front-door (workflow) result, separate from the transport outcome.
 
     Honors ``--record-format`` exactly like the transport ``_emit_outcome``: the
     pasteable record block first (``text`` / ``both``), then the single-line JSON
     last (``json`` / ``both``) so a script scraping the last JSON line of THIS
-    envelope still works. On the dispatch path the adjacent transport outcome (with
-    its `- Submit:` composer-residue line) follows; on the fail-closed path this is
-    the only outcome and no pane was touched.
+    envelope still works.
+
+    Redmine #14232: on the dispatch path this envelope now comes **after** the transport
+    outcome, because the front-door result is derived from it (``SubmitOutcome.from_transport``)
+    rather than claimed before the rail ran. On the front door's own fail-closed path (a missing
+    anchor / kind) this is still the only outcome and no pane was touched.
     """
     if record_format in (RECORD_FORMAT_TEXT, RECORD_FORMAT_BOTH):
         print("\n".join(outcome.record_lines()))
@@ -255,26 +265,63 @@ def cmd_handoff_q_enter(args: argparse.Namespace) -> int:
         )
         return 1
 
-    # The resolved front-door (workflow) result, distinct from the transport
-    # outcome the rail emits next.
-    _emit_submit_outcome(
-        SubmitOutcome(
-            intent=plan.intent,
-            resolved_rail=plan.rail,
-            anchor_required=plan.anchor_required,
-            ticketless=plan.ticketless,
-            delivery_id=delivery_id,
-            dispatched=True,
-            blocked=False,
-        ),
-        record_format=record_format,
-    )
-
     # Thread the front-door telemetry so the transport delivery record carries the
     # composer-residue classification + the same delivery id.
     args.submit_intent = plan.intent
     args.submit_delivery_id = delivery_id
 
+    # Redmine #14232 (j#84877 required correction 1): run the rail FIRST, then derive the
+    # front-door result from its terminal outcome. This block used to emit
+    # `SubmitOutcome(dispatched=True, blocked=False)` *above* the call, so a later `blocked` /
+    # `turn_start_unconfirmed` left a "dispatched" front-door record standing — pre-transport
+    # plan success masquerading as delivery success. The rail may also `die`
+    # (`SystemExit`) on a blocked terminal; the front-door record is emitted on that path too
+    # (in the `finally`) and the exit is then re-raised unchanged, so the CLI exit code and the
+    # transport's own output stay exactly as before.
+    #
+    # Ordering consequence, deliberately accepted: the transport outcome is now printed before
+    # the front-door envelope, so the LAST JSON line of the combined output is the front-door
+    # one. Readers that scrape a delivery outcome match on its `status` + `reason` keys (see
+    # `callback_send_port._parse_outcome`), which the front-door JSON does not carry, so a
+    # reverse scan still finds the transport outcome.
+    rc = 0
+    try:
+        rc = _run_resolved_rail(args, plan)
+    finally:
+        front_door = SubmitOutcome.from_transport(
+            getattr(args, "delivery_outcome", None),
+            plan_intent=plan.intent,
+            rail=plan.rail,
+            anchor_required=plan.anchor_required,
+            ticketless=plan.ticketless,
+            delivery_id=delivery_id,
+        )
+        _emit_submit_outcome(front_door, record_format=record_format)
+    # Redmine #14232 review j#95333 F2: reconcile the process exit code with the front-door
+    # classification. j#94407's acceptance names the exit code as one of the four surfaces that
+    # must converge, and R1 converged the other three: a record that said `blocked` while the
+    # shell reported success left a false success for every automated caller.
+    #
+    # Scope is deliberately the q-enter FRONT DOOR only. `handoff send`'s own rc for a
+    # marker-unobserved `queue_enter` stays 0: #13262 reserved that rail contract ("a
+    # queue-enter contract change would need its own design record"), and this issue does not
+    # hold that authority. The front door is a different surface — #12705 built it so an LLM
+    # reads ONE structured result — so converging it here is in scope and changes no rail.
+    #
+    # `pending_input` is not blocked (see `from_transport`), so an explicitly requested
+    # `--mode pending` park still exits 0. A rail that already died keeps its own non-zero rc.
+    if front_door.blocked and rc == 0:
+        return FRONT_DOOR_BLOCKED_EXIT_CODE
+    return rc
+
+
+def _run_resolved_rail(args: argparse.Namespace, plan) -> int:
+    """Drive the plan's resolved rail (extracted so the #14232 front-door derivation is one block).
+
+    Byte-identical rail selection and the #13583 forward-generation completion hook; the only
+    change is that it now returns to a caller which derives the front-door record from the
+    transport outcome instead of having claimed one before this ran.
+    """
     if plan.ticketless:
         rc = orchestrate_handoff(args, default_kind=plan.default_kind, ticketless=True)
         # Redmine #13583 R1-F1 / R2-F2: a consultation_callback that echoes a forward_action_id
