@@ -844,6 +844,81 @@ class AutoRefusalIsDurableAndTypedTest(unittest.TestCase):
             SUBREASON_TOKEN_PLACEHOLDER,
         )
 
+    def test_a_forged_or_raising_class_attribute_cannot_break_totality(self) -> None:
+        """Review j#96064 F1: admission itself must not run the caller's code.
+
+        R9 owned the value only AFTER `isinstance(value, str)`, and `isinstance` consults
+        `__class__` when the actual type is not `str`. So an object whose `__class__` property
+        returns `str` was admitted and then raised inside `str.__str__`, and one whose
+        `__class__` raises propagated out of the admission test. I had flagged this family as
+        "structurally closed but untested" in the R9 review request; one of the three was not
+        closed. Admission is now the ownership attempt itself.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_route_wording import (  # noqa: E501
+            SUBREASON_TOKEN_PLACEHOLDER,
+            auto_target_repo_lines,
+            execution_root_fence_next_action,
+            renderable_subreason_token,
+        )
+
+        hostile = "future\n- Injected: /Users/example/private"
+
+        class ForgedClass:
+            @property
+            def __class__(self): return str
+
+        class RaisingClass:
+            @property
+            def __class__(self): raise RuntimeError("class")
+
+        class ForgedClassWithFormat:
+            @property
+            def __class__(self): return str
+            def __format__(self, spec): return hostile
+
+        for label, obj in (
+            ("forged", ForgedClass()),
+            ("raising", RaisingClass()),
+            ("forged_with_format", ForgedClassWithFormat()),
+        ):
+            # validator closes to the placeholder rather than raising…
+            self.assertEqual(
+                renderable_subreason_token(obj), SUBREASON_TOKEN_PLACEHOLDER, label
+            )
+            # …and both durable surfaces stay total and clean.
+            action = execution_root_fence_next_action(
+                "auto_target_repo_unresolved", {"subreason": obj}
+            )
+            record = " ".join(auto_target_repo_lines({"subreason": obj, "basis": obj}))
+            for surface, text in (("next_action", action), ("record", record)):
+                where = f"{label}/{surface}"
+                self.assertNotIn("\n", text, where)
+                self.assertNotIn("\r", text, where)
+                self.assertNotIn("/", text, where)
+                self.assertLess(len(text), 1000, where)
+
+    def test_genuine_strings_are_still_admitted(self) -> None:
+        """Positive control: hardening admission must not reject the real cases."""
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_route_wording import (  # noqa: E501
+            SUBREASON_TOKEN_PLACEHOLDER,
+            renderable_subreason_token,
+        )
+
+        class RealSubclass(str):
+            pass
+
+        # exact str
+        self.assertEqual(renderable_subreason_token("future_refusal"), "future_refusal")
+        # a genuine str subclass is still accepted — and owned into an exact str
+        owned = renderable_subreason_token(RealSubclass("future_refusal"))
+        self.assertEqual(owned, "future_refusal")
+        self.assertIs(type(owned), str)
+        # and a genuine subclass whose CHARACTERS are unacceptable still closes
+        self.assertEqual(
+            renderable_subreason_token(RealSubclass("Not A Token")),
+            SUBREASON_TOKEN_PLACEHOLDER,
+        )
+
     def test_control_and_bidi_characters_close_to_the_placeholder(self) -> None:
         """Explicit rows for NUL / RTL override / zero-width / bell / non-ASCII (j#96049)."""
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_route_wording import (  # noqa: E501

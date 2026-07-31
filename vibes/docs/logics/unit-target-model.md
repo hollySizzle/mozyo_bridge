@@ -293,6 +293,12 @@ pane cwd / repo root   != target execution root (nested project)
     (review j#95843 finding 1)。narrative は全 subreason に対して真である表現に
     留め、具体的な段は同 field を読ませる。**受信側が持っていない情報を
     next_action で参照しない** — R3 は存在しない「structured detail」を参照していた。
+  - **admission 自体が caller の code を実行してはならない** (review j#96064 finding 1)。
+    `isinstance(value, str)` は actual type が `str` でないとき **`__class__` を参照する**ので、
+    `__class__` が `str` を返す非 `str` は通過して所有段で `TypeError` になり、
+    `__class__` が例外を投げる object はその場で伝播する。**`type(value) is str` は actual type
+    slot を読み偽装されない**。admission は「所有の試行そのもの」にし、非 `str` は例外ではなく
+    sentinel へ閉じる。**「理論上閉じる」で済ませず、各再介入点を実測して pin する。**
   - **検証した「文字」ではなく、検証済みの「値」を使う** (review j#96049 finding 1)。
     `str` subclass は `__format__` / `__hash__` / `__len__` / `__eq__` 等で
     **検証の後に**再介入できる。R8 は regex と長さを caller の object に対して確認し、

@@ -14,7 +14,6 @@ f_140 module (``render_block_die_message`` / ``render_exception_advisory``).
 from __future__ import annotations
 
 import re
-from typing import Mapping
 
 #: ``DeliveryOutcome.next_action`` for a ``gateway_route_blocked`` outcome — the
 #: suggested safe route, carried in the structured command result (#12918
@@ -239,7 +238,30 @@ def _is_absent(value: object) -> bool:
     """
     if value is None:
         return True
-    return isinstance(value, str) and len(_owned_str(value)) == 0
+    owned = _owned_or_none(value)
+    return owned is not None and len(owned) == 0
+
+
+def _owned_or_none(value: object) -> "str | None":
+    """An exact, inert ``str`` with the same characters, or ``None`` — total, runs no caller hook.
+
+    Review j#96064 finding 1: ``isinstance(value, str)`` consults ``__class__`` when the actual
+    type is not ``str``, so an object whose ``__class__`` property returns ``str`` passed the
+    R9 admission check and then blew up in ``str.__str__``, and an object whose ``__class__``
+    raises propagated straight out. R9 owned the value AFTER an admission test that the caller
+    controlled.
+
+    ``type(value)`` reads the actual type slot and cannot be fooled by a ``__class__``
+    property, so it is the fast path for the only shape the producer emits. A genuine ``str``
+    subclass still gets owned, via the base descriptor, guarded — that call is what refuses a
+    non-``str``, so the refusal costs a ``TypeError`` we catch rather than a hook we run.
+    """
+    if type(value) is str:
+        return value
+    try:
+        return str.__str__(value)  # type: ignore[arg-type]
+    except Exception:  # noqa: BLE001 - a non-str (or a hostile one) is simply not ownable
+        return None
 
 
 def _owned_str(value: str) -> str:
@@ -279,8 +301,8 @@ def _payload_subreason(auto_target_repo: object) -> str:
     object, so an unhashable subclass raised ``TypeError`` and a raising ``__hash__``
     propagated (review j#96049 finding 1).
     """
-    value = _payload_field(auto_target_repo, "subreason")
-    return _owned_str(value) if isinstance(value, str) else ""
+    owned = _owned_or_none(_payload_field(auto_target_repo, "subreason"))
+    return owned if owned is not None else ""
 
 
 def renderable_subreason_token(subreason: object) -> str:
@@ -291,13 +313,15 @@ def renderable_subreason_token(subreason: object) -> str:
     the ticket-facing contract requires, rather than inheriting it from a producer that, on
     this path, is by definition not the one that made the value.
     """
-    if not isinstance(subreason, str):
-        return SUBREASON_TOKEN_PLACEHOLDER
     # Own the characters BEFORE measuring or matching them, and return the owned copy — never
     # the caller's object (review j#96049 finding 1). R8 validated the characters and handed
     # back the original, whose `__format__` then re-ran at interpolation time and put a
     # newline and an absolute path back into text that had just been proven free of both.
-    owned = _owned_str(subreason)
+    # Admission is the ownership attempt itself, not a separate `isinstance` the caller can
+    # answer for (review j#96064 finding 1).
+    owned = _owned_or_none(subreason)
+    if owned is None:
+        return SUBREASON_TOKEN_PLACEHOLDER
     if len(owned) > SUBREASON_TOKEN_MAX_LENGTH:
         return SUBREASON_TOKEN_PLACEHOLDER
     return owned if _SUBREASON_TOKEN_RE.match(owned) else SUBREASON_TOKEN_PLACEHOLDER
