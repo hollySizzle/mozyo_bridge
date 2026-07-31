@@ -90,10 +90,12 @@ AUTO_TARGET_REPO_UNRESOLVED_NEXT_ACTION: str = (
     "`--target-repo auto` could not establish which repo the target runs in, so no "
     "repo root was asserted and nothing was injected (nothing typed, no Enter, no "
     "delivery recorded). Pass an explicit `--target-repo <target lane worktree>`, or "
-    "repair the target lane's worktree binding so `auto` can resolve it. Do NOT drop "
-    "`--target-repo` to get past this: without it a relative `--workdir` resolves "
-    "against the SENDER's cwd, which is the lane-external execution root this fence "
-    "exists to prevent."
+    "repair the target lane's worktree binding so `auto` can resolve it. If the "
+    "structured detail names the lifecycle authority as unreadable, the shared store "
+    "is likely NEWER than this runtime — route through a current runtime (never "
+    "downgrade the store). Do NOT drop `--target-repo` to get past this: without it a "
+    "relative `--workdir` resolves against the SENDER's cwd, which is the lane-external "
+    "execution root this fence exists to prevent."
 )
 
 #: ``DeliveryOutcome`` narrative for an ``auto_target_repo_unresolved`` outcome.
