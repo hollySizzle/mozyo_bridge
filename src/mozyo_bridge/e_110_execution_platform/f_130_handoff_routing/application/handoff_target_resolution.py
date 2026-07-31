@@ -74,7 +74,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Protocol
+from typing import Any, Callable, Dict, List, Optional, Protocol
 
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
     PreflightTarget,
@@ -241,6 +241,7 @@ class TargetResolutionUseCase:
         *,
         reason: str,
         target: Optional[str],
+        auto_target_repo: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Emit a terminal blocked :class:`DeliveryOutcome` from the request context.
 
@@ -260,6 +261,7 @@ class TargetResolutionUseCase:
                 kind=request.kind,
                 notification_marker=None,
                 source=request.source,
+                auto_target_repo=auto_target_repo,
             ),
             record_format=request.record_format,
             command=request.record_command,
@@ -348,14 +350,19 @@ class TargetResolutionUseCase:
             # no sender-cwd fallback: that fallback IS the defect.
             auto = ops.resolve_auto_target_root(request.repo_root, target_info)
             if not auto.ok:
-                # Review j#94499 F1: NOT `target_repo_mismatch`. That reason's durable
-                # narrative asserts an OBSERVED target repo root disagreed, and its
-                # next_action offers "drop the flag to skip the repo gate" — but herdr
-                # observed no pane cwd at all, and dropping `--target-repo` restores the
-                # sender-cwd execution root this issue removed. Reusing the token would
-                # have inherited wording that routes the sender back into the defect.
+                # Review j#94499 F1: NOT `target_repo_mismatch` — that reason's durable
+                # narrative asserts an OBSERVED target repo disagreed and advises "drop the
+                # flag", which walks back into the sender-cwd root this issue removed.
+                # Review j#95843 F1: the wire reason is CHOSEN by the subreason (a
+                # newer-than-runtime store maps onto the existing `reader_upgrade_required`,
+                # whose repair is the only correct one), and the subreason travels on the
+                # outcome so the reader can see WHICH step failed instead of being pointed
+                # at a "structured detail" that did not exist.
                 self._emit_blocked(
-                    request, reason="auto_target_repo_unresolved", target=target
+                    request,
+                    reason=auto.wire_reason(),
+                    target=target,
+                    auto_target_repo=auto.to_structured_dict(),
                 )
                 ops.die(
                     "`--target-repo auto` could not verify the target agent's repo root "

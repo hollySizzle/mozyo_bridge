@@ -113,8 +113,17 @@ WORKER_DISPATCH_BLOCKED_REASONS = frozenset(
 #: replayed) rather than poisoned to the reconcile-only ``uncertain`` terminal. Every
 #: other non-zero outcome — an unparseable record, a timeout, or any post-injection
 #: failure whose fate is unknown — stays ``uncertain`` and never-replay (Acceptance #3).
+#: Redmine #14249 R4 (review j#95843 finding 2): the two #14249 execution-root fences join
+#: them. Both refuse in the preflight — the containment fence in envelope planning and the
+#: `--target-repo auto` frame resolution in target resolution — and both `die` before the
+#: transport rail, so they prove a zero-injection exactly as the two above do.
 SEND_KNOWN_NOT_SENT_REASONS = frozenset(
-    {"gateway_route_blocked", "reader_upgrade_required"}
+    {
+        "gateway_route_blocked",
+        "reader_upgrade_required",
+        "execution_root_outside_target_repo",
+        "auto_target_repo_unresolved",
+    }
 )
 
 

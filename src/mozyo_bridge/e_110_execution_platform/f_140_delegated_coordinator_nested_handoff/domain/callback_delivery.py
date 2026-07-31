@@ -204,6 +204,16 @@ _NOT_SENT_BLOCKED_REASONS = frozenset(
         "target_repo_mismatch",
         "gateway_route_blocked",
         "main_lane_implementation_blocked",
+        # Redmine #13844 / #14249 R4 (review j#95843 finding 2). All three refuse in a
+        # preflight gate that `die`s BEFORE the transport rail types a byte, so each is a
+        # deterministic pre-injection refusal by the definition above — they were simply
+        # never registered here, so a proven zero-send degraded to `uncertain` and was
+        # never retried. `reader_upgrade_required` (the sole emit site,
+        # `gateway_route_gate`, states "Fail closed before any text is typed") was already
+        # trusted by the worker-dispatch classifier, so the two consumers disagreed.
+        "reader_upgrade_required",
+        "execution_root_outside_target_repo",
+        "auto_target_repo_unresolved",
     }
 )
 

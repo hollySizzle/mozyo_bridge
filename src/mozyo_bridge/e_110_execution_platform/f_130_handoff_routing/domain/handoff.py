@@ -36,10 +36,8 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketle
 # small f_130 sibling so this oversized module does not grow inline prose for the
 # new reason (the policy is in the f_140 enforcement module, uncyclable from here).
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_route_wording import (
-    AUTO_TARGET_REPO_UNRESOLVED_NARRATIVE,
-    AUTO_TARGET_REPO_UNRESOLVED_NEXT_ACTION,
-    EXECUTION_ROOT_OUTSIDE_TARGET_REPO_NARRATIVE,
-    EXECUTION_ROOT_OUTSIDE_TARGET_REPO_NEXT_ACTION,
+    EXECUTION_ROOT_FENCE_NARRATIVE,
+    EXECUTION_ROOT_FENCE_NEXT_ACTION,
     GATEWAY_ROUTE_BLOCKED_NARRATIVE,
     GATEWAY_ROUTE_BLOCKED_NEXT_ACTION,
     READER_UPGRADE_REQUIRED_NARRATIVE,
@@ -854,6 +852,8 @@ class DeliveryOutcome:
     # it was still starting up" from every other blocked reason, WITHOUT reading a
     # transcript. `None` for every admitted send and every non-herdr path.
     startup_admission: Optional[dict[str, Any]] = None
+    # Redmine #14249 R4 (j#95843 F1): `--target-repo auto` refusal subreason/basis/detail.
+    auto_target_repo: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1199,11 +1199,8 @@ def next_action_for(
                 "target whose cwd lives under the expected repo."
             ),
         )
-    if reason == "execution_root_outside_target_repo":
-        # Redmine #14249: `--target-repo` and `--workdir` disagree; nothing was typed.
-        return "sender", EXECUTION_ROOT_OUTSIDE_TARGET_REPO_NEXT_ACTION
-    if reason == "auto_target_repo_unresolved":
-        return "sender", AUTO_TARGET_REPO_UNRESOLVED_NEXT_ACTION
+    if reason in EXECUTION_ROOT_FENCE_NEXT_ACTION:
+        return "sender", EXECUTION_ROOT_FENCE_NEXT_ACTION[reason]
     if reason == "gateway_route_blocked":
         # Redmine #12918: governed delivery to a cross-lane Claude worker, blocked.
         # Wording lives in the f_130 sibling `gateway_route_wording` (the policy is
@@ -1662,10 +1659,8 @@ def _outcome_narrative(
             "Target pane's inferred repo root does not match `--target-repo`; "
             "handoff aborted before typing. No notification was typed."
         )
-    if reason == "execution_root_outside_target_repo":
-        return EXECUTION_ROOT_OUTSIDE_TARGET_REPO_NARRATIVE
-    if reason == "auto_target_repo_unresolved":
-        return AUTO_TARGET_REPO_UNRESOLVED_NARRATIVE
+    if reason in EXECUTION_ROOT_FENCE_NARRATIVE:
+        return EXECUTION_ROOT_FENCE_NARRATIVE[reason]
     if reason == "gateway_route_blocked":
         return GATEWAY_ROUTE_BLOCKED_NARRATIVE
     if reason == "reader_upgrade_required":
@@ -2106,6 +2101,7 @@ def make_outcome(
     turn_start_outcome: Optional[dict[str, Any]] = None,
     queue_enter_turn_start_observation: Optional[dict[str, Any]] = None,
     startup_admission: Optional[dict[str, Any]] = None,
+    auto_target_repo: Optional[dict[str, Any]] = None,
 ) -> DeliveryOutcome:
     # `source` is part of the structured outcome contract and must survive
     # anchor-normalization failure paths. When the anchor was successfully
@@ -2156,6 +2152,7 @@ def make_outcome(
         turn_start_outcome=turn_start_outcome,
         queue_enter_turn_start_observation=queue_enter_turn_start_observation,
         startup_admission=startup_admission,
+        auto_target_repo=auto_target_repo,
     )
 
 

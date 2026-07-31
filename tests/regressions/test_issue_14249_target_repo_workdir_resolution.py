@@ -286,6 +286,171 @@ class AutoRefusalCarriesItsOwnReasonTest(unittest.TestCase):
         self.assertIn("drop the flag", mismatch_action)
 
 
+class AutoRefusalIsDurableAndTypedTest(unittest.TestCase):
+    """The refusal must reach its readers with the fact they need (review j#95843 F1/F2).
+
+    R3 wrote a ``next_action`` pointing at "the structured detail" that ``DeliveryOutcome`` had
+    no field for, folded a newer-than-runtime store into the same reason as a corrupt one, and
+    left the new reason out of the closed zero-send consumer sets so a proven pre-injection
+    refusal degraded to ``uncertain``. Each of those is pinned here at the surface its reader
+    actually observes.
+    """
+
+    def _refusal(self, reason: str, detail: str = "d"):
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.herdr_auto_target_root import (  # noqa: E501
+            AutoTargetRoot,
+        )
+
+        return AutoTargetRoot(reason=reason, detail=detail)
+
+    def test_a_newer_store_maps_onto_the_existing_reader_upgrade_reason(self) -> None:
+        """Review j#95843 point 2: do not mint a second token for a condition that has one."""
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.herdr_auto_target_root import (  # noqa: E501
+            REFUSE_STORE_UPGRADE_REQUIRED,
+        )
+
+        self.assertEqual(
+            self._refusal(REFUSE_STORE_UPGRADE_REQUIRED).wire_reason(),
+            "reader_upgrade_required",
+        )
+
+    def test_other_auto_failures_keep_the_auto_reason(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.herdr_auto_target_root import (  # noqa: E501
+            REFUSE_FOREIGN_WORKSPACE,
+            REFUSE_LANE_BINDING_ABSENT,
+            REFUSE_STORE_UNREADABLE,
+        )
+
+        for reason in (
+            REFUSE_LANE_BINDING_ABSENT,
+            REFUSE_FOREIGN_WORKSPACE,
+            REFUSE_STORE_UNREADABLE,
+        ):
+            self.assertEqual(
+                self._refusal(reason).wire_reason(), "auto_target_repo_unresolved", reason
+            )
+
+    def test_the_subreason_actually_reaches_the_outcome(self) -> None:
+        """The exact gap: the advice referenced a field that did not exist."""
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.herdr_auto_target_root import (  # noqa: E501
+            REFUSE_LANE_BINDING_ABSENT,
+        )
+
+        refusal = self._refusal(REFUSE_LANE_BINDING_ABSENT, detail="no row owns lane 'x'")
+        outcome = make_outcome(
+            status="blocked",
+            reason=refusal.wire_reason(),
+            receiver="codex",
+            target="mzb1_x",
+            anchor=RedmineAnchor(issue=ISSUE, journal="95831"),
+            mode="queue-enter",
+            kind="review_request",
+            notification_marker=None,
+            auto_target_repo=refusal.to_structured_dict(),
+        )
+        carried = outcome.to_dict()["auto_target_repo"]
+        self.assertEqual(carried["subreason"], REFUSE_LANE_BINDING_ABSENT)
+        self.assertIn("lane", carried["detail"])
+        # And the next_action names the field the reader can now actually read.
+        self.assertIn("auto_target_repo.subreason", outcome.next_action)
+
+    def test_the_narrative_does_not_assert_a_cause_it_cannot_know(self) -> None:
+        """R3's narrative claimed the worktree binding was non-unique — false for most cases.
+
+        Read off the pasteable record, i.e. the text a human actually receives.
+        """
+        record = build_delivery_record(
+            make_outcome(
+                status="blocked",
+                reason="auto_target_repo_unresolved",
+                receiver="codex",
+                target="mzb1_x",
+                anchor=RedmineAnchor(issue=ISSUE, journal="95831"),
+                mode="queue-enter",
+                kind="review_request",
+                notification_marker=None,
+            )
+        )
+        self.assertNotIn("did not resolve to exactly one live worktree", record)
+        self.assertIn("auto_target_repo.subreason", record)
+
+    def test_proven_zero_send_refusals_are_not_sent_not_uncertain(self) -> None:
+        """Review j#95843 F2: a pre-injection refusal must not degrade to `uncertain`."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_delivery import (  # noqa: E501
+            send_outcome_for_delivery,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_worker_dispatch import (  # noqa: E501
+            SEND_KNOWN_NOT_SENT_REASONS,
+        )
+
+        for reason in (
+            "auto_target_repo_unresolved",
+            # R1's fence carried the same defect from the start (self-swept, j#95849).
+            "execution_root_outside_target_repo",
+            # Reached by the auto path since point 2; its sole emit site dies pre-injection.
+            "reader_upgrade_required",
+        ):
+            self.assertEqual(
+                send_outcome_for_delivery("blocked", reason), "not_sent", reason
+            )
+            self.assertIn(reason, SEND_KNOWN_NOT_SENT_REASONS, reason)
+
+    def test_post_injection_reasons_still_stay_uncertain(self) -> None:
+        """The guard must keep its teeth — widening the set must not swallow these."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_delivery import (  # noqa: E501
+            send_outcome_for_delivery,
+        )
+
+        for reason in ("marker_timeout", "receiver_blocked", "turn_start_absent"):
+            self.assertEqual(
+                send_outcome_for_delivery("blocked", reason), "uncertain", reason
+            )
+
+
+class PublicHelpMatchesTheCurrentContractTest(unittest.TestCase):
+    """`--help` is a contract surface too (review j#95843 F3).
+
+    R2/R3 corrected the narrative and the docs but never rendered `--help`, which kept
+    advising "Drop the flag to skip the repo gate" — the one recovery j#94456 prohibits — and
+    described `auto` as tmux-only. Rendered from THIS source tree, not the installed console
+    script, which is what made the staleness invisible.
+    """
+
+    def _help(self, subcommand: str) -> str:
+        import subprocess
+
+        proc = subprocess.run(
+            [sys.executable, "-m", "mozyo_bridge", "handoff", subcommand, "--help"],
+            capture_output=True,
+            text=True,
+            cwd=str(ROOT),
+            env={"PYTHONPATH": str(ROOT / "src"), "PATH": "/usr/bin:/bin"},
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout
+
+    #: Every subparser that exposes `--target-repo`; the help text is built by one shared
+    #: helper, so a fix that missed one would mean the helper was bypassed.
+    SUBCOMMANDS = ("send", "reply", "cross-workspace-consult")
+
+    def test_no_subcommand_advises_dropping_the_flag_to_recover(self) -> None:
+        for sub in self.SUBCOMMANDS:
+            self.assertNotIn("Drop the flag to skip the repo gate", self._help(sub), sub)
+
+    def test_auto_is_documented_per_backend_not_as_tmux_only(self) -> None:
+        text = " ".join(self._help("send").split())
+        self.assertIn("under herdr", text)
+        self.assertIn("lifecycle worktree binding", text)
+        # The tmux requirement must stay, but scoped to tmux rather than stated absolutely.
+        self.assertIn("under tmux", text)
+
+    def test_help_names_the_fail_closed_reasons_and_forbids_the_fallback(self) -> None:
+        text = " ".join(self._help("send").split())
+        self.assertIn("auto_target_repo_unresolved", text)
+        self.assertIn("never fall back to the sender's root", text)
+
+
 class AutoResolvesTheTargetLaneRootTest(unittest.TestCase):
     """``--target-repo auto`` must name the TARGET lane's root (Redmine #14249 R2 / j#94419).
 

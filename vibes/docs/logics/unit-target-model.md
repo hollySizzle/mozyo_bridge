@@ -284,6 +284,19 @@ pane cwd / repo root   != target execution root (nested project)
     `--target-repo <target lane worktree>` を要求する。sender cwd への silent
     fallback は禁止 — それが本 defect であり、誤った execution root を検証済みの
     ものとして送達する。
+    ただし **store が runtime より新しい場合だけは既存の `reader_upgrade_required`
+    へ写す** (review j#95843 point 2)。同 reason が既に「現行 runtime 経由で送れ、
+    store を downgrade するな」という唯一正しい repair を持つため、同じ条件に
+    2 つ目の token を作らない。
+  - **refusal は durable な subreason を伴う**。どの段で解決に失敗したかは
+    `DeliveryOutcome.auto_target_repo` (`subreason` / `basis` / `detail`) に載せる
+    (review j#95843 finding 1)。narrative は全 subreason に対して真である表現に
+    留め、具体的な段は同 field を読ませる。**受信側が持っていない情報を
+    next_action で参照しない** — R3 は存在しない「structured detail」を参照していた。
+  - **これらの refusal は proven pre-injection zero-send として closed consumer に
+    登録する** (review j#95843 finding 2)。`callback_delivery._NOT_SENT_BLOCKED_REASONS`
+    と `sublane_worker_dispatch.SEND_KNOWN_NOT_SENT_REASONS` の双方。未登録だと
+    `uncertain` へ劣化し、安全な bounded retry が行われない。
     **この失敗に `target_repo_mismatch` を使ってはならない** (review j#94499
     finding 1)。同 reason の narrative / next_action は「観測された target pane の
     repo root が asserted 値と不一致」「flag を外して repo gate を skip」を述べるが、

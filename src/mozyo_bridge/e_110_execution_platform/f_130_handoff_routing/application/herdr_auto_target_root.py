@@ -71,6 +71,13 @@ REFUSE_LANE_BINDING_UNBOUND = "lane_binding_unbound"
 REFUSE_LANE_WORKTREE_UNRESOLVED = "lane_worktree_unresolved"
 #: The lifecycle authority itself could not be read (fail closed, never "no row").
 REFUSE_STORE_UNREADABLE = "lifecycle_store_unreadable"
+#: The lifecycle authority is a NEWER schema than this runtime can read. Kept DISTINCT from
+#: :data:`REFUSE_STORE_UNREADABLE` (review j#95843 finding 1): the reader raises the typed
+#: :class:`LaneLifecycleReaderUpgradeRequired` for it, and the caller maps this subreason onto
+#: the existing wire reason ``reader_upgrade_required`` — whose repair ("route via a current
+#: runtime, never downgrade the store") is the only correct one and is nothing like the repair
+#: for a corrupt store. Folding the two loses the one fact the operator needs.
+REFUSE_STORE_UPGRADE_REQUIRED = "lifecycle_store_upgrade_required"
 
 
 @dataclass(frozen=True)
@@ -89,6 +96,31 @@ class AutoTargetRoot:
     @property
     def ok(self) -> bool:
         return bool(self.root)
+
+    def to_structured_dict(self) -> dict:
+        """The DURABLE subreason payload carried on the blocked outcome (j#95843 finding 1).
+
+        R3 wrote a ``next_action`` that told the reader to consult "the structured detail" —
+        which did not exist: ``DeliveryOutcome`` had no field for it, so the one fact that
+        distinguishes these refusals never reached the reader. This is that field's content.
+        Free-text-free apart from ``detail``, which names only lane ids and store state.
+        """
+        return {"subreason": self.reason, "basis": self.basis, "detail": self.detail}
+
+    def wire_reason(self) -> str:
+        """The wire ``Reason`` this refusal is delivered as.
+
+        A store that is NEWER than this runtime maps onto the EXISTING
+        ``reader_upgrade_required`` (review j#95843 point 2): that reason already carries the
+        correct repair and is already understood by the recovery rails, so a second token for
+        the same condition would fragment it. Everything else is a genuine
+        "auto could not establish the target's frame".
+        """
+        return (
+            "reader_upgrade_required"
+            if self.reason == REFUSE_STORE_UPGRADE_REQUIRED
+            else "auto_target_repo_unresolved"
+        )
 
 
 @dataclass(frozen=True)
@@ -239,15 +271,30 @@ def resolve_herdr_auto_target_repo(
             ),
         )
 
+    # Read through the reader DIRECTLY rather than `load_lane_lifecycle_readonly`, which folds
+    # every failure — including the typed `LaneLifecycleReaderUpgradeRequired` — into `None`
+    # (review j#95843 finding 1). "The store is newer than this runtime" and "the store is
+    # unreadable" have different repairs, so the distinction has to survive to the outcome.
     from mozyo_bridge.core.state.lane_lifecycle_readonly import (
-        load_lane_lifecycle_readonly,
+        LaneLifecycleReader,
+        LaneLifecycleReaderUpgradeRequired,
     )
+    from mozyo_bridge.core.state.lane_lifecycle_schema import LaneLifecycleError
 
-    rows = load_lane_lifecycle_readonly()
-    if rows is None:
+    try:
+        rows = LaneLifecycleReader().records()
+    except LaneLifecycleReaderUpgradeRequired as exc:
+        return AutoTargetRoot(
+            reason=REFUSE_STORE_UPGRADE_REQUIRED,
+            detail=(
+                "the lane lifecycle authority is a NEWER schema than this runtime can read "
+                f"({exc}); route via a current runtime — never downgrade the store"
+            ),
+        )
+    except (LaneLifecycleError, OSError) as exc:
         return AutoTargetRoot(
             reason=REFUSE_STORE_UNREADABLE,
-            detail="the lane lifecycle authority is unreadable; fail closed",
+            detail=f"the lane lifecycle authority is unreadable ({exc}); fail closed",
         )
     lane = _norm_lane(target_info.get("lane_id") or "")
     row = next(

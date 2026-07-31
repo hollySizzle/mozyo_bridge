@@ -89,29 +89,53 @@ EXECUTION_ROOT_OUTSIDE_TARGET_REPO_NARRATIVE: str = (
 AUTO_TARGET_REPO_UNRESOLVED_NEXT_ACTION: str = (
     "`--target-repo auto` could not establish which repo the target runs in, so no "
     "repo root was asserted and nothing was injected (nothing typed, no Enter, no "
-    "delivery recorded). Pass an explicit `--target-repo <target lane worktree>`, or "
-    "repair the target lane's worktree binding so `auto` can resolve it. If the "
-    "structured detail names the lifecycle authority as unreadable, the shared store "
-    "is likely NEWER than this runtime — route through a current runtime (never "
-    "downgrade the store). Do NOT drop `--target-repo` to get past this: without it a "
-    "relative `--workdir` resolves against the SENDER's cwd, which is the lane-external "
-    "execution root this fence exists to prevent."
+    "delivery recorded). Read `auto_target_repo.subreason` on this outcome for which "
+    "step failed: an unattested sender/target identity, a target in another "
+    "workspace, or a target lane whose worktree binding is absent / unbound / not "
+    "uniquely resolvable. Pass an explicit `--target-repo <target lane worktree>`, or "
+    "repair that lane's worktree binding. Do NOT drop `--target-repo` to get past "
+    "this: without it a relative `--workdir` resolves against the SENDER's cwd, which "
+    "is the lane-external execution root this fence exists to prevent."
 )
 
 #: ``DeliveryOutcome`` narrative for an ``auto_target_repo_unresolved`` outcome.
+#:
+#: Deliberately does NOT name one cause (review j#95843 finding 1): the R3 text asserted the
+#: worktree binding "did not resolve to exactly one live worktree", which is simply false for
+#: the unattested-identity and foreign-workspace subreasons. The specific step lives in the
+#: durable ``auto_target_repo.subreason`` field; the narrative states only what is true of
+#: every case.
 AUTO_TARGET_REPO_UNRESOLVED_NARRATIVE: str = (
     "`--target-repo auto` did not resolve the target's own repo root (Redmine "
     "#14249): under the herdr backend there is no target pane cwd to read, so auto "
-    "resolves the target LANE's canonical worktree from its lifecycle worktree "
-    "binding — and that binding did not resolve to exactly one live worktree. "
-    "Distinct from `target_repo_mismatch` (there an OBSERVED target repo disagreed "
-    "with the asserted one); here nothing was observed to compare. Auto never falls "
-    "back to the sender's own root. Handoff aborted before typing; no notification "
-    "was typed."
+    "resolves the target's frame from the resolved route identity and that lane's "
+    "lifecycle worktree binding — and that resolution did not complete. See "
+    "`auto_target_repo.subreason` for which step. Distinct from `target_repo_mismatch` "
+    "(there an OBSERVED target repo disagreed with the asserted one); here nothing was "
+    "observed to compare. Auto never falls back to the sender's own root. Handoff "
+    "aborted before typing; no notification was typed."
 )
 
 
+#: The #14249 execution-root fence pair, keyed by wire ``Reason``. Both are sender-owned
+#: pre-send refusals whose wording lives here, so ``handoff.py`` dispatches them through one
+#: lookup instead of a per-reason branch — which is also what keeps that oversized module
+#: from growing a line for every reason this issue adds.
+EXECUTION_ROOT_FENCE_NEXT_ACTION: dict[str, str] = {
+    "execution_root_outside_target_repo": EXECUTION_ROOT_OUTSIDE_TARGET_REPO_NEXT_ACTION,
+    "auto_target_repo_unresolved": AUTO_TARGET_REPO_UNRESOLVED_NEXT_ACTION,
+}
+
+#: Narrative twin of :data:`EXECUTION_ROOT_FENCE_NEXT_ACTION`.
+EXECUTION_ROOT_FENCE_NARRATIVE: dict[str, str] = {
+    "execution_root_outside_target_repo": EXECUTION_ROOT_OUTSIDE_TARGET_REPO_NARRATIVE,
+    "auto_target_repo_unresolved": AUTO_TARGET_REPO_UNRESOLVED_NARRATIVE,
+}
+
+
 __all__ = (
+    "EXECUTION_ROOT_FENCE_NEXT_ACTION",
+    "EXECUTION_ROOT_FENCE_NARRATIVE",
     "GATEWAY_ROUTE_BLOCKED_NEXT_ACTION",
     "GATEWAY_ROUTE_BLOCKED_NARRATIVE",
     "READER_UPGRADE_REQUIRED_NEXT_ACTION",
