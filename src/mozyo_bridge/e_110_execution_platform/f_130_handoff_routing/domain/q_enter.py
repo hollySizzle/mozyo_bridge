@@ -47,13 +47,21 @@ import hashlib
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (
+    MODE_QUEUE_ENTER,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (
     POST_INJECTION_BLOCKED_REASONS,
     STAGE_SUBMITTED_CONFIRMED,
     blind_retry_prohibited,
-    injection_stage_for,
+    injection_stage_for_outcome,
     stage_guidance,
+    turn_start_positively_observed,
 )
+
+#: The transport status a deliberate ``--mode pending`` park reports. Named here because the
+#: front door treats it as "did what you asked", not as a block (review j#95333 F2).
+STATUS_PENDING_INPUT = "pending_input"
 
 
 class SubmitPlanError(ValueError):
@@ -287,7 +295,14 @@ def resolve_submit_plan(
     )
 
 
-def classify_composer_residue(status: object, reason: object) -> str:
+def classify_composer_residue(
+    status: object,
+    reason: object,
+    *,
+    mode: object = None,
+    queue_enter_turn_start_observation: object = None,
+    turn_start_outcome: object = None,
+) -> str:
     """Classify the receiver composer residue from the transport outcome.
 
     A pure projection of the existing transport ``(status, reason)`` into exactly
@@ -324,7 +339,19 @@ def classify_composer_residue(status: object, reason: object) -> str:
     status_token = status if isinstance(status, str) else ""
     reason_token = reason if isinstance(reason, str) else ""
     if status_token == "sent":
-        return RESIDUE_CLEARED if reason_token == "ok" else RESIDUE_TYPED_BUT_PENDING
+        if reason_token != "ok":
+            return RESIDUE_TYPED_BUT_PENDING
+        # Review j#95333 F1, same misreading on the residue axis: a marker-observed
+        # `queue-enter` send also reports `ok`, but that rail never verified a submit. If the
+        # Enter was absorbed, the marker+body is still sitting in the composer — the composer
+        # is NOT cleared. Only positive turn-start evidence justifies `cleared`.
+        if str(mode or "").strip() == MODE_QUEUE_ENTER and not (
+            turn_start_positively_observed(
+                queue_enter_turn_start_observation, turn_start_outcome
+            )
+        ):
+            return RESIDUE_TYPED_BUT_PENDING
+        return RESIDUE_CLEARED
     if status_token == "pending_input":
         return RESIDUE_TYPED_BUT_PENDING
     if status_token == "blocked" and reason_token in POST_INJECTION_BLOCKED_REASONS:
@@ -443,14 +470,13 @@ class SubmitOutcome:
     @classmethod
     def from_transport(
         cls,
+        outcome: object,
         *,
         plan_intent: str,
         rail: Optional[str],
         anchor_required: bool,
         ticketless: bool,
         delivery_id: str,
-        status: object,
-        reason: object,
     ) -> "SubmitOutcome":
         """Derive the front-door result from the transport's terminal outcome (#14232).
 
@@ -461,13 +487,31 @@ class SubmitOutcome:
         because planning genuinely did succeed; the two facts are reported side by side rather
         than one standing in for the other.
 
-        ``status`` / ``reason`` are the transport's own tokens (``None`` when the rail returned
-        no structured outcome at all — an early return or a caller that never sent). An absent
-        outcome resolves through the authority's fail-closed default to ``uncertain_partial``:
-        the front door must not claim a delivery it cannot see.
+        Redmine #14232 review j#95333 F1: this takes the whole
+        :class:`...handoff.DeliveryOutcome`, not its two wire tokens. ``sent`` / ``ok`` is
+        ambiguous across rails — the marker-observed ``queue-enter`` cell reports it without
+        running any turn-start gate — so a two-token derivation confirmed deliveries the
+        outcome's own telemetry contradicted. ``outcome`` is ``None`` when the rail returned no
+        structured outcome at all (an early return, or a caller that never sent), which the
+        authority fails closed to ``uncertain_partial``: the front door must not claim a
+        delivery it cannot see.
+
+        Three distinct facts are reported, deliberately not collapsed into one:
+
+        - ``dispatched`` — the payload's submission was confirmed;
+        - ``blocked`` — the front door could not do what it was invoked for, and the caller
+          must act. Review j#95333 F2 narrowed this: a ``pending_input`` terminal is **not**
+          blocked, because ``--mode pending`` is the caller explicitly asking the rail not to
+          submit, and getting exactly what you asked for is not a block. R1 derived ``blocked``
+          from ``not delivered``, which swept that deliberate park in with the failures; before
+          #14232 this flag was only ever the front door's OWN fail-closed paths.
+        - ``injection_stage`` / ``blind_retry_prohibited`` — whether a resend may duplicate. A
+          parked ``pending_input`` still prohibits a blind resend: its body IS in the composer.
         """
-        stage = injection_stage_for(status, reason)
+        stage = injection_stage_for_outcome(outcome)
         delivered = stage == STAGE_SUBMITTED_CONFIRMED
+        reason = getattr(outcome, "reason", None)
+        parked = str(getattr(outcome, "status", None) or "").strip() == STATUS_PENDING_INPUT
         return cls(
             intent=plan_intent,
             resolved_rail=rail,
@@ -476,11 +520,10 @@ class SubmitOutcome:
             delivery_id=delivery_id,
             resolved=True,
             dispatched=delivered,
-            # The front door reports `blocked` for anything that did not positively deliver:
-            # the transport's own `blocked` outcomes AND the unconfirmed `sent` / `queue_enter`
-            # and `pending_input` terminals, none of which handed the payload over.
-            blocked=not delivered,
-            blocked_reason=None if delivered else (str(reason) if reason else None),
+            blocked=not delivered and not parked,
+            blocked_reason=(
+                None if (delivered or parked) else (str(reason) if reason else None)
+            ),
             guidance=stage_guidance(stage),
             injection_stage=stage,
             blind_retry_prohibited=blind_retry_prohibited(stage),
@@ -529,6 +572,9 @@ def submit_record_lines(
     reason: object,
     intent: str,
     delivery_id: str,
+    mode: object = None,
+    queue_enter_turn_start_observation: object = None,
+    turn_start_outcome: object = None,
 ) -> list[str]:
     """Render the additive ``- Submit:`` telemetry block for the delivery record.
 
@@ -537,7 +583,13 @@ def submit_record_lines(
     front-door facts the transport outcome does not — the composer residue
     classification and the idempotency id — and never overrides ``next_action``.
     """
-    residue = classify_composer_residue(status, reason)
+    residue = classify_composer_residue(
+        status,
+        reason,
+        mode=mode,
+        queue_enter_turn_start_observation=queue_enter_turn_start_observation,
+        turn_start_outcome=turn_start_outcome,
+    )
     return [
         f"- Submit (q-enter front door): intent `{intent}`, "
         f"delivery id `{delivery_id}`",

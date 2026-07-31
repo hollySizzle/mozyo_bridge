@@ -56,6 +56,13 @@ class HandoffDeliveryResult:
     reason: str
     persist_ok: "bool | None" = None
     persist_reason: str = ""
+    #: The PRODUCER's own injection-stage token, parsed from the sending CLI's structured JSON
+    #: (Redmine #14232 review j#95333 F1). The sender classifies with the whole outcome — mode
+    #: and turn-start telemetry included — so carrying its answer beats re-deriving from
+    #: ``(status, reason)``, which cannot tell a verified standard submission from a
+    #: marker-observed ``queue-enter`` send that never started a turn. "" when the payload
+    #: carried none (a legacy sender), which falls back to the two-token classification.
+    injection_stage: str = ""
 
 
 class HandoffCallbackSender:
@@ -80,7 +87,9 @@ class HandoffCallbackSender:
             result = self._send_fn(row)
         except Exception:  # noqa: BLE001 - a mid-send failure is fail-safe uncertain, never a retry
             return CallbackSendResult(SEND_UNCERTAIN)
-        outcome = send_outcome_for_delivery(result.status, result.reason)
+        outcome = send_outcome_for_delivery(
+            result.status, result.reason, injection_stage=result.injection_stage
+        )
         # Redmine #14248 review j#85410 F1: the send edge's own reason used to be consumed by
         # `send_outcome_for_delivery` and then DROPPED, so a downstream reader could see
         # `not_sent` but never whether it was an authorization refusal or a transport

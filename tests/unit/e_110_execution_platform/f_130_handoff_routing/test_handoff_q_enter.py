@@ -34,6 +34,23 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.q_enter 
 )
 
 
+def _outcome(status, reason, *, mode="queue-enter", **extra):
+    """A real ``DeliveryOutcome`` for the front-door derivation (review j#95333 F1).
+
+    ``from_transport`` reads the whole outcome now, so these tests build one through
+    ``make_outcome`` — the same producer production uses — instead of passing two tokens the
+    authority cannot classify on their own.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+        make_outcome,
+    )
+
+    return make_outcome(
+        status=status, reason=reason, receiver="codex", target="%2", anchor=None,
+        mode=mode, kind="reply", notification_marker="[m]", source="redmine", **extra
+    )
+
+
 class ResolveSubmitPlanTest(unittest.TestCase):
     def test_consultation_callback_resolves_no_anchor_ticketless_rail(self) -> None:
         plan = resolve_submit_plan("consultation_callback")
@@ -236,15 +253,16 @@ class SubmitOutcomeTest(unittest.TestCase):
 
     def test_confirmed_delivery_reports_resolved_and_dispatched(self) -> None:
         # Redmine #14232: built via `from_transport`, the only path that may set `dispatched` —
-        # it is derived from the transport outcome, not from plan success.
+        # it is derived from the transport outcome, not from plan success. Review j#95333 F1:
+        # it takes the whole outcome, because `sent`/`ok` alone cannot say which rail verified
+        # what; this one is a `standard` send, which really did confirm a turn start.
         outcome = SubmitOutcome.from_transport(
+            _outcome("sent", "ok", mode="standard"),
             plan_intent="consultation_callback",
             rail=RAIL_TICKETLESS_CALLBACK,
             anchor_required=False,
             ticketless=True,
             delivery_id="qe-abc",
-            status="sent",
-            reason="ok",
         )
         data = outcome.to_dict()
         self.assertTrue(data["resolved"])
@@ -257,20 +275,18 @@ class SubmitOutcomeTest(unittest.TestCase):
         """The #14232 defect shape: plan success must not read as delivery success."""
         for status, reason, stage in (
             ("sent", "queue_enter", "uncertain_partial"),
-            ("pending_input", "ok", "uncertain_partial"),
             ("blocked", "turn_start_unconfirmed", "uncertain_partial"),
             ("blocked", "transport_error", "uncertain_partial"),
             ("blocked", "invalid_args", "not_sent"),
         ):
             with self.subTest(status=status, reason=reason):
                 outcome = SubmitOutcome.from_transport(
+                    _outcome(status, reason),
                     plan_intent="worker_dispatch",
                     rail=RAIL_ANCHORED_SEND,
                     anchor_required=True,
                     ticketless=False,
                     delivery_id="qe-abc",
-                    status=status,
-                    reason=reason,
                 )
                 self.assertTrue(outcome.resolved)
                 self.assertFalse(outcome.dispatched)
@@ -281,16 +297,64 @@ class SubmitOutcomeTest(unittest.TestCase):
                     stage != "not_sent", outcome.blind_retry_prohibited
                 )
 
+    def test_a_deliberate_pending_park_is_not_blocked(self) -> None:
+        """Review j#95333 F2: `--mode pending` asked the rail NOT to submit.
+
+        Getting exactly what you asked for is not a block — and because the front-door exit
+        code is now derived from `blocked`, calling it one would make a documented operator
+        path exit non-zero. It is still not `dispatched`, and a blind resend is still
+        prohibited: the body IS parked in the receiver's composer.
+        """
+        outcome = SubmitOutcome.from_transport(
+            _outcome("pending_input", "ok", mode="pending"),
+            plan_intent="worker_dispatch",
+            rail=RAIL_ANCHORED_SEND,
+            anchor_required=True,
+            ticketless=False,
+            delivery_id="qe-abc",
+        )
+        self.assertTrue(outcome.resolved)
+        self.assertFalse(outcome.blocked)
+        self.assertFalse(outcome.dispatched)
+        self.assertIsNone(outcome.blocked_reason)
+        self.assertEqual("uncertain_partial", outcome.injection_stage)
+        self.assertTrue(outcome.blind_retry_prohibited)
+
+    def test_marker_observed_queue_enter_is_confirmed_only_with_a_started_turn(self) -> None:
+        """Review j#95333 F1 at the front door: `queue-enter` + `ok` is not proof of submit."""
+        for runtime_state, expect_dispatched in (
+            ("busy", True),
+            ("awaiting_input", False),
+            ("turn_ended", False),
+        ):
+            with self.subTest(runtime_state=runtime_state):
+                outcome = SubmitOutcome.from_transport(
+                    _outcome(
+                        "sent", "ok",
+                        queue_enter_turn_start_observation={
+                            "runtime_state": runtime_state, "read_ok": True,
+                            "read_reason": None, "poll_attempts": 2,
+                            "observation_kind": "post_choreography_snapshot",
+                            "source": "herdr_agent_get",
+                        },
+                    ),
+                    plan_intent="worker_dispatch",
+                    rail=RAIL_ANCHORED_SEND,
+                    anchor_required=True,
+                    ticketless=False,
+                    delivery_id="qe-abc",
+                )
+                self.assertEqual(expect_dispatched, outcome.dispatched)
+
     def test_absent_transport_outcome_fails_closed_to_uncertain(self) -> None:
         """A rail that returned no structured outcome must not read as delivered."""
         outcome = SubmitOutcome.from_transport(
+            None,
             plan_intent="reply",
             rail=RAIL_ANCHORED_REPLY,
             anchor_required=True,
             ticketless=False,
             delivery_id="qe-abc",
-            status=None,
-            reason=None,
         )
         self.assertFalse(outcome.dispatched)
         self.assertEqual("uncertain_partial", outcome.injection_stage)

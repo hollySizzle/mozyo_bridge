@@ -38,8 +38,10 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injectio
     injection_stage_for,
     injection_stage_record_lines,
     injection_stage_telemetry,
+    injection_stage_for_outcome,
     stage_from_telemetry,
     stage_guidance,
+    turn_start_positively_observed,
 )
 
 
@@ -159,6 +161,182 @@ class InjectionStageTruthTableTest(unittest.TestCase):
         self.assertEqual(injection_stage_for(" sent ", " ok "), STAGE_SUBMITTED_CONFIRMED)
 
 
+def _snapshot(runtime_state: str, *, read_ok: bool = True) -> dict:
+    """A queue-enter post-choreography snapshot in the shape the rail persists."""
+    return {
+        "observation_kind": "post_choreography_snapshot",
+        "source": "herdr_agent_get",
+        "runtime_state": runtime_state,
+        "read_ok": read_ok,
+        "read_reason": None if read_ok else "transport_error",
+        "poll_attempts": 3,
+    }
+
+
+def _run_front_door(status, reason, *, mode="queue-enter", rail_rc=0):
+    """Drive the q-enter front door with a stubbed rail and return ``(exit_code, outcome)``."""
+    import argparse
+
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application import (
+        cli_handoff_q_enter as mod,
+    )
+
+    emitted = []
+
+    def _fake_orchestrate(args, **kwargs):
+        args.delivery_outcome = make_outcome(
+            status=status, reason=reason, receiver="claude", target="%7", anchor=None,
+            mode=mode, kind="implementation_request", notification_marker="[m]",
+            source="redmine",
+        )
+        return rail_rc
+
+    original_emit, original_orchestrate = mod._emit_submit_outcome, mod.orchestrate_handoff
+    mod._emit_submit_outcome = lambda o, *, record_format: emitted.append(o)
+    mod.orchestrate_handoff = _fake_orchestrate
+    try:
+        rc = mod.cmd_handoff_q_enter(argparse.Namespace(
+            intent="worker_dispatch", source="redmine", issue="14232", journal="94508",
+            task_id=None, comment_id=None, anchor_url=None,
+            kind="implementation_request", to="claude", classification=None,
+            record_format="both",
+        ))
+    finally:
+        mod._emit_submit_outcome = original_emit
+        mod.orchestrate_handoff = original_orchestrate
+    return rc, emitted[0]
+
+
+class TurnStartEvidenceTest(unittest.TestCase):
+    """What counts as POSITIVE evidence that the receiver began a turn (j#95333 F1)."""
+
+    def test_only_a_busy_snapshot_or_a_started_event_wait_counts(self):
+        self.assertTrue(turn_start_positively_observed(_snapshot("busy")))
+        self.assertTrue(
+            turn_start_positively_observed(None, {"outcome": "started"})
+        )
+
+    def test_awaiting_input_is_evidence_AGAINST_a_start(self):
+        # The observation module documents it as "delivered, but a turn start was not
+        # observed" — so it is not merely an absent signal.
+        self.assertFalse(turn_start_positively_observed(_snapshot("awaiting_input")))
+
+    def test_turn_ended_is_not_evidence_of_this_send_starting_a_turn(self):
+        # Ambiguous, and the exact post snapshot #14232 j#84870 recorded as the defect.
+        self.assertFalse(turn_start_positively_observed(_snapshot("turn_ended")))
+
+    def test_every_other_signal_fails_closed(self):
+        for observation, event in (
+            (_snapshot("blocked"), None),
+            (_snapshot("unknown"), None),
+            (_snapshot("busy", read_ok=False), None),   # a failed read observed nothing
+            (None, None),                                # no observation at all
+            (None, {"outcome": "delivered_not_started"}),
+            (None, {"outcome": "inject_failed"}),
+            ("not-a-mapping", "not-a-mapping"),
+        ):
+            with self.subTest(observation=observation, event=event):
+                self.assertFalse(turn_start_positively_observed(observation, event))
+
+
+class QueueEnterConfirmationCarveOutTest(unittest.TestCase):
+    """`sent`/`ok` means different things per rail, so the mode is part of the input."""
+
+    def test_queue_enter_ok_needs_positive_turn_start_evidence(self):
+        self.assertEqual(
+            injection_stage_for("sent", "ok", mode="queue-enter",
+                                queue_enter_turn_start_observation=_snapshot("busy")),
+            STAGE_SUBMITTED_CONFIRMED,
+        )
+        for state in ("awaiting_input", "turn_ended", "blocked", "unknown"):
+            with self.subTest(runtime_state=state):
+                self.assertEqual(
+                    injection_stage_for("sent", "ok", mode="queue-enter",
+                                        queue_enter_turn_start_observation=_snapshot(state)),
+                    STAGE_UNCERTAIN_PARTIAL,
+                )
+
+    def test_queue_enter_ok_with_no_observation_at_all_is_unconfirmed(self):
+        # The tmux backend runs no queue-enter snapshot, so this is its normal shape.
+        self.assertEqual(
+            injection_stage_for("sent", "ok", mode="queue-enter"),
+            STAGE_UNCERTAIN_PARTIAL,
+        )
+
+    def test_the_standard_rail_is_untouched_by_the_carve_out(self):
+        # `--mode standard` DID verify a turn start before resolving to `ok`.
+        self.assertEqual(
+            injection_stage_for("sent", "ok", mode="standard"), STAGE_SUBMITTED_CONFIRMED
+        )
+        self.assertEqual(
+            injection_stage_for("sent", "ok", mode="standard",
+                                turn_start_outcome={"outcome": "started"}),
+            STAGE_SUBMITTED_CONFIRMED,
+        )
+
+    def test_an_unset_mode_keeps_the_pre_carve_out_reading(self):
+        """A two-token reader cannot apply the carve-out and must not demote everything.
+
+        Demoting on unknown mode would downgrade every genuinely-confirmed standard send a
+        legacy reader sees. The authoritative call site always passes the mode (see
+        `MakeOutcomeCarriesTheStageTest`), and consumers read the carried result.
+        """
+        self.assertEqual(
+            injection_stage_for("sent", "ok"), STAGE_SUBMITTED_CONFIRMED
+        )
+
+
+class CarveOutIsNotAnOverCorrectionTest(unittest.TestCase):
+    """The j#95333 F1 / F2 fixes must not blanket-demote or blanket-fail.
+
+    Relocated here from the #14232 regressions file: measured GREEN on the reviewed head
+    ``0426e915``, so these assert a contract rather than detect a recurrence (the
+    tests-placement policy's R3-b is a file-unit rule). They exist because a guard that
+    demoted *every* send, or an exit mapping that failed *every* invocation, would satisfy
+    the recurrence pins while being just as wrong.
+    """
+
+    def test_a_receiver_that_did_start_a_turn_is_still_confirmed(self):
+        self.assertEqual(
+            injection_stage_for(
+                "sent", "ok", mode="queue-enter",
+                queue_enter_turn_start_observation=_snapshot("busy"),
+            ),
+            STAGE_SUBMITTED_CONFIRMED,
+        )
+
+    def test_a_confirmed_front_door_delivery_still_exits_zero(self):
+        rc, front = _run_front_door("sent", "ok", mode="standard")
+        self.assertFalse(front.blocked)
+        self.assertTrue(front.dispatched)
+        self.assertEqual(rc, 0)
+
+    def test_a_rail_that_already_failed_keeps_its_own_exit_code(self):
+        rc, _front = _run_front_door("blocked", "transport_error", rail_rc=3)
+        self.assertEqual(rc, 3)
+
+
+class InjectionStageForOutcomeTest(unittest.TestCase):
+    def test_absent_outcome_fails_closed(self):
+        self.assertEqual(injection_stage_for_outcome(None), STAGE_UNCERTAIN_PARTIAL)
+
+    def test_a_carried_stage_wins_over_re_derivation(self):
+        class _Carrying:
+            injection_stage = {"stage": STAGE_NOT_SENT}
+            status, reason, mode = "sent", "ok", "standard"
+
+        self.assertEqual(injection_stage_for_outcome(_Carrying()), STAGE_NOT_SENT)
+
+    def test_an_outcome_without_a_carried_stage_is_re_derived_with_full_context(self):
+        class _Legacy:
+            injection_stage = None
+            status, reason, mode = "sent", "ok", "queue-enter"
+            queue_enter_turn_start_observation = None
+            turn_start_outcome = None
+
+        self.assertEqual(injection_stage_for_outcome(_Legacy()), STAGE_UNCERTAIN_PARTIAL)
+
+
 class BlindRetryPredicateTest(unittest.TestCase):
     def test_only_not_sent_permits_a_blind_retry(self):
         self.assertFalse(blind_retry_prohibited(STAGE_NOT_SENT))
@@ -232,17 +410,18 @@ class MakeOutcomeCarriesTheStageTest(unittest.TestCase):
     hand-picked publish sites were missed.
     """
 
-    def _built(self, status: str, reason: str):
+    def _built(self, status: str, reason: str, *, mode: str = "standard", **extra):
         return make_outcome(
             status=status,
             reason=reason,
             receiver="codex",
             target="%7",
             anchor=None,
-            mode="queue-enter",
+            mode=mode,
             kind="reply",
             notification_marker=None,
             source="redmine",
+            **extra,
         )
 
     def test_stage_is_present_on_sent_pending_and_blocked_outcomes(self):
@@ -260,6 +439,41 @@ class MakeOutcomeCarriesTheStageTest(unittest.TestCase):
                     outcome.injection_stage["blind_retry_prohibited"],
                     blind_retry_prohibited(expected),
                 )
+
+    def test_make_outcome_passes_the_mode_and_telemetry_to_the_authority(self):
+        """The one full-context call: `make_outcome` must not drop the carve-out inputs.
+
+        If it ever passed only the two tokens again, a marker-observed queue-enter send whose
+        receiver never started a turn would be recorded as a confirmed submission — the exact
+        j#95333 F1 defect.
+        """
+        confirmed = self._built(
+            "sent", "ok", mode="queue-enter",
+            queue_enter_turn_start_observation={
+                "runtime_state": "busy", "read_ok": True, "read_reason": None,
+                "poll_attempts": 1, "observation_kind": "post_choreography_snapshot",
+                "source": "herdr_agent_get",
+            },
+        )
+        unconfirmed = self._built(
+            "sent", "ok", mode="queue-enter",
+            queue_enter_turn_start_observation={
+                "runtime_state": "awaiting_input", "read_ok": True, "read_reason": None,
+                "poll_attempts": 4, "observation_kind": "post_choreography_snapshot",
+                "source": "herdr_agent_get",
+            },
+        )
+        self.assertEqual(
+            confirmed.injection_stage["stage"], STAGE_SUBMITTED_CONFIRMED
+        )
+        self.assertEqual(
+            unconfirmed.injection_stage["stage"], STAGE_UNCERTAIN_PARTIAL
+        )
+        # status / reason / next_action_owner stay identical — the #13292 telemetry-only
+        # boundary forbids the observation influencing the wire, and it still does.
+        self.assertEqual(confirmed.status, unconfirmed.status)
+        self.assertEqual(confirmed.reason, unconfirmed.reason)
+        self.assertEqual(confirmed.next_action_owner, unconfirmed.next_action_owner)
 
     def test_stage_survives_the_json_projection(self):
         payload = self._built("blocked", REASON_TRANSPORT_ERROR).to_dict()

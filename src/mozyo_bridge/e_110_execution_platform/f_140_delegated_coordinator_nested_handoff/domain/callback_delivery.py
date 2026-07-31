@@ -223,7 +223,9 @@ _SEND_OUTCOME_BY_STAGE: dict = {
 }
 
 
-def send_outcome_for_delivery(status: str, reason: str) -> str:
+def send_outcome_for_delivery(
+    status: str, reason: str, *, injection_stage: str = ""
+) -> str:
     """Map a handoff ``DeliveryOutcome`` (status, reason) onto a closed send outcome (pure).
 
     Redmine #14232 acceptance 4 ("the callback / outbox sender reuses the same
@@ -256,7 +258,18 @@ def send_outcome_for_delivery(status: str, reason: str) -> str:
        :data:`SEND_NOT_SENT`. Both are documented zero-send refusals ("Refused pre-send (zero
        bytes typed)"), so a bounded retry cannot duplicate; previously they fell to uncertain
        and were therefore never retried at all.
+
+    **``injection_stage`` is the producer's own answer** (Redmine #14232 review j#95333 F1).
+    The sending CLI classifies with the whole outcome — mode and turn-start telemetry included
+    — and carries the result in its structured JSON, so a reader that parsed it should NOT
+    re-derive from the two wire tokens: ``sent`` / ``ok`` alone cannot distinguish a verified
+    standard submission from a marker-observed ``queue-enter`` send that never started a turn.
+    When it is supplied and recognised it wins; otherwise this falls back to the two-token
+    classification, which keeps a legacy / unparseable payload working and still fails closed.
     """
+    carried = str(injection_stage or "").strip()
+    if carried in _SEND_OUTCOME_BY_STAGE:
+        return _SEND_OUTCOME_BY_STAGE[carried]
     return _SEND_OUTCOME_BY_STAGE[injection_stage_for(status, reason)]
 
 

@@ -1,12 +1,18 @@
 """Recurrence pins for Redmine #14232 handoff partial-delivery typed outcome.
 
-Every test here detects the return of one of the three residual defects #14232 j#84877
-recorded against the daily-default handoff rails. Each was reproduced RED on the lane base
-``a83587a3`` before the fix; none of them asserts a general module contract (the new
-injection-stage vocabulary's own contract lives in
-``tests/unit/e_110_execution_platform/f_130_handoff_routing/test_handoff_injection_stage.py``).
+Every test here detects the return of one of the **five** defects this issue fixed: the three
+residual defects #14232 j#84877 recorded against the daily-default handoff rails (1-3, each
+reproduced non-passing on the lane base ``a83587a3``), plus the two the same-lane review
+j#95333 found in the first fix (4-5, each reproduced non-passing on the reviewed head
+``0426e915``).
 
-The three symptoms, and why each is a #14232 defect rather than a design preference:
+None of them asserts a general module contract. The injection-stage vocabulary's own contract
+— including the guards that the 4-5 fixes are not *over*-corrections, which are green on both
+heads — lives in
+``tests/unit/e_110_execution_platform/f_130_handoff_routing/test_handoff_injection_stage.py``,
+because the tests-placement policy's R3-b is a file-unit rule.
+
+The five symptoms, and why each is a #14232 defect rather than a design preference:
 
 1. **A transport exception escaped the high-level handoff boundary.** Under
    ``terminal_transport.backend: herdr`` the shim
@@ -34,6 +40,23 @@ The three symptoms, and why each is a #14232 defect rather than a design prefere
    as "not typed at all" (j#84877 required correction 2), and the callback / outbox retry
    authority disagreed with the handoff positive-delivery gate on ``sent`` / ``queue_enter``
    (j#84877 required correction 3 / acceptance 4).
+
+4. **A marker-observed ``queue-enter`` send was reported as a confirmed submission.** The
+   first fix removed the *reason*-level optimism (``sent``/``queue_enter``) but kept a
+   *rail*-level one: on ``queue-enter`` a landed marker resolves to ``sent``/``ok``, and that
+   rail runs **no turn-start gate** — ``ok`` there means only "the marker landed and Enter was
+   pressed". Classifying from ``(status, reason)`` alone therefore claimed
+   ``submitted_confirmed`` / ``dispatched=true`` even when the outcome's own snapshot said
+   ``awaiting_input`` ("delivered, but a turn start was not observed") or ``turn_ended`` — the
+   exact post snapshot j#84870 recorded as the residual defect.
+
+5. **A ``blocked`` front-door terminal still exited 0.** j#94407's acceptance names *front
+   door / delivery record / exit code / callback retry authority* as the four surfaces that
+   must converge on one classification; the first fix converged three. A record reading
+   ``blocked=True dispatched=False`` alongside shell success is a false success for every
+   automated caller. (The same fix narrowed a defect the first fix introduced: it derived
+   ``blocked`` from ``not delivered``, which swept an explicitly requested ``--mode pending``
+   park in with the failures.)
 """
 from __future__ import annotations
 
@@ -57,6 +80,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injectio
     STAGE_SUBMITTED_CONFIRMED,
     STAGE_UNCERTAIN_PARTIAL,
     injection_stage_for,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.delivery_outcome_gate import (
+    delivery_was_positive,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.q_enter import (
     RESIDUE_NOT_TYPED,
@@ -497,6 +523,146 @@ class PostInjectionOutcomeIsNotClassifiedAsNotTypedTest(unittest.TestCase):
         self.assertNotEqual(
             send_outcome_for_delivery("sent", "queue_enter"), SEND_DELIVERED
         )
+
+
+class MarkerObservedQueueEnterIsNotAConfirmedSubmissionTest(unittest.TestCase):
+    """Defect 4 (review j#95333 finding 1): a second optimistic delivered-ization.
+
+    R1 fixed the *reason*-level optimism (`sent`/`queue_enter`) but left the *rail*-level one:
+    a ``queue-enter`` send whose landing marker WAS observed reports ``sent``/``ok``, and R1
+    read that as ``submitted_confirmed`` / ``dispatched=true``. But the queue-enter rail runs
+    no turn-start gate at all — ``ok`` there means only "the marker landed and Enter was
+    pressed". Measured on `0426e915`, all four runtime snapshots (including ``awaiting_input``,
+    which the observation module documents as *"delivered, but a turn start was not
+    observed"*, and ``turn_ended``, the exact post snapshot j#84870 recorded as the residual
+    defect) produced ``stage=submitted_confirmed dispatched=True delivery_was_positive=True``.
+    """
+
+    def _built(self, runtime_state=None, *, mode=_MODE_QUEUE_ENTER):
+        observation = None
+        if runtime_state is not None:
+            observation = {
+                "observation_kind": "post_choreography_snapshot",
+                "source": "herdr_agent_get",
+                "runtime_state": runtime_state,
+                "read_ok": True,
+                "read_reason": None,
+                "poll_attempts": 3,
+            }
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+            make_outcome,
+        )
+
+        return make_outcome(
+            status="sent", reason="ok", receiver="codex", target="w4B:p4T",
+            anchor=RedmineAnchor(issue="14232", journal="94508"), mode=mode,
+            kind="review_request", notification_marker="[m]", source="redmine",
+            queue_enter_turn_start_observation=observation,
+        )
+
+    def test_a_receiver_that_never_started_a_turn_is_not_confirmed(self):
+        for runtime_state in ("awaiting_input", "turn_ended"):
+            with self.subTest(runtime_state=runtime_state):
+                outcome = self._built(runtime_state)
+                self.assertEqual(
+                    outcome.injection_stage["stage"], STAGE_UNCERTAIN_PARTIAL
+                )
+                args = argparse.Namespace()
+                args.delivery_outcome = outcome
+                self.assertFalse(delivery_was_positive(args))
+
+    def test_the_front_door_does_not_report_it_dispatched(self):
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.q_enter import (
+            RAIL_ANCHORED_SEND,
+            SubmitOutcome,
+        )
+
+        front = SubmitOutcome.from_transport(
+            self._built("awaiting_input"),
+            plan_intent="worker_dispatch", rail=RAIL_ANCHORED_SEND,
+            anchor_required=True, ticketless=False, delivery_id="qe-x",
+        )
+        self.assertFalse(front.dispatched)
+        self.assertEqual(front.injection_stage, STAGE_UNCERTAIN_PARTIAL)
+
+    def test_the_composer_residue_is_not_reported_cleared(self):
+        """The same misreading on the residue axis: an absorbed Enter leaves the body typed."""
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.q_enter import (
+            RESIDUE_CLEARED,
+        )
+
+        outcome = self._built("awaiting_input")
+        self.assertNotEqual(
+            classify_composer_residue(
+                outcome.status, outcome.reason, mode=outcome.mode,
+                queue_enter_turn_start_observation=(
+                    outcome.queue_enter_turn_start_observation
+                ),
+            ),
+            RESIDUE_CLEARED,
+        )
+
+
+class FrontDoorBlockedTerminalDoesNotExitZeroTest(unittest.TestCase):
+    """Defect 5 (review j#95333 finding 2): the exit code never joined the convergence.
+
+    j#94407's acceptance names *front door / delivery record / exit code / callback retry
+    authority* as the four surfaces that must converge on one classification. R1 converged
+    three: measured on `0426e915`, a front-door record reading ``blocked=True
+    dispatched=False stage=uncertain_partial`` still exited **0**, so every automated caller
+    saw shell success for an unconfirmed delivery.
+    """
+
+    def _run(self, status, reason, *, mode=_MODE_QUEUE_ENTER, rail_rc=0):
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application import (
+            cli_handoff_q_enter as mod,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+            make_outcome,
+        )
+
+        emitted: List[object] = []
+
+        def _fake_orchestrate(args, **kwargs):
+            args.delivery_outcome = make_outcome(
+                status=status, reason=reason, receiver="claude", target="%7",
+                anchor=RedmineAnchor(issue="14232", journal="94508"), mode=mode,
+                kind="implementation_request", notification_marker="[m]", source="redmine",
+            )
+            return rail_rc
+
+        original_emit, original_orchestrate = (
+            mod._emit_submit_outcome, mod.orchestrate_handoff
+        )
+        mod._emit_submit_outcome = lambda o, *, record_format: emitted.append(o)
+        mod.orchestrate_handoff = _fake_orchestrate
+        try:
+            rc = mod.cmd_handoff_q_enter(argparse.Namespace(
+                intent="worker_dispatch", source="redmine", issue="14232",
+                journal="94508", task_id=None, comment_id=None, anchor_url=None,
+                kind="implementation_request", to="claude", classification=None,
+                record_format="both",
+            ))
+        finally:
+            mod._emit_submit_outcome = original_emit
+            mod.orchestrate_handoff = original_orchestrate
+        return rc, emitted[0]
+
+    def test_an_unconfirmed_queue_enter_delivery_does_not_exit_zero(self):
+        for reason in ("ok", "queue_enter"):
+            with self.subTest(reason=reason):
+                rc, front = self._run("sent", reason)
+                self.assertTrue(front.blocked)
+                self.assertNotEqual(
+                    rc, 0, "a blocked front-door terminal must not report shell success"
+                )
+
+    def test_a_deliberate_pending_park_still_exits_zero(self):
+        """`--mode pending` asked the rail not to submit; that is not a blocked terminal."""
+        rc, front = self._run("pending_input", "ok", mode="pending")
+        self.assertFalse(front.blocked)
+        self.assertFalse(front.dispatched)
+        self.assertEqual(rc, 0)
 
 
 if __name__ == "__main__":  # pragma: no cover - manual runner parity

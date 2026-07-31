@@ -145,6 +145,13 @@ def configure_q_enter_parser(parser_: argparse.ArgumentParser) -> None:
     )
 
 
+#: The exit code a front-door ``blocked`` terminal returns when the rail itself exited 0
+#: (Redmine #14232 review j#95333 F2). Matches ``die``'s code so every non-delivered front-door
+#: terminal — the plan fail-closes, a transport block, and an unconfirmed submission — is one
+#: shell-visible failure class.
+FRONT_DOOR_BLOCKED_EXIT_CODE = 1
+
+
 def _emit_submit_outcome(outcome: SubmitOutcome, *, record_format: str) -> None:
     """Emit the front-door (workflow) result, separate from the transport outcome.
 
@@ -281,19 +288,30 @@ def cmd_handoff_q_enter(args: argparse.Namespace) -> int:
     try:
         rc = _run_resolved_rail(args, plan)
     finally:
-        outcome = getattr(args, "delivery_outcome", None)
-        _emit_submit_outcome(
-            SubmitOutcome.from_transport(
-                plan_intent=plan.intent,
-                rail=plan.rail,
-                anchor_required=plan.anchor_required,
-                ticketless=plan.ticketless,
-                delivery_id=delivery_id,
-                status=getattr(outcome, "status", None),
-                reason=getattr(outcome, "reason", None),
-            ),
-            record_format=record_format,
+        front_door = SubmitOutcome.from_transport(
+            getattr(args, "delivery_outcome", None),
+            plan_intent=plan.intent,
+            rail=plan.rail,
+            anchor_required=plan.anchor_required,
+            ticketless=plan.ticketless,
+            delivery_id=delivery_id,
         )
+        _emit_submit_outcome(front_door, record_format=record_format)
+    # Redmine #14232 review j#95333 F2: reconcile the process exit code with the front-door
+    # classification. j#94407's acceptance names the exit code as one of the four surfaces that
+    # must converge, and R1 converged the other three: a record that said `blocked` while the
+    # shell reported success left a false success for every automated caller.
+    #
+    # Scope is deliberately the q-enter FRONT DOOR only. `handoff send`'s own rc for a
+    # marker-unobserved `queue_enter` stays 0: #13262 reserved that rail contract ("a
+    # queue-enter contract change would need its own design record"), and this issue does not
+    # hold that authority. The front door is a different surface — #12705 built it so an LLM
+    # reads ONE structured result — so converging it here is in scope and changes no rail.
+    #
+    # `pending_input` is not blocked (see `from_transport`), so an explicitly requested
+    # `--mode pending` park still exits 0. A rail that already died keeps its own non-zero rc.
+    if front_door.blocked and rc == 0:
+        return FRONT_DOOR_BLOCKED_EXIT_CODE
     return rc
 
 

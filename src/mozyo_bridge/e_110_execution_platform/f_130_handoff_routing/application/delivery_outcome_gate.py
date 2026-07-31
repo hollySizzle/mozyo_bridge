@@ -26,7 +26,7 @@ from typing import Any, Callable
 
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (
     STAGE_SUBMITTED_CONFIRMED,
-    injection_stage_for,
+    injection_stage_for_outcome,
 )
 
 #: The only transport result that counts as a positive delivery: the send landed AND the landing
@@ -63,15 +63,15 @@ def delivery_was_positive(args: argparse.Namespace) -> bool:
     if outcome is None:
         return False
     # Redmine #14232: evaluate the SHARED injection-stage authority rather than re-testing the
-    # two tokens locally. Behaviour is unchanged (``sent`` + ``ok`` is the only
-    # ``submitted_confirmed`` cell) — what changes is that this gate and the callback / outbox
-    # retry authority can no longer answer "was it delivered?" differently.
-    return (
-        injection_stage_for(
-            getattr(outcome, "status", ""), getattr(outcome, "reason", "")
-        )
-        == STAGE_SUBMITTED_CONFIRMED
-    )
+    # two tokens locally, so this gate and the callback / outbox retry authority can no longer
+    # answer "was it delivered?" differently.
+    #
+    # Review j#95333 F1: read the WHOLE outcome, not the two tokens. A marker-observed
+    # ``queue-enter`` send also reports ``sent`` / ``ok``, but that rail runs no turn-start
+    # gate — so the tokens alone would let this predicate confirm a delivery whose own
+    # telemetry says the receiver never started a turn. That is a stricter reading of the same
+    # predicate, in the same fail-closed direction #13583 chose for ``queue_enter``.
+    return injection_stage_for_outcome(outcome) == STAGE_SUBMITTED_CONFIRMED
 
 
 def make_publishing_emitter(publish: Callable[[Any], None], emit):

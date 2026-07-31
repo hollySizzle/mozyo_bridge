@@ -51,6 +51,13 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Optional
 
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (
+    MODE_QUEUE_ENTER,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (
+    RUNTIME_BUSY,
+)
+
 # --- The closed injection-stage vocabulary (j#84877 required correction 2). ---------
 STAGE_NOT_SENT = "not_sent"
 STAGE_UNCERTAIN_PARTIAL = "uncertain_partial"
@@ -203,11 +210,63 @@ _STATUS_SENT = "sent"
 _STATUS_PENDING_INPUT = "pending_input"
 _STATUS_BLOCKED = "blocked"
 
+#: The herdr event rail's confirmed-start outcome token (``...turn_start_rail.OUTCOME_STARTED``).
+#: Kept as a literal so this module stays a leaf over the adapter package; the sibling
+#: ``RUNTIME_BUSY`` is imported because ``agent_state`` is already a leaf-safe constants module.
+_TURN_START_OUTCOME_STARTED = "started"
 
-def injection_stage_for(status: object, reason: object) -> str:
-    """Classify a handoff ``(status, reason)`` into one :data:`INJECTION_STAGES` token (pure).
 
-    - ``sent`` + ``ok`` -> :data:`STAGE_SUBMITTED_CONFIRMED` (the only confirmed submission);
+def turn_start_positively_observed(
+    queue_enter_turn_start_observation: object = None,
+    turn_start_outcome: object = None,
+) -> bool:
+    """True only on **positive** evidence that the receiver began a turn (pure).
+
+    Redmine #14232 review j#95333 finding 1. Two independent signals count, and nothing else:
+
+    - the herdr **event** rail's armed ``wait agent-status --status working`` transition
+      (``turn_start_outcome.outcome == "started"``) — a causally-attributable observation;
+    - the queue-enter **post-choreography snapshot** reporting a receiver that is actually
+      producing a turn (``read_ok`` and ``runtime_state == "busy"``).
+
+    Every other snapshot state is explicitly NOT evidence of a start, and the reason each is
+    excluded matters:
+
+    - ``awaiting_input`` — the observation module documents it as *"receiver is idle — no turn
+      was observed starting within the window (delivered, but a turn start was not observed)"*.
+      That is positive evidence AGAINST a start, not an absence of evidence.
+    - ``turn_ended`` — ambiguous between "a fast turn ran and finished" and "the previous turn's
+      end state never changed". It is also the exact post snapshot #14232 j#84870 recorded as the
+      residual defect (``dispatched=true`` alongside a receiver that never started), so it fails
+      closed.
+    - ``blocked`` / ``unknown`` / a failed read / no observation at all — nothing was observed.
+
+    Fail-closed by construction: the default answer is ``False``.
+    """
+    if isinstance(turn_start_outcome, dict):
+        if str(turn_start_outcome.get("outcome") or "") == _TURN_START_OUTCOME_STARTED:
+            return True
+    if isinstance(queue_enter_turn_start_observation, dict):
+        observation = queue_enter_turn_start_observation
+        if bool(observation.get("read_ok")) and (
+            str(observation.get("runtime_state") or "") == RUNTIME_BUSY
+        ):
+            return True
+    return False
+
+
+def injection_stage_for(
+    status: object,
+    reason: object,
+    *,
+    mode: object = None,
+    queue_enter_turn_start_observation: object = None,
+    turn_start_outcome: object = None,
+) -> str:
+    """Classify a handoff delivery outcome into one :data:`INJECTION_STAGES` token (pure).
+
+    - ``sent`` + ``ok`` -> :data:`STAGE_SUBMITTED_CONFIRMED`, **except** on the relaxed
+      ``queue-enter`` rail without positive turn-start evidence (see below);
     - ``sent`` + ``queue_enter`` -> :data:`STAGE_UNCERTAIN_PARTIAL` (Enter was pressed but
       landing was never pre-confirmed, so submission is unverified);
     - ``pending_input`` -> :data:`STAGE_UNCERTAIN_PARTIAL` (the body is parked in the
@@ -216,14 +275,73 @@ def injection_stage_for(status: object, reason: object) -> str:
     - everything else, including any unrecognised status / reason ->
       :data:`STAGE_UNCERTAIN_PARTIAL` (fail-closed: never blind-retry what you cannot
       classify).
+
+    **The queue-enter carve-out (Redmine #14232 review j#95333 finding 1).** ``sent`` + ``ok``
+    means different things on different rails, so the ``(status, reason)`` pair alone cannot
+    answer this module's question:
+
+    - on ``--mode standard`` the rail *verified a turn start* before resolving to ``ok`` (the
+      capture-based observation, or the herdr event rail's ``started``), so it is a genuine
+      confirmed submission;
+    - on the daily-default ``queue-enter`` rail ``ok`` only means **the landing marker was
+      observed and Enter was pressed** — that rail deliberately runs no turn-start gate
+      (its snapshot is additive telemetry). A receiver whose composer took the text but whose
+      Enter was absorbed reports exactly this outcome.
+
+    Reading ``ok`` as confirmed on queue-enter was therefore the same optimistic
+    delivered-ization the issue's Non-goals prohibit, in a second place: it claimed a
+    confirmed submission while the outcome's own telemetry said ``awaiting_input`` ("delivered,
+    but a turn start was not observed"). A queue-enter ``ok`` is now confirmed only with
+    positive evidence from :func:`turn_start_positively_observed`.
+
+    ``mode`` / ``queue_enter_turn_start_observation`` / ``turn_start_outcome`` are optional
+    because a reader may hold nothing but the two wire tokens. **Every caller that can see the
+    outcome MUST pass them** — :func:`injection_stage_telemetry` (and therefore
+    ``make_outcome``, which runs it on every terminal path) always does, so the authoritative
+    classification is computed once, with full context, and carried on the outcome for
+    consumers to read rather than re-derive (:func:`stage_from_telemetry`). An unset ``mode``
+    cannot apply the carve-out and keeps the pre-carve-out reading: demoting on unknown mode
+    would wrongly downgrade every genuinely-confirmed standard send a two-token reader sees.
     """
     status_s = str(status or "").strip()
     reason_s = str(reason or "").strip()
     if status_s == _STATUS_SENT and reason_s == REASON_OK:
+        if str(mode or "").strip() == MODE_QUEUE_ENTER and not (
+            turn_start_positively_observed(
+                queue_enter_turn_start_observation, turn_start_outcome
+            )
+        ):
+            return STAGE_UNCERTAIN_PARTIAL
         return STAGE_SUBMITTED_CONFIRMED
     if status_s == _STATUS_BLOCKED and reason_s in PRE_INJECTION_BLOCKED_REASONS:
         return STAGE_NOT_SENT
     return STAGE_UNCERTAIN_PARTIAL
+
+
+def injection_stage_for_outcome(outcome: object) -> str:
+    """The stage for a whole :class:`...handoff.DeliveryOutcome` (pure, fail-closed).
+
+    Prefers the stage the producer already derived and carried on the outcome
+    (``make_outcome`` computes it with full context), and falls back to re-deriving from the
+    outcome's own fields when it carries none — a hand-built or legacy outcome. ``None``
+    (no outcome at all: an early return, or a caller that never sent) is
+    :data:`STAGE_UNCERTAIN_PARTIAL`, because a delivery you cannot see is not one you may
+    claim.
+    """
+    if outcome is None:
+        return STAGE_UNCERTAIN_PARTIAL
+    carried = stage_from_telemetry(getattr(outcome, "injection_stage", None))
+    if carried is not None:
+        return carried
+    return injection_stage_for(
+        getattr(outcome, "status", None),
+        getattr(outcome, "reason", None),
+        mode=getattr(outcome, "mode", None),
+        queue_enter_turn_start_observation=getattr(
+            outcome, "queue_enter_turn_start_observation", None
+        ),
+        turn_start_outcome=getattr(outcome, "turn_start_outcome", None),
+    )
 
 
 def blind_retry_prohibited(stage: object) -> bool:
@@ -264,7 +382,14 @@ def stage_guidance(stage: object) -> str:
     return _STAGE_GUIDANCE.get(str(stage or "").strip(), "")
 
 
-def injection_stage_telemetry(status: object, reason: object) -> dict[str, Any]:
+def injection_stage_telemetry(
+    status: object,
+    reason: object,
+    *,
+    mode: object = None,
+    queue_enter_turn_start_observation: object = None,
+    turn_start_outcome: object = None,
+) -> dict[str, Any]:
     """The machine-readable injection-stage projection carried on a delivery outcome (pure).
 
     Tokens + a bool + a fixed guidance string only — no free text, no absolute paths, no raw
@@ -272,8 +397,19 @@ def injection_stage_telemetry(status: object, reason: object) -> dict[str, Any]:
     :class:`...domain.handoff.DeliveryOutcome` (derived in ``make_outcome``) so no terminal
     path can forget it, which is the same "publication is a property of emitting" posture the
     #13583 delivery-outcome gate adopted after hand-picked publish sites were missed.
+
+    Redmine #14232 review j#95333 finding 1: ``make_outcome`` passes the mode and whichever
+    turn-start telemetry the rail produced, so **this is the one call that always classifies
+    with full context**. Consumers then read the carried result instead of re-deriving from
+    the two wire tokens (which cannot resolve the queue-enter carve-out).
     """
-    stage = injection_stage_for(status, reason)
+    stage = injection_stage_for(
+        status,
+        reason,
+        mode=mode,
+        queue_enter_turn_start_observation=queue_enter_turn_start_observation,
+        turn_start_outcome=turn_start_outcome,
+    )
     return {
         "stage": stage,
         "blind_retry_prohibited": blind_retry_prohibited(stage),
@@ -333,8 +469,10 @@ __all__: Iterable[str] = (
     "STAGE_UNCERTAIN_PARTIAL",
     "blind_retry_prohibited",
     "injection_stage_for",
+    "injection_stage_for_outcome",
     "injection_stage_record_lines",
     "injection_stage_telemetry",
     "stage_from_telemetry",
     "stage_guidance",
+    "turn_start_positively_observed",
 )

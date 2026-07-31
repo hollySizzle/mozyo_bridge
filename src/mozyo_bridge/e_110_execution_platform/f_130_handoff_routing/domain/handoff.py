@@ -2155,7 +2155,7 @@ def make_outcome(
         turn_start_outcome=turn_start_outcome,
         queue_enter_turn_start_observation=queue_enter_turn_start_observation,
         startup_admission=startup_admission,
-        injection_stage=injection_stage_telemetry(status, reason),  # Redmine #14232
+        injection_stage=injection_stage_telemetry(status, reason, mode=mode, queue_enter_turn_start_observation=queue_enter_turn_start_observation, turn_start_outcome=turn_start_outcome),  # noqa: E501 - Redmine #14232 + review j#95333 F1: the ONE full-context classification (the mode and both turn-start telemetries resolve the queue-enter `ok` cell)
     )
 
 
