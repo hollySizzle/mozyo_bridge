@@ -4,28 +4,41 @@ Owner intent (#14763 description; disposition j#94798, Gate j#95316): a managed
 ``delegated_coordinator`` must start as ``gpt-5.6-sol`` at reasoning effort ``high``, and
 that has to be provable from the effective launch argv — not asserted from the config text.
 
-The defect this pins is a *lane-class inheritance illusion*. ``.mozyo-bridge/config.yaml``
-declared the coordination profile's model only under ``launch_argv.default``, and lane
-classes do NOT inherit (``AgentsTopologyConfig.resolve_launch_argv_for_role`` returns the
-tokens of the matching lane class or ``[]`` — the #13451 invariant). A ``delegated_coordinator``
-is a named lane, and ``herdr_session_start`` derives ``lane_class = "default" if lane_id ==
-DEFAULT_LANE else "sublane"``, so it resolved the *sublane* row: effort only, no model. The
-model the config appeared to state was never on that launch.
+Causing commit: ``ceab289e`` ("Pin Codex coordinator/default lane to gpt-5.6-sol; keep
+sublane on Codex default", #13451). It put ``--model gpt-5.6-sol`` on the Codex *default*
+lane class and left the *sublane* row carrying reasoning effort alone; the v1 -> v2 migration
+carried that exact shape into ``agents.profiles.coordination``.
 
-Two layers are checked, and neither restates the other:
+The symptom that shape produces is a *lane-class inheritance illusion*. Lane classes do NOT
+inherit (``AgentsTopologyConfig.resolve_launch_argv_for_role`` returns the tokens of the
+matching lane class or ``[]`` — the #13451 invariant). A ``delegated_coordinator`` is a named
+lane, and ``herdr_session_start`` derives ``lane_class = "default" if lane_id == DEFAULT_LANE
+else "sublane"``, so it resolved the *sublane* row: effort only, no model. The model the
+config appeared to state was never on that launch.
 
-1. **Config resolution** — over the profiles/roles the committed config actually resolves,
-   never a hand-listed set. The generalized rule (`every declared lane class pins a model`)
-   is what catches the defect *class*; a repo can only trip it by declaring a lane class that
-   silently borrows another one's model, which is the bug that happened here.
+Every test below re-detects that one symptom, at one of two layers, and neither layer
+restates the other:
+
+1. **Config resolution** — over the coordination roles and the coordination profile's own
+   declared lane classes, derived from what the committed config resolves rather than a
+   hand-listed set. Scope is the coordination profile: that is where the symptom lives, and
+   whether OTHER profiles must also pin a model is a repo-wide policy question this file does
+   not decide (Review j#95508 finding 2; verdict j#95511).
 2. **Effective managed launch argv** — the committed config is driven through the real
    ``prepare_session`` launch chain against a fake herdr, and the assertion reads the argv
    herdr was actually asked to start. Layer 1 passing cannot make layer 2 pass: the launch
    path resolves its own lane class, and a config that pins the model on the wrong row lands
    an argv without it.
 
+The counting oracle carries its own teeth test. An earlier revision folded the argv into a
+SET of ``(flag, value)`` pairs, so a repeated *identical* ``--model`` collapsed to one and the
+"exactly one" assertion passed on argv that declares the flag twice — the detector for this
+symptom could go false-green (Review j#95508 finding 1; verdict j#95511). Multiplicity is
+preserved now, and a test pins that it is.
+
 The owner-pinned model/effort literals appear here because the owner named them; everything
-else (which roles coordinate, which lane classes exist) is derived from the config.
+else (which roles coordinate, which lane classes the coordination profile declares) is
+derived from the config.
 """
 
 from __future__ import annotations
@@ -92,8 +105,15 @@ _FAST_PROBE = StartupProbe(polls=1, interval=0.0, sleeper=lambda _seconds: None)
 
 
 def _flag_pairs(argv):
-    """The ``(flag, value)`` pairs of ``argv``, so an assertion pins adjacency, not presence."""
-    return {
+    """The ``(flag, value)`` pairs of ``argv``, so an assertion pins adjacency, not presence.
+
+    Returns a LIST, in argv order, with multiplicity preserved. A set would silently fold a
+    repeated identical pair into one, which is how the "exactly one ``--model``" check below
+    went false-green before Review j#95508 finding 1: an argv declaring the same model flag
+    twice counted as one. Membership assertions read the same either way; only counting
+    depends on multiplicity, and counting is what the symptom detector rests on.
+    """
+    return [
         (tok, argv[i + 1])
         for i, tok in enumerate(argv)
         # `--` is the herdr/provider separator, not a flag; pairing it would make the
@@ -102,7 +122,16 @@ def _flag_pairs(argv):
         and tok != "--"
         and i + 1 < len(argv)
         and not argv[i + 1].startswith("--")
-    }
+    ]
+
+
+def _model_tokens(argv):
+    """Every value bound to ``--model`` in ``argv``, with repeats kept.
+
+    A bare trailing ``--model`` binds no value and so contributes nothing: a flag without a
+    value pins no model, which is the condition this file exists to catch.
+    """
+    return [value for flag, value in _flag_pairs(argv) if flag == MODEL_FLAG]
 
 
 def _committed_config():
@@ -141,30 +170,54 @@ class CommittedCoordinationLaunchArgvTest(unittest.TestCase):
                         f"{flag} {value}",
                     )
 
-    def test_every_declared_lane_class_pins_its_model_explicitly(self) -> None:
-        # The defect CLASS, stated once for the whole config: lane classes do not inherit
-        # (`resolve_launch_argv_for_role` returns the matching row or `[]`), so a declared
-        # lane class that omits `--model` launches on whatever the provider CLI defaults to
-        # — while the config reads as though a model were pinned. This is exactly how the
-        # coordination sublane lost `gpt-5.6-sol`.
-        declared = [
-            (profile.name, lane_class, tokens)
-            for profile in self.topology.resolved_profiles().values()
-            for lane_class, tokens in profile.launch_argv
-        ]
-        self.assertTrue(declared, "committed config declares no launch argv at all")
-        for name, lane_class, tokens in sorted(declared):
-            with self.subTest(profile=name, lane_class=lane_class):
-                pairs = _flag_pairs(list(tokens))
-                models = [value for flag, value in pairs if flag == MODEL_FLAG]
+    def test_the_coordination_profile_pins_a_model_on_every_lane_class_it_declares(
+        self,
+    ) -> None:
+        # The symptom, stated over the surface it actually occupied. The coordination
+        # profile declared TWO lane classes and put `--model` on only one of them; because
+        # lane classes do not inherit (`resolve_launch_argv_for_role` returns the matching
+        # row or `[]`), the other row launched on whatever the provider CLI defaults to
+        # while the config still read as though a model were pinned.
+        #
+        # Scope is deliberately this profile. Requiring the same of every profile in the
+        # repo would be a new repo-wide rule about future provider-default choices, which
+        # no owner decision states and which this regression file has no standing to
+        # introduce (Review j#95508 finding 2 / verdict j#95511).
+        profile = self.topology.resolved_profiles()[DEFAULT_PROFILE_COORDINATION]
+        declared = sorted(profile.launch_argv)
+        self.assertTrue(
+            declared,
+            f"profile {DEFAULT_PROFILE_COORDINATION!r} declares no launch argv at all",
+        )
+        for lane_class, tokens in declared:
+            with self.subTest(lane_class=lane_class):
+                models = _model_tokens(list(tokens))
                 self.assertEqual(
                     1,
                     len(models),
-                    f"profile {name!r} lane_class {lane_class!r} declares {list(tokens)!r}; "
-                    f"a lane class must pin exactly one {MODEL_FLAG} (nothing is inherited "
-                    f"from another lane class)",
+                    f"profile {DEFAULT_PROFILE_COORDINATION!r} lane_class {lane_class!r} "
+                    f"declares {list(tokens)!r}; it must pin exactly one {MODEL_FLAG} "
+                    f"(nothing is inherited from another lane class)",
                 )
                 self.assertTrue(models[0], "the pinned model token must not be empty")
+
+    def test_the_model_count_oracle_does_not_fold_a_repeated_identical_flag(self) -> None:
+        # Teeth for the counter the test above rests on. Folding the argv into a SET of
+        # (flag, value) pairs made a repeated IDENTICAL `--model` count as one, so argv
+        # declaring the flag twice satisfied "exactly one" — the symptom detector itself
+        # could go false-green (Review j#95508 finding 1 / verdict j#95511). A repeat with
+        # a DIFFERENT value was already counted twice, which is why the gap survived: only
+        # the identical case folded.
+        repeated_identical = ["--model", "gpt-5.6-sol", "--model", "gpt-5.6-sol"]
+        self.assertEqual(
+            ["gpt-5.6-sol", "gpt-5.6-sol"],
+            _model_tokens(repeated_identical),
+            "a repeated identical --model must be counted twice, not folded to one",
+        )
+        repeated_conflicting = ["--model", "gpt-5.6-sol", "--model", "some-other-model"]
+        self.assertEqual(2, len(_model_tokens(repeated_conflicting)))
+        # A flag with no value binds no model, so it must not be counted as pinning one.
+        self.assertEqual([], _model_tokens(["--config", "x=1", "--model"]))
 
 
 class EffectiveManagedLaunchArgvTest(unittest.TestCase):
