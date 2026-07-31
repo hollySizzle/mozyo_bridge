@@ -1835,24 +1835,46 @@ Three contracts follow, and they are deliberately separate:
    accepting a provider prompt, and would also silence the split instead of surfacing it.
 2. **The authority split itself is classified, fail-closed, before any side effect.**
    `agent_provider_update_authority` compares the managed `exec_target` against the
-   *distinct trusted-`PATH` resolutions* — the updater's reach — and yields
-   `aligned` / `split` / `unknown`. `unknown` never decays to `aligned`: an unreadable
-   `PATH`, an unresolvable provider, or no `PATH` resolution at all are all states in
-   which the updater's target is undescribable, and "the updater has nowhere to write" is
-   a guess. A second axis re-verifies a lane's exact executable identity (realpath **and**
+   install roots the provider's own updater was **positively resolved** to write to, and
+   yields `aligned` / `split` / `unknown`.
+
+   The updater's write target is *supplied*, never inferred (review j#95741 F2). The
+   first cut derived it from the distinct trusted-`PATH` resolutions of the provider's
+   *command*, and that is a proxy the fact cannot be reduced to: an update runs the
+   package manager, which writes to **its** global prefix, and where the binary sits on
+   `PATH` is an independently determined fact. A host with one matching `codex` on `PATH`
+   but a `PATH` `npm` owning a different prefix was classified `aligned` — and before the
+   update the second install does not exist at all, so no enumeration of the provider
+   command could ever have observed the split it was meant to detect. Establishing a
+   package manager's prefix means asking that package manager; mozyo does not guess it,
+   so the honest and common verdict is `unknown`, which never decays to `aligned`.
+
+   A second axis re-verifies a lane's exact executable identity (realpath **and**
    version), because path pinning alone cannot see an in-place rewrite and version pinning
    alone cannot see the split. A same-version reinstall is a *match*, not a drift —
    nothing the lane runs changed.
-3. **A split lane is never healthy residency, and the preflight is what stops it.** The
-   `startup_health` classifier gains `provider_update_authority_split`,
+3. **A split lane is fenced at the send, and is never healthy residency.** The action-time
+   `evaluate_update_authority` preflight runs inside the shared pre-send gate
+   (`admit_receiver_startup_or_die`), immediately after the startup screen is found clear
+   and before the first injection. A **positively demonstrated** wrong binary — `split`
+   or `drifted` — refuses the send with `receiver_update_authority_split`, zero-send, and
+   the refusal is ledgered like every other terminal outcome.
+
+   `unknown` deliberately does **not** refuse a send, and the asymmetry is the point.
+   Once the F2 proxy was removed, `unknown` became the honest verdict for any host whose
+   package-manager prefix nobody has positively resolved; refusing every such send would
+   take the whole workspace offline to guard against a possibility, which is not
+   fail-closed but a different outage. It is still withheld where it matters most: a
+   **re-launch** requires the strict predicate, because re-launch is the exact moment the
+   #14741 loop re-armed itself.
+
+   The `startup_health` classifier gains `provider_update_authority_split`,
    `provider_executable_binding_drift`, and `provider_update_authority_unverified` in the
-   would-be-green tail, so a split lane cannot be reported as healthy. It is ordered
-   *after* the observed causes on purpose: this classifier answers "what is there now",
-   and hoisting a configuration fact above a live one (an unreadable inventory, a startup
-   screen) would trade one unactionable report for another. What actually breaks the loop
-   is the action-time `evaluate_update_authority` preflight, which refuses the re-launch
-   and the send. Both axes are opt-in (`not_evaluated` by default), so every pre-#14741
-   verdict is byte-invariant.
+   would-be-green tail, so a split *or undecided* lane cannot be reported as healthy. They
+   are ordered *after* the observed causes on purpose: this classifier answers "what is
+   there now", and hoisting a configuration fact above a live one (an unreadable
+   inventory, a startup screen) would trade one unactionable report for another. Both axes
+   are opt-in (`not_evaluated` by default), so every pre-#14741 verdict is byte-invariant.
 
 What this explicitly does **not** do, because the incident is what happens when something
 proceeds helpfully: it never relaxes to `PATH` first-match, never rewrites the override,

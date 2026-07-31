@@ -9,21 +9,31 @@ loop lived exactly in that gap: the lane was probed ready, the provider's update
 consumed the Enter, the process exited 0, and the self-heal re-launched the same pinned
 older binary a few seconds later.
 
-What this evaluates, and what it refuses to do
-----------------------------------------------
-- It resolves where the managed launch points (the profile's trusted override, else the
-  trusted PATH search) and where the provider's own updater reaches (the trusted PATH,
-  always — an updater shells out to a package manager and does not honor mozyo's pin).
-  A disagreement is :data:`...AUTHORITY_SPLIT`.
-- It re-verifies a lane's exact executable binding when the caller supplies one, so a
-  re-launch after an update cannot inherit a pin that no longer describes what is there.
+Where the updater's write target comes from (review j#95741 F2)
+--------------------------------------------------------------
+It is **supplied**, never inferred. The first cut derived it from the distinct realpaths
+the provider's *command* resolved to on the trusted PATH, and that is a proxy for a fact
+it cannot stand in for: an update runs the package manager, which writes to *its* global
+prefix. A host with a single matching ``codex`` on PATH but a PATH ``npm`` owning a
+different prefix was classified ``aligned``; worse, before the update the second install
+does not exist at all, so no enumeration of the provider command could ever have observed
+the split it was supposed to detect.
+
+So this module takes an optional ``updater_targets`` probe — a callable returning the
+install roots the provider's updater writes to, plus whether it could establish them. It
+ships **no default probe**: establishing a package manager's prefix means asking that
+package manager, which is a code-execution decision this layer will not make on its own.
+With no probe the verdict is :data:`...AUTHORITY_UNKNOWN`, which is the honest answer and
+the one Acceptance 2 explicitly allows ("検出不能を typed unknown として fail-closed").
+
+What it refuses to do
+---------------------
 - It **never repairs**: no PATH first-match relaxation, no override rewrite, no update
   invoked, no update prompt answered. Those are the #14741 guardrails, and the whole
   incident is what happens when something downstream "helpfully" proceeds.
 - It never raises for an undecidable environment. Every failure to establish a fact
-  becomes a typed ``unknown``, which does not admit a launch. The launch resolver's own
-  fail-closed raises are untouched; this is a classifier layered beside it, not a
-  replacement for it.
+  becomes a typed ``unknown``. The launch resolver's own fail-closed raises are
+  untouched; this is a classifier layered beside it, not a replacement for it.
 
 Nothing about the host leaves: the returned :class:`UpdateAuthority` carries fixed
 tokens and a small count, never a path, a version, or an env value.
@@ -32,12 +42,11 @@ tokens and a small count, never a path, a version, or an env value.
 from __future__ import annotations
 
 import os
-from typing import Mapping, Optional
+from typing import Callable, Mapping, Optional, Sequence, Tuple
 
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_executable import (  # noqa: E501
     AgentProviderExecutableError,
     resolve_agent_launch,
-    trusted_path_exec_targets,
 )
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile_config import (  # noqa: E501
     AgentProviderProfileError,
@@ -50,6 +59,13 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_pr
     classify_executable_binding,
     classify_update_authority,
 )
+
+#: A probe that answers "where does this provider's own updater write?".
+#:
+#: Returns ``(install_roots, resolved)``. ``resolved`` is False whenever the probe could
+#: not establish the answer — that is a typed unknown, never an empty-therefore-fine.
+#: Injected rather than defaulted: see the module docstring.
+UpdaterTargetProbe = Callable[[str], Tuple[Sequence[str], bool]]
 
 
 def executable_identity(exec_target: str, version: str) -> str:
@@ -73,15 +89,42 @@ def executable_identity(exec_target: str, version: str) -> str:
     return f"{target}@{ver}"
 
 
+def _probe_updater_targets(
+    provider_id: str, probe: Optional[UpdaterTargetProbe]
+) -> Tuple[Tuple[str, ...], bool]:
+    """Run ``probe`` fail-closed: any failure or malformed answer is "not resolved"."""
+    if probe is None:
+        return ((), False)
+    try:
+        roots, resolved = probe(provider_id)
+    except Exception:  # noqa: BLE001 - an injected probe is foreign code; it may do anything
+        # A probe that raises has not established anything. Fail closed rather than let a
+        # third-party failure decide a trust question by exception.
+        return ((), False)
+    if not resolved:
+        return ((), False)
+    normalised: list[str] = []
+    for root in roots or ():
+        if isinstance(root, str) and root.strip():
+            real = os.path.realpath(root.strip())
+            if real not in normalised:
+                normalised.append(real)
+    return (tuple(normalised), True)
+
+
 def evaluate_update_authority(
     provider_id: str,
     env: Optional[Mapping[str, str]] = None,
     *,
     registry: Optional[AgentProviderProfileRegistry] = None,
+    updater_targets: Optional[UpdaterTargetProbe] = None,
     bound_identity: str = "",
     observed_identity: str = "",
 ) -> UpdateAuthority:
     """Evaluate both update-authority axes for ``provider_id`` (never raises).
+
+    ``updater_targets`` is the injected probe described in the module docstring; with no
+    probe the authority axis is :data:`...AUTHORITY_UNKNOWN`.
 
     ``bound_identity`` / ``observed_identity`` are :func:`executable_identity` tokens.
     Leaving ``bound_identity`` empty leaves the binding axis
@@ -97,22 +140,16 @@ def evaluate_update_authority(
     env = os.environ if env is None else env
 
     try:
-        launch = resolve_agent_launch(provider_id, env, registry=registry)
-        exec_target = launch.exec_target
+        exec_target = resolve_agent_launch(provider_id, env, registry=registry).exec_target
     except AgentProviderExecutableError:
-        # The managed side is undecidable, so the comparison is too. Still report the
-        # updater's reach when it is readable: `reachable_installs` is what tells an
-        # operator whether the fix is "pin one" or "install one".
-        path_targets, readable = trusted_path_exec_targets(
-            provider_id, env, registry=registry
-        )
+        roots, resolved = _probe_updater_targets(provider_id, updater_targets)
         return UpdateAuthority(
             provider=provider_id,
             authority=AUTHORITY_UNKNOWN,
             binding=classify_executable_binding(
                 bound_identity=bound_identity, observed_identity=observed_identity
             ),
-            reachable_installs=len(path_targets) if readable else 0,
+            updater_targets=len(roots) if resolved else 0,
         )
     except AgentProviderProfileError:
         # An unknown provider / malformed profile. Caught explicitly (and NOT as a bare
@@ -126,24 +163,23 @@ def evaluate_update_authority(
             binding=BINDING_NOT_EVALUATED,
         )
 
-    path_targets, readable = trusted_path_exec_targets(
-        provider_id, env, registry=registry
-    )
+    roots, resolved = _probe_updater_targets(provider_id, updater_targets)
     return UpdateAuthority(
         provider=provider_id,
         authority=classify_update_authority(
             exec_target=exec_target,
-            path_exec_targets=path_targets,
-            path_readable=readable,
+            updater_write_roots=roots,
+            updater_roots_readable=resolved,
         ),
         binding=classify_executable_binding(
             bound_identity=bound_identity, observed_identity=observed_identity
         ),
-        reachable_installs=len(path_targets),
+        updater_targets=len(roots),
     )
 
 
 __all__ = (
+    "UpdaterTargetProbe",
     "evaluate_update_authority",
     "executable_identity",
 )

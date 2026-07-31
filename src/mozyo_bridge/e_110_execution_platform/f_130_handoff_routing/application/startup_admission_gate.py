@@ -34,6 +34,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     evaluate_startup_admission,
     startup_admission_record_lines,
 )
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_update_authority_preflight import (  # noqa: E501
+    UpdaterTargetProbe,
+    evaluate_update_authority,
+)
 from mozyo_bridge.shared.errors import die
 
 #: The blocked reason for a receiver that is mid-startup. A distinct token (not
@@ -47,6 +51,94 @@ REASON_STARTUP_INTERACTION = "receiver_startup_interaction_required"
 #: pane" and "the pane was showing a trust prompt" are different facts — and it must never
 #: decay to admitted, which would type into a receiver nobody could see.
 REASON_UNREADABLE = "target_unavailable"
+
+#: The receiver's provider runs a different install than its own updater writes to, or
+#: the executable this lane bound is no longer the one that is there (Redmine #14741).
+#: Distinct from every startup-screen reason: the pane may be perfectly ready, and the
+#: send would even land — but the lane is running a binary that no update can fix, which
+#: is how the #14741 gateway loop stayed invisible while the transport recorded delivery.
+REASON_UPDATE_AUTHORITY_SPLIT = "receiver_update_authority_split"
+
+
+def _refuse_wrong_binary_or_pass(
+    *,
+    receiver: str,
+    target: str,
+    emit: Callable[..., None],
+    record_format: str,
+    record_command: Optional[str],
+    anchor: Any,
+    mode: Optional[str],
+    kind: Optional[str],
+    source: Optional[str],
+    execution_root: Any,
+    role_profile_contract: Optional[str],
+    duplicate_lane_panes: Optional[list],
+    ledger: Optional[Callable[[Any], None]],
+    updater_targets: Optional[UpdaterTargetProbe],
+    bound_executable_identity: str,
+    observed_executable_identity: str,
+) -> None:
+    """The #14741 half of the pre-send fence: refuse a send to a wrong-binary lane.
+
+    Runs only once the startup screen is CLEAR — the two questions are different and the
+    order matters. A startup screen is about what the pane can accept *right now*; this
+    is about whether the lane is running a binary that an update can even reach. A pane
+    can be perfectly ready and still be the #14741 shape, which is precisely why the
+    original loop was invisible: every projection said ready, the send "landed", and the
+    process exited seconds later into a self-heal that restarted the same old binary.
+
+    Only a **positively demonstrated** wrong binary refuses
+    (:attr:`...UpdateAuthority.proven_wrong_binary`): the updater writes to a different
+    install (``split``), or the executable is not the one this lane bound (``drifted``).
+    An ``unknown`` authority does NOT refuse a send here — see that property's docstring
+    for why turning the honest common case into a workspace-wide outage is not
+    fail-closed. It still keeps the lane out of a green startup-health verdict, and it
+    still refuses a *re-launch* (:attr:`...UpdateAuthority.admits_relaunch`).
+
+    Zero-send by construction: this runs before the first injection, so a refusal has
+    typed nothing and pressed no Enter.
+    """
+    authority = evaluate_update_authority(
+        receiver,
+        updater_targets=updater_targets,
+        bound_identity=bound_executable_identity,
+        observed_identity=observed_executable_identity,
+    )
+    if not authority.proven_wrong_binary:
+        return
+
+    outcome = make_outcome(
+        status="blocked",
+        reason=REASON_UPDATE_AUTHORITY_SPLIT,
+        receiver=receiver,
+        target=target,
+        anchor=anchor,
+        mode=mode,
+        kind=kind,
+        notification_marker=None,
+        source=source,
+        execution_root=execution_root,
+    )
+    emit(
+        outcome,
+        record_format=record_format,
+        command=record_command,
+        duplicate_lane_panes=duplicate_lane_panes or None,
+        role_profile_contract=role_profile_contract,
+    )
+    if ledger is not None:
+        ledger(outcome)
+    die(
+        f"blocked: the {receiver} receiver is not running the binary its own updater "
+        f"writes to (update authority: {authority.authority}, executable binding: "
+        f"{authority.binding}). target={target}. Nothing was typed and Enter was never "
+        "pressed. Updating the provider cannot change what this lane runs, so an update "
+        "that exits 0 is not a fix and a self-heal will restart the same binary. "
+        "Re-point the trusted override at the install the updater owns, or remove the "
+        "extra install — mozyo never relaxes to PATH first-match, never rewrites the "
+        "override for you, and never accepts an update prompt on your behalf."
+    )
 
 
 def admit_receiver_startup_or_die(
@@ -67,6 +159,9 @@ def admit_receiver_startup_or_die(
     role_profile_contract: Optional[str] = None,
     duplicate_lane_panes: Optional[list] = None,
     ledger: Optional[Callable[[Any], None]] = None,
+    updater_targets: Optional[UpdaterTargetProbe] = None,
+    bound_executable_identity: str = "",
+    observed_executable_identity: str = "",
 ) -> None:
     """Read the receiver once, at action time, and refuse a send it cannot accept.
 
@@ -98,6 +193,24 @@ def admit_receiver_startup_or_die(
         read_visible=lambda: capture_pane(target, read_lines),
     )
     if admission.admitted:
+        _refuse_wrong_binary_or_pass(
+            receiver=receiver,
+            target=target,
+            emit=emit,
+            record_format=record_format,
+            record_command=record_command,
+            anchor=anchor,
+            mode=mode,
+            kind=kind,
+            source=source,
+            execution_root=execution_root,
+            role_profile_contract=role_profile_contract,
+            duplicate_lane_panes=duplicate_lane_panes,
+            ledger=ledger,
+            updater_targets=updater_targets,
+            bound_executable_identity=bound_executable_identity,
+            observed_executable_identity=observed_executable_identity,
+        )
         return
 
     blocked_reason = (

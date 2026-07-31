@@ -705,6 +705,7 @@ Reason = Literal[
     # non-blank, "ready-looking" pane, which is exactly why typing into it silently
     # destroyed an Implementation Request (#13582 j#77917).
     "receiver_startup_interaction_required",
+    "receiver_update_authority_split",
     "cross_session_claude",
     "target_repo_mismatch",
     "gateway_route_blocked",

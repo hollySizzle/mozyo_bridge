@@ -255,52 +255,6 @@ def resolve_agent_launch(
     return resolutions[0]
 
 
-def trusted_path_exec_targets(
-    provider_id: str,
-    env: Optional[Mapping[str, str]] = None,
-    *,
-    registry: Optional[AgentProviderProfileRegistry] = None,
-) -> "tuple[tuple[str, ...], bool]":
-    """The distinct realpaths the trusted PATH resolves this provider's command to.
-
-    Returns ``(exec_targets, path_readable)``. This is the **updater's reach** (Redmine
-    #14741): the provider's own in-TUI updater shells out to a package manager on the
-    ambient PATH, so what the trusted PATH resolves — not what mozyo pinned — is what an
-    update actually rewrites. :func:`resolve_agent_launch` cannot answer this once an
-    override is set, because an override short-circuits the search entirely; that
-    short-circuit is exactly how a managed lane and its provider's updater came to own
-    two different installs without anything noticing.
-
-    ``path_readable`` is False when the trusted PATH could not be enumerated at all: it
-    was absent/empty, or it carried an unsafe (empty / relative) component and was
-    therefore refused whole. The refusal is reported as unreadable rather than raised,
-    because the caller of this function is a *classifier* that must fail closed on an
-    undecidable input — the launch path keeps raising through
-    :func:`resolve_agent_launch`, whose fail-closed contract is unchanged.
-
-    Pure with respect to side effects: it stats candidate paths, exactly as the launch
-    resolver does, and mutates nothing.
-    """
-    env = os.environ if env is None else env
-    profiles = AGENT_PROVIDER_PROFILES if registry is None else registry
-    profile = profiles.require(provider_id)
-
-    try:
-        directories = _trusted_path_dirs(env, provider_id=provider_id)
-    except AgentProviderExecutableError:
-        return ((), False)
-    if not directories:
-        return ((), False)
-
-    name = profile.executable.command
-    targets: list[str] = []
-    for directory in directories:
-        verified = _verify_trusted_executable(os.path.join(directory, name))
-        if verified is not None and verified.exec_target not in targets:
-            targets.append(verified.exec_target)
-    return (tuple(targets), True)
-
-
 def resolve_agent_executable(
     provider_id: str,
     env: Optional[Mapping[str, str]] = None,
@@ -447,5 +401,4 @@ __all__ = (
     "resolve_agent_argv0",
     "resolve_agent_executable",
     "resolve_agent_launch",
-    "trusted_path_exec_targets",
 )

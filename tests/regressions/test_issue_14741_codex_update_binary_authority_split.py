@@ -253,8 +253,8 @@ class UpdateAuthorityClassifierTest(unittest.TestCase):
         self.assertEqual(
             classify_update_authority(
                 exec_target="/opt/pm/lib/node_modules/x/bin/x",
-                path_exec_targets=("/opt/pm/lib/node_modules/x/bin/x",),
-                path_readable=True,
+                updater_write_roots=("/opt/pm/lib/node_modules/x/bin/x",),
+                updater_roots_readable=True,
             ),
             AUTHORITY_ALIGNED,
         )
@@ -264,8 +264,8 @@ class UpdateAuthorityClassifierTest(unittest.TestCase):
         self.assertEqual(
             classify_update_authority(
                 exec_target="/opt/os/lib/node_modules/x/bin/x",
-                path_exec_targets=("/home/u/.nvm/versions/node/v22/bin/x",),
-                path_readable=True,
+                updater_write_roots=("/home/u/.nvm/versions/node/v22/bin/x",),
+                updater_roots_readable=True,
             ),
             AUTHORITY_SPLIT,
         )
@@ -274,8 +274,8 @@ class UpdateAuthorityClassifierTest(unittest.TestCase):
         self.assertEqual(
             classify_update_authority(
                 exec_target="/opt/a/x",
-                path_exec_targets=("/opt/a/x", "/opt/b/x"),
-                path_readable=True,
+                updater_write_roots=("/opt/a/x", "/opt/b/x"),
+                updater_roots_readable=True,
             ),
             AUTHORITY_SPLIT,
         )
@@ -283,7 +283,7 @@ class UpdateAuthorityClassifierTest(unittest.TestCase):
     def test_unreadable_path_is_unknown_never_aligned(self) -> None:
         self.assertEqual(
             classify_update_authority(
-                exec_target="/opt/a/x", path_exec_targets=(), path_readable=False
+                exec_target="/opt/a/x", updater_write_roots=(), updater_roots_readable=False
             ),
             AUTHORITY_UNKNOWN,
         )
@@ -292,7 +292,7 @@ class UpdateAuthorityClassifierTest(unittest.TestCase):
         """"The updater has nowhere to write" is a guess, not an observation."""
         self.assertEqual(
             classify_update_authority(
-                exec_target="/opt/a/x", path_exec_targets=(), path_readable=True
+                exec_target="/opt/a/x", updater_write_roots=(), updater_roots_readable=True
             ),
             AUTHORITY_UNKNOWN,
         )
@@ -303,8 +303,8 @@ class UpdateAuthorityClassifierTest(unittest.TestCase):
                 self.assertEqual(
                     classify_update_authority(
                         exec_target=empty,
-                        path_exec_targets=("/opt/a/x",),
-                        path_readable=True,
+                        updater_write_roots=("/opt/a/x",),
+                        updater_roots_readable=True,
                     ),
                     AUTHORITY_UNKNOWN,
                 )
@@ -313,8 +313,8 @@ class UpdateAuthorityClassifierTest(unittest.TestCase):
         self.assertEqual(
             classify_update_authority(
                 exec_target="/opt/a/x",
-                path_exec_targets=("/opt/a/x", "/opt/a/x", ""),
-                path_readable=True,
+                updater_write_roots=("/opt/a/x", "/opt/a/x", ""),
+                updater_roots_readable=True,
             ),
             AUTHORITY_ALIGNED,
         )
@@ -327,8 +327,8 @@ class UpdateAuthorityClassifierTest(unittest.TestCase):
                     with self.subTest(r=readable, t=targets, x=target):
                         verdict = classify_update_authority(
                             exec_target=target,
-                            path_exec_targets=targets,
-                            path_readable=readable,
+                            updater_write_roots=targets,
+                            updater_roots_readable=readable,
                         )
                         self.assertIn(verdict, UPDATE_AUTHORITIES)
 
@@ -402,7 +402,7 @@ class ExecutableBindingClassifierTest(unittest.TestCase):
 class UpdateAuthorityRecordTest(unittest.TestCase):
     """The record is closed, and it carries nothing about the host."""
 
-    def test_admits_launch_only_for_evaluated_or_unevaluated_positives(self) -> None:
+    def test_admits_relaunch_only_for_evaluated_or_unevaluated_positives(self) -> None:
         cases = {
             (AUTHORITY_NOT_EVALUATED, BINDING_NOT_EVALUATED): True,
             (AUTHORITY_ALIGNED, BINDING_MATCHED): True,
@@ -417,17 +417,17 @@ class UpdateAuthorityRecordTest(unittest.TestCase):
                 record = UpdateAuthority(
                     provider="fakex", authority=authority, binding=binding
                 )
-                self.assertEqual(record.admits_launch, admits)
+                self.assertEqual(record.admits_relaunch, admits)
 
     def test_payload_carries_no_path_version_or_env_value(self) -> None:
         payload = UpdateAuthority(
             provider="fakex",
             authority=AUTHORITY_SPLIT,
             binding=BINDING_DRIFTED,
-            reachable_installs=2,
+            updater_targets=2,
         ).as_payload()
         self.assertEqual(
-            set(payload), {"provider", "authority", "binding", "reachable_installs"}
+            set(payload), {"provider", "authority", "binding", "updater_targets"}
         )
         for value in payload.values():
             self.assertNotIn("/", str(value))
@@ -436,8 +436,8 @@ class UpdateAuthorityRecordTest(unittest.TestCase):
         for kwargs in (
             {"authority": "probably_fine"},
             {"binding": "probably_fine"},
-            {"reachable_installs": -1},
-            {"reachable_installs": True},
+            {"updater_targets": -1},
+            {"updater_targets": True},
             {"provider": ""},
         ):
             with self.subTest(kwargs=kwargs):
@@ -450,7 +450,13 @@ class UpdateAuthorityRecordTest(unittest.TestCase):
 
 
 class UpdateAuthorityPreflightTest(unittest.TestCase):
-    """Acceptance 2/3 at action time, against real files in a tmp tree — no live provider."""
+    """Acceptance 2/3 at action time, against real files in a tmp tree — no live provider.
+
+    Redmine #14741 review j#95741 F2: the updater's write target is **supplied by a
+    probe**, never inferred from where the provider's command sits on PATH. These tests
+    pin that distinction directly, because the first cut's PATH inference is exactly what
+    promoted an unverified authority to a positive `aligned`.
+    """
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -458,45 +464,131 @@ class UpdateAuthorityPreflightTest(unittest.TestCase):
         self.root = self.tmp.name
         self.registry = _fake_profile_registry()
 
-    def test_split_is_detected_when_an_override_pins_a_non_path_install(self) -> None:
-        """The exact #14741 configuration, reproduced with fake binaries."""
-        pinned = _make_executable(os.path.join(self.root, "os", "bin"))
-        _make_executable(os.path.join(self.root, "nvm", "bin"))
-        env = {
-            "PATH": os.path.join(self.root, "nvm", "bin"),
-            "MOZYO_AGENT_FAKEX_BINARY": pinned,
-        }
-        record = evaluate_update_authority("fakex", env, registry=self.registry)
-        self.assertEqual(record.authority, AUTHORITY_SPLIT)
-        self.assertFalse(
-            record.admits_launch,
-            "a split authority must never admit a re-launch: the self-heal that "
-            "inherited it is what made #14741 loop",
-        )
-        self.assertEqual(record.reachable_installs, 1)
+    def _probe(self, *roots, resolved=True):
+        return lambda provider_id: (list(roots), resolved)
 
-    def test_aligned_when_the_override_pins_the_path_install(self) -> None:
+    def test_no_probe_is_unknown_never_aligned(self) -> None:
+        """The default. Nothing established where the updater writes, so nothing is claimed."""
         bindir = os.path.join(self.root, "os", "bin")
         pinned = _make_executable(bindir)
         env = {"PATH": bindir, "MOZYO_AGENT_FAKEX_BINARY": pinned}
         record = evaluate_update_authority("fakex", env, registry=self.registry)
+        self.assertEqual(record.authority, AUTHORITY_UNKNOWN)
+        self.assertEqual(record.updater_targets, 0)
+        self.assertFalse(record.admits_relaunch, "a re-launch needs a positive authority")
+        self.assertFalse(
+            record.proven_wrong_binary,
+            "unknown is not a demonstrated wrong binary, so it must not refuse a send",
+        )
+
+    def test_provider_command_on_path_is_no_longer_evidence_of_alignment(self) -> None:
+        """The j#95741 F2 regression, stated as the property that was violated.
+
+        One `fakex` on PATH, identical to the override — the exact configuration the
+        first cut called `aligned`. Without a resolved updater target it must be
+        `unknown`: where a binary sits on PATH and where its package manager writes are
+        independently determined facts.
+        """
+        bindir = os.path.join(self.root, "os", "bin")
+        pinned = _make_executable(bindir)
+        env = {"PATH": bindir, "MOZYO_AGENT_FAKEX_BINARY": pinned}
+        record = evaluate_update_authority("fakex", env, registry=self.registry)
+        self.assertNotEqual(
+            record.authority,
+            AUTHORITY_ALIGNED,
+            "a single matching PATH entry is a proxy, not the updater's write target",
+        )
+
+    def test_aligned_only_when_a_resolved_updater_root_contains_the_exec_target(self) -> None:
+        pkg_root = os.path.join(self.root, "pm", "lib", "node_modules")
+        bindir = os.path.join(pkg_root, "provider", "bin")
+        pinned = _make_executable(bindir)
+        env = {"PATH": bindir, "MOZYO_AGENT_FAKEX_BINARY": pinned}
+        record = evaluate_update_authority(
+            "fakex", env, registry=self.registry, updater_targets=self._probe(pkg_root)
+        )
         self.assertEqual(record.authority, AUTHORITY_ALIGNED)
-        self.assertTrue(record.admits_launch)
+        self.assertTrue(record.admits_relaunch)
+        self.assertFalse(record.proven_wrong_binary)
+
+    def test_split_when_the_updater_writes_to_another_prefix(self) -> None:
+        """The measured #14741 shape: the override pins one install, the package manager
+        owns another — and the second one need not exist yet."""
+        pinned = _make_executable(os.path.join(self.root, "os", "bin"))
+        nvm_root = os.path.join(self.root, "nvm", "lib", "node_modules")
+        os.makedirs(nvm_root, exist_ok=True)
+        env = {
+            "PATH": os.path.join(self.root, "os", "bin"),
+            "MOZYO_AGENT_FAKEX_BINARY": pinned,
+        }
+        record = evaluate_update_authority(
+            "fakex", env, registry=self.registry, updater_targets=self._probe(nvm_root)
+        )
+        self.assertEqual(record.authority, AUTHORITY_SPLIT)
+        self.assertTrue(
+            record.proven_wrong_binary,
+            "a demonstrated split must refuse the send: updating cannot fix this lane",
+        )
+        self.assertFalse(record.admits_relaunch)
+
+    def test_sibling_prefix_is_not_read_as_containment(self) -> None:
+        """`/a/nodes` must not count as inside `/a/node`. A false alignment is the one
+        direction this classifier may never fail in."""
+        near = os.path.join(self.root, "nodes")
+        root = os.path.join(self.root, "node")
+        os.makedirs(root, exist_ok=True)
+        pinned = _make_executable(os.path.join(near, "bin"))
+        env = {"PATH": os.path.join(near, "bin"), "MOZYO_AGENT_FAKEX_BINARY": pinned}
+        record = evaluate_update_authority(
+            "fakex", env, registry=self.registry, updater_targets=self._probe(root)
+        )
+        self.assertEqual(record.authority, AUTHORITY_SPLIT)
+
+    def test_ambiguous_updater_target_is_split(self) -> None:
+        pkg_root = os.path.join(self.root, "pm", "lib", "node_modules")
+        bindir = os.path.join(pkg_root, "provider", "bin")
+        pinned = _make_executable(bindir)
+        env = {"PATH": bindir, "MOZYO_AGENT_FAKEX_BINARY": pinned}
+        record = evaluate_update_authority(
+            "fakex",
+            env,
+            registry=self.registry,
+            updater_targets=self._probe(pkg_root, os.path.join(self.root, "other")),
+        )
+        self.assertEqual(record.authority, AUTHORITY_SPLIT)
+
+    def test_probe_that_fails_or_raises_is_unknown_not_aligned(self) -> None:
+        bindir = os.path.join(self.root, "os", "bin")
+        pinned = _make_executable(bindir)
+        env = {"PATH": bindir, "MOZYO_AGENT_FAKEX_BINARY": pinned}
+
+        def raising(_provider_id):
+            raise RuntimeError("package manager unavailable")
+
+        for probe in (raising, self._probe(bindir, resolved=False)):
+            with self.subTest(probe=probe):
+                record = evaluate_update_authority(
+                    "fakex", env, registry=self.registry, updater_targets=probe
+                )
+                self.assertEqual(record.authority, AUTHORITY_UNKNOWN)
+                self.assertFalse(record.proven_wrong_binary)
 
     def test_symlinked_alias_is_not_a_false_split(self) -> None:
-        """Both sides are realpaths, so an alias and its target compare equal."""
-        real_dir = os.path.join(self.root, "pkg", "bin")
+        """Both sides are realpath-resolved, so an alias and its target compare equal."""
+        pkg_root = os.path.join(self.root, "pkg")
+        real_dir = os.path.join(pkg_root, "bin")
         target = _make_executable(real_dir)
         link_dir = os.path.join(self.root, "shim")
         os.makedirs(link_dir, exist_ok=True)
         link = os.path.join(link_dir, "fakex")
         os.symlink(target, link)
         env = {"PATH": link_dir, "MOZYO_AGENT_FAKEX_BINARY": link}
-        record = evaluate_update_authority("fakex", env, registry=self.registry)
+        record = evaluate_update_authority(
+            "fakex", env, registry=self.registry, updater_targets=self._probe(pkg_root)
+        )
         self.assertEqual(record.authority, AUTHORITY_ALIGNED)
 
     def test_unsafe_path_is_unknown_and_does_not_raise(self) -> None:
-        """A relative PATH component is refused whole — and reported, not thrown."""
         bindir = os.path.join(self.root, "os", "bin")
         pinned = _make_executable(bindir)
         env = {
@@ -505,21 +597,13 @@ class UpdateAuthorityPreflightTest(unittest.TestCase):
         }
         record = evaluate_update_authority("fakex", env, registry=self.registry)
         self.assertEqual(record.authority, AUTHORITY_UNKNOWN)
-        self.assertFalse(record.admits_launch)
-
-    def test_absent_path_is_unknown_never_aligned(self) -> None:
-        pinned = _make_executable(os.path.join(self.root, "os", "bin"))
-        record = evaluate_update_authority(
-            "fakex", {"MOZYO_AGENT_FAKEX_BINARY": pinned}, registry=self.registry
-        )
-        self.assertEqual(record.authority, AUTHORITY_UNKNOWN)
 
     def test_unresolvable_provider_is_unknown_and_does_not_raise(self) -> None:
         record = evaluate_update_authority(
             "fakex", {"PATH": os.path.join(self.root, "empty")}, registry=self.registry
         )
         self.assertEqual(record.authority, AUTHORITY_UNKNOWN)
-        self.assertFalse(record.admits_launch)
+        self.assertFalse(record.admits_relaunch)
 
     def test_unknown_provider_is_unknown_and_does_not_raise(self) -> None:
         record = evaluate_update_authority(
@@ -527,41 +611,60 @@ class UpdateAuthorityPreflightTest(unittest.TestCase):
         )
         self.assertEqual(record.authority, AUTHORITY_UNKNOWN)
 
-    def test_binding_axis_is_carried_through_the_preflight(self) -> None:
-        bindir = os.path.join(self.root, "os", "bin")
+    def test_binding_drift_is_a_demonstrated_wrong_binary(self) -> None:
+        pkg_root = os.path.join(self.root, "pm")
+        bindir = os.path.join(pkg_root, "bin")
         pinned = _make_executable(bindir)
         env = {"PATH": bindir, "MOZYO_AGENT_FAKEX_BINARY": pinned}
         record = evaluate_update_authority(
             "fakex",
             env,
             registry=self.registry,
+            updater_targets=self._probe(pkg_root),
             bound_identity=executable_identity(pinned, "0.145.0"),
             observed_identity=executable_identity(pinned, "0.146.0"),
         )
         self.assertEqual(record.authority, AUTHORITY_ALIGNED)
         self.assertEqual(record.binding, BINDING_DRIFTED)
-        self.assertFalse(
-            record.admits_launch,
-            "a re-launch must re-bind explicitly rather than inherit a stale pin",
+        self.assertTrue(record.proven_wrong_binary)
+        self.assertFalse(record.admits_relaunch)
+
+    def test_same_version_reinstall_stays_admitted(self) -> None:
+        """Nothing this lane runs changed, so a reinstall must not fence the lane off."""
+        pkg_root = os.path.join(self.root, "pm")
+        bindir = os.path.join(pkg_root, "bin")
+        pinned = _make_executable(bindir)
+        identity = executable_identity(pinned, "0.146.0")
+        record = evaluate_update_authority(
+            "fakex",
+            {"PATH": bindir, "MOZYO_AGENT_FAKEX_BINARY": pinned},
+            registry=self.registry,
+            updater_targets=self._probe(pkg_root),
+            bound_identity=identity,
+            observed_identity=identity,
         )
+        self.assertEqual(record.binding, BINDING_MATCHED)
+        self.assertTrue(record.admits_relaunch)
+        self.assertFalse(record.proven_wrong_binary)
 
     def test_preflight_mutates_nothing(self) -> None:
         """It describes; it never repairs. No install, no override rewrite, no update."""
         bindir = os.path.join(self.root, "os", "bin")
         pinned = _make_executable(bindir)
-        env = {"PATH": os.path.join(self.root, "nvm", "bin"), "MOZYO_AGENT_FAKEX_BINARY": pinned}
-        _make_executable(os.path.join(self.root, "nvm", "bin"))
+        env = {"PATH": bindir, "MOZYO_AGENT_FAKEX_BINARY": pinned}
         before = {
-            path: os.stat(os.path.join(dirpath, path)).st_mtime_ns
-            for dirpath, _, files in os.walk(self.root)
-            for path in files
+            os.path.join(d, f): os.stat(os.path.join(d, f)).st_mtime_ns
+            for d, _, files in os.walk(self.root)
+            for f in files
         }
         env_before = dict(env)
-        evaluate_update_authority("fakex", env, registry=self.registry)
+        evaluate_update_authority(
+            "fakex", env, registry=self.registry, updater_targets=self._probe(bindir)
+        )
         after = {
-            path: os.stat(os.path.join(dirpath, path)).st_mtime_ns
-            for dirpath, _, files in os.walk(self.root)
-            for path in files
+            os.path.join(d, f): os.stat(os.path.join(d, f)).st_mtime_ns
+            for d, _, files in os.walk(self.root)
+            for f in files
         }
         self.assertEqual(before, after)
         self.assertEqual(env, env_before)
@@ -663,3 +766,183 @@ class SplitLaneIsNeverHealthyResidencyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProductionSendFenceTest(unittest.TestCase):
+    """Acceptance 4 through the PRODUCTION gate (Redmine #14741 review j#95741 F3).
+
+    The first cut's 49 tests all passed while nothing was wired, which is the proof that
+    they did not measure acceptance 2/3. These run `admit_receiver_startup_or_die` — the
+    same shared pre-send fence `orchestrate_handoff` calls — with fake collaborators, and
+    assert on what the *lane* does: whether a body could have been sent.
+
+    "Zero-send" is asserted, never assumed: `capture_pane` is the ONLY collaborator that
+    may be touched, and the gate returns before any injection, so a refusal is proven by
+    the gate raising while the emitted outcome carries the refusal reason.
+    """
+
+    def setUp(self) -> None:
+        self.emitted: list = []
+        self.ledgered: list = []
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name
+
+    def _gate(self, *, pane: str, receiver: str = "codex", **kwargs):
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.startup_admission_gate import (  # noqa: E501
+            admit_receiver_startup_or_die,
+        )
+
+        reads: list = []
+
+        def capture_pane(target, lines):
+            reads.append((target, lines))
+            return pane
+
+        def emit(outcome, **_kw):
+            self.emitted.append(outcome)
+
+        admit_receiver_startup_or_die(
+            herdr_send=True,
+            receiver=receiver,
+            target="w4B:p51",
+            read_lines=40,
+            capture_pane=capture_pane,
+            emit=emit,
+            record_format="text",
+            record_command=None,
+            ledger=self.ledgered.append,
+            **kwargs,
+        )
+        return reads
+
+    def _probe(self, *roots, resolved=True):
+        return lambda provider_id: (list(roots), resolved)
+
+    def _pinned_codex(self, subdir="pm"):
+        """A real inert file pinned as the managed codex exec target."""
+        bindir = os.path.join(self.root, subdir, "bin")
+        os.makedirs(bindir, exist_ok=True)
+        path = os.path.join(bindir, "codex")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/sh\nexit 0\n")
+        os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
+        return os.path.realpath(path)
+
+    def test_update_prompt_refuses_the_send_through_the_production_gate(self) -> None:
+        """The live #14741 pane: the gate must raise before anything is typed."""
+        with self.assertRaises(SystemExit):
+            self._gate(pane=CAPTURED_UPDATE_PROMPT)
+        self.assertEqual(len(self.emitted), 1)
+        self.assertEqual(self.emitted[0].reason, "receiver_startup_interaction_required")
+        self.assertTrue(self.ledgered, "a refusal must be visible to the supervisor")
+
+    def test_ready_composer_passes_the_production_gate(self) -> None:
+        """Positive control at the production seam: a ready lane still sends."""
+        reads = self._gate(pane=READY_COMPOSER)
+        self.assertEqual(self.emitted, [], "an admitted send emits no refusal")
+        self.assertEqual(len(reads), 1, "exactly one action-time read, as before")
+
+    def test_split_authority_refuses_the_send_even_on_a_ready_pane(self) -> None:
+        """The whole point of #14741: the pane looks ready and the lane is still wrong."""
+        pinned = self._pinned_codex()
+        other_root = os.path.join(self.root, "nvm", "lib", "node_modules")
+        os.makedirs(other_root, exist_ok=True)
+        os.environ["MOZYO_AGENT_CODEX_BINARY"] = pinned
+        self.addCleanup(os.environ.pop, "MOZYO_AGENT_CODEX_BINARY", None)
+        with self.assertRaises(SystemExit):
+            self._gate(pane=READY_COMPOSER, updater_targets=self._probe(other_root))
+        self.assertEqual(len(self.emitted), 1)
+        self.assertEqual(self.emitted[0].reason, "receiver_update_authority_split")
+        self.assertTrue(self.ledgered)
+
+    def test_binding_drift_refuses_the_send_even_on_a_ready_pane(self) -> None:
+        """An update rewrote the executable under the lane: re-bind, never inherit."""
+        pinned = self._pinned_codex()
+        os.environ["MOZYO_AGENT_CODEX_BINARY"] = pinned
+        self.addCleanup(os.environ.pop, "MOZYO_AGENT_CODEX_BINARY", None)
+        with self.assertRaises(SystemExit):
+            self._gate(
+                pane=READY_COMPOSER,
+                updater_targets=self._probe(os.path.join(self.root, "pm")),
+                bound_executable_identity=executable_identity(pinned, "0.145.0"),
+                observed_executable_identity=executable_identity(pinned, "0.146.0"),
+            )
+        self.assertEqual(self.emitted[0].reason, "receiver_update_authority_split")
+
+    def test_same_version_reinstall_does_not_fence_the_lane(self) -> None:
+        """Update SUCCESS that changed nothing this lane runs: the send proceeds."""
+        pinned = self._pinned_codex()
+        identity = executable_identity(pinned, "0.146.0")
+        os.environ["MOZYO_AGENT_CODEX_BINARY"] = pinned
+        self.addCleanup(os.environ.pop, "MOZYO_AGENT_CODEX_BINARY", None)
+        self._gate(
+            pane=READY_COMPOSER,
+            updater_targets=self._probe(os.path.join(self.root, "pm")),
+            bound_executable_identity=identity,
+            observed_executable_identity=identity,
+        )
+        self.assertEqual(self.emitted, [])
+
+    def test_unknown_authority_does_not_take_the_workspace_offline(self) -> None:
+        """The honest common case (no probe) must not become a workspace-wide outage.
+
+        `unknown` still withholds a re-launch and still keeps the lane out of a green
+        startup-health verdict; it does not refuse a send to a live, ready pane.
+        """
+        self._gate(pane=READY_COMPOSER)
+        self.assertEqual(self.emitted, [])
+
+    def test_tmux_path_is_byte_invariant(self) -> None:
+        """The non-herdr path keeps its unchanged snapshot preflight and no new gate."""
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.startup_admission_gate import (  # noqa: E501
+            admit_receiver_startup_or_die,
+        )
+
+        reads: list = []
+        admit_receiver_startup_or_die(
+            herdr_send=False,
+            receiver="codex",
+            target="w4B:p51",
+            read_lines=40,
+            capture_pane=lambda t, n: reads.append((t, n)) or "",
+            emit=lambda *a, **k: self.emitted.append(a),
+            record_format="text",
+            record_command=None,
+        )
+        self.assertEqual(len(reads), 1)
+        self.assertEqual(self.emitted, [])
+
+
+class SelfHealRelaunchTest(unittest.TestCase):
+    """Acceptance 3/4: a self-heal re-launch must re-verify, never inherit a stale pin."""
+
+    def test_relaunch_is_withheld_for_every_non_positive_authority(self) -> None:
+        """`unknown` withholds a RE-LAUNCH even though it does not refuse a send.
+
+        Re-launch is the moment the #14741 loop re-armed itself: restarting a binary
+        whose authority nobody established is how the loop stayed invisible.
+        """
+        for authority in (AUTHORITY_SPLIT, AUTHORITY_UNKNOWN):
+            with self.subTest(authority=authority):
+                record = UpdateAuthority(provider="codex", authority=authority)
+                self.assertFalse(record.admits_relaunch)
+        for binding in (BINDING_DRIFTED, BINDING_UNKNOWN):
+            with self.subTest(binding=binding):
+                record = UpdateAuthority(provider="codex", binding=binding)
+                self.assertFalse(record.admits_relaunch)
+
+    def test_health_projection_forwards_the_axes_to_the_classifier(self) -> None:
+        """The production health seam actually carries the axes (j#95741 F1)."""
+        import inspect
+
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_startup_health,
+        )
+
+        signature = inspect.signature(herdr_startup_health.probe_startup_health)
+        self.assertIn("update_authority", signature.parameters)
+        self.assertIn("executable_binding", signature.parameters)
+        source = inspect.getsource(herdr_startup_health._observe_once)
+        self.assertIn("update_authority=update_authority", source)
+        self.assertIn("executable_binding=executable_binding", source)

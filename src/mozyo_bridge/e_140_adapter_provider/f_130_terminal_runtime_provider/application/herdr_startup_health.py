@@ -72,6 +72,8 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     ATTESTATION_INVALID,
     ATTESTATION_NOT_PROBED,
     ATTESTATION_OK,
+    AUTHORITY_NOT_EVALUATED,
+    BINDING_NOT_EVALUATED,
     COMPENSATION_NOT_NEEDED,
     COMPENSATION_ROLLBACK_OWED,
     DISPOSITION_ADOPTED,
@@ -288,6 +290,8 @@ def _observe_once(
     attested_launch: bool = True,
     registry=None,
     evidence: str = EVIDENCE_NOT_APPLICABLE,
+    update_authority: str = AUTHORITY_NOT_EVALUATED,
+    executable_binding: str = BINDING_NOT_EVALUATED,
 ) -> tuple[str, str]:
     """Classify one live slot against an ALREADY-READ inventory -> ``(health, blocker)``.
 
@@ -318,6 +322,8 @@ def _observe_once(
                 screen=SCREEN_UNREADABLE,
                 attestation=ATTESTATION_ABSENT,
                 evidence=evidence,
+                update_authority=update_authority,
+                executable_binding=executable_binding,
             ),
             "",
         )
@@ -353,6 +359,8 @@ def _observe_once(
         evidence=evidence,
         screen=screen,
         attestation=attestation,
+        update_authority=update_authority,
+        executable_binding=executable_binding,
     )
     return health, (blocker_id if health == HEALTH_STARTUP_INTERACTION else "")
 
@@ -406,6 +414,8 @@ def probe_startup_health(
     interval: float = DEFAULT_PROBE_INTERVAL,
     sleeper: Callable[[float], None] = time.sleep,
     evidence_reader: Optional[EvidenceReader] = None,
+    update_authority: str = AUTHORITY_NOT_EVALUATED,
+    executable_binding: str = BINDING_NOT_EVALUATED,
 ) -> SlotHealth:
     """Observe ONE live slot until healthy, terminal, or the deadline expires.
 
@@ -445,6 +455,12 @@ def probe_startup_health(
             evidence=(
                 evidence_reader(assigned_name) if expected else EVIDENCE_NOT_APPLICABLE
             ),
+            # Redmine #14741 j#95741 F1: the update-authority axes reach the classifier
+            # through the same per-slot seam as every other observed fact. Defaulted to
+            # `not_evaluated`, so a caller that does not arm them keeps its pre-#14741
+            # verdicts byte-for-byte.
+            update_authority=update_authority,
+            executable_binding=executable_binding,
         )
         if health == HEALTH_HEALTHY or health not in _RETRYABLE:
             break

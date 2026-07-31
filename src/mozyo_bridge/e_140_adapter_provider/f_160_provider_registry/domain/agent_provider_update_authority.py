@@ -14,11 +14,20 @@ install the ambient PATH's package manager owns. Those were two different instal
   the same pinned older binary, and looped — while the Implementation Request the
   queue-enter rail had typed was consumed by the update prompt's default option.
 
-The authority split is the root cause, and it is decidable **before any side effect**
-from facts the launch resolver already computes: where the managed launch points, and
-where the trusted PATH — the updater's reach — points. This module is the pure, total
-classifier for that question, plus the second axis the re-launch needs: whether the
-exact executable identity a lane was bound to is still the one that is there.
+The authority split is the root cause, and it is decidable **before any side effect** —
+but only from the right two facts: where the managed launch points, and where the
+provider's own updater actually *writes*. This module is the pure, total classifier for
+that question, plus the second axis the re-launch needs: whether the exact executable
+identity a lane was bound to is still the one that is there.
+
+**Review j#95741 F2 correction.** The first cut answered the second question with the
+distinct realpaths the provider's *command* resolved to on the trusted PATH. That is a
+proxy, and an unsound one: an update runs the package manager, which writes to *its*
+global prefix, and where the binary sits on PATH is an independently determined fact. A
+host with one matching ``codex`` on PATH but a PATH ``npm`` owning a different prefix was
+classified ``aligned`` — and before the update the second install does not exist, so no
+enumeration of the provider command could have seen it. The proxy is gone: only a
+positively resolved updater write target is accepted, and its absence is ``unknown``.
 
 Design constraints this module deliberately honors
 --------------------------------------------------
@@ -40,6 +49,7 @@ Design constraints this module deliberately honors
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -48,8 +58,8 @@ from typing import Sequence
 #: The caller did not supply authority facts. The gate is not armed — byte-invariant
 #: with the pre-#14741 behavior. Never a claim that the authority is sound.
 AUTHORITY_NOT_EVALUATED = "not_evaluated"
-#: The managed exec target is exactly the executable the trusted PATH resolves — the
-#: provider's own updater writes to the install the managed launch runs.
+#: The managed exec target lies inside the single install root the provider's own updater
+#: was positively resolved to write to: an update reaches what the managed launch runs.
 AUTHORITY_ALIGNED = "aligned"
 #: The managed launch and the provider's updater target different installs. Updating
 #: cannot change what the managed lane runs, so an update "success" is not a launch fix.
@@ -103,12 +113,15 @@ class UpdateAuthorityError(ValueError):
 class UpdateAuthority:
     """One provider's two-axis update-authority verdict (validated on build).
 
-    ``provider`` is the profile id. ``reachable_installs`` is the number of DISTINCT
-    executables the trusted PATH resolves the provider command to — a small count, not
-    a path list, so the record stays safe for a durable journal. Zero means the PATH
-    resolved none (which is why an override was needed, and why the updater's reach
-    cannot be described); two or more means the updater's own target is itself
-    ambiguous, which is a split on its face.
+    ``provider`` is the profile id. ``updater_targets`` is the number of DISTINCT install
+    roots the provider's own updater was **positively resolved** to write to — a small
+    count, not a path list, so the record stays safe for a durable journal. Zero is the
+    honest common case: nothing established where the updater writes. Two or more means
+    the updater's own target is itself ambiguous, which is a split on its face.
+
+    (It was ``reachable_installs`` in the first cut, when it counted provider-command PATH
+    resolutions. That input was the j#95741 F2 proxy and is gone; the name went with it,
+    because a count of the wrong thing is worse than no count at all.)
 
     There is deliberately no field carrying a path, a version string, or an env value.
     """
@@ -116,7 +129,7 @@ class UpdateAuthority:
     provider: str
     authority: str = AUTHORITY_NOT_EVALUATED
     binding: str = BINDING_NOT_EVALUATED
-    reachable_installs: int = 0
+    updater_targets: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.provider, str) or not self.provider.strip():
@@ -133,26 +146,47 @@ class UpdateAuthority:
                 f"executable binding {self.binding!r} is not recognised; "
                 f"allowed: {sorted(EXECUTABLE_BINDINGS)}"
             )
-        if not isinstance(self.reachable_installs, int) or isinstance(
-            self.reachable_installs, bool
+        if not isinstance(self.updater_targets, int) or isinstance(
+            self.updater_targets, bool
         ):
             raise UpdateAuthorityError(
-                f"reachable_installs must be an int, got "
-                f"{type(self.reachable_installs).__name__}"
+                f"updater_targets must be an int, got "
+                f"{type(self.updater_targets).__name__}"
             )
-        if self.reachable_installs < 0:
+        if self.updater_targets < 0:
             raise UpdateAuthorityError(
-                f"reachable_installs cannot be negative, got {self.reachable_installs}"
+                f"updater_targets cannot be negative, got {self.updater_targets}"
             )
 
     @property
-    def admits_launch(self) -> bool:
-        """True only when neither axis withholds admission.
+    def proven_wrong_binary(self) -> bool:
+        """True only when a POSITIVE finding says this lane runs the wrong binary.
+
+        ``split`` (the updater writes somewhere else) and ``drifted`` (the executable is
+        not the one this lane bound) are both positive, demonstrated findings.
+        ``unknown`` is deliberately NOT one: it says the question is undecided.
+
+        This is the predicate the **pre-send** fence uses, and the split from
+        :attr:`admits_relaunch` is the #14741 j#95741 F1/F2 resolution. Once the F2 proxy
+        was removed, ``unknown`` became the common and honest verdict for any host whose
+        package-manager prefix nobody has positively resolved. Treating ``unknown`` as a
+        send refusal would have taken the entire workspace offline to guard against a
+        possibility, which is not fail-closed — it is a different outage. Acceptance 3
+        asks for zero-send on "drift/split", and that is exactly what this predicate is.
+        """
+        return self.authority == AUTHORITY_SPLIT or self.binding == BINDING_DRIFTED
+
+    @property
+    def admits_relaunch(self) -> bool:
+        """True only when neither axis withholds admission — the STRICT predicate.
 
         An un-evaluated axis admits (the caller did not arm it); an aligned / matched
         axis admits (it was armed and passed). ``split`` / ``drifted`` / ``unknown``
-        never admit — including ``unknown``, because the whole point is that an
-        undecidable authority must not be spent as an aligned one.
+        never admit — including ``unknown``, because a re-launch is precisely the moment
+        the #14741 loop re-armed itself, and re-starting a binary whose authority nobody
+        could establish is how that loop stayed invisible. A send to a live pane is a
+        weaker action than resurrecting a dead one, which is why the pre-send fence uses
+        :attr:`proven_wrong_binary` instead.
         """
         return self.authority in (
             AUTHORITY_NOT_EVALUATED,
@@ -164,7 +198,7 @@ class UpdateAuthority:
             "provider": self.provider,
             "authority": self.authority,
             "binding": self.binding,
-            "reachable_installs": self.reachable_installs,
+            "updater_targets": self.updater_targets,
         }
 
 
@@ -176,8 +210,9 @@ AUTHORITY_DETAIL: dict[str, str] = {
         "the managed executable and the provider's updater agree"
     ),
     AUTHORITY_ALIGNED: (
-        "the managed exec target is the executable the trusted PATH resolves, so the "
-        "provider's own updater writes to the install the managed lane runs"
+        "the managed exec target lies inside the single install root the provider's own "
+        "updater was positively resolved to write to, so an update reaches the install "
+        "this lane runs"
     ),
     AUTHORITY_SPLIT: (
         "the managed exec target and the provider's own updater target are different "
@@ -187,9 +222,12 @@ AUTHORITY_DETAIL: dict[str, str] = {
         "never relaxes to PATH first-match and never accepts an update prompt for you"
     ),
     AUTHORITY_UNKNOWN: (
-        "the managed exec target or the provider's updater reach could not be "
-        "established, so an authority split can be neither shown nor ruled out; an "
-        "undecidable authority is never admitted as an aligned one"
+        "the managed exec target, or the install root the provider's own updater writes "
+        "to, could not be positively established, so an authority split can be neither "
+        "shown nor ruled out. Establishing an updater's target means asking its package "
+        "manager; mozyo does not infer it from where the provider's binary sits on PATH, "
+        "because those are independently determined facts. An undecidable authority is "
+        "never admitted as an aligned one"
     ),
 }
 
@@ -214,52 +252,76 @@ BINDING_DETAIL: dict[str, str] = {
 }
 
 
+def _within(exec_target: str, root: str) -> bool:
+    """True iff ``exec_target`` is the root itself or a path underneath it.
+
+    Separator-anchored on purpose: a plain ``startswith`` would read ``/opt/nodes/x`` as
+    living under ``/opt/node``, which would turn a genuine split into a false alignment —
+    the one direction this classifier must never fail in.
+    """
+    if exec_target == root:
+        return True
+    prefix = root if root.endswith(os.sep) else root + os.sep
+    return exec_target.startswith(prefix)
+
+
 def classify_update_authority(
     *,
     exec_target: str,
-    path_exec_targets: Sequence[str],
-    path_readable: bool,
+    updater_write_roots: Sequence[str],
+    updater_roots_readable: bool,
 ) -> str:
-    """Classify the managed-exec vs updater-target authority (pure, total, fail-closed).
+    """Classify the managed-exec vs updater-write authority (pure, total, fail-closed).
 
     ``exec_target`` is the verified realpath the managed launch runs.
-    ``path_exec_targets`` are the DISTINCT verified realpaths the provider's command
-    resolves to on the **trusted** PATH — the reach of the provider's own updater,
-    which runs through a package manager on that PATH rather than through mozyo's pin.
-    ``path_readable`` is False when the trusted PATH could not be enumerated at all (it
-    was absent, or a component was empty / relative and the whole PATH was refused).
+    ``updater_write_roots`` are the **positively resolved install roots the provider's
+    own updater would write to** — the package manager's / installer's own target.
+    ``updater_roots_readable`` is False when that target could not be established.
+
+    **Redmine #14741 review j#95741 F2 — why this input is what it is.** The first cut
+    passed the distinct realpaths the provider's *command* resolves to on the trusted
+    PATH, and treated a single match against ``exec_target`` as alignment. That is a
+    **proxy, not the fact**: an update runs ``npm install -g <package>`` (or its pnpm /
+    bun / brew / installer equivalent), which writes to the *package manager's* global
+    prefix. Where the provider's binary happens to sit on PATH and where its package
+    manager writes are two independently determined facts. A host with exactly one
+    ``codex`` on PATH matching the override, but a PATH ``npm`` owning a different global
+    prefix, returned ``aligned`` — and the second install does not even exist yet before
+    the update, so no enumeration of the provider command could ever have seen it. The
+    proxy therefore promoted an unverified authority to a positive alignment, which is
+    the same class of defect this issue exists to close. Only a positively resolved
+    updater write target is accepted now; nothing is inferred from the provider command.
 
     Precedence, and why:
 
-    1. an unreadable PATH decides nothing -> :data:`AUTHORITY_UNKNOWN`. It is exactly
-       the state in which the updater's target is undescribable;
+    1. an unresolved updater target decides nothing -> :data:`AUTHORITY_UNKNOWN`. This is
+       the common case, and it is the honest one: establishing where a package manager
+       writes requires asking that package manager, which this module does not do;
     2. a missing / blank ``exec_target`` likewise -> :data:`AUTHORITY_UNKNOWN`;
-    3. **no** PATH resolution -> :data:`AUTHORITY_UNKNOWN`, NOT "aligned". A provider
-       the trusted PATH cannot resolve is the shape an override exists to rescue, and
-       "the updater has nowhere to write" is a guess, not an observation;
-    4. more than one distinct PATH resolution -> :data:`AUTHORITY_SPLIT`. The updater's
-       own target is ambiguous, so at most one of them can be the managed one;
-    5. exactly one, and it is not the managed exec target -> :data:`AUTHORITY_SPLIT`.
-       This is the measured #14741 shape;
-    6. exactly one, and it IS the managed exec target -> :data:`AUTHORITY_ALIGNED`.
+    3. **no** write root -> :data:`AUTHORITY_UNKNOWN`, NOT "aligned". "The updater has
+       nowhere to write" is a guess, not an observation;
+    4. more than one distinct write root -> :data:`AUTHORITY_SPLIT`: the updater's own
+       target is ambiguous, so at most one of them can be the managed one;
+    5. exactly one, and the managed exec target is NOT inside it ->
+       :data:`AUTHORITY_SPLIT`. This is the measured #14741 shape;
+    6. exactly one, and the managed exec target IS inside it -> :data:`AUTHORITY_ALIGNED`.
 
-    Comparison is on the already-realpath-resolved strings the resolver produced: both
-    sides come from :func:`os.path.realpath`, so a symlinked alias on one side and its
-    target on the other compare equal rather than reading as a false split.
+    Both sides are expected to be :func:`os.path.realpath`-resolved by the caller, so a
+    symlinked alias and its target compare equal rather than reading as a false split.
     """
-    if not path_readable:
+    if not updater_roots_readable:
         return AUTHORITY_UNKNOWN
     if not isinstance(exec_target, str) or not exec_target.strip():
         return AUTHORITY_UNKNOWN
-    distinct = []
-    for candidate in path_exec_targets:
+    distinct: list[str] = []
+    for candidate in updater_write_roots:
         if isinstance(candidate, str) and candidate.strip() and candidate not in distinct:
             distinct.append(candidate)
     if not distinct:
         return AUTHORITY_UNKNOWN
     if len(distinct) > 1:
         return AUTHORITY_SPLIT
-    return AUTHORITY_ALIGNED if distinct[0] == exec_target else AUTHORITY_SPLIT
+    return AUTHORITY_ALIGNED if _within(exec_target, distinct[0]) else AUTHORITY_SPLIT
 
 
 def classify_executable_binding(
