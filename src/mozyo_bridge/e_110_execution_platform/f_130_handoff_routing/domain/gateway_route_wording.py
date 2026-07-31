@@ -117,6 +117,94 @@ AUTO_TARGET_REPO_UNRESOLVED_NARRATIVE: str = (
 )
 
 
+#: Per-subreason repair for the terminal (stderr) ``--target-repo auto`` refusal
+#: (review j#95911 finding 4). R4 printed ONE sentence for every refusal — "auto resolves the
+#: TARGET lane's worktree from its lifecycle binding; repair that binding" — which names a
+#: step `identity_unattested` / `foreign_workspace` never reach, and prescribes a repair that
+#: cannot fix `lifecycle_store_upgrade_required`. stderr is the first surface a sender reads,
+#: so generalising only the durable narrative left the wrong instruction where it is seen
+#: first. Keyed by ``AutoTargetRoot.reason``; the fallback is true of every subreason.
+AUTO_TARGET_REPO_SUBREASON_REPAIR: dict[str, str] = {
+    "identity_unattested": (
+        "the sender's or target's herdr identity is not fully attested, so there is no unit "
+        "to resolve a frame from. Send from an attested lane agent, or pass an explicit "
+        "`--target-repo <target lane worktree>`."
+    ),
+    "foreign_workspace": (
+        "the target runs in a different workspace than the sender, whose worktrees are not "
+        "enumerable from here. Pass an explicit `--target-repo <target lane worktree>`."
+    ),
+    "lane_binding_absent": (
+        "no lifecycle row owns the target lane, so it has no authoritative worktree binding. "
+        "Declare the lane, or pass an explicit `--target-repo <target lane worktree>`."
+    ),
+    "lane_binding_unbound": (
+        "the target lane's lifecycle row carries an EMPTY worktree binding (a legacy row). "
+        "Repair the lane's worktree binding, or pass an explicit `--target-repo <root>`."
+    ),
+    "lane_worktree_unresolved": (
+        "the target lane's binding token matched no unique live worktree of this repo "
+        "(pruned, moved, or non-unique). Restore / prune the worktree so exactly one matches, "
+        "or pass an explicit `--target-repo <target lane worktree>`."
+    ),
+    "lifecycle_store_unreadable": (
+        "the lane lifecycle authority could not be read, so no binding could be checked — "
+        "fail-closed by design. Pass an explicit `--target-repo <target lane worktree>`."
+    ),
+    "lifecycle_store_upgrade_required": (
+        "the shared lifecycle authority is a NEWER schema than this runtime can read. Re-run "
+        "from the current up-to-date source CLI / installed facade; do NOT downgrade or "
+        "repair the store."
+    ),
+}
+
+#: True of every subreason — used when a new subreason has no entry above yet.
+AUTO_TARGET_REPO_GENERIC_REPAIR: str = (
+    "auto could not establish the target's frame. Pass an explicit "
+    "`--target-repo <target lane worktree>`."
+)
+
+
+def auto_target_repo_die_message(subreason: str, detail: str) -> str:
+    """The terminal (stderr) message for an ``--target-repo auto`` refusal.
+
+    Carries the subreason, its OWN repair, and the one invariant that holds for all of them:
+    never drop ``--target-repo`` to get past this. ``detail`` is the resolver's bounded,
+    path-free sentence (see ``AutoTargetRoot.to_structured_dict``) — never raw exception text.
+    """
+    repair = AUTO_TARGET_REPO_SUBREASON_REPAIR.get(
+        subreason, AUTO_TARGET_REPO_GENERIC_REPAIR
+    )
+    return (
+        f"`--target-repo auto` did not resolve the target agent's repo root under the herdr "
+        f"backend (subreason={subreason}): {detail}. {repair} Do NOT drop `--target-repo` to "
+        "get past this: without it a relative `--workdir` resolves against the SENDER's cwd, "
+        "which is the lane-external execution root this fence exists to prevent "
+        "(Redmine #14249)."
+    )
+
+
+def auto_target_repo_lines(payload: "dict[str, str] | None") -> "list[str]":
+    """Pasteable-record lines for the ``--target-repo auto`` refusal (review j#95911 F1).
+
+    R4 put the subreason on the WIRE outcome only, while the ``next_action`` — which the
+    markdown record does render — told the reader to go read it. The markdown is what
+    ``--persist-delivery`` stores and what a human pastes into the ticket, so the one fact
+    that discriminates these refusals has to be legible THERE, not just in the JSON.
+
+    Renders the CLOSED-VOCABULARY tokens only (``subreason`` / ``basis``), never the free-text
+    ``detail``: this record is published to a ticket, and a bounded token cannot carry a host
+    path the way an interpolated message can (finding 2, same review). Empty list when the
+    outcome is not an auto refusal, so every other record is byte-identical.
+    """
+    if not payload:
+        return []
+    subreason = str(payload.get("subreason") or "").strip() or "—"
+    basis = str(payload.get("basis") or "").strip()
+    line = f"- Auto target-repo: subreason `{subreason}`"
+    return [f"{line} (basis `{basis}`)" if basis else line]
+
+
 #: The #14249 execution-root fence pair, keyed by wire ``Reason``. Both are sender-owned
 #: pre-send refusals whose wording lives here, so ``handoff.py`` dispatches them through one
 #: lookup instead of a per-reason branch — which is also what keeps that oversized module
@@ -134,6 +222,9 @@ EXECUTION_ROOT_FENCE_NARRATIVE: dict[str, str] = {
 
 
 __all__ = (
+    "auto_target_repo_lines",
+    "auto_target_repo_die_message",
+    "AUTO_TARGET_REPO_SUBREASON_REPAIR",
     "EXECUTION_ROOT_FENCE_NEXT_ACTION",
     "EXECUTION_ROOT_FENCE_NARRATIVE",
     "GATEWAY_ROUTE_BLOCKED_NEXT_ACTION",

@@ -103,7 +103,13 @@ class AutoTargetRoot:
         R3 wrote a ``next_action`` that told the reader to consult "the structured detail" —
         which did not exist: ``DeliveryOutcome`` had no field for it, so the one fact that
         distinguishes these refusals never reached the reader. This is that field's content.
-        Free-text-free apart from ``detail``, which names only lane ids and store state.
+
+        **Every value here is bounded and path-free.** ``subreason`` / ``basis`` are closed
+        vocabulary tokens; ``detail`` is a fixed sentence that may name lane / workspace ids
+        and exception TYPES, never a filesystem path and never raw exception text. This
+        payload reaches the wire outcome, the pasteable record and stderr, so an absolute path
+        placed here is published three ways — which is exactly what R4 did before review
+        j#95911 finding 2 (an interpolated exception carried the operator's home path).
         """
         return {"subreason": self.reason, "basis": self.basis, "detail": self.detail}
 
@@ -283,18 +289,27 @@ def resolve_herdr_auto_target_repo(
 
     try:
         rows = LaneLifecycleReader().records()
-    except LaneLifecycleReaderUpgradeRequired as exc:
+    except LaneLifecycleReaderUpgradeRequired:
+        # The exception text is DELIBERATELY not interpolated (review j#95911 finding 2):
+        # it carries the store's absolute path, and `detail` travels onto the structured
+        # outcome, the pasteable record and stderr. R4 interpolated it and leaked the
+        # operator's home path into all three. The subreason already says everything the
+        # reader needs; the path is host-local state, not a fact the record may hold.
         return AutoTargetRoot(
             reason=REFUSE_STORE_UPGRADE_REQUIRED,
             detail=(
-                "the lane lifecycle authority is a NEWER schema than this runtime can read "
-                f"({exc}); route via a current runtime — never downgrade the store"
+                "the lane lifecycle authority is a NEWER schema than this runtime can "
+                "read; route via a current runtime — never downgrade the store"
             ),
         )
     except (LaneLifecycleError, OSError) as exc:
+        # Only the exception TYPE — a bounded, path-free token (same reason as above).
         return AutoTargetRoot(
             reason=REFUSE_STORE_UNREADABLE,
-            detail=f"the lane lifecycle authority is unreadable ({exc}); fail closed",
+            detail=(
+                "the lane lifecycle authority is unreadable "
+                f"({type(exc).__name__}); fail closed"
+            ),
         )
     lane = _norm_lane(target_info.get("lane_id") or "")
     row = next(

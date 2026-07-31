@@ -82,6 +82,9 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.herdr_auto_target_root import (  # noqa: E501
     AutoTargetRoot,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_route_wording import (  # noqa: E501
+    auto_target_repo_die_message,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     AUTO_TARGET_REPO,
     DeliveryOutcome,
@@ -365,14 +368,7 @@ class TargetResolutionUseCase:
                     auto_target_repo=auto.to_structured_dict(),
                 )
                 ops.die(
-                    "`--target-repo auto` could not verify the target agent's repo root "
-                    f"under the herdr backend (reason={auto.reason}): {auto.detail}. "
-                    "herdr carries no target pane cwd, so auto resolves the TARGET lane's "
-                    "own worktree from its lifecycle worktree binding and never falls back "
-                    "to the sender's cwd (Redmine #14249) — a sender root would deliver an "
-                    "execution root the receiver does not run in. Pass an explicit "
-                    "`--target-repo <target lane worktree>`, or repair the lane's worktree "
-                    "binding."
+                    auto_target_repo_die_message(auto.reason, auto.detail)
                 )
                 raise AssertionError("unreachable")
             # The synthesized herdr record carries no `cwd` for `auto` (there is no pane cwd to

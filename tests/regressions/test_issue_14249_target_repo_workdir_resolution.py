@@ -44,6 +44,7 @@ feeds its answer through the REAL planner: nothing hand-computes the lane root.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -395,6 +396,132 @@ class AutoRefusalIsDurableAndTypedTest(unittest.TestCase):
             )
             self.assertIn(reason, SEND_KNOWN_NOT_SENT_REASONS, reason)
 
+    def test_the_pasteable_record_carries_the_subreason_value(self) -> None:
+        """Review j#95911 F1: the markdown — not just the JSON — is what gets persisted.
+
+        R4 put the subreason on the wire outcome while the record rendered only the
+        next_action telling the reader to go look at it. `--persist-delivery` stores this
+        markdown, so the discriminating fact has to be legible in it.
+        """
+        record = build_delivery_record(
+            make_outcome(
+                status="blocked",
+                reason="auto_target_repo_unresolved",
+                receiver="codex",
+                target="mzb1_x",
+                anchor=RedmineAnchor(issue=ISSUE, journal="95887"),
+                mode="queue-enter",
+                kind="review_request",
+                notification_marker=None,
+                auto_target_repo={
+                    "subreason": "lane_binding_absent",
+                    "basis": "",
+                    "detail": "no row owns lane 'x'",
+                },
+            )
+        )
+        self.assertIn("lane_binding_absent", record)
+        self.assertIn("- Auto target-repo: subreason `lane_binding_absent`", record)
+
+    def test_a_non_auto_outcome_record_is_unchanged(self) -> None:
+        """The new line must not appear on every other delivery record."""
+        record = build_delivery_record(
+            make_outcome(
+                status="sent",
+                reason="ok",
+                receiver="codex",
+                target="mzb1_x",
+                anchor=RedmineAnchor(issue=ISSUE, journal="95887"),
+                mode="queue-enter",
+                kind="review_request",
+                notification_marker="m",
+            )
+        )
+        self.assertNotIn("Auto target-repo", record)
+
+    def test_no_refusal_payload_carries_a_filesystem_path(self) -> None:
+        """Review j#95911 F2: R4 interpolated a raw exception and leaked the home path.
+
+        Driven through the REAL ``resolve_herdr_auto_target_repo`` with the reader raising
+        exceptions whose text carries a path — because that is where the leak lived. An
+        earlier version of this test built payloads by hand and passed happily while the
+        defect was reintroduced: it never entered the ``except`` branches at all.
+        """
+        import mozyo_bridge.core.state.lane_lifecycle_readonly as readonly
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.herdr_auto_target_root import (  # noqa: E501
+            resolve_herdr_auto_target_repo,
+        )
+        from mozyo_bridge.core.state.lane_lifecycle_schema import LaneLifecycleError
+
+        secret = Path.home() / ".mozyo_bridge" / "state.sqlite"
+        cases = (
+            readonly.LaneLifecycleReaderUpgradeRequired(
+                f"lane lifecycle store at {secret} is version 9, this build reads 7"
+            ),
+            LaneLifecycleError(f"unable to open database file: {secret}"),
+            OSError(f"[Errno 13] Permission denied: '{secret}'"),
+        )
+        original = readonly.LaneLifecycleReader.records
+        for exc in cases:
+            def _raise(self, _exc=exc):  # noqa: ANN001
+                raise _exc
+
+            readonly.LaneLifecycleReader.records = _raise
+            try:
+                refusal = resolve_herdr_auto_target_repo(
+                    Path(ROOT),
+                    {
+                        "id": "x", "cwd": "",
+                        "workspace_id": "ws", "lane_id": "target_lane",
+                        "herdr_sender_workspace_id": "ws",
+                        "herdr_sender_lane_id": "sender_lane",
+                    },
+                )
+            finally:
+                readonly.LaneLifecycleReader.records = original
+            payload = refusal.to_structured_dict()
+            label = f"{type(exc).__name__}:{payload['subreason']}"
+            # The refusal must still be typed…
+            self.assertFalse(refusal.ok, label)
+            self.assertTrue(payload["subreason"], label)
+            # …and must not republish the store path onto wire / record / stderr.
+            for key, value in payload.items():
+                self.assertNotIn(str(secret), str(value), f"{label}.{key}")
+                self.assertNotIn(str(Path.home()), str(value), f"{label}.{key}")
+                self.assertNotIn("/", str(value), f"{label}.{key}")
+
+    def test_the_terminal_error_gives_each_subreason_its_own_repair(self) -> None:
+        """Review j#95911 F4: stderr told every refusal to repair a worktree binding."""
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_route_wording import (  # noqa: E501
+            AUTO_TARGET_REPO_SUBREASON_REPAIR,
+            auto_target_repo_die_message,
+        )
+
+        # A step `identity_unattested` never reaches must not be prescribed to it.
+        unattested = auto_target_repo_die_message("identity_unattested", "d")
+        self.assertNotIn("repair that lane's worktree binding", unattested)
+        self.assertNotIn("repair the lane's worktree binding", unattested)
+        self.assertIn("attested lane agent", unattested)
+
+        # The newer-store case must say "use a current runtime", never "repair the binding".
+        upgrade = auto_target_repo_die_message("lifecycle_store_upgrade_required", "d")
+        self.assertIn("do NOT downgrade", upgrade)
+        self.assertNotIn("worktree binding", upgrade)
+
+        # Every subreason the resolver can emit has its own entry.
+        for subreason in (
+            "identity_unattested", "foreign_workspace", "lane_binding_absent",
+            "lane_binding_unbound", "lane_worktree_unresolved",
+            "lifecycle_store_unreadable", "lifecycle_store_upgrade_required",
+        ):
+            self.assertIn(subreason, AUTO_TARGET_REPO_SUBREASON_REPAIR, subreason)
+            # …and the invariant holds for all of them.
+            self.assertIn(
+                "Do NOT drop `--target-repo`",
+                auto_target_repo_die_message(subreason, "d"),
+                subreason,
+            )
+
     def test_post_injection_reasons_still_stay_uncertain(self) -> None:
         """The guard must keep its teeth — widening the set must not swallow these."""
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_delivery import (  # noqa: E501
@@ -416,11 +543,11 @@ class PublicHelpMatchesTheCurrentContractTest(unittest.TestCase):
     script, which is what made the staleness invisible.
     """
 
-    def _help(self, subcommand: str) -> str:
+    def _help_raw(self, argv: "list[str]") -> str:
         import subprocess
 
         proc = subprocess.run(
-            [sys.executable, "-m", "mozyo_bridge", "handoff", subcommand, "--help"],
+            [sys.executable, "-m", "mozyo_bridge", *argv],
             capture_output=True,
             text=True,
             cwd=str(ROOT),
@@ -430,13 +557,46 @@ class PublicHelpMatchesTheCurrentContractTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         return proc.stdout
 
-    #: Every subparser that exposes `--target-repo`; the help text is built by one shared
-    #: helper, so a fix that missed one would mean the helper was bypassed.
-    SUBCOMMANDS = ("send", "reply", "cross-workspace-consult")
+    def _help(self, subcommand: str) -> str:
+        return self._help_raw(["handoff", subcommand, "--help"])
 
-    def test_no_subcommand_advises_dropping_the_flag_to_recover(self) -> None:
-        for sub in self.SUBCOMMANDS:
-            self.assertNotIn("Drop the flag to skip the repo gate", self._help(sub), sub)
+    def _subcommands(self) -> "list[str]":
+        """Every `handoff` subcommand, DERIVED — never hand-listed (review j#95911 F3).
+
+        R4 hand-listed three and asserted in a comment that they were "every subparser that
+        exposes --target-repo". There are seven, and the one it missed
+        (``ticketless-callback``) is built by a separate module that still carried the old
+        contract. A hand-written enumeration cannot notice a parser nobody remembered.
+        """
+        text = self._help_raw(["handoff", "--help"])
+        inside = text.split("{", 1)[1].split("}", 1)[0]
+        subs = [s.strip() for s in inside.split(",") if s.strip()]
+        self.assertGreaterEqual(len(subs), 7, subs)
+        return subs
+
+    def _target_repo_subcommands(self) -> "list[str]":
+        """The derived subcommands that actually expose ``--target-repo``."""
+        found = [s for s in self._subcommands() if "--target-repo" in self._help(s)]
+        self.assertGreaterEqual(len(found), 7, found)
+        return found
+
+    #: Contract violations, matched by SHAPE rather than one parser's exact sentence. R4
+    #: grepped the literal "Drop the flag to skip the repo gate"; the ticketless parser says
+    #: "Drop to skip the repo gate", so the sweep reported a clean zero it had not earned.
+    FORBIDDEN = (
+        re.compile(r"drop\b.{0,20}\bto skip the repo gate", re.I),
+        # `auto` stated as universally requiring a %pane — true only under tmux.
+        re.compile(r"`auto`\s+requires an explicit\s+`?%pane", re.I),
+    )
+
+    def test_no_target_repo_parser_advises_dropping_the_flag_to_recover(self) -> None:
+        offenders = []
+        for sub in self._target_repo_subcommands():
+            text = " ".join(self._help(sub).split())
+            for pattern in self.FORBIDDEN:
+                if pattern.search(text):
+                    offenders.append((sub, pattern.pattern))
+        self.assertEqual(offenders, [], f"stale --target-repo contract in: {offenders}")
 
     def test_auto_is_documented_per_backend_not_as_tmux_only(self) -> None:
         text = " ".join(self._help("send").split())

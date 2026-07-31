@@ -38,6 +38,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketle
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_route_wording import (
     EXECUTION_ROOT_FENCE_NARRATIVE,
     EXECUTION_ROOT_FENCE_NEXT_ACTION,
+    auto_target_repo_lines,
     GATEWAY_ROUTE_BLOCKED_NARRATIVE,
     GATEWAY_ROUTE_BLOCKED_NEXT_ACTION,
     READER_UPGRADE_REQUIRED_NARRATIVE,
@@ -1917,6 +1918,7 @@ def build_delivery_record(
         *ticketless_callback_lines(outcome.ticketless_callback),
         *ticketless_consultation_lines(outcome.ticketless_consultation),
         *ticketless_work_intake_lines(outcome.ticketless_work_intake),
+        *auto_target_repo_lines(outcome.auto_target_repo),
         f"- Status: `{outcome.status}` (reason: `{outcome.reason}`)",
         f"- Outcome: {_outcome_narrative(outcome.status, outcome.reason, outcome.mode, outcome.receiver, turn_start_outcome=_herdr_turn_start_token(outcome.turn_start_outcome))}",
         f"- Next action owner: `{outcome.next_action_owner}` — {outcome.next_action}",

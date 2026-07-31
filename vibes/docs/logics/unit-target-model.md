@@ -293,6 +293,19 @@ pane cwd / repo root   != target execution root (nested project)
     (review j#95843 finding 1)。narrative は全 subreason に対して真である表現に
     留め、具体的な段は同 field を読ませる。**受信側が持っていない情報を
     next_action で参照しない** — R3 は存在しない「structured detail」を参照していた。
+  - **subreason は reader surface 全てに届かせる** (review j#95911 finding 1/4)。
+    wire JSON だけでは足りない。`--persist-delivery` が保存し人が ticket に貼るのは
+    **pasteable markdown** であり、sender が最初に読むのは **stderr** である。
+    markdown には closed vocabulary の token (`subreason` / `basis`) を固定形式で
+    render し、stderr は **subreason ごとの正しい repair** を出す
+    (`auto_target_repo_die_message`)。全 refusal に同一の repair を出してはならない —
+    `identity_unattested` / `foreign_workspace` は binding 段に到達せず、
+    `lifecycle_store_upgrade_required` は binding repair では解消しない。
+  - **refusal payload に filesystem path を入れない** (review j#95911 finding 2)。
+    `detail` は wire outcome・pasteable record・stderr の 3 経路へ同時に出るため、
+    raw exception を補間すると個人 home path が 3 箇所へ publish される
+    (R4 が実際に起こした)。exception は **type 名のみ**を使い、path・秘密値は載せない。
+    正本: organization baseline (個人情報を chat / ticket / Git / log へ記録しない)。
   - **これらの refusal は proven pre-injection zero-send として closed consumer に
     登録する** (review j#95843 finding 2)。`callback_delivery._NOT_SENT_BLOCKED_REASONS`
     と `sublane_worker_dispatch.SEND_KNOWN_NOT_SENT_REASONS` の双方。未登録だと

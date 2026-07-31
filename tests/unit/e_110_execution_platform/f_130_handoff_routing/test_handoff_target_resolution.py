@@ -401,7 +401,10 @@ class TargetRepoAutoTest(unittest.TestCase):
         self.assertEqual(ops.herdr_auto_diag, [])
         assert isinstance(raised, _FakeDie)
         self.assertIn(REFUSE_LANE_BINDING_ABSENT, raised.message)
-        self.assertIn("never falls back to the sender's cwd", raised.message)
+        # The terminal message is per-subreason since review j#95911 F4, but the invariant it
+        # must always carry is the same one: never recover by dropping `--target-repo`.
+        self.assertIn("Do NOT drop `--target-repo`", raised.message)
+        self.assertIn("SENDER's cwd", raised.message)
 
     def test_tmux_auto_keeps_target_repo_mismatch(self) -> None:
         """The new reason is herdr-only: the tmux branch DID observe a pane cwd."""
