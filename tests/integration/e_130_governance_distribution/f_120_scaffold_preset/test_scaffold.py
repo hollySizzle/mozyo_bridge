@@ -48,6 +48,26 @@ class ScaffoldRulesTest(unittest.TestCase):
             text=True,
         )
 
+    def git_untracked_paths(self, project: Path) -> set[str]:
+        """Repo-relative paths Git offers as untracked candidates.
+
+        `--untracked-files=all` lists files individually instead of
+        collapsing a directory, which is what makes an ignore rule's
+        effect on a single runtime file observable.
+        """
+        proc = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=project,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return {
+            line[3:]
+            for line in proc.stdout.splitlines()
+            if line.startswith("?? ")
+        }
+
     def test_rules_install_and_scaffold_asana_thin_router(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
@@ -1947,6 +1967,224 @@ class ScaffoldRulesTest(unittest.TestCase):
                     tracked,
                     msg=f"manifest does not track {tracked_path}",
                 )
+
+    # Runtime state `claude-nagger` writes into the directory the governed
+    # scaffold populates: the session SQLite DB with its WAL sidecars
+    # (`-wal` / `-shm`) and the rollback sidecar SQLite falls back to when
+    # WAL is unavailable (`-journal`), the suggest-rules drop box, the
+    # local vault, hook logs, and the derived file-convention output.
+    NAGGER_RUNTIME_PATHS = (
+        ".claude-nagger/state.db",
+        ".claude-nagger/state.db-wal",
+        ".claude-nagger/state.db-shm",
+        ".claude-nagger/state.db-journal",
+        ".claude-nagger/suggested_rules/suggested_rules.yaml",
+        ".claude-nagger/vault/secrets.yaml",
+        ".claude-nagger/file_conventions.generated.yaml",
+        ".claude-nagger/hook.log",
+    )
+
+    # The conventions an operator activates by copying the skeleton. These
+    # are the project's own configuration and must stay committable.
+    NAGGER_OPERATOR_PATHS = (
+        ".claude-nagger/config.yaml",
+        ".claude-nagger/command_conventions.yaml",
+        ".claude-nagger/mcp_conventions.yaml",
+        ".claude-nagger/file_conventions.yaml",
+    )
+
+    # The shipped skeleton itself, which the scaffold manifest tracks.
+    NAGGER_SHIPPED_PATHS = (
+        ".claude-nagger/.gitignore",
+        ".claude-nagger/config.yaml.example",
+        ".claude-nagger/command_conventions.yaml.example",
+        ".claude-nagger/mcp_conventions.yaml.example",
+    )
+
+    def test_governed_nagger_gitignore_excludes_runtime_state_only(self) -> None:
+        """Redmine #14773: the shipped nagger `.gitignore` hides runtime state.
+
+        `claude-nagger` keeps its session SQLite DB — and the
+        suggest-rules drop box — inside the very `.claude-nagger/`
+        directory the governed scaffold populates, so a distributed
+        artifact that does not exclude its own runtime state lets a
+        routine `git add -A` commit it (#14725 j#95187). Upstream ships
+        the same exclusions in its own `DOTCN_GITIGNORE_TEMPLATE`, but
+        only writes them when no `.gitignore` exists yet; the scaffolded
+        file wins, so the exclusion has to live here.
+
+        The exclusion stays narrow on purpose: no `.claude-nagger/**`
+        blanket. The conventions an operator activates by hand, and the
+        shipped skeleton, must still surface as Git candidates.
+        """
+        for preset in ("redmine-governed", "redmine-rails-governed"):
+            with self.subTest(preset=preset):
+                with tempfile.TemporaryDirectory() as tmp:
+                    home = Path(tmp) / "home"
+                    project = Path(tmp) / "project"
+                    project.mkdir()
+                    self.init_git_repository(project)
+                    self.run_cli(["rules", "install", "--home", str(home)])
+                    result, _ = self.run_cli(
+                        [
+                            "scaffold",
+                            "apply",
+                            preset,
+                            "--target",
+                            str(project),
+                            "--home",
+                            str(home),
+                        ]
+                    )
+                    self.assertEqual(0, result)
+
+                    for relative in (
+                        self.NAGGER_RUNTIME_PATHS + self.NAGGER_OPERATOR_PATHS
+                    ):
+                        path = project / relative
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        # Placeholder content only: a real state DB is
+                        # local runtime state and is never fixtured.
+                        path.write_text("local\n", encoding="utf-8")
+
+                    untracked = self.git_untracked_paths(project)
+                    for relative in self.NAGGER_RUNTIME_PATHS:
+                        self.assertNotIn(
+                            relative,
+                            untracked,
+                            msg=(
+                                f"{preset} scaffold leaves {relative} as a Git "
+                                "candidate; runtime state must be ignored"
+                            ),
+                        )
+                    for relative in (
+                        self.NAGGER_OPERATOR_PATHS + self.NAGGER_SHIPPED_PATHS
+                    ):
+                        self.assertIn(
+                            relative,
+                            untracked,
+                            msg=(
+                                f"{preset} scaffold hides {relative}; the ignore "
+                                "must not swallow project configuration"
+                            ),
+                        )
+
+    def test_governed_nagger_redistribution_keeps_tracked_runtime_file(self) -> None:
+        """Redmine #14773: re-distributing the fix never untracks a file.
+
+        An adopting repo that committed `.claude-nagger/state.db` before
+        the exclusion shipped (#14725 j#95187) must be repaired by a plain
+        `scaffold apply --backup`: the refreshed `.gitignore` keeps *new*
+        runtime files out of Git, while the file the repo already tracks
+        stays tracked. Dropping it is the repo owner's decision, not a
+        side effect of redistribution — and the replaced `.gitignore` is
+        backed up rather than lost.
+        """
+        pre_fix_gitignore = (
+            "# Generated artifacts and runtime cache live next to the config files\n"
+            "# but should never be committed. The catalog is the source of truth;\n"
+            "# any `file_conventions.generated.yaml` here is derived output, and\n"
+            "# any `vault/` content is local runtime state.\n"
+            "file_conventions.generated.yaml\n"
+            "vault/\n"
+            "*.log\n"
+        )
+        for preset in ("redmine-governed", "redmine-rails-governed"):
+            with self.subTest(preset=preset):
+                with tempfile.TemporaryDirectory() as tmp:
+                    home = Path(tmp) / "home"
+                    project = Path(tmp) / "project"
+                    project.mkdir()
+                    self.init_git_repository(project)
+
+                    # Adopted repo as it stood before the fix: the old
+                    # skeleton `.gitignore`, an activated config, and a
+                    # runtime DB that `git add -A` already staged.
+                    nagger = project / ".claude-nagger"
+                    nagger.mkdir()
+                    (nagger / ".gitignore").write_text(
+                        pre_fix_gitignore, encoding="utf-8"
+                    )
+                    (nagger / "config.yaml").write_text(
+                        "notify: {}\n", encoding="utf-8"
+                    )
+                    (nagger / "state.db").write_text("local\n", encoding="utf-8")
+                    subprocess.run(
+                        ["git", "add", "-A"],
+                        cwd=project,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+
+                    self.run_cli(["rules", "install", "--home", str(home)])
+                    result, _ = self.run_cli(
+                        [
+                            "scaffold",
+                            "apply",
+                            preset,
+                            "--target",
+                            str(project),
+                            "--home",
+                            str(home),
+                            "--backup",
+                        ]
+                    )
+                    self.assertEqual(0, result)
+
+                    refreshed = (nagger / ".gitignore").read_text(encoding="utf-8")
+                    for entry in (
+                        "state.db",
+                        "state.db-wal",
+                        "state.db-shm",
+                        "state.db-journal",
+                        "suggested_rules/",
+                    ):
+                        self.assertIn(
+                            entry,
+                            refreshed,
+                            msg=(
+                                f"{preset} redistribution did not add {entry} to "
+                                "the nagger .gitignore"
+                            ),
+                        )
+                    self.assertTrue(
+                        list(nagger.glob(".gitignore.bak.*")),
+                        msg=(
+                            f"{preset} redistribution replaced the nagger "
+                            ".gitignore without a backup"
+                        ),
+                    )
+
+                    tracked = subprocess.run(
+                        ["git", "ls-files"],
+                        cwd=project,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.splitlines()
+                    self.assertIn(
+                        ".claude-nagger/state.db",
+                        tracked,
+                        msg=(
+                            f"{preset} redistribution untracked an existing "
+                            "state.db; the ignore must not delete tracked files"
+                        ),
+                    )
+
+                    # New sidecars written after the repair stay out of Git.
+                    for name in ("state.db-wal", "state.db-shm"):
+                        (nagger / name).write_text("local\n", encoding="utf-8")
+                    untracked = self.git_untracked_paths(project)
+                    for name in ("state.db-wal", "state.db-shm"):
+                        self.assertNotIn(
+                            f".claude-nagger/{name}",
+                            untracked,
+                            msg=(
+                                f"{preset} redistribution leaves {name} as a Git "
+                                "candidate"
+                            ),
+                        )
 
     def test_governed_nagger_warns_on_default_lane_implementation_handoff(self) -> None:
         """Redmine #12171: governed Nagger skeleton ships the dispatch warning.
