@@ -569,6 +569,25 @@ class DeliveryTerminalityTest(ProxySendTestBase):
         self.assertFalse(older.sent)
         self.assertEqual(port.calls, [])
 
+    def test_a_superseding_decision_from_another_issue_still_delivers_once(self):
+        # The route carries decisions, not issues: the fence refuses a candidate that does not
+        # supersede the delegated ordinal, and a different issue is not itself a refusal ground. So
+        # a genuinely newer decision raised on another issue reaches the port — exactly once.
+        self.fence.bootstrap()
+        route = self._route()
+        first = self.fence.reserve(route, issue="14500", journal=OLDER_JOURNAL)
+        self.assertTrue(first.won, first)
+        self.assertTrue(
+            self.fence.mark_delivered(
+                route, first.action_id, issue="14500", journal=OLDER_JOURNAL
+            )
+        )
+
+        result, port = self._execute(self._context())
+        self.assertTrue(result.sent, result)
+        self.assertEqual(len(port.calls), 1)
+        self.assertEqual(port.calls[0][1], CURRENT_JOURNAL)
+
     def test_an_uncertain_generation_blocks_even_a_newer_decision(self):
         # `uncertain` is the one state that is genuinely unresolved: the send may have landed. A
         # newer decision must NOT be admitted over it, or the coordinator could receive two.

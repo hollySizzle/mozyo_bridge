@@ -22,11 +22,18 @@ tests pin the contract:
 
 from __future__ import annotations
 
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from mozyo_bridge.core.state.startup_execution_events import (
+# Self-insert like every sibling in this directory: a test module has to stand on its own under
+# single-file isolated discovery, not free-ride on a `src` path some earlier-imported module
+# happened to add (review j#95727 F2, found by sweeping the whole subtree).
+ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(ROOT / "src"))
+
+from mozyo_bridge.core.state.startup_execution_events import (  # noqa: E402
     EXECUTION_EVENT_STAGES,
     JOIN_EXEC_STOPPED_LOCATOR_LIVE,
     JOIN_INVENTORY_UNREADABLE,
