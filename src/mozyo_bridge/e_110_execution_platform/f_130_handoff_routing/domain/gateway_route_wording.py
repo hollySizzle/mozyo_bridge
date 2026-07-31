@@ -80,6 +80,35 @@ EXECUTION_ROOT_OUTSIDE_TARGET_REPO_NARRATIVE: str = (
 )
 
 
+#: ``DeliveryOutcome.next_action`` for an ``auto_target_repo_unresolved`` outcome
+#: (Redmine #14249 R2, review j#94499 finding 1). `--target-repo auto` asked which
+#: repo the TARGET runs in and got no answer, so no root can be asserted. The owner
+#: is the SENDER: the repairs (name the root explicitly, or repair the lane's
+#: worktree binding) are both sender / operator side, and neither is "drop the flag"
+#: — dropping `--target-repo` restores the sender-cwd execution root #14249 removed.
+AUTO_TARGET_REPO_UNRESOLVED_NEXT_ACTION: str = (
+    "`--target-repo auto` could not establish which repo the target runs in, so no "
+    "repo root was asserted and nothing was injected (nothing typed, no Enter, no "
+    "delivery recorded). Pass an explicit `--target-repo <target lane worktree>`, or "
+    "repair the target lane's worktree binding so `auto` can resolve it. Do NOT drop "
+    "`--target-repo` to get past this: without it a relative `--workdir` resolves "
+    "against the SENDER's cwd, which is the lane-external execution root this fence "
+    "exists to prevent."
+)
+
+#: ``DeliveryOutcome`` narrative for an ``auto_target_repo_unresolved`` outcome.
+AUTO_TARGET_REPO_UNRESOLVED_NARRATIVE: str = (
+    "`--target-repo auto` did not resolve the target's own repo root (Redmine "
+    "#14249): under the herdr backend there is no target pane cwd to read, so auto "
+    "resolves the target LANE's canonical worktree from its lifecycle worktree "
+    "binding — and that binding did not resolve to exactly one live worktree. "
+    "Distinct from `target_repo_mismatch` (there an OBSERVED target repo disagreed "
+    "with the asserted one); here nothing was observed to compare. Auto never falls "
+    "back to the sender's own root. Handoff aborted before typing; no notification "
+    "was typed."
+)
+
+
 __all__ = (
     "GATEWAY_ROUTE_BLOCKED_NEXT_ACTION",
     "GATEWAY_ROUTE_BLOCKED_NARRATIVE",
@@ -87,4 +116,6 @@ __all__ = (
     "READER_UPGRADE_REQUIRED_NARRATIVE",
     "EXECUTION_ROOT_OUTSIDE_TARGET_REPO_NEXT_ACTION",
     "EXECUTION_ROOT_OUTSIDE_TARGET_REPO_NARRATIVE",
+    "AUTO_TARGET_REPO_UNRESOLVED_NEXT_ACTION",
+    "AUTO_TARGET_REPO_UNRESOLVED_NARRATIVE",
 )

@@ -1031,6 +1031,12 @@ allowlist:
       repo root instead of the `%pane`-only gate; the resolution itself is the new
       `herdr_send_entry.herdr_auto_target_repo` helper, not here — only the guarded branch
       remains). tmux `auto` is byte-invariant (the branch is guarded on `herdr_send`).
+      HISTORICAL (Redmine #14249 R2, review j#94499 finding 3): the sender-root behaviour
+      and the `herdr_auto_target_repo` helper described in the #13331 entry above were
+      SUPERSEDED and the helper deleted. `auto` now resolves the TARGET's frame in
+      `f_130_handoff_routing/application/herdr_auto_target_root.py` and fails closed. The
+      #13331 text is kept as the record of why this baseline was raised, not as current
+      behaviour.
       Raised 3518 -> 3525 for the #13477 role-profile `redmine_project` auto-resolution
       wiring in `orchestrate_handoff`: the parse + `durable_anchor` + verified-default
       auto-fill now go through the extracted
@@ -1126,9 +1132,11 @@ allowlist:
       `f_130_handoff_routing/application/handoff_target_resolution.py`
       (`TargetResolutionUseCase` over a typed `TargetResolutionRequest` + `TargetResolutionResult`
       + a side-effect `TargetResolutionOps` port; `LiveTargetResolutionOps` routes the
-      resolve_herdr_send_target / pane_info / herdr_auto_target_repo / project_preflight_target and
+      resolve_herdr_send_target / pane_info / project_preflight_target and
       the pane-resolver / project-discovery / diagnostic seams through `commands` at call time so
-      every monkeypatch seam stays in force). The facade keeps one thin call site that builds the
+      every monkeypatch seam stays in force; since Redmine #14249 R2 the herdr `--target-repo
+      auto` root resolves through the `herdr_auto_target_root` application module instead of a
+      `commands`-routed helper). The facade keeps one thin call site that builds the
       typed request from the resolved envelope + backend predicate and reads the resolved
       target_info / target / duplicate_lane_panes / resolved_target_repo / preflight_target back off
       the typed result (and drop the now-orphaned `HerdrSendEntryError` / `AUTO_TARGET_REPO` /

@@ -14,11 +14,14 @@ conditions:
 - **same-lane duplicate diagnostics** thread the resolved rows through onto the result under tmux,
   and are an explicit no-op (empty) under the herdr backend;
 - **``--target-repo auto``** resolves the TARGET agent's own repo root under herdr — re-stating the
-  synthesized record's ``cwd`` with it, and failing closed (``blocked`` / ``target_repo_mismatch``)
-  rather than degrading to the sender's root (Redmine #14249 R2); under tmux it requires an
+  synthesized record's ``cwd`` with it, and failing closed (``blocked`` /
+  ``auto_target_repo_unresolved``) rather than degrading to the sender's root (Redmine #14249 R2;
+  the reason is its OWN, not ``target_repo_mismatch``, whose durable wording asserts an observed
+  pane repo root and advises dropping the flag — review j#94499 F1); under tmux it requires an
   explicit ``%pane`` (else ``blocked`` / ``invalid_args``) and a cwd that reaches a workspace/repo
-  marker (else ``blocked`` / ``target_repo_mismatch``), and on success prints the audit diagnostic
-  and hands the concrete root back; a non-auto ``--target-repo`` value passes through untouched;
+  marker (else ``blocked`` / ``target_repo_mismatch`` — there a pane cwd WAS observed), and on
+  success prints the audit diagnostic and hands the concrete root back; a non-auto
+  ``--target-repo`` value passes through untouched;
 - the canonical ``preflight_target`` projection is threaded onto the result.
 
 The live composition (``run_target_resolution`` over ``LiveTargetResolutionOps``, routing every
@@ -157,7 +160,7 @@ class _FakeOps:
         self.dup_calls.append((target_info, receiver))
         return list(self.duplicate_rows)
 
-    def herdr_auto_target_repo(
+    def resolve_auto_target_root(
         self, repo_root: Path, target_info: Dict[str, str]
     ) -> AutoTargetRoot:
         self.events.append("herdr_auto")
@@ -389,12 +392,27 @@ class TargetRepoAutoTest(unittest.TestCase):
             ops.events, ["herdr_resolve", "herdr_auto", "emit", "die"]
         )
         self.assertEqual(ops.emitted[0].outcome.status, "blocked")
-        self.assertEqual(ops.emitted[0].outcome.reason, "target_repo_mismatch")
+        # Review j#94499 F1: its OWN reason, not `target_repo_mismatch` — whose durable
+        # wording asserts an observed pane repo root and offers "drop the flag".
+        self.assertEqual(
+            ops.emitted[0].outcome.reason, "auto_target_repo_unresolved"
+        )
         self.assertEqual(ops.emitted[0].outcome.target, "herdr:claude:live")
         self.assertEqual(ops.herdr_auto_diag, [])
         assert isinstance(raised, _FakeDie)
         self.assertIn(REFUSE_LANE_BINDING_ABSENT, raised.message)
         self.assertIn("never falls back to the sender's cwd", raised.message)
+
+    def test_tmux_auto_keeps_target_repo_mismatch(self) -> None:
+        """The new reason is herdr-only: the tmux branch DID observe a pane cwd."""
+        ops = _FakeOps(
+            pane_info_result={"id": "%14", "cwd": "/nowhere"}, workspace_root=None
+        )
+        _result, raised = _run(
+            ops, _request(herdr_send=False, resolved_target_repo=_AUTO)
+        )
+        self.assertIsInstance(raised, _FakeDie)
+        self.assertEqual(ops.emitted[0].outcome.reason, "target_repo_mismatch")
 
     def test_auto_under_tmux_non_explicit_pane_blocks_invalid_args(self) -> None:
         ops = _FakeOps(pane_info_result={"id": "w1", "cwd": "/repo/work"})

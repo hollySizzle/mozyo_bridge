@@ -142,8 +142,17 @@ def bind_lane_worktree(
     key is the lifecycle row's authoritative ``worktree_identity`` token alone: among the
     workspace repo's own ``git worktree list --porcelain`` entries, exactly one path must
     RE-DERIVE that token — a missing row/token, a pruned path, or a non-unique match binds
-    nothing. The returned ``branch_ref`` is that entry's raw ref line (``""`` / non-``refs/heads``
-    for a detached worktree), so a caller that needs branch authority checks it itself.
+    nothing.
+
+    **The binding is path identity only; it does NOT imply branch authority.** A DETACHED
+    worktree binds successfully and returns ``branch_ref == ""`` (a non-``refs/heads`` ref line
+    is the same case). This is deliberate: the token proves which path is the lane's worktree
+    regardless of what is checked out there. A caller that needs the branch — a push / HEAD
+    topology observation — must check ``branch_ref`` itself and fail closed, exactly as
+    :func:`observe_lane_topology` does below; a caller that only needs the lane's ROOT (the
+    handoff rail's ``--target-repo auto``) correctly ignores it. Review j#94499 finding 2 is
+    what makes this explicit: the split left the fence in one caller, and the other caller's
+    record claimed a refusal that its code never performed.
 
     Split out of :func:`observe_lane_topology` (Redmine #14249 R2) so the handoff rail's
     ``--target-repo auto`` resolution can ask the SAME question — "which worktree is this

@@ -241,6 +241,51 @@ class UnchangedContractsTest(_SenderCwdFixture):
         self.assertTrue(env.marker)
 
 
+class AutoRefusalCarriesItsOwnReasonTest(unittest.TestCase):
+    """An unresolvable ``auto`` must not inherit `target_repo_mismatch`'s repair advice.
+
+    Review j#94499 finding 1: R2 emitted `target_repo_mismatch` for a herdr `auto` that
+    could not establish the target's frame. That reason's DURABLE narrative asserts an
+    observed target repo root disagreed, and its next_action offers "drop the flag to skip
+    the repo gate" — but herdr observes no pane cwd, and dropping `--target-repo` restores
+    the sender-cwd execution root #14249 exists to remove. The `die` string was right; the
+    structured outcome, which is what survives, was not.
+    """
+
+    REASON = "auto_target_repo_unresolved"
+
+    def test_the_refusal_never_tells_the_sender_to_drop_the_flag(self) -> None:
+        owner, action = next_action_for("blocked", self.REASON, "codex")
+        self.assertEqual(owner, "sender")
+        # The exact advice that would walk back into the defect.
+        self.assertNotIn("drop the flag", action)
+        self.assertIn("explicit `--target-repo", action)
+
+    def test_the_refusal_does_not_claim_an_observed_pane_repo_root(self) -> None:
+        outcome = make_outcome(
+            status="blocked",
+            reason=self.REASON,
+            receiver="codex",
+            target="mzb1_ws_codex_lane",
+            anchor=RedmineAnchor(issue=ISSUE, journal="94488"),
+            mode="queue-enter",
+            kind="review_request",
+            notification_marker=None,
+        )
+        record = build_delivery_record(outcome)
+        # herdr read no pane cwd, so the record must not assert one disagreed.
+        self.assertNotIn("Target pane's inferred repo root", record)
+        self.assertNotIn("Handoff did not deliver; see structured outcome", record)
+        self.assertEqual(outcome.next_action_owner, "sender")
+
+    def test_it_stays_distinct_from_target_repo_mismatch(self) -> None:
+        """Both are sender-owned, but the repairs differ — that is why it is a new reason."""
+        _, auto_action = next_action_for("blocked", self.REASON, "codex")
+        _, mismatch_action = next_action_for("blocked", "target_repo_mismatch", "codex")
+        self.assertNotEqual(auto_action, mismatch_action)
+        self.assertIn("drop the flag", mismatch_action)
+
+
 class AutoResolvesTheTargetLaneRootTest(unittest.TestCase):
     """``--target-repo auto`` must name the TARGET lane's root (Redmine #14249 R2 / j#94419).
 
@@ -465,6 +510,25 @@ class AutoResolvesTheTargetLaneRootTest(unittest.TestCase):
         self.assertEqual(resolved.root, "")
         self.assertEqual(resolved.reason, REFUSE_LANE_BINDING_ABSENT)
         self.assertNotIn(str(self.sender_worktree), resolved.detail)
+
+    def test_a_detached_lane_worktree_still_resolves(self) -> None:
+        """A detached lane binds by TOKEN, not by branch (review j#94499 finding 2).
+
+        j#94487 asserted the opposite — that a detached worktree refuses — without ever
+        measuring it, and the code accepted it all along. The contract is now the measured
+        one and is pinned here: ``worktree_identity`` hashes the canonical path, so it
+        proves which path is the lane's worktree regardless of what is checked out. Branch
+        authority belongs to ``observe_lane_topology`` (push / HEAD topology), not to
+        resolving an execution root.
+        """
+        self._git(
+            "-C", str(self.lane_worktree), "checkout", "-q", "--detach", env=self._env
+        )
+        resolved = self._resolve_auto(lane=self.LANE)
+        self.assertTrue(resolved.ok, f"{resolved.reason}: {resolved.detail}")
+        self.assertEqual(resolved.root, str(self.lane_worktree.resolve()))
+        # And it is still the LANE's root, never the sender's.
+        self.assertNotEqual(resolved.root, str(self.sender_worktree.resolve()))
 
     def test_a_pruned_lane_worktree_fails_closed(self) -> None:
         """A bound lane whose worktree is gone resolves nothing (not the sender's root)."""

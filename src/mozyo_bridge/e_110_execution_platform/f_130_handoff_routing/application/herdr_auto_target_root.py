@@ -66,7 +66,8 @@ REFUSE_FOREIGN_WORKSPACE = "foreign_workspace"
 REFUSE_LANE_BINDING_ABSENT = "lane_binding_absent"
 #: The lane's row carries an EMPTY ``worktree_identity`` (a known-unbound legacy row).
 REFUSE_LANE_BINDING_UNBOUND = "lane_binding_unbound"
-#: The binding token matched no unique live worktree (pruned / moved / non-unique / detached).
+#: The binding token matched no unique live worktree (pruned / moved / non-unique). A
+#: DETACHED worktree is NOT this case — see :func:`decide_lane_worktree_root`.
 REFUSE_LANE_WORKTREE_UNRESOLVED = "lane_worktree_unresolved"
 #: The lifecycle authority itself could not be read (fail closed, never "no row").
 REFUSE_STORE_UNREADABLE = "lifecycle_store_unreadable"
@@ -153,6 +154,14 @@ def decide_lane_worktree_root(
     is present but carries no ``worktree_identity`` (a v1/v2/v3 row the #14475 repair rail
     exists to converge) — two different facts, so they refuse with two different reasons.
     ``lane_worktree`` is the topology join's unique match, or ``""``.
+
+    A **detached** lane worktree resolves normally (review j#94499 finding 2). The join key
+    is the ``worktree_identity`` token — a hash of the canonical path — so it proves "this
+    path IS the lane's worktree" independently of what the worktree has checked out. Branch
+    authority answers a different question, which is why :func:`observe_lane_topology` (push
+    / HEAD topology) requires it and this resolver does not: the execution root of a detached
+    lane is still exactly that lane's root, and refusing it would stop a live lane for no
+    gain. (An earlier record claimed detached was refused; it was never measured. j#95735.)
     """
     lane = _norm_lane(target_lane_id)
     if lane_binding is None:
@@ -173,7 +182,7 @@ def decide_lane_worktree_root(
             reason=REFUSE_LANE_WORKTREE_UNRESOLVED,
             detail=(
                 f"lane {lane!r}'s worktree binding matched no unique live worktree of this "
-                "repo (pruned, moved, detached, or non-unique)"
+                "repo (pruned, moved, or non-unique)"
             ),
         )
     return AutoTargetRoot(

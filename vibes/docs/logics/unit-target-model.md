@@ -272,12 +272,25 @@ pane cwd / repo root   != target execution root (nested project)
     observation と共有する単一 join。send 経路なので local only、`ls-remote` は
     しない)。lane id を branch と見なす推論はしない (review j#86739 R3-F2)。
     display metadata の `lane_metadata.worktree_path` を authority に昇格させない。
+    **binding は path identity のみを与え、branch authority を含まない**:
+    `worktree_identity` は canonical path の hash なので、**detached HEAD の lane
+    worktree もそのまま解決する** (review j#94499 finding 2)。branch を要求するのは
+    push / HEAD topology を観測する `observe_lane_topology` 側の責務であり、
+    execution root の解決には不要。detached を拒否しても正しい root を持つ稼働中
+    lane を止めるだけで安全上の利得が無い。
   - それ以外 (identity 未 attested / foreign workspace / lifecycle row 不在 /
     `worktree_identity` 空 / join 非一意 / store 読取不能): **typed fail-closed**。
-    `blocked` / `target_repo_mismatch` で zero-send し、explicit
+    `blocked` / **`auto_target_repo_unresolved`** で zero-send し、explicit
     `--target-repo <target lane worktree>` を要求する。sender cwd への silent
     fallback は禁止 — それが本 defect であり、誤った execution root を検証済みの
     ものとして送達する。
+    **この失敗に `target_repo_mismatch` を使ってはならない** (review j#94499
+    finding 1)。同 reason の narrative / next_action は「観測された target pane の
+    repo root が asserted 値と不一致」「flag を外して repo gate を skip」を述べるが、
+    herdr auto は pane cwd を観測しておらず (比較対象が存在しない)、かつ flag を
+    外すと relative workdir が sender cwd 基準に戻り、本節が禁じた状態そのものに
+    なる。**reason を再利用することは、その narrative / next_action を継承すること
+    である** — token の抽象的な近さではなく、sender に渡る repair が正しいかで選ぶ。
   herdr の synthesized target record の `cwd` も、この解決済み root で re-state
   する。そうしないと下流の `target_repo_mismatch` gate が「検証済み target root」対
   「sender root」を比較し、正しくなった send を構造的に落とす。

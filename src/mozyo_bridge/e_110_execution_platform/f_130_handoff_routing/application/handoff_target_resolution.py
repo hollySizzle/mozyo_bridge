@@ -13,11 +13,14 @@ canonical preflight vocabulary. That slice is one coherent step:
 - project the locator ``target = target_info["id"]``;
 - surface any live same-lane receiver-duplicate panes for the durable record (diagnostic only, an
   explicit no-op under herdr, and a snapshot-read failure never changes delivery);
-- resolve ``--target-repo auto`` — herdr resolves to the sender's own repo root; tmux infers the
-  repo root from the explicitly-named ``%pane``'s own cwd (fail-closed to ``invalid_args`` when the
-  target is not an explicit ``%pane``, or ``target_repo_mismatch`` when the cwd reaches no
-  workspace/repo marker); a hand-passed ``--target-repo <root>`` and a non-auto value pass through
-  untouched;
+- resolve ``--target-repo auto`` — herdr resolves the TARGET's own frame (its lane's canonical
+  worktree, or this checkout when the target IS the sender's lane), fail-closed to
+  ``auto_target_repo_unresolved`` and never degrading to the sender's root (Redmine #14249 R2);
+  tmux infers the repo root from the explicitly-named ``%pane``'s own cwd (fail-closed to
+  ``invalid_args`` when the target is not an explicit ``%pane``, or ``target_repo_mismatch`` when
+  the cwd reaches no workspace/repo marker — there a pane cwd WAS observed, which is why that
+  branch keeps the mismatch reason); a hand-passed ``--target-repo <root>`` and a non-auto value
+  pass through untouched;
 - project the resolved pane onto the canonical ``PreflightTarget`` identity vocabulary
   (``project_preflight_target``), the same projection ``agents targets`` uses.
 
@@ -177,7 +180,7 @@ class TargetResolutionOps(Protocol):
         """Live same-lane receiver-duplicate rows (diagnostic; a snapshot-read failure -> [])."""
         ...
 
-    def herdr_auto_target_repo(
+    def resolve_auto_target_root(
         self, repo_root: Path, target_info: Dict[str, str]
     ) -> AutoTargetRoot:
         """Resolve ``--target-repo auto`` for a herdr send to the TARGET agent's repo root."""
@@ -343,10 +346,16 @@ class TargetResolutionUseCase:
             # the sender's lane, otherwise that lane's canonical worktree via its lifecycle
             # worktree binding — and refuses when neither is establishable. There is deliberately
             # no sender-cwd fallback: that fallback IS the defect.
-            auto = ops.herdr_auto_target_repo(request.repo_root, target_info)
+            auto = ops.resolve_auto_target_root(request.repo_root, target_info)
             if not auto.ok:
+                # Review j#94499 F1: NOT `target_repo_mismatch`. That reason's durable
+                # narrative asserts an OBSERVED target repo root disagreed, and its
+                # next_action offers "drop the flag to skip the repo gate" — but herdr
+                # observed no pane cwd at all, and dropping `--target-repo` restores the
+                # sender-cwd execution root this issue removed. Reusing the token would
+                # have inherited wording that routes the sender back into the defect.
                 self._emit_blocked(
-                    request, reason="target_repo_mismatch", target=target
+                    request, reason="auto_target_repo_unresolved", target=target
                 )
                 ops.die(
                     "`--target-repo auto` could not verify the target agent's repo root "
@@ -509,7 +518,7 @@ class LiveTargetResolutionOps:
         except (Exception, SystemExit):
             return []
 
-    def herdr_auto_target_repo(
+    def resolve_auto_target_root(
         self, repo_root: Path, target_info: Dict[str, str]
     ) -> AutoTargetRoot:
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.herdr_auto_target_root import (  # noqa: E501

@@ -36,6 +36,8 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketle
 # small f_130 sibling so this oversized module does not grow inline prose for the
 # new reason (the policy is in the f_140 enforcement module, uncyclable from here).
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_route_wording import (
+    AUTO_TARGET_REPO_UNRESOLVED_NARRATIVE,
+    AUTO_TARGET_REPO_UNRESOLVED_NEXT_ACTION,
     EXECUTION_ROOT_OUTSIDE_TARGET_REPO_NARRATIVE,
     EXECUTION_ROOT_OUTSIDE_TARGET_REPO_NEXT_ACTION,
     GATEWAY_ROUTE_BLOCKED_NARRATIVE,
@@ -715,11 +717,9 @@ Reason = Literal[
     # — kept apart from the generic `gateway_route_blocked` (an unreadable/corrupt store) so
     # the operator is told the reader is stale, not that the route is wrong.
     "reader_upgrade_required",
-    # Redmine #14249: an asserted `--target-repo` and the resolved `--workdir` contradict
-    # each other, so the delivery would name a root OUTSIDE the lane the receiver was gated
-    # into. Refused pre-send (zero bytes typed). Distinct from `target_repo_mismatch` (there
-    # the target PANE failed the repo gate; here it passed and the sender's flags disagree).
+    # Redmine #14249 pre-send refusals, NOT `target_repo_mismatch`: `gateway_route_wording`.
     "execution_root_outside_target_repo",
+    "auto_target_repo_unresolved",
 ]
 NextActionOwner = Literal["receiver", "sender", "operator"]
 
@@ -1202,6 +1202,8 @@ def next_action_for(
     if reason == "execution_root_outside_target_repo":
         # Redmine #14249: `--target-repo` and `--workdir` disagree; nothing was typed.
         return "sender", EXECUTION_ROOT_OUTSIDE_TARGET_REPO_NEXT_ACTION
+    if reason == "auto_target_repo_unresolved":
+        return "sender", AUTO_TARGET_REPO_UNRESOLVED_NEXT_ACTION
     if reason == "gateway_route_blocked":
         # Redmine #12918: governed delivery to a cross-lane Claude worker, blocked.
         # Wording lives in the f_130 sibling `gateway_route_wording` (the policy is
@@ -1662,6 +1664,8 @@ def _outcome_narrative(
         )
     if reason == "execution_root_outside_target_repo":
         return EXECUTION_ROOT_OUTSIDE_TARGET_REPO_NARRATIVE
+    if reason == "auto_target_repo_unresolved":
+        return AUTO_TARGET_REPO_UNRESOLVED_NARRATIVE
     if reason == "gateway_route_blocked":
         return GATEWAY_ROUTE_BLOCKED_NARRATIVE
     if reason == "reader_upgrade_required":
