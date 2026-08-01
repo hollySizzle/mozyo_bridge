@@ -307,24 +307,67 @@ class LiveAutoIntegrationGitOperations:
 
     # -- mutations --------------------------------------------------------
 
-    #: Config that pins what `commit-tree` and `merge-tree` may otherwise take from the host.
-    #: `i18n.commitEncoding` adds an encoding header and changes the commit id (measured,
-    #: j#96417 finding 1); `commit.gpgsign` does not reach `commit-tree` at all (also
-    #: measured) but is pinned so a future git cannot make it reach.
+    #: Config pinned on every object-building invocation, with why each one is here. `-c`
+    #: overrides every config file including repo-local (measured), so this is the one lever
+    #: that reaches all of them.
+    #:
+    #: - ``i18n.commitEncoding`` adds an encoding header and changes the commit id (measured,
+    #:   j#96417 finding 1);
+    #: - ``commit.gpgsign`` does not reach ``commit-tree`` at all (measured) but is pinned so
+    #:   a future git cannot make it reach;
+    #: - ``merge.directoryRenames`` / ``merge.renames`` / ``diff.renames`` each change the
+    #:   MERGED TREE (measured, j#96422 finding 1 — flipping any one of them produced a
+    #:   different tree for the same action). The values are git's documented defaults, so
+    #:   pinning fixes them without changing what a merge means;
+    #: - the two rename limits are pinned by reasoning rather than by a demonstrated
+    #:   difference: our scene did not exceed them, but a *bound* that varies per host is a
+    #:   varying input, and git falls back to no rename detection once it is exceeded.
+    #:
+    #: This list is the enforced set, stated exactly. It is not a claim that no other key can
+    #: matter — three rounds running I wrote "the inputs are only X" and was wrong (j#96412,
+    #: j#96417, j#96422). What IS claimed: these are pinned, the environment is built rather
+    #: than inherited, replace refs are off, and a custom merge driver is refused.
     _DETERMINISTIC_CONFIG: Tuple[str, ...] = (
         "-c",
         "i18n.commitEncoding=UTF-8",
         "-c",
         "commit.gpgsign=false",
+        "-c",
+        "merge.directoryRenames=conflict",
+        "-c",
+        "merge.renames=true",
+        "-c",
+        "diff.renames=true",
+        "-c",
+        "merge.renameLimit=32767",
+        "-c",
+        "diff.renameLimit=32767",
     )
-    #: Global and system config are made empty for the two object-building invocations. Both
-    #: are host state; neither is needed by an operation that touches no network and no
-    #: checkout. Repo-local `.git/config` is NOT isolated — it cannot be, and what it can
-    #: still change is handled by refusing (see `_nondeterministic_merge_config`).
-    _ISOLATED_CONFIG_ENV = {
-        "GIT_CONFIG_GLOBAL": os.devnull,
-        "GIT_CONFIG_SYSTEM": os.devnull,
-    }
+    #: Passed to the merge so ``refs/replace/*`` cannot silently substitute an object for
+    #: another. Replace refs live in the repository, so no environment isolation reaches them
+    #: (j#96422 finding 1).
+    _NO_REPLACE: Tuple[str, ...] = ("--no-replace-objects",)
+    #: The environment variables an object-building invocation is allowed to inherit. Every
+    #: ``GIT_*`` variable is dropped rather than passed through: ``GIT_DIR``,
+    #: ``GIT_OBJECT_DIRECTORY``, ``GIT_ALTERNATE_OBJECT_DIRECTORIES``, ``GIT_ATTR_NOSYSTEM``
+    #: and friends change what git reads and are not reachable by ``-c``. R12 overlaid a few
+    #: variables onto the inherited environment and called that isolation; it was not
+    #: (j#96422 finding 1).
+    _INHERITABLE_ENV = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "SYSTEMROOT")
+
+    def _object_env(self, **overrides: str) -> dict[str, str]:
+        """Build the environment for an object-building invocation instead of inheriting it."""
+        env = {
+            name: os.environ[name]
+            for name in self._INHERITABLE_ENV
+            if name in os.environ
+        }
+        env["GIT_CONFIG_GLOBAL"] = os.devnull
+        env["GIT_CONFIG_SYSTEM"] = os.devnull
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        env["GIT_NO_REPLACE_OBJECTS"] = "1"
+        env.update(overrides)
+        return env
 
     def _merge_tree_capability(self) -> str:
         """``supported`` / ``unsupported`` / ``probe_error`` — three answers, not two.
@@ -348,6 +391,33 @@ class LiveAutoIntegrationGitOperations:
             )
         return MERGE_PROBE_ERROR
 
+    def _checked_target_branch(self, target_ref: str) -> str:
+        """The bare branch name, validated against BOTH grammars it has to satisfy.
+
+        ``_checked_branch`` answers "can this be spelled in a refspec without changing what
+        the argv means" — it rejects ``+`` (which spells a force) and a leading ``-`` (which
+        turns the value into an option). That is not the same question as "is this a legal
+        branch name", and R12 shipped only the first: ``main..bad``, ``main.lock``,
+        ``main@{bad`` and ``main//bad`` all merged and produced commits (measured, j#96422
+        finding 3). ``git check-ref-format --branch`` answers the second, and rejects all
+        four. Neither subsumes the other — ``ma+in`` passes check-ref-format and must still be
+        refused — so both run.
+
+        Raises :class:`UnsafeRefspecError`, which the caller turns into ``invalid_input``.
+        """
+        branch = _checked_branch(target_ref)
+        # `check-ref-format` does not accept `--end-of-options` (measured: exit 129). It is
+        # safe without one only because `_checked_branch` has already refused a leading `-`,
+        # so the value cannot be read as an option — the order of these two checks is load
+        # bearing, not incidental.
+        checked = self._run("check-ref-format", "--branch", branch)
+        if checked.returncode != 0:
+            raise UnsafeRefspecError(
+                f"target ref {target_ref!r} is not a valid branch name: "
+                f"{checked.stderr.strip()[:120]}"
+            )
+        return branch
+
     def _nondeterministic_merge_config(self) -> str:
         """The configured merge driver, if any — the input this adapter cannot pin.
 
@@ -360,10 +430,22 @@ class LiveAutoIntegrationGitOperations:
         producing an object it cannot promise to reproduce — the rule this issue has applied
         to three destructive operations, applied to a determinism claim.
 
+        Asked through the SAME config view the merge itself uses. R12 asked it without the
+        isolation the real invocations apply, so an unused driver sitting in a *global* config
+        — which the merge would never have seen — refused a clean merge (measured, j#96422
+        finding 4). A gate must be asked about the world its subject actually runs in.
+
+        A driver declared in repo-local config still refuses even when no in-tree attribute
+        selects it: which paths a merge touches is not known until it has run, so "declared
+        but unselected" cannot be established beforehand. Whether that conservative reading
+        should stand is an owner/design question, recorded rather than settled here.
+
         Returns the offending config key, or ``""`` when there is none. An unreadable config
         reads as "there is one": the fail-closed direction for a determinism gate.
         """
-        result = self._run("config", "--get-regexp", r"^merge\..*\.driver$")
+        result = self._run(
+            "config", "--get-regexp", r"^merge\..*\.driver$", env=self._object_env()
+        )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip().splitlines()[0].split()[0]
         if result.returncode not in (0, 1):
@@ -434,7 +516,7 @@ class LiveAutoIntegrationGitOperations:
                 ),
             )
         try:
-            branch = _checked_branch(target_ref)
+            branch = self._checked_target_branch(target_ref)
         except UnsafeRefspecError as unsafe:
             # R11 declared this vocabulary member and then let the exception escape into the
             # caller (j#96417 finding 3): a status that says it covers unusable ref names, and
@@ -470,12 +552,13 @@ class LiveAutoIntegrationGitOperations:
             )
         merged = self._run(
             *self._DETERMINISTIC_CONFIG,
+            *self._NO_REPLACE,
             "merge-tree",
             "--write-tree",
             "--end-of-options",
             expected_target_head,
             source_head,
-            env=self._ISOLATED_CONFIG_ENV,
+            env=self._object_env(),
         )
         first_line = merged.stdout.strip().splitlines()[0].strip() if merged.stdout.strip() else ""
         tree = first_line if _is_full_sha(first_line) else ""
@@ -515,6 +598,7 @@ class LiveAutoIntegrationGitOperations:
             )
         committed = self._run(
             *self._DETERMINISTIC_CONFIG,
+            *self._NO_REPLACE,
             "commit-tree",
             tree,
             "-p",
@@ -523,15 +607,14 @@ class LiveAutoIntegrationGitOperations:
             source_head,
             "-m",
             f"Merge {source_head} into {branch}",
-            env={
-                **self._ISOLATED_CONFIG_ENV,
+            env=self._object_env(**{
                 "GIT_AUTHOR_NAME": ACTUATOR_IDENTITY_NAME,
                 "GIT_AUTHOR_EMAIL": ACTUATOR_IDENTITY_EMAIL,
                 "GIT_AUTHOR_DATE": timestamp,
                 "GIT_COMMITTER_NAME": ACTUATOR_IDENTITY_NAME,
                 "GIT_COMMITTER_EMAIL": ACTUATOR_IDENTITY_EMAIL,
                 "GIT_COMMITTER_DATE": timestamp,
-            },
+            }),
         )
         integration_head = committed.stdout.strip() if committed.returncode == 0 else ""
         if not _is_full_sha(integration_head):

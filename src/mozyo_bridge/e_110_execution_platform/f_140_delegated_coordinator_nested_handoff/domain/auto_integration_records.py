@@ -236,6 +236,12 @@ LEDGER_MISSING_HEAD = "ledger_step_head_missing"
 LEDGER_DUPLICATE_STEP = "ledger_duplicate_step"
 #: A ``done`` entry names a step this machine does not have.
 LEDGER_UNKNOWN_STEP = "ledger_unknown_step"
+#: A ``done`` apply whose recorded merge status is not :data:`MERGE_MERGED`, or any other step
+#: carrying a merge status at all. R12 added the status as a durable field and then had no
+#: consumer read it, so an apply recorded ``done`` with ``unrecognized_status`` reached
+#: ``push_waiting`` and authorized a push (measured, j#96422 finding 2). A field nothing reads
+#: is not a gate — the same lesson as the round before, one layer further out.
+LEDGER_MERGE_STATUS_UNSOUND = "ledger_merge_status_unsound"
 
 
 def ledger_integrity_errors(
@@ -244,6 +250,7 @@ def ledger_integrity_errors(
     action_key: str,
     required_order: Tuple[str, ...],
     head_bearing_steps: Tuple[str, ...] = (),
+    merge_status_step: str = "",
     recorded_by: str = "",
     known_steps: Tuple[str, ...] = (),
 ) -> Tuple[str, ...]:
@@ -258,6 +265,11 @@ def ledger_integrity_errors(
     ledger); ``head_bearing_steps`` are the steps whose ``done`` entry must name a full commit
     SHA, because a step that cannot say what it produced has not been shown to have produced
     anything.
+
+    ``merge_status_step`` names the step whose ``done`` entry must ALSO carry
+    :data:`MERGE_MERGED`. Anything else — a failure status, an unrecognized one, or none at
+    all — means the apply was not shown to have merged, and no step other than that one may
+    carry a merge status at all.
     """
     entries = [
         entry
@@ -295,6 +307,16 @@ def ledger_integrity_errors(
         entry = positions.get(step)
         if entry is not None and not is_full_sha(entries[entry].head):
             problems.append(LEDGER_MISSING_HEAD)
+            break
+    for entry in entries:
+        expected_merged = merge_status_step and entry.step == merge_status_step
+        if expected_merged and entry.merge_status != MERGE_MERGED:
+            problems.append(LEDGER_MERGE_STATUS_UNSOUND)
+            break
+        if not expected_merged and entry.merge_status:
+            # A status on a step that cannot produce one is a record about something that did
+            # not happen; it is refused rather than ignored.
+            problems.append(LEDGER_MERGE_STATUS_UNSOUND)
             break
     return tuple(dict.fromkeys(problems))
 
@@ -618,6 +640,7 @@ __all__ = (
     "MERGE_COMMIT_ERROR",
     "MERGE_UNRECOGNIZED",
     "MERGE_STATUSES",
+    "LEDGER_MERGE_STATUS_UNSOUND",
     "checked_merge_status",
     "IntegrationPreflight",
 )

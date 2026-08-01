@@ -23,6 +23,7 @@ process is spawned and no network is touched.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import unittest
@@ -59,6 +60,24 @@ OTHER_HEAD = "e" * 40
 TREE = "f" * 40
 DATE = "2026-08-01T12:00:00+09:00"
 OTHER_DATE = "2026-07-01T12:00:00+09:00"
+#: The config every object-building invocation pins, in order. Asserted as a whole so a
+#: silently dropped key fails rather than passing a prefix check.
+_PINNED = (
+    "-c",
+    "i18n.commitEncoding=UTF-8",
+    "-c",
+    "commit.gpgsign=false",
+    "-c",
+    "merge.directoryRenames=conflict",
+    "-c",
+    "merge.renames=true",
+    "-c",
+    "diff.renames=true",
+    "-c",
+    "merge.renameLimit=32767",
+    "-c",
+    "diff.renameLimit=32767",
+)
 
 
 class _Recorder:
@@ -173,8 +192,8 @@ class MergeTest(unittest.TestCase):
         return _fail_rc(1)
 
     def _preamble(self) -> list:
-        """The two questions asked before any merge: can this git, and is it deterministic."""
-        return [self._ok_version(), self._no_driver()]
+        """Everything asked before a merge: is the ref legal, can this git, is it deterministic."""
+        return [_ok("main"), self._ok_version(), self._no_driver()]
 
     def _dates(self) -> list:
         """Both parents' committer dates, as ISO strings then as epoch seconds."""
@@ -189,26 +208,45 @@ class MergeTest(unittest.TestCase):
         self.assertFalse(result.conflicted)
         self.assertEqual(result.integration_head, MERGE_HEAD)
 
-        version, driver, write_tree = recorder.argvs[:3]
+        ref_check, version, driver, write_tree = recorder.argvs[:4]
         commit = recorder.argvs[-1]
+        # The target ref is validated against git's own grammar before any object is built
+        # (j#96422 finding 3).
+        self.assertEqual(ref_check[:2], ("check-ref-format", "--branch"))
         self.assertEqual(version, ("--version",))
         # Determinism is CHECKED before it is claimed: a configured merge driver would make
         # the tree host-dependent, so the adapter asks (j#96417 finding 1).
         self.assertEqual(driver[:2], ("config", "--get-regexp"))
-        self.assertEqual(write_tree[4:6], ("merge-tree", "--write-tree"))
+        self.assertEqual(
+            write_tree[len(_PINNED) : len(_PINNED) + 3],
+            ("--no-replace-objects", "merge-tree", "--write-tree"),
+        )
         # The merge's inputs are object ids, in the order that makes the measured target the
         # first parent — not a branch name anything could re-point.
         self.assertEqual(write_tree[-2:], (TARGET, SOURCE))
-        self.assertEqual(commit[4:6], ("commit-tree", TREE))
+        self.assertEqual(
+            commit[len(_PINNED) : len(_PINNED) + 3],
+            ("--no-replace-objects", "commit-tree", TREE),
+        )
         self.assertEqual(commit.count("-p"), 2)
         self.assertEqual(commit[commit.index("-p") + 1], TARGET)
-        # Encoding is pinned per-invocation on both object-building commands, because
-        # `i18n.commitEncoding` changes the commit id (measured).
+        # Every measured host input is pinned on BOTH object-building commands: the encoding
+        # that changes the commit id, and the rename settings that change the merged tree
+        # (j#96417 finding 1, j#96422 finding 1).
         for argv in (write_tree, commit):
-            self.assertEqual(
-                argv[:4],
-                ("-c", "i18n.commitEncoding=UTF-8", "-c", "commit.gpgsign=false"),
-            )
+            self.assertEqual(argv[: len(_PINNED)], _PINNED)
+        # ...and the environment is built rather than inherited, so no GIT_* variable the
+        # caller happens to have set reaches git.
+        object_envs = [
+            env
+            for argv, _, env in recorder.calls
+            if "merge-tree" in argv or "commit-tree" in argv
+        ]
+        self.assertEqual(len(object_envs), 2)
+        for env in object_envs:
+            self.assertEqual(env["GIT_CONFIG_GLOBAL"], os.devnull)
+            self.assertEqual(env["GIT_NO_REPLACE_OBJECTS"], "1")
+            self.assertNotIn("GIT_DIR", env)
 
     def test_the_commit_takes_its_identity_from_the_action_not_the_host(self) -> None:
         # R10 review j#96412 finding 1: the same action produced two SHAs a second apart,
@@ -261,24 +299,39 @@ class MergeTest(unittest.TestCase):
         # Measured on real git: a `merge.<name>.driver` rewrites the merged content as
         # arbitrary host-local code, so the same action would not rebuild the same commit.
         recorder = _Recorder(
-            [self._ok_version(), _ok("merge.mine.driver cp %A %B")]
+            [_ok("main"), self._ok_version(), _ok("merge.mine.driver cp %A %B")]
         )
         result = _adapter(recorder).apply_merge(
             source_head=SOURCE, target_ref="main", expected_target_head=TARGET
         )
         self.assertEqual(result.status, MERGE_NONDETERMINISTIC_CONFIG)
         self.assertIn("merge.mine.driver", result.detail)
-        self.assertEqual(len(recorder.argvs), 2)  # it never merged
+        self.assertEqual(len(recorder.argvs), 3)  # it never merged
+        # The probe asks through the SAME config view the merge would use, so a driver the
+        # merge could never have seen does not refuse it (j#96422 finding 4).
+        self.assertEqual(recorder.envs[-1]["GIT_CONFIG_GLOBAL"], os.devnull)
 
     def test_an_unsafe_ref_name_is_invalid_input_not_an_exception(self) -> None:
         # R11 declared this status covers unusable ref names and then let the exception
-        # escape into the actuator (j#96417 finding 3).
+        # escape into the actuator (j#96417 finding 3). `+` is a legal ref character that
+        # spells a force inside a refspec, so this one never reaches git.
         recorder = _Recorder([])
         result = _adapter(recorder).apply_merge(
             source_head=SOURCE, target_ref="ma+in", expected_target_head=TARGET
         )
         self.assertEqual(result.status, MERGE_INVALID_INPUT)
         self.assertEqual(recorder.argvs, [])
+
+    def test_a_name_git_itself_rejects_is_invalid_input(self) -> None:
+        # The other half of the grammar: `main..bad` and friends carry no refspec-unsafe
+        # character, so only git's own validator catches them — and R12 shipped without it,
+        # merging and committing for all four (measured, j#96422 finding 3).
+        recorder = _Recorder([_fail("is not a valid branch name")])
+        result = _adapter(recorder).apply_merge(
+            source_head=SOURCE, target_ref="main..bad", expected_target_head=TARGET
+        )
+        self.assertEqual(result.status, MERGE_INVALID_INPUT)
+        self.assertEqual(len(recorder.argvs), 1)  # nothing was built
 
     def test_nothing_runs_in_a_worktree_and_nothing_switches_or_moves_a_ref(self) -> None:
         recorder = _Recorder([*self._preamble(), _ok(TREE), *self._dates(), _ok(MERGE_HEAD)])
@@ -314,7 +367,7 @@ class MergeTest(unittest.TestCase):
         self.assertEqual(result.status, MERGE_CONTENT_CONFLICT)
         self.assertTrue(result.is_content_conflict)
         self.assertEqual(result.integration_head, "")
-        self.assertEqual(len(recorder.argvs), 3)  # nothing was committed
+        self.assertEqual(len(recorder.argvs), 4)  # nothing was committed
         flat = " ".join(" ".join(argv) for argv in recorder.argvs)
         for forbidden in ("--strategy", "-X", "theirs", "ours", "rebase"):
             self.assertNotIn(forbidden, flat, forbidden)
@@ -335,21 +388,21 @@ class MergeTest(unittest.TestCase):
         self.assertIn("NOT proof that the primitive is unavailable", result.detail)
 
     def test_unsupported_is_established_by_the_version_not_by_an_exit_code(self) -> None:
-        recorder = _Recorder([_ok("git version 2.37.9")])
+        recorder = _Recorder([_ok("main"), _ok("git version 2.37.9")])
         result = _adapter(recorder).apply_merge(
             source_head=SOURCE, target_ref="main", expected_target_head=TARGET
         )
         self.assertEqual(result.status, MERGE_PRIMITIVE_UNSUPPORTED)
         # It refused BEFORE attempting the merge, rather than running it and guessing from
         # whatever came back (j#96412 finding 2: an unknown exit code is not evidence).
-        self.assertEqual(len(recorder.argvs), 1)
+        self.assertEqual(len(recorder.argvs), 2)
 
     def test_an_unanswerable_capability_question_is_not_an_answer(self) -> None:
         # R11 folded "the version command failed" and "its output was unparseable" into
         # `primitive_unsupported` — asserting a fact it had just failed to establish, in the
         # same round whose review required the opposite (j#96417 finding 3).
         for unreadable in (_fail("git: command not found"), _ok("garbage")):
-            recorder = _Recorder([unreadable])
+            recorder = _Recorder([_ok("main"), unreadable])
             self.assertEqual(
                 _adapter(recorder)
                 .apply_merge(
@@ -365,7 +418,7 @@ class MergeTest(unittest.TestCase):
             source_head=SOURCE, target_ref="main", expected_target_head=TARGET
         )
         self.assertEqual(result.status, MERGE_ERROR)
-        self.assertEqual(len(recorder.argvs), 3)
+        self.assertEqual(len(recorder.argvs), 4)
 
     def test_a_tree_that_cannot_be_committed_says_so(self) -> None:
         recorder = _Recorder(

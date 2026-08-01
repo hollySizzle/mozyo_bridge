@@ -77,6 +77,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     IntegrationCiEvidence,
     IntegrationPreflight,
     LaneWorktree,
+    MERGE_MERGED,
+    LEDGER_MERGE_STATUS_UNSOUND,
     checked_merge_status,
     StepOutcome,
     build_integration_action_record,
@@ -616,6 +618,12 @@ def decide_integration(
         head_bearing_steps=(STEP_INTEGRATION_APPLY, STEP_PUSH)
         if disposition == DISPOSITION_MERGE_COMMIT
         else (STEP_PUSH,),
+        # The apply's recorded merge status is READ here, not merely stored. j#96422 finding
+        # 2: a `done` apply carrying `unrecognized_status` reached `push_waiting` and
+        # authorized a push, because the field existed and nothing consulted it.
+        merge_status_step=(
+            STEP_INTEGRATION_APPLY if disposition == DISPOSITION_MERGE_COMMIT else ""
+        ),
         recorded_by=trusted_recorder,
         known_steps=INTEGRATION_STEPS,
     )
@@ -922,6 +930,8 @@ __all__ = (
     "AutoIntegrationPolicy",
     "IntegrationPreflight",
     "LaneWorktree",
+    "MERGE_MERGED",
+    "LEDGER_MERGE_STATUS_UNSOUND",
     "checked_merge_status",
     "IntegrationDecision",
     "decide_integration",

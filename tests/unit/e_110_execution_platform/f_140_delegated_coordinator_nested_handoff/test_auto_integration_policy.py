@@ -80,6 +80,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     AutoIntegrationPolicy,
     IntegrationActionRecord,
     IntegrationCiEvidence,
+    MERGE_MERGED,
+    LEDGER_MERGE_STATUS_UNSOUND,
     IntegrationPreflight,
     StepOutcome,
     build_integration_action_record,
@@ -445,6 +447,90 @@ class StateOrderTest(unittest.TestCase):
         self.assertIn("run-1", decision.reason)
 
 
+class R12ReviewFinding2Test(unittest.TestCase):
+    """A recorded apply is believed only when it recorded that it MERGED.
+
+    j#96417 finding 2 asked for the typed status to reach the durable record; R12 added the
+    field, and nothing read it. Measured on the pure decision: an apply recorded ``done`` with
+    ``unrecognized_status``, trusted provenance and a full head reached ``push_waiting`` and
+    authorized the push (j#96422 finding 2). Storing a fact and gating on it are two different
+    pieces of work, and only the first had been done.
+    """
+
+    def _merge_policy(self) -> AutoIntegrationPolicy:
+        return AutoIntegrationPolicy(
+            mode=MODE_AUTO, integration_branch="main", ff_only=False
+        )
+
+    def _applied(self, record, status: str) -> list:
+        return [
+            StepOutcome(
+                record.action_key,
+                STEP_INTEGRATION_APPLY,
+                OUTCOME_DONE,
+                head=OTHER,
+                recorded_by=RECORDER,
+                merge_status=status,
+            )
+        ]
+
+    def test_only_a_merged_apply_authorizes_the_push(self) -> None:
+        record = _record()
+        for status in (
+            "unrecognized_status",
+            "content_conflict",
+            "merge_error",
+            "primitive_unsupported",
+            "probe_error",
+            "",
+        ):
+            decision = decide_integration(
+                self._merge_policy(),
+                record,
+                _clean(fast_forward_possible=False),
+                ledger=self._applied(record, status),
+                trusted_recorder=RECORDER,
+            )
+            self.assertTrue(decision.is_blocked, status)
+            self.assertIsNone(decision.next_step, status)
+            self.assertIn(LEDGER_MERGE_STATUS_UNSOUND, decision.reason, status)
+
+    def test_a_merged_apply_still_reaches_the_push(self) -> None:
+        record = _record()
+        decision = decide_integration(
+            self._merge_policy(),
+            record,
+            _clean(fast_forward_possible=False),
+            ledger=self._applied(record, MERGE_MERGED),
+            trusted_recorder=RECORDER,
+        )
+        self.assertEqual(decision.next_step, STEP_PUSH)
+        self.assertFalse(decision.is_blocked)
+
+    def test_a_merge_status_on_a_step_that_cannot_produce_one_is_refused(self) -> None:
+        # A record about something that did not happen is refused rather than ignored.
+        record = _record()
+        decision = decide_integration(
+            self._merge_policy(),
+            record,
+            _clean(fast_forward_possible=False),
+            ledger=self._applied(record, MERGE_MERGED)
+            + [
+                StepOutcome(
+                    record.action_key,
+                    STEP_PUSH,
+                    OUTCOME_DONE,
+                    head=OTHER,
+                    recorded_by=RECORDER,
+                    merge_status=MERGE_MERGED,
+                )
+            ],
+            trusted_recorder=RECORDER,
+        )
+        self.assertTrue(decision.is_blocked)
+        self.assertIn(LEDGER_MERGE_STATUS_UNSOUND, decision.reason)
+
+
 class IdempotencyTest(unittest.TestCase):
     def test_a_done_step_is_not_re_run(self) -> None:
         record = _record()
@@ -478,7 +564,8 @@ class IdempotencyTest(unittest.TestCase):
         )
         ledger = [
             StepOutcome(
-                record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE, head=OTHER, recorded_by=RECORDER)
+                record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE,
+                head=OTHER, recorded_by=RECORDER, merge_status=MERGE_MERGED)
         ]
         decision = decide_integration(policy, record, world, ledger=ledger)
         self.assertEqual(decision.next_step, STEP_PUSH)
@@ -544,7 +631,9 @@ class R1ReviewFindingRegressionTest(unittest.TestCase):
         )
         merge_head = "f" * 40
         ledger = [
-            StepOutcome(record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE, head=merge_head, recorded_by=RECORDER),
+            StepOutcome(
+                record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE,
+                head=merge_head, recorded_by=RECORDER, merge_status=MERGE_MERGED),
             StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=merge_head, recorded_by=RECORDER),
         ]
         about_source = IntegrationCiEvidence(
@@ -858,7 +947,8 @@ class R2ReviewFindingRegressionTest(unittest.TestCase):
             ),
             ledger=[
                 StepOutcome(
-                    record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE, head=merge_head, recorded_by=RECORDER),
+                record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE,
+                head=merge_head, recorded_by=RECORDER, merge_status=MERGE_MERGED),
                 StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head="", recorded_by=RECORDER),
             ],
         )
@@ -900,7 +990,8 @@ class R2ReviewFindingRegressionTest(unittest.TestCase):
             ),
             ledger=[
                 StepOutcome(
-                    record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE, head=merge_head, recorded_by=RECORDER),
+                record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE,
+                head=merge_head, recorded_by=RECORDER, merge_status=MERGE_MERGED),
                 StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER),
             ],
         )
@@ -926,7 +1017,8 @@ class R2ReviewFindingRegressionTest(unittest.TestCase):
             ),
             ledger=[
                 StepOutcome(
-                    record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE, head=merge_head, recorded_by=RECORDER),
+                record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE,
+                head=merge_head, recorded_by=RECORDER, merge_status=MERGE_MERGED),
                 StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=merge_head, recorded_by=RECORDER),
             ],
         )

@@ -198,11 +198,23 @@ R11 が書いた「入力は arguments のみ / どの host でも同じ」は *
 | 現在時刻 | 1.1 秒差で別 SHA (同上) | 下記 timestamp 規則 |
 | `i18n.commitEncoding` | encoding header が付き別 SHA (j#96417 F1 実測) | `-c i18n.commitEncoding=UTF-8` で invocation ごとに pin |
 | global / system config 全般 | 同上 | `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM` を空にして実行 |
+| `merge.directoryRenames` / `merge.renames` / `diff.renames` | **merged tree が変わる** (実測。j#96422 F1) | **`-c` で pin** (値は git の documented default) |
+| rename limit 2 key | 我々の scene では差が出なかったが **bound が host ごとに変わるのは varying input** | `-c` で固定値へ pin |
+| 継承 `GIT_*` env (`GIT_DIR` / `GIT_OBJECT_DIRECTORY` / `GIT_ALTERNATE_OBJECT_DIRECTORIES` 等) | `-c` の対象外で git の読む先を変える | **環境を継承せず構築**する (許可 list のみ) |
+| `refs/replace/*` | object を差し替える (j#96422 F1) | `--no-replace-objects` + `GIT_NO_REPLACE_OBJECTS=1` |
 | **`merge.<name>.driver`** | **merged tree の内容そのものが任意 code で書き換わる** (実測: conflict が rc=0 + `DRIVER WON` になる) | **pin 不能 → typed status `nondeterministic_merge_config` で拒否** |
 
-driver は in-tree `.gitattributes` が名前を選ぶため列挙できず、repo-local `.git/config` にあるため
-隔離もできない。**「条件を自分で enforce できない操作は提供しない」を、破壊的操作ではなく
-決定性の主張へ適用した** — 再現できない commit を作るくらいなら拒否する。
+driver だけが pin 不能である。名前を in-tree `.gitattributes` が選ぶため `-c` で列挙できず、
+repo-local `.git/config` にあるため隔離もできない。**「条件を自分で enforce できない操作は
+提供しない」を、破壊的操作ではなく決定性の主張へ適用した** — 再現できない commit を作るくらいなら拒否する。
+
+> **enforce 範囲は「具体名の列挙」で書く。** R10 は「入力は全て object id」、R11 は「arguments alone」、
+> R12 は「pin 不能なのは driver だけ」と書き、**3 回とも外した** (j#96412 / j#96417 / j#96422)。
+> 「全部やった」ではなく「pin した key はこれ、isolate した env はこれ、refuse する条件はこれ」と書く。
+> 上の表がその列挙であり、**表に無いものは enforce していない**。
+
+driver 拒否の範囲 (repo-local に宣言されているが今回 attribute で選択されない driver も拒否するか) は
+**owner/design 裁定事項**として未決である (j#96422 F4)。
 
 - author / committer identity = **固定 literal** (`mozyo-bridge auto-integration <auto-integration@mozyo-bridge.invalid>`)。
   `git log` 上でも人間が書いたのでないことが読める
@@ -239,10 +251,15 @@ driver は in-tree `.gitattributes` が名前を選ぶため列挙できず、re
 - target head は **fresh remote tip**。pre-push は expected-head CAS、post-push は landed-head
   reachability。
 - **merge は object から組む** (`merge-tree --write-tree` + `commit-tree`)。checkout・index・ref・
-  HEAD を一切触らず、first parent は measured remote target。**dedicated integration worktree は
+  HEAD を一切触らず、first parent は measured remote target。target ref は **refspec 安全性検査と
+  `git check-ref-format --branch` の両方**を通ること (どちらも他方を包含しない。j#96422 F3)。**dedicated integration worktree は
   存在しない** (j#96406 F1)。**commit は action の純関数**であり、hook 非実行・無署名 (上節)。
-- **merge の失敗は typed status** で、**durable な `StepOutcome.merge_status` field に載る**
-  (prose 接頭辞ではない。j#96417 F2)。vocabulary は domain 側の closed set:
+- **merge の失敗は typed status** で、**durable な `StepOutcome.merge_status` field に載り、
+  ledger integrity がそれを読む** (j#96417 F2 / j#96422 F2)。apply の `done` は
+  **`merge_status == merged` のときだけ** push authority になり、それ以外 (失敗 status / 未知 /
+  空) と、**apply 以外の step が status を持つ**場合は `ledger_merge_status_unsound` で zero-push。
+  *field に載せただけで誰も読まなければ gate ではない* — R11 は prose に着地させ、R12 は field に
+  着地させて consumer を書かなかった。vocabulary は domain 側の closed set:
   `merged` / `content_conflict` / `primitive_unsupported` / `probe_error` / `invalid_input` /
   `nondeterministic_merge_config` / `merge_error` / `commit_error` / `unrecognized_status`。
   **exit code だけで分類しない** — missing object は content conflict と同じ rc=1 で返る (実測)。

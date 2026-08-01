@@ -53,6 +53,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MERGE_CONTENT_CONFLICT,
     MERGE_ERROR,
     MERGE_MERGED,
+    MERGE_INVALID_INPUT,
     MERGE_NONDETERMINISTIC_CONFIG,
     AutoIntegrationUseCase,
     IntegrationAuthority,
@@ -271,6 +272,113 @@ class DeterministicMergeCommitTest(unittest.TestCase):
                     os.environ.pop("GIT_CONFIG_GLOBAL", None)
                 else:
                     os.environ["GIT_CONFIG_GLOBAL"] = previous
+
+    def test_merge_config_cannot_change_the_tree(self) -> None:
+        """j#96422 finding 1: `merge.directoryRenames` produced a different tree per host.
+
+        Measured before the fix. Unlike a custom driver, these keys have canonical names, so
+        `-c` can pin them — which is the distinction R12 missed when it treated the driver as
+        the only unpinnable input.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            _init(repo)
+            (repo / "dir").mkdir()
+            for index in range(3):
+                (repo / "dir" / f"f{index}.txt").write_text(
+                    f"content {index}\n" * 20, encoding="utf-8"
+                )
+            _git(repo, "add", "-A")
+            _git(repo, "commit", "-qm", "base")
+            _git(repo, "checkout", "-q", "-b", "lane")
+            (repo / "dir" / "new.txt").write_text("new\n", encoding="utf-8")
+            _git(repo, "add", "-A")
+            _git(repo, "commit", "-qm", "lane adds a file")
+            source = _git(repo, "rev-parse", "HEAD")
+            _git(repo, "checkout", "-q", "main")
+            _git(repo, "mv", "dir", "moved")
+            _git(repo, "add", "-A")
+            _git(repo, "commit", "-qm", "target renames the directory")
+            target = _git(repo, "rev-parse", "HEAD")
+
+            operations = LiveAutoIntegrationGitOperations(repo_root=repo)
+            outcomes = []
+            for value in ("false", "true", "conflict"):
+                _git(repo, "config", "merge.directoryRenames", value)
+                outcomes.append(
+                    operations.apply_merge(
+                        source_head=source,
+                        target_ref="main",
+                        expected_target_head=target,
+                    )
+                )
+            # Raw git disagrees with itself across those settings; the adapter does not.
+            raw = {
+                subprocess.run(
+                    ["git", "-c", f"merge.directoryRenames={value}",
+                     "merge-tree", "--write-tree", target, source],
+                    cwd=repo, capture_output=True, text=True,
+                ).stdout.strip()
+                for value in ("false", "true")
+            }
+            self.assertEqual(len(raw), 2, "the scene must be sensitive to the setting")
+            self.assertEqual(
+                len({(outcome.status, outcome.integration_head) for outcome in outcomes}),
+                1,
+                [outcome.status for outcome in outcomes],
+            )
+
+    def test_a_ref_git_itself_rejects_never_reaches_an_object(self) -> None:
+        """j#96422 finding 3: four unusable branch names merged and produced commits."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            _init(repo)
+            _commit(repo, "a.txt", "base")
+            _git(repo, "checkout", "-q", "-b", "lane")
+            source = _commit(repo, "lane.txt", "reviewed")
+            _git(repo, "checkout", "-q", "main")
+            target = _git(repo, "rev-parse", "main")
+            operations = LiveAutoIntegrationGitOperations(repo_root=repo)
+
+            for name in ("main..bad", "main.lock", "main@{bad", "main//bad", "ma+in"):
+                result = operations.apply_merge(
+                    source_head=source, target_ref=name, expected_target_head=target
+                )
+                self.assertEqual(result.status, MERGE_INVALID_INPUT, name)
+                self.assertEqual(result.integration_head, "", name)
+
+    def test_a_driver_the_merge_would_never_see_does_not_refuse_it(self) -> None:
+        """j#96422 finding 4: an unused driver in GLOBAL config refused a clean merge.
+
+        The merge isolates global config; R12's probe did not, so it reported a determinism
+        hazard about an input that could not reach the operation it was guarding.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init(repo)
+            _commit(repo, "a.txt", "base")
+            _git(repo, "checkout", "-q", "-b", "lane")
+            source = _commit(repo, "lane.txt", "reviewed")
+            _git(repo, "checkout", "-q", "main")
+            target = _git(repo, "rev-parse", "main")
+
+            global_config = root / "gitconfig"
+            global_config.write_text(
+                '[merge "unused"]\n\tdriver = false\n', encoding="utf-8"
+            )
+            previous = os.environ.get("GIT_CONFIG_GLOBAL")
+            os.environ["GIT_CONFIG_GLOBAL"] = str(global_config)
+            try:
+                result = LiveAutoIntegrationGitOperations(repo_root=repo).apply_merge(
+                    source_head=source, target_ref="main", expected_target_head=target
+                )
+            finally:
+                if previous is None:
+                    os.environ.pop("GIT_CONFIG_GLOBAL", None)
+                else:
+                    os.environ["GIT_CONFIG_GLOBAL"] = previous
+            self.assertEqual(result.status, MERGE_MERGED, result.detail)
 
     def test_a_merge_driver_is_refused_rather_than_silently_obeyed(self) -> None:
         """The input that cannot be pinned, so it is checked instead.
