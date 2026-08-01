@@ -875,6 +875,72 @@ class CanonicalDecimalFieldsTests(unittest.TestCase):
         self.assertIsNone(refusal)
         self.assertEqual(fields["evidence_lane_generation"], 3)
 
+    def test_the_predicate_never_raises_on_either_supported_interpreter(self):
+        """Review j#94093: the guard added to stop this predicate raising was itself raising.
+
+        ``sys.get_int_max_str_digits`` is new in Python 3.10.7 and this package supports ``>=3.10``
+        (``pyproject.toml``), so calling it unconditionally made a CLEAN ``req`` and a clean CLI
+        ``lane_generation`` die with ``AttributeError`` on 3.10.0-3.10.6. Exercised against BOTH
+        interpreter shapes by removing the attribute, because "a predicate that raises is not a
+        predicate" is the rule this whole line of fixes rests on and one runtime cannot show it.
+
+        Where the API is absent so is the conversion limit it reports, so an over-long token is
+        accepted there — the same rule ("refuse what no consumer could convert"), not a relaxation.
+        """
+        import sys as _sys
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (  # noqa: E501
+            is_canonical_positive_decimal,
+            is_journal_id,
+        )
+
+        oversized = "9" * 4301
+        always_true = ("1", "3", "93802", "9" * 4300)
+        always_false = ("01", "007", "0", "", " 1", "٣", None, 3, True)
+
+        def assert_invariants(shape):
+            for value in always_true:
+                with self.subTest(shape=shape, value=value[:8]):
+                    self.assertTrue(is_journal_id(value))
+                    self.assertTrue(is_canonical_positive_decimal(value))
+            for value in always_false:
+                with self.subTest(shape=shape, value=repr(value)[:12]):
+                    self.assertFalse(is_journal_id(value))
+                    self.assertFalse(is_canonical_positive_decimal(value))
+
+        sentinel = object()
+        saved = getattr(_sys, "get_int_max_str_digits", sentinel)
+        assert_invariants("api present")
+        if saved is not sentinel:
+            self.assertFalse(is_journal_id(oversized), "the reported limit must be honoured")
+            del _sys.get_int_max_str_digits
+            try:
+                assert_invariants("api absent")
+                # No limit to report, so nothing to refuse for length — and, crucially, no raise.
+                self.assertTrue(is_journal_id(oversized))
+            finally:
+                _sys.get_int_max_str_digits = saved
+        self.assertTrue(hasattr(_sys, "get_int_max_str_digits") or saved is sentinel)
+
+    def test_the_cli_generation_survives_an_interpreter_without_the_limit_api(self):
+        import sys as _sys
+
+        sentinel = object()
+        saved = getattr(_sys, "get_int_max_str_digits", sentinel)
+        if saved is sentinel:
+            self.skipTest("interpreter already lacks the API; the present-shape case covers it")
+        del _sys.get_int_max_str_digits
+        try:
+            fields, refusal = lane_envelope_marker_fields(self._envelope_args("3"))
+            self.assertIsNone(refusal)
+            self.assertEqual(fields["evidence_lane_generation"], 3)
+            self.assertEqual(
+                lane_envelope_marker_fields(self._envelope_args("01"))[1],
+                "evidence_envelope_malformed_generation",
+            )
+        finally:
+            _sys.get_int_max_str_digits = saved
+
     def test_both_decimal_fields_ask_the_same_predicate(self):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (  # noqa: E501
             is_canonical_positive_decimal,

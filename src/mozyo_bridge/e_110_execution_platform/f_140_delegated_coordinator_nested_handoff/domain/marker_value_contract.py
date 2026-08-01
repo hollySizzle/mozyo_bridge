@@ -123,10 +123,19 @@ def is_canonical_positive_decimal(value: object) -> bool:
     if not set(value) <= _ASCII_DIGITS:
         return False
     # A token no consumer could convert to an integer names nothing. The bound is the interpreter's
-    # own (`sys.get_int_max_str_digits()`, 0 = unlimited) rather than a number chosen here, so this
-    # refuses exactly the input that used to make the predicate RAISE — as a False, which is what a
-    # predicate owes its caller.
-    limit = sys.get_int_max_str_digits()
+    # own rather than a number chosen here — and it is read through `getattr`, because
+    # `sys.get_int_max_str_digits` is new in Python 3.10.7 while this package supports `>=3.10`
+    # (review j#94093). Calling it unconditionally made a CLEAN `req` / `lane_generation` raise
+    # `AttributeError` on 3.10.0-3.10.6: a guard added to stop this predicate raising was itself
+    # raising, on a supported interpreter.
+    #
+    # Where the API is absent so is the conversion limit it reports, so every length IS convertible
+    # there and refusing none of them is the SAME rule, not a relaxation of it. Nothing here calls
+    # `int()` any more, so the predicate cannot raise on either interpreter.
+    reported = getattr(sys, "get_int_max_str_digits", None)
+    if reported is None:
+        return True
+    limit = reported()
     return not limit or len(value) <= limit
 
 
