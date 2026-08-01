@@ -165,34 +165,52 @@ non-force push と exact-SHA CI が gate するのは **remote への着地**で
 checkout に対して行った switch / merge を取り消さない。
 
 新: `git merge-tree --write-tree <expected_target_head> <source_head>` → tree、
-`git commit-tree <tree> -p <target> -p <source>` → merge commit。**入力は全て object id**であり、
-checkout・index・ref・HEAD を一切触らない (実測)。**決定と mutation の間に late-bound な名前が
+`git commit-tree <tree> -p <target> -p <source>` → merge commit。
+checkout・index・ref・HEAD を一切触らない (実測)。**merge の対象指定に late-bound な名前が
 介在しない**ので、差し替えるものが無い。
 
-失敗は 2 種を分ける: `merge-tree` の **rc=1 のみ conflict**、それ以外の非 0 は **primitive 不可用**
-(`--write-tree` は git >= 2.38)。「この git では実行できない」を「branch が conflict した」と
-記録するのは j#96396 F2 と同型の嘘になる。
+> ⚠️ **この節は R10 時点の記述であり、2 点が誤っていた。** 訂正は下の 2 節が正本である。
+> 1. R10 は「**入力は全て object id**」と断定した。**誤り** — `commit-tree` は host の identity
+>    config と現在時刻を、`merge-tree`/`commit-tree` は `i18n.commitEncoding` と merge driver を
+>    暗黙に読む (j#96412 F1 / j#96417 F1、いずれも実測)。
+> 2. R10 は失敗を「**rc=1 のみ conflict、それ以外の非 0 は primitive 不可用**」と分類した。
+>    **誤り** — `merge-tree` は **missing object も rc=1** で返し (実測)、また不可用性を exit code
+>    から推定してはならない (j#96412 F2 / j#96417 F3)。
 
 これに伴い dedicated worktree の apparatus 一式 (`IntegrationWorktree` / 専用 probe /
 `integration_worktree_inadmissible` / constructor field / report field) を撤去した。残った
 `describe_lane_worktree` は **lane 側の read probe** であり、「ここで mutate してよいか」ではなく
 「source は review されたものか」に答える。
 
-## 統合 commit の policy (R11 / j#96412 F1・F3)
+## 統合 commit の policy (R11-R12 / j#96412 F1・F3 / j#96417 F1・F3・F5)
 
 object-level merge は plumbing であり、`git merge` と **同値ではない**。差分を暗黙にせず policy として明示する。
 
-### commit は action の純関数である (F1)
+### 決定性: 何を enforce しているかを正確に述べる (F1)
 
-`commit-tree` は既定で **host の identity config と現在時刻**を読む。これは action key が覆わない
-入力であり、**同一 action の replay が別 SHA を作る** (実測: 1.1 秒差で別 SHA、tree は同一)。
-apply 後 / ledger receipt 前に crash すると、replay が CI 対象とは別の object を作る。よって:
+契約は「**同一 repository 内容に対し、同一 action は同一 commit を再構築する**」である。
+R11 が書いた「入力は arguments のみ / どの host でも同じ」は **不正確だった**。到達までに 2 度
+訂正している:
+
+| 隠れた入力 | 影響 | 対処 |
+| --- | --- | --- |
+| host の git identity config | 別 SHA (j#96412 F1 実測) | **固定 literal identity** を env で与える |
+| 現在時刻 | 1.1 秒差で別 SHA (同上) | 下記 timestamp 規則 |
+| `i18n.commitEncoding` | encoding header が付き別 SHA (j#96417 F1 実測) | `-c i18n.commitEncoding=UTF-8` で invocation ごとに pin |
+| global / system config 全般 | 同上 | `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM` を空にして実行 |
+| **`merge.<name>.driver`** | **merged tree の内容そのものが任意 code で書き換わる** (実測: conflict が rc=0 + `DRIVER WON` になる) | **pin 不能 → typed status `nondeterministic_merge_config` で拒否** |
+
+driver は in-tree `.gitattributes` が名前を選ぶため列挙できず、repo-local `.git/config` にあるため
+隔離もできない。**「条件を自分で enforce できない操作は提供しない」を、破壊的操作ではなく
+決定性の主張へ適用した** — 再現できない commit を作るくらいなら拒否する。
 
 - author / committer identity = **固定 literal** (`mozyo-bridge auto-integration <auto-integration@mozyo-bridge.invalid>`)。
-  host config を継承しない (継承すると host 間で SHA が変わる)。`git log` 上でも人間が書いたのでないことが読める
-- author / committer date = **source head の committer date**。object の性質なので action key が既に覆う
+  `git log` 上でも人間が書いたのでないことが読める
+- author / committer date = **`max(source, target)` の committer date** (j#96417 F5)。両者とも
+  action key が覆う object の性質なので決定的であり、かつ **merge commit が first parent より
+  古くならない** (source 単独だと non-ff の通常ケースで古くなり、`git log --since` から落ちる)
 - message = 固定 format `Merge <source_head> into <branch>`
-- 結果として **同一 action → 同一 SHA** (real-Git test で固定。異なる `user.name` config でも一致することを確認)
+- `commit.gpgsign` は `commit-tree` に届かない (実測) が、将来届くようになっても効かないよう pin する
 
 ### hook を実行せず、署名しない (F3)
 
@@ -207,7 +225,7 @@ apply 後 / ledger receipt 前に crash すると、replay が CI 対象とは�
 - **この判断は project policy であり実装詳細ではない。** 署名や hook 実行を要求する運用なら、
   決定性との両立方法 (例: 決定的な署名 identity) を含めて owner/design 判断が要る
 
-## 現行 contract の要約 (R10 時点)
+## 現行 contract の要約 (R12 時点)
 
 歴史的経緯は後続の節に残すが、**現時点で成立している契約**はこれだけである。矛盾したら本節を優先する。
 
@@ -223,10 +241,14 @@ apply 後 / ledger receipt 前に crash すると、replay が CI 対象とは�
 - **merge は object から組む** (`merge-tree --write-tree` + `commit-tree`)。checkout・index・ref・
   HEAD を一切触らず、first parent は measured remote target。**dedicated integration worktree は
   存在しない** (j#96406 F1)。**commit は action の純関数**であり、hook 非実行・無署名 (上節)。
-- **merge の失敗は typed status** (`content_conflict` / `primitive_unsupported` / `invalid_input` /
-  `merge_error` / `commit_error`)。**exit code だけで分類しない** — missing object は content conflict と
-  同じ rc=1 で返る (実測)。conflict は tree を名乗り、operational failure は名乗らない。
-  `primitive_unsupported` は **version probe でのみ**判定する (j#96412 F2)。
+- **merge の失敗は typed status** で、**durable な `StepOutcome.merge_status` field に載る**
+  (prose 接頭辞ではない。j#96417 F2)。vocabulary は domain 側の closed set:
+  `merged` / `content_conflict` / `primitive_unsupported` / `probe_error` / `invalid_input` /
+  `nondeterministic_merge_config` / `merge_error` / `commit_error` / `unrecognized_status`。
+  **exit code だけで分類しない** — missing object は content conflict と同じ rc=1 で返る (実測)。
+  conflict は tree を名乗り、operational failure は名乗らない。可用性は **version probe** で確かめ、
+  **probe 自体が失敗したら `probe_error`** であって不可用ではない (j#96417 F3)。
+  vocabulary 外の値は `unrecognized_status` として **typed に** 落とす。
 - `already_integrated` / `patch_equivalent` は **push 前のみ** terminal。push 後は exact-SHA CI を完走。
 - **cleanup 側に破壊的操作は 1 つも無い**。ref delete も worktree remove も持たない (上節)。
   cleanup は git port を **read probe すら呼ばない**。

@@ -77,6 +77,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     IntegrationCiEvidence,
     IntegrationPreflight,
     LaneWorktree,
+    checked_merge_status,
     StepOutcome,
     build_integration_action_record,
     completed_steps,
@@ -921,6 +922,7 @@ __all__ = (
     "AutoIntegrationPolicy",
     "IntegrationPreflight",
     "LaneWorktree",
+    "checked_merge_status",
     "IntegrationDecision",
     "decide_integration",
     # Re-exported from the records sibling for a stable public surface.

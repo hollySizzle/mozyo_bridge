@@ -41,6 +41,16 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Protocol, Sequence, runtime_checkable
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_records import (
+    MERGE_COMMIT_ERROR,
+    MERGE_CONTENT_CONFLICT,
+    MERGE_ERROR,
+    MERGE_INVALID_INPUT,
+    MERGE_MERGED,
+    MERGE_NONDETERMINISTIC_CONFIG,
+    MERGE_PRIMITIVE_UNSUPPORTED,
+    MERGE_PROBE_ERROR,
+    MERGE_STATUSES,
+    MERGE_UNRECOGNIZED,
     IntegrationActionRecord,
     IntegrationCiEvidence,
     LaneWorktree,
@@ -70,33 +80,10 @@ class PushResult:
     detail: str = ""
 
 
-#: The merge succeeded and produced :attr:`MergeResult.integration_head`.
-MERGE_MERGED = "merged"
-#: The two sides genuinely conflict in content. The only outcome a human has to resolve.
-MERGE_CONTENT_CONFLICT = "content_conflict"
-#: This git cannot perform an object-level merge (``merge-tree --write-tree`` needs 2.38).
-#: Established by an explicit version probe, never inferred from an exit code.
-MERGE_PRIMITIVE_UNSUPPORTED = "primitive_unsupported"
-#: The arguments were not what the operation requires (not full SHAs, unusable ref name).
-MERGE_INVALID_INPUT = "invalid_input"
-#: ``merge-tree`` failed for an operational reason: a missing or unreadable object, a broken
-#: repository, a merge driver that errored. NOT a content conflict, and NOT proof that the
-#: primitive is unavailable.
-MERGE_ERROR = "merge_error"
-#: The merged tree existed but could not be turned into a commit object.
-MERGE_COMMIT_ERROR = "commit_error"
-
-MERGE_STATUSES: frozenset = frozenset(
-    {
-        MERGE_MERGED,
-        MERGE_CONTENT_CONFLICT,
-        MERGE_PRIMITIVE_UNSUPPORTED,
-        MERGE_INVALID_INPUT,
-        MERGE_ERROR,
-        MERGE_COMMIT_ERROR,
-    }
-)
-
+# The merge-status vocabulary lives in the DOMAIN (`...domain.auto_integration_records`) and
+# is re-exported here for the port's callers. It has to: the durable `StepOutcome` records the
+# status, and a domain record cannot depend on an application-layer literal (j#96417 finding
+# 2 required the status reach the durable outcome, which is where it is defined).
 
 @dataclass(frozen=True)
 class MergeResult:
@@ -181,10 +168,15 @@ class AutoIntegrationGitOperations(Protocol):
         unsupported primitive, invalid input, an operational merge failure, or a failed commit
         — and MUST NOT infer "unsupported" from an unrecognized exit code.
 
-        The commit it produces MUST be a function of its arguments alone. Two runs of the same
-        action, on different hosts or at different times, MUST produce the same commit id;
-        review j#96412 finding 1 measured two SHAs for one action because the commit inherited
-        the host's identity configuration and the current clock, which no action key covers.
+        **Determinism, stated as exactly what is enforced.** Two runs of the same action MUST
+        produce the same commit id given the same repository content. That is narrower than
+        R11's "a function of its arguments alone", which was not true: review j#96412 finding
+        1 measured the host identity and the clock leaking in, and j#96417 finding 1 measured
+        ``i18n.commitEncoding`` doing the same. Those are pinned. What cannot be pinned is a
+        configured ``merge.<name>.driver`` — it runs arbitrary code over the merged content
+        and cannot be disabled per-invocation (measured) — so an implementation MUST refuse
+        with :data:`MERGE_NONDETERMINISTIC_CONFIG` rather than build a commit it cannot
+        promise to rebuild.
         """
         ...
 

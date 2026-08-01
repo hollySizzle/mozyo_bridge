@@ -82,6 +82,65 @@ STEP_OUTCOMES: frozenset = frozenset(
 BLOCKED_ACTION_KEY_MISMATCH = "action_key_mismatch"
 
 
+# ---------------------------------------------------------------------------
+# How an apply ended, as a closed vocabulary rather than a sentence.
+# ---------------------------------------------------------------------------
+
+#: The merge succeeded and produced the recorded integration head.
+MERGE_MERGED = "merged"
+#: The two sides genuinely conflict in content. The only outcome a human has to resolve.
+MERGE_CONTENT_CONFLICT = "content_conflict"
+#: This git cannot build a merge without a checkout (``merge-tree --write-tree`` needs 2.38),
+#: established by reading the version — never inferred from an unrecognized exit code.
+MERGE_PRIMITIVE_UNSUPPORTED = "primitive_unsupported"
+#: The capability question could not be answered at all: the version command failed or its
+#: output was unparseable. R10 review j#96412 required that an unknown operational error not
+#: be reported as "unavailable", and R11 collapsed exactly this case into that claim anyway
+#: (j#96417 finding 3). Not knowing is its own answer.
+MERGE_PROBE_ERROR = "probe_error"
+#: The arguments were not what the operation requires: not full SHAs, or a ref name that
+#: cannot be turned into a safe refspec.
+MERGE_INVALID_INPUT = "invalid_input"
+#: The repository's configuration can change what a merge produces — a configured
+#: ``merge.<name>.driver`` runs arbitrary code and rewrites the merged content (measured).
+#: An actuator that promises the same action rebuilds the same commit cannot keep that
+#: promise here, so it refuses rather than producing a commit it cannot reproduce.
+MERGE_NONDETERMINISTIC_CONFIG = "nondeterministic_merge_config"
+#: ``merge-tree`` failed for an operational reason: a missing or unreadable object, a broken
+#: repository. NOT a content conflict, and NOT proof that the primitive is unavailable.
+MERGE_ERROR = "merge_error"
+#: The merged tree existed but could not be turned into a commit object.
+MERGE_COMMIT_ERROR = "commit_error"
+#: A port returned something outside this vocabulary. Recorded as a value rather than folded
+#: into prose, so a consumer sees "this run produced a status I do not know" instead of a
+#: sentence it must parse (j#96417 finding 2).
+MERGE_UNRECOGNIZED = "unrecognized_status"
+
+MERGE_STATUSES: frozenset = frozenset(
+    {
+        MERGE_MERGED,
+        MERGE_CONTENT_CONFLICT,
+        MERGE_PRIMITIVE_UNSUPPORTED,
+        MERGE_PROBE_ERROR,
+        MERGE_INVALID_INPUT,
+        MERGE_NONDETERMINISTIC_CONFIG,
+        MERGE_ERROR,
+        MERGE_COMMIT_ERROR,
+        MERGE_UNRECOGNIZED,
+    }
+)
+
+
+def checked_merge_status(value: object) -> str:
+    """Coerce ``value`` to a known merge status, or to :data:`MERGE_UNRECOGNIZED`.
+
+    Fail-closed in the direction that matters: an unknown status must not read as a known
+    one, and must not be dropped into prose where only a human could notice it.
+    """
+    candidate = str(value or "").strip()
+    return candidate if candidate in MERGE_STATUSES else MERGE_UNRECOGNIZED
+
+
 @dataclass(frozen=True)
 class StepOutcome:
     """One recorded step outcome, bound to the action key it was performed under.
@@ -100,6 +159,11 @@ class StepOutcome:
     #: The exact commit the step produced, where it produces one (the integration head an
     #: apply created, or the head a push landed). Empty when the step produces no commit.
     head: str = ""
+    #: For an apply: HOW the merge ended, from the closed :data:`MERGE_STATUSES` vocabulary.
+    #: Empty for every other step. R11 shipped the typed status on the port's return value
+    #: and then wrote it back into ``detail`` as a string prefix, so the durable record — the
+    #: thing a consumer actually reads — was still prose (j#96417 finding 2).
+    merge_status: str = ""
 
     def as_payload(self) -> dict[str, object]:
         """The durable serialization — provenance included.
@@ -115,11 +179,13 @@ class StepOutcome:
             "detail": self.detail,
             "head": self.head,
             "recorded_by": self.recorded_by,
+            "merge_status": self.merge_status,
         }
 
     @classmethod
     def from_payload(cls, payload: "dict[str, object]") -> "StepOutcome":
         """Parse a serialized outcome, keeping every field the trust decision reads."""
+        raw_status = payload.get("merge_status", "")
         return cls(
             action_key=str(payload.get("action_key", "")),
             step=str(payload.get("step", "")),
@@ -127,6 +193,11 @@ class StepOutcome:
             detail=str(payload.get("detail", "")),
             head=str(payload.get("head", "")),
             recorded_by=str(payload.get("recorded_by", "")),
+            # A serialized status outside the vocabulary comes back as `unrecognized_status`
+            # rather than as itself: a record cannot introduce a new outcome by writing one.
+            merge_status=(
+                checked_merge_status(raw_status) if str(raw_status or "").strip() else ""
+            ),
         )
 
 
@@ -537,5 +608,16 @@ __all__ = (
     "CI_CONCLUSION_SUCCESS",
     "IntegrationCiEvidence",
     "LaneWorktree",
+    "MERGE_MERGED",
+    "MERGE_CONTENT_CONFLICT",
+    "MERGE_PRIMITIVE_UNSUPPORTED",
+    "MERGE_PROBE_ERROR",
+    "MERGE_INVALID_INPUT",
+    "MERGE_NONDETERMINISTIC_CONFIG",
+    "MERGE_ERROR",
+    "MERGE_COMMIT_ERROR",
+    "MERGE_UNRECOGNIZED",
+    "MERGE_STATUSES",
+    "checked_merge_status",
     "IntegrationPreflight",
 )

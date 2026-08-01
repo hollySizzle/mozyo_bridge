@@ -46,8 +46,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MERGE_ERROR,
     MERGE_INVALID_INPUT,
     MERGE_MERGED,
+    MERGE_NONDETERMINISTIC_CONFIG,
     MERGE_PRIMITIVE_UNSUPPORTED,
+    MERGE_PROBE_ERROR,
     MERGE_STATUSES,
+    MERGE_UNRECOGNIZED,
     AutoIntegrationGitOperations,
     CleanupAuthority,
     DurableAuthorityReader,
@@ -73,6 +76,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     IntegrationPreflight,
     LaneWorktree,
     StepOutcome,
+    checked_merge_status,
     completed_steps,
     is_full_sha,
     decide_integration,
@@ -442,19 +446,21 @@ class AutoIntegrationUseCase:
                 # The parent the merge must sit on: the freshly measured remote target.
                 expected_target_head=preflight.observed_target_head,
             )
-            if result.status != MERGE_MERGED:
-                # The typed status goes into the durable record verbatim (j#96412 finding 2).
-                # Every refusal used to arrive here as one boolean and leave as the phrase
-                # "merge conflict", so "this object does not exist" and "this git is too old"
-                # were both written down as the branches disagreeing. What blocks the run is
-                # the same for all of them; what the record SAYS is not.
-                known = result.status if result.status in MERGE_STATUSES else "unknown_status"
+            status = checked_merge_status(result.status)
+            if status != MERGE_MERGED:
+                # The status is a FIELD of the durable outcome, not a prefix on its prose.
+                # j#96412 finding 2 asked for the typed status to reach the durable record and
+                # R11 answered by string-formatting it into `detail`, which is the same
+                # unparseable sentence with more words (j#96417 finding 2). An unknown status
+                # becomes `unrecognized_status` — a value a consumer can match on — rather
+                # than being folded into a sentence only a human would notice.
                 return StepOutcome(
                     action_key=decision.action_key,
                     step=step,
                     recorded_by=self.recorder_id,
                     outcome=OUTCOME_BLOCKED,
-                    detail=f"{known}: {result.detail}".strip().rstrip(":"),
+                    merge_status=status,
+                    detail=result.detail,
                 )
             if not is_full_sha(result.integration_head):
                 # A merge that reports success without naming the commit it created has not
@@ -477,6 +483,7 @@ class AutoIntegrationUseCase:
                 step=step,
                 recorded_by=self.recorder_id,
                 outcome=OUTCOME_DONE,
+                merge_status=status,
                 detail=result.detail,
                 head=result.integration_head,
             )
@@ -708,9 +715,12 @@ __all__: Tuple[str, ...] = (
     "MERGE_MERGED",
     "MERGE_CONTENT_CONFLICT",
     "MERGE_PRIMITIVE_UNSUPPORTED",
+    "MERGE_PROBE_ERROR",
     "MERGE_INVALID_INPUT",
+    "MERGE_NONDETERMINISTIC_CONFIG",
     "MERGE_ERROR",
     "MERGE_COMMIT_ERROR",
+    "MERGE_UNRECOGNIZED",
     "MERGE_STATUSES",
     "AutoIntegrationGitOperations",
     "ManagedProcessOperations",

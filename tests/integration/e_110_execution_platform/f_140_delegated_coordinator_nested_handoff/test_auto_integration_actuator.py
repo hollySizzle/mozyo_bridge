@@ -54,7 +54,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MERGE_CONTENT_CONFLICT,
     MERGE_ERROR,
     MERGE_MERGED,
+    MERGE_NONDETERMINISTIC_CONFIG,
     MERGE_PRIMITIVE_UNSUPPORTED,
+    MERGE_PROBE_ERROR,
+    MERGE_UNRECOGNIZED,
     MergeResult,
     PushResult,
     integration_policy_from_config,
@@ -594,14 +597,16 @@ class MergeCommitRunTest(unittest.TestCase):
         self.assertEqual(operations.performed, ["apply_merge"])
         self.assertEqual(report.outcomes[-1].outcome, OUTCOME_BLOCKED)
 
-    def test_every_merge_failure_reaches_the_record_as_its_own_status(self) -> None:
-        # R10 review j#96412 finding 2: every refusal arrived here as one boolean and left as
-        # the phrase "merge conflict", so "this object does not exist" and "this git is too
-        # old" were both written down as the branches disagreeing. The run blocks either way;
-        # what the durable record says must differ.
+    def test_every_merge_failure_reaches_the_durable_record_as_a_typed_field(self) -> None:
+        # j#96412 finding 2 asked for the typed status to reach the durable outcome; R11
+        # string-formatted it into `detail`, which is the same unparseable sentence with more
+        # words (j#96417 finding 2). It is a FIELD now, and this asserts the field — including
+        # across the payload round trip a durable store performs.
         for status in (
             MERGE_CONTENT_CONFLICT,
             MERGE_PRIMITIVE_UNSUPPORTED,
+            MERGE_PROBE_ERROR,
+            MERGE_NONDETERMINISTIC_CONFIG,
             MERGE_ERROR,
         ):
             operations = FakeGitOperations(
@@ -613,15 +618,35 @@ class MergeCommitRunTest(unittest.TestCase):
             self.assertEqual(operations.performed, ["apply_merge"], status)
             outcome = report.outcomes[-1]
             self.assertEqual(outcome.outcome, OUTCOME_BLOCKED, status)
-            self.assertIn(status, outcome.detail, status)
-        # ...and the one that is genuinely a conflict is not described as anything else.
-        conflicted = FakeGitOperations(
-            merge_result=MergeResult(status=MERGE_CONTENT_CONFLICT, detail="a.py")
+            self.assertEqual(outcome.merge_status, status)
+            self.assertEqual(outcome.as_payload()["merge_status"], status)
+            self.assertEqual(
+                StepOutcome.from_payload(outcome.as_payload()).merge_status, status
+            )
+
+    def test_a_status_outside_the_vocabulary_is_typed_not_prose(self) -> None:
+        # A port that returns something unknown must not be able to introduce an outcome by
+        # writing a sentence: the record says `unrecognized_status`, which a consumer matches.
+        operations = FakeGitOperations(
+            merge_result=MergeResult(status="something_new", detail="?")
         )
         report = _use_case(
-            conflicted, integration_policy=self._policy()
+            operations, integration_policy=self._policy()
         ).run_integration(_record())
-        self.assertNotIn(MERGE_ERROR, report.outcomes[-1].detail)
+        self.assertEqual(report.outcomes[-1].merge_status, MERGE_UNRECOGNIZED)
+        self.assertEqual(report.outcomes[-1].outcome, OUTCOME_BLOCKED)
+
+    def test_a_successful_apply_records_its_status_too(self) -> None:
+        operations = FakeGitOperations()
+        report = _use_case(
+            operations, integration_policy=self._policy()
+        ).run_integration(_record())
+        applied = [o for o in report.outcomes if o.step == STEP_INTEGRATION_APPLY][0]
+        self.assertEqual(applied.merge_status, MERGE_MERGED)
+        # Every other step leaves the field empty rather than inventing a value for it.
+        for other in report.outcomes:
+            if other.step != STEP_INTEGRATION_APPLY:
+                self.assertEqual(other.merge_status, "")
 
     def test_the_merge_names_no_checkout_for_anything_to_re_point(self) -> None:
         # R2 gated the dedicated checkout's identity so the lane's own could never be used.

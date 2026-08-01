@@ -36,6 +36,7 @@ runnable where the binary is not installed.
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -52,6 +53,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MERGE_CONTENT_CONFLICT,
     MERGE_ERROR,
     MERGE_MERGED,
+    MERGE_NONDETERMINISTIC_CONFIG,
     AutoIntegrationUseCase,
     IntegrationAuthority,
 )
@@ -222,6 +224,96 @@ class DeterministicMergeCommitTest(unittest.TestCase):
             third = self._merge_twice(repo, name="somebody else", email="b@example.invalid")
             self.assertEqual(first, third)
 
+    def test_git_config_cannot_change_the_commit(self) -> None:
+        """j#96417 finding 1: `i18n.commitEncoding` produced a different SHA for one action.
+
+        Measured before the fix — the encoding header changes the commit object. The same
+        went for anything a *global* config could set, since the adapter inherited it. Both
+        are pinned per-invocation now, and this drives the actual knobs rather than trusting
+        the argv.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init(repo)
+            _commit(repo, "a.txt", "base")
+            _git(repo, "checkout", "-q", "-b", "lane")
+            _commit(repo, "lane.txt", "reviewed")
+            _git(repo, "checkout", "-q", "main")
+            base = _git(repo, "rev-parse", "main")
+            source = _git(repo, "rev-parse", "lane")
+            operations = LiveAutoIntegrationGitOperations(repo_root=repo)
+
+            def merged() -> str:
+                result = operations.apply_merge(
+                    source_head=source, target_ref="main", expected_target_head=base
+                )
+                self.assertEqual(result.status, MERGE_MERGED, result.detail)
+                return result.integration_head
+
+            baseline = merged()
+
+            # A repo-local encoding, which `-c` must override.
+            _git(repo, "config", "i18n.commitEncoding", "ISO-8859-1")
+            self.assertEqual(merged(), baseline)
+
+            # A global config, which the isolated environment must not see.
+            global_config = root / "gitconfig"
+            global_config.write_text(
+                "[i18n]\n\tcommitEncoding = ISO-8859-1\n", encoding="utf-8"
+            )
+            previous = os.environ.get("GIT_CONFIG_GLOBAL")
+            os.environ["GIT_CONFIG_GLOBAL"] = str(global_config)
+            try:
+                self.assertEqual(merged(), baseline)
+            finally:
+                if previous is None:
+                    os.environ.pop("GIT_CONFIG_GLOBAL", None)
+                else:
+                    os.environ["GIT_CONFIG_GLOBAL"] = previous
+
+    def test_a_merge_driver_is_refused_rather_than_silently_obeyed(self) -> None:
+        """The input that cannot be pinned, so it is checked instead.
+
+        Measured: a configured `merge.<name>.driver` selected by an in-tree `.gitattributes`
+        turns a conflict into a clean merge whose content is whatever the driver wrote. It
+        lives in repo-local config, which `GIT_CONFIG_GLOBAL`/`SYSTEM` do not cover, and its
+        name comes from the tree so it cannot be enumerated in advance. An actuator promising
+        that the same action rebuilds the same commit cannot keep that promise here.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            _init(repo)
+            (repo / ".gitattributes").write_text("a.txt merge=mine\n", encoding="utf-8")
+            _commit(repo, "a.txt", "base\n")
+            _git(repo, "checkout", "-q", "-b", "lane")
+            source = _commit(repo, "a.txt", "lane\n")
+            _git(repo, "checkout", "-q", "main")
+            target = _commit(repo, "a.txt", "target\n")
+            operations = LiveAutoIntegrationGitOperations(repo_root=repo)
+
+            # Without the driver configured this is an ordinary content conflict.
+            self.assertEqual(
+                operations.apply_merge(
+                    source_head=source, target_ref="main", expected_target_head=target
+                ).status,
+                MERGE_CONTENT_CONFLICT,
+            )
+
+            # With it, real git would produce a clean tree of the driver's choosing...
+            _git(repo, "config", "merge.mine.driver", "printf 'DRIVER WON\\n' > %A")
+            direct = subprocess.run(
+                ["git", "merge-tree", "--write-tree", target, source],
+                cwd=repo, capture_output=True, text=True,
+            )
+            self.assertEqual(direct.returncode, 0)
+            # ...and the adapter refuses instead of committing what it cannot reproduce.
+            refused = operations.apply_merge(
+                source_head=source, target_ref="main", expected_target_head=target
+            )
+            self.assertEqual(refused.status, MERGE_NONDETERMINISTIC_CONFIG)
+            self.assertEqual(refused.integration_head, "")
+
     def test_the_commit_says_it_was_not_written_by_a_person(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
@@ -318,23 +410,28 @@ class UseCaseWorktreeSwapRegressionTest(unittest.TestCase):
             _git(repo, "push", "-q", "origin", "main")
             base = _git(repo, "rev-parse", "main")
 
+            # The branch the swap will put at the lane's own path, mid-run.
             _git(repo, "branch", "foreign_lane")
-            contested = root / "contested"
-            _git(repo, "worktree", "add", "-q", str(contested), "foreign_lane")
-            before_branch = _git(contested, "rev-parse", "--abbrev-ref", "HEAD")
-            before_head = _git(contested, "rev-parse", "HEAD")
+            foreign_head = _git(repo, "rev-parse", "foreign_lane")
 
             swapped: list[str] = []
 
             class SwappingOperations(LiveAutoIntegrationGitOperations):
-                """Real adapter that stages the swap the moment the preflight has measured."""
+                """Real adapter that PERFORMS the swap once the preflight has measured.
+
+                R11 shipped this class with a body that appended to a list and swapped
+                nothing, while its docstring and my journal both said otherwise (j#96417
+                finding 4 — the second round running). It does the thing now: the lane's
+                worktree is removed and a foreign lane's checkout is put at the same path,
+                after the measurement and before the apply.
+                """
 
                 def describe_lane_worktree(self, *, path: str):
                     described = super().describe_lane_worktree(path=path)
                     if not swapped:
-                        # The window: the checkout at the contested path becomes somebody
-                        # else's between the measurement and the apply.
                         swapped.append(path)
+                        _git(repo, "worktree", "remove", path)
+                        _git(repo, "worktree", "add", "-q", path, "foreign_lane")
                     return described
 
             operations = SwappingOperations(repo_root=repo)
@@ -360,18 +457,26 @@ class UseCaseWorktreeSwapRegressionTest(unittest.TestCase):
                 )
             )
 
-            self.assertTrue(swapped, "the preflight must have measured before the apply")
-            # Whatever the run decided, the foreign lane's checkout is exactly as it was.
             self.assertEqual(
-                _git(contested, "rev-parse", "--abbrev-ref", "HEAD"), before_branch
+                swapped, [str(lane_worktree)], "the swap must have happened, once"
             )
-            self.assertEqual(_git(contested, "rev-parse", "HEAD"), before_head)
-            self.assertEqual(_git(contested, "status", "--porcelain"), "")
-            self.assertEqual(_git(repo, "rev-parse", "foreign_lane"), before_head)
-            # And the run did reach the apply, so this is not a vacuous pass.
-            self.assertIn(
-                STEP_INTEGRATION_APPLY, [outcome.step for outcome in report.outcomes]
+            # The swap really took: that path now holds the foreign lane.
+            self.assertEqual(
+                _git(lane_worktree, "rev-parse", "--abbrev-ref", "HEAD"), "foreign_lane"
             )
+            # And the run touched none of it. Under the worktree merge this checkout would
+            # have been switched to `main` with the merge commit built on top.
+            self.assertEqual(_git(lane_worktree, "rev-parse", "HEAD"), foreign_head)
+            self.assertEqual(_git(lane_worktree, "status", "--porcelain"), "")
+            self.assertEqual(_git(repo, "rev-parse", "foreign_lane"), foreign_head)
+            # Not a vacuous pass: the run reached the apply, and the apply succeeded.
+            applied = [
+                outcome
+                for outcome in report.outcomes
+                if outcome.step == STEP_INTEGRATION_APPLY
+            ]
+            self.assertEqual(len(applied), 1)
+            self.assertEqual(applied[0].merge_status, MERGE_MERGED)
 
 
 @unittest.skipIf(_GIT is None, "git is not available on PATH")

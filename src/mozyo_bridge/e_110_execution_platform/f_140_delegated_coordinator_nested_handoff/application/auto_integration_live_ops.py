@@ -64,6 +64,7 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Tuple
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_actuator import (
     MERGE_COMMIT_ERROR,
@@ -71,7 +72,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MERGE_ERROR,
     MERGE_INVALID_INPUT,
     MERGE_MERGED,
+    MERGE_NONDETERMINISTIC_CONFIG,
     MERGE_PRIMITIVE_UNSUPPORTED,
+    MERGE_PROBE_ERROR,
     MergeResult,
     PushResult,
 )
@@ -304,36 +307,97 @@ class LiveAutoIntegrationGitOperations:
 
     # -- mutations --------------------------------------------------------
 
-    def _merge_tree_supported(self) -> bool:
-        """Is ``merge-tree --write-tree`` available? Probed by version, never inferred.
+    #: Config that pins what `commit-tree` and `merge-tree` may otherwise take from the host.
+    #: `i18n.commitEncoding` adds an encoding header and changes the commit id (measured,
+    #: j#96417 finding 1); `commit.gpgsign` does not reach `commit-tree` at all (also
+    #: measured) but is pinned so a future git cannot make it reach.
+    _DETERMINISTIC_CONFIG: Tuple[str, ...] = (
+        "-c",
+        "i18n.commitEncoding=UTF-8",
+        "-c",
+        "commit.gpgsign=false",
+    )
+    #: Global and system config are made empty for the two object-building invocations. Both
+    #: are host state; neither is needed by an operation that touches no network and no
+    #: checkout. Repo-local `.git/config` is NOT isolated — it cannot be, and what it can
+    #: still change is handled by refusing (see `_nondeterministic_merge_config`).
+    _ISOLATED_CONFIG_ENV = {
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+    }
 
-        Review j#96412 finding 2: an unrecognized exit code is not evidence that the
-        primitive is missing — ``merge-tree`` exits 1 for a missing object exactly as it does
-        for a content conflict (measured). So the capability question is asked directly, and
-        an unreadable or unparseable version reads as "not supported" rather than as "assume
-        it works".
+    def _merge_tree_capability(self) -> str:
+        """``supported`` / ``unsupported`` / ``probe_error`` — three answers, not two.
+
+        R10 review j#96412 required that an unknown operational error never be reported as
+        "the primitive is unavailable", and R11 collapsed a failed or unparseable
+        ``git --version`` into exactly that claim (j#96417 finding 3). Not being able to ask
+        the question is a different fact from having asked it and been told no.
         """
         result = self._run("--version")
         if result.returncode != 0:
-            return False
+            return MERGE_PROBE_ERROR
         for token in result.stdout.split():
             parts = token.split(".")
             if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
                 continue
-            return (int(parts[0]), int(parts[1])) >= (2, 38)
-        return False
+            return (
+                MERGE_MERGED
+                if (int(parts[0]), int(parts[1])) >= (2, 38)
+                else MERGE_PRIMITIVE_UNSUPPORTED
+            )
+        return MERGE_PROBE_ERROR
+
+    def _nondeterministic_merge_config(self) -> str:
+        """The configured merge driver, if any — the input this adapter cannot pin.
+
+        A ``merge.<name>.driver`` runs arbitrary code over the merged content and changes the
+        resulting tree (measured: a conflict became a clean merge whose file said whatever the
+        driver wrote). It is selected by an in-tree ``.gitattributes`` entry, so the driver
+        names cannot be enumerated in advance, and it lives in repo-local config, which
+        ``GIT_CONFIG_GLOBAL`` / ``GIT_CONFIG_SYSTEM`` do not cover. An actuator whose contract
+        is "the same action rebuilds the same commit" therefore refuses here rather than
+        producing an object it cannot promise to reproduce — the rule this issue has applied
+        to three destructive operations, applied to a determinism claim.
+
+        Returns the offending config key, or ``""`` when there is none. An unreadable config
+        reads as "there is one": the fail-closed direction for a determinism gate.
+        """
+        result = self._run("config", "--get-regexp", r"^merge\..*\.driver$")
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().splitlines()[0].split()[0]
+        if result.returncode not in (0, 1):
+            return "merge.*.driver (config unreadable)"
+        return ""
 
     def _commit_date(self, commit: str) -> str:
-        """The committer date of ``commit``, in a form ``commit-tree`` accepts verbatim.
-
-        This is where the merge commit's timestamp comes from, and the choice is the whole
-        point of review j#96412 finding 1: the clock is not a function of the action, and a
-        commit built from the clock is a different object every time it is built. A commit's
-        own committer date IS a function of the action — the action key covers the source
-        head, and this value is part of that object.
-        """
+        """The committer date of ``commit``, in a form ``commit-tree`` accepts verbatim."""
         result = self._run("show", "-s", "--format=%cI", "--end-of-options", commit)
         return result.stdout.strip() if result.returncode == 0 else ""
+
+    def _merge_timestamp(self, *, source_head: str, target_head: str) -> str:
+        """The later of the two parents' committer dates, or ``""`` if either is unreadable.
+
+        Both are properties of objects the action key covers, so the choice stays a function
+        of the action. R11 used the source's alone, and review j#96417 finding 5 pointed out
+        what that costs: in the ordinary non-fast-forward case the target has moved on since
+        the lane branched, so the merge commit would carry a timestamp OLDER than its own
+        first parent — and ``git log --since`` filters on commit date, so a freshly integrated
+        merge could fall out of a time-bounded search. Taking the later date keeps the
+        chronology without reintroducing the clock.
+        """
+        dates = [self._commit_date(source_head), self._commit_date(target_head)]
+        if not all(dates):
+            return ""
+        # ISO-8601 with an offset does not sort lexically across offsets, so compare the
+        # instants git itself reports rather than the strings.
+        stamps = [
+            self._run("show", "-s", "--format=%ct", "--end-of-options", head)
+            for head in (source_head, target_head)
+        ]
+        if any(stamp.returncode != 0 or not stamp.stdout.strip().isdigit() for stamp in stamps):
+            return ""
+        return dates[0] if int(stamps[0].stdout) >= int(stamps[1].stdout) else dates[1]
 
     def apply_merge(
         self, *, source_head: str, target_ref: str, expected_target_head: str
@@ -342,30 +406,24 @@ class LiveAutoIntegrationGitOperations:
 
         ``git merge-tree --write-tree <target> <source>`` writes the merged tree into the
         object database and prints its id; ``git commit-tree`` then wraps it with the two
-        parents. Every input is an object id, so there is no name for anything to re-point
-        between the decision and the mutation — which is the whole point.
+        parents. The target and source are object ids, so there is no name for anything to
+        re-point between the decision and the mutation — which is the point of building the
+        merge this way (review j#96406 finding 1 reproduced a foreign lane's checkout being
+        switched off its own branch and having the merge built on it, back when the merge ran
+        inside a path an earlier probe had vouched for).
 
-        R9 review j#96406 finding 1 is why this is not a worktree merge any more. The previous
-        form switched a *path* to the target branch and merged there, with that path's identity
-        established by an earlier probe. Reproduced on real git: swapping a foreign lane's
-        clean checkout onto that path between the probe and the merge switched the foreign
-        checkout off its own branch and built the merge commit on it, and it reported success.
-        A non-force push and an exact-SHA CI gate what *lands*; neither undoes a checkout
-        someone else was standing in.
+        **What determinism means here, exactly.** The same action rebuilds the same commit
+        given the same repository content. Getting there took two corrections: the host's git
+        identity and the clock (j#96412 finding 1) and ``i18n.commitEncoding`` (j#96417
+        finding 1) all reached the commit object, and each was measured producing a different
+        SHA for identical inputs. Identity and timestamps are supplied explicitly, encoding is
+        pinned per-invocation, and global/system config is emptied. What is left is a
+        configured merge driver, which cannot be pinned or disabled — so it is refused.
 
-        **The commit is a function of the action.** R10 review j#96412 finding 1 measured the
-        same action producing two different SHAs a second apart, because ``commit-tree`` takes
-        its identity from the host's configuration and its timestamps from the clock — two
-        inputs no action key covers, and which I had overlooked when calling this operation
-        "object ids only". Both are pinned here: a fixed literal identity (so two hosts agree)
-        and the source commit's own committer date (so two runs agree). A replay after a crash
-        rebuilds the *same* object, which is what makes the ledger's idempotency real rather
-        than asserted.
-
-        Failure is a typed status, never a boolean. ``merge-tree`` exits 1 for a missing
-        object exactly as it does for a real conflict (measured), so the exit code alone
-        cannot classify: a conflict prints the merged tree's id first, an operational failure
-        prints none. "Unsupported" is a separate question, asked of the version.
+        Failure is a typed status, never a boolean and never prose. ``merge-tree`` exits 1 for
+        a missing object exactly as it does for a real conflict (measured), so the exit code
+        alone cannot classify: a conflict prints the merged tree's id first, an operational
+        failure prints none.
         """
         if not _is_full_sha(expected_target_head) or not _is_full_sha(source_head):
             return MergeResult(
@@ -375,22 +433,49 @@ class LiveAutoIntegrationGitOperations:
                     f"commit SHAs (source={source_head!r} target={expected_target_head!r})"
                 ),
             )
-        branch = _checked_branch(target_ref)
-        if not self._merge_tree_supported():
+        try:
+            branch = _checked_branch(target_ref)
+        except UnsafeRefspecError as unsafe:
+            # R11 declared this vocabulary member and then let the exception escape into the
+            # caller (j#96417 finding 3): a status that says it covers unusable ref names, and
+            # an operation that instead crashes the actuator on one.
+            return MergeResult(status=MERGE_INVALID_INPUT, detail=str(unsafe))
+        capability = self._merge_tree_capability()
+        if capability == MERGE_PRIMITIVE_UNSUPPORTED:
             return MergeResult(
                 status=MERGE_PRIMITIVE_UNSUPPORTED,
                 detail=(
                     "`git merge-tree --write-tree` requires git >= 2.38; this workspace's git "
-                    "cannot build a merge without a checkout, and merging in one is not an "
-                    "available fallback (#13686 j#96406)"
+                    "is older, and merging inside a checkout is not an available fallback "
+                    "(#13686 j#96406)"
+                ),
+            )
+        if capability != MERGE_MERGED:
+            return MergeResult(
+                status=MERGE_PROBE_ERROR,
+                detail=(
+                    "could not establish whether this git can build an object-level merge; "
+                    "not knowing is not the same as knowing it cannot"
+                ),
+            )
+        driver = self._nondeterministic_merge_config()
+        if driver:
+            return MergeResult(
+                status=MERGE_NONDETERMINISTIC_CONFIG,
+                detail=(
+                    f"a merge driver is configured ({driver}); it rewrites merged content as "
+                    "arbitrary host-local code, so the same action would not rebuild the same "
+                    "commit. Refusing rather than producing an unreproducible integration"
                 ),
             )
         merged = self._run(
+            *self._DETERMINISTIC_CONFIG,
             "merge-tree",
             "--write-tree",
             "--end-of-options",
             expected_target_head,
             source_head,
+            env=self._ISOLATED_CONFIG_ENV,
         )
         first_line = merged.stdout.strip().splitlines()[0].strip() if merged.stdout.strip() else ""
         tree = first_line if _is_full_sha(first_line) else ""
@@ -417,16 +502,19 @@ class LiveAutoIntegrationGitOperations:
                 status=MERGE_ERROR,
                 detail="the merge reported success but named no tree; refusing to commit it",
             )
-        source_date = self._commit_date(source_head)
-        if not source_date:
+        timestamp = self._merge_timestamp(
+            source_head=source_head, target_head=expected_target_head
+        )
+        if not timestamp:
             return MergeResult(
                 status=MERGE_ERROR,
                 detail=(
-                    f"could not read {source_head}'s committer date, which the merge commit's "
+                    "could not read both parents' committer dates, which the merge commit's "
                     "timestamps are derived from; refusing to fall back to the clock"
                 ),
             )
         committed = self._run(
+            *self._DETERMINISTIC_CONFIG,
             "commit-tree",
             tree,
             "-p",
@@ -436,12 +524,13 @@ class LiveAutoIntegrationGitOperations:
             "-m",
             f"Merge {source_head} into {branch}",
             env={
+                **self._ISOLATED_CONFIG_ENV,
                 "GIT_AUTHOR_NAME": ACTUATOR_IDENTITY_NAME,
                 "GIT_AUTHOR_EMAIL": ACTUATOR_IDENTITY_EMAIL,
-                "GIT_AUTHOR_DATE": source_date,
+                "GIT_AUTHOR_DATE": timestamp,
                 "GIT_COMMITTER_NAME": ACTUATOR_IDENTITY_NAME,
                 "GIT_COMMITTER_EMAIL": ACTUATOR_IDENTITY_EMAIL,
-                "GIT_COMMITTER_DATE": source_date,
+                "GIT_COMMITTER_DATE": timestamp,
             },
         )
         integration_head = committed.stdout.strip() if committed.returncode == 0 else ""
@@ -459,8 +548,8 @@ class LiveAutoIntegrationGitOperations:
             detail=(
                 f"merged {source_head} onto {expected_target_head} as objects "
                 "(first parent is the measured target; no worktree, index or ref touched; "
-                "identity and timestamps derived from the action, so a replay rebuilds the "
-                "same commit)"
+                "identity, timestamps and encoding pinned, so the same action on the same "
+                "repository rebuilds this exact commit)"
             ),
         )
 
