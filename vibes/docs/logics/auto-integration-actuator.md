@@ -206,19 +206,46 @@ R11 が書いた「入力は arguments のみ / どの host でも同じ」は *
 | 継承 `GIT_*` env (`GIT_DIR` / `GIT_OBJECT_DIRECTORY` / `GIT_ALTERNATE_OBJECT_DIRECTORIES` / `GIT_CONFIG_COUNT` 等) | `-c` の対象外で git の読む先を変える | **環境を継承せず置換**する (許可 list のみ)。**dict を作ることと child が受け取ることは別** (j#96428 F1) |
 | `refs/replace/*` | object を差し替える (j#96422 F1)。**timestamp probe 経由でも commit を変える** (j#96428 F2) | `--no-replace-objects` + `GIT_NO_REPLACE_OBJECTS=1` を **決定性に寄与する全 invocation** へ |
 | **git binary / version** | **pin 不能** | **claim の成立範囲を「同一 git version」へ限定** (下記) |
-| **`merge.<name>.driver`** | **merged tree の内容そのものが任意 code で書き換わる** (実測: conflict が rc=0 + `DRIVER WON` になる) | **pin 不能 → typed status `nondeterministic_merge_config` で拒否** |
+| **`merge.<name>.driver`** | **merged tree の内容が任意 code で書き換わる** (実測: conflict が rc=0 + `DRIVER WON`) | **sandbox で不可視化** |
+| **`$GIT_DIR/info/attributes`** | merge 挙動を選ぶ。tree の一部でなく、どの option も redirect しない | **sandbox で不可視化** |
+| **`$GIT_COMMON_DIR/shallow`** | 同じ object ids の ancestry 解釈を変える (実測: `refusing to merge unrelated histories`) | **sandbox で不可視化** |
+| partial clone / promisor remote | missing object の demand fetch = **外部 I/O / availability input** | **列挙のみ** (valid object content は OID に束縛されるため別 commit 生成は未確認) |
+| **git binary / version** | pin 不能 | **exact version を durable outcome に記録**し、replay 時に照合可能にする |
 
-driver だけが pin 不能である。名前を in-tree `.gitattributes` が選ぶため `-c` で列挙できず、
-repo-local `.git/config` にあるため隔離もできない。**「条件を自分で enforce できない操作は
-提供しない」を、破壊的操作ではなく決定性の主張へ適用した** — 再現できない commit を作るくらいなら拒否する。
+### repo-local state は「拒否」ではなく **不可視化** する (R15 / j#96435 F1)
+
+R12-R14 は driver と `info/attributes` を **probe して拒否**していた。**これは閉じない** —
+reviewer が probe と merge の間に driver を追加し、その shell command が実行されて merged content が
+書き換わることを再現した。**検査と mutation が別 invocation である限り、同じ時点に束縛されない。**
+撤去した 3 つの破壊的操作と同じ構造である。
+
+代わりに **merge を repository の外で実行する**:
+
+- 呼び出しごとに使い捨ての bare git dir を作る (`--object-format` は実 repo と一致させる)
+- `GIT_DIR` を sandbox へ、`GIT_OBJECT_DIRECTORY` を **実 repo の objects** へ向ける
+- → object は全て読め、書いたものは push が見つける場所に落ちる。一方 config /
+  `info/attributes` / `shallow` は **生成直後の空 repository のもの**である
+
+実測: driver と `info/attributes` を置いたまま、直接 merge は driver の出力を含む clean tree を返し、
+sandbox 経由は **通常の conflict** を返して driver は実行されなかった。shallow も同様に無効化される。
+
+**これは precheck ではなく物理的な不可視化であり、競合窓が存在しない。** これに伴い driver /
+`info/attributes` の **refusal は撤去した** — 到達し得ない入力を拒否するのは false positive であり
+(j#96422 F4 と同型)、driver を常用する repo で feature を止める理由も無くなった。
 
 **claim の成立範囲**: 「**同一 git version の下で、同一 repository 内容に対し、同一 action は同一 commit を
 再構築する**」。git binary は pin できないため cross-version の同一性は主張しない。
+**そして prose で限定するだけにしない** — apply の durable outcome (`StepOutcome.git_version`) に
+**exact version を記録**するので、replay が同一 version 下だったかを後から照合できる (j#96435 F4)。
 
 > **enforce 範囲は「具体名の列挙」で書く。** R10 は「入力は全て object id」、R11 は「arguments alone」、
-> R12 は「pin 不能なのは driver だけ」、R13 は上の表 (2 key と 1 供給元が欠落) と書き、
-> **4 回とも外した** (j#96412 / j#96417 / j#96422 / j#96428)。
+> R12 は「pin 不能なのは driver だけ」、R13 は上の表 (2 key と 1 供給元が欠落)、
+> R14 は「pin できないものは拒否した」(**拒否が precheck であり時点を束縛していなかった**) と書き、
+> **5 回とも外した** (j#96412 / j#96417 / j#96422 / j#96428 / j#96435)。
 > **列挙形式にしても網羅性は保証されない** — 形式は「何を主張していないか」を読めるようにするだけである。
+> **さらに: 列挙して pin / refuse を並べても、refuse が別 invocation なら守っていない。**
+> R15 の sandbox はこの系列で初めて **「入力を数える」ことに依存しない**構造である
+> (repo-local state は分類ではなく丸ごと不可視になる)。
 > 「全部やった」ではなく「pin した key はこれ、isolate した env はこれ、refuse する条件はこれ」と書く。
 > 上の表がその列挙であり、**表に無いものは enforce していない**。
 

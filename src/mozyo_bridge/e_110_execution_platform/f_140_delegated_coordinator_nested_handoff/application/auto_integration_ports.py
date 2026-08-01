@@ -111,6 +111,10 @@ class MergeResult:
     status: str
     integration_head: str = ""
     detail: str = ""
+    #: The exact ``git --version`` this merge ran under, so a durable record can say which git
+    #: produced the commit rather than leaving "same version" as an unverifiable sentence
+    #: (j#96435 finding 4).
+    git_version: str = ""
 
     @property
     def conflicted(self) -> bool:
@@ -127,6 +131,7 @@ class MergeResult:
             "status": self.status,
             "integration_head": self.integration_head,
             "detail": self.detail,
+            "git_version": self.git_version,
         }
 
 

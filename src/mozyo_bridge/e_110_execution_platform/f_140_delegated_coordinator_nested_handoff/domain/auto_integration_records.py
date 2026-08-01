@@ -159,6 +159,12 @@ class StepOutcome:
     #: The exact commit the step produced, where it produces one (the integration head an
     #: apply created, or the head a push landed). Empty when the step produces no commit.
     head: str = ""
+    #: For an apply: the exact ``git --version`` string the merge ran under. The commit is a
+    #: function of the action *given the same git*, and R14 stated that limit in prose while
+    #: discarding the only evidence that could check it — the version was read for a
+    #: capability comparison and thrown away (j#96435 finding 4). A replay can now be compared
+    #: against the version that produced the original.
+    git_version: str = ""
     #: For an apply: HOW the merge ended, from the closed :data:`MERGE_STATUSES` vocabulary.
     #: Empty for every other step. R11 shipped the typed status on the port's return value
     #: and then wrote it back into ``detail`` as a string prefix, so the durable record — the
@@ -180,6 +186,7 @@ class StepOutcome:
             "head": self.head,
             "recorded_by": self.recorded_by,
             "merge_status": self.merge_status,
+            "git_version": self.git_version,
         }
 
     @classmethod
@@ -198,6 +205,7 @@ class StepOutcome:
             merge_status=(
                 checked_merge_status(raw_status) if str(raw_status or "").strip() else ""
             ),
+            git_version=str(payload.get("git_version", "")),
         )
 
 

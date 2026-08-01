@@ -484,6 +484,7 @@ class AutoIntegrationUseCase:
                 recorded_by=self.recorder_id,
                 outcome=OUTCOME_DONE,
                 merge_status=status,
+                git_version=result.git_version,
                 detail=result.detail,
                 head=result.integration_head,
             )

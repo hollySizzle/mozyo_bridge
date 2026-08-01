@@ -62,9 +62,11 @@ from __future__ import annotations
 
 import os
 import subprocess
-from dataclasses import dataclass
+import tempfile
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Tuple
+from typing import Iterator, Optional, Tuple
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_actuator import (
     MERGE_COMMIT_ERROR,
@@ -136,7 +138,7 @@ def _checked_branch(ref: str) -> str:
     return candidate
 
 
-@dataclass(frozen=True)
+@dataclass
 class LiveAutoIntegrationGitOperations:
     """Subprocess-backed auto-integration Git operations for a concrete repo root.
 
@@ -147,6 +149,14 @@ class LiveAutoIntegrationGitOperations:
 
     repo_root: Path
     remote: str = DEFAULT_REMOTE
+    #: The sanitized git directory an object-building call is currently running in, and the
+    #: repository object store it writes through. Set only for the duration of
+    #: :meth:`_sanitized_git_dir`; ``None`` everywhere else, so a sealed call outside one
+    #: raises rather than quietly running against the repository.
+    _sandbox: Optional[Path] = field(default=None, init=False, repr=False, compare=False)
+    _sandbox_objects: Optional[Path] = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     # -- infrastructure ---------------------------------------------------
 
@@ -411,22 +421,93 @@ class LiveAutoIntegrationGitOperations:
         env.update(overrides)
         return env
 
+    @contextmanager
+    def _sanitized_git_dir(self) -> "Iterator[Optional[Path]]":
+        """A throwaway git directory that can SEE the repository's objects and nothing else.
+
+        This is the answer to review j#96435 finding 1, and it is a different kind of answer
+        from the four rounds before it. Those all took the form "check the repository's state,
+        then act": pin what can be pinned, probe for what cannot, refuse when the probe finds
+        it. The reviewer's reproduction showed why that shape cannot work — a merge driver
+        added to ``.git/config`` *between* the probe and the merge ran its shell command and
+        rewrote the merged content, and an ``info/attributes`` written in the same window
+        changed a conflict into a clean merge. A check and a mutation in two invocations are
+        never bound to the same instant. That is the identical defect that retired the local
+        branch delete and the worktree removal; here, unlike there, an alternative exists.
+
+        So the merge does not run in the repository. It runs in a bare git directory created
+        for this call, whose object store IS the repository's (``GIT_OBJECT_DIRECTORY``), so
+        every object is readable and anything written lands where the push will find it — but
+        whose config, ``info/attributes`` and ``shallow`` are those of an empty repository that
+        has existed for microseconds. The hostile state is not refused; it is **not visible**,
+        and there is no window in which it can become visible.
+
+        Measured: with a driver and an ``info/attributes`` both in place, the direct merge
+        returned a clean tree containing the driver's output, and the sanitized one returned an
+        ordinary conflict with the driver never invoked. A repository marked shallow behaved
+        the same way — ``refusing to merge unrelated histories`` directly, an ordinary merge
+        here (j#96435 finding 3, closed by the same construction).
+
+        Yields ``None`` when the sandbox cannot be built, and every caller treats that as a
+        refusal rather than falling back to the repository.
+        """
+        object_format = self._run("rev-parse", "--show-object-format")
+        object_dir = self._run("rev-parse", "--absolute-git-dir")
+        if object_format.returncode != 0 or object_dir.returncode != 0:
+            yield None
+            return
+        objects = Path(object_dir.stdout.strip()) / "objects"
+        with tempfile.TemporaryDirectory(prefix="mozyo-merge-") as scratch:
+            sandbox = Path(scratch) / "sanitized.git"
+            created = self._run(
+                "init",
+                "--bare",
+                "--quiet",
+                "--object-format",
+                object_format.stdout.strip() or "sha1",
+                str(sandbox),
+            )
+            if created.returncode != 0 or not sandbox.is_dir():
+                yield None
+                return
+            self._sandbox = sandbox
+            self._sandbox_objects = objects
+            try:
+                yield sandbox
+            finally:
+                self._sandbox = None
+                self._sandbox_objects = None
+
     def _sealed(self, *args: str, **overrides: str) -> subprocess.CompletedProcess[str]:
-        """Run git with the pinned config and a REPLACED environment.
+        """Run git with the pinned config, a REPLACED environment, and no repository state.
 
         Every invocation whose answer feeds the integration commit goes through here — the
-        merge, the commit, the driver probe, and the timestamp reads. j#96428 finding 2 is why
-        the last of those is on the list: R13 sealed the two object-building calls and left the
-        ``git show`` that decides the commit's timestamps running in the ambient environment,
-        so a replace ref still changed the resulting commit (measured).
+        merge, the commit, and the timestamp reads. j#96428 finding 2 is why the last of those
+        is on the list: R13 sealed the two object-building calls and left the ``git show`` that
+        decides the commit's timestamps running in the ambient environment, so a replace ref
+        still changed the resulting commit (measured).
+
+        Requires an open :meth:`_sanitized_git_dir`; without one there is no context to run in
+        and the caller has nothing to fall back to.
         """
+        if self._sandbox is None or self._sandbox_objects is None:
+            raise RuntimeError("a sealed git invocation requires a sanitized git directory")
         return self._run(
             *self._DETERMINISTIC_CONFIG,
             *self._NO_REPLACE,
             *args,
-            env=self._sealed_env(**overrides),
+            env=self._sealed_env(
+                GIT_DIR=str(self._sandbox),
+                GIT_OBJECT_DIRECTORY=str(self._sandbox_objects),
+                **overrides,
+            ),
             seal_env=True,
         )
+
+    def _git_version(self) -> str:
+        """The exact ``git --version`` output, recorded on the outcome (j#96435 finding 4)."""
+        result = self._run("--version")
+        return result.stdout.strip() if result.returncode == 0 else ""
 
     def _merge_tree_capability(self) -> str:
         """``supported`` / ``unsupported`` / ``probe_error`` — three answers, not two.
@@ -477,60 +558,14 @@ class LiveAutoIntegrationGitOperations:
             )
         return branch
 
-    def _external_attributes(self) -> str:
-        """``$GIT_DIR/info/attributes``, which selects merge behaviour and cannot be pinned.
-
-        Attributes come from three places (j#96428 finding 3). The user's file is named by
-        ``core.attributesFile`` and the system's is disabled by ``GIT_ATTR_NOSYSTEM``, both
-        reachable. This one is a fixed path inside the repository that no option redirects,
-        and it is not part of the tree — so two clones of the same commit can merge
-        differently, which is exactly what the determinism claim denies. Measured: adding
-        ``f.txt merge=union`` to it turned a content conflict into a clean merge.
-
-        Refused rather than pinned, like a configured driver. Returns the path when present.
-        """
-        candidate = self._sealed("rev-parse", "--git-path", "info/attributes")
-        if candidate.returncode != 0:
-            return "$GIT_DIR/info/attributes (git dir unreadable)"
-        path = Path(candidate.stdout.strip())
-        if not path.is_absolute():
-            path = self.repo_root / path
-        try:
-            return str(path) if path.is_file() else ""
-        except OSError:
-            return str(path)
-
-    def _nondeterministic_merge_config(self) -> str:
-        """The configured merge driver, if any — the input this adapter cannot pin.
-
-        A ``merge.<name>.driver`` runs arbitrary code over the merged content and changes the
-        resulting tree (measured: a conflict became a clean merge whose file said whatever the
-        driver wrote). It is selected by an in-tree ``.gitattributes`` entry, so the driver
-        names cannot be enumerated in advance, and it lives in repo-local config, which
-        ``GIT_CONFIG_GLOBAL`` / ``GIT_CONFIG_SYSTEM`` do not cover. An actuator whose contract
-        is "the same action rebuilds the same commit" therefore refuses here rather than
-        producing an object it cannot promise to reproduce — the rule this issue has applied
-        to three destructive operations, applied to a determinism claim.
-
-        Asked through the SAME config view the merge itself uses. R12 asked it without the
-        isolation the real invocations apply, so an unused driver sitting in a *global* config
-        — which the merge would never have seen — refused a clean merge (measured, j#96422
-        finding 4). A gate must be asked about the world its subject actually runs in.
-
-        A driver declared in repo-local config still refuses even when no in-tree attribute
-        selects it: which paths a merge touches is not known until it has run, so "declared
-        but unselected" cannot be established beforehand. Whether that conservative reading
-        should stand is an owner/design question, recorded rather than settled here.
-
-        Returns the offending config key, or ``""`` when there is none. An unreadable config
-        reads as "there is one": the fail-closed direction for a determinism gate.
-        """
-        result = self._sealed("config", "--get-regexp", r"^merge\..*\.driver$")
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip().splitlines()[0].split()[0]
-        if result.returncode not in (0, 1):
-            return "merge.*.driver (config unreadable)"
-        return ""
+    # There is no `_nondeterministic_merge_config` and no `_external_attributes` any more.
+    # Both were probes that read the repository, decided it was hazardous, and refused — and
+    # review j#96435 finding 1 reproduced a driver added between the probe and the merge doing
+    # exactly what the probe existed to prevent. A check in one invocation cannot bind a
+    # mutation in another. The merge now runs where those inputs do not exist
+    # (:meth:`_sanitized_git_dir`), which also retires the false positives the refusals caused
+    # (an unused driver, an attributes file about other paths) and the feature-stop they
+    # implied for repositories that legitimately use either.
 
     def _commit_date(self, commit: str) -> str:
         """The committer date of ``commit``, in a form ``commit-tree`` accepts verbatim.
@@ -625,26 +660,23 @@ class LiveAutoIntegrationGitOperations:
                     "not knowing is not the same as knowing it cannot"
                 ),
             )
-        driver = self._nondeterministic_merge_config()
-        if driver:
-            return MergeResult(
-                status=MERGE_NONDETERMINISTIC_CONFIG,
-                detail=(
-                    f"a merge driver is configured ({driver}); it rewrites merged content as "
-                    "arbitrary host-local code, so the same action would not rebuild the same "
-                    "commit. Refusing rather than producing an unreproducible integration"
-                ),
-            )
-        attributes = self._external_attributes()
-        if attributes:
-            return MergeResult(
-                status=MERGE_NONDETERMINISTIC_CONFIG,
-                detail=(
-                    f"{attributes} exists; it selects merge behaviour, is not part of the "
-                    "tree, and no option redirects it, so two clones of this commit can merge "
-                    "differently. Refusing rather than producing an unreproducible integration"
-                ),
-            )
+        with self._sanitized_git_dir() as sandbox:
+            if sandbox is None:
+                return MergeResult(
+                    status=MERGE_NONDETERMINISTIC_CONFIG,
+                    detail=(
+                        "could not build the sanitized git directory the merge runs in; "
+                        "refusing rather than merging in the repository, where a driver or an "
+                        "info/attributes file added mid-run would change the result"
+                    ),
+                )
+            return self._merge_in(sandbox, source_head=source_head, branch=branch,
+                                  expected_target_head=expected_target_head)
+
+    def _merge_in(
+        self, sandbox: Path, *, source_head: str, branch: str, expected_target_head: str
+    ) -> MergeResult:
+        """Build the merge inside an open sanitized git directory."""
         merged = self._sealed(
             "merge-tree",
             "--write-tree",
@@ -716,6 +748,7 @@ class LiveAutoIntegrationGitOperations:
         return MergeResult(
             status=MERGE_MERGED,
             integration_head=integration_head,
+            git_version=self._git_version(),
             detail=(
                 f"merged {source_head} onto {expected_target_head} as objects "
                 "(first parent is the measured target; no worktree, index or ref touched; "

@@ -476,34 +476,101 @@ class DeterministicMergeCommitTest(unittest.TestCase):
             self.assertEqual(after.status, MERGE_MERGED, after.detail)
             self.assertEqual(after.integration_head, before.integration_head)
 
-    def test_an_external_attributes_file_is_refused(self) -> None:
-        """j#96428 finding 3: `$GIT_DIR/info/attributes` is neither in the tree nor pinnable."""
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp) / "repo"
+    def test_hostile_repository_state_cannot_reach_the_merge(self) -> None:
+        """R14 review j#96435 finding 1, adversarially: the state is present, and inert.
+
+        R12-R14 probed for a merge driver and an ``info/attributes`` file and refused when
+        either was found. The reviewer added a driver *between* the probe and the merge and
+        watched its shell command run and rewrite the merged content — a check in one
+        invocation cannot bind a mutation in another, which is the defect that retired three
+        destructive operations. There is no probe now: the merge runs in a git directory where
+        this state does not exist, so each of these is present throughout and changes nothing.
+
+        ``.git/shallow`` is here for the same reason (finding 3): in the repository it turned
+        the merge into ``refusing to merge unrelated histories``; in the sanitized directory
+        the merge is ordinary. And ``info/attributes`` is exercised as a *directory* as well as
+        a file, because R14's presence check used ``is_file()`` and missed that (finding 2) —
+        a distinction that stops mattering once nothing is being checked.
+        """
+        def build(repo: Path) -> tuple:
             _init(repo)
+            (repo / ".gitattributes").write_text("f.txt merge=mine\n", encoding="utf-8")
             _commit(repo, "f.txt", "base\n")
             _git(repo, "checkout", "-q", "-b", "lane")
             source = _commit(repo, "f.txt", "lane\n")
             _git(repo, "checkout", "-q", "main")
             target = _commit(repo, "f.txt", "target\n")
-            operations = LiveAutoIntegrationGitOperations(repo_root=repo)
+            return source, target
 
-            # Without it, this is an ordinary content conflict.
-            self.assertEqual(
-                operations.apply_merge(
+        def git_dir(repo: Path) -> Path:
+            return Path(_git(repo, "rev-parse", "--absolute-git-dir"))
+
+        hostilities = {
+            "merge driver": lambda repo: _git(
+                repo, "config", "merge.mine.driver", "printf 'DRIVER WON\\n' > %A"
+            ),
+            "info/attributes file": lambda repo: (
+                (git_dir(repo) / "info").mkdir(exist_ok=True),
+                (git_dir(repo) / "info" / "attributes").write_text(
+                    "f.txt merge=union\n", encoding="utf-8"
+                ),
+            ),
+            "info/attributes directory": lambda repo: (
+                git_dir(repo) / "info" / "attributes"
+            ).mkdir(parents=True, exist_ok=True),
+            "shallow": lambda repo: (git_dir(repo) / "shallow").write_text(
+                f"{_git(repo, 'rev-parse', 'main')}\n{_git(repo, 'rev-parse', 'lane')}\n",
+                encoding="utf-8",
+            ),
+        }
+
+        for label, make_hostile in hostilities.items():
+            with tempfile.TemporaryDirectory() as tmp:
+                repo = Path(tmp) / "repo"
+                source, target = build(repo)
+                operations = LiveAutoIntegrationGitOperations(repo_root=repo)
+                before = operations.apply_merge(
                     source_head=source, target_ref="main", expected_target_head=target
-                ).status,
-                MERGE_CONTENT_CONFLICT,
-            )
+                )
+                make_hostile(repo)
+                after = operations.apply_merge(
+                    source_head=source, target_ref="main", expected_target_head=target
+                )
+                self.assertEqual(after.status, before.status, label)
+                self.assertEqual(after.integration_head, before.integration_head, label)
+                # ...and the run is not refused either: a present-but-unreachable input is
+                # not a hazard to report (the false positive of j#96422 finding 4).
+                self.assertNotEqual(after.status, MERGE_NONDETERMINISTIC_CONFIG, label)
 
-            info = repo / ".git" / "info"
-            info.mkdir(exist_ok=True)
-            (info / "attributes").write_text("f.txt merge=union\n", encoding="utf-8")
-            refused = operations.apply_merge(
+    def test_the_merge_driver_would_have_fired_without_the_sanitized_directory(self) -> None:
+        """The scene above is only meaningful if raw git really would run the driver."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            _init(repo)
+            (repo / ".gitattributes").write_text("f.txt merge=mine\n", encoding="utf-8")
+            _commit(repo, "f.txt", "base\n")
+            _git(repo, "checkout", "-q", "-b", "lane")
+            source = _commit(repo, "f.txt", "lane\n")
+            _git(repo, "checkout", "-q", "main")
+            target = _commit(repo, "f.txt", "target\n")
+            _git(repo, "config", "merge.mine.driver", "printf 'DRIVER WON\\n' > %A")
+
+            raw = subprocess.run(
+                ["git", "merge-tree", "--write-tree", target, source],
+                cwd=repo, capture_output=True, text=True,
+            )
+            self.assertEqual(raw.returncode, 0, "the driver must turn the conflict clean")
+            content = subprocess.run(
+                ["git", "cat-file", "-p", f"{raw.stdout.strip()}:f.txt"],
+                cwd=repo, capture_output=True, text=True, check=True,
+            ).stdout
+            self.assertIn("DRIVER WON", content)
+
+            # The adapter, on the same repository, is untouched by it.
+            result = LiveAutoIntegrationGitOperations(repo_root=repo).apply_merge(
                 source_head=source, target_ref="main", expected_target_head=target
             )
-            self.assertEqual(refused.status, MERGE_NONDETERMINISTIC_CONFIG)
-            self.assertEqual(refused.integration_head, "")
+            self.assertEqual(result.status, MERGE_CONTENT_CONFLICT)
 
     def test_merge_semantics_config_cannot_change_the_result(self) -> None:
         """`merge.default` picks a driver for paths no attribute names (j#96428 finding 3)."""
@@ -533,48 +600,6 @@ class DeterministicMergeCommitTest(unittest.TestCase):
                     key,
                 )
                 _git(repo, "config", "--unset", key)
-
-    def test_a_merge_driver_is_refused_rather_than_silently_obeyed(self) -> None:
-        """The input that cannot be pinned, so it is checked instead.
-
-        Measured: a configured `merge.<name>.driver` selected by an in-tree `.gitattributes`
-        turns a conflict into a clean merge whose content is whatever the driver wrote. It
-        lives in repo-local config, which `GIT_CONFIG_GLOBAL`/`SYSTEM` do not cover, and its
-        name comes from the tree so it cannot be enumerated in advance. An actuator promising
-        that the same action rebuilds the same commit cannot keep that promise here.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp) / "repo"
-            _init(repo)
-            (repo / ".gitattributes").write_text("a.txt merge=mine\n", encoding="utf-8")
-            _commit(repo, "a.txt", "base\n")
-            _git(repo, "checkout", "-q", "-b", "lane")
-            source = _commit(repo, "a.txt", "lane\n")
-            _git(repo, "checkout", "-q", "main")
-            target = _commit(repo, "a.txt", "target\n")
-            operations = LiveAutoIntegrationGitOperations(repo_root=repo)
-
-            # Without the driver configured this is an ordinary content conflict.
-            self.assertEqual(
-                operations.apply_merge(
-                    source_head=source, target_ref="main", expected_target_head=target
-                ).status,
-                MERGE_CONTENT_CONFLICT,
-            )
-
-            # With it, real git would produce a clean tree of the driver's choosing...
-            _git(repo, "config", "merge.mine.driver", "printf 'DRIVER WON\\n' > %A")
-            direct = subprocess.run(
-                ["git", "merge-tree", "--write-tree", target, source],
-                cwd=repo, capture_output=True, text=True,
-            )
-            self.assertEqual(direct.returncode, 0)
-            # ...and the adapter refuses instead of committing what it cannot reproduce.
-            refused = operations.apply_merge(
-                source_head=source, target_ref="main", expected_target_head=target
-            )
-            self.assertEqual(refused.status, MERGE_NONDETERMINISTIC_CONFIG)
-            self.assertEqual(refused.integration_head, "")
 
     def test_the_commit_says_it_was_not_written_by_a_person(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
