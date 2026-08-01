@@ -54,8 +54,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     STEP_INTEGRATION_CI,
     STEP_PUSH,
     AutoIntegrationPolicy,
+    CoordinatorConfirmation,
     IntegrationActionRecord,
+    IntegrationCiEvidence,
     IntegrationPreflight,
+    IntegrationWorktree,
     StepOutcome,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.retirement_cleanup_policy import (
@@ -87,7 +90,6 @@ class FakeGitOperations:
     push_result: PushResult = field(default_factory=lambda: PushResult(accepted=True))
     worktree_removed: bool = True
     branch_deleted: bool = True
-    remote_deleted: bool = True
     calls: List[Tuple[str, dict]] = field(default_factory=list)
 
     def apply_merge(
@@ -120,10 +122,6 @@ class FakeGitOperations:
             ("delete_local_branch", {"branch": branch, "expected_tip": expected_tip})
         )
         return self.branch_deleted
-
-    def delete_remote_branch(self, *, branch: str) -> bool:
-        self.calls.append(("delete_remote_branch", {"branch": branch}))
-        return self.remote_deleted
 
     @property
     def performed(self) -> List[str]:
@@ -166,12 +164,27 @@ def _clean(**overrides: object) -> IntegrationPreflight:
         "review_generation_admissible": True,
         "target_identity_known": True,
         "source_ci_green": True,
-        "integration_ci_green": True,
         "callbacks_drained": True,
         "owner_gates_resolved": True,
+        "integration_ci": IntegrationCiEvidence(
+            integration_head=SOURCE, workflow="required-ci", run="run-1", conclusion="success"
+        ),
     }
     fields.update(overrides)
     return IntegrationPreflight(**fields)  # type: ignore[arg-type]
+
+
+def _dedicated(**overrides: object) -> IntegrationWorktree:
+    """A verified dedicated integration worktree (registered, clean, not the lane's)."""
+    fields: dict = {
+        "path": "<integration-worktree>",
+        "registered": True,
+        "is_lane_worktree": False,
+        "clean": True,
+        "checked_out_branch": "main",
+    }
+    fields.update(overrides)
+    return IntegrationWorktree(**fields)  # type: ignore[arg-type]
 
 
 def _use_case(operations: FakeGitOperations, **kwargs: object) -> AutoIntegrationUseCase:
@@ -179,7 +192,6 @@ def _use_case(operations: FakeGitOperations, **kwargs: object) -> AutoIntegratio
         "integration_policy": AutoIntegrationPolicy(
             mode=MODE_AUTO, integration_branch="main"
         ),
-        "integration_worktree": "<integration-worktree>",
     }
     defaults.update(kwargs)
     return AutoIntegrationUseCase(operations=operations, **defaults)  # type: ignore[arg-type]
@@ -211,7 +223,9 @@ class ConfigTranslationTest(unittest.TestCase):
         policy = cleanup_policy_from_config(AutoIntegrationConfig.default())
         self.assertTrue(policy.remove_worktree)
         self.assertTrue(policy.delete_local_branch)
-        self.assertFalse(policy.delete_remote_branch)
+        # R1 review j#96344 finding 1: there is no remote-delete knob to be False; the
+        # operation is gone, so no config can ask for it.
+        self.assertFalse(hasattr(policy, "delete_remote_branch"))
 
     def test_the_default_config_translates_to_a_disabled_actuator(self) -> None:
         policy = integration_policy_from_config(AutoIntegrationConfig.default())
@@ -276,7 +290,7 @@ class FastForwardRunTest(unittest.TestCase):
     def test_a_fast_forward_pushes_the_source_head_and_never_merges(self) -> None:
         operations = FakeGitOperations()
         report = _use_case(operations).run_integration(
-            _record(), _clean(integration_ci_green=False)
+            _record(), _clean(integration_ci=None)
         )
         self.assertEqual(operations.performed, ["push_non_force"])
         self.assertEqual(
@@ -322,7 +336,12 @@ class MergeCommitRunTest(unittest.TestCase):
     def test_a_merge_disposition_applies_then_pushes_the_merge_commit(self) -> None:
         operations = FakeGitOperations()
         report = _use_case(operations, integration_policy=self._policy()).run_integration(
-            _record(), _clean(fast_forward_possible=False, integration_ci_green=False)
+            _record(),
+            _clean(
+                fast_forward_possible=False,
+                integration_ci=None,
+                integration_worktree=_dedicated(),
+            ),
         )
         self.assertEqual(operations.performed, ["apply_merge", "push_non_force"])
         self.assertEqual(
@@ -337,20 +356,36 @@ class MergeCommitRunTest(unittest.TestCase):
             merge_result=MergeResult(conflicted=True, detail="conflict in a.py")
         )
         report = _use_case(operations, integration_policy=self._policy()).run_integration(
-            _record(), _clean(fast_forward_possible=False)
+            _record(),
+            _clean(fast_forward_possible=False, integration_worktree=_dedicated()),
         )
         self.assertEqual(operations.performed, ["apply_merge"])
         self.assertEqual(report.outcomes[-1].outcome, OUTCOME_BLOCKED)
         self.assertIn("conflict in a.py", report.outcomes[-1].detail)
 
+    def test_the_lane_s_own_worktree_never_reaches_the_merge(self) -> None:
+        # R1 review j#96344 finding 3: R1 forwarded ANY non-empty path, so passing the lane's
+        # own checkout made the actuator do the one thing j#77124 forbids. The refusal is now
+        # the decision's, before any step is authorized — the port is never called.
+        operations = FakeGitOperations()
+        report = _use_case(operations, integration_policy=self._policy()).run_integration(
+            _record(),
+            _clean(
+                fast_forward_possible=False,
+                integration_worktree=_dedicated(is_lane_worktree=True),
+            ),
+        )
+        self.assertEqual(operations.performed, [])
+        self.assertEqual(report.outcomes, [])
+        self.assertEqual(report.final_decision.state, STATE_INTEGRATION_BLOCKED)
+
     def test_a_missing_dedicated_worktree_refuses_rather_than_using_the_lane(self) -> None:
         operations = FakeGitOperations()
-        report = _use_case(
-            operations, integration_policy=self._policy(), integration_worktree=""
-        ).run_integration(_record(), _clean(fast_forward_possible=False))
+        report = _use_case(operations, integration_policy=self._policy()).run_integration(
+            _record(), _clean(fast_forward_possible=False)
+        )
         self.assertEqual(operations.performed, [])
-        self.assertEqual(report.outcomes[-1].outcome, OUTCOME_BLOCKED)
-        self.assertIn("dedicated integration worktree", report.outcomes[-1].detail)
+        self.assertEqual(report.final_decision.state, STATE_INTEGRATION_BLOCKED)
 
     def test_a_resumed_run_pushes_the_recorded_merge_commit_not_the_source(self) -> None:
         # The in-memory head is gone on a resume; without reading it back from the ledger
@@ -367,7 +402,8 @@ class MergeCommitRunTest(unittest.TestCase):
         ]
         _use_case(operations, integration_policy=self._policy()).run_integration(
             record,
-            _clean(fast_forward_possible=False, integration_ci_green=False),
+            _clean(fast_forward_possible=False, integration_ci=None,
+                   integration_worktree=_dedicated()),
             ledger=ledger,
         )
         self.assertEqual(operations.performed, ["push_non_force"])
@@ -447,26 +483,15 @@ class CleanupCompositionTest(unittest.TestCase):
             operations.calls[1][1], {"branch": "issue_13686_lane", "expected_tip": SOURCE}
         )
 
-    def test_remote_delete_stays_off_unless_enabled(self) -> None:
+    def test_the_port_cannot_delete_a_remote_ref_at_all(self) -> None:
+        # R1 review j#96344 finding 1: the operation is removed from the interface rather
+        # than guarded, so no policy, config, or code path can reach it.
+        self.assertFalse(hasattr(FakeGitOperations(), "delete_remote_branch"))
         operations = FakeGitOperations()
-        _use_case(
-            operations,
-            processes=FakeProcessOperations(),
-            cleanup_policy=RetirementCleanupPolicy.default(),
-        ).run_cleanup(self._record(), self._clean())
-        self.assertNotIn("delete_remote_branch", operations.performed)
-
-    def test_enabling_remote_delete_adds_it_after_the_local_one(self) -> None:
-        operations = FakeGitOperations()
-        _use_case(
-            operations,
-            processes=FakeProcessOperations(),
-            cleanup_policy=RetirementCleanupPolicy(delete_remote_branch=True),
-        ).run_cleanup(self._record(), self._clean())
-        self.assertEqual(
-            operations.performed,
-            ["remove_worktree", "delete_local_branch", "delete_remote_branch"],
+        _use_case(operations, processes=FakeProcessOperations()).run_cleanup(
+            self._record(), self._clean()
         )
+        self.assertNotIn("delete_remote_branch", operations.performed)
 
     def test_a_dirty_worktree_stops_before_the_branch_delete(self) -> None:
         operations = FakeGitOperations()

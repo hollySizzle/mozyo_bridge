@@ -62,7 +62,6 @@ AUTO_INTEGRATION_KEYS: frozenset[str] = frozenset(
         "require_integration_ci",
         "remove_worktree",
         "delete_local_branch",
-        "delete_remote_branch",
     }
 )
 #: ``mode: auto`` advances the integration once every gate is satisfied;
@@ -89,9 +88,12 @@ DEFAULT_REQUIRE_SOURCE_CI: bool = True
 DEFAULT_REQUIRE_INTEGRATION_CI: bool = True
 DEFAULT_REMOVE_WORKTREE: bool = True
 DEFAULT_DELETE_LOCAL_BRANCH: bool = True
-#: Deleting the branch on the remote is off by default (j#96335). It is the one cleanup step
-#: whose effect is not recoverable from the local clone.
-DEFAULT_DELETE_REMOTE_BRANCH: bool = False
+# There is deliberately no `delete_remote_branch` key. R1 shipped one (default False per
+# j#96335) and review j#96344 finding 1 found the step it enabled bypassed every local CAS
+# condition and had no compare-and-swap against the remote tip. A remote-ref CAS requires
+# `--force-with-lease`, a force that j#96335 prohibits, so the operation cannot be made safe
+# in this tranche; the key is removed rather than left as a way to ask for it. Whether a
+# non-force path exists is an owner/design question (recorded on #13686).
 #: The closed set of recognized keys inside the ``agent_launch`` sub-record
 #: (Redmine #13155): the per-role / lane managed-pane launch model knob. ``version``
 #: is optional and defaults to :data:`REPO_LOCAL_CONFIG_VERSION`; ``sublane_claude_model``
@@ -382,9 +384,7 @@ class AutoIntegrationConfig:
     - :attr:`delete_local_branch` — safe-delete the lane's local branch. Again the CAS
       conditions (no worktree holds it, no unique unpushed commit, reachable from the target
       or patch-equivalent, tip unchanged since the action) are not reachable from here, and
-      ``git branch -D`` is never the fallback.
-    - :attr:`delete_remote_branch` — **default False** (j#96335). Enabling it adds a step
-      behind every local condition; it relaxes none of them.
+      ``git branch -D`` is never the fallback. This is the only ref-deleting step there is.
 
     Boundary, kept enforced in code (this is *policy intent*, not authority):
 
@@ -399,8 +399,8 @@ class AutoIntegrationConfig:
       ``send`` / credential, …) is rejected by the same closed-schema screen the rest of this
       module enforces — which is also why the ff / CI / cleanup fields are spelled without
       those tokens.
-    - **Force push, auto-rebase, and remote ref rewriting are not expressible.** There is no
-      field for them by construction, so no config can request one.
+    - **Force push, auto-rebase, and remote ref deletion / rewriting are not expressible.**
+      There is no field for any of them by construction, so no config can request one.
     """
 
     mode: str = DEFAULT_AUTO_INTEGRATION_MODE
@@ -410,7 +410,6 @@ class AutoIntegrationConfig:
     require_integration_ci: bool = DEFAULT_REQUIRE_INTEGRATION_CI
     remove_worktree: bool = DEFAULT_REMOVE_WORKTREE
     delete_local_branch: bool = DEFAULT_DELETE_LOCAL_BRANCH
-    delete_remote_branch: bool = DEFAULT_DELETE_REMOTE_BRANCH
 
     @classmethod
     def default(cls) -> "AutoIntegrationConfig":
@@ -473,12 +472,6 @@ class AutoIntegrationConfig:
             ),
             delete_local_branch=_checked_bool(
                 record, "delete_local_branch", DEFAULT_DELETE_LOCAL_BRANCH, source=source
-            ),
-            delete_remote_branch=_checked_bool(
-                record,
-                "delete_remote_branch",
-                DEFAULT_DELETE_REMOTE_BRANCH,
-                source=source,
             ),
         )
 
@@ -637,7 +630,6 @@ __all__ = (
     "DEFAULT_REQUIRE_INTEGRATION_CI",
     "DEFAULT_REMOVE_WORKTREE",
     "DEFAULT_DELETE_LOCAL_BRANCH",
-    "DEFAULT_DELETE_REMOTE_BRANCH",
     "AGENT_LAUNCH_KEYS",
     "RepoLocalConfigError",
     "_reject_boundary_token",

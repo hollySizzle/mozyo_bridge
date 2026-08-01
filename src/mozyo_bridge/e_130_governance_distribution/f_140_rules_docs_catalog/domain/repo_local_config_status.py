@@ -165,9 +165,9 @@ CONFIG_LEAF_KEYS: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = (
     # The #13686 actuator leaves. Every one of them decides whether a real side effect —
     # a push to an integration branch, a worktree removal, a ref delete — is attempted, so
     # an operator must be able to read what a workspace actually resolved to rather than
-    # infer it from an absent block. `mode` and `delete_remote_branch` matter most: the
-    # first is what turns the actuator on at all, the second is the one cleanup step whose
-    # effect is not recoverable from the local clone.
+    # infer it from an absent block. `mode` matters most: it is what turns the actuator on
+    # at all. `require_integration_ci` matters next: it is the one gate whose waiver a
+    # durable record would otherwise not distinguish from a green run (#13686 j#96346).
     ("auto_integration.mode", (("auto_integration", "mode"),)),
     (
         "auto_integration.integration_branch",
@@ -186,10 +186,6 @@ CONFIG_LEAF_KEYS: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = (
     (
         "auto_integration.delete_local_branch",
         (("auto_integration", "delete_local_branch"),),
-    ),
-    (
-        "auto_integration.delete_remote_branch",
-        (("auto_integration", "delete_remote_branch"),),
     ),
     ("terminal_transport.backend", (("terminal_transport", "backend"),)),
     ("presentation.surface", (("presentation", "surface"),)),

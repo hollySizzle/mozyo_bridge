@@ -8,15 +8,16 @@ integration:
 - the always-enforced gates (issue closed, integration confirmed, CI settled green,
   callbacks drained, owner gates resolved, non-foreign worktree), which stop **every** step
   including the non-destructive process retire;
-- the step order process_retire -> worktree_remove -> local_branch_delete ->
-  remote_branch_delete, one step per call, with a complete stage table on every decision;
+- the step order process_retire -> worktree_remove -> local_branch_delete, one step per
+  call, with a complete stage table on every decision;
 - the j#77124 必須訂正2 safety conditions: a worktree is removed only when clean and at its
   exact registered path (never forced), and the local branch delete is a compare-and-swap
   requiring no holding worktree, no unique unpushed commit, target reachability or patch
   equivalence, and an unchanged tip;
 - the non-Git path, where the worktree / branch steps are explicit ``not_applicable`` and
   the process retire still runs;
-- remote branch deletion staying off unless explicitly enabled;
+- the R1 review j#96344 finding 1 regression: the local CAS conditions cannot be skipped by
+  a policy toggle, because the CAS-gated delete is the ONLY ref-deleting step there is;
 - idempotent resume: a ``done`` step is not re-run, and a stale ledger satisfies nothing.
 
 Pure decisions only — no IO, no git, no use case (those are the integration tests).
@@ -30,7 +31,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_policy import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_records import (
     BLOCKED_ACTION_KEY_MISMATCH,
     OUTCOME_BLOCKED,
     OUTCOME_DONE,
@@ -57,14 +58,17 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     STATE_PROCESS_RETIRING,
     STATE_RETIRED,
     STATE_WORKTREE_REMOVING,
+    CLEANUP_STEPS,
+    REF_DELETING_STEPS,
     STEP_LOCAL_BRANCH_DELETE,
     STEP_PROCESS_RETIRE,
-    STEP_REMOTE_BRANCH_DELETE,
     STEP_WORKTREE_REMOVE,
     CleanupActionRecord,
     CleanupPreflight,
     RetirementCleanupPolicy,
     decide_cleanup,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_journal import (
     render_cleanup_journal,
 )
 
@@ -231,10 +235,6 @@ class StepOrderTest(unittest.TestCase):
         )
         self.assertEqual(fourth.state, STATE_RETIRED)
         self.assertIsNone(fourth.next_step)
-        # Remote deletion stayed off, and says so rather than staying silent.
-        self.assertEqual(
-            fourth.outcome_for(STEP_REMOTE_BRANCH_DELETE), OUTCOME_NOT_APPLICABLE
-        )
 
     def test_stage_table_is_complete_on_every_decision(self) -> None:
         record = _record()
@@ -243,12 +243,7 @@ class StepOrderTest(unittest.TestCase):
         )
         self.assertEqual(
             [step for step, _ in decision.step_outcomes],
-            [
-                STEP_PROCESS_RETIRE,
-                STEP_WORKTREE_REMOVE,
-                STEP_LOCAL_BRANCH_DELETE,
-                STEP_REMOTE_BRANCH_DELETE,
-            ],
+            [STEP_PROCESS_RETIRE, STEP_WORKTREE_REMOVE, STEP_LOCAL_BRANCH_DELETE],
         )
         self.assertEqual(decision.outcome_for(STEP_PROCESS_RETIRE), OUTCOME_DONE)
         self.assertEqual(decision.outcome_for(STEP_WORKTREE_REMOVE), OUTCOME_PENDING)
@@ -365,50 +360,42 @@ class LocalBranchDeleteCasTest(unittest.TestCase):
         )
 
 
-class RemoteBranchDeleteTest(unittest.TestCase):
-    def test_remote_delete_is_off_by_default(self) -> None:
+class R1ReviewFinding1RegressionTest(unittest.TestCase):
+    """No policy toggle can leave a ref delete running with its conditions unevaluated."""
+
+    def test_there_is_no_remote_branch_delete_step(self) -> None:
+        # R1 shipped one and review j#96344 finding 1 found it bypassed every local CAS
+        # condition and had no compare-and-swap against the remote tip. A remote-ref CAS needs
+        # `--force-with-lease`, a prohibited force, so the operation is gone rather than
+        # guarded.
+        self.assertNotIn("remote", " ".join(CLEANUP_STEPS).lower())
+
+    def test_every_ref_deleting_step_is_the_cas_gated_one(self) -> None:
+        # The structural form of the fix: a toggle can skip a step, so no step whose
+        # conditions belong to a DIFFERENT step may delete a ref.
+        self.assertEqual(REF_DELETING_STEPS, {STEP_LOCAL_BRANCH_DELETE})
+
+    def test_disabling_the_local_delete_deletes_no_ref_at_all(self) -> None:
+        # The exact R1 input: every local condition violated, local delete off. R1 answered
+        # `next_step=remote_branch_delete`; there is now nothing left to reach.
         record = _record()
         decision = decide_cleanup(
-            DEFAULT_POLICY,
+            RetirementCleanupPolicy(remove_worktree=False, delete_local_branch=False),
             record,
-            _clean(),
-            ledger=_ledger(
-                record,
-                STEP_PROCESS_RETIRE,
-                STEP_WORKTREE_REMOVE,
-                STEP_LOCAL_BRANCH_DELETE,
+            _clean(
+                worktree_clean=False,
+                worktree_path_registered=False,
+                branch_checked_out_elsewhere=True,
+                unpushed_unique_commits=True,
+                branch_reachable_from_target=False,
+                branch_tip=MOVED,
             ),
+            ledger=_ledger(record, STEP_PROCESS_RETIRE),
         )
         self.assertEqual(decision.state, STATE_RETIRED)
+        self.assertIsNone(decision.next_step)
         self.assertEqual(
-            decision.outcome_for(STEP_REMOTE_BRANCH_DELETE), OUTCOME_NOT_APPLICABLE
-        )
-
-    def test_enabling_it_adds_a_step_behind_every_local_condition(self) -> None:
-        record = _record()
-        policy = RetirementCleanupPolicy(delete_remote_branch=True)
-        decision = decide_cleanup(
-            policy,
-            record,
-            _clean(),
-            ledger=_ledger(
-                record,
-                STEP_PROCESS_RETIRE,
-                STEP_WORKTREE_REMOVE,
-                STEP_LOCAL_BRANCH_DELETE,
-            ),
-        )
-        self.assertEqual(decision.next_step, STEP_REMOTE_BRANCH_DELETE)
-        # And it does not relax any of them: a refused local delete never reaches it.
-        refused = decide_cleanup(
-            policy,
-            record,
-            _clean(unpushed_unique_commits=True),
-            ledger=_ledger(record, STEP_PROCESS_RETIRE, STEP_WORKTREE_REMOVE),
-        )
-        self.assertEqual(refused.state, STATE_CLEANUP_BLOCKED)
-        self.assertEqual(
-            refused.outcome_for(STEP_REMOTE_BRANCH_DELETE), OUTCOME_PENDING
+            decision.outcome_for(STEP_LOCAL_BRANCH_DELETE), OUTCOME_NOT_APPLICABLE
         )
 
 
@@ -425,11 +412,7 @@ class NonGitWorkspaceTest(unittest.TestCase):
         )
         self.assertEqual(second.state, STATE_RETIRED)
         self.assertIsNone(second.next_step)
-        for step in (
-            STEP_WORKTREE_REMOVE,
-            STEP_LOCAL_BRANCH_DELETE,
-            STEP_REMOTE_BRANCH_DELETE,
-        ):
+        for step in (STEP_WORKTREE_REMOVE, STEP_LOCAL_BRANCH_DELETE):
             self.assertEqual(second.outcome_for(step), OUTCOME_NOT_APPLICABLE, step)
 
     def test_a_non_git_lane_is_not_blocked_by_the_foreign_worktree_gate(self) -> None:

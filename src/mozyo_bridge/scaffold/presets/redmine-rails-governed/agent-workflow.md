@@ -457,9 +457,12 @@ origin到達可能性:
       - lane worktree が clean かつ foreign でなく、unique な unpushed commit を持たないこと
       - 未解決の callback / owner 判断 / release gate が無いこと
     実行形態:
-      - 既定は ff-only の normal (non-force) push。non-ff を許す設定でも merge commit は専用 integration worktree で作り、lane worktree で target branch を checkout しない
+      - 既定は ff-only の normal (non-force) push。non-ff を許す設定でも merge commit は専用 integration worktree で作り、lane worktree で target branch を checkout しない。**専用 worktree であることは主張ではなく検査**とする — registered / lane worktree でない / clean を action-time に測り、満たさなければ apply しない
+      - 統合先は **設定された integration branch と exact 一致**していること。「既知の integration branch である」ことと「この actuator に指定された branch である」ことは別の制約であり、前者だけでは config を守らない
       - conflict / non-ff / target drift / push 拒否は fail-closed。rebase も force も代替手段にしない
-      - 統合 SHA に対する CI は **非同期 gate** として別 state で待つ。単一の同期 command 内で CI 完了を仮定しない
+      - 統合 SHA に対する CI は **非同期 gate** として別 state で待つ。単一の同期 command 内で CI 完了を仮定しない。CI green は **bool ではなく照合可能な記録**で受ける — required check の identity + run id + conclusion + 対象 commit を持ち、**push が着地した head と exact-match** すること (`### Hibernate Evidence Marker Contract` の `required_ci_green` と同形)。無関係な green run が gate を満たしてはならない
+      - CI gate を config で外した場合は、その事実を durable record に **machine-readable に残す**。`integrated` だけでは「CI green」と「gate を外した」を区別できず、区別できない記録は前者として読まれる
+      - `coordinator_confirmed` mode の confirmation は、**確認した exact action key + 発行 role + durable anchor** を伴う記録として解決する。bool の自己申告や anchor を欠く主張は confirmation として扱わない (`### 根拠出所分類`)
       - already_integrated (target ancestry) と patch_equivalent (明示 patch-id evidence) は別 disposition として記録し、同じ merge を再生成しない
     記録:
       - 各段階 (integration / push / CI / process retire / worktree remove / branch cleanup) を段階別 outcome として記録する
@@ -469,7 +472,8 @@ origin到達可能性:
       - integration state machine と分離した別 state machine で扱う。統合が close を代替しない
       - `git worktree remove` は clean かつ exact registered path に対してのみ、`--force` なしで実行する
       - local branch delete は `git branch -D` を使わず、worktree 非保持 / unique unpushed commit なし / target 到達または patch-equivalent / ref tip が record 済み source head と一致、を満たす CAS-safe delete に限る
-      - remote branch delete は既定 false。有効化しても上記 local 条件は緩まない
+      - **ref を消す step は CAS 条件を自分で持つ 1 つだけにする。** policy toggle は step を止められるため、「別 step の条件が評価されないまま、後続の step が ref を消す」形を作らない
+      - **remote branch delete は行わない。** remote ref に対する真の compare-and-swap は `--force-with-lease` を要し、それは本節が禁じる force である。安全性を提供できない操作は「既定 off」で持つのではなく **持たない**。非 force な CAS 経路の有無は owner/design 判断とする
 ```
 
 ### Codex Direct Edit Gate

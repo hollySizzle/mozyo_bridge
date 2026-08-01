@@ -4,7 +4,9 @@ Pins the typed field contract of the gated auto-integration knob:
 
 - the behavior-preserving default (``mode: disabled``), so a repo that declares nothing
   keeps the fully manual coordinator integration it had before the actuator existed;
-- the owner's j#96335 defaults: ff-only on, remote branch deletion off;
+- the owner's j#96335 default: ff-only on;
+- that no ``delete_remote_branch`` key exists at all (R1 review j#96344 finding 1 — the
+  operation had no compare-and-swap and is removed rather than defaulted off);
 - fail-closed parsing — a non-mapping record, an unknown key, an unsupported version, a mode
   outside the closed vocabulary, a non-boolean flag, an empty ``integration_branch``;
 - that the closed key set cannot express an authority (a boundary-shaped key is refused with
@@ -54,10 +56,8 @@ class DefaultsTest(unittest.TestCase):
 
     def test_owner_decision_defaults(self) -> None:
         config = AutoIntegrationConfig.default()
-        # j#96335: fast-forward-only is the default, and deleting the remote branch — the one
-        # cleanup effect not recoverable from the local clone — is off.
+        # j#96335: fast-forward-only is the default.
         self.assertTrue(config.ff_only)
-        self.assertFalse(config.delete_remote_branch)
         # Both CI gates are required by default; both cleanup local steps are on.
         self.assertTrue(config.require_source_ci)
         self.assertTrue(config.require_integration_ci)
@@ -118,7 +118,6 @@ class FailClosedParsingTest(unittest.TestCase):
             "require_integration_ci",
             "remove_worktree",
             "delete_local_branch",
-            "delete_remote_branch",
         ):
             for value in (0, 1, "true", "yes", None):
                 with self.assertRaises(RepoLocalConfigError, msg=f"{key}={value!r}"):
@@ -147,9 +146,17 @@ class BoundaryTest(unittest.TestCase):
                 "require_integration_ci",
                 "remove_worktree",
                 "delete_local_branch",
-                "delete_remote_branch",
             },
         )
+
+    def test_there_is_no_remote_branch_delete_key(self) -> None:
+        # R1 review j#96344 finding 1: the step had no CAS against the remote tip and a real
+        # one needs the prohibited `--force-with-lease`, so the operation is gone. The key is
+        # removed rather than left as a way to ask for it — declaring it is now an error.
+        self.assertNotIn("delete_remote_branch", AUTO_INTEGRATION_KEYS)
+        self.assertFalse(hasattr(AutoIntegrationConfig.default(), "delete_remote_branch"))
+        with self.assertRaises(RepoLocalConfigError):
+            AutoIntegrationConfig.from_record({"delete_remote_branch": False})
 
     def test_an_authority_shaped_key_is_refused_with_the_boundary_message(self) -> None:
         for key in (
@@ -166,7 +173,13 @@ class BoundaryTest(unittest.TestCase):
     def test_no_key_can_request_a_force_push_or_a_rebase(self) -> None:
         # Not expressible by construction: the closed key set has no such field, so the
         # rejection is the ordinary unknown-key one rather than a special case.
-        for key in ("force_push", "force", "auto_rebase", "rebase_on_conflict"):
+        for key in (
+            "force_push",
+            "force",
+            "auto_rebase",
+            "rebase_on_conflict",
+            "delete_remote_branch",
+        ):
             with self.assertRaises(RepoLocalConfigError, msg=key):
                 AutoIntegrationConfig.from_record({key: True})
 
@@ -178,7 +191,7 @@ class ComposedConfigTest(unittest.TestCase):
                 "auto_integration": {
                     "mode": AUTO_INTEGRATION_MODE_COORDINATOR_CONFIRMED,
                     "integration_branch": "main",
-                    "delete_remote_branch": True,
+                    "require_integration_ci": False,
                 }
             }
         )
@@ -186,7 +199,7 @@ class ComposedConfigTest(unittest.TestCase):
             config.auto_integration.mode, AUTO_INTEGRATION_MODE_COORDINATOR_CONFIRMED
         )
         self.assertEqual(config.auto_integration.integration_branch, "main")
-        self.assertTrue(config.auto_integration.delete_remote_branch)
+        self.assertFalse(config.auto_integration.require_integration_ci)
 
     def test_an_absent_block_composes_to_the_disabled_default(self) -> None:
         config = RepoLocalConfig.from_record({})
@@ -211,9 +224,9 @@ class DeclarationStatusTest(unittest.TestCase):
             "require_integration_ci",
             "remove_worktree",
             "delete_local_branch",
-            "delete_remote_branch",
         ):
             self.assertIn(f"auto_integration.{field_name}", leaves, field_name)
+        self.assertNotIn("auto_integration.delete_remote_branch", leaves)
 
     def test_undeclared_leaves_report_the_default_they_resolve_to(self) -> None:
         # The actuator's effective settings must be readable rather than inferred from an
@@ -232,8 +245,10 @@ class DeclarationStatusTest(unittest.TestCase):
             statuses["auto_integration.mode"].effective_value,
             AUTO_INTEGRATION_MODE_DISABLED,
         )
+        # The CI gate's waiver must be readable: `integrated` alone cannot distinguish a
+        # green run from a turned-off gate (#13686 j#96346).
         self.assertIs(
-            statuses["auto_integration.delete_remote_branch"].effective_value, False
+            statuses["auto_integration.require_integration_ci"].effective_value, True
         )
 
     def test_a_declared_leaf_reports_declared(self) -> None:

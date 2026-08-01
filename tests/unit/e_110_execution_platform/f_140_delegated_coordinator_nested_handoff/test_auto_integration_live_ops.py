@@ -9,6 +9,9 @@ and cannot construct is pinned here rather than left to inspection:
   ``--force``, no ``--force-with-lease``, no ``+`` refspec;
 - the merge runs in the dedicated worktree and aborts on conflict rather than resolving it;
 - ``git worktree remove`` carries no ``--force``;
+- the adapter has **no remote-ref delete at all** (R1 review j#96344 finding 1);
+- ``describe_integration_worktree`` measures the dedicated-worktree identity and reads every
+  failure to measure as the unsafe answer;
 - the local branch delete is ``git update-ref -d <ref> <old_value>`` — a real
   compare-and-swap — and never ``git branch -d`` / ``-D``;
 - every read probe fails closed when ``git`` could not run.
@@ -27,12 +30,15 @@ from typing import List, Tuple
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_actuator import (
+    AutoIntegrationGitOperations,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_live_ops import (
     LiveAutoIntegrationGitOperations,
     UnsafeRefspecError,
     _checked_branch,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_policy import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_records import (
     EMPTY_TARGET_HEAD,
 )
 
@@ -196,6 +202,72 @@ class CleanupOperationTest(unittest.TestCase):
             _adapter(recorder).delete_local_branch(branch="lane", expected_tip=SOURCE)
         )
         self.assertEqual(len(recorder.argvs), 1)
+
+
+class NoRemoteRefDeleteTest(unittest.TestCase):
+    def test_the_adapter_cannot_delete_a_remote_ref(self) -> None:
+        # R1 had `delete_remote_branch`; review j#96344 finding 1 found it had no CAS against
+        # the remote tip, and a real CAS needs the prohibited `--force-with-lease`. Removed
+        # rather than guarded, so there is no argv to get wrong.
+        self.assertFalse(hasattr(LiveAutoIntegrationGitOperations, "delete_remote_branch"))
+        self.assertFalse(
+            hasattr(AutoIntegrationGitOperations, "delete_remote_branch"),
+            "the port must not declare an operation the adapter refuses to provide",
+        )
+
+    def test_no_mutation_constructs_a_deleting_refspec(self) -> None:
+        # A ref delete is spelled as an EMPTY source in the refspec (`:refs/heads/x`). Drive
+        # every mutation the adapter has and assert none of them produces that shape.
+        recorder = _Recorder([_ok(), _ok(), _ok(MERGE_HEAD), _ok(), _ok(), _ok()])
+        operations = _adapter(recorder)
+        operations.apply_merge(
+            source_head=SOURCE, target_ref="main", integration_worktree="/wt"
+        )
+        operations.push_non_force(source_head=SOURCE, target_ref="main")
+        operations.remove_worktree(worktree_path="/wt")
+        operations.delete_local_branch(branch="lane", expected_tip=SOURCE)
+        for argv in recorder.argvs:
+            for token in argv:
+                self.assertFalse(
+                    token.startswith(":"), f"{token!r} is a ref-deleting refspec"
+                )
+
+
+class IntegrationWorktreeProbeTest(unittest.TestCase):
+    def test_a_registered_non_lane_clean_worktree_is_admissible(self) -> None:
+        recorder = _Recorder(
+            [_ok("worktree /wt\nHEAD abc\n"), _ok("main\n"), _ok("")]
+        )
+        described = _adapter(recorder).describe_integration_worktree(
+            path="/wt", lane_worktree="/lane"
+        )
+        self.assertEqual(described.admissibility_errors(), ())
+        self.assertEqual(described.checked_out_branch, "main")
+
+    def test_the_lane_s_own_path_is_reported_as_the_lane_s(self) -> None:
+        recorder = _Recorder([_ok("worktree /lane\n"), _ok("lane\n"), _ok("")])
+        described = _adapter(recorder).describe_integration_worktree(
+            path="/lane", lane_worktree="/lane"
+        )
+        self.assertTrue(described.is_lane_worktree)
+        self.assertTrue(described.admissibility_errors())
+
+    def test_an_unreadable_worktree_list_reads_as_unregistered(self) -> None:
+        recorder = _Recorder([_fail(), _fail(), _fail()])
+        described = _adapter(recorder).describe_integration_worktree(
+            path="/wt", lane_worktree="/lane"
+        )
+        self.assertFalse(described.registered)
+        # ...and an unreadable status reads as not clean.
+        self.assertFalse(described.clean)
+        self.assertTrue(described.admissibility_errors())
+
+    def test_a_dirty_worktree_is_reported_unclean(self) -> None:
+        recorder = _Recorder([_ok("worktree /wt\n"), _ok("main\n"), _ok(" M a.py\n")])
+        described = _adapter(recorder).describe_integration_worktree(
+            path="/wt", lane_worktree="/lane"
+        )
+        self.assertFalse(described.clean)
 
 
 class ReadProbeTest(unittest.TestCase):

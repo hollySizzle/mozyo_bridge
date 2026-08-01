@@ -47,12 +47,43 @@ explicit patch-id evidence supplied by the caller. Neither performs a side effec
 Pure: no IO, no discovery. Every fact is supplied by the caller from the action-time probe
 or the durable record, mirroring the :mod:`...domain.sublane_integration_policy` style
 (frozen inputs / outputs, literal machine-readable vocabularies, ``as_payload`` dicts).
+
+The value objects the decision reasons over live in the sibling
+:mod:`...domain.auto_integration_records` and are re-exported here for a stable public
+surface. R1 review j#96344 is why they are objects at all: four of this module's inputs were
+bare booleans, and a boolean cannot be audited. ``integration_ci_green`` claimed a green run
+without naming which run, which check, or which commit; ``coordinator_confirmed`` claimed an
+approval without naming who, of what, or where it is written; the integration worktree was a
+string never checked against being the lane's own; and the configured integration branch was
+declared and read by nothing. Each is now a record that carries the identity its claim
+depends on, and each is validated against the exact action it is offered for.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Iterable, Optional, Tuple
+
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_records import (
+    BLOCKED_ACTION_KEY_MISMATCH,
+    CI_CONCLUSION_SUCCESS,
+    CONFIRMATION_ISSUER_COORDINATOR,
+    EMPTY_TARGET_HEAD,
+    OUTCOME_BLOCKED,
+    OUTCOME_DONE,
+    OUTCOME_NOT_APPLICABLE,
+    OUTCOME_PENDING,
+    STEP_OUTCOMES,
+    CoordinatorConfirmation,
+    IntegrationActionRecord,
+    IntegrationCiEvidence,
+    IntegrationWorktree,
+    StepOutcome,
+    build_integration_action_record,
+    completed_steps,
+    is_full_sha,
+    normalized_branch,
+)
 
 # ---------------------------------------------------------------------------
 # Config-driven mode vocabulary (literal; machine-readable regardless of UI language).
@@ -87,6 +118,22 @@ DISPOSITION_MERGE_COMMIT = "merge_commit"
 
 INTEGRATION_DISPOSITIONS: frozenset = frozenset(
     {DISPOSITION_FAST_FORWARD, DISPOSITION_MERGE_COMMIT}
+)
+
+# ---------------------------------------------------------------------------
+# What the exact-SHA CI gate did (R1 review j#96344 finding 2 / dispute j#96346).
+# ---------------------------------------------------------------------------
+
+#: The gate was required and satisfied by checkable evidence for the exact pushed commit.
+CI_GATE_GREEN = "green"
+#: The gate was turned off by config. The integration completed WITHOUT an observed CI run,
+#: and the record says so rather than letting `integrated` imply a green one.
+CI_GATE_WAIVED = "waived"
+#: The decision never got as far as the CI gate (blocked, terminal no-op, or still pushing).
+CI_GATE_NOT_REACHED = "not_reached"
+
+CI_GATE_STATES: frozenset = frozenset(
+    {CI_GATE_GREEN, CI_GATE_WAIVED, CI_GATE_NOT_REACHED}
 )
 
 # ---------------------------------------------------------------------------
@@ -151,7 +198,8 @@ TERMINAL_STATES: frozenset = frozenset(
 )
 
 # ---------------------------------------------------------------------------
-# Steps and their outcomes — the "段階別 outcome" the acceptance requires.
+# Steps. The outcome vocabulary and the ledger live in the records sibling, so the two
+# state machines share one spelling of "done" rather than each defining its own.
 # ---------------------------------------------------------------------------
 
 STEP_INTEGRATION_APPLY = "integration_apply"
@@ -162,22 +210,6 @@ INTEGRATION_STEPS: Tuple[str, ...] = (
     STEP_INTEGRATION_APPLY,
     STEP_PUSH,
     STEP_INTEGRATION_CI,
-)
-
-#: The step completed. A ``done`` outcome under the same action key is never re-run.
-OUTCOME_DONE = "done"
-#: The step does not apply to this action (a fast-forward disposition has nothing to apply;
-#: a non-Git workspace has no integration at all). Distinct from ``done``: it asserts that
-#: nothing happened, rather than that something succeeded.
-OUTCOME_NOT_APPLICABLE = "not_applicable"
-#: The step was refused. Recorded so a re-run explains itself rather than silently retrying.
-OUTCOME_BLOCKED = "blocked"
-#: The step was started and its result is not yet settled — the asynchronous CI gate's
-#: normal reading. Never treated as success.
-OUTCOME_PENDING = "pending"
-
-STEP_OUTCOMES: frozenset = frozenset(
-    {OUTCOME_DONE, OUTCOME_NOT_APPLICABLE, OUTCOME_BLOCKED, OUTCOME_PENDING}
 )
 
 # ---------------------------------------------------------------------------
@@ -235,8 +267,31 @@ BLOCKED_UNRESOLVED_OWNER_GATE = "unresolved_owner_gate"
 #: The push was attempted and lost the race (or otherwise failed). Recorded distinctly from
 #: :data:`BLOCKED_TARGET_DRIFT`, which is the *pre*-push observation.
 BLOCKED_PUSH_REJECTED = "push_rejected"
-#: CI on the exact integration SHA failed.
+#: CI on the exact integration SHA settled with a non-success conclusion.
 BLOCKED_INTEGRATION_CI_FAILED = "integration_ci_failed"
+#: CI evidence was supplied but cannot be checked: a missing run id, a missing required-check
+#: identity, a malformed head (R1 review j#96344 finding 2). Distinct from a red conclusion —
+#: "we cannot tell what this run was" is not "the run failed", and the operator's next action
+#: differs (produce a complete record vs fix the build).
+BLOCKED_INTEGRATION_CI_EVIDENCE_INCOMPLETE = "integration_ci_evidence_incomplete"
+#: The CI evidence is about a different commit than the one the push landed. A green run on
+#: the previous integration, on a sibling branch, or on the source before the merge is not
+#: this action's CI, and a bare boolean could not tell the difference.
+BLOCKED_INTEGRATION_CI_HEAD_MISMATCH = "integration_ci_head_mismatch"
+#: The action's target ref is not the integration branch this actuator is configured for
+#: (R1 review j#96344 finding 4). Distinct from :data:`BLOCKED_UNKNOWN_TARGET`, which asks
+#: whether the ref is a known integration branch at all: a ref can be perfectly well known
+#: and still not be the one the operator pointed THIS actuator at.
+BLOCKED_TARGET_NOT_CONFIGURED = "target_not_configured"
+#: A coordinator confirmation was supplied but does not authorize this action: it names a
+#: different action key, was not issued by the coordinator role, or carries no durable anchor
+#: (R1 review j#96344 finding 5). Absence is not this — that is
+#: :data:`STATE_CONFIRMATION_REQUIRED`; this is a confirmation that is present and invalid.
+BLOCKED_CONFIRMATION_INADMISSIBLE = "coordinator_confirmation_inadmissible"
+#: The dedicated integration worktree is unusable: unregistered, not clean, or — the one this
+#: exists for — the lane's own checkout, which must never check out the target branch
+#: (j#77124 / R1 review j#96344 finding 3).
+BLOCKED_INTEGRATION_WORKTREE_INADMISSIBLE = "integration_worktree_inadmissible"
 
 #: Precedence for the *primary* reason, most fundamental first. The full set is always
 #: reported too, so a durable record shows every failing gate rather than only the first.
@@ -244,8 +299,10 @@ _BLOCKED_REASON_PRECEDENCE: Tuple[str, ...] = (
     BLOCKED_ACTION_RECORD_INVALID,
     BLOCKED_MODE_UNRECOGNIZED,
     BLOCKED_ACTION_KEY_MISMATCH,
+    BLOCKED_CONFIRMATION_INADMISSIBLE,
     BLOCKED_FOREIGN_WORKTREE,
     BLOCKED_UNKNOWN_TARGET,
+    BLOCKED_TARGET_NOT_CONFIGURED,
     BLOCKED_REVIEW_INADMISSIBLE,
     BLOCKED_SOURCE_MUTATED,
     BLOCKED_SOURCE_UNREACHABLE,
@@ -258,6 +315,9 @@ _BLOCKED_REASON_PRECEDENCE: Tuple[str, ...] = (
     BLOCKED_NON_FAST_FORWARD,
     BLOCKED_MERGE_CONFLICT,
     BLOCKED_PUSH_REJECTED,
+    BLOCKED_INTEGRATION_WORKTREE_INADMISSIBLE,
+    BLOCKED_INTEGRATION_CI_EVIDENCE_INCOMPLETE,
+    BLOCKED_INTEGRATION_CI_HEAD_MISMATCH,
     BLOCKED_INTEGRATION_CI_FAILED,
 )
 
@@ -312,139 +372,6 @@ class AutoIntegrationPolicy:
 
 
 # ---------------------------------------------------------------------------
-# The immutable action record and its idempotency key.
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class IntegrationActionRecord:
-    """The immutable identity of one integration action (j#77124 必須訂正1 / 訂正2).
-
-    Six fields, and :attr:`action_key` is exactly their tuple: ``issue``,
-    ``lane_generation``, ``source_head``, ``target_ref``, ``expected_target_head``,
-    ``review_generation``. Any drift in any of them yields a different key, which is what
-    makes a re-run safe: a ledger recorded for the old key satisfies nothing under the new
-    one, so a partial failure resumes and a changed world starts over.
-
-    ``source_head`` and ``expected_target_head`` are exact full commit SHAs — a branch name
-    is not a pin, and the whole point of the record is that the action is bound to the exact
-    commits the gates were evaluated against.
-    """
-
-    issue: str
-    lane_generation: int
-    source_head: str
-    target_ref: str
-    expected_target_head: str
-    review_generation: str
-
-    @property
-    def action_key(self) -> str:
-        """The idempotency key: the six identity fields, in a fixed order."""
-        return "|".join(
-            (
-                f"issue={self.issue}",
-                f"lane_generation={self.lane_generation}",
-                f"source_head={self.source_head}",
-                f"target_ref={self.target_ref}",
-                f"expected_target_head={self.expected_target_head}",
-                f"review_generation={self.review_generation}",
-            )
-        )
-
-    def validation_errors(self) -> Tuple[str, ...]:
-        """The reasons this record cannot identify an action (empty iff usable).
-
-        ``lane_generation`` must be a positive integer (``bool`` is rejected even though it
-        is an ``int`` subclass, so ``lane_generation: true`` never reads as generation 1),
-        and every string field must be non-empty. The two head fields must additionally be
-        full 40-hex commit SHAs; ``expected_target_head`` may instead be the empty-target
-        sentinel :data:`EMPTY_TARGET_HEAD` for a target ref that does not exist yet.
-        """
-        problems: list[str] = []
-        if not str(self.issue).strip():
-            problems.append("issue is empty")
-        if isinstance(self.lane_generation, bool) or not isinstance(
-            self.lane_generation, int
-        ):
-            problems.append("lane_generation must be an integer")
-        elif self.lane_generation <= 0:
-            problems.append("lane_generation must be positive")
-        if not str(self.target_ref).strip():
-            problems.append("target_ref is empty")
-        if not str(self.review_generation).strip():
-            problems.append("review_generation is empty")
-        if not _is_full_sha(self.source_head):
-            problems.append("source_head must be a full 40-hex commit SHA")
-        if self.expected_target_head != EMPTY_TARGET_HEAD and not _is_full_sha(
-            self.expected_target_head
-        ):
-            problems.append(
-                "expected_target_head must be a full 40-hex commit SHA "
-                f"(or {EMPTY_TARGET_HEAD!r} for a target that does not exist yet)"
-            )
-        return tuple(problems)
-
-
-#: The ``expected_target_head`` sentinel for a target ref that does not exist yet. Spelled
-#: explicitly rather than left as an empty string so "the target is empty" is a stated fact
-#: and not an omitted field.
-EMPTY_TARGET_HEAD = "none"
-
-_HEX_DIGITS = frozenset("0123456789abcdef")
-
-
-def _is_full_sha(value: object) -> bool:
-    """True iff ``value`` is exactly 40 lowercase hex digits (a full commit SHA)."""
-    if not isinstance(value, str) or len(value) != 40:
-        return False
-    return all(character in _HEX_DIGITS for character in value)
-
-
-# ---------------------------------------------------------------------------
-# The step ledger — what has already happened under an action key.
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class StepOutcome:
-    """One recorded step outcome, bound to the action key it was performed under."""
-
-    action_key: str
-    step: str
-    outcome: str
-    detail: str = ""
-    #: The exact commit the step produced, where it produces one (the integration head an
-    #: apply created, or the head a push landed). Empty when the step produces no commit.
-    head: str = ""
-
-    def as_payload(self) -> dict[str, object]:
-        return {
-            "action_key": self.action_key,
-            "step": self.step,
-            "outcome": self.outcome,
-            "detail": self.detail,
-            "head": self.head,
-        }
-
-
-def completed_steps(
-    ledger: Iterable[StepOutcome], *, action_key: str
-) -> dict[str, StepOutcome]:
-    """The ``done`` steps recorded under exactly ``action_key`` (later wins).
-
-    Entries under any other key are ignored rather than merged: that is the whole
-    idempotency contract. Non-``done`` outcomes are also ignored — a ``blocked`` or
-    ``pending`` step has not happened, so it must be evaluated again.
-    """
-    return {
-        entry.step: entry
-        for entry in ledger
-        if entry.action_key == action_key and entry.outcome == OUTCOME_DONE
-    }
-
-
-# ---------------------------------------------------------------------------
 # Action-time preflight facts.
 # ---------------------------------------------------------------------------
 
@@ -478,10 +405,24 @@ class IntegrationPreflight:
     - ``review_generation_admissible`` — the latest review generation is approved AND carries
       no unresolved blocking finding (never merely "an approval exists somewhere").
     - ``target_identity_known`` — the target ref is a known, allowlisted integration branch.
-    - ``source_ci_green`` / ``integration_ci_green`` — settled green, not merely started.
+      Note this is a *different* question from whether the ref is the branch this actuator
+      was configured for; that one is checked against ``policy.integration_branch``.
+    - ``source_ci_green`` — settled green, not merely started.
     - ``callbacks_drained`` / ``owner_gates_resolved``.
-    - ``coordinator_confirmed`` — an explicit confirmation of *this* action key, read only
-      under :data:`MODE_COORDINATOR_CONFIRMED`. It gates actuation; it relaxes nothing.
+
+    Typed records (R1 review j#96344 — each replaced a bare boolean that could not be
+    audited; all default to ``None``, which is the unsatisfied reading):
+
+    - ``integration_ci`` — :class:`IntegrationCiEvidence`: the CI verdict for the exact
+      commit the push landed, carrying the required check's identity and the run id so an
+      unrelated green run cannot satisfy it. Read only when ``require_integration_ci``.
+    - ``coordinator_confirmation`` — :class:`CoordinatorConfirmation`: an explicit
+      confirmation of *this* action key by the coordinator role, with the durable anchor it
+      is recorded at. Read only under :data:`MODE_COORDINATOR_CONFIRMED`. It gates actuation;
+      it relaxes nothing.
+    - ``integration_worktree`` — :class:`IntegrationWorktree`: the dedicated checkout a
+      merge-commit disposition is applied in, with the measured facts proving it is not the
+      lane's own. Read only when the effective disposition is a merge commit.
     """
 
     is_git_workspace: bool
@@ -500,10 +441,12 @@ class IntegrationPreflight:
     review_generation_admissible: bool = False
     target_identity_known: bool = False
     source_ci_green: bool = False
-    integration_ci_green: bool = False
     callbacks_drained: bool = False
     owner_gates_resolved: bool = False
-    coordinator_confirmed: bool = False
+    # Typed records (R1 review j#96344). `None` is the unsatisfied reading throughout.
+    integration_ci: Optional[IntegrationCiEvidence] = None
+    coordinator_confirmation: Optional[CoordinatorConfirmation] = None
+    integration_worktree: Optional[IntegrationWorktree] = None
 
 
 # ---------------------------------------------------------------------------
@@ -521,6 +464,14 @@ class IntegrationDecision:
     ``blocked_reasons`` is the full failing-gate set with ``primary_reason`` its most
     fundamental member; both are empty / ``None`` unless the state is
     :data:`STATE_INTEGRATION_BLOCKED`.
+
+    ``integration_ci`` says, machine-readably, what the exact-SHA CI gate did for this
+    decision — :data:`CI_GATE_GREEN`, :data:`CI_GATE_WAIVED`, or :data:`CI_GATE_NOT_REACHED`.
+    It exists because ``state == integrated`` alone cannot distinguish "CI was green on this
+    exact commit" from "the operator turned the CI gate off", and a durable record that
+    cannot distinguish them will be read as the first (R1 review j#96344 finding 2; the
+    knob itself is owner-authorized — j#96335 lists branch/target CI as config-driven — so
+    the waiver is made visible rather than removed. Dispute record: j#96346).
     """
 
     state: str
@@ -530,6 +481,7 @@ class IntegrationDecision:
     blocked_reasons: Tuple[str, ...] = ()
     primary_reason: Optional[str] = None
     reason: str = ""
+    integration_ci: str = CI_GATE_NOT_REACHED
 
     @property
     def is_blocked(self) -> bool:
@@ -562,6 +514,7 @@ class IntegrationDecision:
             "blocked_reasons": list(self.blocked_reasons),
             "primary_reason": self.primary_reason,
             "reason": self.reason,
+            "integration_ci": self.integration_ci,
         }
 
 
@@ -571,6 +524,7 @@ def _blocked(
     *,
     disposition: str,
     action_key: str = "",
+    reason: str = "",
 ) -> IntegrationDecision:
     ordered = _order_reasons(reasons)
     return IntegrationDecision(
@@ -580,7 +534,7 @@ def _blocked(
         disposition=disposition,
         blocked_reasons=ordered,
         primary_reason=ordered[0] if ordered else None,
-        reason="integration refused; no side effect performed",
+        reason=reason or "integration refused; no side effect performed",
     )
 
 
@@ -672,6 +626,16 @@ def decide_integration(
         blockers.add(BLOCKED_FOREIGN_WORKTREE)
     if not preflight.target_identity_known:
         blockers.add(BLOCKED_UNKNOWN_TARGET)
+    # R1 review j#96344 finding 4: the CONFIGURED branch must actually constrain the push.
+    # `target_identity_known` asks whether the ref is a known integration branch at all;
+    # this asks whether it is the one the operator pointed THIS actuator at. Without it the
+    # policy's `integration_branch` was declared and read by nothing, and a record naming a
+    # different target integrated happily. `None` means runtime resolution, which is the
+    # documented "no configured constraint" case, so it imposes none.
+    if policy.integration_branch is not None and normalized_branch(
+        policy.integration_branch
+    ) != normalized_branch(record.target_ref):
+        blockers.add(BLOCKED_TARGET_NOT_CONFIGURED)
     if not preflight.review_generation_admissible:
         blockers.add(BLOCKED_REVIEW_INADMISSIBLE)
     if not preflight.source_head_matches_review:
@@ -740,17 +704,32 @@ def decide_integration(
                 action_key=action_key,
             )
 
-    if policy.mode == MODE_COORDINATOR_CONFIRMED and not preflight.coordinator_confirmed:
-        return IntegrationDecision(
-            state=STATE_CONFIRMATION_REQUIRED,
-            action_key=action_key,
-            next_step=None,
-            disposition=disposition,
-            reason=(
-                "every gate passed; awaiting the coordinator's explicit confirmation of "
-                f"action key {action_key}"
-            ),
-        )
+    if policy.mode == MODE_COORDINATOR_CONFIRMED:
+        # R1 review j#96344 finding 5: a confirmation must name WHAT it confirms, WHO issued
+        # it, and WHERE it is recorded. A bare flag said none of those, so any caller could
+        # assert one. Absence and inadmissibility are kept apart: the first is a normal wait,
+        # the second is a refusal.
+        confirmation = preflight.coordinator_confirmation
+        if confirmation is None:
+            return IntegrationDecision(
+                state=STATE_CONFIRMATION_REQUIRED,
+                action_key=action_key,
+                next_step=None,
+                disposition=disposition,
+                reason=(
+                    "every gate passed; awaiting the coordinator's explicit confirmation of "
+                    f"action key {action_key}"
+                ),
+            )
+        problems = confirmation.admissibility_errors(action_key=action_key)
+        if problems:
+            return _blocked(
+                record,
+                (BLOCKED_CONFIRMATION_INADMISSIBLE,),
+                disposition=disposition,
+                action_key=action_key,
+                reason="; ".join(problems),
+            )
 
     done = completed_steps(ledger, action_key=action_key)
 
@@ -758,6 +737,25 @@ def decide_integration(
     #    `not_applicable` rather than reported done.
     if disposition == DISPOSITION_MERGE_COMMIT:
         if STEP_INTEGRATION_APPLY not in done:
+            # R1 review j#96344 finding 3: j#77124 forbids the lane's worktree ever checking
+            # out the target branch, and R1 asserted that in a docstring while enforcing
+            # nothing — a caller passing the lane's own path made the actuator perform the
+            # forbidden operation. The identity is now measured and checked before the step
+            # is authorized, not after it is handed to git.
+            worktree = preflight.integration_worktree
+            problems = (
+                ("no dedicated integration worktree was supplied",)
+                if worktree is None
+                else worktree.admissibility_errors()
+            )
+            if problems:
+                return _blocked(
+                    record,
+                    (BLOCKED_INTEGRATION_WORKTREE_INADMISSIBLE,),
+                    disposition=disposition,
+                    action_key=action_key,
+                    reason="; ".join(problems),
+                )
             return IntegrationDecision(
                 state=STATE_INTEGRATION_APPLY,
                 action_key=action_key,
@@ -783,17 +781,17 @@ def decide_integration(
         )
 
     # 3. CI on the exact integration SHA — asynchronous, never assumed complete.
+    #
+    # R1 review j#96344 finding 2: the gate used to read a bare `integration_ci_green: bool`,
+    # which said a run was green without saying WHICH run, which required check, or which
+    # commit — so an unrelated green run satisfied it. The evidence now names all three and
+    # is matched against the head the push actually landed. The head comes from the ledger,
+    # not from a caller-supplied field, so the two cannot drift apart.
+    ci_gate = CI_GATE_NOT_REACHED
     if policy.require_integration_ci:
-        if not preflight.integration_ci_green:
-            if STEP_INTEGRATION_CI in done:
-                # The step was recorded done, yet the exact-SHA CI is not green: the run
-                # settled red. Reported as its own reason rather than as a still-pending gate.
-                return _blocked(
-                    record,
-                    (BLOCKED_INTEGRATION_CI_FAILED,),
-                    disposition=disposition,
-                    action_key=action_key,
-                )
+        landed_head = done[STEP_PUSH].head or record.source_head
+        evidence = preflight.integration_ci
+        if evidence is None:
             return IntegrationDecision(
                 state=STATE_AWAITING_CI,
                 action_key=action_key,
@@ -804,13 +802,53 @@ def decide_integration(
                     "command never assumes the run completed"
                 ),
             )
+        incomplete = evidence.completeness_errors()
+        if incomplete:
+            # "We cannot tell what this run was" is not "the run failed": the operator's next
+            # action is to produce a complete record, not to fix a build.
+            return _blocked(
+                record,
+                (BLOCKED_INTEGRATION_CI_EVIDENCE_INCOMPLETE,),
+                disposition=disposition,
+                action_key=action_key,
+                reason="; ".join(incomplete),
+            )
+        if evidence.integration_head != landed_head:
+            return _blocked(
+                record,
+                (BLOCKED_INTEGRATION_CI_HEAD_MISMATCH,),
+                disposition=disposition,
+                action_key=action_key,
+                reason=(
+                    f"the CI evidence is about {evidence.integration_head}, but the push "
+                    f"landed {landed_head}"
+                ),
+            )
+        if not evidence.is_green:
+            return _blocked(
+                record,
+                (BLOCKED_INTEGRATION_CI_FAILED,),
+                disposition=disposition,
+                action_key=action_key,
+                reason=(
+                    f"required check {evidence.workflow!r} run {evidence.run!r} settled "
+                    f"{evidence.conclusion!r} on {evidence.integration_head}"
+                ),
+            )
+        ci_gate = CI_GATE_GREEN
+    else:
+        # The knob is owner-authorized (j#96335 lists branch/target CI as config-driven), so
+        # the waiver is made VISIBLE rather than removed: `integrated` alone cannot say
+        # whether CI ran, and a durable record that cannot say will be read as if it did.
+        ci_gate = CI_GATE_WAIVED
 
     # The reason names only the gates that actually ran: with `require_integration_ci: false`
     # no exact-SHA CI was observed, and a durable record must not say one was.
     settled = (
-        "origin reachability and exact-SHA CI are both settled"
-        if policy.require_integration_ci
-        else "origin reachability is settled; the exact-SHA CI gate is disabled by config"
+        "origin reachability is settled and the exact-SHA CI gate is green"
+        if ci_gate == CI_GATE_GREEN
+        else "origin reachability is settled; the exact-SHA CI gate is WAIVED by config "
+        "(no CI run was observed for this commit)"
     )
     return IntegrationDecision(
         state=STATE_INTEGRATED,
@@ -818,64 +856,8 @@ def decide_integration(
         next_step=None,
         disposition=disposition,
         reason=f"integrated into {record.target_ref}: {settled}",
+        integration_ci=ci_gate,
     )
-
-
-# ---------------------------------------------------------------------------
-# Durable-record renderer.
-# ---------------------------------------------------------------------------
-
-
-def render_integration_action_journal(
-    decision: IntegrationDecision,
-    record: IntegrationActionRecord,
-    *,
-    integration_head: str = "",
-) -> str:
-    """Render an integration decision as a durable record (pure).
-
-    Emits only machine-readable decision fields plus the action identity — never a private
-    path or a pane id. ``integration_head`` is the exact commit the integration produced on
-    the target, which for a merge commit differs from the source head; the two are kept
-    separate for the same reason the Hibernate Evidence Marker Contract keeps them separate
-    (a single head cannot prove a patch-equivalent or merge-commit integration).
-
-    The heading is deliberately **not** a ``## Gate: <token>`` one. This is the actuator's
-    decision record — an input to the coordinator's integration journal, not that journal's
-    gate heading — and the central preset's ``### Gate Heading Canonical Literal`` reserves
-    the ``## Gate:`` form for tokens the Gate Schema / Journal Templates define. Writing
-    ``## Gate: integration_disposition`` would mint a gate token no vocabulary defines, which
-    is exactly what the #14665 regression guard exists to catch. For the same reason this
-    renderer does not emit the ``integration_disposition`` evidence marker: that marker is the
-    coordinator's to write, from the canonical producer, on the coordinator's own journal.
-    """
-    # Keyed on ``is_blocked``, NOT on ``integrated``: an in-progress decision (push_waiting,
-    # awaiting_ci, confirmation required) is neither, and rendering it under
-    # ``## integration_blocked`` would put a refusal that never happened into a durable record.
-    lines = [
-        "## integration_blocked" if decision.is_blocked else "## integration action decision",
-        "",
-        f"- issue: #{record.issue}",
-        f"- state: {decision.state}",
-        f"- action_key: {decision.action_key}",
-        f"- source_head: {record.source_head}",
-        f"- integration_branch: {record.target_ref}",
-        f"- expected_target_head: {record.expected_target_head}",
-        f"- integration_head: {integration_head or 'none'}",
-        f"- disposition: {decision.disposition}",
-        f"- review_generation: {record.review_generation}",
-    ]
-    if decision.is_blocked:
-        lines.append(f"- primary_reason: {decision.primary_reason}")
-        lines.append("- blocked_reasons: " + ", ".join(decision.blocked_reasons))
-        lines.append(
-            "- next_action: coordinator callback (fail-closed; nothing integrated, "
-            "no force push, no rebase, no ref deleted)"
-        )
-    else:
-        lines.append(f"- next_step: {decision.next_step or 'none'}")
-        lines.append(f"- reason: {decision.reason}")
-    return "\n".join(lines)
 
 
 __all__ = (
@@ -926,13 +908,36 @@ __all__ = (
     "BLOCKED_UNRESOLVED_OWNER_GATE",
     "BLOCKED_PUSH_REJECTED",
     "BLOCKED_INTEGRATION_CI_FAILED",
-    "EMPTY_TARGET_HEAD",
+    "BLOCKED_INTEGRATION_CI_EVIDENCE_INCOMPLETE",
+    "BLOCKED_INTEGRATION_CI_HEAD_MISMATCH",
+    "BLOCKED_TARGET_NOT_CONFIGURED",
+    "BLOCKED_CONFIRMATION_INADMISSIBLE",
+    "BLOCKED_INTEGRATION_WORKTREE_INADMISSIBLE",
+    "CI_GATE_GREEN",
+    "CI_GATE_WAIVED",
+    "CI_GATE_NOT_REACHED",
+    "CI_GATE_STATES",
     "AutoIntegrationPolicy",
-    "IntegrationActionRecord",
-    "StepOutcome",
-    "completed_steps",
     "IntegrationPreflight",
     "IntegrationDecision",
     "decide_integration",
-    "render_integration_action_journal",
+    # Re-exported from the records sibling for a stable public surface.
+    "EMPTY_TARGET_HEAD",
+    "is_full_sha",
+    "normalized_branch",
+    "OUTCOME_DONE",
+    "OUTCOME_NOT_APPLICABLE",
+    "OUTCOME_BLOCKED",
+    "OUTCOME_PENDING",
+    "STEP_OUTCOMES",
+    "BLOCKED_ACTION_KEY_MISMATCH",
+    "StepOutcome",
+    "completed_steps",
+    "IntegrationActionRecord",
+    "build_integration_action_record",
+    "CI_CONCLUSION_SUCCESS",
+    "IntegrationCiEvidence",
+    "CONFIRMATION_ISSUER_COORDINATOR",
+    "CoordinatorConfirmation",
+    "IntegrationWorktree",
 )

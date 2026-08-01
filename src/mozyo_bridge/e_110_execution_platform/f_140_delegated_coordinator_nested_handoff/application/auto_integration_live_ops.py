@@ -21,8 +21,11 @@ What the adapter can and cannot express is the safety story, so it is enumerated
   compare-and-swap: git deletes the ref only while it still points at the recorded tip.
   ``git branch -d`` would consult *reachability from HEAD*, which is not the question, and
   ``git branch -D`` would consult nothing at all. Neither is used.
-- **Deleting the remote branch is the one destructive remote op**, reached only when the
-  policy explicitly enabled it. Nothing here rewrites a remote ref.
+- **There is no remote-ref delete.** R1 had one; review j#96344 finding 1 found it had no
+  compare-and-swap against the remote tip and ran even when every local condition failed. A
+  real CAS on a remote ref needs ``--force-with-lease``, which is a force and prohibited
+  (j#96335), so the operation is removed rather than shipped unsafely. Nothing here deletes
+  or rewrites a remote ref.
 
 Every probe fails closed: a ``git`` that could not run has proven nothing, so a failed
 invocation reads as the unsafe answer (not a workspace, not an ancestor, not reachable,
@@ -42,8 +45,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MergeResult,
     PushResult,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_policy import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_records import (
     EMPTY_TARGET_HEAD,
+    IntegrationWorktree,
 )
 
 #: The default shared remote. Named rather than inlined so the one place a remote is chosen
@@ -235,6 +239,51 @@ class LiveAutoIntegrationGitOperations:
         needle = f"branch refs/heads/{branch}"
         return any(line.strip() == needle for line in result.stdout.splitlines())
 
+    def describe_integration_worktree(
+        self, *, path: str, lane_worktree: str
+    ) -> IntegrationWorktree:
+        """Measure the facts that decide whether ``path`` may be integrated in (read-only).
+
+        Every field is measured, and every failure to measure reads as the UNSAFE answer:
+        an unreadable worktree list means "not registered", an unreadable status means "not
+        clean". The identity comparison that matters — is this the lane's own checkout? — is
+        done on resolved common paths rather than on the strings, so a symlinked or
+        differently-spelled path cannot present the lane's worktree as a different one.
+        """
+        candidate = Path(path)
+        listed = self._run("worktree", "list", "--porcelain")
+        registered = False
+        if listed.returncode == 0:
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                resolved = candidate
+            for line in listed.stdout.splitlines():
+                if not line.startswith("worktree "):
+                    continue
+                entry = Path(line[len("worktree ") :].strip())
+                try:
+                    entry_resolved = entry.resolve()
+                except OSError:
+                    entry_resolved = entry
+                if entry_resolved == resolved:
+                    registered = True
+                    break
+        try:
+            is_lane = candidate.resolve() == Path(lane_worktree).resolve()
+        except OSError:
+            # Unresolvable paths cannot be shown to be different, so they are treated as the
+            # same — the fail-closed reading of the one question this exists to answer.
+            is_lane = True
+        branch = self._run("rev-parse", "--abbrev-ref", "HEAD", cwd=candidate)
+        return IntegrationWorktree(
+            path=str(path),
+            registered=registered,
+            is_lane_worktree=is_lane,
+            clean=not self.worktree_dirty(worktree_path=str(path)),
+            checked_out_branch=branch.stdout.strip() if branch.returncode == 0 else "",
+        )
+
     # -- mutations --------------------------------------------------------
 
     def apply_merge(
@@ -337,14 +386,6 @@ class LiveAutoIntegrationGitOperations:
         name = _checked_branch(branch)
         result = self._run(
             "update-ref", "-d", "--end-of-options", f"refs/heads/{name}", expected_tip
-        )
-        return result.returncode == 0
-
-    def delete_remote_branch(self, *, branch: str) -> bool:
-        """Delete ``branch`` on the shared remote (only reached when explicitly enabled)."""
-        name = _checked_branch(branch)
-        result = self._run(
-            "push", "--atomic", "--end-of-options", self.remote, f":refs/heads/{name}"
         )
         return result.returncode == 0
 

@@ -63,7 +63,7 @@ preflight は「失敗 gate を見つけて blocked になる」か「後続 sta
 
 | disposition | 判定根拠 | 副作用 |
 | --- | --- | --- |
-| `integrated` | push 済み + 統合 SHA の CI green | push |
+| `integrated` | push 済み + 統合 SHA の CI green (gate 有効時) / gate waived | push |
 | `already_integrated` | target ancestry (source head が target から到達可能) | なし |
 | `patch_equivalent` | **明示的な patch-id evidence** | なし |
 | `not_applicable` | 非 Git workspace | なし (process retire は別途走る) |
@@ -104,6 +104,7 @@ action-time に再検証し、一つでも欠ければ副作用の **前** に�
 ```yaml
 integration:
   - foreign_worktree / unknown_target_branch
+  - target_not_configured               # 設定された integration branch と exact 一致しない (R2)
   - review_generation_inadmissible      # 最新 generation が approved かつ blocking finding なし
   - source_mutated_after_review         # review 済みの exact head であること
   - source_head_unreachable             # origin 到達可能
@@ -113,7 +114,12 @@ integration:
   - target_drift                        # expected_target_head からの drift
   - non_fast_forward                    # ff-only 時
   - merge_conflict                      # merge commit disposition 時
-  - push_rejected / integration_ci_failed
+  - integration_worktree_inadmissible   # 専用 worktree が未登録 / dirty / lane 自身 (R2)
+  - coordinator_confirmation_inadmissible  # 別 action / 非 coordinator / anchor 欠落 (R2)
+  - push_rejected
+  - integration_ci_evidence_incomplete  # run / check identity / head を欠く (R2)
+  - integration_ci_head_mismatch        # push が着地した head と別 commit の run (R2)
+  - integration_ci_failed               # 決着したが non-success
 cleanup:
   - action_key_mismatch                 # 別 action の authorization を継承しない
   - issue_not_closed / integration_unconfirmed / integration_ci_unsettled
@@ -134,18 +140,42 @@ fallback する」という選択肢が構造上存在しない。
 - local branch delete は `git branch -D` を使わない。`git update-ref -d <ref> <old_value>` による
   真の compare-and-swap で、record 済み source head を指している間だけ消える。`git branch -d` は
   *HEAD からの到達性* を見るが、それはここで問うている問いではない。
-- remote branch delete は既定 false。有効化しても local の CAS 条件は緩まない。
+- **ref を消す step はこの 1 つだけである** (`REF_DELETING_STEPS`)。policy toggle は step を
+  止められるので、「別 step の条件が評価されないまま後続の step が ref を消す」形を作らない。
+- **remote branch delete は存在しない。** R1 は既定 false の toggle として持っていたが、R1 review
+  j#96344 finding 1 が (a) local delete を off にすると CAS 条件群の評価ごと飛ばして remote を
+  消せる、(b) remote tip に対する CAS が無い、の 2 点を再現した。remote ref の真の CAS は
+  `--force-with-lease` を要し、それは j#96335 が禁じた force である。**安全性を提供できない操作は
+  「既定 off」で持つのではなく持たない**という判断で、config key / step / port method / adapter
+  method を全て削除した。非 force な CAS 経路の有無は owner/design 判断とする。
 - 非 Git workspace では worktree / branch step を明示的に `not_applicable` とし、process retire
   だけを独立に実行する。
 
 ## 実装構成
 
 ```text
-domain/auto_integration_policy.py        pure: mode gate / action record / integration 状態遷移
+domain/auto_integration_records.py       pure: 2 machine が共有する value object 群
+domain/auto_integration_policy.py        pure: mode gate / integration 状態遷移
 domain/retirement_cleanup_policy.py      pure: close 後の cleanup 状態遷移と CAS 条件
+domain/auto_integration_journal.py       pure: durable record renderer (判断はしない)
 application/auto_integration_actuator.py port (Protocol) + use case + config→policy 変換
 application/auto_integration_live_ops.py live subprocess adapter (実 git)
 ```
+
+### bool ではなく記録で受ける (R1 review j#96344)
+
+R1 は 4 つの入力を bare bool / bare string で受けており、review が「**bool は監査できない**」と
+指摘した。いずれも identity を持つ record へ置換した (正本: `auto_integration_records.py`)。
+
+| R1 | R2 | 何が言えていなかったか |
+| --- | --- | --- |
+| `integration_ci_green: bool` | `IntegrationCiEvidence` | どの run の・どの required check が・どの commit について green か。無関係な green run が gate を満たしていた |
+| `coordinator_confirmed: bool` | `CoordinatorConfirmation` | 誰が・どの action を・どこに記録して承認したか |
+| `integration_worktree: str` | `IntegrationWorktree` | それが lane 自身の checkout でないこと (j#77124 が禁じる操作を actuator 自身が実行し得た) |
+| `policy.integration_branch` (未参照) | decision が exact-match を要求 | 設定した branch が実際に統合先を制約すること |
+
+CI evidence は **push が着地した head** (ledger の push outcome が記録した commit) と exact-match
+する。fast-forward なら source head、merge commit なら merge した commit である。
 
 domain は IO を持たず、事実は全て caller が preflight として渡す ([[logic-object-oriented-architecture-policy]]
 の pure core 方針、既存 `domain/sublane_integration_policy.py` と同じ形)。use case は
@@ -160,14 +190,22 @@ CI は actuator が actuate しない。統合 SHA の CI は非同期 gate で�
 ```yaml
 auto_integration:
   mode: disabled            # auto | coordinator_confirmed | disabled (既定 disabled)
-  integration_branch: null  # 未設定は runtime 解決。解決不能は fail-closed
+  integration_branch: null  # 未設定は runtime 解決。設定時は action の target と exact 一致必須
   ff_only: true             # 既定 (j#96335)
   require_source_ci: true
   require_integration_ci: true
   remove_worktree: true
   delete_local_branch: true
-  delete_remote_branch: false   # 既定 false (j#96335)
 ```
+
+`delete_remote_branch` key は存在しない (上記「破壊的 step の safety 条件」参照)。宣言すると
+unknown key として fail-closed する。
+
+`require_integration_ci: false` は owner 授権済みの knob である (j#96335 が「branch/target CI」を
+設定駆動項目として列挙)。ただし **waiver を不可視にしない**: decision は `integration_ci: waived`
+を machine-readable に返し、durable record が「exact-SHA CI green」と読めないようにする
+(R1 review finding 2 の是正条件のうち「必須 gate に固定する」節への counterproposal。dispute
+記録は j#96346)。
 
 既定 `mode: disabled` は **behavior-preserving** である。#13686 以前は auto-integration が存在
 しなかったため、block を宣言しない repo は従来どおり完全手動の coordinator 統合を保つ。
@@ -196,6 +234,9 @@ closed-schema screen が拒否する。宣言状況は `mozyo-bridge config stat
 - `python3 -m unittest tests.unit.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.test_retirement_cleanup_policy`
 - `python3 -m unittest tests.unit.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.test_auto_integration_live_ops`
   (live adapter が構成する実 argv と refusal。`_run` を stub した hermetic test で、実 git process は起動しない)
+- R1 review j#96344 の 5 finding は `R1ReviewFindingRegressionTest` /
+  `R1ReviewFinding1RegressionTest` / `NoRemoteRefDeleteTest` に、**再現した入力そのもの**で
+  pin してある。verdict は j#96345。
 - `python3 -m unittest tests.integration.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.test_auto_integration_actuator`
 - `python3 -m unittest tests.unit.e_130_governance_distribution.f_140_rules_docs_catalog.test_auto_integration_config`
 - `PYTHONPATH=src python3 -m mozyo_bridge docs validate --repo .` ほか catalog 検証一式。

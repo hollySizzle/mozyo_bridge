@@ -12,7 +12,7 @@ a step that does not apply, and a step that was refused are three different fact
 durable record says which. Re-running is safe because every step is bound to the
 integration action key that authorized it (:class:`CleanupActionRecord`), so a partial
 failure resumes without deleting anything twice — and a *different* action key refuses
-outright (:data:`~...domain.auto_integration_policy.BLOCKED_ACTION_KEY_MISMATCH`) rather
+outright (:data:`~...domain.auto_integration_records.BLOCKED_ACTION_KEY_MISMATCH`) rather
 than being silently ignored, because a destructive step must not inherit some other
 action's authorization.
 
@@ -25,15 +25,22 @@ The safety rules are the ones j#77124 必須訂正2 fixed, and they are not conf
   reachable from the target or is patch-equivalent to it; and the ref tip still equals the
   source head recorded in the action. The last is the compare-and-swap: a branch that moved
   since the action was formed is a different branch than the one that was integrated.
-- Deleting the **remote** branch is off by default and is a separate, explicitly enabled
-  step. Nothing here force-pushes or rewrites any remote ref.
+- There is **no remote-branch delete**. R1 shipped one behind a config toggle and review
+  j#96344 finding 1 found it bypassed every local condition (disabling the local delete
+  skipped the CAS checks and then deleted the remote ref anyway) and had no compare-and-swap
+  against the remote tip. A real CAS on a remote ref needs ``--force-with-lease``, which is a
+  force and therefore prohibited (j#96335) — so the operation cannot be made safe in this
+  tranche and is not offered at all rather than offered unsafely. Whether a non-force CAS
+  path exists is an owner/design question, not an implementation detail. Nothing here
+  force-pushes, deletes, or rewrites any remote ref.
 - A foreign worktree / ref, an unconfirmed integration, an unsettled CI, or an owed callback
   stops every subsequent destructive step at a safe interruption point.
 - In a **non-Git** workspace the worktree / branch steps are explicit ``not_applicable`` and
   the process retire still runs on its own.
 
 Pure: no IO and no discovery, mirroring the sibling policies (frozen inputs / outputs,
-literal machine-readable vocabularies, ``as_payload`` dicts, a journal renderer).
+literal machine-readable vocabularies, ``as_payload`` dicts). The durable-record renderer
+lives in :mod:`...domain.auto_integration_journal`.
 """
 
 from __future__ import annotations
@@ -41,7 +48,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Optional, Tuple
 
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_policy import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_records import (
     BLOCKED_ACTION_KEY_MISMATCH,
     OUTCOME_BLOCKED,
     OUTCOME_DONE,
@@ -60,17 +67,21 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 STEP_PROCESS_RETIRE = "process_retire"
 #: ``git worktree remove`` — clean, exact registered path, never ``--force``.
 STEP_WORKTREE_REMOVE = "worktree_remove"
-#: The CAS-safe local branch delete (never ``git branch -D``).
+#: The CAS-safe local branch delete (never ``git branch -D``). The ONLY ref-deleting step:
+#: every ref this machine can delete is gated by the compare-and-swap conditions below, so
+#: no toggle can leave a delete running with its conditions unevaluated (R1 review j#96344
+#: finding 1).
 STEP_LOCAL_BRANCH_DELETE = "local_branch_delete"
-#: Delete the branch on the remote. Off by default; an explicitly enabled, separate step.
-STEP_REMOTE_BRANCH_DELETE = "remote_branch_delete"
 
 CLEANUP_STEPS: Tuple[str, ...] = (
     STEP_PROCESS_RETIRE,
     STEP_WORKTREE_REMOVE,
     STEP_LOCAL_BRANCH_DELETE,
-    STEP_REMOTE_BRANCH_DELETE,
 )
+
+#: The steps that delete a ref. Named so the invariant "every ref delete is CAS-gated" is
+#: stateable — and testable — rather than implicit in the order of a function body.
+REF_DELETING_STEPS: frozenset = frozenset({STEP_LOCAL_BRANCH_DELETE})
 
 # ---------------------------------------------------------------------------
 # States.
@@ -166,14 +177,18 @@ class RetirementCleanupPolicy:
     """The resolved cleanup policy intent (domain mirror of the config block).
 
     Intent only: each flag can turn a step *off*, and none of them can turn a safety gate
-    off — no gate below reads a policy field. ``delete_remote_branch`` defaults to ``False``
-    per the owner's decision (j#96335), and enabling it does not relax any of the local
-    delete's CAS conditions; it adds a further step behind them.
+    off — no gate below reads a policy field.
+
+    There is deliberately no ``delete_remote_branch`` field. R1 had one, and review j#96344
+    finding 1 showed the shape of the bug it enabled: turning the *local* delete off skipped
+    that step's CAS conditions and then let the remote delete run regardless. The lesson is
+    structural — a toggle must not be able to skip the evaluation of conditions a later step
+    depends on — and the fix is that the only ref-deleting step left is the one whose
+    conditions are its own (:data:`REF_DELETING_STEPS`).
     """
 
     remove_worktree: bool = True
     delete_local_branch: bool = True
-    delete_remote_branch: bool = False
 
     @classmethod
     def default(cls) -> "RetirementCleanupPolicy":
@@ -339,8 +354,9 @@ def decide_cleanup(
        process retire, because these gates are what establish that the lane is finished.
     3. The process retire runs first, and is the only step a non-Git lane has.
     4. The worktree removal runs next, behind its own gates (clean, registered, not foreign).
-    5. The local branch delete runs last among the local steps, behind the CAS conditions.
-    6. The remote delete runs only when explicitly enabled.
+    5. The local branch delete runs last, behind the CAS conditions. It is the only step
+       that deletes a ref, so no toggle can leave a ref delete running with its conditions
+       unevaluated (R1 review j#96344 finding 1).
 
     Steps a policy turned off, and steps a non-Git workspace does not have, are reported
     ``not_applicable`` rather than skipped silently.
@@ -402,7 +418,6 @@ def decide_cleanup(
     if not preflight.is_git_workspace:
         outcomes[STEP_WORKTREE_REMOVE] = OUTCOME_NOT_APPLICABLE
         outcomes[STEP_LOCAL_BRANCH_DELETE] = OUTCOME_NOT_APPLICABLE
-        outcomes[STEP_REMOTE_BRANCH_DELETE] = OUTCOME_NOT_APPLICABLE
         return CleanupDecision(
             state=STATE_RETIRED,
             action_key=action_key,
@@ -490,21 +505,7 @@ def decide_cleanup(
             ),
         )
 
-    # 4. Remote branch delete — explicitly enabled only.
-    if not policy.delete_remote_branch:
-        outcomes[STEP_REMOTE_BRANCH_DELETE] = OUTCOME_NOT_APPLICABLE
-    elif STEP_REMOTE_BRANCH_DELETE not in outcomes:
-        return CleanupDecision(
-            state=STATE_BRANCH_CLEANUP,
-            action_key=action_key,
-            next_step=STEP_REMOTE_BRANCH_DELETE,
-            step_outcomes=_table(**outcomes),
-            reason=(
-                f"deleting the remote branch {record.branch}; explicitly enabled by "
-                "config (the default is off)"
-            ),
-        )
-
+    # There is no step 4. The remote ref is never touched — see the module docstring.
     return CleanupDecision(
         state=STATE_RETIRED,
         action_key=action_key,
@@ -514,56 +515,12 @@ def decide_cleanup(
     )
 
 
-# ---------------------------------------------------------------------------
-# Durable-record renderer.
-# ---------------------------------------------------------------------------
-
-
-def render_cleanup_journal(
-    decision: CleanupDecision, record: CleanupActionRecord
-) -> str:
-    """Render a cleanup decision as a durable record (pure).
-
-    The stage table is emitted in full so a reader sees which steps ran, which do not apply,
-    and which were refused — the distinction the acceptance's "段階別 outcome" asks for.
-    Only machine-readable fields and the lane's own branch / issue are emitted.
-
-    As in the integration sibling, the heading is deliberately not a ``## Gate: <token>`` one:
-    the central preset's ``### Gate Heading Canonical Literal`` reserves that form for tokens
-    the Gate Schema / Journal Templates define, and ``retirement_cleanup`` is not one. This is
-    the actuator's decision record, not a workflow gate journal.
-    """
-    lines = [
-        "## retirement cleanup decision" if not decision.is_blocked else "## cleanup_blocked",
-        "",
-        f"- issue: #{record.issue}",
-        f"- state: {decision.state}",
-        f"- action_key: {decision.action_key}",
-        f"- integration_action_key: {record.integration_action_key}",
-        f"- branch: {record.branch}",
-        f"- recorded_source_head: {record.recorded_source_head}",
-    ]
-    for step, outcome in decision.step_outcomes:
-        lines.append(f"- step.{step}: {outcome}")
-    if decision.is_blocked:
-        lines.append(f"- primary_reason: {decision.primary_reason}")
-        lines.append("- blocked_reasons: " + ", ".join(decision.blocked_reasons))
-        lines.append(
-            "- next_action: coordinator callback (fail-closed; no worktree removed, "
-            "no ref deleted, no --force and no `git branch -D`)"
-        )
-    else:
-        lines.append(f"- next_step: {decision.next_step or 'none'}")
-        lines.append(f"- reason: {decision.reason}")
-    return "\n".join(lines)
-
-
 __all__ = (
     "STEP_PROCESS_RETIRE",
     "STEP_WORKTREE_REMOVE",
     "STEP_LOCAL_BRANCH_DELETE",
-    "STEP_REMOTE_BRANCH_DELETE",
     "CLEANUP_STEPS",
+    "REF_DELETING_STEPS",
     "STATE_CLEANUP_PREFLIGHT",
     "STATE_PROCESS_RETIRING",
     "STATE_WORKTREE_REMOVING",
@@ -589,5 +546,4 @@ __all__ = (
     "CleanupPreflight",
     "CleanupDecision",
     "decide_cleanup",
-    "render_cleanup_journal",
 )

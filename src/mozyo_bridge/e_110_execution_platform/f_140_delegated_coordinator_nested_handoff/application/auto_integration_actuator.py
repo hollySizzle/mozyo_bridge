@@ -54,7 +54,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.retirement_cleanup_policy import (
     STEP_LOCAL_BRANCH_DELETE,
     STEP_PROCESS_RETIRE,
-    STEP_REMOTE_BRANCH_DELETE,
     STEP_WORKTREE_REMOVE,
     CleanupActionRecord,
     CleanupDecision,
@@ -94,7 +93,6 @@ def cleanup_policy_from_config(
     return RetirementCleanupPolicy(
         remove_worktree=config.remove_worktree,
         delete_local_branch=config.delete_local_branch,
-        delete_remote_branch=config.delete_remote_branch,
     )
 
 
@@ -137,10 +135,13 @@ class AutoIntegrationGitOperations(Protocol):
     """The Git operations the actuator needs, injected so tests drive fakes.
 
     Only two mutations exist on the integration side (``apply_merge`` / ``push_non_force``)
-    and three on the cleanup side, and every one of them is the *weak* form: there is no
-    force push, no rebase, no ``--force`` worktree removal, and no unconditional ref delete
+    and two on the cleanup side, and every one of them is the *weak* form: there is no force
+    push, no rebase, no ``--force`` worktree removal, and no unconditional ref delete
     anywhere in this interface. An operation this port cannot express is one the actuator
-    cannot perform, which is the point.
+    cannot perform, which is the point — and it is why R1 review j#96344 finding 1 was
+    resolved by DELETING ``delete_remote_branch`` from this interface rather than by adding a
+    guard in front of it: a remote ref delete has no non-force compare-and-swap, so it cannot
+    be offered safely, so it is not offered.
     """
 
     def apply_merge(
@@ -163,10 +164,6 @@ class AutoIntegrationGitOperations(Protocol):
 
     def delete_local_branch(self, *, branch: str, expected_tip: str) -> bool:
         """Compare-and-swap delete: remove ``branch`` only while it points at ``expected_tip``."""
-        ...
-
-    def delete_remote_branch(self, *, branch: str) -> bool:
-        """Delete ``branch`` on the remote. Only reached when explicitly enabled."""
         ...
 
 
@@ -237,9 +234,14 @@ class CleanupRunReport:
 class AutoIntegrationUseCase:
     """Runs the #13686 integration and cleanup machines against the injected ports.
 
-    ``integration_worktree`` is the dedicated checkout a merge-commit disposition is applied
-    in. It is required only for that disposition; a fast-forward never needs one, so the
-    fast-forward default path works with it unset.
+    The dedicated integration worktree is **not** held here. R1 kept it as a bare
+    ``integration_worktree: str`` that the use case checked only for being non-empty, and
+    review j#96344 finding 3 showed that a caller passing the lane's own path made the
+    actuator check the target branch out in the lane — the exact operation j#77124 forbids.
+    It now arrives as a measured :class:`IntegrationWorktree` on the preflight, where
+    :func:`decide_integration` refuses an inadmissible one *before* authorizing the step; by
+    the time the step reaches here it has already been proven registered, clean, and not the
+    lane's own.
     """
 
     operations: AutoIntegrationGitOperations
@@ -248,7 +250,6 @@ class AutoIntegrationUseCase:
         default_factory=RetirementCleanupPolicy.default
     )
     processes: Optional[ManagedProcessOperations] = None
-    integration_worktree: str = ""
 
     # -- integration ------------------------------------------------------
 
@@ -294,7 +295,9 @@ class AutoIntegrationUseCase:
             if decision.next_step is None:
                 return report
 
-            outcome = self._perform_integration_step(decision, record, report)
+            outcome = self._perform_integration_step(
+                decision, record, report, preflight=preflight
+            )
             report.outcomes.append(outcome)
             working_ledger.append(outcome)
             if outcome.outcome != OUTCOME_DONE:
@@ -312,24 +315,32 @@ class AutoIntegrationUseCase:
         decision: IntegrationDecision,
         record: IntegrationActionRecord,
         report: IntegrationRunReport,
+        *,
+        preflight: IntegrationPreflight,
     ) -> StepOutcome:
         """Perform exactly the step the decision authorized (no substitutions)."""
         step = decision.next_step
         if step == STEP_INTEGRATION_APPLY:
-            if not self.integration_worktree:
+            worktree = preflight.integration_worktree
+            # The decision authorizes this step only after `IntegrationWorktree` passed its
+            # own admissibility, so an inadmissible one cannot reach here. Re-asserted rather
+            # than assumed: this is the last point before a `git switch` on a real checkout,
+            # and the cost of the belt is one branch.
+            if worktree is None or worktree.admissibility_errors():
                 return StepOutcome(
                     action_key=decision.action_key,
                     step=step,
                     outcome=OUTCOME_BLOCKED,
                     detail=(
-                        "a merge-commit disposition requires a dedicated integration "
-                        "worktree; the lane's own worktree must not check out the target"
+                        "a merge-commit disposition requires a verified dedicated "
+                        "integration worktree; the lane's own worktree must never check "
+                        "out the target branch (j#77124)"
                     ),
                 )
             result = self.operations.apply_merge(
                 source_head=record.source_head,
                 target_ref=record.target_ref,
-                integration_worktree=self.integration_worktree,
+                integration_worktree=worktree.path,
             )
             if result.conflicted:
                 return StepOutcome(
@@ -443,23 +454,14 @@ class AutoIntegrationUseCase:
                 decision.action_key, step, removed, "worktree removal (no --force)"
             )
 
-        if step == STEP_LOCAL_BRANCH_DELETE:
-            deleted = self.operations.delete_local_branch(
-                branch=record.branch, expected_tip=record.recorded_source_head
-            )
-            return _settled(
-                decision.action_key,
-                step,
-                deleted,
-                "compare-and-swap local branch delete (never `git branch -D`)",
-            )
-
-        deleted = self.operations.delete_remote_branch(branch=record.branch)
+        deleted = self.operations.delete_local_branch(
+            branch=record.branch, expected_tip=record.recorded_source_head
+        )
         return _settled(
             decision.action_key,
-            STEP_REMOTE_BRANCH_DELETE,
+            STEP_LOCAL_BRANCH_DELETE,
             deleted,
-            "remote branch delete (explicitly enabled by config)",
+            "compare-and-swap local branch delete (never `git branch -D`)",
         )
 
 
