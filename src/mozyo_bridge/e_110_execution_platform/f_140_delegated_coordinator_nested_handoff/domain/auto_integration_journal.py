@@ -115,8 +115,8 @@ def render_cleanup_journal(
         lines.append(f"- primary_reason: {decision.primary_reason}")
         lines.append("- blocked_reasons: " + ", ".join(decision.blocked_reasons))
         lines.append(
-            "- next_action: coordinator callback (fail-closed; no worktree removed, "
-            "no ref deleted, no --force and no `git branch -D`)"
+            "- next_action: coordinator callback (fail-closed; no worktree removed and "
+            "no --force; this machine deletes no ref at all)"
         )
     else:
         lines.append(f"- next_step: {decision.next_step or 'none'}")

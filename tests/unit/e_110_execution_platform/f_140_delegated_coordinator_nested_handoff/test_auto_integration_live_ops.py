@@ -9,11 +9,11 @@ and cannot construct is pinned here rather than left to inspection:
   ``--force``, no ``--force-with-lease``, no ``+`` refspec;
 - the merge runs in the dedicated worktree and aborts on conflict rather than resolving it;
 - ``git worktree remove`` carries no ``--force``;
-- the adapter has **no remote-ref delete at all** (R1 review j#96344 finding 1);
+- the adapter has **no ref delete at all**, local or remote (R1 review j#96344 finding 1 and
+  R7 review j#96396 finding 1) — neither delete could enforce its own condition in one
+  invocation, so neither exists to be called;
 - ``describe_integration_worktree`` measures the dedicated-worktree identity and reads every
   failure to measure as the unsafe answer;
-- the local branch delete is ``git update-ref -d <ref> <old_value>`` — a real
-  compare-and-swap — and never ``git branch -d`` / ``-D``;
 - every read probe fails closed when ``git`` could not run.
 
 Hermetic: ``_run`` is stubbed to record argv and return canned results. No real ``git``
@@ -203,66 +203,26 @@ class CleanupOperationTest(unittest.TestCase):
         self.assertNotIn("--force", argv)
         self.assertNotIn("-f", argv)
 
-    def test_local_delete_verifies_the_tip_with_git_then_lets_git_enforce_checkout(
-        self,
-    ) -> None:
-        # R6 review j#96391 finding 3, measured on real git: `update-ref -d` deletes a branch
-        # a linked worktree still holds, leaving that worktree's HEAD unresolvable, while
-        # `git branch -D` refuses it atomically. The tip is verified first by a no-op
-        # compare-and-set, so both conditions are checked by git rather than by an earlier
-        # probe this process is hoping is still true.
-        recorder = _Recorder([_ok(), _ok()])
-        self.assertTrue(
-            _adapter(recorder).delete_local_branch(branch="lane", expected_tip=SOURCE)
-        )
-        verify, delete = recorder.argvs
-        self.assertEqual(verify[0], "update-ref")
-        self.assertIn("refs/heads/lane", verify)
-        self.assertEqual(verify.count(SOURCE), 2)  # old == new: a check, not a move
-        self.assertEqual(delete[:2], ("branch", "-D"))
-
-    def test_a_tip_that_moved_is_refused_before_the_delete(self) -> None:
-        recorder = _Recorder([_fail("ref changed")])
-        self.assertFalse(
-            _adapter(recorder).delete_local_branch(branch="lane", expected_tip=SOURCE)
-        )
-        self.assertEqual(len(recorder.argvs), 1)
-
-    def test_a_checked_out_branch_is_refused_by_git_itself(self) -> None:
-        recorder = _Recorder([_ok(), _fail("cannot delete branch 'lane' used by worktree")])
-        self.assertFalse(
-            _adapter(recorder).delete_local_branch(branch="lane", expected_tip=SOURCE)
-        )
-
-    def test_a_non_sha_expected_tip_refuses_without_spawning_git(self) -> None:
-        recorder = _Recorder([])
-        self.assertFalse(
-            _adapter(recorder).delete_local_branch(branch="lane", expected_tip="HEAD")
-        )
-        self.assertEqual(recorder.argvs, [])
-
-    def test_a_failed_delete_reports_failure_rather_than_escalating(self) -> None:
-        recorder = _Recorder([_fail("ref changed")])
-        self.assertFalse(
-            _adapter(recorder).delete_local_branch(branch="lane", expected_tip=SOURCE)
-        )
-        self.assertEqual(len(recorder.argvs), 1)
-
-
-class NoRemoteRefDeleteTest(unittest.TestCase):
-    def test_the_adapter_cannot_delete_a_remote_ref(self) -> None:
+class NoRefDeleteTest(unittest.TestCase):
+    def test_the_adapter_cannot_delete_a_ref_local_or_remote(self) -> None:
         # R1 had `delete_remote_branch`; review j#96344 finding 1 found it had no CAS against
-        # the remote tip, and a real CAS needs the prohibited `--force-with-lease`. Removed
-        # rather than guarded, so there is no argv to get wrong.
-        self.assertFalse(hasattr(LiveAutoIntegrationGitOperations, "delete_remote_branch"))
-        self.assertFalse(
-            hasattr(AutoIntegrationGitOperations, "delete_remote_branch"),
-            "the port must not declare an operation the adapter refuses to provide",
-        )
+        # the remote tip, and a real CAS needs the prohibited `--force-with-lease`. R1 also
+        # had `delete_local_branch`; review j#96396 finding 1 retired it because its tip
+        # verification and its delete are separate invocations and a commit landing between
+        # them is destroyed. Removed rather than guarded, so there is no argv to get wrong.
+        for gone in ("delete_remote_branch", "delete_local_branch"):
+            self.assertFalse(
+                hasattr(LiveAutoIntegrationGitOperations, gone), gone
+            )
+            self.assertFalse(
+                hasattr(AutoIntegrationGitOperations, gone),
+                "the port must not declare an operation the adapter refuses to provide",
+            )
 
-    def test_no_mutation_constructs_a_deleting_refspec(self) -> None:
-        # A ref delete is spelled as an EMPTY source in the refspec (`:refs/heads/x`). Drive
-        # every mutation the adapter has and assert none of them produces that shape.
+    def test_no_mutation_spells_a_delete(self) -> None:
+        # A ref delete is spelled either as an EMPTY refspec source (`:refs/heads/x`) or as a
+        # branch/update-ref delete flag. Drive every mutation the adapter has and assert none
+        # of them produces either shape.
         recorder = _Recorder([_ok(), _ok(TARGET), _ok(), _ok(MERGE_HEAD), _ok(), _ok(), _ok()])
         operations = _adapter(recorder)
         operations.apply_merge(
@@ -273,8 +233,9 @@ class NoRemoteRefDeleteTest(unittest.TestCase):
         )
         operations.push_non_force(source_head=SOURCE, target_ref="main")
         operations.remove_worktree(worktree_path="/wt")
-        operations.delete_local_branch(branch="lane", expected_tip=SOURCE)
         for argv in recorder.argvs:
+            self.assertNotIn("-D", argv)
+            self.assertNotEqual(argv[:1], ("update-ref",))
             for token in argv:
                 self.assertFalse(
                     token.startswith(":"), f"{token!r} is a ref-deleting refspec"
@@ -347,12 +308,6 @@ class ReadProbeTest(unittest.TestCase):
         operations = _adapter(_Recorder([_fail()]))
         self.assertTrue(operations.worktree_dirty())
 
-        # An unreadable worktree list reads "the branch is still checked out".
-        operations = _adapter(_Recorder([_fail()]))
-        self.assertTrue(operations.branch_checked_out_elsewhere("lane"))
-
-        operations = _adapter(_Recorder([_fail()]))
-        self.assertEqual(operations.branch_tip("lane"), "")
 
     def test_a_spawn_failure_does_not_escape_a_read_only_probe(self) -> None:
         # The real `_run` maps OSError (missing cwd after a reboot, git absent from PATH) onto

@@ -4,14 +4,18 @@ Split from :mod:`...application.auto_integration_actuator` to keep that module i
 module-health line budget; the boundary is a real one either way — these are the seams the
 actuator is defined against, and the use case is what composes them.
 
-What this interface can and cannot express IS the safety story, arrived at over seven review
-rounds. Only weak mutations exist: a non-force push, a merge in a dedicated worktree bound to
-the expected target parent, a ``worktree remove`` without ``--force``, and a branch delete git
-itself refuses while any worktree holds the branch. There is no force push, no rebase, no
-remote ref delete, and no unconditional ref delete anywhere here. An operation this port
-cannot express is one the actuator cannot perform, which is the point — R2 review j#96350
-finding 1 was resolved by DELETING the remote-branch delete rather than guarding it, because a
-remote ref delete has no non-force compare-and-swap.
+What this interface can and cannot express IS the safety story, arrived at over eight review
+rounds. Only three weak mutations exist: a non-force push, a merge in a dedicated worktree
+bound to the expected target parent, and a ``worktree remove`` without ``--force``. There is
+no force push, no rebase, and **no ref delete of any kind** — an operation this port cannot
+express is one the actuator cannot perform, which is the point.
+
+Both ref deletes were removed rather than guarded, for the same reason: R2 review j#96350
+finding 1 retired the remote delete because a remote ref delete has no non-force
+compare-and-swap, and R7 review j#96396 finding 1 retired the local delete because its two
+conditions — the tip is still the recorded one, and no worktree holds the branch — cannot be
+enforced by any single git invocation, so the guarded form left a window in which a commit
+that landed between the check and the delete was destroyed.
 
 The read side matters as much: every fact that gates a mutation is measured through a probe
 here or read through :class:`DurableAuthorityReader`, never accepted from the caller. That
@@ -73,13 +77,14 @@ class AutoIntegrationGitOperations(Protocol):
     """The Git operations the actuator needs, injected so tests drive fakes.
 
     Only two mutations exist on the integration side (``apply_merge`` / ``push_non_force``)
-    and two on the cleanup side, and every one of them is the *weak* form: there is no force
-    push, no rebase, no ``--force`` worktree removal, and no unconditional ref delete
-    anywhere in this interface. An operation this port cannot express is one the actuator
-    cannot perform, which is the point — and it is why R1 review j#96344 finding 1 was
-    resolved by DELETING ``delete_remote_branch`` from this interface rather than by adding a
-    guard in front of it: a remote ref delete has no non-force compare-and-swap, so it cannot
-    be offered safely, so it is not offered.
+    and one on the cleanup side (``remove_worktree``), and every one of them is the *weak*
+    form: there is no force push, no rebase, no ``--force`` worktree removal, and **no ref
+    delete at all** in this interface. An operation this port cannot express is one the
+    actuator cannot perform, which is the point — and it is why R1 review j#96344 finding 1
+    was resolved by DELETING ``delete_remote_branch`` here rather than by adding a guard in
+    front of it, and R7 review j#96396 finding 1 by deleting ``delete_local_branch`` the same
+    way. Neither delete could enforce its own condition in one operation, so neither is
+    offered (see the module docstring for what each one could not enforce).
     """
 
     def apply_merge(
@@ -149,20 +154,13 @@ class AutoIntegrationGitOperations(Protocol):
         """True iff ``commit`` is reachable from the remote's current ``branch`` tip."""
         ...
 
-    def branch_tip(self, branch: str) -> str:
-        """The full SHA ``branch`` points at, or ``""``."""
-        ...
-
-    def branch_checked_out_elsewhere(self, branch: str) -> bool:
-        """True iff any worktree still holds ``branch`` checked out (fail-closed)."""
-        ...
-
     def remove_worktree(self, *, worktree_path: str) -> bool:
-        """Remove the worktree at ``worktree_path`` without ``--force``."""
-        ...
+        """Remove the worktree at ``worktree_path`` without ``--force``.
 
-    def delete_local_branch(self, *, branch: str, expected_tip: str) -> bool:
-        """Compare-and-swap delete: remove ``branch`` only while it points at ``expected_tip``."""
+        The only destructive operation on this port, and the reason it survived both delete
+        retirements: a removed checkout is reconstructible from the ref it pointed at, while
+        a deleted ref can take unreachable commits with it.
+        """
         ...
 
 
@@ -203,6 +201,8 @@ class CleanupAuthority:
 
     R3 review j#96368 finding 2: every one of these was caller-supplied, and the independent
     reproduction removed a *foreign* lane's worktree and deleted its branch on that basis.
+    The branch delete is gone (j#96396 finding 1); the worktree removal these still gate is
+    not.
     """
 
     issue_closed: bool = False

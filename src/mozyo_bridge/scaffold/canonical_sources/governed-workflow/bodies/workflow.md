@@ -455,15 +455,16 @@ origin到達可能性:
       - `coordinator_confirmed` mode の confirmation は、**確認した exact action key + 発行 role + durable anchor** を伴う記録として解決する。bool の自己申告や anchor を欠く主張は confirmation として扱わない (`### 根拠出所分類`)。**anchor は action-time に fresh-read し、role は記録の author から解決する** — caller が名乗った role や、非空文字列であることは authority ではない
       - already_integrated (target ancestry) と patch_equivalent (明示 patch-id evidence) は別 disposition として記録し、同じ merge を再生成しない
     記録:
-      - 各段階 (integration / push / CI / process retire / worktree remove / branch cleanup) を段階別 outcome として記録する
+      - 実装した各段階 (integration / push / CI / process retire / worktree remove など) を段階別 outcome として記録する。実装しない段階は「記録が無い」ではなく **step 自体が存在しない**ことを設計に明示する
       - action key は `issue + lane_generation + source_head + target_ref + expected_target_head + review_generation` を覆い、部分失敗からの再実行で重複 merge / 重複 delete を起こさない
       - 統合結果は従来どおり integration journal に記録し、自動判断の evidence にする場合は `### Hibernate Evidence Marker Contract` の `integration_disposition` marker を付ける
     close 後の retirement / cleanup:
       - integration state machine と分離した別 state machine で扱う。統合が close を代替しない
       - `git worktree remove` は clean かつ exact registered path に対してのみ、`--force` なしで実行する
-      - local branch delete は `git branch -D` を使わず、worktree 非保持 / unique unpushed commit なし / target 到達または patch-equivalent / ref tip が record 済み source head と一致、を満たす CAS-safe delete に限る
-      - **ref を消す step は CAS 条件を自分で持つ 1 つだけにする。** policy toggle は step を止められるため、「別 step の条件が評価されないまま、後続の step が ref を消す」形を作らない
-      - **remote branch delete は行わない。** remote ref に対する真の compare-and-swap は `--force-with-lease` を要し、それは本節が禁じる force である。安全性を提供できない操作は「既定 off」で持つのではなく **持たない**。非 force な CAS 経路の有無は owner/design 判断とする
+      - **ref を消す step は、その step 自身が 1 つの操作で全条件を enforce できる場合に限り持つ。** 条件の一部を別 probe や別 invocation に委ねた delete は、その隙間で着地した commit を消し得るため CAS-safe とは呼ばない。policy toggle は step を止められるため、「別 step の条件が評価されないまま、後続の step が ref を消す」形も作らない
+      - **local branch delete は行わない。** 必要条件は 2 軸 (ref tip が record 済み source head と一致 / どの worktree もその branch を保持していない) だが、**両軸を 1 invocation で enforce する git primitive は存在しない** (git 2.50.1 実測: `update-ref -d <ref> <tip>` は tip を CAS するが保持中の worktree ごと消して `HEAD` を壊す / `branch -D` は保持を原子的に拒否するが tip 制約を取らない / `update-ref --stdin` は同一 ref への `verify` + `delete` を拒否する)。2 invocation に分けた実装は、その窓で着地した commit を到達不能にすることが再現された (#13686 j#96396)。lane branch の削除は **operator の runbook step** (`git branch -d`) に残す
+      - **remote branch delete も行わない。** remote ref に対する真の compare-and-swap は `--force-with-lease` を要し、それは本節が禁じる force である
+      - 上記 2 つに共通する判断規則: **安全性を提供できない操作は「既定 off」で持つのではなく持たない。** 無い操作を off にする config key も持たない。原子的な CAS 経路が後に得られた場合の再導入可否は owner/design 判断とする
 ```
 
 ### Codex Direct Edit Gate

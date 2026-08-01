@@ -8,16 +8,15 @@ integration:
 - the always-enforced gates (issue closed, integration confirmed, CI settled green,
   callbacks drained, owner gates resolved, non-foreign worktree), which stop **every** step
   including the non-destructive process retire;
-- the step order process_retire -> worktree_remove -> local_branch_delete, one step per
-  call, with a complete stage table on every decision;
-- the j#77124 必須訂正2 safety conditions: a worktree is removed only when clean and at its
-  exact registered path (never forced), and the local branch delete is a compare-and-swap
-  requiring no holding worktree, no unique unpushed commit, target reachability or patch
-  equivalence, and an unchanged tip;
-- the non-Git path, where the worktree / branch steps are explicit ``not_applicable`` and
-  the process retire still runs;
-- the R1 review j#96344 finding 1 regression: the local CAS conditions cannot be skipped by
-  a policy toggle, because the CAS-gated delete is the ONLY ref-deleting step there is;
+- the step order process_retire -> worktree_remove, one step per call, with a complete stage
+  table on every decision;
+- the j#77124 必須訂正2 safety condition that survived: a worktree is removed only when clean
+  and at its exact registered path, never forced;
+- the non-Git path, where the worktree step is an explicit ``not_applicable`` and the process
+  retire still runs;
+- that this machine deletes **no ref at all**. Both deletes it once had are retired — the
+  remote one by review j#96344 finding 1, the local one by review j#96396 finding 1 — so the
+  toggle-skips-a-later-step's-conditions bug has no ref-deleting step left to reach;
 - idempotent resume: a ``done`` step is not re-run, and a stale ledger satisfies nothing.
 
 Pure decisions only — no IO, no git, no use case (those are the integration tests).
@@ -39,20 +38,18 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     OUTCOME_PENDING,
     StepOutcome,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain import (
+    retirement_cleanup_policy,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.retirement_cleanup_policy import (
-    BLOCKED_BRANCH_CHECKED_OUT,
-    BLOCKED_BRANCH_TIP_DRIFT,
     BLOCKED_CI_UNSETTLED,
     BLOCKED_DIRTY_WORKTREE,
     BLOCKED_FOREIGN_WORKTREE,
     BLOCKED_INTEGRATION_UNCONFIRMED,
     BLOCKED_ISSUE_NOT_CLOSED,
-    BLOCKED_NOT_INTEGRATED_REF,
-    BLOCKED_UNPUSHED_COMMITS,
     BLOCKED_UNRESOLVED_CALLBACK,
     BLOCKED_UNRESOLVED_OWNER_GATE,
     BLOCKED_WORKTREE_PATH_UNREGISTERED,
-    STATE_BRANCH_CLEANUP,
     STATE_CLEANUP_BLOCKED,
     STATE_CLEANUP_PREFLIGHT,
     STATE_PROCESS_RETIRING,
@@ -60,7 +57,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     STATE_WORKTREE_REMOVING,
     CLEANUP_STEPS,
     REF_DELETING_STEPS,
-    STEP_LOCAL_BRANCH_DELETE,
     STEP_PROCESS_RETIRE,
     STEP_WORKTREE_REMOVE,
     CleanupActionRecord,
@@ -105,11 +101,6 @@ def _clean(**overrides: object) -> CleanupPreflight:
         "worktree_is_foreign": False,
         "worktree_clean": True,
         "worktree_path_registered": True,
-        "branch_checked_out_elsewhere": False,
-        "unpushed_unique_commits": False,
-        "branch_reachable_from_target": True,
-        "branch_patch_equivalent": False,
-        "branch_tip": TIP,
     }
     fields.update(overrides)
     return CleanupPreflight(**fields)  # type: ignore[arg-type]
@@ -211,30 +202,16 @@ class StepOrderTest(unittest.TestCase):
             (STATE_WORKTREE_REMOVING, STEP_WORKTREE_REMOVE),
         )
 
+        # The worktree removal is the last step: nothing follows it, because the branch
+        # delete that used to (j#96396 finding 1) is gone.
         third = decide_cleanup(
             DEFAULT_POLICY,
             record,
             world,
             ledger=_ledger(record, STEP_PROCESS_RETIRE, STEP_WORKTREE_REMOVE),
         )
-        self.assertEqual(
-            (third.state, third.next_step),
-            (STATE_BRANCH_CLEANUP, STEP_LOCAL_BRANCH_DELETE),
-        )
-
-        fourth = decide_cleanup(
-            DEFAULT_POLICY,
-            record,
-            world,
-            ledger=_ledger(
-                record,
-                STEP_PROCESS_RETIRE,
-                STEP_WORKTREE_REMOVE,
-                STEP_LOCAL_BRANCH_DELETE,
-            ),
-        )
-        self.assertEqual(fourth.state, STATE_RETIRED)
-        self.assertIsNone(fourth.next_step)
+        self.assertEqual(third.state, STATE_RETIRED)
+        self.assertIsNone(third.next_step)
 
     def test_stage_table_is_complete_on_every_decision(self) -> None:
         record = _record()
@@ -243,7 +220,7 @@ class StepOrderTest(unittest.TestCase):
         )
         self.assertEqual(
             [step for step, _ in decision.step_outcomes],
-            [STEP_PROCESS_RETIRE, STEP_WORKTREE_REMOVE, STEP_LOCAL_BRANCH_DELETE],
+            [STEP_PROCESS_RETIRE, STEP_WORKTREE_REMOVE],
         )
         self.assertEqual(decision.outcome_for(STEP_PROCESS_RETIRE), OUTCOME_DONE)
         self.assertEqual(decision.outcome_for(STEP_WORKTREE_REMOVE), OUTCOME_PENDING)
@@ -275,7 +252,7 @@ class WorktreeRemovalSafetyTest(unittest.TestCase):
             decision.blocked_reasons, (BLOCKED_WORKTREE_PATH_UNREGISTERED,)
         )
 
-    def test_a_refused_removal_stops_the_branch_delete_that_would_follow(self) -> None:
+    def test_a_refused_removal_ends_the_run_without_a_next_step(self) -> None:
         record = _record()
         decision = decide_cleanup(
             DEFAULT_POLICY,
@@ -283,9 +260,7 @@ class WorktreeRemovalSafetyTest(unittest.TestCase):
             _clean(worktree_clean=False),
             ledger=_ledger(record, STEP_PROCESS_RETIRE),
         )
-        self.assertEqual(
-            decision.outcome_for(STEP_LOCAL_BRANCH_DELETE), OUTCOME_PENDING
-        )
+        self.assertEqual(decision.state, STATE_CLEANUP_BLOCKED)
         self.assertIsNone(decision.next_step)
 
     def test_disabled_removal_is_not_applicable_not_silently_skipped(self) -> None:
@@ -297,67 +272,65 @@ class WorktreeRemovalSafetyTest(unittest.TestCase):
         self.assertEqual(
             decision.outcome_for(STEP_WORKTREE_REMOVE), OUTCOME_NOT_APPLICABLE
         )
-        self.assertEqual(decision.next_step, STEP_LOCAL_BRANCH_DELETE)
+        # `not_applicable`, and then nothing — a turned-off step does not hand off to a
+        # further one, because there is no further one.
+        self.assertEqual(decision.state, STATE_RETIRED)
+        self.assertIsNone(decision.next_step)
 
 
-class LocalBranchDeleteCasTest(unittest.TestCase):
-    def _after_worktree(self, record: CleanupActionRecord) -> list[StepOutcome]:
-        return _ledger(record, STEP_PROCESS_RETIRE, STEP_WORKTREE_REMOVE)
+class NoRefDeleteTest(unittest.TestCase):
+    """R7 review j#96396 finding 1: the local branch delete is retired, not guarded.
 
-    def test_each_cas_condition_refuses_on_its_own(self) -> None:
-        record = _record()
-        cases = (
-            ({"branch_checked_out_elsewhere": True}, BLOCKED_BRANCH_CHECKED_OUT),
-            ({"unpushed_unique_commits": True}, BLOCKED_UNPUSHED_COMMITS),
-            (
-                {"branch_reachable_from_target": False},
-                BLOCKED_NOT_INTEGRATED_REF,
-            ),
-            ({"branch_tip": MOVED}, BLOCKED_BRANCH_TIP_DRIFT),
-        )
-        for overrides, reason in cases:
-            decision = decide_cleanup(
-                DEFAULT_POLICY,
-                record,
-                _clean(**overrides),
-                ledger=self._after_worktree(record),
-            )
-            self.assertEqual(decision.state, STATE_CLEANUP_BLOCKED, overrides)
-            self.assertEqual(decision.blocked_reasons, (reason,), overrides)
-            self.assertIn("git branch -D", decision.reason)
+    It shipped in R1 as a compare-and-swap on the branch tip, and R7 rebuilt it around
+    ``git branch -D`` so git itself would refuse a branch a worktree still held. Neither form
+    could enforce both conditions at once — the reviewer's reproduction, re-run independently,
+    landed a commit between the tip verification and the delete and watched it be destroyed
+    while the step recorded ``done``. What is pinned here is the *absence*: there is no step,
+    no state, and no policy field through which this machine can delete a ref.
+    """
 
-    def test_patch_equivalence_satisfies_the_reachability_condition(self) -> None:
+    def test_the_worktree_removal_is_the_last_step(self) -> None:
         record = _record()
         decision = decide_cleanup(
             DEFAULT_POLICY,
             record,
-            _clean(branch_reachable_from_target=False, branch_patch_equivalent=True),
-            ledger=self._after_worktree(record),
-        )
-        self.assertEqual(decision.next_step, STEP_LOCAL_BRANCH_DELETE)
-
-    def test_a_branch_that_moved_since_the_action_survives(self) -> None:
-        # The compare-and-swap is the whole safety of the delete: a moved tip is a different
-        # branch than the one that was integrated.
-        record = _record()
-        decision = decide_cleanup(
-            DEFAULT_POLICY,
-            record,
-            _clean(branch_tip=MOVED),
-            ledger=self._after_worktree(record),
-        )
-        self.assertEqual(decision.blocked_reasons, (BLOCKED_BRANCH_TIP_DRIFT,))
-
-    def test_disabled_delete_is_not_applicable(self) -> None:
-        record = _record()
-        policy = RetirementCleanupPolicy(delete_local_branch=False)
-        decision = decide_cleanup(
-            policy, record, _clean(), ledger=self._after_worktree(record)
+            _clean(),
+            ledger=_ledger(record, STEP_PROCESS_RETIRE, STEP_WORKTREE_REMOVE),
         )
         self.assertEqual(decision.state, STATE_RETIRED)
-        self.assertEqual(
-            decision.outcome_for(STEP_LOCAL_BRANCH_DELETE), OUTCOME_NOT_APPLICABLE
+        self.assertIsNone(decision.next_step)
+        # And the resting record says where branch cleanup went, rather than being silent
+        # about a step callers used to get.
+        self.assertIn("operator", decision.reason)
+
+    def test_no_step_deletes_a_ref(self) -> None:
+        self.assertEqual(REF_DELETING_STEPS, frozenset())
+        joined = " ".join(CLEANUP_STEPS).lower()
+        self.assertNotIn("delete", joined)
+        self.assertNotIn("remote", joined)
+
+    def test_no_state_or_policy_field_survives_the_retired_step(self) -> None:
+        # A leftover `branch_cleanup` state or `delete_local_branch` flag would be a seam a
+        # later change could hang a delete back on without re-arguing the ruling.
+        self.assertNotIn(
+            "branch_cleanup", retirement_cleanup_policy.CLEANUP_STATES
         )
+        self.assertFalse(
+            hasattr(RetirementCleanupPolicy.default(), "delete_local_branch")
+        )
+
+    def test_no_preflight_field_promises_branch_protection(self) -> None:
+        # The five branch-shaped facts were the delete's conditions. A caller that could
+        # still set them would be buying a protection nothing evaluates.
+        for gone in (
+            "branch_checked_out_elsewhere",
+            "unpushed_unique_commits",
+            "branch_reachable_from_target",
+            "branch_patch_equivalent",
+            "branch_tip",
+        ):
+            with self.assertRaises(TypeError, msg=gone):
+                CleanupPreflight(is_git_workspace=True, **{gone: True})
 
 
 class R3LedgerFenceTest(unittest.TestCase):
@@ -369,8 +342,8 @@ class R3LedgerFenceTest(unittest.TestCase):
             DEFAULT_POLICY,
             record,
             _clean(),
-            # the branch delete claims to be done while the process retire never was
-            ledger=_ledger(record, STEP_LOCAL_BRANCH_DELETE),
+            # the worktree removal claims to be done while the process retire never was
+            ledger=_ledger(record, STEP_WORKTREE_REMOVE),
         )
         self.assertEqual(decision.state, STATE_CLEANUP_BLOCKED)
         self.assertIsNone(decision.next_step)
@@ -395,39 +368,22 @@ class R3LedgerFenceTest(unittest.TestCase):
 class R1ReviewFinding1RegressionTest(unittest.TestCase):
     """No policy toggle can leave a ref delete running with its conditions unevaluated."""
 
-    def test_there_is_no_remote_branch_delete_step(self) -> None:
-        # R1 shipped one and review j#96344 finding 1 found it bypassed every local CAS
-        # condition and had no compare-and-swap against the remote tip. A remote-ref CAS needs
-        # `--force-with-lease`, a prohibited force, so the operation is gone rather than
-        # guarded.
-        self.assertNotIn("remote", " ".join(CLEANUP_STEPS).lower())
-
-    def test_every_ref_deleting_step_is_the_cas_gated_one(self) -> None:
-        # The structural form of the fix: a toggle can skip a step, so no step whose
-        # conditions belong to a DIFFERENT step may delete a ref.
-        self.assertEqual(REF_DELETING_STEPS, {STEP_LOCAL_BRANCH_DELETE})
-
-    def test_disabling_the_local_delete_deletes_no_ref_at_all(self) -> None:
-        # The exact R1 input: every local condition violated, local delete off. R1 answered
-        # `next_step=remote_branch_delete`; there is now nothing left to reach.
+    def test_the_r1_input_reaches_no_further_step(self) -> None:
+        # The exact R1 input: every worktree condition violated and the removal turned off.
+        # R1 answered `next_step=remote_branch_delete` — a ref delete reached with another
+        # step's conditions unevaluated. R7 would have answered `local_branch_delete`. There
+        # is nothing left to reach.
         record = _record()
         decision = decide_cleanup(
-            RetirementCleanupPolicy(remove_worktree=False, delete_local_branch=False),
+            RetirementCleanupPolicy(remove_worktree=False),
             record,
-            _clean(
-                worktree_clean=False,
-                worktree_path_registered=False,
-                branch_checked_out_elsewhere=True,
-                unpushed_unique_commits=True,
-                branch_reachable_from_target=False,
-                branch_tip=MOVED,
-            ),
+            _clean(worktree_clean=False, worktree_path_registered=False),
             ledger=_ledger(record, STEP_PROCESS_RETIRE),
         )
         self.assertEqual(decision.state, STATE_RETIRED)
         self.assertIsNone(decision.next_step)
         self.assertEqual(
-            decision.outcome_for(STEP_LOCAL_BRANCH_DELETE), OUTCOME_NOT_APPLICABLE
+            decision.outcome_for(STEP_WORKTREE_REMOVE), OUTCOME_NOT_APPLICABLE
         )
 
 
@@ -444,8 +400,9 @@ class NonGitWorkspaceTest(unittest.TestCase):
         )
         self.assertEqual(second.state, STATE_RETIRED)
         self.assertIsNone(second.next_step)
-        for step in (STEP_WORKTREE_REMOVE, STEP_LOCAL_BRANCH_DELETE):
-            self.assertEqual(second.outcome_for(step), OUTCOME_NOT_APPLICABLE, step)
+        self.assertEqual(
+            second.outcome_for(STEP_WORKTREE_REMOVE), OUTCOME_NOT_APPLICABLE
+        )
 
     def test_a_non_git_lane_is_not_blocked_by_the_foreign_worktree_gate(self) -> None:
         # There is no worktree to be foreign; the gate must not fire on its fail-closed
@@ -476,7 +433,8 @@ class IdempotencyTest(unittest.TestCase):
             _clean(),
             ledger=_ledger(record, STEP_PROCESS_RETIRE, STEP_WORKTREE_REMOVE),
         )
-        self.assertEqual(decision.next_step, STEP_LOCAL_BRANCH_DELETE)
+        self.assertEqual(decision.state, STATE_RETIRED)
+        self.assertIsNone(decision.next_step)
 
     def test_a_ledger_under_a_drifted_key_satisfies_nothing(self) -> None:
         record = _record()
@@ -512,8 +470,8 @@ class JournalRendererTest(unittest.TestCase):
         rendered = render_cleanup_journal(decision, record)
         self.assertIn("## cleanup_blocked", rendered)
         self.assertIn(BLOCKED_DIRTY_WORKTREE, rendered)
-        self.assertIn("no worktree removed, no ref deleted", rendered)
-        self.assertIn("`git branch -D`", rendered)
+        self.assertIn("no worktree removed", rendered)
+        self.assertIn("deletes no ref at all", rendered)
 
     def test_record_emits_the_full_stage_table(self) -> None:
         record = _record()

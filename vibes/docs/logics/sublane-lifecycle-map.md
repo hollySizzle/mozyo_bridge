@@ -96,10 +96,13 @@ retire_三義:
           patch_equivalent (明示 evidence) は別 disposition。
 
 [6] retire / cleanup     close 後に lane を退役する (managed process / worktree / branch)。
-                         owner 確認なしに退役してよい条件は所有 doc。
+                         owner 確認なしに退役してよい条件は所有 doc。**actuator が自動化するのは
+                         process retire と worktree remove まで**で、local branch delete は
+                         operator runbook 側に残る (#13686 j#96396: 両 safety 軸を 1 invocation で
+                         enforce する git primitive が無いため)。
       正本: logic-worktree-lifecycle-boundary (sublane retirement authority / record),
             logic-auto-integration-actuator (integration とは別 state machine としての
-            cleanup 段階別 outcome と CAS-safe delete 条件),
+            cleanup 段階別 outcome と、ref delete を持たない理由),
             logic-coordinator-sublane-development-flow (retirement drain),
             logic-session-boundary (pane guarded_kill / orphan)
       非該当: fallback rail の retirement は別概念 (logic-fallback-retirement-ledger)。

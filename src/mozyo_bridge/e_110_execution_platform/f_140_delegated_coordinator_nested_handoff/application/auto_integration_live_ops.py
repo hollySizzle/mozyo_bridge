@@ -2,7 +2,7 @@
 
 The concrete :class:`~...application.auto_integration_actuator.AutoIntegrationGitOperations`
 implementation: real ``git`` invocations for the read probes the action-time preflight needs
-and for the five weak mutations the port defines. It replaces the deliberately gated
+and for the three weak mutations the port defines. It replaces the deliberately gated
 ``LiveSublaneGitOperations.merge_to_integration_branch`` ``NotImplementedError``, which was
 held closed until this issue's design consultation (j#77124) and owner decision (j#96335)
 settled what an auto-integration is allowed to be.
@@ -17,15 +17,24 @@ What the adapter can and cannot express is the safety story, so it is enumerated
   with a conflict resolution strategy. A conflict aborts the merge and is reported.
 - **`git worktree remove` runs without `--force`.** git itself then refuses a dirty or
   unregistered worktree, so the refusal has a second, independent enforcer.
-- **The local branch delete is `git update-ref -d <ref> <old_value>`**, a real
-  compare-and-swap: git deletes the ref only while it still points at the recorded tip.
-  ``git branch -d`` would consult *reachability from HEAD*, which is not the question, and
-  ``git branch -D`` would consult nothing at all. Neither is used.
-- **There is no remote-ref delete.** R1 had one; review j#96344 finding 1 found it had no
-  compare-and-swap against the remote tip and ran even when every local condition failed. A
-  real CAS on a remote ref needs ``--force-with-lease``, which is a force and prohibited
-  (j#96335), so the operation is removed rather than shipped unsafely. Nothing here deletes
-  or rewrites a remote ref.
+- **No ref is deleted here — local or remote.** Both deletes were shipped and both were
+  removed, because neither could enforce its own condition in one invocation:
+
+  - the remote delete (R1, retired by review j#96344 finding 1) had no compare-and-swap
+    against the remote tip and ran even when every local condition failed; a real CAS on a
+    remote ref needs ``--force-with-lease``, a force, prohibited by j#96335;
+  - the local delete (retired by review j#96396 finding 1) needed the tip to still be the
+    recorded one *and* no worktree to hold the branch. Measured on git 2.50.1:
+    ``update-ref -d <ref> <tip>`` compare-and-swaps the tip but deletes a branch a linked
+    worktree is standing on and leaves that worktree's ``HEAD`` unresolvable; ``branch -D``
+    refuses the held branch atomically but takes no tip constraint (a second argument is
+    read as another *branch name*); and ``update-ref --stdin`` refuses ``verify`` +
+    ``delete`` on one ref (``multiple updates for ref ... not allowed``). R7's two-invocation
+    form was reproduced destroying a commit that landed in the window between them.
+
+  Deleting a lane branch is an operator step in the ``preflight_sublane_retire`` runbook,
+  where ``git branch -d`` refuses unmerged work and a human decides. Nothing here deletes or
+  rewrites any ref.
 
 Every probe fails closed: a ``git`` that could not run has proven nothing, so a failed
 invocation reads as the unsafe answer (not a workspace, not an ancestor, not reachable,
@@ -217,28 +226,6 @@ class LiveAutoIntegrationGitOperations:
             return False
         return self.is_ancestor(ancestor=commit, descendant=tip)
 
-    def branch_tip(self, branch: str) -> str:
-        """The full SHA ``branch`` points at, or ``""`` when it does not resolve."""
-        result = self._run(
-            "rev-parse", "--verify", "--quiet", "--end-of-options", f"refs/heads/{branch}"
-        )
-        if result.returncode != 0:
-            return ""
-        candidate = result.stdout.strip()
-        return candidate if _is_full_sha(candidate) else ""
-
-    def branch_checked_out_elsewhere(self, branch: str) -> bool:
-        """True iff any worktree still has ``branch`` checked out (fail-closed).
-
-        An unreadable worktree list reads "yes, it is checked out": deleting a ref that some
-        worktree still holds is exactly what this answer exists to prevent.
-        """
-        result = self._run("worktree", "list", "--porcelain")
-        if result.returncode != 0:
-            return True
-        needle = f"branch refs/heads/{branch}"
-        return any(line.strip() == needle for line in result.stdout.splitlines())
-
     def describe_integration_worktree(
         self, *, path: str, lane_worktree: str
     ) -> IntegrationWorktree:
@@ -392,46 +379,6 @@ class LiveAutoIntegrationGitOperations:
         """Remove the worktree without ``--force`` (git refuses a dirty / unregistered one)."""
         result = self._run("worktree", "remove", "--end-of-options", worktree_path)
         return result.returncode == 0
-
-    def delete_local_branch(self, *, branch: str, expected_tip: str) -> bool:
-        """Delete ``refs/heads/<branch>``, with git enforcing both safety conditions.
-
-        Two conditions matter and they need different primitives (R6 review j#96391 finding 3,
-        measured on real git):
-
-        - **No worktree may hold the branch.** ``git update-ref -d`` does NOT check this: with
-          a linked worktree on ``lane`` it deleted the ref and left that worktree's HEAD
-          unresolvable. ``git branch -D`` refuses atomically — ``cannot delete branch 'lane'
-          used by worktree at ...`` — so the destructive primitive is now that one. R1 chose
-          ``update-ref`` for its compare-and-swap and left this condition to a separate probe,
-          which is a time-of-check/time-of-use gap on the one axis whose failure is not
-          recoverable for the affected worktree.
-        - **The tip must still be the recorded one.** ``git branch -D`` does not check it, so
-          it is verified immediately before by a no-op compare-and-set: ``update-ref <ref>
-          <tip> <tip>`` succeeds only while the ref already points there. Asking git rather
-          than trusting an earlier probe keeps the check on the ref itself.
-
-        Residual, stated rather than hidden: the tip verification and the delete are two
-        invocations, so a tip that moves between them is not caught. That window cannot be
-        closed with git's primitives — no single command both compare-and-swaps a tip and
-        refuses a checked-out branch. It is bounded by the gates that precede it (the branch
-        must already be reachable from the target, so its commits survive) and by git's reflog.
-        If that residual is unacceptable the operation should be withdrawn entirely, as the
-        remote-branch delete was; #13686 j#96392 asks for that ruling.
-        """
-        if not _is_full_sha(expected_tip):
-            return False
-        name = _checked_branch(branch)
-        ref = f"refs/heads/{name}"
-        # Compare-and-set the tip to itself: a verification git performs on the ref, not a
-        # value this process read earlier and hopes is still true.
-        verified = self._run(
-            "update-ref", "--end-of-options", ref, expected_tip, expected_tip
-        )
-        if verified.returncode != 0:
-            return False
-        deleted = self._run("branch", "-D", "--end-of-options", name)
-        return deleted.returncode == 0
 
 
 __all__ = (

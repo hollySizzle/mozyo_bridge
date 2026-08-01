@@ -7,8 +7,9 @@ Pins the typed field contract of the gated auto-integration knob:
 - the owner's j#96335 default: ff-only on;
 - that no CI knob exists (R2 review j#96350 finding 1 — both gates are unconditional in the
   state machine, so a key that could turn one off would be a key the runtime ignores);
-- that no ``delete_remote_branch`` key exists at all (R1 review j#96344 finding 1 — the
-  operation had no compare-and-swap and is removed rather than defaulted off);
+- that no ref-delete key exists at all, local or remote (R1 review j#96344 finding 1 and R7
+  review j#96396 finding 1 — neither operation could enforce its own safety condition, and
+  both are removed rather than defaulted off);
 - fail-closed parsing — a non-mapping record, an unknown key, an unsupported version, a mode
   outside the closed vocabulary, a non-boolean flag, an empty ``integration_branch``;
 - that the closed key set cannot express an authority (a boundary-shaped key is refused with
@@ -60,7 +61,6 @@ class DefaultsTest(unittest.TestCase):
         # j#96335: fast-forward-only is the default.
         self.assertTrue(config.ff_only)
         self.assertTrue(config.remove_worktree)
-        self.assertTrue(config.delete_local_branch)
         # An unset target defers to runtime resolution rather than guessing a branch.
         self.assertIsNone(config.integration_branch)
 
@@ -111,7 +111,6 @@ class FailClosedParsingTest(unittest.TestCase):
         for key in (
             "ff_only",
             "remove_worktree",
-            "delete_local_branch",
         ):
             for value in (0, 1, "true", "yes", None):
                 with self.assertRaises(RepoLocalConfigError, msg=f"{key}={value!r}"):
@@ -137,18 +136,20 @@ class BoundaryTest(unittest.TestCase):
                 "integration_branch",
                 "ff_only",
                 "remove_worktree",
-                "delete_local_branch",
             },
         )
 
-    def test_there_is_no_remote_branch_delete_key(self) -> None:
-        # R1 review j#96344 finding 1: the step had no CAS against the remote tip and a real
-        # one needs the prohibited `--force-with-lease`, so the operation is gone. The key is
-        # removed rather than left as a way to ask for it — declaring it is now an error.
-        self.assertNotIn("delete_remote_branch", AUTO_INTEGRATION_KEYS)
-        self.assertFalse(hasattr(AutoIntegrationConfig.default(), "delete_remote_branch"))
-        with self.assertRaises(RepoLocalConfigError):
-            AutoIntegrationConfig.from_record({"delete_remote_branch": False})
+    def test_there_is_no_ref_delete_key_local_or_remote(self) -> None:
+        # R1 review j#96344 finding 1 retired the remote delete (no CAS against the remote
+        # tip; a real one needs the prohibited `--force-with-lease`) and R7 review j#96396
+        # finding 1 retired the local one (its tip check and its delete are separate
+        # invocations, and a commit landing between them was reproduced being destroyed).
+        # Neither key is left as a way to ask for the operation — declaring one is an error.
+        for gone in ("delete_remote_branch", "delete_local_branch"):
+            self.assertNotIn(gone, AUTO_INTEGRATION_KEYS, gone)
+            self.assertFalse(hasattr(AutoIntegrationConfig.default(), gone), gone)
+            with self.assertRaises(RepoLocalConfigError, msg=gone):
+                AutoIntegrationConfig.from_record({gone: False})
 
     def test_an_authority_shaped_key_is_refused_with_the_boundary_message(self) -> None:
         for key in (
@@ -215,10 +216,10 @@ class DeclarationStatusTest(unittest.TestCase):
             "integration_branch",
             "ff_only",
             "remove_worktree",
-            "delete_local_branch",
         ):
             self.assertIn(f"auto_integration.{field_name}", leaves, field_name)
         for gone in (
+            "auto_integration.delete_local_branch",
             "auto_integration.delete_remote_branch",
             "auto_integration.require_source_ci",
             "auto_integration.require_integration_ci",

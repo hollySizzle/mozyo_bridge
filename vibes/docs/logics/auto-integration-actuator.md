@@ -1,8 +1,9 @@
 # Guarded auto-integration / retirement-cleanup actuator
 
 Redmine #13686 (parent #12603 / Version #303)。coordinator が手作業で行っていた
-「review 承認 → integration branch への統合 → CI → close → lane 退役 (worktree remove /
-local branch delete)」を、**gate 付きで replayable な単一 actuator** に移すための設計正本。
+「review 承認 → integration branch への統合 → CI → close → lane 退役 (worktree remove)」を、
+**gate 付きで replayable な単一 actuator** に移すための設計正本。lane の local branch 削除は
+**本 actuator の scope から外れた** — 経緯と根拠は `## 破壊的 step の safety 条件`。
 
 owner decision は #13686 j#96335、設計境界は同 j#77124 (Coordinator Design Answer,
 approved_with_corrections)。両者が本 doc の上位である。実行契約のうち **authority 側**
@@ -51,7 +52,7 @@ durable retire record を **merge の前に** 要求する。ここへ live merg
                                                                                     ↓
                                                                       (issue close は別経路)
                                                                                     ↓
-[cleanup]      cleanup_preflight → process_retiring → worktree_removing → branch_cleanup → retired
+[cleanup]      cleanup_preflight → process_retiring → worktree_removing → retired
 ```
 
 `integration_preflight` / `cleanup_preflight` は **entry phase であり resting state ではない**。
@@ -125,8 +126,6 @@ cleanup:
   - issue_not_closed / integration_unconfirmed / integration_ci_unsettled
   - unresolved_callback / unresolved_owner_gate / foreign_worktree
   - worktree_path_unregistered / dirty_worktree
-  - branch_still_checked_out / unpushed_unique_commits
-  - branch_not_reachable_from_target / branch_tip_drift
 ```
 
 **代替手段を持たない**ことが安全性の中身である。conflict / non-ff / target drift / push 拒否を
@@ -137,21 +136,29 @@ fallback する」という選択肢が構造上存在しない。
 
 - `git worktree remove` は **clean かつ exact registered path** に対してのみ、`--force` なしで
   実行する。live adapter が `--force` を渡さないので git 自身が二重の enforcer になる。
-- local branch delete は `git branch -D` を使わない。`git update-ref -d <ref> <old_value>` による
-  真の compare-and-swap で、record 済み source head を指している間だけ消える。`git branch -d` は
-  *HEAD からの到達性* を見るが、それはここで問うている問いではない。
-- **ref を消す step はこの 1 つだけである** (`REF_DELETING_STEPS`)。policy toggle は step を
-  止められるので、「別 step の条件が評価されないまま後続の step が ref を消す」形を作らない。
-- **remote branch delete は存在しない。** R1 は既定 false の toggle として持っていたが、R1 review
-  j#96344 finding 1 が (a) local delete を off にすると CAS 条件群の評価ごと飛ばして remote を
-  消せる、(b) remote tip に対する CAS が無い、の 2 点を再現した。remote ref の真の CAS は
-  `--force-with-lease` を要し、それは j#96335 が禁じた force である。**安全性を提供できない操作は
-  「既定 off」で持つのではなく持たない**という判断で、config key / step / port method / adapter
-  method を全て削除した。非 force な CAS 経路の有無は owner/design 判断とする。
-- 非 Git workspace では worktree / branch step を明示的に `not_applicable` とし、process retire
-  だけを独立に実行する。
+- **ref を消す step は 1 つも無い** (`REF_DELETING_STEPS` は空集合)。local / remote の 2 つの
+  delete を実装し、2 つとも同じ理由で撤去した — **安全性を提供できない操作は「既定 off」で持つ
+  のではなく持たない**。
+  - **remote branch delete**: R1 は既定 false の toggle として持っていたが、R1 review j#96344
+    finding 1 が (a) local delete を off にすると CAS 条件群の評価ごと飛ばして remote を消せる、
+    (b) remote tip に対する CAS が無い、の 2 点を再現した。remote ref の真の CAS は
+    `--force-with-lease` を要し、それは j#96335 が禁じた force である。
+  - **local branch delete**: 満たすべき条件は 2 軸 — ref tip が record 済み source head のまま
+    であること、どの worktree もその branch を保持していないこと。**この 2 軸を 1 invocation で
+    enforce する git primitive は存在しない** (git 2.50.1 で実測):
+    `update-ref -d <ref> <tip>` は tip を CAS するが worktree が保持中でも消し、その worktree の
+    `HEAD` を解決不能にする / `branch -D` は保持中の branch を原子的に拒否するが tip 制約を
+    取らない (2 個目の引数は **別の branch 名**として読まれる) / `update-ref --stdin` は同一 ref
+    への `verify` + `delete` を `multiple updates for ref ... not allowed` で拒否する。
+    R1 は前者、R7 は後者 + 直前 CAS の 2 invocation 形で出した。R7 review j#96396 finding 1 が
+    その残余窓を再現した — CAS 成功と `branch -D` の間に着地した commit が branch ごと消え、
+    全 ref から到達不能になり、step は `done` と記録された。よって撤去する。
+  - lane branch の削除は **operator の runbook step** として `preflight_sublane_retire` に残る
+    (`git branch -d`。unmerged work を git が拒否し、人間が判断する)。
+- 非 Git workspace では worktree step を明示的に `not_applicable` とし、process retire だけを
+  独立に実行する。
 
-## 現行 contract の要約 (R7 時点)
+## 現行 contract の要約 (R8 時点)
 
 歴史的経緯は後続の節に残すが、**現時点で成立している契約**はこれだけである。矛盾したら本節を優先する。
 
@@ -163,8 +170,9 @@ fallback する」という選択肢が構造上存在しない。
 - target head は **fresh remote tip**。pre-push は expected-head CAS、post-push は landed-head
   reachability。merge の parent も **measured remote target に exact-bind** する。
 - `already_integrated` / `patch_equivalent` は **push 前のみ** terminal。push 後は exact-SHA CI を完走。
-- destructive: worktree remove は clean + registered + 自 lane、branch delete は **`git branch -D`**
-  (checkout 不在を git が原子的に enforce) + 直前の git 側 tip CAS。**remote ref delete は無い**。
+- destructive mutation は **`git worktree remove` (clean + registered + 自 lane + no `--force`) の
+  1 つだけ**。**ref delete は local / remote とも存在しない** (上節)。checkout の除去は ref から
+  復元できるが、ref の削除は到達不能 commit を道連れにし得る — これが両者を分けた基準である。
 - `mode` は `auto` / `disabled` のみ。CI gate は config で外せない。
 
 ## 実装構成
@@ -237,8 +245,9 @@ authority reader 未注入なら durable 事実は何も確立されず、`integ
   (「誰かが先に動かした」= drift とは別の事実、「我々の成果が消えた」)。
 - `already_integrated` は **push 前にのみ** terminal disposition である。push 後は source が target
   から到達可能なのは当然であり、そこで終了すると exact-SHA CI gate を飛ばしてしまう。
-- cleanup も remove と delete の間で世界が変わる。`branch_checked_out_elsewhere` は **削除対象の
-  worktree 自身も数える**ため、remove 前後で答えが違う。両 machine とも **step ごとに再測定**する。
+- cleanup も自分の mutation で世界が変わる。remove 前後で lane worktree の registered / checkout
+  状態は別の答えになるため、両 machine とも **step ごとに再測定**する (この節が扱っていた
+  `branch_checked_out_elsewhere` は、branch delete と共に撤去された probe である)。
 
 > **test double が mutation の効果を反映しないと、検査そのものが無効になる。**
 > R5 の 2 件はどちらも、fake が push 後も target head を静止させ、remove 後も checkout 状態を
@@ -276,11 +285,11 @@ auto_integration:
   integration_branch: null  # 未設定は runtime 解決。設定時は action の target と exact 一致必須
   ff_only: true             # 既定 (j#96335)
   remove_worktree: true
-  delete_local_branch: true
 ```
 
-`delete_remote_branch` key は存在しない (上記「破壊的 step の safety 条件」参照)。宣言すると
-unknown key として fail-closed する。
+`delete_local_branch` / `delete_remote_branch` key は **どちらも存在しない** (上記「破壊的 step の
+safety 条件」参照)。宣言すると unknown key として fail-closed する。無い操作を off にする key は
+持たない。
 
 **CI key も存在しない。** R2 は `require_source_ci` / `require_integration_ci` を持ち、
 「j#96335 が『branch/target CI』を設定駆動項目に列挙している」ことを根拠に waiver を owner 授権済み

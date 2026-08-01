@@ -17,9 +17,9 @@ Three parts:
   module imports the governance schema.
 - :class:`AutoIntegrationUseCase` executes **one decided step at a time** and returns the
   step's outcome. It performs only the side effect the decision authorized and never
-  substitutes a stronger one: no ``--force``, no rebase, no ``git branch -D``, no remote ref
-  rewrite. Each executed step is appended to the ledger the next decision reads, which is
-  what makes a partial failure resumable without a duplicate merge, push, or delete.
+  substitutes a stronger one: no ``--force``, no rebase, no ref delete of any kind, no remote
+  ref rewrite. Each executed step is appended to the ledger the next decision reads, which is
+  what makes a partial failure resumable without a duplicate merge or push.
 - :class:`IntegrationRunReport` is the replayable record of a run: the states it passed
   through and the outcome of every step, so a durable journal can be rendered from it.
 
@@ -69,7 +69,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     decide_integration,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.retirement_cleanup_policy import (
-    STEP_LOCAL_BRANCH_DELETE,
     STEP_PROCESS_RETIRE,
     STEP_WORKTREE_REMOVE,
     CleanupActionRecord,
@@ -105,10 +104,7 @@ def cleanup_policy_from_config(
     config: AutoIntegrationConfig,
 ) -> RetirementCleanupPolicy:
     """Translate the ``auto_integration`` config block into the cleanup policy."""
-    return RetirementCleanupPolicy(
-        remove_worktree=config.remove_worktree,
-        delete_local_branch=config.delete_local_branch,
-    )
+    return RetirementCleanupPolicy(remove_worktree=config.remove_worktree)
 
 
 # ---------------------------------------------------------------------------
@@ -558,9 +554,14 @@ class AutoIntegrationUseCase:
         the wrong thing; this side destroys another lane's work.
 
         The identity question is answered from the actuator's OWN configuration, not from the
-        record: a cleanup may only touch this actuator's lane worktree and lane branch. A CAS
-        on the branch tip cannot substitute for it — an unchanged tip says the branch has not
-        moved, not that it is ours.
+        record: a cleanup may only touch this actuator's lane worktree.
+
+        Five branch-shaped measurements used to be taken here for the local branch delete
+        (its tip, whether anything held it, whether it was reachable from the configured
+        target, whether it had unique unpushed commits). They are gone with the step
+        (j#96396 finding 1) rather than left measured-but-unread — a probe whose answer no
+        gate consults is how R4 shipped a `checked_out_branch` that was measured and never
+        compared.
         """
         ops = self.operations
         if not ops.is_git_workspace():
@@ -579,12 +580,6 @@ class AutoIntegrationUseCase:
                 owner_gates_resolved=authority.owner_gates_resolved,
             )
 
-        # R4 review j#96379 finding 2: the reachability target used to be a caller argument,
-        # so passing the lane's OWN branch made "is this integrated?" trivially true and the
-        # destructive steps ran on unintegrated work. It comes from the configured integration
-        # branch now — the same value the integration side is bound to — and an actuator with
-        # no configured target cannot establish reachability at all.
-        configured_target = self.integration_policy.integration_branch
         lane = ops.describe_integration_worktree(
             path=record.worktree_path, lane_worktree=self.lane_worktree
         )
@@ -616,7 +611,6 @@ class AutoIntegrationUseCase:
             )
         else:
             is_ours = names_our_lane and not lane.registered
-        tip = ops.branch_tip(record.branch)
         authority = (
             self.authority.read_cleanup_authority(record=record)
             if self.authority is not None
@@ -635,35 +629,22 @@ class AutoIntegrationUseCase:
             # because they did, and a vanished path cannot answer them again.
             worktree_clean=lane.clean if removed is None else True,
             worktree_path_registered=lane.registered if removed is None else True,
-            branch_checked_out_elsewhere=ops.branch_checked_out_elsewhere(record.branch),
-            unpushed_unique_commits=not ops.commit_on_remote(tip, branch=record.branch),
-            branch_reachable_from_target=(
-                bool(configured_target)
-                and ops.is_ancestor(
-                    ancestor=tip, descendant=ops.remote_branch_tip(configured_target)
-                )
-            ),
-            # Patch equivalence needs explicit evidence; no probe establishes it.
-            branch_patch_equivalent=False,
-            branch_tip=tip,
         )
 
     def run_cleanup(self, record: CleanupActionRecord) -> CleanupRunReport:
         """Drive the post-close cleanup machine until it rests, performing each decided step.
 
-        As with :meth:`run_integration` there is no caller preflight and no caller ledger.
-        The branch the lane's work must be reachable from is the CONFIGURED integration
-        branch, not an argument (j#96379 finding 2); everything else is measured
-        (:meth:`_measure_cleanup`).
+        As with :meth:`run_integration` there is no caller preflight and no caller ledger:
+        everything the machine decides from is measured here (:meth:`_measure_cleanup`).
         """
         report = CleanupRunReport()
         working_ledger: List[StepOutcome] = list(
             self.ledger.read(action_key=record.action_key)
         )
         while True:
-            # Re-measured before every step: `remove_worktree` changes whether the lane
-            # worktree is registered and whether anything still holds the branch, so the
-            # branch delete must decide from the world AFTER the removal, not before it.
+            # Re-measured before every step rather than once per run: `remove_worktree`
+            # changes what the next measurement of this lane can see, and a preflight taken
+            # before a step is not a description of the world after it.
             preflight = self._measure_cleanup(record, ledger=working_ledger)
             report.measured_preflight = preflight
             decision = decide_cleanup(
@@ -733,15 +714,20 @@ class AutoIntegrationUseCase:
                 recorded_by=self.recorder_id,
             )
 
-        deleted = self.operations.delete_local_branch(
-            branch=record.branch, expected_tip=record.recorded_source_head
-        )
-        return _settled(
-            decision.action_key,
-            STEP_LOCAL_BRANCH_DELETE,
-            deleted,
-            "compare-and-swap local branch delete (never `git branch -D`)",
+        # No step falls through to a destructive default. Until R7 the local branch delete sat
+        # here as the unnamed tail of this dispatch — a shape that runs *something* for any
+        # step the decision names — and review j#96396 finding 2 caught the record that came
+        # out of it claiming a compare-and-swap while the argv was `git branch -D`. There is
+        # no ref delete to reach now, and an unrecognized step is refused rather than mapped
+        # onto whatever operation happens to be last.
+        return StepOutcome(
+            action_key=decision.action_key,
+            step=str(step or "unknown"),
             recorded_by=self.recorder_id,
+            outcome=OUTCOME_BLOCKED,
+            detail=(
+                f"cleanup step {step!r} is not one this actuator performs; nothing was run"
+            ),
         )
 
 

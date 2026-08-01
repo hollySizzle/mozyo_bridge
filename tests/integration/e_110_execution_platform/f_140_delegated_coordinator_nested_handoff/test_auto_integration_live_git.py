@@ -1,20 +1,22 @@
-"""Real-``git`` tests for the #13686 live adapter's two destructive primitives.
+"""Real-``git`` tests for the #13686 live adapter (Redmine #13686).
 
 R6 review j#96391 finding 6 asked for these specifically, and the reason is on the record:
-findings 1 and 3 were both properties of what ``git`` actually does, and the recording fake
-could not have caught either. A fake answers what it was told to answer — it cannot tell you
-that ``git update-ref -d`` will happily delete a branch a linked worktree is standing on, or
-that ``git merge`` will take whatever the checked-out tip happens to be as its first parent.
+that round's findings were both properties of what ``git`` actually does, and the recording
+fake could not have caught either. A fake answers what it was told to answer — it cannot tell
+you that ``git merge`` will take whatever the checked-out tip happens to be as its first
+parent, or what a ref-deleting primitive does to a worktree standing on that ref.
 
-So these two facts are pinned against a real binary in a temp repository:
+What is pinned against a real binary here is **the merge's target parent**: it must be the
+commit the action measured on the remote, not the dedicated worktree's local tip (a worktree
+carrying one extra unreviewed commit produced a merge containing it, and the push was
+accepted because it was still a fast-forward).
 
-- **the merge's target parent** must be the commit the action measured on the remote, not the
-  dedicated worktree's local tip (finding 1: a worktree carrying one extra unreviewed commit
-  produced a merge containing it, and the push was accepted because it was still a
-  fast-forward);
-- **the branch delete** must refuse while any worktree holds the branch (finding 3: measured,
-  ``update-ref -d`` deleted the ref and left that worktree's ``HEAD`` unresolvable, while
-  ``git branch -D`` refuses atomically).
+The branch-delete tests this module also carried are gone with the operation. R7 review
+j#96396 finding 1 reproduced the residual its docstring admitted — a commit landing between
+the tip verification and the delete was destroyed while the step recorded ``done`` — and the
+delete was retired rather than guarded again, because no single ``git`` invocation enforces
+both its tip condition and its no-holding-worktree condition. :class:`NoRefDeleteTest` pins
+the absence against the same real binary the delete used to run through.
 
 Hermetic: every repository is created under a fresh ``TemporaryDirectory`` and no remote is
 contacted. The tests skip when ``git`` is unavailable rather than failing, so the suite stays
@@ -132,69 +134,94 @@ class MergeParentBindingTest(unittest.TestCase):
 
 
 @unittest.skipIf(_GIT is None, "git is not available on PATH")
-class BranchDeleteEnforcementTest(unittest.TestCase):
-    """A branch a worktree is standing on is not deletable, and git is what enforces it."""
+class NoRefDeleteTest(unittest.TestCase):
+    """The adapter deletes no ref, and the reason is measurable on the binary itself."""
 
-    def test_a_branch_held_by_a_linked_worktree_is_not_deleted(self) -> None:
+    def test_the_adapter_exposes_no_ref_deleting_operation(self) -> None:
+        for gone in ("delete_local_branch", "delete_remote_branch"):
+            self.assertFalse(hasattr(LiveAutoIntegrationGitOperations, gone), gone)
+
+    def test_no_git_primitive_enforces_both_delete_conditions_at_once(self) -> None:
+        """The measurement the retirement rests on, kept executable rather than asserted.
+
+        If a future git makes one invocation enforce both conditions — the ref still points
+        at the recorded tip AND no worktree holds it — this test is what will notice, and the
+        ruling can be revisited on evidence instead of on memory.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            repo = root / "repo"
+
+            # (a) `update-ref -d <ref> <tip>` compare-and-swaps the tip, and deletes the ref
+            #     out from under a worktree that is standing on it.
+            repo = root / "cas"
             _init(repo)
             _commit(repo, "a.txt", "base")
             _git(repo, "branch", "lane")
             held = root / "held"
             _git(repo, "worktree", "add", "-q", str(held), "lane")
             tip = _git(repo, "rev-parse", "lane")
-
-            operations = LiveAutoIntegrationGitOperations(repo_root=repo)
-            self.assertFalse(
-                operations.delete_local_branch(branch="lane", expected_tip=tip)
+            cas = subprocess.run(
+                ["git", "update-ref", "-d", "refs/heads/lane", tip],
+                cwd=repo, capture_output=True, text=True,
             )
-            # The ref survives and the worktree's HEAD still resolves — which is exactly what
-            # `git update-ref -d` did NOT preserve (j#96391 finding 3, measured).
-            self.assertEqual(_git(repo, "rev-parse", "lane"), tip)
-            self.assertEqual(_git(held, "rev-parse", "HEAD"), tip)
+            self.assertEqual(cas.returncode, 0, cas.stderr)
+            self.assertNotEqual(
+                subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=held, capture_output=True
+                ).returncode,
+                0,
+                "the held worktree's HEAD should have been orphaned by the delete",
+            )
 
-    def test_the_branch_is_deleted_once_no_worktree_holds_it(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            repo = root / "repo"
+            # (b) `branch -D` refuses the held branch atomically, and takes no tip constraint:
+            #     a second argument is read as another BRANCH NAME, not as an expected tip.
+            repo = root / "force"
             _init(repo)
             _commit(repo, "a.txt", "base")
             _git(repo, "branch", "lane")
-            held = root / "held"
+            held = root / "held2"
             _git(repo, "worktree", "add", "-q", str(held), "lane")
-            tip = _git(repo, "rev-parse", "lane")
+            forced = subprocess.run(
+                ["git", "branch", "-D", "lane"], cwd=repo, capture_output=True, text=True
+            )
+            self.assertNotEqual(forced.returncode, 0)
+            self.assertIn("used by worktree", forced.stderr)
             _git(repo, "worktree", "remove", str(held))
-
-            operations = LiveAutoIntegrationGitOperations(repo_root=repo)
-            self.assertTrue(
-                operations.delete_local_branch(branch="lane", expected_tip=tip)
+            stale = "0" * 40
+            with_tip = subprocess.run(
+                ["git", "branch", "-D", "lane", stale],
+                cwd=repo, capture_output=True, text=True,
             )
+            # The branch is gone despite the "expected tip" being nonsense — it was never a
+            # constraint. What failed is the attempt to delete a branch NAMED by that SHA.
             self.assertNotEqual(
                 subprocess.run(
                     ["git", "rev-parse", "--verify", "--quiet", "refs/heads/lane"],
-                    cwd=repo,
-                    capture_output=True,
+                    cwd=repo, capture_output=True,
                 ).returncode,
                 0,
             )
+            self.assertIn(stale, with_tip.stderr)
 
-    def test_a_tip_that_moved_is_refused(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp) / "repo"
+            # (c) A transaction cannot combine the two: one ref, one update.
+            repo = root / "txn"
             _init(repo)
             _commit(repo, "a.txt", "base")
-            _git(repo, "checkout", "-q", "-b", "lane")
-            stale = _git(repo, "rev-parse", "lane")
-            _commit(repo, "b.txt", "moved")  # the branch advanced since the action was formed
-            _git(repo, "checkout", "-q", "main")
-
-            operations = LiveAutoIntegrationGitOperations(repo_root=repo)
-            self.assertFalse(
-                operations.delete_local_branch(branch="lane", expected_tip=stale)
+            _git(repo, "branch", "lane")
+            tip = _git(repo, "rev-parse", "lane")
+            txn = subprocess.run(
+                ["git", "update-ref", "--stdin"],
+                cwd=repo,
+                input=(
+                    f"start\nverify refs/heads/lane {tip}\n"
+                    f"delete refs/heads/lane {tip}\nprepare\ncommit\n"
+                ),
+                capture_output=True,
+                text=True,
             )
-            self.assertTrue(_git(repo, "rev-parse", "lane"))
+            self.assertNotEqual(txn.returncode, 0)
+            self.assertIn("multiple updates", txn.stderr)
+            self.assertEqual(_git(repo, "rev-parse", "lane"), tip)
 
 
 if __name__ == "__main__":  # pragma: no cover - manual invocation

@@ -76,7 +76,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.retirement_cleanup_policy import (
     STATE_CLEANUP_BLOCKED,
     STATE_RETIRED,
-    STEP_LOCAL_BRANCH_DELETE,
     STEP_PROCESS_RETIRE,
     STEP_WORKTREE_REMOVE,
     CleanupActionRecord,
@@ -108,8 +107,6 @@ _READ_PROBES = (
     "is_ancestor",
     "worktree_dirty",
     "commit_on_remote",
-    "branch_tip",
-    "branch_checked_out_elsewhere",
 )
 
 
@@ -135,19 +132,12 @@ class FakeGitOperations:
     dedicated_local_target: Optional[str] = None
     on_remote: bool = True
     tip: str = SOURCE
-    #: Before the removal the lane's own worktree still holds the branch, exactly as the live
-    #: probe reports it (it counts the worktree being removed).
-    checked_out_elsewhere: bool = True
-    #: What the probe answers once the lane worktree is gone. A test sets this True to model
-    #: somebody else checking the branch out in the window between remove and delete.
-    checked_out_after_remove: bool = False
 
     merge_result: MergeResult = field(
         default_factory=lambda: MergeResult(conflicted=False, integration_head=MERGE_HEAD)
     )
     push_result: PushResult = field(default_factory=lambda: PushResult(accepted=True))
     worktree_removed: bool = True
-    branch_deleted: bool = True
     calls: List[Tuple[str, dict]] = field(default_factory=list)
 
     # -- read probes ------------------------------------------------------
@@ -173,14 +163,6 @@ class FakeGitOperations:
     def commit_on_remote(self, commit: str, *, branch: str) -> bool:
         self.calls.append(("commit_on_remote", {"commit": commit, "branch": branch}))
         return self.on_remote
-
-    def branch_tip(self, branch: str) -> str:
-        self.calls.append(("branch_tip", {"branch": branch}))
-        return self.tip
-
-    def branch_checked_out_elsewhere(self, branch: str) -> bool:
-        self.calls.append(("branch_checked_out_elsewhere", {"branch": branch}))
-        return self.checked_out_elsewhere
 
     def describe_integration_worktree(
         self, *, path: str, lane_worktree: str
@@ -265,14 +247,7 @@ class FakeGitOperations:
             # different lie from none.
             self.lane_registered = False
             self.lane_branch_checked_out = ""
-            self.checked_out_elsewhere = self.checked_out_after_remove
         return self.worktree_removed
-
-    def delete_local_branch(self, *, branch: str, expected_tip: str) -> bool:
-        self.calls.append(
-            ("delete_local_branch", {"branch": branch, "expected_tip": expected_tip})
-        )
-        return self.branch_deleted
 
     @property
     def performed(self) -> List[str]:
@@ -400,11 +375,14 @@ class ConfigTranslationTest(unittest.TestCase):
             self.assertFalse(hasattr(config, gone), gone)
             self.assertFalse(hasattr(policy, gone), gone)
 
-    def test_cleanup_fields_map_through_with_no_remote_delete(self) -> None:
+    def test_cleanup_fields_map_through_with_no_ref_delete(self) -> None:
         policy = cleanup_policy_from_config(AutoIntegrationConfig.default())
         self.assertTrue(policy.remove_worktree)
-        self.assertTrue(policy.delete_local_branch)
-        self.assertFalse(hasattr(policy, "delete_remote_branch"))
+        # Neither delete has a config field, because neither step exists (j#96344 finding 1,
+        # j#96396 finding 1).
+        for gone in ("delete_remote_branch", "delete_local_branch"):
+            self.assertFalse(hasattr(policy, gone), gone)
+            self.assertFalse(hasattr(AutoIntegrationConfig.default(), gone), gone)
 
     def test_the_default_config_translates_to_a_disabled_actuator(self) -> None:
         self.assertEqual(
@@ -765,8 +743,10 @@ class R6ReviewFindingTest(unittest.TestCase):
 
     def test_f2_our_own_removal_does_not_make_the_lane_foreign(self) -> None:
         # R6 finding 2: after the removal the path is gone, so re-requiring the pre-removal
-        # branch identity blocked the branch cleanup that is supposed to follow it. The fake
-        # now clears the checked-out branch the way the live probe does.
+        # branch identity blocked the step that follows it. The fake now clears the checked-out
+        # branch the way the live probe does. The removal is the last step since j#96396
+        # finding 1, so what this pins is that the run RESTS at `retired` instead of blocking
+        # on `foreign_worktree` when it re-measures a path it just removed.
         operations = FakeGitOperations(ancestors=((SOURCE, TARGET),), tip=SOURCE)
         report = _use_case(operations, processes=FakeProcessOperations()).run_cleanup(
             CleanupActionRecord(
@@ -779,9 +759,7 @@ class R6ReviewFindingTest(unittest.TestCase):
             )
         )
         self.assertEqual(report.final_decision.state, STATE_RETIRED)
-        self.assertEqual(
-            operations.performed, ["remove_worktree", "delete_local_branch"]
-        )
+        self.assertEqual(operations.performed, ["remove_worktree"])
 
 
 class R3ReviewFinding2Test(unittest.TestCase):
@@ -806,7 +784,8 @@ class R3ReviewFinding2Test(unittest.TestCase):
 
     def test_a_foreign_lane_is_never_cleaned_up(self) -> None:
         # The R3 reproduction: caller booleans alone removed a foreign lane's worktree and
-        # deleted its branch. The actuator now answers "is this ours?" from its own identity.
+        # deleted its branch. The actuator now answers "is this ours?" from its own identity
+        # (and there is no branch delete left to reach at all).
         operations = self._ops()
         report = _use_case(operations, processes=FakeProcessOperations()).run_cleanup(self._record(
                 branch="foreign_lane_branch",
@@ -815,41 +794,39 @@ class R3ReviewFinding2Test(unittest.TestCase):
         self.assertEqual(report.final_decision.state, STATE_CLEANUP_BLOCKED)
         self.assertEqual(operations.performed, [])
 
-    def test_our_own_lane_runs_the_three_steps_in_order(self) -> None:
+    def test_our_own_lane_runs_the_two_steps_in_order(self) -> None:
         operations = self._ops()
         processes = FakeProcessOperations()
         report = _use_case(operations, processes=processes).run_cleanup(self._record())
         self.assertEqual(report.final_decision.state, STATE_RETIRED)
-        self.assertEqual(operations.performed, ["remove_worktree", "delete_local_branch"])
+        self.assertEqual(operations.performed, ["remove_worktree"])
         self.assertEqual(
             [o.step for o in report.outcomes],
-            [STEP_PROCESS_RETIRE, STEP_WORKTREE_REMOVE, STEP_LOCAL_BRANCH_DELETE],
-        )
-        self.assertEqual(
-            operations.args_for("delete_local_branch")[0],
-            {"branch": LANE_BRANCH, "expected_tip": SOURCE},
+            [STEP_PROCESS_RETIRE, STEP_WORKTREE_REMOVE],
         )
 
-    def test_a_dirty_lane_worktree_deletes_nothing(self) -> None:
+    def test_a_dirty_lane_worktree_mutates_nothing(self) -> None:
         operations = self._ops(lane_clean=False)
         report = _use_case(operations, processes=FakeProcessOperations()).run_cleanup(self._record())
         self.assertEqual(report.final_decision.state, STATE_CLEANUP_BLOCKED)
         self.assertEqual(operations.performed, [])
 
-    def test_a_branch_checked_out_between_remove_and_delete_is_not_deleted(self) -> None:
-        # R5 review j#96385 finding 3: the cleanup measured once and reused that snapshot for
-        # both mutations, so a branch somebody checked out in the window between the worktree
-        # removal and the ref delete was deleted anyway.
-        operations = self._ops(checked_out_after_remove=True)
-        report = _use_case(operations, processes=FakeProcessOperations()).run_cleanup(self._record())
-        self.assertEqual(operations.performed, ["remove_worktree"])
-        self.assertEqual(report.final_decision.state, STATE_CLEANUP_BLOCKED)
-
-    def test_a_branch_not_reachable_from_the_target_is_not_deleted(self) -> None:
-        operations = self._ops(ancestors=())  # no ancestry -> not integrated
-        report = _use_case(operations, processes=FakeProcessOperations()).run_cleanup(self._record())
-        self.assertEqual(operations.performed, ["remove_worktree"])
-        self.assertEqual(report.final_decision.state, STATE_CLEANUP_BLOCKED)
+    def test_the_run_asks_for_no_ref_delete_however_it_ends(self) -> None:
+        # R7 review j#96396 finding 1 and 2: the actuator used to call a branch delete here and
+        # record it as a compare-and-swap that the argv was not. Whatever the world looks like,
+        # the only mutation this half can ask for is the worktree removal.
+        for kwargs in ({}, {"lane_clean": False}, {"ancestors": ()}, {"worktree_removed": False}):
+            operations = self._ops(**kwargs)
+            report = _use_case(
+                operations, processes=FakeProcessOperations()
+            ).run_cleanup(self._record())
+            self.assertNotIn("delete_local_branch", operations.performed, kwargs)
+            self.assertTrue(
+                set(operations.performed) <= {"remove_worktree"}, operations.performed
+            )
+            for outcome in report.outcomes:
+                self.assertNotIn("branch -D", outcome.detail)
+                self.assertNotIn("compare-and-swap", outcome.detail)
 
     def test_no_authority_reader_means_the_cleanup_is_refused(self) -> None:
         operations = self._ops()
@@ -877,15 +854,40 @@ class R3ReviewFinding2Test(unittest.TestCase):
             )
             self.assertNotIn("target_ref", parameters, name)
 
-    def test_no_configured_target_means_reachability_is_never_established(self) -> None:
+    def test_an_unconfirmed_integration_is_what_stops_the_removal(self) -> None:
+        # R4 finding 2 pinned this through branch REACHABILITY: with no configured integration
+        # branch the delete could not establish that the lane's work survived, so it blocked.
+        # The delete is gone (j#96396 finding 1) and reachability went with it — it was that
+        # step's condition, and a removed worktree loses nothing while the ref still holds the
+        # commits. What gates the removal is the durable authority, so that is pinned directly
+        # here rather than left implied by the retired probe.
         operations = self._ops()
         report = _use_case(
             operations,
             processes=FakeProcessOperations(),
+            authority=FakeAuthorityReader(
+                cleanup=CleanupAuthority(
+                    issue_closed=True,
+                    integration_confirmed=False,
+                    integration_ci_settled_green=True,
+                    callbacks_drained=True,
+                    owner_gates_resolved=True,
+                )
+            ),
+        ).run_cleanup(self._record())
+        self.assertEqual(operations.performed, [])
+        self.assertEqual(report.final_decision.state, STATE_CLEANUP_BLOCKED)
+
+        # And an actuator with no configured integration branch no longer measures anything
+        # about the lane's ref: nothing in the cleanup half reads one.
+        unconfigured = self._ops()
+        rested = _use_case(
+            unconfigured,
+            processes=FakeProcessOperations(),
             integration_policy=AutoIntegrationPolicy(mode=MODE_AUTO, integration_branch=None),
         ).run_cleanup(self._record())
-        self.assertEqual(operations.performed, ["remove_worktree"])
-        self.assertEqual(report.final_decision.state, STATE_CLEANUP_BLOCKED)
+        self.assertEqual(unconfigured.performed, ["remove_worktree"])
+        self.assertEqual(rested.final_decision.state, STATE_RETIRED)
 
     def test_a_worktree_holding_a_foreign_branch_is_never_cleaned_up(self) -> None:
         # R4 finding 2's second reproduction: the probe reported `checked_out_branch` and the
