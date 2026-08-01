@@ -9,6 +9,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.af_unix_endpoint_budget import (  # noqa: E501
+    disposable_instance_root,
+    endpoint_path_budget_for_isolated_home,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.disposable_herdr_instance import (  # noqa: E501
     WITHHOLD_WORKERS_NOT_CONTAINED,
     WITHHOLD_WORKERS_UNVERIFIED,
@@ -427,6 +431,11 @@ def run_disposable_shared_space_smoke(
     # Before the binary, the server, the isolated home — before anything exists that
     # would have to be cleaned up if this turned out to be unusable (review j#91604 F2).
     bounded_timeout = bounded_process_timeout(process_timeout)
+    # Same reason as the timeout, one derivation earlier (#14657): an endpoint path this
+    # host cannot bind must be a typed blocker while nothing exists yet — not a readiness
+    # timeout observed after a server child failed to bind into ``DEVNULL``.  The
+    # lifecycle repeats the check as its own last line of defence before ``Popen``.
+    endpoint_path_budget_for_isolated_home(isolated_home).raise_if_blocked()
     try:
         resolution = resolve_herdr_binary(env)
     except Exception as exc:
@@ -441,7 +450,9 @@ def run_disposable_shared_space_smoke(
         kwargs["popen_factory"] = popen_factory
     instance = DisposableHerdrInstance(
         binary=resolution.path,
-        root=Path(isolated_home).expanduser().resolve() / "herdr-instance",
+        # The one derivation, shared with the preflight above so the path that was
+        # measured is the path that gets bound (#14657).
+        root=disposable_instance_root(isolated_home),
         base_env=env,
         **kwargs,
     )

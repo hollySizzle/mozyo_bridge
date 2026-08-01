@@ -2087,12 +2087,14 @@ file_conventions:
   - id: fc-disposable-herdr-lifecycle
     name: disposable Herdr instance lifecycle and shared-space live smoke actuation
     patterns:
+      - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/af_unix_endpoint_budget.py
       - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/disposable_herdr_instance.py
       - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/disposable_endpoint_gate_evidence.py
       - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/disposable_shared_space_smoke.py
       - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/shared_space_smoke_harness.py
       - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/shared_space_smoke_observation.py
       - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/shared_space_smoke_cli.py
+      - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_af_unix_endpoint_budget.py
       - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_disposable_herdr_instance.py
       - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_shared_space_smoke_cli.py
       - tests/integration/e_140_adapter_provider/f_130_terminal_runtime_provider/test_disposable_shared_space_smoke.py

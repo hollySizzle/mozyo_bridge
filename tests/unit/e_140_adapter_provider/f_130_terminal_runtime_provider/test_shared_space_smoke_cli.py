@@ -34,6 +34,14 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.disposable_shared_space_smoke import (  # noqa: E402,E501
     bounded_process_timeout,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E402,E501
+    af_unix_endpoint_budget as budget_module,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.af_unix_endpoint_budget import (  # noqa: E402,E501
+    BUDGET_UNMEASURED,
+    ENDPOINT_PATH_BUDGET_UNMEASURED,
+    ENDPOINT_PATH_TOO_LONG,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.shared_space_smoke_observation import (  # noqa: E402,E501
     PHASE_WORKER_ERROR,
     SharedSpaceSmokeError,
@@ -97,6 +105,24 @@ def _report(*, success: bool) -> dict:
         "owned_root_present": not success,
         "owned_root_released": success,
         "root_withhold_reason": "" if success else "workers_not_contained",
+        # Reported on both branches: it is what separates "this host cannot bind the
+        # derived endpoint path" from "the server was slow" (#14657).
+        "endpoint_path_bytes": 74,
+        "endpoint_path_budget_bytes": 103,
+        "endpoint_path_within_budget": True,
+        "endpoint_path_blocker": "",
+    }
+
+
+def _preflight_report() -> dict:
+    """The read-only branch's report, before the CLI merges the endpoint-path facts."""
+    return {
+        "isolated_home_ok": True,
+        "clean_slate_ok": True,
+        "mode": "shared_space",
+        "projects": 2,
+        "coordinators_create_expected": 1,
+        "actuated": False,
     }
 
 
@@ -262,25 +288,147 @@ class ProcessTimeoutDomainTests(unittest.TestCase):
 class PreflightBranchTests(unittest.TestCase):
     def test_read_only_preflight_is_unchanged_and_never_dies(self) -> None:
         """Without ``--execute`` there is no success key to fail on."""
-        preflight = {
-            "isolated_home_ok": True,
-            "clean_slate_ok": True,
-            "mode": "shared_space",
-            "projects": 2,
-            "coordinators_create_expected": 1,
-            "actuated": False,
-        }
         args = Namespace(
             isolated_home="/tmp/iso", projects=2, execute=False,
             process_timeout=1.0, json=True,
         )
         out = io.StringIO()
         with mock.patch.object(
-            cli, "smoke_shared_space_preflight", lambda *a, **k: dict(preflight)
+            cli, "smoke_shared_space_preflight", lambda *a, **k: _preflight_report()
         ):
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(cli.cmd_herdr_smoke_shared_space(args), 0)
-        self.assertFalse(json.loads(out.getvalue())["actuated"])
+        payload = json.loads(out.getvalue())
+        self.assertFalse(payload["actuated"])
+        # The read-only branch carries the endpoint-path facts too, so an operator can
+        # read the constraint without actuating anything (#14657).
+        self.assertTrue(payload["endpoint_path_within_budget"])
+        self.assertEqual(payload["endpoint_path_blocker"], "")
+        self.assertGreater(payload["endpoint_path_budget_bytes"], 0)
+
+
+class EndpointPathPreflightTests(unittest.TestCase):
+    """The endpoint-path blocker is rendered as evidence, then signalled by exit code.
+
+    Incident #14185 j#91992 surfaced an over-long derived socket path as a generic
+    readiness timeout.  The CLI has to name it instead — and, per the disposable-smoke
+    contract that a failing branch still prints its evidence
+    (``vibes/docs/specs/herdr-native-identity.md`` §5.1), it prints before it dies.
+    """
+
+    def _run(self, *, budget: int, json_mode: bool, execute: bool) -> _CliRun:
+        args = Namespace(
+            isolated_home="/tmp/iso-endpoint-path",
+            projects=2,
+            execute=execute,
+            process_timeout=1.0,
+            json=json_mode,
+        )
+        actuations: list = []
+        out, err = io.StringIO(), io.StringIO()
+        exit_code = 0
+        with mock.patch.object(
+            budget_module, "host_af_unix_path_budget", lambda: budget
+        ):
+            with mock.patch.object(
+                cli,
+                "run_disposable_shared_space_smoke",
+                lambda *a, **k: actuations.append("execute") or _report(success=True),
+            ):
+                with mock.patch.object(
+                    cli,
+                    "smoke_shared_space_preflight",
+                    lambda *a, **k: actuations.append("preflight")
+                    or _preflight_report(),
+                ):
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        try:
+                            cli.cmd_herdr_smoke_shared_space(args)
+                        except SystemExit as exc:
+                            exit_code = exc.code
+        run = _CliRun(exit_code, out.getvalue(), err.getvalue())
+        run.actuations = actuations  # type: ignore[attr-defined]
+        return run
+
+    def test_an_over_budget_path_prints_evidence_then_fails_with_zero_actuation(self) -> None:
+        for execute in (True, False):
+            with self.subTest(execute=execute):
+                run = self._run(budget=8, json_mode=True, execute=execute)
+
+                self.assertEqual(run.exit_code, 2)
+                self.assertNotEqual(
+                    run.stdout, "", "the blocked branch printed no evidence"
+                )
+                payload = run.json
+                self.assertFalse(payload["endpoint_path_within_budget"])
+                self.assertEqual(payload["endpoint_path_blocker"], ENDPOINT_PATH_TOO_LONG)
+                self.assertEqual(payload["endpoint_path_budget_bytes"], 8)
+                self.assertGreater(payload["endpoint_path_bytes"], 8)
+                self.assertFalse(payload["actuated"])
+                self.assertIn("herdr smoke-shared-space failed", run.stderr)
+                self.assertIn(ENDPOINT_PATH_TOO_LONG, run.stderr)
+                self.assertIn("--isolated-home", run.stderr, "resolution must be named")
+                self.assertEqual(
+                    run.actuations,  # type: ignore[attr-defined]
+                    [],
+                    "neither the driver nor the read-only preflight may run",
+                )
+
+    def test_an_unmeasured_budget_is_its_own_named_blocker(self) -> None:
+        run = self._run(budget=BUDGET_UNMEASURED, json_mode=True, execute=True)
+        self.assertEqual(run.exit_code, 2)
+        self.assertEqual(
+            run.json["endpoint_path_blocker"], ENDPOINT_PATH_BUDGET_UNMEASURED
+        )
+        self.assertEqual(run.actuations, [])  # type: ignore[attr-defined]
+
+    def test_text_mode_names_the_blocker_and_the_resolution_without_a_path(self) -> None:
+        run = self._run(budget=8, json_mode=False, execute=True)
+        self.assertEqual(run.exit_code, 2)
+        self.assertIn("endpoint_path_within_budget=False", run.stdout)
+        self.assertIn(f"endpoint_path_blocker={ENDPOINT_PATH_TOO_LONG}", run.stdout)
+        self.assertIn("endpoint_path_budget_bytes=8", run.stdout)
+        self.assertIn("--isolated-home", run.stdout)
+        for stream in (run.stdout, run.stderr):
+            self.assertNotIn("/tmp/iso-endpoint-path", stream)
+            self.assertNotIn("herdr-instance", stream)
+
+    def test_a_bindable_path_leaves_both_branches_running_and_exiting_zero(self) -> None:
+        """Baseline: the preflight must not refuse the paths the smoke actually uses."""
+        for execute, expected in ((True, "execute"), (False, "preflight")):
+            with self.subTest(execute=execute):
+                run = self._run(budget=4096, json_mode=True, execute=execute)
+                self.assertEqual(run.exit_code, 0)
+                self.assertEqual(
+                    run.actuations, [expected]  # type: ignore[attr-defined]
+                )
+                self.assertTrue(run.json["endpoint_path_within_budget"])
+
+    def test_text_mode_reports_the_budget_on_the_running_branches_too(self) -> None:
+        for execute in (True, False):
+            with self.subTest(execute=execute):
+                run = self._run(budget=4096, json_mode=False, execute=execute)
+                self.assertEqual(run.exit_code, 0)
+                self.assertIn("endpoint_path_within_budget=True", run.stdout)
+                self.assertIn("endpoint_path_blocker=none", run.stdout)
+
+    def test_help_names_the_constraint_and_the_reported_counts(self) -> None:
+        parser = argparse.ArgumentParser(prog="mozyo-bridge")
+        cli.register_herdr_smoke_shared_space_parser(parser.add_subparsers())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["smoke-shared-space", "--help"])
+        text = out.getvalue()
+        # Single tokens, so argparse's line wrapping cannot break the assertion.
+        for token in (
+            "--isolated-home",
+            "AF_UNIX",
+            "endpoint_path_bytes",
+            "endpoint_path_budget_bytes",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, text)
 
 
 if __name__ == "__main__":

@@ -77,6 +77,18 @@ per-process snapshot a worker returns; :class:`EndpointGateEvidence` aggregates 
 parent's snapshot with one per worker and is **fail-closed on absence**: a missing or
 internally inconsistent worker snapshot is never counted as a zero.
 
+Endpoint-path budget before the child exists (Redmine #14657)
+-------------------------------------------------------------
+The owned endpoint is a *derived* path, so it can be longer than the host's
+``sockaddr_un.sun_path`` capacity.  When that happened (#14185 R3 live smoke j#91992,
+socket 216 bytes) the failure landed in the one place nobody reads: the server child
+binds with ``stderr=DEVNULL``, so its ``OSError: AF_UNIX path too long`` was invisible
+and the readiness loop below simply timed out.  ``start`` therefore consults
+:mod:`af_unix_endpoint_budget` — a measured host budget, not a per-platform length
+table — **before** the tree, the config file or ``Popen``, and refuses with a typed
+blocker at zero actuation.  The verdict is also reported in evidence on every branch,
+so a report can distinguish "the path cannot be bound here" from "herdr was slow".
+
 It deliberately does not expose raw ``herdr server`` choreography to callers.  The
 CLI composes this object and reports only closed booleans/counts; socket paths,
 config paths, subprocess output, and environment values never enter evidence.
@@ -93,6 +105,13 @@ from dataclasses import InitVar, dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Protocol, Sequence
 
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.af_unix_endpoint_budget import (  # noqa: E501
+    CLIENT_SOCKET_NAME,
+    SERVER_SOCKET_NAME,
+    EndpointPathBudget,
+    derived_endpoint_paths,
+    evaluate_endpoint_paths,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.disposable_endpoint_gate_evidence import (  # noqa: E501
     EndpointGateCounters,
     EndpointGateEvidence,
@@ -468,6 +487,7 @@ class DisposableHerdrInstance:
         shutdown_timeout: float = 10.0,
         sleeper: Callable[[float], None] = time.sleep,
         ambient_env: Optional[Mapping[str, str]] = None,
+        endpoint_path_budget_bytes: Optional[int] = None,
     ) -> None:
         self.binary = binary
         self.root = Path(root).expanduser().resolve()
@@ -479,9 +499,18 @@ class DisposableHerdrInstance:
         self._sleep = sleeper
         self.binding = DisposableHerdrBinding(
             root=self.root,
-            socket_path=self.root / "herdr.sock",
-            client_socket_path=self.root / "herdr-client.sock",
+            socket_path=self.root / SERVER_SOCKET_NAME,
+            client_socket_path=self.root / CLIENT_SOCKET_NAME,
             config_path=self.root / "config.toml",
+        )
+        #: Whether THIS host can bind the endpoint paths this root implies (#14657).
+        #: Purely derived — nothing is created or launched to answer it — so the fact
+        #: exists before ``start`` and can be reported on every evidence branch.
+        #: ``endpoint_path_budget_bytes`` pins the budget for a boundary test; by default
+        #: it is measured from the runtime that performs the bind.
+        self.endpoint_path_budget: EndpointPathBudget = evaluate_endpoint_paths(
+            derived_endpoint_paths(self.root),
+            budget_bytes=endpoint_path_budget_bytes,
         )
         self._process: Optional[OwnedServerProcess] = None
         self._capability: Optional[OwnedEndpointCapability] = None
@@ -637,6 +666,12 @@ class DisposableHerdrInstance:
     def start(self) -> None:
         if self._process is not None:
             raise SharedSpaceSmokeError("disposable Herdr instance already started")
+        # Before the tree, the config file and the child: an endpoint path this host
+        # cannot bind is a typed blocker, not a readiness timeout.  The server child
+        # binds with ``stderr=DEVNULL``, so its own ``AF_UNIX path too long`` was
+        # unreadable and got folded into the bounded startup window below — the operator
+        # could not tell an over-long path from a slow server (#14185 j#91992, #14657).
+        self.endpoint_path_budget.raise_if_blocked()
         if self.root.exists() and any(self.root.iterdir()):
             raise SharedSpaceSmokeError(
                 "disposable Herdr instance root is not empty; refuse to adopt or "
@@ -859,6 +894,9 @@ class DisposableHerdrInstance:
         return {
             "server_started": self.started,
             "server_ready": self.ready,
+            # Reported on every branch, converged or not: it is what separates "this
+            # host cannot bind the derived endpoint path" from a readiness timeout.
+            **self.endpoint_path_budget.as_evidence(),
             **scope.as_evidence(),
             "graceful_stop_refused": self.graceful_stop_refused,
             "server_stopped": self.stopped,

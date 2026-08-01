@@ -1217,6 +1217,35 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
   「request 0 の process」として数えず、`endpoint_gate_receipts_complete` /
   `endpoint_gate_receipts_consistent` が false なら `endpoint_gate_proven_zero_external` は false、
   run は success にならない。observe できなかったことを「0 だった」と述べない。
+- **derived endpoint path の host 制約は actuation 前に検証する** (Redmine #14657、incident #14185 j#91992)。
+  disposable endpoint は `--isolated-home` から**導出される** path なので、host の
+  `sockaddr_un.sun_path` 容量を超えうる。超えた場合 bind は **server child 側**で失敗し、child は
+  `stderr=DEVNULL` で起動されているため `OSError: AF_UNIX path too long` は誰にも読まれず、
+  汎用の ready timeout (`did not become ready within the bounded startup window`) に畳まれる
+  (実測: socket 216 byte で FAIL / 61 byte で PASS)。fail-closed・cleanup・operator endpoint 非接触は
+  維持されていたので、欠陥は **diagnostic** に限る: operator が「path が bind 不能」と「server が遅い」を
+  識別できない。
+  - **判定は固定長の推測表ではなく、bind を行う runtime の実測で行う**。`sun_path` は macOS 104 /
+    Linux 108 で、NUL 分の 1 byte をどう数えるかも CPython / Rust / libc で揃わない。repo 側の
+    platform 定数表は**他者の契約についての推測**であり、最初に食い違った host で incident と
+    同じ形で落ちる。よって scratch directory 内で **実際に bind できる最長 total path を二分探索で
+    measure** し (`probe_af_unix_path_budget`)、host 事実として process 内で memoise する。
+  - **over-budget の判定は message ではなく runtime の error 契約から読む**。CPython の事前 check は
+    **errno を持たない** 素の `OSError` を投げ、kernel 側の拒否は `ENAMETOOLONG` で来る。それ以外の
+    `OSError` は長さの答えではないので、`endpoint_path_budget_unmeasured` として **数値に畳まない**。
+  - **「測れない」と「収まらない」は別 closed token** (`endpoint_path_budget_unmeasured` /
+    `endpoint_path_too_long`)。畳むと、答えられなかった probe が黙って permissive 側に化ける。
+    どちらも fail-closed で zero-actuation。
+  - **fence は `Popen` より前**。後ろに置くと観測できるのは再び timeout だけである。driver は
+    binary 解決・isolated home 確立より前に、lifecycle は tree / `config.toml` 作成より前に refuse する。
+  - **measure する path と bind される path は同一導出から取る**。endpoint file 名と instance root 名は
+    一箇所 (`af_unix_endpoint_budget`) で宣言し、`DisposableHerdrBinding` が同じ定数を使う。
+    導出を再実装すると、測った path と bind される path が乖離する。**client socket 名の方が長い**ので
+    判定は derive された全 endpoint path の**最長**を取る。
+  - **evidence / help は制約と解決策を値非表示で示す**。`endpoint_path_bytes` /
+    `endpoint_path_budget_bytes` / `endpoint_path_within_budget` / `endpoint_path_blocker` は
+    byte count・bool・closed token であり、path は出さない。CLI は refusal 分岐でも report を
+    render してから exit code で失敗を伝える (下記「失敗分岐でも evidence を出す」と同じ規律)。
 - **失敗分岐でも evidence を出す** (review j#85841 F3)。`--execute` が収束しなかった run こそ
   failure phase / residue / 負証明が必要になる。CLI は success/failure どちらでも report を
   render してから **exit code で失敗を伝える**。JSON mode は同一 key 集合の redacted evidence を

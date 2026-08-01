@@ -50,6 +50,15 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     OwnedEndpointCapability,
     SmokeEndpointEscapeError,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.af_unix_endpoint_budget import (  # noqa: E402,E501
+    BUDGET_UNMEASURED,
+    CLIENT_SOCKET_NAME,
+    ENDPOINT_PATH_BUDGET_UNMEASURED,
+    ENDPOINT_PATH_TOO_LONG,
+    SmokeEndpointPathBudgetError,
+    host_af_unix_path_budget,
+    path_bytes,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.shared_space_smoke_observation import (  # noqa: E402,E501
     SharedSpaceSmokeError,
 )
@@ -681,6 +690,128 @@ class RootReleaseContainmentTests(unittest.TestCase):
                 "a pre-process startup failure must not leave the owned tree behind",
             )
             self.assertTrue(instance.as_evidence()["owned_root_released"])
+
+
+class EndpointPathBudgetFenceTests(unittest.TestCase):
+    """An unbindable endpoint path is a typed blocker, not a readiness timeout (#14657).
+
+    Incident #14185 j#91992: the derived socket path was 216 bytes, the server child's
+    own ``bind()`` failed into ``stderr=DEVNULL``, and the run surfaced the generic
+    "did not become ready within the bounded startup window".  The fence therefore has
+    to fire *before* ``Popen`` — after it, the only observable is the timeout again.
+    """
+
+    def _instance(
+        self, root: Path, *, popen_calls: list, run_calls: list, **kwargs
+    ) -> DisposableHerdrInstance:
+        return DisposableHerdrInstance(
+            binary="/bin/true",
+            root=root,
+            base_env={"HOME": str(root.parent / "operator")},
+            runner=lambda argv, **k: run_calls.append(list(argv))
+            or subprocess.CompletedProcess(argv, 0, "[]", ""),
+            popen_factory=lambda argv, **k: popen_calls.append(list(argv))
+            or _Process(),
+            sleeper=lambda _s: None,
+            ambient_env={},
+            **kwargs,
+        )
+
+    def test_an_over_budget_endpoint_path_refuses_at_zero_actuation(self) -> None:
+        popen_calls: list = []
+        run_calls: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self._instance(
+                Path(tmp) / "instance",
+                popen_calls=popen_calls,
+                run_calls=run_calls,
+                endpoint_path_budget_bytes=8,
+            )
+            with self.assertRaises(SmokeEndpointPathBudgetError) as caught:
+                instance.start()
+
+            self.assertEqual(caught.exception.blocker, ENDPOINT_PATH_TOO_LONG)
+            self.assertEqual(popen_calls, [], "no server child may be launched")
+            self.assertEqual(run_calls, [], "no herdr request may be dispatched")
+            self.assertFalse(instance.started)
+            self.assertFalse(instance.ready)
+            self.assertFalse(
+                instance.root.exists(), "not even the owned tree may be created"
+            )
+            evidence = instance.as_evidence()
+            self.assertFalse(evidence["endpoint_path_within_budget"])
+            self.assertEqual(evidence["endpoint_path_blocker"], ENDPOINT_PATH_TOO_LONG)
+            self.assertEqual(evidence["endpoint_path_budget_bytes"], 8)
+            self.assertGreater(evidence["endpoint_path_bytes"], 8)
+            self.assertNotIn(tmp, repr(evidence))
+
+            # Cleanup regression: a refused start leaves nothing for shutdown to remove,
+            # and shutdown stays idempotent rather than raising on a tree that never was.
+            instance.shutdown()
+            self.assertFalse(instance.root.exists())
+            self.assertTrue(instance.as_evidence()["owned_root_released"])
+
+    def test_an_unmeasured_budget_is_refused_too(self) -> None:
+        """"Cannot tell" must not be the permissive answer."""
+        popen_calls: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self._instance(
+                Path(tmp) / "instance",
+                popen_calls=popen_calls,
+                run_calls=[],
+                endpoint_path_budget_bytes=BUDGET_UNMEASURED,
+            )
+            with self.assertRaises(SmokeEndpointPathBudgetError) as caught:
+                instance.start()
+            self.assertEqual(
+                caught.exception.blocker, ENDPOINT_PATH_BUDGET_UNMEASURED
+            )
+            self.assertEqual(popen_calls, [])
+            self.assertFalse(instance.root.exists())
+
+    def test_the_incident_shape_is_refused_by_the_measured_budget(self) -> None:
+        """No injection: a really over-long root is refused by the host's own figure."""
+        popen_calls: list = []
+        budget = host_af_unix_path_budget()
+        self.assertGreater(budget, 0, "premise: this host can bind AF_UNIX at all")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            while path_bytes(root / CLIENT_SOCKET_NAME) <= budget:
+                root = root / ("d" * 32)
+            root.mkdir(parents=True)
+            instance = self._instance(root, popen_calls=popen_calls, run_calls=[])
+            with self.assertRaises(SmokeEndpointPathBudgetError):
+                instance.start()
+            self.assertEqual(popen_calls, [], "the incident's Popen must not happen")
+
+    def test_a_bindable_endpoint_path_still_starts_and_cleans_up(self) -> None:
+        """Baseline: the fence must not turn into a blanket refusal.
+
+        Paired with the refusal above so neither can pass vacuously — this one runs on
+        the host's *measured* budget, with no injected number at all.
+        """
+        popen_calls: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self._instance(
+                Path(tmp) / "instance", popen_calls=popen_calls, run_calls=[]
+            )
+            self.assertEqual(
+                instance.endpoint_path_budget.budget_bytes,
+                host_af_unix_path_budget(),
+                "the default budget is measured, not a per-platform constant",
+            )
+            instance.start()
+            self.assertTrue(instance.started)
+            self.assertTrue(instance.ready)
+            self.assertEqual(len(popen_calls), 1)
+            evidence = instance.as_evidence()
+            self.assertTrue(evidence["endpoint_path_within_budget"])
+            self.assertEqual(evidence["endpoint_path_blocker"], "")
+            self.assertLessEqual(
+                evidence["endpoint_path_bytes"], evidence["endpoint_path_budget_bytes"]
+            )
+            instance.shutdown()
+            self.assertFalse(instance.root.exists())
 
 
 class RootObservationTriStateTests(unittest.TestCase):

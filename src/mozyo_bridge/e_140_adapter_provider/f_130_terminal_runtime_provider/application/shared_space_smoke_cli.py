@@ -11,6 +11,14 @@ Without ``--execute`` it preserves the original read-only preflight.  With
 processes into the production shared-space start path, closes the exact launched pane
 locators, proves residue zero, and shuts the server down.  No raw server/socket command
 is exposed to the operator and the report contains counts/bools/closed tokens only.
+
+Both modes answer one question before either branch runs (Redmine #14657): can this host
+bind the AF_UNIX endpoint path that ``--isolated-home`` implies?  It is derived, so it
+can exceed ``sun_path``, and when that happened the server child's own ``bind()`` failed
+into ``DEVNULL`` and the run reported a generic readiness timeout (#14185 j#91992).  The
+check is purely derived — nothing is created, resolved or launched to answer it — and a
+blocked path renders its evidence and then fails through the exit code, exactly as a
+non-converged ``--execute`` run does.
 """
 
 from __future__ import annotations
@@ -21,6 +29,11 @@ import os
 import subprocess
 from pathlib import Path
 
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.af_unix_endpoint_budget import (  # noqa: E501
+    ENDPOINT_PATH_RESOLUTION,
+    endpoint_path_budget_for_isolated_home,
+    endpoint_path_refusal,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
     HerdrSessionStartError,
 )
@@ -67,7 +80,38 @@ def _failure_phases(report: dict) -> str:
     return ",".join(sorted(set(phases))) if phases else "none"
 
 
+def _emit(report: dict, *, json_mode: bool) -> None:
+    """Print the redacted report, in the caller's chosen shape."""
+    if json_mode:
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+    else:
+        print(_render_text(report))
+
+
+def _endpoint_path_line(report: dict) -> str:
+    """The endpoint-path budget facts, in closed tokens and byte counts only (#14657).
+
+    Present on every branch, because "the derived endpoint path does not fit this host"
+    used to be indistinguishable from "the server was slow to become ready".
+    """
+    return (
+        f"endpoint_path_within_budget={report['endpoint_path_within_budget']} "
+        f"endpoint_path_blocker={report['endpoint_path_blocker'] or 'none'} "
+        f"endpoint_path_bytes={report['endpoint_path_bytes']} "
+        f"endpoint_path_budget_bytes={report['endpoint_path_budget_bytes']}"
+    )
+
+
 def _render_text(report: dict) -> str:
+    if not report.get("endpoint_path_within_budget", True):
+        # The refusal branch renders evidence too (spec `herdr-native-identity.md`
+        # §5.1 「失敗分岐でも evidence を出す」): the measured budget and the derived
+        # length are exactly what the operator needs to shorten the base.
+        return (
+            "herdr smoke-shared-space endpoint-path preflight: "
+            f"{_endpoint_path_line(report)} actuated={report['actuated']}\n"
+            f"  {ENDPOINT_PATH_RESOLUTION}"
+        )
     if report.get("actuated"):
         return (
             "herdr smoke-shared-space: "
@@ -88,7 +132,8 @@ def _render_text(report: dict) -> str:
             "endpoint_gate_receipts_complete="
             f"{report['endpoint_gate_receipts_complete']} "
             "endpoint_gate_proven_zero_external="
-            f"{report['endpoint_gate_proven_zero_external']}"
+            f"{report['endpoint_gate_proven_zero_external']} "
+            f"{_endpoint_path_line(report)}"
         )
     return (
         "herdr smoke-shared-space preflight: "
@@ -96,7 +141,8 @@ def _render_text(report: dict) -> str:
         f"clean_slate_ok={report['clean_slate_ok']} mode={report['mode']} "
         f"projects={report['projects']} "
         f"coordinators_create_expected={report['coordinators_create_expected']} "
-        f"actuated={report['actuated']}\n"
+        f"actuated={report['actuated']} "
+        f"{_endpoint_path_line(report)}\n"
         "  ready: the isolated home is distinct and the herdr instance has no "
         "pre-existing coordinators space; the live shared-space smoke (Redmine "
         "#14185) may run here."
@@ -114,6 +160,16 @@ def cmd_herdr_smoke_shared_space(args: argparse.Namespace) -> int:
         )
         raise AssertionError("unreachable")
     projects = getattr(args, "projects", None) or 2
+    json_mode = bool(getattr(args, "json", False))
+    # Zero actuation: purely derived from ``--isolated-home``, so it is answered before
+    # the isolated home is established, before the herdr binary is resolved and before
+    # any server exists (#14657).  Evidence is rendered first and the refusal is signalled
+    # by the exit code, exactly as the failing --execute branch does.
+    endpoint_path = endpoint_path_budget_for_isolated_home(Path(isolated_home))
+    if not endpoint_path.within_budget:
+        _emit({"actuated": False, **endpoint_path.as_evidence()}, json_mode=json_mode)
+        die(f"herdr smoke-shared-space failed: {endpoint_path_refusal(endpoint_path)}")
+        raise AssertionError("unreachable")
     try:
         if getattr(args, "execute", False):
             report = run_disposable_shared_space_smoke(
@@ -133,6 +189,10 @@ def cmd_herdr_smoke_shared_space(args: argparse.Namespace) -> int:
                 env=os.environ,
                 projects=projects,
             )
+            # The read-only branch runs no disposable instance, so the endpoint-path
+            # facts come from the same evaluation the refusal above used.  The
+            # --execute branch gets them from the lifecycle that enforced them.
+            report.update(endpoint_path.as_evidence())
     except (SmokeIsolationError, SharedSpaceSmokeError, HerdrSessionStartError) as exc:
         # Literal, typed, fail-closed: isolation not provable, a coordinators space
         # already exists / labels unreadable, or the herdr binary is unresolvable.
@@ -142,10 +202,7 @@ def cmd_herdr_smoke_shared_space(args: argparse.Namespace) -> int:
     # exactly when the failure phase, the residue counts and the endpoint-gate
     # negative proof matter, so the report is rendered on both branches and the
     # failure is signalled by the exit code — never by withholding the evidence.
-    if getattr(args, "json", False):
-        print(json.dumps(report, ensure_ascii=False, sort_keys=True))
-    else:
-        print(_render_text(report))
+    _emit(report, json_mode=json_mode)
     if getattr(args, "execute", False) and not report.get("success", False):
         die(
             "herdr smoke-shared-space failed: disposable cross-process smoke did not "
@@ -169,7 +226,13 @@ def register_herdr_smoke_shared_space_parser(sub) -> None:
             "runs the clean-slate gate. `--execute` additionally owns an endpoint-bound "
             "disposable Herdr server, starts two OS processes through the production "
             "shared-space path, performs exact-locator cleanup and residue verification, "
-            "then shuts the server down. The operator's normal server is never contacted."
+            "then shuts the server down. The operator's normal server is never contacted. "
+            "Both modes first check the AF_UNIX endpoint-path budget: the disposable "
+            "endpoint path is derived from --isolated-home, and a path longer than the "
+            "budget this host actually accepts is refused as a typed blocker before "
+            "anything is created — it is not a readiness timeout. The reported "
+            "endpoint_path_bytes / endpoint_path_budget_bytes are byte counts; no path "
+            "is printed."
         ),
     )
     parser.add_argument(
@@ -177,7 +240,9 @@ def register_herdr_smoke_shared_space_parser(sub) -> None:
         required=True,
         help=(
             "a fresh directory to use as the isolated operator home — must be distinct "
-            "from (and not nested with) the real operator home"
+            "from (and not nested with) the real operator home, and short enough that "
+            "the endpoint path derived from it fits this host's measured AF_UNIX "
+            f"endpoint-path byte budget ({ENDPOINT_PATH_RESOLUTION})"
         ),
     )
     parser.add_argument(
