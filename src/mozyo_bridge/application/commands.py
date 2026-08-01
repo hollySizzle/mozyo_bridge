@@ -1923,7 +1923,7 @@ def orchestrate_handoff(
     # provider's declared startup screens, and a trust / first-run / login screen refuses
     # the send with ZERO bytes typed. The gate body lives in the f_130 seam (module-health;
     # and it keeps every provider-specific string in profile DATA, out of this module).
-    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.startup_admission_gate import (
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.startup_admission_composition import (
         admit_receiver_startup_or_die,
     )
 

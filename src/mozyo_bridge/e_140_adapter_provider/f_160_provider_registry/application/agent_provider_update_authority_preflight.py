@@ -53,6 +53,7 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_pr
     AgentProviderProfileRegistry,
 )
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_update_authority import (  # noqa: E501
+    AUTHORITY_NOT_EVALUATED,
     AUTHORITY_UNKNOWN,
     BINDING_NOT_EVALUATED,
     UpdateAuthority,
@@ -92,7 +93,15 @@ def executable_identity(exec_target: str, version: str) -> str:
 def _probe_updater_targets(
     provider_id: str, probe: Optional[UpdaterTargetProbe]
 ) -> Tuple[Tuple[str, ...], bool]:
-    """Run ``probe`` fail-closed: any failure or malformed answer is "not resolved"."""
+    """Run ``probe`` fail-closed: any failure or malformed answer is "not resolved".
+
+    ``None`` is NOT a failure — it means the caller did not arm this gate, and it is
+    reported by :func:`evaluate_update_authority` as ``not_evaluated`` rather than
+    ``unknown`` (Design Answer D2 j#96288 item 1). R3 conflated the two, so every provider
+    without a built-in updater binding — Claude included — was promoted to ``unknown`` and
+    zero-actuation, and 29 unrelated send tests died. "Nobody asked" and "we asked and
+    could not tell" are different facts and now have different tokens.
+    """
     if probe is None:
         return ((), False)
     try:
@@ -138,6 +147,17 @@ def evaluate_update_authority(
     it exists to describe.
     """
     env = os.environ if env is None else env
+
+    if updater_targets is None:
+        # Unarmed: byte-invariant with every pre-#14741 call site (D2 item 1). The binding
+        # axis is still honoured, because a caller that pinned an identity DID arm that.
+        return UpdateAuthority(
+            provider=provider_id,
+            authority=AUTHORITY_NOT_EVALUATED,
+            binding=classify_executable_binding(
+                bound_identity=bound_identity, observed_identity=observed_identity
+            ),
+        )
 
     try:
         exec_target = resolve_agent_launch(provider_id, env, registry=registry).exec_target

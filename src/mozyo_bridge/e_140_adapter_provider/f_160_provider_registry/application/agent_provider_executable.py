@@ -260,18 +260,21 @@ def resolve_trusted_command(
 ) -> Optional[str]:
     """One bare command name resolved on the trusted ``PATH``, or ``None`` (fail-closed).
 
-    The same discipline :func:`resolve_agent_launch` applies to a provider binary, exposed
-    for the **update-manager adapter** (Redmine #14741 Design Answer j#96167 item 3): an
-    unsafe ``PATH`` (empty / relative component), no match, or MORE THAN ONE distinct
-    executable realpath all yield ``None``. First-match is not an ambiguity check, and an
-    ambiguous package manager is exactly the state in which "where would an update write?"
-    has no single answer.
+    The trusted-``PATH`` safety discipline :func:`resolve_agent_launch` applies to a
+    provider binary, exposed for the **update-manager adapter** (Redmine #14741 Design
+    Answers j#96167 item 3 and j#96288 item 4). An unsafe ``PATH`` (empty / relative
+    component) or no match yields ``None``. A *shadowed* second match does not: the
+    effective executable is the first one on the trusted ``PATH``, because that is the one
+    the updater's own shell lookup resolves, and the question being asked is "what would
+    the updater actually run?".
 
-    Deliberately NOT a revival of the deleted ``trusted_path_exec_targets``. That function
-    enumerated the *provider's own command* and was used as a stand-in for the updater's
-    write target — the j#95741 F2 proxy. This resolves a **different** executable (the
-    package manager) for a **different** purpose (to ask it, positively, where it writes),
-    and it returns one realpath rather than a candidate set to compare against.
+    Deliberately NOT a revival of the deleted ``trusted_path_exec_targets``, and the
+    difference is the whole reason first-match is acceptable here and forbidden there.
+    That function enumerated the *provider's own command* and used it as a stand-in for
+    the updater's write target — the j#95741 F2 proxy. This resolves a **different**
+    executable (the package manager) for a **different** purpose: to ask it, positively,
+    where it writes. Picking the effective manager is not picking which binary a managed
+    lane runs; the provider executable keeps its unambiguous-or-override rule untouched.
 
     Returns the symlink-resolved realpath, so what a caller runs is deterministic across
     cwd and symlinks. Never raises.
@@ -285,12 +288,19 @@ def resolve_trusted_command(
         directories = _trusted_path_dirs(env, provider_id=bare)
     except AgentProviderExecutableError:
         return None
-    found: list[str] = []
     for directory in directories:
         verified = _verify_trusted_executable(os.path.join(directory, bare))
-        if verified is not None and verified.exec_target not in found:
-            found.append(verified.exec_target)
-    return found[0] if len(found) == 1 else None
+        if verified is not None:
+            # Design Answer D2 (j#96288 item 4): the EFFECTIVE executable — the one the
+            # updater's own shell lookup would get — is the first match on the trusted
+            # PATH. A shadowed later `npm` is not ambiguity; it is simply not the one that
+            # would run, and treating its mere existence as undecidable took a workspace
+            # offline (j#96202). This applies ONLY to resolving the update manager we are
+            # about to *ask a question of*. The managed provider executable is unchanged:
+            # it still requires an unambiguous distinct-realpath resolution or an explicit
+            # override, and is never relaxed to first-match.
+            return verified.exec_target
+    return None
 
 
 def resolve_agent_executable(

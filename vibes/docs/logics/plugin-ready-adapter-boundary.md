@@ -1863,12 +1863,31 @@ Three contracts follow, and they are deliberately separate:
    `unknown`**. The send refusal is `receiver_update_authority_split`, zero-send and
    ledgered; the launch refusal raises before a workspace, tab, or agent exists.
 
-   The gate **defaults** to the built-in adapter rather than having `commands.py` thread a
-   probe in. That is deliberate: in the round before this one the parameter existed and the
-   production caller passed nothing, so the fence evaluated `unknown` with no probe and
-   admitted every send while looking wired. A default cannot be forgotten. (It also keeps
-   the largest module under the module-health gate unchanged, which is why the gate lives
-   in this file at all.)
+   **Scope: only providers with a trusted built-in updater binding** (Design Answer D2
+   j#96288 item 1). A provider without one is `not_evaluated` — this gate does not apply to
+   it — and is emphatically NOT promoted to `unknown`. The round before this one conflated
+   the two, armed every provider from an ambient default inside the generic gate, and
+   refused every Claude send on every host while making 29 unrelated tests read the live
+   host's `npm`. "Nobody asked" and "we asked and could not tell" are different facts.
+
+   The scope carve-out is confined to the *generic ready send*. An update screen actually
+   observed on the receiver is still refused by the #13760 blocker path whatever the
+   binding, and an update-caused exit / self-heal arms the fence explicitly (item 2): a
+   provider whose update state cannot be described must not be actuated on an
+   update-relevant path.
+
+   **Arming is a composition decision, never a gate default** (item 3). The generic gate
+   constructs no probe of its own; `startup_admission_composition` picks the typed resolver
+   for supported providers and `commands.py` takes that one neutral dependency, naming no
+   provider, manager, or query. (It also keeps the largest module under the module-health
+   gate byte-identical — the baseline is never self-approved to make room.)
+
+   **Which `npm` gets asked** (item 4): the *effective* one — the first match on the trusted
+   `PATH`, because that is what the updater's own shell lookup resolves. A shadowed second
+   install does not make the question undecidable; treating it that way took a workspace
+   offline. This is a rule for the manager being *interrogated* only. The managed provider
+   executable is untouched: it still requires an unambiguous distinct-realpath resolution or
+   an explicit override, and is never relaxed to first-match.
 
    **Where "where does the updater write?" is answered** (Design Consultation Answer
    j#96167, option D). Not in profile data — a read-only query is still an execution
@@ -1891,11 +1910,11 @@ Three contracts follow, and they are deliberately separate:
    not been measured; a guessed one would re-create this very defect, so they resolve to
    `unknown` rather than to an approximation.
 
-   **The operational cost is real and is not softened.** On a host where the adapter
-   cannot positively resolve — notably one carrying several `npm` installs on the trusted
-   `PATH` — every armed send and launch is refused until an operator makes the install
-   unambiguous. That is the ruled trade-off (Answer item 4 chose it over letting an
-   unresolved authority through), not an implementation accident.
+   **The operational cost is real and is not softened** — but it is now scoped. For a
+   provider WITH a binding, an authority that cannot be positively resolved refuses every
+   armed send and launch until an operator makes the install unambiguous. That is the ruled
+   trade-off, not an implementation accident. What it no longer does is extend that refusal
+   to providers this ticket never measured.
 
    The `startup_health` classifier gains `provider_update_authority_split`,
    `provider_executable_binding_drift`, and `provider_update_authority_unverified` in the

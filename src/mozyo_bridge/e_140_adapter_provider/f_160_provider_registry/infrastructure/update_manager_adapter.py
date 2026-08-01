@@ -195,6 +195,17 @@ def resolve_updater_target(
     )
 
 
+def is_supported_provider(provider_id: str) -> bool:
+    """True iff a trusted built-in updater binding exists for ``provider_id``.
+
+    The composition root asks this BEFORE arming the authority gate (Design Answer D2
+    j#96288 item 1): a provider with no binding is out of this ticket's scope for a
+    generic ready send and must stay ``not_evaluated``, not be promoted to ``unknown``.
+    R3 armed everything and refused every Claude send on every host.
+    """
+    return str(provider_id or "").strip() in _PROVIDER_UPDATE_BINDINGS
+
+
 def builtin_updater_target_probe(
     env: Optional[Mapping[str, str]] = None, *, runner: Optional[Runner] = None
 ) -> Callable[[str], Tuple[Sequence[str], bool]]:

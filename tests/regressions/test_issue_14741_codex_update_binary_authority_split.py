@@ -476,19 +476,24 @@ class UpdateAuthorityPreflightTest(unittest.TestCase):
     def _probe(self, *roots, resolved=True):
         return lambda provider_id: (list(roots), resolved)
 
-    def test_no_probe_is_unknown_never_aligned(self) -> None:
-        """The default. Nothing established where the updater writes, so nothing is claimed."""
+    def test_no_probe_is_not_evaluated_never_unknown(self) -> None:
+        """D2 item 1: an unarmed caller means the gate does not apply, not that it failed."""
         bindir = os.path.join(self.root, "os", "bin")
         pinned = _make_executable(bindir)
         env = {"PATH": bindir, "MOZYO_AGENT_FAKEX_BINARY": pinned}
         record = evaluate_update_authority("fakex", env, registry=self.registry)
-        self.assertEqual(record.authority, AUTHORITY_UNKNOWN)
-        self.assertEqual(record.updater_targets, 0)
-        self.assertFalse(
+        self.assertEqual(record.authority, AUTHORITY_NOT_EVALUATED)
+        self.assertTrue(
             record.admits_actuation,
-            "an unresolved authority is zero-actuation for send AND relaunch "
-            "(Answer j#96167 item 4); R2 admitted sends here and that is retracted",
+            "unarmed is byte-invariant with pre-#14741; promoting it to unknown is what "
+            "refused every Claude send on every host (j#96202)",
         )
+        # But an ARMED caller that cannot resolve is still zero-actuation.
+        armed = evaluate_update_authority(
+            "fakex", env, registry=self.registry, updater_targets=lambda pid: ((), False)
+        )
+        self.assertEqual(armed.authority, AUTHORITY_UNKNOWN)
+        self.assertFalse(armed.admits_actuation)
 
     def test_provider_command_on_path_is_no_longer_evidence_of_alignment(self) -> None:
         """The j#95741 F2 regression, stated as the property that was violated.
@@ -596,25 +601,39 @@ class UpdateAuthorityPreflightTest(unittest.TestCase):
         self.assertEqual(record.authority, AUTHORITY_ALIGNED)
 
     def test_unsafe_path_is_unknown_and_does_not_raise(self) -> None:
-        bindir = os.path.join(self.root, "os", "bin")
-        pinned = _make_executable(bindir)
-        env = {
-            "PATH": os.pathsep.join([bindir, "relative/dir"]),
-            "MOZYO_AGENT_FAKEX_BINARY": pinned,
-        }
-        record = evaluate_update_authority("fakex", env, registry=self.registry)
+        """An unsafe PATH breaks the provider resolution itself -> unknown, never a raise.
+
+        No override here on purpose: with one, the launch resolves regardless of PATH
+        safety, and PATH safety is then the *manager* resolver's concern, which
+        `D2EffectiveManagerResolutionTest` pins separately.
+        """
+        _make_executable(os.path.join(self.root, "os", "bin"))
+        env = {"PATH": os.pathsep.join([os.path.join(self.root, "os", "bin"), "relative/dir"])}
+        record = evaluate_update_authority(
+            "fakex",
+            env,
+            registry=self.registry,
+            updater_targets=lambda pid: ((), False),
+        )
         self.assertEqual(record.authority, AUTHORITY_UNKNOWN)
+        self.assertFalse(record.admits_actuation)
 
     def test_unresolvable_provider_is_unknown_and_does_not_raise(self) -> None:
         record = evaluate_update_authority(
-            "fakex", {"PATH": os.path.join(self.root, "empty")}, registry=self.registry
+            "fakex",
+            {"PATH": os.path.join(self.root, "empty")},
+            registry=self.registry,
+            updater_targets=lambda pid: ((), False),
         )
         self.assertEqual(record.authority, AUTHORITY_UNKNOWN)
         self.assertFalse(record.admits_actuation)
 
     def test_unknown_provider_is_unknown_and_does_not_raise(self) -> None:
         record = evaluate_update_authority(
-            "no_such_provider", {"PATH": self.root}, registry=self.registry
+            "no_such_provider",
+            {"PATH": self.root},
+            registry=self.registry,
+            updater_targets=lambda pid: ((), False),
         )
         self.assertEqual(record.authority, AUTHORITY_UNKNOWN)
 
@@ -827,18 +846,18 @@ class BuiltinUpdaterTargetAdapterTest(unittest.TestCase):
         self.assertFalse(res.resolved)
         self.assertEqual(res.reason, REASON_PROVIDER_UNREGISTERED)
 
-    def test_ambiguous_or_missing_manager_is_typed(self) -> None:
-        """Two npms on PATH is exactly 'where would an update write?' having no answer."""
-        other = os.path.join(self.root, "other")
-        os.makedirs(other, exist_ok=True)
-        npm2 = os.path.join(other, "npm")
-        with open(npm2, "w", encoding="utf-8") as h:
-            h.write("#!/bin/sh\nexit 1\n")
-        os.chmod(npm2, os.stat(npm2).st_mode | stat.S_IXUSR)
+    def test_missing_or_unsafe_path_manager_is_typed(self) -> None:
+        """No manager, or a PATH we refuse to read, is still unresolvable.
+
+        A *shadowed* second npm is deliberately NOT in this list any more: Design Answer
+        D2 (j#96288 item 4) ruled that the effective — first trusted-PATH — executable is
+        the one an updater would run, and treating its shadow as undecidable took a
+        workspace offline (j#96202). `D2EffectiveManagerResolutionTest` pins that.
+        """
         for env in (
-            {"PATH": os.pathsep.join([self.bindir, other])},
             {"PATH": os.path.join(self.root, "empty")},
             {"PATH": os.pathsep.join([self.bindir, "relative/dir"])},
+            {},
         ):
             with self.subTest(env=env):
                 res = resolve_updater_target("codex", env, runner=self._runner())
@@ -870,7 +889,7 @@ class ProductionOrchestrationFenceTest(unittest.TestCase):
     the caller's own wiring: the probe reaching the fence is the thing under test.
     """
 
-    def test_the_production_call_shape_arms_the_fence(self) -> None:
+    def _RETIRED_test_the_production_call_shape_arms_the_fence(self) -> None:
         """The exact gap j#96060 F1 named, asserted on BEHAVIOR rather than source text.
 
         `commands.py` calls the gate without `updater_targets`. R2 made that mean "no
@@ -916,7 +935,7 @@ class ProductionOrchestrationFenceTest(unittest.TestCase):
         source = inspect.getsource(commands)
         self.assertNotIn("builtin_updater_target_probe", source)
 
-    def test_send_is_refused_when_the_authority_cannot_be_established(self) -> None:
+    def _RETIRED_test_send_is_refused_when_the_authority_cannot_be_established(self) -> None:
         """`unknown` is zero-send now (Answer item 4). R2 admitted it; that is retracted."""
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.startup_admission_gate import (  # noqa: E501
             admit_receiver_startup_or_die,
@@ -971,6 +990,169 @@ class ProductionOrchestrationFenceTest(unittest.TestCase):
                 updater_targets=lambda pid: ([bindir], True),
             ),
         )
+
+
+class D2CompositionScopeTest(unittest.TestCase):
+    """Design Answer D2 (j#96288) item 5 — the behavioral pins that must all hold.
+
+    R3 armed the authority fence for every provider from an ambient default inside the
+    generic gate. That refused every Claude send on every host and made 29 unrelated tests
+    read the live host's npm. These pin the corrected scope directly, and none of them
+    consults the host: the resolver is either absent by design or an explicit fake.
+    """
+
+    def setUp(self) -> None:
+        self.emitted: list = []
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _admit(self, receiver, pane=None, **kwargs):
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.startup_admission_composition import (  # noqa: E501
+            admit_receiver_startup_or_die,
+        )
+
+        admit_receiver_startup_or_die(
+            herdr_send=True,
+            receiver=receiver,
+            target="w4B:p51",
+            read_lines=40,
+            capture_pane=lambda t, n: pane if pane is not None else READY_COMPOSER,
+            emit=lambda o, **k: self.emitted.append(o),
+            record_format="text",
+            record_command=None,
+            **kwargs,
+        )
+
+    def test_ready_claude_without_a_binding_still_sends_and_never_touches_npm(self) -> None:
+        """D2 item 1, and the direct regression for the 29 failures."""
+        import mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter as adapter
+
+        consulted: list = []
+        real = adapter.resolve_updater_target
+        adapter.resolve_updater_target = lambda *a, **k: consulted.append(True)
+        self.addCleanup(setattr, adapter, "resolve_updater_target", real)
+
+        self._admit("claude")
+        self.assertEqual(self.emitted, [], "an unbound provider is out of this gate's scope")
+        self.assertEqual(consulted, [], "and the host's package manager is never consulted")
+
+    def test_unbound_provider_is_not_evaluated_never_unknown(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.startup_admission_composition import (  # noqa: E501
+            updater_target_resolver_for,
+        )
+
+        self.assertIsNone(updater_target_resolver_for("claude"))
+        self.assertEqual(
+            evaluate_update_authority("claude", {}).authority,
+            AUTHORITY_NOT_EVALUATED,
+            "'nobody asked' and 'we asked and could not tell' are different facts",
+        )
+
+    def test_update_prompt_is_refused_regardless_of_binding(self) -> None:
+        """D2 item 2: an observed update screen is zero-send even for an unbound provider.
+
+        The declared-blocker path does this, so the guarantee does not depend on the
+        authority gate being armed.
+        """
+        with self.assertRaises(SystemExit):
+            self._admit("codex", pane=CAPTURED_UPDATE_PROMPT)
+        self.assertEqual(self.emitted[0].reason, "receiver_startup_interaction_required")
+
+    def test_supported_provider_is_armed_and_split_is_refused(self) -> None:
+        with self.assertRaises(SystemExit):
+            self._admit("codex", updater_targets=lambda pid: ([self.tmp.name], True))
+        self.assertEqual(self.emitted[0].reason, "receiver_update_authority_split")
+
+    def test_supported_provider_unknown_is_refused(self) -> None:
+        with self.assertRaises(SystemExit):
+            self._admit("codex", updater_targets=lambda pid: ((), False))
+        self.assertEqual(self.emitted[0].reason, "receiver_update_authority_split")
+
+    def test_generic_gate_constructs_no_probe_of_its_own(self) -> None:
+        """D2 item 3: arming is a composition decision, never an ambient gate default."""
+        import inspect
+
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application import (  # noqa: E501
+            startup_admission_gate as gate,
+        )
+
+        self.assertNotIn("builtin_updater_target_probe", inspect.getsource(gate))
+
+    def test_command_module_keeps_one_neutral_dependency(self) -> None:
+        import inspect
+
+        from mozyo_bridge.application import commands
+
+        source = inspect.getsource(commands)
+        self.assertIn("startup_admission_composition", source)
+        for leaked in ("builtin_updater_target_probe", "npm", "@openai"):
+            self.assertNotIn(leaked, source)
+
+
+class D2EffectiveManagerResolutionTest(unittest.TestCase):
+    """D2 item 4 — a shadowed second npm is not ambiguity; the effective one is asked."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name
+
+    def _npm_dir(self, name):
+        d = os.path.join(self.root, name)
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, "npm")
+        with open(p, "w", encoding="utf-8") as h:
+            h.write("#!/bin/sh\nexit 0\n")
+        os.chmod(p, os.stat(p).st_mode | stat.S_IXUSR)
+        return d, os.path.realpath(p)
+
+    def test_first_trusted_path_npm_is_the_one_asked(self) -> None:
+        first_dir, first = self._npm_dir("first")
+        second_dir, second = self._npm_dir("second")
+        node_modules = os.path.join(self.root, "nm")
+        os.makedirs(os.path.join(node_modules, "@openai", "codex"), exist_ok=True)
+        asked: list = []
+
+        def runner(argv, **kwargs):
+            asked.append(argv[0])
+            return types.SimpleNamespace(returncode=0, stdout=node_modules)
+
+        res = resolve_updater_target(
+            "codex",
+            {"PATH": os.pathsep.join([first_dir, second_dir])},
+            runner=runner,
+        )
+        self.assertTrue(res.resolved, "a shadowed npm must not make this undecidable")
+        self.assertEqual(asked, [first], "the EFFECTIVE npm is the one interrogated")
+        self.assertNotIn(second, asked)
+
+    def test_unsafe_or_relative_path_is_still_unknown(self) -> None:
+        first_dir, _ = self._npm_dir("first")
+        for path in (os.pathsep.join([first_dir, "relative/dir"]), ""):
+            with self.subTest(path=path):
+                res = resolve_updater_target(
+                    "codex", {"PATH": path}, runner=lambda *a, **k: None
+                )
+                self.assertFalse(res.resolved)
+                self.assertEqual(res.reason, REASON_QUERY_EXECUTABLE_UNRESOLVED)
+
+    def test_managed_provider_executable_is_not_relaxed_to_first_match(self) -> None:
+        """The first-match rule is for the MANAGER only; the provider keeps exact identity."""
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_executable import (  # noqa: E501
+            AgentProviderExecutableError,
+            resolve_agent_launch,
+        )
+
+        a = os.path.join(self.root, "a")
+        b = os.path.join(self.root, "b")
+        _make_executable(a)
+        _make_executable(b)
+        with self.assertRaises(AgentProviderExecutableError):
+            resolve_agent_launch(
+                "fakex",
+                {"PATH": os.pathsep.join([a, b])},
+                registry=_fake_profile_registry(),
+            )
 
 
 if __name__ == "__main__":

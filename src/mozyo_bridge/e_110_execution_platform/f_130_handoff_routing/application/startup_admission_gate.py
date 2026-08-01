@@ -38,9 +38,6 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.age
     UpdaterTargetProbe,
     evaluate_update_authority,
 )
-from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter import (  # noqa: E501
-    builtin_updater_target_probe,
-)
 from mozyo_bridge.shared.errors import die
 
 #: The blocked reason for a receiver that is mid-startup. A distinct token (not
@@ -107,18 +104,14 @@ def _refuse_wrong_binary_or_pass(
     Zero-send by construction: this runs before the first injection, so a refusal has
     typed nothing and pressed no Enter.
     """
-    # Redmine #14741 j#96060 F1 / Answer j#96167 item 6. The probe DEFAULTS to the
-    # built-in adapter rather than being threaded from `commands.py`, for the reason this
-    # module's own docstring gives: `orchestrate_handoff` is the largest module under the
-    # module-health gate, so the gate composes here and the command module keeps a single
-    # unchanged call. R2's failure was that the parameter existed and production supplied
-    # nothing, so the fence silently evaluated `unknown` with no probe; a default closes
-    # that by construction — production cannot forget to arm it. A caller may still inject
-    # its own probe (tests do), and an explicitly unresolving probe is honoured as unknown.
-    probe = updater_targets if updater_targets is not None else builtin_updater_target_probe()
+    # Redmine #14741 Answer D2 (j#96288 item 3): this generic gate NEVER constructs a
+    # probe of its own. R3 defaulted one here, which armed the fence for every caller
+    # including every unit test, made them read the real host's PATH and npm, and killed
+    # 29 unrelated sends. Arming is a composition decision and lives in
+    # `startup_admission_composition`; an unarmed call is `not_evaluated`, not `unknown`.
     authority = evaluate_update_authority(
         receiver,
-        updater_targets=probe,
+        updater_targets=updater_targets,
         bound_identity=bound_executable_identity,
         observed_identity=observed_executable_identity,
     )
