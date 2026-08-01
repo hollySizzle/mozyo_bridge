@@ -560,3 +560,45 @@ class ClosedStatusSurvivesTheNoGatePathTest(unittest.TestCase):
             {"13820"},
             "it belongs on the debt surface instead — visible, but not counted",
         )
+
+
+class ScopeUnresolvedDegradesTest(unittest.TestCase):
+    """The fail-closed contract j#96306 option (b) preserved: no scope -> no roster, and say so.
+
+    An unresolvable repo workspace must NOT fall back to the host-global roster: "no workspace
+    registry / anchor" is not evidence that no foreign workspace exists, and a fresh checkout
+    whose repo config selects herdr would re-import the very leak #14813 R1-F1 closed. So both
+    reads report an error, which the CLI turns into `degraded`.
+
+    Added because a probe found the contract unguarded: deleting the scope-unresolved error
+    left every test green. `test_residue_enumeration_error_degrades_the_view` covers the CLI's
+    handling of an error, not the production of one.
+    """
+
+    def _with_unresolved_scope(self, fn):
+        original = source._repo_scope_workspace_id
+        source._repo_scope_workspace_id = lambda _root: None
+        try:
+            return fn()
+        finally:
+            source._repo_scope_workspace_id = original
+
+    def test_roster_reports_an_error_instead_of_falling_back(self) -> None:
+        rows, error = self._with_unresolved_scope(
+            lambda: source.enumerate_active_lanes_for_repo(Path("/nonexistent"))
+        )
+        self.assertEqual(rows, (), "an unresolvable scope must not yield a host-global roster")
+        self.assertIsNotNone(
+            error,
+            "the caller has to be able to report degraded; a silent empty read is "
+            "indistinguishable from 'nothing active'",
+        )
+        self.assertIn("scope unresolved", error or "")
+
+    def test_residue_reports_an_error_instead_of_falling_back(self) -> None:
+        rows, error = self._with_unresolved_scope(
+            lambda: source.enumerate_detached_residue_for_repo(Path("/nonexistent"))
+        )
+        self.assertEqual(rows, ())
+        self.assertIsNotNone(error)
+        self.assertIn("scope unresolved", error or "")

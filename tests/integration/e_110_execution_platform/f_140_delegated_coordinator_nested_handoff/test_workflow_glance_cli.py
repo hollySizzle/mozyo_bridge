@@ -27,6 +27,9 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application.cli import build_parser
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+    cli_workflow_glance as cli_glance,
+)
 from mozyo_bridge.core.state.herdr_delivery_ledger import (
     HerdrDeliveryLedger,
     HerdrDeliveryLedgerRecord,
@@ -41,6 +44,27 @@ def _run(argv):
     with contextlib.redirect_stdout(out):
         rc = ns.func(ns)
     return rc, out.getvalue()
+
+
+def _pin_residue_read_empty(test_case) -> None:
+    """Pin the repo-scoped detached-residue read to a successful empty result.
+
+    Redmine #14813 j#96306: these tests exercise the Redmine / advisory **fold**, not the
+    residue diagnostic. `cmd_workflow_glance` reads residue unconditionally, and that read
+    enumerates the live sublane views — which raises when the host has no herdr binary (CI) and
+    succeeds when it does (a developer machine). Left live, the off-target collaborator makes
+    `degraded` depend on the machine: green locally, red on CI.
+
+    The fix is to make the collaborator hermetic, NOT to relax the `degraded` expectation —
+    "scope unresolved / read failed -> degraded" is a real contract with its own regression in
+    `tests/regressions/test_issue_14813_active_roster_capacity_partition.py`, and rewriting
+    these assertions to accept `degraded=True` would delete the signal this file is asserting.
+    """
+    original = cli_glance.enumerate_detached_residue_for_repo
+    cli_glance.enumerate_detached_residue_for_repo = lambda _root: ((), None)
+    test_case.addCleanup(
+        setattr, cli_glance, "enumerate_detached_residue_for_repo", original
+    )
 
 
 def _write_snapshot(path: Path, issues) -> None:
@@ -134,6 +158,7 @@ class ActiveLanesRedmineFoldTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.store_path = Path(self._tmp.name) / "workflow-runtime.sqlite"  # left empty
+        _pin_residue_read_empty(self)
         self.redmine = Path(self._tmp.name) / "redmine.json"
         self.redmine.write_text(
             json.dumps(
@@ -243,6 +268,7 @@ class ActiveLanesStoreAdvisoryTest(unittest.TestCase):
     """``--no-redmine``: roster + advisory runtime store + ledger (offline fallback)."""
 
     def setUp(self) -> None:
+        _pin_residue_read_empty(self)
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.store_path = Path(self._tmp.name) / "workflow-runtime.sqlite"
