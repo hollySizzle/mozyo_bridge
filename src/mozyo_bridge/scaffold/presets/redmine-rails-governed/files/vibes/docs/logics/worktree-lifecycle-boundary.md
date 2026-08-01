@@ -4,6 +4,10 @@ Redmine #11889 / #12603。git worktree の生成・削除・命名・並列運�
 
 > 本 doc は責務境界の **方針正本 + 汎用 runbook** である。#11889 時点では新しい core CLI worktree command を追加しない。#12603 / `sublane lifecycle and worktree integration late window` roadmap group では、設定駆動の sublane lifecycle として core-managed Git worktree / retire-time merge を導入するかを再設計する。実運用 policy (削除条件・N 本並列の上限など) は operator 判断であり、OSS default に固定しない。
 
+> **決着済みの例外 (Redmine #13686 / owner decision j#96335)**: 「retire 時の live merge と worktree / local branch cleanup を guarded actuator へ接続する」は、本 doc `## scope 境界 / Design Consultation triggers` が要求していた個別 issue + Design Consultation を経て決着した (設計 j#77124 / owner j#96335)。本 doc の中核方針は撤回されていない — core が worktree lifecycle を**無条件に**取り込むことは引き続き避け、actuator は既定 `mode: disabled` の opt-in であり、統合 authority も coordinator のままである。以下の `## core に含めないもの` は、この設定駆動 actuator を **例外として除いた** 範囲で読む。
+>
+> 配布注記: 実装構成の設計正本 [[logic-auto-integration-actuator]] は **mozyo_bridge repo-local であり配布されない**。配布先 (adopter) が読むべき正本は central preset `agent-workflow.md` `### Commit Hash Origin 到達可能性` の `coordinator_owned_auto_integration` であり、そこに許可条件・実行形態・記録・close 後 cleanup の safety 条件が揃っている。
+
 ## 背景
 
 `#11850` の cockpit サブレーン PoC では、issue ごとに git worktree を作り、lane / pane / branch / Redmine gate を対応させる運用が有効だった。運用哲学、bandwidth/admission、pipeline fill の正本は、この repo では repo-local spine [[logic-coordinator-sublane-development-flow]] である。worktree 段階を含むサブレーン全体のライフサイクル (workspace identity / launch / worktree / callback / retire / merge / acceptance smoke) の段階関係と各段階の正本所在は [[logic-sublane-lifecycle-map]] を index として読む。
@@ -137,7 +141,12 @@ material な退役では、対象 issue に以下を記録する。
 
 次を要する変更は本 issue に含めず、個別 issue + Design Consultation で行う:
 
-- `git worktree add/remove` の core CLI lifecycle command 追加。
+- `git worktree add/remove` の core CLI lifecycle command 追加。**decided**: #13686 が設定駆動の
+  guarded actuator として決着させた範囲 (retire-time の統合と、close 後の worktree remove /
+  local branch safe-delete) は、配布正本が central preset の
+  `coordinator_owned_auto_integration`、repo-local な実装構成正本が
+  [[logic-auto-integration-actuator]] である。それ以外の worktree lifecycle command 追加は
+  引き続き本 trigger の対象である。
 - `#11820` lane identity semantics の変更。
 - private / operator 固有の並列 lane policy を product default へ追加。
 - shared skill の挙動を、互換 story なしに全 downstream へ影響する形で変更。

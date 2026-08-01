@@ -72,6 +72,7 @@ ACTIONS: frozenset[str] = frozenset(
 CONFIG_BLOCK_KEYS: tuple[str, ...] = (
     "work_unit",
     "sublane_integration",
+    "auto_integration",
     "terminal_transport",
     "presentation",
     "agents",
@@ -160,6 +161,35 @@ CONFIG_LEAF_KEYS: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = (
     (
         "sublane_integration.manage_worktree",
         (("sublane_integration", "manage_worktree"),),
+    ),
+    # The #13686 actuator leaves. Every one of them decides whether a real side effect —
+    # a push to an integration branch, a worktree removal, a ref delete — is attempted, so
+    # an operator must be able to read what a workspace actually resolved to rather than
+    # infer it from an absent block. `mode` and `delete_remote_branch` matter most: the
+    # first is what turns the actuator on at all, the second is the one cleanup step whose
+    # effect is not recoverable from the local clone.
+    ("auto_integration.mode", (("auto_integration", "mode"),)),
+    (
+        "auto_integration.integration_branch",
+        (("auto_integration", "integration_branch"),),
+    ),
+    ("auto_integration.ff_only", (("auto_integration", "ff_only"),)),
+    (
+        "auto_integration.require_source_ci",
+        (("auto_integration", "require_source_ci"),),
+    ),
+    (
+        "auto_integration.require_integration_ci",
+        (("auto_integration", "require_integration_ci"),),
+    ),
+    ("auto_integration.remove_worktree", (("auto_integration", "remove_worktree"),)),
+    (
+        "auto_integration.delete_local_branch",
+        (("auto_integration", "delete_local_branch"),),
+    ),
+    (
+        "auto_integration.delete_remote_branch",
+        (("auto_integration", "delete_remote_branch"),),
     ),
     ("terminal_transport.backend", (("terminal_transport", "backend"),)),
     ("presentation.surface", (("presentation", "surface"),)),

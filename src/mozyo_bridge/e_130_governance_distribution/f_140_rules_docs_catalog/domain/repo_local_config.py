@@ -93,6 +93,7 @@ from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.
     REPO_LOCAL_CONFIG_VERSION,
     RepoLocalConfigError,
     SUBLANE_INTEGRATION_KEYS,
+    AutoIntegrationConfig,
     SublaneIntegrationConfig,
     _checked_bool,
     _checked_version,
@@ -191,6 +192,7 @@ REPO_LOCAL_CONFIG_KEYS: frozenset[str] = frozenset(
         "presentation",
         "delegation",
         "sublane_integration",
+        "auto_integration",
         "work_unit",
         "agent_launch",
         "lane_placement",
@@ -482,6 +484,12 @@ class RepoLocalConfig:
     sublane_integration: SublaneIntegrationConfig = field(
         default_factory=SublaneIntegrationConfig.default
     )
+    #: The coordinator-owned gated auto-integration / post-close cleanup knob (#13686). An
+    #: absent block resolves to ``mode: disabled``, which is what every build did before the
+    #: actuator existed, so the default is behavior-preserving.
+    auto_integration: AutoIntegrationConfig = field(
+        default_factory=AutoIntegrationConfig.default
+    )
     work_unit: WorkUnitGranularityConfig = field(
         default_factory=WorkUnitGranularityConfig.default
     )
@@ -622,6 +630,13 @@ class RepoLocalConfig:
         sublane_integration = SublaneIntegrationConfig.from_record(
             record.get("sublane_integration")
         )
+        # The gated auto-integration knob (#13686) is parsed by its own self-contained
+        # sub-record, which raises RepoLocalConfigError directly, so the single fail-closed
+        # boundary holds without re-wrapping. An absent ``auto_integration`` block resolves
+        # to ``mode: disabled`` — the behavior-preserving default.
+        auto_integration = AutoIntegrationConfig.from_record(
+            record.get("auto_integration")
+        )
         # The governed work-unit granularity knob (#13002) is parsed by its own
         # self-contained domain schema; its WorkUnitGranularityError is re-raised
         # as a RepoLocalConfigError so the loader keeps a single fail-closed
@@ -716,6 +731,7 @@ class RepoLocalConfig:
             presentation=presentation,
             delegation=delegation,
             sublane_integration=sublane_integration,
+            auto_integration=auto_integration,
             work_unit=work_unit,
             agent_launch=agent_launch,
             lane_placement=lane_placement,
@@ -746,10 +762,14 @@ __all__ = (
     "SUBLANE_INTEGRATION_KEYS",
     "DEFAULT_MANAGE_WORKTREE",
     "DEFAULT_MERGE_ON_RETIRE",
+    "AUTO_INTEGRATION_KEYS",
+    "AUTO_INTEGRATION_MODES",
+    "DEFAULT_AUTO_INTEGRATION_MODE",
     "AGENT_LAUNCH_KEYS",
     "RepoLocalConfigError",
     "PresentationSelectionConfig",
     "SublaneIntegrationConfig",
+    "AutoIntegrationConfig",
     "AgentLaunchConfig",
     "LanePlacementConfig",
     "LanePlacementError",

@@ -434,8 +434,39 @@ origin到達可能性:
     - owner_close_approval / Close gate は origin 到達不能な commit hash では成立しない
     - local-only commit に対する close は invalid。reopen + correction journal を起票する
   禁止:
-    - 自動 push/pull 機構の導入。push は実装者の明示操作のままとし、gate 検証は read-only な到達性確認に限る
-    - 自動 merge / auto-integration 機構の導入。統合は coordinator の明示操作と integration journal 記録のままとする
+    - 実装者による integration branch への push (手動・自動を問わない)。実装者の push は issue / lane branch に限り、gate 検証は read-only な到達性確認に限る
+    - gate を満たさない統合。coordinator-owned であっても、下記 `coordinator_owned_auto_integration` の gate を一つでも欠く統合は実行しない
+    - force push / `--force-with-lease` / 自動 rebase / remote branch の rewrite。conflict や target drift をこれらで解消しない
+    - close / owner approval / review admissibility を actuator の config で緩めること。config は step を止められるが、gate を外せない
+  coordinator_owned_auto_integration:
+    根拠: owner decision (Redmine #13686 j#96335) + 設計 (同 j#77124)
+    位置づけ: |
+      「自動 merge / auto-integration 機構を導入しない」という以前の全面禁止は範囲が広すぎたため撤回する。
+      撤回するのは *機構の存在* の禁止だけであり、統合の authority は動かない — 統合は依然 coordinator の
+      責務であり、実装者が integration branch を前進させない点も変わらない。actuator は coordinator の
+      明示操作を代行する実行系であって、新しい authority ではない。
+    許可条件 (すべて必須。一つでも欠けたら fail-closed):
+      - 最新 review generation が approved かつ未解決の blocking finding なし (古い approval の使い回しは不可)
+      - 統合対象が review 済みの exact head であること (review 後に source が変化していたら不可)
+      - source head が origin 到達可能であること
+      - source branch の CI が green (設定で必須化を外せるが、外した事実は config status に出る)
+      - target ref が既知の integration branch で、action 形成時の expected head から drift していないこと
+      - lane worktree が clean かつ foreign でなく、unique な unpushed commit を持たないこと
+      - 未解決の callback / owner 判断 / release gate が無いこと
+    実行形態:
+      - 既定は ff-only の normal (non-force) push。non-ff を許す設定でも merge commit は専用 integration worktree で作り、lane worktree で target branch を checkout しない
+      - conflict / non-ff / target drift / push 拒否は fail-closed。rebase も force も代替手段にしない
+      - 統合 SHA に対する CI は **非同期 gate** として別 state で待つ。単一の同期 command 内で CI 完了を仮定しない
+      - already_integrated (target ancestry) と patch_equivalent (明示 patch-id evidence) は別 disposition として記録し、同じ merge を再生成しない
+    記録:
+      - 各段階 (integration / push / CI / process retire / worktree remove / branch cleanup) を段階別 outcome として記録する
+      - action key は `issue + lane_generation + source_head + target_ref + expected_target_head + review_generation` を覆い、部分失敗からの再実行で重複 merge / 重複 delete を起こさない
+      - 統合結果は従来どおり integration journal に記録し、自動判断の evidence にする場合は `### Hibernate Evidence Marker Contract` の `integration_disposition` marker を付ける
+    close 後の retirement / cleanup:
+      - integration state machine と分離した別 state machine で扱う。統合が close を代替しない
+      - `git worktree remove` は clean かつ exact registered path に対してのみ、`--force` なしで実行する
+      - local branch delete は `git branch -D` を使わず、worktree 非保持 / unique unpushed commit なし / target 到達または patch-equivalent / ref tip が record 済み source head と一致、を満たす CAS-safe delete に限る
+      - remote branch delete は既定 false。有効化しても上記 local 条件は緩まない
 ```
 
 ### Codex Direct Edit Gate

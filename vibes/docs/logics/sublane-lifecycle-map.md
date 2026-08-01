@@ -81,17 +81,28 @@ retire_三義:
           TOCTOU 保全 fence」節 (fingerprint/activity/attestation/revision の release 直前再検証と
           process_release state 分離)、および `sublane_hibernate*.py` module docstring。
 
-[5] retire               lane を退役する (pane/worktree/branch)。owner 確認なしに退役してよい条件は所有 doc。
+[5] integration          review 承認済みの exact head を integration branch へ統合する。
+                         **retire より前**の段階である (Redmine #13686 j#77124: 実際の順序は
+                         review approval → integration → exact-SHA CI → close → retire)。
+      正本: logic-auto-integration-actuator (gated actuator の state machine / action key /
+            fail-closed。#13686 owner decision j#96335),
+            central preset `### Commit Hash Origin 到達可能性` の
+            `coordinator_owned_auto_integration` (authority 側の正本),
+            logic-coordinator-sublane-development-flow (integration disposition),
+            logic-existing-project-sublane-adoption (origin reachability / clean integration branch)
+      注: 統合 authority は coordinator のままで、実装者は integration branch を前進させない。
+          conflict / non-ff / target drift / dirty / unpushed / CI 未確定は fail-closed であり、
+          force push・auto-rebase では解消しない。already_integrated (ancestry) と
+          patch_equivalent (明示 evidence) は別 disposition。
+
+[6] retire / cleanup     close 後に lane を退役する (managed process / worktree / branch)。
+                         owner 確認なしに退役してよい条件は所有 doc。
       正本: logic-worktree-lifecycle-boundary (sublane retirement authority / record),
+            logic-auto-integration-actuator (integration とは別 state machine としての
+            cleanup 段階別 outcome と CAS-safe delete 条件),
             logic-coordinator-sublane-development-flow (retirement drain),
             logic-session-boundary (pane guarded_kill / orphan)
       非該当: fallback rail の retirement は別概念 (logic-fallback-retirement-ledger)。
-
-[6] merge / integration  退役時に lane commit を target branch へ統合する (#12603 retire-time merge)。
-      正本: logic-worktree-lifecycle-boundary (#12603 設定駆動 integration 境界),
-            logic-coordinator-sublane-development-flow (integration disposition),
-            logic-existing-project-sublane-adoption (origin reachability / clean integration branch)
-      注: conflict / dirty / target branch 不明では退役せず管制塔へ feedback。
 
 [7] acceptance smoke     ライフサイクル全体を実機で検証する (段階ではなく全体に被さる検証層)。
       正本: logic-delegated-coordinator-real-machine-acceptance (3層実機 acceptance),
@@ -112,8 +123,10 @@ worktree:
   非Git: worktree は成立しない。directory scaffold で lane を置き、worktree 段階を skip する。
   正本: [[logic-worktree-lifecycle-boundary]]
 merge:
-  Git: retire 時に lane commit を target branch へ統合する余地がある。
-  非Git: branch/merge が無いため retire-time merge は対象外。成果の取り込みは別経路で扱う。
+  Git: close 前に lane commit を integration branch へ統合する (段階 [5])。
+  非Git: branch/merge が無いため integration 段階は明示的に not_applicable。process retire だけが
+        独立に走る。成果の取り込みは別経路で扱う。
+  正本: [[logic-auto-integration-actuator]]
 callback / acceptance:
   共通: durable anchor (Redmine journal) 経由の配送・検証は workspace 種別に依らず同じ。
 ```

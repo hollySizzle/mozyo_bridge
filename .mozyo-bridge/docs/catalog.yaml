@@ -997,11 +997,28 @@ documents:
     purpose: git worktree lifecycle (add/remove、branch/path 命名、削除 policy、N-lane 並列 policy) の現行 runbook 境界と、#12603 で再評価する設定駆動 sublane lifecycle / core-managed Git worktree / retire-time merge の設計境界正本。
     audit_role: worktree_lifecycle_boundary_logic
     related_document_refs:
+      - logic-auto-integration-actuator
       - logic-sublane-lifecycle-map
       - logic-coordinator-sublane-development-flow
       - logic-scaffold-distribution-minimization
       - logic-delegated-coordinator-cockpit-display
       - rule-public-private-boundary
+      - spec-project-map
+
+  - id: logic-auto-integration-actuator
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/auto-integration-actuator.md
+    purpose: "coordinator-owned gated auto-integration / 退役 cleanup actuator の設計正本 (Redmine #13686 / owner decision j#96335 / 設計 j#77124)。integration (preflight → apply → push → 非同期 CI → integrated) と close 後 retirement cleanup (process retire → worktree remove → CAS-safe local branch delete) を別 state machine に分離する境界、action key (issue + lane_generation + source_head + target_ref + expected_target_head + review_generation) による段階別 outcome と idempotent 再実行、already_integrated (ancestry) と patch_equivalent (明示 evidence) の分離、non-ff / conflict / target drift / dirty / foreign / unpushed / CI 未確定の fail-closed、force push・auto-rebase・`git branch -D`・`worktree remove --force` を構造上表現しない port 設計、`auto_integration` config block (既定 mode: disabled / ff_only: true / delete_remote_branch: false) を記録する。authority 側の正本は central preset `### Commit Hash Origin 到達可能性` であり複製しない。"
+    audit_role: auto_integration_actuator_logic
+    related_document_refs:
+      - logic-worktree-lifecycle-boundary
+      - logic-sublane-lifecycle-map
+      - logic-coordinator-sublane-development-flow
+      - logic-object-oriented-architecture-policy
+      - logic-scaffold-rules
+      - rule-llm-rule-authoring
+      - rule-project-agent-workflow
       - spec-project-map
 
   - id: logic-sublane-bandwidth-policy
@@ -1072,6 +1089,7 @@ documents:
     purpose: サブレーンの一連のライフサイクル (workspace identity / launch / worktree / callback / retire / merge / acceptance smoke) の関係と段階ごとの正本所在を一箇所に束ねる navigation map。Git / 非Git workspace の段階差分と「retire」の三義 (sublane retirement / pane guarded_kill / fallback rail retirement) を整理する。各段階の execution 契約は canonical doc が正本であり本 map は複製しない。
     audit_role: sublane_lifecycle_map_logic
     related_document_refs:
+      - logic-auto-integration-actuator
       - rule-llm-rule-authoring
       - logic-coordinator-sublane-development-flow
       - logic-worktree-lifecycle-boundary
