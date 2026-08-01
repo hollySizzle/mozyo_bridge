@@ -38,6 +38,17 @@ import uuid
 from dataclasses import dataclass, field
 from typing import List, Optional, Protocol, Sequence, Tuple, runtime_checkable
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ports import (
+    AutoIntegrationGitOperations,
+    CleanupAuthority,
+    DurableAuthorityReader,
+    InMemoryLedgerStore,
+    IntegrationAuthority,
+    LedgerStore,
+    ManagedProcessOperations,
+    MergeResult,
+    PushResult,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_policy import (
     BLOCKED_PUSH_REJECTED,
     DISPOSITION_MERGE_COMMIT,
@@ -98,231 +109,6 @@ def cleanup_policy_from_config(
         remove_worktree=config.remove_worktree,
         delete_local_branch=config.delete_local_branch,
     )
-
-
-# ---------------------------------------------------------------------------
-# Injected Git operations port.
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class PushResult:
-    """The outcome of a normal, non-force push.
-
-    ``rejected`` is what a lost race looks like: the remote moved and a non-force push
-    cannot advance it. There is deliberately no field that would let a caller retry it as a
-    force — the resolution is to re-form the action against the new target head.
-    """
-
-    accepted: bool
-    rejected: bool = False
-    detail: str = ""
-
-
-@dataclass(frozen=True)
-class MergeResult:
-    """The outcome of applying a merge-commit disposition in a dedicated worktree.
-
-    ``integration_head`` is the exact commit the merge produced — a *different* commit from
-    the source head, which is why the two are recorded separately (the same reason the
-    Hibernate Evidence Marker Contract splits ``head`` from ``integration_head``: one head
-    cannot prove a merge-commit integration).
-    """
-
-    conflicted: bool
-    integration_head: str = ""
-    detail: str = ""
-
-
-@runtime_checkable
-class AutoIntegrationGitOperations(Protocol):
-    """The Git operations the actuator needs, injected so tests drive fakes.
-
-    Only two mutations exist on the integration side (``apply_merge`` / ``push_non_force``)
-    and two on the cleanup side, and every one of them is the *weak* form: there is no force
-    push, no rebase, no ``--force`` worktree removal, and no unconditional ref delete
-    anywhere in this interface. An operation this port cannot express is one the actuator
-    cannot perform, which is the point — and it is why R1 review j#96344 finding 1 was
-    resolved by DELETING ``delete_remote_branch`` from this interface rather than by adding a
-    guard in front of it: a remote ref delete has no non-force compare-and-swap, so it cannot
-    be offered safely, so it is not offered.
-    """
-
-    def apply_merge(
-        self, *, source_head: str, target_ref: str, integration_worktree: str
-    ) -> MergeResult:
-        """Merge ``source_head`` into ``target_ref`` inside ``integration_worktree``.
-
-        The dedicated worktree is required (j#77124): the lane's own worktree never checks
-        the target branch out. A conflict is reported, never auto-resolved.
-        """
-        ...
-
-    def push_non_force(self, *, source_head: str, target_ref: str) -> PushResult:
-        """Push ``source_head`` to ``target_ref`` with a normal, non-force push."""
-        ...
-
-    def describe_integration_worktree(
-        self, *, path: str, lane_worktree: str
-    ) -> IntegrationWorktree:
-        """MEASURE the dedicated integration worktree's identity (read-only).
-
-        On the port, not merely on the live adapter, because the use case must be able to
-        call it. R2 had this probe on the adapter only and never invoked it, so the use case
-        re-checked the *caller's* booleans and handed the caller's own path to
-        ``apply_merge`` — a forged record naming the lane's worktree passed (j#96350 finding
-        3). Whoever measures a safety fact is the authority for it, and that must be the
-        actuator.
-        """
-        ...
-
-    def resolve_head(self, ref: str) -> str:
-        """The full commit SHA a LOCAL ``ref`` resolves to (read-only, fail-closed)."""
-        ...
-
-    def remote_branch_tip(self, branch: str) -> str:
-        """The shared remote's CURRENT tip for ``branch``, read fresh (``""`` on failure).
-
-        The target gate's authority. R4 review j#96379 finding 4: the gate used
-        :meth:`resolve_head`, a local ``git rev-parse``, while this fresh ``ls-remote`` probe
-        already existed on the same adapter and went unused — so a target another clone had
-        advanced still read as its old SHA and the drift was invisible.
-        """
-        ...
-
-    def is_ancestor(self, *, ancestor: str, descendant: str) -> bool:
-        """True iff ``ancestor`` is an ancestor of ``descendant`` (read-only, fail-closed)."""
-        ...
-
-    def worktree_dirty(self, *, worktree_path: str = "") -> bool:
-        """True iff the worktree has uncommitted / untracked changes (fail-closed)."""
-        ...
-
-    def commit_on_remote(self, commit: str, *, branch: str) -> bool:
-        """True iff ``commit`` is reachable from the remote's current ``branch`` tip."""
-        ...
-
-    def branch_tip(self, branch: str) -> str:
-        """The full SHA ``branch`` points at, or ``""``."""
-        ...
-
-    def branch_checked_out_elsewhere(self, branch: str) -> bool:
-        """True iff any worktree still holds ``branch`` checked out (fail-closed)."""
-        ...
-
-    def remove_worktree(self, *, worktree_path: str) -> bool:
-        """Remove the worktree at ``worktree_path`` without ``--force``."""
-        ...
-
-    def delete_local_branch(self, *, branch: str, expected_tip: str) -> bool:
-        """Compare-and-swap delete: remove ``branch`` only while it points at ``expected_tip``."""
-        ...
-
-
-@runtime_checkable
-class ManagedProcessOperations(Protocol):
-    """Releasing the lane's managed pane / process — the one Git-independent cleanup step."""
-
-    def release_process(self, *, issue: str, lane_generation: int) -> bool: ...
-
-
-@dataclass(frozen=True)
-class IntegrationAuthority:
-    """The durable-record facts an integration needs, as read from the source of truth.
-
-    These are the ones no git probe can answer: whether the latest review generation is
-    admissible and which head it approved, whether the target ref is an allowlisted
-    integration branch, whether callbacks and owner gates are settled, and the source
-    branch's CI evidence. R3 review j#96368 finding 1 found them taken verbatim from the
-    caller, so an integration could be authorized by the requester's own say-so.
-
-    Every field defaults to its unsatisfied value: a reader that cannot answer leaves the
-    gate closed rather than open.
-    """
-
-    review_generation_admissible: bool = False
-    #: The exact head the latest admissible review approved. Compared against the action's
-    #: source head, so "reviewed" cannot mean "some earlier commit was reviewed".
-    reviewed_head: str = ""
-    target_identity_known: bool = False
-    callbacks_drained: bool = False
-    owner_gates_resolved: bool = False
-    source_ci: Optional[IntegrationCiEvidence] = None
-
-
-@dataclass(frozen=True)
-class CleanupAuthority:
-    """The durable-record facts a post-close cleanup needs (the destructive half).
-
-    R3 review j#96368 finding 2: every one of these was caller-supplied, and the independent
-    reproduction removed a *foreign* lane's worktree and deleted its branch on that basis.
-    """
-
-    issue_closed: bool = False
-    integration_confirmed: bool = False
-    integration_ci_settled_green: bool = False
-    callbacks_drained: bool = False
-    owner_gates_resolved: bool = False
-
-
-@runtime_checkable
-class LedgerStore(Protocol):
-    """The actuator's own record of what it has done, read and appended by the actuator.
-
-    R4 review j#96379 finding 1: the ledger arrived as a caller-supplied sequence and the
-    provenance stamped on entries was derived from public constructor values, so a caller
-    could author entries indistinguishable from the actuator's own — claiming a push that
-    never happened, or slipping a foreign apply head into the commit the push would use.
-    Handing the caller the ledger is the same mistake as handing it the preflight.
-
-    An implementation MUST persist and return whole :class:`StepOutcome` records including
-    ``recorded_by`` (:meth:`StepOutcome.as_payload` carries it), and MUST NOT accept entries
-    from anywhere but :meth:`append`.
-    """
-
-    def read(self, *, action_key: str) -> Sequence[StepOutcome]: ...
-
-    def append(self, outcome: StepOutcome) -> None: ...
-
-
-@dataclass
-class InMemoryLedgerStore:
-    """A process-local :class:`LedgerStore` — the default when no durable store is bound.
-
-    Its lifetime is one actuator instance, so a resume across processes finds nothing and the
-    run starts over rather than trusting a ledger it cannot attribute. That is the fail-closed
-    reading: an unrecoverable ledger means "nothing is known to have run", never "what the
-    caller says ran".
-    """
-
-    entries: List[StepOutcome] = field(default_factory=list)
-
-    def read(self, *, action_key: str) -> Sequence[StepOutcome]:
-        return [entry for entry in self.entries if entry.action_key == action_key]
-
-    def append(self, outcome: StepOutcome) -> None:
-        self.entries.append(outcome)
-
-
-@runtime_checkable
-class DurableAuthorityReader(Protocol):
-    """Reads the authority facts from the durable record (Redmine), fresh, at action time.
-
-    An implementation MUST read the source of truth rather than any caller-provided cache,
-    and MUST leave a field at its unsatisfied default when it cannot establish the fact.
-    """
-
-    def read_integration_authority(
-        self, *, record: IntegrationActionRecord
-    ) -> IntegrationAuthority: ...
-
-    def read_integration_ci(
-        self, *, record: IntegrationActionRecord, integration_head: str
-    ) -> Optional[IntegrationCiEvidence]: ...
-
-    def read_cleanup_authority(
-        self, *, record: CleanupActionRecord
-    ) -> CleanupAuthority: ...
 
 
 # ---------------------------------------------------------------------------
@@ -464,10 +250,8 @@ class AutoIntegrationUseCase:
 
         There is no ``preflight`` parameter: the actuator measures the world itself
         (:meth:`_measure`). A caller cannot hand this method a fact, only an action record —
-        which is identity, not evidence. The measurement is taken once per run and not
-        re-derived between steps; the action key binds the run to it, and a world that has
-        changed produces a different key on the next call, which is where re-validation
-        belongs.
+        which is identity, not evidence. The measurement is re-taken before **every** step,
+        because this actuator's own mutations change the world it is deciding about.
         """
         report = IntegrationRunReport()
         # The ledger comes from this actuator's own store, never from an argument.
@@ -664,6 +448,9 @@ class AutoIntegrationUseCase:
                 source_head=record.source_head,
                 target_ref=record.target_ref,
                 integration_worktree=worktree.path,
+                # The parent the merge must sit on: the freshly measured remote target, not
+                # whatever the dedicated worktree happens to have checked out.
+                expected_target_head=preflight.observed_target_head,
             )
             if result.conflicted:
                 return StepOutcome(
@@ -759,7 +546,9 @@ class AutoIntegrationUseCase:
 
     # -- cleanup ----------------------------------------------------------
 
-    def _measure_cleanup(self, record: CleanupActionRecord) -> CleanupPreflight:
+    def _measure_cleanup(
+        self, record: CleanupActionRecord, *, ledger: Sequence[StepOutcome]
+    ) -> CleanupPreflight:
         """Build the ENTIRE cleanup preflight from this actuator's own measurements.
 
         R3 review j#96368 finding 2 is the reason this exists, and it was the heaviest finding
@@ -799,17 +588,34 @@ class AutoIntegrationUseCase:
         lane = ops.describe_integration_worktree(
             path=record.worktree_path, lane_worktree=self.lane_worktree
         )
-        # "Ours" is three facts, not one string comparison: the record must name this
-        # actuator's own lane, AND the checkout must actually be that worktree, AND it must
-        # currently hold this actuator's branch. R4 gated on the string pair alone and
-        # measured `checked_out_branch` without using it, so a registered worktree holding a
-        # foreign branch was removed.
-        is_ours = (
+        # Ownership is PHASE-AWARE (R6 review j#96391 finding 2). Before the removal it is
+        # three facts: the record names this actuator's lane, the checkout is that worktree,
+        # and it currently holds this actuator's branch — R4 gated on the string pair alone
+        # and measured `checked_out_branch` without using it, so a registered worktree holding
+        # a foreign branch was removed.
+        #
+        # After OUR OWN removal those facts cannot be re-measured: the path is gone, so the
+        # branch probe answers empty and the identity test would fail forever, blocking the
+        # branch cleanup it is supposed to precede. R6 shipped exactly that, and the fake hid
+        # it by clearing `registered` while leaving `checked_out_branch` set. Once a trusted
+        # remove receipt exists the question changes to "did we own it when we removed it, and
+        # is the path now actually gone" — the first was established at that time and recorded,
+        # the second is measurable.
+        removed = completed_steps(
+            ledger, action_key=record.action_key, recorded_by=self.recorder_id
+        ).get(STEP_WORKTREE_REMOVE)
+        names_our_lane = (
             record.worktree_path == self.lane_worktree
             and record.branch == self.lane_branch
-            and lane.is_lane_worktree
-            and lane.checked_out_branch == self.lane_branch
         )
+        if removed is None:
+            is_ours = (
+                names_our_lane
+                and lane.is_lane_worktree
+                and lane.checked_out_branch == self.lane_branch
+            )
+        else:
+            is_ours = names_our_lane and not lane.registered
         tip = ops.branch_tip(record.branch)
         authority = (
             self.authority.read_cleanup_authority(record=record)
@@ -825,8 +631,10 @@ class AutoIntegrationUseCase:
             callbacks_drained=authority.callbacks_drained,
             owner_gates_resolved=authority.owner_gates_resolved,
             worktree_is_foreign=not is_ours,
-            worktree_clean=lane.clean,
-            worktree_path_registered=lane.registered,
+            # Once removed, the removal itself is the evidence these held: the step only ran
+            # because they did, and a vanished path cannot answer them again.
+            worktree_clean=lane.clean if removed is None else True,
+            worktree_path_registered=lane.registered if removed is None else True,
             branch_checked_out_elsewhere=ops.branch_checked_out_elsewhere(record.branch),
             unpushed_unique_commits=not ops.commit_on_remote(tip, branch=record.branch),
             branch_reachable_from_target=(
@@ -856,7 +664,7 @@ class AutoIntegrationUseCase:
             # Re-measured before every step: `remove_worktree` changes whether the lane
             # worktree is registered and whether anything still holds the branch, so the
             # branch delete must decide from the world AFTER the removal, not before it.
-            preflight = self._measure_cleanup(record)
+            preflight = self._measure_cleanup(record, ledger=working_ledger)
             report.measured_preflight = preflight
             decision = decide_cleanup(
                 self.cleanup_policy,
@@ -884,7 +692,7 @@ class AutoIntegrationUseCase:
                 report.final_decision = decide_cleanup(
                     self.cleanup_policy,
                     record,
-                    self._measure_cleanup(record),
+                    self._measure_cleanup(record, ledger=working_ledger),
                     ledger=working_ledger,
                     trusted_recorder=self.recorder_id,
                 )

@@ -711,7 +711,11 @@ def decide_integration(
                 f"{record.target_ref}; no merge and no push performed"
             ),
         )
-    if preflight.patch_equivalent_evidence:
+    if preflight.patch_equivalent_evidence and pushed is None:
+        # R6 review j#96391 finding 4: R6 added this phase fence to `already_integrated` and
+        # not to its neighbour, so patch-equivalent evidence supplied after a push short-cut
+        # the mandatory exact-SHA CI gate. Both terminals answer "nothing needed doing", which
+        # can only be true before we did anything.
         return IntegrationDecision(
             state=STATE_PATCH_EQUIVALENT,
             action_key=action_key,

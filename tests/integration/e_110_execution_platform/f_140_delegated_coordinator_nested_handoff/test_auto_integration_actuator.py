@@ -130,6 +130,9 @@ class FakeGitOperations:
     lane_registered: bool = True
     lane_branch_checked_out: str = LANE_BRANCH
     dedicated_worktree: Optional[IntegrationWorktree] = None
+    #: What the dedicated worktree's local target branch points at. ``None`` means "matches
+    #: whatever was expected" (the healthy case).
+    dedicated_local_target: Optional[str] = None
     on_remote: bool = True
     tip: str = SOURCE
     #: Before the removal the lane's own worktree still holds the branch, exactly as the live
@@ -206,7 +209,12 @@ class FakeGitOperations:
 
     # -- mutations --------------------------------------------------------
     def apply_merge(
-        self, *, source_head: str, target_ref: str, integration_worktree: str
+        self,
+        *,
+        source_head: str,
+        target_ref: str,
+        integration_worktree: str,
+        expected_target_head: str,
     ) -> MergeResult:
         self.calls.append(
             (
@@ -215,9 +223,20 @@ class FakeGitOperations:
                     "source_head": source_head,
                     "target_ref": target_ref,
                     "integration_worktree": integration_worktree,
+                    "expected_target_head": expected_target_head,
                 },
             )
         )
+        # The live adapter refuses when the dedicated worktree's local target tip is not the
+        # expected one (R6 review j#96391 finding 1); the fake models that refusal so a test
+        # can exercise it.
+        if self.dedicated_local_target is not None and (
+            self.dedicated_local_target != expected_target_head
+        ):
+            return MergeResult(
+                conflicted=True,
+                detail="local target tip is not the expected remote target",
+            )
         return self.merge_result
 
     def push_non_force(self, *, source_head: str, target_ref: str) -> PushResult:
@@ -238,11 +257,14 @@ class FakeGitOperations:
     def remove_worktree(self, *, worktree_path: str) -> bool:
         self.calls.append(("remove_worktree", {"worktree_path": worktree_path}))
         if self.worktree_removed:
-            # Removing the worktree un-registers it and releases the branch it held. Modelling
-            # this is what exposes the stale-snapshot race in finding 3 — and it is also why
-            # the live `branch_checked_out_elsewhere`, which counts the worktree being removed,
-            # answers differently before and after.
+            # Removing the worktree un-registers it AND leaves nothing to report a checked-out
+            # branch for — the path is gone. R6 review j#96391 finding 2: this fake cleared
+            # only `registered` and kept `checked_out_branch`, so the identity gate still
+            # matched and the run reached `retired`; the live adapter answers empty and the
+            # same run blocked on `foreign_worktree` forever. Half a mutation modelled is a
+            # different lie from none.
             self.lane_registered = False
+            self.lane_branch_checked_out = ""
             self.checked_out_elsewhere = self.checked_out_after_remove
         return self.worktree_removed
 
@@ -710,6 +732,56 @@ class R3ReviewFinding3Test(unittest.TestCase):
         ).run_integration(record)
         self.assertNotIn("push_non_force", operations.performed)
         self.assertEqual(report.outcomes[-1].outcome, OUTCOME_BLOCKED)
+
+
+class R6ReviewFindingTest(unittest.TestCase):
+    """R6 review j#96391's findings, pinned with the conditions that reproduced them."""
+
+    def _merge_policy(self) -> AutoIntegrationPolicy:
+        return AutoIntegrationPolicy(
+            mode=MODE_AUTO, integration_branch="main", ff_only=False
+        )
+
+    def test_f1_the_merge_parent_is_bound_to_the_measured_remote_target(self) -> None:
+        # R6 finding 1: the adapter merged onto whatever the dedicated worktree's local target
+        # happened to be, so an extra unreviewed commit there ended up on the integration
+        # branch — and the push was accepted because it was still a fast-forward.
+        operations = FakeGitOperations(dedicated_local_target=OTHER)  # carries extra work
+        report = _use_case(
+            operations, integration_policy=self._merge_policy()
+        ).run_integration(_record())
+        self.assertEqual(operations.performed, ["apply_merge"])
+        self.assertNotIn("push_non_force", operations.performed)
+        self.assertEqual(report.outcomes[-1].outcome, OUTCOME_BLOCKED)
+
+    def test_f1_the_expected_target_is_handed_to_the_apply(self) -> None:
+        operations = FakeGitOperations()
+        _use_case(operations, integration_policy=self._merge_policy()).run_integration(
+            _record()
+        )
+        self.assertEqual(
+            operations.args_for("apply_merge")[0]["expected_target_head"], TARGET
+        )
+
+    def test_f2_our_own_removal_does_not_make_the_lane_foreign(self) -> None:
+        # R6 finding 2: after the removal the path is gone, so re-requiring the pre-removal
+        # branch identity blocked the branch cleanup that is supposed to follow it. The fake
+        # now clears the checked-out branch the way the live probe does.
+        operations = FakeGitOperations(ancestors=((SOURCE, TARGET),), tip=SOURCE)
+        report = _use_case(operations, processes=FakeProcessOperations()).run_cleanup(
+            CleanupActionRecord(
+                issue="13686",
+                lane_generation=3,
+                branch=LANE_BRANCH,
+                worktree_path=LANE_WORKTREE,
+                recorded_source_head=SOURCE,
+                integration_action_key="k",
+            )
+        )
+        self.assertEqual(report.final_decision.state, STATE_RETIRED)
+        self.assertEqual(
+            operations.performed, ["remove_worktree", "delete_local_branch"]
+        )
 
 
 class R3ReviewFinding2Test(unittest.TestCase):

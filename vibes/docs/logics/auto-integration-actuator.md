@@ -151,6 +151,22 @@ fallback する」という選択肢が構造上存在しない。
 - 非 Git workspace では worktree / branch step を明示的に `not_applicable` とし、process retire
   だけを独立に実行する。
 
+## 現行 contract の要約 (R7 時点)
+
+歴史的経緯は後続の節に残すが、**現時点で成立している契約**はこれだけである。矛盾したら本節を優先する。
+
+- `run_integration(record)` / `run_cleanup(record)` は **action record (identity) のみ**を受け取る。
+  caller preflight も caller ledger も存在しない。
+- 安全事実は **actuator が測る**: git 事実は port probe、durable 事実は `DurableAuthorityReader`、
+  lane identity は actuator 自身の `lane_worktree` / `lane_branch`。**live reader は未実装 (#14825)**。
+- 測定は **step ごと**に取り直す。actuator 自身の mutation が世界を変えるため。
+- target head は **fresh remote tip**。pre-push は expected-head CAS、post-push は landed-head
+  reachability。merge の parent も **measured remote target に exact-bind** する。
+- `already_integrated` / `patch_equivalent` は **push 前のみ** terminal。push 後は exact-SHA CI を完走。
+- destructive: worktree remove は clean + registered + 自 lane、branch delete は **`git branch -D`**
+  (checkout 不在を git が原子的に enforce) + 直前の git 側 tip CAS。**remote ref delete は無い**。
+- `mode` は `auto` / `disabled` のみ。CI gate は config で外せない。
+
 ## 実装構成
 
 ```text

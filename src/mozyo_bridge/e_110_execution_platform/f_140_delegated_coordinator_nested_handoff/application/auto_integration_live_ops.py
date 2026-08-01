@@ -287,7 +287,12 @@ class LiveAutoIntegrationGitOperations:
     # -- mutations --------------------------------------------------------
 
     def apply_merge(
-        self, *, source_head: str, target_ref: str, integration_worktree: str
+        self,
+        *,
+        source_head: str,
+        target_ref: str,
+        integration_worktree: str,
+        expected_target_head: str,
     ) -> MergeResult:
         """Merge ``source_head`` into ``target_ref`` inside ``integration_worktree``.
 
@@ -305,6 +310,21 @@ class LiveAutoIntegrationGitOperations:
                 detail=(
                     f"could not switch the integration worktree to {branch}: "
                     f"{switched.stderr.strip()}"
+                ),
+            )
+        # R6 review j#96391 finding 1: the merge's target parent must be the commit the
+        # action measured on the REMOTE, not whatever this worktree's local branch points at.
+        # Measured wrong: a dedicated worktree holding one extra unreviewed commit produced a
+        # merge containing it, and the push was accepted because it was still a fast-forward.
+        local_tip = self._run("rev-parse", "--verify", "HEAD", cwd=worktree)
+        local_head = local_tip.stdout.strip() if local_tip.returncode == 0 else ""
+        if not _is_full_sha(expected_target_head) or local_head != expected_target_head:
+            return MergeResult(
+                conflicted=True,
+                detail=(
+                    f"the integration worktree's {branch} is at {local_head or 'an unreadable head'}, "
+                    f"not the expected target {expected_target_head}; refusing to merge onto an "
+                    "unverified parent"
                 ),
             )
         merged = self._run(
@@ -374,20 +394,44 @@ class LiveAutoIntegrationGitOperations:
         return result.returncode == 0
 
     def delete_local_branch(self, *, branch: str, expected_tip: str) -> bool:
-        """Compare-and-swap delete of ``refs/heads/<branch>`` at ``expected_tip``.
+        """Delete ``refs/heads/<branch>``, with git enforcing both safety conditions.
 
-        ``git update-ref -d <ref> <old_value>`` deletes only while the ref still points at
-        ``old_value``, so a branch that moved since the action was formed survives. Neither
-        ``git branch -d`` (which asks about reachability from HEAD — the wrong question) nor
-        ``git branch -D`` (which asks nothing) is used.
+        Two conditions matter and they need different primitives (R6 review j#96391 finding 3,
+        measured on real git):
+
+        - **No worktree may hold the branch.** ``git update-ref -d`` does NOT check this: with
+          a linked worktree on ``lane`` it deleted the ref and left that worktree's HEAD
+          unresolvable. ``git branch -D`` refuses atomically — ``cannot delete branch 'lane'
+          used by worktree at ...`` — so the destructive primitive is now that one. R1 chose
+          ``update-ref`` for its compare-and-swap and left this condition to a separate probe,
+          which is a time-of-check/time-of-use gap on the one axis whose failure is not
+          recoverable for the affected worktree.
+        - **The tip must still be the recorded one.** ``git branch -D`` does not check it, so
+          it is verified immediately before by a no-op compare-and-set: ``update-ref <ref>
+          <tip> <tip>`` succeeds only while the ref already points there. Asking git rather
+          than trusting an earlier probe keeps the check on the ref itself.
+
+        Residual, stated rather than hidden: the tip verification and the delete are two
+        invocations, so a tip that moves between them is not caught. That window cannot be
+        closed with git's primitives — no single command both compare-and-swaps a tip and
+        refuses a checked-out branch. It is bounded by the gates that precede it (the branch
+        must already be reachable from the target, so its commits survive) and by git's reflog.
+        If that residual is unacceptable the operation should be withdrawn entirely, as the
+        remote-branch delete was; #13686 j#96392 asks for that ruling.
         """
         if not _is_full_sha(expected_tip):
             return False
         name = _checked_branch(branch)
-        result = self._run(
-            "update-ref", "-d", "--end-of-options", f"refs/heads/{name}", expected_tip
+        ref = f"refs/heads/{name}"
+        # Compare-and-set the tip to itself: a verification git performs on the ref, not a
+        # value this process read earlier and hopes is still true.
+        verified = self._run(
+            "update-ref", "--end-of-options", ref, expected_tip, expected_tip
         )
-        return result.returncode == 0
+        if verified.returncode != 0:
+            return False
+        deleted = self._run("branch", "-D", "--end-of-options", name)
+        return deleted.returncode == 0
 
 
 __all__ = (

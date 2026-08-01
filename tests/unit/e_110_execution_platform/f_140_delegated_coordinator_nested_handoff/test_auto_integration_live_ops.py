@@ -44,6 +44,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 
 SOURCE = "a" * 40
 MERGE_HEAD = "d" * 40
+TARGET = "b" * 40
+OTHER_HEAD = "e" * 40
 
 
 class _Recorder:
@@ -135,21 +137,43 @@ class PushTest(unittest.TestCase):
 
 class MergeTest(unittest.TestCase):
     def test_the_merge_runs_in_the_dedicated_worktree(self) -> None:
-        recorder = _Recorder([_ok(), _ok(), _ok(MERGE_HEAD)])
+        # switch -> verify the local target tip -> merge -> read the head
+        recorder = _Recorder([_ok(), _ok(TARGET), _ok(), _ok(MERGE_HEAD)])
         result = _adapter(recorder).apply_merge(
-            source_head=SOURCE, target_ref="main", integration_worktree="/wt"
+            source_head=SOURCE,
+            target_ref="main",
+            integration_worktree="/wt",
+            expected_target_head=TARGET,
         )
         self.assertFalse(result.conflicted)
         self.assertEqual(result.integration_head, MERGE_HEAD)
         # Every command ran in the dedicated worktree, never in the lane's repo root.
         self.assertTrue(all(cwd == Path("/wt") for _, cwd in recorder.calls))
         self.assertEqual(recorder.argvs[0][:2], ("switch", "main"))
-        self.assertIn("--no-ff", recorder.argvs[1])
+        self.assertIn("--no-ff", recorder.argvs[2])
+
+    def test_a_local_target_that_is_not_the_expected_remote_head_is_refused(self) -> None:
+        # R6 review j#96391 finding 1: merging onto whatever the dedicated worktree happened
+        # to have checked out put an unreviewed commit on the integration branch.
+        recorder = _Recorder([_ok(), _ok(OTHER_HEAD)])
+        result = _adapter(recorder).apply_merge(
+            source_head=SOURCE,
+            target_ref="main",
+            integration_worktree="/wt",
+            expected_target_head=TARGET,
+        )
+        self.assertTrue(result.conflicted)
+        self.assertIn("refusing to merge onto an unverified parent", result.detail)
+        # It never reached the merge.
+        self.assertNotIn("merge", [argv[0] for argv in recorder.argvs])
 
     def test_a_conflict_aborts_and_is_not_resolved(self) -> None:
-        recorder = _Recorder([_ok(), _fail("CONFLICT"), _ok()])
+        recorder = _Recorder([_ok(), _ok(TARGET), _fail("CONFLICT"), _ok()])
         result = _adapter(recorder).apply_merge(
-            source_head=SOURCE, target_ref="main", integration_worktree="/wt"
+            source_head=SOURCE,
+            target_ref="main",
+            integration_worktree="/wt",
+            expected_target_head=TARGET,
         )
         self.assertTrue(result.conflicted)
         self.assertIn(("merge", "--abort"), [argv[:2] for argv in recorder.argvs])
@@ -159,9 +183,12 @@ class MergeTest(unittest.TestCase):
             self.assertNotIn(forbidden, flat, forbidden)
 
     def test_a_merge_whose_head_cannot_be_resolved_is_treated_as_failed(self) -> None:
-        recorder = _Recorder([_ok(), _ok(), _fail()])
+        recorder = _Recorder([_ok(), _ok(TARGET), _ok(), _fail()])
         result = _adapter(recorder).apply_merge(
-            source_head=SOURCE, target_ref="main", integration_worktree="/wt"
+            source_head=SOURCE,
+            target_ref="main",
+            integration_worktree="/wt",
+            expected_target_head=TARGET,
         )
         self.assertTrue(result.conflicted)
         self.assertEqual(result.integration_head, "")
@@ -176,18 +203,36 @@ class CleanupOperationTest(unittest.TestCase):
         self.assertNotIn("--force", argv)
         self.assertNotIn("-f", argv)
 
-    def test_local_delete_is_a_compare_and_swap_not_a_branch_delete(self) -> None:
-        recorder = _Recorder([_ok()])
+    def test_local_delete_verifies_the_tip_with_git_then_lets_git_enforce_checkout(
+        self,
+    ) -> None:
+        # R6 review j#96391 finding 3, measured on real git: `update-ref -d` deletes a branch
+        # a linked worktree still holds, leaving that worktree's HEAD unresolvable, while
+        # `git branch -D` refuses it atomically. The tip is verified first by a no-op
+        # compare-and-set, so both conditions are checked by git rather than by an earlier
+        # probe this process is hoping is still true.
+        recorder = _Recorder([_ok(), _ok()])
         self.assertTrue(
             _adapter(recorder).delete_local_branch(branch="lane", expected_tip=SOURCE)
         )
-        argv = recorder.argvs[0]
-        self.assertEqual(argv[:2], ("update-ref", "-d"))
-        # The old value is supplied, which is what makes the delete conditional.
-        self.assertIn("refs/heads/lane", argv)
-        self.assertIn(SOURCE, argv)
-        self.assertNotIn("branch", argv)
-        self.assertNotIn("-D", argv)
+        verify, delete = recorder.argvs
+        self.assertEqual(verify[0], "update-ref")
+        self.assertIn("refs/heads/lane", verify)
+        self.assertEqual(verify.count(SOURCE), 2)  # old == new: a check, not a move
+        self.assertEqual(delete[:2], ("branch", "-D"))
+
+    def test_a_tip_that_moved_is_refused_before_the_delete(self) -> None:
+        recorder = _Recorder([_fail("ref changed")])
+        self.assertFalse(
+            _adapter(recorder).delete_local_branch(branch="lane", expected_tip=SOURCE)
+        )
+        self.assertEqual(len(recorder.argvs), 1)
+
+    def test_a_checked_out_branch_is_refused_by_git_itself(self) -> None:
+        recorder = _Recorder([_ok(), _fail("cannot delete branch 'lane' used by worktree")])
+        self.assertFalse(
+            _adapter(recorder).delete_local_branch(branch="lane", expected_tip=SOURCE)
+        )
 
     def test_a_non_sha_expected_tip_refuses_without_spawning_git(self) -> None:
         recorder = _Recorder([])
@@ -218,10 +263,13 @@ class NoRemoteRefDeleteTest(unittest.TestCase):
     def test_no_mutation_constructs_a_deleting_refspec(self) -> None:
         # A ref delete is spelled as an EMPTY source in the refspec (`:refs/heads/x`). Drive
         # every mutation the adapter has and assert none of them produces that shape.
-        recorder = _Recorder([_ok(), _ok(), _ok(MERGE_HEAD), _ok(), _ok(), _ok()])
+        recorder = _Recorder([_ok(), _ok(TARGET), _ok(), _ok(MERGE_HEAD), _ok(), _ok(), _ok()])
         operations = _adapter(recorder)
         operations.apply_merge(
-            source_head=SOURCE, target_ref="main", integration_worktree="/wt"
+            source_head=SOURCE,
+            target_ref="main",
+            integration_worktree="/wt",
+            expected_target_head=TARGET,
         )
         operations.push_non_force(source_head=SOURCE, target_ref="main")
         operations.remove_worktree(worktree_path="/wt")
