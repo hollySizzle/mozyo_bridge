@@ -22,13 +22,20 @@ other, not a configuration surface.
 What "positive" means (Answer item 4)
 ------------------------------------
 This adapter returns a write root **only** when it can positively correspond all of:
-the manager to use, the query executable (resolved with the same trusted-``PATH``
-discipline as a provider binary — absolute components only, realpath-verified, ambiguity
-is fail-closed), the write root that query reports, and the provider's own package
-directory inside it. Anything else — an unregistered provider, an unknown manager, zero or
-several query executables, a failed / malformed query, a package directory that is not
-there — is a typed ``unresolved`` with a fixed reason token, which the caller must treat as
-``unknown`` and therefore as zero-actuation. It never falls back to "where the provider's
+the manager to use, the query executable, the write root that query reports, and the
+provider's own package directory inside it.
+
+The query executable is resolved under the trusted-``PATH`` safety rules (absolute
+components only, realpath-verified) and taken as the **effective** one — the first match,
+which is what the updater's own shell lookup would run (Design Answer D2 j#96288 item 4).
+A shadowed second install is therefore not ambiguity; an earlier cut treated it as such
+and took a workspace offline. The resolved executable is then run **under that same env**,
+never the ambient process env (review j#96360 F3).
+
+Anything else — an unregistered provider, an unknown manager, no query executable at all,
+an unsafe ``PATH``, a failed / malformed query, a package directory that is not there — is
+a typed ``unresolved`` with a fixed reason token, which the caller must treat as ``unknown``
+and therefore as zero-actuation. It never falls back to "where the provider's
 binary happens to sit on PATH": that was the j#95741 F2 proxy, and it is the reason this
 module exists.
 
@@ -164,6 +171,12 @@ def resolve_updater_target(
             text=True,
             timeout=QUERY_TIMEOUT_SECONDS,
             check=False,
+            # Redmine #14741 review j#96360 F3. The query MUST run under the same env the
+            # executable was resolved from. Inheriting the ambient process env instead let
+            # a stray `NPM_CONFIG_PREFIX` answer about a different global root than the one
+            # being evaluated — i.e. asking the wrong authority, which is the very defect
+            # this whole module exists to close.
+            env=dict(env),
         )
     except Exception:  # noqa: BLE001 - a manager may fail in any number of ways
         return UpdaterTargetResolution(reason=REASON_QUERY_FAILED)

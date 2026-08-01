@@ -72,6 +72,7 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.
     REASON_PROVIDER_UNREGISTERED,
     REASON_QUERY_EXECUTABLE_UNRESOLVED,
     REASON_QUERY_FAILED,
+    UpdaterTargetResolution,
     resolve_updater_target,
 )
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile_config import (  # noqa: E501
@@ -889,43 +890,6 @@ class ProductionOrchestrationFenceTest(unittest.TestCase):
     the caller's own wiring: the probe reaching the fence is the thing under test.
     """
 
-    def _RETIRED_test_the_production_call_shape_arms_the_fence(self) -> None:
-        """The exact gap j#96060 F1 named, asserted on BEHAVIOR rather than source text.
-
-        `commands.py` calls the gate without `updater_targets`. R2 made that mean "no
-        probe -> unknown -> admit", so the fence was inert in production while the tests
-        injected a probe and stayed green. Now the same call shape must consult the
-        built-in adapter and refuse when it cannot vouch for the binary.
-        """
-        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application import (  # noqa: E501
-            startup_admission_gate as gate,
-        )
-
-        consulted: list = []
-        real = gate.builtin_updater_target_probe
-
-        def spy():
-            consulted.append(True)
-            return lambda provider_id: ((), False)
-
-        gate.builtin_updater_target_probe = spy
-        self.addCleanup(setattr, gate, "builtin_updater_target_probe", real)
-
-        emitted: list = []
-        with self.assertRaises(SystemExit):
-            gate.admit_receiver_startup_or_die(
-                herdr_send=True,
-                receiver="codex",
-                target="w4B:p51",
-                read_lines=40,
-                capture_pane=lambda t, n: READY_COMPOSER,
-                emit=lambda o, **k: emitted.append(o),
-                record_format="text",
-                record_command=None,
-            )
-        self.assertTrue(consulted, "the production call shape must consult the adapter")
-        self.assertEqual(emitted[0].reason, "receiver_update_authority_split")
-
     def test_command_module_keeps_its_single_unchanged_call(self) -> None:
         """The composition lives in the gate, so the largest module gains nothing."""
         import inspect
@@ -934,28 +898,6 @@ class ProductionOrchestrationFenceTest(unittest.TestCase):
 
         source = inspect.getsource(commands)
         self.assertNotIn("builtin_updater_target_probe", source)
-
-    def _RETIRED_test_send_is_refused_when_the_authority_cannot_be_established(self) -> None:
-        """`unknown` is zero-send now (Answer item 4). R2 admitted it; that is retracted."""
-        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.startup_admission_gate import (  # noqa: E501
-            admit_receiver_startup_or_die,
-        )
-
-        emitted: list = []
-        with self.assertRaises(SystemExit):
-            admit_receiver_startup_or_die(
-                herdr_send=True,
-                receiver="codex",
-                target="w4B:p51",
-                read_lines=40,
-                capture_pane=lambda t, n: READY_COMPOSER,
-                emit=lambda o, **k: emitted.append(o),
-                record_format="text",
-                record_command=None,
-                ledger=emitted.append,
-                updater_targets=lambda pid: ((), False),
-            )
-        self.assertEqual(emitted[0].reason, "receiver_update_authority_split")
 
     def test_launch_preflight_refuses_a_relaunch_it_cannot_vouch_for(self) -> None:
         """The whole-plan launch fence — the path a lane self-heal re-enters."""
@@ -1153,6 +1095,226 @@ class D2EffectiveManagerResolutionTest(unittest.TestCase):
                 {"PATH": os.pathsep.join([a, b])},
                 registry=_fake_profile_registry(),
             )
+
+
+class ActualOrchestratorFenceTest(unittest.TestCase):
+    """Review j#96360 F2 — drive the REAL `orchestrate_handoff`, not a helper.
+
+    Three rounds of this issue were reported as wired while the production caller supplied
+    nothing, because every test measured a helper boundary (`admit_receiver_startup_or_die`,
+    `preflight_launch_providers`) that the tests themselves armed. These call the actual
+    orchestrator, so an unwired composition root shows up as a passing send instead of a
+    refusal — the failure mode that kept slipping through.
+    """
+
+    def _orchestrate(self, *, receiver, pane, resolution):
+        """Substitute the HOST boundary only — never the composition's own decision.
+
+        The first cut of this helper patched `updater_target_resolver_for`, which is the
+        decision under test, so unwiring the composition root left every assertion green:
+        the same mistake j#96360 F2 named. Patching `resolve_updater_target` instead keeps
+        the test hermetic while leaving "is the fence armed for this receiver?" to
+        production code.
+        """
+        import mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.startup_admission_composition as comp
+        import mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter as adapter
+
+        real = adapter.resolve_updater_target
+        adapter.resolve_updater_target = lambda *a, **k: resolution
+        self.addCleanup(setattr, adapter, "resolve_updater_target", real)
+
+        emitted: list = []
+        try:
+            comp.admit_receiver_startup_or_die(
+                herdr_send=True,
+                receiver=receiver,
+                target="w4B:p51",
+                read_lines=40,
+                capture_pane=lambda t, n: pane,
+                emit=lambda o, **k: emitted.append(o),
+                record_format="text",
+                record_command=None,
+            )
+            return "SENT", emitted
+        except SystemExit:
+            return "REFUSED", emitted
+
+    def test_real_send_path_refuses_a_split_codex_lane(self) -> None:
+        unresolved = UpdaterTargetResolution(roots=(), resolved=False, reason=REASON_QUERY_FAILED)
+        verdict, emitted = self._orchestrate(
+            receiver="codex", pane=READY_COMPOSER, resolution=unresolved
+        )
+        self.assertEqual(verdict, "REFUSED")
+        self.assertEqual(emitted[0].reason, "receiver_update_authority_split")
+
+    def test_real_send_path_admits_an_unbound_provider(self) -> None:
+        unresolved = UpdaterTargetResolution(roots=(), resolved=False, reason=REASON_QUERY_FAILED)
+        verdict, emitted = self._orchestrate(
+            receiver="claude", pane=READY_COMPOSER, resolution=unresolved
+        )
+        self.assertEqual(verdict, "SENT")
+        self.assertEqual(emitted, [])
+
+
+class ActualLaunchAndSelfHealFenceTest(unittest.TestCase):
+    """Review j#96360 F1/F2 — the production launch path, and the self-heal that re-enters it.
+
+    `herdr_session_start` is the one production caller of `preflight_launch_providers`, and
+    a lane self-heal re-launches through it. R4 added the parameter and left this caller
+    passing nothing; this pins the caller itself rather than the helper.
+    """
+
+    def test_production_launch_path_arms_the_fence(self) -> None:
+        import inspect
+
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_session_start,
+        )
+
+        # The arming lives in the composed preflight the launch path imports, not in a
+        # kwarg at the call site: `herdr_session_start` sits just under the module-health
+        # threshold and a self-approved allowlist entry is not an option, so the wiring is
+        # an import redirect exactly as it is for `commands.py`.
+        source = inspect.getsource(herdr_session_start)
+        self.assertIn("agent_provider_launch_composition import", source)
+        self.assertNotIn("agent_provider_executable import", source)
+
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application import (  # noqa: E501
+            agent_provider_launch_composition as comp,
+        )
+
+        self.assertIs(
+            herdr_session_start.preflight_launch_providers,
+            comp.preflight_launch_providers,
+            "the production launch path must resolve to the ARMED preflight",
+        )
+
+    def test_composed_launch_preflight_arms_without_being_asked(self) -> None:
+        """Behavioral, not structural: the composed preflight must fence a codex launch
+        even though the caller passes no `updater_targets`.
+
+        The import-identity assertion above proves the right symbol is wired; it cannot
+        prove the symbol still arms. This one goes RED the moment the composition stops
+        supplying the resolver — which is the property j#96360 F1/F2 asked for.
+        """
+        import mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter as adapter
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_launch_composition import (  # noqa: E501
+            preflight_launch_providers,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_executable import (  # noqa: E501
+            AgentProviderExecutableError,
+        )
+
+        real = adapter.resolve_updater_target
+        adapter.resolve_updater_target = lambda *a, **k: UpdaterTargetResolution(
+            roots=(), resolved=False, reason=REASON_QUERY_FAILED
+        )
+        self.addCleanup(setattr, adapter, "resolve_updater_target", real)
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        bindir = os.path.join(tmp.name, "bin")
+        os.makedirs(bindir, exist_ok=True)
+        exe = os.path.join(bindir, "codex")
+        with open(exe, "w", encoding="utf-8") as h:
+            h.write("#!/bin/sh\nexit 0\n")
+        os.chmod(exe, os.stat(exe).st_mode | stat.S_IXUSR)
+
+        with self.assertRaises(AgentProviderExecutableError):
+            preflight_launch_providers(
+                ["codex"], {"PATH": bindir, "MOZYO_AGENT_CODEX_BINARY": exe}
+            )
+
+    def test_launch_composition_scopes_per_provider(self) -> None:
+        """A bound sibling must not drag an unbound provider into the fence (D2 item 1)."""
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_launch_composition import (  # noqa: E501
+            launch_updater_target_resolver,
+        )
+
+        self.assertIsNone(launch_updater_target_resolver(["claude"]))
+        mixed = launch_updater_target_resolver(["codex", "claude"])
+        self.assertIsNotNone(mixed)
+        self.assertIsNone(mixed("claude"), "unbound stays not_evaluated inside a mixed plan")
+
+    def test_relaunch_is_refused_when_the_binding_drifted(self) -> None:
+        """An update rewrote the executable under the lane: the self-heal must not restart it."""
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_executable import (  # noqa: E501
+            AgentProviderExecutableError,
+            preflight_launch_providers,
+        )
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        bindir = os.path.join(tmp.name, "bin")
+        pinned = _make_executable(bindir)
+        env = {"PATH": bindir, "MOZYO_AGENT_FAKEX_BINARY": pinned}
+        registry = _fake_profile_registry()
+
+        with self.assertRaises(AgentProviderExecutableError):
+            preflight_launch_providers(
+                ["fakex"],
+                env,
+                registry=registry,
+                updater_targets=lambda pid: ([bindir], True),
+                bound_identities={"fakex": executable_identity(pinned, "0.145.0")},
+                observed_versions={"fakex": "0.146.0"},
+            )
+
+        # Same-version reinstall changed nothing this lane runs -> the relaunch proceeds.
+        self.assertIn(
+            "fakex",
+            preflight_launch_providers(
+                ["fakex"],
+                env,
+                registry=registry,
+                updater_targets=lambda pid: ([bindir], True),
+                bound_identities={"fakex": executable_identity(pinned, "0.146.0")},
+                observed_versions={"fakex": "0.146.0"},
+            ),
+        )
+
+
+class QueryEnvironmentTest(unittest.TestCase):
+    """Review j#96360 F3 — the query runs under the env its executable was resolved from."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.bindir = os.path.join(self.tmp.name, "bin")
+        os.makedirs(self.bindir, exist_ok=True)
+        npm = os.path.join(self.bindir, "npm")
+        with open(npm, "w", encoding="utf-8") as h:
+            h.write("#!/bin/sh\nexit 0\n")
+        os.chmod(npm, os.stat(npm).st_mode | stat.S_IXUSR)
+
+    def test_runner_receives_the_trusted_env_not_the_ambient_one(self) -> None:
+        seen: dict = {}
+
+        def runner(argv, **kwargs):
+            seen.update(kwargs)
+            return types.SimpleNamespace(returncode=0, stdout="/nowhere")
+
+        env = {"PATH": self.bindir, "NPM_CONFIG_PREFIX": "/elsewhere"}
+        resolve_updater_target("codex", env, runner=runner)
+        self.assertEqual(
+            seen.get("env"),
+            env,
+            "a stray NPM_CONFIG_PREFIX in the ambient env would answer about a different "
+            "global root than the one being evaluated (j#96360 F3)",
+        )
+
+    def test_no_retired_placeholder_tests_remain(self) -> None:
+        """j#96360 F2 also flagged disabled, non-executing tests. None may survive.
+
+        The marker is assembled at runtime so this assertion does not match its own
+        source — the same trap as quoting a gate marker literally in a gate journal.
+        """
+        import inspect
+
+        import tests.regressions.test_issue_14741_codex_update_binary_authority_split as mod
+
+        marker = "_" + "RETIRED" + "_"
+        self.assertNotIn(marker, inspect.getsource(mod))
 
 
 if __name__ == "__main__":

@@ -205,7 +205,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     build_agent_start_argv,
     resolve_attest_launcher,
 )
-from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_executable import (
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_launch_composition import (
     ResolvedProviderLaunch,
     preflight_launch_providers,
 )

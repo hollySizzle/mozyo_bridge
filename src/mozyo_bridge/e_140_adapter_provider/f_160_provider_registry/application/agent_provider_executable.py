@@ -381,6 +381,8 @@ def preflight_launch_providers(
     permission_mode_default: Optional[str] = None,
     registry: Optional[AgentProviderProfileRegistry] = None,
     updater_targets: Optional[object] = None,
+    bound_identities: Optional[Mapping[str, str]] = None,
+    observed_versions: Optional[Mapping[str, str]] = None,
 ) -> "dict[str, ResolvedProviderLaunch]":
     """Resolve EVERY launch provider up front, or raise having touched nothing.
 
@@ -426,6 +428,7 @@ def preflight_launch_providers(
     # caller mutates nothing (zero-relaunch).
     from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_update_authority_preflight import (  # noqa: E501
         evaluate_update_authority,
+        executable_identity,
     )
 
     resolved: dict[str, ResolvedProviderLaunch] = {}
@@ -433,9 +436,28 @@ def preflight_launch_providers(
         if provider_id in resolved:
             continue
         launch_exe = resolve_agent_launch(provider_id, env, registry=registry)
-        if updater_targets is not None:
+        per_provider = (
+            updater_targets(provider_id) if callable(updater_targets) else None
+        )
+        if updater_targets is not None and per_provider is not None:
+            # Review j#96360 F1: the launch fence had no identity input at all, so an
+            # in-place version rewrite under a lane could not be re-verified here. The
+            # bound identity is what the lane was pinned to; the observed version is what
+            # THIS resolution's exec target reports now. Both are supplied by the caller —
+            # this module runs no provider binary.
+            bound = (bound_identities or {}).get(provider_id, "")
+            observed = (
+                executable_identity(launch_exe.exec_target, (observed_versions or {}).get(provider_id, ""))
+                if bound
+                else ""
+            )
             authority = evaluate_update_authority(
-                provider_id, env, registry=registry, updater_targets=updater_targets
+                provider_id,
+                env,
+                registry=registry,
+                updater_targets=lambda _pid, _r=per_provider: _r,
+                bound_identity=bound,
+                observed_identity=observed,
             )
             if not authority.admits_actuation:
                 raise AgentProviderExecutableError(
