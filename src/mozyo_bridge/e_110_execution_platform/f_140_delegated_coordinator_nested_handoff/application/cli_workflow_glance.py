@@ -50,7 +50,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MappingGlanceRedmineSource,
     MappingGlanceSnapshotSource,
     active_lane_snapshots,
-    enumerate_active_lanes,
+    enumerate_active_lanes_for_repo,
+    enumerate_detached_residue_for_repo,
     enumerate_lifecycle_diagnostic,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_glance import (
@@ -176,7 +177,11 @@ def _roster(args: argparse.Namespace):
     issues = [i.strip() for i in (getattr(args, "issue", None) or []) if i.strip()]
     if issues:
         return tuple((issue, "") for issue in issues), None
-    return enumerate_active_lanes(Path.cwd())
+    # Redmine #14813 R1-F1: scoped to THIS repo's workspace, not host-global. A lane owned by
+    # another workspace on the same host is not this repo's capacity, and it leaked into the
+    # rows while the CLI called the host-global enumerator. An unresolved scope degrades
+    # rather than falling back — a silent fallback is the leak.
+    return enumerate_active_lanes_for_repo(Path.cwd())
 
 
 def _collect(args: argparse.Namespace):
@@ -228,7 +233,19 @@ def _collect(args: argparse.Namespace):
 
     if issues:
         snaps = [s for s in snaps if s.issue_id in issues]
-    return fold_glance_rows(snaps), degraded, tuple(notes)
+    # Redmine #14813 R1-F2 / acceptance 2: a lane whose issue is already closed is coordinator
+    # debt (unintegrated / unretired), not active workflow. It is partitioned OUT of the active
+    # rows and reported as a typed drain diagnostic — kept visible, but not mixed into the
+    # population an operator reads as "what is in flight". The split is on the durable
+    # `issue_open` fact, so it needs no extra source.
+    active = [s for s in snaps if s.signal.issue_open]
+    closed_debt = [s for s in snaps if not s.signal.issue_open]
+    return (
+        fold_glance_rows(active),
+        fold_glance_rows(closed_debt),
+        degraded,
+        tuple(notes),
+    )
 
 
 def cmd_workflow_glance(args: argparse.Namespace) -> int:
@@ -239,7 +256,7 @@ def cmd_workflow_glance(args: argparse.Namespace) -> int:
     source that was unavailable is never silently read as "nothing active". Mutates nothing
     and always returns 0 — the output is a projection, not a delivery.
     """
-    rows, degraded, notes = _collect(args)
+    rows, closed_debt, degraded, notes = _collect(args)
     # Redmine #13681 W4 / R1 F4 (j#77247): the lifecycle diagnostic roster is folded into
     # the SAME operator-facing view. A superseded / hibernated / retired lane is excluded
     # from the active-capacity roster above (it no longer owns its issue), but its
@@ -250,8 +267,31 @@ def cmd_workflow_glance(args: argparse.Namespace) -> int:
     if diag_error:
         degraded = True
         notes = tuple(notes) + (diag_error,)
+    # Redmine #14813 R1-F2: the rows the capacity partition drops must land on an
+    # operator-facing surface. Excluding detached residue from capacity without reporting it
+    # would trade "residue counted as capacity" for "detached worktree invisible" — the same
+    # failure pointed the other way. An enumeration error degrades the view, so a residue read
+    # that could not run is never read as "no residue".
+    residue, residue_error = enumerate_detached_residue_for_repo(Path.cwd())
+    if residue_error:
+        degraded = True
+        notes = tuple(notes) + (residue_error,)
     if getattr(args, "as_json", False):
         payload = glance_payload(rows, degraded=degraded, notes=notes)
+        payload["closed_coordinator_debt"] = [
+            {
+                "issue": row.issue_id,
+                "lane": row.lane,
+                "workflow_state": row.workflow_state,
+                "next_action": row.next_action,
+                "next_owner": row.next_owner,
+            }
+            for row in closed_debt
+        ]
+        payload["detached_residue"] = [
+            {"issue": issue, "lane": lane, "execution_surface": surface}
+            for issue, lane, surface in residue
+        ]
         payload["lifecycle_diagnostic"] = [
             {
                 "issue": issue,
@@ -264,6 +304,21 @@ def cmd_workflow_glance(args: argparse.Namespace) -> int:
         print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     else:
         print(render_glance_table(rows))
+        if closed_debt:
+            print("")
+            print("closed coordinator debt (closed issue, still on the lane surface):")
+            for row in closed_debt:
+                print(
+                    f"  - #{row.issue_id or '-'} {row.lane or '-'}: "
+                    f"{row.workflow_state} / {row.next_action} ({row.next_owner})"
+                )
+        if residue:
+            print("")
+            print(
+                "detached residue (no lifecycle row, no slots — excluded from capacity):"
+            )
+            for issue, lane, surface in residue:
+                print(f"  - #{issue or '-'} {lane or '-'}: {surface}")
         if diagnostic:
             print("")
             print("lifecycle diagnostic (non-active lanes, excluded from capacity):")

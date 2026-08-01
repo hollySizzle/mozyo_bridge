@@ -312,3 +312,133 @@ class CatalogSoftProfileDriftTest(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class GlanceCliSurfaceTest(unittest.TestCase):
+    """R1-F2 / R1-F1: what the operator actually sees when running `workflow glance`.
+
+    The first revision fixed the fold and asserted foreign exclusion through the **private**
+    `_fold(..., workspace_id=...)`. That test could not fail on the real defect: the CLI called
+    the host-global enumerator, so a foreign live lane still reached the rows (j#96246 measured
+    host-global 13 vs current-workspace 12, `#14648` leaking). These tests go through
+    `cmd_workflow_glance` instead, so the wiring is what is pinned, not the helper.
+    """
+
+    def _run_glance(self, *, roster, roster_error=None, residue=(), residue_error=None,
+                    snapshots=()):
+        import argparse
+        import io
+        import json as _json
+        from contextlib import redirect_stdout
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            cli_workflow_glance as cli,
+        )
+
+        originals = {
+            "roster": cli.enumerate_active_lanes_for_repo,
+            "residue": cli.enumerate_detached_residue_for_repo,
+            "diag": cli.enumerate_lifecycle_diagnostic,
+            "snaps": cli.active_lane_snapshots,
+        }
+        cli.enumerate_active_lanes_for_repo = lambda _root: (tuple(roster), roster_error)
+        cli.enumerate_detached_residue_for_repo = lambda _root: (tuple(residue), residue_error)
+        cli.enumerate_lifecycle_diagnostic = lambda _root: ((), None)
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.glance_snapshot_source import (  # noqa: E501
+            GlanceCollection,
+        )
+
+        cli.active_lane_snapshots = lambda *a, **k: GlanceCollection(tuple(snapshots))
+        args = argparse.Namespace(active_lanes=True, as_json=True, issue=None)
+        buffer = io.StringIO()
+        try:
+            with redirect_stdout(buffer):
+                cli.cmd_workflow_glance(args)
+        finally:
+            cli.enumerate_active_lanes_for_repo = originals["roster"]
+            cli.enumerate_detached_residue_for_repo = originals["residue"]
+            cli.enumerate_lifecycle_diagnostic = originals["diag"]
+            cli.active_lane_snapshots = originals["snaps"]
+        return _json.loads(buffer.getvalue())
+
+    def _snapshot(self, issue: str, *, issue_open: bool = True):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (  # noqa: E501
+            LaneSignal,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_glance import (  # noqa: E501
+            IssueGlanceSnapshot,
+        )
+
+        return IssueGlanceSnapshot(
+            issue_id=issue,
+            signal=LaneSignal(issue=issue, issue_open=issue_open),
+            subject=f"subject {issue}",
+            lane=f"lane-{issue}",
+        )
+
+    def test_cli_reads_the_repo_scoped_roster(self) -> None:
+        # The wiring itself: the CLI must call the repo-scoped enumerator. Pinned by name
+        # because the host-global one returns a superset and the difference is the leak.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            cli_workflow_glance as cli,
+        )
+
+        self.assertTrue(
+            hasattr(cli, "enumerate_active_lanes_for_repo"),
+            "the glance CLI must resolve the repo workspace scope; the host-global roster "
+            "carries other workspaces' lanes into this repo's rows",
+        )
+
+    def test_detached_residue_reaches_the_json_surface(self) -> None:
+        payload = self._run_glance(
+            roster=(("14100", "resident"),),
+            residue=(("14001", "stale", SURFACE_DETACHED_WORKTREE),),
+            snapshots=(self._snapshot("14100"),),
+        )
+        self.assertEqual(
+            payload["detached_residue"],
+            [
+                {
+                    "issue": "14001",
+                    "lane": "stale",
+                    "execution_surface": SURFACE_DETACHED_WORKTREE,
+                }
+            ],
+            "residue dropped from capacity must still be reported; otherwise the fix trades "
+            "'residue counted as capacity' for 'detached worktree invisible'",
+        )
+
+    def test_residue_enumeration_error_degrades_the_view(self) -> None:
+        payload = self._run_glance(
+            roster=(),
+            residue=(),
+            residue_error="detached residue scope unresolved (repo workspace id unknown)",
+        )
+        self.assertTrue(
+            payload["degraded"],
+            "a residue read that could not run must degrade the view, never read as 'none'",
+        )
+
+    def test_closed_issue_is_reported_as_debt_not_as_an_active_row(self) -> None:
+        payload = self._run_glance(
+            roster=(("14100", "resident"), ("13820", "closed-lane")),
+            snapshots=(
+                self._snapshot("14100"),
+                self._snapshot("13820", issue_open=False),
+            ),
+        )
+        # `rows` uses the row payload's own key (`issue_id`); the debt list is this
+        # commit's own shape and uses `issue`, matching `detached_residue`.
+        active_ids = {row["issue_id"] for row in payload["rows"]}
+        debt_ids = {row["issue"] for row in payload["closed_coordinator_debt"]}
+        self.assertEqual(
+            active_ids,
+            {"14100"},
+            "a closed issue is coordinator debt, not active workflow",
+        )
+        self.assertEqual(
+            debt_ids,
+            {"13820"},
+            "closed debt must stay visible on its own surface, not be deleted",
+        )
