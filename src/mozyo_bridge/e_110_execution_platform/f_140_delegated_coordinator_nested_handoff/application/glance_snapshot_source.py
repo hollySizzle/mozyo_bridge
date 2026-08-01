@@ -39,6 +39,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_integration_disposition import (
     IntegrationDispositionFacts,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_execution_surface import (
+    SURFACE_DETACHED_WORKTREE,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
+    SUBLANE_STATE_DETACHED,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_journal_grammar import (
     fold_issue_gate_facts,
     lane_signal_from_gate_facts,
@@ -538,12 +544,29 @@ def _fold_active_roster(views, *, workspace_id) -> tuple:
     also excludes a lane the lifecycle authority marks non-active — a superseded / hibernated /
     retired lane still holding live panes would otherwise consume capacity in the window between
     the disposition write and the process release. Join the lifecycle records by the lane's
-    ``(workspace_id, lane_id)`` unit; a lane with disposition ``active``, no lifecycle row
-    (owner-unbound), or an unreadable lifecycle store stays in the roster (over-counting capacity
-    is the conservative direction — it never over-dispatches).
+    ``(workspace_id, lane_id)`` unit; a lane with disposition ``active`` or an unreadable
+    lifecycle store stays in the roster (over-counting capacity is the conservative direction —
+    it never over-dispatches).
+
+    Redmine #14813: a lane with **no lifecycle row** is split by whether it actually holds
+    slots. The pre-#14813 fold kept every such lane, so legacy inventory residue — a view with
+    no lifecycle row, no pair and no panes — entered the active roster, resolved to
+    ``execution_surface=unknown`` downstream, and stopped the whole pipeline on
+    ``stop_unverified_surface`` (32 roster rows / 25 closed / 19 unknown, j#96022). Residue
+    cannot occupy a managed sublane slot: it has nothing running. It is therefore excluded from
+    active capacity and returned as a typed ``detached_worktree`` diagnostic instead of being
+    dropped.
+
+    The conservative direction is preserved exactly where it matters: a row with **no lifecycle
+    row but live slot evidence** is an unverified *live* managed claim and stays in the roster,
+    so it still fails closed downstream. The split is on residency evidence, never on the issue's
+    Redmine state — a closed issue whose pair is still running keeps consuming capacity.
+
+    Returns ``(roster, residue)``.
     """
     disposition_by_unit = _lifecycle_disposition_by_unit()
     roster = []
+    residue = []
     for view in views:
         issue = str(getattr(view, "issue", "") or "").strip()
         lane = str(getattr(view, "lane_label", "") or getattr(view, "lane_id", "") or "").strip()
@@ -559,9 +582,48 @@ def _fold_active_roster(views, *, workspace_id) -> tuple:
             # Non-active disposition: excluded from active capacity (kept on the
             # lifecycle diagnostic roster below).
             continue
+        if disposition is None and not _view_holds_slots(view):
+            # Redmine #14813: owner-unbound AND holding nothing — inventory residue, not
+            # capacity. Kept as a diagnostic so a detached worktree never silently vanishes.
+            if issue or lane:
+                residue.append((issue, lane, SURFACE_DETACHED_WORKTREE))
+            continue
         if issue:
             roster.append((issue, lane))
-    return tuple(roster)
+    return tuple(roster), tuple(residue)
+
+
+def _view_holds_slots(view) -> bool:
+    """Does ``view`` carry evidence that it currently occupies runtime slots? (pure)
+
+    The residency test the #14813 partition turns on, deliberately built as a **conjunction of
+    two independent signals**: a view is treated as holding nothing only when the read model's
+    published ``state`` says ``detached`` AND no pane evidence is present. Either signal alone
+    is unsafe in a different direction:
+
+    * panes alone — a view that simply does not populate pane fields would read as residue even
+      while it is live. The roster's own contract
+      (``test_no_lifecycle_rows_keeps_every_live_lane``) pins that an owner-unbound world keeps
+      every live lane, and its views carry ``state`` without panes;
+    * ``state`` alone — a stale label could outlive the panes it describes.
+
+    Requiring both keeps #13681's conservative direction exactly: a lane is dropped from
+    capacity only when two independently-derived facts agree it is holding nothing. That is
+    precisely the population j#96022 measured — all 19 residue rows were ``state=detached``
+    *and* ``gateway_pane=null`` / ``worker_pane=null`` / ``panes=[]``.
+
+    Reached only for rows the lifecycle store does not know at all; a lifecycle-known lane is
+    decided by its disposition first.
+    """
+    for attr in ("gateway_pane", "worker_pane"):
+        if str(getattr(view, attr, "") or "").strip():
+            return True
+    if tuple(getattr(view, "panes", ()) or ()):
+        return True
+    # No pane evidence. Only a view the read model itself calls `detached` is residue; any
+    # other state (including an absent / unrecognized one) stays in the roster.
+    state = str(getattr(view, "state", "") or "").strip()
+    return state != SUBLANE_STATE_DETACHED
 
 
 def enumerate_active_lanes(repo_root) -> tuple:
@@ -585,7 +647,7 @@ def enumerate_active_lanes(repo_root) -> tuple:
         views = _active_lane_views(repo_root)
     except Exception as exc:  # noqa: BLE001 - a roster read never raises out of the glance
         return (), f"active-lane roster enumeration failed ({type(exc).__name__})"
-    return _fold_active_roster(views, workspace_id=None), None
+    return _fold_active_roster(views, workspace_id=None)[0], None
 
 
 def enumerate_active_lanes_for_workspace(repo_root, *, workspace_id: str) -> tuple:
@@ -607,7 +669,28 @@ def enumerate_active_lanes_for_workspace(repo_root, *, workspace_id: str) -> tup
         views = _active_lane_views(repo_root)
     except Exception as exc:  # noqa: BLE001 - a roster read never raises out of the supervisor
         return (), f"active-lane roster enumeration failed ({type(exc).__name__})"
-    return _fold_active_roster(views, workspace_id=wanted), None
+    return _fold_active_roster(views, workspace_id=wanted)[0], None
+
+
+def enumerate_detached_residue(repo_root, *, workspace_id=None) -> tuple:
+    """Enumerate the rows #14813 partitions OUT of active capacity: ``(rows, error)``.
+
+    The other half of :func:`enumerate_active_lanes`. A view with no lifecycle row and no slot
+    evidence is inventory residue — it cannot occupy a managed sublane slot, so counting it as
+    capacity turned the whole projection ``degraded`` and stopped admission on
+    ``stop_unverified_surface``. Excluding it silently would be the opposite failure (a detached
+    worktree that no longer appears anywhere), so it is reported here instead.
+
+    Each row is ``(issue, lane_label, execution_surface)`` with the surface fixed to
+    ``detached_worktree``. Same ``(rows, error)`` degrade contract as the roster enumeration:
+    a read that could not run is never confused with "no residue".
+    """
+    try:
+        views = _active_lane_views(repo_root)
+    except Exception as exc:  # noqa: BLE001 - a residue read never raises out of the glance
+        return (), f"detached residue enumeration failed ({type(exc).__name__})"
+    wanted = None if workspace_id is None else str(workspace_id or "").strip()
+    return _fold_active_roster(views, workspace_id=wanted)[1], None
 
 
 #: Bound lazily so the pure glance path never imports the state layer unless a roster
