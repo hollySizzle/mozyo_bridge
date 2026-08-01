@@ -529,6 +529,12 @@ class IntegrationPreflight:
     source_ci: Optional[IntegrationCiEvidence] = None
     integration_ci: Optional[IntegrationCiEvidence] = None
     integration_worktree: Optional[IntegrationWorktree] = None
+    #: Is the commit this action's push landed still reachable from the CURRENT target tip?
+    #: Read only once a trusted push receipt exists, and it is what replaces the pre-push
+    #: expected-head comparison at that point (R5 review j#96385 finding 2): after our own
+    #: push the target has moved by construction, so "it differs from what we expected before
+    #: pushing" is not evidence of anything. Defaults to the unsatisfied value.
+    landed_head_on_target: bool = False
 
 
 __all__ = (

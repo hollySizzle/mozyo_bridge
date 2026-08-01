@@ -209,6 +209,25 @@ authority reader 未注入なら durable 事実は何も確立されず、`integ
 `foreign_worktree` で止まる — CAS tip 一致は「branch が動いていない」ことしか言わず「それが自分のものか」を
 言わないためである。
 
+### 測定は step ごとに取り直す (R5 review j#96385 findings 2/3)
+
+**一度だけ測った snapshot は、その後のすべての mutation にとって stale である。** しかも actuator が
+作用する世界は **actuator 自身の mutation が変える** 世界である。R5 まではこれを取り違えていた:
+
+- push が成功すると remote target は `expected_target_head` から landed head へ移る。それを
+  pre-push の期待値と比べていたため、**自分の成功を drift と誤判定して resume が恒常的に止まった**
+  (feature が完了不能だった)。→ **pre-push は expected-head CAS、post-push は landed-head が
+  現在の target から到達可能か**、と質問を分けた。到達不能は `integration_lost_from_target`
+  (「誰かが先に動かした」= drift とは別の事実、「我々の成果が消えた」)。
+- `already_integrated` は **push 前にのみ** terminal disposition である。push 後は source が target
+  から到達可能なのは当然であり、そこで終了すると exact-SHA CI gate を飛ばしてしまう。
+- cleanup も remove と delete の間で世界が変わる。`branch_checked_out_elsewhere` は **削除対象の
+  worktree 自身も数える**ため、remove 前後で答えが違う。両 machine とも **step ごとに再測定**する。
+
+> **test double が mutation の効果を反映しないと、検査そのものが無効になる。**
+> R5 の 2 件はどちらも、fake が push 後も target head を静止させ、remove 後も checkout 状態を
+> 固定していたために test をすり抜けた。mutating port の fake は自分の mutation を世界へ適用する。
+
 ### ledger は provenance と順序を持つ (R3 review j#96368 finding 3)
 
 `StepOutcome` は `recorded_by` を持ち、actuator は **自分が記録した entry しか数えない**。

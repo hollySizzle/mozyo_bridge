@@ -132,7 +132,12 @@ class FakeGitOperations:
     dedicated_worktree: Optional[IntegrationWorktree] = None
     on_remote: bool = True
     tip: str = SOURCE
-    checked_out_elsewhere: bool = False
+    #: Before the removal the lane's own worktree still holds the branch, exactly as the live
+    #: probe reports it (it counts the worktree being removed).
+    checked_out_elsewhere: bool = True
+    #: What the probe answers once the lane worktree is gone. A test sets this True to model
+    #: somebody else checking the branch out in the window between remove and delete.
+    checked_out_after_remove: bool = False
 
     merge_result: MergeResult = field(
         default_factory=lambda: MergeResult(conflicted=False, integration_head=MERGE_HEAD)
@@ -219,10 +224,26 @@ class FakeGitOperations:
         self.calls.append(
             ("push_non_force", {"source_head": source_head, "target_ref": target_ref})
         )
+        if self.push_result.accepted:
+            # THE WORLD MOVES. R5 review j#96385 findings 2 and 5: this fake used to leave the
+            # target head untouched after a push, so the actuator's own successful push was
+            # invisible to the next run — which is precisely the condition that made the
+            # resume block on `target_drift` forever, and precisely why the tests missed it.
+            # A fake for a mutating port that does not apply its own mutation tells a lie the
+            # tests then certify.
+            self.target_head = source_head
+            self.ancestors = tuple(set(self.ancestors) | {(source_head, source_head)})
         return self.push_result
 
     def remove_worktree(self, *, worktree_path: str) -> bool:
         self.calls.append(("remove_worktree", {"worktree_path": worktree_path}))
+        if self.worktree_removed:
+            # Removing the worktree un-registers it and releases the branch it held. Modelling
+            # this is what exposes the stale-snapshot race in finding 3 — and it is also why
+            # the live `branch_checked_out_elsewhere`, which counts the worktree being removed,
+            # answers differently before and after.
+            self.lane_registered = False
+            self.checked_out_elsewhere = self.checked_out_after_remove
         return self.worktree_removed
 
     def delete_local_branch(self, *, branch: str, expected_tip: str) -> bool:
@@ -490,15 +511,41 @@ class FastForwardRunTest(unittest.TestCase):
             [(STEP_PUSH, OUTCOME_DONE), (STEP_INTEGRATION_CI, OUTCOME_PENDING)],
         )
 
-    def test_a_green_exact_sha_ci_completes_a_RESUMED_run(self) -> None:
-        # CI on a commit pushed moments ago cannot already be settled, so a fresh run rests
-        # at `awaiting_ci`. The SAME actuator resumes from its own ledger and completes.
+    def test_a_run_rests_at_awaiting_ci_until_the_authority_reports_a_verdict(self) -> None:
+        # While CI has not settled the run rests; once the authority reports green for the
+        # commit that landed, the SAME actuator resumes from its own ledger and completes.
+        # R5 review j#96385 finding 2: this used to be impossible — the resume compared the
+        # target against the pre-push expectation, so the actuator's own successful push
+        # looked like drift and every resume blocked.
         record = _record()
-        use_case = _use_case(FakeGitOperations(ancestors=_ff_ancestors()))
-        fresh = use_case.run_integration(record)
-        self.assertEqual(fresh.final_decision.state, STATE_AWAITING_CI)
-        self.assertEqual(use_case.run_integration(record).final_decision.state,
-                         STATE_INTEGRATED)
+        reader = FakeAuthorityReader(withhold_ci=True)
+        operations = FakeGitOperations(ancestors=_ff_ancestors())
+        use_case = _use_case(operations, authority=reader)
+
+        waiting = use_case.run_integration(record)
+        self.assertEqual(waiting.final_decision.state, STATE_AWAITING_CI)
+        self.assertEqual(operations.performed, ["push_non_force"])
+
+        reader.withhold_ci = False
+        resumed = use_case.run_integration(record)
+        self.assertEqual(resumed.final_decision.state, STATE_INTEGRATED)
+        # ...and it did not push again.
+        self.assertEqual(operations.performed, ["push_non_force"])
+
+    def test_work_rewritten_off_the_target_after_our_push_is_not_integrated(self) -> None:
+        # The post-push counterpart of drift: our push landed, then somebody reset the branch.
+        record = _record()
+        reader = FakeAuthorityReader(withhold_ci=True)
+        operations = FakeGitOperations(ancestors=_ff_ancestors())
+        use_case = _use_case(operations, authority=reader)
+        use_case.run_integration(record)
+
+        operations.target_head = OTHER          # somebody rewrote the target
+        operations.ancestors = ()               # our commit is no longer reachable from it
+        reader.withhold_ci = False
+        lost = use_case.run_integration(record)
+        self.assertEqual(lost.final_decision.state, STATE_INTEGRATION_BLOCKED)
+        self.assertEqual(operations.performed, ["push_non_force"])
 
     def test_a_different_actuator_instance_cannot_resume_this_one_s_work(self) -> None:
         # The receipt is per-instance, so a second actuator sharing the same store does not
@@ -717,8 +764,11 @@ class R3ReviewFinding2Test(unittest.TestCase):
         self.assertEqual(report.final_decision.state, STATE_CLEANUP_BLOCKED)
         self.assertEqual(operations.performed, [])
 
-    def test_a_branch_still_checked_out_is_not_deleted(self) -> None:
-        operations = self._ops(checked_out_elsewhere=True)
+    def test_a_branch_checked_out_between_remove_and_delete_is_not_deleted(self) -> None:
+        # R5 review j#96385 finding 3: the cleanup measured once and reused that snapshot for
+        # both mutations, so a branch somebody checked out in the window between the worktree
+        # removal and the ref delete was deleted anyway.
+        operations = self._ops(checked_out_after_remove=True)
         report = _use_case(operations, processes=FakeProcessOperations()).run_cleanup(self._record())
         self.assertEqual(operations.performed, ["remove_worktree"])
         self.assertEqual(report.final_decision.state, STATE_CLEANUP_BLOCKED)

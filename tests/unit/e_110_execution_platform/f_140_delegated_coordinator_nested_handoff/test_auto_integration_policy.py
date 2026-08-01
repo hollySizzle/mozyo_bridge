@@ -35,6 +35,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCKED_INTEGRATION_CI_EVIDENCE_INCOMPLETE,
     BLOCKED_INTEGRATION_CI_HEAD_MISMATCH,
     BLOCKED_INTEGRATION_WORKTREE_INADMISSIBLE,
+    BLOCKED_INTEGRATION_LOST_FROM_TARGET,
     BLOCKED_LEDGER_UNTRUSTWORTHY,
     BLOCKED_MERGE_CONFLICT,
     BLOCKED_MODE_UNRECOGNIZED,
@@ -130,6 +131,10 @@ def _clean(**overrides: object) -> IntegrationPreflight:
         ),
         "callbacks_drained": True,
         "owner_gates_resolved": True,
+        # Post-push: what this action landed is still on the target. Read only once a trusted
+        # push receipt exists, and it is what replaces the pre-push expected-head comparison
+        # at that point (R5 review j#96385 finding 2).
+        "landed_head_on_target": True,
         # The CI evidence names the exact commit a fast-forward push lands (the source head),
         # plus the required check and the run — a bare "it was green" is no longer accepted.
         "integration_ci": IntegrationCiEvidence(
@@ -751,6 +756,73 @@ class R3ReviewFindingRegressionTest(unittest.TestCase):
             _clean(),
         )
         self.assertEqual(decision.blocked_reasons, (BLOCKED_MODE_UNRECOGNIZED,))
+
+
+class R5ReviewFinding2Test(unittest.TestCase):
+    """The target gate asks a different question before and after this action has pushed."""
+
+    def test_pre_push_the_target_must_still_be_where_the_action_expected_it(self) -> None:
+        decision = decide_integration(AUTO, _record(), _clean(observed_target_head=OTHER))
+        self.assertEqual(decision.blocked_reasons, (BLOCKED_TARGET_DRIFT,))
+
+    def test_post_push_the_expected_head_is_no_longer_the_question(self) -> None:
+        # R5 review j#96385 finding 2: our own push moves the target off the pre-push
+        # expectation by construction, so comparing them made every successful integration
+        # look like drift and no run could ever complete.
+        record = _record()
+        ledger = [
+            StepOutcome(
+                record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE,
+                recorded_by=RECORDER,
+            )
+        ]
+        decision = decide_integration(
+            AUTO,
+            record,
+            # The target now holds what we landed — which is NOT the expected head.
+            _clean(observed_target_head=SOURCE, landed_head_on_target=True),
+            ledger=ledger,
+            trusted_recorder=RECORDER,
+        )
+        self.assertEqual(decision.state, STATE_INTEGRATED)
+
+    def test_post_push_work_rewritten_off_the_target_is_its_own_reason(self) -> None:
+        record = _record()
+        ledger = [
+            StepOutcome(
+                record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE,
+                recorded_by=RECORDER,
+            )
+        ]
+        decision = decide_integration(
+            AUTO,
+            record,
+            _clean(observed_target_head=OTHER, landed_head_on_target=False),
+            ledger=ledger,
+            trusted_recorder=RECORDER,
+        )
+        self.assertEqual(
+            decision.blocked_reasons, (BLOCKED_INTEGRATION_LOST_FROM_TARGET,)
+        )
+
+    def test_already_integrated_is_only_a_no_op_before_we_push(self) -> None:
+        # After our own push the source IS reachable from the target; terminating as
+        # `already_integrated` there would skip the exact-SHA CI gate entirely.
+        record = _record()
+        ledger = [
+            StepOutcome(
+                record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE,
+                recorded_by=RECORDER,
+            )
+        ]
+        decision = decide_integration(
+            AUTO,
+            record,
+            _clean(already_integrated=True, integration_ci=None),
+            ledger=ledger,
+            trusted_recorder=RECORDER,
+        )
+        self.assertEqual(decision.state, STATE_AWAITING_CI)
 
 
 class R2ReviewFindingRegressionTest(unittest.TestCase):

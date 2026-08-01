@@ -255,8 +255,15 @@ BLOCKED_SOURCE_CI_HEAD_MISMATCH = "source_ci_head_mismatch"
 BLOCKED_UNKNOWN_TARGET = "unknown_target_branch"
 #: The observed target head differs from the expected one recorded in the action: the
 #: target advanced since the action was formed. Resolved by re-forming the action against
-#: the new head, never by forcing.
+#: the new head, never by forcing. Checked ONLY before this action has pushed — afterwards
+#: the target has moved *because of us*, and comparing it to the pre-push expectation would
+#: make every successful integration look like drift (R5 review j#96385 finding 2).
 BLOCKED_TARGET_DRIFT = "target_drift"
+#: This action's push landed, but the commit it landed is no longer reachable from the
+#: target. Something rewrote or removed it after we pushed — a force push, a branch reset, a
+#: deleted ref. The post-push counterpart of :data:`BLOCKED_TARGET_DRIFT`, and a different
+#: fact: drift means "somebody moved it before us", this means "our own work is gone".
+BLOCKED_INTEGRATION_LOST_FROM_TARGET = "integration_lost_from_target"
 #: The integration would not be a fast-forward and ``ff_only`` is in force.
 BLOCKED_NON_FAST_FORWARD = "non_fast_forward"
 #: The merge-commit disposition conflicted. Auto-resolution and auto-rebase are prohibited.
@@ -331,6 +338,7 @@ _BLOCKED_REASON_PRECEDENCE: Tuple[str, ...] = (
     BLOCKED_UNRESOLVED_OWNER_GATE,
     BLOCKED_UNRESOLVED_CALLBACK,
     BLOCKED_TARGET_DRIFT,
+    BLOCKED_INTEGRATION_LOST_FROM_TARGET,
     BLOCKED_NON_FAST_FORWARD,
     BLOCKED_MERGE_CONFLICT,
     BLOCKED_PUSH_REJECTED,
@@ -599,6 +607,39 @@ def decide_integration(
             ),
         )
 
+    # The trusted ledger view is needed before the gates: the target check is a different
+    # question before and after this action has pushed (R5 review j#96385 finding 2).
+    ledger_entries = tuple(ledger)
+    integrity = ledger_integrity_errors(
+        ledger_entries,
+        action_key=action_key,
+        required_order=(STEP_INTEGRATION_APPLY, STEP_PUSH, STEP_INTEGRATION_CI)
+        if disposition == DISPOSITION_MERGE_COMMIT
+        else (STEP_PUSH, STEP_INTEGRATION_CI),
+        head_bearing_steps=(STEP_INTEGRATION_APPLY, STEP_PUSH)
+        if disposition == DISPOSITION_MERGE_COMMIT
+        else (STEP_PUSH,),
+        recorded_by=trusted_recorder,
+        known_steps=INTEGRATION_STEPS,
+    )
+    if integrity:
+        return _blocked(
+            record,
+            tuple(
+                BLOCKED_PUSH_OUTCOME_HEAD_MISSING
+                if problem == LEDGER_MISSING_HEAD
+                else BLOCKED_LEDGER_UNTRUSTWORTHY
+                for problem in integrity
+            ),
+            disposition=disposition,
+            action_key=action_key,
+            reason="; ".join(integrity),
+        )
+    done = completed_steps(
+        ledger_entries, action_key=action_key, recorded_by=trusted_recorder
+    )
+    pushed = done.get(STEP_PUSH)
+
     blockers: set[str] = set()
     if preflight.worktree_is_foreign:
         blockers.add(BLOCKED_FOREIGN_WORKTREE)
@@ -643,15 +684,23 @@ def decide_integration(
         blockers.add(BLOCKED_UNRESOLVED_OWNER_GATE)
     if not preflight.callbacks_drained:
         blockers.add(BLOCKED_UNRESOLVED_CALLBACK)
-    if preflight.observed_target_head != record.expected_target_head:
-        blockers.add(BLOCKED_TARGET_DRIFT)
+    if pushed is None:
+        # Pre-push: the target must still be where the action expected it (CAS).
+        if preflight.observed_target_head != record.expected_target_head:
+            blockers.add(BLOCKED_TARGET_DRIFT)
+    elif not preflight.landed_head_on_target:
+        # Post-push: the target has moved BECAUSE OF US, so the question is whether what we
+        # landed is still there.
+        blockers.add(BLOCKED_INTEGRATION_LOST_FROM_TARGET)
     if blockers:
         return _blocked(record, blockers, disposition=disposition, action_key=action_key)
 
     # Terminal no-op dispositions. Checked only once every gate is clean, so a blocked
     # action is never reported as already integrated, and checked before any step so the
     # same merge is never re-produced (j#77124 必須訂正2).
-    if preflight.already_integrated:
+    if preflight.already_integrated and pushed is None:
+        # Only meaningful before we act. After our own push the source IS reachable from the
+        # target by construction, and terminating here would skip the exact-SHA CI gate.
         return IntegrationDecision(
             state=STATE_ALREADY_INTEGRATED,
             action_key=action_key,
@@ -694,41 +743,6 @@ def decide_integration(
                 disposition=disposition,
                 action_key=action_key,
             )
-
-    # R3 review j#96368 finding 3: a ledger is only evidence if its recorded steps are in
-    # dependency order and carry the heads they must. Checked BEFORE any step is selected, so
-    # an out-of-order ledger cannot authorize a mutation.
-    ledger_entries = tuple(ledger)
-    integrity = ledger_integrity_errors(
-        ledger_entries,
-        action_key=action_key,
-        required_order=(STEP_INTEGRATION_APPLY, STEP_PUSH, STEP_INTEGRATION_CI)
-        if disposition == DISPOSITION_MERGE_COMMIT
-        else (STEP_PUSH, STEP_INTEGRATION_CI),
-        head_bearing_steps=(STEP_INTEGRATION_APPLY, STEP_PUSH)
-        if disposition == DISPOSITION_MERGE_COMMIT
-        else (STEP_PUSH,),
-        recorded_by=trusted_recorder,
-        known_steps=INTEGRATION_STEPS,
-    )
-    if integrity:
-        # Distinct problems keep distinct tokens: "the steps are out of order" and "a step
-        # cannot say what it produced" call for different operator actions.
-        return _blocked(
-            record,
-            tuple(
-                BLOCKED_PUSH_OUTCOME_HEAD_MISSING
-                if problem == LEDGER_MISSING_HEAD
-                else BLOCKED_LEDGER_UNTRUSTWORTHY
-                for problem in integrity
-            ),
-            disposition=disposition,
-            action_key=action_key,
-            reason="; ".join(integrity),
-        )
-    done = completed_steps(
-        ledger_entries, action_key=action_key, recorded_by=trusted_recorder
-    )
 
     # 1. Apply. A fast-forward has nothing to apply, so the step is skipped as
     #    `not_applicable` rather than reported done.
@@ -894,6 +908,7 @@ __all__ = (
     "BLOCKED_SOURCE_CI_NOT_GREEN",
     "BLOCKED_UNKNOWN_TARGET",
     "BLOCKED_TARGET_DRIFT",
+    "BLOCKED_INTEGRATION_LOST_FROM_TARGET",
     "BLOCKED_NON_FAST_FORWARD",
     "BLOCKED_MERGE_CONFLICT",
     "BLOCKED_DIRTY_WORKTREE",

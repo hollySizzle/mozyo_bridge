@@ -401,7 +401,7 @@ class CleanupRunReport:
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(frozen=True)
 class AutoIntegrationUseCase:
     """Runs the #13686 integration and cleanup machines against the injected ports.
 
@@ -434,11 +434,15 @@ class AutoIntegrationUseCase:
     lane_branch: str = ""
     integration_worktree_path: str = ""
 
-    #: The writer receipt this actuator stamps on the steps it records. R4 review j#96379
-    #: finding 1: R4 derived it from ``lane_worktree`` / ``lane_branch``, which are public
-    #: constructor values, so a caller could reproduce it exactly. It is now an unguessable
-    #: per-instance token, generated once and never taken from an argument — a caller cannot
-    #: author an entry this actuator will count.
+    #: The writer receipt this actuator stamps on the steps it records. R4 derived it from
+    #: public constructor values, so a caller could reproduce it; R5 made it an unguessable
+    #: per-instance token but left the dataclass mutable, so it could simply be reassigned
+    #: (R5 review j#96385 finding 1). The class is frozen again and the field is ``init=False``,
+    #: so it is neither supplied nor rewritable through the public surface.
+    #:
+    #: This is a boundary WITHIN one process, not an authority boundary across processes: a
+    #: durable store with an authenticated writer identity is the real answer, and it belongs
+    #: with the production data plane the durable authority reader needs.
     _receipt: str = field(default_factory=lambda: f"receipt:{uuid.uuid4().hex}", init=False)
 
     @property
@@ -470,7 +474,6 @@ class AutoIntegrationUseCase:
         working_ledger: List[StepOutcome] = list(
             self.ledger.read(action_key=record.action_key)
         )
-        preflight = self._measure(record, report, ledger=working_ledger)
         # A resumed run has no in-memory memory of the commit a previous run's apply
         # produced, but the ledger recorded it. Without this the push after a resumed apply
         # would push the SOURCE head instead of the merge commit — silently integrating a
@@ -486,6 +489,13 @@ class AutoIntegrationUseCase:
             report.integration_head = applied.head
 
         while True:
+            # R5 review j#96385 findings 2 and 3: a snapshot taken once, before the first
+            # mutation, is stale for every mutation after it — and this actuator acts on a
+            # world its own mutations change. Re-measuring here re-verifies the target
+            # immediately before the push AND immediately after it, which is what lets the
+            # post-push gate ask "is what we landed still there" instead of comparing the
+            # target to an expectation our own push has already invalidated.
+            preflight = self._measure(record, report, ledger=working_ledger)
             decision = decide_integration(
                 self.integration_policy,
                 record,
@@ -511,7 +521,7 @@ class AutoIntegrationUseCase:
                 report.final_decision = decide_integration(
                     self.integration_policy,
                     record,
-                    preflight,
+                    self._measure(record, report, ledger=working_ledger),
                     ledger=working_ledger,
                     trusted_recorder=self.recorder_id,
                 )
@@ -561,20 +571,31 @@ class AutoIntegrationUseCase:
 
         # The CI gate is about the commit the push RECORDED landing, so it is read only once
         # that head exists in this actuator's own ledger.
-        landed = completed_steps(
+        trusted_view = completed_steps(
             ledger, action_key=record.action_key, recorded_by=self.recorder_id
-        ).get(STEP_PUSH)
+        )
+        landed_push = trusted_view.get(STEP_PUSH)
         integration_ci = (
             self.authority.read_integration_ci(
-                record=record, integration_head=landed.head
+                record=record, integration_head=landed_push.head
             )
-            if self.authority is not None and landed is not None and landed.head
+            if self.authority is not None
+            and landed_push is not None
+            and landed_push.head
             else None
         )
 
+        landed = trusted_view.get(STEP_PUSH)
         return IntegrationPreflight(
             is_git_workspace=True,
             observed_target_head=observed_target,
+            # Post-push: is what we landed still on the target? Measured against the same
+            # fresh remote tip, so a force push or reset after ours is visible.
+            landed_head_on_target=(
+                landed is not None
+                and is_full_sha(landed.head)
+                and ops.is_ancestor(ancestor=landed.head, descendant=observed_target)
+            ),
             fast_forward_possible=ops.is_ancestor(
                 ancestor=record.expected_target_head, descendant=record.source_head
             ),
@@ -831,10 +852,12 @@ class AutoIntegrationUseCase:
         working_ledger: List[StepOutcome] = list(
             self.ledger.read(action_key=record.action_key)
         )
-        preflight = self._measure_cleanup(record)
-        report.measured_preflight = preflight
-
         while True:
+            # Re-measured before every step: `remove_worktree` changes whether the lane
+            # worktree is registered and whether anything still holds the branch, so the
+            # branch delete must decide from the world AFTER the removal, not before it.
+            preflight = self._measure_cleanup(record)
+            report.measured_preflight = preflight
             decision = decide_cleanup(
                 self.cleanup_policy,
                 record,
@@ -861,7 +884,7 @@ class AutoIntegrationUseCase:
                 report.final_decision = decide_cleanup(
                     self.cleanup_policy,
                     record,
-                    preflight,
+                    self._measure_cleanup(record),
                     ledger=working_ledger,
                     trusted_recorder=self.recorder_id,
                 )
