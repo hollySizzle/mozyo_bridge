@@ -343,7 +343,8 @@ class LiveAutoIntegrationGitOperations:
     #: This list is the enforced set, stated exactly. It is not a claim that no other key can
     #: matter — three rounds running I wrote "the inputs are only X" and was wrong (j#96412,
     #: j#96417, j#96422). What IS claimed: these are pinned, the environment is built rather
-    #: than inherited, replace refs are off, and a custom merge driver is refused.
+    #: than inherited, replace refs are off, and the merge runs in a git directory where
+    #: the repository's own config and attributes do not exist (:meth:`_sanitized_git_dir`).
     _DETERMINISTIC_CONFIG: Tuple[str, ...] = (
         "-c",
         "i18n.commitEncoding=UTF-8",
@@ -451,21 +452,57 @@ class LiveAutoIntegrationGitOperations:
         Yields ``None`` when the sandbox cannot be built, and every caller treats that as a
         refusal rather than falling back to the repository.
         """
-        object_format = self._run("rev-parse", "--show-object-format")
-        object_dir = self._run("rev-parse", "--absolute-git-dir")
-        if object_format.returncode != 0 or object_dir.returncode != 0:
+        # The probes and the `init` are sealed too. R15 sealed what ran *inside* the sandbox
+        # and left the three commands that BUILD it running in the ambient environment —
+        # measured, a `GIT_TEMPLATE_DIR` in the parent put an `info/attributes` into the
+        # supposedly empty sandbox and turned a conflict into a clean merge (j#96441 finding
+        # 1). The boundary belongs around everything that establishes the property, not
+        # around the operation that benefits from it.
+        environment = self._sealed_env()
+        object_format = self._run("rev-parse", "--show-object-format", env=environment, seal_env=True)
+        # `--absolute-git-dir` is the WRONG question in a linked worktree: it answers
+        # `$GIT_COMMON_DIR/worktrees/<name>`, which holds no object database. This lane is
+        # itself a linked worktree, so R15's merge could not have worked here at all
+        # (j#96441 finding 2) — and every scene I had tested was a plain checkout.
+        common_dir = self._run(
+            "rev-parse", "--path-format=absolute", "--git-common-dir",
+            env=environment, seal_env=True,
+        )
+        if object_format.returncode != 0 or common_dir.returncode != 0:
             yield None
             return
-        objects = Path(object_dir.stdout.strip()) / "objects"
-        with tempfile.TemporaryDirectory(prefix="mozyo-merge-") as scratch:
-            sandbox = Path(scratch) / "sanitized.git"
+        objects = Path(common_dir.stdout.strip()) / "objects"
+        if not objects.is_dir():
+            yield None
+            return
+        try:
+            scratch = tempfile.TemporaryDirectory(prefix="mozyo-merge-")
+        except OSError:
+            # Filesystem failures were escaping as exceptions rather than becoming a typed
+            # refusal (j#96441 finding 3).
+            yield None
+            return
+        with scratch:
+            root = Path(scratch.name)
+            sandbox = root / "sanitized.git"
+            # An EMPTY template we own, so `init` cannot be pointed at one that seeds the
+            # sandbox with attributes, hooks or config.
+            template = root / "empty-template"
+            try:
+                template.mkdir()
+            except OSError:
+                yield None
+                return
             created = self._run(
                 "init",
                 "--bare",
                 "--quiet",
+                f"--template={template}",
                 "--object-format",
                 object_format.stdout.strip() or "sha1",
                 str(sandbox),
+                env=environment,
+                seal_env=True,
             )
             if created.returncode != 0 or not sandbox.is_dir():
                 yield None
@@ -504,12 +541,7 @@ class LiveAutoIntegrationGitOperations:
             seal_env=True,
         )
 
-    def _git_version(self) -> str:
-        """The exact ``git --version`` output, recorded on the outcome (j#96435 finding 4)."""
-        result = self._run("--version")
-        return result.stdout.strip() if result.returncode == 0 else ""
-
-    def _merge_tree_capability(self) -> str:
+    def _merge_tree_capability(self) -> "tuple[str, str]":
         """``supported`` / ``unsupported`` / ``probe_error`` — three answers, not two.
 
         R10 review j#96412 required that an unknown operational error never be reported as
@@ -519,17 +551,15 @@ class LiveAutoIntegrationGitOperations:
         """
         result = self._run("--version")
         if result.returncode != 0:
-            return MERGE_PROBE_ERROR
-        for token in result.stdout.split():
+            return MERGE_PROBE_ERROR, ""
+        version = result.stdout.strip()
+        for token in version.split():
             parts = token.split(".")
             if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
                 continue
-            return (
-                MERGE_MERGED
-                if (int(parts[0]), int(parts[1])) >= (2, 38)
-                else MERGE_PRIMITIVE_UNSUPPORTED
-            )
-        return MERGE_PROBE_ERROR
+            supported = (int(parts[0]), int(parts[1])) >= (2, 38)
+            return (MERGE_MERGED if supported else MERGE_PRIMITIVE_UNSUPPORTED), version
+        return MERGE_PROBE_ERROR, ""
 
     def _checked_target_branch(self, target_ref: str) -> str:
         """The bare branch name, validated against BOTH grammars it has to satisfy.
@@ -642,7 +672,7 @@ class LiveAutoIntegrationGitOperations:
             # caller (j#96417 finding 3): a status that says it covers unusable ref names, and
             # an operation that instead crashes the actuator on one.
             return MergeResult(status=MERGE_INVALID_INPUT, detail=str(unsafe))
-        capability = self._merge_tree_capability()
+        capability, git_version = self._merge_tree_capability()
         if capability == MERGE_PRIMITIVE_UNSUPPORTED:
             return MergeResult(
                 status=MERGE_PRIMITIVE_UNSUPPORTED,
@@ -652,7 +682,7 @@ class LiveAutoIntegrationGitOperations:
                     "(#13686 j#96406)"
                 ),
             )
-        if capability != MERGE_MERGED:
+        if capability != MERGE_MERGED or not git_version:
             return MergeResult(
                 status=MERGE_PROBE_ERROR,
                 detail=(
@@ -663,18 +693,29 @@ class LiveAutoIntegrationGitOperations:
         with self._sanitized_git_dir() as sandbox:
             if sandbox is None:
                 return MergeResult(
-                    status=MERGE_NONDETERMINISTIC_CONFIG,
+                    status=MERGE_SANDBOX_ERROR,
                     detail=(
-                        "could not build the sanitized git directory the merge runs in; "
-                        "refusing rather than merging in the repository, where a driver or an "
-                        "info/attributes file added mid-run would change the result"
+                        "could not build the isolated git directory the merge runs in (or "
+                        "locate this repository's object store); refusing rather than merging "
+                        "in the repository, where state added mid-run would change the result"
                     ),
                 )
-            return self._merge_in(sandbox, source_head=source_head, branch=branch,
-                                  expected_target_head=expected_target_head)
+            return self._merge_in(
+                sandbox,
+                source_head=source_head,
+                branch=branch,
+                expected_target_head=expected_target_head,
+                git_version=git_version,
+            )
 
     def _merge_in(
-        self, sandbox: Path, *, source_head: str, branch: str, expected_target_head: str
+        self,
+        sandbox: Path,
+        *,
+        source_head: str,
+        branch: str,
+        expected_target_head: str,
+        git_version: str,
     ) -> MergeResult:
         """Build the merge inside an open sanitized git directory."""
         merged = self._sealed(
@@ -748,12 +789,15 @@ class LiveAutoIntegrationGitOperations:
         return MergeResult(
             status=MERGE_MERGED,
             integration_head=integration_head,
-            git_version=self._git_version(),
+            # The version the capability probe READ, carried here rather than asked again:
+            # R15 re-probed after the commit and let an empty answer through with a `merged`
+            # status (j#96441 finding 4). A success cannot be reported without it.
+            git_version=git_version,
             detail=(
                 f"merged {source_head} onto {expected_target_head} as objects "
                 "(first parent is the measured target; no worktree, index or ref touched; "
                 "identity, timestamps and encoding pinned, so the same action on the same "
-                "repository rebuilds this exact commit)"
+                f"repository under {git_version} rebuilds this exact commit)"
             ),
         )
 

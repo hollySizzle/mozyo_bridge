@@ -95,6 +95,9 @@ from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.
 SOURCE = "a" * 40
 TARGET = "b" * 40
 MERGE_HEAD = "d" * 40
+#: A real apply names the git that built the commit; a `done` apply without it is refused
+#: by the ledger since j#96441 finding 4.
+GIT_VERSION = "git version 2.50.1"
 OTHER = "e" * 40
 
 LANE_WORKTREE = "/lane"
@@ -140,7 +143,9 @@ class FakeGitOperations:
     tip: str = SOURCE
 
     merge_result: MergeResult = field(
-        default_factory=lambda: MergeResult(status=MERGE_MERGED, integration_head=MERGE_HEAD)
+        default_factory=lambda: MergeResult(
+            status=MERGE_MERGED, integration_head=MERGE_HEAD, git_version=GIT_VERSION
+        )
     )
     push_result: PushResult = field(default_factory=lambda: PushResult(accepted=True))
     calls: List[Tuple[str, dict]] = field(default_factory=list)

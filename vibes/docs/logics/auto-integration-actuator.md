@@ -202,15 +202,15 @@ R11 が書いた「入力は arguments のみ / どの host でも同じ」は *
 | rename limit 2 key | 我々の scene では差が出なかったが **bound が host ごとに変わるのは varying input** | `-c` で固定値へ pin |
 | `merge.renormalize` / `merge.default` | merge の canonicalization と既定 driver を変える (j#96428 F3。`merge.default=union` は conflict を merged にした) | **`-c` で pin** |
 | user / system attributes | merge attribute の供給元 | `core.attributesFile` を空へ pin + `GIT_ATTR_NOSYSTEM=1` |
-| **`$GIT_DIR/info/attributes`** | merge 挙動を選ぶが **tree の一部ではなく、pin も隔離もできない** (j#96428 F3) | **存在すれば refuse** |
 | 継承 `GIT_*` env (`GIT_DIR` / `GIT_OBJECT_DIRECTORY` / `GIT_ALTERNATE_OBJECT_DIRECTORIES` / `GIT_CONFIG_COUNT` 等) | `-c` の対象外で git の読む先を変える | **環境を継承せず置換**する (許可 list のみ)。**dict を作ることと child が受け取ることは別** (j#96428 F1) |
 | `refs/replace/*` | object を差し替える (j#96422 F1)。**timestamp probe 経由でも commit を変える** (j#96428 F2) | `--no-replace-objects` + `GIT_NO_REPLACE_OBJECTS=1` を **決定性に寄与する全 invocation** へ |
-| **git binary / version** | **pin 不能** | **claim の成立範囲を「同一 git version」へ限定** (下記) |
 | **`merge.<name>.driver`** | **merged tree の内容が任意 code で書き換わる** (実測: conflict が rc=0 + `DRIVER WON`) | **sandbox で不可視化** |
 | **`$GIT_DIR/info/attributes`** | merge 挙動を選ぶ。tree の一部でなく、どの option も redirect しない | **sandbox で不可視化** |
 | **`$GIT_COMMON_DIR/shallow`** | 同じ object ids の ancestry 解釈を変える (実測: `refusing to merge unrelated histories`) | **sandbox で不可視化** |
 | partial clone / promisor remote | missing object の demand fetch = **外部 I/O / availability input** | **列挙のみ** (valid object content は OID に束縛されるため別 commit 生成は未確認) |
-| **git binary / version** | pin 不能 | **exact version を durable outcome に記録**し、replay 時に照合可能にする |
+| **git binary / version** | pin 不能 | **claim を「同一 git version」へ限定し、exact version を durable outcome に記録**。`merged` は version を記録できたときのみ成立し、ledger も non-empty を要求する (j#96441 F4) |
+| **sandbox 構築そのもの** (`rev-parse` ×2 / `git init`) | 未封止なら `GIT_TEMPLATE_DIR` 等で sandbox に state を注入できる (j#96441 F1 実測) | **構築工程ごと sealed**、`--template` は agent 所有の空 dir |
+| **object store の位置** | linked worktree では `--absolute-git-dir` に objects が無い (j#96441 F2 実測。本 lane がその形) | **`--path-format=absolute --git-common-dir`** から解決 |
 
 ### repo-local state は「拒否」ではなく **不可視化** する (R15 / j#96435 F1)
 
@@ -249,8 +249,8 @@ sandbox 経由は **通常の conflict** を返して driver は実行されな�
 > 「全部やった」ではなく「pin した key はこれ、isolate した env はこれ、refuse する条件はこれ」と書く。
 > 上の表がその列挙であり、**表に無いものは enforce していない**。
 
-driver 拒否の範囲 (repo-local に宣言されているが今回 attribute で選択されない driver も拒否するか) は
-**owner/design 裁定事項**として未決である (j#96422 F4)。
+**driver 拒否の範囲は裁定事項ではなくなった** — R15 で refusal 自体を撤去したためである (j#96435 F1)。
+driver も `info/attributes` も **sandbox から見えない**ので、宣言の有無で feature が止まることはない。
 
 - author / committer identity = **固定 literal** (`mozyo-bridge auto-integration <auto-integration@mozyo-bridge.invalid>`)。
   `git log` 上でも人間が書いたのでないことが読める
@@ -297,7 +297,9 @@ driver 拒否の範囲 (repo-local に宣言されているが今回 attribute �
   *field に載せただけで誰も読まなければ gate ではない* — R11 は prose に着地させ、R12 は field に
   着地させて consumer を書かなかった。vocabulary は domain 側の closed set:
   `merged` / `content_conflict` / `primitive_unsupported` / `probe_error` / `invalid_input` /
-  `nondeterministic_merge_config` / `merge_error` / `commit_error` / `unrecognized_status`。
+  `nondeterministic_merge_config` / `sandbox_error` / `merge_error` / `commit_error` /
+  `unrecognized_status`。`sandbox_error` は「隔離を構築できなかった / object store を特定できなかった」
+  であり、非決定的 config の検出ではない (j#96441 F3)。
   **exit code だけで分類しない** — missing object は content conflict と同じ rc=1 で返る (実測)。
   conflict は tree を名乗り、operational failure は名乗らない。可用性は **version probe** で確かめ、
   **probe 自体が失敗したら `probe_error`** であって不可用ではない (j#96417 F3)。
@@ -466,7 +468,9 @@ closed-schema screen が拒否する。宣言状況は `mozyo-bridge config stat
 - `python3 -m unittest tests.unit.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.test_auto_integration_policy`
 - `python3 -m unittest tests.unit.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.test_retirement_cleanup_policy`
 - `python3 -m unittest tests.unit.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.test_auto_integration_live_ops`
-  (live adapter が構成する実 argv と refusal。`_run` を stub した hermetic test で、実 git process は起動しない)
+  (live adapter が構成する実 argv と typed status の分類。`_run` を stub した hermetic test で、実 git
+  process は起動しない。**隔離そのものは stub の向こう側で起きるため、ここでは検査できない** —
+  j#96428 F1 の教訓であり、隔離は下の real-Git suite でのみ pin する)
 - R1 review j#96344 の 5 finding は `R1ReviewFindingRegressionTest` /
   `R1ReviewFinding1RegressionTest` / `NoRemoteRefDeleteTest` に、**再現した入力そのもの**で
   pin してある。verdict は j#96345。

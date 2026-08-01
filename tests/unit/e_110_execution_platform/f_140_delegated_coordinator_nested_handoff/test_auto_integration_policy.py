@@ -82,6 +82,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     IntegrationCiEvidence,
     MERGE_MERGED,
     LEDGER_MERGE_STATUS_UNSOUND,
+    LEDGER_MERGE_VERSION_MISSING,
     IntegrationPreflight,
     StepOutcome,
     build_integration_action_record,
@@ -95,6 +96,9 @@ SOURCE = "a" * 40
 RECORDER = "actuator:/lane|lane_br"
 TARGET = "b" * 40
 OTHER = "c" * 40
+#: What a real apply records about the git that built the commit — required on a `done`
+#: apply since j#96441 finding 4 (a version the record could not name was accepted before).
+GIT_VERSION = "git version 2.50.1"
 
 
 def _record(**overrides: object) -> IntegrationActionRecord:
@@ -181,6 +185,38 @@ class ModeGateTest(unittest.TestCase):
         self.assertEqual(decision.state, STATE_INTEGRATED)
         self.assertEqual(decision.integration_ci, CI_GATE_GREEN)
         self.assertEqual(CI_GATE_STATES, {CI_GATE_GREEN, CI_GATE_NOT_REACHED})
+
+class R15ReviewFinding4Test(unittest.TestCase):
+    """A `done` apply must name the git that built the commit (j#96441 finding 4).
+
+    The field was added in R14, filled in R15 by a probe that could fail and still report
+    success, and read by nobody. Third time in this shape: prose, then a field no consumer
+    read, then a field allowed to be empty.
+    """
+
+    def test_an_apply_without_a_recorded_version_does_not_authorize_the_push(self) -> None:
+        record = _record()
+        decision = decide_integration(
+            AutoIntegrationPolicy(mode=MODE_AUTO, integration_branch="main", ff_only=False),
+            record,
+            _clean(fast_forward_possible=False),
+            ledger=[
+                StepOutcome(
+                    record.action_key,
+                    STEP_INTEGRATION_APPLY,
+                    OUTCOME_DONE,
+                    head=OTHER,
+                    recorded_by=RECORDER,
+                    merge_status=MERGE_MERGED,
+                    git_version="   ",
+                )
+            ],
+            trusted_recorder=RECORDER,
+        )
+        self.assertTrue(decision.is_blocked)
+        self.assertIsNone(decision.next_step)
+        self.assertIn(LEDGER_MERGE_VERSION_MISSING, decision.reason)
+
 
 class NonGitWorkspaceTest(unittest.TestCase):
     def test_non_git_workspace_has_no_integration(self) -> None:
@@ -471,6 +507,7 @@ class R12ReviewFinding2Test(unittest.TestCase):
                 head=OTHER,
                 recorded_by=RECORDER,
                 merge_status=status,
+                git_version=GIT_VERSION,
             )
         ]
 
@@ -523,6 +560,7 @@ class R12ReviewFinding2Test(unittest.TestCase):
                     head=OTHER,
                     recorded_by=RECORDER,
                     merge_status=MERGE_MERGED,
+                    git_version=GIT_VERSION,
                 )
             ],
             trusted_recorder=RECORDER,
@@ -565,7 +603,8 @@ class IdempotencyTest(unittest.TestCase):
         ledger = [
             StepOutcome(
                 record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE,
-                head=OTHER, recorded_by=RECORDER, merge_status=MERGE_MERGED)
+                head=OTHER, recorded_by=RECORDER, merge_status=MERGE_MERGED,
+                git_version=GIT_VERSION)
         ]
         decision = decide_integration(policy, record, world, ledger=ledger)
         self.assertEqual(decision.next_step, STEP_PUSH)
@@ -633,7 +672,8 @@ class R1ReviewFindingRegressionTest(unittest.TestCase):
         ledger = [
             StepOutcome(
                 record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE,
-                head=merge_head, recorded_by=RECORDER, merge_status=MERGE_MERGED),
+                head=merge_head, recorded_by=RECORDER, merge_status=MERGE_MERGED,
+                git_version=GIT_VERSION),
             StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=merge_head, recorded_by=RECORDER),
         ]
         about_source = IntegrationCiEvidence(
@@ -948,7 +988,8 @@ class R2ReviewFindingRegressionTest(unittest.TestCase):
             ledger=[
                 StepOutcome(
                 record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE,
-                head=merge_head, recorded_by=RECORDER, merge_status=MERGE_MERGED),
+                head=merge_head, recorded_by=RECORDER, merge_status=MERGE_MERGED,
+                git_version=GIT_VERSION),
                 StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head="", recorded_by=RECORDER),
             ],
         )
@@ -991,7 +1032,8 @@ class R2ReviewFindingRegressionTest(unittest.TestCase):
             ledger=[
                 StepOutcome(
                 record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE,
-                head=merge_head, recorded_by=RECORDER, merge_status=MERGE_MERGED),
+                head=merge_head, recorded_by=RECORDER, merge_status=MERGE_MERGED,
+                git_version=GIT_VERSION),
                 StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER),
             ],
         )
@@ -1018,7 +1060,8 @@ class R2ReviewFindingRegressionTest(unittest.TestCase):
             ledger=[
                 StepOutcome(
                 record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE,
-                head=merge_head, recorded_by=RECORDER, merge_status=MERGE_MERGED),
+                head=merge_head, recorded_by=RECORDER, merge_status=MERGE_MERGED,
+                git_version=GIT_VERSION),
                 StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=merge_head, recorded_by=RECORDER),
             ],
         )

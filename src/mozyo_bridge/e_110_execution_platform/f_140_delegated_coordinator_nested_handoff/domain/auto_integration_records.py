@@ -106,6 +106,10 @@ MERGE_INVALID_INPUT = "invalid_input"
 #: An actuator that promises the same action rebuilds the same commit cannot keep that
 #: promise here, so it refuses rather than producing a commit it cannot reproduce.
 MERGE_NONDETERMINISTIC_CONFIG = "nondeterministic_merge_config"
+#: The isolated git directory the merge runs in could not be built or its object store could
+#: not be located. Distinct from a non-deterministic *config*: nothing hazardous was detected,
+#: the isolation simply could not be established (j#96441 finding 3).
+MERGE_SANDBOX_ERROR = "sandbox_error"
 #: ``merge-tree`` failed for an operational reason: a missing or unreadable object, a broken
 #: repository. NOT a content conflict, and NOT proof that the primitive is unavailable.
 MERGE_ERROR = "merge_error"
@@ -124,6 +128,7 @@ MERGE_STATUSES: frozenset = frozenset(
         MERGE_PROBE_ERROR,
         MERGE_INVALID_INPUT,
         MERGE_NONDETERMINISTIC_CONFIG,
+        MERGE_SANDBOX_ERROR,
         MERGE_ERROR,
         MERGE_COMMIT_ERROR,
         MERGE_UNRECOGNIZED,
@@ -244,6 +249,11 @@ LEDGER_MISSING_HEAD = "ledger_step_head_missing"
 LEDGER_DUPLICATE_STEP = "ledger_duplicate_step"
 #: A ``done`` entry names a step this machine does not have.
 LEDGER_UNKNOWN_STEP = "ledger_unknown_step"
+#: A ``done`` apply that recorded no git version. R14 added the field, R15 filled it from a
+#: second probe that could fail and still report success, and nothing checked it — so "which
+#: git built this commit" was recordable but not required (j#96441 finding 4). The third time
+#: this shape appeared: prose, then a field no consumer read, then a field allowed to be empty.
+LEDGER_MERGE_VERSION_MISSING = "ledger_merge_version_missing"
 #: A ``done`` apply whose recorded merge status is not :data:`MERGE_MERGED`, or any other step
 #: carrying a merge status at all. R12 added the status as a durable field and then had no
 #: consumer read it, so an apply recorded ``done`` with ``unrecognized_status`` reached
@@ -320,6 +330,9 @@ def ledger_integrity_errors(
         expected_merged = merge_status_step and entry.step == merge_status_step
         if expected_merged and entry.merge_status != MERGE_MERGED:
             problems.append(LEDGER_MERGE_STATUS_UNSOUND)
+            break
+        if expected_merged and not entry.git_version.strip():
+            problems.append(LEDGER_MERGE_VERSION_MISSING)
             break
         if not expected_merged and entry.merge_status:
             # A status on a step that cannot produce one is a record about something that did
@@ -644,11 +657,13 @@ __all__ = (
     "MERGE_PROBE_ERROR",
     "MERGE_INVALID_INPUT",
     "MERGE_NONDETERMINISTIC_CONFIG",
+    "MERGE_SANDBOX_ERROR",
     "MERGE_ERROR",
     "MERGE_COMMIT_ERROR",
     "MERGE_UNRECOGNIZED",
     "MERGE_STATUSES",
     "LEDGER_MERGE_STATUS_UNSOUND",
+    "LEDGER_MERGE_VERSION_MISSING",
     "checked_merge_status",
     "IntegrationPreflight",
 )

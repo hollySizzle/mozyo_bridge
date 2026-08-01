@@ -542,6 +542,98 @@ class DeterministicMergeCommitTest(unittest.TestCase):
                 # not a hazard to report (the false positive of j#96422 finding 4).
                 self.assertNotEqual(after.status, MERGE_NONDETERMINISTIC_CONFIG, label)
 
+    def test_every_repository_shape_produces_the_same_commit(self) -> None:
+        """j#96441 finding 2 — including the shape this lane itself is.
+
+        R15 located the object store by appending ``objects`` to ``--absolute-git-dir``. In a
+        linked worktree that answers ``$GIT_COMMON_DIR/worktrees/<name>``, which holds no
+        object database, so the merge failed outright — and the lane this issue is developed
+        in *is* a linked worktree. Every scene I had tested was a plain checkout. The store is
+        resolved from ``--git-common-dir`` now, and all three shapes are pinned because
+        "it works here" was exactly the assumption that failed.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init(repo)
+            _commit(repo, "a.txt", "base")
+            _git(repo, "checkout", "-q", "-b", "lane")
+            source = _commit(repo, "lane.txt", "reviewed")
+            _git(repo, "checkout", "-q", "main")
+            target = _commit(repo, "target.txt", "moved on")
+
+            linked = root / "linked"
+            _git(repo, "branch", "work")
+            _git(repo, "worktree", "add", "-q", str(linked), "work")
+            bare = root / "bare.git"
+            subprocess.run(
+                ["git", "clone", "--bare", "-q", str(repo), str(bare)],
+                check=True, capture_output=True,
+            )
+
+            results = {}
+            for shape, root_path in (
+                ("normal checkout", repo),
+                ("linked worktree", linked),
+                ("bare repository", bare),
+            ):
+                results[shape] = LiveAutoIntegrationGitOperations(
+                    repo_root=root_path
+                ).apply_merge(
+                    source_head=source, target_ref="main", expected_target_head=target
+                )
+
+            for shape, result in results.items():
+                self.assertEqual(result.status, MERGE_MERGED, f"{shape}: {result.detail}")
+                self.assertTrue(result.git_version, shape)
+            self.assertEqual(
+                len({result.integration_head for result in results.values()}),
+                1,
+                {shape: result.integration_head for shape, result in results.items()},
+            )
+
+    def test_an_init_template_cannot_seed_the_sandbox(self) -> None:
+        """j#96441 finding 1: the sandbox's own creation was running unsealed.
+
+        Measured — a ``GIT_TEMPLATE_DIR`` in the parent process placed an ``info/attributes``
+        into the "empty" sandbox and turned a content conflict into a clean merge. Sealing
+        what runs *inside* an isolation while building it in the open is not an isolation.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init(repo)
+            (repo / ".gitattributes").write_text("f.txt merge=text\n", encoding="utf-8")
+            _commit(repo, "f.txt", "base\n")
+            _git(repo, "checkout", "-q", "-b", "lane")
+            source = _commit(repo, "f.txt", "lane\n")
+            _git(repo, "checkout", "-q", "main")
+            target = _commit(repo, "f.txt", "target\n")
+            operations = LiveAutoIntegrationGitOperations(repo_root=repo)
+
+            baseline = operations.apply_merge(
+                source_head=source, target_ref="main", expected_target_head=target
+            )
+            self.assertEqual(baseline.status, MERGE_CONTENT_CONFLICT)
+
+            template = root / "template"
+            (template / "info").mkdir(parents=True)
+            (template / "info" / "attributes").write_text(
+                "f.txt merge=union\n", encoding="utf-8"
+            )
+            previous = os.environ.get("GIT_TEMPLATE_DIR")
+            os.environ["GIT_TEMPLATE_DIR"] = str(template)
+            try:
+                injected = operations.apply_merge(
+                    source_head=source, target_ref="main", expected_target_head=target
+                )
+            finally:
+                if previous is None:
+                    os.environ.pop("GIT_TEMPLATE_DIR", None)
+                else:
+                    os.environ["GIT_TEMPLATE_DIR"] = previous
+            self.assertEqual(injected.status, MERGE_CONTENT_CONFLICT, injected.detail)
+
     def test_the_merge_driver_would_have_fired_without_the_sanitized_directory(self) -> None:
         """The scene above is only meaningful if raw git really would run the driver."""
         with tempfile.TemporaryDirectory() as tmp:

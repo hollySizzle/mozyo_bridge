@@ -49,6 +49,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MERGE_NONDETERMINISTIC_CONFIG,
     MERGE_PRIMITIVE_UNSUPPORTED,
     MERGE_PROBE_ERROR,
+    MERGE_SANDBOX_ERROR,
     MERGE_STATUSES,
     MERGE_UNRECOGNIZED,
     IntegrationActionRecord,

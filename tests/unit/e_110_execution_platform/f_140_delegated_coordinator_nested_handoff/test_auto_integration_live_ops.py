@@ -300,6 +300,26 @@ class MergeTest(unittest.TestCase):
             self.assertEqual(env["GIT_DIR"], "/sandbox.git")
             self.assertNotIn("GIT_CONFIG_COUNT", env)
 
+    def test_a_success_carries_the_version_the_capability_probe_read(self) -> None:
+        # R15 re-probed `--version` after the commit and let an empty answer through with a
+        # `merged` status (j#96441 finding 4). The version now comes from the probe that
+        # already ran, and a success cannot be produced without one.
+        recorder = _Recorder([*self._preamble(), _ok(TREE), *self._dates(), _ok(MERGE_HEAD)])
+        result = _adapter(recorder).apply_merge(
+            source_head=SOURCE, target_ref="main", expected_target_head=TARGET
+        )
+        self.assertEqual(result.status, MERGE_MERGED)
+        self.assertEqual(result.git_version, "git version 2.50.1")
+        # Exactly one version probe: the capability question, whose answer is carried.
+        self.assertEqual([argv for argv in recorder.argvs].count(("--version",)), 1)
+
+    def test_an_unreadable_version_refuses_rather_than_reporting_success(self) -> None:
+        recorder = _Recorder([_ok("main"), _ok("git version unknown-build")])
+        result = _adapter(recorder).apply_merge(
+            source_head=SOURCE, target_ref="main", expected_target_head=TARGET
+        )
+        self.assertEqual(result.status, MERGE_PROBE_ERROR)
+
     def test_the_commit_takes_its_identity_from_the_action_not_the_host(self) -> None:
         # R10 review j#96412 finding 1: the same action produced two SHAs a second apart,
         # because `commit-tree` reads `user.name` and the clock — two inputs no action key
