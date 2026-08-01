@@ -10,9 +10,7 @@ policy module re-exports the public names, mirroring the
 
 The theme of everything here is the R1 review's central finding: **a boolean cannot be
 audited.** ``integration_ci_green: bool`` said a run was green without saying which run,
-which check, or which commit — so an unrelated green run satisfied it. ``coordinator_confirmed:
-bool`` said someone approved without saying who, of what, or where it is written down.
-``integration_worktree: str`` said "a worktree" without saying it was not the lane's own.
+which check, or which commit — so an unrelated green run satisfied it. ``integration_worktree: str`` said "a worktree" without saying it was not the lane's own.
 Each is replaced by a record that carries the identity its claim depends on, and each
 validates itself against the action it is offered for.
 """
@@ -86,12 +84,19 @@ BLOCKED_ACTION_KEY_MISMATCH = "action_key_mismatch"
 
 @dataclass(frozen=True)
 class StepOutcome:
-    """One recorded step outcome, bound to the action key it was performed under."""
+    """One recorded step outcome, bound to the action key it was performed under.
+
+    ``recorded_by`` is the provenance: which actuator wrote this entry. R3 review j#96368
+    finding 3 found the ledger had none, so any caller-authored entry counted as a completed
+    step — and a ledger claiming a push that never happened let the run reach ``integrated``
+    without ever pushing. An actuator counts only entries it recognises as its own.
+    """
 
     action_key: str
     step: str
     outcome: str
     detail: str = ""
+    recorded_by: str = ""
     #: The exact commit the step produced, where it produces one (the integration head an
     #: apply created, or the head a push landed). Empty when the step produces no commit.
     head: str = ""
@@ -107,19 +112,85 @@ class StepOutcome:
 
 
 def completed_steps(
-    ledger: Iterable[StepOutcome], *, action_key: str
+    ledger: Iterable[StepOutcome],
+    *,
+    action_key: str,
+    recorded_by: str = "",
 ) -> dict[str, StepOutcome]:
     """The ``done`` steps recorded under exactly ``action_key`` (later wins).
 
     Entries under any other key are ignored rather than merged: that is the whole
     idempotency contract. Non-``done`` outcomes are also ignored — a ``blocked`` or
     ``pending`` step has not happened, so it must be evaluated again.
+
+    ``recorded_by``, when given, additionally requires the entry's provenance to match: an
+    actuator counts only what it wrote. Omitting it accepts any provenance, which is what a
+    direct call to the pure decision does (the actuator always passes its own identity).
     """
     return {
         entry.step: entry
         for entry in ledger
-        if entry.action_key == action_key and entry.outcome == OUTCOME_DONE
+        if entry.action_key == action_key
+        and entry.outcome == OUTCOME_DONE
+        and (not recorded_by or entry.recorded_by == recorded_by)
     }
+
+
+#: A ledger whose ``done`` steps are out of dependency order proves nothing about what ran.
+LEDGER_ORDER_VIOLATION = "ledger_step_order_violation"
+#: A ``done`` step that must name the commit it produced does not.
+LEDGER_MISSING_HEAD = "ledger_step_head_missing"
+
+
+def ledger_integrity_errors(
+    ledger: Iterable[StepOutcome],
+    *,
+    action_key: str,
+    required_order: Tuple[str, ...],
+    head_bearing_steps: Tuple[str, ...] = (),
+    recorded_by: str = "",
+) -> Tuple[str, ...]:
+    """The reasons this ledger cannot be believed (empty iff it can).
+
+    R3 review j#96368 finding 3: ``completed_steps`` mapped entries without looking at their
+    ORDER, so a ledger recording a push before any apply let the run treat the push as done —
+    it applied a merge and then reported ``integrated`` having pushed nothing. A recorded step
+    is only evidence if the steps it depends on were recorded before it.
+
+    ``required_order`` is the dependency chain (earlier steps must appear earlier in the
+    ledger); ``head_bearing_steps`` are the steps whose ``done`` entry must name a full commit
+    SHA, because a step that cannot say what it produced has not been shown to have produced
+    anything.
+    """
+    entries = [
+        entry
+        for entry in ledger
+        if entry.action_key == action_key
+        and entry.outcome == OUTCOME_DONE
+        and (not recorded_by or entry.recorded_by == recorded_by)
+    ]
+    problems: list[str] = []
+    positions = {entry.step: index for index, entry in enumerate(entries)}
+    ranked = [step for step in required_order if step in positions]
+    for earlier, later in zip(ranked, ranked[1:]):
+        if positions[earlier] > positions[later]:
+            problems.append(LEDGER_ORDER_VIOLATION)
+            break
+    # A later step recorded without the earlier one it depends on is the same defect: the
+    # push-before-apply ledger simply omitted the apply.
+    seen_later = False
+    for step in reversed(required_order):
+        if step in positions:
+            seen_later = True
+        elif seen_later:
+            problems.append(LEDGER_ORDER_VIOLATION)
+            break
+    for step in head_bearing_steps:
+        entry = positions.get(step)
+        if entry is not None and not is_full_sha(entries[entry].head):
+            problems.append(LEDGER_MISSING_HEAD)
+            break
+    return tuple(dict.fromkeys(problems))
 
 
 # ---------------------------------------------------------------------------
@@ -290,62 +361,6 @@ class IntegrationCiEvidence:
 
 
 # ---------------------------------------------------------------------------
-# Coordinator confirmation (R1 review j#96344 finding 5).
-# ---------------------------------------------------------------------------
-
-#: The only role whose confirmation authorizes an actuation. The actuator performs the
-#: coordinator's own operation on their behalf; no other role can hand it that authority.
-CONFIRMATION_ISSUER_COORDINATOR = "coordinator"
-
-
-@dataclass(frozen=True)
-class CoordinatorConfirmation:
-    """An explicit coordinator confirmation of exactly one action.
-
-    Replaces the R1 ``coordinator_confirmed: bool``, which authorized an actuation on the
-    strength of a self-reported flag: it said someone approved without saying who, of what,
-    or where it is written down. The central preset's ``### 根拠出所分類`` fixes the general
-    rule — "anchor を欠く owner_intent 主張は hearsay として扱う (ラベルではなく anchor が重みを
-    決める)" — and a confirmation is exactly such a claim.
-
-    ``action_key`` is the action confirmed, compared for exact equality against the action
-    being decided: a confirmation of *some* action is not a confirmation of *this* one, and
-    since any identity drift mints a new key, a confirmation cannot survive the world
-    changing under it. ``durable_anchor`` is where the confirmation is recorded
-    (``#<issue> j#<journal>``), so a later audit can read it rather than take its word.
-    """
-
-    action_key: str
-    issuer_role: str
-    durable_anchor: str
-
-    def admissibility_errors(self, *, action_key: str) -> Tuple[str, ...]:
-        """The reasons this confirmation cannot authorize ``action_key`` (empty iff it can)."""
-        problems: list[str] = []
-        if self.action_key != action_key:
-            problems.append(
-                "the confirmation names a different action than the one being decided"
-            )
-        if self.issuer_role != CONFIRMATION_ISSUER_COORDINATOR:
-            problems.append(
-                f"issuer_role must be {CONFIRMATION_ISSUER_COORDINATOR!r}; got "
-                f"{self.issuer_role!r}"
-            )
-        if not str(self.durable_anchor).strip():
-            problems.append(
-                "durable_anchor is empty; an unrecorded confirmation is hearsay"
-            )
-        return tuple(problems)
-
-    def as_payload(self) -> dict[str, object]:
-        return {
-            "action_key": self.action_key,
-            "issuer_role": self.issuer_role,
-            "durable_anchor": self.durable_anchor,
-        }
-
-
-# ---------------------------------------------------------------------------
 # The dedicated integration worktree (R1 review j#96344 finding 3).
 # ---------------------------------------------------------------------------
 
@@ -452,13 +467,6 @@ class IntegrationPreflight:
       run satisfies it" hole applied, so it carries the same identity.
     - ``integration_ci`` — :class:`IntegrationCiEvidence` for the exact commit the push
       landed, carrying the required check's identity and the run id.
-    - ``coordinator_confirmation`` — :class:`CoordinatorConfirmation`. **Set by the actuator,
-      not by the caller** (R2 review j#96350 finding 4): the caller supplies
-      ``coordinator_confirmation_anchor`` (where the confirmation is recorded) and the
-      actuator's resolver fresh-reads it. A caller that constructs this field directly is
-      calling the pure decision without an actuator, which is what the tests do.
-    - ``coordinator_confirmation_anchor`` — the durable anchor to resolve a confirmation
-      FROM. A pointer, not a claim.
     - ``integration_worktree`` — :class:`IntegrationWorktree`: the dedicated checkout a
       merge-commit disposition is applied in. **Also actuator-measured** (finding 3): R2
       accepted the caller's own description of it, so a record naming the lane's worktree with
@@ -485,8 +493,6 @@ class IntegrationPreflight:
     # Typed records (R1 review j#96344, extended R2/R3). `None` is the unsatisfied reading.
     source_ci: Optional[IntegrationCiEvidence] = None
     integration_ci: Optional[IntegrationCiEvidence] = None
-    coordinator_confirmation: Optional[CoordinatorConfirmation] = None
-    coordinator_confirmation_anchor: str = ""
     integration_worktree: Optional[IntegrationWorktree] = None
 
 
@@ -502,12 +508,13 @@ __all__ = (
     "BLOCKED_ACTION_KEY_MISMATCH",
     "StepOutcome",
     "completed_steps",
+    "ledger_integrity_errors",
+    "LEDGER_ORDER_VIOLATION",
+    "LEDGER_MISSING_HEAD",
     "IntegrationActionRecord",
     "build_integration_action_record",
     "CI_CONCLUSION_SUCCESS",
     "IntegrationCiEvidence",
-    "CONFIRMATION_ISSUER_COORDINATOR",
-    "CoordinatorConfirmation",
     "IntegrationWorktree",
     "IntegrationPreflight",
 )

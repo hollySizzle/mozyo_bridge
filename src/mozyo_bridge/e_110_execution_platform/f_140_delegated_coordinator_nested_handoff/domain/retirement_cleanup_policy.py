@@ -50,6 +50,7 @@ from typing import Iterable, Optional, Tuple
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_records import (
     BLOCKED_ACTION_KEY_MISMATCH,
+    ledger_integrity_errors,
     OUTCOME_BLOCKED,
     OUTCOME_DONE,
     OUTCOME_NOT_APPLICABLE,
@@ -142,9 +143,12 @@ BLOCKED_NOT_INTEGRATED_REF = "branch_not_reachable_from_target"
 #: The branch tip is no longer the source head the action recorded — the compare-and-swap
 #: failed, so this is not the branch that was integrated.
 BLOCKED_BRANCH_TIP_DRIFT = "branch_tip_drift"
+#: The ledger's recorded steps are out of dependency order or carry foreign provenance.
+BLOCKED_LEDGER_UNTRUSTWORTHY = "ledger_untrustworthy"
 
 _BLOCKED_REASON_PRECEDENCE: Tuple[str, ...] = (
     BLOCKED_ACTION_KEY_MISMATCH,
+    BLOCKED_LEDGER_UNTRUSTWORTHY,
     BLOCKED_FOREIGN_WORKTREE,
     BLOCKED_ISSUE_NOT_CLOSED,
     BLOCKED_INTEGRATION_UNCONFIRMED,
@@ -343,6 +347,7 @@ def decide_cleanup(
     preflight: CleanupPreflight,
     *,
     ledger: Iterable[StepOutcome] = (),
+    trusted_recorder: str = "",
 ) -> CleanupDecision:
     """Decide the next cleanup state / step for one lane (pure).
 
@@ -402,7 +407,29 @@ def decide_cleanup(
             reason="cleanup refused before any step; nothing removed and no ref deleted",
         )
 
-    done = completed_steps(ledger, action_key=action_key)
+    # R3 review j#96368 finding 3: provenance and order are checked before any destructive
+    # step is selected. A ledger whose steps are out of order proves nothing about what ran.
+    ledger_entries = tuple(ledger)
+    integrity = ledger_integrity_errors(
+        ledger_entries,
+        action_key=action_key,
+        required_order=CLEANUP_STEPS,
+        recorded_by=trusted_recorder,
+    )
+    if integrity:
+        ordered = _order_reasons((BLOCKED_LEDGER_UNTRUSTWORTHY,))
+        return CleanupDecision(
+            state=STATE_CLEANUP_BLOCKED,
+            action_key=action_key,
+            next_step=None,
+            step_outcomes=_table(),
+            blocked_reasons=ordered,
+            primary_reason=ordered[0],
+            reason="; ".join(integrity),
+        )
+    done = completed_steps(
+        ledger_entries, action_key=action_key, recorded_by=trusted_recorder
+    )
     outcomes: dict[str, str] = {step: OUTCOME_DONE for step in done if step in CLEANUP_STEPS}
 
     # 1. Process retire — Git-independent.
@@ -541,6 +568,7 @@ __all__ = (
     "BLOCKED_UNPUSHED_COMMITS",
     "BLOCKED_NOT_INTEGRATED_REF",
     "BLOCKED_BRANCH_TIP_DRIFT",
+    "BLOCKED_LEDGER_UNTRUSTWORTHY",
     "RetirementCleanupPolicy",
     "CleanupActionRecord",
     "CleanupPreflight",

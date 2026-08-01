@@ -360,6 +360,38 @@ class LocalBranchDeleteCasTest(unittest.TestCase):
         )
 
 
+class R3LedgerFenceTest(unittest.TestCase):
+    """R3 review j#96368 finding 3: order and provenance are checked before any step runs."""
+
+    def test_a_later_step_recorded_without_its_predecessor_is_not_believed(self) -> None:
+        record = _record()
+        decision = decide_cleanup(
+            DEFAULT_POLICY,
+            record,
+            _clean(),
+            # the branch delete claims to be done while the process retire never was
+            ledger=_ledger(record, STEP_LOCAL_BRANCH_DELETE),
+        )
+        self.assertEqual(decision.state, STATE_CLEANUP_BLOCKED)
+        self.assertIsNone(decision.next_step)
+
+    def test_a_ledger_this_actuator_did_not_write_does_not_count(self) -> None:
+        record = _record()
+        decision = decide_cleanup(
+            DEFAULT_POLICY,
+            record,
+            _clean(),
+            ledger=[
+                StepOutcome(
+                    record.action_key, STEP_PROCESS_RETIRE, OUTCOME_DONE,
+                    recorded_by="somebody-else",
+                )
+            ],
+            trusted_recorder="actuator:/lane|lane_br",
+        )
+        self.assertEqual(decision.next_step, STEP_PROCESS_RETIRE)
+
+
 class R1ReviewFinding1RegressionTest(unittest.TestCase):
     """No policy toggle can leave a ref delete running with its conditions unevaluated."""
 

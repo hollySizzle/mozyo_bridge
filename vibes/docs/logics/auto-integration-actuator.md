@@ -192,15 +192,40 @@ R1 で bool を型へ変えた 4 入力のうち 2 つは、**値を caller が�
 
 R3 ではこの 2 つを preflight の入力から外し、actuator が action-time に自分で測る。
 
-| 入力 | caller が渡すもの | actuator が測るもの |
-| --- | --- | --- |
-| dedicated integration worktree | path (どこを見るか) | `describe_integration_worktree` port の測定結果 |
-| coordinator confirmation | durable anchor (どこを見るか) | `CoordinatorConfirmationResolver` port の解決結果 |
+R3 は 2 field だけを測り、残りを caller から取っていた。R3 review j#96368 finding 1/2 が
+「**2 項目だけ測っても、残りが caller 供給なら mutation authority は依然 caller のもの**」と指摘し、
+cleanup 側では **foreign lane の worktree 削除と branch 削除**が caller boolean だけで再現された。
 
-caller が同じ field に値を入れていても **破棄する** (merge しない / 「より具体的」を優先しない)。
-依頼者が選んだ値は、その依頼についての証拠にならないためである。resolver 未注入で
-`mode: coordinator_confirmed` の場合は confirmation が解決されず、`coordinator_confirmation_required`
-で停止する (暗黙承認にしない)。
+**R4 で caller preflight を廃止した。** `run_integration` / `run_cleanup` は preflight 引数を持たない。
+caller が渡すのは action record (identity) と、この actuator 自身の lane 設定だけである。
+
+| 事実の種類 | 誰が測るか |
+| --- | --- |
+| git 事実 (target head / ancestry / dirty / registered / tip / checked-out / origin 到達) | actuator が `AutoIntegrationGitOperations` の read probe で測定 |
+| durable 事実 (review generation・reviewed head・target identity・callback・owner gate・CI) | actuator が `DurableAuthorityReader` port から action-time に読む |
+| lane identity (これは自分の lane か) | actuator 自身の `lane_worktree` / `lane_branch` と照合 |
+| patch equivalence | **測定できない**。明示 evidence を要する主張であり、probe が無いので提供しない |
+
+authority reader 未注入なら durable 事実は何も確立されず、`integrated` にも `retired` にも到達しない
+(fail-closed)。cleanup は record の path/branch が **actuator 自身の lane と exact 一致**しない限り
+`foreign_worktree` で止まる — CAS tip 一致は「branch が動いていない」ことしか言わず「それが自分のものか」を
+言わないためである。
+
+### ledger は provenance と順序を持つ (R3 review j#96368 finding 3)
+
+`StepOutcome` は `recorded_by` を持ち、actuator は **自分が記録した entry しか数えない**。
+さらに mutation の前に `ledger_integrity_errors` が dependency order と必須 head を検査する。
+push を apply より前に記録した ledger では、R3 は apply だけ実行して **push せずに `integrated`** へ
+到達していた。merge の push は自 run の apply が生んだ commit を押す。source head への fallback は
+**decision 層と mutation 層の両方から**除去した (R3 は decision 層しか直していなかった)。
+
+### `coordinator_confirmed` mode は提供しない (R3 review j#96368 finding 4)
+
+R3 は confirmation resolver を port として置いたが production binding が無く、mode は live 実行不能で、
+任意の injected resolver が架空 anchor を保証できた。reviewer が示した 2 択のうち「配線完了まで
+mode を非提供にする」を採った。**follow-up が実装すべき契約**は次のとおり: anchor を action-time に
+fresh-read し、その記録が **この exact action key** を confirm していることを確認し、`issuer_role` は
+**記録の author から導出**する (caller が名乗った role は authority ではない)。
 
 domain は IO を持たず、事実は全て caller が preflight として渡す ([[logic-object-oriented-architecture-policy]]
 の pure core 方針、既存 `domain/sublane_integration_policy.py` と同じ形)。use case は
@@ -217,8 +242,6 @@ auto_integration:
   mode: disabled            # auto | coordinator_confirmed | disabled (既定 disabled)
   integration_branch: null  # 未設定は runtime 解決。設定時は action の target と exact 一致必須
   ff_only: true             # 既定 (j#96335)
-  require_source_ci: true
-  require_integration_ci: true
   remove_worktree: true
   delete_local_branch: true
 ```

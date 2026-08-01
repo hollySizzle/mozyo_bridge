@@ -34,7 +34,6 @@ from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.
     AUTO_INTEGRATION_KEYS,
     AUTO_INTEGRATION_MODES,
     AUTO_INTEGRATION_MODE_AUTO,
-    AUTO_INTEGRATION_MODE_COORDINATOR_CONFIRMED,
     AUTO_INTEGRATION_MODE_DISABLED,
     AutoIntegrationConfig,
 )
@@ -70,8 +69,7 @@ class ModeTest(unittest.TestCase):
     def test_every_mode_in_the_closed_vocabulary_parses(self) -> None:
         for mode in (
             AUTO_INTEGRATION_MODE_AUTO,
-            AUTO_INTEGRATION_MODE_COORDINATOR_CONFIRMED,
-            AUTO_INTEGRATION_MODE_DISABLED,
+                    AUTO_INTEGRATION_MODE_DISABLED,
         ):
             self.assertEqual(
                 AutoIntegrationConfig.from_record({"mode": mode}).mode, mode
@@ -82,8 +80,7 @@ class ModeTest(unittest.TestCase):
             AUTO_INTEGRATION_MODES,
             {
                 AUTO_INTEGRATION_MODE_AUTO,
-                AUTO_INTEGRATION_MODE_COORDINATOR_CONFIRMED,
-                AUTO_INTEGRATION_MODE_DISABLED,
+                            AUTO_INTEGRATION_MODE_DISABLED,
             },
         )
 
@@ -186,14 +183,14 @@ class ComposedConfigTest(unittest.TestCase):
         config = RepoLocalConfig.from_record(
             {
                 "auto_integration": {
-                    "mode": AUTO_INTEGRATION_MODE_COORDINATOR_CONFIRMED,
+                    "mode": AUTO_INTEGRATION_MODE_AUTO,
                     "integration_branch": "main",
                     "ff_only": False,
                 }
             }
         )
         self.assertEqual(
-            config.auto_integration.mode, AUTO_INTEGRATION_MODE_COORDINATOR_CONFIRMED
+            config.auto_integration.mode, AUTO_INTEGRATION_MODE_AUTO
         )
         self.assertEqual(config.auto_integration.integration_branch, "main")
         self.assertFalse(config.auto_integration.ff_only)

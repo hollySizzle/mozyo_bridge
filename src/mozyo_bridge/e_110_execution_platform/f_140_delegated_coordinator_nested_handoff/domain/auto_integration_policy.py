@@ -67,14 +67,12 @@ from typing import Iterable, Optional, Tuple
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_records import (
     BLOCKED_ACTION_KEY_MISMATCH,
     CI_CONCLUSION_SUCCESS,
-    CONFIRMATION_ISSUER_COORDINATOR,
     EMPTY_TARGET_HEAD,
     OUTCOME_BLOCKED,
     OUTCOME_DONE,
     OUTCOME_NOT_APPLICABLE,
     OUTCOME_PENDING,
     STEP_OUTCOMES,
-    CoordinatorConfirmation,
     IntegrationActionRecord,
     IntegrationCiEvidence,
     IntegrationPreflight,
@@ -83,6 +81,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     build_integration_action_record,
     completed_steps,
     is_full_sha,
+    LEDGER_MISSING_HEAD,
+    ledger_integrity_errors,
     normalized_branch,
 )
 
@@ -92,18 +92,21 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 
 #: Advance the integration automatically once every gate is satisfied.
 MODE_AUTO = "auto"
-#: Every gate is evaluated, but the actuation additionally waits for an explicit
-#: coordinator confirmation of *this* action key. The gates are not relaxed by it — a
-#: confirmation cannot un-block a blocked action.
-MODE_COORDINATOR_CONFIRMED = "coordinator_confirmed"
+# There is deliberately no `coordinator_confirmed` mode. R3 shipped one whose confirmation
+# was resolved through a port with no production binding, so the mode was not live-executable
+# and any injected resolver could return a syntactically valid record for a fictitious anchor
+# (R3 review j#96368 finding 4). The reviewer's two options were to wire a live resolver or to
+# stop offering the mode until one exists; the second is taken here, because R4 already moves
+# the whole preflight's measurement authority and adding a credentialed Redmine resolver in the
+# same round would ship it under-verified. The design (a resolver that fresh-reads the anchor,
+# matches the exact action key, and derives the issuer role from the record's author) is kept
+# in `vibes/docs/logics/auto-integration-actuator.md` as the contract the follow-up implements.
 #: No auto-integration at all: the decision is terminal and performs nothing. This is the
 #: behavior-preserving default, so a repo that declares no ``auto_integration`` block keeps
 #: today's fully manual coordinator integration.
 MODE_DISABLED = "disabled"
 
-INTEGRATION_MODES: frozenset = frozenset(
-    {MODE_AUTO, MODE_COORDINATOR_CONFIRMED, MODE_DISABLED}
-)
+INTEGRATION_MODES: frozenset = frozenset({MODE_AUTO, MODE_DISABLED})
 
 # ---------------------------------------------------------------------------
 # Integration disposition vocabulary — HOW the source reaches the integration branch.
@@ -167,9 +170,6 @@ STATE_PATCH_EQUIVALENT = "patch_equivalent"
 #: Terminal: not a Git workspace, so there is no integration to perform. The separate
 #: process retire still runs — see :mod:`...domain.retirement_cleanup_policy`.
 STATE_NOT_APPLICABLE = "not_applicable"
-#: Terminal for this evaluation: ``coordinator_confirmed`` mode with no confirmation for
-#: this exact action key yet. Every gate already passed; only the confirmation is missing.
-STATE_CONFIRMATION_REQUIRED = "coordinator_confirmation_required"
 #: Terminal: ``mode: disabled``.
 STATE_DISABLED = "disabled"
 
@@ -184,7 +184,6 @@ INTEGRATION_STATES: frozenset = frozenset(
         STATE_ALREADY_INTEGRATED,
         STATE_PATCH_EQUIVALENT,
         STATE_NOT_APPLICABLE,
-        STATE_CONFIRMATION_REQUIRED,
         STATE_DISABLED,
     }
 )
@@ -197,7 +196,6 @@ TERMINAL_STATES: frozenset = frozenset(
         STATE_ALREADY_INTEGRATED,
         STATE_PATCH_EQUIVALENT,
         STATE_NOT_APPLICABLE,
-        STATE_CONFIRMATION_REQUIRED,
         STATE_DISABLED,
     }
 )
@@ -277,6 +275,11 @@ BLOCKED_UNRESOLVED_OWNER_GATE = "unresolved_owner_gate"
 #: The push was attempted and lost the race (or otherwise failed). Recorded distinctly from
 #: :data:`BLOCKED_TARGET_DRIFT`, which is the *pre*-push observation.
 BLOCKED_PUSH_REJECTED = "push_rejected"
+#: The ledger's ``done`` steps are out of dependency order, omit a step a later one depends
+#: on, or lack a head a step must carry (R3 review j#96368 finding 3). A push recorded before
+#: any apply is the reproduction: the run applied a merge and then reported ``integrated``
+#: having pushed nothing, because the map of completed steps never looked at their order.
+BLOCKED_LEDGER_UNTRUSTWORTHY = "ledger_untrustworthy"
 #: A push was recorded ``done`` but its outcome carries no usable head (R2 review j#96350
 #: finding 2). R2 fell back to the source head here, which turned "we failed to record what
 #: landed" into "the source landed" — and then matched a merge integration's CI against the
@@ -302,11 +305,6 @@ BLOCKED_INTEGRATION_CI_HEAD_MISMATCH = "integration_ci_head_mismatch"
 #: whether the ref is a known integration branch at all: a ref can be perfectly well known
 #: and still not be the one the operator pointed THIS actuator at.
 BLOCKED_TARGET_NOT_CONFIGURED = "target_not_configured"
-#: A coordinator confirmation was supplied but does not authorize this action: it names a
-#: different action key, was not issued by the coordinator role, or carries no durable anchor
-#: (R1 review j#96344 finding 5). Absence is not this — that is
-#: :data:`STATE_CONFIRMATION_REQUIRED`; this is a confirmation that is present and invalid.
-BLOCKED_CONFIRMATION_INADMISSIBLE = "coordinator_confirmation_inadmissible"
 #: The dedicated integration worktree is unusable: unregistered, not clean, or — the one this
 #: exists for — the lane's own checkout, which must never check out the target branch
 #: (j#77124 / R1 review j#96344 finding 3).
@@ -318,7 +316,7 @@ _BLOCKED_REASON_PRECEDENCE: Tuple[str, ...] = (
     BLOCKED_ACTION_RECORD_INVALID,
     BLOCKED_MODE_UNRECOGNIZED,
     BLOCKED_ACTION_KEY_MISMATCH,
-    BLOCKED_CONFIRMATION_INADMISSIBLE,
+    BLOCKED_LEDGER_UNTRUSTWORTHY,
     BLOCKED_FOREIGN_WORKTREE,
     BLOCKED_UNKNOWN_TARGET,
     BLOCKED_TARGET_NOT_CONFIGURED,
@@ -369,7 +367,7 @@ class AutoIntegrationPolicy:
     Intent only. Exactly as in the #12604 sibling, the policy may opt *out* of an action;
     it can never opt out of a safety gate, because no gate below reads a policy field.
 
-    ``mode`` — :data:`MODE_AUTO` / :data:`MODE_COORDINATOR_CONFIRMED` / :data:`MODE_DISABLED`.
+    ``mode`` — :data:`MODE_AUTO` or :data:`MODE_DISABLED`.
     ``integration_branch`` — the configured target ref; ``None`` defers to runtime
     resolution, and a runtime that cannot resolve one fails closed rather than guessing.
     ``ff_only`` — the owner's default (j#96335). ``False`` admits the merge-commit
@@ -523,6 +521,7 @@ def decide_integration(
     preflight: IntegrationPreflight,
     *,
     ledger: Iterable[StepOutcome] = (),
+    trusted_recorder: str = "",
 ) -> IntegrationDecision:
     """Decide the next integration state / step for one action (pure).
 
@@ -696,34 +695,39 @@ def decide_integration(
                 action_key=action_key,
             )
 
-    if policy.mode == MODE_COORDINATOR_CONFIRMED:
-        # R1 review j#96344 finding 5: a confirmation must name WHAT it confirms, WHO issued
-        # it, and WHERE it is recorded. A bare flag said none of those, so any caller could
-        # assert one. Absence and inadmissibility are kept apart: the first is a normal wait,
-        # the second is a refusal.
-        confirmation = preflight.coordinator_confirmation
-        if confirmation is None:
-            return IntegrationDecision(
-                state=STATE_CONFIRMATION_REQUIRED,
-                action_key=action_key,
-                next_step=None,
-                disposition=disposition,
-                reason=(
-                    "every gate passed; awaiting the coordinator's explicit confirmation of "
-                    f"action key {action_key}"
-                ),
-            )
-        problems = confirmation.admissibility_errors(action_key=action_key)
-        if problems:
-            return _blocked(
-                record,
-                (BLOCKED_CONFIRMATION_INADMISSIBLE,),
-                disposition=disposition,
-                action_key=action_key,
-                reason="; ".join(problems),
-            )
-
-    done = completed_steps(ledger, action_key=action_key)
+    # R3 review j#96368 finding 3: a ledger is only evidence if its recorded steps are in
+    # dependency order and carry the heads they must. Checked BEFORE any step is selected, so
+    # an out-of-order ledger cannot authorize a mutation.
+    ledger_entries = tuple(ledger)
+    integrity = ledger_integrity_errors(
+        ledger_entries,
+        action_key=action_key,
+        required_order=(STEP_INTEGRATION_APPLY, STEP_PUSH, STEP_INTEGRATION_CI)
+        if disposition == DISPOSITION_MERGE_COMMIT
+        else (STEP_PUSH, STEP_INTEGRATION_CI),
+        head_bearing_steps=(STEP_INTEGRATION_APPLY, STEP_PUSH)
+        if disposition == DISPOSITION_MERGE_COMMIT
+        else (STEP_PUSH,),
+        recorded_by=trusted_recorder,
+    )
+    if integrity:
+        # Distinct problems keep distinct tokens: "the steps are out of order" and "a step
+        # cannot say what it produced" call for different operator actions.
+        return _blocked(
+            record,
+            tuple(
+                BLOCKED_PUSH_OUTCOME_HEAD_MISSING
+                if problem == LEDGER_MISSING_HEAD
+                else BLOCKED_LEDGER_UNTRUSTWORTHY
+                for problem in integrity
+            ),
+            disposition=disposition,
+            action_key=action_key,
+            reason="; ".join(integrity),
+        )
+    done = completed_steps(
+        ledger_entries, action_key=action_key, recorded_by=trusted_recorder
+    )
 
     # 1. Apply. A fast-forward has nothing to apply, so the step is skipped as
     #    `not_applicable` rather than reported done.
@@ -853,7 +857,6 @@ def decide_integration(
 
 __all__ = (
     "MODE_AUTO",
-    "MODE_COORDINATOR_CONFIRMED",
     "MODE_DISABLED",
     "INTEGRATION_MODES",
     "DISPOSITION_FAST_FORWARD",
@@ -868,7 +871,6 @@ __all__ = (
     "STATE_ALREADY_INTEGRATED",
     "STATE_PATCH_EQUIVALENT",
     "STATE_NOT_APPLICABLE",
-    "STATE_CONFIRMATION_REQUIRED",
     "STATE_DISABLED",
     "INTEGRATION_STATES",
     "TERMINAL_STATES",
@@ -883,6 +885,7 @@ __all__ = (
     "STEP_OUTCOMES",
     "BLOCKED_ACTION_RECORD_INVALID",
     "BLOCKED_ACTION_KEY_MISMATCH",
+    "BLOCKED_LEDGER_UNTRUSTWORTHY",
     "BLOCKED_MODE_UNRECOGNIZED",
     "BLOCKED_SOURCE_MUTATED",
     "BLOCKED_SOURCE_UNREACHABLE",
@@ -906,7 +909,6 @@ __all__ = (
     "BLOCKED_INTEGRATION_CI_EVIDENCE_INCOMPLETE",
     "BLOCKED_INTEGRATION_CI_HEAD_MISMATCH",
     "BLOCKED_TARGET_NOT_CONFIGURED",
-    "BLOCKED_CONFIRMATION_INADMISSIBLE",
     "BLOCKED_INTEGRATION_WORKTREE_INADMISSIBLE",
     "CI_GATE_GREEN",
     "CI_GATE_NOT_REACHED",
@@ -925,13 +927,12 @@ __all__ = (
     "OUTCOME_PENDING",
     "STEP_OUTCOMES",
     "BLOCKED_ACTION_KEY_MISMATCH",
+    "BLOCKED_LEDGER_UNTRUSTWORTHY",
     "StepOutcome",
     "completed_steps",
     "IntegrationActionRecord",
     "build_integration_action_record",
     "CI_CONCLUSION_SUCCESS",
     "IntegrationCiEvidence",
-    "CONFIRMATION_ISSUER_COORDINATOR",
-    "CoordinatorConfirmation",
     "IntegrationWorktree",
 )

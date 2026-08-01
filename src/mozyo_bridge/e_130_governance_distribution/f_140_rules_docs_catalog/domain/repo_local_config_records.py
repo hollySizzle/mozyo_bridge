@@ -62,18 +62,19 @@ AUTO_INTEGRATION_KEYS: frozenset[str] = frozenset(
         "delete_local_branch",
     }
 )
-#: ``mode: auto`` advances the integration once every gate is satisfied;
-#: ``coordinator_confirmed`` additionally waits for an explicit confirmation of the exact
-#: action key; ``disabled`` performs nothing.
+#: ``mode: auto`` advances the integration once every gate is satisfied; ``disabled``
+#: performs nothing.
+#:
+#: There is deliberately no ``coordinator_confirmed``. R3 shipped it with a confirmation
+#: resolver that had no production binding, so the mode was not live-executable and any
+#: injected resolver could vouch for a fictitious anchor (R3 review j#96368 finding 4). The
+#: reviewer's options were to wire a live resolver or stop offering the mode until one
+#: exists; the second is taken, so the value is not accepted by this schema either — a config
+#: that names it fails closed rather than selecting a mode the runtime cannot honour.
 AUTO_INTEGRATION_MODE_AUTO: str = "auto"
-AUTO_INTEGRATION_MODE_COORDINATOR_CONFIRMED: str = "coordinator_confirmed"
 AUTO_INTEGRATION_MODE_DISABLED: str = "disabled"
 AUTO_INTEGRATION_MODES: frozenset[str] = frozenset(
-    {
-        AUTO_INTEGRATION_MODE_AUTO,
-        AUTO_INTEGRATION_MODE_COORDINATOR_CONFIRMED,
-        AUTO_INTEGRATION_MODE_DISABLED,
-    }
+    {AUTO_INTEGRATION_MODE_AUTO, AUTO_INTEGRATION_MODE_DISABLED}
 )
 #: ``disabled`` is the behavior-preserving default: before #13686 there was no
 #: auto-integration at all, so a repo that declares no ``auto_integration`` block keeps its
@@ -367,8 +368,7 @@ class AutoIntegrationConfig:
 
     Integration fields:
 
-    - :attr:`mode` — :data:`AUTO_INTEGRATION_MODE_AUTO` /
-      :data:`AUTO_INTEGRATION_MODE_COORDINATOR_CONFIRMED` /
+    - :attr:`mode` — :data:`AUTO_INTEGRATION_MODE_AUTO` or
       :data:`AUTO_INTEGRATION_MODE_DISABLED`. The default is ``disabled``, which is
       behavior-preserving: nothing integrated itself before #13686 either.
     - :attr:`integration_branch` — the configured target ref. ``None`` defers to runtime
@@ -613,7 +613,6 @@ __all__ = (
     "AUTO_INTEGRATION_KEYS",
     "AUTO_INTEGRATION_MODES",
     "AUTO_INTEGRATION_MODE_AUTO",
-    "AUTO_INTEGRATION_MODE_COORDINATOR_CONFIRMED",
     "AUTO_INTEGRATION_MODE_DISABLED",
     "DEFAULT_AUTO_INTEGRATION_MODE",
     "DEFAULT_FF_ONLY",

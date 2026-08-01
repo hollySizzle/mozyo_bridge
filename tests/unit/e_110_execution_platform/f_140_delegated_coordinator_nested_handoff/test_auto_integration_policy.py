@@ -32,10 +32,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCKED_DIRTY_WORKTREE,
     BLOCKED_FOREIGN_WORKTREE,
     BLOCKED_INTEGRATION_CI_FAILED,
-    BLOCKED_CONFIRMATION_INADMISSIBLE,
     BLOCKED_INTEGRATION_CI_EVIDENCE_INCOMPLETE,
     BLOCKED_INTEGRATION_CI_HEAD_MISMATCH,
     BLOCKED_INTEGRATION_WORKTREE_INADMISSIBLE,
+    BLOCKED_LEDGER_UNTRUSTWORTHY,
     BLOCKED_MERGE_CONFLICT,
     BLOCKED_MODE_UNRECOGNIZED,
     BLOCKED_TARGET_NOT_CONFIGURED,
@@ -59,14 +59,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DISPOSITION_FAST_FORWARD,
     DISPOSITION_MERGE_COMMIT,
     EMPTY_TARGET_HEAD,
+    INTEGRATION_MODES,
     MODE_AUTO,
-    MODE_COORDINATOR_CONFIRMED,
     MODE_DISABLED,
     OUTCOME_BLOCKED,
     OUTCOME_DONE,
     STATE_ALREADY_INTEGRATED,
     STATE_AWAITING_CI,
-    STATE_CONFIRMATION_REQUIRED,
     STATE_DISABLED,
     STATE_INTEGRATED,
     STATE_INTEGRATION_APPLY,
@@ -79,7 +78,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     STEP_INTEGRATION_CI,
     STEP_PUSH,
     AutoIntegrationPolicy,
-    CoordinatorConfirmation,
     IntegrationActionRecord,
     IntegrationCiEvidence,
     IntegrationPreflight,
@@ -93,6 +91,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 
 SOURCE = "a" * 40
+RECORDER = "actuator:/lane|lane_br"
 TARGET = "b" * 40
 OTHER = "c" * 40
 
@@ -141,16 +140,6 @@ def _clean(**overrides: object) -> IntegrationPreflight:
     return IntegrationPreflight(**fields)  # type: ignore[arg-type]
 
 
-def _confirmation(record: IntegrationActionRecord, **overrides: object) -> CoordinatorConfirmation:
-    fields: dict = {
-        "action_key": record.action_key,
-        "issuer_role": "coordinator",
-        "durable_anchor": "#13686 j#96350",
-    }
-    fields.update(overrides)
-    return CoordinatorConfirmation(**fields)  # type: ignore[arg-type]
-
-
 def _dedicated_worktree(**overrides: object) -> IntegrationWorktree:
     fields: dict = {
         "path": "<dedicated-integration-worktree>",
@@ -194,82 +183,11 @@ class ModeGateTest(unittest.TestCase):
         # R2 review j#96350 finding 1: `waived` is withdrawn, so `integrated` cannot mean
         # "no CI ran". There are only two CI-gate states left.
         record = _record()
-        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE)]
+        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER)]
         decision = decide_integration(AUTO, record, _clean(), ledger=ledger)
         self.assertEqual(decision.state, STATE_INTEGRATED)
         self.assertEqual(decision.integration_ci, CI_GATE_GREEN)
         self.assertEqual(CI_GATE_STATES, {CI_GATE_GREEN, CI_GATE_NOT_REACHED})
-
-    def test_coordinator_confirmed_waits_for_this_exact_action_key(self) -> None:
-        # R1 review j#96344 finding 5: the R1 version of this test asserted only that the key
-        # appeared in the PROSE reason, while its name promised the decision was bound to it.
-        # It now drives the binding it claims.
-        policy = AutoIntegrationPolicy(
-            mode=MODE_COORDINATOR_CONFIRMED, integration_branch="main"
-        )
-        record = _record()
-
-        absent = decide_integration(policy, record, _clean())
-        self.assertEqual(absent.state, STATE_CONFIRMATION_REQUIRED)
-        self.assertIsNone(absent.next_step)
-
-        # A confirmation of a DIFFERENT action does not authorize this one. Any identity
-        # drift mints a new key, so a confirmation cannot survive the world changing.
-        other = _record(source_head=OTHER)
-        stale = decide_integration(
-            policy, record, _clean(coordinator_confirmation=_confirmation(other))
-        )
-        self.assertEqual(stale.state, STATE_INTEGRATION_BLOCKED)
-        self.assertEqual(stale.blocked_reasons, (BLOCKED_CONFIRMATION_INADMISSIBLE,))
-        self.assertIsNone(stale.next_step)
-
-    def test_a_confirmation_needs_the_coordinator_role_and_a_durable_anchor(self) -> None:
-        policy = AutoIntegrationPolicy(
-            mode=MODE_COORDINATOR_CONFIRMED, integration_branch="main"
-        )
-        record = _record()
-        for overrides in (
-            {"issuer_role": "implementation_worker"},
-            {"issuer_role": ""},
-            {"durable_anchor": ""},
-            {"durable_anchor": "   "},
-        ):
-            decision = decide_integration(
-                policy,
-                record,
-                _clean(coordinator_confirmation=_confirmation(record, **overrides)),
-            )
-            self.assertEqual(
-                decision.blocked_reasons, (BLOCKED_CONFIRMATION_INADMISSIBLE,), overrides
-            )
-
-    def test_coordinator_confirmation_does_not_relax_a_gate(self) -> None:
-        # A confirmation authorizes actuation; it is not an override. A blocked action stays
-        # blocked with the confirmation present.
-        policy = AutoIntegrationPolicy(
-            mode=MODE_COORDINATOR_CONFIRMED, integration_branch="main"
-        )
-        decision = decide_integration(
-            policy,
-            _record(),
-            _clean(
-                coordinator_confirmation=_confirmation(_record()),
-                source_worktree_dirty=True,
-            ),
-        )
-        self.assertEqual(decision.state, STATE_INTEGRATION_BLOCKED)
-        self.assertIn(BLOCKED_DIRTY_WORKTREE, decision.blocked_reasons)
-
-    def test_confirmed_action_proceeds_to_the_push(self) -> None:
-        policy = AutoIntegrationPolicy(
-            mode=MODE_COORDINATOR_CONFIRMED, integration_branch="main"
-        )
-        decision = decide_integration(
-            policy, _record(), _clean(coordinator_confirmation=_confirmation(_record()))
-        )
-        self.assertEqual(decision.state, STATE_PUSH_WAITING)
-        self.assertEqual(decision.next_step, STEP_PUSH)
-
 
 class NonGitWorkspaceTest(unittest.TestCase):
     def test_non_git_workspace_has_no_integration(self) -> None:
@@ -509,7 +427,7 @@ class StateOrderTest(unittest.TestCase):
         first = decide_integration(AUTO, record, pending_ci)
         self.assertEqual((first.state, first.next_step), (STATE_PUSH_WAITING, STEP_PUSH))
 
-        pushed = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE)]
+        pushed = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER)]
         second = decide_integration(AUTO, record, pending_ci, ledger=pushed)
         self.assertEqual(
             (second.state, second.next_step), (STATE_AWAITING_CI, STEP_INTEGRATION_CI)
@@ -524,7 +442,7 @@ class StateOrderTest(unittest.TestCase):
         # "The run settled" and "the run was green" are separate facts: a settled non-green
         # verdict is a failure, not a still-pending gate.
         record = _record()
-        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE)]
+        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER)]
         red = IntegrationCiEvidence(
             integration_head=SOURCE, workflow="required-ci", run="run-1", conclusion="failure"
         )
@@ -540,7 +458,7 @@ class StateOrderTest(unittest.TestCase):
 class IdempotencyTest(unittest.TestCase):
     def test_a_done_step_is_not_re_run(self) -> None:
         record = _record()
-        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE)]
+        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER)]
         decision = decide_integration(AUTO, record, _clean(), ledger=ledger)
         self.assertEqual(decision.state, STATE_INTEGRATED)
         self.assertIsNone(decision.next_step)
@@ -556,7 +474,7 @@ class IdempotencyTest(unittest.TestCase):
 
     def test_a_blocked_step_outcome_does_not_count_as_progress(self) -> None:
         record = _record()
-        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_BLOCKED, head=SOURCE)]
+        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_BLOCKED, head=SOURCE, recorded_by=RECORDER)]
         decision = decide_integration(AUTO, record, _clean(), ledger=ledger)
         self.assertEqual(decision.next_step, STEP_PUSH)
 
@@ -570,8 +488,7 @@ class IdempotencyTest(unittest.TestCase):
         )
         ledger = [
             StepOutcome(
-                record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE, head=OTHER
-            )
+                record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE, head=OTHER, recorded_by=RECORDER)
         ]
         decision = decide_integration(policy, record, world, ledger=ledger)
         self.assertEqual(decision.next_step, STEP_PUSH)
@@ -587,7 +504,7 @@ class R1ReviewFindingRegressionTest(unittest.TestCase):
         # landed — the central preset's `### Hibernate Evidence Marker Contract` rule that an
         # unrelated green run must not satisfy a required-CI claim.
         record = _record()
-        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE)]
+        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER)]
         elsewhere = IntegrationCiEvidence(
             integration_head=OTHER, workflow="required-ci", run="run-9", conclusion="success"
         )
@@ -602,7 +519,7 @@ class R1ReviewFindingRegressionTest(unittest.TestCase):
         # "We cannot tell what this run was" is not "the run failed": the operator's next
         # action differs, so the tokens differ.
         record = _record()
-        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE)]
+        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER)]
         for overrides in (
             {"workflow": ""},
             {"run": ""},
@@ -637,8 +554,8 @@ class R1ReviewFindingRegressionTest(unittest.TestCase):
         )
         merge_head = "f" * 40
         ledger = [
-            StepOutcome(record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE, head=merge_head),
-            StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=merge_head),
+            StepOutcome(record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE, head=merge_head, recorded_by=RECORDER),
+            StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=merge_head, recorded_by=RECORDER),
         ]
         about_source = IntegrationCiEvidence(
             integration_head=SOURCE, workflow="required-ci", run="r", conclusion="success"
@@ -762,6 +679,80 @@ class R1ReviewFindingRegressionTest(unittest.TestCase):
         )
 
 
+class R3ReviewFindingRegressionTest(unittest.TestCase):
+    """R3 review j#96368's findings, pinned with the inputs that reproduced them."""
+
+    def test_f3_a_push_recorded_before_any_apply_is_not_believed(self) -> None:
+        # R3: `completed_steps` mapped entries without looking at ORDER, so a ledger claiming
+        # a push that never happened let the run apply a merge and then report `integrated`
+        # having pushed nothing.
+        record = _record()
+        policy = AutoIntegrationPolicy(
+            mode=MODE_AUTO, integration_branch="main", ff_only=False
+        )
+        decision = decide_integration(
+            policy,
+            record,
+            _clean(
+                fast_forward_possible=False, integration_worktree=_dedicated_worktree()
+            ),
+            ledger=[
+                StepOutcome(
+                    record.action_key, STEP_PUSH, OUTCOME_DONE, head=OTHER,
+                    recorded_by=RECORDER,
+                )
+            ],
+            trusted_recorder=RECORDER,
+        )
+        self.assertEqual(decision.blocked_reasons, (BLOCKED_LEDGER_UNTRUSTWORTHY,))
+        self.assertIsNone(decision.next_step)
+
+    def test_f3_a_ledger_entry_this_actuator_did_not_write_does_not_count(self) -> None:
+        # Provenance: an actuator counts only what it recorded. A caller-authored entry is
+        # not evidence that a step ran.
+        record = _record()
+        decision = decide_integration(
+            AUTO,
+            record,
+            _clean(),
+            ledger=[
+                StepOutcome(
+                    record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE,
+                    recorded_by="somebody-else",
+                )
+            ],
+            trusted_recorder=RECORDER,
+        )
+        self.assertEqual(decision.next_step, STEP_PUSH)
+
+    def test_f3_an_in_order_own_provenance_ledger_is_believed(self) -> None:
+        record = _record()
+        decision = decide_integration(
+            AUTO,
+            record,
+            _clean(),
+            ledger=[
+                StepOutcome(
+                    record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE,
+                    recorded_by=RECORDER,
+                )
+            ],
+            trusted_recorder=RECORDER,
+        )
+        self.assertEqual(decision.state, STATE_INTEGRATED)
+
+    def test_f4_the_coordinator_confirmed_mode_is_not_offered(self) -> None:
+        # R3 review j#96368 finding 4: the mode had no live resolver binding, so it was not
+        # live-executable. Withdrawn until one exists (the reviewer's second option).
+        self.assertEqual(INTEGRATION_MODES, {MODE_AUTO, MODE_DISABLED})
+        decision = decide_integration(
+            AutoIntegrationPolicy(mode="coordinator_confirmed", integration_branch="main"),
+            _record(),
+            _clean(),
+        )
+        self.assertEqual(decision.blocked_reasons, (BLOCKED_MODE_UNRECOGNIZED,))
+
+
 class R2ReviewFindingRegressionTest(unittest.TestCase):
     """R2 review j#96350's findings, pinned with the inputs that reproduced them."""
 
@@ -776,7 +767,7 @@ class R2ReviewFindingRegressionTest(unittest.TestCase):
             AUTO,
             record,
             _clean(integration_ci=None),
-            ledger=[StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE)],
+            ledger=[StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER)],
         )
         self.assertEqual(decision.state, STATE_AWAITING_CI)
         self.assertEqual(decision.integration_ci, CI_GATE_NOT_REACHED)
@@ -827,9 +818,8 @@ class R2ReviewFindingRegressionTest(unittest.TestCase):
             ),
             ledger=[
                 StepOutcome(
-                    record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE, head=merge_head
-                ),
-                StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=""),
+                    record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE, head=merge_head, recorded_by=RECORDER),
+                StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head="", recorded_by=RECORDER),
             ],
         )
         self.assertEqual(decision.blocked_reasons, (BLOCKED_PUSH_OUTCOME_HEAD_MISSING,))
@@ -841,7 +831,7 @@ class R2ReviewFindingRegressionTest(unittest.TestCase):
             record,
             _clean(),
             ledger=[
-                StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head="not-a-sha")
+                StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head="not-a-sha", recorded_by=RECORDER)
             ],
         )
         self.assertEqual(decision.blocked_reasons, (BLOCKED_PUSH_OUTCOME_HEAD_MISSING,))
@@ -854,7 +844,7 @@ class R2ReviewFindingRegressionTest(unittest.TestCase):
             AUTO,
             record,
             _clean(),
-            ledger=[StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=OTHER)],
+            ledger=[StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=OTHER, recorded_by=RECORDER)],
         )
         self.assertEqual(ff.blocked_reasons, (BLOCKED_PUSH_HEAD_MISMATCH,))
 
@@ -870,9 +860,8 @@ class R2ReviewFindingRegressionTest(unittest.TestCase):
             ),
             ledger=[
                 StepOutcome(
-                    record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE, head=merge_head
-                ),
-                StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE),
+                    record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE, head=merge_head, recorded_by=RECORDER),
+                StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER),
             ],
         )
         self.assertEqual(merged.blocked_reasons, (BLOCKED_PUSH_HEAD_MISMATCH,))
@@ -898,9 +887,8 @@ class R2ReviewFindingRegressionTest(unittest.TestCase):
             ),
             ledger=[
                 StepOutcome(
-                    record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE, head=merge_head
-                ),
-                StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=merge_head),
+                    record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE, head=merge_head, recorded_by=RECORDER),
+                StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=merge_head, recorded_by=RECORDER),
             ],
         )
         self.assertEqual(decision.state, STATE_INTEGRATED)
@@ -923,7 +911,7 @@ class JournalRendererTest(unittest.TestCase):
     def test_integrated_record_separates_source_and_integration_heads(self) -> None:
         # A single head cannot prove a merge-commit integration, so both are emitted.
         record = _record()
-        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE)]
+        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER)]
         decision = decide_integration(AUTO, record, _clean(), ledger=ledger)
         rendered = render_integration_action_journal(
             decision, record, integration_head=OTHER
@@ -944,7 +932,7 @@ class JournalRendererTest(unittest.TestCase):
                 record,
                 preflight,
                 ledger=[
-                    StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE)
+                    StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER)
                 ]
                 if preflight.integration_ci is None
                 else [],

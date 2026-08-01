@@ -452,7 +452,7 @@ origin到達可能性:
       - 最新 review generation が approved かつ未解決の blocking finding なし (古い approval の使い回しは不可)
       - 統合対象が review 済みの exact head であること (review 後に source が変化していたら不可)
       - source head が origin 到達可能であること
-      - source branch の CI が green (設定で必須化を外せるが、外した事実は config status に出る)
+      - source branch の CI が green。**設定で外せない** — どの required check を要求するかは設定事項だが、要求するか否かは設定事項ではない
       - target ref が既知の integration branch で、action 形成時の expected head から drift していないこと
       - lane worktree が clean かつ foreign でなく、unique な unpushed commit を持たないこと
       - 未解決の callback / owner 判断 / release gate が無いこと

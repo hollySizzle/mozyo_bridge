@@ -39,7 +39,7 @@ from typing import List, Optional, Protocol, Sequence, Tuple, runtime_checkable
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_policy import (
     BLOCKED_PUSH_REJECTED,
-    MODE_COORDINATOR_CONFIRMED,
+    DISPOSITION_MERGE_COMMIT,
     OUTCOME_BLOCKED,
     OUTCOME_DONE,
     OUTCOME_PENDING,
@@ -52,10 +52,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     IntegrationPreflight,
     IntegrationWorktree,
     StepOutcome,
+    completed_steps,
+    is_full_sha,
     decide_integration,
-)
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_records import (
-    CoordinatorConfirmation,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.retirement_cleanup_policy import (
     STEP_LOCAL_BRANCH_DELETE,
@@ -176,6 +175,30 @@ class AutoIntegrationGitOperations(Protocol):
         """
         ...
 
+    def resolve_head(self, ref: str) -> str:
+        """The full commit SHA ``ref`` resolves to (read-only, fail-closed)."""
+        ...
+
+    def is_ancestor(self, *, ancestor: str, descendant: str) -> bool:
+        """True iff ``ancestor`` is an ancestor of ``descendant`` (read-only, fail-closed)."""
+        ...
+
+    def worktree_dirty(self, *, worktree_path: str = "") -> bool:
+        """True iff the worktree has uncommitted / untracked changes (fail-closed)."""
+        ...
+
+    def commit_on_remote(self, commit: str, *, branch: str) -> bool:
+        """True iff ``commit`` is reachable from the remote's current ``branch`` tip."""
+        ...
+
+    def branch_tip(self, branch: str) -> str:
+        """The full SHA ``branch`` points at, or ``""``."""
+        ...
+
+    def branch_checked_out_elsewhere(self, branch: str) -> bool:
+        """True iff any worktree still holds ``branch`` checked out (fail-closed)."""
+        ...
+
     def remove_worktree(self, *, worktree_path: str) -> bool:
         """Remove the worktree at ``worktree_path`` without ``--force``."""
         ...
@@ -192,26 +215,64 @@ class ManagedProcessOperations(Protocol):
     def release_process(self, *, issue: str, lane_generation: int) -> bool: ...
 
 
-@runtime_checkable
-class CoordinatorConfirmationResolver(Protocol):
-    """Resolves a coordinator confirmation from the durable record it is recorded at.
+@dataclass(frozen=True)
+class IntegrationAuthority:
+    """The durable-record facts an integration needs, as read from the source of truth.
 
-    R2 accepted a :class:`CoordinatorConfirmation` straight from the caller, so a forged one
-    naming a nonexistent anchor authorized an actuation (j#96350 finding 4): typing a
-    self-assertion does not stop it being a self-assertion. The caller now supplies only an
-    *anchor* — where to look — and this port does the looking.
+    These are the ones no git probe can answer: whether the latest review generation is
+    admissible and which head it approved, whether the target ref is an allowlisted
+    integration branch, whether callbacks and owner gates are settled, and the source
+    branch's CI evidence. R3 review j#96368 finding 1 found them taken verbatim from the
+    caller, so an integration could be authorized by the requester's own say-so.
 
-    An implementation MUST: fresh-read the anchor from the source of truth; confirm the
-    record there confirms **this exact action key**; and derive ``issuer_role`` from the
-    record's own author rather than from anything the caller said. It returns ``None`` for
-    every failure — unreadable anchor, absent record, wrong action, non-coordinator author —
-    because "we could not establish a confirmation" and "there is no confirmation" lead to
-    the same fail-closed place.
+    Every field defaults to its unsatisfied value: a reader that cannot answer leaves the
+    gate closed rather than open.
     """
 
-    def resolve(
-        self, *, anchor: str, action_key: str
-    ) -> Optional[CoordinatorConfirmation]: ...
+    review_generation_admissible: bool = False
+    #: The exact head the latest admissible review approved. Compared against the action's
+    #: source head, so "reviewed" cannot mean "some earlier commit was reviewed".
+    reviewed_head: str = ""
+    target_identity_known: bool = False
+    callbacks_drained: bool = False
+    owner_gates_resolved: bool = False
+    source_ci: Optional[IntegrationCiEvidence] = None
+
+
+@dataclass(frozen=True)
+class CleanupAuthority:
+    """The durable-record facts a post-close cleanup needs (the destructive half).
+
+    R3 review j#96368 finding 2: every one of these was caller-supplied, and the independent
+    reproduction removed a *foreign* lane's worktree and deleted its branch on that basis.
+    """
+
+    issue_closed: bool = False
+    integration_confirmed: bool = False
+    integration_ci_settled_green: bool = False
+    callbacks_drained: bool = False
+    owner_gates_resolved: bool = False
+
+
+@runtime_checkable
+class DurableAuthorityReader(Protocol):
+    """Reads the authority facts from the durable record (Redmine), fresh, at action time.
+
+    An implementation MUST read the source of truth rather than any caller-provided cache,
+    and MUST leave a field at its unsatisfied default when it cannot establish the fact.
+    """
+
+    def read_integration_authority(
+        self, *, record: IntegrationActionRecord
+    ) -> IntegrationAuthority: ...
+
+    def read_integration_ci(
+        self, *, record: IntegrationActionRecord, integration_head: str
+    ) -> Optional[IntegrationCiEvidence]: ...
+
+    def read_cleanup_authority(
+        self, *, record: CleanupActionRecord
+    ) -> CleanupAuthority: ...
 
 
 # ---------------------------------------------------------------------------
@@ -238,8 +299,8 @@ class IntegrationRunReport:
     #: What the actuator MEASURED about the dedicated integration worktree, as opposed to
     #: what the caller claimed. Recorded so the durable record shows the measurement.
     measured_worktree: Optional[IntegrationWorktree] = None
-    #: The confirmation the resolver returned for this action (``None`` when none resolved).
-    resolved_confirmation: Optional[CoordinatorConfirmation] = None
+    #: The durable-record authority this run READ (as opposed to anything a caller claimed).
+    measured_authority: Optional["IntegrationAuthority"] = None
 
     def as_payload(self) -> dict[str, object]:
         return {
@@ -249,9 +310,9 @@ class IntegrationRunReport:
             "measured_worktree": (
                 self.measured_worktree.as_payload() if self.measured_worktree else None
             ),
-            "resolved_confirmation": (
-                self.resolved_confirmation.as_payload()
-                if self.resolved_confirmation
+            "measured_authority": (
+                dataclasses.asdict(self.measured_authority)
+                if self.measured_authority
                 else None
             ),
             "final_decision": (
@@ -267,11 +328,18 @@ class CleanupRunReport:
     states: List[str] = field(default_factory=list)
     outcomes: List[StepOutcome] = field(default_factory=list)
     final_decision: Optional[CleanupDecision] = None
+    #: What this actuator MEASURED, as opposed to anything a caller claimed.
+    measured_preflight: Optional[CleanupPreflight] = None
 
     def as_payload(self) -> dict[str, object]:
         return {
             "states": list(self.states),
             "outcomes": [outcome.as_payload() for outcome in self.outcomes],
+            "measured_preflight": (
+                dataclasses.asdict(self.measured_preflight)
+                if self.measured_preflight
+                else None
+            ),
             "final_decision": (
                 self.final_decision.as_payload() if self.final_decision else None
             ),
@@ -307,16 +375,26 @@ class AutoIntegrationUseCase:
         default_factory=RetirementCleanupPolicy.default
     )
     processes: Optional[ManagedProcessOperations] = None
-    confirmations: Optional[CoordinatorConfirmationResolver] = None
+    authority: Optional[DurableAuthorityReader] = None
     lane_worktree: str = ""
+    lane_branch: str = ""
     integration_worktree_path: str = ""
+
+    @property
+    def recorder_id(self) -> str:
+        """This actuator's ledger provenance — what it stamps on the steps it records.
+
+        R3 review j#96368 finding 3: without it, any caller-authored ledger entry counted as
+        a completed step. Derived from the actuator's own lane identity so two lanes cannot
+        claim each other's work.
+        """
+        return f"actuator:{self.lane_worktree}|{self.lane_branch}"
 
     # -- integration ------------------------------------------------------
 
     def run_integration(
         self,
         record: IntegrationActionRecord,
-        preflight: IntegrationPreflight,
         *,
         ledger: Sequence[StepOutcome] = (),
     ) -> IntegrationRunReport:
@@ -327,13 +405,16 @@ class AutoIntegrationUseCase:
         soon as a step is refused, or as soon as it reaches the asynchronous CI gate — which
         it records ``pending`` rather than waiting on, because it cannot make a run finish.
 
-        The preflight is **not** re-derived between steps. It is a snapshot of the world at
-        action time, and the action key binds the run to it; a world that has changed
-        produces a different key on the next call, which is where the re-validation belongs.
+        There is no ``preflight`` parameter: the actuator measures the world itself
+        (:meth:`_measure`). A caller cannot hand this method a fact, only an action record —
+        which is identity, not evidence. The measurement is taken once per run and not
+        re-derived between steps; the action key binds the run to it, and a world that has
+        changed produces a different key on the next call, which is where re-validation
+        belongs.
         """
         report = IntegrationRunReport()
         working_ledger: List[StepOutcome] = list(ledger)
-        preflight = self._measure(record, preflight, report)
+        preflight = self._measure(record, report, ledger=working_ledger)
         # A resumed run has no in-memory memory of the commit a previous run's apply
         # produced, but the ledger recorded it. Without this the push after a resumed apply
         # would push the SOURCE head instead of the merge commit — silently integrating a
@@ -349,7 +430,11 @@ class AutoIntegrationUseCase:
 
         while True:
             decision = decide_integration(
-                self.integration_policy, record, preflight, ledger=working_ledger
+                self.integration_policy,
+                record,
+                preflight,
+                ledger=working_ledger,
+                trusted_recorder=self.recorder_id,
             )
             report.states.append(decision.state)
             report.final_decision = decision
@@ -366,7 +451,11 @@ class AutoIntegrationUseCase:
                 # produce the same step again, and looping on it would turn a fail-closed
                 # refusal into a spin.
                 report.final_decision = decide_integration(
-                    self.integration_policy, record, preflight, ledger=working_ledger
+                    self.integration_policy,
+                    record,
+                    preflight,
+                    ledger=working_ledger,
+                    trusted_recorder=self.recorder_id,
                 )
                 report.states.append(report.final_decision.state)
                 return report
@@ -374,42 +463,92 @@ class AutoIntegrationUseCase:
     def _measure(
         self,
         record: IntegrationActionRecord,
-        preflight: IntegrationPreflight,
         report: IntegrationRunReport,
+        *,
+        ledger: Sequence[StepOutcome],
     ) -> IntegrationPreflight:
-        """Replace the caller-supplied safety facts with the actuator's own measurements.
+        """Build the ENTIRE integration preflight from this actuator's own measurements.
 
-        The two fields overwritten here are the ones R2 review j#96350 found a caller could
-        forge. Whatever the caller put in them is discarded — not merged, not preferred when
-        "more specific", discarded — because a value the caller chose cannot be evidence
-        about the caller's own request.
+        R3 review j#96368 finding 1: R3 overwrote two fields and took the rest — target head,
+        review generation, origin reachability, source CI, dirty / foreign / unpushed,
+        callback and owner gates — verbatim from the caller, so the mutation authority was
+        still the requester's. There is no caller preflight any more. The caller supplies the
+        action record (identity) and this actuator's own lane configuration; every safety fact
+        below is read from a port at action time.
 
-        The measurement runs unconditionally rather than only for the disposition that needs
-        it: deciding *whether* to measure from the same preflight the measurement is meant to
-        replace would make the skip forgeable too.
+        Anything a port cannot answer stays at its unsatisfied value, so an unreadable world
+        blocks rather than admits.
         """
-        worktree = self.operations.describe_integration_worktree(
-            path=self.integration_worktree_path,
-            lane_worktree=self.lane_worktree,
+        ops = self.operations
+        if not ops.is_git_workspace():
+            return IntegrationPreflight(is_git_workspace=False)
+
+        observed_target = ops.resolve_head(record.target_ref)
+        lane = ops.describe_integration_worktree(
+            path=self.lane_worktree, lane_worktree=self.lane_worktree
         )
-        report.measured_worktree = worktree
+        integration_worktree = ops.describe_integration_worktree(
+            path=self.integration_worktree_path, lane_worktree=self.lane_worktree
+        )
+        report.measured_worktree = integration_worktree
 
-        confirmation: Optional[CoordinatorConfirmation] = None
-        if self.integration_policy.mode == MODE_COORDINATOR_CONFIRMED:
-            if self.confirmations is not None:
-                confirmation = self.confirmations.resolve(
-                    anchor=preflight.coordinator_confirmation_anchor,
-                    action_key=record.action_key,
-                )
-            # No resolver injected: nothing can be resolved, so nothing is confirmed. The
-            # decision then reports `coordinator_confirmation_required` and stops — the
-            # fail-closed reading, not an implicit approval.
-        report.resolved_confirmation = confirmation
+        authority = (
+            self.authority.read_integration_authority(record=record)
+            if self.authority is not None
+            else IntegrationAuthority()
+        )
+        report.measured_authority = authority
 
-        return dataclasses.replace(
-            preflight,
-            integration_worktree=worktree,
-            coordinator_confirmation=confirmation,
+        # The CI gate is about the commit the push RECORDED landing, so it is read only once
+        # that head exists in this actuator's own ledger.
+        landed = completed_steps(
+            ledger, action_key=record.action_key, recorded_by=self.recorder_id
+        ).get(STEP_PUSH)
+        integration_ci = (
+            self.authority.read_integration_ci(
+                record=record, integration_head=landed.head
+            )
+            if self.authority is not None and landed is not None and landed.head
+            else None
+        )
+
+        return IntegrationPreflight(
+            is_git_workspace=True,
+            observed_target_head=observed_target,
+            fast_forward_possible=ops.is_ancestor(
+                ancestor=record.expected_target_head, descendant=record.source_head
+            ),
+            already_integrated=ops.is_ancestor(
+                ancestor=record.source_head, descendant=observed_target
+            ),
+            # Patch equivalence is a CLAIM requiring explicit evidence, not a measurement.
+            # There is no probe that can establish it, so it is not offered here at all
+            # rather than defaulted to a value the actuator cannot justify.
+            patch_equivalent_evidence=False,
+            merge_conflict=False,  # discovered by the apply step itself, never predicted
+            source_worktree_dirty=not lane.clean,
+            # "Foreign" is answered from the actuator's OWN identity: the lane checkout must
+            # be a registered worktree holding this actuator's lane branch.
+            worktree_is_foreign=(
+                not lane.registered or lane.checked_out_branch != self.lane_branch
+            ),
+            unpushed_unique_commits=not ops.commit_on_remote(
+                record.source_head, branch=self.lane_branch
+            ),
+            source_head_matches_review=(
+                bool(authority.reviewed_head)
+                and authority.reviewed_head == record.source_head
+            ),
+            source_origin_reachable=ops.commit_on_remote(
+                record.source_head, branch=self.lane_branch
+            ),
+            review_generation_admissible=authority.review_generation_admissible,
+            target_identity_known=authority.target_identity_known,
+            callbacks_drained=authority.callbacks_drained,
+            owner_gates_resolved=authority.owner_gates_resolved,
+            source_ci=authority.source_ci,
+            integration_ci=integration_ci,
+            integration_worktree=integration_worktree,
         )
 
     def _perform_integration_step(
@@ -432,6 +571,7 @@ class AutoIntegrationUseCase:
                 return StepOutcome(
                     action_key=decision.action_key,
                     step=step,
+                    recorded_by=self.recorder_id,
                     outcome=OUTCOME_BLOCKED,
                     detail=(
                         "a merge-commit disposition requires a verified dedicated "
@@ -448,13 +588,30 @@ class AutoIntegrationUseCase:
                 return StepOutcome(
                     action_key=decision.action_key,
                     step=step,
+                    recorded_by=self.recorder_id,
                     outcome=OUTCOME_BLOCKED,
                     detail=result.detail or "merge conflict; not auto-resolved",
+                )
+            if not is_full_sha(result.integration_head):
+                # A merge that reports success without naming the commit it created has not
+                # been shown to have created one. The live adapter already treats this as a
+                # failure; the use case does too, so no port implementation can slip a
+                # headless "success" into the ledger for the push step to inherit.
+                return StepOutcome(
+                    action_key=decision.action_key,
+                    step=step,
+                    outcome=OUTCOME_BLOCKED,
+                    recorded_by=self.recorder_id,
+                    detail=(
+                        "the merge reported success but named no commit; refusing to treat "
+                        "it as applied"
+                    ),
                 )
             report.integration_head = result.integration_head
             return StepOutcome(
                 action_key=decision.action_key,
                 step=step,
+                recorded_by=self.recorder_id,
                 outcome=OUTCOME_DONE,
                 detail=result.detail,
                 head=result.integration_head,
@@ -463,7 +620,25 @@ class AutoIntegrationUseCase:
         if step == STEP_PUSH:
             # A merge-commit disposition pushes the commit the apply produced; a
             # fast-forward pushes the source head itself.
-            pushed_head = report.integration_head or record.source_head
+            # R3 review j#96368 finding 3: R3 removed this fallback from the DECISION and left
+            # it here, in the layer that actually pushes — so a merge resume whose apply head
+            # was unrecorded pushed the source head and only failed the check afterwards. A
+            # merge must push the commit its own apply produced, or push nothing.
+            pushed_head = report.integration_head
+            if decision.disposition == DISPOSITION_MERGE_COMMIT and not pushed_head:
+                return StepOutcome(
+                    action_key=decision.action_key,
+                    step=step,
+                    outcome=OUTCOME_BLOCKED,
+                    recorded_by=self.recorder_id,
+                    detail=(
+                        "a merge disposition has no trusted apply head to push; refusing to "
+                        "fall back to the source head"
+                    ),
+                )
+            pushed_head = pushed_head or record.source_head
+            if decision.disposition != DISPOSITION_MERGE_COMMIT:
+                pushed_head = record.source_head
             result = self.operations.push_non_force(
                 source_head=pushed_head, target_ref=record.target_ref
             )
@@ -471,6 +646,7 @@ class AutoIntegrationUseCase:
                 return StepOutcome(
                     action_key=decision.action_key,
                     step=step,
+                    recorded_by=self.recorder_id,
                     outcome=OUTCOME_BLOCKED,
                     detail=(
                         result.detail
@@ -481,6 +657,7 @@ class AutoIntegrationUseCase:
             return StepOutcome(
                 action_key=decision.action_key,
                 step=step,
+                recorded_by=self.recorder_id,
                 outcome=OUTCOME_DONE,
                 detail=result.detail,
                 head=pushed_head,
@@ -490,6 +667,7 @@ class AutoIntegrationUseCase:
         return StepOutcome(
             action_key=decision.action_key,
             step=STEP_INTEGRATION_CI,
+            recorded_by=self.recorder_id,
             outcome=OUTCOME_PENDING,
             detail=(
                 "CI on the exact integration SHA is an asynchronous gate; re-run once the "
@@ -500,20 +678,99 @@ class AutoIntegrationUseCase:
 
     # -- cleanup ----------------------------------------------------------
 
+    def _measure_cleanup(
+        self, record: CleanupActionRecord, *, target_ref: str
+    ) -> CleanupPreflight:
+        """Build the ENTIRE cleanup preflight from this actuator's own measurements.
+
+        R3 review j#96368 finding 2 is the reason this exists, and it was the heaviest finding
+        of the round: every one of the fifteen facts gating the destructive steps was
+        caller-supplied, and the reproduction removed a **foreign lane's worktree and deleted
+        its branch** on nothing but those booleans. The integration side can at worst integrate
+        the wrong thing; this side destroys another lane's work.
+
+        The identity question is answered from the actuator's OWN configuration, not from the
+        record: a cleanup may only touch this actuator's lane worktree and lane branch. A CAS
+        on the branch tip cannot substitute for it — an unchanged tip says the branch has not
+        moved, not that it is ours.
+        """
+        ops = self.operations
+        if not ops.is_git_workspace():
+            authority = (
+                self.authority.read_cleanup_authority(record=record)
+                if self.authority is not None
+                else CleanupAuthority()
+            )
+            return CleanupPreflight(
+                is_git_workspace=False,
+                authorizing_action_key=record.integration_action_key,
+                issue_closed=authority.issue_closed,
+                integration_confirmed=authority.integration_confirmed,
+                integration_ci_settled_green=authority.integration_ci_settled_green,
+                callbacks_drained=authority.callbacks_drained,
+                owner_gates_resolved=authority.owner_gates_resolved,
+            )
+
+        # Is this lane's own? Measured against the actuator's identity, both ways.
+        is_ours = (
+            record.worktree_path == self.lane_worktree
+            and record.branch == self.lane_branch
+        )
+        lane = ops.describe_integration_worktree(
+            path=record.worktree_path, lane_worktree=self.lane_worktree
+        )
+        tip = ops.branch_tip(record.branch)
+        authority = (
+            self.authority.read_cleanup_authority(record=record)
+            if self.authority is not None
+            else CleanupAuthority()
+        )
+        return CleanupPreflight(
+            is_git_workspace=True,
+            authorizing_action_key=record.integration_action_key,
+            issue_closed=authority.issue_closed,
+            integration_confirmed=authority.integration_confirmed,
+            integration_ci_settled_green=authority.integration_ci_settled_green,
+            callbacks_drained=authority.callbacks_drained,
+            owner_gates_resolved=authority.owner_gates_resolved,
+            worktree_is_foreign=not is_ours,
+            worktree_clean=lane.clean,
+            worktree_path_registered=lane.registered,
+            branch_checked_out_elsewhere=ops.branch_checked_out_elsewhere(record.branch),
+            unpushed_unique_commits=not ops.commit_on_remote(tip, branch=record.branch),
+            branch_reachable_from_target=ops.is_ancestor(
+                ancestor=tip, descendant=ops.resolve_head(target_ref)
+            ),
+            # Patch equivalence needs explicit evidence; no probe establishes it.
+            branch_patch_equivalent=False,
+            branch_tip=tip,
+        )
+
     def run_cleanup(
         self,
         record: CleanupActionRecord,
-        preflight: CleanupPreflight,
         *,
+        target_ref: str,
         ledger: Sequence[StepOutcome] = (),
     ) -> CleanupRunReport:
-        """Drive the post-close cleanup machine until it rests, performing each decided step."""
+        """Drive the post-close cleanup machine until it rests, performing each decided step.
+
+        As with :meth:`run_integration` there is no caller preflight: ``target_ref`` is the
+        integration branch the lane's work must be reachable from, and everything else is
+        measured (:meth:`_measure_cleanup`).
+        """
         report = CleanupRunReport()
         working_ledger: List[StepOutcome] = list(ledger)
+        preflight = self._measure_cleanup(record, target_ref=target_ref)
+        report.measured_preflight = preflight
 
         while True:
             decision = decide_cleanup(
-                self.cleanup_policy, record, preflight, ledger=working_ledger
+                self.cleanup_policy,
+                record,
+                preflight,
+                ledger=working_ledger,
+                trusted_recorder=self.recorder_id,
             )
             report.states.append(decision.state)
             report.final_decision = decision
@@ -523,9 +780,19 @@ class AutoIntegrationUseCase:
             outcome = self._perform_cleanup_step(decision, record)
             report.outcomes.append(outcome)
             working_ledger.append(outcome)
+            if outcome.recorded_by != self.recorder_id:
+                # Unreachable by construction, and asserted rather than assumed: an outcome
+                # the next decision will not count would make this loop spin forever.
+                raise AssertionError(
+                    "a recorded cleanup outcome lost this actuator's provenance"
+                )
             if outcome.outcome != OUTCOME_DONE:
                 report.final_decision = decide_cleanup(
-                    self.cleanup_policy, record, preflight, ledger=working_ledger
+                    self.cleanup_policy,
+                    record,
+                    preflight,
+                    ledger=working_ledger,
+                    trusted_recorder=self.recorder_id,
                 )
                 report.states.append(report.final_decision.state)
                 return report
@@ -540,20 +807,28 @@ class AutoIntegrationUseCase:
                 return StepOutcome(
                     action_key=decision.action_key,
                     step=step,
+                    recorded_by=self.recorder_id,
                     outcome=OUTCOME_BLOCKED,
                     detail="no managed-process port injected; the process was not released",
                 )
             released = self.processes.release_process(
                 issue=record.issue, lane_generation=record.lane_generation
             )
-            return _settled(decision.action_key, step, released, "process release")
+            return _settled(
+                decision.action_key, step, released, "process release",
+                recorded_by=self.recorder_id,
+            )
 
         if step == STEP_WORKTREE_REMOVE:
             removed = self.operations.remove_worktree(
                 worktree_path=record.worktree_path
             )
             return _settled(
-                decision.action_key, step, removed, "worktree removal (no --force)"
+                decision.action_key,
+                step,
+                removed,
+                "worktree removal (no --force)",
+                recorded_by=self.recorder_id,
             )
 
         deleted = self.operations.delete_local_branch(
@@ -564,20 +839,28 @@ class AutoIntegrationUseCase:
             STEP_LOCAL_BRANCH_DELETE,
             deleted,
             "compare-and-swap local branch delete (never `git branch -D`)",
+            recorded_by=self.recorder_id,
         )
 
 
-def _settled(action_key: str, step: str, succeeded: bool, what: str) -> StepOutcome:
+def _settled(
+    action_key: str, step: str, succeeded: bool, what: str, *, recorded_by: str
+) -> StepOutcome:
     """A step outcome for an operation that either happened or did not.
 
     A failed operation is ``blocked``, never retried with a stronger form: the whole point of
     the port's weak operations is that there is no stronger form to fall back to.
+
+    ``recorded_by`` is required rather than defaulted: an outcome without the actuator's
+    provenance is not counted by the next decision, so a missing stamp would silently turn a
+    completed step into one the run repeats forever.
     """
     return StepOutcome(
         action_key=action_key,
         step=step,
         outcome=OUTCOME_DONE if succeeded else OUTCOME_BLOCKED,
         detail=f"{what} {'succeeded' if succeeded else 'failed; nothing forced'}",
+        recorded_by=recorded_by,
     )
 
 
@@ -588,7 +871,9 @@ __all__: Tuple[str, ...] = (
     "MergeResult",
     "AutoIntegrationGitOperations",
     "ManagedProcessOperations",
-    "CoordinatorConfirmationResolver",
+    "DurableAuthorityReader",
+    "IntegrationAuthority",
+    "CleanupAuthority",
     "IntegrationRunReport",
     "CleanupRunReport",
     "AutoIntegrationUseCase",
