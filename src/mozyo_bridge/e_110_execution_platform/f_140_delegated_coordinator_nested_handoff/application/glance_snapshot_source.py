@@ -662,22 +662,6 @@ def enumerate_active_lanes_for_workspace(repo_root, *, workspace_id: str) -> tup
     return _fold_active_roster(views, workspace_id=wanted)[0], None
 
 
-def enumerate_detached_residue(repo_root, *, workspace_id=None) -> tuple:
-    """Enumerate the rows #14813 partitions OUT of active capacity: ``(rows, error)``.
-
-    The other half of :func:`enumerate_active_lanes`. Excluding residue silently would be the
-    opposite failure of counting it (a detached worktree appearing nowhere), so it is reported
-    here. Rows are ``(issue, lane_label, execution_surface)``, surface fixed to
-    ``detached_worktree``. Same ``(rows, error)`` degrade contract as the roster.
-    """
-    try:
-        views = _active_lane_views(repo_root)
-    except Exception as exc:  # noqa: BLE001 - a residue read never raises out of the glance
-        return (), f"detached residue enumeration failed ({type(exc).__name__})"
-    wanted = None if workspace_id is None else str(workspace_id or "").strip()
-    return _fold_active_roster(views, workspace_id=wanted)[1], None
-
-
 def enumerate_active_lanes_for_repo(repo_root) -> tuple:
     """The roster for THIS repo's workspace: ``(roster, error)``.
 
@@ -696,11 +680,21 @@ def enumerate_active_lanes_for_repo(repo_root) -> tuple:
 
 
 def enumerate_detached_residue_for_repo(repo_root) -> tuple:
-    """This repo's detached residue: ``(rows, error)``. Scope-resolved like the roster."""
+    """This repo's detached residue — the rows #14813 keeps OUT of capacity: ``(rows, error)``.
+
+    The other half of :func:`enumerate_active_lanes_for_repo`. Excluding residue silently would
+    be the opposite failure of counting it (a detached worktree appearing nowhere), so it is
+    reported here. Rows are ``(issue, lane_label, execution_surface)``, surface fixed to
+    ``detached_worktree``. Same scope resolution and ``(rows, error)`` contract as the roster.
+    """
     workspace_id = _repo_scope_workspace_id(repo_root)
     if workspace_id is None:
         return (), "detached residue scope unresolved (repo workspace id unknown)"
-    return enumerate_detached_residue(repo_root, workspace_id=workspace_id)
+    try:
+        views = _active_lane_views(repo_root)
+    except Exception as exc:  # noqa: BLE001 - a residue read never raises out of the glance
+        return (), f"detached residue enumeration failed ({type(exc).__name__})"
+    return _fold_active_roster(views, workspace_id=workspace_id)[1], None
 
 
 #: Bound lazily so the pure glance path never imports the state layer unless a roster
@@ -918,6 +912,7 @@ def active_lane_snapshots(
         # work-unit evidence, no disposition recorded).
         work_unit = ""
         integration = IntegrationDispositionFacts()
+        observed_issue_open = None
 
         if redmine_source is not None:
             record = None
@@ -927,6 +922,9 @@ def active_lane_snapshots(
                 notes.append(f"issue {issue}: Redmine source unavailable ({type(exc).__name__})")
             if record is not None:
                 subject = record.subject
+                # #14813 R2-F1: keep the observed status even when no Gate resolves; losing
+                # it here reversed a known-closed issue to open in the fallback below.
+                observed_issue_open = record.issue_open
                 facts = fold_issue_gate_facts(record.journals)
                 if facts is not None:
                     signal = lane_signal_from_gate_facts(issue, facts, issue_open=record.issue_open)
@@ -956,7 +954,12 @@ def active_lane_snapshots(
                     )
 
         if signal is None:
-            signal = LaneSignal(issue=issue)
+            # Carry the observed status; default only when never observed. Asserts nothing
+            # about retirement — gate/commit/integration stay unresolved and the row stays
+            # `degraded` (j#74323 Finding 3). It only refuses to overwrite closed with open.
+            if observed_issue_open is None:
+                observed_issue_open = True
+            signal = LaneSignal(issue=issue, issue_open=observed_issue_open)
 
         snaps.append(
             IssueGlanceSnapshot(

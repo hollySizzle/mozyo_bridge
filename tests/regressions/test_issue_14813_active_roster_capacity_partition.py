@@ -169,18 +169,21 @@ class ActiveRosterCapacityPartitionTest(unittest.TestCase):
 
 
 class DetachedResidueEnumeratorTest(unittest.TestCase):
-    """``enumerate_detached_residue`` — the public read of the partitioned-out rows."""
+    """``enumerate_detached_residue_for_repo`` — the public read of partitioned-out rows."""
 
     def _with_views(self, views, dispositions=None):
         original_views = source._active_lane_views
         original_disp = source._lifecycle_disposition_by_unit
+        original_scope = source._repo_scope_workspace_id
         source._active_lane_views = lambda _root: tuple(views)
         source._lifecycle_disposition_by_unit = lambda: dict(dispositions or {})
+        source._repo_scope_workspace_id = lambda _root: WORKSPACE
         try:
-            return source.enumerate_detached_residue(Path("/nonexistent"), workspace_id=WORKSPACE)
+            return source.enumerate_detached_residue_for_repo(Path("/nonexistent"))
         finally:
             source._active_lane_views = original_views
             source._lifecycle_disposition_by_unit = original_disp
+            source._repo_scope_workspace_id = original_scope
 
     def test_reports_residue_rows(self) -> None:
         rows, error = self._with_views(
@@ -191,15 +194,18 @@ class DetachedResidueEnumeratorTest(unittest.TestCase):
 
     def test_enumeration_failure_is_an_error_not_an_empty_read(self) -> None:
         original = source._active_lane_views
+        original_scope = source._repo_scope_workspace_id
 
         def _boom(_root):
             raise RuntimeError("inventory unreadable")
 
         source._active_lane_views = _boom
+        source._repo_scope_workspace_id = lambda _root: WORKSPACE
         try:
-            rows, error = source.enumerate_detached_residue(Path("/nonexistent"))
+            rows, error = source.enumerate_detached_residue_for_repo(Path("/nonexistent"))
         finally:
             source._active_lane_views = original
+            source._repo_scope_workspace_id = original_scope
         self.assertEqual(rows, ())
         self.assertIsNotNone(error)
         self.assertIn("RuntimeError", error or "")
@@ -441,4 +447,116 @@ class GlanceCliSurfaceTest(unittest.TestCase):
             debt_ids,
             {"13820"},
             "closed debt must stay visible on its own surface, not be deleted",
+        )
+
+
+class ClosedStatusSurvivesTheNoGatePathTest(unittest.TestCase):
+    """R2-F1: a Redmine-closed issue with no recognized Gate must not read as open.
+
+    `active_lane_snapshots` knew `record.issue_open=False`, reported it in the notes, then
+    built the fallback `LaneSignal(issue=issue)` — whose `issue_open` defaults to True. The
+    closed fact was overwritten on the way to the partition, so `workflow glance` listed
+    `14613` / `13820` as active rows while the same payload's notes called them closed
+    (j#96286 live observation). Carrying the observed status asserts nothing about retirement:
+    the row stays `degraded` because gate/commit/integration are still unresolved.
+
+    Runs through `active_lane_snapshots` and `cmd_workflow_glance`, not the fold, because the
+    reversal happened in the snapshot builder and only shows up on the CLI surface.
+    """
+
+    def _record(self, issue: str, *, issue_open: bool):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.glance_snapshot_source import (  # noqa: E501
+            GlanceIssueRecord,
+        )
+
+        # No journals -> no canonical Gate resolves -> the degraded fallback path.
+        return GlanceIssueRecord(
+            issue_id=issue, subject=f"subject {issue}", journals=(), issue_open=issue_open
+        )
+
+    class _Source:
+        def __init__(self, records):
+            self._records = records
+
+        def read_issue(self, issue):
+            return self._records.get(issue)
+
+    def test_snapshot_keeps_the_closed_status_without_a_gate(self) -> None:
+        records = {"13820": self._record("13820", issue_open=False)}
+        collection = source.active_lane_snapshots(
+            (("13820", "closed-lane"),), redmine_source=self._Source(records)
+        )
+        self.assertEqual(len(collection.snapshots), 1)
+        self.assertFalse(
+            collection.snapshots[0].signal.issue_open,
+            "the observed closed status must survive the no-Gate fallback; defaulting to open "
+            "is what kept closed lanes in active capacity",
+        )
+        self.assertTrue(
+            collection.degraded,
+            "carrying the status must not silence the degraded/unknown report — gate, commit "
+            "and integration facts are still unresolved (j#74323 Finding 3)",
+        )
+
+    def test_open_issue_without_a_gate_is_unchanged(self) -> None:
+        records = {"14100": self._record("14100", issue_open=True)}
+        collection = source.active_lane_snapshots(
+            (("14100", "open-lane"),), redmine_source=self._Source(records)
+        )
+        self.assertTrue(collection.snapshots[0].signal.issue_open)
+
+    def test_no_redmine_source_still_defaults_to_open(self) -> None:
+        # Never observed is not the same as observed-closed: with no source at all the
+        # conservative default stands.
+        collection = source.active_lane_snapshots((("14100", "lane"),))
+        self.assertTrue(collection.snapshots[0].signal.issue_open)
+
+    def test_closed_lane_reaches_the_debt_surface_end_to_end(self) -> None:
+        import argparse
+        import io
+        import json as _json
+        from contextlib import redirect_stdout
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            cli_workflow_glance as cli,
+        )
+
+        records = {
+            "13820": self._record("13820", issue_open=False),
+            "14100": self._record("14100", issue_open=True),
+        }
+        originals = {
+            "roster": cli.enumerate_active_lanes_for_repo,
+            "residue": cli.enumerate_detached_residue_for_repo,
+            "diag": cli.enumerate_lifecycle_diagnostic,
+            "redmine": cli._redmine_source,
+        }
+        cli.enumerate_active_lanes_for_repo = lambda _root: (
+            (("13820", "closed-lane"), ("14100", "open-lane")),
+            None,
+        )
+        cli.enumerate_detached_residue_for_repo = lambda _root: ((), None)
+        cli.enumerate_lifecycle_diagnostic = lambda _root: ((), None)
+        cli._redmine_source = lambda _args: self._Source(records)
+        buffer = io.StringIO()
+        try:
+            with redirect_stdout(buffer):
+                cli.cmd_workflow_glance(
+                    argparse.Namespace(active_lanes=True, as_json=True, issue=None)
+                )
+        finally:
+            cli.enumerate_active_lanes_for_repo = originals["roster"]
+            cli.enumerate_detached_residue_for_repo = originals["residue"]
+            cli.enumerate_lifecycle_diagnostic = originals["diag"]
+            cli._redmine_source = originals["redmine"]
+        payload = _json.loads(buffer.getvalue())
+        self.assertEqual(
+            {row["issue_id"] for row in payload["rows"]},
+            {"14100"},
+            "a Redmine-closed lane must not stay in the active rows the fill decision reads",
+        )
+        self.assertEqual(
+            {row["issue"] for row in payload["closed_coordinator_debt"]},
+            {"13820"},
+            "it belongs on the debt surface instead — visible, but not counted",
         )
