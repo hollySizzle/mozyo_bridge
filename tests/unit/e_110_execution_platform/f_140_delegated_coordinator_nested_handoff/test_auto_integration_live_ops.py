@@ -77,6 +77,13 @@ _PINNED = (
     "merge.renameLimit=32767",
     "-c",
     "diff.renameLimit=32767",
+    "-c",
+    "merge.renormalize=false",
+    "-c",
+    "merge.default=text",
+    "-c",
+    f"core.attributesFile={os.devnull}",
+    "--no-replace-objects",
 )
 
 
@@ -88,9 +95,18 @@ class _Recorder:
         self.calls: List[Tuple[Tuple[str, ...], object, object]] = []
 
     def __call__(
-        self, *args: str, cwd: object = None, env: object = None
+        self,
+        *args: str,
+        cwd: object = None,
+        env: object = None,
+        seal_env: bool = False,
     ) -> subprocess.CompletedProcess:
-        self.calls.append((args, cwd, env))
+        # `seal_env` is recorded because it is the difference between "a dict was built" and
+        # "the child got that dict" — R13 passed the right dict to a `_run` that merged it
+        # back into `os.environ`, and this stub could not see that (j#96428 finding 1). It
+        # still cannot: what a stub proves about a boundary ends at the boundary, so the
+        # regression that matters runs real git.
+        self.calls.append((args, cwd, env if not seal_env else {**(env or {}), "__sealed__": "1"}))
         if self.results:
             return self.results.pop(0)
         return _ok("")
@@ -192,8 +208,17 @@ class MergeTest(unittest.TestCase):
         return _fail_rc(1)
 
     def _preamble(self) -> list:
-        """Everything asked before a merge: is the ref legal, can this git, is it deterministic."""
-        return [_ok("main"), self._ok_version(), self._no_driver()]
+        """Everything asked before a merge: the ref, the git, the driver, the attributes file.
+
+        The last is `rev-parse --git-path info/attributes`, whose answer is a path this fake
+        points at a name that does not exist — so the attributes gate passes.
+        """
+        return [
+            _ok("main"),
+            self._ok_version(),
+            self._no_driver(),
+            _ok("/nonexistent-repo-root/.git/info/attributes"),
+        ]
 
     def _dates(self) -> list:
         """Both parents' committer dates, as ISO strings then as epoch seconds."""
@@ -208,25 +233,26 @@ class MergeTest(unittest.TestCase):
         self.assertFalse(result.conflicted)
         self.assertEqual(result.integration_head, MERGE_HEAD)
 
-        ref_check, version, driver, write_tree = recorder.argvs[:4]
+        ref_check, version = recorder.argvs[0], recorder.argvs[1]
+        driver, attributes, write_tree = recorder.argvs[2], recorder.argvs[3], recorder.argvs[4]
         commit = recorder.argvs[-1]
+        # The driver probe is sealed too, so it sees the same config the merge will.
+        self.assertEqual(driver[len(_PINNED) : len(_PINNED) + 2], ("config", "--get-regexp"))
+        self.assertEqual(attributes[-3:], ("rev-parse", "--git-path", "info/attributes"))
         # The target ref is validated against git's own grammar before any object is built
         # (j#96422 finding 3).
         self.assertEqual(ref_check[:2], ("check-ref-format", "--branch"))
         self.assertEqual(version, ("--version",))
         # Determinism is CHECKED before it is claimed: a configured merge driver would make
         # the tree host-dependent, so the adapter asks (j#96417 finding 1).
-        self.assertEqual(driver[:2], ("config", "--get-regexp"))
         self.assertEqual(
-            write_tree[len(_PINNED) : len(_PINNED) + 3],
-            ("--no-replace-objects", "merge-tree", "--write-tree"),
+            write_tree[len(_PINNED) : len(_PINNED) + 2], ("merge-tree", "--write-tree")
         )
         # The merge's inputs are object ids, in the order that makes the measured target the
         # first parent — not a branch name anything could re-point.
         self.assertEqual(write_tree[-2:], (TARGET, SOURCE))
         self.assertEqual(
-            commit[len(_PINNED) : len(_PINNED) + 3],
-            ("--no-replace-objects", "commit-tree", TREE),
+            commit[len(_PINNED) : len(_PINNED) + 2], ("commit-tree", TREE)
         )
         self.assertEqual(commit.count("-p"), 2)
         self.assertEqual(commit[commit.index("-p") + 1], TARGET)
@@ -235,17 +261,26 @@ class MergeTest(unittest.TestCase):
         # (j#96417 finding 1, j#96422 finding 1).
         for argv in (write_tree, commit):
             self.assertEqual(argv[: len(_PINNED)], _PINNED)
-        # ...and the environment is built rather than inherited, so no GIT_* variable the
-        # caller happens to have set reaches git.
-        object_envs = [
-            env
-            for argv, _, env in recorder.calls
-            if "merge-tree" in argv or "commit-tree" in argv
+        # ...and EVERY invocation whose answer feeds the commit is sealed, including the
+        # timestamp reads (j#96428 finding 2: R13 sealed two of them and left those out).
+        sealed = [
+            argv
+            for argv in recorder.argvs
+            if argv[: len(_PINNED)] == _PINNED
         ]
-        self.assertEqual(len(object_envs), 2)
-        for env in object_envs:
+        # Everything except the two questions asked before sealing matters: the ref-format
+        # check and the version probe.
+        unsealed = [argv for argv in recorder.argvs if argv[: len(_PINNED)] != _PINNED]
+        self.assertEqual(len(unsealed), 2, unsealed)
+        self.assertEqual(unsealed[0][:2], ("check-ref-format", "--branch"))
+        self.assertEqual(unsealed[1], ("--version",))
+        self.assertTrue(sealed)
+        for env in recorder.envs:
+            if not env:
+                continue
             self.assertEqual(env["GIT_CONFIG_GLOBAL"], os.devnull)
             self.assertEqual(env["GIT_NO_REPLACE_OBJECTS"], "1")
+            self.assertEqual(env["GIT_ATTR_NOSYSTEM"], "1")
             self.assertNotIn("GIT_DIR", env)
 
     def test_the_commit_takes_its_identity_from_the_action_not_the_host(self) -> None:
@@ -295,6 +330,19 @@ class MergeTest(unittest.TestCase):
         )
         self.assertEqual(recorder.envs[-1]["GIT_COMMITTER_DATE"], OTHER_DATE)
 
+    def test_an_external_attributes_file_refuses_rather_than_merging(self) -> None:
+        # `$GIT_DIR/info/attributes` selects merge behaviour, is not part of the tree, and no
+        # option redirects it — so two clones of one commit can merge differently (measured,
+        # j#96428 finding 3). Refused like a driver rather than pinned, because it cannot be.
+        recorder = _Recorder(
+            [_ok("main"), self._ok_version(), self._no_driver(), _ok(__file__)]
+        )
+        result = _adapter(recorder).apply_merge(
+            source_head=SOURCE, target_ref="main", expected_target_head=TARGET
+        )
+        self.assertEqual(result.status, MERGE_NONDETERMINISTIC_CONFIG)
+        self.assertEqual(len(recorder.argvs), 4)  # it never merged
+
     def test_a_configured_merge_driver_refuses_rather_than_merging(self) -> None:
         # Measured on real git: a `merge.<name>.driver` rewrites the merged content as
         # arbitrary host-local code, so the same action would not rebuild the same commit.
@@ -306,7 +354,7 @@ class MergeTest(unittest.TestCase):
         )
         self.assertEqual(result.status, MERGE_NONDETERMINISTIC_CONFIG)
         self.assertIn("merge.mine.driver", result.detail)
-        self.assertEqual(len(recorder.argvs), 3)  # it never merged
+        self.assertEqual(len(recorder.argvs), 3)  # it never merged, and never looked further
         # The probe asks through the SAME config view the merge would use, so a driver the
         # merge could never have seen does not refuse it (j#96422 finding 4).
         self.assertEqual(recorder.envs[-1]["GIT_CONFIG_GLOBAL"], os.devnull)
@@ -367,7 +415,7 @@ class MergeTest(unittest.TestCase):
         self.assertEqual(result.status, MERGE_CONTENT_CONFLICT)
         self.assertTrue(result.is_content_conflict)
         self.assertEqual(result.integration_head, "")
-        self.assertEqual(len(recorder.argvs), 4)  # nothing was committed
+        self.assertEqual(len(recorder.argvs), 5)  # nothing was committed
         flat = " ".join(" ".join(argv) for argv in recorder.argvs)
         for forbidden in ("--strategy", "-X", "theirs", "ours", "rebase"):
             self.assertNotIn(forbidden, flat, forbidden)
@@ -418,7 +466,7 @@ class MergeTest(unittest.TestCase):
             source_head=SOURCE, target_ref="main", expected_target_head=TARGET
         )
         self.assertEqual(result.status, MERGE_ERROR)
-        self.assertEqual(len(recorder.argvs), 4)
+        self.assertEqual(len(recorder.argvs), 5)
 
     def test_a_tree_that_cannot_be_committed_says_so(self) -> None:
         recorder = _Recorder(

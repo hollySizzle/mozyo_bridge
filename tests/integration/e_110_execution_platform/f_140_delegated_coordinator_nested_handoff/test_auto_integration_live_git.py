@@ -380,6 +380,160 @@ class DeterministicMergeCommitTest(unittest.TestCase):
                     os.environ["GIT_CONFIG_GLOBAL"] = previous
             self.assertEqual(result.status, MERGE_MERGED, result.detail)
 
+    def test_the_child_process_does_not_inherit_the_parents_git_environment(self) -> None:
+        """j#96428 finding 1 — and the reason this test runs real git rather than a stub.
+
+        R13 built an allowlist environment and handed it to a ``_run`` that merged it straight
+        back into ``os.environ``. The dict was right; the child process was not. The unit test
+        inspected the dict, which is the wrong side of the boundary where the merge happened,
+        and passed. A sealed environment is only observable from the child.
+
+        Measured before the fix: an inherited ``GIT_OBJECT_DIRECTORY`` pointing at an empty
+        directory changed the outcome, because git looked for the objects there.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init(repo)
+            _commit(repo, "a.txt", "base")
+            _git(repo, "checkout", "-q", "-b", "lane")
+            source = _commit(repo, "lane.txt", "reviewed")
+            _git(repo, "checkout", "-q", "main")
+            target = _commit(repo, "target.txt", "moved on")
+            operations = LiveAutoIntegrationGitOperations(repo_root=repo)
+
+            baseline = operations.apply_merge(
+                source_head=source, target_ref="main", expected_target_head=target
+            )
+            self.assertEqual(baseline.status, MERGE_MERGED, baseline.detail)
+
+            empty_objects = root / "empty-objects"
+            empty_objects.mkdir()
+            hostile = {
+                "GIT_OBJECT_DIRECTORY": str(empty_objects),
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "i18n.commitEncoding",
+                "GIT_CONFIG_VALUE_0": "ISO-8859-1",
+            }
+            previous = {name: os.environ.get(name) for name in hostile}
+            os.environ.update(hostile)
+            try:
+                sealed = operations.apply_merge(
+                    source_head=source, target_ref="main", expected_target_head=target
+                )
+            finally:
+                for name, value in previous.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
+
+            self.assertEqual(sealed.status, MERGE_MERGED, sealed.detail)
+            self.assertEqual(sealed.integration_head, baseline.integration_head)
+
+    def test_a_replace_ref_cannot_change_the_commit_through_the_timestamp(self) -> None:
+        """j#96428 finding 2: R13 sealed the merge and left the date reads in the open.
+
+        A replace ref substitutes one object for another everywhere git looks — including the
+        ``git show`` that decides the merge commit's timestamps. Measured: a replacement whose
+        tree was identical but whose committer date differed moved the integration head.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            _init(repo)
+            _commit(repo, "a.txt", "base")
+            _git(repo, "checkout", "-q", "-b", "lane")
+            source = _commit(repo, "lane.txt", "reviewed")
+            _git(repo, "checkout", "-q", "main")
+            target = _commit(repo, "target.txt", "moved on")
+            operations = LiveAutoIntegrationGitOperations(repo_root=repo)
+
+            before = operations.apply_merge(
+                source_head=source, target_ref="main", expected_target_head=target
+            )
+            self.assertEqual(before.status, MERGE_MERGED, before.detail)
+
+            # Same tree, same parent, different committer date.
+            tree = _git(repo, "rev-parse", f"{source}^{{tree}}")
+            parent = _git(repo, "rev-parse", f"{source}^")
+            replacement = subprocess.run(
+                ["git", "commit-tree", tree, "-p", parent, "-m", "lane"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=True,
+                env={
+                    **os.environ,
+                    "GIT_AUTHOR_DATE": "2030-01-01T00:00:00+00:00",
+                    "GIT_COMMITTER_DATE": "2030-01-01T00:00:00+00:00",
+                },
+            ).stdout.strip()
+            _git(repo, "replace", "-f", source, replacement)
+
+            after = operations.apply_merge(
+                source_head=source, target_ref="main", expected_target_head=target
+            )
+            self.assertEqual(after.status, MERGE_MERGED, after.detail)
+            self.assertEqual(after.integration_head, before.integration_head)
+
+    def test_an_external_attributes_file_is_refused(self) -> None:
+        """j#96428 finding 3: `$GIT_DIR/info/attributes` is neither in the tree nor pinnable."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            _init(repo)
+            _commit(repo, "f.txt", "base\n")
+            _git(repo, "checkout", "-q", "-b", "lane")
+            source = _commit(repo, "f.txt", "lane\n")
+            _git(repo, "checkout", "-q", "main")
+            target = _commit(repo, "f.txt", "target\n")
+            operations = LiveAutoIntegrationGitOperations(repo_root=repo)
+
+            # Without it, this is an ordinary content conflict.
+            self.assertEqual(
+                operations.apply_merge(
+                    source_head=source, target_ref="main", expected_target_head=target
+                ).status,
+                MERGE_CONTENT_CONFLICT,
+            )
+
+            info = repo / ".git" / "info"
+            info.mkdir(exist_ok=True)
+            (info / "attributes").write_text("f.txt merge=union\n", encoding="utf-8")
+            refused = operations.apply_merge(
+                source_head=source, target_ref="main", expected_target_head=target
+            )
+            self.assertEqual(refused.status, MERGE_NONDETERMINISTIC_CONFIG)
+            self.assertEqual(refused.integration_head, "")
+
+    def test_merge_semantics_config_cannot_change_the_result(self) -> None:
+        """`merge.default` picks a driver for paths no attribute names (j#96428 finding 3)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            _init(repo)
+            _commit(repo, "f.txt", "base\n")
+            _git(repo, "checkout", "-q", "-b", "lane")
+            source = _commit(repo, "f.txt", "lane\n")
+            _git(repo, "checkout", "-q", "main")
+            target = _commit(repo, "f.txt", "target\n")
+            operations = LiveAutoIntegrationGitOperations(repo_root=repo)
+
+            baseline = operations.apply_merge(
+                source_head=source, target_ref="main", expected_target_head=target
+            )
+            for key, value in (
+                ("merge.default", "union"),
+                ("merge.renormalize", "true"),
+            ):
+                _git(repo, "config", key, value)
+                self.assertEqual(
+                    operations.apply_merge(
+                        source_head=source, target_ref="main", expected_target_head=target
+                    ).status,
+                    baseline.status,
+                    key,
+                )
+                _git(repo, "config", "--unset", key)
+
     def test_a_merge_driver_is_refused_rather_than_silently_obeyed(self) -> None:
         """The input that cannot be pinned, so it is checked instead.
 

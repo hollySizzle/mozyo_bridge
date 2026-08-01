@@ -200,16 +200,25 @@ R11 が書いた「入力は arguments のみ / どの host でも同じ」は *
 | global / system config 全般 | 同上 | `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM` を空にして実行 |
 | `merge.directoryRenames` / `merge.renames` / `diff.renames` | **merged tree が変わる** (実測。j#96422 F1) | **`-c` で pin** (値は git の documented default) |
 | rename limit 2 key | 我々の scene では差が出なかったが **bound が host ごとに変わるのは varying input** | `-c` で固定値へ pin |
-| 継承 `GIT_*` env (`GIT_DIR` / `GIT_OBJECT_DIRECTORY` / `GIT_ALTERNATE_OBJECT_DIRECTORIES` 等) | `-c` の対象外で git の読む先を変える | **環境を継承せず構築**する (許可 list のみ) |
-| `refs/replace/*` | object を差し替える (j#96422 F1) | `--no-replace-objects` + `GIT_NO_REPLACE_OBJECTS=1` |
+| `merge.renormalize` / `merge.default` | merge の canonicalization と既定 driver を変える (j#96428 F3。`merge.default=union` は conflict を merged にした) | **`-c` で pin** |
+| user / system attributes | merge attribute の供給元 | `core.attributesFile` を空へ pin + `GIT_ATTR_NOSYSTEM=1` |
+| **`$GIT_DIR/info/attributes`** | merge 挙動を選ぶが **tree の一部ではなく、pin も隔離もできない** (j#96428 F3) | **存在すれば refuse** |
+| 継承 `GIT_*` env (`GIT_DIR` / `GIT_OBJECT_DIRECTORY` / `GIT_ALTERNATE_OBJECT_DIRECTORIES` / `GIT_CONFIG_COUNT` 等) | `-c` の対象外で git の読む先を変える | **環境を継承せず置換**する (許可 list のみ)。**dict を作ることと child が受け取ることは別** (j#96428 F1) |
+| `refs/replace/*` | object を差し替える (j#96422 F1)。**timestamp probe 経由でも commit を変える** (j#96428 F2) | `--no-replace-objects` + `GIT_NO_REPLACE_OBJECTS=1` を **決定性に寄与する全 invocation** へ |
+| **git binary / version** | **pin 不能** | **claim の成立範囲を「同一 git version」へ限定** (下記) |
 | **`merge.<name>.driver`** | **merged tree の内容そのものが任意 code で書き換わる** (実測: conflict が rc=0 + `DRIVER WON` になる) | **pin 不能 → typed status `nondeterministic_merge_config` で拒否** |
 
 driver だけが pin 不能である。名前を in-tree `.gitattributes` が選ぶため `-c` で列挙できず、
 repo-local `.git/config` にあるため隔離もできない。**「条件を自分で enforce できない操作は
 提供しない」を、破壊的操作ではなく決定性の主張へ適用した** — 再現できない commit を作るくらいなら拒否する。
 
+**claim の成立範囲**: 「**同一 git version の下で、同一 repository 内容に対し、同一 action は同一 commit を
+再構築する**」。git binary は pin できないため cross-version の同一性は主張しない。
+
 > **enforce 範囲は「具体名の列挙」で書く。** R10 は「入力は全て object id」、R11 は「arguments alone」、
-> R12 は「pin 不能なのは driver だけ」と書き、**3 回とも外した** (j#96412 / j#96417 / j#96422)。
+> R12 は「pin 不能なのは driver だけ」、R13 は上の表 (2 key と 1 供給元が欠落) と書き、
+> **4 回とも外した** (j#96412 / j#96417 / j#96422 / j#96428)。
+> **列挙形式にしても網羅性は保証されない** — 形式は「何を主張していないか」を読めるようにするだけである。
 > 「全部やった」ではなく「pin した key はこれ、isolate した env はこれ、refuse する条件はこれ」と書く。
 > 上の表がその列挙であり、**表に無いものは enforce していない**。
 

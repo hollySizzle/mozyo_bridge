@@ -155,6 +155,7 @@ class LiveAutoIntegrationGitOperations:
         *args: str,
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
+        seal_env: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         """Run ``git`` in :attr:`repo_root` (or ``cwd``), mapping a spawn failure to a failure.
 
@@ -163,9 +164,15 @@ class LiveAutoIntegrationGitOperations:
         family. Both are mapped onto a failed result so a read-only probe fails closed
         instead of raising out of a preflight (#14499).
 
-        ``env`` OVERLAYS the inherited environment rather than replacing it, so ``PATH`` and
-        the credential helpers keep working while the caller pins the few variables that would
-        otherwise make an operation non-deterministic (:meth:`apply_merge`).
+        ``env`` OVERLAYS the inherited environment; ``seal_env`` REPLACES it. The distinction
+        is the whole of j#96428 finding 1: R13 built an allowlist environment and then passed
+        it here, where it was merged straight back into ``os.environ`` — so "the environment
+        is built rather than inherited" was true of the dict and false of the child process.
+        Measured: an inherited ``GIT_OBJECT_DIRECTORY`` reached git and changed the outcome.
+
+        The unit test did not catch it because it stubs *this method* and inspects the dict it
+        was handed, which is the wrong side of the boundary where the merge happens. A sealed
+        environment is only observable from the child, so the regression for it runs real git.
         """
         try:
             return subprocess.run(
@@ -173,7 +180,7 @@ class LiveAutoIntegrationGitOperations:
                 cwd=cwd or self.repo_root,
                 text=True,
                 capture_output=True,
-                env={**os.environ, **env} if env else None,
+                env=(env if seal_env else {**os.environ, **env}) if env else None,
             )
         except OSError as exc:
             return subprocess.CompletedProcess(
@@ -342,21 +349,53 @@ class LiveAutoIntegrationGitOperations:
         "merge.renameLimit=32767",
         "-c",
         "diff.renameLimit=32767",
+        # `merge.renormalize` canonicalizes content (text/eol/filters) before merging and
+        # `merge.default` picks the driver for paths no attribute names — both change what a
+        # merge produces (j#96428 finding 3; `merge.default=union` turned a conflict into a
+        # clean merge in our own scene). Pinned to git's built-in behaviour.
+        "-c",
+        "merge.renormalize=false",
+        "-c",
+        "merge.default=text",
+        # The USER attributes file is config-selected, so `-c` reaches it; the system one is
+        # a compiled-in path, disabled by `GIT_ATTR_NOSYSTEM` in the sealed environment. The
+        # repository's own `.git/info/attributes` is neither — see `_external_attributes`.
+        "-c",
+        f"core.attributesFile={os.devnull}",
     )
     #: Passed to the merge so ``refs/replace/*`` cannot silently substitute an object for
     #: another. Replace refs live in the repository, so no environment isolation reaches them
     #: (j#96422 finding 1).
     _NO_REPLACE: Tuple[str, ...] = ("--no-replace-objects",)
-    #: The environment variables an object-building invocation is allowed to inherit. Every
-    #: ``GIT_*`` variable is dropped rather than passed through: ``GIT_DIR``,
-    #: ``GIT_OBJECT_DIRECTORY``, ``GIT_ALTERNATE_OBJECT_DIRECTORIES``, ``GIT_ATTR_NOSYSTEM``
-    #: and friends change what git reads and are not reachable by ``-c``. R12 overlaid a few
-    #: variables onto the inherited environment and called that isolation; it was not
-    #: (j#96422 finding 1).
-    _INHERITABLE_ENV = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "SYSTEMROOT")
+    #: The environment variables a sealed invocation is allowed to inherit. Every ``GIT_*``
+    #: variable is dropped rather than passed through: ``GIT_DIR``, ``GIT_OBJECT_DIRECTORY``,
+    #: ``GIT_ALTERNATE_OBJECT_DIRECTORIES``, ``GIT_ATTR_NOSYSTEM`` and friends change what git
+    #: reads and are not reachable by ``-c``. R12 overlaid a few variables onto the inherited
+    #: environment and called that isolation (j#96422 finding 1); R13 built the allowlist and
+    #: then handed it to a ``_run`` that merged it back (j#96428 finding 1). The dict was
+    #: right both times; what reached the child was not.
+    #:
+    #: Windows needs ``SYSTEMROOT`` / ``TEMP`` / ``TMP`` for a process to start at all; they
+    #: are inherited when present. Whether that list is sufficient on Windows is untested here
+    #: (no Windows host), and is recorded as such rather than claimed.
+    _INHERITABLE_ENV = (
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "LANG",
+        "LC_ALL",
+        "SYSTEMROOT",
+        "USERPROFILE",
+    )
 
-    def _object_env(self, **overrides: str) -> dict[str, str]:
-        """Build the environment for an object-building invocation instead of inheriting it."""
+    def _sealed_env(self, **overrides: str) -> dict[str, str]:
+        """The COMPLETE environment for an invocation whose result must not vary by host.
+
+        Used with ``seal_env=True``, so this dict is what the child gets — not a set of
+        additions to whatever the parent happened to be running with.
+        """
         env = {
             name: os.environ[name]
             for name in self._INHERITABLE_ENV
@@ -366,8 +405,28 @@ class LiveAutoIntegrationGitOperations:
         env["GIT_CONFIG_SYSTEM"] = os.devnull
         env["GIT_CONFIG_NOSYSTEM"] = "1"
         env["GIT_NO_REPLACE_OBJECTS"] = "1"
+        # System-wide gitattributes are read from a compiled-in path that no config can
+        # redirect; this is the documented way to ignore them (j#96428 finding 3).
+        env["GIT_ATTR_NOSYSTEM"] = "1"
         env.update(overrides)
         return env
+
+    def _sealed(self, *args: str, **overrides: str) -> subprocess.CompletedProcess[str]:
+        """Run git with the pinned config and a REPLACED environment.
+
+        Every invocation whose answer feeds the integration commit goes through here — the
+        merge, the commit, the driver probe, and the timestamp reads. j#96428 finding 2 is why
+        the last of those is on the list: R13 sealed the two object-building calls and left the
+        ``git show`` that decides the commit's timestamps running in the ambient environment,
+        so a replace ref still changed the resulting commit (measured).
+        """
+        return self._run(
+            *self._DETERMINISTIC_CONFIG,
+            *self._NO_REPLACE,
+            *args,
+            env=self._sealed_env(**overrides),
+            seal_env=True,
+        )
 
     def _merge_tree_capability(self) -> str:
         """``supported`` / ``unsupported`` / ``probe_error`` — three answers, not two.
@@ -418,6 +477,29 @@ class LiveAutoIntegrationGitOperations:
             )
         return branch
 
+    def _external_attributes(self) -> str:
+        """``$GIT_DIR/info/attributes``, which selects merge behaviour and cannot be pinned.
+
+        Attributes come from three places (j#96428 finding 3). The user's file is named by
+        ``core.attributesFile`` and the system's is disabled by ``GIT_ATTR_NOSYSTEM``, both
+        reachable. This one is a fixed path inside the repository that no option redirects,
+        and it is not part of the tree — so two clones of the same commit can merge
+        differently, which is exactly what the determinism claim denies. Measured: adding
+        ``f.txt merge=union`` to it turned a content conflict into a clean merge.
+
+        Refused rather than pinned, like a configured driver. Returns the path when present.
+        """
+        candidate = self._sealed("rev-parse", "--git-path", "info/attributes")
+        if candidate.returncode != 0:
+            return "$GIT_DIR/info/attributes (git dir unreadable)"
+        path = Path(candidate.stdout.strip())
+        if not path.is_absolute():
+            path = self.repo_root / path
+        try:
+            return str(path) if path.is_file() else ""
+        except OSError:
+            return str(path)
+
     def _nondeterministic_merge_config(self) -> str:
         """The configured merge driver, if any — the input this adapter cannot pin.
 
@@ -443,9 +525,7 @@ class LiveAutoIntegrationGitOperations:
         Returns the offending config key, or ``""`` when there is none. An unreadable config
         reads as "there is one": the fail-closed direction for a determinism gate.
         """
-        result = self._run(
-            "config", "--get-regexp", r"^merge\..*\.driver$", env=self._object_env()
-        )
+        result = self._sealed("config", "--get-regexp", r"^merge\..*\.driver$")
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip().splitlines()[0].split()[0]
         if result.returncode not in (0, 1):
@@ -453,8 +533,13 @@ class LiveAutoIntegrationGitOperations:
         return ""
 
     def _commit_date(self, commit: str) -> str:
-        """The committer date of ``commit``, in a form ``commit-tree`` accepts verbatim."""
-        result = self._run("show", "-s", "--format=%cI", "--end-of-options", commit)
+        """The committer date of ``commit``, in a form ``commit-tree`` accepts verbatim.
+
+        Sealed like the merge itself: a replace ref substitutes a different object for this
+        one, and R13 read the date through the ambient environment, so a replacement carrying
+        another timestamp changed the integration commit (measured, j#96428 finding 2).
+        """
+        result = self._sealed("show", "-s", "--format=%cI", "--end-of-options", commit)
         return result.stdout.strip() if result.returncode == 0 else ""
 
     def _merge_timestamp(self, *, source_head: str, target_head: str) -> str:
@@ -474,7 +559,7 @@ class LiveAutoIntegrationGitOperations:
         # ISO-8601 with an offset does not sort lexically across offsets, so compare the
         # instants git itself reports rather than the strings.
         stamps = [
-            self._run("show", "-s", "--format=%ct", "--end-of-options", head)
+            self._sealed("show", "-s", "--format=%ct", "--end-of-options", head)
             for head in (source_head, target_head)
         ]
         if any(stamp.returncode != 0 or not stamp.stdout.strip().isdigit() for stamp in stamps):
@@ -550,15 +635,22 @@ class LiveAutoIntegrationGitOperations:
                     "commit. Refusing rather than producing an unreproducible integration"
                 ),
             )
-        merged = self._run(
-            *self._DETERMINISTIC_CONFIG,
-            *self._NO_REPLACE,
+        attributes = self._external_attributes()
+        if attributes:
+            return MergeResult(
+                status=MERGE_NONDETERMINISTIC_CONFIG,
+                detail=(
+                    f"{attributes} exists; it selects merge behaviour, is not part of the "
+                    "tree, and no option redirects it, so two clones of this commit can merge "
+                    "differently. Refusing rather than producing an unreproducible integration"
+                ),
+            )
+        merged = self._sealed(
             "merge-tree",
             "--write-tree",
             "--end-of-options",
             expected_target_head,
             source_head,
-            env=self._object_env(),
         )
         first_line = merged.stdout.strip().splitlines()[0].strip() if merged.stdout.strip() else ""
         tree = first_line if _is_full_sha(first_line) else ""
@@ -596,9 +688,7 @@ class LiveAutoIntegrationGitOperations:
                     "timestamps are derived from; refusing to fall back to the clock"
                 ),
             )
-        committed = self._run(
-            *self._DETERMINISTIC_CONFIG,
-            *self._NO_REPLACE,
+        committed = self._sealed(
             "commit-tree",
             tree,
             "-p",
@@ -607,14 +697,12 @@ class LiveAutoIntegrationGitOperations:
             source_head,
             "-m",
             f"Merge {source_head} into {branch}",
-            env=self._object_env(**{
-                "GIT_AUTHOR_NAME": ACTUATOR_IDENTITY_NAME,
-                "GIT_AUTHOR_EMAIL": ACTUATOR_IDENTITY_EMAIL,
-                "GIT_AUTHOR_DATE": timestamp,
-                "GIT_COMMITTER_NAME": ACTUATOR_IDENTITY_NAME,
-                "GIT_COMMITTER_EMAIL": ACTUATOR_IDENTITY_EMAIL,
-                "GIT_COMMITTER_DATE": timestamp,
-            }),
+            GIT_AUTHOR_NAME=ACTUATOR_IDENTITY_NAME,
+            GIT_AUTHOR_EMAIL=ACTUATOR_IDENTITY_EMAIL,
+            GIT_AUTHOR_DATE=timestamp,
+            GIT_COMMITTER_NAME=ACTUATOR_IDENTITY_NAME,
+            GIT_COMMITTER_EMAIL=ACTUATOR_IDENTITY_EMAIL,
+            GIT_COMMITTER_DATE=timestamp,
         )
         integration_head = committed.stdout.strip() if committed.returncode == 0 else ""
         if not _is_full_sha(integration_head):
