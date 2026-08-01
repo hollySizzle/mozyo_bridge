@@ -101,10 +101,13 @@ MERGE_PROBE_ERROR = "probe_error"
 #: The arguments were not what the operation requires: not full SHAs, or a ref name that
 #: cannot be turned into a safe refspec.
 MERGE_INVALID_INPUT = "invalid_input"
-#: The repository's configuration can change what a merge produces — a configured
-#: ``merge.<name>.driver`` runs arbitrary code and rewrites the merged content (measured).
-#: An actuator that promises the same action rebuilds the same commit cannot keep that
-#: promise here, so it refuses rather than producing a commit it cannot reproduce.
+#: **Legacy / compatibility only — no current producer emits this.** It was the refusal an
+#: earlier revision returned when it found a configured ``merge.<name>.driver`` or an
+#: ``info/attributes`` file. Review j#96435 finding 1 retired that approach: a check in one
+#: invocation cannot bind a mutation in another, and a driver added between the two ran
+#: anyway. Repository-local state is now invisible to the merge rather than checked for, so
+#: there is nothing left to refuse on. The member stays so a durable record written by an
+#: earlier revision still parses into a known status rather than `unrecognized_status`.
 MERGE_NONDETERMINISTIC_CONFIG = "nondeterministic_merge_config"
 #: The isolated git directory the merge runs in could not be built or its object store could
 #: not be located. Distinct from a non-deterministic *config*: nothing hazardous was detected,

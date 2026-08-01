@@ -256,7 +256,9 @@ class MergeTest(unittest.TestCase):
         commit = [argv for argv in recorder.argvs if "commit-tree" in argv][0]
         # The target ref is validated against git's own grammar before any object is built
         # (j#96422 finding 3).
-        self.assertEqual(ref_check[:2], ("check-ref-format", "--branch"))
+        # The LITERAL ref, not `--branch`: the latter expands `@{-n}` from repository state
+        # (j#96447 finding 1).
+        self.assertEqual(ref_check, ("check-ref-format", "refs/heads/main"))
         self.assertEqual(version, ("--version",))
         # Determinism is CHECKED before it is claimed: a configured merge driver would make
         # the tree host-dependent, so the adapter asks (j#96417 finding 1).
@@ -286,19 +288,23 @@ class MergeTest(unittest.TestCase):
         # Everything except the questions asked before sealing: the ref-format check and the
         # version probes (capability, then the exact version recorded on the outcome).
         unsealed = [argv for argv in recorder.argvs if argv[: len(_PINNED)] != _PINNED]
-        self.assertEqual(unsealed[0][:2], ("check-ref-format", "--branch"))
+        self.assertEqual(unsealed[0][:1], ("check-ref-format",))
         self.assertTrue(all(argv == ("--version",) for argv in unsealed[1:]), unsealed)
         self.assertTrue(sealed)
-        for env in recorder.envs:
+        for argv, _, env in recorder.calls:
             if not env:
                 continue
             self.assertEqual(env["GIT_CONFIG_GLOBAL"], os.devnull)
             self.assertEqual(env["GIT_NO_REPLACE_OBJECTS"], "1")
             self.assertEqual(env["GIT_ATTR_NOSYSTEM"], "1")
-            # GIT_DIR is SET, to the sanitized directory — the repository's own is not what
-            # these commands read (j#96435 finding 1).
-            self.assertEqual(env["GIT_DIR"], "/sandbox.git")
             self.assertNotIn("GIT_CONFIG_COUNT", env)
+            if argv[:1] == ("check-ref-format",):
+                # Sealed, but deliberately NOT pointed at a repository: the literal ref check
+                # must not depend on one (j#96447 finding 1).
+                self.assertNotIn("GIT_DIR", env)
+            else:
+                # Everything that reads or writes objects runs in the sanitized directory.
+                self.assertEqual(env["GIT_DIR"], "/sandbox.git")
 
     def test_a_success_carries_the_version_the_capability_probe_read(self) -> None:
         # R15 re-probed `--version` after the commit and let an empty answer through with a

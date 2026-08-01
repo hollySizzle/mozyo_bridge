@@ -57,6 +57,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MERGE_NONDETERMINISTIC_CONFIG,
     MERGE_PRIMITIVE_UNSUPPORTED,
     MERGE_PROBE_ERROR,
+    MERGE_SANDBOX_ERROR,
     MERGE_UNRECOGNIZED,
     MergeResult,
     PushResult,
@@ -611,7 +612,8 @@ class MergeCommitRunTest(unittest.TestCase):
             MERGE_CONTENT_CONFLICT,
             MERGE_PRIMITIVE_UNSUPPORTED,
             MERGE_PROBE_ERROR,
-            MERGE_NONDETERMINISTIC_CONFIG,
+            MERGE_SANDBOX_ERROR,
+            MERGE_NONDETERMINISTIC_CONFIG,  # legacy: parses, no current producer emits it
             MERGE_ERROR,
         ):
             operations = FakeGitOperations(

@@ -74,7 +74,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MERGE_ERROR,
     MERGE_INVALID_INPUT,
     MERGE_MERGED,
-    MERGE_NONDETERMINISTIC_CONFIG,
     MERGE_PRIMITIVE_UNSUPPORTED,
     MERGE_PROBE_ERROR,
     MergeResult,
@@ -370,7 +369,8 @@ class LiveAutoIntegrationGitOperations:
         "merge.default=text",
         # The USER attributes file is config-selected, so `-c` reaches it; the system one is
         # a compiled-in path, disabled by `GIT_ATTR_NOSYSTEM` in the sealed environment. The
-        # repository's own `.git/info/attributes` is neither — see `_external_attributes`.
+        # repository's own `.git/info/attributes` is neither reachable nor needed to be: the
+        # merge does not run in a directory that has one (:meth:`_sanitized_git_dir`).
         "-c",
         f"core.attributesFile={os.devnull}",
     )
@@ -449,8 +449,10 @@ class LiveAutoIntegrationGitOperations:
         the same way — ``refusing to merge unrelated histories`` directly, an ordinary merge
         here (j#96435 finding 3, closed by the same construction).
 
-        Yields ``None`` when the sandbox cannot be built, and every caller treats that as a
-        refusal rather than falling back to the repository.
+        Yields ``None`` when the sandbox cannot be built or this repository's object store
+        cannot be located, and the caller turns that into
+        :data:`~...domain.auto_integration_records.MERGE_SANDBOX_ERROR` rather than falling
+        back to the repository.
         """
         # The probes and the `init` are sealed too. R15 sealed what ran *inside* the sandbox
         # and left the three commands that BUILD it running in the ambient environment —
@@ -475,24 +477,20 @@ class LiveAutoIntegrationGitOperations:
         if not objects.is_dir():
             yield None
             return
+        # The ENTIRE lifecycle is inside the guard, cleanup included. R16 caught the
+        # constructor and the template mkdir and left `TemporaryDirectory.__exit__` outside it,
+        # so a cleanup failure raised out of `apply_merge` *after* the commit had been built
+        # (j#96447 finding 2). "Filesystem failures become a typed refusal" was accepted two
+        # rounds ago and implemented for two of the four places one can occur.
+        scratch = None
         try:
             scratch = tempfile.TemporaryDirectory(prefix="mozyo-merge-")
-        except OSError:
-            # Filesystem failures were escaping as exceptions rather than becoming a typed
-            # refusal (j#96441 finding 3).
-            yield None
-            return
-        with scratch:
             root = Path(scratch.name)
             sandbox = root / "sanitized.git"
             # An EMPTY template we own, so `init` cannot be pointed at one that seeds the
             # sandbox with attributes, hooks or config.
             template = root / "empty-template"
-            try:
-                template.mkdir()
-            except OSError:
-                yield None
-                return
+            template.mkdir()
             created = self._run(
                 "init",
                 "--bare",
@@ -514,6 +512,17 @@ class LiveAutoIntegrationGitOperations:
             finally:
                 self._sandbox = None
                 self._sandbox_objects = None
+        except OSError:
+            yield None
+            return
+        finally:
+            if scratch is not None:
+                try:
+                    scratch.cleanup()
+                except OSError:
+                    # A sandbox that cannot be removed is a temp-directory leak, not a reason
+                    # to raise past a caller that has already been given its answer.
+                    pass
 
     def _sealed(self, *args: str, **overrides: str) -> subprocess.CompletedProcess[str]:
         """Run git with the pinned config, a REPLACED environment, and no repository state.
@@ -576,11 +585,25 @@ class LiveAutoIntegrationGitOperations:
         Raises :class:`UnsafeRefspecError`, which the caller turns into ``invalid_input``.
         """
         branch = _checked_branch(target_ref)
-        # `check-ref-format` does not accept `--end-of-options` (measured: exit 129). It is
-        # safe without one only because `_checked_branch` has already refused a leading `-`,
-        # so the value cannot be read as an option — the order of these two checks is load
-        # bearing, not incidental.
-        checked = self._run("check-ref-format", "--branch", branch)
+        # The LITERAL form, not `--branch`. `--branch` is not a validator: it also expands
+        # `@{-n}` into whatever branch was checked out n switches ago, so it reads repository
+        # state and answers differently under a different `GIT_DIR` — measured, `@{-1}` came
+        # back rc=0 with `other`, and rc=128 elsewhere (j#96447 finding 1). R16 then discarded
+        # the expansion and kept `@{-1}` as the target, which would have built a merge for a
+        # ref name no push could ever use. `check-ref-format refs/heads/<name>` is a pure
+        # string check: measured, it rejects `@{-1}` along with `main..bad`, `main.lock`,
+        # `main@{bad` and `main//bad`, and it works outside any repository with an empty
+        # environment — which is how it is run here.
+        #
+        # `--end-of-options` is not accepted by this command (measured: exit 129); it is safe
+        # without one only because `_checked_branch` has already refused a leading `-`, so the
+        # order of these two checks is load bearing, not incidental.
+        checked = self._run(
+            "check-ref-format",
+            f"refs/heads/{branch}",
+            env=self._sealed_env(),
+            seal_env=True,
+        )
         if checked.returncode != 0:
             raise UnsafeRefspecError(
                 f"target ref {target_ref!r} is not a valid branch name: "

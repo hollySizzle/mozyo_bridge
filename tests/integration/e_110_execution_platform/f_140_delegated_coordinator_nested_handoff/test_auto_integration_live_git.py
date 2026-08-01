@@ -592,6 +592,96 @@ class DeterministicMergeCommitTest(unittest.TestCase):
                 {shape: result.integration_head for shape, result in results.items()},
             )
 
+    def test_a_ref_whose_meaning_depends_on_the_repository_is_refused(self) -> None:
+        """j#96447 finding 1: `check-ref-format --branch` is not a validator.
+
+        It also expands `@{-n}` into whatever branch was checked out n switches ago, so it
+        reads repository state — measured, `@{-1}` returned rc=0 and `other` here and rc=128
+        under a different `GIT_DIR`. R16 then threw the expansion away and kept `@{-1}` as the
+        target, which would have built a merge for a ref no push could use. The literal form
+        is checked now, in a sealed environment, so the answer cannot depend on where the
+        process happens to be standing.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init(repo)
+            _commit(repo, "a.txt", "base")
+            _git(repo, "checkout", "-q", "-b", "lane")
+            source = _commit(repo, "lane.txt", "reviewed")
+            _git(repo, "checkout", "-q", "main")
+            target = _commit(repo, "target.txt", "moved on")
+            # A previous checkout, so `@{-1}` resolves for real git.
+            _git(repo, "checkout", "-q", "-b", "other")
+            _git(repo, "checkout", "-q", "main")
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "check-ref-format", "--branch", "@{-1}"],
+                    cwd=repo, capture_output=True, text=True,
+                ).stdout.strip(),
+                "other",
+                "the scene must be one where --branch really expands",
+            )
+
+            operations = LiveAutoIntegrationGitOperations(repo_root=repo)
+            refused = operations.apply_merge(
+                source_head=source, target_ref="@{-1}", expected_target_head=target
+            )
+            self.assertEqual(refused.status, MERGE_INVALID_INPUT)
+            self.assertEqual(refused.integration_head, "")
+
+            # ...and the same answer from somewhere else entirely.
+            elsewhere = root / "elsewhere"
+            _init(elsewhere)
+            previous = os.environ.get("GIT_DIR")
+            os.environ["GIT_DIR"] = str(elsewhere / ".git")
+            try:
+                self.assertEqual(
+                    operations.apply_merge(
+                        source_head=source, target_ref="@{-1}", expected_target_head=target
+                    ).status,
+                    MERGE_INVALID_INPUT,
+                )
+            finally:
+                if previous is None:
+                    os.environ.pop("GIT_DIR", None)
+                else:
+                    os.environ["GIT_DIR"] = previous
+
+    def test_a_sandbox_cleanup_failure_does_not_escape(self) -> None:
+        """j#96447 finding 2: the temp directory's exit was outside the guard.
+
+        R16 caught the constructor and the template mkdir and left cleanup uncaught, so a
+        failure there raised out of `apply_merge` *after* the commit existed. "Filesystem
+        failures become a typed refusal" was accepted two rounds earlier and implemented for
+        two of the four places one can occur.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            _init(repo)
+            _commit(repo, "a.txt", "base")
+            _git(repo, "checkout", "-q", "-b", "lane")
+            source = _commit(repo, "lane.txt", "reviewed")
+            _git(repo, "checkout", "-q", "main")
+            target = _commit(repo, "target.txt", "moved on")
+
+            original = tempfile.TemporaryDirectory.cleanup
+
+            def exploding(self) -> None:
+                original(self)
+                raise OSError("simulated cleanup failure")
+
+            tempfile.TemporaryDirectory.cleanup = exploding
+            try:
+                result = LiveAutoIntegrationGitOperations(repo_root=repo).apply_merge(
+                    source_head=source, target_ref="main", expected_target_head=target
+                )
+            finally:
+                tempfile.TemporaryDirectory.cleanup = original
+            # The merge itself succeeded; a directory that would not delete is not a reason to
+            # raise past a caller that already has its answer.
+            self.assertEqual(result.status, MERGE_MERGED, result.detail)
+
     def test_an_init_template_cannot_seed_the_sandbox(self) -> None:
         """j#96441 finding 1: the sandbox's own creation was running unsealed.
 

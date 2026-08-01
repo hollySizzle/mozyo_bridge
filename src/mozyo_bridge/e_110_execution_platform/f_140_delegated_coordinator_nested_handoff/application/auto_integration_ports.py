@@ -175,14 +175,24 @@ class AutoIntegrationGitOperations(Protocol):
         — and MUST NOT infer "unsupported" from an unrecognized exit code.
 
         **Determinism, stated as exactly what is enforced.** Two runs of the same action MUST
-        produce the same commit id given the same repository content. That is narrower than
-        R11's "a function of its arguments alone", which was not true: review j#96412 finding
-        1 measured the host identity and the clock leaking in, and j#96417 finding 1 measured
-        ``i18n.commitEncoding`` doing the same. Those are pinned. What cannot be pinned is a
-        configured ``merge.<name>.driver`` — it runs arbitrary code over the merged content
-        and cannot be disabled per-invocation (measured) — so an implementation MUST refuse
-        with :data:`MERGE_NONDETERMINISTIC_CONFIG` rather than build a commit it cannot
-        promise to rebuild.
+        produce the same commit id, given the same repository content and the same git
+        version. That is narrower than R11's "a function of its arguments alone", which was
+        not true: review j#96412 finding 1 measured the host identity and the clock leaking
+        in, and j#96417 finding 1 measured ``i18n.commitEncoding`` doing the same.
+
+        An implementation MUST NOT satisfy that by checking the repository for hazards and
+        refusing when it finds them. Earlier revisions of this contract required exactly that
+        for a configured ``merge.<name>.driver``, and review j#96435 finding 1 reproduced a
+        driver added *between* the check and the merge, whose shell command then rewrote the
+        merged content. A check and a mutation in two invocations are never bound to the same
+        instant. What is required instead is that repository-local state cannot reach the
+        merge at all — the reference implementation builds the merge in a throwaway git
+        directory whose object store is the repository's and whose config, attributes and
+        ``shallow`` are empty.
+
+        An implementation MUST record the exact git version it ran under on a successful
+        result: "the same version" is otherwise unverifiable after the fact (j#96441
+        finding 4).
         """
         ...
 
