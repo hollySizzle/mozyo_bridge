@@ -69,6 +69,15 @@ _FRONT_DOOR_ANCHOR_REFUSAL = [
 _SEND_SEMANTICS_REFUSAL = [
     "handoff", "send",
     "--to", "claude",
+    # Redmine #14232 j#96316: pin the rail explicitly. Without a `--target`, the send resolves
+    # a target through the repo-configured backend, and where that backend is herdr with no
+    # herdr binary (CI) the terminal refusal fires FIRST and prints a bare `error:` line — no
+    # structured record, so the typed-outcome assertion fails for a reason that has nothing to
+    # do with send semantics. A `%pane` target selects the tmux rail deterministically, so the
+    # static `--force`-under-`queue-enter` refusal is what the test actually observes. The pane
+    # is intentionally nonexistent: the refusal is static and must precede any real target
+    # resolution or typing, which is exactly what this pins.
+    "--target", "%99",
     "--source", "redmine",
     "--issue", "14232",
     "--journal", "94407",
