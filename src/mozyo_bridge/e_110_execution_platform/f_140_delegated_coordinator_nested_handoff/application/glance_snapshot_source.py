@@ -877,8 +877,10 @@ def active_lane_snapshots(
 
     1. the ``redmine_source`` (when given) fetches the issue's raw journals and the
        glance-only grammar folds a workflow state from the canonical ``## Gate:`` template;
-    2. a closed Redmine issue with no recognized gate still folds to a close/retire state
-       (the closed status is a stronger durable fact than the journal fold);
+    2. a closed Redmine issue with no recognized gate keeps its observed ``issue_open=False``
+       but is **not** folded to a close/retire state — without resolved gate/commit/integration
+       facts the issue cannot be claimed safe to retire (re-audit j#74323 Finding 3), so it
+       stays a degraded unknown row that the caller partitions as closed debt (#14813);
     3. otherwise the ``store`` advisory cache supplies the gate facts;
     4. otherwise the lane is emitted degraded (``durable_facts_available=False`` ->
        ``workflow_state=unknown``), never dropped.
