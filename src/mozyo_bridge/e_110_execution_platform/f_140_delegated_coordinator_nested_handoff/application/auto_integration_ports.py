@@ -4,11 +4,12 @@ Split from :mod:`...application.auto_integration_actuator` to keep that module i
 module-health line budget; the boundary is a real one either way — these are the seams the
 actuator is defined against, and the use case is what composes them.
 
-What this interface can and cannot express IS the safety story, arrived at over nine review
+What this interface can and cannot express IS the safety story, arrived at over ten review
 rounds. Only two mutations exist, both on the integration side: a non-force push, and a merge
-in a dedicated worktree bound to the expected target parent. There is no force push, no
-rebase, **no ref delete of any kind, and no worktree removal** — an operation this port
-cannot express is one the actuator cannot perform, which is the point.
+built **from objects** onto the expected target parent — no checkout, index, ref or HEAD is
+involved. There is no force push, no rebase, **no ref delete of any kind, and no worktree
+removal** — an operation this port cannot express is one the actuator cannot perform, which
+is the point.
 
 Three destructive operations were removed rather than guarded, and one sentence retired all
 three: *an operation whose safety condition cannot be enforced by the operation itself is not
@@ -69,19 +70,77 @@ class PushResult:
     detail: str = ""
 
 
+#: The merge succeeded and produced :attr:`MergeResult.integration_head`.
+MERGE_MERGED = "merged"
+#: The two sides genuinely conflict in content. The only outcome a human has to resolve.
+MERGE_CONTENT_CONFLICT = "content_conflict"
+#: This git cannot perform an object-level merge (``merge-tree --write-tree`` needs 2.38).
+#: Established by an explicit version probe, never inferred from an exit code.
+MERGE_PRIMITIVE_UNSUPPORTED = "primitive_unsupported"
+#: The arguments were not what the operation requires (not full SHAs, unusable ref name).
+MERGE_INVALID_INPUT = "invalid_input"
+#: ``merge-tree`` failed for an operational reason: a missing or unreadable object, a broken
+#: repository, a merge driver that errored. NOT a content conflict, and NOT proof that the
+#: primitive is unavailable.
+MERGE_ERROR = "merge_error"
+#: The merged tree existed but could not be turned into a commit object.
+MERGE_COMMIT_ERROR = "commit_error"
+
+MERGE_STATUSES: frozenset = frozenset(
+    {
+        MERGE_MERGED,
+        MERGE_CONTENT_CONFLICT,
+        MERGE_PRIMITIVE_UNSUPPORTED,
+        MERGE_INVALID_INPUT,
+        MERGE_ERROR,
+        MERGE_COMMIT_ERROR,
+    }
+)
+
+
 @dataclass(frozen=True)
 class MergeResult:
-    """The outcome of applying a merge-commit disposition in a dedicated worktree.
+    """The outcome of building a merge commit, as a typed status rather than a boolean.
 
     ``integration_head`` is the exact commit the merge produced — a *different* commit from
     the source head, which is why the two are recorded separately (the same reason the
     Hibernate Evidence Marker Contract splits ``head`` from ``integration_head``: one head
     cannot prove a merge-commit integration).
+
+    R10 review j#96412 finding 2 is why ``status`` exists. This record carried a single
+    ``conflicted: bool``, and five different outcomes collapsed into it: invalid arguments, a
+    real content conflict, an unusable primitive, an unreadable object, and a failed commit.
+    Worse, the adapter classified them by exit code, and ``merge-tree`` exits **1 for a
+    missing object exactly as it does for a conflict** (measured) — so "this object does not
+    exist" was recorded as "the branches conflict". That is the same defect as j#96396
+    finding 2, made in the round that claimed to have learned it, and it is the same defect
+    as the very first review's "a boolean cannot be audited": ten rounds of replacing
+    booleans with records, and this is one I introduced.
+
+    ``conflicted`` remains as a derived property so callers that only need "may I proceed?"
+    keep reading correctly, but nothing may *classify* on it.
     """
 
-    conflicted: bool
+    status: str
     integration_head: str = ""
     detail: str = ""
+
+    @property
+    def conflicted(self) -> bool:
+        """True for every non-success. Deliberately derived: a refusal is not a diagnosis."""
+        return self.status != MERGE_MERGED
+
+    @property
+    def is_content_conflict(self) -> bool:
+        """The one outcome that means the *branches* disagree rather than the run failed."""
+        return self.status == MERGE_CONTENT_CONFLICT
+
+    def as_payload(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "integration_head": self.integration_head,
+            "detail": self.detail,
+        }
 
 
 @runtime_checkable
@@ -117,8 +176,15 @@ class AutoIntegrationGitOperations(Protocol):
         merge built on it, and the call still returned ``conflicted=False``. A path is a name;
         a gate in front of a name is a check, not a guarantee. Objects have no such gap.
 
-        A conflict is reported, never auto-resolved, and it MUST be distinguishable from the
-        merge primitive being unavailable.
+        A conflict is reported and never auto-resolved. An implementation MUST return a
+        :data:`MERGE_STATUSES` value that says which outcome occurred — a content conflict, an
+        unsupported primitive, invalid input, an operational merge failure, or a failed commit
+        — and MUST NOT infer "unsupported" from an unrecognized exit code.
+
+        The commit it produces MUST be a function of its arguments alone. Two runs of the same
+        action, on different hosts or at different times, MUST produce the same commit id;
+        review j#96412 finding 1 measured two SHAs for one action because the commit inherited
+        the host's identity configuration and the current clock, which no action key covers.
         """
         ...
 

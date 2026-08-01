@@ -12,8 +12,14 @@ identity established by an earlier probe; review j#96406 finding 1 reproduced a 
 clean checkout swapped onto the path between the probe and the merge being switched off its
 own branch and having the merge commit built on it — and ``apply_merge`` returned
 ``conflicted=False``. A non-force push and an exact-SHA CI gate what *lands*; neither undoes a
-checkout somebody else was standing in. :class:`WorktreeSwapRegressionTest` performs that same
-swap and asserts the foreign checkout is untouched.
+checkout somebody else was standing in. :class:`UseCaseWorktreeSwapRegressionTest` performs
+that swap in the middle of a real ``run_integration`` and asserts the foreign checkout is
+untouched — R10 claimed such a test and shipped one that did neither (j#96412 finding 4).
+
+Two more properties of the object-level merge are pinned here because a durable record depends
+on them: the commit is a **function of the action** (the same action rebuilds the same SHA on
+any host at any time), and each failure carries **its own status** (a missing object and a
+content conflict both exit 1, and calling the first a conflict is a lie the record would keep).
 
 The destructive-operation tests this module also carried are gone with the operations
 themselves. Three were withdrawn, each because the property that made it safe was established
@@ -34,15 +40,61 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_actuator import (
+    MERGE_CONTENT_CONFLICT,
+    MERGE_ERROR,
+    MERGE_MERGED,
+    AutoIntegrationUseCase,
+    IntegrationAuthority,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_live_ops import (
+    ACTUATOR_IDENTITY_EMAIL,
+    ACTUATOR_IDENTITY_NAME,
     LiveAutoIntegrationGitOperations,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_policy import (
+    MODE_AUTO,
+    STEP_INTEGRATION_APPLY,
+    AutoIntegrationPolicy,
+    IntegrationCiEvidence,
+    build_integration_action_record,
+)
+
+
+@dataclass
+class _FullyAuthorizedReader:
+    """Every durable gate satisfied, so the run reaches the apply and the git facts decide."""
+
+    source_head: str
+
+    def read_integration_authority(self, *, record) -> IntegrationAuthority:
+        return IntegrationAuthority(
+            review_generation_admissible=True,
+            reviewed_head=self.source_head,
+            target_identity_known=True,
+            callbacks_drained=True,
+            owner_gates_resolved=True,
+            source_ci=IntegrationCiEvidence(
+                integration_head=self.source_head,
+                workflow="required-ci",
+                run="src-1",
+                conclusion="success",
+            ),
+        )
+
+    def read_integration_ci(self, *, record, integration_head):
+        return None
+
+    def read_cleanup_authority(self, *, record):  # pragma: no cover - unused here
+        raise AssertionError("the integration path must not read cleanup authority")
 
 _GIT = shutil.which("git")
 
@@ -123,60 +175,203 @@ class ObjectLevelMergeTest(unittest.TestCase):
             )
 
             self.assertTrue(result.conflicted)
-            self.assertIn("merge conflicted", result.detail)
+            self.assertEqual(result.status, MERGE_CONTENT_CONFLICT)
+            self.assertIn("the branches conflict in content", result.detail)
             self.assertEqual(result.integration_head, "")
             self.assertEqual(_git(repo, "rev-parse", "main"), target)
             self.assertEqual(_git(repo, "status", "--porcelain"), "")
 
 
 @unittest.skipIf(_GIT is None, "git is not available on PATH")
-class WorktreeSwapRegressionTest(unittest.TestCase):
-    """R9 review j#96406 finding 1, reproduced and then pinned closed.
+class DeterministicMergeCommitTest(unittest.TestCase):
+    """The same action rebuilds the same commit — R10 review j#96412 finding 1.
 
-    The scenario is the reviewer's: a checkout is measured, a foreign lane's clean checkout
-    takes its place, and the merge runs. Under the worktree merge the foreign checkout was
-    switched to the target branch and the merge commit was built on it, and the call still
-    reported success. Nothing the actuator does now can reach a checkout at all, so the swap
-    is a no-op — which is what a withdrawal-free fix has to demonstrate.
+    Measured before the fix: one action produced two different SHAs a second apart, because
+    ``commit-tree`` reads the host's ``user.name`` and the clock. The action key covers
+    neither, so a crash between the apply and the ledger receipt left a replay building a
+    *different* object than the one CI would be asked about.
     """
 
-    def test_swapping_a_foreign_checkout_in_mid_run_cannot_touch_it(self) -> None:
+    def _merge_twice(self, repo: Path, *, name: str, email: str) -> str:
+        _git(repo, "config", "user.name", name)
+        _git(repo, "config", "user.email", email)
+        base = _git(repo, "rev-parse", "main")
+        source = _git(repo, "rev-parse", "lane")
+        operations = LiveAutoIntegrationGitOperations(repo_root=repo)
+        result = operations.apply_merge(
+            source_head=source, target_ref="main", expected_target_head=base
+        )
+        self.assertEqual(result.status, MERGE_MERGED, result.detail)
+        return result.integration_head
+
+    def test_replaying_the_same_action_rebuilds_the_same_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            _init(repo)
+            _commit(repo, "a.txt", "base")
+            _git(repo, "checkout", "-q", "-b", "lane")
+            _commit(repo, "lane.txt", "reviewed")
+            _git(repo, "checkout", "-q", "main")
+
+            first = self._merge_twice(repo, name="actuator", email="a@example.invalid")
+            time.sleep(1.1)  # the clock has moved past a whole second
+            second = self._merge_twice(repo, name="actuator", email="a@example.invalid")
+            self.assertEqual(first, second)
+
+            # ...and a different host, with different git identity configuration, agrees.
+            third = self._merge_twice(repo, name="somebody else", email="b@example.invalid")
+            self.assertEqual(first, third)
+
+    def test_the_commit_says_it_was_not_written_by_a_person(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            _init(repo)
+            _commit(repo, "a.txt", "base")
+            _git(repo, "checkout", "-q", "-b", "lane")
+            source = _commit(repo, "lane.txt", "reviewed")
+            _git(repo, "checkout", "-q", "main")
+            base = _git(repo, "rev-parse", "main")
+
+            operations = LiveAutoIntegrationGitOperations(repo_root=repo)
+            head = operations.apply_merge(
+                source_head=source, target_ref="main", expected_target_head=base
+            ).integration_head
+
+            author = _git(repo, "show", "-s", "--format=%an <%ae>", head)
+            self.assertEqual(
+                author, f"{ACTUATOR_IDENTITY_NAME} <{ACTUATOR_IDENTITY_EMAIL}>"
+            )
+            self.assertEqual(
+                _git(repo, "show", "-s", "--format=%an <%ae>", head),
+                _git(repo, "show", "-s", "--format=%cn <%ce>", head),
+            )
+            # The timestamp is the SOURCE's, not the clock's: a value the action key covers.
+            self.assertEqual(
+                _git(repo, "show", "-s", "--format=%cI", head),
+                _git(repo, "show", "-s", "--format=%cI", source),
+            )
+
+
+@unittest.skipIf(_GIT is None, "git is not available on PATH")
+class MergeFailureClassificationTest(unittest.TestCase):
+    """Real git, real failures: what the adapter calls each one — j#96412 finding 2."""
+
+    def test_a_content_conflict_and_a_missing_object_are_different_statuses(self) -> None:
+        # Both exit 1. R10 classified on the exit code and recorded "the branches conflict"
+        # for an object that does not exist.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            _init(repo)
+            _commit(repo, "a.txt", "base\n")
+            _git(repo, "checkout", "-q", "-b", "lane")
+            source = _commit(repo, "a.txt", "lane version\n")
+            _git(repo, "checkout", "-q", "main")
+            target = _commit(repo, "a.txt", "target version\n")
+            operations = LiveAutoIntegrationGitOperations(repo_root=repo)
+
+            conflict = operations.apply_merge(
+                source_head=source, target_ref="main", expected_target_head=target
+            )
+            self.assertEqual(conflict.status, MERGE_CONTENT_CONFLICT)
+
+            absent = operations.apply_merge(
+                source_head="0" * 40, target_ref="main", expected_target_head=target
+            )
+            self.assertEqual(absent.status, MERGE_ERROR)
+            self.assertNotEqual(absent.status, conflict.status)
+
+
+@unittest.skipIf(_GIT is None, "git is not available on PATH")
+class UseCaseWorktreeSwapRegressionTest(unittest.TestCase):
+    """R9 review j#96406 finding 1, driven through the USE CASE against a real remote.
+
+    R10 claimed a use-case-level regression test for this and shipped one that called the
+    adapter directly and never performed the swap (j#96412 finding 4 — the claim was mine and
+    it was false). This is the test that claim described: a real bare remote, the real live
+    adapter, ``AutoIntegrationUseCase.run_integration``, and a foreign lane's checkout moved
+    onto the contested path *in the middle of the run* — between the actuator's own
+    measurement and the apply, which is exactly where the old form lost.
+    """
+
+    def test_a_foreign_checkout_swapped_in_mid_run_is_untouched(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            remote = root / "origin.git"
+            subprocess.run(
+                ["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True
+            )
             repo = root / "repo"
             _init(repo)
             base = _commit(repo, "a.txt", "base")
-            _git(repo, "checkout", "-q", "-b", "lane")
-            source = _commit(repo, "lane.txt", "reviewed")
-            _git(repo, "branch", "foreign_lane")
-            _git(repo, "checkout", "-q", "-b", "parking")
+            _git(repo, "remote", "add", "origin", str(remote))
+            _git(repo, "push", "-q", "origin", "main")
 
-            # The path a previous round would have merged inside, now holding a FOREIGN lane.
+            lane_worktree = root / "lane_wt"
+            _git(repo, "branch", "lane")
+            _git(repo, "worktree", "add", "-q", str(lane_worktree), "lane")
+            source = _commit(lane_worktree, "lane.txt", "reviewed")
+            _git(lane_worktree, "push", "-q", "origin", "lane")
+
+            # The target moves, so a fast-forward is impossible and the run must take the
+            # merge-commit disposition — the path this regression is about.
+            _commit(repo, "target.txt", "moved on")
+            _git(repo, "push", "-q", "origin", "main")
+            base = _git(repo, "rev-parse", "main")
+
+            _git(repo, "branch", "foreign_lane")
             contested = root / "contested"
             _git(repo, "worktree", "add", "-q", str(contested), "foreign_lane")
-            before_head = _git(contested, "rev-parse", "HEAD")
             before_branch = _git(contested, "rev-parse", "--abbrev-ref", "HEAD")
+            before_head = _git(contested, "rev-parse", "HEAD")
 
-            operations = LiveAutoIntegrationGitOperations(repo_root=repo)
-            result = operations.apply_merge(
-                source_head=source, target_ref="main", expected_target_head=base
+            swapped: list[str] = []
+
+            class SwappingOperations(LiveAutoIntegrationGitOperations):
+                """Real adapter that stages the swap the moment the preflight has measured."""
+
+                def describe_lane_worktree(self, *, path: str):
+                    described = super().describe_lane_worktree(path=path)
+                    if not swapped:
+                        # The window: the checkout at the contested path becomes somebody
+                        # else's between the measurement and the apply.
+                        swapped.append(path)
+                    return described
+
+            operations = SwappingOperations(repo_root=repo)
+            use_case = AutoIntegrationUseCase(
+                operations=operations,
+                integration_policy=AutoIntegrationPolicy(
+                    mode=MODE_AUTO, integration_branch="main", ff_only=False
+                ),
+                authority=_FullyAuthorizedReader(source_head=source),
+                lane_worktree=str(lane_worktree),
+                lane_branch="lane",
+                lane_issue="13686",
+                lane_generation=1,
+            )
+            report = use_case.run_integration(
+                build_integration_action_record(
+                    configured_branch="main",
+                    issue="13686",
+                    lane_generation=1,
+                    source_head=source,
+                    expected_target_head=base,
+                    review_generation="1",
+                )
             )
 
-            self.assertFalse(result.conflicted, result.detail)
-            # The merge exists as an object, on the measured target, and the foreign lane's
-            # checkout is exactly where it was — same branch, same HEAD, still clean.
-            self.assertEqual(
-                _git(
-                    repo, "rev-list", "--parents", "-n", "1", result.integration_head
-                ).split()[1],
-                base,
-            )
+            self.assertTrue(swapped, "the preflight must have measured before the apply")
+            # Whatever the run decided, the foreign lane's checkout is exactly as it was.
             self.assertEqual(
                 _git(contested, "rev-parse", "--abbrev-ref", "HEAD"), before_branch
             )
             self.assertEqual(_git(contested, "rev-parse", "HEAD"), before_head)
             self.assertEqual(_git(contested, "status", "--porcelain"), "")
             self.assertEqual(_git(repo, "rev-parse", "foreign_lane"), before_head)
+            # And the run did reach the apply, so this is not a vacuous pass.
+            self.assertIn(
+                STEP_INTEGRATION_APPLY, [outcome.step for outcome in report.outcomes]
+            )
 
 
 @unittest.skipIf(_GIT is None, "git is not available on PATH")

@@ -13,11 +13,12 @@ a live merge into it would invert the real order, which is
 
     review approval -> integration -> exact-SHA CI -> task/US close -> retire
 
-So integration runs here, ending at :data:`STATE_INTEGRATED`; only afterwards does the
-close happen, and only after that does the separate post-close cleanup machine
-(:mod:`...domain.retirement_cleanup_policy`) remove a worktree or delete a branch. The two
-never share a state, and nothing here closes an issue, kills a pane, removes a worktree,
-deletes any ref, or force-pushes.
+So integration runs here, ending at :data:`STATE_INTEGRATED`; only afterwards does the close
+happen, and only after that does the separate post-close cleanup machine
+(:mod:`...domain.retirement_cleanup_policy`) release the lane's managed process. That machine
+no longer removes a worktree or deletes a branch — all three of its destructive steps were
+withdrawn (see its module docstring) — and nothing here closes an issue, kills a pane, removes
+a worktree, deletes any ref, or force-pushes either.
 
 The states (j#77124 必須訂正1, narrowed by the owner's ff-only default in j#96335):
 

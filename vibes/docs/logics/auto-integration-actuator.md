@@ -178,6 +178,35 @@ checkout・index・ref・HEAD を一切触らない (実測)。**決定と mutat
 `describe_lane_worktree` は **lane 側の read probe** であり、「ここで mutate してよいか」ではなく
 「source は review されたものか」に答える。
 
+## 統合 commit の policy (R11 / j#96412 F1・F3)
+
+object-level merge は plumbing であり、`git merge` と **同値ではない**。差分を暗黙にせず policy として明示する。
+
+### commit は action の純関数である (F1)
+
+`commit-tree` は既定で **host の identity config と現在時刻**を読む。これは action key が覆わない
+入力であり、**同一 action の replay が別 SHA を作る** (実測: 1.1 秒差で別 SHA、tree は同一)。
+apply 後 / ledger receipt 前に crash すると、replay が CI 対象とは別の object を作る。よって:
+
+- author / committer identity = **固定 literal** (`mozyo-bridge auto-integration <auto-integration@mozyo-bridge.invalid>`)。
+  host config を継承しない (継承すると host 間で SHA が変わる)。`git log` 上でも人間が書いたのでないことが読める
+- author / committer date = **source head の committer date**。object の性質なので action key が既に覆う
+- message = 固定 format `Merge <source_head> into <branch>`
+- 結果として **同一 action → 同一 SHA** (real-Git test で固定。異なる `user.name` config でも一致することを確認)
+
+### hook を実行せず、署名しない (F3)
+
+`git merge` は `pre-merge-commit` / `commit-msg` hook を実行し、`-S` で署名できる。plumbing の
+`commit-tree` はどちらも経由しない。**これを「同値」として扱わず、意図的な policy とする**:
+
+- **local hook を実行しない。** hook は host ごとに任意の code であり、(a) actuator の決定性と両立せず
+  (hook が commit を書き換えれば SHA が変わる)、(b) host によって統合結果が変わることは
+  「同一 action → 同一 SHA」と矛盾する。**統合成果物の gate は push 後の exact-SHA CI** であり、
+  それは local hook より強い (共有 CI が同じ commit を検査する)
+- **署名しない。** 署名鍵は host / 個人に紐づき、fixed identity と決定性に反する
+- **この判断は project policy であり実装詳細ではない。** 署名や hook 実行を要求する運用なら、
+  決定性との両立方法 (例: 決定的な署名 identity) を含めて owner/design 判断が要る
+
 ## 現行 contract の要約 (R10 時点)
 
 歴史的経緯は後続の節に残すが、**現時点で成立している契約**はこれだけである。矛盾したら本節を優先する。
@@ -193,7 +222,11 @@ checkout・index・ref・HEAD を一切触らない (実測)。**決定と mutat
   reachability。
 - **merge は object から組む** (`merge-tree --write-tree` + `commit-tree`)。checkout・index・ref・
   HEAD を一切触らず、first parent は measured remote target。**dedicated integration worktree は
-  存在しない** (j#96406 F1)。
+  存在しない** (j#96406 F1)。**commit は action の純関数**であり、hook 非実行・無署名 (上節)。
+- **merge の失敗は typed status** (`content_conflict` / `primitive_unsupported` / `invalid_input` /
+  `merge_error` / `commit_error`)。**exit code だけで分類しない** — missing object は content conflict と
+  同じ rc=1 で返る (実測)。conflict は tree を名乗り、operational failure は名乗らない。
+  `primitive_unsupported` は **version probe でのみ**判定する (j#96412 F2)。
 - `already_integrated` / `patch_equivalent` は **push 前のみ** terminal。push 後は exact-SHA CI を完走。
 - **cleanup 側に破壊的操作は 1 つも無い**。ref delete も worktree remove も持たない (上節)。
   cleanup は git port を **read probe すら呼ばない**。

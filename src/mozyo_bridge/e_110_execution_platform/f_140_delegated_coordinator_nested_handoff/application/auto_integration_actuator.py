@@ -41,6 +41,13 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Protocol, Sequence, Tuple, runtime_checkable
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ports import (
+    MERGE_COMMIT_ERROR,
+    MERGE_CONTENT_CONFLICT,
+    MERGE_ERROR,
+    MERGE_INVALID_INPUT,
+    MERGE_MERGED,
+    MERGE_PRIMITIVE_UNSUPPORTED,
+    MERGE_STATUSES,
     AutoIntegrationGitOperations,
     CleanupAuthority,
     DurableAuthorityReader,
@@ -435,13 +442,19 @@ class AutoIntegrationUseCase:
                 # The parent the merge must sit on: the freshly measured remote target.
                 expected_target_head=preflight.observed_target_head,
             )
-            if result.conflicted:
+            if result.status != MERGE_MERGED:
+                # The typed status goes into the durable record verbatim (j#96412 finding 2).
+                # Every refusal used to arrive here as one boolean and leave as the phrase
+                # "merge conflict", so "this object does not exist" and "this git is too old"
+                # were both written down as the branches disagreeing. What blocks the run is
+                # the same for all of them; what the record SAYS is not.
+                known = result.status if result.status in MERGE_STATUSES else "unknown_status"
                 return StepOutcome(
                     action_key=decision.action_key,
                     step=step,
                     recorded_by=self.recorder_id,
                     outcome=OUTCOME_BLOCKED,
-                    detail=result.detail or "merge conflict; not auto-resolved",
+                    detail=f"{known}: {result.detail}".strip().rstrip(":"),
                 )
             if not is_full_sha(result.integration_head):
                 # A merge that reports success without naming the commit it created has not
@@ -692,6 +705,13 @@ __all__: Tuple[str, ...] = (
     "integration_policy_from_config",
     "PushResult",
     "MergeResult",
+    "MERGE_MERGED",
+    "MERGE_CONTENT_CONFLICT",
+    "MERGE_PRIMITIVE_UNSUPPORTED",
+    "MERGE_INVALID_INPUT",
+    "MERGE_ERROR",
+    "MERGE_COMMIT_ERROR",
+    "MERGE_STATUSES",
     "AutoIntegrationGitOperations",
     "ManagedProcessOperations",
     "DurableAuthorityReader",

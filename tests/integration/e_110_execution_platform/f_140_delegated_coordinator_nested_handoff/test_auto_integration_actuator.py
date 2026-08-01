@@ -51,6 +51,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DurableAuthorityReader,
     IntegrationAuthority,
     ManagedProcessOperations,
+    MERGE_CONTENT_CONFLICT,
+    MERGE_ERROR,
+    MERGE_MERGED,
+    MERGE_PRIMITIVE_UNSUPPORTED,
     MergeResult,
     PushResult,
     integration_policy_from_config,
@@ -133,7 +137,7 @@ class FakeGitOperations:
     tip: str = SOURCE
 
     merge_result: MergeResult = field(
-        default_factory=lambda: MergeResult(conflicted=False, integration_head=MERGE_HEAD)
+        default_factory=lambda: MergeResult(status=MERGE_MERGED, integration_head=MERGE_HEAD)
     )
     push_result: PushResult = field(default_factory=lambda: PushResult(accepted=True))
     calls: List[Tuple[str, dict]] = field(default_factory=list)
@@ -193,7 +197,8 @@ class FakeGitOperations:
             self.refuse_parent_other_than != expected_target_head
         ):
             return MergeResult(
-                conflicted=True, detail="the merge parent is not the measured remote target"
+                status=MERGE_ERROR,
+                detail="the merge parent is not the measured remote target",
             )
         return self.merge_result
 
@@ -579,13 +584,44 @@ class MergeCommitRunTest(unittest.TestCase):
 
     def test_a_conflict_stops_before_any_push(self) -> None:
         operations = FakeGitOperations(
-            merge_result=MergeResult(conflicted=True, detail="conflict in a.py")
+            merge_result=MergeResult(
+                status=MERGE_CONTENT_CONFLICT, detail="conflict in a.py"
+            )
         )
         report = _use_case(
             operations, integration_policy=self._policy()
         ).run_integration(_record())
         self.assertEqual(operations.performed, ["apply_merge"])
         self.assertEqual(report.outcomes[-1].outcome, OUTCOME_BLOCKED)
+
+    def test_every_merge_failure_reaches_the_record_as_its_own_status(self) -> None:
+        # R10 review j#96412 finding 2: every refusal arrived here as one boolean and left as
+        # the phrase "merge conflict", so "this object does not exist" and "this git is too
+        # old" were both written down as the branches disagreeing. The run blocks either way;
+        # what the durable record says must differ.
+        for status in (
+            MERGE_CONTENT_CONFLICT,
+            MERGE_PRIMITIVE_UNSUPPORTED,
+            MERGE_ERROR,
+        ):
+            operations = FakeGitOperations(
+                merge_result=MergeResult(status=status, detail="because")
+            )
+            report = _use_case(
+                operations, integration_policy=self._policy()
+            ).run_integration(_record())
+            self.assertEqual(operations.performed, ["apply_merge"], status)
+            outcome = report.outcomes[-1]
+            self.assertEqual(outcome.outcome, OUTCOME_BLOCKED, status)
+            self.assertIn(status, outcome.detail, status)
+        # ...and the one that is genuinely a conflict is not described as anything else.
+        conflicted = FakeGitOperations(
+            merge_result=MergeResult(status=MERGE_CONTENT_CONFLICT, detail="a.py")
+        )
+        report = _use_case(
+            conflicted, integration_policy=self._policy()
+        ).run_integration(_record())
+        self.assertNotIn(MERGE_ERROR, report.outcomes[-1].detail)
 
     def test_the_merge_names_no_checkout_for_anything_to_re_point(self) -> None:
         # R2 gated the dedicated checkout's identity so the lane's own could never be used.
@@ -676,7 +712,7 @@ class R3ReviewFinding3Test(unittest.TestCase):
         # R3 removed this fallback from the decision and left it in the layer that pushes.
         record = _record()
         operations = FakeGitOperations(
-            merge_result=MergeResult(conflicted=False, integration_head="")
+            merge_result=MergeResult(status=MERGE_MERGED, integration_head="")
         )
         report = _use_case(
             operations, integration_policy=self._policy()

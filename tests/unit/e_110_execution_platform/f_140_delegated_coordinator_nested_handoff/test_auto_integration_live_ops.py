@@ -8,8 +8,9 @@ and cannot construct is pinned here rather than left to inspection:
 - the push is a plain non-force push of an exact SHA to ``refs/heads/<branch>`` — no
   ``--force``, no ``--force-with-lease``, no ``+`` refspec;
 - the merge is built from objects (``merge-tree --write-tree`` + ``commit-tree``): no
-  checkout is switched, no ref moves, a conflict is reported rather than resolved, and an
-  unusable primitive is reported as something other than a conflict;
+  checkout is switched, no ref moves, the commit's identity and timestamps come from the
+  action rather than from the host and the clock, and every failure carries its own typed
+  status rather than one boolean;
 - the adapter has **no destructive operation at all** — no ref delete local or remote, and
   no worktree removal (reviews j#96344 / j#96396 / j#96401, each finding 1). None of the
   three could enforce its own condition in one invocation, so none exists to be called;
@@ -32,6 +33,12 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_actuator import (
+    MERGE_COMMIT_ERROR,
+    MERGE_CONTENT_CONFLICT,
+    MERGE_ERROR,
+    MERGE_INVALID_INPUT,
+    MERGE_MERGED,
+    MERGE_PRIMITIVE_UNSUPPORTED,
     AutoIntegrationGitOperations,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_live_ops import (
@@ -48,6 +55,7 @@ MERGE_HEAD = "d" * 40
 TARGET = "b" * 40
 OTHER_HEAD = "e" * 40
 TREE = "f" * 40
+DATE = "2026-08-01T12:00:00+09:00"
 
 
 class _Recorder:
@@ -55,17 +63,24 @@ class _Recorder:
 
     def __init__(self, results: List[subprocess.CompletedProcess]) -> None:
         self.results = list(results)
-        self.calls: List[Tuple[Tuple[str, ...], object]] = []
+        self.calls: List[Tuple[Tuple[str, ...], object, object]] = []
 
-    def __call__(self, *args: str, cwd: object = None) -> subprocess.CompletedProcess:
-        self.calls.append((args, cwd))
+    def __call__(
+        self, *args: str, cwd: object = None, env: object = None
+    ) -> subprocess.CompletedProcess:
+        self.calls.append((args, cwd, env))
         if self.results:
             return self.results.pop(0)
         return _ok("")
 
     @property
     def argvs(self) -> List[Tuple[str, ...]]:
-        return [args for args, _ in self.calls]
+        return [args for args, _, _ in self.calls]
+
+    @property
+    def envs(self) -> List[dict]:
+        """The environment overlays, so a test can pin what was made deterministic."""
+        return [env or {} for _, _, env in self.calls]
 
 
 def _ok(stdout: str = "") -> subprocess.CompletedProcess:
@@ -145,33 +160,64 @@ class PushTest(unittest.TestCase):
 
 
 class MergeTest(unittest.TestCase):
-    """The merge is objects only. Review j#96406 finding 1 is why there is no worktree here."""
+    """The merge is objects only, deterministic, and honest about how it failed."""
+
+    def _ok_version(self) -> subprocess.CompletedProcess:
+        return _ok("git version 2.50.1")
 
     def test_the_merge_writes_a_tree_and_commits_it_with_the_measured_parent(self) -> None:
-        recorder = _Recorder([_ok(TREE), _ok(MERGE_HEAD)])
+        recorder = _Recorder([self._ok_version(), _ok(TREE), _ok(DATE), _ok(MERGE_HEAD)])
         result = _adapter(recorder).apply_merge(
             source_head=SOURCE, target_ref="main", expected_target_head=TARGET
         )
+        self.assertEqual(result.status, MERGE_MERGED)
         self.assertFalse(result.conflicted)
         self.assertEqual(result.integration_head, MERGE_HEAD)
 
-        write_tree, commit = recorder.argvs
+        version, write_tree, date, commit = recorder.argvs
+        self.assertEqual(version, ("--version",))
         self.assertEqual(write_tree[:2], ("merge-tree", "--write-tree"))
         # The merge's inputs are object ids, in the order that makes the measured target the
         # first parent — not a branch name anything could re-point.
         self.assertEqual(write_tree[-2:], (TARGET, SOURCE))
+        self.assertEqual(date[:2], ("show", "-s"))
         self.assertEqual(commit[:2], ("commit-tree", TREE))
         self.assertEqual(commit.count("-p"), 2)
         self.assertEqual(commit[commit.index("-p") + 1], TARGET)
 
-    def test_nothing_runs_in_a_worktree_and_nothing_switches_or_moves_a_ref(self) -> None:
-        # The reproduction that retired the old form switched a foreign lane's checkout onto
-        # the target branch. Nothing here may switch, checkout, reset or update a ref.
-        recorder = _Recorder([_ok(TREE), _ok(MERGE_HEAD)])
+    def test_the_commit_takes_its_identity_from_the_action_not_the_host(self) -> None:
+        # R10 review j#96412 finding 1: the same action produced two SHAs a second apart,
+        # because `commit-tree` reads `user.name` and the clock — two inputs no action key
+        # covers. Both are pinned, and the timestamp comes from the SOURCE COMMIT, which is
+        # an object the action key already covers.
+        recorder = _Recorder([self._ok_version(), _ok(TREE), _ok(DATE), _ok(MERGE_HEAD)])
         _adapter(recorder).apply_merge(
             source_head=SOURCE, target_ref="main", expected_target_head=TARGET
         )
-        self.assertTrue(all(cwd is None for _, cwd in recorder.calls))
+        environment = recorder.envs[-1]
+        self.assertEqual(environment["GIT_AUTHOR_DATE"], DATE)
+        self.assertEqual(environment["GIT_COMMITTER_DATE"], DATE)
+        self.assertEqual(
+            environment["GIT_AUTHOR_NAME"], environment["GIT_COMMITTER_NAME"]
+        )
+        self.assertNotIn("@", environment["GIT_AUTHOR_NAME"])
+        self.assertIn("@", environment["GIT_AUTHOR_EMAIL"])
+
+    def test_an_unreadable_source_date_refuses_rather_than_using_the_clock(self) -> None:
+        recorder = _Recorder([self._ok_version(), _ok(TREE), _fail("no such object")])
+        result = _adapter(recorder).apply_merge(
+            source_head=SOURCE, target_ref="main", expected_target_head=TARGET
+        )
+        self.assertEqual(result.status, MERGE_ERROR)
+        self.assertIn("refusing to fall back to the clock", result.detail)
+        self.assertEqual(len(recorder.argvs), 3)  # it never reached commit-tree
+
+    def test_nothing_runs_in_a_worktree_and_nothing_switches_or_moves_a_ref(self) -> None:
+        recorder = _Recorder([self._ok_version(), _ok(TREE), _ok(DATE), _ok(MERGE_HEAD)])
+        _adapter(recorder).apply_merge(
+            source_head=SOURCE, target_ref="main", expected_target_head=TARGET
+        )
+        self.assertTrue(all(cwd is None for _, cwd, _ in recorder.calls))
         verbs = {argv[0] for argv in recorder.argvs}
         for forbidden in ("switch", "checkout", "merge", "reset", "update-ref", "branch"):
             self.assertNotIn(forbidden, verbs, forbidden)
@@ -183,50 +229,80 @@ class MergeTest(unittest.TestCase):
         ):
             recorder = _Recorder([])
             result = _adapter(recorder).apply_merge(target_ref="main", **kwargs)
-            self.assertTrue(result.conflicted)
+            self.assertEqual(result.status, MERGE_INVALID_INPUT, kwargs)
             self.assertEqual(recorder.argvs, [], kwargs)
 
-    def test_a_conflict_is_reported_and_never_resolved(self) -> None:
-        # `merge-tree` exits 1 for a real conflict and prints the conflicted paths.
-        recorder = _Recorder([_fail_rc(1, out=f"{TREE}\n100644 abc 1\ta.py\nCONFLICT (content)")])
+    def test_a_content_conflict_names_itself_and_commits_nothing(self) -> None:
+        # A real conflict exits 1 AND names the tree it produced.
+        recorder = _Recorder(
+            [
+                self._ok_version(),
+                _fail_rc(1, out=f"{TREE}\n100644 abc 1\ta.py\nCONFLICT (content)"),
+            ]
+        )
         result = _adapter(recorder).apply_merge(
             source_head=SOURCE, target_ref="main", expected_target_head=TARGET
         )
-        self.assertTrue(result.conflicted)
-        self.assertIn("merge conflicted", result.detail)
+        self.assertEqual(result.status, MERGE_CONTENT_CONFLICT)
+        self.assertTrue(result.is_content_conflict)
         self.assertEqual(result.integration_head, "")
-        # It never committed the conflicted tree, and used no strategy to make it go away.
-        self.assertEqual(len(recorder.argvs), 1)
+        self.assertEqual(len(recorder.argvs), 2)  # nothing was committed
         flat = " ".join(" ".join(argv) for argv in recorder.argvs)
         for forbidden in ("--strategy", "-X", "theirs", "ours", "rebase"):
             self.assertNotIn(forbidden, flat, forbidden)
 
-    def test_an_unusable_primitive_is_not_reported_as_a_conflict(self) -> None:
-        # `--write-tree` needs git >= 2.38. Both refuse, but a durable record that says
-        # "the branches conflict" when the truth is "this git cannot do it" is the class of
-        # lie j#96396 finding 2 was about.
-        recorder = _Recorder([_fail_rc(129, err="error: unknown option `write-tree'")])
+    def test_an_operational_failure_at_exit_1_is_not_called_a_conflict(self) -> None:
+        # MEASURED on real git: a missing object exits 1 exactly as a conflict does, and
+        # names no tree. R10 classified on the exit code alone and wrote "the branches
+        # conflict" into the durable record for an object that does not exist.
+        recorder = _Recorder(
+            [self._ok_version(), _fail_rc(1, err="merge-tree: 000... - not something we can merge")]
+        )
         result = _adapter(recorder).apply_merge(
             source_head=SOURCE, target_ref="main", expected_target_head=TARGET
         )
-        self.assertTrue(result.conflicted)
-        self.assertIn("unavailable", result.detail)
+        self.assertEqual(result.status, MERGE_ERROR)
+        self.assertFalse(result.is_content_conflict)
         self.assertIn("NOT a content conflict", result.detail)
+        self.assertIn("NOT proof that the primitive is unavailable", result.detail)
 
-    def test_a_merge_that_names_no_tree_is_not_committed(self) -> None:
-        recorder = _Recorder([_ok("")])
+    def test_unsupported_is_established_by_the_version_not_by_an_exit_code(self) -> None:
+        recorder = _Recorder([_ok("git version 2.37.9")])
         result = _adapter(recorder).apply_merge(
             source_head=SOURCE, target_ref="main", expected_target_head=TARGET
         )
-        self.assertTrue(result.conflicted)
+        self.assertEqual(result.status, MERGE_PRIMITIVE_UNSUPPORTED)
+        # It refused BEFORE attempting the merge, rather than running it and guessing from
+        # whatever came back (j#96412 finding 2: an unknown exit code is not evidence).
         self.assertEqual(len(recorder.argvs), 1)
 
-    def test_a_tree_that_cannot_be_committed_is_reported_as_failed(self) -> None:
-        recorder = _Recorder([_ok(TREE), _fail("could not write commit")])
+        for unreadable in (_fail("git: command not found"), _ok("garbage")):
+            recorder = _Recorder([unreadable])
+            self.assertEqual(
+                _adapter(recorder)
+                .apply_merge(
+                    source_head=SOURCE, target_ref="main", expected_target_head=TARGET
+                )
+                .status,
+                MERGE_PRIMITIVE_UNSUPPORTED,
+            )
+
+    def test_a_merge_that_names_no_tree_is_not_committed(self) -> None:
+        recorder = _Recorder([self._ok_version(), _ok("")])
         result = _adapter(recorder).apply_merge(
             source_head=SOURCE, target_ref="main", expected_target_head=TARGET
         )
-        self.assertTrue(result.conflicted)
+        self.assertEqual(result.status, MERGE_ERROR)
+        self.assertEqual(len(recorder.argvs), 2)
+
+    def test_a_tree_that_cannot_be_committed_says_so(self) -> None:
+        recorder = _Recorder(
+            [self._ok_version(), _ok(TREE), _ok(DATE), _fail("could not write commit")]
+        )
+        result = _adapter(recorder).apply_merge(
+            source_head=SOURCE, target_ref="main", expected_target_head=TARGET
+        )
+        self.assertEqual(result.status, MERGE_COMMIT_ERROR)
         self.assertEqual(result.integration_head, "")
 
 

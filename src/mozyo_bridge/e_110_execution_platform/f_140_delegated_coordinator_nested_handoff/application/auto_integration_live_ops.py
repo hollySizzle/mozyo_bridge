@@ -60,11 +60,18 @@ letting that escape a read-only preflight is how six production runs ended in tr
 
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_actuator import (
+    MERGE_COMMIT_ERROR,
+    MERGE_CONTENT_CONFLICT,
+    MERGE_ERROR,
+    MERGE_INVALID_INPUT,
+    MERGE_MERGED,
+    MERGE_PRIMITIVE_UNSUPPORTED,
     MergeResult,
     PushResult,
 )
@@ -77,6 +84,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 #: is visible; it is not operator-configurable here because the config schema deliberately
 #: has no key that could redirect a push.
 DEFAULT_REMOTE = "origin"
+
+#: The identity every actuator-built merge commit carries. A LITERAL, not the host's git
+#: configuration: review j#96412 finding 1 requires that the same action produce the same
+#: commit id, and an identity that varies by host or by `user.name` cannot do that. It also
+#: says plainly in `git log` that no human authored this commit.
+ACTUATOR_IDENTITY_NAME = "mozyo-bridge auto-integration"
+ACTUATOR_IDENTITY_EMAIL = "auto-integration@mozyo-bridge.invalid"
 
 _HEX_DIGITS = frozenset("0123456789abcdef")
 
@@ -133,13 +147,22 @@ class LiveAutoIntegrationGitOperations:
 
     # -- infrastructure ---------------------------------------------------
 
-    def _run(self, *args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    def _run(
+        self,
+        *args: str,
+        cwd: Path | None = None,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         """Run ``git`` in :attr:`repo_root` (or ``cwd``), mapping a spawn failure to a failure.
 
         ``subprocess.run(cwd=...)`` raises ``FileNotFoundError`` — not a non-zero exit — when
         ``cwd`` does not exist, and ``git`` missing from ``PATH`` raises the same ``OSError``
         family. Both are mapped onto a failed result so a read-only probe fails closed
         instead of raising out of a preflight (#14499).
+
+        ``env`` OVERLAYS the inherited environment rather than replacing it, so ``PATH`` and
+        the credential helpers keep working while the caller pins the few variables that would
+        otherwise make an operation non-deterministic (:meth:`apply_merge`).
         """
         try:
             return subprocess.run(
@@ -147,6 +170,7 @@ class LiveAutoIntegrationGitOperations:
                 cwd=cwd or self.repo_root,
                 text=True,
                 capture_output=True,
+                env={**os.environ, **env} if env else None,
             )
         except OSError as exc:
             return subprocess.CompletedProcess(
@@ -280,6 +304,37 @@ class LiveAutoIntegrationGitOperations:
 
     # -- mutations --------------------------------------------------------
 
+    def _merge_tree_supported(self) -> bool:
+        """Is ``merge-tree --write-tree`` available? Probed by version, never inferred.
+
+        Review j#96412 finding 2: an unrecognized exit code is not evidence that the
+        primitive is missing — ``merge-tree`` exits 1 for a missing object exactly as it does
+        for a content conflict (measured). So the capability question is asked directly, and
+        an unreadable or unparseable version reads as "not supported" rather than as "assume
+        it works".
+        """
+        result = self._run("--version")
+        if result.returncode != 0:
+            return False
+        for token in result.stdout.split():
+            parts = token.split(".")
+            if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+                continue
+            return (int(parts[0]), int(parts[1])) >= (2, 38)
+        return False
+
+    def _commit_date(self, commit: str) -> str:
+        """The committer date of ``commit``, in a form ``commit-tree`` accepts verbatim.
+
+        This is where the merge commit's timestamp comes from, and the choice is the whole
+        point of review j#96412 finding 1: the clock is not a function of the action, and a
+        commit built from the clock is a different object every time it is built. A commit's
+        own committer date IS a function of the action — the action key covers the source
+        head, and this value is part of that object.
+        """
+        result = self._run("show", "-s", "--format=%cI", "--end-of-options", commit)
+        return result.stdout.strip() if result.returncode == 0 else ""
+
     def apply_merge(
         self, *, source_head: str, target_ref: str, expected_target_head: str
     ) -> MergeResult:
@@ -294,27 +349,42 @@ class LiveAutoIntegrationGitOperations:
         form switched a *path* to the target branch and merged there, with that path's identity
         established by an earlier probe. Reproduced on real git: swapping a foreign lane's
         clean checkout onto that path between the probe and the merge switched the foreign
-        checkout off its own branch and built the merge commit on it, and it returned
-        ``conflicted=False``. A non-force push and an exact-SHA CI gate what *lands*; neither
-        undoes a checkout someone else was standing in. The three destructive operations this
-        issue withdrew had no alternative primitive; this one did.
+        checkout off its own branch and built the merge commit on it, and it reported success.
+        A non-force push and an exact-SHA CI gate what *lands*; neither undoes a checkout
+        someone else was standing in.
 
-        Failure modes are kept apart on purpose. ``merge-tree`` exits 1 for a real conflict and
-        prints the conflict information; any *other* non-zero exit is the primitive itself
-        being unusable (``--write-tree`` needs git >= 2.38), which must not be reported as
-        "the branches conflict". Both refuse, but they refuse with different reasons, and a
-        durable record that says "conflict" when the truth is "this git cannot do it" is the
-        class of lie j#96396 finding 2 was about.
+        **The commit is a function of the action.** R10 review j#96412 finding 1 measured the
+        same action producing two different SHAs a second apart, because ``commit-tree`` takes
+        its identity from the host's configuration and its timestamps from the clock — two
+        inputs no action key covers, and which I had overlooked when calling this operation
+        "object ids only". Both are pinned here: a fixed literal identity (so two hosts agree)
+        and the source commit's own committer date (so two runs agree). A replay after a crash
+        rebuilds the *same* object, which is what makes the ledger's idempotency real rather
+        than asserted.
+
+        Failure is a typed status, never a boolean. ``merge-tree`` exits 1 for a missing
+        object exactly as it does for a real conflict (measured), so the exit code alone
+        cannot classify: a conflict prints the merged tree's id first, an operational failure
+        prints none. "Unsupported" is a separate question, asked of the version.
         """
         if not _is_full_sha(expected_target_head) or not _is_full_sha(source_head):
             return MergeResult(
-                conflicted=True,
+                status=MERGE_INVALID_INPUT,
                 detail=(
                     "refusing to merge: both the source and the expected target must be full "
                     f"commit SHAs (source={source_head!r} target={expected_target_head!r})"
                 ),
             )
         branch = _checked_branch(target_ref)
+        if not self._merge_tree_supported():
+            return MergeResult(
+                status=MERGE_PRIMITIVE_UNSUPPORTED,
+                detail=(
+                    "`git merge-tree --write-tree` requires git >= 2.38; this workspace's git "
+                    "cannot build a merge without a checkout, and merging in one is not an "
+                    "available fallback (#13686 j#96406)"
+                ),
+            )
         merged = self._run(
             "merge-tree",
             "--write-tree",
@@ -322,28 +392,39 @@ class LiveAutoIntegrationGitOperations:
             expected_target_head,
             source_head,
         )
-        if merged.returncode == 1:
-            return MergeResult(
-                conflicted=True,
-                detail=(
-                    "merge conflicted; auto-resolution and auto-rebase are prohibited: "
-                    f"{merged.stdout.strip()[:400]}"
-                ),
-            )
+        first_line = merged.stdout.strip().splitlines()[0].strip() if merged.stdout.strip() else ""
+        tree = first_line if _is_full_sha(first_line) else ""
         if merged.returncode != 0:
+            # A conflict names the tree it produced; an operational failure names nothing.
+            if merged.returncode == 1 and tree:
+                return MergeResult(
+                    status=MERGE_CONTENT_CONFLICT,
+                    detail=(
+                        "the branches conflict in content; auto-resolution and auto-rebase "
+                        f"are prohibited: {merged.stdout.strip()[:400]}"
+                    ),
+                )
             return MergeResult(
-                conflicted=True,
+                status=MERGE_ERROR,
                 detail=(
-                    "the object-level merge primitive is unavailable (`git merge-tree "
-                    "--write-tree` needs git >= 2.38); this is NOT a content conflict: "
-                    f"{merged.stderr.strip()[:200]}"
+                    f"the object-level merge failed (exit {merged.returncode}) without "
+                    "producing a tree; this is NOT a content conflict and NOT proof that the "
+                    f"primitive is unavailable: {merged.stderr.strip()[:300]}"
                 ),
             )
-        tree = merged.stdout.strip().splitlines()[0].strip() if merged.stdout.strip() else ""
-        if not _is_full_sha(tree):
+        if not tree:
             return MergeResult(
-                conflicted=True,
+                status=MERGE_ERROR,
                 detail="the merge reported success but named no tree; refusing to commit it",
+            )
+        source_date = self._commit_date(source_head)
+        if not source_date:
+            return MergeResult(
+                status=MERGE_ERROR,
+                detail=(
+                    f"could not read {source_head}'s committer date, which the merge commit's "
+                    "timestamps are derived from; refusing to fall back to the clock"
+                ),
             )
         committed = self._run(
             "commit-tree",
@@ -354,22 +435,32 @@ class LiveAutoIntegrationGitOperations:
             source_head,
             "-m",
             f"Merge {source_head} into {branch}",
+            env={
+                "GIT_AUTHOR_NAME": ACTUATOR_IDENTITY_NAME,
+                "GIT_AUTHOR_EMAIL": ACTUATOR_IDENTITY_EMAIL,
+                "GIT_AUTHOR_DATE": source_date,
+                "GIT_COMMITTER_NAME": ACTUATOR_IDENTITY_NAME,
+                "GIT_COMMITTER_EMAIL": ACTUATOR_IDENTITY_EMAIL,
+                "GIT_COMMITTER_DATE": source_date,
+            },
         )
         integration_head = committed.stdout.strip() if committed.returncode == 0 else ""
         if not _is_full_sha(integration_head):
             return MergeResult(
-                conflicted=True,
+                status=MERGE_COMMIT_ERROR,
                 detail=(
                     "the merged tree could not be committed: "
                     f"{committed.stderr.strip()[:200]}"
                 ),
             )
         return MergeResult(
-            conflicted=False,
+            status=MERGE_MERGED,
             integration_head=integration_head,
             detail=(
                 f"merged {source_head} onto {expected_target_head} as objects "
-                f"(first parent is the measured target; no worktree, index or ref touched)"
+                "(first parent is the measured target; no worktree, index or ref touched; "
+                "identity and timestamps derived from the action, so a replay rebuilds the "
+                "same commit)"
             ),
         )
 
