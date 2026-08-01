@@ -67,7 +67,6 @@ preflight は「失敗 gate を見つけて blocked になる」か「後続 sta
 | `already_integrated` | target ancestry (source head が target から到達可能) | なし |
 | `patch_equivalent` | **明示的な patch-id evidence** | なし |
 | `not_applicable` | 非 Git workspace | なし (process retire は別途走る) |
-| `coordinator_confirmation_required` | `mode: coordinator_confirmed` で確認未取得 | なし |
 | `disabled` | `mode: disabled` (既定) | なし |
 | `integration_blocked` | いずれかの gate 不成立 | なし |
 
@@ -115,7 +114,6 @@ integration:
   - non_fast_forward                    # ff-only 時
   - merge_conflict                      # merge commit disposition 時
   - integration_worktree_inadmissible   # 専用 worktree が未登録 / dirty / lane 自身 (R2)
-  - coordinator_confirmation_inadmissible  # 別 action / 非 coordinator / anchor 欠落 (R2)
   - push_rejected
   - push_outcome_head_missing           # push done なのに着地 head が無い。fallback しない (R3)
   - push_head_mismatch                  # 記録された head が disposition の着地 head でない (R3)
@@ -172,7 +170,7 @@ R1 は 4 つの入力を bare bool / bare string で受けており、review が
 | R1 | R2 | 何が言えていなかったか |
 | --- | --- | --- |
 | `integration_ci_green: bool` | `IntegrationCiEvidence` | どの run の・どの required check が・どの commit について green か。無関係な green run が gate を満たしていた |
-| `coordinator_confirmed: bool` | `CoordinatorConfirmation` | 誰が・どの action を・どこに記録して承認したか |
+| `coordinator_confirmed: bool` | (R4 で mode ごと撤回) | 誰が・どの action を・どこに記録して承認したか |
 | `integration_worktree: str` | `IntegrationWorktree` | それが lane 自身の checkout でないこと (j#77124 が禁じる操作を actuator 自身が実行し得た) |
 | `policy.integration_branch` (未参照) | decision が exact-match を要求 | 設定した branch が実際に統合先を制約すること |
 | `source_ci_green: bool` (R2 まで残存) | `IntegrationCiEvidence` | 同上。sibling gate に同じ穴が残っていた (R3) |
@@ -239,7 +237,7 @@ CI は actuator が actuate しない。統合 SHA の CI は非同期 gate で�
 
 ```yaml
 auto_integration:
-  mode: disabled            # auto | coordinator_confirmed | disabled (既定 disabled)
+  mode: disabled            # auto | disabled (既定 disabled)
   integration_branch: null  # 未設定は runtime 解決。設定時は action の target と exact 一致必須
   ff_only: true             # 既定 (j#96335)
   remove_worktree: true

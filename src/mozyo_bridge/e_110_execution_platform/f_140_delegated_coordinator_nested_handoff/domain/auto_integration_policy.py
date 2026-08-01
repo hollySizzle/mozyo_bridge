@@ -709,6 +709,7 @@ def decide_integration(
         if disposition == DISPOSITION_MERGE_COMMIT
         else (STEP_PUSH,),
         recorded_by=trusted_recorder,
+        known_steps=INTEGRATION_STEPS,
     )
     if integrity:
         # Distinct problems keep distinct tokens: "the steps are out of order" and "a step

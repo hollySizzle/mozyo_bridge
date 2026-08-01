@@ -43,6 +43,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     AutoIntegrationGitOperations,
     AutoIntegrationUseCase,
     CleanupAuthority,
+    InMemoryLedgerStore,
+    LedgerStore,
     DurableAuthorityReader,
     IntegrationAuthority,
     ManagedProcessOperations,
@@ -93,7 +95,8 @@ LANE_WORKTREE = "/lane"
 LANE_BRANCH = "lane_br"
 DEDICATED = "/dedicated"
 #: What the use case stamps on the outcomes it records (and therefore trusts on resume).
-RECORDER = f"actuator:{LANE_WORKTREE}|{LANE_BRANCH}"
+#: The receipt is per-instance and unguessable, so tests seed a ledger by driving
+#: the actuator rather than by authoring entries (which is the point of the fix).
 
 #: The read-only probes. Calling one is not a side effect, so the zero-side-effect assertions
 #: look at mutations only.
@@ -101,6 +104,7 @@ _READ_PROBES = (
     "describe_integration_worktree",
     "is_git_workspace",
     "resolve_head",
+    "remote_branch_tip",
     "is_ancestor",
     "worktree_dirty",
     "commit_on_remote",
@@ -114,7 +118,11 @@ class FakeGitOperations:
     """A recording :class:`AutoIntegrationGitOperations` with configurable measurements."""
 
     git_workspace: bool = True
+    #: What the REMOTE says the target is (the gate's authority).
     target_head: str = TARGET
+    #: What this clone's LOCAL ref says — deliberately separable, so a test can make them
+    #: disagree the way a target another clone advanced does (j#96379 finding 4).
+    local_head: str = TARGET
     #: ``is_ancestor`` answers by (ancestor, descendant) pair; the default says "no ancestry",
     #: so neither ``already_integrated`` nor a fast-forward is true unless configured.
     ancestors: Tuple[Tuple[str, str], ...] = ()
@@ -140,6 +148,10 @@ class FakeGitOperations:
 
     def resolve_head(self, ref: str) -> str:
         self.calls.append(("resolve_head", {"ref": ref}))
+        return self.local_head
+
+    def remote_branch_tip(self, branch: str) -> str:
+        self.calls.append(("remote_branch_tip", {"branch": branch}))
         return self.target_head
 
     def is_ancestor(self, *, ancestor: str, descendant: str) -> bool:
@@ -386,6 +398,29 @@ class ZeroSideEffectTest(unittest.TestCase):
         self.assertEqual(operations.performed, [])
 
 
+class R4ReviewFinding4Test(unittest.TestCase):
+    """The target gate reads the REMOTE tip, not this clone's local ref."""
+
+    def test_a_target_another_clone_advanced_is_seen_as_drift(self) -> None:
+        # R4 review j#96379 finding 4: `_measure` used a local `git rev-parse` while a fresh
+        # `ls-remote` probe sat unused on the same adapter, so a target another clone had
+        # moved still read as its old SHA. Local disagrees with remote here; the gate must
+        # follow the remote.
+        operations = FakeGitOperations(
+            ancestors=_ff_ancestors(),
+            local_head=TARGET,          # this clone's stale opinion
+            target_head=OTHER,          # what the remote actually has
+        )
+        report = _use_case(operations).run_integration(_record())
+        self.assertEqual(report.final_decision.state, STATE_INTEGRATION_BLOCKED)
+        self.assertEqual(operations.performed, [])
+
+    def test_the_gate_asks_the_remote_probe(self) -> None:
+        operations = FakeGitOperations(ancestors=_ff_ancestors())
+        _use_case(operations).run_integration(_record())
+        self.assertTrue(operations.args_for("remote_branch_tip"))
+
+
 class R3ReviewFinding1Test(unittest.TestCase):
     """The actuator measures the whole preflight; an unreadable world refuses."""
 
@@ -456,28 +491,27 @@ class FastForwardRunTest(unittest.TestCase):
         )
 
     def test_a_green_exact_sha_ci_completes_a_RESUMED_run(self) -> None:
-        # CI on a commit that was pushed moments ago cannot already be settled, so a fresh
-        # run always rests at `awaiting_ci`. The actuator reads the verdict on the next run,
-        # once its own ledger names the head that landed — which is the asynchronous gate
-        # working as designed rather than a single command assuming a run finished.
+        # CI on a commit pushed moments ago cannot already be settled, so a fresh run rests
+        # at `awaiting_ci`. The SAME actuator resumes from its own ledger and completes.
         record = _record()
-        operations = FakeGitOperations(ancestors=_ff_ancestors())
-        fresh = _use_case(operations).run_integration(record)
+        use_case = _use_case(FakeGitOperations(ancestors=_ff_ancestors()))
+        fresh = use_case.run_integration(record)
         self.assertEqual(fresh.final_decision.state, STATE_AWAITING_CI)
+        self.assertEqual(use_case.run_integration(record).final_decision.state,
+                         STATE_INTEGRATED)
 
-        resumed = _use_case(FakeGitOperations(ancestors=_ff_ancestors())).run_integration(
-            record,
-            ledger=[
-                StepOutcome(
-                    record.action_key,
-                    STEP_PUSH,
-                    OUTCOME_DONE,
-                    head=SOURCE,
-                    recorded_by=RECORDER,
-                )
-            ],
+    def test_a_different_actuator_instance_cannot_resume_this_one_s_work(self) -> None:
+        # The receipt is per-instance, so a second actuator sharing the same store does not
+        # count the first one's entries: it starts over rather than trusting them.
+        record = _record()
+        store = InMemoryLedgerStore()
+        _use_case(FakeGitOperations(ancestors=_ff_ancestors()), ledger=store).run_integration(
+            record
         )
-        self.assertEqual(resumed.final_decision.state, STATE_INTEGRATED)
+        self.assertTrue(store.entries)
+        operations = FakeGitOperations(ancestors=_ff_ancestors())
+        _use_case(operations, ledger=store).run_integration(record)
+        self.assertIn("push_non_force", operations.performed)
 
     def test_a_rejected_push_stops_the_run_and_never_escalates(self) -> None:
         operations = FakeGitOperations(
@@ -488,12 +522,19 @@ class FastForwardRunTest(unittest.TestCase):
         self.assertEqual(operations.performed, ["push_non_force"])
         self.assertEqual(report.outcomes[-1].outcome, OUTCOME_BLOCKED)
 
-    def test_recorded_outcomes_carry_this_actuator_s_provenance(self) -> None:
+    def test_recorded_outcomes_carry_this_actuator_s_unguessable_receipt(self) -> None:
+        # R4 review j#96379 finding 1: the receipt used to be derived from public constructor
+        # values, so a caller could reproduce it. It is per-instance and unguessable now.
         operations = FakeGitOperations(ancestors=_ff_ancestors())
-        report = _use_case(operations).run_integration(_record())
+        use_case = _use_case(operations)
+        report = use_case.run_integration(_record())
         self.assertTrue(report.outcomes)
         for outcome in report.outcomes:
-            self.assertEqual(outcome.recorded_by, RECORDER)
+            self.assertEqual(outcome.recorded_by, use_case.recorder_id)
+        # Two actuators built identically do not share a receipt.
+        self.assertNotEqual(
+            use_case.recorder_id, _use_case(FakeGitOperations()).recorder_id
+        )
 
 
 class MergeCommitRunTest(unittest.TestCase):
@@ -540,25 +581,21 @@ class MergeCommitRunTest(unittest.TestCase):
         self.assertEqual(operations.performed, [])
         self.assertEqual(report.final_decision.state, STATE_INTEGRATION_BLOCKED)
 
-    def test_a_resumed_merge_pushes_the_recorded_merge_commit(self) -> None:
+    def test_a_resumed_merge_pushes_the_commit_its_own_apply_produced(self) -> None:
+        # Run 1 applies and its push is rejected; run 2 resumes from the actuator's own
+        # ledger and must use the merge commit recorded there, never the source head.
         record = _record()
-        operations = FakeGitOperations()
-        ledger = [
-            StepOutcome(
-                record.action_key,
-                STEP_INTEGRATION_APPLY,
-                OUTCOME_DONE,
-                head=MERGE_HEAD,
-                recorded_by=RECORDER,
-            )
-        ]
-        _use_case(operations, integration_policy=self._policy()).run_integration(
-            record, ledger=ledger
+        operations = FakeGitOperations(
+            push_result=PushResult(accepted=False, rejected=True)
         )
-        self.assertEqual(operations.performed, ["push_non_force"])
-        self.assertEqual(
-            operations.args_for("push_non_force")[0]["source_head"], MERGE_HEAD
-        )
+        use_case = _use_case(operations, integration_policy=self._policy())
+        use_case.run_integration(record)
+        self.assertEqual(operations.performed, ["apply_merge", "push_non_force"])
+
+        operations.push_result = PushResult(accepted=True)
+        use_case.run_integration(record)
+        for pushed in operations.args_for("push_non_force"):
+            self.assertEqual(pushed["source_head"], MERGE_HEAD)
 
 
 class R3ReviewFinding3Test(unittest.TestCase):
@@ -569,43 +606,49 @@ class R3ReviewFinding3Test(unittest.TestCase):
             mode=MODE_AUTO, integration_branch="main", ff_only=False
         )
 
-    def test_a_push_recorded_before_any_apply_mutates_nothing(self) -> None:
-        # R3 review j#96368 finding 3's reproduction: the run applied a merge and then
-        # reported `integrated` having pushed nothing.
+    def test_a_caller_can_no_longer_author_a_ledger_at_all(self) -> None:
+        # R4 review j#96379 finding 1: the run took the ledger as an argument. It reads its
+        # own store now, so there is no parameter to forge.
+        for name in ("run_integration", "run_cleanup"):
+            parameters = set(
+                inspect.signature(getattr(AutoIntegrationUseCase, name)).parameters
+            )
+            self.assertNotIn("ledger", parameters, name)
+
+    def test_an_out_of_order_store_is_refused_before_any_mutation(self) -> None:
+        # A tampered store, not a caller argument: a push recorded before any apply. R3's
+        # reproduction applied the merge and then reported `integrated` having pushed nothing.
         record = _record()
+        store = InMemoryLedgerStore()
         operations = FakeGitOperations()
-        report = _use_case(
-            operations, integration_policy=self._policy()
-        ).run_integration(
-            record,
-            ledger=[
-                StepOutcome(
-                    record.action_key,
-                    STEP_PUSH,
-                    OUTCOME_DONE,
-                    head=MERGE_HEAD,
-                    recorded_by=RECORDER,
-                )
-            ],
+        use_case = _use_case(operations, integration_policy=self._policy(), ledger=store)
+        store.append(
+            StepOutcome(
+                record.action_key,
+                STEP_PUSH,
+                OUTCOME_DONE,
+                head=MERGE_HEAD,
+                recorded_by=use_case.recorder_id,
+            )
         )
+        report = use_case.run_integration(record)
         self.assertEqual(operations.performed, [])
         self.assertEqual(report.final_decision.state, STATE_INTEGRATION_BLOCKED)
 
-    def test_a_foreign_provenance_ledger_is_not_believed(self) -> None:
+    def test_a_foreign_provenance_entry_in_the_store_is_not_believed(self) -> None:
         record = _record()
-        operations = FakeGitOperations(ancestors=_ff_ancestors())
-        _use_case(operations).run_integration(
-            record,
-            ledger=[
-                StepOutcome(
-                    record.action_key,
-                    STEP_PUSH,
-                    OUTCOME_DONE,
-                    head=SOURCE,
-                    recorded_by="somebody-else",
-                )
-            ],
+        store = InMemoryLedgerStore()
+        store.append(
+            StepOutcome(
+                record.action_key,
+                STEP_PUSH,
+                OUTCOME_DONE,
+                head=SOURCE,
+                recorded_by="somebody-else",
+            )
         )
+        operations = FakeGitOperations(ancestors=_ff_ancestors())
+        _use_case(operations, ledger=store).run_integration(record)
         # The claimed push does not count, so this run performs the push itself.
         self.assertEqual(operations.performed, ["push_non_force"])
 
@@ -646,22 +689,17 @@ class R3ReviewFinding2Test(unittest.TestCase):
         # The R3 reproduction: caller booleans alone removed a foreign lane's worktree and
         # deleted its branch. The actuator now answers "is this ours?" from its own identity.
         operations = self._ops()
-        report = _use_case(operations, processes=FakeProcessOperations()).run_cleanup(
-            self._record(
+        report = _use_case(operations, processes=FakeProcessOperations()).run_cleanup(self._record(
                 branch="foreign_lane_branch",
                 worktree_path="/foreign/registered/worktree",
-            ),
-            target_ref="main",
-        )
+            ))
         self.assertEqual(report.final_decision.state, STATE_CLEANUP_BLOCKED)
         self.assertEqual(operations.performed, [])
 
     def test_our_own_lane_runs_the_three_steps_in_order(self) -> None:
         operations = self._ops()
         processes = FakeProcessOperations()
-        report = _use_case(operations, processes=processes).run_cleanup(
-            self._record(), target_ref="main"
-        )
+        report = _use_case(operations, processes=processes).run_cleanup(self._record())
         self.assertEqual(report.final_decision.state, STATE_RETIRED)
         self.assertEqual(operations.performed, ["remove_worktree", "delete_local_branch"])
         self.assertEqual(
@@ -675,25 +713,19 @@ class R3ReviewFinding2Test(unittest.TestCase):
 
     def test_a_dirty_lane_worktree_deletes_nothing(self) -> None:
         operations = self._ops(lane_clean=False)
-        report = _use_case(operations, processes=FakeProcessOperations()).run_cleanup(
-            self._record(), target_ref="main"
-        )
+        report = _use_case(operations, processes=FakeProcessOperations()).run_cleanup(self._record())
         self.assertEqual(report.final_decision.state, STATE_CLEANUP_BLOCKED)
         self.assertEqual(operations.performed, [])
 
     def test_a_branch_still_checked_out_is_not_deleted(self) -> None:
         operations = self._ops(checked_out_elsewhere=True)
-        report = _use_case(operations, processes=FakeProcessOperations()).run_cleanup(
-            self._record(), target_ref="main"
-        )
+        report = _use_case(operations, processes=FakeProcessOperations()).run_cleanup(self._record())
         self.assertEqual(operations.performed, ["remove_worktree"])
         self.assertEqual(report.final_decision.state, STATE_CLEANUP_BLOCKED)
 
     def test_a_branch_not_reachable_from_the_target_is_not_deleted(self) -> None:
         operations = self._ops(ancestors=())  # no ancestry -> not integrated
-        report = _use_case(operations, processes=FakeProcessOperations()).run_cleanup(
-            self._record(), target_ref="main"
-        )
+        report = _use_case(operations, processes=FakeProcessOperations()).run_cleanup(self._record())
         self.assertEqual(operations.performed, ["remove_worktree"])
         self.assertEqual(report.final_decision.state, STATE_CLEANUP_BLOCKED)
 
@@ -701,19 +733,47 @@ class R3ReviewFinding2Test(unittest.TestCase):
         operations = self._ops()
         report = _use_case(
             operations, processes=FakeProcessOperations(), authority=None
-        ).run_cleanup(self._record(), target_ref="main")
+        ).run_cleanup(self._record())
         self.assertEqual(report.final_decision.state, STATE_CLEANUP_BLOCKED)
         self.assertEqual(operations.performed, [])
 
     def test_a_non_git_lane_releases_the_process_and_touches_no_git(self) -> None:
         operations = self._ops(git_workspace=False)
         processes = FakeProcessOperations()
-        report = _use_case(operations, processes=processes).run_cleanup(
-            self._record(), target_ref="main"
-        )
+        report = _use_case(operations, processes=processes).run_cleanup(self._record())
         self.assertEqual(report.final_decision.state, STATE_RETIRED)
         self.assertEqual(operations.performed, [])
         self.assertEqual(len(processes.calls), 1)
+
+    def test_the_reachability_target_is_not_a_caller_argument(self) -> None:
+        # R4 review j#96379 finding 2: `target_ref` was a caller argument, so passing the
+        # lane's OWN branch made reachability trivially true and the destructive steps ran on
+        # unintegrated work. It comes from the configured integration branch now.
+        for name in ("run_cleanup",):
+            parameters = set(
+                inspect.signature(getattr(AutoIntegrationUseCase, name)).parameters
+            )
+            self.assertNotIn("target_ref", parameters, name)
+
+    def test_no_configured_target_means_reachability_is_never_established(self) -> None:
+        operations = self._ops()
+        report = _use_case(
+            operations,
+            processes=FakeProcessOperations(),
+            integration_policy=AutoIntegrationPolicy(mode=MODE_AUTO, integration_branch=None),
+        ).run_cleanup(self._record())
+        self.assertEqual(operations.performed, ["remove_worktree"])
+        self.assertEqual(report.final_decision.state, STATE_CLEANUP_BLOCKED)
+
+    def test_a_worktree_holding_a_foreign_branch_is_never_cleaned_up(self) -> None:
+        # R4 finding 2's second reproduction: the probe reported `checked_out_branch` and the
+        # gate ignored it, so a registered worktree holding somebody else's branch was removed.
+        operations = self._ops(lane_branch_checked_out="SOME_FOREIGN_BRANCH")
+        report = _use_case(operations, processes=FakeProcessOperations()).run_cleanup(
+            self._record()
+        )
+        self.assertEqual(operations.performed, [])
+        self.assertEqual(report.final_decision.state, STATE_CLEANUP_BLOCKED)
 
     def test_the_port_cannot_delete_a_remote_ref_at_all(self) -> None:
         self.assertFalse(hasattr(FakeGitOperations(), "delete_remote_branch"))

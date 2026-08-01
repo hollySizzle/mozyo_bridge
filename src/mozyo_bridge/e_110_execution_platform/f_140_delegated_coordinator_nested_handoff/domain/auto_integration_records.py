@@ -102,13 +102,32 @@ class StepOutcome:
     head: str = ""
 
     def as_payload(self) -> dict[str, object]:
+        """The durable serialization — provenance included.
+
+        R4 review j#96379 finding 1: this dropped ``recorded_by``, so a round trip through
+        the durable record silently laundered a foreign entry into an unattributed one. A
+        serialization that loses the field the trust decision reads is worse than none.
+        """
         return {
             "action_key": self.action_key,
             "step": self.step,
             "outcome": self.outcome,
             "detail": self.detail,
             "head": self.head,
+            "recorded_by": self.recorded_by,
         }
+
+    @classmethod
+    def from_payload(cls, payload: "dict[str, object]") -> "StepOutcome":
+        """Parse a serialized outcome, keeping every field the trust decision reads."""
+        return cls(
+            action_key=str(payload.get("action_key", "")),
+            step=str(payload.get("step", "")),
+            outcome=str(payload.get("outcome", "")),
+            detail=str(payload.get("detail", "")),
+            head=str(payload.get("head", "")),
+            recorded_by=str(payload.get("recorded_by", "")),
+        )
 
 
 def completed_steps(
@@ -140,6 +159,12 @@ def completed_steps(
 LEDGER_ORDER_VIOLATION = "ledger_step_order_violation"
 #: A ``done`` step that must name the commit it produced does not.
 LEDGER_MISSING_HEAD = "ledger_step_head_missing"
+#: The same step is recorded ``done`` more than once for one action. Two records of one
+#: event cannot both be the event, and "later wins" would let an appended entry overwrite
+#: what actually ran (R4 review j#96379 finding 1).
+LEDGER_DUPLICATE_STEP = "ledger_duplicate_step"
+#: A ``done`` entry names a step this machine does not have.
+LEDGER_UNKNOWN_STEP = "ledger_unknown_step"
 
 
 def ledger_integrity_errors(
@@ -149,6 +174,7 @@ def ledger_integrity_errors(
     required_order: Tuple[str, ...],
     head_bearing_steps: Tuple[str, ...] = (),
     recorded_by: str = "",
+    known_steps: Tuple[str, ...] = (),
 ) -> Tuple[str, ...]:
     """The reasons this ledger cannot be believed (empty iff it can).
 
@@ -170,6 +196,15 @@ def ledger_integrity_errors(
         and (not recorded_by or entry.recorded_by == recorded_by)
     ]
     problems: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if entry.step in seen:
+            problems.append(LEDGER_DUPLICATE_STEP)
+            break
+        seen.add(entry.step)
+    permitted = set(known_steps or required_order)
+    if any(entry.step not in permitted for entry in entries):
+        problems.append(LEDGER_UNKNOWN_STEP)
     positions = {entry.step: index for index, entry in enumerate(entries)}
     ranked = [step for step in required_order if step in positions]
     for earlier, later in zip(ranked, ranked[1:]):
@@ -511,6 +546,8 @@ __all__ = (
     "ledger_integrity_errors",
     "LEDGER_ORDER_VIOLATION",
     "LEDGER_MISSING_HEAD",
+    "LEDGER_DUPLICATE_STEP",
+    "LEDGER_UNKNOWN_STEP",
     "IntegrationActionRecord",
     "build_integration_action_record",
     "CI_CONCLUSION_SUCCESS",

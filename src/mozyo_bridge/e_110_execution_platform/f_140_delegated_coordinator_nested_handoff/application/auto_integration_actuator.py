@@ -34,6 +34,7 @@ a single synchronous command never assumes either.
 from __future__ import annotations
 
 import dataclasses
+import uuid
 from dataclasses import dataclass, field
 from typing import List, Optional, Protocol, Sequence, Tuple, runtime_checkable
 
@@ -176,7 +177,17 @@ class AutoIntegrationGitOperations(Protocol):
         ...
 
     def resolve_head(self, ref: str) -> str:
-        """The full commit SHA ``ref`` resolves to (read-only, fail-closed)."""
+        """The full commit SHA a LOCAL ``ref`` resolves to (read-only, fail-closed)."""
+        ...
+
+    def remote_branch_tip(self, branch: str) -> str:
+        """The shared remote's CURRENT tip for ``branch``, read fresh (``""`` on failure).
+
+        The target gate's authority. R4 review j#96379 finding 4: the gate used
+        :meth:`resolve_head`, a local ``git rev-parse``, while this fresh ``ls-remote`` probe
+        already existed on the same adapter and went unused — so a target another clone had
+        advanced still read as its old SHA and the drift was invisible.
+        """
         ...
 
     def is_ancestor(self, *, ancestor: str, descendant: str) -> bool:
@@ -252,6 +263,45 @@ class CleanupAuthority:
     integration_ci_settled_green: bool = False
     callbacks_drained: bool = False
     owner_gates_resolved: bool = False
+
+
+@runtime_checkable
+class LedgerStore(Protocol):
+    """The actuator's own record of what it has done, read and appended by the actuator.
+
+    R4 review j#96379 finding 1: the ledger arrived as a caller-supplied sequence and the
+    provenance stamped on entries was derived from public constructor values, so a caller
+    could author entries indistinguishable from the actuator's own — claiming a push that
+    never happened, or slipping a foreign apply head into the commit the push would use.
+    Handing the caller the ledger is the same mistake as handing it the preflight.
+
+    An implementation MUST persist and return whole :class:`StepOutcome` records including
+    ``recorded_by`` (:meth:`StepOutcome.as_payload` carries it), and MUST NOT accept entries
+    from anywhere but :meth:`append`.
+    """
+
+    def read(self, *, action_key: str) -> Sequence[StepOutcome]: ...
+
+    def append(self, outcome: StepOutcome) -> None: ...
+
+
+@dataclass
+class InMemoryLedgerStore:
+    """A process-local :class:`LedgerStore` — the default when no durable store is bound.
+
+    Its lifetime is one actuator instance, so a resume across processes finds nothing and the
+    run starts over rather than trusting a ledger it cannot attribute. That is the fail-closed
+    reading: an unrecoverable ledger means "nothing is known to have run", never "what the
+    caller says ran".
+    """
+
+    entries: List[StepOutcome] = field(default_factory=list)
+
+    def read(self, *, action_key: str) -> Sequence[StepOutcome]:
+        return [entry for entry in self.entries if entry.action_key == action_key]
+
+    def append(self, outcome: StepOutcome) -> None:
+        self.entries.append(outcome)
 
 
 @runtime_checkable
@@ -351,18 +401,21 @@ class CleanupRunReport:
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
+@dataclass
 class AutoIntegrationUseCase:
     """Runs the #13686 integration and cleanup machines against the injected ports.
 
-    **The actuator measures its own safety facts.** Two of the preflight's fields are not
-    read from the caller at all: the dedicated integration worktree and the coordinator
-    confirmation. R1 typed them and R2 review j#96350 (findings 3 and 4) showed that typing
-    changed nothing while the *caller* still supplied the values — a record naming the lane's
-    own worktree with ``is_lane_worktree=False``, or a confirmation naming an anchor that does
-    not exist, both passed. Whoever measures a safety fact is its authority, so
-    :meth:`run_integration` overwrites both from its own ports before deciding. A caller
-    supplies only pointers: which path, and which anchor.
+    **The actuator measures its own safety facts, and owns its own ledger.** There is no
+    caller preflight and no caller ledger: a caller supplies an action record — identity —
+    and nothing else. Every fact that gates a mutation is read at action time from a port
+    (git probes, the durable authority reader) or from this actuator's own configuration,
+    and every completed step is read back from a :class:`LedgerStore` this instance owns.
+
+    Four review rounds arrived at that. j#96344 said a boolean cannot be audited; j#96350
+    said typing it changes nothing while the caller still supplies the value; j#96368 said
+    measuring two facts does not move the authority while the rest are supplied; j#96379 said
+    the same of the ledger, and that a provenance derived from public constructor values is
+    reproducible by the caller. The receipt is now an unguessable per-instance token.
 
     ``lane_worktree`` is this actuator's own lane checkout and
     ``integration_worktree_path`` the dedicated one — constructor state rather than per-call
@@ -376,27 +429,27 @@ class AutoIntegrationUseCase:
     )
     processes: Optional[ManagedProcessOperations] = None
     authority: Optional[DurableAuthorityReader] = None
+    ledger: LedgerStore = field(default_factory=InMemoryLedgerStore)
     lane_worktree: str = ""
     lane_branch: str = ""
     integration_worktree_path: str = ""
 
+    #: The writer receipt this actuator stamps on the steps it records. R4 review j#96379
+    #: finding 1: R4 derived it from ``lane_worktree`` / ``lane_branch``, which are public
+    #: constructor values, so a caller could reproduce it exactly. It is now an unguessable
+    #: per-instance token, generated once and never taken from an argument — a caller cannot
+    #: author an entry this actuator will count.
+    _receipt: str = field(default_factory=lambda: f"receipt:{uuid.uuid4().hex}", init=False)
+
     @property
     def recorder_id(self) -> str:
-        """This actuator's ledger provenance — what it stamps on the steps it records.
-
-        R3 review j#96368 finding 3: without it, any caller-authored ledger entry counted as
-        a completed step. Derived from the actuator's own lane identity so two lanes cannot
-        claim each other's work.
-        """
-        return f"actuator:{self.lane_worktree}|{self.lane_branch}"
+        """This actuator's ledger provenance — what it stamps on the steps it records."""
+        return self._receipt
 
     # -- integration ------------------------------------------------------
 
     def run_integration(
-        self,
-        record: IntegrationActionRecord,
-        *,
-        ledger: Sequence[StepOutcome] = (),
+        self, record: IntegrationActionRecord
     ) -> IntegrationRunReport:
         """Drive the integration machine until it rests, performing each decided step.
 
@@ -413,20 +466,24 @@ class AutoIntegrationUseCase:
         belongs.
         """
         report = IntegrationRunReport()
-        working_ledger: List[StepOutcome] = list(ledger)
+        # The ledger comes from this actuator's own store, never from an argument.
+        working_ledger: List[StepOutcome] = list(
+            self.ledger.read(action_key=record.action_key)
+        )
         preflight = self._measure(record, report, ledger=working_ledger)
         # A resumed run has no in-memory memory of the commit a previous run's apply
         # produced, but the ledger recorded it. Without this the push after a resumed apply
         # would push the SOURCE head instead of the merge commit — silently integrating a
         # different commit than the one the apply created.
-        for entry in working_ledger:
-            if (
-                entry.action_key == record.action_key
-                and entry.step == STEP_INTEGRATION_APPLY
-                and entry.outcome == OUTCOME_DONE
-                and entry.head
-            ):
-                report.integration_head = entry.head
+        # R4 review j#96379 finding 1: this restoration ignored `recorded_by`, so a foreign
+        # apply entry's head became the commit the push would use — the decision's provenance
+        # fence did not protect the MUTATION INPUT. Both now read the same validated view.
+        trusted = completed_steps(
+            working_ledger, action_key=record.action_key, recorded_by=self.recorder_id
+        )
+        applied = trusted.get(STEP_INTEGRATION_APPLY)
+        if applied is not None and is_full_sha(applied.head):
+            report.integration_head = applied.head
 
         while True:
             decision = decide_integration(
@@ -445,6 +502,7 @@ class AutoIntegrationUseCase:
                 decision, record, report, preflight=preflight
             )
             report.outcomes.append(outcome)
+            self.ledger.append(outcome)
             working_ledger.append(outcome)
             if outcome.outcome != OUTCOME_DONE:
                 # A refused or unsettled step stops the run here. Re-deciding would only
@@ -483,7 +541,9 @@ class AutoIntegrationUseCase:
         if not ops.is_git_workspace():
             return IntegrationPreflight(is_git_workspace=False)
 
-        observed_target = ops.resolve_head(record.target_ref)
+        # The target's head is the REMOTE's, read fresh. A local ref is this clone's stale
+        # opinion of a branch other clones also push to (j#96379 finding 4).
+        observed_target = ops.remote_branch_tip(record.target_ref)
         lane = ops.describe_integration_worktree(
             path=self.lane_worktree, lane_worktree=self.lane_worktree
         )
@@ -678,9 +738,7 @@ class AutoIntegrationUseCase:
 
     # -- cleanup ----------------------------------------------------------
 
-    def _measure_cleanup(
-        self, record: CleanupActionRecord, *, target_ref: str
-    ) -> CleanupPreflight:
+    def _measure_cleanup(self, record: CleanupActionRecord) -> CleanupPreflight:
         """Build the ENTIRE cleanup preflight from this actuator's own measurements.
 
         R3 review j#96368 finding 2 is the reason this exists, and it was the heaviest finding
@@ -711,13 +769,25 @@ class AutoIntegrationUseCase:
                 owner_gates_resolved=authority.owner_gates_resolved,
             )
 
-        # Is this lane's own? Measured against the actuator's identity, both ways.
+        # R4 review j#96379 finding 2: the reachability target used to be a caller argument,
+        # so passing the lane's OWN branch made "is this integrated?" trivially true and the
+        # destructive steps ran on unintegrated work. It comes from the configured integration
+        # branch now — the same value the integration side is bound to — and an actuator with
+        # no configured target cannot establish reachability at all.
+        configured_target = self.integration_policy.integration_branch
+        lane = ops.describe_integration_worktree(
+            path=record.worktree_path, lane_worktree=self.lane_worktree
+        )
+        # "Ours" is three facts, not one string comparison: the record must name this
+        # actuator's own lane, AND the checkout must actually be that worktree, AND it must
+        # currently hold this actuator's branch. R4 gated on the string pair alone and
+        # measured `checked_out_branch` without using it, so a registered worktree holding a
+        # foreign branch was removed.
         is_ours = (
             record.worktree_path == self.lane_worktree
             and record.branch == self.lane_branch
-        )
-        lane = ops.describe_integration_worktree(
-            path=record.worktree_path, lane_worktree=self.lane_worktree
+            and lane.is_lane_worktree
+            and lane.checked_out_branch == self.lane_branch
         )
         tip = ops.branch_tip(record.branch)
         authority = (
@@ -738,30 +808,30 @@ class AutoIntegrationUseCase:
             worktree_path_registered=lane.registered,
             branch_checked_out_elsewhere=ops.branch_checked_out_elsewhere(record.branch),
             unpushed_unique_commits=not ops.commit_on_remote(tip, branch=record.branch),
-            branch_reachable_from_target=ops.is_ancestor(
-                ancestor=tip, descendant=ops.resolve_head(target_ref)
+            branch_reachable_from_target=(
+                bool(configured_target)
+                and ops.is_ancestor(
+                    ancestor=tip, descendant=ops.remote_branch_tip(configured_target)
+                )
             ),
             # Patch equivalence needs explicit evidence; no probe establishes it.
             branch_patch_equivalent=False,
             branch_tip=tip,
         )
 
-    def run_cleanup(
-        self,
-        record: CleanupActionRecord,
-        *,
-        target_ref: str,
-        ledger: Sequence[StepOutcome] = (),
-    ) -> CleanupRunReport:
+    def run_cleanup(self, record: CleanupActionRecord) -> CleanupRunReport:
         """Drive the post-close cleanup machine until it rests, performing each decided step.
 
-        As with :meth:`run_integration` there is no caller preflight: ``target_ref`` is the
-        integration branch the lane's work must be reachable from, and everything else is
-        measured (:meth:`_measure_cleanup`).
+        As with :meth:`run_integration` there is no caller preflight and no caller ledger.
+        The branch the lane's work must be reachable from is the CONFIGURED integration
+        branch, not an argument (j#96379 finding 2); everything else is measured
+        (:meth:`_measure_cleanup`).
         """
         report = CleanupRunReport()
-        working_ledger: List[StepOutcome] = list(ledger)
-        preflight = self._measure_cleanup(record, target_ref=target_ref)
+        working_ledger: List[StepOutcome] = list(
+            self.ledger.read(action_key=record.action_key)
+        )
+        preflight = self._measure_cleanup(record)
         report.measured_preflight = preflight
 
         while True:
@@ -779,6 +849,7 @@ class AutoIntegrationUseCase:
 
             outcome = self._perform_cleanup_step(decision, record)
             report.outcomes.append(outcome)
+            self.ledger.append(outcome)
             working_ledger.append(outcome)
             if outcome.recorded_by != self.recorder_id:
                 # Unreachable by construction, and asserted rather than assumed: an outcome
@@ -872,6 +943,8 @@ __all__: Tuple[str, ...] = (
     "AutoIntegrationGitOperations",
     "ManagedProcessOperations",
     "DurableAuthorityReader",
+    "LedgerStore",
+    "InMemoryLedgerStore",
     "IntegrationAuthority",
     "CleanupAuthority",
     "IntegrationRunReport",

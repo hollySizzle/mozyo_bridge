@@ -415,6 +415,7 @@ def decide_cleanup(
         action_key=action_key,
         required_order=CLEANUP_STEPS,
         recorded_by=trusted_recorder,
+        known_steps=CLEANUP_STEPS,
     )
     if integrity:
         ordered = _order_reasons((BLOCKED_LEDGER_UNTRUSTWORTHY,))
