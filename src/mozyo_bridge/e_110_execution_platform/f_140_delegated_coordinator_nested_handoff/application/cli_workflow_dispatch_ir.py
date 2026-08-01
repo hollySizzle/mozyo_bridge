@@ -106,7 +106,15 @@ def cmd_workflow_dispatch_ir(args: argparse.Namespace) -> int:
     body = _dispatch_body(args)
 
     if not getattr(args, "execute", False):
-        note = render_dispatch_note(body, lane=lane, lane_generation=generation)
+        # The dry-run reaches the marker producer directly, so it owns the producer's refusal too
+        # (#14717). A `--generation abc` must print the same fail-closed reason `--execute` reports
+        # rather than a traceback: the preview's whole purpose is to show the operator the body
+        # `--execute` would post, and "there is no such body" is part of that answer.
+        try:
+            note = render_dispatch_note(body, lane=lane, lane_generation=generation)
+        except ValueError as exc:
+            print(f"mozyo-bridge workflow dispatch-ir: {exc}", file=sys.stderr)
+            return 2
         print("dispatch-ir (dry-run: no Redmine write, no handoff send). Marker-bearing IR journal body:")
         print(note)
         print(

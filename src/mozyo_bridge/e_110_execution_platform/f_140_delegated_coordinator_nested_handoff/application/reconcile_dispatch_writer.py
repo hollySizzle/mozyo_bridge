@@ -35,6 +35,7 @@ from typing import Callable, Iterable, Optional
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
     RedmineJournalEntry,
     dispatch_entry_journals,
+    render_dispatch_marker,
     render_dispatch_note,
 )
 
@@ -246,6 +247,21 @@ def dispatch_implementation_request(
     problems = validate_dispatch_route(route, vocab)
     if problems:
         return _result(DISPATCH_INPUT_INVALID, detail=f"invalid_route:{','.join(problems)}")
+
+    # #14717: the marker producer now REFUSES a lane / generation it cannot render, so this
+    # boundary has to own that refusal as a typed result. Without it, the hardening would have
+    # turned a fail-closed status into a traceback out of a function whose whole contract is that
+    # every outcome is an ``IrDispatchResult`` — the same failure form #14694 R6 self-detected,
+    # where a CLI's typed refusal became an exception once the producer below it got strict.
+    # It is asked HERE, before the pre-read, because a request that can never be written must not
+    # reach the provider at all. ``ValueError`` rather than ``MarkerValueError`` alone: the lane
+    # half is judged by ``require_marker_token``, whose refusal is a plain ``ValueError``, and the
+    # generation half by ``require_canonical_generation``, whose ``MarkerValueError`` is one. The
+    # call is a pure renderer, so a ``ValueError`` out of it is a producer refusal and nothing else.
+    try:
+        render_dispatch_marker(lane_s, gen_s)
+    except ValueError:
+        return _result(DISPATCH_INPUT_INVALID, detail="invalid_marker")
 
     # R7-F3: pre-read idempotency — never write a duplicate marker.
     try:

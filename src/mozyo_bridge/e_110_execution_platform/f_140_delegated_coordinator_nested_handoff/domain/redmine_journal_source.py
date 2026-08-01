@@ -50,7 +50,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (  # noqa: E501
     MARKER_VALUE_FORBIDDEN_CHARS,
     MarkerValueError,
+    is_canonical_positive_decimal,
     is_exact_str,
+    require_canonical_generation,
     review_anchor_fields,
     review_marker_fields,
     validate_marker_field_value,
@@ -58,6 +60,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_envelope import (  # noqa: E501
     LaneEvidenceEnvelope,
     render_lane_envelope,
+    require_marker_token,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_event_intake import (
     JournalMarker,
@@ -432,9 +435,42 @@ def render_dispatch_marker(lane: str, lane_generation: object) -> str:
     can resolve the exact dispatch anchor from the owning entry's journal id (Design Answer
     j#79507 Q2). A separate closed vocabulary from :func:`render_workflow_event_marker` (which is
     for callback gate kinds); this token names ``implementation_request`` and carries no gate.
+
+    Both fields are validated RAW, before anything is rendered, by the same authorities the
+    envelope's ``lane`` / ``lane_generation`` already use (Redmine #14717). This was the last
+    renderer of those two fields still doing ``str(x or "").strip()``, and every reading of that
+    line was measured on the unfixed head:
+
+    - ``lane=' r1 '`` and ``lane_generation=' 7 '`` were trimmed into clean canonical tokens, so
+      the durable anchor named something the caller had not written and nothing said so;
+    - ``lane=None`` / ``False`` / ``0`` rendered ``lane=``, and an arbitrary object whose
+      ``__str__`` said ``r1`` rendered ``lane=r1`` — a wrong TYPE arriving as a plausible VALUE;
+    - ``lane_generation`` of ``0``, ``-5``, ``1.5``, ``True``, ``abc`` and ``٣`` all rendered, each
+      one a generation the central `### Hibernate Evidence Marker Contract` refuses;
+    - ``lane_generation='1]junk'`` closed the marker early, so the note read back as a CLEAN
+      canonical dispatch for generation ``1`` — the anchor a reconciler then resolves is not the
+      round the caller asked to dispatch;
+    - worst, ``lane`` carrying ``]`` and a newline made :func:`render_dispatch_note` emit a note
+      whose SECOND line was a forged ``[mozyo:workflow-event:gate=implementation_done…]``, which
+      :func:`extract_markers_from_note` read as a gate-bearing marker. A producer documented to
+      carry NO gate could write a callback-required gate into a durable Redmine journal — the raw
+      value did not merely reach the record, it widened what the record was allowed to say.
+
+    ``lane`` is judged by :func:`...hibernate_evidence_envelope.require_marker_token` — the SAME
+    authority :func:`...hibernate_evidence_envelope.render_lane_envelope` applies to the SAME
+    envelope field, so the lane a dispatch names and the lane an evidence marker names cannot mean
+    two different things. Deliberately not the stricter
+    :func:`...marker_value_contract.validate_marker_field_value` (which the proxy-decision producer
+    uses): that also refuses ``=``, and the body scanner partitions each component on its FIRST
+    ``=``, so ``lane=a=b`` round-trips today. Refusing it would be a narrowing of what a legitimate
+    lane id may be, smuggled in by a change whose purpose is the separator set the central contract
+    actually enumerates — ``:`` ``]`` ``[`` and 空白.
+
+    Raises ``ValueError`` (``MarkerValueError`` for the generation half) rather than emitting the
+    marker; both boundaries that reach this producer own that refusal as a typed result.
     """
-    lane_s = str(lane or "").strip()
-    gen_s = str(lane_generation if lane_generation is not None else "").strip()
+    lane_s = require_marker_token(lane, field="lane", requirement="dispatch marker")
+    gen_s = require_canonical_generation(lane_generation, what="dispatch marker")
     return (
         f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:"
         f"kind={DISPATCH_KIND_IMPLEMENTATION_REQUEST}:lane={lane_s}:lane_generation={gen_s}]"
@@ -498,6 +534,16 @@ def dispatch_generations(entries: "Iterable[RedmineJournalEntry]", *, lane: str)
     since opened. This scans the same durable dispatch markers WITHOUT fixing a generation, so a
     caller can compare the round it is sweeping against the newest round on the record. A
     non-numeric / blank generation is skipped (never guessed).
+
+    "Numeric" is the producer's rule, not ``int()``'s (Redmine #14717, closing the consumer half of
+    the same field this module's producer was hardened on). This asked ``int(raw)`` directly, so
+    the round authority disagreed with the renderer in both directions: ``lane_generation=٣`` — a
+    decimal digit to Python and to no source system — was read as round ``3``, and ``01`` as round
+    ``1``, while a value wide enough to trip CPython's int-from-str cap was silently dropped by the
+    ``ValueError`` arm rather than judged. :func:`...marker_value_contract.is_canonical_positive_decimal`
+    is the predicate the producer now writes against and the one ``parse_lane_envelope`` already
+    reads with, so a generation means one thing on both sides of the record (review j#94247 found
+    exactly this shape left on the parser after the producer was fixed).
     """
     lane_s = str(lane or "").strip()
     if not lane_s:
@@ -510,10 +556,10 @@ def dispatch_generations(entries: "Iterable[RedmineJournalEntry]", *, lane: str)
             if str(fields.get("lane", "")).strip() != lane_s:
                 continue
             raw = str(fields.get("lane_generation", "")).strip()
-            try:
-                found.add(int(raw))
-            except (TypeError, ValueError):
+            if not is_canonical_positive_decimal(raw):
                 continue
+            # Guarded above, so this cannot raise: the token is ASCII decimal and bounded.
+            found.add(int(raw))
     return tuple(sorted(found))
 
 

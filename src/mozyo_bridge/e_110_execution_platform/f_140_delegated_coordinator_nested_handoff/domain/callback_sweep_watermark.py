@@ -54,6 +54,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     strict_gate_markers,
     strict_marker_fields_in_note,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_envelope import (  # noqa: E501
+    require_marker_token,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (  # noqa: E501
+    require_canonical_generation,
+    require_vocabulary,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_callback import (
     CALLBACK_ABSENT,
     STATE_NO_PROGRESS_AFTER_HANDOFF,
@@ -443,20 +450,18 @@ def render_progress_marker(kind: str, *, lane: str, lane_generation: object) -> 
     ``kind`` must be a :data:`PROGRESS_BEARING_KINDS` member; a callback-required gate uses
     ``render_gate_note`` instead (it owes a callback, which this token deliberately does not
     signal).
+
+    Every field is validated RAW (Redmine #14717). "Mirroring ``render_dispatch_marker``" above was
+    literal: this carried the same ``str(value or "").strip()`` on the same two envelope fields, so
+    the round scoping the docstring calls load-bearing was only as exact as a trimmed argument.
+    ``lane`` and ``lane_generation`` therefore go through the authorities every other renderer of
+    those fields uses, and ``kind`` through :func:`...marker_value_contract.require_vocabulary` —
+    membership on ``str(kind)`` could only speak for the string it had just built, so an object
+    whose ``__str__`` said ``progress_log`` passed the vocabulary (#14694 review j#93882 finding 1).
     """
-    kind_s = str(kind).strip()
-    if kind_s not in PROGRESS_BEARING_KINDS:
-        raise ValueError(
-            f"render_progress_marker kind must be one of {sorted(PROGRESS_BEARING_KINDS)}, "
-            f"got {kind!r} (a callback-required gate uses render_gate_note)"
-        )
-    lane_s = str(lane or "").strip()
-    gen_s = str(lane_generation if lane_generation is not None else "").strip()
-    if not (lane_s and gen_s):
-        raise ValueError(
-            "render_progress_marker requires a lane and lane_generation: an unscoped progress "
-            "marker cannot be attributed to a dispatch round (Redmine #13889 review F3)"
-        )
+    kind_s = require_vocabulary(kind, field="kind", vocabulary=PROGRESS_BEARING_KINDS)
+    lane_s = require_marker_token(lane, field="lane", requirement="progress marker")
+    gen_s = require_canonical_generation(lane_generation, what="progress marker")
     return (
         f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:"
         f"kind={kind_s}:lane={lane_s}:lane_generation={gen_s}]"
@@ -487,16 +492,22 @@ def render_sweep_record_marker(
     ``outcome`` is in the key because a round's verdict legitimately changes (``stall_unprovable``
     -> ``progress_without_callback`` once a gate lands): each distinct resolution is recorded once,
     while a repeated pass at the same resolution recovers rather than spams.
+
+    Every field is validated RAW (Redmine #14717), for the reason this marker exists: it is the KEY
+    the sweep recognizes its own prior record by. A key normalized on the way in is not the key the
+    caller asked about, so "recognize rather than duplicate" silently became "recognize whatever
+    the trim produced". The whole function is swept, not only the two envelope fields — leaving the
+    siblings on the old idiom is how ``req`` was hardened while the ``lane_generation`` beside it
+    was not (#14694 review j#94038 blocker 1). ``dispatch_anchor`` / ``outcome`` take the raw token
+    rules rather than a shape of their own: refusing what the grammar cannot round-trip is the
+    claim being made here, and narrowing them further is not.
     """
-    lane_s = str(lane or "").strip()
-    gen_s = str(lane_generation if lane_generation is not None else "").strip()
-    anchor_s = str(dispatch_anchor or "").strip()
-    outcome_s = str(outcome or "").strip()
-    if not (lane_s and gen_s and anchor_s and outcome_s):
-        raise ValueError(
-            "render_sweep_record_marker requires lane, lane_generation, dispatch_anchor and "
-            "outcome: an unkeyed sweep record cannot be recovered or pointed at"
-        )
+    lane_s = require_marker_token(lane, field="lane", requirement="sweep record marker")
+    gen_s = require_canonical_generation(lane_generation, what="sweep record marker")
+    anchor_s = require_marker_token(
+        dispatch_anchor, field="anchor", requirement="sweep record marker"
+    )
+    outcome_s = require_marker_token(outcome, field="outcome", requirement="sweep record marker")
     return (
         f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:kind={SWEEP_RECORD_KIND}:"
         f"lane={lane_s}:lane_generation={gen_s}:anchor={anchor_s}:outcome={outcome_s}]"

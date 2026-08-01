@@ -72,8 +72,38 @@ def validate_marker_field_value(field: str, value: object, *, what: str = "marke
     value is how a producer ends up emitting something its caller did not ask for; the boundary's
     job is to refuse it and say so. Callers that genuinely hold untrimmed input must trim it
     themselves, deliberately, before they claim the value is what they mean.
+
+    The RAW TYPE is judged before anything is rendered (Redmine #14717). The check used to be
+    ``str(value if value is not None else "")``, which answered the contract's question about a
+    STRING THIS FUNCTION HAD JUST INVENTED rather than about the caller's value: an arbitrary
+    object whose ``__str__`` returned ``'r1'`` passed every rule below and wrote ``lane=r1``,
+    ``False`` wrote ``lane=False``, and ``None`` was reported as "empty" — a value error for what
+    is a type error. Measured on the unfixed contract, all three.
+
+    ``str`` and ``int`` are the two admitted types, and the ``int`` is deliberate rather than
+    incidental: the recovery-admission producer passes ``lane_generation=1`` as an ``int`` and that
+    conversion is load-bearing for it (Redmine #14667 review j#93162, which is why a blanket
+    string-only rule was refused HERE and kept local to the proxy-decision producer). Bounding the
+    conversion to the one type a caller actually holds keeps that caller working while ending the
+    open-ended coercion: an ``int``'s decimal spelling is a value the caller can read back out of
+    the marker, an arbitrary object's ``__str__`` is not. ``bool`` is not an ``int`` for this
+    purpose (:func:`is_exact_int`) — ``lane=False`` is a wrong type arriving as a plausible value.
+
+    A caller that legitimately holds something else converts it ITSELF, deliberately, for the same
+    reason it must trim deliberately: the conversion is then something the caller asserted rather
+    than something the boundary did on its behalf.
     """
-    text = str(value if value is not None else "")
+    if is_exact_str(value):
+        text = value
+    elif is_exact_int(value):
+        # The value the caller passed, in the one spelling that reads back as that value.
+        text = str(value)
+    else:
+        raise MarkerValueError(
+            f"{what} field {field!r} must be a builtin str or int, got "
+            f"{type(value).__name__} {value!r}. Rendering a non-string through ``str()`` writes a "
+            "RENDERING of the caller's object, which is not the value the caller passed"
+        )
     if not text:
         raise MarkerValueError(
             f"{what} field {field!r} is empty; a blank field names nothing and the strict "
@@ -170,6 +200,42 @@ def is_canonical_positive_decimal(value: object) -> bool:
     if len(value) != len(_MAX_CANONICAL_DECIMAL):
         return within_marker_decimal_width(value)
     return value <= _MAX_CANONICAL_DECIMAL
+
+
+def require_canonical_generation(
+    value: object, *, field: str = "lane_generation", what: str = "marker"
+) -> str:
+    """A lane generation's canonical decimal token, judged RAW, or raise (pure).
+
+    The producer-side answer to "what may a ``lane_generation`` field be", for the renderers whose
+    caller may hold EITHER type. :func:`...hibernate_evidence_envelope.render_lane_envelope` takes
+    the generation off a typed dataclass and can require an ``int`` outright; the dispatch marker's
+    callers cannot — ``workflow dispatch-ir`` gets ``--generation`` off argv as a ``str`` and the
+    reconciler passes a ``str``, while the in-repo callers pass an ``int``. Both types therefore
+    reach one renderer, and this is the single place that says what each of them may be.
+
+    It is the two established predicates and no third rule: :func:`is_canonical_positive_int` for
+    the ``int``, :func:`is_canonical_positive_decimal` for the ``str``. They were written as one
+    shape reached through two types precisely so a field carrying both cannot end up with two
+    contracts (Redmine #14694 review j#94038 blocker 1, where ``req`` was hardened and the
+    ``lane_generation`` beside it was left on ``isdigit()`` + ``int()``).
+
+    Redmine #14717: the dispatch producer had NO generation rule at all — ``str(value).strip()``
+    rendered ``lane_generation=0``, ``-5``, ``1.5``, ``True``, ``abc`` and ``٣`` (measured), every
+    one of them a token the central `### Hibernate Evidence Marker Contract` calls a producer error:
+    "非正 generation ... は、書き込み時点で producer error として拒否する".
+    """
+    if is_canonical_positive_int(value):
+        # An exact ``int``'s decimal spelling IS the canonical token: no sign, no leading zero, and
+        # bounded above by the predicate, so nothing here can widen what was judged.
+        return str(value)
+    if is_canonical_positive_decimal(value):
+        return value  # the value ITSELF, never a rendering of it (review j#93882 finding 1)
+    raise MarkerValueError(
+        f"{what} field {field!r} must be a canonical positive decimal generation no wider than "
+        f"{MAX_CANONICAL_DECIMAL_VALUE}, as a builtin str or int, got {type(value).__name__} "
+        f"{value!r}"
+    )
 
 
 def is_journal_id(value: object) -> bool:
