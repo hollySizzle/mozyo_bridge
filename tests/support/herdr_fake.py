@@ -208,6 +208,8 @@ class FakeHerdr:
         self.read_text = read_text
         #: Every driven argv tail (after the binary), in order — the routing tape.
         self.calls: list = []
+        #: Set once ``server stop`` retires the server this fake stands in for.
+        self.server_stopped = False
         # --- one-shot fail-closed injection state (design §2.1 stimuli) ---------
         self._misplace_next: Optional[str] = None
         self._drop_next_locator = False
@@ -376,6 +378,8 @@ class FakeHerdr:
             return self._cmd_pane_close(argv, rest)
         if head in (["pane", "send-text"], ["pane", "send-keys"]):
             return self._cmd_pane_send(argv, rest)
+        if head == ["server", "stop"]:
+            return self._cmd_server_stop(argv)
         raise UnknownHerdrCommandError(f"unmodelled herdr call: {list(argv)!r}")
 
     # -- PopenFactory (subprocess.Popen shape) for the wait rail --------------
@@ -418,6 +422,22 @@ class FakeHerdr:
                 }
             },
         )
+
+    def _cmd_server_stop(self, argv):
+        """``server stop`` — the disposable minter retiring the server it owns.
+
+        Modelled for Redmine #14658 R12: the instrumented oracle has to observe every
+        admitted pair through the real gate, and this one was the single command the fake
+        could not answer, so the minter's teardown raised instead of being recorded.
+
+        It is deliberately NOT a client call.  ``server stop`` is minter-only cleanup
+        authority over a server this process started (ruling j#93525), and the fake keeps
+        that distinction by refusing to serve anything afterwards — a stopped server is
+        stopped, so a later call is a defect the oracle must be able to see rather than a
+        silently successful one.
+        """
+        self.server_stopped = True
+        return _ok(argv, {"result": {"type": "server_stop", "stopped": True}})
 
     def _cmd_workspace_list(self, argv):
         # H (Redmine #14139): the live workspace label authority. Each live workspace
