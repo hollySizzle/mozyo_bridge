@@ -3,9 +3,9 @@
 The **retirement half** of the #13686 actuator, deliberately a separate machine from
 :mod:`...domain.auto_integration_policy` (design consultation answer j#77124, 必須訂正1).
 Integration ends at ``integrated``; the issue then closes; and only after that does this
-machine run — releasing the managed process and removing the worktree. Folding the two
-together is what inverted the real order in the #12604 use case, so they never share a
-state and this one never merges, pushes, or integrates.
+machine run — releasing the managed process. Folding the two together is what inverted the
+real order in the #12604 use case, so they never share a state and this one never merges,
+pushes, or integrates.
 
 Each stage is its own recorded outcome (the acceptance's "段階別 outcome"): a step that ran,
 a step that does not apply, and a step that was refused are three different facts, and the
@@ -16,36 +16,45 @@ outright (:data:`~...domain.auto_integration_records.BLOCKED_ACTION_KEY_MISMATCH
 than being silently ignored, because a destructive step must not inherit some other
 action's authorization.
 
-The safety rules are the ones j#77124 必須訂正2 fixed, and they are not config-reachable:
+**This machine performs no Git operation at all.** Three were shipped and all three were
+withdrawn across R7-R9, and the reason is one rule rather than three coincidences:
 
-- ``git worktree remove`` runs only against a **clean** worktree at the **exact registered
-  path**, and never with ``--force``. An unclean or unregistered path is refused, not forced.
-- **This machine deletes no ref at all** — not a remote one and not a local one
-  (:data:`REF_DELETING_STEPS` is empty, and that is asserted rather than described). Both
-  deletes were shipped and both were removed for the same reason, which is worth stating
-  once because it is the rule and not two coincidences: an operation whose safety condition
-  cannot be enforced by the operation itself is not offered.
+    an operation whose safety condition cannot be enforced by the operation itself
+    is not offered.
 
-  R1's remote delete bypassed every local condition (disabling the local delete skipped the
-  CAS checks and then deleted the remote ref anyway) and had no compare-and-swap against the
-  remote tip; a real CAS on a remote ref needs ``--force-with-lease``, a force, prohibited by
-  j#96335 (review j#96344 finding 1).
+- The **remote branch delete** (R1, retired by review j#96344 finding 1) bypassed every local
+  condition and had no compare-and-swap against the remote tip; a real CAS on a remote ref
+  needs ``--force-with-lease``, a force, prohibited by j#96335.
+- The **local branch delete** (retired by review j#96396 finding 1) needed two conditions at
+  once — the tip is still the recorded one, and no worktree holds the branch — and no git
+  primitive enforces both in one invocation (measured on git 2.50.1): ``update-ref -d`` CASes
+  the tip but deletes a branch a worktree is standing on; ``branch -D`` refuses the held
+  branch atomically but takes no tip constraint; ``update-ref --stdin`` rejects ``verify`` +
+  ``delete`` on one ref. The two-invocation form was reproduced destroying a commit that
+  landed in the window, while the step recorded ``done``.
+- The **worktree removal** (retired by review j#96401 finding 1) measured the checkout's lane
+  identity with one command and removed it by *path* with another. Reproduced: swapping a
+  foreign lane's clean checkout onto that path between the two removed the foreign checkout
+  and recorded ``done``. ``git worktree remove`` takes no expected-identity argument, the
+  admin entry name is reused after such a swap so it is not instance identity, and while
+  ``git worktree lock`` does pin the path→entry binding against every git-level takeover,
+  **no mutation can run while it is held** — ``remove`` and ``move`` both refuse a locked
+  worktree and want ``-f -f`` — so the unlock that must precede the removal reopens the
+  window. All measured; see the real-git tests.
 
-  The local delete needed two conditions at once — the ref tip still equals the recorded
-  source head, and no worktree holds the branch — and **no git primitive enforces both in
-  one invocation** (measured on git 2.50.1): ``update-ref -d <ref> <tip>`` compare-and-swaps
-  the tip but deletes a branch a worktree is standing on, leaving that worktree's ``HEAD``
-  unresolvable; ``branch -D`` refuses the held branch atomically but accepts no tip
-  constraint; ``update-ref --stdin`` rejects ``verify`` + ``delete`` on one ref outright
-  (``multiple updates for ref ... not allowed``). R7 split it into a verification followed by
-  a delete, and review j#96396 finding 1 reproduced the window: a commit that landed between
-  the two invocations was deleted with the branch and left reachable from no ref, while the
-  step recorded ``done``. Deleting the lane branch remains an **operator** step in the
-  ``preflight_sublane_retire`` runbook (``git branch -d``, which refuses unmerged work).
-- A foreign worktree / ref, an unconfirmed integration, an unsettled CI, or an owed callback
-  stops every subsequent destructive step at a safe interruption point.
-- In a **non-Git** workspace the worktree step is an explicit ``not_applicable`` and the
-  process retire still runs on its own.
+What survives is the one step whose primitive takes the identity as its argument rather than
+resolving it from a mutable name: ``release_process(issue, lane_generation)``. That is the
+distinction, and it is worth stating plainly — a path and a ref name are late-bound, and
+anything that binds them earlier than the mutation is a check, not a guarantee.
+
+Removing the lane's worktree and branch remains an **operator** step in the
+``preflight_sublane_retire`` runbook, where ``git worktree remove`` and ``git branch -d``
+run with a human deciding.
+
+The gates are unchanged and none of them is config-reachable: an unclosed issue, an
+unconfirmed integration, an unsettled CI, an owed callback, an unresolved owner gate, or a
+record that does not name this actuator's own lane stops the run at a safe interruption
+point.
 
 Pure: no IO and no discovery, mirroring the sibling policies (frozen inputs / outputs,
 literal machine-readable vocabularies, ``as_payload`` dicts). The durable-record renderer
@@ -72,24 +81,23 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 # Steps, in the only order they may run.
 # ---------------------------------------------------------------------------
 
-#: Release the managed pane / process. Independent of Git: it is the one step a non-Git
-#: lane still performs.
+#: Release the managed pane / process — the only step, and the only one whose primitive is
+#: parameterized by the identity it acts on (``issue`` + ``lane_generation``) rather than by
+#: a late-bound name another actor can re-point. Independent of Git, so a non-Git lane
+#: performs it too.
 STEP_PROCESS_RETIRE = "process_retire"
-#: ``git worktree remove`` — clean, exact registered path, never ``--force``. The last step:
-#: removing a checkout is recoverable from the ref, which is why it is the destructive
-#: operation this machine kept.
-STEP_WORKTREE_REMOVE = "worktree_remove"
 
-CLEANUP_STEPS: Tuple[str, ...] = (
-    STEP_PROCESS_RETIRE,
-    STEP_WORKTREE_REMOVE,
-)
+CLEANUP_STEPS: Tuple[str, ...] = (STEP_PROCESS_RETIRE,)
 
-#: The steps that delete a ref — **empty**, and kept as a value rather than a sentence so
-#: the invariant is checkable. Both ref deletes this machine once had were removed (module
-#: docstring); a future step that deletes a ref belongs here only once the delete enforces
-#: its own conditions in a single operation.
-REF_DELETING_STEPS: frozenset = frozenset()
+#: The steps that touch the Git object / ref / worktree graph — **empty**, and kept as a
+#: value rather than a sentence so the invariant is checkable rather than merely stated. The
+#: three that once lived here (remote branch delete, local branch delete, worktree removal)
+#: were each withdrawn for the same reason; see the module docstring. A future step belongs
+#: here only once its primitive enforces its own conditions in a single operation.
+GIT_MUTATING_STEPS: frozenset = frozenset()
+#: For this machine "deletes a ref" and "touches Git at all" are now the same empty set; the
+#: older name is kept so the invariant reads the same from either side.
+REF_DELETING_STEPS: frozenset = GIT_MUTATING_STEPS
 
 # ---------------------------------------------------------------------------
 # States.
@@ -99,7 +107,6 @@ REF_DELETING_STEPS: frozenset = frozenset()
 #: never a returned resting state.
 STATE_CLEANUP_PREFLIGHT = "cleanup_preflight"
 STATE_PROCESS_RETIRING = "process_retiring"
-STATE_WORKTREE_REMOVING = "worktree_removing"
 #: Every applicable step reached a settled outcome.
 STATE_RETIRED = "retired"
 #: Fail-closed: no further destructive step runs.
@@ -109,7 +116,6 @@ CLEANUP_STATES: frozenset = frozenset(
     {
         STATE_CLEANUP_PREFLIGHT,
         STATE_PROCESS_RETIRING,
-        STATE_WORKTREE_REMOVING,
         STATE_RETIRED,
         STATE_CLEANUP_BLOCKED,
     }
@@ -124,7 +130,7 @@ CLEANUP_TERMINAL_STATES: frozenset = frozenset({STATE_RETIRED, STATE_CLEANUP_BLO
 #: The lane's issue is not closed. Cleanup is a post-close activity by construction.
 BLOCKED_ISSUE_NOT_CLOSED = "issue_not_closed"
 #: The integration is not confirmed (not ``integrated`` / ``already_integrated`` /
-#: ``patch_equivalent``). Removing the checkout of unintegrated work discards it.
+#: ``patch_equivalent``). Retiring a lane whose work is not on the target abandons it.
 BLOCKED_INTEGRATION_UNCONFIRMED = "integration_unconfirmed"
 #: CI on the integration head has not settled. "Not yet red" is not green.
 BLOCKED_CI_UNSETTLED = "integration_ci_unsettled"
@@ -132,13 +138,10 @@ BLOCKED_CI_UNSETTLED = "integration_ci_unsettled"
 BLOCKED_UNRESOLVED_CALLBACK = "unresolved_callback"
 #: An owner / release gate is unresolved.
 BLOCKED_UNRESOLVED_OWNER_GATE = "unresolved_owner_gate"
-#: The worktree or ref belongs to another lane. Refused outright.
+#: The record does not name this actuator's own lane. Refused outright: releasing another
+#: lane's managed process is a cross-lane side effect exactly as removing its checkout was.
+#: The literal is unchanged so durable records written by earlier rounds stay readable.
 BLOCKED_FOREIGN_WORKTREE = "foreign_worktree"
-#: The worktree has uncommitted / untracked changes. Removing it would discard them, and
-#: ``--force`` is not an available answer.
-BLOCKED_DIRTY_WORKTREE = "dirty_worktree"
-#: The path to remove is not the exact path registered for this lane.
-BLOCKED_WORKTREE_PATH_UNREGISTERED = "worktree_path_unregistered"
 #: The ledger's recorded steps are out of dependency order or carry foreign provenance.
 BLOCKED_LEDGER_UNTRUSTWORTHY = "ledger_untrustworthy"
 
@@ -151,8 +154,6 @@ _BLOCKED_REASON_PRECEDENCE: Tuple[str, ...] = (
     BLOCKED_CI_UNSETTLED,
     BLOCKED_UNRESOLVED_OWNER_GATE,
     BLOCKED_UNRESOLVED_CALLBACK,
-    BLOCKED_WORKTREE_PATH_UNREGISTERED,
-    BLOCKED_DIRTY_WORKTREE,
 )
 
 
@@ -164,30 +165,17 @@ def _order_reasons(reasons: Iterable[str]) -> Tuple[str, ...]:
 
 
 # ---------------------------------------------------------------------------
-# Policy, action record, preflight.
+# Action record, preflight.
 # ---------------------------------------------------------------------------
 
-
-@dataclass(frozen=True)
-class RetirementCleanupPolicy:
-    """The resolved cleanup policy intent (domain mirror of the config block).
-
-    Intent only: each flag can turn a step *off*, and none of them can turn a safety gate
-    off — no gate below reads a policy field.
-
-    There is deliberately no ``delete_remote_branch`` and no ``delete_local_branch`` field.
-    R1 had both, and review j#96344 finding 1 showed the shape of the bug a delete toggle
-    enabled: turning the *local* delete off skipped that step's CAS conditions and then let
-    the remote delete run regardless. The lesson is structural — a toggle must not be able to
-    skip the evaluation of conditions a later step depends on — and with no ref-deleting step
-    left (:data:`REF_DELETING_STEPS`) there is no toggle that can do it.
-    """
-
-    remove_worktree: bool = True
-
-    @classmethod
-    def default(cls) -> "RetirementCleanupPolicy":
-        return cls()
+# There is deliberately no cleanup policy record and no cleanup config block. Every version
+# of it was a set of toggles over Git steps (``delete_remote_branch``,
+# ``delete_local_branch``, ``remove_worktree``), and review j#96344 finding 1 showed the bug
+# that shape enables: turning one step off skipped the conditions a later step depended on.
+# With every Git step withdrawn (:data:`GIT_MUTATING_STEPS`) the remaining step is
+# unconditional, so a policy argument here could only be a field nothing reads — and the
+# rule this issue keeps re-learning is that such a field is worse than absent, because
+# setting it looks like buying something.
 
 
 @dataclass(frozen=True)
@@ -202,7 +190,11 @@ class CleanupActionRecord:
     ``recorded_source_head`` is the branch tip that integration ran against. It is part of
     the identity this cleanup is bound to — a cleanup authorized for one source head is not
     the same action as one authorized for another — and nothing here compares a live tip
-    against it, because no step reads a ref (:data:`REF_DELETING_STEPS`).
+    against it, because no step reads a ref (:data:`GIT_MUTATING_STEPS`).
+
+    ``branch`` and ``worktree_path`` are likewise identity, not targets: nothing in this
+    machine removes a checkout or touches a ref. They name the lane so the actuator can
+    refuse a record that is not its own.
     """
 
     issue: str
@@ -234,7 +226,7 @@ class CleanupPreflight:
     Every safety-bearing field defaults to its **unsatisfied** value, so a caller that omits
     one is blocked rather than default-admitted.
 
-    Always enforced:
+    All of them are enforced; there is no longer a conditional group:
 
     - ``issue_closed`` — cleanup is post-close by construction.
     - ``integration_confirmed`` — the integration reached ``integrated`` /
@@ -244,32 +236,26 @@ class CleanupPreflight:
     - ``callbacks_drained`` / ``owner_gates_resolved``.
     - ``authorizing_action_key`` — the integration action key the caller is acting under.
       Compared for equality against the record's; a mismatch refuses.
+    - ``lane_is_foreign`` — the record does not name the actuator's own lane. Answered by
+      comparing the record against the actuator's own configuration, not by probing the
+      filesystem: with no Git step left there is nothing on disk this decision acts on, and
+      what still matters is that we do not retire another lane's managed process.
 
-    Git-shaped (consulted only when ``is_git_workspace``):
-
-    - ``worktree_is_foreign`` — the checkout belongs to another lane.
-    - ``worktree_clean`` — no uncommitted / untracked changes.
-    - ``worktree_path_registered`` — the path is the exact registered one for this lane.
-
-    There are deliberately no branch-shaped fields left. R7 carried five of them
-    (``branch_checked_out_elsewhere``, ``unpushed_unique_commits``,
-    ``branch_reachable_from_target``, ``branch_patch_equivalent``, ``branch_tip``) as the
-    conditions of a local branch delete that review j#96396 finding 1 retired; a field no
-    gate reads is worse than absent, because supplying it looks like buying protection.
+    **No Git-shaped field remains.** R7 carried five branch-shaped ones for the local branch
+    delete and R8 three worktree-shaped ones for the removal; both steps were withdrawn
+    (module docstring) and their fields went with them. The rule, learned three times on this
+    issue: a field no gate reads is worse than absent, because supplying it looks like buying
+    protection. ``is_git_workspace`` is gone for the same reason — every remaining step runs
+    identically in a non-Git workspace.
     """
 
-    is_git_workspace: bool
     authorizing_action_key: str = ""
-    # Always enforced.
     issue_closed: bool = False
     integration_confirmed: bool = False
     integration_ci_settled_green: bool = False
     callbacks_drained: bool = False
     owner_gates_resolved: bool = False
-    # Git-shaped.
-    worktree_is_foreign: bool = True
-    worktree_clean: bool = False
-    worktree_path_registered: bool = False
+    lane_is_foreign: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -283,9 +269,10 @@ class CleanupDecision:
 
     ``next_step`` is the single step the actuator may perform now (``None`` in a terminal
     state). ``step_outcomes`` records what this decision determined about *every* step —
-    ``done`` from the ledger, ``not_applicable`` for a step this workspace or policy does not
-    have, ``blocked`` for a refused one, ``pending`` for one not yet reached — so the durable
-    record is a complete stage table rather than a single verdict.
+    ``done`` from the ledger, ``blocked`` for a refused one, ``pending`` for one not yet
+    reached — so the durable record is a complete stage table rather than a single verdict.
+    ``not_applicable`` is still part of the vocabulary and is still rendered, but no step
+    reaches it any more: the steps that could be turned off or skipped were the Git ones.
     """
 
     state: str
@@ -329,7 +316,6 @@ def _table(**outcomes: str) -> Tuple[Tuple[str, str], ...]:
 
 
 def decide_cleanup(
-    policy: RetirementCleanupPolicy,
     record: CleanupActionRecord,
     preflight: CleanupPreflight,
     *,
@@ -338,18 +324,17 @@ def decide_cleanup(
 ) -> CleanupDecision:
     """Decide the next cleanup state / step for one lane (pure).
 
+    There is no ``policy`` parameter. It carried the Git-step toggles, and with every Git
+    step withdrawn there is nothing left to turn off — an argument that can no longer change
+    an outcome is removed rather than accepted and ignored.
+
     Evaluation order:
 
     1. The authorizing action key must match the record's, or nothing runs.
-    2. The always-enforced gates are collected in full; any failure is
-       :data:`STATE_CLEANUP_BLOCKED` and **no** step runs — not even the non-destructive
-       process retire, because these gates are what establish that the lane is finished.
-    3. The process retire runs first, and is the only step a non-Git lane has.
-    4. The worktree removal runs last, behind its own gates (clean, registered, not foreign).
-       There is no step after it: no ref is deleted here (:data:`REF_DELETING_STEPS`).
-
-    Steps a policy turned off, and steps a non-Git workspace does not have, are reported
-    ``not_applicable`` rather than skipped silently.
+    2. The gates are collected in full; any failure is :data:`STATE_CLEANUP_BLOCKED` and the
+       step does not run — not even though it is non-destructive, because these gates are
+       what establish that the lane is finished and that it is ours.
+    3. The process retire runs. There is no step after it (:data:`CLEANUP_STEPS`).
     """
     action_key = record.action_key
 
@@ -378,7 +363,7 @@ def decide_cleanup(
         blockers.add(BLOCKED_UNRESOLVED_CALLBACK)
     if not preflight.owner_gates_resolved:
         blockers.add(BLOCKED_UNRESOLVED_OWNER_GATE)
-    if preflight.is_git_workspace and preflight.worktree_is_foreign:
+    if preflight.lane_is_foreign:
         blockers.add(BLOCKED_FOREIGN_WORKTREE)
     if blockers:
         ordered = _order_reasons(blockers)
@@ -389,7 +374,10 @@ def decide_cleanup(
             step_outcomes=_table(),
             blocked_reasons=ordered,
             primary_reason=ordered[0],
-            reason="cleanup refused before any step; nothing removed and no ref deleted",
+            reason=(
+                "cleanup refused before any step; no process released (and this machine "
+                "removes no checkout and deletes no ref at all)"
+            ),
         )
 
     # R3 review j#96368 finding 3: provenance and order are checked before any destructive
@@ -418,86 +406,42 @@ def decide_cleanup(
     )
     outcomes: dict[str, str] = {step: OUTCOME_DONE for step in done if step in CLEANUP_STEPS}
 
-    # 1. Process retire — Git-independent.
+    # The one step. Its primitive takes the lane identity as its argument, which is the
+    # property the three withdrawn Git steps could not offer (module docstring).
     if STEP_PROCESS_RETIRE not in outcomes:
         return CleanupDecision(
             state=STATE_PROCESS_RETIRING,
             action_key=action_key,
             next_step=STEP_PROCESS_RETIRE,
             step_outcomes=_table(**outcomes),
-            reason="releasing the managed process (independent of the Git steps)",
-        )
-
-    if not preflight.is_git_workspace:
-        outcomes[STEP_WORKTREE_REMOVE] = OUTCOME_NOT_APPLICABLE
-        return CleanupDecision(
-            state=STATE_RETIRED,
-            action_key=action_key,
-            next_step=None,
-            step_outcomes=_table(**outcomes),
             reason=(
-                "not a Git workspace; the process was released and the worktree step does "
-                "not apply"
+                f"releasing the managed process for issue {record.issue} generation "
+                f"{record.lane_generation} (no checkout removed, no ref touched)"
             ),
         )
 
-    # 2. Worktree removal — clean, exact registered path, never --force. The last step.
-    if not policy.remove_worktree:
-        outcomes[STEP_WORKTREE_REMOVE] = OUTCOME_NOT_APPLICABLE
-    elif STEP_WORKTREE_REMOVE not in outcomes:
-        worktree_blockers: set[str] = set()
-        if not preflight.worktree_path_registered:
-            worktree_blockers.add(BLOCKED_WORKTREE_PATH_UNREGISTERED)
-        if not preflight.worktree_clean:
-            worktree_blockers.add(BLOCKED_DIRTY_WORKTREE)
-        if worktree_blockers:
-            ordered = _order_reasons(worktree_blockers)
-            outcomes[STEP_WORKTREE_REMOVE] = OUTCOME_BLOCKED
-            return CleanupDecision(
-                state=STATE_CLEANUP_BLOCKED,
-                action_key=action_key,
-                next_step=None,
-                step_outcomes=_table(**outcomes),
-                blocked_reasons=ordered,
-                primary_reason=ordered[0],
-                reason=(
-                    "worktree removal refused; `--force` is not an available answer and "
-                    "nothing else runs"
-                ),
-            )
-        return CleanupDecision(
-            state=STATE_WORKTREE_REMOVING,
-            action_key=action_key,
-            next_step=STEP_WORKTREE_REMOVE,
-            step_outcomes=_table(**outcomes),
-            reason=(
-                f"removing the clean, registered worktree at {record.worktree_path} "
-                "without --force"
-            ),
-        )
-
-    # There is no step 3. No ref is deleted here, local or remote — see the module docstring
-    # for what each delete could not enforce about itself.
+    # There is no step 2. This machine removes no checkout and deletes no ref — see the
+    # module docstring for what each withdrawn step could not enforce about itself.
     return CleanupDecision(
         state=STATE_RETIRED,
         action_key=action_key,
         next_step=None,
         step_outcomes=_table(**outcomes),
         reason=(
-            f"every applicable cleanup step reached a settled outcome; local branch "
-            f"{record.branch} is left for the operator runbook"
+            f"every applicable cleanup step reached a settled outcome; the worktree at "
+            f"{record.worktree_path} and the local branch {record.branch} are left for the "
+            "operator runbook"
         ),
     )
 
 
 __all__ = (
     "STEP_PROCESS_RETIRE",
-    "STEP_WORKTREE_REMOVE",
     "CLEANUP_STEPS",
+    "GIT_MUTATING_STEPS",
     "REF_DELETING_STEPS",
     "STATE_CLEANUP_PREFLIGHT",
     "STATE_PROCESS_RETIRING",
-    "STATE_WORKTREE_REMOVING",
     "STATE_RETIRED",
     "STATE_CLEANUP_BLOCKED",
     "CLEANUP_STATES",
@@ -508,10 +452,7 @@ __all__ = (
     "BLOCKED_UNRESOLVED_CALLBACK",
     "BLOCKED_UNRESOLVED_OWNER_GATE",
     "BLOCKED_FOREIGN_WORKTREE",
-    "BLOCKED_DIRTY_WORKTREE",
-    "BLOCKED_WORKTREE_PATH_UNREGISTERED",
     "BLOCKED_LEDGER_UNTRUSTWORTHY",
-    "RetirementCleanupPolicy",
     "CleanupActionRecord",
     "CleanupPreflight",
     "CleanupDecision",

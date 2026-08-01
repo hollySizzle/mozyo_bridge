@@ -7,9 +7,10 @@ Pins the typed field contract of the gated auto-integration knob:
 - the owner's j#96335 default: ff-only on;
 - that no CI knob exists (R2 review j#96350 finding 1 — both gates are unconditional in the
   state machine, so a key that could turn one off would be a key the runtime ignores);
-- that no ref-delete key exists at all, local or remote (R1 review j#96344 finding 1 and R7
-  review j#96396 finding 1 — neither operation could enforce its own safety condition, and
-  both are removed rather than defaulted off);
+- that **no post-close cleanup key exists at all** — no ref delete local or remote, and no
+  worktree removal (reviews j#96344 / j#96396 / j#96401, each finding 1). None of the three
+  operations could enforce its own safety condition, so each was removed rather than
+  defaulted off, and a key that turns off a step that does not exist is not offered;
 - fail-closed parsing — a non-mapping record, an unknown key, an unsupported version, a mode
   outside the closed vocabulary, a non-boolean flag, an empty ``integration_branch``;
 - that the closed key set cannot express an authority (a boundary-shaped key is refused with
@@ -60,7 +61,6 @@ class DefaultsTest(unittest.TestCase):
         config = AutoIntegrationConfig.default()
         # j#96335: fast-forward-only is the default.
         self.assertTrue(config.ff_only)
-        self.assertTrue(config.remove_worktree)
         # An unset target defers to runtime resolution rather than guessing a branch.
         self.assertIsNone(config.integration_branch)
 
@@ -108,10 +108,7 @@ class FailClosedParsingTest(unittest.TestCase):
     def test_non_boolean_flags_fail_closed(self) -> None:
         # `0` / `1` must not silently read as a policy change; this is the same strict-bool
         # boundary the sibling blocks enforce.
-        for key in (
-            "ff_only",
-            "remove_worktree",
-        ):
+        for key in ("ff_only",):
             for value in (0, 1, "true", "yes", None):
                 with self.assertRaises(RepoLocalConfigError, msg=f"{key}={value!r}"):
                     AutoIntegrationConfig.from_record({key: value})
@@ -135,17 +132,18 @@ class BoundaryTest(unittest.TestCase):
                 "mode",
                 "integration_branch",
                 "ff_only",
-                "remove_worktree",
             },
         )
 
-    def test_there_is_no_ref_delete_key_local_or_remote(self) -> None:
-        # R1 review j#96344 finding 1 retired the remote delete (no CAS against the remote
-        # tip; a real one needs the prohibited `--force-with-lease`) and R7 review j#96396
-        # finding 1 retired the local one (its tip check and its delete are separate
-        # invocations, and a commit landing between them was reproduced being destroyed).
-        # Neither key is left as a way to ask for the operation — declaring one is an error.
-        for gone in ("delete_remote_branch", "delete_local_branch"):
+    def test_there_is_no_post_close_cleanup_key_at_all(self) -> None:
+        # Three steps, three withdrawals, one rule — an operation that cannot enforce its own
+        # safety condition is not offered: the remote delete had no CAS against the remote tip
+        # (j#96344 finding 1); the local delete verified the tip in a different invocation
+        # from the one that deleted, and a commit landing between them was destroyed (j#96396
+        # finding 1); the worktree removal took a path an earlier probe had vouched for, and a
+        # foreign lane's checkout swapped onto it was removed (j#96401 finding 1). No key is
+        # left as a way to ask for any of them — declaring one is an error.
+        for gone in ("delete_remote_branch", "delete_local_branch", "remove_worktree"):
             self.assertNotIn(gone, AUTO_INTEGRATION_KEYS, gone)
             self.assertFalse(hasattr(AutoIntegrationConfig.default(), gone), gone)
             with self.assertRaises(RepoLocalConfigError, msg=gone):
@@ -215,10 +213,10 @@ class DeclarationStatusTest(unittest.TestCase):
             "mode",
             "integration_branch",
             "ff_only",
-            "remove_worktree",
         ):
             self.assertIn(f"auto_integration.{field_name}", leaves, field_name)
         for gone in (
+            "auto_integration.remove_worktree",
             "auto_integration.delete_local_branch",
             "auto_integration.delete_remote_branch",
             "auto_integration.require_source_ci",

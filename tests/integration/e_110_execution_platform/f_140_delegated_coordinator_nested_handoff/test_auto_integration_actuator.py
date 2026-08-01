@@ -39,6 +39,9 @@ from typing import List, Optional, Tuple
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+    auto_integration_actuator,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_actuator import (
     AutoIntegrationGitOperations,
     AutoIntegrationUseCase,
@@ -50,7 +53,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ManagedProcessOperations,
     MergeResult,
     PushResult,
-    cleanup_policy_from_config,
     integration_policy_from_config,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_policy import (
@@ -77,9 +79,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     STATE_CLEANUP_BLOCKED,
     STATE_RETIRED,
     STEP_PROCESS_RETIRE,
-    STEP_WORKTREE_REMOVE,
     CleanupActionRecord,
-    RetirementCleanupPolicy,
 )
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config_records import (
     AutoIntegrationConfig,
@@ -137,7 +137,6 @@ class FakeGitOperations:
         default_factory=lambda: MergeResult(conflicted=False, integration_head=MERGE_HEAD)
     )
     push_result: PushResult = field(default_factory=lambda: PushResult(accepted=True))
-    worktree_removed: bool = True
     calls: List[Tuple[str, dict]] = field(default_factory=list)
 
     # -- read probes ------------------------------------------------------
@@ -236,18 +235,10 @@ class FakeGitOperations:
             self.ancestors = tuple(set(self.ancestors) | {(source_head, source_head)})
         return self.push_result
 
-    def remove_worktree(self, *, worktree_path: str) -> bool:
-        self.calls.append(("remove_worktree", {"worktree_path": worktree_path}))
-        if self.worktree_removed:
-            # Removing the worktree un-registers it AND leaves nothing to report a checked-out
-            # branch for — the path is gone. R6 review j#96391 finding 2: this fake cleared
-            # only `registered` and kept `checked_out_branch`, so the identity gate still
-            # matched and the run reached `retired`; the live adapter answers empty and the
-            # same run blocked on `foreign_worktree` forever. Half a mutation modelled is a
-            # different lie from none.
-            self.lane_registered = False
-            self.lane_branch_checked_out = ""
-        return self.worktree_removed
+    # There is deliberately no `remove_worktree` here. The port lost it with review j#96401
+    # finding 1 (the removal named its target by a path an earlier probe had vouched for),
+    # and a fake that still answered it would let a test assert behaviour no production code
+    # can reach — the inverse of the R6 problem, where the fake modelled half a mutation.
 
     @property
     def performed(self) -> List[str]:
@@ -375,14 +366,16 @@ class ConfigTranslationTest(unittest.TestCase):
             self.assertFalse(hasattr(config, gone), gone)
             self.assertFalse(hasattr(policy, gone), gone)
 
-    def test_cleanup_fields_map_through_with_no_ref_delete(self) -> None:
-        policy = cleanup_policy_from_config(AutoIntegrationConfig.default())
-        self.assertTrue(policy.remove_worktree)
-        # Neither delete has a config field, because neither step exists (j#96344 finding 1,
-        # j#96396 finding 1).
-        for gone in ("delete_remote_branch", "delete_local_branch"):
-            self.assertFalse(hasattr(policy, gone), gone)
-            self.assertFalse(hasattr(AutoIntegrationConfig.default(), gone), gone)
+    def test_the_config_has_no_cleanup_field_and_no_cleanup_translation(self) -> None:
+        # All three cleanup steps were withdrawn (j#96344 / j#96396 / j#96401, each finding 1),
+        # so there is nothing left for a config key to turn off and nothing for a cleanup
+        # policy translation to carry.
+        config = AutoIntegrationConfig.default()
+        for gone in ("delete_remote_branch", "delete_local_branch", "remove_worktree"):
+            self.assertFalse(hasattr(config, gone), gone)
+        self.assertFalse(
+            hasattr(auto_integration_actuator, "cleanup_policy_from_config")
+        )
 
     def test_the_default_config_translates_to_a_disabled_actuator(self) -> None:
         self.assertEqual(
@@ -741,12 +734,12 @@ class R6ReviewFindingTest(unittest.TestCase):
             operations.args_for("apply_merge")[0]["expected_target_head"], TARGET
         )
 
-    def test_f2_our_own_removal_does_not_make_the_lane_foreign(self) -> None:
-        # R6 finding 2: after the removal the path is gone, so re-requiring the pre-removal
-        # branch identity blocked the step that follows it. The fake now clears the checked-out
-        # branch the way the live probe does. The removal is the last step since j#96396
-        # finding 1, so what this pins is that the run RESTS at `retired` instead of blocking
-        # on `foreign_worktree` when it re-measures a path it just removed.
+    def test_f2_the_cleanup_run_completes(self) -> None:
+        # R6 finding 2 was a cleanup that could never finish: the identity gate kept demanding
+        # facts about a path the removal had just deleted. Both the removal and the phase-aware
+        # re-measurement it forced are gone (j#96401 finding 1), so what is pinned now is the
+        # property the finding was really about — the run reaches `retired` rather than
+        # blocking on a fact about itself.
         operations = FakeGitOperations(ancestors=((SOURCE, TARGET),), tip=SOURCE)
         report = _use_case(operations, processes=FakeProcessOperations()).run_cleanup(
             CleanupActionRecord(
@@ -759,7 +752,7 @@ class R6ReviewFindingTest(unittest.TestCase):
             )
         )
         self.assertEqual(report.final_decision.state, STATE_RETIRED)
-        self.assertEqual(operations.performed, ["remove_worktree"])
+        self.assertEqual(operations.performed, [])
 
 
 class R3ReviewFinding2Test(unittest.TestCase):
@@ -794,39 +787,28 @@ class R3ReviewFinding2Test(unittest.TestCase):
         self.assertEqual(report.final_decision.state, STATE_CLEANUP_BLOCKED)
         self.assertEqual(operations.performed, [])
 
-    def test_our_own_lane_runs_the_two_steps_in_order(self) -> None:
+    def test_our_own_lane_runs_the_one_step(self) -> None:
         operations = self._ops()
         processes = FakeProcessOperations()
         report = _use_case(operations, processes=processes).run_cleanup(self._record())
         self.assertEqual(report.final_decision.state, STATE_RETIRED)
-        self.assertEqual(operations.performed, ["remove_worktree"])
-        self.assertEqual(
-            [o.step for o in report.outcomes],
-            [STEP_PROCESS_RETIRE, STEP_WORKTREE_REMOVE],
-        )
+        self.assertEqual([o.step for o in report.outcomes], [STEP_PROCESS_RETIRE])
+        self.assertEqual(len(processes.calls), 1)
 
-    def test_a_dirty_lane_worktree_mutates_nothing(self) -> None:
-        operations = self._ops(lane_clean=False)
-        report = _use_case(operations, processes=FakeProcessOperations()).run_cleanup(self._record())
-        self.assertEqual(report.final_decision.state, STATE_CLEANUP_BLOCKED)
-        self.assertEqual(operations.performed, [])
-
-    def test_the_run_asks_for_no_ref_delete_however_it_ends(self) -> None:
-        # R7 review j#96396 finding 1 and 2: the actuator used to call a branch delete here and
-        # record it as a compare-and-swap that the argv was not. Whatever the world looks like,
-        # the only mutation this half can ask for is the worktree removal.
-        for kwargs in ({}, {"lane_clean": False}, {"ancestors": ()}, {"worktree_removed": False}):
+    def test_the_cleanup_half_asks_the_git_port_for_nothing_at_all(self) -> None:
+        # The strongest form of the three withdrawals (j#96344 / j#96396 / j#96401, each
+        # finding 1): whatever the world looks like and however the run ends, `run_cleanup`
+        # makes no call on the Git port — not a mutation, and not even a read probe, since
+        # every probe existed to gate a step that no longer exists.
+        for kwargs in ({}, {"lane_clean": False}, {"ancestors": ()}, {"git_workspace": False}):
             operations = self._ops(**kwargs)
             report = _use_case(
                 operations, processes=FakeProcessOperations()
             ).run_cleanup(self._record())
-            self.assertNotIn("delete_local_branch", operations.performed, kwargs)
-            self.assertTrue(
-                set(operations.performed) <= {"remove_worktree"}, operations.performed
-            )
+            self.assertEqual(operations.calls, [], kwargs)
             for outcome in report.outcomes:
-                self.assertNotIn("branch -D", outcome.detail)
-                self.assertNotIn("compare-and-swap", outcome.detail)
+                for retired in ("branch -D", "compare-and-swap", "worktree remove"):
+                    self.assertNotIn(retired, outcome.detail)
 
     def test_no_authority_reader_means_the_cleanup_is_refused(self) -> None:
         operations = self._ops()
@@ -854,13 +836,12 @@ class R3ReviewFinding2Test(unittest.TestCase):
             )
             self.assertNotIn("target_ref", parameters, name)
 
-    def test_an_unconfirmed_integration_is_what_stops_the_removal(self) -> None:
+    def test_an_unconfirmed_integration_is_what_stops_the_run(self) -> None:
         # R4 finding 2 pinned this through branch REACHABILITY: with no configured integration
         # branch the delete could not establish that the lane's work survived, so it blocked.
-        # The delete is gone (j#96396 finding 1) and reachability went with it — it was that
-        # step's condition, and a removed worktree loses nothing while the ref still holds the
-        # commits. What gates the removal is the durable authority, so that is pinned directly
-        # here rather than left implied by the retired probe.
+        # Both the delete and the removal are gone, and reachability went with them — it was
+        # their condition. What gates the surviving step is the durable authority, so that is
+        # pinned directly rather than left implied by a retired probe.
         operations = self._ops()
         report = _use_case(
             operations,
@@ -878,32 +859,32 @@ class R3ReviewFinding2Test(unittest.TestCase):
         self.assertEqual(operations.performed, [])
         self.assertEqual(report.final_decision.state, STATE_CLEANUP_BLOCKED)
 
-        # And an actuator with no configured integration branch no longer measures anything
-        # about the lane's ref: nothing in the cleanup half reads one.
+        # And an actuator with no configured integration branch cleans up normally: nothing
+        # in this half reads a branch, a ref or a path any more.
         unconfigured = self._ops()
         rested = _use_case(
             unconfigured,
             processes=FakeProcessOperations(),
             integration_policy=AutoIntegrationPolicy(mode=MODE_AUTO, integration_branch=None),
         ).run_cleanup(self._record())
-        self.assertEqual(unconfigured.performed, ["remove_worktree"])
+        self.assertEqual(unconfigured.performed, [])
         self.assertEqual(rested.final_decision.state, STATE_RETIRED)
 
-    def test_a_worktree_holding_a_foreign_branch_is_never_cleaned_up(self) -> None:
-        # R4 finding 2's second reproduction: the probe reported `checked_out_branch` and the
-        # gate ignored it, so a registered worktree holding somebody else's branch was removed.
-        operations = self._ops(lane_branch_checked_out="SOME_FOREIGN_BRANCH")
-        report = _use_case(operations, processes=FakeProcessOperations()).run_cleanup(
-            self._record()
+    def test_a_record_naming_another_lanes_branch_is_refused(self) -> None:
+        # R4 finding 2's second reproduction removed a registered worktree that held somebody
+        # else's branch. The removal is gone, but the identity question survives it: the record
+        # must name BOTH this actuator's worktree and its branch, or no process is released.
+        operations = self._ops()
+        processes = FakeProcessOperations()
+        report = _use_case(operations, processes=processes).run_cleanup(
+            self._record(branch="SOME_FOREIGN_BRANCH")
         )
-        self.assertEqual(operations.performed, [])
         self.assertEqual(report.final_decision.state, STATE_CLEANUP_BLOCKED)
+        self.assertEqual(processes.calls, [])
 
-    def test_the_port_cannot_delete_a_remote_ref_at_all(self) -> None:
-        self.assertFalse(hasattr(FakeGitOperations(), "delete_remote_branch"))
-        self.assertFalse(
-            hasattr(RetirementCleanupPolicy.default(), "delete_remote_branch")
-        )
+    def test_the_port_offers_no_destructive_operation_at_all(self) -> None:
+        for gone in ("delete_remote_branch", "delete_local_branch", "remove_worktree"):
+            self.assertFalse(hasattr(FakeGitOperations(), gone), gone)
 
 
 if __name__ == "__main__":  # pragma: no cover - manual invocation

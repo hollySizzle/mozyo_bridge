@@ -163,7 +163,7 @@ CONFIG_LEAF_KEYS: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = (
         (("sublane_integration", "manage_worktree"),),
     ),
     # The #13686 actuator leaves. Every one of them decides whether a real side effect —
-    # a push to an integration branch, a worktree removal — is attempted, so
+    # a push to an integration branch — is attempted, so
     # an operator must be able to read what a workspace actually resolved to rather than
     # infer it from an absent block. `mode` matters most: it is what turns the actuator on
     # at all. The CI gates are deliberately absent: they are unconditional in the state
@@ -174,7 +174,6 @@ CONFIG_LEAF_KEYS: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = (
         (("auto_integration", "integration_branch"),),
     ),
     ("auto_integration.ff_only", (("auto_integration", "ff_only"),)),
-    ("auto_integration.remove_worktree", (("auto_integration", "remove_worktree"),)),
     ("terminal_transport.backend", (("terminal_transport", "backend"),)),
     ("presentation.surface", (("presentation", "surface"),)),
     (

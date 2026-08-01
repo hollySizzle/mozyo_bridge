@@ -10,16 +10,18 @@ implementation rather than a hard dependency of the decision path.
 
 Three parts:
 
-- :func:`integration_policy_from_config` / :func:`cleanup_policy_from_config` translate the
-  governance config block
+- :func:`integration_policy_from_config` translates the governance config block
   (:class:`~mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config_records.AutoIntegrationConfig`)
-  into the two domain policies. The application layer owns the translation so neither domain
-  module imports the governance schema.
+  into the integration policy. The application layer owns the translation so the domain never
+  imports the governance schema. There is no cleanup counterpart: the cleanup machine has no
+  configurable step left (its Git steps were withdrawn), so a config→policy translation there
+  would produce a record nothing reads.
 - :class:`AutoIntegrationUseCase` executes **one decided step at a time** and returns the
   step's outcome. It performs only the side effect the decision authorized and never
   substitutes a stronger one: no ``--force``, no rebase, no ref delete of any kind, no remote
-  ref rewrite. Each executed step is appended to the ledger the next decision reads, which is
-  what makes a partial failure resumable without a duplicate merge or push.
+  ref rewrite, and no worktree removal. Each executed step is appended to the ledger the next
+  decision reads, which is what makes a partial failure resumable without a duplicate merge
+  or push.
 - :class:`IntegrationRunReport` is the replayable record of a run: the states it passed
   through and the outcome of every step, so a durable journal can be rendered from it.
 
@@ -70,11 +72,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.retirement_cleanup_policy import (
     STEP_PROCESS_RETIRE,
-    STEP_WORKTREE_REMOVE,
     CleanupActionRecord,
     CleanupDecision,
     CleanupPreflight,
-    RetirementCleanupPolicy,
     decide_cleanup,
 )
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config_records import (
@@ -98,13 +98,6 @@ def integration_policy_from_config(
         integration_branch=config.integration_branch,
         ff_only=config.ff_only,
     )
-
-
-def cleanup_policy_from_config(
-    config: AutoIntegrationConfig,
-) -> RetirementCleanupPolicy:
-    """Translate the ``auto_integration`` config block into the cleanup policy."""
-    return RetirementCleanupPolicy(remove_worktree=config.remove_worktree)
 
 
 # ---------------------------------------------------------------------------
@@ -202,13 +195,14 @@ class AutoIntegrationUseCase:
     ``lane_worktree`` is this actuator's own lane checkout and
     ``integration_worktree_path`` the dedicated one — constructor state rather than per-call
     arguments, so a single instance cannot be redirected mid-run.
+
+    There is no ``cleanup_policy``: with every Git step withdrawn from the cleanup machine
+    (review j#96401 finding 1 took the last one), nothing there is configurable, and the
+    ``operations`` port is not consulted by :meth:`run_cleanup` at all.
     """
 
     operations: AutoIntegrationGitOperations
     integration_policy: AutoIntegrationPolicy
-    cleanup_policy: RetirementCleanupPolicy = field(
-        default_factory=RetirementCleanupPolicy.default
-    )
     processes: Optional[ManagedProcessOperations] = None
     authority: Optional[DurableAuthorityReader] = None
     ledger: LedgerStore = field(default_factory=InMemoryLedgerStore)
@@ -542,93 +536,46 @@ class AutoIntegrationUseCase:
 
     # -- cleanup ----------------------------------------------------------
 
-    def _measure_cleanup(
-        self, record: CleanupActionRecord, *, ledger: Sequence[StepOutcome]
-    ) -> CleanupPreflight:
-        """Build the ENTIRE cleanup preflight from this actuator's own measurements.
+    def _measure_cleanup(self, record: CleanupActionRecord) -> CleanupPreflight:
+        """Build the ENTIRE cleanup preflight from this actuator's own reading (no caller input).
 
         R3 review j#96368 finding 2 is the reason this exists, and it was the heaviest finding
         of the round: every one of the fifteen facts gating the destructive steps was
         caller-supplied, and the reproduction removed a **foreign lane's worktree and deleted
-        its branch** on nothing but those booleans. The integration side can at worst integrate
-        the wrong thing; this side destroys another lane's work.
+        its branch** on nothing but those booleans.
 
-        The identity question is answered from the actuator's OWN configuration, not from the
-        record: a cleanup may only touch this actuator's lane worktree.
+        It no longer touches Git. Every Git step was withdrawn — the two ref deletes first
+        (j#96396 finding 1) and then the worktree removal (j#96401 finding 1) — and the probes
+        that gated them went with them rather than being kept as measured-but-unread values.
+        The ledger is not consulted here either: the phase-aware re-measurement R6 needed
+        existed because the removal changed what the next probe could see, and with no
+        mutation of the world there is nothing for a later measurement to disagree with.
 
-        Five branch-shaped measurements used to be taken here for the local branch delete
-        (its tip, whether anything held it, whether it was reachable from the configured
-        target, whether it had unique unpushed commits). They are gone with the step
-        (j#96396 finding 1) rather than left measured-but-unread — a probe whose answer no
-        gate consults is how R4 shipped a `checked_out_branch` that was measured and never
-        compared.
+        Two things are still read, and both still matter for the one remaining step:
+
+        - the durable authority, fresh, because releasing a lane's managed process before its
+          work is integrated, its CI settled, or its callbacks drained abandons the lane;
+        - **whether the record names THIS actuator's lane**, answered by comparing it against
+          this actuator's own configuration. Retiring another lane's process is a cross-lane
+          side effect exactly as removing its checkout was, and the answer must not come from
+          the record that is asking.
         """
-        ops = self.operations
-        if not ops.is_git_workspace():
-            authority = (
-                self.authority.read_cleanup_authority(record=record)
-                if self.authority is not None
-                else CleanupAuthority()
-            )
-            return CleanupPreflight(
-                is_git_workspace=False,
-                authorizing_action_key=record.integration_action_key,
-                issue_closed=authority.issue_closed,
-                integration_confirmed=authority.integration_confirmed,
-                integration_ci_settled_green=authority.integration_ci_settled_green,
-                callbacks_drained=authority.callbacks_drained,
-                owner_gates_resolved=authority.owner_gates_resolved,
-            )
-
-        lane = ops.describe_integration_worktree(
-            path=record.worktree_path, lane_worktree=self.lane_worktree
-        )
-        # Ownership is PHASE-AWARE (R6 review j#96391 finding 2). Before the removal it is
-        # three facts: the record names this actuator's lane, the checkout is that worktree,
-        # and it currently holds this actuator's branch — R4 gated on the string pair alone
-        # and measured `checked_out_branch` without using it, so a registered worktree holding
-        # a foreign branch was removed.
-        #
-        # After OUR OWN removal those facts cannot be re-measured: the path is gone, so the
-        # branch probe answers empty and the identity test would fail forever, blocking the
-        # branch cleanup it is supposed to precede. R6 shipped exactly that, and the fake hid
-        # it by clearing `registered` while leaving `checked_out_branch` set. Once a trusted
-        # remove receipt exists the question changes to "did we own it when we removed it, and
-        # is the path now actually gone" — the first was established at that time and recorded,
-        # the second is measurable.
-        removed = completed_steps(
-            ledger, action_key=record.action_key, recorded_by=self.recorder_id
-        ).get(STEP_WORKTREE_REMOVE)
-        names_our_lane = (
-            record.worktree_path == self.lane_worktree
-            and record.branch == self.lane_branch
-        )
-        if removed is None:
-            is_ours = (
-                names_our_lane
-                and lane.is_lane_worktree
-                and lane.checked_out_branch == self.lane_branch
-            )
-        else:
-            is_ours = names_our_lane and not lane.registered
         authority = (
             self.authority.read_cleanup_authority(record=record)
             if self.authority is not None
             else CleanupAuthority()
         )
         return CleanupPreflight(
-            is_git_workspace=True,
             authorizing_action_key=record.integration_action_key,
             issue_closed=authority.issue_closed,
             integration_confirmed=authority.integration_confirmed,
             integration_ci_settled_green=authority.integration_ci_settled_green,
             callbacks_drained=authority.callbacks_drained,
             owner_gates_resolved=authority.owner_gates_resolved,
-            worktree_is_foreign=not is_ours,
-            # Once removed, the removal itself is the evidence these held: the step only ran
-            # because they did, and a vanished path cannot answer them again.
-            worktree_clean=lane.clean if removed is None else True,
-            worktree_path_registered=lane.registered if removed is None else True,
+            lane_is_foreign=not (
+                record.worktree_path == self.lane_worktree
+                and record.branch == self.lane_branch
+            ),
         )
 
     def run_cleanup(self, record: CleanupActionRecord) -> CleanupRunReport:
@@ -642,13 +589,13 @@ class AutoIntegrationUseCase:
             self.ledger.read(action_key=record.action_key)
         )
         while True:
-            # Re-measured before every step rather than once per run: `remove_worktree`
-            # changes what the next measurement of this lane can see, and a preflight taken
-            # before a step is not a description of the world after it.
-            preflight = self._measure_cleanup(record, ledger=working_ledger)
+            # Still re-read before every step. The reason R5/R6 needed it was that this
+            # machine's own mutations changed what a later probe could see; nothing it does
+            # now moves the world, but the durable authority is read fresh regardless — an
+            # owner gate or callback can be raised by somebody else between two steps.
+            preflight = self._measure_cleanup(record)
             report.measured_preflight = preflight
             decision = decide_cleanup(
-                self.cleanup_policy,
                 record,
                 preflight,
                 ledger=working_ledger,
@@ -671,9 +618,8 @@ class AutoIntegrationUseCase:
                 )
             if outcome.outcome != OUTCOME_DONE:
                 report.final_decision = decide_cleanup(
-                    self.cleanup_policy,
                     record,
-                    self._measure_cleanup(record, ledger=working_ledger),
+                    self._measure_cleanup(record),
                     ledger=working_ledger,
                     trusted_recorder=self.recorder_id,
                 )
@@ -702,23 +648,11 @@ class AutoIntegrationUseCase:
                 recorded_by=self.recorder_id,
             )
 
-        if step == STEP_WORKTREE_REMOVE:
-            removed = self.operations.remove_worktree(
-                worktree_path=record.worktree_path
-            )
-            return _settled(
-                decision.action_key,
-                step,
-                removed,
-                "worktree removal (no --force)",
-                recorded_by=self.recorder_id,
-            )
-
-        # No step falls through to a destructive default. Until R7 the local branch delete sat
-        # here as the unnamed tail of this dispatch — a shape that runs *something* for any
-        # step the decision names — and review j#96396 finding 2 caught the record that came
-        # out of it claiming a compare-and-swap while the argv was `git branch -D`. There is
-        # no ref delete to reach now, and an unrecognized step is refused rather than mapped
+        # No step falls through to a default. Until R7 the local branch delete sat here as the
+        # unnamed tail of this dispatch — a shape that runs *something* for any step the
+        # decision names — and review j#96396 finding 2 caught the record that came out of it
+        # claiming a compare-and-swap while the argv was `git branch -D`. There is nothing
+        # destructive left to reach, and an unrecognized step is refused rather than mapped
         # onto whatever operation happens to be last.
         return StepOutcome(
             action_key=decision.action_key,
@@ -754,7 +688,6 @@ def _settled(
 
 __all__: Tuple[str, ...] = (
     "integration_policy_from_config",
-    "cleanup_policy_from_config",
     "PushResult",
     "MergeResult",
     "AutoIntegrationGitOperations",

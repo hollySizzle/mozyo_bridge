@@ -602,7 +602,7 @@ def decide_integration(
             next_step=None,
             disposition=disposition,
             reason=(
-                "not a Git workspace; integration and branch cleanup do not apply "
+                "not a Git workspace; there is nothing to integrate "
                 "(the separate process retire is unaffected)"
             ),
         )

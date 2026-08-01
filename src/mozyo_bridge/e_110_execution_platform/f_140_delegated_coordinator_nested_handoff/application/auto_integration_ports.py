@@ -4,18 +4,30 @@ Split from :mod:`...application.auto_integration_actuator` to keep that module i
 module-health line budget; the boundary is a real one either way — these are the seams the
 actuator is defined against, and the use case is what composes them.
 
-What this interface can and cannot express IS the safety story, arrived at over eight review
-rounds. Only three weak mutations exist: a non-force push, a merge in a dedicated worktree
-bound to the expected target parent, and a ``worktree remove`` without ``--force``. There is
-no force push, no rebase, and **no ref delete of any kind** — an operation this port cannot
-express is one the actuator cannot perform, which is the point.
+What this interface can and cannot express IS the safety story, arrived at over nine review
+rounds. Only two mutations exist, both on the integration side: a non-force push, and a merge
+in a dedicated worktree bound to the expected target parent. There is no force push, no
+rebase, **no ref delete of any kind, and no worktree removal** — an operation this port
+cannot express is one the actuator cannot perform, which is the point.
 
-Both ref deletes were removed rather than guarded, for the same reason: R2 review j#96350
-finding 1 retired the remote delete because a remote ref delete has no non-force
-compare-and-swap, and R7 review j#96396 finding 1 retired the local delete because its two
-conditions — the tip is still the recorded one, and no worktree holds the branch — cannot be
-enforced by any single git invocation, so the guarded form left a window in which a commit
-that landed between the check and the delete was destroyed.
+Three destructive operations were removed rather than guarded, and one sentence retired all
+three: *an operation whose safety condition cannot be enforced by the operation itself is not
+offered.*
+
+- the **remote branch delete** (j#96344 finding 1) — a remote ref delete has no non-force
+  compare-and-swap;
+- the **local branch delete** (j#96396 finding 1) — its two conditions cannot be enforced by
+  any single git invocation, and the guarded two-call form was reproduced destroying a commit
+  that landed between the check and the delete;
+- the **worktree removal** (j#96401 finding 1) — ``git worktree remove`` identifies its
+  target by a *path*, which another actor can re-point between the identity probe and the
+  removal; reproduced removing a foreign lane's checkout. ``git worktree lock`` does pin that
+  binding, but no mutation may run while it is held, so the unlock that must precede the
+  removal reopens the window.
+
+The cleanup half therefore needs nothing from this port at all: its one remaining step is on
+:class:`ManagedProcessOperations`, and that primitive's arguments *are* the identity it acts
+on.
 
 The read side matters as much: every fact that gates a mutation is measured through a probe
 here or read through :class:`DurableAuthorityReader`, never accepted from the caller. That
@@ -76,15 +88,13 @@ class MergeResult:
 class AutoIntegrationGitOperations(Protocol):
     """The Git operations the actuator needs, injected so tests drive fakes.
 
-    Only two mutations exist on the integration side (``apply_merge`` / ``push_non_force``)
-    and one on the cleanup side (``remove_worktree``), and every one of them is the *weak*
-    form: there is no force push, no rebase, no ``--force`` worktree removal, and **no ref
-    delete at all** in this interface. An operation this port cannot express is one the
-    actuator cannot perform, which is the point — and it is why R1 review j#96344 finding 1
-    was resolved by DELETING ``delete_remote_branch`` here rather than by adding a guard in
-    front of it, and R7 review j#96396 finding 1 by deleting ``delete_local_branch`` the same
-    way. Neither delete could enforce its own condition in one operation, so neither is
-    offered (see the module docstring for what each one could not enforce).
+    Exactly two mutations exist, both on the integration side (``apply_merge`` /
+    ``push_non_force``), and both are the *weak* form: no force push, no rebase, **no ref
+    delete and no worktree removal anywhere in this interface**. An operation this port
+    cannot express is one the actuator cannot perform, which is the point — and it is why
+    ``delete_remote_branch``, ``delete_local_branch`` and ``remove_worktree`` were each
+    DELETED here rather than guarded (see the module docstring for what each one could not
+    enforce about itself).
     """
 
     def apply_merge(
@@ -154,19 +164,16 @@ class AutoIntegrationGitOperations(Protocol):
         """True iff ``commit`` is reachable from the remote's current ``branch`` tip."""
         ...
 
-    def remove_worktree(self, *, worktree_path: str) -> bool:
-        """Remove the worktree at ``worktree_path`` without ``--force``.
-
-        The only destructive operation on this port, and the reason it survived both delete
-        retirements: a removed checkout is reconstructible from the ref it pointed at, while
-        a deleted ref can take unreachable commits with it.
-        """
-        ...
-
 
 @runtime_checkable
 class ManagedProcessOperations(Protocol):
-    """Releasing the lane's managed pane / process — the one Git-independent cleanup step."""
+    """Releasing the lane's managed pane / process — the only cleanup step there is.
+
+    It survived the three destructive withdrawals for a structural reason rather than a lucky
+    one: ``release_process`` is parameterized by the identity it acts on, so there is no
+    window in which the thing named by its arguments becomes something else. A path and a ref
+    name are late-bound; ``issue`` + ``lane_generation`` is not.
+    """
 
     def release_process(self, *, issue: str, lane_generation: int) -> bool: ...
 
@@ -201,8 +208,9 @@ class CleanupAuthority:
 
     R3 review j#96368 finding 2: every one of these was caller-supplied, and the independent
     reproduction removed a *foreign* lane's worktree and deleted its branch on that basis.
-    The branch delete is gone (j#96396 finding 1); the worktree removal these still gate is
-    not.
+    Both of those steps have since been withdrawn (j#96396 / j#96401 finding 1), and what
+    these still gate is the managed-process release — a cross-lane side effect in exactly the
+    same way, so they are still read fresh from the durable record.
     """
 
     issue_closed: bool = False

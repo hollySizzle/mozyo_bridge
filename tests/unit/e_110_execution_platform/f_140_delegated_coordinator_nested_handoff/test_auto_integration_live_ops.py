@@ -8,10 +8,9 @@ and cannot construct is pinned here rather than left to inspection:
 - the push is a plain non-force push of an exact SHA to ``refs/heads/<branch>`` — no
   ``--force``, no ``--force-with-lease``, no ``+`` refspec;
 - the merge runs in the dedicated worktree and aborts on conflict rather than resolving it;
-- ``git worktree remove`` carries no ``--force``;
-- the adapter has **no ref delete at all**, local or remote (R1 review j#96344 finding 1 and
-  R7 review j#96396 finding 1) — neither delete could enforce its own condition in one
-  invocation, so neither exists to be called;
+- the adapter has **no destructive operation at all** — no ref delete local or remote, and
+  no worktree removal (reviews j#96344 / j#96396 / j#96401, each finding 1). None of the
+  three could enforce its own condition in one invocation, so none exists to be called;
 - ``describe_integration_worktree`` measures the dedicated-worktree identity and reads every
   failure to measure as the unsafe answer;
 - every read probe fails closed when ``git`` could not run.
@@ -194,23 +193,17 @@ class MergeTest(unittest.TestCase):
         self.assertEqual(result.integration_head, "")
 
 
-class CleanupOperationTest(unittest.TestCase):
-    def test_worktree_remove_carries_no_force(self) -> None:
-        recorder = _Recorder([_ok()])
-        self.assertTrue(_adapter(recorder).remove_worktree(worktree_path="/wt"))
-        argv = recorder.argvs[0]
-        self.assertEqual(argv[:2], ("worktree", "remove"))
-        self.assertNotIn("--force", argv)
-        self.assertNotIn("-f", argv)
-
-class NoRefDeleteTest(unittest.TestCase):
-    def test_the_adapter_cannot_delete_a_ref_local_or_remote(self) -> None:
-        # R1 had `delete_remote_branch`; review j#96344 finding 1 found it had no CAS against
-        # the remote tip, and a real CAS needs the prohibited `--force-with-lease`. R1 also
-        # had `delete_local_branch`; review j#96396 finding 1 retired it because its tip
-        # verification and its delete are separate invocations and a commit landing between
-        # them is destroyed. Removed rather than guarded, so there is no argv to get wrong.
-        for gone in ("delete_remote_branch", "delete_local_branch"):
+class NoDestructiveOperationTest(unittest.TestCase):
+    def test_the_adapter_exposes_no_destructive_operation(self) -> None:
+        # Three were shipped and three were retired, each because the property that made it
+        # safe was established in a different invocation from the one that acted:
+        # `delete_remote_branch` (j#96344 finding 1) had no CAS against the remote tip at all;
+        # `delete_local_branch` (j#96396 finding 1) verified the tip and then deleted, and a
+        # commit landing between the two was destroyed; `remove_worktree` (j#96401 finding 1)
+        # took a path whose identity an earlier probe had established, and a foreign lane's
+        # checkout swapped onto that path was removed. Removed rather than guarded, so there
+        # is no argv left to get wrong.
+        for gone in ("delete_remote_branch", "delete_local_branch", "remove_worktree"):
             self.assertFalse(
                 hasattr(LiveAutoIntegrationGitOperations, gone), gone
             )
@@ -219,10 +212,10 @@ class NoRefDeleteTest(unittest.TestCase):
                 "the port must not declare an operation the adapter refuses to provide",
             )
 
-    def test_no_mutation_spells_a_delete(self) -> None:
+    def test_no_mutation_spells_a_delete_or_a_removal(self) -> None:
         # A ref delete is spelled either as an EMPTY refspec source (`:refs/heads/x`) or as a
-        # branch/update-ref delete flag. Drive every mutation the adapter has and assert none
-        # of them produces either shape.
+        # branch/update-ref delete flag; a checkout removal as `worktree remove`. Drive every
+        # mutation the adapter has left and assert none produces any of those shapes.
         recorder = _Recorder([_ok(), _ok(TARGET), _ok(), _ok(MERGE_HEAD), _ok(), _ok(), _ok()])
         operations = _adapter(recorder)
         operations.apply_merge(
@@ -232,10 +225,10 @@ class NoRefDeleteTest(unittest.TestCase):
             expected_target_head=TARGET,
         )
         operations.push_non_force(source_head=SOURCE, target_ref="main")
-        operations.remove_worktree(worktree_path="/wt")
         for argv in recorder.argvs:
             self.assertNotIn("-D", argv)
             self.assertNotEqual(argv[:1], ("update-ref",))
+            self.assertNotEqual(argv[:2], ("worktree", "remove"))
             for token in argv:
                 self.assertFalse(
                     token.startswith(":"), f"{token!r} is a ref-deleting refspec"

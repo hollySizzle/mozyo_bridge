@@ -5,18 +5,16 @@ integration:
 
 - the authorization binding: a cleanup only runs under the exact integration action key
   that authorized it, and a different key refuses rather than being ignored;
-- the always-enforced gates (issue closed, integration confirmed, CI settled green,
-  callbacks drained, owner gates resolved, non-foreign worktree), which stop **every** step
-  including the non-destructive process retire;
-- the step order process_retire -> worktree_remove, one step per call, with a complete stage
-  table on every decision;
-- the j#77124 必須訂正2 safety condition that survived: a worktree is removed only when clean
-  and at its exact registered path, never forced;
-- the non-Git path, where the worktree step is an explicit ``not_applicable`` and the process
-  retire still runs;
-- that this machine deletes **no ref at all**. Both deletes it once had are retired — the
-  remote one by review j#96344 finding 1, the local one by review j#96396 finding 1 — so the
-  toggle-skips-a-later-step's-conditions bug has no ref-deleting step left to reach;
+- the gates (issue closed, integration confirmed, CI settled green, callbacks drained, owner
+  gates resolved, the record naming our own lane), which stop the step even though what is
+  left is non-destructive;
+- that the machine has exactly **one** step, ``process_retire``, and a complete stage table
+  on every decision;
+- that it performs **no Git operation at all**. All three it once had are retired: the remote
+  branch delete (review j#96344 finding 1), the local branch delete (j#96396 finding 1) and
+  the worktree removal (j#96401 finding 1). What is pinned here is the absence — no step, no
+  state, no preflight field and no policy through which any of them can come back without
+  re-arguing the ruling;
 - idempotent resume: a ``done`` step is not re-run, and a stale ledger satisfies nothing.
 
 Pure decisions only — no IO, no git, no use case (those are the integration tests).
@@ -34,7 +32,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCKED_ACTION_KEY_MISMATCH,
     OUTCOME_BLOCKED,
     OUTCOME_DONE,
-    OUTCOME_NOT_APPLICABLE,
     OUTCOME_PENDING,
     StepOutcome,
 )
@@ -43,25 +40,21 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.retirement_cleanup_policy import (
     BLOCKED_CI_UNSETTLED,
-    BLOCKED_DIRTY_WORKTREE,
     BLOCKED_FOREIGN_WORKTREE,
     BLOCKED_INTEGRATION_UNCONFIRMED,
     BLOCKED_ISSUE_NOT_CLOSED,
     BLOCKED_UNRESOLVED_CALLBACK,
     BLOCKED_UNRESOLVED_OWNER_GATE,
-    BLOCKED_WORKTREE_PATH_UNREGISTERED,
     STATE_CLEANUP_BLOCKED,
     STATE_CLEANUP_PREFLIGHT,
     STATE_PROCESS_RETIRING,
     STATE_RETIRED,
-    STATE_WORKTREE_REMOVING,
     CLEANUP_STEPS,
+    GIT_MUTATING_STEPS,
     REF_DELETING_STEPS,
     STEP_PROCESS_RETIRE,
-    STEP_WORKTREE_REMOVE,
     CleanupActionRecord,
     CleanupPreflight,
-    RetirementCleanupPolicy,
     decide_cleanup,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_journal import (
@@ -71,8 +64,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 TIP = "a" * 40
 MOVED = "c" * 40
 AUTHORIZING_KEY = "issue=13686|lane_generation=3|source_head=" + TIP
-
-DEFAULT_POLICY = RetirementCleanupPolicy.default()
 
 
 def _record(**overrides: object) -> CleanupActionRecord:
@@ -91,16 +82,13 @@ def _record(**overrides: object) -> CleanupActionRecord:
 def _clean(**overrides: object) -> CleanupPreflight:
     """A preflight in which every cleanup gate passes."""
     fields: dict = {
-        "is_git_workspace": True,
         "authorizing_action_key": AUTHORIZING_KEY,
         "issue_closed": True,
         "integration_confirmed": True,
         "integration_ci_settled_green": True,
         "callbacks_drained": True,
         "owner_gates_resolved": True,
-        "worktree_is_foreign": False,
-        "worktree_clean": True,
-        "worktree_path_registered": True,
+        "lane_is_foreign": False,
     }
     fields.update(overrides)
     return CleanupPreflight(**fields)  # type: ignore[arg-type]
@@ -115,7 +103,6 @@ class AuthorizationBindingTest(unittest.TestCase):
         # A destructive step must not inherit another action's authorization, so this is a
         # refusal rather than a silently ignored ledger entry.
         decision = decide_cleanup(
-            DEFAULT_POLICY,
             _record(),
             _clean(authorizing_action_key="issue=99999|lane_generation=1"),
         )
@@ -125,7 +112,7 @@ class AuthorizationBindingTest(unittest.TestCase):
 
     def test_a_missing_authorization_refuses(self) -> None:
         decision = decide_cleanup(
-            DEFAULT_POLICY, _record(), _clean(authorizing_action_key="")
+            _record(), _clean(authorizing_action_key="")
         )
         self.assertEqual(decision.blocked_reasons, (BLOCKED_ACTION_KEY_MISMATCH,))
 
@@ -138,28 +125,26 @@ class AlwaysEnforcedGateTest(unittest.TestCase):
             ({"integration_ci_settled_green": False}, BLOCKED_CI_UNSETTLED),
             ({"callbacks_drained": False}, BLOCKED_UNRESOLVED_CALLBACK),
             ({"owner_gates_resolved": False}, BLOCKED_UNRESOLVED_OWNER_GATE),
-            ({"worktree_is_foreign": True}, BLOCKED_FOREIGN_WORKTREE),
+            ({"lane_is_foreign": True}, BLOCKED_FOREIGN_WORKTREE),
         )
         for overrides, reason in cases:
-            decision = decide_cleanup(DEFAULT_POLICY, _record(), _clean(**overrides))
+            decision = decide_cleanup(_record(), _clean(**overrides))
             self.assertEqual(decision.state, STATE_CLEANUP_BLOCKED, overrides)
             self.assertEqual(decision.blocked_reasons, (reason,), overrides)
             self.assertIsNone(decision.next_step, overrides)
 
-    def test_a_failing_gate_stops_even_the_non_destructive_process_retire(self) -> None:
-        # These gates are what establish that the lane is finished; before they pass, not
-        # even releasing the process is authorized.
-        decision = decide_cleanup(DEFAULT_POLICY, _record(), _clean(issue_closed=False))
+    def test_a_failing_gate_stops_the_process_retire(self) -> None:
+        # These gates are what establish that the lane is finished AND that it is ours.
+        # Releasing another lane's managed process is a cross-lane side effect exactly as
+        # removing its checkout was, so being non-destructive earns the step nothing here.
+        decision = decide_cleanup(_record(), _clean(issue_closed=False))
         self.assertIsNone(decision.next_step)
         self.assertEqual(decision.outcome_for(STEP_PROCESS_RETIRE), OUTCOME_PENDING)
 
     def test_an_omitted_preflight_field_is_blocked_not_admitted(self) -> None:
         decision = decide_cleanup(
-            DEFAULT_POLICY,
             _record(),
-            CleanupPreflight(
-                is_git_workspace=True, authorizing_action_key=AUTHORIZING_KEY
-            ),
+            CleanupPreflight(authorizing_action_key=AUTHORIZING_KEY),
         )
         self.assertEqual(decision.state, STATE_CLEANUP_BLOCKED)
         self.assertIn(BLOCKED_ISSUE_NOT_CLOSED, decision.blocked_reasons)
@@ -167,7 +152,6 @@ class AlwaysEnforcedGateTest(unittest.TestCase):
 
     def test_every_failing_gate_is_reported(self) -> None:
         decision = decide_cleanup(
-            DEFAULT_POLICY,
             _record(),
             _clean(issue_closed=False, callbacks_drained=False),
         )
@@ -179,9 +163,9 @@ class AlwaysEnforcedGateTest(unittest.TestCase):
 
 class StepOrderTest(unittest.TestCase):
     def test_preflight_is_an_entry_phase_never_a_resting_state(self) -> None:
-        for preflight in (_clean(), _clean(issue_closed=False), _clean(is_git_workspace=False)):
+        for preflight in (_clean(), _clean(issue_closed=False), _clean(lane_is_foreign=True)):
             self.assertNotEqual(
-                decide_cleanup(DEFAULT_POLICY, _record(), preflight).state,
+                decide_cleanup(_record(), preflight).state,
                 STATE_CLEANUP_PREFLIGHT,
             )
 
@@ -189,169 +173,123 @@ class StepOrderTest(unittest.TestCase):
         record = _record()
         world = _clean()
 
-        first = decide_cleanup(DEFAULT_POLICY, record, world)
+        first = decide_cleanup(record, world)
         self.assertEqual(
             (first.state, first.next_step), (STATE_PROCESS_RETIRING, STEP_PROCESS_RETIRE)
         )
 
+        # The process retire is the only step: nothing follows it, because the worktree
+        # removal that used to (j#96401 finding 1) is gone, as are both ref deletes.
         second = decide_cleanup(
-            DEFAULT_POLICY, record, world, ledger=_ledger(record, STEP_PROCESS_RETIRE)
+            record, world, ledger=_ledger(record, STEP_PROCESS_RETIRE)
         )
-        self.assertEqual(
-            (second.state, second.next_step),
-            (STATE_WORKTREE_REMOVING, STEP_WORKTREE_REMOVE),
-        )
-
-        # The worktree removal is the last step: nothing follows it, because the branch
-        # delete that used to (j#96396 finding 1) is gone.
-        third = decide_cleanup(
-            DEFAULT_POLICY,
-            record,
-            world,
-            ledger=_ledger(record, STEP_PROCESS_RETIRE, STEP_WORKTREE_REMOVE),
-        )
-        self.assertEqual(third.state, STATE_RETIRED)
-        self.assertIsNone(third.next_step)
+        self.assertEqual(second.state, STATE_RETIRED)
+        self.assertIsNone(second.next_step)
 
     def test_stage_table_is_complete_on_every_decision(self) -> None:
         record = _record()
         decision = decide_cleanup(
-            DEFAULT_POLICY, record, _clean(), ledger=_ledger(record, STEP_PROCESS_RETIRE)
+            record, _clean(), ledger=_ledger(record, STEP_PROCESS_RETIRE)
         )
         self.assertEqual(
-            [step for step, _ in decision.step_outcomes],
-            [STEP_PROCESS_RETIRE, STEP_WORKTREE_REMOVE],
+            [step for step, _ in decision.step_outcomes], [STEP_PROCESS_RETIRE]
         )
         self.assertEqual(decision.outcome_for(STEP_PROCESS_RETIRE), OUTCOME_DONE)
-        self.assertEqual(decision.outcome_for(STEP_WORKTREE_REMOVE), OUTCOME_PENDING)
 
 
-class WorktreeRemovalSafetyTest(unittest.TestCase):
-    def test_dirty_worktree_refuses_and_force_is_not_an_answer(self) -> None:
-        record = _record()
-        decision = decide_cleanup(
-            DEFAULT_POLICY,
-            record,
-            _clean(worktree_clean=False),
-            ledger=_ledger(record, STEP_PROCESS_RETIRE),
-        )
-        self.assertEqual(decision.state, STATE_CLEANUP_BLOCKED)
-        self.assertEqual(decision.blocked_reasons, (BLOCKED_DIRTY_WORKTREE,))
-        self.assertEqual(decision.outcome_for(STEP_WORKTREE_REMOVE), OUTCOME_BLOCKED)
-        self.assertIn("--force", decision.reason)
+class NoGitOperationTest(unittest.TestCase):
+    """All three Git steps this machine once had are retired, not guarded.
 
-    def test_unregistered_path_refuses(self) -> None:
-        record = _record()
-        decision = decide_cleanup(
-            DEFAULT_POLICY,
-            record,
-            _clean(worktree_path_registered=False),
-            ledger=_ledger(record, STEP_PROCESS_RETIRE),
-        )
-        self.assertEqual(
-            decision.blocked_reasons, (BLOCKED_WORKTREE_PATH_UNREGISTERED,)
-        )
-
-    def test_a_refused_removal_ends_the_run_without_a_next_step(self) -> None:
-        record = _record()
-        decision = decide_cleanup(
-            DEFAULT_POLICY,
-            record,
-            _clean(worktree_clean=False),
-            ledger=_ledger(record, STEP_PROCESS_RETIRE),
-        )
-        self.assertEqual(decision.state, STATE_CLEANUP_BLOCKED)
-        self.assertIsNone(decision.next_step)
-
-    def test_disabled_removal_is_not_applicable_not_silently_skipped(self) -> None:
-        record = _record()
-        policy = RetirementCleanupPolicy(remove_worktree=False)
-        decision = decide_cleanup(
-            policy, record, _clean(), ledger=_ledger(record, STEP_PROCESS_RETIRE)
-        )
-        self.assertEqual(
-            decision.outcome_for(STEP_WORKTREE_REMOVE), OUTCOME_NOT_APPLICABLE
-        )
-        # `not_applicable`, and then nothing — a turned-off step does not hand off to a
-        # further one, because there is no further one.
-        self.assertEqual(decision.state, STATE_RETIRED)
-        self.assertIsNone(decision.next_step)
-
-
-class NoRefDeleteTest(unittest.TestCase):
-    """R7 review j#96396 finding 1: the local branch delete is retired, not guarded.
-
-    It shipped in R1 as a compare-and-swap on the branch tip, and R7 rebuilt it around
-    ``git branch -D`` so git itself would refuse a branch a worktree still held. Neither form
-    could enforce both conditions at once — the reviewer's reproduction, re-run independently,
-    landed a commit between the tip verification and the delete and watched it be destroyed
-    while the step recorded ``done``. What is pinned here is the *absence*: there is no step,
-    no state, and no policy field through which this machine can delete a ref.
+    The remote branch delete went first (j#96344 finding 1), the local branch delete second
+    (j#96396 finding 1), and the worktree removal last (j#96401 finding 1). Every one of them
+    named its target by something another actor could re-point — a remote ref, a local ref, a
+    path — and checked the property that mattered in a *separate* invocation from the one
+    that acted. What is pinned here is the absence, on every surface a step could come back
+    through: the step tuple, the state set, the blocked vocabulary, and the preflight fields.
     """
 
-    def test_the_worktree_removal_is_the_last_step(self) -> None:
-        record = _record()
-        decision = decide_cleanup(
-            DEFAULT_POLICY,
-            record,
-            _clean(),
-            ledger=_ledger(record, STEP_PROCESS_RETIRE, STEP_WORKTREE_REMOVE),
-        )
-        self.assertEqual(decision.state, STATE_RETIRED)
-        self.assertIsNone(decision.next_step)
-        # And the resting record says where branch cleanup went, rather than being silent
-        # about a step callers used to get.
-        self.assertIn("operator", decision.reason)
+    def test_the_process_retire_is_the_only_step(self) -> None:
+        self.assertEqual(CLEANUP_STEPS, (STEP_PROCESS_RETIRE,))
 
-    def test_no_step_deletes_a_ref(self) -> None:
+    def test_no_step_touches_git(self) -> None:
+        self.assertEqual(GIT_MUTATING_STEPS, frozenset())
         self.assertEqual(REF_DELETING_STEPS, frozenset())
         joined = " ".join(CLEANUP_STEPS).lower()
-        self.assertNotIn("delete", joined)
-        self.assertNotIn("remote", joined)
+        for token in ("delete", "remove", "remote", "worktree", "branch"):
+            self.assertNotIn(token, joined, token)
 
-    def test_no_state_or_policy_field_survives_the_retired_step(self) -> None:
-        # A leftover `branch_cleanup` state or `delete_local_branch` flag would be a seam a
-        # later change could hang a delete back on without re-arguing the ruling.
-        self.assertNotIn(
-            "branch_cleanup", retirement_cleanup_policy.CLEANUP_STATES
-        )
-        self.assertFalse(
-            hasattr(RetirementCleanupPolicy.default(), "delete_local_branch")
-        )
+    def test_the_surviving_step_is_the_one_whose_primitive_takes_its_identity(self) -> None:
+        # Not a coincidence and worth pinning as intent: `release_process(issue,
+        # lane_generation)` cannot be re-pointed between the decision and the call, which is
+        # exactly what a path or a ref name could be.
+        record = _record()
+        decision = decide_cleanup(record, _clean())
+        self.assertEqual(decision.next_step, STEP_PROCESS_RETIRE)
+        self.assertIn(record.issue, decision.reason)
+        self.assertIn(str(record.lane_generation), decision.reason)
 
-    def test_no_preflight_field_promises_branch_protection(self) -> None:
-        # The five branch-shaped facts were the delete's conditions. A caller that could
-        # still set them would be buying a protection nothing evaluates.
+    def test_no_state_survives_a_retired_step(self) -> None:
+        # A leftover `worktree_removing` / `branch_cleanup` state would be a seam a later
+        # change could hang the operation back on without re-arguing the ruling.
+        for gone in ("worktree_removing", "branch_cleanup"):
+            self.assertNotIn(gone, retirement_cleanup_policy.CLEANUP_STATES, gone)
+
+    def test_no_preflight_field_promises_a_protection_nothing_evaluates(self) -> None:
+        # Eight fields were the conditions of the retired steps: five branch-shaped (R7) and
+        # three worktree-shaped (R8). A caller that could still set one would be buying a
+        # protection no gate reads — the failure mode this issue hit three times.
         for gone in (
             "branch_checked_out_elsewhere",
             "unpushed_unique_commits",
             "branch_reachable_from_target",
             "branch_patch_equivalent",
             "branch_tip",
+            "worktree_is_foreign",
+            "worktree_clean",
+            "worktree_path_registered",
+            "is_git_workspace",
         ):
             with self.assertRaises(TypeError, msg=gone):
-                CleanupPreflight(is_git_workspace=True, **{gone: True})
+                CleanupPreflight(**{gone: True})
+
+    def test_the_resting_record_says_where_the_retired_work_went(self) -> None:
+        record = _record()
+        decision = decide_cleanup(
+            record, _clean(), ledger=_ledger(record, STEP_PROCESS_RETIRE)
+        )
+        self.assertEqual(decision.state, STATE_RETIRED)
+        # Silence about a step callers used to get would read as "it happened".
+        self.assertIn("operator", decision.reason)
+        self.assertIn(record.worktree_path, decision.reason)
+        self.assertIn(record.branch, decision.reason)
+
+    def test_the_lane_identity_gate_still_guards_the_surviving_step(self) -> None:
+        # The foreign-lane refusal outlived the steps it was introduced for: releasing
+        # another lane's managed process is the same class of cross-lane side effect.
+        decision = decide_cleanup(_record(), _clean(lane_is_foreign=True))
+        self.assertEqual(decision.state, STATE_CLEANUP_BLOCKED)
+        self.assertEqual(decision.blocked_reasons, (BLOCKED_FOREIGN_WORKTREE,))
+        self.assertIsNone(decision.next_step)
 
 
 class R3LedgerFenceTest(unittest.TestCase):
     """R3 review j#96368 finding 3: order and provenance are checked before any step runs."""
 
-    def test_a_later_step_recorded_without_its_predecessor_is_not_believed(self) -> None:
+    def test_a_step_this_machine_does_not_have_is_not_believed(self) -> None:
+        # The order fence and the unknown-step fence are the same guard: a ledger naming a
+        # step outside `CLEANUP_STEPS` — including one of the three retired ones — is refused
+        # rather than ignored, so a stale record cannot resurrect a withdrawn step's `done`.
         record = _record()
-        decision = decide_cleanup(
-            DEFAULT_POLICY,
-            record,
-            _clean(),
-            # the worktree removal claims to be done while the process retire never was
-            ledger=_ledger(record, STEP_WORKTREE_REMOVE),
-        )
-        self.assertEqual(decision.state, STATE_CLEANUP_BLOCKED)
-        self.assertIsNone(decision.next_step)
+        for foreign_step in ("worktree_remove", "local_branch_delete", "remote_branch_delete"):
+            decision = decide_cleanup(
+                record, _clean(), ledger=_ledger(record, foreign_step)
+            )
+            self.assertEqual(decision.state, STATE_CLEANUP_BLOCKED, foreign_step)
+            self.assertIsNone(decision.next_step, foreign_step)
 
     def test_a_ledger_this_actuator_did_not_write_does_not_count(self) -> None:
         record = _record()
         decision = decide_cleanup(
-            DEFAULT_POLICY,
             record,
             _clean(),
             ledger=[
@@ -365,73 +303,29 @@ class R3LedgerFenceTest(unittest.TestCase):
         self.assertEqual(decision.next_step, STEP_PROCESS_RETIRE)
 
 
-class R1ReviewFinding1RegressionTest(unittest.TestCase):
-    """No policy toggle can leave a ref delete running with its conditions unevaluated."""
-
-    def test_the_r1_input_reaches_no_further_step(self) -> None:
-        # The exact R1 input: every worktree condition violated and the removal turned off.
-        # R1 answered `next_step=remote_branch_delete` — a ref delete reached with another
-        # step's conditions unevaluated. R7 would have answered `local_branch_delete`. There
-        # is nothing left to reach.
-        record = _record()
-        decision = decide_cleanup(
-            RetirementCleanupPolicy(remove_worktree=False),
-            record,
-            _clean(worktree_clean=False, worktree_path_registered=False),
-            ledger=_ledger(record, STEP_PROCESS_RETIRE),
-        )
-        self.assertEqual(decision.state, STATE_RETIRED)
-        self.assertIsNone(decision.next_step)
-        self.assertEqual(
-            decision.outcome_for(STEP_WORKTREE_REMOVE), OUTCOME_NOT_APPLICABLE
-        )
-
-
 class NonGitWorkspaceTest(unittest.TestCase):
-    def test_process_retire_runs_and_the_git_steps_are_not_applicable(self) -> None:
+    def test_the_machine_is_identical_in_a_non_git_workspace(self) -> None:
+        # There used to be a `is_git_workspace` branch marking the Git steps `not_applicable`.
+        # With no Git step left the distinction cannot change an outcome, so the field is gone
+        # rather than kept and ignored — and this is what pins that the non-Git lane, which
+        # only ever had the process retire, still gets exactly it.
         record = _record()
-        world = _clean(is_git_workspace=False)
-
-        first = decide_cleanup(DEFAULT_POLICY, record, world)
+        first = decide_cleanup(record, _clean())
         self.assertEqual(first.next_step, STEP_PROCESS_RETIRE)
 
         second = decide_cleanup(
-            DEFAULT_POLICY, record, world, ledger=_ledger(record, STEP_PROCESS_RETIRE)
+            record, _clean(), ledger=_ledger(record, STEP_PROCESS_RETIRE)
         )
         self.assertEqual(second.state, STATE_RETIRED)
         self.assertIsNone(second.next_step)
-        self.assertEqual(
-            second.outcome_for(STEP_WORKTREE_REMOVE), OUTCOME_NOT_APPLICABLE
-        )
-
-    def test_a_non_git_lane_is_not_blocked_by_the_foreign_worktree_gate(self) -> None:
-        # There is no worktree to be foreign; the gate must not fire on its fail-closed
-        # default and strand every directory-scaffold lane.
-        record = _record()
-        decision = decide_cleanup(
-            DEFAULT_POLICY,
-            record,
-            CleanupPreflight(
-                is_git_workspace=False,
-                authorizing_action_key=AUTHORIZING_KEY,
-                issue_closed=True,
-                integration_confirmed=True,
-                integration_ci_settled_green=True,
-                callbacks_drained=True,
-                owner_gates_resolved=True,
-            ),
-        )
-        self.assertEqual(decision.next_step, STEP_PROCESS_RETIRE)
+        self.assertEqual([step for step, _ in second.step_outcomes], [STEP_PROCESS_RETIRE])
 
 
 class IdempotencyTest(unittest.TestCase):
     def test_a_done_step_is_not_re_run(self) -> None:
         record = _record()
         decision = decide_cleanup(
-            DEFAULT_POLICY,
-            record,
-            _clean(),
-            ledger=_ledger(record, STEP_PROCESS_RETIRE, STEP_WORKTREE_REMOVE),
+            record, _clean(), ledger=_ledger(record, STEP_PROCESS_RETIRE)
         )
         self.assertEqual(decision.state, STATE_RETIRED)
         self.assertIsNone(decision.next_step)
@@ -440,7 +334,6 @@ class IdempotencyTest(unittest.TestCase):
         record = _record()
         stale = _record(recorded_source_head=MOVED)
         decision = decide_cleanup(
-            DEFAULT_POLICY,
             record,
             _clean(),
             ledger=[StepOutcome(stale.action_key, STEP_PROCESS_RETIRE, OUTCOME_DONE)],
@@ -450,7 +343,6 @@ class IdempotencyTest(unittest.TestCase):
     def test_a_blocked_step_outcome_does_not_count_as_progress(self) -> None:
         record = _record()
         decision = decide_cleanup(
-            DEFAULT_POLICY,
             record,
             _clean(),
             ledger=[StepOutcome(record.action_key, STEP_PROCESS_RETIRE, OUTCOME_BLOCKED)],
@@ -461,27 +353,22 @@ class IdempotencyTest(unittest.TestCase):
 class JournalRendererTest(unittest.TestCase):
     def test_blocked_record_names_the_zero_side_effect(self) -> None:
         record = _record()
-        decision = decide_cleanup(
-            DEFAULT_POLICY,
-            record,
-            _clean(worktree_clean=False),
-            ledger=_ledger(record, STEP_PROCESS_RETIRE),
-        )
+        decision = decide_cleanup(record, _clean(lane_is_foreign=True))
         rendered = render_cleanup_journal(decision, record)
         self.assertIn("## cleanup_blocked", rendered)
-        self.assertIn(BLOCKED_DIRTY_WORKTREE, rendered)
-        self.assertIn("no worktree removed", rendered)
-        self.assertIn("deletes no ref at all", rendered)
+        self.assertIn(BLOCKED_FOREIGN_WORKTREE, rendered)
+        self.assertIn("no process released", rendered)
+        self.assertIn("removes no checkout and deletes no ref at all", rendered)
 
     def test_record_emits_the_full_stage_table(self) -> None:
         record = _record()
         decision = decide_cleanup(
-            DEFAULT_POLICY, record, _clean(), ledger=_ledger(record, STEP_PROCESS_RETIRE)
+            record, _clean(), ledger=_ledger(record, STEP_PROCESS_RETIRE)
         )
         rendered = render_cleanup_journal(decision, record)
         self.assertIn("## retirement cleanup decision", rendered)
         self.assertIn(f"- step.{STEP_PROCESS_RETIRE}: {OUTCOME_DONE}", rendered)
-        self.assertIn(f"- step.{STEP_WORKTREE_REMOVE}: {OUTCOME_PENDING}", rendered)
+        self.assertNotIn("worktree_remove", rendered)
         self.assertIn(f"- integration_action_key: {AUTHORIZING_KEY}", rendered)
 
 

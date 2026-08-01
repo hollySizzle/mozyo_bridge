@@ -11,12 +11,14 @@ commit the action measured on the remote, not the dedicated worktree's local tip
 carrying one extra unreviewed commit produced a merge containing it, and the push was
 accepted because it was still a fast-forward).
 
-The branch-delete tests this module also carried are gone with the operation. R7 review
-j#96396 finding 1 reproduced the residual its docstring admitted — a commit landing between
-the tip verification and the delete was destroyed while the step recorded ``done`` — and the
-delete was retired rather than guarded again, because no single ``git`` invocation enforces
-both its tip condition and its no-holding-worktree condition. :class:`NoRefDeleteTest` pins
-the absence against the same real binary the delete used to run through.
+The destructive-operation tests this module also carried are gone with the operations
+themselves. Three were withdrawn, each because the property that made it safe was established
+in a *different* invocation from the one that acted — j#96396 finding 1 for the local branch
+delete (a commit landing in the window was destroyed) and j#96401 finding 1 for the worktree
+removal (a foreign lane's checkout swapped onto the measured path was removed).
+:class:`NoDestructiveOperationTest` pins the absence, and keeps the measurements the
+withdrawals rest on executable against the same real binary — so a future ``git`` that closes
+either gap will say so rather than being remembered wrongly.
 
 Hermetic: every repository is created under a fresh ``TemporaryDirectory`` and no remote is
 contacted. The tests skip when ``git`` is unavailable rather than failing, so the suite stays
@@ -134,15 +136,15 @@ class MergeParentBindingTest(unittest.TestCase):
 
 
 @unittest.skipIf(_GIT is None, "git is not available on PATH")
-class NoRefDeleteTest(unittest.TestCase):
-    """The adapter deletes no ref, and the reason is measurable on the binary itself."""
+class NoDestructiveOperationTest(unittest.TestCase):
+    """The adapter destroys nothing, and the reason is measurable on the binary itself."""
 
-    def test_the_adapter_exposes_no_ref_deleting_operation(self) -> None:
-        for gone in ("delete_local_branch", "delete_remote_branch"):
+    def test_the_adapter_exposes_no_destructive_operation(self) -> None:
+        for gone in ("delete_local_branch", "delete_remote_branch", "remove_worktree"):
             self.assertFalse(hasattr(LiveAutoIntegrationGitOperations, gone), gone)
 
     def test_no_git_primitive_enforces_both_delete_conditions_at_once(self) -> None:
-        """The measurement the retirement rests on, kept executable rather than asserted.
+        """The measurement the branch-delete withdrawal rests on, kept executable.
 
         If a future git makes one invocation enforce both conditions — the ref still points
         at the recorded tip AND no worktree holds it — this test is what will notice, and the
@@ -222,6 +224,95 @@ class NoRefDeleteTest(unittest.TestCase):
             self.assertNotEqual(txn.returncode, 0)
             self.assertIn("multiple updates", txn.stderr)
             self.assertEqual(_git(repo, "rev-parse", "lane"), tip)
+
+    def test_no_git_primitive_binds_a_worktree_removal_to_an_identity(self) -> None:
+        """The measurement the worktree-removal withdrawal rests on, kept executable.
+
+        Review j#96401 finding 1 asked for the identity to be verified *inside* the mutation
+        primitive or under a lock held across it. Neither is constructible, and this is where
+        that claim is checked rather than asserted.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            # (a) `worktree remove` takes no expected-identity argument at all.
+            repo = root / "flags"
+            _init(repo)
+            _commit(repo, "a.txt", "base")
+            usage = subprocess.run(
+                ["git", "worktree", "remove", "-h"], cwd=repo, capture_output=True, text=True
+            )
+            options = (usage.stdout + usage.stderr).lower()
+            # The whole option surface is one flag, and it is the one we may not use.
+            self.assertIn("force", options)
+            for absent in ("--expect", "--branch", "--if-", "--verify", "--head"):
+                self.assertNotIn(absent, options, absent)
+
+            # (b) the admin entry name is REUSED after a swap, so it is not instance identity.
+            repo = root / "name"
+            _init(repo)
+            _commit(repo, "a.txt", "base")
+            _git(repo, "branch", "lane")
+            _git(repo, "branch", "foreign")
+            path = root / "wt-name"
+            _git(repo, "worktree", "add", "-q", str(path), "lane")
+            admin = repo / ".git" / "worktrees"
+            before = sorted(entry.name for entry in admin.iterdir())
+            _git(repo, "worktree", "remove", str(path))
+            _git(repo, "worktree", "add", "-q", str(path), "foreign")
+            self.assertEqual(before, sorted(entry.name for entry in admin.iterdir()))
+
+            # (c) `worktree lock` DOES pin the path->entry binding against every git-level
+            #     takeover — and that is why it looks like an answer...
+            repo = root / "lock"
+            _init(repo)
+            _commit(repo, "a.txt", "base")
+            _git(repo, "branch", "lane")
+            _git(repo, "branch", "foreign")
+            path = root / "wt-lock"
+            _git(repo, "worktree", "add", "-q", str(path), "lane")
+            _git(repo, "worktree", "lock", "--reason", "ours", str(path))
+            competitor = subprocess.run(
+                ["git", "worktree", "remove", str(path)],
+                cwd=repo, capture_output=True, text=True,
+            )
+            self.assertNotEqual(competitor.returncode, 0)
+            shutil.rmtree(path)
+            _git(repo, "worktree", "prune")
+            readd = subprocess.run(
+                ["git", "worktree", "add", "-q", str(path), "foreign"],
+                cwd=repo, capture_output=True, text=True,
+            )
+            self.assertNotEqual(readd.returncode, 0)
+            self.assertIn("locked", readd.stderr)
+
+            # ... (d) ...but NO mutation runs while it is held, so the unlock that must come
+            #     first reopens exactly the window the lock was supposed to close.
+            repo = root / "held-lock"
+            _init(repo)
+            _commit(repo, "a.txt", "base")
+            _git(repo, "branch", "lane")
+            path = root / "wt-held"
+            _git(repo, "worktree", "add", "-q", str(path), "lane")
+            _git(repo, "worktree", "lock", "--reason", "ours", str(path))
+            for argv in (
+                ["git", "worktree", "remove", str(path)],
+                ["git", "worktree", "remove", "--force", str(path)],
+                ["git", "worktree", "move", str(path), str(root / "moved")],
+            ):
+                result = subprocess.run(cwd=repo, args=argv, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0, argv)
+                self.assertIn("locked", result.stderr, argv)
+
+            # (e) and the lock is not even an ownership token: anyone unlocks it without
+            #     presenting the reason.
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "worktree", "unlock", str(path)],
+                    cwd=repo, capture_output=True,
+                ).returncode,
+                0,
+            )
 
 
 if __name__ == "__main__":  # pragma: no cover - manual invocation

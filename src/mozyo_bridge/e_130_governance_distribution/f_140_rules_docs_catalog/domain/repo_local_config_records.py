@@ -58,7 +58,6 @@ AUTO_INTEGRATION_KEYS: frozenset[str] = frozenset(
         "mode",
         "integration_branch",
         "ff_only",
-        "remove_worktree",
     }
 )
 #: ``mode: auto`` advances the integration once every gate is satisfied; ``disabled``
@@ -89,18 +88,22 @@ DEFAULT_FF_ONLY: bool = True
 # required check is demanded, not whether one is; reading it as the latter makes that journal
 # contradict itself. Both gates are unconditional in the state machine, so a key that could
 # turn one off would be a key the runtime ignores.
-DEFAULT_REMOVE_WORKTREE: bool = True
-# There is deliberately no `delete_remote_branch` and no `delete_local_branch` key, and the
-# two were removed for the same reason at different rounds. R1 shipped a remote delete
-# (default False per j#96335); review j#96344 finding 1 found the step it enabled bypassed
-# every local CAS condition and had no compare-and-swap against the remote tip, and a
-# remote-ref CAS requires `--force-with-lease`, a force that j#96335 prohibits. R1 also
-# shipped a local delete; review j#96396 finding 1 retired it because its two conditions —
-# the tip is still the recorded one, no worktree holds the branch — cannot both be enforced
-# by one `git` invocation (measured on 2.50.1), and the two-invocation form was reproduced
-# destroying a commit that landed in the window. Neither key is left as a way to ask for an
-# operation that cannot be performed safely. Whether a non-force / atomic path exists is an
-# owner/design question (recorded on #13686).
+# There is deliberately no post-close cleanup key at all — no `remove_worktree`, no
+# `delete_local_branch`, no `delete_remote_branch`. R1 shipped all three steps and all three
+# were withdrawn, each for the same reason: an operation whose safety condition cannot be
+# enforced by the operation itself is not offered.
+#
+#   - remote branch delete (j#96344 finding 1): no compare-and-swap against the remote tip,
+#     and a real one needs `--force-with-lease`, a force that j#96335 prohibits;
+#   - local branch delete (j#96396 finding 1): its two conditions cannot both be enforced by
+#     one `git` invocation (measured on 2.50.1), and the two-call form was reproduced
+#     destroying a commit that landed in the window;
+#   - worktree removal (j#96401 finding 1): `git worktree remove` names its target by a path
+#     another actor can re-point between the identity probe and the removal; reproduced
+#     removing a foreign lane's checkout.
+#
+# A key that turns off a step that does not exist is a key the runtime ignores, so none is
+# offered. Whether an atomic path exists is an owner/design question (recorded on #13686).
 #: The closed set of recognized keys inside the ``agent_launch`` sub-record
 #: (Redmine #13155): the per-role / lane managed-pane launch model knob. ``version``
 #: is optional and defaults to :data:`REPO_LOCAL_CONFIG_VERSION`; ``sublane_claude_model``
@@ -380,17 +383,11 @@ class AutoIntegrationConfig:
       commit created in a dedicated integration worktree; it does **not** admit a rebase or
       a force push, neither of which this schema can express.
 
-    Post-close cleanup fields:
-
-    - :attr:`remove_worktree` — remove the lane's worktree after close. The removal itself is
-      still only ever performed against a clean worktree at its exact registered path and
-      never with ``--force``; this flag can only turn the step *off*.
-    There is deliberately no ``delete_local_branch``. R1 shipped one; review j#96396
-    finding 1 retired the step it toggled, because the delete's two conditions — the ref tip
-    is still the recorded one, and no worktree holds the branch — cannot both be enforced by
-    a single ``git`` invocation, and the guarded two-invocation form was reproduced deleting
-    a commit that landed between the check and the delete. No step in either state machine
-    deletes a ref now, so there is nothing for such a key to turn off.
+    **There are no post-close cleanup fields.** R1 had three (``remove_worktree``,
+    ``delete_local_branch``, ``delete_remote_branch``) and every step they toggled has since
+    been withdrawn (see the comment above :data:`AUTO_INTEGRATION_KEYS`), leaving the cleanup
+    machine one unconditional step. A key that can only turn off something that does not
+    exist is a key the runtime ignores.
 
     Boundary, kept enforced in code (this is *policy intent*, not authority):
 
@@ -405,15 +402,14 @@ class AutoIntegrationConfig:
       ``send`` / credential, …) is rejected by the same closed-schema screen the rest of this
       module enforces — which is also why the ff / CI / cleanup fields are spelled without
       those tokens.
-    - **Force push, auto-rebase, ref deletion (local or remote), and CI-gate removal are not
-      expressible.** There is no field for any of them by construction, so no config can
-      request one.
+    - **Force push, auto-rebase, ref deletion (local or remote), worktree removal, and
+      CI-gate removal are not expressible.** There is no field for any of them by
+      construction, so no config can request one.
     """
 
     mode: str = DEFAULT_AUTO_INTEGRATION_MODE
     integration_branch: Optional[str] = None
     ff_only: bool = DEFAULT_FF_ONLY
-    remove_worktree: bool = DEFAULT_REMOVE_WORKTREE
 
     @classmethod
     def default(cls) -> "AutoIntegrationConfig":
@@ -462,9 +458,6 @@ class AutoIntegrationConfig:
             mode=mode,
             integration_branch=integration_branch,
             ff_only=_checked_bool(record, "ff_only", DEFAULT_FF_ONLY, source=source),
-            remove_worktree=_checked_bool(
-                record, "remove_worktree", DEFAULT_REMOVE_WORKTREE, source=source
-            ),
         )
 
 
@@ -617,7 +610,6 @@ __all__ = (
     "AUTO_INTEGRATION_MODE_DISABLED",
     "DEFAULT_AUTO_INTEGRATION_MODE",
     "DEFAULT_FF_ONLY",
-    "DEFAULT_REMOVE_WORKTREE",
     "AGENT_LAUNCH_KEYS",
     "RepoLocalConfigError",
     "_reject_boundary_token",

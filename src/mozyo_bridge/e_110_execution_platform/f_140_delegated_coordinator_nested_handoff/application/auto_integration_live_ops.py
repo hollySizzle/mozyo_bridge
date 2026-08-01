@@ -2,7 +2,7 @@
 
 The concrete :class:`~...application.auto_integration_actuator.AutoIntegrationGitOperations`
 implementation: real ``git`` invocations for the read probes the action-time preflight needs
-and for the three weak mutations the port defines. It replaces the deliberately gated
+and for the two weak mutations the port defines. It replaces the deliberately gated
 ``LiveSublaneGitOperations.merge_to_integration_branch`` ``NotImplementedError``, which was
 held closed until this issue's design consultation (j#77124) and owner decision (j#96335)
 settled what an auto-integration is allowed to be.
@@ -15,10 +15,8 @@ What the adapter can and cannot express is the safety story, so it is enumerated
   refspec and a branch name is not trusted to be free of it.
 - **Merge is `--no-ff` inside a dedicated worktree**, never in the lane's checkout, and never
   with a conflict resolution strategy. A conflict aborts the merge and is reported.
-- **`git worktree remove` runs without `--force`.** git itself then refuses a dirty or
-  unregistered worktree, so the refusal has a second, independent enforcer.
-- **No ref is deleted here — local or remote.** Both deletes were shipped and both were
-  removed, because neither could enforce its own condition in one invocation:
+- **Nothing here is destructive.** A ref delete, and now a worktree removal, were shipped and
+  removed, because none of them could enforce its own condition in one invocation:
 
   - the remote delete (R1, retired by review j#96344 finding 1) had no compare-and-swap
     against the remote tip and ran even when every local condition failed; a real CAS on a
@@ -30,11 +28,23 @@ What the adapter can and cannot express is the safety story, so it is enumerated
     refuses the held branch atomically but takes no tip constraint (a second argument is
     read as another *branch name*); and ``update-ref --stdin`` refuses ``verify`` +
     ``delete`` on one ref (``multiple updates for ref ... not allowed``). R7's two-invocation
-    form was reproduced destroying a commit that landed in the window between them.
+    form was reproduced destroying a commit that landed in the window between them;
+  - the worktree removal (retired by review j#96401 finding 1) named its target by *path*.
+    ``git worktree remove`` checks that the path is registered and clean — both inside the
+    invocation, both worth having — but nothing about *whose* checkout it is; that was a
+    separate ``worktree list`` probe. Reproduced: replacing our lane's checkout with a
+    foreign lane's clean one at the same path between the probe and the removal removed the
+    foreign checkout, and the step recorded ``done``. Measured alternatives, all on git
+    2.50.1: ``worktree remove`` has no expected-identity argument; the admin entry name under
+    ``$GIT_DIR/worktrees`` is reused after such a swap, so it is not instance identity; and
+    while ``worktree lock`` genuinely pins the path→entry binding (a competitor's ``remove``
+    is refused, ``prune`` skips it, and even after an ``rm -rf`` a re-``add`` fails with *"is
+    a missing but locked worktree"*), **no mutation runs while the lock is held** —
+    ``remove`` and ``move`` both demand ``-f -f`` — so the unlock reopens the window, and the
+    lock is not even attributable, since anyone may ``worktree unlock`` without the reason.
 
-  Deleting a lane branch is an operator step in the ``preflight_sublane_retire`` runbook,
-  where ``git branch -d`` refuses unmerged work and a human decides. Nothing here deletes or
-  rewrites any ref.
+  Removing a lane's worktree and branch is an operator step in the ``preflight_sublane_retire``
+  runbook, where a human decides. Nothing here removes a checkout or touches any ref.
 
 Every probe fails closed: a ``git`` that could not run has proven nothing, so a failed
 invocation reads as the unsafe answer (not a workspace, not an ancestor, not reachable,
@@ -374,11 +384,6 @@ class LiveAutoIntegrationGitOperations:
                 f"{result.stderr.strip()}"
             ),
         )
-
-    def remove_worktree(self, *, worktree_path: str) -> bool:
-        """Remove the worktree without ``--force`` (git refuses a dirty / unregistered one)."""
-        result = self._run("worktree", "remove", "--end-of-options", worktree_path)
-        return result.returncode == 0
 
 
 __all__ = (
