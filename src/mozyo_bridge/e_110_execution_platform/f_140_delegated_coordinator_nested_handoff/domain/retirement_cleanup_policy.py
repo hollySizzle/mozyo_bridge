@@ -138,17 +138,22 @@ BLOCKED_CI_UNSETTLED = "integration_ci_unsettled"
 BLOCKED_UNRESOLVED_CALLBACK = "unresolved_callback"
 #: An owner / release gate is unresolved.
 BLOCKED_UNRESOLVED_OWNER_GATE = "unresolved_owner_gate"
-#: The record does not name this actuator's own lane. Refused outright: releasing another
-#: lane's managed process is a cross-lane side effect exactly as removing its checkout was.
-#: The literal is unchanged so durable records written by earlier rounds stay readable.
-BLOCKED_FOREIGN_WORKTREE = "foreign_worktree"
+#: The record does not name this actuator's own lane — issue, lane generation, branch and
+#: worktree path must ALL match its configuration. Refused outright: releasing another lane's
+#: managed process is a cross-lane side effect exactly as removing its checkout was.
+#:
+#: R9 kept the older ``foreign_worktree`` literal "for existing durable records"; review
+#: j#96406 finding 4 pointed out that no such records exist — the production durable reader
+#: and ledger are #14825, unimplemented — so the name was being kept wrong for a
+#: compatibility that has no instances. It says what it means now.
+BLOCKED_LANE_IDENTITY_MISMATCH = "lane_identity_mismatch"
 #: The ledger's recorded steps are out of dependency order or carry foreign provenance.
 BLOCKED_LEDGER_UNTRUSTWORTHY = "ledger_untrustworthy"
 
 _BLOCKED_REASON_PRECEDENCE: Tuple[str, ...] = (
     BLOCKED_ACTION_KEY_MISMATCH,
     BLOCKED_LEDGER_UNTRUSTWORTHY,
-    BLOCKED_FOREIGN_WORKTREE,
+    BLOCKED_LANE_IDENTITY_MISMATCH,
     BLOCKED_ISSUE_NOT_CLOSED,
     BLOCKED_INTEGRATION_UNCONFIRMED,
     BLOCKED_CI_UNSETTLED,
@@ -364,7 +369,7 @@ def decide_cleanup(
     if not preflight.owner_gates_resolved:
         blockers.add(BLOCKED_UNRESOLVED_OWNER_GATE)
     if preflight.lane_is_foreign:
-        blockers.add(BLOCKED_FOREIGN_WORKTREE)
+        blockers.add(BLOCKED_LANE_IDENTITY_MISMATCH)
     if blockers:
         ordered = _order_reasons(blockers)
         return CleanupDecision(
@@ -451,7 +456,7 @@ __all__ = (
     "BLOCKED_CI_UNSETTLED",
     "BLOCKED_UNRESOLVED_CALLBACK",
     "BLOCKED_UNRESOLVED_OWNER_GATE",
-    "BLOCKED_FOREIGN_WORKTREE",
+    "BLOCKED_LANE_IDENTITY_MISMATCH",
     "BLOCKED_LEDGER_UNTRUSTWORTHY",
     "CleanupActionRecord",
     "CleanupPreflight",

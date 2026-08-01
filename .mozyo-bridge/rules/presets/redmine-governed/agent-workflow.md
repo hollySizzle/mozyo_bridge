@@ -454,9 +454,10 @@ origin到達可能性:
       - lane worktree が clean かつ foreign でなく、unique な unpushed commit を持たないこと
       - 未解決の callback / owner 判断 / release gate が無いこと
     実行形態:
-      - 既定は ff-only の normal (non-force) push。non-ff を許す設定でも merge commit は専用 integration worktree で作り、lane worktree で target branch を checkout しない。**専用 worktree であることは主張ではなく検査**とする — registered / lane worktree でない / clean を action-time に測り、満たさなければ apply しない
+      - 既定は ff-only の normal (non-force) push。non-ff を許す設定でも **merge commit は checkout の外で object として組む** (`git merge-tree --write-tree` + `git commit-tree`)。どの worktree も switch せず、index も ref も HEAD も動かさない。first parent は action-time に測定した target head と exact 一致させる。**「専用 worktree を検査してからそこで merge する」形は採らない** — path は late-bound であり、検査と mutation の間に別 lane の checkout へ差し替えられ得ることが再現された (#13686 j#96406)。merge の失敗は **content conflict と primitive 不可用を別事由として記録**する
       - 統合先は **設定された integration branch と exact 一致**していること。「既知の integration branch である」ことと「この actuator に指定された branch である」ことは別の制約であり、前者だけでは config を守らない
-      - **safety fact を測るのは actuator であり、依頼者ではない。** 専用 worktree identity・confirmation のように「これは安全である」と述べる値は、caller が渡した値を検査するのではなく actuator 自身が action-time に測定して上書きする。型を与えても測定者を固定しなければ自己申告のままである
+      - **safety fact を測るのは actuator であり、依頼者ではない。** confirmation のように「これは安全である」と述べる値は、caller が渡した値を検査するのではなく actuator 自身が action-time に測定して上書きする。型を与えても測定者を固定しなければ自己申告のままである
+      - **検証した値と mutation が消費する値を一致させる。** 別の値を検証して別の値で操作する形は検査になっていない。可能なら操作対象を **object id や primitive の引数そのもの**で束縛し、path・ref 名・pane locator のような late-bound な名前を対象指定に使わない (#13686 j#96406)
       - conflict / non-ff / target drift / push 拒否は fail-closed。rebase も force も代替手段にしない
       - 統合 SHA に対する CI は **非同期 gate** として別 state で待つ。単一の同期 command 内で CI 完了を仮定しない。CI green は **bool ではなく照合可能な記録**で受ける — required check の identity + run id + conclusion + 対象 commit を持ち、**push が着地した head と exact-match** すること (`### Hibernate Evidence Marker Contract` の `required_ci_green` と同形)。無関係な green run が gate を満たしてはならない
       - **CI gate 自体は config で外せない。** どの required check を要求するかは設定事項だが、要求するか否かは設定事項ではない。gate を外した統合は close 後 cleanup の前提 (統合 SHA CI green) と接続できず、cleanup が永久 block するか未実行 CI の自己申告で破壊的 step へ進むかのどちらかになる

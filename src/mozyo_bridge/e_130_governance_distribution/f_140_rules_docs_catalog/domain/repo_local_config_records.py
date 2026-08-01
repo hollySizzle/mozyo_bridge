@@ -380,8 +380,8 @@ class AutoIntegrationConfig:
     - :attr:`integration_branch` — the configured target ref. ``None`` defers to runtime
       resolution, and a runtime that cannot resolve one fails closed rather than guessing.
     - :attr:`ff_only` — fast-forward-only (the owner's default). ``False`` admits a merge
-      commit created in a dedicated integration worktree; it does **not** admit a rebase or
-      a force push, neither of which this schema can express.
+      commit, built from objects and never inside a checkout; it does **not** admit a rebase
+      or a force push, neither of which this schema can express.
 
     **There are no post-close cleanup fields.** R1 had three (``remove_worktree``,
     ``delete_local_branch``, ``delete_remote_branch``) and every step they toggled has since

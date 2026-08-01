@@ -42,7 +42,7 @@ from typing import List, Optional, Protocol, Sequence, runtime_checkable
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_records import (
     IntegrationActionRecord,
     IntegrationCiEvidence,
-    IntegrationWorktree,
+    LaneWorktree,
     StepOutcome,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.retirement_cleanup_policy import (
@@ -98,25 +98,27 @@ class AutoIntegrationGitOperations(Protocol):
     """
 
     def apply_merge(
-        self,
-        *,
-        source_head: str,
-        target_ref: str,
-        integration_worktree: str,
-        expected_target_head: str,
+        self, *, source_head: str, target_ref: str, expected_target_head: str
     ) -> MergeResult:
-        """Merge ``source_head`` into ``target_ref`` inside ``integration_worktree``.
+        """Build the merge commit **as objects**: no checkout, no index, no ref, no HEAD.
 
-        The dedicated worktree is required (j#77124): the lane's own worktree never checks
-        the target branch out. A conflict is reported, never auto-resolved.
+        Every argument is an object id or a name used only for the commit message, so there is
+        nothing here that another actor can re-point between the decision and the mutation.
+        An implementation MUST make ``expected_target_head`` the first parent, MUST NOT switch
+        or modify any checkout, and MUST NOT move any ref — the push step is the only thing
+        that publishes the result.
 
-        ``expected_target_head`` is the commit the merge's target parent MUST be. R6 review
-        j#96391 finding 1: the adapter switched to the target branch and merged onto whatever
-        that worktree's local tip happened to be, so a dedicated worktree carrying an extra
-        unreviewed commit produced a merge containing it — and the push, being a fast-forward
-        from the remote's point of view, was accepted. Reading the target head from the remote
-        (R4) and merging onto the remote's commit are two different claims; only the first was
-        implemented. An implementation MUST refuse when the local target tip differs.
+        There used to be an ``integration_worktree`` argument, and the whole j#77124
+        dedicated-checkout apparatus behind it. R6 review j#96391 finding 1 first bound the
+        merge's parent to the measured remote target (the adapter had been merging onto
+        whatever the checkout's local tip happened to be), and review j#96406 finding 1 then
+        reproduced the deeper problem: a foreign lane's clean checkout swapped onto that path
+        between the identity probe and the merge was switched off its own branch and had the
+        merge built on it, and the call still returned ``conflicted=False``. A path is a name;
+        a gate in front of a name is a check, not a guarantee. Objects have no such gap.
+
+        A conflict is reported, never auto-resolved, and it MUST be distinguishable from the
+        merge primitive being unavailable.
         """
         ...
 
@@ -124,10 +126,8 @@ class AutoIntegrationGitOperations(Protocol):
         """Push ``source_head`` to ``target_ref`` with a normal, non-force push."""
         ...
 
-    def describe_integration_worktree(
-        self, *, path: str, lane_worktree: str
-    ) -> IntegrationWorktree:
-        """MEASURE the dedicated integration worktree's identity (read-only).
+    def describe_lane_worktree(self, *, path: str) -> LaneWorktree:
+        """MEASURE the LANE's own checkout (read-only) — the source side of an integration.
 
         On the port, not merely on the live adapter, because the use case must be able to
         call it. R2 had this probe on the adapter only and never invoked it, so the use case

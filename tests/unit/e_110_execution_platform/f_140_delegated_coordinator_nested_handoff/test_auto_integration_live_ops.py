@@ -7,12 +7,14 @@ and cannot construct is pinned here rather than left to inspection:
   leading ``-`` becomes an option) is refused before any argv is built;
 - the push is a plain non-force push of an exact SHA to ``refs/heads/<branch>`` — no
   ``--force``, no ``--force-with-lease``, no ``+`` refspec;
-- the merge runs in the dedicated worktree and aborts on conflict rather than resolving it;
+- the merge is built from objects (``merge-tree --write-tree`` + ``commit-tree``): no
+  checkout is switched, no ref moves, a conflict is reported rather than resolved, and an
+  unusable primitive is reported as something other than a conflict;
 - the adapter has **no destructive operation at all** — no ref delete local or remote, and
   no worktree removal (reviews j#96344 / j#96396 / j#96401, each finding 1). None of the
   three could enforce its own condition in one invocation, so none exists to be called;
-- ``describe_integration_worktree`` measures the dedicated-worktree identity and reads every
-  failure to measure as the unsafe answer;
+- ``describe_lane_worktree`` measures the LANE's checkout and reads every failure to measure
+  as the unsafe answer;
 - every read probe fails closed when ``git`` could not run.
 
 Hermetic: ``_run`` is stubbed to record argv and return canned results. No real ``git``
@@ -45,6 +47,7 @@ SOURCE = "a" * 40
 MERGE_HEAD = "d" * 40
 TARGET = "b" * 40
 OTHER_HEAD = "e" * 40
+TREE = "f" * 40
 
 
 class _Recorder:
@@ -71,6 +74,13 @@ def _ok(stdout: str = "") -> subprocess.CompletedProcess:
 
 def _fail(stderr: str = "boom") -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(args=["git"], returncode=1, stdout="", stderr=stderr)
+
+
+def _fail_rc(returncode: int, *, out: str = "", err: str = "") -> subprocess.CompletedProcess:
+    """A failure with an EXACT exit code — `merge-tree` distinguishes 1 from everything else."""
+    return subprocess.CompletedProcess(
+        args=["git"], returncode=returncode, stdout=out, stderr=err
+    )
 
 
 def _adapter(recorder: _Recorder) -> LiveAutoIntegrationGitOperations:
@@ -135,59 +145,86 @@ class PushTest(unittest.TestCase):
 
 
 class MergeTest(unittest.TestCase):
-    def test_the_merge_runs_in_the_dedicated_worktree(self) -> None:
-        # switch -> verify the local target tip -> merge -> read the head
-        recorder = _Recorder([_ok(), _ok(TARGET), _ok(), _ok(MERGE_HEAD)])
+    """The merge is objects only. Review j#96406 finding 1 is why there is no worktree here."""
+
+    def test_the_merge_writes_a_tree_and_commits_it_with_the_measured_parent(self) -> None:
+        recorder = _Recorder([_ok(TREE), _ok(MERGE_HEAD)])
         result = _adapter(recorder).apply_merge(
-            source_head=SOURCE,
-            target_ref="main",
-            integration_worktree="/wt",
-            expected_target_head=TARGET,
+            source_head=SOURCE, target_ref="main", expected_target_head=TARGET
         )
         self.assertFalse(result.conflicted)
         self.assertEqual(result.integration_head, MERGE_HEAD)
-        # Every command ran in the dedicated worktree, never in the lane's repo root.
-        self.assertTrue(all(cwd == Path("/wt") for _, cwd in recorder.calls))
-        self.assertEqual(recorder.argvs[0][:2], ("switch", "main"))
-        self.assertIn("--no-ff", recorder.argvs[2])
 
-    def test_a_local_target_that_is_not_the_expected_remote_head_is_refused(self) -> None:
-        # R6 review j#96391 finding 1: merging onto whatever the dedicated worktree happened
-        # to have checked out put an unreviewed commit on the integration branch.
-        recorder = _Recorder([_ok(), _ok(OTHER_HEAD)])
+        write_tree, commit = recorder.argvs
+        self.assertEqual(write_tree[:2], ("merge-tree", "--write-tree"))
+        # The merge's inputs are object ids, in the order that makes the measured target the
+        # first parent — not a branch name anything could re-point.
+        self.assertEqual(write_tree[-2:], (TARGET, SOURCE))
+        self.assertEqual(commit[:2], ("commit-tree", TREE))
+        self.assertEqual(commit.count("-p"), 2)
+        self.assertEqual(commit[commit.index("-p") + 1], TARGET)
+
+    def test_nothing_runs_in_a_worktree_and_nothing_switches_or_moves_a_ref(self) -> None:
+        # The reproduction that retired the old form switched a foreign lane's checkout onto
+        # the target branch. Nothing here may switch, checkout, reset or update a ref.
+        recorder = _Recorder([_ok(TREE), _ok(MERGE_HEAD)])
+        _adapter(recorder).apply_merge(
+            source_head=SOURCE, target_ref="main", expected_target_head=TARGET
+        )
+        self.assertTrue(all(cwd is None for _, cwd in recorder.calls))
+        verbs = {argv[0] for argv in recorder.argvs}
+        for forbidden in ("switch", "checkout", "merge", "reset", "update-ref", "branch"):
+            self.assertNotIn(forbidden, verbs, forbidden)
+
+    def test_a_non_sha_input_refuses_without_spawning_git(self) -> None:
+        for kwargs in (
+            {"source_head": "HEAD", "expected_target_head": TARGET},
+            {"source_head": SOURCE, "expected_target_head": "main"},
+        ):
+            recorder = _Recorder([])
+            result = _adapter(recorder).apply_merge(target_ref="main", **kwargs)
+            self.assertTrue(result.conflicted)
+            self.assertEqual(recorder.argvs, [], kwargs)
+
+    def test_a_conflict_is_reported_and_never_resolved(self) -> None:
+        # `merge-tree` exits 1 for a real conflict and prints the conflicted paths.
+        recorder = _Recorder([_fail_rc(1, out=f"{TREE}\n100644 abc 1\ta.py\nCONFLICT (content)")])
         result = _adapter(recorder).apply_merge(
-            source_head=SOURCE,
-            target_ref="main",
-            integration_worktree="/wt",
-            expected_target_head=TARGET,
+            source_head=SOURCE, target_ref="main", expected_target_head=TARGET
         )
         self.assertTrue(result.conflicted)
-        self.assertIn("refusing to merge onto an unverified parent", result.detail)
-        # It never reached the merge.
-        self.assertNotIn("merge", [argv[0] for argv in recorder.argvs])
-
-    def test_a_conflict_aborts_and_is_not_resolved(self) -> None:
-        recorder = _Recorder([_ok(), _ok(TARGET), _fail("CONFLICT"), _ok()])
-        result = _adapter(recorder).apply_merge(
-            source_head=SOURCE,
-            target_ref="main",
-            integration_worktree="/wt",
-            expected_target_head=TARGET,
-        )
-        self.assertTrue(result.conflicted)
-        self.assertIn(("merge", "--abort"), [argv[:2] for argv in recorder.argvs])
-        # No strategy flag was used to make the conflict go away.
+        self.assertIn("merge conflicted", result.detail)
+        self.assertEqual(result.integration_head, "")
+        # It never committed the conflicted tree, and used no strategy to make it go away.
+        self.assertEqual(len(recorder.argvs), 1)
         flat = " ".join(" ".join(argv) for argv in recorder.argvs)
         for forbidden in ("--strategy", "-X", "theirs", "ours", "rebase"):
             self.assertNotIn(forbidden, flat, forbidden)
 
-    def test_a_merge_whose_head_cannot_be_resolved_is_treated_as_failed(self) -> None:
-        recorder = _Recorder([_ok(), _ok(TARGET), _ok(), _fail()])
+    def test_an_unusable_primitive_is_not_reported_as_a_conflict(self) -> None:
+        # `--write-tree` needs git >= 2.38. Both refuse, but a durable record that says
+        # "the branches conflict" when the truth is "this git cannot do it" is the class of
+        # lie j#96396 finding 2 was about.
+        recorder = _Recorder([_fail_rc(129, err="error: unknown option `write-tree'")])
         result = _adapter(recorder).apply_merge(
-            source_head=SOURCE,
-            target_ref="main",
-            integration_worktree="/wt",
-            expected_target_head=TARGET,
+            source_head=SOURCE, target_ref="main", expected_target_head=TARGET
+        )
+        self.assertTrue(result.conflicted)
+        self.assertIn("unavailable", result.detail)
+        self.assertIn("NOT a content conflict", result.detail)
+
+    def test_a_merge_that_names_no_tree_is_not_committed(self) -> None:
+        recorder = _Recorder([_ok("")])
+        result = _adapter(recorder).apply_merge(
+            source_head=SOURCE, target_ref="main", expected_target_head=TARGET
+        )
+        self.assertTrue(result.conflicted)
+        self.assertEqual(len(recorder.argvs), 1)
+
+    def test_a_tree_that_cannot_be_committed_is_reported_as_failed(self) -> None:
+        recorder = _Recorder([_ok(TREE), _fail("could not write commit")])
+        result = _adapter(recorder).apply_merge(
+            source_head=SOURCE, target_ref="main", expected_target_head=TARGET
         )
         self.assertTrue(result.conflicted)
         self.assertEqual(result.integration_head, "")
@@ -219,10 +256,7 @@ class NoDestructiveOperationTest(unittest.TestCase):
         recorder = _Recorder([_ok(), _ok(TARGET), _ok(), _ok(MERGE_HEAD), _ok(), _ok(), _ok()])
         operations = _adapter(recorder)
         operations.apply_merge(
-            source_head=SOURCE,
-            target_ref="main",
-            integration_worktree="/wt",
-            expected_target_head=TARGET,
+            source_head=SOURCE, target_ref="main", expected_target_head=TARGET
         )
         operations.push_non_force(source_head=SOURCE, target_ref="main")
         for argv in recorder.argvs:
@@ -235,52 +269,44 @@ class NoDestructiveOperationTest(unittest.TestCase):
                 )
 
 
-class IntegrationWorktreeProbeTest(unittest.TestCase):
+class LaneWorktreeProbeTest(unittest.TestCase):
     def test_the_probe_is_part_of_the_port_the_use_case_calls(self) -> None:
         # R2 review j#96350 finding 3: R2 had this probe on the adapter only, so the use case
         # could not call it and re-checked the caller's booleans instead. Being on the port is
         # what makes the actuator — not the caller — the authority for this fact.
-        self.assertTrue(
-            hasattr(AutoIntegrationGitOperations, "describe_integration_worktree")
-        )
+        self.assertTrue(hasattr(AutoIntegrationGitOperations, "describe_lane_worktree"))
         self.assertIsInstance(
             LiveAutoIntegrationGitOperations(repo_root=Path("/x")),
             AutoIntegrationGitOperations,
         )
 
-    def test_a_registered_non_lane_clean_worktree_is_admissible(self) -> None:
-        recorder = _Recorder(
-            [_ok("worktree /wt\nHEAD abc\n"), _ok("main\n"), _ok("")]
-        )
-        described = _adapter(recorder).describe_integration_worktree(
-            path="/wt", lane_worktree="/lane"
-        )
-        self.assertEqual(described.admissibility_errors(), ())
-        self.assertEqual(described.checked_out_branch, "main")
+    def test_it_no_longer_describes_a_checkout_anything_is_performed_in(self) -> None:
+        # The probe outlived the dedicated worktree it was written for; what is gone with it
+        # is the admissibility verdict, which only ever meant "you may mutate here".
+        described = _adapter(
+            _Recorder([_ok("worktree /lane\n"), _ok("lane\n"), _ok("")])
+        ).describe_lane_worktree(path="/lane")
+        self.assertFalse(hasattr(described, "admissibility_errors"))
+        self.assertFalse(hasattr(described, "is_lane_worktree"))
 
-    def test_the_lane_s_own_path_is_reported_as_the_lane_s(self) -> None:
-        recorder = _Recorder([_ok("worktree /lane\n"), _ok("lane\n"), _ok("")])
-        described = _adapter(recorder).describe_integration_worktree(
-            path="/lane", lane_worktree="/lane"
-        )
-        self.assertTrue(described.is_lane_worktree)
-        self.assertTrue(described.admissibility_errors())
+    def test_a_registered_clean_lane_is_measured(self) -> None:
+        recorder = _Recorder([_ok("worktree /lane\nHEAD abc\n"), _ok("lane\n"), _ok("")])
+        described = _adapter(recorder).describe_lane_worktree(path="/lane")
+        self.assertTrue(described.registered)
+        self.assertTrue(described.clean)
+        self.assertEqual(described.checked_out_branch, "lane")
 
     def test_an_unreadable_worktree_list_reads_as_unregistered(self) -> None:
         recorder = _Recorder([_fail(), _fail(), _fail()])
-        described = _adapter(recorder).describe_integration_worktree(
-            path="/wt", lane_worktree="/lane"
-        )
+        described = _adapter(recorder).describe_lane_worktree(path="/lane")
         self.assertFalse(described.registered)
         # ...and an unreadable status reads as not clean.
         self.assertFalse(described.clean)
-        self.assertTrue(described.admissibility_errors())
+        self.assertEqual(described.checked_out_branch, "")
 
-    def test_a_dirty_worktree_is_reported_unclean(self) -> None:
-        recorder = _Recorder([_ok("worktree /wt\n"), _ok("main\n"), _ok(" M a.py\n")])
-        described = _adapter(recorder).describe_integration_worktree(
-            path="/wt", lane_worktree="/lane"
-        )
+    def test_a_dirty_lane_is_reported_unclean(self) -> None:
+        recorder = _Recorder([_ok("worktree /lane\n"), _ok("lane\n"), _ok(" M a.py\n")])
+        described = _adapter(recorder).describe_lane_worktree(path="/lane")
         self.assertFalse(described.clean)
 
 

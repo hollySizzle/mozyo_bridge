@@ -72,7 +72,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     AutoIntegrationPolicy,
     IntegrationActionRecord,
     IntegrationCiEvidence,
-    IntegrationWorktree,
+    LaneWorktree,
     StepOutcome,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.retirement_cleanup_policy import (
@@ -92,7 +92,6 @@ OTHER = "e" * 40
 
 LANE_WORKTREE = "/lane"
 LANE_BRANCH = "lane_br"
-DEDICATED = "/dedicated"
 #: What the use case stamps on the outcomes it records (and therefore trusts on resume).
 #: The receipt is per-instance and unguessable, so tests seed a ledger by driving
 #: the actuator rather than by authoring entries (which is the point of the fix).
@@ -100,7 +99,7 @@ DEDICATED = "/dedicated"
 #: The read-only probes. Calling one is not a side effect, so the zero-side-effect assertions
 #: look at mutations only.
 _READ_PROBES = (
-    "describe_integration_worktree",
+    "describe_lane_worktree",
     "is_git_workspace",
     "resolve_head",
     "remote_branch_tip",
@@ -126,10 +125,10 @@ class FakeGitOperations:
     lane_clean: bool = True
     lane_registered: bool = True
     lane_branch_checked_out: str = LANE_BRANCH
-    dedicated_worktree: Optional[IntegrationWorktree] = None
-    #: What the dedicated worktree's local target branch points at. ``None`` means "matches
-    #: whatever was expected" (the healthy case).
-    dedicated_local_target: Optional[str] = None
+    #: What the object-level merge would find the target parent to be. ``None`` means it is
+    #: whatever was expected (the healthy case); setting it models a merge asked to sit on a
+    #: parent other than the measured remote target.
+    refuse_parent_other_than: Optional[str] = None
     on_remote: bool = True
     tip: str = SOURCE
 
@@ -163,39 +162,18 @@ class FakeGitOperations:
         self.calls.append(("commit_on_remote", {"commit": commit, "branch": branch}))
         return self.on_remote
 
-    def describe_integration_worktree(
-        self, *, path: str, lane_worktree: str
-    ) -> IntegrationWorktree:
-        self.calls.append(
-            (
-                "describe_integration_worktree",
-                {"path": path, "lane_worktree": lane_worktree},
-            )
-        )
-        if path == DEDICATED:
-            return self.dedicated_worktree or IntegrationWorktree(
-                path=path,
-                registered=True,
-                is_lane_worktree=False,
-                clean=True,
-                checked_out_branch="main",
-            )
-        return IntegrationWorktree(
+    def describe_lane_worktree(self, *, path: str) -> LaneWorktree:
+        self.calls.append(("describe_lane_worktree", {"path": path}))
+        return LaneWorktree(
             path=path,
             registered=self.lane_registered,
-            is_lane_worktree=(path == lane_worktree),
             clean=self.lane_clean,
             checked_out_branch=self.lane_branch_checked_out,
         )
 
     # -- mutations --------------------------------------------------------
     def apply_merge(
-        self,
-        *,
-        source_head: str,
-        target_ref: str,
-        integration_worktree: str,
-        expected_target_head: str,
+        self, *, source_head: str, target_ref: str, expected_target_head: str
     ) -> MergeResult:
         self.calls.append(
             (
@@ -203,20 +181,19 @@ class FakeGitOperations:
                 {
                     "source_head": source_head,
                     "target_ref": target_ref,
-                    "integration_worktree": integration_worktree,
                     "expected_target_head": expected_target_head,
                 },
             )
         )
-        # The live adapter refuses when the dedicated worktree's local target tip is not the
-        # expected one (R6 review j#96391 finding 1); the fake models that refusal so a test
-        # can exercise it.
-        if self.dedicated_local_target is not None and (
-            self.dedicated_local_target != expected_target_head
+        # The live adapter makes `expected_target_head` the merge's first parent by
+        # construction (R6 review j#96391 finding 1 bound it; j#96406 finding 1 removed the
+        # checkout it used to be read from). The fake models a refusal so a test can exercise
+        # the use case's handling of one.
+        if self.refuse_parent_other_than is not None and (
+            self.refuse_parent_other_than != expected_target_head
         ):
             return MergeResult(
-                conflicted=True,
-                detail="local target tip is not the expected remote target",
+                conflicted=True, detail="the merge parent is not the measured remote target"
             )
         return self.merge_result
 
@@ -332,7 +309,8 @@ def _use_case(operations: FakeGitOperations, **kwargs: object) -> AutoIntegratio
         "authority": FakeAuthorityReader(),
         "lane_worktree": LANE_WORKTREE,
         "lane_branch": LANE_BRANCH,
-        "integration_worktree_path": DEDICATED,
+        "lane_issue": "13686",
+        "lane_generation": 3,
     }
     defaults.update(kwargs)
     return AutoIntegrationUseCase(operations=operations, **defaults)  # type: ignore[arg-type]
@@ -477,13 +455,13 @@ class R3ReviewFinding1Test(unittest.TestCase):
         self.assertEqual(report.final_decision.state, STATE_INTEGRATION_BLOCKED)
         self.assertEqual(operations.performed, [])
 
-    def test_the_probes_are_asked_about_the_actuator_s_own_paths(self) -> None:
+    def test_the_probe_is_asked_about_the_actuator_s_own_lane(self) -> None:
         operations = FakeGitOperations(ancestors=_ff_ancestors())
         _use_case(operations).run_integration(_record())
-        probed = {
-            args["path"] for args in operations.args_for("describe_integration_worktree")
-        }
-        self.assertEqual(probed, {LANE_WORKTREE, DEDICATED})
+        probed = {args["path"] for args in operations.args_for("describe_lane_worktree")}
+        # One path, and it is this actuator's own. The dedicated integration checkout it used
+        # to probe alongside is gone with the worktree merge (j#96406 finding 1).
+        self.assertEqual(probed, {LANE_WORKTREE})
 
 
 class FastForwardRunTest(unittest.TestCase):
@@ -583,16 +561,16 @@ class MergeCommitRunTest(unittest.TestCase):
             mode=MODE_AUTO, integration_branch="main", ff_only=False
         )
 
-    def test_a_merge_applies_in_the_dedicated_worktree_then_pushes_the_merge_commit(
-        self,
-    ) -> None:
+    def test_a_merge_is_built_from_objects_then_pushes_the_merge_commit(self) -> None:
         operations = FakeGitOperations()  # no ancestry -> not a fast-forward
         report = _use_case(
             operations, integration_policy=self._policy()
         ).run_integration(_record())
         self.assertEqual(operations.performed, ["apply_merge", "push_non_force"])
+        # Object ids only: nothing names a checkout for anything to re-point.
         self.assertEqual(
-            operations.args_for("apply_merge")[0]["integration_worktree"], DEDICATED
+            set(operations.args_for("apply_merge")[0]),
+            {"source_head", "target_ref", "expected_target_head"},
         )
         self.assertEqual(
             operations.args_for("push_non_force")[0]["source_head"], MERGE_HEAD
@@ -609,17 +587,19 @@ class MergeCommitRunTest(unittest.TestCase):
         self.assertEqual(operations.performed, ["apply_merge"])
         self.assertEqual(report.outcomes[-1].outcome, OUTCOME_BLOCKED)
 
-    def test_a_measured_lane_worktree_never_becomes_the_integration_worktree(self) -> None:
-        operations = FakeGitOperations(
-            dedicated_worktree=IntegrationWorktree(
-                path=DEDICATED, registered=True, is_lane_worktree=True, clean=True
-            )
+    def test_the_merge_names_no_checkout_for_anything_to_re_point(self) -> None:
+        # R2 gated the dedicated checkout's identity so the lane's own could never be used.
+        # Review j#96406 finding 1 reproduced a foreign lane's checkout swapped onto that path
+        # AFTER the gate, so the gate went with the checkout: the port takes object ids now,
+        # and the use case has no path to hand it.
+        operations = FakeGitOperations()
+        _use_case(operations, integration_policy=self._policy()).run_integration(_record())
+        arguments = operations.args_for("apply_merge")[0]
+        for value in arguments.values():
+            self.assertNotIn("/", str(value), arguments)
+        self.assertFalse(
+            hasattr(_use_case(FakeGitOperations()), "integration_worktree_path")
         )
-        report = _use_case(
-            operations, integration_policy=self._policy()
-        ).run_integration(_record())
-        self.assertEqual(operations.performed, [])
-        self.assertEqual(report.final_decision.state, STATE_INTEGRATION_BLOCKED)
 
     def test_a_resumed_merge_pushes_the_commit_its_own_apply_produced(self) -> None:
         # Run 1 applies and its push is rejected; run 2 resumes from the actuator's own
@@ -713,11 +693,13 @@ class R6ReviewFindingTest(unittest.TestCase):
             mode=MODE_AUTO, integration_branch="main", ff_only=False
         )
 
-    def test_f1_the_merge_parent_is_bound_to_the_measured_remote_target(self) -> None:
+    def test_f1_a_refused_merge_parent_stops_before_any_push(self) -> None:
         # R6 finding 1: the adapter merged onto whatever the dedicated worktree's local target
         # happened to be, so an extra unreviewed commit there ended up on the integration
-        # branch — and the push was accepted because it was still a fast-forward.
-        operations = FakeGitOperations(dedicated_local_target=OTHER)  # carries extra work
+        # branch — and the push was accepted because it was still a fast-forward. The merge is
+        # built from object ids now, so the parent cannot differ; what is still worth pinning
+        # is that a port which refuses stops the run rather than falling through to a push.
+        operations = FakeGitOperations(refuse_parent_other_than=OTHER)
         report = _use_case(
             operations, integration_policy=self._merge_policy()
         ).run_integration(_record())

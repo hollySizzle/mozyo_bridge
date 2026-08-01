@@ -24,9 +24,9 @@ The states (j#77124 必須訂正1, narrowed by the owner's ff-only default in j#
 1. :data:`STATE_INTEGRATION_PREFLIGHT` — revalidate *at action time*: the exact source head
    the review approved, origin reachability, the latest review generation, source CI, target
    identity / ref allowlist, the expected target head, a clean non-foreign source.
-2. :data:`STATE_INTEGRATION_APPLY` — apply the recorded disposition in a **dedicated
-   integration worktree**, never by checking the target branch out in the lane's worktree.
-   With the ff-only default there is nothing to apply and this state is skipped.
+2. :data:`STATE_INTEGRATION_APPLY` — build the recorded disposition **as objects**
+   (``merge-tree --write-tree`` + ``commit-tree``), touching no checkout, index or ref. With
+   the ff-only default there is nothing to apply and this state is skipped.
 3. :data:`STATE_PUSH_WAITING` — a normal, non-force push. Remote drift loses the race and
    fails closed; it is never resolved by a force or a rebase.
 4. :data:`STATE_AWAITING_CI` — CI on the **exact integration SHA**, as an asynchronous gate.
@@ -53,9 +53,8 @@ The value objects the decision reasons over live in the sibling
 surface. R1 review j#96344 is why they are objects at all: four of this module's inputs were
 bare booleans, and a boolean cannot be audited. ``integration_ci_green`` claimed a green run
 without naming which run, which check, or which commit; ``coordinator_confirmed`` claimed an
-approval without naming who, of what, or where it is written; the integration worktree was a
-string never checked against being the lane's own; and the configured integration branch was
-declared and read by nothing. Each is now a record that carries the identity its claim
+approval without naming who, of what, or where it is written; and the configured integration
+branch was declared and read by nothing. Each is now a record that carries the identity its claim
 depends on, and each is validated against the exact action it is offered for.
 """
 
@@ -76,7 +75,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     IntegrationActionRecord,
     IntegrationCiEvidence,
     IntegrationPreflight,
-    IntegrationWorktree,
+    LaneWorktree,
     StepOutcome,
     build_integration_action_record,
     completed_steps,
@@ -116,8 +115,9 @@ INTEGRATION_MODES: frozenset = frozenset({MODE_AUTO, MODE_DISABLED})
 #: a normal non-force push of the source head to the target ref *is* a fast-forward, so no
 #: new commit is created and there is nothing to conflict.
 DISPOSITION_FAST_FORWARD = "fast_forward"
-#: Create a merge commit in a dedicated integration worktree. Only reachable when the
-#: operator turned ``ff_only`` off; a conflict fails closed and is never auto-resolved.
+#: Create a merge commit from objects, with the measured target head as its first parent.
+#: Only reachable when the operator turned ``ff_only`` off; a conflict fails closed and is
+#: never auto-resolved.
 DISPOSITION_MERGE_COMMIT = "merge_commit"
 
 INTEGRATION_DISPOSITIONS: frozenset = frozenset(
@@ -312,10 +312,6 @@ BLOCKED_INTEGRATION_CI_HEAD_MISMATCH = "integration_ci_head_mismatch"
 #: whether the ref is a known integration branch at all: a ref can be perfectly well known
 #: and still not be the one the operator pointed THIS actuator at.
 BLOCKED_TARGET_NOT_CONFIGURED = "target_not_configured"
-#: The dedicated integration worktree is unusable: unregistered, not clean, or — the one this
-#: exists for — the lane's own checkout, which must never check out the target branch
-#: (j#77124 / R1 review j#96344 finding 3).
-BLOCKED_INTEGRATION_WORKTREE_INADMISSIBLE = "integration_worktree_inadmissible"
 
 #: Precedence for the *primary* reason, most fundamental first. The full set is always
 #: reported too, so a durable record shows every failing gate rather than only the first.
@@ -344,7 +340,6 @@ _BLOCKED_REASON_PRECEDENCE: Tuple[str, ...] = (
     BLOCKED_PUSH_REJECTED,
     BLOCKED_PUSH_OUTCOME_HEAD_MISSING,
     BLOCKED_PUSH_HEAD_MISMATCH,
-    BLOCKED_INTEGRATION_WORKTREE_INADMISSIBLE,
     BLOCKED_INTEGRATION_CI_EVIDENCE_INCOMPLETE,
     BLOCKED_INTEGRATION_CI_HEAD_MISMATCH,
     BLOCKED_INTEGRATION_CI_FAILED,
@@ -752,33 +747,23 @@ def decide_integration(
     #    `not_applicable` rather than reported done.
     if disposition == DISPOSITION_MERGE_COMMIT:
         if STEP_INTEGRATION_APPLY not in done:
-            # R1 review j#96344 finding 3: j#77124 forbids the lane's worktree ever checking
-            # out the target branch, and R1 asserted that in a docstring while enforcing
-            # nothing — a caller passing the lane's own path made the actuator perform the
-            # forbidden operation. The identity is now measured and checked before the step
-            # is authorized, not after it is handed to git.
-            worktree = preflight.integration_worktree
-            problems = (
-                ("no dedicated integration worktree was supplied",)
-                if worktree is None
-                else worktree.admissibility_errors()
-            )
-            if problems:
-                return _blocked(
-                    record,
-                    (BLOCKED_INTEGRATION_WORKTREE_INADMISSIBLE,),
-                    disposition=disposition,
-                    action_key=action_key,
-                    reason="; ".join(problems),
-                )
+            # There is no worktree gate here any more, and its absence is the fix rather than
+            # an omission. j#77124 forbids the lane's checkout ever holding the target branch;
+            # R1 asserted that in a docstring while enforcing nothing (j#96344 finding 3), so
+            # R2 made the dedicated checkout's identity a measured, gated fact. Review j#96406
+            # finding 1 then showed that gating a *path* cannot work: a foreign lane's
+            # checkout swapped onto it between the measurement and the merge was switched off
+            # its own branch and had the merge built on it. The merge is now assembled from
+            # objects (`merge-tree --write-tree` + `commit-tree`), so no checkout is involved
+            # for a rule to protect.
             return IntegrationDecision(
                 state=STATE_INTEGRATION_APPLY,
                 action_key=action_key,
                 next_step=STEP_INTEGRATION_APPLY,
                 disposition=disposition,
                 reason=(
-                    "applying the recorded merge disposition in a dedicated integration "
-                    "worktree (the lane's worktree never checks out the target branch)"
+                    "building the recorded merge disposition as objects onto the measured "
+                    "target head (no checkout is switched, and no ref moves until the push)"
                 ),
             )
 
@@ -929,12 +914,12 @@ __all__ = (
     "BLOCKED_INTEGRATION_CI_EVIDENCE_INCOMPLETE",
     "BLOCKED_INTEGRATION_CI_HEAD_MISMATCH",
     "BLOCKED_TARGET_NOT_CONFIGURED",
-    "BLOCKED_INTEGRATION_WORKTREE_INADMISSIBLE",
     "CI_GATE_GREEN",
     "CI_GATE_NOT_REACHED",
     "CI_GATE_STATES",
     "AutoIntegrationPolicy",
     "IntegrationPreflight",
+    "LaneWorktree",
     "IntegrationDecision",
     "decide_integration",
     # Re-exported from the records sibling for a stable public surface.
@@ -954,5 +939,4 @@ __all__ = (
     "build_integration_action_record",
     "CI_CONCLUSION_SUCCESS",
     "IntegrationCiEvidence",
-    "IntegrationWorktree",
 )

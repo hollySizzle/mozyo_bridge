@@ -114,7 +114,6 @@ integration:
   - target_drift                        # expected_target_head からの drift
   - non_fast_forward                    # ff-only 時
   - merge_conflict                      # merge commit disposition 時
-  - integration_worktree_inadmissible   # 専用 worktree が未登録 / dirty / lane 自身 (R2)
   - push_rejected
   - push_outcome_head_missing           # push done なのに着地 head が無い。fallback しない (R3)
   - push_head_mismatch                  # 記録された head が disposition の着地 head でない (R3)
@@ -125,7 +124,7 @@ cleanup:
   - action_key_mismatch                 # 別 action の authorization を継承しない
   - issue_not_closed / integration_unconfirmed / integration_ci_unsettled
   - unresolved_callback / unresolved_owner_gate
-  - foreign_worktree                    # record が自 lane を指していない (literal は据置)
+  - lane_identity_mismatch              # record が自 lane (issue / generation / branch / path) を指していない
 ```
 
 **代替手段を持たない**ことが安全性の中身である。conflict / non-ff / target drift / push 拒否を
@@ -155,21 +154,52 @@ lane の worktree / branch の削除は **operator の runbook step** として 
 (`tests/integration/.../test_auto_integration_live_git.py`)。将来の git が答えを変えたら test が
 知らせ、撤去の裁定を記憶ではなく証拠で見直せる。
 
-## 現行 contract の要約 (R9 時点)
+## merge を checkout から object へ (R10 / j#96406 F1)
+
+破壊的操作 3 件と違い、**merge には代替 primitive があった**ので撤去せず置換した。
+
+旧: dedicated worktree を測定 → その path で `git switch <target>` → `git merge --no-ff`。
+**測定と mutation の間に path を foreign lane の clean checkout へ差し替えると、その checkout が
+target branch へ switch され、そこに merge commit が作られる** (実測。`conflicted=False` を返す)。
+non-force push と exact-SHA CI が gate するのは **remote への着地**であって、既に他 lane の
+checkout に対して行った switch / merge を取り消さない。
+
+新: `git merge-tree --write-tree <expected_target_head> <source_head>` → tree、
+`git commit-tree <tree> -p <target> -p <source>` → merge commit。**入力は全て object id**であり、
+checkout・index・ref・HEAD を一切触らない (実測)。**決定と mutation の間に late-bound な名前が
+介在しない**ので、差し替えるものが無い。
+
+失敗は 2 種を分ける: `merge-tree` の **rc=1 のみ conflict**、それ以外の非 0 は **primitive 不可用**
+(`--write-tree` は git >= 2.38)。「この git では実行できない」を「branch が conflict した」と
+記録するのは j#96396 F2 と同型の嘘になる。
+
+これに伴い dedicated worktree の apparatus 一式 (`IntegrationWorktree` / 専用 probe /
+`integration_worktree_inadmissible` / constructor field / report field) を撤去した。残った
+`describe_lane_worktree` は **lane 側の read probe** であり、「ここで mutate してよいか」ではなく
+「source は review されたものか」に答える。
+
+## 現行 contract の要約 (R10 時点)
 
 歴史的経緯は後続の節に残すが、**現時点で成立している契約**はこれだけである。矛盾したら本節を優先する。
 
 - `run_integration(record)` / `run_cleanup(record)` は **action record (identity) のみ**を受け取る。
   caller preflight も caller ledger も存在しない。
 - 安全事実は **actuator が測る**: git 事実は port probe、durable 事実は `DurableAuthorityReader`、
-  lane identity は actuator 自身の `lane_worktree` / `lane_branch`。**live reader は未実装 (#14825)**。
+  lane identity は actuator 自身の `lane_issue` / `lane_generation` / `lane_worktree` /
+  `lane_branch`。**live reader は未実装 (#14825)**。
 - 測定は **step ごと**に取り直す。integration 側は actuator 自身の mutation が世界を変えるため、
   cleanup 側は durable authority が他者によって動くため。
 - target head は **fresh remote tip**。pre-push は expected-head CAS、post-push は landed-head
-  reachability。merge の parent も **measured remote target に exact-bind** する。
+  reachability。
+- **merge は object から組む** (`merge-tree --write-tree` + `commit-tree`)。checkout・index・ref・
+  HEAD を一切触らず、first parent は measured remote target。**dedicated integration worktree は
+  存在しない** (j#96406 F1)。
 - `already_integrated` / `patch_equivalent` は **push 前のみ** terminal。push 後は exact-SHA CI を完走。
 - **cleanup 側に破壊的操作は 1 つも無い**。ref delete も worktree remove も持たない (上節)。
   cleanup は git port を **read probe すら呼ばない**。
+- **verify する値と mutate する値を一致させる**。cleanup の identity 照合は
+  `issue` / `lane_generation` / `branch` / `worktree_path` の 4 値すべてで、そこには
+  `release_process` が引数に取る 2 値が含まれる (j#96406 F2)。
 - `mode` は `auto` / `disabled` のみ。CI gate は config で外せない。
 
 ## 実装構成
@@ -192,7 +222,7 @@ R1 は 4 つの入力を bare bool / bare string で受けており、review が
 | --- | --- | --- |
 | `integration_ci_green: bool` | `IntegrationCiEvidence` | どの run の・どの required check が・どの commit について green か。無関係な green run が gate を満たしていた |
 | `coordinator_confirmed: bool` | (R4 で mode ごと撤回) | 誰が・どの action を・どこに記録して承認したか |
-| `integration_worktree: str` | `IntegrationWorktree` | それが lane 自身の checkout でないこと (j#77124 が禁じる操作を actuator 自身が実行し得た) |
+| `integration_worktree: str` | (撤去) | R1 は非空 string、R2 は測定済み `IntegrationWorktree`。**R10 で概念ごと撤去** — path を gate しても差し替えられる (j#96406 F1)。merge は object から組む |
 | `policy.integration_branch` (未参照) | decision が exact-match を要求 | 設定した branch が実際に統合先を制約すること |
 | `source_ci_green: bool` (R2 まで残存) | `IntegrationCiEvidence` | 同上。sibling gate に同じ穴が残っていた (R3) |
 
@@ -204,7 +234,7 @@ CI evidence は **push が着地した head** (ledger の push outcome が記録
 ### 型を足すだけでは足りない — 測定者を固定する (R2 review j#96350)
 
 R1 で bool を型へ変えた 4 入力のうち 2 つは、**値を caller が供給し続けていた**ため R2 でも
-自己申告のままだった。forged な `IntegrationWorktree(is_lane_worktree=False)` も、存在しない anchor を
+自己申告のままだった。forged な `IntegrationWorktree(is_lane_worktree=False)` (当時) も、存在しない anchor を
 指す `CoordinatorConfirmation` も、そのまま通った。
 
 > **safety fact を測るのは actuator であり、依頼者ではない。**
@@ -227,7 +257,7 @@ caller が渡すのは action record (identity) と、この actuator 自身の 
 
 authority reader 未注入なら durable 事実は何も確立されず、`integrated` にも `retired` にも到達しない
 (fail-closed)。cleanup は record の path/branch が **actuator 自身の lane と exact 一致**しない限り
-`foreign_worktree` で止まる — CAS tip 一致は「branch が動いていない」ことしか言わず「それが自分のものか」を
+`lane_identity_mismatch` で止まる — CAS tip 一致は「branch が動いていない」ことしか言わず「それが自分のものか」を
 言わないためである。
 
 ### 測定は step ごとに取り直す (R5 review j#96385 findings 2/3)
@@ -242,9 +272,10 @@ authority reader 未注入なら durable 事実は何も確立されず、`integ
   (「誰かが先に動かした」= drift とは別の事実、「我々の成果が消えた」)。
 - `already_integrated` は **push 前にのみ** terminal disposition である。push 後は source が target
   から到達可能なのは当然であり、そこで終了すると exact-SHA CI gate を飛ばしてしまう。
-- cleanup も自分の mutation で世界が変わる。remove 前後で lane worktree の registered / checkout
-  状態は別の答えになるため、両 machine とも **step ごとに再測定**する (この節が扱っていた
-  `branch_checked_out_elsewhere` は、branch delete と共に撤去された probe である)。
+- **cleanup 側はもう世界を動かさない** (破壊的 step を全て撤去したため)。それでも step ごとに
+  durable authority を読み直す — owner gate や callback は *他者* が動かすからである。この節が
+  扱っていた `branch_checked_out_elsewhere` / remove 前後の checkout 状態は、対応する step と
+  共に撤去された probe である。
 
 > **test double が mutation の効果を反映しないと、検査そのものが無効になる。**
 > R5 の 2 件はどちらも、fake が push 後も target head を静止させ、remove 後も checkout 状態を

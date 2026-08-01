@@ -6,10 +6,14 @@ fake could not have caught either. A fake answers what it was told to answer —
 you that ``git merge`` will take whatever the checked-out tip happens to be as its first
 parent, or what a ref-deleting primitive does to a worktree standing on that ref.
 
-What is pinned against a real binary here is **the merge's target parent**: it must be the
-commit the action measured on the remote, not the dedicated worktree's local tip (a worktree
-carrying one extra unreviewed commit produced a merge containing it, and the push was
-accepted because it was still a fast-forward).
+What is pinned against a real binary here is that **the merge is built from objects and
+touches no checkout**. It used to be performed inside a dedicated worktree, with that path's
+identity established by an earlier probe; review j#96406 finding 1 reproduced a foreign lane's
+clean checkout swapped onto the path between the probe and the merge being switched off its
+own branch and having the merge commit built on it — and ``apply_merge`` returned
+``conflicted=False``. A non-force push and an exact-SHA CI gate what *lands*; neither undoes a
+checkout somebody else was standing in. :class:`WorktreeSwapRegressionTest` performs that same
+swap and asserts the foreign checkout is untouched.
 
 The destructive-operation tests this module also carried are gone with the operations
 themselves. Three were withdrawn, each because the property that made it safe was established
@@ -66,73 +70,113 @@ def _commit(repo: Path, name: str, text: str) -> str:
 
 
 @unittest.skipIf(_GIT is None, "git is not available on PATH")
-class MergeParentBindingTest(unittest.TestCase):
-    """The merge's first parent is the measured remote target, or there is no merge."""
+class ObjectLevelMergeTest(unittest.TestCase):
+    """The merge is objects: the right parent, the right content, and nothing else moved."""
 
-    def test_a_dedicated_worktree_carrying_extra_work_is_refused(self) -> None:
+    def test_the_merge_sits_on_the_measured_target_and_moves_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            repo = root / "repo"
-            _init(repo)
-            base = _commit(repo, "a.txt", "base")
-
-            # The lane's reviewed work.
-            _git(repo, "checkout", "-q", "-b", "lane")
-            source = _commit(repo, "lane.txt", "reviewed")
-            # The primary checkout parks off `main` so the dedicated worktree can hold it —
-            # git refuses to check one branch out in two worktrees, which is the same reason
-            # the lane's own worktree must never hold the target.
-            _git(repo, "checkout", "-q", "-b", "parking")
-
-            # A dedicated integration worktree that has drifted ahead of the remote target
-            # with a commit nobody reviewed.
-            dedicated = root / "dedicated"
-            _git(repo, "worktree", "add", "-q", str(dedicated), "main")
-            unreviewed = _commit(dedicated, "sneaky.txt", "never reviewed")
-            self.assertNotEqual(unreviewed, base)
-
-            operations = LiveAutoIntegrationGitOperations(repo_root=repo)
-            result = operations.apply_merge(
-                source_head=source,
-                target_ref="main",
-                integration_worktree=str(dedicated),
-                # What the action measured on the remote — the pre-drift commit.
-                expected_target_head=base,
-            )
-
-            self.assertTrue(result.conflicted, result.detail)
-            self.assertEqual(result.integration_head, "")
-            self.assertIn("unverified parent", result.detail)
-            # Nothing was merged: the dedicated worktree still sits on its own commit.
-            self.assertEqual(_git(dedicated, "rev-parse", "HEAD"), unreviewed)
-
-    def test_a_dedicated_worktree_at_the_expected_target_merges(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            repo = root / "repo"
+            repo = Path(tmp) / "repo"
             _init(repo)
             base = _commit(repo, "a.txt", "base")
             _git(repo, "checkout", "-q", "-b", "lane")
             source = _commit(repo, "lane.txt", "reviewed")
-            _git(repo, "checkout", "-q", "-b", "parking")
-
-            dedicated = root / "dedicated"
-            _git(repo, "worktree", "add", "-q", str(dedicated), "main")
+            _git(repo, "checkout", "-q", "main")
 
             operations = LiveAutoIntegrationGitOperations(repo_root=repo)
             result = operations.apply_merge(
-                source_head=source,
-                target_ref="main",
-                integration_worktree=str(dedicated),
-                expected_target_head=base,
+                source_head=source, target_ref="main", expected_target_head=base
             )
 
             self.assertFalse(result.conflicted, result.detail)
             self.assertEqual(len(result.integration_head), 40)
-            # The merge sits on the expected target and contains the reviewed source.
-            parents = _git(dedicated, "rev-list", "--parents", "-n", "1", "HEAD").split()
-            self.assertIn(base, parents)
-            self.assertIn(source, parents)
+            parents = _git(
+                repo, "rev-list", "--parents", "-n", "1", result.integration_head
+            ).split()
+            self.assertEqual(parents[1], base, "the measured target must be the FIRST parent")
+            self.assertEqual(parents[2], source)
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "cat-file", "-e", f"{result.integration_head}:lane.txt"],
+                    cwd=repo,
+                    capture_output=True,
+                ).returncode,
+                0,
+            )
+            # Nothing published, nothing switched, nothing dirtied.
+            self.assertEqual(_git(repo, "rev-parse", "main"), base)
+            self.assertEqual(_git(repo, "rev-parse", "--abbrev-ref", "HEAD"), "main")
+            self.assertEqual(_git(repo, "status", "--porcelain"), "")
+
+    def test_a_conflict_is_reported_and_still_moves_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            _init(repo)
+            _commit(repo, "a.txt", "base")
+            _git(repo, "checkout", "-q", "-b", "lane")
+            source = _commit(repo, "a.txt", "lane version")
+            _git(repo, "checkout", "-q", "main")
+            target = _commit(repo, "a.txt", "target version")
+
+            operations = LiveAutoIntegrationGitOperations(repo_root=repo)
+            result = operations.apply_merge(
+                source_head=source, target_ref="main", expected_target_head=target
+            )
+
+            self.assertTrue(result.conflicted)
+            self.assertIn("merge conflicted", result.detail)
+            self.assertEqual(result.integration_head, "")
+            self.assertEqual(_git(repo, "rev-parse", "main"), target)
+            self.assertEqual(_git(repo, "status", "--porcelain"), "")
+
+
+@unittest.skipIf(_GIT is None, "git is not available on PATH")
+class WorktreeSwapRegressionTest(unittest.TestCase):
+    """R9 review j#96406 finding 1, reproduced and then pinned closed.
+
+    The scenario is the reviewer's: a checkout is measured, a foreign lane's clean checkout
+    takes its place, and the merge runs. Under the worktree merge the foreign checkout was
+    switched to the target branch and the merge commit was built on it, and the call still
+    reported success. Nothing the actuator does now can reach a checkout at all, so the swap
+    is a no-op — which is what a withdrawal-free fix has to demonstrate.
+    """
+
+    def test_swapping_a_foreign_checkout_in_mid_run_cannot_touch_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init(repo)
+            base = _commit(repo, "a.txt", "base")
+            _git(repo, "checkout", "-q", "-b", "lane")
+            source = _commit(repo, "lane.txt", "reviewed")
+            _git(repo, "branch", "foreign_lane")
+            _git(repo, "checkout", "-q", "-b", "parking")
+
+            # The path a previous round would have merged inside, now holding a FOREIGN lane.
+            contested = root / "contested"
+            _git(repo, "worktree", "add", "-q", str(contested), "foreign_lane")
+            before_head = _git(contested, "rev-parse", "HEAD")
+            before_branch = _git(contested, "rev-parse", "--abbrev-ref", "HEAD")
+
+            operations = LiveAutoIntegrationGitOperations(repo_root=repo)
+            result = operations.apply_merge(
+                source_head=source, target_ref="main", expected_target_head=base
+            )
+
+            self.assertFalse(result.conflicted, result.detail)
+            # The merge exists as an object, on the measured target, and the foreign lane's
+            # checkout is exactly where it was — same branch, same HEAD, still clean.
+            self.assertEqual(
+                _git(
+                    repo, "rev-list", "--parents", "-n", "1", result.integration_head
+                ).split()[1],
+                base,
+            )
+            self.assertEqual(
+                _git(contested, "rev-parse", "--abbrev-ref", "HEAD"), before_branch
+            )
+            self.assertEqual(_git(contested, "rev-parse", "HEAD"), before_head)
+            self.assertEqual(_git(contested, "status", "--porcelain"), "")
+            self.assertEqual(_git(repo, "rev-parse", "foreign_lane"), before_head)
 
 
 @unittest.skipIf(_GIT is None, "git is not available on PATH")

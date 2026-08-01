@@ -13,8 +13,12 @@ What the adapter can and cannot express is the safety story, so it is enumerated
   ``--force``, no ``--force-with-lease`` (still a force), and no ``+`` refspec — the last is
   additionally refused by construction, because ``+`` is how a force is spelled *inside* a
   refspec and a branch name is not trusted to be free of it.
-- **Merge is `--no-ff` inside a dedicated worktree**, never in the lane's checkout, and never
-  with a conflict resolution strategy. A conflict aborts the merge and is reported.
+- **Merge is built from objects**, never inside a checkout: ``merge-tree --write-tree`` writes
+  the merged tree and ``commit-tree`` wraps it with the measured target as first parent. No
+  worktree is switched, no index is written, no ref moves, and a conflict is reported rather
+  than resolved. Review j#96406 finding 1 is why: the previous form merged inside a *path*
+  whose identity an earlier probe had established, and a foreign lane's checkout swapped onto
+  that path was switched off its own branch and had the merge built on it.
 - **Nothing here is destructive.** A ref delete, and now a worktree removal, were shipped and
   removed, because none of them could enforce its own condition in one invocation:
 
@@ -66,7 +70,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_records import (
     EMPTY_TARGET_HEAD,
-    IntegrationWorktree,
+    LaneWorktree,
 )
 
 #: The default shared remote. Named rather than inlined so the one place a remote is chosen
@@ -236,16 +240,16 @@ class LiveAutoIntegrationGitOperations:
             return False
         return self.is_ancestor(ancestor=commit, descendant=tip)
 
-    def describe_integration_worktree(
-        self, *, path: str, lane_worktree: str
-    ) -> IntegrationWorktree:
-        """Measure the facts that decide whether ``path`` may be integrated in (read-only).
+    def describe_lane_worktree(self, *, path: str) -> LaneWorktree:
+        """Measure the lane's own checkout (read-only), failing closed on every unknown.
 
-        Every field is measured, and every failure to measure reads as the UNSAFE answer:
-        an unreadable worktree list means "not registered", an unreadable status means "not
-        clean". The identity comparison that matters — is this the lane's own checkout? — is
-        done on resolved common paths rather than on the strings, so a symlinked or
-        differently-spelled path cannot present the lane's worktree as a different one.
+        Every failure to measure reads as the UNSAFE answer: an unreadable worktree list
+        means "not registered", an unreadable status means "not clean", an unreadable HEAD
+        means no branch. Registration is compared on RESOLVED paths rather than on the
+        strings, so a symlinked or differently-spelled path is still recognised.
+
+        This is a read probe about the source of an integration. It no longer describes a
+        checkout anything is performed in — see :meth:`apply_merge`.
         """
         candidate = Path(path)
         listed = self._run("worktree", "list", "--porcelain")
@@ -266,17 +270,10 @@ class LiveAutoIntegrationGitOperations:
                 if entry_resolved == resolved:
                     registered = True
                     break
-        try:
-            is_lane = candidate.resolve() == Path(lane_worktree).resolve()
-        except OSError:
-            # Unresolvable paths cannot be shown to be different, so they are treated as the
-            # same — the fail-closed reading of the one question this exists to answer.
-            is_lane = True
         branch = self._run("rev-parse", "--abbrev-ref", "HEAD", cwd=candidate)
-        return IntegrationWorktree(
+        return LaneWorktree(
             path=str(path),
             registered=registered,
-            is_lane_worktree=is_lane,
             clean=not self.worktree_dirty(worktree_path=str(path)),
             checked_out_branch=branch.stdout.strip() if branch.returncode == 0 else "",
         )
@@ -284,69 +281,96 @@ class LiveAutoIntegrationGitOperations:
     # -- mutations --------------------------------------------------------
 
     def apply_merge(
-        self,
-        *,
-        source_head: str,
-        target_ref: str,
-        integration_worktree: str,
-        expected_target_head: str,
+        self, *, source_head: str, target_ref: str, expected_target_head: str
     ) -> MergeResult:
-        """Merge ``source_head`` into ``target_ref`` inside ``integration_worktree``.
+        """Create the merge commit **as objects**, touching no worktree, index, ref or HEAD.
 
-        Runs entirely in the dedicated worktree (j#77124): the lane's own checkout never has
-        the target branch checked out, so a failed merge cannot strand the lane on someone
-        else's branch. A conflict is aborted (``git merge --abort``) so the dedicated
-        worktree is left usable, and reported — never resolved by a strategy flag.
+        ``git merge-tree --write-tree <target> <source>`` writes the merged tree into the
+        object database and prints its id; ``git commit-tree`` then wraps it with the two
+        parents. Every input is an object id, so there is no name for anything to re-point
+        between the decision and the mutation — which is the whole point.
+
+        R9 review j#96406 finding 1 is why this is not a worktree merge any more. The previous
+        form switched a *path* to the target branch and merged there, with that path's identity
+        established by an earlier probe. Reproduced on real git: swapping a foreign lane's
+        clean checkout onto that path between the probe and the merge switched the foreign
+        checkout off its own branch and built the merge commit on it, and it returned
+        ``conflicted=False``. A non-force push and an exact-SHA CI gate what *lands*; neither
+        undoes a checkout someone else was standing in. The three destructive operations this
+        issue withdrew had no alternative primitive; this one did.
+
+        Failure modes are kept apart on purpose. ``merge-tree`` exits 1 for a real conflict and
+        prints the conflict information; any *other* non-zero exit is the primitive itself
+        being unusable (``--write-tree`` needs git >= 2.38), which must not be reported as
+        "the branches conflict". Both refuse, but they refuse with different reasons, and a
+        durable record that says "conflict" when the truth is "this git cannot do it" is the
+        class of lie j#96396 finding 2 was about.
         """
+        if not _is_full_sha(expected_target_head) or not _is_full_sha(source_head):
+            return MergeResult(
+                conflicted=True,
+                detail=(
+                    "refusing to merge: both the source and the expected target must be full "
+                    f"commit SHAs (source={source_head!r} target={expected_target_head!r})"
+                ),
+            )
         branch = _checked_branch(target_ref)
-        worktree = Path(integration_worktree)
-        switched = self._run("switch", branch, cwd=worktree)
-        if switched.returncode != 0:
-            return MergeResult(
-                conflicted=True,
-                detail=(
-                    f"could not switch the integration worktree to {branch}: "
-                    f"{switched.stderr.strip()}"
-                ),
-            )
-        # R6 review j#96391 finding 1: the merge's target parent must be the commit the
-        # action measured on the REMOTE, not whatever this worktree's local branch points at.
-        # Measured wrong: a dedicated worktree holding one extra unreviewed commit produced a
-        # merge containing it, and the push was accepted because it was still a fast-forward.
-        local_tip = self._run("rev-parse", "--verify", "HEAD", cwd=worktree)
-        local_head = local_tip.stdout.strip() if local_tip.returncode == 0 else ""
-        if not _is_full_sha(expected_target_head) or local_head != expected_target_head:
-            return MergeResult(
-                conflicted=True,
-                detail=(
-                    f"the integration worktree's {branch} is at {local_head or 'an unreadable head'}, "
-                    f"not the expected target {expected_target_head}; refusing to merge onto an "
-                    "unverified parent"
-                ),
-            )
         merged = self._run(
-            "merge", "--no-ff", "--no-edit", "--end-of-options", source_head, cwd=worktree
+            "merge-tree",
+            "--write-tree",
+            "--end-of-options",
+            expected_target_head,
+            source_head,
         )
-        if merged.returncode != 0:
-            self._run("merge", "--abort", cwd=worktree)
+        if merged.returncode == 1:
             return MergeResult(
                 conflicted=True,
                 detail=(
-                    "merge conflicted and was aborted; auto-resolution and auto-rebase are "
-                    f"prohibited: {merged.stderr.strip()}"
+                    "merge conflicted; auto-resolution and auto-rebase are prohibited: "
+                    f"{merged.stdout.strip()[:400]}"
                 ),
             )
-        head = self._run("rev-parse", "--verify", "HEAD", cwd=worktree)
-        integration_head = head.stdout.strip() if head.returncode == 0 else ""
+        if merged.returncode != 0:
+            return MergeResult(
+                conflicted=True,
+                detail=(
+                    "the object-level merge primitive is unavailable (`git merge-tree "
+                    "--write-tree` needs git >= 2.38); this is NOT a content conflict: "
+                    f"{merged.stderr.strip()[:200]}"
+                ),
+            )
+        tree = merged.stdout.strip().splitlines()[0].strip() if merged.stdout.strip() else ""
+        if not _is_full_sha(tree):
+            return MergeResult(
+                conflicted=True,
+                detail="the merge reported success but named no tree; refusing to commit it",
+            )
+        committed = self._run(
+            "commit-tree",
+            tree,
+            "-p",
+            expected_target_head,
+            "-p",
+            source_head,
+            "-m",
+            f"Merge {source_head} into {branch}",
+        )
+        integration_head = committed.stdout.strip() if committed.returncode == 0 else ""
         if not _is_full_sha(integration_head):
             return MergeResult(
                 conflicted=True,
-                detail="the merge reported success but its head could not be resolved",
+                detail=(
+                    "the merged tree could not be committed: "
+                    f"{committed.stderr.strip()[:200]}"
+                ),
             )
         return MergeResult(
             conflicted=False,
             integration_head=integration_head,
-            detail=f"merged {source_head} into {branch} in the dedicated worktree",
+            detail=(
+                f"merged {source_head} onto {expected_target_head} as objects "
+                f"(first parent is the measured target; no worktree, index or ref touched)"
+            ),
         )
 
     def push_non_force(self, *, source_head: str, target_ref: str) -> PushResult:

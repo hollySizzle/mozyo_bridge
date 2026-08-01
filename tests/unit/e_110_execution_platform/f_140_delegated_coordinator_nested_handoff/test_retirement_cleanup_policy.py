@@ -40,7 +40,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.retirement_cleanup_policy import (
     BLOCKED_CI_UNSETTLED,
-    BLOCKED_FOREIGN_WORKTREE,
+    BLOCKED_LANE_IDENTITY_MISMATCH,
     BLOCKED_INTEGRATION_UNCONFIRMED,
     BLOCKED_ISSUE_NOT_CLOSED,
     BLOCKED_UNRESOLVED_CALLBACK,
@@ -125,7 +125,7 @@ class AlwaysEnforcedGateTest(unittest.TestCase):
             ({"integration_ci_settled_green": False}, BLOCKED_CI_UNSETTLED),
             ({"callbacks_drained": False}, BLOCKED_UNRESOLVED_CALLBACK),
             ({"owner_gates_resolved": False}, BLOCKED_UNRESOLVED_OWNER_GATE),
-            ({"lane_is_foreign": True}, BLOCKED_FOREIGN_WORKTREE),
+            ({"lane_is_foreign": True}, BLOCKED_LANE_IDENTITY_MISMATCH),
         )
         for overrides, reason in cases:
             decision = decide_cleanup(_record(), _clean(**overrides))
@@ -148,7 +148,7 @@ class AlwaysEnforcedGateTest(unittest.TestCase):
         )
         self.assertEqual(decision.state, STATE_CLEANUP_BLOCKED)
         self.assertIn(BLOCKED_ISSUE_NOT_CLOSED, decision.blocked_reasons)
-        self.assertIn(BLOCKED_FOREIGN_WORKTREE, decision.blocked_reasons)
+        self.assertIn(BLOCKED_LANE_IDENTITY_MISMATCH, decision.blocked_reasons)
 
     def test_every_failing_gate_is_reported(self) -> None:
         decision = decide_cleanup(
@@ -268,7 +268,7 @@ class NoGitOperationTest(unittest.TestCase):
         # another lane's managed process is the same class of cross-lane side effect.
         decision = decide_cleanup(_record(), _clean(lane_is_foreign=True))
         self.assertEqual(decision.state, STATE_CLEANUP_BLOCKED)
-        self.assertEqual(decision.blocked_reasons, (BLOCKED_FOREIGN_WORKTREE,))
+        self.assertEqual(decision.blocked_reasons, (BLOCKED_LANE_IDENTITY_MISMATCH,))
         self.assertIsNone(decision.next_step)
 
 
@@ -356,7 +356,7 @@ class JournalRendererTest(unittest.TestCase):
         decision = decide_cleanup(record, _clean(lane_is_foreign=True))
         rendered = render_cleanup_journal(decision, record)
         self.assertIn("## cleanup_blocked", rendered)
-        self.assertIn(BLOCKED_FOREIGN_WORKTREE, rendered)
+        self.assertIn(BLOCKED_LANE_IDENTITY_MISMATCH, rendered)
         self.assertIn("no process released", rendered)
         self.assertIn("removes no checkout and deletes no ref at all", rendered)
 

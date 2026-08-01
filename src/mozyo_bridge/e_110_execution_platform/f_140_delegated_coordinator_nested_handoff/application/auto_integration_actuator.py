@@ -64,7 +64,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     IntegrationActionRecord,
     IntegrationDecision,
     IntegrationPreflight,
-    IntegrationWorktree,
+    LaneWorktree,
     StepOutcome,
     completed_steps,
     is_full_sha,
@@ -121,9 +121,11 @@ class IntegrationRunReport:
     #: The exact commit the integration produced on the target, when one was produced. Empty
     #: for a fast-forward (which creates no commit) and for every refusal.
     integration_head: str = ""
-    #: What the actuator MEASURED about the dedicated integration worktree, as opposed to
-    #: what the caller claimed. Recorded so the durable record shows the measurement.
-    measured_worktree: Optional[IntegrationWorktree] = None
+    #: What the actuator MEASURED about the LANE's checkout, as opposed to what the caller
+    #: claimed. Recorded so the durable record shows the measurement. There is no dedicated
+    #: integration worktree to record any more: the merge is built from objects
+    #: (j#96406 finding 1).
+    measured_worktree: Optional[LaneWorktree] = None
     #: The durable-record authority this run READ (as opposed to anything a caller claimed).
     measured_authority: Optional["IntegrationAuthority"] = None
 
@@ -192,9 +194,16 @@ class AutoIntegrationUseCase:
     the same of the ledger, and that a provenance derived from public constructor values is
     reproducible by the caller. The receipt is now an unguessable per-instance token.
 
-    ``lane_worktree`` is this actuator's own lane checkout and
-    ``integration_worktree_path`` the dedicated one — constructor state rather than per-call
-    arguments, so a single instance cannot be redirected mid-run.
+    ``lane_issue`` / ``lane_generation`` / ``lane_worktree`` / ``lane_branch`` are this
+    actuator's own identity — constructor state rather than per-call arguments, so a single
+    instance cannot be redirected mid-run. The first two exist because review j#96406
+    finding 2 found the gap: the cleanup verified the record's *branch and path* while the
+    operation it authorized acts on the record's *issue and lane generation*. Verifying one
+    pair and mutating on another is not a check at all, so every value the mutation consumes
+    is now compared against this actuator's own.
+
+    There is no ``integration_worktree_path``. The merge is assembled from objects, so there
+    is no checkout for the actuator to be pointed at (j#96406 finding 1).
 
     There is no ``cleanup_policy``: with every Git step withdrawn from the cleanup machine
     (review j#96401 finding 1 took the last one), nothing there is configurable, and the
@@ -208,7 +217,10 @@ class AutoIntegrationUseCase:
     ledger: LedgerStore = field(default_factory=InMemoryLedgerStore)
     lane_worktree: str = ""
     lane_branch: str = ""
-    integration_worktree_path: str = ""
+    #: The issue and lane generation this actuator is bound to. Compared against the values a
+    #: cleanup record supplies, because those are the values ``release_process`` acts on.
+    lane_issue: str = ""
+    lane_generation: Optional[int] = None
 
     #: The writer receipt this actuator stamps on the steps it records. R4 derived it from
     #: public constructor values, so a caller could reproduce it; R5 made it an unguessable
@@ -328,13 +340,8 @@ class AutoIntegrationUseCase:
         # The target's head is the REMOTE's, read fresh. A local ref is this clone's stale
         # opinion of a branch other clones also push to (j#96379 finding 4).
         observed_target = ops.remote_branch_tip(record.target_ref)
-        lane = ops.describe_integration_worktree(
-            path=self.lane_worktree, lane_worktree=self.lane_worktree
-        )
-        integration_worktree = ops.describe_integration_worktree(
-            path=self.integration_worktree_path, lane_worktree=self.lane_worktree
-        )
-        report.measured_worktree = integration_worktree
+        lane = ops.describe_lane_worktree(path=self.lane_worktree)
+        report.measured_worktree = lane
 
         authority = (
             self.authority.read_integration_authority(record=record)
@@ -403,7 +410,6 @@ class AutoIntegrationUseCase:
             owner_gates_resolved=authority.owner_gates_resolved,
             source_ci=authority.source_ci,
             integration_ci=integration_ci,
-            integration_worktree=integration_worktree,
         )
 
     def _perform_integration_step(
@@ -417,29 +423,16 @@ class AutoIntegrationUseCase:
         """Perform exactly the step the decision authorized (no substitutions)."""
         step = decision.next_step
         if step == STEP_INTEGRATION_APPLY:
-            worktree = preflight.integration_worktree
-            # The decision authorizes this step only after `IntegrationWorktree` passed its
-            # own admissibility, so an inadmissible one cannot reach here. Re-asserted rather
-            # than assumed: this is the last point before a `git switch` on a real checkout,
-            # and the cost of the belt is one branch.
-            if worktree is None or worktree.admissibility_errors():
-                return StepOutcome(
-                    action_key=decision.action_key,
-                    step=step,
-                    recorded_by=self.recorder_id,
-                    outcome=OUTCOME_BLOCKED,
-                    detail=(
-                        "a merge-commit disposition requires a verified dedicated "
-                        "integration worktree; the lane's own worktree must never check "
-                        "out the target branch (j#77124)"
-                    ),
-                )
+            # There is no checkout to verify before this call. The apply used to be preceded
+            # by a re-assertion that a dedicated worktree was admissible, because the next
+            # thing to happen was a `git switch` on a real checkout; review j#96406 finding 1
+            # showed that no amount of verification in front of a *path* is worth anything,
+            # since the path can be re-pointed after the check. What goes to the port now is
+            # two object ids and a branch name used for the message.
             result = self.operations.apply_merge(
                 source_head=record.source_head,
                 target_ref=record.target_ref,
-                integration_worktree=worktree.path,
-                # The parent the merge must sit on: the freshly measured remote target, not
-                # whatever the dedicated worktree happens to have checked out.
+                # The parent the merge must sit on: the freshly measured remote target.
                 expected_target_head=preflight.observed_target_head,
             )
             if result.conflicted:
@@ -572,9 +565,18 @@ class AutoIntegrationUseCase:
             integration_ci_settled_green=authority.integration_ci_settled_green,
             callbacks_drained=authority.callbacks_drained,
             owner_gates_resolved=authority.owner_gates_resolved,
+            # Every value the mutation consumes is compared, not merely some of them.
+            # Review j#96406 finding 2: this checked the record's branch and path while
+            # `release_process` acts on its issue and lane generation, so the pair being
+            # verified was not the pair being used. An unbound expectation (the actuator
+            # never configured with an issue / generation) fails closed rather than
+            # matching whatever the record says.
             lane_is_foreign=not (
                 record.worktree_path == self.lane_worktree
                 and record.branch == self.lane_branch
+                and record.issue == self.lane_issue
+                and self.lane_generation is not None
+                and record.lane_generation == self.lane_generation
             ),
         )
 

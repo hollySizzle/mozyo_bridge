@@ -34,7 +34,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCKED_INTEGRATION_CI_FAILED,
     BLOCKED_INTEGRATION_CI_EVIDENCE_INCOMPLETE,
     BLOCKED_INTEGRATION_CI_HEAD_MISMATCH,
-    BLOCKED_INTEGRATION_WORKTREE_INADMISSIBLE,
     BLOCKED_INTEGRATION_LOST_FROM_TARGET,
     BLOCKED_LEDGER_UNTRUSTWORTHY,
     BLOCKED_MERGE_CONFLICT,
@@ -82,7 +81,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     IntegrationActionRecord,
     IntegrationCiEvidence,
     IntegrationPreflight,
-    IntegrationWorktree,
     StepOutcome,
     build_integration_action_record,
     decide_integration,
@@ -143,18 +141,6 @@ def _clean(**overrides: object) -> IntegrationPreflight:
     }
     fields.update(overrides)
     return IntegrationPreflight(**fields)  # type: ignore[arg-type]
-
-
-def _dedicated_worktree(**overrides: object) -> IntegrationWorktree:
-    fields: dict = {
-        "path": "<dedicated-integration-worktree>",
-        "registered": True,
-        "is_lane_worktree": False,
-        "clean": True,
-        "checked_out_branch": "main",
-    }
-    fields.update(overrides)
-    return IntegrationWorktree(**fields)  # type: ignore[arg-type]
 
 
 AUTO = AutoIntegrationPolicy(mode=MODE_AUTO, integration_branch="main")
@@ -378,7 +364,6 @@ class DispositionTest(unittest.TestCase):
             _record(),
             _clean(
                 fast_forward_possible=False,
-                integration_worktree=_dedicated_worktree(),
             ),
         )
         self.assertEqual(decision.state, STATE_INTEGRATION_APPLY)
@@ -489,7 +474,7 @@ class IdempotencyTest(unittest.TestCase):
             mode=MODE_AUTO, integration_branch="main", ff_only=False
         )
         world = _clean(
-            fast_forward_possible=False, integration_worktree=_dedicated_worktree()
+            fast_forward_possible=False
         )
         ledger = [
             StepOutcome(
@@ -570,7 +555,6 @@ class R1ReviewFindingRegressionTest(unittest.TestCase):
             record,
             _clean(
                 fast_forward_possible=False,
-                integration_worktree=_dedicated_worktree(),
                 integration_ci=about_source,
             ),
             ledger=ledger,
@@ -585,7 +569,6 @@ class R1ReviewFindingRegressionTest(unittest.TestCase):
             record,
             _clean(
                 fast_forward_possible=False,
-                integration_worktree=_dedicated_worktree(),
                 integration_ci=about_merge,
             ),
             ledger=ledger,
@@ -593,47 +576,33 @@ class R1ReviewFindingRegressionTest(unittest.TestCase):
         self.assertEqual(ok.state, STATE_INTEGRATED)
         self.assertEqual(ok.integration_ci, CI_GATE_GREEN)
 
-    def test_f3_the_lane_s_own_worktree_is_never_the_integration_worktree(self) -> None:
-        # j#77124: the lane must never check out the target branch. R1 asserted this in a
-        # docstring and enforced nothing.
-        policy = AutoIntegrationPolicy(
-            mode=MODE_AUTO, integration_branch="main", ff_only=False
-        )
-        for overrides in (
-            {"is_lane_worktree": True},
-            {"registered": False},
-            {"clean": False},
-            {"path": ""},
-        ):
-            decision = decide_integration(
-                policy,
-                _record(),
-                _clean(
-                    fast_forward_possible=False,
-                    integration_worktree=_dedicated_worktree(**overrides),
-                ),
-            )
-            self.assertEqual(
-                decision.blocked_reasons,
-                (BLOCKED_INTEGRATION_WORKTREE_INADMISSIBLE,),
-                overrides,
-            )
-            self.assertIsNone(decision.next_step, overrides)
+    def test_f3_no_merge_is_ever_performed_in_a_checkout(self) -> None:
+        """j#77124's rule outlived the mechanism that was supposed to enforce it.
 
-    def test_f3_a_missing_integration_worktree_refuses_rather_than_defaulting(self) -> None:
+        R1 asserted "the lane never checks out the target branch" in a docstring and enforced
+        nothing (j#96344 finding 3); R2 made a dedicated checkout's identity a measured, gated
+        fact. Review j#96406 finding 1 then reproduced a foreign lane's checkout being swapped
+        onto that path between the gate and the merge — so the gate is gone along with the
+        checkout it guarded, and what is pinned instead is that the decision carries no
+        checkout at all and its apply step names none.
+        """
         policy = AutoIntegrationPolicy(
             mode=MODE_AUTO, integration_branch="main", ff_only=False
         )
         decision = decide_integration(
             policy, _record(), _clean(fast_forward_possible=False)
         )
-        self.assertEqual(
-            decision.blocked_reasons, (BLOCKED_INTEGRATION_WORKTREE_INADMISSIBLE,)
-        )
+        self.assertEqual(decision.next_step, STEP_INTEGRATION_APPLY)
+        self.assertEqual(decision.blocked_reasons, ())
+        # No preflight field and no blocked reason may reintroduce one, and the decision says
+        # what it now does rather than naming a place it does it in.
+        self.assertFalse(hasattr(_clean(), "integration_worktree"))
+        self.assertIn("as objects", decision.reason)
+        self.assertNotIn("dedicated", decision.reason.lower())
 
-    def test_f3_a_fast_forward_needs_no_integration_worktree(self) -> None:
-        # The gate applies to the disposition that actually checks a branch out; a
-        # fast-forward creates no commit and needs no worktree.
+    def test_f3_a_fast_forward_still_applies_nothing(self) -> None:
+        # A fast-forward creates no commit, so there is nothing to build and the apply step
+        # is skipped entirely.
         decision = decide_integration(AUTO, _record(), _clean())
         self.assertEqual(decision.next_step, STEP_PUSH)
 
@@ -699,7 +668,7 @@ class R3ReviewFindingRegressionTest(unittest.TestCase):
             policy,
             record,
             _clean(
-                fast_forward_possible=False, integration_worktree=_dedicated_worktree()
+                fast_forward_possible=False
             ),
             ledger=[
                 StepOutcome(
@@ -885,7 +854,6 @@ class R2ReviewFindingRegressionTest(unittest.TestCase):
             record,
             _clean(
                 fast_forward_possible=False,
-                integration_worktree=_dedicated_worktree(),
                 integration_ci=about_source,
             ),
             ledger=[
@@ -928,7 +896,7 @@ class R2ReviewFindingRegressionTest(unittest.TestCase):
             policy,
             record,
             _clean(
-                fast_forward_possible=False, integration_worktree=_dedicated_worktree()
+                fast_forward_possible=False
             ),
             ledger=[
                 StepOutcome(
@@ -949,7 +917,6 @@ class R2ReviewFindingRegressionTest(unittest.TestCase):
             record,
             _clean(
                 fast_forward_possible=False,
-                integration_worktree=_dedicated_worktree(),
                 integration_ci=IntegrationCiEvidence(
                     integration_head=merge_head,
                     workflow="required-ci",

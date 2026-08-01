@@ -10,7 +10,7 @@ policy module re-exports the public names, mirroring the
 
 The theme of everything here is the R1 review's central finding: **a boolean cannot be
 audited.** ``integration_ci_green: bool`` said a run was green without saying which run,
-which check, or which commit — so an unrelated green run satisfied it. ``integration_worktree: str`` said "a worktree" without saying it was not the lane's own.
+which check, or which commit — so an unrelated green run satisfied it.
 Each is replaced by a record that carries the identity its claim depends on, and each
 validates itself against the action it is offered for.
 """
@@ -396,61 +396,39 @@ class IntegrationCiEvidence:
 
 
 # ---------------------------------------------------------------------------
-# The dedicated integration worktree (R1 review j#96344 finding 3).
+# The lane's own checkout (a read-only measurement).
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class IntegrationWorktree:
-    """The dedicated checkout a merge-commit disposition is applied in.
+class LaneWorktree:
+    """What the actuator measured about the LANE's checkout — the source side, read-only.
 
-    Replaces the R1 ``integration_worktree: str``, which was checked only for being
-    non-empty and then handed to ``git switch <target>``. j#77124 必須訂正1 requires that
-    the lane's own worktree never check out the target branch, and the R1 code *asserted*
-    that invariant in a docstring while enforcing nothing — passing the lane's own path made
-    the actuator perform the very operation the rule forbids (measured, R1 review finding 3).
+    This is the shrunken remnant of ``IntegrationWorktree``, and the shrinking is the point.
+    That record described the *dedicated* checkout a merge was applied in, and carried an
+    ``admissibility_errors()`` gate because a mutation was about to be performed there.
+    Review j#96406 finding 1 showed a gate on a path cannot hold: a foreign lane's checkout
+    swapped onto it between the measurement and the merge was switched off its own branch and
+    had the merge built on it. The merge is assembled from objects now, so **nothing is ever
+    performed in a checkout**, and what is left here describes only the lane whose work is
+    being integrated — used to answer "is the source what was reviewed?", never "may I mutate
+    this?".
 
-    Every field is a measured fact supplied by the caller (the live adapter probes them);
-    none is inferred here. All default to the **unsatisfied** value so a caller that omits
-    one is refused rather than admitted.
+    Every field defaults to its unsatisfied value, so an unreadable checkout blocks.
     """
 
     path: str
-    #: This path is a worktree registered to the repo being integrated into — not an
-    #: unrelated directory that merely exists.
+    #: This path is a worktree registered to the repo. An unreadable list reads "no".
     registered: bool = False
-    #: This path IS the lane's own checkout. The one thing it must not be.
-    is_lane_worktree: bool = True
-    #: No uncommitted / untracked changes. A merge into a dirty checkout mixes the lane's
-    #: leftovers into the integration commit.
+    #: No uncommitted / untracked changes: what would be integrated is what was reviewed.
     clean: bool = False
-    #: The branch currently checked out there, if any. Informational: the adapter switches
-    #: to the target itself, so this is for the durable record rather than a gate.
+    #: The branch checked out there. Compared against the actuator's own lane branch.
     checked_out_branch: str = ""
-
-    def admissibility_errors(self) -> Tuple[str, ...]:
-        """The reasons this worktree may not be integrated in (empty iff it may)."""
-        problems: list[str] = []
-        if not str(self.path).strip():
-            problems.append("path is empty")
-        if not self.registered:
-            problems.append(
-                "the path is not a registered worktree of the target repository"
-            )
-        if self.is_lane_worktree:
-            problems.append(
-                "the path is the lane's own worktree; the lane must never check out the "
-                "target branch (j#77124)"
-            )
-        if not self.clean:
-            problems.append("the integration worktree is not clean")
-        return tuple(problems)
 
     def as_payload(self) -> dict[str, object]:
         return {
             "path": self.path,
             "registered": self.registered,
-            "is_lane_worktree": self.is_lane_worktree,
             "clean": self.clean,
             "checked_out_branch": self.checked_out_branch,
         }
@@ -502,10 +480,11 @@ class IntegrationPreflight:
       run satisfies it" hole applied, so it carries the same identity.
     - ``integration_ci`` — :class:`IntegrationCiEvidence` for the exact commit the push
       landed, carrying the required check's identity and the run id.
-    - ``integration_worktree`` — :class:`IntegrationWorktree`: the dedicated checkout a
-      merge-commit disposition is applied in. **Also actuator-measured** (finding 3): R2
-      accepted the caller's own description of it, so a record naming the lane's worktree with
-      ``is_lane_worktree=False`` passed.
+    There is deliberately no ``integration_worktree``. A merge-commit disposition used to be
+    applied inside a dedicated checkout, and this carried its measured admissibility; review
+    j#96406 finding 1 reproduced a foreign lane's checkout being swapped onto that path
+    between the measurement and the merge, so the merge is built from objects now
+    (``merge-tree --write-tree`` + ``commit-tree``) and no checkout is involved to describe.
     """
 
     is_git_workspace: bool
@@ -528,7 +507,6 @@ class IntegrationPreflight:
     # Typed records (R1 review j#96344, extended R2/R3). `None` is the unsatisfied reading.
     source_ci: Optional[IntegrationCiEvidence] = None
     integration_ci: Optional[IntegrationCiEvidence] = None
-    integration_worktree: Optional[IntegrationWorktree] = None
     #: Is the commit this action's push landed still reachable from the CURRENT target tip?
     #: Read only once a trusted push receipt exists, and it is what replaces the pre-push
     #: expected-head comparison at that point (R5 review j#96385 finding 2): after our own
@@ -558,6 +536,6 @@ __all__ = (
     "build_integration_action_record",
     "CI_CONCLUSION_SUCCESS",
     "IntegrationCiEvidence",
-    "IntegrationWorktree",
+    "LaneWorktree",
     "IntegrationPreflight",
 )
