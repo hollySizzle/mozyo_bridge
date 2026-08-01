@@ -255,6 +255,44 @@ def resolve_agent_launch(
     return resolutions[0]
 
 
+def resolve_trusted_command(
+    name: str, env: Optional[Mapping[str, str]] = None
+) -> Optional[str]:
+    """One bare command name resolved on the trusted ``PATH``, or ``None`` (fail-closed).
+
+    The same discipline :func:`resolve_agent_launch` applies to a provider binary, exposed
+    for the **update-manager adapter** (Redmine #14741 Design Answer j#96167 item 3): an
+    unsafe ``PATH`` (empty / relative component), no match, or MORE THAN ONE distinct
+    executable realpath all yield ``None``. First-match is not an ambiguity check, and an
+    ambiguous package manager is exactly the state in which "where would an update write?"
+    has no single answer.
+
+    Deliberately NOT a revival of the deleted ``trusted_path_exec_targets``. That function
+    enumerated the *provider's own command* and was used as a stand-in for the updater's
+    write target — the j#95741 F2 proxy. This resolves a **different** executable (the
+    package manager) for a **different** purpose (to ask it, positively, where it writes),
+    and it returns one realpath rather than a candidate set to compare against.
+
+    Returns the symlink-resolved realpath, so what a caller runs is deterministic across
+    cwd and symlinks. Never raises.
+    """
+    env = os.environ if env is None else env
+    bare = name.strip() if isinstance(name, str) else ""
+    if not bare or os.sep in bare:
+        # A path-ish "name" would escape the trusted PATH search entirely.
+        return None
+    try:
+        directories = _trusted_path_dirs(env, provider_id=bare)
+    except AgentProviderExecutableError:
+        return None
+    found: list[str] = []
+    for directory in directories:
+        verified = _verify_trusted_executable(os.path.join(directory, bare))
+        if verified is not None and verified.exec_target not in found:
+            found.append(verified.exec_target)
+    return found[0] if len(found) == 1 else None
+
+
 def resolve_agent_executable(
     provider_id: str,
     env: Optional[Mapping[str, str]] = None,
@@ -332,6 +370,7 @@ def preflight_launch_providers(
     *,
     permission_mode_default: Optional[str] = None,
     registry: Optional[AgentProviderProfileRegistry] = None,
+    updater_targets: Optional[object] = None,
 ) -> "dict[str, ResolvedProviderLaunch]":
     """Resolve EVERY launch provider up front, or raise having touched nothing.
 
@@ -368,11 +407,36 @@ def preflight_launch_providers(
     # the "pure" builder RAISE `unknown agent provider`.
     profiles = AGENT_PROVIDER_PROFILES if registry is None else registry
 
+    # Redmine #14741 (j#96060 F1, Answer j#96167 item 6). This is the whole-plan launch
+    # fence — the one place every launch, including a lane self-heal's re-launch, passes
+    # before the first side effect — so the update-authority verdict is consumed HERE
+    # rather than at a per-slot builder that runs after a sibling has already started.
+    # Armed only when the caller supplies a probe, so every pre-#14741 call site is
+    # byte-invariant; when armed, anything short of a positive authority raises and the
+    # caller mutates nothing (zero-relaunch).
+    from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_update_authority_preflight import (  # noqa: E501
+        evaluate_update_authority,
+    )
+
     resolved: dict[str, ResolvedProviderLaunch] = {}
     for provider_id in providers:
         if provider_id in resolved:
             continue
         launch_exe = resolve_agent_launch(provider_id, env, registry=registry)
+        if updater_targets is not None:
+            authority = evaluate_update_authority(
+                provider_id, env, registry=registry, updater_targets=updater_targets
+            )
+            if not authority.admits_actuation:
+                raise AgentProviderExecutableError(
+                    f"refusing to launch agent provider {provider_id!r}: mozyo could not "
+                    f"establish that it runs the binary its own updater writes to "
+                    f"(update authority: {authority.authority}, executable binding: "
+                    f"{authority.binding}). Re-launching here is exactly how the #14741 "
+                    f"loop re-armed itself, so nothing was started. Make the install "
+                    f"unambiguous, or pin the trusted override at the install the "
+                    f"updater owns."
+                )
         profile = profiles.require(provider_id)
         resolved[provider_id] = ResolvedProviderLaunch(
             provider_id=provider_id,

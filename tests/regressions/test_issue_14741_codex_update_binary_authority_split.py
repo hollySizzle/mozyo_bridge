@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 import stat
 import tempfile
+import types
 import unittest
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_health import (  # noqa: E501
@@ -64,6 +65,14 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.age
 )
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile import (  # noqa: E501
     AGENT_PROVIDER_PROFILES,
+)
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter import (  # noqa: E501
+    REASON_IDENTITY_UNCORRESPONDED,
+    REASON_OK,
+    REASON_PROVIDER_UNREGISTERED,
+    REASON_QUERY_EXECUTABLE_UNRESOLVED,
+    REASON_QUERY_FAILED,
+    resolve_updater_target,
 )
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile_config import (  # noqa: E501
     AgentProviderProfile,
@@ -402,7 +411,7 @@ class ExecutableBindingClassifierTest(unittest.TestCase):
 class UpdateAuthorityRecordTest(unittest.TestCase):
     """The record is closed, and it carries nothing about the host."""
 
-    def test_admits_relaunch_only_for_evaluated_or_unevaluated_positives(self) -> None:
+    def test_admits_actuation_only_for_evaluated_or_unevaluated_positives(self) -> None:
         cases = {
             (AUTHORITY_NOT_EVALUATED, BINDING_NOT_EVALUATED): True,
             (AUTHORITY_ALIGNED, BINDING_MATCHED): True,
@@ -417,7 +426,7 @@ class UpdateAuthorityRecordTest(unittest.TestCase):
                 record = UpdateAuthority(
                     provider="fakex", authority=authority, binding=binding
                 )
-                self.assertEqual(record.admits_relaunch, admits)
+                self.assertEqual(record.admits_actuation, admits)
 
     def test_payload_carries_no_path_version_or_env_value(self) -> None:
         payload = UpdateAuthority(
@@ -475,10 +484,10 @@ class UpdateAuthorityPreflightTest(unittest.TestCase):
         record = evaluate_update_authority("fakex", env, registry=self.registry)
         self.assertEqual(record.authority, AUTHORITY_UNKNOWN)
         self.assertEqual(record.updater_targets, 0)
-        self.assertFalse(record.admits_relaunch, "a re-launch needs a positive authority")
         self.assertFalse(
-            record.proven_wrong_binary,
-            "unknown is not a demonstrated wrong binary, so it must not refuse a send",
+            record.admits_actuation,
+            "an unresolved authority is zero-actuation for send AND relaunch "
+            "(Answer j#96167 item 4); R2 admitted sends here and that is retracted",
         )
 
     def test_provider_command_on_path_is_no_longer_evidence_of_alignment(self) -> None:
@@ -508,8 +517,7 @@ class UpdateAuthorityPreflightTest(unittest.TestCase):
             "fakex", env, registry=self.registry, updater_targets=self._probe(pkg_root)
         )
         self.assertEqual(record.authority, AUTHORITY_ALIGNED)
-        self.assertTrue(record.admits_relaunch)
-        self.assertFalse(record.proven_wrong_binary)
+        self.assertTrue(record.admits_actuation)
 
     def test_split_when_the_updater_writes_to_another_prefix(self) -> None:
         """The measured #14741 shape: the override pins one install, the package manager
@@ -525,11 +533,10 @@ class UpdateAuthorityPreflightTest(unittest.TestCase):
             "fakex", env, registry=self.registry, updater_targets=self._probe(nvm_root)
         )
         self.assertEqual(record.authority, AUTHORITY_SPLIT)
-        self.assertTrue(
-            record.proven_wrong_binary,
+        self.assertFalse(
+            record.admits_actuation,
             "a demonstrated split must refuse the send: updating cannot fix this lane",
         )
-        self.assertFalse(record.admits_relaunch)
 
     def test_sibling_prefix_is_not_read_as_containment(self) -> None:
         """`/a/nodes` must not count as inside `/a/node`. A false alignment is the one
@@ -571,7 +578,7 @@ class UpdateAuthorityPreflightTest(unittest.TestCase):
                     "fakex", env, registry=self.registry, updater_targets=probe
                 )
                 self.assertEqual(record.authority, AUTHORITY_UNKNOWN)
-                self.assertFalse(record.proven_wrong_binary)
+                self.assertFalse(record.admits_actuation)
 
     def test_symlinked_alias_is_not_a_false_split(self) -> None:
         """Both sides are realpath-resolved, so an alias and its target compare equal."""
@@ -603,7 +610,7 @@ class UpdateAuthorityPreflightTest(unittest.TestCase):
             "fakex", {"PATH": os.path.join(self.root, "empty")}, registry=self.registry
         )
         self.assertEqual(record.authority, AUTHORITY_UNKNOWN)
-        self.assertFalse(record.admits_relaunch)
+        self.assertFalse(record.admits_actuation)
 
     def test_unknown_provider_is_unknown_and_does_not_raise(self) -> None:
         record = evaluate_update_authority(
@@ -626,8 +633,7 @@ class UpdateAuthorityPreflightTest(unittest.TestCase):
         )
         self.assertEqual(record.authority, AUTHORITY_ALIGNED)
         self.assertEqual(record.binding, BINDING_DRIFTED)
-        self.assertTrue(record.proven_wrong_binary)
-        self.assertFalse(record.admits_relaunch)
+        self.assertFalse(record.admits_actuation)
 
     def test_same_version_reinstall_stays_admitted(self) -> None:
         """Nothing this lane runs changed, so a reinstall must not fence the lane off."""
@@ -644,8 +650,10 @@ class UpdateAuthorityPreflightTest(unittest.TestCase):
             observed_identity=identity,
         )
         self.assertEqual(record.binding, BINDING_MATCHED)
-        self.assertTrue(record.admits_relaunch)
-        self.assertFalse(record.proven_wrong_binary)
+        self.assertTrue(
+            record.admits_actuation,
+            "a reinstall that changed nothing this lane runs must not fence it off",
+        )
 
     def test_preflight_mutates_nothing(self) -> None:
         """It describes; it never repairs. No install, no override rewrite, no update."""
@@ -764,185 +772,206 @@ class SplitLaneIsNeverHealthyResidencyTest(unittest.TestCase):
         self.assertEqual(set(HEALTH_DETAIL), HEALTH_OUTCOMES)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class BuiltinUpdaterTargetAdapterTest(unittest.TestCase):
+    """Design Answer j#96167 items 3-5: positive resolution, or a typed reason. Never a guess.
 
-
-class ProductionSendFenceTest(unittest.TestCase):
-    """Acceptance 4 through the PRODUCTION gate (Redmine #14741 review j#95741 F3).
-
-    The first cut's 49 tests all passed while nothing was wired, which is the proof that
-    they did not measure acceptance 2/3. These run `admit_receiver_startup_or_die` — the
-    same shared pre-send fence `orchestrate_handoff` calls — with fake collaborators, and
-    assert on what the *lane* does: whether a body could have been sent.
-
-    "Zero-send" is asserted, never assumed: `capture_pane` is the ONLY collaborator that
-    may be touched, and the gate returns before any injection, so a refusal is proven by
-    the gate raising while the emitted outcome carries the refusal reason.
+    The manager is never actually invoked: the runner is a fake with `subprocess.run`'s
+    shape, so nothing here depends on an installed npm or on which package manager owns
+    the host.
     """
 
     def setUp(self) -> None:
-        self.emitted: list = []
-        self.ledgered: list = []
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = self.tmp.name
+        self.bindir = os.path.join(self.root, "bin")
+        os.makedirs(self.bindir, exist_ok=True)
+        npm = os.path.join(self.bindir, "npm")
+        with open(npm, "w", encoding="utf-8") as h:
+            h.write("#!/bin/sh\nexit 0\n")
+        os.chmod(npm, os.stat(npm).st_mode | stat.S_IXUSR)
+        self.env = {"PATH": self.bindir}
 
-    def _gate(self, *, pane: str, receiver: str = "codex", **kwargs):
-        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.startup_admission_gate import (  # noqa: E501
-            admit_receiver_startup_or_die,
+    def _runner(self, stdout="", returncode=0, raises=None):
+        def run(argv, **kwargs):
+            if raises is not None:
+                raise raises
+            self.assertEqual(argv[1:], ["root", "-g"], "only the allowlisted query runs")
+            return types.SimpleNamespace(returncode=returncode, stdout=stdout)
+
+        return run
+
+    def test_positive_resolution_requires_the_package_directory_to_exist(self) -> None:
+        node_modules = os.path.join(self.root, "lib", "node_modules")
+        pkg = os.path.join(node_modules, "@openai", "codex")
+        os.makedirs(pkg, exist_ok=True)
+        res = resolve_updater_target(
+            "codex", self.env, runner=self._runner(stdout=node_modules + "\n")
+        )
+        self.assertTrue(res.resolved)
+        self.assertEqual(res.reason, REASON_OK)
+        self.assertEqual(res.roots, (os.path.realpath(pkg),))
+
+    def test_query_answer_without_this_provider_package_is_uncorresponded(self) -> None:
+        """The manager writes somewhere, but not for THIS provider — never `aligned`."""
+        node_modules = os.path.join(self.root, "lib", "node_modules")
+        os.makedirs(node_modules, exist_ok=True)
+        res = resolve_updater_target(
+            "codex", self.env, runner=self._runner(stdout=node_modules)
+        )
+        self.assertFalse(res.resolved)
+        self.assertEqual(res.reason, REASON_IDENTITY_UNCORRESPONDED)
+
+    def test_unregistered_provider_is_typed_not_guessed(self) -> None:
+        res = resolve_updater_target("claude", self.env, runner=self._runner())
+        self.assertFalse(res.resolved)
+        self.assertEqual(res.reason, REASON_PROVIDER_UNREGISTERED)
+
+    def test_ambiguous_or_missing_manager_is_typed(self) -> None:
+        """Two npms on PATH is exactly 'where would an update write?' having no answer."""
+        other = os.path.join(self.root, "other")
+        os.makedirs(other, exist_ok=True)
+        npm2 = os.path.join(other, "npm")
+        with open(npm2, "w", encoding="utf-8") as h:
+            h.write("#!/bin/sh\nexit 1\n")
+        os.chmod(npm2, os.stat(npm2).st_mode | stat.S_IXUSR)
+        for env in (
+            {"PATH": os.pathsep.join([self.bindir, other])},
+            {"PATH": os.path.join(self.root, "empty")},
+            {"PATH": os.pathsep.join([self.bindir, "relative/dir"])},
+        ):
+            with self.subTest(env=env):
+                res = resolve_updater_target("codex", env, runner=self._runner())
+                self.assertFalse(res.resolved)
+                self.assertEqual(res.reason, REASON_QUERY_EXECUTABLE_UNRESOLVED)
+
+    def test_failed_relative_or_raising_query_is_typed(self) -> None:
+        for runner in (
+            self._runner(returncode=1, stdout="/x"),
+            self._runner(stdout=""),
+            self._runner(stdout="relative/dir"),
+            self._runner(raises=OSError("boom")),
+        ):
+            with self.subTest(runner=runner):
+                res = resolve_updater_target("codex", self.env, runner=runner)
+                self.assertFalse(res.resolved)
+                self.assertEqual(res.reason, REASON_QUERY_FAILED)
+
+    def test_resolution_never_leaks_a_path_into_the_reason(self) -> None:
+        res = resolve_updater_target("codex", self.env, runner=self._runner(stdout="/nope"))
+        self.assertNotIn("/", res.reason)
+
+
+class ProductionOrchestrationFenceTest(unittest.TestCase):
+    """j#96060 F3 / Answer j#96167 item 6 — drive the PRODUCTION caller, not the gate.
+
+    R2's tests called `admit_receiver_startup_or_die` directly and injected the probe
+    themselves, so they stayed green while `commands.py` passed nothing. These assert on
+    the caller's own wiring: the probe reaching the fence is the thing under test.
+    """
+
+    def test_the_production_call_shape_arms_the_fence(self) -> None:
+        """The exact gap j#96060 F1 named, asserted on BEHAVIOR rather than source text.
+
+        `commands.py` calls the gate without `updater_targets`. R2 made that mean "no
+        probe -> unknown -> admit", so the fence was inert in production while the tests
+        injected a probe and stayed green. Now the same call shape must consult the
+        built-in adapter and refuse when it cannot vouch for the binary.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application import (  # noqa: E501
+            startup_admission_gate as gate,
         )
 
-        reads: list = []
+        consulted: list = []
+        real = gate.builtin_updater_target_probe
 
-        def capture_pane(target, lines):
-            reads.append((target, lines))
-            return pane
+        def spy():
+            consulted.append(True)
+            return lambda provider_id: ((), False)
 
-        def emit(outcome, **_kw):
-            self.emitted.append(outcome)
+        gate.builtin_updater_target_probe = spy
+        self.addCleanup(setattr, gate, "builtin_updater_target_probe", real)
 
-        admit_receiver_startup_or_die(
-            herdr_send=True,
-            receiver=receiver,
-            target="w4B:p51",
-            read_lines=40,
-            capture_pane=capture_pane,
-            emit=emit,
-            record_format="text",
-            record_command=None,
-            ledger=self.ledgered.append,
-            **kwargs,
-        )
-        return reads
-
-    def _probe(self, *roots, resolved=True):
-        return lambda provider_id: (list(roots), resolved)
-
-    def _pinned_codex(self, subdir="pm"):
-        """A real inert file pinned as the managed codex exec target."""
-        bindir = os.path.join(self.root, subdir, "bin")
-        os.makedirs(bindir, exist_ok=True)
-        path = os.path.join(bindir, "codex")
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write("#!/bin/sh\nexit 0\n")
-        os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
-        return os.path.realpath(path)
-
-    def test_update_prompt_refuses_the_send_through_the_production_gate(self) -> None:
-        """The live #14741 pane: the gate must raise before anything is typed."""
+        emitted: list = []
         with self.assertRaises(SystemExit):
-            self._gate(pane=CAPTURED_UPDATE_PROMPT)
-        self.assertEqual(len(self.emitted), 1)
-        self.assertEqual(self.emitted[0].reason, "receiver_startup_interaction_required")
-        self.assertTrue(self.ledgered, "a refusal must be visible to the supervisor")
-
-    def test_ready_composer_passes_the_production_gate(self) -> None:
-        """Positive control at the production seam: a ready lane still sends."""
-        reads = self._gate(pane=READY_COMPOSER)
-        self.assertEqual(self.emitted, [], "an admitted send emits no refusal")
-        self.assertEqual(len(reads), 1, "exactly one action-time read, as before")
-
-    def test_split_authority_refuses_the_send_even_on_a_ready_pane(self) -> None:
-        """The whole point of #14741: the pane looks ready and the lane is still wrong."""
-        pinned = self._pinned_codex()
-        other_root = os.path.join(self.root, "nvm", "lib", "node_modules")
-        os.makedirs(other_root, exist_ok=True)
-        os.environ["MOZYO_AGENT_CODEX_BINARY"] = pinned
-        self.addCleanup(os.environ.pop, "MOZYO_AGENT_CODEX_BINARY", None)
-        with self.assertRaises(SystemExit):
-            self._gate(pane=READY_COMPOSER, updater_targets=self._probe(other_root))
-        self.assertEqual(len(self.emitted), 1)
-        self.assertEqual(self.emitted[0].reason, "receiver_update_authority_split")
-        self.assertTrue(self.ledgered)
-
-    def test_binding_drift_refuses_the_send_even_on_a_ready_pane(self) -> None:
-        """An update rewrote the executable under the lane: re-bind, never inherit."""
-        pinned = self._pinned_codex()
-        os.environ["MOZYO_AGENT_CODEX_BINARY"] = pinned
-        self.addCleanup(os.environ.pop, "MOZYO_AGENT_CODEX_BINARY", None)
-        with self.assertRaises(SystemExit):
-            self._gate(
-                pane=READY_COMPOSER,
-                updater_targets=self._probe(os.path.join(self.root, "pm")),
-                bound_executable_identity=executable_identity(pinned, "0.145.0"),
-                observed_executable_identity=executable_identity(pinned, "0.146.0"),
+            gate.admit_receiver_startup_or_die(
+                herdr_send=True,
+                receiver="codex",
+                target="w4B:p51",
+                read_lines=40,
+                capture_pane=lambda t, n: READY_COMPOSER,
+                emit=lambda o, **k: emitted.append(o),
+                record_format="text",
+                record_command=None,
             )
-        self.assertEqual(self.emitted[0].reason, "receiver_update_authority_split")
+        self.assertTrue(consulted, "the production call shape must consult the adapter")
+        self.assertEqual(emitted[0].reason, "receiver_update_authority_split")
 
-    def test_same_version_reinstall_does_not_fence_the_lane(self) -> None:
-        """Update SUCCESS that changed nothing this lane runs: the send proceeds."""
-        pinned = self._pinned_codex()
-        identity = executable_identity(pinned, "0.146.0")
-        os.environ["MOZYO_AGENT_CODEX_BINARY"] = pinned
-        self.addCleanup(os.environ.pop, "MOZYO_AGENT_CODEX_BINARY", None)
-        self._gate(
-            pane=READY_COMPOSER,
-            updater_targets=self._probe(os.path.join(self.root, "pm")),
-            bound_executable_identity=identity,
-            observed_executable_identity=identity,
-        )
-        self.assertEqual(self.emitted, [])
-
-    def test_unknown_authority_does_not_take_the_workspace_offline(self) -> None:
-        """The honest common case (no probe) must not become a workspace-wide outage.
-
-        `unknown` still withholds a re-launch and still keeps the lane out of a green
-        startup-health verdict; it does not refuse a send to a live, ready pane.
-        """
-        self._gate(pane=READY_COMPOSER)
-        self.assertEqual(self.emitted, [])
-
-    def test_tmux_path_is_byte_invariant(self) -> None:
-        """The non-herdr path keeps its unchanged snapshot preflight and no new gate."""
-        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.startup_admission_gate import (  # noqa: E501
-            admit_receiver_startup_or_die,
-        )
-
-        reads: list = []
-        admit_receiver_startup_or_die(
-            herdr_send=False,
-            receiver="codex",
-            target="w4B:p51",
-            read_lines=40,
-            capture_pane=lambda t, n: reads.append((t, n)) or "",
-            emit=lambda *a, **k: self.emitted.append(a),
-            record_format="text",
-            record_command=None,
-        )
-        self.assertEqual(len(reads), 1)
-        self.assertEqual(self.emitted, [])
-
-
-class SelfHealRelaunchTest(unittest.TestCase):
-    """Acceptance 3/4: a self-heal re-launch must re-verify, never inherit a stale pin."""
-
-    def test_relaunch_is_withheld_for_every_non_positive_authority(self) -> None:
-        """`unknown` withholds a RE-LAUNCH even though it does not refuse a send.
-
-        Re-launch is the moment the #14741 loop re-armed itself: restarting a binary
-        whose authority nobody established is how the loop stayed invisible.
-        """
-        for authority in (AUTHORITY_SPLIT, AUTHORITY_UNKNOWN):
-            with self.subTest(authority=authority):
-                record = UpdateAuthority(provider="codex", authority=authority)
-                self.assertFalse(record.admits_relaunch)
-        for binding in (BINDING_DRIFTED, BINDING_UNKNOWN):
-            with self.subTest(binding=binding):
-                record = UpdateAuthority(provider="codex", binding=binding)
-                self.assertFalse(record.admits_relaunch)
-
-    def test_health_projection_forwards_the_axes_to_the_classifier(self) -> None:
-        """The production health seam actually carries the axes (j#95741 F1)."""
+    def test_command_module_keeps_its_single_unchanged_call(self) -> None:
+        """The composition lives in the gate, so the largest module gains nothing."""
         import inspect
 
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
-            herdr_startup_health,
+        from mozyo_bridge.application import commands
+
+        source = inspect.getsource(commands)
+        self.assertNotIn("builtin_updater_target_probe", source)
+
+    def test_send_is_refused_when_the_authority_cannot_be_established(self) -> None:
+        """`unknown` is zero-send now (Answer item 4). R2 admitted it; that is retracted."""
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.startup_admission_gate import (  # noqa: E501
+            admit_receiver_startup_or_die,
         )
 
-        signature = inspect.signature(herdr_startup_health.probe_startup_health)
-        self.assertIn("update_authority", signature.parameters)
-        self.assertIn("executable_binding", signature.parameters)
-        source = inspect.getsource(herdr_startup_health._observe_once)
-        self.assertIn("update_authority=update_authority", source)
-        self.assertIn("executable_binding=executable_binding", source)
+        emitted: list = []
+        with self.assertRaises(SystemExit):
+            admit_receiver_startup_or_die(
+                herdr_send=True,
+                receiver="codex",
+                target="w4B:p51",
+                read_lines=40,
+                capture_pane=lambda t, n: READY_COMPOSER,
+                emit=lambda o, **k: emitted.append(o),
+                record_format="text",
+                record_command=None,
+                ledger=emitted.append,
+                updater_targets=lambda pid: ((), False),
+            )
+        self.assertEqual(emitted[0].reason, "receiver_update_authority_split")
+
+    def test_launch_preflight_refuses_a_relaunch_it_cannot_vouch_for(self) -> None:
+        """The whole-plan launch fence — the path a lane self-heal re-enters."""
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_executable import (  # noqa: E501
+            AgentProviderExecutableError,
+            preflight_launch_providers,
+        )
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        bindir = os.path.join(tmp.name, "bin")
+        _make_executable(bindir)
+        env = {"PATH": bindir, "MOZYO_AGENT_FAKEX_BINARY": os.path.join(bindir, "fakex")}
+        registry = _fake_profile_registry()
+
+        # Unarmed: byte-invariant with pre-#14741 (no probe supplied).
+        self.assertIn(
+            "fakex", preflight_launch_providers(["fakex"], env, registry=registry)
+        )
+        # Armed and unresolved: zero-relaunch, and nothing was started.
+        with self.assertRaises(AgentProviderExecutableError):
+            preflight_launch_providers(
+                ["fakex"], env, registry=registry, updater_targets=lambda pid: ((), False)
+            )
+        # Armed and positively aligned: the launch plan resolves as before.
+        self.assertIn(
+            "fakex",
+            preflight_launch_providers(
+                ["fakex"],
+                env,
+                registry=registry,
+                updater_targets=lambda pid: ([bindir], True),
+            ),
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

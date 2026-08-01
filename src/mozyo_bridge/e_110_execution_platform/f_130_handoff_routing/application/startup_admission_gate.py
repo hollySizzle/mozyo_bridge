@@ -38,6 +38,9 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.age
     UpdaterTargetProbe,
     evaluate_update_authority,
 )
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter import (  # noqa: E501
+    builtin_updater_target_probe,
+)
 from mozyo_bridge.shared.errors import die
 
 #: The blocked reason for a receiver that is mid-startup. A distinct token (not
@@ -88,24 +91,38 @@ def _refuse_wrong_binary_or_pass(
     original loop was invisible: every projection said ready, the send "landed", and the
     process exited seconds later into a self-heal that restarted the same old binary.
 
-    Only a **positively demonstrated** wrong binary refuses
-    (:attr:`...UpdateAuthority.proven_wrong_binary`): the updater writes to a different
-    install (``split``), or the executable is not the one this lane bound (``drifted``).
-    An ``unknown`` authority does NOT refuse a send here — see that property's docstring
-    for why turning the honest common case into a workspace-wide outage is not
-    fail-closed. It still keeps the lane out of a green startup-health verdict, and it
-    still refuses a *re-launch* (:attr:`...UpdateAuthority.admits_relaunch`).
+    Anything short of a positive authority refuses
+    (:attr:`...UpdateAuthority.admits_actuation`): the updater writes to a different
+    install (``split``), the executable is not the one this lane bound (``drifted``), OR
+    the authority could not be established at all (``unknown``). R2 let ``unknown``
+    through; Design Consultation Answer j#96167 item 4 ruled that an unresolved authority
+    is zero-actuation, so it no longer does.
+
+    The operational cost is deliberate and visible: on a host where the built-in adapter
+    cannot positively resolve the updater target — several package managers on the trusted
+    PATH, an unsupported manager variant, a failed query — every armed send is refused
+    until an operator makes the install unambiguous. Refusing is the ruled behavior; it is
+    not softened here.
 
     Zero-send by construction: this runs before the first injection, so a refusal has
     typed nothing and pressed no Enter.
     """
+    # Redmine #14741 j#96060 F1 / Answer j#96167 item 6. The probe DEFAULTS to the
+    # built-in adapter rather than being threaded from `commands.py`, for the reason this
+    # module's own docstring gives: `orchestrate_handoff` is the largest module under the
+    # module-health gate, so the gate composes here and the command module keeps a single
+    # unchanged call. R2's failure was that the parameter existed and production supplied
+    # nothing, so the fence silently evaluated `unknown` with no probe; a default closes
+    # that by construction — production cannot forget to arm it. A caller may still inject
+    # its own probe (tests do), and an explicitly unresolving probe is honoured as unknown.
+    probe = updater_targets if updater_targets is not None else builtin_updater_target_probe()
     authority = evaluate_update_authority(
         receiver,
-        updater_targets=updater_targets,
+        updater_targets=probe,
         bound_identity=bound_executable_identity,
         observed_identity=observed_executable_identity,
     )
-    if not authority.proven_wrong_binary:
+    if authority.admits_actuation:
         return
 
     outcome = make_outcome(
@@ -130,8 +147,9 @@ def _refuse_wrong_binary_or_pass(
     if ledger is not None:
         ledger(outcome)
     die(
-        f"blocked: the {receiver} receiver is not running the binary its own updater "
-        f"writes to (update authority: {authority.authority}, executable binding: "
+        f"blocked: mozyo could not establish that the {receiver} receiver runs the "
+        f"binary its own updater writes to (update authority: {authority.authority}, "
+        f"executable binding: "
         f"{authority.binding}). target={target}. Nothing was typed and Enter was never "
         "pressed. Updating the provider cannot change what this lane runs, so an update "
         "that exits 0 is not a fix and a self-heal will restart the same binary. "

@@ -1853,34 +1853,49 @@ Three contracts follow, and they are deliberately separate:
    version), because path pinning alone cannot see an in-place rewrite and version pinning
    alone cannot see the split. A same-version reinstall is a *match*, not a drift —
    nothing the lane runs changed.
-3. **A split lane must be fenced at the send, and must never be healthy residency.**
+3. **A split lane is fenced at the send and at the launch, and is never healthy residency.**
 
-   **Status — NOT YET IN FORCE (Redmine #14741 review j#96060 F1/F2).** This clause states
-   the contract, not the current behavior, and the distinction is recorded here because
-   two consecutive rounds of this issue described the fence as wired when it was not. What
-   exists today: `admit_receiver_startup_or_die` *accepts* the updater-target probe and the
-   bound/observed executable identity and evaluates the authority; what does **not** exist:
-   its only production caller (`application/commands.py`) supplies none of them, so every
-   production send evaluates to `unknown` with no probe. Nothing consumes
-   `admits_relaunch`, so no re-launch or self-heal path is fenced at all. Treat the
-   paragraphs below as the target contract until a round lands that measures the
-   production caller itself.
+   The action-time preflight runs inside the shared pre-send gate
+   (`admit_receiver_startup_or_die`), immediately after the startup screen is found clear
+   and before the first injection, and inside `preflight_launch_providers` — the whole-plan
+   launch fence every launch and every self-heal re-launch passes before the first side
+   effect. Anything short of a positive authority refuses: `split`, `drifted`, **and
+   `unknown`**. The send refusal is `receiver_update_authority_split`, zero-send and
+   ledgered; the launch refusal raises before a workspace, tab, or agent exists.
 
-   The intended contract: the action-time preflight runs inside the shared pre-send gate,
-   immediately after the startup screen is found clear and before the first injection, and
-   a wrong binary refuses the send with `receiver_update_authority_split`, zero-send and
-   ledgered.
+   The gate **defaults** to the built-in adapter rather than having `commands.py` thread a
+   probe in. That is deliberate: in the round before this one the parameter existed and the
+   production caller passed nothing, so the fence evaluated `unknown` with no probe and
+   admitted every send while looking wired. A default cannot be forgotten. (It also keeps
+   the largest module under the module-health gate unchanged, which is why the gate lives
+   in this file at all.)
 
-   **The unresolved precondition.** `unknown` must fail closed (j#94469 Acceptance 2,
-   j#95741 F1, accepted in j#96040), but with no positive updater-target resolver
-   `unknown` is the verdict for *every* host, so fencing on it takes the whole workspace
-   offline. The resolver is therefore the precondition, and it is blocked on a trust
-   boundary this document itself draws: the profile schema fail-closed forbids a profile
-   from carrying an argv, so "ask npm where it writes" cannot be declared as provider
-   data, and putting the provider→package-manager mapping in a consumer module violates
-   the rule that a provider-specific string never belongs there. That question is open
-   (#14741 design consultation); until it is answered the honest description of this
-   surface is "classifier and seam exist, fence is not in force".
+   **Where "where does the updater write?" is answered** (Design Consultation Answer
+   j#96167, option D). Not in profile data — a read-only query is still an execution
+   recipe, and the profile schema fail-closed forbids an argv. Not in a provider-neutral
+   consumer — those see only a typed port and a typed result. It is answered by a
+   **built-in update-manager adapter** in trusted code with a closed registry: the manager
+   list, the query argv, and the provider→manager/package mapping are literals in one
+   module, resolved with the same trusted-`PATH` discipline as a provider binary and run
+   through an injected runner. No plugin API, no operator-supplied argv, no repo-local
+   script, no dynamic module loading.
+
+   A write root is returned **only** when the manager, its query executable, the reported
+   root, and the provider's own package directory inside it all correspond. Every other
+   shape — unregistered provider, unsupported manager, zero or several query executables,
+   a failed or relative answer, a package directory that is not there — is a fixed reason
+   token and a typed `unknown`, which is zero-actuation.
+
+   **Only npm is supported in this first cut** (Answer item 5). pnpm, bun, brew and the
+   curl installer are real variants whose positive query and identity correspondence have
+   not been measured; a guessed one would re-create this very defect, so they resolve to
+   `unknown` rather than to an approximation.
+
+   **The operational cost is real and is not softened.** On a host where the adapter
+   cannot positively resolve — notably one carrying several `npm` installs on the trusted
+   `PATH` — every armed send and launch is refused until an operator makes the install
+   unambiguous. That is the ruled trade-off (Answer item 4 chose it over letting an
+   unresolved authority through), not an implementation accident.
 
    The `startup_health` classifier gains `provider_update_authority_split`,
    `provider_executable_binding_drift`, and `provider_update_authority_unverified` in the

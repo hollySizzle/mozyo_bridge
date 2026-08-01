@@ -159,34 +159,27 @@ class UpdateAuthority:
             )
 
     @property
-    def proven_wrong_binary(self) -> bool:
-        """True only when a POSITIVE finding says this lane runs the wrong binary.
+    def admits_actuation(self) -> bool:
+        """True only when this lane may be actuated at all — send, launch, or re-launch.
 
-        ``split`` (the updater writes somewhere else) and ``drifted`` (the executable is
-        not the one this lane bound) are both positive, demonstrated findings.
-        ``unknown`` is deliberately NOT one: it says the question is undecided.
+        Redmine #14741 Design Consultation Answer j#96167 item 4. R2 split this into a
+        lenient send predicate and a strict re-launch predicate so that ``unknown`` — the
+        verdict for every host with no positive resolver — would not refuse sends. That
+        was the implementer narrowing an accepted finding without a ruling (j#96060 F2),
+        and the ruling went the other way: an unresolved authority is zero-actuation for
+        send, relaunch, and any reading of an update as success.
 
-        This is the predicate the **pre-send** fence uses, and the split from
-        :attr:`admits_relaunch` is the #14741 j#95741 F1/F2 resolution. Once the F2 proxy
-        was removed, ``unknown`` became the common and honest verdict for any host whose
-        package-manager prefix nobody has positively resolved. Treating ``unknown`` as a
-        send refusal would have taken the entire workspace offline to guard against a
-        possibility, which is not fail-closed — it is a different outage. Acceptance 3
-        asks for zero-send on "drift/split", and that is exactly what this predicate is.
-        """
-        return self.authority == AUTHORITY_SPLIT or self.binding == BINDING_DRIFTED
+        So there is one predicate again. ``not_evaluated`` still admits, and only that:
+        it means a caller has not armed the gate, which keeps every pre-#14741 call site
+        byte-invariant. ``aligned`` / ``matched`` admit because they were armed and
+        positively passed. ``split``, ``drifted`` and ``unknown`` never admit — including
+        ``unknown``, because "we could not establish which binary an update would reach"
+        is precisely the state in which the #14741 loop was invisible.
 
-    @property
-    def admits_relaunch(self) -> bool:
-        """True only when neither axis withholds admission — the STRICT predicate.
-
-        An un-evaluated axis admits (the caller did not arm it); an aligned / matched
-        axis admits (it was armed and passed). ``split`` / ``drifted`` / ``unknown``
-        never admit — including ``unknown``, because a re-launch is precisely the moment
-        the #14741 loop re-armed itself, and re-starting a binary whose authority nobody
-        could establish is how that loop stayed invisible. A send to a live pane is a
-        weaker action than resurrecting a dead one, which is why the pre-send fence uses
-        :attr:`proven_wrong_binary` instead.
+        The cost is real and is meant to be visible: on a host where the built-in adapter
+        cannot positively resolve the updater target, every armed actuation is refused
+        until an operator makes the install unambiguous. That is the ruled trade-off, not
+        an accident of implementation.
         """
         return self.authority in (
             AUTHORITY_NOT_EVALUATED,
