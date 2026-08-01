@@ -1189,13 +1189,15 @@ class ActualLaunchAndSelfHealFenceTest(unittest.TestCase):
             "the production launch path must resolve to the ARMED preflight",
         )
 
-    def test_composed_launch_preflight_arms_without_being_asked(self) -> None:
-        """Behavioral, not structural: the composed preflight must fence a codex launch
-        even though the caller passes no `updater_targets`.
+    def test_launch_is_armed_by_cause_not_by_provider(self) -> None:
+        """Design Answer j#96374 items 1-2, behavioral at the production boundary.
 
-        The import-identity assertion above proves the right symbol is wired; it cannot
-        prove the symbol still arms. This one goes RED the moment the composition stops
-        supplying the resolver — which is the property j#96360 F1/F2 asked for.
+        A GENERIC fresh launch must stay byte-invariant with the pre-#14741 path and never
+        consult a package manager — arming every bound-provider launch is what regressed
+        210 tests (j#96364). Only an update-derived relaunch is fenced.
+
+        Goes RED if the composition stops arming `update_relaunch`, and RED if it starts
+        arming `generic_fresh` again.
         """
         import mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter as adapter
         from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_launch_composition import (  # noqa: E501
@@ -1220,10 +1222,38 @@ class ActualLaunchAndSelfHealFenceTest(unittest.TestCase):
             h.write("#!/bin/sh\nexit 0\n")
         os.chmod(exe, os.stat(exe).st_mode | stat.S_IXUSR)
 
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_launch_composition import (  # noqa: E501
+            LAUNCH_CAUSE_GENERIC_FRESH,
+            LAUNCH_CAUSE_UPDATE_RELAUNCH,
+            LaunchCauseError,
+        )
+
+        env = {"PATH": bindir, "MOZYO_AGENT_CODEX_BINARY": exe}
+
+        # generic fresh: unarmed, and the adapter is never reached.
+        consulted: list = []
+        adapter.resolve_updater_target = lambda *a, **k: (
+            consulted.append(True)
+            or UpdaterTargetResolution(roots=(), resolved=False, reason=REASON_QUERY_FAILED)
+        )
+        self.assertIn(
+            "codex",
+            preflight_launch_providers(
+                ["codex"], env, launch_cause=LAUNCH_CAUSE_GENERIC_FRESH
+            ),
+        )
+        self.assertEqual(consulted, [], "a generic launch must not consult a package manager")
+
+        # update-derived relaunch: armed, and an unresolved authority is zero-relaunch.
         with self.assertRaises(AgentProviderExecutableError):
             preflight_launch_providers(
-                ["codex"], {"PATH": bindir, "MOZYO_AGENT_CODEX_BINARY": exe}
+                ["codex"], env, launch_cause=LAUNCH_CAUSE_UPDATE_RELAUNCH
             )
+        self.assertTrue(consulted)
+
+        # an unrecognised cause is never treated as the harmless one.
+        with self.assertRaises(LaunchCauseError):
+            preflight_launch_providers(["codex"], env, launch_cause="probably_fine")
 
     def test_launch_composition_scopes_per_provider(self) -> None:
         """A bound sibling must not drag an unbound provider into the fence (D2 item 1)."""

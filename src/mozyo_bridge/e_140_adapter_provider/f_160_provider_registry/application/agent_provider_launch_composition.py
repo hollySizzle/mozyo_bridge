@@ -32,6 +32,23 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.
 )
 
 
+#: A launch that nobody has tied to a provider update. The overwhelming majority, and the
+#: pre-#14741 behavior: the authority gate does not apply, no package manager is consulted.
+LAUNCH_CAUSE_GENERIC_FRESH = "generic_fresh"
+#: A launch caused by a provider update — a verified update/install startup-blocker
+#: observation, or an update outcome bound to this same lane generation. ONLY this cause
+#: arms the strict authority gate (Design Answer j#96374 items 1-2).
+LAUNCH_CAUSE_UPDATE_RELAUNCH = "update_relaunch"
+
+LAUNCH_CAUSES: frozenset = frozenset(
+    {LAUNCH_CAUSE_GENERIC_FRESH, LAUNCH_CAUSE_UPDATE_RELAUNCH}
+)
+
+
+class LaunchCauseError(ValueError):
+    """An unrecognised launch cause. Fail closed rather than guess which one was meant."""
+
+
 def launch_updater_target_resolver(
     providers: Sequence[str],
 ) -> Optional[Callable[[str], Any]]:
@@ -59,25 +76,48 @@ def launch_updater_target_resolver(
 def preflight_launch_providers(
     providers: Sequence[str],
     env: Optional[Any] = None,
+    *,
+    launch_cause: str = LAUNCH_CAUSE_GENERIC_FRESH,
     **kwargs: Any,
 ) -> "dict[str, ResolvedProviderLaunch]":
-    """The launch preflight with the update-authority fence **already armed**.
+    """The launch preflight, with the update-authority fence armed **by cause**.
 
     Signature-compatible with the unarmed resolver, so the production launch path
-    (``herdr_session_start``) imports this name instead and its call is unchanged. That
-    matters twice over: the caller cannot forget to arm the fence, and the module stays
-    exactly the size it was — ``herdr_session_start`` sits just under the module-health
-    threshold, and a self-approved allowlist entry is not an option.
+    (``herdr_session_start``) imports this name instead and its call is unchanged.
+
+    **Only an update-derived launch is armed** (Design Answer j#96374 items 1-2). The
+    previous cut armed every launch that involved a bound provider, which refused any
+    launch whose env had no resolvable package manager and regressed 210 tests (j#96364):
+    a fence that reads host state, armed on a path that never asked for it. A generic
+    fresh launch is now byte-invariant with the pre-#14741 behavior and consults no
+    package manager at all.
+
+    ``launch_cause`` is a typed, provider-neutral token supplied by the composition root
+    from a *verified* signal — an update/install startup-blocker observation, or an update
+    outcome bound to this lane generation. It is deliberately NOT derivable here: a clean
+    exit alone does not make a relaunch update-derived, and neither this module nor its
+    callers re-guess it from pane text or ambient host state.
 
     An explicit ``updater_targets`` from the caller wins; this only supplies the default.
-    Providers with no trusted built-in updater binding stay unarmed (``not_evaluated``),
-    per Design Answer D2 j#96288 item 1.
+    Providers with no trusted built-in updater binding stay unarmed (``not_evaluated``)
+    even under ``update_relaunch``, per D2 j#96288 item 1.
     """
-    kwargs.setdefault("updater_targets", launch_updater_target_resolver(providers))
+    if launch_cause not in LAUNCH_CAUSES:
+        raise LaunchCauseError(
+            f"launch cause {launch_cause!r} is not recognised; allowed: "
+            f"{sorted(LAUNCH_CAUSES)}. The cause decides whether the update-authority "
+            f"gate is armed, so an unrecognised one is never treated as the harmless case."
+        )
+    if launch_cause == LAUNCH_CAUSE_UPDATE_RELAUNCH:
+        kwargs.setdefault("updater_targets", launch_updater_target_resolver(providers))
     return _preflight_unarmed(providers, env, **kwargs)
 
 
 __all__ = (
+    "LAUNCH_CAUSES",
+    "LAUNCH_CAUSE_GENERIC_FRESH",
+    "LAUNCH_CAUSE_UPDATE_RELAUNCH",
+    "LaunchCauseError",
     "ResolvedProviderLaunch",
     "launch_updater_target_resolver",
     "preflight_launch_providers",
