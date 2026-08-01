@@ -77,6 +77,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     CoordinatorConfirmation,
     IntegrationActionRecord,
     IntegrationCiEvidence,
+    IntegrationPreflight,
     IntegrationWorktree,
     StepOutcome,
     build_integration_action_record,
@@ -121,20 +122,24 @@ INTEGRATION_DISPOSITIONS: frozenset = frozenset(
 )
 
 # ---------------------------------------------------------------------------
-# What the exact-SHA CI gate did (R1 review j#96344 finding 2 / dispute j#96346).
+# What the exact-SHA CI gate did.
+#
+# R2 review j#96350 finding 1 withdrew the `waived` state and the config knob behind it.
+# R2 argued from j#96335's configuration list ("branch/target CI を設定駆動") that an optional
+# gate was owner-authorized; three durable anchors say otherwise — j#77124 state 5
+# ("integrated: origin reachability + exact-SHA CI green を確定"), j#96335's own target flow
+# ("exact integration SHA CI green → Close Gate"), and j#96337's fail_closed list ("CI未確定").
+# The waiver also had no downstream semantics: the cleanup machine requires a settled green
+# CI, so a waived integration either blocked cleanup forever or forced a false self-report.
+# The dispute (j#96346) is withdrawn and the gate is mandatory. Only two states remain.
 # ---------------------------------------------------------------------------
 
-#: The gate was required and satisfied by checkable evidence for the exact pushed commit.
+#: The gate was satisfied by checkable evidence for the exact pushed commit.
 CI_GATE_GREEN = "green"
-#: The gate was turned off by config. The integration completed WITHOUT an observed CI run,
-#: and the record says so rather than letting `integrated` imply a green one.
-CI_GATE_WAIVED = "waived"
 #: The decision never got as far as the CI gate (blocked, terminal no-op, or still pushing).
 CI_GATE_NOT_REACHED = "not_reached"
 
-CI_GATE_STATES: frozenset = frozenset(
-    {CI_GATE_GREEN, CI_GATE_WAIVED, CI_GATE_NOT_REACHED}
-)
+CI_GATE_STATES: frozenset = frozenset({CI_GATE_GREEN, CI_GATE_NOT_REACHED})
 
 # ---------------------------------------------------------------------------
 # States.
@@ -241,8 +246,13 @@ BLOCKED_SOURCE_UNREACHABLE = "source_head_unreachable"
 #: The latest review generation is not admissible (no approval, a stale approval for an
 #: older generation, or an unresolved blocking finding in the latest one).
 BLOCKED_REVIEW_INADMISSIBLE = "review_generation_inadmissible"
-#: Required source-branch CI is not green (or not settled).
+#: Source-branch CI settled with a non-success conclusion.
 BLOCKED_SOURCE_CI_NOT_GREEN = "source_ci_not_green"
+#: Source CI evidence was supplied but cannot be checked (missing run / check identity /
+#: malformed head). The sibling of the integration-CI token, kept apart for the same reason.
+BLOCKED_SOURCE_CI_EVIDENCE_INCOMPLETE = "source_ci_evidence_incomplete"
+#: The source CI evidence is about a different commit than the source head being integrated.
+BLOCKED_SOURCE_CI_HEAD_MISMATCH = "source_ci_head_mismatch"
 #: The configured target ref is not a known, allowlisted integration branch.
 BLOCKED_UNKNOWN_TARGET = "unknown_target_branch"
 #: The observed target head differs from the expected one recorded in the action: the
@@ -267,6 +277,15 @@ BLOCKED_UNRESOLVED_OWNER_GATE = "unresolved_owner_gate"
 #: The push was attempted and lost the race (or otherwise failed). Recorded distinctly from
 #: :data:`BLOCKED_TARGET_DRIFT`, which is the *pre*-push observation.
 BLOCKED_PUSH_REJECTED = "push_rejected"
+#: A push was recorded ``done`` but its outcome carries no usable head (R2 review j#96350
+#: finding 2). R2 fell back to the source head here, which turned "we failed to record what
+#: landed" into "the source landed" — and then matched a merge integration's CI against the
+#: wrong commit. There is no fallback: a push that cannot say what it landed has not been
+#: shown to have landed anything.
+BLOCKED_PUSH_OUTCOME_HEAD_MISSING = "push_outcome_head_missing"
+#: The head the push recorded is not the head this disposition should have landed: the source
+#: head for a fast-forward, or the apply step's merge commit for a merge disposition.
+BLOCKED_PUSH_HEAD_MISMATCH = "push_head_mismatch"
 #: CI on the exact integration SHA settled with a non-success conclusion.
 BLOCKED_INTEGRATION_CI_FAILED = "integration_ci_failed"
 #: CI evidence was supplied but cannot be checked: a missing run id, a missing required-check
@@ -308,6 +327,8 @@ _BLOCKED_REASON_PRECEDENCE: Tuple[str, ...] = (
     BLOCKED_SOURCE_UNREACHABLE,
     BLOCKED_UNPUSHED_COMMITS,
     BLOCKED_DIRTY_WORKTREE,
+    BLOCKED_SOURCE_CI_EVIDENCE_INCOMPLETE,
+    BLOCKED_SOURCE_CI_HEAD_MISMATCH,
     BLOCKED_SOURCE_CI_NOT_GREEN,
     BLOCKED_UNRESOLVED_OWNER_GATE,
     BLOCKED_UNRESOLVED_CALLBACK,
@@ -315,6 +336,8 @@ _BLOCKED_REASON_PRECEDENCE: Tuple[str, ...] = (
     BLOCKED_NON_FAST_FORWARD,
     BLOCKED_MERGE_CONFLICT,
     BLOCKED_PUSH_REJECTED,
+    BLOCKED_PUSH_OUTCOME_HEAD_MISSING,
+    BLOCKED_PUSH_HEAD_MISMATCH,
     BLOCKED_INTEGRATION_WORKTREE_INADMISSIBLE,
     BLOCKED_INTEGRATION_CI_EVIDENCE_INCOMPLETE,
     BLOCKED_INTEGRATION_CI_HEAD_MISMATCH,
@@ -351,15 +374,17 @@ class AutoIntegrationPolicy:
     resolution, and a runtime that cannot resolve one fails closed rather than guessing.
     ``ff_only`` — the owner's default (j#96335). ``False`` admits the merge-commit
     disposition; it never admits a rebase or a force push, which have no representation here.
-    ``require_source_ci`` / ``require_integration_ci`` — whether the source-branch and
-    exact-integration-SHA CI gates are required.
+
+    There are deliberately no CI knobs. R2 shipped ``require_source_ci`` /
+    ``require_integration_ci`` and review j#96350 finding 1 ruled them out: j#77124, j#96335's
+    target flow, and j#96337's fail-closed list all require green CI for an integration, and a
+    config value naming *which* CI to require is not authority to require none. Both gates are
+    unconditional, so no field can turn one off.
     """
 
     mode: str = MODE_DISABLED
     integration_branch: Optional[str] = None
     ff_only: bool = True
-    require_source_ci: bool = True
-    require_integration_ci: bool = True
 
     @classmethod
     def default(cls) -> "AutoIntegrationPolicy":
@@ -369,84 +394,6 @@ class AutoIntegrationPolicy:
     def disposition(self) -> str:
         """The disposition this policy admits (never a rebase / force)."""
         return DISPOSITION_FAST_FORWARD if self.ff_only else DISPOSITION_MERGE_COMMIT
-
-
-# ---------------------------------------------------------------------------
-# Action-time preflight facts.
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class IntegrationPreflight:
-    """The action-time facts the integration decision is made from (supplied, not discovered).
-
-    Every safety-bearing field defaults to its **unsatisfied** value, so a caller that omits
-    one is blocked rather than default-admitted. The two that describe the world rather than
-    a gate (``already_integrated`` / ``patch_equivalent_evidence``) default to ``False``,
-    which is also the conservative reading: "not known to be integrated" leads to the gates,
-    never past them.
-
-    Git-shaped facts (consulted only when ``is_git_workspace``):
-
-    - ``observed_target_head`` — the target ref's head *right now*, compared against the
-      action's ``expected_target_head``. :data:`EMPTY_TARGET_HEAD` for a ref that does not exist.
-    - ``fast_forward_possible`` — the expected target head is an ancestor of the source head.
-    - ``already_integrated`` — the source head is reachable from the target head.
-    - ``patch_equivalent_evidence`` — explicit patch-id evidence that the same patches are
-      already on the target. Only this admits :data:`STATE_PATCH_EQUIVALENT`; a bare "looks
-      the same" never does.
-    - ``merge_conflict`` — the merge-commit disposition conflicted.
-    - ``source_worktree_dirty`` / ``worktree_is_foreign`` / ``unpushed_unique_commits``.
-
-    Durable-record facts, always enforced:
-
-    - ``source_head_matches_review`` — the source head is the exact head the review approved.
-    - ``source_origin_reachable`` — that head is reachable from origin.
-    - ``review_generation_admissible`` — the latest review generation is approved AND carries
-      no unresolved blocking finding (never merely "an approval exists somewhere").
-    - ``target_identity_known`` — the target ref is a known, allowlisted integration branch.
-      Note this is a *different* question from whether the ref is the branch this actuator
-      was configured for; that one is checked against ``policy.integration_branch``.
-    - ``source_ci_green`` — settled green, not merely started.
-    - ``callbacks_drained`` / ``owner_gates_resolved``.
-
-    Typed records (R1 review j#96344 — each replaced a bare boolean that could not be
-    audited; all default to ``None``, which is the unsatisfied reading):
-
-    - ``integration_ci`` — :class:`IntegrationCiEvidence`: the CI verdict for the exact
-      commit the push landed, carrying the required check's identity and the run id so an
-      unrelated green run cannot satisfy it. Read only when ``require_integration_ci``.
-    - ``coordinator_confirmation`` — :class:`CoordinatorConfirmation`: an explicit
-      confirmation of *this* action key by the coordinator role, with the durable anchor it
-      is recorded at. Read only under :data:`MODE_COORDINATOR_CONFIRMED`. It gates actuation;
-      it relaxes nothing.
-    - ``integration_worktree`` — :class:`IntegrationWorktree`: the dedicated checkout a
-      merge-commit disposition is applied in, with the measured facts proving it is not the
-      lane's own. Read only when the effective disposition is a merge commit.
-    """
-
-    is_git_workspace: bool
-    # Git-shaped.
-    observed_target_head: str = ""
-    fast_forward_possible: bool = False
-    already_integrated: bool = False
-    patch_equivalent_evidence: bool = False
-    merge_conflict: bool = False
-    source_worktree_dirty: bool = True
-    worktree_is_foreign: bool = True
-    unpushed_unique_commits: bool = True
-    # Durable-record.
-    source_head_matches_review: bool = False
-    source_origin_reachable: bool = False
-    review_generation_admissible: bool = False
-    target_identity_known: bool = False
-    source_ci_green: bool = False
-    callbacks_drained: bool = False
-    owner_gates_resolved: bool = False
-    # Typed records (R1 review j#96344). `None` is the unsatisfied reading throughout.
-    integration_ci: Optional[IntegrationCiEvidence] = None
-    coordinator_confirmation: Optional[CoordinatorConfirmation] = None
-    integration_worktree: Optional[IntegrationWorktree] = None
 
 
 # ---------------------------------------------------------------------------
@@ -466,12 +413,10 @@ class IntegrationDecision:
     :data:`STATE_INTEGRATION_BLOCKED`.
 
     ``integration_ci`` says, machine-readably, what the exact-SHA CI gate did for this
-    decision — :data:`CI_GATE_GREEN`, :data:`CI_GATE_WAIVED`, or :data:`CI_GATE_NOT_REACHED`.
-    It exists because ``state == integrated`` alone cannot distinguish "CI was green on this
-    exact commit" from "the operator turned the CI gate off", and a durable record that
-    cannot distinguish them will be read as the first (R1 review j#96344 finding 2; the
-    knob itself is owner-authorized — j#96335 lists branch/target CI as config-driven — so
-    the waiver is made visible rather than removed. Dispute record: j#96346).
+    decision — :data:`CI_GATE_GREEN` or :data:`CI_GATE_NOT_REACHED`. There is no third
+    value: R2's ``waived`` and the config knob behind it were withdrawn by review j#96350
+    finding 1 (dispute j#96346 withdrawn in j#96351), so an ``integrated`` decision always
+    carries a green exact-SHA gate.
     """
 
     state: str
@@ -516,6 +461,40 @@ class IntegrationDecision:
             "reason": self.reason,
             "integration_ci": self.integration_ci,
         }
+
+
+def _ci_evidence_problem(
+    evidence: Optional[IntegrationCiEvidence],
+    *,
+    expected_head: str,
+    incomplete_reason: str,
+    mismatch_reason: str,
+    failed_reason: str,
+) -> Optional[Tuple[str, str]]:
+    """The (token, detail) this CI evidence fails on, or ``None`` if it is green for ``expected_head``.
+
+    One checker for both CI gates so they cannot drift apart — the source gate spent a round
+    as a bare boolean while its sibling was typed, which is exactly how two spellings of the
+    same rule diverge. ``None`` evidence is NOT a problem here: absence means "not settled
+    yet", which each caller renders as its own waiting or blocking state.
+    """
+    if evidence is None:
+        return None
+    incomplete = evidence.completeness_errors()
+    if incomplete:
+        return incomplete_reason, "; ".join(incomplete)
+    if evidence.integration_head != expected_head:
+        return (
+            mismatch_reason,
+            f"the CI evidence is about {evidence.integration_head}, not {expected_head}",
+        )
+    if not evidence.is_green:
+        return (
+            failed_reason,
+            f"required check {evidence.workflow!r} run {evidence.run!r} settled "
+            f"{evidence.conclusion!r} on {evidence.integration_head}",
+        )
+    return None
 
 
 def _blocked(
@@ -646,8 +625,21 @@ def decide_integration(
         blockers.add(BLOCKED_UNPUSHED_COMMITS)
     if preflight.source_worktree_dirty:
         blockers.add(BLOCKED_DIRTY_WORKTREE)
-    if policy.require_source_ci and not preflight.source_ci_green:
+    # The source-branch CI gate is unconditional (j#96350 finding 1) and typed against the
+    # source head: absent evidence is "not green", and present evidence must be about the very
+    # commit being integrated.
+    if preflight.source_ci is None:
         blockers.add(BLOCKED_SOURCE_CI_NOT_GREEN)
+    else:
+        problem = _ci_evidence_problem(
+            preflight.source_ci,
+            expected_head=record.source_head,
+            incomplete_reason=BLOCKED_SOURCE_CI_EVIDENCE_INCOMPLETE,
+            mismatch_reason=BLOCKED_SOURCE_CI_HEAD_MISMATCH,
+            failed_reason=BLOCKED_SOURCE_CI_NOT_GREEN,
+        )
+        if problem:
+            blockers.add(problem[0])
     if not preflight.owner_gates_resolved:
         blockers.add(BLOCKED_UNRESOLVED_OWNER_GATE)
     if not preflight.callbacks_drained:
@@ -782,81 +774,80 @@ def decide_integration(
 
     # 3. CI on the exact integration SHA — asynchronous, never assumed complete.
     #
-    # R1 review j#96344 finding 2: the gate used to read a bare `integration_ci_green: bool`,
-    # which said a run was green without saying WHICH run, which required check, or which
-    # commit — so an unrelated green run satisfied it. The evidence now names all three and
-    # is matched against the head the push actually landed. The head comes from the ledger,
-    # not from a caller-supplied field, so the two cannot drift apart.
-    ci_gate = CI_GATE_NOT_REACHED
-    if policy.require_integration_ci:
-        landed_head = done[STEP_PUSH].head or record.source_head
-        evidence = preflight.integration_ci
-        if evidence is None:
-            return IntegrationDecision(
-                state=STATE_AWAITING_CI,
-                action_key=action_key,
-                next_step=STEP_INTEGRATION_CI,
-                disposition=disposition,
-                reason=(
-                    "awaiting CI on the exact integration SHA; a single synchronous "
-                    "command never assumes the run completed"
-                ),
-            )
-        incomplete = evidence.completeness_errors()
-        if incomplete:
-            # "We cannot tell what this run was" is not "the run failed": the operator's next
-            # action is to produce a complete record, not to fix a build.
-            return _blocked(
-                record,
-                (BLOCKED_INTEGRATION_CI_EVIDENCE_INCOMPLETE,),
-                disposition=disposition,
-                action_key=action_key,
-                reason="; ".join(incomplete),
-            )
-        if evidence.integration_head != landed_head:
-            return _blocked(
-                record,
-                (BLOCKED_INTEGRATION_CI_HEAD_MISMATCH,),
-                disposition=disposition,
-                action_key=action_key,
-                reason=(
-                    f"the CI evidence is about {evidence.integration_head}, but the push "
-                    f"landed {landed_head}"
-                ),
-            )
-        if not evidence.is_green:
-            return _blocked(
-                record,
-                (BLOCKED_INTEGRATION_CI_FAILED,),
-                disposition=disposition,
-                action_key=action_key,
-                reason=(
-                    f"required check {evidence.workflow!r} run {evidence.run!r} settled "
-                    f"{evidence.conclusion!r} on {evidence.integration_head}"
-                ),
-            )
-        ci_gate = CI_GATE_GREEN
-    else:
-        # The knob is owner-authorized (j#96335 lists branch/target CI as config-driven), so
-        # the waiver is made VISIBLE rather than removed: `integrated` alone cannot say
-        # whether CI ran, and a durable record that cannot say will be read as if it did.
-        ci_gate = CI_GATE_WAIVED
-
-    # The reason names only the gates that actually ran: with `require_integration_ci: false`
-    # no exact-SHA CI was observed, and a durable record must not say one was.
-    settled = (
-        "origin reachability is settled and the exact-SHA CI gate is green"
-        if ci_gate == CI_GATE_GREEN
-        else "origin reachability is settled; the exact-SHA CI gate is WAIVED by config "
-        "(no CI run was observed for this commit)"
+    # The head the run must be about is the head the push RECORDED landing. R2 fell back to
+    # the source head when that record was empty (`... or record.source_head`), which turned
+    # "we failed to record what landed" into "the source landed" and let a merge integration
+    # be gated by CI about a commit that was never on the target (j#96350 finding 2). There
+    # is no fallback, and the recorded head must additionally be the one this disposition
+    # should have produced.
+    push_outcome = done[STEP_PUSH]
+    landed_head = push_outcome.head
+    if not is_full_sha(landed_head):
+        return _blocked(
+            record,
+            (BLOCKED_PUSH_OUTCOME_HEAD_MISSING,),
+            disposition=disposition,
+            action_key=action_key,
+            reason=(
+                "the push step was recorded done but its outcome carries no full commit "
+                "head; a push that cannot say what it landed has not been shown to have "
+                "landed anything"
+            ),
+        )
+    expected_landed = (
+        done[STEP_INTEGRATION_APPLY].head
+        if disposition == DISPOSITION_MERGE_COMMIT
+        else record.source_head
     )
+    if landed_head != expected_landed:
+        return _blocked(
+            record,
+            (BLOCKED_PUSH_HEAD_MISMATCH,),
+            disposition=disposition,
+            action_key=action_key,
+            reason=(
+                f"the push recorded landing {landed_head}, but this {disposition} "
+                f"disposition should have landed {expected_landed or 'an applied commit'}"
+            ),
+        )
+
+    if preflight.integration_ci is None:
+        return IntegrationDecision(
+            state=STATE_AWAITING_CI,
+            action_key=action_key,
+            next_step=STEP_INTEGRATION_CI,
+            disposition=disposition,
+            reason=(
+                "awaiting CI on the exact integration SHA; a single synchronous "
+                "command never assumes the run completed"
+            ),
+        )
+    problem = _ci_evidence_problem(
+        preflight.integration_ci,
+        expected_head=landed_head,
+        incomplete_reason=BLOCKED_INTEGRATION_CI_EVIDENCE_INCOMPLETE,
+        mismatch_reason=BLOCKED_INTEGRATION_CI_HEAD_MISMATCH,
+        failed_reason=BLOCKED_INTEGRATION_CI_FAILED,
+    )
+    if problem:
+        return _blocked(
+            record,
+            (problem[0],),
+            disposition=disposition,
+            action_key=action_key,
+            reason=problem[1],
+        )
+
     return IntegrationDecision(
         state=STATE_INTEGRATED,
         action_key=action_key,
         next_step=None,
         disposition=disposition,
-        reason=f"integrated into {record.target_ref}: {settled}",
-        integration_ci=ci_gate,
+        reason=(
+            f"integrated into {record.target_ref} at {landed_head}: origin reachability is "
+            "settled and the exact-SHA CI gate is green"
+        ),
+        integration_ci=CI_GATE_GREEN,
     )
 
 
@@ -908,13 +899,16 @@ __all__ = (
     "BLOCKED_UNRESOLVED_OWNER_GATE",
     "BLOCKED_PUSH_REJECTED",
     "BLOCKED_INTEGRATION_CI_FAILED",
+    "BLOCKED_SOURCE_CI_EVIDENCE_INCOMPLETE",
+    "BLOCKED_SOURCE_CI_HEAD_MISMATCH",
+    "BLOCKED_PUSH_OUTCOME_HEAD_MISSING",
+    "BLOCKED_PUSH_HEAD_MISMATCH",
     "BLOCKED_INTEGRATION_CI_EVIDENCE_INCOMPLETE",
     "BLOCKED_INTEGRATION_CI_HEAD_MISMATCH",
     "BLOCKED_TARGET_NOT_CONFIGURED",
     "BLOCKED_CONFIRMATION_INADMISSIBLE",
     "BLOCKED_INTEGRATION_WORKTREE_INADMISSIBLE",
     "CI_GATE_GREEN",
-    "CI_GATE_WAIVED",
     "CI_GATE_NOT_REACHED",
     "CI_GATE_STATES",
     "AutoIntegrationPolicy",

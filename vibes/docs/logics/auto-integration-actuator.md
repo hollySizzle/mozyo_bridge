@@ -63,7 +63,7 @@ preflight は「失敗 gate を見つけて blocked になる」か「後続 sta
 
 | disposition | 判定根拠 | 副作用 |
 | --- | --- | --- |
-| `integrated` | push 済み + 統合 SHA の CI green (gate 有効時) / gate waived | push |
+| `integrated` | push 済み + 統合 SHA の CI green (**gate は外せない**) | push |
 | `already_integrated` | target ancestry (source head が target から到達可能) | なし |
 | `patch_equivalent` | **明示的な patch-id evidence** | なし |
 | `not_applicable` | 非 Git workspace | なし (process retire は別途走る) |
@@ -109,7 +109,7 @@ integration:
   - source_mutated_after_review         # review 済みの exact head であること
   - source_head_unreachable             # origin 到達可能
   - unpushed_unique_commits / dirty_worktree
-  - source_ci_not_green                 # 設定で必須化を外せる
+  - source_ci_not_green / source_ci_evidence_incomplete / source_ci_head_mismatch  # (R3)
   - unresolved_owner_gate / unresolved_callback
   - target_drift                        # expected_target_head からの drift
   - non_fast_forward                    # ff-only 時
@@ -117,6 +117,8 @@ integration:
   - integration_worktree_inadmissible   # 専用 worktree が未登録 / dirty / lane 自身 (R2)
   - coordinator_confirmation_inadmissible  # 別 action / 非 coordinator / anchor 欠落 (R2)
   - push_rejected
+  - push_outcome_head_missing           # push done なのに着地 head が無い。fallback しない (R3)
+  - push_head_mismatch                  # 記録された head が disposition の着地 head でない (R3)
   - integration_ci_evidence_incomplete  # run / check identity / head を欠く (R2)
   - integration_ci_head_mismatch        # push が着地した head と別 commit の run (R2)
   - integration_ci_failed               # 決着したが non-success
@@ -173,9 +175,32 @@ R1 は 4 つの入力を bare bool / bare string で受けており、review が
 | `coordinator_confirmed: bool` | `CoordinatorConfirmation` | 誰が・どの action を・どこに記録して承認したか |
 | `integration_worktree: str` | `IntegrationWorktree` | それが lane 自身の checkout でないこと (j#77124 が禁じる操作を actuator 自身が実行し得た) |
 | `policy.integration_branch` (未参照) | decision が exact-match を要求 | 設定した branch が実際に統合先を制約すること |
+| `source_ci_green: bool` (R2 まで残存) | `IntegrationCiEvidence` | 同上。sibling gate に同じ穴が残っていた (R3) |
 
 CI evidence は **push が着地した head** (ledger の push outcome が記録した commit) と exact-match
-する。fast-forward なら source head、merge commit なら merge した commit である。
+する。fast-forward なら source head、merge commit なら merge した commit である。**着地 head が
+記録されていない場合に source head へ fallback しない** — 「何が着地したか記録し損ねた」ことは
+「source が着地した」証拠ではない (R2 review j#96350 finding 2)。
+
+### 型を足すだけでは足りない — 測定者を固定する (R2 review j#96350)
+
+R1 で bool を型へ変えた 4 入力のうち 2 つは、**値を caller が供給し続けていた**ため R2 でも
+自己申告のままだった。forged な `IntegrationWorktree(is_lane_worktree=False)` も、存在しない anchor を
+指す `CoordinatorConfirmation` も、そのまま通った。
+
+> **safety fact を測るのは actuator であり、依頼者ではない。**
+
+R3 ではこの 2 つを preflight の入力から外し、actuator が action-time に自分で測る。
+
+| 入力 | caller が渡すもの | actuator が測るもの |
+| --- | --- | --- |
+| dedicated integration worktree | path (どこを見るか) | `describe_integration_worktree` port の測定結果 |
+| coordinator confirmation | durable anchor (どこを見るか) | `CoordinatorConfirmationResolver` port の解決結果 |
+
+caller が同じ field に値を入れていても **破棄する** (merge しない / 「より具体的」を優先しない)。
+依頼者が選んだ値は、その依頼についての証拠にならないためである。resolver 未注入で
+`mode: coordinator_confirmed` の場合は confirmation が解決されず、`coordinator_confirmation_required`
+で停止する (暗黙承認にしない)。
 
 domain は IO を持たず、事実は全て caller が preflight として渡す ([[logic-object-oriented-architecture-policy]]
 の pure core 方針、既存 `domain/sublane_integration_policy.py` と同じ形)。use case は
@@ -201,11 +226,19 @@ auto_integration:
 `delete_remote_branch` key は存在しない (上記「破壊的 step の safety 条件」参照)。宣言すると
 unknown key として fail-closed する。
 
-`require_integration_ci: false` は owner 授権済みの knob である (j#96335 が「branch/target CI」を
-設定駆動項目として列挙)。ただし **waiver を不可視にしない**: decision は `integration_ci: waived`
-を machine-readable に返し、durable record が「exact-SHA CI green」と読めないようにする
-(R1 review finding 2 の是正条件のうち「必須 gate に固定する」節への counterproposal。dispute
-記録は j#96346)。
+**CI key も存在しない。** R2 は `require_source_ci` / `require_integration_ci` を持ち、
+「j#96335 が『branch/target CI』を設定駆動項目に列挙している」ことを根拠に waiver を owner 授権済み
+と主張した (dispute j#96346)。R2 review j#96350 finding 1 がこれを否とし、**私はその判断を受け入れて
+dispute を撤回した** (j#96351)。理由は 2 つある。
+
+1. **anchor の数が逆だった。** j#77124 state 5 (`integrated: origin reachability + exact-SHA CI
+   green を確定`)、j#96335 自身の target flow (`... → exact integration SHA CI green → Close Gate`)、
+   j#96337 の fail_closed (`CI未確定`) の 3 つが「integrated には CI green が要る」と述べている。
+   「branch/target CI を設定駆動」は **どの** required check を要求するかの設定とも読め、その読みなら
+   j#96335 は自己整合する。私の読みは同 journal を自己矛盾させる読みだった。
+2. **waiver に downstream semantics が無かった。** cleanup は統合 SHA の CI green を常時要求する。
+   waiver 後の lane は cleanup が永久 block するか、未実行 CI を green と自己申告して破壊的 step へ
+   進むかのどちらかになる。end-to-end で成立しない gate は gate ではない。
 
 既定 `mode: disabled` は **behavior-preserving** である。#13686 以前は auto-integration が存在
 しなかったため、block を宣言しない repo は従来どおり完全手動の coordinator 統合を保つ。
@@ -237,6 +270,9 @@ closed-schema screen が拒否する。宣言状況は `mozyo-bridge config stat
 - R1 review j#96344 の 5 finding は `R1ReviewFindingRegressionTest` /
   `R1ReviewFinding1RegressionTest` / `NoRemoteRefDeleteTest` に、**再現した入力そのもの**で
   pin してある。verdict は j#96345。
+- R2 review j#96350 の 4 finding は `R2ReviewFindingRegressionTest` および
+  `CoordinatorConfirmationResolutionTest` / `MergeCommitRunTest` に同様に pin してある。
+  verdict と full-surface escalation の受け入れは j#96351。
 - `python3 -m unittest tests.integration.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.test_auto_integration_actuator`
 - `python3 -m unittest tests.unit.e_130_governance_distribution.f_140_rules_docs_catalog.test_auto_integration_config`
 - `PYTHONPATH=src python3 -m mozyo_bridge docs validate --repo .` ほか catalog 検証一式。

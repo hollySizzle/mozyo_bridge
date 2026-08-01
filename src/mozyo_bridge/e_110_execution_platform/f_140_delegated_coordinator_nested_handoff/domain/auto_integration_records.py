@@ -20,7 +20,7 @@ validates itself against the action it is offered for.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Tuple
+from typing import Iterable, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Commit identity.
@@ -406,6 +406,90 @@ class IntegrationWorktree:
         }
 
 
+# ---------------------------------------------------------------------------
+# Action-time preflight facts.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class IntegrationPreflight:
+    """The action-time facts the integration decision is made from (supplied, not discovered).
+
+    Every safety-bearing field defaults to its **unsatisfied** value, so a caller that omits
+    one is blocked rather than default-admitted. The two that describe the world rather than
+    a gate (``already_integrated`` / ``patch_equivalent_evidence``) default to ``False``,
+    which is also the conservative reading: "not known to be integrated" leads to the gates,
+    never past them.
+
+    Git-shaped facts (consulted only when ``is_git_workspace``):
+
+    - ``observed_target_head`` — the target ref's head *right now*, compared against the
+      action's ``expected_target_head``. :data:`EMPTY_TARGET_HEAD` for a ref that does not exist.
+    - ``fast_forward_possible`` — the expected target head is an ancestor of the source head.
+    - ``already_integrated`` — the source head is reachable from the target head.
+    - ``patch_equivalent_evidence`` — explicit patch-id evidence that the same patches are
+      already on the target. Only this admits :data:`STATE_PATCH_EQUIVALENT`; a bare "looks
+      the same" never does.
+    - ``merge_conflict`` — the merge-commit disposition conflicted.
+    - ``source_worktree_dirty`` / ``worktree_is_foreign`` / ``unpushed_unique_commits``.
+
+    Durable-record facts, always enforced:
+
+    - ``source_head_matches_review`` — the source head is the exact head the review approved.
+    - ``source_origin_reachable`` — that head is reachable from origin.
+    - ``review_generation_admissible`` — the latest review generation is approved AND carries
+      no unresolved blocking finding (never merely "an approval exists somewhere").
+    - ``target_identity_known`` — the target ref is a known, allowlisted integration branch.
+      Note this is a *different* question from whether the ref is the branch this actuator
+      was configured for; that one is checked against ``policy.integration_branch``.
+    - ``callbacks_drained`` / ``owner_gates_resolved``.
+
+    Typed records (R1 review j#96344 — each replaced a bare boolean that could not be
+    audited; all default to ``None``, which is the unsatisfied reading):
+
+    - ``source_ci`` — :class:`IntegrationCiEvidence` for the SOURCE head. R2 left this one a
+      bare ``source_ci_green: bool`` while typing its sibling; the same "an unrelated green
+      run satisfies it" hole applied, so it carries the same identity.
+    - ``integration_ci`` — :class:`IntegrationCiEvidence` for the exact commit the push
+      landed, carrying the required check's identity and the run id.
+    - ``coordinator_confirmation`` — :class:`CoordinatorConfirmation`. **Set by the actuator,
+      not by the caller** (R2 review j#96350 finding 4): the caller supplies
+      ``coordinator_confirmation_anchor`` (where the confirmation is recorded) and the
+      actuator's resolver fresh-reads it. A caller that constructs this field directly is
+      calling the pure decision without an actuator, which is what the tests do.
+    - ``coordinator_confirmation_anchor`` — the durable anchor to resolve a confirmation
+      FROM. A pointer, not a claim.
+    - ``integration_worktree`` — :class:`IntegrationWorktree`: the dedicated checkout a
+      merge-commit disposition is applied in. **Also actuator-measured** (finding 3): R2
+      accepted the caller's own description of it, so a record naming the lane's worktree with
+      ``is_lane_worktree=False`` passed.
+    """
+
+    is_git_workspace: bool
+    # Git-shaped.
+    observed_target_head: str = ""
+    fast_forward_possible: bool = False
+    already_integrated: bool = False
+    patch_equivalent_evidence: bool = False
+    merge_conflict: bool = False
+    source_worktree_dirty: bool = True
+    worktree_is_foreign: bool = True
+    unpushed_unique_commits: bool = True
+    # Durable-record.
+    source_head_matches_review: bool = False
+    source_origin_reachable: bool = False
+    review_generation_admissible: bool = False
+    target_identity_known: bool = False
+    callbacks_drained: bool = False
+    owner_gates_resolved: bool = False
+    # Typed records (R1 review j#96344, extended R2/R3). `None` is the unsatisfied reading.
+    source_ci: Optional[IntegrationCiEvidence] = None
+    integration_ci: Optional[IntegrationCiEvidence] = None
+    coordinator_confirmation: Optional[CoordinatorConfirmation] = None
+    coordinator_confirmation_anchor: str = ""
+    integration_worktree: Optional[IntegrationWorktree] = None
+
+
 __all__ = (
     "EMPTY_TARGET_HEAD",
     "is_full_sha",
@@ -425,4 +509,5 @@ __all__ = (
     "CONFIRMATION_ISSUER_COORDINATOR",
     "CoordinatorConfirmation",
     "IntegrationWorktree",
+    "IntegrationPreflight",
 )

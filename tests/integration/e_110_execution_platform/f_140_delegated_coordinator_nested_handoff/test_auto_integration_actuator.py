@@ -31,6 +31,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_actuator import (
     AutoIntegrationGitOperations,
     AutoIntegrationUseCase,
+    CoordinatorConfirmationResolver,
     ManagedProcessOperations,
     MergeResult,
     PushResult,
@@ -39,12 +40,14 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_policy import (
     MODE_AUTO,
+    MODE_COORDINATOR_CONFIRMED,
     MODE_DISABLED,
     OUTCOME_BLOCKED,
     OUTCOME_DONE,
     OUTCOME_PENDING,
     STATE_ALREADY_INTEGRATED,
     STATE_AWAITING_CI,
+    STATE_CONFIRMATION_REQUIRED,
     STATE_DISABLED,
     STATE_INTEGRATED,
     STATE_INTEGRATION_BLOCKED,
@@ -78,6 +81,7 @@ from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.
 SOURCE = "a" * 40
 TARGET = "b" * 40
 MERGE_HEAD = "d" * 40
+OTHER = "e" * 40
 
 
 @dataclass
@@ -113,6 +117,25 @@ class FakeGitOperations:
         )
         return self.push_result
 
+    #: What the PROBE reports, independent of anything a caller claims.
+    measured_worktree: IntegrationWorktree = field(
+        default_factory=lambda: IntegrationWorktree(
+            path="/dedicated", registered=True, is_lane_worktree=False, clean=True,
+            checked_out_branch="main",
+        )
+    )
+
+    def describe_integration_worktree(
+        self, *, path: str, lane_worktree: str
+    ) -> IntegrationWorktree:
+        self.calls.append(
+            (
+                "describe_integration_worktree",
+                {"path": path, "lane_worktree": lane_worktree},
+            )
+        )
+        return self.measured_worktree
+
     def remove_worktree(self, *, worktree_path: str) -> bool:
         self.calls.append(("remove_worktree", {"worktree_path": worktree_path}))
         return self.worktree_removed
@@ -123,8 +146,17 @@ class FakeGitOperations:
         )
         return self.branch_deleted
 
+    #: The read-only probes. Calling one is not a side effect, so the zero-side-effect
+    #: assertions look at :attr:`performed` (mutations only) rather than every call.
+    READ_PROBES = ("describe_integration_worktree",)
+
     @property
     def performed(self) -> List[str]:
+        """The MUTATIONS this port was asked for, in order."""
+        return [name for name, _ in self.calls if name not in self.READ_PROBES]
+
+    @property
+    def every_call(self) -> List[str]:
         return [name for name, _ in self.calls]
 
 
@@ -136,6 +168,21 @@ class FakeProcessOperations:
     def release_process(self, *, issue: str, lane_generation: int) -> bool:
         self.calls.append({"issue": issue, "lane_generation": lane_generation})
         return self.released
+
+
+@dataclass
+class FakeConfirmationResolver:
+    """Resolves confirmations from a fixed anchor->confirmation table (the "durable record")."""
+
+    table: dict = field(default_factory=dict)
+    calls: List[dict] = field(default_factory=list)
+
+    def resolve(self, *, anchor: str, action_key: str):
+        self.calls.append({"anchor": anchor, "action_key": action_key})
+        found = self.table.get(anchor)
+        if found is None or found.action_key != action_key:
+            return None
+        return found
 
 
 def _record(**overrides: object) -> IntegrationActionRecord:
@@ -163,7 +210,9 @@ def _clean(**overrides: object) -> IntegrationPreflight:
         "source_origin_reachable": True,
         "review_generation_admissible": True,
         "target_identity_known": True,
-        "source_ci_green": True,
+        "source_ci": IntegrationCiEvidence(
+            integration_head=SOURCE, workflow="required-ci", run="src-1", conclusion="success"
+        ),
         "callbacks_drained": True,
         "owner_gates_resolved": True,
         "integration_ci": IntegrationCiEvidence(
@@ -192,6 +241,8 @@ def _use_case(operations: FakeGitOperations, **kwargs: object) -> AutoIntegratio
         "integration_policy": AutoIntegrationPolicy(
             mode=MODE_AUTO, integration_branch="main"
         ),
+        "lane_worktree": "/lane",
+        "integration_worktree_path": "/dedicated",
     }
     defaults.update(kwargs)
     return AutoIntegrationUseCase(operations=operations, **defaults)  # type: ignore[arg-type]
@@ -206,18 +257,16 @@ class PortConformanceTest(unittest.TestCase):
 class ConfigTranslationTest(unittest.TestCase):
     def test_integration_fields_map_through(self) -> None:
         config = AutoIntegrationConfig(
-            mode=MODE_AUTO,
-            integration_branch="release",
-            ff_only=False,
-            require_source_ci=False,
-            require_integration_ci=False,
+            mode=MODE_AUTO, integration_branch="release", ff_only=False
         )
         policy = integration_policy_from_config(config)
         self.assertEqual(policy.mode, MODE_AUTO)
         self.assertEqual(policy.integration_branch, "release")
         self.assertFalse(policy.ff_only)
-        self.assertFalse(policy.require_source_ci)
-        self.assertFalse(policy.require_integration_ci)
+        # R2 review j#96350 finding 1: no CI knob survives the boundary because none exists.
+        for field_name in ("require_source_ci", "require_integration_ci"):
+            self.assertFalse(hasattr(config, field_name), field_name)
+            self.assertFalse(hasattr(policy, field_name), field_name)
 
     def test_cleanup_fields_map_through_with_remote_delete_off(self) -> None:
         policy = cleanup_policy_from_config(AutoIntegrationConfig.default())
@@ -293,10 +342,8 @@ class FastForwardRunTest(unittest.TestCase):
             _record(), _clean(integration_ci=None)
         )
         self.assertEqual(operations.performed, ["push_non_force"])
-        self.assertEqual(
-            operations.calls[0][1],
-            {"source_head": SOURCE, "target_ref": "main"},
-        )
+        pushed = [args for name, args in operations.calls if name == "push_non_force"][0]
+        self.assertEqual(pushed, {"source_head": SOURCE, "target_ref": "main"})
         # It stops at the asynchronous CI gate rather than waiting on it.
         self.assertEqual(report.final_decision.state, STATE_AWAITING_CI)
         self.assertEqual(
@@ -308,8 +355,7 @@ class FastForwardRunTest(unittest.TestCase):
         record = _record()
         operations = FakeGitOperations()
         ledger = [
-            StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE),
-            StepOutcome(record.action_key, STEP_INTEGRATION_CI, OUTCOME_DONE),
+            StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE),
         ]
         report = _use_case(operations).run_integration(
             record, _clean(), ledger=ledger
@@ -344,11 +390,12 @@ class MergeCommitRunTest(unittest.TestCase):
             ),
         )
         self.assertEqual(operations.performed, ["apply_merge", "push_non_force"])
-        self.assertEqual(
-            operations.calls[0][1]["integration_worktree"], "<integration-worktree>"
-        )
+        applied = [args for name, args in operations.calls if name == "apply_merge"][0]
+        # The path handed to git is the MEASURED one, not anything a caller named.
+        self.assertEqual(applied["integration_worktree"], "/dedicated")
+        pushed = [args for name, args in operations.calls if name == "push_non_force"][0]
         # The pushed head is the commit the merge produced, not the source head.
-        self.assertEqual(operations.calls[1][1]["source_head"], MERGE_HEAD)
+        self.assertEqual(pushed["source_head"], MERGE_HEAD)
         self.assertEqual(report.integration_head, MERGE_HEAD)
 
     def test_a_conflict_stops_before_any_push(self) -> None:
@@ -363,24 +410,53 @@ class MergeCommitRunTest(unittest.TestCase):
         self.assertEqual(report.outcomes[-1].outcome, OUTCOME_BLOCKED)
         self.assertIn("conflict in a.py", report.outcomes[-1].detail)
 
-    def test_the_lane_s_own_worktree_never_reaches_the_merge(self) -> None:
-        # R1 review j#96344 finding 3: R1 forwarded ANY non-empty path, so passing the lane's
-        # own checkout made the actuator do the one thing j#77124 forbids. The refusal is now
-        # the decision's, before any step is authorized — the port is never called.
-        operations = FakeGitOperations()
+    def test_a_measured_lane_worktree_never_reaches_the_merge(self) -> None:
+        # The MEASUREMENT decides. j#77124 forbids the lane checking out the target branch.
+        operations = FakeGitOperations(
+            measured_worktree=_dedicated(is_lane_worktree=True)
+        )
         report = _use_case(operations, integration_policy=self._policy()).run_integration(
-            _record(),
-            _clean(
-                fast_forward_possible=False,
-                integration_worktree=_dedicated(is_lane_worktree=True),
-            ),
+            _record(), _clean(fast_forward_possible=False)
         )
         self.assertEqual(operations.performed, [])
         self.assertEqual(report.outcomes, [])
         self.assertEqual(report.final_decision.state, STATE_INTEGRATION_BLOCKED)
 
-    def test_a_missing_dedicated_worktree_refuses_rather_than_using_the_lane(self) -> None:
+    def test_a_caller_supplied_worktree_record_is_discarded(self) -> None:
+        # R2 review j#96350 finding 3: R2 typed this field and then still let the CALLER fill
+        # it, so a forged record naming the lane's worktree with `is_lane_worktree=False`
+        # passed. The actuator now overwrites it with its own measurement, so the forgery is
+        # not merely rejected — it is never consulted.
+        operations = FakeGitOperations(
+            measured_worktree=_dedicated(is_lane_worktree=True)  # the truth
+        )
+        report = _use_case(operations, integration_policy=self._policy()).run_integration(
+            _record(),
+            _clean(
+                fast_forward_possible=False,
+                integration_worktree=_dedicated(is_lane_worktree=False),  # the forgery
+            ),
+        )
+        self.assertEqual(operations.performed, [])
+        self.assertEqual(report.final_decision.state, STATE_INTEGRATION_BLOCKED)
+        self.assertTrue(report.measured_worktree.is_lane_worktree)
+
+    def test_the_probe_is_asked_about_the_actuator_s_own_paths(self) -> None:
         operations = FakeGitOperations()
+        _use_case(operations, integration_policy=self._policy()).run_integration(
+            _record(), _clean(fast_forward_possible=False)
+        )
+        probed = [
+            args
+            for name, args in operations.calls
+            if name == "describe_integration_worktree"
+        ][0]
+        self.assertEqual(probed, {"path": "/dedicated", "lane_worktree": "/lane"})
+
+    def test_an_unmeasurable_worktree_refuses(self) -> None:
+        operations = FakeGitOperations(
+            measured_worktree=IntegrationWorktree(path="/dedicated")
+        )
         report = _use_case(operations, integration_policy=self._policy()).run_integration(
             _record(), _clean(fast_forward_possible=False)
         )
@@ -407,7 +483,110 @@ class MergeCommitRunTest(unittest.TestCase):
             ledger=ledger,
         )
         self.assertEqual(operations.performed, ["push_non_force"])
-        self.assertEqual(operations.calls[0][1]["source_head"], MERGE_HEAD)
+        pushed = [args for name, args in operations.calls if name == "push_non_force"][0]
+        self.assertEqual(pushed["source_head"], MERGE_HEAD)
+
+
+class CoordinatorConfirmationResolutionTest(unittest.TestCase):
+    """R2 review j#96350 finding 4: the confirmation is RESOLVED, never accepted."""
+
+    def _policy(self) -> AutoIntegrationPolicy:
+        return AutoIntegrationPolicy(
+            mode=MODE_COORDINATOR_CONFIRMED, integration_branch="main"
+        )
+
+    def test_the_resolver_satisfies_the_declared_port(self) -> None:
+        self.assertIsInstance(FakeConfirmationResolver(), CoordinatorConfirmationResolver)
+
+    def test_a_caller_supplied_confirmation_is_discarded(self) -> None:
+        # The exact R2 reproduction: exact action key, literal `coordinator`, an anchor that
+        # does not exist. R2 pushed. The actuator now resolves from the anchor instead, and
+        # the resolver finds nothing there.
+        operations = FakeGitOperations()
+        record = _record()
+        forged = CoordinatorConfirmation(
+            action_key=record.action_key,
+            issuer_role="coordinator",
+            durable_anchor="this-journal-does-not-exist",
+        )
+        report = _use_case(
+            operations,
+            integration_policy=self._policy(),
+            confirmations=FakeConfirmationResolver(table={}),
+        ).run_integration(
+            record,
+            _clean(
+                coordinator_confirmation=forged,
+                coordinator_confirmation_anchor="this-journal-does-not-exist",
+            ),
+        )
+        self.assertEqual(operations.performed, [])
+        self.assertEqual(report.final_decision.state, STATE_CONFIRMATION_REQUIRED)
+        self.assertIsNone(report.resolved_confirmation)
+
+    def test_a_resolved_confirmation_authorizes_the_push(self) -> None:
+        operations = FakeGitOperations()
+        record = _record()
+        resolver = FakeConfirmationResolver(
+            table={
+                "#13686 j#96360": CoordinatorConfirmation(
+                    action_key=record.action_key,
+                    issuer_role="coordinator",
+                    durable_anchor="#13686 j#96360",
+                )
+            }
+        )
+        report = _use_case(
+            operations, integration_policy=self._policy(), confirmations=resolver
+        ).run_integration(
+            record, _clean(coordinator_confirmation_anchor="#13686 j#96360")
+        )
+        self.assertEqual(operations.performed, ["push_non_force"])
+        self.assertEqual(
+            resolver.calls, [{"anchor": "#13686 j#96360", "action_key": record.action_key}]
+        )
+
+    def test_a_confirmation_for_another_action_does_not_resolve(self) -> None:
+        operations = FakeGitOperations()
+        record = _record()
+        other = _record(source_head=OTHER)
+        resolver = FakeConfirmationResolver(
+            table={
+                "#13686 j#96360": CoordinatorConfirmation(
+                    action_key=other.action_key,
+                    issuer_role="coordinator",
+                    durable_anchor="#13686 j#96360",
+                )
+            }
+        )
+        report = _use_case(
+            operations, integration_policy=self._policy(), confirmations=resolver
+        ).run_integration(
+            record, _clean(coordinator_confirmation_anchor="#13686 j#96360")
+        )
+        self.assertEqual(operations.performed, [])
+        self.assertEqual(report.final_decision.state, STATE_CONFIRMATION_REQUIRED)
+
+    def test_no_resolver_injected_is_fail_closed_not_implicit_approval(self) -> None:
+        operations = FakeGitOperations()
+        report = _use_case(
+            operations, integration_policy=self._policy(), confirmations=None
+        ).run_integration(
+            _record(), _clean(coordinator_confirmation_anchor="#13686 j#96360")
+        )
+        self.assertEqual(operations.performed, [])
+        self.assertEqual(report.final_decision.state, STATE_CONFIRMATION_REQUIRED)
+
+    def test_auto_mode_never_consults_the_resolver(self) -> None:
+        resolver = FakeConfirmationResolver(table={})
+        _use_case(
+            FakeGitOperations(),
+            integration_policy=AutoIntegrationPolicy(
+                mode=MODE_AUTO, integration_branch="main"
+            ),
+            confirmations=resolver,
+        ).run_integration(_record(), _clean())
+        self.assertEqual(resolver.calls, [])
 
 
 class RecoveryLaneTest(unittest.TestCase):

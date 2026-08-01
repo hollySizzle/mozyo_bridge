@@ -234,6 +234,18 @@ class NoRemoteRefDeleteTest(unittest.TestCase):
 
 
 class IntegrationWorktreeProbeTest(unittest.TestCase):
+    def test_the_probe_is_part_of_the_port_the_use_case_calls(self) -> None:
+        # R2 review j#96350 finding 3: R2 had this probe on the adapter only, so the use case
+        # could not call it and re-checked the caller's booleans instead. Being on the port is
+        # what makes the actuator — not the caller — the authority for this fact.
+        self.assertTrue(
+            hasattr(AutoIntegrationGitOperations, "describe_integration_worktree")
+        )
+        self.assertIsInstance(
+            LiveAutoIntegrationGitOperations(repo_root=Path("/x")),
+            AutoIntegrationGitOperations,
+        )
+
     def test_a_registered_non_lane_clean_worktree_is_admissible(self) -> None:
         recorder = _Recorder(
             [_ok("worktree /wt\nHEAD abc\n"), _ok("main\n"), _ok("")]

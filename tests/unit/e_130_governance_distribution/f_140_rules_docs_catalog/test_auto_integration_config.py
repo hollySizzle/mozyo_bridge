@@ -5,6 +5,8 @@ Pins the typed field contract of the gated auto-integration knob:
 - the behavior-preserving default (``mode: disabled``), so a repo that declares nothing
   keeps the fully manual coordinator integration it had before the actuator existed;
 - the owner's j#96335 default: ff-only on;
+- that no CI knob exists (R2 review j#96350 finding 1 — both gates are unconditional in the
+  state machine, so a key that could turn one off would be a key the runtime ignores);
 - that no ``delete_remote_branch`` key exists at all (R1 review j#96344 finding 1 — the
   operation had no compare-and-swap and is removed rather than defaulted off);
 - fail-closed parsing — a non-mapping record, an unknown key, an unsupported version, a mode
@@ -58,9 +60,6 @@ class DefaultsTest(unittest.TestCase):
         config = AutoIntegrationConfig.default()
         # j#96335: fast-forward-only is the default.
         self.assertTrue(config.ff_only)
-        # Both CI gates are required by default; both cleanup local steps are on.
-        self.assertTrue(config.require_source_ci)
-        self.assertTrue(config.require_integration_ci)
         self.assertTrue(config.remove_worktree)
         self.assertTrue(config.delete_local_branch)
         # An unset target defers to runtime resolution rather than guessing a branch.
@@ -114,8 +113,6 @@ class FailClosedParsingTest(unittest.TestCase):
         # boundary the sibling blocks enforce.
         for key in (
             "ff_only",
-            "require_source_ci",
-            "require_integration_ci",
             "remove_worktree",
             "delete_local_branch",
         ):
@@ -142,8 +139,6 @@ class BoundaryTest(unittest.TestCase):
                 "mode",
                 "integration_branch",
                 "ff_only",
-                "require_source_ci",
-                "require_integration_ci",
                 "remove_worktree",
                 "delete_local_branch",
             },
@@ -179,6 +174,8 @@ class BoundaryTest(unittest.TestCase):
             "auto_rebase",
             "rebase_on_conflict",
             "delete_remote_branch",
+            "require_source_ci",
+            "require_integration_ci",
         ):
             with self.assertRaises(RepoLocalConfigError, msg=key):
                 AutoIntegrationConfig.from_record({key: True})
@@ -191,7 +188,7 @@ class ComposedConfigTest(unittest.TestCase):
                 "auto_integration": {
                     "mode": AUTO_INTEGRATION_MODE_COORDINATOR_CONFIRMED,
                     "integration_branch": "main",
-                    "require_integration_ci": False,
+                    "ff_only": False,
                 }
             }
         )
@@ -199,7 +196,7 @@ class ComposedConfigTest(unittest.TestCase):
             config.auto_integration.mode, AUTO_INTEGRATION_MODE_COORDINATOR_CONFIRMED
         )
         self.assertEqual(config.auto_integration.integration_branch, "main")
-        self.assertFalse(config.auto_integration.require_integration_ci)
+        self.assertFalse(config.auto_integration.ff_only)
 
     def test_an_absent_block_composes_to_the_disabled_default(self) -> None:
         config = RepoLocalConfig.from_record({})
@@ -220,13 +217,16 @@ class DeclarationStatusTest(unittest.TestCase):
             "mode",
             "integration_branch",
             "ff_only",
-            "require_source_ci",
-            "require_integration_ci",
             "remove_worktree",
             "delete_local_branch",
         ):
             self.assertIn(f"auto_integration.{field_name}", leaves, field_name)
-        self.assertNotIn("auto_integration.delete_remote_branch", leaves)
+        for gone in (
+            "auto_integration.delete_remote_branch",
+            "auto_integration.require_source_ci",
+            "auto_integration.require_integration_ci",
+        ):
+            self.assertNotIn(gone, leaves, gone)
 
     def test_undeclared_leaves_report_the_default_they_resolve_to(self) -> None:
         # The actuator's effective settings must be readable rather than inferred from an
@@ -245,11 +245,7 @@ class DeclarationStatusTest(unittest.TestCase):
             statuses["auto_integration.mode"].effective_value,
             AUTO_INTEGRATION_MODE_DISABLED,
         )
-        # The CI gate's waiver must be readable: `integrated` alone cannot distinguish a
-        # green run from a turned-off gate (#13686 j#96346).
-        self.assertIs(
-            statuses["auto_integration.require_integration_ci"].effective_value, True
-        )
+        self.assertIs(statuses["auto_integration.ff_only"].effective_value, True)
 
     def test_a_declared_leaf_reports_declared(self) -> None:
         record = {"auto_integration": {"mode": AUTO_INTEGRATION_MODE_AUTO}}

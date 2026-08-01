@@ -58,8 +58,6 @@ AUTO_INTEGRATION_KEYS: frozenset[str] = frozenset(
         "mode",
         "integration_branch",
         "ff_only",
-        "require_source_ci",
-        "require_integration_ci",
         "remove_worktree",
         "delete_local_branch",
     }
@@ -84,8 +82,13 @@ DEFAULT_AUTO_INTEGRATION_MODE: str = AUTO_INTEGRATION_MODE_DISABLED
 #: Fast-forward-only is the owner's default (j#96335): the integration branch only ever
 #: advances to a commit that already contains its current head, so nothing is rewritten.
 DEFAULT_FF_ONLY: bool = True
-DEFAULT_REQUIRE_SOURCE_CI: bool = True
-DEFAULT_REQUIRE_INTEGRATION_CI: bool = True
+# There are deliberately no CI keys. R2 shipped `require_source_ci` / `require_integration_ci`
+# and review j#96350 finding 1 ruled them out: j#77124 ("integrated: origin reachability +
+# exact-SHA CI green を確定"), j#96335's own target flow, and j#96337's fail-closed list all
+# require green CI for an integration. j#96335's "branch/target CI を設定駆動" configures WHICH
+# required check is demanded, not whether one is; reading it as the latter makes that journal
+# contradict itself. Both gates are unconditional in the state machine, so a key that could
+# turn one off would be a key the runtime ignores.
 DEFAULT_REMOVE_WORKTREE: bool = True
 DEFAULT_DELETE_LOCAL_BRANCH: bool = True
 # There is deliberately no `delete_remote_branch` key. R1 shipped one (default False per
@@ -373,8 +376,6 @@ class AutoIntegrationConfig:
     - :attr:`ff_only` — fast-forward-only (the owner's default). ``False`` admits a merge
       commit created in a dedicated integration worktree; it does **not** admit a rebase or
       a force push, neither of which this schema can express.
-    - :attr:`require_source_ci` / :attr:`require_integration_ci` — whether the
-      source-branch and exact-integration-SHA CI gates are required.
 
     Post-close cleanup fields:
 
@@ -399,15 +400,14 @@ class AutoIntegrationConfig:
       ``send`` / credential, …) is rejected by the same closed-schema screen the rest of this
       module enforces — which is also why the ff / CI / cleanup fields are spelled without
       those tokens.
-    - **Force push, auto-rebase, and remote ref deletion / rewriting are not expressible.**
-      There is no field for any of them by construction, so no config can request one.
+    - **Force push, auto-rebase, remote ref deletion, and CI-gate removal are not
+      expressible.** There is no field for any of them by construction, so no config can
+      request one.
     """
 
     mode: str = DEFAULT_AUTO_INTEGRATION_MODE
     integration_branch: Optional[str] = None
     ff_only: bool = DEFAULT_FF_ONLY
-    require_source_ci: bool = DEFAULT_REQUIRE_SOURCE_CI
-    require_integration_ci: bool = DEFAULT_REQUIRE_INTEGRATION_CI
     remove_worktree: bool = DEFAULT_REMOVE_WORKTREE
     delete_local_branch: bool = DEFAULT_DELETE_LOCAL_BRANCH
 
@@ -458,15 +458,6 @@ class AutoIntegrationConfig:
             mode=mode,
             integration_branch=integration_branch,
             ff_only=_checked_bool(record, "ff_only", DEFAULT_FF_ONLY, source=source),
-            require_source_ci=_checked_bool(
-                record, "require_source_ci", DEFAULT_REQUIRE_SOURCE_CI, source=source
-            ),
-            require_integration_ci=_checked_bool(
-                record,
-                "require_integration_ci",
-                DEFAULT_REQUIRE_INTEGRATION_CI,
-                source=source,
-            ),
             remove_worktree=_checked_bool(
                 record, "remove_worktree", DEFAULT_REMOVE_WORKTREE, source=source
             ),
@@ -626,8 +617,6 @@ __all__ = (
     "AUTO_INTEGRATION_MODE_DISABLED",
     "DEFAULT_AUTO_INTEGRATION_MODE",
     "DEFAULT_FF_ONLY",
-    "DEFAULT_REQUIRE_SOURCE_CI",
-    "DEFAULT_REQUIRE_INTEGRATION_CI",
     "DEFAULT_REMOVE_WORKTREE",
     "DEFAULT_DELETE_LOCAL_BRANCH",
     "AGENT_LAUNCH_KEYS",

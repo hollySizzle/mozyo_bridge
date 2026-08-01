@@ -166,22 +166,14 @@ CONFIG_LEAF_KEYS: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = (
     # a push to an integration branch, a worktree removal, a ref delete — is attempted, so
     # an operator must be able to read what a workspace actually resolved to rather than
     # infer it from an absent block. `mode` matters most: it is what turns the actuator on
-    # at all. `require_integration_ci` matters next: it is the one gate whose waiver a
-    # durable record would otherwise not distinguish from a green run (#13686 j#96346).
+    # at all. The CI gates are deliberately absent: they are unconditional in the state
+    # machine (#13686 j#96350 finding 1), so there is no declaration to classify.
     ("auto_integration.mode", (("auto_integration", "mode"),)),
     (
         "auto_integration.integration_branch",
         (("auto_integration", "integration_branch"),),
     ),
     ("auto_integration.ff_only", (("auto_integration", "ff_only"),)),
-    (
-        "auto_integration.require_source_ci",
-        (("auto_integration", "require_source_ci"),),
-    ),
-    (
-        "auto_integration.require_integration_ci",
-        (("auto_integration", "require_integration_ci"),),
-    ),
     ("auto_integration.remove_worktree", (("auto_integration", "remove_worktree"),)),
     (
         "auto_integration.delete_local_branch",

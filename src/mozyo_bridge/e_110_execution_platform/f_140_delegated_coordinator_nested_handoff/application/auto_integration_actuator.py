@@ -33,11 +33,13 @@ a single synchronous command never assumes either.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 from typing import List, Optional, Protocol, Sequence, Tuple, runtime_checkable
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_policy import (
     BLOCKED_PUSH_REJECTED,
+    MODE_COORDINATOR_CONFIRMED,
     OUTCOME_BLOCKED,
     OUTCOME_DONE,
     OUTCOME_PENDING,
@@ -48,8 +50,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     IntegrationActionRecord,
     IntegrationDecision,
     IntegrationPreflight,
+    IntegrationWorktree,
     StepOutcome,
     decide_integration,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_records import (
+    CoordinatorConfirmation,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.retirement_cleanup_policy import (
     STEP_LOCAL_BRANCH_DELETE,
@@ -81,8 +87,6 @@ def integration_policy_from_config(
         mode=config.mode,
         integration_branch=config.integration_branch,
         ff_only=config.ff_only,
-        require_source_ci=config.require_source_ci,
-        require_integration_ci=config.require_integration_ci,
     )
 
 
@@ -158,6 +162,20 @@ class AutoIntegrationGitOperations(Protocol):
         """Push ``source_head`` to ``target_ref`` with a normal, non-force push."""
         ...
 
+    def describe_integration_worktree(
+        self, *, path: str, lane_worktree: str
+    ) -> IntegrationWorktree:
+        """MEASURE the dedicated integration worktree's identity (read-only).
+
+        On the port, not merely on the live adapter, because the use case must be able to
+        call it. R2 had this probe on the adapter only and never invoked it, so the use case
+        re-checked the *caller's* booleans and handed the caller's own path to
+        ``apply_merge`` — a forged record naming the lane's worktree passed (j#96350 finding
+        3). Whoever measures a safety fact is the authority for it, and that must be the
+        actuator.
+        """
+        ...
+
     def remove_worktree(self, *, worktree_path: str) -> bool:
         """Remove the worktree at ``worktree_path`` without ``--force``."""
         ...
@@ -172,6 +190,28 @@ class ManagedProcessOperations(Protocol):
     """Releasing the lane's managed pane / process — the one Git-independent cleanup step."""
 
     def release_process(self, *, issue: str, lane_generation: int) -> bool: ...
+
+
+@runtime_checkable
+class CoordinatorConfirmationResolver(Protocol):
+    """Resolves a coordinator confirmation from the durable record it is recorded at.
+
+    R2 accepted a :class:`CoordinatorConfirmation` straight from the caller, so a forged one
+    naming a nonexistent anchor authorized an actuation (j#96350 finding 4): typing a
+    self-assertion does not stop it being a self-assertion. The caller now supplies only an
+    *anchor* — where to look — and this port does the looking.
+
+    An implementation MUST: fresh-read the anchor from the source of truth; confirm the
+    record there confirms **this exact action key**; and derive ``issuer_role`` from the
+    record's own author rather than from anything the caller said. It returns ``None`` for
+    every failure — unreadable anchor, absent record, wrong action, non-coordinator author —
+    because "we could not establish a confirmation" and "there is no confirmation" lead to
+    the same fail-closed place.
+    """
+
+    def resolve(
+        self, *, anchor: str, action_key: str
+    ) -> Optional[CoordinatorConfirmation]: ...
 
 
 # ---------------------------------------------------------------------------
@@ -195,12 +235,25 @@ class IntegrationRunReport:
     #: The exact commit the integration produced on the target, when one was produced. Empty
     #: for a fast-forward (which creates no commit) and for every refusal.
     integration_head: str = ""
+    #: What the actuator MEASURED about the dedicated integration worktree, as opposed to
+    #: what the caller claimed. Recorded so the durable record shows the measurement.
+    measured_worktree: Optional[IntegrationWorktree] = None
+    #: The confirmation the resolver returned for this action (``None`` when none resolved).
+    resolved_confirmation: Optional[CoordinatorConfirmation] = None
 
     def as_payload(self) -> dict[str, object]:
         return {
             "states": list(self.states),
             "outcomes": [outcome.as_payload() for outcome in self.outcomes],
             "integration_head": self.integration_head,
+            "measured_worktree": (
+                self.measured_worktree.as_payload() if self.measured_worktree else None
+            ),
+            "resolved_confirmation": (
+                self.resolved_confirmation.as_payload()
+                if self.resolved_confirmation
+                else None
+            ),
             "final_decision": (
                 self.final_decision.as_payload() if self.final_decision else None
             ),
@@ -234,14 +287,18 @@ class CleanupRunReport:
 class AutoIntegrationUseCase:
     """Runs the #13686 integration and cleanup machines against the injected ports.
 
-    The dedicated integration worktree is **not** held here. R1 kept it as a bare
-    ``integration_worktree: str`` that the use case checked only for being non-empty, and
-    review j#96344 finding 3 showed that a caller passing the lane's own path made the
-    actuator check the target branch out in the lane — the exact operation j#77124 forbids.
-    It now arrives as a measured :class:`IntegrationWorktree` on the preflight, where
-    :func:`decide_integration` refuses an inadmissible one *before* authorizing the step; by
-    the time the step reaches here it has already been proven registered, clean, and not the
-    lane's own.
+    **The actuator measures its own safety facts.** Two of the preflight's fields are not
+    read from the caller at all: the dedicated integration worktree and the coordinator
+    confirmation. R1 typed them and R2 review j#96350 (findings 3 and 4) showed that typing
+    changed nothing while the *caller* still supplied the values — a record naming the lane's
+    own worktree with ``is_lane_worktree=False``, or a confirmation naming an anchor that does
+    not exist, both passed. Whoever measures a safety fact is its authority, so
+    :meth:`run_integration` overwrites both from its own ports before deciding. A caller
+    supplies only pointers: which path, and which anchor.
+
+    ``lane_worktree`` is this actuator's own lane checkout and
+    ``integration_worktree_path`` the dedicated one — constructor state rather than per-call
+    arguments, so a single instance cannot be redirected mid-run.
     """
 
     operations: AutoIntegrationGitOperations
@@ -250,6 +307,9 @@ class AutoIntegrationUseCase:
         default_factory=RetirementCleanupPolicy.default
     )
     processes: Optional[ManagedProcessOperations] = None
+    confirmations: Optional[CoordinatorConfirmationResolver] = None
+    lane_worktree: str = ""
+    integration_worktree_path: str = ""
 
     # -- integration ------------------------------------------------------
 
@@ -273,6 +333,7 @@ class AutoIntegrationUseCase:
         """
         report = IntegrationRunReport()
         working_ledger: List[StepOutcome] = list(ledger)
+        preflight = self._measure(record, preflight, report)
         # A resumed run has no in-memory memory of the commit a previous run's apply
         # produced, but the ledger recorded it. Without this the push after a resumed apply
         # would push the SOURCE head instead of the merge commit — silently integrating a
@@ -309,6 +370,47 @@ class AutoIntegrationUseCase:
                 )
                 report.states.append(report.final_decision.state)
                 return report
+
+    def _measure(
+        self,
+        record: IntegrationActionRecord,
+        preflight: IntegrationPreflight,
+        report: IntegrationRunReport,
+    ) -> IntegrationPreflight:
+        """Replace the caller-supplied safety facts with the actuator's own measurements.
+
+        The two fields overwritten here are the ones R2 review j#96350 found a caller could
+        forge. Whatever the caller put in them is discarded — not merged, not preferred when
+        "more specific", discarded — because a value the caller chose cannot be evidence
+        about the caller's own request.
+
+        The measurement runs unconditionally rather than only for the disposition that needs
+        it: deciding *whether* to measure from the same preflight the measurement is meant to
+        replace would make the skip forgeable too.
+        """
+        worktree = self.operations.describe_integration_worktree(
+            path=self.integration_worktree_path,
+            lane_worktree=self.lane_worktree,
+        )
+        report.measured_worktree = worktree
+
+        confirmation: Optional[CoordinatorConfirmation] = None
+        if self.integration_policy.mode == MODE_COORDINATOR_CONFIRMED:
+            if self.confirmations is not None:
+                confirmation = self.confirmations.resolve(
+                    anchor=preflight.coordinator_confirmation_anchor,
+                    action_key=record.action_key,
+                )
+            # No resolver injected: nothing can be resolved, so nothing is confirmed. The
+            # decision then reports `coordinator_confirmation_required` and stops — the
+            # fail-closed reading, not an implicit approval.
+        report.resolved_confirmation = confirmation
+
+        return dataclasses.replace(
+            preflight,
+            integration_worktree=worktree,
+            coordinator_confirmation=confirmation,
+        )
 
     def _perform_integration_step(
         self,
@@ -486,6 +588,7 @@ __all__: Tuple[str, ...] = (
     "MergeResult",
     "AutoIntegrationGitOperations",
     "ManagedProcessOperations",
+    "CoordinatorConfirmationResolver",
     "IntegrationRunReport",
     "CleanupRunReport",
     "AutoIntegrationUseCase",

@@ -49,9 +49,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCKED_UNPUSHED_COMMITS,
     BLOCKED_UNRESOLVED_CALLBACK,
     BLOCKED_UNRESOLVED_OWNER_GATE,
+    BLOCKED_PUSH_HEAD_MISMATCH,
+    BLOCKED_PUSH_OUTCOME_HEAD_MISSING,
+    BLOCKED_SOURCE_CI_EVIDENCE_INCOMPLETE,
+    BLOCKED_SOURCE_CI_HEAD_MISMATCH,
     CI_GATE_GREEN,
     CI_GATE_NOT_REACHED,
-    CI_GATE_WAIVED,
+    CI_GATE_STATES,
     DISPOSITION_FAST_FORWARD,
     DISPOSITION_MERGE_COMMIT,
     EMPTY_TARGET_HEAD,
@@ -122,7 +126,9 @@ def _clean(**overrides: object) -> IntegrationPreflight:
         "source_origin_reachable": True,
         "review_generation_admissible": True,
         "target_identity_known": True,
-        "source_ci_green": True,
+        "source_ci": IntegrationCiEvidence(
+            integration_head=SOURCE, workflow="required-ci", run="src-1", conclusion="success"
+        ),
         "callbacks_drained": True,
         "owner_gates_resolved": True,
         # The CI evidence names the exact commit a fast-forward push lands (the source head),
@@ -184,21 +190,15 @@ class ModeGateTest(unittest.TestCase):
         self.assertEqual(decision.blocked_reasons, (BLOCKED_MODE_UNRECOGNIZED,))
         self.assertNotEqual(decision.state, STATE_DISABLED)
 
-    def test_the_integrated_reason_does_not_claim_a_disabled_ci_gate(self) -> None:
+    def test_an_integrated_decision_always_carries_a_green_exact_sha_gate(self) -> None:
+        # R2 review j#96350 finding 1: `waived` is withdrawn, so `integrated` cannot mean
+        # "no CI ran". There are only two CI-gate states left.
         record = _record()
         ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE)]
-        relaxed = AutoIntegrationPolicy(
-            mode=MODE_AUTO, integration_branch="main", require_integration_ci=False
-        )
-        decision = decide_integration(
-            relaxed, record, _clean(integration_ci=None), ledger=ledger
-        )
+        decision = decide_integration(AUTO, record, _clean(), ledger=ledger)
         self.assertEqual(decision.state, STATE_INTEGRATED)
-        self.assertEqual(decision.integration_ci, CI_GATE_WAIVED)
-        self.assertIn("WAIVED", decision.reason)
-        required = decide_integration(AUTO, record, _clean(), ledger=ledger)
-        self.assertEqual(required.integration_ci, CI_GATE_GREEN)
-        self.assertIn("green", required.reason)
+        self.assertEqual(decision.integration_ci, CI_GATE_GREEN)
+        self.assertEqual(CI_GATE_STATES, {CI_GATE_GREEN, CI_GATE_NOT_REACHED})
 
     def test_coordinator_confirmed_waits_for_this_exact_action_key(self) -> None:
         # R1 review j#96344 finding 5: the R1 version of this test asserted only that the key
@@ -341,7 +341,7 @@ class FailClosedGateTest(unittest.TestCase):
             _clean(
                 source_worktree_dirty=True,
                 callbacks_drained=False,
-                source_ci_green=False,
+                source_ci=None,
             ),
         )
         self.assertEqual(decision.state, STATE_INTEGRATION_BLOCKED)
@@ -365,7 +365,7 @@ class FailClosedGateTest(unittest.TestCase):
             ({"source_origin_reachable": False}, BLOCKED_SOURCE_UNREACHABLE),
             ({"unpushed_unique_commits": True}, BLOCKED_UNPUSHED_COMMITS),
             ({"source_worktree_dirty": True}, BLOCKED_DIRTY_WORKTREE),
-            ({"source_ci_green": False}, BLOCKED_SOURCE_CI_NOT_GREEN),
+            ({"source_ci": None}, BLOCKED_SOURCE_CI_NOT_GREEN),
             ({"owner_gates_resolved": False}, BLOCKED_UNRESOLVED_OWNER_GATE),
             ({"callbacks_drained": False}, BLOCKED_UNRESOLVED_CALLBACK),
             ({"observed_target_head": OTHER}, BLOCKED_TARGET_DRIFT),
@@ -386,18 +386,15 @@ class FailClosedGateTest(unittest.TestCase):
         self.assertIn(BLOCKED_FOREIGN_WORKTREE, decision.blocked_reasons)
         self.assertIn(BLOCKED_REVIEW_INADMISSIBLE, decision.blocked_reasons)
 
-    def test_source_ci_gate_is_skippable_by_config_but_no_safety_gate_is(self) -> None:
-        relaxed = AutoIntegrationPolicy(
-            mode=MODE_AUTO, integration_branch="main", require_source_ci=False
-        )
-        decision = decide_integration(relaxed, _record(), _clean(source_ci_green=False))
-        self.assertEqual(decision.state, STATE_PUSH_WAITING)
-        # The same config cannot make a dirty worktree acceptable.
-        blocked = decide_integration(
-            relaxed, _record(), _clean(source_ci_green=False, source_worktree_dirty=True)
-        )
-        self.assertEqual(blocked.state, STATE_INTEGRATION_BLOCKED)
-        self.assertEqual(blocked.blocked_reasons, (BLOCKED_DIRTY_WORKTREE,))
+    def test_no_config_field_can_turn_a_ci_gate_off(self) -> None:
+        # R2 review j#96350 finding 1: `require_source_ci` / `require_integration_ci` are gone.
+        # j#77124, j#96335's target flow, and j#96337's fail-closed list all require green CI.
+        for field_name in ("require_source_ci", "require_integration_ci"):
+            self.assertFalse(hasattr(AUTO, field_name), field_name)
+
+    def test_absent_source_ci_evidence_blocks(self) -> None:
+        decision = decide_integration(AUTO, _record(), _clean(source_ci=None))
+        self.assertEqual(decision.blocked_reasons, (BLOCKED_SOURCE_CI_NOT_GREEN,))
 
 
 class TerminalDispositionTest(unittest.TestCase):
@@ -512,7 +509,7 @@ class StateOrderTest(unittest.TestCase):
         first = decide_integration(AUTO, record, pending_ci)
         self.assertEqual((first.state, first.next_step), (STATE_PUSH_WAITING, STEP_PUSH))
 
-        pushed = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE)]
+        pushed = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE)]
         second = decide_integration(AUTO, record, pending_ci, ledger=pushed)
         self.assertEqual(
             (second.state, second.next_step), (STATE_AWAITING_CI, STEP_INTEGRATION_CI)
@@ -539,23 +536,11 @@ class StateOrderTest(unittest.TestCase):
         # The reason names the run, so the record can be checked afterwards.
         self.assertIn("run-1", decision.reason)
 
-    def test_integration_ci_gate_is_skippable_by_config(self) -> None:
-        record = _record()
-        policy = AutoIntegrationPolicy(
-            mode=MODE_AUTO, integration_branch="main", require_integration_ci=False
-        )
-        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE)]
-        decision = decide_integration(
-            policy, record, _clean(integration_ci=None), ledger=ledger
-        )
-        self.assertEqual(decision.state, STATE_INTEGRATED)
-        self.assertEqual(decision.integration_ci, CI_GATE_WAIVED)
-
 
 class IdempotencyTest(unittest.TestCase):
     def test_a_done_step_is_not_re_run(self) -> None:
         record = _record()
-        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE)]
+        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE)]
         decision = decide_integration(AUTO, record, _clean(), ledger=ledger)
         self.assertEqual(decision.state, STATE_INTEGRATED)
         self.assertIsNone(decision.next_step)
@@ -571,7 +556,7 @@ class IdempotencyTest(unittest.TestCase):
 
     def test_a_blocked_step_outcome_does_not_count_as_progress(self) -> None:
         record = _record()
-        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_BLOCKED)]
+        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_BLOCKED, head=SOURCE)]
         decision = decide_integration(AUTO, record, _clean(), ledger=ledger)
         self.assertEqual(decision.next_step, STEP_PUSH)
 
@@ -777,6 +762,151 @@ class R1ReviewFindingRegressionTest(unittest.TestCase):
         )
 
 
+class R2ReviewFindingRegressionTest(unittest.TestCase):
+    """R2 review j#96350's findings, pinned with the inputs that reproduced them."""
+
+    def test_f1_the_ci_waiver_and_its_config_knobs_are_gone(self) -> None:
+        # R2 argued from j#96335's configuration list that an optional gate was authorized;
+        # j#77124, j#96335's own target flow, and j#96337's fail-closed list all say
+        # otherwise, and the waiver had no downstream semantics (cleanup requires a settled
+        # green CI). Dispute j#96346 withdrawn in j#96351.
+        self.assertNotIn("waived", CI_GATE_STATES)
+        record = _record()
+        decision = decide_integration(
+            AUTO,
+            record,
+            _clean(integration_ci=None),
+            ledger=[StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE)],
+        )
+        self.assertEqual(decision.state, STATE_AWAITING_CI)
+        self.assertEqual(decision.integration_ci, CI_GATE_NOT_REACHED)
+
+    def test_f1_the_source_ci_gate_is_typed_and_bound_to_the_source_head(self) -> None:
+        # The sibling gate kept a bare bool through R2. Same hole, same fix.
+        elsewhere = IntegrationCiEvidence(
+            integration_head=OTHER, workflow="required-ci", run="r", conclusion="success"
+        )
+        self.assertEqual(
+            decide_integration(AUTO, _record(), _clean(source_ci=elsewhere)).blocked_reasons,
+            (BLOCKED_SOURCE_CI_HEAD_MISMATCH,),
+        )
+        incomplete = IntegrationCiEvidence(
+            integration_head=SOURCE, workflow="", run="r", conclusion="success"
+        )
+        self.assertEqual(
+            decide_integration(AUTO, _record(), _clean(source_ci=incomplete)).blocked_reasons,
+            (BLOCKED_SOURCE_CI_EVIDENCE_INCOMPLETE,),
+        )
+        red = IntegrationCiEvidence(
+            integration_head=SOURCE, workflow="required-ci", run="r", conclusion="failure"
+        )
+        self.assertEqual(
+            decide_integration(AUTO, _record(), _clean(source_ci=red)).blocked_reasons,
+            (BLOCKED_SOURCE_CI_NOT_GREEN,),
+        )
+
+    def test_f2_a_push_outcome_without_a_head_does_not_fall_back(self) -> None:
+        # R2: `landed_head = done[STEP_PUSH].head or record.source_head` turned "we failed to
+        # record what landed" into "the source landed", and then gated a MERGE integration on
+        # CI about the source commit. Exact reproduction input.
+        record = _record()
+        policy = AutoIntegrationPolicy(
+            mode=MODE_AUTO, integration_branch="main", ff_only=False
+        )
+        merge_head = "f" * 40
+        about_source = IntegrationCiEvidence(
+            integration_head=SOURCE, workflow="required-ci", run="r", conclusion="success"
+        )
+        decision = decide_integration(
+            policy,
+            record,
+            _clean(
+                fast_forward_possible=False,
+                integration_worktree=_dedicated_worktree(),
+                integration_ci=about_source,
+            ),
+            ledger=[
+                StepOutcome(
+                    record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE, head=merge_head
+                ),
+                StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=""),
+            ],
+        )
+        self.assertEqual(decision.blocked_reasons, (BLOCKED_PUSH_OUTCOME_HEAD_MISSING,))
+
+    def test_f2_a_malformed_push_head_is_refused_too(self) -> None:
+        record = _record()
+        decision = decide_integration(
+            AUTO,
+            record,
+            _clean(),
+            ledger=[
+                StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head="not-a-sha")
+            ],
+        )
+        self.assertEqual(decision.blocked_reasons, (BLOCKED_PUSH_OUTCOME_HEAD_MISSING,))
+
+    def test_f2_the_recorded_head_must_be_what_the_disposition_should_have_landed(
+        self,
+    ) -> None:
+        record = _record()
+        ff = decide_integration(
+            AUTO,
+            record,
+            _clean(),
+            ledger=[StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=OTHER)],
+        )
+        self.assertEqual(ff.blocked_reasons, (BLOCKED_PUSH_HEAD_MISMATCH,))
+
+        policy = AutoIntegrationPolicy(
+            mode=MODE_AUTO, integration_branch="main", ff_only=False
+        )
+        merge_head = "f" * 40
+        merged = decide_integration(
+            policy,
+            record,
+            _clean(
+                fast_forward_possible=False, integration_worktree=_dedicated_worktree()
+            ),
+            ledger=[
+                StepOutcome(
+                    record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE, head=merge_head
+                ),
+                StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE),
+            ],
+        )
+        self.assertEqual(merged.blocked_reasons, (BLOCKED_PUSH_HEAD_MISMATCH,))
+
+    def test_f2_a_correctly_recorded_merge_push_reaches_integrated(self) -> None:
+        record = _record()
+        policy = AutoIntegrationPolicy(
+            mode=MODE_AUTO, integration_branch="main", ff_only=False
+        )
+        merge_head = "f" * 40
+        decision = decide_integration(
+            policy,
+            record,
+            _clean(
+                fast_forward_possible=False,
+                integration_worktree=_dedicated_worktree(),
+                integration_ci=IntegrationCiEvidence(
+                    integration_head=merge_head,
+                    workflow="required-ci",
+                    run="r",
+                    conclusion="success",
+                ),
+            ),
+            ledger=[
+                StepOutcome(
+                    record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE, head=merge_head
+                ),
+                StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=merge_head),
+            ],
+        )
+        self.assertEqual(decision.state, STATE_INTEGRATED)
+        self.assertIn(merge_head, decision.reason)
+
+
 class JournalRendererTest(unittest.TestCase):
     def test_blocked_record_names_every_reason_and_the_zero_side_effect(self) -> None:
         record = _record()
@@ -793,7 +923,7 @@ class JournalRendererTest(unittest.TestCase):
     def test_integrated_record_separates_source_and_integration_heads(self) -> None:
         # A single head cannot prove a merge-commit integration, so both are emitted.
         record = _record()
-        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE)]
+        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE)]
         decision = decide_integration(AUTO, record, _clean(), ledger=ledger)
         rendered = render_integration_action_journal(
             decision, record, integration_head=OTHER

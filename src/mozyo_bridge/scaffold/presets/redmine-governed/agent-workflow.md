@@ -456,10 +456,12 @@ origin到達可能性:
     実行形態:
       - 既定は ff-only の normal (non-force) push。non-ff を許す設定でも merge commit は専用 integration worktree で作り、lane worktree で target branch を checkout しない。**専用 worktree であることは主張ではなく検査**とする — registered / lane worktree でない / clean を action-time に測り、満たさなければ apply しない
       - 統合先は **設定された integration branch と exact 一致**していること。「既知の integration branch である」ことと「この actuator に指定された branch である」ことは別の制約であり、前者だけでは config を守らない
+      - **safety fact を測るのは actuator であり、依頼者ではない。** 専用 worktree identity・confirmation のように「これは安全である」と述べる値は、caller が渡した値を検査するのではなく actuator 自身が action-time に測定して上書きする。型を与えても測定者を固定しなければ自己申告のままである
       - conflict / non-ff / target drift / push 拒否は fail-closed。rebase も force も代替手段にしない
       - 統合 SHA に対する CI は **非同期 gate** として別 state で待つ。単一の同期 command 内で CI 完了を仮定しない。CI green は **bool ではなく照合可能な記録**で受ける — required check の identity + run id + conclusion + 対象 commit を持ち、**push が着地した head と exact-match** すること (`### Hibernate Evidence Marker Contract` の `required_ci_green` と同形)。無関係な green run が gate を満たしてはならない
-      - CI gate を config で外した場合は、その事実を durable record に **machine-readable に残す**。`integrated` だけでは「CI green」と「gate を外した」を区別できず、区別できない記録は前者として読まれる
-      - `coordinator_confirmed` mode の confirmation は、**確認した exact action key + 発行 role + durable anchor** を伴う記録として解決する。bool の自己申告や anchor を欠く主張は confirmation として扱わない (`### 根拠出所分類`)
+      - **CI gate 自体は config で外せない。** どの required check を要求するかは設定事項だが、要求するか否かは設定事項ではない。gate を外した統合は close 後 cleanup の前提 (統合 SHA CI green) と接続できず、cleanup が永久 block するか未実行 CI の自己申告で破壊的 step へ進むかのどちらかになる
+      - push が着地した head は **記録された outcome から取り、欠落時に source head へ fallback しない**。「何が着地したか記録し損ねた」ことは「source が着地した」証拠ではない。fast-forward は source head、merge は同 action の apply outcome head と exact-match すること
+      - `coordinator_confirmed` mode の confirmation は、**確認した exact action key + 発行 role + durable anchor** を伴う記録として解決する。bool の自己申告や anchor を欠く主張は confirmation として扱わない (`### 根拠出所分類`)。**anchor は action-time に fresh-read し、role は記録の author から解決する** — caller が名乗った role や、非空文字列であることは authority ではない
       - already_integrated (target ancestry) と patch_equivalent (明示 patch-id evidence) は別 disposition として記録し、同じ merge を再生成しない
     記録:
       - 各段階 (integration / push / CI / process retire / worktree remove / branch cleanup) を段階別 outcome として記録する
