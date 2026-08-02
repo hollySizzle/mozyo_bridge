@@ -37,7 +37,7 @@ does not amend.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Optional, Protocol, Sequence
 
 #: Every generation in the plan predates identity receipts; the pins are unchanged.
 PLAN_LEGACY_UNCHANGED = "legacy_unchanged"
@@ -54,10 +54,20 @@ REFUSE_LIFECYCLE_MISMATCH = "lifecycle_mismatch"
 REFUSE_EVIDENCE_UNAVAILABLE = "evidence_unavailable"
 REFUSE_EVIDENCE_MISMATCH = "evidence_mismatch"
 REFUSE_DIVERGENT_PRE_PIN = "divergent_pre_pin"
+#: The bound evidence exists but is not in the ``bound`` phase (consumed / unknown).
+REFUSE_EVIDENCE_NOT_BOUND = "evidence_not_bound"
+#: The observed screen does not map to an update-derived launch cause.
+REFUSE_CAUSE_NOT_UPDATE_DERIVED = "cause_not_update_derived"
 
 
 class EvidencePlanRefused(RuntimeError):
-    """A receipt-capable participant could not be planned. Zero plan, zero launch."""
+    """A receipt-capable participant could not be planned. Zero plan, zero launch.
+
+    ``reason`` is the outward authority and is always one of the fixed tokens below.
+    ``detail`` is a FIXED clause chosen by this module — never an exception string or a
+    host path (audit j#97062 finding 5), so a refusal is safe to put on a durable record
+    verbatim.
+    """
 
     def __init__(self, reason: str, detail: str = "") -> None:
         self.reason = reason
@@ -72,13 +82,56 @@ class EvidencePlan:
     outcome: str
 
 
-#: ``assigned_name -> LaunchGeneration | None``. Raising is a refusal, not an absence.
-GenerationPort = Callable[[str], Any]
-#: ``lane_id -> (lane_generation, lifecycle_revision) | None``.
-LifecyclePort = Callable[[str], Any]
-#: ``(workspace_id, lane_id, provider, lane_generation, lifecycle_revision) ->
-#: UpdateRelaunchEvidence | None``.
-EvidencePort = Callable[..., Any]
+@dataclass(frozen=True)
+class PlanningContext:
+    """The authority this plan is scoped to. Immutable, and supplied — never inferred.
+
+    ``workspace_id`` is here rather than read off the participant because a fresh pin has
+    no evidence fields yet: deriving the lookup workspace from the very field this planner
+    is about to write is circular, and it made the production lookup ask for a blank
+    workspace (audit j#97062 finding 1).
+    """
+
+    workspace_id: str
+    lane_id: str
+
+
+class GenerationPort(Protocol):
+    """``(assigned_name) -> LaunchGeneration | None``. Raising is a refusal."""
+
+    def __call__(self, assigned_name: str) -> Any: ...  # pragma: no cover - shape only
+
+
+class LifecyclePort(Protocol):
+    """``(lane_id) -> (lane_generation, lifecycle_revision) | None``."""
+
+    def __call__(self, lane_id: str) -> Any: ...  # pragma: no cover - shape only
+
+
+class EvidencePort(Protocol):
+    """The lane's live bound evidence for one provider, or ``None``."""
+
+    def __call__(
+        self,
+        *,
+        workspace_id: str,
+        lane_id: str,
+        provider: str,
+        lane_generation: str,
+        lifecycle_revision: str,
+    ) -> Any: ...  # pragma: no cover - shape only
+
+
+class UpdateCausePort(Protocol):
+    """``(provider, blocker_id) -> typed launch cause | ""``.
+
+    Injected rather than imported (audit j#97062 finding 4). The mapping from an observed
+    screen to a launch cause is provider-registry knowledge in e_140; importing it here
+    would add an e_110 -> e_140 reverse dependency, and re-spelling the vocabulary locally
+    would give the same token two owners.
+    """
+
+    def __call__(self, provider: str, blocker_id: str) -> str: ...  # pragma: no cover
 
 
 def _norm(value: object) -> str:
@@ -94,11 +147,13 @@ class ReplacementEvidencePlanner:
         generations: GenerationPort,
         lifecycle: LifecyclePort,
         evidence: EvidencePort,
+        update_cause: UpdateCausePort,
         capability: Optional[Callable[[object], bool]] = None,
     ) -> None:
         self._generations = generations
         self._lifecycle = lifecycle
         self._evidence = evidence
+        self._update_cause = update_cause
         self._capability = capability
 
     # -- capability ---------------------------------------------------------------------
@@ -119,11 +174,14 @@ class ReplacementEvidencePlanner:
         try:
             return bool(classify(action_id))
         except Exception as exc:  # noqa: BLE001 - an unclassifiable action is never legacy
-            raise EvidencePlanRefused(REFUSE_UNKNOWN_ACTION_SHAPE, str(exc)) from exc
+            raise EvidencePlanRefused(
+                REFUSE_UNKNOWN_ACTION_SHAPE,
+                "the startup action id matches no known shape",
+            ) from exc
 
     # -- planning -----------------------------------------------------------------------
 
-    def plan(self, participants: Sequence[Any]) -> EvidencePlan:
+    def plan(self, participants: Sequence[Any], context: PlanningContext) -> EvidencePlan:
         """Return the participants to plan the transaction with.
 
         Legacy plans come back byte-exact with the receipt store untouched. A
@@ -139,18 +197,20 @@ class ReplacementEvidencePlanner:
         planned = []
         touched = False
         for pin in pinned:
-            action_id = self._action_id_for(pin)
+            generation = self._generation_for(pin)
+            action_id = _norm(getattr(generation, "startup_action_id", ""))
             if not self._requires_receipt(action_id):
                 planned.append(self._legacy_pin(pin))
                 continue
-            planned.append(self._receipt_pin(pin, action_id))
+            self._require_generation_identity(pin, generation, context)
+            planned.append(self._receipt_pin(pin, action_id, context))
             touched = True
         return EvidencePlan(
             participants=tuple(planned),
             outcome=PLAN_EVIDENCE_PINNED if touched else PLAN_LEGACY_UNCHANGED,
         )
 
-    def _action_id_for(self, pin: Any) -> str:
+    def _generation_for(self, pin: Any) -> Any:
         """The startup action this participant's live generation belongs to.
 
         Read from the launch-generation authority, which is the store where a relaunch
@@ -178,16 +238,27 @@ class ReplacementEvidencePlanner:
                 REFUSE_GENERATION_NOT_ATTESTED,
                 f"the launch generation for {assigned!r} is not attested",
             )
-        self._require_generation_identity(pin, generation)
-        return _norm(getattr(generation, "startup_action_id", ""))
+        return generation
 
-    def _require_generation_identity(self, pin: Any, generation: Any) -> None:
-        """The live generation must be the participant this plan names."""
-        for field, attr in (("role", "role"), ("lane_id", "lane_id")):
-            if _norm(getattr(generation, attr, "")) != _norm(getattr(pin, field, "")):
+    def _require_generation_identity(self, pin: Any, generation: Any, context) -> None:
+        """The live generation must be EXACTLY the participant this plan names.
+
+        Audit j#97062 finding 1: comparing only role and lane let a foreign generation
+        through. Every axis the generation carries is compared — including the workspace
+        and the locator, which are the two a same-named slot in another workspace, or a
+        recycled pane, would differ on.
+        """
+        for attr, expected in (
+            ("workspace_id", _norm(context.workspace_id)),
+            ("lane_id", _norm(getattr(pin, "lane_id", ""))),
+            ("role", _norm(getattr(pin, "role", ""))),
+            ("assigned_name", _norm(getattr(pin, "assigned_name", ""))),
+            ("locator", _norm(getattr(pin, "old_locator", ""))),
+        ):
+            if _norm(getattr(generation, attr, "")) != expected:
                 raise EvidencePlanRefused(
                     REFUSE_GENERATION_MISMATCH,
-                    f"the live generation's {attr} is not the participant's",
+                    "the live launch generation is not the participant this plan names",
                 )
 
     def _legacy_pin(self, pin: Any):
@@ -207,89 +278,50 @@ class ReplacementEvidencePlanner:
             )
         return pin
 
-    def _receipt_pin(self, pin: Any, action_id: str):
+    def _receipt_pin(self, pin: Any, action_id: str, context: PlanningContext):
         from mozyo_bridge.core.state.replacement_transaction_model import ParticipantPin
 
         lane_id = _norm(getattr(pin, "lane_id", ""))
-        try:
-            lifecycle = self._lifecycle(lane_id)
-        except Exception as exc:  # noqa: BLE001
-            raise EvidencePlanRefused(REFUSE_LIFECYCLE_UNAVAILABLE, str(exc)) from exc
-        if not lifecycle:
-            raise EvidencePlanRefused(
-                REFUSE_LIFECYCLE_UNAVAILABLE,
-                f"lane {lane_id!r} has no declared lifecycle generation/revision",
-            )
-        lane_generation, lifecycle_revision = (_norm(v) for v in lifecycle)
-        if not lane_generation or not lifecycle_revision:
-            raise EvidencePlanRefused(
-                REFUSE_LIFECYCLE_UNAVAILABLE, "the lifecycle pair is not fully declared"
-            )
+        provider = _norm(getattr(pin, "provider", ""))
+        assigned = _norm(getattr(pin, "assigned_name", ""))
+        workspace_id = _norm(context.workspace_id)
+
+        lane_generation, lifecycle_revision = self._current_lifecycle(lane_id)
+        # Audit j#97062 finding 2: a receipt-capable participant must ALREADY pin the
+        # lifecycle it is acting on, and that pin must be the lane's current one. The first
+        # cut only compared when the pin was non-empty, so an empty pin was "consistent"
+        # with anything — the transaction would then carry no lifecycle authority at all
+        # while the plan believed it had checked one.
         pinned_generation = _norm(getattr(pin, "lane_generation", ""))
         pinned_revision = _norm(getattr(pin, "lane_revision", ""))
-        if (pinned_generation and pinned_generation != lane_generation) or (
-            pinned_revision and pinned_revision != lifecycle_revision
-        ):
-            # The plan captured a lifecycle the lane has since moved off. Acting on it is
-            # what the #13810 pin exists to prevent.
+        if not pinned_generation or not pinned_revision:
+            raise EvidencePlanRefused(
+                REFUSE_LIFECYCLE_MISMATCH,
+                "a receipt-capable participant must pin the lane lifecycle it acts on",
+            )
+        if pinned_generation != lane_generation or pinned_revision != lifecycle_revision:
             raise EvidencePlanRefused(
                 REFUSE_LIFECYCLE_MISMATCH,
                 "the participant's pinned lifecycle is not the lane's current one",
             )
 
-        workspace_id = _norm(getattr(pin, "evidence_workspace_id", ""))
-        try:
-            found = self._evidence(
-                workspace_id=workspace_id or None,
-                lane_id=lane_id,
-                provider=_norm(getattr(pin, "provider", "")),
-                lane_generation=lane_generation,
-                lifecycle_revision=lifecycle_revision,
-            )
-        except Exception as exc:  # noqa: BLE001
-            raise EvidencePlanRefused(REFUSE_EVIDENCE_UNAVAILABLE, str(exc)) from exc
-        if found is None:
-            raise EvidencePlanRefused(
-                REFUSE_EVIDENCE_UNAVAILABLE,
-                "no live update evidence is bound to this exact generation",
-            )
-
-        key = getattr(found, "key", None)
-        if key is None or _norm(getattr(key, "startup_action_id", "")) != action_id:
-            raise EvidencePlanRefused(
-                REFUSE_EVIDENCE_MISMATCH,
-                "the bound evidence names a different startup action",
-            )
-        for attr, expected in (
-            ("lane_id", lane_id),
-            ("provider", _norm(getattr(pin, "provider", ""))),
-            ("assigned_name", _norm(getattr(pin, "assigned_name", ""))),
-        ):
-            if _norm(getattr(key, attr, "")) != expected:
-                raise EvidencePlanRefused(
-                    REFUSE_EVIDENCE_MISMATCH,
-                    f"the bound evidence's {attr} is not the participant's",
-                )
-        cause = _norm(getattr(found, "blocker_id", ""))
-        if not cause:
-            raise EvidencePlanRefused(
-                REFUSE_EVIDENCE_MISMATCH, "the bound evidence carries no typed cause"
-            )
-        evidence_workspace = _norm(getattr(key, "workspace_id", ""))
-        if workspace_id and workspace_id != evidence_workspace:
-            raise EvidencePlanRefused(
-                REFUSE_DIVERGENT_PRE_PIN,
-                "the participant already carries a different evidence workspace",
-            )
-        existing_action = _norm(getattr(pin, "evidence_startup_action_id", ""))
-        existing_cause = _norm(getattr(pin, "evidence_cause", ""))
-        if (existing_action and existing_action != action_id) or (
-            existing_cause and existing_cause != cause
-        ):
-            raise EvidencePlanRefused(
-                REFUSE_DIVERGENT_PRE_PIN,
-                "the participant already carries a different evidence action or cause",
-            )
+        found = self._bound_evidence(
+            workspace_id=workspace_id,
+            lane_id=lane_id,
+            provider=provider,
+            lane_generation=lane_generation,
+            lifecycle_revision=lifecycle_revision,
+        )
+        self._require_evidence_identity(
+            found,
+            action_id=action_id,
+            workspace_id=workspace_id,
+            lane_id=lane_id,
+            provider=provider,
+            assigned=assigned,
+        )
+        cause = self._typed_cause(provider, _norm(getattr(found, "blocker_id", "")))
+        self._require_no_divergent_pre_pin(pin, workspace_id, action_id, cause)
 
         # Every existing authority on the input pin is carried across unchanged; only the
         # triplet is added. Re-planning an already-correct pin reproduces it exactly.
@@ -302,16 +334,127 @@ class ReplacementEvidencePlanner:
             is_self=pin.is_self,
             lane_revision=pin.lane_revision,
             lane_generation=pin.lane_generation,
-            evidence_workspace_id=evidence_workspace,
+            evidence_workspace_id=workspace_id,
             evidence_startup_action_id=action_id,
             evidence_cause=cause,
             phase=pin.phase,
         )
 
+    def _current_lifecycle(self, lane_id: str) -> tuple:
+        try:
+            lifecycle = self._lifecycle(lane_id)
+        except Exception as exc:  # noqa: BLE001
+            raise EvidencePlanRefused(
+                REFUSE_LIFECYCLE_UNAVAILABLE,
+                "the lane lifecycle authority could not be read",
+            ) from exc
+        if not lifecycle:
+            raise EvidencePlanRefused(
+                REFUSE_LIFECYCLE_UNAVAILABLE,
+                "the lane has no declared lifecycle generation and revision",
+            )
+        lane_generation, lifecycle_revision = (_norm(v) for v in lifecycle)
+        if not lane_generation or not lifecycle_revision:
+            raise EvidencePlanRefused(
+                REFUSE_LIFECYCLE_UNAVAILABLE,
+                "the lane's declared lifecycle pair is incomplete",
+            )
+        return (lane_generation, lifecycle_revision)
+
+    def _bound_evidence(self, **lookup):
+        """The lane's live evidence, proven to be in the ``bound`` phase.
+
+        Audit j#97062 finding 3: the production reader only returns bound rows, but this
+        planner takes an injected port — so it verifies the phase itself rather than
+        inheriting a guarantee from an implementation it does not control. Consumed
+        evidence must never re-arm a plan.
+        """
+        try:
+            found = self._evidence(**lookup)
+        except Exception as exc:  # noqa: BLE001
+            raise EvidencePlanRefused(
+                REFUSE_EVIDENCE_UNAVAILABLE, "the receipt authority could not be read"
+            ) from exc
+        if found is None:
+            raise EvidencePlanRefused(
+                REFUSE_EVIDENCE_UNAVAILABLE,
+                "no live update evidence is bound to this exact generation",
+            )
+        if getattr(found, "bound", None) is not True:
+            raise EvidencePlanRefused(
+                REFUSE_EVIDENCE_NOT_BOUND,
+                "the update evidence for this generation is not in the bound phase",
+            )
+        return found
+
+    def _require_evidence_identity(
+        self, found, *, action_id, workspace_id, lane_id, provider, assigned
+    ) -> None:
+        key = getattr(found, "key", None)
+        if key is None:
+            raise EvidencePlanRefused(
+                REFUSE_EVIDENCE_MISMATCH, "the bound evidence carries no generation key"
+            )
+        for attr, expected in (
+            ("startup_action_id", action_id),
+            ("workspace_id", workspace_id),
+            ("lane_id", lane_id),
+            ("provider", provider),
+            ("assigned_name", assigned),
+        ):
+            if _norm(getattr(key, attr, "")) != expected:
+                raise EvidencePlanRefused(
+                    REFUSE_EVIDENCE_MISMATCH,
+                    "the bound evidence names a different generation than this participant",
+                )
+
+    def _typed_cause(self, provider: str, blocker_id: str) -> str:
+        """The typed LAUNCH cause for an observed screen (audit j#97062 finding 4).
+
+        ``blocker_id`` is what was SEEN (``update_prompt_available`` /
+        ``update_in_progress``); the cause a replacement pins is the closed launch token
+        (``update_relaunch``). The first cut stored the screen id as the cause, which put a
+        second vocabulary into a field every other surface reads with the first. The
+        mapping is provider-registry knowledge, so it arrives through a port.
+        """
+        if not blocker_id:
+            raise EvidencePlanRefused(
+                REFUSE_EVIDENCE_MISMATCH, "the bound evidence carries no observed screen"
+            )
+        try:
+            cause = _norm(self._update_cause(provider, blocker_id))
+        except Exception as exc:  # noqa: BLE001
+            raise EvidencePlanRefused(
+                REFUSE_CAUSE_NOT_UPDATE_DERIVED,
+                "the observed screen could not be classified",
+            ) from exc
+        if not cause:
+            raise EvidencePlanRefused(
+                REFUSE_CAUSE_NOT_UPDATE_DERIVED,
+                "the observed screen is not an update-derived launch cause",
+            )
+        return cause
+
+    def _require_no_divergent_pre_pin(self, pin, workspace_id, action_id, cause) -> None:
+        for attr, expected in (
+            ("evidence_workspace_id", workspace_id),
+            ("evidence_startup_action_id", action_id),
+            ("evidence_cause", cause),
+        ):
+            existing = _norm(getattr(pin, attr, ""))
+            if existing and existing != expected:
+                raise EvidencePlanRefused(
+                    REFUSE_DIVERGENT_PRE_PIN,
+                    "the participant already carries a different evidence triplet",
+                )
+
 
 __all__ = (
     "EvidencePlan",
     "EvidencePlanRefused",
+    "PlanningContext",
+    "REFUSE_CAUSE_NOT_UPDATE_DERIVED",
+    "REFUSE_EVIDENCE_NOT_BOUND",
     "PLAN_EVIDENCE_PINNED",
     "PLAN_LEGACY_UNCHANGED",
     "REFUSE_DIVERGENT_PRE_PIN",

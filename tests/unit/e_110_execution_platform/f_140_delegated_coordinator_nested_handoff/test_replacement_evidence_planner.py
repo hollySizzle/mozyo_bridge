@@ -25,8 +25,14 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     PLAN_EVIDENCE_PINNED,
     PLAN_LEGACY_UNCHANGED,
     EvidencePlanRefused,
+    PlanningContext,
     ReplacementEvidencePlanner,
 )
+
+WORKSPACE = "wA"
+CONTEXT = PlanningContext(workspace_id=WORKSPACE, lane_id="issue_14741")
+#: The typed LAUNCH cause a replacement pins — NOT the observed screen id.
+CAUSE = "update_relaunch"
 
 ACTION = "startup-ir1-" + "a" * 64
 LEGACY_ACTION = "startup-" + "b" * 64
@@ -41,18 +47,22 @@ def _pin(**kw):
         provider="codex",
         assigned_name="mzb1_wA_codex_lane",
         old_locator="wA:p1",
+        lane_generation=GEN,
+        lane_revision=REV,
     )
     base.update(kw)
     return ParticipantPin(**base)
 
 
-def _generation(action_id=ACTION, phase="attested", role="gateway", lane="issue_14741"):
+def _generation(action_id=ACTION, phase="attested", role="gateway", lane="issue_14741",
+                workspace="wA", assigned="mzb1_wA_codex_lane", locator="wA:p1"):
     return SimpleNamespace(
-        startup_action_id=action_id, phase=phase, role=role, lane_id=lane
+        startup_action_id=action_id, phase=phase, role=role, lane_id=lane,
+        workspace_id=workspace, assigned_name=assigned, locator=locator,
     )
 
 
-def _evidence(action_id=ACTION, cause="update_prompt_available", **kw):
+def _evidence(action_id=ACTION, blocker="update_prompt_available", bound=True, **kw):
     key = SimpleNamespace(
         workspace_id=kw.get("workspace_id", "wA"),
         lane_id=kw.get("lane_id", "issue_14741"),
@@ -60,7 +70,16 @@ def _evidence(action_id=ACTION, cause="update_prompt_available", **kw):
         assigned_name=kw.get("assigned_name", "mzb1_wA_codex_lane"),
         startup_action_id=action_id,
     )
-    return SimpleNamespace(key=key, blocker_id=cause)
+    return SimpleNamespace(key=key, blocker_id=blocker, bound=bound)
+
+
+def _update_cause(provider, blocker_id):
+    """The port e_140 supplies: observed screen -> typed launch cause."""
+    if provider == "codex" and blocker_id in (
+        "update_prompt_available", "update_in_progress"
+    ):
+        return CAUSE
+    return ""
 
 
 _DEFAULT = object()
@@ -99,11 +118,12 @@ class _Ports:
             raise self._evidence_error
         return self._evidence
 
-    def planner(self, capability=None):
+    def planner(self, capability=None, update_cause=None):
         return ReplacementEvidencePlanner(
             generations=self.generations,
             lifecycle=self.lifecycle,
             evidence=self.evidence,
+            update_cause=update_cause or _update_cause,
             capability=capability if capability is not None else _is_capable,
         )
 
@@ -116,7 +136,7 @@ class LegacyPositiveControlTest(unittest.TestCase):
     def test_a_legacy_generation_is_byte_exact_and_opens_no_receipt_store(self) -> None:
         ports = _Ports(generation=_generation(action_id=LEGACY_ACTION))
         pin = _pin()
-        plan = ports.planner().plan([pin])
+        plan = ports.planner().plan([pin], CONTEXT)
         self.assertEqual(plan.outcome, PLAN_LEGACY_UNCHANGED)
         self.assertEqual(plan.participants, (pin,))
         self.assertIs(plan.participants[0], pin, "the same object, not a rebuilt copy")
@@ -125,7 +145,7 @@ class LegacyPositiveControlTest(unittest.TestCase):
 
     def test_an_empty_plan_is_legacy_and_touches_nothing(self) -> None:
         ports = _Ports()
-        plan = ports.planner().plan([])
+        plan = ports.planner().plan([], CONTEXT)
         self.assertEqual(plan.participants, ())
         self.assertEqual(plan.outcome, PLAN_LEGACY_UNCHANGED)
         self.assertEqual(ports.evidence_calls, 0)
@@ -134,19 +154,19 @@ class LegacyPositiveControlTest(unittest.TestCase):
 class ReceiptCapablePlanningTest(unittest.TestCase):
     def test_a_fully_agreeing_generation_is_planned_with_its_triplet(self) -> None:
         ports = _Ports(evidence=_evidence())
-        planned = ports.planner().plan([_pin()])
+        planned = ports.planner().plan([_pin()], CONTEXT)
         self.assertEqual(planned.outcome, PLAN_EVIDENCE_PINNED)
         pin = planned.participants[0]
         self.assertEqual(pin.evidence_workspace_id, "wA")
         self.assertEqual(pin.evidence_startup_action_id, ACTION)
-        self.assertEqual(pin.evidence_cause, "update_prompt_available")
+        self.assertEqual(pin.evidence_cause, CAUSE, "the typed launch cause, not the screen id")
 
     def test_every_existing_authority_on_the_input_pin_is_carried_across(self) -> None:
         ports = _Ports(evidence=_evidence())
         original = _pin(
             is_self=True, lane_revision=REV, lane_generation=GEN, phase="launch_owed"
         )
-        pin = ports.planner().plan([original]).participants[0]
+        pin = ports.planner().plan([original], CONTEXT).participants[0]
         for attr in (
             "lane_id", "role", "provider", "assigned_name", "old_locator",
             "is_self", "lane_revision", "lane_generation", "phase",
@@ -157,8 +177,8 @@ class ReceiptCapablePlanningTest(unittest.TestCase):
 
     def test_planning_is_deterministic_and_idempotent(self) -> None:
         ports = _Ports(evidence=_evidence())
-        once = ports.planner().plan([_pin()]).participants[0]
-        twice = ports.planner().plan([once]).participants[0]
+        once = ports.planner().plan([_pin()], CONTEXT).participants[0]
+        twice = ports.planner().plan([once], CONTEXT).participants[0]
         self.assertEqual(once, twice, "re-planning a correct pin reproduces it exactly")
 
 
@@ -167,7 +187,7 @@ class RefusalTest(unittest.TestCase):
 
     def _refuses(self, reason, ports, pin=None, capability=None):
         with self.assertRaises(EvidencePlanRefused) as ctx:
-            ports.planner(capability=capability).plan([pin or _pin()])
+            ports.planner(capability=capability).plan([pin or _pin()], CONTEXT)
         self.assertEqual(ctx.exception.reason, reason)
 
     def test_an_unclassifiable_action_is_never_treated_as_legacy(self) -> None:
@@ -186,7 +206,7 @@ class RefusalTest(unittest.TestCase):
         """There is no slot to look a generation up for."""
         planner = _Ports().planner()
         with self.assertRaises(EvidencePlanRefused) as ctx:
-            planner.plan([SimpleNamespace(assigned_name="  ", lane_id="l", role="r")])
+            planner.plan([SimpleNamespace(assigned_name="  ", lane_id="l", role="r")], CONTEXT)
         self.assertEqual(ctx.exception.reason, "generation_unavailable")
 
     def test_a_pending_generation_refuses(self) -> None:
@@ -218,6 +238,34 @@ class RefusalTest(unittest.TestCase):
         )
         self._refuses("lifecycle_mismatch", ports, pin=_pin(lane_revision="6"))
 
+    def test_a_receipt_capable_pin_without_a_lifecycle_pin_refuses(self) -> None:
+        """Audit j#97062 finding 2: an empty pin is not 'consistent with anything'."""
+        ports = _Ports(evidence=_evidence())
+        self._refuses("lifecycle_mismatch", ports, pin=_pin(lane_generation=""))
+        self._refuses("lifecycle_mismatch", ports, pin=_pin(lane_revision=""))
+
+    def test_a_foreign_generation_refuses(self) -> None:
+        """Audit j#97062 finding 1: workspace, assigned name and locator are compared."""
+        for label, generation in (
+            ("other workspace", _generation(workspace="wOTHER")),
+            ("other assigned name", _generation(assigned="mzb1_wA_codex_two")),
+            ("recycled locator", _generation(locator="wA:pOTHER")),
+        ):
+            with self.subTest(label=label):
+                self._refuses(
+                    "generation_mismatch", _Ports(generation=generation, evidence=_evidence())
+                )
+
+    def test_consumed_or_unbound_evidence_refuses(self) -> None:
+        """Audit j#97062 finding 3: consumed evidence must never re-arm a plan."""
+        self._refuses("evidence_not_bound", _Ports(evidence=_evidence(bound=False)))
+
+    def test_a_screen_that_is_not_update_derived_refuses(self) -> None:
+        """Audit j#97062 finding 4: a trust prompt is a blocker, not a launch cause."""
+        self._refuses(
+            "cause_not_update_derived", _Ports(evidence=_evidence(blocker="trust_dialog"))
+        )
+
     def test_absent_or_unreadable_evidence_refuses(self) -> None:
         self._refuses("evidence_unavailable", _Ports(evidence=None))
         self._refuses(
@@ -234,7 +282,7 @@ class RefusalTest(unittest.TestCase):
             _Ports(evidence=_evidence(assigned_name="mzb1_wA_codex_two")),
         )
         self._refuses("evidence_mismatch", _Ports(evidence=_evidence(provider="claude")))
-        self._refuses("evidence_mismatch", _Ports(evidence=_evidence(cause="")))
+        self._refuses("evidence_mismatch", _Ports(evidence=_evidence(blocker="")))
 
     def test_a_divergent_pre_existing_triplet_refuses(self) -> None:
         ports = _Ports(evidence=_evidence())
@@ -253,7 +301,7 @@ class RefusalTest(unittest.TestCase):
             pin=_pin(
                 evidence_workspace_id="wA",
                 evidence_startup_action_id=ACTION,
-                evidence_cause="update_in_progress",
+                evidence_cause="some_other_cause",
             ),
         )
 
@@ -266,9 +314,24 @@ class RefusalTest(unittest.TestCase):
             pin=_pin(
                 evidence_workspace_id="wA",
                 evidence_startup_action_id=ACTION,
-                evidence_cause="update_prompt_available",
+                evidence_cause=CAUSE,
             ),
         )
+
+
+class RefusalSafetyTest(unittest.TestCase):
+    """Audit j#97062 finding 5: a refusal is durable-record safe verbatim."""
+
+    def test_no_exception_text_or_host_path_reaches_the_refusal(self) -> None:
+        ports = _Ports(
+            evidence_error=OSError("/Users/secret/home/receipts.sqlite is unreadable")
+        )
+        with self.assertRaises(EvidencePlanRefused) as ctx:
+            ports.planner().plan([_pin()], CONTEXT)
+        message = str(ctx.exception)
+        self.assertEqual(ctx.exception.reason, "evidence_unavailable")
+        self.assertNotIn("/Users/", message)
+        self.assertNotIn("secret", message)
 
 
 if __name__ == "__main__":
