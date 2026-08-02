@@ -107,10 +107,18 @@ class _ManagerQuery:
 
 @dataclass(frozen=True)
 class _UpdateBinding:
-    """One provider's built-in update binding: which manager, and which package."""
+    """One provider's built-in update binding: which manager, which package, which bin.
+
+    ``bin_name`` is the key the package's own manifest maps to the executable this lane
+    runs. It is part of the binding rather than derived from the provider id because the
+    two are independent facts: a package may ship several bins, or one whose name differs
+    from the provider token, and guessing that mapping is exactly the kind of proxy
+    (j#95741 F2) this module exists to stop using.
+    """
 
     manager: str
     package: str
+    bin_name: str
 
 
 #: The closed manager registry. The argv is a literal here and nowhere else.
@@ -123,7 +131,7 @@ _BUILTIN_MANAGERS: dict[str, _ManagerQuery] = {
 
 #: The closed provider->update binding registry. Adding a provider is a source edit.
 _PROVIDER_UPDATE_BINDINGS: dict[str, _UpdateBinding] = {
-    "codex": _UpdateBinding(manager="npm", package="@openai/codex"),
+    "codex": _UpdateBinding(manager="npm", package="@openai/codex", bin_name="codex"),
 }
 
 #: Which of a provider's DECLARED startup blockers mean "an update is happening here".
@@ -235,6 +243,203 @@ def is_supported_provider(provider_id: str) -> bool:
     return str(provider_id or "").strip() in _PROVIDER_UPDATE_BINDINGS
 
 
+# --- Exact executable identity (Design Answer j#96872 item 2) ---------------------------
+
+#: A manifest larger than this is not the small `package.json` we are reading; refuse
+#: rather than parse an arbitrarily large file found at a path we expected a manifest at.
+MAX_MANIFEST_BYTES = 1_000_000
+#: A version longer than this is not a version. Bounded so a malformed manifest cannot put
+#: an unbounded string into a digest input.
+MAX_VERSION_LEN = 128
+
+#: The manifest could not be opened / read / decoded as a JSON object.
+REASON_MANIFEST_UNREADABLE = "manifest_unreadable"
+#: The manifest parsed, but its shape is not the strict one this resolver requires.
+REASON_MANIFEST_MALFORMED = "manifest_malformed"
+#: The manifest's own `name` is not the package this binding is about.
+REASON_PACKAGE_NAME_MISMATCH = "package_name_mismatch"
+#: No canonical, non-empty `version`.
+REASON_VERSION_UNUSABLE = "version_unusable"
+#: `bin` does not map this binding's bin name to a usable target inside the package.
+REASON_BIN_UNUSABLE = "bin_unusable"
+#: The managed exec target is not, exactly, the bin the updater's package owns.
+REASON_EXEC_TARGET_MISMATCH = "exec_target_mismatch"
+
+#: Digest scheme tag. Bumping it invalidates every stored receipt by construction, which is
+#: the intended behaviour if the identity definition ever changes.
+_IDENTITY_DIGEST_SCHEME = "mzb1"
+
+
+@dataclass(frozen=True)
+class ProviderIdentity:
+    """An exact provider executable identity, as an OPAQUE digest.
+
+    ``digest`` is non-empty only when ``resolved``. It is a one-way function of the exact
+    bin realpath AND the manifest version, so two identities compare equal iff both halves
+    are equal — and neither half can be recovered from it. That is deliberate: the whole
+    point of carrying an identity is to compare it and to store it, never to report it, and
+    a stored path is a stored path however carefully a caller promises not to print it
+    (Design Answer j#96872 item 2: "path/version/env は outcome・journal へ出さない").
+
+    ``reason`` is a fixed token, safe on a durable record.
+    """
+
+    digest: str = ""
+    resolved: bool = False
+    reason: str = REASON_PROVIDER_UNREGISTERED
+
+
+def _identity_digest(bin_realpath: str, version: str) -> str:
+    """The opaque identity token for one (exact bin, exact version) pair."""
+    import hashlib
+
+    # NUL-separated so no (path, version) pair can be re-spelled as another one by moving
+    # the boundary — a path may legally contain almost anything except NUL.
+    payload = f"{bin_realpath}\0{version}".encode("utf-8", "surrogatepass")
+    return f"{_IDENTITY_DIGEST_SCHEME}:{hashlib.sha256(payload).hexdigest()}"
+
+
+def _contained(child: str, parent: str) -> bool:
+    """True iff ``child`` is ``parent`` or sits under it (both already realpath-resolved).
+
+    Compared on the path-component boundary, so ``/a/bc`` is not read as being inside
+    ``/a/b`` — a prefix test would, and a sibling directory whose name merely starts with
+    the package's is precisely the confusion this containment check exists to prevent.
+    """
+    if child == parent:
+        return True
+    return child.startswith(parent.rstrip(os.sep) + os.sep)
+
+
+def _read_manifest(manifest_path: str) -> Tuple[Optional[dict], str]:
+    """Read + decode the manifest under strict bounds (never raises)."""
+    import json
+
+    try:
+        if not os.path.isfile(manifest_path):
+            # Deliberately `isfile`, so a directory / fifo / device at this path is not
+            # opened. A manifest is a regular file or it is not a manifest.
+            return (None, REASON_MANIFEST_UNREADABLE)
+        if os.path.getsize(manifest_path) > MAX_MANIFEST_BYTES:
+            return (None, REASON_MANIFEST_UNREADABLE)
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            document = json.load(handle)
+    except Exception:  # noqa: BLE001 - unreadable / undecodable / not utf-8 / not JSON
+        return (None, REASON_MANIFEST_UNREADABLE)
+    if not isinstance(document, dict):
+        return (None, REASON_MANIFEST_MALFORMED)
+    return (document, REASON_OK)
+
+
+def _manifest_version(document: dict) -> Tuple[str, str]:
+    """The canonical, bounded, non-empty ``version`` string, or a typed reason."""
+    version = document.get("version")
+    if not isinstance(version, str):
+        return ("", REASON_VERSION_UNUSABLE)
+    version = version.strip()
+    if not version or len(version) > MAX_VERSION_LEN:
+        return ("", REASON_VERSION_UNUSABLE)
+    if any(ch.isspace() or not ch.isprintable() for ch in version):
+        # Whitespace or a control character inside a version means the manifest is not
+        # saying what it appears to say. Refuse rather than normalise it into a digest.
+        return ("", REASON_VERSION_UNUSABLE)
+    return (version, REASON_OK)
+
+
+def _manifest_bin_target(document: dict, package_dir: str, bin_name: str) -> Tuple[str, str]:
+    """The exact realpath the manifest's ``bin`` maps ``bin_name`` to, or a typed reason.
+
+    ``bin`` may be a bare string (the single-bin form, which npm names after the package)
+    or an object. Both are accepted, and both must resolve to a REGULAR FILE inside the
+    package directory: a bin pointing outside its own package is not this package's
+    identity, whatever the manifest claims.
+    """
+    declared = document.get("bin")
+    if isinstance(declared, str):
+        # The single-bin form is named after the package's own (unscoped) name.
+        expected = str(document.get("name") or "").split("/")[-1]
+        if expected != bin_name:
+            return ("", REASON_BIN_UNUSABLE)
+        relative = declared
+    elif isinstance(declared, dict):
+        relative = declared.get(bin_name)
+    else:
+        return ("", REASON_BIN_UNUSABLE)
+    if not isinstance(relative, str) or not relative.strip():
+        return ("", REASON_BIN_UNUSABLE)
+    target = os.path.realpath(os.path.join(package_dir, relative.strip()))
+    if not _contained(target, package_dir) or not os.path.isfile(target):
+        return ("", REASON_BIN_UNUSABLE)
+    return (target, REASON_OK)
+
+
+def resolve_provider_identity(
+    provider_id: str,
+    env: Optional[Mapping[str, str]] = None,
+    *,
+    exec_target: str = "",
+    runner: Optional[Runner] = None,
+) -> ProviderIdentity:
+    """Resolve the exact identity of the executable ``provider_id``'s updater owns.
+
+    Design Answer j#96872 item 2, and the answer to "where does a version come from without
+    running the provider?". It comes from the package manager's own manifest: ``npm root
+    -g`` already tells us the global prefix, the package directory is inside it, and
+    ``package.json`` states the name, the version, and which file the bin is. Reading a
+    manifest is not executing a provider — no provider argv is ever built, nothing is
+    spawned but the manager's existing read-only ``root -g`` query, and there is no repo
+    script, plugin, or operator-supplied command anywhere in this path.
+
+    Resolves ONLY when every link corresponds: the manager answers, the package directory
+    is inside the answered root, the manifest is a small regular JSON object, its ``name``
+    is exactly this binding's package, its ``version`` is canonical and non-empty, its
+    ``bin`` maps this binding's bin name to a regular file inside the package, and — when
+    ``exec_target`` is supplied — that file is EXACTLY the realpath the managed launch
+    runs. Anything else is a typed refusal with an empty digest, which every caller must
+    treat as zero-actuation.
+
+    Passing no ``exec_target`` asks a different, legitimate question: "what does the
+    updater's package currently own?" — the *bound* half of the relaunch comparison
+    (j#96872 item 5). Passing one asks "is what I am about to launch that same thing?".
+    """
+    env = os.environ if env is None else env
+
+    binding = _PROVIDER_UPDATE_BINDINGS.get(str(provider_id or "").strip())
+    if binding is None:
+        return ProviderIdentity(reason=REASON_PROVIDER_UNREGISTERED)
+
+    # Reuse the SAME positively-resolved package directory the authority axis uses, so the
+    # two axes can never disagree about which install they are describing.
+    target = resolve_updater_target(provider_id, env, runner=runner)
+    if not target.resolved or not target.roots:
+        return ProviderIdentity(reason=target.reason)
+    package_dir = target.roots[0]
+
+    document, reason = _read_manifest(os.path.join(package_dir, "package.json"))
+    if document is None:
+        return ProviderIdentity(reason=reason)
+    if str(document.get("name") or "").strip() != binding.package:
+        return ProviderIdentity(reason=REASON_PACKAGE_NAME_MISMATCH)
+
+    version, reason = _manifest_version(document)
+    if not version:
+        return ProviderIdentity(reason=reason)
+
+    bin_target, reason = _manifest_bin_target(document, package_dir, binding.bin_name)
+    if not bin_target:
+        return ProviderIdentity(reason=reason)
+
+    if exec_target:
+        if os.path.realpath(str(exec_target).strip()) != bin_target:
+            # The managed launch runs a different file than the updater's package owns.
+            # This is the #14741 split, stated as an identity rather than as containment.
+            return ProviderIdentity(reason=REASON_EXEC_TARGET_MISMATCH)
+
+    return ProviderIdentity(
+        digest=_identity_digest(bin_target, version), resolved=True, reason=REASON_OK
+    )
+
+
 def is_update_derived_blocker(provider_id: str, blocker_id: str) -> bool:
     """True iff ``blocker_id`` is a screen that means ``provider_id`` is updating.
 
@@ -281,6 +486,16 @@ def builtin_updater_target_probe(
 
 
 __all__ = (
+    "MAX_MANIFEST_BYTES",
+    "MAX_VERSION_LEN",
+    "ProviderIdentity",
+    "REASON_BIN_UNUSABLE",
+    "REASON_EXEC_TARGET_MISMATCH",
+    "REASON_MANIFEST_MALFORMED",
+    "REASON_MANIFEST_UNREADABLE",
+    "REASON_PACKAGE_NAME_MISMATCH",
+    "REASON_VERSION_UNUSABLE",
+    "resolve_provider_identity",
     "QUERY_TIMEOUT_SECONDS",
     "REASON_IDENTITY_UNCORRESPONDED",
     "REASON_MANAGER_UNSUPPORTED",

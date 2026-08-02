@@ -1003,18 +1003,13 @@ class HerdrSublaneOpsTest(unittest.TestCase):
             herdr.read_text = self._UPDATE_PROMPT_RENDER
         return ops, home, worktree
 
-    def test_heal_refuses_an_update_relaunch_with_no_exact_generation_identity(self) -> None:
-        # Redmine #14741 clarification j#96847: `update_relaunch` must not arm on the cause
-        # alone. Even with an ALIGNED authority, a relaunch whose exact-generation
-        # executable identity is absent is refused — "we could not establish which binary
-        # this lane had been running" is an unproven generation, and the audit found that
-        # the previous cut passed it. Zero relaunch.
-        #
-        # This is the state the production heal is in today: the lane's workspace, lane id,
-        # provider, assigned name, launch generation, startup action and lifecycle revision
-        # are all establishable, but nothing durable records the executable realpath+version
-        # the generation ran, so the identity is absent and an observed update screen means
-        # zero relaunch until the operator clears it.
+    def test_heal_refuses_an_update_relaunch_it_cannot_identify(self) -> None:
+        # Redmine #14741 j#96847 / j#96872: `update_relaunch` must not arm on the cause
+        # alone. The updater's own package must be identifiable — an exact package dir with
+        # a strict manifest — before anything is restarted. Here the write root resolves but
+        # carries no readable `package.json`, so the install the updater owns cannot be
+        # established and the relaunch is refused. Zero relaunch, even though the authority
+        # containment alone would have looked aligned.
         from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter import (  # noqa: E501
             REASON_OK,
             UpdaterTargetResolution,
@@ -1035,11 +1030,11 @@ class HerdrSublaneOpsTest(unittest.TestCase):
                     with self.assertRaises(RuntimeError) as ctx:
                         ops.heal_lane_column(str(worktree))
         self.assertIn("relaunch_authority_refused", str(ctx.exception))
-        self.assertIn("exact-generation", str(ctx.exception))
+        self.assertIn("could not be established", str(ctx.exception))
         self.assertEqual(
             len(herdr.start_argvs),
             launches_before,
-            "an unproven generation must not be relaunched, even under an aligned authority",
+            "an unidentifiable install must not be relaunched",
         )
 
     def test_heal_without_an_observed_update_screen_consults_no_package_manager(self) -> None:

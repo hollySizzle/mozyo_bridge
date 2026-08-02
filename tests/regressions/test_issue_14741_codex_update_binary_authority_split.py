@@ -1333,6 +1333,200 @@ class QueryEnvironmentTest(unittest.TestCase):
             "global root than the one being evaluated (j#96360 F3)",
         )
 
+class ProviderIdentityResolverTest(unittest.TestCase):
+    """Design Answer j#96872 item 2: an exact identity from the manager's own manifest.
+
+    The question this closes is "where does a version come from without running the
+    provider?". It comes from `package.json` inside the directory `npm root -g` already
+    reports. Nothing here spawns a provider: the only subprocess shape is the fake runner
+    answering the one allowlisted `root -g` query, so these tests need no installed npm and
+    no installed Codex.
+    """
+
+    PACKAGE = "@openai/codex"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = os.path.realpath(self.tmp.name)
+        self.bindir = os.path.join(self.root, "bin")
+        os.makedirs(self.bindir, exist_ok=True)
+        npm = os.path.join(self.bindir, "npm")
+        with open(npm, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/sh\nexit 0\n")
+        os.chmod(npm, os.stat(npm).st_mode | stat.S_IXUSR)
+        self.env = {"PATH": self.bindir}
+        self.node_modules = os.path.join(self.root, "lib", "node_modules")
+        self.package_dir = os.path.join(self.node_modules, "@openai", "codex")
+        os.makedirs(self.package_dir, exist_ok=True)
+
+    def _runner(self):
+        def run(argv, **kwargs):
+            self.assertEqual(argv[1:], ["root", "-g"], "only the allowlisted query runs")
+            return types.SimpleNamespace(returncode=0, stdout=self.node_modules + "\n")
+
+        return run
+
+    def _write_manifest(self, document) -> None:
+        import json
+
+        with open(os.path.join(self.package_dir, "package.json"), "w", encoding="utf-8") as h:
+            json.dump(document, h)
+
+    def _write_bin(self, relative="bin/codex.js") -> str:
+        path = os.path.join(self.package_dir, relative)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("#!/usr/bin/env node\n")
+        return os.path.realpath(path)
+
+    def _resolve(self, exec_target=""):
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter import (  # noqa: E501
+            resolve_provider_identity,
+        )
+
+        return resolve_provider_identity(
+            "codex", self.env, exec_target=exec_target, runner=self._runner()
+        )
+
+    def _healthy(self, version="0.146.0"):
+        target = self._write_bin()
+        self._write_manifest(
+            {"name": self.PACKAGE, "version": version, "bin": {"codex": "bin/codex.js"}}
+        )
+        return target
+
+    def test_a_fully_corresponding_install_resolves_an_opaque_digest(self) -> None:
+        target = self._healthy()
+        identity = self._resolve(exec_target=target)
+        self.assertTrue(identity.resolved, identity.reason)
+        self.assertTrue(identity.digest)
+        # Opaque: neither half may be recoverable from the token (j#96872 item 2 forbids
+        # a path or a version reaching an outcome or a journal, and a digest that embedded
+        # them would make every stored receipt a stored path).
+        self.assertNotIn(target, identity.digest)
+        self.assertNotIn("0.146.0", identity.digest)
+
+    def test_the_same_install_resolves_the_same_digest_and_a_new_version_a_new_one(self):
+        target = self._healthy(version="0.146.0")
+        first = self._resolve(exec_target=target)
+        second = self._resolve(exec_target=target)
+        self.assertEqual(first.digest, second.digest, "identity must be stable")
+        self._write_manifest(
+            {"name": self.PACKAGE, "version": "0.147.0", "bin": {"codex": "bin/codex.js"}}
+        )
+        advanced = self._resolve(exec_target=target)
+        self.assertTrue(advanced.resolved, advanced.reason)
+        self.assertNotEqual(
+            first.digest, advanced.digest, "an in-place version advance is a new identity"
+        )
+
+    def test_a_managed_exec_target_that_is_not_the_package_bin_is_refused(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter import (  # noqa: E501
+            REASON_EXEC_TARGET_MISMATCH,
+        )
+
+        self._healthy()
+        other = _make_executable(os.path.join(self.root, "other"), name="codex")
+        identity = self._resolve(exec_target=other)
+        self.assertFalse(identity.resolved)
+        self.assertEqual(identity.reason, REASON_EXEC_TARGET_MISMATCH)
+        self.assertEqual(identity.digest, "")
+
+    def test_no_exec_target_asks_what_the_updater_owns(self) -> None:
+        """The BOUND half of j#96872 item 5 — a legitimate, different question."""
+        target = self._healthy()
+        owned = self._resolve()
+        self.assertTrue(owned.resolved, owned.reason)
+        self.assertEqual(owned.digest, self._resolve(exec_target=target).digest)
+
+    def test_every_broken_manifest_shape_is_a_typed_refusal(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter import (  # noqa: E501
+            REASON_BIN_UNUSABLE,
+            REASON_MANIFEST_MALFORMED,
+            REASON_MANIFEST_UNREADABLE,
+            REASON_PACKAGE_NAME_MISMATCH,
+            REASON_VERSION_UNUSABLE,
+        )
+
+        target = self._write_bin()
+        manifest = os.path.join(self.package_dir, "package.json")
+
+        # Absent.
+        self.assertEqual(self._resolve(exec_target=target).reason, REASON_MANIFEST_UNREADABLE)
+        # Not JSON.
+        with open(manifest, "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        self.assertEqual(self._resolve(exec_target=target).reason, REASON_MANIFEST_UNREADABLE)
+        # JSON, but not an object.
+        with open(manifest, "w", encoding="utf-8") as handle:
+            handle.write("[1, 2]")
+        self.assertEqual(self._resolve(exec_target=target).reason, REASON_MANIFEST_MALFORMED)
+
+        for document, expected in (
+            ({"name": "@evil/codex", "version": "1.0.0", "bin": {"codex": "bin/codex.js"}},
+             REASON_PACKAGE_NAME_MISMATCH),
+            ({"name": self.PACKAGE, "bin": {"codex": "bin/codex.js"}},
+             REASON_VERSION_UNUSABLE),
+            ({"name": self.PACKAGE, "version": "  ", "bin": {"codex": "bin/codex.js"}},
+             REASON_VERSION_UNUSABLE),
+            ({"name": self.PACKAGE, "version": "1.0 .0", "bin": {"codex": "bin/codex.js"}},
+             REASON_VERSION_UNUSABLE),
+            ({"name": self.PACKAGE, "version": "1.0.0"},
+             REASON_BIN_UNUSABLE),
+            ({"name": self.PACKAGE, "version": "1.0.0", "bin": {"other": "bin/codex.js"}},
+             REASON_BIN_UNUSABLE),
+            ({"name": self.PACKAGE, "version": "1.0.0", "bin": {"codex": "   "}},
+             REASON_BIN_UNUSABLE),
+            ({"name": self.PACKAGE, "version": "1.0.0", "bin": {"codex": "bin/absent.js"}},
+             REASON_BIN_UNUSABLE),
+        ):
+            with self.subTest(expected=expected):
+                self._write_manifest(document)
+                identity = self._resolve(exec_target=target)
+                self.assertFalse(identity.resolved)
+                self.assertEqual(identity.reason, expected)
+                self.assertEqual(identity.digest, "")
+
+    def test_a_bin_pointing_outside_its_own_package_is_refused(self) -> None:
+        """A manifest cannot claim a file it does not contain as this package's identity."""
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter import (  # noqa: E501
+            REASON_BIN_UNUSABLE,
+        )
+
+        outside = _make_executable(os.path.join(self.root, "elsewhere"), name="codex")
+        self._write_manifest(
+            {"name": self.PACKAGE, "version": "1.0.0", "bin": {"codex": "../../../elsewhere/codex"}}
+        )
+        identity = self._resolve(exec_target=outside)
+        self.assertFalse(identity.resolved)
+        self.assertEqual(identity.reason, REASON_BIN_UNUSABLE)
+
+    def test_an_oversized_manifest_is_never_parsed(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter import (  # noqa: E501
+            MAX_MANIFEST_BYTES,
+            REASON_MANIFEST_UNREADABLE,
+        )
+
+        target = self._write_bin()
+        with open(os.path.join(self.package_dir, "package.json"), "w", encoding="utf-8") as h:
+            h.write(" " * (MAX_MANIFEST_BYTES + 1))
+        self.assertEqual(self._resolve(exec_target=target).reason, REASON_MANIFEST_UNREADABLE)
+
+    def test_an_unregistered_provider_never_reaches_the_filesystem(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter import (  # noqa: E501
+            REASON_PROVIDER_UNREGISTERED,
+            resolve_provider_identity,
+        )
+
+        def explode(*a, **k):  # pragma: no cover - must never run
+            raise AssertionError("an unregistered provider must not run any query")
+
+        identity = resolve_provider_identity("claude", self.env, runner=explode)
+        self.assertFalse(identity.resolved)
+        self.assertEqual(identity.reason, REASON_PROVIDER_UNREGISTERED)
+
+
 class UpdateDerivedBlockerRegistryTest(unittest.TestCase):
     """The provider-specific "which screen means an update" registry (j#96374 item 2)."""
 
@@ -1414,7 +1608,12 @@ class UpdateDerivedBlockerRegistryTest(unittest.TestCase):
 
 
 class RelaunchAuthorityFenceTest(unittest.TestCase):
-    """The relaunch fence's own contract (j#96374 items 1-2, clarification j#96847)."""
+    """The relaunch fence under the corrected identity semantics (j#96872 item 5).
+
+    The identity resolver is injected, so nothing here needs npm, a global prefix, or an
+    installed Codex — but the resolver's REAL contract is exercised separately in
+    `ProviderIdentityResolverTest`, so this is not a fake standing in for an untested one.
+    """
 
     _UPDATE = [("codex", "update_prompt_available")]
 
@@ -1425,164 +1624,158 @@ class RelaunchAuthorityFenceTest(unittest.TestCase):
 
         return evaluate_relaunch_authority
 
-    def test_an_unobserved_relaunch_resolves_nothing_at_all(self) -> None:
-        """Q1: a heal nobody tied to an update must not consult a package manager."""
-        consulted: list = []
+    def _identity(self, digest="", resolved=False, reason="unknown"):
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter import (  # noqa: E501
+            ProviderIdentity,
+        )
 
+        return ProviderIdentity(digest=digest, resolved=resolved, reason=reason)
+
+    def _resolver(self, owned, launched=None, record=None):
+        """`owned` answers the bound question; `launched` the observed one."""
+
+        def resolve(provider_id, env=None, *, exec_target="", **kw):
+            if record is not None:
+                record.append((provider_id, exec_target))
+            if exec_target:
+                return owned if launched is None else launched
+            return owned
+
+        return resolve
+
+    def test_an_unobserved_relaunch_resolves_nothing_at_all(self) -> None:
+        """Q1: a heal nobody tied to an update opens no manifest and runs no query."""
+        record = []
         verdict = self._fence()(
             ["codex"],
             {},
             observations=[],
-            registry=_fake_profile_registry(),
-            updater_targets=lambda pid: consulted.append(pid) or ((), False),
+            identity_resolver=self._resolver(self._identity(), record=record),
+            exec_target_resolver=lambda *a: "/does/not/matter",
         )
         self.assertTrue(verdict.ok)
         self.assertEqual(verdict.launch_cause, "generic_fresh")
-        self.assertEqual(consulted, [], "an unarmed relaunch resolves nothing")
+        self.assertEqual(record, [], "an unarmed relaunch resolves no identity")
 
-    def test_aligned_with_an_exact_identity_admits_the_relaunch(self) -> None:
-        """The fence is not a blanket block: a proven, aligned generation relaunches."""
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        bindir = os.path.join(tmp.name, "bin")
-        pinned = _make_executable(bindir)
-        identity = executable_identity(pinned, "0.146.0")
-
+    def test_an_aligned_identity_admits_exactly_the_update_target(self) -> None:
+        record = []
+        aligned = self._identity(digest="mzb1:same", resolved=True, reason="resolved")
         verdict = self._fence()(
-            ["fakex"],
-            {"PATH": bindir, "MOZYO_AGENT_FAKEX_BINARY": pinned},
+            ["codex", "claude"],
+            {},
             observations=self._UPDATE,
-            registry=_fake_profile_registry(),
-            updater_targets=lambda pid: ([bindir], True),
-            bound_identities={"fakex": identity},
-            observed_identities={"fakex": identity},
+            identity_resolver=self._resolver(aligned, record=record),
+            exec_target_resolver=lambda *a: "/pkg/bin/codex.js",
         )
         self.assertTrue(verdict.ok, verdict.detail)
         self.assertEqual(verdict.launch_cause, "update_relaunch")
         self.assertEqual(verdict.reason, "relaunch_authority_aligned")
+        # Mixed plan: ONLY the provider the screen condemned was evaluated.
+        self.assertEqual({pid for pid, _ in record}, {"codex"})
 
-    def test_a_missing_exact_identity_refuses_even_when_aligned(self) -> None:
-        """j#96847: the cause alone must not arm — an unproven generation is zero-relaunch."""
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        bindir = os.path.join(tmp.name, "bin")
-        pinned = _make_executable(bindir)
-        env = {"PATH": bindir, "MOZYO_AGENT_FAKEX_BINARY": pinned}
+    def test_a_version_advance_on_the_same_aligned_path_still_relaunches(self) -> None:
+        """j#96872 item 5's whole point: an in-place update must not be a permanent drift.
 
-        for bound, observed in (
-            ({}, {}),
-            ({"fakex": executable_identity(pinned, "0.146.0")}, {}),
-            ({}, {"fakex": executable_identity(pinned, "0.146.0")}),
-            ({"fakex": "   "}, {"fakex": executable_identity(pinned, "0.146.0")}),
-        ):
-            with self.subTest(bound=bool(bound), observed=bool(observed)):
-                verdict = self._fence()(
-                    ["fakex"],
-                    env,
-                    observations=self._UPDATE,
-                    registry=_fake_profile_registry(),
-            updater_targets=lambda pid: ([bindir], True),
-                    bound_identities=bound,
-                    observed_identities=observed,
-                )
-                self.assertFalse(verdict.ok)
-                self.assertIn("exact-generation", verdict.detail)
-
-    def test_a_drifted_identity_refuses_on_path_and_on_version(self) -> None:
-        """An update rewrote what the lane runs: relaunching would inherit a stale pin."""
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        bindir = os.path.join(tmp.name, "bin")
-        pinned = _make_executable(bindir)
-        other = _make_executable(os.path.join(tmp.name, "other"), name="fakex")
-        env = {"PATH": bindir, "MOZYO_AGENT_FAKEX_BINARY": pinned}
-
-        # Version drift: same file, new build (the in-place package-manager rewrite).
-        version_drift = self._fence()(
-            ["fakex"],
-            env,
-            observations=self._UPDATE,
-            registry=_fake_profile_registry(),
-            updater_targets=lambda pid: ([bindir], True),
-            bound_identities={"fakex": executable_identity(pinned, "0.145.0")},
-            observed_identities={"fakex": executable_identity(pinned, "0.146.0")},
-        )
-        self.assertFalse(version_drift.ok)
-        self.assertIn("drifted", version_drift.detail)
-
-        # Path drift: same version, different install (the authority split's twin).
-        path_drift = self._fence()(
-            ["fakex"],
-            env,
-            observations=self._UPDATE,
-            registry=_fake_profile_registry(),
-            updater_targets=lambda pid: ([bindir], True),
-            bound_identities={"fakex": executable_identity(pinned, "0.146.0")},
-            observed_identities={"fakex": executable_identity(other, "0.146.0")},
-        )
-        self.assertFalse(path_drift.ok)
-        self.assertIn("drifted", path_drift.detail)
-
-        # A same-version reinstall at the same path is a MATCH, not a drift.
-        same = executable_identity(pinned, "0.146.0")
-        reinstall = self._fence()(
-            ["fakex"],
-            env,
-            observations=self._UPDATE,
-            registry=_fake_profile_registry(),
-            updater_targets=lambda pid: ([bindir], True),
-            bound_identities={"fakex": same},
-            observed_identities={"fakex": same},
-        )
-        self.assertTrue(reinstall.ok, reinstall.detail)
-
-    def test_a_split_authority_refuses_with_a_proven_identity(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        bindir = os.path.join(tmp.name, "bin")
-        pinned = _make_executable(bindir)
-        identity = executable_identity(pinned, "0.146.0")
-        elsewhere = os.path.join(tmp.name, "other-prefix")
-        os.makedirs(elsewhere, exist_ok=True)
-
-        verdict = self._fence()(
-            ["fakex"],
-            {"PATH": bindir, "MOZYO_AGENT_FAKEX_BINARY": pinned},
-            observations=self._UPDATE,
-            registry=_fake_profile_registry(),
-            updater_targets=lambda pid: ([elsewhere], True),
-            bound_identities={"fakex": identity},
-            observed_identities={"fakex": identity},
-        )
-        self.assertFalse(verdict.ok)
-        self.assertIn("split", verdict.detail)
-
-    def test_an_unbound_sibling_never_refuses_on_a_bound_provider_s_behalf(self) -> None:
-        """D2 item 1, one layer down: a lane pair is (codex, claude).
-
-        The resolver answers ``None`` for an unbound provider, and handing that straight to
-        the classifier reads as a failed probe -> ``unknown`` -> refuse. That would let
-        codex's update screen refuse the relaunch on CLAUDE's unbound authority, which is
-        the R3 shape that refused every Claude send on every host.
+        The lane ran 0.146.0 and the operator let the update run; the package now owns
+        0.147.0 at the same path. Comparing the old generation's digest against the new one
+        would call that `drifted` and refuse the relaunch forever — turning the fence into
+        an outage precisely when the operator did the right thing. The bound/observed pair
+        is resolved fresh, so the new version is simply the new identity, and it aligns.
         """
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        bindir = os.path.join(tmp.name, "bin")
-        pinned = _make_executable(bindir)
-        identity = executable_identity(pinned, "0.146.0")
-
+        advanced = self._identity(digest="mzb1:v147", resolved=True, reason="resolved")
         verdict = self._fence()(
-            ["fakex", "claude"],
-            {"PATH": bindir, "MOZYO_AGENT_FAKEX_BINARY": pinned},
+            ["codex"],
+            {},
             observations=self._UPDATE,
-            # Scoped exactly like the production resolver: bound provider answers, the
-            # unbound one answers None.
-            registry=_fake_profile_registry(),
-            updater_targets=lambda pid: ([bindir], True) if pid == "fakex" else None,
-            bound_identities={"fakex": identity},
-            observed_identities={"fakex": identity},
+            identity_resolver=self._resolver(advanced),
+            exec_target_resolver=lambda *a: "/pkg/bin/codex.js",
         )
         self.assertTrue(verdict.ok, verdict.detail)
+        # And a same-version reinstall is likewise a match, not a drift.
+        same = self._identity(digest="mzb1:v146", resolved=True, reason="resolved")
+        self.assertTrue(
+            self._fence()(
+                ["codex"],
+                {},
+                observations=self._UPDATE,
+                identity_resolver=self._resolver(same),
+                exec_target_resolver=lambda *a: "/pkg/bin/codex.js",
+            ).ok
+        )
+
+    def test_a_lane_running_a_file_the_updater_does_not_own_is_refused(self) -> None:
+        """The measured #14741 split, now stated as an identity mismatch."""
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter import (  # noqa: E501
+            REASON_EXEC_TARGET_MISMATCH,
+        )
+
+        owned = self._identity(digest="mzb1:owned", resolved=True, reason="resolved")
+        verdict = self._fence()(
+            ["codex"],
+            {},
+            observations=self._UPDATE,
+            identity_resolver=self._resolver(
+                owned, launched=self._identity(reason=REASON_EXEC_TARGET_MISMATCH)
+            ),
+            exec_target_resolver=lambda *a: "/somewhere/else/codex",
+        )
+        self.assertFalse(verdict.ok)
+        self.assertIn(REASON_EXEC_TARGET_MISMATCH, verdict.detail)
+
+    def test_an_unresolvable_bound_identity_is_zero_relaunch(self) -> None:
+        verdict = self._fence()(
+            ["codex"],
+            {},
+            observations=self._UPDATE,
+            identity_resolver=self._resolver(self._identity(reason="query_failed")),
+            exec_target_resolver=lambda *a: "/pkg/bin/codex.js",
+        )
+        self.assertFalse(verdict.ok)
+        self.assertIn("query_failed", verdict.detail)
+
+    def test_an_unresolvable_managed_target_is_zero_relaunch(self) -> None:
+        owned = self._identity(digest="mzb1:owned", resolved=True, reason="resolved")
+        verdict = self._fence()(
+            ["codex"],
+            {},
+            observations=self._UPDATE,
+            identity_resolver=self._resolver(owned),
+            exec_target_resolver=lambda *a: "",
+        )
+        self.assertFalse(verdict.ok)
+        self.assertIn("managed launch target", verdict.detail)
+
+    def test_a_screen_on_a_slot_this_relaunch_is_not_starting_is_out_of_scope(self) -> None:
+        record = []
+        verdict = self._fence()(
+            ["claude"],  # codex is not in this plan
+            {},
+            observations=self._UPDATE,
+            identity_resolver=self._resolver(self._identity(), record=record),
+            exec_target_resolver=lambda *a: "/pkg/bin/codex.js",
+        )
+        self.assertTrue(verdict.ok, verdict.detail)
+        self.assertEqual(record, [])
+
+    def test_the_verdict_never_carries_a_path_or_a_version(self) -> None:
+        """Fixed tokens only — the verdict is durable-record safe (j#96872 item 2)."""
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter import (  # noqa: E501
+            REASON_EXEC_TARGET_MISMATCH,
+        )
+
+        owned = self._identity(digest="mzb1:owned", resolved=True, reason="resolved")
+        verdict = self._fence()(
+            ["codex"],
+            {},
+            observations=self._UPDATE,
+            identity_resolver=self._resolver(
+                owned, launched=self._identity(reason=REASON_EXEC_TARGET_MISMATCH)
+            ),
+            exec_target_resolver=lambda *a: "/private/secret/path/codex",
+        )
+        self.assertFalse(verdict.ok)
+        self.assertNotIn("/private/secret/path", verdict.detail)
+        self.assertNotIn("mzb1:owned", verdict.detail)
 
 
 class RetiredPlaceholderTest(unittest.TestCase):

@@ -52,10 +52,6 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.age
     LAUNCH_CAUSE_GENERIC_FRESH,
     LAUNCH_CAUSE_UPDATE_RELAUNCH,
     launch_cause_for_observed_blockers,
-    launch_updater_target_resolver,
-)
-from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_update_authority_preflight import (  # noqa: E501
-    evaluate_update_authority,
 )
 
 #: The heal was not tied to a provider update, so this fence does not apply. The
@@ -128,123 +124,140 @@ def evaluate_relaunch_authority(
     env: Optional[Mapping[str, str]] = None,
     *,
     observations: Sequence[Any] = (),
-    updater_targets: Optional[Callable[[str], Any]] = None,
-    bound_identities: Optional[Mapping[str, str]] = None,
-    observed_identities: Optional[Mapping[str, str]] = None,
+    identity_resolver: Optional[Callable[..., Any]] = None,
+    exec_target_resolver: Optional[Callable[..., str]] = None,
     registry: Optional[Any] = None,
 ) -> RelaunchAuthorityVerdict:
     """Decide whether an update-caused relaunch of ``providers`` may proceed (never raises).
 
-    ``observations`` are the ``(provider_id, blocker_id)`` facts
-    :func:`observe_lane_update_screens` read. With none of them update-derived the cause is
-    ``generic_fresh`` and this returns admitted **without resolving anything** — no package
-    manager is consulted, which is what keeps an ordinary heal byte-invariant and hermetic.
+    ``observations`` are the ``(provider_id, blocker_id)`` facts an evidence producer read.
+    With none of them update-derived the cause is ``generic_fresh`` and this returns
+    admitted **without resolving anything** — no package manager is consulted and no
+    manifest is opened, which is what keeps an ordinary heal byte-invariant and hermetic.
 
-    ``updater_targets`` overrides the resolver (tests, and any caller arming deliberately);
-    by default the built-in one is composed for the plan, and a plan with no provider
-    carrying a trusted updater binding resolves to ``None`` — those providers stay
-    ``not_evaluated`` and admit, per D2 j#96288 item 1. An unbound provider is out of this
-    ticket's scope even under ``update_relaunch``; it is never promoted to ``unknown``,
-    which is what refused every Claude send on every host in R3.
+    Only the providers an observation actually condemns are evaluated (j#96872: mixed
+    plans scope to the update target). A sibling in the same lane is untouched, because a
+    screen on one slot says nothing about the other — evaluating it is the R3 shape that
+    refused every Claude send.
 
-    ``bound_identities`` / ``observed_identities`` are
-    :func:`...agent_provider_update_authority_preflight.executable_identity` tokens keyed by
-    provider — ``<realpath>@<version>``, the exact-generation executable identity.
+    The two identities, and why they are BOTH resolved here rather than supplied
+    (Design Answer j#96872 item 5)
+    ------------------------------------------------------------------------------
+    - **bound** — the exact package bin realpath + manifest version the updater target
+      *currently owns*;
+    - **observed** — the exact exec realpath + that same manifest's version the managed
+      resolver is *about to launch*.
 
-    **Under ``update_relaunch`` both are REQUIRED** (clarification j#96847). An independent
-    audit found the previous cut's hole: the typed cause alone armed the fence, so an armed
-    relaunch whose identity was simply *absent* still passed on the authority axis, and a
-    lane could be restarted with nothing at all known about which binary it had been running.
-    A missing / blank identity on either side is therefore not "the axis was not armed" here
-    — it is an unproven generation, and it refuses. The asymmetry with the caller-optional
-    axis elsewhere is deliberate: an update-derived relaunch is precisely the moment the
-    identity matters, so it is the one moment its absence cannot be waived.
+    A relaunch is admitted only when both resolve and are equal. Note what this deliberately
+    does NOT do: it never compares a *stored* identity from the old generation against the
+    new one. The previous cut did, and it was wrong in a way that would have been ugly in
+    production — a provider that updated in place gets a new version, so a pre/post equality
+    test reads every legitimate update as ``drifted`` and refuses the relaunch **forever**,
+    turning the fence into a permanent outage exactly when the operator has done the right
+    thing. The old generation's digest is *provenance* — which process showed the update
+    screen — and it is used as provenance only.
 
-    A drifted identity refuses for the same reason (path OR version): a relaunch would
-    inherit a pin that no longer describes what it starts. A same-version reinstall at the
-    same realpath is a MATCH, not a drift — nothing this lane runs changed.
+    So a version advance on the same aligned path relaunches on the new version, and a
+    same-version reinstall matches. What still refuses is what should: the managed lane
+    running a file the updater's package does not own (the #14741 split), a manifest that
+    cannot be corresponded (unknown), and any unresolved half.
     """
+    from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_launch_composition import (  # noqa: E501
+        update_derived_providers,
+    )
+
     cause = launch_cause_for_observed_blockers(observations)
     if cause != LAUNCH_CAUSE_UPDATE_RELAUNCH:
         return RelaunchAuthorityVerdict(
             ok=True,
             reason=RELAUNCH_NOT_EVALUATED,
             detail=(
-                "no update-derived startup screen was observed on this lane, so the "
-                "relaunch is not tied to a provider update and the update-authority "
-                "fence does not apply to it"
+                "no update-derived evidence applies to this relaunch, so it is not tied "
+                "to a provider update and the update-authority fence does not apply"
             ),
             launch_cause=cause,
         )
 
-    resolver = (
-        launch_updater_target_resolver(providers)
-        if updater_targets is None
-        else updater_targets
-    )
-    for provider in providers or ():
-        per_provider = resolver(provider) if callable(resolver) else None
-        if per_provider is None:
-            # D2 j#96288 item 1, and the one ordering that has to be got right here. The
-            # plan-wide resolver answers ``None`` for a provider with no trusted updater
-            # binding, and that must SKIP the evaluation — not be handed to the classifier,
-            # which reads a probe returning ``None`` as a failed probe and answers
-            # ``unknown``, i.e. refuses. A lane is a (codex, claude) pair, so passing the
-            # resolver straight through would have let codex's update screen refuse the
-            # relaunch on CLAUDE's unbound authority: the R3 shape that refused every
-            # Claude send on every host, rebuilt one layer down. The launch preflight
-            # (:func:`...agent_provider_executable.preflight_launch_providers`) applies the
-            # same skip for the same reason; both are tested separately so neither masks
-            # the other's loss.
+    resolve_identity = identity_resolver
+    if resolve_identity is None:
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter import (  # noqa: E501
+            resolve_provider_identity as resolve_identity,
+        )
+    resolve_exec = exec_target_resolver
+    if resolve_exec is None:
+        resolve_exec = _managed_exec_target
+
+    in_plan = tuple(providers or ())
+    for provider in update_derived_providers(observations):
+        if provider not in in_plan:
+            # The screen was read on a slot this relaunch is not starting. Out of scope.
             continue
-        # Exact-generation identity is mandatory once armed (j#96847). Checked BEFORE the
-        # authority classifier, because "we do not know which binary this lane was running"
-        # is a stronger and earlier defect than anything the authority axis can report, and
-        # reporting an authority verdict for an unidentified generation would be answering
-        # a different question than the one asked. Scoped per provider, so a bound provider
-        # missing its identity never refuses on an unbound sibling's behalf.
-        bound = str((bound_identities or {}).get(provider, "") or "").strip()
-        observed = str((observed_identities or {}).get(provider, "") or "").strip()
-        if not bound or not observed:
-            return RelaunchAuthorityVerdict(
-                ok=False,
-                reason=RELAUNCH_AUTHORITY_REFUSED,
-                detail=(
-                    f"provider {provider} update-derived relaunch has no exact-generation "
-                    f"executable identity (bound={'present' if bound else 'absent'}, "
-                    f"observed={'present' if observed else 'absent'}); an update-caused "
-                    "relaunch is not admitted on an unproven generation"
-                ),
-                launch_cause=cause,
+
+        bound = resolve_identity(provider, env)
+        if not getattr(bound, "resolved", False):
+            return _refuse(
+                provider,
+                cause,
+                f"the install its own updater owns could not be established "
+                f"({getattr(bound, 'reason', 'unknown')})",
             )
-        authority = evaluate_update_authority(
-            provider,
-            env,
-            registry=registry,
-            updater_targets=lambda _pid, _r=per_provider: _r,
-            bound_identity=bound,
-            observed_identity=observed,
-        )
-        if authority.admits_actuation:
-            continue
-        return RelaunchAuthorityVerdict(
-            ok=False,
-            reason=RELAUNCH_AUTHORITY_REFUSED,
-            detail=(
-                f"provider {authority.provider} update authority="
-                f"{authority.authority}, executable binding={authority.binding}; "
-                "restarting it would start the same binary the update could not reach"
-            ),
-            launch_cause=cause,
-        )
+
+        exec_target = resolve_exec(provider, env, registry)
+        if not exec_target:
+            return _refuse(
+                provider, cause, "the managed launch target could not be resolved"
+            )
+
+        observed = resolve_identity(provider, env, exec_target=exec_target)
+        if not getattr(observed, "resolved", False):
+            return _refuse(
+                provider,
+                cause,
+                f"what this lane would launch is not the install its updater owns "
+                f"({getattr(observed, 'reason', 'unknown')})",
+            )
+        if observed.digest != bound.digest:
+            # Defence in depth: an exec target matching the package bin already forces the
+            # digests equal, so a difference here means the two resolutions disagreed
+            # between calls (a concurrent install). Refuse rather than pick one.
+            return _refuse(
+                provider, cause, "the install changed while it was being evaluated"
+            )
+
     return RelaunchAuthorityVerdict(
         ok=True,
         reason=RELAUNCH_AUTHORITY_ALIGNED,
         detail=(
-            "every bound provider in the plan runs the install its own updater writes to"
+            "the update-target provider will launch exactly the executable its own "
+            "updater owns, at that package's stated version"
         ),
         launch_cause=cause,
     )
+
+
+def _refuse(provider: str, cause: str, why: str) -> RelaunchAuthorityVerdict:
+    """One refusal shape. Fixed tokens plus a fixed clause — no path, version, or env."""
+    return RelaunchAuthorityVerdict(
+        ok=False,
+        reason=RELAUNCH_AUTHORITY_REFUSED,
+        detail=f"provider {provider}: {why}; refusing to relaunch it",
+        launch_cause=cause,
+    )
+
+
+def _managed_exec_target(provider: str, env, registry) -> str:
+    """The realpath the managed launch would run, or ``""`` when it cannot be resolved."""
+    from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_executable import (  # noqa: E501
+        AgentProviderProfileError,
+        resolve_agent_launch,
+    )
+
+    try:
+        return resolve_agent_launch(provider, env, registry=registry).exec_target
+    except AgentProviderProfileError:
+        # Includes the executable-resolution failures. This classifier runs beside the
+        # launch resolver's own fail-closed raise, so it reports rather than raises.
+        return ""
 
 
 def fence_update_relaunch_or_die(
@@ -254,8 +267,7 @@ def fence_update_relaunch_or_die(
     slots: Optional[Mapping[str, Any]] = None,
     read_visible_factory: Callable[[], Callable[[str], object]],
     registry: Optional[Any] = None,
-    bound_identities: Optional[Mapping[str, str]] = None,
-    observed_identities: Optional[Mapping[str, str]] = None,
+    identity_resolver: Optional[Callable[..., Any]] = None,
 ) -> None:
     """Observe, decide, and refuse a relaunch the lane may not have — or return.
 
@@ -293,8 +305,7 @@ def fence_update_relaunch_or_die(
         env,
         observations=observations,
         registry=registry,
-        bound_identities=bound_identities,
-        observed_identities=observed_identities,
+        identity_resolver=identity_resolver,
     )
     if verdict.ok:
         return

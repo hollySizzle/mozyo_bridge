@@ -86,6 +86,25 @@ def launch_cause_for_observed_blockers(
     return LAUNCH_CAUSE_GENERIC_FRESH
 
 
+def update_derived_providers(observations: Sequence[Any]) -> "tuple[str, ...]":
+    """Which providers an observation actually condemns (pure, total, order-preserving).
+
+    The relaunch fence evaluates ONLY these (Design Answer j#96872: "mixed provider では
+    update 対象 provider だけを評価"). A lane is a pair, and a screen on one slot is not a
+    statement about the other: evaluating the sibling would let one provider's update
+    refuse a relaunch on facts that have nothing to do with it — the R3 shape.
+    """
+    seen: list[str] = []
+    for observation in observations or ():
+        try:
+            provider_id, blocker_id = observation
+        except (TypeError, ValueError):
+            continue
+        if is_update_derived_blocker(provider_id, blocker_id) and provider_id not in seen:
+            seen.append(provider_id)
+    return tuple(seen)
+
+
 def launch_updater_target_resolver(
     providers: Sequence[str],
 ) -> Optional[Callable[[str], Any]]:
@@ -158,5 +177,6 @@ __all__ = (
     "ResolvedProviderLaunch",
     "launch_cause_for_observed_blockers",
     "launch_updater_target_resolver",
+    "update_derived_providers",
     "preflight_launch_providers",
 )
