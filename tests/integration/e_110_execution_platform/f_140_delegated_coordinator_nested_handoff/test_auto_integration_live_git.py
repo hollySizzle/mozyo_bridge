@@ -683,6 +683,14 @@ class DeterministicMergeCommitTest(unittest.TestCase):
         The injection is now at the seam the real failure uses: ``_rmtree``, reached after the
         detach, which is what makes a production leak permanent. So the directory genuinely
         survives, and the test says so by looking for it after ``apply_merge`` has returned.
+
+        The save and restore go through ``__dict__``. R19 read the attribute off the class,
+        which invokes the ``classmethod`` descriptor and hands back a *bound method*; putting
+        that back left ``TemporaryDirectory.__dict__['_rmtree']`` a ``method`` where it had
+        been a ``classmethod`` — process-global standard-library state, altered for every test
+        that ran afterwards (j#96492 finding 1). The restoration is asserted, so a patch that
+        does not put the class back exactly as it found it fails here rather than in whatever
+        test happens to run next.
         """
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
@@ -693,7 +701,8 @@ class DeterministicMergeCommitTest(unittest.TestCase):
             _git(repo, "checkout", "-q", "main")
             target = _commit(repo, "target.txt", "moved on")
 
-            original = tempfile.TemporaryDirectory._rmtree
+            # The DESCRIPTOR, not what accessing it produces.
+            original = tempfile.TemporaryDirectory.__dict__["_rmtree"]
             refused: list = []
 
             def refusing(cls, name: str, *args: object, **kwargs: object) -> None:
@@ -719,6 +728,12 @@ class DeterministicMergeCommitTest(unittest.TestCase):
                 for path in refused:
                     shutil.rmtree(path, ignore_errors=True)
 
+            # The standard library is exactly as it was found — same object, same descriptor
+            # type — so nothing that runs after this test inherits a patched `tempfile`.
+            self.assertIs(tempfile.TemporaryDirectory.__dict__["_rmtree"], original)
+            self.assertIsInstance(
+                tempfile.TemporaryDirectory.__dict__["_rmtree"], classmethod
+            )
             self.assertEqual(result.status, MERGE_SANDBOX_ERROR, result.detail)
             self.assertEqual(result.integration_head, "")
             # Not a vacuous pass: the injection ran, and it ran on THIS interpreter's cleanup
@@ -771,6 +786,26 @@ class DeterministicMergeCommitTest(unittest.TestCase):
             # Precedence: the leak outranks the body's failure, because "the isolation was
             # not torn down" is the fact an operator has to act on.
             self.assertEqual(both.status, MERGE_SANDBOX_ERROR, both.detail)
+
+            # ...and a violated program invariant is NOT a git outcome. R19 caught `ValueError`
+            # here too, so a defect was recorded in the durable ledger as `merge_error`
+            # (j#96492 finding 2). The process boundary's own `ValueError` — a NUL in argv —
+            # never reaches this handler: `_run` has already turned it into a failed result.
+            class DefectRaises(LiveAutoIntegrationGitOperations):
+                def _merge_in(self, *args: object, **kwargs: object):
+                    raise ValueError("program invariant was violated")
+
+            with self.assertRaises(ValueError):
+                DefectRaises(repo_root=repo).apply_merge(
+                    source_head=source, target_ref="main", expected_target_head=target
+                )
+            self.assertEqual(
+                LiveAutoIntegrationGitOperations(repo_root=repo)
+                ._run("rev-parse", "--verify", "a\x00b")
+                .returncode,
+                127,
+                "the process boundary's own ValueError is converted before it gets here",
+            )
 
     def test_a_ref_carrying_a_control_character_is_invalid_input(self) -> None:
         """j#96453 finding 2: a NUL made `subprocess.run` raise before git was spawned.

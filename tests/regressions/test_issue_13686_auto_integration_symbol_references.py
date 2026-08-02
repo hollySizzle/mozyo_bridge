@@ -1,9 +1,16 @@
-"""Every symbol the auto-integration modules point at still exists (Redmine #13686).
+"""Redmine #13686: a withdrawn symbol is still named by the sources that used it.
 
-Four review rounds running, the same class of defect survived a claimed sweep: a docstring or
-a ``#:`` comment naming a method that an earlier round had withdrawn. R14 through R17 each
-narrowed what "sweep all tracked files" meant, and R18 still shipped five ``:meth:`` references
-to ``_sanitized_git_dir``, a method deleted the round before (j#96461 finding 4).
+One issue, one fixed symptom, and both tests below detect only its recurrence — which is why
+this is a regression pin rather than a unit test of anything (placement decision tree branch 3;
+R19 review j#96492 finding 3 corrected R19's placement under ``tests/unit/``).
+
+**The symptom, and the commit that left it.** ``044200bd`` (#13686 R18) withdrew
+``_sanitized_git_dir`` and replaced it with ``_open_sandbox`` / ``_close_sandbox``, and left
+five ``:meth:`_sanitized_git_dir``` references behind in ``auto_integration_live_ops.py`` — in
+``#:`` comments and docstrings, where nothing executes them. It was the fourth consecutive
+round of the same thing: R14 through R17 each claimed a sweep of the tracked files and each
+narrowed what "sweep" meant, and each time the reviewer found what the claim had missed
+(j#96435 F5, j#96441 F5, j#96447 F3, j#96453 F3, j#96461 F4). Fixed in #13686 R20.
 
 Repeating the claim a fifth time is not a fix. The check is mechanical, so it is performed
 mechanically: this module resolves every Sphinx cross-reference in the auto-integration
@@ -35,7 +42,7 @@ import sys
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[4]
+ROOT = Path(__file__).resolve().parents[2]  # tests/regressions/<file> -> repo root
 sys.path.insert(0, str(ROOT / "src"))
 
 PACKAGE = "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff"

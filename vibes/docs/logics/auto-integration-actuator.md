@@ -300,8 +300,16 @@ driver も `info/attributes` も **sandbox から見えない**ので、宣言�
   `normalized_branch` が 1 回だけ行う** upstream の工程であり、adapter 層ではない。
   さらに **typed 拒否は apply path だけでは足りない**: actuator は apply の前に必ず target ref で
   remote tip を読むため、**read probe は raise せず自身の fail-closed 値 (`""` / `False`) を返す**。
-  raise を保つのは mutation (`push_non_force`) のみで、そこには caller が無視し得る戻り値が無い
-  (j#96461 F2 — R18 は read から例外が抜けて run 全体が落ちた)。
+  raise を保つのは mutation (`push_non_force`) のみ (j#96461 F2 — R18 は read から例外が抜けて
+  run 全体が落ちた)。**その理由は「戻り値が無いから」ではない** — `push_non_force` は `PushResult` を
+  返し、use case は `accepted` を読む (R19 の記述は誤り、j#96492 F4)。理由は `PushResult` の 2 state が
+  **どちらも「試行された push」を表す**ことである: `accepted` か、remote が動いたための `rejected` で、
+  後者の解決策は「新 target head で action を組み直す」。使用不能な ref はそのどちらでもなく、
+  `accepted=False` へ畳むと **conflict と missing object を bool へ畳んだのと同型の誤分類** になる
+  (j#96412 F2)。加えて構造上到達し得ない — apply が同 ref を `invalid_input` で拒否し、
+  push authority は `merge_status == merged` の apply の後にしか生じない。よって raise は
+  **broken invariant の表明**であり、caller が扱う path ではない。この exception contract は
+  **port docstring に literal で書く** (adapter の実装を読まないと分からない状態にしない)。
   **dedicated integration worktree は存在しない** (j#96406 F1)。
   **commit は「同一 git version の下で、同一 repository 内容に対し」再構築可能**であり、
   hook 非実行・無署名 (上節)。
@@ -316,11 +324,16 @@ driver も `info/attributes` も **sandbox から見えない**ので、宣言�
   `unrecognized_status`。`sandbox_error` は「隔離を構築できなかった / object store を特定できなかった」
   であり、非決定的 config の検出ではない (j#96441 F3)。
   **sandbox lifecycle の 3 段階は、構造を分けるだけでなく 3 段階とも typed に着地する**:
-  setup 失敗 = `sandbox_error`、**body (merge 実行中) の失敗 = `merge_error`**、teardown 失敗 =
-  `sandbox_error`。**優先順位は teardown > body** — sandbox が残っている事実の方が operator が
+  setup 失敗 = `sandbox_error`、**body (merge 実行中) の operational 失敗 (`OSError`) = `merge_error`**、
+  teardown 失敗 = `sandbox_error`。**優先順位は teardown > body** — sandbox が残っている事実の方が operator が
   対処すべき事実だからである。R17 は 3 段階を 1 つの `@contextmanager` に入れて
   `generator didn't stop after throw()` を出し、R18 は分割したが body の例外を変換せず raw
   `OSError` が caller へ抜けた (j#96461 F1)。**構造分割は typed 着地の代わりにならない。**
+  一方で **`ValueError` はここで捕捉しない** (j#96492 F2)。process 境界は `_run` の内側にあり、
+  NUL in argv の `ValueError` は `_run` が既に失敗 `CompletedProcess` (rc=127) へ変換している。
+  したがってこの handler に届く `ValueError` は operational ではなく **program defect** であり、
+  捕捉すると「破られた invariant」を durable ledger へ `merge_error` として記録してしまう。
+  **defect は typed status に化けさせず落とす。**
   **exit code だけで分類しない** — missing object は content conflict と同じ rc=1 で返る (実測)。
   conflict は tree を名乗り、operational failure は名乗らない。可用性は **version probe** で確かめ、
   **probe 自体が失敗したら `probe_error`** であって不可用ではない (j#96417 F3)。

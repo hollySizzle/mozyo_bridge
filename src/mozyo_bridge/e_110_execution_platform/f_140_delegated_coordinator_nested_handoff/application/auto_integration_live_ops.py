@@ -54,8 +54,9 @@ Every probe fails closed: a ``git`` that could not run has proven nothing, so a 
 invocation reads as the unsafe answer (not a workspace, not an ancestor, not reachable,
 dirty) rather than as a permissive one. A ref name that could not be handed to ``git`` in the
 first place is the same kind of answer and is returned the same way — the reads refuse by
-value, and only the mutations refuse by raising, because only they have no return value a
-caller could ignore (j#96461 finding 2). The spawn-failure mapping mirrors
+value (j#96461 finding 2). The push refuses by RAISING instead, for the reason recorded on
+:class:`UnsafeRefspecError` and in the port's own ``push_non_force`` contract. The
+spawn-failure mapping mirrors
 :meth:`...application.sublane_integration.LiveSublaneGitOperations._run` — a missing ``cwd``
 after a host reboot (#14499) raises ``FileNotFoundError`` rather than exiting non-zero, and
 letting that escape a read-only preflight is how six production runs ended in tracebacks.
@@ -109,11 +110,17 @@ def _is_full_sha(value: str) -> bool:
 class UnsafeRefspecError(ValueError):
     """A ref name could not be turned into a provably non-force refspec.
 
-    Raised by the MUTATIONS, which have nowhere to put a refusal: a branch name carrying
-    ``+``, whitespace, or a leading ``-`` would change what the constructed ``git push`` argv
-    *means* — ``+`` spells a force inside a refspec, and a leading ``-`` turns the value into
-    an option — so for a push the argv is never built at all, and the caller is not offered a
-    return value it could ignore.
+    A branch name carrying ``+``, whitespace, or a leading ``-`` would change what the
+    constructed ``git push`` argv *means* — ``+`` spells a force inside a refspec, and a
+    leading ``-`` turns the value into an option — so the argv is never built at all.
+
+    **Why the push raises rather than returning.** Not because it has nowhere to put a
+    refusal — R19 wrote that and it is false: :meth:`push_non_force` returns a
+    :class:`PushResult` and the use case reads its ``accepted`` (j#96492 finding 4). Because
+    both ``PushResult`` states describe a push that was ATTEMPTED, and folding an unusable ref
+    into ``accepted=False`` would repeat the conflation the merge's boolean made of a conflict
+    and a missing object (j#96412 finding 2). The full contract is on the port's
+    ``push_non_force``, where a caller reading the protocol will find it.
 
     The READ probes catch it instead and answer their own fail-closed value (``""``, ``False``):
     a read that cannot answer has refused, and the actuator's preflight performs those reads
@@ -769,16 +776,21 @@ class LiveAutoIntegrationGitOperations:
                 expected_target_head=expected_target_head,
                 git_version=git_version,
             )
-        except (OSError, ValueError) as broken:
-            # The BODY failing is an operational failure of this merge, and it lands as one.
-            # R18 split the lifecycle into three steps but converted only two of them: a
-            # filesystem failure during the merge left `apply_merge` raising a raw `OSError`
-            # at its caller, which is the same escape R17's `generator didn't stop after
-            # throw()` was (j#96461 finding 1), wearing a different exception type. The two
-            # caught classes are the ones the process boundary itself produces — `_run` maps
-            # the same pair for the same reason (a NUL in argv is a `ValueError` raised
-            # before any spawn), so nothing that git can do to us leaves this method by
-            # exception.
+        except OSError as broken:
+            # The BODY failing OPERATIONALLY is an operational failure of this merge, and it
+            # lands as one. R18 split the lifecycle into three steps but converted only two of
+            # them: a filesystem failure during the merge left `apply_merge` raising a raw
+            # `OSError` at its caller, which is the same escape R17's `generator didn't stop
+            # after throw()` was (j#96461 finding 1), wearing a different exception type.
+            #
+            # `OSError` ONLY. R19 also caught `ValueError`, calling it "what the process
+            # boundary produces" — but the process boundary is inside `_run`, which already
+            # converts a NUL-in-argv `ValueError` into a failed `CompletedProcess` (measured:
+            # rc=127) before anything here sees it. So no `ValueError` reaching this handler
+            # is operational, and catching it recorded a violated program invariant in the
+            # durable ledger as `merge_error` — a defect disguised as a git outcome
+            # (j#96492 finding 2, reproduced with `_merge_in -> ValueError`). A defect now
+            # crashes, loudly, where it can be seen.
             result = MergeResult(
                 status=MERGE_ERROR,
                 detail=(

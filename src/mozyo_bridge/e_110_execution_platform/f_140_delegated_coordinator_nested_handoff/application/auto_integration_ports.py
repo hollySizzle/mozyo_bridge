@@ -197,7 +197,19 @@ class AutoIntegrationGitOperations(Protocol):
         ...
 
     def push_non_force(self, *, source_head: str, target_ref: str) -> PushResult:
-        """Push ``source_head`` to ``target_ref`` with a normal, non-force push."""
+        """Push ``source_head`` to ``target_ref`` with a normal, non-force push.
+
+        :class:`PushResult` describes a push that was ATTEMPTED: ``accepted``, or ``rejected``
+        because the remote moved. An implementation that cannot express ``target_ref`` as a
+        provably non-force refspec at all MAY raise instead — and this is the one place in the
+        port where raising is contract rather than defect, so it is written down here rather
+        than left to a reader of the adapter (j#96492 finding 4). Neither ``PushResult`` state
+        fits: nothing was attempted, and the rejected case's resolution — re-form the action
+        against the new target head — cannot help a ref no push can ever use. Callers reach
+        this step only after an apply that returned ``merged``, which has already refused such
+        a ref as ``invalid_input``, so the raise marks a broken invariant and not a path a
+        caller is expected to handle.
+        """
         ...
 
     def describe_lane_worktree(self, *, path: str) -> LaneWorktree:
