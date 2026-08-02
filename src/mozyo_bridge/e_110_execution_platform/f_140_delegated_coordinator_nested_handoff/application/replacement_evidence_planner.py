@@ -155,8 +155,38 @@ class UpdateCausePort(Protocol):
     def __call__(self, provider: str, blocker_id: str) -> str: ...  # pragma: no cover
 
 
-def _norm(value: object) -> str:
-    return str(value or "").strip()
+def _exact(value: object) -> str:
+    """The token EXACTLY as the authority holds it, or ``""`` when it is not one.
+
+    No strip, no coercion. The first cut normalised with ``str(value or "").strip()`` and
+    then compared the RESULT, which laundered a padded, non-text or foreign representation
+    into a canonical token before the authority check ever ran (audit j#97074):
+    ``" issue_14741 "`` became authority for lane ``issue_14741``. A value that is not
+    already canonical text is not a near-miss to be repaired into one — it is a different
+    value, and on a receipt-capable path that is the difference between proving a relaunch
+    and asserting one.
+
+    ``isinstance`` rather than ``type is``: a ``str`` subclass still compares byte-wise, so
+    it is the same token. A bool, a number, ``bytes`` and an object with a helpful
+    ``__str__`` are all rejected here, because each only becomes a token by being rendered
+    into one.
+    """
+    if not isinstance(value, str):
+        return ""
+    if not value or value != value.strip():
+        return ""
+    return value
+
+
+def _present(value: object) -> bool:
+    """Whether this slot carries ANYTHING, canonical or not.
+
+    Deliberately not :func:`_exact`: for "a legacy participant must carry no evidence" the
+    question is presence, not well-formedness. Asking ``_exact`` there would read a padded
+    or non-text triplet as absent and wave the participant through as legacy — the same
+    laundering this correction is about, inverted.
+    """
+    return value is not None and value != ""
 
 
 class ReplacementEvidencePlanner:
@@ -224,13 +254,23 @@ class ReplacementEvidencePlanner:
         for pin in pinned:
             # Audit j#97065 finding 1: the context's lane was never compared, so a
             # participant from another lane planned happily inside this lane's transaction.
-            if _norm(getattr(pin, "lane_id", "")) != context.lane_id:
+            pin_lane = _exact(getattr(pin, "lane_id", None))
+            if not pin_lane or pin_lane != context.lane_id:
                 raise EvidencePlanRefused(
                     REFUSE_LANE_OUT_OF_CONTEXT,
                     "a participant names a lane this plan is not scoped to",
                 )
             generation = self._generation_for(pin)
-            action_id = _norm(getattr(generation, "startup_action_id", ""))
+            action_id = _exact(getattr(generation, "startup_action_id", None))
+            if not action_id:
+                # Refused BEFORE classification on purpose. Handing a padded id to the
+                # capability port would let a shape test answer "not receipt-capable" and
+                # route a capable action down the legacy path — fail-open in the one
+                # direction this whole ticket exists to close.
+                raise EvidencePlanRefused(
+                    REFUSE_UNKNOWN_ACTION_SHAPE,
+                    "the startup action id matches no known shape",
+                )
             if not self._requires_receipt(action_id):
                 planned.append(self._legacy_pin(pin))
                 continue
@@ -249,10 +289,10 @@ class ReplacementEvidencePlanner:
         atomically supersedes the previous row — so it answers for the generation that is
         actually there, not for one that used to be.
         """
-        assigned = _norm(getattr(pin, "assigned_name", ""))
+        assigned = _exact(getattr(pin, "assigned_name", None))
         if not assigned:
             raise EvidencePlanRefused(
-                REFUSE_GENERATION_UNAVAILABLE, "participant has no assigned name"
+                REFUSE_GENERATION_UNAVAILABLE, "participant has no canonical assigned name"
             )
         try:
             generation = self._generations(assigned)
@@ -268,7 +308,7 @@ class ReplacementEvidencePlanner:
                 REFUSE_GENERATION_UNAVAILABLE,
                 "no launch generation is recorded for this participant",
             )
-        if _norm(getattr(generation, "phase", "")) != "attested":
+        if _exact(getattr(generation, "phase", None)) != "attested":
             # A pending generation has not proven it came up. Planning a replacement whose
             # evidence rests on it would rest on a launch that may never have happened.
             raise EvidencePlanRefused(
@@ -286,13 +326,15 @@ class ReplacementEvidencePlanner:
         recycled pane, would differ on.
         """
         for attr, expected in (
-            ("workspace_id", _norm(context.workspace_id)),
-            ("lane_id", _norm(getattr(pin, "lane_id", ""))),
-            ("role", _norm(getattr(pin, "role", ""))),
-            ("assigned_name", _norm(getattr(pin, "assigned_name", ""))),
-            ("locator", _norm(getattr(pin, "old_locator", ""))),
+            ("workspace_id", context.workspace_id),
+            ("lane_id", context.lane_id),
+            ("role", _exact(getattr(pin, "role", None))),
+            ("assigned_name", _exact(getattr(pin, "assigned_name", None))),
+            ("locator", _exact(getattr(pin, "old_locator", None))),
         ):
-            if _norm(getattr(generation, attr, "")) != expected:
+            # An empty `expected` means the PARTICIPANT's own axis is not canonical, and it
+            # must never be allowed to match an authority that is equally empty.
+            if not expected or _exact(getattr(generation, attr, None)) != expected:
                 raise EvidencePlanRefused(
                     REFUSE_GENERATION_MISMATCH,
                     "the live launch generation is not the participant this plan names",
@@ -300,12 +342,14 @@ class ReplacementEvidencePlanner:
 
     def _legacy_pin(self, pin: Any):
         """A pre-#14741 participant: byte-exact, and the receipt store is never opened."""
-        triplet = (
-            _norm(getattr(pin, "evidence_workspace_id", "")),
-            _norm(getattr(pin, "evidence_startup_action_id", "")),
-            _norm(getattr(pin, "evidence_cause", "")),
-        )
-        if any(triplet):
+        if any(
+            _present(getattr(pin, attr, ""))
+            for attr in (
+                "evidence_workspace_id",
+                "evidence_startup_action_id",
+                "evidence_cause",
+            )
+        ):
             # A legacy generation carrying evidence is not a legacy generation. Refuse
             # rather than silently strip it or silently keep it.
             raise EvidencePlanRefused(
@@ -318,10 +362,10 @@ class ReplacementEvidencePlanner:
     def _receipt_pin(self, pin: Any, action_id: str, context: PlanningContext):
         from mozyo_bridge.core.state.replacement_transaction_model import ParticipantPin
 
-        lane_id = _norm(getattr(pin, "lane_id", ""))
-        provider = _norm(getattr(pin, "provider", ""))
-        assigned = _norm(getattr(pin, "assigned_name", ""))
-        workspace_id = _norm(context.workspace_id)
+        lane_id = _exact(getattr(pin, "lane_id", None))
+        provider = _exact(getattr(pin, "provider", None))
+        assigned = _exact(getattr(pin, "assigned_name", None))
+        workspace_id = context.workspace_id
 
         lane_generation, lifecycle_revision = self._current_lifecycle(lane_id)
         # Audit j#97062 finding 2: a receipt-capable participant must ALREADY pin the
@@ -329,8 +373,8 @@ class ReplacementEvidencePlanner:
         # cut only compared when the pin was non-empty, so an empty pin was "consistent"
         # with anything — the transaction would then carry no lifecycle authority at all
         # while the plan believed it had checked one.
-        pinned_generation = _norm(getattr(pin, "lane_generation", ""))
-        pinned_revision = _norm(getattr(pin, "lane_revision", ""))
+        pinned_generation = _exact(getattr(pin, "lane_generation", None))
+        pinned_revision = _exact(getattr(pin, "lane_revision", None))
         if not pinned_generation or not pinned_revision:
             raise EvidencePlanRefused(
                 REFUSE_LIFECYCLE_MISMATCH,
@@ -358,7 +402,9 @@ class ReplacementEvidencePlanner:
             assigned=assigned,
         )
         cause = self._typed_cause(
-            provider, _norm(getattr(found, "blocker_id", "")), context.expected_update_cause
+            provider,
+            _exact(getattr(found, "blocker_id", None)),
+            context.expected_update_cause,
         )
         self._require_no_divergent_pre_pin(pin, workspace_id, action_id, cause)
 
@@ -394,8 +440,8 @@ class ReplacementEvidencePlanner:
             )
         # Exactly two text tokens (audit j#97065 finding 4). A 1- or 3-element answer used
         # to escape as a raw `ValueError` from tuple unpacking, which is not a typed
-        # refusal — and a bool / number would have been coerced by `_norm` into something
-        # that looks like a token.
+        # refusal — and a bool or a number must not be rendered into something that looks
+        # like a token.
         if isinstance(lifecycle, (str, bytes)) or not isinstance(lifecycle, (tuple, list)):
             raise EvidencePlanRefused(
                 REFUSE_LIFECYCLE_UNAVAILABLE,
@@ -460,7 +506,7 @@ class ReplacementEvidencePlanner:
             ("provider", provider),
             ("assigned_name", assigned),
         ):
-            if _norm(getattr(key, attr, "")) != expected:
+            if not expected or _exact(getattr(key, attr, None)) != expected:
                 raise EvidencePlanRefused(
                     REFUSE_EVIDENCE_MISMATCH,
                     "the bound evidence names a different generation than this participant",
@@ -480,15 +526,16 @@ class ReplacementEvidencePlanner:
                 REFUSE_EVIDENCE_MISMATCH, "the bound evidence carries no observed screen"
             )
         try:
-            cause = _norm(self._update_cause(provider, blocker_id))
+            cause = self._update_cause(provider, blocker_id)
         except Exception as exc:  # noqa: BLE001
             raise EvidencePlanRefused(
                 REFUSE_CAUSE_NOT_UPDATE_DERIVED,
                 "the observed screen could not be classified",
             ) from exc
-        if cause != expected:
-            # Non-empty is a shape, not an authority: a port answering with any token at
-            # all would otherwise have been pinned as the cause.
+        if not isinstance(cause, str) or cause != expected:
+            # Non-empty is a shape, not an authority, and neither is "strips to the right
+            # thing": a port answering with any token at all, or with a padded one, would
+            # otherwise have been pinned as the cause.
             raise EvidencePlanRefused(
                 REFUSE_CAUSE_NOT_UPDATE_DERIVED,
                 "the observed screen is not the expected update-derived launch cause",
@@ -501,8 +548,10 @@ class ReplacementEvidencePlanner:
             ("evidence_startup_action_id", action_id),
             ("evidence_cause", cause),
         ):
-            existing = _norm(getattr(pin, attr, ""))
-            if existing and existing != expected:
+            existing = getattr(pin, attr, "")
+            if _present(existing) and (
+                not isinstance(existing, str) or existing != expected
+            ):
                 raise EvidencePlanRefused(
                     REFUSE_DIVERGENT_PRE_PIN,
                     "the participant already carries a different evidence triplet",

@@ -326,6 +326,145 @@ class RefusalTest(unittest.TestCase):
         )
 
 
+def _foreign(**kw):
+    """A participant that is NOT a :class:`ParticipantPin`.
+
+    Needed because ``ParticipantPin.__post_init__`` strips its own fields, so a padded
+    value cannot reach the planner through the domain type at all. The planner takes
+    ``Sequence[Any]``, so the exactness it owes is the exactness it applies to whatever it
+    is handed -- not one inherited from a constructor it does not control.
+    """
+    base = dict(
+        lane_id="issue_14741",
+        role="gateway",
+        provider="codex",
+        assigned_name="mzb1_wA_codex_lane",
+        old_locator="wA:p1",
+        lane_generation=GEN,
+        lane_revision=REV,
+        evidence_workspace_id="",
+        evidence_startup_action_id="",
+        evidence_cause="",
+        is_self=False,
+        phase="",
+    )
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+class _RenderedToken:
+    """An authority value that is only a token once something renders it."""
+
+    def __str__(self) -> str:  # pragma: no cover - exercised via the planner
+        return "issue_14741"
+
+
+class ExactAuthorityTest(unittest.TestCase):
+    """Audit j#97074: normalising before comparing laundered foreign representations.
+
+    Every case here was ACCEPTED at 9bcb1af0, where each authority axis was compared as
+    ``str(value or "").strip()`` -- so a padded or renderable value was turned into the
+    canonical token first and then found to match it.
+    """
+
+    def _refuses(self, reason, the_pin=None, planner_kw=None, **ports):
+        with self.assertRaises(EvidencePlanRefused) as ctx:
+            _Ports(**ports).planner(**(planner_kw or {})).plan(
+                [the_pin if the_pin is not None else _pin()], CONTEXT
+            )
+        self.assertEqual(ctx.exception.reason, reason)
+
+    def test_a_padded_generation_workspace_is_not_the_workspace(self) -> None:
+        self._refuses(
+            "generation_mismatch", generation=_generation(workspace=" wA "), evidence=_evidence()
+        )
+
+    def test_a_padded_evidence_key_lane_is_not_the_lane(self) -> None:
+        self._refuses("evidence_mismatch", evidence=_evidence(lane_id=" issue_14741 "))
+
+    def test_a_padded_cause_token_is_not_the_cause(self) -> None:
+        self._refuses(
+            "cause_not_update_derived",
+            evidence=_evidence(),
+            planner_kw={"update_cause": lambda provider, blocker: " " + CAUSE + " "},
+        )
+
+    def test_a_padded_action_id_is_refused_before_it_is_classified(self) -> None:
+        """A padded id must never reach the capability port.
+
+        A shape test would answer "not receipt-capable" for it and route a capable action
+        down the legacy path -- fail-open in the one direction this ticket exists to close.
+        """
+        seen = []
+        self._refuses(
+            "unknown_action_shape",
+            generation=_generation(action_id=" " + ACTION + " "),
+            evidence=_evidence(),
+            planner_kw={"capability": lambda action_id: seen.append(action_id) or True},
+        )
+        self.assertEqual(seen, [], "the capability port was never asked")
+
+    def test_a_padded_attested_phase_is_not_attested(self) -> None:
+        self._refuses(
+            "generation_not_attested",
+            generation=_generation(phase=" attested "),
+            evidence=_evidence(),
+        )
+
+    def test_a_nontext_authority_is_never_rendered_into_a_token(self) -> None:
+        for label, kw, reason in (
+            ("bool phase", dict(generation=_generation(phase=True)), "generation_not_attested"),
+            (
+                "bytes action id",
+                dict(generation=_generation(action_id=ACTION.encode())),
+                "unknown_action_shape",
+            ),
+            (
+                "numeric locator",
+                dict(generation=_generation(locator=1)),
+                "generation_mismatch",
+            ),
+        ):
+            with self.subTest(label=label):
+                self._refuses(reason, evidence=_evidence(), **kw)
+
+    def test_a_renderable_participant_lane_is_not_the_lane(self) -> None:
+        self._refuses(
+            "lane_out_of_context", the_pin=_foreign(lane_id=_RenderedToken()), evidence=_evidence()
+        )
+
+    def test_a_padded_participant_axis_is_not_that_axis(self) -> None:
+        for label, kw, reason in (
+            ("lane", dict(lane_id=" issue_14741 "), "lane_out_of_context"),
+            ("assigned name", dict(assigned_name=" mzb1_wA_codex_lane "), "generation_unavailable"),
+            ("lane generation", dict(lane_generation=" " + GEN + " "), "lifecycle_mismatch"),
+        ):
+            with self.subTest(label=label):
+                self._refuses(reason, the_pin=_foreign(**kw), evidence=_evidence())
+
+    def test_a_legacy_participant_carrying_a_padded_triplet_still_refuses(self) -> None:
+        """Presence, not well-formedness.
+
+        Reading this slot with the exact-token helper would call a padded triplet ABSENT
+        and wave the participant through as legacy -- the same laundering, inverted.
+        """
+        self._refuses(
+            "divergent_pre_pin",
+            the_pin=_foreign(evidence_workspace_id=" wA "),
+            generation=_generation(action_id=LEGACY_ACTION),
+        )
+
+    def test_a_clean_legacy_participant_is_still_returned_unchanged(self) -> None:
+        """The positive control for the two tests above."""
+        ports = _Ports(generation=_generation(action_id=LEGACY_ACTION))
+        the_pin = _foreign()
+        plan = ports.planner().plan([the_pin], CONTEXT)
+        self.assertEqual(plan.outcome, PLAN_LEGACY_UNCHANGED)
+        self.assertIs(plan.participants[0], the_pin, "returned byte-exact, not rebuilt")
+        self.assertEqual(ports.evidence_calls, 0)
+        self.assertEqual(ports.lifecycle_calls, 0)
+
+
 class ClosedContextTest(unittest.TestCase):
     """Audit j#97065: the context is authority, and every port answer is closed."""
 
