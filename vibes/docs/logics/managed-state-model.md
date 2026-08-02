@@ -438,7 +438,9 @@ Table naming:
     - **何を保存するか**: その lane が hibernate した回数 = 発行済み世代番号。**`hibernated` へ
       向かう disposition CAS だけ**が **格納値から** 発行する (増分は strict decode 後に Python 側で
       算出し canonical decimal TEXT を書く。**SQL 算術は使わない**)。
-      **malformed な格納値 (TEXT / REAL / `bool` / `NULL` / negative) からは発行しない**
+      **malformed な格納値からは発行しない** — malformed とは **canonical decimal TEXT 以外すべて**、
+      すなわち noncanonical TEXT (符号付き `+0` / 前置ゼロ `00` / 空白付き `" 0 "` / 小数 `0.0`) /
+      INTEGER / REAL / BLOB / `NULL` / `bool` / negative である (**canonical decimal TEXT は valid**)
       (#14756 j#96881 F2 / j#96911 F2)。「未発行 (canonical decimal TEXT `"0"`)」と「読めない」は別の事実であり、
       read 側は両方 `lane_epoch_authority_unavailable` へ畳んでよいが、**writer が畳むと
       counter rollback になる** — corrupt 値から 1 を mint すると、既に release 済みの世代が

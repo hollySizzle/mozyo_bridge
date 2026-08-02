@@ -101,6 +101,19 @@ def _hibernated_lane(tmp: str, *, cycles: int = 1):
     return store, key
 
 
+def _lane_epoch_storage_section(markdown: str) -> str:
+    """The `lane_epoch` storage paragraph of ``managed-state-model.md``, on its own.
+
+    Assertions about a contract have to be made where the contract is stated. Checking the
+    whole document let a positive match somewhere else stand in for the paragraph actually
+    under review, which is how a section defining "malformed" as bare ``TEXT`` survived a
+    green regression that asserted canonical TEXT is valid (review j#96997 F14).
+    """
+    start = markdown.index("**lane epoch (hibernate 世代の単調 counter)**")
+    end = markdown.index("**release generation observation", start)
+    return markdown[start:end]
+
+
 class EpochIsMintedByTheStoreNotTheCaller(unittest.TestCase):
     """The defect class #14477 could never close: an authority a caller supplies."""
 
@@ -2835,6 +2848,21 @@ class R11ReviewFindingsStayClosed(unittest.TestCase):
         identity = docs["herdr-native-identity.md"]
         self.assertIn("完全一致", identity)  # admission is equality, not a lower bound
         self.assertIn("canonical decimal TEXT", identity)
+
+        # ...and it must be stated WHERE the malformed set is listed (review j#96997 F14).
+        # A whole-file positive check is satisfied by the contract appearing anywhere, so it
+        # passed while the very paragraph defining "malformed" listed bare `TEXT` — i.e. said
+        # the exact opposite of the storage contract two lines above it. Scoping the check to
+        # the section is what makes a self-contradiction detectable: an assertion whose
+        # evidence can come from somewhere else cannot see a local disagreement.
+        section = _lane_epoch_storage_section(model)
+        self.assertIn("canonical decimal TEXT は valid", section)
+        self.assertNotIn("malformed な格納値 (TEXT /", section)
+        # The malformed set names noncanonical TEXT specifically, never TEXT wholesale.
+        malformed_line = next(
+            line for line in section.splitlines() if "malformed とは" in line
+        )
+        self.assertIn("canonical decimal TEXT 以外", malformed_line)
 
 
 class R12ReviewFindingsStayClosed(unittest.TestCase):
