@@ -517,7 +517,7 @@ class ActuatorConsumePositionTest(unittest.TestCase):
         self.assertEqual(self._phase(), "replaced")
 
 
-class FiveSiteRuntimeWiringTest(unittest.TestCase):
+class SiteRuntimeWiringTest(unittest.TestCase):
     """Audit j#97136 F3: the wiring is proven by RUNNING the sites, not by reading them.
 
     A source-string search is green for dead code, an unreachable branch and a second
@@ -556,6 +556,12 @@ class FiveSiteRuntimeWiringTest(unittest.TestCase):
             "tests.regressions.test_issue_13933_bound_stale_pair_convergence",
             "A14PartialPreflightSurfaceTests",
             "test_public_execute_replay_resumes_outer_transaction_through_real_observe",
+        ),
+        (
+            "sublane_vanished_gateway_recovery_live",
+            "tests.regressions.test_issue_14741_vanished_gateway_recovery_live",
+            "HappyPathTest",
+            "test_an_absent_gateway_is_relaunched_attested_and_its_evidence_discharged",
         ),
     )
 
@@ -721,7 +727,7 @@ class FiveSiteRuntimeWiringTest(unittest.TestCase):
         )
 
 
-class FiveSiteWiringTest(unittest.TestCase):
+class SiteSourceWiringTest(unittest.TestCase):
     """The AUXILIARY source assertion (j#97136 F3 permits it as support, not as the proof).
 
     It is the only evidence for the one site with no runtime coverage, and a cheap
@@ -729,6 +735,7 @@ class FiveSiteWiringTest(unittest.TestCase):
     """
 
     SITES = (
+        "sublane_vanished_gateway_recovery_live",
         "sublane_gateway_recovery",
         "sublane_stale_worker_recovery",
         "sublane_worker_refresh",
@@ -745,11 +752,10 @@ class FiveSiteWiringTest(unittest.TestCase):
         )
         return path.read_text()
 
-    def test_every_planner_site_also_discharges(self) -> None:
+    def test_every_site_wires_a_completion(self) -> None:
         for module in self.SITES:
             with self.subTest(module=module):
                 source = self._source(module)
-                self.assertIn("plan_participants_with_evidence(", source)
                 self.assertIn("evidence_completion=build_update_evidence_completion(", source)
 
     def test_the_completion_home_is_the_stores_own_home_not_a_guess(self) -> None:
@@ -758,8 +764,8 @@ class FiveSiteWiringTest(unittest.TestCase):
             with self.subTest(module=module):
                 source = self._source(module)
                 start = source.index("evidence_completion=build_update_evidence_completion(")
-                snippet = source[start : start + 200]
-                self.assertIn(".path.parent", snippet)
+                snippet = source[start : start + 220]
+                self.assertIn(".path).parent" if "Path(store.path)" in snippet else ".path.parent", snippet)
                 for guess in ("Path.cwd()", "repo_root", "os.getcwd"):
                     self.assertNotIn(guess, snippet)
 

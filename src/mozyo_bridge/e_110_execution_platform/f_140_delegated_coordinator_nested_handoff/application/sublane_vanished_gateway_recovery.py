@@ -203,7 +203,7 @@ def _raw(value: object) -> str:
     return value
 
 
-def _stored_is_this_action(stored, *, key, anchor, action_id) -> bool:
+def stored_row_is_this_recovery(stored, *, key, anchor, action_id) -> bool:
     """Is this stored row THIS recovery, compared as raw stored fields? (pure)
 
     Audit j#97151 R4: the first cut compared value objects, which normalise, so a row whose
@@ -268,7 +268,7 @@ def _replayed(stored, key, anchor, action_id, *, outcome=OUTCOME_REPLAYED) -> Re
     from mozyo_bridge.core.state.replacement_transaction_model import decode_participants
 
     try:
-        if not _stored_is_this_action(stored, key=key, anchor=anchor, action_id=action_id):
+        if not stored_row_is_this_recovery(stored, key=key, anchor=anchor, action_id=action_id):
             return RecoveryPlan(
                 decision=refuse(
                     REFUSE_FOREIGN_TRANSACTION,
@@ -509,6 +509,7 @@ def plan_fresh_recovery(
 
 __all__ = (
     "RECOVERY_ACTION_GENERATION",
+    "stored_row_is_this_recovery",
     "REFUSE_ACTION_ID_INVALID",
     "REFUSE_EVIDENCE_DIVERGENT",
     "REFUSE_HOME_INVALID",
