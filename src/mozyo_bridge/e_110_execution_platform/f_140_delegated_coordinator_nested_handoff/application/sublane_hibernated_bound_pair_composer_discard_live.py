@@ -29,6 +29,9 @@ from mozyo_bridge.core.state.replacement_transaction import (
     ParticipantPin,
     ReplacementTransactionKey,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_evidence_completion import (  # noqa: E501
+    build_update_evidence_completion,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_evidence_planner_composition import (  # noqa: E501
     plan_participants_with_evidence,
 )
@@ -945,6 +948,9 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
             # relaunches through the same actuator, so it needs the same pre-close fence
             # (Redmine #14756 j#96848).
             store_admission=self.store_admission,
+            evidence_completion=build_update_evidence_completion(
+                self.transaction_store.path.parent
+            ),
         ).drive_worker_recovery(
             key,
             holder=holder,

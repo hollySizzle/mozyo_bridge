@@ -27,10 +27,15 @@ Every method is an **evidence probe or an additive/idempotent effect**:
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Protocol, TYPE_CHECKING, runtime_checkable
 
 from mozyo_bridge.core.state.replacement_preservation import PreservationObservation
 from mozyo_bridge.core.state.replacement_transaction_model import ParticipantPin
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from mozyo_bridge.core.state.replacement_transaction import (
+        ReplacementTransactionKey,
+    )
 
 
 @runtime_checkable
@@ -88,4 +93,31 @@ class ExactGenerationActuatorPort(Protocol):
         ...
 
 
-__all__ = ("ExactGenerationActuatorPort",)
+@runtime_checkable
+class UpdateEvidenceCompletionPort(Protocol):
+    """Discharge the update evidence a verified relaunch has now satisfied (#14741 j#97131).
+
+    A SEPARATE port, deliberately. Adding a sixth method to
+    :class:`ExactGenerationActuatorPort` would force every existing implementer -- including
+    the self-replacement executor, which must never consume anything -- to grow a method it
+    has no business having. Optional injection also makes "no completion port" a state the
+    use case can refuse on, rather than a duck-typing accident.
+    """
+
+    def __call__(
+        self,
+        key: "ReplacementTransactionKey",
+        pin: ParticipantPin,
+        *,
+        replacement_action_id: str,
+    ) -> str:
+        """Consume the exact bound evidence this participant was planned with.
+
+        Returns a :mod:`...core.state.launch_identity_receipt` consume outcome, or a typed
+        refusal token. Never raises at the caller: a completion that failed must leave the
+        participant owed, not surface an exception mid-actuation.
+        """
+        ...
+
+
+__all__ = ("ExactGenerationActuatorPort", "UpdateEvidenceCompletionPort")

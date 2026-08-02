@@ -52,8 +52,13 @@ from mozyo_bridge.core.state.replacement_transaction_model import (
     ReplacementTransactionKey,
     ReplacementTransactionRecord,
 )
+from mozyo_bridge.core.state.launch_identity_receipt import (
+    CONSUME_OK,
+    CONSUME_REPLAY,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_actuator_ops import (  # noqa: E501
     ExactGenerationActuatorPort,
+    UpdateEvidenceCompletionPort,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (  # noqa: E501
     ACTUATION_AMBIGUOUS,
@@ -123,6 +128,22 @@ class ActuationResult:
         }
 
 
+def _pin_carries_evidence(pin) -> bool:
+    """Does this participant carry an update-evidence triplet at all? (pure)
+
+    Presence, not well-formedness: a pin whose triplet is malformed must reach the
+    completion port and be refused there, not be read as "legacy" and skipped.
+    """
+    return any(
+        getattr(pin, name, "") not in (None, "")
+        for name in (
+            "evidence_workspace_id",
+            "evidence_startup_action_id",
+            "evidence_cause",
+        )
+    )
+
+
 class ReplacementActuatorUseCase:
     """Drive a replacement transaction's non-self participants and arm it (tranche B)."""
 
@@ -140,6 +161,7 @@ class ReplacementActuatorUseCase:
         store_admission: Optional[
             Callable[[ReplacementTransactionKey, ParticipantPin], Optional[str]]
         ] = None,
+        evidence_completion: Optional[UpdateEvidenceCompletionPort] = None,
     ) -> None:
         self._store = store
         self._port = port
@@ -179,6 +201,12 @@ class ReplacementActuatorUseCase:
         # resolve it differently. The injected callable therefore supplies only what genuinely
         # varies per site — which store home is selected.
         self._store_admission = store_admission
+        # OPTIONAL, and a separate port from the actuator's five effects on purpose: the
+        # self-replacement executor must never consume anything, so "no port" has to be a
+        # state this use case can refuse on rather than a method every implementer is
+        # forced to grow. Bound by each construction site to the SAME explicit home the
+        # planner reads, so a plan and its discharge cannot address different stores.
+        self._evidence_completion = evidence_completion
 
     def run(
         self,
@@ -668,6 +696,41 @@ class ReplacementActuatorUseCase:
                 status=ACTUATION_IN_PROGRESS, phase=rec.phase, revision=rec.revision,
                 stopped_on=pin.identity, detail="attestation pending",
             )
+        # The relaunch is now VERIFIED, so this is the one moment the update evidence that
+        # armed it may be discharged: earlier and a crash loses the evidence while the launch
+        # never happened (j#96966 C15); later and the transaction is complete with the
+        # evidence still live for the next recovery to re-arm from (j#97131). A legacy /
+        # generic participant carries no evidence and takes the pre-#14741 path untouched --
+        # no port call, no re-authentication, same effect order.
+        if _pin_carries_evidence(pin):
+            fresh = self._reauth_before_effect(
+                key, holder, gen, pin.identity, PARTICIPANT_VERIFY_OWED
+            )
+            if isinstance(fresh, ActuationResult):
+                return fresh
+            if self._evidence_completion is None:
+                # An evidenceful participant reaching an actuator with no completion port is
+                # a composition error, and it fails closed: staying `verify_owed` is
+                # replayable, discharging nothing is not recoverable from.
+                return ActuationResult(
+                    status=ACTUATION_EFFECT_FAILED, phase=fresh.phase,
+                    revision=fresh.revision, stopped_on=pin.identity,
+                    detail="no update-evidence completion port is wired",
+                )
+            outcome = self._evidence_completion(
+                key, pin, replacement_action_id=rec.action_id
+            )
+            if outcome not in (CONSUME_OK, CONSUME_REPLAY):
+                # `replay` is this SAME replacement action having already consumed it, which
+                # is exactly what a crash between the consume and the CAS below looks like.
+                # Everything else -- absent, foreign consumer, a refusal token, an unknown
+                # answer -- stays owed with zero launch and zero CAS.
+                return ActuationResult(
+                    status=ACTUATION_EFFECT_FAILED, phase=fresh.phase,
+                    revision=fresh.revision, stopped_on=pin.identity,
+                    detail=f"update evidence not discharged ({outcome})",
+                )
+            rec, now = fresh, self._clock()
         cas = self._store.transition_participant(
             key, expected_revision=rec.revision, expected_action_generation=gen,
             identity=pin.identity, target=PARTICIPANT_REPLACED, holder=holder, now=now,

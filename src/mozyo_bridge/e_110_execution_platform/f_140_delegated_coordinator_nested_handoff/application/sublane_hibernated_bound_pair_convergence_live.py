@@ -46,6 +46,9 @@ from mozyo_bridge.core.state.replacement_transaction import (
     ReplacementTransactionKey,
     ReplacementTransactionStore,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_evidence_completion import (  # noqa: E501
+    build_update_evidence_completion,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_evidence_planner_composition import (  # noqa: E501
     plan_participants_with_evidence,
 )
@@ -763,6 +766,9 @@ class LiveBoundPairConvergenceOps:
             port,
             preservation_policy=assess_preservation,
             store_admission=self.store_admission,
+            evidence_completion=build_update_evidence_completion(
+                self.transaction_store.path.parent
+            ),
         ).drive_worker_recovery(
             key,
             holder=holder,
