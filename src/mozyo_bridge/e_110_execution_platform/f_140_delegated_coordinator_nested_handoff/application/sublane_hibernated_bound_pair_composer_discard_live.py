@@ -29,6 +29,9 @@ from mozyo_bridge.core.state.replacement_transaction import (
     ParticipantPin,
     ReplacementTransactionKey,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_evidence_planner_composition import (  # noqa: E501
+    plan_participants_with_evidence,
+)
 from mozyo_bridge.core.state.replacement_transaction_model import (
     PARTICIPANT_CLOSE_OWED,
     PARTICIPANT_LAUNCH_OWED,
@@ -830,6 +833,25 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
                 )
                 for slot in selected
             )
+            planning = plan_participants_with_evidence(
+                planned,
+                home=self.transaction_store.path.parent,
+                # `fresh` is the approval-bound observation this branch already proved
+                # byte-equal to the pre-approval one; `initial.workspace_id` is what the
+                # transaction key was built from, and they are the same workspace by that
+                # equality. Naming the one the key used keeps the plan and its key reading
+                # the same authority.
+                workspace_id=initial.workspace_id,
+                lane_id=request.lane,
+            )
+            if planning.refused:
+                # Before plan_transaction: no row, no supersede, no actuation.
+                return PreparationDrive(
+                    False,
+                    "transaction_conflict",
+                    f"update evidence planning refused ({planning.refusal})",
+                )
+            planned = tuple(planning.participants)
             try:
                 result = self.transaction_store.plan_transaction(
                     key,

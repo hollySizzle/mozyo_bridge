@@ -407,6 +407,51 @@ class _HostileText(str):
     __hash__ = str.__hash__
 
 
+class CurrentRowIsTheOnlyBindingTest(unittest.TestCase):
+    """Ruling j#97105: capability is read from the participant's OWN current row.
+
+    A legacy pass-through decided from a row that belongs to someone else would be reading
+    a stranger's action id as proof that THIS participant predates identity receipts -- the
+    capability laundering j#96892 closed, arriving through the cheaper door.
+    """
+
+    def _refuses(self, reason, **ports):
+        with self.assertRaises(EvidencePlanRefused) as ctx:
+            _Ports(**ports).planner().plan([_pin()], CONTEXT)
+        self.assertEqual(ctx.exception.reason, reason)
+
+    def test_a_legacy_action_on_a_foreign_row_does_not_pass_through(self) -> None:
+        for label, generation in (
+            ("another workspace", _generation(action_id=LEGACY_ACTION, workspace="wB")),
+            ("another lane", _generation(action_id=LEGACY_ACTION, lane="issue_OTHER")),
+            ("another role", _generation(action_id=LEGACY_ACTION, role="worker")),
+            ("another slot", _generation(action_id=LEGACY_ACTION, assigned="someone_else")),
+            ("a recycled pane", _generation(action_id=LEGACY_ACTION, locator="wA:p9")),
+        ):
+            with self.subTest(label=label):
+                self._refuses("generation_mismatch", generation=generation)
+
+    def test_a_legacy_action_on_its_own_current_row_still_passes_through(self) -> None:
+        """The positive control: an exactly-matched legacy row is unchanged and free."""
+        ports = _Ports(generation=_generation(action_id=LEGACY_ACTION))
+        the_pin = _pin()
+        plan = ports.planner().plan([the_pin], CONTEXT)
+        self.assertEqual(plan.outcome, PLAN_LEGACY_UNCHANGED)
+        self.assertIs(plan.participants[0], the_pin)
+        self.assertEqual(ports.evidence_calls, 0)
+        self.assertEqual(ports.lifecycle_calls, 0)
+
+    def test_a_pending_row_refuses_before_capability_is_consulted(self) -> None:
+        """Absent / unreadable / not-attested stay typed refusals, whatever the shape."""
+        seen = []
+        with self.assertRaises(EvidencePlanRefused) as ctx:
+            _Ports(generation=_generation(action_id=LEGACY_ACTION, phase="pending")).planner(
+                capability=lambda action_id: seen.append(action_id) or False
+            ).plan([_pin()], CONTEXT)
+        self.assertEqual(ctx.exception.reason, "generation_not_attested")
+        self.assertEqual(seen, [])
+
+
 class NontextAuthorityTest(unittest.TestCase):
     """Audit j#97083: a foreign value must never get to run code on the way to a refusal.
 

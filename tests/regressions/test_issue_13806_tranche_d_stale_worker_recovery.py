@@ -32,6 +32,10 @@ from mozyo_bridge.core.state.replacement_preservation import (  # noqa: E402
     PreservationObservation,
     assess_worker_recovery_preservation,
 )
+from tests.support.current_launch_authority import (  # noqa: E402
+    RECEIPT_CAPABLE_ACTION_ID,
+    seed_current_generation,
+)
 from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
     ContinuationPointer,
     DecisionPointer,
@@ -214,6 +218,19 @@ class _RecoveryCase(unittest.TestCase):
         self.store = ReplacementTransactionStore(home=self.home)
         self.workspace_id = "ws"
         self.port = FakeActuatorPort()
+        # Ruling j#97105: the recovery reads this worker's CURRENT launch-generation row.
+        # A home without one is a lane whose current authority is missing, which refuses --
+        # so the pre-#14741 path is seeded explicitly as a canonical untagged action id.
+        self._seed_current_authority()
+
+    def _seed_current_authority(self, **overrides):
+        base = dict(
+            workspace_id=self.workspace_id, lane_id=WORKER["lane_id"],
+            role=WORKER["role"], assigned_name=WORKER["assigned_name"],
+            locator=WORKER["old_locator"],
+        )
+        base.update(overrides)
+        seed_current_generation(self.home, **base)
 
     def _request(self, **overrides) -> RecoveryRequest:
         base = dict(
@@ -248,6 +265,72 @@ class _RecoveryCase(unittest.TestCase):
 
 
 # -- 1. shell-residue success (full happy path) ---------------------------------
+
+
+class CurrentLaunchAuthorityTests(_RecoveryCase):
+    """Ruling j#97105: this worker's own current row is the only capability binding.
+
+    Each refusal is zero-effect -- the planner runs before the transaction plan, so no row,
+    no supersede and no actuation are left behind.
+    """
+
+    def _fresh_home(self):
+        self.home = Path(tempfile.mkdtemp())
+        self.store = ReplacementTransactionStore(home=self.home)
+
+    def _assert_zero_effect(self, outcome):
+        self.assertEqual(outcome.status, RECOVERY_REFUSED)
+        self.assertIn("update evidence planning refused", outcome.detail)
+        self.assertIsNone(self._phase(), "no transaction row was created")
+        self.assertEqual(self.port.closed, [])
+        self.assertEqual(self.port.launched, [])
+
+    def test_a_canonical_legacy_current_row_recovers_byte_invariantly(self):
+        """The positive control: the pre-#14741 path, now stated rather than assumed."""
+        outcome = self._use_case(FakeRecoveryOps(_all_clear())).run(
+            self._request(), execute=True
+        )
+        self.assertEqual(outcome.status, RECOVERY_COMPLETED)
+        key = ReplacementTransactionKey(self.workspace_id, ACTION_ID)
+        stored = self.store.get(key).participants[0]
+        self.assertEqual(
+            (
+                stored.evidence_workspace_id,
+                stored.evidence_startup_action_id,
+                stored.evidence_cause,
+            ),
+            ("", "", ""),
+            "a legacy participant carries no evidence, and none was invented for it",
+        )
+
+    def test_an_absent_current_row_is_a_typed_zero_effect_refusal(self):
+        self._fresh_home()
+        self._assert_zero_effect(
+            self._use_case(FakeRecoveryOps(_all_clear())).run(self._request(), execute=True)
+        )
+
+    def test_a_current_row_for_another_slot_is_a_typed_zero_effect_refusal(self):
+        for label, override in (
+            ("another workspace", dict(workspace_id="OTHER_WS")),
+            ("a recycled pane", dict(locator="w99:pZ")),
+        ):
+            with self.subTest(label=label):
+                self.setUp()
+                self._fresh_home()
+                self._seed_current_authority(**override)
+                self._assert_zero_effect(
+                    self._use_case(FakeRecoveryOps(_all_clear())).run(
+                        self._request(), execute=True
+                    )
+                )
+
+    def test_a_receipt_capable_current_row_without_receipts_refuses(self):
+        """Capability lives in the action id, so a tagged row cannot fall back to legacy."""
+        self._fresh_home()
+        self._seed_current_authority(action_id=RECEIPT_CAPABLE_ACTION_ID)
+        self._assert_zero_effect(
+            self._use_case(FakeRecoveryOps(_all_clear())).run(self._request(), execute=True)
+        )
 
 
 class HappyPathTests(_RecoveryCase):

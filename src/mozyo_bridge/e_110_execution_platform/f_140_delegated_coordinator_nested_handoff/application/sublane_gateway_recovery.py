@@ -53,6 +53,9 @@ from mozyo_bridge.core.state.replacement_transaction import (
     ReplacementTransactionKey,
     ReplacementTransactionStore,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_evidence_planner_composition import (  # noqa: E501
+    plan_participants_with_evidence,
+)
 from mozyo_bridge.core.state.replacement_transaction_model import (
     ContinuationPointerError,
     DecisionPointerError,
@@ -594,6 +597,17 @@ class GatewayRefreshUseCase:
         except ValueError:
             return refused("workspace / action identity is incomplete")
         gen = request.action_generation
+
+        # 1b. Pin the update evidence this replacement rests on, through the ONE planner
+        # authority (j#97093 decision 2). Zero-effect on refusal: this runs before the plan,
+        # so nothing is written, superseded or actuated.
+        planning = plan_participants_with_evidence(
+            [gateway], home=self._store.path.parent,
+            workspace_id=self._workspace_id, lane_id=gateway.lane_id,
+        )
+        if planning.refused:
+            return refused(f"update evidence planning refused ({planning.refusal})")
+        gateway = planning.participants[0]
 
         # 2. Plan (or idempotently resume) the non-self refresh transaction.
         plan = self._store.plan_transaction(

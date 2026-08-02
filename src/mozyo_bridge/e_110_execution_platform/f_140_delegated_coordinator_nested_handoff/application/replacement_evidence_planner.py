@@ -289,10 +289,14 @@ class ReplacementEvidencePlanner:
                     REFUSE_UNKNOWN_ACTION_SHAPE,
                     "the startup action id matches no known shape",
                 )
+            # The current row must be EXACTLY this participant before its action id is
+            # allowed to say anything about capability (ruling j#97105). A legacy
+            # pass-through decided from a row that belongs to someone else would be reading
+            # a stranger's action id as proof that THIS participant predates receipts.
+            self._require_generation_identity(pin, generation, context)
             if not self._requires_receipt(action_id):
                 planned.append(self._legacy_pin(pin))
                 continue
-            self._require_generation_identity(pin, generation, context)
             planned.append(self._receipt_pin(pin, action_id, context))
             touched = True
         return EvidencePlan(

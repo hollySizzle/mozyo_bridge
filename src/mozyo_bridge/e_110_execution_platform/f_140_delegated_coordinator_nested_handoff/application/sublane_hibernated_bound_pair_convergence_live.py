@@ -46,6 +46,9 @@ from mozyo_bridge.core.state.replacement_transaction import (
     ReplacementTransactionKey,
     ReplacementTransactionStore,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_evidence_planner_composition import (  # noqa: E501
+    plan_participants_with_evidence,
+)
 from mozyo_bridge.core.state.replacement_transaction_model import (
     PARTICIPANT_CLOSE_OWED,
     PHASE_COMPLETED,
@@ -661,6 +664,20 @@ class LiveBoundPairConvergenceOps:
                     )
                     for slot in recover
                 ]
+                planning = plan_participants_with_evidence(
+                    participants,
+                    home=self.transaction_store.path.parent,
+                    workspace_id=initial_observation.workspace_id,
+                    lane_id=request.lane,
+                )
+                if planning.refused:
+                    # Before plan_transaction: no row, no supersede, no actuation.
+                    return ReplacementDrive(
+                        False,
+                        "transaction_conflict",
+                        f"update evidence planning refused ({planning.refusal})",
+                    )
+                participants = list(planning.participants)
                 planned_participants = tuple(participants)
                 plan = self.transaction_store.plan_transaction(
                     key,

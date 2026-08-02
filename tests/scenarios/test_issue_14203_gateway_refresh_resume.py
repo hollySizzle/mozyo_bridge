@@ -22,6 +22,9 @@ from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
     ReplacementTransactionKey,
     ReplacementTransactionStore,
 )
+from tests.support.current_launch_authority import (  # noqa: E402
+    seed_current_generation,
+)
 from mozyo_bridge.core.state.replacement_transaction_model import (  # noqa: E402
     PHASE_COMPLETED,
 )
@@ -60,6 +63,12 @@ class GatewayRefreshResumeScenario(unittest.TestCase):
         self.home = Path(tempfile.mkdtemp())
         self.store = ReplacementTransactionStore(home=self.home)
         self.port = FakeActuatorPort()
+        # Ruling j#97105: seed this gateway's CURRENT (pre-#14741, untagged) row.
+        seed_current_generation(
+            self.home, workspace_id="ws", lane_id=GATEWAY["lane_id"],
+            role=GATEWAY["role"], assigned_name=GATEWAY["assigned_name"],
+            locator=GATEWAY["old_locator"],
+        )
 
     def _request(self) -> GatewayRefreshRequest:
         return GatewayRefreshRequest(

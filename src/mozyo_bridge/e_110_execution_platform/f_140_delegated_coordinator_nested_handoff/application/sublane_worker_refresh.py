@@ -56,6 +56,9 @@ from mozyo_bridge.core.state.replacement_transaction import (
     ReplacementTransactionKey,
     ReplacementTransactionStore,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_evidence_planner_composition import (  # noqa: E501
+    plan_participants_with_evidence,
+)
 from mozyo_bridge.core.state.replacement_transaction_model import (
     ContinuationPointerError,
     DecisionPointerError,
@@ -636,6 +639,16 @@ class WorkerRefreshUseCase:
         except ValueError:
             return refused("workspace / action identity is incomplete")
         gen = request.action_generation
+
+        # 1b. The ONE planner authority for this participant's update evidence (j#97093
+        # decision 2), before the plan and therefore zero-effect on refusal.
+        planning = plan_participants_with_evidence(
+            [worker], home=self._store.path.parent,
+            workspace_id=self._workspace_id, lane_id=worker.lane_id,
+        )
+        if planning.refused:
+            return refused(f"update evidence planning refused ({planning.refusal})")
+        worker = planning.participants[0]
 
         # 2. Plan (or idempotently resume) the non-self refresh transaction.
         plan = self._store.plan_transaction(

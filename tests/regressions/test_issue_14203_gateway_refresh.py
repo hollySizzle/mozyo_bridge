@@ -28,6 +28,11 @@ from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
 from mozyo_bridge.core.state.replacement_transaction_model import (  # noqa: E402
     ParticipantPin,
 )
+from tests.support.current_launch_authority import (  # noqa: E402
+    LEGACY_ACTION_ID,
+    RECEIPT_CAPABLE_ACTION_ID,
+    seed_current_generation,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.fresh_coordinator_drain import (  # noqa: E402,E501
     DRAIN_SEND_ERROR,
     DRAIN_SEND_OK,
@@ -208,6 +213,20 @@ class _RefreshCase(unittest.TestCase):
         self.store = ReplacementTransactionStore(home=self.home)
         self.workspace_id = "ws"
         self.port = FakeActuatorPort()
+        # Ruling j#97105: a refresh reads the participant's CURRENT launch-generation row,
+        # and a home without one is not a production lane -- it is a lane whose current
+        # authority is missing, which refuses. So the pre-#14741 path is stated as a fact
+        # about this exact slot: a canonical untagged `startup-<64hex>` row.
+        self._seed_current_authority()
+
+    def _seed_current_authority(self, **overrides):
+        base = dict(
+            workspace_id=self.workspace_id, lane_id=GATEWAY["lane_id"],
+            role=GATEWAY["role"], assigned_name=GATEWAY["assigned_name"],
+            locator=GATEWAY["old_locator"],
+        )
+        base.update(overrides)
+        seed_current_generation(self.home, **base)
 
     def _request(self, **overrides) -> GatewayRefreshRequest:
         base = dict(
@@ -352,7 +371,13 @@ class ExecuteRefusalTests(_RefreshCase):
         # The decision / continuation pointers are the use case's own, learned from a run
         # against a throwaway store so this test states a stored-row conflict rather than
         # re-implementing how the pointers are built.
-        scratch = ReplacementTransactionStore(home=Path(tempfile.mkdtemp()))
+        scratch_home = Path(tempfile.mkdtemp())
+        seed_current_generation(
+            scratch_home, workspace_id=self.workspace_id, lane_id=GATEWAY["lane_id"],
+            role=GATEWAY["role"], assigned_name=GATEWAY["assigned_name"],
+            locator=GATEWAY["old_locator"],
+        )
+        scratch = ReplacementTransactionStore(home=scratch_home)
         GatewayRefreshUseCase(
             scratch, FakeActuatorPort(), FakeGatewayOps(),
             workspace_id=self.workspace_id, clock=lambda: FIXED,
@@ -371,6 +396,83 @@ class ExecuteRefusalTests(_RefreshCase):
         self.assertEqual(self.port.launched, [])
         stored = self.store.get(key).participants[0]
         self.assertEqual(stored.evidence_cause, "update_relaunch")
+
+
+class CurrentLaunchAuthorityTests(_RefreshCase):
+    """Ruling j#97105: the participant's own current row is the only capability binding.
+
+    Every case here is zero-effect on refusal -- the planner runs BEFORE the transaction
+    plan, so a refused refresh leaves no row, no supersede and no actuation behind.
+    """
+
+    def _run(self, ops=None):
+        return self._use_case(ops or FakeGatewayOps()).run(self._request(), execute=True)
+
+    def _assert_zero_effect(self, outcome, ops):
+        self.assertEqual(outcome.status, REFRESH_STATUS_REFUSED)
+        self.assertIn("update evidence planning refused", outcome.detail)
+        self.assertIsNone(self._row(), "no transaction row was created")
+        self.assertEqual(self.port.closed, [])
+        self.assertEqual(self.port.launched, [])
+        self.assertEqual(ops.resumes, [])
+
+    def test_a_canonical_legacy_current_row_refreshes_byte_invariantly(self):
+        """The positive control the seeded authority buys: unchanged pre-#14741 behaviour."""
+        ops = FakeGatewayOps()
+        outcome = self._run(ops)
+        self.assertEqual(outcome.status, REFRESH_STATUS_COMPLETED)
+        stored = self._row().participants[0]
+        self.assertEqual(
+            (
+                stored.evidence_workspace_id,
+                stored.evidence_startup_action_id,
+                stored.evidence_cause,
+            ),
+            ("", "", ""),
+            "a legacy participant carries no evidence, and none was invented for it",
+        )
+
+    def test_an_absent_current_row_is_a_typed_zero_effect_refusal(self):
+        """`generation_unavailable`: nobody recorded which action this slot belongs to."""
+        self.home = Path(tempfile.mkdtemp())
+        self.store = ReplacementTransactionStore(home=self.home)
+        ops = FakeGatewayOps()
+        self._assert_zero_effect(self._run(ops), ops)
+
+    def test_a_pending_current_row_is_a_typed_zero_effect_refusal(self):
+        """A launch that never proved it came up cannot back a replacement's evidence."""
+        self.home = Path(tempfile.mkdtemp())
+        self.store = ReplacementTransactionStore(home=self.home)
+        self._seed_current_authority(attested=False)
+        ops = FakeGatewayOps()
+        self._assert_zero_effect(self._run(ops), ops)
+
+    def test_a_current_row_for_another_slot_is_a_typed_zero_effect_refusal(self):
+        """A row that belongs to someone else is not this participant's authority."""
+        for label, override in (
+            ("another workspace", dict(workspace_id="OTHER_WS")),
+            ("another lane", dict(lane_id="issue_other")),
+            ("a recycled pane", dict(locator="w:99")),
+        ):
+            with self.subTest(label=label):
+                self.setUp()
+                self.home = Path(tempfile.mkdtemp())
+                self.store = ReplacementTransactionStore(home=self.home)
+                self._seed_current_authority(**override)
+                ops = FakeGatewayOps()
+                self._assert_zero_effect(self._run(ops), ops)
+
+    def test_a_receipt_capable_current_row_without_receipts_refuses(self):
+        """Capability lives in the action id, so a tagged row cannot fall back to legacy.
+
+        There is no receipt store in this home. A capable action therefore refuses rather
+        than being read as "no evidence, so pre-feature" -- the laundering j#96892 closed.
+        """
+        self.home = Path(tempfile.mkdtemp())
+        self.store = ReplacementTransactionStore(home=self.home)
+        self._seed_current_authority(action_id=RECEIPT_CAPABLE_ACTION_ID)
+        ops = FakeGatewayOps()
+        self._assert_zero_effect(self._run(ops), ops)
 
 
 class HappyPathTests(_RefreshCase):

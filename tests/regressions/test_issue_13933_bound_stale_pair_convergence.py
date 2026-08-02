@@ -15,6 +15,9 @@ from unittest import mock
 from mozyo_bridge.core.state.lane_release_observation import (  # noqa: E402
     build_release_observation,
 )
+from tests.support.current_launch_authority import (  # noqa: E402
+    seed_current_generation,
+)
 from mozyo_bridge.core.state.herdr_identity_attestation import (
     HerdrIdentityAttestationStore,
     IdentityAttestationRecord,
@@ -520,8 +523,19 @@ class LiveActuatorBoundaryTests(unittest.TestCase):
         _preflight, fields = _authorize(auth_ops)
         expectation = _expectation_from(auth_ops, fields)
 
+        # Ruling j#97105: the plan reads the participants' CURRENT launch-generation rows
+        # from the store's own home, so this fake carries a real (temp) path and the lane's
+        # pre-#14741 rows are seeded for the exact slots the observation recovers.
+        recording_home = Path(tempfile.mkdtemp())
+        for slot in initial.slots:
+            seed_current_generation(
+                recording_home, workspace_id=initial.workspace_id, lane_id=REQ.lane,
+                role=slot.role, assigned_name=slot.assigned_name, locator=slot.locator,
+            )
+
         class RecordingStore:
             plan_calls = 0
+            path = recording_home / "state.sqlite"
 
             def get(self, key):
                 return None
@@ -538,6 +552,41 @@ class LiveActuatorBoundaryTests(unittest.TestCase):
         result = ops.drive_replacement(REQ, expectation, initial)
         self.assertFalse(result.ok)
         self.assertEqual(store.plan_calls, 1)
+
+    def test_transaction_plan_write_requires_a_current_launch_authority(self):
+        """Ruling j#97105: no current row for a participant means no plan at all.
+
+        The sibling test above proves the plan IS reached once every slot's current row is
+        seeded. This one removes that seeding and asserts the write never happens: the
+        planner runs before ``plan_transaction``, so the refusal is zero-effect rather than
+        a row that has to be cleaned up afterwards.
+        """
+        auth_ops = FakeOps(_observation())
+        initial = auth_ops.observe(REQ)
+        _preflight, fields = _authorize(auth_ops)
+        expectation = _expectation_from(auth_ops, fields)
+
+        class RecordingStore:
+            plan_calls = 0
+            path = Path(tempfile.mkdtemp()) / "state.sqlite"
+
+            def get(self, key):
+                return None
+
+            def plan_transaction(self, *args, **kwargs):
+                self.plan_calls += 1
+                return SimpleNamespace(applied=False, reason="test_refusal")
+
+        store = RecordingStore()
+        ops = LiveBoundPairConvergenceOps(
+            repo_root=Path("/coordinator"), env={}, transaction_store=store
+        )
+        ops.observe = mock.Mock(return_value=initial)
+        result = ops.drive_replacement(REQ, expectation, initial)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "transaction_conflict")
+        self.assertIn("update evidence planning refused", result.detail)
+        self.assertEqual(store.plan_calls, 0)
 
     def test_unreadable_inventory_is_zero_effect(self):
         ops = FakeOps(_observation(inventory_readable=False))
@@ -2310,6 +2359,16 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
             self._seed_released_bound_lifecycle(
                 home, workspace, identity, gw_name=gw_name, gw_old=gw_old
             )
+            # Ruling j#97105: the discard plan reads each participant's CURRENT
+            # launch-generation row. This lane is a pre-#14741 one, and that is now a
+            # recorded fact about these two exact slots rather than the absence of a row.
+            for name, locator, role in (
+                (gw_name, gw_old, "gateway"), (wk_name, wk_old, "worker"),
+            ):
+                seed_current_generation(
+                    home, workspace_id=workspace, lane_id=self.LANE, role=role,
+                    assigned_name=name, locator=locator,
+                )
 
             # Real inventory: the FakeHerdr rows enriched with the ``revision`` / ``foreground_cwd``
             # fields real herdr carries (the fake omits them) so the real pending-composer

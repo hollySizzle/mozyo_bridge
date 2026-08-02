@@ -49,6 +49,9 @@ import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_
 from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
     HerdrIdentityReplacementBindingStore,
 )
+from tests.support.current_launch_authority import (  # noqa: E402
+    seed_current_generation,
+)
 from mozyo_bridge.core.state.replacement_preservation import PreservationObservation
 from mozyo_bridge.core.state.replacement_transaction import ReplacementTransactionStore
 from mozyo_bridge.core.state.startup_transaction_fence import (
@@ -295,6 +298,14 @@ class RealDriveWiringTest(unittest.TestCase):
     def setUp(self):
         self.home = Path(tempfile.mkdtemp())
         self.obs = _observation()
+        # Ruling j#97105: the discard plan reads each participant's CURRENT
+        # launch-generation row, and this lane is a pre-#14741 one -- stated for the exact
+        # slots the observation carries rather than left absent (which now refuses).
+        for slot in self.obs.slots:
+            seed_current_generation(
+                self.home, workspace_id=WS, lane_id=LANE, role=slot.role,
+                assigned_name=slot.assigned_name, locator=slot.locator,
+            )
         self.unit = StartupUnit(WS, LANE, _MANAGED)
         self.nonce = "n1"
         self.action_id = startup_action_id(self.unit, self.nonce)

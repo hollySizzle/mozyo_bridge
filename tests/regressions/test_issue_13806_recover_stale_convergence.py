@@ -42,6 +42,9 @@ from mozyo_bridge.core.state.replacement_preservation import (  # noqa: E402
     PRESERVE_IDENTITY_MISMATCH,
     PreservationObservation,
 )
+from tests.support.current_launch_authority import (  # noqa: E402
+    seed_current_generation,
+)
 from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
     CAS_ACTION_MISMATCH,
     CAS_APPLIED,
@@ -530,6 +533,13 @@ class _ConvergenceCase(unittest.TestCase):
         self.store = ReplacementTransactionStore(home=self.home)
         self.key = ReplacementTransactionKey(WS, ACTION_ID)
         self.port = _FakeActuatorPort()
+        # Ruling j#97105: the recovery reads this worker's CURRENT launch-generation row,
+        # and this lane is a pre-#14741 one -- stated as a canonical untagged row for the
+        # exact slot rather than left as an absent authority (which now refuses).
+        seed_current_generation(
+            self.home, workspace_id=WS, lane_id=LANE, role=ROLE,
+            assigned_name=NAME, locator=LOCATOR,
+        )
 
     def _seed_a10_residue(self, *, lane_revision="0"):
         """The durable mis-bound residue the installed a10 left: replacing_nonself, worker

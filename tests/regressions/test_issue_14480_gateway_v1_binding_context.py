@@ -44,6 +44,9 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (  # noqa: E402
     HerdrIdentityAttestationStore,
     IdentityAttestationRecord,
 )
+from tests.support.current_launch_authority import (  # noqa: E402
+    seed_current_generation,
+)
 from mozyo_bridge.core.state.replacement_preservation import (  # noqa: E402
     PreservationObservation,
 )
@@ -647,6 +650,12 @@ class PublicOutcomeTests(unittest.TestCase):
     def setUp(self):
         self.home = Path(tempfile.mkdtemp())
         self.store = ReplacementTransactionStore(home=self.home)
+        # Ruling j#97105: seed this gateway's CURRENT (pre-#14741, untagged) row, so the
+        # launch fence under test is reached instead of the missing-authority refusal.
+        seed_current_generation(
+            self.home, workspace_id=WS, lane_id=LANE, role=GATEWAY_PROVIDER,
+            assigned_name="gw", locator=OLD_GATEWAY_LOCATOR,
+        )
 
     def _request(self) -> GatewayRefreshRequest:
         return GatewayRefreshRequest(

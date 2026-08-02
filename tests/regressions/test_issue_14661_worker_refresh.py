@@ -25,6 +25,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from mozyo_bridge.core.state.replacement_preservation import (  # noqa: E402
     PreservationObservation,
 )
+from tests.support.current_launch_authority import (  # noqa: E402
+    RECEIPT_CAPABLE_ACTION_ID,
+    seed_current_generation,
+)
 from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
     ReplacementTransactionKey,
     ReplacementTransactionStore,
@@ -240,6 +244,19 @@ class _RefreshCase(unittest.TestCase):
         self.store = ReplacementTransactionStore(home=self.home)
         self.workspace_id = "ws"
         self.port = FakeActuatorPort()
+        # Ruling j#97105: the refresh reads this worker's CURRENT launch-generation row.
+        # A home without one is a missing current authority, which refuses -- so the
+        # pre-#14741 path is a recorded fact about this exact slot.
+        self._seed_current_authority()
+
+    def _seed_current_authority(self, **overrides):
+        base = dict(
+            workspace_id=self.workspace_id, lane_id=WORKER["lane_id"],
+            role=WORKER["role"], assigned_name=WORKER["assigned_name"],
+            locator=WORKER["old_locator"],
+        )
+        base.update(overrides)
+        seed_current_generation(self.home, **base)
 
     def _request(self, **overrides) -> WorkerRefreshRequest:
         base = dict(

@@ -46,6 +46,9 @@ from mozyo_bridge.core.state.replacement_transaction import (
     ReplacementTransactionKey,
     ReplacementTransactionStore,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_evidence_planner_composition import (  # noqa: E501
+    plan_participants_with_evidence,
+)
 from mozyo_bridge.core.state.replacement_transaction_model import (
     ContinuationPointerError,
     DecisionPointerError,
@@ -592,6 +595,18 @@ class StaleWorkerRecoveryUseCase:
                 request, verdict, status=RECOVERY_REFUSED, executed=True,
                 observation=observation, detail="approved worker pin is incomplete",
             )
+        planning = plan_participants_with_evidence(
+            [worker], home=self._store.path.parent,
+            workspace_id=self._workspace_id, lane_id=worker.lane_id,
+        )
+        if planning.refused:
+            # Zero-effect: before the plan, before any supersede, before any actuation.
+            return self._outcome(
+                request, verdict, status=RECOVERY_REFUSED, executed=True,
+                observation=observation,
+                detail=f"update evidence planning refused ({planning.refusal})",
+            )
+        worker = planning.participants[0]
         try:
             key = ReplacementTransactionKey(self._workspace_id, expected_action)
         except ValueError:
