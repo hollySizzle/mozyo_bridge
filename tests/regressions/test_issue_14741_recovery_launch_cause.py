@@ -204,6 +204,24 @@ class PropagationTest(unittest.TestCase):
             start._prepare_session_locked = original
         return seen
 
+    def test_the_binding_rail_hands_the_cause_to_the_locked_entry(self) -> None:
+        """The lock-held rail, actually driven.
+
+        Scoped to `admission_lock_held=True`: the no-lock rail goes through the public
+        `prepare_session`, which acquires a real lock on a real home, so it is covered by
+        the public-wrapper tests below instead of being driven from here. Measured: this
+        path does NOT catch a kwarg dropped at the public wrapper's call dict, so it is not
+        offered as evidence for that hop -- only for this one.
+        """
+        seen = self._capture_through_binding(
+            admission_lock_held=True, launch_cause=LAUNCH_CAUSE_UPDATE_RELAUNCH
+        )
+        self.assertEqual(seen["launch_cause"], LAUNCH_CAUSE_UPDATE_RELAUNCH)
+
+    def test_the_binding_rail_defaults_to_unarmed(self) -> None:
+        seen = self._capture_through_binding(admission_lock_held=True)
+        self.assertEqual(seen["launch_cause"], LAUNCH_CAUSE_GENERIC_FRESH)
+
     def test_the_public_wrapper_forwards_an_armed_cause(self) -> None:
         seen = self._capture_through_public_wrapper(
             launch_cause=LAUNCH_CAUSE_UPDATE_RELAUNCH
