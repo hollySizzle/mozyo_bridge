@@ -237,11 +237,38 @@ _IDENTITY_MANIFEST_SHAPE = (
 )
 
 
+def _canonical_manifest_sql() -> str:
+    """The exact ``sqlite_schema.sql`` text SQLite stores for this build's table."""
+    return " ".join(_IDENTITY_MANIFEST_SQL.split()).strip()
+
+
 def _manifest_table_state(conn) -> str:
     """``"absent"`` / ``"exact"`` — or raise for anything else (zero-write)."""
     rows = conn.execute(f"PRAGMA table_info({_IDENTITY_MANIFEST_TABLE})").fetchall()
     if not rows:
         return "absent"
+    # Audit j#96946 C3: `table_info` reports columns and NOTHING else, so a table carrying
+    # an extra CHECK, a UNIQUE constraint, an index, or a trigger passed as "exact" and was
+    # then written into. The stored DDL text is what actually distinguishes this build's
+    # table from one that merely has the same columns, and attached indexes/triggers are
+    # separate schema objects that `table_info` cannot see at all.
+    stored = conn.execute(
+        "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?",
+        (_IDENTITY_MANIFEST_TABLE,),
+    ).fetchone()
+    stored_sql = " ".join(str(stored[0] or "").split()).strip() if stored else ""
+    attached = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE type IN ('index','trigger')"
+        " AND tbl_name=? AND sql IS NOT NULL",
+        (_IDENTITY_MANIFEST_TABLE,),
+    ).fetchone()
+    if stored_sql != _canonical_manifest_sql() or (attached and attached[0]):
+        raise StartupTransactionError(
+            f"{REASON_RECEIPT_REQUIREMENT_UNAVAILABLE}: the "
+            f"{_IDENTITY_MANIFEST_TABLE!r} table's stored schema is not the one this build "
+            "creates (constraint drift, or an attached index/trigger); refusing to read or "
+            "write it — nothing was started"
+        )
     actual = tuple(
         (int(r[0]), str(r[1]), str(r[2]).upper(), int(r[3]), r[4], int(r[5])) for r in rows
     )
@@ -276,7 +303,14 @@ class IdentityManifestSlot:
     def canonical(self) -> tuple:
         provider = _norm(self.provider)
         assigned = _norm(self.assigned_name)
-        required = bool(self.identity_receipt_required)
+        # Audit j#96946 C4: `bool(...)` launders 1 / "yes" / any truthy object into True, so
+        # a stored payload could carry a non-boolean and still read as an obligation. The
+        # flag must BE a boolean, in the payload and on the way back out.
+        if self.identity_receipt_required is not True and self.identity_receipt_required is not False:
+            raise ValueError(
+                "identity_receipt_required must be exactly True or False, not a truthy value"
+            )
+        required = self.identity_receipt_required
         digest = _norm(self.identity_digest)
         if not provider or not assigned:
             raise ValueError("a manifest slot requires an exact provider and assigned name")
@@ -328,6 +362,14 @@ class IdentityManifest:
         slots = [slot.canonical() for slot in self.slots]
         if len({(s[0], s[1]) for s in slots}) != len(slots):
             raise ValueError("a launch manifest must not repeat a (provider, assigned) slot")
+        # Audit j#96946 C4: an assigned name is a herdr identity and is unique across the
+        # WHOLE host, so two providers claiming one is not a plan — it is a plan that cannot
+        # be launched. Uniqueness per (provider, assigned) is not enough.
+        if len({s[1] for s in slots}) != len(slots):
+            raise ValueError(
+                "a launch manifest must not give two slots the same assigned name; "
+                "assigned names are host-unique herdr identities"
+            )
         return json.dumps(
             [protocol, workspace, lane, slots],
             ensure_ascii=True,
@@ -402,7 +444,26 @@ def read_identity_manifest(fence, action_id: str):
     values = dict(zip(_IDENTITY_MANIFEST_COLUMNS, row))
     try:
         decoded = json.loads(values["slots"])
+        if not isinstance(decoded, list) or len(decoded) != 4:
+            raise ValueError("payload is not the 4-element canonical form")
         protocol, workspace, lane, slots = decoded
+        # Audit j#96946 C6: the stored `protocol` COLUMN is a separate mutable field. It
+        # must be this build's protocol AND byte-identical to the payload's, or the row and
+        # the plan it claims to file are describing different contracts.
+        if protocol != IDENTITY_MANIFEST_PROTOCOL or values["protocol"] != protocol:
+            raise ValueError("stored protocol column and payload protocol disagree")
+        if not isinstance(slots, list) or not slots:
+            raise ValueError("payload slots are not a non-empty list")
+        for slot in slots:
+            # Audit j#96946 C4: exact raw shape. A 3-tuple, a stringly-typed flag, or an
+            # integer 1 must not decode into an obligation — `bool(1)` is True and that is
+            # precisely the laundering this check exists to stop.
+            if not isinstance(slot, list) or len(slot) != 4:
+                raise ValueError("a payload slot is not the 4-element canonical form")
+            if not all(isinstance(part, str) for part in (slot[0], slot[1], slot[3])):
+                raise ValueError("a payload slot carries a non-string field")
+            if slot[2] is not True and slot[2] is not False:
+                raise ValueError("a payload slot's receipt flag is not a JSON boolean")
         manifest = IdentityManifest(
             workspace_id=workspace,
             lane_id=lane,
@@ -503,7 +564,7 @@ def resolve_reserve_identity(canonical, nonce: str, manifest):
 
 def verify_manifest_binding(
     action_id: str, *, workspace_id: str, lane_id: str, providers, nonce: str, digest: str
-) -> None:
+) -> None:  # noqa: D401
     """Recompute ``action_id`` from the stored row and require a byte-exact match.
 
     Audit j#96928 F1. The previous reader only checked that the payload reproduced the
@@ -513,6 +574,15 @@ def verify_manifest_binding(
     recompute the id. That needs the nonce, which is why it is now stored beside the
     manifest: without it the binding was an assertion, not a check.
     """
+    # Audit j#96946 C4: the witness is compared RAW. `startup_action_id` normalises its
+    # nonce, so a padded stored nonce would still re-derive the same id and a tampered
+    # witness would pass. A stored witness that is not already canonical is itself the
+    # tamper signal.
+    if nonce != _norm(nonce):
+        raise StartupTransactionError(
+            f"{REASON_RECEIPT_REQUIREMENT_UNAVAILABLE}: startup action {action_id!r} has a "
+            "stored binding witness that is not canonical; zero-actuation"
+        )
     rederived = startup_action_id(
         StartupUnit(workspace_id=workspace_id, lane_id=lane_id, providers=tuple(providers)),
         nonce,
@@ -675,6 +745,12 @@ def reserve_or_replay(
     reuse and refuses; nothing is ever updated or replaced. A LEGACY reserve keeps its
     existing contract exactly: a repeat is a reuse, full stop.
     """
+    # Audit j#96946 C2: a nonce identifies ONE action, and a tagged id folds the manifest
+    # digest into itself — so looking up only the id we are about to write meant the same
+    # (unit, nonce) with a DIFFERENT plan hashed to a different id and was inserted as a
+    # second action. The nonce authority has to be digest-independent, so both the legacy
+    # id for this (unit, nonce) and any manifest row already filed under it are checked.
+    _refuse_conflicting_nonce(conn, action_id=action_id, canonical=canonical, nonce=nonce)
     existing = conn.execute(
         "SELECT phase FROM startup_actions WHERE action_id = ?", (action_id,)
     ).fetchone()
@@ -764,137 +840,50 @@ def require_v2_for_tagged_reserve(conn) -> None:
 
 
 
-# --- Offline v1 -> v2 migration primitive (Design Answer j#96936 items 3, 5, 7) ----------
-#
-# #14741 owns this PRIMITIVE and its regressions; #14838 owns the orchestration around it
-# (stop every consumer, back up, migrate the sibling stores too, restart on an attested new
-# binary, verify health, roll back). The real migration of a shared home runs only under
-# that rail with exact owner approval — nothing here is invoked by a normal startup.
+def _refuse_conflicting_nonce(conn, *, action_id: str, canonical, nonce: str) -> None:
+    """Refuse a reserve whose (unit, nonce) already names a DIFFERENT action (zero-write).
 
-MIGRATION_OK = "migrated"
-#: Already v2 and exactly the shape v2 requires. Idempotent replay of a completed rollout.
-MIGRATION_ALREADY_V2 = "already_v2"
-#: A consumer still holds the store. Migrating under a live peer is the one thing an
-#: offline rollout must never do, so contention is a refusal and never a wait.
-MIGRATION_LIVE_CONSUMER = "live_consumer"
-#: The store already contains capability-tagged actions while claiming v1. Nothing this
-#: build wrote could be in that state, so the store's history is not what it claims.
-MIGRATION_TAGGED_ROWS_PRESENT = "tagged_rows_present"
-#: The named sibling table exists in a shape this build did not create.
-MIGRATION_FOREIGN_SIBLING = "foreign_sibling_schema"
-#: The backup could not be produced. No backup, no migration.
-MIGRATION_BACKUP_FAILED = "backup_failed"
-#: The caller's migration plan is not the plan this store presents.
-MIGRATION_PLAN_DRIFT = "plan_drift"
+    Two shapes have to be caught, because a tagged id is content-bound and a legacy one is
+    not:
 
+    - the legacy id for this exact (unit, nonce) exists — so the same invocation was already
+      recorded, untagged;
+    - a manifest is already filed for this (workspace, lane, nonce) under another action id
+      — i.e. the same invocation with a different plan.
 
-class StartupStoreMigrationRefused(StartupTransactionError):
-    """An offline v1->v2 migration was refused. Carries a fixed reason; zero mutation."""
-
-    def __init__(self, reason: str, detail: str = "") -> None:
-        self.reason = reason
-        super().__init__(f"{reason}: {detail}" if detail else reason)
-
-
-def startup_store_migration_plan_digest(conn) -> str:
-    """A digest of what the migration is ABOUT to act on, for the caller to pre-approve.
-
-    Covers the facts a rollout plan is written against: the schema version, the action ids
-    present, and whether the sibling table already exists. If any of them changed between
-    the plan being approved and the migration running, the digest differs and the migration
-    refuses — which is what "plan drift" means operationally.
+    Either way the nonce has been used, and reusing it is refused rather than allowed to
+    mint a second action nobody can tell apart from the first.
     """
-    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-    actions = [
-        str(row[0])
-        for row in conn.execute(
-            "SELECT action_id FROM startup_actions ORDER BY action_id"
-        ).fetchall()
-    ]
-    sibling = _manifest_table_state(conn)
-    payload = json.dumps([version, actions, sibling], ensure_ascii=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _refuse_if_tagged_rows(conn) -> None:
-    for row in conn.execute("SELECT action_id FROM startup_actions").fetchall():
-        try:
-            capability = action_capability(row[0])
-        except StartupTransactionError:
-            raise StartupStoreMigrationRefused(
-                MIGRATION_TAGGED_ROWS_PRESENT,
-                "the store holds an action id this build cannot classify",
+    legacy_id = startup_action_id(canonical, nonce)
+    if legacy_id != action_id:
+        clash = conn.execute(
+            "SELECT action_id FROM startup_actions WHERE action_id = ?", (legacy_id,)
+        ).fetchone()
+        if clash is not None:
+            raise StartupTransactionError(
+                f"startup nonce for {canonical.lane_id!r} already names legacy action "
+                f"{legacy_id!r}; a nonce must never be reused — refusing to reserve a "
+                "second action for the same invocation"
             )
-        if capability != CAPABILITY_LEGACY:
-            raise StartupStoreMigrationRefused(
-                MIGRATION_TAGGED_ROWS_PRESENT,
-                "the store already holds capability-tagged actions while declaring v1",
+    if _manifest_table_state(conn) == "absent":
+        return
+    for row in conn.execute(
+        f"SELECT action_id FROM {_IDENTITY_MANIFEST_TABLE} WHERE workspace_id = ?"
+        " AND lane_id = ? AND nonce = ?",
+        (canonical.workspace_id, canonical.lane_id, _norm(nonce)),
+    ).fetchall():
+        if str(row[0]) != action_id:
+            raise StartupTransactionError(
+                f"startup nonce for {canonical.lane_id!r} already names action {row[0]!r} "
+                "with a different launch plan; a nonce must never be reused — refusing to "
+                "reserve a divergent action for the same invocation"
             )
 
 
-def migrate_startup_store_v1_to_v2(fence, *, backup_path, expected_plan_digest: str = "") -> str:
-    """Take a v1 startup store to v2, offline and fail-closed. Returns a fixed token.
+def __getattr__(name: str):
+    """Re-export the migration primitive, which now lives in its own module."""
+    if name.startswith(("MIGRATION_", "migrate_", "startup_store_migration", "StartupStoreMigration")):
+        from mozyo_bridge.core.state import startup_store_migration as _migration
 
-    Every refusal happens BEFORE any mutation, and the migration itself is one transaction:
-    create the sibling table if absent, then set ``user_version = 2``. A store left
-    half-migrated would be the worst outcome available here — an old runtime would still
-    accept it while a new one thinks the capability contract holds — so there is no
-    intermediate state to be interrupted in.
-    """
-    import shutil
-
-    backup = Path(backup_path)
-    try:
-        holder = fence._hold()
-    except Exception as exc:  # noqa: BLE001 - contention is a refusal, never a wait
-        raise StartupStoreMigrationRefused(MIGRATION_LIVE_CONSUMER, str(exc)) from exc
-    with holder:
-        with fence._connection("rw") as conn:
-            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            if version == 2:
-                # Idempotent replay of a completed rollout; the connection's own `_verify`
-                # already proved the v2 shape, so there is nothing left to do.
-                return MIGRATION_ALREADY_V2
-            if version != 1:
-                raise StartupStoreMigrationRefused(
-                    MIGRATION_PLAN_DRIFT, f"store is v{version}, not v1"
-                )
-            # `_manifest_table_state` raises on a foreign/partial shape — surface it as the
-            # migration's own typed refusal rather than a generic authority error.
-            try:
-                sibling = _manifest_table_state(conn)
-            except StartupTransactionError as exc:
-                raise StartupStoreMigrationRefused(
-                    MIGRATION_FOREIGN_SIBLING, str(exc)
-                ) from exc
-            _refuse_if_tagged_rows(conn)
-            actual_plan = startup_store_migration_plan_digest(conn)
-            if expected_plan_digest and actual_plan != expected_plan_digest:
-                raise StartupStoreMigrationRefused(
-                    MIGRATION_PLAN_DRIFT,
-                    "the store is not in the state the approved migration plan described",
-                )
-            try:
-                backup.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(fence.path, backup)
-                if not backup.exists() or backup.stat().st_size <= 0:
-                    raise OSError("backup is absent or empty")
-            except OSError as exc:
-                raise StartupStoreMigrationRefused(
-                    MIGRATION_BACKUP_FAILED, str(exc)
-                ) from exc
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                if sibling == "absent":
-                    conn.execute(_IDENTITY_MANIFEST_SQL)
-                conn.execute("PRAGMA user_version = 2")
-                conn.execute("COMMIT")
-            except Exception as exc:  # noqa: BLE001
-                try:
-                    conn.execute("ROLLBACK")
-                except sqlite3.DatabaseError:
-                    pass
-                raise StartupStoreMigrationRefused(
-                    MIGRATION_PLAN_DRIFT, f"the migration write failed ({exc})"
-                ) from exc
-    return MIGRATION_OK
+        return getattr(_migration, name)
+    raise AttributeError(name)

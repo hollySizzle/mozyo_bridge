@@ -351,10 +351,17 @@ class AtomicManifestCoCommitTest(unittest.TestCase):
                 IdentityManifestSlot("claude", "mzb1_wA_claude_lane", False, ""),
             ),
         )
-        # A different plan yields a different action id, so it is a fresh reserve — the
-        # collision this guards is the SAME id arriving with different content.
-        other = self.fence.reserve(UNIT, "nonce-1", manifest=divergent)
-        self.assertNotEqual(other.action_id, self._reserve_tagged().action_id)
+        # Audit j#96946 C2: a nonce names ONE action. A different plan hashes to a
+        # different id, so the id lookup alone let this through as a SECOND action for the
+        # same invocation. It is a zero-write conflict.
+        with sqlite3.connect(self.path) as conn:
+            before = conn.execute("SELECT COUNT(*) FROM startup_actions").fetchone()[0]
+        with self.assertRaises(StartupTransactionError):
+            self.fence.reserve(UNIT, "nonce-1", manifest=divergent)
+        with sqlite3.connect(self.path) as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM startup_actions").fetchone()[0], before
+            )
 
     def test_a_replay_after_the_action_started_is_refused(self) -> None:
         """A reservation with effects in flight must never be handed to a second caller."""
@@ -732,3 +739,180 @@ class ParentRuntimeRejectsV2Test(unittest.TestCase):
                 with self.assertRaises(parent.StartupTransactionError) as ctx:
                     surface()
                 self.assertIn("schema", str(ctx.exception).lower())
+
+
+class AuditJ96946RegressionTest(unittest.TestCase):
+    """The j#96946 adversarial findings (C2-C7), each reproduced before being fixed."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.path = self.dir / "s.sqlite"
+        self.fence = StartupTransactionFence(self.path)
+        _to_v2(self.fence, self.tmp.name)
+
+    def _rows(self, table="startup_actions"):
+        with sqlite3.connect(self.path) as conn:
+            return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+    # C2 -------------------------------------------------------------------------------
+    def test_c2_a_legacy_action_blocks_a_tagged_reserve_on_the_same_nonce(self) -> None:
+        """The nonce authority must be digest-INDEPENDENT in both directions."""
+        self.fence.reserve(UNIT, "shared-nonce")
+        before = self._rows()
+        with self.assertRaises(StartupTransactionError):
+            self.fence.reserve(UNIT, "shared-nonce", manifest=_manifest())
+        self.assertEqual(self._rows(), before)
+
+    # C3 -------------------------------------------------------------------------------
+    def test_c3_constraint_index_and_trigger_drift_are_zero_write(self) -> None:
+        """`PRAGMA table_info` cannot see any of these, so the stored DDL is compared."""
+        base = (
+            "action_id TEXT NOT NULL PRIMARY KEY, workspace_id TEXT NOT NULL,"
+            " lane_id TEXT NOT NULL, protocol TEXT NOT NULL, slots TEXT NOT NULL,"
+            " manifest_digest TEXT NOT NULL, nonce TEXT NOT NULL, recorded_at TEXT NOT NULL"
+        )
+        for label, setup in (
+            (
+                "extra CHECK",
+                [f"CREATE TABLE startup_identity_manifests ({base}, CHECK (length(nonce) > 0))"],
+            ),
+            (
+                "extra UNIQUE",
+                [f"CREATE TABLE startup_identity_manifests ({base}, UNIQUE (nonce))"],
+            ),
+            (
+                "attached index",
+                [
+                    f"CREATE TABLE startup_identity_manifests ({base})",
+                    "CREATE INDEX ix_mzb ON startup_identity_manifests (nonce)",
+                ],
+            ),
+            (
+                "attached trigger",
+                [
+                    f"CREATE TABLE startup_identity_manifests ({base})",
+                    "CREATE TRIGGER tg_mzb AFTER INSERT ON startup_identity_manifests"
+                    " BEGIN SELECT 1; END",
+                ],
+            ),
+        ):
+            with self.subTest(label=label):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                path = Path(tmp.name) / "s.sqlite"
+                fence = StartupTransactionFence(path)
+                _to_v2(fence, tmp.name)
+                with sqlite3.connect(path) as conn:
+                    conn.execute("DROP TABLE startup_identity_manifests")
+                    for ddl in setup:
+                        conn.execute(ddl)
+                    before = conn.execute(
+                        "SELECT COUNT(*) FROM startup_identity_manifests"
+                    ).fetchone()[0]
+                with self.assertRaises(StartupTransactionError):
+                    fence.reserve(UNIT, "nonce-1", manifest=_manifest())
+                with sqlite3.connect(path) as conn:
+                    self.assertEqual(
+                        conn.execute(
+                            "SELECT COUNT(*) FROM startup_identity_manifests"
+                        ).fetchone()[0],
+                        before,
+                        "zero mutation of a foreign table",
+                    )
+
+    # C4 -------------------------------------------------------------------------------
+    def test_c4_a_non_boolean_receipt_flag_is_refused_on_the_way_in(self) -> None:
+        for flag in (1, 0, "true", "", None):
+            with self.subTest(flag=flag):
+                with self.assertRaises(ValueError):
+                    IdentityManifestSlot("codex", "cn", flag, DIGEST).canonical()
+
+    def test_c4_a_non_boolean_receipt_flag_is_refused_on_the_way_out(self) -> None:
+        """`bool(1)` is True — a stored integer must not decode into an obligation."""
+        action = self.fence.reserve(UNIT, "nonce-1", manifest=_manifest())
+        with sqlite3.connect(self.path) as conn:
+            payload = conn.execute(
+                "SELECT slots FROM startup_identity_manifests"
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE startup_identity_manifests SET slots = ?",
+                (payload.replace("true", "1"),),
+            )
+        with self.assertRaises(StartupTransactionError):
+            self.fence.read_identity_manifest(action.action_id)
+
+    def test_c4_a_padded_stored_witness_is_refused(self) -> None:
+        action = self.fence.reserve(UNIT, "nonce-1", manifest=_manifest())
+        with sqlite3.connect(self.path) as conn:
+            conn.execute("UPDATE startup_identity_manifests SET nonce = ?", (" nonce-1 ",))
+        with self.assertRaises(StartupTransactionError) as ctx:
+            self.fence.read_identity_manifest(action.action_id)
+        self.assertIn(REASON_RECEIPT_REQUIREMENT_UNAVAILABLE, str(ctx.exception))
+
+    def test_c4_two_providers_may_not_share_one_assigned_name(self) -> None:
+        """An assigned name is a host-unique herdr identity."""
+        clash = IdentityManifest(
+            workspace_id="wA",
+            lane_id="issue_14741",
+            slots=(
+                IdentityManifestSlot("codex", "same_name", True, DIGEST),
+                IdentityManifestSlot("claude", "same_name", False, ""),
+            ),
+        )
+        before = self._rows()
+        with self.assertRaises(StartupTransactionError):
+            self.fence.reserve(UNIT, "nonce-1", manifest=clash)
+        self.assertEqual(self._rows(), before)
+
+    # C5 -------------------------------------------------------------------------------
+    def test_c5_a_whitespace_padded_action_id_is_never_laundered_by_the_authority_read(self):
+        action = self.fence.reserve(UNIT, "nonce-1", manifest=_manifest())
+        legacy = self.fence.reserve(UNIT, "legacy-nonce")
+        for padded in (
+            action.action_id + "\n",
+            action.action_id + "\t",
+            " " + action.action_id,
+            legacy.action_id + "\n",
+        ):
+            with self.subTest(padded=repr(padded)):
+                # Either a typed refusal (unclassifiable id) or simply no such row — never
+                # the canonical row.
+                try:
+                    self.assertIsNone(self.fence.read(padded))
+                except StartupTransactionError:
+                    pass
+
+    # C6 -------------------------------------------------------------------------------
+    def test_c6_a_tampered_protocol_column_is_refused(self) -> None:
+        action = self.fence.reserve(UNIT, "nonce-1", manifest=_manifest())
+        with sqlite3.connect(self.path) as conn:
+            conn.execute("UPDATE startup_identity_manifests SET protocol = ?", ("future-v9",))
+        with self.assertRaises(StartupTransactionError) as ctx:
+            self.fence.read_identity_manifest(action.action_id)
+        self.assertIn(REASON_RECEIPT_REQUIREMENT_UNAVAILABLE, str(ctx.exception))
+
+    # C7 -------------------------------------------------------------------------------
+    def test_c7_a_database_error_surfaces_as_a_typed_authority_error(self) -> None:
+        """The handler referenced `sqlite3` — a missing import would raise NameError here."""
+        import mozyo_bridge.core.state.startup_action_capability as capability
+
+        action = self.fence.reserve(UNIT, "nonce-1", manifest=_manifest())
+
+        class _Boom:
+            def execute(self, *a, **k):
+                raise sqlite3.DatabaseError("synthetic")
+
+        # The rollback helper is the handler that names sqlite3; it must swallow a DB error
+        # rather than explode with NameError.
+        capability._rollback_quietly if hasattr(capability, "_rollback_quietly") else None
+        from mozyo_bridge.core.state.startup_transaction_fence import _rollback_quietly
+
+        _rollback_quietly(_Boom())  # must not raise
+
+        # And a read against a store whose table read fails is a typed authority error.
+        with sqlite3.connect(self.path) as conn:
+            conn.execute("DROP TABLE startup_identity_manifests")
+        with self.assertRaises(StartupTransactionError):
+            self.fence.read_identity_manifest(action.action_id)

@@ -157,7 +157,6 @@ from mozyo_bridge.core.state.startup_action_capability import (  # noqa: F401
     resolve_reserve_identity as _resolve_reserve_identity,
     reserve_or_replay as _reserve_or_replay,
     REASON_OFFLINE_UPGRADE_REQUIRED,
-    STARTUP_TRANSACTION_FENCE_SCHEMA_VERSION_V2,
     STARTUP_TRANSACTION_FENCE_SUPPORTED_VERSIONS,
     require_v2_for_tagged_reserve as _require_v2_for_tagged_reserve,
     verify_supported_version as _verify_supported_version,
@@ -575,11 +574,10 @@ class StartupTransactionFence:
     def _verify(self, conn: sqlite3.Connection) -> sqlite3.Connection:
         """Prove an open connection is a complete, identity-matched authority (fail-closed).
 
-        Four checks, all normalized by the callers' shared guard: the schema *version*
-        (v1 or v2 — j#96936), the table/column *shape* (R3-F1), v2's required manifest
-        table, and the seal/DB-nonce *identity* (R1-F7). The version check alone is not an
-        identity check — a store swapped for another valid-schema store passed it — and
-        neither is enough without the shape.
+        Four checks, normalized by the callers' shared guard: schema *version* (v1 or v2,
+        j#96936), table/column *shape* (R3-F1), v2's required manifest table, and the
+        seal/DB-nonce *identity* (R1-F7). Version alone is not identity — a store swapped
+        for another valid-schema store passed it.
         """
         _verify_supported_version(conn)
         self._verify_shape(conn)
@@ -684,11 +682,13 @@ class StartupTransactionFence:
             )
         with self._connection("ro") as conn:
             try:
+                # Audit j#96946 C5: query the RAW id. `_norm` stripped padding and matched
+                # the canonical row, laundering an id the pure classifier refuses.
                 row = conn.execute(
                     "SELECT action_id, workspace_id, lane_id, providers, phase, revision,"
                     " participants, reserved_at, updated_at FROM startup_actions"
                     " WHERE action_id = ?",
-                    (_norm(action_id),),
+                    (action_id if isinstance(action_id, str) else "",),
                 ).fetchone()
                 # The row read AND its decode are inside the guard (R3-F1 / R4-F1): a query
                 # against a partial schema raises OperationalError, and a malformed cell
