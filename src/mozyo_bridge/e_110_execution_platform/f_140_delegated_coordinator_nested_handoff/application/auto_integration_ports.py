@@ -385,11 +385,18 @@ class LedgerStore(Protocol):
     An implementation MUST persist and return whole :class:`StepOutcome` records including
     ``recorded_by`` (:meth:`StepOutcome.as_payload` carries it), and MUST NOT accept entries
     from anywhere but :meth:`append`.
+
+    ``receipt`` is the admission token a durable implementation issues before a mutation and
+    requires back with its outcome (Redmine #14825 review j#96611 finding 3: stamping a
+    provenance onto an unexamined payload authenticates the file, not the claim). It is
+    optional on the Protocol because a process-local store has no admission to authenticate —
+    its entries do not outlive the process either — and an implementation that ignores it MUST
+    say so, rather than appearing to check something it does not.
     """
 
     def read(self, *, action_key: str) -> Sequence[StepOutcome]: ...
 
-    def append(self, outcome: StepOutcome) -> None: ...
+    def append(self, outcome: StepOutcome, *, receipt: str = "") -> None: ...
 
 
 @dataclass
@@ -407,7 +414,13 @@ class InMemoryLedgerStore:
     def read(self, *, action_key: str) -> Sequence[StepOutcome]:
         return [entry for entry in self.entries if entry.action_key == action_key]
 
-    def append(self, outcome: StepOutcome) -> None:
+    def append(self, outcome: StepOutcome, *, receipt: str = "") -> None:
+        """Append unconditionally. ``receipt`` is accepted and IGNORED, deliberately.
+
+        There is no admission to authenticate: this store's entries die with the process, so
+        the trust question the token answers does not arise here. Saying that plainly is the
+        point — a fake check would be worse than none.
+        """
         self.entries.append(outcome)
 
 

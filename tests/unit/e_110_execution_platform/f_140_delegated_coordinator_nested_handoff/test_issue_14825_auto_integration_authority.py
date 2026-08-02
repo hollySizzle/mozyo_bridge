@@ -412,5 +412,62 @@ class DeclaredIntegrationBranchTest(unittest.TestCase):
         self.assertIn("unconfigured target", str(raised.exception))
 
 
+class ActionTimeFreshReadTest(unittest.TestCase):
+    """Review j#96611 finding 2: the two reads that were snapshots, and now are not."""
+
+    def test_the_declared_target_is_asked_again_on_every_read(self) -> None:
+        # R1 tupled the branches at construction and closed over them, so an actuator built
+        # before a config change kept answering from the value it was born with — while the
+        # docstring promised the repository's CURRENT declaration.
+        answers = iter([(TARGET_REF,), ("some-other-branch",)])
+        reader = _reader(
+            _approved_journals(), integration_branches_fn=lambda: next(answers)
+        )
+        first = reader.read_integration_authority(record=_action())
+        second = reader.read_integration_authority(record=_action())
+        self.assertTrue(first.target_identity_known)
+        self.assertFalse(
+            second.target_identity_known,
+            "the second read must reflect the repository's new declaration, not the first "
+            "read's answer",
+        )
+
+    def test_an_unreadable_declaration_declares_nothing(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_composition import (  # noqa: E501
+            _declared_branches_now,
+        )
+        import pathlib
+
+        # A path with no repo-local config at all: the loader's missing-file default carries no
+        # branch, so nothing is declared and the gate stays closed.
+        self.assertEqual(
+            _declared_branches_now(pathlib.Path("/nonexistent-repo-root-14825")), ()
+        )
+
+    def test_the_issuer_anchor_is_resolved_per_read(self) -> None:
+        # The anchor binds a writer to a role. R1 resolved it once when the reader was built.
+        import pathlib
+        from unittest import mock
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            auto_integration_composition as composition,
+        )
+
+        seen: list[str] = []
+        with mock.patch.object(
+            composition, "committed_config_policy_pointer", side_effect=lambda root: (
+                seen.append(str(root)) or "git:.mozyo-bridge/config.yaml@" + "a" * 40
+            )
+        ), mock.patch.object(
+            composition.LiveRedmineJournalSource,
+            "from_environment",
+            side_effect=composition.LiveRedmineJournalError("unconfigured"),
+        ):
+            read = composition.live_journal_reader(repo_root=pathlib.Path("."))
+            self.assertEqual(seen, [], "building the reader must resolve nothing yet")
+            read("14825")
+            read("14825")
+        self.assertEqual(len(seen), 2, "each read resolves the anchor again")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

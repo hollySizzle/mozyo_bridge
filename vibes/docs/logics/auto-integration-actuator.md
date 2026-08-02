@@ -391,6 +391,8 @@ application/auto_integration_live_authority.py live DurableAuthorityReader (#148
 application/auto_integration_ledger.py   durable append-only step ledger (SQLite, #14825)
 application/auto_integration_process_ops.py live ManagedProcessOperations (#14825)
 application/auto_integration_composition.py production composition root + async CI 継続 (#14825)
+application/auto_integration_reconcile.py crash で取り残された admission の recovery (#14825 R2)
+application/cli_workflow_auto_integration.py `workflow auto-integration` runtime entrypoint (#14825 R2)
 ```
 
 `auto_integration_refspec.py` は R22 (j#96516 裁定 2) で `live_ops` から分割した。責務は
@@ -562,20 +564,44 @@ action で表現される — action を組み直せば head が変わり、head
 issue 自身の canonical gate fold (`fold_issue_gate_facts`) の `blocked` gate / 未解決 review round から読む。
 actuator は「この issue が止まっているか」について二つ目の意見を持たない。
 
-### ledger は writer identity を自分で持つ (item 4)
+### ledger は admission に紐づく receipt でしか書けない (item 4 / R2 で修正)
 
-`SqliteLedgerStore` は home-scoped SQLite file。`StepOutcome.recorded_by` の自己申告は **読まない** — store が
-file 生成時に鋳造した `writer_id` を stamp する。信頼境界は **ledger file (その permission)** であって
-process ではない。cross-process resume の全目的が「後の process が前の process の記録を信じる」ことなので、
-per-process token では成立しない。保証は「この writer id を持つ entry は、この store の append API を通った」であり、
-それ以上ではない。
+`SqliteLedgerStore` は home-scoped SQLite file。
 
-**mutation と receipt の間の crash** は `begin_step` の intent 行で保持する。receipt は同一 transaction で
-intent を閉じる。未解決 intent がある action は、次の run が **何も実行せず blocked で止まる** — 「push の
-記録が無い」は「push していない」ではないからである。
+> ⚠️ **R1 の記述は誤っていた。** R1 はここに「`recorded_by` の自己申告は読まず store の `writer_id` を stamp する」
+> と書き、それを authentication と呼んだ。**検査していない payload に provenance を押すのは file の認証であって
+> claim の認証ではない** — review j#96611 finding 3 は、mutation 一切なしの `append` で
+> `done` + `push_status=accepted` の push receipt を作り、それが cleanup の authorizing action として
+> 採用されることを再現した。以下が現行契約である。
 
-`done` step は action key ごとに一度だけ (partial unique index)。重複 merge / 重複 push は reader の後付け
-検査ではなく **store が拒否する**。
+- **receipt は admission に紐づく。** `begin_step` が one-time token を open intent 行へ鋳造して返し、
+  `append` は **その `(action_key, step)` の open intent と一致する token** を要求する。誰も admit されて
+  いない step の outcome は記録できない。
+- **admission は compare-and-set である。** open intent への partial unique index により、同一 step への
+  2 つ目の `begin_step` は **副作用の前に** 拒否される。R1 は `unresolved_intents` を読んでから insert する
+  check-then-write で、2 つの run が同じ push に admit された (j#96611 finding 4 実測)。
+- **信頼境界の主張範囲。** file を共有する 2 process は互いを認証できない。filesystem permission が依然
+  外側の境界であり、admission が足すのは「偽造者はまず admission を勝ち取らねばならず、その間 本物の
+  actuator は refuse される」= **偽造が静かでなく騒がしくなる**ことだけである。これは
+  「相互不信の process 間で認証される」より弱い主張であり、共有 file が支えられる最強の主張でもある。
+- **crash は検出だけでなく回復する** (j#96611 finding 5)。crash した run の token は道連れになるので、
+  `resolve_intent` は token 無しで open intent を閉じ、**reconciler が測定した内容**を記録して行を
+  `reconciled` と印づける (「やった run がそう言った」と「後の run が見に行った」を durable record で混同しない)。
+  open intent の存在は要求するので、receipt を捏造する第二の経路にはならない。
+- `done` step は action key ごとに一度だけ (partial unique index)。
+
+### crash recovery は測定で閉じる (R2)
+
+`application/auto_integration_reconcile.py`。durable record が答えられない唯一の問い —
+**mutation は着地したか** — を世界に訊き、stranded admission をその答えで閉じる。
+
+- `push`: 提示されたはずの head (merge なら自 action の apply receipt、ff なら source head) が
+  target ref から到達可能か。**到達可能=landed / 不可能=not_landed**。
+- `integration_apply` / `integration_ci`: ref を動かさない (apply は object を書くだけ、CI は観測のみ) ため、
+  中断は target を変えていない。`not_landed` として閉じ、再実行に委ねる。
+- **`ambiguous` は不便ではなく設計である。** probe 自体が実行できない (target tip が読めない) ときは
+  admission を **開いたまま** にし、action は止まったままになる。見えないときに推測する reconciliation は、
+  それが回復しようとしている欠陥そのものを一層外側で繰り返す。**読めない remote は push されていない commit ではない。**
 
 ### cleanup の authorization は record 自身から来ない (item 5)
 
@@ -605,9 +631,28 @@ production では常に blocked と報告する (実測)。
 代替する形は #13686 が merge (j#96406 F1) / branch delete (j#96396) / worktree remove (j#96401) から
 取り除いた当のものである。composition root は未設定の場合 actuator を **組み立てない** (例外)。
 
-`target_identity_known` は committed config を action-time に読み直して答える。これは
+`target_identity_known` は committed config を **呼び出しごとに** 読み直して答える。これは
 `policy.integration_branch` (この instance が構築された値) とは **別の問い** であり、repository が現在宣言して
 いない branch に対して構築された actuator は、その不一致で fail-closed する。
+
+> ⚠️ **R1 はこれを contract として書き、実装は snapshot だった** (j#96611 finding 2)。branch tuple を構築時に
+> 1 回だけ作って closure で閉じ込め、issuer anchor (`committed_config_policy_pointer`) も reader 構築時に
+> 1 回だけ解決していた。**両方とも呼び出しごとの再読へ直した**。anchor は writer を role へ束縛する値であり、
+> それを snapshot から読むのは、この subsystem が他の全箇所から取り除いている stale-authority の形そのものである。
+
+### runtime entrypoint (R2 / j#96611 finding 1)
+
+`workflow auto-integration <run|continue|reconcile>`
+(`application/cli_workflow_auto_integration.py`)。R1 は composition root と continuation を作って
+**どこからも呼ばれない**まま置いた (`grep` の runtime 参照 0 件)。**誰も呼ばない trigger は trigger ではない。**
+
+- `run` — action を形成し integration machine を rest まで駆動する (非同期 CI gate で止まる)。
+- `continue` — CI 決着後に **同じ action** を再入する。item 3 が要求する trigger の実体。
+- `reconcile` — crash で取り残された admission を測定で閉じる。
+
+**この command は authority を足さない。** 引数から identity を解決し composition root へ渡し、machine の
+判断を印字するだけである。gate を skip / force / waive する flag は存在せず、**`--target-ref` も存在しない**
+(caller が push の target を名指しできることは item 6 が撤回した runtime resolution そのものである)。
 
 ### live ManagedProcessOperations (item 7)
 
@@ -662,7 +707,11 @@ close 0 で admission block になる)。
   (#14825 の durable fold / live reader の identity fence / target 宣言)
 - `python3 -m unittest tests.integration.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.test_issue_14825_live_authority_composition`
   (#14825 の実 `LaneLifecycleStore` / 実 SQLite ledger に対する production test。zero-release 4 条件、
-  writer identity、crash 境界、非同期 CI 継続、cleanup authorization)
+  admission/receipt 境界、duplicate admission の CAS、crash recovery の landed / not_landed / ambiguous、
+  非同期 CI 継続、cleanup authorization。R1 review j#96611 の finding 3/4/5 は
+  `R1ReviewFindingRegressionTest` に **再現した入力そのもの** で pin してある。verdict は j#96613)
+- `python3 -m unittest tests.integration.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.test_issue_14825_auto_integration_cli`
+  (runtime entrypoint の到達可能性。j#96611 finding 1)
 - `python3 -m unittest tests.unit.e_130_governance_distribution.f_140_rules_docs_catalog.test_auto_integration_config`
 - `PYTHONPATH=src python3 -m mozyo_bridge docs validate --repo .` ほか catalog 検証一式。
 - preset 本文を変えたため `PYTHONPATH=src python3 -m mozyo_bridge scaffold canonical --check` と

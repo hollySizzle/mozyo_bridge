@@ -40,6 +40,9 @@ import uuid
 from dataclasses import dataclass, field
 from typing import List, Optional, Protocol, Sequence, Tuple, runtime_checkable
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ledger import (  # noqa: E501
+    AutoIntegrationAdmissionError,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ports import (
     MERGE_COMMIT_ERROR,
     MERGE_CONTENT_CONFLICT,
@@ -197,14 +200,12 @@ class CleanupRunReport:
 # Use case.
 # ---------------------------------------------------------------------------
 
-#: The steps that change something outside this process, and so are the ones whose intent must
-#: reach the durable ledger before they run (Redmine #14825 item 4). The CI step is absent on
-#: purpose: it observes an asynchronous gate and actuates nothing, so a crash across it loses no
-#: information a re-read cannot recover.
-_MUTATING_INTEGRATION_STEPS: Tuple[str, ...] = (STEP_INTEGRATION_APPLY, STEP_PUSH)
-#: The cleanup machine's one step. It is here for the same reason and no other: a released
-#: managed process is not something a resumed run may offer to release a second time.
-_MUTATING_CLEANUP_STEPS: Tuple[str, ...] = (STEP_PROCESS_RETIRE,)
+# There is no "which steps need an admission" table any more. R1 had one, listing the two
+# mutating integration steps and the one cleanup step, so the CI step could be recorded without
+# one. Review j#96611 finding 3 made the receipt the ONLY way to record an outcome at all, and a
+# table of exemptions from that is a table of ways to write a row nobody was admitted to write.
+# Every step claims its admission; the ones that mutate are simply the ones where losing the
+# receipt matters.
 
 
 @dataclass(frozen=True)
@@ -293,11 +294,28 @@ class AutoIntegrationUseCase:
         open_intents = reader(action_key=action_key)
         return str(open_intents[0].step) if open_intents else None
 
-    def _begin_step(self, action_key: str, step: str) -> None:
-        """Tell the ledger a side effect is about to run, when it can hold that fact."""
+    def _begin_step(self, action_key: str, step: str) -> "Tuple[str, Optional[str]]":
+        """Claim the admission to run ``step``, returning ``(receipt, refusal)``.
+
+        A store with no admission concept answers ``("", None)`` — that is #13686's in-memory
+        default, whose entries do not outlive the process anyway. A durable store either mints
+        the receipt this run must present with its outcome, or REFUSES because another run
+        already holds the admission (Redmine #14825 review j#96611 finding 4: R1 read the open
+        intents and then inserted one, so two runs were both admitted to the same push). A
+        refusal is not retried here: it means somebody else is mutating, or crashed mid-mutation,
+        and either way a second mutation is what must not happen.
+        """
         opener = getattr(self.ledger, "begin_step", None)
-        if opener is not None:
-            opener(action_key=action_key, step=step)
+        if opener is None:
+            return "", None
+        try:
+            return str(getattr(opener(action_key=action_key, step=step), "receipt", "")), None
+        except AutoIntegrationAdmissionError as refusal:
+            return "", str(refusal)
+
+    def _record(self, outcome: StepOutcome, receipt: str) -> None:
+        """Append ``outcome`` under the admission that produced it."""
+        self.ledger.append(outcome, receipt=receipt)
 
     # -- integration ------------------------------------------------------
 
@@ -373,15 +391,26 @@ class AutoIntegrationUseCase:
             if decision.next_step is None:
                 return report
 
-            if decision.next_step in _MUTATING_INTEGRATION_STEPS:
-                # The intent lands BEFORE the side effect. Recording it afterwards would leave
-                # exactly the window it exists to close.
-                self._begin_step(record.action_key, decision.next_step)
+            # The admission lands BEFORE the side effect, for every step: claiming it
+            # afterwards would leave exactly the window it exists to close, and a step with no
+            # admission cannot record an outcome at all (the receipt IS the admission).
+            receipt, refused = self._begin_step(record.action_key, decision.next_step)
+            if refused is not None:
+                report.outcomes.append(
+                    StepOutcome(
+                        action_key=record.action_key,
+                        step=decision.next_step,
+                        outcome=OUTCOME_BLOCKED,
+                        recorded_by=self.recorder_id,
+                        detail=refused,
+                    )
+                )
+                return report
             outcome = self._perform_integration_step(
                 decision, record, report, preflight=preflight
             )
             report.outcomes.append(outcome)
-            self.ledger.append(outcome)
+            self._record(outcome, receipt)
             working_ledger.append(outcome)
             if outcome.outcome != OUTCOME_DONE:
                 # A refused or unsettled step stops the run here. Re-deciding would only
@@ -731,11 +760,21 @@ class AutoIntegrationUseCase:
             if decision.next_step is None:
                 return report
 
-            if decision.next_step in _MUTATING_CLEANUP_STEPS:
-                self._begin_step(record.action_key, decision.next_step)
+            receipt, refused = self._begin_step(record.action_key, decision.next_step)
+            if refused is not None:
+                report.outcomes.append(
+                    StepOutcome(
+                        action_key=record.action_key,
+                        step=decision.next_step,
+                        outcome=OUTCOME_BLOCKED,
+                        recorded_by=self.recorder_id,
+                        detail=refused,
+                    )
+                )
+                return report
             outcome = self._perform_cleanup_step(decision, record)
             report.outcomes.append(outcome)
-            self.ledger.append(outcome)
+            self._record(outcome, receipt)
             working_ledger.append(outcome)
             if outcome.recorded_by != self.recorder_id:
                 # Unreachable by construction, and asserted rather than assumed: an outcome

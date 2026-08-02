@@ -46,6 +46,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence, Tuple
 
+from mozyo_bridge.application.repo_local_config_loader import load_repo_local_config
 from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_actuator import (  # noqa: E501
     AutoIntegrationUseCase,
@@ -149,10 +150,17 @@ def live_journal_reader(
     A fetch that fails returns ``None``, not an empty page. "We could not read the evidence" and
     "the evidence says no" are different facts, and only one of them may look like an issue with
     nothing recorded on it.
+
+    **The anchor is resolved per read, not once per closure** (review j#96611 finding 2). R1
+    computed it when this reader was BUILT, so an actuator constructed before a config change
+    kept resolving issuers against the blob that was committed at construction time — while the
+    module docstring promised an action-time read. The anchor is what binds a writer to a role;
+    reading it from a snapshot is exactly the stale-authority shape this subsystem removes
+    everywhere else.
     """
-    policy_pointer = committed_config_policy_pointer(repo_root)
 
     def read(issue: str) -> Optional[Sequence[EvidenceJournal]]:
+        policy_pointer = committed_config_policy_pointer(repo_root)
         try:
             source = LiveRedmineJournalSource.from_environment(environ=environ, home=home)
             entries = source.read_entries(issue)
@@ -300,7 +308,6 @@ def build_auto_integration_use_case(
     callback_outbox: object = None,
     home: Optional[Path] = None,
     environ: Optional[Mapping[str, str]] = None,
-    ledger: Optional[SqliteLedgerStore] = None,
 ) -> AutoIntegrationUseCase:
     """Compose the actuator against live ports, or refuse to compose one at all.
 
@@ -321,7 +328,11 @@ def build_auto_integration_use_case(
 
     store = lifecycle_store or LaneLifecycleStore(home=home)
     ops = inventory_ops or _live_inventory_ops(repo_root=repo_root, environ=environ)
-    durable_ledger = ledger or SqliteLedgerStore(home=home)
+    # NOT injectable. R1 accepted a caller-supplied ledger for test convenience, which is the
+    # very shape `LedgerStore`'s own docstring calls out — "handing the caller the ledger is the
+    # same mistake as handing it the preflight" (review j#96611 finding 3). A test that needs a
+    # scratch ledger passes `home`, which is what the production path uses to find one.
+    durable_ledger = SqliteLedgerStore(home=home)
     scope = LaneScope(
         workspace=binding.workspace,
         lane=binding.lane,
@@ -334,7 +345,12 @@ def build_auto_integration_use_case(
         journals_fn=live_journal_reader(
             repo_root=repo_root, home=home, environ=environ
         ),
-        integration_branches_fn=lambda: branches,
+        # Re-read from the repository on every call, NOT the tuple computed above (review
+        # j#96611 finding 2). The construction-time value is what this actuator was pointed at;
+        # `target_identity_known` asks what the repository declares NOW, and if those two ever
+        # disagree the run must fail closed on the disagreement rather than integrate on its own
+        # construction. A snapshot cannot express that, because it IS the construction.
+        integration_branches_fn=lambda: _declared_branches_now(repo_root),
         callback_debt_fn=lambda: (
             unresolved_callback_debt(callback_outbox, binding.workspace)
             if callback_outbox is not None
@@ -360,6 +376,19 @@ def build_auto_integration_use_case(
         lane_issue=binding.issue,
         lane_generation=binding.lane_generation,
     )
+
+
+def _declared_branches_now(repo_root: Path) -> Tuple[str, ...]:
+    """The integration branches the repository declares AT THIS MOMENT (fail-closed).
+
+    A config that cannot be read declares nothing, so ``target_identity_known`` stays False and
+    the action stops — an unreadable declaration is not a permissive one.
+    """
+    try:
+        config = load_repo_local_config(repo_root)
+    except Exception:  # noqa: BLE001 — an unreadable config declares no target
+        return ()
+    return declared_integration_branches(config.auto_integration)
 
 
 def _live_inventory_ops(

@@ -43,8 +43,16 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ledger_authorizing_action_reader,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ledger import (  # noqa: E501
+    AutoIntegrationAdmissionError,
     AutoIntegrationLedgerError,
     SqliteLedgerStore,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_reconcile import (  # noqa: E501
+    RECONCILED_AMBIGUOUS,
+    RECONCILED_LANDED,
+    RECONCILED_NOTHING_STRANDED,
+    RECONCILED_NOT_LANDED,
+    StrandedActionReconciler,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ports import (  # noqa: E501
     CleanupAuthority,
@@ -249,7 +257,8 @@ class DurableLedgerTest(unittest.TestCase):
         self.ledger = SqliteLedgerStore(home=self.home)
 
     def test_the_payloads_claim_about_its_writer_is_ignored(self) -> None:
-        self.ledger.append(
+        _admitted_append(
+            self.ledger,
             StepOutcome(
                 action_key="A",
                 step=STEP_PUSH,
@@ -257,7 +266,7 @@ class DurableLedgerTest(unittest.TestCase):
                 head=SOURCE,
                 push_status="accepted",
                 recorded_by="receipt:forged-by-a-caller",
-            )
+            ),
         )
         (entry,) = self.ledger.read(action_key="A")
         self.assertEqual(entry.recorded_by, self.ledger.writer_id)
@@ -266,8 +275,9 @@ class DurableLedgerTest(unittest.TestCase):
     def test_a_second_store_on_the_same_file_is_the_same_writer(self) -> None:
         # What makes a resume across the asynchronous CI gate possible: the next process reads
         # the same identity back and therefore counts what the first one recorded.
-        self.ledger.append(
-            StepOutcome(action_key="A", step=STEP_PUSH, outcome=OUTCOME_DONE, head=SOURCE)
+        _admitted_append(
+            self.ledger,
+            StepOutcome(action_key="A", step=STEP_PUSH, outcome=OUTCOME_DONE, head=SOURCE),
         )
         resumed = SqliteLedgerStore(home=self.home)
         self.assertEqual(resumed.writer_id, self.ledger.writer_id)
@@ -281,16 +291,17 @@ class DurableLedgerTest(unittest.TestCase):
         done = StepOutcome(
             action_key="A", step=STEP_PUSH, outcome=OUTCOME_DONE, head=SOURCE
         )
-        self.ledger.append(done)
+        _admitted_append(self.ledger, done)
         with self.assertRaises(AutoIntegrationLedgerError):
-            self.ledger.append(done)
+            _admitted_append(self.ledger, done)
 
     def test_a_blocked_step_may_be_recorded_more_than_once(self) -> None:
         # Only `done` is once-per-action: a refusal is an observation, and re-running an action
         # that keeps failing must keep recording that it failed.
         for _ in range(2):
-            self.ledger.append(
-                StepOutcome(action_key="A", step=STEP_PUSH, outcome=OUTCOME_BLOCKED)
+            _admitted_append(
+                self.ledger,
+                StepOutcome(action_key="A", step=STEP_PUSH, outcome=OUTCOME_BLOCKED),
             )
         self.assertEqual(len(self.ledger.read(action_key="A")), 2)
 
@@ -303,28 +314,31 @@ class DurableLedgerTest(unittest.TestCase):
         self.assertEqual(resumed.read(action_key="A"), ())
 
     def test_the_receipt_closes_the_intent_in_one_transaction(self) -> None:
-        self.ledger.begin_step(action_key="A", step=STEP_PUSH)
+        intent = self.ledger.begin_step(action_key="A", step=STEP_PUSH)
         self.ledger.append(
-            StepOutcome(action_key="A", step=STEP_PUSH, outcome=OUTCOME_DONE, head=SOURCE)
+            StepOutcome(action_key="A", step=STEP_PUSH, outcome=OUTCOME_DONE, head=SOURCE),
+            receipt=intent.receipt,
         )
         self.assertEqual(self.ledger.unresolved_intents(action_key="A"), ())
 
     def test_entries_of_another_action_are_not_this_actions(self) -> None:
-        self.ledger.append(
-            StepOutcome(action_key="A", step=STEP_PUSH, outcome=OUTCOME_DONE, head=SOURCE)
+        _admitted_append(
+            self.ledger,
+            StepOutcome(action_key="A", step=STEP_PUSH, outcome=OUTCOME_DONE, head=SOURCE),
         )
         self.assertEqual(self.ledger.read(action_key="B"), ())
 
     def test_an_action_key_wildcard_cannot_widen_a_prefix_match(self) -> None:
         # `%` and `_` are legal in an action key (a target ref may carry either). If they reached
         # LIKE unescaped, one action's key would match another's rows.
-        self.ledger.append(
+        _admitted_append(
+            self.ledger,
             StepOutcome(
                 action_key="issue=1|lane_generation=1|source_head=XY|rest",
                 step=STEP_INTEGRATION_CI,
                 outcome=OUTCOME_DONE,
                 head=SOURCE,
-            )
+            ),
         )
         self.assertEqual(
             self.ledger.completed_action_keys(
@@ -378,7 +392,19 @@ class StubGitOperations:
         return False
 
     def commit_on_remote(self, commit: str, *, branch: str) -> bool:
-        return True
+        """Reachability that reflects this stub's own state, per branch.
+
+        The lane branch always carries the source (it is where the work was pushed). The TARGET
+        carries only what this stub's ``target_head`` says it does — which the push mutates. A
+        double that answered True unconditionally could not express "the interrupted push never
+        landed" at all, and the recovery path's whole job is telling those apart (the R5 lesson
+        in #13686: a fake that does not reflect its own mutation makes the check meaningless).
+        """
+        if branch == LANE_BRANCH:
+            return True
+        return commit == self.target_head or self.is_ancestor(
+            ancestor=commit, descendant=self.target_head
+        )
 
 
 @dataclass
@@ -603,7 +629,7 @@ class CleanupAuthorizationTest(unittest.TestCase):
 
     def test_the_ledger_reader_names_the_action_whose_push_landed(self) -> None:
         record = _record()
-        self.ledger.append(_landed_push(record.action_key))
+        _admitted_append(self.ledger, _landed_push(record.action_key))
         read = ledger_authorizing_action_reader(self.ledger)
         self.assertEqual(read(self._cleanup_record("ignored")), record.action_key)
 
@@ -612,13 +638,14 @@ class CleanupAuthorizationTest(unittest.TestCase):
         # reader is reading a FILE — where an invariant of the writer is not an invariant of the
         # bytes.
         record = _record()
-        self.ledger.append(
+        _admitted_append(
+            self.ledger,
             StepOutcome(
                 action_key=record.action_key,
                 step=STEP_PUSH,
                 outcome=OUTCOME_DONE,
                 head=SOURCE,
-            )
+            ),
         )
         read = ledger_authorizing_action_reader(self.ledger)
         self.assertEqual(read(self._cleanup_record("ignored")), "")
@@ -638,7 +665,7 @@ class CleanupAuthorizationTest(unittest.TestCase):
             review_generation="r1",
         )
         for key in (base.action_key, other.action_key):
-            self.ledger.append(_landed_push(key))
+            _admitted_append(self.ledger, _landed_push(key))
         read = ledger_authorizing_action_reader(self.ledger)
         self.assertEqual(read(self._cleanup_record("ignored")), "")
 
@@ -652,6 +679,207 @@ def _landed_push(action_key: str) -> StepOutcome:
         head=SOURCE,
         push_status=PUSH_ACCEPTED,
     )
+
+
+def _admitted_append(ledger: SqliteLedgerStore, outcome: StepOutcome) -> None:
+    """Record ``outcome`` the way a run does: claim the admission, then present its receipt.
+
+    Every test that wants a row in the ledger goes through this. Review j#96611 finding 3 was
+    that a row could be written WITHOUT it, and the tests that appended directly were part of
+    how that went unnoticed — they asserted the store accepted what the store should refuse.
+    """
+    intent = ledger.begin_step(action_key=outcome.action_key, step=outcome.step)
+    ledger.append(outcome, receipt=intent.receipt)
+
+
+class R1ReviewFindingRegressionTest(unittest.TestCase):
+    """Review j#96611's findings 3 / 4 / 5, pinned with the inputs that reproduced them."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.ledger = SqliteLedgerStore(home=self.home)
+
+    # -- finding 3: an outcome needs the admission that produced it --------
+
+    def test_f3_an_append_with_no_admission_is_refused(self) -> None:
+        # The exact reproduction: a bare `done` push with `accepted`, no mutation anywhere. R1
+        # wrote the row and stamped it with the store's writer id.
+        with self.assertRaises(AutoIntegrationLedgerError) as raised:
+            self.ledger.append(_landed_push("A"))
+        self.assertIn("no open admission", str(raised.exception))
+        self.assertEqual(self.ledger.read(action_key="A"), ())
+
+    def test_f3_an_append_on_somebody_elses_admission_is_refused(self) -> None:
+        self.ledger.begin_step(action_key="A", step=STEP_PUSH)
+        with self.assertRaises(AutoIntegrationLedgerError) as raised:
+            self.ledger.append(_landed_push("A"), receipt="receipt:guessed")
+        self.assertIn("not the one this store minted", str(raised.exception))
+        self.assertEqual(self.ledger.read(action_key="A"), ())
+
+    def test_f3_a_forged_row_can_no_longer_authorize_a_cleanup(self) -> None:
+        # The consequence the finding named: the forged row became a cleanup's authorizing
+        # action. With no row, the reader names nothing, and an empty key matches no record's.
+        record = _record()
+        try:
+            self.ledger.append(_landed_push(record.action_key))
+        except AutoIntegrationLedgerError:
+            pass
+        read = ledger_authorizing_action_reader(self.ledger)
+        self.assertEqual(
+            read(
+                CleanupActionRecord(
+                    issue=ISSUE,
+                    lane_generation=GEN,
+                    branch=LANE_BRANCH,
+                    worktree_path=LANE_WORKTREE,
+                    recorded_source_head=SOURCE,
+                    integration_action_key="anything",
+                )
+            ),
+            "",
+        )
+
+    # -- finding 4: the admission is a compare-and-set --------------------
+
+    def test_f4_a_second_run_is_refused_the_admission_before_it_mutates(self) -> None:
+        # Reviewer's minimal reproduction: two stores on one file both opened an intent for the
+        # same push, so both proceeded to mutate.
+        other = SqliteLedgerStore(home=self.home)
+        self.ledger.begin_step(action_key="A", step=STEP_PUSH)
+        with self.assertRaises(AutoIntegrationAdmissionError):
+            other.begin_step(action_key="A", step=STEP_PUSH)
+        self.assertEqual(len(self.ledger.unresolved_intents(action_key="A")), 1)
+
+    def test_f4_the_admission_is_reusable_once_it_is_closed(self) -> None:
+        # Exclusive while held, not exclusive forever: a blocked step must be re-attemptable.
+        _admitted_append(
+            self.ledger,
+            StepOutcome(action_key="A", step=STEP_PUSH, outcome=OUTCOME_BLOCKED),
+        )
+        self.ledger.begin_step(action_key="A", step=STEP_PUSH)
+        self.assertEqual(len(self.ledger.unresolved_intents(action_key="A")), 1)
+
+    def test_f4_a_refused_admission_stops_the_run_without_mutating(self) -> None:
+        record = _record()
+        self.ledger.begin_step(action_key=record.action_key, step=STEP_PUSH)
+        use_case = AutoIntegrationUseCase(
+            operations=StubGitOperations(),
+            integration_policy=AutoIntegrationPolicy(
+                mode="auto", integration_branch=TARGET_REF, ff_only=True
+            ),
+            authority=StubAuthority(),
+            ledger=SqliteLedgerStore(home=self.home),
+            lane_worktree=LANE_WORKTREE,
+            lane_branch=LANE_BRANCH,
+            lane_issue=ISSUE,
+            lane_generation=GEN,
+        )
+        report = use_case.run_integration(record)
+        self.assertEqual(use_case.operations.pushed, [])
+        self.assertEqual(report.outcomes[-1].outcome, OUTCOME_BLOCKED)
+
+    # -- finding 5: recovery, with three outcomes -------------------------
+
+    def _reconciler(self, *, target_head: str) -> StrandedActionReconciler:
+        return StrandedActionReconciler(
+            use_case=AutoIntegrationUseCase(
+                operations=StubGitOperations(target_head=target_head),
+                integration_policy=AutoIntegrationPolicy(
+                    mode="auto", integration_branch=TARGET_REF, ff_only=True
+                ),
+                authority=StubAuthority(),
+                ledger=SqliteLedgerStore(home=self.home),
+                lane_worktree=LANE_WORKTREE,
+                lane_branch=LANE_BRANCH,
+                lane_issue=ISSUE,
+                lane_generation=GEN,
+            )
+        )
+
+    def test_f5_a_stranded_push_that_landed_is_recorded_as_landed(self) -> None:
+        record = _record()
+        self.ledger.begin_step(action_key=record.action_key, step=STEP_PUSH)
+        # The remote carries the source head: the interrupted push did land.
+        outcome = self._reconciler(target_head=SOURCE).reconcile(record)
+        self.assertEqual(outcome.status, RECONCILED_LANDED)
+        self.assertEqual(outcome.head, SOURCE)
+        (row,) = SqliteLedgerStore(home=self.home).read(action_key=record.action_key)
+        self.assertEqual(row.outcome, OUTCOME_DONE)
+        self.assertEqual(row.push_status, PUSH_ACCEPTED)
+        self.assertEqual(
+            SqliteLedgerStore(home=self.home).unresolved_intents(
+                action_key=record.action_key
+            ),
+            (),
+        )
+
+    def test_f5_a_stranded_push_that_did_not_land_is_re_runnable(self) -> None:
+        record = _record()
+        self.ledger.begin_step(action_key=record.action_key, step=STEP_PUSH)
+        # The remote is still at the old target: the push never landed.
+        outcome = self._reconciler(target_head=TARGET).reconcile(record)
+        self.assertEqual(outcome.status, RECONCILED_NOT_LANDED)
+        (row,) = SqliteLedgerStore(home=self.home).read(action_key=record.action_key)
+        self.assertEqual(row.outcome, OUTCOME_BLOCKED)
+        self.assertEqual(
+            SqliteLedgerStore(home=self.home).unresolved_intents(
+                action_key=record.action_key
+            ),
+            (),
+        )
+
+    def test_f5_an_unreadable_target_leaves_the_admission_open(self) -> None:
+        # The third outcome, and the one that must NOT resolve: an unreadable remote is not an
+        # unpushed commit, and guessing here is the defect being recovered from, one layer out.
+        record = _record()
+        self.ledger.begin_step(action_key=record.action_key, step=STEP_PUSH)
+        outcome = self._reconciler(target_head="").reconcile(record)
+        self.assertEqual(outcome.status, RECONCILED_AMBIGUOUS)
+        self.assertFalse(outcome.resolved)
+        self.assertEqual(
+            len(
+                SqliteLedgerStore(home=self.home).unresolved_intents(
+                    action_key=record.action_key
+                )
+            ),
+            1,
+        )
+
+    def test_f5_reconciliation_needs_a_stranded_admission_to_close(self) -> None:
+        # Not a second way to invent a receipt: with nothing open there is nothing to close.
+        outcome = self._reconciler(target_head=SOURCE).reconcile(_record())
+        self.assertEqual(outcome.status, RECONCILED_NOTHING_STRANDED)
+        self.assertEqual(SqliteLedgerStore(home=self.home).read(action_key=_record().action_key), ())
+
+    def test_f5_after_recovery_the_action_continues(self) -> None:
+        # The whole point of recovery over permanent block: the run proceeds afterwards.
+        record = _record()
+        self.ledger.begin_step(action_key=record.action_key, step=STEP_PUSH)
+        self._reconciler(target_head=SOURCE).reconcile(record)
+        use_case = AutoIntegrationUseCase(
+            operations=StubGitOperations(target_head=SOURCE),
+            integration_policy=AutoIntegrationPolicy(
+                mode="auto", integration_branch=TARGET_REF, ff_only=True
+            ),
+            authority=StubAuthority(
+                integration_ci=IntegrationCiEvidence(
+                    integration_head=SOURCE,
+                    workflow="required-ci",
+                    run="int-1",
+                    conclusion="success",
+                )
+            ),
+            ledger=SqliteLedgerStore(home=self.home),
+            lane_worktree=LANE_WORKTREE,
+            lane_branch=LANE_BRANCH,
+            lane_issue=ISSUE,
+            lane_generation=GEN,
+        )
+        outcome = AsyncCiContinuation(use_case=use_case).resume(record)
+        self.assertEqual(outcome.status, CONTINUATION_INTEGRATED)
+        self.assertEqual(use_case.operations.pushed, [])
 
 
 @dataclass

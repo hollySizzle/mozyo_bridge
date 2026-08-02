@@ -9,35 +9,47 @@ there is no continuation, and the feature cannot complete.
 
 This is that store. Three properties, each of which #13686 named as owed to this issue.
 
-**The writer identity belongs to the store.** ``StepOutcome.recorded_by`` arrives from the caller
-and is ignored: :meth:`SqliteLedgerStore.append` stamps :attr:`~SqliteLedgerStore.writer_id`,
-which the store minted into its own file the first time that file was created. A caller cannot
-choose it, cannot rewrite it, and cannot construct an entry that carries it without going through
-``append``. #13686's per-instance receipt could not do this and said so: "a durable store with an
-authenticated writer identity is the real answer".
+**An outcome may only be recorded by the run that was admitted to produce it.** R1 stamped the
+store's ``writer_id`` on whatever ``StepOutcome`` a caller passed, and review j#96611 finding 3
+reproduced the consequence: ``append`` of a bare ``done`` push with ``push_status=accepted``, no
+mutation anywhere, produced a row indistinguishable from a real receipt — and
+``ledger_authorizing_action_reader`` accepted it as a cleanup's authorizing action. Stamping a
+provenance onto an unexamined payload authenticates the FILE, not the CLAIM.
 
-*What that boundary actually is, stated rather than implied.* The identity is the STORE's, not a
-per-process token — it has to be, because the whole point is that a later process trusts what an
-earlier one wrote. So the trust boundary is the ledger FILE (its filesystem permissions), and the
-guarantee is: an entry carrying this writer id was written through this store's append API. It is
-not a proof of which process wrote it, and nothing here should be read as one. What it does close
-is the defect it was asked to close (R4 review j#96379 finding 1): a provenance derived from
-public constructor values that a caller could reproduce *without* the store.
+So the receipt is now bound to an admission. :meth:`begin_step` mints a one-time token into an
+open intent row and returns it; :meth:`append` requires a token matching an OPEN intent for
+exactly that ``(action_key, step)``, and closes it in the same transaction. There is no way to
+record an outcome for a step nobody was admitted to perform.
 
-**A mutation and its receipt are two writes, and a crash can land between them.** So they are not
-two independent writes: :meth:`begin_step` records an INTENT before the actuator performs the
-side effect, and ``append`` closes that intent and records the outcome in ONE transaction. A run
-that finds an unresolved intent knows a mutation may have run and that its outcome is unknown —
-which is not the same as knowing it did not run, and must never resolve to "retry the push". The
-actuator refuses to mutate while one is open (:meth:`unresolved_intents`), and an operator
-resolves it by reading what actually landed.
+*What that boundary is, stated exactly.* Two processes sharing a file cannot authenticate each
+other — filesystem permission is still the outer boundary, and nothing here should be read as
+more. What the admission adds is that a forger must first WIN the admission (:meth:`begin_step`
+is a compare-and-set, below), and while it holds one the real actuator is refused rather than
+racing it. The forgery becomes loud instead of silent. That is a different and weaker claim than
+"authenticated across mutually distrusting processes", and it is the strongest one a shared file
+supports.
+
+**One run at a time may be admitted to a step.** R1 read :meth:`unresolved_intents` and then
+called ``begin_step`` — a check-then-write with no constraint behind it, so two runs both opened
+an intent for the same push and both proceeded to mutate (reproduced, j#96611 finding 4; the
+``done`` unique index only catches the second one AFTER its mutation). A partial unique index on
+the OPEN intents makes the admission itself the compare-and-set: the second ``begin_step`` is
+refused, before any side effect.
+
+**A crash between a mutation and its receipt is recoverable, not merely detectable.** The
+crashed run's token died with it, so recovery cannot present one — :meth:`resolve_intent` closes
+an open intent without a token and records what the RECONCILER MEASURED, marking the row
+``reconciled`` so the durable record never confuses "the run that did it said so" with
+"a later run went and looked". It still requires an open intent to exist, so it is not a second
+way to invent a receipt. Review j#96611 finding 5: R1 detected the state and then blocked
+forever, which is not the replay-safe recovery the acceptance asks for.
 
 **A ``done`` step is recorded once per action.** A partial unique index makes a second ``done``
 row for the same ``(action_key, step)`` a database error rather than a second entry the ledger
 would then report as a duplicate step. The idempotency contract is enforced by the store, not
 only checked by the reader afterwards.
 
-The store is append-only: there is no update and no delete on the outcome table, and resolving an
+The store is append-only: there is no update and no delete on the outcome table, and closing an
 intent writes to the intent table alone.
 """
 
@@ -61,7 +73,13 @@ AUTO_INTEGRATION_LEDGER_FILENAME = "auto_integration_ledger.sqlite3"
 
 #: Bumped only for an incompatible layout. A file written by a newer schema is left untouched
 #: rather than opened optimistically (the same downgrade-safe posture as the herdr ledger).
-AUTO_INTEGRATION_LEDGER_SCHEMA_VERSION = 1
+#:
+#: v2 (Redmine #14825 review j#96611): the intent row carries a one-time ``receipt`` an append
+#: must present, and the open intents are uniquely constrained. There is no migration because
+#: there is nothing to migrate — this feature has never run, so no v1 file exists outside a test
+#: that creates one; a v1 file is refused rather than silently upgraded, which is the same
+#: downgrade-safe posture in the other direction.
+AUTO_INTEGRATION_LEDGER_SCHEMA_VERSION = 2
 
 _WRITER_SQL = """
 CREATE TABLE IF NOT EXISTS auto_integration_writer (
@@ -94,7 +112,10 @@ CREATE TABLE IF NOT EXISTS auto_integration_intent (
     action_key TEXT NOT NULL,
     step TEXT NOT NULL,
     recorded_by TEXT NOT NULL,
-    resolved_at TEXT
+    receipt TEXT NOT NULL,
+    resolved_at TEXT,
+    closed_by TEXT,
+    observation TEXT
 )
 """
 
@@ -106,9 +127,23 @@ _INDEX_SQL = (
     # produced by this store at all — a reader that finds one is looking at a foreign file.
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_auto_integration_ledger_done "
     "ON auto_integration_ledger(action_key, step) WHERE outcome = 'done'",
+    # The ADMISSION, as a compare-and-set rather than a check followed by a write (j#96611
+    # finding 4). At most one OPEN intent may exist for a step of an action, so the second
+    # concurrent `begin_step` is refused by the database BEFORE its caller mutates anything.
+    # Resolved rows are excluded, so the history of an action's steps is unbounded while its
+    # admission is exclusive.
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_auto_integration_intent_admission "
+    "ON auto_integration_intent(action_key, step) WHERE resolved_at IS NULL",
     "CREATE INDEX IF NOT EXISTS idx_auto_integration_intent_open "
     "ON auto_integration_intent(action_key, resolved_at)",
 )
+
+#: How an intent was closed. ``receipt`` is the run that was admitted presenting its own token;
+#: ``reconciled`` is a LATER run that measured the world because the admitted run never came
+#: back. Kept apart in the durable record because they are different evidence: one is the actor
+#: saying what it did, the other is an observer saying what it found.
+CLOSED_BY_RECEIPT = "receipt"
+CLOSED_BY_RECONCILIATION = "reconciled"
 
 _COLUMNS = (
     "recorded_at, action_key, step, outcome, detail, head, git_version, "
@@ -118,6 +153,19 @@ _COLUMNS = (
 
 class AutoIntegrationLedgerError(RuntimeError):
     """The ledger could not be opened or written. Fail-closed: never "nothing has run"."""
+
+
+class AutoIntegrationAdmissionError(AutoIntegrationLedgerError):
+    """Another run holds the admission for this step. NOTHING was mutated.
+
+    A distinct type because the caller's response is distinct: this is not an error to retry
+    past, it is the compare-and-set doing its job. Whoever holds the admission is running, or
+    crashed while running, and either way a second mutation is exactly what must not happen.
+    """
+
+
+class _Unadmitted(Exception):
+    """Internal: the write has no valid admission behind it (never escapes this module)."""
 
 
 @dataclass(frozen=True)
@@ -134,6 +182,10 @@ class StepIntent:
     opened_at: str
     intent_id: int = 0
     recorded_by: str = ""
+    #: The one-time token :meth:`SqliteLedgerStore.append` requires to close this admission.
+    #: Held only by the run that was admitted; a crash takes it with it, which is why recovery
+    #: goes through :meth:`SqliteLedgerStore.resolve_intent` instead of presenting one.
+    receipt: str = ""
 
 
 def auto_integration_ledger_path(home: Optional[Path] = None) -> Path:
@@ -205,21 +257,44 @@ class SqliteLedgerStore:
             conn.close()
         return tuple(_row_to_outcome(row) for row in rows)
 
-    def append(self, outcome: StepOutcome) -> None:
-        """Record ``outcome``, stamped with THIS store's writer identity.
+    def append(self, outcome: StepOutcome, *, receipt: str = "") -> None:
+        """Record ``outcome`` against the ADMISSION that produced it.
 
-        ``outcome.recorded_by`` is not read. A payload's own claim about who wrote it is exactly
-        the self-report this store exists to replace, and accepting it "when it happens to match"
-        would make the check depend on the value being checked.
+        ``receipt`` is the token :meth:`begin_step` minted for exactly this
+        ``(action_key, step)``. Without a matching OPEN intent the write is refused: an outcome
+        for a step nobody was admitted to perform is not a receipt, whatever it says about
+        itself (j#96611 finding 3 reproduced a forged ``done`` push landing here).
 
-        Any intent open for the same ``(action_key, step)`` is resolved in the same transaction,
-        so the receipt and the closing of the intent cannot come apart the way the mutation and
-        the receipt can.
+        ``outcome.recorded_by`` is still not read. A payload's own claim about who wrote it is
+        the self-report this store exists to replace, and accepting it "when it happens to
+        match" would make the check depend on the value being checked. The store stamps its own
+        writer id, and the admission is what makes that stamp mean something.
+
+        The row and the closing of its intent are ONE transaction, so the receipt and the intent
+        cannot come apart the way the mutation and the receipt can.
         """
+        token = str(receipt or "")
         conn = self._connect()
         try:
             writer = self._read_writer(conn)
             with conn:
+                intent = conn.execute(
+                    "SELECT id, receipt FROM auto_integration_intent WHERE action_key = ? "
+                    "AND step = ? AND resolved_at IS NULL",
+                    (str(outcome.action_key), str(outcome.step)),
+                ).fetchone()
+                if intent is None:
+                    raise _Unadmitted(
+                        f"no open admission for step {outcome.step!r} of this action; an "
+                        "outcome may only be recorded by the run that was admitted to produce "
+                        "it (call begin_step first, or resolve_intent to reconcile a crash)"
+                    )
+                if not token or not secrets.compare_digest(str(intent[1]), token):
+                    raise _Unadmitted(
+                        f"the receipt offered for step {outcome.step!r} is not the one this "
+                        "store minted for the open admission; refusing to record an outcome "
+                        "on somebody else's admission"
+                    )
                 conn.execute(
                     f"INSERT INTO auto_integration_ledger ({_COLUMNS}) "
                     f"VALUES ({', '.join('?' * 10)})",
@@ -237,10 +312,12 @@ class SqliteLedgerStore:
                     ),
                 )
                 conn.execute(
-                    "UPDATE auto_integration_intent SET resolved_at = ? "
-                    "WHERE action_key = ? AND step = ? AND resolved_at IS NULL",
-                    (_utc_now(), str(outcome.action_key), str(outcome.step)),
+                    "UPDATE auto_integration_intent SET resolved_at = ?, closed_by = ? "
+                    "WHERE id = ?",
+                    (_utc_now(), CLOSED_BY_RECEIPT, int(intent[0])),
                 )
+        except _Unadmitted as exc:
+            raise AutoIntegrationLedgerError(str(exc)) from None
         except sqlite3.IntegrityError as exc:
             raise AutoIntegrationLedgerError(
                 f"step {outcome.step!r} is already recorded {OUTCOME_DONE} for this action; "
@@ -290,24 +367,39 @@ class SqliteLedgerStore:
     # -- crash boundary ----------------------------------------------------
 
     def begin_step(self, *, action_key: str, step: str) -> StepIntent:
-        """Record that ``step`` is ABOUT to run, before the side effect happens.
+        """Claim the exclusive admission to run ``step``, before the side effect happens.
 
-        The window this closes is the one between a ``git push`` landing and its receipt being
-        written. Without an intent the next run sees no push entry and offers the push again; with
-        one it sees a step whose outcome is unknown and stops. "We do not know" is a state the
-        durable record has to be able to hold, or it will be rounded to the convenient one.
+        Two things at once, and both are load-bearing:
+
+        - it records that a mutation is ABOUT to happen, so a crash before the receipt leaves
+          "we do not know" in the durable record rather than an absence the next run reads as
+          "not yet done" and offers to do again;
+        - it is the COMPARE-AND-SET that admits exactly one run to that step. R1 left this as a
+          plain insert behind a separate ``unresolved_intents`` read, and two runs were both
+          admitted to the same push (reproduced, j#96611 finding 4). The unique index over the
+          OPEN intents is what makes the second one fail here, before it mutates.
+
+        Raises :class:`AutoIntegrationAdmissionError` when another run already holds the
+        admission. A caller must treat that as "do not mutate" — it is not a retryable error,
+        it is somebody else's turn.
         """
         conn = self._connect()
         try:
             writer = self._read_writer(conn)
             opened_at = _utc_now()
+            token = f"receipt:{secrets.token_hex(16)}"
             with conn:
                 cursor = conn.execute(
                     "INSERT INTO auto_integration_intent "
-                    "(opened_at, action_key, step, recorded_by) VALUES (?, ?, ?, ?)",
-                    (opened_at, str(action_key), str(step), writer),
+                    "(opened_at, action_key, step, recorded_by, receipt) VALUES (?, ?, ?, ?, ?)",
+                    (opened_at, str(action_key), str(step), writer, token),
                 )
                 intent_id = cursor.lastrowid
+        except sqlite3.IntegrityError as exc:
+            raise AutoIntegrationAdmissionError(
+                f"another run already holds the admission for step {step!r} of this action; "
+                "refusing to admit a second one (nothing was mutated)"
+            ) from exc
         except sqlite3.Error as exc:
             raise AutoIntegrationLedgerError(
                 f"auto-integration ledger {self.path} could not record a step intent "
@@ -321,7 +413,84 @@ class SqliteLedgerStore:
             opened_at=opened_at,
             intent_id=intent_id,
             recorded_by=writer,
+            receipt=token,
         )
+
+    def resolve_intent(
+        self, *, action_key: str, step: str, resolution: StepOutcome, observation: str
+    ) -> None:
+        """Close a STRANDED admission with what a later run MEASURED (the recovery path).
+
+        The crashed run's token died with it, so recovery cannot present one — requiring it here
+        would make the state permanent, which is what R1 shipped and what j#96611 finding 5
+        rejected. Two things keep this from becoming a second way to forge a receipt:
+
+        - an OPEN intent must exist. This closes a step somebody was admitted to run; it cannot
+          invent an outcome for a step nobody ever began;
+        - the row is marked :data:`CLOSED_BY_RECONCILIATION` and carries the ``observation`` the
+          reconciler made, so the durable record never confuses "the run that did it said so"
+          with "a later run went and looked". A reader that cares about the difference can see
+          it.
+
+        ``resolution`` is the outcome the measurement supports — ``done`` when the mutation is
+        observed to have landed, ``blocked`` when it is observed not to have. A reconciler that
+        cannot tell must not call this at all: ambiguity stays open, which is the honest state.
+        """
+        conn = self._connect()
+        try:
+            writer = self._read_writer(conn)
+            with conn:
+                intent = conn.execute(
+                    "SELECT id FROM auto_integration_intent WHERE action_key = ? AND step = ? "
+                    "AND resolved_at IS NULL",
+                    (str(action_key), str(step)),
+                ).fetchone()
+                if intent is None:
+                    raise _Unadmitted(
+                        f"there is no open admission for step {step!r} of this action to "
+                        "reconcile; reconciliation closes a stranded admission, it does not "
+                        "open one"
+                    )
+                conn.execute(
+                    f"INSERT INTO auto_integration_ledger ({_COLUMNS}) "
+                    f"VALUES ({', '.join('?' * 10)})",
+                    (
+                        _utc_now(),
+                        str(resolution.action_key),
+                        str(resolution.step),
+                        str(resolution.outcome),
+                        str(resolution.detail),
+                        str(resolution.head),
+                        str(resolution.git_version),
+                        str(resolution.merge_status),
+                        str(resolution.push_status),
+                        writer,
+                    ),
+                )
+                conn.execute(
+                    "UPDATE auto_integration_intent SET resolved_at = ?, closed_by = ?, "
+                    "observation = ? WHERE id = ?",
+                    (
+                        _utc_now(),
+                        CLOSED_BY_RECONCILIATION,
+                        str(observation),
+                        int(intent[0]),
+                    ),
+                )
+        except _Unadmitted as exc:
+            raise AutoIntegrationLedgerError(str(exc)) from None
+        except sqlite3.IntegrityError as exc:
+            raise AutoIntegrationLedgerError(
+                f"step {resolution.step!r} is already recorded {OUTCOME_DONE} for this action; "
+                "the reconciliation would duplicate it"
+            ) from exc
+        except sqlite3.Error as exc:
+            raise AutoIntegrationLedgerError(
+                f"auto-integration ledger {self.path} could not be reconciled "
+                f"({exc.__class__.__name__})"
+            ) from exc
+        finally:
+            conn.close()
 
     def unresolved_intents(self, *, action_key: str) -> Tuple[StepIntent, ...]:
         """Steps whose side effect may have run and whose outcome never arrived."""
@@ -442,6 +611,9 @@ def _row_to_outcome(row: Sequence[object]) -> StepOutcome:
 __all__ = (
     "AUTO_INTEGRATION_LEDGER_FILENAME",
     "AUTO_INTEGRATION_LEDGER_SCHEMA_VERSION",
+    "CLOSED_BY_RECEIPT",
+    "CLOSED_BY_RECONCILIATION",
+    "AutoIntegrationAdmissionError",
     "AutoIntegrationLedgerError",
     "SqliteLedgerStore",
     "StepIntent",

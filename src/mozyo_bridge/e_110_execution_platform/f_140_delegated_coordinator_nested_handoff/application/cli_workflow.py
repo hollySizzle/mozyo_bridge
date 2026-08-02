@@ -879,6 +879,16 @@ def register(sub) -> None:
 
     register_proxy_parsers(workflow_sub)
 
+    # `workflow auto-integration` (Redmine #14825 review j#96611 finding 1): the runtime
+    # entrypoint for the #13686 actuator. Until this existed the composition root and the
+    # asynchronous continuation were reachable only from a test — a trigger nobody invokes is
+    # not a trigger.
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_auto_integration import (  # noqa: E501
+        register_auto_integration_parsers,
+    )
+
+    register_auto_integration_parsers(workflow_sub)
+
     step = workflow_sub.add_parser(
         "step",
         description=(
