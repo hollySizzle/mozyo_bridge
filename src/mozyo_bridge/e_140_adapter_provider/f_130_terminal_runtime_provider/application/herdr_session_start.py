@@ -344,6 +344,8 @@ def prepare_session(
         probe=probe,
         startup_fence=startup_fence,
         action_nonce=action_nonce,
+        # In the dict too: signature-only left the public rail unarmed (audit j#97177 F1).
+        launch_cause=launch_cause,
     )
     # Before the lock: acquiring it creates the home dir and a lock file, and a malformed
     # ratio authority must cost neither (#14569 j#91331 R4-F1). The locked entry re-checks.
@@ -642,9 +644,7 @@ def _prepare_session_locked(
             [plan.provider for plan in launch_plans],
             env,
             permission_mode_default=claude_permission_mode_default,
-            # The typed cause the CALLER proved, defaulting to the unarmed one. A create or
-            # an ordinary heal never names a cause, so its preflight is byte-invariant and
-            # queries no updater (Redmine #14741 j#97171).
+            # The cause the CALLER proved; naming none stays byte-invariant (j#97171).
             launch_cause=launch_cause,
         )
     except AgentProviderProfileError as exc:

@@ -141,54 +141,78 @@ class ActuatorOpsDefaultTest(unittest.TestCase):
 class PropagationTest(unittest.TestCase):
     """The token really arrives at the provider preflight, on both replacement shapes."""
 
-    def _capture(self, *, admission_lock_held: bool, launch_cause=None):
+    def _capture_through_binding(self, *, admission_lock_held: bool, launch_cause=None):
+        """Drive the binding rail and capture what the SESSION START entry receives.
+
+        Only the innermost entry is seamed. The public `prepare_session` is NOT replaced --
+        the first cut faked it, so the very transition it claimed to prove was skipped and a
+        dropped kwarg stayed green (audit j#97177 F1).
+        """
         import mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start as start
         import mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_v1_replacement_binding as binding
-
-        seen = {}
-
-        def _fake(**kwargs):
-            seen.update(kwargs)
-            raise _Stop()
 
         class _Stop(Exception):
             pass
 
-        original_locked = start._prepare_session_locked
-        original_plain = start.prepare_session
-        start._prepare_session_locked = _fake
-        start.prepare_session = _fake
+        seen = {}
+
+        def _fake_locked(**kwargs):
+            seen.update(kwargs)
+            raise _Stop()
+
+        original = start._prepare_session_locked
+        start._prepare_session_locked = _fake_locked
         try:
             kwargs = dict(
                 worktree_path="/repo", config_repo_root=Path("/repo"),
                 providers=["codex"], lane_id="l", env={}, runner=None, timeout=1.0,
                 replacement_action_id="a:gen1", admission_lock_held=admission_lock_held,
+                dry_run=True,
             )
             if launch_cause is not None:
                 kwargs["launch_cause"] = launch_cause
             try:
-                binding.prepare_actuator_lane_session(**kwargs)
+                binding.prepare_actuator_lane_session(
+                    **{k: v for k, v in kwargs.items() if k != "dry_run"}
+                )
             except _Stop:
                 pass
         finally:
-            start._prepare_session_locked = original_locked
-            start.prepare_session = original_plain
+            start._prepare_session_locked = original
         return seen
 
-    def test_the_update_cause_reaches_the_session_start_on_both_rails(self) -> None:
-        for admission_lock_held in (True, False):
-            with self.subTest(locked=admission_lock_held):
-                seen = self._capture(
-                    admission_lock_held=admission_lock_held,
-                    launch_cause=LAUNCH_CAUSE_UPDATE_RELAUNCH,
-                )
-                self.assertEqual(seen["launch_cause"], LAUNCH_CAUSE_UPDATE_RELAUNCH)
+    def _capture_through_public_wrapper(self, **kwargs):
+        """Run the REAL public `prepare_session` and capture the inner call's kwargs.
 
-    def test_an_omitted_cause_is_the_unarmed_default(self) -> None:
-        for admission_lock_held in (True, False):
-            with self.subTest(locked=admission_lock_held):
-                seen = self._capture(admission_lock_held=admission_lock_held)
-                self.assertEqual(seen["launch_cause"], LAUNCH_CAUSE_GENERIC_FRESH)
+        `dry_run=True` keeps it on the no-lock path and stops it before any side effect,
+        while still going through the public wrapper's own argument binding and call dict --
+        which is where the token was being dropped.
+        """
+        import tempfile
+
+        import mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start as start
+
+        seen = {}
+        original = start._prepare_session_locked
+        start._prepare_session_locked = lambda **kw: seen.update(kw)
+        try:
+            start.prepare_session(
+                repo_root=Path(tempfile.mkdtemp()), providers=["codex"], lane_id="l",
+                env={}, dry_run=True, **kwargs,
+            )
+        finally:
+            start._prepare_session_locked = original
+        return seen
+
+    def test_the_public_wrapper_forwards_an_armed_cause(self) -> None:
+        seen = self._capture_through_public_wrapper(
+            launch_cause=LAUNCH_CAUSE_UPDATE_RELAUNCH
+        )
+        self.assertEqual(seen.get("launch_cause"), LAUNCH_CAUSE_UPDATE_RELAUNCH)
+
+    def test_the_public_wrapper_defaults_to_unarmed(self) -> None:
+        seen = self._capture_through_public_wrapper()
+        self.assertEqual(seen.get("launch_cause"), LAUNCH_CAUSE_GENERIC_FRESH)
 
     def _reach_preflight(self, **kwargs):
         """Drive the REAL `_prepare_session_locked` until the provider preflight is called.
