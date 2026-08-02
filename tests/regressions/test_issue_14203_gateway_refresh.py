@@ -25,6 +25,9 @@ from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
     ReplacementTransactionKey,
     ReplacementTransactionStore,
 )
+from mozyo_bridge.core.state.replacement_transaction_model import (  # noqa: E402
+    ParticipantPin,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.fresh_coordinator_drain import (  # noqa: E402,E501
     DRAIN_SEND_ERROR,
     DRAIN_SEND_OK,
@@ -326,6 +329,48 @@ class ExecuteRefusalTests(_RefreshCase):
         self.assertEqual(outcome.status, REFRESH_STATUS_REFUSED)
         self.assertIn("different refresh authority", outcome.detail)
         self.assertEqual(ops2.resumes, [])
+
+    def test_a_stored_row_with_a_different_evidence_triplet_is_a_conflict(self):
+        """Redmine #14741 j#97093 decision 5: the comparison is the WHOLE participant.
+
+        The check used to be a hand-picked field list (locator, revision, generation), which
+        answers "did the fields I remembered to name change?". The evidence triplet was not
+        on it, so a stored row pinned to a different startup action -- a different launch --
+        counted as the same authority, and the refresh would have actuated against it. One
+        differing evidence field is enough, and the refusal is zero-actuation.
+        """
+        key = ReplacementTransactionKey(self.workspace_id, ACTION_ID)
+        planned = ParticipantPin(
+            lane_id=GATEWAY["lane_id"], role=GATEWAY["role"],
+            provider=GATEWAY["provider"], assigned_name=GATEWAY["assigned_name"],
+            old_locator=GATEWAY["old_locator"], is_self=False,
+            lane_revision="5", lane_generation="2",
+            evidence_workspace_id="ws",
+            evidence_startup_action_id="startup-ir1-" + "a" * 64,
+            evidence_cause="update_relaunch",
+        )
+        # The decision / continuation pointers are the use case's own, learned from a run
+        # against a throwaway store so this test states a stored-row conflict rather than
+        # re-implementing how the pointers are built.
+        scratch = ReplacementTransactionStore(home=Path(tempfile.mkdtemp()))
+        GatewayRefreshUseCase(
+            scratch, FakeActuatorPort(), FakeGatewayOps(),
+            workspace_id=self.workspace_id, clock=lambda: FIXED,
+        ).run(self._request(), execute=True)
+        reference = scratch.get(key)
+        ops = FakeGatewayOps()
+        self.store.plan_transaction(
+            key, action_generation=GEN, decision=reference.decision,
+            continuation=reference.continuation, participants=[planned],
+        )
+        outcome = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(outcome.status, REFRESH_STATUS_REFUSED)
+        self.assertIn("different refresh authority", outcome.detail)
+        self.assertEqual(ops.resumes, [])
+        self.assertEqual(self.port.closed, [])
+        self.assertEqual(self.port.launched, [])
+        stored = self.store.get(key).participants[0]
+        self.assertEqual(stored.evidence_cause, "update_relaunch")
 
 
 class HappyPathTests(_RefreshCase):

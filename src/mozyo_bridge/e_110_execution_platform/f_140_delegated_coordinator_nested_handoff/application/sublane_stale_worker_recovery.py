@@ -51,6 +51,7 @@ from mozyo_bridge.core.state.replacement_transaction_model import (
     DecisionPointerError,
     ParticipantPinError,
     norm,
+    participant_authority_matches,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_actuator import (  # noqa: E501
     DEFAULT_LEASE_TTL_SECONDS,
@@ -629,10 +630,7 @@ class StaleWorkerRecoveryUseCase:
             or current.decision != decision
             or current.continuation != continuation
             or len(current.participants) != 1
-            or stored_worker is None
-            or stored_worker.old_locator != worker.old_locator
-            or stored_worker.lane_revision != worker.lane_revision
-            or stored_worker.lane_generation != worker.lane_generation
+            or not participant_authority_matches(stored_worker, worker)
         )
         converged_supersede = False
         if diverged:

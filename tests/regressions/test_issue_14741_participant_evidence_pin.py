@@ -94,6 +94,105 @@ class TripletContractTest(unittest.TestCase):
                     _pin(**kw)
 
 
+class StrictEvidenceTextTest(unittest.TestCase):
+    """The triplet is NEW authority, so it is plain exact text or a refusal (j#97093 #4).
+
+    The pre-#14741 fields keep their normalisation on purpose -- that is a compatibility
+    contract with every producer and every stored row. The three evidence fields have no
+    such history, and a value that had to be repaired before it matched is a value nobody
+    wrote: it would let a manifest claim a startup action or a cause the receipt authority
+    never recorded.
+    """
+
+    def _refuses(self, **kw) -> None:
+        base = dict(
+            evidence_workspace_id="wA",
+            evidence_startup_action_id=ACTION,
+            evidence_cause="update_relaunch",
+        )
+        base.update(kw)
+        with self.assertRaises(ParticipantPinError):
+            _pin(**base)
+
+    def test_a_padded_evidence_value_is_refused(self) -> None:
+        for field, value in (
+            ("evidence_workspace_id", " wA "),
+            ("evidence_startup_action_id", ACTION + " "),
+            ("evidence_cause", "\tupdate_relaunch"),
+        ):
+            with self.subTest(field=field):
+                self._refuses(**{field: value})
+
+    def test_a_whitespace_only_evidence_value_is_refused(self) -> None:
+        """Not "empty after stripping" -- a whitespace value is a written value."""
+        self._refuses(evidence_cause="   ")
+
+    def test_a_nontext_evidence_value_is_refused(self) -> None:
+        for value in (None, 1, True, b"wA", ["wA"], object()):
+            with self.subTest(value=type(value).__name__):
+                self._refuses(evidence_workspace_id=value)
+
+    def test_the_legacy_fields_still_normalise(self) -> None:
+        """The contrast is the point: only the new authority got strict."""
+        pin = _pin(lane_id=" issue_14741 ", old_locator=" wA:p1 ")
+        self.assertEqual(pin.lane_id, "issue_14741")
+        self.assertEqual(pin.old_locator, "wA:p1")
+
+
+class StrictEvidenceDecodeTest(unittest.TestCase):
+    """A stored manifest is validated BEFORE it reaches the constructor (j#97093 #4)."""
+
+    def _manifest(self, version=PARTICIPANTS_VERSION, **evidence) -> str:
+        row = {
+            "lane_id": "issue_14741",
+            "role": "gateway",
+            "provider": "codex",
+            "assigned_name": "mzb1_wA_codex_lane",
+            "old_locator": "wA:p1",
+            "is_self": False,
+            "lane_revision": "7",
+            "lane_generation": "g1",
+            "phase": PARTICIPANT_CLOSE_OWED,
+        }
+        row.update(evidence)
+        return json.dumps({"version": version, "participants": [row]})
+
+    def test_a_padded_or_nontext_stored_evidence_value_fails_closed(self) -> None:
+        for label, evidence in (
+            ("padded workspace", {"evidence_workspace_id": " wA "}),
+            ("padded action", {"evidence_startup_action_id": ACTION + " "}),
+            ("null cause", {"evidence_cause": None}),
+            ("numeric workspace", {"evidence_workspace_id": 7}),
+            ("nested object", {"evidence_cause": {"cause": "update_relaunch"}}),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaises(ParticipantPinError):
+                    decode_participants(self._manifest(**evidence))
+
+    def test_a_v1_row_without_the_keys_reads_as_an_empty_triplet(self) -> None:
+        """Read-compatibility is about a MISSING key, not about repairing a present one."""
+        pins = decode_participants(self._manifest(version=1))
+        self.assertEqual(len(pins), 1)
+        self.assertEqual(
+            (
+                pins[0].evidence_workspace_id,
+                pins[0].evidence_startup_action_id,
+                pins[0].evidence_cause,
+            ),
+            ("", "", ""),
+        )
+
+    def test_an_exact_stored_triplet_still_decodes(self) -> None:
+        pins = decode_participants(
+            self._manifest(
+                evidence_workspace_id="wA",
+                evidence_startup_action_id=ACTION,
+                evidence_cause="update_relaunch",
+            )
+        )
+        self.assertEqual(pins[0].evidence_startup_action_id, ACTION)
+
+
 class RoundTripAndReplayTest(unittest.TestCase):
     def test_the_envelope_this_build_writes_is_v2(self) -> None:
         self.assertEqual(PARTICIPANTS_VERSION, 2)

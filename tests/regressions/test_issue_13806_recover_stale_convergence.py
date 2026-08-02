@@ -123,6 +123,28 @@ def _worker(*, lane_revision: str = "5", lane_generation: str = "1") -> Particip
     )
 
 
+EVIDENCE_ACTION = "startup-ir1-" + "a" * 64
+
+
+def _evidence_worker(
+    *,
+    lane_revision: str = "5",
+    lane_generation: str = "1",
+    evidence_workspace_id: str = "w28",
+    evidence_startup_action_id: str = EVIDENCE_ACTION,
+    evidence_cause: str = "update_relaunch",
+) -> ParticipantPin:
+    """The same worker, carrying the update-evidence triplet a receipt-capable plan pins."""
+    return ParticipantPin(
+        lane_id=LANE, role=ROLE, provider=PROVIDER, assigned_name=NAME,
+        old_locator=LOCATOR, is_self=False,
+        lane_revision=lane_revision, lane_generation=lane_generation,
+        evidence_workspace_id=evidence_workspace_id,
+        evidence_startup_action_id=evidence_startup_action_id,
+        evidence_cause=evidence_cause,
+    )
+
+
 # ============================================================================
 # 1. Store-level supersede CAS (the zero-effect convergence primitive)
 # ============================================================================
@@ -322,6 +344,47 @@ class SupersedeStoreTests(unittest.TestCase):
         out = self._supersede(worker=foreign)
         self.assertFalse(out.applied)
         self.assertEqual(out.reason, CAS_ACTION_MISMATCH)
+
+    def test_supersede_refused_when_evidence_appears_from_nowhere(self):
+        """Redmine #14741 j#97093 decision 6: empty -> pinned is not a lifecycle correction.
+
+        A supersede exists to fix a MIS-BOUND LIFECYCLE. If the evidence triplet were left
+        out of the signature, a row planned with no evidence could acquire a relaunch cause
+        it never observed, through the one path whose purpose is to change an unrelated
+        field -- and the transaction would then arm a relaunch on evidence no receipt
+        authority ever wrote.
+        """
+        self._plan_zero_effect(worker=_worker(lane_revision="0"))
+        before = self.store.get(self.key)
+        out = self._supersede(worker=_evidence_worker())
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_ACTION_MISMATCH)
+        after = self.store.get(self.key)
+        self.assertEqual(after.revision, before.revision)
+        self.assertEqual(after.participants[0].evidence_cause, "")
+
+    def test_supersede_refused_on_any_single_evidence_axis(self):
+        """One field is enough: the triplet names ONE generation, not three hints."""
+        for field, value in (
+            ("evidence_workspace_id", "OTHER"),
+            ("evidence_startup_action_id", "startup-ir1-" + "c" * 64),
+            ("evidence_cause", "generic_fresh"),
+        ):
+            with self.subTest(field=field):
+                self.setUp()
+                self._plan_zero_effect(worker=_evidence_worker(lane_revision="0"))
+                out = self._supersede(worker=_evidence_worker(**{field: value}))
+                self.assertFalse(out.applied)
+                self.assertEqual(out.reason, CAS_ACTION_MISMATCH)
+
+    def test_supersede_applies_on_the_same_triplet_with_a_lifecycle_only_correction(self):
+        """The positive control: the triplet is immutable, the lifecycle is what converges."""
+        self._plan_zero_effect(worker=_evidence_worker(lane_revision="0"))
+        out = self._supersede(worker=_evidence_worker(lane_revision="5"))
+        self.assertTrue(out.applied, out.reason)
+        after = self.store.get(self.key)
+        self.assertEqual(after.participants[0].lane_revision, "5")
+        self.assertEqual(after.participants[0].evidence_cause, "update_relaunch")
 
     def test_supersede_refused_on_old_locator_drift(self):
         # Redmine #13806 R2 F1: the exact live-generation locator is NOT re-anchorable — only the

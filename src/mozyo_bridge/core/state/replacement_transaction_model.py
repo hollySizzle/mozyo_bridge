@@ -307,19 +307,41 @@ def transaction_has_zero_actuation_effect(
     )
 
 
+#: The update-evidence triplet, in the one order every consumer reads it in.
+_EVIDENCE_FIELDS = (
+    "evidence_workspace_id",
+    "evidence_startup_action_id",
+    "evidence_cause",
+)
+
+
 def _supersede_participant_signature(
     pin: "ParticipantPin",
-) -> tuple[str, str, str, str, str, bool]:
+) -> tuple:
     """The immutable-across-supersede signature of a participant. (pure)
 
     Everything a supersede re-anchor may NOT change: the stable identity ``(lane_id, role,
     provider, assigned_name)`` PLUS ``old_locator`` (the exact live-generation evidence, and the
-    token the recovery action-id is derived from) and ``is_self`` (self-close ordering). Only
-    the lane-lifecycle evidence (``lane_revision`` / ``lane_generation``) — the mis-bound field
-    the convergence exists to correct — is deliberately excluded (Redmine #13806 R2 F1).
+    token the recovery action-id is derived from), ``is_self`` (self-close ordering) and the
+    update-evidence triplet. Only the lane-lifecycle evidence (``lane_revision`` /
+    ``lane_generation``) — the mis-bound field the convergence exists to correct — is
+    deliberately excluded (Redmine #13806 R2 F1).
+
+    The triplet is in the signature because a supersede corrects a MIS-BOUND LIFECYCLE, not
+    a different launch (Redmine #14741 j#97093 decision 6). Leaving it out would have made
+    ``empty -> pinned`` a legal re-anchor: a row planned with no evidence could acquire a
+    relaunch cause it never observed, through a path whose whole purpose is to change one
+    unrelated field.
     """
     lane_id, role, provider, assigned_name = pin.identity
-    return (lane_id, role, provider, assigned_name, pin.old_locator, pin.is_self)
+    return (
+        lane_id,
+        role,
+        provider,
+        assigned_name,
+        pin.old_locator,
+        pin.is_self,
+    ) + tuple(getattr(pin, name) for name in _EVIDENCE_FIELDS)
 
 
 def supersede_refusal_reason(
@@ -371,6 +393,26 @@ def supersede_refusal_reason(
     if new_action_generation <= existing.action_generation:
         return CAS_GENERATION_MISMATCH
     return None
+
+
+def participant_authority_matches(
+    stored: Optional["ParticipantPin"], planned: "ParticipantPin"
+) -> bool:
+    """Is a stored row the SAME participant authority as the one just planned? (pure)
+
+    Phase is the one field the STORE owns — it advances ``close_owed -> launch_owed -> ...``
+    as the transaction runs — so it is compared canonically by holding it equal, and every
+    other axis must match as a whole :class:`ParticipantPin`, evidence triplet included.
+
+    The call sites this replaces compared a hand-picked list (locator, revision,
+    generation). A hand-picked list answers "did the fields I remembered to name change?",
+    and the evidence triplet was not on it — so a stored row could carry a different
+    startup action or cause than the participant about to be actuated, and the comparison
+    would call them the same authority (Redmine #14741 j#97093 decision 5).
+    """
+    if stored is None:
+        return False
+    return stored.with_phase(planned.phase) == planned
 
 
 def participant_actuation_phase_allowed(is_self: bool, transaction_phase: str) -> bool:
@@ -522,6 +564,9 @@ class ParticipantPin:
     phase: str = PARTICIPANT_CLOSE_OWED
 
     def __post_init__(self) -> None:
+        # The pre-#14741 fields keep their normalisation. That is a compatibility contract
+        # with every producer and every stored row, and j#97093 decision 4 is explicit that
+        # it is not changed wholesale here.
         for name in (
             "lane_id",
             "role",
@@ -530,12 +575,21 @@ class ParticipantPin:
             "old_locator",
             "lane_revision",
             "lane_generation",
-            "evidence_workspace_id",
-            "evidence_startup_action_id",
-            "evidence_cause",
             "phase",
         ):
             object.__setattr__(self, name, norm(getattr(self, name)))
+        # The evidence triplet is NEW authority, so it starts strict: plain exact text or a
+        # refusal, never laundered into shape. These three fields are what a relaunch fence
+        # proves itself with, and a value that had to be repaired before it matched is a
+        # value nobody wrote (Redmine #14741 j#97074 / j#97093 decision 4).
+        for name in _EVIDENCE_FIELDS:
+            value = getattr(self, name)
+            if type(value) is not str or value != value.strip():
+                raise ParticipantPinError(
+                    "a participant's update-evidence field must be plain exact text "
+                    "(no padding, no coercion); an evidence value that needs repairing "
+                    "names a generation nobody recorded"
+                )
         object.__setattr__(self, "is_self", bool(self.is_self))
         missing = [
             name
@@ -552,11 +606,7 @@ class ParticipantPin:
             raise ParticipantPinError(
                 f"unknown participant phase {self.phase!r}"
             )
-        triplet = (
-            self.evidence_workspace_id,
-            self.evidence_startup_action_id,
-            self.evidence_cause,
-        )
+        triplet = tuple(getattr(self, name) for name in _EVIDENCE_FIELDS)
         if any(triplet) and not all(triplet):
             raise ParticipantPinError(
                 "a participant's update-evidence triplet must be wholly empty (legacy / "
@@ -658,6 +708,29 @@ def encode_participants(participants: Sequence[ParticipantPin]) -> str:
     )
 
 
+def _decoded_evidence(item: dict) -> dict:
+    """The raw manifest's evidence triplet, strictly, as constructor keywords.
+
+    A missing key reads as absent (v1 compatibility). A present key must already be plain
+    exact text — padding, ``null``, a number, a bool or a nested object is a corrupt
+    manifest and fails closed, exactly like an unknown version does.
+    """
+    decoded: dict = {}
+    for name in _EVIDENCE_FIELDS:
+        if name not in item:
+            decoded[name] = ""
+            continue
+        value = item[name]
+        if type(value) is not str or value != value.strip():
+            raise ParticipantPinError(
+                f"participant manifest field {name} is not plain exact text; a stored "
+                "evidence value that needs repairing is a corrupt manifest, not a "
+                "recoverable one"
+            )
+        decoded[name] = value
+    return decoded
+
+
 def decode_participants(raw: str) -> tuple[ParticipantPin, ...]:
     """Read the participant manifest back. Empty means none; corrupt / unknown **raises**.
 
@@ -709,12 +782,15 @@ def decode_participants(raw: str) -> tuple[ParticipantPin, ...]:
                 lane_revision=norm(item.get("lane_revision")),
                 lane_generation=norm(item.get("lane_generation")),
                 # A v1 manifest predates identity receipts, so its participants carry no
-                # evidence. Reading that as an empty triplet is read-COMPATIBILITY, not a
-                # default: the absence is a fact about when the row was written, and it is
-                # exactly what a legacy/generic participant should say.
-                evidence_workspace_id=norm(item.get("evidence_workspace_id")),
-                evidence_startup_action_id=norm(item.get("evidence_startup_action_id")),
-                evidence_cause=norm(item.get("evidence_cause")),
+                # evidence. Reading a MISSING key as an empty triplet is read-COMPATIBILITY,
+                # not a default: the absence is a fact about when the row was written, and
+                # it is exactly what a legacy/generic participant should say.
+                #
+                # A key that is PRESENT is validated before it reaches the constructor
+                # (j#97093 decision 4). ``norm`` would have repaired a padded or non-text
+                # value into a canonical token, which is how a manifest nobody wrote becomes
+                # the authority a relaunch is proven against.
+                **_decoded_evidence(item),
                 phase=norm(item.get("phase")) or PARTICIPANT_CLOSE_OWED,
             )
         )
