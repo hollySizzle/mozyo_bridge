@@ -38,6 +38,7 @@ import errno
 import fcntl
 import hashlib
 import json
+import re
 import os
 import sqlite3
 from dataclasses import dataclass, field
@@ -135,12 +136,27 @@ _EXPECTED_COLUMNS: dict[str, tuple[str, ...]] = {
 }
 
 
-class StartupTransactionError(RuntimeError):
-    """The startup transaction authority is unusable / was asked for something invalid."""
-
-
-class StartupTransactionBusy(StartupTransactionError):
-    """Another startup transaction holds this authority. Never wait, never steal."""
+from mozyo_bridge.core.state.startup_action_capability import (  # noqa: F401
+    CAPABILITIES,
+    CAPABILITY_IDENTITY_RECEIPT,
+    CAPABILITY_LEGACY,
+    IDENTITY_MANIFEST_PROTOCOL,
+    REASON_RECEIPT_REQUIREMENT_UNAVAILABLE,
+    IdentityManifest,
+    IdentityManifestSlot,
+    StartupTransactionBusy,
+    StartupTransactionError,
+    _IDENTITY_MANIFEST_COLUMNS,
+    _IDENTITY_MANIFEST_SQL,
+    _IDENTITY_MANIFEST_TABLE,
+    action_capability,
+    read_identity_manifest as _read_identity_manifest,
+    resolve_reserve_identity as _resolve_reserve_identity,
+    write_reserved_action as _write_reserved_action,
+    requires_identity_receipt,
+    startup_action_id,
+    startup_action_id_matching,
+)
 
 
 def _norm(value: object) -> str:
@@ -159,6 +175,20 @@ def _close_quietly(conn) -> None:
     try:
         conn.close()
     except (sqlite3.DatabaseError, OSError):
+        pass
+
+
+def _rollback_quietly(conn) -> None:
+    """Roll back a co-commit that failed mid-transaction, swallowing a secondary failure.
+
+    The primary fault is what the caller must see; a rollback that itself fails must not
+    mask it. An unrolled-back BEGIN is closed by `_connection` anyway, which discards it.
+    """
+    if conn is None:
+        return
+    try:
+        conn.execute("ROLLBACK")
+    except sqlite3.DatabaseError:
         pass
 
 
@@ -208,31 +238,6 @@ class StartupUnit:
             lane_id=_norm(self.lane_id),
             providers=canonical_providers(self.providers),
         )
-
-
-def startup_action_id(unit: StartupUnit, nonce: str) -> str:
-    """The immutable identity of one session-start invocation.
-
-    The unit alone is NOT an identity: the same operator re-running the same command in the
-    same lane is a *different* action, and letting the second inherit the first's record is
-    how an old completion gets applied to a live pair. The ``nonce`` is what separates
-    them; it is supplied by the caller (and injected by tests) rather than minted here, so
-    this stays pure and the invocation stays the single place a new identity is born.
-    """
-    canonical = unit.canonical()
-    values = (
-        canonical.workspace_id,
-        canonical.lane_id,
-        ",".join(canonical.providers),
-        _norm(nonce),
-    )
-    if not all(values):
-        raise ValueError(
-            "a startup action identity requires an exact workspace, lane, requested "
-            "provider set, and nonce"
-        )
-    encoded = json.dumps(values, ensure_ascii=True, separators=(",", ":"))
-    return "startup-" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -656,6 +661,15 @@ class StartupTransactionFence:
 
     # -- reads -------------------------------------------------------------
 
+    def read_identity_manifest(self, action_id: str) -> "Optional[IdentityManifest]":
+        """The canonical launch manifest a TAGGED action is content-bound to (fail-closed).
+
+        Body in :func:`...startup_action_capability.read_identity_manifest` — this module is
+        at the module-health ceiling, and the read is a cohesive unit of the capability
+        feature rather than of the v1 authority it lives beside.
+        """
+        return _read_identity_manifest(self, action_id)
+
     def read(self, action_id: str) -> Optional[StartupAction]:
         """Read one action. ``None`` = no such record. Raises when the store is unusable."""
         shape = self.store_shape()
@@ -692,15 +706,28 @@ class StartupTransactionFence:
 
     # -- writes ------------------------------------------------------------
 
-    def reserve(self, unit: StartupUnit, nonce: str) -> StartupAction:
+    def reserve(
+        self,
+        unit: StartupUnit,
+        nonce: str,
+        *,
+        manifest: "Optional[IdentityManifest]" = None,
+    ) -> StartupAction:
         """Mint + persist a new action BEFORE its first side effect (bootstraps if absent).
 
         Bootstrapping here is safe precisely because the identity is new: there is no prior
         record for this action to forget. (A rollback against an absent store is the
         opposite case and refuses — see :meth:`read` callers.)
+
+        Passing a ``manifest`` mints a **capability-tagged** action content-bound to it, and
+        co-commits both rows in one transaction inside this lock (Redmine #14741 j#96917;
+        contract in :func:`...startup_action_capability.write_reserved_action`). Omitting it
+        is the pre-#14741 path, byte for byte.
         """
         canonical = unit.canonical()
-        action_id = startup_action_id(canonical, nonce)
+        action_id, manifest_digest, manifest_payload = _resolve_reserve_identity(
+            canonical, nonce, manifest
+        )
         now = _utc_now()
         with self._hold():
             shape = self.store_shape()
@@ -732,28 +759,24 @@ class StartupTransactionFence:
                             f"{existing[0]!r}); a nonce must never be reused — refusing to "
                             "reserve over a recorded action"
                         )
-                    conn.execute(
-                        "INSERT INTO startup_actions (action_id, workspace_id, lane_id,"
-                        " providers, phase, revision, participants, reserved_at,"
-                        " updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (
-                            action_id,
-                            canonical.workspace_id,
-                            canonical.lane_id,
-                            ",".join(canonical.providers),
-                            PHASE_PLANNED,
-                            1,
-                            json.dumps([]),
-                            now,
-                            now,
-                        ),
+                    _write_reserved_action(
+                        conn,
+                        action_id=action_id,
+                        canonical=canonical,
+                        phase=PHASE_PLANNED,
+                        now=now,
+                        manifest=manifest,
+                        manifest_digest=manifest_digest,
+                        manifest_payload=manifest_payload,
                     )
                 except StartupTransactionError:
+                    _rollback_quietly(conn)
                     raise
                 except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
                     # The SELECT/INSERT are normalized (R4-F2); the connection close is
                     # guaranteed and normalized by `_connection` (R6-F3.3). reserve is the
                     # reserve-before-effect anchor — it must fail closed, not leak internals.
+                    _rollback_quietly(conn)
                     raise StartupTransactionError(
                         f"the startup transaction authority {self.path} could not record "
                         f"the reserve ({exc}); nothing was started"

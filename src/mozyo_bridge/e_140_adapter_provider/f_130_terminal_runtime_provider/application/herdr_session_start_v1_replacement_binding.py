@@ -31,8 +31,10 @@ from mozyo_bridge.core.state.startup_transaction_fence import (
     PHASE_COMPLETED_SUCCESS,
     PHASE_ROLLBACK_OWED,
     StartupTransactionFence,
+    StartupTransactionError,
     StartupUnit,
     startup_action_id,
+    startup_action_id_matching,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (  # noqa: E501
     COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
@@ -179,10 +181,18 @@ def _binding_identity_matches(
     ):
         return False
     try:
-        expected_startup = startup_action_id(
-            StartupUnit(workspace_id, lane_id, startup_providers), intent.startup_nonce
+        # Redmine #14741 j#96917: re-derive through the capability-aware helper. A legacy
+        # stored id re-derives byte-identically; a capability-tagged one is content-bound to
+        # a manifest this caller does not hold, so it returns "" and cannot match — which is
+        # the fail-closed answer, not an accident of a hash mismatch.
+        expected_startup = startup_action_id_matching(
+            StartupUnit(workspace_id, lane_id, startup_providers),
+            intent.startup_nonce,
+            intent.startup_action_id,
         )
-    except ValueError:
+    except (ValueError, StartupTransactionError):
+        return False
+    if not expected_startup:
         return False
     return intent.startup_action_id == expected_startup
 

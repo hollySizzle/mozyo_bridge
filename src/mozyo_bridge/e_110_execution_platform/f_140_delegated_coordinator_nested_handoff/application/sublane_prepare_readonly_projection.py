@@ -24,8 +24,10 @@ from mozyo_bridge.core.state.lane_lifecycle import norm
 from mozyo_bridge.core.state.startup_transaction_fence import (
     PHASE_ROLLBACK_OWED,
     StartupTransactionFence,
+    StartupTransactionError,
     StartupUnit,
     startup_action_id,
+    startup_action_id_matching,
 )
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (
@@ -145,10 +147,15 @@ def resolve_rollback_owed_startup_action(
             ):
                 continue
             try:
-                expected_startup = startup_action_id(
-                    StartupUnit(workspace, lane, managed_pair), intent.startup_nonce
+                # Redmine #14741 j#96917: capability-aware re-derivation (see the helper).
+                expected_startup = startup_action_id_matching(
+                    StartupUnit(workspace, lane, managed_pair),
+                    intent.startup_nonce,
+                    intent.startup_action_id,
                 )
-            except ValueError:
+            except (ValueError, StartupTransactionError):
+                continue
+            if not expected_startup:
                 continue
             if norm(intent.startup_action_id) != expected_startup:
                 continue
