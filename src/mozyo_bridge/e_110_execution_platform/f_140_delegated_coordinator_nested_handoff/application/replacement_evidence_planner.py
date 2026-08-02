@@ -58,6 +58,10 @@ REFUSE_DIVERGENT_PRE_PIN = "divergent_pre_pin"
 REFUSE_EVIDENCE_NOT_BOUND = "evidence_not_bound"
 #: The observed screen does not map to an update-derived launch cause.
 REFUSE_CAUSE_NOT_UPDATE_DERIVED = "cause_not_update_derived"
+#: The planning context itself is not a set of exact non-empty tokens.
+REFUSE_CONTEXT_INVALID = "context_invalid"
+#: A participant names a lane the context is not scoped to.
+REFUSE_LANE_OUT_OF_CONTEXT = "lane_out_of_context"
 
 
 class EvidencePlanRefused(RuntimeError):
@@ -94,6 +98,23 @@ class PlanningContext:
 
     workspace_id: str
     lane_id: str
+    #: The exact closed launch-cause token a receipt-capable participant may be pinned
+    #: with, supplied by the composition (audit j#97065 finding 2). A port answer is
+    #: accepted only when it byte-equals this: "the port returned something non-empty" is
+    #: not an authority, it is a shape. Carried here rather than re-spelled in e_110 so the
+    #: token keeps exactly one owner.
+    expected_update_cause: str
+
+    def validate(self) -> "PlanningContext":
+        """Every axis is a non-empty exact token, or the whole plan is refused."""
+        for attr in ("workspace_id", "lane_id", "expected_update_cause"):
+            value = getattr(self, attr)
+            if not isinstance(value, str) or value != value.strip() or not value:
+                raise EvidencePlanRefused(
+                    REFUSE_CONTEXT_INVALID,
+                    "the planning context is not a set of exact non-empty tokens",
+                )
+        return self
 
 
 class GenerationPort(Protocol):
@@ -172,7 +193,10 @@ class ReplacementEvidencePlanner:
 
             classify = requires_identity_receipt
         try:
-            return bool(classify(action_id))
+            answer = classify(action_id)
+            if answer is not True and answer is not False:
+                raise TypeError("capability answer is not an exact boolean")
+            return answer
         except Exception as exc:  # noqa: BLE001 - an unclassifiable action is never legacy
             raise EvidencePlanRefused(
                 REFUSE_UNKNOWN_ACTION_SHAPE,
@@ -190,6 +214,7 @@ class ReplacementEvidencePlanner:
         some proven participants and some unproven ones would have to decide at run time
         which kind it is.
         """
+        context = context.validate()
         pinned = tuple(participants or ())
         if not pinned:
             return EvidencePlan(participants=(), outcome=PLAN_LEGACY_UNCHANGED)
@@ -197,6 +222,13 @@ class ReplacementEvidencePlanner:
         planned = []
         touched = False
         for pin in pinned:
+            # Audit j#97065 finding 1: the context's lane was never compared, so a
+            # participant from another lane planned happily inside this lane's transaction.
+            if _norm(getattr(pin, "lane_id", "")) != context.lane_id:
+                raise EvidencePlanRefused(
+                    REFUSE_LANE_OUT_OF_CONTEXT,
+                    "a participant names a lane this plan is not scoped to",
+                )
             generation = self._generation_for(pin)
             action_id = _norm(getattr(generation, "startup_action_id", ""))
             if not self._requires_receipt(action_id):
@@ -225,18 +257,23 @@ class ReplacementEvidencePlanner:
         try:
             generation = self._generations(assigned)
         except Exception as exc:  # noqa: BLE001 - an unreadable authority is a refusal
-            raise EvidencePlanRefused(REFUSE_GENERATION_UNAVAILABLE, str(exc)) from exc
+            # The cause chain is kept for a debugger; the outward message never renders the
+            # exception body, a host path, or the assigned name (audit j#97065 finding 3).
+            raise EvidencePlanRefused(
+                REFUSE_GENERATION_UNAVAILABLE,
+                "the launch generation authority could not be read",
+            ) from exc
         if generation is None:
             raise EvidencePlanRefused(
                 REFUSE_GENERATION_UNAVAILABLE,
-                f"no launch generation is recorded for {assigned!r}",
+                "no launch generation is recorded for this participant",
             )
         if _norm(getattr(generation, "phase", "")) != "attested":
             # A pending generation has not proven it came up. Planning a replacement whose
             # evidence rests on it would rest on a launch that may never have happened.
             raise EvidencePlanRefused(
                 REFUSE_GENERATION_NOT_ATTESTED,
-                f"the launch generation for {assigned!r} is not attested",
+                "the launch generation for this participant is not attested",
             )
         return generation
 
@@ -320,7 +357,9 @@ class ReplacementEvidencePlanner:
             provider=provider,
             assigned=assigned,
         )
-        cause = self._typed_cause(provider, _norm(getattr(found, "blocker_id", "")))
+        cause = self._typed_cause(
+            provider, _norm(getattr(found, "blocker_id", "")), context.expected_update_cause
+        )
         self._require_no_divergent_pre_pin(pin, workspace_id, action_id, cause)
 
         # Every existing authority on the input pin is carried across unchanged; only the
@@ -353,11 +392,30 @@ class ReplacementEvidencePlanner:
                 REFUSE_LIFECYCLE_UNAVAILABLE,
                 "the lane has no declared lifecycle generation and revision",
             )
-        lane_generation, lifecycle_revision = (_norm(v) for v in lifecycle)
-        if not lane_generation or not lifecycle_revision:
+        # Exactly two text tokens (audit j#97065 finding 4). A 1- or 3-element answer used
+        # to escape as a raw `ValueError` from tuple unpacking, which is not a typed
+        # refusal — and a bool / number would have been coerced by `_norm` into something
+        # that looks like a token.
+        if isinstance(lifecycle, (str, bytes)) or not isinstance(lifecycle, (tuple, list)):
             raise EvidencePlanRefused(
                 REFUSE_LIFECYCLE_UNAVAILABLE,
-                "the lane's declared lifecycle pair is incomplete",
+                "the lane lifecycle authority answered in an unusable shape",
+            )
+        if len(lifecycle) != 2 or not all(isinstance(v, str) for v in lifecycle):
+            raise EvidencePlanRefused(
+                REFUSE_LIFECYCLE_UNAVAILABLE,
+                "the lane lifecycle authority answered in an unusable shape",
+            )
+        lane_generation, lifecycle_revision = lifecycle
+        if (
+            lane_generation != lane_generation.strip()
+            or lifecycle_revision != lifecycle_revision.strip()
+            or not lane_generation
+            or not lifecycle_revision
+        ):
+            raise EvidencePlanRefused(
+                REFUSE_LIFECYCLE_UNAVAILABLE,
+                "the lane's declared lifecycle pair is incomplete or not canonical",
             )
         return (lane_generation, lifecycle_revision)
 
@@ -408,7 +466,7 @@ class ReplacementEvidencePlanner:
                     "the bound evidence names a different generation than this participant",
                 )
 
-    def _typed_cause(self, provider: str, blocker_id: str) -> str:
+    def _typed_cause(self, provider: str, blocker_id: str, expected: str) -> str:
         """The typed LAUNCH cause for an observed screen (audit j#97062 finding 4).
 
         ``blocker_id`` is what was SEEN (``update_prompt_available`` /
@@ -428,10 +486,12 @@ class ReplacementEvidencePlanner:
                 REFUSE_CAUSE_NOT_UPDATE_DERIVED,
                 "the observed screen could not be classified",
             ) from exc
-        if not cause:
+        if cause != expected:
+            # Non-empty is a shape, not an authority: a port answering with any token at
+            # all would otherwise have been pinned as the cause.
             raise EvidencePlanRefused(
                 REFUSE_CAUSE_NOT_UPDATE_DERIVED,
-                "the observed screen is not an update-derived launch cause",
+                "the observed screen is not the expected update-derived launch cause",
             )
         return cause
 
@@ -454,6 +514,8 @@ __all__ = (
     "EvidencePlanRefused",
     "PlanningContext",
     "REFUSE_CAUSE_NOT_UPDATE_DERIVED",
+    "REFUSE_CONTEXT_INVALID",
+    "REFUSE_LANE_OUT_OF_CONTEXT",
     "REFUSE_EVIDENCE_NOT_BOUND",
     "PLAN_EVIDENCE_PINNED",
     "PLAN_LEGACY_UNCHANGED",

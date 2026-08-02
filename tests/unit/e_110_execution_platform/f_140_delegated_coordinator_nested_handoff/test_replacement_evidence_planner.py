@@ -30,7 +30,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 
 WORKSPACE = "wA"
-CONTEXT = PlanningContext(workspace_id=WORKSPACE, lane_id="issue_14741")
+CONTEXT = PlanningContext(
+    workspace_id=WORKSPACE, lane_id="issue_14741", expected_update_cause="update_relaunch"
+)
 #: The typed LAUNCH cause a replacement pins — NOT the observed screen id.
 CAUSE = "update_relaunch"
 
@@ -206,7 +208,12 @@ class RefusalTest(unittest.TestCase):
         """There is no slot to look a generation up for."""
         planner = _Ports().planner()
         with self.assertRaises(EvidencePlanRefused) as ctx:
-            planner.plan([SimpleNamespace(assigned_name="  ", lane_id="l", role="r")], CONTEXT)
+            # The lane must match the context, so the refusal under test is reached rather
+            # than the (now earlier) lane-scope gate.
+            planner.plan(
+                [SimpleNamespace(assigned_name="  ", lane_id=CONTEXT.lane_id, role="r")],
+                CONTEXT,
+            )
         self.assertEqual(ctx.exception.reason, "generation_unavailable")
 
     def test_a_pending_generation_refuses(self) -> None:
@@ -317,6 +324,76 @@ class RefusalTest(unittest.TestCase):
                 evidence_cause=CAUSE,
             ),
         )
+
+
+class ClosedContextTest(unittest.TestCase):
+    """Audit j#97065: the context is authority, and every port answer is closed."""
+
+    def _refuses(self, reason, ports, *, pin=None, context=CONTEXT, **kw):
+        with self.assertRaises(EvidencePlanRefused) as ctx:
+            ports.planner(**kw).plan([pin or _pin()], context)
+        self.assertEqual(ctx.exception.reason, reason)
+
+    def test_a_participant_from_another_lane_refuses(self) -> None:
+        """Finding 1: the context lane was never compared."""
+        foreign = PlanningContext(
+            workspace_id=WORKSPACE,
+            lane_id="issue_FOREIGN",
+            expected_update_cause="update_relaunch",
+        )
+        self._refuses(
+            "lane_out_of_context", _Ports(evidence=_evidence()), context=foreign
+        )
+
+    def test_an_invalid_context_refuses_before_anything_is_read(self) -> None:
+        ports = _Ports(evidence=_evidence())
+        for label, context in (
+            ("blank workspace", PlanningContext("", "issue_14741", "update_relaunch")),
+            ("blank lane", PlanningContext(WORKSPACE, "", "update_relaunch")),
+            ("blank cause", PlanningContext(WORKSPACE, "issue_14741", "")),
+            ("padded", PlanningContext(" wA ", "issue_14741", "update_relaunch")),
+        ):
+            with self.subTest(label=label):
+                self._refuses("context_invalid", ports, context=context)
+        self.assertEqual(ports.evidence_calls, 0, "refused before any port is consulted")
+
+    def test_an_arbitrary_cause_token_is_not_an_authority(self) -> None:
+        """Finding 2: non-empty is a shape, not a cause."""
+        self._refuses(
+            "cause_not_update_derived",
+            _Ports(evidence=_evidence()),
+            update_cause=lambda provider, blocker: "arbitrary_nonempty",
+        )
+
+    def test_a_port_exception_never_renders_its_body(self) -> None:
+        """Finding 3: the generation port leaked its message, host path included."""
+        ports = _Ports(generation_error=OSError("/private/host/path exploded"))
+        with self.assertRaises(EvidencePlanRefused) as ctx:
+            ports.planner().plan([_pin()], CONTEXT)
+        message = str(ctx.exception)
+        self.assertEqual(ctx.exception.reason, "generation_unavailable")
+        self.assertNotIn("/private/host/path", message)
+        self.assertNotIn("exploded", message)
+        self.assertIsInstance(ctx.exception.__cause__, OSError, "the chain is kept")
+
+    def test_an_unusable_lifecycle_shape_is_typed_not_a_raw_error(self) -> None:
+        """Finding 4: a 1-element answer escaped as a raw ValueError."""
+        for label, lifecycle in (
+            ("one element", (GEN,)),
+            ("three elements", (GEN, REV, "extra")),
+            ("not iterable", 7),
+            ("a string", GEN),
+            ("booleans", (True, False)),
+            ("padded tokens", (" " + GEN, REV)),
+        ):
+            with self.subTest(label=label):
+                self._refuses("lifecycle_unavailable", _Ports(lifecycle=lifecycle))
+
+    def test_a_capability_port_that_is_not_an_exact_bool_refuses(self) -> None:
+        self._refuses(
+            "unknown_action_shape", _Ports(), capability=lambda action_id: "yes"
+        )
+        self._refuses("unknown_action_shape", _Ports(), capability=lambda action_id: 1)
 
 
 class RefusalSafetyTest(unittest.TestCase):
