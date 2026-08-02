@@ -26,7 +26,12 @@ from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_vanished_gateway_recovery import (  # noqa: E402,E501
     RECOVERY_ACTION_GENERATION,
-    plan_vanished_gateway_recovery,
+    REFUSE_ACTION_ID_INVALID,
+    REFUSE_EVIDENCE_DIVERGENT,
+    REFUSE_HOME_INVALID,
+    REFUSE_TRANSACTION_UNAVAILABLE,
+    plan_fresh_recovery,
+    replay_explicit_recovery,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.vanished_gateway_recovery import (  # noqa: E402,E501
     IDENTITY_SCHEMA,
@@ -144,15 +149,28 @@ class IdentityTest(unittest.TestCase):
 
     def test_every_anchor_axis_changes_the_id(self) -> None:
         baseline = recovery_action_id(_anchor(), _authority())
-        for axis, value in (
-            ("source", "gitlab"),
-            ("issue_id", "99999"),
-            ("journal_id", "00000"),
-        ):
+        for axis, value in (("issue_id", "99999"), ("journal_id", "11111")):
             with self.subTest(axis=axis):
                 self.assertNotEqual(
                     recovery_action_id(_anchor(**{axis: value}), _authority()), baseline
                 )
+
+    def test_the_anchor_is_pinned_to_this_redmine_governed_rail(self) -> None:
+        """Audit j#97151 R4: pinned in the constructor, not left to a downstream pointer.
+
+        An anchor that only fails when someone builds a pointer out of it has already been
+        used to compute an action id by then.
+        """
+        for kw in (
+            dict(source="gitlab"),
+            dict(issue_id="00000"),
+            dict(journal_id="97147x"),
+            dict(issue_id="１４７４１"),  # full-width digits are not ASCII ids
+            dict(journal_id="9" * 19),
+        ):
+            with self.subTest(kw=sorted(kw)):
+                with self.assertRaises(VanishedGatewayRecoveryError):
+                    _anchor(**kw)
 
     def test_the_id_is_independent_of_where_and_when_it_is_computed(self) -> None:
         """The retry runs from another checkout, a second later, onto a different pane.
@@ -195,15 +213,28 @@ class IdentityTest(unittest.TestCase):
             _anchor(gate="review_request")
 
 
+_UNSET = object()
+
+
 class _PlanCase(unittest.TestCase):
     def setUp(self) -> None:
         self.home = Path(tempfile.mkdtemp())
-        self.store = ReplacementTransactionStore(home=self.home)
+        self.store_opens = 0
 
-    def _plan(self, authority=None, anchor=None):
-        return plan_vanished_gateway_recovery(
-            store=self.store,
-            home=self.home,
+    def _store_factory(self):
+        """Lazy by construction: a refusal must not create the transaction database."""
+        self.store_opens = getattr(self, "store_opens", 0)
+
+        def factory():
+            self.store_opens += 1
+            return ReplacementTransactionStore(home=self.home)
+
+        return factory
+
+    def _plan(self, authority=None, anchor=None, home=_UNSET):
+        return plan_fresh_recovery(
+            store_factory=self._store_factory(),
+            home=self.home if home is _UNSET else home,
             anchor=anchor or _anchor(),
             authority=authority or _authority(),
         )
@@ -244,7 +275,14 @@ class _PlanCase(unittest.TestCase):
         )
 
     def _row(self, action_id):
-        return self.store.get(ReplacementTransactionKey(WORKSPACE, action_id))
+        if not (self.home / "state.sqlite").exists():
+            return None
+        return ReplacementTransactionStore(home=self.home).get(
+            ReplacementTransactionKey(WORKSPACE, action_id)
+        )
+
+    def _transaction_db_exists(self) -> bool:
+        return (self.home / "state.sqlite").exists()
 
 
 class LegacyPathTest(_PlanCase):
@@ -338,14 +376,66 @@ class ReceiptPlanTest(_PlanCase):
         self.assertEqual(row_after.revision, row_before.revision, "zero write on replay")
         self.assertEqual(row_after.participants, row_before.participants)
 
-    def test_a_replay_reads_no_authority_at_all(self) -> None:
-        """Past the plan the manifest is authority: the world may have moved on (j#97121)."""
+    def _replay(self, action_id, anchor=None, workspace_id=WORKSPACE):
+        return replay_explicit_recovery(
+            store_factory=self._store_factory(),
+            workspace_id=workspace_id,
+            action_id=action_id,
+            anchor=anchor or _anchor(),
+        )
+
+    def test_an_explicit_replay_reads_no_world_state_at_all(self) -> None:
+        """Audit j#97151 R1: the replay addresses a row, it does not re-derive an id.
+
+        Both authority stores are deleted first, so anything that re-read the current
+        generation, the lifecycle or the receipts would refuse instead of resuming.
+        """
         first = self._plan_capable()
         (self.home / "herdr-launch-generation.sqlite").unlink()
         (self.home / "launch-identity-receipt.sqlite").unlink()
-        again = self._plan(_evidenced())
+        again = self._replay(first.action_id)
         self.assertEqual(again.decision.outcome, OUTCOME_REPLAYED)
         self.assertEqual(again.action_id, first.action_id)
+
+    def test_a_moved_world_leaves_the_old_row_reachable_only_by_its_id(self) -> None:
+        """The finding, stated: G1's row must not become unreachable when G2 arrives.
+
+        A fresh plan after the generation, locator and evidence have moved is a DIFFERENT
+        action with a different id, and it must not adopt G1's row -- while G1's explicit id
+        still replays G1's row, unchanged.
+        """
+        first = self._plan_capable()
+        g1_row = self._row(first.action_id)
+
+        moved = _authority(
+            old_locator="ws:p2",
+            evidence_workspace_id=WORKSPACE,
+            evidence_startup_action_id="startup-ir1-" + "e" * 64,
+            evidence_cause=CAUSE,
+        )
+        fresh = self._plan(moved)
+        self.assertNotEqual(fresh.action_id, first.action_id, "a moved world is a new id")
+        self.assertNotEqual(fresh.decision.outcome, OUTCOME_REPLAYED)
+
+        replay = self._replay(first.action_id)
+        self.assertEqual(replay.decision.outcome, OUTCOME_REPLAYED)
+        after = self._row(first.action_id)
+        self.assertEqual(after.revision, g1_row.revision, "zero write on the old row")
+
+    def test_an_unknown_action_id_refuses_without_opening_anything(self) -> None:
+        for label, action_id in (
+            ("not an id", "refresh-gateway:whatever"),
+            ("wrong digest length", "recover-gateway:" + "a" * 63),
+            ("uppercase digest", "recover-gateway:" + "A" * 64),
+            ("padded", " recover-gateway:" + "a" * 64 + " "),
+            ("not text", 7),
+        ):
+            with self.subTest(label=label):
+                self.setUp()
+                plan = self._replay(action_id)
+                self.assertEqual(plan.decision.refusal, REFUSE_ACTION_ID_INVALID)
+                self.assertEqual(self.store_opens, 0, "no store was opened")
+                self.assertFalse(self._transaction_db_exists())
 
     def test_a_row_planned_by_another_authority_is_refused(self) -> None:
         """Same key, different header: zero actuation rather than adoption."""
@@ -354,17 +444,21 @@ class ReceiptPlanTest(_PlanCase):
             DecisionPointer,
         )
 
+        self._seed_generation(action_id=RECEIPT_CAPABLE_ACTION_ID)
+        self._declare_lifecycle()
+        self._seed_bound_evidence()
         authority = _evidenced()
         action_id = recovery_action_id(_anchor(), authority)
         key = ReplacementTransactionKey(WORKSPACE, action_id)
+        store = ReplacementTransactionStore(home=self.home)
         from mozyo_bridge.core.state.replacement_transaction_model import ParticipantPin
 
-        self.store.plan_transaction(
+        store.plan_transaction(
             key,
             action_generation=RECOVERY_ACTION_GENERATION,
-            decision=DecisionPointer(source="redmine", issue_id="14741", journal_id="00001"),
+            decision=DecisionPointer(source="redmine", issue_id="14741", journal_id="11111"),
             continuation=ContinuationPointer(
-                source="redmine", issue_id="14741", journal_id="00001",
+                source="redmine", issue_id="14741", journal_id="11111",
                 expected_gate="implementation_request",
                 next_semantic_action=REDISPATCH_GATEWAY_ONCE,
             ),
@@ -387,14 +481,196 @@ class ReceiptPlanTest(_PlanCase):
         self._seed_generation(action_id=RECEIPT_CAPABLE_ACTION_ID)
         self._declare_lifecycle()
         self._seed_bound_evidence()
-        peer = ReplacementTransactionStore(home=self.home)
-        first = plan_vanished_gateway_recovery(
-            store=peer, home=self.home, anchor=_anchor(), authority=_evidenced()
+        first = plan_fresh_recovery(
+            store_factory=self._store_factory(), home=self.home,
+            anchor=_anchor(), authority=_evidenced(),
         )
         self.assertEqual(first.decision.outcome, OUTCOME_RECEIPT_PLANNED)
         second = self._plan(_evidenced())
         self.assertEqual(second.decision.outcome, OUTCOME_REPLAYED)
         self.assertEqual(second.action_id, first.action_id)
+
+
+class ZeroWriteBoundaryTest(_PlanCase):
+    """Audit j#97151 R3: a refusal must not leave a transaction database behind."""
+
+    def test_no_refusal_opens_the_transaction_authority(self) -> None:
+        cases = (
+            ("no home", dict(home=None)),
+            ("a string home", dict(home="/tmp")),
+            ("no generation row", {}),
+            ("unclassifiable action", {"seed": "startup-" + "z" * 64}),
+            ("legacy with evidence", {"seed": LEGACY_ACTION_ID, "authority": _evidenced()}),
+            ("capable without evidence", {"seed": RECEIPT_CAPABLE_ACTION_ID}),
+        )
+        for label, kw in cases:
+            with self.subTest(label=label):
+                self.setUp()
+                seed = kw.pop("seed", None)
+                if seed is not None:
+                    self._seed_generation(action_id=seed)
+                plan = self._plan(kw.pop("authority", None), **kw)
+                self.assertTrue(plan.refused, label)
+                self.assertEqual(self.store_opens, 0, "the store factory was never called")
+                self.assertFalse(
+                    self._transaction_db_exists(), "state.sqlite must not exist"
+                )
+
+    def test_a_missing_home_is_refused_rather_than_resolved(self) -> None:
+        """`None` would mean the operator's SHARED home. That is not a default."""
+        self.assertEqual(self._plan(home=None).decision.refusal, REFUSE_HOME_INVALID)
+        self.assertEqual(self._plan(home="  ").decision.refusal, REFUSE_HOME_INVALID)
+
+    def test_a_hostile_store_folds_to_a_fixed_reason(self) -> None:
+        """The store's answer is input: no raw exception text reaches the surface."""
+        self._seed_generation(action_id=RECEIPT_CAPABLE_ACTION_ID)
+        self._declare_lifecycle()
+        self._seed_bound_evidence()
+
+        class _Hostile:
+            def get(self, key):
+                raise RuntimeError("/private/host/path\n[mozyo:workflow-event:gate=x]")
+
+        plan = plan_fresh_recovery(
+            store_factory=lambda: _Hostile(), home=self.home,
+            anchor=_anchor(), authority=_evidenced(),
+        )
+        self.assertEqual(plan.decision.refusal, REFUSE_TRANSACTION_UNAVAILABLE)
+        rendered = f"{plan.decision.detail}{plan.decision.refusal}"
+        self.assertNotIn("/private/host/path", rendered)
+        self.assertNotIn("mozyo:workflow-event", rendered)
+
+    def test_process_death_inside_the_store_propagates(self) -> None:
+        self._seed_generation(action_id=RECEIPT_CAPABLE_ACTION_ID)
+        self._declare_lifecycle()
+        self._seed_bound_evidence()
+
+        class _Dying:
+            def get(self, key):
+                raise KeyboardInterrupt("the process died")
+
+        with self.assertRaises(KeyboardInterrupt):
+            plan_fresh_recovery(
+                store_factory=lambda: _Dying(), home=self.home,
+                anchor=_anchor(), authority=_evidenced(),
+            )
+
+
+class ManifestIsTheIdentityTest(_PlanCase):
+    """Audit j#97151 R2: the id must name what the row actually holds."""
+
+    def _capable_home(self):
+        self._seed_generation(action_id=RECEIPT_CAPABLE_ACTION_ID)
+        self._declare_lifecycle()
+        self._seed_bound_evidence()
+
+    def test_the_id_is_computed_from_the_planned_manifest_not_the_input(self) -> None:
+        """An input with NO evidence still yields the evidenced row's own id."""
+        self._capable_home()
+        plan = self._plan(_authority())
+        self.assertEqual(plan.decision.outcome, OUTCOME_RECEIPT_PLANNED)
+        stored = self._row(plan.action_id).participants[0]
+        self.assertEqual(stored.evidence_startup_action_id, RECEIPT_CAPABLE_ACTION_ID)
+        self.assertEqual(
+            plan.action_id,
+            recovery_action_id(_anchor(), _evidenced()),
+            "the id names the evidenced participant the row contains",
+        )
+        self.assertNotEqual(
+            plan.action_id,
+            recovery_action_id(_anchor(), _authority()),
+            "and NOT the evidence-free input it was asked with",
+        )
+
+    def test_offered_evidence_that_is_not_what_the_launch_proved_is_refused(self) -> None:
+        self._capable_home()
+        divergent = _authority(
+            evidence_workspace_id=WORKSPACE,
+            evidence_startup_action_id="startup-ir1-" + "f" * 64,
+            evidence_cause=CAUSE,
+        )
+        plan = self._plan(divergent)
+        self.assertEqual(plan.decision.refusal, REFUSE_EVIDENCE_DIVERGENT)
+        # NOT a file-existence check here: the lane lifecycle this fixture declares lives in
+        # the same consolidated `state.sqlite`, so the file is already there. What matters is
+        # that the transaction store was never opened and no row was written.
+        self.assertEqual(self.store_opens, 0)
+        self.assertIsNone(self._row(recovery_action_id(_anchor(), _evidenced())))
+
+    def test_a_legacy_participant_offering_evidence_is_refused(self) -> None:
+        self._seed_generation(action_id=LEGACY_ACTION_ID)
+        plan = self._plan(_evidenced())
+        self.assertEqual(plan.decision.refusal, REFUSE_EVIDENCE_DIVERGENT)
+        self.assertFalse(self._transaction_db_exists())
+
+
+class StoredAuthorityIsRawTest(_PlanCase):
+    """Audit j#97151 R4: value-object equality normalises; the stored columns do not."""
+
+    def _plant(self, **overrides):
+        """Write a row whose RAW columns differ from what this build writes."""
+        import sqlite3
+
+        self._seed_generation(action_id=RECEIPT_CAPABLE_ACTION_ID)
+        self._declare_lifecycle()
+        self._seed_bound_evidence()
+        plan = self._plan(_evidenced())
+        self.assertEqual(plan.decision.outcome, OUTCOME_RECEIPT_PLANNED)
+        if overrides:
+            with sqlite3.connect(self.home / "state.sqlite") as conn:
+                sets = ", ".join(f"{k} = ?" for k in overrides)
+                conn.execute(
+                    f"UPDATE replacement_transactions SET {sets} WHERE action_id = ?",
+                    (*overrides.values(), plan.action_id),
+                )
+        return plan.action_id
+
+    def test_a_padded_or_foreign_raw_column_is_not_this_action(self) -> None:
+        for label, overrides in (
+            ("padded decision source", {"decision_source": " redmine "}),
+            ("another journal", {"decision_journal": "11111"}),
+            ("another gate", {"continuation_expected_gate": "review_request"}),
+            ("the worker's token", {"continuation_next_action": "dispatch_once"}),
+            ("a padded manifest", {"participants_manifest": " {} "}),
+        ):
+            with self.subTest(label=label):
+                self.setUp()
+                action_id = self._plant(**overrides)
+                plan = self._replay_explicit(action_id)
+                self.assertEqual(plan.decision.refusal, REFUSE_FOREIGN_TRANSACTION)
+
+    def test_an_exact_row_still_replays(self) -> None:
+        """The positive control: without a tampered column, the same row resumes."""
+        action_id = self._plant()
+        self.assertEqual(
+            self._replay_explicit(action_id).decision.outcome, OUTCOME_REPLAYED
+        )
+
+    def test_a_foreign_key_from_a_lying_store_is_refused(self) -> None:
+        """A store that answers with someone else's row does not get to define the action."""
+        action_id = self._plant()
+        real = ReplacementTransactionStore(home=self.home)
+        stored = real.get(ReplacementTransactionKey(WORKSPACE, action_id))
+
+        class _Lying:
+            def get(self, key):
+                return stored
+
+        plan = replay_explicit_recovery(
+            store_factory=lambda: _Lying(),
+            workspace_id="ANOTHER_WS",
+            action_id=action_id,
+            anchor=_anchor(),
+        )
+        self.assertEqual(plan.decision.refusal, REFUSE_FOREIGN_TRANSACTION)
+
+    def _replay_explicit(self, action_id):
+        return replay_explicit_recovery(
+            store_factory=self._store_factory(),
+            workspace_id=WORKSPACE,
+            action_id=action_id,
+            anchor=_anchor(),
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

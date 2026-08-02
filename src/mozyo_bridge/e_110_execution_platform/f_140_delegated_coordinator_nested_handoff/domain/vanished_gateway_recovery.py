@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -67,6 +68,21 @@ REFUSE_EVIDENCE_UNAVAILABLE = "evidence_unavailable"
 REFUSE_FOREIGN_TRANSACTION = "foreign_transaction"
 
 
+#: The exact shape of a recovery action id. Validated BEFORE any store is opened, so an
+#: unknown id is refused without reading the world (audit j#97151 R1).
+ACTION_ID_RE = re.compile(r"recover-gateway:[0-9a-f]{64}")
+
+#: This rail is Redmine-governed; an anchor from anywhere else is not an anchor here.
+ANCHOR_SOURCE = "redmine"
+_ASCII_DIGITS = frozenset("0123456789")
+_MAX_ID_DIGITS = 18
+
+
+def is_recovery_action_id(value: object) -> bool:
+    """Is this exactly a recovery action id? (pure, total)"""
+    return type(value) is str and bool(ACTION_ID_RE.fullmatch(value))
+
+
 class VanishedGatewayRecoveryError(ValueError):
     """The request or the authority is not exact. Never raised for a refusal outcome."""
 
@@ -100,6 +116,24 @@ class RequestAnchor:
                 raise VanishedGatewayRecoveryError(
                     "a recovery anchor requires exact non-empty "
                     "(source, issue_id, journal_id, gate)"
+                )
+        # Pinned HERE rather than left to the pointer constructors downstream (audit
+        # j#97151 R4): an anchor that only fails when someone tries to build a pointer out
+        # of it has already been used to compute an action id by then.
+        if self.source != ANCHOR_SOURCE:
+            raise VanishedGatewayRecoveryError(
+                "this recovery rail is redmine-governed; another source is not an anchor"
+            )
+        for name in ("issue_id", "journal_id"):
+            value = getattr(self, name)
+            if (
+                not value
+                or len(value) > _MAX_ID_DIGITS
+                or set(value) - _ASCII_DIGITS
+                or value.lstrip("0") == ""
+            ):
+                raise VanishedGatewayRecoveryError(
+                    f"anchor {name} must be a positive ASCII decimal id"
                 )
         if self.gate != RESUME_GATE:
             raise VanishedGatewayRecoveryError(
@@ -228,6 +262,35 @@ def recovery_action_id(anchor: RequestAnchor, authority: ParticipantAuthority) -
     return f"recover-gateway:{digest}"
 
 
+def recovery_action_id_for_pin(anchor: "RequestAnchor", pin, *, workspace_id: str) -> str:
+    """The action id of the FINAL manifest, computed from a planned or stored pin. (pure)
+
+    Audit j#97151 R2: the id must be the identity of what the transaction actually holds.
+    Deriving it from the caller's input and then letting the planner add the evidence made
+    the id describe a participant the row does not contain -- and made a replay of that row
+    uncomputable from the row itself.
+
+    ``workspace_id`` is passed rather than read off the pin because a pin does not carry
+    one: on a replay it is the key's workspace, which is the same value the row is filed
+    under, so the recomputation is anchored to where the row actually lives.
+    """
+    authority = ParticipantAuthority(
+        workspace_id=workspace_id,
+        lane_id=getattr(pin, "lane_id", ""),
+        provider=getattr(pin, "provider", ""),
+        assigned_name=getattr(pin, "assigned_name", ""),
+        old_locator=getattr(pin, "old_locator", ""),
+        lane_revision=getattr(pin, "lane_revision", ""),
+        lane_generation=getattr(pin, "lane_generation", ""),
+        evidence_workspace_id=getattr(pin, "evidence_workspace_id", ""),
+        evidence_startup_action_id=getattr(pin, "evidence_startup_action_id", ""),
+        evidence_cause=getattr(pin, "evidence_cause", ""),
+        role=getattr(pin, "role", ""),
+        is_self=bool(getattr(pin, "is_self", False)),
+    )
+    return recovery_action_id(anchor, authority)
+
+
 @dataclass(frozen=True)
 class RecoveryDecision:
     """What this recovery is, once its authority has been classified. (pure value)"""
@@ -247,6 +310,8 @@ def refuse(reason: str, detail: str = "") -> RecoveryDecision:
 
 
 __all__ = (
+    "ACTION_ID_RE",
+    "ANCHOR_SOURCE",
     "IDENTITY_SCHEMA",
     "OUTCOME_LEGACY_DIRECT",
     "OUTCOME_RECEIPT_PLANNED",
@@ -263,7 +328,9 @@ __all__ = (
     "RecoveryDecision",
     "RequestAnchor",
     "VanishedGatewayRecoveryError",
+    "is_recovery_action_id",
     "recovery_action_id",
+    "recovery_action_id_for_pin",
     "recovery_identity_payload",
     "refuse",
 )
