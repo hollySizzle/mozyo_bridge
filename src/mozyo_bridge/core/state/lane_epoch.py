@@ -47,10 +47,13 @@ always ``lane_epoch - 1`` and can only drift out of agreement with the first (th
 R7 lesson: one stored fact classified by two surfaces is eventually classified two ways):
 
 - :func:`hibernate_boundary_epoch` — the epoch the RELEASED generation held, ``lane_epoch - 1``;
-- :func:`required_resume_epoch` — the epoch a fresh generation must carry, ``lane_epoch``.
+- :func:`required_resume_epoch` — the epoch a fresh generation must carry, ``lane_epoch``,
+  and it must carry exactly that.
 
-so ``attested > hibernate_boundary_epoch`` and ``attested >= required_resume_epoch`` are the
-same predicate, and :func:`lane_epoch_verdict` computes it once. Both spellings are exported
+Admission requires the attested epoch to EQUAL ``required_resume_epoch`` (review j#96949
+F1): a larger value is not a fresher generation but a token the store has never minted, and
+the launch injects exactly the stored counter. So ``attested == required_resume_epoch``
+implies ``attested > hibernate_boundary_epoch``, and :func:`lane_epoch_verdict` computes it once. Both spellings are exported
 so a caller states whichever half it means without re-deriving the arithmetic.
 
 **Zero is absence, never a boundary.** A row migrated from a pre-v10 build, or one that has
@@ -99,8 +102,10 @@ _MAX_EPOCH_DIGITS = 18
 LANE_EPOCH_UNMINTED = 0
 
 # --- Verdict vocabulary (closed; a consumer branches on these). ------------------------
-#: Both halves resolved and the attested epoch is at least the required one — i.e. strictly
-#: newer than the epoch the released generation held. The ONLY passing token.
+#: Both halves resolved and the attested epoch EQUALS the required one — i.e. exactly the
+#: generation the lifecycle minted, which is necessarily strictly newer than the epoch the
+#: released generation held. The ONLY passing token (review j#96949 F1 narrowed this from a
+#: lower bound, which admitted forged future epochs).
 EPOCH_OK = "lane_epoch_ok"
 #: The LIFECYCLE row cannot state a required epoch: there is no row, or its ``lane_epoch``
 #: is unminted (a pre-v10 hibernation, or a lane hibernated by an older build). The proof
@@ -354,7 +359,17 @@ def lane_epoch_on_transition(
     stored, state = classify_stored_epoch(current)
     if state == EPOCH_STORED_MALFORMED:
         return None
-    return encode_lane_epoch(stored + 1 if target == hibernated else stored)
+    successor = stored + 1 if target == hibernated else stored
+    encoded = encode_lane_epoch(successor)
+    if classify_stored_epoch(encoded)[1] == EPOCH_STORED_MALFORMED:
+        # The successor would not survive its own classifier — the counter has reached the
+        # canonical bound, and one more increment writes bytes every later read rejects
+        # (Redmine #14756 review j#96971 R11-F10). That is self-corruption introduced by the
+        # bound this module added in F2: a lane at the maximum would have been advanced into
+        # a permanently unreadable epoch, which no rail can recover from. Refuse BEFORE the
+        # mutation instead, so the row keeps the last value that is still provable.
+        return None
+    return encoded
 
 
 __all__ = (

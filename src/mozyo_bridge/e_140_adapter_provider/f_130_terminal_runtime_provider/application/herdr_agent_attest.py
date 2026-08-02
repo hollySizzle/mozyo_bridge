@@ -345,7 +345,21 @@ def perform_self_attestation(
     # proof classifies it byte-exactly and a normalised token would launder a value the
     # lifecycle authority never minted into the authority position.
     observed_epoch = env.get(MOZYO_LANE_EPOCH_ENV, "")
-    if _norm(observed_epoch) != _norm(lane_epoch):
+    # RAW byte equality, not `_norm` (Redmine #14756 review j#96971 R11-F7). `_norm` strips,
+    # so an expectation of `" 1"` compared EQUAL to an observed `"1"` and the padded token was
+    # promoted to authority — while this contract says the epoch is recorded raw and
+    # never-trimmed. A comparison that normalises manufactures the agreement the record then
+    # claims to have observed. Each side is also validated canonically on its own, so a token
+    # no producer could have written is refused even when both sides carry it identically.
+    from mozyo_bridge.core.state.lane_epoch import EPOCH_OK, parse_attested_epoch
+
+    _declared, declared_reason = parse_attested_epoch(lane_epoch)
+    _seen, seen_reason = parse_attested_epoch(observed_epoch)
+    if (
+        observed_epoch != lane_epoch
+        or declared_reason != EPOCH_OK
+        or seen_reason != EPOCH_OK
+    ):
         # The launcher's declaration and the process's environment disagree. Surfaced on the
         # action's event projection AND withheld from the record, because an event is not
         # admission-visible: the resume proof reads the identity record, so a disagreement

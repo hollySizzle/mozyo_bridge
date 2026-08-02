@@ -2628,6 +2628,189 @@ class TheV10BackupIsARealRecoveryPoint(unittest.TestCase):
         self.assertIn("src.backup(dst)", snapshot)
 
 
+class R11ReviewFindingsStayClosed(unittest.TestCase):
+    """Redmine #14756 review j#96971 / j#96973 — R11-F6..F10, each reproduced first.
+
+    Four of the five are the same shape as findings already closed on this issue: a value
+    that could not have been produced honestly was normalised into one that looked like it
+    could. F10 is different and worse — it was introduced BY the bound added for F2, so the
+    fix for one forgery hole created a self-corruption hole.
+    """
+
+    # -- F6: the backup readback compared counts, not content --------------------
+
+    def test_a_tampered_snapshot_is_not_published_as_a_backup(self) -> None:
+        from mozyo_bridge.core.state import lane_lifecycle_backup as backup
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "state.sqlite"
+            conn = sqlite3.connect(path)
+            conn.execute("CREATE TABLE lane_lifecycle_records (lane_id TEXT)")
+            conn.execute("INSERT INTO lane_lifecycle_records VALUES ('source-value')")
+            conn.execute("PRAGMA user_version=9")
+            conn.commit()
+            before = path.read_bytes()
+
+            real = backup._snapshot_state_container
+
+            def _tamper(source, target):
+                # Same schema, same version, same row COUNT — only the cell differs. This is
+                # exactly what the count-only readback published (j#96971 R11-F6).
+                real(source, target)
+                edit = sqlite3.connect(target)
+                edit.execute("UPDATE lane_lifecycle_records SET lane_id='different-value'")
+                edit.commit()
+                edit.close()
+
+            with mock.patch.object(backup, "_snapshot_state_container", _tamper):
+                with self.assertRaises(backup.StateStoreError):
+                    backup.backup_state_container(path)
+
+            backups = pathlib.Path(tmp) / "backups"
+            self.assertEqual(list(backups.glob("state-*")), [])
+            self.assertEqual(list(backups.glob(".staging-*")), [])
+            self.assertEqual(path.read_bytes(), before)
+            conn.close()
+
+    def test_a_publish_stage_failure_leaves_no_backup_and_no_residue(self) -> None:
+        # j#96971 named the PUBLISH stage specifically; the earlier tests only injected at
+        # snapshot and readback.
+        from mozyo_bridge.core.state import lane_lifecycle_backup as backup
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "state.sqlite"
+            conn = sqlite3.connect(path)
+            conn.execute("CREATE TABLE lane_lifecycle_records (lane_id TEXT)")
+            conn.execute("PRAGMA user_version=9")
+            conn.commit()
+            before = path.read_bytes()
+
+            original_rename = pathlib.Path.rename
+
+            def _boom(self_path, target):
+                if ".staging-" in str(self_path):
+                    raise OSError("injected publish failure")
+                return original_rename(self_path, target)
+
+            with mock.patch.object(pathlib.Path, "rename", _boom):
+                with self.assertRaises(backup.StateStoreError):
+                    backup.backup_state_container(path)
+
+            backups = pathlib.Path(tmp) / "backups"
+            self.assertEqual(list(backups.glob("state-*")), [])
+            self.assertEqual(list(backups.glob(".staging-*")), [])
+            self.assertEqual(path.read_bytes(), before)
+            conn.close()
+
+    # -- F7: expected/observed compared after strip() ----------------------------
+
+    def test_a_padded_expected_epoch_is_not_agreement(self) -> None:
+        for expected in (" 1", "1 ", "01"):
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as tmp:
+                store, key = _hibernated_lane(tmp)
+                record = ForgedEpochsAndUnboundedTokensFailClosed._attest(
+                    tmp, expected=expected, observed="1"
+                )
+                # `_norm`-based comparison called these equal and promoted "1" to authority.
+                self.assertEqual(record.lane_epoch, "")
+                self.assertEqual(
+                    lane_epoch_verdict(store.get(key), record.lane_epoch),
+                    (False, EPOCH_ATTESTATION_ABSENT),
+                )
+
+    # -- F8: empty assertion dropped before the cardinality check ----------------
+
+    def test_an_empty_or_padded_assertion_slot_is_refused(self) -> None:
+        for asserted in (
+            ("pair-gateway", "pair-worker", ""),
+            ("pair-gateway", "pair-worker", "   "),
+            ("pair-gateway", " pair-worker"),
+        ):
+            with self.subTest(asserted=asserted), tempfile.TemporaryDirectory() as tmp:
+                home, store, key, pins, agents = (
+                    TheLegacyRecoveryPlanRefusesBeforeItCloses()._ready_world(tmp)
+                )
+                plan = TheLegacyRecoveryPlanRefusesBeforeItCloses()._plan(
+                    home, store, key,
+                    TheLegacyRecoveryPlanRefusesBeforeItCloses._view(agents=agents),
+                    asserted=asserted,
+                )
+                self.assertEqual(plan.state, "blocked_target_slot_assertion_failed")
+
+    # -- F10: minting past the canonical bound ----------------------------------
+
+    def test_the_counter_refuses_to_mint_past_its_own_bound(self) -> None:
+        from mozyo_bridge.core.state.lane_epoch import (
+            EPOCH_STORED_MALFORMED,
+            EPOCH_STORED_MINTED,
+            classify_stored_epoch,
+            lane_epoch_on_transition,
+        )
+
+        largest = "9" * 18
+        self.assertEqual(classify_stored_epoch(largest)[1], EPOCH_STORED_MINTED)
+        # Pre-fix this returned a 19-digit successor that its own classifier then called
+        # malformed — the row would have been advanced into a permanently unreadable epoch.
+        self.assertIsNone(
+            lane_epoch_on_transition(
+                largest, target="hibernated", hibernated="hibernated"
+            )
+        )
+        self.assertEqual(
+            classify_stored_epoch("1" + "0" * 18)[1], EPOCH_STORED_MALFORMED
+        )
+
+    def test_a_lane_at_the_bound_takes_a_zero_write_refusal_on_the_next_mint(self) -> None:
+        # Only the MINTING direction can overflow: a rehydrate carries the counter across
+        # unchanged, so it stays canonical and must still be allowed. Asserting a refusal
+        # there — as the first version of this test did — would have pinned an outage.
+        with tempfile.TemporaryDirectory() as tmp:
+            store, key = _hibernated_lane(tmp)
+            rec = store.get(key)
+            store.transition_disposition(
+                key, expected_disposition=DISPOSITION_HIBERNATED,
+                expected_revision=rec.revision, target=DISPOSITION_ACTIVE,
+                decision=_decision(),
+            )
+            conn = sqlite3.connect(store.path)
+            try:
+                conn.execute(
+                    "UPDATE lane_lifecycle_records SET lane_epoch = ?", ("9" * 18,)
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            before = store.get(key)
+            outcome = store.transition_disposition(
+                key,
+                expected_disposition=DISPOSITION_ACTIVE,
+                expected_revision=before.revision,
+                target=DISPOSITION_HIBERNATED,  # the mint that would overflow
+                decision=_decision(),
+            )
+            after = store.get(key)
+            self.assertFalse(outcome.applied)
+            self.assertEqual(after.revision, before.revision)
+            self.assertEqual(after.lane_disposition, before.lane_disposition)
+            self.assertEqual(after.lane_epoch, "9" * 18)  # byte-preserved, not advanced
+
+    # -- F9: the docs stopped describing a contract the code does not have -------
+
+    def test_no_doc_or_docstring_still_describes_the_superseded_contract(self) -> None:
+        roots = [
+            ROOT.parent / "src/mozyo_bridge/core/state/lane_epoch.py",
+            ROOT.parent / "src/mozyo_bridge/core/state/lane_lifecycle_model.py",
+            ROOT.parent / "vibes/docs/logics/managed-state-model.md",
+            ROOT.parent / "vibes/docs/specs/herdr-native-identity.md",
+        ]
+        stale = ("at least the required", "現行 `lane_epoch` 以上", "backup は file copy")
+        for path in roots:
+            text = pathlib.Path(path).read_text()
+            for phrase in stale:
+                with self.subTest(path=path.name, phrase=phrase):
+                    self.assertNotIn(phrase, text)
+
+
 class ExistingFencesAreNotWeakened(unittest.TestCase):
     """Acceptance 4 / R1 scope 4: the epoch is a conjunct, never a replacement."""
 

@@ -104,34 +104,72 @@ def _snapshot_state_container(source: Path, target: Path) -> None:
             src.backup(dst)
 
 
+def _content_digest(conn: sqlite3.Connection) -> str:
+    """A deterministic digest of the whole logical database — schema AND every cell.
+
+    Row COUNTS and ``user_version`` were the entire readback before Redmine #14756 review
+    j#96971 R11-F6, which measured the gap directly: a snapshot with the same schema, same
+    version and the same number of rows, but one cell rewritten, was published as a verified
+    backup. A recovery point that can differ from the store in content is not one.
+
+    ``typeof()`` is folded in beside each value so the digest cannot be satisfied by a
+    different storage class holding an equal-looking value — the same laundering the
+    ``lane_epoch`` column had to be moved off INTEGER affinity to avoid. Rows are ordered by
+    their full tuple rather than by ``rowid`` so the digest is a property of the CONTENT and
+    not of physical layout, which a logical snapshot legitimately changes.
+    """
+    import hashlib
+
+    digest = hashlib.sha256()
+    schema = conn.execute(
+        "SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' "
+        "ORDER BY type, name"
+    ).fetchall()
+    digest.update(repr(schema).encode())
+    tables = [
+        name
+        for _type, name, _sql in schema
+        if _type == "table"
+    ]
+    for table in tables:
+        columns = [
+            row[1]
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        ]
+        if not columns:
+            continue
+        projection = ", ".join(
+            f"typeof({column}), {column}" for column in columns
+        )
+        rows = conn.execute(
+            f"SELECT {projection} FROM {table} ORDER BY {projection}"
+        ).fetchall()
+        digest.update(table.encode())
+        digest.update(repr(rows).encode())
+    digest.update(str(conn.execute("PRAGMA user_version").fetchone()[0]).encode())
+    return digest.hexdigest()
+
+
 def _readback_state_container(source: Path, staged: Path) -> None:
-    """Fail closed unless the staged snapshot reproduces the source's version and rows."""
+    """Fail closed unless the staged snapshot reproduces the source EXACTLY, content included.
+
+    Compares one digest covering schema identity, every cell with its storage class, and
+    ``user_version`` — so a mismatch anywhere refuses the publish, leaving no backup rather
+    than a plausible-looking wrong one.
+    """
     with sqlite3.connect(f"file:{staged}?mode=ro", uri=True) as snap:
         with sqlite3.connect(f"file:{source}?mode=ro", uri=True) as src:
-            for table, in src.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' "
-                "AND name NOT LIKE 'sqlite_%'"
-            ).fetchall():
-                expected = src.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
-                try:
-                    got = snap.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
-                except sqlite3.DatabaseError as exc:
-                    raise StateStoreError(
-                        f"backup readback failed: {table!r} is unreadable in the snapshot "
-                        f"({exc}); migration aborted (nothing was written)"
-                    ) from exc
-                if got != expected:
-                    raise StateStoreError(
-                        f"backup readback failed: {table!r} holds {got} row(s) in the "
-                        f"snapshot but {expected} in the store; migration aborted "
-                        f"(nothing was written)"
-                    )
-            src_version = src.execute("PRAGMA user_version").fetchone()[0]
-            snap_version = snap.execute("PRAGMA user_version").fetchone()[0]
-            if src_version != snap_version:
+            try:
+                snapshot_digest = _content_digest(snap)
+            except sqlite3.DatabaseError as exc:
                 raise StateStoreError(
-                    f"backup readback failed: snapshot user_version {snap_version} != "
-                    f"{src_version}; migration aborted (nothing was written)"
+                    f"backup readback failed: the snapshot is unreadable ({exc}); "
+                    f"migration aborted (nothing was written)"
+                ) from exc
+            if snapshot_digest != _content_digest(src):
+                raise StateStoreError(
+                    "backup readback failed: the snapshot's schema, rows or recorded "
+                    "version differ from the store; migration aborted (nothing was written)"
                 )
 
 

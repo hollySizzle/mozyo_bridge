@@ -711,7 +711,8 @@ class LaneLifecycleRecord:
 
     ``lane_epoch`` (v10, Redmine #14756) is the MONOTONIC hibernate-generation counter the
     clock-free, locator-free resume proof is bound to. Exactly one event mints it — the
-    disposition CAS INTO ``hibernated`` — and it is minted from the row's own stored value
+    disposition CAS INTO ``hibernated`` — minted from the row's own stored value, in Python
+    after a strict decode, and stored as canonical decimal TEXT in a NONE-affinity column
     evaluated by the database against the row's OWN stored value, so there is no caller
     parameter to backdate and no second value to reconcile (the defect shape that defeated
     both the v8 timestamp and the pre-v9 caller-supplied pins). It reaches a process only as
@@ -724,7 +725,7 @@ class LaneLifecycleRecord:
     re-mint epochs an earlier generation's processes still hold. ``0`` means no epoch has
     ever been minted (a pre-v10 row, or a lane that never hibernated under this build) and is
     reported UNAVAILABLE rather than used as a threshold every epoch clears. The stored value
-    is decoded RAW — the classifier requires an exact ``int`` and treats anything else as
+    is decoded RAW — the classifier requires an exact canonical decimal TEXT and treats anything else as
     unminted, rather than a decoder coercing a corrupt cell into a plausible threshold.
     Semantics: :mod:`...lane_epoch`.
     """

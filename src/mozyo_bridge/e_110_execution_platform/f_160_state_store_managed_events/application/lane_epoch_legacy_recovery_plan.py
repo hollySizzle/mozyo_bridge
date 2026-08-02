@@ -305,7 +305,28 @@ def plan_lane_epoch_legacy_recovery(
     # `plan_ready`. An assertion that quietly edits itself into agreement is not an
     # assertion; a caller who names a slot twice has said something the authority does not,
     # and is told so.
-    raw_asserted = tuple(str(name).strip() for name in asserted_slots if str(name).strip())
+    # The RAW input is inspected before any normalisation (Redmine #14756 review j#96971
+    # R11-F8). Filtering empties first made `gateway, worker, ""` — three assertions for a
+    # two-slot pair — collapse to a correct-looking two and pass; the cardinality the caller
+    # got wrong disappeared before anything could compare it. Padding is refused for the same
+    # reason a padded epoch token is: it is a spelling no authority produced.
+    raw_asserted = tuple(asserted_slots or ())
+    malformed = [
+        name
+        for name in raw_asserted
+        if not isinstance(name, str) or not name or name != name.strip()
+    ]
+    if malformed:
+        return LaneEpochRecoveryPlan(
+            state=BLOCKED_TARGET_SLOT_ASSERTION_FAILED,
+            asserted_slots=tuple(str(name) for name in raw_asserted),
+            detail=(
+                "an asserted slot is empty, padded, or not a string. An assertion is compared "
+                "to the authority byte-for-byte, so a token that no declaration could carry "
+                "is refused rather than trimmed into one that might match"
+            ),
+            **{"lane": lane, "workspace_id": workspace_id, "issue_id": issue_id},
+        )
     asserted = tuple(sorted(raw_asserted))
     base = {"lane": lane, "workspace_id": workspace_id, "issue_id": issue_id}
 

@@ -242,7 +242,8 @@ def register_herdr_attestation_store_parser(herdr_sub, *, add_repo_option=None) 
             "only checks that derivation against your expectation and refuses on any "
             "difference. It cannot add a slot, and therefore cannot shrink the consumer "
             "census — supplying every consumer's name refuses rather than clearing the "
-            "global blocker (Redmine #14756 j#96881 F1)."
+            "global blocker (Redmine #14756 j#96881 F1). Empty or padded values are refused "
+            "rather than dropped, so a stray argument cannot shrink what is compared."
         ),
     )
     _add_common(plan, add_repo_option=add_repo_option)

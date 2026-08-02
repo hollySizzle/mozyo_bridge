@@ -133,7 +133,7 @@ resolver はこれを fail-closed に読む。
     `hibernated_at` は clear するが、counter を reset すると旧世代 process が持つ epoch を再発行して
     しまうため、両者の非対称は仕様である。
   - **admission**: resume は各 slot の attested epoch が **hibernate epoch より strictly newer**
-    (= 現行 `lane_epoch` 以上) のときのみ admit する。survivor は release 前に注入された epoch しか
+    (= 現行 `lane_epoch` と **完全一致**) のときのみ admit する。survivor は release 前に注入された epoch しか
     持てず、稼働中 process の env は他プロセスから書き換えられない (POSIX) ので、この判定は
     **clock にも pane-id 非再利用にも依存しない**。
   - **byte-exact 判定**: canonical form は `str(n)` (`n >= 1`) のみ。`"01"` / `" 1"` / `"+1"` /
