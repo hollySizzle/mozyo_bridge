@@ -16,7 +16,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from mozyo_bridge.core.state.replacement_transaction_model import ContinuationPointer
+from mozyo_bridge.core.state.replacement_transaction_model import (
+    ContinuationPointer,
+    ParticipantPin,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_vanished_gateway_recovery import (  # noqa: E501
     RECOVERY_ACTION_GENERATION,
     stored_row_is_this_recovery,
@@ -59,6 +62,12 @@ class ContinuationPreparation:
     #: which is the re-derivation this rail exists to avoid. Always exactly that type or
     #: ``None`` -- see the type gate below (audit j#97226).
     pointer: Optional["ContinuationPointer"] = None
+    #: The canonical stored gateway participant, from the SAME verified row as the pointer
+    #: (audit j#97233 item 1). The target resolver needs its workspace/lane/provider/
+    #: assigned_name/old_locator, and taking them from anywhere else -- a caller's pin, a
+    #: re-decoded manifest -- would let the send address a participant this transaction
+    #: never pinned. Always exactly a `ParticipantPin` or ``None``.
+    participant: Optional["ParticipantPin"] = None
 
     @property
     def ready(self) -> bool:
@@ -174,9 +183,27 @@ def prepare_vanished_gateway_continuation(
             action_id,
         )
 
+    # The participant comes off the SAME record the pointer did, and is type-gated for the
+    # same reason: a look-alike would be carried into the resolver's exact joins.
+    try:
+        participants = tuple(getattr(stored, "participants", ()) or ())
+    except Exception:  # noqa: BLE001 - a hostile record is input, not truth
+        return _stopped(
+            STOPPED_TRANSACTION_UNAVAILABLE,
+            "the stored participants could not be read",
+            action_id,
+        )
+    if len(participants) != 1 or type(participants[0]) is not ParticipantPin:
+        return _stopped(
+            STOPPED_CONTINUATION_INVALID,
+            "the stored row does not carry exactly one canonical participant",
+            action_id,
+        )
+
     return ContinuationPreparation(
         outcome=CONTINUATION_READY,
         action_id=action_id,
+        participant=participants[0],
         # Derived, never accepted: the delivery leg has to take the same lease this
         # recovery already holds (j#97190 F5).
         holder=recovery_lease_holder(action_id),

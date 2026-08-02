@@ -20,8 +20,13 @@ from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
 from mozyo_bridge.core.state.replacement_transaction_model import (  # noqa: E402
     ContinuationPointer,
 )
+from mozyo_bridge.core.state.replacement_transaction_model import (  # noqa: E402
+    ParticipantPin,
+)
 from tests.regressions.test_issue_14741_vanished_gateway_recovery_live import (  # noqa: E402,E501
+    ASSIGNED,
     LANE,
+    LOCATOR,
     WORKSPACE,
     _LiveCase,
     _Port,
@@ -339,6 +344,68 @@ class RefusalTest(_PrepareCase):
         result = self._prepare()
         self.assertEqual(result.outcome, CONTINUATION_READY)
         self.assertIs(type(result.pointer), ContinuationPointer)
+
+    def test_the_canonical_participant_travels_with_the_pointer(self) -> None:
+        """Audit j#97233 item 1: the resolver's identity must come from the SAME row."""
+        result = self._prepare()
+        self.assertEqual(result.outcome, CONTINUATION_READY)
+        stored = self.store.get(
+            ReplacementTransactionKey(WORKSPACE, self.plan.action_id)
+        )
+        self.assertIs(type(result.participant), ParticipantPin)
+        self.assertEqual(result.participant, stored.participants[0])
+        self.assertEqual(result.participant.assigned_name, ASSIGNED)
+        self.assertEqual(result.participant.old_locator, LOCATOR)
+
+    def test_a_foreign_participant_shape_is_refused(self) -> None:
+        """A look-alike would be carried straight into the resolver's exact joins."""
+        from types import SimpleNamespace
+
+        real = self.store
+        module = (
+            "mozyo_bridge.e_110_execution_platform"
+            ".f_140_delegated_coordinator_nested_handoff.application"
+            ".sublane_vanished_gateway_continuation"
+        )
+
+        class _Store:
+            path = real.path
+
+            def get(self, key):
+                record = real.get(key)
+                if record is None:
+                    return None
+                if sys._getframe(1).f_globals.get("__name__") != module:
+                    return record
+
+                class _Facade:
+                    def __getattr__(self, name):
+                        if name == "participants":
+                            pin = record.participants[0]
+                            return (
+                                SimpleNamespace(
+                                    lane_id=pin.lane_id,
+                                    role=pin.role,
+                                    provider=pin.provider,
+                                    assigned_name=pin.assigned_name,
+                                    old_locator=pin.old_locator,
+                                ),
+                            )
+                        return getattr(record, name)
+
+                return _Facade()
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+        result = prepare_vanished_gateway_continuation(
+            plan=self.plan, anchor=_anchor(), store=_Store(), home=self.home,
+            workspace_id=WORKSPACE, actuation_port=_Port(),
+            launch_authority=lambda pin: True, store_admission=lambda key, pin: None,
+            clock=lambda: "2026-08-02T00:00:00+00:00",
+        )
+        self.assertEqual(result.stopped, STOPPED_CONTINUATION_INVALID)
+        self.assertIsNone(result.participant)
 
     def test_nothing_here_reaches_a_delivery_ledger(self) -> None:
         """The tranche boundary, stated: preparation opens no ledger."""
