@@ -43,6 +43,9 @@ STOPPED_NOT_ACTIONABLE = "plan_not_actionable"
 STOPPED_PORTS_INCOMPLETE = "authority_ports_incomplete"
 #: The workspace or the transaction home is not an exact plain authority.
 STOPPED_AUTHORITY_INVALID = "authority_invalid"
+#: The stored row's phase is not one this worker-recovery flow owns, or it is a progressed
+#: phase whose participants contradict it.
+STOPPED_PHASE_NOT_RECOVERABLE = "phase_not_recoverable"
 #: The stored row is absent, unreadable, or is not this exact recovery any more.
 STOPPED_TRANSACTION_UNAVAILABLE = "transaction_unavailable"
 #: The actuator refused or could not finish. The exact step is carried as its own token.
@@ -51,6 +54,19 @@ STOPPED_ACTUATION = "actuation_stopped"
 #: The plan outcomes this executor accepts. They are ONE family: they differ in when the row
 #: was observed, not in what authority it carries (ruling j#97162).
 ACTIONABLE_OUTCOMES = (OUTCOME_RECEIPT_PLANNED, OUTCOME_REPLAYED)
+
+#: The phases this worker-recovery flow owns. Anything else -- a self-replacement phase, or
+#: one this build does not know -- is refused BEFORE the lease claim, because a claim is a
+#: durable write: it moves the row's revision and takes its lease (audit j#97196 F1).
+RECOVERABLE_PHASES = (
+    "planned",
+    "claimed",
+    "replacing_nonself",
+)
+#: Phases that MEAN the redispatch leg already ran. They are only true if every non-self
+#: participant really is replaced -- a `completed` row whose gateway is still `close_owed`
+#: is a contradiction, not a success (audit j#97196 F2).
+PROGRESSED_PHASES = ("draining_continuation", "completed")
 
 
 @dataclass(frozen=True)
@@ -98,11 +114,20 @@ def _plan_action_id(plan) -> str:
     instance does not guarantee what its `decision` is, and a hostile `outcome` property
     escaped as a raw `RuntimeError` (measured, audit j#97190 F4).
     """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.vanished_gateway_recovery import (  # noqa: E501
+        RecoveryDecision,
+    )
+
     decision = getattr(plan, "decision", None)
+    # The EXACT type, not a look-alike: a foreign object with the right field names is not
+    # this rail's decision, and `_raw` folded a padded refusal to "" so `" denied "` read as
+    # not-refused (audit j#97198 F4).
+    if type(decision) is not RecoveryDecision:
+        return ""
+    if type(decision.refusal) is not str or decision.refusal != "":
+        return ""
     outcome = getattr(decision, "outcome", None)
     if type(outcome) is not str or outcome not in ACTIONABLE_OUTCOMES:
-        return ""
-    if _raw(getattr(decision, "refusal", "")):
         return ""
     action_id = _raw(getattr(plan, "action_id", None))
     if not action_id or _raw(getattr(decision, "action_id", None)) != action_id:
@@ -115,6 +140,7 @@ def actuate_vanished_gateway_recovery(
     plan: RecoveryPlan,
     anchor: RequestAnchor,
     store: Any,
+    home: Any,
     workspace_id: str,
     actuation_port: Any,
     launch_authority: Any = None,
@@ -174,7 +200,6 @@ def actuate_vanished_gateway_recovery(
         )
     try:
         store_path = Path(store.path)
-        home = store_path.parent
     except Exception:  # noqa: BLE001 - a hostile `path` property is input, not truth
         return _stopped(
             STOPPED_AUTHORITY_INVALID, "the transaction store has no readable path", action_id
@@ -184,6 +209,20 @@ def actuate_vanished_gateway_recovery(
         # and that only surfaces AFTER a live launch.
         return _stopped(
             STOPPED_AUTHORITY_INVALID, "the transaction store path is not absolute", action_id
+        )
+    # "Absolute" is not "the same store" (audit j#97198 F3): a facade that delegates every
+    # method to the real store while advertising a different absolute path actuated the row
+    # and then discharged into someone else's home. The caller states the home it means, and
+    # it must BE the store's.
+    if type(home) is not type(store_path) and not isinstance(home, Path):
+        return _stopped(
+            STOPPED_AUTHORITY_INVALID, "no explicit transaction home was given", action_id
+        )
+    if not home.is_absolute() or home != store_path.parent:
+        return _stopped(
+            STOPPED_AUTHORITY_INVALID,
+            "the transaction home is not this store's own home",
+            action_id,
         )
 
     try:
@@ -213,6 +252,33 @@ def actuate_vanished_gateway_recovery(
         return _stopped(
             STOPPED_TRANSACTION_UNAVAILABLE,
             "the stored row at this key is not this recovery",
+            action_id,
+        )
+
+    # Phase gate BEFORE the actuator, because `drive_worker_recovery` claims the lease
+    # first: a phase this flow does not own used to be refused only after the claim had
+    # already bumped the row's revision and taken its lease (audit j#97196 F1).
+    try:
+        phase = _raw(getattr(stored, "phase", None))
+        participants = tuple(getattr(stored, "participants", ()) or ())
+        replaced = all(_raw(getattr(p, "phase", None)) == "replaced" for p in participants)
+    except Exception:  # noqa: BLE001
+        return _stopped(
+            STOPPED_TRANSACTION_UNAVAILABLE,
+            "the stored transaction could not be read",
+            action_id,
+        )
+    if phase in PROGRESSED_PHASES:
+        if not participants or not replaced:
+            return _stopped(
+                STOPPED_PHASE_NOT_RECOVERABLE,
+                "a progressed phase whose participants are not replaced",
+                action_id,
+            )
+    elif phase not in RECOVERABLE_PHASES:
+        return _stopped(
+            STOPPED_PHASE_NOT_RECOVERABLE,
+            "the phase is not part of the worker-recovery flow",
             action_id,
         )
 
@@ -254,7 +320,10 @@ __all__ = (
     "STOPPED_ACTUATION",
     "STOPPED_NOT_ACTIONABLE",
     "STOPPED_TRANSACTION_UNAVAILABLE",
+    "PROGRESSED_PHASES",
+    "RECOVERABLE_PHASES",
     "STOPPED_AUTHORITY_INVALID",
+    "STOPPED_PHASE_NOT_RECOVERABLE",
     "STOPPED_PORTS_INCOMPLETE",
     "RecoveryActuation",
     "recovery_lease_holder",
