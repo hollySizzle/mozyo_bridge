@@ -40,6 +40,34 @@ class ScaffoldRulesTest(unittest.TestCase):
             result = args.func(args)
         return result, stdout.getvalue()
 
+    def init_git_repository(self, project: Path) -> None:
+        subprocess.run(
+            ["git", "init", "--quiet", str(project)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def git_untracked_paths(self, project: Path) -> set[str]:
+        """Repo-relative paths Git offers as untracked candidates.
+
+        `--untracked-files=all` lists files individually instead of
+        collapsing a directory, which is what makes an ignore rule's
+        effect on a single runtime file observable.
+        """
+        proc = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=project,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return {
+            line[3:]
+            for line in proc.stdout.splitlines()
+            if line.startswith("?? ")
+        }
+
     def test_rules_install_and_scaffold_asana_thin_router(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
@@ -924,6 +952,7 @@ class ScaffoldRulesTest(unittest.TestCase):
                     str(home),
                 ]
             )
+            self.init_git_repository(project)
 
             catalog_path = project / ".mozyo-bridge/docs/catalog.yaml"
             base_catalog = (
@@ -992,6 +1021,253 @@ class ScaffoldRulesTest(unittest.TestCase):
                 real_gap_output,
             )
 
+    def test_docs_validate_file_coverage_obeys_git_ignore_authority(self) -> None:
+        """Coverage uses Git's tracked/untracked/ignored source boundary."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+            self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                ]
+            )
+            self.init_git_repository(project)
+
+            base_catalog = (
+                project / ".mozyo-bridge/docs/catalog.yaml.example"
+            ).read_text(encoding="utf-8")
+            catalog = base_catalog.replace(
+                "coverage_roots:\n  - src\n  - tests\n  - docs\n",
+                "coverage_roots:\n  - source\n",
+                1,
+            ).replace(
+                "      - src/**\n",
+                "      - src/**\n      - source/covered*.rb\n",
+                1,
+            )
+            (project / ".mozyo-bridge/docs/catalog.yaml").write_text(
+                catalog,
+                encoding="utf-8",
+            )
+
+            source = project / "source"
+            nested = source / "nested"
+            source.mkdir()
+            nested.mkdir()
+            (source / "covered.rb").write_text("# covered\n", encoding="utf-8")
+            (project / ".gitignore").write_text(
+                "source/dependency/\n",
+                encoding="utf-8",
+            )
+            (nested / ".gitignore").write_text(
+                "ignored.rb\ntracked_ignored.rb\n",
+                encoding="utf-8",
+            )
+
+            def run_coverage() -> tuple[int, str]:
+                return self.run_cli(
+                    [
+                        "docs",
+                        "validate",
+                        "--repo",
+                        str(project),
+                        "--check-file-coverage",
+                    ]
+                )
+
+            clean_code, clean_output = run_coverage()
+            self.assertEqual(0, clean_code, msg=clean_output)
+
+            dependency = source / "dependency"
+            dependency.mkdir()
+            (dependency / "orphan.rb").write_text(
+                "# ignored dependency\n",
+                encoding="utf-8",
+            )
+            (nested / "ignored.rb").write_text(
+                "# nested ignore\n",
+                encoding="utf-8",
+            )
+            outside = Path(tmp) / "outside.rb"
+            outside.write_text("# outside\n", encoding="utf-8")
+            (source / "linked.rb").symlink_to(outside)
+
+            installed_code, installed_output = run_coverage()
+            self.assertEqual(0, installed_code, msg=installed_output)
+
+            orphan = source / "orphan.rb"
+            orphan.write_text("# untracked source\n", encoding="utf-8")
+            orphan_code, orphan_output = run_coverage()
+            self.assertEqual(1, orphan_code)
+            self.assertIn(
+                "no file_convention matched: source/orphan.rb",
+                orphan_output,
+            )
+            orphan.unlink()
+
+            tracked_ignored = nested / "tracked_ignored.rb"
+            tracked_ignored.write_text("# tracked but ignored\n", encoding="utf-8")
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(project),
+                    "add",
+                    "-f",
+                    "source/nested/tracked_ignored.rb",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            tracked_code, tracked_output = run_coverage()
+            self.assertEqual(1, tracked_code)
+            self.assertIn(
+                "no file_convention matched: source/nested/tracked_ignored.rb",
+                tracked_output,
+            )
+
+    def test_governed_scaffold_syncs_catalog_governance_manifest_only(
+        self,
+    ) -> None:
+        """Re-apply syncs the rule and changes only its manifest hash."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+            apply_args = [
+                "scaffold",
+                "apply",
+                "redmine-governed",
+                "--target",
+                str(project),
+                "--home",
+                str(home),
+            ]
+            initial_code, initial_output = self.run_cli(apply_args)
+            self.assertEqual(0, initial_code, msg=initial_output)
+
+            relative_rule = ".mozyo-bridge/rules/docs_catalog_governance.yaml"
+            rule_path = project / relative_rule
+            stale_rule = rule_path.read_text(encoding="utf-8") + "\n# stale fixture\n"
+            rule_path.write_text(stale_rule, encoding="utf-8")
+
+            manifest_path = project / ".mozyo-bridge/scaffold.json"
+            before = json.loads(manifest_path.read_text(encoding="utf-8"))
+            before["files"][relative_rule]["sha256"] = hashlib.sha256(
+                stale_rule.encode("utf-8")
+            ).hexdigest()
+            manifest_path.write_text(
+                json.dumps(before, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            reapplied_code, reapplied_output = self.run_cli([*apply_args, "--force"])
+            self.assertEqual(0, reapplied_code, msg=reapplied_output)
+
+            distributed_source = (
+                ROOT
+                / "src/mozyo_bridge/scaffold/presets/redmine-governed/files"
+                / relative_rule
+            )
+            self.assertEqual(rule_path.read_bytes(), distributed_source.read_bytes())
+
+            after = json.loads(manifest_path.read_text(encoding="utf-8"))
+            expected = json.loads(json.dumps(before))
+            expected["files"][relative_rule] = after["files"][relative_rule]
+            self.assertEqual(expected, after)
+
+    def test_docs_validate_file_coverage_fails_closed_when_git_is_unavailable(
+        self,
+    ) -> None:
+        """Coverage never silently allows an uncertain Git source set."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+            self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                ]
+            )
+            shutil.copyfile(
+                project / ".mozyo-bridge/docs/catalog.yaml.example",
+                project / ".mozyo-bridge/docs/catalog.yaml",
+            )
+
+            outside_code, outside_output = self.run_cli(
+                [
+                    "docs",
+                    "validate",
+                    "--repo",
+                    str(project),
+                    "--check-file-coverage",
+                ]
+            )
+            self.assertEqual(1, outside_code)
+            self.assertIn("file coverage source enumeration failed", outside_output)
+
+            with patch(
+                "mozyo_bridge.docs_tools.validate.subprocess.run",
+                side_effect=FileNotFoundError("git unavailable"),
+            ):
+                unavailable_code, unavailable_output = self.run_cli(
+                    [
+                        "docs",
+                        "validate",
+                        "--repo",
+                        str(project),
+                        "--check-file-coverage",
+                    ]
+                )
+            self.assertEqual(1, unavailable_code)
+            self.assertIn("Git is unavailable", unavailable_output)
+
+            self.init_git_repository(project)
+            successful_root_check = subprocess.CompletedProcess(
+                args=["git"],
+                returncode=0,
+                stdout=f"{project}\n",
+                stderr="",
+            )
+            failed_listing = subprocess.CompletedProcess(
+                args=["git"],
+                returncode=2,
+                stdout=b"",
+                stderr=b"simulated ls-files failure",
+            )
+            with patch(
+                "mozyo_bridge.docs_tools.validate.subprocess.run",
+                side_effect=[successful_root_check, failed_listing],
+            ):
+                failed_code, failed_output = self.run_cli(
+                    [
+                        "docs",
+                        "validate",
+                        "--repo",
+                        str(project),
+                        "--check-file-coverage",
+                    ]
+                )
+            self.assertEqual(1, failed_code)
+            self.assertIn("cannot enumerate Git source paths", failed_output)
+
     def test_docs_cli_round_trips_against_shipped_catalog_example(self) -> None:
         """The packaged `docs ...` CLI must work on the catalog skeleton.
 
@@ -1019,6 +1295,7 @@ class ScaffoldRulesTest(unittest.TestCase):
                     str(home),
                 ]
             )
+            self.init_git_repository(project)
             example = project / ".mozyo-bridge/docs/catalog.yaml.example"
             catalog = project / ".mozyo-bridge/docs/catalog.yaml"
             _shutil.copyfile(example, catalog)
@@ -1370,6 +1647,7 @@ class ScaffoldRulesTest(unittest.TestCase):
                     str(home),
                 ]
             )
+            self.init_git_repository(project)
             _shutil.copyfile(
                 project / ".mozyo-bridge/docs/catalog.yaml.example",
                 project / ".mozyo-bridge/docs/catalog.yaml",
@@ -1689,6 +1967,224 @@ class ScaffoldRulesTest(unittest.TestCase):
                     tracked,
                     msg=f"manifest does not track {tracked_path}",
                 )
+
+    # Runtime state `claude-nagger` writes into the directory the governed
+    # scaffold populates: the session SQLite DB with its WAL sidecars
+    # (`-wal` / `-shm`) and the rollback sidecar SQLite falls back to when
+    # WAL is unavailable (`-journal`), the suggest-rules drop box, the
+    # local vault, hook logs, and the derived file-convention output.
+    NAGGER_RUNTIME_PATHS = (
+        ".claude-nagger/state.db",
+        ".claude-nagger/state.db-wal",
+        ".claude-nagger/state.db-shm",
+        ".claude-nagger/state.db-journal",
+        ".claude-nagger/suggested_rules/suggested_rules.yaml",
+        ".claude-nagger/vault/secrets.yaml",
+        ".claude-nagger/file_conventions.generated.yaml",
+        ".claude-nagger/hook.log",
+    )
+
+    # The conventions an operator activates by copying the skeleton. These
+    # are the project's own configuration and must stay committable.
+    NAGGER_OPERATOR_PATHS = (
+        ".claude-nagger/config.yaml",
+        ".claude-nagger/command_conventions.yaml",
+        ".claude-nagger/mcp_conventions.yaml",
+        ".claude-nagger/file_conventions.yaml",
+    )
+
+    # The shipped skeleton itself, which the scaffold manifest tracks.
+    NAGGER_SHIPPED_PATHS = (
+        ".claude-nagger/.gitignore",
+        ".claude-nagger/config.yaml.example",
+        ".claude-nagger/command_conventions.yaml.example",
+        ".claude-nagger/mcp_conventions.yaml.example",
+    )
+
+    def test_governed_nagger_gitignore_excludes_runtime_state_only(self) -> None:
+        """Redmine #14773: the shipped nagger `.gitignore` hides runtime state.
+
+        `claude-nagger` keeps its session SQLite DB — and the
+        suggest-rules drop box — inside the very `.claude-nagger/`
+        directory the governed scaffold populates, so a distributed
+        artifact that does not exclude its own runtime state lets a
+        routine `git add -A` commit it (#14725 j#95187). Upstream ships
+        the same exclusions in its own `DOTCN_GITIGNORE_TEMPLATE`, but
+        only writes them when no `.gitignore` exists yet; the scaffolded
+        file wins, so the exclusion has to live here.
+
+        The exclusion stays narrow on purpose: no `.claude-nagger/**`
+        blanket. The conventions an operator activates by hand, and the
+        shipped skeleton, must still surface as Git candidates.
+        """
+        for preset in ("redmine-governed", "redmine-rails-governed"):
+            with self.subTest(preset=preset):
+                with tempfile.TemporaryDirectory() as tmp:
+                    home = Path(tmp) / "home"
+                    project = Path(tmp) / "project"
+                    project.mkdir()
+                    self.init_git_repository(project)
+                    self.run_cli(["rules", "install", "--home", str(home)])
+                    result, _ = self.run_cli(
+                        [
+                            "scaffold",
+                            "apply",
+                            preset,
+                            "--target",
+                            str(project),
+                            "--home",
+                            str(home),
+                        ]
+                    )
+                    self.assertEqual(0, result)
+
+                    for relative in (
+                        self.NAGGER_RUNTIME_PATHS + self.NAGGER_OPERATOR_PATHS
+                    ):
+                        path = project / relative
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        # Placeholder content only: a real state DB is
+                        # local runtime state and is never fixtured.
+                        path.write_text("local\n", encoding="utf-8")
+
+                    untracked = self.git_untracked_paths(project)
+                    for relative in self.NAGGER_RUNTIME_PATHS:
+                        self.assertNotIn(
+                            relative,
+                            untracked,
+                            msg=(
+                                f"{preset} scaffold leaves {relative} as a Git "
+                                "candidate; runtime state must be ignored"
+                            ),
+                        )
+                    for relative in (
+                        self.NAGGER_OPERATOR_PATHS + self.NAGGER_SHIPPED_PATHS
+                    ):
+                        self.assertIn(
+                            relative,
+                            untracked,
+                            msg=(
+                                f"{preset} scaffold hides {relative}; the ignore "
+                                "must not swallow project configuration"
+                            ),
+                        )
+
+    def test_governed_nagger_redistribution_keeps_tracked_runtime_file(self) -> None:
+        """Redmine #14773: re-distributing the fix never untracks a file.
+
+        An adopting repo that committed `.claude-nagger/state.db` before
+        the exclusion shipped (#14725 j#95187) must be repaired by a plain
+        `scaffold apply --backup`: the refreshed `.gitignore` keeps *new*
+        runtime files out of Git, while the file the repo already tracks
+        stays tracked. Dropping it is the repo owner's decision, not a
+        side effect of redistribution — and the replaced `.gitignore` is
+        backed up rather than lost.
+        """
+        pre_fix_gitignore = (
+            "# Generated artifacts and runtime cache live next to the config files\n"
+            "# but should never be committed. The catalog is the source of truth;\n"
+            "# any `file_conventions.generated.yaml` here is derived output, and\n"
+            "# any `vault/` content is local runtime state.\n"
+            "file_conventions.generated.yaml\n"
+            "vault/\n"
+            "*.log\n"
+        )
+        for preset in ("redmine-governed", "redmine-rails-governed"):
+            with self.subTest(preset=preset):
+                with tempfile.TemporaryDirectory() as tmp:
+                    home = Path(tmp) / "home"
+                    project = Path(tmp) / "project"
+                    project.mkdir()
+                    self.init_git_repository(project)
+
+                    # Adopted repo as it stood before the fix: the old
+                    # skeleton `.gitignore`, an activated config, and a
+                    # runtime DB that `git add -A` already staged.
+                    nagger = project / ".claude-nagger"
+                    nagger.mkdir()
+                    (nagger / ".gitignore").write_text(
+                        pre_fix_gitignore, encoding="utf-8"
+                    )
+                    (nagger / "config.yaml").write_text(
+                        "notify: {}\n", encoding="utf-8"
+                    )
+                    (nagger / "state.db").write_text("local\n", encoding="utf-8")
+                    subprocess.run(
+                        ["git", "add", "-A"],
+                        cwd=project,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+
+                    self.run_cli(["rules", "install", "--home", str(home)])
+                    result, _ = self.run_cli(
+                        [
+                            "scaffold",
+                            "apply",
+                            preset,
+                            "--target",
+                            str(project),
+                            "--home",
+                            str(home),
+                            "--backup",
+                        ]
+                    )
+                    self.assertEqual(0, result)
+
+                    refreshed = (nagger / ".gitignore").read_text(encoding="utf-8")
+                    for entry in (
+                        "state.db",
+                        "state.db-wal",
+                        "state.db-shm",
+                        "state.db-journal",
+                        "suggested_rules/",
+                    ):
+                        self.assertIn(
+                            entry,
+                            refreshed,
+                            msg=(
+                                f"{preset} redistribution did not add {entry} to "
+                                "the nagger .gitignore"
+                            ),
+                        )
+                    self.assertTrue(
+                        list(nagger.glob(".gitignore.bak.*")),
+                        msg=(
+                            f"{preset} redistribution replaced the nagger "
+                            ".gitignore without a backup"
+                        ),
+                    )
+
+                    tracked = subprocess.run(
+                        ["git", "ls-files"],
+                        cwd=project,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.splitlines()
+                    self.assertIn(
+                        ".claude-nagger/state.db",
+                        tracked,
+                        msg=(
+                            f"{preset} redistribution untracked an existing "
+                            "state.db; the ignore must not delete tracked files"
+                        ),
+                    )
+
+                    # New sidecars written after the repair stay out of Git.
+                    for name in ("state.db-wal", "state.db-shm"):
+                        (nagger / name).write_text("local\n", encoding="utf-8")
+                    untracked = self.git_untracked_paths(project)
+                    for name in ("state.db-wal", "state.db-shm"):
+                        self.assertNotIn(
+                            f".claude-nagger/{name}",
+                            untracked,
+                            msg=(
+                                f"{preset} redistribution leaves {name} as a Git "
+                                "candidate"
+                            ),
+                        )
 
     def test_governed_nagger_warns_on_default_lane_implementation_handoff(self) -> None:
         """Redmine #12171: governed Nagger skeleton ships the dispatch warning.

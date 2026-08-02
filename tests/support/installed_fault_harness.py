@@ -49,6 +49,9 @@ from pathlib import Path
 from typing import Any, Mapping, NamedTuple, Optional
 from unittest import mock
 
+from mozyo_bridge.core.state.lane_release_observation import (  # noqa: E402
+    build_release_observation,
+)
 from mozyo_bridge.core.state.lane_metadata import record_lane_created
 from mozyo_bridge.core.state.workspace_registry import read_anchor, register_workspace
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
@@ -726,8 +729,8 @@ class InstalledFaultHarness:
         rec = store.get(key)
         store.request_release(
             key, expected_revision=rec.revision, action_id="rel-1",
-            pins=[ReleasePin("gateway", "codex-mzb1", "w1:p1"),
-                  ReleasePin("worker", "claude-mzb1", "w1:p2")],
+            observation=build_release_observation([ReleasePin("gateway", "codex-mzb1", "w1:p1"),
+                  ReleasePin("worker", "claude-mzb1", "w1:p2")]),
         )
         rec = store.get(key)
         from mozyo_bridge.core.state.lane_lifecycle import RELEASE_RELEASED

@@ -213,7 +213,6 @@ active_herdr_turn_start_rail = None
 # instead of via the tmux pane resolver, so a pure herdr session (no tmux server)
 # routes. Strictly config-guarded; the tmux path is untouched.
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
-    herdr_auto_target_repo,
     herdr_effective_backend_selected,
     resolve_herdr_send_target,
 )

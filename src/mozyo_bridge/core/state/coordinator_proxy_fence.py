@@ -16,10 +16,14 @@ different from its siblings, and it is required by the failure it guards:
 - a repeat of the SAME ``(issue, journal)`` is a duplicate **even after the generation completed** —
   a durable decision is delegated once, full stop. A fence that re-opened on completion would let
   "run the command again" re-deliver a decision the coordinator already acted on;
-- a delegation whose ``journal`` is OLDER than the one already delegated on this route is **stale**:
-  the durable record moved on, and shipping a superseded decision is the same defect as shipping a
-  duplicate. Redmine journal ids are monotonic per issue, so the comparison is a numeric one, and a
-  non-numeric journal fails closed rather than sorting as a string.
+- only a **strictly newer** ``journal`` mints the route's next generation. Anything that does not
+  supersede the delegated one — older, or the SAME ordinal on a different issue — is **stale**: the
+  durable record moved on, and shipping a decision that is not newer is the same defect as shipping
+  a duplicate. Redmine journal ids are monotonic across the instance, not merely within one issue,
+  which is what makes a journal-only comparison sound on a route that may carry decisions from
+  different issues; equal ordinals on different issues are therefore not a newer decision but an
+  unresolvable anchor, and fail closed. The comparison is numeric, and a non-numeric journal fails
+  closed rather than sorting as a string.
 
 Store identity mirrors the sibling fences (``forward_outbox_fence`` / the dispatch fence): a
 DB-external ``store_nonce`` sidecar fails a deleted / replaced store **closed**, and :meth:`bootstrap`
@@ -70,7 +74,7 @@ _TERMINAL_STATES = frozenset({PROXY_DELIVERED, PROXY_COMPLETED, PROXY_ABANDONED}
 # Reserve verdicts (why a reserve did or did not win). Machine-readable.
 RESERVE_WON = "won"
 RESERVE_DUPLICATE = "duplicate"  # same (issue, journal) already delegated, or a generation in flight
-RESERVE_STALE = "stale"  # this journal is older than the one already delegated on this route
+RESERVE_STALE = "stale"  # this journal is not strictly newer than the one already delegated here
 RESERVE_NEEDS_RECONCILE = "needs_reconcile"  # a prior reserve never resolved (crash window)
 
 _TABLE_SQL = """
@@ -319,14 +323,20 @@ class CoordinatorProxyFence:
         """Reserve the single delegation of ``(issue, journal)`` on ``route``, or refuse.
 
         Wins only when the route is fresh, or when its prior generation is terminal
-        (:data:`PROXY_DELIVERED` / :data:`PROXY_ABANDONED` / legacy :data:`PROXY_COMPLETED`) for a
-        **strictly older** journal on the same issue. Refuses with:
+        (:data:`PROXY_DELIVERED` / :data:`PROXY_ABANDONED` / legacy :data:`PROXY_COMPLETED`) and
+        ``journal`` is **strictly newer** than the journal that generation delegated. The comparison
+        is on the journal ordinal ALONE and the candidate's ``issue`` never relaxes it: a different
+        issue is not evidence of a newer decision. Refuses with:
 
         - :data:`RESERVE_DUPLICATE` — a generation is in flight (reserved / uncertain), or ANY
           generation already delegated this exact ``(issue, journal)``. A decision is delegated
           once, whatever state its generation reached;
-        - :data:`RESERVE_STALE` — the terminal generation delegated a NEWER journal, so this
-          decision is superseded;
+        - :data:`RESERVE_STALE` — the terminal generation's journal is not older than this one, so
+          this decision does not supersede it. That covers a smaller ordinal AND an equal ordinal,
+          including an equal ordinal carried by a different issue: equal is not strictly newer, and
+          since Redmine journal ids are unique across the instance, one ordinal naming two issues is
+          an unresolvable anchor rather than a newer decision. The refusal writes nothing and sends
+          nothing;
         - :data:`RESERVE_NEEDS_RECONCILE` — a prior reserve never resolved (crash window). The row
           is moved to :data:`PROXY_UNCERTAIN` and never auto-retried.
 
@@ -423,8 +433,14 @@ class CoordinatorProxyFence:
                     prior_state=prior_state, prior_issue=prior_issue, prior_journal=prior_journal,
                     detail=f"generation state {prior_state!r} is not terminal; never-send",
                 )
+            # STRICTLY newer, so `<=` and not `<`: an equal ordinal does not supersede. The exact
+            # `(issue, journal)` repeat is already duplicate above, so what `<=` newly refuses is an
+            # equal ordinal reached with a DIFFERENT anchor string — another issue, or the same issue
+            # written with leading zeros. `<` admitted those as a new generation while this method's
+            # contract, the spec (§3b / §4) and the delivery terminal all say only a strictly newer
+            # canonical decision mints past a terminal row (Redmine #14701).
             prior_ordinal = journal_ordinal(prior_journal)
-            if want_ordinal is None or prior_ordinal is None or want_ordinal < prior_ordinal:
+            if want_ordinal is None or prior_ordinal is None or want_ordinal <= prior_ordinal:
                 conn.execute("ROLLBACK")
                 return ProxyReserveResult(
                     won=False, verdict=RESERVE_STALE, action_id=prior_action,

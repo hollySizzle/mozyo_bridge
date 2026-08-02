@@ -158,7 +158,7 @@ ANCHOR_DECISION_UNREADABLE = "decision_unreadable"
 
 FENCE_OPEN = "open"  # the fence reserved this delegation (the single caller cleared to deliver)
 FENCE_DUPLICATE = "duplicate"  # in flight, or this exact decision was already delegated
-FENCE_STALE = "stale"  # a newer decision was already delegated on this route
+FENCE_STALE = "stale"  # this decision is not strictly newer than the one delegated on this route
 FENCE_RECONCILE = "reconcile"  # a prior reserve never resolved; an operator reconcile precedes
 FENCE_UNAVAILABLE = "unavailable"  # the store could not be consulted -> do-not-send
 

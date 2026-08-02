@@ -80,8 +80,17 @@ def _add_ticketless_delivery_options(
             "Optional cross-workspace identity gate (#10332 cross-workspace handoff "
             "identity gate): the target "
             "pane's cwd must resolve to this repo root, else the callback is "
-            "rejected with `target_repo_mismatch`. Pass `auto` to infer the root "
-            "from an explicit `%%pane` target's own cwd. Drop to skip the repo gate."
+            "rejected with `target_repo_mismatch`. Omitting the flag skips the repo "
+            "gate — but a relative `--workdir` then resolves against the SENDER's "
+            "cwd, so do NOT drop it to get past an `auto` failure (Redmine #14249). "
+            "`auto` resolves per backend: under tmux from an explicit `%%pane` "
+            "target's own cwd, which it therefore requires; under herdr there is no "
+            "pane cwd, so it resolves the TARGET's own frame — this checkout when the "
+            "target is the sender's own lane, otherwise that lane's canonical worktree "
+            "via its lifecycle worktree binding. Both stay fail-closed "
+            "(`target_repo_mismatch` / `auto_target_repo_unresolved`) and never fall "
+            "back to the sender's root; pass an explicit `--target-repo <root>` "
+            "instead."
         ),
     )
     parser_.add_argument(

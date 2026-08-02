@@ -255,6 +255,115 @@ pane cwd / repo root   != target execution root (nested project)
   absolute path を渡した場合と A/B で同一の execution root になる。
   `--target-repo` 未指定時は権威ある receiver frame が無いため、relative path は
   従来どおり sender cwd 基準で解決する (既存契約は不変)。
+- **`--target-repo auto` は target 自身の frame へ解決し、sender cwd へ fallback
+  しない** (Redmine #14249 R2、reproduction j#94419)。上記の「`auto` は解決後の
+  root」は誰の root かを述べていなかった。tmux では target `%pane` の cwd から
+  推論する。herdr には読むべき pane cwd が無く、#13331 j#73312 #2 はそこを
+  **sender の repo root** で埋めていたが、それが正しいのは target が sender 自身の
+  lane であるときに限られる。cross-lane send では receiver が居ない repo を
+  assert し、しかも上記の relative-workdir 基準がそれを検証済みとして運んでいた。
+  herdr の `auto` は次の frame で解決する。
+  - target unit == sender unit: この checkout が target の root である (#13331 の
+    ケース。resolved route identity から**検証**して選ぶ。仮定しない)。
+  - 同一 workspace の別 lane: その lane の canonical worktree。join key は
+    lifecycle authority の `worktree_identity` token であり、workspace repo 自身の
+    `git worktree list --porcelain` entry のうち exactly one がその token を
+    re-derive しなければならない (`bind_lane_worktree` — hibernate topology
+    observation と共有する単一 join。send 経路なので local only、`ls-remote` は
+    しない)。lane id を branch と見なす推論はしない (review j#86739 R3-F2)。
+    display metadata の `lane_metadata.worktree_path` を authority に昇格させない。
+    **binding は path identity のみを与え、branch authority を含まない**:
+    `worktree_identity` は canonical path の hash なので、**detached HEAD の lane
+    worktree もそのまま解決する** (review j#94499 finding 2)。branch を要求するのは
+    push / HEAD topology を観測する `observe_lane_topology` 側の責務であり、
+    execution root の解決には不要。detached を拒否しても正しい root を持つ稼働中
+    lane を止めるだけで安全上の利得が無い。
+  - それ以外 (identity 未 attested / foreign workspace / lifecycle row 不在 /
+    `worktree_identity` 空 / join 非一意 / store 読取不能): **typed fail-closed**。
+    `blocked` / **`auto_target_repo_unresolved`** で zero-send し、explicit
+    `--target-repo <target lane worktree>` を要求する。sender cwd への silent
+    fallback は禁止 — それが本 defect であり、誤った execution root を検証済みの
+    ものとして送達する。
+    ただし **store が runtime より新しい場合だけは既存の `reader_upgrade_required`
+    へ写す** (review j#95843 point 2)。同 reason が既に「現行 runtime 経由で送れ、
+    store を downgrade するな」という唯一正しい repair を持つため、同じ条件に
+    2 つ目の token を作らない。
+  - **refusal は durable な subreason を伴う**。どの段で解決に失敗したかは
+    `DeliveryOutcome.auto_target_repo` (`subreason` / `basis` / `detail`) に載せる
+    (review j#95843 finding 1)。narrative は全 subreason に対して真である表現に
+    留め、具体的な段は同 field を読ませる。**受信側が持っていない情報を
+    next_action で参照しない** — R3 は存在しない「structured detail」を参照していた。
+  - **admission 自体が caller の code を実行してはならない** (review j#96064 finding 1)。
+    `isinstance(value, str)` は actual type が `str` でないとき **`__class__` を参照する**ので、
+    `__class__` が `str` を返す非 `str` は通過して所有段で `TypeError` になり、
+    `__class__` が例外を投げる object はその場で伝播する。**`type(value) is str` は actual type
+    slot を読み偽装されない**。admission は「所有の試行そのもの」にし、非 `str` は例外ではなく
+    sentinel へ閉じる。**「理論上閉じる」で済ませず、各再介入点を実測して pin する。**
+  - **検証した「文字」ではなく、検証済みの「値」を使う** (review j#96049 finding 1)。
+    `str` subclass は `__format__` / `__hash__` / `__len__` / `__eq__` 等で
+    **検証の後に**再介入できる。R8 は regex と長さを caller の object に対して確認し、
+    その object をそのまま table lookup と f-string へ渡したため、
+    `__hash__` が例外を投げ、`__format__` が newline と absolute path を再注入した。
+    **exact builtin `str` へ正規化してから使う**。本 repo は既に同じ問題を裁定しており
+    (`_owned_str(value) = str.__str__(value)`、review **j#86068 / j#86081**)、
+    `str(value)` / `value[:]` / `"" + value` がいずれも subclass hook に届くことも
+    そこに記録されている。**同種の問題は、まず既存 ruling を探す。**
+    payload 型は **exact `dict`** に限定し、adversarial な `Mapping.get` / equality を
+    generic fallback へ閉じる (「never raises」を宣言ではなく証明可能にするため)。
+  - **未知 token を durable 文面へ出してよい条件** (review j#96042 finding 1)。
+    producer が closed vocabulary を出すことは、**producer 保証が及ばない経路**
+    (未知 token の表示) の安全性を意味しない。表示する側の境界で値自身を検証する:
+    **`str` 型であること / `[a-z][a-z0-9_]*` に一致すること / 明示的最大長以内であること**。
+    いずれかを満たさなければ **raw 値を出さず stable placeholder** にする。
+    payload が Mapping でない・値が unhashable でも**例外を出さず** generic へ閉じる。
+    これにより ticket へ出る token は **single-line・bounded・path-free** であることが
+    構造的に保証される (R7 は raw 補間で newline / backtick / absolute path / 10,000 文字を
+    そのまま durable 文面へ通していた)。
+  - **fallback は最も保守的な文面にする**。subreason が欠損 / 未知のときに通る経路は
+    「最も情報が無い」経路であり、**原因を推測してはならない**。全 refusal に真な
+    generic repair のみを返し、未知 token は「未知である」と提示する
+    (review j#96019 finding 1)。R6 は既知 token 経路だけを直し、fallback を
+    直前に誤りと確定した最も具体的な文面のまま残していた。
+    **reason と payload の coupling も helper 内で検証する** — 別 reason の payload が
+    紛れても、その reason 自身の repair を返す。
+  - **surface ごとに検査すべき属性は 2 つある: 可読性 (subreason が読めるか) と
+    助言の正しさ (その subreason に対する repair か)**。R5 は前者だけを全 surface で
+    測り、後者は stderr でしか確認しなかったため、`next_action` (wire JSON と
+    pasteable record の両方に載る) が 6 subreason で同一の誤 repair を出し続けた
+    (review j#95995 finding 1)。**「全 surface を見た」ではなく
+    「surface × 属性」の行列で測る**。
+  - **subreason は reader surface 全てに届かせる** (review j#95911 finding 1/4)。
+    wire JSON だけでは足りない。`--persist-delivery` が保存し人が ticket に貼るのは
+    **pasteable markdown** であり、sender が最初に読むのは **stderr** である。
+    markdown には closed vocabulary の token (`subreason` / `basis`) を固定形式で
+    render し、stderr は **subreason ごとの正しい repair** を出す
+    (`auto_target_repo_die_message`)。全 refusal に同一の repair を出してはならない —
+    `identity_unattested` / `foreign_workspace` は binding 段に到達せず、
+    `lifecycle_store_upgrade_required` は binding repair では解消しない。
+  - **refusal payload に filesystem path を入れない** (review j#95911 finding 2)。
+    `detail` は wire outcome・pasteable record・stderr の 3 経路へ同時に出るため、
+    raw exception を補間すると個人 home path が 3 箇所へ publish される
+    (R4 が実際に起こした)。exception は **type 名のみ**を使い、path・秘密値は載せない。
+    正本: organization baseline (個人情報を chat / ticket / Git / log へ記録しない)。
+  - **これらの refusal は proven pre-injection zero-send として closed consumer に
+    登録する** (review j#95843 finding 2)。未登録だと `uncertain` へ劣化し、安全な
+    bounded retry が行われない。登録先は **共有 partition**
+    `injection_stage.PRE_INJECTION_BLOCKED_REASONS` (Redmine #14232) と
+    `sublane_worker_dispatch.SEND_KNOWN_NOT_SENT_REASONS` の双方。
+    `callback_delivery._NOT_SENT_BLOCKED_REASONS` は #14232 以降その共有 partition の
+    alias であり **private table ではない** — callback 側に reason を再列挙しない。
+    共有 partition は wire `Reason` 全体に対する網羅性を drift-guard test で検査する
+    ため、新 reason を既定 bucket へ取りこぼせない。
+    **この失敗に `target_repo_mismatch` を使ってはならない** (review j#94499
+    finding 1)。同 reason の narrative / next_action は「観測された target pane の
+    repo root が asserted 値と不一致」「flag を外して repo gate を skip」を述べるが、
+    herdr auto は pane cwd を観測しておらず (比較対象が存在しない)、かつ flag を
+    外すと relative workdir が sender cwd 基準に戻り、本節が禁じた状態そのものに
+    なる。**reason を再利用することは、その narrative / next_action を継承すること
+    である** — token の抽象的な近さではなく、sender に渡る repair が正しいかで選ぶ。
+  herdr の synthesized target record の `cwd` も、この解決済み root で re-state
+  する。そうしないと下流の `target_repo_mismatch` gate が「検証済み target root」対
+  「sender root」を比較し、正しくなった send を構造的に落とす。
 - **asserted `--target-repo` 配下に無い execution root は pre-send で
   zero-send 拒否する** (Redmine #14249)。repo_root と workdir が互いに矛盾した
   delivery — receiver は gate を通された repo とは別の root を指される — を

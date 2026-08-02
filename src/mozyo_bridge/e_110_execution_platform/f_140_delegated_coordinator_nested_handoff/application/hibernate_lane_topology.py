@@ -132,21 +132,33 @@ def observe_branch_origin_head(cwd: Path, branch: str) -> str:
     return sha if _full_sha(sha) else ""
 
 
-def observe_lane_topology(
+def bind_lane_worktree(
     repo_root: Path, rows, *, workspace: str, lane: str, generation: int
-) -> Optional[LaneTopologyObservation]:
-    """The lane's single typed topology observation from FRESH Git facts, or ``None``.
+) -> "Optional[tuple[Path, str]]":
+    """The lane's canonical worktree + its ``branch`` ref line, from LOCAL Git facts only.
 
     Review j#86739 R3-F2: ``lane_label`` and ``branch`` are INDEPENDENT caller-supplied fields
     of the public create contract, so the lane id is never inferred to be the branch. The join
     key is the lifecycle row's authoritative ``worktree_identity`` token alone: among the
     workspace repo's own ``git worktree list --porcelain`` entries, exactly one path must
-    RE-DERIVE that token, and the branch is THAT entry's current Git fact — a detached HEAD,
-    a missing row/token, a pruned path, or a non-unique match resolves nothing.
+    RE-DERIVE that token — a missing row/token, a pruned path, or a non-unique match binds
+    nothing.
 
-    Review j#86757 R4-F1: the observation also captures the worktree's local ``HEAD`` (required,
-    fail-closed) and the branch's origin head (best-effort, ``""`` when unobservable), so pushed
-    means ``local HEAD == origin head`` — never the mere existence of an origin ref.
+    **The binding is path identity only; it does NOT imply branch authority.** A DETACHED
+    worktree binds successfully and returns ``branch_ref == ""`` (a non-``refs/heads`` ref line
+    is the same case). This is deliberate: the token proves which path is the lane's worktree
+    regardless of what is checked out there. A caller that needs the branch — a push / HEAD
+    topology observation — must check ``branch_ref`` itself and fail closed, exactly as
+    :func:`observe_lane_topology` does below; a caller that only needs the lane's ROOT (the
+    handoff rail's ``--target-repo auto``) correctly ignores it. Review j#94499 finding 2 is
+    what makes this explicit: the split left the fence in one caller, and the other caller's
+    record claimed a refusal that its code never performed.
+
+    Split out of :func:`observe_lane_topology` (Redmine #14249 R2) so the handoff rail's
+    ``--target-repo auto`` resolution can ask the SAME question — "which worktree is this
+    lane's?" — without the topology observation's ``git ls-remote``: a send must not make a
+    network round trip, and writing the join a second time is exactly the drift this repo has
+    already paid for three times (review j#88526 F2). One join, two callers.
     """
     row = next(
         (
@@ -191,7 +203,28 @@ def observe_lane_topology(
             matches.append((resolved, branch_ref))
     if len(matches) != 1:
         return None
-    resolved, branch_ref = matches[0]
+    return matches[0]
+
+
+def observe_lane_topology(
+    repo_root: Path, rows, *, workspace: str, lane: str, generation: int
+) -> Optional[LaneTopologyObservation]:
+    """The lane's single typed topology observation from FRESH Git facts, or ``None``.
+
+    The worktree binding is :func:`bind_lane_worktree` (the token join; the lane id is never
+    inferred to be the branch), and the branch is THAT entry's current Git fact — a detached
+    HEAD, a missing row/token, a pruned path, or a non-unique match observes nothing.
+
+    Review j#86757 R4-F1: the observation also captures the worktree's local ``HEAD`` (required,
+    fail-closed) and the branch's origin head (best-effort, ``""`` when unobservable), so pushed
+    means ``local HEAD == origin head`` — never the mere existence of an origin ref.
+    """
+    bound = bind_lane_worktree(
+        repo_root, rows, workspace=workspace, lane=lane, generation=generation
+    )
+    if bound is None:
+        return None
+    resolved, branch_ref = bound
     prefix = "refs/heads/"
     if not branch_ref.startswith(prefix):
         return None  # detached HEAD carries no branch authority (fail-closed)
@@ -280,6 +313,7 @@ def observe_worktree_clean(worktree: Optional[Path]) -> Optional[bool]:
 
 __all__ = [
     "LaneTopologyObservation",
+    "bind_lane_worktree",
     "committed_config_policy_pointer",
     "observe_worktree_head",
     "observe_branch_origin_head",

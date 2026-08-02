@@ -37,6 +37,9 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mozyo_bridge.core.state.lane_release_observation import (  # noqa: E402
+    build_release_observation,
+)
 from mozyo_bridge.core.state.lane_active_retire import LaneActiveRetireStore
 from mozyo_bridge.core.state.lane_bound_retire import LaneBoundRetireStore
 from mozyo_bridge.core.state.lane_declaration import LaneDeclarationStore
@@ -125,10 +128,10 @@ def _seed_active_bound(
         key,
         expected_revision=rec.revision,
         action_id="rel-1",
-        pins=[
+        observation=build_release_observation([
             ReleasePin("gateway", "codex-mzb1", "w2X:p3Q"),
             ReleasePin("worker", "claude-mzb1", "w2X:p3R"),
-        ],
+        ]),
     )
     if release_target == RELEASE_REQUESTED:
         return
@@ -290,7 +293,7 @@ class ActiveRetireCasMatrix(unittest.TestCase):
             _key(),
             expected_revision=rec.revision,
             action_id="rel-1",
-            pins=[ReleasePin("gateway", "codex-mzb1", "w2X:p3Q")],
+            observation=build_release_observation([ReleasePin("gateway", "codex-mzb1", "w2X:p3Q")]),
         )
         self.assertFalse(out.applied)
         self.assertEqual(
@@ -354,7 +357,7 @@ class ActiveRetireCasMatrix(unittest.TestCase):
         rec = lifecycle.get(_key())
         req = lifecycle.request_release(
             _key(), expected_revision=rec.revision, action_id="rel-1",
-            pins=[ReleasePin("gateway", "codex-mzb1", "w2X:p3Q")],
+            observation=build_release_observation([ReleasePin("gateway", "codex-mzb1", "w2X:p3Q")]),
         )
         self.assertFalse(req.applied)
         rec = lifecycle.get(_key())
@@ -783,7 +786,7 @@ class ActiveRetireDoesNotErodeSiblings(unittest.TestCase):
             key=_key() if False else _key(),
             expected_revision=rec.revision,
             action_id="rel-1",
-            pins=[ReleasePin("gateway", "codex-mzb1", "w2X:p3Q")],
+            observation=build_release_observation([ReleasePin("gateway", "codex-mzb1", "w2X:p3Q")]),
         )
         rec = lifecycle.get(_key())
         lifecycle.record_release_outcome(

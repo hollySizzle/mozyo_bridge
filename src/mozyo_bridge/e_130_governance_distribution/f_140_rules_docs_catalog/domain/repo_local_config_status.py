@@ -72,6 +72,7 @@ ACTIONS: frozenset[str] = frozenset(
 CONFIG_BLOCK_KEYS: tuple[str, ...] = (
     "work_unit",
     "sublane_integration",
+    "auto_integration",
     "terminal_transport",
     "presentation",
     "agents",
@@ -161,6 +162,18 @@ CONFIG_LEAF_KEYS: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = (
         "sublane_integration.manage_worktree",
         (("sublane_integration", "manage_worktree"),),
     ),
+    # The #13686 actuator leaves. Every one of them decides whether a real side effect —
+    # a push to an integration branch — is attempted, so
+    # an operator must be able to read what a workspace actually resolved to rather than
+    # infer it from an absent block. `mode` matters most: it is what turns the actuator on
+    # at all. The CI gates are deliberately absent: they are unconditional in the state
+    # machine (#13686 j#96350 finding 1), so there is no declaration to classify.
+    ("auto_integration.mode", (("auto_integration", "mode"),)),
+    (
+        "auto_integration.integration_branch",
+        (("auto_integration", "integration_branch"),),
+    ),
+    ("auto_integration.ff_only", (("auto_integration", "ff_only"),)),
     ("terminal_transport.backend", (("terminal_transport", "backend"),)),
     ("presentation.surface", (("presentation", "surface"),)),
     (

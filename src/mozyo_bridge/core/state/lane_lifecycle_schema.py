@@ -73,11 +73,25 @@ LANE_LIFECYCLE_COMPONENT = "lane_lifecycle"
 #: overwrite. A pre-v7 row migrates with an empty ``lane_kind`` (no durable kind fact → the
 #: launch path falls back to ``lane_class`` geometry, the issue's close condition), never a
 #: guessed value.
-LANE_LIFECYCLE_SCHEMA_VERSION = 7
-#: The component shapes this build can read and write. ``1``–``6`` are migrated
-#: additively to ``7``; anything else — a newer version from a future build, or a foreign
+#: v8 (Redmine #14477) adds ``hibernated_at`` — the IMMUTABLE hibernate-transition boundary
+#: the resume freshness proof (#13682) compares self-attestations against. It is written by
+#: exactly one event (the disposition CAS INTO ``hibernated``) and by no metadata write, so a
+#: revision / decision / declared-pin repair can no longer push the boundary past the
+#: attestation of the very pair it just verified (#14476 j#88614-j#88618). A pre-v8 row
+#: migrates with an EMPTY anchor and is NOT given a substitute boundary: the freshness proof
+#: reports it as unavailable and the caller fails closed (review j#94515 / verdict j#94520
+#: measured a survivor being admitted when ``updated_at`` was substituted). Semantics and the
+#: reason no safe substitute exists: :mod:`...lane_hibernation_anchor`.
+#: v9 (Redmine #14477 disposition j#94582) adds ``release_observation`` — the IMMUTABLE snapshot
+#: of the live slots the release driver enumerated. ``''`` means ABSENT (legacy / never recorded)
+#: and is distinct from a recorded COMPLETE-EMPTY observation; resume fails closed on the former
+#: and may accept the latter as positive "no process was live" evidence. Semantics, envelope and
+#: the writer/read matching contract: :mod:`...lane_release_observation`.
+LANE_LIFECYCLE_SCHEMA_VERSION = 9
+#: The component shapes this build can read and write. ``1``–``8`` are migrated
+#: additively to ``9``; anything else — a newer version from a future build, or a foreign
 #: value — fails closed and the store is left untouched (R3-F1).
-_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7})
+_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9})
 #: A coordinator decision that cannot be rebuilt from events; loss requires an
 #: explicit re-declare from the Redmine durable pointer.
 LANE_LIFECYCLE_RECOVERY_POLICY = "operator_current_state"
@@ -123,6 +137,8 @@ CREATE TABLE IF NOT EXISTS {_TABLE} (
     declared_slots TEXT NOT NULL DEFAULT '',
     reconcile_phase TEXT NOT NULL DEFAULT '',
     lane_kind TEXT NOT NULL DEFAULT '',
+    hibernated_at TEXT NOT NULL DEFAULT '',
+    release_observation TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (repo_workspace_id, lane_id)
 )
 """
@@ -158,91 +174,15 @@ _COLUMNS = (
     "replacement_action_id, replacement_pins, decision_source, "
     "decision_issue_id, decision_journal, created_at, updated_at, worktree_identity, "
     "binding_kind, project_scope, lane_generation, declared_slots, reconcile_phase, "
-    "lane_kind"
+    "lane_kind, hibernated_at, release_observation"
 )
 
-_V1_COLUMNS = frozenset(
-    {
-        "repo_workspace_id",
-        "lane_id",
-        "issue_id",
-        "lane_disposition",
-        "process_release",
-        "revision",
-        "release_action_id",
-        "release_pins",
-        "decision_source",
-        "decision_journal",
-        "created_at",
-        "updated_at",
-    }
+# The exact per-version shape / column-definition tables live in their own leaf so this
+# module stays under the module-health threshold (a pure move, #14477 j#94582).
+from mozyo_bridge.core.state.lane_lifecycle_shapes import (  # noqa: E402
+    _ALLOWED_SHAPES_BY_VERSION,
+    _COLUMN_DEFS,
 )
-_V2_ADDS = frozenset({"decision_issue_id"})  # R2-F1: split the decision anchor's issue
-_V3_ADDS = frozenset(
-    {"replacement_state", "replacement_action_id", "replacement_pins"}  # #13763
-)
-_V4_ADDS = frozenset({"worktree_identity"})  # #13754 worktree binding
-_V5_ADDS = frozenset(
-    {"binding_kind", "project_scope", "lane_generation", "declared_slots"}  # #13810
-)
-_V6_ADDS = frozenset({"reconcile_phase"})  # #13842 reconcile owed-close provenance
-_V7_ADDS = frozenset({"lane_kind"})  # #13647 generation-bound lane-role heal authority
-
-#: The EXACT allowed column-name signatures per recorded version (Redmine #13754 R6-F1,
-#: j#78803). A recognized store must match one of its version's signatures EXACTLY (set
-#: equality — no unknown extra columns, no missing columns), or it is a partial /
-#: incompatible authority shape and fails closed (never silently re-created, migrated, or
-#: re-stamped). v3 is the collision point where TWO branches legitimately exist — the
-#: staging replacement-v3 and the already-live #13754 worktree-v3 — so v3 allows exactly
-#: those two shapes and NOTHING ELSE (a pure-v2 shape recorded v3 is NOT a known v3).
-_SHAPE_V1 = _V1_COLUMNS
-_SHAPE_V2 = _V1_COLUMNS | _V2_ADDS
-_SHAPE_V3_REPLACEMENT = _V1_COLUMNS | _V2_ADDS | _V3_ADDS
-_SHAPE_V3_WORKTREE = _V1_COLUMNS | _V2_ADDS | _V4_ADDS
-_SHAPE_V4 = _V1_COLUMNS | _V2_ADDS | _V3_ADDS | _V4_ADDS
-_SHAPE_V5 = _V1_COLUMNS | _V2_ADDS | _V3_ADDS | _V4_ADDS | _V5_ADDS
-_SHAPE_V6 = _V1_COLUMNS | _V2_ADDS | _V3_ADDS | _V4_ADDS | _V5_ADDS | _V6_ADDS
-_SHAPE_V7 = _SHAPE_V6 | _V7_ADDS
-_ALLOWED_SHAPES_BY_VERSION: dict[int, tuple[frozenset, ...]] = {
-    1: (_SHAPE_V1,),
-    2: (_SHAPE_V2,),
-    3: (_SHAPE_V3_REPLACEMENT, _SHAPE_V3_WORKTREE),
-    4: (_SHAPE_V4,),
-    5: (_SHAPE_V5,),
-    6: (_SHAPE_V6,),
-    7: (_SHAPE_V7,),
-}
-
-#: The authority-affecting definition each column MUST carry: ``(type, notnull, default,
-#: pk_order)`` as ``PRAGMA table_info`` reports it. A same-named but re-typed / nullable /
-#: default-changed / PK-shifted column is NOT the current column — it fails closed rather
-#: than being read as authoritative (R6-F1). ``pk_order`` is the 1-based composite-PK
-#: position (0 for a non-PK column); ``default`` is the SQL literal ``table_info`` returns.
-_COLUMN_DEFS: dict[str, tuple[str, int, Optional[str], int]] = {
-    "repo_workspace_id": ("TEXT", 1, None, 1),
-    "lane_id": ("TEXT", 1, None, 2),
-    "issue_id": ("TEXT", 1, "''", 0),
-    "lane_disposition": ("TEXT", 1, None, 0),
-    "process_release": ("TEXT", 1, None, 0),
-    "revision": ("INTEGER", 1, None, 0),
-    "release_action_id": ("TEXT", 1, "''", 0),
-    "release_pins": ("TEXT", 1, "''", 0),
-    "replacement_state": ("TEXT", 1, "'not_requested'", 0),
-    "replacement_action_id": ("TEXT", 1, "''", 0),
-    "replacement_pins": ("TEXT", 1, "''", 0),
-    "decision_source": ("TEXT", 1, "''", 0),
-    "decision_issue_id": ("TEXT", 1, "''", 0),
-    "decision_journal": ("TEXT", 1, "''", 0),
-    "created_at": ("TEXT", 1, None, 0),
-    "updated_at": ("TEXT", 1, None, 0),
-    "worktree_identity": ("TEXT", 1, "''", 0),
-    "binding_kind": ("TEXT", 1, "'issue'", 0),
-    "project_scope": ("TEXT", 1, "''", 0),
-    "lane_generation": ("INTEGER", 1, "1", 0),
-    "declared_slots": ("TEXT", 1, "''", 0),
-    "reconcile_phase": ("TEXT", 1, "''", 0),
-    "lane_kind": ("TEXT", 1, "''", 0),
-}
 
 
 class LaneLifecycleError(RuntimeError):
@@ -613,7 +553,7 @@ def readonly_compatible_select(conn: sqlite3.Connection) -> Optional[str]:
     The read half of the read-compatible / write-migrating split (Redmine #13844). Given a
     store whose recorded component version this build recognizes AND whose live table shape
     EXACTLY matches one of that version's known signatures (:func:`_schema_signature_matches`),
-    returns a ``SELECT`` column expression that yields the full current (v6) column vocabulary
+    returns a ``SELECT`` column expression that yields the full current column vocabulary
     in :data:`COLUMNS` order — projecting the columns the store's older shape lacks as their
     **migration-default literal** (``'' AS reconcile_phase`` for a v5 store, and so on). The
     caller then decodes each row exactly as a native current row, WITHOUT altering the DB
@@ -910,6 +850,27 @@ def ensure_lane_lifecycle_schema(path: Path) -> LifecycleSchemaOutcome:
                 conn.execute(
                     f"ALTER TABLE {_TABLE} "
                     "ADD COLUMN lane_kind TEXT NOT NULL DEFAULT ''"
+                )
+            # v8 (Redmine #14477): the immutable hibernate-transition freshness boundary. A
+            # pre-v8 row lands EMPTY — the boundary of a hibernation this build never observed
+            # is not reconstructible — and the resume reader reports it as UNAVAILABLE rather
+            # than substituting another column (review j#94515: substituting ``updated_at``
+            # admitted a real survivor). Never back-filled from ``updated_at`` here either:
+            # that would freeze one metadata write's stamp INTO the immutable column and make
+            # the very false ``stale_generation`` this version exists to remove permanent.
+            if "hibernated_at" not in current_columns:
+                conn.execute(
+                    f"ALTER TABLE {_TABLE} "
+                    "ADD COLUMN hibernated_at TEXT NOT NULL DEFAULT ''"
+                )
+            # v9 (Redmine #14477 j#94582): the immutable release-observation snapshot. A
+            # pre-v9 row lands EMPTY = ABSENT (never recorded), which resume treats as no
+            # freshness proof and fails closed on. Never back-filled from ``release_pins``:
+            # those pins are exactly the caller-supplied value this version stops trusting.
+            if "release_observation" not in current_columns:
+                conn.execute(
+                    f"ALTER TABLE {_TABLE} "
+                    "ADD COLUMN release_observation TEXT NOT NULL DEFAULT ''"
                 )
             conn.execute(_OWNER_INDEX_SQL)
             conn.execute(_PROJECT_OWNER_INDEX_SQL)

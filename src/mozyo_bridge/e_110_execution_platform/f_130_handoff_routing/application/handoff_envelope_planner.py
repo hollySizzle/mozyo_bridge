@@ -432,9 +432,11 @@ class HandoffEnvelopePlanner:
         execution_root = None
         if inp.workdir:
             # The repo anchor is resolved FIRST, because it is also the base a relative
-            # `--workdir` resolves against (#14249). An explicit `--target-repo` (or the
-            # `auto` sentinel already resolved to a concrete root by the target-resolution
-            # tranche) is an ASSERTION about the receiver's repo root, gated by
+            # `--workdir` resolves against (#14249). An explicit `--target-repo` — or the
+            # `auto` sentinel, which the target-resolution slice resolves to the TARGET's
+            # own concrete root or refuses (#14249 R2; R1 assumed that here and j#94419
+            # measured the herdr `auto` path arriving with the SENDER's root instead) — is
+            # an ASSERTION about the receiver's repo root, gated by
             # `target_repo_mismatch`; when it is present the receiver's frame — not the
             # sender's cwd — is the meaningful base.
             repo_anchor_abs: str | None

@@ -36,13 +36,13 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketle
 # small f_130 sibling so this oversized module does not grow inline prose for the
 # new reason (the policy is in the f_140 enforcement module, uncyclable from here).
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_route_wording import (
-    EXECUTION_ROOT_OUTSIDE_TARGET_REPO_NARRATIVE,
-    EXECUTION_ROOT_OUTSIDE_TARGET_REPO_NEXT_ACTION,
-    GATEWAY_ROUTE_BLOCKED_NARRATIVE,
-    GATEWAY_ROUTE_BLOCKED_NEXT_ACTION,
-    READER_UPGRADE_REQUIRED_NARRATIVE,
-    READER_UPGRADE_REQUIRED_NEXT_ACTION,
+    EXECUTION_ROOT_FENCE_NARRATIVE, EXECUTION_ROOT_FENCE_NEXT_ACTION, execution_root_fence_next_action, auto_target_repo_lines,  # noqa: E501 - Redmine #14249 execution-root fence family, folded to hold this module's line baseline
+    GATEWAY_ROUTE_BLOCKED_NARRATIVE, GATEWAY_ROUTE_BLOCKED_NEXT_ACTION,
+    READER_UPGRADE_REQUIRED_NARRATIVE, READER_UPGRADE_REQUIRED_NEXT_ACTION,
 )
+# Redmine #14232: the ONE injection-stage authority + the transport-failure family's wording
+# (see that module's `## Reason wording owned here` note). It imports nothing from here.
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import INJECT_FAILED_NARRATIVE, INJECT_FAILED_NEXT_ACTION, TRANSPORT_ERROR_NARRATIVE, TRANSPORT_ERROR_NEXT_ACTION, TRANSPORT_ERROR_RECEIVER_CONTRACT, injection_stage_telemetry  # noqa: E501
 
 if TYPE_CHECKING:
     from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import RoleProfileResolution
@@ -716,11 +716,12 @@ Reason = Literal[
     # — kept apart from the generic `gateway_route_blocked` (an unreadable/corrupt store) so
     # the operator is told the reader is stale, not that the route is wrong.
     "reader_upgrade_required",
-    # Redmine #14249: an asserted `--target-repo` and the resolved `--workdir` contradict
-    # each other, so the delivery would name a root OUTSIDE the lane the receiver was gated
-    # into. Refused pre-send (zero bytes typed). Distinct from `target_repo_mismatch` (there
-    # the target PANE failed the repo gate; here it passed and the sender's flags disagree).
+    # Redmine #14249 pre-send refusals, NOT `target_repo_mismatch`: `gateway_route_wording`.
     "execution_root_outside_target_repo",
+    "auto_target_repo_unresolved",
+    # Redmine #14232: a terminal-transport primitive raised at or after the single body
+    # injection (rationale, classification, and the pre-#14232 defect: `injection_stage`).
+    "transport_error",
 ]
 NextActionOwner = Literal["receiver", "sender", "operator"]
 
@@ -855,6 +856,10 @@ class DeliveryOutcome:
     # it was still starting up" from every other blocked reason, WITHOUT reading a
     # transcript. `None` for every admitted send and every non-herdr path.
     startup_admission: Optional[dict[str, Any]] = None
+    auto_target_repo: Optional[dict[str, Any]] = None  # #14249: refusal subreason
+    # Redmine #14232: the injection-stage projection, derived unconditionally by
+    # `make_outcome` so EVERY outcome carries it (contract / rationale: `injection_stage`).
+    injection_stage: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1007,6 +1012,7 @@ def next_action_for(
     receiver: str,
     *,
     turn_start_outcome: Optional[str] = None,
+    auto_target_repo: Optional[dict[str, Any]] = None,
 ) -> tuple[NextActionOwner, str]:
     """Return the canonical owner/action phrase for an outcome.
 
@@ -1150,17 +1156,11 @@ def next_action_for(
             ),
         )
     if reason == "inject_failed":
-        # Redmine #13255: a herdr transport primitive (send_text / send_keys) failed
-        # mid-injection; the armed wait was cancelled and the send fails closed.
-        return (
-            "sender",
-            (
-                "the herdr transport failed to inject the notification (a "
-                "send_text / send_keys primitive returned an error); the armed wait "
-                "was cancelled and nothing was confirmed delivered. Check the herdr "
-                f"binary / session for {receiver}, then re-issue the send."
-            ),
-        )
+        # Redmine #13255; wording relocated to the `injection_stage` transport-failure family
+        # by #14232 (same reason as the `gateway_route_wording` sibling: module health).
+        return "sender", INJECT_FAILED_NEXT_ACTION.format(receiver=receiver)
+    if reason == "transport_error":
+        return "sender", TRANSPORT_ERROR_NEXT_ACTION  # Redmine #14232
     if reason == "target_unavailable":
         return (
             "sender",
@@ -1200,9 +1200,8 @@ def next_action_for(
                 "target whose cwd lives under the expected repo."
             ),
         )
-    if reason == "execution_root_outside_target_repo":
-        # Redmine #14249: `--target-repo` and `--workdir` disagree; nothing was typed.
-        return "sender", EXECUTION_ROOT_OUTSIDE_TARGET_REPO_NEXT_ACTION
+    if reason in EXECUTION_ROOT_FENCE_NEXT_ACTION:
+        return "sender", execution_root_fence_next_action(reason, auto_target_repo)
     if reason == "gateway_route_blocked":
         # Redmine #12918: governed delivery to a cross-lane Claude worker, blocked.
         # Wording lives in the f_130 sibling `gateway_route_wording` (the policy is
@@ -1621,11 +1620,9 @@ def _outcome_narrative(
             "rail fails closed rather than injecting."
         )
     if reason == "inject_failed":
-        return (
-            "herdr turn-start rail (--mode standard): a transport primitive "
-            "(send_text / send_keys) failed mid-injection; the armed wait was "
-            "cancelled and the send fails closed. Nothing was confirmed delivered."
-        )
+        return INJECT_FAILED_NARRATIVE  # relocated by #14232 (module health)
+    if reason == "transport_error":
+        return TRANSPORT_ERROR_NARRATIVE
     if reason == "target_unavailable":
         return (
             "Receiver pane could not be resolved; no notification was typed."
@@ -1661,8 +1658,8 @@ def _outcome_narrative(
             "Target pane's inferred repo root does not match `--target-repo`; "
             "handoff aborted before typing. No notification was typed."
         )
-    if reason == "execution_root_outside_target_repo":
-        return EXECUTION_ROOT_OUTSIDE_TARGET_REPO_NARRATIVE
+    if reason in EXECUTION_ROOT_FENCE_NARRATIVE:
+        return EXECUTION_ROOT_FENCE_NARRATIVE[reason]
     if reason == "gateway_route_blocked":
         return GATEWAY_ROUTE_BLOCKED_NARRATIVE
     if reason == "reader_upgrade_required":
@@ -1724,6 +1721,8 @@ def _receiver_contract_line(
             "the receiver's own UI; the same durable anchor is then re-sent by the "
             "sender and delivers exactly once."
         )
+    if reason == "transport_error":  # Redmine #14232
+        return TRANSPORT_ERROR_RECEIVER_CONTRACT.format(receiver=receiver)
     if reason in (
         "receiver_blocked",
         "turn_start_absent",
@@ -1919,6 +1918,7 @@ def build_delivery_record(
         *ticketless_callback_lines(outcome.ticketless_callback),
         *ticketless_consultation_lines(outcome.ticketless_consultation),
         *ticketless_work_intake_lines(outcome.ticketless_work_intake),
+        *auto_target_repo_lines(outcome.auto_target_repo),
         f"- Status: `{outcome.status}` (reason: `{outcome.reason}`)",
         f"- Outcome: {_outcome_narrative(outcome.status, outcome.reason, outcome.mode, outcome.receiver, turn_start_outcome=_herdr_turn_start_token(outcome.turn_start_outcome))}",
         f"- Next action owner: `{outcome.next_action_owner}` — {outcome.next_action}",
@@ -2103,6 +2103,7 @@ def make_outcome(
     turn_start_outcome: Optional[dict[str, Any]] = None,
     queue_enter_turn_start_observation: Optional[dict[str, Any]] = None,
     startup_admission: Optional[dict[str, Any]] = None,
+    auto_target_repo: Optional[dict[str, Any]] = None,
 ) -> DeliveryOutcome:
     # `source` is part of the structured outcome contract and must survive
     # anchor-normalization failure paths. When the anchor was successfully
@@ -2116,6 +2117,7 @@ def make_outcome(
         reason,
         receiver,
         turn_start_outcome=_herdr_turn_start_token(turn_start_outcome),
+        auto_target_repo=auto_target_repo,
     )
     return DeliveryOutcome(
         status=status,
@@ -2153,6 +2155,8 @@ def make_outcome(
         turn_start_outcome=turn_start_outcome,
         queue_enter_turn_start_observation=queue_enter_turn_start_observation,
         startup_admission=startup_admission,
+        auto_target_repo=auto_target_repo,
+        injection_stage=injection_stage_telemetry(status, reason, mode=mode, queue_enter_turn_start_observation=queue_enter_turn_start_observation, turn_start_outcome=turn_start_outcome),  # noqa: E501 - Redmine #14232 + review j#95333 F1: the ONE full-context classification (the mode and both turn-start telemetries resolve the queue-enter `ok` cell)
     )
 
 

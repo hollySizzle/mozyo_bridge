@@ -39,6 +39,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_integration_disposition import (
     IntegrationDispositionFacts,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_execution_surface import (
+    SURFACE_DETACHED_WORKTREE,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
+    SUBLANE_STATE_DETACHED,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_journal_grammar import (
     fold_issue_gate_facts,
     lane_signal_from_gate_facts,
@@ -538,12 +544,23 @@ def _fold_active_roster(views, *, workspace_id) -> tuple:
     also excludes a lane the lifecycle authority marks non-active — a superseded / hibernated /
     retired lane still holding live panes would otherwise consume capacity in the window between
     the disposition write and the process release. Join the lifecycle records by the lane's
-    ``(workspace_id, lane_id)`` unit; a lane with disposition ``active``, no lifecycle row
-    (owner-unbound), or an unreadable lifecycle store stays in the roster (over-counting capacity
-    is the conservative direction — it never over-dispatches).
+    ``(workspace_id, lane_id)`` unit; a lane with disposition ``active`` or an unreadable
+    lifecycle store stays in the roster (over-counting capacity is the conservative direction —
+    it never over-dispatches).
+
+    Redmine #14813: a lane with **no lifecycle row** is split by whether it holds slots
+    (:func:`_view_holds_slots`). The pre-#14813 fold kept every such lane, so inventory residue
+    entered the roster, resolved to ``execution_surface=unknown``, and stopped the pipeline on
+    ``stop_unverified_surface`` (32 rows / 25 closed / 19 unknown, j#96022). Residue has nothing
+    running, so it leaves capacity — but is returned as a typed diagnostic, not dropped.
+
+    A row with no lifecycle row **but** slot evidence is an unverified *live* claim and stays,
+    so it still fails closed. The split is on residency, never on the issue's Redmine state: a
+    closed issue whose pair runs keeps consuming capacity. Returns ``(roster, residue)``.
     """
     disposition_by_unit = _lifecycle_disposition_by_unit()
     roster = []
+    residue = []
     for view in views:
         issue = str(getattr(view, "issue", "") or "").strip()
         lane = str(getattr(view, "lane_label", "") or getattr(view, "lane_id", "") or "").strip()
@@ -559,9 +576,44 @@ def _fold_active_roster(views, *, workspace_id) -> tuple:
             # Non-active disposition: excluded from active capacity (kept on the
             # lifecycle diagnostic roster below).
             continue
+        if disposition is None and not _view_holds_slots(view):
+            # Redmine #14813: owner-unbound AND holding nothing — inventory residue, not
+            # capacity. Kept as a diagnostic so a detached worktree never silently vanishes.
+            if issue or lane:
+                residue.append((issue, lane, SURFACE_DETACHED_WORKTREE))
+            continue
         if issue:
             roster.append((issue, lane))
-    return tuple(roster)
+    return tuple(roster), tuple(residue)
+
+
+def _view_holds_slots(view) -> bool:
+    """Does ``view`` carry evidence that it currently occupies runtime slots? (pure)
+
+    Residue only when ``state`` says ``detached`` AND no pane evidence is present.
+
+    These are **not independent signals** — herdr computes ``state`` from the same slots
+    (``_lane_state(entry.gateway, entry.worker, ...)``), so there they agree by construction
+    (#14813 j#96246; an earlier revision claimed independence, which was wrong). The
+    conjunction buys a conservative default for everything else: a view whose ``state`` is
+    absent, unrecognized, or derived differently by another backend stays in the roster rather
+    than being demoted on pane fields alone — which is what
+    ``test_no_lifecycle_rows_keeps_every_live_lane`` pins, and what a panes-only predicate
+    broke. So #13681's direction holds: residue leaves capacity only for the exact shape
+    j#96022 measured (``state=detached`` *and* no gateway/worker pane and no panes).
+
+    Reached only for rows the lifecycle store does not know at all; a lifecycle-known lane is
+    decided by its disposition first.
+    """
+    for attr in ("gateway_pane", "worker_pane"):
+        if str(getattr(view, attr, "") or "").strip():
+            return True
+    if tuple(getattr(view, "panes", ()) or ()):
+        return True
+    # No pane evidence. Only a view the read model itself calls `detached` is residue; any
+    # other state (including an absent / unrecognized one) stays in the roster.
+    state = str(getattr(view, "state", "") or "").strip()
+    return state != SUBLANE_STATE_DETACHED
 
 
 def enumerate_active_lanes(repo_root) -> tuple:
@@ -585,7 +637,7 @@ def enumerate_active_lanes(repo_root) -> tuple:
         views = _active_lane_views(repo_root)
     except Exception as exc:  # noqa: BLE001 - a roster read never raises out of the glance
         return (), f"active-lane roster enumeration failed ({type(exc).__name__})"
-    return _fold_active_roster(views, workspace_id=None), None
+    return _fold_active_roster(views, workspace_id=None)[0], None
 
 
 def enumerate_active_lanes_for_workspace(repo_root, *, workspace_id: str) -> tuple:
@@ -607,7 +659,42 @@ def enumerate_active_lanes_for_workspace(repo_root, *, workspace_id: str) -> tup
         views = _active_lane_views(repo_root)
     except Exception as exc:  # noqa: BLE001 - a roster read never raises out of the supervisor
         return (), f"active-lane roster enumeration failed ({type(exc).__name__})"
-    return _fold_active_roster(views, workspace_id=wanted), None
+    return _fold_active_roster(views, workspace_id=wanted)[0], None
+
+
+def enumerate_active_lanes_for_repo(repo_root) -> tuple:
+    """The roster for THIS repo's workspace: ``(roster, error)``.
+
+    The operator-facing entry point. :func:`enumerate_active_lanes` stays host-global by
+    contract (the coordinator cockpit view), but a repo's ``workflow glance`` asks "what is
+    active *here*" — another workspace's lane is not this repo's capacity (#14813 R1-F1: a
+    foreign live lane leaked into the CLI rows because the CLI called the host-global one).
+
+    Fail-closed on an unresolved scope rather than falling back, because a silent fallback is
+    the leak. Same ``(roster, error)`` contract, so the caller reports it degraded.
+    """
+    workspace_id = _repo_scope_workspace_id(repo_root)
+    if workspace_id is None:
+        return (), "active-lane roster scope unresolved (repo workspace id unknown)"
+    return enumerate_active_lanes_for_workspace(repo_root, workspace_id=workspace_id)
+
+
+def enumerate_detached_residue_for_repo(repo_root) -> tuple:
+    """This repo's detached residue — the rows #14813 keeps OUT of capacity: ``(rows, error)``.
+
+    The other half of :func:`enumerate_active_lanes_for_repo`. Excluding residue silently would
+    be the opposite failure of counting it (a detached worktree appearing nowhere), so it is
+    reported here. Rows are ``(issue, lane_label, execution_surface)``, surface fixed to
+    ``detached_worktree``. Same scope resolution and ``(rows, error)`` contract as the roster.
+    """
+    workspace_id = _repo_scope_workspace_id(repo_root)
+    if workspace_id is None:
+        return (), "detached residue scope unresolved (repo workspace id unknown)"
+    try:
+        views = _active_lane_views(repo_root)
+    except Exception as exc:  # noqa: BLE001 - a residue read never raises out of the glance
+        return (), f"detached residue enumeration failed ({type(exc).__name__})"
+    return _fold_active_roster(views, workspace_id=workspace_id)[1], None
 
 
 #: Bound lazily so the pure glance path never imports the state layer unless a roster
@@ -790,8 +877,10 @@ def active_lane_snapshots(
 
     1. the ``redmine_source`` (when given) fetches the issue's raw journals and the
        glance-only grammar folds a workflow state from the canonical ``## Gate:`` template;
-    2. a closed Redmine issue with no recognized gate still folds to a close/retire state
-       (the closed status is a stronger durable fact than the journal fold);
+    2. a closed Redmine issue with no recognized gate keeps its observed ``issue_open=False``
+       but is **not** folded to a close/retire state — without resolved gate/commit/integration
+       facts the issue cannot be claimed safe to retire (re-audit j#74323 Finding 3), so it
+       stays a degraded unknown row that the caller partitions as closed debt (#14813);
     3. otherwise the ``store`` advisory cache supplies the gate facts;
     4. otherwise the lane is emitted degraded (``durable_facts_available=False`` ->
        ``workflow_state=unknown``), never dropped.
@@ -825,6 +914,7 @@ def active_lane_snapshots(
         # work-unit evidence, no disposition recorded).
         work_unit = ""
         integration = IntegrationDispositionFacts()
+        observed_issue_open = None
 
         if redmine_source is not None:
             record = None
@@ -834,6 +924,9 @@ def active_lane_snapshots(
                 notes.append(f"issue {issue}: Redmine source unavailable ({type(exc).__name__})")
             if record is not None:
                 subject = record.subject
+                # #14813 R2-F1: keep the observed status even when no Gate resolves; losing
+                # it here reversed a known-closed issue to open in the fallback below.
+                observed_issue_open = record.issue_open
                 facts = fold_issue_gate_facts(record.journals)
                 if facts is not None:
                     signal = lane_signal_from_gate_facts(issue, facts, issue_open=record.issue_open)
@@ -863,7 +956,12 @@ def active_lane_snapshots(
                     )
 
         if signal is None:
-            signal = LaneSignal(issue=issue)
+            # Carry the observed status; default only when never observed. Asserts nothing
+            # about retirement — gate/commit/integration stay unresolved and the row stays
+            # `degraded` (j#74323 Finding 3). It only refuses to overwrite closed with open.
+            if observed_issue_open is None:
+                observed_issue_open = True
+            signal = LaneSignal(issue=issue, issue_open=observed_issue_open)
 
         snaps.append(
             IssueGlanceSnapshot(

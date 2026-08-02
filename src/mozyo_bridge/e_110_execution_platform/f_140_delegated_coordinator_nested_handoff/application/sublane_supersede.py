@@ -59,6 +59,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_process_release import (  # noqa: E501
     ReleaseOutcome,
     drive_process_release,
+    render_release_state,
     evaluate_pair_attestation,
     pin_matched_close_plan,
 )
@@ -504,7 +505,9 @@ def format_supersede_text(outcome: SupersedeOutcome) -> str:
         )
     if outcome.release is not None:
         rel = outcome.release
-        lines.append(f"  release: {rel.process_release} ({rel.detail})")
+        lines.append(
+            f"  release: {render_release_state(rel.process_release)} ({rel.detail})"
+        )
         for role, locator in rel.closed:
             lines.append(f"    - closed {role} {locator}")
         for role, locator, detail in rel.failed:

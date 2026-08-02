@@ -13,11 +13,15 @@ conditions:
   diagnostic, and re-raises the ``SystemExit`` (the original resolver failure is unchanged);
 - **same-lane duplicate diagnostics** thread the resolved rows through onto the result under tmux,
   and are an explicit no-op (empty) under the herdr backend;
-- **``--target-repo auto``** resolves to the sender's own repo root under herdr; under tmux it
-  requires an explicit ``%pane`` (else ``blocked`` / ``invalid_args``) and a cwd that reaches a
-  workspace/repo marker (else ``blocked`` / ``target_repo_mismatch``), and on success prints the
-  audit diagnostic and hands the concrete root back; a non-auto ``--target-repo`` value passes
-  through untouched;
+- **``--target-repo auto``** resolves the TARGET agent's own repo root under herdr — re-stating the
+  synthesized record's ``cwd`` with it, and failing closed (``blocked`` /
+  ``auto_target_repo_unresolved``) rather than degrading to the sender's root (Redmine #14249 R2;
+  the reason is its OWN, not ``target_repo_mismatch``, whose durable wording asserts an observed
+  pane repo root and advises dropping the flag — review j#94499 F1); under tmux it requires an
+  explicit ``%pane`` (else ``blocked`` / ``invalid_args``) and a cwd that reaches a workspace/repo
+  marker (else ``blocked`` / ``target_repo_mismatch`` — there a pane cwd WAS observed), and on
+  success prints the audit diagnostic and hands the concrete root back; a non-auto
+  ``--target-repo`` value passes through untouched;
 - the canonical ``preflight_target`` projection is threaded onto the result.
 
 The live composition (``run_target_resolution`` over ``LiveTargetResolutionOps``, routing every
@@ -33,6 +37,12 @@ from typing import Dict, List, Optional
 
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
     PreflightTarget,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.herdr_auto_target_root import (  # noqa: E501
+    BASIS_LANE_WORKTREE,
+    BASIS_SENDER_LANE,
+    REFUSE_LANE_BINDING_ABSENT,
+    AutoTargetRoot,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_target_resolution import (
     TargetResolutionOps,
@@ -99,7 +109,12 @@ class _FakeOps:
     #: tmux resolution: the pane record, or ``None`` to raise ``SystemExit``.
     pane_info_result: Optional[Dict[str, str]] = None
     duplicate_rows: List[str] = field(default_factory=list)
-    herdr_auto_repo: str = "/repo/herdr-root"
+    #: The herdr auto resolution (#14249 R2): a verified target root, or a typed refusal.
+    herdr_auto_root: AutoTargetRoot = field(
+        default_factory=lambda: AutoTargetRoot(
+            root="/repo/lane-worktree", basis=BASIS_LANE_WORKTREE
+        )
+    )
     workspace_root: Optional[str] = "/repo/tmux-root"
     projection: PreflightTarget = field(default_factory=_preflight)
 
@@ -109,6 +124,8 @@ class _FakeOps:
     codex_diag: List[str] = field(default_factory=list)
     dup_calls: List[tuple] = field(default_factory=list)
     auto_diag: List[tuple] = field(default_factory=list)
+    herdr_auto_diag: List[tuple] = field(default_factory=list)
+    herdr_auto_calls: List[tuple] = field(default_factory=list)
     workspace_root_calls: List[str] = field(default_factory=list)
 
     def resolve_herdr_send_target(
@@ -143,9 +160,12 @@ class _FakeOps:
         self.dup_calls.append((target_info, receiver))
         return list(self.duplicate_rows)
 
-    def herdr_auto_target_repo(self, repo_root: Path) -> str:
+    def resolve_auto_target_root(
+        self, repo_root: Path, target_info: Dict[str, str]
+    ) -> AutoTargetRoot:
         self.events.append("herdr_auto")
-        return self.herdr_auto_repo
+        self.herdr_auto_calls.append((repo_root, dict(target_info)))
+        return self.herdr_auto_root
 
     def resolve_workspace_root(self, cwd: str) -> Optional[str]:
         self.events.append("workspace_root")
@@ -155,6 +175,12 @@ class _FakeOps:
     def print_auto_repo_diagnostic(self, *, target: str, cwd: str, root: str) -> None:
         self.events.append("auto_diag")
         self.auto_diag.append((target, cwd, root))
+
+    def print_herdr_auto_repo_diagnostic(
+        self, *, target: str, root: str, basis: str
+    ) -> None:
+        self.events.append("herdr_auto_diag")
+        self.herdr_auto_diag.append((target, root, basis))
 
     def project_preflight_target(self, target_info: Dict[str, str]) -> PreflightTarget:
         self.events.append("project")
@@ -303,19 +329,93 @@ class TargetRepoAutoTest(unittest.TestCase):
         self.assertNotIn("workspace_root", ops.events)
         self.assertNotIn("herdr_auto", ops.events)
 
-    def test_auto_under_herdr_resolves_to_sender_repo_root(self) -> None:
+    def test_auto_under_herdr_resolves_the_target_lane_root(self) -> None:
+        """Redmine #14249 R2: auto resolves the TARGET's frame, not the sender's."""
         ops = _FakeOps(
-            herdr_target_info={"id": "herdr:claude:live"},
-            herdr_auto_repo="/repo/herdr-root",
+            herdr_target_info={"id": "herdr:claude:live", "cwd": "/repo/sender-root"},
+            herdr_auto_root=AutoTargetRoot(
+                root="/repo/lane-worktree", basis=BASIS_LANE_WORKTREE
+            ),
         )
         result, raised = _run(
             ops, _request(herdr_send=True, resolved_target_repo=_AUTO)
         )
         self.assertIsNone(raised)
         assert result is not None
-        self.assertEqual(result.resolved_target_repo, "/repo/herdr-root")
-        self.assertIn("herdr_auto", ops.events)
+        self.assertEqual(result.resolved_target_repo, "/repo/lane-worktree")
+        # The synthesized record's `cwd` is re-stated with the verified root, so the
+        # downstream `target_repo_mismatch` gate compares like-for-like instead of
+        # gating the correct send against the sender's root (j#94419).
+        self.assertEqual(result.target_info["cwd"], "/repo/lane-worktree")
+        self.assertEqual(
+            ops.events, ["herdr_resolve", "herdr_auto", "herdr_auto_diag", "project"]
+        )
+        self.assertEqual(
+            ops.herdr_auto_diag,
+            [("herdr:claude:live", "/repo/lane-worktree", BASIS_LANE_WORKTREE)],
+        )
+        # The resolver is handed the resolved target record (its identity unit), not just the repo.
+        self.assertEqual(ops.herdr_auto_calls[0][0], Path("/repo"))
+        self.assertEqual(ops.herdr_auto_calls[0][1]["id"], "herdr:claude:live")
         self.assertNotIn("workspace_root", ops.events)
+
+    def test_auto_under_herdr_sender_lane_basis_keeps_this_checkout(self) -> None:
+        """The #13331 same-lane case still resolves — now as a verified basis."""
+        ops = _FakeOps(
+            herdr_target_info={"id": "herdr:claude:live", "cwd": ""},
+            herdr_auto_root=AutoTargetRoot(
+                root="/repo", basis=BASIS_SENDER_LANE
+            ),
+        )
+        result, raised = _run(
+            ops, _request(herdr_send=True, resolved_target_repo=_AUTO)
+        )
+        self.assertIsNone(raised)
+        assert result is not None
+        self.assertEqual(result.resolved_target_repo, "/repo")
+        self.assertEqual(result.target_info["cwd"], "/repo")
+
+    def test_auto_under_herdr_refusal_blocks_and_never_uses_the_sender_root(self) -> None:
+        """A frame that cannot be verified is zero-send, not a sender-cwd fallback."""
+        ops = _FakeOps(
+            herdr_target_info={"id": "herdr:claude:live", "cwd": "/repo/sender-root"},
+            herdr_auto_root=AutoTargetRoot(
+                reason=REFUSE_LANE_BINDING_ABSENT, detail="no lifecycle row owns lane 'x'"
+            ),
+        )
+        result, raised = _run(
+            ops, _request(herdr_send=True, resolved_target_repo=_AUTO)
+        )
+        self.assertIsNone(result)
+        self.assertIsInstance(raised, _FakeDie)
+        self.assertEqual(
+            ops.events, ["herdr_resolve", "herdr_auto", "emit", "die"]
+        )
+        self.assertEqual(ops.emitted[0].outcome.status, "blocked")
+        # Review j#94499 F1: its OWN reason, not `target_repo_mismatch` — whose durable
+        # wording asserts an observed pane repo root and offers "drop the flag".
+        self.assertEqual(
+            ops.emitted[0].outcome.reason, "auto_target_repo_unresolved"
+        )
+        self.assertEqual(ops.emitted[0].outcome.target, "herdr:claude:live")
+        self.assertEqual(ops.herdr_auto_diag, [])
+        assert isinstance(raised, _FakeDie)
+        self.assertIn(REFUSE_LANE_BINDING_ABSENT, raised.message)
+        # The terminal message is per-subreason since review j#95911 F4, but the invariant it
+        # must always carry is the same one: never recover by dropping `--target-repo`.
+        self.assertIn("Do NOT drop `--target-repo`", raised.message)
+        self.assertIn("SENDER's cwd", raised.message)
+
+    def test_tmux_auto_keeps_target_repo_mismatch(self) -> None:
+        """The new reason is herdr-only: the tmux branch DID observe a pane cwd."""
+        ops = _FakeOps(
+            pane_info_result={"id": "%14", "cwd": "/nowhere"}, workspace_root=None
+        )
+        _result, raised = _run(
+            ops, _request(herdr_send=False, resolved_target_repo=_AUTO)
+        )
+        self.assertIsInstance(raised, _FakeDie)
+        self.assertEqual(ops.emitted[0].outcome.reason, "target_repo_mismatch")
 
     def test_auto_under_tmux_non_explicit_pane_blocks_invalid_args(self) -> None:
         ops = _FakeOps(pane_info_result={"id": "w1", "cwd": "/repo/work"})

@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import sys
 import unittest
+from pathlib import Path
 
-from mozyo_bridge.core.state.lane_kind import (
+# Self-insert like every sibling in this directory: a test module has to stand on its own under
+# single-file isolated discovery, not free-ride on a `src` path some earlier-imported module
+# happened to add (review j#95727 F2, found by sweeping the whole subtree).
+ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(ROOT / "src"))
+
+from mozyo_bridge.core.state.lane_kind import (  # noqa: E402
     LANE_KIND_COORDINATOR,
     LANE_KIND_DELEGATED_COORDINATOR,
     LANE_KIND_IMPLEMENTATION,

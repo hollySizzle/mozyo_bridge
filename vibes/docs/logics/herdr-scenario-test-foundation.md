@@ -243,9 +243,17 @@ explicit_tmux_pane_target(args)` (`herdr_send_entry.py:111-132`)。`herdr_backen
 (`herdr_send_entry.py:81`)、`repo_root_from_args` = `resolve_repo_root(args.repo)`
 (`commands_common.py:25-26`)。
 
-inner send は `--target-repo auto` で `--repo` を明示しない (`herdr_auto_target_repo` =
-`repo_root_from_args`, `herdr_send_entry.py:135-148`) ので、`resolve_repo_root(None)` が
-**cwd から marker walk で root 推定**する。外部 project で config-only marker
+inner send は `--target-repo auto` で `--repo` を明示しない ので、`resolve_repo_root(None)` が
+**cwd から marker walk で root 推定**する。
+
+> **現行 (Redmine #14249 R2)**: 上段の `#13397` 分析が参照していた
+> `herdr_send_entry.herdr_auto_target_repo` (= `repo_root_from_args`、`auto` を **sender の
+> repo root** へ解決する helper) は削除済みである。`auto` の解決は
+> `f_130_handoff_routing/application/herdr_auto_target_root.py` が **target 自身の frame**
+> (sender と同一 unit ならこの checkout、同一 workspace の別 lane ならその lane の canonical
+> worktree) に対して行い、確立できなければ typed fail-closed する。本節が扱う欠陥は
+> backend 再解決 (`repo_root_from_args` による root 推定) の側であり、そこは不変なので
+> scenario 自体は有効である。外部 project で config-only marker
 (`.mozyo-bridge/config.yaml` のみ、`.git` 無し) が walk 側 root marker に不在だと
 (#13379 j#73711 が walk 側 `REPO_ROOT_MARKERS` へ追加して修正した系統の残穴)、
 child cwd から root 解決に失敗 → config load が herdr を読めず → `herdr_backend_selected`

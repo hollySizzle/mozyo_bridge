@@ -1,10 +1,11 @@
-"""Repo-local config shared helpers + launch / integration sub-records (Redmine #12189/#12604/#13155/#13425).
+"""Repo-local config shared helpers + launch / integration sub-records (Redmine #12189/#12604/#13155/#13425/#13686).
 
 Extracted from :mod:`repo_local_config` so that module stays within the module-health line
 budget (Redmine #14148 item 10 leaf split). This holds the fail-closed schema *helpers* every
 repo-local sub-record shares (:class:`RepoLocalConfigError`, the boundary-token / unknown-key
-screens, the strict version / bool checks) plus the two self-contained sub-record schemas
-(:class:`SublaneIntegrationConfig`, :class:`AgentLaunchConfig`). It imports only the launch-argv
+screens, the strict version / bool checks) plus the self-contained sub-record schemas
+(:class:`SublaneIntegrationConfig`, :class:`AutoIntegrationConfig`,
+:class:`AgentLaunchConfig`). It imports only the launch-argv
 validator sibling, so the dependency points one way (records -> agent_launch_argv); the composing
 :mod:`repo_local_config` imports back from here and re-exports for a stable public surface.
 """
@@ -44,6 +45,65 @@ SUBLANE_INTEGRATION_KEYS: frozenset[str] = frozenset(
 #: the sublane integration flow is unaffected by the defaults.
 DEFAULT_MANAGE_WORKTREE: bool = True
 DEFAULT_MERGE_ON_RETIRE: bool = True
+#: The closed set of recognized keys inside the ``auto_integration`` sub-record (Redmine
+#: #13686): the coordinator-owned gated auto-integration / retirement-cleanup knob the owner
+#: authorized in j#96335. Like its #12604 sibling it carries *operational intent only* — the
+#: gates that decide whether an integration may happen live in the pure
+#: :mod:`...domain.auto_integration_policy` / :mod:`...domain.retirement_cleanup_policy`
+#: state machines and read no field from here, so no ``config.yaml`` can admit a blocked
+#: integration or a refused delete.
+AUTO_INTEGRATION_KEYS: frozenset[str] = frozenset(
+    {
+        "version",
+        "mode",
+        "integration_branch",
+        "ff_only",
+    }
+)
+#: ``mode: auto`` advances the integration once every gate is satisfied; ``disabled``
+#: performs nothing.
+#:
+#: There is deliberately no ``coordinator_confirmed``. R3 shipped it with a confirmation
+#: resolver that had no production binding, so the mode was not live-executable and any
+#: injected resolver could vouch for a fictitious anchor (R3 review j#96368 finding 4). The
+#: reviewer's options were to wire a live resolver or stop offering the mode until one
+#: exists; the second is taken, so the value is not accepted by this schema either — a config
+#: that names it fails closed rather than selecting a mode the runtime cannot honour.
+AUTO_INTEGRATION_MODE_AUTO: str = "auto"
+AUTO_INTEGRATION_MODE_DISABLED: str = "disabled"
+AUTO_INTEGRATION_MODES: frozenset[str] = frozenset(
+    {AUTO_INTEGRATION_MODE_AUTO, AUTO_INTEGRATION_MODE_DISABLED}
+)
+#: ``disabled`` is the behavior-preserving default: before #13686 there was no
+#: auto-integration at all, so a repo that declares no ``auto_integration`` block keeps its
+#: fully manual coordinator integration. Enabling the actuator is an explicit operator act.
+DEFAULT_AUTO_INTEGRATION_MODE: str = AUTO_INTEGRATION_MODE_DISABLED
+#: Fast-forward-only is the owner's default (j#96335): the integration branch only ever
+#: advances to a commit that already contains its current head, so nothing is rewritten.
+DEFAULT_FF_ONLY: bool = True
+# There are deliberately no CI keys. R2 shipped `require_source_ci` / `require_integration_ci`
+# and review j#96350 finding 1 ruled them out: j#77124 ("integrated: origin reachability +
+# exact-SHA CI green を確定"), j#96335's own target flow, and j#96337's fail-closed list all
+# require green CI for an integration. j#96335's "branch/target CI を設定駆動" configures WHICH
+# required check is demanded, not whether one is; reading it as the latter makes that journal
+# contradict itself. Both gates are unconditional in the state machine, so a key that could
+# turn one off would be a key the runtime ignores.
+# There is deliberately no post-close cleanup key at all — no `remove_worktree`, no
+# `delete_local_branch`, no `delete_remote_branch`. R1 shipped all three steps and all three
+# were withdrawn, each for the same reason: an operation whose safety condition cannot be
+# enforced by the operation itself is not offered.
+#
+#   - remote branch delete (j#96344 finding 1): no compare-and-swap against the remote tip,
+#     and a real one needs `--force-with-lease`, a force that j#96335 prohibits;
+#   - local branch delete (j#96396 finding 1): its two conditions cannot both be enforced by
+#     one `git` invocation (measured on 2.50.1), and the two-call form was reproduced
+#     destroying a commit that landed in the window;
+#   - worktree removal (j#96401 finding 1): `git worktree remove` names its target by a path
+#     another actor can re-point between the identity probe and the removal; reproduced
+#     removing a foreign lane's checkout.
+#
+# A key that turns off a step that does not exist is a key the runtime ignores, so none is
+# offered. Whether an atomic path exists is an owner/design question (recorded on #13686).
 #: The closed set of recognized keys inside the ``agent_launch`` sub-record
 #: (Redmine #13155): the per-role / lane managed-pane launch model knob. ``version``
 #: is optional and defaults to :data:`REPO_LOCAL_CONFIG_VERSION`; ``sublane_claude_model``
@@ -304,6 +364,110 @@ class SublaneIntegrationConfig:
             merge_on_retire=merge_on_retire,
         )
 @dataclass(frozen=True)
+class AutoIntegrationConfig:
+    """The coordinator-owned gated auto-integration knob (Redmine #13686).
+
+    The typed *field contract* for the ``auto_integration`` block of
+    ``.mozyo-bridge/config.yaml``. It configures the actuator the owner authorized in
+    j#96335: the implementer's direct push to an integration branch stays prohibited, and a
+    coordinator-owned integration that has satisfied every durable gate may advance itself.
+
+    Integration fields:
+
+    - :attr:`mode` — :data:`AUTO_INTEGRATION_MODE_AUTO` or
+      :data:`AUTO_INTEGRATION_MODE_DISABLED`. The default is ``disabled``, which is
+      behavior-preserving: nothing integrated itself before #13686 either.
+    - :attr:`integration_branch` — the configured target ref. ``None`` is an UNCONFIGURED
+      target, and an unconfigured target integrates nothing. It used to be documented as
+      deferring to "runtime resolution"; no resolver was ever written, and Redmine #14825
+      item 6 withdrew the declaration rather than building one. The value is the target of a
+      push, and resolving it from a late-bound name is the shape #13686 removed from every
+      mutation it performs, so the production composition refuses to build an actuator at all
+      while this is unset (:func:`~....f_140_delegated_coordinator_nested_handoff.application.auto_integration_composition.build_auto_integration_use_case`).
+    - :attr:`ff_only` — fast-forward-only (the owner's default). ``False`` admits a merge
+      commit, built from objects and never inside a checkout; it does **not** admit a rebase
+      or a force push, neither of which this schema can express.
+
+    **There are no post-close cleanup fields.** R1 had three (``remove_worktree``,
+    ``delete_local_branch``, ``delete_remote_branch``) and every step they toggled has since
+    been withdrawn (see the comment above :data:`AUTO_INTEGRATION_KEYS`), leaving the cleanup
+    machine one unconditional step. A key that can only turn off something that does not
+    exist is a key the runtime ignores.
+
+    Boundary, kept enforced in code (this is *policy intent*, not authority):
+
+    - **The gates are the authority, never this config.** The pure
+      :mod:`...domain.auto_integration_policy` and
+      :mod:`...domain.retirement_cleanup_policy` state machines read no field of this record
+      when deciding whether an action is admissible. A flag can decline to attempt a step; no
+      value of any flag turns a blocked action into an ``ok`` one.
+    - **The review / close / callback / owner invariants have no key here.** The closed
+      :data:`AUTO_INTEGRATION_KEYS` set admits only the operational fields above, and a
+      boundary-shaped key (``owner`` / ``approval`` / ``review`` / ``close`` / ``route`` /
+      ``send`` / credential, …) is rejected by the same closed-schema screen the rest of this
+      module enforces — which is also why the ff / CI / cleanup fields are spelled without
+      those tokens.
+    - **Force push, auto-rebase, ref deletion (local or remote), worktree removal, and
+      CI-gate removal are not expressible.** There is no field for any of them by
+      construction, so no config can request one.
+    """
+
+    mode: str = DEFAULT_AUTO_INTEGRATION_MODE
+    integration_branch: Optional[str] = None
+    ff_only: bool = DEFAULT_FF_ONLY
+
+    @classmethod
+    def default(cls) -> "AutoIntegrationConfig":
+        """The behavior-preserving default (``mode: disabled``)."""
+        return cls()
+
+    @classmethod
+    def from_record(
+        cls, record: "Optional[Mapping[str, object]]" = None
+    ) -> "AutoIntegrationConfig":
+        """Normalize an ``auto_integration`` sub-record into a typed policy.
+
+        ``None`` or an empty mapping yields the behavior-preserving default. A non-mapping
+        record, a boundary-crossing / unknown key, an unsupported version, a ``mode`` outside
+        :data:`AUTO_INTEGRATION_MODES`, a non-boolean flag, or an ``integration_branch`` that
+        is neither ``None`` nor a non-empty string fails closed with
+        :class:`RepoLocalConfigError`.
+        """
+        if record is None:
+            return cls.default()
+        if not isinstance(record, Mapping):
+            raise RepoLocalConfigError(
+                "auto integration config record must be a mapping (a YAML table), got "
+                f"{type(record).__name__}"
+            )
+        source = "auto integration config"
+        _reject_boundary_and_unknown_keys(
+            record, allowed=AUTO_INTEGRATION_KEYS, source=source
+        )
+        _checked_version(record, source=source)
+        mode = record.get("mode", DEFAULT_AUTO_INTEGRATION_MODE)
+        if mode not in AUTO_INTEGRATION_MODES:
+            raise RepoLocalConfigError(
+                f"{source} 'mode' must be one of {sorted(AUTO_INTEGRATION_MODES)}; got "
+                f"{mode!r}"
+            )
+        integration_branch = record.get("integration_branch")
+        if integration_branch is not None:
+            if not isinstance(integration_branch, str) or not integration_branch.strip():
+                raise RepoLocalConfigError(
+                    f"{source} 'integration_branch' must be a non-empty string naming the "
+                    "target branch, or omitted to leave the target unconfigured (which "
+                    "integrates nothing); got "
+                    f"{integration_branch!r}"
+                )
+        return cls(
+            mode=mode,
+            integration_branch=integration_branch,
+            ff_only=_checked_bool(record, "ff_only", DEFAULT_FF_ONLY, source=source),
+        )
+
+
+@dataclass(frozen=True)
 class AgentLaunchConfig:
     """The provider-agnostic per-agent x lane-class launch-argv override (#13155/#13425).
 
@@ -446,6 +610,12 @@ __all__ = (
     "SUBLANE_INTEGRATION_KEYS",
     "DEFAULT_MANAGE_WORKTREE",
     "DEFAULT_MERGE_ON_RETIRE",
+    "AUTO_INTEGRATION_KEYS",
+    "AUTO_INTEGRATION_MODES",
+    "AUTO_INTEGRATION_MODE_AUTO",
+    "AUTO_INTEGRATION_MODE_DISABLED",
+    "DEFAULT_AUTO_INTEGRATION_MODE",
+    "DEFAULT_FF_ONLY",
     "AGENT_LAUNCH_KEYS",
     "RepoLocalConfigError",
     "_reject_boundary_token",
@@ -453,5 +623,6 @@ __all__ = (
     "_checked_version",
     "_checked_bool",
     "SublaneIntegrationConfig",
+    "AutoIntegrationConfig",
     "AgentLaunchConfig",
 )

@@ -4278,6 +4278,17 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "inherits via a used import of redmine_journal_source and (Redmine #14695) "
             "no_change_review_waiver; names no marker token itself",
         ),
+        f"{_D}/domain/auto_integration_authority.py": (
+            ['*', '*', '*', '*'],
+            "inherits via used imports of hibernate_basis_producer, hibernate_evidence_integration, "
+            "hibernate_evidence_marker, redmine_journal_source; names no marker token itself "
+            "(Redmine #14825). It READS: the review / integration authorities come from the shared "
+            "conjunct producer, so a note carrying more than one marker is resolved by that "
+            "producer's own rules (latest declaration wins by existing; a marker the canonical "
+            "producer could not render yields a typed gap). Its own read — the per-head CI "
+            "record — refuses two DIFFERING green records about one head as a conflict, and "
+            "refuses outright when the issue's current CI declaration parses as nothing at all",
+        ),
         f"{_D}/domain/hibernate_basis_producer.py": (
             ['*', '*', '*', '*', 'handoff'],
             "inherits via a used import of hibernate_evidence_integration, hibernate_evidence_marker, hibernate_park_record, redmine_journal_source; names no marker token itself",

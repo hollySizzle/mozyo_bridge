@@ -183,23 +183,13 @@ def herdr_effective_backend_selected(*, repo_root: Path, target: str | None) -> 
     return backend_selected and not is_explicit_pane_target(target)
 
 
-def herdr_auto_target_repo(repo_root: Path) -> str:
-    """Resolve ``--target-repo auto`` for a herdr send to the sender's own repo root.
-
-    Redmine #13729: takes the facade-resolved ``repo_root`` (Namespace-free);
-    byte-identical to the former ``str(repo_root_from_args(args))``.
-
-    Redmine #13331 (j#73312 scope addition #2): a herdr send has no tmux ``%pane`` /
-    ``pane_current_path`` to infer a target repo from, so the ``%pane``-only ``auto`` gate is
-    inapplicable — it forced a hand-passed ``--target-repo <root>`` even for a same-workspace
-    herdr send. The herdr target is already workspace-scoped by the resolver (a same-workspace
-    send resolves the receiver in the sender's own workspace; a cross-workspace lane dispatch
-    passes an EXPLICIT ``--target-repo``, never ``auto``), so ``auto`` resolves to the sender's
-    own repo root — the same-workspace target's repo — and flows through the unchanged
-    ``target_repo_mismatch`` gate like a hand-passed root. Kept out of the oversized
-    ``commands.py`` (module-health gate); the command module calls this from its herdr branch.
-    """
-    return str(repo_root)
+# Redmine #14249 R2 (reproduction j#94419): ``herdr_auto_target_repo(repo_root)`` used to live
+# here and answered "what is the target's repo root" with the SENDER's root (#13331 j#73312 #2).
+# That is right only while the target is the sender's own lane — for a cross-lane send it named a
+# repo the receiver does not run in, and the R1 relative-workdir base then carried it as a
+# verified assertion. It is deleted rather than left in place: a helper whose only answer is the
+# wrong frame is a trap, not a fallback. ``auto`` now resolves the TARGET's frame in
+# ``...f_130_handoff_routing.application.herdr_auto_target_root`` and fails closed.
 
 
 def _legacy_lane_token(repo_root: Path) -> str:
@@ -446,7 +436,8 @@ def resolve_herdr_send_target(
                 "--target coordinator) so the route authority resolves the target you named."
             )
     # The synthesized target record's `cwd` is the TARGET agent's repo root (the tmux path
-    # reads the target pane's own cwd). Three shapes (#13331 / #13377 j#73640 finding 1):
+    # reads the target pane's own cwd). Four shapes (#13331 / #13377 j#73640 finding 1;
+    # #14249 R2):
     #
     # - a #13331 cross-workspace dispatch names the target repo explicitly, so `cwd` is
     #   the expanded `--target-repo` and the downstream `target_repo_mismatch` gate
@@ -457,12 +448,20 @@ def resolve_herdr_send_target(
     #   --cwd`), not the sender's repo — synthesizing the sender root here made the repo
     #   gate structurally fail (`expected` = lane worktree vs `observed` = main repo).
     #   The explicit pair rides the same like-for-like precedent as cross-workspace;
+    # - `--target-repo auto` (Redmine #14249 R2) leaves `cwd` EMPTY here. There is no pane
+    #   cwd to read, and the sender's root is only the target's root when the target is the
+    #   sender's own lane — synthesizing it unconditionally is exactly the j#94419 defect.
+    #   The target-resolution use case resolves the target's frame and re-states this field
+    #   with the root it verified (or refuses); an unknown cwd is the fail-closed shape to
+    #   carry in between, never a confident wrong one;
     # - every other same-workspace send (no explicit lane) keeps `cwd` = the sender's
     #   repo root, so the repo gate's conservatism for implicit sends is unchanged.
     raw_target_repo = target_repo
     explicit_target_repo = bool(raw_target_repo) and raw_target_repo != AUTO_TARGET_REPO
     if cross_workspace or (explicit_target_repo and _norm(explicit_lane)):
         target_cwd = str(Path(raw_target_repo).expanduser())
+    elif raw_target_repo == AUTO_TARGET_REPO:
+        target_cwd = ""
     else:
         target_cwd = str(repo_root)
     return {
