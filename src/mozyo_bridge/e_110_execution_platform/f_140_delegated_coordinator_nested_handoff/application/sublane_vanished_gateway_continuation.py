@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from mozyo_bridge.core.state.replacement_transaction_model import ContinuationPointer
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_vanished_gateway_recovery import (  # noqa: E501
     RECOVERY_ACTION_GENERATION,
     stored_row_is_this_recovery,
@@ -55,8 +56,9 @@ class ContinuationPreparation:
     #: The STORED :class:`ContinuationPointer` itself, carried rather than re-assembled
     #: (audit j#97223). The next legs hand this straight to `drive_continuation_once`; a
     #: flattened copy would mean each of them rebuilding a pointer from raw columns again,
-    #: which is the re-derivation this rail exists to avoid.
-    pointer: Any = None
+    #: which is the re-derivation this rail exists to avoid. Always exactly that type or
+    #: ``None`` -- see the type gate below (audit j#97226).
+    pointer: Optional["ContinuationPointer"] = None
 
     @property
     def ready(self) -> bool:
@@ -147,10 +149,16 @@ def prepare_vanished_gateway_continuation(
             "the stored continuation could not be read",
             action_id,
         )
-    if pointer is None:
+    # The EXACT type (audit j#97226). The same-action validator proves the raw COLUMNS,
+    # but the record's `continuation` property is the thing that turns them into an object,
+    # and a facade can return whatever it likes from it: a look-alike with the right five
+    # attributes read as canonical and would have been carried into the send closure of the
+    # next leg. A subclass is refused for the same reason it is everywhere else on this
+    # rail -- it decides for itself what its own members mean.
+    if type(pointer) is not ContinuationPointer:
         return _stopped(
             STOPPED_CONTINUATION_INVALID,
-            "the stored continuation is not re-readable",
+            "the stored continuation is not a canonical pointer",
             action_id,
         )
     if (

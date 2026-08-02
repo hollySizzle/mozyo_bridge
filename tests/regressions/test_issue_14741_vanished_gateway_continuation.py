@@ -17,6 +17,9 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
     ReplacementTransactionKey,
 )
+from mozyo_bridge.core.state.replacement_transaction_model import (  # noqa: E402
+    ContinuationPointer,
+)
 from tests.regressions.test_issue_14741_vanished_gateway_recovery_live import (  # noqa: E402,E501
     LANE,
     WORKSPACE,
@@ -269,6 +272,73 @@ class RefusalTest(_PrepareCase):
         # No row assertion here on purpose: the actuation ahead of this boundary is SUPPOSED
         # to run and write, so "the row is unchanged" would be a claim about the executor,
         # not about the re-read this test is for.
+
+    def test_a_foreign_continuation_object_is_not_a_canonical_pointer(self) -> None:
+        """Audit j#97226: the validator proves the COLUMNS, not the object built from them.
+
+        The facade delegates the raw columns honestly -- so the same-action check passes --
+        and returns a look-alike from `continuation`. Five matching attributes used to be
+        enough, which would have carried a mutable foreign object into the next leg's send
+        closure.
+        """
+        from types import SimpleNamespace
+
+        real = self.store
+        module = (
+            "mozyo_bridge.e_110_execution_platform"
+            ".f_140_delegated_coordinator_nested_handoff.application"
+            ".sublane_vanished_gateway_continuation"
+        )
+
+        class _Impostor(ContinuationPointer):
+            """A subclass is not the canonical type either."""
+
+        def _foreign(record):
+            class _Facade:
+                def __getattr__(self, name):
+                    if name == "continuation":
+                        stored = record.continuation
+                        return SimpleNamespace(
+                            source=stored.source,
+                            issue_id=stored.issue_id,
+                            journal_id=stored.journal_id,
+                            expected_gate=stored.expected_gate,
+                            next_semantic_action=stored.next_semantic_action,
+                        )
+                    return getattr(record, name)
+
+            return _Facade()
+
+        class _Store:
+            path = real.path
+
+            def get(self, key):
+                record = real.get(key)
+                if record is None:
+                    return None
+                if sys._getframe(1).f_globals.get("__name__") == module:
+                    return _foreign(record)
+                return record
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+        port = _Port()
+        result = prepare_vanished_gateway_continuation(
+            plan=self.plan, anchor=_anchor(), store=_Store(), home=self.home,
+            workspace_id=WORKSPACE, actuation_port=port,
+            launch_authority=lambda pin: True, store_admission=lambda key, pin: None,
+            clock=lambda: "2026-08-02T00:00:00+00:00",
+        )
+        self.assertEqual(result.stopped, STOPPED_CONTINUATION_INVALID)
+        self.assertEqual(result.outcome, "")
+        self.assertIsNone(result.pointer)
+
+    def test_a_canonical_pointer_is_still_accepted(self) -> None:
+        """The positive control for the type gate."""
+        result = self._prepare()
+        self.assertEqual(result.outcome, CONTINUATION_READY)
+        self.assertIs(type(result.pointer), ContinuationPointer)
 
     def test_nothing_here_reaches_a_delivery_ledger(self) -> None:
         """The tranche boundary, stated: preparation opens no ledger."""
