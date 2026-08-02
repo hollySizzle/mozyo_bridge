@@ -465,12 +465,7 @@ class ParticipantPinError(ValueError):
 
 #: The participant-manifest envelope version. Bumped when the pin shape changes so an
 #: older build reading a newer manifest fails closed rather than dropping fields.
-#: The manifest envelope this build WRITES (Redmine #14741 j#97038). v2 adds the update
-#: evidence triplet; v1 is still READ, as a legacy all-empty triplet.
-PARTICIPANTS_VERSION = 2
-#: Envelope versions this build can read. A v1 manifest predates identity receipts, so its
-#: participants simply carry no evidence — that is a fact, not a gap.
-PARTICIPANTS_READABLE_VERSIONS: tuple = (1, 2)
+PARTICIPANTS_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -505,20 +500,6 @@ class ParticipantPin:
     is_self: bool = False
     lane_revision: str = ""
     lane_generation: str = ""
-    #: The exact generation whose update evidence this transaction owns, plus the typed
-    #: cause (Redmine #14741 j#97038). Pinned HERE rather than re-derived at consume time:
-    #: reconstruction needs the launch-generation authority to still exist, so a transaction
-    #: could not replay its own evidence after that authority was lost — and owning the
-    #: evidence across crash and replay is exactly what C15 asks of the transaction.
-    #:
-    #: ``lane_id`` / ``provider`` / ``assigned_name`` above already carry the rest of the
-    #: key, so only the workspace, the startup action and the cause are added.
-    #:
-    #: All three empty (legacy / generic) or all three non-empty (receipt-capable). A
-    #: partial triplet is refused: it would name a generation nobody can address.
-    evidence_workspace_id: str = ""
-    evidence_startup_action_id: str = ""
-    evidence_cause: str = ""
     phase: str = PARTICIPANT_CLOSE_OWED
 
     def __post_init__(self) -> None:
@@ -530,9 +511,6 @@ class ParticipantPin:
             "old_locator",
             "lane_revision",
             "lane_generation",
-            "evidence_workspace_id",
-            "evidence_startup_action_id",
-            "evidence_cause",
             "phase",
         ):
             object.__setattr__(self, name, norm(getattr(self, name)))
@@ -552,17 +530,6 @@ class ParticipantPin:
             raise ParticipantPinError(
                 f"unknown participant phase {self.phase!r}"
             )
-        triplet = (
-            self.evidence_workspace_id,
-            self.evidence_startup_action_id,
-            self.evidence_cause,
-        )
-        if any(triplet) and not all(triplet):
-            raise ParticipantPinError(
-                "a participant's update-evidence triplet must be wholly empty (legacy / "
-                "generic) or wholly present (receipt-capable); a partial triplet names a "
-                "generation nobody can address"
-            )
 
     @property
     def identity(self) -> tuple[str, str, str, str]:
@@ -580,9 +547,6 @@ class ParticipantPin:
             is_self=self.is_self,
             lane_revision=self.lane_revision,
             lane_generation=self.lane_generation,
-            evidence_workspace_id=self.evidence_workspace_id,
-            evidence_startup_action_id=self.evidence_startup_action_id,
-            evidence_cause=self.evidence_cause,
             phase=phase,
         )
 
@@ -596,9 +560,6 @@ class ParticipantPin:
             "is_self": self.is_self,
             "lane_revision": self.lane_revision,
             "lane_generation": self.lane_generation,
-            "evidence_workspace_id": self.evidence_workspace_id,
-            "evidence_startup_action_id": self.evidence_startup_action_id,
-            "evidence_cause": self.evidence_cause,
             "phase": self.phase,
         }
 
@@ -684,12 +645,11 @@ def decode_participants(raw: str) -> tuple[ParticipantPin, ...]:
     if (
         not isinstance(version, int)
         or isinstance(version, bool)
-        or version not in PARTICIPANTS_READABLE_VERSIONS
+        or version != PARTICIPANTS_VERSION
     ):
         raise ParticipantPinError(
-            f"participant manifest version {version!r} is not one this build reads "
-            f"{list(PARTICIPANTS_READABLE_VERSIONS)} (unknown / newer / malformed); "
-            "fail closed"
+            f"participant manifest version {version!r} is not exactly "
+            f"{PARTICIPANTS_VERSION} (unknown / newer / malformed); fail closed"
         )
     rows = loaded.get("participants")
     if not isinstance(rows, list):
@@ -708,13 +668,6 @@ def decode_participants(raw: str) -> tuple[ParticipantPin, ...]:
                 is_self=bool(item.get("is_self")),
                 lane_revision=norm(item.get("lane_revision")),
                 lane_generation=norm(item.get("lane_generation")),
-                # A v1 manifest predates identity receipts, so its participants carry no
-                # evidence. Reading that as an empty triplet is read-COMPATIBILITY, not a
-                # default: the absence is a fact about when the row was written, and it is
-                # exactly what a legacy/generic participant should say.
-                evidence_workspace_id=norm(item.get("evidence_workspace_id")),
-                evidence_startup_action_id=norm(item.get("evidence_startup_action_id")),
-                evidence_cause=norm(item.get("evidence_cause")),
                 phase=norm(item.get("phase")) or PARTICIPANT_CLOSE_OWED,
             )
         )
@@ -878,7 +831,6 @@ __all__ = (
     "PARTICIPANT_VERIFY_OWED",
     "PARTICIPANT_REPLACED",
     "PARTICIPANT_PHASES",
-    "PARTICIPANTS_READABLE_VERSIONS",
     "PARTICIPANTS_VERSION",
     "CAS_ACTION_MISMATCH",
     "CAS_ALREADY_DECLARED",
