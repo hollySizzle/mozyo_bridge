@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import subprocess
 import tempfile
 import unittest
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from mozyo_bridge.core.state.callback_outbox import CallbackOutbox
-from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
+from mozyo_bridge.core.state.lane_lifecycle import (
+    DecisionPointer,
+    LaneLifecycleKey,
+    LaneLifecycleStore,
+)
 from mozyo_bridge.core.state.supervisor_lease import SupervisorLeaseStore
 from mozyo_bridge.core.state.workflow_runtime_store import WorkflowRuntimeStore
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_actuator import (  # noqa: E501
@@ -42,6 +47,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SUPERVISION_REFUSED,
     AutoIntegrationSupervisionOutcome,
     AutoIntegrationSupervisorLeg,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+    declared_worktree_identity,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workspace_callback_supervisor import (  # noqa: E501
     SupervisedWorkspace,
@@ -273,6 +281,84 @@ class AutoIntegrationSupervisorTest(unittest.TestCase):
         other.mkdir()
         outcome = self._leg(root=other)(WORKSPACE, ISSUE)
         self.assertEqual(outcome.actions[0].status, SUPERVISION_REFUSED)
+        self.assertEqual(self.git.pushes, 0)
+
+    def test_a_lifecycle_attested_linked_worktree_is_an_execution_root(self) -> None:
+        canonical = self.home / "canonical"
+        canonical.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", str(canonical)], check=True, capture_output=True
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(canonical),
+                "-c",
+                "user.name=Auto Integration Test",
+                "-c",
+                "user.email=auto-integration@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "base",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        self.root.rmdir()
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(canonical),
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                BRANCH,
+                str(self.root),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        identity = declared_worktree_identity(str(self.root), LANE)
+        self.assertTrue(identity and identity.startswith("wt_"), identity)
+        declared = LaneLifecycleStore(home=self.home).declare_active(
+            LaneLifecycleKey(WORKSPACE, LANE),
+            decision=DecisionPointer("redmine", ISSUE, "96778"),
+            issue_id=ISSUE,
+            worktree_identity=str(identity),
+        )
+        self.assertTrue(declared.applied, declared)
+
+        outcome = self._leg(root=canonical)(WORKSPACE, ISSUE)
+
+        self.assertEqual(outcome.actions[0].status, SUPERVISION_AWAITING_CI)
+        self.assertEqual(self.git.pushes, 1)
+
+    def test_a_foreign_git_worktree_never_substitutes_for_the_bound_root(self) -> None:
+        foreign = self.home / "foreign"
+        subprocess.run(
+            ["git", "init", "-q", str(self.root)], check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "init", "-q", str(foreign)], check=True, capture_output=True
+        )
+        identity = declared_worktree_identity(str(self.root), LANE)
+        declared = LaneLifecycleStore(home=self.home).declare_active(
+            LaneLifecycleKey(WORKSPACE, LANE),
+            decision=DecisionPointer("redmine", ISSUE, "96778"),
+            issue_id=ISSUE,
+            worktree_identity=str(identity),
+        )
+        self.assertTrue(declared.applied, declared)
+
+        outcome = self._leg(root=foreign)(WORKSPACE, ISSUE)
+
+        self.assertEqual(outcome.actions[0].status, SUPERVISION_REFUSED)
+        self.assertIn("Git common directory", outcome.actions[0].detail)
         self.assertEqual(self.git.pushes, 0)
 
     def test_the_production_workspace_supervisor_wires_the_owner_leg(self) -> None:

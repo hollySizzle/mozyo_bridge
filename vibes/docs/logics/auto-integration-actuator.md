@@ -667,6 +667,21 @@ publish したか) だけを問う。
 issue lease 内で `registered` / `awaiting_ci` action を永続 registry から発見し、landed SHA + target branch +
 required workflow の current verdict を poll する。idempotency は **immutable action frame + append-only
 transition + step ledger の一意制約**。
+
+standard sublane の action root は workspace registry の canonical rootそのものではなく、同じ workspace idを
+継承する linked worktree である。live smoke #14835 は、両pathの単純な不一致をrefuseする旧supervisorが
+正常な標準laneを構造上再開できないことを実測した (j#96778)。現行supervisorはcallerのpathを信用せず、
+canonical rootそのもの、または次の積を満たすcurrent linked worktreeだけをexecution rootにする。
+
+- immutable action frameの `repo_root` と `worktree` がcanonical pathでexact一致する。
+- lifecycle rowがexact workspace / lane / issue / lane generationで一意かつactiveである。
+- rowのstored worktree identityと、action pathから再導出したidentityがbyte-exact一致する。
+- action rootとworkspace canonical rootをGitが同じcommon directoryへ解決する。
+
+store / Gitが読めない、foreign / stale / ambiguous row、path / identity / common-dir不一致はcomposition前に
+zero-mutationでrefuseする。これによりlinked worktreeを通常triggerで再開できる一方、caller-selected sibling
+repoをexecution authorityへ昇格させない。
+
 二重 wake / operator の再実行 / supervisor retry は再読み・再判断するだけで再 push できない (push は既に
 `done`、二度目の receipt は store が拒否する)。1 pass / leg の external mutation は 1 件までで、callback /
 reconcile / hibernate と pass-wide budget を共有する。分類は **action registry の terminal state** で行う。

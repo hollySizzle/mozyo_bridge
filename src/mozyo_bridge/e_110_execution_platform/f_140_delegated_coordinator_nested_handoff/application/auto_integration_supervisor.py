@@ -11,11 +11,19 @@ checked against the canonical workspace registry before composition.
 from __future__ import annotations
 
 import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
-from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
+from mozyo_bridge.core.state.lane_lifecycle import (
+    DISPOSITION_ACTIVE,
+    LaneLifecycleError,
+    LaneLifecycleStore,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+    declared_worktree_identity,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ci_source import (  # noqa: E501
     GhCliCiStatusReader,
 )
@@ -91,6 +99,29 @@ def _default_ci_reader(repo_root: Path):
     return GhCliCiStatusReader(repo_root=repo_root)
 
 
+def _git_common_dir(repo_root: Path) -> Optional[Path]:
+    """Return Git's canonical common directory without accepting an unreadable root."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--git-common-dir"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    value = result.stdout.strip()
+    if result.returncode != 0 or not value:
+        return None
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = repo_root / candidate
+    try:
+        return candidate.resolve()
+    except OSError:
+        return None
+
+
 @dataclass(frozen=True)
 class AutoIntegrationSupervisorLeg:
     """One bounded, idempotent pass over one workspace/issue continuation partition."""
@@ -158,19 +189,12 @@ class AutoIntegrationSupervisorLeg:
     def _supervise_action(
         self, action: DurableIntegrationAction, canonical_root: Path
     ) -> ActionSupervisionOutcome:
-        try:
-            recorded_root = Path(action.repo_root).resolve()
-        except (OSError, RuntimeError):
+        execution_root, root_refusal = self._execution_root(action, canonical_root)
+        if execution_root is None:
             return ActionSupervisionOutcome(
                 action.action_key,
                 SUPERVISION_REFUSED,
-                "the registered repo root could not be resolved canonically",
-            )
-        if recorded_root != canonical_root:
-            return ActionSupervisionOutcome(
-                action.action_key,
-                SUPERVISION_REFUSED,
-                "the registered repo root does not equal the workspace registry's canonical root",
+                root_refusal,
             )
         problems = action.validation_errors()
         if problems:
@@ -182,9 +206,9 @@ class AutoIntegrationSupervisorLeg:
 
         try:
             if self.compose_fn is not None:
-                use_case = self.compose_fn(action, canonical_root)
+                use_case = self.compose_fn(action, execution_root)
             else:
-                config = load_committed_repo_local_config(canonical_root)
+                config = load_committed_repo_local_config(execution_root)
                 use_case = build_auto_integration_use_case(
                     binding=LaneBinding(
                         issue=action.issue,
@@ -195,7 +219,7 @@ class AutoIntegrationSupervisorLeg:
                         worktree=action.worktree,
                     ),
                     config=config.auto_integration,
-                    repo_root=canonical_root,
+                    repo_root=execution_root,
                     lifecycle_store=self.lifecycle_store,
                     callback_outbox=self.callback_outbox,
                     admission_record=action.record,
@@ -211,6 +235,64 @@ class AutoIntegrationSupervisorLeg:
                 f"the continuation pass failed ({exc.__class__.__name__})",
                 uncertain=uncertain,
             )
+
+    def _execution_root(
+        self, action: DurableIntegrationAction, canonical_root: Path
+    ) -> tuple[Optional[Path], str]:
+        """Resolve the only repository root this durable action may execute in.
+
+        A default-lane action runs in the workspace registry's canonical root.  A standard
+        sublane instead runs in a linked worktree while deliberately inheriting that same
+        workspace id.  The latter is admitted only when three independent authorities agree:
+        the immutable action frame names its own worktree, the current lifecycle row binds that
+        exact path token to the same issue/lane/generation, and Git says both paths share one
+        common repository.  A caller-selected sibling path therefore never becomes authority.
+        """
+        try:
+            recorded_root = Path(action.repo_root).resolve()
+            recorded_worktree = Path(action.worktree).resolve()
+        except (OSError, RuntimeError):
+            return None, "the registered repo root could not be resolved canonically"
+        if recorded_root == canonical_root:
+            return recorded_root, ""
+        if recorded_root != recorded_worktree:
+            return None, "the registered repo root does not equal the action's worktree root"
+
+        try:
+            rows = self.lifecycle_store.records()
+        except (LaneLifecycleError, OSError):
+            return None, "the lifecycle authority for the registered worktree is unreadable"
+        matches = [
+            row
+            for row in rows
+            if str(row.repo_workspace_id) == str(action.workspace)
+            and str(row.lane_id) == str(action.lane)
+            and str(row.issue_id) == str(action.issue)
+            and int(row.lane_generation) == int(action.lane_generation)
+            and str(row.lane_disposition) == DISPOSITION_ACTIVE
+        ]
+        if len(matches) != 1:
+            return None, (
+                "the registered worktree does not have one current active lifecycle binding "
+                "for this exact workspace/lane/issue/generation"
+            )
+        expected_identity = declared_worktree_identity(
+            str(recorded_root), str(action.lane)
+        )
+        if not expected_identity or str(matches[0].worktree_identity) != expected_identity:
+            return None, "the registered worktree does not match its durable lifecycle identity"
+        recorded_common = _git_common_dir(recorded_root)
+        canonical_common = _git_common_dir(canonical_root)
+        if (
+            recorded_common is None
+            or canonical_common is None
+            or recorded_common != canonical_common
+        ):
+            return None, (
+                "the registered worktree and workspace canonical root do not share one "
+                "readable Git common directory"
+            )
+        return recorded_root, ""
 
     def _drive(self, use_case, action: DurableIntegrationAction) -> ActionSupervisionOutcome:
         record = action.record
