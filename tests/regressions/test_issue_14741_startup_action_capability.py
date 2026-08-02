@@ -37,7 +37,22 @@ from mozyo_bridge.core.state.startup_transaction_fence import (  # noqa: E402
     startup_action_id_matching,
 )
 
+from mozyo_bridge.core.state.startup_action_capability import (  # noqa: E402
+    MIGRATION_ALREADY_V2,
+    MIGRATION_OK,
+    REASON_OFFLINE_UPGRADE_REQUIRED,
+    StartupStoreMigrationRefused,
+    migrate_startup_store_v1_to_v2,
+    startup_store_migration_plan_digest,
+)
+
 UNIT = StartupUnit("wA", "issue_14741", ("codex", "claude"))
+
+
+def _to_v2(fence, tmpdir, seed_nonce="seed"):
+    """Stand the store up and take it to v2 the only way a store may get there."""
+    fence.reserve(UNIT, seed_nonce)
+    migrate_startup_store_v1_to_v2(fence, backup_path=Path(tmpdir) / "backup.sqlite")
 DIGEST = "mzb1:" + "a" * 64
 
 
@@ -177,6 +192,7 @@ class AtomicManifestCoCommitTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / "s.sqlite"
         self.fence = StartupTransactionFence(self.path)
+        _to_v2(self.fence, self.tmp.name)
 
     def _reserve_tagged(self, nonce="nonce-1"):
         return self.fence.reserve(UNIT, nonce, manifest=_manifest())
@@ -201,9 +217,22 @@ class AtomicManifestCoCommitTest(unittest.TestCase):
             # required with no pinned identity — a requirement nothing could satisfy
             slots=(IdentityManifestSlot("codex", "mzb1_wA_codex_lane", True, ""),),
         )
+        with sqlite3.connect(self.path) as conn:
+            before = conn.execute("SELECT COUNT(*) FROM startup_actions").fetchone()[0]
         with self.assertRaises(StartupTransactionError):
             self.fence.reserve(UNIT, "nonce-1", manifest=broken)
-        self.assertFalse(self.path.exists(), "nothing was created")
+        with sqlite3.connect(self.path) as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM startup_actions").fetchone()[0],
+                before,
+                "a non-canonical plan writes no action row",
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM startup_identity_manifests"
+                ).fetchone()[0],
+                0,
+            )
 
     def test_a_manifest_for_a_different_lane_is_refused(self) -> None:
         with self.assertRaises(StartupTransactionError):
@@ -220,13 +249,20 @@ class AtomicManifestCoCommitTest(unittest.TestCase):
             self.fence.read_identity_manifest(action.action_id)
         self.assertIn(REASON_RECEIPT_REQUIREMENT_UNAVAILABLE, str(ctx.exception))
 
-    def test_a_tagged_action_whose_manifest_table_is_gone_is_zero_actuation(self) -> None:
+    def test_a_v2_store_missing_the_manifest_table_is_a_partial_schema(self) -> None:
+        """Under v2 the table is REQUIRED, so its absence is a partial schema, not 'empty'.
+
+        That is the difference v2 buys: under v1 the sibling is additive and its absence
+        means "no manifests here", which is benign. A v2 store cannot claim the capability
+        contract while carrying none of the structure that contract is about.
+        """
         action = self._reserve_tagged()
         with sqlite3.connect(self.path) as conn:
             conn.execute("DROP TABLE startup_identity_manifests")
-        with self.assertRaises(StartupTransactionError) as ctx:
+        with self.assertRaises(StartupTransactionError):
             self.fence.read_identity_manifest(action.action_id)
-        self.assertIn(REASON_RECEIPT_REQUIREMENT_UNAVAILABLE, str(ctx.exception))
+        with self.assertRaises(StartupTransactionError):
+            self.fence.read(action.action_id)
 
     def test_a_tampered_manifest_payload_is_detected(self) -> None:
         """The id is the digest's witness, so editing the plan is detectable."""
@@ -279,7 +315,7 @@ class AtomicManifestCoCommitTest(unittest.TestCase):
                 str(row[1])
                 for row in conn.execute("PRAGMA table_info(startup_actions)").fetchall()
             }
-        self.assertEqual(version, 1, "no schema bump")
+        self.assertEqual(version, 2, "migrated store declares v2")
         self.assertEqual(
             columns,
             {
@@ -352,6 +388,7 @@ class AuditedDefectRegressionTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / "s.sqlite"
         self.fence = StartupTransactionFence(self.path)
+        _to_v2(self.fence, self.tmp.name)
 
     def _tagged(self):
         return self.fence.reserve(UNIT, "nonce-1", manifest=_manifest())
@@ -436,8 +473,9 @@ class AuditedDefectRegressionTest(unittest.TestCase):
                 self.addCleanup(tmp.cleanup)
                 path = Path(tmp.name) / "s.sqlite"
                 fence = StartupTransactionFence(path)
-                fence.reserve(UNIT, "seed")  # legacy reserve bootstraps the store
+                _to_v2(fence, tmp.name)
                 with sqlite3.connect(path) as conn:
+                    conn.execute("DROP TABLE startup_identity_manifests")
                     conn.execute(ddl)
                     before = conn.execute(
                         "SELECT COUNT(*) FROM startup_identity_manifests"
@@ -456,7 +494,6 @@ class AuditedDefectRegressionTest(unittest.TestCase):
 
     def test_f5_an_unrelated_sibling_table_is_tolerated(self) -> None:
         """Scope correction (j#96931): only the NAMED table's shape is policed."""
-        self.fence.reserve(UNIT, "seed")
         with sqlite3.connect(self.path) as conn:
             conn.execute("CREATE TABLE somebody_elses_sidecar (a TEXT)")
         action = self.fence.reserve(UNIT, "nonce-1", manifest=_manifest())
@@ -493,3 +530,205 @@ class AuditedDefectRegressionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SchemaV2CutoverTest(unittest.TestCase):
+    """Design Answer j#96936: the store version, not the action tag, is the old-runtime fence.
+
+    The R11 j#96933 proof stands — an old runtime never inspects an action id, so a
+    per-action marker can never make it fail closed. What it DOES enforce is an exact
+    ``user_version == 1`` check. So tags are only ever written into v2 stores, and a v2
+    store is one an old runtime rejects wholesale at the DB door.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.path = self.dir / "s.sqlite"
+        self.fence = StartupTransactionFence(self.path)
+
+    def _v1(self):
+        self.fence.reserve(UNIT, "seed")
+        return self.fence
+
+    def test_a_fresh_store_is_still_v1_and_normal_startup_never_migrates(self) -> None:
+        """No implicit migration: a normal startup leaves the version exactly as it found it."""
+        self._v1()
+        for nonce in ("a", "b", "c"):
+            self.fence.reserve(UNIT, nonce)
+            self.fence.read(startup_action_id(UNIT, nonce))
+        with sqlite3.connect(self.path) as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+                    " AND name='startup_identity_manifests'"
+                ).fetchone()[0],
+                0,
+                "and it creates no manifest table either",
+            )
+
+    def test_a_tagged_reserve_on_a_v1_store_is_typed_and_zero_write(self) -> None:
+        self._v1()
+        with sqlite3.connect(self.path) as conn:
+            before = conn.execute("SELECT COUNT(*) FROM startup_actions").fetchone()[0]
+        with self.assertRaises(StartupTransactionError) as ctx:
+            self.fence.reserve(UNIT, "nonce-1", manifest=_manifest())
+        self.assertIn(REASON_OFFLINE_UPGRADE_REQUIRED, str(ctx.exception))
+        with sqlite3.connect(self.path) as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM startup_actions").fetchone()[0], before
+            )
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+
+    def test_legacy_actions_still_read_on_a_v1_store(self) -> None:
+        self._v1()
+        self.assertIsNotNone(self.fence.read(startup_action_id(UNIT, "seed")))
+
+    def test_after_migration_tagged_reserve_read_and_replay_all_work(self) -> None:
+        self._v1()
+        self.assertEqual(
+            migrate_startup_store_v1_to_v2(self.fence, backup_path=self.dir / "b.sqlite"),
+            MIGRATION_OK,
+        )
+        action = self.fence.reserve(UNIT, "nonce-1", manifest=_manifest())
+        self.assertTrue(requires_identity_receipt(action.action_id))
+        self.assertIsNotNone(self.fence.read_identity_manifest(action.action_id))
+        self.assertEqual(
+            self.fence.reserve(UNIT, "nonce-1", manifest=_manifest()).action_id,
+            action.action_id,
+        )
+        # And the legacy action written before the cutover is still there.
+        self.assertIsNotNone(self.fence.read(startup_action_id(UNIT, "seed")))
+
+    def test_migration_is_idempotent(self) -> None:
+        self._v1()
+        migrate_startup_store_v1_to_v2(self.fence, backup_path=self.dir / "b.sqlite")
+        self.assertEqual(
+            migrate_startup_store_v1_to_v2(self.fence, backup_path=self.dir / "b2.sqlite"),
+            MIGRATION_ALREADY_V2,
+        )
+
+    def test_migration_refuses_plan_drift_with_zero_mutation(self) -> None:
+        self._v1()
+        with sqlite3.connect(self.path) as conn:
+            approved = startup_store_migration_plan_digest(conn)
+        # The store moves on after the plan was approved.
+        self.fence.reserve(UNIT, "unplanned")
+        with self.assertRaises(StartupStoreMigrationRefused) as ctx:
+            migrate_startup_store_v1_to_v2(
+                self.fence,
+                backup_path=self.dir / "b.sqlite",
+                expected_plan_digest=approved,
+            )
+        self.assertEqual(ctx.exception.reason, "plan_drift")
+        with sqlite3.connect(self.path) as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+
+    def test_migration_refuses_a_foreign_sibling_table_with_zero_mutation(self) -> None:
+        self._v1()
+        with sqlite3.connect(self.path) as conn:
+            conn.execute("CREATE TABLE startup_identity_manifests (wrong TEXT)")
+        with self.assertRaises(StartupStoreMigrationRefused) as ctx:
+            migrate_startup_store_v1_to_v2(self.fence, backup_path=self.dir / "b.sqlite")
+        self.assertEqual(ctx.exception.reason, "foreign_sibling_schema")
+        with sqlite3.connect(self.path) as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+
+    def test_migration_refuses_a_backup_it_cannot_write(self) -> None:
+        self._v1()
+        with self.assertRaises(StartupStoreMigrationRefused) as ctx:
+            migrate_startup_store_v1_to_v2(
+                self.fence, backup_path=self.dir / "s.sqlite" / "nested" / "b.sqlite"
+            )
+        self.assertEqual(ctx.exception.reason, "backup_failed")
+        with sqlite3.connect(self.path) as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+
+    def test_migration_refuses_a_store_already_holding_tagged_rows(self) -> None:
+        """Nothing this build wrote could be in that state, so the history is not as claimed."""
+        self._v1()
+        forged = startup_action_id(
+            UNIT,
+            "x",
+            capability=CAPABILITY_IDENTITY_RECEIPT,
+            manifest_digest=_manifest().digest(),
+        )
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                "INSERT INTO startup_actions (action_id, workspace_id, lane_id, providers,"
+                " phase, revision, participants, reserved_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (forged, "wA", "issue_14741", "claude,codex", "planned", 1, "[]", "t", "t"),
+            )
+        with self.assertRaises(StartupStoreMigrationRefused) as ctx:
+            migrate_startup_store_v1_to_v2(self.fence, backup_path=self.dir / "b.sqlite")
+        self.assertEqual(ctx.exception.reason, "tagged_rows_present")
+        with sqlite3.connect(self.path) as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+
+
+class ParentRuntimeRejectsV2Test(unittest.TestCase):
+    """The old-runtime fail-closed EVIDENCE (j#96936 item 4).
+
+    Runs the ACTUAL parent runtime's fence module, vendored verbatim from `4867fa0a`, against
+    a v2 store. This is the proof R11 could not give with a per-action tag: the old code is
+    executed, not described, and it rejects the store at its own `user_version` check —
+    which is the check every one of its surfaces (rollback, status, current-action) goes
+    through, because they all open the store the same way.
+    """
+
+    FIXTURE = (
+        Path(__file__).resolve().parents[1]
+        / "support"
+        / "fixtures"
+        / "parent_runtime_startup_fence_4867fa0a.py.txt"
+    )
+
+    def _parent_module(self):
+        import importlib.util
+
+        name = "parent_fence_4867fa0a"
+        spec = importlib.util.spec_from_loader(name, loader=None)
+        module = importlib.util.module_from_spec(spec)
+        module.__file__ = str(self.FIXTURE)
+        # `@dataclass` resolves its own module out of `sys.modules`, so the module must be
+        # registered before the body executes.
+        sys.modules[name] = module
+        self.addCleanup(sys.modules.pop, name, None)
+        exec(compile(self.FIXTURE.read_text(), str(self.FIXTURE), "exec"), module.__dict__)
+        return module
+
+    def test_the_vendored_fixture_is_the_parent_runtime(self) -> None:
+        """A stale fixture would make this whole proof vacuous."""
+        self.assertTrue(self.FIXTURE.exists())
+        text = self.FIXTURE.read_text()
+        self.assertIn("STARTUP_TRANSACTION_FENCE_SCHEMA_VERSION = 1", text)
+        self.assertNotIn("startup_identity_manifests", text)
+        self.assertNotIn("CAPABILITY_IDENTITY_RECEIPT", text)
+
+    def test_the_parent_runtime_reads_a_v1_store_but_rejects_a_v2_store(self) -> None:
+        parent = self._parent_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.sqlite"
+            fence = StartupTransactionFence(path)
+            action = fence.reserve(UNIT, "seed")
+
+            # v1: the parent runtime is perfectly happy — mixed-runtime still works.
+            self.assertIsNotNone(
+                parent.StartupTransactionFence(path).read(action.action_id)
+            )
+
+            migrate_startup_store_v1_to_v2(fence, backup_path=Path(tmp) / "b.sqlite")
+
+            # v2: the parent rejects the WHOLE store, so every surface it has — rollback,
+            # status, current-action — fails closed, not merely the tagged actions.
+            old = parent.StartupTransactionFence(path)
+            for surface in (
+                lambda: old.read(action.action_id),
+                lambda: old.store_shape() and old.read(action.action_id),
+            ):
+                with self.assertRaises(parent.StartupTransactionError) as ctx:
+                    surface()
+                self.assertIn("schema", str(ctx.exception).lower())

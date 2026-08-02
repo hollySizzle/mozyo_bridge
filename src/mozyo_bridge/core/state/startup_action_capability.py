@@ -22,7 +22,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
 from dataclasses import dataclass
+from pathlib import Path
 
 
 class StartupTransactionError(RuntimeError):
@@ -43,6 +45,23 @@ CAPABILITY_LEGACY = ""
 CAPABILITY_IDENTITY_RECEIPT = "ir1"
 
 CAPABILITIES: frozenset = frozenset({CAPABILITY_LEGACY, CAPABILITY_IDENTITY_RECEIPT})
+
+#: The version that carries the identity-receipt manifest as part of its REQUIRED shape.
+#:
+#: Design Answer j#96936 supersedes the no-schema-bump part of j#96917, on the strength of
+#: the R11 j#96933 proof: an old runtime does not inspect the action id, so a per-action
+#: tag can never make it fail closed. What it DOES have is an exact `user_version == 1`
+#: check — a store-global fence it already enforces. So the tag stops being asked to do a
+#: job it cannot do, and the store version does it instead: an old runtime meeting a v2
+#: store rejects the whole store at the DB door, including rollback / status /
+#: current-action.
+STARTUP_TRANSACTION_FENCE_SCHEMA_VERSION_V2 = 2
+#: Versions this runtime can READ. A v1 store stays fully usable for legacy actions; only
+#: writing a capability-tagged action requires v2.
+STARTUP_TRANSACTION_FENCE_SUPPORTED_VERSIONS: tuple = (1, 2)
+#: A tagged reserve was asked for on a v1 store. Typed, and zero-write: the runtime never
+#: migrates a shared home on its own — that is the #14838 offline rail's authority alone.
+REASON_OFFLINE_UPGRADE_REQUIRED = "offline_global_runtime_upgrade_required"
 
 # `fullmatch`, never `$`: Python's `$` also matches BEFORE a trailing newline, so
 # "startup-ir1-<64hex>\n" classified as tagged (audit j#96928 F6). An action id is a byte
@@ -685,3 +704,197 @@ def reserve_or_replay(
         nonce=nonce,
     )
     return ""
+
+
+def verify_supported_version(conn) -> int:
+    """Accept a store version this runtime can read, or fail closed. Returns the version."""
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if version not in STARTUP_TRANSACTION_FENCE_SUPPORTED_VERSIONS:
+        raise StartupTransactionError(
+            f"startup transaction store schema {version!r} is not one this runtime "
+            f"supports {list(STARTUP_TRANSACTION_FENCE_SUPPORTED_VERSIONS)}; fail closed "
+            "rather than read an unknown shape"
+        )
+    return version
+
+
+def verify_v2_manifest_shape(conn) -> None:
+    """A v2 store MUST carry the manifest table, in exactly this build's shape.
+
+    The difference from the v1 tolerance is the point (Design Answer j#96936 item 1): under
+    v1 the sibling table is additive and its absence is simply "no manifests here". Under
+    v2 it is part of the declared schema, so its absence is a PARTIAL schema and fails
+    closed — otherwise a v2 store could claim the capability contract while carrying none
+    of the rows that contract is about.
+    """
+    if int(conn.execute("PRAGMA user_version").fetchone()[0]) != 2:
+        return
+    if _manifest_table_state(conn) == "absent":
+        raise StartupTransactionError(
+            "the startup transaction authority declares schema v2 but is missing the "
+            f"{_IDENTITY_MANIFEST_TABLE!r} table (partial schema); fail closed"
+        )
+
+
+def require_v2_for_tagged_reserve(conn) -> None:
+    """A capability-tagged action may be reserved ONLY on a v2 store (j#96936 item 2).
+
+    This is what makes the whole fail-closed argument hold. A tag written into a v1 store
+    would be invisible to an older peer runtime, which reads v1 happily and never inspects
+    an action id — so it could spend a receipt-capable action with no idea one existed. By
+    refusing to write the tag until the store itself is v2, the only stores that ever
+    contain tagged actions are stores an old runtime already rejects wholesale at its
+    exact ``user_version == 1`` check.
+
+    Zero-write and typed: the runtime NEVER migrates a shared home on its own. Upgrading is
+    an all-consumers-stopped, backed-up, plan-checked operation owned by the #14838 offline
+    rail (item 3), and a normal startup that quietly bumped a version would be exactly the
+    implicit migration that rail exists to prevent.
+    """
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if version != 2:
+        raise StartupTransactionError(
+            f"{REASON_OFFLINE_UPGRADE_REQUIRED}: this launch would record an identity "
+            f"receipt obligation, which requires startup-transaction store schema v2, but "
+            f"the store is v{version}. Nothing was started and nothing was written — the "
+            "upgrade is an offline, all-consumers-stopped rollout, never something a "
+            "launch performs on its own."
+        )
+
+
+
+
+# --- Offline v1 -> v2 migration primitive (Design Answer j#96936 items 3, 5, 7) ----------
+#
+# #14741 owns this PRIMITIVE and its regressions; #14838 owns the orchestration around it
+# (stop every consumer, back up, migrate the sibling stores too, restart on an attested new
+# binary, verify health, roll back). The real migration of a shared home runs only under
+# that rail with exact owner approval — nothing here is invoked by a normal startup.
+
+MIGRATION_OK = "migrated"
+#: Already v2 and exactly the shape v2 requires. Idempotent replay of a completed rollout.
+MIGRATION_ALREADY_V2 = "already_v2"
+#: A consumer still holds the store. Migrating under a live peer is the one thing an
+#: offline rollout must never do, so contention is a refusal and never a wait.
+MIGRATION_LIVE_CONSUMER = "live_consumer"
+#: The store already contains capability-tagged actions while claiming v1. Nothing this
+#: build wrote could be in that state, so the store's history is not what it claims.
+MIGRATION_TAGGED_ROWS_PRESENT = "tagged_rows_present"
+#: The named sibling table exists in a shape this build did not create.
+MIGRATION_FOREIGN_SIBLING = "foreign_sibling_schema"
+#: The backup could not be produced. No backup, no migration.
+MIGRATION_BACKUP_FAILED = "backup_failed"
+#: The caller's migration plan is not the plan this store presents.
+MIGRATION_PLAN_DRIFT = "plan_drift"
+
+
+class StartupStoreMigrationRefused(StartupTransactionError):
+    """An offline v1->v2 migration was refused. Carries a fixed reason; zero mutation."""
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        self.reason = reason
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+
+
+def startup_store_migration_plan_digest(conn) -> str:
+    """A digest of what the migration is ABOUT to act on, for the caller to pre-approve.
+
+    Covers the facts a rollout plan is written against: the schema version, the action ids
+    present, and whether the sibling table already exists. If any of them changed between
+    the plan being approved and the migration running, the digest differs and the migration
+    refuses — which is what "plan drift" means operationally.
+    """
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    actions = [
+        str(row[0])
+        for row in conn.execute(
+            "SELECT action_id FROM startup_actions ORDER BY action_id"
+        ).fetchall()
+    ]
+    sibling = _manifest_table_state(conn)
+    payload = json.dumps([version, actions, sibling], ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _refuse_if_tagged_rows(conn) -> None:
+    for row in conn.execute("SELECT action_id FROM startup_actions").fetchall():
+        try:
+            capability = action_capability(row[0])
+        except StartupTransactionError:
+            raise StartupStoreMigrationRefused(
+                MIGRATION_TAGGED_ROWS_PRESENT,
+                "the store holds an action id this build cannot classify",
+            )
+        if capability != CAPABILITY_LEGACY:
+            raise StartupStoreMigrationRefused(
+                MIGRATION_TAGGED_ROWS_PRESENT,
+                "the store already holds capability-tagged actions while declaring v1",
+            )
+
+
+def migrate_startup_store_v1_to_v2(fence, *, backup_path, expected_plan_digest: str = "") -> str:
+    """Take a v1 startup store to v2, offline and fail-closed. Returns a fixed token.
+
+    Every refusal happens BEFORE any mutation, and the migration itself is one transaction:
+    create the sibling table if absent, then set ``user_version = 2``. A store left
+    half-migrated would be the worst outcome available here — an old runtime would still
+    accept it while a new one thinks the capability contract holds — so there is no
+    intermediate state to be interrupted in.
+    """
+    import shutil
+
+    backup = Path(backup_path)
+    try:
+        holder = fence._hold()
+    except Exception as exc:  # noqa: BLE001 - contention is a refusal, never a wait
+        raise StartupStoreMigrationRefused(MIGRATION_LIVE_CONSUMER, str(exc)) from exc
+    with holder:
+        with fence._connection("rw") as conn:
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if version == 2:
+                # Idempotent replay of a completed rollout; the connection's own `_verify`
+                # already proved the v2 shape, so there is nothing left to do.
+                return MIGRATION_ALREADY_V2
+            if version != 1:
+                raise StartupStoreMigrationRefused(
+                    MIGRATION_PLAN_DRIFT, f"store is v{version}, not v1"
+                )
+            # `_manifest_table_state` raises on a foreign/partial shape — surface it as the
+            # migration's own typed refusal rather than a generic authority error.
+            try:
+                sibling = _manifest_table_state(conn)
+            except StartupTransactionError as exc:
+                raise StartupStoreMigrationRefused(
+                    MIGRATION_FOREIGN_SIBLING, str(exc)
+                ) from exc
+            _refuse_if_tagged_rows(conn)
+            actual_plan = startup_store_migration_plan_digest(conn)
+            if expected_plan_digest and actual_plan != expected_plan_digest:
+                raise StartupStoreMigrationRefused(
+                    MIGRATION_PLAN_DRIFT,
+                    "the store is not in the state the approved migration plan described",
+                )
+            try:
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(fence.path, backup)
+                if not backup.exists() or backup.stat().st_size <= 0:
+                    raise OSError("backup is absent or empty")
+            except OSError as exc:
+                raise StartupStoreMigrationRefused(
+                    MIGRATION_BACKUP_FAILED, str(exc)
+                ) from exc
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                if sibling == "absent":
+                    conn.execute(_IDENTITY_MANIFEST_SQL)
+                conn.execute("PRAGMA user_version = 2")
+                conn.execute("COMMIT")
+            except Exception as exc:  # noqa: BLE001
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.DatabaseError:
+                    pass
+                raise StartupStoreMigrationRefused(
+                    MIGRATION_PLAN_DRIFT, f"the migration write failed ({exc})"
+                ) from exc
+    return MIGRATION_OK
