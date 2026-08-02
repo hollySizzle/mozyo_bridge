@@ -439,12 +439,16 @@ Table naming:
       向かう disposition CAS だけ**が **格納値から** 発行する (増分は strict decode 後に Python 側で
       算出し canonical decimal TEXT を書く。**SQL 算術は使わない**)。
       **malformed な格納値 (TEXT / REAL / `bool` / `NULL` / negative) からは発行しない**
-      (#14756 j#96881 F2)。「未発行 (exact int `0`)」と「読めない」は別の事実であり、
+      (#14756 j#96881 F2 / j#96911 F2)。「未発行 (canonical decimal TEXT `"0"`)」と「読めない」は別の事実であり、
       read 側は両方 `lane_epoch_authority_unavailable` へ畳んでよいが、**writer が畳むと
       counter rollback になる** — corrupt 値から 1 を mint すると、既に release 済みの世代が
       持つ epoch を再発行してしまう。非 hibernate 遷移も corrupt 値を `0` へ正規化しない
       (無関係な遷移経由の laundering も laundering である)。malformed を観測した CAS は
-      **zero-write の typed refusal** とし、adoption も **exact int `0`** のみ許可する。
+      **zero-write の typed refusal** とし、adoption も **canonical TEXT `"0"`** のみ許可する。
+      malformed の集合は「canonical decimal TEXT 以外すべて」= INTEGER / REAL / BLOB / `NULL` /
+      `bool` / 符号付き / 前置ゼロ / 空白付き。列は `BLOB` (NONE affinity) なので storage class
+      がそのまま返る。**successor が canonical 境界を越える場合も mutation 前に zero-write
+      refusal** とする (#14756 j#96973 R11-F10)。
       caller に epoch parameter は存在しない。timestamp (v8) と caller 供給 pins (pre-v9) が
       どちらも世代証明にならなかった根本原因は「caller が値を供給できる」ことだったので、
       **供給する seam 自体を作らない**。
@@ -1583,12 +1587,15 @@ mixed-runtime home keeps working exactly as #13882 requires. The operator rail i
   never "none". Folding it to an empty set fails open on precisely the destructive `rebuild` path, whose entire target set *is*
   unreadable stores — the same "unreadable is not empty" rule already applied to the inventory, which the first implementation
   applied there but not to the store.
-- **The migration snapshot is a SQLite backup-API copy, not a file copy** (#13882 review j#80000 finding 1). `shutil.copy2`
+- **The migration snapshot is a SQLite backup-API copy, not a file copy** (#13882 review j#80000 finding 1;
+  extended to `lane_lifecycle_backup.backup_state_container` by #14756 j#96956 F5, which additionally stages the
+  snapshot, verifies it against a schema+content digest that carries each cell's storage class, and publishes by
+  atomic rename — a count-only readback published a snapshot whose cells differed, #14756 j#96973 R11-F6). `shutil.copy2`
   duplicates only the main DB file, so a store in WAL mode leaves committed pages in `-wal` and the snapshot loses them —
   reproduced: a v1 store with one committed row under `journal_mode=WAL` / `wal_autocheckpoint=0` produced a recovery point reading
   `version=1, rows=0` while the live store held the row. A recovery point that is incomplete *and trusted* is worse than none.
   `Connection.backup()` is transaction-consistent and checkpoint-independent, so the snapshot is judged by **content** (version +
-  rows), not bytes. (The sibling `lane_lifecycle_schema.backup_state_container` and `state_store._backup` still use the file-copy
+  rows), not bytes. (`state_store._backup` still uses the file-copy
   shape; that is pre-existing and out of this component's scope, but shares the hazard.)
 - **The two preservation rails are split by CALLER INTENT, never by exception type** (#13882 review j#80029 R2-F1). The logical
   snapshot (`backup_attestation_store`, used by `migrate`) has **no fallback**: any failure raises and the migration aborts with the

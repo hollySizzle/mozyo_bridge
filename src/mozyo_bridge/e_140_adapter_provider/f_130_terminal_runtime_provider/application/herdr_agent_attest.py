@@ -355,7 +355,16 @@ def perform_self_attestation(
 
     _declared, declared_reason = parse_attested_epoch(lane_epoch)
     _seen, seen_reason = parse_attested_epoch(observed_epoch)
-    if (
+    # BOTH absent is agreement, not a failure (Redmine #14756 review j#96988 R12-F11). A true
+    # legacy `lane_epoch=0` lane launches with no epoch declared and none injected, which
+    # conditional C (j#96844 rule 1) keeps as a supported path — so the previous form, which
+    # only asked whether each side parsed as a canonical epoch, filed a
+    # `lane_epoch_not_injected` failure against every legitimate legacy boot. That is a false
+    # entry in the diagnostic projection, and this fence was added to make disagreement
+    # visible, not to invent it. (Introduced by the F7 fix in the round before; the fence
+    # became stricter than the contract it enforces.)
+    both_absent = not lane_epoch and not observed_epoch
+    if not both_absent and (
         observed_epoch != lane_epoch
         or declared_reason != EPOCH_OK
         or seen_reason != EPOCH_OK

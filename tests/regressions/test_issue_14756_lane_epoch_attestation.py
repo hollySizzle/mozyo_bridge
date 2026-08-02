@@ -2797,18 +2797,161 @@ class R11ReviewFindingsStayClosed(unittest.TestCase):
     # -- F9: the docs stopped describing a contract the code does not have -------
 
     def test_no_doc_or_docstring_still_describes_the_superseded_contract(self) -> None:
-        roots = [
-            ROOT.parent / "src/mozyo_bridge/core/state/lane_epoch.py",
-            ROOT.parent / "src/mozyo_bridge/core/state/lane_lifecycle_model.py",
-            ROOT.parent / "vibes/docs/logics/managed-state-model.md",
-            ROOT.parent / "vibes/docs/specs/herdr-native-identity.md",
-        ]
-        stale = ("at least the required", "現行 `lane_epoch` 以上", "backup は file copy")
-        for path in roots:
-            text = pathlib.Path(path).read_text()
-            for phrase in stale:
-                with self.subTest(path=path.name, phrase=phrase):
+        """Bans AND positive assertions (Redmine #14756 review j#96988 R12-F13).
+
+        The first version of this test banned three literal strings and passed while several
+        real stale variants sat untouched — `exact int 0`, the malformed-set spelled as
+        "TEXT ... malformed", and a backup section still calling the lifecycle sibling a
+        file copy. A ban list only closes the phrasings its author happened to think of, so
+        each contract is ALSO asserted positively: if the docs stop saying the true thing,
+        that fails too, whatever wording replaced it.
+        """
+        docs = {
+            path.name: pathlib.Path(path).read_text()
+            for path in (
+                ROOT.parent / "src/mozyo_bridge/core/state/lane_epoch.py",
+                ROOT.parent / "src/mozyo_bridge/core/state/lane_lifecycle_model.py",
+                ROOT.parent / "vibes/docs/logics/managed-state-model.md",
+                ROOT.parent / "vibes/docs/specs/herdr-native-identity.md",
+            )
+        }
+        banned = (
+            "at least the required",
+            "現行 `lane_epoch` 以上",
+            "backup は file copy",
+            "exact int `0`",
+            "lane_epoch = lane_epoch + 1` として",
+            "`lane_lifecycle_schema.backup_state_container` and `state_store._backup` still use",
+        )
+        for name, text in docs.items():
+            for phrase in banned:
+                with self.subTest(doc=name, banned=phrase):
                     self.assertNotIn(phrase, text)
+
+        # The contract must still be STATED, not merely un-contradicted.
+        model = docs["managed-state-model.md"]
+        self.assertIn("canonical decimal TEXT", model)
+        self.assertIn("NONE affinity", model)
+        identity = docs["herdr-native-identity.md"]
+        self.assertIn("完全一致", identity)  # admission is equality, not a lower bound
+        self.assertIn("canonical decimal TEXT", identity)
+
+
+class R12ReviewFindingsStayClosed(unittest.TestCase):
+    """Redmine #14756 review j#96988 — R12-F11..F13, each reproduced first.
+
+    F11 is the third time on this issue that a fence I added to close one hole opened
+    another: the raw byte-exact comparison from R11-F7 also started filing a failure event
+    against every legitimate legacy boot.
+    """
+
+    def test_a_true_legacy_launch_records_no_failure_event(self) -> None:
+        """R12-F11: both sides absent is AGREEMENT, not a failed injection.
+
+        Conditional C (j#96844 rule 1) keeps the true legacy `lane_epoch=0` path supported.
+        Such a launch declares no epoch and receives none, so the diagnostic projection must
+        stay clean — this fence exists to make disagreement visible, not to invent it.
+        """
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_agent_attest as attest,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            seen: list = []
+            record = attest.perform_self_attestation(
+                assigned_name="n", workspace_id=WS, role="claude", lane=LANE,
+                env={"MOZYO_HERDR_BINARY": "/usr/bin/true"},  # no epoch injected
+                lane_epoch="",                                 # and none declared
+                home=Path(tmp),
+                append_event=lambda stage, bounded_reason="": seen.append(
+                    (stage, bounded_reason)
+                ),
+                runner=lambda *a, **k: type(
+                    "R", (), {
+                        "returncode": 0,
+                        "stdout": '{"agents":[{"name":"n","pane_id":"%1"}]}',
+                    }
+                )(),
+            )
+            self.assertIsNotNone(record)
+            self.assertEqual(record.lane_epoch, "")
+            reasons = [reason for _stage, reason in seen]
+            self.assertNotIn("lane_epoch_not_injected", reasons)
+
+    def test_one_sided_or_noncanonical_agreement_still_fails(self) -> None:
+        # The converse, so the fix above cannot have simply disabled the fence.
+        for expected, observed in (("1", None), ("", "1"), ("01", "01")):
+            with self.subTest(expected=expected, observed=observed):
+                with tempfile.TemporaryDirectory() as tmp:
+                    record = ForgedEpochsAndUnboundedTokensFailClosed._attest(
+                        tmp, expected=expected, observed=observed
+                    )
+                    self.assertEqual(record.lane_epoch, "")
+
+    def test_a_tampered_autoincrement_sequence_is_not_published(self) -> None:
+        """R12-F12: `sqlite_sequence` is internal but not derivable.
+
+        Measured before the fix: with user rows, schema and version identical, rewriting the
+        snapshot's `seq` from 1 to 999 published — and the published snapshot's next insert
+        took id 1000 where the source's would have taken 2. A backup that hands out IDs the
+        source would never issue is not an exact recovery point.
+        """
+        from mozyo_bridge.core.state import lane_lifecycle_backup as backup
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "state.sqlite"
+            conn = sqlite3.connect(path)
+            conn.execute(
+                "CREATE TABLE lane_lifecycle_records "
+                "(id INTEGER PRIMARY KEY AUTOINCREMENT, lane_id TEXT)"
+            )
+            conn.execute("INSERT INTO lane_lifecycle_records (lane_id) VALUES ('a')")
+            conn.execute("PRAGMA user_version=9")
+            conn.commit()
+            before = path.read_bytes()
+
+            real = backup._snapshot_state_container
+
+            def _tamper(source, target):
+                real(source, target)
+                edit = sqlite3.connect(target)
+                edit.execute("UPDATE sqlite_sequence SET seq=999")
+                edit.commit()
+                edit.close()
+
+            with mock.patch.object(backup, "_snapshot_state_container", _tamper):
+                with self.assertRaises(backup.StateStoreError):
+                    backup.backup_state_container(path)
+
+            backups = pathlib.Path(tmp) / "backups"
+            self.assertEqual(list(backups.glob("state-*")), [])
+            self.assertEqual(list(backups.glob(".staging-*")), [])
+            self.assertEqual(path.read_bytes(), before)
+            conn.close()
+
+    def test_an_untampered_autoincrement_store_still_backs_up(self) -> None:
+        # Including `sqlite_sequence` must not make every AUTOINCREMENT store unbackupable.
+        from mozyo_bridge.core.state import lane_lifecycle_backup as backup
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "state.sqlite"
+            conn = sqlite3.connect(path)
+            conn.execute(
+                "CREATE TABLE lane_lifecycle_records "
+                "(id INTEGER PRIMARY KEY AUTOINCREMENT, lane_id TEXT)"
+            )
+            conn.execute("INSERT INTO lane_lifecycle_records (lane_id) VALUES ('a')")
+            conn.commit()
+            self.assertIsNotNone(backup.backup_state_container(path))
+            conn.close()
+
+    def test_identifiers_are_quoted_rather_than_interpolated_bare(self) -> None:
+        # The digest interpolates table and column names (identifiers cannot be bound), so a
+        # reserved word or a quote in a name must not change the statement's shape.
+        from mozyo_bridge.core.state.lane_lifecycle_backup import _quote_identifier
+
+        self.assertEqual(_quote_identifier("order"), '"order"')
+        self.assertEqual(_quote_identifier('we"ird'), '"we""ird"')
 
 
 class ExistingFencesAreNotWeakened(unittest.TestCase):

@@ -104,6 +104,11 @@ def _snapshot_state_container(source: Path, target: Path) -> None:
             src.backup(dst)
 
 
+def _quote_identifier(name: str) -> str:
+    """Quote a table / column name for interpolation (identifiers cannot be bound)."""
+    return '"' + name.replace('"', '""') + '"'
+
+
 def _content_digest(conn: sqlite3.Connection) -> str:
     """A deterministic digest of the whole logical database — schema AND every cell.
 
@@ -126,23 +131,32 @@ def _content_digest(conn: sqlite3.Connection) -> str:
         "ORDER BY type, name"
     ).fetchall()
     digest.update(repr(schema).encode())
-    tables = [
-        name
-        for _type, name, _sql in schema
-        if _type == "table"
-    ]
+    tables = [name for _type, name, _sql in schema if _type == "table"]
+    # `sqlite_sequence` is internal but NOT derivable: it holds the next AUTOINCREMENT value,
+    # so a snapshot that omits it can hand out IDs the source would never have issued
+    # (Redmine #14756 review j#96988 R12-F12 — measured: tampering `seq` 1 -> 999 published,
+    # and the published snapshot's next insert took 1000 where the source's would be 2).
+    # Other `sqlite_%` objects are derivable metadata (statistics, auto-indexes) and are
+    # deliberately still excluded: including them would make the digest depend on physical
+    # layout, which a logical snapshot legitimately changes.
+    if conn.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'"
+    ).fetchone()[0]:
+        tables.append("sqlite_sequence")
     for table in tables:
+        quoted_table = _quote_identifier(table)
         columns = [
             row[1]
-            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            for row in conn.execute(f"PRAGMA table_info({quoted_table})").fetchall()
         ]
         if not columns:
             continue
         projection = ", ".join(
-            f"typeof({column}), {column}" for column in columns
+            f"typeof({_quote_identifier(column)}), {_quote_identifier(column)}"
+            for column in columns
         )
         rows = conn.execute(
-            f"SELECT {projection} FROM {table} ORDER BY {projection}"
+            f"SELECT {projection} FROM {quoted_table} ORDER BY {projection}"
         ).fetchall()
         digest.update(table.encode())
         digest.update(repr(rows).encode())
