@@ -58,6 +58,9 @@ if TYPE_CHECKING:
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_ops import (
     GATEWAY_READY_CAPTURE_LINES,
 )
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_launch_composition import (  # noqa: E501
+    LAUNCH_CAUSE_GENERIC_FRESH,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_startup_projection import (
     project_sublane_startup,
 )
@@ -186,6 +189,10 @@ class HerdrSublaneActuatorOps:
     #: (Redmine #13933 R12). Empty on every normal create/heal.
     replacement_assigned_name: str = ""
     replacement_old_locator: str = ""
+    #: The typed launch cause this actuator's relaunch carries (Redmine #14741 j#97171).
+    #: Defaults to the UNARMED cause, so every existing create / heal / recover caller that
+    #: omits it is byte-invariant and queries no updater.
+    replacement_launch_cause: str = LAUNCH_CAUSE_GENERIC_FRESH
     #: Recover-pair's explicit both-absent v1 mode: launch and receipt-bind only the exact
     #: target provider. Default False preserves the pair-managed #13933 replacement path.
     replacement_target_only: bool = False
@@ -382,6 +389,7 @@ class HerdrSublaneActuatorOps:
                 action_nonce=action_nonce,
                 startup_fence=startup_fence,
                 admission_lock_held=admission_lock_held,
+                launch_cause=self.replacement_launch_cause,
                 # Redmine #13647 T1b (review j#85848 F1): the lane's delegation-geometry
                 # kind must reach the FIRST launch. The lifecycle row this lane heals from
                 # is declared only after this call returns, so a fresh create has no stored

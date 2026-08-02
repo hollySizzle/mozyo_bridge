@@ -20,6 +20,9 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     HerdrIdentityAttestationStore,
     evaluate_attestation,
 )
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_launch_composition import (  # noqa: E501
+    LAUNCH_CAUSE_GENERIC_FRESH,
+)
 from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
     HerdrIdentityReplacementBindingStore,
     ReplacementActionBinding,
@@ -68,6 +71,7 @@ def prepare_actuator_lane_session(
     admission_lock_held: bool = False,
     launch_context: object = None,
     pair_order: object = None,
+    launch_cause: str = LAUNCH_CAUSE_GENERIC_FRESH,
 ) -> SessionStartResult:
     """Compose one actuator launch, optionally beneath its caller-held store lock.
 
@@ -110,6 +114,7 @@ def prepare_actuator_lane_session(
         action_nonce=action_nonce,
         startup_fence=startup_fence,
         launch_context=launch_context,
+        launch_cause=launch_cause,
     )
 
 

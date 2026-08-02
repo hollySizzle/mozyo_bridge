@@ -102,6 +102,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_runtime_fence import (  # noqa: E501
     SublaneHealError,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_launch_cause import (  # noqa: E501
+    launch_cause_for_pin,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_ops import (  # noqa: E501
     HerdrSublaneActuatorOps,
 )
@@ -179,6 +182,7 @@ def _quarantine_request(request: RecoveryRequest) -> QuarantineRequest:
 
 
 @dataclass
+
 class LiveRecoveryActuatorPort:
     """The live exact-generation close / launch / attest port (reuses the #13763 live ops).
 
@@ -407,6 +411,14 @@ class LiveRecoveryActuatorPort:
         broad final ``except`` stays — it is the fail-closed floor — but it no longer swallows
         the typed reasons the fences above it raise.
         """
+        cause = launch_cause_for_pin(pin)
+        if not cause:
+            # An unusable cause is decided BEFORE the actuator is built, so the first Herdr
+            # write never happens (Redmine #14741 j#97171). Value-free: the offending token
+            # is not carried into the public reason.
+            self.launch_failure_reason = LAUNCH_FAILURE_UNTYPED
+            self.launch_startup_health = None
+            return LAUNCH_ERROR
         try:
             HerdrSublaneActuatorOps(
                 repo_root=self.repo_root, lane_label=_norm(self.request.lane),
@@ -415,6 +427,7 @@ class LiveRecoveryActuatorPort:
                 replacement_action_id=_norm(action_id),
                 replacement_assigned_name=_norm(pin.assigned_name),
                 replacement_old_locator=_norm(pin.old_locator),
+                replacement_launch_cause=cause,
             ).heal_lane_column(
                 str(self.repo_root), target_provider=_norm(pin.provider) or None
             )

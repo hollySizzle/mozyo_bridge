@@ -123,6 +123,9 @@ from mozyo_bridge.core.state.workspace_registry import (
     read_anchor,
     register_workspace,
 )
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_launch_composition import (  # noqa: E501
+    LAUNCH_CAUSE_GENERIC_FRESH,
+)
 from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
     AttestationStoreLockBusy,
     attestation_store_lock,
@@ -292,6 +295,7 @@ def prepare_session(
     probe: "Optional[StartupProbe]" = None,
     startup_fence: "Optional[StartupTransactionFence]" = None,
     action_nonce: str = "",
+    launch_cause: str = LAUNCH_CAUSE_GENERIC_FRESH,
 ) -> SessionStartResult:
     """Managed-launch admission under the store's shared lock (Redmine #13882 j#80190).
 
@@ -385,6 +389,7 @@ def _prepare_session_locked(
     probe: "Optional[StartupProbe]" = None,
     startup_fence: "Optional[StartupTransactionFence]" = None,
     action_nonce: str = "",
+    launch_cause: str = LAUNCH_CAUSE_GENERIC_FRESH,
 ) -> SessionStartResult:
     """Mint (or adopt) durable herdr identities for ``providers`` (fail-closed).
 
@@ -637,6 +642,10 @@ def _prepare_session_locked(
             [plan.provider for plan in launch_plans],
             env,
             permission_mode_default=claude_permission_mode_default,
+            # The typed cause the CALLER proved, defaulting to the unarmed one. A create or
+            # an ordinary heal never names a cause, so its preflight is byte-invariant and
+            # queries no updater (Redmine #14741 j#97171).
+            launch_cause=launch_cause,
         )
     except AgentProviderProfileError as exc:
         # Includes AgentProviderExecutableError (unknown / undrivable / missing /
