@@ -67,8 +67,13 @@ def _lifecycle_port(home: Optional[Path]):
         ]
         if len(matched) != 1:
             return None
+        # `lane_generation` / `revision`, which is what the record actually exposes. The
+        # first cut read `generation`, an attribute no lifecycle record has ever had, so the
+        # port answered `("", ...)` for every lane and the receipt-capable path could not
+        # plan at all -- and I reported that as a platform limitation (j#97115) rather than
+        # as the typo it was. Both are ints on the record; the planner wants exact text.
         return (
-            str(getattr(matched[0], "generation", "") or ""),
+            str(getattr(matched[0], "lane_generation", "") or ""),
             str(getattr(matched[0], "revision", "") or ""),
         )
 
