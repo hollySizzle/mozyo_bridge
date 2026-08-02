@@ -53,9 +53,10 @@ What the adapter can and cannot express is the safety story, so it is enumerated
 Every probe fails closed: a ``git`` that could not run has proven nothing, so a failed
 invocation reads as the unsafe answer (not a workspace, not an ancestor, not reachable,
 dirty) rather than as a permissive one. A ref name that could not be handed to ``git`` in the
-first place is the same kind of answer and is returned the same way — the reads refuse by
-value (j#96461 finding 2). The push refuses by RAISING instead, for the reason recorded on
-:class:`UnsafeRefspecError` and in the port's own ``push_non_force`` contract. The
+first place is the same kind of answer, and every operation that takes one returns it that
+way: a read answers ``""`` / ``False``, the merge answers ``invalid_input``, and the push
+answers ``accepted=False, rejected=False`` without spawning anything (j#96461 finding 2,
+j#96499 finding 1). Nothing about a ref name leaves this adapter as an exception. The
 spawn-failure mapping mirrors
 :meth:`...application.sublane_integration.LiveSublaneGitOperations._run` — a missing ``cwd``
 after a host reboot (#14499) raises ``FileNotFoundError`` rather than exiting non-zero, and
@@ -114,18 +115,13 @@ class UnsafeRefspecError(ValueError):
     constructed ``git push`` argv *means* — ``+`` spells a force inside a refspec, and a
     leading ``-`` turns the value into an option — so the argv is never built at all.
 
-    **Why the push raises rather than returning.** Not because it has nowhere to put a
-    refusal — R19 wrote that and it is false: :meth:`push_non_force` returns a
-    :class:`PushResult` and the use case reads its ``accepted`` (j#96492 finding 4). Because
-    both ``PushResult`` states describe a push that was ATTEMPTED, and folding an unusable ref
-    into ``accepted=False`` would repeat the conflation the merge's boolean made of a conflict
-    and a missing object (j#96412 finding 2). The full contract is on the port's
-    ``push_non_force``, where a caller reading the protocol will find it.
-
-    The READ probes catch it instead and answer their own fail-closed value (``""``, ``False``):
-    a read that cannot answer has refused, and the actuator's preflight performs those reads
-    before it reaches the apply that would have classified the same input as ``invalid_input``.
-    R18 let this escape out of a read and take the whole run down (j#96461 finding 2).
+    **This exception does not leave the adapter.** All three call sites catch it and answer in
+    that operation's own fail-closed vocabulary: a read returns ``""`` / ``False``,
+    :meth:`apply_merge` returns ``invalid_input``, and :meth:`push_non_force` returns
+    ``accepted=False, rejected=False`` — the state it already used for an unusable source
+    head. Three rounds went into defending an escape out of one of them (j#96461 finding 2,
+    j#96492 finding 4, j#96499 finding 1); an unusable input is a refusal, and this adapter
+    now has one way of saying so.
     """
 
 
@@ -916,8 +912,16 @@ class LiveAutoIntegrationGitOperations:
         The refspec is built from a validated bare branch name, so it can never carry the
         leading ``+`` that spells a force. A rejection means the remote moved; the answer is
         to re-form the action against the new head, and this adapter offers no other one.
+
+        **Both unusable inputs are refused the same way** — ``accepted=False,
+        rejected=False``, nothing spawned — because they are the same kind of thing. The
+        state's meaning is the port's; what R19 and R20 got wrong about it, twice, is in the
+        design doc (j#96499 finding 1). ``rejected`` keeps its one meaning, the remote moved.
         """
-        branch = _checked_branch(target_ref)
+        try:
+            branch = _checked_branch(target_ref)
+        except UnsafeRefspecError as unsafe:
+            return PushResult(accepted=False, rejected=False, detail=str(unsafe))
         if not _is_full_sha(source_head):
             return PushResult(
                 accepted=False,

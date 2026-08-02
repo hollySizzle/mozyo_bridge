@@ -299,17 +299,19 @@ driver も `info/attributes` も **sandbox から見えない**ので、宣言�
   黙って `main` へ書き換えていた (j#96461 F2)。**周囲 whitespace の trim は record 生成時の
   `normalized_branch` が 1 回だけ行う** upstream の工程であり、adapter 層ではない。
   さらに **typed 拒否は apply path だけでは足りない**: actuator は apply の前に必ず target ref で
-  remote tip を読むため、**read probe は raise せず自身の fail-closed 値 (`""` / `False`) を返す**。
-  raise を保つのは mutation (`push_non_force`) のみ (j#96461 F2 — R18 は read から例外が抜けて
-  run 全体が落ちた)。**その理由は「戻り値が無いから」ではない** — `push_non_force` は `PushResult` を
-  返し、use case は `accepted` を読む (R19 の記述は誤り、j#96492 F4)。理由は `PushResult` の 2 state が
-  **どちらも「試行された push」を表す**ことである: `accepted` か、remote が動いたための `rejected` で、
-  後者の解決策は「新 target head で action を組み直す」。使用不能な ref はそのどちらでもなく、
-  `accepted=False` へ畳むと **conflict と missing object を bool へ畳んだのと同型の誤分類** になる
-  (j#96412 F2)。加えて構造上到達し得ない — apply が同 ref を `invalid_input` で拒否し、
-  push authority は `merge_status == merged` の apply の後にしか生じない。よって raise は
-  **broken invariant の表明**であり、caller が扱う path ではない。この exception contract は
-  **port docstring に literal で書く** (adapter の実装を読まないと分からない状態にしない)。
+  remote tip を読む (j#96461 F2 — R18 は read から例外が抜けて run 全体が落ちた)。
+  **使用不能な ref は、それを取る全 operation が自身の fail-closed 値で返す**:
+  read は `""` / `False`、`apply_merge` は `invalid_input`、`push_non_force` は
+  **`accepted=False, rejected=False`** (spawn 0)。`UnsafeRefspecError` は adapter 内部の signal であり、
+  **ref 名に起因する例外は adapter の外へ出ない**。
+  `PushResult` は **3 state** である: `accepted` / remote が動いた `rejected` / **未試行拒否**
+  (`accepted=False, rejected=False`)。3 番目は残り物ではなく、**R1 から使用不能な source head の
+  拒否に使われてきた**。`rejected` は「remote が動いた」以外を意味してはならない。
+  > R19-R20 はここで raise を維持し、2 度異なる根拠で正当化した — 「戻り値が無い」(j#96492 F4) と
+  > 「2 state はどちらも試行済み / apply が先に拒否するので到達不能」(j#96499 F1)。**3 つとも
+  > 実装に反証された**: `PushResult` は use case が読んでおり、3 番目の state は既に存在し、
+  > **fast-forward disposition は apply を一度も呼ばずに push へ進む**。
+  > 教訓は「置き換えた根拠を実装に当てて確かめる」であり、doc に残す。
   **dedicated integration worktree は存在しない** (j#96406 F1)。
   **commit は「同一 git version の下で、同一 repository 内容に対し」再構築可能**であり、
   hook 非実行・無署名 (上節)。

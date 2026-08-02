@@ -212,10 +212,47 @@ class RefspecSafetyTest(unittest.TestCase):
         self.assertEqual(recorder.argvs, [], "no git may be spawned for an unusable ref")
 
     def test_the_push_refuses_an_unsafe_target_before_spawning_git(self) -> None:
+        """j#96499 finding 1: the refusal is a RESULT, and the same one both inputs get.
+
+        R19 and R20 let this out as an exception and defended it twice — once on the claim
+        that ``PushResult`` could not express a refusal that never tried, while the unusable
+        SOURCE head had been getting exactly that state since R1. The two are asserted
+        together here so they cannot drift apart again.
+        """
         recorder = _Recorder([])
-        with self.assertRaises(UnsafeRefspecError):
-            _adapter(recorder).push_non_force(source_head=SOURCE, target_ref="+main")
-        self.assertEqual(recorder.argvs, [])
+        adapter = _adapter(recorder)
+        for unusable in (
+            {"source_head": SOURCE, "target_ref": "+main"},
+            {"source_head": SOURCE, "target_ref": "main\x00bad"},
+            {"source_head": "not-a-sha", "target_ref": "main"},
+        ):
+            result = adapter.push_non_force(**unusable)
+            self.assertFalse(result.accepted, unusable)
+            # NOT `rejected`: that word means the remote moved, and nothing was attempted.
+            self.assertFalse(result.rejected, unusable)
+            self.assertTrue(result.detail, unusable)
+        self.assertEqual(recorder.argvs, [], "no git may be spawned for an unusable input")
+
+    def test_no_ref_name_leaves_the_adapter_as_an_exception(self) -> None:
+        # The three operations that take a ref, each answering in its own fail-closed
+        # vocabulary. `UnsafeRefspecError` is an internal signal; nothing re-raises it.
+        recorder = _Recorder([])
+        adapter = _adapter(recorder)
+        for name in ("+main", "main\x00bad", "-main"):
+            self.assertEqual(adapter.remote_branch_tip(name), "", repr(name))
+            self.assertFalse(adapter.commit_on_remote(SOURCE, branch=name), repr(name))
+            self.assertEqual(
+                adapter.apply_merge(
+                    source_head=SOURCE, target_ref=name, expected_target_head=TARGET
+                ).status,
+                MERGE_INVALID_INPUT,
+                repr(name),
+            )
+            self.assertFalse(
+                adapter.push_non_force(source_head=SOURCE, target_ref=name).accepted,
+                repr(name),
+            )
+        self.assertEqual(recorder.argvs, [], "none of them reached a git invocation")
 
 
 class PushTest(unittest.TestCase):

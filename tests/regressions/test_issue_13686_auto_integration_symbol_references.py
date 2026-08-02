@@ -10,7 +10,10 @@ five ``:meth:`_sanitized_git_dir``` references behind in ``auto_integration_live
 ``#:`` comments and docstrings, where nothing executes them. It was the fourth consecutive
 round of the same thing: R14 through R17 each claimed a sweep of the tracked files and each
 narrowed what "sweep" meant, and each time the reviewer found what the claim had missed
-(j#96435 F5, j#96441 F5, j#96447 F3, j#96453 F3, j#96461 F4). Fixed in #13686 R20.
+(j#96435 F5, j#96441 F5, j#96447 F3, j#96453 F3, j#96461 F4). Fixed in #13686 R19, commit
+``749e31a1``, which repointed the five references at ``_open_sandbox`` and added the checker
+below. (R20 ``2ba9376f`` only moved this file here and wrote this paragraph; saying it was the
+fix was itself a description that did not match the code — j#96499 finding 2.)
 
 Repeating the claim a fifth time is not a fix. The check is mechanical, so it is performed
 mechanically: this module resolves every Sphinx cross-reference in the auto-integration

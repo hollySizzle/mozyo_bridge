@@ -69,11 +69,16 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 
 @dataclass(frozen=True)
 class PushResult:
-    """The outcome of a normal, non-force push.
+    """The outcome of a normal, non-force push — three states, not two.
 
-    ``rejected`` is what a lost race looks like: the remote moved and a non-force push
-    cannot advance it. There is deliberately no field that would let a caller retry it as a
-    force — the resolution is to re-form the action against the new target head.
+    ``accepted`` — it landed. ``rejected`` — a lost race: the remote moved and a non-force
+    push cannot advance it; this is the only thing ``rejected`` may mean. And
+    ``accepted=False, rejected=False`` — the push was never ATTEMPTED, because an input could
+    not be used. The third state is not a leftover; it is how an implementation refuses an
+    unusable source head or target ref without raising (j#96499 finding 1).
+
+    There is deliberately no field that would let a caller retry a rejection as a force — the
+    resolution is to re-form the action against the new target head.
     """
 
     accepted: bool
@@ -199,16 +204,17 @@ class AutoIntegrationGitOperations(Protocol):
     def push_non_force(self, *, source_head: str, target_ref: str) -> PushResult:
         """Push ``source_head`` to ``target_ref`` with a normal, non-force push.
 
-        :class:`PushResult` describes a push that was ATTEMPTED: ``accepted``, or ``rejected``
-        because the remote moved. An implementation that cannot express ``target_ref`` as a
-        provably non-force refspec at all MAY raise instead — and this is the one place in the
-        port where raising is contract rather than defect, so it is written down here rather
-        than left to a reader of the adapter (j#96492 finding 4). Neither ``PushResult`` state
-        fits: nothing was attempted, and the rejected case's resolution — re-form the action
-        against the new target head — cannot help a ref no push can ever use. Callers reach
-        this step only after an apply that returned ``merged``, which has already refused such
-        a ref as ``invalid_input``, so the raise marks a broken invariant and not a path a
-        caller is expected to handle.
+        The result carries three distinguishable outcomes, and an implementation MUST NOT
+        collapse them: ``accepted``; ``rejected``, which means the remote moved and is the
+        ONLY thing that word may mean here; and ``accepted=False, rejected=False``, which
+        means the push was never attempted because an input could not be used — an incomplete
+        source head, or a ``target_ref`` that cannot be spelled as a provably non-force
+        refspec. **Refusing an unusable input is a return value, not an exception.** R19 and
+        R20 documented a raise here on two premises that the adapter itself refutes: that the
+        third state did not exist (it has, for the source head, since R1), and that an
+        unusable ref could not reach the push because the apply refuses it first (a
+        fast-forward disposition never calls the apply) — j#96492 finding 4, j#96499
+        finding 1.
         """
         ...
 
