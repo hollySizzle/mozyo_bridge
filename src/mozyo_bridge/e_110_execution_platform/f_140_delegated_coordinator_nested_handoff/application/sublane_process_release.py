@@ -42,6 +42,7 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     IdentityAttestationRecord,
     evaluate_attestation,
 )
+from mozyo_bridge.core.state.lane_epoch import lane_epoch_verdict
 from mozyo_bridge.core.state.lane_pin_role import (
     resolve_declared_pin_pair,
 )
@@ -160,6 +161,7 @@ def evaluate_pair_attestation(
     read_attestation: Callable[[str], Optional[IdentityAttestationRecord]],
     *,
     fresh_after: Optional[str] = None,
+    epoch_record: Optional[object] = None,
 ) -> tuple[bool, bool, str]:
     """``(both_slots_live, attested, detail)`` for a lane's gateway/worker pair.
 
@@ -183,8 +185,16 @@ def evaluate_pair_attestation(
     caller-supplied CAS stamp that regresses, a host clock that rolls back, and an
     ``observed_at`` written by the attesting process itself. The clock-independent
     discriminator lives in
-    :mod:`mozyo_bridge.core.state.lane_released_locator_fence`, and the authority-grade
-    proof is Redmine #14756.
+    :mod:`mozyo_bridge.core.state.lane_released_locator_fence`.
+
+    ``epoch_record`` (Redmine #14756) is the lane's lifecycle row, and supplying it adds the
+    **authority-grade** conjunct the two above could not be: each slot's attested
+    ``lane_epoch`` must be strictly newer than the epoch the released generation held
+    (:mod:`mozyo_bridge.core.state.lane_epoch`). It is an ADDITIONAL conjunct, not a
+    replacement — every existing fence keeps its exact verdict, so this can only ever refuse
+    more, never admit something the pre-#14756 rail refused. ``None`` (supersede's fresh
+    recovery lane, where a survivor is impossible by construction) skips it, exactly as
+    ``fresh_after`` is skipped there.
     """
     slots = unit_slots(rows, workspace_id, lane)
     if GATEWAY_ROLE not in slots or WORKER_ROLE not in slots:
@@ -210,6 +220,21 @@ def evaluate_pair_attestation(
             observed = _norm(record.observed_at) if record is not None else ""
             if not observed or observed <= threshold:
                 return True, False, f"{role}: stale_generation"
+        if epoch_record is not None:
+            # Redmine #14756: the clock-free, locator-free half. The epoch reached this
+            # process only as an injected env var, and a live process's env is immutable to
+            # every other process (POSIX), so a pane that SURVIVED hibernate's release
+            # necessarily still holds a pre-advance epoch and cannot clear this. The RAW
+            # attested token is passed through — the classifier is byte-exact on purpose, and
+            # normalising here would launder a token the lifecycle authority never minted.
+            # ``record`` is necessarily non-None here: ``evaluate_attestation(None, ...)``
+            # returns ``ATTEST_ABSENT`` and the ``join.ok`` guard above already returned. No
+            # ``if record is not None`` fallback is written for that reason — an unreachable
+            # branch would silently absorb a decode bug as "epoch absent" (#14477 R5-F1: an
+            # unreachable shape is where a semantic error hides).
+            epoch_ok, epoch_reason = lane_epoch_verdict(epoch_record, record.lane_epoch)
+            if not epoch_ok:
+                return True, False, f"{role}: {epoch_reason}"
     return True, True, "both slots attested and generation-matched"
 
 

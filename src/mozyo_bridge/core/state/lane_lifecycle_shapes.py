@@ -47,6 +47,7 @@ _V6_ADDS = frozenset({"reconcile_phase"})  # #13842 reconcile owed-close provena
 _V7_ADDS = frozenset({"lane_kind"})  # #13647 generation-bound lane-role heal authority
 _V8_ADDS = frozenset({"hibernated_at"})  # #14477 immutable resume-freshness boundary
 _V9_ADDS = frozenset({"release_observation"})  # #14477 j#94582 release-observation authority
+_V10_ADDS = frozenset({"lane_epoch"})  # #14756 monotonic hibernate-generation epoch
 
 #: The EXACT allowed column-name signatures per recorded version (Redmine #13754 R6-F1,
 #: j#78803). A recognized store must match one of its version's signatures EXACTLY (set
@@ -65,6 +66,7 @@ _SHAPE_V6 = _V1_COLUMNS | _V2_ADDS | _V3_ADDS | _V4_ADDS | _V5_ADDS | _V6_ADDS
 _SHAPE_V7 = _SHAPE_V6 | _V7_ADDS
 _SHAPE_V8 = _SHAPE_V7 | _V8_ADDS
 _SHAPE_V9 = _SHAPE_V8 | _V9_ADDS
+_SHAPE_V10 = _SHAPE_V9 | _V10_ADDS
 _ALLOWED_SHAPES_BY_VERSION: dict[int, tuple[frozenset, ...]] = {
     1: (_SHAPE_V1,),
     2: (_SHAPE_V2,),
@@ -75,6 +77,7 @@ _ALLOWED_SHAPES_BY_VERSION: dict[int, tuple[frozenset, ...]] = {
     7: (_SHAPE_V7,),
     8: (_SHAPE_V8,),
     9: (_SHAPE_V9,),
+    10: (_SHAPE_V10,),
 }
 
 #: The authority-affecting definition each column MUST carry: ``(type, notnull, default,
@@ -108,4 +111,10 @@ _COLUMN_DEFS: dict[str, tuple[str, int, Optional[str], int]] = {
     "lane_kind": ("TEXT", 1, "''", 0),
     "hibernated_at": ("TEXT", 1, "''", 0),
     "release_observation": ("TEXT", 1, "''", 0),
+    # #14756: the monotonic hibernate-generation epoch. INTEGER (not TEXT) because the
+    # STORE derives it — ``lane_epoch = lane_epoch + 1`` inside the hibernate CAS — and no
+    # caller ever supplies a value that would have to be parsed. ``0`` is the migration
+    # default and means NO EPOCH HAS EVER BEEN MINTED for this lane; it is never a
+    # substitute boundary (see :mod:`...lane_epoch`).
+    "lane_epoch": ("INTEGER", 1, "0", 0),
 }

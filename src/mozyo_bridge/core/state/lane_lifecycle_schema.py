@@ -87,11 +87,22 @@ LANE_LIFECYCLE_COMPONENT = "lane_lifecycle"
 #: and is distinct from a recorded COMPLETE-EMPTY observation; resume fails closed on the former
 #: and may accept the latter as positive "no process was live" evidence. Semantics, envelope and
 #: the writer/read matching contract: :mod:`...lane_release_observation`.
-LANE_LIFECYCLE_SCHEMA_VERSION = 9
-#: The component shapes this build can read and write. ``1``–``8`` are migrated
-#: additively to ``9``; anything else — a newer version from a future build, or a foreign
+#: v10 (Redmine #14756) adds ``lane_epoch`` — the MONOTONIC hibernate-generation counter the
+#: resume proof is bound to. It is minted by exactly one event (the disposition CAS INTO
+#: ``hibernated``) as ``lane_epoch = lane_epoch + 1`` evaluated against the row's OWN stored
+#: value, so no caller can supply, backdate or reconcile it — the defect shape that defeated
+#: the v8 timestamp and the pre-v9 caller-supplied pins alike. It is injected into a managed
+#: launch's process env and self-attested by the process that received it, and because a live
+#: process's env is immutable (POSIX) a pane that SURVIVED hibernate's release can only hold a
+#: pre-advance epoch. Unlike ``hibernated_at`` it is NEVER cleared on the way back to
+#: ``active``: resetting a counter re-mints epochs an earlier generation's processes still
+#: hold. A pre-v10 row migrates at ``0`` = never minted, which is reported UNAVAILABLE rather
+#: than used as a threshold. Semantics: :mod:`...lane_epoch`.
+LANE_LIFECYCLE_SCHEMA_VERSION = 10
+#: The component shapes this build can read and write. ``1``–``9`` are migrated
+#: additively to ``10``; anything else — a newer version from a future build, or a foreign
 #: value — fails closed and the store is left untouched (R3-F1).
-_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9})
+_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
 #: A coordinator decision that cannot be rebuilt from events; loss requires an
 #: explicit re-declare from the Redmine durable pointer.
 LANE_LIFECYCLE_RECOVERY_POLICY = "operator_current_state"
@@ -139,6 +150,7 @@ CREATE TABLE IF NOT EXISTS {_TABLE} (
     lane_kind TEXT NOT NULL DEFAULT '',
     hibernated_at TEXT NOT NULL DEFAULT '',
     release_observation TEXT NOT NULL DEFAULT '',
+    lane_epoch INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (repo_workspace_id, lane_id)
 )
 """
@@ -174,7 +186,7 @@ _COLUMNS = (
     "replacement_action_id, replacement_pins, decision_source, "
     "decision_issue_id, decision_journal, created_at, updated_at, worktree_identity, "
     "binding_kind, project_scope, lane_generation, declared_slots, reconcile_phase, "
-    "lane_kind, hibernated_at, release_observation"
+    "lane_kind, hibernated_at, release_observation, lane_epoch"
 )
 
 # The exact per-version shape / column-definition tables live in their own leaf so this
@@ -871,6 +883,18 @@ def ensure_lane_lifecycle_schema(path: Path) -> LifecycleSchemaOutcome:
                 conn.execute(
                     f"ALTER TABLE {_TABLE} "
                     "ADD COLUMN release_observation TEXT NOT NULL DEFAULT ''"
+                )
+            # v10 (Redmine #14756): the monotonic hibernate-generation epoch. A pre-v10 row
+            # lands at ``0`` = NO EPOCH EVER MINTED, which is NOT a threshold every attested
+            # epoch clears — the reader reports it UNAVAILABLE and the caller fails closed
+            # (:mod:`...lane_epoch`). Never back-filled from ``lane_generation``: that counter
+            # advances on re-incarnation, not on hibernation, so seeding it here would mint an
+            # epoch matching processes that were launched before this build existed. The only
+            # rail forward for such a lane is a real v10 hibernate transition.
+            if "lane_epoch" not in current_columns:
+                conn.execute(
+                    f"ALTER TABLE {_TABLE} "
+                    "ADD COLUMN lane_epoch INTEGER NOT NULL DEFAULT 0"
                 )
             conn.execute(_OWNER_INDEX_SQL)
             conn.execute(_PROJECT_OWNER_INDEX_SQL)

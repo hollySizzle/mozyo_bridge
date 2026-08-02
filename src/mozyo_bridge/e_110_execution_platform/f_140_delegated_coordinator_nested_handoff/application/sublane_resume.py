@@ -435,6 +435,15 @@ class SublaneResumeUseCase:
             lane,
             self.ops.read_attestation,
             fresh_after=hibernation_anchor,
+            # Redmine #14756: the authority-grade generation proof, added as a CONJUNCT.
+            # The lifecycle row mints a monotonic epoch inside the hibernate CAS from its
+            # own stored value, the launch injects it into the fresh processes' env, and
+            # each slot self-attests what it actually received. A survivor's env cannot be
+            # rewritten (POSIX), so it can only hold a pre-advance epoch. This defeats all
+            # three vectors the timestamp could not (backdated CAS stamp, regressed host
+            # clock, self-written ``observed_at``) WITHOUT depending on pane-id
+            # non-reuse — but it replaces nothing: every fence below keeps its verdict.
+            epoch_record=rec,
         )
         # Redmine #14477 disposition j#94544 A: the CLOCK-INDEPENDENT half of the proof. A
         # survivor keeps its tmux pane-id, so its locator is among the ones hibernate's release

@@ -74,6 +74,7 @@ import sys
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
+from mozyo_bridge.core.state.lane_epoch import lane_epoch_on_transition
 from mozyo_bridge.core.state.lane_hibernation_anchor import hibernation_anchor_on_transition
 from mozyo_bridge.core.state.lane_lifecycle_model import (
     BINDING_KIND_ISSUE,
@@ -517,6 +518,30 @@ class LaneLifecycleStore:
             replacement_pins = "" if rehydrating else current.replacement_pins
             # v8 (#14477): resume's freshness boundary moves ONLY here (lane_hibernation_anchor).
             anchor = hibernation_anchor_on_transition(current.hibernated_at, target=target, stamp=stamp)
+            # v10 (#14756): the hibernate-generation epoch is minted ONLY here, and only on
+            # the way INTO ``hibernated``. It is written as a literal computed from the
+            # row's own stored value under this same BEGIN IMMEDIATE + revision guard, so
+            # the increment is serialized with the disposition change it belongs to and no
+            # caller can supply, skip or backdate it. Note the asymmetry with ``anchor``
+            # above: the anchor CLEARS on the way back to ``active``, the epoch never does —
+            # resetting a counter would re-mint epochs a released generation still holds
+            # (:func:`lane_epoch_on_transition`).
+            epoch = lane_epoch_on_transition(
+                current.lane_epoch, target=target, hibernated=DISPOSITION_HIBERNATED
+            )
+            if epoch is None:
+                # The stored counter is not a value this writer can have produced (TEXT,
+                # REAL, bool, NULL or negative). Refuse the WHOLE transition with zero write
+                # rather than advance from it (#14756 j#96881 F2): minting from an unreadable
+                # value re-issues an epoch a released generation may still hold, and writing a
+                # normalised 0 back through a non-minting target would launder the corrupt row
+                # into one the adoption rail then mints to 1. Both are counter rollbacks.
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_FORBIDDEN_TRANSITION,
+                    revision=current.revision,
+                )
             declared_slots = current.declared_slots
             if rehydrating and encoded_rehydrated_slots is not None:
                 declared_slots = encoded_rehydrated_slots
@@ -527,7 +552,7 @@ class LaneLifecycleStore:
                     "release_action_id = ?, release_pins = ?, release_observation = ?, "
                     "replacement_state = ?, "
                     "replacement_action_id = ?, replacement_pins = ?, declared_slots = ?, "
-                    "hibernated_at = ?, revision = ?, "
+                    "hibernated_at = ?, lane_epoch = ?, revision = ?, "
                     "decision_source = ?, decision_issue_id = ?, decision_journal = ?, "
                     "updated_at = ? "
                     "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ?",
@@ -542,6 +567,7 @@ class LaneLifecycleStore:
                         replacement_pins,
                         declared_slots,
                         anchor,
+                        epoch,
                         revision,
                         decision.source,
                         decision.issue_id,

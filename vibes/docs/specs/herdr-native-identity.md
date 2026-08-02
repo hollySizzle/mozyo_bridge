@@ -113,6 +113,63 @@ resolver はこれを fail-closed に読む。
   next action として返す (自動 destructive repair を行わない)。真の暗号学的 attestation
   (nonce / challenge-response) の導入は別 US 判断であり本節の範囲外。
 
+- **startup attestation は lane epoch へ bind する (Redmine #14756)。** #13637 の record は
+  「boot 時に triplet が届いたか」を証明するが、**その boot がどの世代か**は locator (tmux pane-id)
+  と timestamp でしか語れなかった。#14477 はこの 2 つがどちらも世代証明にならないことを確定した
+  (timestamp は caller backdate / host clock rollback / 自己記入 `observed_at` で破れ、locator は
+  pane-id 再利用で false refusal になり、release evidence 欠落では恒久 fail-closed になる)。
+  #14756 は 4 つ目の識別子として **`lane_epoch`** を追加する。
+  - **env var**: `MOZYO_LANE_EPOCH`。managed launch が `--env` で注入し、wrapper には
+    launcher-expected 値を `--lane-epoch` で渡す。**両方渡すのが要点**である: flag だけなら
+    「launcher がそう意図した」しか証明できず、env に届いたことを証明できるのは §2 冒頭と同じ理由で
+    **agent 自身の process だけ**だからである。record が保存するのは **観測した raw token** であり、
+    expected 値ではない (expected を保存すると launcher を attest することになり、#14477 が排除した
+    caller 供給 authority を epoch 軸で再導入する)。
+  - **正本 (mint)**: lifecycle authority `lane_lifecycle.lane_epoch` (schema v10)。**`hibernated` へ
+    向かう disposition CAS だけ**が `lane_epoch = lane_epoch + 1` として **格納値から** 発行する。
+    caller に epoch parameter は無い。`active` へ戻る際に **clear しない** — sibling の
+    `hibernated_at` は clear するが、counter を reset すると旧世代 process が持つ epoch を再発行して
+    しまうため、両者の非対称は仕様である。
+  - **admission**: resume は各 slot の attested epoch が **hibernate epoch より strictly newer**
+    (= 現行 `lane_epoch` 以上) のときのみ admit する。survivor は release 前に注入された epoch しか
+    持てず、稼働中 process の env は他プロセスから書き換えられない (POSIX) ので、この判定は
+    **clock にも pane-id 非再利用にも依存しない**。
+  - **byte-exact 判定**: canonical form は `str(n)` (`n >= 1`) のみ。`"01"` / `" 1"` / `"+1"` /
+    非 ASCII 数字は `int()` が受理しても **producer が描画し得ない token** なので
+    `lane_epoch_malformed` で fail-closed とし、正規化して canonical へ昇格させない。
+  - **fail-closed vocabulary**: `lane_epoch_authority_unavailable` (lifecycle row が epoch 未発行 =
+    pre-v10 hibernation。次の rail は v10 hibernate transition) / `lane_epoch_attestation_absent`
+    (legacy attestation row / pre-#14756 launcher) / `lane_epoch_malformed` / `lane_epoch_not_newer`
+    (survivor)。`0` は **未発行** であって「全 epoch が上回る閾値」ではない。
+  - **既存 fence を弱めない**。epoch は **追加 conjunct** であり、attestation / locator / provider /
+    multiplicity / declared-pin / `release_observation` の各 fence は verdict を 1 つも変えない。
+  - **rebuildable cache を流用しない**。`herdr_launch_generation` は `rebuildable_cache` の
+    projection なので load-bearing authority にしない (`### recovery policy vocabulary`)。
+  - **store 互換性の拒否は effect より前**。`attestation_store_epoch_unsupported` は
+    launch preflight (`decide_store_compatibility`) と replacement の pre-effect fence
+    (`replacement_store_admission`) の**両方**で、同一の 2 predicate から答える。後者は
+    #14756 j#96848 で追加した: replacement は close が launch より先なので、launch step で
+    判定すると「typed に拒否したが old slot は既に閉じている」状態になる。判定を
+    owed-step dispatch より前へ上げ、refusal 時は zero-close / zero-CAS / zero-launch。
+    epoch を持たない launch (conditional C rule 1 の true legacy `lane_epoch=0`) は
+    どの store shape でも従来どおり通す。store shape が **知り得ない** 場合 (unreadable /
+    unsupported) は、epoch が懸かっているときに限り probe 自身の state token で拒否する。
+  - **legacy lane の前進は plan のみ**。pre-epoch build が hibernate した lane の手順は
+    close-first に固定する (#14756 j#96861)。実行 rail は置かない: 実測した attested-live
+    intersection は 5 workspaces / 18 agents で、target pair だけ close しても store
+    migration は止まる (#14756 j#96866)。lane-local rail は target pair 以外の consumer を
+    観測した時点で typed `offline_global_runtime_upgrade_required` を返す。
+    公開 surface は `mozyo-bridge herdr attestation-store lane-epoch-recovery-plan`
+    (`--write` を**持たない**)。global rollout は別 work unit。
+    自 lane の pair は **current generation の `declared_slots`** から exact 2 slot を導出し、
+    live inventory / attestation へ workspace / lane / role / assigned_name / locator を
+    byte-exact join する (#14756 j#96881 F1 / j#96890 / j#96895)。caller 入力は
+    `--assert-slot` による assertion のみで、供給源にしない。`release_observation` は
+    current pair authority の代替にしない。
+  - **malformed な stored epoch は `0` へ洗浄しない** (#14756 j#96881 F2)。read 側は
+    `lane_epoch_authority_unavailable` へ畳んでよいが、writer (`transition_disposition` /
+    adoption) は exact non-bool int かつ 0 以上でなければ zero-write typed refusal とする。
+
 ## 3. Target-resolution semantics
 
 > **Redmine #13305 で route authority を収束 (design record #13305 j#73008)。** 本節の

@@ -919,6 +919,10 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
             self.transaction_store,
             port,
             preservation_policy=assess_preservation,
+            # Inherited from LiveBoundPairConvergenceOps — the discard rail closes and
+            # relaunches through the same actuator, so it needs the same pre-close fence
+            # (Redmine #14756 j#96848).
+            store_admission=self.store_admission,
         ).drive_worker_recovery(
             key,
             holder=holder,

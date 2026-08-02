@@ -55,6 +55,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     encode_assigned_name,
 )
 
+#: The epoch a lane that has hibernated once has minted (#14756). These fixtures drive
+#: exactly one hibernate transition before resuming.
+CURRENT_EPOCH = "1"
+
 WS = "wProj"
 ISSUE = "13441"
 LANE = "issue_13441_provider"
@@ -80,7 +84,17 @@ def _attest(
     locator: str,
     verdict: str = VERDICT_PRESENT,
     observed_at: str = FRESH_AT,
+    lane_epoch: str = CURRENT_EPOCH,
 ):
+    """A startup self-attestation for this fixture's pair.
+
+    ``lane_epoch`` defaults to the epoch a lane hibernated ONCE has minted (Redmine #14756),
+    because that is what a genuine relaunch of these fixtures' pairs would have received. It
+    is a parameter so a test can attest a PRE-hibernate epoch — what a survivor carries.
+    Supplying it weakens nothing these tests pin: the epoch is an ADDITIONAL conjunct, so
+    every refusal asserted here is still asserted for the reason it was written for. Without
+    it those tests would pass for a second, unrelated reason, i.e. vacuously.
+    """
     return IdentityAttestationRecord(
         assigned_name=encode_assigned_name(WS, role, lane),
         workspace_id=WS,
@@ -89,6 +103,7 @@ def _attest(
         locator=locator,
         verdict=verdict,
         observed_at=observed_at,
+        lane_epoch=lane_epoch,
     )
 
 

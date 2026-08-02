@@ -346,6 +346,8 @@ class LaneKindSchemaMigrationTest(unittest.TestCase):
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN hibernated_at")
             # v9 (#14477 j#94582) added release_observation; a faithful pre-v9 rewind drops it.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN release_observation")
+            # v10 (#14756) added lane_epoch; a faithful pre-v10 rewind drops it too.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 6 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -373,7 +375,7 @@ class LaneKindSchemaMigrationTest(unittest.TestCase):
         LaneLifecycleStore(home=self.home).ensure_schema()
 
         self.assertEqual(self._recorded(), LANE_LIFECYCLE_SCHEMA_VERSION)
-        self.assertEqual(LANE_LIFECYCLE_SCHEMA_VERSION, 9)  # v9 = #14477 release_observation
+        self.assertEqual(LANE_LIFECYCLE_SCHEMA_VERSION, 10)  # v10 = #14756 lane_epoch
         # backup-first: the pre-migration snapshot was preserved before the first write
         backups = sorted((self.home / "backups").glob("state-*"))
         self.assertEqual(len(backups), 1)

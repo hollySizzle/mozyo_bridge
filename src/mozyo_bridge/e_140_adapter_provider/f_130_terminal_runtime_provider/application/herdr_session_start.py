@@ -201,6 +201,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
     TerminalTransportError,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_preflight import (  # noqa: E501
+    preflight_managed_launch,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
     build_agent_start_argv,
     resolve_attest_launcher,
@@ -219,7 +222,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _invoke,
     _list_rows,
     _list_workspace_labels,
-    preflight_launcher_compatibility,
     HerdrLauncherIncompatibleError,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (
@@ -655,29 +657,19 @@ def _prepare_session_locked(
                 f"unresolved or mismatched provider"
             )
 
-    # Managed-launch compatibility boundary — the same fail-closed point as the provider
-    # preflight above, and the LAST one before any herdr write, so a skewed launcher aborts
-    # the run with zero actuation. The whole conjunction (wrapper subcommand + attestation
-    # schema #13748/#13847, the real store it writes #13882, the target config + shared lane
-    # lifecycle it must read #14258, the launch-generation protocol the reserve below joins
-    # on #14203) is `preflight_launcher_compatibility`, shared with the `sublane create`
+    # Managed-launch compatibility boundary — the LAST fail-closed point before any herdr
+    # write. The whole conjunction, its gating and its derived flags live beside it in
+    # `herdr_launch_preflight.preflight_managed_launch`, shared with the `sublane create`
     # pre-worktree gate so a conjunct can never be present at only one of the two boundaries.
-    # Gated on a resolved wrapper AND an actual launch plan: an unwrapped (`attest_launcher
-    # == ""`) or adopt-only / dry-run run runs no wrapper, so it is never probed and stays
-    # byte-invariant (Redmine #13637 fallback preserved).
-    if attest_launcher and launch_plans:
-        # Redmine #14231 j#84910: probe in the SAME cwd the wrapper will get
-        # (`build_agent_start_argv` passes `--cwd repo_root`), so a launcher that only
-        # fails inside the lane's own config directory is caught here too.
-        preflight_launcher_compatibility(
-            attest_launcher,
-            runner,
-            timeout,
-            env,
-            repo_root=repo_root,
-            store_home=Path(store_home),
-            replacement_launch=bool((replacement_action_id or "").strip()),
-        )
+    preflight_managed_launch(
+        attest_launcher, runner, timeout, env,
+        repo_root=repo_root,
+        store_home=Path(store_home),
+        workspace_id=workspace_id,
+        lane_id=result.lane_id,
+        replacement_action_id=replacement_action_id,
+        launch_planned=bool(launch_plans),
+    )
 
     # Reserve BOTH pre-side-effect identity records — the immutable startup action (#13948,
     # Answer j#80989) and each wrapped slot's launch generation (#14203 j#87472) — the LAST

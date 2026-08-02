@@ -130,6 +130,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     OLD_SLOT_PRESENT,
     OLD_SLOT_RECYCLED,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_epoch import (  # noqa: E501
+    replacement_store_admission,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (
     herdr_workspace_segment,
 )
@@ -409,6 +412,28 @@ class LiveBoundPairConvergenceOps:
     lifecycle_store: LaneLifecycleStore = field(default_factory=LaneLifecycleStore)
     transaction_store: ReplacementTransactionStore = field(default_factory=ReplacementTransactionStore)
     pin_store: LanePinRepairStore = field(default_factory=LanePinRepairStore)
+
+    def store_admission(self, key, pin) -> str | None:
+        """The pre-effect epoch/store verdict for one participant (Redmine #14756 j#96848).
+
+        Injected into every :class:`ReplacementActuatorUseCase` this ops object builds, so the
+        refusal lands before the old slot is closed rather than inside the launch step behind
+        it. Both halves of the question come from the transaction itself — the workspace from
+        the key, the lane from the pin — so this resolves nothing on its own that could drift
+        from what the action is actually about to act on.
+
+        BOTH homes are derived from the lifecycle store this ops object was constructed with,
+        rather than one derived and one left ambient. They name one directory — the two state
+        files live side by side under a single mozyo-bridge home — so deriving both keeps them
+        agreeing under a store injected by path, where the ambient home is some other
+        directory entirely. Mixing the two sources would have read the epoch out of the
+        injected store and the shape out of the real one, and the mismatch would surface as a
+        confident verdict about a store the action has nothing to do with.
+        """
+        home = str(self.lifecycle_store.path.parent)
+        return replacement_store_admission(
+            key.workspace_id, pin.lane_id, lifecycle_home=home, attestation_home=home
+        )
 
     def _worktree(self, request: ConvergeBoundPairRequest) -> tuple[Path | None, str, str]:
         """Resolve the target lane root and the identity that root derives.
@@ -720,6 +745,7 @@ class LiveBoundPairConvergenceOps:
             self.transaction_store,
             port,
             preservation_policy=assess_preservation,
+            store_admission=self.store_admission,
         ).drive_worker_recovery(
             key,
             holder=holder,

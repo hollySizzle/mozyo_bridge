@@ -275,6 +275,13 @@ def evaluate_launcher_compatibility(
             repo_root=probe_cwd,
             store_home=Path(store_home),
             replacement_launch=bool((replacement_action_id or "").strip()),
+            # Redmine #14756: `epoch_launch` is deliberately left at its default False here,
+            # and that is a decision rather than an omission. This is the pre-worktree CREATE
+            # gate: the lane it is about does not exist yet, so its lifecycle row has minted
+            # no epoch and the launch it gates cannot carry one. `prepare_session` runs the
+            # same conjunction again at step 2, by which point the row exists and the flag is
+            # resolved from it — so an epoch-bearing launch is still refused before any herdr
+            # write, just at the boundary that can actually observe one.
             config_parse=config_parse,
         )
     except HerdrLauncherIncompatibleError as exc:

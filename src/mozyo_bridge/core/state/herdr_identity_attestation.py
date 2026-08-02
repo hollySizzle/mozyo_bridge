@@ -38,6 +38,26 @@ detail token naming *which variable* was missing/conflicting (never a value), an
 timestamp / schema version. Env **values**, credentials, and ambient env are never
 stored — the whitelist dataclass simply has no field for them.
 
+``lane_epoch`` (v3, Redmine #14756) is a **deliberate, bounded widening of that
+whitelist**, called out here rather than quietly slipped in: it is the one field holding
+a value the agent read out of its own environment, where every other field holds an
+*expectation* the launcher supplied. The widening is stated because the rule above is
+load-bearing, and the reasons it is safe are specific rather than general:
+
+- the value is a small counter minted by this project's own lifecycle authority, never a
+  credential, a path, or ambient env — the categories the rule exists to keep out;
+- storing the launcher's *expected* epoch instead would defeat the purpose. #13637 exists
+  because a launcher can prove it PASSED a value but not that the value ARRIVED, and an
+  epoch recorded from the expectation would attest the launcher rather than the process —
+  reintroducing on this axis exactly the caller-supplied authority #14477 spent its whole
+  lifetime removing;
+- acceptance 2 requires FORGERY to fail closed, which is only decidable if the read side
+  can see the token that was actually there. A token classified before storage could only
+  ever be refused as "absent", losing the distinction an operator needs.
+
+The token is therefore stored raw and classified byte-exactly at read time
+(:func:`...lane_epoch.parse_attested_epoch`); nothing here parses, trims or re-renders it.
+
 Conventions mirror the sibling home-scoped stores (``herdr_delivery_ledger`` /
 ``workspace_registry``): a ``*_FILENAME`` constant, a ``*_path(home=None)`` helper
 through :func:`mozyo_bridge.shared.paths.mozyo_bridge_home`, a frozen dataclass with
@@ -68,7 +88,7 @@ from pathlib import Path
 from typing import Mapping, Optional
 
 from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
-    COLUMNS_V2,
+    COLUMNS_V3,
     AttestationStoreLockUnavailable,
     attestation_store_lock,
     HERDR_IDENTITY_ATTESTATION_RECOVERY_POLICY,
@@ -81,6 +101,7 @@ from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
     recorded_version,
     store_status,
     writable_projection,
+    write_drops_lane_epoch,
     write_drops_replacement_action_id,
 )
 from mozyo_bridge.shared.paths import mozyo_bridge_home
@@ -163,6 +184,14 @@ class IdentityAttestationRecord:
     #: R2-F2), or empty on a normal (non-replacement) launch. A token only — never a secret /
     #: env value. A replacement recovery verifies its fresh worker by matching this exactly.
     replacement_action_id: str = ""
+    #: The lane epoch this process observed in its OWN env at boot (Redmine #14756), or
+    #: ``""`` when the launch injected none (a lane whose lifecycle row has minted no
+    #: epoch, or a pre-#14756 launcher). Stored as the RAW observed token, never parsed or
+    #: normalised here: the resume proof classifies it byte-exactly
+    #: (:func:`...lane_epoch.parse_attested_epoch`), so a padded / signed / non-decimal
+    #: token must survive to that classifier as itself rather than being laundered into a
+    #: canonical number the launcher never minted. A token only — never a secret.
+    lane_epoch: str = ""
     schema_version: int = HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION
 
     def as_payload(self) -> dict:
@@ -176,6 +205,7 @@ class IdentityAttestationRecord:
             "detail": self.detail,
             "observed_at": self.observed_at,
             "replacement_action_id": self.replacement_action_id,
+            "lane_epoch": self.lane_epoch,
             "schema_version": self.schema_version,
         }
 
@@ -392,6 +422,22 @@ class HerdrIdentityAttestationStore:
                     f"untouched). Migrate the store first: "
                     f"`mozyo-bridge herdr attestation-store migrate --write`."
                 )
+            if write_drops_lane_epoch(version, record.lane_epoch):
+                # Redmine #14756, the same shape as the refusal above and for the same
+                # reason. A launch that carries an epoch is a launch whose pair must later be
+                # PROVABLE: resume admits it only on a strictly-newer attested epoch. Writing
+                # this row v1/v2-shaped would land an attestation with no epoch at all, so the
+                # pair would be live, correctly launched, and permanently unresumable — the
+                # #13882 "live but unattested" failure re-created on the epoch axis. Refuse
+                # visibly and name the rail instead.
+                raise HerdrIdentityAttestationError(
+                    f"herdr identity attestation store {self.path} is schema v{version}, "
+                    f"which has no `lane_epoch` column, but this is an epoch-bound launch "
+                    f"carrying one. Refusing to write a row that silently drops the lane "
+                    f"epoch (the store is left untouched); the pair would launch live and "
+                    f"never be resumable. Migrate the store first: "
+                    f"`mozyo-bridge herdr attestation-store migrate --write`."
+                )
             columns = writable_projection(version)
             assert columns is not None  # store_status() already proved it recognized
             values = {
@@ -404,6 +450,7 @@ class HerdrIdentityAttestationStore:
                 "detail": record.detail,
                 "observed_at": observed_at,
                 "replacement_action_id": record.replacement_action_id,
+                "lane_epoch": record.lane_epoch,
             }
             updatable = [c for c in columns if c != "assigned_name"]
             with conn:
@@ -426,6 +473,7 @@ class HerdrIdentityAttestationStore:
             detail=record.detail,
             observed_at=observed_at,
             replacement_action_id=record.replacement_action_id,
+            lane_epoch=record.lane_epoch,
         )
 
     def assigned_names(self) -> Optional[frozenset]:
@@ -510,6 +558,7 @@ class HerdrIdentityAttestationStore:
             detail=row[6],
             observed_at=row[7],
             replacement_action_id=row[8],
+            lane_epoch=row[9],
         )
 
 
@@ -537,7 +586,7 @@ def record_identity_attestation(
 
 
 __all__ = (
-    "COLUMNS_V2",
+    "COLUMNS_V3",
     "HERDR_IDENTITY_ATTESTATION_FILENAME",
     "HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION",
     "HERDR_IDENTITY_ATTESTATION_RECOVERY_POLICY",

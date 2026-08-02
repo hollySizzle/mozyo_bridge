@@ -1790,13 +1790,28 @@ class ZeroSideEffectTest(unittest.TestCase):
             herdr_pane_lifecycle,
         )
 
+        # Redmine #14756: the call moved again, into the named session-level entry point
+        # `herdr_launch_preflight.preflight_managed_launch`, when the module-health split
+        # took the argument assembly out of the composition root. The ordering this pins is
+        # unchanged, so the guard follows the body — but it is deliberately NOT reduced to a
+        # rename: it pins the entry point's POSITION here, and separately that the entry
+        # point still reaches the store join. A pin that only chased the new name would go
+        # green while the conjunction it guards had been dropped.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_launch_preflight,
+        )
+
         src = inspect.getsource(herdr_session_start._prepare_session_locked)
-        self.assertIn("preflight_launcher_compatibility", src)
+        self.assertIn("preflight_managed_launch", src)
         self.assertLess(
-            src.index("preflight_launcher_compatibility"),
+            src.index("preflight_managed_launch"),
             src.index("_create_workspace"),
             "the launcher compatibility conjunction must precede the first herdr "
             "workspace write",
+        )
+        self.assertIn(
+            "preflight_launcher_compatibility",
+            inspect.getsource(herdr_launch_preflight.preflight_managed_launch),
         )
         self.assertIn(
             "preflight_attest_store_schema",

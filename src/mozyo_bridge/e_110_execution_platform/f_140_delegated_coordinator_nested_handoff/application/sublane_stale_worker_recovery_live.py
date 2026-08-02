@@ -108,6 +108,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_dispatch_herdr_ops import (  # noqa: E501
     HerdrWorkerDispatchOps,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_epoch import (  # noqa: E501
+    replacement_store_admission as _replacement_store_admission,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (  # noqa: E501
     RUNTIME_BUSY,
     map_agent_status,
@@ -756,6 +759,21 @@ class LiveStaleWorkerRecoveryOps:
         if _norm_lane(self._current_branch(str(self.repo_root))) != _norm_lane(request.lane):
             return LAUNCH_AUTHORITY_BRANCH_DRIFTED
         return LAUNCH_AUTHORITY_OK
+
+    def replacement_store_admission(self, key, pin) -> Optional[str]:
+        """The pre-close epoch/store verdict, against THIS ops object's homes (#14756).
+
+        Both homes are passed explicitly rather than left ambient. This is exactly the case
+        where they can differ from the process-wide ones — the live ops carries isolated
+        homes under test — and a fence that read the real shared home there would be
+        measuring the wrong store while appearing to work.
+        """
+        return _replacement_store_admission(
+            key.workspace_id,
+            pin.lane_id,
+            lifecycle_home=str(self.lifecycle_home) if self.lifecycle_home else "",
+            attestation_home=str(self.attestation_home) if self.attestation_home else "",
+        )
 
     def resume_lane_authority(self, request: RecoveryRequest) -> bool:
         """Is the lane's ambient authority EXACT and current, right now? (read-only)

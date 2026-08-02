@@ -82,6 +82,36 @@ def cmd_herdr_attestation_store_rebuild(args: argparse.Namespace) -> int:
     )
 
 
+def cmd_herdr_attestation_store_lane_epoch_recovery_plan(args: argparse.Namespace) -> int:
+    """Plan (never perform) the legacy lane-epoch recovery for one exact lane (#14756)."""
+    from mozyo_bridge.core.state.lane_lifecycle_model import DecisionPointer
+    from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application.lane_epoch_legacy_recovery_plan import (  # noqa: E501
+        format_recovery_plan,
+        plan_lane_epoch_legacy_recovery,
+    )
+
+    plan = plan_lane_epoch_legacy_recovery(
+        home=_home(args),
+        view=_inventory_view(args),
+        workspace_id=args.workspace,
+        lane=args.lane,
+        issue_id=args.issue,
+        expected_revision=int(args.revision),
+        decision=DecisionPointer(
+            source="redmine", issue_id=args.issue, journal_id=str(args.journal)
+        ),
+        asserted_slots=tuple(args.assert_slot or ()),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(plan.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(
+            format_recovery_plan(plan),
+            file=sys.stdout if plan.ok else sys.stderr,
+        )
+    return 0 if plan.ok else 1
+
+
 def _add_common(parser: argparse.ArgumentParser, *, add_repo_option=None) -> None:
     parser.add_argument(
         "--home",
@@ -169,6 +199,54 @@ def register_herdr_attestation_store_parser(herdr_sub, *, add_repo_option=None) 
     )
     _add_common(rebuild, add_repo_option=add_repo_option)
     rebuild.set_defaults(func=cmd_herdr_attestation_store_rebuild)
+
+    plan = sub.add_parser(
+        "lane-epoch-recovery-plan",
+        help=(
+            "Redmine #14756: PLAN (never perform) the recovery of a lane hibernated by a "
+            "pre-epoch build. Prints the canonical close-first sequence only when the "
+            "attested-live consumer intersection is already empty; otherwise refuses with "
+            "`offline_global_runtime_upgrade_required` and names the live consumers, "
+            "because the migration step this recovery depends on cannot succeed while any "
+            "of them holds a row here. There is no --write: closing the target pair and "
+            "then attempting a fleet-wide migration would destroy that pair and still stop "
+            "at the same wall (j#96866). Reads only; closes, launches and migrates nothing."
+        ),
+    )
+    plan.add_argument("--workspace", required=True, help="Exact repo workspace id.")
+    plan.add_argument("--lane", required=True, help="Exact lane id.")
+    plan.add_argument("--issue", required=True, help="Exact issue the lane must own.")
+    plan.add_argument(
+        "--revision",
+        required=True,
+        type=int,
+        help=(
+            "Lifecycle revision observed for the lane. Reported back through the same CAS "
+            "predicate the adoption step uses, so a stale pin reads as refused here too."
+        ),
+    )
+    plan.add_argument(
+        "--journal",
+        required=True,
+        help="Durable journal id authorising this recovery for --issue.",
+    )
+    plan.add_argument(
+        "--assert-slot",
+        action="append",
+        default=[],
+        metavar="ASSIGNED_NAME",
+        help=(
+            "ASSERT that the lane's own pair contains this assigned name (repeatable). The "
+            "pair itself is derived from the lane's stored release observation, joined "
+            "byte-exact against the live inventory and the startup attestation; this flag "
+            "only checks that derivation against your expectation and refuses on any "
+            "difference. It cannot add a slot, and therefore cannot shrink the consumer "
+            "census — supplying every consumer's name refuses rather than clearing the "
+            "global blocker (Redmine #14756 j#96881 F1)."
+        ),
+    )
+    _add_common(plan, add_repo_option=add_repo_option)
+    plan.set_defaults(func=cmd_herdr_attestation_store_lane_epoch_recovery_plan)
 
 
 __all__ = (

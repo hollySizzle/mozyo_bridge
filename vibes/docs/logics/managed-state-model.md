@@ -433,6 +433,94 @@ Table naming:
         件数は完全性を証明しない: **別 locator 2 件を記録すれば count は充足し交差も起きず、
         true survivor が admit される**ことを実測した。根本原因は `release_pins` が
         **caller 供給**だったこと — timestamp と同型の欠陥である。
+  - **lane epoch (hibernate 世代の単調 counter)** (schema v10、#14756)。追加 field `lane_epoch`。
+    実装正本は `core/state/lane_epoch.py`。
+    - **何を保存するか**: その lane が hibernate した回数 = 発行済み世代番号。**`hibernated` へ
+      向かう disposition CAS だけ**が `lane_epoch = lane_epoch + 1` として **格納値から** 発行し、
+      **malformed な格納値 (TEXT / REAL / `bool` / `NULL` / negative) からは発行しない**
+      (#14756 j#96881 F2)。「未発行 (exact int `0`)」と「読めない」は別の事実であり、
+      read 側は両方 `lane_epoch_authority_unavailable` へ畳んでよいが、**writer が畳むと
+      counter rollback になる** — corrupt 値から 1 を mint すると、既に release 済みの世代が
+      持つ epoch を再発行してしまう。非 hibernate 遷移も corrupt 値を `0` へ正規化しない
+      (無関係な遷移経由の laundering も laundering である)。malformed を観測した CAS は
+      **zero-write の typed refusal** とし、adoption も **exact int `0`** のみ許可する。
+      caller に epoch parameter は存在しない。timestamp (v8) と caller 供給 pins (pre-v9) が
+      どちらも世代証明にならなかった根本原因は「caller が値を供給できる」ことだったので、
+      **供給する seam 自体を作らない**。
+    - **`0` は未発行であって閾値ではない**。pre-v10 row / 未 hibernate lane は `0` で migrate し、
+      `lane_epoch_authority_unavailable` として **fail-closed** する。`lane_generation` からの
+      backfill は禁止 (あれは re-incarnation の counter であり hibernation の counter ではない。
+      seed すると本 build 以前に launch された process と一致する epoch を発行してしまう)。
+    - **`active` へ戻る際に clear しない**。`hibernated_at` は clear するが、これは
+      「有効な境界」と「単調 counter」の違いである。counter を reset すると旧世代 process が持つ
+      epoch を再発行し、`release_observation` / locator fence を通り抜ける survivor を作る。
+      clear する 3 writer (`transition_disposition` rehydrate / `supersede_and_activate` /
+      `open_next_generation`) は本 field を **UPDATE 列に含めない**ことで保存する。
+      R4 review (j#94707 R4-F1) は「field を足したら reset する writer も同数ある」を検出したが、
+      本 field はその **逆向きの義務** — reset してはならない writer を列挙する — を負う。
+    - **消費**: managed launch が read-only reader で読み `MOZYO_LANE_EPOCH` として注入し、agent が
+      自 env で観測した raw token を startup attestation (v3) に記録する。resume は両 slot の
+      attested epoch が hibernate epoch より strictly newer のときのみ admit する。詳細と
+      fail-closed vocabulary は `vibes/docs/specs/herdr-native-identity.md` §2 を読む。
+    - **launch path は read のみ**。epoch は hibernate CAS でしか発行されないので、launch は
+      write も migration も増やさない (`#### read-compatible / write-migrating split` の
+      「read は migrate しない」契約を維持する)。store が読めない場合は注入せず launch は
+      #14756 前と byte-invariant で、拒否は resume 側の typed reason に出る。
+    - **replacement path の拒否は close より前に置く** (#14756 j#96848)。replacement は old slot を
+      close してから new slot を launch するので、epoch/store 互換性を launch step で判定すると
+      「typed に拒否したが pair は既に壊れている」状態になる (実測: herdr start は 0 だったが
+      close と participant CAS は 0 ではなかった)。判定は `ReplacementActuatorUseCase` の
+      owed-step dispatch **より前** の `store_admission` seam で行い、refusal 時は
+      zero-close / zero-CAS / zero-launch とする。crash replay も同じ dispatch 点を通る。
+      - 判定は `herdr_launch_epoch.replacement_store_admission` **1 箇所**が答える。launch
+        preflight と同じ `launch_carries_lane_epoch` + `epoch_store_admission` を使い、
+        epoch 軸**だけ**を見る (launcher capability 軸は subprocess probe が要るので分離)。
+      - **action 単位で評価する**。actuate 対象の participant だけでなく、`replaced` でない
+        participant **全て**を見る。1 つでも inadmissible なら action 全体を拒否する。
+        participant 単位にすると「A を close/relaunch した後に B が戻れないと判明する」——
+        この fence が防ぐはずの半壊 pair に 1 step 遅れて到達する。
+      - **6 construction site すべてに注入する**。seam を作っただけで注入しないと本番では
+        未発効であり、regression は green のまま欠陥が残る (j#96854 実測: 注入 0/6)。
+        3 つの ops protocol は本 member を **required** として宣言し、実装漏れが silent な
+        un-gated path ではなく error になるようにする。`self_close_executor` は passthrough
+        のみで未 arm — src に composition root が無いことを実測した上での判断であり、
+        その理由を call site に明記する (省略と判断を区別する)。
+    - **legacy recovery は plan のみで、実行 rail を持たない** (#14756 j#96861 / j#96866)。
+      pre-epoch build が hibernate した lane を前進させる手順は close-first に固定する
+      (`lane_epoch_legacy_recovery_plan.CANONICAL_STEPS`): 旧 pair 両 slot を terminal close →
+      attested-live intersection=0 の fresh 確認 → backup-first store migration + strict
+      readback → lifecycle epoch `0→1` adoption → v3/native epoch1 で fresh pair relaunch。
+      adoption を先に置くと crash 時に `epoch=1` + v1 store + live old pair が残り、上記の
+      pre-effect fence が次の close を拒否する **自己 deadlock** になる。
+      - ただし **この sequence を実行する rail は置かない**。j#96866 が実環境で計測した
+        attested-live intersection は **5 workspaces / 18 agents** (実行主体たる coordinator を
+        含む) であり、target pair だけ close しても migration は `blocked_consumers_live` で
+        止まる。close してから壁に当たる実装は、救うはずの pair だけを壊して partial
+        shutdown を作る。
+      - したがって lane-local rail は **target pair 以外の consumer を観測した時点で**
+        typed `offline_global_runtime_upgrade_required` を返し、zero-close / zero-CAS /
+        zero-migrate とする。census は lane の shape 判定**より前**に評価する
+        (fleet の事実が「そもそも可能か」を決めるため)。
+      - **除外集合 (= 自 lane の pair) は caller 入力から取らない** (#14756 j#96881 F1)。
+        caller supplied な slot 名を無条件に census から引くと、**全 consumer 名を渡すだけで
+        global blocker を消して `plan_ready` にできる** (実測)。authority は
+        **current generation の `declared_slots`** であり、exact 2 slot を decode して
+        live inventory と startup attestation へ workspace / lane / role / assigned_name /
+        **locator** を byte-exact join する (j#96890 §2: attestation 側 locator を join
+        しないと stale row が recycled pane を「自分のもの」にしてしまう)。
+      - **`release_observation` / release pins を current pair authority の代替にしない**
+        (#14756 j#96895)。実 #14755 row は observation length 0 / `declared_slots` length 532
+        であり、observation を authority にすると **named acceptance 対象がまず refuse される**。
+        observation は original release 時点の snapshot で、bootstrap / pin repair 後の
+        current pair ではない。過去 evidence として矛盾診断に使うのは可。
+      - declared slots が absent / corrupt / **exact 2 slot でない** / role 重複 / locator 不一致
+        の場合は typed refusal。**部分集合だけを除外しない** (半分の pair を pair として扱うと、
+        不完全な答えで census を狭める)。CLI flag は `--assert-slot` = **assertion 専用**で、
+        導出集合と exact 一致しなければ refuse する。供給源にはしない。
+      - 全 workspace drain / callback supervisor 停止 / attestation store migration /
+        lifecycle v9→v10 backup-first migration / new runtime install / top coordinator
+        first relaunch を含む **global rollout は別の durable work unit** であり、fleet の
+        外側の非 consumer 主体を必要とする。本 plan はその window の中でだけ有効。
   - **release generation observation (release が閉じた slot 集合の immutable 正本)**
     (schema v9、#14477 disposition j#94582)。追加 field `release_observation`。実装正本は
     `core/state/lane_release_observation.py` / `core/state/lane_release.py`。
@@ -1433,6 +1521,13 @@ both refusing. 94 genuine v1 rows read as `absent`. The #13847 capability prefli
   the identical defect, merely inverted onto the old runtimes. So a recognized older store is written in **its own shape**
   (`writable_projection`) and left at its own version. Forward migration is an **explicit operator command only**, never a launch
   side effect.
+- **v3 adds `lane_epoch` (#14756) under the same contract.** A v1/v2 row truthfully carries an EMPTY epoch (its
+writer was never handed one), so the read projection pads `''` — never a number, which would be a threshold claim the row
+never made. The write side gains the second instance of the refusal below: an **epoch-bearing** launch onto a v1/v2 store
+raises (`write_drops_lane_epoch`) rather than landing a row with the epoch dropped, because such a pair would be live,
+correctly launched, and permanently unresumable. An **epoch-less** launch still writes the older shape, so the
+mixed-runtime home keeps working exactly as #13882 requires. The operator rail is the same explicit
+`mozyo-bridge herdr attestation-store migrate --write`.
 - **The one write refusal is the field that cannot be dropped.** A **normal** launch (empty `replacement_action_id`) writes the v1
   shape losing nothing. A **replacement** launch (non-empty `action_id`) is refused there and raises
   (`write_drops_replacement_action_id`), because a dropped binding would leave a fresh worker a replacement recovery matches on

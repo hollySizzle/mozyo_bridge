@@ -1434,6 +1434,8 @@ class R3RegressionTest(unittest.TestCase):
                 "lane_kind",
                 "hibernated_at",
         "release_observation",
+        # v10 (#14756) added lane_epoch; a faithful rewind to an older signature drops it.
+        "lane_epoch",
             ):
                 conn.execute(f"ALTER TABLE lane_lifecycle_records DROP COLUMN {col}")
             conn.execute(
@@ -1481,6 +1483,8 @@ class R3RegressionTest(unittest.TestCase):
                 "lane_kind",
                 "hibernated_at",
         "release_observation",
+        # v10 (#14756) added lane_epoch; a faithful rewind to an older signature drops it.
+        "lane_epoch",
             ):
                 conn.execute(f"ALTER TABLE lane_lifecycle_records DROP COLUMN {col}")
             conn.execute(
@@ -1918,6 +1922,8 @@ class BackupFirstMigrationTest(unittest.TestCase):
         "lane_kind",
         "hibernated_at",
         "release_observation",
+        # v10 (#14756) added lane_epoch; a faithful rewind to an older signature drops it.
+        "lane_epoch",
     ]
 
     def _v2_store(self) -> Path:

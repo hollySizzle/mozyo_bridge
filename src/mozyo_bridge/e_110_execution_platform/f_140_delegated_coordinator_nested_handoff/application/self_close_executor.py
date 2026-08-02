@@ -36,7 +36,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, Protocol, runtime_checkable
+from typing import Callable, Optional, Protocol, runtime_checkable
 
 from mozyo_bridge.core.state.replacement_preservation import PreservationObservation
 from mozyo_bridge.core.state.replacement_transaction import ReplacementTransactionStore
@@ -190,12 +190,26 @@ class SelfCloseExecutorUseCase:
         *,
         clock: Callable[[], str] = _utc_now,
         lease_ttl_seconds: int = DEFAULT_LEASE_TTL_SECONDS,
+        store_admission: Optional[Callable[[object, object], Optional[str]]] = None,
     ) -> None:
         self._store = store
         self._actuation_port = actuation_port
         self._seal_port = seal_port
         self._clock = clock
         self._ttl = lease_ttl_seconds
+        # Forwarded verbatim to the actuator (Redmine #14756 j#96848). This path closes and
+        # relaunches the self coordinator, so it wants the same pre-close epoch/store fence
+        # the other five construction sites now arm.
+        #
+        # It is a passthrough and NOT resolved here, for a stated reason rather than an
+        # oversight: this use case has no composition root in ``src`` today — only
+        # ``PreAttachReconcileUseCase`` consumes it, and nothing in ``src`` constructs THAT
+        # either (measured, not assumed). Resolving a lane / home here would mean inventing
+        # the very context a real composition root will have to supply, and inventing it is
+        # how the preflight and the launch come to disagree. So the seam is present and
+        # armable, and the decision that it is currently un-armed is written down instead of
+        # being left as a silence for the next reader to mistake for coverage.
+        self._store_admission = store_admission
 
     def run(
         self,
@@ -243,7 +257,8 @@ class SelfCloseExecutorUseCase:
             self._actuation_port, self._seal_port, self._store, key, self_pin.identity
         )
         actuator = ReplacementActuatorUseCase(
-            self._store, wrapped, clock=self._clock, lease_ttl_seconds=self._ttl
+            self._store, wrapped, clock=self._clock, lease_ttl_seconds=self._ttl,
+            store_admission=self._store_admission,
         )
         outcome: ActuationResult = actuator.drive_self_participant(
             key, holder=holder, expected_action_generation=expected_action_generation

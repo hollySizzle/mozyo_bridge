@@ -300,6 +300,17 @@ class GatewayRecoveryOps(Protocol):
         """
         ...
 
+    def replacement_store_admission(self, key, pin) -> Optional[str]:
+        """May this replacement produce effects at all? (read-only, Redmine #14756 j#96848)
+
+        A reason token refuses the whole action with zero close, zero participant CAS and
+        zero launch; ``None`` permits. It is a REQUIRED member rather than an optional one
+        because the fence it arms is invisible when absent: an ops implementation that simply
+        omitted it would leave the actuator un-gated and every test would still pass. Making
+        it part of the protocol turns "this path was not gated" from a silence into an error.
+        """
+        ...
+
     def gateway_name_free_of_live_process(self, request: GatewayRefreshRequest) -> bool:
         """Is the gateway's assigned name free of ANY live process? (read-only)
 
@@ -654,6 +665,7 @@ class GatewayRefreshUseCase:
                 self._ops.resume_lane_authority(request)
                 and self._ops.gateway_name_free_of_live_process(request)
             ),
+            store_admission=self._ops.replacement_store_admission,
         )
         recov = actuator.drive_worker_recovery(
             key, holder=request.holder, expected_action_generation=gen,
