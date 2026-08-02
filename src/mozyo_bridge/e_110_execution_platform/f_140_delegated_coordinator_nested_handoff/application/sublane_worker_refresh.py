@@ -65,6 +65,8 @@ from mozyo_bridge.core.state.replacement_transaction_model import (
     ParticipantPinError,
     norm,
     participant_authority_matches,
+    participant_with_stored_evidence,
+    stored_evidence_is_foreign,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_actuator import (  # noqa: E501
     DEFAULT_LEASE_TTL_SECONDS,
@@ -640,29 +642,43 @@ class WorkerRefreshUseCase:
             return refused("workspace / action identity is incomplete")
         gen = request.action_generation
 
-        # 1b. The ONE planner authority for this participant's update evidence (j#97093
-        # decision 2), before the plan and therefore zero-effect on refusal.
-        planning = plan_participants_with_evidence(
-            [worker], home=self._store.path.parent,
-            workspace_id=self._workspace_id, lane_id=worker.lane_id,
-        )
-        if planning.refused:
-            return refused(f"update evidence planning refused ({planning.refusal})")
-        worker = planning.participants[0]
-
-        # 2. Plan (or idempotently resume) the non-self refresh transaction.
-        plan = self._store.plan_transaction(
-            key, action_generation=gen, decision=decision, continuation=continuation,
-            participants=[worker],
-        )
-        if not plan.applied and plan.reason != CAS_ALREADY_DECLARED:
-            return self._outcome(
-                request, turn_class, turn_reason, verdict,
-                status=WORKER_REFRESH_STATUS_STOPPED, executed=True,
-                turn_observation=turn_obs, observation=observation,
-                detail=f"transaction plan refused ({plan.reason})",
-                authority_reason=authority_reason,
+        # 1b. Fresh transaction: plan the evidence. Progressed transaction: resume on the
+        # manifest already pinned (j#97121) -- the current generation and the bound evidence
+        # may have moved on legitimately after this action recorded what it acts on.
+        existing = self._store.get(key)
+        if existing is None:
+            planning = plan_participants_with_evidence(
+                [worker], home=self._store.path.parent,
+                workspace_id=self._workspace_id, lane_id=worker.lane_id,
             )
+            if planning.refused:
+                # Zero-effect: before the plan, before any actuation.
+                return refused(f"update evidence planning refused ({planning.refusal})")
+            worker = planning.participants[0]
+
+            # 2. Plan the non-self refresh transaction.
+            plan = self._store.plan_transaction(
+                key, action_generation=gen, decision=decision, continuation=continuation,
+                participants=[worker],
+            )
+            if not plan.applied and plan.reason != CAS_ALREADY_DECLARED:
+                return self._outcome(
+                    request, turn_class, turn_reason, verdict,
+                    status=WORKER_REFRESH_STATUS_STOPPED, executed=True,
+                    turn_observation=turn_obs, observation=observation,
+                    detail=f"transaction plan refused ({plan.reason})",
+                    authority_reason=authority_reason,
+                )
+        else:
+            # The request-built pin wearing the stored triplet, and nothing else from the
+            # stored row: the whole-participant comparison below still decides whether this
+            # is the same action.
+            stored_pin = existing.find_participant(worker.identity)
+            if stored_evidence_is_foreign(stored_pin, workspace_id=self._workspace_id):
+                return refused(
+                    "the stored update evidence names another workspace; zero actuation"
+                )
+            worker = participant_with_stored_evidence(worker, stored_pin)
         current = self._store.get(key)
         if current is None:
             return self._outcome(

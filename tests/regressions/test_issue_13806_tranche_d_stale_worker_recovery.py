@@ -32,6 +32,9 @@ from mozyo_bridge.core.state.replacement_preservation import (  # noqa: E402
     PreservationObservation,
     assess_worker_recovery_preservation,
 )
+from mozyo_bridge.core.state.herdr_launch_generation import (  # noqa: E402
+    HERDR_LAUNCH_GENERATION_FILENAME,
+)
 from tests.support.current_launch_authority import (  # noqa: E402
     RECEIPT_CAPABLE_ACTION_ID,
     seed_current_generation,
@@ -331,6 +334,92 @@ class CurrentLaunchAuthorityTests(_RecoveryCase):
         self._assert_zero_effect(
             self._use_case(FakeRecoveryOps(_all_clear())).run(self._request(), execute=True)
         )
+
+
+class ProgressedReplayTests(_RecoveryCase):
+    """Ruling j#97121: a replay past the close reads the stored manifest, not the world."""
+
+    def _spy_on_the_planner(self, run):
+        import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_stale_worker_recovery as site
+
+        calls = []
+        original = site.plan_participants_with_evidence
+
+        def spy(*args, **kwargs):
+            calls.append(kwargs.get("lane_id"))
+            return original(*args, **kwargs)
+
+        site.plan_participants_with_evidence = spy
+        try:
+            outcome = run()
+        finally:
+            site.plan_participants_with_evidence = original
+        return outcome, calls
+
+    def _complete_once(self):
+        return self._use_case(FakeRecoveryOps(_all_clear())).run(
+            self._request(), execute=True
+        )
+
+    def _replay(self):
+        # The idempotent shape this family already uses for a rerun: the gate has landed, so
+        # the leg completes with no new send.
+        return self._use_case(FakeRecoveryOps(_all_clear(), already_landed=True)).run(
+            self._request(), execute=True
+        )
+
+    def test_a_replay_survives_the_current_generation_row_vanishing(self):
+        self.assertEqual(self._complete_once().status, RECOVERY_COMPLETED)
+        before = self.store.get(
+            ReplacementTransactionKey(self.workspace_id, ACTION_ID)
+        ).participants
+        (self.home / HERDR_LAUNCH_GENERATION_FILENAME).unlink()
+        outcome = self._replay()
+        self.assertEqual(outcome.status, RECOVERY_COMPLETED)
+        after = self.store.get(
+            ReplacementTransactionKey(self.workspace_id, ACTION_ID)
+        ).participants
+        self.assertEqual(after, before, "the stored manifest is what the replay resumed on")
+
+    def test_a_replay_consults_no_external_authority_at_all(self):
+        self._complete_once()
+        outcome, calls = self._spy_on_the_planner(self._replay)
+        self.assertEqual(outcome.status, RECOVERY_COMPLETED)
+        self.assertEqual(calls, [], "the planner was not consulted on a progressed replay")
+
+    def test_a_fresh_run_still_consults_the_planner(self):
+        outcome, calls = self._spy_on_the_planner(self._complete_once)
+        self.assertEqual(outcome.status, RECOVERY_COMPLETED)
+        self.assertEqual(calls, [WORKER["lane_id"]])
+
+    def test_a_stored_triplet_from_another_workspace_is_a_conflict(self):
+        """Adopting stored evidence is not adopting ANY: a foreign triplet refuses."""
+        self._complete_once()
+        key = ReplacementTransactionKey(self.workspace_id, ACTION_ID)
+        row = self.store.get(key)
+        foreign = ParticipantPin(
+            lane_id=WORKER["lane_id"], role=WORKER["role"], provider=WORKER["provider"],
+            assigned_name=WORKER["assigned_name"], old_locator=WORKER["old_locator"],
+            is_self=False, lane_revision=row.participants[0].lane_revision,
+            lane_generation=row.participants[0].lane_generation,
+            evidence_workspace_id="ANOTHER_WS",
+            evidence_startup_action_id=RECEIPT_CAPABLE_ACTION_ID,
+            evidence_cause="update_relaunch",
+            phase=row.participants[0].phase,
+        )
+        fresh_home = Path(tempfile.mkdtemp())
+        self.home, self.store = fresh_home, ReplacementTransactionStore(home=fresh_home)
+        self.port = FakeActuatorPort()
+        self._seed_current_authority()
+        self.store.plan_transaction(
+            key, action_generation=row.action_generation, decision=row.decision,
+            continuation=row.continuation, participants=[foreign],
+        )
+        outcome = self._complete_once()
+        self.assertEqual(outcome.status, RECOVERY_REFUSED)
+        self.assertIn("names another workspace", outcome.detail)
+        self.assertEqual(self.port.closed, [])
+        self.assertEqual(self.port.launched, [])
 
 
 class HappyPathTests(_RecoveryCase):

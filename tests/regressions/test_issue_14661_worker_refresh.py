@@ -25,6 +25,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from mozyo_bridge.core.state.replacement_preservation import (  # noqa: E402
     PreservationObservation,
 )
+from mozyo_bridge.core.state.herdr_launch_generation import (  # noqa: E402
+    HERDR_LAUNCH_GENERATION_FILENAME,
+)
 from tests.support.current_launch_authority import (  # noqa: E402
     RECEIPT_CAPABLE_ACTION_ID,
     seed_current_generation,
@@ -509,6 +512,59 @@ class ExecuteTests(_RefreshCase):
         self.assertEqual(ops.resumes[0].expected_gate, "review_result")
         # The name-collision fence ran before the launch.
         self.assertTrue(ops.name_free_checks)
+
+    def test_a_replay_survives_the_current_generation_row_vanishing(self):
+        """Ruling j#97121: a replay past the close reads the stored manifest, not the world.
+
+        After the close the current launch generation legitimately rotates or disappears --
+        after this transaction recorded what it acts on. Re-reading it to replay an already
+        durable decision would let ordinary external progress refuse a replay nobody
+        re-authorised.
+        """
+        ops = FakeWorkerOps()
+        self._use_case(ops).run(self._request(), execute=True)
+        (self.home / HERDR_LAUNCH_GENERATION_FILENAME).unlink()
+        again = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(again.status, WORKER_REFRESH_STATUS_COMPLETED)
+
+    def test_a_replay_consults_no_external_authority_at_all(self):
+        import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_refresh as site
+
+        ops = FakeWorkerOps()
+        self._use_case(ops).run(self._request(), execute=True)
+        calls = []
+        original = site.plan_participants_with_evidence
+
+        def spy(*args, **kwargs):
+            calls.append(kwargs.get("lane_id"))
+            return original(*args, **kwargs)
+
+        site.plan_participants_with_evidence = spy
+        try:
+            again = self._use_case(ops).run(self._request(), execute=True)
+        finally:
+            site.plan_participants_with_evidence = original
+        self.assertEqual(again.status, WORKER_REFRESH_STATUS_COMPLETED)
+        self.assertEqual(calls, [], "the planner was not consulted on a progressed replay")
+
+    def test_a_fresh_run_still_consults_the_planner(self):
+        """The positive control for the spy above: the fresh path is unchanged."""
+        import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_refresh as site
+
+        calls = []
+        original = site.plan_participants_with_evidence
+
+        def spy(*args, **kwargs):
+            calls.append(kwargs.get("lane_id"))
+            return original(*args, **kwargs)
+
+        site.plan_participants_with_evidence = spy
+        try:
+            outcome = self._use_case(FakeWorkerOps()).run(self._request(), execute=True)
+        finally:
+            site.plan_participants_with_evidence = original
+        self.assertEqual(outcome.status, WORKER_REFRESH_STATUS_COMPLETED)
+        self.assertEqual(calls, [WORKER["lane_id"]])
 
     def test_a_rerun_after_completion_is_idempotent_zero_send(self):
         ops = FakeWorkerOps()

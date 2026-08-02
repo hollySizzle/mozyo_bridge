@@ -28,6 +28,12 @@ from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
 from mozyo_bridge.core.state.replacement_transaction_model import (  # noqa: E402
     ParticipantPin,
 )
+from mozyo_bridge.core.state.herdr_launch_generation import (  # noqa: E402
+    HERDR_LAUNCH_GENERATION_FILENAME,
+)
+from mozyo_bridge.core.state.launch_identity_receipt import (  # noqa: E402
+    LAUNCH_IDENTITY_RECEIPT_FILENAME,
+)
 from tests.support.current_launch_authority import (  # noqa: E402
     LEGACY_ACTION_ID,
     RECEIPT_CAPABLE_ACTION_ID,
@@ -349,14 +355,14 @@ class ExecuteRefusalTests(_RefreshCase):
         self.assertIn("different refresh authority", outcome.detail)
         self.assertEqual(ops2.resumes, [])
 
-    def test_a_stored_row_with_a_different_evidence_triplet_is_a_conflict(self):
-        """Redmine #14741 j#97093 decision 5: the comparison is the WHOLE participant.
+    def test_a_stored_triplet_from_another_workspace_is_a_conflict(self):
+        """Redmine #14741 j#97121 item 6: adopting stored evidence is not adopting ANY.
 
-        The check used to be a hand-picked field list (locator, revision, generation), which
-        answers "did the fields I remembered to name change?". The evidence triplet was not
-        on it, so a stored row pinned to a different startup action -- a different launch --
-        counted as the same authority, and the refresh would have actuated against it. One
-        differing evidence field is enough, and the refusal is zero-actuation.
+        A progressed replay resumes on the triplet the transaction already pinned, which is
+        what makes it independent of a rotated generation or a consumed receipt. That must
+        not make a foreign manifest adoptable: a triplet naming another workspace names a
+        launch in someone else's workspace, and "it was already stored" does not make it
+        this action's evidence. Zero actuation.
         """
         key = ReplacementTransactionKey(self.workspace_id, ACTION_ID)
         planned = ParticipantPin(
@@ -364,7 +370,7 @@ class ExecuteRefusalTests(_RefreshCase):
             provider=GATEWAY["provider"], assigned_name=GATEWAY["assigned_name"],
             old_locator=GATEWAY["old_locator"], is_self=False,
             lane_revision="5", lane_generation="2",
-            evidence_workspace_id="ws",
+            evidence_workspace_id="ANOTHER_WS",
             evidence_startup_action_id="startup-ir1-" + "a" * 64,
             evidence_cause="update_relaunch",
         )
@@ -390,12 +396,12 @@ class ExecuteRefusalTests(_RefreshCase):
         )
         outcome = self._use_case(ops).run(self._request(), execute=True)
         self.assertEqual(outcome.status, REFRESH_STATUS_REFUSED)
-        self.assertIn("different refresh authority", outcome.detail)
+        self.assertIn("names another workspace", outcome.detail)
         self.assertEqual(ops.resumes, [])
         self.assertEqual(self.port.closed, [])
         self.assertEqual(self.port.launched, [])
         stored = self.store.get(key).participants[0]
-        self.assertEqual(stored.evidence_cause, "update_relaunch")
+        self.assertEqual(stored.evidence_workspace_id, "ANOTHER_WS")
 
 
 class CurrentLaunchAuthorityTests(_RefreshCase):
@@ -473,6 +479,93 @@ class CurrentLaunchAuthorityTests(_RefreshCase):
         self._seed_current_authority(action_id=RECEIPT_CAPABLE_ACTION_ID)
         ops = FakeGatewayOps()
         self._assert_zero_effect(self._run(ops), ops)
+
+
+class ProgressedReplayTests(_RefreshCase):
+    """Ruling j#97121: a replay past the close reads the stored manifest, not the world.
+
+    After the close, the current launch generation legitimately rotates and the bound
+    evidence is legitimately consumed -- both AFTER this transaction recorded what it acts
+    on. Re-reading them to replay an already durable decision would let ordinary external
+    progress refuse an action nobody re-authorised, which is the whole finding.
+    """
+
+    def _complete_once(self):
+        self._use_case(FakeGatewayOps()).run(self._request(), execute=True)
+        return self._row()
+
+    def _replay(self):
+        rerun_ops = FakeGatewayOps(already_landed=True, target=_target())
+        outcome = self._use_case(rerun_ops).run(self._request(), execute=True)
+        return outcome, rerun_ops
+
+    def test_a_replay_survives_the_current_generation_row_vanishing(self):
+        before = self._complete_once()
+        generation_store = self.home / HERDR_LAUNCH_GENERATION_FILENAME
+        self.assertTrue(generation_store.exists(), "the seeded authority was really there")
+        generation_store.unlink()
+        outcome, rerun_ops = self._replay()
+        self.assertEqual(outcome.status, REFRESH_STATUS_COMPLETED)
+        self.assertEqual(rerun_ops.resumes, [])
+        after = self._row()
+        self.assertEqual(after.participants, before.participants, "stored manifest is intact")
+
+    def test_a_replay_survives_a_rotated_generation_for_the_same_slot(self):
+        """The successor launch is a NEW generation -- and it is not this action's business."""
+        self._complete_once()
+        self._seed_current_authority(
+            action_id="startup-" + "9f9f9f9f" * 8, locator="w:99"
+        )
+        outcome, rerun_ops = self._replay()
+        self.assertEqual(outcome.status, REFRESH_STATUS_COMPLETED)
+        self.assertEqual(rerun_ops.resumes, [])
+
+    def test_a_replay_survives_an_unreadable_receipt_authority(self):
+        """A corrupt receipt store is not consulted at all on a replay."""
+        self._complete_once()
+        (self.home / LAUNCH_IDENTITY_RECEIPT_FILENAME).write_bytes(b"not a database")
+        outcome, rerun_ops = self._replay()
+        self.assertEqual(outcome.status, REFRESH_STATUS_COMPLETED)
+        self.assertEqual(rerun_ops.resumes, [])
+
+    def test_a_replay_consults_no_external_authority_at_all(self):
+        """The direct statement: zero planner, generation, lifecycle and receipt calls."""
+        self._complete_once()
+        import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_gateway_recovery as site
+
+        calls = []
+        original = site.plan_participants_with_evidence
+
+        def spy(*args, **kwargs):
+            calls.append(kwargs.get("lane_id"))
+            return original(*args, **kwargs)
+
+        site.plan_participants_with_evidence = spy
+        try:
+            outcome, _ = self._replay()
+        finally:
+            site.plan_participants_with_evidence = original
+        self.assertEqual(outcome.status, REFRESH_STATUS_COMPLETED)
+        self.assertEqual(calls, [], "the planner was not consulted on a progressed replay")
+
+    def test_a_fresh_run_still_consults_the_planner(self):
+        """The positive control for the spy above: the fresh path is unchanged."""
+        import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_gateway_recovery as site
+
+        calls = []
+        original = site.plan_participants_with_evidence
+
+        def spy(*args, **kwargs):
+            calls.append(kwargs.get("lane_id"))
+            return original(*args, **kwargs)
+
+        site.plan_participants_with_evidence = spy
+        try:
+            outcome = self._use_case(FakeGatewayOps()).run(self._request(), execute=True)
+        finally:
+            site.plan_participants_with_evidence = original
+        self.assertEqual(outcome.status, REFRESH_STATUS_COMPLETED)
+        self.assertEqual(calls, [GATEWAY["lane_id"]])
 
 
 class HappyPathTests(_RefreshCase):

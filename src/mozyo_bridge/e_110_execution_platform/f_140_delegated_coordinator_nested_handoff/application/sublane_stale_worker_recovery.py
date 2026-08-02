@@ -55,6 +55,8 @@ from mozyo_bridge.core.state.replacement_transaction_model import (
     ParticipantPinError,
     norm,
     participant_authority_matches,
+    participant_with_stored_evidence,
+    stored_evidence_is_foreign,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_actuator import (  # noqa: E501
     DEFAULT_LEASE_TTL_SECONDS,
@@ -595,18 +597,6 @@ class StaleWorkerRecoveryUseCase:
                 request, verdict, status=RECOVERY_REFUSED, executed=True,
                 observation=observation, detail="approved worker pin is incomplete",
             )
-        planning = plan_participants_with_evidence(
-            [worker], home=self._store.path.parent,
-            workspace_id=self._workspace_id, lane_id=worker.lane_id,
-        )
-        if planning.refused:
-            # Zero-effect: before the plan, before any supersede, before any actuation.
-            return self._outcome(
-                request, verdict, status=RECOVERY_REFUSED, executed=True,
-                observation=observation,
-                detail=f"update evidence planning refused ({planning.refusal})",
-            )
-        worker = planning.participants[0]
         try:
             key = ReplacementTransactionKey(self._workspace_id, expected_action)
         except ValueError:
@@ -616,16 +606,51 @@ class StaleWorkerRecoveryUseCase:
             )
         gen = request.action_generation
 
-        # 2. Plan (or idempotently resume) the non-self worker-recovery transaction.
-        plan = self._store.plan_transaction(
-            key, action_generation=gen, decision=decision, continuation=continuation,
-            participants=[worker],
-        )
-        if not plan.applied and plan.reason != CAS_ALREADY_DECLARED:
-            return self._outcome(
-                request, verdict, status=RECOVERY_STOPPED, executed=True,
-                observation=observation, detail=f"transaction plan refused ({plan.reason})",
+        # 1b. A FRESH transaction pins its update evidence through the ONE planner authority
+        # (j#97093 decision 2); a PROGRESSED one resumes on the manifest it already pinned
+        # (j#97121). After the close, the current launch generation may have rotated and the
+        # bound evidence may have been consumed -- both legitimate and both AFTER this
+        # transaction recorded what it acts on -- so re-reading them to replay an already
+        # durable decision would let ordinary external progress refuse it.
+        existing = self._store.get(key)
+        if existing is None:
+            planning = plan_participants_with_evidence(
+                [worker], home=self._store.path.parent,
+                workspace_id=self._workspace_id, lane_id=worker.lane_id,
             )
+            if planning.refused:
+                # Zero-effect: before the plan, before any supersede, before any actuation.
+                return self._outcome(
+                    request, verdict, status=RECOVERY_REFUSED, executed=True,
+                    observation=observation,
+                    detail=f"update evidence planning refused ({planning.refusal})",
+                )
+            worker = planning.participants[0]
+
+            # 2. Plan the non-self worker-recovery transaction.
+            plan = self._store.plan_transaction(
+                key, action_generation=gen, decision=decision, continuation=continuation,
+                participants=[worker],
+            )
+            if not plan.applied and plan.reason != CAS_ALREADY_DECLARED:
+                return self._outcome(
+                    request, verdict, status=RECOVERY_STOPPED, executed=True,
+                    observation=observation,
+                    detail=f"transaction plan refused ({plan.reason})",
+                )
+        else:
+            # The request-built pin wearing the stored triplet, and nothing else from the
+            # stored row. The whole-participant comparison below still decides whether this
+            # is the same action -- including for the supersede path, whose signature
+            # carries the triplet (j#97093 decision 6).
+            stored_pin = existing.find_participant(worker.identity)
+            if stored_evidence_is_foreign(stored_pin, workspace_id=self._workspace_id):
+                return self._outcome(
+                    request, verdict, status=RECOVERY_REFUSED, executed=True,
+                    observation=observation,
+                    detail="the stored update evidence names another workspace; zero actuation",
+                )
+            worker = participant_with_stored_evidence(worker, stored_pin)
         current = self._store.get(key)
         if current is None:
             return self._outcome(
