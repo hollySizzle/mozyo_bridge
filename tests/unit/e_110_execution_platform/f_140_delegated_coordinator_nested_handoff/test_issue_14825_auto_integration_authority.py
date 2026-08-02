@@ -20,6 +20,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from mozyo_bridge.core.state.lane_lifecycle import (
+    DISPOSITION_HIBERNATED,
+    RELEASE_RELEASED,
+    DecisionPointer,
+    LaneLifecycleKey,
+    LaneLifecycleStore,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ci_source import (  # noqa: E501
     CI_STATE_SUCCESS,
     CiVerdict,
@@ -37,6 +44,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LaneCallbackScope,
     LiveDurableAuthorityReader,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ports import (  # noqa: E501
+    CleanupAuthority,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ledger import (  # noqa: E501
     AutoIntegrationLedgerError,
 )
@@ -51,6 +61,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_records import (  # noqa: E501
     IntegrationActionRecord,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.retirement_cleanup_policy import (  # noqa: E501
+    CleanupActionRecord,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_candidate import (  # noqa: E501
     CONJUNCT_REQUIRED_CI_GREEN,
@@ -348,6 +361,19 @@ def _action(**over):
     return IntegrationActionRecord(**fields)  # type: ignore[arg-type]
 
 
+def _cleanup(**over):
+    fields = dict(
+        issue=ISSUE,
+        lane_generation=GEN,
+        branch="issue_14825",
+        worktree_path="/work/issue_14825",
+        recorded_source_head=SOURCE,
+        integration_action_key="integration-action",
+    )
+    fields.update(over)
+    return CleanupActionRecord(**fields)  # type: ignore[arg-type]
+
+
 class ReaderIdentityFenceTest(unittest.TestCase):
     """A record for another action establishes nothing, and is refused before any read."""
 
@@ -363,6 +389,37 @@ class ReaderIdentityFenceTest(unittest.TestCase):
         self.assertTrue(authority.callbacks_drained)
         self.assertIsNotNone(authority.source_ci)
         self.assertEqual(authority.source_ci.run, "299")
+
+    def test_cleanup_carries_the_exact_integration_journal_for_the_lifecycle_cas(self) -> None:
+        journals = _approved_journals() + [
+            _journal("96520", _integration_note(), ISSUER_COORDINATOR),
+            _journal(
+                "96530", _ci_note(head=INTEGRATION), ISSUER_COORDINATOR
+            ),
+        ]
+        authority = _reader(
+            journals,
+            authorizing_action_fn=lambda record, proof_head: "integration-action",
+        ).read_cleanup_authority(record=_cleanup())
+
+        self.assertTrue(authority.issue_closed)
+        self.assertTrue(authority.integration_confirmed)
+        self.assertTrue(authority.integration_ci_settled_green)
+        self.assertEqual(authority.authorizing_action_key, "integration-action")
+        self.assertEqual(authority.lifecycle_decision_journal, "96520")
+
+    def test_cleanup_for_a_different_source_has_no_lifecycle_decision(self) -> None:
+        journals = [
+            _journal("96520", _integration_note(), ISSUER_COORDINATOR),
+            _journal(
+                "96530", _ci_note(head=INTEGRATION), ISSUER_COORDINATOR
+            ),
+        ]
+        authority = _reader(journals).read_cleanup_authority(
+            record=_cleanup(recorded_source_head=OTHER)
+        )
+        self.assertFalse(authority.integration_confirmed)
+        self.assertEqual(authority.lifecycle_decision_journal, "")
 
     def test_a_caller_selected_review_generation_is_not_admissible(self) -> None:
         authority = _reader(_approved_journals()).read_integration_authority(
@@ -574,6 +631,104 @@ class DeclaredIntegrationBranchTest(unittest.TestCase):
                     landed_head=SOURCE,
                     ci_workflow="Test",
                 )
+
+    def test_production_composition_wires_fresh_cleanup_authority_into_release(self) -> None:
+        local_generation = 1
+
+        class Inventory:
+            def __init__(self) -> None:
+                self.closed = []
+
+            def read_inventory(self):
+                return (), True
+
+            def live_rows(self):
+                return ()
+
+            def execute_close(self, plan):
+                self.closed.append(plan)
+                return type(
+                    "CloseResult",
+                    (),
+                    {"closed": (), "failed": (), "foreign_names": ()},
+                )()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            store = LaneLifecycleStore(home=home)
+            key = LaneLifecycleKey(WS, LANE)
+            store.declare_active(
+                key,
+                issue_id=ISSUE,
+                decision=DecisionPointer(
+                    source="redmine", issue_id=ISSUE, journal_id="96589"
+                ),
+            )
+            inventory = Inventory()
+            admitted = _action(lane_generation=local_generation)
+            journals = [
+                _journal(
+                    REQ,
+                    _request_note(),
+                    ISSUER_REVIEW_GATEWAY,
+                    gen=local_generation,
+                ),
+                _journal(
+                    "96510",
+                    _review_note(gen=local_generation),
+                    ISSUER_REVIEW_GATEWAY,
+                    gen=local_generation,
+                ),
+            ]
+            with mock.patch(
+                "mozyo_bridge.e_110_execution_platform."
+                "f_140_delegated_coordinator_nested_handoff.application."
+                "auto_integration_composition.live_journal_reader",
+                return_value=lambda issue: journals,
+            ):
+                use_case = build_auto_integration_use_case(
+                    binding=LaneBinding(
+                        issue=ISSUE,
+                        workspace=WS,
+                        lane=LANE,
+                        lane_generation=local_generation,
+                        branch="issue_14825",
+                        worktree="/tmp/wt",
+                    ),
+                    config=AutoIntegrationConfig(
+                        mode="auto", integration_branch=TARGET_REF
+                    ),
+                    repo_root=Path("."),
+                    lifecycle_store=store,
+                    inventory_ops=inventory,
+                    callback_outbox=object(),
+                    admission_record=admitted,
+                    home=home,
+                )
+            current = CleanupAuthority(
+                issue_closed=True,
+                integration_confirmed=True,
+                integration_ci_settled_green=True,
+                callbacks_drained=True,
+                owner_gates_resolved=True,
+                authorizing_action_key=admitted.action_key,
+                lifecycle_decision_journal="96790",
+            )
+            with mock.patch.object(
+                LiveDurableAuthorityReader,
+                "read_cleanup_authority",
+                return_value=current,
+            ) as fresh_read:
+                outcome = use_case.processes.describe_release(
+                    issue=ISSUE, lane_generation=local_generation
+                )
+
+            self.assertTrue(outcome.released, outcome.detail)
+            self.assertEqual(store.get(key).lane_disposition, DISPOSITION_HIBERNATED)
+            self.assertEqual(store.get(key).process_release, RELEASE_RELEASED)
+            self.assertEqual(store.get(key).decision.journal_id, "96790")
+            self.assertEqual(len(inventory.closed), 1)
+            fresh_read.assert_called_once_with(record=mock.ANY)
 
     def test_supersede_after_composition_is_zero_register_and_zero_event(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

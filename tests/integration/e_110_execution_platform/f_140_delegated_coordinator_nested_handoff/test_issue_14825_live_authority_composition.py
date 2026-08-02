@@ -36,6 +36,7 @@ from mozyo_bridge.core.state.lane_lifecycle import (
     DecisionPointer,
     LaneLifecycleKey,
     LaneLifecycleStore,
+    RELEASE_NOT_REQUESTED,
     RELEASE_RELEASED,
 )
 from mozyo_bridge.core.state.workflow_runtime_store import (
@@ -109,6 +110,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REFUSE_FOREIGN_LANE,
     REFUSE_INVENTORY_UNREADABLE,
     REFUSE_NO_ROW,
+    REFUSE_TRANSITION,
+    REFUSE_TRANSITION_AUTHORITY,
     LiveManagedProcessOperations,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
@@ -508,6 +511,29 @@ class LiveManagedProcessReleaseTest(unittest.TestCase):
         self.assertTrue(outcome.released, outcome.detail)
         self.assertEqual(outcome.resolved_lane, LANE)
 
+    def test_production_cleanup_transitions_the_active_lane_then_releases(self) -> None:
+        key = self._declare()
+        inventory = FakeInventoryOps()
+        observed = []
+
+        def transition_decision(issue: str, lane_generation: int) -> DecisionPointer:
+            observed.append((issue, lane_generation))
+            return DecisionPointer(
+                source="redmine", issue_id=ISSUE, journal_id="96790"
+            )
+
+        outcome = self._ops(
+            inventory=inventory, transition_decision_fn=transition_decision
+        ).describe_release(issue=ISSUE, lane_generation=GEN)
+
+        self.assertTrue(outcome.released, outcome.detail)
+        self.assertEqual(observed, [(ISSUE, GEN)])
+        record = self.store.get(key)
+        self.assertEqual(record.lane_disposition, DISPOSITION_HIBERNATED)
+        self.assertEqual(record.process_release, RELEASE_RELEASED)
+        self.assertEqual(record.decision.journal_id, "96790")
+        self.assertEqual(len(inventory.closed), 1)
+
     def test_a_generation_that_is_not_the_rows_resolves_to_no_row_at_all(self) -> None:
         # The staleness mechanism, stated as the test that proves it: a lifecycle row carries the
         # lane's CURRENT generation, so a superseded generation matches nothing. There is no
@@ -553,10 +579,43 @@ class LiveManagedProcessReleaseTest(unittest.TestCase):
         self.assertFalse(outcome.released)
         self.assertEqual(outcome.refusal, REFUSE_INVENTORY_UNREADABLE)
 
-    def test_a_lane_still_active_is_never_released(self) -> None:
-        self._declare()
+    def test_an_active_lane_without_durable_transition_authority_is_never_released(self) -> None:
+        key = self._declare()
         outcome = self._ops().describe_release(issue=ISSUE, lane_generation=GEN)
         self.assertFalse(outcome.released)
+        self.assertEqual(outcome.refusal, REFUSE_TRANSITION_AUTHORITY)
+        self.assertEqual(self.store.get(key).lane_disposition, DISPOSITION_ACTIVE)
+
+    def test_lifecycle_drift_after_authority_read_closes_no_process(self) -> None:
+        key = self._declare()
+        inventory = FakeInventoryOps()
+
+        def transition_decision(issue: str, lane_generation: int) -> DecisionPointer:
+            self.assertEqual((issue, lane_generation), (ISSUE, GEN))
+            observed = self.store.get(key)
+            self.store.transition_disposition(
+                key,
+                expected_disposition=DISPOSITION_ACTIVE,
+                expected_revision=observed.revision,
+                target=DISPOSITION_HIBERNATED,
+                decision=DecisionPointer(
+                    source="redmine", issue_id=ISSUE, journal_id="96789"
+                ),
+            )
+            return DecisionPointer(
+                source="redmine", issue_id=ISSUE, journal_id="96790"
+            )
+
+        outcome = self._ops(
+            inventory=inventory, transition_decision_fn=transition_decision
+        ).describe_release(issue=ISSUE, lane_generation=GEN)
+
+        self.assertFalse(outcome.released)
+        self.assertEqual(outcome.refusal, REFUSE_TRANSITION)
+        self.assertEqual(inventory.closed, [])
+        record = self.store.get(key)
+        self.assertEqual(record.lane_disposition, DISPOSITION_HIBERNATED)
+        self.assertEqual(record.process_release, RELEASE_NOT_REQUESTED)
 
     def test_a_non_positive_generation_resolves_nothing(self) -> None:
         self._declare()

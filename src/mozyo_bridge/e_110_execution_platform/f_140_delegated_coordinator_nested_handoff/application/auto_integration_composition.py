@@ -50,7 +50,7 @@ from typing import Callable, Mapping, Optional, Sequence, Tuple
 import yaml
 
 from mozyo_bridge.application.repo_local_config_loader import CONFIG_FILE_RELPATH
-from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
+from mozyo_bridge.core.state.lane_lifecycle import DecisionPointer, LaneLifecycleStore
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_actuator import (  # noqa: E501
     AutoIntegrationUseCase,
     IntegrationRunReport,
@@ -449,6 +449,47 @@ def build_auto_integration_use_case(
         ),
     )
 
+    admitted_cleanup_record = CleanupActionRecord(
+        issue=binding.issue,
+        lane_generation=binding.lane_generation,
+        branch=binding.branch,
+        worktree_path=binding.worktree,
+        recorded_source_head=admission_record.source_head,
+        integration_action_key=admission_record.action_key,
+    )
+
+    def cleanup_transition_decision(
+        issue: str, lane_generation: int
+    ) -> Optional[DecisionPointer]:
+        """Fresh durable authority for the release driver's required lifecycle CAS.
+
+        The process adapter may not release an ``active`` owner in place. Re-read the exact same
+        cleanup authority immediately before the CAS and return the coordinator's integration
+        journal only while every post-close gate still holds. The callback receives only the
+        already-verified issue/generation identity; a caller cannot select a different journal.
+        """
+        if issue != binding.issue or lane_generation != binding.lane_generation:
+            return None
+        current = authority.read_cleanup_authority(record=admitted_cleanup_record)
+        if not (
+            current.issue_closed
+            and current.integration_confirmed
+            and current.integration_ci_settled_green
+            and current.callbacks_drained
+            and current.owner_gates_resolved
+            and current.authorizing_action_key == admission_record.action_key
+            and current.lifecycle_decision_journal
+        ):
+            return None
+        try:
+            return DecisionPointer(
+                source="redmine",
+                issue_id=issue,
+                journal_id=current.lifecycle_decision_journal,
+            )
+        except ValueError:
+            return None
+
     admitted_action_frame = (
         admission_record.action_key,
         binding.issue,
@@ -463,14 +504,7 @@ def build_auto_integration_use_case(
         admission_record.expected_target_head,
         admission_record.review_generation,
     )
-    admitted_cleanup_action_key = CleanupActionRecord(
-        issue=binding.issue,
-        lane_generation=binding.lane_generation,
-        branch=binding.branch,
-        worktree_path=binding.worktree,
-        recorded_source_head=admission_record.source_head,
-        integration_action_key=admission_record.action_key,
-    ).action_key
+    admitted_cleanup_action_key = admitted_cleanup_record.action_key
 
     return AutoIntegrationUseCase(
         operations=LiveAutoIntegrationGitOperations(repo_root=repo_root),
@@ -483,6 +517,7 @@ def build_auto_integration_use_case(
             ops=ops,
             lane_workspace=binding.workspace,
             lane_id=binding.lane,
+            transition_decision_fn=cleanup_transition_decision,
         ),
         authority=authority,
         ledger=durable_ledger,

@@ -660,6 +660,15 @@ authorize していた。live reader は **ledger** から答える: この issu
 `integration_ci_settled_green` が答えるので、ledger には ledger が答えられる問い (どの action が commit を
 publish したか) だけを問う。
 
+**process release は active owner をその場で閉じない。** fake-free live smoke の post-close cleanup は全 gate を
+満たしたにもかかわらず、共有 release driver が `active` lifecycle row を正しく拒否したため停止した
+(#14825 j#96793)。production composition は cleanup admission 後も同じ immutable action record で authority を
+再読し、issue close、integration disposition、target CI、callback、owner gate、ledger action-key の積がなお成立する
+場合に限り、coordinator-issued integration-disposition journal を decision pointer として
+`active -> hibernated` を exact revision CAS する。その post-transition revision を共有 release driver へ渡して
+初めて managed process を閉じる。authority 欠落・不一致・read failure・CAS drift は zero-close であり、既に
+`hibernated` の retry は transition を再実行せず既存 release generation をそのまま継続する。
+
 ### 非同期 CI は待たずに継続する (item 3)
 
 `AsyncCiContinuation` は同じ action record で `run_integration` を再入する。通常 owner / trigger は production

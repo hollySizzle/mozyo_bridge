@@ -374,6 +374,11 @@ class CleanupAuthority:
     callbacks_drained: bool = False
     owner_gates_resolved: bool = False
     authorizing_action_key: str = ""
+    #: The exact coordinator integration-disposition journal that may anchor the lifecycle
+    #: ``active -> hibernated`` CAS immediately before managed-process release. It is not caller
+    #: input: the live authority returns it from the same exact-head integration record that
+    #: establishes ``integration_confirmed``. Blank is fail-closed.
+    lifecycle_decision_journal: str = ""
 
 
 @runtime_checkable

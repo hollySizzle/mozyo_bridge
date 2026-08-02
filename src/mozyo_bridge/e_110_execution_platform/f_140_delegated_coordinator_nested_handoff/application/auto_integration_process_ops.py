@@ -30,27 +30,36 @@ So this adapter resolves its target from the durable lifecycle store and from no
 * **a foreign lane releases nothing.** The one resolved row must be this actuator's own
   workspace and lane. Retiring another lane's managed process is a cross-lane side effect in
   exactly the way removing its checkout was;
+* **an active owner first leaves ``active`` under fresh durable authority.** The shared release
+  driver deliberately refuses an active lane. Production cleanup therefore resolves the exact
+  current integration-disposition journal again, uses it for an ``active -> hibernated`` CAS,
+  and only then opens the release generation. Missing authority or revision drift closes
+  nothing;
 * **the release consumes the identity that was verified.** The lifecycle key handed to the
-  driver is built from the resolved ROW, and the row's ``revision`` is passed as the driver's
-  ``expected_revision`` — so any lifecycle write between the resolution and the mutation
-  (including the generation bump that would make our answer stale) closes nothing and reports
-  an admission block. Verifying one value and mutating on another is the defect j#96406
+  driver is built from the resolved ROW, and the row's post-transition ``revision`` is passed as
+  the driver's ``expected_revision`` — so any lifecycle write between the resolution and the
+  mutation (including the generation bump that would make our answer stale) closes nothing and
+  reports an admission block. Verifying one value and mutating on another is the defect j#96406
   finding 2 found on the other side of this same step.
 
-The mutation itself is the shared tombstone-free driver
+The process mutation itself is the shared tombstone-free driver
 (:func:`~...application.sublane_process_release.drive_process_release`): it closes the lane's
 durably pinned managed slots and never removes a worktree, deletes a branch, or writes a
-tombstone. This adapter adds identity resolution and adds nothing to what that driver may do.
+tombstone. This adapter adds the exact lifecycle transition that driver's contract requires; it
+does not weaken or bypass the driver.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Optional, Protocol, Sequence, Tuple, runtime_checkable
+from typing import Callable, Mapping, Optional, Protocol, Sequence, Tuple, runtime_checkable
 
 from mozyo_bridge.core.state.lane_lifecycle import (
+    DISPOSITION_ACTIVE,
+    DISPOSITION_HIBERNATED,
     RELEASE_NOT_REQUESTED,
     RELEASE_RELEASED,
+    DecisionPointer,
     LaneLifecycleError,
     LaneLifecycleKey,
     LaneLifecycleStore,
@@ -80,6 +89,8 @@ REFUSE_AMBIGUOUS = "lifecycle_row_ambiguous"
 REFUSE_FOREIGN_LANE = "foreign_lane"
 REFUSE_INVENTORY_UNREADABLE = "inventory_unreadable"
 REFUSE_INVALID_IDENTITY = "invalid_identity"
+REFUSE_TRANSITION_AUTHORITY = "lifecycle_transition_authority_unavailable"
+REFUSE_TRANSITION = "lifecycle_transition_refused"
 
 
 @runtime_checkable
@@ -125,6 +136,9 @@ class LiveManagedProcessOperations:
     ops: ManagedInventoryOps
     lane_workspace: str
     lane_id: str
+    transition_decision_fn: Optional[
+        Callable[[str, int], Optional[DecisionPointer]]
+    ] = None
 
     def release_process(self, *, issue: str, lane_generation: int) -> bool:
         """Release the managed process of the lane those two values identify, or nothing.
@@ -228,6 +242,106 @@ class LiveManagedProcessOperations:
                 detail=f"the resolved row does not form a lifecycle key ({exc})",
             )
 
+        if record.lane_disposition == DISPOSITION_ACTIVE:
+            if self.transition_decision_fn is None:
+                return ProcessReleaseOutcome(
+                    refusal=REFUSE_TRANSITION_AUTHORITY,
+                    detail=(
+                        "the lane is active and no durable cleanup decision reader is wired; "
+                        "an active owner is never released in place"
+                    ),
+                    resolved_lane=str(record.lane_id),
+                    resolved_workspace=str(record.repo_workspace_id),
+                    resolved_revision=int(record.revision),
+                )
+            try:
+                decision = self.transition_decision_fn(
+                    wanted_issue, int(lane_generation)
+                )
+            except Exception as exc:  # noqa: BLE001 — unreadable authority -> zero-close
+                return ProcessReleaseOutcome(
+                    refusal=REFUSE_TRANSITION_AUTHORITY,
+                    detail=(
+                        "the durable cleanup decision could not be resolved "
+                        f"({exc.__class__.__name__}); the active lane was not changed"
+                    ),
+                    resolved_lane=str(record.lane_id),
+                    resolved_workspace=str(record.repo_workspace_id),
+                    resolved_revision=int(record.revision),
+                )
+            if not isinstance(decision, DecisionPointer):
+                return ProcessReleaseOutcome(
+                    refusal=REFUSE_TRANSITION_AUTHORITY,
+                    detail=(
+                        "the current integration disposition did not yield a complete durable "
+                        "decision pointer; the active lane was not changed"
+                    ),
+                    resolved_lane=str(record.lane_id),
+                    resolved_workspace=str(record.repo_workspace_id),
+                    resolved_revision=int(record.revision),
+                )
+            try:
+                transitioned = self.store.transition_disposition(
+                    key,
+                    expected_disposition=DISPOSITION_ACTIVE,
+                    expected_revision=record.revision,
+                    target=DISPOSITION_HIBERNATED,
+                    decision=decision,
+                )
+            except (LaneLifecycleError, OSError) as exc:
+                return ProcessReleaseOutcome(
+                    refusal=REFUSE_TRANSITION,
+                    detail=(
+                        "the active-to-hibernated lifecycle CAS could not be written "
+                        f"({exc.__class__.__name__}); zero process close"
+                    ),
+                    resolved_lane=str(record.lane_id),
+                    resolved_workspace=str(record.repo_workspace_id),
+                    resolved_revision=int(record.revision),
+                )
+            if not transitioned.applied:
+                return ProcessReleaseOutcome(
+                    refusal=REFUSE_TRANSITION,
+                    detail=(
+                        "the active-to-hibernated lifecycle CAS was refused "
+                        f"({transitioned.reason}); zero process close"
+                    ),
+                    resolved_lane=str(record.lane_id),
+                    resolved_workspace=str(record.repo_workspace_id),
+                    resolved_revision=int(record.revision),
+                )
+            try:
+                advanced = self.store.get(key)
+            except (LaneLifecycleError, OSError) as exc:
+                return ProcessReleaseOutcome(
+                    refusal=REFUSE_STORE_UNREADABLE,
+                    detail=(
+                        "the post-transition lifecycle row could not be read "
+                        f"({exc.__class__.__name__}); zero process close"
+                    ),
+                    resolved_lane=str(record.lane_id),
+                    resolved_workspace=str(record.repo_workspace_id),
+                    resolved_revision=int(transitioned.revision),
+                )
+            if (
+                advanced is None
+                or advanced.lane_disposition != DISPOSITION_HIBERNATED
+                or str(advanced.issue_id) != wanted_issue
+                or int(advanced.lane_generation) != int(lane_generation)
+                or int(advanced.revision) != int(transitioned.revision)
+            ):
+                return ProcessReleaseOutcome(
+                    refusal=REFUSE_TRANSITION,
+                    detail=(
+                        "the post-transition lifecycle row did not byte-exactly preserve the "
+                        "verified issue, generation and revision; zero process close"
+                    ),
+                    resolved_lane=str(record.lane_id),
+                    resolved_workspace=str(record.repo_workspace_id),
+                    resolved_revision=int(transitioned.revision),
+                )
+            record = advanced
+
         outcome = drive_process_release(
             store=self.store,
             ops=self.ops,
@@ -319,6 +433,8 @@ __all__ = (
     "REFUSE_INVENTORY_UNREADABLE",
     "REFUSE_NO_ROW",
     "REFUSE_STORE_UNREADABLE",
+    "REFUSE_TRANSITION",
+    "REFUSE_TRANSITION_AUTHORITY",
     "LiveManagedProcessOperations",
     "ManagedInventoryOps",
     "ProcessReleaseOutcome",

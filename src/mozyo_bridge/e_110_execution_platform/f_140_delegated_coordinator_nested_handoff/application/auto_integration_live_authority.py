@@ -503,6 +503,7 @@ class LiveDurableAuthorityReader:
             callbacks_drained=self._callbacks_drained(),
             owner_gates_resolved=self._owner_gates_resolved(journals),
             authorizing_action_key=self.authorizing_action_fn(record, proof_head),
+            lifecycle_decision_journal=(integration.journal if confirmed else ""),
         )
 
     # -- shared reads ------------------------------------------------------
