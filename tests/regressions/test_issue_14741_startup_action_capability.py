@@ -630,14 +630,16 @@ class SchemaV2CutoverTest(unittest.TestCase):
             backup_path=self.dir / "b.sqlite",
             expected_plan_digest=_approved_digest(self.fence),
         )
-        self.assertEqual(
+        # Audit j#96966 C10: "already v2" is not "I already did this". Without the
+        # external completion receipt for THIS plan and target, replay is unverified —
+        # and the old test asserting an arbitrary digest succeeded was itself the defect.
+        with self.assertRaises(StartupStoreMigrationRefused) as ctx:
             migrate_startup_store_v1_to_v2(
                 self.fence,
                 backup_path=self.dir / "b2.sqlite",
                 expected_plan_digest="0" * 64,
-            ).outcome,
-            MIGRATION_ALREADY_V2,
-        )
+            )
+        self.assertEqual(ctx.exception.reason, "already_v2_unverified")
 
     def test_migration_refuses_plan_drift_with_zero_mutation(self) -> None:
         self._v1()
@@ -1109,3 +1111,92 @@ class MigrationBackupAndDigestTest(unittest.TestCase):
         self.assertTrue(result.backup_path)
         self.assertTrue(result.content_digest)
         self.assertEqual(result.action_count, 1)
+
+
+class MigrationReplayAndRecoveryArtifactTest(unittest.TestCase):
+    """j#96966 C10/C11: an unproven replay is not a success, and a DB alone is not a backup."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.path = self.dir / "s.sqlite"
+        self.fence = StartupTransactionFence(self.path)
+        self.fence.reserve(UNIT, "seed")
+        self.plan = _approved_digest(self.fence)
+
+    def _run(self, **kw):
+        from mozyo_bridge.core.state.startup_store_migration import (
+            migrate_startup_store_v1_to_v2 as run,
+        )
+
+        kw.setdefault("backup_path", self.dir / "backup.sqlite")
+        kw.setdefault("expected_plan_digest", self.plan)
+        return run(self.fence, **kw)
+
+    # C10 ------------------------------------------------------------------------------
+    def test_c10_replay_without_a_completion_receipt_is_refused(self) -> None:
+        self.assertEqual(self._run().outcome, MIGRATION_OK)
+        with self.assertRaises(StartupStoreMigrationRefused) as ctx:
+            self._run(backup_path=self.dir / "b2.sqlite")
+        self.assertEqual(ctx.exception.reason, "already_v2_unverified")
+
+    def test_c10_a_foreign_or_malformed_receipt_does_not_prove_completion(self) -> None:
+        self._run()
+        for label, receipt in (
+            ("wrong plan", {"plan_digest": "1" * 64, "target_path": str(self.path),
+                            "outcome": MIGRATION_OK}),
+            ("wrong target", {"plan_digest": self.plan, "target_path": "/elsewhere.sqlite",
+                              "outcome": MIGRATION_OK}),
+            ("not completed", {"plan_digest": self.plan, "target_path": str(self.path),
+                               "outcome": "in_progress"}),
+            ("not a mapping", "receipt"),
+            ("absent", None),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaises(StartupStoreMigrationRefused) as ctx:
+                    self._run(backup_path=self.dir / "b3.sqlite", completion_receipt=receipt)
+                self.assertEqual(ctx.exception.reason, "already_v2_unverified")
+
+    def test_c10_the_matching_completion_receipt_replays_idempotently(self) -> None:
+        first = self._run()
+        replay = self._run(
+            backup_path=self.dir / "b4.sqlite",
+            completion_receipt={
+                "plan_digest": self.plan,
+                "target_path": str(self.path),
+                "outcome": MIGRATION_OK,
+            },
+        )
+        self.assertEqual(replay.outcome, MIGRATION_ALREADY_V2)
+        self.assertEqual(replay.schema_version, 2)
+        self.assertEqual(replay.content_digest, first.content_digest)
+
+    # C11 ------------------------------------------------------------------------------
+    def test_c11_the_artifact_carries_the_seal_and_restores_a_usable_authority(self) -> None:
+        """A DB-only restore is a DAMAGED authority; the pair restores a working one."""
+        result = self._run()
+        self.assertTrue(result.backup_seal_path)
+        self.assertTrue(result.seal_nonce_verified)
+
+        # DB alone: the fence requires its external seal, so this refuses.
+        db_only = self.dir / "restore_db_only.sqlite"
+        db_only.write_bytes(Path(result.backup_path).read_bytes())
+        with self.assertRaises(StartupTransactionError):
+            StartupTransactionFence(db_only).read(startup_action_id(UNIT, "seed"))
+
+        # DB + seal: a real recovery point.
+        paired = self.dir / "restore_paired.sqlite"
+        paired.write_bytes(Path(result.backup_path).read_bytes())
+        paired.with_name(paired.name + ".seal").write_bytes(
+            Path(result.backup_seal_path).read_bytes()
+        )
+        restored = StartupTransactionFence(paired).read(startup_action_id(UNIT, "seed"))
+        self.assertIsNotNone(restored, "the DB+seal artifact restores a usable authority")
+
+    def test_c11_a_missing_seal_refuses_the_migration_with_zero_mutation(self) -> None:
+        Path(self.fence.seal_path).unlink()
+        with self.assertRaises(StartupTransactionError):
+            self._run()
+        with sqlite3.connect(self.path) as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)

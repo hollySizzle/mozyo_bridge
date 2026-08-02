@@ -22,6 +22,7 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
 from mozyo_bridge.core.state.startup_action_capability import (
     CAPABILITY_LEGACY,
@@ -54,6 +55,12 @@ MIGRATION_FOREIGN_SIBLING = "foreign_sibling_schema"
 MIGRATION_BACKUP_FAILED = "backup_failed"
 #: The approved plan digest was absent or not a canonical digest. Required, never defaulted.
 MIGRATION_PLAN_DIGEST_REQUIRED = "plan_digest_required"
+#: The store is already v2, but nothing proves this build's run is the SAME completed
+#: rollout. "It is already done" is not the same statement as "I already did it".
+MIGRATION_ALREADY_V2_UNVERIFIED = "already_v2_unverified"
+#: The seal could not be snapshotted or read back with the DB, so the artifact could not
+#: restore the authority it claims to back up.
+MIGRATION_SEAL_UNAVAILABLE = "seal_unavailable"
 #: The caller's migration plan is not the plan this store presents.
 MIGRATION_PLAN_DRIFT = "plan_drift"
 
@@ -66,10 +73,19 @@ _BACKUP_STAGING_SUFFIX = ".staging"
 
 @dataclass(frozen=True)
 class StartupStoreMigrationResult:
-    """What a migration did, and the evidence it verified before doing it."""
+    """What a migration did, and the evidence it verified before doing it.
+
+    ``backup_path`` alone is NOT a recovery point (audit j#96966 C11): the fence's
+    ``store_shape`` requires an external ``.seal`` whose nonce byte-matches the DB's, so
+    restoring the database on its own yields a *damaged* authority that refuses every read.
+    ``backup_seal_path`` is the seal captured with it, and ``seal_nonce_verified`` records
+    that the published pair was read back and agreed. A caller must restore BOTH.
+    """
 
     outcome: str
     backup_path: str = ""
+    backup_seal_path: str = ""
+    seal_nonce_verified: bool = False
     schema_version: int = 0
     action_count: int = 0
     content_digest: str = ""
@@ -88,6 +104,27 @@ def _store_facts(conn) -> tuple:
         separators=(",", ":"),
     )
     return (version, len(rows), hashlib.sha256(payload.encode("utf-8")).hexdigest())
+
+
+def staged_seal_backup(fence, backup_path: Path) -> tuple:
+    """Stage the fence's identity seal beside the DB snapshot (audit j#96966 C11).
+
+    The seal is a separate file the fence requires and byte-matches against the DB's own
+    stored nonce. A snapshot without it restores to a store that fails `store_shape` — so
+    the "backup" would be a file that cannot be used as one. Captured and published under
+    the same staging/rename discipline as the DB.
+    """
+    seal_source = Path(fence.seal_path)
+    seal_target = backup_path.with_name(backup_path.name + ".seal")
+    staging = seal_target.with_name(seal_target.name + _BACKUP_STAGING_SUFFIX)
+    if not seal_source.is_file():
+        raise OSError("the store has no readable identity seal to snapshot")
+    if staging.exists():
+        staging.unlink()
+    staging.write_bytes(seal_source.read_bytes())
+    if staging.read_bytes() != seal_source.read_bytes():
+        raise OSError("the seal snapshot does not read back as the source seal")
+    return (staging, seal_target)
 
 
 def staged_backup(conn, backup_path: Path) -> tuple:
@@ -176,7 +213,25 @@ def _refuse_if_tagged_rows(conn) -> None:
             )
 
 
-def migrate_startup_store_v1_to_v2(fence, *, backup_path, expected_plan_digest: str):
+def _receipt_proves_completion(receipt, plan_digest: str, target_path) -> bool:
+    """True iff ``receipt`` is #14838's completion record for THIS plan and THIS store.
+
+    Deliberately strict and deliberately dumb: exact plan digest, exact target path. It is
+    not this primitive's job to interpret the rollout's bookkeeping — only to refuse to
+    call an unproven state a success.
+    """
+    if not isinstance(receipt, Mapping):
+        return False
+    return (
+        str(receipt.get("plan_digest") or "") == plan_digest
+        and str(receipt.get("target_path") or "") == str(target_path)
+        and str(receipt.get("outcome") or "") == MIGRATION_OK
+    )
+
+
+def migrate_startup_store_v1_to_v2(
+    fence, *, backup_path, expected_plan_digest: str, completion_receipt=None
+):
     """Take a v1 startup store to v2, offline and fail-closed. Returns a fixed token.
 
     Every refusal happens BEFORE any mutation, and the migration itself is one transaction:
@@ -204,9 +259,23 @@ def migrate_startup_store_v1_to_v2(fence, *, backup_path, expected_plan_digest: 
         with fence._connection("rw") as conn:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             if version == 2:
-                # Idempotent replay of a completed rollout; the connection's own `_verify`
-                # already proved the v2 shape, so there is nothing left to do.
+                # Audit j#96966 C10. "The store is already v2" is NOT "I already did this
+                # migration". The previous cut returned success here before even looking at
+                # the approved plan, so any well-formed digest — including a store migrated
+                # by some other run, against some other plan — read as an idempotent
+                # completion. Replay succeeds only when the caller presents the completion
+                # receipt for THIS action from the external action store (#14838) and it
+                # names this plan and this target.
                 facts = _store_facts(conn)
+                if not _receipt_proves_completion(
+                    completion_receipt, digest_token, fence.path
+                ):
+                    raise StartupStoreMigrationRefused(
+                        MIGRATION_ALREADY_V2_UNVERIFIED,
+                        "the store is already v2, but no external action completion "
+                        "receipt proves this run is that same completed rollout; refusing "
+                        "to report an unverified success",
+                    )
                 return StartupStoreMigrationResult(
                     MIGRATION_ALREADY_V2,
                     schema_version=facts[0],
@@ -232,20 +301,35 @@ def migrate_startup_store_v1_to_v2(fence, *, backup_path, expected_plan_digest: 
                     MIGRATION_PLAN_DRIFT,
                     "the store is not in the state the approved migration plan described",
                 )
-            staging = None
+            staging = seal_staging = None
+            seal_target = None
             try:
                 staging, source_facts = staged_backup(conn, backup)
+                seal_staging, seal_target = staged_seal_backup(fence, backup)
+                # Publish the PAIR, DB first: a reader that finds the DB must find the seal
+                # that goes with it, and a crash between the two leaves a DB whose missing
+                # seal makes it obviously unusable rather than silently wrong.
                 publish_backup(staging, backup)
                 staging = None
+                publish_backup(seal_staging, seal_target)
+                seal_staging = None
+                if backup.read_bytes()[:16] and Path(seal_target).read_bytes() != Path(
+                    fence.seal_path
+                ).read_bytes():
+                    raise OSError("the published seal does not match the live store's seal")
             except (OSError, sqlite3.DatabaseError, ValueError) as exc:
-                if staging is not None:
-                    try:
-                        Path(staging).unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                raise StartupStoreMigrationRefused(
-                    MIGRATION_BACKUP_FAILED, str(exc)
-                ) from exc
+                for leftover in (staging, seal_staging):
+                    if leftover is not None:
+                        try:
+                            Path(leftover).unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                reason = (
+                    MIGRATION_SEAL_UNAVAILABLE
+                    if "seal" in str(exc)
+                    else MIGRATION_BACKUP_FAILED
+                )
+                raise StartupStoreMigrationRefused(reason, str(exc)) from exc
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 if sibling == "absent":
@@ -264,6 +348,8 @@ def migrate_startup_store_v1_to_v2(fence, *, backup_path, expected_plan_digest: 
     return StartupStoreMigrationResult(
         MIGRATION_OK,
         backup_path=str(backup),
+        backup_seal_path=str(seal_target),
+        seal_nonce_verified=True,
         schema_version=post[0],
         action_count=post[1],
         content_digest=post[2],
