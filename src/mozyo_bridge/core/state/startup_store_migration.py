@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
+import os
+import re
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 
 from mozyo_bridge.core.state.startup_action_capability import (
@@ -50,8 +52,84 @@ MIGRATION_TAGGED_ROWS_PRESENT = "tagged_rows_present"
 MIGRATION_FOREIGN_SIBLING = "foreign_sibling_schema"
 #: The backup could not be produced. No backup, no migration.
 MIGRATION_BACKUP_FAILED = "backup_failed"
+#: The approved plan digest was absent or not a canonical digest. Required, never defaulted.
+MIGRATION_PLAN_DIGEST_REQUIRED = "plan_digest_required"
 #: The caller's migration plan is not the plan this store presents.
 MIGRATION_PLAN_DRIFT = "plan_drift"
+
+
+_PLAN_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
+#: Suffix for the staged snapshot. A backup is published by rename, so a reader never sees
+#: a half-written one.
+_BACKUP_STAGING_SUFFIX = ".staging"
+
+
+@dataclass(frozen=True)
+class StartupStoreMigrationResult:
+    """What a migration did, and the evidence it verified before doing it."""
+
+    outcome: str
+    backup_path: str = ""
+    schema_version: int = 0
+    action_count: int = 0
+    content_digest: str = ""
+
+
+def _store_facts(conn) -> tuple:
+    """``(user_version, action count, content digest)`` — the readback identity."""
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    rows = conn.execute(
+        "SELECT action_id, workspace_id, lane_id, providers, phase, revision,"
+        " participants, reserved_at, updated_at FROM startup_actions ORDER BY action_id"
+    ).fetchall()
+    payload = json.dumps(
+        [[str(cell) for cell in row] for row in rows],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    return (version, len(rows), hashlib.sha256(payload.encode("utf-8")).hexdigest())
+
+
+def staged_backup(conn, backup_path: Path) -> tuple:
+    """Snapshot the LIVE store with SQLite's backup API, then verify it by readback.
+
+    Audit j#96959 C8. ``shutil.copy2`` copies the main database file and nothing else, so a
+    store in WAL mode with ``wal_autocheckpoint=0`` loses every committed row still sitting
+    in the write-ahead log — measured: 1 of 2 actions survived a raw copy while the backup
+    API preserved both. A recovery point that silently drops committed actions is worse than
+    no backup, because the rollback would look like it worked.
+
+    The snapshot is written to a STAGING path and read back as a fresh connection: version,
+    action count, and a content digest must match the source. Only then is it published by
+    rename, so a reader never sees a partial backup and a failed backup publishes nothing.
+    """
+    staging = backup_path.with_name(backup_path.name + _BACKUP_STAGING_SUFFIX)
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    if staging.exists():
+        staging.unlink()
+    source_facts = _store_facts(conn)
+    dest = sqlite3.connect(staging)
+    try:
+        conn.backup(dest)
+        dest.commit()
+    finally:
+        dest.close()
+    verify = sqlite3.connect(f"file:{staging}?mode=ro", uri=True)
+    try:
+        snapshot_facts = _store_facts(verify)
+    finally:
+        verify.close()
+    if snapshot_facts != source_facts:
+        raise OSError(
+            f"the snapshot does not read back as the source "
+            f"(source={source_facts}, snapshot={snapshot_facts})"
+        )
+    return (staging, source_facts)
+
+
+def publish_backup(staging: Path, backup_path: Path) -> None:
+    """Atomically publish a verified staging snapshot. Rename, never copy."""
+    os.replace(staging, backup_path)
 
 
 class StartupStoreMigrationRefused(StartupTransactionError):
@@ -98,7 +176,7 @@ def _refuse_if_tagged_rows(conn) -> None:
             )
 
 
-def migrate_startup_store_v1_to_v2(fence, *, backup_path, expected_plan_digest: str = "") -> str:
+def migrate_startup_store_v1_to_v2(fence, *, backup_path, expected_plan_digest: str):
     """Take a v1 startup store to v2, offline and fail-closed. Returns a fixed token.
 
     Every refusal happens BEFORE any mutation, and the migration itself is one transaction:
@@ -107,9 +185,17 @@ def migrate_startup_store_v1_to_v2(fence, *, backup_path, expected_plan_digest: 
     accept it while a new one thinks the capability contract holds — so there is no
     intermediate state to be interrupted in.
     """
-    import shutil
-
     backup = Path(backup_path)
+    # Audit j#96959 C9: the approved plan digest is REQUIRED. Defaulting it to "" and
+    # guarding with a truthy test meant a caller that simply omitted it silently disabled
+    # drift detection — the one check that ties this run to the plan an operator approved.
+    digest_token = expected_plan_digest if isinstance(expected_plan_digest, str) else ""
+    if not _PLAN_DIGEST_RE.fullmatch(digest_token):
+        raise StartupStoreMigrationRefused(
+            MIGRATION_PLAN_DIGEST_REQUIRED,
+            "an offline migration requires the exact canonical digest of the approved "
+            "plan; missing, padded or malformed is refused before any mutation",
+        )
     try:
         holder = fence._hold()
     except Exception as exc:  # noqa: BLE001 - contention is a refusal, never a wait
@@ -120,7 +206,13 @@ def migrate_startup_store_v1_to_v2(fence, *, backup_path, expected_plan_digest: 
             if version == 2:
                 # Idempotent replay of a completed rollout; the connection's own `_verify`
                 # already proved the v2 shape, so there is nothing left to do.
-                return MIGRATION_ALREADY_V2
+                facts = _store_facts(conn)
+                return StartupStoreMigrationResult(
+                    MIGRATION_ALREADY_V2,
+                    schema_version=facts[0],
+                    action_count=facts[1],
+                    content_digest=facts[2],
+                )
             if version != 1:
                 raise StartupStoreMigrationRefused(
                     MIGRATION_PLAN_DRIFT, f"store is v{version}, not v1"
@@ -135,17 +227,22 @@ def migrate_startup_store_v1_to_v2(fence, *, backup_path, expected_plan_digest: 
                 ) from exc
             _refuse_if_tagged_rows(conn)
             actual_plan = startup_store_migration_plan_digest(conn)
-            if expected_plan_digest and actual_plan != expected_plan_digest:
+            if actual_plan != digest_token:
                 raise StartupStoreMigrationRefused(
                     MIGRATION_PLAN_DRIFT,
                     "the store is not in the state the approved migration plan described",
                 )
+            staging = None
             try:
-                backup.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(fence.path, backup)
-                if not backup.exists() or backup.stat().st_size <= 0:
-                    raise OSError("backup is absent or empty")
-            except OSError as exc:
+                staging, source_facts = staged_backup(conn, backup)
+                publish_backup(staging, backup)
+                staging = None
+            except (OSError, sqlite3.DatabaseError, ValueError) as exc:
+                if staging is not None:
+                    try:
+                        Path(staging).unlink(missing_ok=True)
+                    except OSError:
+                        pass
                 raise StartupStoreMigrationRefused(
                     MIGRATION_BACKUP_FAILED, str(exc)
                 ) from exc
@@ -163,6 +260,13 @@ def migrate_startup_store_v1_to_v2(fence, *, backup_path, expected_plan_digest: 
                 raise StartupStoreMigrationRefused(
                     MIGRATION_PLAN_DRIFT, f"the migration write failed ({exc})"
                 ) from exc
-    return MIGRATION_OK
+            post = _store_facts(conn)
+    return StartupStoreMigrationResult(
+        MIGRATION_OK,
+        backup_path=str(backup),
+        schema_version=post[0],
+        action_count=post[1],
+        content_digest=post[2],
+    )
 
 

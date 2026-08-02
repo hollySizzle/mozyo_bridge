@@ -49,10 +49,20 @@ from mozyo_bridge.core.state.startup_action_capability import (  # noqa: E402
 UNIT = StartupUnit("wA", "issue_14741", ("codex", "claude"))
 
 
+def _approved_digest(fence):
+    """The digest an operator would have approved for the store as it stands."""
+    with sqlite3.connect(fence.path) as conn:
+        return startup_store_migration_plan_digest(conn)
+
+
 def _to_v2(fence, tmpdir, seed_nonce="seed"):
     """Stand the store up and take it to v2 the only way a store may get there."""
     fence.reserve(UNIT, seed_nonce)
-    migrate_startup_store_v1_to_v2(fence, backup_path=Path(tmpdir) / "backup.sqlite")
+    return migrate_startup_store_v1_to_v2(
+        fence,
+        backup_path=Path(tmpdir) / "backup.sqlite",
+        expected_plan_digest=_approved_digest(fence),
+    )
 DIGEST = "mzb1:" + "a" * 64
 
 
@@ -596,7 +606,11 @@ class SchemaV2CutoverTest(unittest.TestCase):
     def test_after_migration_tagged_reserve_read_and_replay_all_work(self) -> None:
         self._v1()
         self.assertEqual(
-            migrate_startup_store_v1_to_v2(self.fence, backup_path=self.dir / "b.sqlite"),
+            migrate_startup_store_v1_to_v2(
+                self.fence,
+                backup_path=self.dir / "b.sqlite",
+                expected_plan_digest=_approved_digest(self.fence),
+            ).outcome,
             MIGRATION_OK,
         )
         action = self.fence.reserve(UNIT, "nonce-1", manifest=_manifest())
@@ -611,9 +625,17 @@ class SchemaV2CutoverTest(unittest.TestCase):
 
     def test_migration_is_idempotent(self) -> None:
         self._v1()
-        migrate_startup_store_v1_to_v2(self.fence, backup_path=self.dir / "b.sqlite")
+        migrate_startup_store_v1_to_v2(
+            self.fence,
+            backup_path=self.dir / "b.sqlite",
+            expected_plan_digest=_approved_digest(self.fence),
+        )
         self.assertEqual(
-            migrate_startup_store_v1_to_v2(self.fence, backup_path=self.dir / "b2.sqlite"),
+            migrate_startup_store_v1_to_v2(
+                self.fence,
+                backup_path=self.dir / "b2.sqlite",
+                expected_plan_digest="0" * 64,
+            ).outcome,
             MIGRATION_ALREADY_V2,
         )
 
@@ -637,8 +659,14 @@ class SchemaV2CutoverTest(unittest.TestCase):
         self._v1()
         with sqlite3.connect(self.path) as conn:
             conn.execute("CREATE TABLE startup_identity_manifests (wrong TEXT)")
+        # A well-formed but arbitrary digest: the sibling refusal is reached first, and
+        # computing the real one would itself trip over the foreign table.
         with self.assertRaises(StartupStoreMigrationRefused) as ctx:
-            migrate_startup_store_v1_to_v2(self.fence, backup_path=self.dir / "b.sqlite")
+            migrate_startup_store_v1_to_v2(
+                self.fence,
+                backup_path=self.dir / "b.sqlite",
+                expected_plan_digest="0" * 64,
+            )
         self.assertEqual(ctx.exception.reason, "foreign_sibling_schema")
         with sqlite3.connect(self.path) as conn:
             self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
@@ -647,7 +675,9 @@ class SchemaV2CutoverTest(unittest.TestCase):
         self._v1()
         with self.assertRaises(StartupStoreMigrationRefused) as ctx:
             migrate_startup_store_v1_to_v2(
-                self.fence, backup_path=self.dir / "s.sqlite" / "nested" / "b.sqlite"
+                self.fence,
+                backup_path=self.dir / "s.sqlite" / "nested" / "b.sqlite",
+                expected_plan_digest=_approved_digest(self.fence),
             )
         self.assertEqual(ctx.exception.reason, "backup_failed")
         with sqlite3.connect(self.path) as conn:
@@ -670,7 +700,11 @@ class SchemaV2CutoverTest(unittest.TestCase):
                 (forged, "wA", "issue_14741", "claude,codex", "planned", 1, "[]", "t", "t"),
             )
         with self.assertRaises(StartupStoreMigrationRefused) as ctx:
-            migrate_startup_store_v1_to_v2(self.fence, backup_path=self.dir / "b.sqlite")
+            migrate_startup_store_v1_to_v2(
+                self.fence,
+                backup_path=self.dir / "b.sqlite",
+                expected_plan_digest=_approved_digest(self.fence),
+            )
         self.assertEqual(ctx.exception.reason, "tagged_rows_present")
         with sqlite3.connect(self.path) as conn:
             self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
@@ -727,7 +761,11 @@ class ParentRuntimeRejectsV2Test(unittest.TestCase):
                 parent.StartupTransactionFence(path).read(action.action_id)
             )
 
-            migrate_startup_store_v1_to_v2(fence, backup_path=Path(tmp) / "b.sqlite")
+            migrate_startup_store_v1_to_v2(
+                fence,
+                backup_path=Path(tmp) / "b.sqlite",
+                expected_plan_digest=_approved_digest(fence),
+            )
 
             # v2: the parent rejects the WHOLE store, so every surface it has — rollback,
             # status, current-action — fails closed, not merely the tagged actions.
@@ -916,3 +954,158 @@ class AuditJ96946RegressionTest(unittest.TestCase):
             conn.execute("DROP TABLE startup_identity_manifests")
         with self.assertRaises(StartupTransactionError):
             self.fence.read_identity_manifest(action.action_id)
+
+
+class MigrationBackupAndDigestTest(unittest.TestCase):
+    """j#96959 C8/C9: the recovery point must be real, and the plan must be pre-approved.
+
+    Every case runs against a temp isolated store. No shared home is touched.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.path = self.dir / "s.sqlite"
+        self.fence = StartupTransactionFence(self.path)
+        self.fence.reserve(UNIT, "seed")
+
+    def _migrate(self, **kw):
+        from mozyo_bridge.core.state.startup_store_migration import (
+            migrate_startup_store_v1_to_v2 as run,
+        )
+
+        kw.setdefault("backup_path", self.dir / "backup.sqlite")
+        kw.setdefault("expected_plan_digest", _approved_digest(self.fence))
+        return run(self.fence, **kw)
+
+    # C8 -------------------------------------------------------------------------------
+    def _wal_with_uncheckpointed_commit(self) -> int:
+        """Commit an action that stays in the WAL, and return the true row count."""
+        with sqlite3.connect(self.path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+        conn = sqlite3.connect(self.path, isolation_level=None)
+        self.addCleanup(conn.close)
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            # lower(hex(...)): the classifier requires lowercase hex, and an uppercase id
+            # is (correctly) unclassifiable — which is a different test than this one.
+            "INSERT INTO startup_actions VALUES"
+            " ('startup-'||substr(lower(hex(randomblob(32))),1,64),'wA','issue_14741',"
+            "'claude,codex','planned',1,'[]','t','t')"
+        )
+        conn.execute("COMMIT")
+        return conn.execute("SELECT COUNT(*) FROM startup_actions").fetchone()[0]
+
+    def test_c8_an_uncheckpointed_committed_action_survives_into_the_snapshot(self) -> None:
+        """A raw file copy loses it; the backup API keeps it. Measured, not assumed."""
+        expected = self._wal_with_uncheckpointed_commit()
+        self.assertEqual(expected, 2)
+
+        # What the OLD implementation would have preserved, for contrast.
+        import shutil
+
+        raw = self.dir / "raw.sqlite"
+        shutil.copy2(self.path, raw)
+        raw_rows = sqlite3.connect(raw).execute(
+            "SELECT COUNT(*) FROM startup_actions"
+        ).fetchone()[0]
+        self.assertLess(raw_rows, expected, "a raw copy really does drop WAL commits")
+
+        result = self._migrate()
+        self.assertEqual(result.outcome, MIGRATION_OK)
+        backup_rows = sqlite3.connect(result.backup_path).execute(
+            "SELECT COUNT(*) FROM startup_actions"
+        ).fetchone()[0]
+        self.assertEqual(backup_rows, expected, "the snapshot is a real recovery point")
+
+    def test_c8_a_failed_backup_publishes_nothing_and_migrates_nothing(self) -> None:
+        import mozyo_bridge.core.state.startup_store_migration as migration
+
+        for stage in ("staged_backup", "publish_backup"):
+            with self.subTest(stage=stage):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                path = Path(tmp.name) / "s.sqlite"
+                fence = StartupTransactionFence(path)
+                fence.reserve(UNIT, "seed")
+                backup = Path(tmp.name) / "backup.sqlite"
+
+                def boom(*a, **k):
+                    raise OSError("synthetic failure")
+
+                real = getattr(migration, stage)
+                setattr(migration, stage, boom)
+                try:
+                    with self.assertRaises(StartupStoreMigrationRefused) as ctx:
+                        migration.migrate_startup_store_v1_to_v2(
+                            fence,
+                            backup_path=backup,
+                            expected_plan_digest=_approved_digest(fence),
+                        )
+                finally:
+                    setattr(migration, stage, real)
+                self.assertEqual(ctx.exception.reason, "backup_failed")
+                self.assertFalse(backup.exists(), "no partial backup is published")
+                self.assertFalse(
+                    backup.with_name(backup.name + ".staging").exists(),
+                    "and no staging file is left behind",
+                )
+                with sqlite3.connect(path) as conn:
+                    self.assertEqual(
+                        conn.execute("PRAGMA user_version").fetchone()[0],
+                        1,
+                        "the source store was not migrated",
+                    )
+
+    def test_c8_a_snapshot_that_does_not_read_back_is_refused(self) -> None:
+        """The snapshot is verified against the source before it is published."""
+        import mozyo_bridge.core.state.startup_store_migration as migration
+
+        backup = self.dir / "backup.sqlite"
+        real = migration._store_facts
+        calls = {"n": 0}
+
+        def drifting(conn):
+            calls["n"] += 1
+            facts = real(conn)
+            # Make the SNAPSHOT readback disagree with the source.
+            return facts if calls["n"] == 1 else (facts[0], facts[1] + 1, facts[2])
+
+        migration._store_facts = drifting
+        try:
+            with self.assertRaises(StartupStoreMigrationRefused) as ctx:
+                self._migrate(backup_path=backup)
+        finally:
+            migration._store_facts = real
+        self.assertEqual(ctx.exception.reason, "backup_failed")
+        self.assertFalse(backup.exists())
+
+    # C9 -------------------------------------------------------------------------------
+    def test_c9_a_missing_padded_or_malformed_digest_is_zero_write(self) -> None:
+        good = _approved_digest(self.fence)
+        for label, digest in (
+            ("empty", ""),
+            ("padded", " " + good),
+            ("trailing newline", good + "\n"),
+            ("uppercase", good.upper()),
+            ("truncated", good[:-1]),
+            ("not a digest", "not-a-digest"),
+            ("wrong type", None),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaises(StartupStoreMigrationRefused) as ctx:
+                    self._migrate(expected_plan_digest=digest)
+                self.assertEqual(ctx.exception.reason, "plan_digest_required")
+                with sqlite3.connect(self.path) as conn:
+                    self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+                self.assertFalse((self.dir / "backup.sqlite").exists())
+
+    def test_c9_only_an_exact_digest_on_a_clean_v1_store_proceeds(self) -> None:
+        result = self._migrate()
+        self.assertEqual(result.outcome, MIGRATION_OK)
+        self.assertEqual(result.schema_version, 2)
+        self.assertTrue(result.backup_path)
+        self.assertTrue(result.content_digest)
+        self.assertEqual(result.action_count, 1)
