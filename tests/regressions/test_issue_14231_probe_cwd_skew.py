@@ -183,7 +183,27 @@ class ProbeFailureIsZeroActuationTest(unittest.TestCase):
                 herdr_pane_lifecycle,
             )
 
-            self.assertTrue(hasattr(ss, "preflight_launcher_compatibility"))
+            # Redmine #14756 moved the session-level entry point out of
+            # `herdr_session_start` (which had reached 1012 of a 1000-line gate) into
+            # `herdr_launch_preflight.preflight_managed_launch`. That inserted a hop, so the
+            # old `hasattr(ss, "preflight_launcher_compatibility")` proxy now reports a broken
+            # wire where the wire is intact. Following the rename alone would have re-pinned a
+            # name; what this test exists to guard is the CHAIN, so every link is pinned:
+            # session start -> managed-launch entry -> composite -> cwd-sensitive probe.
+            from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+                herdr_launch_preflight,
+            )
+
+            # `prepare_session` takes the store lock and delegates; the wiring lives in the
+            # locked entry, so that is what is pinned. Pinning the public wrapper would pass
+            # on a build where the locked body had dropped the call entirely.
+            self.assertIn(
+                "preflight_managed_launch",
+                inspect.getsource(ss._prepare_session_locked),
+            )
+            entry = inspect.getsource(herdr_launch_preflight.preflight_managed_launch)
+            self.assertIn("preflight_launcher_compatibility", entry)
+            self.assertIn("repo_root=repo_root", entry)
             composite = inspect.getsource(
                 herdr_pane_lifecycle.preflight_launcher_compatibility
             )

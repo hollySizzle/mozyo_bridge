@@ -32,6 +32,10 @@ import sys
 import tempfile
 import threading
 import unittest
+
+from tests.support.lifecycle_backup_assert import (  # noqa: E402
+    assert_backup_preserves,
+)
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
@@ -144,6 +148,8 @@ def _seed_v5(home: Path, *, disposition: str = DISPOSITION_ACTIVE) -> Path:
         conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN hibernated_at")
         # v9 (#14477 j#94582) added release_observation; a faithful pre-v9 rewind drops it.
         conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN release_observation")
+        # v10 (#14756) added lane_epoch; a faithful pre-v10 rewind drops it too.
+        conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
         conn.execute(
             "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
             (LANE_LIFECYCLE_COMPONENT,),
@@ -371,7 +377,7 @@ class WriteMigratingGateTest(unittest.TestCase):
         self.assertIn("reconcile_phase", _columns(self.home))
         backups = sorted((self.home / "backups").glob("state-*"))
         self.assertEqual(len(backups), 1)
-        self.assertEqual((backups[0] / "state.sqlite").read_bytes(), before)
+        assert_backup_preserves(self, backups[0] / "state.sqlite", before)
 
     def test_migration_then_reensure_is_intact_and_idempotent(self) -> None:
         # Required regression 5: restart idempotency — re-running ensure after a migration is
@@ -980,6 +986,8 @@ class UniversalWriteGateTest(unittest.TestCase):
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN hibernated_at")
             # v9 (#14477 j#94582) added release_observation; a faithful pre-v9 rewind drops it.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN release_observation")
+            # v10 (#14756) added lane_epoch; a faithful pre-v10 rewind drops it too.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -1170,6 +1178,8 @@ class RealCommandMigrationAdvisoryTest(unittest.TestCase):
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN hibernated_at")
             # v9 (#14477 j#94582) added release_observation; a faithful pre-v9 rewind drops it.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN release_observation")
+            # v10 (#14756) added lane_epoch; a faithful pre-v10 rewind drops it too.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -1260,6 +1270,8 @@ class PreMigrationAdvisoryTimingTest(unittest.TestCase):
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN hibernated_at")
             # v9 (#14477 j#94582) added release_observation; a faithful pre-v9 rewind drops it.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN release_observation")
+            # v10 (#14756) added lane_epoch; a faithful pre-v10 rewind drops it too.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -1342,6 +1354,8 @@ class ComposingStoreMigrationSurfaceTest(unittest.TestCase):
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN hibernated_at")
             # v9 (#14477 j#94582) added release_observation; a faithful pre-v9 rewind drops it.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN release_observation")
+            # v10 (#14756) added lane_epoch; a faithful pre-v10 rewind drops it too.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),

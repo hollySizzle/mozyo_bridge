@@ -93,6 +93,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     WorkerRefreshObservation,
     WorkerTurnObservation,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_epoch import (  # noqa: E501
+    replacement_store_admission as _replacement_store_admission,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (  # noqa: E501
     RUNTIME_AWAITING_INPUT,
     RUNTIME_TURN_ENDED,
@@ -235,6 +238,21 @@ class LiveWorkerRefreshOps:
 
     def worker_name_free_of_live_process(self, request: WorkerRefreshRequest) -> bool:
         return self._delegate().lane_free_of_live_process(port_pin_request(request))
+
+    def replacement_store_admission(self, key, pin) -> Optional[str]:
+        """The pre-close epoch/store verdict, against THIS ops object's homes (#14756).
+
+        Both homes are passed explicitly. A worker refresh is exactly the case where they can
+        differ from the ambient ones — the live ops carries isolated homes under test — and a
+        fence that read the real shared home there would be measuring the wrong store while
+        appearing to work.
+        """
+        return _replacement_store_admission(
+            key.workspace_id,
+            pin.lane_id,
+            lifecycle_home=str(self.lifecycle_home) if self.lifecycle_home else "",
+            attestation_home=str(self.attestation_home) if self.attestation_home else "",
+        )
 
     # -- live target observation ----------------------------------------------
 

@@ -812,6 +812,47 @@ def _seed_v1_attestation_store(home: Path) -> Path:
     return path
 
 
+def _pre_v10_hibernate_seam():
+    """Compatibility fixture: rewind ``lane_epoch`` to 0 after each real v10 hibernate CAS.
+
+    Redmine #14756 Design Answer j#96844 rule 3, with the description corrected per the
+    j#96848 addendum. **What this actually does matters, and an earlier version of this
+    docstring overstated it.** It does NOT simulate a pre-v10 runtime performing the
+    transition: the REAL current-build ``transition_disposition`` runs, mints
+    ``lane_epoch = 1``, and this wrapper then rewinds the column to 0 in a separate
+    fixture-owned transaction. That is a compatibility rewind, not a causal reproduction, and
+    it must not be counted as proof that a pre-v10 production path behaves this way.
+
+    What it legitimately buys: this module's subject is the pre-v10 mixed-runtime v1
+    side-binding heal, and that subject requires a lane at ``lane_epoch == 0``. Left unseamed
+    the fixture becomes a *current-build* lane at ``epoch=1``, which on a v1 store is the
+    combination the ruling says must NOT be admitted as the v1 subject — it is refused
+    ``attestation_store_epoch_unsupported``, correct behaviour but a different scenario. The
+    rewind happens after the CAS rather than before the run because the transition occurs
+    *inside* the heal, leaving no external moment between the mint and the launch.
+    """
+    real = LaneLifecycleStore.transition_disposition
+
+    def _legacy_transition(self, key, **kwargs):
+        outcome = real(self, key, **kwargs)
+        if outcome.applied:
+            conn = sqlite3.connect(self.path)
+            try:
+                conn.execute(
+                    "UPDATE lane_lifecycle_records SET lane_epoch = 0 "
+                    "WHERE repo_workspace_id = ? AND lane_id = ?",
+                    (key.repo_workspace_id, key.lane_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        return outcome
+
+    return mock.patch.object(
+        LaneLifecycleStore, "transition_disposition", _legacy_transition
+    )
+
+
 def _fake_binary(tmp: str) -> Path:
     binpath = Path(tmp) / "fake-herdr"
     binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -2302,6 +2343,14 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
         self.assertEqual(record.revision, 4)
 
     def test_public_execute_replay_resumes_outer_transaction_through_real_observe(self):
+        # Redmine #14756 j#96844 rule 3 / j#96848: hold the lane at legacy `lane_epoch=0`
+        # so the v1 side-binding subject is reachable. This is a compatibility REWIND after
+        # the real CAS, not a pre-v10 causal reproduction (see the helper's docstring).
+        # Installed for the whole test: the transition happens in an earlier stage than the
+        # setup call below.
+        _patcher = _pre_v10_hibernate_seam()
+        _patcher.start()
+        self.addCleanup(_patcher.stop)
         # Redmine #13933 R13 (review j#82094): the faithful public-rail acceptance of the whole
         # "a14 partial -> public rollback -> public-execute replay" recovery chain, driven end to
         # end by the REAL production observe/drive (never a scripted PreparationObservation).

@@ -22,6 +22,10 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+
+from tests.support.lifecycle_backup_assert import (  # noqa: E402
+    assert_backup_preserves,
+)
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -592,7 +596,9 @@ class SchemaV5MigrationTest(unittest.TestCase):
         self.assertEqual(self._recorded(), LANE_LIFECYCLE_SCHEMA_VERSION)
         # v5 added the binding/generation columns; v6 (Redmine #13842) added reconcile_phase;
         # v7 added lane_kind; v8 added hibernated_at; v9 added release_observation (#14477).
-        self.assertEqual(LANE_LIFECYCLE_SCHEMA_VERSION, 9)
+        # Not re-pinned to a literal: #13810's contract is that ITS columns survive, not
+        # that no later issue may add one (#14756 took the component to v10).
+        self.assertGreaterEqual(LANE_LIFECYCLE_SCHEMA_VERSION, 5)
         for col in ("binding_kind", "project_scope", "lane_generation", "declared_slots",
                     "reconcile_phase", "lane_kind", "hibernated_at",
                     "release_observation"):
@@ -615,7 +621,8 @@ class SchemaV5MigrationTest(unittest.TestCase):
             # lane_kind so the rewound shape is a genuine pre-#13810 v4 signature.
             for col in ("binding_kind", "project_scope", "lane_generation", "declared_slots",
                         "reconcile_phase", "lane_kind", "hibernated_at",
-                    "release_observation"):
+                        "release_observation",
+                        "lane_epoch"):  # v10 (#14756)
                 conn.execute(f"ALTER TABLE lane_lifecycle_records DROP COLUMN {col}")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 4 WHERE component = ?",
@@ -635,7 +642,7 @@ class SchemaV5MigrationTest(unittest.TestCase):
         # the pre-migration snapshot was preserved before the first write
         backups = sorted((self.home / "backups").glob("state-*"))
         self.assertEqual(len(backups), 1)
-        self.assertEqual((backups[0] / "state.sqlite").read_bytes(), before)
+        assert_backup_preserves(self, backups[0] / "state.sqlite", before)
         # the existing issue row lands on the additive defaults (never guessed)
         rec = LaneLifecycleStore(home=self.home).get(self.key)
         self.assertEqual(rec.binding_kind, BINDING_KIND_ISSUE)
@@ -668,6 +675,8 @@ class SchemaV5MigrationTest(unittest.TestCase):
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN hibernated_at")
             # v9 (#14477 j#94582) added release_observation; a faithful pre-v9 rewind drops it.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN release_observation")
+            # v10 (#14756) added lane_epoch; a faithful pre-v10 rewind drops it too.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -694,11 +703,13 @@ class SchemaV5MigrationTest(unittest.TestCase):
         LaneLifecycleStore(home=self.home).ensure_schema()
 
         self.assertEqual(self._recorded(), LANE_LIFECYCLE_SCHEMA_VERSION)
-        self.assertEqual(LANE_LIFECYCLE_SCHEMA_VERSION, 9)
+        # Not re-pinned to a literal: #13810's contract is that ITS columns survive, not
+        # that no later issue may add one (#14756 took the component to v10).
+        self.assertGreaterEqual(LANE_LIFECYCLE_SCHEMA_VERSION, 5)
         # the pre-migration snapshot was preserved before the first write (backup-first)
         backups = sorted((self.home / "backups").glob("state-*"))
         self.assertEqual(len(backups), 1)
-        self.assertEqual((backups[0] / "state.sqlite").read_bytes(), before)
+        assert_backup_preserves(self, backups[0] / "state.sqlite", before)
         # the v6 column was added additively on the existing row with the neutral default
         self.assertIn("reconcile_phase", self._columns())
         rec = LaneLifecycleStore(home=self.home).get(self.key)

@@ -32,6 +32,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (  # noqa: E501
     build_agent_start_argv,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_epoch import (  # noqa: E501
+    resolve_launch_lane_epoch,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
     _invoke,
 )
@@ -151,6 +154,12 @@ def _execute_slot(
         launch_argv_extra=launch_argv_extra,
         replacement_action_id=replacement_action_id,
         action_id=action_id,
+        # Redmine #14756: read (never mint) the lane's current epoch and hand it to the
+        # wrapper + the injected env, so this process generation can later PROVE it is
+        # post-hibernate without consulting a clock or a reusable pane-id.
+        lane_epoch=resolve_launch_lane_epoch(
+            workspace_id, lane, store_home=store_home
+        ),
     )
     started = _invoke(
         binary,

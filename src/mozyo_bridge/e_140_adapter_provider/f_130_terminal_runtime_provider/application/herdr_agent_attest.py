@@ -42,6 +42,7 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     classify_identity_env,
     record_identity_attestation,
 )
+from mozyo_bridge.core.state.lane_epoch import MOZYO_LANE_EPOCH_ENV
 from mozyo_bridge.core.state.startup_execution_events import (
     STAGE_ATTESTATION_WRITE_FAILED,
     STAGE_ATTESTATION_WRITE_SUCCEEDED,
@@ -98,6 +99,13 @@ ATTESTATION_REASON_LOCATOR_UNAVAILABLE = "locator_unavailable"
 #: The attestation store write itself failed (the best-effort writer returned no
 #: persisted record). Value-free: names the step, never the store error text.
 ATTESTATION_REASON_STORE_WRITE_FAILED = "store_write_failed"
+
+#: The launch declared a lane epoch but the value that actually landed in this process's own
+#: env differs from it, or is absent (Redmine #14756). Value-free: names the DISAGREEMENT,
+#: never either epoch. The observed token is still what gets recorded — the read side is the
+#: authority on what a token means, and a record that quietly substituted the launcher's
+#: expectation for what the process really saw would attest the launcher, not the process.
+ATTESTATION_REASON_LANE_EPOCH_NOT_INJECTED = "lane_epoch_not_injected"
 
 #: The injected ``MOZYO_PROVIDER_ARGV0`` alias did not re-verify as a trusted alias of the
 #: exec target at this boundary (#14017's fail-closed check), so the exec was refused.
@@ -271,6 +279,7 @@ def perform_self_attestation(
     role: str,
     lane: str,
     env: Mapping[str, str],
+    lane_epoch: str = "",
     replacement_action_id: str = "",
     home=None,
     now: Optional[str] = None,
@@ -326,6 +335,64 @@ def perform_self_attestation(
         # projection carries the typed outcome instead of the store carrying an invalid row.
         emit(STAGE_ATTESTATION_WRITE_FAILED, ATTESTATION_REASON_LOCATOR_UNAVAILABLE)
         return None
+    # Redmine #14756: the epoch is read from THIS process's own env — the same and only
+    # place the identity triplet is truthfully readable, and for the same reason (herdr
+    # exposes no surface returning a launched process's env, and a live process's env is
+    # immutable to every other process). The OBSERVED token is what gets recorded, never the
+    # launcher-expected one: substituting the expectation would attest what the launcher
+    # intended rather than what the process received, which is exactly the gap this wrapper
+    # exists to close. It is recorded RAW — not trimmed, not re-rendered — because the resume
+    # proof classifies it byte-exactly and a normalised token would launder a value the
+    # lifecycle authority never minted into the authority position.
+    observed_epoch = env.get(MOZYO_LANE_EPOCH_ENV, "")
+    # RAW byte equality, not `_norm` (Redmine #14756 review j#96971 R11-F7). `_norm` strips,
+    # so an expectation of `" 1"` compared EQUAL to an observed `"1"` and the padded token was
+    # promoted to authority — while this contract says the epoch is recorded raw and
+    # never-trimmed. A comparison that normalises manufactures the agreement the record then
+    # claims to have observed. Each side is also validated canonically on its own, so a token
+    # no producer could have written is refused even when both sides carry it identically.
+    from mozyo_bridge.core.state.lane_epoch import EPOCH_OK, parse_attested_epoch
+
+    _declared, declared_reason = parse_attested_epoch(lane_epoch)
+    _seen, seen_reason = parse_attested_epoch(observed_epoch)
+    # BOTH absent is agreement, not a failure (Redmine #14756 review j#96988 R12-F11). A true
+    # legacy `lane_epoch=0` lane launches with no epoch declared and none injected, which
+    # conditional C (j#96844 rule 1) keeps as a supported path — so the previous form, which
+    # only asked whether each side parsed as a canonical epoch, filed a
+    # `lane_epoch_not_injected` failure against every legitimate legacy boot. That is a false
+    # entry in the diagnostic projection, and this fence was added to make disagreement
+    # visible, not to invent it. (Introduced by the F7 fix in the round before; the fence
+    # became stricter than the contract it enforces.)
+    both_absent = not lane_epoch and not observed_epoch
+    if not both_absent and (
+        observed_epoch != lane_epoch
+        or declared_reason != EPOCH_OK
+        or seen_reason != EPOCH_OK
+    ):
+        # The launcher's declaration and the process's environment disagree. Surfaced on the
+        # action's event projection AND withheld from the record, because an event is not
+        # admission-visible: the resume proof reads the identity record, so a disagreement
+        # that lives only in the event stream is a disagreement the gate never sees
+        # (Redmine #14756 review j#96949 F1).
+        #
+        # Note the condition covers BOTH directions. The earlier form only checked a declared
+        # epoch that failed to land; it skipped the case where the launcher declared NOTHING
+        # and the process reported an epoch anyway — an unexplained token (a stale value
+        # inherited through the environment, say) which was then stored as a clean
+        # attestation and could satisfy admission on its own.
+        #
+        # The epoch is recorded EMPTY rather than corrected. That is not the substitution the
+        # contract below forbids: writing the launcher's expectation would attest what was
+        # intended instead of what happened, whereas writing nothing attests exactly what this
+        # launch established about the epoch — which is nothing. `sublane resume` then fails
+        # closed on `lane_epoch_attestation_absent`, naming the real state, and the event
+        # carries why. Every other axis of the record is unaffected and the boot is never
+        # blocked.
+        emit(
+            STAGE_ATTESTATION_WRITE_FAILED,
+            ATTESTATION_REASON_LANE_EPOCH_NOT_INJECTED,
+        )
+        observed_epoch = ""
     record = IdentityAttestationRecord(
         assigned_name=assigned_name,
         workspace_id=_norm(workspace_id),
@@ -336,6 +403,7 @@ def perform_self_attestation(
         detail=detail,
         observed_at=now,
         replacement_action_id=_norm(replacement_action_id),
+        lane_epoch=observed_epoch,
     )
     persisted = record_identity_attestation(record, home=home)
     if persisted is None:
@@ -448,6 +516,9 @@ def cmd_herdr_agent_attest(args: argparse.Namespace) -> int:
         role=_norm(getattr(args, "role", "")),
         lane=_norm(getattr(args, "lane", "")),
         env=env,
+        # Redmine #14756: the launcher-EXPECTED epoch (absent on a lane with no minted epoch
+        # and on every pre-#14756 launcher, which is the byte-invariant path).
+        lane_epoch=_norm(getattr(args, "lane_epoch", "")),
         replacement_action_id=_norm(getattr(args, "replacement_action_id", "")),
         append_event=append_event,
     )
@@ -505,6 +576,7 @@ def cmd_herdr_agent_attest(args: argparse.Namespace) -> int:
 
 
 __all__ = (
+    "ATTESTATION_REASON_LANE_EPOCH_NOT_INJECTED",
     "ATTESTATION_REASON_LOCATOR_UNAVAILABLE",
     "ATTESTATION_REASON_STORE_WRITE_FAILED",
     "EXEC_REASON_ARGV0_ALIAS_UNBOUND",

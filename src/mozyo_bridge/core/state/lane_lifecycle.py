@@ -74,6 +74,7 @@ import sys
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
+from mozyo_bridge.core.state.lane_epoch import lane_epoch_on_transition
 from mozyo_bridge.core.state.lane_hibernation_anchor import hibernation_anchor_on_transition
 from mozyo_bridge.core.state.lane_lifecycle_model import (
     BINDING_KIND_ISSUE,
@@ -517,20 +518,41 @@ class LaneLifecycleStore:
             replacement_pins = "" if rehydrating else current.replacement_pins
             # v8 (#14477): resume's freshness boundary moves ONLY here (lane_hibernation_anchor).
             anchor = hibernation_anchor_on_transition(current.hibernated_at, target=target, stamp=stamp)
+            # v10 (#14756): minted ONLY here and only INTO ``hibernated``, never cleared on
+            # the way back. ``None`` = the stored counter is not a value this writer can have
+            # produced, so the WHOLE transition refuses with zero write rather than advance
+            # from it (:func:`lane_epoch_on_transition`).
+            epoch = lane_epoch_on_transition(
+                current.lane_epoch, target=target, hibernated=DISPOSITION_HIBERNATED
+            )
+            if epoch is None:
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_FORBIDDEN_TRANSITION,
+                    revision=current.revision,
+                )
             declared_slots = current.declared_slots
             if rehydrating and encoded_rehydrated_slots is not None:
                 declared_slots = encoded_rehydrated_slots
             revision = current.revision + 1
+            changes_before = conn.total_changes
             try:
                 conn.execute(
                     f"UPDATE {_TABLE} SET lane_disposition = ?, process_release = ?, "
                     "release_action_id = ?, release_pins = ?, release_observation = ?, "
                     "replacement_state = ?, "
                     "replacement_action_id = ?, replacement_pins = ?, declared_slots = ?, "
-                    "hibernated_at = ?, revision = ?, "
+                    "hibernated_at = ?, lane_epoch = ?, revision = ?, "
                     "decision_source = ?, decision_issue_id = ?, decision_journal = ?, "
                     "updated_at = ? "
-                    "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ?",
+                    # The epoch is part of the CAS, by exact bytes AND storage class
+                    # (#14756 j#96911 F2). Matching only the revision would let a
+                    # concurrent writer that rewrote the counter — or changed its type
+                    # out from under NONE affinity — be overwritten by an increment
+                    # computed from the value this transaction read earlier.
+                    "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ? "
+                    "AND lane_epoch IS ? AND typeof(lane_epoch) = 'text'",
                     (
                         target,
                         release,
@@ -542,6 +564,7 @@ class LaneLifecycleStore:
                         replacement_pins,
                         declared_slots,
                         anchor,
+                        epoch,
                         revision,
                         decision.source,
                         decision.issue_id,
@@ -550,8 +573,17 @@ class LaneLifecycleStore:
                         key.repo_workspace_id,
                         key.lane_id,
                         current.revision,
+                        current.lane_epoch,
                     ),
                 )
+                if conn.total_changes == changes_before:
+                    # A concurrent writer changed the epoch bytes or their storage class
+                    # between the guarded read and this write (the CAS matches both). Zero
+                    # write, never a retry: an increment must not come from a vanished value.
+                    conn.execute("ROLLBACK")
+                    return CasOutcome(
+                        applied=False, reason=CAS_STALE_REVISION, revision=current.revision
+                    )
             except sqlite3.IntegrityError:
                 conn.execute("ROLLBACK")
                 return CasOutcome(

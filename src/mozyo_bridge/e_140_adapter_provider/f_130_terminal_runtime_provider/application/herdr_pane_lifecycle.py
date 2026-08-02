@@ -266,6 +266,7 @@ def preflight_attest_store_schema(
     *,
     store_home: Path,
     replacement_launch: bool = False,
+    epoch_launch: bool = False,
 ) -> None:
     """Fail closed unless the SELECTED home store's real shape can be attested into.
 
@@ -289,12 +290,20 @@ def preflight_attest_store_schema(
     fabricated. A **replacement** launch is refused there, because that field cannot
     survive the v1 shape. The error is raised, never persisted, so no personal path is
     written to a durable store.
+
+    ``epoch_launch`` (Redmine #14756) is the second instance of that same "field that cannot
+    be dropped" rule, and it MUST be decided here rather than in the child: the child's
+    attestation write is best-effort and swallows its own refusal so a boot is never blocked,
+    so a store-side epoch check that is not in this preflight does not exist in any form the
+    operator can observe. Without it the pair boots live, correctly launched, and permanently
+    unresumable.
     """
     verdict = decide_store_compatibility(
         observation,
         probe_store_schema(herdr_identity_attestation_path(Path(store_home))),
         required_schema_version=HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
         replacement_launch=replacement_launch,
+        epoch_launch=epoch_launch,
     )
     if not verdict.ok:
         raise HerdrLauncherIncompatibleError(
@@ -665,6 +674,7 @@ def preflight_launcher_compatibility(
     repo_root=None,
     store_home: Path,
     replacement_launch: bool = False,
+    epoch_launch: bool = False,
     config_parse: Optional[ConfigParseObservation] = None,
 ) -> LauncherCapabilityObservation:
     """The WHOLE managed-launch compatibility conjunction, in one place (Redmine #14258).
@@ -714,7 +724,10 @@ def preflight_launcher_compatibility(
             launcher, runner, timeout, env, repo_root=Path(neutral)
         )
     preflight_attest_store_schema(
-        observation, store_home=Path(store_home), replacement_launch=replacement_launch
+        observation,
+        store_home=Path(store_home),
+        replacement_launch=replacement_launch,
+        epoch_launch=epoch_launch,
     )
     if config_parse is None:
         state, text = read_target_config_text(repo_root)

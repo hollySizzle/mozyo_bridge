@@ -708,6 +708,26 @@ class LaneLifecycleRecord:
     unavailable and the caller fails closed, because ``updated_at`` is not monotonic and
     standing in for the boundary admitted a real survivor (review j#94515 / verdict j#94520).
     Semantics: :mod:`...lane_hibernation_anchor`.
+
+    ``lane_epoch`` (v10, Redmine #14756) is the MONOTONIC hibernate-generation counter the
+    clock-free, locator-free resume proof is bound to. Exactly one event mints it — the
+    disposition CAS INTO ``hibernated`` — minted from the row's own stored value, in Python
+    after a strict decode, and stored as canonical decimal TEXT in a NONE-affinity column
+    evaluated by the database against the row's OWN stored value, so there is no caller
+    parameter to backdate and no second value to reconcile (the defect shape that defeated
+    both the v8 timestamp and the pre-v9 caller-supplied pins). It reaches a process only as
+    an injected environment variable at launch, and a live process's env is immutable to
+    every other process (POSIX), so a pane that SURVIVED hibernate's release necessarily
+    still holds a pre-advance epoch.
+
+    It is **never cleared**, and that asymmetry against ``hibernated_at`` above is deliberate:
+    a boundary in force is meaningless for an awake lane, but resetting a *counter* would
+    re-mint epochs an earlier generation's processes still hold. ``0`` means no epoch has
+    ever been minted (a pre-v10 row, or a lane that never hibernated under this build) and is
+    reported UNAVAILABLE rather than used as a threshold every epoch clears. The stored value
+    is decoded RAW — the classifier requires an exact canonical decimal TEXT and treats anything else as
+    unminted, rather than a decoder coercing a corrupt cell into a plausible threshold.
+    Semantics: :mod:`...lane_epoch`.
     """
 
     repo_workspace_id: str
@@ -735,6 +755,10 @@ class LaneLifecycleRecord:
     lane_kind: str = ""
     hibernated_at: str = ""
     release_observation: str = ""
+    #: Typed ``object``, not ``int``, on purpose: the decoder passes the stored cell through
+    #: untouched so a corrupt / foreign value can never be coerced into a plausible
+    #: threshold, and :mod:`...lane_epoch` is total over whatever arrives.
+    lane_epoch: object = 0
 
     @property
     def key(self) -> LaneLifecycleKey:
@@ -809,6 +833,7 @@ class LaneLifecycleRecord:
             "lane_kind": self.lane_kind,
             "hibernated_at": self.hibernated_at,
             "release_observation": self.release_observation,
+            "lane_epoch": self.lane_epoch,
         }
 
 

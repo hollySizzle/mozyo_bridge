@@ -137,6 +137,9 @@ class ReplacementActuatorUseCase:
             [PreservationObservation], PreservationVerdict
         ] = assess_preservation,
         launch_authority: Optional[Callable[[ParticipantPin], bool]] = None,
+        store_admission: Optional[
+            Callable[[ReplacementTransactionKey, ParticipantPin], Optional[str]]
+        ] = None,
     ) -> None:
         self._store = store
         self._port = port
@@ -156,6 +159,26 @@ class ReplacementActuatorUseCase:
         # relaunch is fenced action-time and not by a stale admission-time snapshot. Returns
         # ``True`` to permit the launch; ``False`` fails closed with zero launch (stay launch_owed).
         self._launch_authority = launch_authority
+        # An OPTIONAL pre-effect admission probe evaluated BEFORE any owed step is dispatched
+        # (Redmine #14756 j#96848). It answers "may this action produce effects at all?" — as
+        # opposed to ``launch_authority``, which answers "is the lane still exact?" immediately
+        # before one launch. The distinction is the whole point of this seam: the attestation
+        # store's shape is knowable before anything is touched, and evaluating it inside the
+        # LAUNCH step meant the refusal arrived only after ``_step_close_owed`` had already
+        # closed the old slot and CAS'd the participant to ``launch_owed`` — irreversible
+        # effects ahead of a typed "we refuse to act" (measured; the contract claimed
+        # zero-close and was not). Returning a reason token refuses with zero close, zero CAS
+        # and zero launch; ``None`` permits. Replays reach it too, because every owed step —
+        # first run or crash replay — dispatches through one place.
+        #
+        # It is called with ``(key, pin)`` because the transaction already pins both halves of
+        # the question — ``key.workspace_id`` and ``pin.lane_id`` — so no construction site has
+        # to re-derive them from whatever it happens to have in scope. That matters: the six
+        # sites are NOT alike (three hold an ops handle and a request, three do not), and a
+        # seam that made each one resolve the lane itself would have been six chances to
+        # resolve it differently. The injected callable therefore supplies only what genuinely
+        # varies per site — which store home is selected.
+        self._store_admission = store_admission
 
     def run(
         self,
@@ -513,11 +536,43 @@ class ReplacementActuatorUseCase:
                 status=ACTUATION_EFFECT_FAILED, phase=rec.phase, revision=rec.revision,
                 stopped_on=pin.identity, detail=f"unactionable owed phase {pin.phase!r}",
             )
+        blocked = self._admission_refusal(key, rec)
+        if blocked is not None:
+            # Redmine #14756 j#96848: BEFORE the close / participant CAS / launch, not between
+            # them. A refusal here leaves the transaction exactly where it was, so the pair's
+            # WIP and the operator's next rail both survive it.
+            identity, refusal = blocked
+            return ActuationResult(
+                status=ACTUATION_PRESERVATION_BLOCKED, phase=rec.phase,
+                revision=rec.revision, stopped_on=identity, detail=refusal,
+            )
         if pin.phase == PARTICIPANT_CLOSE_OWED:
             return self._step_close_owed(key, rec, pin, holder, gen, now)
         if pin.phase == PARTICIPANT_LAUNCH_OWED:
             return self._step_launch_owed(key, rec, pin, holder, gen, now)
         return self._step_verify_owed(key, rec, pin, holder, gen, now)
+
+    def _admission_refusal(self, key, rec) -> Optional[tuple[str, str]]:
+        """``(identity, reason)`` if any UNFINISHED participant is inadmissible, else ``None``.
+
+        Evaluated over every participant that still owes work — not only the one about to be
+        actuated. j#96848 asks for zero close, zero CAS and zero launch for the OUTER action,
+        and a per-participant gate would not give that: it would let the first participant be
+        closed and relaunched before discovering that the second one can never come back,
+        which is the same half-destroyed pair the fence exists to prevent, reached one step
+        later. Already-``replaced`` participants are skipped because they have no remaining
+        effect to withhold; refusing on their behalf would strand a transaction that is past
+        them without protecting anything.
+        """
+        if self._store_admission is None:
+            return None
+        for candidate in rec.participants:
+            if candidate.phase == PARTICIPANT_REPLACED:
+                continue
+            refusal = self._store_admission(key, candidate)
+            if refusal:
+                return (candidate.identity, refusal)
+        return None
 
     def _step_close_owed(self, key, rec, pin, holder, gen, now) -> Optional[ActuationResult]:
         observation = self._port.observe_old_slot(pin)

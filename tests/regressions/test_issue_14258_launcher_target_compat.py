@@ -57,6 +57,13 @@ _SRC = _TESTS_ROOT.parent / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (  # noqa: E402,E501
+    MOZYO_BRIDGE_LAUNCHER_ENV,
+)
+from mozyo_bridge.core.state.herdr_identity_attestation_schema import (  # noqa: E402
+    HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
+    RECOGNIZED_SCHEMA_VERSIONS as RECOGNIZED_STORE_VERSIONS,
+)
 from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
 from mozyo_bridge.core.state.lane_lifecycle_readonly import (
     LIFECYCLE_SCHEMA_ABSENT,
@@ -116,6 +123,56 @@ _TIMEOUT = 10.0
 def _capable_help() -> str:
     """What THIS build's launcher advertises — the canonical contract, never a copy."""
     return f"usage: x [{_MARKER} NAME]\n\n{build_attest_capability_epilog()}\n"
+
+
+def _pre_14258_help() -> str:
+    """A launcher satisfying every PRE-#14258 conjunct and nothing else.
+
+    The attestation schema and writable-store set are DERIVED from this build's constants
+    rather than spelled as literals. The literals used to read ``schema=2`` / ``stores=1_2``,
+    which silently stopped meaning "current" the moment Redmine #14756 took the attestation
+    store to v3: the exact-version launcher check then refused these fixtures first, and every
+    test here started passing (or failing) for a reason that had nothing to do with #14258's
+    subject. A fixture that means "current except for the axis under test" has to say so in
+    terms of the axis, not in terms of whatever the number happened to be.
+    """
+    stores = "_".join(str(v) for v in sorted(RECOGNIZED_STORE_VERSIONS))
+    return (
+        f"usage: x [{_MARKER} NAME]\n"
+        f"mozyo_attest_capability_schema={HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION}\n"
+        f"mozyo_attest_capability_stores={stores}\n"
+    )
+
+
+def _source_build_launcher(directory: Path) -> str:
+    """A real executable advertising THIS build's capability contract (Redmine #14756).
+
+    The tests below drive the real evaluator, which resolves a launcher out of the env and
+    probes it as a subprocess. Passing a bare ``dict(os.environ)`` resolved whatever
+    ``mozyo-bridge`` happened to be **installed on the host**, so these tests silently
+    depended on the installed CLI's advertised schema matching the source tree's required
+    one. That held until #14756 took the attestation store to v3: the installed 0.14.0
+    advertises v2, the exact-version launcher check fired first, and five tests here started
+    failing on a conjunct that is not their subject — masking #14258's actual assertions.
+
+    A fixture launcher rendered from ``build_attest_capability_epilog()`` fixes the class of
+    problem, not the instance: it advertises whatever the source build requires, so no future
+    capability bump can desynchronise it either.
+    """
+    path = directory / "mozyo-bridge"
+    lines = "".join(
+        f"printf '%s\\n' {line!r}\n" for line in _capable_help().splitlines()
+    )
+    path.write_text("#!/bin/sh\n" + lines + "exit 0\n", encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return str(path)
+
+
+def _source_build_env(directory: Path) -> dict:
+    """``os.environ`` with the launcher pinned to :func:`_source_build_launcher`."""
+    env = dict(os.environ)
+    env[MOZYO_BRIDGE_LAUNCHER_ENV] = _source_build_launcher(directory)
+    return env
 
 
 def _observation(help_text: str):
@@ -251,11 +308,7 @@ class ConjunctionZeroActuationTest(unittest.TestCase):
     def test_an_incompatible_launcher_is_refused_with_the_typed_reason(self) -> None:
         # A launcher that satisfies every PRE-#14258 conjunct (subcommand marker, attestation
         # schema, writable stores) and nothing else: before this issue it launched the pair.
-        pre_14258 = (
-            f"usage: x [{_MARKER} NAME]\n"
-            "mozyo_attest_capability_schema=2\n"
-            "mozyo_attest_capability_stores=1_2\n"
-        )
+        pre_14258 = _pre_14258_help()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "repo" / ".mozyo-bridge").mkdir(parents=True)
@@ -448,12 +501,7 @@ class ExplicitLauncherOverrideTest(unittest.TestCase):
                 _V2_CONFIG, encoding="utf-8"
             )
             capable = self._launcher(root / "repo", _capable_help())
-            incapable = self._launcher(
-                root,
-                f"usage: x [{_MARKER} NAME]\n"
-                "mozyo_attest_capability_schema=2\n"
-                "mozyo_attest_capability_stores=1_2\n",
-            )
+            incapable = self._launcher(root, _pre_14258_help())
             for launcher, admitted in ((capable, True), (incapable, False)):
                 with self.subTest(admitted=admitted):
                     env = {MOZYO_BRIDGE_LAUNCHER_ENV: launcher}
@@ -1572,7 +1620,8 @@ class R13PublicReasonTest(unittest.TestCase):
 
         LaneLifecycleStore(home=root / "home").ensure_schema()
         return evaluate_launcher_compatibility(
-            env=dict(os.environ),
+            # #14756: pin the launcher to this build's contract, never the installed CLI.
+            env=_source_build_env(root),
             runner=subprocess.run,
             timeout=60.0,
             repo_root=repo,
@@ -1872,7 +1921,8 @@ class R17AttributeSentinelTest(unittest.TestCase):
 
                 def preflight_launcher_compatibility(self, **kwargs):
                     return evaluate_launcher_compatibility(
-                        env=dict(os.environ), runner=subprocess.run, timeout=60.0,
+                        # #14756: this build's contract, not the installed CLI's.
+                        env=_source_build_env(root), runner=subprocess.run, timeout=60.0,
                         repo_root=repo, store_home=root / "home",
                         replacement_action_id="",
                         committed_blob=git_ops.committed_blob,
@@ -2463,9 +2513,11 @@ class R14DeclaresNothingTest(unittest.TestCase):
                 f"printf '%s\\n' {line!r}\n"
                 for line in (
                     f"usage: x [{_MARKER} NAME]",
-                    "mozyo_attest_capability_schema=2",
-                    "mozyo_attest_capability_stores=1_2",
-                    "mozyo_attest_capability_lifecycle=1_2_3_4_5_6_7_8_9",
+                    f"mozyo_attest_capability_schema="
+                    f"{HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION}",
+                    "mozyo_attest_capability_stores="
+                    + "_".join(str(v) for v in sorted(RECOGNIZED_STORE_VERSIONS)),
+                    "mozyo_attest_capability_lifecycle=1_2_3_4_5_6_7_8_9_10",
                     "mozyo_generation_protocol_capability=1",
                 )
             )

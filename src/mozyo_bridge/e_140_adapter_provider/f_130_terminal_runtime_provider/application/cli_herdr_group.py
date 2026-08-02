@@ -180,6 +180,17 @@ def register_herdr_group(
         ),
     )
     herdr_agent_attest.add_argument(
+        "--lane-epoch",
+        dest="lane_epoch",
+        default="",
+        help=(
+            "Redmine #14756: the lane epoch the lifecycle authority had minted when this "
+            "launch was planned (empty when the lane has none). The launcher-EXPECTED "
+            "value only — what gets recorded is the epoch this process actually observes "
+            "in its own env, so a disagreement is reported rather than papered over."
+        ),
+    )
+    herdr_agent_attest.add_argument(
         "provider_argv",
         nargs=argparse.REMAINDER,
         help="The provider command to exec, after a `--` separator.",

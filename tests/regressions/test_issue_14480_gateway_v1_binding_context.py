@@ -630,6 +630,15 @@ class _Ops:
     def resume_lane_authority(self, request) -> bool:
         return True
 
+    def replacement_store_admission(self, key, pin):
+        """No store constraint in this fixture (Redmine #14756 j#96848).
+
+        ``None`` is the admit verdict, so every assertion in this module measures exactly
+        what it measured before the pre-close fence existed. The fence's own behaviour is
+        measured in ``test_issue_14756_lane_epoch_attestation``.
+        """
+        return None
+
     def gateway_name_free_of_live_process(self, request) -> bool:
         return True
 

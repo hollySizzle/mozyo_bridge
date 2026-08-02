@@ -460,5 +460,3 @@ def migrate_startup_store_v1_to_v2(
         action_count=post[1],
         content_digest=post[2],
     )
-
-

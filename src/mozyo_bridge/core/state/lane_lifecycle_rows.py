@@ -28,6 +28,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Optional, Sequence
 
+from mozyo_bridge.core.state.lane_epoch import LANE_EPOCH_UNMINTED, encode_lane_epoch
 from mozyo_bridge.core.state.lane_lifecycle_model import (
     BINDING_KIND_ISSUE,
     BINDING_KIND_PROJECT_GATEWAY,
@@ -84,6 +85,14 @@ def _record(row: Sequence[object]) -> LaneLifecycleRecord:
         lane_kind=str(row[22] or ""),
         hibernated_at=str(row[23] or ""),
         release_observation=str(row[24] or ""),
+        # RAW-typed, never coerced (Redmine #14756). ``int(row[25] or 0)`` would turn a
+        # corrupt REAL / TEXT cell into a plausible threshold; the epoch classifier
+        # (:mod:`...lane_epoch`) requires an exact ``int`` and treats anything else as
+        # UNMINTED, so the decode hands the stored value through untouched and lets the one
+        # authority decide. The same reasoning as ``binding_kind`` above (review j#94992
+        # R11-F1): a decoder that manufactures a canonical value defeats every byte-exact
+        # classifier downstream.
+        lane_epoch=row[25],
     )
 
 
@@ -158,6 +167,14 @@ def _insert_active_row(
             # v9 (#14477 j#94582): no release generation has been opened, so there is no
             # observation. ABSENT (not complete-empty) — only opening a generation records one.
             "",
+            # v10 (#14756): a brand-new lane has never hibernated, so no epoch has been
+            # minted. ``0`` is UNMINTED — deliberately not ``1``, which would be an epoch no
+            # launch was ever handed and would let the lane's first resume compare against a
+            # threshold nothing could have attested. Only the CAS into ``hibernated`` mints.
+            # Bound as canonical TEXT, not as the int: the column is NONE affinity, so an
+            # int bind would store storage class INTEGER and every later read would
+            # classify the row malformed (#14756 j#96911 F2).
+            encode_lane_epoch(LANE_EPOCH_UNMINTED),
         ),
     )
 

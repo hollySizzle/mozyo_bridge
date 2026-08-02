@@ -124,12 +124,17 @@ class AttestationStoreMaintenanceResult:
 
 #: Consumer measurement outcomes. Tri-state on purpose: "proven none" and "cannot tell"
 #: are different facts, and collapsing them is how a destructive path fails open.
-_CONSUMERS_NONE = "no_consumers"
-_CONSUMERS_PRESENT = "consumers"
-_CONSUMERS_UNMEASURABLE = "unmeasurable"
+#:
+#: Public since Redmine #14756 j#96866, which gave the measurement a second caller: the
+#: legacy lane-epoch recovery planner has to answer the SAME question this module's gate
+#: answers, one step earlier. Reusing the measurement is the point — a planner with its own
+#: definition of "consumer" would eventually disagree with the gate it exists to predict.
+CONSUMERS_NONE = "no_consumers"
+CONSUMERS_PRESENT = "consumers"
+CONSUMERS_UNMEASURABLE = "unmeasurable"
 
 
-def _measure_consumers(view, home: Path) -> tuple:
+def measure_store_consumers(view, home: Path) -> tuple:
     """Measure this store's live consumers -> ``(state, names)``. Never guesses.
 
     Scoped by evidence. herdr exposes no surface returning a launched process's
@@ -149,32 +154,32 @@ def _measure_consumers(view, home: Path) -> tuple:
     proof of no consumers whatever the store's state — nothing can be consuming a store
     when nothing is running — so it is checked *before* the store is read. Only when
     agents ARE live does the store's readability matter: if its rows cannot be enumerated,
-    the intersection is unknown, and the honest answer is :data:`_CONSUMERS_UNMEASURABLE`,
+    the intersection is unknown, and the honest answer is :data:`CONSUMERS_UNMEASURABLE`,
     never "none". Previously this folded to an empty set and admitted a destructive
     ``rebuild`` against an unreadable store while agents were live — fail-open on the one
     path whose entire target set is unreadable stores.
     """
     if not view.backend_selected:
         # No herdr backend: no managed consumers of this store by construction.
-        return _CONSUMERS_NONE, ()
+        return CONSUMERS_NONE, ()
     if not view.ok:
-        return _CONSUMERS_UNMEASURABLE, ()
+        return CONSUMERS_UNMEASURABLE, ()
     live = {agent.name for agent in view.managed_agents}
     if not live:
-        return _CONSUMERS_NONE, ()
+        return CONSUMERS_NONE, ()
     attested = HerdrIdentityAttestationStore(home=home).assigned_names()
     if attested is None:
-        return _CONSUMERS_UNMEASURABLE, tuple(sorted(live))
+        return CONSUMERS_UNMEASURABLE, tuple(sorted(live))
     matched = tuple(sorted(live & attested))
-    return (_CONSUMERS_PRESENT, matched) if matched else (_CONSUMERS_NONE, ())
+    return (CONSUMERS_PRESENT, matched) if matched else (CONSUMERS_NONE, ())
 
 
 def _consumer_gate(view, intent: str, home: Path) -> Optional[AttestationStoreMaintenanceResult]:
     """Refuse a mutation while consumers are live / unmeasurable, else ``None``."""
-    state, names = _measure_consumers(view, home)
-    if state == _CONSUMERS_NONE:
+    state, names = measure_store_consumers(view, home)
+    if state == CONSUMERS_NONE:
         return None
-    if state == _CONSUMERS_PRESENT:
+    if state == CONSUMERS_PRESENT:
         return AttestationStoreMaintenanceResult(
             intent=intent,
             state=BLOCKED_CONSUMERS_LIVE,
@@ -576,6 +581,10 @@ __all__ = (
     "APPLIED",
     "BLOCKED_CONSUMERS_LIVE",
     "BLOCKED_CONSUMERS_UNMEASURABLE",
+    "CONSUMERS_NONE",
+    "CONSUMERS_PRESENT",
+    "CONSUMERS_UNMEASURABLE",
+    "measure_store_consumers",
     "BLOCKED_FAILED",
     "BLOCKED_INVENTORY_UNREADABLE",
     "BLOCKED_MIGRATE_INSTEAD",

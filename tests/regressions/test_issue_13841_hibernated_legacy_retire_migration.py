@@ -525,6 +525,8 @@ class RetireMigrationCommandTests(unittest.TestCase):
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN hibernated_at")
             # v9 (#14477 j#94582) added release_observation; a faithful pre-v9 rewind drops it.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN release_observation")
+            # v10 (#14756) added lane_epoch; a faithful pre-v10 rewind drops it too.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -544,6 +546,8 @@ class RetireMigrationCommandTests(unittest.TestCase):
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN hibernated_at")
             # v9 (#14477 j#94582) added release_observation; a faithful pre-v9 rewind drops it.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN release_observation")
+            # v10 (#14756) added lane_epoch; a faithful pre-v10 rewind drops it too.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),

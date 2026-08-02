@@ -108,6 +108,8 @@ from mozyo_bridge.core.state.lane_lifecycle_schema import (  # noqa: E402
     LANE_LIFECYCLE_COMPONENT,
     LANE_LIFECYCLE_SCHEMA_VERSION,
 )
+from mozyo_bridge.core.state.lane_lifecycle_shapes import _COLUMN_DEFS  # noqa: E402
+from mozyo_bridge.core.state.lane_epoch import EPOCH_NOT_NEWER  # noqa: E402
 from mozyo_bridge.core.state.lane_pin_repair import LanePinRepairStore  # noqa: E402
 from mozyo_bridge.core.state.lane_pin_role import read_declared_pin_pair  # noqa: E402
 from mozyo_bridge.core.state.lane_release import (  # noqa: E402
@@ -203,7 +205,26 @@ def _live_pins() -> tuple[ProcessGenerationPin, ...]:
     )
 
 
-def _attest(provider: str, locator: str, observed_at: str) -> IdentityAttestationRecord:
+#: The epoch a lane that has hibernated once has minted (#14756). These fixtures drive
+#: exactly one hibernate transition before resuming.
+_CURRENT_EPOCH = "1"
+#: ...and after a SECOND hibernate, which several fixtures below drive.
+_SECOND_EPOCH = "2"
+
+
+def _attest(
+    provider: str, locator: str, observed_at: str, lane_epoch: str = _CURRENT_EPOCH
+) -> IdentityAttestationRecord:
+    """A startup self-attestation for this fixture's lane.
+
+    ``lane_epoch`` defaults to the epoch a lane hibernated ONCE has minted (Redmine #14756),
+    because that is what a genuine relaunch of these fixtures' pairs would have received. It
+    is a parameter rather than a constant so a test can attest a PRE-hibernate epoch, which
+    is what a survivor carries. Supplying it does not weaken anything these tests pin: the
+    epoch is an additional conjunct, so every refusal asserted below is still asserted for
+    the reason it was originally written for — this only stops those tests refusing for a
+    second, unrelated reason and thereby passing vacuously.
+    """
     return IdentityAttestationRecord(
         assigned_name=encode_assigned_name(_WS, provider, _LANE),
         workspace_id=_WS,
@@ -212,6 +233,7 @@ def _attest(provider: str, locator: str, observed_at: str) -> IdentityAttestatio
         locator=locator,
         verdict=VERDICT_PRESENT,
         observed_at=observed_at,
+        lane_epoch=lane_epoch,
     )
 
 
@@ -225,14 +247,15 @@ class _FakeOps:
         providers=(_GW_PROVIDER, _WK_PROVIDER),
         gw_locator: str = _GW_LOC,
         wk_locator: str = _WK_LOC,
+        lane_epoch: str = _CURRENT_EPOCH,
     ):
         self._rows = [
             {"name": _gw_name(), "pane_id": gw_locator},
             {"name": _wk_name(), "pane_id": wk_locator},
         ]
         self._attest = {
-            _gw_name(): _attest(_GW_PROVIDER, gw_locator, observed_at),
-            _wk_name(): _attest(_WK_PROVIDER, wk_locator, observed_at),
+            _gw_name(): _attest(_GW_PROVIDER, gw_locator, observed_at, lane_epoch),
+            _wk_name(): _attest(_WK_PROVIDER, wk_locator, observed_at, lane_epoch),
         }
         self._providers = providers
 
@@ -492,6 +515,8 @@ class PreV8CompatibilityTest(_Fixture):
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN hibernated_at")
             # v9 (#14477 j#94582) added release_observation; a faithful pre-v9 rewind drops it.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN release_observation")
+            # v10 (#14756) added lane_epoch; a faithful pre-v10 rewind drops it too.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 7 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -688,7 +713,14 @@ class ReleasedLocatorFenceTest(_Fixture):
         self._hibernate_again(released=(_GW_LOC, _WK_LOC), now=T_RESUME)
         fresh_gw, fresh_wk = f"{_WS}:p9A", f"{_WS}:p9B"
         outcome = self._resume(
-            ops=_FakeOps(observed_at=T_LATER, gw_locator=fresh_gw, wk_locator=fresh_wk)
+            # Second hibernate -> the counter is at 2, so a genuine relaunch is handed 2
+            # (#14756). Spelling the generation out is the point of the fixture, not noise.
+            ops=_FakeOps(
+                observed_at=T_LATER,
+                gw_locator=fresh_gw,
+                wk_locator=fresh_wk,
+                lane_epoch=_SECOND_EPOCH,
+            )
         )
         self.assertFalse(
             outcome.is_blocked,
@@ -855,11 +887,29 @@ class ReleaseObservationBindingTest(_Fixture):
                 now=T_BACKDATED,
             ).applied
         )
+        # INVERTED by Redmine #14756, not deleted. This assertion previously read
+        # ``assertFalse(outcome.is_blocked)`` and documented the residual in its own message:
+        # "a fabricated observation is still trusted; Redmine #14756 replaces this
+        # trust-boundary authority with an epoch bound into the attestation". That is exactly
+        # what happened, so the pin now records the CLOSED state and keeps the history
+        # visible — a deleted pin would leave no trace that the hole ever existed or when it
+        # stopped existing.
+        #
+        # Why the epoch closes it: a fabricated observation is a lie about which locators the
+        # release closed, and every locator-based fence is downstream of that lie. The epoch
+        # is not — it is minted by the store from its own row and delivered to the process
+        # through an environment a writer inside this boundary cannot forge into a LIVE
+        # process. The survivor here holds the pre-hibernate epoch, so it is refused whatever
+        # the observation claims.
         outcome = self._resume(ops=_FakeOps(observed_at=T_SURVIVOR))
-        self.assertFalse(
+        self.assertTrue(
             outcome.is_blocked,
-            "a fabricated observation is still trusted; Redmine #14756 replaces this "
-            "trust-boundary authority with an epoch bound into the attestation",
+            "a fabricated observation must no longer admit a survivor: Redmine #14756 "
+            "replaced this trust-boundary authority with an epoch bound into the attestation",
+        )
+        self.assertIn(BLOCK_PAIR_ATTESTATION, outcome.preflight.blocked_reasons)
+        self.assertIn(
+            EPOCH_NOT_NEWER, outcome.preflight.pair_attestation_detail
         )
 
 
@@ -1504,7 +1554,12 @@ class DriverDerivedObservationE2ETest(_Fixture):
         self._hibernate_then_drive((_GW_LOC, _WK_LOC), now=T_RESUME)
         outcome = self._resume(
             ops=_FakeOps(
-                observed_at=T_LATER, gw_locator=f"{_WS}:p9A", wk_locator=f"{_WS}:p9B"
+                observed_at=T_LATER,
+                gw_locator=f"{_WS}:p9A",
+                wk_locator=f"{_WS}:p9B",
+                # Second hibernate -> the counter is at 2, which is what a genuine relaunch
+                # is handed (#14756).
+                lane_epoch=_SECOND_EPOCH,
             )
         )
         self.assertFalse(
@@ -2444,6 +2499,7 @@ class StoredBindingKindIsNeverNormalisedTest(_Fixture):
             # A genuine v4 shape lacks every column added after it, not only the v5 tranche —
             # the schema gate matches the FULL signature and refuses a partial rewind.
             for column in (
+                "lane_epoch",  # v10
                 "release_observation",  # v9
                 "hibernated_at",  # v8
                 "lane_kind",  # v7
@@ -2504,8 +2560,14 @@ class StoredBindingKindIsNeverNormalisedTest(_Fixture):
 
 
 class SchemaVersionTest(unittest.TestCase):
-    def test_the_anchor_landed_as_schema_v8(self) -> None:
-        self.assertEqual(LANE_LIFECYCLE_SCHEMA_VERSION, 9)
+    def test_the_anchor_and_observation_are_still_present_after_later_bumps(self) -> None:
+        # Redmine #14756 moved the component to v10. This assertion is deliberately NOT
+        # re-pinned to a literal: what #14477 needs to stay true is that its two columns
+        # survive, not that no later issue may add one. Pinning the number made a later
+        # additive bump look like a #14477 regression.
+        self.assertGreaterEqual(LANE_LIFECYCLE_SCHEMA_VERSION, 9)
+        self.assertIn("hibernated_at", _COLUMN_DEFS)
+        self.assertIn("release_observation", _COLUMN_DEFS)
 
 
 if __name__ == "__main__":  # pragma: no cover

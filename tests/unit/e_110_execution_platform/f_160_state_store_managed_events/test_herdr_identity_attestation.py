@@ -267,6 +267,12 @@ class StoreRoundTripTest(unittest.TestCase):
                     "detail",
                     "observed_at",
                     "replacement_action_id",
+                    # v3 (#14756). The ONE field carrying a value the agent read from its
+                    # own env rather than a launcher-supplied expectation — a bounded
+                    # numeric epoch, never a credential / path / ambient env. The widening
+                    # of the privacy whitelist is argued in the store module's docstring;
+                    # this guard still pins that NOTHING ELSE crept in.
+                    "lane_epoch",
                 },
             )
 

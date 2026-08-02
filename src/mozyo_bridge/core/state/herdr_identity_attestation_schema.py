@@ -30,12 +30,15 @@ verify then failed closed with no public recovery. The launcher-capability probe
   merely inverted onto the old runtimes. So a v1 store stays v1 until an operator runs
   the explicit backup-first migration command; a normal launch instead writes the
   **v1-shaped** row (:func:`writable_projection`).
-- **Nothing is ever fabricated.** The v1 shape lacks only ``replacement_action_id``, a
-  field introduced with the replacement transaction (#13806). A v1 row therefore
-  *truthfully* carries an empty action id — padding it with ``''`` is a proven
-  backward-compatible projection, not a guess. The converse is refused: a **replacement**
-  launch (non-empty ``action_id``) can never be written v1-shaped, because dropping that
-  field would silently lose the binding a replacement recovery matches on.
+- **Nothing is ever fabricated.** Each newer shape adds exactly one column whose *absence*
+  from an older row is that row's true value, so the projection pads with a fact rather than
+  a guess: ``replacement_action_id`` (v2, #13806) is empty for a row whose writer had no
+  replacement concept, and ``lane_epoch`` (v3, #14756) is empty for a row whose writer was
+  never handed an epoch. Both converses are refused. A **replacement** launch (non-empty
+  ``action_id``) can never be written v1-shaped, because dropping that field would silently
+  lose the binding a replacement recovery matches on; an **epoch-bearing** launch can never
+  be written v1/v2-shaped, because dropping the epoch would land a live, correctly launched
+  pair that the resume proof can never admit (:func:`write_drops_lane_epoch`).
 
 Compatibility is judged only by the **shape / capability table**
 (:data:`_ALLOWED_SHAPES_BY_VERSION` / :data:`_COLUMN_DEFS`), never a guessed version
@@ -64,13 +67,13 @@ from mozyo_bridge.core.state.state_store import BACKUPS_DIRNAME, StateStoreError
 _TABLE = "herdr_identity_attestations"
 
 #: The shape this build writes for a fresh store and reads as native.
-HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION = 2
+HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION = 3
 
 #: The store shapes this build can read (and, per the write policy above, write
 #: *conservatively* without migrating). v1 = pre-#13806, v2 = additive
-#: ``replacement_action_id``. A version outside this set is unsupported and fails closed
-#: with the file byte-untouched.
-RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2})
+#: ``replacement_action_id``, v3 = additive ``lane_epoch`` (#14756). A version outside this
+#: set is unsupported and fails closed with the file byte-untouched.
+RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3})
 
 #: Recovery policy (``managed-state-model.md`` ``### recovery policy vocabulary``): a
 #: rebuildable projection — losing it degrades to fail-closed (adopt refuses, doctor
@@ -92,17 +95,22 @@ _V1_COLUMNS = frozenset(
 )
 #: v2 (#13806 tranche D R2-F2) is purely additive over v1.
 _V2_ADDS = frozenset({"replacement_action_id"})
+#: v3 (#14756) is purely additive over v2: the lane epoch the agent observed in its OWN
+#: process env at boot — the clock-free, locator-free half of the resume generation proof.
+_V3_ADDS = frozenset({"lane_epoch"})
 _SHAPE_V1 = _V1_COLUMNS
 _SHAPE_V2 = _V1_COLUMNS | _V2_ADDS
+_SHAPE_V3 = _SHAPE_V2 | _V3_ADDS
 
 _ALLOWED_SHAPES_BY_VERSION: dict[int, tuple[frozenset, ...]] = {
     1: (_SHAPE_V1,),
     2: (_SHAPE_V2,),
+    3: (_SHAPE_V3,),
 }
 
 #: The current column vocabulary, in the order every read projects and every native write
 #: uses. Kept as an ordered tuple so a projection and a native SELECT decode identically.
-COLUMNS_V2 = (
+COLUMNS_V3 = (
     "assigned_name",
     "workspace_id",
     "role",
@@ -112,23 +120,35 @@ COLUMNS_V2 = (
     "detail",
     "observed_at",
     "replacement_action_id",
+    "lane_epoch",
 )
-#: The v1 write vocabulary — the same order minus the additive column.
+#: The v2 write vocabulary — the current order minus the #14756 additive column.
+COLUMNS_V2 = tuple(c for c in COLUMNS_V3 if c not in _V3_ADDS)
+#: The v1 write vocabulary — v2's minus the #13806 additive column.
 COLUMNS_V1 = tuple(c for c in COLUMNS_V2 if c not in _V2_ADDS)
 
 #: ``column -> migration default literal`` for columns absent from an older shape. A
 #: column mapped to ``None`` has no proven default and makes a projection fail closed
 #: rather than invent a value. ``replacement_action_id`` defaults to the empty string
 #: because a v1 row was written by a runtime with no replacement concept at all — ``''``
-#: is that row's true value, not a fabrication.
-_COLUMN_DEFAULTS: dict[str, Optional[str]] = {"replacement_action_id": "''"}
-
-#: The DDL each additive column is migrated in with (must agree with ``_TABLE_SQL_V2``).
-_COLUMN_MIGRATION_DDL: dict[str, str] = {
-    "replacement_action_id": "TEXT NOT NULL DEFAULT ''",
+#: is that row's true value, not a fabrication. ``lane_epoch`` defaults to ``''`` for the
+#: same reason and with the same honesty: a v1 / v2 row was written by a runtime that was
+#: never handed an epoch, so "no epoch was observed" IS that row's true value. Note what
+#: this projection does NOT do — it does not pad with an epoch number, because ANY number
+#: would be a threshold claim the row never made (:mod:`...lane_epoch`); an empty epoch
+#: reads as ``lane_epoch_attestation_absent`` and the resume proof fails closed on it.
+_COLUMN_DEFAULTS: dict[str, Optional[str]] = {
+    "replacement_action_id": "''",
+    "lane_epoch": "''",
 }
 
-_TABLE_SQL_V2 = f"""
+#: The DDL each additive column is migrated in with (must agree with ``_TABLE_SQL_V3``).
+_COLUMN_MIGRATION_DDL: dict[str, str] = {
+    "replacement_action_id": "TEXT NOT NULL DEFAULT ''",
+    "lane_epoch": "TEXT NOT NULL DEFAULT ''",
+}
+
+_TABLE_SQL_V3 = f"""
 CREATE TABLE IF NOT EXISTS {_TABLE} (
     assigned_name TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL,
@@ -138,7 +158,8 @@ CREATE TABLE IF NOT EXISTS {_TABLE} (
     verdict TEXT NOT NULL,
     detail TEXT NOT NULL DEFAULT '',
     observed_at TEXT NOT NULL,
-    replacement_action_id TEXT NOT NULL DEFAULT ''
+    replacement_action_id TEXT NOT NULL DEFAULT '',
+    lane_epoch TEXT NOT NULL DEFAULT ''
 )
 """
 
@@ -338,9 +359,9 @@ def reader_upgrade_required(conn: sqlite3.Connection) -> bool:
 
 
 def readonly_compatible_select(conn: sqlite3.Connection) -> Optional[str]:
-    """A SELECT list projecting any recognized shape onto :data:`COLUMNS_V2`, or ``None``.
+    """A SELECT list projecting any recognized shape onto :data:`COLUMNS_V3`, or ``None``.
 
-    Emits the full current column vocabulary in :data:`COLUMNS_V2` order, projecting a
+    Emits the full current column vocabulary in :data:`COLUMNS_V3` order, projecting a
     column absent from an older shape as its migration-default *literal* (``'' AS
     replacement_action_id`` for a v1 store) so the caller decodes a v1 row with exactly
     the same row-decoder as a native v2 row. Returns ``None`` — fail closed, never a
@@ -353,7 +374,7 @@ def readonly_compatible_select(conn: sqlite3.Connection) -> Optional[str]:
         return None
     present = _present_columns(conn)
     parts: list[str] = []
-    for column in COLUMNS_V2:
+    for column in COLUMNS_V3:
         if column in present:
             parts.append(column)
             continue
@@ -367,14 +388,23 @@ def readonly_compatible_select(conn: sqlite3.Connection) -> Optional[str]:
 def writable_projection(version: int) -> Optional[tuple[str, ...]]:
     """The column vocabulary a write must use against a store at ``version``.
 
-    ``COLUMNS_V2`` for a v2 store, ``COLUMNS_V1`` for a v1 store (the conservative,
-    non-migrating write), or ``None`` for an unrecognized version. The caller is
-    responsible for refusing a write whose payload cannot survive the returned
-    projection — see :func:`write_drops_replacement_action_id`.
+    ``COLUMNS_V3`` for a v3 store, ``COLUMNS_V2`` for a v2 one, ``COLUMNS_V1`` for a v1 one
+    (the conservative, non-migrating write), or ``None`` for an unrecognized version. The
+    caller is responsible for refusing a write whose payload cannot survive the returned
+    projection — see :func:`write_drops_replacement_action_id` /
+    :func:`write_drops_lane_epoch`.
+
+    Selected by an **exact, ordered ladder rather than ``>=``**: each recognized version maps
+    to the vocabulary that version's shape actually has. A bare ``>= 2`` would hand a future
+    v4 store the v3 vocabulary, i.e. write columns whose presence nothing verified.
     """
     if version not in RECOGNIZED_SCHEMA_VERSIONS:
         return None
-    return COLUMNS_V2 if version >= 2 else COLUMNS_V1
+    if version >= 3:
+        return COLUMNS_V3
+    if version == 2:
+        return COLUMNS_V2
+    return COLUMNS_V1
 
 
 def write_drops_replacement_action_id(version: int, replacement_action_id: str) -> bool:
@@ -390,6 +420,29 @@ def write_drops_replacement_action_id(version: int, replacement_action_id: str) 
         return False
     projection = writable_projection(version)
     return projection is not None and "replacement_action_id" not in projection
+
+
+def write_drops_lane_epoch(version: int, lane_epoch: str) -> bool:
+    """Whether writing ``lane_epoch`` at ``version`` would silently drop it (#14756).
+
+    The exact twin of :func:`write_drops_replacement_action_id`, and it exists for the same
+    reason rather than for symmetry. A launch that was handed an epoch is a launch whose
+    whole point is to be *provable* later: the resume proof admits a relaunched pair only on
+    a strictly-newer attested epoch (:mod:`...lane_epoch`). Landing that row v1/v2-shaped
+    would store an attestation carrying **no** epoch, which reads as
+    ``lane_epoch_attestation_absent`` — so the pair would be live, correctly launched, and
+    permanently unresumable, with nothing in the record saying why. Refusing the write
+    visibly is the only outcome that names the operator's next rail
+    (``mozyo-bridge herdr attestation-store migrate --write``).
+
+    An epoch-less launch (the pre-#14756 shape, or a lane whose lifecycle row has minted no
+    epoch) carries ``''`` and loses nothing, so it still writes the older shape and the
+    mixed-runtime home keeps working exactly as #13882 requires.
+    """
+    if not (lane_epoch or "").strip():
+        return False
+    projection = writable_projection(version)
+    return projection is not None and "lane_epoch" not in projection
 
 
 @dataclass(frozen=True)
@@ -461,7 +514,7 @@ def probe_store_schema(path: Path) -> StoreSchemaObservation:
 
 def create_schema(conn: sqlite3.Connection) -> None:
     """Create a fresh store at the current version (used only when nothing exists)."""
-    conn.execute(_TABLE_SQL_V2)
+    conn.execute(_TABLE_SQL_V3)
     conn.execute(f"PRAGMA user_version = {HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION}")
 
 
@@ -790,7 +843,7 @@ def migrate_attestation_store(path: Path) -> AttestationMigrationOutcome:
             ) from exc
         try:
             present = _present_columns(conn)
-            for column in COLUMNS_V2:
+            for column in COLUMNS_V3:
                 if column in present:
                     continue
                 ddl = _COLUMN_MIGRATION_DDL.get(column)
@@ -827,6 +880,7 @@ def _rollback_quietly(conn: sqlite3.Connection) -> None:
 __all__ = (
     "COLUMNS_V1",
     "COLUMNS_V2",
+    "COLUMNS_V3",
     "HERDR_IDENTITY_ATTESTATION_RECOVERY_POLICY",
     "HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION",
     "MIGRATION_ABSENT",
@@ -856,5 +910,6 @@ __all__ = (
     "shape_matches",
     "store_status",
     "writable_projection",
+    "write_drops_lane_epoch",
     "write_drops_replacement_action_id",
 )

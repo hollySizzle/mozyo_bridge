@@ -57,6 +57,10 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_epoch import (  # noqa: E501
+    MIGRATE_HINT as _MIGRATE_HINT,
+    epoch_store_admission,
+)
 from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
     STORE_ABSENT as _STORE_ABSENT_STATE,
     STORE_UNREADABLE as _STORE_UNREADABLE_STATE,
@@ -546,8 +550,6 @@ STORE_REPLACEMENT_UNSUPPORTED = "attestation_store_replacement_unsupported"
 #: launch cannot be attested by anything older.
 _REPLACEMENT_MIN_STORE_VERSION = 2
 
-_MIGRATE_HINT = "`mozyo-bridge herdr attestation-store migrate --write`"
-
 
 def decide_store_compatibility(
     observation: LauncherCapabilityObservation,
@@ -555,6 +557,7 @@ def decide_store_compatibility(
     *,
     required_schema_version: int,
     replacement_launch: bool,
+    epoch_launch: bool = False,
 ) -> LauncherCapabilityVerdict:
     """Join the launcher's advertised capability with the SELECTED store's real shape.
 
@@ -571,6 +574,9 @@ def decide_store_compatibility(
     3. an absent store is fine — the first write creates it at the required version;
     4. replacement launch onto a pre-``replacement_action_id`` shape ->
        :data:`STORE_REPLACEMENT_UNSUPPORTED` (the field cannot be dropped);
+    4b. epoch-bearing launch onto a pre-``lane_epoch`` shape ->
+       ``STORE_EPOCH_UNSUPPORTED`` (Redmine #14756; the same "field that cannot be
+       dropped" shape, on the axis the resume generation proof depends on);
     5. the probed launcher cannot prove it writes this shape ->
        :data:`STORE_LAUNCHER_CANNOT_WRITE`;
     6. otherwise :data:`STORE_JOIN_OK` — including the v1-store / normal-launch case,
@@ -617,6 +623,11 @@ def decide_store_compatibility(
             f"exactly, so the pair would relaunch unverifiable. Migrate the store first: "
             f"{_MIGRATE_HINT}",
         )
+    epoch_refusal = epoch_store_admission(
+        epoch_launch=epoch_launch, store_version=version, migrate_hint=_MIGRATE_HINT
+    )
+    if epoch_refusal is not None:
+        return LauncherCapabilityVerdict(False, *epoch_refusal)
     if version not in observation.writable_store_versions:
         provable = (
             "advertises no writable-store set, so it is credited only with its native "

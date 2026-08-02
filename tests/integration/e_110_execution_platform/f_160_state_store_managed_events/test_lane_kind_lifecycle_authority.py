@@ -28,6 +28,10 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+
+from tests.support.lifecycle_backup_assert import (  # noqa: E402
+    assert_backup_preserves,
+)
 from pathlib import Path
 
 from mozyo_bridge.core.state.lane_declaration import LaneDeclarationStore
@@ -346,6 +350,8 @@ class LaneKindSchemaMigrationTest(unittest.TestCase):
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN hibernated_at")
             # v9 (#14477 j#94582) added release_observation; a faithful pre-v9 rewind drops it.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN release_observation")
+            # v10 (#14756) added lane_epoch; a faithful pre-v10 rewind drops it too.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 6 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -373,11 +379,11 @@ class LaneKindSchemaMigrationTest(unittest.TestCase):
         LaneLifecycleStore(home=self.home).ensure_schema()
 
         self.assertEqual(self._recorded(), LANE_LIFECYCLE_SCHEMA_VERSION)
-        self.assertEqual(LANE_LIFECYCLE_SCHEMA_VERSION, 9)  # v9 = #14477 release_observation
+        self.assertEqual(LANE_LIFECYCLE_SCHEMA_VERSION, 10)  # v10 = #14756 lane_epoch
         # backup-first: the pre-migration snapshot was preserved before the first write
         backups = sorted((self.home / "backups").glob("state-*"))
         self.assertEqual(len(backups), 1)
-        self.assertEqual((backups[0] / "state.sqlite").read_bytes(), before)
+        assert_backup_preserves(self, backups[0] / "state.sqlite", before)
         # the v7 column landed additively with the neutral default on the existing row
         self.assertIn("lane_kind", self._columns())
         record = LaneLifecycleStore(home=self.home).get(self.key)

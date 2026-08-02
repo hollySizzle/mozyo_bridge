@@ -35,6 +35,7 @@ import os
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from mozyo_bridge.core.state.lane_epoch import MOZYO_LANE_EPOCH_ENV
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.codex_shell_identity import (
     CodexShellIdentity,
 )
@@ -270,6 +271,7 @@ def build_agent_start_argv(
     launch_argv_extra: Sequence[str],
     replacement_action_id: str = "",
     action_id: str = "",
+    lane_epoch: str = "",
 ) -> list[str]:
     """Assemble the full ``herdr agent start`` argv for one launched slot (pure).
 
@@ -364,6 +366,15 @@ def build_agent_start_argv(
         # non-empty, so a normal (non-replacement) launch stays byte-invariant.
         if (replacement_action_id or "").strip():
             run_cmd += ["--replacement-action-id", replacement_action_id.strip()]
+        # Redmine #14756: the lane epoch the lifecycle authority had minted when this launch
+        # was planned, passed as the launcher-EXPECTED value. The wrapper compares it against
+        # what actually landed in its own env (the injected `MOZYO_LANE_EPOCH` below), which
+        # is the same "the launcher can prove it PASSED the value, only the process can prove
+        # it ARRIVED" split #13637 established for the identity triplet. Emitted ONLY when
+        # non-empty, so a lane with no minted epoch — and every pre-#14756 launch — stays
+        # byte-invariant.
+        if (lane_epoch or "").strip():
+            run_cmd += ["--lane-epoch", lane_epoch.strip()]
         run_cmd += ["--", *provider_cmd]
     else:
         run_cmd = provider_cmd
@@ -392,6 +403,17 @@ def build_agent_start_argv(
     # never gates or fails the launch either way.
     if attest_launcher and (action_id or "").strip():
         env_flags += ["--env", f"{MOZYO_STARTUP_ACTION_ID_ENV}={action_id.strip()}"]
+    # Lane epoch (Redmine #14756): the one value that makes a resume's generation proof
+    # clock- and locator-independent. It must reach the process as an ENV var, not merely as
+    # a wrapper flag, because the proof rests on a property only the environment has — a live
+    # process's env is immutable to every other process (POSIX), so a pane that SURVIVED
+    # hibernate's release cannot be handed the post-hibernate epoch without being relaunched.
+    # A wrapper argument would prove only what the launcher intended. Rides along ONLY when
+    # wrapping (the unwrapped fallback writes no attestation at all, so an injected epoch
+    # would be unobservable) AND when the lane has a minted epoch, keeping every other launch
+    # byte-for-byte the pre-#14756 env set.
+    if attest_launcher and (lane_epoch or "").strip():
+        env_flags += ["--env", f"{MOZYO_LANE_EPOCH_ENV}={lane_epoch.strip()}"]
     # Provider argv[0] alias (Redmine #14017): the provider command keeps the verified
     # realpath as its exec target (argv[0] token after `--`), but a symlinked provider
     # whose stable trusted alias differs from that realpath is handed argv[0]=<alias> by
@@ -430,6 +452,7 @@ __all__ = (
     "ATTEST_CAPABILITY_MARKER",
     "ATTEST_WRAPPER_SUBCOMMAND",
     "MOZYO_BRIDGE_LAUNCHER_ENV",
+    "MOZYO_LANE_EPOCH_ENV",
     "MOZYO_PROVIDER_ARGV0_ENV",
     "build_agent_start_argv",
     "CONFIG_PARSE_REJECTED_EXIT",
