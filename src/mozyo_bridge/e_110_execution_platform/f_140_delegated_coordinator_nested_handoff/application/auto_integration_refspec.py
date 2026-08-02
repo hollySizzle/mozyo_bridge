@@ -28,12 +28,11 @@ class _UnsafeRefspecError(ValueError):
     leading ``-`` turns the value into an option — so the argv is never built at all.
 
     **This exception does not leave the adapter.** All three call sites catch it and answer in
-    that operation's own fail-closed vocabulary: a read returns ``""`` / ``False``,
-    :meth:`apply_merge` returns ``invalid_input``, and :meth:`push_non_force` returns
-    ``accepted=False, rejected=False`` — the state it already used for an unusable source
-    head. Three rounds went into defending an escape out of one of them (j#96461 finding 2,
-    j#96492 finding 4, j#96499 finding 1); an unusable input is a refusal, and this adapter
-    now has one way of saying so.
+    that operation's own fail-closed vocabulary: a read returns ``""`` / ``False``, and both
+    the merge and the push return their vocabulary's ``invalid_input`` — the same status the
+    push already gives an unusable source head. Three rounds went into defending an escape out
+    of one of them (j#96461 finding 2, j#96492 finding 4, j#96499 finding 1); an unusable
+    input is a refusal, and this adapter has one way of saying so.
     """
 
 

@@ -381,8 +381,17 @@ domain/auto_integration_policy.py        pure: mode gate / integration 状態遷
 domain/retirement_cleanup_policy.py      pure: close 後の cleanup 状態遷移 (git 操作を持たない)
 domain/auto_integration_journal.py       pure: durable record renderer (判断はしない)
 application/auto_integration_actuator.py port (Protocol) + use case + config→policy 変換
+application/auto_integration_ports.py     port (Protocol) 定義 + 交換する value object
 application/auto_integration_live_ops.py live subprocess adapter (実 git)
+application/auto_integration_refspec.py  ref spelling 検査 + porcelain 自 ref 行の push 分類
 ```
+
+`auto_integration_refspec.py` は R22 (j#96516 裁定 2) で `live_ops` から分割した。責務は
+**「ref 名が何であってよいか」と「push についての git の答えが自 ref について何を意味するか」**の 2 つで、
+どちらも *process boundary が運ぶ文字列* についての問いであり、repository / remote / sandbox を必要としない。
+関数はすべて private (`_UnsafeRefspecError` / `_checked_branch` / `_push_status`) で、
+**subsystem 内でのみ import される。public re-export はしない** (`__all__` にも入れない)。
+分割の直接の契機は、typed push status 追加で `live_ops` が 998/1000 行に達したことである。
 
 ### bool ではなく記録で受ける (R1 review j#96344)
 

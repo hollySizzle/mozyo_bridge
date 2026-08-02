@@ -54,9 +54,15 @@ Every probe fails closed: a ``git`` that could not run has proven nothing, so a 
 invocation reads as the unsafe answer (not a workspace, not an ancestor, not reachable,
 dirty) rather than as a permissive one. A ref name that could not be handed to ``git`` in the
 first place is the same kind of answer, and every operation that takes one returns it that
-way: a read answers ``""`` / ``False``, the merge answers ``invalid_input``, and the push
-answers ``accepted=False, rejected=False`` without spawning anything (j#96461 finding 2,
-j#96499 finding 1). Nothing about a ref name leaves this adapter as an exception. The
+way: a read answers ``""`` / ``False``, and the merge and the push each answer
+``invalid_input`` from their own typed vocabulary, without spawning anything (j#96461
+finding 2, j#96499 finding 1). Nothing about a ref name leaves this adapter as an exception.
+
+**A push reports HOW it ended, from the closed vocabulary the port requires** — ``accepted``,
+``invalid_input``, ``remote_moved``, ``remote_refused``, ``operational_error`` — and it is
+read from what git said about our own ref, never inferred from an exit status. R21 had one
+failure flag for all of them, so a git that could not be spawned was durably recorded as a
+lost race with the one recovery that could not work (j#96516 finding 1). The
 spawn-failure mapping mirrors
 :meth:`...application.sublane_integration.LiveSublaneGitOperations._run` — a missing ``cwd``
 after a host reboot (#14499) raises ``FileNotFoundError`` rather than exiting non-zero, and

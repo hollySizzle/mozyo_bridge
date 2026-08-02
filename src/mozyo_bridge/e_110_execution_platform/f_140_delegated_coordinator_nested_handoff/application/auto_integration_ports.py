@@ -230,17 +230,34 @@ class AutoIntegrationGitOperations(Protocol):
     def push_non_force(self, *, source_head: str, target_ref: str) -> PushResult:
         """Push ``source_head`` to ``target_ref`` with a normal, non-force push.
 
-        The result carries three distinguishable outcomes, and an implementation MUST NOT
-        collapse them: ``accepted``; ``rejected``, which means the remote moved and is the
-        ONLY thing that word may mean here; and ``accepted=False, rejected=False``, which
-        means the push was never attempted because an input could not be used — an incomplete
-        source head, or a ``target_ref`` that cannot be spelled as a provably non-force
-        refspec. **Refusing an unusable input is a return value, not an exception.** R19 and
-        R20 documented a raise here on two premises that the adapter itself refutes: that the
-        third state did not exist (it has, for the source head, since R1), and that an
-        unusable ref could not reach the push because the apply refuses it first (a
-        fast-forward disposition never calls the apply) — j#96492 finding 4, j#96499
-        finding 1.
+        **What an implementation MUST return**, from the closed vocabulary in
+        :data:`~...domain.auto_integration_records.PUSH_STATUSES`. The statuses are not
+        severities to pick from — each names a DIFFERENT RECOVERY, which is the whole reason
+        they may not be collapsed:
+
+        - :data:`PUSH_ACCEPTED` — it landed.
+        - :data:`PUSH_INVALID_INPUT` — nothing was attempted: an argument could not be used
+          (an incomplete ``source_head``, or a ``target_ref`` that cannot be spelled as a
+          provably non-force refspec). Recovery: fix the input. **Refusing an unusable input
+          is a return value, not an exception** — R19 and R20 documented a raise here on two
+          premises the adapter itself refutes (j#96492 finding 4, j#96499 finding 1).
+        - :data:`PUSH_REMOTE_MOVED` — a lost race; the remote's ref is not an ancestor of what
+          we offered. Recovery: re-form the action against the new target head. This is the
+          only status that means that, and an implementation MUST establish it from what the
+          remote actually said about THIS ref — **never by inferring it from a non-zero exit
+          status**, which is how R21 recorded a git that could not be spawned as a lost race
+          (j#96516 finding 1).
+        - :data:`PUSH_REMOTE_REFUSED` — the remote answered and declined the update (a hook, a
+          protected branch). Recovery: whoever owns that policy, not a new target head.
+        - :data:`PUSH_OPERATIONAL_ERROR` — the push could not be carried out, or the result
+          said nothing about our ref at all. Recovery: investigate the environment. An
+          implementation MUST NOT report anything about the remote's ref here, because it does
+          not know anything about it.
+
+        ``PushResult.accepted`` and ``.rejected`` are DERIVED from the status, so an
+        implementation cannot report a contradiction; ``rejected`` continues to mean
+        :data:`PUSH_REMOTE_MOVED` and nothing else. A status outside the vocabulary is read as
+        :data:`PUSH_UNRECOGNIZED` and is not a success.
         """
         ...
 
