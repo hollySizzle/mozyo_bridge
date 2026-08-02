@@ -810,6 +810,63 @@ class ActuatorTopologyTests(unittest.TestCase):
             PARTICIPANT_REPLACED,
         )
 
+    def test_a_phase_outside_this_flow_is_refused_before_the_claim(self):
+        """Audit j#97201: the gate belongs on the SHARED method, not on one wrapper.
+
+        `drive_worker_recovery` has six direct call sites. Refusing only in the
+        vanished-gateway wrapper left the same invariant violation on the other five: a
+        self-flow or unknown phase was reported as recovered, and the row had already been
+        claimed -- revision bumped, lease taken -- by the time the refusal came back.
+        """
+        import sqlite3
+
+        for phase in ("self_close_armed", "future_phase"):
+            with self.subTest(phase=phase):
+                store, key = self._store_with([ParticipantPin(**WORKER)])
+                with sqlite3.connect(store.path) as conn:
+                    conn.execute(
+                        "UPDATE replacement_transactions SET phase = ? WHERE action_id = ?",
+                        (phase, key.action_id),
+                    )
+                before = store.get(key)
+                port = FakeActuatorPort()
+                result = ReplacementActuatorUseCase(
+                    store, port, clock=lambda: FIXED
+                ).drive_worker_recovery(
+                    key, holder="H", expected_action_generation=GEN
+                )
+                self.assertEqual(result.status, ACTUATION_INVALID_TOPOLOGY)
+                after = store.get(key)
+                self.assertEqual(after.revision, before.revision, "nothing was claimed")
+                self.assertEqual(after.lease_holder, before.lease_holder)
+                self.assertEqual(port.closed, [])
+                self.assertFalse(port.launched)
+
+    def test_a_progressed_phase_with_an_unreplaced_worker_is_not_recovered(self):
+        """`completed` means the redispatch leg ran; a still-owed worker contradicts it."""
+        import sqlite3
+
+        for phase in ("draining_continuation", "completed"):
+            with self.subTest(phase=phase):
+                store, key = self._store_with([ParticipantPin(**WORKER)])
+                with sqlite3.connect(store.path) as conn:
+                    conn.execute(
+                        "UPDATE replacement_transactions SET phase = ? WHERE action_id = ?",
+                        (phase, key.action_id),
+                    )
+                before = store.get(key)
+                port = FakeActuatorPort()
+                result = ReplacementActuatorUseCase(
+                    store, port, clock=lambda: FIXED
+                ).drive_worker_recovery(
+                    key, holder="H", expected_action_generation=GEN
+                )
+                self.assertEqual(result.status, ACTUATION_INVALID_TOPOLOGY)
+                after = store.get(key)
+                self.assertEqual(after.revision, before.revision)
+                self.assertEqual(after.lease_holder, before.lease_holder)
+                self.assertFalse(port.launched)
+
     def test_recycled_old_slot_is_zero_actuation(self):
         store, key = self._store_with([ParticipantPin(**WORKER)])
         port = FakeActuatorPort()

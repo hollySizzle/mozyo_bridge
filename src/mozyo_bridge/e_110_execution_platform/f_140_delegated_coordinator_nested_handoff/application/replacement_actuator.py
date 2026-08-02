@@ -187,6 +187,54 @@ def _completion_outcome(port, key, pin, replacement_action_id: str) -> str:
     return COMPLETION_UNKNOWN
 
 
+def _phase_token(value: object) -> str:
+    """A phase only when it is already plain exact text; otherwise no phase at all."""
+    if type(value) is not str:
+        return ""
+    if not value or value != value.strip():
+        return ""
+    return value
+
+
+#: The phases a worker recovery may be driven from.
+_RECOVERY_DRIVABLE_PHASES = (PHASE_PLANNED, PHASE_CLAIMED, PHASE_REPLACING_NONSELF)
+#: The phases that MEAN the redispatch leg already ran.
+_RECOVERY_PROGRESSED_PHASES = (PHASE_DRAINING_CONTINUATION, PHASE_COMPLETED)
+
+
+def _worker_recovery_phase_refusal(rec):
+    """The refusal a row's phase earns before anything is claimed, or ``None``. (pure)
+
+    Two things this used to get wrong, both measured (j#97190 F2, j#97201):
+
+    * every phase outside the drivable three was reported as ``recovered`` -- including a
+      SELF-replacement phase and one this build does not know -- for a participant that was
+      never launched or attested;
+    * ``draining_continuation`` / ``completed`` were taken at face value. They mean the
+      redispatch leg already ran, which is only true if every non-self participant really is
+      ``replaced``; a completed row whose worker is still ``close_owed`` is a contradiction,
+      not an idempotent success.
+    """
+    phase = _phase_token(getattr(rec, "phase", ""))
+    if phase in _RECOVERY_PROGRESSED_PHASES:
+        participants = tuple(getattr(rec, "participants", ()) or ())
+        if participants and all(
+            _phase_token(getattr(p, "phase", "")) == PARTICIPANT_REPLACED
+            for p in participants
+        ):
+            return None
+        return ActuationResult(
+            status=ACTUATION_INVALID_TOPOLOGY, phase=rec.phase, revision=rec.revision,
+            detail="a progressed phase whose participants are not replaced",
+        )
+    if phase in _RECOVERY_DRIVABLE_PHASES:
+        return None
+    return ActuationResult(
+        status=ACTUATION_INVALID_TOPOLOGY, phase=rec.phase, revision=rec.revision,
+        detail="phase is not part of the worker-recovery flow",
+    )
+
+
 def _pin_carries_evidence(pin) -> bool:
     """Does this participant carry an update-evidence triplet at all? (pure)
 
@@ -470,6 +518,15 @@ class ReplacementActuatorUseCase:
                     "non-self participant"
                 ),
             )
+        phase_refusal = _worker_recovery_phase_refusal(rec)
+        if phase_refusal is not None:
+            # BEFORE the clock and the claim (audit j#97201): a claim is a durable write --
+            # it moves the row's revision and takes its lease -- so a phase this flow does
+            # not own, or a progressed phase whose participants contradict it, has to be
+            # refused here rather than after the row has already been altered. The
+            # vanished-gateway executor had this gate; the other five call sites of this
+            # shared method did not, which is why it belongs on this side of the boundary.
+            return phase_refusal
         now = self._clock()
         claim = self._store.claim(
             key,

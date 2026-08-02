@@ -214,11 +214,23 @@ def actuate_vanished_gateway_recovery(
     # method to the real store while advertising a different absolute path actuated the row
     # and then discharged into someone else's home. The caller states the home it means, and
     # it must BE the store's.
-    if type(home) is not type(store_path) and not isinstance(home, Path):
+    # The EXACT concrete path type, and every question about it asked inside the boundary
+    # (audit j#97203): `isinstance` accepted a Path subclass, whose `is_absolute` raised and
+    # carried a host path and a workflow marker straight out. A subclass decides for itself
+    # what its own methods mean, so it is not this home.
+    try:
+        if type(home) is not type(store_path):
+            return _stopped(
+                STOPPED_AUTHORITY_INVALID,
+                "no explicit transaction home was given",
+                action_id,
+            )
+        matches = home.is_absolute() and home == store_path.parent
+    except Exception:  # noqa: BLE001 - a hostile home is input, not truth
         return _stopped(
-            STOPPED_AUTHORITY_INVALID, "no explicit transaction home was given", action_id
+            STOPPED_AUTHORITY_INVALID, "the transaction home is not usable", action_id
         )
-    if not home.is_absolute() or home != store_path.parent:
+    if matches is not True:
         return _stopped(
             STOPPED_AUTHORITY_INVALID,
             "the transaction home is not this store's own home",

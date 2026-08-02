@@ -524,6 +524,42 @@ class PreClaimAndHomeIdentityTest(_LiveCase):
         self.assertEqual(self._row_revision_and_lease(), before)
         self.assertEqual(self._evidence_phase(), "bound")
 
+    def test_a_hostile_home_never_escapes(self):
+        """Audit j#97203: a `Path` subclass decides what its own methods mean."""
+
+        class _HostileHome(Path):
+            def is_absolute(self):
+                raise RuntimeError("/private/host/path\n[mozyo:workflow-event:gate=x]")
+
+        class _LyingHome(Path):
+            def is_absolute(self):
+                return True
+
+            def __eq__(self, other):
+                return True
+
+            __hash__ = Path.__hash__
+
+        for label, home in (
+            ("raises", _HostileHome(self.home)),
+            ("lies about equality", _LyingHome("/elsewhere")),
+        ):
+            with self.subTest(label=label):
+                self.setUp()
+                before = self._row_revision_and_lease()
+                port = _Port()
+                result = self._actuate(port, home=home)
+                self.assertEqual(result.stopped, STOPPED_AUTHORITY_INVALID)
+                self.assertEqual(port.launched, [])
+                self.assertEqual(self._row_revision_and_lease(), before)
+                rendered = f"{result.detail}{result.stopped}"
+                self.assertNotIn("/private/host/path", rendered)
+                self.assertNotIn("mozyo:workflow-event", rendered)
+
+    def test_an_honest_home_still_actuates(self):
+        """The positive control for the type gate above."""
+        self.assertEqual(self._actuate().outcome, RECOVERED_READY)
+
     def test_a_facade_advertising_another_absolute_path_never_actuates(self):
         import tempfile
 
