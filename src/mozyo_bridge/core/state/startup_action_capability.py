@@ -44,8 +44,12 @@ CAPABILITY_IDENTITY_RECEIPT = "ir1"
 
 CAPABILITIES: frozenset = frozenset({CAPABILITY_LEGACY, CAPABILITY_IDENTITY_RECEIPT})
 
-_LEGACY_ACTION_RE = re.compile(r"^startup-[0-9a-f]{64}$")
-_TAGGED_ACTION_RE = re.compile(r"^startup-(ir1)-[0-9a-f]{64}$")
+# `fullmatch`, never `$`: Python's `$` also matches BEFORE a trailing newline, so
+# "startup-ir1-<64hex>\n" classified as tagged (audit j#96928 F6). An action id is a byte
+# string, and its classification must be byte-exact — a trailing newline or control
+# character is a DIFFERENT id and must not be recognised as either shape.
+_LEGACY_ACTION_RE = re.compile(r"startup-[0-9a-f]{64}")
+_TAGGED_ACTION_RE = re.compile(r"startup-(ir1)-[0-9a-f]{64}")
 
 
 def startup_action_id(
@@ -127,9 +131,9 @@ def action_capability(action_id: object) -> str:
     "assume legacy" is precisely the fail-open j#96892 forbids.
     """
     value = action_id if isinstance(action_id, str) else ""
-    if _LEGACY_ACTION_RE.match(value):
+    if _LEGACY_ACTION_RE.fullmatch(value):
         return CAPABILITY_LEGACY
-    tagged = _TAGGED_ACTION_RE.match(value)
+    tagged = _TAGGED_ACTION_RE.fullmatch(value)
     if tagged:
         return tagged.group(1)
     raise StartupTransactionError(
@@ -178,21 +182,58 @@ def startup_action_id_matching(
 _IDENTITY_MANIFEST_TABLE = "startup_identity_manifests"
 
 _IDENTITY_MANIFEST_SQL = f"""
-CREATE TABLE IF NOT EXISTS {_IDENTITY_MANIFEST_TABLE} (
-    action_id       TEXT PRIMARY KEY NOT NULL,
+CREATE TABLE {_IDENTITY_MANIFEST_TABLE} (
+    action_id       TEXT NOT NULL PRIMARY KEY,
     workspace_id    TEXT NOT NULL,
     lane_id         TEXT NOT NULL,
     protocol        TEXT NOT NULL,
     slots           TEXT NOT NULL,
     manifest_digest TEXT NOT NULL,
+    nonce           TEXT NOT NULL,
     recorded_at     TEXT NOT NULL
 )
 """
 
 _IDENTITY_MANIFEST_COLUMNS = (
     "action_id", "workspace_id", "lane_id", "protocol", "slots", "manifest_digest",
-    "recorded_at",
+    "nonce", "recorded_at",
 )
+
+#: The EXACT shape a usable sibling table has, as ``PRAGMA table_info`` reports it:
+#: ``(cid, name, declared type, notnull, default, pk)``. Compared in full and in order.
+#:
+#: Audit j#96928 F5: checking only that the required column NAMES are present let a foreign
+#: table with extra columns, a missing primary key, or drifted types/notnull/defaults be
+#: written into. A store this feature did not create is not a store this feature may mutate:
+#: the table is created ONLY when absent, and anything else is a zero-write refusal.
+_IDENTITY_MANIFEST_SHAPE = (
+    (0, "action_id", "TEXT", 1, None, 1),
+    (1, "workspace_id", "TEXT", 1, None, 0),
+    (2, "lane_id", "TEXT", 1, None, 0),
+    (3, "protocol", "TEXT", 1, None, 0),
+    (4, "slots", "TEXT", 1, None, 0),
+    (5, "manifest_digest", "TEXT", 1, None, 0),
+    (6, "nonce", "TEXT", 1, None, 0),
+    (7, "recorded_at", "TEXT", 1, None, 0),
+)
+
+
+def _manifest_table_state(conn) -> str:
+    """``"absent"`` / ``"exact"`` — or raise for anything else (zero-write)."""
+    rows = conn.execute(f"PRAGMA table_info({_IDENTITY_MANIFEST_TABLE})").fetchall()
+    if not rows:
+        return "absent"
+    actual = tuple(
+        (int(r[0]), str(r[1]), str(r[2]).upper(), int(r[3]), r[4], int(r[5])) for r in rows
+    )
+    if actual != _IDENTITY_MANIFEST_SHAPE:
+        raise StartupTransactionError(
+            f"{REASON_RECEIPT_REQUIREMENT_UNAVAILABLE}: the "
+            f"{_IDENTITY_MANIFEST_TABLE!r} table exists with a shape this build did not "
+            "create (extra/missing columns, drifted type/notnull/default, or no primary "
+            "key); refusing to read or write it — nothing was started"
+        )
+    return "exact"
 
 #: The manifest protocol this build writes and accepts.
 IDENTITY_MANIFEST_PROTOCOL = "ir1"
@@ -253,8 +294,16 @@ class IdentityManifest:
         workspace = _norm(self.workspace_id)
         lane = _norm(self.lane_id)
         protocol = _norm(self.protocol)
-        if not workspace or not lane or not protocol:
-            raise ValueError("a launch manifest requires an exact workspace, lane, protocol")
+        if not workspace or not lane:
+            raise ValueError("a launch manifest requires an exact workspace and lane")
+        if protocol != IDENTITY_MANIFEST_PROTOCOL:
+            # Audit j#96931 F9: an unknown protocol was accepted and canonicalised, so a
+            # manifest this build cannot interpret would still have produced a digest and a
+            # tagged action. Exact only, both when writing and when reading back.
+            raise ValueError(
+                f"unknown launch manifest protocol {protocol!r}; this build writes and "
+                f"accepts exactly {IDENTITY_MANIFEST_PROTOCOL!r}"
+            )
         if not self.slots:
             raise ValueError("a launch manifest records the WHOLE plan; it is never empty")
         slots = [slot.canonical() for slot in self.slots]
@@ -311,16 +360,9 @@ def read_identity_manifest(fence, action_id: str):
         )
     with fence._connection("ro") as conn:
         try:
-            columns = {
-                str(row[1])
-                for row in conn.execute(
-                    f"PRAGMA table_info({_IDENTITY_MANIFEST_TABLE})"
-                ).fetchall()
-            }
-            if set(_IDENTITY_MANIFEST_COLUMNS) - columns:
+            if _manifest_table_state(conn) == "absent":
                 raise StartupTransactionError(
-                    f"{unavailable}, but the manifest table is absent or partial; "
-                    "zero-actuation"
+                    f"{unavailable}, but the manifest table is absent; zero-actuation"
                 )
             row = conn.execute(
                 f"SELECT {', '.join(_IDENTITY_MANIFEST_COLUMNS)} FROM "
@@ -367,17 +409,19 @@ def read_identity_manifest(fence, action_id: str):
             f"{unavailable}, but its stored manifest does not reproduce the digest it "
             "was filed under; zero-actuation"
         )
-    if (
-        _norm(manifest.workspace_id) != _norm(values["workspace_id"])
-        or _norm(manifest.lane_id) != _norm(values["lane_id"])
-    ):
-        # A payload whose own workspace/lane disagree with the row it is filed under is
-        # a manifest moved between actions. The digest check above cannot see that (it
-        # only proves the payload is intact), so it is checked separately.
-        raise StartupTransactionError(
-            f"{unavailable}, but its manifest describes a different workspace/lane "
-            "than the action it is filed under; zero-actuation"
-        )
+    # The real binding check (audit j#96928 F1). The digest check above only proves the
+    # payload is INTACT, and `manifest_digest` is itself a mutable column — rewriting the
+    # payload and the digest together passes it. What cannot be forged is that the action id
+    # is a hash PREIMAGE of the digest, so the reader recomputes the id from the stored row
+    # and requires a byte-exact match. That needs the nonce, which is why it is stored.
+    verify_manifest_binding(
+        action_id,
+        workspace_id=values["workspace_id"],
+        lane_id=values["lane_id"],
+        providers=tuple(slot.provider for slot in manifest.slots),
+        nonce=values["nonce"],
+        digest=values["manifest_digest"],
+    )
     return manifest
 
 
@@ -410,6 +454,21 @@ def resolve_reserve_identity(canonical, nonce: str, manifest):
             "the launch manifest describes a different workspace/lane than the action it "
             "would be bound to; nothing was started"
         )
+    # Audit j#96928 F3: the manifest must be the WHOLE plan. Without this, an action scoped
+    # to (codex, claude) could file a manifest naming only codex, and claude would carry no
+    # receipt obligation at all while the action id still claimed the capability — a hole
+    # in exactly the direction that fails open.
+    providers = [_norm(slot.provider) for slot in manifest.slots]
+    if len(providers) != len(set(providers)):
+        raise StartupTransactionError(
+            "the launch manifest names a provider twice; a plan with a duplicate slot has "
+            "no single obligation per provider — nothing was started"
+        )
+    if tuple(sorted(set(providers))) != canonical.providers:
+        raise StartupTransactionError(
+            "the launch manifest's provider set is not exactly the action's requested set "
+            "(missing or extra slots); nothing was started"
+        )
     digest = manifest.digest()
     return (
         startup_action_id(
@@ -423,6 +482,47 @@ def resolve_reserve_identity(canonical, nonce: str, manifest):
     )
 
 
+def verify_manifest_binding(
+    action_id: str, *, workspace_id: str, lane_id: str, providers, nonce: str, digest: str
+) -> None:
+    """Recompute ``action_id`` from the stored row and require a byte-exact match.
+
+    Audit j#96928 F1. The previous reader only checked that the payload reproduced the
+    stored ``manifest_digest`` — but that column is itself mutable, so rewriting the payload
+    and the digest together (keeping workspace/lane) passed. What makes the binding real is
+    that the action id is a hash PREIMAGE of the digest, so the reader has to be able to
+    recompute the id. That needs the nonce, which is why it is now stored beside the
+    manifest: without it the binding was an assertion, not a check.
+    """
+    rederived = startup_action_id(
+        StartupUnit(workspace_id=workspace_id, lane_id=lane_id, providers=tuple(providers)),
+        nonce,
+        capability=CAPABILITY_IDENTITY_RECEIPT,
+        manifest_digest=digest,
+    )
+    if rederived != action_id:
+        raise StartupTransactionError(
+            f"{REASON_RECEIPT_REQUIREMENT_UNAVAILABLE}: startup action {action_id!r} is not "
+            "the identity its stored manifest binding reproduces; zero-actuation"
+        )
+
+
+@dataclass(frozen=True)
+class StartupUnit:
+    """Local mirror of the fence's unit, so this leaf module needs no import back."""
+
+    workspace_id: str
+    lane_id: str
+    providers: tuple
+
+    def canonical(self) -> "StartupUnit":
+        return StartupUnit(
+            workspace_id=_norm(self.workspace_id),
+            lane_id=_norm(self.lane_id),
+            providers=tuple(sorted({_norm(p) for p in self.providers if _norm(p)})),
+        )
+
+
 def write_reserved_action(
     conn,
     *,
@@ -433,6 +533,7 @@ def write_reserved_action(
     manifest,
     manifest_digest: str,
     manifest_payload: str,
+    nonce: str = "",
 ) -> None:
     """Write the action row and (when tagged) its manifest in ONE transaction.
 
@@ -443,9 +544,10 @@ def write_reserved_action(
     and both happen strictly before the reserve's first side effect.
     """
     if manifest is not None:
-        # Created here, inside the caller's lock, only after the store itself verified. It
-        # is additive, so a store written before this feature simply does not have it yet.
-        conn.execute(_IDENTITY_MANIFEST_SQL)
+        # Exact probe BEFORE any mutation (audit j#96928 F5): create only when absent, and
+        # refuse anything whose shape this build did not create.
+        if _manifest_table_state(conn) == "absent":
+            conn.execute(_IDENTITY_MANIFEST_SQL)
     conn.execute("BEGIN IMMEDIATE")
     conn.execute(
         "INSERT INTO startup_actions (action_id, workspace_id, lane_id, providers,"
@@ -466,7 +568,8 @@ def write_reserved_action(
     if manifest is not None:
         conn.execute(
             f"INSERT INTO {_IDENTITY_MANIFEST_TABLE} (action_id, workspace_id, lane_id,"
-            " protocol, slots, manifest_digest, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            " protocol, slots, manifest_digest, nonce, recorded_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 action_id,
                 canonical.workspace_id,
@@ -474,7 +577,111 @@ def write_reserved_action(
                 _norm(manifest.protocol),
                 manifest_payload,
                 manifest_digest,
+                _norm(nonce),
                 now,
             ),
         )
     conn.execute("COMMIT")
+
+
+def identical_pending_replay(
+    conn, *, action_id: str, canonical, manifest_digest: str, manifest_payload: str, nonce: str
+) -> bool:
+    """True iff this reserve is a byte-exact replay of an untouched tagged reservation.
+
+    Every field is compared, including the ones a caller cannot see (the stored payload and
+    the stored nonce), and the action must still be exactly as reserved — reserved phase,
+    revision 1, no participants. A reservation that has already started something is NOT
+    replayable: returning it would hand a second caller an action whose effects are
+    already in flight.
+
+    Never mutates. A divergent replay simply returns False and the caller refuses.
+    """
+    row = conn.execute(
+        "SELECT workspace_id, lane_id, providers, phase, revision, participants"
+        " FROM startup_actions WHERE action_id = ?",
+        (action_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    workspace, lane, providers, phase, revision, participants = row
+    if (
+        workspace != canonical.workspace_id
+        or lane != canonical.lane_id
+        or providers != ",".join(canonical.providers)
+        or _norm(phase) != "planned"
+        or int(revision) != 1
+    ):
+        return False
+    try:
+        if json.loads(participants):
+            return False
+    except (ValueError, TypeError):
+        return False
+    if _manifest_table_state(conn) == "absent":
+        return False
+    stored = conn.execute(
+        f"SELECT slots, manifest_digest, nonce FROM {_IDENTITY_MANIFEST_TABLE}"
+        " WHERE action_id = ?",
+        (action_id,),
+    ).fetchone()
+    if stored is None:
+        return False
+    return (
+        stored[0] == manifest_payload
+        and stored[1] == manifest_digest
+        and stored[2] == _norm(nonce)
+    )
+
+
+def reserve_or_replay(
+    conn,
+    *,
+    action_id: str,
+    canonical,
+    phase: str,
+    now: str,
+    manifest,
+    manifest_digest: str,
+    manifest_payload: str,
+    nonce: str,
+) -> str:
+    """Write the reservation, or recognise an exact replay. Returns the replayed id or "".
+
+    One place decides, so the "already exists" branch and the write can never disagree
+    about what an identical replay is. Audit j#96928 F4: an EXACT identical replay of a
+    TAGGED reserve is idempotent — same unit, same nonce, same manifest, action untouched
+    in its reserved state — because that is one action being retried, and refusing it would
+    strand a crash-replay that had already written. Anything divergent is still a nonce
+    reuse and refuses; nothing is ever updated or replaced. A LEGACY reserve keeps its
+    existing contract exactly: a repeat is a reuse, full stop.
+    """
+    existing = conn.execute(
+        "SELECT phase FROM startup_actions WHERE action_id = ?", (action_id,)
+    ).fetchone()
+    if existing is not None:
+        if manifest is not None and identical_pending_replay(
+            conn,
+            action_id=action_id,
+            canonical=canonical,
+            manifest_digest=manifest_digest,
+            manifest_payload=manifest_payload,
+            nonce=nonce,
+        ):
+            return action_id
+        raise StartupTransactionError(
+            f"startup action {action_id!r} already exists (phase {existing[0]!r}); a nonce "
+            "must never be reused — refusing to reserve over a recorded action"
+        )
+    write_reserved_action(
+        conn,
+        action_id=action_id,
+        canonical=canonical,
+        phase=phase,
+        now=now,
+        manifest=manifest,
+        manifest_digest=manifest_digest,
+        manifest_payload=manifest_payload,
+        nonce=nonce,
+    )
+    return ""

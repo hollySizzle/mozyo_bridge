@@ -151,8 +151,9 @@ from mozyo_bridge.core.state.startup_action_capability import (  # noqa: F401
     _IDENTITY_MANIFEST_TABLE,
     action_capability,
     read_identity_manifest as _read_identity_manifest,
+    resolve_reserve_identity,
     resolve_reserve_identity as _resolve_reserve_identity,
-    write_reserved_action as _write_reserved_action,
+    reserve_or_replay as _reserve_or_replay,
     requires_identity_receipt,
     startup_action_id,
     startup_action_id_matching,
@@ -697,12 +698,18 @@ class StartupTransactionFence:
                     _row_to_action,
                 )
 
-                return _row_to_action(row) if row else None
+                action = _row_to_action(row) if row else None
             except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
                 raise StartupTransactionError(
                     f"the startup transaction authority {self.path} could not be read "
                     f"({exc}); fail closed rather than treat it as empty"
                 ) from exc
+        if action is not None:
+            # Audit j#96928 F2: rollback / status / current-action all consume THIS read, so
+            # a tagged action must prove its manifest obligation here or it can be spent
+            # without anyone looking at it. Legacy short-circuits and is unchanged.
+            self.read_identity_manifest(action.action_id)
+        return action
 
     # -- writes ------------------------------------------------------------
 
@@ -729,6 +736,7 @@ class StartupTransactionFence:
             canonical, nonce, manifest
         )
         now = _utc_now()
+        replayed = ""
         with self._hold():
             shape = self.store_shape()
             if shape.state == STORE_DAMAGED:
@@ -749,17 +757,7 @@ class StartupTransactionFence:
                 ) from exc
             with self._connection("rw") as conn:
                 try:
-                    existing = conn.execute(
-                        "SELECT phase FROM startup_actions WHERE action_id = ?",
-                        (action_id,),
-                    ).fetchone()
-                    if existing is not None:
-                        raise StartupTransactionError(
-                            f"startup action {action_id!r} already exists (phase "
-                            f"{existing[0]!r}); a nonce must never be reused — refusing to "
-                            "reserve over a recorded action"
-                        )
-                    _write_reserved_action(
+                    replayed = _reserve_or_replay(
                         conn,
                         action_id=action_id,
                         canonical=canonical,
@@ -768,19 +766,22 @@ class StartupTransactionFence:
                         manifest=manifest,
                         manifest_digest=manifest_digest,
                         manifest_payload=manifest_payload,
+                        nonce=nonce,
                     )
                 except StartupTransactionError:
                     _rollback_quietly(conn)
                     raise
                 except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
-                    # The SELECT/INSERT are normalized (R4-F2); the connection close is
-                    # guaranteed and normalized by `_connection` (R6-F3.3). reserve is the
-                    # reserve-before-effect anchor — it must fail closed, not leak internals.
+                    # Normalized here (R4-F2); the close is guaranteed by `_connection`
+                    # (R6-F3.3). reserve is the reserve-before-effect anchor, so it fails
+                    # closed rather than leaking internals.
                     _rollback_quietly(conn)
                     raise StartupTransactionError(
                         f"the startup transaction authority {self.path} could not record "
                         f"the reserve ({exc}); nothing was started"
                     ) from exc
+        if replayed:
+            return self._require(replayed)
         return StartupAction(
             action_id=action_id,
             unit=canonical,

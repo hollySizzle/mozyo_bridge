@@ -289,10 +289,206 @@ class AtomicManifestCoCommitTest(unittest.TestCase):
             "the v1 nine columns are untouched",
         )
 
-    def test_a_reused_nonce_is_still_refused_for_a_tagged_action(self) -> None:
+    def test_an_exact_identical_replay_is_idempotent(self) -> None:
+        """j#96917 / audit F4: one action retried, not a nonce reused."""
+        first = self._reserve_tagged()
+        again = self._reserve_tagged()
+        self.assertEqual(again.action_id, first.action_id)
+        self.assertEqual(again.phase, first.phase)
+        with sqlite3.connect(self.path) as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM startup_identity_manifests"
+                ).fetchone()[0],
+                1,
+                "a replay must not write a second manifest",
+            )
+
+    def test_a_divergent_replay_is_still_refused(self) -> None:
+        """Same unit+nonce but a DIFFERENT plan is not a replay; it is a reuse."""
         self._reserve_tagged()
+        divergent = IdentityManifest(
+            workspace_id="wA",
+            lane_id="issue_14741",
+            slots=(
+                IdentityManifestSlot("codex", "mzb1_wA_codex_lane", True, "mzb1:CHANGED"),
+                IdentityManifestSlot("claude", "mzb1_wA_claude_lane", False, ""),
+            ),
+        )
+        # A different plan yields a different action id, so it is a fresh reserve — the
+        # collision this guards is the SAME id arriving with different content.
+        other = self.fence.reserve(UNIT, "nonce-1", manifest=divergent)
+        self.assertNotEqual(other.action_id, self._reserve_tagged().action_id)
+
+    def test_a_replay_after_the_action_started_is_refused(self) -> None:
+        """A reservation with effects in flight must never be handed to a second caller."""
+        from mozyo_bridge.core.state.startup_transaction_fence import Participant
+
+        action = self._reserve_tagged()
+        self.fence.record_participant(
+            action.action_id,
+            Participant(
+                assigned_name="mzb1_wA_codex_lane",
+                role="codex",
+                locator="wA:p1",
+                receipt="wA",
+            ),
+        )
         with self.assertRaises(StartupTransactionError):
             self._reserve_tagged()
+
+    def test_a_legacy_reserve_keeps_refusing_a_reused_nonce(self) -> None:
+        """The legacy contract is untouched: a repeat is a nonce reuse."""
+        self.fence.reserve(UNIT, "legacy-nonce")
+        with self.assertRaises(StartupTransactionError):
+            self.fence.reserve(UNIT, "legacy-nonce")
+
+
+class AuditedDefectRegressionTest(unittest.TestCase):
+    """The exact defects the j#96928 / j#96931 adversarial audit reproduced."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "s.sqlite"
+        self.fence = StartupTransactionFence(self.path)
+
+    def _tagged(self):
+        return self.fence.reserve(UNIT, "nonce-1", manifest=_manifest())
+
+    def test_f1_payload_and_digest_rewritten_together_is_detected(self) -> None:
+        """The digest column is mutable, so matching it proves nothing on its own.
+
+        What makes the binding real is that the action id is a hash PREIMAGE of the digest:
+        the reader recomputes the id from the stored row, which a coordinated rewrite —
+        same workspace, same lane — cannot survive.
+        """
+        action = self._tagged()
+        forged = IdentityManifest(
+            workspace_id="wA",
+            lane_id="issue_14741",
+            slots=(
+                IdentityManifestSlot("codex", "mzb1_wA_codex_lane", False, ""),
+                IdentityManifestSlot("claude", "mzb1_wA_claude_lane", False, ""),
+            ),
+        )
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                "UPDATE startup_identity_manifests SET slots = ?, manifest_digest = ?",
+                (forged.canonical_payload(), forged.digest()),
+            )
+        with self.assertRaises(StartupTransactionError) as ctx:
+            self.fence.read_identity_manifest(action.action_id)
+        self.assertIn(REASON_RECEIPT_REQUIREMENT_UNAVAILABLE, str(ctx.exception))
+
+    def test_f2_the_generic_read_refuses_a_tagged_action_with_no_manifest(self) -> None:
+        """rollback / status / current-action all consume THIS read."""
+        action = self._tagged()
+        with sqlite3.connect(self.path) as conn:
+            conn.execute("DELETE FROM startup_identity_manifests")
+        with self.assertRaises(StartupTransactionError) as ctx:
+            self.fence.read(action.action_id)
+        self.assertIn(REASON_RECEIPT_REQUIREMENT_UNAVAILABLE, str(ctx.exception))
+
+    def test_f2_a_legacy_action_read_is_unaffected(self) -> None:
+        action = self.fence.reserve(UNIT, "legacy-nonce")
+        self.assertIsNotNone(self.fence.read(action.action_id))
+
+    def test_f3_the_manifest_must_be_the_whole_plan(self) -> None:
+        codex_only = IdentityManifest(
+            workspace_id="wA",
+            lane_id="issue_14741",
+            slots=(IdentityManifestSlot("codex", "mzb1_wA_codex_lane", True, DIGEST),),
+        )
+        extra = IdentityManifest(
+            workspace_id="wA",
+            lane_id="issue_14741",
+            slots=(
+                IdentityManifestSlot("codex", "mzb1_wA_codex_lane", True, DIGEST),
+                IdentityManifestSlot("claude", "mzb1_wA_claude_lane", False, ""),
+                IdentityManifestSlot("fakex", "mzb1_wA_fakex_lane", False, ""),
+            ),
+        )
+        duplicate = IdentityManifest(
+            workspace_id="wA",
+            lane_id="issue_14741",
+            slots=(
+                IdentityManifestSlot("codex", "mzb1_wA_codex_lane", True, DIGEST),
+                IdentityManifestSlot("codex", "mzb1_wA_codex_two", False, ""),
+                IdentityManifestSlot("claude", "mzb1_wA_claude_lane", False, ""),
+            ),
+        )
+        for label, bad in (("partial", codex_only), ("extra", extra), ("dup", duplicate)):
+            with self.subTest(label=label):
+                with self.assertRaises(StartupTransactionError):
+                    self.fence.reserve(UNIT, f"nonce-{label}", manifest=bad)
+
+    def test_f5_a_foreign_named_table_is_never_written_into(self) -> None:
+        """Zero-mutation: the named table's shape must be exactly what this build creates."""
+        for label, ddl in (
+            ("extra column", "CREATE TABLE startup_identity_manifests (action_id TEXT NOT NULL PRIMARY KEY, workspace_id TEXT NOT NULL, lane_id TEXT NOT NULL, protocol TEXT NOT NULL, slots TEXT NOT NULL, manifest_digest TEXT NOT NULL, nonce TEXT NOT NULL, recorded_at TEXT NOT NULL, extra TEXT)"),
+            ("no primary key", "CREATE TABLE startup_identity_manifests (action_id TEXT NOT NULL, workspace_id TEXT NOT NULL, lane_id TEXT NOT NULL, protocol TEXT NOT NULL, slots TEXT NOT NULL, manifest_digest TEXT NOT NULL, nonce TEXT NOT NULL, recorded_at TEXT NOT NULL)"),
+            ("type drift", "CREATE TABLE startup_identity_manifests (action_id TEXT NOT NULL PRIMARY KEY, workspace_id TEXT NOT NULL, lane_id TEXT NOT NULL, protocol TEXT NOT NULL, slots BLOB NOT NULL, manifest_digest TEXT NOT NULL, nonce TEXT NOT NULL, recorded_at TEXT NOT NULL)"),
+            ("notnull drift", "CREATE TABLE startup_identity_manifests (action_id TEXT NOT NULL PRIMARY KEY, workspace_id TEXT NOT NULL, lane_id TEXT NOT NULL, protocol TEXT NOT NULL, slots TEXT, manifest_digest TEXT NOT NULL, nonce TEXT NOT NULL, recorded_at TEXT NOT NULL)"),
+        ):
+            with self.subTest(label=label):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                path = Path(tmp.name) / "s.sqlite"
+                fence = StartupTransactionFence(path)
+                fence.reserve(UNIT, "seed")  # legacy reserve bootstraps the store
+                with sqlite3.connect(path) as conn:
+                    conn.execute(ddl)
+                    before = conn.execute(
+                        "SELECT COUNT(*) FROM startup_identity_manifests"
+                    ).fetchone()[0]
+                with self.assertRaises(StartupTransactionError):
+                    fence.reserve(UNIT, "nonce-1", manifest=_manifest())
+                with sqlite3.connect(path) as conn:
+                    after = conn.execute(
+                        "SELECT COUNT(*) FROM startup_identity_manifests"
+                    ).fetchone()[0]
+                    actions = conn.execute(
+                        "SELECT COUNT(*) FROM startup_actions"
+                    ).fetchone()[0]
+                self.assertEqual(after, before, "zero mutation of a foreign table")
+                self.assertEqual(actions, 1, "and no action row was added either")
+
+    def test_f5_an_unrelated_sibling_table_is_tolerated(self) -> None:
+        """Scope correction (j#96931): only the NAMED table's shape is policed."""
+        self.fence.reserve(UNIT, "seed")
+        with sqlite3.connect(self.path) as conn:
+            conn.execute("CREATE TABLE somebody_elses_sidecar (a TEXT)")
+        action = self.fence.reserve(UNIT, "nonce-1", manifest=_manifest())
+        self.assertIsNotNone(self.fence.read_identity_manifest(action.action_id))
+
+    def test_f6_a_trailing_newline_or_control_character_is_not_a_valid_id(self) -> None:
+        legacy = startup_action_id(UNIT, "nonce-1")
+        tagged = startup_action_id(
+            UNIT,
+            "nonce-1",
+            capability=CAPABILITY_IDENTITY_RECEIPT,
+            manifest_digest=_manifest().digest(),
+        )
+        for bad in (legacy + "\n", tagged + "\n", legacy + "\t", " " + tagged, tagged + "\x00"):
+            with self.subTest(bad=repr(bad)):
+                with self.assertRaises(StartupTransactionError):
+                    action_capability(bad)
+
+    def test_f9_an_unknown_manifest_protocol_is_refused(self) -> None:
+        future = IdentityManifest(
+            workspace_id="wA",
+            lane_id="issue_14741",
+            protocol="future-v9",
+            slots=(
+                IdentityManifestSlot("codex", "mzb1_wA_codex_lane", True, DIGEST),
+                IdentityManifestSlot("claude", "mzb1_wA_claude_lane", False, ""),
+            ),
+        )
+        with self.assertRaises(ValueError):
+            future.canonical_payload()
+        with self.assertRaises(StartupTransactionError):
+            self.fence.reserve(UNIT, "nonce-1", manifest=future)
 
 
 if __name__ == "__main__":

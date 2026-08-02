@@ -33,7 +33,7 @@ from mozyo_bridge.core.state.startup_transaction_fence import (
     StartupTransactionFence,
     StartupTransactionError,
     StartupUnit,
-    startup_action_id,
+    resolve_reserve_identity,
     startup_action_id_matching,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (  # noqa: E501
@@ -451,8 +451,13 @@ def launch_or_resume_v1_replacement(
         return
 
     nonce = binding_store.new_startup_nonce()
-    startup_id = startup_action_id(
-        StartupUnit(workspace_id, lane_id, startup_providers), nonce
+    # Redmine #14741 audit j#96931 F8: mint through the SAME helper `reserve` uses, so the
+    # id stored in the durable binding and the id the eventual reserve actually mints can
+    # never diverge. A replacement launch builds no launch manifest today, so both sides
+    # resolve the legacy id; when replacement launches become receipt-capable there is
+    # exactly ONE place that decides, instead of two that must be kept in step.
+    startup_id, _digest, _payload = resolve_reserve_identity(
+        StartupUnit(workspace_id, lane_id, startup_providers).canonical(), nonce, None
     )
     if intent is None:
         try:
