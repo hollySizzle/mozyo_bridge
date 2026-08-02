@@ -53,8 +53,16 @@ from mozyo_bridge.core.state.replacement_transaction_model import (
     ReplacementTransactionRecord,
 )
 from mozyo_bridge.core.state.launch_identity_receipt import (
+    CONSUME_ABSENT,
+    CONSUME_FOREIGN,
     CONSUME_OK,
     CONSUME_REPLAY,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_evidence_completion import (  # noqa: E501
+    COMPLETION_CAUSE_MISMATCH,
+    COMPLETION_FOREIGN_WORKSPACE,
+    COMPLETION_INCOMPLETE,
+    COMPLETION_UNAVAILABLE,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_actuator_ops import (  # noqa: E501
     ExactGenerationActuatorPort,
@@ -126,6 +134,52 @@ class ActuationResult:
             "detail": self.detail,
             "preservation_reasons": list(self.preservation_reasons),
         }
+
+
+#: Every answer the actuator will act on, as exact closed tokens. An injected port is not
+#: the actuator's code: whatever it returns is INPUT, and input does not get rendered into a
+#: public detail (audit j#97136 F1). A newline, an ANSI escape, a workflow marker or an
+#: object with an opinionated ``__format__`` would otherwise reach the surface verbatim.
+COMPLETION_SUCCESS_OUTCOMES = (CONSUME_OK, CONSUME_REPLAY)
+#: The typed refusals this build knows how to name.
+COMPLETION_KNOWN_FAILURES = (
+    CONSUME_ABSENT,
+    CONSUME_FOREIGN,
+    COMPLETION_CAUSE_MISMATCH,
+    COMPLETION_FOREIGN_WORKSPACE,
+    COMPLETION_INCOMPLETE,
+    COMPLETION_UNAVAILABLE,
+)
+#: Anything else -- an unknown token, a non-``str``, or a port that raised.
+COMPLETION_UNKNOWN = "evidence_completion_unknown_outcome"
+#: Closed, fixed text per outcome. Built from the token constants themselves, so the detail
+#: can only ever be one of these literals.
+COMPLETION_FAILURE_DETAIL = {
+    token: f"update evidence not discharged ({token})"
+    for token in COMPLETION_KNOWN_FAILURES + (COMPLETION_UNKNOWN,)
+}
+
+
+def _completion_outcome(port, key, pin, replacement_action_id: str) -> str:
+    """Call the completion port and reduce its answer to a token this build knows.
+
+    ``type(outcome) is str`` and membership in the closed set, in that order: a ``str``
+    subclass decides for itself what ``==`` means, and an arbitrary object should never be
+    compared at all. ``KeyboardInterrupt`` / ``SystemExit`` are NOT caught -- those are the
+    process dying, and the whole point of consuming here is that dying at this moment is
+    survivable.
+    """
+    try:
+        outcome = port(key, pin, replacement_action_id=replacement_action_id)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:  # noqa: BLE001 - an unusable port leaves the participant owed
+        return COMPLETION_UNKNOWN
+    if type(outcome) is not str:
+        return COMPLETION_UNKNOWN
+    if outcome in COMPLETION_SUCCESS_OUTCOMES or outcome in COMPLETION_KNOWN_FAILURES:
+        return outcome
+    return COMPLETION_UNKNOWN
 
 
 def _pin_carries_evidence(pin) -> bool:
@@ -717,8 +771,8 @@ class ReplacementActuatorUseCase:
                     revision=fresh.revision, stopped_on=pin.identity,
                     detail="no update-evidence completion port is wired",
                 )
-            outcome = self._evidence_completion(
-                key, pin, replacement_action_id=rec.action_id
+            outcome = _completion_outcome(
+                self._evidence_completion, key, pin, rec.action_id
             )
             if outcome not in (CONSUME_OK, CONSUME_REPLAY):
                 # `replay` is this SAME replacement action having already consumed it, which
@@ -728,7 +782,7 @@ class ReplacementActuatorUseCase:
                 return ActuationResult(
                     status=ACTUATION_EFFECT_FAILED, phase=fresh.phase,
                     revision=fresh.revision, stopped_on=pin.identity,
-                    detail=f"update evidence not discharged ({outcome})",
+                    detail=COMPLETION_FAILURE_DETAIL[outcome],
                 )
             rec, now = fresh, self._clock()
         cas = self._store.transition_participant(

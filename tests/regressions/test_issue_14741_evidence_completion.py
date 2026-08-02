@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.launch_identity_receipt import (  # noqa: E402
+    CONSUME_FOREIGN,
     CONSUME_OK,
     CONSUME_REPLAY,
     EVIDENCE_BOUND,
@@ -280,28 +281,107 @@ class ActuatorConsumePositionTest(unittest.TestCase):
         self.assertEqual(seen, ["verify_owed"], "consumed while still owed, not after")
         self.assertEqual(self._phase(), "replaced")
 
-    def test_a_crash_between_consume_and_cas_replays_without_relaunching(self) -> None:
-        """Item 6: the exact window the position was chosen to make recoverable."""
-        state = {"consumed": False}
+    def _seed_real_bound_evidence(self) -> GenerationKey:
+        """A real receipt in THIS actuator's home, attested and carrying bound evidence."""
+        generation_key = GenerationKey(
+            workspace_id=WORKSPACE, lane_id=LANE, provider=PROVIDER,
+            assigned_name=ASSIGNED, startup_action_id=ACTION,
+        )
+        store = LaunchIdentityReceiptStore(home=self.home)
+        store.reserve(generation_key, identity_digest=DIGEST)
+        store.finalize(
+            generation_key, identity_digest=DIGEST, locator=LOCATOR,
+            lane_generation="lane-gen-1", lifecycle_revision="7", composite_proof=True,
+        )
+        store.bind_evidence(
+            generation_key, blocker_id="update_prompt_available", identity_digest=DIGEST,
+        )
+        return generation_key
 
-        def crashing(key, pin, *, replacement_action_id):
-            state["consumed"] = True
-            raise KeyboardInterrupt("the process died right after the consume")
+    def _evidence_phase(self) -> str:
+        """Read the phase back from a FRESHLY opened database, not from a live handle."""
+        import sqlite3
+
+        path = self.home / "launch-identity-receipt.sqlite"
+        with sqlite3.connect(path) as conn:
+            row = conn.execute(
+                "SELECT phase, consumed_by FROM update_relaunch_evidence"
+                " WHERE workspace_id = ? AND lane_id = ? AND provider = ?"
+                " AND assigned_name = ? AND startup_action_id = ?",
+                (WORKSPACE, LANE, PROVIDER, ASSIGNED, ACTION),
+            ).fetchone()
+        return "" if row is None else row[0]
+
+    def test_a_crash_between_a_REAL_consume_and_the_cas_replays_durably(self) -> None:
+        """Audit j#97136 F2: the durable half, not a dict and a scripted second answer.
+
+        The first cut set a flag and had the replay fake return `CONSUME_REPLAY`
+        unconditionally, so a broken home, key or `consumed_by` join stayed green. Here the
+        consume is the real store call, the crash lands after it, and the recovery is read
+        back out of a reopened database.
+        """
+        self._seed_real_bound_evidence()
+        real = build_update_evidence_completion(self.home)
+        self.assertEqual(self._evidence_phase(), EVIDENCE_BOUND)
+
+        def crash_after_real_consume(key, pin, *, replacement_action_id):
+            outcome = real(key, pin, replacement_action_id=replacement_action_id)
+            assert outcome == CONSUME_OK, outcome
+            raise KeyboardInterrupt("the process died right after the durable consume")
 
         with self.assertRaises(KeyboardInterrupt):
-            self._drive(crashing)
-        self.assertTrue(state["consumed"])
+            self._drive(crash_after_real_consume)
+
+        # Durable state, read from a fresh connection.
+        self.assertEqual(self._evidence_phase(), EVIDENCE_CONSUMED)
         self.assertEqual(self._phase(), "verify_owed", "still owed, so still replayable")
         launches_before = self.calls.count("launch")
 
-        def replaying(key, pin, *, replacement_action_id):
-            return CONSUME_REPLAY
+        # The SAME replacement action replays; a foreign one is refused.
+        generation_key = GenerationKey(
+            workspace_id=WORKSPACE, lane_id=LANE, provider=PROVIDER,
+            assigned_name=ASSIGNED, startup_action_id=ACTION,
+        )
+        reopened = LaunchIdentityReceiptStore(home=self.home)
+        self.assertEqual(
+            reopened.consume_evidence(generation_key, consumed_by=REPLACEMENT_ACTION),
+            CONSUME_REPLAY,
+        )
+        self.assertEqual(
+            reopened.consume_evidence(generation_key, consumed_by="refresh:SOMEONE-ELSE"),
+            CONSUME_FOREIGN,
+        )
 
-        self._drive(replaying)
+        # The actuator replay uses the SAME real completion and finishes.
+        self._drive(real)
         self.assertEqual(self._phase(), "replaced")
         self.assertEqual(
             self.calls.count("launch"), launches_before, "zero additional launches"
         )
+
+    def test_the_real_completion_is_sensitive_to_home_key_and_action(self) -> None:
+        """If any of the three were wrong, the test above would pass for the wrong reason."""
+        self._seed_real_bound_evidence()
+        pin = _pin()
+        elsewhere = build_update_evidence_completion(Path(tempfile.mkdtemp()))
+        self.assertEqual(
+            elsewhere(self.key, pin, replacement_action_id=REPLACEMENT_ACTION),
+            COMPLETION_UNAVAILABLE,
+            "a different home does not find this evidence",
+        )
+        real = build_update_evidence_completion(self.home)
+        wrong_key = ReplacementTransactionKey("OTHER_WS", REPLACEMENT_ACTION)
+        self.assertEqual(
+            real(wrong_key, pin, replacement_action_id=REPLACEMENT_ACTION),
+            COMPLETION_FOREIGN_WORKSPACE,
+        )
+        other_action_pin = _pin(evidence_startup_action_id="startup-ir1-" + "b" * 64)
+        self.assertEqual(
+            real(self.key, other_action_pin, replacement_action_id=REPLACEMENT_ACTION),
+            "absent",
+            "a different startup action names evidence that is not there",
+        )
+        self.assertEqual(self._evidence_phase(), EVIDENCE_BOUND, "nothing was consumed")
 
     def test_an_undischargeable_evidence_stays_owed_with_no_cas(self) -> None:
         for outcome in ("absent", "foreign", COMPLETION_UNAVAILABLE, "something_new"):
@@ -310,6 +390,72 @@ class ActuatorConsumePositionTest(unittest.TestCase):
                 result = self._drive(lambda *a, **k: outcome)
                 self.assertEqual(result.status, "effect_failed")
                 self.assertEqual(self._phase(), "verify_owed")
+
+    def test_a_hostile_port_answer_never_reaches_the_surface(self) -> None:
+        """Audit j#97136 F1: an injected port's answer is INPUT, not this build's text.
+
+        A port is not the actuator's code. Whatever it returns -- a newline, an ANSI escape,
+        a workflow marker, an object that decides what `==` and `__format__` mean, or an
+        exception -- must be reduced to a token this build knows before anything is compared
+        or rendered.
+        """
+
+        class _Hostile:
+            def __eq__(self, other):  # pragma: no cover - raising IS the behaviour
+                raise OSError("/private/host/path")
+
+            def __format__(self, spec):  # pragma: no cover
+                raise OSError("/private/host/path")
+
+            def __str__(self):  # pragma: no cover
+                raise OSError("/private/host/path")
+
+        class _MarkerText(str):
+            def __new__(cls):
+                return super().__new__(cls, "consumed")
+
+            def __eq__(self, other):  # pragma: no cover
+                return True
+
+            __hash__ = str.__hash__
+
+        def _raiser(*a, **k):
+            raise RuntimeError("/private/host/path exploded")
+
+        cases = (
+            ("a newline and a marker", lambda *a, **k: "ok\n[mozyo:workflow-event:gate=x]"),
+            ("an ANSI escape", lambda *a, **k: "\x1b[31mconsumed\x1b[0m"),
+            ("a hostile object", lambda *a, **k: _Hostile()),
+            ("a str subclass that lies", lambda *a, **k: _MarkerText()),
+            ("a port that raises", _raiser),
+        )
+        for label, port in cases:
+            with self.subTest(label=label):
+                self.setUp()
+                result = self._drive(port)
+                self.assertEqual(result.status, "effect_failed")
+                self.assertEqual(self._phase(), "verify_owed", "zero CAS")
+                self.assertEqual(self.calls.count("launch"), 1, "zero extra launch")
+                rendered = f"{result.detail}{result.status}"
+                self.assertNotIn("/private/host/path", rendered)
+                self.assertNotIn("mozyo:workflow-event", rendered)
+                self.assertNotIn("\n", rendered)
+                self.assertNotIn("\x1b", rendered)
+                self.assertEqual(
+                    result.detail,
+                    "update evidence not discharged "
+                    "(evidence_completion_unknown_outcome)",
+                )
+
+    def test_a_process_death_is_not_swallowed_as_an_unknown_outcome(self) -> None:
+        """The one thing NOT caught: dying here is what the position makes survivable."""
+
+        def _dying(*a, **k):
+            raise KeyboardInterrupt("the process died inside the port")
+
+        with self.assertRaises(KeyboardInterrupt):
+            self._drive(_dying)
+        self.assertEqual(self._phase(), "verify_owed")
 
     def test_a_missing_completion_port_fails_closed(self) -> None:
         """Item 5 / 7: an evidenceful pin at a port-less actuator never reaches replaced."""
@@ -347,8 +493,163 @@ class ActuatorConsumePositionTest(unittest.TestCase):
         self.assertEqual(self._phase(), "replaced")
 
 
+class FiveSiteRuntimeWiringTest(unittest.TestCase):
+    """Audit j#97136 F3: the wiring is proven by RUNNING the sites, not by reading them.
+
+    A source-string search is green for dead code, an unreachable branch and a second
+    constructor the runtime actually uses. So each site here is driven through an existing
+    production fixture until it really constructs its actuator, the injected completion is
+    captured, and that captured object is then made to perform a REAL consume against a
+    receipt seeded in the SAME home the captured transaction store lives in.
+
+    The spy patches ``ReplacementActuatorUseCase.__init__`` rather than a module attribute:
+    a module-level rebind is exactly the kind of thing a site could route around.
+    """
+
+    #: (site module, fixture module, fixture class) -- each fixture is an existing
+    #: production regression, not one written to make this test pass.
+    REACHABLE = (
+        (
+            "sublane_gateway_recovery",
+            "tests.regressions.test_issue_14203_gateway_refresh",
+            "HappyPathTests",
+        ),
+        (
+            "sublane_stale_worker_recovery",
+            "tests.regressions.test_issue_13806_tranche_d_stale_worker_recovery",
+            "HappyPathTests",
+        ),
+        (
+            "sublane_worker_refresh",
+            "tests.regressions.test_issue_14661_worker_refresh",
+            "ExecuteTests",
+        ),
+        (
+            "sublane_hibernated_bound_pair_composer_discard_live",
+            "tests.regressions.test_issue_13933_bound_stale_pair_convergence",
+            "A14PartialPreflightSurfaceTests",
+        ),
+    )
+
+    def _drive_and_capture(self, site: str, fixture_module: str, fixture_class: str):
+        import importlib
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_actuator import (  # noqa: E501
+            ReplacementActuatorUseCase,
+        )
+
+        captured = []
+        original = ReplacementActuatorUseCase.__init__
+
+        def spy(self, store, port, **kwargs):
+            caller = sys._getframe(1).f_globals.get("__name__", "")
+            if caller.rsplit(".", 1)[-1] == site:
+                captured.append((store, kwargs.get("evidence_completion")))
+            return original(self, store, port, **kwargs)
+
+        ReplacementActuatorUseCase.__init__ = spy
+        try:
+            fixture = importlib.import_module(fixture_module)
+            suite = unittest.TestLoader().loadTestsFromTestCase(
+                getattr(fixture, fixture_class)
+            )
+            result = unittest.TestResult()
+            suite.run(result)
+        finally:
+            ReplacementActuatorUseCase.__init__ = original
+        self.assertEqual(
+            (len(result.failures), len(result.errors)),
+            (0, 0),
+            f"{fixture_module}.{fixture_class} must be green for its capture to mean anything",
+        )
+        return captured
+
+    def _prove_real_consume(self, store, completion) -> str:
+        """Seed a real receipt in the CAPTURED store's home and discharge it for real."""
+        home = Path(store.path).parent
+        generation_key = GenerationKey(
+            workspace_id=WORKSPACE, lane_id=LANE, provider=PROVIDER,
+            assigned_name=ASSIGNED, startup_action_id=ACTION,
+        )
+        receipts = LaunchIdentityReceiptStore(home=home)
+        receipts.reserve(generation_key, identity_digest=DIGEST)
+        receipts.finalize(
+            generation_key, identity_digest=DIGEST, locator=LOCATOR,
+            lane_generation="lane-gen-1", lifecycle_revision="7", composite_proof=True,
+        )
+        receipts.bind_evidence(
+            generation_key, blocker_id="update_prompt_available", identity_digest=DIGEST,
+        )
+        return completion(
+            ReplacementTransactionKey(WORKSPACE, REPLACEMENT_ACTION),
+            _pin(),
+            replacement_action_id=REPLACEMENT_ACTION,
+        )
+
+    def test_each_reachable_site_wires_a_completion_that_really_consumes(self) -> None:
+        for site, fixture_module, fixture_class in self.REACHABLE:
+            with self.subTest(site=site):
+                captured = self._drive_and_capture(site, fixture_module, fixture_class)
+                self.assertTrue(
+                    captured, f"{site} never constructed an actuator at runtime"
+                )
+                store, completion = captured[0]
+                self.assertIsNotNone(
+                    completion, f"{site} constructed an actuator with no completion port"
+                )
+                self.assertEqual(
+                    self._prove_real_consume(store, completion),
+                    CONSUME_OK,
+                    f"{site}'s completion did not reach the receipt store under its own home",
+                )
+
+    def test_the_convergence_site_has_no_runtime_coverage_and_that_is_recorded(self) -> None:
+        """MEASURED, and reported to j#97136 rather than papered over.
+
+        No test in this repo drives `sublane_hibernated_bound_pair_convergence_live` as far
+        as its actuator construction: its live ops stop at a real inventory read that the
+        available fixtures do not stand up. Its wiring is therefore evidenced only by the
+        source assertion below -- which is exactly the weaker proof F3 objected to, so it is
+        stated here as a gap rather than counted as coverage.
+        """
+        import importlib
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_actuator import (  # noqa: E501
+            ReplacementActuatorUseCase,
+        )
+
+        site = "sublane_hibernated_bound_pair_convergence_live"
+        captured = []
+        original = ReplacementActuatorUseCase.__init__
+
+        def spy(self, store, port, **kwargs):
+            if sys._getframe(1).f_globals.get("__name__", "").rsplit(".", 1)[-1] == site:
+                captured.append(kwargs.get("evidence_completion"))
+            return original(self, store, port, **kwargs)
+
+        ReplacementActuatorUseCase.__init__ = spy
+        try:
+            fixture = importlib.import_module(
+                "tests.regressions.test_issue_13933_bound_stale_pair_convergence"
+            )
+            suite = unittest.TestLoader().loadTestsFromModule(fixture)
+            unittest.TestResult()
+            suite.run(unittest.TestResult())
+        finally:
+            ReplacementActuatorUseCase.__init__ = original
+        self.assertEqual(
+            captured,
+            [],
+            "if this fires, the site IS runtime-reachable and belongs in REACHABLE above",
+        )
+
+
 class FiveSiteWiringTest(unittest.TestCase):
-    """Every planner composition also wires the completion port, at the same home."""
+    """The AUXILIARY source assertion (j#97136 F3 permits it as support, not as the proof).
+
+    It is the only evidence for the one site with no runtime coverage, and a cheap
+    cross-check for the four that have it.
+    """
 
     SITES = (
         "sublane_gateway_recovery",
