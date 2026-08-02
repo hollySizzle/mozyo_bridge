@@ -58,6 +58,94 @@ def updater_target_resolver_for(receiver: str) -> Optional[Callable[[str], Any]]
     return builtin_updater_target_probe() if is_supported_provider(receiver) else None
 
 
+def resolve_generation_key(receiver: str, locator: str, *, home: Any = None):
+    """The EXACT generation living at ``locator`` right now, or ``None`` (audit j#96966 C14).
+
+    The launch-generation store is the authority for this question, and the receipt store
+    deliberately is not. A reservation there atomically supersedes the previous row for the
+    same slot, so "which generation is at this pane" has exactly one current answer; the
+    receipt store, by contrast, keeps every generation's row, so searching IT by locator
+    could attach a live screen to a stale attested row from an earlier generation. That is
+    the defect C14 names, and the fix is to ask a different store — not to search the same
+    one more carefully.
+
+    Requires exactly one ATTESTED generation at the locator. Zero means nothing to bind to;
+    more than one means the host is in a state where the question has no answer, and both
+    are ``None`` rather than a guess.
+    """
+    from mozyo_bridge.core.state.herdr_launch_generation import (
+        GENERATION_ATTESTED,
+        HerdrLaunchGenerationError,
+        HerdrLaunchGenerationStore,
+    )
+    from mozyo_bridge.core.state.launch_identity_receipt import GenerationKey
+
+    provider = str(receiver or "").strip()
+    pane = str(locator or "").strip()
+    if not provider or not pane:
+        return None
+    store = HerdrLaunchGenerationStore(home=home)
+    try:
+        names = store.assigned_names()
+        if not names:
+            return None
+        matches = []
+        for name in sorted(names):
+            generation = store.read(name)
+            if (
+                generation is not None
+                and generation.phase == GENERATION_ATTESTED
+                and generation.locator == pane
+                and generation.role == provider
+            ):
+                matches.append(generation)
+    except (HerdrLaunchGenerationError, OSError):
+        return None
+    if len(matches) != 1:
+        return None
+    found = matches[0]
+    return GenerationKey(
+        workspace_id=found.workspace_id,
+        lane_id=found.lane_id,
+        provider=found.role,
+        assigned_name=found.assigned_name,
+        startup_action_id=found.startup_action_id,
+    )
+
+
+def record_update_evidence(receiver: str, target: str, blocker_id: str) -> None:
+    """Bind durable update-relaunch evidence to the EXACT generation at ``target``.
+
+    The answer to j#96871 Q3: a self-heal that fires after the gateway has vanished has no
+    pane left to read, but the screen WAS observed here, while the process was alive.
+
+    Only an update-derived screen produces evidence — a trust or login prompt says nothing
+    about which binary an update would reach. And nothing is swallowed (audit j#96966 C14 /
+    C12): a receipt-capable generation whose evidence cannot be recorded surfaces its
+    failure. The send is being refused either way at this point, so the only thing a
+    swallow would buy is a quieter refusal that lost the fact.
+    """
+    from mozyo_bridge.core.state.launch_identity_receipt import LaunchIdentityReceiptStore
+    from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter import (  # noqa: E501
+        is_update_derived_blocker,
+    )
+
+    if not is_update_derived_blocker(receiver, blocker_id):
+        return
+    key = resolve_generation_key(receiver, target)
+    if key is None:
+        # No single attested generation at this pane: there is nothing this observation can
+        # be bound TO. Recording it against a guess is the mis-binding C14 forbids.
+        return
+    store = LaunchIdentityReceiptStore()
+    receipt = store.read_receipt(key)
+    if receipt is None or not receipt.attested:
+        return
+    store.bind_evidence(
+        key, blocker_id=blocker_id, identity_digest=receipt.identity_digest
+    )
+
+
 def admit_receiver_startup_or_die(*, receiver: str, **kwargs: Any) -> None:
     """Compose the provider-specific resolver, then run the provider-neutral gate.
 
@@ -66,7 +154,13 @@ def admit_receiver_startup_or_die(*, receiver: str, **kwargs: Any) -> None:
     fence deliberately) always wins — this only supplies the default for a real send.
     """
     kwargs.setdefault("updater_targets", updater_target_resolver_for(receiver))
+    kwargs.setdefault("on_startup_blocker", record_update_evidence)
     _admit_with_gate(receiver=receiver, **kwargs)
 
 
-__all__ = ("admit_receiver_startup_or_die", "updater_target_resolver_for")
+__all__ = (
+    "admit_receiver_startup_or_die",
+    "record_update_evidence",
+    "resolve_generation_key",
+    "updater_target_resolver_for",
+)
