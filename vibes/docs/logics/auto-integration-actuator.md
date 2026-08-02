@@ -188,7 +188,10 @@ object-level merge は plumbing であり、`git merge` と **同値ではない
 
 ### 決定性: 何を enforce しているかを正確に述べる (F1)
 
-契約は「**同一 repository 内容に対し、同一 action は同一 commit を再構築する**」である。
+契約は「**同一 git version の下で、同一 repository 内容に対し、同一 action は同一 commit を
+再構築する**」である。git binary そのものは pin できないため、version 条件は契約の一部であり
+省略できない (R18 まで本節だけがこの条件を落としており、同 doc の current contract 節と矛盾していた
+— j#96461 F4)。
 R11 が書いた「入力は arguments のみ / どの host でも同じ」は **不正確だった**。到達までに 2 度
 訂正している:
 
@@ -291,7 +294,15 @@ driver も `info/attributes` も **sandbox から見えない**ので、宣言�
   **literal `git check-ref-format refs/heads/<name>` を sealed env で** の両方を通ること
   (どちらも他方を包含しない。j#96422 F3。`--branch` は `@{-n}` を repository state から展開するため
   validator ではない — j#96447 F1)。control 文字を含む ref は process argv に渡せないため事前に
-  `invalid_input` (j#96453 F2)。**dedicated integration worktree は存在しない** (j#96406 F1)。
+  `invalid_input` (j#96453 F2)。ref の検査は **spelling そのもの**に対して行い、adapter は trim
+  しない — R18 は trim してから検査したため `'ma in'` を拒否しつつ `' main '` / `'main\n'` を
+  黙って `main` へ書き換えていた (j#96461 F2)。**周囲 whitespace の trim は record 生成時の
+  `normalized_branch` が 1 回だけ行う** upstream の工程であり、adapter 層ではない。
+  さらに **typed 拒否は apply path だけでは足りない**: actuator は apply の前に必ず target ref で
+  remote tip を読むため、**read probe は raise せず自身の fail-closed 値 (`""` / `False`) を返す**。
+  raise を保つのは mutation (`push_non_force`) のみで、そこには caller が無視し得る戻り値が無い
+  (j#96461 F2 — R18 は read から例外が抜けて run 全体が落ちた)。
+  **dedicated integration worktree は存在しない** (j#96406 F1)。
   **commit は「同一 git version の下で、同一 repository 内容に対し」再構築可能**であり、
   hook 非実行・無署名 (上節)。
 - **merge の失敗は typed status** で、**durable な `StepOutcome.merge_status` field に載り、
@@ -304,6 +315,12 @@ driver も `info/attributes` も **sandbox から見えない**ので、宣言�
   `nondeterministic_merge_config` / `sandbox_error` / `merge_error` / `commit_error` /
   `unrecognized_status`。`sandbox_error` は「隔離を構築できなかった / object store を特定できなかった」
   であり、非決定的 config の検出ではない (j#96441 F3)。
+  **sandbox lifecycle の 3 段階は、構造を分けるだけでなく 3 段階とも typed に着地する**:
+  setup 失敗 = `sandbox_error`、**body (merge 実行中) の失敗 = `merge_error`**、teardown 失敗 =
+  `sandbox_error`。**優先順位は teardown > body** — sandbox が残っている事実の方が operator が
+  対処すべき事実だからである。R17 は 3 段階を 1 つの `@contextmanager` に入れて
+  `generator didn't stop after throw()` を出し、R18 は分割したが body の例外を変換せず raw
+  `OSError` が caller へ抜けた (j#96461 F1)。**構造分割は typed 着地の代わりにならない。**
   **exit code だけで分類しない** — missing object は content conflict と同じ rc=1 で返る (実測)。
   conflict は tree を名乗り、operational failure は名乗らない。可用性は **version probe** で確かめ、
   **probe 自体が失敗したら `probe_error`** であって不可用ではない (j#96417 F3)。

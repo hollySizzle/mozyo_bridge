@@ -52,7 +52,10 @@ What the adapter can and cannot express is the safety story, so it is enumerated
 
 Every probe fails closed: a ``git`` that could not run has proven nothing, so a failed
 invocation reads as the unsafe answer (not a workspace, not an ancestor, not reachable,
-dirty) rather than as a permissive one. The spawn-failure mapping mirrors
+dirty) rather than as a permissive one. A ref name that could not be handed to ``git`` in the
+first place is the same kind of answer and is returned the same way — the reads refuse by
+value, and only the mutations refuse by raising, because only they have no return value a
+caller could ignore (j#96461 finding 2). The spawn-failure mapping mirrors
 :meth:`...application.sublane_integration.LiveSublaneGitOperations._run` — a missing ``cwd``
 after a host reboot (#14499) raises ``FileNotFoundError`` rather than exiting non-zero, and
 letting that escape a read-only preflight is how six production runs ended in tracebacks.
@@ -63,10 +66,9 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, Optional, Tuple
+from typing import Optional, Tuple
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_actuator import (
     MERGE_COMMIT_ERROR,
@@ -107,20 +109,35 @@ def _is_full_sha(value: str) -> bool:
 class UnsafeRefspecError(ValueError):
     """A ref name could not be turned into a provably non-force refspec.
 
-    Raised rather than returned: this is not a gate a caller may observe and proceed past.
-    A branch name carrying ``+``, whitespace, or a leading ``-`` would change what the
-    constructed ``git push`` argv *means* — ``+`` spells a force inside a refspec, and a
-    leading ``-`` turns the value into an option — so the argv is never built at all.
+    Raised by the MUTATIONS, which have nowhere to put a refusal: a branch name carrying
+    ``+``, whitespace, or a leading ``-`` would change what the constructed ``git push`` argv
+    *means* — ``+`` spells a force inside a refspec, and a leading ``-`` turns the value into
+    an option — so for a push the argv is never built at all, and the caller is not offered a
+    return value it could ignore.
+
+    The READ probes catch it instead and answer their own fail-closed value (``""``, ``False``):
+    a read that cannot answer has refused, and the actuator's preflight performs those reads
+    before it reaches the apply that would have classified the same input as ``invalid_input``.
+    R18 let this escape out of a read and take the whole run down (j#96461 finding 2).
     """
 
 
 def _checked_branch(ref: str) -> str:
     """Return ``ref`` as a bare branch name, or raise :class:`UnsafeRefspecError`.
 
-    Accepts either ``<branch>`` or ``refs/heads/<branch>`` and normalizes to the bare name,
-    so the caller's target ref spelling does not decide whether the refspec is safe.
+    Accepts either ``<branch>`` or ``refs/heads/<branch>`` and normalizes to the bare name, so
+    that one spelling choice — how the caller qualifies the ref — does not decide whether the
+    refspec is safe. That is the ONLY normalization performed here; everything else about the
+    name is judged as written.
     """
-    candidate = (ref or "").strip()
+    # No `.strip()`. R18 trimmed first and checked afterwards, so `'ma in'` was refused while
+    # `' main '` and `'main\n'` were silently rewritten to `main` — the same character
+    # accepted or rejected depending on where in the name it sat (j#96461 finding 2). This
+    # function's job is to answer whether the ref AS SPELLED can be handed to git, so a
+    # spelling it would have to be repaired to be usable is not one it can vouch for. Trimming
+    # a configured value is a separate, deliberate step that happens once, upstream, in
+    # `normalized_branch` when the action record is formed.
+    candidate = ref or ""
     if candidate.startswith("refs/heads/"):
         candidate = candidate[len("refs/heads/") :]
     if not candidate:
@@ -159,7 +176,7 @@ class LiveAutoIntegrationGitOperations:
     remote: str = DEFAULT_REMOTE
     #: The sanitized git directory an object-building call is currently running in, and the
     #: repository object store it writes through. Set only for the duration of
-    #: :meth:`_sanitized_git_dir`; ``None`` everywhere else, so a sealed call outside one
+    #: :meth:`_open_sandbox`; ``None`` everywhere else, so a sealed call outside one
     #: raises rather than quietly running against the repository.
     _sandbox: Optional[Path] = field(default=None, init=False, repr=False, compare=False)
     _sandbox_objects: Optional[Path] = field(
@@ -265,8 +282,21 @@ class LiveAutoIntegrationGitOperations:
         ``refs/remotes/*`` tracking refs — a stale tracking ref can assert a tip the remote
         no longer has, and #14066 fixed exactly that class of false reachability proof for
         the sibling terminal-retire path. No fetch, no ref update, no mutation.
+
+        An unusable ref name is a probe that cannot answer, not a crash. R18 let
+        :class:`UnsafeRefspecError` out of this read, and the actuator calls it from
+        :meth:`AutoIntegrationUseCase._measure` **before** the apply that turns the same input
+        into ``invalid_input`` — so a target ref carrying a NUL, a tab or a ``+`` took down
+        the whole run instead of being refused by it (reproduced end to end, j#96461
+        finding 2). The distinction the raise was protecting is real but belongs to the
+        MUTATIONS: :meth:`push_non_force` still refuses to build an argv it cannot prove
+        non-force. A read that returns ``""`` is already fail-closed — an empty tip matches no
+        expected head, satisfies no reachability, and authorizes nothing.
         """
-        name = _checked_branch(branch)
+        try:
+            name = _checked_branch(branch)
+        except UnsafeRefspecError:
+            return ""
         result = self._run(
             "ls-remote", "--heads", "--end-of-options", self.remote, f"refs/heads/{name}"
         )
@@ -355,7 +385,7 @@ class LiveAutoIntegrationGitOperations:
     #: matter — three rounds running I wrote "the inputs are only X" and was wrong (j#96412,
     #: j#96417, j#96422). What IS claimed: these are pinned, the environment is built rather
     #: than inherited, replace refs are off, and the merge runs in a git directory where
-    #: the repository's own config and attributes do not exist (:meth:`_sanitized_git_dir`).
+    #: the repository's own config and attributes do not exist (:meth:`_open_sandbox`).
     _DETERMINISTIC_CONFIG: Tuple[str, ...] = (
         "-c",
         "i18n.commitEncoding=UTF-8",
@@ -382,7 +412,7 @@ class LiveAutoIntegrationGitOperations:
         # The USER attributes file is config-selected, so `-c` reaches it; the system one is
         # a compiled-in path, disabled by `GIT_ATTR_NOSYSTEM` in the sealed environment. The
         # repository's own `.git/info/attributes` is neither reachable nor needed to be: the
-        # merge does not run in a directory that has one (:meth:`_sanitized_git_dir`).
+        # merge does not run in a directory that has one (:meth:`_open_sandbox`).
         "-c",
         f"core.attributesFile={os.devnull}",
     )
@@ -536,8 +566,8 @@ class LiveAutoIntegrationGitOperations:
         decides the commit's timestamps running in the ambient environment, so a replace ref
         still changed the resulting commit (measured).
 
-        Requires an open :meth:`_sanitized_git_dir`; without one there is no context to run in
-        and the caller has nothing to fall back to.
+        Requires a sandbox opened by :meth:`_open_sandbox`; without one there is no context to
+        run in and the caller has nothing to fall back to.
         """
         if self._sandbox is None or self._sandbox_objects is None:
             raise RuntimeError("a sealed git invocation requires a sanitized git directory")
@@ -619,7 +649,7 @@ class LiveAutoIntegrationGitOperations:
     # review j#96435 finding 1 reproduced a driver added between the probe and the merge doing
     # exactly what the probe existed to prevent. A check in one invocation cannot bind a
     # mutation in another. The merge now runs where those inputs do not exist
-    # (:meth:`_sanitized_git_dir`), which also retires the false positives the refusals caused
+    # (:meth:`_open_sandbox`), which also retires the false positives the refusals caused
     # (an unused driver, an attributes file about other paths) and the feature-stop they
     # implied for repositories that legitimately use either.
 
@@ -739,11 +769,32 @@ class LiveAutoIntegrationGitOperations:
                 expected_target_head=expected_target_head,
                 git_version=git_version,
             )
+        except (OSError, ValueError) as broken:
+            # The BODY failing is an operational failure of this merge, and it lands as one.
+            # R18 split the lifecycle into three steps but converted only two of them: a
+            # filesystem failure during the merge left `apply_merge` raising a raw `OSError`
+            # at its caller, which is the same escape R17's `generator didn't stop after
+            # throw()` was (j#96461 finding 1), wearing a different exception type. The two
+            # caught classes are the ones the process boundary itself produces — `_run` maps
+            # the same pair for the same reason (a NUL in argv is a `ValueError` raised
+            # before any spawn), so nothing that git can do to us leaves this method by
+            # exception.
+            result = MergeResult(
+                status=MERGE_ERROR,
+                detail=(
+                    "the merge failed inside the isolated git directory: "
+                    f"{type(broken).__name__}: {str(broken)[:120]}"
+                ),
+                git_version=git_version,
+            )
         finally:
             leaked = self._close_sandbox(scratch)
         if leaked:
-            # The merge may well have produced a commit; what cannot be reported is success,
-            # because the isolation this design rests on was not fully torn down.
+            # PRECEDENCE, stated rather than implied: a leaked sandbox outranks whatever the
+            # body reported, success or failure. The merge may well have produced a commit,
+            # and the body may instead have failed — either way, what cannot be reported is
+            # that this call is done with, because the isolation the whole design rests on is
+            # not known to have been torn down. That is the fact an operator has to act on.
             return MergeResult(
                 status=MERGE_SANDBOX_ERROR,
                 detail=(

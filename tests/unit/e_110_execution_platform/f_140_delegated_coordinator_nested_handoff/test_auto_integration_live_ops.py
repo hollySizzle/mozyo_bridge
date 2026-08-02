@@ -39,7 +39,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MERGE_ERROR,
     MERGE_INVALID_INPUT,
     MERGE_MERGED,
-    MERGE_NONDETERMINISTIC_CONFIG,
     MERGE_PRIMITIVE_UNSUPPORTED,
     MERGE_PROBE_ERROR,
     AutoIntegrationGitOperations,
@@ -187,7 +186,30 @@ class RefspecSafetyTest(unittest.TestCase):
 
     def test_a_fully_qualified_ref_normalizes_to_its_bare_name(self) -> None:
         self.assertEqual(_checked_branch("refs/heads/feature/x"), "feature/x")
-        self.assertEqual(_checked_branch("  main  "), "main")
+
+    def test_surrounding_whitespace_is_refused_rather_than_trimmed(self) -> None:
+        """j#96461 finding 2: the same character, accepted or rejected by position.
+
+        R18 trimmed and then checked, so ``'ma in'`` was refused while ``' main '`` and
+        ``'main\\n'`` were quietly rewritten to ``main`` — and the design doc's statement that
+        a ref carrying a control character is refused was false for exactly the spellings a
+        stray newline produces. This function answers whether the ref AS SPELLED can be handed
+        to git; trimming a configured value is a separate, deliberate step performed once
+        upstream by ``normalized_branch`` when the action record is formed.
+        """
+        for name in ("  main  ", "\tmain", "main\n", "\nmain\t", "refs/heads/main "):
+            with self.assertRaises(UnsafeRefspecError, msg=repr(name)):
+                _checked_branch(name)
+
+    def test_an_unusable_ref_makes_a_read_probe_answer_nothing_not_raise(self) -> None:
+        # The typed refusal was only on `apply_merge`, which the actuator reaches *after* the
+        # preflight read (j#96461 finding 2). A read that cannot answer answers `""`; only the
+        # mutations still refuse by raising.
+        recorder = _Recorder([])
+        adapter = _adapter(recorder)
+        for name in ("main\x00bad", "main\tbad", "ma+in", "-main", ""):
+            self.assertEqual(adapter.remote_branch_tip(name), "", repr(name))
+        self.assertEqual(recorder.argvs, [], "no git may be spawned for an unusable ref")
 
     def test_the_push_refuses_an_unsafe_target_before_spawning_git(self) -> None:
         recorder = _Recorder([])
@@ -239,7 +261,7 @@ class MergeTest(unittest.TestCase):
 
         The driver and attributes probes are gone: those inputs are not checked any more, they
         are invisible to the merge (j#96435 finding 1). The sandbox itself is faked here — see
-        `_fake_sandbox` for why that is not a gap.
+        `_fake_open_sandbox` for why that is not a gap.
         """
         return [_ok("main"), self._ok_version()]
 

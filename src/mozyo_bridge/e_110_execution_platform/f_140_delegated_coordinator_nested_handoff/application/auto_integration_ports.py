@@ -219,6 +219,12 @@ class AutoIntegrationGitOperations(Protocol):
     def remote_branch_tip(self, branch: str) -> str:
         """The shared remote's CURRENT tip for ``branch``, read fresh (``""`` on failure).
 
+        "On failure" includes a ``branch`` this implementation cannot safely hand to its
+        backend at all: a read that cannot ask the question answers ``""``, it does not raise.
+        The actuator performs this read for the action's target ref *before* the apply that
+        classifies an unusable ref as ``invalid_input``, so an implementation that raises here
+        takes the run down instead of blocking it (j#96461 finding 2).
+
         The target gate's authority. R4 review j#96379 finding 4: the gate used
         :meth:`resolve_head`, a local ``git rev-parse``, while this fresh ``ls-remote`` probe
         already existed on the same adapter and went unused — so a target another clone had

@@ -8,10 +8,11 @@ parent, or what a ref-deleting primitive does to a worktree standing on that ref
 
 What is pinned against a real binary here is that **the merge is built from objects and
 touches no checkout**, and that the same action rebuilds the same commit **on the same git
-version, given the same repository content** — the limit R12-R14 kept overstating. It used to be performed inside a dedicated worktree, with that path's
-identity established by an earlier probe; review j#96406 finding 1 reproduced a foreign lane's
-clean checkout swapped onto the path between the probe and the merge being switched off its
-own branch and having the merge commit built on it — and ``apply_merge`` returned
+version, given the same repository content** — the limit R12-R14 kept overstating. It used to
+be performed inside a dedicated worktree, with that path's identity established by an earlier
+probe; review j#96406 finding 1 reproduced a foreign lane's clean checkout swapped onto the
+path between the probe and the merge being switched off its own branch and having the merge
+commit built on it — and ``apply_merge`` returned
 ``conflicted=False``. A non-force push and an exact-SHA CI gate what *lands*; neither undoes a
 checkout somebody else was standing in. :class:`UseCaseWorktreeSwapRegressionTest` performs
 that swap in the middle of a real ``run_integration`` and asserts the foreign checkout is
@@ -37,6 +38,7 @@ runnable where the binary is not installed.
 """
 from __future__ import annotations
 
+import gc
 import os
 import shutil
 import subprocess
@@ -44,6 +46,7 @@ import sys
 import tempfile
 import time
 import unittest
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -69,6 +72,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MODE_AUTO,
     STEP_INTEGRATION_APPLY,
     AutoIntegrationPolicy,
+    IntegrationActionRecord,
     IntegrationCiEvidence,
     build_integration_action_record,
 )
@@ -189,12 +193,21 @@ class ObjectLevelMergeTest(unittest.TestCase):
 
 @unittest.skipIf(_GIT is None, "git is not available on PATH")
 class DeterministicMergeCommitTest(unittest.TestCase):
-    """The same action rebuilds the same commit — R10 review j#96412 finding 1.
+    """What decides the merge commit, and what it does when it cannot produce one.
 
-    Measured before the fix: one action produced two different SHAs a second apart, because
-    ``commit-tree`` reads the host's ``user.name`` and the clock. The action key covers
-    neither, so a crash between the apply and the ledger receipt left a replay building a
-    *different* object than the one CI would be asked about.
+    It began as the determinism regression for R10 review j#96412 finding 1 — measured before
+    the fix, one action produced two different SHAs a second apart, because ``commit-tree``
+    reads the host's ``user.name`` and the clock, and the action key covers neither, so a crash
+    between the apply and the ledger receipt left a replay building a *different* object than
+    the one CI would be asked about.
+
+    Six rounds of "the inputs are only X" being falsified grew it past that name, and the name
+    is corrected here rather than left to mislead. What is pinned below, against a real binary:
+    the commit is a function of the action (identity, timestamps, config, environment,
+    repository shape); the sandbox the merge runs in is built sealed and hides repository-local
+    state; every stage of that sandbox's lifecycle lands as a typed status rather than an
+    exception; and a ref name git cannot use is refused — by the reads as a fail-closed value,
+    by the apply as ``invalid_input``, and by the whole ``run_integration`` as a blocked run.
     """
 
     def _merge_twice(self, repo: Path, *, name: str, email: str) -> str:
@@ -657,8 +670,19 @@ class DeterministicMergeCommitTest(unittest.TestCase):
         sandbox was acceptable and returned `merged` — a change to the contract accepted in
         j#96449, made without a ruling. And the test it shipped alongside called the real
         cleanup first and *then* raised, so the directory was always removed: the leak path it
-        claimed to cover never executed. This injection removes nothing and asserts the
-        directory survives, so a regression cannot pass by tidying up behind itself.
+        claimed to cover never executed.
+
+        R18's replacement injected at ``TemporaryDirectory.cleanup``, which is the wrong seam
+        (j#96461 finding 3). ``cleanup`` detaches the object's finalizer *before* removing
+        anything, so replacing the whole method leaves the finalizer armed: the interpreter
+        tidied the sandbox up at collection, the path the test recorded did not exist by the
+        time the call returned — and the focused suite said so, out loud, with
+        ``ResourceWarning: Implicitly cleaning up <TemporaryDirectory ...>``. A leak test that
+        does not leak.
+
+        The injection is now at the seam the real failure uses: ``_rmtree``, reached after the
+        detach, which is what makes a production leak permanent. So the directory genuinely
+        survives, and the test says so by looking for it after ``apply_merge`` has returned.
         """
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
@@ -669,26 +693,84 @@ class DeterministicMergeCommitTest(unittest.TestCase):
             _git(repo, "checkout", "-q", "main")
             target = _commit(repo, "target.txt", "moved on")
 
-            original = tempfile.TemporaryDirectory.cleanup
-            leaked: list = []
+            original = tempfile.TemporaryDirectory._rmtree
+            refused: list = []
 
-            def refusing(self) -> None:
-                leaked.append(self.name)
+            def refusing(cls, name: str, *args: object, **kwargs: object) -> None:
+                refused.append(name)
                 raise OSError("simulated: the sandbox cannot be removed")
 
-            tempfile.TemporaryDirectory.cleanup = refusing
+            tempfile.TemporaryDirectory._rmtree = classmethod(refusing)
             try:
-                result = LiveAutoIntegrationGitOperations(repo_root=repo).apply_merge(
-                    source_head=source, target_ref="main", expected_target_head=target
-                )
+                with warnings.catch_warnings(record=True) as raised:
+                    warnings.simplefilter("always")
+                    result = LiveAutoIntegrationGitOperations(repo_root=repo).apply_merge(
+                        source_head=source, target_ref="main", expected_target_head=target
+                    )
+                    gc.collect()  # give any armed finalizer its chance to run
+                    survived = [path for path in refused if Path(path).exists()]
+                    implicit = [
+                        str(warning.message)
+                        for warning in raised
+                        if issubclass(warning.category, ResourceWarning)
+                    ]
             finally:
-                tempfile.TemporaryDirectory.cleanup = original
-                for path in leaked:
+                tempfile.TemporaryDirectory._rmtree = original
+                for path in refused:
                     shutil.rmtree(path, ignore_errors=True)
 
             self.assertEqual(result.status, MERGE_SANDBOX_ERROR, result.detail)
             self.assertEqual(result.integration_head, "")
-            self.assertTrue(leaked, "the injection must have been reached")
+            # Not a vacuous pass: the injection ran, and it ran on THIS interpreter's cleanup
+            # path. A CPython that stops routing removal through `_rmtree` fails here loudly
+            # rather than passing while testing nothing.
+            self.assertTrue(refused, "the injection must have been reached")
+            self.assertEqual(
+                survived, refused, "the sandbox must still be on disk after the call returns"
+            )
+            # And nothing tidied up behind the test — the property R18's version lost.
+            self.assertEqual(implicit, [])
+
+    def test_a_merge_that_fails_mid_flight_is_a_status_not_an_exception(self) -> None:
+        """j#96461 finding 1: the sandbox BODY failing escaped as a raw ``OSError``.
+
+        R17 wrapped setup, use and teardown in one context manager and got ``generator didn't
+        stop after throw()``. R18 split them, which fixed the confusion but converted only the
+        setup and teardown failures: a filesystem failure *during* the merge still left the
+        method raising at its caller — the same escape in different clothing. Both orders are
+        pinned here, including the precedence when the body and the teardown fail together.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            _init(repo)
+            _commit(repo, "a.txt", "base")
+            _git(repo, "checkout", "-q", "-b", "lane")
+            source = _commit(repo, "lane.txt", "reviewed")
+            _git(repo, "checkout", "-q", "main")
+            target = _commit(repo, "target.txt", "moved on")
+
+            class BodyFails(LiveAutoIntegrationGitOperations):
+                def _merge_in(self, *args: object, **kwargs: object):
+                    raise OSError("simulated: the merge could not read the object store")
+
+            result = BodyFails(repo_root=repo).apply_merge(
+                source_head=source, target_ref="main", expected_target_head=target
+            )
+            self.assertEqual(result.status, MERGE_ERROR, result.detail)
+            self.assertEqual(result.integration_head, "")
+            self.assertIn("OSError", result.detail)
+
+            class BothFail(BodyFails):
+                def _close_sandbox(self, scratch: object) -> bool:
+                    super()._close_sandbox(scratch)
+                    return True
+
+            both = BothFail(repo_root=repo).apply_merge(
+                source_head=source, target_ref="main", expected_target_head=target
+            )
+            # Precedence: the leak outranks the body's failure, because "the isolation was
+            # not torn down" is the fact an operator has to act on.
+            self.assertEqual(both.status, MERGE_SANDBOX_ERROR, both.detail)
 
     def test_a_ref_carrying_a_control_character_is_invalid_input(self) -> None:
         """j#96453 finding 2: a NUL made `subprocess.run` raise before git was spawned.
@@ -713,6 +795,81 @@ class DeterministicMergeCommitTest(unittest.TestCase):
                 )
                 self.assertEqual(result.status, MERGE_INVALID_INPUT, repr(name))
                 self.assertEqual(result.integration_head, "", repr(name))
+
+    def test_the_read_probes_refuse_an_unusable_ref_without_raising(self) -> None:
+        """j#96461 finding 2: the typed refusal was only on the path nothing reaches first.
+
+        ``apply_merge`` classified these correctly — and never saw them. The actuator's
+        preflight reads the remote tip for the same ref *before* deciding anything, and that
+        read raised, so an unusable target ref took the run down rather than being refused by
+        it. The port contract says a probe that cannot answer answers ``""``.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            _init(repo)
+            _commit(repo, "a.txt", "base")
+            operations = LiveAutoIntegrationGitOperations(repo_root=repo)
+
+            for name in ("main\x00bad", "main\tbad", "ma+in", "-main", ""):
+                self.assertEqual(operations.remote_branch_tip(name), "", repr(name))
+                # And the reachability question built on it stays fail-closed rather than
+                # inheriting the crash.
+                self.assertFalse(
+                    operations.commit_on_remote("0" * 40, branch=name), repr(name)
+                )
+
+    def test_an_unusable_target_ref_blocks_the_run_instead_of_crashing_it(self) -> None:
+        """The same finding, through ``run_integration`` against a real remote.
+
+        This is the ordering the earlier test could not see: measure, decide, apply. Every one
+        of these refs raised out of the measurement, so the actuator never reached the typed
+        refusal it already had. Nothing may be pushed, and nothing may escape.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "origin.git"
+            subprocess.run(
+                ["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True
+            )
+            repo = root / "repo"
+            _init(repo)
+            base = _commit(repo, "a.txt", "base")
+            _git(repo, "remote", "add", "origin", str(remote))
+            _git(repo, "push", "-q", "origin", "main")
+
+            lane_worktree = root / "lane_wt"
+            _git(repo, "branch", "lane")
+            _git(repo, "worktree", "add", "-q", str(lane_worktree), "lane")
+            source = _commit(lane_worktree, "lane.txt", "reviewed")
+            _git(lane_worktree, "push", "-q", "origin", "lane")
+            before = _git(repo, "ls-remote", "origin")
+
+            for name in ("main\x00bad", "main\tbad", "ma+in"):
+                use_case = AutoIntegrationUseCase(
+                    operations=LiveAutoIntegrationGitOperations(repo_root=repo),
+                    integration_policy=AutoIntegrationPolicy(
+                        mode=MODE_AUTO, integration_branch=name, ff_only=False
+                    ),
+                    authority=_FullyAuthorizedReader(source_head=source),
+                    lane_worktree=str(lane_worktree),
+                    lane_branch="lane",
+                    lane_issue="13686",
+                    lane_generation=1,
+                )
+                report = use_case.run_integration(
+                    IntegrationActionRecord(
+                        issue="13686",
+                        lane_generation=1,
+                        source_head=source,
+                        target_ref=name,
+                        expected_target_head=base,
+                        review_generation="1",
+                    )
+                )
+                self.assertEqual(
+                    [outcome.step for outcome in report.outcomes], [], repr(name)
+                )
+                self.assertEqual(_git(repo, "ls-remote", "origin"), before, repr(name))
 
     def test_an_init_template_cannot_seed_the_sandbox(self) -> None:
         """j#96441 finding 1: the sandbox's own creation was running unsealed.
