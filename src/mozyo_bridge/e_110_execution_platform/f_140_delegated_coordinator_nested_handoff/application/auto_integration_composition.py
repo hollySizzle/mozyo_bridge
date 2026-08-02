@@ -56,6 +56,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     IntegrationRunReport,
     integration_policy_from_config,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_admission_pin import (  # noqa: E501
+    AdmittedActionPin,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ci_source import (  # noqa: E501
     CI_STATE_FAILURE,
     CI_STATE_SUCCESS,
@@ -70,6 +73,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_live_authority import (  # noqa: E501
     LiveDurableAuthorityReader,
+    live_lane_callback_scope,
+    unresolved_lane_callback_debt,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_live_ops import (  # noqa: E501
     LiveAutoIntegrationGitOperations,
@@ -81,15 +86,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_lane_topology import (  # noqa: E501
     committed_config_policy_pointer,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import (  # noqa: E501
-    unresolved_callback_debt,
-)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E501
     LiveRedmineJournalError,
     LiveRedmineJournalSource,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_authority import (  # noqa: E501
     LaneScope,
+    fold_durable_authority,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_policy import (  # noqa: E501
     AutoIntegrationPolicy,
@@ -342,6 +345,7 @@ def build_auto_integration_use_case(
     lifecycle_store: Optional[LaneLifecycleStore] = None,
     inventory_ops: Optional[ManagedInventoryOps] = None,
     callback_outbox: object = None,
+    admission_record: IntegrationActionRecord,
     home: Optional[Path] = None,
     environ: Optional[Mapping[str, str]] = None,
     ci_reader: Optional[CiStatusReader] = None,
@@ -352,6 +356,10 @@ def build_auto_integration_use_case(
     them can pass them; omitting them binds the same live implementations the ``sublane
     hibernate`` path uses. ``callback_outbox`` omitted means the callback debt is unreadable,
     which leaves ``callbacks_drained`` False — an unwired port blocks, it does not waive.
+    ``admission_record`` is required: before opening the durable writer,
+    composition verifies that its review generation is the exact current approved
+    ``review_request`` journal for its source head. There is no production composition path that
+    can omit this check and later acquire mutation capability.
     """
     branches = declared_integration_branches(config)
     if not branches:
@@ -363,6 +371,44 @@ def build_auto_integration_use_case(
             "Declare the branch in .mozyo-bridge/config.yaml."
         )
 
+    scope = LaneScope(
+        workspace=binding.workspace,
+        lane=binding.lane,
+        lane_generation=binding.lane_generation,
+    )
+    journals_fn = live_journal_reader(
+        repo_root=repo_root, home=home, environ=environ
+    )
+    if (
+        admission_record.issue != binding.issue
+        or admission_record.lane_generation != binding.lane_generation
+        or normalized_branch(admission_record.target_ref) not in branches
+    ):
+        raise AutoIntegrationCompositionError(
+            "the action frame does not match this composition's issue, lane generation, "
+            "and committed integration target"
+        )
+    journals = journals_fn(admission_record.issue)
+    review = (
+        fold_durable_authority(journals, scope=scope).review
+        if journals is not None
+        else None
+    )
+    current_generation = (
+        review.request_journal
+        if review is not None
+        and review.admissible
+        and review.head == admission_record.source_head
+        else ""
+    )
+    if not current_generation or current_generation != admission_record.review_generation:
+        # This runs before the ledger writer is opened. A caller-selected generation therefore
+        # cannot create a fresh registry/ledger namespace merely by changing the action key.
+        raise AutoIntegrationCompositionError(
+            "the action's review generation is not the current approved review_request "
+            "for its exact source head"
+        )
+
     store = lifecycle_store or LaneLifecycleStore(home=home)
     ops = inventory_ops or _live_inventory_ops(repo_root=repo_root, environ=environ)
     # NOT injectable. R1 accepted a caller-supplied ledger for test convenience, which is the
@@ -371,18 +417,10 @@ def build_auto_integration_use_case(
     # scratch ledger passes `home`, which is what the production path uses to find one.
     durable_writer = _open_ledger_writer(home=home)
     durable_ledger = SqliteLedgerStore(home=home)
-    scope = LaneScope(
-        workspace=binding.workspace,
-        lane=binding.lane,
-        lane_generation=binding.lane_generation,
-    )
-
     authority = LiveDurableAuthorityReader(
         scope=scope,
         lane_issue=binding.issue,
-        journals_fn=live_journal_reader(
-            repo_root=repo_root, home=home, environ=environ
-        ),
+        journals_fn=journals_fn,
         # Re-read from the repository on every call, NOT the tuple computed above (review
         # j#96611 finding 2). The construction-time value is what this actuator was pointed at;
         # `target_identity_known` asks what the repository declares NOW, and if those two ever
@@ -390,7 +428,16 @@ def build_auto_integration_use_case(
         # construction. A snapshot cannot express that, because it IS the construction.
         integration_branches_fn=lambda: _declared_branches_now(repo_root),
         callback_debt_fn=lambda: (
-            unresolved_callback_debt(callback_outbox, binding.workspace)
+            unresolved_lane_callback_debt(
+                callback_outbox,
+                scope=live_lane_callback_scope(
+                    store,
+                    workspace_id=binding.workspace,
+                    issue=binding.issue,
+                    lane=binding.lane,
+                    lane_generation=binding.lane_generation,
+                ),
+            )
             if callback_outbox is not None
             else None
         ),
@@ -401,6 +448,29 @@ def build_auto_integration_use_case(
             AutoIntegrationLedgerReader(store=durable_ledger)
         ),
     )
+
+    admitted_action_frame = (
+        admission_record.action_key,
+        binding.issue,
+        binding.workspace,
+        binding.lane,
+        binding.lane_generation,
+        binding.branch,
+        binding.worktree,
+        str(repo_root),
+        admission_record.source_head,
+        admission_record.target_ref,
+        admission_record.expected_target_head,
+        admission_record.review_generation,
+    )
+    admitted_cleanup_action_key = CleanupActionRecord(
+        issue=binding.issue,
+        lane_generation=binding.lane_generation,
+        branch=binding.branch,
+        worktree_path=binding.worktree,
+        recorded_source_head=admission_record.source_head,
+        integration_action_key=admission_record.action_key,
+    ).action_key
 
     return AutoIntegrationUseCase(
         operations=LiveAutoIntegrationGitOperations(repo_root=repo_root),
@@ -417,6 +487,10 @@ def build_auto_integration_use_case(
         authority=authority,
         ledger=durable_ledger,
         _ledger_writer=durable_writer,
+        _admission_pin=AdmittedActionPin(
+            action_frame=admitted_action_frame,
+            cleanup_action_key=admitted_cleanup_action_key,
+        ),
         lane_worktree=binding.worktree,
         lane_branch=binding.branch,
         lane_issue=binding.issue,

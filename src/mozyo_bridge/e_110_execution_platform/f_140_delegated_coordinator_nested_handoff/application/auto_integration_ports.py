@@ -334,6 +334,10 @@ class IntegrationAuthority:
     """
 
     review_generation_admissible: bool = False
+    #: The exact review_request journal that identifies the current approved generation.
+    #: Kept separate from the boolean because an action key names this value; an arbitrary
+    #: non-empty caller string must not mint a second action under the same approval.
+    review_generation: str = ""
     #: The exact head the latest admissible review approved. Compared against the action's
     #: source head, so "reviewed" cannot mean "some earlier commit was reviewed".
     reviewed_head: str = ""

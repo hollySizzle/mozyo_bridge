@@ -226,6 +226,14 @@ def _compose(identity: _Args):
     retracted).
     """
     config = load_committed_repo_local_config(identity.repo_root)
+    record = build_integration_action_record(
+        configured_branch=str(config.auto_integration.integration_branch or ""),
+        issue=identity.issue,
+        lane_generation=identity.lane_generation,
+        source_head=identity.source_head,
+        expected_target_head=identity.expected_target_head,
+        review_generation=identity.review_generation,
+    )
     use_case = build_auto_integration_use_case(
         binding=LaneBinding(
             issue=identity.issue,
@@ -239,14 +247,7 @@ def _compose(identity: _Args):
         repo_root=identity.repo_root,
         environ=dict(os.environ),
         callback_outbox=CallbackOutbox(path=workflow_runtime_store_path()),
-    )
-    record = build_integration_action_record(
-        configured_branch=str(config.auto_integration.integration_branch or ""),
-        issue=identity.issue,
-        lane_generation=identity.lane_generation,
-        source_head=identity.source_head,
-        expected_target_head=identity.expected_target_head,
-        review_generation=identity.review_generation,
+        admission_record=record,
     )
     return use_case, record
 

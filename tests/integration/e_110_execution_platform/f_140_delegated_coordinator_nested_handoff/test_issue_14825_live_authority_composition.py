@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Callable, List, Mapping, Optional, Sequence, Tuple
 from unittest import mock
 
+from mozyo_bridge.core.state.callback_outbox import CallbackOutbox, CallbackOutboxKey
 from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_ACTIVE,
     DISPOSITION_HIBERNATED,
@@ -36,6 +37,13 @@ from mozyo_bridge.core.state.lane_lifecycle import (
     LaneLifecycleKey,
     LaneLifecycleStore,
     RELEASE_RELEASED,
+)
+from mozyo_bridge.core.state.workflow_runtime_store import (
+    CALLBACK_DEAD_LETTER,
+    CALLBACK_DELIVERED,
+    CALLBACK_INFLIGHT,
+    CALLBACK_PENDING,
+    CALLBACK_UNCERTAIN,
 )
 from mozyo_bridge.core.state.lane_release_observation import build_release_observation
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_actuator import (  # noqa: E501
@@ -73,6 +81,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REACHABILITY_NOT_REACHABLE,
     REACHABILITY_REACHABLE,
     REACHABILITY_UNAVAILABLE,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_live_authority import (  # noqa: E501
+    LaneCallbackScope,
+    live_lane_callback_scope,
+    unresolved_lane_callback_debt,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_reconcile import (  # noqa: E501
     RECONCILED_AMBIGUOUS,
@@ -198,6 +211,250 @@ class FakeInventoryOps:
         self.closed.append(plan)
         return HerdrRetireCloseResult(
             workspace_id=plan.workspace_id, lane_id=plan.lane_id
+        )
+
+
+class LaneCallbackDebtTest(unittest.TestCase):
+    """The integration gate owns one issue/lane generation, not workspace history."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.outbox = CallbackOutbox(home=self.home)
+        self._journal = 100
+        self.scope = LaneCallbackScope(
+            workspace_id=WS,
+            issue=ISSUE,
+            lane=LANE,
+            lane_generation=GEN,
+            lane_revision=5,
+        )
+
+    def _enqueue(
+        self,
+        *,
+        state: str,
+        route: str = "coordinator",
+        workspace: str = WS,
+        issue: str = ISSUE,
+        enqueue_generation: str = "",
+        target_generation: str = "",
+        target_lane: str = "",
+    ) -> None:
+        self._journal += 1
+        self.outbox.enqueue(
+            CallbackOutboxKey(
+                source="redmine",
+                issue=issue,
+                journal=str(self._journal),
+                normalized_gate="review_request",
+                callback_route=route,
+                workspace_id=workspace,
+            ),
+            initial_state=state,
+            enqueue_lane_generation=enqueue_generation,
+            target_generation=target_generation,
+            target_lane=target_lane,
+        )
+
+    def _debt(self, outbox=None):
+        return unresolved_lane_callback_debt(
+            outbox or self.outbox,
+            scope=self.scope,
+        )
+
+    def test_each_unresolved_state_in_the_current_generation_blocks(self) -> None:
+        self._enqueue(state=CALLBACK_PENDING, enqueue_generation=str(GEN))
+        self._enqueue(
+            state=CALLBACK_INFLIGHT,
+            route=f"lane_gateway:{LANE}",
+            target_generation=str(self.scope.lane_revision),
+            target_lane=LANE,
+        )
+        self._enqueue(
+            state=CALLBACK_UNCERTAIN,
+            route=f"review_return:{LANE}",
+            target_generation=str(self.scope.lane_revision),
+            target_lane=LANE,
+        )
+        self._enqueue(state=CALLBACK_DEAD_LETTER, enqueue_generation=str(GEN))
+        self.assertEqual(self._debt(), 4)
+
+    def test_foreign_issue_workspace_and_previous_generation_do_not_block(self) -> None:
+        self._enqueue(
+            state=CALLBACK_UNCERTAIN,
+            issue="99999",
+            enqueue_generation=str(GEN),
+        )
+        self._enqueue(
+            state=CALLBACK_DEAD_LETTER,
+            workspace="some-other-workspace",
+            enqueue_generation=str(GEN),
+        )
+        self._enqueue(
+            state=CALLBACK_UNCERTAIN,
+            enqueue_generation=str(GEN + 1),
+        )
+        self._enqueue(
+            state=CALLBACK_UNCERTAIN,
+            route=f"review_return:{LANE}",
+            target_generation=str(self.scope.lane_revision + 1),
+            target_lane=LANE,
+        )
+        self.assertEqual(self._debt(), 0)
+
+    def test_a_proven_different_target_lane_is_foreign(self) -> None:
+        self._enqueue(
+            state=CALLBACK_UNCERTAIN,
+            route="review_return:old-lane",
+            target_generation=str(self.scope.lane_revision),
+            target_lane="old-lane",
+        )
+        self.assertEqual(self._debt(), 0)
+
+    def test_a_delivered_current_row_is_drained(self) -> None:
+        self._enqueue(state=CALLBACK_DELIVERED, enqueue_generation=str(GEN))
+        self.assertEqual(self._debt(), 0)
+
+    def test_same_issue_ambiguous_generation_or_route_stays_debt(self) -> None:
+        self._enqueue(state=CALLBACK_PENDING)
+        self._enqueue(state=CALLBACK_PENDING, enqueue_generation="01")
+        self._enqueue(
+            state=CALLBACK_PENDING,
+            route=f"lane_gateway:{LANE}",
+            target_lane=LANE,
+        )
+        self._enqueue(
+            state=CALLBACK_PENDING,
+            route=f"review_return:{LANE}",
+            target_generation=str(self.scope.lane_revision),
+            enqueue_generation=str(GEN),
+            target_lane=LANE,
+        )
+        self._enqueue(
+            state=CALLBACK_PENDING,
+            route="unknown-route",
+            target_generation=str(GEN),
+        )
+        self.assertEqual(self._debt(), 5)
+
+    def test_stored_authority_is_byte_exact_and_legacy_workspace_blocks(self) -> None:
+        self._enqueue(
+            state=CALLBACK_PENDING,
+            enqueue_generation=f" {GEN} ",
+        )
+        self._enqueue(
+            state=CALLBACK_PENDING,
+            route=" coordinator ",
+            enqueue_generation=str(GEN),
+        )
+        self._enqueue(
+            state=CALLBACK_PENDING,
+            route="lane_gateway:",
+            target_generation=str(self.scope.lane_revision),
+        )
+        self._enqueue(
+            state=CALLBACK_PENDING,
+            workspace="",
+            enqueue_generation=str(GEN),
+        )
+        self._enqueue(
+            state=CALLBACK_PENDING,
+            workspace=f" {WS} ",
+            issue=f" {ISSUE} ",
+            enqueue_generation=str(GEN),
+        )
+        self.assertEqual(self._debt(), 5)
+
+    def test_an_unreadable_outbox_is_not_drained(self) -> None:
+        class Unreadable:
+            def read(self, *, states):
+                raise OSError("unreadable")
+
+        self.assertIsNone(self._debt(Unreadable()))
+
+    def test_an_outbox_without_a_read_result_is_not_drained(self) -> None:
+        class NoResult:
+            def read(self, *, states):
+                return None
+
+        self.assertIsNone(self._debt(NoResult()))
+
+    def test_live_scope_reads_incarnation_and_revision_as_distinct_axes(self) -> None:
+        class Owner:
+            resolved = True
+            lane_id = LANE
+
+        class Record:
+            repo_workspace_id = WS
+            lane_id = LANE
+            issue_id = ISSUE
+            binding_kind = "issue"
+            lane_disposition = "active"
+            lane_generation = GEN
+            revision = 9
+
+        class Store:
+            def resolve_owner(self, workspace, issue):
+                return Owner()
+
+            def get(self, key):
+                return Record()
+
+        scope = live_lane_callback_scope(
+            Store(),
+            workspace_id=WS,
+            issue=ISSUE,
+            lane=LANE,
+            lane_generation=GEN,
+        )
+        self.assertEqual(scope, LaneCallbackScope(WS, ISSUE, LANE, GEN, 9))
+
+    def test_live_scope_rechecks_the_fetched_row_is_still_active(self) -> None:
+        class Owner:
+            resolved = True
+            lane_id = LANE
+
+        class Record:
+            repo_workspace_id = WS
+            lane_id = LANE
+            issue_id = ISSUE
+            binding_kind = "issue"
+            lane_disposition = "hibernated"
+            lane_generation = GEN
+            revision = 9
+
+        class Store:
+            def resolve_owner(self, workspace, issue):
+                return Owner()
+
+            def get(self, key):
+                return Record()
+
+        self.assertIsNone(
+            live_lane_callback_scope(
+                Store(),
+                workspace_id=WS,
+                issue=ISSUE,
+                lane=LANE,
+                lane_generation=GEN,
+            )
+        )
+
+    def test_live_scope_refuses_a_different_active_owner(self) -> None:
+        class Store:
+            def resolve_owner(self, workspace, issue):
+                return type("Owner", (), {"resolved": True, "lane_id": "other-lane"})()
+
+        self.assertIsNone(
+            live_lane_callback_scope(
+                Store(),
+                workspace_id=WS,
+                issue=ISSUE,
+                lane=LANE,
+                lane_generation=GEN,
+            )
         )
 
 
@@ -656,6 +913,7 @@ class StubAuthority:
     def read_integration_authority(self, *, record) -> IntegrationAuthority:
         return IntegrationAuthority(
             review_generation_admissible=True,
+            review_generation=record.review_generation,
             reviewed_head=SOURCE,
             target_identity_known=True,
             callbacks_drained=True,

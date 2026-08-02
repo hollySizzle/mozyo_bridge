@@ -49,8 +49,10 @@ Where each fact comes from, and why that source is the authority for it:
     target, and an unconfigured target integrates nothing.
 
 ``callbacks_drained``
-    The workspace callback outbox's unresolved debt, which is the workspace's existing authority
-    for that question (an unreadable outbox is not a drained one).
+    The callback outbox's unresolved debt for this exact workspace, issue and owning lane. The
+    coordinator route is fenced by the lane incarnation; lane-gateway/review-return routes are
+    fenced by lifecycle revision plus lane identity. Foreign rows do not stop this action;
+    ambiguous same-scope rows and an unreadable lifecycle/outbox do.
 
 ``owner_gates_resolved``
     The issue's own canonical gate fold (:func:`~...domain.glance_journal_grammar.fold_issue_gate_facts`)
@@ -74,6 +76,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Optional, Sequence, Tuple
 
+from mozyo_bridge.core.state.workflow_runtime_store import (
+    CALLBACK_DEAD_LETTER,
+    CALLBACK_INFLIGHT,
+    CALLBACK_PENDING,
+    CALLBACK_UNCERTAIN,
+)
+from mozyo_bridge.core.state.lane_lifecycle_model import (
+    BINDING_KIND_ISSUE,
+    DISPOSITION_ACTIVE,
+    LaneLifecycleKey,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ci_source import (  # noqa: E501
     CiVerdict,
 )
@@ -96,6 +109,15 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     GateFacts,
     fold_issue_gate_facts,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_gateway_route import (  # noqa: E501
+    lane_gateway_route,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (  # noqa: E501
+    review_return_callback_route,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (  # noqa: E501
+    COORDINATOR_ROUTE,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
     EvidenceJournal,
     as_pairs,
@@ -109,7 +131,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 JournalReader = Callable[[str], Optional[Sequence[EvidenceJournal]]]
 #: The tracker's own answer to "is this issue closed". ``None`` when it could not be asked.
 IssueClosedReader = Callable[[str], Optional[bool]]
-#: The workspace's unresolved callback debt. ``None`` when the outbox could not be read.
+#: This action's exact workspace/issue/lane-generation callback debt. ``None`` when unreadable.
 CallbackDebtReader = Callable[[], Optional[int]]
 #: The integration branches the repository currently declares, re-read at action time.
 IntegrationBranchReader = Callable[[], Tuple[str, ...]]
@@ -121,6 +143,196 @@ CiVerdictReader = Callable[..., "CiVerdict"]
 #: given the head the COORDINATOR's record says landed. Both sides are required: the ledger
 #: names the action, the tracker corroborates the commit (review j#96650 finding 1).
 AuthorizingActionReader = Callable[[CleanupActionRecord, str], str]
+
+_UNRESOLVED_CALLBACK_STATES = (
+    CALLBACK_PENDING,
+    CALLBACK_INFLIGHT,
+    CALLBACK_UNCERTAIN,
+    CALLBACK_DEAD_LETTER,
+)
+
+
+@dataclass(frozen=True)
+class LaneCallbackScope:
+    """The two lifecycle axes a callback row may be fenced against.
+
+    ``lane_generation`` is the lane incarnation used by coordinator rows.
+    ``lane_revision`` is the current lifecycle CAS revision used by lane-gateway and
+    review-return rows.  They are deliberately separate: equal numbers are incidental.
+    """
+
+    workspace_id: str
+    issue: str
+    lane: str
+    lane_generation: int
+    lane_revision: int
+
+    @property
+    def is_complete(self) -> bool:
+        return (
+            bool(self.workspace_id)
+            and self.workspace_id == self.workspace_id.strip()
+            and bool(self.issue)
+            and self.issue == self.issue.strip()
+            and bool(self.lane)
+            and self.lane == self.lane.strip()
+            and _canonical_lane_generation(self.lane_generation)
+            == self.lane_generation
+            and _canonical_lane_generation(self.lane_revision) == self.lane_revision
+        )
+
+
+def live_lane_callback_scope(
+    lifecycle_store: object,
+    *,
+    workspace_id: str,
+    issue: str,
+    lane: str,
+    lane_generation: int,
+) -> Optional[LaneCallbackScope]:
+    """Read the current active owner's incarnation and CAS revision, or fail closed.
+
+    This is intentionally fresh on every authority read.  The outbox carries two different
+    generation fields sourced from this lifecycle record, so a construction-time snapshot would
+    let a later owner switch or revision bump pass under stale callback authority.
+    """
+    workspace = str(workspace_id or "")
+    issue_id = str(issue or "")
+    lane_id = str(lane or "")
+    wanted_generation = _canonical_lane_generation(lane_generation)
+    if (
+        not workspace
+        or workspace != workspace.strip()
+        or not issue_id
+        or issue_id != issue_id.strip()
+        or not lane_id
+        or lane_id != lane_id.strip()
+        or wanted_generation is None
+    ):
+        return None
+    try:
+        owner = lifecycle_store.resolve_owner(workspace, issue_id)
+        if not getattr(owner, "resolved", False):
+            return None
+        if str(getattr(owner, "lane_id", "") or "") != lane_id:
+            return None
+        record = lifecycle_store.get(LaneLifecycleKey(workspace, lane_id))
+    except Exception:  # noqa: BLE001 - unreadable lifecycle authority is not a drained scope
+        return None
+    if (
+        record is None
+        or str(getattr(record, "repo_workspace_id", "") or "") != workspace
+        or str(getattr(record, "lane_id", "") or "") != lane_id
+        or str(getattr(record, "issue_id", "") or "") != issue_id
+        or str(getattr(record, "binding_kind", "") or "") != BINDING_KIND_ISSUE
+        or str(getattr(record, "lane_disposition", "") or "") != DISPOSITION_ACTIVE
+        or getattr(record, "lane_generation", None) != wanted_generation
+    ):
+        return None
+    revision = _canonical_lane_generation(getattr(record, "revision", None))
+    if revision is None:
+        return None
+    return LaneCallbackScope(
+        workspace_id=workspace,
+        issue=issue_id,
+        lane=lane_id,
+        lane_generation=wanted_generation,
+        lane_revision=revision,
+    )
+
+
+def unresolved_lane_callback_debt(
+    outbox: object,
+    *,
+    scope: Optional[LaneCallbackScope],
+) -> Optional[int]:
+    """Unresolved debt for one exact owning-lane generation, or ``None`` if unreadable.
+
+    The callback outbox is shared by the workspace, but an integration action is not.  A row for
+    another issue or a positively identified previous generation cannot be authority over this
+    action.  Conversely, a same-issue row whose route/generation is blank, malformed or internally
+    conflicting remains debt: ambiguity is not evidence that the row belongs elsewhere.
+
+    Coordinator rows carry the owning incarnation in ``enqueue_lane_generation``. Same-lane
+    gateway and review-return rows instead carry the lifecycle CAS revision in
+    ``target_generation`` and the lane identity in both the route and ``target_lane``. Stored
+    authority is byte-exact: padded or malformed same-scope values remain debt.
+    """
+    if scope is None or not scope.is_complete:
+        return None
+    try:
+        rows = outbox.read(states=list(_UNRESOLVED_CALLBACK_STATES))
+        if rows is None:
+            return None
+    except Exception:  # noqa: BLE001 - unreadable is never drained
+        return None
+
+    debt = 0
+    for row in rows:
+        row_issue = str(getattr(row, "issue", "") or "")
+        row_workspace = str(getattr(row, "workspace_id", "") or "")
+        if row_issue != scope.issue or row_workspace != scope.workspace_id:
+            # One canonical different dimension is enough to prove the row foreign. If every
+            # differing dimension is blank/padded/malformed, ownership is unknown and remains debt.
+            issue_is_foreign = (
+                bool(row_issue)
+                and row_issue == row_issue.strip()
+                and row_issue != scope.issue
+            )
+            workspace_is_foreign = (
+                bool(row_workspace)
+                and row_workspace == row_workspace.strip()
+                and row_workspace != scope.workspace_id
+            )
+            if issue_is_foreign or workspace_is_foreign:
+                continue
+            debt += 1
+            continue
+
+        route = str(getattr(row, "callback_route", "") or "")
+        enqueued = str(getattr(row, "enqueue_lane_generation", "") or "")
+        targeted = str(getattr(row, "target_generation", "") or "")
+        target_lane = str(getattr(row, "target_lane", "") or "")
+        if route == COORDINATOR_ROUTE:
+            generation = _canonical_lane_generation(enqueued)
+            if targeted or generation is None:
+                debt += 1
+            elif generation == scope.lane_generation:
+                debt += 1
+            continue
+
+        canonical_lane_gateway = (
+            lane_gateway_route(target_lane) if target_lane == target_lane.strip() and target_lane else ""
+        )
+        canonical_review_return = (
+            review_return_callback_route(target_lane)
+            if target_lane == target_lane.strip() and target_lane
+            else ""
+        )
+        if route not in (canonical_lane_gateway, canonical_review_return):
+            debt += 1
+            continue
+        if target_lane != scope.lane:
+            # Route and target_lane agree byte-for-byte on a different lane: provably foreign.
+            continue
+        generation = _canonical_lane_generation(targeted)
+        if enqueued or generation is None:
+            debt += 1
+        elif generation == scope.lane_revision:
+            debt += 1
+    return debt
+
+
+def _canonical_lane_generation(value: object) -> Optional[int]:
+    """A positive base-10 generation in its canonical spelling, else ``None``."""
+    if isinstance(value, bool):
+        return None
+    text = str(value or "")
+    try:
+        parsed = int(text)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 and text == str(parsed) else None
 
 
 @dataclass(frozen=True)
@@ -158,8 +370,15 @@ class LiveDurableAuthorityReader:
             return IntegrationAuthority()
 
         facts = fold_durable_authority(journals, scope=self.scope)
+        current_generation = (
+            facts.review.request_journal if facts.review.admissible else ""
+        )
         return IntegrationAuthority(
-            review_generation_admissible=facts.review.admissible,
+            review_generation_admissible=(
+                bool(current_generation)
+                and current_generation == record.review_generation
+            ),
+            review_generation=current_generation,
             reviewed_head=facts.review.head,
             target_identity_known=self._target_is_declared(record.target_ref),
             callbacks_drained=self._callbacks_drained(),
@@ -171,6 +390,25 @@ class LiveDurableAuthorityReader:
                 bind_attested_run=True,
             ),
         )
+
+    def current_review_generation(self, *, record: IntegrationActionRecord) -> str:
+        """The approved review_request id for this exact action head, read fresh.
+
+        This narrow projection lets the CLI refuse a forged generation before opening the ledger
+        or registering an action.  The actuator still performs the full read again before every
+        mutation, so a review superseded between this check and actuation remains fail-closed.
+        """
+        if not self._record_is_ours(
+            issue=record.issue, lane_generation=record.lane_generation
+        ):
+            return ""
+        journals = self.journals_fn(record.issue)
+        if journals is None:
+            return ""
+        review = fold_durable_authority(journals, scope=self.scope).review
+        if not review.admissible or review.head != record.source_head:
+            return ""
+        return review.request_journal
 
     def read_integration_ci(
         self, *, record: IntegrationActionRecord, integration_head: str

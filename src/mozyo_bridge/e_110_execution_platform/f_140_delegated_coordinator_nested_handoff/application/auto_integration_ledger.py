@@ -21,13 +21,15 @@ open intent row and returns it; :meth:`append` requires a token matching an OPEN
 exactly that ``(action_key, step)``, and closes it in the same transaction. There is no way to
 record an outcome for a step nobody was admitted to perform.
 
-*What that boundary is, stated exactly.* Two processes sharing a file cannot authenticate each
-other — filesystem permission is still the outer boundary, and nothing here should be read as
-more. What the admission adds is that a forger must first WIN the admission (:meth:`begin_step`
-is a compare-and-set, below), and while it holds one the real actuator is refused rather than
-racing it. The forgery becomes loud instead of silent. That is a different and weaker claim than
-"authenticated across mutually distrusting processes", and it is the strongest one a shared file
-supports.
+*What that boundary is, stated exactly.* The OS account that owns the repository, Git/Redmine
+credentials and this file is the trusted principal (owner decision j#96706). Two mutually
+distrusting processes under that same account cannot authenticate each other through a shared
+file; an underscore, an in-process object, mode 0600, a same-user socket or a secret stored beside
+the DB does not change that. The private writer surface is therefore a misuse boundary, not a
+security boundary. What the admission enforces inside that trust boundary is exclusive ordering:
+a second run is refused before it mutates, replay is rejected, and a crash is explicit and
+reconcilable. Protecting against malicious same-UID code would require moving the ledger AND the
+Git/Redmine mutation credentials to a distinct OS security principal; it is not claimed here.
 
 **One run at a time may be admitted to a step.** R1 read :meth:`unresolved_intents` and then
 called ``begin_step`` — a check-then-write with no constraint behind it, so two runs both opened
@@ -814,11 +816,11 @@ def _row_to_outcome(row: Sequence[object]) -> StepOutcome:
 def _open_ledger_writer(
     path: Optional[Path] = None, *, home: Optional[Path] = None
 ) -> SqliteLedgerStore:
-    """Mint the module-private production mutation capability.
+    """Mint the module-private production mutation capability inside the trusted OS account.
 
-    Deliberately omitted from ``__all__``.  Production composition and the recovery owner are
-    the only application modules that import it; callers constructing ``SqliteLedgerStore`` get
-    the read surface and cannot reproduce the begin+append authorization forgery.
+    Deliberately omitted from ``__all__`` so ordinary callers receive only the read surface. This
+    reduces accidental misuse; Python module privacy is not process authentication, and the
+    module-level threat-model statement above is the exact boundary.
     """
     writer = SqliteLedgerStore(
         path=path, home=home, _writer_capability=_LEDGER_WRITER_CAPABILITY

@@ -70,6 +70,7 @@ from .hibernate_candidate import (
     CONJUNCT_STAGING_INTEGRATED,
 )
 from .hibernate_evidence_authority import (
+    MARKER_GATE_REVIEW_RESULT,
     EvidenceJournal,
     check_issuer_lane,
     check_issuer_resolution,
@@ -151,10 +152,14 @@ class ReviewApproval:
     requires: the LATEST generation approved, correlated to the request it answers, unsuperseded
     by a re-review, written by the same-lane gateway, and about this actuator's lane. ``head`` is
     the exact commit that approval names — never a branch, never an earlier commit.
+    ``request_journal`` is the durable review-generation identity: the exact ``review_request``
+    journal the approved result's already-validated ``req`` names.  It is deliberately distinct
+    from ``journal``, which is the review-result event that closed that generation.
     """
 
     admissible: bool = False
     head: str = ""
+    request_journal: str = ""
     journal: str = ""
 
 
@@ -232,10 +237,16 @@ def fold_durable_authority(
         ):
             gaps.append(EvidenceGap(CONJUNCT_REVIEW_APPROVED, GAP_LANE_SCOPE_MISMATCH))
         else:
+            result_journal = str(
+                produced.evidence_journals.get(CONJUNCT_REVIEW_APPROVED, "")
+            )
             review = ReviewApproval(
                 admissible=bool(approved.satisfied),
                 head=approved.bound_head,
-                journal=str(produced.evidence_journals.get(CONJUNCT_REVIEW_APPROVED, "")),
+                request_journal=_approved_request_journal(
+                    journals, result_journal=result_journal
+                ),
+                journal=result_journal,
             )
 
     integration = IntegrationRecord()
@@ -265,6 +276,30 @@ def fold_durable_authority(
     return DurableAuthorityFacts(
         review=review, integration=integration, gaps=tuple(gaps)
     )
+
+
+def _approved_request_journal(
+    journals: Sequence[EvidenceJournal], *, result_journal: str
+) -> str:
+    """The request id carried by the already-validated current approval.
+
+    :func:`produce_conjuncts` has already proved that this result's single ``req`` equals the
+    greatest review request strictly before it, that both name the same head, and that no newer
+    request supersedes it.  This projection therefore does not define correlation again; it
+    retains the exact generation identity that producer validated instead of folding it down to
+    a boolean and a head.
+    """
+    declaration = latest_gate_declaration(
+        journals, gate=MARKER_GATE_REVIEW_RESULT
+    )
+    if not result_journal or declaration.journal != result_journal:
+        return ""
+    requests = {
+        str(fields.get("req", "") or "").strip()
+        for fields in declaration.markers
+    }
+    requests.discard("")
+    return requests.pop() if len(requests) == 1 else ""
 
 
 def _integration_evidence(

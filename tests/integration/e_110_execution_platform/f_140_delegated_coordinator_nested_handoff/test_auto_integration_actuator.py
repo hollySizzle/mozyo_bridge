@@ -32,7 +32,7 @@ from __future__ import annotations
 import inspect
 import sys
 import unittest
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -259,6 +259,7 @@ class FakeAuthorityReader:
     authority: IntegrationAuthority = field(
         default_factory=lambda: IntegrationAuthority(
             review_generation_admissible=True,
+            review_generation="j#96337",
             reviewed_head=SOURCE,
             target_identity_known=True,
             callbacks_drained=True,
@@ -461,6 +462,7 @@ class R3ReviewFinding1Test(unittest.TestCase):
         reader = FakeAuthorityReader(
             authority=IntegrationAuthority(
                 review_generation_admissible=True,
+                review_generation="j#96337",
                 reviewed_head=OTHER,  # a DIFFERENT commit was reviewed
                 target_identity_known=True,
                 callbacks_drained=True,
@@ -477,6 +479,20 @@ class R3ReviewFinding1Test(unittest.TestCase):
         report = _use_case(operations, authority=reader).run_integration(_record())
         self.assertEqual(report.final_decision.state, STATE_INTEGRATION_BLOCKED)
         self.assertEqual(operations.performed, [])
+
+    def test_the_review_generation_must_equal_the_request_the_action_names(self) -> None:
+        reader = FakeAuthorityReader(
+            authority=replace(
+                FakeAuthorityReader().authority,
+                review_generation="some-other-review-request",
+            )
+        )
+        operations = FakeGitOperations(ancestors=_ff_ancestors())
+        use_case = _use_case(operations, authority=reader)
+        report = use_case.run_integration(_record())
+        self.assertEqual(report.final_decision.state, STATE_INTEGRATION_BLOCKED)
+        self.assertEqual(operations.performed, [])
+        self.assertEqual(use_case.ledger.read(action_key=_record().action_key), [])
 
     def test_foreignness_is_answered_from_the_actuator_s_own_lane_branch(self) -> None:
         # The lane checkout must be a registered worktree holding THIS actuator's branch.

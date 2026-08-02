@@ -146,6 +146,7 @@ class _Authority:
     def read_integration_authority(self, *, record):
         return IntegrationAuthority(
             review_generation_admissible=True,
+            review_generation=record.review_generation,
             reviewed_head=SOURCE,
             target_identity_known=True,
             callbacks_drained=True,

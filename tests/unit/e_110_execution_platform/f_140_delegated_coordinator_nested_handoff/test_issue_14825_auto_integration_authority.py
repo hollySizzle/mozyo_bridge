@@ -18,10 +18,14 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ci_source import (  # noqa: E501
     CI_STATE_SUCCESS,
     CiVerdict,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_action_registry import (  # noqa: E501
+    DurableIntegrationAction,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_composition import (  # noqa: E501
     AutoIntegrationCompositionError,
@@ -30,7 +34,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     declared_integration_branches,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_live_authority import (  # noqa: E501
+    LaneCallbackScope,
     LiveDurableAuthorityReader,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ledger import (  # noqa: E501
+    AutoIntegrationLedgerError,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_authority import (  # noqa: E501
     GAP_CI_DECLARATION_UNREADABLE,
@@ -334,7 +342,7 @@ def _action(**over):
         source_head=SOURCE,
         target_ref=TARGET_REF,
         expected_target_head=OTHER,
-        review_generation="r1",
+        review_generation=REQ,
     )
     fields.update(over)
     return IntegrationActionRecord(**fields)  # type: ignore[arg-type]
@@ -349,11 +357,20 @@ class ReaderIdentityFenceTest(unittest.TestCase):
         ]
         authority = _reader(journals).read_integration_authority(record=_action())
         self.assertTrue(authority.review_generation_admissible)
+        self.assertEqual(authority.review_generation, REQ)
         self.assertEqual(authority.reviewed_head, SOURCE)
         self.assertTrue(authority.target_identity_known)
         self.assertTrue(authority.callbacks_drained)
         self.assertIsNotNone(authority.source_ci)
         self.assertEqual(authority.source_ci.run, "299")
+
+    def test_a_caller_selected_review_generation_is_not_admissible(self) -> None:
+        authority = _reader(_approved_journals()).read_integration_authority(
+            record=_action(review_generation="forged-review-generation")
+        )
+        self.assertFalse(authority.review_generation_admissible)
+        self.assertEqual(authority.review_generation, REQ)
+        self.assertEqual(authority.reviewed_head, SOURCE)
 
     def test_fast_forward_integration_ci_uses_the_target_branch_provider_run(self) -> None:
         journals = _approved_journals() + [
@@ -451,8 +468,160 @@ class DeclaredIntegrationBranchTest(unittest.TestCase):
                 ),
                 config=AutoIntegrationConfig(mode="auto"),
                 repo_root=__import__("pathlib").Path("."),
+                admission_record=_action(),
             )
         self.assertIn("unconfigured target", str(raised.exception))
+
+    def test_a_forged_review_generation_refuses_before_the_ledger_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            with mock.patch(
+                "mozyo_bridge.e_110_execution_platform."
+                "f_140_delegated_coordinator_nested_handoff.application."
+                "auto_integration_composition.live_journal_reader",
+                return_value=lambda issue: _approved_journals(),
+            ):
+                with self.assertRaises(AutoIntegrationCompositionError) as raised:
+                    build_auto_integration_use_case(
+                        binding=LaneBinding(
+                            issue=ISSUE,
+                            workspace=WS,
+                            lane=LANE,
+                            lane_generation=GEN,
+                            branch="issue_14825",
+                            worktree="/tmp/wt",
+                        ),
+                        config=AutoIntegrationConfig(
+                            mode="auto", integration_branch=TARGET_REF
+                        ),
+                        repo_root=Path("."),
+                        admission_record=_action(
+                            review_generation="forged-review-generation"
+                        ),
+                        home=home,
+                    )
+            self.assertIn("review generation", str(raised.exception))
+            self.assertFalse((home / "auto_integration_ledger.sqlite3").exists())
+
+    def test_a_valid_composition_cannot_register_a_second_forged_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            with mock.patch(
+                "mozyo_bridge.e_110_execution_platform."
+                "f_140_delegated_coordinator_nested_handoff.application."
+                "auto_integration_composition.live_journal_reader",
+                return_value=lambda issue: _approved_journals(),
+            ):
+                use_case = build_auto_integration_use_case(
+                    binding=LaneBinding(
+                        issue=ISSUE,
+                        workspace=WS,
+                        lane=LANE,
+                        lane_generation=GEN,
+                        branch="issue_14825",
+                        worktree="/tmp/wt",
+                    ),
+                    config=AutoIntegrationConfig(
+                        mode="auto", integration_branch=TARGET_REF
+                    ),
+                    repo_root=Path("."),
+                    inventory_ops=object(),
+                    callback_outbox=object(),
+                    admission_record=_action(),
+                    home=home,
+                )
+            admitted = _action()
+            use_case.register_durable_action(
+                DurableIntegrationAction(
+                    action_key=admitted.action_key,
+                    issue=ISSUE,
+                    workspace=WS,
+                    lane=LANE,
+                    lane_generation=GEN,
+                    branch="issue_14825",
+                    worktree="/tmp/wt",
+                    repo_root=".",
+                    source_head=SOURCE,
+                    target_ref=TARGET_REF,
+                    expected_target_head=OTHER,
+                    review_generation=admitted.review_generation,
+                )
+            )
+            self.assertIsNotNone(use_case.ledger.action(admitted.action_key))
+            forged = _action(review_generation="forged-review-generation")
+            frame = DurableIntegrationAction(
+                action_key=forged.action_key,
+                issue=ISSUE,
+                workspace=WS,
+                lane=LANE,
+                lane_generation=GEN,
+                branch="issue_14825",
+                worktree="/tmp/wt",
+                repo_root=".",
+                source_head=SOURCE,
+                target_ref=TARGET_REF,
+                expected_target_head=OTHER,
+                review_generation=forged.review_generation,
+            )
+            with self.assertRaises(AutoIntegrationLedgerError):
+                use_case.register_durable_action(frame)
+            self.assertIsNone(use_case.ledger.action(forged.action_key))
+            with self.assertRaises(AutoIntegrationLedgerError):
+                use_case.run_integration(forged)
+            with self.assertRaises(AutoIntegrationLedgerError):
+                use_case.mark_action_awaiting_ci(
+                    action_key=forged.action_key,
+                    landed_head=SOURCE,
+                    ci_workflow="Test",
+                )
+
+    def test_production_composition_reads_the_exact_live_lane_callback_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = object()
+            scope = LaneCallbackScope(WS, ISSUE, LANE, GEN, 7)
+            with mock.patch(
+                "mozyo_bridge.e_110_execution_platform."
+                "f_140_delegated_coordinator_nested_handoff.application."
+                "auto_integration_composition.live_journal_reader",
+                return_value=lambda issue: _approved_journals(),
+            ), mock.patch(
+                "mozyo_bridge.e_110_execution_platform."
+                "f_140_delegated_coordinator_nested_handoff.application."
+                "auto_integration_composition.live_lane_callback_scope",
+                return_value=scope,
+            ) as live_scope, mock.patch(
+                "mozyo_bridge.e_110_execution_platform."
+                "f_140_delegated_coordinator_nested_handoff.application."
+                "auto_integration_composition.unresolved_lane_callback_debt",
+                return_value=0,
+            ) as debt:
+                use_case = build_auto_integration_use_case(
+                    binding=LaneBinding(
+                        issue=ISSUE,
+                        workspace=WS,
+                        lane=LANE,
+                        lane_generation=GEN,
+                        branch="issue_14825",
+                        worktree="/tmp/wt",
+                    ),
+                    config=AutoIntegrationConfig(
+                        mode="auto", integration_branch=TARGET_REF
+                    ),
+                    repo_root=Path("."),
+                    inventory_ops=object(),
+                    callback_outbox=outbox,
+                    admission_record=_action(),
+                    home=Path(tmp),
+                )
+                self.assertEqual(use_case.authority.callback_debt_fn(), 0)
+            live_scope.assert_called_once_with(
+                mock.ANY,
+                workspace_id=WS,
+                issue=ISSUE,
+                lane=LANE,
+                lane_generation=GEN,
+            )
+            debt.assert_called_once_with(outbox, scope=scope)
 
 
 class ActionTimeFreshReadTest(unittest.TestCase):

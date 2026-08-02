@@ -44,6 +44,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     AutoIntegrationAdmissionError,
     AutoIntegrationLedgerError,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_admission_pin import (  # noqa: E501
+    AdmittedActionPin,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ports import (
     MERGE_COMMIT_ERROR,
     MERGE_CONTENT_CONFLICT,
@@ -267,6 +270,10 @@ class AutoIntegrationUseCase:
     #: them manufacture an accepted push.  Direct/in-memory tests leave this ``None`` and their
     #: process-local ledger remains combined.
     _ledger_writer: object = field(default=None, repr=False, compare=False)
+    #: Production-only exact resume-frame pin. Direct/in-memory tests keep ``None``.
+    _admission_pin: Optional[AdmittedActionPin] = field(
+        default=None, repr=False, compare=False
+    )
 
     #: The writer receipt this actuator stamps on the steps it records. R4 derived it from
     #: public constructor values, so a caller could reproduce it; R5 made it an unguessable
@@ -274,9 +281,10 @@ class AutoIntegrationUseCase:
     #: (R5 review j#96385 finding 1). The class is frozen again and the field is ``init=False``,
     #: so it is neither supplied nor rewritable through the public surface.
     #:
-    #: This is a boundary WITHIN one process, not an authority boundary across processes: a
-    #: durable store with an authenticated writer identity is the real answer, and it belongs
-    #: with the production data plane the durable authority reader needs.
+    #: This is a boundary WITHIN one process, not an authority boundary across processes. The
+    #: production store supplies durable provenance and admission CAS, but the trusted principal
+    #: is the OS account that also owns the repository and mutation credentials; a private Python
+    #: surface cannot authenticate mutually hostile same-UID code.
     _receipt: str = field(default_factory=lambda: f"receipt:{uuid.uuid4().hex}", init=False)
 
     def _policy(self) -> AutoIntegrationPolicy:
@@ -332,6 +340,8 @@ class AutoIntegrationUseCase:
         refusal is not retried here: it means somebody else is mutating, or crashed mid-mutation,
         and either way a second mutation is what must not happen.
         """
+        if self._admission_pin is not None:
+            self._admission_pin.require_mutation_key(action_key)
         opener = getattr(self._mutation_ledger(), "begin_step", None)
         if opener is None:
             return "", None
@@ -342,6 +352,8 @@ class AutoIntegrationUseCase:
 
     def _record(self, outcome: StepOutcome, receipt: str) -> None:
         """Append ``outcome`` under the admission that produced it."""
+        if self._admission_pin is not None:
+            self._admission_pin.require_mutation_key(outcome.action_key)
         writer = self._mutation_ledger()
         append = getattr(writer, "append", None)
         if append is None:
@@ -352,6 +364,8 @@ class AutoIntegrationUseCase:
 
     def _resolve_intent(self, **kwargs) -> None:
         """Recovery-only write through the same private mutation capability."""
+        if self._admission_pin is not None:
+            self._admission_pin.require_mutation_key(str(kwargs.get("action_key", "")))
         resolver = getattr(self._mutation_ledger(), "resolve_intent", None)
         if resolver is None:
             raise AutoIntegrationLedgerError(
@@ -361,6 +375,8 @@ class AutoIntegrationUseCase:
 
     def register_durable_action(self, action: object) -> None:
         """Register an immutable resume frame before the first production mutation."""
+        if self._admission_pin is not None:
+            self._admission_pin.require_frame(action)
         register = getattr(self._mutation_ledger(), "register_action", None)
         if register is None:
             raise AutoIntegrationLedgerError(
@@ -371,6 +387,8 @@ class AutoIntegrationUseCase:
     def mark_action_awaiting_ci(
         self, *, action_key: str, landed_head: str, ci_workflow: str
     ) -> None:
+        if self._admission_pin is not None:
+            self._admission_pin.require_integration_key(action_key)
         marker = getattr(self._mutation_ledger(), "mark_action_awaiting_ci", None)
         if marker is None:
             raise AutoIntegrationLedgerError(
@@ -385,6 +403,8 @@ class AutoIntegrationUseCase:
     def mark_action_terminal(
         self, *, action_key: str, state: str, landed_head: str, detail: str = ""
     ) -> None:
+        if self._admission_pin is not None:
+            self._admission_pin.require_integration_key(action_key)
         marker = getattr(self._mutation_ledger(), "mark_action_terminal", None)
         if marker is None:
             raise AutoIntegrationLedgerError(
@@ -414,6 +434,8 @@ class AutoIntegrationUseCase:
         which is identity, not evidence. The measurement is re-taken before **every** step,
         because this actuator's own mutations change the world it is deciding about.
         """
+        if self._admission_pin is not None:
+            self._admission_pin.require_integration_key(record.action_key)
         report = IntegrationRunReport()
         stranded = self._unresolved_intent(record.action_key)
         if stranded is not None:
@@ -596,7 +618,11 @@ class AutoIntegrationUseCase:
             source_origin_reachable=ops.commit_on_remote(
                 record.source_head, branch=self.lane_branch
             ),
-            review_generation_admissible=authority.review_generation_admissible,
+            review_generation_admissible=(
+                authority.review_generation_admissible
+                and bool(authority.review_generation)
+                and authority.review_generation == record.review_generation
+            ),
             target_identity_known=authority.target_identity_known,
             callbacks_drained=authority.callbacks_drained,
             owner_gates_resolved=authority.owner_gates_resolved,
@@ -803,6 +829,8 @@ class AutoIntegrationUseCase:
         As with :meth:`run_integration` there is no caller preflight and no caller ledger:
         everything the machine decides from is measured here (:meth:`_measure_cleanup`).
         """
+        if self._admission_pin is not None:
+            self._admission_pin.require_cleanup(record)
         report = CleanupRunReport()
         stranded = self._unresolved_intent(record.action_key)
         if stranded is not None:

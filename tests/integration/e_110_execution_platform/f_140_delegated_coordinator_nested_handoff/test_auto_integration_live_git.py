@@ -91,6 +91,7 @@ class _FullyAuthorizedReader:
     def read_integration_authority(self, *, record) -> IntegrationAuthority:
         return IntegrationAuthority(
             review_generation_admissible=True,
+            review_generation=record.review_generation,
             reviewed_head=self.source_head,
             target_identity_known=True,
             callbacks_drained=True,

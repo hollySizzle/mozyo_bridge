@@ -198,6 +198,7 @@ class AutoIntegrationSupervisorLeg:
                     repo_root=canonical_root,
                     lifecycle_store=self.lifecycle_store,
                     callback_outbox=self.callback_outbox,
+                    admission_record=action.record,
                     home=self.home,
                     environ=dict(self.environ if self.environ is not None else os.environ),
                 )

@@ -86,12 +86,21 @@ action_key:
   - source_head            # full 40-hex commit SHA (branch 名は pin ではない)
   - target_ref
   - expected_target_head   # 存在しない target は `none` sentinel
-  - review_generation
+  - review_generation      # approved review_request の exact journal id
 ```
 
 step ledger は action key ごとに記録され、`done` の step は再実行しない。6 field のいずれかが
 drift すれば **別の key** になるため、古い ledger が新しい action を満たすことはない。これが
 「部分失敗から再実行しても duplicate merge / delete を起こさない」の実体である。
+
+`review_generation` は caller が自由に命名する世代 label ではない。最新の correlated approval が
+承認した `review_request` の **exact journal id** である。production composition は ledger / action
+registry を開く前に durable journal からこの値を再構成して action record と照合し、actuator も
+各 action-time preflight で再照合する。したがって、未承認の文字列を action key に入れて新しい
+世代を作ることはできない。composition が返す mutation capability も、そこで承認した exact
+action key だけでなく workspace / lane / branch / worktree / repo root を含む durable resume frame
+全体へ pin される。正しい record で composition した後に別 frame を registry へ差し替える経路も
+拒否する。
 
 段階別 outcome は `done` / `not_applicable` / `blocked` / `pending` の 4 値で、
 「走った」「そもそも該当しない」「拒否された」「まだ決着していない」を畳まない。
@@ -571,9 +580,24 @@ integration batch は別 run であり、前者を後者に流用しない。
   返答の `head_sha` / `head_branch` / workflow / run id / conclusion を再照合する。後発 failure / pending は古い
   success を撤回し、unavailable は fail-closed。
 
-`callbacks_drained` は workspace の callback outbox の未解決債務 (既存 authority)、`owner_gates_resolved` は
-issue 自身の canonical gate fold (`fold_issue_gate_facts`) の `blocked` gate / 未解決 review round から読む。
-actuator は「この issue が止まっているか」について二つ目の意見を持たない。
+`callbacks_drained` は callback outbox のうち **exact workspace + issue + owning lane** に属する
+未解決債務だけを読む。ここには名前が似た二つの lifecycle 軸があるため、混同しない。
+
+- `coordinator` route の `enqueue_lane_generation` は lane incarnation (`lane_generation`) と比較する。
+- `lane_gateway` / `review_return` route の `target_generation` は lifecycle CAS `revision` と比較し、
+  route suffix と `target_lane` も current lane と byte-exact 一致させる。
+
+production reader は action-time ごとに active owner と lifecycle row を読み直す。foreign workspace /
+issue、正規だが異なる過去世代・revision、route と `target_lane` が一致して証明できる別 lane は
+現在 action を止めない。一方、同一 scope の空・padded・不正・競合 identity、unknown route、
+legacy blank workspace、outbox / lifecycle read failure は fail-closed で止める。coordinator row は
+owning lane id を保存していないため、owner 交代後に別 lane が同じ incarnation number を持つ場合は
+foreign と証明できず保守的に debt のままとする。workspace-wide の未解決数をそのまま使う
+hibernate 向け authority とは integration action の scope が異なる。
+
+`owner_gates_resolved` は issue 自身の canonical gate fold (`fold_issue_gate_facts`) の `blocked` gate /
+未解決 review round から読む。actuator は「この issue が止まっているか」について二つ目の意見を
+持たない。
 
 ### ledger は admission に紐づく receipt でしか書けない (item 4 / R2 で修正)
 
@@ -597,6 +621,11 @@ actuator は「この issue が止まっているか」について二つ目の�
 - **ledger 単独で cleanup を authorize しない。** accepted push receipt の landed head と、ledger writer が
   支配しない coordinator-issued integration disposition の landed head が exact 一致して初めて authorizing action
   になる。shared file が相互不信 process を暗号学的に認証するとは主張しない。
+- **信頼主体は専用 ledger process ではなく、この運用では OS account である。** repository、Git remote、
+  Redmine credential と ledger file を同じ OS account が保有するため、private writer surface は誤用を
+  減らす API boundary であって、悪意ある same-UID code に対する security boundary ではない。same-UID
+  code や SQLite 直接改変を脅威モデルへ含めるなら、ledger だけを daemon 化しても成立せず、Git /
+  Redmine mutation credential を含む全 mutation authority を別 OS principal へ移す必要がある。
 - **crash は検出だけでなく回復する** (j#96611 finding 5)。crash した run の token は道連れになるので、
   `resolve_intent` は token 無しで **観測した exact intent id の open rowだけ**を CAS で閉じ、resolution の
   action / step identity と settled outcome 語彙を store 側で照合してから **reconciler が測定した内容**を記録し、
