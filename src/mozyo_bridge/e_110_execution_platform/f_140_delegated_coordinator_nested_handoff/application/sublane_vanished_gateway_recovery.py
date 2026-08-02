@@ -480,16 +480,12 @@ def plan_fresh_recovery(
 
     decision, continuation = _pointers(anchor)
     try:
-        applied = getattr(
-            store.plan_transaction(
-                key,
-                action_generation=RECOVERY_ACTION_GENERATION,
-                decision=decision,
-                continuation=continuation,
-                participants=[pin],
-            ),
-            "applied",
-            None,
+        store.plan_transaction(
+            key,
+            action_generation=RECOVERY_ACTION_GENERATION,
+            decision=decision,
+            continuation=continuation,
+            participants=[pin],
         )
     except Exception:  # noqa: BLE001
         return RecoveryPlan(
@@ -502,19 +498,13 @@ def plan_fresh_recovery(
             decision=refuse(REFUSE_TRANSACTION_UNAVAILABLE, "the planned row could not be read back"),
             action_id=action_id,
         )
-    # WHO WROTE IT decides the outcome, not whether the row happens to look like ours
-    # (audit j#97157 R9). A race loser's row is byte-identical to the one it tried to write
-    # -- the id is deterministic -- so comparing manifests classified the loser as the
-    # planner. `applied is True` is the store's own answer about which run inserted it, and
-    # anything less certain than that is reported as a resume, because this run did not
-    # write the row it is now reading.
-    return _replayed(
-        current,
-        key,
-        anchor,
-        action_id,
-        outcome=OUTCOME_RECEIPT_PLANNED if applied is True else OUTCOME_REPLAYED,
-    )
+    # OBSERVATIONAL, not causal (ruling j#97162). `plan_transaction` answers
+    # `applied=True` for a pristine re-plan too, so nothing at this seam can say WHICH run
+    # inserted the row -- and with a deterministic id both rows are byte-identical anyway.
+    # So `receipt_planned` means exactly "this fresh path confirmed an exact durable row is
+    # ready after its own plan call", and claims nothing about authorship. Writer identity,
+    # if it is ever needed, wants an atomic result from the store rather than a guess here.
+    return _replayed(current, key, anchor, action_id, outcome=OUTCOME_RECEIPT_PLANNED)
 
 
 __all__ = (

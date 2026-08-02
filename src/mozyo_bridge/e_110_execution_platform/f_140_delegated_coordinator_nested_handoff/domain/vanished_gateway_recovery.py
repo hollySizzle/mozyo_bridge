@@ -49,9 +49,17 @@ REDISPATCH_GATEWAY_ONCE = "redispatch_gateway_implementation_request_once"
 #: The recovery is a plain direct heal: the vanished launch predates identity receipts, so
 #: there is no receipt to prove and no transaction to write.
 OUTCOME_LEGACY_DIRECT = "legacy_direct"
-#: The recovery must go through a durable replacement transaction carrying update evidence.
+#: The fresh path confirmed an exact durable row is ready AFTER its own plan call. This is
+#: an observation, not a claim of authorship: the transaction store answers ``applied=True``
+#: for a pristine re-plan as well, and a deterministic id makes a peer's row byte-identical
+#: to the one this run would have written, so no seam here can say who inserted it
+#: (ruling j#97162).
 OUTCOME_RECEIPT_PLANNED = "receipt_planned"
-#: An existing transaction for this exact action was found and resumed unchanged.
+#: An exact row was confirmed BEFORE any plan call -- either it already existed on the fresh
+#: path, or an explicit action-id replay found it. Also purely observational.
+#:
+#: The two outcomes are one terminal family for anything downstream: they differ in when the
+#: row was observed, not in what authority it carries.
 OUTCOME_REPLAYED = "replayed"
 
 #: No launch-generation row for this participant: nobody recorded which action it belongs to.

@@ -498,17 +498,51 @@ class ReceiptPlanTest(_PlanCase):
         self.assertEqual(after.revision, g1_row.revision, "zero write on the old row")
         self.assertEqual(after.participants, g1_row.participants)
 
-    def test_a_cas_race_loser_resumes_the_peer_row_without_writing(self) -> None:
-        """Audit j#97157 R9, with the window the store can actually distinguish.
+    def test_a_peer_insert_inside_the_plan_call_leaves_the_row_untouched(self) -> None:
+        """The actual CAS window (ruling j#97162), stated observationally.
 
-        MEASURED while writing this: `plan_transaction` is idempotent and answers
-        ``applied=True`` for a byte-identical re-plan, so a loser whose peer inserts
-        STRICTLY INSIDE the plan call is indistinguishable from the planner at this seam --
-        the row is byte-identical either way, because the id is deterministic. What is
-        distinguishable, and what actually protects the row, is the peer landing before this
-        run reads: that resumes, writes nothing, and is asserted here. The narrower window is
-        reported to j#97157 rather than papered over with a fake that only looks like a race.
+        A peer's exact row lands DURING this run's plan call. Nothing at this seam can say
+        who inserted it -- `plan_transaction` answers the same for a pristine re-plan, and
+        the deterministic id makes both rows byte-identical -- so the outcome asserted here
+        is the observation the contract defines: after its own plan call, this fresh path
+        confirmed an exact durable row is ready. What actually matters is that the peer's
+        row is not disturbed: same revision, same manifest, same header.
         """
+        self._seed_generation(action_id=RECEIPT_CAPABLE_ACTION_ID)
+        self._declare_lifecycle()
+        self._seed_bound_evidence()
+
+        real = ReplacementTransactionStore(home=self.home)
+        peer_rows = []
+
+        class _RacingStore:
+            """Empty at the pre-read; the peer lands inside `plan_transaction`."""
+
+            def get(self, key):
+                return real.get(key)
+
+            def plan_transaction(self, key, **kwargs):
+                if not peer_rows:
+                    real.plan_transaction(key, **kwargs)
+                    peer_rows.append(real.get(key))
+                return real.plan_transaction(key, **kwargs)
+
+        plan = plan_fresh_recovery(
+            store_factory=lambda: _RacingStore(), home=self.home,
+            anchor=_anchor(), authority=_evidenced(),
+        )
+        self.assertEqual(plan.decision.outcome, OUTCOME_RECEIPT_PLANNED)
+        self.assertTrue(peer_rows, "the peer really inserted inside the plan call")
+        before = peer_rows[0]
+        after = self._row(plan.action_id)
+        self.assertEqual(after.revision, before.revision, "the peer's row is untouched")
+        self.assertEqual(after.participants_manifest, before.participants_manifest)
+        self.assertEqual(after.action_generation, before.action_generation)
+        self.assertEqual(after.decision_journal, before.decision_journal)
+        self.assertEqual(after.continuation_next_action, before.continuation_next_action)
+
+    def test_an_existing_row_seen_before_the_plan_call_resumes_without_writing(self) -> None:
+        """The other observation: an exact row already there is resumed, plan call 0."""
         self._seed_generation(action_id=RECEIPT_CAPABLE_ACTION_ID)
         self._declare_lifecycle()
         self._seed_bound_evidence()
@@ -520,7 +554,7 @@ class ReceiptPlanTest(_PlanCase):
         planned = []
         real = ReplacementTransactionStore(home=self.home)
 
-        class _LoserStore:
+        class _ObservingStore:
             def get(self, key):
                 return real.get(key)
 
@@ -528,13 +562,13 @@ class ReceiptPlanTest(_PlanCase):
                 planned.append(key)
                 return real.plan_transaction(key, **kwargs)
 
-        loser = plan_fresh_recovery(
-            store_factory=lambda: _LoserStore(), home=self.home,
+        again = plan_fresh_recovery(
+            store_factory=lambda: _ObservingStore(), home=self.home,
             anchor=_anchor(), authority=_evidenced(),
         )
-        self.assertEqual(loser.decision.outcome, OUTCOME_REPLAYED)
-        self.assertEqual(loser.action_id, peer.action_id)
-        self.assertEqual(planned, [], "the loser never attempted a write")
+        self.assertEqual(again.decision.outcome, OUTCOME_REPLAYED)
+        self.assertEqual(again.action_id, peer.action_id)
+        self.assertEqual(planned, [], "no plan call at all")
         after = self._row(peer.action_id)
         self.assertEqual(after.revision, before.revision)
         self.assertEqual(after.participants, before.participants)
