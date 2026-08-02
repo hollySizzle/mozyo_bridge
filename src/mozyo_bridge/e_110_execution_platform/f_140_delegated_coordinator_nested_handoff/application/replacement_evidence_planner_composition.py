@@ -44,7 +44,7 @@ class EvidencePlanning:
         return bool(self.refusal)
 
 
-def _lifecycle_port(home: Path):
+def _lifecycle_port(home: Optional[Path]):
     """``lane_id -> (lane_generation, lifecycle_revision)``, or ``None``.
 
     ``load_lane_lifecycle_readonly`` is the non-creating read: a diagnostic-shaped
@@ -75,7 +75,7 @@ def _lifecycle_port(home: Path):
     return read
 
 
-def _generation_port(home: Path):
+def _generation_port(home: Optional[Path]):
     def read(assigned_name: str):
         from mozyo_bridge.core.state.herdr_launch_generation import (
             HerdrLaunchGenerationStore,
@@ -86,7 +86,7 @@ def _generation_port(home: Path):
     return read
 
 
-def _evidence_port(home: Path):
+def _evidence_port(home: Optional[Path]):
     def read(**lookup):
         from mozyo_bridge.core.state.launch_identity_receipt import (
             LaunchIdentityReceiptStore,
@@ -120,8 +120,13 @@ def _update_cause_port():
     return classify
 
 
-def build_evidence_planner(home: Path):
-    """The planner, bound to the live authorities under ``home``."""
+def build_evidence_planner(home: Optional[Path]):
+    """The planner, bound to the live authorities under ``home``.
+
+    ``None`` means "wherever the stores resolve their own home to" — never ``Path()``,
+    which is the CURRENT DIRECTORY and would silently point every authority at whatever
+    the process happened to be launched from.
+    """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_evidence_planner import (  # noqa: E501
         ReplacementEvidencePlanner,
     )
@@ -161,7 +166,7 @@ def plan_participants_with_evidence(
             lane_id=lane_id,
             expected_update_cause=LAUNCH_CAUSE_UPDATE_RELAUNCH,
         )
-        plan = build_evidence_planner(Path(home) if home else Path()).plan(
+        plan = build_evidence_planner(Path(home) if home is not None else None).plan(
             participants, context
         )
     except EvidencePlanRefused as refusal:
