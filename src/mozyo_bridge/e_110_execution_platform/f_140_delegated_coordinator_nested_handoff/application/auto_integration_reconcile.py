@@ -34,6 +34,17 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ledger import (  # noqa: E501
     AutoIntegrationLedgerError,
+    StepIntent,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_process_ops import (  # noqa: E501
+    RELEASE_OBSERVATION_NOT_RELEASED,
+    RELEASE_OBSERVATION_RELEASED,
+    RELEASE_OBSERVATION_UNAVAILABLE,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_live_ops import (  # noqa: E501
+    REACHABILITY_NOT_REACHABLE,
+    REACHABILITY_REACHABLE,
+    REACHABILITY_UNAVAILABLE,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_policy import (  # noqa: E501
     OUTCOME_BLOCKED,
@@ -42,6 +53,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     STEP_INTEGRATION_APPLY,
     STEP_INTEGRATION_CI,
     STEP_PUSH,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.retirement_cleanup_policy import (  # noqa: E501
+    STEP_PROCESS_RETIRE,
+    CleanupActionRecord,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_records import (  # noqa: E501
     IntegrationActionRecord,
@@ -87,13 +102,20 @@ class StrandedActionReconciler:
     use_case: AutoIntegrationUseCase
 
     def reconcile(self, record: IntegrationActionRecord) -> Reconciliation:
-        """Measure what actually happened for the stranded step, and close it."""
-        stranded = self._open_step(record.action_key)
-        if stranded is None:
+        """Measure what actually happened for the stranded step, and close THAT admission.
+
+        The observed :class:`StepIntent` travels through the whole attempt. R2 carried only the
+        step NAME and let the store re-search for "whatever is open now", so a reconciliation
+        begun against one run could close a LATER run's admission — reproduced (j#96650
+        finding 2), leaving that run's mutation unrecorded and its receipt refused.
+        """
+        observed = self._open_intent(record.action_key)
+        if observed is None:
             return Reconciliation(status=RECONCILED_NOTHING_STRANDED)
+        stranded = observed.step
 
         if stranded == STEP_PUSH:
-            return self._reconcile_push(record)
+            return self._reconcile_push(record, observed)
         if stranded in (STEP_INTEGRATION_APPLY, STEP_INTEGRATION_CI):
             # Neither moves a ref. The apply writes a commit OBJECT into the store and the CI
             # step only observes an asynchronous gate, so re-running either is safe and — for
@@ -102,7 +124,7 @@ class StrandedActionReconciler:
             # decision reads, not a claim that no object was written.
             return self._close(
                 record,
-                step=stranded,
+                observed,
                 landed=False,
                 observation=(
                     f"{stranded} moves no ref: an interrupted attempt left the target "
@@ -124,7 +146,9 @@ class StrandedActionReconciler:
 
     # -- the push, which is the one that publishes -------------------------
 
-    def _reconcile_push(self, record: IntegrationActionRecord) -> Reconciliation:
+    def _reconcile_push(
+        self, record: IntegrationActionRecord, observed: StepIntent
+    ) -> Reconciliation:
         """Did the interrupted push put its commit on the target ref?
 
         The head asked about is the one the push WOULD have offered: a merge disposition
@@ -144,23 +168,39 @@ class StrandedActionReconciler:
                 ),
             )
 
-        # The probe must be able to ask the question at all. An unreadable target tip is not an
-        # unpushed commit, and folding the two would let a network failure re-authorize a push.
-        if not str(ops.remote_branch_tip(record.target_ref) or "").strip():
+        # The THREE-valued probe, not the gate's boolean. R2 checked `remote_branch_tip` once
+        # and then read `commit_on_remote`'s False as "did not land" — but that method folds a
+        # failed tip read, a missing object AND a failed ancestry query into the same False
+        # (measured, j#96650 finding 2), so a probe that could not run re-authorized the push.
+        # A port without the typed probe cannot answer this question at all, which is
+        # `unavailable` rather than an assumption.
+        probe = getattr(ops, "reachability", None)
+        if probe is None:
             return Reconciliation(
                 status=RECONCILED_AMBIGUOUS,
                 step=STEP_PUSH,
                 head=head,
                 detail=(
-                    f"the target ref {record.target_ref!r} could not be read, so whether the "
-                    "push landed is unknown; the admission stays open"
+                    "this git port offers no three-valued reachability probe, so whether the "
+                    "push landed cannot be distinguished from whether it could be checked"
+                ),
+            )
+        answer = str(probe(head, branch=record.target_ref) or REACHABILITY_UNAVAILABLE)
+        if answer not in (REACHABILITY_REACHABLE, REACHABILITY_NOT_REACHABLE):
+            return Reconciliation(
+                status=RECONCILED_AMBIGUOUS,
+                step=STEP_PUSH,
+                head=head,
+                detail=(
+                    f"the target ref {record.target_ref!r} could not be queried ({answer!r}); "
+                    "an unreadable remote is not an unpushed commit, so the admission stays open"
                 ),
             )
 
-        landed = bool(ops.commit_on_remote(head, branch=record.target_ref))
+        landed = answer == REACHABILITY_REACHABLE
         return self._close(
             record,
-            step=STEP_PUSH,
+            observed,
             landed=landed,
             head=head,
             observation=(
@@ -192,13 +232,14 @@ class StrandedActionReconciler:
     def _close(
         self,
         record: IntegrationActionRecord,
+        observed: StepIntent,
         *,
-        step: str,
         landed: bool,
         observation: str,
         detail: str,
         head: str = "",
     ) -> Reconciliation:
+        step = observed.step
         resolution = StepOutcome(
             action_key=record.action_key,
             step=step,
@@ -208,19 +249,11 @@ class StrandedActionReconciler:
             push_status=PUSH_ACCEPTED if (landed and step == STEP_PUSH) else "",
             detail=f"reconciled after an interrupted run: {detail}",
         )
-        resolver = getattr(self.use_case.ledger, "resolve_intent", None)
-        if resolver is None:
-            return Reconciliation(
-                status=RECONCILED_AMBIGUOUS,
-                step=step,
-                head=head,
-                detail=(
-                    "this ledger holds no admissions, so there is nothing to reconcile and "
-                    "nothing that would make the resolution durable"
-                ),
-            )
         try:
-            resolver(
+            self.use_case._resolve_intent(
+                # The exact admission that was OBSERVED, so a later run's admission is not
+                # what gets closed (j#96650 finding 2).
+                intent_id=observed.intent_id,
                 action_key=record.action_key,
                 step=step,
                 resolution=resolution,
@@ -242,15 +275,147 @@ class StrandedActionReconciler:
             detail=detail,
         )
 
-    def _open_step(self, action_key: str) -> Optional[str]:
+    def _open_intent(self, action_key: str) -> Optional[StepIntent]:
+        """The stranded admission INSTANCE, or ``None`` when nothing is stranded."""
         reader = getattr(self.use_case.ledger, "unresolved_intents", None)
         if reader is None:
             return None
         open_intents = reader(action_key=action_key)
-        return str(open_intents[0].step) if open_intents else None
+        return open_intents[0] if open_intents else None
+
+
+@dataclass(frozen=True)
+class StrandedCleanupReconciler:
+    """Closes a stranded ``process_retire`` admission with a measured answer (j#96650 finding 2).
+
+    R2 left this step with no measurement at all — a crash between the release and its receipt
+    reported ``unknown_step`` and stopped the lane forever. The acceptance asks for replay-safe
+    recovery of the mutation/receipt crash, and it does not exempt a mutation for being the only
+    one on its side of the machine.
+
+    The measurement is the lifecycle row the release itself acts on, compared against the action
+    id THIS actuator opens — so it answers "did our release finish", not "is the lane released",
+    which another actor's release would also satisfy. Same three outcomes as the integration
+    side, and ``unavailable`` likewise leaves the admission open.
+    """
+
+    use_case: AutoIntegrationUseCase
+
+    def reconcile(self, record: "CleanupActionRecord") -> Reconciliation:
+        observed = _open_intent(self.use_case.ledger, record.action_key)
+        if observed is None:
+            return Reconciliation(status=RECONCILED_NOTHING_STRANDED)
+        if observed.step != STEP_PROCESS_RETIRE:
+            return Reconciliation(
+                status=RECONCILED_UNKNOWN_STEP,
+                step=observed.step,
+                detail=(
+                    f"no measurement is defined for a stranded {observed.step!r} on the cleanup "
+                    "machine; the admission stays open"
+                ),
+            )
+
+        probe = getattr(self.use_case.processes, "observe_release", None)
+        if probe is None:
+            return Reconciliation(
+                status=RECONCILED_AMBIGUOUS,
+                step=STEP_PROCESS_RETIRE,
+                detail=(
+                    "this managed-process port offers no release observation, so whether the "
+                    "release completed cannot be distinguished from whether it could be checked"
+                ),
+            )
+        answer = str(
+            probe(issue=record.issue, lane_generation=record.lane_generation)
+            or RELEASE_OBSERVATION_UNAVAILABLE
+        )
+        if answer not in (
+            RELEASE_OBSERVATION_RELEASED,
+            RELEASE_OBSERVATION_NOT_RELEASED,
+        ):
+            return Reconciliation(
+                status=RECONCILED_AMBIGUOUS,
+                step=STEP_PROCESS_RETIRE,
+                detail=(
+                    f"the lifecycle authority could not be queried ({answer!r}); an unreadable "
+                    "store is not an unreleased process, so the admission stays open"
+                ),
+            )
+
+        released = answer == RELEASE_OBSERVATION_RELEASED
+        return _close_intent(
+            self.use_case,
+            observed,
+            action_key=record.action_key,
+            landed=released,
+            head="",
+            push_status="",
+            observation=f"lifecycle release observation for this action: {answer}",
+            detail=(
+                "the interrupted release is observed complete; recording the receipt it never "
+                "got to write"
+                if released
+                else "the interrupted release did not complete; the step may be offered again"
+            ),
+        )
+
+
+def _open_intent(ledger, action_key: str) -> Optional[StepIntent]:
+    reader = getattr(ledger, "unresolved_intents", None)
+    if reader is None:
+        return None
+    open_intents = reader(action_key=action_key)
+    return open_intents[0] if open_intents else None
+
+
+def _close_intent(
+    use_case: AutoIntegrationUseCase,
+    observed: StepIntent,
+    *,
+    action_key: str,
+    landed: bool,
+    head: str,
+    push_status: str,
+    observation: str,
+    detail: str,
+) -> Reconciliation:
+    """Record the measured resolution against the OBSERVED admission (shared by both machines)."""
+    resolution = StepOutcome(
+        action_key=action_key,
+        step=observed.step,
+        outcome=OUTCOME_DONE if landed else OUTCOME_BLOCKED,
+        recorded_by=use_case.recorder_id,
+        head=head if landed else "",
+        push_status=push_status if landed else "",
+        detail=f"reconciled after an interrupted run: {detail}",
+    )
+    try:
+        use_case._resolve_intent(
+            intent_id=observed.intent_id,
+            action_key=action_key,
+            step=observed.step,
+            resolution=resolution,
+            observation=observation,
+        )
+    except AutoIntegrationLedgerError as exc:
+        return Reconciliation(
+            status=RECONCILED_STORE_REFUSED,
+            step=observed.step,
+            head=head,
+            observation=observation,
+            detail=str(exc),
+        )
+    return Reconciliation(
+        status=RECONCILED_LANDED if landed else RECONCILED_NOT_LANDED,
+        step=observed.step,
+        head=head if landed else "",
+        observation=observation,
+        detail=detail,
+    )
 
 
 __all__ = (
+    "StrandedCleanupReconciler",
     "RECONCILED_AMBIGUOUS",
     "RECONCILED_LANDED",
     "RECONCILED_NOTHING_STRANDED",

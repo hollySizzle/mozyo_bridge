@@ -181,6 +181,7 @@ class WorkspaceCallbackSupervisor:
             Callable[[str, Sequence[str]], "tuple[tuple[str, ...], tuple[str, ...], Callable[[Sequence[str]], None]]"]
         ] = None,
         hibernate_leg_fn: Optional[Callable[[SupervisedWorkspace, Callable[[], bool]], object]] = None,
+        auto_integration_leg_fn: Optional[Callable[[str, str, object], object]] = None,
     ) -> None:
         holder = str(holder or "").strip()
         if not holder:
@@ -210,6 +211,10 @@ class WorkspaceCallbackSupervisor:
         # Redmine #14219 T2c: the auto-hibernate mode leg — one bounded pass per leased
         # workspace (`workspace_hibernate_leg`). Optional: unwired -> the mode fails closed.
         self._hibernate_leg_fn = hibernate_leg_fn
+        # Redmine #14825: the durable registered-action / asynchronous-CI continuation owner.
+        # It runs on the same leased issue path and shares the pass's one external-mutation
+        # budget, so an accepted push never follows a callback wake in the same bounded pass.
+        self._auto_integration_leg_fn = auto_integration_leg_fn
         # Redmine #13968 F1: the authoritative-workspace resolver — a home-global
         # ``{issue -> sole actively-owning workspace}`` map from the durable lifecycle authority.
         # When wired, each workspace supervises ONLY the issues it uniquely owns (owned-elsewhere /
@@ -630,6 +635,19 @@ class WorkspaceCallbackSupervisor:
             except Exception:  # noqa: BLE001 - a reconcile failure never breaks the sweep
                 pass
 
+        if self._auto_integration_leg_fn is not None and not (
+            pass_budget is not None and _pxb.budget_spent(pass_budget)
+        ):
+            try:
+                auto_outcome = self._auto_integration_leg_fn(workspace_id, issue, source)
+                if pass_budget is not None:
+                    if bool(getattr(auto_outcome, "mutated", False)):
+                        pass_budget["mutated"] = True
+                    if bool(getattr(auto_outcome, "uncertain", False)):
+                        pass_budget["uncertain"] = True
+            except Exception:  # noqa: BLE001 - one continuation never breaks the sweep
+                pass
+
         deliver = report.get("deliver") or {}
         sweep = report.get("sweep") or {}
         # Total fenced this pass: ingest-dropped candidates + send-edge fenced backlog rows.
@@ -843,12 +861,24 @@ def build_supervisor(
         home=home, now_fn=_utc_now_iso,
     )
 
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_supervisor import (  # noqa: E501
+        build_auto_integration_supervisor_leg,
+    )
+
+    workspaces_fn = lambda: default_workspaces(home=home)
+    auto_integration_leg_fn = build_auto_integration_supervisor_leg(
+        home=home,
+        callback_outbox=outbox,
+        lifecycle_store=lifecycle_store,
+        workspaces_fn=workspaces_fn,
+    )
+
     return WorkspaceCallbackSupervisor(
         holder=holder,
         lease_store=lease_store,
         store=store,
         outbox=outbox,
-        workspaces_fn=lambda: default_workspaces(home=home),
+        workspaces_fn=workspaces_fn,
         roster_fn=default_roster,
         redmine_source_fn=lambda ws: default_redmine_source(ws, home=home),
         sender_fn=_sender_fn,
@@ -871,6 +901,7 @@ def build_supervisor(
             home=home, outbox=outbox, source_fn=lambda ws: default_redmine_source(ws, home=home),
             clock_fn=_utc_now_iso,
         ),
+        auto_integration_leg_fn=auto_integration_leg_fn,
     )
 
 

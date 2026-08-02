@@ -50,6 +50,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     PushResult,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_live_ops import (
+    REACHABILITY_NOT_REACHABLE,
+    REACHABILITY_UNAVAILABLE,
     LiveAutoIntegrationGitOperations,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_refspec import (
@@ -770,6 +772,19 @@ class ReadProbeTest(unittest.TestCase):
     def test_an_absent_remote_branch_fails_closed(self) -> None:
         recorder = _Recorder([_ok("")])
         self.assertFalse(_adapter(recorder).commit_on_remote(SOURCE, branch="main"))
+
+    def test_recovery_distinguishes_an_absent_branch_from_an_unavailable_remote(self) -> None:
+        absent = _Recorder([_ok("")])
+        self.assertEqual(
+            _adapter(absent).reachability(SOURCE, branch="new-target"),
+            REACHABILITY_NOT_REACHABLE,
+        )
+
+        unavailable = _Recorder([_fail()])
+        self.assertEqual(
+            _adapter(unavailable).reachability(SOURCE, branch="new-target"),
+            REACHABILITY_UNAVAILABLE,
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover - manual invocation

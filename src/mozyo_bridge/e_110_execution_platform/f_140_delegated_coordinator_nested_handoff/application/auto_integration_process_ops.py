@@ -49,6 +49,7 @@ from dataclasses import dataclass
 from typing import Mapping, Optional, Protocol, Sequence, Tuple, runtime_checkable
 
 from mozyo_bridge.core.state.lane_lifecycle import (
+    RELEASE_NOT_REQUESTED,
     RELEASE_RELEASED,
     LaneLifecycleError,
     LaneLifecycleKey,
@@ -63,6 +64,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 #: generation it resolved, so an operator reading the lifecycle row can tell which action opened
 #: it apart from a ``sublane hibernate`` / ``supersede`` release.
 ACTION_ID_PREFIX = "auto_integration_retire"
+
+#: The three-valued release observation, for the same reason git reachability has one: a
+#: recovery must not read "we could not look" as "it did not happen".
+RELEASE_OBSERVATION_RELEASED = "released"
+RELEASE_OBSERVATION_NOT_RELEASED = "not_released"
+RELEASE_OBSERVATION_UNAVAILABLE = "unavailable"
 
 # Typed refusals. Each is a ZERO-release: nothing was closed, and they stay distinguishable
 # because the operator's next move differs for each (re-form the action against the current
@@ -250,6 +257,52 @@ class LiveManagedProcessOperations:
         )
 
 
+    def observe_release(self, *, issue: str, lane_generation: int) -> str:
+        """Did THIS actuator's release generation complete? (read-only, three-valued.)
+
+        The measurement a stranded ``process_retire`` needs (review j#96650 finding 2). It reads
+        the same lifecycle row the release itself acts on, and compares the stored
+        ``release_action_id`` against the one this actuator opens — so it answers "did OUR
+        release finish", not "is the lane released", which another actor's release would also
+        satisfy.
+
+        ``released`` / ``not_released`` / ``unavailable``, and the third is not folded into the
+        second: a lifecycle store that cannot be read says nothing about what happened.
+        """
+        wanted_issue = str(issue or "").strip()
+        if not wanted_issue or not _is_positive_int(lane_generation):
+            return RELEASE_OBSERVATION_UNAVAILABLE
+        try:
+            records = self.store.records()
+        except (LaneLifecycleError, OSError):
+            return RELEASE_OBSERVATION_UNAVAILABLE
+        matches = [
+            record
+            for record in records
+            if str(record.issue_id or "").strip() == wanted_issue
+            and _is_positive_int(record.lane_generation)
+            and int(record.lane_generation) == int(lane_generation)
+            and str(record.repo_workspace_id) == str(self.lane_workspace)
+            and str(record.lane_id) == str(self.lane_id)
+        ]
+        if len(matches) != 1:
+            return RELEASE_OBSERVATION_UNAVAILABLE
+        record = matches[0]
+        expected = f"{ACTION_ID_PREFIX}:{wanted_issue}:{lane_generation}"
+        stored_action = str(record.release_action_id or "")
+        stored_state = str(record.process_release or "")
+        if stored_state == RELEASE_NOT_REQUESTED and not stored_action:
+            # The only affirmative "it did not happen" observation: no release generation was
+            # ever opened.  Once any action id/state is present, an interrupted or foreign action
+            # is ambiguous to this reconciler and must remain open.
+            return RELEASE_OBSERVATION_NOT_RELEASED
+        if stored_action == expected and stored_state == RELEASE_RELEASED:
+            return RELEASE_OBSERVATION_RELEASED
+        # requested/partial/unknown, a released row owned by another action, and malformed
+        # state/action combinations all mean "we cannot settle OUR stranded mutation".
+        return RELEASE_OBSERVATION_UNAVAILABLE
+
+
 def _is_positive_int(value: object) -> bool:
     """A positive integer, with ``bool`` refused so ``True`` never reads as generation 1."""
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
@@ -257,6 +310,9 @@ def _is_positive_int(value: object) -> bool:
 
 __all__ = (
     "ACTION_ID_PREFIX",
+    "RELEASE_OBSERVATION_NOT_RELEASED",
+    "RELEASE_OBSERVATION_RELEASED",
+    "RELEASE_OBSERVATION_UNAVAILABLE",
     "REFUSE_AMBIGUOUS",
     "REFUSE_FOREIGN_LANE",
     "REFUSE_INVALID_IDENTITY",

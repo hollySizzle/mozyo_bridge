@@ -24,8 +24,13 @@ Where each fact comes from, and why that source is the authority for it:
     answers, written by the same-lane gateway.
 
 ``source_ci`` / :meth:`read_integration_ci`
-    A ``required_ci_green`` record about the EXACT commit being asked about, written by the
-    coordinator. Per-head rather than latest-wins, for the reason that module documents.
+    TWO things, conjoined (review j#96650 finding 5). A ``required_ci_green`` record about the
+    EXACT commit, written by the coordinator — per-head rather than latest-wins, for the reason
+    :mod:`...domain.auto_integration_authority` documents — AND the CI provider's CURRENT
+    verdict for that commit, read now (:mod:`.auto_integration_ci_source`). The marker cannot
+    express a head that went red after it was attested, so on its own it is a gate that opens on
+    stale evidence; the provider cannot express an authority decision, so on its own it is not
+    the attestation the preset requires. Neither alone; both.
 
 ``target_identity_known``
     The committed repository configuration, re-read at action time — a durable, reviewed,
@@ -69,6 +74,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Optional, Sequence, Tuple
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ci_source import (  # noqa: E501
+    CiVerdict,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ports import (  # noqa: E501
     CleanupAuthority,
     IntegrationAuthority,
@@ -105,8 +113,14 @@ IssueClosedReader = Callable[[str], Optional[bool]]
 CallbackDebtReader = Callable[[], Optional[int]]
 #: The integration branches the repository currently declares, re-read at action time.
 IntegrationBranchReader = Callable[[], Tuple[str, ...]]
-#: Which integration action the durable ledger says completed for this lane and source head.
-AuthorizingActionReader = Callable[[CleanupActionRecord], str]
+#: The CI provider's CURRENT verdict for an exact commit. Conjoined with the durable marker,
+#: because the marker cannot express a head that went red after it was attested (j#96650
+#: finding 5).
+CiVerdictReader = Callable[..., "CiVerdict"]
+#: Which integration action the durable ledger says completed for this lane and source head,
+#: given the head the COORDINATOR's record says landed. Both sides are required: the ledger
+#: names the action, the tracker corroborates the commit (review j#96650 finding 1).
+AuthorizingActionReader = Callable[[CleanupActionRecord, str], str]
 
 
 @dataclass(frozen=True)
@@ -120,6 +134,14 @@ class LiveDurableAuthorityReader:
     callback_debt_fn: CallbackDebtReader
     issue_closed_fn: IssueClosedReader
     authorizing_action_fn: AuthorizingActionReader
+    #: The lane branch whose source-CI run the coordinator attested.  Integration CI is instead
+    #: bound to ``record.target_ref``; a fast-forward may have the same SHA on both branches, but
+    #: the issue-branch quick lane and target-branch integration batch are not the same run.
+    source_branch: str = ""
+    #: ``None`` means no action-time CI authority is wired, and CI evidence then establishes
+    #: nothing — the same fail-closed direction as every other unwired port here. It is NOT
+    #: optional in production; the composition root binds it.
+    ci_verdict_fn: Optional[CiVerdictReader] = None
 
     # -- integration -------------------------------------------------------
 
@@ -142,7 +164,12 @@ class LiveDurableAuthorityReader:
             target_identity_known=self._target_is_declared(record.target_ref),
             callbacks_drained=self._callbacks_drained(),
             owner_gates_resolved=self._owner_gates_resolved(journals),
-            source_ci=self._ci_evidence(journals, head=record.source_head),
+            source_ci=self._ci_evidence(
+                journals,
+                head=record.source_head,
+                branch=normalized_branch(self.source_branch),
+                bind_attested_run=True,
+            ),
         )
 
     def read_integration_ci(
@@ -162,7 +189,30 @@ class LiveDurableAuthorityReader:
         journals = self.journals_fn(record.issue)
         if journals is None:
             return None
-        return self._ci_evidence(journals, head=integration_head)
+        return self._ci_evidence(
+            journals,
+            head=integration_head,
+            branch=normalized_branch(record.target_ref),
+            bind_attested_run=False,
+        )
+
+    def required_ci_workflow(self, *, record: IntegrationActionRecord) -> str:
+        """The durable source-CI marker's workflow, without treating it as live-green.
+
+        This is recovery metadata, not authority: the normal reads still conjoin the marker with
+        the provider's current verdict.  A supervisor uses this narrow projection only to recover
+        the required workflow after a process dies between the accepted push receipt and the
+        ``awaiting_ci`` registry transition.
+        """
+        if not self._record_is_ours(
+            issue=record.issue, lane_generation=record.lane_generation
+        ):
+            return ""
+        journals = self.journals_fn(record.issue)
+        if journals is None:
+            return ""
+        found = ci_record_for_head(journals, head=record.source_head, scope=self.scope)
+        return found.workflow if isinstance(found, CiRecord) else ""
 
     # -- cleanup -----------------------------------------------------------
 
@@ -190,9 +240,20 @@ class LiveDurableAuthorityReader:
             and integration.source_head == record.recorded_source_head
         )
         ci = (
-            self._ci_evidence(journals, head=integration.integration_head)
+            self._ci_evidence(
+                journals,
+                head=integration.integration_head,
+                branch=normalized_branch(integration.integration_branch),
+                bind_attested_run=False,
+            )
             if confirmed and integration.integration_head
             else None
+        )
+        # The commit the COORDINATOR says landed — a merge names its integration head, a
+        # fast-forward names the source head. The ledger's push receipt must agree with it, so
+        # a forged receipt alone authorizes nothing.
+        proof_head = (
+            (integration.integration_head or integration.source_head) if confirmed else ""
         )
         return CleanupAuthority(
             issue_closed=self.issue_closed_fn(record.issue) is True,
@@ -203,7 +264,7 @@ class LiveDurableAuthorityReader:
             integration_ci_settled_green=ci is not None,
             callbacks_drained=self._callbacks_drained(),
             owner_gates_resolved=self._owner_gates_resolved(journals),
-            authorizing_action_key=self.authorizing_action_fn(record),
+            authorizing_action_key=self.authorizing_action_fn(record, proof_head),
         )
 
     # -- shared reads ------------------------------------------------------
@@ -259,7 +320,12 @@ class LiveDurableAuthorityReader:
         return not facts.blocker_recorded and not facts.review_round_unresolved
 
     def _ci_evidence(
-        self, journals: Sequence[EvidenceJournal], *, head: str
+        self,
+        journals: Sequence[EvidenceJournal],
+        *,
+        head: str,
+        branch: str,
+        bind_attested_run: bool,
     ) -> Optional[IntegrationCiEvidence]:
         """The CI record about ``head`` as the actuator's evidence type, or ``None``.
 
@@ -271,11 +337,43 @@ class LiveDurableAuthorityReader:
         found = ci_record_for_head(journals, head=head, scope=self.scope)
         if not isinstance(found, CiRecord):
             return None
+        # The attestation is necessary and NOT sufficient (j#96650 finding 5). The marker says
+        # the coordinator recorded a required check green; it cannot say the commit went red
+        # afterwards, because the producer renders no failure. So the provider is asked about
+        # this exact commit now, and anything short of a current success withdraws the evidence.
+        if self.ci_verdict_fn is None:
+            return None
+        verdict = self.ci_verdict_fn(
+            head,
+            workflow=found.workflow,
+            attested_run=found.run if bind_attested_run else "",
+            branch=branch,
+        )
+        if getattr(verdict, "blocks", True):
+            return None
+        # Source CI is the exact coordinator-attested run. Integration CI uses that marker to
+        # authorize the required WORKFLOW, then requires the provider's successful run on the
+        # TARGET branch. This is what lets a fast-forward distinguish issue-branch quick CI from
+        # the same SHA's post-push integration batch without inventing a second conflicting
+        # required_ci_green marker for one head.
+        run = found.run if bind_attested_run else str(getattr(verdict, "run", "") or "")
+        conclusion = (
+            found.conclusion
+            if bind_attested_run
+            else str(getattr(verdict, "conclusion", "") or "")
+        )
+        if not bind_attested_run and (
+            not run
+            or str(getattr(verdict, "commit", "") or "") != found.head
+            or str(getattr(verdict, "branch", "") or "") != branch
+            or str(getattr(verdict, "workflow", "") or "") != found.workflow
+        ):
+            return None
         return IntegrationCiEvidence(
             integration_head=found.head,
             workflow=found.workflow,
-            run=found.run,
-            conclusion=found.conclusion,
+            run=run,
+            conclusion=conclusion,
         )
 
 

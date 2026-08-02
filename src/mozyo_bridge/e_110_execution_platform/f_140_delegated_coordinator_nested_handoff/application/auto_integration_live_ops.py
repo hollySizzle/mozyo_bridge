@@ -107,6 +107,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 #: has no key that could redirect a push.
 DEFAULT_REMOTE = "origin"
 
+#: The three-valued reachability vocabulary (Redmine #14825 review j#96650 finding 2). A gate may
+#: fold the last two together — an unprovable fact opens nothing — but a RECOVERY may not: "the
+#: push is not there" and "we could not look" call for opposite actions.
+REACHABILITY_REACHABLE = "reachable"
+REACHABILITY_NOT_REACHABLE = "not_reachable"
+REACHABILITY_UNAVAILABLE = "unavailable"
+
 #: The identity every actuator-built merge commit carries. A LITERAL, not the host's git
 #: configuration: review j#96412 finding 1 requires that the same action produce the same
 #: commit id, and an identity that varies by host or by `user.name` cannot do that. It also
@@ -282,6 +289,60 @@ class LiveAutoIntegrationGitOperations:
         if self._run("cat-file", "-e", f"{tip}^{{commit}}").returncode != 0:
             return False
         return self.is_ancestor(ancestor=commit, descendant=tip)
+
+    def reachability(self, commit: str, *, branch: str) -> str:
+        """``reachable`` / ``not_reachable`` / ``unavailable`` — the THREE-valued form.
+
+        :meth:`commit_on_remote` folds every failure to ``False``, which is right for a gate (an
+        unprovable fact must not open one) and WRONG for a reconciliation. Review j#96650
+        finding 2: the crash reconciler read that ``False`` as "the push did not land" and
+        allowed the push to be offered again, when an unreadable remote says nothing about
+        whether it landed. The gate keeps its boolean; recovery needs to know the difference.
+
+        ``unavailable`` covers every step that could not be carried out: the remote tip could
+        not be read, the tip is not an object this clone has, or the ancestry query itself
+        failed. Only a query that RAN and answered "no" is ``not_reachable``.
+        """
+        if not _is_full_sha(commit):
+            return REACHABILITY_UNAVAILABLE
+        try:
+            name = _checked_branch(branch)
+        except _UnsafeRefspecError:
+            return REACHABILITY_UNAVAILABLE
+        remote = self._run(
+            "ls-remote", "--heads", "--end-of-options", self.remote, f"refs/heads/{name}"
+        )
+        if remote.returncode != 0:
+            return REACHABILITY_UNAVAILABLE
+        tips = [
+            parts[0]
+            for line in remote.stdout.splitlines()
+            for parts in (line.split(),)
+            if len(parts) == 2 and parts[1] == f"refs/heads/{name}"
+        ]
+        if not tips:
+            # A successful query with no matching ref is an affirmative observation: the push
+            # did not create the branch. It is the recovery case for EMPTY_TARGET_HEAD, not an
+            # unavailable provider.
+            return REACHABILITY_NOT_REACHABLE
+        if len(tips) != 1 or not _is_full_sha(tips[0]):
+            return REACHABILITY_UNAVAILABLE
+        tip = tips[0]
+        if tip == commit:
+            return REACHABILITY_REACHABLE
+        if self._run("cat-file", "-e", f"{tip}^{{commit}}").returncode != 0:
+            return REACHABILITY_UNAVAILABLE
+        if self._run("cat-file", "-e", f"{commit}^{{commit}}").returncode != 0:
+            return REACHABILITY_UNAVAILABLE
+        probe = self._run("merge-base", "--is-ancestor", commit, tip)
+        if probe.returncode == 0:
+            return REACHABILITY_REACHABLE
+        # git documents exit 1 as "not an ancestor"; anything else is the query failing.
+        return (
+            REACHABILITY_NOT_REACHABLE
+            if probe.returncode == 1
+            else REACHABILITY_UNAVAILABLE
+        )
 
     def describe_lane_worktree(self, *, path: str) -> LaneWorktree:
         """Measure the lane's own checkout (read-only), failing closed on every unknown.

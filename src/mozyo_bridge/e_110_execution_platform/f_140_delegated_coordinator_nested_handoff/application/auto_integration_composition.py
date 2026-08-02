@@ -42,20 +42,31 @@ an authority: an implementation that cannot answer leaves the gate closed.
 from __future__ import annotations
 
 import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence, Tuple
 
-from mozyo_bridge.application.repo_local_config_loader import load_repo_local_config
+import yaml
+
+from mozyo_bridge.application.repo_local_config_loader import CONFIG_FILE_RELPATH
 from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_actuator import (  # noqa: E501
     AutoIntegrationUseCase,
     IntegrationRunReport,
     integration_policy_from_config,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ci_source import (  # noqa: E501
+    CI_STATE_FAILURE,
+    CI_STATE_SUCCESS,
+    CiStatusReader,
+    GhCliCiStatusReader,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ledger import (  # noqa: E501
     AutoIntegrationLedgerError,
+    AutoIntegrationLedgerReader,
     SqliteLedgerStore,
+    _open_ledger_writer,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_live_authority import (  # noqa: E501
     LiveDurableAuthorityReader,
@@ -81,6 +92,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LaneScope,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_policy import (  # noqa: E501
+    AutoIntegrationPolicy,
     OUTCOME_DONE,
     OUTCOME_PENDING,
     PUSH_ACCEPTED,
@@ -91,6 +103,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_records import (  # noqa: E501
     IntegrationActionRecord,
     completed_steps,
+    is_full_sha,
     normalized_branch,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
@@ -104,6 +117,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config_records import (  # noqa: E501
     AutoIntegrationConfig,
+    RepoLocalConfigError,
+)
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (  # noqa: E501
+    RepoLocalConfig,
 )
 
 
@@ -221,8 +238,8 @@ def live_issue_closed_reader(
 
 
 def ledger_authorizing_action_reader(
-    ledger: SqliteLedgerStore,
-) -> Callable[[CleanupActionRecord], str]:
+    ledger: "AutoIntegrationLedgerReader",
+) -> Callable[[CleanupActionRecord, str], str]:
     """Which integration action the LEDGER says put this lane's work on the target.
 
     The independent side of the cleanup's authorization check (item 5). The prefix is the action
@@ -243,11 +260,22 @@ def ledger_authorizing_action_reader(
     records a ``done`` push on an accepted one, but this reader checks rather than relies on
     that: it is reading a file, and a file is not an invariant.
 
+    **And the receipt must agree with a record its writer does not control** (review j#96650
+    finding 1). R2 rested the authorization on the ledger alone, and a caller that took its own
+    admission could write the row that satisfied it. ``proof_head`` is the commit the
+    COORDINATOR's integration disposition says landed — read from the tracker, issuer-checked —
+    and the ledger's push receipt must name exactly it. Forging the row is then not enough:
+    the same actor would have to write a coordinator-issued marker on the issue as well, which
+    is a different authority and not one the ledger's file permissions grant.
+
+    ``ledger`` is a READ capability (:class:`AutoIntegrationLedgerReader`). A module that
+    decides who authorized something has no business being able to write what it reads.
+
     Zero matches and more than one both answer ``""``. An empty key matches no record's, so the
     cleanup refuses — an ambiguous authorization is not an authorization.
     """
 
-    def read(record: CleanupActionRecord) -> str:
+    def read(record: CleanupActionRecord, proof_head: str) -> str:
         prefix = "|".join(
             (
                 f"issue={record.issue}",
@@ -256,9 +284,14 @@ def ledger_authorizing_action_reader(
                 "",
             )
         )
+        if not is_full_sha(proof_head):
+            # No corroborating head means nothing to agree with, so nothing is authorized.
+            return ""
         try:
             keys = ledger.completed_action_keys(prefix=prefix, step=STEP_PUSH)
-            landed = [key for key in keys if _push_accepted(ledger, key)]
+            landed = [
+                key for key in keys if _push_accepted(ledger, key, proof_head=proof_head)
+            ]
         except AutoIntegrationLedgerError:
             return ""
         return landed[0] if len(landed) == 1 else ""
@@ -266,12 +299,15 @@ def ledger_authorizing_action_reader(
     return read
 
 
-def _push_accepted(ledger: SqliteLedgerStore, action_key: str) -> bool:
-    """Whether this action's ``done`` push actually reports an accepted landing."""
+def _push_accepted(
+    ledger: "AutoIntegrationLedgerReader", action_key: str, *, proof_head: str
+) -> bool:
+    """Whether this action's ``done`` push reports an accepted landing OF ``proof_head``."""
     return any(
         entry.step == STEP_PUSH
         and entry.outcome == OUTCOME_DONE
         and entry.push_status == PUSH_ACCEPTED
+        and entry.head == proof_head
         for entry in ledger.read(action_key=action_key)
     )
 
@@ -308,6 +344,7 @@ def build_auto_integration_use_case(
     callback_outbox: object = None,
     home: Optional[Path] = None,
     environ: Optional[Mapping[str, str]] = None,
+    ci_reader: Optional[CiStatusReader] = None,
 ) -> AutoIntegrationUseCase:
     """Compose the actuator against live ports, or refuse to compose one at all.
 
@@ -332,6 +369,7 @@ def build_auto_integration_use_case(
     # very shape `LedgerStore`'s own docstring calls out — "handing the caller the ledger is the
     # same mistake as handing it the preflight" (review j#96611 finding 3). A test that needs a
     # scratch ledger passes `home`, which is what the production path uses to find one.
+    durable_writer = _open_ledger_writer(home=home)
     durable_ledger = SqliteLedgerStore(home=home)
     scope = LaneScope(
         workspace=binding.workspace,
@@ -357,12 +395,19 @@ def build_auto_integration_use_case(
             else None
         ),
         issue_closed_fn=live_issue_closed_reader(home=home, environ=environ),
-        authorizing_action_fn=ledger_authorizing_action_reader(durable_ledger),
+        source_branch=binding.branch,
+        ci_verdict_fn=(ci_reader or GhCliCiStatusReader(repo_root=repo_root)).verdict_for,
+        authorizing_action_fn=ledger_authorizing_action_reader(
+            AutoIntegrationLedgerReader(store=durable_ledger)
+        ),
     )
 
     return AutoIntegrationUseCase(
         operations=LiveAutoIntegrationGitOperations(repo_root=repo_root),
         integration_policy=integration_policy_from_config(config),
+        # And re-read before every decision (j#96650 finding 4). The constructor value above is
+        # the starting point; this is what the gates actually consult.
+        policy_source=lambda: _policy_now(repo_root),
         processes=LiveManagedProcessOperations(
             store=store,
             ops=ops,
@@ -371,11 +416,27 @@ def build_auto_integration_use_case(
         ),
         authority=authority,
         ledger=durable_ledger,
+        _ledger_writer=durable_writer,
         lane_worktree=binding.worktree,
         lane_branch=binding.branch,
         lane_issue=binding.issue,
         lane_generation=binding.lane_generation,
     )
+
+
+def _policy_now(repo_root: Path) -> AutoIntegrationPolicy:
+    """The integration policy the repository declares AT THIS MOMENT (fail-closed).
+
+    An unreadable config yields a policy whose ``mode`` is empty — outside the closed
+    vocabulary, so the decision refuses it. That is the same direction as every other
+    unreadable authority here: a config we cannot read has not authorized anything, and it
+    certainly has not authorized what an earlier read of it said.
+    """
+    try:
+        config = load_committed_repo_local_config(repo_root)
+    except Exception:  # noqa: BLE001 — an unreadable config authorizes nothing
+        return AutoIntegrationPolicy(mode="", integration_branch=None, ff_only=True)
+    return integration_policy_from_config(config.auto_integration)
 
 
 def _declared_branches_now(repo_root: Path) -> Tuple[str, ...]:
@@ -385,10 +446,76 @@ def _declared_branches_now(repo_root: Path) -> Tuple[str, ...]:
     the action stops — an unreadable declaration is not a permissive one.
     """
     try:
-        config = load_repo_local_config(repo_root)
+        config = load_committed_repo_local_config(repo_root)
     except Exception:  # noqa: BLE001 — an unreadable config declares no target
         return ()
     return declared_integration_branches(config.auto_integration)
+
+
+def load_committed_repo_local_config(repo_root: Path) -> RepoLocalConfig:
+    """Parse the exact config blob at the repository's current ``HEAD``.
+
+    The working-tree file is not authority: an uncommitted edit has passed neither review nor
+    integration. Resolve ``HEAD`` once, then use that immutable object id for both tree lookup and
+    blob read so a concurrent checkout cannot make this one observation span two commits. A
+    committed tree with no config has the normal disabled default; an unreadable Git observation
+    raises and its callers fail closed.
+    """
+    root = Path(repo_root)
+    relpath = CONFIG_FILE_RELPATH.as_posix()
+
+    def git(*args: str) -> subprocess.CompletedProcess[str]:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(root), *args],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise AutoIntegrationCompositionError(
+                "the committed auto-integration config could not be read "
+                f"({exc.__class__.__name__})"
+            ) from exc
+        if proc.returncode != 0:
+            raise AutoIntegrationCompositionError(
+                "the committed auto-integration config could not be read from Git"
+            )
+        return proc
+
+    head = git("rev-parse", "--verify", "HEAD^{commit}").stdout.strip()
+    if not is_full_sha(head):
+        raise AutoIntegrationCompositionError(
+            "the repository HEAD did not resolve to an exact commit"
+        )
+    names = tuple(
+        line.strip()
+        for line in git(
+            "ls-tree", "--name-only", "--full-tree", head, "--", relpath
+        ).stdout.splitlines()
+        if line.strip()
+    )
+    if not names:
+        return RepoLocalConfig.default()
+    if names != (relpath,):
+        raise AutoIntegrationCompositionError(
+            "the committed auto-integration config path was ambiguous"
+        )
+    text = git("show", f"{head}:{relpath}").stdout
+    try:
+        parsed = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise AutoIntegrationCompositionError(
+            "the committed auto-integration config was not valid YAML"
+        ) from exc
+    if parsed is None:
+        return RepoLocalConfig.default()
+    try:
+        return RepoLocalConfig.from_record(parsed)
+    except RepoLocalConfigError as exc:
+        raise AutoIntegrationCompositionError(
+            "the committed auto-integration config failed the closed schema"
+        ) from exc
 
 
 def _live_inventory_ops(
@@ -418,6 +545,9 @@ CONTINUATION_NOT_AWAITING_CI = "not_awaiting_ci"
 #: The action re-entered and stopped somewhere other than the CI gate — a gate that was open when
 #: the continuation ran. Distinct from "still waiting", because waiting is not the problem.
 CONTINUATION_BLOCKED = "blocked"
+#: CI reached a terminal non-success conclusion. The action is not re-entered: a failed gate is
+#: a terminal observation for this exact continuation frame, not an invitation to mutate.
+CONTINUATION_CI_FAILED = "ci_failed"
 
 
 @dataclass(frozen=True)
@@ -507,8 +637,85 @@ class AsyncCiContinuation:
         )
 
 
+@dataclass(frozen=True)
+class CiSettlementTrigger:
+    """The OWNER and TRIGGER of the asynchronous continuation (review j#96650 finding 3).
+
+    R2 shipped :class:`AsyncCiContinuation` and a manual ``continue`` subcommand, and described
+    the owner as "whoever holds the ledger". That is a description of an owner, not a binding:
+    nothing observed CI reaching a terminal state and re-entered the action. This is the binding.
+
+    - **owner** — this object. It holds the CI source and the use case, and it is the only thing
+      that decides an action is ready to continue.
+    - **trigger** — the CI provider reporting a TERMINAL state for the commit the push landed.
+      Pending is not a trigger; unavailable is not a trigger. Both leave the action exactly
+      where it was.
+    - **idempotency** — the action key and the ledger, as before. Firing this twice re-reads and
+      re-decides; it cannot re-push, because the push step is already recorded ``done`` and a
+      second ``done`` is refused by the store. A repeated *unsettled* firing now also records
+      nothing at all, which R2 claimed and did not do.
+
+    It is a poll rather than a webhook because the durable state it needs — which action landed
+    which commit — lives in the ledger, and a webhook would still have to look it up. What makes
+    it a trigger rather than a timer is that it only continues an action whose CI has SETTLED.
+    """
+
+    use_case: AutoIntegrationUseCase
+    ci_reader: CiStatusReader
+
+    def settle(
+        self,
+        record: IntegrationActionRecord,
+        *,
+        workflow: str = "",
+        attested_run: str = "",
+        branch: str = "",
+    ) -> ContinuationOutcome:
+        """Continue ``record`` iff the CI for the commit it landed has reached a terminal state."""
+        landed = completed_steps(
+            self.use_case.ledger.read(action_key=record.action_key),
+            action_key=record.action_key,
+            recorded_by=self.use_case.recorder_id,
+        ).get(STEP_PUSH)
+        if landed is None or not landed.head:
+            return ContinuationOutcome(
+                status=CONTINUATION_NOT_AWAITING_CI,
+                detail=(
+                    "no push receipt names a landed commit under this action key, so there is "
+                    "nothing for a CI run to be about"
+                ),
+            )
+        verdict = self.ci_reader.verdict_for(
+            landed.head,
+            workflow=str(workflow or ""),
+            attested_run=str(attested_run or ""),
+            branch=normalized_branch(branch),
+        )
+        if verdict.state not in (CI_STATE_SUCCESS, CI_STATE_FAILURE):
+            return ContinuationOutcome(
+                status=CONTINUATION_CI_UNSETTLED,
+                landed_head=landed.head,
+                detail=(
+                    f"CI for {landed.head} has not settled ({verdict.state}: {verdict.detail}); "
+                    "the action is not re-entered and nothing is recorded"
+                ),
+            )
+        if verdict.state == CI_STATE_FAILURE:
+            return ContinuationOutcome(
+                status=CONTINUATION_CI_FAILED,
+                landed_head=landed.head,
+                detail=(
+                    f"CI for {landed.head} settled unsuccessfully ({verdict.detail}); "
+                    "the action is not re-entered and no mutation is attempted"
+                ),
+            )
+        return AsyncCiContinuation(use_case=self.use_case).resume(record)
+
+
 __all__ = (
+    "CiSettlementTrigger",
     "CONTINUATION_BLOCKED",
+    "CONTINUATION_CI_FAILED",
     "CONTINUATION_CI_UNSETTLED",
     "CONTINUATION_INTEGRATED",
     "CONTINUATION_NOT_AWAITING_CI",
@@ -519,6 +726,7 @@ __all__ = (
     "build_auto_integration_use_case",
     "declared_integration_branches",
     "ledger_authorizing_action_reader",
+    "load_committed_repo_local_config",
     "live_issue_closed_reader",
     "live_journal_reader",
 )

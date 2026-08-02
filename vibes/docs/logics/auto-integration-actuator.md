@@ -389,10 +389,13 @@ application/auto_integration_live_ops.py live subprocess adapter (実 git)
 application/auto_integration_refspec.py  ref spelling 検査 + porcelain 自 ref 行の push 分類
 application/auto_integration_live_authority.py live DurableAuthorityReader (#14825)
 application/auto_integration_ledger.py   durable append-only step ledger (SQLite, #14825)
+application/auto_integration_action_registry.py immutable action frame + continuation events (#14825 R2)
+application/auto_integration_ci_source.py GitHub Actions の current exact-workflow verdict (#14825 R2)
 application/auto_integration_process_ops.py live ManagedProcessOperations (#14825)
 application/auto_integration_composition.py production composition root + async CI 継続 (#14825)
 application/auto_integration_reconcile.py crash で取り残された admission の recovery (#14825 R2)
 application/cli_workflow_auto_integration.py `workflow auto-integration` runtime entrypoint (#14825 R2)
+application/auto_integration_supervisor.py scheduled continuation owner (#14825 R2)
 ```
 
 `auto_integration_refspec.py` は R22 (j#96516 裁定 2) で `live_ops` から分割した。責務は
@@ -491,8 +494,12 @@ domain は IO を持たず、事実は全て caller が preflight として渡�
 **decision が authorize した step だけ**を 1 回ずつ実行し、outcome を ledger へ積む。
 
 CI は actuator が actuate しない。統合 SHA の CI は非同期 gate であり、use case は
-`pending` を記録して停止する。呼び手は run が **決着した後**に `done` として記録し、verdict を
-`integration_ci_green` として渡す。「run が決着した」と「run が green だった」は別の事実である。
+`pending` を記録して停止する。workspace callback supervisor が永続 action registry から同じ frame を
+発見し、**landed SHA + target branch + required workflow** の provider verdict を poll する。success の
+ときだけ同じ action を再入し、
+live authority reader が durable marker と provider の current verdict を再測定して terminal へ進める。
+failure は `ci_failed`、pending / unavailable は `awaiting_ci` のままである。「run が決着した」と
+「run が green だった」は別の事実である。
 
 ## 設定 (`.mozyo-bridge/config.yaml` の `auto_integration`)
 
@@ -551,14 +558,18 @@ evidence の lane envelope は **actuator 自身の設定** (`LaneScope`) と ex
 target を見ないのは自身の anchor check を tautology にしないためで、比較そのものは caller 側で行う
 (hibernate では T1 classifier が同じ役割を担う)。
 
-**CI だけは latest-wins ではなく head 単位で読む。** source branch の CI と統合 SHA の CI は同じ
-`required_ci_green` gate の下で **別 commit** についての記録であり、後者は前者の後に必ず記録される。
-latest-wins だと統合 SHA の run が着地した瞬間 — つまり非同期継続が再入するその瞬間 — に source CI gate が
-落ち始め、run は永久に `integrated` へ到達できない。したがって問う質問は「この exact commit について green な
-required-CI 記録があるか」であり、別 commit についての記録はこの commit について何も述べていない。
-同一 head について**相異なる** 2 記録は従来どおり conflict で拒否する。境界として、red run は marker を持てない
-(producer は `conclusion=success` しか描画しない) ため「後で red になった」は読めない。撤回は記録ではなく
-action で表現される — action を組み直せば head が変わり、head は一度しか統合されない。
+**CI は head 単位かつ branch context 付きで読む。** source CI と integration CI は merge なら別 commit、
+fast-forward なら同じ commit になり得る。同じ SHA でも issue branch の quick run と target branch (`main` 等) の
+integration batch は別 run であり、前者を後者に流用しない。
+
+- source CI: coordinator の `required_ci_green` marker が名指す exact workflow / run を source branch 上で
+  provider と再照合する。
+- integration CI: 同 marker が required workflow を authority として定め、provider が返す **landed SHA +
+  target branch** の最新 run を evidence の run id / conclusion とする。fast-forward の同一 head に相異なる2 markerを
+  作ると既存 grammar が conflict にするため、target run の事実は provider sourceから取る。
+- provider query は installed `gh` でも成立する `gh api --method GET .../actions/runs -f head_sha=<sha>` を使い、
+  返答の `head_sha` / `head_branch` / workflow / run id / conclusion を再照合する。後発 failure / pending は古い
+  success を撤回し、unavailable は fail-closed。
 
 `callbacks_drained` は workspace の callback outbox の未解決債務 (既存 authority)、`owner_gates_resolved` は
 issue 自身の canonical gate fold (`fold_issue_gate_facts`) の `blocked` gate / 未解決 review round から読む。
@@ -574,18 +585,21 @@ actuator は「この issue が止まっているか」について二つ目の�
 > `done` + `push_status=accepted` の push receipt を作り、それが cleanup の authorizing action として
 > 採用されることを再現した。以下が現行契約である。
 
-- **receipt は admission に紐づく。** `begin_step` が one-time token を open intent 行へ鋳造して返し、
+- **public store は read capability。** 通常 caller が構築する `SqliteLedgerStore` は read-only で、
+  mutation capability は production composition が actuator / reconciler 内へ私有する。authorization reader は
+  `AutoIntegrationLedgerReader` だけを持ち、`begin_step` / `append` / `resolve_intent` を持たない。
+- **receipt は admission に紐づく。** private writer の `begin_step` が one-time token を open intent 行へ鋳造して返し、
   `append` は **その `(action_key, step)` の open intent と一致する token** を要求する。誰も admit されて
   いない step の outcome は記録できない。
 - **admission は compare-and-set である。** open intent への partial unique index により、同一 step への
   2 つ目の `begin_step` は **副作用の前に** 拒否される。R1 は `unresolved_intents` を読んでから insert する
   check-then-write で、2 つの run が同じ push に admit された (j#96611 finding 4 実測)。
-- **信頼境界の主張範囲。** file を共有する 2 process は互いを認証できない。filesystem permission が依然
-  外側の境界であり、admission が足すのは「偽造者はまず admission を勝ち取らねばならず、その間 本物の
-  actuator は refuse される」= **偽造が静かでなく騒がしくなる**ことだけである。これは
-  「相互不信の process 間で認証される」より弱い主張であり、共有 file が支えられる最強の主張でもある。
+- **ledger 単独で cleanup を authorize しない。** accepted push receipt の landed head と、ledger writer が
+  支配しない coordinator-issued integration disposition の landed head が exact 一致して初めて authorizing action
+  になる。shared file が相互不信 process を暗号学的に認証するとは主張しない。
 - **crash は検出だけでなく回復する** (j#96611 finding 5)。crash した run の token は道連れになるので、
-  `resolve_intent` は token 無しで open intent を閉じ、**reconciler が測定した内容**を記録して行を
+  `resolve_intent` は token 無しで **観測した exact intent id の open rowだけ**を CAS で閉じ、resolution の
+  action / step identity と settled outcome 語彙を store 側で照合してから **reconciler が測定した内容**を記録し、
   `reconciled` と印づける (「やった run がそう言った」と「後の run が見に行った」を durable record で混同しない)。
   open intent の存在は要求するので、receipt を捏造する第二の経路にはならない。
 - `done` step は action key ごとに一度だけ (partial unique index)。
@@ -618,11 +632,14 @@ publish したか) だけを問う。
 
 ### 非同期 CI は待たずに継続する (item 3)
 
-`AsyncCiContinuation` は同じ action record で `run_integration` を再入するだけである。owner は ledger を持つ者、
-trigger は再呼び出し、idempotency は **action key + ledger の一意制約**。二重 wake / operator の再実行 /
-supervisor の retry は再読み・再判断するだけで再 push できない (push は既に `done`、二度目の `done` は store が
-拒否する)。分類は **terminal state** で行う (`integrated` に到達したか) — ledger の CI entry を見る形は
-production では常に blocked と報告する (実測)。
+`AsyncCiContinuation` は同じ action record で `run_integration` を再入する。通常 owner / trigger は production
+`WorkspaceCallbackSupervisor` に結線した `AutoIntegrationSupervisorLeg` である。bounded reconciliation の
+issue lease 内で `registered` / `awaiting_ci` action を永続 registry から発見し、landed SHA + target branch +
+required workflow の current verdict を poll する。idempotency は **immutable action frame + append-only
+transition + step ledger の一意制約**。
+二重 wake / operator の再実行 / supervisor retry は再読み・再判断するだけで再 push できない (push は既に
+`done`、二度目の receipt は store が拒否する)。1 pass / leg の external mutation は 1 件までで、callback /
+reconcile / hibernate と pass-wide budget を共有する。分類は **action registry の terminal state** で行う。
 
 ### target branch は設定されているか、actuator が存在しないか (item 6)
 
@@ -631,7 +648,9 @@ production では常に blocked と報告する (実測)。
 代替する形は #13686 が merge (j#96406 F1) / branch delete (j#96396) / worktree remove (j#96401) から
 取り除いた当のものである。composition root は未設定の場合 actuator を **組み立てない** (例外)。
 
-`target_identity_known` は committed config を **呼び出しごとに** 読み直して答える。これは
+`mode` / `ff_only` / `integration_branch` は作業ツリーの未 commit ファイルではなく、current `HEAD` の
+exact config blob を **decision ごとに** 読み直す。未 review のローカル編集は operational intent の authority
+ではない。`target_identity_known` も同じ committed config を **呼び出しごとに** 読み直して答える。これは
 `policy.integration_branch` (この instance が構築された値) とは **別の問い** であり、repository が現在宣言して
 いない branch に対して構築された actuator は、その不一致で fail-closed する。
 
@@ -642,13 +661,21 @@ production では常に blocked と報告する (実測)。
 
 ### runtime entrypoint (R2 / j#96611 finding 1)
 
-`workflow auto-integration <run|continue|reconcile>`
+`workflow auto-integration <run|continue|settle|reconcile|cleanup|reconcile-cleanup>`
 (`application/cli_workflow_auto_integration.py`)。R1 は composition root と continuation を作って
 **どこからも呼ばれない**まま置いた (`grep` の runtime 参照 0 件)。**誰も呼ばない trigger は trigger ではない。**
 
-- `run` — action を形成し integration machine を rest まで駆動する (非同期 CI gate で止まる)。
-- `continue` — CI 決着後に **同じ action** を再入する。item 3 が要求する trigger の実体。
-- `reconcile` — crash で取り残された admission を測定で閉じる。
+- `run` — immutable action frame を mutation より先に登録し、integration machine を rest まで駆動する。
+- `continue` — **同じ action** を手動再入する recovery/debug surface。authority gate は迂回しない。
+- `settle` — provider を手動 poll し、terminal success のときだけ再入する recovery/debug surface。
+- `reconcile` — crash で取り残された integration admission を remote の 3 値測定で閉じる。
+- `cleanup` — guarded managed-process release を実行する。
+- `reconcile-cleanup` — release 周辺で取り残された cleanup admission を観測で閉じる。
+
+通常 trigger は CLI ではなく scheduled workspace supervisor である。CLI `run` は実 `CallbackOutbox` を渡し、
+accepted push と required workflow を durable registry に残すため、別 process の supervisor が exact frame を
+復元できる。public `SqliteLedgerStore` は read capability のみで、mutation capability は actuator / reconciler の
+private composition に限定する。
 
 **この command は authority を足さない。** 引数から identity を解決し composition root へ渡し、machine の
 判断を印字するだけである。gate を skip / force / waive する flag は存在せず、**`--target-ref` も存在しない**
@@ -670,20 +697,19 @@ close 0 で admission block になる)。
 
 ## scope 境界 / 未了
 
-- **CLI subcommand 結線は本 tranche に含まない。** `application/cli_sublane_retire.py` が
-  #14755 の保護 path であるため、R1 では library + config + docs + preset 層までとした。
-  actuator を運用 command から呼ぶ結線は follow-up。
-- **Herdr live smoke / live acceptance は未実施。** #13686 受入条件の残余として親 #12603 へ
-  引き継ぐ。#14825 も同じ残余を持つ: composition root は live port を束ねるが、実 Redmine /
-  実 herdr / 実 remote に対する end-to-end 実行は本 tranche で行っていない (実 lifecycle store /
-  実 SQLite ledger に対する production test までが到達点)。**したがって #14825 の受入条件
-  「test fake なしの production composition で success path が成立する」は、composition の
-  存在としては満たすが live 実行の実測としては未達である。**
-- **CI evidence の red 表現が無い。** `required_ci_green` marker は `conclusion=success` しか
-  描画できないため、「一度 green と記録された head が後で red になった」を durable record 側で
-  表現する手段が無い。本 issue は head 単位読取でこの穴を広げてはいないが、閉じてもいない
-  (撤回は action の組み直し = 別 head で表現する、という設計依存)。marker vocabulary の拡張要否は
-  coordinator 判断とする。
+- ~~**CLI subcommand 結線は本 tranche に含まない。**~~ **撤回済み (#14825 R2)。** #13686 R1 時点の
+  記述であり、`workflow auto-integration` の結線で解消した (`### runtime entrypoint`)。R2 はこの
+  bullet を残したまま新節を足し、**同じ doc が「結線済み」と「結線しない」を同時に述べる**状態を
+  作った (review j#96650 finding 6)。`application/cli_sublane_retire.py` (#14755 の保護 path) には
+  依然触れていない — 新設した command は `workflow` family 側にある。
+- **Herdr / Redmine / remote / ledger の live smoke は commit 後の受入手順で実施する。** unit /
+  integration test の fake-free production composition と、実環境 smoke の結果を混同しない。実測前に
+  live acceptance 済みとは記録しない。
+- durable `required_ci_green` marker は authority attestation、GitHub Actions source は action-time の
+  current factとして **積**で評価する。source CI は marker の exact run + source branch、integration CI は
+  landed SHA + target branch 上の同 workflow の最新 runを要求する。後発 failure / pending は古い green を
+  撤回し、provider unavailable は fail-closed。marker vocabularyを拡張せず red-survival と fast-forward時の
+  source-run流用の両holeを閉じる。
 - `domain/sublane_integration_policy.py` (#12604) の retire 判断は **置き換えていない**。本 doc の
   2 machine はその隣に新設したものであり、既存 `sublane retire` の挙動は変えていない。両者の
   統合 / 片寄せは別 issue の判断とする。
@@ -711,7 +737,9 @@ close 0 で admission block になる)。
   非同期 CI 継続、cleanup authorization。R1 review j#96611 の finding 3/4/5 は
   `R1ReviewFindingRegressionTest` に **再現した入力そのもの** で pin してある。verdict は j#96613)
 - `python3 -m unittest tests.integration.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.test_issue_14825_auto_integration_cli`
-  (runtime entrypoint の到達可能性。j#96611 finding 1)
+  (6 runtime subcommand と実 callback outbox の到達可能性。j#96611 finding 1 / j#96650 finding 7)
+- `python3 -m unittest tests.integration.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.test_issue_14825_auto_integration_supervisor`
+  (scheduled owner、pending→success、duplicate wake、push crash recovery、canonical root fence)
 - `python3 -m unittest tests.unit.e_130_governance_distribution.f_140_rules_docs_catalog.test_auto_integration_config`
 - `PYTHONPATH=src python3 -m mozyo_bridge docs validate --repo .` ほか catalog 検証一式。
 - preset 本文を変えたため `PYTHONPATH=src python3 -m mozyo_bridge scaffold canonical --check` と

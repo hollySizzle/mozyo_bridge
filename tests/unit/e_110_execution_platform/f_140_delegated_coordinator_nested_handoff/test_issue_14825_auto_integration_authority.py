@@ -14,8 +14,15 @@ Pins what the fold establishes and — more of the file — what it refuses:
 
 from __future__ import annotations
 
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ci_source import (  # noqa: E501
+    CI_STATE_SUCCESS,
+    CiVerdict,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_composition import (  # noqa: E501
     AutoIntegrationCompositionError,
     LaneBinding,
@@ -304,7 +311,17 @@ def _reader(journals, **over):
         integration_branches_fn=lambda: (TARGET_REF,),
         callback_debt_fn=lambda: 0,
         issue_closed_fn=lambda issue: True,
-        authorizing_action_fn=lambda record: "",
+        authorizing_action_fn=lambda record, proof_head: "",
+        source_branch="issue_14825",
+        ci_verdict_fn=lambda head, **scope: CiVerdict(
+            CI_STATE_SUCCESS,
+            "fixed",
+            run=scope.get("attested_run") or "target-run",
+            workflow=scope.get("workflow") or "",
+            commit=head,
+            branch=scope.get("branch") or "",
+            conclusion="success",
+        ),
     )
     fields.update(over)
     return LiveDurableAuthorityReader(**fields)  # type: ignore[arg-type]
@@ -337,6 +354,32 @@ class ReaderIdentityFenceTest(unittest.TestCase):
         self.assertTrue(authority.callbacks_drained)
         self.assertIsNotNone(authority.source_ci)
         self.assertEqual(authority.source_ci.run, "299")
+
+    def test_fast_forward_integration_ci_uses_the_target_branch_provider_run(self) -> None:
+        journals = _approved_journals() + [
+            _journal("96530", _ci_note(head=SOURCE), ISSUER_COORDINATOR)
+        ]
+        calls = []
+
+        def verdict(head, **scope):
+            calls.append((head, scope))
+            return CiVerdict(
+                CI_STATE_SUCCESS,
+                "fixed",
+                run="target-run-300",
+                workflow=scope["workflow"],
+                commit=head,
+                branch=scope["branch"],
+                conclusion="success",
+            )
+
+        evidence = _reader(journals, ci_verdict_fn=verdict).read_integration_ci(
+            record=_action(), integration_head=SOURCE
+        )
+        self.assertIsNotNone(evidence)
+        self.assertEqual(evidence.run, "target-run-300")
+        self.assertEqual(calls[0][1]["branch"], TARGET_REF)
+        self.assertEqual(calls[0][1]["attested_run"], "")
 
     def test_another_issues_record_never_reaches_the_journals(self) -> None:
         reads: list = []
@@ -443,6 +486,68 @@ class ActionTimeFreshReadTest(unittest.TestCase):
         self.assertEqual(
             _declared_branches_now(pathlib.Path("/nonexistent-repo-root-14825")), ()
         )
+
+    def test_policy_reads_each_committed_head_and_ignores_the_worktree_file(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_composition import (  # noqa: E501
+            _declared_branches_now,
+            _policy_now,
+            load_committed_repo_local_config,
+        )
+
+        initial = """\
+version: 2
+auto_integration:
+  mode: auto
+  integration_branch: main
+  ff_only: false
+"""
+        tightened = """\
+version: 2
+auto_integration:
+  mode: disabled
+  integration_branch: release
+  ff_only: true
+"""
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+
+            def git(*args: str) -> None:
+                subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            git("init", "-q")
+            git("config", "user.name", "mozyo-bridge test")
+            git("config", "user.email", "test@example.invalid")
+            path = repo / ".mozyo-bridge" / "config.yaml"
+            path.parent.mkdir(parents=True)
+            path.write_text(initial, encoding="utf-8")
+            git("add", ".mozyo-bridge/config.yaml")
+            git("commit", "-qm", "initial config")
+
+            # A dirty working-tree edit has no review/integration provenance and is not policy.
+            path.write_text(tightened, encoding="utf-8")
+            committed = load_committed_repo_local_config(repo)
+            self.assertEqual(committed.auto_integration.integration_branch, "main")
+            before = _policy_now(repo)
+            self.assertEqual(
+                (before.mode, before.integration_branch, before.ff_only),
+                ("auto", "main", False),
+            )
+            self.assertEqual(_declared_branches_now(repo), ("main",))
+
+            # Once the exact blob becomes HEAD, a later action-time read observes it.
+            git("add", ".mozyo-bridge/config.yaml")
+            git("commit", "-qm", "tighten config")
+            after = _policy_now(repo)
+            self.assertEqual(
+                (after.mode, after.integration_branch, after.ff_only),
+                ("disabled", "release", True),
+            )
+            self.assertEqual(_declared_branches_now(repo), ("release",))
 
     def test_the_issuer_anchor_is_resolved_per_read(self) -> None:
         # The anchor binds a writer to a role. R1 resolved it once when the reader was built.

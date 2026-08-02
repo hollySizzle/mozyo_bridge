@@ -63,10 +63,33 @@ from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
 from mozyo_bridge.shared.paths import mozyo_bridge_home
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_action_registry import (  # noqa: E501
+    ACTION_AWAITING_CI,
+    ACTION_CI_FAILED,
+    ACTION_INDEX_SQL,
+    ACTION_INTEGRATED,
+    ACTION_REGISTERED,
+    ACTION_SCHEMA_SQL,
+    ACTION_STATES,
+    ActionRegistryError,
+    DurableIntegrationAction,
+    action_event_count as _action_event_count,
+    mark_action_awaiting_ci as _mark_action_awaiting_ci,
+    mark_action_terminal as _mark_action_terminal,
+    read_action as _read_action,
+    register_action as _register_action,
+    resumable_actions as _resumable_actions,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_records import (  # noqa: E501
+    OUTCOME_BLOCKED,
     OUTCOME_DONE,
+    OUTCOME_PENDING,
     StepOutcome,
 )
+
+#: What a reconciliation may record. A measurement settles a question, so ``pending`` is not an
+#: answer it can give — and an outcome outside this set is a caller inventing a vocabulary.
+_RECONCILABLE_OUTCOMES = frozenset({OUTCOME_DONE, OUTCOME_BLOCKED})
 
 #: The ledger file, alongside the other home-scoped durable stores.
 AUTO_INTEGRATION_LEDGER_FILENAME = "auto_integration_ledger.sqlite3"
@@ -79,7 +102,7 @@ AUTO_INTEGRATION_LEDGER_FILENAME = "auto_integration_ledger.sqlite3"
 #: there is nothing to migrate — this feature has never run, so no v1 file exists outside a test
 #: that creates one; a v1 file is refused rather than silently upgraded, which is the same
 #: downgrade-safe posture in the other direction.
-AUTO_INTEGRATION_LEDGER_SCHEMA_VERSION = 2
+AUTO_INTEGRATION_LEDGER_SCHEMA_VERSION = 3
 
 _WRITER_SQL = """
 CREATE TABLE IF NOT EXISTS auto_integration_writer (
@@ -136,7 +159,7 @@ _INDEX_SQL = (
     "ON auto_integration_intent(action_key, step) WHERE resolved_at IS NULL",
     "CREATE INDEX IF NOT EXISTS idx_auto_integration_intent_open "
     "ON auto_integration_intent(action_key, resolved_at)",
-)
+) + ACTION_INDEX_SQL
 
 #: How an intent was closed. ``receipt`` is the run that was admitted presenting its own token;
 #: ``reconciled`` is a LATER run that measured the world because the admitted run never came
@@ -188,12 +211,44 @@ class StepIntent:
     receipt: str = ""
 
 
+# The production mutation capability is deliberately module-private.  A public
+# ``SqliteLedgerStore`` is a reader: constructing one no longer gives arbitrary code the
+# begin+append pair that review j#96650 used to forge an accepted push.  The composition root
+# mints the writer and keeps it inside the use case/reconciler boundary.
+_LEDGER_WRITER_CAPABILITY = object()
+
+
 def auto_integration_ledger_path(home: Optional[Path] = None) -> Path:
     return (home or mozyo_bridge_home()) / AUTO_INTEGRATION_LEDGER_FILENAME
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+@dataclass(frozen=True)
+class AutoIntegrationLedgerReader:
+    """The ledger's READ surface, with no way to write through it (j#96650 finding 1).
+
+    The authorization derivation holds one of these. R2 handed it the whole store, so the
+    module that decides "which action authorized this cleanup" was also able to manufacture the
+    row it then read. Separating the capability does not make a shared file authenticate its
+    writers — nothing in one process can — but it removes the shape where a read path carries a
+    write capability it never needs.
+
+    **This is one of two halves.** The other is that the authorization is corroborated against a
+    record the ledger's writer does not control (the coordinator's integration disposition, read
+    from the tracker), so a forged ledger row alone establishes nothing. Neither half is
+    sufficient; the finding is answered by both.
+    """
+
+    store: "SqliteLedgerStore"
+
+    def read(self, *, action_key: str) -> Sequence[StepOutcome]:
+        return self.store.read(action_key=action_key)
+
+    def completed_action_keys(self, *, prefix: str, step: str) -> Tuple[str, ...]:
+        return self.store.completed_action_keys(prefix=prefix, step=step)
 
 
 class SqliteLedgerStore:
@@ -206,10 +261,22 @@ class SqliteLedgerStore:
     """
 
     def __init__(
-        self, path: Optional[Path] = None, *, home: Optional[Path] = None
+        self,
+        path: Optional[Path] = None,
+        *,
+        home: Optional[Path] = None,
+        _writer_capability: object = None,
     ) -> None:
         self.path = path or auto_integration_ledger_path(home)
         self._writer_id = ""
+        self._writer_enabled = _writer_capability is _LEDGER_WRITER_CAPABILITY
+
+    def _require_writer(self) -> None:
+        if not self._writer_enabled:
+            raise AutoIntegrationLedgerError(
+                "this SqliteLedgerStore is a read capability; mutation is owned by the "
+                "production actuator/reconciler and is not available from the public store"
+            )
 
     # -- identity ---------------------------------------------------------
 
@@ -222,7 +289,12 @@ class SqliteLedgerStore:
         mechanism a resume across the asynchronous CI gate rests on.
         """
         if not self._writer_id:
-            conn = self._connect()
+            if not self.path.exists() and not self._writer_enabled:
+                raise AutoIntegrationLedgerError(
+                    "the auto-integration ledger does not exist; a read capability never "
+                    "creates its authority store"
+                )
+            conn = self._connect(read_only=not self._writer_enabled)
             try:
                 self._writer_id = self._read_writer(conn)
             finally:
@@ -273,6 +345,7 @@ class SqliteLedgerStore:
         The row and the closing of its intent are ONE transaction, so the receipt and the intent
         cannot come apart the way the mutation and the receipt can.
         """
+        self._require_writer()
         token = str(receipt or "")
         conn = self._connect()
         try:
@@ -295,6 +368,26 @@ class SqliteLedgerStore:
                         "store minted for the open admission; refusing to record an outcome "
                         "on somebody else's admission"
                     )
+                if outcome.outcome == OUTCOME_PENDING and conn.execute(
+                    "SELECT 1 FROM auto_integration_ledger WHERE action_key = ? AND step = ? "
+                    "AND outcome = ? LIMIT 1",
+                    (str(outcome.action_key), str(outcome.step), OUTCOME_PENDING),
+                ).fetchone():
+                    # Already recorded as pending: close the admission and write NOTHING.
+                    # Review j#96650 finding 3 measured the alternative — each re-entry of an
+                    # unsettled asynchronous gate appended another row (2 -> 3), while the
+                    # continuation's own detail said it "recorded no progress". An observation
+                    # that has not changed is not a new observation, and a durable record that
+                    # grows on every poll is a durable record of the polling.
+                    #
+                    # Scoped to `pending` on purpose. A repeated `blocked` IS new information —
+                    # the step was attempted again and refused again — so those still accumulate.
+                    conn.execute(
+                        "UPDATE auto_integration_intent SET resolved_at = ?, closed_by = ? "
+                        "WHERE id = ?",
+                        (_utc_now(), CLOSED_BY_RECEIPT, int(intent[0])),
+                    )
+                    return
                 conn.execute(
                     f"INSERT INTO auto_integration_ledger ({_COLUMNS}) "
                     f"VALUES ({', '.join('?' * 10)})",
@@ -383,6 +476,7 @@ class SqliteLedgerStore:
         admission. A caller must treat that as "do not mutate" — it is not a retryable error,
         it is somebody else's turn.
         """
+        self._require_writer()
         conn = self._connect()
         try:
             writer = self._read_writer(conn)
@@ -417,7 +511,13 @@ class SqliteLedgerStore:
         )
 
     def resolve_intent(
-        self, *, action_key: str, step: str, resolution: StepOutcome, observation: str
+        self,
+        *,
+        intent_id: int,
+        action_key: str,
+        step: str,
+        resolution: StepOutcome,
+        observation: str,
     ) -> None:
         """Close a STRANDED admission with what a later run MEASURED (the recovery path).
 
@@ -435,21 +535,48 @@ class SqliteLedgerStore:
         ``resolution`` is the outcome the measurement supports — ``done`` when the mutation is
         observed to have landed, ``blocked`` when it is observed not to have. A reconciler that
         cannot tell must not call this at all: ambiguity stays open, which is the honest state.
+
+        Two identity constraints, both added after review j#96650 reproduced what their absence
+        cost:
+
+        - **``resolution`` must be about the admission being closed** (finding 1). R2 searched
+          for the intent by ``(action_key, step)`` and then inserted whatever ``resolution``
+          named, so ONE open admission on a decoy action could write an ``accepted`` push for a
+          DIFFERENT action — a cross-action forgery introduced by the very path added to close
+          a forgery. The outcome vocabulary is closed here too: a reconciliation records a
+          settled fact, never ``pending``.
+        - **the row closed is the row that was OBSERVED** (finding 2). R2 re-searched for
+          "whatever is open now", so a reconciliation begun against one run could close a
+          LATER run's admission — reproduced, leaving that run's mutation unrecorded and its
+          receipt refused. ``intent_id`` is the observed instance, and the update is a
+          compare-and-set on it still being open.
         """
+        self._require_writer()
+        if str(resolution.action_key) != str(action_key) or str(resolution.step) != str(step):
+            raise AutoIntegrationLedgerError(
+                "a reconciliation may only record an outcome for the admission it closes; "
+                f"asked to close {action_key!r}/{step!r} while recording "
+                f"{resolution.action_key!r}/{resolution.step!r}"
+            )
+        if resolution.outcome not in _RECONCILABLE_OUTCOMES:
+            raise AutoIntegrationLedgerError(
+                f"a reconciliation records a settled outcome ({sorted(_RECONCILABLE_OUTCOMES)}), "
+                f"not {resolution.outcome!r}"
+            )
         conn = self._connect()
         try:
             writer = self._read_writer(conn)
             with conn:
                 intent = conn.execute(
-                    "SELECT id FROM auto_integration_intent WHERE action_key = ? AND step = ? "
-                    "AND resolved_at IS NULL",
-                    (str(action_key), str(step)),
+                    "SELECT id FROM auto_integration_intent WHERE id = ? AND action_key = ? "
+                    "AND step = ? AND resolved_at IS NULL",
+                    (int(intent_id), str(action_key), str(step)),
                 ).fetchone()
                 if intent is None:
                     raise _Unadmitted(
-                        f"there is no open admission for step {step!r} of this action to "
-                        "reconcile; reconciliation closes a stranded admission, it does not "
-                        "open one"
+                        f"admission {intent_id} for step {step!r} of this action is not open; "
+                        "reconciliation closes the exact admission it observed, so a later "
+                        "run's admission is not it either"
                     )
                 conn.execute(
                     f"INSERT INTO auto_integration_ledger ({_COLUMNS}) "
@@ -522,6 +649,67 @@ class SqliteLedgerStore:
             for row in rows
         )
 
+    # -- durable async-action registry -----------------------------------
+
+    def register_action(self, action: DurableIntegrationAction) -> None:
+        """Persist an immutable action frame before any integration mutation."""
+        try:
+            _register_action(self, action)
+        except ActionRegistryError as exc:
+            raise AutoIntegrationLedgerError(str(exc)) from exc
+
+    def mark_action_awaiting_ci(
+        self, *, action_key: str, landed_head: str, ci_workflow: str
+    ) -> None:
+        """Append the one ``awaiting_ci`` transition, or no-op on exact replay."""
+        try:
+            _mark_action_awaiting_ci(
+                self,
+                action_key=action_key,
+                landed_head=landed_head,
+                ci_workflow=ci_workflow,
+            )
+        except ActionRegistryError as exc:
+            raise AutoIntegrationLedgerError(str(exc)) from exc
+
+    def mark_action_terminal(
+        self, *, action_key: str, state: str, landed_head: str, detail: str = ""
+    ) -> None:
+        """Append one terminal continuation result under an awaiting action."""
+        try:
+            _mark_action_terminal(
+                self,
+                action_key=action_key,
+                state=state,
+                landed_head=landed_head,
+                detail=detail,
+            )
+        except ActionRegistryError as exc:
+            raise AutoIntegrationLedgerError(str(exc)) from exc
+
+    def action(self, action_key: str) -> Optional[DurableIntegrationAction]:
+        """The immutable frame plus latest append-only transition for one action."""
+        try:
+            return _read_action(self, action_key)
+        except ActionRegistryError as exc:
+            raise AutoIntegrationLedgerError(str(exc)) from exc
+
+    def resumable_actions(
+        self, *, workspace: str = "", issue: str = ""
+    ) -> Tuple[DurableIntegrationAction, ...]:
+        """Registered/awaiting actions a supervisor may inspect, oldest first."""
+        try:
+            return _resumable_actions(self, workspace=workspace, issue=issue)
+        except ActionRegistryError as exc:
+            raise AutoIntegrationLedgerError(str(exc)) from exc
+
+    def action_event_count(self, *, action_key: str) -> int:
+        """Read-only idempotency diagnostic used by regression tests and operators."""
+        try:
+            return _action_event_count(self, action_key=action_key)
+        except ActionRegistryError as exc:
+            raise AutoIntegrationLedgerError(str(exc)) from exc
+
     # -- connection --------------------------------------------------------
 
     def _connect(self, *, read_only: bool = False) -> sqlite3.Connection:
@@ -538,6 +726,8 @@ class SqliteLedgerStore:
                 conn.execute(_WRITER_SQL)
                 conn.execute(_OUTCOME_SQL)
                 conn.execute(_INTENT_SQL)
+                for sql in ACTION_SCHEMA_SQL:
+                    conn.execute(sql)
                 for sql in _INDEX_SQL:
                     conn.execute(sql)
                 conn.execute(
@@ -545,6 +735,19 @@ class SqliteLedgerStore:
                     "(id, writer_id, created_at) VALUES (1, ?, ?)",
                     (f"ledger:{secrets.token_hex(16)}", _utc_now()),
                 )
+                conn.execute(
+                    f"PRAGMA user_version = {AUTO_INTEGRATION_LEDGER_SCHEMA_VERSION}"
+                )
+            return conn
+        if version == 2:
+            # v2 was created by the unreleased R2 implementation and contains only writer /
+            # outcome / intent rows.  v3 adds the immutable action registry and append-only
+            # continuation events; the migration deletes or rewrites nothing.
+            with conn:
+                for sql in ACTION_SCHEMA_SQL:
+                    conn.execute(sql)
+                for sql in _INDEX_SQL:
+                    conn.execute(sql)
                 conn.execute(
                     f"PRAGMA user_version = {AUTO_INTEGRATION_LEDGER_SCHEMA_VERSION}"
                 )
@@ -608,13 +811,37 @@ def _row_to_outcome(row: Sequence[object]) -> StepOutcome:
     )
 
 
+def _open_ledger_writer(
+    path: Optional[Path] = None, *, home: Optional[Path] = None
+) -> SqliteLedgerStore:
+    """Mint the module-private production mutation capability.
+
+    Deliberately omitted from ``__all__``.  Production composition and the recovery owner are
+    the only application modules that import it; callers constructing ``SqliteLedgerStore`` get
+    the read surface and cannot reproduce the begin+append authorization forgery.
+    """
+    writer = SqliteLedgerStore(
+        path=path, home=home, _writer_capability=_LEDGER_WRITER_CAPABILITY
+    )
+    # Create/migrate before a separately constructed reader is handed to the use case.
+    _ = writer.writer_id
+    return writer
+
+
 __all__ = (
+    "ACTION_AWAITING_CI",
+    "ACTION_CI_FAILED",
+    "ACTION_INTEGRATED",
+    "ACTION_REGISTERED",
+    "ACTION_STATES",
     "AUTO_INTEGRATION_LEDGER_FILENAME",
+    "AutoIntegrationLedgerReader",
     "AUTO_INTEGRATION_LEDGER_SCHEMA_VERSION",
     "CLOSED_BY_RECEIPT",
     "CLOSED_BY_RECONCILIATION",
     "AutoIntegrationAdmissionError",
     "AutoIntegrationLedgerError",
+    "DurableIntegrationAction",
     "SqliteLedgerStore",
     "StepIntent",
     "auto_integration_ledger_path",

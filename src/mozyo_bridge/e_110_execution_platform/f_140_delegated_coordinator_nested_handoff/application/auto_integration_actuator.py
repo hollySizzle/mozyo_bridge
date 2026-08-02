@@ -38,10 +38,11 @@ from __future__ import annotations
 import dataclasses
 import uuid
 from dataclasses import dataclass, field
-from typing import List, Optional, Protocol, Sequence, Tuple, runtime_checkable
+from typing import Callable, List, Optional, Protocol, Sequence, Tuple, runtime_checkable
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ledger import (  # noqa: E501
     AutoIntegrationAdmissionError,
+    AutoIntegrationLedgerError,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ports import (
     MERGE_COMMIT_ERROR,
@@ -241,6 +242,9 @@ class AutoIntegrationUseCase:
     """
 
     operations: AutoIntegrationGitOperations
+    #: The policy this actuator was CONSTRUCTED with. Used directly only when no
+    #: :attr:`policy_source` is bound — a directly-constructed use case (the classical tests)
+    #: has no repository to re-read.
     integration_policy: AutoIntegrationPolicy
     processes: Optional[ManagedProcessOperations] = None
     authority: Optional[DurableAuthorityReader] = None
@@ -251,6 +255,18 @@ class AutoIntegrationUseCase:
     #: cleanup record supplies, because those are the values ``release_process`` acts on.
     lane_issue: str = ""
     lane_generation: Optional[int] = None
+    #: Re-reads the policy from the repository before EVERY decision (review j#96650 finding 4).
+    #: R2 fixed two action-time reads and left this one a construction-time snapshot, so a
+    #: config tightened from ``auto`` to ``disabled`` — or ``ff_only`` from False to True —
+    #: between construction and the mutation was never observed. ``mode`` and ``ff_only`` are
+    #: exactly as much a gate as the target branch is, and a gate read once is a gate read at
+    #: the wrong time. ``None`` keeps :attr:`integration_policy`.
+    policy_source: Optional[Callable[[], AutoIntegrationPolicy]] = None
+    #: Production-only mutation capability.  ``ledger`` is deliberately the read surface;
+    #: review j#96650 demonstrated that handing arbitrary callers the begin+append pair lets
+    #: them manufacture an accepted push.  Direct/in-memory tests leave this ``None`` and their
+    #: process-local ledger remains combined.
+    _ledger_writer: object = field(default=None, repr=False, compare=False)
 
     #: The writer receipt this actuator stamps on the steps it records. R4 derived it from
     #: public constructor values, so a caller could reproduce it; R5 made it an unguessable
@@ -262,6 +278,15 @@ class AutoIntegrationUseCase:
     #: durable store with an authenticated writer identity is the real answer, and it belongs
     #: with the production data plane the durable authority reader needs.
     _receipt: str = field(default_factory=lambda: f"receipt:{uuid.uuid4().hex}", init=False)
+
+    def _policy(self) -> AutoIntegrationPolicy:
+        """The policy in force RIGHT NOW, re-read when this actuator has a source for it."""
+        if self.policy_source is None:
+            return self.integration_policy
+        return self.policy_source()
+
+    def _mutation_ledger(self) -> object:
+        return self._ledger_writer if self._ledger_writer is not None else self.ledger
 
     @property
     def recorder_id(self) -> str:
@@ -275,7 +300,9 @@ class AutoIntegrationUseCase:
         default), where a process-local boundary is the honest one — that store's entries do not
         outlive the process either (Redmine #14825 item 4).
         """
-        declared = str(getattr(self.ledger, "writer_id", "") or "").strip()
+        declared = str(
+            getattr(self._mutation_ledger(), "writer_id", "") or ""
+        ).strip()
         return declared or self._receipt
 
     def _unresolved_intent(self, action_key: str) -> Optional[str]:
@@ -305,7 +332,7 @@ class AutoIntegrationUseCase:
         refusal is not retried here: it means somebody else is mutating, or crashed mid-mutation,
         and either way a second mutation is what must not happen.
         """
-        opener = getattr(self.ledger, "begin_step", None)
+        opener = getattr(self._mutation_ledger(), "begin_step", None)
         if opener is None:
             return "", None
         try:
@@ -315,7 +342,60 @@ class AutoIntegrationUseCase:
 
     def _record(self, outcome: StepOutcome, receipt: str) -> None:
         """Append ``outcome`` under the admission that produced it."""
-        self.ledger.append(outcome, receipt=receipt)
+        writer = self._mutation_ledger()
+        append = getattr(writer, "append", None)
+        if append is None:
+            raise AutoIntegrationLedgerError(
+                "the actuator has no ledger mutation capability; no outcome was recorded"
+            )
+        append(outcome, receipt=receipt)
+
+    def _resolve_intent(self, **kwargs) -> None:
+        """Recovery-only write through the same private mutation capability."""
+        resolver = getattr(self._mutation_ledger(), "resolve_intent", None)
+        if resolver is None:
+            raise AutoIntegrationLedgerError(
+                "the actuator has no reconciliation mutation capability"
+            )
+        resolver(**kwargs)
+
+    def register_durable_action(self, action: object) -> None:
+        """Register an immutable resume frame before the first production mutation."""
+        register = getattr(self._mutation_ledger(), "register_action", None)
+        if register is None:
+            raise AutoIntegrationLedgerError(
+                "the actuator has no durable action registry"
+            )
+        register(action)
+
+    def mark_action_awaiting_ci(
+        self, *, action_key: str, landed_head: str, ci_workflow: str
+    ) -> None:
+        marker = getattr(self._mutation_ledger(), "mark_action_awaiting_ci", None)
+        if marker is None:
+            raise AutoIntegrationLedgerError(
+                "the actuator has no durable continuation registry"
+            )
+        marker(
+            action_key=action_key,
+            landed_head=landed_head,
+            ci_workflow=ci_workflow,
+        )
+
+    def mark_action_terminal(
+        self, *, action_key: str, state: str, landed_head: str, detail: str = ""
+    ) -> None:
+        marker = getattr(self._mutation_ledger(), "mark_action_terminal", None)
+        if marker is None:
+            raise AutoIntegrationLedgerError(
+                "the actuator has no durable continuation registry"
+            )
+        marker(
+            action_key=action_key,
+            state=state,
+            landed_head=landed_head,
+            detail=detail,
+        )
 
     # -- integration ------------------------------------------------------
 
@@ -380,7 +460,7 @@ class AutoIntegrationUseCase:
             # target to an expectation our own push has already invalidated.
             preflight = self._measure(record, report, ledger=working_ledger)
             decision = decide_integration(
-                self.integration_policy,
+                self._policy(),
                 record,
                 preflight,
                 ledger=working_ledger,
@@ -417,7 +497,7 @@ class AutoIntegrationUseCase:
                 # produce the same step again, and looping on it would turn a fail-closed
                 # refusal into a spin.
                 report.final_decision = decide_integration(
-                    self.integration_policy,
+                    self._policy(),
                     record,
                     self._measure(record, report, ledger=working_ledger),
                     ledger=working_ledger,
