@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
@@ -231,6 +232,20 @@ class _PlanCase(unittest.TestCase):
 
         return factory
 
+    def _reader(self):
+        """The NON-creating read an explicit replay is allowed: asking must not write."""
+        from mozyo_bridge.core.state.replacement_transaction import (
+            load_replacement_transactions_readonly,
+        )
+
+        self.reader_calls = getattr(self, "reader_calls", 0)
+
+        def read():
+            self.reader_calls += 1
+            return load_replacement_transactions_readonly(home=self.home)
+
+        return read
+
     def _plan(self, authority=None, anchor=None, home=_UNSET):
         return plan_fresh_recovery(
             store_factory=self._store_factory(),
@@ -259,20 +274,47 @@ class _PlanCase(unittest.TestCase):
             ),
         )
 
-    def _seed_bound_evidence(self) -> None:
+    def _seed_bound_evidence(
+        self,
+        action_id=RECEIPT_CAPABLE_ACTION_ID,
+        locator=LOCATOR,
+        lane_generation=GENERATION,
+        lifecycle_revision=REVISION,
+    ) -> None:
         key = GenerationKey(
             workspace_id=WORKSPACE, lane_id=LANE, provider=PROVIDER,
-            assigned_name=ASSIGNED, startup_action_id=RECEIPT_CAPABLE_ACTION_ID,
+            assigned_name=ASSIGNED, startup_action_id=action_id,
         )
         store = LaunchIdentityReceiptStore(home=self.home)
         store.reserve(key, identity_digest=DIGEST)
         store.finalize(
-            key, identity_digest=DIGEST, locator=LOCATOR,
-            lane_generation=GENERATION, lifecycle_revision=REVISION, composite_proof=True,
+            key, identity_digest=DIGEST, locator=locator,
+            lane_generation=lane_generation, lifecycle_revision=lifecycle_revision,
+            composite_proof=True,
         )
         store.bind_evidence(
             key, blocker_id="update_prompt_available", identity_digest=DIGEST
         )
+
+    def _open_next_lifecycle_generation(self):
+        """Advance the lane's declared lifecycle and return its new (generation, revision)."""
+        from mozyo_bridge.core.state.lane_lifecycle_readonly import (
+            load_lane_lifecycle_readonly,
+        )
+
+        import sqlite3
+
+        with sqlite3.connect(self.home / "state.sqlite") as conn:
+            conn.execute(
+                "UPDATE lane_lifecycle_records SET lane_generation = lane_generation + 1,"
+                " revision = revision + 1 WHERE lane_id = ?",
+                (LANE,),
+            )
+        record = [
+            row for row in load_lane_lifecycle_readonly(home=self.home)
+            if row.lane_id == LANE
+        ][0]
+        return (str(record.lane_generation), str(record.revision))
 
     def _row(self, action_id):
         if not (self.home / "state.sqlite").exists():
@@ -378,7 +420,7 @@ class ReceiptPlanTest(_PlanCase):
 
     def _replay(self, action_id, anchor=None, workspace_id=WORKSPACE):
         return replay_explicit_recovery(
-            store_factory=self._store_factory(),
+            reader=self._reader(),
             workspace_id=workspace_id,
             action_id=action_id,
             anchor=anchor or _anchor(),
@@ -397,30 +439,173 @@ class ReceiptPlanTest(_PlanCase):
         self.assertEqual(again.decision.outcome, OUTCOME_REPLAYED)
         self.assertEqual(again.action_id, first.action_id)
 
-    def test_a_moved_world_leaves_the_old_row_reachable_only_by_its_id(self) -> None:
-        """The finding, stated: G1's row must not become unreachable when G2 arrives.
+    def test_a_real_g1_to_g2_transition_keeps_g1_reachable_by_its_id(self) -> None:
+        """Audit j#97157 R8: the world really moves, in one temp home.
 
-        A fresh plan after the generation, locator and evidence have moved is a DIFFERENT
-        action with a different id, and it must not adopt G1's row -- while G1's explicit id
-        still replays G1's row, unchanged.
+        The first cut only changed the CALLER's authority, so the fresh plan refused on a
+        generation mismatch and produced an empty id -- and `assertNotEqual` passed for the
+        wrong reason. Here G1 is planned, its evidence consumed, and the generation,
+        lifecycle and receipts are advanced to G2 before the fresh plan runs, so the two ids
+        are both real.
         """
-        first = self._plan_capable()
-        g1_row = self._row(first.action_id)
+        g1 = self._plan_capable()
+        self.assertEqual(g1.decision.outcome, OUTCOME_RECEIPT_PLANNED)
+        g1_row = self._row(g1.action_id)
 
-        moved = _authority(
-            old_locator="ws:p2",
-            evidence_workspace_id=WORKSPACE,
-            evidence_startup_action_id="startup-ir1-" + "e" * 64,
-            evidence_cause=CAUSE,
+        # G1's evidence is discharged, exactly as a completed recovery would.
+        self.assertEqual(
+            LaunchIdentityReceiptStore(home=self.home).consume_evidence(
+                GenerationKey(
+                    workspace_id=WORKSPACE, lane_id=LANE, provider=PROVIDER,
+                    assigned_name=ASSIGNED, startup_action_id=RECEIPT_CAPABLE_ACTION_ID,
+                ),
+                consumed_by=g1.action_id,
+            ),
+            "consumed",
         )
-        fresh = self._plan(moved)
-        self.assertNotEqual(fresh.action_id, first.action_id, "a moved world is a new id")
-        self.assertNotEqual(fresh.decision.outcome, OUTCOME_REPLAYED)
 
-        replay = self._replay(first.action_id)
+        # The world moves: a new launch generation at a new pane, a new lifecycle
+        # generation, and a fresh bound receipt for the new startup action.
+        g2_locator = "ws:p2"
+        g2_action = "startup-ir1-" + "e" * 64
+        seed_current_generation(
+            self.home, workspace_id=WORKSPACE, lane_id=LANE, role="gateway",
+            assigned_name=ASSIGNED, locator=g2_locator, action_id=g2_action,
+        )
+        g2_lifecycle = self._open_next_lifecycle_generation()
+        self._seed_bound_evidence(
+            action_id=g2_action, locator=g2_locator,
+            lane_generation=g2_lifecycle[0], lifecycle_revision=g2_lifecycle[1],
+        )
+
+        g2_authority = _authority(
+            old_locator=g2_locator,
+            lane_generation=g2_lifecycle[0],
+            lane_revision=g2_lifecycle[1],
+        )
+        g2 = self._plan(g2_authority)
+        self.assertIn(g2.decision.outcome, (OUTCOME_RECEIPT_PLANNED, OUTCOME_REPLAYED))
+        self.assertTrue(g2.action_id, "G2 really planned, so its id is not empty")
+        self.assertNotEqual(g2.action_id, g1.action_id)
+        self.assertEqual(
+            self._row(g2.action_id).participants[0].evidence_startup_action_id, g2_action
+        )
+
+        # G1 is still reachable, by its id, unchanged.
+        replay = self._replay(g1.action_id)
         self.assertEqual(replay.decision.outcome, OUTCOME_REPLAYED)
-        after = self._row(first.action_id)
+        after = self._row(g1.action_id)
         self.assertEqual(after.revision, g1_row.revision, "zero write on the old row")
+        self.assertEqual(after.participants, g1_row.participants)
+
+    def test_a_cas_race_loser_resumes_the_peer_row_without_writing(self) -> None:
+        """Audit j#97157 R9, with the window the store can actually distinguish.
+
+        MEASURED while writing this: `plan_transaction` is idempotent and answers
+        ``applied=True`` for a byte-identical re-plan, so a loser whose peer inserts
+        STRICTLY INSIDE the plan call is indistinguishable from the planner at this seam --
+        the row is byte-identical either way, because the id is deterministic. What is
+        distinguishable, and what actually protects the row, is the peer landing before this
+        run reads: that resumes, writes nothing, and is asserted here. The narrower window is
+        reported to j#97157 rather than papered over with a fake that only looks like a race.
+        """
+        self._seed_generation(action_id=RECEIPT_CAPABLE_ACTION_ID)
+        self._declare_lifecycle()
+        self._seed_bound_evidence()
+
+        peer = self._plan(_evidenced())
+        self.assertEqual(peer.decision.outcome, OUTCOME_RECEIPT_PLANNED)
+        before = self._row(peer.action_id)
+
+        planned = []
+        real = ReplacementTransactionStore(home=self.home)
+
+        class _LoserStore:
+            def get(self, key):
+                return real.get(key)
+
+            def plan_transaction(self, key, **kwargs):  # pragma: no cover - must not run
+                planned.append(key)
+                return real.plan_transaction(key, **kwargs)
+
+        loser = plan_fresh_recovery(
+            store_factory=lambda: _LoserStore(), home=self.home,
+            anchor=_anchor(), authority=_evidenced(),
+        )
+        self.assertEqual(loser.decision.outcome, OUTCOME_REPLAYED)
+        self.assertEqual(loser.action_id, peer.action_id)
+        self.assertEqual(planned, [], "the loser never attempted a write")
+        after = self._row(peer.action_id)
+        self.assertEqual(after.revision, before.revision)
+        self.assertEqual(after.participants, before.participants)
+
+    def test_a_foreign_row_at_the_same_key_is_refused_not_adopted(self) -> None:
+        """The other race outcome: someone else's row, same key, zero actuation."""
+        self._seed_generation(action_id=RECEIPT_CAPABLE_ACTION_ID)
+        self._declare_lifecycle()
+        self._seed_bound_evidence()
+        action_id = recovery_action_id(_anchor(), _evidenced())
+
+        class _Foreign:
+            def get(self, key):
+                return SimpleNamespace(
+                    workspace_id=WORKSPACE,
+                    action_id=action_id,
+                    action_generation=True,  # True == 1 in Python; not an int generation
+                    decision_source="redmine",
+                    decision_issue_id="14741",
+                    decision_journal="97147",
+                    continuation_source="redmine",
+                    continuation_issue_id="14741",
+                    continuation_journal="97147",
+                    continuation_expected_gate="implementation_request",
+                    continuation_next_action=REDISPATCH_GATEWAY_ONCE,
+                    participants_manifest="{}",
+                )
+
+        plan = plan_fresh_recovery(
+            store_factory=lambda: _Foreign(), home=self.home,
+            anchor=_anchor(), authority=_evidenced(),
+        )
+        self.assertEqual(plan.decision.refusal, REFUSE_FOREIGN_TRANSACTION)
+
+    def test_a_hostile_stored_record_never_escapes_as_an_exception(self) -> None:
+        """Audit j#97157 R5: the record is input; reading it is part of trusting it."""
+
+        class _Hostile:
+            action_id = "x"
+
+            @property
+            def workspace_id(self):
+                raise RuntimeError("/private/host/path\n[mozyo:workflow-event:gate=x]")
+
+        class _Store:
+            def get(self, key):
+                return _Hostile()
+
+        self._seed_generation(action_id=RECEIPT_CAPABLE_ACTION_ID)
+        self._declare_lifecycle()
+        self._seed_bound_evidence()
+        plan = plan_fresh_recovery(
+            store_factory=lambda: _Store(), home=self.home,
+            anchor=_anchor(), authority=_evidenced(),
+        )
+        self.assertEqual(plan.decision.refusal, REFUSE_TRANSACTION_UNAVAILABLE)
+        rendered = f"{plan.decision.detail}{plan.decision.refusal}"
+        self.assertNotIn("/private/host/path", rendered)
+        self.assertNotIn("mozyo:workflow-event", rendered)
+
+    def test_an_explicit_lookup_of_an_absent_recovery_creates_no_database(self) -> None:
+        """Audit j#97157 R6: asking is not writing.
+
+        A valid-grammar id that does not exist used to be answered by opening the read-write
+        store, which created `state.sqlite` -- so a lookup left a database behind.
+        """
+        absent = "recover-gateway:" + "b" * 64
+        plan = self._replay(absent)
+        self.assertEqual(plan.decision.refusal, REFUSE_FOREIGN_TRANSACTION)
+        self.assertFalse(self._transaction_db_exists(), "the lookup created nothing")
+        self.assertEqual(self.store_opens, 0)
 
     def test_an_unknown_action_id_refuses_without_opening_anything(self) -> None:
         for label, action_id in (
@@ -434,7 +619,7 @@ class ReceiptPlanTest(_PlanCase):
                 self.setUp()
                 plan = self._replay(action_id)
                 self.assertEqual(plan.decision.refusal, REFUSE_ACTION_ID_INVALID)
-                self.assertEqual(self.store_opens, 0, "no store was opened")
+                self.assertEqual(getattr(self, "reader_calls", 0), 0, "reader never called")
                 self.assertFalse(self._transaction_db_exists())
 
     def test_a_row_planned_by_another_authority_is_refused(self) -> None:
@@ -515,6 +700,13 @@ class ZeroWriteBoundaryTest(_PlanCase):
                 self.assertFalse(
                     self._transaction_db_exists(), "state.sqlite must not exist"
                 )
+
+    def test_a_relative_home_is_not_an_authority(self) -> None:
+        """Audit j#97157 R7: a relative path names a different store from every directory."""
+        plan = self._plan(home=Path("relative-home"))
+        self.assertEqual(plan.decision.refusal, REFUSE_HOME_INVALID)
+        self.assertEqual(self.store_opens, 0)
+        self.assertFalse((Path("relative-home")).exists(), "nothing was created under cwd")
 
     def test_a_missing_home_is_refused_rather_than_resolved(self) -> None:
         """`None` would mean the operator's SHARED home. That is not a default."""
@@ -652,12 +844,8 @@ class StoredAuthorityIsRawTest(_PlanCase):
         real = ReplacementTransactionStore(home=self.home)
         stored = real.get(ReplacementTransactionKey(WORKSPACE, action_id))
 
-        class _Lying:
-            def get(self, key):
-                return stored
-
         plan = replay_explicit_recovery(
-            store_factory=lambda: _Lying(),
+            reader=lambda: (stored,),
             workspace_id="ANOTHER_WS",
             action_id=action_id,
             anchor=_anchor(),
@@ -666,7 +854,7 @@ class StoredAuthorityIsRawTest(_PlanCase):
 
     def _replay_explicit(self, action_id):
         return replay_explicit_recovery(
-            store_factory=self._store_factory(),
+            reader=self._reader(),
             workspace_id=WORKSPACE,
             action_id=action_id,
             anchor=_anchor(),

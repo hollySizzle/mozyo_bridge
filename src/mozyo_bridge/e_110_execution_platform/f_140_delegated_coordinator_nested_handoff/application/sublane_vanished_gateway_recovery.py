@@ -157,11 +157,17 @@ def _require_home(home) -> Optional[Path]:
     ``None`` is rejected rather than resolved (audit j#97151 R3): "wherever this build keeps
     its home" is the operator's SHARED home, and a recovery that silently planned against it
     because a caller forgot an argument is the kind of thing that is only noticed afterwards.
+    A RELATIVE path is rejected for the same reason one layer down (j#97157 R7): it names a
+    different authority from every directory.
     """
     if not isinstance(home, Path):
         return None
     text = str(home)
     if not text or text != text.strip():
+        return None
+    if not home.is_absolute():
+        # A relative home is resolved against the CURRENT DIRECTORY, so the same recovery
+        # would address a different authority depending on where it ran (audit j#97157 R7).
         return None
     return home
 
@@ -251,27 +257,43 @@ def _stored_is_this_action(stored, *, key, anchor, action_id) -> bool:
     )
 
 
-def _replayed(stored, key, anchor, action_id) -> RecoveryPlan:
+def _replayed(stored, key, anchor, action_id, *, outcome=OUTCOME_REPLAYED) -> RecoveryPlan:
+    """Verify a stored row and build the resume, with the record itself as untrusted input.
+
+    Audit j#97157 R5: only ``store.get`` was guarded, so a record whose ``workspace_id``
+    property raised carried a host path and a workflow marker straight out. A row is data
+    that arrived from outside; reading its attributes, decoding its manifest and recomputing
+    its id are all part of trusting it, so all three happen inside this boundary.
+    """
     from mozyo_bridge.core.state.replacement_transaction_model import decode_participants
 
-    if not _stored_is_this_action(stored, key=key, anchor=anchor, action_id=action_id):
+    try:
+        if not _stored_is_this_action(stored, key=key, anchor=anchor, action_id=action_id):
+            return RecoveryPlan(
+                decision=refuse(
+                    REFUSE_FOREIGN_TRANSACTION,
+                    "the stored row at this key is not this recovery",
+                ),
+                action_id=action_id,
+            )
+        pin = decode_participants(stored.participants_manifest)[0]
+    except Exception:  # noqa: BLE001 - KI / SystemExit / GeneratorExit propagate
         return RecoveryPlan(
             decision=refuse(
-                REFUSE_FOREIGN_TRANSACTION,
-                "the stored row at this key is not this recovery",
+                REFUSE_TRANSACTION_UNAVAILABLE,
+                "the stored transaction could not be read",
             ),
             action_id=action_id,
         )
-    pins = decode_participants(stored.participants_manifest)
     return RecoveryPlan(
-        decision=RecoveryDecision(outcome=OUTCOME_REPLAYED, action_id=action_id),
+        decision=RecoveryDecision(outcome=outcome, action_id=action_id),
         action_id=action_id,
-        participants=(pins[0],),
+        participants=(pin,),
     )
 
 
 def replay_explicit_recovery(
-    *, store_factory, workspace_id: str, action_id: str, anchor: RequestAnchor
+    *, reader, workspace_id: str, action_id: str, anchor: RequestAnchor
 ) -> RecoveryPlan:
     """Resume the recovery filed under an EXPLICIT action id. Reads no world state.
 
@@ -281,6 +303,10 @@ def replay_explicit_recovery(
     action and the stored row becomes unreachable. So the id is an input here, its grammar
     is checked before anything is opened, and the current launch generation, the lifecycle
     and the receipt store are never consulted at all.
+
+    ``reader`` is a NON-CREATING read (audit j#97157 R6). The first cut opened the
+    read-write store, so asking about a recovery that does not exist created the database --
+    a lookup that writes is not a zero-write replay.
     """
     if not is_recovery_action_id(action_id):
         return RecoveryPlan(
@@ -293,25 +319,39 @@ def replay_explicit_recovery(
         ReplacementTransactionKey,
     )
 
-    store = _open(store_factory)
-    if store is None:
-        return RecoveryPlan(
-            decision=refuse(REFUSE_TRANSACTION_UNAVAILABLE, "the transaction authority could not be opened"),
-            action_id=action_id,
-        )
     key = ReplacementTransactionKey(workspace_id, action_id)
-    ok, stored = _get(store, key)
-    if not ok:
+    try:
+        rows = reader()
+    except Exception:  # noqa: BLE001
         return RecoveryPlan(
             decision=refuse(REFUSE_TRANSACTION_UNAVAILABLE, "the transaction authority could not be read"),
             action_id=action_id,
         )
-    if stored is None:
+    if rows is None:
+        # The non-creating reader's fail-closed answer: an unknown / newer / partial
+        # component schema. Not "no such row".
+        return RecoveryPlan(
+            decision=refuse(REFUSE_TRANSACTION_UNAVAILABLE, "the transaction component is not readable"),
+            action_id=action_id,
+        )
+    try:
+        matched = [
+            row
+            for row in rows
+            if _raw(getattr(row, "action_id", None)) == action_id
+            and _raw(getattr(row, "workspace_id", None)) == key.workspace_id
+        ]
+    except Exception:  # noqa: BLE001 - a hostile row is input, not truth
+        return RecoveryPlan(
+            decision=refuse(REFUSE_TRANSACTION_UNAVAILABLE, "the stored transaction could not be read"),
+            action_id=action_id,
+        )
+    if len(matched) != 1:
         return RecoveryPlan(
             decision=refuse(REFUSE_FOREIGN_TRANSACTION, "no such recovery transaction"),
             action_id=action_id,
         )
-    return _replayed(stored, key, anchor, action_id)
+    return _replayed(matched[0], key, anchor, action_id)
 
 
 def plan_fresh_recovery(
@@ -440,12 +480,16 @@ def plan_fresh_recovery(
 
     decision, continuation = _pointers(anchor)
     try:
-        store.plan_transaction(
-            key,
-            action_generation=RECOVERY_ACTION_GENERATION,
-            decision=decision,
-            continuation=continuation,
-            participants=[pin],
+        applied = getattr(
+            store.plan_transaction(
+                key,
+                action_generation=RECOVERY_ACTION_GENERATION,
+                decision=decision,
+                continuation=continuation,
+                participants=[pin],
+            ),
+            "applied",
+            None,
         )
     except Exception:  # noqa: BLE001
         return RecoveryPlan(
@@ -458,23 +502,18 @@ def plan_fresh_recovery(
             decision=refuse(REFUSE_TRANSACTION_UNAVAILABLE, "the planned row could not be read back"),
             action_id=action_id,
         )
-    if not _stored_is_this_action(current, key=key, anchor=anchor, action_id=action_id):
-        # A peer inserted a different row at this key, or ours did not land as written.
-        return RecoveryPlan(
-            decision=refuse(
-                REFUSE_FOREIGN_TRANSACTION,
-                "the stored row at this key is not this recovery",
-            ),
-            action_id=action_id,
-        )
-    from mozyo_bridge.core.state.replacement_transaction_model import decode_participants
-
-    stored_pin = decode_participants(current.participants_manifest)[0]
-    outcome = OUTCOME_RECEIPT_PLANNED if stored_pin == pin else OUTCOME_REPLAYED
-    return RecoveryPlan(
-        decision=RecoveryDecision(outcome=outcome, action_id=action_id),
-        action_id=action_id,
-        participants=(stored_pin,),
+    # WHO WROTE IT decides the outcome, not whether the row happens to look like ours
+    # (audit j#97157 R9). A race loser's row is byte-identical to the one it tried to write
+    # -- the id is deterministic -- so comparing manifests classified the loser as the
+    # planner. `applied is True` is the store's own answer about which run inserted it, and
+    # anything less certain than that is reported as a resume, because this run did not
+    # write the row it is now reading.
+    return _replayed(
+        current,
+        key,
+        anchor,
+        action_id,
+        outcome=OUTCOME_RECEIPT_PLANNED if applied is True else OUTCOME_REPLAYED,
     )
 
 
