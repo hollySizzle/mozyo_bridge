@@ -109,7 +109,7 @@ class PlanningContext:
         """Every axis is a non-empty exact token, or the whole plan is refused."""
         for attr in ("workspace_id", "lane_id", "expected_update_cause"):
             value = getattr(self, attr)
-            if not isinstance(value, str) or value != value.strip() or not value:
+            if type(value) is not str or value != value.strip() or not value:
                 raise EvidencePlanRefused(
                     REFUSE_CONTEXT_INVALID,
                     "the planning context is not a set of exact non-empty tokens",
@@ -166,12 +166,18 @@ def _exact(value: object) -> str:
     value, and on a receipt-capable path that is the difference between proving a relaunch
     and asserting one.
 
-    ``isinstance`` rather than ``type is``: a ``str`` subclass still compares byte-wise, so
-    it is the same token. A bool, a number, ``bytes`` and an object with a helpful
-    ``__str__`` are all rejected here, because each only becomes a token by being rendered
-    into one.
+    ``type(value) is str``, NOT ``isinstance``. The first cut used ``isinstance`` and its
+    docstring justified it: "a ``str`` subclass still compares byte-wise, so it is the same
+    token". That was asserted, not measured, and it is false — a subclass can override
+    ``__eq__``, so the comparison is whatever the subclass decides, including raising. A
+    ``str`` subclass therefore is not plain text here. A bool, a number, ``bytes`` and an
+    object with a helpful ``__str__`` are rejected for the older reason: each only becomes
+    a token by being rendered into one.
+
+    Nothing foreign is compared, rendered or truth-tested on the way to that decision. The
+    type test comes first precisely so a hostile ``__eq__`` never runs (audit j#97083).
     """
-    if not isinstance(value, str):
+    if type(value) is not str:
         return ""
     if not value or value != value.strip():
         return ""
@@ -185,8 +191,20 @@ def _present(value: object) -> bool:
     question is presence, not well-formedness. Asking ``_exact`` there would read a padded
     or non-text triplet as absent and wave the participant through as legacy — the same
     laundering this correction is about, inverted.
+
+    Absent means literally ``None`` or literally empty plain text, and the test for it
+    touches nothing else. The first cut asked ``value != ""``, which HANDS CONTROL to the
+    value: an object whose ``__ne__`` raises turned a presence question into a raw
+    ``OSError`` carrying a host path (audit j#97083). ``len`` on an exact ``str`` is the
+    only operation here that a foreign object could influence, and the type test rules it
+    out first. Everything else — non-text, ``str`` subclasses, padded text — is present,
+    which is the fail-closed direction: present means "explain this", not "accept it".
     """
-    return value is not None and value != ""
+    if value is None:
+        return False
+    if type(value) is str and len(value) == 0:
+        return False
+    return True
 
 
 class ReplacementEvidencePlanner:
@@ -245,7 +263,7 @@ class ReplacementEvidencePlanner:
         which kind it is.
         """
         context = context.validate()
-        pinned = tuple(participants or ())
+        pinned = () if participants is None else tuple(participants)
         if not pinned:
             return EvidencePlan(participants=(), outcome=PLAN_LEGACY_UNCHANGED)
 
@@ -433,7 +451,9 @@ class ReplacementEvidencePlanner:
                 REFUSE_LIFECYCLE_UNAVAILABLE,
                 "the lane lifecycle authority could not be read",
             ) from exc
-        if not lifecycle:
+        if lifecycle is None:
+            # `if not lifecycle` would ask the ANSWER whether it is empty, and a foreign
+            # object answers that question with whatever it likes, including an exception.
             raise EvidencePlanRefused(
                 REFUSE_LIFECYCLE_UNAVAILABLE,
                 "the lane has no declared lifecycle generation and revision",
@@ -447,7 +467,7 @@ class ReplacementEvidencePlanner:
                 REFUSE_LIFECYCLE_UNAVAILABLE,
                 "the lane lifecycle authority answered in an unusable shape",
             )
-        if len(lifecycle) != 2 or not all(isinstance(v, str) for v in lifecycle):
+        if len(lifecycle) != 2 or not all(type(v) is str for v in lifecycle):
             raise EvidencePlanRefused(
                 REFUSE_LIFECYCLE_UNAVAILABLE,
                 "the lane lifecycle authority answered in an unusable shape",
@@ -532,7 +552,7 @@ class ReplacementEvidencePlanner:
                 REFUSE_CAUSE_NOT_UPDATE_DERIVED,
                 "the observed screen could not be classified",
             ) from exc
-        if not isinstance(cause, str) or cause != expected:
+        if type(cause) is not str or cause != expected:
             # Non-empty is a shape, not an authority, and neither is "strips to the right
             # thing": a port answering with any token at all, or with a padded one, would
             # otherwise have been pinned as the cause.
@@ -550,7 +570,7 @@ class ReplacementEvidencePlanner:
         ):
             existing = getattr(pin, attr, "")
             if _present(existing) and (
-                not isinstance(existing, str) or existing != expected
+                type(existing) is not str or existing != expected
             ):
                 raise EvidencePlanRefused(
                     REFUSE_DIVERGENT_PRE_PIN,

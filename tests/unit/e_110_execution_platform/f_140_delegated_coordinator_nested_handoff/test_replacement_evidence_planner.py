@@ -359,6 +359,136 @@ class _RenderedToken:
         return "issue_14741"
 
 
+class _Hostile:
+    """An authority value that answers every question with a host path.
+
+    Not a contrived shape: it stands for any value the planner did not construct — a row
+    from a store, a decoded payload, an adapter's object — whose dunders are not the
+    planner's to trust.
+    """
+
+    _BOOM = "/private/host/path"
+
+    def __eq__(self, other):  # pragma: no cover - raising IS the behaviour under test
+        raise OSError(self._BOOM)
+
+    def __ne__(self, other):  # pragma: no cover
+        raise OSError(self._BOOM)
+
+    def __str__(self):  # pragma: no cover
+        raise OSError(self._BOOM)
+
+    def __bool__(self):  # pragma: no cover
+        raise OSError(self._BOOM)
+
+    def __len__(self):  # pragma: no cover
+        raise OSError(self._BOOM)
+
+
+class _HostileText(str):
+    """The same, wearing ``str``.
+
+    This is why the planner tests ``type(x) is str`` and not ``isinstance``: a subclass
+    passes every ``isinstance`` check and then decides for itself what ``==`` means.
+    """
+
+    def __new__(cls):
+        return super().__new__(cls, "x")
+
+    def __eq__(self, other):  # pragma: no cover
+        raise OSError(_Hostile._BOOM)
+
+    def __ne__(self, other):  # pragma: no cover
+        raise OSError(_Hostile._BOOM)
+
+    def __str__(self):  # pragma: no cover
+        raise OSError(_Hostile._BOOM)
+
+    __hash__ = str.__hash__
+
+
+class NontextAuthorityTest(unittest.TestCase):
+    """Audit j#97083: a foreign value must never get to run code on the way to a refusal.
+
+    At ec60a315 the legacy triplet was read with ``value != ""`` and every other axis with
+    ``isinstance(value, str)`` followed by a comparison — so a hostile ``__ne__``/``__eq__``
+    replaced the typed refusal with a raw ``OSError`` carrying a host path.
+    """
+
+    def _refuses_typed(self, label, the_pin=None, planner_kw=None, **ports):
+        with self.subTest(label=label):
+            try:
+                _Ports(**ports).planner(**(planner_kw or {})).plan(
+                    [the_pin if the_pin is not None else _foreign()], CONTEXT
+                )
+            except EvidencePlanRefused as refusal:
+                self.assertNotIn(_Hostile._BOOM, str(refusal))
+                self.assertNotIn("OSError", str(refusal))
+            except Exception as raw:  # noqa: BLE001 - the defect this test exists for
+                self.fail(f"{label}: raw {type(raw).__name__} escaped: {raw}")
+            else:
+                self.fail(f"{label}: a hostile authority value was ACCEPTED")
+
+    def _sweep(self, hostile, kind: str) -> None:
+        legacy = dict(generation=_generation(action_id=LEGACY_ACTION))
+        capable = dict(evidence=_evidence())
+        for attr in (
+            "evidence_workspace_id",
+            "evidence_startup_action_id",
+            "evidence_cause",
+        ):
+            pin = _foreign(**{attr: hostile})
+            self._refuses_typed(f"{kind} legacy {attr}", pin, **legacy)
+            self._refuses_typed(f"{kind} receipt pre-pin {attr}", pin, **capable)
+        for attr in (
+            "lane_id",
+            "role",
+            "provider",
+            "assigned_name",
+            "old_locator",
+            "lane_generation",
+            "lane_revision",
+        ):
+            self._refuses_typed(
+                f"{kind} pin {attr}", _foreign(**{attr: hostile}), **capable
+            )
+        for label, generation in (
+            ("phase", _generation(phase=hostile)),
+            ("action id", _generation(action_id=hostile)),
+            ("locator", _generation(locator=hostile)),
+        ):
+            self._refuses_typed(
+                f"{kind} generation {label}", generation=generation, evidence=_evidence()
+            )
+        self._refuses_typed(f"{kind} evidence key lane", evidence=_evidence(lane_id=hostile))
+        self._refuses_typed(f"{kind} evidence blocker", evidence=_evidence(blocker=hostile))
+        self._refuses_typed(
+            f"{kind} cause port result",
+            evidence=_evidence(),
+            planner_kw={"update_cause": lambda provider, blocker: hostile},
+        )
+        self._refuses_typed(f"{kind} lifecycle result", evidence=_evidence(), lifecycle=hostile)
+        self._refuses_typed(
+            f"{kind} lifecycle member", evidence=_evidence(), lifecycle=(hostile, REV)
+        )
+
+    def test_no_axis_lets_a_hostile_object_run_code(self) -> None:
+        self._sweep(_Hostile(), "object")
+
+    def test_no_axis_lets_a_hostile_str_subclass_run_code(self) -> None:
+        self._sweep(_HostileText(), "str subclass")
+
+    def test_a_clean_legacy_participant_is_unaffected(self) -> None:
+        """The positive control: closing these holes did not close the legacy path."""
+        ports = _Ports(generation=_generation(action_id=LEGACY_ACTION))
+        the_pin = _foreign()
+        plan = ports.planner().plan([the_pin], CONTEXT)
+        self.assertEqual(plan.outcome, PLAN_LEGACY_UNCHANGED)
+        self.assertIs(plan.participants[0], the_pin)
+        self.assertEqual(ports.evidence_calls, 0)
+        self.assertEqual(ports.lifecycle_calls, 0)
+
+
 class ExactAuthorityTest(unittest.TestCase):
     """Audit j#97074: normalising before comparing laundered foreign representations.
 
