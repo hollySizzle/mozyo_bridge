@@ -3,6 +3,10 @@ work_unit:
   granularity: user_story
 sublane_integration:
   integration_branch: main
+auto_integration:
+  mode: auto
+  integration_branch: integration_14825_live_smoke_20260802
+  ff_only: true
 agents:
   profiles:
     implementation:
