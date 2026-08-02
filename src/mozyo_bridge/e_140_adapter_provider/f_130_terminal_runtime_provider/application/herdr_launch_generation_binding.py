@@ -42,6 +42,9 @@ from mozyo_bridge.core.state.startup_execution_events import (
     read_execution_events,
 )
 from mozyo_bridge.core.state.startup_transaction_fence import StartupTransactionFence
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_identity_binding import (  # noqa: E501
+    reserve_session_launch_identities,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     _norm,
     _norm_lane,
@@ -204,7 +207,7 @@ def reserve_session_launch_generations(
 
 def open_startup_transaction_and_reserve_generations(
     *, workspace_id, lane_id, providers, dry_run, home, fence, nonce, launch_plans,
-    attest_launcher,
+    attest_launcher, env=None, resolved=None,
 ):
     """Reserve BOTH pre-side-effect identity records in one step — the immutable startup
     action (#13948) and each wrapped slot's launch generation (#14203 j#87472) — the LAST
@@ -222,6 +225,15 @@ def open_startup_transaction_and_reserve_generations(
     reserve_session_launch_generations(
         store_home=home, transaction=transaction, launch_plans=launch_plans,
         workspace_id=workspace_id, lane_id=lane_id, attest_launcher=attest_launcher,
+    )
+    # Redmine #14741 bracket 1 (j#96917 / j#96966 C12): the identity reservation is
+    # established at the SAME pre-side-effect moment as the generation, from the identity
+    # the preflight already PINNED — never a separate disk re-resolution (j#96886). A
+    # receipt-capable action that cannot record it refuses the launch outright.
+    reserve_session_launch_identities(
+        store_home=home, transaction=transaction, launch_plans=launch_plans,
+        workspace_id=workspace_id, lane_id=lane_id, attest_launcher=attest_launcher,
+        resolved=resolved,
     )
     return transaction
 

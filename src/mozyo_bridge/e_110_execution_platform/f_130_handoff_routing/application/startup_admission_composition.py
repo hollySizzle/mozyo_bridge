@@ -58,6 +58,32 @@ def updater_target_resolver_for(receiver: str) -> Optional[Callable[[str], Any]]
     return builtin_updater_target_probe() if is_supported_provider(receiver) else None
 
 
+def record_update_evidence(receiver: str, target: str, blocker_id: str) -> None:
+    """Bind durable update-relaunch evidence to the generation at ``target`` (never raises).
+
+    The answer to j#96871 Q3. A self-heal that fires after the gateway has vanished has no
+    pane left to read, so a live observation can never be its authority — but the screen WAS
+    observed, here, while the process was still alive. Writing it down at that moment is what
+    lets the relaunch fence arm later from a fact instead of from a guess.
+
+    Only an update-derived screen produces evidence: a trust or login prompt is a blocker too,
+    and it says nothing about which binary an update would reach.
+    """
+    from mozyo_bridge.core.state.launch_identity_receipt import LaunchIdentityReceiptStore
+    from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter import (  # noqa: E501
+        is_update_derived_blocker,
+    )
+
+    if not is_update_derived_blocker(receiver, blocker_id):
+        return
+    try:
+        LaunchIdentityReceiptStore().bind_evidence_by_locator(
+            provider=receiver, locator=target, blocker_id=blocker_id
+        )
+    except Exception:  # noqa: BLE001 - evidence is additive; a send refusal never depends on it
+        return
+
+
 def admit_receiver_startup_or_die(*, receiver: str, **kwargs: Any) -> None:
     """Compose the provider-specific resolver, then run the provider-neutral gate.
 
@@ -66,7 +92,12 @@ def admit_receiver_startup_or_die(*, receiver: str, **kwargs: Any) -> None:
     fence deliberately) always wins — this only supplies the default for a real send.
     """
     kwargs.setdefault("updater_targets", updater_target_resolver_for(receiver))
+    kwargs.setdefault("on_startup_blocker", record_update_evidence)
     _admit_with_gate(receiver=receiver, **kwargs)
 
 
-__all__ = ("admit_receiver_startup_or_die", "updater_target_resolver_for")
+__all__ = (
+    "admit_receiver_startup_or_die",
+    "record_update_evidence",
+    "updater_target_resolver_for",
+)

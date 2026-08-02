@@ -173,6 +173,7 @@ def admit_receiver_startup_or_die(
     updater_targets: Optional[UpdaterTargetProbe] = None,
     bound_executable_identity: str = "",
     observed_executable_identity: str = "",
+    on_startup_blocker: Optional[Callable[[str, str, str], None]] = None,
 ) -> None:
     """Read the receiver once, at action time, and refuse a send it cannot accept.
 
@@ -223,6 +224,19 @@ def admit_receiver_startup_or_die(
             observed_executable_identity=observed_executable_identity,
         )
         return
+
+    if admission.outcome == ADMISSION_BLOCKED and on_startup_blocker is not None:
+        # Redmine #14741 j#96872 item 3. This gate is the only place a provider startup
+        # screen is positively identified by its DECLARED signatures, which makes it the
+        # only honest producer of update evidence. It stays provider-neutral: it hands the
+        # typed observation to an injected sink and knows nothing about stores, update
+        # screens, or what the sink will do with it. Producing evidence must never affect
+        # whether this send is refused — the refusal below is already decided — so a sink
+        # that fails is swallowed.
+        try:
+            on_startup_blocker(receiver, target, admission.blocker_id)
+        except Exception:  # noqa: BLE001 - an injected sink is foreign code
+            pass
 
     blocked_reason = (
         REASON_STARTUP_INTERACTION

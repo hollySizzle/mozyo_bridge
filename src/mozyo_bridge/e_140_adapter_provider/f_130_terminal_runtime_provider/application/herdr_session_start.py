@@ -686,7 +686,7 @@ def _prepare_session_locked(
     transaction = open_startup_transaction_and_reserve_generations(
         workspace_id=workspace_id, lane_id=result.lane_id, providers=providers,
         dry_run=dry_run, home=Path(store_home), fence=startup_fence, nonce=action_nonce,
-        launch_plans=launch_plans, attest_launcher=attest_launcher,
+        launch_plans=launch_plans, attest_launcher=attest_launcher, env=env, resolved=resolved_launches,
     )
     result.action_id = transaction.action_id if transaction else ""
 

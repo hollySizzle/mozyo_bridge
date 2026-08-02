@@ -88,6 +88,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SublaneStartupObservation,
     SublaneLauncherIncompatibleError,
 )
+from mozyo_bridge.core.state.launch_identity_receipt import LaunchIdentityReceiptStore
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_identity_binding import (  # noqa: E501
+    finalize_lane_identity_receipts,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_relaunch_authority_fence import (  # noqa: E501
     fence_update_relaunch_or_die,
 )
@@ -400,6 +404,10 @@ class HerdrSublaneActuatorOps:
         # shared-model projections join on. A metadata write failure never breaks the
         # actuation — the projections fail open (`lane_record_missing`).
         self._record_lane_metadata(worktree_path)
+        # Redmine #14741 bracket 3 (j#96899 / C13): only HERE does the lane's lifecycle
+        # row exist, so only here is there an actual generation/revision to bind to —
+        # `prepare_session`'s own finalize runs strictly earlier (measured, j#97001).
+        finalize_lane_identity_receipts(store_home=mozyo_bridge_home(), result=result)
         return result
 
     def _launch_context(self):
@@ -666,6 +674,13 @@ class HerdrSublaneActuatorOps:
             read_visible_factory=lambda: live_visible_reader(
                 _resolve_binary_or_die(self.env), self._resolve_runner(), self.timeout
             ),
+            # The durable half. This is what arms the vanished-gateway heal, where there is
+            # no pane left to read (j#96872 item 3 / j#96871 Q3). `consumed_by` is this
+            # heal's own identity, so a replay cannot relaunch twice off one screen.
+            workspace_id=_ws,
+            lane_id=self.lane_label,
+            evidence_store=LaunchIdentityReceiptStore(home=mozyo_bridge_home()),
+            consumed_by=f"heal:{_ws}:{self.lane_label}:{worktree_path}",
         )
 
         used_v1_binding = V1ReplacementDriver(home=mozyo_bridge_home()).run(

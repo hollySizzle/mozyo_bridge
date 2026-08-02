@@ -268,7 +268,11 @@ def fence_update_relaunch_or_die(
     read_visible_factory: Callable[[], Callable[[str], object]],
     registry: Optional[Any] = None,
     identity_resolver: Optional[Callable[..., Any]] = None,
-) -> None:
+    workspace_id: str = "",
+    lane_id: str = "",
+    evidence_store: Optional[Any] = None,
+    consumed_by: str = "",
+) -> str:
     """Observe, decide, and refuse a relaunch the lane may not have — or return.
 
     The whole fence as ONE call, so the heal's composition root keeps a single neutral
@@ -300,6 +304,20 @@ def fence_update_relaunch_or_die(
             )
         except Exception:  # noqa: BLE001 - transport construction / read may fail any way
             observations = ()
+
+    # The durable half (Design Answer j#96872 item 3 / j#96871 Q3). A live read cannot be
+    # the authority for the case this ticket exists to fix: `heal_and_retry_dispatch` fires
+    # precisely BECAUSE the gateway pane is gone, and the gateway IS the slot that showed
+    # the update screen. The pre-send gate wrote that observation down against the exact
+    # generation while the process was still alive, so the fence reads it here.
+    consumable = _bound_evidence(
+        evidence_store, workspace_id=workspace_id, lane_id=lane_id, providers=providers
+    )
+    if consumable is not None:
+        observations = tuple(observations) + (
+            (consumable.key.provider, consumable.blocker_id),
+        )
+
     verdict = evaluate_relaunch_authority(
         providers,
         env,
@@ -308,7 +326,16 @@ def fence_update_relaunch_or_die(
         identity_resolver=identity_resolver,
     )
     if verdict.ok:
-        return
+        # Item 6: consume in the SAME action that is about to relaunch. A crash replay then
+        # finds the evidence `consumed` and does not relaunch a second time off one screen.
+        # Consumed only on an ADMITTED verdict — a refusal must leave the evidence standing,
+        # or a single refused attempt would disarm the fence for every attempt after it.
+        if consumable is not None and consumed_by:
+            try:
+                evidence_store.consume_evidence(consumable.key, consumed_by=consumed_by)
+            except Exception:  # noqa: BLE001 - a bookkeeping failure never blocks a heal
+                pass
+        return verdict.launch_cause
     raise RuntimeError(
         f"lane heal fenced ({verdict.reason}): {verdict.detail}. This lane showed a "
         "provider update screen, so the relaunch is update-derived and must prove, for "
@@ -317,6 +344,28 @@ def fence_update_relaunch_or_die(
         "mozyo never relaxes to PATH first-match, never rewrites the override for you, and "
         "never answers an update prompt on your behalf."
     )
+
+
+def _bound_evidence(store, *, workspace_id: str, lane_id: str, providers) -> Optional[Any]:
+    """The lane's live update evidence for a provider in this plan, or ``None``.
+
+    Never raises and never creates a store: an absent, unreadable, or schema-foreign store
+    means "no evidence", which leaves the relaunch UNARMED and therefore byte-invariant.
+    That is the correct direction here — the fence refuses relaunches that a positive fact
+    condemns, so the absence of the fact must not manufacture a refusal.
+    """
+    if store is None or not workspace_id or not lane_id:
+        return None
+    for provider in providers or ():
+        try:
+            evidence = store.read_bound_evidence(
+                workspace_id=workspace_id, lane_id=lane_id, provider=provider
+            )
+        except Exception:  # noqa: BLE001 - absent / corrupt / foreign store
+            return None
+        if evidence is not None:
+            return evidence
+    return None
 
 
 __all__ = (

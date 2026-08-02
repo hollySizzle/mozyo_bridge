@@ -440,6 +440,72 @@ def resolve_provider_identity(
     )
 
 
+#: How far above an executable its own package root may sit. npm lays a bin out as
+#: ``<pkg>/bin/<file>`` or ``<pkg>/<file>``; a bound keeps this a fixed, cheap walk and stops
+#: it from wandering up into unrelated ancestors.
+MAX_PACKAGE_ROOT_DEPTH = 4
+#: No enclosing package manifest corresponds to this executable.
+REASON_PACKAGE_ROOT_UNRESOLVED = "package_root_unresolved"
+
+
+def resolve_launched_identity(
+    provider_id: str, exec_target: str
+) -> ProviderIdentity:
+    """Identify an executable from ITS OWN enclosing package manifest — no query, ever.
+
+    The launch-time counterpart of :func:`resolve_provider_identity`, and it exists because
+    of a hard constraint the ruling states twice (j#96847, j#96872): an ordinary launch must
+    issue **zero** package-manager queries. Recording a receipt at launch by asking ``npm
+    root -g`` would have put a subprocess on every managed launch on every host — the same
+    "a fence reads host state on a path that never asked for it" defect this ticket has now
+    hit three times, in a new place.
+
+    It is also the more correct question at that moment. At launch we are not asking "what
+    does the updater own?" — we are asking "what, exactly, is this thing I am starting?".
+    That is answerable from the file itself: walk up from the exec realpath to the package
+    root that *contains* it, and require that root's manifest to name this binding's package
+    AND to map its bin back to this same file. Filesystem only: a few ``stat`` calls and one
+    small JSON read next to a binary that was already resolved. Nothing is spawned.
+
+    The two resolvers deliberately produce the SAME digest for the same (bin, version) pair,
+    so a receipt written here compares directly against an authority answer resolved there.
+    """
+    binding = _PROVIDER_UPDATE_BINDINGS.get(str(provider_id or "").strip())
+    if binding is None:
+        return ProviderIdentity(reason=REASON_PROVIDER_UNREGISTERED)
+    target = os.path.realpath(str(exec_target or "").strip()) if exec_target else ""
+    if not target or not os.path.isfile(target):
+        return ProviderIdentity(reason=REASON_EXEC_TARGET_MISMATCH)
+
+    package_dir = os.path.dirname(target)
+    for _ in range(MAX_PACKAGE_ROOT_DEPTH):
+        document, reason = _read_manifest(os.path.join(package_dir, "package.json"))
+        if document is not None and str(document.get("name") or "").strip() == binding.package:
+            version, reason = _manifest_version(document)
+            if not version:
+                return ProviderIdentity(reason=reason)
+            bin_target, reason = _manifest_bin_target(
+                document, package_dir, binding.bin_name
+            )
+            if not bin_target:
+                return ProviderIdentity(reason=reason)
+            if bin_target != target:
+                # The manifest that contains this file declares a DIFFERENT bin as the
+                # provider's. Refuse rather than identify a file its own package does not
+                # present as the provider.
+                return ProviderIdentity(reason=REASON_EXEC_TARGET_MISMATCH)
+            return ProviderIdentity(
+                digest=_identity_digest(bin_target, version),
+                resolved=True,
+                reason=REASON_OK,
+            )
+        parent = os.path.dirname(package_dir)
+        if parent == package_dir:
+            break
+        package_dir = parent
+    return ProviderIdentity(reason=REASON_PACKAGE_ROOT_UNRESOLVED)
+
+
 def is_update_derived_blocker(provider_id: str, blocker_id: str) -> bool:
     """True iff ``blocker_id`` is a screen that means ``provider_id`` is updating.
 
@@ -495,6 +561,9 @@ __all__ = (
     "REASON_MANIFEST_UNREADABLE",
     "REASON_PACKAGE_NAME_MISMATCH",
     "REASON_VERSION_UNUSABLE",
+    "MAX_PACKAGE_ROOT_DEPTH",
+    "REASON_PACKAGE_ROOT_UNRESOLVED",
+    "resolve_launched_identity",
     "resolve_provider_identity",
     "QUERY_TIMEOUT_SECONDS",
     "REASON_IDENTITY_UNCORRESPONDED",
