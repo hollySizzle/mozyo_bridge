@@ -7,7 +7,8 @@ you that ``git merge`` will take whatever the checked-out tip happens to be as i
 parent, or what a ref-deleting primitive does to a worktree standing on that ref.
 
 What is pinned against a real binary here is that **the merge is built from objects and
-touches no checkout**. It used to be performed inside a dedicated worktree, with that path's
+touches no checkout**, and that the same action rebuilds the same commit **on the same git
+version, given the same repository content** — the limit R12-R14 kept overstating. It used to be performed inside a dedicated worktree, with that path's
 identity established by an earlier probe; review j#96406 finding 1 reproduced a foreign lane's
 clean checkout swapped onto the path between the probe and the merge being switched off its
 own branch and having the merge commit built on it — and ``apply_merge`` returned
@@ -18,7 +19,7 @@ untouched — R10 claimed such a test and shipped one that did neither (j#96412 
 
 Two more properties of the object-level merge are pinned here because a durable record depends
 on them: the commit is a **function of the action** (the same action rebuilds the same SHA on
-any host at any time), and each failure carries **its own status** (a missing object and a
+the same git version and repository content), and each failure carries **its own status** (a missing object and a
 content conflict both exit 1, and calling the first a conflict is a lie the record would keep).
 
 The destructive-operation tests this module also carried are gone with the operations
@@ -55,6 +56,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MERGE_MERGED,
     MERGE_INVALID_INPUT,
     MERGE_NONDETERMINISTIC_CONFIG,
+    MERGE_SANDBOX_ERROR,
     AutoIntegrationUseCase,
     IntegrationAuthority,
 )
@@ -648,13 +650,15 @@ class DeterministicMergeCommitTest(unittest.TestCase):
                 else:
                     os.environ["GIT_DIR"] = previous
 
-    def test_a_sandbox_cleanup_failure_does_not_escape(self) -> None:
-        """j#96447 finding 2: the temp directory's exit was outside the guard.
+    def test_a_sandbox_that_cannot_be_removed_is_not_a_success(self) -> None:
+        """j#96453 finding 1: cleanup failure was swallowed and reported as `merged`.
 
-        R16 caught the constructor and the template mkdir and left cleanup uncaught, so a
-        failure there raised out of `apply_merge` *after* the commit existed. "Filesystem
-        failures become a typed refusal" was accepted two rounds earlier and implemented for
-        two of the four places one can occur.
+        Two things were wrong and the second is worse. R17 decided on its own that a leaked
+        sandbox was acceptable and returned `merged` — a change to the contract accepted in
+        j#96449, made without a ruling. And the test it shipped alongside called the real
+        cleanup first and *then* raised, so the directory was always removed: the leak path it
+        claimed to cover never executed. This injection removes nothing and asserts the
+        directory survives, so a regression cannot pass by tidying up behind itself.
         """
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
@@ -666,21 +670,49 @@ class DeterministicMergeCommitTest(unittest.TestCase):
             target = _commit(repo, "target.txt", "moved on")
 
             original = tempfile.TemporaryDirectory.cleanup
+            leaked: list = []
 
-            def exploding(self) -> None:
-                original(self)
-                raise OSError("simulated cleanup failure")
+            def refusing(self) -> None:
+                leaked.append(self.name)
+                raise OSError("simulated: the sandbox cannot be removed")
 
-            tempfile.TemporaryDirectory.cleanup = exploding
+            tempfile.TemporaryDirectory.cleanup = refusing
             try:
                 result = LiveAutoIntegrationGitOperations(repo_root=repo).apply_merge(
                     source_head=source, target_ref="main", expected_target_head=target
                 )
             finally:
                 tempfile.TemporaryDirectory.cleanup = original
-            # The merge itself succeeded; a directory that would not delete is not a reason to
-            # raise past a caller that already has its answer.
-            self.assertEqual(result.status, MERGE_MERGED, result.detail)
+                for path in leaked:
+                    shutil.rmtree(path, ignore_errors=True)
+
+            self.assertEqual(result.status, MERGE_SANDBOX_ERROR, result.detail)
+            self.assertEqual(result.integration_head, "")
+            self.assertTrue(leaked, "the injection must have been reached")
+
+    def test_a_ref_carrying_a_control_character_is_invalid_input(self) -> None:
+        """j#96453 finding 2: a NUL made `subprocess.run` raise before git was spawned.
+
+        `ValueError` is not an `OSError`, so it went straight past the adapter's fail-closed
+        wrapper and out of `apply_merge` — for an input the port contract says must come back
+        as `invalid_input`.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            _init(repo)
+            _commit(repo, "a.txt", "base")
+            _git(repo, "checkout", "-q", "-b", "lane")
+            source = _commit(repo, "lane.txt", "reviewed")
+            _git(repo, "checkout", "-q", "main")
+            target = _commit(repo, "target.txt", "moved on")
+            operations = LiveAutoIntegrationGitOperations(repo_root=repo)
+
+            for name in ("main\x00bad", "refs/heads/main\x00bad", "main\tbad", "main\x7f"):
+                result = operations.apply_merge(
+                    source_head=source, target_ref=name, expected_target_head=target
+                )
+                self.assertEqual(result.status, MERGE_INVALID_INPUT, repr(name))
+                self.assertEqual(result.integration_head, "", repr(name))
 
     def test_an_init_template_cannot_seed_the_sandbox(self) -> None:
         """j#96441 finding 1: the sandbox's own creation was running unsealed.

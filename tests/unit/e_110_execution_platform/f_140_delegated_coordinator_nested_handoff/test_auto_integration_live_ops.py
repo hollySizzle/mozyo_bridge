@@ -26,7 +26,6 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from contextlib import contextmanager
 import unittest
 from pathlib import Path
 from typing import List, Tuple
@@ -137,30 +136,35 @@ def _fail_rc(returncode: int, *, out: str = "", err: str = "") -> subprocess.Com
     )
 
 
-@contextmanager
-def _fake_sandbox(operations: LiveAutoIntegrationGitOperations):
-    """Stand in for the sanitized git directory so argv-level tests can run.
+def _fake_open_sandbox(operations: LiveAutoIntegrationGitOperations):
+    """Stand in for building the sanitized git directory so argv-level tests can run.
 
     Deliberately NOT a test of the isolation. Creating the sandbox is real filesystem and real
     git work, and whether the child process ends up seeing the repository's config is only
     observable from the child — the lesson of j#96428 finding 1, where a stub-side assertion
-    passed while the isolation did not exist. The isolation is pinned in the real-git suite;
-    what these tests check is the argv and the classification, which the stub CAN see.
+    passed while the isolation did not exist. The isolation, and the teardown's failure
+    handling (j#96453 finding 1), are pinned in the real-git suite; what these tests check is
+    the argv and the classification, which the stub CAN see.
     """
     operations._sandbox = Path("/sandbox.git")
     operations._sandbox_objects = Path("/nonexistent-repo-root/.git/objects")
-    try:
-        yield operations._sandbox
-    finally:
-        operations._sandbox = None
-        operations._sandbox_objects = None
+    return operations._sandbox, None
+
+
+def _fake_close_sandbox(operations: LiveAutoIntegrationGitOperations, scratch):
+    operations._sandbox = None
+    operations._sandbox_objects = None
+    return False
 
 
 def _adapter(recorder: _Recorder) -> LiveAutoIntegrationGitOperations:
     operations = LiveAutoIntegrationGitOperations(repo_root=Path("/nonexistent-repo-root"))
     object.__setattr__(operations, "_run", recorder)
     object.__setattr__(
-        operations, "_sanitized_git_dir", lambda: _fake_sandbox(operations)
+        operations, "_open_sandbox", lambda: _fake_open_sandbox(operations)
+    )
+    object.__setattr__(
+        operations, "_close_sandbox", lambda scratch: _fake_close_sandbox(operations, scratch)
     )
     return operations
 
@@ -260,8 +264,8 @@ class MergeTest(unittest.TestCase):
         # (j#96447 finding 1).
         self.assertEqual(ref_check, ("check-ref-format", "refs/heads/main"))
         self.assertEqual(version, ("--version",))
-        # Determinism is CHECKED before it is claimed: a configured merge driver would make
-        # the tree host-dependent, so the adapter asks (j#96417 finding 1).
+        # No probe asks about merge drivers any more: repository-local state is invisible to
+        # the merge rather than checked for (j#96435 finding 1).
         self.assertEqual(
             write_tree[len(_PINNED) : len(_PINNED) + 2], ("merge-tree", "--write-tree")
         )

@@ -288,8 +288,12 @@ driver も `info/attributes` も **sandbox から見えない**ので、宣言�
   reachability。
 - **merge は object から組む** (`merge-tree --write-tree` + `commit-tree`)。checkout・index・ref・
   HEAD を一切触らず、first parent は measured remote target。target ref は **refspec 安全性検査と
-  `git check-ref-format --branch` の両方**を通ること (どちらも他方を包含しない。j#96422 F3)。**dedicated integration worktree は
-  存在しない** (j#96406 F1)。**commit は action の純関数**であり、hook 非実行・無署名 (上節)。
+  **literal `git check-ref-format refs/heads/<name>` を sealed env で** の両方を通ること
+  (どちらも他方を包含しない。j#96422 F3。`--branch` は `@{-n}` を repository state から展開するため
+  validator ではない — j#96447 F1)。control 文字を含む ref は process argv に渡せないため事前に
+  `invalid_input` (j#96453 F2)。**dedicated integration worktree は存在しない** (j#96406 F1)。
+  **commit は「同一 git version の下で、同一 repository 内容に対し」再構築可能**であり、
+  hook 非実行・無署名 (上節)。
 - **merge の失敗は typed status** で、**durable な `StepOutcome.merge_status` field に載り、
   ledger integrity がそれを読む** (j#96417 F2 / j#96422 F2)。apply の `done` は
   **`merge_status == merged` のときだけ** push authority になり、それ以外 (失敗 status / 未知 /

@@ -76,6 +76,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MERGE_MERGED,
     MERGE_PRIMITIVE_UNSUPPORTED,
     MERGE_PROBE_ERROR,
+    MERGE_SANDBOX_ERROR,
     MergeResult,
     PushResult,
 )
@@ -127,6 +128,14 @@ def _checked_branch(ref: str) -> str:
     if candidate.startswith("-"):
         raise UnsafeRefspecError(
             f"target ref {ref!r} starts with '-' and would be read as an option"
+        )
+    # NUL and friends never reach git: `subprocess.run` raises `ValueError` before spawning,
+    # which is not an `OSError` and so escaped `_run` entirely (j#96453 finding 2). A ref the
+    # process boundary cannot carry is invalid input, not an exception.
+    if any(character < " " or character == "\x7f" for character in candidate):
+        raise UnsafeRefspecError(
+            f"target ref {ref!r} contains a control character that cannot be passed to a "
+            "process; refusing to construct the command"
         )
     forbidden = set("+ \t\n:^~?*[\\")
     if any(character in forbidden for character in candidate):
@@ -191,7 +200,10 @@ class LiveAutoIntegrationGitOperations:
                 capture_output=True,
                 env=(env if seal_env else {**os.environ, **env}) if env else None,
             )
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
+            # `ValueError` is not hypothetical: an argument containing NUL makes
+            # `subprocess.run` raise before git is spawned (j#96453 finding 2). Both mean the
+            # same thing here — nothing ran — so both fail closed rather than propagate.
             return subprocess.CompletedProcess(
                 args=["git", *args],
                 returncode=127,
@@ -422,73 +434,59 @@ class LiveAutoIntegrationGitOperations:
         env.update(overrides)
         return env
 
-    @contextmanager
-    def _sanitized_git_dir(self) -> "Iterator[Optional[Path]]":
-        """A throwaway git directory that can SEE the repository's objects and nothing else.
+    def _open_sandbox(self) -> "tuple[Optional[Path], Optional[object]]":
+        """Build a throwaway git directory that can SEE the repository's objects and nothing else.
 
         This is the answer to review j#96435 finding 1, and it is a different kind of answer
-        from the four rounds before it. Those all took the form "check the repository's state,
-        then act": pin what can be pinned, probe for what cannot, refuse when the probe finds
-        it. The reviewer's reproduction showed why that shape cannot work — a merge driver
-        added to ``.git/config`` *between* the probe and the merge ran its shell command and
-        rewrote the merged content, and an ``info/attributes`` written in the same window
-        changed a conflict into a clean merge. A check and a mutation in two invocations are
-        never bound to the same instant. That is the identical defect that retired the local
-        branch delete and the worktree removal; here, unlike there, an alternative exists.
+        from the rounds before it. Those all took the form "check the repository's state, then
+        act": pin what can be pinned, probe for what cannot, refuse when the probe finds it.
+        The reviewer's reproduction showed why that shape cannot work — a merge driver added
+        to ``.git/config`` *between* the probe and the merge ran its shell command and rewrote
+        the merged content. A check and a mutation in two invocations are never bound to the
+        same instant. That is the identical defect that retired the local branch delete and
+        the worktree removal; here, unlike there, an alternative exists.
 
         So the merge does not run in the repository. It runs in a bare git directory created
         for this call, whose object store IS the repository's (``GIT_OBJECT_DIRECTORY``), so
         every object is readable and anything written lands where the push will find it — but
-        whose config, ``info/attributes`` and ``shallow`` are those of an empty repository that
-        has existed for microseconds. The hostile state is not refused; it is **not visible**,
-        and there is no window in which it can become visible.
+        whose config, ``info/attributes`` and ``shallow`` are those of an empty repository
+        that has existed for microseconds. The hostile state is not refused; it is **not
+        visible**, and there is no window in which it can become visible.
 
-        Measured: with a driver and an ``info/attributes`` both in place, the direct merge
-        returned a clean tree containing the driver's output, and the sanitized one returned an
-        ordinary conflict with the driver never invoked. A repository marked shallow behaved
-        the same way — ``refusing to merge unrelated histories`` directly, an ordinary merge
-        here (j#96435 finding 3, closed by the same construction).
+        Setup, use and teardown are three separate steps on purpose. R17 wrapped all three in
+        one ``@contextmanager`` with a single ``except OSError``, which (a) swallowed a
+        cleanup failure and reported the merge as ``merged`` with the sandbox still on disk,
+        and (b) caught an ``OSError`` raised *into* the generator from the body and tried to
+        yield a second time, producing ``generator didn't stop after throw()`` (j#96453
+        finding 1). Three different failures cannot share one handler.
 
-        Yields ``None`` when the sandbox cannot be built or this repository's object store
-        cannot be located, and the caller turns that into
-        :data:`~...domain.auto_integration_records.MERGE_SANDBOX_ERROR` rather than falling
-        back to the repository.
+        Returns ``(sandbox, scratch)``, or ``(None, scratch_or_None)`` when the sandbox could
+        not be built. The caller must pass whatever it gets back to :meth:`_close_sandbox`.
         """
-        # The probes and the `init` are sealed too. R15 sealed what ran *inside* the sandbox
-        # and left the three commands that BUILD it running in the ambient environment —
-        # measured, a `GIT_TEMPLATE_DIR` in the parent put an `info/attributes` into the
-        # supposedly empty sandbox and turned a conflict into a clean merge (j#96441 finding
-        # 1). The boundary belongs around everything that establishes the property, not
-        # around the operation that benefits from it.
         environment = self._sealed_env()
-        object_format = self._run("rev-parse", "--show-object-format", env=environment, seal_env=True)
-        # `--absolute-git-dir` is the WRONG question in a linked worktree: it answers
-        # `$GIT_COMMON_DIR/worktrees/<name>`, which holds no object database. This lane is
-        # itself a linked worktree, so R15's merge could not have worked here at all
-        # (j#96441 finding 2) — and every scene I had tested was a plain checkout.
-        common_dir = self._run(
-            "rev-parse", "--path-format=absolute", "--git-common-dir",
-            env=environment, seal_env=True,
-        )
-        if object_format.returncode != 0 or common_dir.returncode != 0:
-            yield None
-            return
-        objects = Path(common_dir.stdout.strip()) / "objects"
-        if not objects.is_dir():
-            yield None
-            return
-        # The ENTIRE lifecycle is inside the guard, cleanup included. R16 caught the
-        # constructor and the template mkdir and left `TemporaryDirectory.__exit__` outside it,
-        # so a cleanup failure raised out of `apply_merge` *after* the commit had been built
-        # (j#96447 finding 2). "Filesystem failures become a typed refusal" was accepted two
-        # rounds ago and implemented for two of the four places one can occur.
         scratch = None
         try:
+            object_format = self._run(
+                "rev-parse", "--show-object-format", env=environment, seal_env=True
+            )
+            # `--absolute-git-dir` is the WRONG question in a linked worktree: it answers
+            # `$GIT_COMMON_DIR/worktrees/<name>`, which holds no object database. This lane is
+            # itself a linked worktree, so R15's merge could not have worked here at all
+            # (j#96441 finding 2) — and every scene I had tested was a plain checkout.
+            common_dir = self._run(
+                "rev-parse", "--path-format=absolute", "--git-common-dir",
+                env=environment, seal_env=True,
+            )
+            if object_format.returncode != 0 or common_dir.returncode != 0:
+                return None, None
+            objects = Path(common_dir.stdout.strip()) / "objects"
+            if not objects.is_dir():
+                return None, None
             scratch = tempfile.TemporaryDirectory(prefix="mozyo-merge-")
             root = Path(scratch.name)
             sandbox = root / "sanitized.git"
             # An EMPTY template we own, so `init` cannot be pointed at one that seeds the
-            # sandbox with attributes, hooks or config.
+            # sandbox with attributes, hooks or config (j#96441 finding 1).
             template = root / "empty-template"
             template.mkdir()
             created = self._run(
@@ -503,26 +501,31 @@ class LiveAutoIntegrationGitOperations:
                 seal_env=True,
             )
             if created.returncode != 0 or not sandbox.is_dir():
-                yield None
-                return
-            self._sandbox = sandbox
-            self._sandbox_objects = objects
-            try:
-                yield sandbox
-            finally:
-                self._sandbox = None
-                self._sandbox_objects = None
+                return None, scratch
         except OSError:
-            yield None
-            return
-        finally:
-            if scratch is not None:
-                try:
-                    scratch.cleanup()
-                except OSError:
-                    # A sandbox that cannot be removed is a temp-directory leak, not a reason
-                    # to raise past a caller that has already been given its answer.
-                    pass
+            return None, scratch
+        self._sandbox = sandbox
+        self._sandbox_objects = objects
+        return sandbox, scratch
+
+    def _close_sandbox(self, scratch: "Optional[object]") -> bool:
+        """Tear the sandbox down. ``True`` iff it could not be removed.
+
+        A sandbox that will not delete is not a merge that succeeded: the accepted contract
+        (j#96449 finding 2) says every failure in this lifecycle lands as
+        :data:`~...domain.auto_integration_records.MERGE_SANDBOX_ERROR`, and R17 decided on
+        its own to report ``merged`` and leave the directory behind instead. That was a change
+        to an accepted contract made without a ruling, so it is reverted here.
+        """
+        self._sandbox = None
+        self._sandbox_objects = None
+        if scratch is None:
+            return False
+        try:
+            scratch.cleanup()
+        except OSError:
+            return True
+        return False
 
     def _sealed(self, *args: str, **overrides: str) -> subprocess.CompletedProcess[str]:
         """Run git with the pinned config, a REPLACED environment, and no repository state.
@@ -578,9 +581,9 @@ class LiveAutoIntegrationGitOperations:
         turns the value into an option). That is not the same question as "is this a legal
         branch name", and R12 shipped only the first: ``main..bad``, ``main.lock``,
         ``main@{bad`` and ``main//bad`` all merged and produced commits (measured, j#96422
-        finding 3). ``git check-ref-format --branch`` answers the second, and rejects all
-        four. Neither subsumes the other — ``ma+in`` passes check-ref-format and must still be
-        refused — so both run.
+        finding 3). The LITERAL ``git check-ref-format refs/heads/<name>`` answers the second
+        and rejects all four. Neither subsumes the other — ``ma+in`` is a legal ref name that
+        must still be refused as a refspec — so both run.
 
         Raises :class:`UnsafeRefspecError`, which the caller turns into ``invalid_input``.
         """
@@ -668,12 +671,16 @@ class LiveAutoIntegrationGitOperations:
         inside a path an earlier probe had vouched for).
 
         **What determinism means here, exactly.** The same action rebuilds the same commit
-        given the same repository content. Getting there took two corrections: the host's git
-        identity and the clock (j#96412 finding 1) and ``i18n.commitEncoding`` (j#96417
-        finding 1) all reached the commit object, and each was measured producing a different
-        SHA for identical inputs. Identity and timestamps are supplied explicitly, encoding is
-        pinned per-invocation, and global/system config is emptied. What is left is a
-        configured merge driver, which cannot be pinned or disabled — so it is refused.
+        **under the same git version, given the same repository content**. Getting there took
+        several corrections, each measured producing a different SHA for identical inputs: the
+        host's git identity and the clock (j#96412 finding 1), ``i18n.commitEncoding``
+        (j#96417 finding 1), the rename settings and replace refs (j#96422 finding 1), and the
+        inherited environment itself (j#96428 finding 1). Identity and timestamps are supplied
+        explicitly, the measured config is pinned per-invocation, the environment is replaced
+        rather than overlaid — and repository-local state that no option can pin is not
+        refused but made invisible, because the merge runs in a git directory that has none
+        (:meth:`_open_sandbox`, j#96435 finding 1). The git binary cannot be pinned at all, so
+        the version is recorded rather than claimed away.
 
         Failure is a typed status, never a boolean and never prose. ``merge-tree`` exits 1 for
         a missing object exactly as it does for a real conflict (measured), so the exit code
@@ -713,23 +720,39 @@ class LiveAutoIntegrationGitOperations:
                     "not knowing is not the same as knowing it cannot"
                 ),
             )
-        with self._sanitized_git_dir() as sandbox:
-            if sandbox is None:
-                return MergeResult(
-                    status=MERGE_SANDBOX_ERROR,
-                    detail=(
-                        "could not build the isolated git directory the merge runs in (or "
-                        "locate this repository's object store); refusing rather than merging "
-                        "in the repository, where state added mid-run would change the result"
-                    ),
-                )
-            return self._merge_in(
+        sandbox, scratch = self._open_sandbox()
+        if sandbox is None:
+            self._close_sandbox(scratch)
+            return MergeResult(
+                status=MERGE_SANDBOX_ERROR,
+                detail=(
+                    "could not build the isolated git directory the merge runs in (or locate "
+                    "this repository's object store); refusing rather than merging in the "
+                    "repository, where state added mid-run would change the result"
+                ),
+            )
+        try:
+            result = self._merge_in(
                 sandbox,
                 source_head=source_head,
                 branch=branch,
                 expected_target_head=expected_target_head,
                 git_version=git_version,
             )
+        finally:
+            leaked = self._close_sandbox(scratch)
+        if leaked:
+            # The merge may well have produced a commit; what cannot be reported is success,
+            # because the isolation this design rests on was not fully torn down.
+            return MergeResult(
+                status=MERGE_SANDBOX_ERROR,
+                detail=(
+                    "the isolated git directory could not be removed after the merge; "
+                    "reporting the sandbox failure rather than a success, and leaving the "
+                    "directory for an operator to inspect"
+                ),
+            )
+        return result
 
     def _merge_in(
         self,
