@@ -112,6 +112,11 @@ PRE_INJECTION_BLOCKED_REASONS: frozenset[str] = frozenset(
         "invalid_args",
         "precondition_not_idle",
         "receiver_startup_interaction_required",
+        # Redmine #14741. The update-authority gate runs after the startup screen reads
+        # CLEAR but still BEFORE the first keystroke, so a refusal has typed nothing and
+        # pressed no Enter — nothing a retry could duplicate. Pre-injection, like its
+        # startup-screen sibling above.
+        "receiver_update_authority_split",
         "cross_session_claude",
         "target_repo_mismatch",
         "gateway_route_blocked",

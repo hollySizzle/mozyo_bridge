@@ -1232,8 +1232,15 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
-    lines: 2216
+    lines: 2217
     reason: >-
+      Baseline 2216 -> 2217 for #14741 (Codex update prompt / managed binary authority
+      split): one additive `receiver_update_authority_split` token on the closed `Reason`
+      vocabulary. Exactly the additive-Reason pattern this entry already records twice
+      below (#12918 `gateway_route_blocked`, #13760's startup reason); the refusal wording
+      and the whole gate body live in the f_130 application sibling
+      `startup_admission_gate.py`, so only the token itself lands here, because this module
+      owns the closed vocabulary. +1 line.
       Baseline 2202 -> 2216 for #13844 (shared lifecycle schema reader-upgrade routing):
       the additive `reader_upgrade_required` token on the closed `Reason` vocabulary plus
       its one-line `next_action_for` / `_outcome_narrative` branches — the same additive-

@@ -1333,6 +1333,259 @@ class QueryEnvironmentTest(unittest.TestCase):
             "global root than the one being evaluated (j#96360 F3)",
         )
 
+class UpdateDerivedBlockerRegistryTest(unittest.TestCase):
+    """The provider-specific "which screen means an update" registry (j#96374 item 2)."""
+
+    def test_registry_and_shipped_profiles_agree_in_both_directions(self) -> None:
+        """A renamed profile id must not silently stop arming the relaunch fence.
+
+        The mapping lives in trusted adapter code while the ids live in profile DATA, so
+        nothing at runtime notices when they diverge — and the failure mode of divergence
+        is fail-OPEN (the fence never arms), which is invisible. Both directions are
+        checked: an id in the registry that the profile does not declare is a dangling
+        reference, and a declared blocker the registry has never heard of is a screen
+        nobody classified.
+        """
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_runtime import (  # noqa: E501
+            AGENT_PROVIDER_PROFILES,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter import (  # noqa: E501
+            _PROVIDER_UPDATE_BLOCKERS,
+            update_derived_blocker_ids,
+        )
+
+        self.assertTrue(_PROVIDER_UPDATE_BLOCKERS, "the registry must not be empty")
+        for provider_id in _PROVIDER_UPDATE_BLOCKERS:
+            profile = AGENT_PROVIDER_PROFILES.get(provider_id)
+            self.assertIsNotNone(
+                profile, f"{provider_id} is registered but has no shipped profile"
+            )
+            declared = {b.blocker_id for b in (profile.startup_blockers or ())}
+            registered = update_derived_blocker_ids(provider_id)
+            self.assertEqual(
+                registered - declared,
+                set(),
+                f"{provider_id}: registry names blocker ids the profile does not declare; "
+                "the fence would never arm on them",
+            )
+            self.assertEqual(
+                declared - registered,
+                set(),
+                f"{provider_id}: the profile declares startup blockers the update registry "
+                "does not classify. If a NON-update screen (a trust or login prompt) is "
+                "added, this assertion is the prompt to decide explicitly whether it is "
+                "update-derived rather than let it default to 'no'",
+            )
+
+    def test_only_update_screens_resolve_to_an_update_relaunch(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_launch_composition import (  # noqa: E501
+            LAUNCH_CAUSE_GENERIC_FRESH,
+            LAUNCH_CAUSE_UPDATE_RELAUNCH,
+            launch_cause_for_observed_blockers,
+        )
+
+        self.assertEqual(
+            launch_cause_for_observed_blockers([("codex", "update_prompt_available")]),
+            LAUNCH_CAUSE_UPDATE_RELAUNCH,
+        )
+        self.assertEqual(
+            launch_cause_for_observed_blockers([("codex", "update_in_progress")]),
+            LAUNCH_CAUSE_UPDATE_RELAUNCH,
+        )
+        # A trust / login screen is a blocker, but not an update. It must NOT arm.
+        self.assertEqual(
+            launch_cause_for_observed_blockers([("codex", "trust_confirmation")]),
+            LAUNCH_CAUSE_GENERIC_FRESH,
+        )
+        # An unbound provider's screen never arms (D2 item 1).
+        self.assertEqual(
+            launch_cause_for_observed_blockers([("claude", "update_prompt_available")]),
+            LAUNCH_CAUSE_GENERIC_FRESH,
+        )
+        # No observation at all — the ordinary heal.
+        self.assertEqual(
+            launch_cause_for_observed_blockers([]), LAUNCH_CAUSE_GENERIC_FRESH
+        )
+        # Malformed entries must not crash a relaunch, and must not arm one.
+        self.assertEqual(
+            launch_cause_for_observed_blockers([None, 7, ("codex",)]),
+            LAUNCH_CAUSE_GENERIC_FRESH,
+        )
+
+
+class RelaunchAuthorityFenceTest(unittest.TestCase):
+    """The relaunch fence's own contract (j#96374 items 1-2, clarification j#96847)."""
+
+    _UPDATE = [("codex", "update_prompt_available")]
+
+    def _fence(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_relaunch_authority_fence import (  # noqa: E501
+            evaluate_relaunch_authority,
+        )
+
+        return evaluate_relaunch_authority
+
+    def test_an_unobserved_relaunch_resolves_nothing_at_all(self) -> None:
+        """Q1: a heal nobody tied to an update must not consult a package manager."""
+        consulted: list = []
+
+        verdict = self._fence()(
+            ["codex"],
+            {},
+            observations=[],
+            registry=_fake_profile_registry(),
+            updater_targets=lambda pid: consulted.append(pid) or ((), False),
+        )
+        self.assertTrue(verdict.ok)
+        self.assertEqual(verdict.launch_cause, "generic_fresh")
+        self.assertEqual(consulted, [], "an unarmed relaunch resolves nothing")
+
+    def test_aligned_with_an_exact_identity_admits_the_relaunch(self) -> None:
+        """The fence is not a blanket block: a proven, aligned generation relaunches."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        bindir = os.path.join(tmp.name, "bin")
+        pinned = _make_executable(bindir)
+        identity = executable_identity(pinned, "0.146.0")
+
+        verdict = self._fence()(
+            ["fakex"],
+            {"PATH": bindir, "MOZYO_AGENT_FAKEX_BINARY": pinned},
+            observations=self._UPDATE,
+            registry=_fake_profile_registry(),
+            updater_targets=lambda pid: ([bindir], True),
+            bound_identities={"fakex": identity},
+            observed_identities={"fakex": identity},
+        )
+        self.assertTrue(verdict.ok, verdict.detail)
+        self.assertEqual(verdict.launch_cause, "update_relaunch")
+        self.assertEqual(verdict.reason, "relaunch_authority_aligned")
+
+    def test_a_missing_exact_identity_refuses_even_when_aligned(self) -> None:
+        """j#96847: the cause alone must not arm — an unproven generation is zero-relaunch."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        bindir = os.path.join(tmp.name, "bin")
+        pinned = _make_executable(bindir)
+        env = {"PATH": bindir, "MOZYO_AGENT_FAKEX_BINARY": pinned}
+
+        for bound, observed in (
+            ({}, {}),
+            ({"fakex": executable_identity(pinned, "0.146.0")}, {}),
+            ({}, {"fakex": executable_identity(pinned, "0.146.0")}),
+            ({"fakex": "   "}, {"fakex": executable_identity(pinned, "0.146.0")}),
+        ):
+            with self.subTest(bound=bool(bound), observed=bool(observed)):
+                verdict = self._fence()(
+                    ["fakex"],
+                    env,
+                    observations=self._UPDATE,
+                    registry=_fake_profile_registry(),
+            updater_targets=lambda pid: ([bindir], True),
+                    bound_identities=bound,
+                    observed_identities=observed,
+                )
+                self.assertFalse(verdict.ok)
+                self.assertIn("exact-generation", verdict.detail)
+
+    def test_a_drifted_identity_refuses_on_path_and_on_version(self) -> None:
+        """An update rewrote what the lane runs: relaunching would inherit a stale pin."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        bindir = os.path.join(tmp.name, "bin")
+        pinned = _make_executable(bindir)
+        other = _make_executable(os.path.join(tmp.name, "other"), name="fakex")
+        env = {"PATH": bindir, "MOZYO_AGENT_FAKEX_BINARY": pinned}
+
+        # Version drift: same file, new build (the in-place package-manager rewrite).
+        version_drift = self._fence()(
+            ["fakex"],
+            env,
+            observations=self._UPDATE,
+            registry=_fake_profile_registry(),
+            updater_targets=lambda pid: ([bindir], True),
+            bound_identities={"fakex": executable_identity(pinned, "0.145.0")},
+            observed_identities={"fakex": executable_identity(pinned, "0.146.0")},
+        )
+        self.assertFalse(version_drift.ok)
+        self.assertIn("drifted", version_drift.detail)
+
+        # Path drift: same version, different install (the authority split's twin).
+        path_drift = self._fence()(
+            ["fakex"],
+            env,
+            observations=self._UPDATE,
+            registry=_fake_profile_registry(),
+            updater_targets=lambda pid: ([bindir], True),
+            bound_identities={"fakex": executable_identity(pinned, "0.146.0")},
+            observed_identities={"fakex": executable_identity(other, "0.146.0")},
+        )
+        self.assertFalse(path_drift.ok)
+        self.assertIn("drifted", path_drift.detail)
+
+        # A same-version reinstall at the same path is a MATCH, not a drift.
+        same = executable_identity(pinned, "0.146.0")
+        reinstall = self._fence()(
+            ["fakex"],
+            env,
+            observations=self._UPDATE,
+            registry=_fake_profile_registry(),
+            updater_targets=lambda pid: ([bindir], True),
+            bound_identities={"fakex": same},
+            observed_identities={"fakex": same},
+        )
+        self.assertTrue(reinstall.ok, reinstall.detail)
+
+    def test_a_split_authority_refuses_with_a_proven_identity(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        bindir = os.path.join(tmp.name, "bin")
+        pinned = _make_executable(bindir)
+        identity = executable_identity(pinned, "0.146.0")
+        elsewhere = os.path.join(tmp.name, "other-prefix")
+        os.makedirs(elsewhere, exist_ok=True)
+
+        verdict = self._fence()(
+            ["fakex"],
+            {"PATH": bindir, "MOZYO_AGENT_FAKEX_BINARY": pinned},
+            observations=self._UPDATE,
+            registry=_fake_profile_registry(),
+            updater_targets=lambda pid: ([elsewhere], True),
+            bound_identities={"fakex": identity},
+            observed_identities={"fakex": identity},
+        )
+        self.assertFalse(verdict.ok)
+        self.assertIn("split", verdict.detail)
+
+    def test_an_unbound_sibling_never_refuses_on_a_bound_provider_s_behalf(self) -> None:
+        """D2 item 1, one layer down: a lane pair is (codex, claude).
+
+        The resolver answers ``None`` for an unbound provider, and handing that straight to
+        the classifier reads as a failed probe -> ``unknown`` -> refuse. That would let
+        codex's update screen refuse the relaunch on CLAUDE's unbound authority, which is
+        the R3 shape that refused every Claude send on every host.
+        """
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        bindir = os.path.join(tmp.name, "bin")
+        pinned = _make_executable(bindir)
+        identity = executable_identity(pinned, "0.146.0")
+
+        verdict = self._fence()(
+            ["fakex", "claude"],
+            {"PATH": bindir, "MOZYO_AGENT_FAKEX_BINARY": pinned},
+            observations=self._UPDATE,
+            # Scoped exactly like the production resolver: bound provider answers, the
+            # unbound one answers None.
+            registry=_fake_profile_registry(),
+            updater_targets=lambda pid: ([bindir], True) if pid == "fakex" else None,
+            bound_identities={"fakex": identity},
+            observed_identities={"fakex": identity},
+        )
+        self.assertTrue(verdict.ok, verdict.detail)
+
+
+class RetiredPlaceholderTest(unittest.TestCase):
     def test_no_retired_placeholder_tests_remain(self) -> None:
         """j#96360 F2 also flagged disabled, non-executing tests. None may survive.
 

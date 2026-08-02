@@ -126,6 +126,22 @@ _PROVIDER_UPDATE_BINDINGS: dict[str, _UpdateBinding] = {
     "codex": _UpdateBinding(manager="npm", package="@openai/codex"),
 }
 
+#: Which of a provider's DECLARED startup blockers mean "an update is happening here".
+#:
+#: The ids are the ``startup_blockers[].id`` tokens in ``agent_provider_profiles.yaml``.
+#: This mapping lives here, beside the manager binding, for the same reason (Answer j#96167
+#: item 2): "screen X means this provider is updating" is provider-specific knowledge, and
+#: the launch/relaunch consumers must keep seeing a typed cause, never a provider name or a
+#: screen id. Closed and source-edit-only like every other registry in this module.
+#:
+#: The correspondence with the profile data is NOT self-enforcing — an id renamed in the
+#: YAML would silently stop matching here, which is a fail-OPEN drift of exactly the kind
+#: the blocker schema's own bounds exist to prevent. It is pinned instead by a regression
+#: that asserts this mapping and the shipped profiles agree in BOTH directions.
+_PROVIDER_UPDATE_BLOCKERS: dict[str, frozenset] = {
+    "codex": frozenset({"update_prompt_available", "update_in_progress"}),
+}
+
 
 def _package_directory(root: str, package: str) -> str:
     """``<root>/<package>``, with a scoped npm name (``@scope/name``) split into dirs."""
@@ -219,6 +235,36 @@ def is_supported_provider(provider_id: str) -> bool:
     return str(provider_id or "").strip() in _PROVIDER_UPDATE_BINDINGS
 
 
+def is_update_derived_blocker(provider_id: str, blocker_id: str) -> bool:
+    """True iff ``blocker_id`` is a screen that means ``provider_id`` is updating.
+
+    The one provider-specific question the relaunch composition root asks before it decides
+    a launch is update-derived (Design Answer j#96374 item 2). Everything the caller learns
+    is a boolean, so no consumer sees a screen id, a provider name, or a package manager.
+
+    Unregistered provider, unknown id, blank input — all False. False here means only "this
+    observation does not establish an update", never "no update is happening": the caller
+    maps it to :data:`...LAUNCH_CAUSE_GENERIC_FRESH`, which is the *unarmed* case and
+    therefore byte-invariant with the pre-#14741 launch, exactly as Q1 ruled. This is the
+    one place in the #14741 fence where the absence of a signal is not a refusal, and it is
+    deliberate: arming a launch that nobody tied to an update is what regressed 210 tests.
+    """
+    declared = _PROVIDER_UPDATE_BLOCKERS.get(str(provider_id or "").strip())
+    if not declared:
+        return False
+    return str(blocker_id or "").strip() in declared
+
+
+def update_derived_blocker_ids(provider_id: str) -> frozenset:
+    """The declared update-derived blocker ids for ``provider_id`` (empty when none).
+
+    Exposed for the profile-correspondence regression: the drift this guards against is
+    invisible at runtime, so the check needs to read the mapping rather than probe it one
+    id at a time.
+    """
+    return _PROVIDER_UPDATE_BLOCKERS.get(str(provider_id or "").strip(), frozenset())
+
+
 def builtin_updater_target_probe(
     env: Optional[Mapping[str, str]] = None, *, runner: Optional[Runner] = None
 ) -> Callable[[str], Tuple[Sequence[str], bool]]:
@@ -245,5 +291,8 @@ __all__ = (
     "Runner",
     "UpdaterTargetResolution",
     "builtin_updater_target_probe",
+    "is_supported_provider",
+    "is_update_derived_blocker",
     "resolve_updater_target",
+    "update_derived_blocker_ids",
 )

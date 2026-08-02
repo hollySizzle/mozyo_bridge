@@ -29,6 +29,7 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.age
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter import (  # noqa: E501
     builtin_updater_target_probe,
     is_supported_provider,
+    is_update_derived_blocker,
 )
 
 
@@ -47,6 +48,42 @@ LAUNCH_CAUSES: frozenset = frozenset(
 
 class LaunchCauseError(ValueError):
     """An unrecognised launch cause. Fail closed rather than guess which one was meant."""
+
+
+def launch_cause_for_observed_blockers(
+    observations: Sequence[Any],
+) -> str:
+    """Resolve the typed launch cause from observed startup-blocker facts (pure, total).
+
+    ``observations`` are ``(provider_id, blocker_id)`` pairs a composition root READ — the
+    #13760 admission classifier's own typed verdict for a live slot, matched against
+    signatures the provider profile declares and that were verified by rendering the real
+    screen. That is what makes this a *verified update/install startup-blocker observation*
+    in the sense of Design Answer j#96374 item 2, and not the thing that answer forbids: no
+    caller re-guesses update-ness from raw pane text, from a clean exit, or from ambient
+    host state, and this function reads nothing at all.
+
+    Any observed update-derived screen makes the launch
+    :data:`LAUNCH_CAUSE_UPDATE_RELAUNCH` — one slot mid-update is enough, because the
+    package manager writes a shared install that the whole plan's binaries come from.
+    Everything else — no observation, a non-update blocker (a trust or login screen), an
+    unregistered provider — is :data:`LAUNCH_CAUSE_GENERIC_FRESH`, i.e. UNARMED and
+    byte-invariant with the pre-#14741 launch. That asymmetry is the ruling, not a
+    softening: arming a launch nobody tied to an update is the R5 regression.
+
+    Malformed entries are skipped rather than raised on. A relaunch must not be turned into
+    a crash by a badly shaped observation, and skipping is the conservative direction here
+    precisely because it lands on the *unarmed* cause — it can only ever fail to arm a
+    fence, never arm one that was not asked for.
+    """
+    for observation in observations or ():
+        try:
+            provider_id, blocker_id = observation
+        except (TypeError, ValueError):
+            continue
+        if is_update_derived_blocker(provider_id, blocker_id):
+            return LAUNCH_CAUSE_UPDATE_RELAUNCH
+    return LAUNCH_CAUSE_GENERIC_FRESH
 
 
 def launch_updater_target_resolver(
@@ -119,6 +156,7 @@ __all__ = (
     "LAUNCH_CAUSE_UPDATE_RELAUNCH",
     "LaunchCauseError",
     "ResolvedProviderLaunch",
+    "launch_cause_for_observed_blockers",
     "launch_updater_target_resolver",
     "preflight_launch_providers",
 )

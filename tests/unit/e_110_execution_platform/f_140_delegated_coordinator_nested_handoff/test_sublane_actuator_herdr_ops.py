@@ -956,6 +956,129 @@ class HerdrSublaneOpsTest(unittest.TestCase):
         self.assertIn("preflight", str(ctx.exception))
         self.assertEqual(len(herdr.start_argvs), launches_before)
 
+    # --- Redmine #14741: the update-authority fence on the REAL self-heal path ----------
+    #
+    # These drive `heal_lane_column` itself (not a helper), so "zero relaunch" is measured
+    # the only way it can honestly be measured: `herdr.start_argvs` does not grow. The
+    # lane's shape is the measured #14741 one — the codex slot sits on its update prompt
+    # while its sibling died — so a heal genuinely WOULD relaunch, and a test that sees no
+    # growth is seeing the fence, not an absent opportunity.
+
+    #: The verified render (#14725 j#94108, codex-cli 0.146.0). Both `all_of` signatures of
+    #: the `update_prompt_available` blocker are present, in the layout Codex prints.
+    _UPDATE_PROMPT_RENDER = (
+        "✨ Update available!  0.146.0 -> 99.0.0\n"
+        "Release notes: https://github.com/openai/codex/releases/latest\n"
+        "› 1. Update now (runs `npm install -g @openai/codex`)\n"
+        "  2. Skip\n"
+        "  3. Skip until next version\n"
+        "Press enter to continue\n"
+    )
+
+    def _fake_updater_resolution(self, resolution):
+        """Answer the built-in updater probe with ``resolution`` for this test only."""
+        import mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter as adapter  # noqa: E501
+
+        consulted: list = []
+
+        def _fake(provider_id, *a, **k):
+            consulted.append(provider_id)
+            return resolution
+
+        real = adapter.resolve_updater_target
+        adapter.resolve_updater_target = _fake
+        self.addCleanup(setattr, adapter, "resolve_updater_target", real)
+        return consulted
+
+    def _lane_on_the_update_prompt(self, tmp, herdr):
+        """Stand a lane up, then leave codex on its update prompt with claude dead."""
+        ops, home = self._ops(tmp, herdr)
+        worktree = Path(tmp) / "lane-wt"
+        worktree.mkdir()
+        with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+            ops.append_lane_column(str(worktree))
+            # The worker died; the codex gateway is alive and rendering the update prompt.
+            # A heal therefore has a real relaunch to perform.
+            herdr.agents = [a for a in herdr.agents if "_claude_" not in a["name"]]
+            herdr.read_text = self._UPDATE_PROMPT_RENDER
+        return ops, home, worktree
+
+    def test_heal_refuses_an_update_relaunch_with_no_exact_generation_identity(self) -> None:
+        # Redmine #14741 clarification j#96847: `update_relaunch` must not arm on the cause
+        # alone. Even with an ALIGNED authority, a relaunch whose exact-generation
+        # executable identity is absent is refused — "we could not establish which binary
+        # this lane had been running" is an unproven generation, and the audit found that
+        # the previous cut passed it. Zero relaunch.
+        #
+        # This is the state the production heal is in today: the lane's workspace, lane id,
+        # provider, assigned name, launch generation, startup action and lifecycle revision
+        # are all establishable, but nothing durable records the executable realpath+version
+        # the generation ran, so the identity is absent and an observed update screen means
+        # zero relaunch until the operator clears it.
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter import (  # noqa: E501
+            REASON_OK,
+            UpdaterTargetResolution,
+        )
+
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            # The updater writes to the directory the managed codex actually runs from —
+            # i.e. the AUTHORITY axis is aligned. Only the identity axis is missing.
+            owned = os.path.dirname(os.path.realpath(provider_bin_path("codex")))
+            self._fake_updater_resolution(
+                UpdaterTargetResolution(roots=(owned,), resolved=True, reason=REASON_OK)
+            )
+            ops, home, worktree = self._lane_on_the_update_prompt(tmp, herdr)
+            launches_before = len(herdr.start_argvs)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                with _no_probe_wait():
+                    with self.assertRaises(RuntimeError) as ctx:
+                        ops.heal_lane_column(str(worktree))
+        self.assertIn("relaunch_authority_refused", str(ctx.exception))
+        self.assertIn("exact-generation", str(ctx.exception))
+        self.assertEqual(
+            len(herdr.start_argvs),
+            launches_before,
+            "an unproven generation must not be relaunched, even under an aligned authority",
+        )
+
+    def test_heal_without_an_observed_update_screen_consults_no_package_manager(self) -> None:
+        # Redmine #14741 j#96374 Q1, and the R5 regression this closes. A heal fires on a
+        # vanished slot, which is a CLEAN EXIT — explicitly excluded as a derivation
+        # source. So an ordinary heal must stay byte-invariant: it arms nothing, asks no
+        # package manager, and relaunches exactly as it did before this ticket, even
+        # though the authority here would have been a hard `split`.
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter import (  # noqa: E501
+            REASON_OK,
+            UpdaterTargetResolution,
+        )
+
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            elsewhere = Path(tmp) / "other-prefix" / "@openai" / "codex"
+            elsewhere.mkdir(parents=True)
+            consulted = self._fake_updater_resolution(
+                UpdaterTargetResolution(
+                    roots=(str(elsewhere),), resolved=True, reason=REASON_OK
+                )
+            )
+            ops, home = self._ops(tmp, herdr)
+            worktree = Path(tmp) / "lane-wt"
+            worktree.mkdir()
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                ops.append_lane_column(str(worktree))
+                launches_before = len(herdr.start_argvs)
+                # A plain vanish, and a composer — no update screen anywhere.
+                herdr.agents = [a for a in herdr.agents if "_codex_" not in a["name"]]
+                with _no_probe_wait():
+                    ops.heal_lane_column(str(worktree))
+        self.assertEqual(len(herdr.start_argvs), launches_before + 1)
+        self.assertEqual(
+            consulted,
+            [],
+            "an un-armed heal must not consult a package manager (the R5 regression)",
+        )
+
     def test_heal_postcondition_inventory_unreadable_fails_closed(self) -> None:
         # Redmine #13705 R1-F3: an unreadable inventory AFTER the relaunch does not pass
         # as success — the same-tab placement is unverified, so it fails closed.

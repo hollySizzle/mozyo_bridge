@@ -88,10 +88,16 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SublaneStartupObservation,
     SublaneLauncherIncompatibleError,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_relaunch_authority_fence import (  # noqa: E501
+    fence_update_relaunch_or_die,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (
     HerdrSessionStartError,
     _resolve_binary_or_die,
     herdr_workspace_segment,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_health import (  # noqa: E501
+    live_visible_reader,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_v1_replacement_binding import (  # noqa: E501
     prepare_actuator_lane_session,
@@ -648,6 +654,19 @@ class HerdrSublaneActuatorOps:
         )
         if not verdict.ok:
             raise RuntimeError(f"lane heal fenced ({verdict.reason}): {verdict.detail}")
+
+        # Update-authority fence (Redmine #14741, j#96374 / j#96847). Still inside the
+        # pre-side-effect window, so a refusal is a ZERO-relaunch refusal.
+        fence_update_relaunch_or_die(
+            managed_pair,
+            self.env,
+            slots=existing,
+            # A factory: with no live slot to read, the transport is never even resolved,
+            # so a heal that needs no observation keeps its pre-#14741 dependencies.
+            read_visible_factory=lambda: live_visible_reader(
+                _resolve_binary_or_die(self.env), self._resolve_runner(), self.timeout
+            ),
+        )
 
         used_v1_binding = V1ReplacementDriver(home=mozyo_bridge_home()).run(
             V1ReplacementRequest(
