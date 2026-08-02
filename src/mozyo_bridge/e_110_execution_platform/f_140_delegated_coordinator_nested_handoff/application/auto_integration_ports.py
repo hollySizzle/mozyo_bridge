@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Protocol, Sequence, runtime_checkable
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_records import (
+    LEDGER_PUSH_STATUS_UNSOUND,
     MERGE_COMMIT_ERROR,
     MERGE_CONTENT_CONFLICT,
     MERGE_ERROR,
@@ -52,6 +53,14 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MERGE_SANDBOX_ERROR,
     MERGE_STATUSES,
     MERGE_UNRECOGNIZED,
+    PUSH_ACCEPTED,
+    PUSH_INVALID_INPUT,
+    PUSH_OPERATIONAL_ERROR,
+    PUSH_REMOTE_MOVED,
+    PUSH_REMOTE_REFUSED,
+    PUSH_STATUSES,
+    PUSH_UNRECOGNIZED,
+    checked_push_status,
     IntegrationActionRecord,
     IntegrationCiEvidence,
     LaneWorktree,
@@ -69,21 +78,38 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 
 @dataclass(frozen=True)
 class PushResult:
-    """The outcome of a normal, non-force push — three states, not two.
+    """The outcome of a normal, non-force push, as ONE value from a closed vocabulary.
 
-    ``accepted`` — it landed. ``rejected`` — a lost race: the remote moved and a non-force
-    push cannot advance it; this is the only thing ``rejected`` may mean. And
-    ``accepted=False, rejected=False`` — the push was never ATTEMPTED, because an input could
-    not be used. The third state is not a leftover; it is how an implementation refuses an
-    unusable source head or target ref without raising (j#96499 finding 1).
+    R21 wrote this as two booleans and described them as three states. Review j#96516
+    finding 1 showed both halves of why that fails. ``PushResult(accepted=True,
+    rejected=True)`` was constructible and the use case read it as a success — a state that
+    means nothing, treated as the state that means everything. And because the adapter had
+    only one failure flag, it set ``rejected`` for every non-zero exit, so a ``git`` that
+    could not be spawned was durably recorded as "the remote moved; re-form the action
+    against the new head" (reproduced). Re-forming it would never have helped.
 
-    There is deliberately no field that would let a caller retry a rejection as a force — the
+    So the states are the vocabulary, and the two booleans are DERIVED from it — a
+    contradiction is not rejected by validation, it cannot be written down. Each status names
+    a different recovery, which is the reason the distinction has to reach the durable
+    record: fix the input, re-form the action, take it up with whoever owns the remote's
+    policy, or investigate the environment.
+
+    There is deliberately no field that would let a caller retry a lost race as a force — the
     resolution is to re-form the action against the new target head.
     """
 
-    accepted: bool
-    rejected: bool = False
+    status: str
     detail: str = ""
+
+    @property
+    def accepted(self) -> bool:
+        """The push landed. Derived, so nothing can be both accepted and something else."""
+        return self.status == PUSH_ACCEPTED
+
+    @property
+    def rejected(self) -> bool:
+        """A lost race, and ONLY that. Not "the push failed" — see the vocabulary."""
+        return self.status == PUSH_REMOTE_MOVED
 
 
 # The merge-status vocabulary lives in the DOMAIN (`...domain.auto_integration_records`) and

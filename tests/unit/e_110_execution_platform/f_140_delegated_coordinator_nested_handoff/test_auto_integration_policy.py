@@ -77,6 +77,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     STEP_INTEGRATION_APPLY,
     STEP_INTEGRATION_CI,
     STEP_PUSH,
+    PUSH_ACCEPTED,
+    PUSH_REMOTE_MOVED,
     AutoIntegrationPolicy,
     IntegrationActionRecord,
     IntegrationCiEvidence,
@@ -180,7 +182,7 @@ class ModeGateTest(unittest.TestCase):
         # R2 review j#96350 finding 1: `waived` is withdrawn, so `integrated` cannot mean
         # "no CI ran". There are only two CI-gate states left.
         record = _record()
-        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER)]
+        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER, push_status=PUSH_ACCEPTED)]
         decision = decide_integration(AUTO, record, _clean(), ledger=ledger)
         self.assertEqual(decision.state, STATE_INTEGRATED)
         self.assertEqual(decision.integration_ci, CI_GATE_GREEN)
@@ -455,7 +457,7 @@ class StateOrderTest(unittest.TestCase):
         first = decide_integration(AUTO, record, pending_ci)
         self.assertEqual((first.state, first.next_step), (STATE_PUSH_WAITING, STEP_PUSH))
 
-        pushed = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER)]
+        pushed = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER, push_status=PUSH_ACCEPTED)]
         second = decide_integration(AUTO, record, pending_ci, ledger=pushed)
         self.assertEqual(
             (second.state, second.next_step), (STATE_AWAITING_CI, STEP_INTEGRATION_CI)
@@ -470,7 +472,7 @@ class StateOrderTest(unittest.TestCase):
         # "The run settled" and "the run was green" are separate facts: a settled non-green
         # verdict is a failure, not a still-pending gate.
         record = _record()
-        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER)]
+        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER, push_status=PUSH_ACCEPTED)]
         red = IntegrationCiEvidence(
             integration_head=SOURCE, workflow="required-ci", run="run-1", conclusion="failure"
         )
@@ -560,8 +562,7 @@ class R12ReviewFinding2Test(unittest.TestCase):
                     head=OTHER,
                     recorded_by=RECORDER,
                     merge_status=MERGE_MERGED,
-                    git_version=GIT_VERSION,
-                )
+                    git_version=GIT_VERSION, push_status=PUSH_ACCEPTED)
             ],
             trusted_recorder=RECORDER,
         )
@@ -569,10 +570,94 @@ class R12ReviewFinding2Test(unittest.TestCase):
         self.assertIn(LEDGER_MERGE_STATUS_UNSOUND, decision.reason)
 
 
+class R21ReviewFinding1Test(unittest.TestCase):
+    """A recorded push is believed only when it recorded that it was ACCEPTED.
+
+    The merge lesson, learned a second time. R21 recorded the push's outcome as two booleans
+    and a sentence, so a `git` that could not be spawned and a lost race produced the same
+    durable record — and the sentence told the operator to re-form the action either way
+    (j#96516 finding 1). The typed status now has to be there, has to be `accepted`, and has
+    to be absent from every step that cannot push.
+    """
+
+    def _pushed(self, record, status: str) -> list:
+        return [
+            StepOutcome(
+                record.action_key,
+                STEP_PUSH,
+                OUTCOME_DONE,
+                head=SOURCE,
+                recorded_by=RECORDER,
+                push_status=status,
+            )
+        ]
+
+    def test_only_an_accepted_push_is_believed(self) -> None:
+        record = _record()
+        for status in (
+            PUSH_REMOTE_MOVED,
+            "remote_refused",
+            "operational_error",
+            "invalid_input",
+            "unrecognized_status",
+            "",
+        ):
+            decision = decide_integration(
+                AUTO, record, _clean(), ledger=self._pushed(record, status),
+                trusted_recorder=RECORDER,
+            )
+            self.assertTrue(decision.is_blocked, status)
+            self.assertIn(BLOCKED_LEDGER_UNTRUSTWORTHY, decision.blocked_reasons, status)
+
+    def test_an_accepted_push_reaches_the_ci_gate(self) -> None:
+        record = _record()
+        decision = decide_integration(
+            AUTO, record, _clean(), ledger=self._pushed(record, PUSH_ACCEPTED),
+            trusted_recorder=RECORDER,
+        )
+        self.assertFalse(decision.is_blocked, decision.reason)
+
+    def test_a_step_that_cannot_push_may_not_carry_a_push_status(self) -> None:
+        record = _record()
+        ledger = [
+            StepOutcome(
+                record.action_key,
+                STEP_INTEGRATION_APPLY,
+                OUTCOME_DONE,
+                head=OTHER,
+                recorded_by=RECORDER,
+                merge_status=MERGE_MERGED,
+                git_version=GIT_VERSION,
+                push_status=PUSH_ACCEPTED,
+            )
+        ]
+        decision = decide_integration(
+            AutoIntegrationPolicy(mode=MODE_AUTO, integration_branch="main", ff_only=False),
+            record,
+            _clean(fast_forward_possible=False),
+            ledger=ledger,
+            trusted_recorder=RECORDER,
+        )
+        self.assertTrue(decision.is_blocked)
+        self.assertIn(BLOCKED_LEDGER_UNTRUSTWORTHY, decision.blocked_reasons)
+
+    def test_the_status_survives_the_durable_round_trip_and_unknowns_fail_closed(self) -> None:
+        entry = StepOutcome(
+            "k", STEP_PUSH, OUTCOME_DONE, head=SOURCE, push_status=PUSH_ACCEPTED
+        )
+        self.assertEqual(entry.as_payload()["push_status"], PUSH_ACCEPTED)
+        self.assertEqual(
+            StepOutcome.from_payload(entry.as_payload()).push_status, PUSH_ACCEPTED
+        )
+        # A record cannot introduce a new outcome by writing one.
+        payload = dict(entry.as_payload(), push_status="landed_probably")
+        self.assertEqual(StepOutcome.from_payload(payload).push_status, "unrecognized_status")
+
+
 class IdempotencyTest(unittest.TestCase):
     def test_a_done_step_is_not_re_run(self) -> None:
         record = _record()
-        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER)]
+        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER, push_status=PUSH_ACCEPTED)]
         decision = decide_integration(AUTO, record, _clean(), ledger=ledger)
         self.assertEqual(decision.state, STATE_INTEGRATED)
         self.assertIsNone(decision.next_step)
@@ -581,7 +666,7 @@ class IdempotencyTest(unittest.TestCase):
         # The lane advanced, so the action is a different action. The old push does not
         # count, and the new one is decided from scratch.
         stale = _record(source_head=OTHER)
-        ledger = [StepOutcome(stale.action_key, STEP_PUSH, OUTCOME_DONE)]
+        ledger = [StepOutcome(stale.action_key, STEP_PUSH, OUTCOME_DONE, push_status=PUSH_ACCEPTED)]
         decision = decide_integration(AUTO, _record(), _clean(), ledger=ledger)
         self.assertEqual(decision.state, STATE_PUSH_WAITING)
         self.assertEqual(decision.next_step, STEP_PUSH)
@@ -620,7 +705,7 @@ class R1ReviewFindingRegressionTest(unittest.TestCase):
         # landed — the central preset's `### Hibernate Evidence Marker Contract` rule that an
         # unrelated green run must not satisfy a required-CI claim.
         record = _record()
-        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER)]
+        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER, push_status=PUSH_ACCEPTED)]
         elsewhere = IntegrationCiEvidence(
             integration_head=OTHER, workflow="required-ci", run="run-9", conclusion="success"
         )
@@ -635,7 +720,7 @@ class R1ReviewFindingRegressionTest(unittest.TestCase):
         # "We cannot tell what this run was" is not "the run failed": the operator's next
         # action differs, so the tokens differ.
         record = _record()
-        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER)]
+        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER, push_status=PUSH_ACCEPTED)]
         for overrides in (
             {"workflow": ""},
             {"run": ""},
@@ -674,7 +759,7 @@ class R1ReviewFindingRegressionTest(unittest.TestCase):
                 record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE,
                 head=merge_head, recorded_by=RECORDER, merge_status=MERGE_MERGED,
                 git_version=GIT_VERSION),
-            StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=merge_head, recorded_by=RECORDER),
+            StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=merge_head, recorded_by=RECORDER, push_status=PUSH_ACCEPTED),
         ]
         about_source = IntegrationCiEvidence(
             integration_head=SOURCE, workflow="required-ci", run="r", conclusion="success"
@@ -802,8 +887,7 @@ class R3ReviewFindingRegressionTest(unittest.TestCase):
             ledger=[
                 StepOutcome(
                     record.action_key, STEP_PUSH, OUTCOME_DONE, head=OTHER,
-                    recorded_by=RECORDER,
-                )
+                    recorded_by=RECORDER, push_status=PUSH_ACCEPTED)
             ],
             trusted_recorder=RECORDER,
         )
@@ -821,8 +905,7 @@ class R3ReviewFindingRegressionTest(unittest.TestCase):
             ledger=[
                 StepOutcome(
                     record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE,
-                    recorded_by="somebody-else",
-                )
+                    recorded_by="somebody-else", push_status=PUSH_ACCEPTED)
             ],
             trusted_recorder=RECORDER,
         )
@@ -837,8 +920,7 @@ class R3ReviewFindingRegressionTest(unittest.TestCase):
             ledger=[
                 StepOutcome(
                     record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE,
-                    recorded_by=RECORDER,
-                )
+                    recorded_by=RECORDER, push_status=PUSH_ACCEPTED)
             ],
             trusted_recorder=RECORDER,
         )
@@ -871,8 +953,7 @@ class R5ReviewFinding2Test(unittest.TestCase):
         ledger = [
             StepOutcome(
                 record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE,
-                recorded_by=RECORDER,
-            )
+                recorded_by=RECORDER, push_status=PUSH_ACCEPTED)
         ]
         decision = decide_integration(
             AUTO,
@@ -889,8 +970,7 @@ class R5ReviewFinding2Test(unittest.TestCase):
         ledger = [
             StepOutcome(
                 record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE,
-                recorded_by=RECORDER,
-            )
+                recorded_by=RECORDER, push_status=PUSH_ACCEPTED)
         ]
         decision = decide_integration(
             AUTO,
@@ -910,8 +990,7 @@ class R5ReviewFinding2Test(unittest.TestCase):
         ledger = [
             StepOutcome(
                 record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE,
-                recorded_by=RECORDER,
-            )
+                recorded_by=RECORDER, push_status=PUSH_ACCEPTED)
         ]
         decision = decide_integration(
             AUTO,
@@ -937,7 +1016,7 @@ class R2ReviewFindingRegressionTest(unittest.TestCase):
             AUTO,
             record,
             _clean(integration_ci=None),
-            ledger=[StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER)],
+            ledger=[StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER, push_status=PUSH_ACCEPTED)],
         )
         self.assertEqual(decision.state, STATE_AWAITING_CI)
         self.assertEqual(decision.integration_ci, CI_GATE_NOT_REACHED)
@@ -990,7 +1069,7 @@ class R2ReviewFindingRegressionTest(unittest.TestCase):
                 record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE,
                 head=merge_head, recorded_by=RECORDER, merge_status=MERGE_MERGED,
                 git_version=GIT_VERSION),
-                StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head="", recorded_by=RECORDER),
+                StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head="", recorded_by=RECORDER, push_status=PUSH_ACCEPTED),
             ],
         )
         self.assertEqual(decision.blocked_reasons, (BLOCKED_PUSH_OUTCOME_HEAD_MISSING,))
@@ -1002,7 +1081,7 @@ class R2ReviewFindingRegressionTest(unittest.TestCase):
             record,
             _clean(),
             ledger=[
-                StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head="not-a-sha", recorded_by=RECORDER)
+                StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head="not-a-sha", recorded_by=RECORDER, push_status=PUSH_ACCEPTED)
             ],
         )
         self.assertEqual(decision.blocked_reasons, (BLOCKED_PUSH_OUTCOME_HEAD_MISSING,))
@@ -1015,7 +1094,7 @@ class R2ReviewFindingRegressionTest(unittest.TestCase):
             AUTO,
             record,
             _clean(),
-            ledger=[StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=OTHER, recorded_by=RECORDER)],
+            ledger=[StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=OTHER, recorded_by=RECORDER, push_status=PUSH_ACCEPTED)],
         )
         self.assertEqual(ff.blocked_reasons, (BLOCKED_PUSH_HEAD_MISMATCH,))
 
@@ -1034,7 +1113,7 @@ class R2ReviewFindingRegressionTest(unittest.TestCase):
                 record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE,
                 head=merge_head, recorded_by=RECORDER, merge_status=MERGE_MERGED,
                 git_version=GIT_VERSION),
-                StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER),
+                StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER, push_status=PUSH_ACCEPTED),
             ],
         )
         self.assertEqual(merged.blocked_reasons, (BLOCKED_PUSH_HEAD_MISMATCH,))
@@ -1062,7 +1141,7 @@ class R2ReviewFindingRegressionTest(unittest.TestCase):
                 record.action_key, STEP_INTEGRATION_APPLY, OUTCOME_DONE,
                 head=merge_head, recorded_by=RECORDER, merge_status=MERGE_MERGED,
                 git_version=GIT_VERSION),
-                StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=merge_head, recorded_by=RECORDER),
+                StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=merge_head, recorded_by=RECORDER, push_status=PUSH_ACCEPTED),
             ],
         )
         self.assertEqual(decision.state, STATE_INTEGRATED)
@@ -1085,7 +1164,7 @@ class JournalRendererTest(unittest.TestCase):
     def test_integrated_record_separates_source_and_integration_heads(self) -> None:
         # A single head cannot prove a merge-commit integration, so both are emitted.
         record = _record()
-        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER)]
+        ledger = [StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER, push_status=PUSH_ACCEPTED)]
         decision = decide_integration(AUTO, record, _clean(), ledger=ledger)
         rendered = render_integration_action_journal(
             decision, record, integration_head=OTHER
@@ -1106,7 +1185,7 @@ class JournalRendererTest(unittest.TestCase):
                 record,
                 preflight,
                 ledger=[
-                    StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER)
+                    StepOutcome(record.action_key, STEP_PUSH, OUTCOME_DONE, head=SOURCE, recorded_by=RECORDER, push_status=PUSH_ACCEPTED)
                 ]
                 if preflight.integration_ci is None
                 else [],

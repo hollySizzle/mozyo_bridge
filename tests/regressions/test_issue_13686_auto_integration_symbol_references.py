@@ -54,6 +54,7 @@ PACKAGE = "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nes
 #: adding a module to the subsystem is a deliberate act that includes covering it here.
 MODULES = (
     f"{PACKAGE}.application.auto_integration_live_ops",
+    f"{PACKAGE}.application.auto_integration_refspec",
     f"{PACKAGE}.application.auto_integration_ports",
     f"{PACKAGE}.application.auto_integration_actuator",
     f"{PACKAGE}.domain.auto_integration_records",

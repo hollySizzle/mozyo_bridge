@@ -81,6 +81,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LEDGER_MERGE_STATUS_UNSOUND,
     LEDGER_MERGE_VERSION_MISSING,
     checked_merge_status,
+    checked_push_status,
+    PUSH_ACCEPTED,
+    PUSH_REMOTE_MOVED,
     StepOutcome,
     build_integration_action_record,
     completed_steps,
@@ -625,6 +628,11 @@ def decide_integration(
         merge_status_step=(
             STEP_INTEGRATION_APPLY if disposition == DISPOSITION_MERGE_COMMIT else ""
         ),
+        # And the push's typed status is READ here too — the same gate for the same reason
+        # (j#96516 finding 1). A `done` push whose status is anything but `accepted` — a lost
+        # race, an unreachable remote, an unrecognized value — has not been shown to have
+        # landed, and a step that cannot push may not carry a push status at all.
+        push_status_step=STEP_PUSH,
         recorded_by=trusted_recorder,
         known_steps=INTEGRATION_STEPS,
     )
@@ -935,6 +943,9 @@ __all__ = (
     "LEDGER_MERGE_STATUS_UNSOUND",
     "LEDGER_MERGE_VERSION_MISSING",
     "checked_merge_status",
+    "checked_push_status",
+    "PUSH_ACCEPTED",
+    "PUSH_REMOTE_MOVED",
     "IntegrationDecision",
     "decide_integration",
     # Re-exported from the records sibling for a stable public surface.

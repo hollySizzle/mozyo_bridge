@@ -81,8 +81,15 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MERGE_PRIMITIVE_UNSUPPORTED,
     MERGE_PROBE_ERROR,
     MERGE_SANDBOX_ERROR,
+    PUSH_ACCEPTED,
+    PUSH_INVALID_INPUT,
     MergeResult,
     PushResult,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_refspec import (
+    _checked_branch,
+    _push_status,
+    _UnsafeRefspecError,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_records import (
     EMPTY_TARGET_HEAD,
@@ -106,64 +113,6 @@ _HEX_DIGITS = frozenset("0123456789abcdef")
 
 def _is_full_sha(value: str) -> bool:
     return len(value) == 40 and all(character in _HEX_DIGITS for character in value)
-
-
-class UnsafeRefspecError(ValueError):
-    """A ref name could not be turned into a provably non-force refspec.
-
-    A branch name carrying ``+``, whitespace, or a leading ``-`` would change what the
-    constructed ``git push`` argv *means* — ``+`` spells a force inside a refspec, and a
-    leading ``-`` turns the value into an option — so the argv is never built at all.
-
-    **This exception does not leave the adapter.** All three call sites catch it and answer in
-    that operation's own fail-closed vocabulary: a read returns ``""`` / ``False``,
-    :meth:`apply_merge` returns ``invalid_input``, and :meth:`push_non_force` returns
-    ``accepted=False, rejected=False`` — the state it already used for an unusable source
-    head. Three rounds went into defending an escape out of one of them (j#96461 finding 2,
-    j#96492 finding 4, j#96499 finding 1); an unusable input is a refusal, and this adapter
-    now has one way of saying so.
-    """
-
-
-def _checked_branch(ref: str) -> str:
-    """Return ``ref`` as a bare branch name, or raise :class:`UnsafeRefspecError`.
-
-    Accepts either ``<branch>`` or ``refs/heads/<branch>`` and normalizes to the bare name, so
-    that one spelling choice — how the caller qualifies the ref — does not decide whether the
-    refspec is safe. That is the ONLY normalization performed here; everything else about the
-    name is judged as written.
-    """
-    # No `.strip()`. R18 trimmed first and checked afterwards, so `'ma in'` was refused while
-    # `' main '` and `'main\n'` were silently rewritten to `main` — the same character
-    # accepted or rejected depending on where in the name it sat (j#96461 finding 2). This
-    # function's job is to answer whether the ref AS SPELLED can be handed to git, so a
-    # spelling it would have to be repaired to be usable is not one it can vouch for. Trimming
-    # a configured value is a separate, deliberate step that happens once, upstream, in
-    # `normalized_branch` when the action record is formed.
-    candidate = ref or ""
-    if candidate.startswith("refs/heads/"):
-        candidate = candidate[len("refs/heads/") :]
-    if not candidate:
-        raise UnsafeRefspecError("target ref is empty")
-    if candidate.startswith("-"):
-        raise UnsafeRefspecError(
-            f"target ref {ref!r} starts with '-' and would be read as an option"
-        )
-    # NUL and friends never reach git: `subprocess.run` raises `ValueError` before spawning,
-    # which is not an `OSError` and so escaped `_run` entirely (j#96453 finding 2). A ref the
-    # process boundary cannot carry is invalid input, not an exception.
-    if any(character < " " or character == "\x7f" for character in candidate):
-        raise UnsafeRefspecError(
-            f"target ref {ref!r} contains a control character that cannot be passed to a "
-            "process; refusing to construct the command"
-        )
-    forbidden = set("+ \t\n:^~?*[\\")
-    if any(character in forbidden for character in candidate):
-        raise UnsafeRefspecError(
-            f"target ref {ref!r} contains a character that would change the refspec's "
-            "meaning ('+' spells a force); refusing to construct the push"
-        )
-    return candidate
 
 
 @dataclass
@@ -287,7 +236,7 @@ class LiveAutoIntegrationGitOperations:
         the sibling terminal-retire path. No fetch, no ref update, no mutation.
 
         An unusable ref name is a probe that cannot answer, not a crash. R18 let
-        :class:`UnsafeRefspecError` out of this read, and the actuator calls it from
+        :class:`_UnsafeRefspecError` out of this read, and the actuator calls it from
         :meth:`AutoIntegrationUseCase._measure` **before** the apply that turns the same input
         into ``invalid_input`` — so a target ref carrying a NUL, a tab or a ``+`` took down
         the whole run instead of being refused by it (reproduced end to end, j#96461
@@ -298,7 +247,7 @@ class LiveAutoIntegrationGitOperations:
         """
         try:
             name = _checked_branch(branch)
-        except UnsafeRefspecError:
+        except _UnsafeRefspecError:
             return ""
         result = self._run(
             "ls-remote", "--heads", "--end-of-options", self.remote, f"refs/heads/{name}"
@@ -618,7 +567,7 @@ class LiveAutoIntegrationGitOperations:
         and rejects all four. Neither subsumes the other — ``ma+in`` is a legal ref name that
         must still be refused as a refspec — so both run.
 
-        Raises :class:`UnsafeRefspecError`, which the caller turns into ``invalid_input``.
+        Raises :class:`_UnsafeRefspecError`, which the caller turns into ``invalid_input``.
         """
         branch = _checked_branch(target_ref)
         # The LITERAL form, not `--branch`. `--branch` is not a validator: it also expands
@@ -641,7 +590,7 @@ class LiveAutoIntegrationGitOperations:
             seal_env=True,
         )
         if checked.returncode != 0:
-            raise UnsafeRefspecError(
+            raise _UnsafeRefspecError(
                 f"target ref {target_ref!r} is not a valid branch name: "
                 f"{checked.stderr.strip()[:120]}"
             )
@@ -730,7 +679,7 @@ class LiveAutoIntegrationGitOperations:
             )
         try:
             branch = self._checked_target_branch(target_ref)
-        except UnsafeRefspecError as unsafe:
+        except _UnsafeRefspecError as unsafe:
             # R11 declared this vocabulary member and then let the exception escape into the
             # caller (j#96417 finding 3): a status that says it covers unusable ref names, and
             # an operation that instead crashes the actuator on one.
@@ -913,46 +862,45 @@ class LiveAutoIntegrationGitOperations:
         leading ``+`` that spells a force. A rejection means the remote moved; the answer is
         to re-form the action against the new head, and this adapter offers no other one.
 
-        **Both unusable inputs are refused the same way** — ``accepted=False,
-        rejected=False``, nothing spawned — because they are the same kind of thing. The
-        state's meaning is the port's; what R19 and R20 got wrong about it, twice, is in the
-        design doc (j#96499 finding 1). ``rejected`` keeps its one meaning, the remote moved.
+        **Both unusable inputs are refused the same way** — ``invalid_input``, nothing
+        spawned — because they are the same kind of thing. What R19 and R20 got wrong about
+        that, twice, is in the design doc (j#96499 finding 1).
+
+        **How it failed is read from git, not guessed from the exit code.** R21 mapped every
+        non-zero exit onto "the remote moved" (j#96516 finding 1), so a ``git`` that never
+        spawned told an operator to re-form the action — advice that could never work.
+        ``--porcelain`` prints a machine-readable line per ref; :func:`_push_status` reads
+        ours. The measured situation-to-status table is in the design doc, stated once.
         """
         try:
             branch = _checked_branch(target_ref)
-        except UnsafeRefspecError as unsafe:
-            return PushResult(accepted=False, rejected=False, detail=str(unsafe))
+        except _UnsafeRefspecError as unsafe:
+            return PushResult(status=PUSH_INVALID_INPUT, detail=str(unsafe))
         if not _is_full_sha(source_head):
             return PushResult(
-                accepted=False,
-                rejected=False,
+                status=PUSH_INVALID_INPUT,
                 detail=f"refusing to push {source_head!r}: not a full commit SHA",
             )
+        refspec = f"{source_head}:refs/heads/{branch}"
         result = self._run(
-            "push",
-            "--atomic",
-            "--end-of-options",
-            self.remote,
-            f"{source_head}:refs/heads/{branch}",
+            "push", "--porcelain", "--atomic", "--end-of-options", self.remote, refspec
         )
         if result.returncode == 0:
             return PushResult(
-                accepted=True,
+                status=PUSH_ACCEPTED,
                 detail=f"pushed {source_head} to {self.remote}/{branch} (non-force)",
             )
+        status = _push_status(result.stdout, refspec=refspec)
         return PushResult(
-            accepted=False,
-            rejected=True,
+            status=status,
             detail=(
-                f"non-force push to {self.remote}/{branch} was rejected; re-form the action "
-                f"against the new target head (never force, never rebase): "
-                f"{result.stderr.strip()}"
+                f"non-force push to {self.remote}/{branch} did not land ({status}): "
+                f"{(result.stderr.strip() or result.stdout.strip())[:400]}"
             ),
         )
 
 
 __all__ = (
     "DEFAULT_REMOTE",
-    "UnsafeRefspecError",
     "LiveAutoIntegrationGitOperations",
 )

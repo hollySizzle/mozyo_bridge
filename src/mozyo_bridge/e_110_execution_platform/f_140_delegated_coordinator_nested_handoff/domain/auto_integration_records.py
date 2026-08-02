@@ -139,6 +139,59 @@ MERGE_STATUSES: frozenset = frozenset(
 )
 
 
+# ---------------------------------------------------------------------------
+# How a push ended — the same treatment, for the same reason.
+# ---------------------------------------------------------------------------
+#
+# R21 shipped two booleans here and called them three states. Review j#96516 finding 1 showed
+# what that cost: EVERY non-zero `git push` exit was recorded as `rejected`, whose documented
+# meaning is "the remote moved, re-form the action against the new head" — so a `git` that
+# could not be spawned at all told an operator to re-form an action, forever. And
+# `PushResult(accepted=True, rejected=True)` was constructible and read as a success.
+#
+# The three recoveries are genuinely different, which is the whole reason the distinction has
+# to survive into the durable record: fix the input, re-form the action, or investigate the
+# environment. A `detail` sentence cannot be dispatched on — the same lesson j#96417 finding 2
+# taught about the merge status, which is why this vocabulary looks exactly like that one.
+
+#: The push landed.
+PUSH_ACCEPTED = "accepted"
+#: Nothing was attempted: an argument could not be used — an incomplete source head, or a ref
+#: that cannot be spelled as a provably non-force refspec. Recovery: fix the input.
+PUSH_INVALID_INPUT = "invalid_input"
+#: The remote's ref is not an ancestor of what we offered — a lost race. This is the ONLY
+#: status that means "re-form the action against the new target head", and it is established
+#: from the porcelain ref line's ``[rejected]``, never inferred from an exit code.
+PUSH_REMOTE_MOVED = "remote_moved"
+#: The remote answered and DECLINED the update — a pre-receive/update hook, a protected
+#: branch. Measured as ``[remote rejected]``, a different porcelain string from the one above.
+#: Kept separate because re-forming the action does not help: whoever owns that policy does.
+PUSH_REMOTE_REFUSED = "remote_refused"
+#: The push could not be carried out: git would not run, the remote was unreachable, or the
+#: output named no outcome for our ref at all. Not a statement about the remote's ref.
+PUSH_OPERATIONAL_ERROR = "operational_error"
+#: A port returned something outside this vocabulary — recorded as a value, never folded into
+#: prose (the same fail-closed direction as :data:`MERGE_UNRECOGNIZED`).
+PUSH_UNRECOGNIZED = "unrecognized_status"
+
+PUSH_STATUSES: frozenset = frozenset(
+    {
+        PUSH_ACCEPTED,
+        PUSH_INVALID_INPUT,
+        PUSH_REMOTE_MOVED,
+        PUSH_REMOTE_REFUSED,
+        PUSH_OPERATIONAL_ERROR,
+        PUSH_UNRECOGNIZED,
+    }
+)
+
+
+def checked_push_status(value: object) -> str:
+    """Coerce ``value`` to a known push status, or to :data:`PUSH_UNRECOGNIZED`."""
+    candidate = str(value or "").strip()
+    return candidate if candidate in PUSH_STATUSES else PUSH_UNRECOGNIZED
+
+
 def checked_merge_status(value: object) -> str:
     """Coerce ``value`` to a known merge status, or to :data:`MERGE_UNRECOGNIZED`.
 
@@ -178,6 +231,11 @@ class StepOutcome:
     #: and then wrote it back into ``detail`` as a string prefix, so the durable record — the
     #: thing a consumer actually reads — was still prose (j#96417 finding 2).
     merge_status: str = ""
+    #: For a push: HOW it ended, from the closed :data:`PUSH_STATUSES` vocabulary. Empty for
+    #: every other step. Recorded for the same reason as ``merge_status`` and after the same
+    #: mistake: R21 left the push's outcome as two booleans plus a sentence, so a spawn
+    #: failure and a lost race were the same durable record (j#96516 finding 1).
+    push_status: str = ""
 
     def as_payload(self) -> dict[str, object]:
         """The durable serialization — provenance included.
@@ -194,6 +252,7 @@ class StepOutcome:
             "head": self.head,
             "recorded_by": self.recorded_by,
             "merge_status": self.merge_status,
+            "push_status": self.push_status,
             "git_version": self.git_version,
         }
 
@@ -201,6 +260,7 @@ class StepOutcome:
     def from_payload(cls, payload: "dict[str, object]") -> "StepOutcome":
         """Parse a serialized outcome, keeping every field the trust decision reads."""
         raw_status = payload.get("merge_status", "")
+        raw_push = payload.get("push_status", "")
         return cls(
             action_key=str(payload.get("action_key", "")),
             step=str(payload.get("step", "")),
@@ -212,6 +272,9 @@ class StepOutcome:
             # rather than as itself: a record cannot introduce a new outcome by writing one.
             merge_status=(
                 checked_merge_status(raw_status) if str(raw_status or "").strip() else ""
+            ),
+            push_status=(
+                checked_push_status(raw_push) if str(raw_push or "").strip() else ""
             ),
             git_version=str(payload.get("git_version", "")),
         )
@@ -263,6 +326,10 @@ LEDGER_MERGE_VERSION_MISSING = "ledger_merge_version_missing"
 #: ``push_waiting`` and authorized a push (measured, j#96422 finding 2). A field nothing reads
 #: is not a gate — the same lesson as the round before, one layer further out.
 LEDGER_MERGE_STATUS_UNSOUND = "ledger_merge_status_unsound"
+#: The push step's ``done`` entry does not carry :data:`PUSH_ACCEPTED`, or a step that cannot
+#: push carries a push status at all. The same gate as the merge one, added for the same
+#: reason: a typed status nothing reads is not a gate (j#96422 finding 2, j#96516 finding 1).
+LEDGER_PUSH_STATUS_UNSOUND = "ledger_push_status_unsound"
 
 
 def ledger_integrity_errors(
@@ -272,6 +339,7 @@ def ledger_integrity_errors(
     required_order: Tuple[str, ...],
     head_bearing_steps: Tuple[str, ...] = (),
     merge_status_step: str = "",
+    push_status_step: str = "",
     recorded_by: str = "",
     known_steps: Tuple[str, ...] = (),
 ) -> Tuple[str, ...]:
@@ -291,6 +359,13 @@ def ledger_integrity_errors(
     :data:`MERGE_MERGED`. Anything else — a failure status, an unrecognized one, or none at
     all — means the apply was not shown to have merged, and no step other than that one may
     carry a merge status at all.
+
+    ``push_status_step`` is the same requirement for :data:`PUSH_ACCEPTED`. It exists because
+    the merge lesson had to be learned twice: R12 stored a typed merge status that nothing
+    consulted, and a `done` apply carrying `unrecognized_status` authorized a push
+    (j#96422 finding 2). R21 then stored the push's outcome as two booleans and a sentence,
+    so a `git` that never ran was durably recorded as a lost race (j#96516 finding 1). A
+    status is a gate only where something reads it.
     """
     entries = [
         entry
@@ -341,6 +416,14 @@ def ledger_integrity_errors(
             # A status on a step that cannot produce one is a record about something that did
             # not happen; it is refused rather than ignored.
             problems.append(LEDGER_MERGE_STATUS_UNSOUND)
+            break
+    for entry in entries:
+        expected_pushed = push_status_step and entry.step == push_status_step
+        if expected_pushed and entry.push_status != PUSH_ACCEPTED:
+            problems.append(LEDGER_PUSH_STATUS_UNSOUND)
+            break
+        if not expected_pushed and entry.push_status:
+            problems.append(LEDGER_PUSH_STATUS_UNSOUND)
             break
     return tuple(dict.fromkeys(problems))
 
@@ -668,5 +751,14 @@ __all__ = (
     "LEDGER_MERGE_STATUS_UNSOUND",
     "LEDGER_MERGE_VERSION_MISSING",
     "checked_merge_status",
+    "PUSH_ACCEPTED",
+    "PUSH_INVALID_INPUT",
+    "PUSH_REMOTE_MOVED",
+    "PUSH_REMOTE_REFUSED",
+    "PUSH_OPERATIONAL_ERROR",
+    "PUSH_UNRECOGNIZED",
+    "PUSH_STATUSES",
+    "LEDGER_PUSH_STATUS_UNSOUND",
+    "checked_push_status",
     "IntegrationPreflight",
 )

@@ -52,6 +52,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MERGE_SANDBOX_ERROR,
     MERGE_STATUSES,
     MERGE_UNRECOGNIZED,
+    PUSH_ACCEPTED,
+    PUSH_INVALID_INPUT,
+    PUSH_OPERATIONAL_ERROR,
+    PUSH_REMOTE_MOVED,
+    PUSH_REMOTE_REFUSED,
+    PUSH_STATUSES,
+    PUSH_UNRECOGNIZED,
     AutoIntegrationGitOperations,
     CleanupAuthority,
     DurableAuthorityReader,
@@ -78,6 +85,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LaneWorktree,
     StepOutcome,
     checked_merge_status,
+    checked_push_status,
     completed_steps,
     is_full_sha,
     decide_integration,
@@ -515,16 +523,23 @@ class AutoIntegrationUseCase:
             result = self.operations.push_non_force(
                 source_head=pushed_head, target_ref=record.target_ref
             )
-            if not result.accepted:
+            # The TYPED status decides, and the typed status is recorded. R21 read
+            # `accepted` — a derived boolean — and left the reason in `detail` as prose, so
+            # the durable record could not tell a lost race from a git that never ran, and the
+            # only recovery it suggested was the one for a lost race (j#96516 finding 1). An
+            # unrecognized status is not a success: a port answering outside the vocabulary
+            # has not shown that anything landed.
+            status = checked_push_status(result.status)
+            if status != PUSH_ACCEPTED:
                 return StepOutcome(
                     action_key=decision.action_key,
                     step=step,
                     recorded_by=self.recorder_id,
                     outcome=OUTCOME_BLOCKED,
+                    push_status=status,
                     detail=(
                         result.detail
-                        or f"{BLOCKED_PUSH_REJECTED}: the remote moved; re-form the action "
-                        "against the new target head (never force, never rebase)"
+                        or f"{BLOCKED_PUSH_REJECTED}: the push did not land ({status})"
                     ),
                 )
             return StepOutcome(
@@ -532,6 +547,7 @@ class AutoIntegrationUseCase:
                 step=step,
                 recorded_by=self.recorder_id,
                 outcome=OUTCOME_DONE,
+                push_status=status,
                 detail=result.detail,
                 head=pushed_head,
             )
@@ -725,6 +741,13 @@ __all__: Tuple[str, ...] = (
     "MERGE_COMMIT_ERROR",
     "MERGE_UNRECOGNIZED",
     "MERGE_STATUSES",
+    "PUSH_ACCEPTED",
+    "PUSH_INVALID_INPUT",
+    "PUSH_REMOTE_MOVED",
+    "PUSH_REMOTE_REFUSED",
+    "PUSH_OPERATIONAL_ERROR",
+    "PUSH_UNRECOGNIZED",
+    "PUSH_STATUSES",
     "AutoIntegrationGitOperations",
     "ManagedProcessOperations",
     "DurableAuthorityReader",

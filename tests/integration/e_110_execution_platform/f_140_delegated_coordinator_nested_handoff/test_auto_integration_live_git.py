@@ -60,6 +60,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MERGE_INVALID_INPUT,
     MERGE_NONDETERMINISTIC_CONFIG,
     MERGE_SANDBOX_ERROR,
+    PUSH_ACCEPTED,
+    PUSH_OPERATIONAL_ERROR,
+    PUSH_REMOTE_MOVED,
+    PUSH_REMOTE_REFUSED,
     AutoIntegrationUseCase,
     IntegrationAuthority,
 )
@@ -1035,6 +1039,94 @@ class DeterministicMergeCommitTest(unittest.TestCase):
                 _git(repo, "show", "-s", "--format=%cI", head),
                 _git(repo, "show", "-s", "--format=%cI", source),
             )
+
+
+@unittest.skipIf(_GIT is None, "git is not available on PATH")
+class PushFailureClassificationTest(unittest.TestCase):
+    """Real git, real push failures: what the adapter calls each one — j#96516 finding 1.
+
+    R21 had one failure flag, so every non-zero exit was recorded as ``rejected``, whose
+    documented meaning is "the remote moved; re-form the action against the new head". A
+    ``git`` that could not be spawned got that record, and re-forming would never have fixed
+    it. Each case below produces a genuinely different recovery, so each is produced here
+    against a real binary rather than from a canned string.
+    """
+
+    def _scene(self, root: Path) -> "tuple[Path, Path]":
+        remote = root / "origin.git"
+        subprocess.run(
+            ["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True
+        )
+        repo = root / "repo"
+        _init(repo)
+        _commit(repo, "a.txt", "base")
+        return repo, remote
+
+    def test_a_push_that_lands_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote = self._scene(Path(tmp))
+            head = _git(repo, "rev-parse", "HEAD")
+            result = LiveAutoIntegrationGitOperations(
+                repo_root=repo, remote=str(remote)
+            ).push_non_force(source_head=head, target_ref="main")
+            self.assertEqual(result.status, PUSH_ACCEPTED, result.detail)
+            self.assertTrue(result.accepted)
+            self.assertEqual(_git(repo, "ls-remote", str(remote), "refs/heads/main").split()[0], head)
+
+    def test_a_remote_that_moved_is_the_only_thing_called_a_lost_race(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, remote = self._scene(root)
+            _git(repo, "push", "-q", str(remote), "main")
+            # Somebody else advances the remote, so ours is no longer a fast-forward.
+            other = root / "other"
+            subprocess.run(["git", "clone", "-q", str(remote), str(other)], check=True)
+            _git(other, "config", "user.email", "o@example.invalid")
+            _git(other, "config", "user.name", "other")
+            _commit(other, "theirs.txt", "theirs")
+            _git(other, "push", "-q", "origin", "main")
+            mine = _commit(repo, "mine.txt", "mine")
+
+            result = LiveAutoIntegrationGitOperations(
+                repo_root=repo, remote=str(remote)
+            ).push_non_force(source_head=mine, target_ref="main")
+            self.assertEqual(result.status, PUSH_REMOTE_MOVED, result.detail)
+            self.assertTrue(result.rejected)
+
+    def test_a_remote_that_declined_is_not_a_remote_that_moved(self) -> None:
+        # A pre-receive hook: the remote answered and said no. Re-forming the action against a
+        # new target head cannot help — whoever owns that policy can.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote = self._scene(Path(tmp))
+            hook = remote / "hooks" / "pre-receive"
+            hook.write_text("#!/bin/sh\necho 'policy says no' >&2\nexit 1\n", encoding="utf-8")
+            hook.chmod(0o755)
+            head = _git(repo, "rev-parse", "HEAD")
+
+            result = LiveAutoIntegrationGitOperations(
+                repo_root=repo, remote=str(remote)
+            ).push_non_force(source_head=head, target_ref="main")
+            self.assertEqual(result.status, PUSH_REMOTE_REFUSED, result.detail)
+            self.assertFalse(result.rejected, "this is not a lost race")
+            self.assertEqual(_git(repo, "ls-remote", str(remote), "refs/heads/main"), "")
+
+    def test_a_push_that_could_not_run_says_so(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _ = self._scene(Path(tmp))
+            head = _git(repo, "rev-parse", "HEAD")
+
+            unreachable = LiveAutoIntegrationGitOperations(
+                repo_root=repo, remote=str(Path(tmp) / "no-such-remote.git")
+            ).push_non_force(source_head=head, target_ref="main")
+            self.assertEqual(unreachable.status, PUSH_OPERATIONAL_ERROR, unreachable.detail)
+            self.assertFalse(unreachable.rejected)
+
+            # And the case that started the finding: git never spawned at all.
+            never_ran = LiveAutoIntegrationGitOperations(
+                repo_root=Path(tmp) / "gone", remote=str(Path(tmp) / "origin.git")
+            ).push_non_force(source_head=head, target_ref="main")
+            self.assertEqual(never_ran.status, PUSH_OPERATIONAL_ERROR, never_ran.detail)
+            self.assertFalse(never_ran.rejected)
 
 
 @unittest.skipIf(_GIT is None, "git is not available on PATH")

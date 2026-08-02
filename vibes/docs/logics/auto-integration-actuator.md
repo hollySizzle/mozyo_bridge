@@ -302,16 +302,41 @@ driver も `info/attributes` も **sandbox から見えない**ので、宣言�
   remote tip を読む (j#96461 F2 — R18 は read から例外が抜けて run 全体が落ちた)。
   **使用不能な ref は、それを取る全 operation が自身の fail-closed 値で返す**:
   read は `""` / `False`、`apply_merge` は `invalid_input`、`push_non_force` は
-  **`accepted=False, rejected=False`** (spawn 0)。`UnsafeRefspecError` は adapter 内部の signal であり、
+  **`invalid_input`** (spawn 0)。`_UnsafeRefspecError` は adapter 内部の signal であり `__all__` にも無く、
   **ref 名に起因する例外は adapter の外へ出ない**。
-  `PushResult` は **3 state** である: `accepted` / remote が動いた `rejected` / **未試行拒否**
-  (`accepted=False, rejected=False`)。3 番目は残り物ではなく、**R1 から使用不能な source head の
-  拒否に使われてきた**。`rejected` は「remote が動いた」以外を意味してはならない。
-  > R19-R20 はここで raise を維持し、2 度異なる根拠で正当化した — 「戻り値が無い」(j#96492 F4) と
-  > 「2 state はどちらも試行済み / apply が先に拒否するので到達不能」(j#96499 F1)。**3 つとも
-  > 実装に反証された**: `PushResult` は use case が読んでおり、3 番目の state は既に存在し、
-  > **fast-forward disposition は apply を一度も呼ばずに push へ進む**。
-  > 教訓は「置き換えた根拠を実装に当てて確かめる」であり、doc に残す。
+  **`PushResult` は closed vocabulary 1 値**であり bool の組ではない (j#96516 F1)。
+  `accepted` / `invalid_input` (使用不能な source head・target ref) / `remote_moved` /
+  `remote_refused` / `operational_error` / `unrecognized_status`。`accepted` と `rejected` は
+  **status からの派生 property** なので、`accepted=True, rejected=True` のような**矛盾は
+  validation で弾くのではなく書けない**。
+  **`rejected` は `remote_moved` 以外を意味しない。**
+  > R19-R21 はここで 3 度誤った。「raise する理由は戻り値が無いから」(j#96492 F4)、
+  > 「2 state はどちらも試行済み / apply が先に拒否するので到達不能」(j#96499 F1)、そして
+  > **「非 SHA source を `accepted=False,rejected=False` にしたのだから 3 state で足りる」** —
+  > だが同じ method が **全 non-zero exit を `rejected=True`** にしていたため、
+  > **spawn 失敗が「remote が動いた。action を組み直せ」として durable record に残っていた**
+  > (j#96516 F1 実測)。`PushResult(accepted=True, rejected=True)` も構築でき、consumer は成功と読んだ。
+  > 教訓は「置き換えた根拠を実装に当てて確かめる」「bool を足して state を増やしたと呼ばない」。
+
+- **push の失敗は exit code から推定しない。`git push --porcelain` の自 ref 行で分類する**
+  (j#96516 F1)。実測 (git 2.50.1):
+
+| 状況 | rc | 自 ref の porcelain 行 | status | recovery |
+| --- | --- | --- | --- | --- |
+| 着地 | 0 | `*\t<sha>:refs/heads/x\t[new branch]` | `accepted` | — |
+| remote が前進 | 1 | `!\t...\t[rejected] (fetch first)` | `remote_moved` | 新 target head で action を組み直す |
+| remote が拒否 (hook 等) | 1 | `!\t...\t[remote rejected] (...)` | `remote_refused` | policy 所有者に当たる |
+| remote 到達不能 | 128 | **自 ref の行なし** | `operational_error` | 環境を調査 |
+| git が起動しない | 127 (`_run` sentinel) | 出力なし | `operational_error` | 同上 |
+
+  `[rejected]` と `[remote rejected]` は**部分一致ではなく token 先頭一致**で判定する (後者は前者を含む)。
+  自 ref の行が無い結果は remote の ref について何も述べていないので、**述べたことにしない**。
+
+- **push status は durable な `StepOutcome.push_status` に載り、ledger integrity がそれを読む**
+  (`push_status_step`)。push の `done` は **`push_status == accepted` のときだけ**信じられ、
+  それ以外 (失敗 status / 未知 / 空) と、**push 以外の step が push status を持つ**場合は
+  `ledger_push_status_unsound` で blocked。merge status と同一構造であり、同じ誤り
+  (「field に載せただけで誰も読まない」j#96422 F2) を 2 度目に繰り返さないための gate である。
   **dedicated integration worktree は存在しない** (j#96406 F1)。
   **commit は「同一 git version の下で、同一 repository 内容に対し」再構築可能**であり、
   hook 非実行・無署名 (上節)。

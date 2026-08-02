@@ -41,12 +41,21 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MERGE_MERGED,
     MERGE_PRIMITIVE_UNSUPPORTED,
     MERGE_PROBE_ERROR,
+    PUSH_ACCEPTED,
+    PUSH_INVALID_INPUT,
+    PUSH_OPERATIONAL_ERROR,
+    PUSH_REMOTE_MOVED,
+    PUSH_REMOTE_REFUSED,
     AutoIntegrationGitOperations,
+    PushResult,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_live_ops import (
     LiveAutoIntegrationGitOperations,
-    UnsafeRefspecError,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_refspec import (
+    _UnsafeRefspecError,
     _checked_branch,
+    _push_status,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.auto_integration_records import (
     EMPTY_TARGET_HEAD,
@@ -172,16 +181,16 @@ class RefspecSafetyTest(unittest.TestCase):
     def test_a_plus_prefixed_branch_is_refused(self) -> None:
         # `+` is how a force is spelled INSIDE a refspec, so a branch name carrying one must
         # never reach argv construction.
-        with self.assertRaises(UnsafeRefspecError):
+        with self.assertRaises(_UnsafeRefspecError):
             _checked_branch("+main")
 
     def test_an_option_shaped_branch_is_refused(self) -> None:
-        with self.assertRaises(UnsafeRefspecError):
+        with self.assertRaises(_UnsafeRefspecError):
             _checked_branch("--force")
 
     def test_meaning_changing_characters_are_refused(self) -> None:
         for name in ("ma in", "main:other", "main^", "main~1", "ma*n", "main\tx", ""):
-            with self.assertRaises(UnsafeRefspecError, msg=name):
+            with self.assertRaises(_UnsafeRefspecError, msg=name):
                 _checked_branch(name)
 
     def test_a_fully_qualified_ref_normalizes_to_its_bare_name(self) -> None:
@@ -198,7 +207,7 @@ class RefspecSafetyTest(unittest.TestCase):
         upstream by ``normalized_branch`` when the action record is formed.
         """
         for name in ("  main  ", "\tmain", "main\n", "\nmain\t", "refs/heads/main "):
-            with self.assertRaises(UnsafeRefspecError, msg=repr(name)):
+            with self.assertRaises(_UnsafeRefspecError, msg=repr(name)):
                 _checked_branch(name)
 
     def test_an_unusable_ref_makes_a_read_probe_answer_nothing_not_raise(self) -> None:
@@ -235,7 +244,7 @@ class RefspecSafetyTest(unittest.TestCase):
 
     def test_no_ref_name_leaves_the_adapter_as_an_exception(self) -> None:
         # The three operations that take a ref, each answering in its own fail-closed
-        # vocabulary. `UnsafeRefspecError` is an internal signal; nothing re-raises it.
+        # vocabulary. `_UnsafeRefspecError` is an internal signal; nothing re-raises it.
         recorder = _Recorder([])
         adapter = _adapter(recorder)
         for name in ("+main", "main\x00bad", "-main"):
@@ -270,17 +279,64 @@ class PushTest(unittest.TestCase):
     def test_a_non_sha_source_is_refused_without_spawning_git(self) -> None:
         recorder = _Recorder([])
         result = _adapter(recorder).push_non_force(source_head="main", target_ref="main")
+        self.assertEqual(result.status, PUSH_INVALID_INPUT)
         self.assertFalse(result.accepted)
         self.assertFalse(result.rejected)
         self.assertEqual(recorder.argvs, [])
 
-    def test_a_rejected_push_reports_rejection_and_offers_no_force(self) -> None:
-        recorder = _Recorder([_fail("non-fast-forward")])
-        result = _adapter(recorder).push_non_force(source_head=SOURCE, target_ref="main")
-        self.assertFalse(result.accepted)
-        self.assertTrue(result.rejected)
-        self.assertIn("never force, never rebase", result.detail)
-        self.assertEqual(len(recorder.argvs), 1)
+    def test_the_push_asks_git_for_a_machine_readable_answer(self) -> None:
+        # `--porcelain` is not cosmetic here: it is the only thing that distinguishes the
+        # failures below from each other (j#96516 finding 1).
+        recorder = _Recorder([_ok()])
+        _adapter(recorder).push_non_force(source_head=SOURCE, target_ref="main")
+        self.assertIn("--porcelain", recorder.argvs[0])
+
+    def test_each_failure_is_classified_from_the_porcelain_line_not_the_exit_code(self) -> None:
+        """j#96516 finding 1: every non-zero exit was recorded as "the remote moved".
+
+        A `git` that could not be spawned told an operator to re-form the action against a new
+        target head — advice that would never work, in the durable record. These are the exact
+        outputs git produced for each case, measured on 2.50.1.
+        """
+        refspec = f"{SOURCE}:refs/heads/main"
+        cases = (
+            (PUSH_REMOTE_MOVED, 1, f"To /r\n!\t{refspec}\t[rejected] (fetch first)\nDone\n"),
+            (
+                PUSH_REMOTE_REFUSED,
+                1,
+                f"To /r\n!\t{refspec}\t[remote rejected] (pre-receive hook declined)\nDone\n",
+            ),
+            # Unreachable remote: git says plenty on stderr and NOTHING about our ref.
+            (PUSH_OPERATIONAL_ERROR, 128, ""),
+            # `_run`'s own sentinel for "git never started".
+            (PUSH_OPERATIONAL_ERROR, 127, ""),
+            # A line about somebody else's ref is not an answer about ours.
+            (
+                PUSH_OPERATIONAL_ERROR,
+                1,
+                f"To /r\n!\t{SOURCE}:refs/heads/other\t[rejected] (fetch first)\nDone\n",
+            ),
+        )
+        for expected, code, porcelain in cases:
+            recorder = _Recorder([_fail_rc(code, out=porcelain, err="stderr text")])
+            result = _adapter(recorder).push_non_force(
+                source_head=SOURCE, target_ref="main"
+            )
+            self.assertEqual(result.status, expected, porcelain)
+            self.assertFalse(result.accepted, porcelain)
+            # `rejected` means the remote moved and nothing else, so it must be false for
+            # every one of these except the first.
+            self.assertEqual(result.rejected, expected == PUSH_REMOTE_MOVED, porcelain)
+
+    def test_a_contradictory_result_cannot_be_constructed(self) -> None:
+        # R21's two booleans allowed `accepted=True, rejected=True`, which the use case read
+        # as a success (j#96516 finding 1). The flags are derived now, so the state that means
+        # nothing cannot be written down.
+        for status in (PUSH_ACCEPTED, PUSH_REMOTE_MOVED, PUSH_INVALID_INPUT):
+            result = PushResult(status=status)
+            self.assertEqual([result.accepted, result.rejected].count(True), 1 if status in (PUSH_ACCEPTED, PUSH_REMOTE_MOVED) else 0)
+        with self.assertRaises(TypeError):
+            PushResult(accepted=True, rejected=True)  # type: ignore[call-arg]
 
 
 class MergeTest(unittest.TestCase):

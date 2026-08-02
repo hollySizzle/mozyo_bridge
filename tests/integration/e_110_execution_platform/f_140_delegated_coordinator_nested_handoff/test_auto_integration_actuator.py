@@ -59,6 +59,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MERGE_PROBE_ERROR,
     MERGE_SANDBOX_ERROR,
     MERGE_UNRECOGNIZED,
+    PUSH_ACCEPTED,
+    PUSH_INVALID_INPUT,
+    PUSH_OPERATIONAL_ERROR,
+    PUSH_REMOTE_MOVED,
+    PUSH_REMOTE_REFUSED,
+    PUSH_UNRECOGNIZED,
     MergeResult,
     PushResult,
     integration_policy_from_config,
@@ -148,7 +154,7 @@ class FakeGitOperations:
             status=MERGE_MERGED, integration_head=MERGE_HEAD, git_version=GIT_VERSION
         )
     )
-    push_result: PushResult = field(default_factory=lambda: PushResult(accepted=True))
+    push_result: PushResult = field(default_factory=lambda: PushResult(status=PUSH_ACCEPTED))
     calls: List[Tuple[str, dict]] = field(default_factory=list)
 
     # -- read probes ------------------------------------------------------
@@ -548,7 +554,7 @@ class FastForwardRunTest(unittest.TestCase):
     def test_a_rejected_push_stops_the_run_and_never_escalates(self) -> None:
         operations = FakeGitOperations(
             ancestors=_ff_ancestors(),
-            push_result=PushResult(accepted=False, rejected=True, detail="stale target"),
+            push_result=PushResult(status=PUSH_REMOTE_MOVED, detail="stale target"),
         )
         report = _use_case(operations).run_integration(_record())
         self.assertEqual(operations.performed, ["push_non_force"])
@@ -674,13 +680,13 @@ class MergeCommitRunTest(unittest.TestCase):
         # ledger and must use the merge commit recorded there, never the source head.
         record = _record()
         operations = FakeGitOperations(
-            push_result=PushResult(accepted=False, rejected=True)
+            push_result=PushResult(status=PUSH_REMOTE_MOVED)
         )
         use_case = _use_case(operations, integration_policy=self._policy())
         use_case.run_integration(record)
         self.assertEqual(operations.performed, ["apply_merge", "push_non_force"])
 
-        operations.push_result = PushResult(accepted=True)
+        operations.push_result = PushResult(status=PUSH_ACCEPTED)
         use_case.run_integration(record)
         for pushed in operations.args_for("push_non_force"):
             self.assertEqual(pushed["source_head"], MERGE_HEAD)
