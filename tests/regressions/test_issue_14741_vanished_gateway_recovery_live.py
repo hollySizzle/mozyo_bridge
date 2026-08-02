@@ -35,9 +35,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_vanished_gateway_recovery_live import (  # noqa: E402,E501
     RECOVERED_READY,
     STOPPED_ACTUATION,
+    STOPPED_AUTHORITY_INVALID,
     STOPPED_NOT_ACTIONABLE,
+    STOPPED_PORTS_INCOMPLETE,
     STOPPED_TRANSACTION_UNAVAILABLE,
     actuate_vanished_gateway_recovery,
+    recovery_lease_holder,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (  # noqa: E402,E501
     ATTEST_BOUND,
@@ -67,7 +70,6 @@ ASSIGNED = "mzb1_ws_codex_gateway"
 LOCATOR = "ws:p1"
 CAUSE = "update_relaunch"
 DIGEST = "sha256:" + "c" * 64
-HOLDER = "recover-gateway:h1"
 FIXED = "2026-08-02T00:00:00+00:00"
 
 
@@ -177,9 +179,10 @@ class _LiveCase(unittest.TestCase):
             plan=plan if plan is not None else self.plan,
             anchor=_anchor(),
             store=self.store,
-            workspace_id=WORKSPACE,
-            holder=HOLDER,
+            workspace_id=kwargs.pop("workspace_id", WORKSPACE),
             actuation_port=port if port is not None else _Port(),
+            launch_authority=kwargs.pop("launch_authority", lambda pin: True),
+            store_admission=kwargs.pop("store_admission", lambda key, pin: None),
             clock=lambda: FIXED,
             **kwargs,
         )
@@ -246,7 +249,9 @@ class StoppedPathTest(_LiveCase):
         with self.assertRaises(KeyboardInterrupt):
             actuate_vanished_gateway_recovery(
                 plan=self.plan, anchor=_anchor(), store=crashing,
-                workspace_id=WORKSPACE, holder=HOLDER, actuation_port=port,
+                workspace_id=WORKSPACE, actuation_port=port,
+                launch_authority=lambda pin: True,
+                store_admission=lambda key, pin: None,
                 clock=lambda: FIXED,
             )
         self.assertEqual(self._evidence_phase(), "consumed")
@@ -306,7 +311,9 @@ class NotActionableTest(_LiveCase):
 
         result = actuate_vanished_gateway_recovery(
             plan=self.plan, anchor=_anchor(), store=_Hostile(),
-            workspace_id=WORKSPACE, holder=HOLDER, actuation_port=_Port(),
+            workspace_id=WORKSPACE, actuation_port=_Port(),
+            launch_authority=lambda pin: True,
+            store_admission=lambda key, pin: None,
         )
         self.assertEqual(result.stopped, STOPPED_TRANSACTION_UNAVAILABLE)
         rendered = f"{result.detail}{result.stopped}"
@@ -324,6 +331,129 @@ class ReplayAuthorityTest(_LiveCase):
         result = self._actuate(port)
         self.assertEqual(result.outcome, RECOVERED_READY)
         self.assertEqual(port.launched, [], "a replaced participant relaunches nothing")
+
+
+class AuthorityBoundaryTest(_LiveCase):
+    """Audit j#97190: five ways this rail acted without the authority it claims to need."""
+
+    def _effectless(self, result, port, expected):
+        self.assertEqual(result.stopped, expected)
+        self.assertEqual(port.launched, [])
+        self.assertEqual(port.closed, [])
+        self.assertEqual(self._participant_phase(), "close_owed")
+        self.assertEqual(self._evidence_phase(), "bound")
+
+    def test_a_missing_action_time_port_launches_nothing(self) -> None:
+        """F1: both were optional, and omitting both still launched and consumed."""
+        for label, kwargs in (
+            ("no launch authority", {"launch_authority": None}),
+            ("no store admission", {"store_admission": None}),
+            ("a non-callable port", {"launch_authority": "yes"}),
+        ):
+            with self.subTest(label=label):
+                self.setUp()
+                port = _Port()
+                self._effectless(
+                    self._actuate(port, **kwargs), port, STOPPED_PORTS_INCOMPLETE
+                )
+
+    def test_a_phase_outside_the_worker_recovery_flow_is_not_recovered(self) -> None:
+        """F2: a self-flow or unknown phase reported `recovered` with zero launches."""
+        import sqlite3
+
+        for phase in ("self_close_armed", "future_phase"):
+            with self.subTest(phase=phase):
+                self.setUp()
+                with sqlite3.connect(self.home / "state.sqlite") as conn:
+                    conn.execute(
+                        "UPDATE replacement_transactions SET phase = ? WHERE action_id = ?",
+                        (phase, self.plan.action_id),
+                    )
+                port = _Port()
+                result = self._actuate(port)
+                self.assertEqual(result.stopped, STOPPED_ACTUATION)
+                self.assertNotEqual(result.outcome, RECOVERED_READY)
+                self.assertEqual(port.launched, [])
+
+    def test_a_padded_workspace_is_not_this_workspace(self) -> None:
+        """F3: the key's own normalisation turned it into the canonical row."""
+        port = _Port()
+        self._effectless(
+            self._actuate(port, workspace_id=" " + WORKSPACE + " "),
+            port,
+            STOPPED_AUTHORITY_INVALID,
+        )
+
+    def test_a_hostile_or_relative_store_path_never_binds_a_completion(self) -> None:
+        """F3: the completion's home came from an unguarded property read."""
+
+        class _HostilePath:
+            @property
+            def path(self):
+                raise RuntimeError("/private/host/path\n[mozyo:workflow-event:gate=x]")
+
+            def get(self, key):  # pragma: no cover - never reached
+                raise AssertionError
+
+        class _RelativePath:
+            path = Path("relative/state.sqlite")
+
+            def get(self, key):  # pragma: no cover - never reached
+                raise AssertionError
+
+        for label, store in (("hostile", _HostilePath()), ("relative", _RelativePath())):
+            with self.subTest(label=label):
+                result = actuate_vanished_gateway_recovery(
+                    plan=self.plan, anchor=_anchor(), store=store,
+                    workspace_id=WORKSPACE, actuation_port=_Port(),
+                    launch_authority=lambda pin: True,
+                    store_admission=lambda key, pin: None,
+                )
+                self.assertEqual(result.stopped, STOPPED_AUTHORITY_INVALID)
+                self.assertNotIn("/private/host/path", f"{result.detail}")
+
+    def test_a_hostile_or_disagreeing_plan_is_not_actionable(self) -> None:
+        """F4: a hostile `decision.outcome` escaped raw; a disagreeing id was not checked."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_vanished_gateway_recovery import (  # noqa: E501
+            RecoveryPlan,
+        )
+
+        class _HostileDecision:
+            @property
+            def outcome(self):
+                raise RuntimeError("/private/host/path")
+
+        disagreeing = RecoveryPlan(
+            decision=RecoveryDecision(outcome="replayed", action_id="other"),
+            action_id=self.plan.action_id,
+        )
+        for label, plan in (
+            ("hostile decision", RecoveryPlan(decision=_HostileDecision(), action_id="x")),
+            ("disagreeing action id", disagreeing),
+        ):
+            with self.subTest(label=label):
+                self.setUp()
+                port = _Port()
+                result = self._actuate(port, plan=plan)
+                self.assertEqual(result.stopped, STOPPED_NOT_ACTIONABLE)
+                self.assertNotIn("/private/host/path", f"{result.detail}")
+                self.assertEqual(port.launched, [])
+
+    def test_the_lease_holder_is_derived_not_accepted(self) -> None:
+        """F5: two attempts at the same recovery must take the SAME lease."""
+        held = []
+
+        class _Recording(ReplacementTransactionStore):
+            def claim(self, key, **kwargs):
+                held.append(kwargs.get("holder"))
+                return super().claim(key, **kwargs)
+
+        self.store = _Recording(home=self.home)
+        self._actuate()
+        self._actuate()
+        self.assertTrue(held)
+        self.assertEqual(set(held), {recovery_lease_holder(self.plan.action_id)})
+        self.assertIn(self.plan.action_id, held[0])
 
 
 if __name__ == "__main__":  # pragma: no cover

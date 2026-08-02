@@ -39,6 +39,10 @@ RECOVERED_READY = "recovered_ready"
 
 #: The plan is not one this executor acts on (legacy direct, a refusal, or an unknown shape).
 STOPPED_NOT_ACTIONABLE = "plan_not_actionable"
+#: A required action-time port is missing or is not a plain callable.
+STOPPED_PORTS_INCOMPLETE = "authority_ports_incomplete"
+#: The workspace or the transaction home is not an exact plain authority.
+STOPPED_AUTHORITY_INVALID = "authority_invalid"
 #: The stored row is absent, unreadable, or is not this exact recovery any more.
 STOPPED_TRANSACTION_UNAVAILABLE = "transaction_unavailable"
 #: The actuator refused or could not finish. The exact step is carried as its own token.
@@ -67,16 +71,54 @@ def _stopped(reason: str, detail: str = "", action_id: str = "") -> RecoveryActu
     return RecoveryActuation(stopped=reason, detail=detail, action_id=action_id)
 
 
+def _raw(value: object) -> str:
+    """Plain exact text, or ``""``. No strip, no subclass, no coercion."""
+    if type(value) is not str:
+        return ""
+    if not value or value != value.strip():
+        return ""
+    return value
+
+
+def recovery_lease_holder(action_id: str) -> str:
+    """The lease identity for this recovery, DERIVED rather than accepted (j#97190 F5).
+
+    A caller-supplied holder is not an identity: two attempts at the same recovery have to
+    take the same lease, and the continuation leg has to be able to inherit it. Deriving it
+    from the action id and the fixed generation makes that true by construction instead of
+    by convention.
+    """
+    return f"recover-gateway:{action_id}:g{RECOVERY_ACTION_GENERATION}"
+
+
+def _plan_action_id(plan) -> str:
+    """The plan's action id, agreed by both the plan and its decision, or ``""``.
+
+    Everything here is read inside the caller's exception boundary: a `RecoveryPlan`
+    instance does not guarantee what its `decision` is, and a hostile `outcome` property
+    escaped as a raw `RuntimeError` (measured, audit j#97190 F4).
+    """
+    decision = getattr(plan, "decision", None)
+    outcome = getattr(decision, "outcome", None)
+    if type(outcome) is not str or outcome not in ACTIONABLE_OUTCOMES:
+        return ""
+    if _raw(getattr(decision, "refusal", "")):
+        return ""
+    action_id = _raw(getattr(plan, "action_id", None))
+    if not action_id or _raw(getattr(decision, "action_id", None)) != action_id:
+        return ""
+    return action_id
+
+
 def actuate_vanished_gateway_recovery(
     *,
     plan: RecoveryPlan,
     anchor: RequestAnchor,
     store: Any,
     workspace_id: str,
-    holder: str,
     actuation_port: Any,
-    launch_authority: Optional[Any] = None,
-    store_admission: Optional[Any] = None,
+    launch_authority: Any = None,
+    store_admission: Any = None,
     clock: Optional[Any] = None,
 ) -> RecoveryActuation:
     """Drive the planned recovery to a live attested gateway, or stop with a typed reason.
@@ -103,17 +145,49 @@ def actuate_vanished_gateway_recovery(
 
     if not isinstance(plan, RecoveryPlan) or not isinstance(anchor, RequestAnchor):
         return _stopped(STOPPED_NOT_ACTIONABLE, "not an exact plan")
-    outcome = getattr(getattr(plan, "decision", None), "outcome", None)
-    if type(outcome) is not str or outcome not in ACTIONABLE_OUTCOMES:
-        # `legacy_direct`, any refusal, and anything unrecognised: this executor is the
-        # receipt-capable rail only, and it acts on nothing else.
+    try:
+        # `legacy_direct`, any refusal, a disagreeing decision id and anything unrecognised:
+        # this executor is the receipt-capable rail only, and it acts on nothing else.
+        action_id = _plan_action_id(plan)
+    except Exception:  # noqa: BLE001 - a hostile plan is input, not truth
+        return _stopped(STOPPED_NOT_ACTIONABLE, "the plan could not be read")
+    if not action_id:
         return _stopped(STOPPED_NOT_ACTIONABLE, "the plan is not a receipt-capable recovery")
-    action_id = getattr(plan, "action_id", "")
-    if type(action_id) is not str or not action_id:
-        return _stopped(STOPPED_NOT_ACTIONABLE, "the plan carries no action id")
+
+    # Both action-time ports are REQUIRED (audit j#97190 F1). Omitting them used to launch a
+    # gateway and discharge its evidence with no lane authority and no store admission
+    # consulted at all -- the fences exist precisely for this rail.
+    for port in (launch_authority, store_admission):
+        if port is None or not callable(port):
+            return _stopped(
+                STOPPED_PORTS_INCOMPLETE,
+                "an action-time authority port is missing",
+                action_id,
+            )
+
+    exact_workspace = _raw(workspace_id)
+    if not exact_workspace:
+        # A padded workspace used to reach the canonical row through the key's own
+        # normalisation and actuate it (audit j#97190 F3).
+        return _stopped(
+            STOPPED_AUTHORITY_INVALID, "the workspace is not an exact token", action_id
+        )
+    try:
+        store_path = Path(store.path)
+        home = store_path.parent
+    except Exception:  # noqa: BLE001 - a hostile `path` property is input, not truth
+        return _stopped(
+            STOPPED_AUTHORITY_INVALID, "the transaction store has no readable path", action_id
+        )
+    if not store_path.is_absolute():
+        # A relative store path binds the completion to a cwd-relative receipt authority,
+        # and that only surfaces AFTER a live launch.
+        return _stopped(
+            STOPPED_AUTHORITY_INVALID, "the transaction store path is not absolute", action_id
+        )
 
     try:
-        key = ReplacementTransactionKey(workspace_id, action_id)
+        key = ReplacementTransactionKey(exact_workspace, action_id)
         stored = store.get(key)
     except Exception:  # noqa: BLE001 - KI / SystemExit / GeneratorExit propagate
         return _stopped(
@@ -147,17 +221,17 @@ def actuate_vanished_gateway_recovery(
         # From the FIRST construction, and bound to this store's own home (j#97131): an
         # actuator that reached its consume step with no completion port would fail closed
         # after a live relaunch, which is the expensive place to discover a wiring gap.
-        evidence_completion=build_update_evidence_completion(Path(store.path).parent),
+        evidence_completion=build_update_evidence_completion(home),
+        launch_authority=launch_authority,
+        store_admission=store_admission,
     )
-    if launch_authority is not None:
-        kwargs["launch_authority"] = launch_authority
-    if store_admission is not None:
-        kwargs["store_admission"] = store_admission
     if clock is not None:
         kwargs["clock"] = clock
     try:
         result = ReplacementActuatorUseCase(store, actuation_port, **kwargs).drive_worker_recovery(
-            key, holder=holder, expected_action_generation=RECOVERY_ACTION_GENERATION
+            key,
+            holder=recovery_lease_holder(action_id),
+            expected_action_generation=RECOVERY_ACTION_GENERATION,
         )
     except Exception:  # noqa: BLE001 - no adapter prose reaches this rail's surface
         return _stopped(STOPPED_ACTUATION, "the actuator could not be driven", action_id)
@@ -180,6 +254,9 @@ __all__ = (
     "STOPPED_ACTUATION",
     "STOPPED_NOT_ACTIONABLE",
     "STOPPED_TRANSACTION_UNAVAILABLE",
+    "STOPPED_AUTHORITY_INVALID",
+    "STOPPED_PORTS_INCOMPLETE",
     "RecoveryActuation",
+    "recovery_lease_holder",
     "actuate_vanished_gateway_recovery",
 )

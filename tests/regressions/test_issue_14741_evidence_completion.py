@@ -765,7 +765,13 @@ class SiteSourceWiringTest(unittest.TestCase):
                 source = self._source(module)
                 start = source.index("evidence_completion=build_update_evidence_completion(")
                 snippet = source[start : start + 220]
-                self.assertIn(".path).parent" if "Path(store.path)" in snippet else ".path.parent", snippet)
+                # The home is the injected store's own, whether taken inline at the binding
+                # or resolved into a validated local first (the vanished-gateway rail checks
+                # it is absolute before using it). Either way it comes from `store.path`.
+                self.assertTrue(
+                    ".path.parent" in snippet or "store_path.parent" in source,
+                    f"{module} does not bind the completion to its own store's home",
+                )
                 for guess in ("Path.cwd()", "repo_root", "os.getcwd"):
                     self.assertNotIn(guess, snippet)
 

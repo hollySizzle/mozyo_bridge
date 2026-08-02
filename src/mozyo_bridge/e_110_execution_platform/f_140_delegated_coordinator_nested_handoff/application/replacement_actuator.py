@@ -45,6 +45,8 @@ from mozyo_bridge.core.state.replacement_transaction_model import (
     PARTICIPANT_VERIFY_OWED,
     PHASE_AWAITING_SELF_TURN_END,
     PHASE_CLAIMED,
+    PHASE_COMPLETED,
+    PHASE_DRAINING_CONTINUATION,
     PHASE_PLANNED,
     PHASE_REPLACING_NONSELF,
     PHASE_SELF_CLOSE_ARMED,
@@ -529,11 +531,24 @@ class ReplacementActuatorUseCase:
                 terminal = self._actuate_participant(
                     key, rec, pending[0], holder, gen, now
                 )
-            else:
-                # draining_continuation / completed: the redispatch leg already advanced past
-                # replacing_nonself — the workers are replaced. Report recovered (idempotent).
+            elif phase in (PHASE_DRAINING_CONTINUATION, PHASE_COMPLETED):
+                # The redispatch leg already advanced past replacing_nonself -- the workers
+                # are replaced. Report recovered (idempotent).
                 return ActuationResult(
                     status=ACTUATION_RECOVERED, phase=rec.phase, revision=rec.revision,
+                )
+            else:
+                # NAMED phases only (audit j#97190 F2). A bare `else` reported every other
+                # phase as recovered, so a row sitting in a SELF-replacement phase, or in one
+                # this build does not know, answered "recovered" for a gateway that was never
+                # launched or attested -- measured: `self_close_armed` and an unknown phase
+                # both returned recovered with zero launches and the participant still
+                # close_owed. A phase this worker-recovery flow does not own is a refusal
+                # before any claim or effect, not a success.
+                return ActuationResult(
+                    status=ACTUATION_INVALID_TOPOLOGY, phase=rec.phase,
+                    revision=rec.revision,
+                    detail="phase is not part of the worker-recovery flow",
                 )
             if terminal is not None:
                 return terminal
