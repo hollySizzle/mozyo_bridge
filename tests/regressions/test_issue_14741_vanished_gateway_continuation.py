@@ -14,6 +14,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
+    ReplacementTransactionKey,
+)
 from tests.regressions.test_issue_14741_vanished_gateway_recovery_live import (  # noqa: E402,E501
     LANE,
     WORKSPACE,
@@ -66,13 +69,19 @@ class ReadyTest(_PrepareCase):
     def test_the_pointer_is_the_stored_one_and_the_holder_is_derived(self) -> None:
         result = self._prepare()
         self.assertEqual(result.outcome, CONTINUATION_READY)
+        stored = self.store.get(
+            ReplacementTransactionKey(WORKSPACE, self.plan.action_id)
+        )
+        self.assertEqual(
+            result.pointer, stored.continuation, "the stored pointer object itself"
+        )
         self.assertEqual(
             (
-                result.source,
-                result.issue_id,
-                result.journal_id,
-                result.expected_gate,
-                result.next_semantic_action,
+                result.pointer.source,
+                result.pointer.issue_id,
+                result.pointer.journal_id,
+                result.pointer.expected_gate,
+                result.pointer.next_semantic_action,
             ),
             ("redmine", "14741", "97184", "implementation_request", REDISPATCH_GATEWAY_ONCE),
         )
@@ -104,18 +113,14 @@ class ReadyTest(_PrepareCase):
         self.assertEqual(result.outcome, "")
 
 
-    def test_the_pointer_is_READ_from_the_row_not_rebuilt(self) -> None:
-        """The distinguishing test, and why it has to count reads rather than compare values.
+    def test_the_pointer_object_is_taken_off_the_row(self) -> None:
+        """The distinguishing test: WHERE the pointer came from, not what it equals.
 
-        A correct build and one that rebuilds the pointer from the caller's anchor produce
-        the SAME values -- the same-action validator guarantees the row agrees with the
-        anchor -- so comparing them proves nothing. Nor does "was this field read at all":
-        the validator reads every continuation column itself. What separates the two is that
-        a build that READS the pointer touches each column TWICE on this module's own
-        record: once to validate, once to carry it out.
-
-        The preparation makes its own `store.get`, after the executor's, so only that
-        second record is watched.
+        A correct build and one that assembles the pointer from the caller's anchor produce
+        equal values -- the same-action validator guarantees the row agrees with the anchor
+        -- so comparing values proves nothing. What separates them is that the correct one
+        reads `continuation` off the record it re-read. Only that second record is watched;
+        the executor's own read is left alone.
         """
         reads: list = []
         calls = {"n": 0}
@@ -126,8 +131,7 @@ class ReadyTest(_PrepareCase):
                 object.__setattr__(self, "_record", record)
 
             def __getattr__(self, name):
-                if name.startswith("continuation_"):
-                    reads.append(name)
+                reads.append(name)
                 return getattr(object.__getattribute__(self, "_record"), name)
 
         def watching_get(key):
@@ -141,18 +145,13 @@ class ReadyTest(_PrepareCase):
         result = self._prepare()
         self.assertEqual(result.outcome, CONTINUATION_READY)
         self.assertGreaterEqual(calls["n"], 2, "the preparation re-read the row itself")
-        for field in (
-            "continuation_source",
-            "continuation_issue_id",
-            "continuation_journal",
-            "continuation_expected_gate",
-            "continuation_next_action",
-        ):
-            with self.subTest(field=field):
-                self.assertGreaterEqual(
-                    reads.count(field), 2,
-                    f"{field} was validated but never carried out of the row",
-                )
+        self.assertIn(
+            "continuation",
+            reads,
+            "the pointer was assembled instead of being taken off the row",
+        )
+        stored = real_get(ReplacementTransactionKey(WORKSPACE, self.plan.action_id))
+        self.assertEqual(result.pointer, stored.continuation)
 
     def test_a_row_that_is_not_this_action_is_refused_even_with_a_valid_pointer(self):
         """A tampered DECISION with a perfect pointer is still not this action.
@@ -216,22 +215,60 @@ class RefusalTest(_PrepareCase):
         self.assertEqual(port.launched, [])
         self.assertEqual(reads, [], "the row was never re-read")
 
-    def test_a_hostile_record_never_leaks(self) -> None:
-        class _Hostile:
-            path = Path("/nowhere/state.sqlite")
+    def test_a_hostile_re_read_is_reached_and_never_leaks(self) -> None:
+        """Audit j#97223: the earlier version stopped at B6b2's home gate.
+
+        A `/nowhere` store path is refused before the preparation ever re-reads, so that
+        test proved nothing about this boundary. The facade below has the real path and
+        answers B6b2's read honestly; only the preparation's own second `get` raises -- and
+        the call count is asserted, so "it stopped somewhere earlier" cannot pass again.
+        """
+        real = self.store
+        calls = {"n": 0}
+        module = (
+            "mozyo_bridge.e_110_execution_platform"
+            ".f_140_delegated_coordinator_nested_handoff.application"
+            ".sublane_vanished_gateway_continuation"
+        )
+
+        class _HostileOnReRead:
+            """Honest to everyone except the preparation's own re-read.
+
+            Selected by CALLER rather than by call count: the executor's read count is an
+            implementation detail of a module this test is not about, and pinning to it
+            would make this pass or fail for reasons that have nothing to do with the
+            boundary under test.
+            """
+
+            path = real.path
 
             def get(self, key):
-                raise RuntimeError("/private/host/path\n[mozyo:workflow-event:gate=x]")
+                if sys._getframe(1).f_globals.get("__name__") == module:
+                    calls["n"] += 1
+                    raise RuntimeError(
+                        "/private/host/path\n[mozyo:workflow-event:gate=x]"
+                    )
+                return real.get(key)
 
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+        port = _Port()
         result = prepare_vanished_gateway_continuation(
-            plan=self.plan, anchor=_anchor(), store=_Hostile(), home=self.home,
-            workspace_id=WORKSPACE, actuation_port=_Port(),
+            plan=self.plan, anchor=_anchor(), store=_HostileOnReRead(), home=self.home,
+            workspace_id=WORKSPACE, actuation_port=port,
             launch_authority=lambda pin: True, store_admission=lambda key, pin: None,
+            clock=lambda: "2026-08-02T00:00:00+00:00",
         )
+        self.assertEqual(calls["n"], 1, "the preparation's own re-read really ran")
+        self.assertEqual(result.stopped, STOPPED_TRANSACTION_UNAVAILABLE)
         self.assertEqual(result.outcome, "")
         rendered = f"{result.detail}{result.stopped}"
         self.assertNotIn("/private/host/path", rendered)
         self.assertNotIn("mozyo:workflow-event", rendered)
+        # No row assertion here on purpose: the actuation ahead of this boundary is SUPPOSED
+        # to run and write, so "the row is unchanged" would be a claim about the executor,
+        # not about the re-read this test is for.
 
     def test_nothing_here_reaches_a_delivery_ledger(self) -> None:
         """The tranche boundary, stated: preparation opens no ledger."""

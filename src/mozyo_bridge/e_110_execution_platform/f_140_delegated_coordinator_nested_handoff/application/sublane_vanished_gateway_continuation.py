@@ -52,11 +52,11 @@ class ContinuationPreparation:
     detail: str = ""
     action_id: str = ""
     holder: str = ""
-    source: str = ""
-    issue_id: str = ""
-    journal_id: str = ""
-    expected_gate: str = ""
-    next_semantic_action: str = ""
+    #: The STORED :class:`ContinuationPointer` itself, carried rather than re-assembled
+    #: (audit j#97223). The next legs hand this straight to `drive_continuation_once`; a
+    #: flattened copy would mean each of them rebuilding a pointer from raw columns again,
+    #: which is the re-derivation this rail exists to avoid.
+    pointer: Any = None
 
     @property
     def ready(self) -> bool:
@@ -136,31 +136,29 @@ def prepare_vanished_gateway_continuation(
             action_id,
         )
 
-    # ONLY the stored pointer. Compared field by raw field against the closed shape this
-    # rail delivers -- a continuation rebuilt from the caller's anchor would deliver
-    # whatever today's caller believes, not what the transaction recorded.
+    # ONLY the stored pointer, and the stored OBJECT: the raw columns were already proved
+    # exact by the same-action validator above, so re-flattening them here would just be a
+    # second, drifting copy of the thing the next legs actually need.
     try:
-        pointer = {
-            "source": _raw(getattr(stored, "continuation_source", None)),
-            "issue_id": _raw(getattr(stored, "continuation_issue_id", None)),
-            "journal_id": _raw(getattr(stored, "continuation_journal", None)),
-            "expected_gate": _raw(getattr(stored, "continuation_expected_gate", None)),
-            "next_semantic_action": _raw(
-                getattr(stored, "continuation_next_action", None)
-            ),
-        }
+        pointer = stored.continuation
     except Exception:  # noqa: BLE001 - a hostile record is input, not truth
         return _stopped(
             STOPPED_TRANSACTION_UNAVAILABLE,
             "the stored continuation could not be read",
             action_id,
         )
+    if pointer is None:
+        return _stopped(
+            STOPPED_CONTINUATION_INVALID,
+            "the stored continuation is not re-readable",
+            action_id,
+        )
     if (
-        pointer["source"] != anchor.source
-        or pointer["issue_id"] != anchor.issue_id
-        or pointer["journal_id"] != anchor.journal_id
-        or pointer["expected_gate"] != RESUME_GATE
-        or pointer["next_semantic_action"] != REDISPATCH_GATEWAY_ONCE
+        _raw(getattr(pointer, "source", None)) != anchor.source
+        or _raw(getattr(pointer, "issue_id", None)) != anchor.issue_id
+        or _raw(getattr(pointer, "journal_id", None)) != anchor.journal_id
+        or _raw(getattr(pointer, "expected_gate", None)) != RESUME_GATE
+        or _raw(getattr(pointer, "next_semantic_action", None)) != REDISPATCH_GATEWAY_ONCE
     ):
         return _stopped(
             STOPPED_CONTINUATION_INVALID,
@@ -174,7 +172,7 @@ def prepare_vanished_gateway_continuation(
         # Derived, never accepted: the delivery leg has to take the same lease this
         # recovery already holds (j#97190 F5).
         holder=recovery_lease_holder(action_id),
-        **pointer,
+        pointer=pointer,
     )
 
 
