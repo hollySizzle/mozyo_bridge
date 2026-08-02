@@ -34,6 +34,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REDISPATCH_GATEWAY_ONCE,
     RESUME_GATE,
     RequestAnchor,
+    recovery_action_id_for_pin,
 )
 
 #: The stored continuation is exact and this recovery is ready to deliver it. NOT delivered,
@@ -193,10 +194,35 @@ def prepare_vanished_gateway_continuation(
             "the stored participants could not be read",
             action_id,
         )
-    if len(participants) != 1 or type(participants[0]) is not ParticipantPin:
+    if (
+        type(participants) is not tuple
+        or len(participants) != 1
+        or type(participants[0]) is not ParticipantPin
+    ):
         return _stopped(
             STOPPED_CONTINUATION_INVALID,
             "the stored row does not carry exactly one canonical participant",
+            action_id,
+        )
+    # Re-bound to the action id, not merely type-checked (audit j#97236). The same-action
+    # validator decodes the raw MANIFEST; `participants` is a different property on the same
+    # record, so a facade can hand back an exact-type pin that the manifest never contained
+    # -- measured, with a foreign assigned_name. The canonical id function is the join: a pin
+    # that is really this action's re-derives this action's id.
+    try:
+        rebound = recovery_action_id_for_pin(
+            anchor, participants[0], workspace_id=key.workspace_id
+        )
+    except Exception:  # noqa: BLE001 - an unusable pin is not this participant
+        return _stopped(
+            STOPPED_CONTINUATION_INVALID,
+            "the stored participant could not be bound to this action",
+            action_id,
+        )
+    if rebound != action_id:
+        return _stopped(
+            STOPPED_CONTINUATION_INVALID,
+            "the stored participant is not the one this action pinned",
             action_id,
         )
 

@@ -407,6 +407,64 @@ class RefusalTest(_PrepareCase):
         self.assertEqual(result.stopped, STOPPED_CONTINUATION_INVALID)
         self.assertIsNone(result.participant)
 
+    def test_a_same_type_foreign_participant_is_refused(self) -> None:
+        """Audit j#97236: the manifest is validated, `participants` is a different property.
+
+        The facade delegates the raw manifest honestly -- so the same-action check passes --
+        and returns an exact `ParticipantPin` that the manifest never contained. Only
+        re-deriving the action id from the pin catches that.
+        """
+        import dataclasses
+
+        real = self.store
+        module = (
+            "mozyo_bridge.e_110_execution_platform"
+            ".f_140_delegated_coordinator_nested_handoff.application"
+            ".sublane_vanished_gateway_continuation"
+        )
+
+        for axis, value in (
+            ("assigned_name", "mzb1_foreign_gateway"),
+            ("lane_id", "issue_other"),
+            ("provider", "claude"),
+            ("old_locator", "ws:p9"),
+        ):
+            with self.subTest(axis=axis):
+                self.setUp()
+                real = self.store
+
+                class _Store:
+                    path = real.path
+
+                    def get(self, key):
+                        record = real.get(key)
+                        if record is None:
+                            return None
+                        if sys._getframe(1).f_globals.get("__name__") != module:
+                            return record
+
+                        class _Facade:
+                            def __getattr__(self, name):
+                                if name == "participants":
+                                    pin = record.participants[0]
+                                    return (dataclasses.replace(pin, **{axis: value}),)
+                                return getattr(record, name)
+
+                        return _Facade()
+
+                    def __getattr__(self, name):
+                        return getattr(real, name)
+
+                result = prepare_vanished_gateway_continuation(
+                    plan=self.plan, anchor=_anchor(), store=_Store(), home=self.home,
+                    workspace_id=WORKSPACE, actuation_port=_Port(),
+                    launch_authority=lambda pin: True,
+                    store_admission=lambda key, pin: None,
+                    clock=lambda: "2026-08-02T00:00:00+00:00",
+                )
+                self.assertEqual(result.stopped, STOPPED_CONTINUATION_INVALID)
+                self.assertIsNone(result.participant)
+
     def test_nothing_here_reaches_a_delivery_ledger(self) -> None:
         """The tranche boundary, stated: preparation opens no ledger."""
         opens = []
