@@ -867,6 +867,45 @@ class ActuatorTopologyTests(unittest.TestCase):
                 self.assertEqual(after.lease_holder, before.lease_holder)
                 self.assertFalse(port.launched)
 
+    def test_a_valid_progressed_row_reclaims_so_it_can_still_finish(self):
+        """Ruling j#97210, correcting j#97207.
+
+        The shared method deliberately DOES re-claim a valid progressed row: an existing
+        recovery whose send is confirmed but whose lease expired can only finish through
+        that same-holder re-claim. Answering it without claiming stranded such a row in
+        `draining_continuation` forever, holding its one send. The vanished-gateway rail's
+        zero-write replay is satisfied in its own wrapper instead.
+        """
+        import sqlite3
+
+        for phase in ("draining_continuation", "completed"):
+            with self.subTest(phase=phase):
+                store, key = self._store_with([ParticipantPin(**WORKER)])
+                ReplacementActuatorUseCase(
+                    store, FakeActuatorPort(), clock=lambda: FIXED
+                ).drive_worker_recovery(
+                    key, holder="H", expected_action_generation=GEN
+                )
+                with sqlite3.connect(store.path) as conn:
+                    conn.execute(
+                        "UPDATE replacement_transactions SET phase = ? WHERE action_id = ?",
+                        (phase, key.action_id),
+                    )
+                before = store.get(key)
+                port = FakeActuatorPort()
+                result = ReplacementActuatorUseCase(
+                    store, port, clock=lambda: FIXED
+                ).drive_worker_recovery(
+                    key, holder="H", expected_action_generation=GEN
+                )
+                self.assertEqual(result.status, ACTUATION_RECOVERED)
+                after = store.get(key)
+                self.assertEqual(
+                    after.lease_holder, "H", "the same holder re-took the lease"
+                )
+                self.assertGreater(after.revision, before.revision)
+                self.assertFalse(port.launched, "no worker is re-actuated")
+
     def test_recycled_old_slot_is_zero_actuation(self):
         store, key = self._store_with([ParticipantPin(**WORKER)])
         port = FakeActuatorPort()

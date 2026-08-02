@@ -501,15 +501,27 @@ class PreClaimAndHomeIdentityTest(_LiveCase):
                 self.assertEqual(port.launched, [])
                 self.assertEqual(self._row_revision_and_lease(), before)
 
-    def test_a_progressed_phase_with_every_participant_replaced_is_recovered(self):
-        """The positive control: the phase is only a contradiction when it contradicts."""
-        self._actuate()
-        self.assertEqual(self._participant_phase(), "replaced")
-        self._set_phase("completed")
-        port = _Port()
-        result = self._actuate(port)
-        self.assertEqual(result.outcome, RECOVERED_READY)
-        self.assertEqual(port.launched, [], "no additional launch")
+    def test_a_valid_progressed_replay_is_recovered_and_writes_nothing(self):
+        """Audit j#97207: an idempotent replay was rewriting the row it only read.
+
+        Measured before the fix: revision 9 -> 10 with the lease re-taken, for an answer
+        that was "nothing changed".
+        """
+        for phase in ("draining_continuation", "completed"):
+            with self.subTest(phase=phase):
+                self.setUp()
+                self._actuate()
+                self.assertEqual(self._participant_phase(), "replaced")
+                self._set_phase(phase)
+                before = self._row_revision_and_lease()
+                port = _Port()
+                result = self._actuate(port)
+                self.assertEqual(result.outcome, RECOVERED_READY)
+                self.assertEqual(port.launched, [], "no additional launch")
+                self.assertEqual(
+                    self._row_revision_and_lease(), before,
+                    "an idempotent replay writes nothing at all",
+                )
 
     def test_a_home_that_is_not_this_stores_home_never_actuates(self):
         """Absolute is not the same store (j#97198 F3)."""

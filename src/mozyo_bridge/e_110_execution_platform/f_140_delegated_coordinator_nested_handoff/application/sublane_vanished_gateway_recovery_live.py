@@ -287,6 +287,13 @@ def actuate_vanished_gateway_recovery(
                 "a progressed phase whose participants are not replaced",
                 action_id,
             )
+        # Answered HERE, without calling the shared actuator at all (ruling j#97210): this
+        # row is already past the redispatch leg, so a replay has nothing to do and must not
+        # rewrite the authority it is only reading. The shared method still re-claims a valid
+        # progressed row, because an existing recovery whose send is confirmed but whose
+        # lease expired needs exactly that to finish -- so the zero-write requirement is met
+        # on this rail rather than by changing what the other five call sites depend on.
+        return RecoveryActuation(outcome=RECOVERED_READY, action_id=action_id)
     elif phase not in RECOVERABLE_PHASES:
         return _stopped(
             STOPPED_PHASE_NOT_RECOVERABLE,
