@@ -96,8 +96,9 @@ drift すれば **別の key** になるため、古い ledger が新しい acti
 `review_generation` は caller が自由に命名する世代 label ではない。最新の correlated approval が
 承認した `review_request` の **exact journal id** である。production composition は ledger / action
 registry を開く前に durable journal からこの値を再構成して action record と照合し、actuator も
-各 action-time preflight で再照合する。したがって、未承認の文字列を action key に入れて新しい
-世代を作ることはできない。composition が返す mutation capability も、そこで承認した exact
+registry の writer mutation 直前と各 action-time preflight で再照合する。したがって、未承認の
+文字列や composition 後に supersede された request を action key に入れて新しい世代を作ることは
+できない。composition が返す mutation capability も、そこで承認した exact
 action key だけでなく workspace / lane / branch / worktree / repo root を含む durable resume frame
 全体へ pin される。正しい record で composition した後に別 frame を registry へ差し替える経路も
 拒否する。

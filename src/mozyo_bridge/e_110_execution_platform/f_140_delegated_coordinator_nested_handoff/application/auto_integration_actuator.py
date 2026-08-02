@@ -377,6 +377,9 @@ class AutoIntegrationUseCase:
         """Register an immutable resume frame before the first production mutation."""
         if self._admission_pin is not None:
             self._admission_pin.require_frame(action)
+            self._admission_pin.require_current_review_generation(
+                action=action, authority=self.authority
+            )
         register = getattr(self._mutation_ledger(), "register_action", None)
         if register is None:
             raise AutoIntegrationLedgerError(

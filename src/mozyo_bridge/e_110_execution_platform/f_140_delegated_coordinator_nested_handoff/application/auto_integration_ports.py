@@ -440,6 +440,10 @@ class DurableAuthorityReader(Protocol):
         self, *, record: IntegrationActionRecord
     ) -> IntegrationAuthority: ...
 
+    def current_review_generation(self, *, record: IntegrationActionRecord) -> str:
+        """Read the exact currently-approved request journal for ``record`` fresh."""
+        ...
+
     def read_integration_ci(
         self, *, record: IntegrationActionRecord, integration_head: str
     ) -> Optional[IntegrationCiEvidence]: ...

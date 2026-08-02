@@ -575,6 +575,63 @@ class DeclaredIntegrationBranchTest(unittest.TestCase):
                     ci_workflow="Test",
                 )
 
+    def test_supersede_after_composition_is_zero_register_and_zero_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            journals = _approved_journals()
+            with mock.patch(
+                "mozyo_bridge.e_110_execution_platform."
+                "f_140_delegated_coordinator_nested_handoff.application."
+                "auto_integration_composition.live_journal_reader",
+                return_value=lambda issue: list(journals),
+            ):
+                use_case = build_auto_integration_use_case(
+                    binding=LaneBinding(
+                        issue=ISSUE,
+                        workspace=WS,
+                        lane=LANE,
+                        lane_generation=GEN,
+                        branch="issue_14825",
+                        worktree="/tmp/wt",
+                    ),
+                    config=AutoIntegrationConfig(
+                        mode="auto", integration_branch=TARGET_REF
+                    ),
+                    repo_root=Path("."),
+                    inventory_ops=object(),
+                    callback_outbox=object(),
+                    admission_record=_action(),
+                    home=home,
+                )
+
+            journals.append(
+                _journal("96520", _request_note(), ISSUER_REVIEW_GATEWAY)
+            )
+            admitted = _action()
+            frame = DurableIntegrationAction(
+                action_key=admitted.action_key,
+                issue=ISSUE,
+                workspace=WS,
+                lane=LANE,
+                lane_generation=GEN,
+                branch="issue_14825",
+                worktree="/tmp/wt",
+                repo_root=".",
+                source_head=SOURCE,
+                target_ref=TARGET_REF,
+                expected_target_head=OTHER,
+                review_generation=admitted.review_generation,
+            )
+            self.assertEqual(
+                use_case.authority.current_review_generation(record=admitted), ""
+            )
+            with self.assertRaises(AutoIntegrationLedgerError):
+                use_case.register_durable_action(frame)
+            self.assertIsNone(use_case.ledger.action(admitted.action_key))
+            self.assertEqual(
+                use_case.ledger.action_event_count(action_key=admitted.action_key), 0
+            )
+
     def test_production_composition_reads_the_exact_live_lane_callback_scope(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             outbox = object()

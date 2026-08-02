@@ -292,6 +292,14 @@ class FakeAuthorityReader:
     def read_integration_authority(self, *, record) -> IntegrationAuthority:
         return self.authority
 
+    def current_review_generation(self, *, record) -> str:
+        if (
+            self.authority.review_generation_admissible
+            and self.authority.reviewed_head == record.source_head
+        ):
+            return self.authority.review_generation
+        return ""
+
     def read_integration_ci(self, *, record, integration_head):
         if self.withhold_ci:
             return None
