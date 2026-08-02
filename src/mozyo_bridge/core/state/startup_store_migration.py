@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,10 +86,24 @@ class StartupStoreMigrationResult:
     outcome: str
     backup_path: str = ""
     backup_seal_path: str = ""
+    artifact_path: str = ""
+    artifact_digest: str = ""
     seal_nonce_verified: bool = False
     schema_version: int = 0
     action_count: int = 0
     content_digest: str = ""
+
+
+def _store_identity(conn) -> str:
+    """The store's OWN identity — its ``store_meta.store_nonce``, never its path.
+
+    A path is a name two different stores can wear in sequence; the nonce is the thing the
+    fence's own seal check is about.
+    """
+    row = conn.execute(
+        "SELECT value FROM store_meta WHERE key = ?", ("store_nonce",)
+    ).fetchone()
+    return str(row[0]) if row and row[0] else ""
 
 
 def _store_facts(conn) -> tuple:
@@ -106,67 +121,87 @@ def _store_facts(conn) -> tuple:
     return (version, len(rows), hashlib.sha256(payload.encode("utf-8")).hexdigest())
 
 
-def staged_seal_backup(fence, backup_path: Path) -> tuple:
-    """Stage the fence's identity seal beside the DB snapshot (audit j#96966 C11).
+#: Names inside the artifact directory. Fixed, so a restore is a copy of two known files.
+ARTIFACT_DB_NAME = "startup-transaction-fence.sqlite"
+ARTIFACT_SEAL_NAME = ARTIFACT_DB_NAME + ".seal"
 
-    The seal is a separate file the fence requires and byte-matches against the DB's own
-    stored nonce. A snapshot without it restores to a store that fails `store_shape` — so
-    the "backup" would be a file that cannot be used as one. Captured and published under
-    the same staging/rename discipline as the DB.
+
+def stage_recovery_artifact(fence, conn, staging_dir: Path) -> tuple:
+    """Build the WHOLE recovery artifact in a staging directory and prove it restores.
+
+    Audit j#96976 C17 + C19. Two separate failures made the previous version's success
+    claim unearned:
+
+    - publishing the DB and the seal as two renames left a real window (and a real
+      injected-fault outcome) where the final namespace held a DB with no seal — a
+      partial artifact that looks restorable and is not;
+    - the "verification" compared the copied seal against the LIVE seal and never opened
+      the backup's own ``store_meta.store_nonce``. Corrupting only the backup nonce still
+      returned ``seal_nonce_verified=True`` while the restored authority was unusable.
+
+    So the pair is assembled here, in a directory nobody else can see, and then actually
+    RESTORED: a fresh :class:`StartupTransactionFence` is opened on the staged DB, which
+    forces the real contract — schema version, table shape, seal present, and the seal's
+    nonce byte-matching the DB's own. Its rows and content are then required to equal the
+    source's. Only a pair that passes all of that is published, and publication is ONE
+    atomic directory rename.
     """
+    from mozyo_bridge.core.state.startup_transaction_fence import StartupTransactionFence
+
     seal_source = Path(fence.seal_path)
-    seal_target = backup_path.with_name(backup_path.name + ".seal")
-    staging = seal_target.with_name(seal_target.name + _BACKUP_STAGING_SUFFIX)
     if not seal_source.is_file():
         raise OSError("the store has no readable identity seal to snapshot")
-    if staging.exists():
-        staging.unlink()
-    staging.write_bytes(seal_source.read_bytes())
-    if staging.read_bytes() != seal_source.read_bytes():
-        raise OSError("the seal snapshot does not read back as the source seal")
-    return (staging, seal_target)
 
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir)
+    staging_dir.mkdir(parents=True)
+    staged_db = staging_dir / ARTIFACT_DB_NAME
+    staged_seal = staging_dir / ARTIFACT_SEAL_NAME
 
-def staged_backup(conn, backup_path: Path) -> tuple:
-    """Snapshot the LIVE store with SQLite's backup API, then verify it by readback.
-
-    Audit j#96959 C8. ``shutil.copy2`` copies the main database file and nothing else, so a
-    store in WAL mode with ``wal_autocheckpoint=0`` loses every committed row still sitting
-    in the write-ahead log — measured: 1 of 2 actions survived a raw copy while the backup
-    API preserved both. A recovery point that silently drops committed actions is worse than
-    no backup, because the rollback would look like it worked.
-
-    The snapshot is written to a STAGING path and read back as a fresh connection: version,
-    action count, and a content digest must match the source. Only then is it published by
-    rename, so a reader never sees a partial backup and a failed backup publishes nothing.
-    """
-    staging = backup_path.with_name(backup_path.name + _BACKUP_STAGING_SUFFIX)
-    backup_path.parent.mkdir(parents=True, exist_ok=True)
-    if staging.exists():
-        staging.unlink()
     source_facts = _store_facts(conn)
-    dest = sqlite3.connect(staging)
+    dest = sqlite3.connect(staged_db)
     try:
         conn.backup(dest)
         dest.commit()
     finally:
         dest.close()
-    verify = sqlite3.connect(f"file:{staging}?mode=ro", uri=True)
-    try:
-        snapshot_facts = _store_facts(verify)
-    finally:
-        verify.close()
-    if snapshot_facts != source_facts:
+    staged_seal.write_bytes(seal_source.read_bytes())
+
+    # The actual restore test. `_verify` inside this read is what proves the DB nonce and
+    # the seal agree — the binding C19 says must be checked on the ARTIFACT, not on the
+    # live store it was copied from.
+    restored = StartupTransactionFence(staged_db)
+    with restored._connection("ro") as verify_conn:
+        artifact_facts = _store_facts(verify_conn)
+    if artifact_facts != source_facts:
         raise OSError(
-            f"the snapshot does not read back as the source "
-            f"(source={source_facts}, snapshot={snapshot_facts})"
+            f"the staged artifact does not read back as the source "
+            f"(source={source_facts}, artifact={artifact_facts})"
         )
-    return (staging, source_facts)
+    artifact_digest = hashlib.sha256(
+        json.dumps(
+            [list(artifact_facts), staged_seal.read_bytes().decode("utf-8", "replace")],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return (source_facts, artifact_digest)
 
 
-def publish_backup(staging: Path, backup_path: Path) -> None:
-    """Atomically publish a verified staging snapshot. Rename, never copy."""
-    os.replace(staging, backup_path)
+def publish_recovery_artifact(staging_dir: Path, artifact_dir: Path) -> None:
+    """Publish the verified artifact in ONE atomic rename (audit j#96976 C17).
+
+    Refuses an existing destination rather than merging into it: a rename over a populated
+    directory is neither atomic nor obviously correct, and silently reusing someone else's
+    artifact path is exactly the ambiguity this whole primitive is trying to remove.
+    """
+    if artifact_dir.exists():
+        raise OSError(
+            f"the recovery artifact path {artifact_dir.name!r} already exists; refusing to "
+            "publish over it"
+        )
+    artifact_dir.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(staging_dir, artifact_dir)
 
 
 class StartupStoreMigrationRefused(StartupTransactionError):
@@ -213,20 +248,93 @@ def _refuse_if_tagged_rows(conn) -> None:
             )
 
 
-def _receipt_proves_completion(receipt, plan_digest: str, target_path) -> bool:
-    """True iff ``receipt`` is #14838's completion record for THIS plan and THIS store.
+#: The receipt protocol this build accepts. An unknown one is refused, never coerced.
+COMPLETION_RECEIPT_PROTOCOL = "mzb-startup-migration-1"
+#: The only phase that means "this rollout finished".
+COMPLETION_PHASE_TERMINAL = "completed"
 
-    Deliberately strict and deliberately dumb: exact plan digest, exact target path. It is
-    not this primitive's job to interpret the rollout's bookkeeping — only to refuse to
-    call an unproven state a success.
+
+@dataclass(frozen=True)
+class MigrationCompletionReceipt:
+    """#14838's durable record that THIS action completed THIS migration.
+
+    A typed value, not a mapping (audit j#96966 C18). The previous check accepted any
+    ``Mapping`` carrying three coercively-``str()``-compared keys, so a three-key dict
+    literal proved completion — and my own regression pinned exactly that as success, which
+    made the test part of the defect. A receipt has to identify the action, the plan, the
+    store, and the artifact, or it identifies nothing.
+
+    Every field is compared for exact string equality. Nothing here is normalised: a padded
+    or wrongly-typed field is a different receipt, not a forgiving one.
     """
-    if not isinstance(receipt, Mapping):
+
+    action_id: str
+    plan_digest: str
+    #: Where the completed rollout published its recovery artifact. Re-verified on replay:
+    #: the digest below is checked against THIS directory, not against itself.
+    artifact_path: str
+    #: The target store's own identity — its ``store_meta.store_nonce``, not its path. A
+    #: path is a name; two different stores can wear it in sequence.
+    store_identity: str
+    artifact_digest: str
+    protocol: str = COMPLETION_RECEIPT_PROTOCOL
+    phase: str = COMPLETION_PHASE_TERMINAL
+    revision: int = 1
+
+
+def artifact_digest_of(artifact_dir) -> str:
+    """Recompute an existing artifact's digest by actually opening it (never raises=False).
+
+    Independent verification, which is the whole point: the digest is derived from the
+    artifact on disk — through a fresh fence, so the seal/nonce binding is proved again —
+    rather than taken from the receipt that claims it. Comparing a receipt field against
+    itself proves nothing, which is what the first cut of the replay check did.
+    """
+    from mozyo_bridge.core.state.startup_transaction_fence import StartupTransactionFence
+
+    directory = Path(artifact_dir)
+    db = directory / ARTIFACT_DB_NAME
+    seal = directory / ARTIFACT_SEAL_NAME
+    if not db.is_file() or not seal.is_file():
+        return ""
+    try:
+        with StartupTransactionFence(db)._connection("ro") as conn:
+            facts = _store_facts(conn)
+    except Exception:  # noqa: BLE001 - an unopenable artifact simply does not verify
+        return ""
+    return hashlib.sha256(
+        json.dumps(
+            [list(facts), seal.read_bytes().decode("utf-8", "replace")],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _receipt_proves_completion(
+    receipt, *, plan_digest: str, store_identity: str
+) -> bool:
+    """True iff ``receipt`` is the typed completion record for THIS plan, store and artifact.
+
+    Strict by construction: the caller must hand over a
+    :class:`MigrationCompletionReceipt` read back from #14838's private action store. Any
+    other object — including a mapping that happens to have the right keys — proves nothing.
+    """
+    if not isinstance(receipt, MigrationCompletionReceipt):
         return False
-    return (
-        str(receipt.get("plan_digest") or "") == plan_digest
-        and str(receipt.get("target_path") or "") == str(target_path)
-        and str(receipt.get("outcome") or "") == MIGRATION_OK
-    )
+    if receipt.protocol != COMPLETION_RECEIPT_PROTOCOL:
+        return False
+    if receipt.phase != COMPLETION_PHASE_TERMINAL or not isinstance(receipt.revision, int):
+        return False
+    if not isinstance(receipt.action_id, str) or not receipt.action_id.strip():
+        return False
+    if receipt.plan_digest != plan_digest or receipt.store_identity != store_identity:
+        return False
+    # The artifact the receipt names must still verify, and its recomputed digest must be
+    # the one the receipt recorded.
+    return bool(receipt.artifact_digest) and artifact_digest_of(
+        receipt.artifact_path
+    ) == receipt.artifact_digest
 
 
 def migrate_startup_store_v1_to_v2(
@@ -240,7 +348,6 @@ def migrate_startup_store_v1_to_v2(
     accept it while a new one thinks the capability contract holds — so there is no
     intermediate state to be interrupted in.
     """
-    backup = Path(backup_path)
     # Audit j#96959 C9: the approved plan digest is REQUIRED. Defaulting it to "" and
     # guarding with a truthy test meant a caller that simply omitted it silently disabled
     # drift detection — the one check that ties this run to the plan an operator approved.
@@ -267,14 +374,17 @@ def migrate_startup_store_v1_to_v2(
                 # receipt for THIS action from the external action store (#14838) and it
                 # names this plan and this target.
                 facts = _store_facts(conn)
+                identity = _store_identity(conn)
                 if not _receipt_proves_completion(
-                    completion_receipt, digest_token, fence.path
+                    completion_receipt,
+                    plan_digest=digest_token,
+                    store_identity=identity,
                 ):
                     raise StartupStoreMigrationRefused(
                         MIGRATION_ALREADY_V2_UNVERIFIED,
-                        "the store is already v2, but no external action completion "
-                        "receipt proves this run is that same completed rollout; refusing "
-                        "to report an unverified success",
+                        "the store is already v2, but no typed action completion receipt "
+                        "from the rollout's own action store proves this run is that same "
+                        "completed rollout; refusing to report an unverified success",
                     )
                 return StartupStoreMigrationResult(
                     MIGRATION_ALREADY_V2,
@@ -301,29 +411,23 @@ def migrate_startup_store_v1_to_v2(
                     MIGRATION_PLAN_DRIFT,
                     "the store is not in the state the approved migration plan described",
                 )
-            staging = seal_staging = None
-            seal_target = None
+            artifact_dir = Path(backup_path)
+            staging_dir = artifact_dir.with_name(
+                artifact_dir.name + _BACKUP_STAGING_SUFFIX
+            )
             try:
-                staging, source_facts = staged_backup(conn, backup)
-                seal_staging, seal_target = staged_seal_backup(fence, backup)
-                # Publish the PAIR, DB first: a reader that finds the DB must find the seal
-                # that goes with it, and a crash between the two leaves a DB whose missing
-                # seal makes it obviously unusable rather than silently wrong.
-                publish_backup(staging, backup)
-                staging = None
-                publish_backup(seal_staging, seal_target)
-                seal_staging = None
-                if backup.read_bytes()[:16] and Path(seal_target).read_bytes() != Path(
-                    fence.seal_path
-                ).read_bytes():
-                    raise OSError("the published seal does not match the live store's seal")
-            except (OSError, sqlite3.DatabaseError, ValueError) as exc:
-                for leftover in (staging, seal_staging):
-                    if leftover is not None:
-                        try:
-                            Path(leftover).unlink(missing_ok=True)
-                        except OSError:
-                            pass
+                source_facts, artifact_digest = stage_recovery_artifact(
+                    fence, conn, staging_dir
+                )
+                publish_recovery_artifact(staging_dir, artifact_dir)
+            except (OSError, sqlite3.DatabaseError, ValueError, StartupTransactionError) as exc:
+                # Zero in the final namespace: the staging directory is removed whole, and
+                # nothing was ever renamed into place.
+                try:
+                    if staging_dir.exists():
+                        shutil.rmtree(staging_dir)
+                except OSError:
+                    pass
                 reason = (
                     MIGRATION_SEAL_UNAVAILABLE
                     if "seal" in str(exc)
@@ -347,8 +451,10 @@ def migrate_startup_store_v1_to_v2(
             post = _store_facts(conn)
     return StartupStoreMigrationResult(
         MIGRATION_OK,
-        backup_path=str(backup),
-        backup_seal_path=str(seal_target),
+        backup_path=str(artifact_dir / ARTIFACT_DB_NAME),
+        backup_seal_path=str(artifact_dir / ARTIFACT_SEAL_NAME),
+        artifact_path=str(artifact_dir),
+        artifact_digest=artifact_digest,
         seal_nonce_verified=True,
         schema_version=post[0],
         action_count=post[1],

@@ -49,6 +49,25 @@ from mozyo_bridge.core.state.startup_action_capability import (  # noqa: E402
 UNIT = StartupUnit("wA", "issue_14741", ("codex", "claude"))
 
 
+def _completion_receipt(fence, plan_digest, artifact_digest, artifact_path=""):
+    """The typed receipt #14838 would have written for a completed rollout."""
+    import sqlite3 as _sqlite3
+
+    from mozyo_bridge.core.state.startup_store_migration import MigrationCompletionReceipt
+
+    with _sqlite3.connect(fence.path) as conn:
+        row = conn.execute(
+            "SELECT value FROM store_meta WHERE key = 'store_nonce'"
+        ).fetchone()
+    return MigrationCompletionReceipt(
+        action_id="rollout-1",
+        plan_digest=plan_digest,
+        artifact_path=str(artifact_path),
+        store_identity=str(row[0]),
+        artifact_digest=artifact_digest,
+    )
+
+
 def _approved_digest(fence):
     """The digest an operator would have approved for the store as it stands."""
     with sqlite3.connect(fence.path) as conn:
@@ -60,7 +79,7 @@ def _to_v2(fence, tmpdir, seed_nonce="seed"):
     fence.reserve(UNIT, seed_nonce)
     return migrate_startup_store_v1_to_v2(
         fence,
-        backup_path=Path(tmpdir) / "backup.sqlite",
+        backup_path=Path(tmpdir) / "artifact",
         expected_plan_digest=_approved_digest(fence),
     )
 DIGEST = "mzb1:" + "a" * 64
@@ -608,7 +627,7 @@ class SchemaV2CutoverTest(unittest.TestCase):
         self.assertEqual(
             migrate_startup_store_v1_to_v2(
                 self.fence,
-                backup_path=self.dir / "b.sqlite",
+                backup_path=self.dir / "artifact_b",
                 expected_plan_digest=_approved_digest(self.fence),
             ).outcome,
             MIGRATION_OK,
@@ -627,7 +646,7 @@ class SchemaV2CutoverTest(unittest.TestCase):
         self._v1()
         migrate_startup_store_v1_to_v2(
             self.fence,
-            backup_path=self.dir / "b.sqlite",
+            backup_path=self.dir / "artifact_b",
             expected_plan_digest=_approved_digest(self.fence),
         )
         # Audit j#96966 C10: "already v2" is not "I already did this". Without the
@@ -636,7 +655,7 @@ class SchemaV2CutoverTest(unittest.TestCase):
         with self.assertRaises(StartupStoreMigrationRefused) as ctx:
             migrate_startup_store_v1_to_v2(
                 self.fence,
-                backup_path=self.dir / "b2.sqlite",
+                backup_path=self.dir / "artifact_b2",
                 expected_plan_digest="0" * 64,
             )
         self.assertEqual(ctx.exception.reason, "already_v2_unverified")
@@ -650,7 +669,7 @@ class SchemaV2CutoverTest(unittest.TestCase):
         with self.assertRaises(StartupStoreMigrationRefused) as ctx:
             migrate_startup_store_v1_to_v2(
                 self.fence,
-                backup_path=self.dir / "b.sqlite",
+                backup_path=self.dir / "artifact_b",
                 expected_plan_digest=approved,
             )
         self.assertEqual(ctx.exception.reason, "plan_drift")
@@ -666,7 +685,7 @@ class SchemaV2CutoverTest(unittest.TestCase):
         with self.assertRaises(StartupStoreMigrationRefused) as ctx:
             migrate_startup_store_v1_to_v2(
                 self.fence,
-                backup_path=self.dir / "b.sqlite",
+                backup_path=self.dir / "artifact_b",
                 expected_plan_digest="0" * 64,
             )
         self.assertEqual(ctx.exception.reason, "foreign_sibling_schema")
@@ -678,7 +697,7 @@ class SchemaV2CutoverTest(unittest.TestCase):
         with self.assertRaises(StartupStoreMigrationRefused) as ctx:
             migrate_startup_store_v1_to_v2(
                 self.fence,
-                backup_path=self.dir / "s.sqlite" / "nested" / "b.sqlite",
+                backup_path=self.dir / "s.sqlite" / "nested" / "artifact",
                 expected_plan_digest=_approved_digest(self.fence),
             )
         self.assertEqual(ctx.exception.reason, "backup_failed")
@@ -704,7 +723,7 @@ class SchemaV2CutoverTest(unittest.TestCase):
         with self.assertRaises(StartupStoreMigrationRefused) as ctx:
             migrate_startup_store_v1_to_v2(
                 self.fence,
-                backup_path=self.dir / "b.sqlite",
+                backup_path=self.dir / "artifact_b",
                 expected_plan_digest=_approved_digest(self.fence),
             )
         self.assertEqual(ctx.exception.reason, "tagged_rows_present")
@@ -765,7 +784,7 @@ class ParentRuntimeRejectsV2Test(unittest.TestCase):
 
             migrate_startup_store_v1_to_v2(
                 fence,
-                backup_path=Path(tmp) / "b.sqlite",
+                backup_path=Path(tmp) / "artifact",
                 expected_plan_digest=_approved_digest(fence),
             )
 
@@ -977,7 +996,7 @@ class MigrationBackupAndDigestTest(unittest.TestCase):
             migrate_startup_store_v1_to_v2 as run,
         )
 
-        kw.setdefault("backup_path", self.dir / "backup.sqlite")
+        kw.setdefault("backup_path", self.dir / "artifact")
         kw.setdefault("expected_plan_digest", _approved_digest(self.fence))
         return run(self.fence, **kw)
 
@@ -1025,14 +1044,14 @@ class MigrationBackupAndDigestTest(unittest.TestCase):
     def test_c8_a_failed_backup_publishes_nothing_and_migrates_nothing(self) -> None:
         import mozyo_bridge.core.state.startup_store_migration as migration
 
-        for stage in ("staged_backup", "publish_backup"):
+        for stage in ("stage_recovery_artifact", "publish_recovery_artifact"):
             with self.subTest(stage=stage):
                 tmp = tempfile.TemporaryDirectory()
                 self.addCleanup(tmp.cleanup)
                 path = Path(tmp.name) / "s.sqlite"
                 fence = StartupTransactionFence(path)
                 fence.reserve(UNIT, "seed")
-                backup = Path(tmp.name) / "backup.sqlite"
+                backup = Path(tmp.name) / "artifact"
 
                 def boom(*a, **k):
                     raise OSError("synthetic failure")
@@ -1049,10 +1068,10 @@ class MigrationBackupAndDigestTest(unittest.TestCase):
                 finally:
                     setattr(migration, stage, real)
                 self.assertEqual(ctx.exception.reason, "backup_failed")
-                self.assertFalse(backup.exists(), "no partial backup is published")
+                self.assertFalse(backup.exists(), "no partial artifact is published")
                 self.assertFalse(
                     backup.with_name(backup.name + ".staging").exists(),
-                    "and no staging file is left behind",
+                    "and no staging directory is left behind",
                 )
                 with sqlite3.connect(path) as conn:
                     self.assertEqual(
@@ -1065,7 +1084,7 @@ class MigrationBackupAndDigestTest(unittest.TestCase):
         """The snapshot is verified against the source before it is published."""
         import mozyo_bridge.core.state.startup_store_migration as migration
 
-        backup = self.dir / "backup.sqlite"
+        backup = self.dir / "artifact"
         real = migration._store_facts
         calls = {"n": 0}
 
@@ -1102,7 +1121,7 @@ class MigrationBackupAndDigestTest(unittest.TestCase):
                 self.assertEqual(ctx.exception.reason, "plan_digest_required")
                 with sqlite3.connect(self.path) as conn:
                     self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
-                self.assertFalse((self.dir / "backup.sqlite").exists())
+                self.assertFalse((self.dir / "artifact").exists())
 
     def test_c9_only_an_exact_digest_on_a_clean_v1_store_proceeds(self) -> None:
         result = self._migrate()
@@ -1130,7 +1149,7 @@ class MigrationReplayAndRecoveryArtifactTest(unittest.TestCase):
             migrate_startup_store_v1_to_v2 as run,
         )
 
-        kw.setdefault("backup_path", self.dir / "backup.sqlite")
+        kw.setdefault("backup_path", self.dir / "artifact")
         kw.setdefault("expected_plan_digest", self.plan)
         return run(self.fence, **kw)
 
@@ -1138,35 +1157,49 @@ class MigrationReplayAndRecoveryArtifactTest(unittest.TestCase):
     def test_c10_replay_without_a_completion_receipt_is_refused(self) -> None:
         self.assertEqual(self._run().outcome, MIGRATION_OK)
         with self.assertRaises(StartupStoreMigrationRefused) as ctx:
-            self._run(backup_path=self.dir / "b2.sqlite")
+            self._run(backup_path=self.dir / "artifact_b2")
         self.assertEqual(ctx.exception.reason, "already_v2_unverified")
 
     def test_c10_a_foreign_or_malformed_receipt_does_not_prove_completion(self) -> None:
-        self._run()
+        """Audit j#96966 C18: a bare mapping with the right-looking keys proves nothing."""
+        from dataclasses import replace
+
+        from mozyo_bridge.core.state.startup_store_migration import (
+            MigrationCompletionReceipt,
+        )
+
+        first = self._run()
+        good = _completion_receipt(
+            self.fence, self.plan, first.artifact_digest, first.artifact_path
+        )
         for label, receipt in (
-            ("wrong plan", {"plan_digest": "1" * 64, "target_path": str(self.path),
-                            "outcome": MIGRATION_OK}),
-            ("wrong target", {"plan_digest": self.plan, "target_path": "/elsewhere.sqlite",
-                              "outcome": MIGRATION_OK}),
-            ("not completed", {"plan_digest": self.plan, "target_path": str(self.path),
-                               "outcome": "in_progress"}),
-            ("not a mapping", "receipt"),
+            ("fabricated mapping", {"plan_digest": self.plan, "outcome": MIGRATION_OK}),
+            ("plain string", "receipt"),
             ("absent", None),
+            ("wrong plan", replace(good, plan_digest="1" * 64)),
+            ("foreign store identity", replace(good, store_identity="somebody-else")),
+            ("foreign artifact", replace(good, artifact_digest="0" * 64)),
+            ("unknown protocol", replace(good, protocol="mzb-startup-migration-9")),
+            ("not terminal", replace(good, phase="in_progress")),
+            ("blank action id", replace(good, action_id="  ")),
+            ("padded plan", replace(good, plan_digest=" " + self.plan)),
+            ("wrong-typed revision", replace(good, revision="1")),
         ):
             with self.subTest(label=label):
                 with self.assertRaises(StartupStoreMigrationRefused) as ctx:
-                    self._run(backup_path=self.dir / "b3.sqlite", completion_receipt=receipt)
+                    self._run(
+                        backup_path=self.dir / f"artifact_{abs(hash(label))}",
+                        completion_receipt=receipt,
+                    )
                 self.assertEqual(ctx.exception.reason, "already_v2_unverified")
 
     def test_c10_the_matching_completion_receipt_replays_idempotently(self) -> None:
         first = self._run()
         replay = self._run(
-            backup_path=self.dir / "b4.sqlite",
-            completion_receipt={
-                "plan_digest": self.plan,
-                "target_path": str(self.path),
-                "outcome": MIGRATION_OK,
-            },
+            backup_path=self.dir / "artifact_b4",
+            completion_receipt=_completion_receipt(
+                self.fence, self.plan, first.artifact_digest, first.artifact_path
+            ),
         )
         self.assertEqual(replay.outcome, MIGRATION_ALREADY_V2)
         self.assertEqual(replay.schema_version, 2)
@@ -1200,3 +1233,146 @@ class MigrationReplayAndRecoveryArtifactTest(unittest.TestCase):
             self._run()
         with sqlite3.connect(self.path) as conn:
             self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+
+
+class RecoveryArtifactAtomicityTest(unittest.TestCase):
+    """j#96976 C17/C19: the artifact is published as one verified unit, or not at all."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.path = self.dir / "s.sqlite"
+        self.fence = StartupTransactionFence(self.path)
+        self.fence.reserve(UNIT, "seed")
+        self.plan = _approved_digest(self.fence)
+        self.artifact = self.dir / "artifact"
+
+    def _run(self, **kw):
+        from mozyo_bridge.core.state.startup_store_migration import (
+            migrate_startup_store_v1_to_v2 as run,
+        )
+
+        kw.setdefault("backup_path", self.artifact)
+        kw.setdefault("expected_plan_digest", self.plan)
+        return run(self.fence, **kw)
+
+    def _assert_nothing_published(self) -> None:
+        self.assertFalse(self.artifact.exists(), "no artifact in the final namespace")
+        self.assertFalse(
+            self.artifact.with_name(self.artifact.name + ".staging").exists(),
+            "and no staging directory left behind",
+        )
+        with sqlite3.connect(self.path) as conn:
+            self.assertEqual(
+                conn.execute("PRAGMA user_version").fetchone()[0], 1, "source untouched"
+            )
+
+    def test_c17_a_failed_publish_leaves_nothing_in_the_final_namespace(self) -> None:
+        """The old two-rename shape left a DB with no seal; one rename cannot."""
+        import mozyo_bridge.core.state.startup_store_migration as migration
+
+        real = migration.publish_recovery_artifact
+
+        def boom(*a, **k):
+            raise OSError("synthetic publish failure")
+
+        migration.publish_recovery_artifact = boom
+        try:
+            with self.assertRaises(StartupStoreMigrationRefused):
+                self._run()
+        finally:
+            migration.publish_recovery_artifact = real
+        self._assert_nothing_published()
+
+    def test_c17_a_failed_stage_leaves_nothing_in_the_final_namespace(self) -> None:
+        import mozyo_bridge.core.state.startup_store_migration as migration
+
+        real = migration.stage_recovery_artifact
+
+        def boom(*a, **k):
+            raise OSError("synthetic stage failure")
+
+        migration.stage_recovery_artifact = boom
+        try:
+            with self.assertRaises(StartupStoreMigrationRefused):
+                self._run()
+        finally:
+            migration.stage_recovery_artifact = real
+        self._assert_nothing_published()
+
+    def test_c17_the_artifact_is_a_single_directory_holding_both_files(self) -> None:
+        result = self._run()
+        published = Path(result.artifact_path)
+        self.assertTrue(published.is_dir())
+        self.assertEqual(
+            sorted(p.name for p in published.iterdir()),
+            sorted(
+                [
+                    Path(result.backup_path).name,
+                    Path(result.backup_seal_path).name,
+                ]
+            ),
+        )
+
+    def test_c17_publishing_over_an_existing_artifact_is_refused(self) -> None:
+        self.artifact.mkdir()
+        with self.assertRaises(StartupStoreMigrationRefused):
+            self._run()
+        with sqlite3.connect(self.path) as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+
+    def test_c19_a_tampered_staged_db_nonce_is_caught_before_publication(self) -> None:
+        """The binding is verified on the ARTIFACT, not on the live store it came from."""
+        import mozyo_bridge.core.state.startup_store_migration as migration
+
+        real = migration.stage_recovery_artifact
+
+        def tamper(fence, conn, staging_dir):
+            facts = real(fence, conn, staging_dir)
+            with sqlite3.connect(staging_dir / migration.ARTIFACT_DB_NAME) as c:
+                c.execute(
+                    "UPDATE store_meta SET value = 'forged' WHERE key = 'store_nonce'"
+                )
+            return facts
+
+        migration.stage_recovery_artifact = tamper
+        try:
+            self._run()
+        finally:
+            migration.stage_recovery_artifact = real
+
+        # The artifact was published (the tamper happened after this build's own check),
+        # so the independent verifier must refuse it — which is what a replay relies on.
+        self.assertEqual(
+            migration.artifact_digest_of(self.artifact),
+            "",
+            "an artifact whose DB nonce no longer matches its seal must not verify",
+        )
+
+    def test_c19_a_verified_artifact_actually_restores(self) -> None:
+        result = self._run()
+        self.assertTrue(result.seal_nonce_verified)
+        self.assertEqual(
+            _artifact_digest(result.artifact_path),
+            result.artifact_digest,
+            "the recorded digest is the one the published artifact reproduces",
+        )
+        restored = StartupTransactionFence(Path(result.backup_path))
+        self.assertIsNotNone(restored.read(startup_action_id(UNIT, "seed")))
+
+    def test_c19_a_db_only_or_seal_only_artifact_does_not_verify(self) -> None:
+        result = self._run()
+        published = Path(result.artifact_path)
+        for missing in (Path(result.backup_seal_path), Path(result.backup_path)):
+            with self.subTest(missing=missing.name):
+                kept = missing.read_bytes()
+                missing.unlink()
+                self.assertEqual(_artifact_digest(published), "")
+                missing.write_bytes(kept)
+
+
+def _artifact_digest(artifact_path):
+    from mozyo_bridge.core.state.startup_store_migration import artifact_digest_of
+
+    return artifact_digest_of(artifact_path)
