@@ -20,9 +20,17 @@ failed because they asked a question the row could not actually answer:
 Why an epoch closes what the other three cannot. The defect shape common to (1) and (2) is
 that a *caller* supplied the value the proof rested on, so no amount of cross-checking made
 it authority. Here nothing is supplied: the lifecycle store advances ``lane_epoch`` with
-``lane_epoch = lane_epoch + 1`` evaluated by SQLite against the row's OWN stored value,
-inside the same guarded transaction as the hibernate disposition CAS. There is no parameter
-to backdate, no clock to roll back, and no second value to reconcile.
+the row's OWN stored value incremented inside the same guarded transaction as the
+hibernate disposition CAS. There is no parameter to backdate, no clock to roll back, and no
+second value to reconcile.
+
+The increment is computed in Python from strictly-decoded canonical bytes and written back as
+canonical bytes — deliberately NOT as SQL arithmetic. ``lane_epoch = lane_epoch + 1`` reads
+whatever SQLite decided the column contains, and with the column's original ``INTEGER``
+affinity that included ``'00'``, ``'+0'``, ``' 0 '``, ``'0.0'``, ``2.0``, ``False`` and
+``True``, each silently coerced to a number before any Python check could run (measured;
+Redmine #14756 j#96911 F2). A predicate cannot reject a conversion that happened beneath it,
+so the column is ``BLOB`` (NONE affinity) and the arithmetic left the database.
 
 Why a survivor cannot hold a fresh epoch. The epoch reaches a process exactly once — as an
 environment variable injected at ``herdr agent start``. A live process's environment is
@@ -46,7 +54,7 @@ same predicate, and :func:`lane_epoch_verdict` computes it once. Both spellings 
 so a caller states whichever half it means without re-deriving the arithmetic.
 
 **Zero is absence, never a boundary.** A row migrated from a pre-v10 build, or one that has
-never hibernated under a v10 build, carries ``0``. That is *no epoch has ever been minted*,
+never hibernated under a v10 build, carries the canonical bytes ``"0"``. That is *no epoch has ever been minted*,
 which is not the same as "an epoch of zero" and must never be treated as a threshold every
 positive epoch clears — that would admit any attested pair at all, the exact inverse of a
 generation proof. It resolves to :data:`EPOCH_AUTHORITY_UNAVAILABLE` and the caller fails
@@ -69,6 +77,7 @@ Pure: no IO, no clock, no environment. Every function is total and returns a clo
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 #: The lifecycle column this module owns the semantics of (schema v10). Named here so the
@@ -105,44 +114,69 @@ EPOCH_MALFORMED = "lane_epoch_malformed"
 EPOCH_NOT_NEWER = "lane_epoch_not_newer"
 
 
-#: A stored ``lane_epoch`` of exactly int ``0`` — the counter has never been minted.
+#: A stored ``lane_epoch`` whose bytes are canonical decimal ``"0"`` — never minted.
 EPOCH_STORED_UNMINTED = "stored_unminted"
-#: A stored ``lane_epoch`` that is an exact positive int — a real generation counter.
+#: A stored ``lane_epoch`` whose bytes are a canonical decimal positive integer.
 EPOCH_STORED_MINTED = "stored_minted"
-#: A stored ``lane_epoch`` that is NOT a value this store's writer can have produced: TEXT,
-#: REAL, ``bool``, ``NULL`` or a negative int. It is not zero, and must never be treated as
-#: zero by anything that WRITES (Redmine #14756 j#96881 F2).
+#: A stored ``lane_epoch`` that is NOT canonical decimal TEXT: an INTEGER, REAL, BLOB,
+#: ``NULL``, ``bool``, a negative or signed form, a leading-zero form, or anything with
+#: surrounding whitespace. It is not zero, and nothing that WRITES may treat it as zero
+#: (Redmine #14756 j#96881 F2, j#96911 F2).
 EPOCH_STORED_MALFORMED = "stored_malformed"
+
+#: Canonical decimal bytes: no sign, no leading zero, no whitespace, no radix point. This is
+#: the ONLY accepted storage form, which is what makes the column's contents self-describing
+#: rather than dependent on what SQLite decided to coerce them into.
+_CANONICAL_EPOCH = re.compile(r"\A(?:0|[1-9][0-9]*)\Z")
+
+
+def encode_lane_epoch(value: int) -> str:
+    """The canonical storage bytes for ``value`` — the only form a writer may bind.
+
+    Returned as ``str`` so the driver binds SQLite storage class TEXT. The column is declared
+    ``BLOB`` (NONE affinity) precisely so that this survives unconverted; see
+    :func:`classify_stored_epoch`.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"a lane epoch must be a non-negative int, not {value!r}")
+    return str(value)
 
 
 def classify_stored_epoch(value: object) -> tuple[int, str]:
     """``(epoch, state)`` for a row's raw ``lane_epoch`` — malformed is its own answer.
 
-    The distinction this exists to preserve: **"never minted" and "unreadable" are different
-    facts**, and only one of them may be advanced from. Folding them together is safe on the
-    read side (both mean "cannot prove a generation") and unsafe on the write side, which is
-    exactly the asymmetry j#96881 F2 measured: because the old helper answered ``0`` for
-    ``'corrupt'``, ``-7``, ``2.5``, ``True`` and ``NULL`` alike, a hibernate CAS minted ``1``
-    from every one of them. That is a counter ROLLBACK — it re-issues an epoch that some
-    already-released generation may still hold in its environment, resurrecting precisely the
-    survivor admission this module exists to close. A negative value is malformed for the same
-    reason rather than merely "small": the counter only ever increments from zero, so a
-    negative one is evidence the row is corrupt, not evidence of an early generation.
+    Two separate laundering routes had to be closed here, and the second is the one that
+    makes this look over-built:
 
-    ``bool`` is excluded and a REAL is rejected rather than truncated, for the reason
-    ``lane_lifecycle_schema._recorded_version`` documents: ``int(2.5) == 2`` would walk a
-    value the store never wrote straight through a threshold comparison.
+    1. **In Python** (j#96881 F2): the original helper answered ``0`` for ``'corrupt'``,
+       ``-7``, ``2.5`` and ``NULL`` alike, so a hibernate CAS minted ``1`` from every one of
+       them. That re-issues an epoch a released generation may still hold, which is the
+       survivor admission this module exists to close.
+    2. **In SQLite, before Python ever sees the value** (j#96911 F2): the column was declared
+       ``INTEGER``, and INTEGER affinity silently converts ``'00'``, ``'+0'``, ``' 0 '``,
+       ``'0.0'``, ``2.0``, ``False`` and ``True`` into integers on the way in. Measured in an
+       isolated store: every one of those produced an *applied* hibernate CAS and re-minted
+       the epoch. A type check written in Python cannot see a conversion that already
+       happened underneath it — which is why the fix is a storage contract, not a stricter
+       predicate. The column is now ``BLOB`` (NONE affinity) holding canonical decimal TEXT,
+       so the bytes that were written are the bytes that come back.
+
+    Hence: only storage class ``str`` matching :data:`_CANONICAL_EPOCH` is a real counter.
+    ``bool`` is excluded before the ``int`` test because ``bool`` is an ``int`` subclass; an
+    ``int`` or ``float`` reaching here at all means the row predates the storage contract or
+    was written around it, and is malformed rather than trusted.
 
     The returned integer is meaningful ONLY for :data:`EPOCH_STORED_MINTED`; for the other
     two it is :data:`LANE_EPOCH_UNMINTED` and must not be compared against.
     """
-    if isinstance(value, bool) or not isinstance(value, int):
-        return LANE_EPOCH_UNMINTED, EPOCH_STORED_MALFORMED
-    if value < LANE_EPOCH_UNMINTED:
-        return LANE_EPOCH_UNMINTED, EPOCH_STORED_MALFORMED
-    if value == LANE_EPOCH_UNMINTED:
-        return LANE_EPOCH_UNMINTED, EPOCH_STORED_UNMINTED
-    return value, EPOCH_STORED_MINTED
+    if isinstance(value, str) and _CANONICAL_EPOCH.match(value):
+        epoch = int(value)
+        return (
+            (epoch, EPOCH_STORED_MINTED)
+            if epoch > LANE_EPOCH_UNMINTED
+            else (LANE_EPOCH_UNMINTED, EPOCH_STORED_UNMINTED)
+        )
+    return LANE_EPOCH_UNMINTED, EPOCH_STORED_MALFORMED
 
 
 def _stored_epoch(value: object) -> int:
@@ -255,8 +289,14 @@ def lane_epoch_verdict(
 
 def lane_epoch_on_transition(
     current: object, *, target: str, hibernated: str
-) -> Optional[int]:
-    """This row's ``lane_epoch`` after a disposition CAS to ``target``, or ``None`` to refuse.
+) -> Optional[str]:
+    """The CANONICAL BYTES to store after a disposition CAS to ``target``, or ``None``.
+
+    Returns storage bytes rather than an ``int`` so this module owns the whole storage
+    contract — classification, arithmetic and encoding — and the lifecycle store only binds
+    what it is handed. A caller that received an ``int`` would have to remember to encode it,
+    and a caller that forgot would silently write storage class INTEGER into a NONE-affinity
+    column, which is the exact shape j#96911 F2 measured.
 
     ``None`` means **the stored value is malformed and this CAS must not write at all**
     (Redmine #14756 j#96881 F2). It is returned for both branches, and the non-hibernate one
@@ -287,9 +327,7 @@ def lane_epoch_on_transition(
     stored, state = classify_stored_epoch(current)
     if state == EPOCH_STORED_MALFORMED:
         return None
-    if target == hibernated:
-        return stored + 1
-    return stored
+    return encode_lane_epoch(stored + 1 if target == hibernated else stored)
 
 
 __all__ = (

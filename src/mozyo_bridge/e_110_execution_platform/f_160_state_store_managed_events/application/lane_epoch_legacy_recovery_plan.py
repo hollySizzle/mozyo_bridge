@@ -155,142 +155,114 @@ CANONICAL_STEPS: tuple = (
 )
 
 
-#: The exact number of slots a lane's own pair has. Not a tunable — the whole rail is
-#: "close BOTH slots of the exact old pair", and a rail that accepted one slot would exclude
-#: half a pair from the census while calling the result the pair (j#96890 §1).
-_PAIR_SLOT_COUNT = 2
-
-
 def _derive_target_pair(record, view, home: Path, workspace_id: str, lane: str):
     """``(names, refusal_state, detail)`` — the lane's OWN pair, from stored authority.
 
     The exclusion set that decides whether the global blocker fires, so it must not come from
     the caller. j#96881 F1 measured why: the first version subtracted a caller-supplied
     ``--target-slot`` list unconditionally, so naming every consumer turned
-    ``offline_global_runtime_upgrade_required`` into ``plan_ready``. The blocker existed and
-    could be erased by the party it was blocking (reproduced before fixing: four consumers,
-    four names supplied, plan went green).
+    ``offline_global_runtime_upgrade_required`` into ``plan_ready``.
 
     **The authority is ``declared_slots``, not ``release_observation``** (j#96895, measured
-    against the real #14755 row: observation length 0, declared slots length 532). Two reasons,
-    and the second is the one that matters:
+    against the real #14755 row: observation length 0, declared slots length 532). The
+    observation is the ORIGINAL release's snapshot; after a bootstrap or pin repair it is past
+    evidence, not the current generation's pair. Release evidence is not consulted here at
+    all — a rail with two authorities answers from whichever happens to be populated.
 
-    - the named acceptance target has no release observation at all, so an
-      observation-sourced derivation refuses the one lane this rail exists for;
-    - a release observation is a snapshot of the slots the ORIGINAL release enumerated. After a
-      bootstrap or a pin repair it is past evidence, not the current generation's pair. Using
-      it as current authority would be reading a stale fact as a live one — the same class of
-      error the epoch itself exists to close.
+    **``role`` and ``provider`` are different axes and must not be joined to each other**
+    (j#96911 F1). The real #14755 row declares ``role=gateway/worker`` with
+    ``provider=codex/claude``, while the live inventory row and the startup attestation both
+    carry the PROVIDER in their own ``role`` token. Comparing ``live.role`` to ``pin.role``
+    therefore compared ``codex`` against ``gateway`` and made the real dry-run refuse
+    ``blocked_pair_identity_mismatch`` — the intended blocker was unreachable on the one lane
+    this rail exists for. The pair's slot identity comes from
+    :func:`...lane_pin_role.read_declared_pin_pair` (which already owns the canonical
+    ``{gateway, worker}`` vocabulary, the legacy spellings, and every ambiguous shape), and
+    the provider is what gets joined against live and attested rows.
 
-    Release evidence is therefore not consulted here at all. It remains useful for diagnosing
-    contradictions, but it is not a fallback: a rail with two authorities eventually answers
-    from whichever one happens to be populated.
-
-    Every axis is joined **byte-exact** across three sources — the stored pin, the live
-    inventory row, and the startup attestation — because a name alone proves nothing about
-    which process currently answers to it. ``locator`` is joined on all three (j#96890 §2: a
-    stale attestation row would otherwise let a recycled pane be excluded as "ours").
-
-    Nothing is ever excluded on inference. Absent / corrupt / non-pair declared slots, a pin
-    that is live but unattested (or the reverse), and any axis mismatch are all typed
-    refusals — never a smaller exclusion set, which would silently narrow the census.
+    Every axis is byte-exact across three sources — stored pin, live inventory row, startup
+    attestation — and each pin must resolve to **exactly one** of each. A name alone proves
+    nothing about which process answers to it, and a duplicate makes "which one" a guess.
+    Absent on both sides is a refusal too: this rail's step 2 closes BOTH slots, so a pair it
+    cannot fully locate is a pair it has not identified, and excluding what it did find would
+    narrow the census on a partial answer.
     """
     from mozyo_bridge.core.state.herdr_identity_attestation import (
         HerdrIdentityAttestationStore,
     )
-    from mozyo_bridge.core.state.lane_declared_slots import decode_declared_slots
+    from mozyo_bridge.core.state.lane_pin_role import read_declared_pin_pair
 
-    raw = getattr(record, "declared_slots", "")
-    if not str(raw or "").strip():
+    pair = read_declared_pin_pair(record)
+    if not pair.ok:
         return (
             frozenset(),
             BLOCKED_PAIR_AUTHORITY_UNAVAILABLE,
-            "this lane's row declares no slots, so there is no stored authority for which "
-            "live processes are its own pair. An absent declaration is not an empty pair",
-        )
-    try:
-        pins = tuple(decode_declared_slots(str(raw)))
-    except Exception:  # noqa: BLE001 — a corrupt snapshot is refused, never guessed
-        return (
-            frozenset(),
-            BLOCKED_PAIR_AUTHORITY_UNAVAILABLE,
-            "this lane's declared slots could not be decoded; a corrupt snapshot cannot say "
-            "which processes belong to this lane",
+            f"this lane's declared slots do not name an unambiguous gateway+worker pair "
+            f"({pair.reason}), so there is no stored authority for which live processes are "
+            f"its own. Excluding a partial answer would narrow the consumer census",
         )
 
-    if len(pins) != _PAIR_SLOT_COUNT:
-        return (
-            frozenset(),
-            BLOCKED_PAIR_AUTHORITY_UNAVAILABLE,
-            f"this lane declares {len(pins)} slot(s); this rail acts on an exact pair of "
-            f"{_PAIR_SLOT_COUNT} and will not treat a partial declaration as one. Excluding "
-            f"a subset would narrow the consumer census on an incomplete answer",
-        )
-    if len({pin.assigned_name for pin in pins}) != _PAIR_SLOT_COUNT:
-        return (
-            frozenset(),
-            BLOCKED_PAIR_AUTHORITY_UNAVAILABLE,
-            "this lane's declared slots repeat an assigned name, so they do not describe two "
-            "distinct processes",
-        )
-    if len({pin.role for pin in pins}) != _PAIR_SLOT_COUNT:
-        return (
-            frozenset(),
-            BLOCKED_PAIR_AUTHORITY_UNAVAILABLE,
-            "this lane's declared slots repeat a role; a pair is two DIFFERENT roles, and two "
-            "slots claiming the same one cannot both be authoritative",
-        )
-
-    live = {agent.name: agent for agent in getattr(view, "managed_agents", ())}
     store = HerdrIdentityAttestationStore(home=home)
+    agents = tuple(getattr(view, "managed_agents", ()))
     derived: set = set()
-    for pin in pins:
-        agent = live.get(pin.assigned_name)
-        try:
-            attested = store.read(pin.assigned_name)
-        except Exception:  # noqa: BLE001
-            attested = None
-        if agent is None and attested is None:
-            # Neither live nor holding a row here: this slot is genuinely gone, contributes
-            # nothing to the census, and excluding it would be a no-op. Not an error — but
-            # not counted as ours either.
-            continue
-        if agent is None or attested is None:
+    for pin in (pair.gateway, pair.worker):
+        name = pin.assigned_name
+        matches = [agent for agent in agents if agent.name == name]
+        if len(matches) > 1:
             return (
                 frozenset(),
                 BLOCKED_PAIR_IDENTITY_MISMATCH,
-                f"slot {pin.assigned_name!r} is "
-                + ("attested here but not live" if agent is None else "live but not attested here")
-                + ". The two sources disagree about this lane's own slot, so which live "
-                "processes belong to this lane cannot be established",
+                f"the live inventory holds {len(matches)} rows named {name!r}; which of them "
+                f"is this lane's slot cannot be decided, and guessing would exclude a "
+                f"stranger from the consumer census",
             )
+        try:
+            attested = store.read(name)
+        except Exception:  # noqa: BLE001
+            attested = None
+        if not matches or attested is None:
+            return (
+                frozenset(),
+                BLOCKED_PAIR_IDENTITY_MISMATCH,
+                f"this lane's declared {pin.role} slot {name!r} is "
+                + (
+                    "neither live nor attested here"
+                    if not matches and attested is None
+                    else "attested here but not live"
+                    if not matches
+                    else "live but not attested here"
+                )
+                + ". The rail closes BOTH slots of the exact pair, so a pair it cannot fully "
+                "locate is one it has not identified",
+            )
+        agent = matches[0]
+        # NOTE the axis names. `pin.provider` is joined against the live and attested `role`
+        # tokens, because those surfaces spell the provider there; `pin.role` is the
+        # gateway/worker slot and has no counterpart on either. Joining them to each other is
+        # the j#96911 F1 defect.
         axes = (
             (agent.workspace_id, workspace_id, "live workspace"),
             (agent.lane_id, lane, "live lane"),
-            (agent.role, pin.role, "live role"),
+            (agent.role, pin.provider, "live provider"),
             (agent.locator, pin.locator, "live locator"),
             (attested.workspace_id, workspace_id, "attested workspace"),
             (attested.lane_id, lane, "attested lane"),
-            (attested.role, pin.role, "attested role"),
+            (attested.role, pin.provider, "attested provider"),
             # j#96890 §2. Without this a STALE attestation row — same name, the locator of a
             # pane that no longer exists — would still qualify the slot as ours and remove a
             # live stranger from the census.
             (attested.locator, pin.locator, "attested locator"),
         )
-        # ``provider`` lives only on the declared pin: neither the herdr inventory row nor the
-        # attestation record carries it (measured, not assumed). It is therefore validated as
-        # part of the pair's distinctness above rather than joined here, and this note exists
-        # so the omission reads as a boundary of the available evidence, not an oversight.
         for observed, expected, axis in axes:
             if str(observed) != str(expected):
                 return (
                     frozenset(),
                     BLOCKED_PAIR_IDENTITY_MISMATCH,
-                    f"slot {pin.assigned_name!r} has {axis} {observed!r} where this lane's "
-                    f"declared pin says {expected!r}. A slot that cannot be proven to belong "
-                    f"to this lane is not excluded from the consumer census",
+                    f"slot {name!r} has {axis} {observed!r} where this lane's declared "
+                    f"{pin.role} pin says {expected!r}. A slot that cannot be proven to "
+                    f"belong to this lane is not excluded from the consumer census",
                 )
-        derived.add(pin.assigned_name)
+        derived.add(name)
     return frozenset(derived), "", ""
 
 

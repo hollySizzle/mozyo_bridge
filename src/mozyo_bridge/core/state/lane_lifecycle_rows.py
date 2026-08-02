@@ -28,7 +28,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Optional, Sequence
 
-from mozyo_bridge.core.state.lane_epoch import LANE_EPOCH_UNMINTED
+from mozyo_bridge.core.state.lane_epoch import LANE_EPOCH_UNMINTED, encode_lane_epoch
 from mozyo_bridge.core.state.lane_lifecycle_model import (
     BINDING_KIND_ISSUE,
     BINDING_KIND_PROJECT_GATEWAY,
@@ -171,7 +171,10 @@ def _insert_active_row(
             # minted. ``0`` is UNMINTED — deliberately not ``1``, which would be an epoch no
             # launch was ever handed and would let the lane's first resume compare against a
             # threshold nothing could have attested. Only the CAS into ``hibernated`` mints.
-            LANE_EPOCH_UNMINTED,
+            # Bound as canonical TEXT, not as the int: the column is NONE affinity, so an
+            # int bind would store storage class INTEGER and every later read would
+            # classify the row malformed (#14756 j#96911 F2).
+            encode_lane_epoch(LANE_EPOCH_UNMINTED),
         ),
     )
 

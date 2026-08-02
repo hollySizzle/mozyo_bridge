@@ -89,15 +89,25 @@ LANE_LIFECYCLE_COMPONENT = "lane_lifecycle"
 #: the writer/read matching contract: :mod:`...lane_release_observation`.
 #: v10 (Redmine #14756) adds ``lane_epoch`` — the MONOTONIC hibernate-generation counter the
 #: resume proof is bound to. It is minted by exactly one event (the disposition CAS INTO
-#: ``hibernated``) as ``lane_epoch = lane_epoch + 1`` evaluated against the row's OWN stored
-#: value, so no caller can supply, backdate or reconcile it — the defect shape that defeated
+#: ``hibernated``) from the row's OWN stored value, so no caller can supply, backdate or
+#: reconcile it — the defect shape that defeated
 #: the v8 timestamp and the pre-v9 caller-supplied pins alike. It is injected into a managed
 #: launch's process env and self-attested by the process that received it, and because a live
 #: process's env is immutable (POSIX) a pane that SURVIVED hibernate's release can only hold a
 #: pre-advance epoch. Unlike ``hibernated_at`` it is NEVER cleared on the way back to
 #: ``active``: resetting a counter re-mints epochs an earlier generation's processes still
-#: hold. A pre-v10 row migrates at ``0`` = never minted, which is reported UNAVAILABLE rather
-#: than used as a threshold. Semantics: :mod:`...lane_epoch`.
+#: hold. A pre-v10 row migrates at ``'0'`` = never minted, which is reported UNAVAILABLE
+#: rather than used as a threshold.
+#:
+#: The column is declared ``BLOB`` — i.e. NONE affinity — and holds CANONICAL DECIMAL TEXT,
+#: not an integer. That is a correctness requirement, not a style choice: under the original
+#: ``INTEGER`` affinity SQLite coerced ``'00'``, ``'+0'``, ``' 0 '``, ``'0.0'``, ``2.0``,
+#: ``False`` and ``True`` into integers on the way in, so every one of them read back as a
+#: legitimate counter and re-minted an epoch (measured; Redmine #14756 j#96911 F2). A Python
+#: type check cannot see a conversion that already happened underneath it, so the guarantee
+#: has to live in the storage class: the bytes written are the bytes returned. The CAS also
+#: matches on the raw bytes and ``typeof(lane_epoch) = 'text'``, so a concurrent writer that
+#: changed either the value or its type loses. Semantics: :mod:`...lane_epoch`.
 LANE_LIFECYCLE_SCHEMA_VERSION = 10
 #: The component shapes this build can read and write. ``1``–``9`` are migrated
 #: additively to ``10``; anything else — a newer version from a future build, or a foreign
@@ -150,7 +160,7 @@ CREATE TABLE IF NOT EXISTS {_TABLE} (
     lane_kind TEXT NOT NULL DEFAULT '',
     hibernated_at TEXT NOT NULL DEFAULT '',
     release_observation TEXT NOT NULL DEFAULT '',
-    lane_epoch INTEGER NOT NULL DEFAULT 0,
+    lane_epoch BLOB NOT NULL DEFAULT '0',
     PRIMARY KEY (repo_workspace_id, lane_id)
 )
 """
@@ -894,7 +904,7 @@ def ensure_lane_lifecycle_schema(path: Path) -> LifecycleSchemaOutcome:
             if "lane_epoch" not in current_columns:
                 conn.execute(
                     f"ALTER TABLE {_TABLE} "
-                    "ADD COLUMN lane_epoch INTEGER NOT NULL DEFAULT 0"
+                    "ADD COLUMN lane_epoch BLOB NOT NULL DEFAULT '0'"
                 )
             conn.execute(_OWNER_INDEX_SQL)
             conn.execute(_PROJECT_OWNER_INDEX_SQL)

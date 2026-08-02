@@ -119,7 +119,7 @@ class EpochIsMintedByTheStoreNotTheCaller(unittest.TestCase):
     def test_epoch_is_computed_from_the_stored_row_under_the_same_cas(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store, key = _hibernated_lane(tmp)
-            self.assertEqual(store.get(key).lane_epoch, 1)
+            self.assertEqual(store.get(key).lane_epoch, "1")
 
     def test_a_refused_cas_mints_nothing(self) -> None:
         # A stale-revision caller must not advance the counter: if it did, a losing racer
@@ -160,13 +160,13 @@ class EpochIsNeverResetOnTheWayBackToActive(unittest.TestCase):
             )
             awake = store.get(key)
             self.assertEqual(awake.hibernated_at, "")  # boundary in force: cleared
-            self.assertEqual(awake.lane_epoch, 1)  # counter: preserved
+            self.assertEqual(awake.lane_epoch, "1")  # counter: preserved
 
     def test_a_second_hibernate_advances_rather_than_restarting(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store, key = _hibernated_lane(tmp, cycles=2)
             rec = store.get(key)
-            self.assertEqual(rec.lane_epoch, 2)
+            self.assertEqual(rec.lane_epoch, "2")
             # The exact regression a reset would cause: the FIRST generation's panes hold
             # epoch 1, and after a reset-and-climb the requirement would be 1 again, so a
             # long-dead survivor would satisfy it.
@@ -183,7 +183,7 @@ class UnmintedIsAbsenceNotAThresholdOfZero(unittest.TestCase):
             key = LaneLifecycleKey(WS, LANE)
             store.declare_active(key, decision=_decision(), issue_id=ISSUE)
             rec = store.get(key)
-            self.assertEqual(rec.lane_epoch, LANE_EPOCH_UNMINTED)
+            self.assertEqual(rec.lane_epoch, "0")
             self.assertEqual(
                 required_resume_epoch(rec),
                 (LANE_EPOCH_UNMINTED, EPOCH_AUTHORITY_UNAVAILABLE),
@@ -252,10 +252,14 @@ class ForgedAndNonCanonicalTokensFailClosed(unittest.TestCase):
         self.assertEqual(parse_attested_epoch(True)[1], EPOCH_MALFORMED)
 
     def test_a_corrupt_stored_epoch_reads_as_unminted_not_as_a_threshold(self) -> None:
-        # SQLite is typeless, so a foreign writer can leave a REAL / TEXT in an INTEGER
-        # column. `int(2.5) == 2` would walk such a cell straight through the comparison
-        # (the #13689 trap), so the classifier requires an exact int both ways.
-        for corrupt in (2.5, "3", None, True):
+        # SQLite is typeless, so a foreign writer can leave any storage class in the column.
+        # `int(2.5) == 2` would walk such a cell straight through the comparison (the #13689
+        # trap), so the classifier accepts ONLY canonical decimal TEXT.
+        #
+        # `"3"` is deliberately NOT in this list any more: since j#96911 F2 the canonical
+        # storage form IS text, so `"3"` is a legitimate counter of three. It sat here while
+        # the column was INTEGER and would now assert the opposite of the contract.
+        for corrupt in (2.5, "03", " 3", "3.0", None, True, 3, b"3"):
             with self.subTest(corrupt=corrupt):
                 fake = type("Row", (), {"lane_epoch": corrupt})()
                 self.assertEqual(
@@ -564,7 +568,7 @@ class OldLifecycleRowsAreBlockedNotGuessed(unittest.TestCase):
                 conn.close()
             # Re-opening migrates v9 -> v10 additively; the epoch must arrive UNMINTED.
             rec = LaneLifecycleStore(home=Path(tmp)).get(key)
-            self.assertEqual(rec.lane_epoch, LANE_EPOCH_UNMINTED)
+            self.assertEqual(rec.lane_epoch, "0")
             self.assertEqual(
                 lane_epoch_verdict(rec, "1"), (False, EPOCH_AUTHORITY_UNAVAILABLE)
             )
@@ -587,7 +591,7 @@ class OldLifecycleRowsAreBlockedNotGuessed(unittest.TestCase):
                 conn.close()
             rec = LaneLifecycleStore(home=Path(tmp)).get(key)
             self.assertEqual(rec.lane_generation, 5)
-            self.assertEqual(rec.lane_epoch, LANE_EPOCH_UNMINTED)
+            self.assertEqual(rec.lane_epoch, "0")
 
 
 class TheEpochRefusalIsOnAnObservableBoundary(unittest.TestCase):
@@ -707,7 +711,7 @@ class TheLegacyNextRailIsActuallyExecutable(unittest.TestCase):
         )
         conn = sqlite3.connect(store.path)
         try:
-            conn.execute("UPDATE lane_lifecycle_records SET lane_epoch = 0")
+            conn.execute("UPDATE lane_lifecycle_records SET lane_epoch = '0'")
             conn.commit()
         finally:
             conn.close()
@@ -737,7 +741,7 @@ class TheLegacyNextRailIsActuallyExecutable(unittest.TestCase):
             )
             self.assertFalse(outcome.applied)
             self.assertEqual(outcome.reason, CAS_FORBIDDEN_TRANSITION)
-            self.assertEqual(store.get(key).lane_epoch, LANE_EPOCH_UNMINTED)
+            self.assertEqual(store.get(key).lane_epoch, "0")
 
     def test_adoption_mints_and_preserves_every_other_column(self) -> None:
         # WIP / identity / replay evidence must survive the rail intact (j#96836 action 3).
@@ -762,7 +766,7 @@ class TheLegacyNextRailIsActuallyExecutable(unittest.TestCase):
             )
             self.assertTrue(outcome.applied, outcome.reason)
             after = store.get(key)
-            self.assertEqual(after.lane_epoch, ADOPTED_LEGACY_EPOCH)
+            self.assertEqual(after.lane_epoch, str(ADOPTED_LEGACY_EPOCH))
             self.assertEqual({c: getattr(after, c) for c in preserved}, before)
 
     def test_adoption_does_not_admit_a_survivor(self) -> None:
@@ -805,7 +809,7 @@ class TheLegacyNextRailIsActuallyExecutable(unittest.TestCase):
                 key, expected_revision=rec.revision, issue_id=ISSUE, decision=_decision()
             )
             self.assertFalse(again.applied)
-            self.assertEqual(store.get(key).lane_epoch, 1)
+            self.assertEqual(store.get(key).lane_epoch, "1")
 
     def test_adoption_refuses_every_state_that_is_not_the_legacy_shape(self) -> None:
         from mozyo_bridge.core.state.lane_epoch_adoption import LaneEpochAdoptionStore
@@ -829,7 +833,7 @@ class TheLegacyNextRailIsActuallyExecutable(unittest.TestCase):
             store, key = _hibernated_lane(tmp)
             conn = sqlite3.connect(store.path)
             try:
-                conn.execute("UPDATE lane_lifecycle_records SET lane_epoch = 0")
+                conn.execute("UPDATE lane_lifecycle_records SET lane_epoch = '0'")
                 conn.commit()
             finally:
                 conn.close()
@@ -913,7 +917,7 @@ class ConditionalCSplitsOnTheAuthorityFactNotCallerIntent(unittest.TestCase):
             key = LaneLifecycleKey(WS, LANE)
             store.declare_active(key, decision=_decision(), issue_id=ISSUE)
             rec = store.get(key)
-            self.assertEqual(rec.lane_epoch, LANE_EPOCH_UNMINTED)
+            self.assertEqual(rec.lane_epoch, "0")
             self.assertTrue(self._store_verdict(1, lane_epoch=0).ok)  # heal: allowed
             self.assertEqual(  # resume: still refused
                 lane_epoch_verdict(rec, "1"), (False, EPOCH_AUTHORITY_UNAVAILABLE)
@@ -1508,7 +1512,7 @@ class TheLegacyRecoveryPlanRefusesBeforeItCloses(unittest.TestCase):
             # The single column a pre-v10 build would not have had, plus the absent release
             # observation the real row carries.
             conn.execute(
-                "UPDATE lane_lifecycle_records SET lane_epoch = 0, release_observation = ''"
+                "UPDATE lane_lifecycle_records SET lane_epoch = '0', release_observation = ''"
             )
             conn.commit()
         finally:
@@ -1519,13 +1523,18 @@ class TheLegacyRecoveryPlanRefusesBeforeItCloses(unittest.TestCase):
     def _pair_pins(cls):
         from mozyo_bridge.core.state.lane_declared_slots import ProcessGenerationPin
 
+        # The ACTUAL #14755 shape (j#96911 F1): the declared `role` is the gateway/worker
+        # SLOT, and `provider` is codex/claude. The live inventory row and the startup
+        # attestation both spell the PROVIDER in their own `role` token. The previous fixture
+        # set role == provider, which made a join of the wrong two axes look correct and hid
+        # the defect that made the real dry-run unreachable.
         return (
             ProcessGenerationPin(
-                role="claude", provider="claude", assigned_name="pair-worker",
+                role="worker", provider="claude", assigned_name="pair-worker",
                 locator="%10",
             ),
             ProcessGenerationPin(
-                role="codex", provider="codex", assigned_name="pair-gateway",
+                role="gateway", provider="codex", assigned_name="pair-gateway",
                 locator="%11",
             ),
         )
@@ -1541,7 +1550,7 @@ class TheLegacyRecoveryPlanRefusesBeforeItCloses(unittest.TestCase):
             row = store.get(key)
             self.assertEqual(row.release_observation, "")
             self.assertTrue(row.declared_slots)
-            self.assertEqual(row.lane_epoch, 0)
+            self.assertEqual(row.lane_epoch, "0")
 
     def _ready_world(self, tmp):
         """A legacy lane whose own pair is live+attested and nothing else is."""
@@ -1550,9 +1559,10 @@ class TheLegacyRecoveryPlanRefusesBeforeItCloses(unittest.TestCase):
         store, key = self._legacy_lane_with_pins(tmp, pins)
         agents = []
         for pin in pins:
-            self._attest(home, pin.assigned_name, role=pin.role, locator=pin.locator)
+            # live + attestation carry the PROVIDER in their `role` token, not the slot role.
+            self._attest(home, pin.assigned_name, role=pin.provider, locator=pin.locator)
             agents.append(
-                self._agent(pin.assigned_name, role=pin.role, locator=pin.locator)
+                self._agent(pin.assigned_name, role=pin.provider, locator=pin.locator)
             )
         return home, store, key, pins, agents
 
@@ -1824,14 +1834,17 @@ class TheLegacyRecoveryPlanRefusesBeforeItCloses(unittest.TestCase):
             self.assertEqual(plan.state, BLOCKED_PAIR_IDENTITY_MISMATCH)
             self.assertEqual(plan.target_slots, ())  # nothing partial is offered
 
-    def test_a_pair_that_is_entirely_gone_derives_an_empty_set_without_refusing(
-        self,
-    ) -> None:
-        # The other side of the same rule: when NEITHER slot is live or attested, there is no
-        # half-answer — the pair is simply absent from the census, so there is nothing to
-        # subtract and nothing to be wrong about.
+    def test_a_pair_that_cannot_be_fully_located_refuses(self) -> None:
+        """j#96911: both-absent is a refusal too, not an empty derivation.
+
+        I first wrote this the other way round — neither slot live, therefore nothing to
+        subtract, therefore ``plan_ready`` — on the argument that an empty exclusion set is
+        harmless. It is harmless to the census and wrong for the rail: step 2 closes BOTH
+        slots of the exact pair, so a pair the rail cannot locate is a pair it has not
+        identified, and proceeding would plan a close against slots nobody has resolved.
+        """
         from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application.lane_epoch_legacy_recovery_plan import (  # noqa: E501
-            PLAN_READY,
+            BLOCKED_PAIR_IDENTITY_MISMATCH,
             plan_lane_epoch_legacy_recovery,
         )
 
@@ -1843,7 +1856,7 @@ class TheLegacyRecoveryPlanRefusesBeforeItCloses(unittest.TestCase):
                 issue_id=ISSUE, expected_revision=store.get(key).revision,
                 decision=_decision(),
             )
-            self.assertEqual(plan.state, PLAN_READY)
+            self.assertEqual(plan.state, BLOCKED_PAIR_IDENTITY_MISMATCH)
             self.assertEqual(plan.target_slots, ())
 
     def test_a_stale_attestation_locator_does_not_qualify_a_slot_as_ours(self) -> None:
@@ -1894,13 +1907,20 @@ class TheLegacyRecoveryPlanRefusesBeforeItCloses(unittest.TestCase):
             # Re-mint: epoch 1, so the lane is NOT the legacy shape any more.
             conn = sqlite3.connect(store.path)
             try:
-                conn.execute("UPDATE lane_lifecycle_records SET lane_epoch = 1")
+                conn.execute("UPDATE lane_lifecycle_records SET lane_epoch = '1'")
                 conn.commit()
             finally:
                 conn.close()
+            agents = []
+            for pin in pins:  # the lane's own pair stays locatable
+                self._attest(home, pin.assigned_name, role=pin.provider, locator=pin.locator)
+                agents.append(
+                    self._agent(pin.assigned_name, role=pin.provider, locator=pin.locator)
+                )
             self._attest(home, "foreign", locator="%99")
+            agents.append(self._agent("foreign", locator="%99"))
             plan = plan_lane_epoch_legacy_recovery(
-                home=home, view=self._view(agents=[self._agent("foreign", locator="%99")]),
+                home=home, view=self._view(agents=agents),
                 workspace_id=WS, lane=LANE, issue_id=ISSUE,
                 expected_revision=store.get(key).revision, decision=_decision(),
             )
@@ -1920,12 +1940,18 @@ class TheLegacyRecoveryPlanRefusesBeforeItCloses(unittest.TestCase):
             store, key = self._legacy_lane_with_pins(tmp, self._pair_pins())
             conn = sqlite3.connect(store.path)
             try:
-                conn.execute("UPDATE lane_lifecycle_records SET lane_epoch = 1")
+                conn.execute("UPDATE lane_lifecycle_records SET lane_epoch = '1'")
                 conn.commit()
             finally:
                 conn.close()
+            agents = []
+            for pin in self._pair_pins():  # locatable pair, empty census
+                self._attest(home, pin.assigned_name, role=pin.provider, locator=pin.locator)
+                agents.append(
+                    self._agent(pin.assigned_name, role=pin.provider, locator=pin.locator)
+                )
             plan = plan_lane_epoch_legacy_recovery(
-                home=home, view=self._view(agents=()), workspace_id=WS, lane=LANE,
+                home=home, view=self._view(agents=agents), workspace_id=WS, lane=LANE,
                 issue_id=ISSUE, expected_revision=store.get(key).revision,
                 decision=_decision(),
             )
@@ -2166,7 +2192,13 @@ class AMalformedStoredEpochIsNeverLaunderedIntoZero(unittest.TestCase):
     whole issue exists to close.
     """
 
-    MALFORMED = ("corrupt", -7, 2.5, True, False, None)
+    #: Every shape the column must refuse. The last seven are the ones j#96911 F2 added:
+    #: under the original INTEGER affinity SQLite coerced them to integers before any Python
+    #: check could run, so they read back as legitimate counters and re-minted an epoch.
+    MALFORMED = (
+        "corrupt", "-7", "2.5", "00", "+0", " 0 ", "0.0", "", "7_0",
+        -7, 2.5, 0, 1, True, False, None, b"0",
+    )
 
     def test_the_classifier_separates_malformed_from_zero(self) -> None:
         from mozyo_bridge.core.state.lane_epoch import (
@@ -2179,8 +2211,8 @@ class AMalformedStoredEpochIsNeverLaunderedIntoZero(unittest.TestCase):
         for value in self.MALFORMED:
             with self.subTest(value=value):
                 self.assertEqual(classify_stored_epoch(value)[1], EPOCH_STORED_MALFORMED)
-        self.assertEqual(classify_stored_epoch(0)[1], EPOCH_STORED_UNMINTED)
-        self.assertEqual(classify_stored_epoch(3), (3, EPOCH_STORED_MINTED))
+        self.assertEqual(classify_stored_epoch("0")[1], EPOCH_STORED_UNMINTED)
+        self.assertEqual(classify_stored_epoch("3"), (3, EPOCH_STORED_MINTED))
 
     def test_a_hibernate_transition_never_mints_from_a_malformed_counter(self) -> None:
         from mozyo_bridge.core.state.lane_epoch import lane_epoch_on_transition
@@ -2194,10 +2226,10 @@ class AMalformedStoredEpochIsNeverLaunderedIntoZero(unittest.TestCase):
                 )
         # The valid cases still advance, or the guard would just be an outage.
         self.assertEqual(
-            lane_epoch_on_transition(0, target="hibernated", hibernated="hibernated"), 1
+            lane_epoch_on_transition("0", target="hibernated", hibernated="hibernated"), "1"
         )
         self.assertEqual(
-            lane_epoch_on_transition(7, target="hibernated", hibernated="hibernated"), 8
+            lane_epoch_on_transition("7", target="hibernated", hibernated="hibernated"), "8"
         )
 
     def test_a_non_hibernate_transition_does_not_normalise_a_malformed_counter(
@@ -2216,7 +2248,7 @@ class AMalformedStoredEpochIsNeverLaunderedIntoZero(unittest.TestCase):
                     )
                 )
         self.assertEqual(
-            lane_epoch_on_transition(5, target="active", hibernated="hibernated"), 5
+            lane_epoch_on_transition("5", target="active", hibernated="hibernated"), "5"
         )
 
     def test_the_read_side_still_fails_closed_rather_than_raising(self) -> None:
@@ -2236,7 +2268,7 @@ class AMalformedStoredEpochIsNeverLaunderedIntoZero(unittest.TestCase):
         j#96881 asks for both, and they are different claims: the pure function can refuse
         while the CAS still writes, if the caller ignores the refusal.
         """
-        for value in ("corrupt", -7, 2.5):
+        for value in ("corrupt", "-7", "2.5", "00", "+0", " 0 ", "0.0", 2.0, 0, 1, True, False, b"0"):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as tmp:
                 store = LaneLifecycleStore(home=pathlib.Path(tmp))
                 key = LaneLifecycleKey(WS, LANE)
@@ -2287,9 +2319,14 @@ class AMalformedStoredEpochIsNeverLaunderedIntoZero(unittest.TestCase):
 
         for value, expected in (
             ("corrupt", CAS_FORBIDDEN_TRANSITION),
-            (-7, CAS_FORBIDDEN_TRANSITION),
-            (2.5, CAS_FORBIDDEN_TRANSITION),
-            (1, CAS_UNEXPECTED_STATE),  # already minted
+            ("-7", CAS_FORBIDDEN_TRANSITION),
+            ("2.5", CAS_FORBIDDEN_TRANSITION),
+            ("00", CAS_FORBIDDEN_TRANSITION),
+            ("0.0", CAS_FORBIDDEN_TRANSITION),
+            (0, CAS_FORBIDDEN_TRANSITION),      # storage class INTEGER, not canonical TEXT
+            (True, CAS_FORBIDDEN_TRANSITION),
+            (b"0", CAS_FORBIDDEN_TRANSITION),
+            ("1", CAS_UNEXPECTED_STATE),        # already minted
         ):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as tmp:
                 store, key = (
@@ -2327,7 +2364,7 @@ class AMalformedStoredEpochIsNeverLaunderedIntoZero(unittest.TestCase):
                 key, expected_revision=rec.revision, issue_id=ISSUE, decision=_decision()
             )
             self.assertTrue(outcome.applied)
-            self.assertEqual(store.get(key).lane_epoch, 1)
+            self.assertEqual(store.get(key).lane_epoch, "1")
 
 
 class ExistingFencesAreNotWeakened(unittest.TestCase):

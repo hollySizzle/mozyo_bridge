@@ -111,10 +111,15 @@ _COLUMN_DEFS: dict[str, tuple[str, int, Optional[str], int]] = {
     "lane_kind": ("TEXT", 1, "''", 0),
     "hibernated_at": ("TEXT", 1, "''", 0),
     "release_observation": ("TEXT", 1, "''", 0),
-    # #14756: the monotonic hibernate-generation epoch. INTEGER (not TEXT) because the
-    # STORE derives it — ``lane_epoch = lane_epoch + 1`` inside the hibernate CAS — and no
-    # caller ever supplies a value that would have to be parsed. ``0`` is the migration
-    # default and means NO EPOCH HAS EVER BEEN MINTED for this lane; it is never a
-    # substitute boundary (see :mod:`...lane_epoch`).
-    "lane_epoch": ("INTEGER", 1, "0", 0),
+    # #14756: the monotonic hibernate-generation epoch, stored as CANONICAL DECIMAL TEXT in
+    # a BLOB (i.e. NONE affinity) column. The declared type is load-bearing and was measured:
+    # under the INTEGER affinity this first used, SQLite coerced ``'00'``, ``'+0'``, ``' 0 '``,
+    # ``'0.0'``, ``2.0``, ``False`` and ``True`` into integers on the way in, so each read back
+    # as a legitimate counter and re-minted an epoch — a rollback that re-issues a value a
+    # released generation may still hold (j#96911 F2). No Python predicate can reject a
+    # conversion that already happened, so the storage class is the guarantee: the bytes
+    # written are the bytes returned, and the CAS matches on both the bytes and
+    # ``typeof(lane_epoch) = 'text'``. ``'0'`` is the migration default and means NO EPOCH HAS
+    # EVER BEEN MINTED; it is never a substitute boundary (see :mod:`...lane_epoch`).
+    "lane_epoch": ("BLOB", 1, "'0'", 0),
 }

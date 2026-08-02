@@ -53,6 +53,7 @@ from typing import Optional
 
 from mozyo_bridge.core.state.lane_epoch import (
     EPOCH_STORED_MALFORMED,
+    encode_lane_epoch,
     EPOCH_STORED_UNMINTED,
     classify_stored_epoch,
 )
@@ -61,6 +62,7 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     CAS_APPLIED,
     CAS_FORBIDDEN_TRANSITION,
     CAS_NOT_FOUND,
+    CAS_STALE_REVISION,
     CAS_UNEXPECTED_STATE,
     DISPOSITION_HIBERNATED,
     RELEASE_RELEASED,
@@ -210,6 +212,7 @@ class LaneEpochAdoptionStore:
                 conn.execute("ROLLBACK")
                 return refusal
             revision = current.revision + 1
+            changes_before = conn.total_changes
             # ``lane_epoch``, the decision anchor and the revision are the ONLY columns this
             # writes. Everything the lane's identity, WIP and replay evidence depend on is
             # absent from this UPDATE and therefore preserved (j#96836 required action 3).
@@ -217,9 +220,10 @@ class LaneEpochAdoptionStore:
                 f"UPDATE {_TABLE} SET lane_epoch = ?, revision = ?, "
                 "decision_source = ?, decision_issue_id = ?, decision_journal = ?, "
                 "updated_at = ? "
-                "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ?",
+                "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ? "
+                "AND lane_epoch IS ? AND typeof(lane_epoch) = 'text'",
                 (
-                    ADOPTED_LEGACY_EPOCH,
+                    encode_lane_epoch(ADOPTED_LEGACY_EPOCH),
                     revision,
                     decision.source,
                     decision.issue_id,
@@ -228,8 +232,16 @@ class LaneEpochAdoptionStore:
                     key.repo_workspace_id,
                     key.lane_id,
                     current.revision,
+                    current.lane_epoch,
                 ),
             )
+            if conn.total_changes == changes_before:
+                # A concurrent writer changed the epoch bytes or their storage class between
+                # the guarded read and this write. Zero-write refusal (#14756 j#96911 F2).
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False, reason=CAS_STALE_REVISION, revision=current.revision
+                )
             conn.execute("COMMIT")
             return CasOutcome(applied=True, reason=CAS_APPLIED, revision=revision)
         except sqlite3.DatabaseError as exc:
