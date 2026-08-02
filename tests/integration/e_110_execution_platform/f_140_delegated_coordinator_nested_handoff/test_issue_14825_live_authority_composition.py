@@ -85,6 +85,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_live_authority import (  # noqa: E501
     LaneCallbackScope,
+    live_cleanup_callback_scope,
     live_lane_callback_scope,
     unresolved_lane_callback_debt,
 )
@@ -405,6 +406,9 @@ class LaneCallbackDebtTest(unittest.TestCase):
             def get(self, key):
                 return Record()
 
+            def records(self):
+                return (Record(),)
+
         scope = live_lane_callback_scope(
             Store(),
             workspace_id=WS,
@@ -435,9 +439,131 @@ class LaneCallbackDebtTest(unittest.TestCase):
             def get(self, key):
                 return Record()
 
+            def records(self):
+                return (Record(),)
+
         self.assertIsNone(
             live_lane_callback_scope(
                 Store(),
+                workspace_id=WS,
+                issue=ISSUE,
+                lane=LANE,
+                lane_generation=GEN,
+            )
+        )
+
+        cleanup_scope = live_cleanup_callback_scope(
+            Store(),
+            workspace_id=WS,
+            issue=ISSUE,
+            lane=LANE,
+            lane_generation=GEN,
+        )
+        self.assertEqual(cleanup_scope, LaneCallbackScope(WS, ISSUE, LANE, GEN, 9))
+
+    def test_cleanup_scope_refuses_stale_or_non_cleanup_dispositions(self) -> None:
+        class Owner:
+            resolved = True
+            lane_id = LANE
+
+        class Store:
+            disposition = DISPOSITION_HIBERNATED
+            generation = GEN
+
+            def resolve_owner(self, workspace, issue):
+                return Owner()
+
+            def get(self, key):
+                return type(
+                    "Record",
+                    (),
+                    {
+                        "repo_workspace_id": WS,
+                        "lane_id": LANE,
+                        "issue_id": ISSUE,
+                        "binding_kind": "issue",
+                        "lane_disposition": self.disposition,
+                        "lane_generation": self.generation,
+                        "revision": 9,
+                    },
+                )()
+
+            def records(self):
+                return (self.get(None),)
+
+        store = Store()
+        store.generation = GEN + 1
+        self.assertIsNone(
+            live_cleanup_callback_scope(
+                store,
+                workspace_id=WS,
+                issue=ISSUE,
+                lane=LANE,
+                lane_generation=GEN,
+            )
+        )
+        store.generation = GEN
+        for disposition in (" hibernated", "retired", "future"):
+            with self.subTest(disposition=disposition):
+                store.disposition = disposition
+                self.assertIsNone(
+                    live_cleanup_callback_scope(
+                        store,
+                        workspace_id=WS,
+                        issue=ISSUE,
+                        lane=LANE,
+                        lane_generation=GEN,
+                    )
+                )
+
+    def test_cleanup_scope_requires_one_readable_exact_owner(self) -> None:
+        def record(*, workspace=WS, lane=LANE, revision=9):
+            return type(
+                "Record",
+                (),
+                {
+                    "repo_workspace_id": workspace,
+                    "lane_id": lane,
+                    "issue_id": ISSUE,
+                    "binding_kind": "issue",
+                    "lane_disposition": DISPOSITION_HIBERNATED,
+                    "lane_generation": GEN,
+                    "revision": revision,
+                },
+            )()
+
+        class Store:
+            rows = (record(),)
+
+            def records(self):
+                return self.rows
+
+        store = Store()
+        refused_rows = (
+            (record(), record(workspace="other-workspace", lane="other-lane")),
+            (record(workspace="other-workspace", lane="other-lane"),),
+            (record(revision="09"),),
+        )
+        for rows in refused_rows:
+            with self.subTest(rows=rows):
+                store.rows = rows
+                self.assertIsNone(
+                    live_cleanup_callback_scope(
+                        store,
+                        workspace_id=WS,
+                        issue=ISSUE,
+                        lane=LANE,
+                        lane_generation=GEN,
+                    )
+                )
+
+        class Unreadable:
+            def records(self):
+                raise OSError("unreadable")
+
+        self.assertIsNone(
+            live_cleanup_callback_scope(
+                Unreadable(),
                 workspace_id=WS,
                 issue=ISSUE,
                 lane=LANE,

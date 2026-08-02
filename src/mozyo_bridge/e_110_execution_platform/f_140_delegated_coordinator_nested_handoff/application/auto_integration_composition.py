@@ -73,6 +73,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_live_authority import (  # noqa: E501
     LiveDurableAuthorityReader,
+    live_cleanup_callback_scope,
     live_lane_callback_scope,
     unresolved_lane_callback_debt,
 )
@@ -431,6 +432,20 @@ def build_auto_integration_use_case(
             unresolved_lane_callback_debt(
                 callback_outbox,
                 scope=live_lane_callback_scope(
+                    store,
+                    workspace_id=binding.workspace,
+                    issue=binding.issue,
+                    lane=binding.lane,
+                    lane_generation=binding.lane_generation,
+                ),
+            )
+            if callback_outbox is not None
+            else None
+        ),
+        cleanup_callback_debt_fn=lambda: (
+            unresolved_lane_callback_debt(
+                callback_outbox,
+                scope=live_cleanup_callback_scope(
                     store,
                     workspace_id=binding.workspace,
                     issue=binding.issue,

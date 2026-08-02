@@ -669,6 +669,14 @@ publish したか) だけを問う。
 初めて managed process を閉じる。authority 欠落・不一致・read failure・CAS drift は zero-close であり、既に
 `hibernated` の retry は transition を再実行せず既存 release generation をそのまま継続する。
 
+callback authority は integration と cleanup で同じ scope を誤共有しない。integration action は従来どおり
+**active-only**。cleanup は exact workspace / lane / issue / lane generation の `active`、またはcleanup/hibernateの
+guarded CASが残したbyte-exactな `hibernated` rowに限り、その **current lifecycle revision** でdebtを再読する。
+これによりstep完了後のfresh preflightと、CAS後crashをreconcileしたretryが自己失効せず収束する一方、foreign / stale /
+ambiguous / unreadable、padded・unknown・`retired` dispositionはscope不明のままfail-closedになる。hibernated CASは
+active revisionに対するcallback drainを通過したdurable boundaryであり、旧revision宛てのcallbackをcurrent workへ
+再昇格させない。
+
 ### 非同期 CI は待たずに継続する (item 3)
 
 `AsyncCiContinuation` は同じ action record で `run_integration` を再入する。通常 owner / trigger は production

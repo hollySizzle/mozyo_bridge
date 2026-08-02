@@ -20,6 +20,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from mozyo_bridge.core.state.callback_outbox import CallbackOutbox
 from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_HIBERNATED,
     RELEASE_RELEASED,
@@ -47,6 +48,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ports import (  # noqa: E501
     CleanupAuthority,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_reconcile import (  # noqa: E501
+    RECONCILED_NOT_LANDED,
+    StrandedCleanupReconciler,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ledger import (  # noqa: E501
     AutoIntegrationLedgerError,
 )
@@ -63,6 +68,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     IntegrationActionRecord,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.retirement_cleanup_policy import (  # noqa: E501
+    STATE_RETIRED,
     CleanupActionRecord,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_candidate import (  # noqa: E501
@@ -632,7 +638,7 @@ class DeclaredIntegrationBranchTest(unittest.TestCase):
                     ci_workflow="Test",
                 )
 
-    def test_production_composition_wires_fresh_cleanup_authority_into_release(self) -> None:
+    def _production_cleanup_fixture(self, home: Path):
         local_generation = 1
 
         class Inventory:
@@ -653,82 +659,144 @@ class DeclaredIntegrationBranchTest(unittest.TestCase):
                     {"closed": (), "failed": (), "foreign_names": ()},
                 )()
 
+        store = LaneLifecycleStore(home=home)
+        key = LaneLifecycleKey(WS, LANE)
+        store.declare_active(
+            key,
+            issue_id=ISSUE,
+            decision=DecisionPointer(
+                source="redmine", issue_id=ISSUE, journal_id="96589"
+            ),
+        )
+        inventory = Inventory()
+        admitted = _action(lane_generation=local_generation)
+        journals = [
+            _journal(
+                REQ,
+                _request_note(),
+                ISSUER_REVIEW_GATEWAY,
+                gen=local_generation,
+            ),
+            _journal(
+                "96510",
+                _review_note(gen=local_generation),
+                ISSUER_REVIEW_GATEWAY,
+                gen=local_generation,
+            ),
+        ]
+        with mock.patch(
+            "mozyo_bridge.e_110_execution_platform."
+            "f_140_delegated_coordinator_nested_handoff.application."
+            "auto_integration_composition.live_journal_reader",
+            return_value=lambda issue: journals,
+        ):
+            use_case = build_auto_integration_use_case(
+                binding=LaneBinding(
+                    issue=ISSUE,
+                    workspace=WS,
+                    lane=LANE,
+                    lane_generation=local_generation,
+                    branch="issue_14825",
+                    worktree="/tmp/wt",
+                ),
+                config=AutoIntegrationConfig(
+                    mode="auto", integration_branch=TARGET_REF
+                ),
+                repo_root=Path("."),
+                lifecycle_store=store,
+                inventory_ops=inventory,
+                callback_outbox=CallbackOutbox(home=home),
+                admission_record=admitted,
+                home=home,
+            )
+        cleanup = CleanupActionRecord(
+            issue=ISSUE,
+            lane_generation=local_generation,
+            branch="issue_14825",
+            worktree_path="/tmp/wt",
+            recorded_source_head=SOURCE,
+            integration_action_key=admitted.action_key,
+        )
+        return use_case, store, key, inventory, admitted, cleanup
+
+    @staticmethod
+    def _fresh_cleanup_authority(use_case, admitted):
+        debt_reader = use_case.authority.cleanup_callback_debt_fn
+        debt = debt_reader() if debt_reader is not None else None
+        return CleanupAuthority(
+            issue_closed=True,
+            integration_confirmed=True,
+            integration_ci_settled_green=True,
+            callbacks_drained=debt == 0,
+            owner_gates_resolved=True,
+            authorizing_action_key=admitted.action_key,
+            lifecycle_decision_journal="96790",
+        )
+
+    def test_production_run_cleanup_reaches_retired_after_hibernating(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp)
-            store = LaneLifecycleStore(home=home)
-            key = LaneLifecycleKey(WS, LANE)
-            store.declare_active(
-                key,
-                issue_id=ISSUE,
-                decision=DecisionPointer(
-                    source="redmine", issue_id=ISSUE, journal_id="96589"
-                ),
+            use_case, store, key, inventory, admitted, cleanup = (
+                self._production_cleanup_fixture(Path(tmp))
             )
-            inventory = Inventory()
-            admitted = _action(lane_generation=local_generation)
-            journals = [
-                _journal(
-                    REQ,
-                    _request_note(),
-                    ISSUER_REVIEW_GATEWAY,
-                    gen=local_generation,
-                ),
-                _journal(
-                    "96510",
-                    _review_note(gen=local_generation),
-                    ISSUER_REVIEW_GATEWAY,
-                    gen=local_generation,
-                ),
-            ]
-            with mock.patch(
-                "mozyo_bridge.e_110_execution_platform."
-                "f_140_delegated_coordinator_nested_handoff.application."
-                "auto_integration_composition.live_journal_reader",
-                return_value=lambda issue: journals,
-            ):
-                use_case = build_auto_integration_use_case(
-                    binding=LaneBinding(
-                        issue=ISSUE,
-                        workspace=WS,
-                        lane=LANE,
-                        lane_generation=local_generation,
-                        branch="issue_14825",
-                        worktree="/tmp/wt",
-                    ),
-                    config=AutoIntegrationConfig(
-                        mode="auto", integration_branch=TARGET_REF
-                    ),
-                    repo_root=Path("."),
-                    lifecycle_store=store,
-                    inventory_ops=inventory,
-                    callback_outbox=object(),
-                    admission_record=admitted,
-                    home=home,
-                )
-            current = CleanupAuthority(
-                issue_closed=True,
-                integration_confirmed=True,
-                integration_ci_settled_green=True,
-                callbacks_drained=True,
-                owner_gates_resolved=True,
-                authorizing_action_key=admitted.action_key,
-                lifecycle_decision_journal="96790",
-            )
+
             with mock.patch.object(
                 LiveDurableAuthorityReader,
                 "read_cleanup_authority",
-                return_value=current,
+                side_effect=lambda **kwargs: self._fresh_cleanup_authority(
+                    use_case, admitted
+                ),
             ) as fresh_read:
-                outcome = use_case.processes.describe_release(
-                    issue=ISSUE, lane_generation=local_generation
-                )
+                report = use_case.run_cleanup(cleanup)
 
-            self.assertTrue(outcome.released, outcome.detail)
+            self.assertEqual(
+                report.final_decision.state, STATE_RETIRED, report.final_decision
+            )
             self.assertEqual(store.get(key).lane_disposition, DISPOSITION_HIBERNATED)
             self.assertEqual(store.get(key).process_release, RELEASE_RELEASED)
             self.assertEqual(store.get(key).decision.journal_id, "96790")
             self.assertEqual(len(inventory.closed), 1)
-            fresh_read.assert_called_once_with(record=mock.ANY)
+            self.assertIsNone(use_case.authority.callback_debt_fn())
+            self.assertEqual(use_case.authority.cleanup_callback_debt_fn(), 0)
+            self.assertGreaterEqual(fresh_read.call_count, 3)
+
+    def test_crash_after_hibernate_reconciles_and_retries_to_retired(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            use_case, store, key, inventory, admitted, cleanup = (
+                self._production_cleanup_fixture(Path(tmp))
+            )
+
+            with mock.patch.object(
+                LiveDurableAuthorityReader,
+                "read_cleanup_authority",
+                side_effect=lambda **kwargs: self._fresh_cleanup_authority(
+                    use_case, admitted
+                ),
+            ):
+                with mock.patch.object(
+                    store,
+                    "request_release",
+                    side_effect=RuntimeError("simulated process crash after lifecycle CAS"),
+                ):
+                    with self.assertRaises(RuntimeError):
+                        use_case.run_cleanup(cleanup)
+
+                stranded = use_case.ledger.unresolved_intents(
+                    action_key=cleanup.action_key
+                )
+                self.assertEqual(len(stranded), 1)
+                self.assertEqual(store.get(key).lane_disposition, DISPOSITION_HIBERNATED)
+                self.assertNotEqual(store.get(key).process_release, RELEASE_RELEASED)
+                reconciled = StrandedCleanupReconciler(use_case=use_case).reconcile(
+                    cleanup
+                )
+                self.assertEqual(reconciled.status, RECONCILED_NOT_LANDED)
+                report = use_case.run_cleanup(cleanup)
+
+            self.assertEqual(
+                report.final_decision.state, STATE_RETIRED, report.final_decision
+            )
+            self.assertEqual(store.get(key).process_release, RELEASE_RELEASED)
+            self.assertEqual(len(inventory.closed), 1)
 
     def test_supersede_after_composition_is_zero_register_and_zero_event(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -791,6 +859,7 @@ class DeclaredIntegrationBranchTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             outbox = object()
             scope = LaneCallbackScope(WS, ISSUE, LANE, GEN, 7)
+            cleanup_scope = LaneCallbackScope(WS, ISSUE, LANE, GEN, 8)
             with mock.patch(
                 "mozyo_bridge.e_110_execution_platform."
                 "f_140_delegated_coordinator_nested_handoff.application."
@@ -802,6 +871,11 @@ class DeclaredIntegrationBranchTest(unittest.TestCase):
                 "auto_integration_composition.live_lane_callback_scope",
                 return_value=scope,
             ) as live_scope, mock.patch(
+                "mozyo_bridge.e_110_execution_platform."
+                "f_140_delegated_coordinator_nested_handoff.application."
+                "auto_integration_composition.live_cleanup_callback_scope",
+                return_value=cleanup_scope,
+            ) as cleanup_live_scope, mock.patch(
                 "mozyo_bridge.e_110_execution_platform."
                 "f_140_delegated_coordinator_nested_handoff.application."
                 "auto_integration_composition.unresolved_lane_callback_debt",
@@ -826,6 +900,7 @@ class DeclaredIntegrationBranchTest(unittest.TestCase):
                     home=Path(tmp),
                 )
                 self.assertEqual(use_case.authority.callback_debt_fn(), 0)
+                self.assertEqual(use_case.authority.cleanup_callback_debt_fn(), 0)
             live_scope.assert_called_once_with(
                 mock.ANY,
                 workspace_id=WS,
@@ -833,7 +908,17 @@ class DeclaredIntegrationBranchTest(unittest.TestCase):
                 lane=LANE,
                 lane_generation=GEN,
             )
-            debt.assert_called_once_with(outbox, scope=scope)
+            cleanup_live_scope.assert_called_once_with(
+                mock.ANY,
+                workspace_id=WS,
+                issue=ISSUE,
+                lane=LANE,
+                lane_generation=GEN,
+            )
+            self.assertEqual(
+                debt.call_args_list,
+                [mock.call(outbox, scope=scope), mock.call(outbox, scope=cleanup_scope)],
+            )
 
 
 class ActionTimeFreshReadTest(unittest.TestCase):

@@ -85,6 +85,7 @@ from mozyo_bridge.core.state.workflow_runtime_store import (
 from mozyo_bridge.core.state.lane_lifecycle_model import (
     BINDING_KIND_ISSUE,
     DISPOSITION_ACTIVE,
+    DISPOSITION_HIBERNATED,
     LaneLifecycleKey,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_ci_source import (  # noqa: E501
@@ -196,6 +197,53 @@ def live_lane_callback_scope(
     generation fields sourced from this lifecycle record, so a construction-time snapshot would
     let a later owner switch or revision bump pass under stale callback authority.
     """
+    return _live_lane_callback_scope(
+        lifecycle_store,
+        workspace_id=workspace_id,
+        issue=issue,
+        lane=lane,
+        lane_generation=lane_generation,
+        admitted_dispositions=(DISPOSITION_ACTIVE,),
+    )
+
+
+def live_cleanup_callback_scope(
+    lifecycle_store: object,
+    *,
+    workspace_id: str,
+    issue: str,
+    lane: str,
+    lane_generation: int,
+) -> Optional[LaneCallbackScope]:
+    """Read the exact active/hibernated cleanup owner's current callback axes.
+
+    Integration authority remains active-only through :func:`live_lane_callback_scope`.
+    Cleanup is different: its one process step first leaves ``active`` under a fresh callback
+    gate and then must re-measure after the CAS, after a partial close, or after crash recovery.
+    A byte-exact ``hibernated`` row is that durable lifecycle boundary, so its current revision
+    is admissible for cleanup-only debt reads. Foreign, stale, ambiguous, malformed and retired
+    rows remain unreadable rather than being folded to zero debt.
+    """
+    return _live_lane_callback_scope(
+        lifecycle_store,
+        workspace_id=workspace_id,
+        issue=issue,
+        lane=lane,
+        lane_generation=lane_generation,
+        admitted_dispositions=(DISPOSITION_ACTIVE, DISPOSITION_HIBERNATED),
+    )
+
+
+def _live_lane_callback_scope(
+    lifecycle_store: object,
+    *,
+    workspace_id: str,
+    issue: str,
+    lane: str,
+    lane_generation: int,
+    admitted_dispositions: Tuple[str, ...],
+) -> Optional[LaneCallbackScope]:
+    """Shared exact resolver; callers choose the closed disposition vocabulary."""
     workspace = str(workspace_id or "")
     issue_id = str(issue or "")
     lane_id = str(lane or "")
@@ -211,12 +259,28 @@ def live_lane_callback_scope(
     ):
         return None
     try:
-        owner = lifecycle_store.resolve_owner(workspace, issue_id)
-        if not getattr(owner, "resolved", False):
-            return None
-        if str(getattr(owner, "lane_id", "") or "") != lane_id:
-            return None
-        record = lifecycle_store.get(LaneLifecycleKey(workspace, lane_id))
+        if DISPOSITION_HIBERNATED in admitted_dispositions:
+            # ``resolve_owner`` is active-owner authority and intentionally stops resolving once
+            # the cleanup CAS hibernates the row. Cleanup therefore proves uniqueness directly
+            # across the store before accepting that exact hibernated row; filtering to our
+            # workspace first would hide a duplicate foreign claimant.
+            records = lifecycle_store.records()
+            matches = [
+                candidate
+                for candidate in records
+                if str(getattr(candidate, "issue_id", "") or "") == issue_id
+                and getattr(candidate, "lane_generation", None) == wanted_generation
+            ]
+            if len(matches) != 1:
+                return None
+            record = matches[0]
+        else:
+            owner = lifecycle_store.resolve_owner(workspace, issue_id)
+            if not getattr(owner, "resolved", False):
+                return None
+            if str(getattr(owner, "lane_id", "") or "") != lane_id:
+                return None
+            record = lifecycle_store.get(LaneLifecycleKey(workspace, lane_id))
     except Exception:  # noqa: BLE001 - unreadable lifecycle authority is not a drained scope
         return None
     if (
@@ -225,7 +289,8 @@ def live_lane_callback_scope(
         or str(getattr(record, "lane_id", "") or "") != lane_id
         or str(getattr(record, "issue_id", "") or "") != issue_id
         or str(getattr(record, "binding_kind", "") or "") != BINDING_KIND_ISSUE
-        or str(getattr(record, "lane_disposition", "") or "") != DISPOSITION_ACTIVE
+        or str(getattr(record, "lane_disposition", "") or "")
+        not in admitted_dispositions
         or getattr(record, "lane_generation", None) != wanted_generation
     ):
         return None
@@ -354,6 +419,11 @@ class LiveDurableAuthorityReader:
     #: nothing — the same fail-closed direction as every other unwired port here. It is NOT
     #: optional in production; the composition root binds it.
     ci_verdict_fn: Optional[CiVerdictReader] = None
+    #: Cleanup alone may continue after its own guarded lifecycle CAS changed ``active`` to
+    #: ``hibernated``. Production supplies a cleanup-specific exact-scope reader; falling back
+    #: to the integration reader preserves compatibility for injected readers without silently
+    #: treating an unwired cleanup port as drained.
+    cleanup_callback_debt_fn: Optional[CallbackDebtReader] = None
 
     # -- integration -------------------------------------------------------
 
@@ -500,7 +570,7 @@ class LiveDurableAuthorityReader:
             # presence for the exact landed commit is the green; its absence is "not settled",
             # which is the same refusal and never a pass.
             integration_ci_settled_green=ci is not None,
-            callbacks_drained=self._callbacks_drained(),
+            callbacks_drained=self._cleanup_callbacks_drained(),
             owner_gates_resolved=self._owner_gates_resolved(journals),
             authorizing_action_key=self.authorizing_action_fn(record, proof_head),
             lifecycle_decision_journal=(integration.journal if confirmed else ""),
@@ -542,6 +612,11 @@ class LiveDurableAuthorityReader:
 
     def _callbacks_drained(self) -> bool:
         debt = self.callback_debt_fn()
+        return debt == 0
+
+    def _cleanup_callbacks_drained(self) -> bool:
+        reader = self.cleanup_callback_debt_fn or self.callback_debt_fn
+        debt = reader()
         return debt == 0
 
     def _owner_gates_resolved(self, journals: Sequence[EvidenceJournal]) -> bool:
@@ -622,5 +697,9 @@ __all__ = (
     "IntegrationBranchReader",
     "IssueClosedReader",
     "JournalReader",
+    "LaneCallbackScope",
     "LiveDurableAuthorityReader",
+    "live_cleanup_callback_scope",
+    "live_lane_callback_scope",
+    "unresolved_lane_callback_debt",
 )
