@@ -54,7 +54,7 @@ the claim to something outside the marker that can be audited:
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Mapping, Optional, Sequence, Tuple
 
 from .glance_integration_disposition import (
@@ -279,7 +279,7 @@ def _journal_int(journal_id: object) -> Optional[int]:
 
 
 @dataclass(frozen=True)
-class _Declaration:
+class EvidenceDeclaration:
     """The current declaration of one gate: its journal, its markers, and who wrote it."""
 
     journal: str = ""
@@ -290,6 +290,10 @@ class _Declaration:
     @property
     def exists(self) -> bool:
         return bool(self.journal)
+
+
+#: The pre-#14825 spelling. Kept so this module's own call sites read unchanged.
+_Declaration = EvidenceDeclaration
 
 
 def _markers_of(notes: str, gate: str) -> tuple:
@@ -307,9 +311,9 @@ def _markers_of(notes: str, gate: str) -> tuple:
     return strict_gate_markers(notes, gate, canonicalize=canonical_marker_value)
 
 
-def _latest_gate_declaration(
+def latest_gate_declaration(
     journals: Sequence[EvidenceJournal], *, gate: str
-) -> _Declaration:
+) -> EvidenceDeclaration:
     """The ``gate`` declaration in the HIGHEST-numbered journal that carries one (pure).
 
     Latest-wins by existence: a journal that declares the gate supersedes every earlier one, however
@@ -340,7 +344,11 @@ def _latest_gate_declaration(
     return _Declaration() if latest is None else latest[1]
 
 
-def _latest_disposition_declaration(journals: Sequence[EvidenceJournal]) -> _Declaration:
+#: The pre-#14825 spelling, kept for this module's own call sites.
+_latest_gate_declaration = latest_gate_declaration
+
+
+def latest_disposition_declaration(journals: Sequence[EvidenceJournal]) -> _Declaration:
     """The integration-disposition declaration of the latest journal that DECLARES one (pure).
 
     Supersession is decided by the glance's own fold, so the two surfaces agree on which journal is
@@ -363,6 +371,10 @@ def _latest_disposition_declaration(journals: Sequence[EvidenceJournal]) -> _Dec
             notes=journal.notes or "",
         )
     return _Declaration()
+
+
+#: The pre-#14825 spelling, kept for this module's own call sites.
+_latest_disposition_declaration = latest_disposition_declaration
 
 
 def _issuer_scope(conjunct: BasisConjunct) -> LaneEvidenceEnvelope:
@@ -606,6 +618,37 @@ def current_dogfood_delegation(
     return got if isinstance(got, HibernateEvidence) else None
 
 
+@dataclass(frozen=True)
+class ProducedConjuncts:
+    """What reading a set of conjunct keys off one issue's journals yielded (Redmine #14825).
+
+    The basis-shaped :class:`ProducedBasis` is this plus the basis name; the split exists because
+    the #13686 auto-integration actuator needs the SAME durable authorities — is the latest review
+    generation approved, and for which head; is the work recorded integrated — without declaring
+    itself a hibernate basis. Reading them through a second fold would be a second definition of
+    the review-generation correlation rule, which is exactly what this producer's own docstring
+    forbids (checkpoint j#86443 R2-F1 already caught a third one being written).
+    """
+
+    conjuncts: tuple[BasisConjunct, ...] = ()
+    gaps: tuple[EvidenceGap, ...] = ()
+    evidence_journals: Mapping[str, str] = field(default_factory=dict)
+
+    def conjunct(self, key: str) -> Optional[BasisConjunct]:
+        """The produced conjunct for ``key``, or ``None`` when it could not be produced."""
+        for produced in self.conjuncts:
+            if produced.key == key:
+                return produced
+        return None
+
+    def gap(self, key: str) -> Optional[EvidenceGap]:
+        """The typed reason ``key`` could not be produced, or ``None``."""
+        for missing in self.gaps:
+            if missing.key == key:
+                return missing
+        return None
+
+
 def produce_basis_conjuncts(
     journals: Sequence[EvidenceJournal],
     *,
@@ -616,21 +659,56 @@ def produce_basis_conjuncts(
 ) -> ProducedBasis:
     """Produce every conjunct ``basis`` requires from the issue's durable journals (pure).
 
+    A thin naming layer over :func:`produce_conjuncts`: it selects the conjunct keys the declared
+    basis requires and labels the result with the basis. Every rule lives in the shared function.
+    """
+    produced = produce_conjuncts(
+        journals,
+        keys=_BASIS_CONJUNCTS.get(basis, ()),
+        source_issue=source_issue,
+        push=push,
+        dogfood_receipts=dogfood_receipts,
+    )
+    return ProducedBasis(
+        basis=basis,
+        conjuncts=produced.conjuncts,
+        gaps=produced.gaps,
+        evidence_journals=produced.evidence_journals,
+    )
+
+
+def produce_conjuncts(
+    journals: Sequence[EvidenceJournal],
+    *,
+    keys: Sequence[str],
+    source_issue: str = "",
+    push: Optional[PushObservation] = None,
+    dogfood_receipts: Optional[Mapping[str, DogfoodReceipt]] = None,
+) -> ProducedConjuncts:
+    """Produce each requested conjunct from the issue's durable journals (pure).
+
     Each conjunct is read from its OWN authority's latest declaration, written by the actor that
     authority belongs to, and bound to the identity that evidence declares. Nothing here compares
-    against a candidate: T1 does that, so a mismatch surfaces as ``conjunct_anchor_mismatch``
-    instead of being absorbed by the producer.
+    against a candidate or an action: the caller does that, so a mismatch surfaces at the caller
+    as a mismatch instead of being absorbed by the producer.
 
     ``source_issue`` is the issue whose journals these are — the SCOPE of the read, not the
     candidate's anchor — and is used only to confirm that a release issue's dogfood receipt is about
     this issue. Passing the candidate's lane or head here would be the tautology the producer exists
     to avoid; passing the issue being read is not.
+
+    A key this producer has no rule for is a caller error rather than a silently empty result: it
+    yields no conjunct AND no gap, which would read as "nothing was asked", so it is refused.
     """
+    unknown = [key for key in keys if key not in _CONJUNCT_PROVENANCE]
+    if unknown:
+        raise ValueError(f"no conjunct producer for {sorted(unknown)!r}")
+
     conjuncts: list[BasisConjunct] = []
     gaps: list[EvidenceGap] = []
     evidence_journals: dict[str, str] = {}
 
-    for key in _BASIS_CONJUNCTS.get(basis, ()):
+    for key in keys:
         if key == CONJUNCT_COMMITS_PUSHED:
             if push is None:
                 gaps.append(EvidenceGap(key, GAP_PUSH_OBSERVATION_ABSENT))
@@ -722,8 +800,7 @@ def produce_basis_conjuncts(
         conjuncts.append(produced)
         evidence_journals[key] = declaration.journal
 
-    return ProducedBasis(
-        basis=basis,
+    return ProducedConjuncts(
         conjuncts=tuple(conjuncts),
         gaps=tuple(gaps),
         evidence_journals=evidence_journals,
@@ -733,10 +810,16 @@ def produce_basis_conjuncts(
 __all__ = (
     "DogfoodReceipt",
     "current_dogfood_delegation",
+    "EvidenceDeclaration",
     "EvidenceGap",
+    "GAP_EVIDENCE_ABSENT",
+    "latest_disposition_declaration",
+    "latest_gate_declaration",
     "MARKER_GATE_REVIEW_REQUEST",
     "MARKER_GATE_REVIEW_RESULT",
     "ProducedBasis",
+    "ProducedConjuncts",
     "PushObservation",
     "produce_basis_conjuncts",
+    "produce_conjuncts",
 )

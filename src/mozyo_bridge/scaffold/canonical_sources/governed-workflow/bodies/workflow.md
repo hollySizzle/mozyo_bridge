@@ -425,8 +425,50 @@ origin到達可能性:
     - owner_close_approval / Close gate は origin 到達不能な commit hash では成立しない
     - local-only commit に対する close は invalid。reopen + correction journal を起票する
   禁止:
-    - 自動 push/pull 機構の導入。push は実装者の明示操作のままとし、gate 検証は read-only な到達性確認に限る
-    - 自動 merge / auto-integration 機構の導入。統合は coordinator の明示操作と integration journal 記録のままとする
+    - 実装者による integration branch への push (手動・自動を問わない)。実装者の push は issue / lane branch に限り、gate 検証は read-only な到達性確認に限る
+    - gate を満たさない統合。coordinator-owned であっても、下記 `coordinator_owned_auto_integration` の gate を一つでも欠く統合は実行しない
+    - force push / `--force-with-lease` / 自動 rebase / remote branch の rewrite。conflict や target drift をこれらで解消しない
+    - close / owner approval / review admissibility を actuator の config で緩めること。config は step を止められるが、gate を外せない
+  coordinator_owned_auto_integration:
+    根拠: owner decision (Redmine #13686 j#96335) + 設計 (同 j#77124)
+    位置づけ: |
+      「自動 merge / auto-integration 機構を導入しない」という以前の全面禁止は範囲が広すぎたため撤回する。
+      撤回するのは *機構の存在* の禁止だけであり、統合の authority は動かない — 統合は依然 coordinator の
+      責務であり、実装者が integration branch を前進させない点も変わらない。actuator は coordinator の
+      明示操作を代行する実行系であって、新しい authority ではない。
+    許可条件 (すべて必須。一つでも欠けたら fail-closed):
+      - 最新 review generation が approved かつ未解決の blocking finding なし (古い approval の使い回しは不可)
+      - 統合対象が review 済みの exact head であること (review 後に source が変化していたら不可)
+      - source head が origin 到達可能であること
+      - source branch の CI が green。**設定で外せない** — どの required check を要求するかは設定事項だが、要求するか否かは設定事項ではない
+      - target ref が既知の integration branch で、action 形成時の expected head から drift していないこと
+      - lane worktree が clean かつ foreign でなく、unique な unpushed commit を持たないこと
+      - 未解決の callback / owner 判断 / release gate が無いこと
+    実行形態:
+      - 既定は ff-only の normal (non-force) push。non-ff を許す設定でも **merge commit は checkout の外で object として組む** (`git merge-tree --write-tree` + `git commit-tree`)。どの worktree も switch せず、index も ref も HEAD も動かさない。first parent は action-time に測定した target head と exact 一致させる。**「専用 worktree を検査してからそこで merge する」形は採らない** — path は late-bound であり、検査と mutation の間に別 lane の checkout へ差し替えられ得ることが再現された (#13686 j#96406)
+      - **統合 commit は「同一 repository 内容に対し同一 action が同一 commit を再構築する」ことを enforce する。** commit の identity と timestamp を host config や現在時刻から取らず (実測 #13686 j#96412)、commit object を変える config (`i18n.commitEncoding` 等) は invocation ごとに pin し、global / system config は隔離する (実測 j#96417)。timestamp は **action key が覆う object から導き、かつ parent より古くならない**値を選ぶ。**pin できない host 依存入力が残る場合は、まず「操作から不可視にする」構造を探し、それが無いときに限り typed status で拒否する。** **「実行前に probe して拒否する」形は、probe と mutation が別 invocation である限り守っていない** — 両者の間に状態が変わり得る (#13686 j#96435 で、probe 通過後に追加した merge driver の shell command が実行され merged content が書き換わることを実測)。例えば object-level merge では、使い捨ての git directory を作り object store だけを実 repository へ向けることで、repo-local config・`info/attributes`・`shallow` を **物理的に見えなく**できる。**再現できない成果物を作るくらいなら作らないが、到達し得ない入力を根拠に拒否するのも誤り**である (false positive は feature を不要に止める)。 「同一 action が同一 SHA を再現する」ことは、これらの config を実際に変えた test で固定する。**enforce 範囲は「pin した key」「isolate した env」「refuse する条件」を具体名で列挙して書く** — 「入力は X だけ」「全て pin した」と要約すると、数え落とした入力が黙って残る (#13686 では 3 round 連続で発生)。列挙に無いものは enforce していない、と読める形にする。**object を作る前に対象 ref を validate する**: 自前の禁止文字検査と `git check-ref-format` は互いを包含しないため両方を通す。**replace refs と継承 `GIT_*` env も入力である** — 前者は無効化 option、後者は環境を**継承せず置換**することで閉じる。**「置換した dict を作った」ことと「child process がそれを受け取った」ことは別である** — その差は stub 越しの test では観測できないので、実プロセスを通す回帰で固定する (#13686 j#96428)。**決定性に寄与する invocation は 1 つ残らず同じ封じ方をする** — 例えば timestamp を読む probe を素通しにすると、replace ref がそこから結果を変える (実測)。attributes の供給元は複数あり (tracked `.gitattributes` / user / system / `$GIT_DIR/info/attributes`)、**pin も隔離もできない供給元が存在すれば副作用前に拒否する**。**Git 実行 binary と semantic version は pin できない**ため、cross-version の同一 SHA は主張しない — 主張の成立範囲を「同一 git version」と明記し、**さらに exact version を durable outcome へ記録して後から照合可能にする** (prose の限定だけでは replay が同条件だったか検証できない)。plumbing で組む以上 local hook は実行されず署名も付かないため、**それを暗黙の同値としないで policy として明示**し、統合成果物の gate は push 後の exact-SHA CI に置く
+      - **merge の失敗は typed status として durable outcome の field に記録する。** content conflict / primitive 不可用 / probe 失敗 / invalid input / 非決定的 config / operational error / commit 失敗を 1 つの bool に畳まず、**prose の接頭辞にもしない** — record を読む consumer が match できる closed vocabulary の field にする (#13686 j#96417)。vocabulary 外の値は sentence へ畳まず typed に fail-closed とする。**exit code だけで分類しない** — 例えば `git merge-tree` は missing object を content conflict と同じ exit 1 で返す (実測)。**unknown な失敗を「primitive 不可用」と断定せず**、可用性は明示的な capability / version probe で確かめ、**probe 自体の失敗は不可用ではなく probe 失敗として記録する**。**gate probe は、それが守る操作と同じ config / 環境 view で行う** — 実操作へ届かない入力を根拠に拒否するのは false positive である。**記録した status は decision 側が読む**: 成功を表す status を伴う step だけが後続の authority になり、status を持てない step が status を持つ record も fail-closed とする。**field に載せただけで誰も読まなければ gate ではない**
+      - 統合先は **設定された integration branch と exact 一致**していること。「既知の integration branch である」ことと「この actuator に指定された branch である」ことは別の制約であり、前者だけでは config を守らない
+      - **safety fact を測るのは actuator であり、依頼者ではない。** confirmation のように「これは安全である」と述べる値は、caller が渡した値を検査するのではなく actuator 自身が action-time に測定して上書きする。型を与えても測定者を固定しなければ自己申告のままである
+      - **検証した値と mutation が消費する値を一致させる。** 別の値を検証して別の値で操作する形は検査になっていない。可能なら操作対象を **object id や primitive の引数そのもの**で束縛し、path・ref 名・pane locator のような late-bound な名前を対象指定に使わない (#13686 j#96406)
+      - conflict / non-ff / target drift / push 拒否は fail-closed。rebase も force も代替手段にしない
+      - 統合 SHA に対する CI は **非同期 gate** として別 state で待つ。単一の同期 command 内で CI 完了を仮定しない。CI green は **bool ではなく照合可能な記録**で受ける — required check の identity + run id + conclusion + 対象 commit を持ち、**push が着地した head と exact-match** すること (`### Hibernate Evidence Marker Contract` の `required_ci_green` と同形)。無関係な green run が gate を満たしてはならない
+      - **CI gate 自体は config で外せない。** どの required check を要求するかは設定事項だが、要求するか否かは設定事項ではない。gate を外した統合は close 後 cleanup の前提 (統合 SHA CI green) と接続できず、cleanup が永久 block するか未実行 CI の自己申告で破壊的 step へ進むかのどちらかになる
+      - push が着地した head は **記録された outcome から取り、欠落時に source head へ fallback しない**。「何が着地したか記録し損ねた」ことは「source が着地した」証拠ではない。fast-forward は source head、merge は同 action の apply outcome head と exact-match すること
+      - `coordinator_confirmed` mode の confirmation は、**確認した exact action key + 発行 role + durable anchor** を伴う記録として解決する。bool の自己申告や anchor を欠く主張は confirmation として扱わない (`### 根拠出所分類`)。**anchor は action-time に fresh-read し、role は記録の author から解決する** — caller が名乗った role や、非空文字列であることは authority ではない
+      - already_integrated (target ancestry) と patch_equivalent (明示 patch-id evidence) は別 disposition として記録し、同じ merge を再生成しない
+    記録:
+      - 実装した各段階 (integration / push / CI / process retire など) を段階別 outcome として記録する。実装しない段階は「記録が無い」ではなく **step 自体が存在しない**ことを設計に明示する
+      - action key は `issue + lane_generation + source_head + target_ref + expected_target_head + review_generation` を覆い、部分失敗からの再実行で重複 merge / 重複 delete を起こさない
+      - 統合結果は従来どおり integration journal に記録し、自動判断の evidence にする場合は `### Hibernate Evidence Marker Contract` の `integration_disposition` marker を付ける
+    close 後の retirement / cleanup:
+      - integration state machine と分離した別 state machine で扱う。統合が close を代替しない
+      - **破壊的 step は、その step 自身が 1 つの操作で全条件を enforce できる場合に限り持つ。** 条件の一部を別 probe や別 invocation に委ねた destructive step は、その隙間で対象がすり替わり得るため safe とは呼ばない。「別 probe で identity を確かめてから消す」は検査であって保証ではない。policy toggle は step を止められるため、「別 step の条件が評価されないまま、後続の step が破壊的操作を行う」形も作らない
+      - **local branch delete は行わない。** 必要条件は 2 軸 (ref tip が record 済み source head と一致 / どの worktree もその branch を保持していない) だが、**両軸を 1 invocation で enforce する git primitive は存在しない** (git 2.50.1 実測: `update-ref -d <ref> <tip>` は tip を CAS するが保持中の worktree ごと消して `HEAD` を壊す / `branch -D` は保持を原子的に拒否するが tip 制約を取らない / `update-ref --stdin` は同一 ref への `verify` + `delete` を拒否する)。2 invocation に分けた実装は、その窓で着地した commit を到達不能にすることが再現された (#13686 j#96396)
+      - **remote branch delete も行わない。** remote ref に対する真の compare-and-swap は `--force-with-lease` を要し、それは本節が禁じる force である
+      - **worktree removal も行わない。** `git worktree remove` は対象を path で指し、clean / registered は同一 invocation で検査するが **どの lane のものかは検査しない**。identity を別 probe に委ねる形では、その間に同じ path へ差し替えられた foreign lane の checkout を削除し得ることが再現された (#13686 j#96401)。expected-identity 引数は無く、admin entry 名は差し替え後に再利用され、`worktree lock` は binding を pin するが **lock 保持中は remove も move も実行できない**ため直前の unlock が窓を開け直す (いずれも git 2.50.1 実測)
+      - 上記に共通する判断規則: **安全性を提供できない操作は「既定 off」で持つのではなく持たない。** 無い操作を off にする config key も持たない。post-close の worktree / branch 削除は operator の runbook step (`git worktree remove` / `git branch -d`) に残す。原子的な経路が後に得られた場合の再導入可否は owner/design 判断とする
+      - 破壊的操作を持たない actuator に残る step は、**primitive 自身が identity を引数に取るもの** (例: `release_process(issue, lane_generation)`) に限られる。path や ref 名は late-bound であり、mutation より前に束縛したものは保証にならない
 ```
 
 ### Codex Direct Edit Gate
