@@ -220,6 +220,11 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+from mozyo_bridge.core.state.lane_lifecycle_backup import (  # noqa: E402
+    backup_state_container,
+)
+
+
 def _backup_stamp(now: str) -> str:
     """Compact filesystem-safe stamp (``20260621T130000Z``) for a backup dir."""
     parsed = datetime.fromisoformat(now)
@@ -256,40 +261,6 @@ def _stamp_component_version(conn: sqlite3.Connection) -> None:
         ),
     )
 
-
-def backup_state_container(path: Path) -> Optional[Path]:
-    """Copy an existing ``state.sqlite`` into ``backups/state-<ts>/`` before a write.
-
-    A **component** write migration (an additive ``ALTER`` on authoritative rows) must
-    honor ``managed-state-model.md`` (``### backup / downgrade / partial migration``)
-    like the container's legacy import does: copy the DB under home before the first
-    write; a copy failure raises :class:`StateStoreError` so the caller fails closed with
-    the DB byte-unchanged. Returns the backup dir, or ``None`` when there is nothing to
-    preserve yet (a fresh store has no prior authority).
-
-    The backup directory **never overwrites an existing snapshot** (Redmine #13754
-    R4-F1): the second-precision stamp can collide, so a taken directory gets a numeric
-    suffix (``…-1``, ``…-2``) rather than a clobbering ``copy2`` over a prior backup.
-    Migration is serialized upstream, so this is defense in depth — a pre-migration
-    snapshot is preserved even if two backups ever share a second.
-    """
-    if not path.exists():
-        return None
-    base = path.parent / BACKUPS_DIRNAME / f"state-{_backup_stamp(_utc_now())}"
-    try:
-        backup_dir = base
-        suffix = 1
-        while backup_dir.exists():
-            backup_dir = base.with_name(f"{base.name}-{suffix}")
-            suffix += 1
-        backup_dir.mkdir(parents=True, exist_ok=False)
-        shutil.copy2(path, backup_dir / path.name)
-    except OSError as exc:
-        raise StateStoreError(
-            f"backup near {base} failed ({exc}); migration aborted "
-            f"(nothing was written)"
-        ) from exc
-    return backup_dir
 
 #: Sentinel for a component row whose version is present but not an exact integer
 #: (a REAL like ``2.5``, TEXT, BLOB, …). It is deliberately outside

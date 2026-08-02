@@ -711,7 +711,7 @@ class LaneLifecycleRecord:
 
     ``lane_epoch`` (v10, Redmine #14756) is the MONOTONIC hibernate-generation counter the
     clock-free, locator-free resume proof is bound to. Exactly one event mints it — the
-    disposition CAS INTO ``hibernated`` — and it is minted as ``lane_epoch = lane_epoch + 1``
+    disposition CAS INTO ``hibernated`` — and it is minted from the row's own stored value
     evaluated by the database against the row's OWN stored value, so there is no caller
     parameter to backdate and no second value to reconcile (the defect shape that defeated
     both the v8 timestamp and the pre-v9 caller-supplied pins). It reaches a process only as

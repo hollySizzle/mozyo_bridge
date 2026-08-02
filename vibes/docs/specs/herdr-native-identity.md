@@ -126,7 +126,9 @@ resolver はこれを fail-closed に読む。
     expected 値ではない (expected を保存すると launcher を attest することになり、#14477 が排除した
     caller 供給 authority を epoch 軸で再導入する)。
   - **正本 (mint)**: lifecycle authority `lane_lifecycle.lane_epoch` (schema v10)。**`hibernated` へ
-    向かう disposition CAS だけ**が `lane_epoch = lane_epoch + 1` として **格納値から** 発行する。
+    向かう disposition CAS だけ**が **格納値から** 発行する。列は `BLOB` (NONE affinity) +
+    canonical decimal TEXT storage で、増分は Python 側、CAS は raw bytes + `typeof(...)='text'`
+    (#14756 j#96911 F2)。
     caller に epoch parameter は無い。`active` へ戻る際に **clear しない** — sibling の
     `hibernated_at` は clear するが、counter を reset すると旧世代 process が持つ epoch を再発行して
     しまうため、両者の非対称は仕様である。
@@ -141,6 +143,11 @@ resolver はこれを fail-closed に読む。
     pre-v10 hibernation。次の rail は v10 hibernate transition) / `lane_epoch_attestation_absent`
     (legacy attestation row / pre-#14756 launcher) / `lane_epoch_malformed` / `lane_epoch_not_newer`
     (survivor)。`0` は **未発行** であって「全 epoch が上回る閾値」ではない。
+  - **admission は exact 一致**。attested epoch は current lifecycle が mint した値と
+    **等しい**ときだけ admit する (`>=` は forged future epoch を通した。#14756 j#96949 F1)。
+    launcher の expected と process の observed が食い違う場合、attestation は epoch を
+    **記録しない** — event だけでは resume gate から見えないため。token 桁数は bounded で、
+    超過は typed malformed (同 F2)。
   - **既存 fence を弱めない**。epoch は **追加 conjunct** であり、attestation / locator / provider /
     multiplicity / declared-pin / `release_observation` の各 fence は verdict を 1 つも変えない。
   - **rebuildable cache を流用しない**。`herdr_launch_generation` は `rebuildable_cache` の

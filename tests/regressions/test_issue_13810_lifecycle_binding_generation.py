@@ -22,6 +22,10 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+
+from tests.support.lifecycle_backup_assert import (  # noqa: E402
+    assert_backup_preserves,
+)
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -638,7 +642,7 @@ class SchemaV5MigrationTest(unittest.TestCase):
         # the pre-migration snapshot was preserved before the first write
         backups = sorted((self.home / "backups").glob("state-*"))
         self.assertEqual(len(backups), 1)
-        self.assertEqual((backups[0] / "state.sqlite").read_bytes(), before)
+        assert_backup_preserves(self, backups[0] / "state.sqlite", before)
         # the existing issue row lands on the additive defaults (never guessed)
         rec = LaneLifecycleStore(home=self.home).get(self.key)
         self.assertEqual(rec.binding_kind, BINDING_KIND_ISSUE)
@@ -705,7 +709,7 @@ class SchemaV5MigrationTest(unittest.TestCase):
         # the pre-migration snapshot was preserved before the first write (backup-first)
         backups = sorted((self.home / "backups").glob("state-*"))
         self.assertEqual(len(backups), 1)
-        self.assertEqual((backups[0] / "state.sqlite").read_bytes(), before)
+        assert_backup_preserves(self, backups[0] / "state.sqlite", before)
         # the v6 column was added additively on the existing row with the neutral default
         self.assertIn("reconcile_phase", self._columns())
         rec = LaneLifecycleStore(home=self.home).get(self.key)

@@ -237,7 +237,7 @@ def register_herdr_attestation_store_parser(herdr_sub, *, add_repo_option=None) 
         metavar="ASSIGNED_NAME",
         help=(
             "ASSERT that the lane's own pair contains this assigned name (repeatable). The "
-            "pair itself is derived from the lane's stored release observation, joined "
+            "pair itself is derived from the lane's current-generation declared slots, joined "
             "byte-exact against the live inventory and the startup attestation; this flag "
             "only checks that derivation against your expectation and refuses on any "
             "difference. It cannot add a slot, and therefore cannot shrink the consumer "

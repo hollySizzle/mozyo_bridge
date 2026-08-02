@@ -28,6 +28,10 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+
+from tests.support.lifecycle_backup_assert import (  # noqa: E402
+    assert_backup_preserves,
+)
 from pathlib import Path
 
 from mozyo_bridge.core.state.lane_declaration import LaneDeclarationStore
@@ -379,7 +383,7 @@ class LaneKindSchemaMigrationTest(unittest.TestCase):
         # backup-first: the pre-migration snapshot was preserved before the first write
         backups = sorted((self.home / "backups").glob("state-*"))
         self.assertEqual(len(backups), 1)
-        self.assertEqual((backups[0] / "state.sqlite").read_bytes(), before)
+        assert_backup_preserves(self, backups[0] / "state.sqlite", before)
         # the v7 column landed additively with the neutral default on the existing row
         self.assertIn("lane_kind", self._columns())
         record = LaneLifecycleStore(home=self.home).get(self.key)

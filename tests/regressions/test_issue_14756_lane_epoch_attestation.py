@@ -279,10 +279,16 @@ class StrictlyNewerIsStatedBothWaysAndAgrees(unittest.TestCase):
             self.assertEqual(boundary, required - 1)
             # "strictly newer than the hibernate epoch" and "at least the required epoch"
             # must select the same tokens, or the acceptance text and the code have drifted.
+            # Redmine #14756 review j#96949 F1 narrowed this from a lower bound to an
+            # EQUALITY. "Strictly newer than the hibernate epoch" and "at least the required
+            # epoch" used to select the same tokens; they also selected every LARGER token,
+            # which admitted a forged future generation. The admissible set is the single
+            # value the lifecycle has actually minted.
             for candidate in range(0, required + 3):
                 with self.subTest(candidate=candidate):
                     admits = lane_epoch_verdict(rec, str(candidate))[0] if candidate else False
-                    self.assertEqual(admits, candidate > boundary and candidate >= 1)
+                    self.assertEqual(admits, candidate == required)
+            self.assertEqual(required, boundary + 1)  # the two spellings still agree
 
 
 class TheEpochSurvivesTheLaunchToAttestationRoundTrip(unittest.TestCase):
@@ -357,9 +363,16 @@ class TheEpochSurvivesTheLaunchToAttestationRoundTrip(unittest.TestCase):
         )
         self.assertNotIn(MOZYO_LANE_EPOCH_ENV, " ".join(build_agent_start_argv(**kwargs)))
 
-    def test_the_wrapper_records_what_it_observed_not_what_was_expected(self) -> None:
-        # If the record carried the launcher's expectation, the epoch would attest the
-        # launcher rather than the process — reintroducing caller-supplied authority.
+    def test_a_disagreeing_epoch_is_recorded_as_neither_side(self) -> None:
+        # Two properties at once, and the second is Redmine #14756 review j#96949 F1.
+        #
+        # (a) The record must NOT carry the launcher's expectation — that would attest the
+        #     launcher rather than the process, reintroducing caller-supplied authority.
+        # (b) It must not carry the unexplained observation either. The earlier contract
+        #     stored the observed token raw and left the disagreement in the event stream
+        #     only; the resume gate reads the identity RECORD, so the disagreement was
+        #     invisible exactly where it had to be visible. Recording nothing is the honest
+        #     answer: this launch established no epoch, and resume fails closed naming that.
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
             herdr_agent_attest as attest,
         )
@@ -384,7 +397,7 @@ class TheEpochSurvivesTheLaunchToAttestationRoundTrip(unittest.TestCase):
                 )(),
             )
             self.assertIsNotNone(record)
-            self.assertEqual(record.lane_epoch, "4")
+            self.assertEqual(record.lane_epoch, "")  # neither 9 (expected) nor 4 (observed)
             self.assertIn(
                 attest.ATTESTATION_REASON_LANE_EPOCH_NOT_INJECTED,
                 [reason for _stage, reason in seen],
@@ -1656,6 +1669,23 @@ class TheLegacyRecoveryPlanRefusesBeforeItCloses(unittest.TestCase):
                         plan.state, "blocked_target_slot_assertion_failed"
                     )
 
+    def test_a_duplicated_assertion_slot_is_refused_not_deduplicated(self) -> None:
+        """Redmine #14756 review j#96949 F3.
+
+        The assertion was normalised with `sorted(set(...))`, so `gateway, worker, worker` —
+        three slots named for a two-slot pair — collapsed to the correct two and returned
+        `plan_ready`. An assertion that edits itself into agreement is not an assertion, and
+        the multiplicity is exactly what the caller got wrong.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            home, store, key, pins, agents = self._ready_world(tmp)
+            plan = self._plan(
+                home, store, key, self._view(agents=agents),
+                asserted=("pair-gateway", "pair-worker", "pair-worker"),
+            )
+            self.assertEqual(plan.state, "blocked_target_slot_assertion_failed")
+            self.assertEqual(plan.target_slots, ("pair-gateway", "pair-worker"))
+
     def test_a_live_consumer_whose_locator_drifted_is_not_excluded(self) -> None:
         """Locator reuse is the failure mode this whole issue exists for.
 
@@ -2365,6 +2395,237 @@ class AMalformedStoredEpochIsNeverLaunderedIntoZero(unittest.TestCase):
             )
             self.assertTrue(outcome.applied)
             self.assertEqual(store.get(key).lane_epoch, "1")
+
+
+class ForgedEpochsAndUnboundedTokensFailClosed(unittest.TestCase):
+    """Redmine #14756 review j#96949 F1/F2 — the four required regressions.
+
+    Both findings were reproduced against the shipped code before the fix, and both are the
+    same shape: a token nobody could honestly hold was treated as evidence. F1 admitted a
+    LARGER epoch than the store had minted; F2 let an absurdly long one crash the parser
+    instead of being refused.
+    """
+
+    @staticmethod
+    def _attest(tmp, *, expected, observed):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_agent_attest as attest,
+        )
+
+        env = {"MOZYO_HERDR_BINARY": "/usr/bin/true"}
+        if observed is not None:
+            env[MOZYO_LANE_EPOCH_ENV] = observed
+        return attest.perform_self_attestation(
+            assigned_name="n", workspace_id=WS, role="claude", lane=LANE,
+            env=env, lane_epoch=expected, home=Path(tmp),
+            append_event=lambda stage, bounded_reason="": None,
+            # Resolves the agent's own live row, so the bounded self-lookup succeeds and a
+            # record is actually written (an empty locator writes nothing at all).
+            runner=lambda *a, **k: type(
+                "R", (), {
+                    "returncode": 0,
+                    "stdout": '{"agents":[{"name":"n","pane_id":"%1"}]}',
+                }
+            )(),
+        )
+
+    def test_expected_one_observed_999_is_refused_end_to_end(self) -> None:
+        """The exact reproduction from j#96949 F1: required 1, observed 999 -> admitted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store, key = _hibernated_lane(tmp)  # mints epoch 1
+            rec = store.get(key)
+            self.assertEqual(required_resume_epoch(rec), (1, EPOCH_OK))
+
+            record = self._attest(tmp, expected="1", observed="999")
+            # The disagreement is on the RECORD, not only in the event stream: the resume
+            # gate reads the record.
+            self.assertEqual(record.lane_epoch, "")
+            self.assertEqual(
+                lane_epoch_verdict(rec, record.lane_epoch),
+                (False, EPOCH_ATTESTATION_ABSENT),
+            )
+            # And even if such a token reached the gate by some other route, it is refused.
+            self.assertFalse(lane_epoch_verdict(rec, "999")[0])
+
+    def test_an_unexplained_epoch_with_no_expectation_is_refused(self) -> None:
+        """j#96949 F1's second case: the launcher declared nothing, the process reported 1.
+
+        The pre-fix condition only fired when an epoch was DECLARED and failed to land, so
+        this direction skipped the check entirely and stored a clean-looking attestation that
+        could satisfy admission on its own.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            store, key = _hibernated_lane(tmp)
+            record = self._attest(tmp, expected="", observed="1")
+            self.assertEqual(record.lane_epoch, "")
+            self.assertEqual(
+                lane_epoch_verdict(store.get(key), record.lane_epoch),
+                (False, EPOCH_ATTESTATION_ABSENT),
+            )
+
+    def test_an_agreeing_epoch_is_still_recorded_and_admitted(self) -> None:
+        # The guard must not become an outage: agreement still round-trips and resumes.
+        with tempfile.TemporaryDirectory() as tmp:
+            store, key = _hibernated_lane(tmp)
+            record = self._attest(tmp, expected="1", observed="1")
+            self.assertEqual(record.lane_epoch, "1")
+            self.assertEqual(
+                lane_epoch_verdict(store.get(key), record.lane_epoch), (True, EPOCH_OK)
+            )
+
+    def test_a_huge_canonical_attested_token_is_typed_not_an_exception(self) -> None:
+        # j#96949 F2: `int(raw)` on 5000 digits raises under CPython's conversion limit, so
+        # a forged attestation crashed the resume verdict instead of being refused. This
+        # function's contract is to be TOTAL over whatever arrives.
+        huge = "9" * 5000
+        self.assertEqual(parse_attested_epoch(huge), (LANE_EPOCH_UNMINTED, EPOCH_MALFORMED))
+        with tempfile.TemporaryDirectory() as tmp:
+            store, key = _hibernated_lane(tmp)
+            self.assertEqual(
+                lane_epoch_verdict(store.get(key), huge), (False, EPOCH_MALFORMED)
+            )
+
+    def test_a_huge_canonical_stored_epoch_is_typed_not_an_exception(self) -> None:
+        # The storage side of the same bound: a corrupt row must not make the lifecycle
+        # reader or the recovery planner raise instead of returning a total result.
+        from mozyo_bridge.core.state.lane_epoch import (
+            EPOCH_STORED_MALFORMED,
+            classify_stored_epoch,
+        )
+
+        huge = "9" * 5000
+        self.assertEqual(classify_stored_epoch(huge)[1], EPOCH_STORED_MALFORMED)
+        with tempfile.TemporaryDirectory() as tmp:
+            store, key = _hibernated_lane(tmp)
+            conn = sqlite3.connect(store.path)
+            try:
+                conn.execute(
+                    "UPDATE lane_lifecycle_records SET lane_epoch = ?", (huge,)
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            rec = store.get(key)  # total, not a raise
+            self.assertEqual(
+                required_resume_epoch(rec),
+                (LANE_EPOCH_UNMINTED, EPOCH_AUTHORITY_UNAVAILABLE),
+            )
+
+
+class TheV10BackupIsARealRecoveryPoint(unittest.TestCase):
+    """Redmine #14756 review j#96956 F5 — a backup that can lose the rows it preserves.
+
+    ``shutil.copy2`` of ``state.sqlite`` is not a recovery point. Under WAL journalling
+    committed pages live in ``-wal`` until a checkpoint folds them back, so a main-file copy
+    silently drops every committed authority row since the last checkpoint —
+    and ``wal_autocheckpoint=0`` makes that window unbounded. Every case below runs against a
+    temp isolated store; the shared home is never migrated.
+    """
+
+    @staticmethod
+    def _wal_store(tmp, *, rows=50, version=9):
+        path = pathlib.Path(tmp) / "state.sqlite"
+        conn = sqlite3.connect(path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")  # nothing folds back on its own
+        conn.execute("CREATE TABLE lane_lifecycle_records (lane_id TEXT, lane_epoch TEXT)")
+        for index in range(rows):
+            conn.execute(
+                "INSERT INTO lane_lifecycle_records VALUES (?, ?)", (str(index), "0")
+            )
+        conn.execute(f"PRAGMA user_version={version}")
+        conn.commit()
+        # The connection is deliberately LEFT OPEN and returned: closing it checkpoints the
+        # WAL back into the main file and deletes `-wal`, which is precisely the state these
+        # tests must not be in. The hazard only exists while committed pages are still in the
+        # WAL, so a fixture that closes first would measure a store that had already healed.
+        return path, conn
+
+    def test_a_main_file_copy_would_have_lost_committed_rows(self) -> None:
+        """The premise, measured — otherwise the fix guards a hazard nobody showed exists."""
+        import shutil as _shutil
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, conn = self._wal_store(tmp)
+            self.assertGreater(pathlib.Path(f"{path}-wal").stat().st_size, 0)
+            naive = pathlib.Path(tmp) / "naive.sqlite"
+            _shutil.copy2(path, naive)  # exactly what the old backup did
+            conn = sqlite3.connect(f"file:{naive}?mode=ro", uri=True)
+            try:
+                rows = conn.execute(
+                    "SELECT count(*) FROM lane_lifecycle_records"
+                ).fetchone()[0]
+            except sqlite3.DatabaseError:
+                rows = -1  # not even readable
+            finally:
+                conn.close()
+            self.assertNotEqual(rows, 50, "the main-file copy unexpectedly kept every row")
+            conn.close()
+
+    def test_the_snapshot_preserves_uncheckpointed_rows_and_version(self) -> None:
+        from mozyo_bridge.core.state.lane_lifecycle_backup import backup_state_container
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, conn = self._wal_store(tmp)
+            backup_dir = backup_state_container(path)
+            self.assertIsNotNone(backup_dir)
+            snap = sqlite3.connect(f"file:{backup_dir / 'state.sqlite'}?mode=ro", uri=True)
+            try:
+                self.assertEqual(
+                    snap.execute(
+                        "SELECT count(*) FROM lane_lifecycle_records"
+                    ).fetchone()[0],
+                    50,
+                )
+                self.assertEqual(snap.execute("PRAGMA user_version").fetchone()[0], 9)
+            finally:
+                snap.close()
+                conn.close()
+
+    def test_a_failed_snapshot_publishes_nothing_and_leaves_the_store_untouched(
+        self,
+    ) -> None:
+        # Injected failure at each stage: no snapshot is published under the backup name,
+        # no staging residue is left, and the source store is byte-identical. A partial
+        # backup published under the real name would be worse than none — a later operator
+        # would restore from it believing it complete.
+        from mozyo_bridge.core.state import lane_lifecycle_backup as schema
+
+        for stage in ("_snapshot_state_container", "_readback_state_container"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as tmp:
+                path, conn = self._wal_store(tmp)
+                before = path.read_bytes()
+
+                def _boom(*_a, **_k):
+                    raise sqlite3.DatabaseError("injected")
+
+                with mock.patch.object(schema, stage, _boom):
+                    with self.assertRaises(schema.StateStoreError):
+                        schema.backup_state_container(path)
+
+                self.assertEqual(path.read_bytes(), before)  # source untouched
+                backups = pathlib.Path(tmp) / "backups"
+                published = list(backups.glob("state-*")) if backups.exists() else []
+                staging = list(backups.glob(".staging-*")) if backups.exists() else []
+                self.assertEqual(published, [], "a partial backup was published")
+                self.assertEqual(staging, [], "staging residue was left behind")
+                conn.close()
+
+    def test_a_backup_failure_is_never_retried_as_a_raw_copy(self) -> None:
+        # If SQLite cannot back a database up, the honest conclusion is that no verified
+        # recovery point exists. Falling back to the copy that loses WAL pages would
+        # manufacture one — the failure mode this whole finding is about.
+        source = pathlib.Path(
+            ROOT.parent / "src/mozyo_bridge/core/state/lane_lifecycle_backup.py"
+        ).read_text()
+        snapshot = source[source.index("def _snapshot_state_container") :]
+        snapshot = snapshot[: snapshot.index("def _readback_state_container")]
+        # Strip the docstring first: it NAMES `copy2` to explain why it is wrong, and a
+        # substring check over the whole function would match that explanation and pass
+        # whatever the body did.
+        body = snapshot.split('"""')[-1]
+        self.assertNotIn("copy2", body)
+        self.assertIn("src.backup(dst)", snapshot)
 
 
 class ExistingFencesAreNotWeakened(unittest.TestCase):

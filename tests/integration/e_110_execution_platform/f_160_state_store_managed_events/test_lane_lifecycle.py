@@ -13,6 +13,10 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+
+from tests.support.lifecycle_backup_assert import (  # noqa: E402
+    assert_backup_preserves,
+)
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -1975,7 +1979,7 @@ class BackupFirstMigrationTest(unittest.TestCase):
         LaneLifecycleStore(home=self.home).ensure_schema()
         backups = self._backups()
         self.assertEqual(len(backups), 1)
-        self.assertEqual((backups[0] / "state.sqlite").read_bytes(), before)
+        assert_backup_preserves(self, backups[0] / "state.sqlite", before)
         self.assertEqual(self._recorded(), LANE_LIFECYCLE_SCHEMA_VERSION)
         cols = self._columns()
         self.assertIn("replacement_state", cols)  # v3 axis
@@ -1991,7 +1995,7 @@ class BackupFirstMigrationTest(unittest.TestCase):
         LaneLifecycleStore(home=self.home).ensure_schema()
         backups = self._backups()
         self.assertEqual(len(backups), 1)
-        self.assertEqual((backups[0] / "state.sqlite").read_bytes(), before)
+        assert_backup_preserves(self, backups[0] / "state.sqlite", before)
         self.assertEqual(self._recorded(), LANE_LIFECYCLE_SCHEMA_VERSION)
         cols = self._columns()
         self.assertIn("replacement_state", cols)  # v3 axis preserved
@@ -2143,7 +2147,7 @@ class BackupFirstMigrationTest(unittest.TestCase):
         self.assertNotIn("worktree_identity", self._columns())
         backups = self._backups()
         self.assertEqual(len(backups), 1)
-        self.assertEqual((backups[0] / "state.sqlite").read_bytes(), before)
+        assert_backup_preserves(self, backups[0] / "state.sqlite", before)
 
     # -- R5-F1: a recorded-current store is verified, never silently repaired -------
 
@@ -2250,7 +2254,7 @@ class BackupFirstMigrationTest(unittest.TestCase):
         self.assertEqual(record.worktree_identity, "wt_oldv3")  # binding value preserved
         backups = self._backups()
         self.assertEqual(len(backups), 1)
-        self.assertEqual((backups[0] / "state.sqlite").read_bytes(), before)
+        assert_backup_preserves(self, backups[0] / "state.sqlite", before)
 
     def _table_present(self) -> bool:
         conn = sqlite3.connect(lane_lifecycle_path(self.home))

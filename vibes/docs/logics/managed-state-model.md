@@ -436,7 +436,8 @@ Table naming:
   - **lane epoch (hibernate 世代の単調 counter)** (schema v10、#14756)。追加 field `lane_epoch`。
     実装正本は `core/state/lane_epoch.py`。
     - **何を保存するか**: その lane が hibernate した回数 = 発行済み世代番号。**`hibernated` へ
-      向かう disposition CAS だけ**が `lane_epoch = lane_epoch + 1` として **格納値から** 発行し、
+      向かう disposition CAS だけ**が **格納値から** 発行する (増分は strict decode 後に Python 側で
+      算出し canonical decimal TEXT を書く。**SQL 算術は使わない**)。
       **malformed な格納値 (TEXT / REAL / `bool` / `NULL` / negative) からは発行しない**
       (#14756 j#96881 F2)。「未発行 (exact int `0`)」と「読めない」は別の事実であり、
       read 側は両方 `lane_epoch_authority_unavailable` へ畳んでよいが、**writer が畳むと

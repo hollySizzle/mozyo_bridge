@@ -67,7 +67,8 @@ BLOCKED_LANE_ABSENT = "blocked_lane_absent"
 BLOCKED_CONSUMERS_UNMEASURABLE = "blocked_consumers_unmeasurable"
 
 #: Refused: the lane's own pair cannot be derived from stored authority — the generation-bound
-#: release observation is absent, malformed, or not a coherent pair. Without it there is no
+#: declared-slot snapshot is absent, malformed, or not a coherent gateway+worker pair.
+#: Without it there is no
 #: authority for WHICH consumers are this lane's own, and the answer must not be guessed.
 BLOCKED_PAIR_AUTHORITY_UNAVAILABLE = "blocked_pair_authority_unavailable"
 
@@ -93,7 +94,7 @@ class LaneEpochRecoveryPlan:
     issue_id: str = ""
     #: Live agents holding a row in this store that are NOT the target pair's own slots.
     foreign_consumers: tuple = ()
-    #: The lane's own slots as DERIVED from its stored release observation and joined
+    #: The lane's own slots as DERIVED from its current-generation declared slots and joined
     #: byte-exact against live inventory + attestation. This is the set actually subtracted
     #: from the census; it never comes from the caller (j#96881 F1).
     target_slots: tuple = ()
@@ -298,9 +299,14 @@ def plan_lane_epoch_legacy_recovery(
     )
     from mozyo_bridge.core.state.lane_lifecycle_readonly import LaneLifecycleReader
 
-    asserted = tuple(
-        sorted({str(name).strip() for name in asserted_slots if str(name).strip()})
-    )
+    # Multiplicity is PRESERVED (Redmine #14756 review j#96949 F3). The earlier
+    # `sorted(set(...))` silently collapsed repeats, so asserting `gateway, worker, worker`
+    # — three slots for a two-slot pair — normalised to the correct two and returned
+    # `plan_ready`. An assertion that quietly edits itself into agreement is not an
+    # assertion; a caller who names a slot twice has said something the authority does not,
+    # and is told so.
+    raw_asserted = tuple(str(name).strip() for name in asserted_slots if str(name).strip())
+    asserted = tuple(sorted(raw_asserted))
     base = {"lane": lane, "workspace_id": workspace_id, "issue_id": issue_id}
 
     # 1. The census, FIRST. Reusing the maintenance module's own measurement rather than
@@ -340,15 +346,16 @@ def plan_lane_epoch_legacy_recovery(
             state=pair_refusal, asserted_slots=asserted, detail=pair_detail, **base
         )
     own = tuple(sorted(derived))
-    if asserted and asserted != own:
+    if asserted and (asserted != own or len(set(raw_asserted)) != len(raw_asserted)):
         return LaneEpochRecoveryPlan(
             state=BLOCKED_TARGET_SLOT_ASSERTION_FAILED,
             asserted_slots=asserted,
             target_slots=own,
             detail=(
-                f"the asserted slots {list(asserted)} do not equal the pair derived from this "
-                f"lane's stored release observation {list(own)}. This flag asserts what the "
-                f"authority already says; it cannot introduce a slot the authority does not"
+                f"the asserted slots {list(asserted)} do not equal the pair derived from "
+                f"this lane's declared slots {list(own)}. This flag asserts what the "
+                f"authority already says; it cannot introduce a slot the authority does not, "
+                f"and a repeated slot is a difference rather than a spelling of the same set"
             ),
             **base,
         )

@@ -32,6 +32,10 @@ import sys
 import tempfile
 import threading
 import unittest
+
+from tests.support.lifecycle_backup_assert import (  # noqa: E402
+    assert_backup_preserves,
+)
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
@@ -373,7 +377,7 @@ class WriteMigratingGateTest(unittest.TestCase):
         self.assertIn("reconcile_phase", _columns(self.home))
         backups = sorted((self.home / "backups").glob("state-*"))
         self.assertEqual(len(backups), 1)
-        self.assertEqual((backups[0] / "state.sqlite").read_bytes(), before)
+        assert_backup_preserves(self, backups[0] / "state.sqlite", before)
 
     def test_migration_then_reensure_is_intact_and_idempotent(self) -> None:
         # Required regression 5: restart idempotency — re-running ensure after a migration is

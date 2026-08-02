@@ -89,6 +89,11 @@ LANE_EPOCH_COLUMN = "lane_epoch"
 #: rather than in the launch adapter so the producer and the consumer cannot drift apart.
 MOZYO_LANE_EPOCH_ENV = "MOZYO_LANE_EPOCH"
 
+#: The largest number of decimal digits an epoch token may carry. A real counter advances
+#: once per hibernate, so any plausible lane stays far inside this; the bound exists so a
+#: FORGED token is refused rather than crashing the parser (#14756 j#96949 F2).
+_MAX_EPOCH_DIGITS = 18
+
 #: The stored value meaning **no epoch has ever been minted for this lane**. Deliberately not
 #: a usable threshold: see this module's docstring.
 LANE_EPOCH_UNMINTED = 0
@@ -169,7 +174,11 @@ def classify_stored_epoch(value: object) -> tuple[int, str]:
     The returned integer is meaningful ONLY for :data:`EPOCH_STORED_MINTED`; for the other
     two it is :data:`LANE_EPOCH_UNMINTED` and must not be compared against.
     """
-    if isinstance(value, str) and _CANONICAL_EPOCH.match(value):
+    if (
+        isinstance(value, str)
+        and len(value) <= _MAX_EPOCH_DIGITS
+        and _CANONICAL_EPOCH.match(value)
+    ):
         epoch = int(value)
         return (
             (epoch, EPOCH_STORED_MINTED)
@@ -248,6 +257,14 @@ def parse_attested_epoch(raw: object) -> tuple[int, str]:
     # #14753 closed the same class of hole on a different surface.
     if not all("0" <= character <= "9" for character in raw):
         return LANE_EPOCH_UNMINTED, EPOCH_MALFORMED
+    if len(raw) > _MAX_EPOCH_DIGITS:
+        # Redmine #14756 review j#96949 F2. `int()` on a very long decimal raises
+        # `ValueError` under CPython's integer conversion limit, so an unbounded parse turned
+        # a forged attestation into a CRASH of the resume verdict rather than a refusal —
+        # this function's contract is to be total over whatever arrives. The bound is checked
+        # on the DIGIT COUNT, before the conversion, because a limit that is enforced by
+        # catching the conversion's own error is a limit that has already done the work.
+        return LANE_EPOCH_UNMINTED, EPOCH_MALFORMED
     parsed = int(raw)
     if str(parsed) != raw or parsed < 1:
         # Non-canonical spelling ("07"), or a non-positive epoch the store never mints.
@@ -280,6 +297,16 @@ def lane_epoch_verdict(
     attested, reason = parse_attested_epoch(attested_raw)
     if reason != EPOCH_OK:
         return False, reason
+    if attested > required:
+        # Redmine #14756 review j#96949 F1. `attested >= required` admitted ANY larger epoch,
+        # so a process that reported `999` against a lane whose counter had minted `1` was
+        # resumed — a forged FUTURE generation, which is the mirror of the survivor this
+        # module exists to refuse and just as unprovable. No honest producer can hold an epoch
+        # the store has not minted yet: the token reaches a process only by injection at
+        # launch, and the launch injects exactly the stored counter. So the admissible set is
+        # the single value `required`, and anything above it is evidence of forgery rather
+        # than of freshness. (Acceptance 2 says "exact epoch"; `>=` was not exact.)
+        return False, EPOCH_MALFORMED
     if attested < required:
         # Equivalently `attested <= hibernate_boundary_epoch(record)`: the process was handed
         # its epoch before the hibernate transition advanced the counter.

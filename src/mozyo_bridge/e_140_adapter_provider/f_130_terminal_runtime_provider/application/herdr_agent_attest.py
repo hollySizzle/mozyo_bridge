@@ -345,15 +345,31 @@ def perform_self_attestation(
     # proof classifies it byte-exactly and a normalised token would launder a value the
     # lifecycle authority never minted into the authority position.
     observed_epoch = env.get(MOZYO_LANE_EPOCH_ENV, "")
-    if _norm(lane_epoch) and _norm(observed_epoch) != _norm(lane_epoch):
-        # The launch declared an epoch and it did not land. Surfaced on the action's event
-        # projection as a typed outcome; the record still carries what was really observed
-        # (including nothing), so the read side fails closed on its own evidence rather than
-        # on this wrapper's opinion. Never blocks the boot.
+    if _norm(observed_epoch) != _norm(lane_epoch):
+        # The launcher's declaration and the process's environment disagree. Surfaced on the
+        # action's event projection AND withheld from the record, because an event is not
+        # admission-visible: the resume proof reads the identity record, so a disagreement
+        # that lives only in the event stream is a disagreement the gate never sees
+        # (Redmine #14756 review j#96949 F1).
+        #
+        # Note the condition covers BOTH directions. The earlier form only checked a declared
+        # epoch that failed to land; it skipped the case where the launcher declared NOTHING
+        # and the process reported an epoch anyway — an unexplained token (a stale value
+        # inherited through the environment, say) which was then stored as a clean
+        # attestation and could satisfy admission on its own.
+        #
+        # The epoch is recorded EMPTY rather than corrected. That is not the substitution the
+        # contract below forbids: writing the launcher's expectation would attest what was
+        # intended instead of what happened, whereas writing nothing attests exactly what this
+        # launch established about the epoch — which is nothing. `sublane resume` then fails
+        # closed on `lane_epoch_attestation_absent`, naming the real state, and the event
+        # carries why. Every other axis of the record is unaffected and the boot is never
+        # blocked.
         emit(
             STAGE_ATTESTATION_WRITE_FAILED,
             ATTESTATION_REASON_LANE_EPOCH_NOT_INJECTED,
         )
+        observed_epoch = ""
     record = IdentityAttestationRecord(
         assigned_name=assigned_name,
         workspace_id=_norm(workspace_id),
