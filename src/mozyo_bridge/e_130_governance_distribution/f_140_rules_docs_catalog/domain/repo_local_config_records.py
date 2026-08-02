@@ -377,8 +377,13 @@ class AutoIntegrationConfig:
     - :attr:`mode` — :data:`AUTO_INTEGRATION_MODE_AUTO` or
       :data:`AUTO_INTEGRATION_MODE_DISABLED`. The default is ``disabled``, which is
       behavior-preserving: nothing integrated itself before #13686 either.
-    - :attr:`integration_branch` — the configured target ref. ``None`` defers to runtime
-      resolution, and a runtime that cannot resolve one fails closed rather than guessing.
+    - :attr:`integration_branch` — the configured target ref. ``None`` is an UNCONFIGURED
+      target, and an unconfigured target integrates nothing. It used to be documented as
+      deferring to "runtime resolution"; no resolver was ever written, and Redmine #14825
+      item 6 withdrew the declaration rather than building one. The value is the target of a
+      push, and resolving it from a late-bound name is the shape #13686 removed from every
+      mutation it performs, so the production composition refuses to build an actuator at all
+      while this is unset (:func:`~....f_140_delegated_coordinator_nested_handoff.application.auto_integration_composition.build_auto_integration_use_case`).
     - :attr:`ff_only` — fast-forward-only (the owner's default). ``False`` admits a merge
       commit, built from objects and never inside a checkout; it does **not** admit a rebase
       or a force push, neither of which this schema can express.
@@ -451,7 +456,8 @@ class AutoIntegrationConfig:
             if not isinstance(integration_branch, str) or not integration_branch.strip():
                 raise RepoLocalConfigError(
                     f"{source} 'integration_branch' must be a non-empty string naming the "
-                    "target branch, or omitted for runtime resolution; got "
+                    "target branch, or omitted to leave the target unconfigured (which "
+                    "integrates nothing); got "
                     f"{integration_branch!r}"
                 )
         return cls(

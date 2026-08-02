@@ -352,6 +352,16 @@ class CleanupAuthority:
     Both of those steps have since been withdrawn (j#96396 / j#96401 finding 1), and what
     these still gate is the managed-process release — a cross-lane side effect in exactly the
     same way, so they are still read fresh from the durable record.
+
+    ``authorizing_action_key`` (Redmine #14825 item 5) is the integration action the DURABLE
+    LIFECYCLE says put this lane's work on the target. It is here because the check that reads it
+    could not fail: the cleanup decision compares the preflight's authorizing key against the
+    record's ``integration_action_key``, and #13686 filled the preflight FROM that same field —
+    two sides of a comparison sourced from one value. A record could therefore authorize itself.
+    The reader now answers this from the actuator's own ledger (which integration action actually
+    ran to completion for this issue, generation and source head), so the comparison has two
+    independently sourced sides again. An empty value is the unsatisfied default: an authority
+    that cannot name the authorizing action has not authorized anything.
     """
 
     issue_closed: bool = False
@@ -359,6 +369,7 @@ class CleanupAuthority:
     integration_ci_settled_green: bool = False
     callbacks_drained: bool = False
     owner_gates_resolved: bool = False
+    authorizing_action_key: str = ""
 
 
 @runtime_checkable

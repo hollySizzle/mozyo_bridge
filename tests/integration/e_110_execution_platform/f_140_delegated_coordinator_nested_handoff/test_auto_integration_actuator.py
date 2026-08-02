@@ -246,6 +246,12 @@ class FakeGitOperations:
         return [args for called, args in self.calls if called == name]
 
 
+#: The integration action key the durable authority reports as having authorized the lane's
+#: cleanup, and the one the cleanup records carry. They are equal here so the gate PASSES;
+#: the tests that matter are the ones where they differ.
+CLEANUP_AUTHORIZING_KEY = "k"
+
+
 @dataclass
 class FakeAuthorityReader:
     """Supplies the durable-record facts no git probe can answer."""
@@ -272,6 +278,12 @@ class FakeAuthorityReader:
             integration_ci_settled_green=True,
             callbacks_drained=True,
             owner_gates_resolved=True,
+            # The authorizing integration action, as a DURABLE reader answers it (Redmine
+            # #14825 item 5). Before that, the preflight took this from the very field the
+            # decision compares it against, so the gate could not fail and no fake had to
+            # supply it. It has to be supplied now, which is the point: the two sides of the
+            # comparison have separate sources again.
+            authorizing_action_key=CLEANUP_AUTHORIZING_KEY,
         )
     )
     withhold_ci: bool = False
@@ -804,7 +816,7 @@ class R6ReviewFindingTest(unittest.TestCase):
                 branch=LANE_BRANCH,
                 worktree_path=LANE_WORKTREE,
                 recorded_source_head=SOURCE,
-                integration_action_key="k",
+                integration_action_key=CLEANUP_AUTHORIZING_KEY,
             )
         )
         self.assertEqual(report.final_decision.state, STATE_RETIRED)
@@ -821,7 +833,7 @@ class R3ReviewFinding2Test(unittest.TestCase):
             "branch": LANE_BRANCH,
             "worktree_path": LANE_WORKTREE,
             "recorded_source_head": SOURCE,
-            "integration_action_key": "k",
+            "integration_action_key": CLEANUP_AUTHORIZING_KEY,
         }
         fields.update(overrides)
         return CleanupActionRecord(**fields)  # type: ignore[arg-type]
@@ -909,6 +921,7 @@ class R3ReviewFinding2Test(unittest.TestCase):
                     integration_ci_settled_green=True,
                     callbacks_drained=True,
                     owner_gates_resolved=True,
+                    authorizing_action_key=CLEANUP_AUTHORIZING_KEY,
                 )
             ),
         ).run_cleanup(self._record())

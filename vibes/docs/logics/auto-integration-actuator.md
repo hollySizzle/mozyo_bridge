@@ -284,7 +284,9 @@ driver も `info/attributes` も **sandbox から見えない**ので、宣言�
   caller preflight も caller ledger も存在しない。
 - 安全事実は **actuator が測る**: git 事実は port probe、durable 事実は `DurableAuthorityReader`、
   lane identity は actuator 自身の `lane_issue` / `lane_generation` / `lane_worktree` /
-  `lane_branch`。**live reader は未実装 (#14825)**。
+  `lane_branch`。**live reader は #14825 で実装済み** (`application/auto_integration_live_authority.py`
+  + pure fold `domain/auto_integration_authority.py`)。reader は自 lane の
+  `issue` + `lane_generation` に束縛され、それ以外を名乗る action record は journal を読む前に拒否する。
 - 測定は **step ごと**に取り直す。integration 側は actuator 自身の mutation が世界を変えるため、
   cleanup 側は durable authority が他者によって動くため。
 - target head は **fresh remote tip**。pre-push は expected-head CAS、post-push は landed-head
@@ -380,10 +382,15 @@ domain/auto_integration_records.py       pure: 2 machine が共有する value o
 domain/auto_integration_policy.py        pure: mode gate / integration 状態遷移
 domain/retirement_cleanup_policy.py      pure: close 後の cleanup 状態遷移 (git 操作を持たない)
 domain/auto_integration_journal.py       pure: durable record renderer (判断はしない)
+domain/auto_integration_authority.py     pure: journal → review / integration / CI の durable fact (#14825)
 application/auto_integration_actuator.py port (Protocol) + use case + config→policy 変換
 application/auto_integration_ports.py     port (Protocol) 定義 + 交換する value object
 application/auto_integration_live_ops.py live subprocess adapter (実 git)
 application/auto_integration_refspec.py  ref spelling 検査 + porcelain 自 ref 行の push 分類
+application/auto_integration_live_authority.py live DurableAuthorityReader (#14825)
+application/auto_integration_ledger.py   durable append-only step ledger (SQLite, #14825)
+application/auto_integration_process_ops.py live ManagedProcessOperations (#14825)
+application/auto_integration_composition.py production composition root + async CI 継続 (#14825)
 ```
 
 `auto_integration_refspec.py` は R22 (j#96516 裁定 2) で `live_ops` から分割した。責務は
@@ -490,9 +497,12 @@ CI は actuator が actuate しない。統合 SHA の CI は非同期 gate で�
 ```yaml
 auto_integration:
   mode: disabled            # auto | disabled (既定 disabled)
-  integration_branch: null  # 未設定は runtime 解決。設定時は action の target と exact 一致必須
+  integration_branch: null  # 未設定 = target 未設定 (何も統合しない)。設定時は action の target と exact 一致必須
   ff_only: true             # 既定 (j#96335)
 ```
+
+`integration_branch: null` は **runtime 解決への委譲ではない** (#14825 item 6 で当該宣言を撤回した。
+詳細は下記 `## live composition (#14825)`)。
 
 **post-close cleanup の key は 1 つも存在しない** (`remove_worktree` / `delete_local_branch` /
 `delete_remote_branch`)。対応する step を全て撤去したため (上記「破壊的操作を持たない理由」)、
@@ -522,13 +532,113 @@ approval / review / close を表す key が構造上存在せず、boundary 形�
 closed-schema screen が拒否する。宣言状況は `mozyo-bridge config status` の
 `auto_integration.*` leaf row で読める (未宣言の実効値が推測ではなく表示される)。
 
+## live composition (#14825)
+
+#13686 は machine と port を作り、実装を一つも束ねなかった。#14825 がそれを束ねる。**この節が
+「production で誰が何を答えるか」の正本**であり、#13686 側の記述と矛盾したらこちらを優先する。
+
+### durable authority は共有 producer を通す (item 1)
+
+live reader は grammar を新設しない。review generation の可否と承認 head、integration disposition は
+`hibernate_basis_producer.produce_conjuncts` — auto-hibernate basis が読むのと **同一の producer** — から
+取る。相関規則 (approval は自分より厳密に前にある最大の `review_request` を答え、head 一致、後続 request で
+supersede) の定義を二本にしないためであり、その producer 自身が「三本目を書いた」defect の記録を持っている
+(checkpoint j#86443 R2-F1)。issuer は `hibernate_issuer_policy` が committed config blob に anchor して解決する。
+
+evidence の lane envelope は **actuator 自身の設定** (`LaneScope`) と exact 一致を要求する。producer が
+target を見ないのは自身の anchor check を tautology にしないためで、比較そのものは caller 側で行う
+(hibernate では T1 classifier が同じ役割を担う)。
+
+**CI だけは latest-wins ではなく head 単位で読む。** source branch の CI と統合 SHA の CI は同じ
+`required_ci_green` gate の下で **別 commit** についての記録であり、後者は前者の後に必ず記録される。
+latest-wins だと統合 SHA の run が着地した瞬間 — つまり非同期継続が再入するその瞬間 — に source CI gate が
+落ち始め、run は永久に `integrated` へ到達できない。したがって問う質問は「この exact commit について green な
+required-CI 記録があるか」であり、別 commit についての記録はこの commit について何も述べていない。
+同一 head について**相異なる** 2 記録は従来どおり conflict で拒否する。境界として、red run は marker を持てない
+(producer は `conclusion=success` しか描画しない) ため「後で red になった」は読めない。撤回は記録ではなく
+action で表現される — action を組み直せば head が変わり、head は一度しか統合されない。
+
+`callbacks_drained` は workspace の callback outbox の未解決債務 (既存 authority)、`owner_gates_resolved` は
+issue 自身の canonical gate fold (`fold_issue_gate_facts`) の `blocked` gate / 未解決 review round から読む。
+actuator は「この issue が止まっているか」について二つ目の意見を持たない。
+
+### ledger は writer identity を自分で持つ (item 4)
+
+`SqliteLedgerStore` は home-scoped SQLite file。`StepOutcome.recorded_by` の自己申告は **読まない** — store が
+file 生成時に鋳造した `writer_id` を stamp する。信頼境界は **ledger file (その permission)** であって
+process ではない。cross-process resume の全目的が「後の process が前の process の記録を信じる」ことなので、
+per-process token では成立しない。保証は「この writer id を持つ entry は、この store の append API を通った」であり、
+それ以上ではない。
+
+**mutation と receipt の間の crash** は `begin_step` の intent 行で保持する。receipt は同一 transaction で
+intent を閉じる。未解決 intent がある action は、次の run が **何も実行せず blocked で止まる** — 「push の
+記録が無い」は「push していない」ではないからである。
+
+`done` step は action key ごとに一度だけ (partial unique index)。重複 merge / 重複 push は reader の後付け
+検査ではなく **store が拒否する**。
+
+### cleanup の authorization は record 自身から来ない (item 5)
+
+#13686 の cleanup preflight は `authorizing_action_key` を `record.integration_action_key` から埋めており、
+decision はそれを同じ field と比較していた。比較の両辺が同一値なので gate は成立し得ず、record が自分自身を
+authorize していた。live reader は **ledger** から答える: この issue / generation / source head の下で
+`push` step を `done`(status `accepted`) で記録した action key が唯一に定まるとき、それが authorizing action である。
+
+**問う step が `integration_ci` ではなく `push` なのは計測結果である。** actuator は CI step を `pending` としか
+記録しない — evidence が決着すると decision はそれを読んで直接 terminal state へ移り、step を実行しないため
+`done` の CI 行は production では一度も書かれない。CI が green だったかは durable record 側の
+`integration_ci_settled_green` が答えるので、ledger には ledger が答えられる問い (どの action が commit を
+publish したか) だけを問う。
+
+### 非同期 CI は待たずに継続する (item 3)
+
+`AsyncCiContinuation` は同じ action record で `run_integration` を再入するだけである。owner は ledger を持つ者、
+trigger は再呼び出し、idempotency は **action key + ledger の一意制約**。二重 wake / operator の再実行 /
+supervisor の retry は再読み・再判断するだけで再 push できない (push は既に `done`、二度目の `done` は store が
+拒否する)。分類は **terminal state** で行う (`integrated` に到達したか) — ledger の CI entry を見る形は
+production では常に blocked と報告する (実測)。
+
+### target branch は設定されているか、actuator が存在しないか (item 6)
+
+`integration_branch: null` は「runtime 解決へ委譲」と記述されていたが resolver は一度も存在しなかった。
+#14825 は resolver を作らず **宣言を撤回する**。対象は **push の target** であり、late-bound な名前で identity を
+代替する形は #13686 が merge (j#96406 F1) / branch delete (j#96396) / worktree remove (j#96401) から
+取り除いた当のものである。composition root は未設定の場合 actuator を **組み立てない** (例外)。
+
+`target_identity_known` は committed config を action-time に読み直して答える。これは
+`policy.integration_branch` (この instance が構築された値) とは **別の問い** であり、repository が現在宣言して
+いない branch に対して構築された actuator は、その不一致で fail-closed する。
+
+### live ManagedProcessOperations (item 7)
+
+対象解決は lifecycle store の `(issue_id, lane_generation)` のみ。path / pane locator / display name は
+解決に一切関与しない。lifecycle row は `(workspace, lane)` で keyed され **現行 generation** を持つので、
+superseded generation は **どの row にも一致しない** — staleness に別 probe は要らない。突合は ownership check
+の **前に全 workspace を横断**する: 自 lane で先に絞ると、同じ issue / generation を主張する別 lane が
+見えなくなり、止めるべき曖昧さが綺麗な単一一致になってしまう。0 件 / 複数件 / foreign lane / inventory 読取不能は
+すべて zero-release。mutation が消費する identity は **解決された row 自身**から作り、row の `revision` を
+driver の `expected_revision` に渡す (解決と mutation の間の lifecycle write — generation bump を含む — は
+close 0 で admission block になる)。
+
+これらは fake ではなく **実 `LaneLifecycleStore`** に対する production test で固定してある
+(`tests/integration/.../test_issue_14825_live_authority_composition.py`、j#96408 の条件 5)。
+
 ## scope 境界 / 未了
 
 - **CLI subcommand 結線は本 tranche に含まない。** `application/cli_sublane_retire.py` が
   #14755 の保護 path であるため、R1 では library + config + docs + preset 層までとした。
   actuator を運用 command から呼ぶ結線は follow-up。
 - **Herdr live smoke / live acceptance は未実施。** #13686 受入条件の残余として親 #12603 へ
-  引き継ぐ。
+  引き継ぐ。#14825 も同じ残余を持つ: composition root は live port を束ねるが、実 Redmine /
+  実 herdr / 実 remote に対する end-to-end 実行は本 tranche で行っていない (実 lifecycle store /
+  実 SQLite ledger に対する production test までが到達点)。**したがって #14825 の受入条件
+  「test fake なしの production composition で success path が成立する」は、composition の
+  存在としては満たすが live 実行の実測としては未達である。**
+- **CI evidence の red 表現が無い。** `required_ci_green` marker は `conclusion=success` しか
+  描画できないため、「一度 green と記録された head が後で red になった」を durable record 側で
+  表現する手段が無い。本 issue は head 単位読取でこの穴を広げてはいないが、閉じてもいない
+  (撤回は action の組み直し = 別 head で表現する、という設計依存)。marker vocabulary の拡張要否は
+  coordinator 判断とする。
 - `domain/sublane_integration_policy.py` (#12604) の retire 判断は **置き換えていない**。本 doc の
   2 machine はその隣に新設したものであり、既存 `sublane retire` の挙動は変えていない。両者の
   統合 / 片寄せは別 issue の判断とする。
@@ -548,6 +658,11 @@ closed-schema screen が拒否する。宣言状況は `mozyo-bridge config stat
   `CoordinatorConfirmationResolutionTest` / `MergeCommitRunTest` に同様に pin してある。
   verdict と full-surface escalation の受け入れは j#96351。
 - `python3 -m unittest tests.integration.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.test_auto_integration_actuator`
+- `python3 -m unittest tests.unit.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.test_issue_14825_auto_integration_authority`
+  (#14825 の durable fold / live reader の identity fence / target 宣言)
+- `python3 -m unittest tests.integration.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.test_issue_14825_live_authority_composition`
+  (#14825 の実 `LaneLifecycleStore` / 実 SQLite ledger に対する production test。zero-release 4 条件、
+  writer identity、crash 境界、非同期 CI 継続、cleanup authorization)
 - `python3 -m unittest tests.unit.e_130_governance_distribution.f_140_rules_docs_catalog.test_auto_integration_config`
 - `PYTHONPATH=src python3 -m mozyo_bridge docs validate --repo .` ほか catalog 検証一式。
 - preset 本文を変えたため `PYTHONPATH=src python3 -m mozyo_bridge scaffold canonical --check` と

@@ -197,6 +197,15 @@ class CleanupRunReport:
 # Use case.
 # ---------------------------------------------------------------------------
 
+#: The steps that change something outside this process, and so are the ones whose intent must
+#: reach the durable ledger before they run (Redmine #14825 item 4). The CI step is absent on
+#: purpose: it observes an asynchronous gate and actuates nothing, so a crash across it loses no
+#: information a re-read cannot recover.
+_MUTATING_INTEGRATION_STEPS: Tuple[str, ...] = (STEP_INTEGRATION_APPLY, STEP_PUSH)
+#: The cleanup machine's one step. It is here for the same reason and no other: a released
+#: managed process is not something a resumed run may offer to release a second time.
+_MUTATING_CLEANUP_STEPS: Tuple[str, ...] = (STEP_PROCESS_RETIRE,)
+
 
 @dataclass(frozen=True)
 class AutoIntegrationUseCase:
@@ -255,8 +264,40 @@ class AutoIntegrationUseCase:
 
     @property
     def recorder_id(self) -> str:
-        """This actuator's ledger provenance — what it stamps on the steps it records."""
-        return self._receipt
+        """This actuator's ledger provenance — what it stamps on the steps it records.
+
+        A store that owns a writer identity supplies it, and this actuator adopts it. That is
+        what makes a resume across processes possible at all: the per-instance receipt below is
+        by construction unrecognisable to the next process, so with it as the provenance a
+        continuation would count nothing the earlier run recorded and would offer the push again.
+        The receipt remains the answer for a store with no identity of its own (the in-memory
+        default), where a process-local boundary is the honest one — that store's entries do not
+        outlive the process either (Redmine #14825 item 4).
+        """
+        declared = str(getattr(self.ledger, "writer_id", "") or "").strip()
+        return declared or self._receipt
+
+    def _unresolved_intent(self, action_key: str) -> Optional[str]:
+        """The step whose side effect may have run and whose outcome never arrived, if any.
+
+        A store that records no intents answers ``None``, which preserves #13686's behaviour
+        exactly. A durable store that does answers with the open step's name, and the run stops:
+        a crash between a ``git push`` and its receipt leaves the ledger with no push entry, and
+        a resume that reads only outcomes cannot tell that from "the push has not been offered
+        yet" — so it offers it again. The intent is the record of the unknown, and an unknown
+        must not resolve to the convenient reading (Redmine #14825 item 4).
+        """
+        reader = getattr(self.ledger, "unresolved_intents", None)
+        if reader is None:
+            return None
+        open_intents = reader(action_key=action_key)
+        return str(open_intents[0].step) if open_intents else None
+
+    def _begin_step(self, action_key: str, step: str) -> None:
+        """Tell the ledger a side effect is about to run, when it can hold that fact."""
+        opener = getattr(self.ledger, "begin_step", None)
+        if opener is not None:
+            opener(action_key=action_key, step=step)
 
     # -- integration ------------------------------------------------------
 
@@ -276,6 +317,24 @@ class AutoIntegrationUseCase:
         because this actuator's own mutations change the world it is deciding about.
         """
         report = IntegrationRunReport()
+        stranded = self._unresolved_intent(record.action_key)
+        if stranded is not None:
+            # Deliberately NOT appended to the ledger: appending an outcome resolves the open
+            # intent, and this run has established nothing about what that step did.
+            report.outcomes.append(
+                StepOutcome(
+                    action_key=record.action_key,
+                    step=stranded,
+                    outcome=OUTCOME_BLOCKED,
+                    recorded_by=self.recorder_id,
+                    detail=(
+                        f"a previous run opened {stranded!r} and never recorded its outcome; "
+                        "the side effect may have happened, so nothing further runs until an "
+                        "operator reconciles what landed"
+                    ),
+                )
+            )
+            return report
         # The ledger comes from this actuator's own store, never from an argument.
         working_ledger: List[StepOutcome] = list(
             self.ledger.read(action_key=record.action_key)
@@ -314,6 +373,10 @@ class AutoIntegrationUseCase:
             if decision.next_step is None:
                 return report
 
+            if decision.next_step in _MUTATING_INTEGRATION_STEPS:
+                # The intent lands BEFORE the side effect. Recording it afterwards would leave
+                # exactly the window it exists to close.
+                self._begin_step(record.action_key, decision.next_step)
             outcome = self._perform_integration_step(
                 decision, record, report, preflight=preflight
             )
@@ -597,7 +660,14 @@ class AutoIntegrationUseCase:
             else CleanupAuthority()
         )
         return CleanupPreflight(
-            authorizing_action_key=record.integration_action_key,
+            # NOT ``record.integration_action_key``. R11 filled this from the very field the
+            # decision compares it against, so ``preflight.authorizing_action_key !=
+            # record.integration_action_key`` could not be true and the gate the cleanup opens
+            # with was unreachable — a record authorized itself (Redmine #14825 item 5). The
+            # authorizing action now comes from the durable authority, which reads which
+            # integration action actually completed for this lane. An authority that cannot name
+            # one leaves this empty, and an empty key matches no record's, so the gate refuses.
+            authorizing_action_key=authority.authorizing_action_key,
             issue_closed=authority.issue_closed,
             integration_confirmed=authority.integration_confirmed,
             integration_ci_settled_green=authority.integration_ci_settled_green,
@@ -625,6 +695,21 @@ class AutoIntegrationUseCase:
         everything the machine decides from is measured here (:meth:`_measure_cleanup`).
         """
         report = CleanupRunReport()
+        stranded = self._unresolved_intent(record.action_key)
+        if stranded is not None:
+            report.outcomes.append(
+                StepOutcome(
+                    action_key=record.action_key,
+                    step=stranded,
+                    outcome=OUTCOME_BLOCKED,
+                    recorded_by=self.recorder_id,
+                    detail=(
+                        f"a previous run opened {stranded!r} and never recorded its outcome; "
+                        "the process may already have been released, so nothing further runs"
+                    ),
+                )
+            )
+            return report
         working_ledger: List[StepOutcome] = list(
             self.ledger.read(action_key=record.action_key)
         )
@@ -646,6 +731,8 @@ class AutoIntegrationUseCase:
             if decision.next_step is None:
                 return report
 
+            if decision.next_step in _MUTATING_CLEANUP_STEPS:
+                self._begin_step(record.action_key, decision.next_step)
             outcome = self._perform_cleanup_step(decision, record)
             report.outcomes.append(outcome)
             self.ledger.append(outcome)

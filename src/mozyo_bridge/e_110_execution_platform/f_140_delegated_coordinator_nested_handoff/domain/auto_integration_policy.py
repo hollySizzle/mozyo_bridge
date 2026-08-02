@@ -663,8 +663,12 @@ def decide_integration(
     # `target_identity_known` asks whether the ref is a known integration branch at all;
     # this asks whether it is the one the operator pointed THIS actuator at. Without it the
     # policy's `integration_branch` was declared and read by nothing, and a record naming a
-    # different target integrated happily. `None` means runtime resolution, which is the
-    # documented "no configured constraint" case, so it imposes none.
+    # different target integrated happily. `None` imposes no constraint HERE — it is an
+    # unconfigured target, and #14825 item 6 made that refusal the composition root's, which
+    # will not build an actuator at all without one. Two gates rather than one, because this
+    # decision must stay evaluable for a directly-constructed use case (the classical tests
+    # do exactly that), and a pure decision cannot read a repository to find out whether a
+    # target was declared.
     if policy.integration_branch is not None and normalized_branch(
         policy.integration_branch
     ) != normalized_branch(record.target_ref):

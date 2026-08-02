@@ -144,8 +144,9 @@ BLOCKED_UNRESOLVED_OWNER_GATE = "unresolved_owner_gate"
 #:
 #: R9 kept the older ``foreign_worktree`` literal "for existing durable records"; review
 #: j#96406 finding 4 pointed out that no such records exist — the production durable reader
-#: and ledger are #14825, unimplemented — so the name was being kept wrong for a
-#: compatibility that has no instances. It says what it means now.
+#: and ledger were #14825, unimplemented — so the name was being kept wrong for a
+#: compatibility that has no instances. It says what it means now. (Both are implemented as of
+#: #14825, so durable records DO exist from here on; the literal they carry is this one.)
 BLOCKED_LANE_IDENTITY_MISMATCH = "lane_identity_mismatch"
 #: The ledger's recorded steps are out of dependency order or carry foreign provenance.
 BLOCKED_LEDGER_UNTRUSTWORTHY = "ledger_untrustworthy"
