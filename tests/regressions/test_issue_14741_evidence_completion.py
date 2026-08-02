@@ -447,15 +447,39 @@ class ActuatorConsumePositionTest(unittest.TestCase):
                     "(evidence_completion_unknown_outcome)",
                 )
 
-    def test_a_process_death_is_not_swallowed_as_an_unknown_outcome(self) -> None:
-        """The one thing NOT caught: dying here is what the position makes survivable."""
+    def test_a_port_failure_folds_but_control_flow_propagates(self) -> None:
+        """Audit j#97142 R1: `except Exception`, not `BaseException`.
 
-        def _dying(*a, **k):
-            raise KeyboardInterrupt("the process died inside the port")
+        A port FAILING is an ``Exception``. A ``KeyboardInterrupt``, ``SystemExit`` or
+        ``GeneratorExit`` is the process or the interpreter unwinding, and swallowing those
+        turns control flow into a typed refusal -- measured: a ``GeneratorExit`` that had to
+        propagate came back as ``evidence_completion_unknown_outcome``.
+        """
 
-        with self.assertRaises(KeyboardInterrupt):
-            self._drive(_dying)
+        class _CustomBase(BaseException):
+            pass
+
+        result = self._drive(self._raising(RuntimeError("a port that simply failed")))
+        self.assertEqual(result.status, "effect_failed")
+        self.assertEqual(
+            result.detail,
+            "update evidence not discharged (evidence_completion_unknown_outcome)",
+        )
         self.assertEqual(self._phase(), "verify_owed")
+
+        for raised in (KeyboardInterrupt, SystemExit, GeneratorExit, _CustomBase):
+            with self.subTest(raised=raised.__name__):
+                self.setUp()
+                with self.assertRaises(raised):
+                    self._drive(self._raising(raised("must propagate")))
+                self.assertEqual(self._phase(), "verify_owed", "zero CAS either way")
+
+    @staticmethod
+    def _raising(error):
+        def _port(*args, **kwargs):
+            raise error
+
+        return _port
 
     def test_a_missing_completion_port_fails_closed(self) -> None:
         """Item 5 / 7: an evidenceful pin at a port-less actuator never reaches replaced."""
@@ -513,25 +537,31 @@ class FiveSiteRuntimeWiringTest(unittest.TestCase):
             "sublane_gateway_recovery",
             "tests.regressions.test_issue_14203_gateway_refresh",
             "HappyPathTests",
+            "test_close_launch_attest_resume_exactly_once",
         ),
         (
             "sublane_stale_worker_recovery",
             "tests.regressions.test_issue_13806_tranche_d_stale_worker_recovery",
             "HappyPathTests",
+            "test_execute_closes_relaunches_attests_and_redispatches_once",
         ),
         (
             "sublane_worker_refresh",
             "tests.regressions.test_issue_14661_worker_refresh",
             "ExecuteTests",
+            "test_close_launch_attest_resume_exactly_once",
         ),
         (
             "sublane_hibernated_bound_pair_composer_discard_live",
             "tests.regressions.test_issue_13933_bound_stale_pair_convergence",
             "A14PartialPreflightSurfaceTests",
+            "test_public_execute_replay_resumes_outer_transaction_through_real_observe",
         ),
     )
 
-    def _drive_and_capture(self, site: str, fixture_module: str, fixture_class: str):
+    def _drive_and_capture(
+        self, site: str, fixture_module: str, fixture_class: str, method: str
+    ):
         import importlib
 
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_actuator import (  # noqa: E501
@@ -550,8 +580,8 @@ class FiveSiteRuntimeWiringTest(unittest.TestCase):
         ReplacementActuatorUseCase.__init__ = spy
         try:
             fixture = importlib.import_module(fixture_module)
-            suite = unittest.TestLoader().loadTestsFromTestCase(
-                getattr(fixture, fixture_class)
+            suite = unittest.TestLoader().loadTestsFromName(
+                method, getattr(fixture, fixture_class)
             )
             result = unittest.TestResult()
             suite.run(result)
@@ -560,7 +590,8 @@ class FiveSiteRuntimeWiringTest(unittest.TestCase):
         self.assertEqual(
             (len(result.failures), len(result.errors)),
             (0, 0),
-            f"{fixture_module}.{fixture_class} must be green for its capture to mean anything",
+            f"{fixture_module}.{fixture_class}.{method} must be green for its capture"
+            " to mean anything",
         )
         return captured
 
@@ -587,9 +618,11 @@ class FiveSiteRuntimeWiringTest(unittest.TestCase):
         )
 
     def test_each_reachable_site_wires_a_completion_that_really_consumes(self) -> None:
-        for site, fixture_module, fixture_class in self.REACHABLE:
+        for site, fixture_module, fixture_class, method in self.REACHABLE:
             with self.subTest(site=site):
-                captured = self._drive_and_capture(site, fixture_module, fixture_class)
+                captured = self._drive_and_capture(
+                    site, fixture_module, fixture_class, method
+                )
                 self.assertTrue(
                     captured, f"{site} never constructed an actuator at runtime"
                 )
@@ -603,44 +636,88 @@ class FiveSiteRuntimeWiringTest(unittest.TestCase):
                     f"{site}'s completion did not reach the receipt store under its own home",
                 )
 
-    def test_the_convergence_site_has_no_runtime_coverage_and_that_is_recorded(self) -> None:
-        """MEASURED, and reported to j#97136 rather than papered over.
+    def test_the_convergence_site_constructs_and_really_consumes_too(self) -> None:
+        """Audit j#97142 R2: the fifth site, driven for real rather than recorded as a gap.
 
-        No test in this repo drives `sublane_hibernated_bound_pair_convergence_live` as far
-        as its actuator construction: its live ops stop at a real inventory read that the
-        available fixtures do not stand up. Its wiring is therefore evidenced only by the
-        source assertion below -- which is exactly the weaker proof F3 objected to, so it is
-        stated here as a gap rather than counted as coverage.
+        Its live ops stop at a real inventory read, which is why the family's own fixtures
+        never reach the actuator. Seaming exactly two things -- the inventory listing, and
+        the actuator's own effects -- lets the REAL `drive_replacement` run to the
+        construction, which is the thing under test. Everything else (observation,
+        approval, expectation, transaction store) is the family's production fixture.
         """
         import importlib
+        from unittest import mock
 
+        from mozyo_bridge.core.state.replacement_transaction import (
+            ReplacementTransactionStore,
+        )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_actuator import (  # noqa: E501
+            ActuationResult,
             ReplacementActuatorUseCase,
         )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (  # noqa: E501
+            ACTUATION_RECOVERED,
+        )
+        from tests.support.current_launch_authority import seed_current_generation
 
-        site = "sublane_hibernated_bound_pair_convergence_live"
+        family = importlib.import_module(
+            "tests.regressions.test_issue_13933_bound_stale_pair_convergence"
+        )
+        site = importlib.import_module(
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff"
+            ".application.sublane_hibernated_bound_pair_convergence_live"
+        )
+
+        home = Path(tempfile.mkdtemp())
+        store = ReplacementTransactionStore(home=home)
+        authorising = family.FakeOps(family._observation())
+        initial = authorising.observe(family.REQ)
+        _preflight, fields = family._authorize(authorising)
+        expectation = family._expectation_from(authorising, fields)
+        for slot in initial.slots:
+            seed_current_generation(
+                home, workspace_id=initial.workspace_id, lane_id=family.REQ.lane,
+                role=slot.role, assigned_name=slot.assigned_name, locator=slot.locator,
+            )
+
         captured = []
-        original = ReplacementActuatorUseCase.__init__
+        original_init = ReplacementActuatorUseCase.__init__
+        original_drive = ReplacementActuatorUseCase.drive_worker_recovery
+        original_rows = site.list_herdr_agent_rows
 
-        def spy(self, store, port, **kwargs):
-            if sys._getframe(1).f_globals.get("__name__", "").rsplit(".", 1)[-1] == site:
-                captured.append(kwargs.get("evidence_completion"))
-            return original(self, store, port, **kwargs)
+        def spy(self, transaction_store, port, **kwargs):
+            caller = sys._getframe(1).f_globals.get("__name__", "")
+            if caller.rsplit(".", 1)[-1].endswith("convergence_live"):
+                captured.append((transaction_store, kwargs.get("evidence_completion")))
+            return original_init(self, transaction_store, port, **kwargs)
 
         ReplacementActuatorUseCase.__init__ = spy
+        # Only the actuator's EFFECTS are seamed -- its construction, which is what this
+        # test is about, still happens in the production code path.
+        ReplacementActuatorUseCase.drive_worker_recovery = (
+            lambda self, *a, **k: ActuationResult(status=ACTUATION_RECOVERED)
+        )
+        site.list_herdr_agent_rows = lambda *a, **k: ()
         try:
-            fixture = importlib.import_module(
-                "tests.regressions.test_issue_13933_bound_stale_pair_convergence"
+            ops = site.LiveBoundPairConvergenceOps(
+                repo_root=Path("/coordinator"), env={}, transaction_store=store
             )
-            suite = unittest.TestLoader().loadTestsFromModule(fixture)
-            unittest.TestResult()
-            suite.run(unittest.TestResult())
+            ops.observe = mock.Mock(return_value=initial)
+            drive = ops.drive_replacement(family.REQ, expectation, initial)
         finally:
-            ReplacementActuatorUseCase.__init__ = original
+            ReplacementActuatorUseCase.__init__ = original_init
+            ReplacementActuatorUseCase.drive_worker_recovery = original_drive
+            site.list_herdr_agent_rows = original_rows
+
+        self.assertTrue(drive.ok, f"{drive.status}: {drive.detail}")
+        self.assertEqual(len(captured), 1, "exactly one actuator construction")
+        captured_store, completion = captured[0]
+        self.assertIs(captured_store, store, "the site's own transaction store")
+        self.assertIsNotNone(completion)
         self.assertEqual(
-            captured,
-            [],
-            "if this fires, the site IS runtime-reachable and belongs in REACHABLE above",
+            self._prove_real_consume(captured_store, completion),
+            CONSUME_OK,
+            "the captured completion did not reach the receipt store under its own home",
         )
 
 

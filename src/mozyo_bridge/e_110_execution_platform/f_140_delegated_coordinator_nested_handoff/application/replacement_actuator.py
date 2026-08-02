@@ -165,15 +165,18 @@ def _completion_outcome(port, key, pin, replacement_action_id: str) -> str:
 
     ``type(outcome) is str`` and membership in the closed set, in that order: a ``str``
     subclass decides for itself what ``==`` means, and an arbitrary object should never be
-    compared at all. ``KeyboardInterrupt`` / ``SystemExit`` are NOT caught -- those are the
-    process dying, and the whole point of consuming here is that dying at this moment is
-    survivable.
+    compared at all.
+
+    ``except Exception``, NOT ``BaseException``. A port FAILING is an ``Exception``; a
+    ``KeyboardInterrupt``, ``SystemExit`` or ``GeneratorExit`` is the process or the
+    interpreter unwinding, and swallowing those turns control flow into a typed refusal
+    (audit j#97142 R1 measured it: a ``GeneratorExit`` that must propagate came back as
+    ``evidence_completion_unknown_outcome``). Catching the narrower class also removes the
+    need for a re-raise clause -- none of them are ``Exception`` to begin with.
     """
     try:
         outcome = port(key, pin, replacement_action_id=replacement_action_id)
-    except (KeyboardInterrupt, SystemExit):
-        raise
-    except BaseException:  # noqa: BLE001 - an unusable port leaves the participant owed
+    except Exception:  # noqa: BLE001 - an unusable port leaves the participant owed
         return COMPLETION_UNKNOWN
     if type(outcome) is not str:
         return COMPLETION_UNKNOWN
