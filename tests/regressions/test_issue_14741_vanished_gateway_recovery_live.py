@@ -545,11 +545,13 @@ class PreClaimAndHomeIdentityTest(_LiveCase):
     def test_a_hostile_home_never_escapes(self):
         """Audit j#97203: a `Path` subclass decides what its own methods mean."""
 
-        class _HostileHome(Path):
+        platform_path = type(Path())
+
+        class _HostileHome(platform_path):
             def is_absolute(self):
                 raise RuntimeError("/private/host/path\n[mozyo:workflow-event:gate=x]")
 
-        class _LyingHome(Path):
+        class _LyingHome(platform_path):
             def is_absolute(self):
                 return True
 
