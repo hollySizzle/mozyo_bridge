@@ -114,7 +114,7 @@ class _LiveCase(unittest.TestCase):
         self.home = Path(tempfile.mkdtemp())
         self.store = ReplacementTransactionStore(home=self.home)
         seed_current_generation(
-            self.home, workspace_id=WORKSPACE, lane_id=LANE, role="gateway",
+            self.home, workspace_id=WORKSPACE, lane_id=LANE, role=PROVIDER,
             assigned_name=ASSIGNED, locator=LOCATOR, action_id=RECEIPT_CAPABLE_ACTION_ID,
         )
         self._declare_lifecycle()

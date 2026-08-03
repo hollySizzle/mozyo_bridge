@@ -83,7 +83,7 @@ def seed_current_generations(home: Path, participants: Iterable, *, workspace_id
             home,
             workspace_id=workspace_id,
             lane_id=getattr(pin, "lane_id", ""),
-            role=getattr(pin, "role", ""),
+            role=getattr(pin, "provider", ""),
             assigned_name=getattr(pin, "assigned_name", ""),
             locator=getattr(pin, "old_locator", "") or getattr(pin, "locator", ""),
             action_id=action_id,

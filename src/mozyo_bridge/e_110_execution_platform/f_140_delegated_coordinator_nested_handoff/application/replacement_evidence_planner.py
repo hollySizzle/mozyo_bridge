@@ -20,7 +20,8 @@ What it will and will not do
 - a **legacy / generic** generation is returned byte-exact and the receipt store is never
   opened. That is what keeps every pre-#14741 replacement identical, including its cost;
 - a **receipt-capable** generation is planned only when the whole identity agrees —
-  workspace, lane, role, provider, assigned name, old locator, the lifecycle
+  workspace, lane, generation provider (stored in its legacy ``role`` column), canonical
+  logical role, assigned name, old locator, the lifecycle
   ``(generation, revision)``, the startup action id, and the bound evidence's own key and
   cause. Then, and only then, a NEW pin is returned carrying the triplet, with every
   existing field of the input pin untouched;
@@ -347,10 +348,15 @@ class ReplacementEvidencePlanner:
         and the locator, which are the two a same-named slot in another workspace, or a
         recycled pane, would differ on.
         """
+        if not _exact(getattr(pin, "role", None)):
+            raise EvidencePlanRefused(
+                REFUSE_GENERATION_MISMATCH,
+                "the live launch generation is not the participant this plan names",
+            )
         for attr, expected in (
             ("workspace_id", context.workspace_id),
             ("lane_id", context.lane_id),
-            ("role", _exact(getattr(pin, "role", None))),
+            ("role", _exact(getattr(pin, "provider", None))),
             ("assigned_name", _exact(getattr(pin, "assigned_name", None))),
             ("locator", _exact(getattr(pin, "old_locator", None))),
         ):

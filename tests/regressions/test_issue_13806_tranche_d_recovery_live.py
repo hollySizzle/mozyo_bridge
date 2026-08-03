@@ -321,6 +321,25 @@ class ActuatorDelegationTests(_LiveCase):
 
         self.assertEqual(self._port(FakeQ()).close_exact_generation(self._pin()), CLOSE_DONE)
 
+    def test_close_addresses_provider_not_logical_participant_role(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine import (  # noqa: E501
+            CloseReceiverResult,
+        )
+
+        addressed = []
+
+        class FakeQ:
+            def close_receiver(self, req, pin):
+                addressed.append(pin.role)
+                return CloseReceiverResult(closed=True)
+
+        pin = ParticipantPin(
+            lane_id=LANE, role="worker", provider=ROLE, assigned_name=NAME,
+            old_locator=LOCATOR, lane_revision="3", lane_generation="2",
+        )
+        self.assertEqual(self._port(FakeQ()).close_exact_generation(pin), CLOSE_DONE)
+        self.assertEqual(addressed, [ROLE])
+
     def test_close_failure_maps_to_error(self):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine import (  # noqa: E501
             CloseReceiverResult,

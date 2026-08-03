@@ -364,7 +364,7 @@ class LiveRecoveryActuatorPort:
     def close_exact_generation(self, pin: ParticipantPin) -> str:
         try:
             release = ReleasePin(
-                role=pin.role, assigned_name=pin.assigned_name, locator=pin.old_locator
+                role=pin.provider, assigned_name=pin.assigned_name, locator=pin.old_locator
             )
         except ReleasePinError:
             return CLOSE_ERROR

@@ -259,7 +259,7 @@ class _PlanCase(unittest.TestCase):
 
     def _seed_generation(self, action_id=LEGACY_ACTION_ID, **kw):
         base = dict(
-            workspace_id=WORKSPACE, lane_id=LANE, role="gateway",
+            workspace_id=WORKSPACE, lane_id=LANE, role=PROVIDER,
             assigned_name=ASSIGNED, locator=LOCATOR, action_id=action_id,
         )
         base.update(kw)
@@ -365,6 +365,7 @@ class AuthorityRefusalTest(_PlanCase):
             ("pending row", LEGACY_ACTION_ID, {"attested": False}, REFUSE_GENERATION_MISMATCH),
             ("another workspace", LEGACY_ACTION_ID, {"workspace_id": "OTHER"}, REFUSE_GENERATION_MISMATCH),
             ("another lane", LEGACY_ACTION_ID, {"lane_id": "issue_other"}, REFUSE_GENERATION_MISMATCH),
+            ("another provider", LEGACY_ACTION_ID, {"role": "claude"}, REFUSE_GENERATION_MISMATCH),
             ("recycled pane", LEGACY_ACTION_ID, {"locator": "ws:p9"}, REFUSE_GENERATION_MISMATCH),
         )
         for label, action_id, overrides, expected in cases:
@@ -472,7 +473,7 @@ class ReceiptPlanTest(_PlanCase):
         g2_locator = "ws:p2"
         g2_action = "startup-ir1-" + "e" * 64
         seed_current_generation(
-            self.home, workspace_id=WORKSPACE, lane_id=LANE, role="gateway",
+            self.home, workspace_id=WORKSPACE, lane_id=LANE, role=PROVIDER,
             assigned_name=ASSIGNED, locator=g2_locator, action_id=g2_action,
         )
         g2_lifecycle = self._open_next_lifecycle_generation()

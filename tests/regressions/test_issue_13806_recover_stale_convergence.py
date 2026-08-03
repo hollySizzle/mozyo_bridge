@@ -546,7 +546,7 @@ class _ConvergenceCase(unittest.TestCase):
         # and this lane is a pre-#14741 one -- stated as a canonical untagged row for the
         # exact slot rather than left as an absent authority (which now refuses).
         seed_current_generation(
-            self.home, workspace_id=WS, lane_id=LANE, role=ROLE,
+            self.home, workspace_id=WS, lane_id=LANE, role=PROVIDER,
             assigned_name=NAME, locator=LOCATOR,
         )
 

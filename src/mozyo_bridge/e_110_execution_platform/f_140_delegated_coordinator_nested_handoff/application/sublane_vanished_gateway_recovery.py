@@ -115,7 +115,7 @@ def _current_generation(home: Optional[Path], authority: ParticipantAuthority):
     for attr, expected in (
         ("workspace_id", authority.workspace_id),
         ("lane_id", authority.lane_id),
-        ("role", authority.role),
+        ("role", authority.provider),
         ("assigned_name", authority.assigned_name),
         ("locator", authority.old_locator),
     ):

@@ -241,7 +241,7 @@ class _RecoveryCase(unittest.TestCase):
     def _seed_current_authority(self, **overrides):
         base = dict(
             workspace_id=self.workspace_id, lane_id=WORKER["lane_id"],
-            role=WORKER["role"], assigned_name=WORKER["assigned_name"],
+            role=WORKER["provider"], assigned_name=WORKER["assigned_name"],
             locator=WORKER["old_locator"],
         )
         base.update(overrides)

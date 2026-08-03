@@ -56,7 +56,7 @@ def _pin(**kw):
     return ParticipantPin(**base)
 
 
-def _generation(action_id=ACTION, phase="attested", role="gateway", lane="issue_14741",
+def _generation(action_id=ACTION, phase="attested", role="codex", lane="issue_14741",
                 workspace="wA", assigned="mzb1_wA_codex_lane", locator="wA:p1"):
     return SimpleNamespace(
         startup_action_id=action_id, phase=phase, role=role, lane_id=lane,
@@ -224,7 +224,7 @@ class RefusalTest(unittest.TestCase):
 
     def test_a_generation_for_a_different_participant_refuses(self) -> None:
         self._refuses(
-            "generation_mismatch", _Ports(generation=_generation(role="worker"))
+            "generation_mismatch", _Ports(generation=_generation(role="claude"))
         )
         self._refuses(
             "generation_mismatch", _Ports(generation=_generation(lane="issue_other"))
@@ -424,7 +424,7 @@ class CurrentRowIsTheOnlyBindingTest(unittest.TestCase):
         for label, generation in (
             ("another workspace", _generation(action_id=LEGACY_ACTION, workspace="wB")),
             ("another lane", _generation(action_id=LEGACY_ACTION, lane="issue_OTHER")),
-            ("another role", _generation(action_id=LEGACY_ACTION, role="worker")),
+            ("another provider", _generation(action_id=LEGACY_ACTION, role="claude")),
             ("another slot", _generation(action_id=LEGACY_ACTION, assigned="someone_else")),
             ("a recycled pane", _generation(action_id=LEGACY_ACTION, locator="wA:p9")),
         ):

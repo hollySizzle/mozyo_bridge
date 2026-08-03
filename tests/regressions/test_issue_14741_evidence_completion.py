@@ -683,7 +683,7 @@ class SiteRuntimeWiringTest(unittest.TestCase):
         for slot in initial.slots:
             seed_current_generation(
                 home, workspace_id=initial.workspace_id, lane_id=family.REQ.lane,
-                role=slot.role, assigned_name=slot.assigned_name, locator=slot.locator,
+                role=slot.provider, assigned_name=slot.assigned_name, locator=slot.locator,
             )
 
         captured = []

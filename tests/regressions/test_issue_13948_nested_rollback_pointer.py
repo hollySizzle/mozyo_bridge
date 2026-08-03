@@ -303,7 +303,7 @@ class RealDriveWiringTest(unittest.TestCase):
         # slots the observation carries rather than left absent (which now refuses).
         for slot in self.obs.slots:
             seed_current_generation(
-                self.home, workspace_id=WS, lane_id=LANE, role=slot.role,
+                self.home, workspace_id=WS, lane_id=LANE, role=slot.provider,
                 assigned_name=slot.assigned_name, locator=slot.locator,
             )
         self.unit = StartupUnit(WS, LANE, _MANAGED)

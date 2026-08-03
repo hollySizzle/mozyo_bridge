@@ -530,7 +530,7 @@ class LiveActuatorBoundaryTests(unittest.TestCase):
         for slot in initial.slots:
             seed_current_generation(
                 recording_home, workspace_id=initial.workspace_id, lane_id=REQ.lane,
-                role=slot.role, assigned_name=slot.assigned_name, locator=slot.locator,
+                role=slot.provider, assigned_name=slot.assigned_name, locator=slot.locator,
             )
 
         class RecordingStore:
@@ -2411,11 +2411,11 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
             # Ruling j#97105: the discard plan reads each participant's CURRENT
             # launch-generation row. This lane is a pre-#14741 one, and that is now a
             # recorded fact about these two exact slots rather than the absence of a row.
-            for name, locator, role in (
-                (gw_name, gw_old, "gateway"), (wk_name, wk_old, "worker"),
+            for name, locator, provider in (
+                (gw_name, gw_old, "codex"), (wk_name, wk_old, "claude"),
             ):
                 seed_current_generation(
-                    home, workspace_id=workspace, lane_id=self.LANE, role=role,
+                    home, workspace_id=workspace, lane_id=self.LANE, role=provider,
                     assigned_name=name, locator=locator,
                 )
 
