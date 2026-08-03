@@ -46,12 +46,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     prepare_vanished_gateway_continuation,
     resolve_vanished_gateway_inventory,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E402,E501
-    repo_scope_workspace_id,
-)
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E402,E501
-    resolve_gateway_provider,
-)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E402,E501
     sublane_vanished_gateway_continuation as continuation_module,
 )
@@ -506,9 +500,9 @@ class RefusalTest(_PrepareCase):
         self.assertEqual(opens, [], "zero delivery-ledger opens")
 
 
-JOIN_WORKSPACE = repo_scope_workspace_id(ROOT)
+JOIN_WORKSPACE = "ws"
 JOIN_LANE = "issue_14741"
-JOIN_PROVIDER = resolve_gateway_provider(str(ROOT))
+JOIN_PROVIDER = "codex"
 JOIN_OLD = "w4B:p61"
 JOIN_FRESH = "w4B:p81"
 
@@ -590,14 +584,32 @@ class FreshInventoryJoinTest(unittest.TestCase):
     """B6b3-2a(2): identify a fresh target, but exercise no delivery authority."""
 
     def _resolve(self, rows=None, **changes):
-        return resolve_vanished_gateway_inventory(
-            changes.pop("preparation", _join_preparation()),
-            repo_root=changes.pop("repo_root", ROOT),
-            list_rows=changes.pop(
-                "list_rows", lambda: [_live_row()] if rows is None else rows
-            ),
-            **changes,
+        workspace_resolver = changes.pop(
+            "_workspace_resolver", lambda root: JOIN_WORKSPACE
         )
+        provider_resolver = changes.pop(
+            "_provider_resolver", lambda root: JOIN_PROVIDER
+        )
+        originals = (
+            continuation_module.repo_scope_workspace_id,
+            continuation_module.resolve_gateway_provider,
+        )
+        continuation_module.repo_scope_workspace_id = workspace_resolver
+        continuation_module.resolve_gateway_provider = provider_resolver
+        try:
+            return resolve_vanished_gateway_inventory(
+                changes.pop("preparation", _join_preparation()),
+                repo_root=changes.pop("repo_root", ROOT),
+                list_rows=changes.pop(
+                    "list_rows", lambda: [_live_row()] if rows is None else rows
+                ),
+                **changes,
+            )
+        finally:
+            (
+                continuation_module.repo_scope_workspace_id,
+                continuation_module.resolve_gateway_provider,
+            ) = originals
 
     def test_caller_cannot_supply_workspace_provider_locator_or_pin_authority(self) -> None:
         import inspect
@@ -656,43 +668,23 @@ class FreshInventoryJoinTest(unittest.TestCase):
             calls["inventory"] += 1
             return [_live_row()]
 
-        originals = (
-            continuation_module.repo_scope_workspace_id,
-            continuation_module.resolve_gateway_provider,
+        result = self._resolve(
+            list_rows=inventory,
+            _workspace_resolver=workspace,
+            _provider_resolver=provider,
         )
-        continuation_module.repo_scope_workspace_id = workspace
-        continuation_module.resolve_gateway_provider = provider
-        try:
-            result = self._resolve(list_rows=inventory)
-        finally:
-            (
-                continuation_module.repo_scope_workspace_id,
-                continuation_module.resolve_gateway_provider,
-            ) = originals
         self.assertEqual(result.outcome, INVENTORY_JOINED)
         self.assertEqual(calls, {"workspace": 1, "provider": 1, "inventory": 1})
 
     def test_an_exact_absolute_string_repo_root_is_also_canonical(self) -> None:
         self.assertEqual(self._resolve(repo_root=str(ROOT)).outcome, INVENTORY_JOINED)
 
-    def test_default_resolvers_join_the_repo_canonical_workspace_and_binding(self) -> None:
-        workspace = repo_scope_workspace_id(ROOT)
-        provider = resolve_gateway_provider(str(ROOT))
-        assigned = encode_assigned_name(workspace, provider, JOIN_LANE)
-        pin = _join_pin(
-            provider=provider,
-            assigned_name=assigned,
-            evidence_workspace_id=workspace,
+    def test_an_unregistered_canonical_workspace_never_falls_back(self) -> None:
+        result = self._resolve(
+            _workspace_resolver=lambda root: "",
         )
-        preparation = _join_preparation(pin=pin, workspace_id=workspace)
-        result = resolve_vanished_gateway_inventory(
-            preparation,
-            repo_root=ROOT,
-            list_rows=lambda: [_live_row(name=assigned, agent=provider)],
-        )
-        self.assertEqual(result.outcome, INVENTORY_JOINED)
-        self.assertEqual(result.workspace_id, workspace)
-        self.assertEqual(result.provider, provider)
+        self.assertEqual(result.stopped, STOPPED_INVENTORY_UNAVAILABLE)
+        self.assertEqual(result.outcome, "")
 
     def test_absent_or_duplicate_name_is_never_selected(self) -> None:
         assigned = encode_assigned_name(JOIN_WORKSPACE, JOIN_PROVIDER, JOIN_LANE)
@@ -740,21 +732,13 @@ class FreshInventoryJoinTest(unittest.TestCase):
             raise RuntimeError(secret)
 
         cases = (
-            ("workspace", "repo_scope_workspace_id"),
-            ("provider", "resolve_gateway_provider"),
-            ("inventory", ""),
+            ("workspace", dict(_workspace_resolver=broken)),
+            ("provider", dict(_provider_resolver=broken)),
+            ("inventory", dict(list_rows=broken)),
         )
-        for label, attribute in cases:
+        for label, kwargs in cases:
             with self.subTest(label=label):
-                if not attribute:
-                    result = self._resolve(list_rows=broken)
-                else:
-                    original = getattr(continuation_module, attribute)
-                    setattr(continuation_module, attribute, broken)
-                    try:
-                        result = self._resolve()
-                    finally:
-                        setattr(continuation_module, attribute, original)
+                result = self._resolve(**kwargs)
                 self.assertEqual(result.stopped, STOPPED_INVENTORY_UNAVAILABLE)
                 self.assertNotIn(secret, f"{result.stopped}{result.detail}")
 
