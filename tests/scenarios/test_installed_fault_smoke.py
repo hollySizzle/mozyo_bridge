@@ -341,3 +341,65 @@ class CallbackDiagnosticsShapeTests(unittest.TestCase):
         self.assertIn('"send_reason"', source)
         self.assertIn("send_reason", published)
         self.assertNotIn("reason", published - {"send_reason", "persist_reason"})
+
+
+class Post14741InstalledFixtureTests(unittest.TestCase):
+    """The installed smoke must positively satisfy the authority it is testing through."""
+
+    @staticmethod
+    def _driver():
+        spec = importlib.util.spec_from_file_location(
+            "installed_fault_smoke_driver_post14741",
+            ROOT / "smoke" / "installed_fault_smoke_driver.py",
+        )
+        driver = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(driver)
+        return driver
+
+    def test_callback_fixture_builds_a_positive_codex_updater_authority(self):
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_update_authority_preflight import (  # noqa: E501
+            evaluate_update_authority,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter import (  # noqa: E501
+            builtin_updater_target_probe,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            env = self._driver()._with_aligned_fake_codex_updater(
+                {"PATH": "/usr/bin:/bin"}, Path(directory)
+            )
+            verdict = evaluate_update_authority(
+                "codex",
+                env,
+                updater_targets=builtin_updater_target_probe(env),
+            )
+        self.assertTrue(verdict.admits_actuation)
+        self.assertEqual(verdict.authority, "aligned")
+
+    def test_recover_failure_diagnostics_are_content_free(self):
+        diagnostics = {}
+        self._driver()._record_recover_diag(
+            diagnostics,
+            "recover_stale",
+            {
+                "pass1": {
+                    "status": "stopped",
+                    "verdict": "store_unavailable",
+                    "recovery_status": "in_progress",
+                },
+                "pass2": {
+                    "status": "stopped",
+                    "verdict": "fresh_receipt_missing",
+                    "redispatch_status": "not_attempted",
+                },
+                "agents_unchanged": True,
+                "redispatch_attempt_count": 0,
+                "redispatch_ok_count": 0,
+            },
+            accepted=False,
+        )
+        record = diagnostics["recover_stale"]
+        self.assertEqual(record["pass2_verdict"], "fresh_receipt_missing")
+        self.assertNotIn("path", str(record).lower())
+        self.assertNotIn("locator", str(record).lower())

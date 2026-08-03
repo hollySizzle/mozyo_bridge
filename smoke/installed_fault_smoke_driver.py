@@ -156,14 +156,18 @@ def drive_representative(
     except (ValueError, StopIteration, KeyError):
         results["sublane_list"] = False
 
-    results["recover_stale"] = _drive_recover_stale(cli, tmp)
-    results["recover_stale_negative"] = _drive_recover_stale_negative(cli, tmp)
+    results["recover_stale"] = _drive_recover_stale(cli, tmp, diagnostics)
+    results["recover_stale_negative"] = _drive_recover_stale_negative(
+        cli, tmp, diagnostics
+    )
     results["session_rollback"] = _drive_session_rollback(cli, tmp)
     results["callback_exactly_once"] = _drive_callback_exactly_once(cli, tmp, diagnostics)
     return results
 
 
-def _drive_recover_stale(cli: Path, tmp: Path) -> bool:
+def _drive_recover_stale(
+    cli: Path, tmp: Path, diagnostics: "dict | None" = None
+) -> bool:
     """F2 positive installed: the recovery drives to the COMPLETED terminal through the artifact.
 
     Not a boolean resume flag (Redmine #14097 review j#85090 F2 — ``post_close_resume`` is true for
@@ -176,10 +180,15 @@ def _drive_recover_stale(cli: Path, tmp: Path) -> bool:
     """
     from installed_fault_smoke import recover_stale_accepts
 
-    return recover_stale_accepts(_recover_stale_outcome(cli, tmp, "rs"))
+    outcome = _recover_stale_outcome(cli, tmp, "rs")
+    accepted = recover_stale_accepts(outcome)
+    _record_recover_diag(diagnostics, "recover_stale", outcome, accepted=accepted)
+    return accepted
 
 
-def _drive_recover_stale_negative(cli: Path, tmp: Path) -> bool:
+def _drive_recover_stale_negative(
+    cli: Path, tmp: Path, diagnostics: "dict | None" = None
+) -> bool:
     """F2 negative CONTROL installed: the SAME acceptance predicate must reject an injected fault.
 
     Seed the fresh receiver's attestation OUTSIDE the redispatch's durable landing window so the
@@ -193,13 +202,67 @@ def _drive_recover_stale_negative(cli: Path, tmp: Path) -> bool:
     from installed_fault_smoke import recover_stale_accepts
 
     outcome = _recover_stale_outcome(cli, tmp, "rsneg", inject_uncertain=True)
-    if outcome is None:
+    if not isinstance(outcome, dict) or "setup_error" in outcome:
+        _record_recover_diag(
+            diagnostics, "recover_stale_negative", outcome, accepted=False
+        )
         return False
     injected_uncertain = (
         outcome["pass2"].get("redispatch_status") == "uncertain"
         and outcome["pass2"].get("status") != "completed"
     )
-    return injected_uncertain and not recover_stale_accepts(outcome)
+    accepted = injected_uncertain and not recover_stale_accepts(outcome)
+    _record_recover_diag(
+        diagnostics,
+        "recover_stale_negative",
+        outcome,
+        accepted=accepted,
+        injected_uncertain=injected_uncertain,
+    )
+    return accepted
+
+
+def _record_recover_diag(
+    diagnostics: "dict | None",
+    name: str,
+    outcome: "dict | None",
+    *,
+    accepted: bool,
+    injected_uncertain: "bool | None" = None,
+) -> None:
+    """Publish only closed tokens/counts when an installed recovery drive fails."""
+    if diagnostics is None:
+        return
+    record = {"parse_ok": isinstance(outcome, dict), "accepted": accepted}
+    if injected_uncertain is not None:
+        record["injected_uncertain"] = injected_uncertain
+    if isinstance(outcome, dict):
+        record["setup_error"] = outcome.get("setup_error")
+        record["pass1_exit"] = outcome.get("pass1_exit")
+        record["pass2_exit"] = outcome.get("pass2_exit")
+        axes = outcome.get("launch_authority_axes")
+        record["launch_authority_axes"] = (
+            dict(axes) if isinstance(axes, dict) else None
+        )
+        for prefix in ("pass1", "pass2"):
+            payload = outcome.get(prefix)
+            if isinstance(payload, dict):
+                record[f"{prefix}_status"] = payload.get("status")
+                record[f"{prefix}_verdict"] = payload.get("verdict")
+                record[f"{prefix}_recovery_status"] = payload.get("recovery_status")
+                record[f"{prefix}_redispatch_status"] = payload.get("redispatch_status")
+                observation = payload.get("observation")
+                record[f"{prefix}_observation"] = (
+                    dict(observation) if isinstance(observation, dict) else None
+                )
+                preservation = payload.get("preservation_reasons")
+                record[f"{prefix}_preservation_reasons"] = (
+                    list(preservation) if isinstance(preservation, list) else []
+                )
+        record["agents_unchanged"] = outcome.get("agents_unchanged")
+        record["redispatch_attempt_count"] = outcome.get("redispatch_attempt_count")
+        record["redispatch_ok_count"] = outcome.get("redispatch_ok_count")
+    diagnostics[name] = record
 
 
 def _recover_stale_outcome(
@@ -239,7 +302,11 @@ def _recover_stale_outcome(
     lkey = LaneLifecycleKey(ws_id, lane)
     lstore.declare_active(lkey, decision=DecisionPointer(source="redmine", issue_id="14097",
                           journal_id="79485"), issue_id="14097",
-                          worktree_identity=derive_lane_workspace_token(str(repo)))
+                          # Mint-time uses the same canonical root the action-time launch
+                          # fence verifies. On macOS a temp path may spell `/var/...` while
+                          # `resolve()` is `/private/var/...`; pinning the alias makes an exact
+                          # checkout look moved and stops before the recovery launch.
+                          worktree_identity=derive_lane_workspace_token(str(repo.resolve())))
     lrec = lstore.get(lkey)
     name = encode_assigned_name(ws_id, "claude", lane)
     fake = FakeHerdr(read_text="idle\n> ")
@@ -249,6 +316,41 @@ def _recover_stale_outcome(
     fws = fake.seed_workspace(cwd=str(repo))
     locator = fake.seed_agent(name, workspace_id=fws, provider="", status="unknown",
                               detected_agent="", revision="3", cwd=str(repo))
+    # The stale-worker scenario predates #14741 identity receipts, but the replacement
+    # planner now requires the current launch-generation authority before it may classify
+    # that process as legacy.  The hermetic source harness already seeds this exact row;
+    # the installed harness must do the same or it refuses at `generation_unavailable`
+    # before exercising any recovery leg.
+    from mozyo_bridge.core.state.herdr_launch_generation import (
+        HerdrLaunchGenerationStore,
+    )
+    from mozyo_bridge.core.state.startup_transaction_fence import (
+        StartupUnit,
+        startup_action_id,
+    )
+
+    legacy_action_id = startup_action_id(
+        StartupUnit(workspace_id=ws_id, lane_id=lane, providers=("claude",)),
+        f"installed-fault-smoke-{tag}-legacy-generation",
+    )
+    generations = HerdrLaunchGenerationStore(home=home)
+    generations.reserve_pending(
+        assigned_name=name,
+        startup_action_id=legacy_action_id,
+        workspace_id=ws_id,
+        role="claude",
+        lane_id=lane,
+    )
+    generations.finalize(
+        assigned_name=name,
+        startup_action_id=legacy_action_id,
+        workspace_id=ws_id,
+        role="claude",
+        lane_id=lane,
+        locator=locator,
+        verdict="present",
+        observed_at="2026-01-01T00:00:00.000000+00:00",
+    )
     # The surviving gateway slot the heal adopts + pins the tab on (a heal never splits the pair).
     fake.seed_agent(encode_assigned_name(ws_id, "codex", lane), workspace_id=fws, provider="codex",
                     cwd=str(repo))
@@ -263,6 +365,11 @@ def _recover_stale_outcome(
         e["PATH"] = str(bins.bin_dir) + os.pathsep + e.get("PATH", "")
         e["MOZYO_AGENT_CLAUDE_BINARY"] = bins.path("claude")
         e["MOZYO_AGENT_CODEX_BINARY"] = bins.path("codex")
+        # The recovery subprocess must launch through the SAME installed wheel under test.
+        # Without this exact override the nested managed-launch resolver falls through to a
+        # host/global `mozyo-bridge` (or no launcher), so the installed smoke stops at
+        # `effect_failed: launch` without exercising the built artifact's wrapper contract.
+        e["MOZYO_BRIDGE_LAUNCHER"] = str(cli)
         # The recovery drives on the LANE worktree (``--repo`` == repo); its redispatch's nested
         # send anchors there, so it must attest AS this lane's identity (env == the repo's anchor
         # workspace) or the sender-anchor fence blocks the send (target_unavailable).
@@ -286,14 +393,29 @@ def _recover_stale_outcome(
     try:
         p1 = json.loads(first.stdout)
     except ValueError:
-        return None
+        return {"setup_error": "pass1_json", "pass1_exit": first.returncode}
 
     # The heal-launched fresh worker (same assigned name, a new pane) and its attestation.
     st = json.loads(state.read_text(encoding="utf-8"))
     fresh_candidates = [a["pane_id"] for a in st["agents"]
                         if a["name"] == name and a["pane_id"] != locator]
     if not fresh_candidates:
-        return None
+        post = lstore.get(lkey)
+        return {
+            "setup_error": "fresh_worker_missing",
+            "pass1": p1,
+            "pass1_exit": first.returncode,
+            "launch_authority_axes": {
+                "lifecycle_present": post is not None,
+                "revision_matches": bool(post) and post.revision == lrec.revision,
+                "generation_matches": bool(post)
+                and post.lane_generation == lrec.lane_generation,
+                "worktree_matches": bool(post)
+                and post.worktree_identity
+                == derive_lane_workspace_token(str(repo.resolve())),
+                "branch_matches": _git_branch(repo) == lane,
+            },
+        }
     fresh = fresh_candidates[0]
     observed_at = (
         "2999-01-01T00:00:00+00:00" if inject_uncertain
@@ -315,7 +437,12 @@ def _recover_stale_outcome(
     try:
         p2 = json.loads(second.stdout)
     except ValueError:
-        return None
+        return {
+            "setup_error": "pass2_json",
+            "pass1": p1,
+            "pass1_exit": first.returncode,
+            "pass2_exit": second.returncode,
+        }
     agents_after = sorted(
         (a["name"], a["pane_id"])
         for a in FakeHerdr.from_state(json.loads(state.read_text(encoding="utf-8"))).agents
@@ -337,6 +464,7 @@ def _recover_stale_outcome(
     ok_count = sum(1 for r in attempts if r.status == "sent" and r.reason == "ok")
     return {
         "pass1": p1, "pass2": p2,
+        "pass1_exit": first.returncode, "pass2_exit": second.returncode,
         "fresh_locator": fresh, "old_locator": locator,
         "agents_unchanged": agents_before == agents_after,
         "redispatch_attempt_count": len(attempts),
@@ -463,7 +591,7 @@ def _drive_callback_exactly_once(cli: Path, tmp: Path, diagnostics: "dict | None
         e["MOZYO_WORKSPACE_ID"] = ws_id
         e["MOZYO_AGENT_ROLE"] = "codex"
         e["MOZYO_LANE_ID"] = "default"
-        return e
+        return _with_aligned_fake_codex_updater(e, tmp)
 
     common = ["--candidate", "14097:84000:coordinator:implementation_done",
               "--redmine-json", str(snap), "--workspace-id", ws_id, "--cursor", "84001", "--json"]
@@ -518,6 +646,42 @@ def _drive_callback_exactly_once(cli: Path, tmp: Path, diagnostics: "dict | None
     failed = sorted(name for name, held in conjuncts.items() if not held)
     _record_cb_diag(diagnostics, record, failed=failed)
     return not failed
+
+
+def _with_aligned_fake_codex_updater(env: dict, tmp: Path) -> dict:
+    """Give the callback fixture one positive, hermetic Codex update authority.
+
+    Redmine #14741 arms the generic send fence for Codex.  The smoke previously supplied
+    neither the bound Codex executable nor an npm installation that owned it, so the new
+    production-safe ``unknown -> zero-send`` verdict made the old fixture fail for the
+    right reason.  This constructs the positive case the exactly-once scenario intends:
+    the trusted override points inside ``npm root -g``'s own ``@openai/codex`` directory.
+    No host npm/Codex installation or network is consulted.
+    """
+    root = tmp / "cb_npm_root"
+    package = root / "@openai" / "codex"
+    provider = package / "bin" / "codex"
+    provider.parent.mkdir(parents=True, exist_ok=True)
+    provider.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    provider.chmod(0o755)
+
+    query_bin = tmp / "cb_npm_query_bin"
+    query_bin.mkdir(parents=True, exist_ok=True)
+    npm = query_bin / "npm"
+    npm.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = root ] && [ \"$2\" = -g ]; then\n"
+        f"  printf '%s\\n' '{root}'\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 2\n",
+        encoding="utf-8",
+    )
+    npm.chmod(0o755)
+    result = dict(env)
+    result["PATH"] = str(query_bin) + os.pathsep + result.get("PATH", "")
+    result["MOZYO_AGENT_CODEX_BINARY"] = str(provider)
+    return result
 
 
 def _fake_transition_observed(state_path: Path) -> "bool | None":
@@ -581,3 +745,12 @@ def _git_init(repo: Path, *, branch: str, ws_id: str) -> None:
     (repo / "README.md").write_text("x\n", encoding="utf-8")
     run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
     run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+
+
+def _git_branch(repo: Path) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
