@@ -1,8 +1,9 @@
-"""Which request and fresh live locator a recovered gateway still owes (#14741 B6b3).
+"""Which request and action-bound fresh gateway a recovery still owes (#14741 B6b3).
 
-Preparation and read-only inventory join only: nothing here attests, sends, reads a delivery
-ledger, or completes a transaction. The pointer and participant come from the STORED row;
-the fresh locator comes from exactly one canonical live-inventory snapshot.
+Preparation, read-only inventory join, and startup-attestation/action verification only:
+nothing here sends, reads a delivery ledger, or completes a transaction. The pointer and
+participant come from the STORED row; the fresh locator comes from exactly one canonical
+live-inventory snapshot.
 """
 
 from __future__ import annotations
@@ -58,6 +59,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     prepare_vanished_gateway_continuation,
     resolve_vanished_gateway_inventory,
     verify_vanished_gateway_attestation,
+    verify_vanished_gateway_attestation_evidence,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E402,E501
     sublane_vanished_gateway_continuation as continuation_module,
@@ -907,6 +909,14 @@ class AttestationBindingTest(unittest.TestCase):
         )
 
     def _verify(self, **changes):
+        return self._call_verifier(verify_vanished_gateway_attestation, **changes)
+
+    def _verify_evidence(self, **changes):
+        return self._call_verifier(
+            verify_vanished_gateway_attestation_evidence, **changes
+        )
+
+    def _call_verifier(self, verifier, **changes):
         preparation = changes.pop("preparation", self.preparation)
         inventory = changes.pop("inventory_join", self.inventory)
         repo_root = changes.pop("repo_root", ROOT)
@@ -927,7 +937,7 @@ class AttestationBindingTest(unittest.TestCase):
         continuation_module.resolve_gateway_provider = provider_resolver
         continuation_module.mozyo_bridge_home = home_resolver
         try:
-            return verify_vanished_gateway_attestation(
+            return verifier(
                 preparation, inventory, repo_root=repo_root
             )
         finally:
@@ -972,13 +982,24 @@ class AttestationBindingTest(unittest.TestCase):
         for claim in ("sent", "confirm", "complete", "ledger"):
             self.assertNotIn(claim, result.outcome)
 
+    def test_send_evidence_timestamp_is_from_the_same_exact_record(self) -> None:
+        record = self._seed(observed_at="2026-08-03T01:02:03+00:00")
+        evidence = self._verify_evidence()
+        self.assertTrue(evidence.bound)
+        self.assertEqual(evidence.observed_at, record.observed_at)
+        self.assertNotIn("observed_at", evidence.proof.__dict__)
+
     def test_public_signature_exposes_no_reader_home_provider_locator_or_pin(self) -> None:
         import inspect
 
-        self.assertEqual(
-            tuple(inspect.signature(verify_vanished_gateway_attestation).parameters),
-            ("preparation", "inventory_join", "repo_root"),
-        )
+        for verifier in (
+            verify_vanished_gateway_attestation,
+            verify_vanished_gateway_attestation_evidence,
+        ):
+            self.assertEqual(
+                tuple(inspect.signature(verifier).parameters),
+                ("preparation", "inventory_join", "repo_root"),
+            )
 
     def test_main_attestation_is_read_once_and_action_helper_gets_exact_axes(self) -> None:
         self._seed()

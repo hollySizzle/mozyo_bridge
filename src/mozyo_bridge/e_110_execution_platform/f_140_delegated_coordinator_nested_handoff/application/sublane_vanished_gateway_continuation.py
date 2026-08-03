@@ -1,10 +1,11 @@
-"""Prepare and live-resolve a recovered gateway continuation (#14741 B6b3-1/2a(2)).
+"""Prepare and verify a recovered gateway continuation (#14741 B6b3-1/2a).
 
 Between "the gateway is live and attested" and "the original implementation request has
 been delivered" there is one question worth isolating: WHICH request, exactly. This module
-answers it, then joins its stored participant to one fresh live inventory row, and stops.
-It sends nothing, reads no delivery ledger or attestation store, and never reports a
-transaction as completed -- those are later tranches.
+answers it, joins its stored participant to one fresh live inventory row, then verifies
+that generation's startup self-attestation and replacement-action binding.  It sends
+nothing, reads no delivery ledger, and never reports a transaction as completed -- those
+are later tranches.
 
 The answer comes only from the stored row. A caller's plan, its anchor, and anything it
 would like the continuation to be are not consulted: the row was written when the recovery
@@ -161,6 +162,23 @@ class VanishedGatewayAttestationProof:
         return self.outcome == ATTESTATION_BOUND
 
 
+@dataclass(frozen=True)
+class VanishedGatewayAttestationEvidence:
+    """A bounded proof plus the timestamp from the exact record used to prove it.
+
+    The general read-only verifier intentionally returns only ``proof``.  The canonical
+    send edge needs ``observed_at`` as a later delivery-ledger time boundary, so it uses
+    this typed evidence and never re-reads a different record for that timestamp.
+    """
+
+    proof: VanishedGatewayAttestationProof
+    observed_at: str = ""
+
+    @property
+    def bound(self) -> bool:
+        return self.proof.bound and bool(self.observed_at)
+
+
 def _raw(value: object) -> str:
     """Plain exact text, or ``""``. No strip, no subclass, no coercion."""
     if type(value) is not str:
@@ -180,6 +198,14 @@ def _inventory_stopped(reason: str, detail: str = "") -> VanishedGatewayInventor
 
 def _attestation_stopped(reason: str, detail: str = "") -> VanishedGatewayAttestationProof:
     return VanishedGatewayAttestationProof(stopped=reason, detail=detail)
+
+
+def _attestation_evidence_stopped(
+    reason: str, detail: str = ""
+) -> VanishedGatewayAttestationEvidence:
+    return VanishedGatewayAttestationEvidence(
+        proof=_attestation_stopped(reason, detail)
+    )
 
 
 def _resolved_repo_root(repo_root: object) -> Optional[Path]:
@@ -375,24 +401,25 @@ def resolve_vanished_gateway_inventory(
     )
 
 
-def verify_vanished_gateway_attestation(
+def verify_vanished_gateway_attestation_evidence(
     preparation: object,
     inventory_join: object,
     *,
     repo_root: object,
-) -> VanishedGatewayAttestationProof:
+) -> VanishedGatewayAttestationEvidence:
     """Verify the joined live generation's canonical startup/action attestation.
 
     Reads the selected main identity-attestation exactly once from the canonical mozyo
     home, then delegates native-current / recognized-v1-side action binding to the shared
     replacement-binding authority. It performs no write, send, ledger read, CAS, or
-    completion transition and exposes no stored record or timestamp.
+    completion transition. The typed evidence exposes only the exact record's timestamp;
+    the general proof wrapper below exposes neither the stored record nor that timestamp.
     """
     if (
         type(preparation) is not ContinuationPreparation
         or type(inventory_join) is not VanishedGatewayInventoryJoin
     ):
-        return _attestation_stopped(
+        return _attestation_evidence_stopped(
             STOPPED_ATTESTATION_INVALID,
             "the continuation or inventory join is not canonical",
         )
@@ -417,14 +444,14 @@ def verify_vanished_gateway_attestation(
         or type(inventory_join.detail) is not str
         or inventory_join.detail != ""
     ):
-        return _attestation_stopped(
+        return _attestation_evidence_stopped(
             STOPPED_ATTESTATION_INVALID,
             "the continuation or inventory join is not ready and exact",
         )
 
     root = _resolved_repo_root(repo_root)
     if root is None:
-        return _attestation_stopped(
+        return _attestation_evidence_stopped(
             STOPPED_ATTESTATION_UNAVAILABLE,
             "the lane runtime repository root is unavailable",
         )
@@ -432,12 +459,12 @@ def verify_vanished_gateway_attestation(
         workspace_id = _raw(repo_scope_workspace_id(root))
         provider = _raw(resolve_gateway_provider(str(root)))
     except Exception:  # noqa: BLE001 - canonical resolver values are never exposed
-        return _attestation_stopped(
+        return _attestation_evidence_stopped(
             STOPPED_ATTESTATION_UNAVAILABLE,
             "the canonical workspace or gateway provider is unavailable",
         )
     if not workspace_id or not provider:
-        return _attestation_stopped(
+        return _attestation_evidence_stopped(
             STOPPED_ATTESTATION_UNAVAILABLE,
             "the canonical workspace or gateway provider is unavailable",
         )
@@ -463,7 +490,7 @@ def verify_vanished_gateway_attestation(
         or type(getattr(pin, "evidence_workspace_id", None)) is not str
         or pin.evidence_workspace_id not in ("", workspace_id)
     ):
-        return _attestation_stopped(
+        return _attestation_evidence_stopped(
             STOPPED_ATTESTATION_INVALID,
             "the stored pointer or participant is not exact",
         )
@@ -471,12 +498,12 @@ def verify_vanished_gateway_attestation(
         anchor = RequestAnchor(source=source, issue_id=issue_id, journal_id=journal_id)
         rebound = recovery_action_id_for_pin(anchor, pin, workspace_id=workspace_id)
     except Exception:  # noqa: BLE001 - forged values carry no authority
-        return _attestation_stopped(
+        return _attestation_evidence_stopped(
             STOPPED_ATTESTATION_INVALID,
             "the stored participant cannot be bound to this action",
         )
     if rebound != action_id:
-        return _attestation_stopped(
+        return _attestation_evidence_stopped(
             STOPPED_ATTESTATION_INVALID,
             "the stored participant is not bound to this action",
         )
@@ -488,7 +515,7 @@ def verify_vanished_gateway_attestation(
         or identity.lane_id != pin.lane_id
         or identity.role != provider
     ):
-        return _attestation_stopped(
+        return _attestation_evidence_stopped(
             STOPPED_ATTESTATION_INVALID,
             "the stored assigned name does not encode the pinned identity",
         )
@@ -516,7 +543,7 @@ def verify_vanished_gateway_attestation(
         or not join_values[5]
         or join_values[5] == join_values[6]
     ):
-        return _attestation_stopped(
+        return _attestation_evidence_stopped(
             STOPPED_ATTESTATION_INVALID,
             "the inventory join is not this stored fresh participant",
         )
@@ -533,12 +560,12 @@ def verify_vanished_gateway_attestation(
             inventory_join.assigned_name
         )
     except Exception:  # noqa: BLE001 - home/store/path/record details never escape
-        return _attestation_stopped(
+        return _attestation_evidence_stopped(
             STOPPED_ATTESTATION_UNAVAILABLE,
             "the canonical startup self-attestation is unavailable",
         )
     if type(record) is not IdentityAttestationRecord:
-        return _attestation_stopped(
+        return _attestation_evidence_stopped(
             STOPPED_ATTESTATION_UNAVAILABLE,
             "the canonical startup self-attestation is unavailable",
         )
@@ -553,7 +580,7 @@ def verify_vanished_gateway_attestation(
         or type(record.replacement_action_id) is not str
         or record.replacement_action_id != record.replacement_action_id.strip()
     ):
-        return _attestation_stopped(
+        return _attestation_evidence_stopped(
             STOPPED_ATTESTATION_INVALID,
             "the startup self-attestation does not match this live generation",
         )
@@ -577,31 +604,49 @@ def verify_vanished_gateway_attestation(
             home=resolved_home,
         )
     except Exception:  # noqa: BLE001 - canonical verifier details never escape
-        return _attestation_stopped(
+        return _attestation_evidence_stopped(
             STOPPED_ATTESTATION_INVALID,
             "the startup self-attestation could not be verified",
         )
     if type(joined) is not AttestationJoin or joined.state != ATTEST_OK or not joined.ok:
-        return _attestation_stopped(
+        return _attestation_evidence_stopped(
             STOPPED_ATTESTATION_INVALID,
             "the startup self-attestation is not generation-matched",
         )
     if action_bound is not True:
-        return _attestation_stopped(
+        return _attestation_evidence_stopped(
             STOPPED_ATTESTATION_INVALID,
             "the startup self-attestation is not bound to this recovery action",
         )
 
-    return VanishedGatewayAttestationProof(
-        outcome=ATTESTATION_BOUND,
-        action_id=action_id,
-        workspace_id=workspace_id,
-        lane_id=pin.lane_id,
-        provider=provider,
-        assigned_name=inventory_join.assigned_name,
-        fresh_locator=inventory_join.fresh_locator,
-        old_locator=inventory_join.old_locator,
+    return VanishedGatewayAttestationEvidence(
+        proof=VanishedGatewayAttestationProof(
+            outcome=ATTESTATION_BOUND,
+            action_id=action_id,
+            workspace_id=workspace_id,
+            lane_id=pin.lane_id,
+            provider=provider,
+            assigned_name=inventory_join.assigned_name,
+            fresh_locator=inventory_join.fresh_locator,
+            old_locator=inventory_join.old_locator,
+        ),
+        observed_at=record.observed_at,
     )
+
+
+def verify_vanished_gateway_attestation(
+    preparation: object,
+    inventory_join: object,
+    *,
+    repo_root: object,
+) -> VanishedGatewayAttestationProof:
+    """Return the bounded proof without exposing its stored timestamp."""
+
+    return verify_vanished_gateway_attestation_evidence(
+        preparation,
+        inventory_join,
+        repo_root=repo_root,
+    ).proof
 
 
 def prepare_vanished_gateway_continuation(
@@ -764,9 +809,11 @@ __all__ = (
     "STOPPED_INVENTORY_UNAVAILABLE",
     "STOPPED_TRANSACTION_UNAVAILABLE",
     "ContinuationPreparation",
+    "VanishedGatewayAttestationEvidence",
     "VanishedGatewayAttestationProof",
     "VanishedGatewayInventoryJoin",
     "prepare_vanished_gateway_continuation",
     "resolve_vanished_gateway_inventory",
     "verify_vanished_gateway_attestation",
+    "verify_vanished_gateway_attestation_evidence",
 )
