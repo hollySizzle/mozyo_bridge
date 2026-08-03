@@ -52,6 +52,13 @@ MAX_STARTUP_SIGNATURES = 6
 MIN_STARTUP_SIGNATURE_FOLDED_LEN = 6
 MAX_STARTUP_SIGNATURE_LEN = 160
 
+# A framed TUI may hard-wrap one logical row across several rendered rows. Keep that
+# rendering tolerance for the vertical Unicode frames the managed providers actually
+# paint, without joining arbitrary transcript lines into a synthetic phrase. ASCII pipe
+# is deliberately excluded: Markdown tables and quoted shell output commonly use it in
+# an otherwise-ready transcript.
+_VERTICAL_FRAME_GLYPHS: frozenset[str] = frozenset({"│", "┃", "║"})
+
 
 def fold_startup_text(text: object) -> str:
     """The classifier's match key: lowercased, alphanumerics only (pure, never raises).
@@ -75,12 +82,58 @@ def fold_startup_text(text: object) -> str:
     return "".join(ch for ch in text.lower() if ch.isalnum())
 
 
+def _folded_startup_segments(content: object) -> tuple[str, ...]:
+    """Return matchable visible segments without joining unrelated transcript lines.
+
+    Every non-empty rendered line is one segment. A contiguous run of Unicode-framed
+    TUI rows also contributes one joined segment so a verified signature may survive a
+    provider dialog's hard wrap. Plain transcript rows are never joined: otherwise an
+    idle agent discussing this classifier can manufacture a blocker signature across
+    two unrelated lines (Redmine #14741 dogfood finding).
+    """
+    if not isinstance(content, str):
+        return ()
+
+    segments: list[str] = []
+    framed_run: list[str] = []
+
+    def flush_framed_run() -> None:
+        if framed_run:
+            joined = "".join(framed_run)
+            if joined:
+                segments.append(joined)
+            framed_run.clear()
+
+    for raw_line in content.splitlines():
+        folded_line = fold_startup_text(raw_line)
+        if folded_line:
+            segments.append(folded_line)
+
+        stripped = raw_line.strip()
+        framed = (
+            len(stripped) >= 2
+            and stripped[0] in _VERTICAL_FRAME_GLYPHS
+            and stripped[-1] in _VERTICAL_FRAME_GLYPHS
+        )
+        if framed:
+            folded_inner = fold_startup_text(stripped[1:-1])
+            if folded_inner:
+                framed_run.append(folded_inner)
+        else:
+            flush_framed_run()
+
+    flush_framed_run()
+    return tuple(segments)
+
+
 @dataclass(frozen=True)
 class StartupBlocker:
     """One provider startup screen that cannot accept a handoff body (Redmine #13760).
 
-    A blocker is matched when **every** signature in ``all_of`` appears in the folded
-    visible pane content (:func:`fold_startup_text`) — an AND, never an any-match, so a
+    A blocker is matched when **every** signature in ``all_of`` appears in a folded
+    visible segment — a rendered line, or a contiguous Unicode-framed TUI block whose
+    rows may be a hard-wrapped logical line. Unrelated transcript lines are never
+    concatenated into a signature. Matching remains an AND, never an any-match, so a
     single generic phrase cannot classify a ready composer as blocked (j#77947
     correction 1). ``blocker_id`` is a fixed token: it is the ONLY thing about the
     screen that is allowed to reach a structured outcome / journal — the pane's own text
@@ -176,15 +229,18 @@ class StartupBlocker:
             folded_keys.append(folded)
 
     def matches(self, content: object) -> bool:
-        """True iff every signature appears in ``content`` (pure; never raises).
+        """True iff every signature appears in a visible segment (pure; never raises).
 
         ``__post_init__`` guarantees every ``all_of`` entry folds to a non-empty key, so
         this AND can no longer collapse to a single-signature match on a blank element.
         """
-        folded = fold_startup_text(content)
-        if not folded:
+        segments = _folded_startup_segments(content)
+        if not segments:
             return False
-        return all(fold_startup_text(sig) in folded for sig in self.all_of)
+        return all(
+            any(fold_startup_text(signature) in segment for segment in segments)
+            for signature in self.all_of
+        )
 
     @classmethod
     def from_record(cls, record: object, *, provider_id: str) -> "StartupBlocker":

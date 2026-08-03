@@ -93,9 +93,9 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_pr
 # The exact visible text of the live-captured Codex update prompt. Wrapped and framed the
 # way a pane renders it, to prove the classifier's folding survives the framing.
 CAPTURED_UPDATE_PROMPT = (
-    "  ✨ Update available!0.146.0 -> 99.0.0"
-    "Release notes: https://github.com/openai/codex/releases/latest"
-    "› 1. Update now (runs `npm install -g @openai/codex`)"
+    "  ✨ Update available!0.146.0 -> 99.0.0\n"
+    "Release notes: https://github.com/openai/codex/releases/latest\n"
+    "› 1. Update now (runs `npm install -g @openai/codex`)\n"
     "2.Skip3.SkipuntilnextversionPress enter to continue"
 )
 
@@ -168,6 +168,15 @@ class CodexUpdateScreenIsAStartupBlockerTest(unittest.TestCase):
     def test_ready_composer_is_not_blocked(self) -> None:
         """The positive control. A false positive here is an outage, not a guard."""
         self.assertIsNone(self.profile.match_startup_blocker(READY_COMPOSER))
+
+    def test_signature_is_not_synthesized_across_transcript_lines(self) -> None:
+        """An idle discussion must not become an active updater screen at a newline."""
+        historical_transcript = (
+            "Earlier analysis ended with the word Updating\n"
+            "Codex via an unrelated example that also named @openai/codex\n"
+            f"{READY_COMPOSER}"
+        )
+        self.assertIsNone(self.profile.match_startup_blocker(historical_transcript))
 
     def test_lone_generic_phrase_does_not_false_positive(self) -> None:
         """Each blocker is an AND of co-located signatures, never an any-match."""
