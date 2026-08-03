@@ -133,6 +133,12 @@ class HerdrInventoryView:
     detail: str = ""
     workspace_segment: str = ""
     agents: tuple = ()
+    # The projection deliberately does not retain malformed transport bodies, but
+    # authority-sensitive consumers still need loss accounting.  ``None`` means
+    # that the producer did not attest the raw/projection join (for example an old
+    # injected test double); a live successful read always supplies both counts.
+    raw_row_count: Optional[int] = None
+    invalid_row_count: Optional[int] = None
 
     @property
     def managed_agents(self) -> tuple:
@@ -287,7 +293,7 @@ def read_herdr_inventory(
                 detail="herdr backend selected but no agent lister could be resolved",
                 workspace_segment=segment,
             )
-        rows = lister.list_agent_rows()
+        rows = tuple(lister.list_agent_rows())
     except TerminalTransportError as exc:
         return HerdrInventoryView(
             backend_selected=True,
@@ -301,6 +307,8 @@ def read_herdr_inventory(
         ok=True,
         workspace_segment=segment,
         agents=project_observed_agents(rows),
+        raw_row_count=len(rows),
+        invalid_row_count=sum(1 for row in rows if not isinstance(row, Mapping)),
     )
 
 

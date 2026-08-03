@@ -14,6 +14,11 @@ import re
 from dataclasses import dataclass, field
 from typing import Mapping, Optional, Sequence
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (  # noqa: E501
+    DEFAULT_SUPERVISOR_DRAIN_SERVICE_LABEL,
+    DEFAULT_SUPERVISOR_SERVICE_LABEL,
+)
+
 
 OFFLINE_ROLLOUT_PLAN_SCHEMA_VERSION = 1
 
@@ -29,6 +34,7 @@ REASON_TOP_IDENTITY_UNRESOLVED = "top_identity_unresolved"
 REASON_WIP_UNREADABLE = "wip_unreadable"
 REASON_STORE_SET_INVALID = "store_set_invalid"
 REASON_STORE_UNREADABLE = "store_unreadable"
+REASON_SUPERVISOR_SET_INVALID = "supervisor_set_invalid"
 
 STORE_ATTESTATION = "attestation"
 STORE_LANE_LIFECYCLE = "lane_lifecycle"
@@ -51,6 +57,12 @@ SCOPE_UNRELATED_PROJECT = "unrelated_project"
 _SCOPES = frozenset({SCOPE_TARGET_PROJECT, SCOPE_UNRELATED_PROJECT})
 
 _SHA40 = re.compile(r"[0-9a-f]{40}")
+OWNED_SUPERVISOR_LABELS = frozenset(
+    {
+        DEFAULT_SUPERVISOR_SERVICE_LABEL,
+        DEFAULT_SUPERVISOR_DRAIN_SERVICE_LABEL,
+    }
+)
 
 
 def _exact_nonempty(value: object) -> bool:
@@ -99,7 +111,6 @@ class AgentSnapshot:
     lane_id: str
     provider: str
     runtime_state: str
-    raw_status: str = ""
 
     def to_record(self) -> dict:
         return {
@@ -108,7 +119,6 @@ class AgentSnapshot:
             "lane_id": self.lane_id,
             "provider": self.provider,
             "runtime_state": self.runtime_state,
-            "raw_status": self.raw_status,
         }
 
 
@@ -186,21 +196,32 @@ class OfflineRolloutPlanResult:
     reason: str = ""
     detail: str = ""
     plan_digest: str = ""
-    plan: Optional[Mapping] = None
+    canonical_plan_bytes: bytes = field(default=b"", repr=False)
     notes: Sequence[str] = field(default_factory=tuple)
 
     @property
     def ok(self) -> bool:
         return self.state == PLAN_READY
 
+    @property
+    def plan(self) -> Optional[dict]:
+        """Decode a fresh public copy from the immutable digest authority."""
+        if not self.canonical_plan_bytes:
+            return None
+        value = json.loads(self.canonical_plan_bytes.decode("utf-8"))
+        if not isinstance(value, dict):  # construction below makes this unreachable
+            raise ValueError("canonical_plan_not_mapping")
+        return value
+
     def as_payload(self) -> dict:
+        plan = self.plan
         return {
             "ok": self.ok,
             "state": self.state,
             "reason": self.reason,
             "detail": self.detail,
             "plan_digest": self.plan_digest,
-            "plan": dict(self.plan) if self.plan is not None else None,
+            "plan": plan,
             "notes": list(self.notes),
         }
 
@@ -300,8 +321,12 @@ def _validate_capture(capture: OfflineRolloutCapture) -> Optional[OfflineRollout
         if store.state == STORE_ABSENT and store.version is not None:
             return refused(REASON_INVALID_CAPTURE, "absent_store_has_version")
     labels = [supervisor.label for supervisor in capture.supervisors]
-    if len(labels) != len(set(labels)) or not all(_exact_nonempty(label) for label in labels):
-        return refused(REASON_INVALID_CAPTURE, "supervisor_record_invalid")
+    if (
+        len(labels) != len(set(labels))
+        or not all(_exact_nonempty(label) for label in labels)
+        or set(labels) != OWNED_SUPERVISOR_LABELS
+    ):
+        return refused(REASON_SUPERVISOR_SET_INVALID, "owned_supervisor_pair_required")
     return None
 
 
@@ -318,6 +343,7 @@ def build_offline_rollout_plan(
     stores = {store.name: store for store in capture.stores}
     top_name = capture.top_identity.assigned_name
     non_top = [agent.assigned_name for agent in agents if agent.assigned_name != top_name]
+    supervisor_labels = sorted(OWNED_SUPERVISOR_LABELS)
 
     body = {
         "schema_version": OFFLINE_ROLLOUT_PLAN_SCHEMA_VERSION,
@@ -347,12 +373,42 @@ def build_offline_rollout_plan(
             }
             for name in sorted(stores)
         ],
+        "phase_order": [
+            {
+                "phase": "supervisor_stop",
+                "supervisor_labels": supervisor_labels,
+                "required_readback": "all_not_installed_and_not_loaded",
+            },
+            {"phase": "non_top_workspace_stop", "assigned_names": non_top},
+            {"phase": "top_workspace_stop", "assigned_names": [top_name]},
+            {"phase": "consumer_zero", "required_readback": "zero"},
+            {"phase": "verified_backup", "stores": sorted(stores)},
+            {"phase": "migrate_attestation", "target_version": 3},
+            {"phase": "migrate_lane_lifecycle", "target_version": 10},
+            {"phase": "migrate_startup_transaction", "target_version": 2},
+            {"phase": "exact_runtime_install"},
+            {
+                "phase": "top_restore_action_bootstrap",
+                "assigned_names": [top_name],
+            },
+            {"phase": "remaining_workspace_restore", "assigned_names": non_top},
+            {
+                "phase": "supervisor_pair_install",
+                "supervisor_labels": supervisor_labels,
+            },
+            {
+                "phase": "supervisor_pair_readback",
+                "supervisor_labels": supervisor_labels,
+            },
+            {"phase": "final_verify"},
+        ],
     }
-    digest = hashlib.sha256(_canonical_bytes(body)).hexdigest()
+    canonical_plan_bytes = _canonical_bytes(body)
+    digest = hashlib.sha256(canonical_plan_bytes).hexdigest()
     return OfflineRolloutPlanResult(
         state=PLAN_READY,
         plan_digest=digest,
-        plan=body,
+        canonical_plan_bytes=canonical_plan_bytes,
         notes=(
             "side_effect_zero",
             "execution_requires_exact_plan_owner_approval",

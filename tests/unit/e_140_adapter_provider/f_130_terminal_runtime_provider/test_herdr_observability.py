@@ -127,11 +127,27 @@ class ReadHerdrInventoryTest(unittest.TestCase):
         self.assertTrue(view.backend_selected)
         self.assertTrue(view.ok)
         self.assertEqual(1, len(view.managed_agents))
+        self.assertEqual(1, view.raw_row_count)
+        self.assertEqual(0, view.invalid_row_count)
         # A standalone temp checkout has no registry anchor: the segment is
         # empty and workspace_agents() is therefore empty (identity gap, not a
         # crash).
         self.assertEqual("", view.workspace_segment)
         self.assertEqual((), view.workspace_agents())
+
+    def test_selected_backend_accounts_for_non_mapping_rows(self) -> None:
+        name = encode_assigned_name("ws-a", "claude", "")
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _herdr_repo(tmp)
+            view = read_herdr_inventory(
+                repo,
+                lister=FakeLister(rows=[{"name": name}, "junk"]),
+            )
+
+        self.assertTrue(view.ok)
+        self.assertEqual(2, view.raw_row_count)
+        self.assertEqual(1, view.invalid_row_count)
+        self.assertEqual(1, len(view.agents))
 
     def test_transport_failure_is_a_structured_fail_not_a_raise(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -88,6 +88,8 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
                     raw_status="idle",
                 ),
             ),
+            raw_row_count=2,
+            invalid_row_count=0,
         )
 
     def _kwargs(self) -> dict:
@@ -118,14 +120,23 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
             "supervisor_reader": lambda *, mozyo_home: {
                 "agents": [
                     {
-                        "label": "jp.giken.mozyo-bridge.reconcile",
+                        "label": "org.mozyo-bridge.callback-supervisor",
                         "installed": True,
                         "loaded": True,
                         "pid": 42,
                         "home_pin": "ok",
                         "executable_matches": True,
                         "credential_readiness": "ready",
-                    }
+                    },
+                    {
+                        "label": "org.mozyo-bridge.callback-supervisor.drain",
+                        "installed": True,
+                        "loaded": True,
+                        "pid": 43,
+                        "home_pin": "ok",
+                        "executable_matches": True,
+                        "credential_readiness": "ready",
+                    },
                 ]
             },
         }
@@ -152,6 +163,8 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
                 ok=True,
                 workspace_segment="ws_main",
                 agents=self.view.agents[:1],
+                raw_row_count=1,
+                invalid_row_count=0,
             )
 
         kwargs = self._kwargs()
@@ -167,6 +180,47 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
         result = capture_offline_rollout_snapshot(**kwargs)
         self.assertFalse(result.ok)
         self.assertEqual(result.reason, "workspace_registry_unreadable")
+
+    def test_raw_inventory_projection_loss_refuses(self) -> None:
+        kwargs = self._kwargs()
+        kwargs["inventory_reader"] = lambda repo_root, env: HerdrInventoryView(
+            backend_selected=True,
+            ok=True,
+            workspace_segment="ws_main",
+            agents=self.view.agents[:1],
+            raw_row_count=2,
+            invalid_row_count=1,
+        )
+        result = capture_offline_rollout_snapshot(**kwargs)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, "inventory_projection_incomplete")
+        self.assertIsNone(result.plan)
+
+    def test_hostile_raw_status_is_not_in_public_plan(self) -> None:
+        marker = "/Users/private/token=secret-value"
+        hostile_agents = (
+            HerdrObservedAgent(
+                **{
+                    **self.view.agents[0].__dict__,
+                    "raw_status": marker,
+                }
+            ),
+            self.view.agents[1],
+        )
+        hostile = HerdrInventoryView(
+            backend_selected=True,
+            ok=True,
+            workspace_segment="ws_main",
+            agents=hostile_agents,
+            raw_row_count=2,
+            invalid_row_count=0,
+        )
+        kwargs = self._kwargs()
+        kwargs["inventory_reader"] = lambda repo_root, env: hostile
+        captured = capture_offline_rollout_snapshot(**kwargs)
+        result = build_offline_rollout_plan(captured)
+        self.assertTrue(result.ok)
+        self.assertNotIn(marker, str(result.as_payload()))
 
     def test_parser_exposes_only_plan_in_phase_a(self) -> None:
         parser = argparse.ArgumentParser()

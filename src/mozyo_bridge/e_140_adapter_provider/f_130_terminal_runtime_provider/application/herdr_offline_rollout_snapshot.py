@@ -72,6 +72,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 
 REASON_REGISTRY_UNREADABLE = "workspace_registry_unreadable"
 REASON_INVENTORY_UNREADABLE = "inventory_unreadable"
+REASON_INVENTORY_PROJECTION_INCOMPLETE = "inventory_projection_incomplete"
 REASON_TOP_IDENTITY_UNRESOLVED = "top_identity_unresolved"
 REASON_SNAPSHOT_DRIFT = "snapshot_drift"
 
@@ -115,7 +116,21 @@ def _inventory_snapshot(repo_root: Path, env: Mapping[str, str], inventory_reade
             for agent in view.agents
         )
     )
-    return view, token
+    return view, (view.raw_row_count, view.invalid_row_count, token)
+
+
+def _inventory_projection_complete(view) -> bool:
+    raw_count = view.raw_row_count
+    invalid_count = view.invalid_row_count
+    return (
+        isinstance(raw_count, int)
+        and not isinstance(raw_count, bool)
+        and isinstance(invalid_count, int)
+        and not isinstance(invalid_count, bool)
+        and raw_count >= 0
+        and invalid_count == 0
+        and raw_count == len(view.agents)
+    )
 
 
 def _worktree_snapshots(records, reader, timeout: float):
@@ -250,6 +265,11 @@ def capture_offline_rollout_snapshot(
     if inventory_before is None:
         return refused(REASON_INVENTORY_UNREADABLE, "global_inventory_not_readable")
     view, inventory_token = inventory_before
+    if not _inventory_projection_complete(view):
+        return refused(
+            REASON_INVENTORY_PROJECTION_INCOMPLETE,
+            "raw_projection_join_not_lossless",
+        )
 
     top_workspace = source_env.get("MOZYO_WORKSPACE_ID", "")
     top_provider = source_env.get("MOZYO_AGENT_ROLE", "")
@@ -276,6 +296,11 @@ def capture_offline_rollout_snapshot(
     inventory_after = _inventory_snapshot(repo_root, source_env, inventory_reader)
     if registry_after is None or inventory_after is None:
         return refused(REASON_SNAPSHOT_DRIFT, "authority_became_unreadable")
+    if not _inventory_projection_complete(inventory_after[0]):
+        return refused(
+            REASON_INVENTORY_PROJECTION_INCOMPLETE,
+            "raw_projection_join_not_lossless",
+        )
     wip_after, wip_after_token = _worktree_snapshots(
         registry_after[0], worktree_reader, timeout
     )
@@ -298,7 +323,6 @@ def capture_offline_rollout_snapshot(
             lane_id=agent.lane_id,
             provider=agent.role,
             runtime_state=agent.runtime_state,
-            raw_status=agent.raw_status,
         )
         for agent in view.managed_agents
     )

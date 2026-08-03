@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import unittest
 from dataclasses import replace
@@ -58,10 +59,19 @@ def _capture() -> OfflineRolloutCapture:
         ),
         supervisors=(
             SupervisorAgentSnapshot(
-                "jp.giken.mozyo-bridge.reconcile",
+                "org.mozyo-bridge.callback-supervisor",
                 True,
                 True,
                 123,
+                "ok",
+                True,
+                "ready",
+            ),
+            SupervisorAgentSnapshot(
+                "org.mozyo-bridge.callback-supervisor.drain",
+                True,
+                True,
+                124,
                 "ok",
                 True,
                 "ready",
@@ -96,6 +106,26 @@ class OfflineRolloutPlanTests(unittest.TestCase):
         self.assertEqual(first.plan["stores"]["attestation"]["target_version"], 3)
         self.assertEqual(first.plan["stores"]["lane_lifecycle"]["target_version"], 10)
         self.assertEqual(first.plan["stores"]["startup_transaction"]["target_version"], 2)
+        phases = [row["phase"] for row in first.plan["phase_order"]]
+        self.assertEqual(
+            phases,
+            [
+                "supervisor_stop",
+                "non_top_workspace_stop",
+                "top_workspace_stop",
+                "consumer_zero",
+                "verified_backup",
+                "migrate_attestation",
+                "migrate_lane_lifecycle",
+                "migrate_startup_transaction",
+                "exact_runtime_install",
+                "top_restore_action_bootstrap",
+                "remaining_workspace_restore",
+                "supervisor_pair_install",
+                "supervisor_pair_readback",
+                "final_verify",
+            ],
+        )
 
     def test_payload_is_path_free_and_json_serializable(self) -> None:
         result = build_offline_rollout_plan(_capture())
@@ -155,6 +185,38 @@ class OfflineRolloutPlanTests(unittest.TestCase):
         )
         self.assertTrue(result.ok)
         self.assertFalse(result.plan["candidate_artifact"]["exact_pin_ready"])
+
+    def test_owned_supervisor_pair_is_exactly_required(self) -> None:
+        source = _capture()
+        missing = build_offline_rollout_plan(
+            replace(source, supervisors=source.supervisors[:1])
+        )
+        foreign = build_offline_rollout_plan(
+            replace(
+                source,
+                supervisors=(
+                    source.supervisors[0],
+                    replace(source.supervisors[1], label="foreign"),
+                ),
+            )
+        )
+        self.assertEqual(missing.reason, "supervisor_set_invalid")
+        self.assertEqual(foreign.reason, "supervisor_set_invalid")
+
+    def test_public_plan_copy_cannot_mutate_digest_authority(self) -> None:
+        result = build_offline_rollout_plan(_capture())
+        mutated = result.plan
+        mutated["schema_transitions"][0]["to_version"] = 999
+
+        fresh = result.plan
+        self.assertNotEqual(fresh["schema_transitions"][0]["to_version"], 999)
+        canonical = json.dumps(
+            fresh,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self.assertEqual(result.plan_digest, hashlib.sha256(canonical).hexdigest())
 
 
 if __name__ == "__main__":
