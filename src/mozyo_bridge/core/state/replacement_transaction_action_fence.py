@@ -3,14 +3,15 @@
 ``state.sqlite`` is shared by every workspace and lane. Holding its global writer lock
 while an external transport runs turns one slow send into an unrelated-lane outage. This
 module supplies the narrower authority: one advisory lock file for one exact
-``(state-store inode, workspace_id, action_id)``. Replacement-transaction writers and
+``(canonical state-store pathname, workspace_id, action_id)``. Replacement-transaction writers and
 the continuation transport take the same lock, so same-action state cannot cross the
 effect while different actions remain free to use short SQLite transactions.
 
 The lock file is coordination metadata, not durable action evidence. It is intentionally
 kept after release: unlinking an advisory-lock inode while another process has it open can
-split lock authority. The filename contains only state device/inode numbers and a SHA-256
-digest of the normalized action key.
+split lock authority. The authority directory is adjacent to the canonical DB pathname,
+owner-private, and remains stable if ``state.sqlite`` is atomically replaced. State-file
+symlinks and hardlinks are rejected; parent-directory aliases converge through resolution.
 """
 
 from __future__ import annotations
@@ -20,7 +21,6 @@ import fcntl
 import hashlib
 import os
 import stat
-import tempfile
 import threading
 from contextlib import contextmanager
 from functools import wraps
@@ -34,8 +34,7 @@ from mozyo_bridge.core.state.replacement_transaction_schema import (
 )
 
 
-_LOCK_ROOT_PREFIX = "mozyo-bridge-"
-_LOCK_DIRECTORY_NAME = "replacement-transaction-action-fences"
+_LOCK_DIRECTORY_SUFFIX = ".replacement-action-fences"
 _THREAD_STATE = threading.local()
 
 
@@ -73,49 +72,63 @@ def _ensure_private_directory(path: Path) -> None:
         )
 
 
-def _private_lock_directory() -> Path:
+def _canonical_state_path(state_path: Path) -> Path:
+    """Resolve a stable pathname authority without following a final file symlink."""
+
+    supplied = Path(state_path)
     try:
-        temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+        supplied_info = supplied.lstat()
+    except FileNotFoundError:
+        supplied_info = None
     except OSError as exc:
         raise ReplacementTransactionActionFenceError(
-            f"replacement action fence temp root unavailable ({type(exc).__name__}); "
+            f"replacement state path unavailable ({type(exc).__name__}); "
             "fail closed"
         ) from exc
-    owner_root = temp_root / f"{_LOCK_ROOT_PREFIX}{os.getuid()}"
-    _ensure_private_directory(owner_root)
-    lock_directory = owner_root / _LOCK_DIRECTORY_NAME
-    _ensure_private_directory(lock_directory)
-    return lock_directory
+    if supplied_info is not None and stat.S_ISLNK(supplied_info.st_mode):
+        raise ReplacementTransactionActionFenceError(
+            "replacement state file symlink is not one pathname authority; fail closed"
+        )
+    try:
+        parent = supplied.parent.resolve(strict=True)
+    except OSError as exc:
+        raise ReplacementTransactionActionFenceError(
+            f"replacement state parent unavailable ({type(exc).__name__}); fail closed"
+        ) from exc
+    return parent / supplied.name
 
 
 def _action_lock_coordinates(
     state_path: Path, key: ReplacementTransactionKey
-) -> tuple[Path, tuple[int, int, str]]:
-    # Migration to the v2 behavioral protocol MUST happen before acquiring the v2 fence.
-    # A v1-only writer then sees an unsupported component version and stops before mutate.
+) -> tuple[Path, tuple[str, str]]:
+    canonical = _canonical_state_path(state_path)
     try:
-        ensure_replacement_transaction_schema(Path(state_path))
-        state_info = os.stat(state_path)
+        ensure_replacement_transaction_schema(canonical)
+        state_info = canonical.lstat()
     except (OSError, ReplacementTransactionError) as exc:
         raise ReplacementTransactionActionFenceError(
             f"replacement state identity unavailable ({type(exc).__name__}); fail closed"
         ) from exc
-    if not stat.S_ISREG(state_info.st_mode) or state_info.st_nlink != 1:
+    if (
+        not stat.S_ISREG(state_info.st_mode)
+        or stat.S_ISLNK(state_info.st_mode)
+        or state_info.st_nlink != 1
+    ):
         raise ReplacementTransactionActionFenceError(
             "replacement state authority is not one regular linked file; fail closed"
         )
     digest = _action_digest(key)
-    identity = (int(state_info.st_dev), int(state_info.st_ino), digest)
-    path = _private_lock_directory() / (
-        f"{identity[0]:x}-{identity[1]:x}-{digest}.lock"
-    )
+    lock_directory = canonical.parent / f".{canonical.name}{_LOCK_DIRECTORY_SUFFIX}"
+    _ensure_private_directory(lock_directory)
+    identity = (str(canonical), digest)
+    path = lock_directory / f"{digest}.lock"
     return path, identity
 
 
 def replacement_transaction_action_lock_path(
     state_path: Path, key: ReplacementTransactionKey
 ) -> Path:
-    """Return the secret-free lock path for the canonical DB inode + exact action."""
+    """Return the lock path for the canonical DB pathname + exact action."""
 
     path, _identity = _action_lock_coordinates(state_path, key)
     return path

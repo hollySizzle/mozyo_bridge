@@ -62,6 +62,9 @@ from mozyo_bridge.core.state.replacement_transaction_model import (  # noqa: E40
     transaction_phase_prerequisite_met,
     transaction_transition_allowed,
 )
+from mozyo_bridge.core.state.replacement_transaction_schema import (  # noqa: E402
+    TABLE as REPLACEMENT_TRANSACTION_TABLE,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.fresh_coordinator_drain import (  # noqa: E402,E501
     DRAIN_SEND_ERROR,
     DRAIN_SEND_OK,
@@ -825,7 +828,8 @@ class ActuatorTopologyTests(unittest.TestCase):
                 store, key = self._store_with([ParticipantPin(**WORKER)])
                 with sqlite3.connect(store.path) as conn:
                     conn.execute(
-                        "UPDATE replacement_transactions SET phase = ? WHERE action_id = ?",
+                        f"UPDATE {REPLACEMENT_TRANSACTION_TABLE} SET phase = ? "
+                        "WHERE action_id = ?",
                         (phase, key.action_id),
                     )
                 before = store.get(key)
@@ -851,7 +855,8 @@ class ActuatorTopologyTests(unittest.TestCase):
                 store, key = self._store_with([ParticipantPin(**WORKER)])
                 with sqlite3.connect(store.path) as conn:
                     conn.execute(
-                        "UPDATE replacement_transactions SET phase = ? WHERE action_id = ?",
+                        f"UPDATE {REPLACEMENT_TRANSACTION_TABLE} SET phase = ? "
+                        "WHERE action_id = ?",
                         (phase, key.action_id),
                     )
                 before = store.get(key)
@@ -888,7 +893,8 @@ class ActuatorTopologyTests(unittest.TestCase):
                 )
                 with sqlite3.connect(store.path) as conn:
                     conn.execute(
-                        "UPDATE replacement_transactions SET phase = ? WHERE action_id = ?",
+                        f"UPDATE {REPLACEMENT_TRANSACTION_TABLE} SET phase = ? "
+                        "WHERE action_id = ?",
                         (phase, key.action_id),
                     )
                 before = store.get(key)

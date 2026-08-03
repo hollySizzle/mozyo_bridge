@@ -42,6 +42,9 @@ from mozyo_bridge.core.state.replacement_transaction_model import (
 )
 from mozyo_bridge.core.state.replacement_transaction_schema import (
     REPLACEMENT_TRANSACTION_COMPONENT,
+    REPLACEMENT_TRANSACTION_EFFECT_FENCE_TABLE,
+    TABLE as REPLACEMENT_TRANSACTION_TABLE,
+    migrate_replacement_transaction_schema_v2,
 )
 
 
@@ -51,6 +54,27 @@ NEAR_EXPIRY = "2026-08-03T00:00:05+00:00"
 AFTER_EXPIRY = "2026-08-03T00:00:10+00:00"
 HOLDER = "replacement-holder"
 GENERATION = 7
+
+
+def _downgrade_to_exact_v1(path: Path) -> None:
+    with sqlite3.connect(path) as conn:
+        for (name,) in conn.execute(
+            "SELECT name FROM sqlite_schema WHERE type='trigger' "
+            "AND tbl_name=?",
+            (REPLACEMENT_TRANSACTION_TABLE,),
+        ).fetchall():
+            quoted = str(name).replace('"', '""')
+            conn.execute(f'DROP TRIGGER "{quoted}"')
+        conn.execute(f"DROP TABLE {REPLACEMENT_TRANSACTION_EFFECT_FENCE_TABLE}")
+        conn.execute("DROP VIEW replacement_transactions")
+        conn.execute(
+            f"ALTER TABLE {REPLACEMENT_TRANSACTION_TABLE} "
+            "RENAME TO replacement_transactions"
+        )
+        conn.execute(
+            "UPDATE state_schema_components SET schema_version=1 WHERE component=?",
+            (REPLACEMENT_TRANSACTION_COMPONENT,),
+        )
 
 
 class ReplacementContinuationOutboxTest(unittest.TestCase):
@@ -83,7 +107,7 @@ class ReplacementContinuationOutboxTest(unittest.TestCase):
         )
         with sqlite3.connect(self.store.path) as conn:
             conn.execute(
-                "UPDATE replacement_transactions SET phase=?, revision=2, lease_holder=?, "
+                f"UPDATE {REPLACEMENT_TRANSACTION_TABLE} SET phase=?, revision=2, lease_holder=?, "
                 "lease_epoch=1, lease_expires_at=? WHERE workspace_id=? AND action_id=?",
                 (
                     PHASE_DRAINING_CONTINUATION,
@@ -152,7 +176,7 @@ class ReplacementContinuationOutboxTest(unittest.TestCase):
         # the already-established sendable fixture state directly.
         with sqlite3.connect(self.store.path) as conn:
             conn.execute(
-                "UPDATE replacement_transactions SET phase=?, revision=revision+1 "
+                f"UPDATE {REPLACEMENT_TRANSACTION_TABLE} SET phase=?, revision=revision+1 "
                 "WHERE workspace_id=? AND action_id=?",
                 (PHASE_DRAINING_CONTINUATION, *self.transaction_key.as_row()),
             )
@@ -203,7 +227,7 @@ class ReplacementContinuationOutboxTest(unittest.TestCase):
         )
         with sqlite3.connect(self.store.path) as conn:
             conn.execute(
-                "UPDATE replacement_transactions SET participants_manifest=? "
+                f"UPDATE {REPLACEMENT_TRANSACTION_TABLE} SET participants_manifest=? "
                 "WHERE workspace_id=? AND action_id=?",
                 (encode_participants(participants), *self.transaction_key.as_row()),
             )
@@ -337,7 +361,7 @@ class ReplacementContinuationOutboxTest(unittest.TestCase):
 
         with sqlite3.connect(self.store.path) as conn:
             conn.execute(
-                "UPDATE replacement_transactions SET lease_expires_at=? "
+                f"UPDATE {REPLACEMENT_TRANSACTION_TABLE} SET lease_expires_at=? "
                 "WHERE workspace_id=? AND action_id=?",
                 (NEAR_EXPIRY, *self.transaction_key.as_row()),
             )
@@ -372,7 +396,7 @@ class ReplacementContinuationOutboxTest(unittest.TestCase):
 
         with sqlite3.connect(self.store.path) as conn:
             conn.execute(
-                "UPDATE replacement_transactions SET lease_expires_at=? "
+                f"UPDATE {REPLACEMENT_TRANSACTION_TABLE} SET lease_expires_at=? "
                 "WHERE workspace_id=? AND action_id=?",
                 (NEAR_EXPIRY, *self.transaction_key.as_row()),
             )
@@ -416,8 +440,24 @@ class ReplacementContinuationOutboxTest(unittest.TestCase):
         self.assertEqual(sends, ["sent"])
         self.assertEqual(len(connect_calls), 2)
 
-    def test_v1_only_writer_cannot_mutate_same_action_during_v2_send(self):
-        """R12-F2: protocol v2 makes a fence-unaware writer fail before mutation."""
+    def test_already_admitted_v1_writer_cannot_mutate_during_v2_send(self):
+        """R13-F2: the DB trigger stops a v1 writer admitted before migration."""
+
+        _downgrade_to_exact_v1(self.store.path)
+        legacy = sqlite3.connect(self.store.path)
+        self.addCleanup(legacy.close)
+        self.assertEqual(
+            legacy.execute(
+                "SELECT typeof(schema_version), schema_version "
+                "FROM state_schema_components WHERE component=?",
+                (REPLACEMENT_TRANSACTION_COMPONENT,),
+            ).fetchone(),
+            ("integer", 1),
+        )
+        # The old process has now passed its one admission check and pauses without an
+        # open SQLite transaction. The offline rail migrates while all actual mutations
+        # are quiesced; this connection then represents the resumed old code path.
+        migrate_replacement_transaction_schema_v2(self.store.path)
 
         reservation = self.outbox.reserve(self.send_key, holder=HOLDER, now=NOW)
         send_entered = threading.Event()
@@ -447,33 +487,62 @@ class ReplacementContinuationOutboxTest(unittest.TestCase):
         consumer.start()
         self.assertTrue(send_entered.wait(2))
 
-        with sqlite3.connect(self.store.path) as legacy:
-            version = legacy.execute(
-                "SELECT typeof(schema_version), schema_version "
-                "FROM state_schema_components WHERE component=?",
-                (REPLACEMENT_TRANSACTION_COMPONENT,),
-            ).fetchone()
-            self.assertNotEqual(version, ("integer", 1))
-            legacy_admitted = version == ("integer", 1)
-            if legacy_admitted:
-                legacy.execute(
-                    "UPDATE replacement_transactions SET phase=? "
+        with self.assertRaisesRegex(sqlite3.OperationalError, "is a view"):
+            legacy.execute(
+                "UPDATE replacement_transactions SET revision=revision+1 "
+                "WHERE workspace_id=? AND action_id=?",
+                self.transaction_key.as_row(),
+            )
+        legacy.rollback()
+        with sqlite3.connect(self.store.path) as fence_unaware_v2:
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError, "replacement transaction effect fenced"
+            ):
+                fence_unaware_v2.execute(
+                    f"UPDATE {REPLACEMENT_TRANSACTION_TABLE} SET revision=revision+1 "
                     "WHERE workspace_id=? AND action_id=?",
-                    (PHASE_COMPLETED, *self.transaction_key.as_row()),
+                    self.transaction_key.as_row(),
                 )
 
-        self.assertFalse(legacy_admitted)
         self.assertEqual(
             self.store.get(self.transaction_key).phase, PHASE_DRAINING_CONTINUATION
         )
         allow_send.set()
         consumer.join(2)
         self.assertEqual(consumed[0].disposition, CONSUME_DELIVERED)
+        with sqlite3.connect(self.store.path) as conn:
+            self.assertEqual(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM {REPLACEMENT_TRANSACTION_EFFECT_FENCE_TABLE}"
+                ).fetchone(),
+                (0,),
+            )
+
+    def test_fresh_v1_only_writer_refuses_protocol_v2_before_mutation(self):
+        """The component stamp remains the admission guard for a fresh old process."""
+
+        def frozen_v1_only_write() -> None:
+            with sqlite3.connect(self.store.path) as legacy:
+                version = legacy.execute(
+                    "SELECT typeof(schema_version), schema_version "
+                    "FROM state_schema_components WHERE component=?",
+                    (REPLACEMENT_TRANSACTION_COMPONENT,),
+                ).fetchone()
+                if version != ("integer", 1):
+                    raise RuntimeError("legacy writer does not understand this protocol")
+                legacy.execute(
+                    "UPDATE replacement_transactions SET phase=? "
+                    "WHERE workspace_id=? AND action_id=?",
+                    (PHASE_COMPLETED, *self.transaction_key.as_row()),
+                )
+
+        with self.assertRaisesRegex(RuntimeError, "does not understand"):
+            frozen_v1_only_write()
 
     def test_zero_send_after_lease_expiry_does_not_stale_release(self):
         with sqlite3.connect(self.store.path) as conn:
             conn.execute(
-                "UPDATE replacement_transactions SET lease_expires_at=? "
+                f"UPDATE {REPLACEMENT_TRANSACTION_TABLE} SET lease_expires_at=? "
                 "WHERE workspace_id=? AND action_id=?",
                 (NEAR_EXPIRY, *self.transaction_key.as_row()),
             )
@@ -491,6 +560,44 @@ class ReplacementContinuationOutboxTest(unittest.TestCase):
             clock=lambda: current[0],
             authority_fn=lambda: True,
             send_fn=zero_send,
+            send_ok="ok",
+            send_zero="zero",
+        )
+
+        self.assertEqual(consumed.disposition, RESERVE_LEASE_LOST)
+        self.assertEqual(self.outbox.state_of(self.send_key), OUTBOX_RESERVED)
+        self.assertEqual(
+            self.store.get(self.transaction_key).phase, PHASE_DRAINING_CONTINUATION
+        )
+
+    def test_zero_send_db_wait_uses_post_lock_clock(self):
+        """R13-F1: BEGIN IMMEDIATE precedes the zero-send lease timestamp."""
+
+        with sqlite3.connect(self.store.path) as conn:
+            conn.execute(
+                f"UPDATE {REPLACEMENT_TRANSACTION_TABLE} SET lease_expires_at=? "
+                "WHERE workspace_id=? AND action_id=?",
+                (NEAR_EXPIRY, *self.transaction_key.as_row()),
+            )
+        reservation = self.outbox.reserve(self.send_key, holder=HOLDER, now=NOW)
+        original_connect = self.outbox._connect
+        connect_calls = []
+        current = [NOW]
+
+        def observed_connect():
+            connect_calls.append("connect")
+            if len(connect_calls) == 2:
+                current[0] = AFTER_EXPIRY
+            return original_connect()
+
+        self.outbox._connect = observed_connect
+        consumed = self.outbox.consume_reserved(
+            self.send_key,
+            reservation.token,
+            holder=HOLDER,
+            clock=lambda: current[0],
+            authority_fn=lambda: True,
+            send_fn=lambda: "zero",
             send_ok="ok",
             send_zero="zero",
         )
@@ -527,7 +634,7 @@ class ReplacementContinuationOutboxTest(unittest.TestCase):
     def test_completed_transaction_wins_before_reservation(self):
         with sqlite3.connect(self.store.path) as conn:
             conn.execute(
-                "UPDATE replacement_transactions SET phase=? WHERE workspace_id=? "
+                f"UPDATE {REPLACEMENT_TRANSACTION_TABLE} SET phase=? WHERE workspace_id=? "
                 "AND action_id=?",
                 (PHASE_COMPLETED, *self.transaction_key.as_row()),
             )

@@ -90,8 +90,10 @@ from mozyo_bridge.core.state.replacement_transaction_schema import (  # noqa: E4
     REPLACEMENT_TRANSACTION_COMPONENT,
     REPLACEMENT_TRANSACTION_RECOVERY_POLICY,
     REPLACEMENT_TRANSACTION_SCHEMA_VERSION,
+    REPLACEMENT_TRANSACTION_EFFECT_FENCE_TABLE,
     TABLE as REPLACEMENT_TABLE,
     ensure_replacement_transaction_schema,
+    migrate_replacement_transaction_schema_v2,
     readonly_component_status,
 )
 from mozyo_bridge.core.state.replacement_preservation import (  # noqa: E402
@@ -109,6 +111,30 @@ from mozyo_bridge.core.state.replacement_preservation import (  # noqa: E402
 
 FUTURE = "2099-01-01T00:00:00+00:00"
 GEN = 7  # the action generation used across the store cases
+
+
+def _downgrade_to_exact_v1(path: Path) -> None:
+    """Turn this test's fresh v2 component into the exact pre-v2 shape."""
+
+    with sqlite3.connect(path) as conn:
+        trigger_names = tuple(
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_schema WHERE type='trigger' AND tbl_name=?",
+                (REPLACEMENT_TABLE,),
+            )
+        )
+        for name in trigger_names:
+            conn.execute(f'DROP TRIGGER "{name.replace(chr(34), chr(34) * 2)}"')
+        conn.execute(f"DROP TABLE {REPLACEMENT_TRANSACTION_EFFECT_FENCE_TABLE}")
+        conn.execute("DROP VIEW replacement_transactions")
+        conn.execute(
+            f"ALTER TABLE {REPLACEMENT_TABLE} RENAME TO replacement_transactions"
+        )
+        conn.execute(
+            "UPDATE state_schema_components SET schema_version=1 WHERE component=?",
+            (REPLACEMENT_TRANSACTION_COMPONENT,),
+        )
 
 
 def _decision(issue: str = "13806", journal: str = "78948") -> DecisionPointer:
@@ -410,19 +436,16 @@ class ActionFenceTests(_StoreCase):
                 with replacement_transaction_action_fence(self.store.path, self.key):
                     self.fail("same-action fence re-entry must not be admitted")
 
-    def test_state_file_symlink_alias_converges_on_one_fence_identity(self):
+    def test_state_file_symlink_alias_fails_closed(self):
         self.store.ensure_schema()
         alias = self.home / "state-alias.sqlite"
         alias.symlink_to(self.store.path)
 
-        self.assertEqual(
-            replacement_transaction_action_lock_path(self.store.path, self.key),
-            replacement_transaction_action_lock_path(alias, self.key),
-        )
-        with replacement_transaction_action_fence(self.store.path, self.key):
-            with self.assertRaises(ReplacementTransactionActionFenceError):
-                with replacement_transaction_action_fence(alias, self.key):
-                    self.fail("one DB inode must not acquire two same-action fences")
+        with self.assertRaises(ReplacementTransactionActionFenceError):
+            replacement_transaction_action_lock_path(alias, self.key)
+        with self.assertRaises(ReplacementTransactionActionFenceError):
+            with replacement_transaction_action_fence(alias, self.key):
+                self.fail("a state-file symlink must not become a second DB authority")
 
     def test_state_file_hardlink_alias_fails_closed(self):
         self.store.ensure_schema()
@@ -448,6 +471,24 @@ class ActionFenceTests(_StoreCase):
             with self.assertRaises(ReplacementTransactionActionFenceError):
                 with replacement_transaction_action_fence(alias, self.key):
                     self.fail("canonical re-entry detection must precede blocking flock")
+
+    def test_atomic_state_file_replacement_keeps_one_fence_identity(self):
+        self.store.ensure_schema()
+        before = replacement_transaction_action_lock_path(self.store.path, self.key)
+
+        replacement = self.home / "replacement.sqlite"
+        with sqlite3.connect(self.store.path) as source, sqlite3.connect(replacement) as dest:
+            source.backup(dest)
+
+        with replacement_transaction_action_fence(self.store.path, self.key):
+            os.replace(replacement, self.store.path)
+            self.assertEqual(
+                replacement_transaction_action_lock_path(self.store.path, self.key),
+                before,
+            )
+            with self.assertRaises(ReplacementTransactionActionFenceError):
+                with replacement_transaction_action_fence(self.store.path, self.key):
+                    self.fail("atomic DB replacement must not split the action lock")
 
 
 class PlanTests(_StoreCase):
@@ -951,21 +992,44 @@ class SchemaRegistrationTests(unittest.TestCase):
 
     def test_v1_to_v2_behavioral_protocol_migration_is_backup_first(self):
         ensure_replacement_transaction_schema(self.path)
-        conn = sqlite3.connect(self.path)
-        try:
-            conn.execute(
-                "UPDATE state_schema_components SET schema_version=1 WHERE component=?",
-                (REPLACEMENT_TRANSACTION_COMPONENT,),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        key = ReplacementTransactionKey("workspace-migration", "action-migration")
+        store = ReplacementTransactionStore(path=self.path)
+        self.assertTrue(
+            store.plan_transaction(
+                key,
+                action_generation=1,
+                decision=_decision(),
+                continuation=_continuation(),
+                participants=(_gateway(),),
+            ).applied
+        )
+        _downgrade_to_exact_v1(self.path)
+        self.assertEqual(
+            tuple(row.key for row in load_replacement_transactions_readonly(home=self.home)),
+            (key,),
+        )
 
-        ensure_replacement_transaction_schema(self.path)
+        with self.assertRaisesRegex(ReplacementTransactionError, "explicit offline"):
+            ensure_replacement_transaction_schema(self.path)
+        self.assertEqual(
+            self._components()[REPLACEMENT_TRANSACTION_COMPONENT][0], 1
+        )
+        self.assertFalse((self.home / "backups").exists())
+
+        backup_dir = migrate_replacement_transaction_schema_v2(self.path)
 
         self.assertEqual(
             self._components()[REPLACEMENT_TRANSACTION_COMPONENT][0], 2
         )
+        self.assertIsNotNone(backup_dir)
+        self.assertEqual(store.get(key).key, key)
+        with sqlite3.connect(self.path) as current:
+            self.assertEqual(
+                current.execute(
+                    "SELECT workspace_id, action_id FROM replacement_transactions"
+                ).fetchone(),
+                key.as_row(),
+            )
         backups = tuple((self.home / "backups").glob("state-*/state.sqlite"))
         self.assertEqual(len(backups), 1)
         with sqlite3.connect(backups[0]) as backup:
@@ -974,6 +1038,26 @@ class SchemaRegistrationTests(unittest.TestCase):
                 (REPLACEMENT_TRANSACTION_COMPONENT,),
             ).fetchone()
         self.assertEqual(version, (1,))
+
+    def test_normal_store_read_does_not_implicitly_migrate_v1(self):
+        ensure_replacement_transaction_schema(self.path)
+        _downgrade_to_exact_v1(self.path)
+
+        store = ReplacementTransactionStore(path=self.path)
+        with self.assertRaisesRegex(ReplacementTransactionError, "explicit offline"):
+            store.get(ReplacementTransactionKey("workspace", "action"))
+        self.assertEqual(load_replacement_transactions_readonly(home=self.home), ())
+
+        self.assertEqual(
+            self._components()[REPLACEMENT_TRANSACTION_COMPONENT][0], 1
+        )
+        with sqlite3.connect(self.path) as conn:
+            self.assertFalse(
+                conn.execute(
+                    "SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?",
+                    (REPLACEMENT_TRANSACTION_EFFECT_FENCE_TABLE,),
+                ).fetchone()
+            )
 
     def test_v1_only_writer_admission_refuses_protocol_v2_before_mutation(self):
         ensure_replacement_transaction_schema(self.path)
@@ -1036,6 +1120,17 @@ class SchemaDowngradeGuardTests(unittest.TestCase):
             conn.commit()
         finally:
             conn.close()
+        with self.assertRaises(ReplacementTransactionError):
+            ensure_replacement_transaction_schema(self.path)
+
+    def test_writable_legacy_compatibility_view_is_rejected(self):
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                "CREATE TRIGGER foreign_legacy_write INSTEAD OF UPDATE "
+                "ON replacement_transactions BEGIN "
+                f"UPDATE {REPLACEMENT_TABLE} SET revision=NEW.revision "
+                "WHERE workspace_id=OLD.workspace_id AND action_id=OLD.action_id; END"
+            )
         with self.assertRaises(ReplacementTransactionError):
             ensure_replacement_transaction_schema(self.path)
 

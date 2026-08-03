@@ -19,6 +19,9 @@ from mozyo_bridge.core.state.replacement_transaction_model import (
     PHASE_DRAINING_CONTINUATION,
     PHASE_REPLACING_NONSELF,
 )
+from mozyo_bridge.core.state.replacement_transaction_schema import (
+    TABLE as REPLACEMENT_TRANSACTION_TABLE,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     RedmineAnchor,
     build_marker,
@@ -183,13 +186,13 @@ class VanishedGatewayContinuationDrainTest(_PrepareCase):
         with sqlite3.connect(self.home / "state.sqlite") as connection:
             if holder is None:
                 connection.execute(
-                    "UPDATE replacement_transactions SET lease_expires_at = ? "
+                    f"UPDATE {REPLACEMENT_TRANSACTION_TABLE} SET lease_expires_at = ? "
                     "WHERE action_id = ?",
                     ("2026-08-01T00:00:00+00:00", self.preparation.action_id),
                 )
             else:
                 connection.execute(
-                    "UPDATE replacement_transactions SET lease_holder = ?, "
+                    f"UPDATE {REPLACEMENT_TRANSACTION_TABLE} SET lease_holder = ?, "
                     "lease_expires_at = ? WHERE action_id = ?",
                     (holder, LATER, self.preparation.action_id),
                 )
@@ -427,14 +430,14 @@ class VanishedGatewayContinuationDrainTest(_PrepareCase):
         def delete_row():
             with sqlite3.connect(self.home / "state.sqlite") as connection:
                 connection.execute(
-                    "DELETE FROM replacement_transactions WHERE action_id = ?",
+                    f"DELETE FROM {REPLACEMENT_TRANSACTION_TABLE} WHERE action_id = ?",
                     (self.preparation.action_id,),
                 )
 
         def move_generation():
             with sqlite3.connect(self.home / "state.sqlite") as connection:
                 connection.execute(
-                    "UPDATE replacement_transactions SET action_generation = 2 "
+                    f"UPDATE {REPLACEMENT_TRANSACTION_TABLE} SET action_generation = 2 "
                     "WHERE action_id = ?",
                     (self.preparation.action_id,),
                 )
@@ -442,7 +445,8 @@ class VanishedGatewayContinuationDrainTest(_PrepareCase):
         def move_phase():
             with sqlite3.connect(self.home / "state.sqlite") as connection:
                 connection.execute(
-                    "UPDATE replacement_transactions SET phase = ? WHERE action_id = ?",
+                    f"UPDATE {REPLACEMENT_TRANSACTION_TABLE} SET phase = ? "
+                    "WHERE action_id = ?",
                     (PHASE_REPLACING_NONSELF, self.preparation.action_id),
                 )
 
@@ -565,14 +569,16 @@ class VanishedGatewayContinuationDrainTest(_PrepareCase):
         cases = (
             (
                 "future generation",
-                "UPDATE replacement_transactions SET action_generation = 2, phase = ? "
+                f"UPDATE {REPLACEMENT_TRANSACTION_TABLE} "
+                "SET action_generation = 2, phase = ? "
                 "WHERE action_id = ?",
                 (PHASE_COMPLETED, self.preparation.action_id),
                 CONTINUATION_GENERATION_MISMATCH,
             ),
             (
                 "unknown phase",
-                "UPDATE replacement_transactions SET phase = ? WHERE action_id = ?",
+                f"UPDATE {REPLACEMENT_TRANSACTION_TABLE} SET phase = ? "
+                "WHERE action_id = ?",
                 ("replacing_self", self.preparation.action_id),
                 CONTINUATION_RELEASE_REFUSED,
             ),
@@ -611,7 +617,7 @@ class VanishedGatewayContinuationDrainTest(_PrepareCase):
         def delete_row():
             with sqlite3.connect(self.home / "state.sqlite") as connection:
                 connection.execute(
-                    "DELETE FROM replacement_transactions WHERE action_id = ?",
+                    f"DELETE FROM {REPLACEMENT_TRANSACTION_TABLE} WHERE action_id = ?",
                     (self.preparation.action_id,),
                 )
 

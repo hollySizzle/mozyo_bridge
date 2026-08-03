@@ -83,6 +83,7 @@ from mozyo_bridge.core.state.replacement_transaction_schema import (
     REPLACEMENT_TRANSACTION_COMPONENT,
     REPLACEMENT_TRANSACTION_RECOVERY_POLICY,
     REPLACEMENT_TRANSACTION_SCHEMA_VERSION,
+    READONLY_TABLE as _READONLY_TABLE,
     TABLE as _TABLE,
     ReplacementTransactionError,
     _utc_now,
@@ -945,7 +946,8 @@ def load_replacement_transactions_readonly(
         if status != READONLY_COMPONENT_RECOGNIZED:
             return None
         rows = conn.execute(
-            f"SELECT {_COLUMNS} FROM {_TABLE} ORDER BY workspace_id, action_id"
+            f"SELECT {_COLUMNS} FROM {_READONLY_TABLE} "
+            "ORDER BY workspace_id, action_id"
         ).fetchall()
     except sqlite3.DatabaseError:
         return None

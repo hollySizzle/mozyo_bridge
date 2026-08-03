@@ -1373,19 +1373,25 @@ observation に join し、次の typed decision を返す。
   commit し、crash 後も `reserved` を自動再取得しない。★**global `state.sqlite` write lock を external transport 中に保持しない**
   （#14741 R11）: exact `(workspace_id, action_id)` の OS advisory fence を全 `ReplacementTransactionStore` mutation と
   continuation consume が共有し、same-action completion / lease / generation mutation だけを actual send 後まで直列化する。
-  fence の lock authority は入力 pathname ではなく、schema ensure 後の canonical state DB
-  `(st_dev, st_ino)` + exact action digest。したがって state file / parent directory の symlink alias は同一lockへ収束し、
-  hardlink state DBはSQLite自身のlock pathname分裂を避けるためfail-closed、same-thread alias re-entryもblocking前に
-  fail-closedとなる。lock fileはowner-only private temp rootに置き、秘密値を名前へ
-  含めず、runtime中はunlinkしない。★`replacement_transaction` component v2 はtable shape変更ではなく、このfenceを必須とする
-  **behavioral write protocol**。v1→v2はbackup-firstでstampし、fence非対応のv1-only runtimeはshared DBをmutateせず
-  unsupportedとしてfail-closedする。mixed source CLIのcutoverはv2 writerを起動する前に旧processを停止するoffline rollout railを使う。
+  fence の lock authority はDB inodeではなく、resolved parent + state filename の **stable canonical pathname** + exact action digest。
+  したがって `state.sqlite` のatomic replacementでも同じlockを使い続ける。state-file symlink / hardlinkはfail-closed、
+  parent-directory symlink aliasはcanonical pathnameへ収束し、same-thread alias re-entryもblocking前にfail-closedとなる。
+  lock fileはcanonical DBの隣接owner-only private directoryに置き、秘密値を名前へ含めず、runtime中はunlinkしない。
+  ★`replacement_transaction` component v2 はrow shapeをv2専用authority tableへ移し、旧table名をread-only互換viewとして残す。
+  migration前にadmission済みのv1 writerも旧名へのUPDATE/INSERT/DELETEをDBが常時拒否し、v2 writerだけが新実表を使う。
+  さらにOS fenceに加えてexact-action effect tableとv2実表のINSERT/UPDATE/DELETE guard triggerを所有する
+  **behavioral write protocol**。continuation consumeはtransport前の短いtransactionでDB fenceをarmし、
+  outcome確定またはproven-zero時の短いtransactionでexact token/generationを条件にdisarmする。これによりv1 admissionを
+  migration前に通過して停止していた旧writerも、send中に再開したmutationをDB自身が拒否する。v1→v2は通常のread/write
+  ensureから暗黙実行せず、旧processを停止したoffline rollout railだけがbackup-first明示migrationを呼ぶ。fresh v1-only runtimeは
+  v2 stampでfail-closedする。
   SQLite の `BEGIN IMMEDIATE` は transport 前後の短い validation / outcome write に限定するため、遅い1送信が別action・別laneの
   state writeを2秒timeoutさせない。action fence は transport railから同action transaction writeへ再入不可（fail-closed）で、
   現行4 production railはlane authorityをread-only、delivery/attestationを別DBへ書く。short transactionでowner /
   transactionを確定後、最後のlane authority観測→fresh clockによるcached live lease判定→actual send invocationの間には
   DB connect / schema ensure / blocking observationを置かない。authority観測中にleaseが失効した場合はsend 0・stale holderによる
-  release/revert 0。
+  release/revert 0。typed `zero_send` のrevert判定はSQLite writer lock取得**後**のfresh clockで行い、DB待機中にleaseが失効した
+  holderを古いtimestampで再認証しない。
   `authority_moved` / rail-proven `zero_send` のみ、**その時点でもliveな** owner token/holderを条件にoutbox row の削除と
   `draining_continuation → replacing_nonself` を同一短時間transactionで行う。send が開始した可能性があれば
   `delivered` / `uncertain` は非再取得 terminal であり、自動再送しない。exact-generation `completed` は lossy ledger read より

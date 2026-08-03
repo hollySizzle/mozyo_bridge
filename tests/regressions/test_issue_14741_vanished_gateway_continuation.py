@@ -27,6 +27,9 @@ from mozyo_bridge.core.state.replacement_transaction_model import (  # noqa: E40
 from mozyo_bridge.core.state.replacement_transaction_model import (  # noqa: E402
     ParticipantPin,
 )
+from mozyo_bridge.core.state.replacement_transaction_schema import (  # noqa: E402
+    TABLE as REPLACEMENT_TRANSACTION_TABLE,
+)
 from mozyo_bridge.core.state.herdr_identity_attestation import (  # noqa: E402
     HerdrIdentityAttestationStore,
     IdentityAttestationRecord,
@@ -98,7 +101,7 @@ class _PrepareCase(_LiveCase):
         sets = ", ".join(f"{k} = ?" for k in columns)
         with sqlite3.connect(self.home / "state.sqlite") as conn:
             conn.execute(
-                f"UPDATE replacement_transactions SET {sets} WHERE action_id = ?",
+                f"UPDATE {REPLACEMENT_TRANSACTION_TABLE} SET {sets} WHERE action_id = ?",
                 (*columns.values(), self.plan.action_id),
             )
 
@@ -201,7 +204,7 @@ class ReadyTest(_PrepareCase):
         """
         with sqlite3.connect(self.home / "state.sqlite") as conn:
             conn.execute(
-                "UPDATE replacement_transactions SET decision_journal = ?"
+                f"UPDATE {REPLACEMENT_TRANSACTION_TABLE} SET decision_journal = ?"
                 " WHERE action_id = ?",
                 ("11111", self.plan.action_id),
             )

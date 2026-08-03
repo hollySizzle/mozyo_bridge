@@ -38,7 +38,10 @@ from mozyo_bridge.core.state.replacement_transaction_model import (
     norm,
 )
 from mozyo_bridge.core.state.replacement_transaction_rows import _locked_row
-from mozyo_bridge.core.state.replacement_transaction_schema import TABLE as TRANSACTION_TABLE
+from mozyo_bridge.core.state.replacement_transaction_schema import (
+    REPLACEMENT_TRANSACTION_EFFECT_FENCE_TABLE,
+    TABLE as TRANSACTION_TABLE,
+)
 
 
 OUTBOX_RESERVED = "reserved"
@@ -314,6 +317,87 @@ class ReplacementContinuationOutbox:
         )
         return updated.rowcount == 1 and deleted.rowcount == 1
 
+    @staticmethod
+    def _arm_effect_locked(
+        conn,
+        send_key: ContinuationSendKey,
+        token: str,
+        *,
+        stamp: str,
+    ) -> bool:
+        existing = conn.execute(
+            f"SELECT 1 FROM {REPLACEMENT_TRANSACTION_EFFECT_FENCE_TABLE} "
+            "WHERE workspace_id=? AND action_id=?",
+            (send_key.workspace_id, send_key.action_id),
+        ).fetchone()
+        if existing is not None:
+            return False
+        conn.execute(
+            f"INSERT INTO {REPLACEMENT_TRANSACTION_EFFECT_FENCE_TABLE} "
+            "(workspace_id, action_id, action_generation, owner_token, armed_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                send_key.workspace_id,
+                send_key.action_id,
+                send_key.action_generation,
+                norm(token),
+                stamp,
+            ),
+        )
+        return True
+
+    @staticmethod
+    def _disarm_effect_locked(
+        conn,
+        send_key: ContinuationSendKey,
+        token: str,
+    ) -> bool:
+        deleted = conn.execute(
+            f"DELETE FROM {REPLACEMENT_TRANSACTION_EFFECT_FENCE_TABLE} "
+            "WHERE workspace_id=? AND action_id=? AND action_generation=? "
+            "AND owner_token=?",
+            (
+                send_key.workspace_id,
+                send_key.action_id,
+                send_key.action_generation,
+                norm(token),
+            ),
+        )
+        return deleted.rowcount == 1
+
+    def _disarm_unsent(
+        self,
+        send_key: ContinuationSendKey,
+        token: str,
+    ) -> bool:
+        """Remove this exact effect fence after proving transport was not entered."""
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = self._owned_reserved(conn, send_key, token)
+            if (
+                row is None
+                or str(row[0]) != OUTBOX_RESERVED
+                or str(row[1]) != norm(token)
+                or not self._disarm_effect_locked(conn, send_key, token)
+            ):
+                conn.execute("ROLLBACK")
+                return False
+            conn.execute("COMMIT")
+            return True
+        except sqlite3.DatabaseError as exc:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.DatabaseError:
+                pass
+            raise ReplacementContinuationOutboxError(
+                f"continuation unsent effect disarm failed "
+                f"({type(exc).__name__}); fail closed"
+            ) from exc
+        finally:
+            conn.close()
+
     def consume_reserved(
         self,
         send_key: ContinuationSendKey,
@@ -413,6 +497,9 @@ class ReplacementContinuationOutbox:
             if disposition != RESERVE_GRANTED:
                 conn.execute("ROLLBACK")
                 return ContinuationConsumption(disposition, state=OUTBOX_RESERVED)
+            if not self._arm_effect_locked(conn, send_key, token, stamp=stamp):
+                conn.execute("ROLLBACK")
+                return ContinuationConsumption(RESERVE_HELD, state=OUTBOX_RESERVED)
             conn.execute("COMMIT")
         except sqlite3.DatabaseError as exc:
             try:
@@ -438,9 +525,16 @@ class ReplacementContinuationOutbox:
         # expiry windows while SQLite waits.
         effect_stamp = self._clock_stamp(clock)
         if not effect_stamp:
-            return ContinuationConsumption(RESERVE_LEASE_LOST, state=OUTBOX_RESERVED)
+            disposition = (
+                RESERVE_LEASE_LOST
+                if self._disarm_unsent(send_key, token)
+                else RESERVE_HELD
+            )
+            return ContinuationConsumption(disposition, state=OUTBOX_RESERVED)
         disposition = self._record_disposition(record, send_key, holder, effect_stamp)
         if disposition != RESERVE_GRANTED:
+            if not self._disarm_unsent(send_key, token):
+                disposition = RESERVE_HELD
             return ContinuationConsumption(disposition, state=OUTBOX_RESERVED)
 
         if not authorized:
@@ -463,13 +557,25 @@ class ReplacementContinuationOutbox:
                     row is None
                     or str(row[0]) != OUTBOX_RESERVED
                     or str(row[1]) != norm(token)
-                    or disposition != RESERVE_GRANTED
                 ):
                     conn.execute("ROLLBACK")
                     return ContinuationConsumption(
-                        disposition if disposition != RESERVE_GRANTED else RESERVE_HELD,
+                        RESERVE_HELD,
                         state=str(row[0]) if row is not None else OUTBOX_RESERVED,
                     )
+                if disposition != RESERVE_GRANTED:
+                    if not self._disarm_effect_locked(conn, send_key, token):
+                        conn.execute("ROLLBACK")
+                        return ContinuationConsumption(
+                            RESERVE_HELD, state=OUTBOX_RESERVED
+                        )
+                    conn.execute("COMMIT")
+                    return ContinuationConsumption(
+                        disposition, state=OUTBOX_RESERVED
+                    )
+                if not self._disarm_effect_locked(conn, send_key, token):
+                    conn.execute("ROLLBACK")
+                    return ContinuationConsumption(RESERVE_HELD, state=OUTBOX_RESERVED)
                 if not self._release_owned_locked(
                     conn,
                     send_key,
@@ -504,29 +610,40 @@ class ReplacementContinuationOutbox:
         if type(sent) is type(send_zero) and sent == send_zero:
             # A typed zero-send is revertible only while this holder still owns a live lease.
             # A stale holder has no transaction mutation authority even when the rail proved
-            # that no effect occurred.
-            zero_stamp = self._clock_stamp(clock)
-            if not zero_stamp:
-                return ContinuationConsumption(RESERVE_LEASE_LOST, state=OUTBOX_RESERVED)
+            # that no effect occurred. Acquire the SQLite writer first, then observe time:
+            # a pre-lock stamp can become stale while BEGIN IMMEDIATE waits (R13-F1).
             conn = self._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
+                zero_stamp = self._clock_stamp(clock)
                 row = self._owned_reserved(conn, send_key, token)
                 record = _locked_row(conn, transaction_key)
-                disposition = self._record_disposition(
-                    record, send_key, holder, zero_stamp
+                disposition = (
+                    self._record_disposition(record, send_key, holder, zero_stamp)
+                    if zero_stamp
+                    else RESERVE_LEASE_LOST
                 )
                 if (
                     row is None
                     or str(row[0]) != OUTBOX_RESERVED
                     or str(row[1]) != norm(token)
-                    or disposition != RESERVE_GRANTED
                 ):
                     conn.execute("ROLLBACK")
                     return ContinuationConsumption(
-                        disposition if disposition != RESERVE_GRANTED else RESERVE_HELD,
+                        RESERVE_HELD,
                         state=str(row[0]) if row is not None else OUTBOX_RESERVED,
                     )
+                if disposition != RESERVE_GRANTED:
+                    if not self._disarm_effect_locked(conn, send_key, token):
+                        conn.execute("ROLLBACK")
+                        return ContinuationConsumption(
+                            RESERVE_HELD, state=OUTBOX_RESERVED
+                        )
+                    conn.execute("COMMIT")
+                    return ContinuationConsumption(disposition, state=OUTBOX_RESERVED)
+                if not self._disarm_effect_locked(conn, send_key, token):
+                    conn.execute("ROLLBACK")
+                    return ContinuationConsumption(RESERVE_HELD, state=OUTBOX_RESERVED)
                 if not self._release_owned_locked(
                     conn,
                     send_key,
@@ -570,6 +687,9 @@ class ReplacementContinuationOutbox:
                 ),
                 stamp=effect_stamp,
             ):
+                conn.execute("ROLLBACK")
+                return ContinuationConsumption(RESERVE_HELD, state=OUTBOX_RESERVED)
+            if not self._disarm_effect_locked(conn, send_key, token):
                 conn.execute("ROLLBACK")
                 return ContinuationConsumption(RESERVE_HELD, state=OUTBOX_RESERVED)
             conn.execute("COMMIT")

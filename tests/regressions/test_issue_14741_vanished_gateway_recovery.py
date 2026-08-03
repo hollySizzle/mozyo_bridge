@@ -25,6 +25,9 @@ from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
     ReplacementTransactionKey,
     ReplacementTransactionStore,
 )
+from mozyo_bridge.core.state.replacement_transaction_schema import (  # noqa: E402
+    TABLE as REPLACEMENT_TRANSACTION_TABLE,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_vanished_gateway_recovery import (  # noqa: E402,E501
     RECOVERY_ACTION_GENERATION,
     REFUSE_ACTION_ID_INVALID,
@@ -846,7 +849,8 @@ class StoredAuthorityIsRawTest(_PlanCase):
             with sqlite3.connect(self.home / "state.sqlite") as conn:
                 sets = ", ".join(f"{k} = ?" for k in overrides)
                 conn.execute(
-                    f"UPDATE replacement_transactions SET {sets} WHERE action_id = ?",
+                    f"UPDATE {REPLACEMENT_TRANSACTION_TABLE} SET {sets} "
+                    "WHERE action_id = ?",
                     (*overrides.values(), plan.action_id),
                 )
         return plan.action_id

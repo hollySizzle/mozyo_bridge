@@ -29,6 +29,9 @@ from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
     ReplacementTransactionKey,
     ReplacementTransactionStore,
 )
+from mozyo_bridge.core.state.replacement_transaction_schema import (  # noqa: E402
+    TABLE as REPLACEMENT_TRANSACTION_TABLE,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_vanished_gateway_recovery import (  # noqa: E402,E501
     plan_fresh_recovery,
 )
@@ -306,7 +309,8 @@ class NotActionableTest(_LiveCase):
 
         with sqlite3.connect(self.home / "state.sqlite") as conn:
             conn.execute(
-                "UPDATE replacement_transactions SET decision_journal = ? WHERE action_id = ?",
+                f"UPDATE {REPLACEMENT_TRANSACTION_TABLE} SET decision_journal = ? "
+                "WHERE action_id = ?",
                 ("11111", self.plan.action_id),
             )
         port = _Port()
@@ -382,7 +386,8 @@ class AuthorityBoundaryTest(_LiveCase):
                 self.setUp()
                 with sqlite3.connect(self.home / "state.sqlite") as conn:
                     conn.execute(
-                        "UPDATE replacement_transactions SET phase = ? WHERE action_id = ?",
+                        f"UPDATE {REPLACEMENT_TRANSACTION_TABLE} SET phase = ? "
+                        "WHERE action_id = ?",
                         (phase, self.plan.action_id),
                     )
                 port = _Port()
@@ -484,7 +489,8 @@ class PreClaimAndHomeIdentityTest(_LiveCase):
 
         with sqlite3.connect(self.home / "state.sqlite") as conn:
             conn.execute(
-                "UPDATE replacement_transactions SET phase = ? WHERE action_id = ?",
+                f"UPDATE {REPLACEMENT_TRANSACTION_TABLE} SET phase = ? "
+                "WHERE action_id = ?",
                 (phase, self.plan.action_id),
             )
 
