@@ -1370,10 +1370,15 @@ observation に join し、次の typed decision を返す。
   `replacement_continuation_outbox` に、exact `(workspace, action_id, action_generation, source, issue, journal,
   expected_gate, next_action)` を送信前予約する。`replacement_transactions` の exact generation / pointer /
   `draining_continuation` / holder / live lease 検証と UNIQUE reserve は同一 `BEGIN IMMEDIATE`。予約は effect より先に
-  commit し、crash 後も `reserved` を自動再取得しない。その後の final transaction validation から transport-internal lane
-  authority rejoin・actual send・outcome write までは第2の `BEGIN IMMEDIATE` を保持し、concurrent completion writer が final
-  snapshot と send の間を横断できないようにする。`authority_moved` / rail-proven `zero_send` のみ、owner token を条件に
-  outbox row の削除と `draining_continuation → replacing_nonself` を同一 transaction で行う。send が開始した可能性があれば
+  commit し、crash 後も `reserved` を自動再取得しない。★**global `state.sqlite` write lock を external transport 中に保持しない**
+  （#14741 R11）: exact `(workspace_id, action_id)` の OS advisory fence を全 `ReplacementTransactionStore` mutation と
+  continuation consume が共有し、same-action completion / lease / generation mutation だけを actual send 後まで直列化する。
+  SQLite の `BEGIN IMMEDIATE` は transport 前後の短い validation / outcome write に限定するため、遅い1送信が別action・別laneの
+  state writeを2秒timeoutさせない。action fence は transport railから同action transaction writeへ再入不可（fail-closed）で、
+  現行4 production railはlane authorityをread-only、delivery/attestationを別DBへ書く。lane authority観測後は fresh clockで
+  live leaseを再検証してからactual sendを呼び、観測中にleaseが失効した場合はsend 0・stale holderによるrelease/revert 0。
+  `authority_moved` / rail-proven `zero_send` のみ、**その時点でもliveな** owner token/holderを条件にoutbox row の削除と
+  `draining_continuation → replacing_nonself` を同一短時間transactionで行う。send が開始した可能性があれば
   `delivered` / `uncertain` は非再取得 terminal であり、自動再送しない。exact-generation `completed` は lossy ledger read より
   強い単調 terminal として全 shared caller が `confirmed` へ投影する。
 

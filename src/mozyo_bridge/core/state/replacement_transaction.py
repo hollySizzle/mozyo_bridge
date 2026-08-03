@@ -32,6 +32,10 @@ import sqlite3
 from pathlib import Path
 from typing import Optional, Sequence
 
+from mozyo_bridge.core.state.replacement_transaction_action_fence import (
+    replacement_transaction_action_fenced,
+)
+
 from mozyo_bridge.core.state.replacement_transaction_model import (
     CAS_ACTION_MISMATCH,
     CAS_ALREADY_DECLARED,
@@ -148,6 +152,7 @@ class ReplacementTransactionStore:
 
     # -- writes (CAS) --------------------------------------------------------
 
+    @replacement_transaction_action_fenced
     def plan_transaction(
         self,
         key: ReplacementTransactionKey,
@@ -243,6 +248,7 @@ class ReplacementTransactionStore:
         finally:
             conn.close()
 
+    @replacement_transaction_action_fenced
     def supersede_transaction(
         self,
         key: ReplacementTransactionKey,
@@ -337,6 +343,7 @@ class ReplacementTransactionStore:
         finally:
             conn.close()
 
+    @replacement_transaction_action_fenced
     def claim(
         self,
         key: ReplacementTransactionKey,
@@ -430,6 +437,7 @@ class ReplacementTransactionStore:
         finally:
             conn.close()
 
+    @replacement_transaction_action_fenced
     def renew(
         self,
         key: ReplacementTransactionKey,
@@ -515,6 +523,7 @@ class ReplacementTransactionStore:
         finally:
             conn.close()
 
+    @replacement_transaction_action_fenced
     def release(
         self,
         key: ReplacementTransactionKey,
@@ -589,6 +598,7 @@ class ReplacementTransactionStore:
         finally:
             conn.close()
 
+    @replacement_transaction_action_fenced
     def transition_phase(
         self,
         key: ReplacementTransactionKey,
@@ -691,6 +701,7 @@ class ReplacementTransactionStore:
         finally:
             conn.close()
 
+    @replacement_transaction_action_fenced
     def release_drain_attempt(
         self,
         key: ReplacementTransactionKey,
@@ -772,6 +783,7 @@ class ReplacementTransactionStore:
         finally:
             conn.close()
 
+    @replacement_transaction_action_fenced
     def transition_participant(
         self,
         key: ReplacementTransactionKey,

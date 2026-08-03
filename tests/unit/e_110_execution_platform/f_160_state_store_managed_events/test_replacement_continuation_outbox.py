@@ -13,6 +13,7 @@ from mozyo_bridge.core.state.replacement_continuation_outbox import (
     CONSUME_AUTHORITY_MOVED,
     CONSUME_DELIVERED,
     OUTBOX_DELIVERED,
+    OUTBOX_RESERVED,
     RESERVE_COMPLETED,
     RESERVE_GENERATION_MISMATCH,
     RESERVE_GRANTED,
@@ -29,6 +30,7 @@ from mozyo_bridge.core.state.replacement_continuation_outbox_schema import (
 )
 from mozyo_bridge.core.state.replacement_transaction import ReplacementTransactionStore
 from mozyo_bridge.core.state.replacement_transaction_model import (
+    PARTICIPANT_REPLACED,
     PHASE_COMPLETED,
     PHASE_DRAINING_CONTINUATION,
     PHASE_REPLACING_NONSELF,
@@ -36,11 +38,14 @@ from mozyo_bridge.core.state.replacement_transaction_model import (
     DecisionPointer,
     ParticipantPin,
     ReplacementTransactionKey,
+    encode_participants,
 )
 
 
 NOW = "2026-08-03T00:00:00+00:00"
 FUTURE = "2099-01-01T00:00:00+00:00"
+NEAR_EXPIRY = "2026-08-03T00:00:05+00:00"
+AFTER_EXPIRY = "2026-08-03T00:00:10+00:00"
 HOLDER = "replacement-holder"
 GENERATION = 7
 
@@ -189,6 +194,16 @@ class ReplacementContinuationOutboxTest(unittest.TestCase):
     def test_completion_writer_cannot_cross_final_validation_and_send(self):
         """The R10-F2 completion race is serialized behind the reserved transport."""
 
+        participants = tuple(
+            participant.with_phase(PARTICIPANT_REPLACED)
+            for participant in self.record.participants
+        )
+        with sqlite3.connect(self.store.path) as conn:
+            conn.execute(
+                "UPDATE replacement_transactions SET participants_manifest=? "
+                "WHERE workspace_id=? AND action_id=?",
+                (encode_participants(participants), *self.transaction_key.as_row()),
+            )
         reservation = self.outbox.reserve(self.send_key, holder=HOLDER, now=NOW)
         send_entered = threading.Event()
         allow_send = threading.Event()
@@ -223,13 +238,15 @@ class ReplacementContinuationOutboxTest(unittest.TestCase):
 
         def complete():
             completion_started.set()
-            with sqlite3.connect(self.store.path, timeout=2) as conn:
-                conn.execute("PRAGMA busy_timeout = 2000")
-                conn.execute(
-                    "UPDATE replacement_transactions SET phase=? WHERE workspace_id=? "
-                    "AND action_id=?",
-                    (PHASE_COMPLETED, *self.transaction_key.as_row()),
-                )
+            outcome = self.store.transition_phase(
+                self.transaction_key,
+                expected_revision=self.record.revision,
+                expected_action_generation=GENERATION,
+                target=PHASE_COMPLETED,
+                holder=HOLDER,
+                now=NOW,
+            )
+            self.assertTrue(outcome.applied)
             order.append("completion")
             completion_done.set()
 
@@ -245,6 +262,138 @@ class ReplacementContinuationOutboxTest(unittest.TestCase):
         self.assertEqual(consumed[0].disposition, CONSUME_DELIVERED)
         self.assertEqual(order, ["send", "completion"])
         self.assertTrue(completion_done.is_set())
+
+    def test_slow_transport_does_not_block_an_unrelated_action_write(self):
+        """R11-F2: the external effect holds no global state.sqlite writer lock."""
+
+        reservation = self.outbox.reserve(self.send_key, holder=HOLDER, now=NOW)
+        send_entered = threading.Event()
+        allow_send = threading.Event()
+        unrelated_done = threading.Event()
+        consumed = []
+
+        def slow_send():
+            send_entered.set()
+            self.assertTrue(allow_send.wait(2))
+            return "ok"
+
+        def consume():
+            consumed.append(
+                self.outbox.consume_reserved(
+                    self.send_key,
+                    reservation.token,
+                    holder=HOLDER,
+                    clock=lambda: NOW,
+                    authority_fn=lambda: True,
+                    send_fn=slow_send,
+                    send_ok="ok",
+                    send_zero="zero",
+                )
+            )
+
+        consumer = threading.Thread(target=consume)
+        consumer.start()
+        self.assertTrue(send_entered.wait(2))
+
+        unrelated_key = ReplacementTransactionKey("workspace-b", "action-b")
+
+        def write_unrelated():
+            self.store.plan_transaction(
+                unrelated_key,
+                action_generation=1,
+                decision=DecisionPointer("redmine", "14741", "97757"),
+                continuation=ContinuationPointer(
+                    "redmine", "14741", "97755", "review_result", "redispatch_once"
+                ),
+                participants=(
+                    ParticipantPin(
+                        lane_id="lane-b",
+                        role="gateway",
+                        provider="codex",
+                        assigned_name="gateway-b",
+                        old_locator="w2:p1",
+                    ),
+                ),
+                now=NOW,
+            )
+            unrelated_done.set()
+
+        writer = threading.Thread(target=write_unrelated)
+        writer.start()
+        self.assertTrue(unrelated_done.wait(0.5))
+        self.assertFalse(allow_send.is_set())
+
+        allow_send.set()
+        consumer.join(2)
+        writer.join(2)
+        self.assertEqual(consumed[0].disposition, CONSUME_DELIVERED)
+        self.assertIsNotNone(self.store.get(unrelated_key))
+
+    def test_authority_latency_that_crosses_lease_expiry_is_zero_send(self):
+        """R11-F1: a DB lock cannot substitute for action-time wall-clock authority."""
+
+        with sqlite3.connect(self.store.path) as conn:
+            conn.execute(
+                "UPDATE replacement_transactions SET lease_expires_at=? "
+                "WHERE workspace_id=? AND action_id=?",
+                (NEAR_EXPIRY, *self.transaction_key.as_row()),
+            )
+        reservation = self.outbox.reserve(self.send_key, holder=HOLDER, now=NOW)
+        current = [NOW]
+        sends = []
+
+        def authority():
+            current[0] = AFTER_EXPIRY
+            return True
+
+        consumed = self.outbox.consume_reserved(
+            self.send_key,
+            reservation.token,
+            holder=HOLDER,
+            clock=lambda: current[0],
+            authority_fn=authority,
+            send_fn=lambda: sends.append("sent") or "ok",
+            send_ok="ok",
+            send_zero="zero",
+        )
+
+        self.assertEqual(consumed.disposition, RESERVE_LEASE_LOST)
+        self.assertEqual(sends, [])
+        self.assertEqual(self.outbox.state_of(self.send_key), OUTBOX_RESERVED)
+        self.assertEqual(
+            self.store.get(self.transaction_key).phase, PHASE_DRAINING_CONTINUATION
+        )
+
+    def test_zero_send_after_lease_expiry_does_not_stale_release(self):
+        with sqlite3.connect(self.store.path) as conn:
+            conn.execute(
+                "UPDATE replacement_transactions SET lease_expires_at=? "
+                "WHERE workspace_id=? AND action_id=?",
+                (NEAR_EXPIRY, *self.transaction_key.as_row()),
+            )
+        reservation = self.outbox.reserve(self.send_key, holder=HOLDER, now=NOW)
+        current = [NOW]
+
+        def zero_send():
+            current[0] = AFTER_EXPIRY
+            return "zero"
+
+        consumed = self.outbox.consume_reserved(
+            self.send_key,
+            reservation.token,
+            holder=HOLDER,
+            clock=lambda: current[0],
+            authority_fn=lambda: True,
+            send_fn=zero_send,
+            send_ok="ok",
+            send_zero="zero",
+        )
+
+        self.assertEqual(consumed.disposition, RESERVE_LEASE_LOST)
+        self.assertEqual(self.outbox.state_of(self.send_key), OUTBOX_RESERVED)
+        self.assertEqual(
+            self.store.get(self.transaction_key).phase, PHASE_DRAINING_CONTINUATION
+        )
 
     def test_atomic_reserve_preserves_typed_transaction_refusals(self):
         cases = (

@@ -49,6 +49,10 @@ from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
     load_replacement_transactions_readonly,
     replacement_transaction_path,
 )
+from mozyo_bridge.core.state.replacement_transaction_action_fence import (  # noqa: E402
+    ReplacementTransactionActionFenceError,
+    replacement_transaction_action_fence,
+)
 from mozyo_bridge.core.state.replacement_transaction_model import (  # noqa: E402
     PARTICIPANT_CLOSE_OWED,
     PARTICIPANT_LAUNCH_OWED,
@@ -395,6 +399,14 @@ class _StoreCase(unittest.TestCase):
         ):
             out = self._participant(identity, tgt, holder=holder)
             self.assertTrue(out.applied, f"{identity} -> {tgt}: {out}")
+
+
+class ActionFenceTests(_StoreCase):
+    def test_same_thread_reentry_fails_closed_instead_of_deadlocking(self):
+        with replacement_transaction_action_fence(self.store.path, self.key):
+            with self.assertRaises(ReplacementTransactionActionFenceError):
+                with replacement_transaction_action_fence(self.store.path, self.key):
+                    self.fail("same-action fence re-entry must not be admitted")
 
 
 class PlanTests(_StoreCase):
