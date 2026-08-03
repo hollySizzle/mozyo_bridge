@@ -24,6 +24,17 @@ from mozyo_bridge.core.state.replacement_transaction_model import (
     ParticipantPin,
 )
 from mozyo_bridge.core.state.lane_pin_role import PIN_ROLE_GATEWAY
+from mozyo_bridge.core.state.herdr_identity_attestation import (
+    ATTEST_OK,
+    AttestationJoin,
+    HerdrIdentityAttestationStore,
+    IdentityAttestationRecord,
+    VERDICT_PRESENT,
+    evaluate_attestation,
+)
+from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
+    replacement_action_bound_after_identity_join,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
     repo_scope_workspace_id,
 )
@@ -55,6 +66,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     SLOT_LIVE,
     classify_named_slot,
 )
+from mozyo_bridge.shared.paths import mozyo_bridge_home
 
 #: The stored continuation is exact and this recovery is ready to deliver it. NOT delivered,
 #: NOT confirmed, NOT completed -- naming it any of those would be a claim about a send that
@@ -73,6 +85,13 @@ STOPPED_INVENTORY_INVALID = "inventory_invalid"
 #: A fresh, live locator has been joined to the stored participant. This is not an
 #: attestation, send, ledger write, or completion claim.
 INVENTORY_JOINED = "inventory_joined"
+
+#: The fresh self-attestation is exact-generation and replacement-action bound.
+ATTESTATION_BOUND = "attestation_bound"
+#: The canonical home or main attestation could not be read.
+STOPPED_ATTESTATION_UNAVAILABLE = "attestation_unavailable"
+#: An attestation was readable but did not prove this generation and action.
+STOPPED_ATTESTATION_INVALID = "attestation_invalid"
 
 
 @dataclass(frozen=True)
@@ -122,6 +141,26 @@ class VanishedGatewayInventoryJoin:
         return self.outcome == INVENTORY_JOINED
 
 
+@dataclass(frozen=True)
+class VanishedGatewayAttestationProof:
+    """The joined gateway is self-attested and action-bound (still no send authority)."""
+
+    outcome: str = ""
+    stopped: str = ""
+    detail: str = ""
+    action_id: str = ""
+    workspace_id: str = ""
+    lane_id: str = ""
+    provider: str = ""
+    assigned_name: str = ""
+    fresh_locator: str = ""
+    old_locator: str = ""
+
+    @property
+    def bound(self) -> bool:
+        return self.outcome == ATTESTATION_BOUND
+
+
 def _raw(value: object) -> str:
     """Plain exact text, or ``""``. No strip, no subclass, no coercion."""
     if type(value) is not str:
@@ -137,6 +176,10 @@ def _stopped(reason: str, detail: str = "", action_id: str = "") -> Continuation
 
 def _inventory_stopped(reason: str, detail: str = "") -> VanishedGatewayInventoryJoin:
     return VanishedGatewayInventoryJoin(stopped=reason, detail=detail)
+
+
+def _attestation_stopped(reason: str, detail: str = "") -> VanishedGatewayAttestationProof:
+    return VanishedGatewayAttestationProof(stopped=reason, detail=detail)
 
 
 def _resolved_repo_root(repo_root: object) -> Optional[Path]:
@@ -332,6 +375,235 @@ def resolve_vanished_gateway_inventory(
     )
 
 
+def verify_vanished_gateway_attestation(
+    preparation: object,
+    inventory_join: object,
+    *,
+    repo_root: object,
+) -> VanishedGatewayAttestationProof:
+    """Verify the joined live generation's canonical startup/action attestation.
+
+    Reads the selected main identity-attestation exactly once from the canonical mozyo
+    home, then delegates native-current / recognized-v1-side action binding to the shared
+    replacement-binding authority. It performs no write, send, ledger read, CAS, or
+    completion transition and exposes no stored record or timestamp.
+    """
+    if (
+        type(preparation) is not ContinuationPreparation
+        or type(inventory_join) is not VanishedGatewayInventoryJoin
+    ):
+        return _attestation_stopped(
+            STOPPED_ATTESTATION_INVALID,
+            "the continuation or inventory join is not canonical",
+        )
+    pointer = preparation.pointer
+    pin = preparation.participant
+    action_id = _raw(preparation.action_id)
+    if (
+        type(preparation.outcome) is not str
+        or preparation.outcome != CONTINUATION_READY
+        or type(preparation.stopped) is not str
+        or preparation.stopped != ""
+        or type(preparation.detail) is not str
+        or preparation.detail != ""
+        or type(pointer) is not ContinuationPointer
+        or type(pin) is not ParticipantPin
+        or not action_id
+        or preparation.holder != recovery_lease_holder(action_id)
+        or type(inventory_join.outcome) is not str
+        or inventory_join.outcome != INVENTORY_JOINED
+        or type(inventory_join.stopped) is not str
+        or inventory_join.stopped != ""
+        or type(inventory_join.detail) is not str
+        or inventory_join.detail != ""
+    ):
+        return _attestation_stopped(
+            STOPPED_ATTESTATION_INVALID,
+            "the continuation or inventory join is not ready and exact",
+        )
+
+    root = _resolved_repo_root(repo_root)
+    if root is None:
+        return _attestation_stopped(
+            STOPPED_ATTESTATION_UNAVAILABLE,
+            "the lane runtime repository root is unavailable",
+        )
+    try:
+        workspace_id = _raw(repo_scope_workspace_id(root))
+        provider = _raw(resolve_gateway_provider(str(root)))
+    except Exception:  # noqa: BLE001 - canonical resolver values are never exposed
+        return _attestation_stopped(
+            STOPPED_ATTESTATION_UNAVAILABLE,
+            "the canonical workspace or gateway provider is unavailable",
+        )
+    if not workspace_id or not provider:
+        return _attestation_stopped(
+            STOPPED_ATTESTATION_UNAVAILABLE,
+            "the canonical workspace or gateway provider is unavailable",
+        )
+
+    source = _raw(getattr(pointer, "source", None))
+    issue_id = _raw(getattr(pointer, "issue_id", None))
+    journal_id = _raw(getattr(pointer, "journal_id", None))
+    if (
+        not source
+        or not issue_id
+        or not journal_id
+        or _raw(getattr(pointer, "expected_gate", None)) != RESUME_GATE
+        or _raw(getattr(pointer, "next_semantic_action", None))
+        != REDISPATCH_GATEWAY_ONCE
+        or _raw(getattr(pin, "role", None)) != PIN_ROLE_GATEWAY
+        or _raw(getattr(pin, "provider", None)) != provider
+        or _raw(getattr(pin, "lane_id", None)) == ""
+        or _raw(getattr(pin, "assigned_name", None)) == ""
+        or _raw(getattr(pin, "old_locator", None)) == ""
+        or type(getattr(pin, "is_self", None)) is not bool
+        or pin.is_self
+        or getattr(pin, "phase", None) != PARTICIPANT_REPLACED
+        or type(getattr(pin, "evidence_workspace_id", None)) is not str
+        or pin.evidence_workspace_id not in ("", workspace_id)
+    ):
+        return _attestation_stopped(
+            STOPPED_ATTESTATION_INVALID,
+            "the stored pointer or participant is not exact",
+        )
+    try:
+        anchor = RequestAnchor(source=source, issue_id=issue_id, journal_id=journal_id)
+        rebound = recovery_action_id_for_pin(anchor, pin, workspace_id=workspace_id)
+    except Exception:  # noqa: BLE001 - forged values carry no authority
+        return _attestation_stopped(
+            STOPPED_ATTESTATION_INVALID,
+            "the stored participant cannot be bound to this action",
+        )
+    if rebound != action_id:
+        return _attestation_stopped(
+            STOPPED_ATTESTATION_INVALID,
+            "the stored participant is not bound to this action",
+        )
+    decoded = decode_assigned_name(pin.assigned_name)
+    identity = decoded.identity if decoded.ok else None
+    if (
+        identity is None
+        or identity.workspace_id != workspace_id
+        or identity.lane_id != pin.lane_id
+        or identity.role != provider
+    ):
+        return _attestation_stopped(
+            STOPPED_ATTESTATION_INVALID,
+            "the stored assigned name does not encode the pinned identity",
+        )
+
+    join_values = (
+        _raw(inventory_join.action_id),
+        _raw(inventory_join.workspace_id),
+        _raw(inventory_join.lane_id),
+        _raw(inventory_join.provider),
+        _raw(inventory_join.assigned_name),
+        _raw(inventory_join.fresh_locator),
+        _raw(inventory_join.old_locator),
+    )
+    expected_values = (
+        action_id,
+        workspace_id,
+        pin.lane_id,
+        provider,
+        pin.assigned_name,
+        inventory_join.fresh_locator,
+        pin.old_locator,
+    )
+    if (
+        join_values != expected_values
+        or not join_values[5]
+        or join_values[5] == join_values[6]
+    ):
+        return _attestation_stopped(
+            STOPPED_ATTESTATION_INVALID,
+            "the inventory join is not this stored fresh participant",
+        )
+
+    try:
+        home = mozyo_bridge_home()
+        concrete_path_type = type(Path())
+        if type(home) is not concrete_path_type:
+            raise ValueError("non-canonical home")
+        resolved_home = home.resolve(strict=True)
+        if home != resolved_home or not resolved_home.is_dir():
+            raise ValueError("non-canonical home")
+        record = HerdrIdentityAttestationStore(home=resolved_home).read(
+            inventory_join.assigned_name
+        )
+    except Exception:  # noqa: BLE001 - home/store/path/record details never escape
+        return _attestation_stopped(
+            STOPPED_ATTESTATION_UNAVAILABLE,
+            "the canonical startup self-attestation is unavailable",
+        )
+    if type(record) is not IdentityAttestationRecord:
+        return _attestation_stopped(
+            STOPPED_ATTESTATION_UNAVAILABLE,
+            "the canonical startup self-attestation is unavailable",
+        )
+    if (
+        _raw(record.assigned_name) != inventory_join.assigned_name
+        or _raw(record.workspace_id) != workspace_id
+        or _raw(record.role) != provider
+        or _raw(record.lane_id) != pin.lane_id
+        or _raw(record.locator) != inventory_join.fresh_locator
+        or _raw(record.verdict) != VERDICT_PRESENT
+        or not _raw(record.observed_at)
+        or type(record.replacement_action_id) is not str
+        or record.replacement_action_id != record.replacement_action_id.strip()
+    ):
+        return _attestation_stopped(
+            STOPPED_ATTESTATION_INVALID,
+            "the startup self-attestation does not match this live generation",
+        )
+    try:
+        joined = evaluate_attestation(
+            record,
+            live_locator=inventory_join.fresh_locator,
+            expected_workspace_id=workspace_id,
+            expected_role=provider,
+            expected_lane=pin.lane_id,
+        )
+        action_bound = replacement_action_bound_after_identity_join(
+            record,
+            action_id=action_id,
+            live_locator=inventory_join.fresh_locator,
+            workspace_id=workspace_id,
+            role=provider,
+            lane=pin.lane_id,
+            assigned_name=inventory_join.assigned_name,
+            old_locator=inventory_join.old_locator,
+            home=resolved_home,
+        )
+    except Exception:  # noqa: BLE001 - canonical verifier details never escape
+        return _attestation_stopped(
+            STOPPED_ATTESTATION_INVALID,
+            "the startup self-attestation could not be verified",
+        )
+    if type(joined) is not AttestationJoin or joined.state != ATTEST_OK or not joined.ok:
+        return _attestation_stopped(
+            STOPPED_ATTESTATION_INVALID,
+            "the startup self-attestation is not generation-matched",
+        )
+    if action_bound is not True:
+        return _attestation_stopped(
+            STOPPED_ATTESTATION_INVALID,
+            "the startup self-attestation is not bound to this recovery action",
+        )
+
+    return VanishedGatewayAttestationProof(
+        outcome=ATTESTATION_BOUND,
+        action_id=action_id,
+        workspace_id=workspace_id,
+        lane_id=pin.lane_id,
+        provider=provider,
+        assigned_name=inventory_join.assigned_name,
+        fresh_locator=inventory_join.fresh_locator,
+        old_locator=inventory_join.old_locator,
+    )
+
+
 def prepare_vanished_gateway_continuation(
     *,
     plan: Any,
@@ -482,14 +754,19 @@ def prepare_vanished_gateway_continuation(
 
 
 __all__ = (
+    "ATTESTATION_BOUND",
     "CONTINUATION_READY",
     "INVENTORY_JOINED",
+    "STOPPED_ATTESTATION_INVALID",
+    "STOPPED_ATTESTATION_UNAVAILABLE",
     "STOPPED_CONTINUATION_INVALID",
     "STOPPED_INVENTORY_INVALID",
     "STOPPED_INVENTORY_UNAVAILABLE",
     "STOPPED_TRANSACTION_UNAVAILABLE",
     "ContinuationPreparation",
+    "VanishedGatewayAttestationProof",
     "VanishedGatewayInventoryJoin",
     "prepare_vanished_gateway_continuation",
     "resolve_vanished_gateway_inventory",
+    "verify_vanished_gateway_attestation",
 )

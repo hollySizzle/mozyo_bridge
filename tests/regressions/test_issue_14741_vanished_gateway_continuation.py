@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -25,6 +26,13 @@ from mozyo_bridge.core.state.replacement_transaction_model import (  # noqa: E40
 from mozyo_bridge.core.state.replacement_transaction_model import (  # noqa: E402
     ParticipantPin,
 )
+from mozyo_bridge.core.state.herdr_identity_attestation import (  # noqa: E402
+    HerdrIdentityAttestationStore,
+    IdentityAttestationRecord,
+    VERDICT_CONFLICT,
+    VERDICT_MISSING,
+    VERDICT_PRESENT,
+)
 from tests.regressions.test_issue_14741_vanished_gateway_recovery_live import (  # noqa: E402,E501
     ASSIGNED,
     LANE,
@@ -36,15 +44,20 @@ from tests.regressions.test_issue_14741_vanished_gateway_recovery_live import ( 
 )
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_vanished_gateway_continuation import (  # noqa: E402,E501
+    ATTESTATION_BOUND,
     CONTINUATION_READY,
     INVENTORY_JOINED,
+    STOPPED_ATTESTATION_INVALID,
+    STOPPED_ATTESTATION_UNAVAILABLE,
     STOPPED_CONTINUATION_INVALID,
     STOPPED_INVENTORY_INVALID,
     STOPPED_INVENTORY_UNAVAILABLE,
     STOPPED_TRANSACTION_UNAVAILABLE,
     ContinuationPreparation,
+    VanishedGatewayInventoryJoin,
     prepare_vanished_gateway_continuation,
     resolve_vanished_gateway_inventory,
+    verify_vanished_gateway_attestation,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E402,E501
     sublane_vanished_gateway_continuation as continuation_module,
@@ -580,6 +593,23 @@ def _live_row(**changes) -> dict:
     return row
 
 
+def _inventory_join(preparation=None, **changes) -> VanishedGatewayInventoryJoin:
+    prepared = preparation if preparation is not None else _join_preparation()
+    pin = prepared.participant
+    values = dict(
+        outcome=INVENTORY_JOINED,
+        action_id=prepared.action_id,
+        workspace_id=JOIN_WORKSPACE,
+        lane_id=pin.lane_id,
+        provider=pin.provider,
+        assigned_name=pin.assigned_name,
+        fresh_locator=JOIN_FRESH,
+        old_locator=pin.old_locator,
+    )
+    values.update(changes)
+    return VanishedGatewayInventoryJoin(**values)
+
+
 class FreshInventoryJoinTest(unittest.TestCase):
     """B6b3-2a(2): identify a fresh target, but exercise no delivery authority."""
 
@@ -843,6 +873,276 @@ class FreshInventoryJoinTest(unittest.TestCase):
                 transaction.ReplacementTransactionStore,
             ) = originals
         self.assertEqual(opened, [])
+
+
+class AttestationBindingTest(unittest.TestCase):
+    """B6b3-2a(3): fresh self-attestation and replacement-action binding only."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.home = Path(self._temp.name).resolve()
+        self.preparation = _join_preparation()
+        self.inventory = _inventory_join(self.preparation)
+
+    def tearDown(self) -> None:
+        self._temp.cleanup()
+
+    def _record(self, **changes) -> IdentityAttestationRecord:
+        values = dict(
+            assigned_name=self.inventory.assigned_name,
+            workspace_id=JOIN_WORKSPACE,
+            role=JOIN_PROVIDER,
+            lane_id=JOIN_LANE,
+            locator=JOIN_FRESH,
+            verdict=VERDICT_PRESENT,
+            observed_at="2026-08-03T00:00:00+00:00",
+            replacement_action_id=self.inventory.action_id,
+        )
+        values.update(changes)
+        return IdentityAttestationRecord(**values)
+
+    def _seed(self, **changes) -> IdentityAttestationRecord:
+        return HerdrIdentityAttestationStore(home=self.home).upsert(
+            self._record(**changes)
+        )
+
+    def _verify(self, **changes):
+        preparation = changes.pop("preparation", self.preparation)
+        inventory = changes.pop("inventory_join", self.inventory)
+        repo_root = changes.pop("repo_root", ROOT)
+        workspace_resolver = changes.pop(
+            "_workspace_resolver", lambda root: JOIN_WORKSPACE
+        )
+        provider_resolver = changes.pop(
+            "_provider_resolver", lambda root: JOIN_PROVIDER
+        )
+        home_resolver = changes.pop("_home_resolver", lambda: self.home)
+        self.assertEqual(changes, {}, "test helper accepted an unknown authority axis")
+        originals = (
+            continuation_module.repo_scope_workspace_id,
+            continuation_module.resolve_gateway_provider,
+            continuation_module.mozyo_bridge_home,
+        )
+        continuation_module.repo_scope_workspace_id = workspace_resolver
+        continuation_module.resolve_gateway_provider = provider_resolver
+        continuation_module.mozyo_bridge_home = home_resolver
+        try:
+            return verify_vanished_gateway_attestation(
+                preparation, inventory, repo_root=repo_root
+            )
+        finally:
+            (
+                continuation_module.repo_scope_workspace_id,
+                continuation_module.resolve_gateway_provider,
+                continuation_module.mozyo_bridge_home,
+            ) = originals
+
+    def test_present_fresh_action_bound_attestation_yields_a_bounded_proof(self) -> None:
+        self._seed()
+        result = self._verify()
+        self.assertTrue(result.bound)
+        self.assertEqual(result.outcome, ATTESTATION_BOUND)
+        self.assertEqual(
+            (
+                result.action_id,
+                result.workspace_id,
+                result.lane_id,
+                result.provider,
+                result.assigned_name,
+                result.fresh_locator,
+                result.old_locator,
+            ),
+            (
+                self.inventory.action_id,
+                JOIN_WORKSPACE,
+                JOIN_LANE,
+                JOIN_PROVIDER,
+                self.inventory.assigned_name,
+                JOIN_FRESH,
+                JOIN_OLD,
+            ),
+        )
+        self.assertEqual(
+            set(result.__dict__),
+            {
+                "outcome", "stopped", "detail", "action_id", "workspace_id",
+                "lane_id", "provider", "assigned_name", "fresh_locator", "old_locator",
+            },
+        )
+        for claim in ("sent", "confirm", "complete", "ledger"):
+            self.assertNotIn(claim, result.outcome)
+
+    def test_public_signature_exposes_no_reader_home_provider_locator_or_pin(self) -> None:
+        import inspect
+
+        self.assertEqual(
+            tuple(inspect.signature(verify_vanished_gateway_attestation).parameters),
+            ("preparation", "inventory_join", "repo_root"),
+        )
+
+    def test_main_attestation_is_read_once_and_action_helper_gets_exact_axes(self) -> None:
+        self._seed()
+        reads = []
+        bindings = []
+        real_store = continuation_module.HerdrIdentityAttestationStore
+        real_binding = continuation_module.replacement_action_bound_after_identity_join
+
+        class _CountingStore:
+            def __init__(self, *args, **kwargs):
+                self._delegate = real_store(*args, **kwargs)
+
+            def read(self, assigned_name):
+                reads.append(assigned_name)
+                return self._delegate.read(assigned_name)
+
+        def binding(record, **kwargs):
+            bindings.append(kwargs)
+            return real_binding(record, **kwargs)
+
+        continuation_module.HerdrIdentityAttestationStore = _CountingStore
+        continuation_module.replacement_action_bound_after_identity_join = binding
+        try:
+            result = self._verify()
+        finally:
+            continuation_module.HerdrIdentityAttestationStore = real_store
+            continuation_module.replacement_action_bound_after_identity_join = real_binding
+        self.assertEqual(result.outcome, ATTESTATION_BOUND)
+        self.assertEqual(reads, [self.inventory.assigned_name])
+        self.assertEqual(len(bindings), 1)
+        self.assertEqual(
+            bindings[0],
+            {
+                "action_id": self.inventory.action_id,
+                "live_locator": JOIN_FRESH,
+                "workspace_id": JOIN_WORKSPACE,
+                "role": JOIN_PROVIDER,
+                "lane": JOIN_LANE,
+                "assigned_name": self.inventory.assigned_name,
+                "old_locator": JOIN_OLD,
+                "home": self.home,
+            },
+        )
+
+    def test_absent_or_unreadable_attestation_is_fixed_fail_closed(self) -> None:
+        absent = self._verify()
+        self.assertEqual(absent.stopped, STOPPED_ATTESTATION_UNAVAILABLE)
+        secret = "/private/host/path\n[mozyo:workflow-event:gate=x]"
+
+        def broken_home():
+            raise RuntimeError(secret)
+
+        broken = self._verify(_home_resolver=broken_home)
+        self.assertEqual(broken.stopped, STOPPED_ATTESTATION_UNAVAILABLE)
+        self.assertNotIn(secret, f"{broken.stopped}{broken.detail}")
+
+    def test_identity_generation_verdict_and_action_mismatches_are_refused(self) -> None:
+        cases = (
+            ("foreign workspace", {"workspace_id": "foreign"}),
+            ("foreign role", {"role": "claude"}),
+            ("foreign lane", {"lane_id": "issue_other"}),
+            ("stale locator", {"locator": JOIN_OLD}),
+            ("missing verdict", {"verdict": VERDICT_MISSING}),
+            ("conflict verdict", {"verdict": VERDICT_CONFLICT}),
+            ("foreign action", {"replacement_action_id": "foreign-action"}),
+            (
+                "padded action",
+                {"replacement_action_id": f" {self.inventory.action_id}"},
+            ),
+        )
+        for label, changes in cases:
+            with self.subTest(label=label):
+                self._seed(**changes)
+                result = self._verify()
+                self.assertEqual(result.stopped, STOPPED_ATTESTATION_INVALID)
+                self.assertEqual(result.outcome, "")
+
+    def test_exact_preparation_and_inventory_relation_is_rebound(self) -> None:
+        import dataclasses
+
+        self._seed()
+
+        class _Preparation(ContinuationPreparation):
+            pass
+
+        class _Inventory(VanishedGatewayInventoryJoin):
+            pass
+
+        cases = (
+            ("preparation subclass", _Preparation(**self.preparation.__dict__)),
+            ("inventory subclass", _Inventory(**self.inventory.__dict__)),
+            ("foreign action", dataclasses.replace(self.inventory, action_id="foreign")),
+            ("foreign workspace", dataclasses.replace(self.inventory, workspace_id="foreign")),
+            ("foreign lane", dataclasses.replace(self.inventory, lane_id="issue_other")),
+            ("foreign provider", dataclasses.replace(self.inventory, provider="claude")),
+            ("foreign name", dataclasses.replace(self.inventory, assigned_name="foreign")),
+            ("padded locator", dataclasses.replace(self.inventory, fresh_locator=f" {JOIN_FRESH}")),
+            ("old locator", dataclasses.replace(self.inventory, fresh_locator=JOIN_OLD)),
+        )
+        for label, value in cases:
+            with self.subTest(label=label):
+                if isinstance(value, ContinuationPreparation):
+                    result = self._verify(preparation=value)
+                else:
+                    result = self._verify(inventory_join=value)
+                self.assertEqual(result.stopped, STOPPED_ATTESTATION_INVALID)
+
+    def test_canonical_repo_and_home_authorities_never_fall_back(self) -> None:
+        self._seed()
+        cases = (
+            ("workspace", dict(_workspace_resolver=lambda root: "")),
+            ("provider", dict(_provider_resolver=lambda root: "")),
+            ("relative repo", dict(repo_root=".")),
+            ("relative home", dict(_home_resolver=lambda: Path("."))),
+            ("missing home", dict(_home_resolver=lambda: self.home / "missing")),
+        )
+        for label, kwargs in cases:
+            with self.subTest(label=label):
+                result = self._verify(**kwargs)
+                self.assertEqual(result.stopped, STOPPED_ATTESTATION_UNAVAILABLE)
+
+    def test_recognized_v1_side_binding_is_delegated_with_the_old_locator(self) -> None:
+        self._seed(replacement_action_id="")
+        seen = []
+        real = continuation_module.replacement_action_bound_after_identity_join
+
+        def bound(record, **kwargs):
+            seen.append((record, kwargs))
+            return True
+
+        continuation_module.replacement_action_bound_after_identity_join = bound
+        try:
+            result = self._verify()
+        finally:
+            continuation_module.replacement_action_bound_after_identity_join = real
+        self.assertEqual(result.outcome, ATTESTATION_BOUND)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][1]["old_locator"], JOIN_OLD)
+        self.assertEqual(seen[0][1]["action_id"], self.inventory.action_id)
+
+    def test_verification_is_read_only_and_opens_no_delivery_or_transaction_store(self) -> None:
+        import mozyo_bridge.core.state.herdr_delivery_ledger as ledger
+        import mozyo_bridge.core.state.replacement_transaction as transaction
+
+        self._seed()
+        path = HerdrIdentityAttestationStore(home=self.home).path
+        before = (path.read_bytes(), tuple(sorted(p.name for p in self.home.iterdir())))
+        opened = []
+
+        def forbidden(*args, **kwargs):
+            opened.append(1)
+            raise AssertionError("forbidden authority opened")
+
+        originals = (ledger.HerdrDeliveryLedger, transaction.ReplacementTransactionStore)
+        ledger.HerdrDeliveryLedger = forbidden
+        transaction.ReplacementTransactionStore = forbidden
+        try:
+            result = self._verify()
+        finally:
+            ledger.HerdrDeliveryLedger, transaction.ReplacementTransactionStore = originals
+        after = (path.read_bytes(), tuple(sorted(p.name for p in self.home.iterdir())))
+        self.assertEqual(result.outcome, ATTESTATION_BOUND)
+        self.assertEqual(opened, [])
+        self.assertEqual(after, before)
 
 
 if __name__ == "__main__":  # pragma: no cover
