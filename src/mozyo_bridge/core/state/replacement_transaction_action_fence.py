@@ -20,6 +20,7 @@ import errno
 import fcntl
 import hashlib
 import os
+import sqlite3
 import stat
 import threading
 from contextlib import contextmanager
@@ -98,25 +99,69 @@ def _canonical_state_path(state_path: Path) -> Path:
     return parent / supplied.name
 
 
-def _action_lock_coordinates(
-    state_path: Path, key: ReplacementTransactionKey
-) -> tuple[Path, tuple[str, str]]:
+def validate_replacement_state_path(
+    state_path: Path, *, require_exists: bool = True
+) -> Path:
+    """Return one canonical regular-file authority or fail closed.
+
+    The check is intentionally reusable at every use boundary.  A caller that validated a
+    regular pathname before taking the action lock must not later let SQLite follow a
+    symlink or hardlink installed at that pathname (R14-F2).
+    """
+
     canonical = _canonical_state_path(state_path)
     try:
-        ensure_replacement_transaction_schema(canonical)
-        state_info = canonical.lstat()
-    except (OSError, ReplacementTransactionError) as exc:
+        info = canonical.lstat()
+    except FileNotFoundError:
+        if not require_exists:
+            return canonical
         raise ReplacementTransactionActionFenceError(
-            f"replacement state identity unavailable ({type(exc).__name__}); fail closed"
+            "replacement state authority disappeared; fail closed"
+        ) from None
+    except OSError as exc:
+        raise ReplacementTransactionActionFenceError(
+            f"replacement state authority unavailable ({type(exc).__name__}); fail closed"
         ) from exc
     if (
-        not stat.S_ISREG(state_info.st_mode)
-        or stat.S_ISLNK(state_info.st_mode)
-        or state_info.st_nlink != 1
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_nlink != 1
     ):
         raise ReplacementTransactionActionFenceError(
             "replacement state authority is not one regular linked file; fail closed"
         )
+    return canonical
+
+
+def connect_validated_replacement_state(state_path: Path, ensure_schema):
+    """Open SQLite only while the final pathname remains one regular authority."""
+
+    conn = None
+    try:
+        path = validate_replacement_state_path(state_path, require_exists=False)
+        ensure_schema(path)
+        validate_replacement_state_path(path)
+        conn = sqlite3.connect(path, isolation_level=None)
+        validate_replacement_state_path(path)
+        conn.execute("PRAGMA busy_timeout = 2000")
+        return conn
+    except BaseException:
+        if conn is not None:
+            conn.close()
+        raise
+
+
+def _action_lock_coordinates(
+    state_path: Path, key: ReplacementTransactionKey
+) -> tuple[Path, tuple[str, str]]:
+    canonical = validate_replacement_state_path(state_path, require_exists=False)
+    try:
+        ensure_replacement_transaction_schema(canonical)
+        canonical = validate_replacement_state_path(canonical)
+    except (ReplacementTransactionActionFenceError, ReplacementTransactionError) as exc:
+        raise ReplacementTransactionActionFenceError(
+            f"replacement state identity unavailable ({type(exc).__name__}); fail closed"
+        ) from exc
     digest = _action_digest(key)
     lock_directory = canonical.parent / f".{canonical.name}{_LOCK_DIRECTORY_SUFFIX}"
     _ensure_private_directory(lock_directory)
@@ -200,6 +245,12 @@ def replacement_transaction_action_fence(
             raise ReplacementTransactionActionFenceError(
                 detail + "; fail closed"
             ) from exc
+        current = validate_replacement_state_path(state_path)
+        if str(current) != identity[0]:
+            raise ReplacementTransactionActionFenceError(
+                "replacement state canonical authority changed after lock selection; "
+                "fail closed"
+            )
         held.add(identity)
         try:
             yield
@@ -217,6 +268,7 @@ def replacement_transaction_action_fenced(method):
     def guarded(self, key: ReplacementTransactionKey, *args, **kwargs):
         try:
             with replacement_transaction_action_fence(self.path, key):
+                validate_replacement_state_path(self.path)
                 return method(self, key, *args, **kwargs)
         except ReplacementTransactionActionFenceError as exc:
             raise ReplacementTransactionError(
@@ -228,7 +280,9 @@ def replacement_transaction_action_fenced(method):
 
 __all__ = (
     "ReplacementTransactionActionFenceError",
+    "connect_validated_replacement_state",
     "replacement_transaction_action_fence",
     "replacement_transaction_action_fenced",
     "replacement_transaction_action_lock_path",
+    "validate_replacement_state_path",
 )

@@ -29,6 +29,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -50,6 +51,7 @@ from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
     load_replacement_transactions_readonly,
     replacement_transaction_path,
 )
+from mozyo_bridge.core.state import replacement_transaction_action_fence as action_fence_module  # noqa: E402,E501
 from mozyo_bridge.core.state.replacement_transaction_action_fence import (  # noqa: E402
     ReplacementTransactionActionFenceError,
     replacement_transaction_action_fence,
@@ -489,6 +491,120 @@ class ActionFenceTests(_StoreCase):
             with self.assertRaises(ReplacementTransactionActionFenceError):
                 with replacement_transaction_action_fence(self.store.path, self.key):
                     self.fail("atomic DB replacement must not split the action lock")
+
+    def test_symlink_swap_after_lock_selection_refuses_mutation(self):
+        self._plan()
+        target_home = self.home / "symlink-target-home"
+        target_home.mkdir()
+        target = ReplacementTransactionStore(home=target_home)
+        self.assertTrue(
+            target.plan_transaction(
+                self.key,
+                action_generation=GEN,
+                decision=_decision(),
+                continuation=_continuation(),
+                participants=(_gateway(),),
+            ).applied
+        )
+        target_revision = target.get(self.key).revision
+        original_open = action_fence_module._open_lock
+
+        def swap_after_selection(lock_path):
+            fd = original_open(lock_path)
+            os.replace(self.store.path, self.home / "source-before-symlink.sqlite")
+            self.store.path.symlink_to(target.path)
+            return fd
+
+        with mock.patch.object(
+            action_fence_module, "_open_lock", side_effect=swap_after_selection
+        ):
+            with self.assertRaises(ReplacementTransactionError):
+                self.store.claim(
+                    self.key,
+                    expected_revision=1,
+                    expected_action_generation=GEN,
+                    holder="must-not-reach-target",
+                    lease_expires_at=FUTURE,
+                )
+        self.store.path.unlink()
+        self.assertEqual(target.get(self.key).revision, target_revision)
+
+    def test_hardlink_swap_after_lock_selection_refuses_mutation(self):
+        self._plan()
+        target_home = self.home / "hardlink-target-home"
+        target_home.mkdir()
+        target = ReplacementTransactionStore(home=target_home)
+        self.assertTrue(
+            target.plan_transaction(
+                self.key,
+                action_generation=GEN,
+                decision=_decision(),
+                continuation=_continuation(),
+                participants=(_gateway(),),
+            ).applied
+        )
+        target_revision = target.get(self.key).revision
+        original_open = action_fence_module._open_lock
+
+        def swap_after_selection(lock_path):
+            fd = original_open(lock_path)
+            os.replace(self.store.path, self.home / "source-before-hardlink.sqlite")
+            os.link(target.path, self.store.path)
+            return fd
+
+        with mock.patch.object(
+            action_fence_module, "_open_lock", side_effect=swap_after_selection
+        ):
+            with self.assertRaises(ReplacementTransactionError):
+                self.store.claim(
+                    self.key,
+                    expected_revision=1,
+                    expected_action_generation=GEN,
+                    holder="must-not-reach-target",
+                    lease_expires_at=FUTURE,
+                )
+        self.store.path.unlink()
+        self.assertEqual(target.get(self.key).revision, target_revision)
+
+    def test_symlink_swap_at_sqlite_open_refuses_mutation(self):
+        self._plan()
+        target_home = self.home / "connect-target-home"
+        target_home.mkdir()
+        target = ReplacementTransactionStore(home=target_home)
+        self.assertTrue(
+            target.plan_transaction(
+                self.key,
+                action_generation=GEN,
+                decision=_decision(),
+                continuation=_continuation(),
+                participants=(_gateway(),),
+            ).applied
+        )
+        target_revision = target.get(self.key).revision
+        original_connect = sqlite3.connect
+        swapped = [False]
+
+        def swap_before_open(database, *args, **kwargs):
+            if kwargs.get("isolation_level", "not-specified") is None and not swapped[0]:
+                swapped[0] = True
+                os.replace(self.store.path, self.home / "source-before-connect.sqlite")
+                self.store.path.symlink_to(target.path)
+            return original_connect(database, *args, **kwargs)
+
+        with mock.patch.object(
+            action_fence_module.sqlite3, "connect", side_effect=swap_before_open
+        ):
+            with self.assertRaises(ReplacementTransactionError):
+                self.store.claim(
+                    self.key,
+                    expected_revision=1,
+                    expected_action_generation=GEN,
+                    holder="must-not-reach-target",
+                    lease_expires_at=FUTURE,
+                )
+        self.assertTrue(swapped[0])
+        self.store.path.unlink()
+        self.assertEqual(target.get(self.key).revision, target_revision)
 
 
 class PlanTests(_StoreCase):
@@ -1038,6 +1154,48 @@ class SchemaRegistrationTests(unittest.TestCase):
                 (REPLACEMENT_TRANSACTION_COMPONENT,),
             ).fetchone()
         self.assertEqual(version, (1,))
+
+    def test_v1_to_v2_backup_includes_uncheckpointed_wal_commit(self):
+        ensure_replacement_transaction_schema(self.path)
+        key = ReplacementTransactionKey("workspace-wal", "action-wal")
+        store = ReplacementTransactionStore(path=self.path)
+        self.assertTrue(
+            store.plan_transaction(
+                key,
+                action_generation=1,
+                decision=_decision(),
+                continuation=_continuation(),
+                participants=(_gateway(),),
+            ).applied
+        )
+        _downgrade_to_exact_v1(self.path)
+
+        wal = sqlite3.connect(self.path)
+        try:
+            self.assertEqual(wal.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+            wal.execute("PRAGMA wal_autocheckpoint=0")
+            wal.execute(
+                "UPDATE replacement_transactions SET revision=77 "
+                "WHERE workspace_id=? AND action_id=?",
+                key.as_row(),
+            )
+            wal.commit()
+            self.assertTrue(Path(str(self.path) + "-wal").exists())
+
+            backup_dir = migrate_replacement_transaction_schema_v2(self.path)
+            self.assertIsNotNone(backup_dir)
+            with sqlite3.connect(backup_dir / self.path.name) as backup:
+                self.assertEqual(
+                    backup.execute(
+                        "SELECT revision FROM replacement_transactions "
+                        "WHERE workspace_id=? AND action_id=?",
+                        key.as_row(),
+                    ).fetchone(),
+                    (77,),
+                )
+            self.assertEqual(store.get(key).revision, 77)
+        finally:
+            wal.close()
 
     def test_normal_store_read_does_not_implicitly_migrate_v1(self):
         ensure_replacement_transaction_schema(self.path)

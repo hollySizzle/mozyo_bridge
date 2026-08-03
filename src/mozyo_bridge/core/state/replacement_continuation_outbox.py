@@ -28,6 +28,7 @@ from mozyo_bridge.core.state.replacement_continuation_outbox_schema import (
 )
 from mozyo_bridge.core.state.replacement_transaction_action_fence import (
     ReplacementTransactionActionFenceError,
+    connect_validated_replacement_state,
     replacement_transaction_action_fence,
 )
 from mozyo_bridge.core.state.replacement_transaction_model import (
@@ -163,11 +164,14 @@ class ReplacementContinuationOutbox:
         self.path = Path(path)
 
     def _connect(self) -> sqlite3.Connection:
-        ensure_replacement_continuation_outbox_schema(self.path)
         try:
-            conn = sqlite3.connect(self.path, isolation_level=None)
-            conn.execute("PRAGMA busy_timeout = 2000")
-            return conn
+            return connect_validated_replacement_state(
+                self.path, ensure_replacement_continuation_outbox_schema
+            )
+        except ReplacementTransactionActionFenceError as exc:
+            raise ReplacementContinuationOutboxError(
+                "continuation outbox state path changed during connection; fail closed"
+            ) from exc
         except sqlite3.DatabaseError as exc:
             raise ReplacementContinuationOutboxError(
                 f"continuation outbox {self.path} is unreadable; fail closed"

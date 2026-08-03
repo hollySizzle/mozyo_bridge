@@ -1377,14 +1377,19 @@ observation に join し、次の typed decision を返す。
   したがって `state.sqlite` のatomic replacementでも同じlockを使い続ける。state-file symlink / hardlinkはfail-closed、
   parent-directory symlink aliasはcanonical pathnameへ収束し、same-thread alias re-entryもblocking前にfail-closedとなる。
   lock fileはcanonical DBの隣接owner-only private directoryに置き、秘密値を名前へ含めず、runtime中はunlinkしない。
+  final state pathはlock座標の算出時だけでなく、lock取得後、schema ensure前後、実SQLite connectionのopen後にも
+  canonical regular file / single linkであることを再検証する。したがって座標確定後のregular→symlink / hardlink差替えは
+  transaction mutationまたはcontinuation sendへ到達する前にfail-closedとなる。
   ★`replacement_transaction` component v2 はrow shapeをv2専用authority tableへ移し、旧table名をread-only互換viewとして残す。
   migration前にadmission済みのv1 writerも旧名へのUPDATE/INSERT/DELETEをDBが常時拒否し、v2 writerだけが新実表を使う。
   さらにOS fenceに加えてexact-action effect tableとv2実表のINSERT/UPDATE/DELETE guard triggerを所有する
   **behavioral write protocol**。continuation consumeはtransport前の短いtransactionでDB fenceをarmし、
   outcome確定またはproven-zero時の短いtransactionでexact token/generationを条件にdisarmする。これによりv1 admissionを
   migration前に通過して停止していた旧writerも、send中に再開したmutationをDB自身が拒否する。v1→v2は通常のread/write
-  ensureから暗黙実行せず、旧processを停止したoffline rollout railだけがbackup-first明示migrationを呼ぶ。fresh v1-only runtimeは
-  v2 stampでfail-closedする。
+  ensureから暗黙実行せず、旧processを停止したoffline rollout railだけがbackup-first明示migrationを呼ぶ。backupはmain DBの
+  file copyではなくSQLite backup APIでWAL committed stateを含むstaged logical snapshotを取得し、schema・全authority content・
+  storage classをsourceとreadback照合した後にdirectory renameでatomic publishする。fresh v1-only runtimeはv2 stampで
+  fail-closedする。
   SQLite の `BEGIN IMMEDIATE` は transport 前後の短い validation / outcome write に限定するため、遅い1送信が別action・別laneの
   state writeを2秒timeoutさせない。action fence は transport railから同action transaction writeへ再入不可（fail-closed）で、
   現行4 production railはlane authorityをread-only、delivery/attestationを別DBへ書く。short transactionでowner /

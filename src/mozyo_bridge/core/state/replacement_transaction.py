@@ -33,6 +33,8 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from mozyo_bridge.core.state.replacement_transaction_action_fence import (
+    ReplacementTransactionActionFenceError,
+    connect_validated_replacement_state,
     replacement_transaction_action_fenced,
 )
 
@@ -110,10 +112,14 @@ class ReplacementTransactionStore:
 
     def _connect(self) -> sqlite3.Connection:
         """An autocommit connection for the CAS (the container guard's is not)."""
-        ensure_replacement_transaction_schema(self.path)
-        conn = sqlite3.connect(self.path, isolation_level=None)
-        conn.execute("PRAGMA busy_timeout = 2000")
-        return conn
+        try:
+            return connect_validated_replacement_state(
+                self.path, ensure_replacement_transaction_schema
+            )
+        except ReplacementTransactionActionFenceError as exc:
+            raise ReplacementTransactionError(
+                "replacement transaction state path changed during connection; fail closed"
+            ) from exc
 
     # -- reads ---------------------------------------------------------------
 

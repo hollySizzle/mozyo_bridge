@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 import sqlite3
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from mozyo_bridge.core.state.replacement_continuation_outbox import (
     CONSUME_AUTHORITY_MOVED,
@@ -29,6 +31,7 @@ from mozyo_bridge.core.state.replacement_continuation_outbox_schema import (
     TABLE,
 )
 from mozyo_bridge.core.state.replacement_transaction import ReplacementTransactionStore
+from mozyo_bridge.core.state import replacement_transaction_action_fence as action_fence_module
 from mozyo_bridge.core.state.replacement_transaction_model import (
     PARTICIPANT_REPLACED,
     PHASE_COMPLETED,
@@ -390,6 +393,59 @@ class ReplacementContinuationOutboxTest(unittest.TestCase):
         self.assertEqual(
             self.store.get(self.transaction_key).phase, PHASE_DRAINING_CONTINUATION
         )
+
+    def test_symlink_swap_after_lock_selection_is_zero_send(self):
+        reservation = self.outbox.reserve(self.send_key, holder=HOLDER, now=NOW)
+        target_home = self.home / "symlink-target-home"
+        target_home.mkdir()
+        target = ReplacementTransactionStore(home=target_home)
+        target_key = ReplacementTransactionKey("workspace-target", "action-target")
+        self.assertTrue(
+            target.plan_transaction(
+                target_key,
+                action_generation=1,
+                decision=DecisionPointer("redmine", "14741", "97771"),
+                continuation=ContinuationPointer(
+                    "redmine", "14741", "97770", "review_request", "redispatch_once"
+                ),
+                participants=(
+                    ParticipantPin(
+                        lane_id="lane-target",
+                        role="gateway",
+                        provider="codex",
+                        assigned_name="gateway-target",
+                        old_locator="w2:p1",
+                    ),
+                ),
+                now=NOW,
+            ).applied
+        )
+        target_revision = target.get(target_key).revision
+        sends = []
+        original_open = action_fence_module._open_lock
+
+        def swap_after_selection(lock_path):
+            fd = original_open(lock_path)
+            os.replace(self.store.path, self.home / "source-before-symlink.sqlite")
+            self.store.path.symlink_to(target.path)
+            return fd
+
+        with mock.patch.object(
+            action_fence_module, "_open_lock", side_effect=swap_after_selection
+        ):
+            with self.assertRaises(ReplacementContinuationOutboxError):
+                self.outbox.consume_reserved(
+                    self.send_key,
+                    reservation.token,
+                    holder=HOLDER,
+                    clock=lambda: NOW,
+                    authority_fn=lambda: True,
+                    send_fn=lambda: sends.append("sent") or "ok",
+                    send_ok="ok",
+                    send_zero="zero",
+                )
+        self.assertEqual(sends, [])
+        self.assertEqual(target.get(target_key).revision, target_revision)
 
     def test_no_db_wait_remains_between_final_authority_lease_join_and_send(self):
         """R12-F1: a final DB connection may move authority/clock only after send."""

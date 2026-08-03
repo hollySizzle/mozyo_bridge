@@ -25,17 +25,18 @@ explicit offline and backup-first, never a silent repair.
 
 from __future__ import annotations
 
-import shutil
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from mozyo_bridge.core.state.lane_lifecycle_backup import (
+    backup_state_container,
+)
 from mozyo_bridge.core.state.replacement_transaction_model import (
     PHASE_PLANNED,
 )
 from mozyo_bridge.core.state.state_store import (
-    BACKUPS_DIRNAME,
     STATE_CONTAINER_VERSION,
     StateStoreError,
     connect_state_container_rw,
@@ -236,14 +237,6 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _backup_stamp(now: str) -> str:
-    """Compact filesystem-safe stamp (``20260621T130000Z``) for a backup dir."""
-    parsed = datetime.fromisoformat(now)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-
 def _rollback_quietly(conn: sqlite3.Connection) -> None:
     """Best-effort ``ROLLBACK`` so a failed migration leaves the store byte-unchanged."""
     try:
@@ -271,33 +264,6 @@ def _stamp_component_version(conn: sqlite3.Connection) -> None:
             _utc_now(),
         ),
     )
-
-
-def backup_state_container(path: Path) -> Optional[Path]:
-    """Copy an existing ``state.sqlite`` into ``backups/state-<ts>/`` before a write.
-
-    The lifecycle component's ``backup_state_container`` contract (Redmine #13754 R3-F1 /
-    R4-F1): copy the DB under home before the first migration write; a copy failure raises
-    :class:`StateStoreError` so the caller fails closed with the DB byte-unchanged. Returns
-    the backup dir, or ``None`` when there is nothing to preserve yet. Never overwrites an
-    existing snapshot — a taken directory gets a numeric suffix.
-    """
-    if not path.exists():
-        return None
-    base = path.parent / BACKUPS_DIRNAME / f"state-{_backup_stamp(_utc_now())}"
-    try:
-        backup_dir = base
-        suffix = 1
-        while backup_dir.exists():
-            backup_dir = base.with_name(f"{base.name}-{suffix}")
-            suffix += 1
-        backup_dir.mkdir(parents=True, exist_ok=False)
-        shutil.copy2(path, backup_dir / path.name)
-    except OSError as exc:
-        raise StateStoreError(
-            f"backup near {base} failed ({exc}); migration aborted (nothing was written)"
-        ) from exc
-    return backup_dir
 
 
 #: Sentinel for a component row whose version is present but not an exact integer.
