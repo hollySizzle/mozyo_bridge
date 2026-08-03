@@ -142,6 +142,28 @@ def drive_continuation_once(
     # j#82760). On a move the send provably has NOT happened — un-record the attempt.
     if not authority_fn():
         return _un_record_attempt(store, clock, key, holder=holder, gen=gen)
+    # The authority observation above is external and may take long enough for the exact
+    # continuation to land (and for another same-action drive to complete the transaction).
+    # Re-join both durable facts AFTER that observation and directly before the transport.
+    # The earlier post-CAS row check cannot close this window: completion may happen inside
+    # ``authority_fn`` itself (Redmine #14741 R8-F1).
+    if confirmed_fn():
+        return finalize_confirmed(store, clock, key, holder=holder, gen=gen)
+    transport_fence = store.get(key)
+    if transport_fence is None:
+        return CONTINUATION_NOT_FOUND
+    if transport_fence.action_generation != gen:
+        return CONTINUATION_GENERATION_MISMATCH
+    if transport_fence.phase == PHASE_COMPLETED:
+        return CONTINUATION_CONFIRMED
+    if transport_fence.phase != PHASE_DRAINING_CONTINUATION:
+        return CONTINUATION_RELEASE_REFUSED
+    transport_now = clock()
+    if (
+        transport_fence.lease_holder != holder
+        or not transport_fence.lease_is_live(transport_now)
+    ):
+        return CONTINUATION_LEASE_LOST
     sent = send_fn()
     if sent == DRAIN_SEND_ZERO:
         # A PROVEN zero-send: the rail established that nothing was transmitted (its own typed
@@ -158,6 +180,17 @@ def drive_continuation_once(
         # and only completes if it confirms — never a blind resend.
         return CONTINUATION_SEND_FAILED
     if not confirmed_fn():
+        # A concurrent same-generation drive may complete while the lossy confirmation read
+        # returns false.  The stored terminal fact is stronger than that observation and must
+        # be projected by the shared driver so every call site reports the same monotonic
+        # outcome, not only wrappers which happen to add a final projection (#14741 R8-F2).
+        completed = store.get(key)
+        if (
+            completed is not None
+            and completed.action_generation == gen
+            and completed.phase == PHASE_COMPLETED
+        ):
+            return CONTINUATION_CONFIRMED
         return CONTINUATION_UNCERTAIN
     return finalize_confirmed(store, clock, key, holder=holder, gen=gen)
 

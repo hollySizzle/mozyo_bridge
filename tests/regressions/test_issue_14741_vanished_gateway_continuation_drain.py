@@ -34,7 +34,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_continuation_drain import (  # noqa: E501
     CONTINUATION_AUTHORITY_MOVED,
     CONTINUATION_CONFIRMED,
+    CONTINUATION_GENERATION_MISMATCH,
     CONTINUATION_LEASE_LOST,
+    CONTINUATION_NOT_FOUND,
+    CONTINUATION_RELEASE_REFUSED,
     CONTINUATION_SEND_FAILED,
     CONTINUATION_UNCERTAIN,
     CONTINUATION_UNREADABLE,
@@ -377,6 +380,133 @@ class VanishedGatewayContinuationDrainTest(_PrepareCase):
         self.assertEqual(self.ops.send_calls, 0)
         self.assertEqual(self._phase(), PHASE_COMPLETED)
 
+    def test_completion_inside_last_authority_read_prevents_duplicate_send(self):
+        """The transport-adjacent fence sees completion during authority re-join."""
+
+        original_authority = self.ops.current_authority
+
+        def complete_during_last_authority(preparation):
+            if self.ops.authority_reads == 2:
+                self.drain.records.append(self._record())
+                self._complete_current_transaction()
+            return original_authority(preparation)
+
+        self.ops.current_authority = complete_during_last_authority
+        result = self.drain.drive(self.preparation)
+
+        self.assertEqual(result.status, CONTINUATION_CONFIRMED)
+        self.assertEqual(self.ops.authority_reads, 3)
+        self.assertEqual(self.ops.send_calls, 0)
+        self.assertEqual(self._phase(), PHASE_COMPLETED)
+
+    def test_ledger_landing_inside_last_authority_read_prevents_duplicate_send(self):
+        """A landed exact record is finalized before transport even without a second drive."""
+
+        original_authority = self.ops.current_authority
+
+        def land_during_last_authority(preparation):
+            if self.ops.authority_reads == 2:
+                self.drain.records.append(self._record())
+            return original_authority(preparation)
+
+        self.ops.current_authority = land_during_last_authority
+        result = self.drain.drive(self.preparation)
+
+        self.assertEqual(result.status, CONTINUATION_CONFIRMED)
+        self.assertEqual(self.ops.authority_reads, 3)
+        self.assertEqual(self.ops.send_calls, 0)
+        self.assertEqual(self._phase(), PHASE_COMPLETED)
+
+    def test_transport_fence_preserves_generation_phase_and_lease_refusals(self):
+        """The new ledger fence never weakens the adjacent transaction authority."""
+
+        def delete_row():
+            with sqlite3.connect(self.home / "state.sqlite") as connection:
+                connection.execute(
+                    "DELETE FROM replacement_transactions WHERE action_id = ?",
+                    (self.preparation.action_id,),
+                )
+
+        def move_generation():
+            with sqlite3.connect(self.home / "state.sqlite") as connection:
+                connection.execute(
+                    "UPDATE replacement_transactions SET action_generation = 2 "
+                    "WHERE action_id = ?",
+                    (self.preparation.action_id,),
+                )
+
+        def move_phase():
+            with sqlite3.connect(self.home / "state.sqlite") as connection:
+                connection.execute(
+                    "UPDATE replacement_transactions SET phase = ? WHERE action_id = ?",
+                    (PHASE_REPLACING_NONSELF, self.preparation.action_id),
+                )
+
+        cases = (
+            ("not found", delete_row, CONTINUATION_NOT_FOUND),
+            ("generation", move_generation, CONTINUATION_GENERATION_MISMATCH),
+            ("phase", move_phase, CONTINUATION_RELEASE_REFUSED),
+            (
+                "lease",
+                lambda: self._expire(holder="foreign-holder"),
+                CONTINUATION_LEASE_LOST,
+            ),
+        )
+        for label, mutate, expected in cases:
+            with self.subTest(label=label):
+                self.setUp()
+                original_authority = self.ops.current_authority
+
+                def mutate_during_last_authority(preparation):
+                    if self.ops.authority_reads == 2:
+                        mutate()
+                    return original_authority(preparation)
+
+                self.ops.current_authority = mutate_during_last_authority
+                result = self.drain.drive(self.preparation)
+
+                self.assertEqual(result.status, expected)
+                self.assertEqual(self.ops.authority_reads, 3)
+                self.assertEqual(self.ops.send_calls, 0)
+
+    def test_shared_driver_projects_post_send_concurrent_completion(self):
+        """All shared call sites see completed even when the final ledger read says false."""
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_continuation_drain import (  # noqa: E501
+            drive_continuation_once,
+        )
+
+        confirmation_reads = 0
+        send_calls = 0
+
+        def confirmed():
+            nonlocal confirmation_reads
+            confirmation_reads += 1
+            if confirmation_reads == 3:
+                self._complete_current_transaction()
+            return False
+
+        def send():
+            nonlocal send_calls
+            send_calls += 1
+            return DRAIN_SEND_OK
+
+        status = drive_continuation_once(
+            self.store,
+            lambda: FIXED,
+            self._key(),
+            holder=self.preparation.holder,
+            gen=1,
+            authority_fn=lambda: True,
+            send_fn=send,
+            confirmed_fn=confirmed,
+        )
+
+        self.assertEqual(status, CONTINUATION_CONFIRMED)
+        self.assertEqual(confirmation_reads, 3)
+        self.assertEqual(send_calls, 1)
+        self.assertEqual(self._phase(), PHASE_COMPLETED)
+
     def test_prelanded_exact_record_completes_with_zero_send(self):
         self.drain.records.append(self._record())
         result = self.drain.drive(self.preparation)
@@ -468,7 +598,7 @@ class VanishedGatewayContinuationDrainTest(_PrepareCase):
 
         def unreadable_after_send(marker):
             state["reads"] += 1
-            if state["reads"] == 3:
+            if state["reads"] == 4:
                 raise OSError("secret ledger diagnostic")
             return original_records(marker)
 
@@ -477,7 +607,7 @@ class VanishedGatewayContinuationDrainTest(_PrepareCase):
         self.assertEqual(result.status, CONTINUATION_UNCERTAIN)
         self.assertEqual(self.ops.send_calls, 1)
         self.assertEqual(self._phase(), PHASE_DRAINING_CONTINUATION)
-        self.assertEqual(state["reads"], 3)
+        self.assertEqual(state["reads"], 4)
 
     def test_rc_zero_without_ledger_is_uncertain_and_replay_never_resends(self):
         first = self.drain.drive(self.preparation)
