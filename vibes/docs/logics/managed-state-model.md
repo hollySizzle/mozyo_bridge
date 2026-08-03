@@ -1364,6 +1364,19 @@ observation に join し、次の typed decision を返す。
   **un-record** し、re-run が exactly-once 送達できる（`draining_continuation`=send-in-flight 誤認で永久 uncertain にしない）。★**release CAS の outcome は無視しない**（Progress blocker j#82768）: concurrent write で `expected_revision` が stale 化し revert が拒否され得るので、`_redispatch` は row を **再読して state 別 typed disposition** へ分岐する — exclusive lease 保持中は fresh revision で bounded retry すれば re-sendable（`replacing_nonself`）へ収束、収束不能な state は具体 typed blocker（`lease_lost`/`generation_mismatch`/`not_found`、concurrent 完了は `confirmed`）に落とし、**cap 超過 / unexpected phase / unexpected refusal reason は zero-send CAS-recovery failure 固有の distinct token `release_refused`**（Review j#82782 F1）に分離する（send-in-flight `uncertain` とは型で区別、send は当該 invocation で proven-zero、false `authority_moved` を作らない）。silent な `draining_continuation` 残置を作らない。moved/newer lifecycle・wrong worktree
   token・drifted branch・unreadable worktree・foreign live（busy/idle）は zero launch/send で durable transaction を温存
   （lease は actuator が effect 直前に別途再認証、launch 後の自 fresh worker は action-bound attestation が正当性を証明）。
+
+  ★**continuation transport reservation**（#14741 R10）: transaction と lane authority を有限回交互に読むだけでは、最後の
+  read 中にもう一方が動く窓を消せない。continuation send は `state.sqlite` native component
+  `replacement_continuation_outbox` に、exact `(workspace, action_id, action_generation, source, issue, journal,
+  expected_gate, next_action)` を送信前予約する。`replacement_transactions` の exact generation / pointer /
+  `draining_continuation` / holder / live lease 検証と UNIQUE reserve は同一 `BEGIN IMMEDIATE`。予約は effect より先に
+  commit し、crash 後も `reserved` を自動再取得しない。その後の final transaction validation から transport-internal lane
+  authority rejoin・actual send・outcome write までは第2の `BEGIN IMMEDIATE` を保持し、concurrent completion writer が final
+  snapshot と send の間を横断できないようにする。`authority_moved` / rail-proven `zero_send` のみ、owner token を条件に
+  outbox row の削除と `draining_continuation → replacing_nonself` を同一 transaction で行う。send が開始した可能性があれば
+  `delivered` / `uncertain` は非再取得 terminal であり、自動再送しない。exact-generation `completed` は lossy ledger read より
+  強い単調 terminal として全 shared caller が `confirmed` へ投影する。
+
   worktree readability は exact worktree-token authority の一部（単なる git-checkout 解決だけでは sibling/wrong worktree を通す）。
   ★**action-time 再 join は「close 前 preflight を持たない理由」にならない** (#14475、live blocker #14462 j#88463)。launch authority が
   action-time にしか無いと、**launch より前に destructive close がある** guarded refresh では「preflight 全 green → close commit →

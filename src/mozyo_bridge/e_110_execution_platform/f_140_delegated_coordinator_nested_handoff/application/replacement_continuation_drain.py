@@ -11,9 +11,10 @@ drift starts). The discipline, unchanged from its origin:
   duplicate the dispatch;
 - **record attempted BEFORE the send** (``-> draining_continuation``), so a crash resumes as
   uncertain rather than re-sending;
-- **lease re-auth + action-time authority re-join immediately before the transport**; on an
-  authority move the send provably has NOT happened, so the attempt is UN-recorded (a typed
-  CAS-outcome-aware revert, j#82768 / j#82782 F1) rather than left mistaken for send-in-flight;
+- **durable exact-marker + generation reservation** after lease re-auth; the reservation is
+  committed before the effect, then final transaction validation, action-time authority re-join,
+  and transport run while completion writers are excluded. On an authority move the send provably
+  has NOT happened, so reservation release + attempt revert are one atomic state-store write;
 - **never blind-resend** past ``attempted``: an unconfirmed effect reports uncertain and a
   later re-run re-checks the durable confirmation.
 
@@ -26,6 +27,22 @@ pure of transports.
 
 from __future__ import annotations
 
+from mozyo_bridge.core.state.replacement_continuation_outbox import (
+    CONSUME_AUTHORITY_MOVED,
+    CONSUME_DELIVERED,
+    CONSUME_UNCERTAIN,
+    CONSUME_ZERO_SEND,
+    RESERVE_COMPLETED,
+    RESERVE_GENERATION_MISMATCH,
+    RESERVE_GRANTED,
+    RESERVE_LEASE_LOST,
+    RESERVE_NOT_FOUND,
+    RESERVE_POINTER_MISMATCH,
+    RESERVE_WRONG_PHASE,
+    ContinuationSendKey,
+    ReplacementContinuationOutbox,
+    ReplacementContinuationOutboxError,
+)
 from mozyo_bridge.core.state.replacement_transaction_model import (
     CAS_GENERATION_MISMATCH,
     CAS_LEASE_NOT_HELD,
@@ -89,14 +106,21 @@ def drive_continuation_once(
 ) -> str:
     """Drive the recovered transaction's continuation exactly once. (the #13806 discipline)
 
-    ``authority_fn() -> bool`` re-joins the exact live lane authority as the LAST external
-    observation immediately before the transport; ``send_fn() -> str`` performs the one
-    high-level effect (``DRAIN_SEND_OK`` on success); ``confirmed_fn() -> bool`` freshly reads
-    the durable confirmation. Returns a closed ``CONTINUATION_*`` token.
+    ``authority_fn() -> bool`` re-joins the exact live lane authority inside the reserved
+    transport boundary as the LAST external observation before ``send_fn()``; ``send_fn() -> str``
+    performs the one high-level effect (``DRAIN_SEND_OK`` on success); ``confirmed_fn() -> bool``
+    freshly reads the durable confirmation. Returns a closed ``CONTINUATION_*`` token.
     """
     rec = store.get(key)
     if rec is None:
         return CONTINUATION_NOT_FOUND
+    if rec.action_generation != gen:
+        return CONTINUATION_GENERATION_MISMATCH
+    # The transaction's exact terminal is stronger than a lossy ledger/history read.  Project
+    # it before touching the confirmation seam so all four shared callers preserve completed
+    # monotonically (Redmine #14741 R10-F3).
+    if rec.phase == PHASE_COMPLETED:
+        return CONTINUATION_CONFIRMED
     if rec.continuation is None:
         return CONTINUATION_UNREADABLE
     # Idempotency FIRST: if the continuation's durable effect has already landed (a prior send
@@ -149,42 +173,53 @@ def drive_continuation_once(
     # effect landed, not permission to complete a future generation or an unrelated phase
     # (Redmine #14741 R9-F2).
     confirmation_landed = confirmed_fn()
-    fenced = _transport_fence(
-        store, clock, key, holder=holder, gen=gen,
-    )
-    if fenced is not None:
-        return fenced
     if confirmation_landed:
         return finalize_confirmed(store, clock, key, holder=holder, gen=gen)
-    # Confirmation and the first transaction fence are themselves observations.  The lane
-    # authority may move while either is being read, so re-join it again afterwards.  A move
-    # still proves ZERO send and takes the same typed revert as the earlier authority fence
-    # (Redmine #14741 R9-F1).
-    if not authority_fn():
-        return _un_record_attempt(store, clock, key, holder=holder, gen=gen)
-    # The final transaction read closes completion / generation / phase / lease changes that
-    # happened inside the last lane-authority observation.  After this point the shared
-    # driver performs no other external observation before invoking the transport.
-    fenced = _transport_fence(
-        store, clock, key, holder=holder, gen=gen,
-    )
-    if fenced is not None:
-        return fenced
-    sent = send_fn()
-    if sent == DRAIN_SEND_ZERO:
-        # A PROVEN zero-send: the rail established that nothing was transmitted (its own typed
-        # disposition, not an inference). That is the same fact the authority-moved branch above
-        # acts on, so it takes the same revert — un-record the attempt so a re-run may send.
-        # Collapsing it into the failure branch below leaves the attempt recorded forever and a
-        # post-close transaction can then never resume its anchor (Redmine #14661 j#92601 F5).
-        return _un_record_attempt(
-            store, clock, key, holder=holder, gen=gen,
-            reverted=CONTINUATION_ZERO_SEND_REVERTED,
+    # Finite alternating transaction/authority reads cannot close both race windows.  Reserve
+    # the exact continuation marker + generation while validating the current transaction under
+    # the SAME state.sqlite BEGIN IMMEDIATE lock.  Only that reservation owner enters the
+    # transport-coupled authority check below (Redmine #14741 R10-F1/F2).
+    try:
+        send_key = ContinuationSendKey.from_record(rec, action_generation=gen)
+        outbox = ReplacementContinuationOutbox(store.path)
+        reservation = outbox.reserve(
+            send_key,
+            holder=holder,
+            now=clock(),
         )
-    if sent != DRAIN_SEND_OK:
-        # Send outcome UNCERTAIN; the state stays attempted. A re-run re-checks the confirmation
-        # and only completes if it confirms — never a blind resend.
+    except (AttributeError, TypeError, ValueError, ReplacementContinuationOutboxError):
+        return CONTINUATION_UNREADABLE
+    terminal = _reservation_terminal(reservation.disposition)
+    if terminal is not None:
+        return terminal
+    # The coupled API opens a second BEGIN IMMEDIATE while the already-committed reservation
+    # remains durable.  It holds that lock from final transaction validation through authority
+    # rejoin and the effect, so a completion writer cannot advance between the final snapshot and
+    # the send.  A crash rolls this transaction back but leaves the earlier reservation intact.
+    try:
+        consumed = outbox.consume_reserved(
+            send_key,
+            reservation.token,
+            holder=holder,
+            clock=clock,
+            authority_fn=authority_fn,
+            send_fn=send_fn,
+            send_ok=DRAIN_SEND_OK,
+            send_zero=DRAIN_SEND_ZERO,
+        )
+    except ReplacementContinuationOutboxError:
+        # The earlier reservation stays durable even when the consuming transaction failed;
+        # re-entry sees held and never sends.
+        return CONTINUATION_UNCERTAIN
+    if consumed.disposition == CONSUME_AUTHORITY_MOVED:
+        return CONTINUATION_AUTHORITY_MOVED
+    if consumed.disposition == CONSUME_ZERO_SEND:
+        return CONTINUATION_ZERO_SEND_REVERTED
+    if consumed.disposition == CONSUME_UNCERTAIN:
         return CONTINUATION_SEND_FAILED
+    terminal = _reservation_terminal(consumed.disposition)
+    if consumed.disposition != CONSUME_DELIVERED:
+        return terminal if terminal is not None else CONTINUATION_UNCERTAIN
     if not confirmed_fn():
         # A concurrent same-generation drive may complete while the lossy confirmation read
         # returns false.  The stored terminal fact is stronger than that observation and must
@@ -199,6 +234,28 @@ def drive_continuation_once(
             return CONTINUATION_CONFIRMED
         return CONTINUATION_UNCERTAIN
     return finalize_confirmed(store, clock, key, holder=holder, gen=gen)
+
+
+def _reservation_terminal(disposition: str):
+    """Map a final atomic reserve refusal onto the shared closed status vocabulary."""
+
+    if disposition == RESERVE_GRANTED:
+        return None
+    if disposition == RESERVE_COMPLETED:
+        return CONTINUATION_CONFIRMED
+    if disposition == RESERVE_NOT_FOUND:
+        return CONTINUATION_NOT_FOUND
+    if disposition == RESERVE_GENERATION_MISMATCH:
+        return CONTINUATION_GENERATION_MISMATCH
+    if disposition == RESERVE_LEASE_LOST:
+        return CONTINUATION_LEASE_LOST
+    if disposition == RESERVE_POINTER_MISMATCH:
+        return CONTINUATION_UNREADABLE
+    if disposition == RESERVE_WRONG_PHASE:
+        return CONTINUATION_RELEASE_REFUSED
+    # Existing reserved/delivered/uncertain all mean another invocation owns or owned the exact
+    # send.  None may be reclaimed or blindly replayed.
+    return CONTINUATION_UNCERTAIN
 
 
 def _un_record_attempt(
@@ -248,24 +305,6 @@ def _un_record_attempt(
             return CONTINUATION_RELEASE_REFUSED
         # CAS_STALE_REVISION / CAS_NOT_FOUND: a concurrent write moved the row — re-read + retry.
     return CONTINUATION_RELEASE_REFUSED  # cap exhausted (a lease-held revert converges quickly)
-
-
-def _transport_fence(store, clock, key, *, holder: str, gen: int):
-    """Return a typed stop for a non-sendable row, or ``None`` when transport may proceed."""
-
-    rec = store.get(key)
-    if rec is None:
-        return CONTINUATION_NOT_FOUND
-    if rec.action_generation != gen:
-        return CONTINUATION_GENERATION_MISMATCH
-    if rec.phase == PHASE_COMPLETED:
-        return CONTINUATION_CONFIRMED
-    if rec.phase != PHASE_DRAINING_CONTINUATION:
-        return CONTINUATION_RELEASE_REFUSED
-    now = clock()
-    if rec.lease_holder != holder or not rec.lease_is_live(now):
-        return CONTINUATION_LEASE_LOST
-    return None
 
 
 def finalize_confirmed(store, clock, key, *, holder: str, gen: int) -> str:

@@ -1125,6 +1125,7 @@ class PostCloseResumeTests(_RecoveryCase):
         self.assertEqual(first.status, RECOVERY_COMPLETED)
         closed_after = list(self.port.closed)
         sends_after = len(ops.sends)
+        ops._landed = False  # exact completed remains terminal after ledger-history loss
         ops._observation = self._gone()
         second = self._use_case(ops).run(self._request(), execute=True)
         self.assertTrue(second.post_close_resume)

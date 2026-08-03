@@ -575,10 +575,11 @@ class ExecuteTests(_RefreshCase):
         self.assertEqual(outcome.status, WORKER_REFRESH_STATUS_COMPLETED)
         self.assertEqual(calls, [WORKER["lane_id"]])
 
-    def test_a_rerun_after_completion_is_idempotent_zero_send(self):
+    def test_a_rerun_after_completion_survives_lost_confirmation_history(self):
         ops = FakeWorkerOps()
         self._use_case(ops).run(self._request(), execute=True)
         sends = len(ops.resumes)
+        ops._landed = False  # simulate compacted/lost delivery-ledger history
         again = self._use_case(ops).run(self._request(), execute=True)
         self.assertEqual(again.status, WORKER_REFRESH_STATUS_COMPLETED)
         self.assertEqual(len(ops.resumes), sends)  # no second send

@@ -24,6 +24,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     build_marker,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+    replacement_continuation_drain as replacement_drain_module,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
     sublane_vanished_gateway_continuation_drain as drain_module,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.fresh_coordinator_drain import (  # noqa: E501
@@ -513,21 +516,18 @@ class VanishedGatewayContinuationDrainTest(_PrepareCase):
         self.assertEqual(self._phase(), PHASE_REPLACING_NONSELF)
 
     def test_transaction_fence_authority_move_is_rejoined_before_shared_transport(self):
-        """Authority movement inside the store observation is caught by the following join."""
+        """Authority movement inside atomic reserve is caught by transport's final join."""
 
         authority = True
         authority_reads = 0
         send_calls = 0
-        store_reads = 0
-        original_get = self.store.get
+        original_reserve = replacement_drain_module.ReplacementContinuationOutbox.reserve
 
-        def moving_get(key):
-            nonlocal authority, store_reads
-            store_reads += 1
-            record = original_get(key)
-            if store_reads == 3:
-                authority = False
-            return record
+        def moving_reserve(outbox, *args, **kwargs):
+            nonlocal authority
+            reservation = original_reserve(outbox, *args, **kwargs)
+            authority = False
+            return reservation
 
         def current_authority():
             nonlocal authority_reads
@@ -539,7 +539,7 @@ class VanishedGatewayContinuationDrainTest(_PrepareCase):
             send_calls += 1
             return DRAIN_SEND_OK
 
-        self.store.get = moving_get
+        replacement_drain_module.ReplacementContinuationOutbox.reserve = moving_reserve
         try:
             status = drive_continuation_once(
                 self.store,
@@ -552,7 +552,7 @@ class VanishedGatewayContinuationDrainTest(_PrepareCase):
                 confirmed_fn=lambda: False,
             )
         finally:
-            self.store.get = original_get
+            replacement_drain_module.ReplacementContinuationOutbox.reserve = original_reserve
 
         self.assertEqual(status, CONTINUATION_AUTHORITY_MOVED)
         self.assertEqual(authority_reads, 2)

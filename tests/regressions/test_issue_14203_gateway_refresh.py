@@ -600,10 +600,11 @@ class HappyPathTests(_RefreshCase):
         self.assertEqual(continuation.journal_id, "87251")
         self.assertEqual(continuation.expected_gate, "review_request")
 
-    def test_a_rerun_after_completion_is_idempotent_zero_send(self):
+    def test_a_rerun_after_completion_survives_lost_confirmation_history(self):
         ops = FakeGatewayOps()
         self._use_case(ops).run(self._request(), execute=True)
-        rerun_ops = FakeGatewayOps(already_landed=True, target=_target())
+        # The exact transaction terminal is stronger than a lossy/compacted delivery ledger.
+        rerun_ops = FakeGatewayOps(already_landed=False, target=_target())
         outcome = self._use_case(rerun_ops).run(self._request(), execute=True)
         # The transaction is already completed; the drive confirms with ZERO new close/send.
         self.assertEqual(outcome.status, REFRESH_STATUS_COMPLETED)
