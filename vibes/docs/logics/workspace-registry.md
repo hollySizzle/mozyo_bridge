@@ -36,8 +36,8 @@ Redmine #11920 / #11921 で primary 名を `workspace-anchor.json` に rename �
 
 設計上の不変条件:
 
-- **tmux runtime state を DB に置かない。** live な window / pane / process 情報は tmux が正本。registry が持つ runtime 隣接 field は `last_seen` のみで、identity table (`workspaces`) から分離した cache table (`workspace_activity`) に置く。cache table を失っても identity は壊れない。
-- **読み取りは read-only / 書き込みは `register_workspace()` 経由。** `resolve_canonical_session()` (および `session name` / bare `mozyo` / `status` / smart `init` の session 解決ステップ) は registry を作らず、`last_seen` も更新せず、anchor にも書かない。registry / anchor への書き込みは `register_workspace()` のみが行い、呼び出し元は (1) 明示的な `workspace register` CLI (手動・idempotent) と (2) smart `init` (#11427) の guarded adoption (fail-closed preflight の後・tmux/vscode mutation の前に、未登録 workspace を登録) の 2 つ。`init` の session 解決自体は read-only で、登録は別の明示的 write step。
+- **terminal runtime state を DB に置かない。** live agent / process 情報は選択中providerのlive inventoryが正本であり、Herdr rolloutではglobal `agent list`、tmux backendではtmux観測を使う。registry が持つ runtime 隣接 field は `last_seen` のみで、identity table (`workspaces`) から分離した cache table (`workspace_activity`) に置く。cache table を失っても identity は壊れない。
+- **通常のidentity登録は `register_workspace()`、missing-path rowの退役は専用 `workspace retire` adapterだけが書く。** `resolve_canonical_session()` (および `session name` / bare `mozyo` / `status` / smart `init` の session 解決ステップ) は registry を作らず、`last_seen` も更新せず、anchor にも書かない。登録側の呼び出し元は (1) 明示的な `workspace register` CLI (手動・idempotent) と (2) smart `init` (#11427) の guarded adoption (fail-closed preflight の後・terminal/vscode mutation の前に、未登録 workspace を登録) の 2つ。退役側はcurrent identity / path / exact record+`updated_at` / global Herdr inventory / plan digestをfenceし、verified independent backup後にexact rowだけをtransactional deleteする。一般delete APIやraw SQLite writeは公開しない。詳細は [[logic-managed-state-model]] の writer rulesを正本とする。
 - **anchor は path を持たない。** anchor の置き場所そのものが path であり、copy / move されても stale path を主張できない。
 - **anchor は workspace root marker である。** `shared/paths.py` の `WORKSPACE_MARKERS` に `.mozyo-bridge/workspace-anchor.json` (新名) と `.mozyo-bridge/workspace.json` (旧名 fallback) を含め、登録済み非 git workspace の subdirectory からの root 推測が登録 root に解決されるようにする (review #54760, rename #11920 / #11921)。`.mozyo-bridge/scaffold.json` (#11301) と同じ「workspace identity を確立する narrow marker」の扱い。
 - **特定 VS Code extension / tmux-integrated を公式 backend にしない。** 既存の `.vscode/settings.json` 連携 (#10796) は維持するが、registry の正本性はそれに依存しない。
@@ -63,7 +63,7 @@ CREATE TABLE workspace_activity (       -- cache。identity と分離
 );
 ```
 
-- 既存 registry の `user_version` が未知の値なら write 側は die する (silent migration しない)。corrupt な registry も write 側は die し、復旧 (退避して anchor から再登録) を operator 判断に残す。read 側 (解決) は corrupt registry を空扱いし、anchor / derivation へ degrade する。
+- 既存 registry の `user_version` が未知の値なら write 側は拒否する (silent migration しない)。`workspace retire` はbackup作成時と `BEGIN IMMEDIATE` 後の双方でexact schemaを再検証し、action-time driftではzero-delete。corrupt な registry も write 側は拒否し、復旧 (退避して anchor から再登録) を operator 判断に残す。read 側 (通常解決) は corrupt registry を空扱いし、anchor / derivation へ degrade するが、退役authority readは空へdegradeしない。
 
 ## Anchor schema (v1)
 
@@ -93,8 +93,9 @@ CREATE TABLE workspace_activity (       -- cache。identity と分離
 - `mozyo-bridge workspace register [--repo PATH] [--name NAME] [--json]` — 明示的・手動の書き込み。idempotent。registry / anchor への書き込み関数 `register_workspace()` を呼ぶ。
 - `mozyo-bridge workspace list [--json]` — read-only。
 - `mozyo-bridge workspace inspect [--repo PATH] [--json]` — registry row / anchor / derived fallback / 効いている解決を並べて表示。drift の可視化用。
+- `mozyo-bridge workspace retire [--repo PATH] --workspace-id ID [--execute --expect-plan-digest SHA256] [--json]` — dry-run既定。missing path、current workspaceでないこと、exact row digest/`updated_at`、lossless global Herdr inventoryでtarget agent 0をplanへ拘束する。executeは同じauthorityをaction-time再読し、live registryとinodeを共有しないprivate backup (single-link regular file / mode 0600) を検証後、rowとactivity cascadeのreadbackを同一write transaction内で証明する。replayもrowだけでなくorphan activity不在を要求する。rollback/recovery境界は [[logic-managed-state-model]] を読む。
 - read-only consumer (`session name`, bare `mozyo`, `status`, `session vscode-settings`) は `resolve_canonical_session()` 経由で、書き込みを伴わない。
-- smart `init` (#11427) は解決自体は `resolve_canonical_session()` 経由 (read-only) だが、未登録 workspace のときは guarded adoption の一部として `register_workspace()` を呼んで登録する (`workspace register` と同じ write 関数)。これは `workspace register` 以外の唯一の write 呼び出し元。
+- smart `init` (#11427) は解決自体は `resolve_canonical_session()` 経由 (read-only) だが、未登録 workspace のときは guarded adoption の一部として `register_workspace()` を呼んで登録する (`workspace register` と同じ登録関数)。これは `workspace register` 以外の唯一の**登録**呼び出し元であり、専用退役writerとは別である。
 - 未登録 workspace の解決は、既定 (`derive_unregistered=True`) では従来の導出と byte 一致で後方互換。
 
 ## 未登録 fallback の degrading mode (Redmine #12038)
@@ -111,6 +112,6 @@ canonical session / defaults 解決そのものが目的の command (`session na
 
 ## 検証
 
-- unit tests: `tests/test_workspace_registry.py` (登録 / 再利用 / anchor 復元 / 移動 / 日本語 path / 長 path / 非 git / corrupt degrade / JSON schema)。
+- registry tests: `tests/integration/e_110_execution_platform/f_110_workspace_session_identity/test_workspace_registry.py` と `test_workspace_retirement_store.py`、`tests/unit/e_110_execution_platform/f_110_workspace_session_identity/test_workspace_retirement.py`。
 - `python3 -m unittest discover -s tests`
 - `mozyo-bridge docs validate --repo .` ほか catalog 検証一式 (catalog 変更時)。

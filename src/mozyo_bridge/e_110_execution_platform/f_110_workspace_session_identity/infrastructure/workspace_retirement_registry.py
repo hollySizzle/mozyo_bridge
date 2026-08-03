@@ -128,6 +128,39 @@ class SQLiteWorkspaceRetirementRegistry:
             raise WorkspaceRetirementAuthorityError("registry_not_readable") from exc
         return _row_to_record(row) if row is not None else None
 
+    def _read_registry_presence(self, workspace_id: str) -> tuple[bool, bool]:
+        """Read row/activity presence in one strict, read-only snapshot."""
+        try:
+            conn = sqlite3.connect(
+                f"file:{self._registry_path}?mode=ro", uri=True
+            )
+            try:
+                conn.execute("BEGIN")
+                if (
+                    conn.execute("PRAGMA user_version").fetchone()[0]
+                    != REGISTRY_SCHEMA_VERSION
+                ):
+                    raise WorkspaceRetirementAuthorityError(
+                        "registry_schema_invalid"
+                    )
+                row_present = (
+                    conn.execute(_SELECT_RECORD, (workspace_id,)).fetchone()
+                    is not None
+                )
+                activity_present = (
+                    conn.execute(
+                        "SELECT 1 FROM workspace_activity WHERE workspace_id = ?",
+                        (workspace_id,),
+                    ).fetchone()
+                    is not None
+                )
+                conn.rollback()
+            finally:
+                conn.close()
+        except (OSError, sqlite3.DatabaseError) as exc:
+            raise WorkspaceRetirementAuthorityError("registry_not_readable") from exc
+        return row_present, activity_present
+
     def observe(self, workspace_id: str) -> Optional[WorkspaceRetirementObservation]:
         if not self._healthy():
             raise WorkspaceRetirementAuthorityError("registry_not_healthy")
@@ -139,13 +172,26 @@ class SQLiteWorkspaceRetirementRegistry:
     ) -> Optional[WorkspaceRecord]:
         path = self._backup_path(plan_digest)
         try:
-            mode = path.lstat().st_mode
+            backup_stat = path.lstat()
         except FileNotFoundError:
             return None
         except OSError as exc:
             raise WorkspaceRetirementAuthorityError("backup_not_readable") from exc
-        if not stat.S_ISREG(mode) or stat.S_IMODE(mode) != 0o600:
+        if (
+            not stat.S_ISREG(backup_stat.st_mode)
+            or stat.S_IMODE(backup_stat.st_mode) != 0o600
+            or backup_stat.st_nlink != 1
+        ):
             raise WorkspaceRetirementAuthorityError("backup_permissions_invalid")
+        try:
+            registry_stat = self._registry_path.lstat()
+        except OSError as exc:
+            raise WorkspaceRetirementAuthorityError("registry_not_readable") from exc
+        if (
+            backup_stat.st_dev == registry_stat.st_dev
+            and backup_stat.st_ino == registry_stat.st_ino
+        ):
+            raise WorkspaceRetirementAuthorityError("backup_not_independent")
         try:
             conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
             try:
@@ -166,8 +212,19 @@ class SQLiteWorkspaceRetirementRegistry:
     def observe_retired(
         self, workspace_id: str, plan_digest: str
     ) -> Optional[WorkspaceRetirementObservation]:
+        if not self._healthy():
+            raise WorkspaceRetirementAuthorityError("registry_not_healthy")
+        self._require_clean_replay_state(workspace_id)
         record = self._read_backup_record(workspace_id, plan_digest)
+        self._require_clean_replay_state(workspace_id)
         return _observation(record) if record is not None else None
+
+    def _require_clean_replay_state(self, workspace_id: str) -> None:
+        row_present, activity_present = self._read_registry_presence(workspace_id)
+        if row_present:
+            raise WorkspaceRetirementAuthorityError("replay_target_present")
+        if activity_present:
+            raise WorkspaceRetirementAuthorityError("replay_activity_present")
 
     def _ensure_backup(
         self,
@@ -188,18 +245,24 @@ class SQLiteWorkspaceRetirementRegistry:
             )
 
         root = self._backup_root
-        if root.is_symlink():
+        try:
+            if root.is_symlink():
+                return False
+            root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            root_stat = root.lstat()
+            if not stat.S_ISDIR(root_stat.st_mode):
+                return False
+            os.chmod(root, 0o700)
+            if stat.S_IMODE(root.lstat().st_mode) != 0o700:
+                return False
+            file_descriptor, temp_name = tempfile.mkstemp(
+                prefix=f".{plan_digest}.",
+                suffix=".pending.sqlite",
+                dir=root,
+            )
+            os.close(file_descriptor)
+        except OSError:
             return False
-        root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if root.is_symlink() or not root.is_dir():
-            return False
-        os.chmod(root, 0o700)
-        file_descriptor, temp_name = tempfile.mkstemp(
-            prefix=f".{plan_digest}.",
-            suffix=".pending.sqlite",
-            dir=root,
-        )
-        os.close(file_descriptor)
         temp_path = Path(temp_name)
         try:
             source = None
@@ -218,6 +281,11 @@ class SQLiteWorkspaceRetirementRegistry:
             os.chmod(temp_path, 0o600)
             conn = sqlite3.connect(f"file:{temp_path}?mode=ro", uri=True)
             try:
+                if (
+                    conn.execute("PRAGMA user_version").fetchone()[0]
+                    != REGISTRY_SCHEMA_VERSION
+                ):
+                    return False
                 row = conn.execute(_SELECT_RECORD, (workspace_id,)).fetchone()
             finally:
                 conn.close()
@@ -234,7 +302,12 @@ class SQLiteWorkspaceRetirementRegistry:
                     existing is not None
                     and _record_digest(existing) == expected_record_digest
                 )
-            return True
+            temp_path.unlink()
+            existing = self._read_backup_record(workspace_id, plan_digest)
+            return (
+                existing is not None
+                and _record_digest(existing) == expected_record_digest
+            )
         except (OSError, sqlite3.DatabaseError, WorkspaceRetirementAuthorityError):
             return False
         finally:
@@ -260,14 +333,21 @@ class SQLiteWorkspaceRetirementRegistry:
             return WorkspaceRetirementStoreOutcome(False, "registry_unreadable")
         if current is None:
             try:
-                retired = self._read_backup_record(workspace_id, plan_digest)
+                retired_observation = self.observe_retired(
+                    workspace_id, plan_digest
+                )
             except WorkspaceRetirementAuthorityError:
-                retired = None
-            if retired is not None and _record_digest(retired) == expected_record_digest:
+                retired_observation = None
+            if (
+                retired_observation is not None
+                and retired_observation.record_digest == expected_record_digest
+            ):
                 return WorkspaceRetirementStoreOutcome(
                     True, backup_receipt=plan_digest
                 )
-            return WorkspaceRetirementStoreOutcome(False, "record_missing_before_backup")
+            return WorkspaceRetirementStoreOutcome(
+                False, "retirement_replay_not_proven"
+            )
         if _record_digest(current) != expected_record_digest:
             return WorkspaceRetirementStoreOutcome(False, "record_drift")
         if _path_state(current.canonical_path) != PATH_MISSING:
@@ -284,8 +364,24 @@ class SQLiteWorkspaceRetirementRegistry:
             conn.execute("PRAGMA foreign_keys = ON")
             try:
                 conn.execute("BEGIN IMMEDIATE")
+                if (
+                    conn.execute("PRAGMA user_version").fetchone()[0]
+                    != REGISTRY_SCHEMA_VERSION
+                ):
+                    conn.rollback()
+                    return WorkspaceRetirementStoreOutcome(
+                        False, "registry_schema_drift"
+                    )
                 row = conn.execute(_SELECT_RECORD, (workspace_id,)).fetchone()
                 if row is None:
+                    if conn.execute(
+                        "SELECT 1 FROM workspace_activity WHERE workspace_id = ?",
+                        (workspace_id,),
+                    ).fetchone() is not None:
+                        conn.rollback()
+                        return WorkspaceRetirementStoreOutcome(
+                            False, "activity_orphan_present"
+                        )
                     conn.rollback()
                     return WorkspaceRetirementStoreOutcome(
                         True, backup_receipt=plan_digest
@@ -318,14 +414,6 @@ class SQLiteWorkspaceRetirementRegistry:
                 conn.close()
         except sqlite3.DatabaseError:
             return WorkspaceRetirementStoreOutcome(False, "registry_write_failed")
-        try:
-            post_delete = self._read_registry_record(workspace_id)
-        except WorkspaceRetirementAuthorityError:
-            return WorkspaceRetirementStoreOutcome(
-                False, "post_delete_readback_failed"
-            )
-        if post_delete is not None:
-            return WorkspaceRetirementStoreOutcome(False, "post_delete_readback_failed")
         return WorkspaceRetirementStoreOutcome(
             True,
             backup_receipt=plan_digest,

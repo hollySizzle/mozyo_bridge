@@ -191,8 +191,10 @@ single SQLite 化では file 境界が消えるため、実装上の ownership �
   lossless readとtarget live agent 0をcanonical planへ拘束する。executeはdirect ownerが承認したexact
   plan digestを再提示した場合だけ、同じauthorityを二度読みし、SQLite backup APIでprivate
   `${MOZYO_BRIDGE_HOME}/workspace-registry-backups/<plan_digest>.sqlite` を作成・検証してから
-  exact rowをtransactional deleteする。`workspace_activity` はforeign-key cascade、削除後はreadback、
-  同じdigestのverified backupがあるreplayはzero-write `already_retired` とする。path present、current
+  exact rowをtransactional deleteする。backupはsingle-link regular file・mode 0600・live registryと異なる
+  device/inodeを要求し、schemaはbackupと `BEGIN IMMEDIATE` 後の双方で再検証する。`workspace_activity` は
+  foreign-key cascade、削除後は同一transaction内readback、同じdigestのverified backupがあるreplayは
+  registry rowとorphan activityの双方が不在の場合だけzero-write `already_retired` とする。path present、current
   identity、live/unknown inventory、record/plan drift、backup/readback不成立は全てtyped refusalである。
   public payloadへcanonical/display/backup absolute pathを出さない。tmux cacheはcurrent Herdr rolloutの
   live consumer authorityへ昇格させない。

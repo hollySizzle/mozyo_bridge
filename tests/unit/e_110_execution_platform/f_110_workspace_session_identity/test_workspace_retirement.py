@@ -208,6 +208,11 @@ class _UnreadableRegistry(_Registry):
         raise WorkspaceRetirementAuthorityError("unreadable")
 
 
+class _InvalidReplayRegistry(_Registry):
+    def observe_retired(self, workspace_id, plan_digest):
+        raise WorkspaceRetirementAuthorityError("replay_activity_present")
+
+
 class _Inventory:
     def __init__(self, observations):
         self.observations = list(observations)
@@ -283,6 +288,20 @@ class WorkspaceRetirementUseCaseTests(unittest.TestCase):
             current_workspace_id=CURRENT,
         )
         self.assertEqual(result.reason, "registry_unreadable")
+
+    def test_unproven_replay_is_not_reported_as_already_retired(self) -> None:
+        result = WorkspaceRetirementUseCase(
+            registry=_InvalidReplayRegistry([None]),
+            inventory=_Inventory([_inventory()]),
+        ).run(
+            workspace_id=TARGET,
+            current_workspace_id=CURRENT,
+            execute=True,
+            expected_plan_digest="a" * 64,
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, "retirement_failed")
+        self.assertEqual(result.detail, "retirement_replay_not_proven")
 
     def test_invalid_digest_is_rejected_before_backup_lookup(self) -> None:
         registry = _Registry([None], retired=_observation())

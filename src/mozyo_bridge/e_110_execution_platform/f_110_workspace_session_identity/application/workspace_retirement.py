@@ -87,7 +87,10 @@ class WorkspaceRetirementUseCase:
                     workspace_id, expected_plan_digest
                 )
             except WorkspaceRetirementAuthorityError:
-                return refused(REASON_REGISTRY_UNREADABLE, "backup_not_readable")
+                return refused(
+                    REASON_RETIREMENT_FAILED,
+                    "retirement_replay_not_proven",
+                )
             if retired is not None:
                 replay_inventory = self._inventory.observe(workspace_id)
                 replay_plan = build_workspace_retirement_plan(
