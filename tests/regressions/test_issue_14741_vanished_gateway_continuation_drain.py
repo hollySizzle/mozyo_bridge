@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import sqlite3
+import threading
 import unittest
 
 from mozyo_bridge.core.state.herdr_delivery_ledger import (
@@ -313,6 +314,67 @@ class VanishedGatewayContinuationDrainTest(_PrepareCase):
         self.assertEqual(result.status, CONTINUATION_CONFIRMED)
         self.assertEqual(self.ops.send_calls, 0)
         self.assertEqual(reads, 2)
+        self.assertEqual(self._phase(), PHASE_COMPLETED)
+
+    def test_two_drives_complete_between_attempt_and_send_without_duplicate(self):
+        """A second same-holder completion wins before the first drive's transport."""
+
+        attempted = threading.Event()
+        completed_before_release = threading.Event()
+        allow_release = threading.Event()
+        original_transition = self.store.transition_phase
+        original_release = self.store.release
+        first_result = []
+        second_result = []
+        failures = []
+
+        def interleaved_transition(*args, **kwargs):
+            outcome = original_transition(*args, **kwargs)
+            if (
+                kwargs.get("target") == PHASE_DRAINING_CONTINUATION
+                and outcome.applied
+                and not attempted.is_set()
+            ):
+                attempted.set()
+                if not completed_before_release.wait(5):
+                    raise AssertionError("concurrent drive did not complete in time")
+            return outcome
+
+        def paused_release(*args, **kwargs):
+            record = self.store.get(self._key())
+            if record is not None and record.phase == PHASE_COMPLETED:
+                completed_before_release.set()
+                if not allow_release.wait(5):
+                    raise AssertionError("first drive did not observe completion in time")
+            return original_release(*args, **kwargs)
+
+        self.store.transition_phase = interleaved_transition
+        self.store.release = paused_release
+
+        def drive_into(target):
+            try:
+                target.append(self.drain.drive(self.preparation))
+            except BaseException as exc:  # noqa: BLE001 - thread failure is asserted below
+                failures.append(exc)
+
+        first = threading.Thread(target=drive_into, args=(first_result,))
+        first.start()
+        self.assertTrue(attempted.wait(5))
+        self.drain.records.append(self._record())
+        second = threading.Thread(target=drive_into, args=(second_result,))
+        second.start()
+        self.assertTrue(completed_before_release.wait(5))
+
+        first.join(5)
+        self.assertFalse(first.is_alive())
+        allow_release.set()
+        second.join(5)
+        self.assertFalse(second.is_alive())
+
+        self.assertEqual(failures, [])
+        self.assertEqual(first_result[0].status, CONTINUATION_CONFIRMED)
+        self.assertEqual(second_result[0].status, CONTINUATION_CONFIRMED)
+        self.assertEqual(self.ops.send_calls, 0)
         self.assertEqual(self._phase(), PHASE_COMPLETED)
 
     def test_prelanded_exact_record_completes_with_zero_send(self):

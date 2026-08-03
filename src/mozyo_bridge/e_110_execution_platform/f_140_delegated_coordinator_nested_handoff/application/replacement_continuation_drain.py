@@ -121,13 +121,21 @@ def drive_continuation_once(
     # Re-authenticate the lease immediately before the send (a live-holder CAS re-read on a
     # fresh clock) — a lost lease yields ZERO send.
     fresh = store.get(key)
+    if fresh is None:
+        return CONTINUATION_NOT_FOUND
+    if fresh.action_generation != gen:
+        return CONTINUATION_GENERATION_MISMATCH
+    # Another same-action drive may confirm the ledger and complete the transaction after
+    # this drive's attempted CAS but before its send.  Completion is the stronger durable
+    # fact and proves this invocation owes ZERO transport; checking only generation/holder/
+    # lease let a still-held completed row pass through and duplicate the delivery
+    # (Redmine #14741 R7-F1).
+    if fresh.phase == PHASE_COMPLETED:
+        return CONTINUATION_CONFIRMED
+    if fresh.phase != PHASE_DRAINING_CONTINUATION:
+        return CONTINUATION_RELEASE_REFUSED
     effect_now = clock()
-    if (
-        fresh is None
-        or fresh.action_generation != gen
-        or fresh.lease_holder != holder
-        or not fresh.lease_is_live(effect_now)
-    ):
+    if fresh.lease_holder != holder or not fresh.lease_is_live(effect_now):
         return CONTINUATION_LEASE_LOST
     # Re-join the exact live lane authority as the LAST external observation, AFTER the
     # attempted CAS + lease re-auth and IMMEDIATELY before the transport (#13806 R3-F1 /
