@@ -336,14 +336,26 @@ class VanishedGatewayContinuationDrain:
                 lease_failure, preparation.action_id
             )
 
+        first_confirmation = True
+
         def confirmed() -> bool:
+            nonlocal first_confirmation
             # Every answer is fresh.  In particular, the driver's first call follows the
             # lease acquisition and is adjacent to its attempted CAS, closing the window in
             # which an already-landed continuation could otherwise be sent a second time.
+            is_first = first_confirmation
+            first_confirmation = False
             current = self.ops.current_authority(preparation)
             if not _authority_is_for_preparation(preparation, current):
                 return False
-            return self._confirmation(preparation, current) is True
+            confirmation = self._confirmation(preparation, current)
+            if confirmation is None and is_first:
+                # The driver's first confirmation is the idempotency barrier immediately
+                # before its attempted CAS.  Unreadable is not evidence of absence there:
+                # fail closed before the transaction can become sendable.  Later (post-send)
+                # unreadable observations retain the driver's uncertain semantics.
+                raise RuntimeError(CONTINUATION_UNREADABLE)
+            return confirmation is True
 
         def authority_current() -> bool:
             return _authority_is_for_preparation(

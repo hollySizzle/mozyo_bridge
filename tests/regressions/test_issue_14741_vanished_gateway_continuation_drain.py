@@ -215,6 +215,55 @@ class VanishedGatewayContinuationDrainTest(_PrepareCase):
         self.assertEqual(self.ops.send_calls, 0)
         self.assertEqual(self._phase(), PHASE_COMPLETED)
 
+    def test_first_fresh_ledger_read_error_after_landing_fails_closed_before_cas(self):
+        """Unreadable at the idempotency barrier is not absence or send authority."""
+
+        drain = self.drain
+        original_lease = drain._ensure_lease
+        original_records = drain._records_for_marker
+        state = {"fail_next": False, "reads": 0}
+
+        def land_after_lease(key, *, holder):
+            outcome = original_lease(key, holder=holder)
+            drain.records.append(self._record())
+            state["fail_next"] = True
+            return outcome
+
+        def transient_unreadable(marker):
+            state["reads"] += 1
+            if state["fail_next"]:
+                state["fail_next"] = False
+                raise OSError("secret ledger diagnostic")
+            return original_records(marker)
+
+        drain._ensure_lease = land_after_lease
+        drain._records_for_marker = transient_unreadable
+        result = drain.drive(self.preparation)
+        self.assertEqual(result.status, CONTINUATION_UNREADABLE)
+        self.assertEqual(self.ops.send_calls, 0)
+        self.assertEqual(self._phase(), PHASE_REPLACING_NONSELF)
+        self.assertEqual(state["reads"], 2)
+
+    def test_post_send_ledger_read_error_remains_uncertain(self):
+        """Unreadable after an attempted send must retain the replay fence."""
+
+        drain = self.drain
+        original_records = drain._records_for_marker
+        state = {"reads": 0}
+
+        def unreadable_after_send(marker):
+            state["reads"] += 1
+            if state["reads"] == 3:
+                raise OSError("secret ledger diagnostic")
+            return original_records(marker)
+
+        drain._records_for_marker = unreadable_after_send
+        result = drain.drive(self.preparation)
+        self.assertEqual(result.status, CONTINUATION_UNCERTAIN)
+        self.assertEqual(self.ops.send_calls, 1)
+        self.assertEqual(self._phase(), PHASE_DRAINING_CONTINUATION)
+        self.assertEqual(state["reads"], 3)
+
     def test_rc_zero_without_ledger_is_uncertain_and_replay_never_resends(self):
         first = self.drain.drive(self.preparation)
         self.assertEqual(first.status, CONTINUATION_UNCERTAIN)
