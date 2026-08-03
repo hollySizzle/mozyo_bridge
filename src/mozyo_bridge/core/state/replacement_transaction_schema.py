@@ -16,8 +16,10 @@ The container guard (``PRAGMA user_version``) is **not** a component guard. A st
 ``replacement_transaction`` component records a version this build does not know is left
 completely untouched: no table create, no migration, no metadata re-stamp
 (``managed-state-model.md`` ``### backup / downgrade / partial migration``). v1 is the
-first version; the additive-migration scaffolding mirrors the lifecycle component so a
-future v2 lands backup-first with the same exact-shape classifier, never a silent repair.
+first shape. v2 keeps that shape but raises the behavioral write protocol: every writer
+must participate in the exact-action effect fence. Stamping that protocol in the shared
+component metadata makes a v1-only runtime fail closed instead of silently bypassing a
+new runtime's fence. The migration is still backup-first, never a silent repair.
 """
 
 from __future__ import annotations
@@ -41,12 +43,13 @@ from mozyo_bridge.core.state.state_store import (
 
 
 REPLACEMENT_TRANSACTION_COMPONENT = "replacement_transaction"
-#: v1 is the first shape (Redmine #13806 tranche A). Bump only with an additive migration;
-#: a newer / unknown version is reported unsupported and left untouched (downgrade-safe).
-REPLACEMENT_TRANSACTION_SCHEMA_VERSION = 1
+#: v2 is the first behavioral write-protocol bump (Redmine #14741 R12-F2). The table
+#: shape is unchanged; the component version is nevertheless authoritative because a v1
+#: writer does not participate in the per-action effect fence.
+REPLACEMENT_TRANSACTION_SCHEMA_VERSION = 2
 #: The component shapes this build can read and write. Anything else — a newer version from
 #: a future build, or a foreign value — fails closed and the store is left untouched.
-_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1})
+_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2})
 #: An owner-approved replacement plan cannot be rebuilt from events; loss requires an
 #: explicit re-plan from the Redmine durable pointer (the lifecycle precedent).
 REPLACEMENT_TRANSACTION_RECOVERY_POLICY = "operator_current_state"
@@ -115,6 +118,7 @@ _V1_COLUMNS = frozenset(
 )
 _ALLOWED_SHAPES_BY_VERSION: dict[int, tuple[frozenset, ...]] = {
     1: (_V1_COLUMNS,),
+    2: (_V1_COLUMNS,),
 }
 
 #: The authority-affecting definition each column MUST carry: ``(type, notnull, default,
@@ -413,10 +417,10 @@ def ensure_replacement_transaction_schema(path: Path) -> None:
             # Intact current: the signature already matches. Do NOT re-run DDL or re-stamp.
             pass
         else:
-            # No older recognized version exists yet (v1 is the first). This branch is the
-            # additive-migration scaffolding a future v2 fills — backup-first, then add only
-            # the columns the older version legitimately lacks. Unreachable at v1, but kept
-            # so the migration story is fail-closed by construction, never open-coded later.
+            # v1 -> v2 is a behavioral write-protocol migration: the table shape is
+            # byte-compatible, but v1-only writers must stop before mutating because they do
+            # not acquire the exact-action effect fence. The authoritative component stamp
+            # therefore changes only after a recovery point has been taken.
             try:
                 backup_state_container(path)
             except StateStoreError as exc:

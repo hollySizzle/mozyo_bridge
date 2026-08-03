@@ -23,6 +23,7 @@ All state lives under an isolated home — never the shared ``$HOME/.mozyo_bridg
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import sys
 import tempfile
@@ -52,6 +53,7 @@ from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
 from mozyo_bridge.core.state.replacement_transaction_action_fence import (  # noqa: E402
     ReplacementTransactionActionFenceError,
     replacement_transaction_action_fence,
+    replacement_transaction_action_lock_path,
 )
 from mozyo_bridge.core.state.replacement_transaction_model import (  # noqa: E402
     PARTICIPANT_CLOSE_OWED,
@@ -407,6 +409,45 @@ class ActionFenceTests(_StoreCase):
             with self.assertRaises(ReplacementTransactionActionFenceError):
                 with replacement_transaction_action_fence(self.store.path, self.key):
                     self.fail("same-action fence re-entry must not be admitted")
+
+    def test_state_file_symlink_alias_converges_on_one_fence_identity(self):
+        self.store.ensure_schema()
+        alias = self.home / "state-alias.sqlite"
+        alias.symlink_to(self.store.path)
+
+        self.assertEqual(
+            replacement_transaction_action_lock_path(self.store.path, self.key),
+            replacement_transaction_action_lock_path(alias, self.key),
+        )
+        with replacement_transaction_action_fence(self.store.path, self.key):
+            with self.assertRaises(ReplacementTransactionActionFenceError):
+                with replacement_transaction_action_fence(alias, self.key):
+                    self.fail("one DB inode must not acquire two same-action fences")
+
+    def test_state_file_hardlink_alias_fails_closed(self):
+        self.store.ensure_schema()
+        alias = self.home / "state-hardlink.sqlite"
+        os.link(self.store.path, alias)
+
+        with self.assertRaises(ReplacementTransactionActionFenceError):
+            replacement_transaction_action_lock_path(self.store.path, self.key)
+        with self.assertRaises(ReplacementTransactionActionFenceError):
+            replacement_transaction_action_lock_path(alias, self.key)
+
+    def test_parent_directory_symlink_alias_is_same_thread_reentry(self):
+        self.store.ensure_schema()
+        parent_alias = self.home / "home-alias"
+        parent_alias.symlink_to(self.home, target_is_directory=True)
+        alias = parent_alias / self.store.path.name
+
+        self.assertEqual(
+            replacement_transaction_action_lock_path(self.store.path, self.key),
+            replacement_transaction_action_lock_path(alias, self.key),
+        )
+        with replacement_transaction_action_fence(self.store.path, self.key):
+            with self.assertRaises(ReplacementTransactionActionFenceError):
+                with replacement_transaction_action_fence(alias, self.key):
+                    self.fail("canonical re-entry detection must precede blocking flock")
 
 
 class PlanTests(_StoreCase):
@@ -868,7 +909,7 @@ class SchemaRegistrationTests(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_registers_native_component_v1(self):
+    def test_registers_native_component_current_protocol(self):
         ensure_replacement_transaction_schema(self.path)
         comps = self._components()
         self.assertIn(REPLACEMENT_TRANSACTION_COMPONENT, comps)
@@ -907,6 +948,55 @@ class SchemaRegistrationTests(unittest.TestCase):
             self._components()[REPLACEMENT_TRANSACTION_COMPONENT][0],
             REPLACEMENT_TRANSACTION_SCHEMA_VERSION,
         )
+
+    def test_v1_to_v2_behavioral_protocol_migration_is_backup_first(self):
+        ensure_replacement_transaction_schema(self.path)
+        conn = sqlite3.connect(self.path)
+        try:
+            conn.execute(
+                "UPDATE state_schema_components SET schema_version=1 WHERE component=?",
+                (REPLACEMENT_TRANSACTION_COMPONENT,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ensure_replacement_transaction_schema(self.path)
+
+        self.assertEqual(
+            self._components()[REPLACEMENT_TRANSACTION_COMPONENT][0], 2
+        )
+        backups = tuple((self.home / "backups").glob("state-*/state.sqlite"))
+        self.assertEqual(len(backups), 1)
+        with sqlite3.connect(backups[0]) as backup:
+            version = backup.execute(
+                "SELECT schema_version FROM state_schema_components WHERE component=?",
+                (REPLACEMENT_TRANSACTION_COMPONENT,),
+            ).fetchone()
+        self.assertEqual(version, (1,))
+
+    def test_v1_only_writer_admission_refuses_protocol_v2_before_mutation(self):
+        ensure_replacement_transaction_schema(self.path)
+
+        def frozen_v1_only_write() -> None:
+            conn = sqlite3.connect(self.path)
+            try:
+                version = conn.execute(
+                    "SELECT typeof(schema_version), schema_version "
+                    "FROM state_schema_components WHERE component=?",
+                    (REPLACEMENT_TRANSACTION_COMPONENT,),
+                ).fetchone()
+                if version != ("integer", 1):
+                    raise RuntimeError("legacy writer does not understand this protocol")
+                conn.execute(
+                    f"DELETE FROM {REPLACEMENT_TABLE} WHERE workspace_id='never'"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+        with self.assertRaisesRegex(RuntimeError, "does not understand"):
+            frozen_v1_only_write()
 
 
 class SchemaDowngradeGuardTests(unittest.TestCase):

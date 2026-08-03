@@ -430,52 +430,72 @@ class ReplacementContinuationOutbox:
         except (Exception, SystemExit):
             authorized = False
 
-        # R11-F1: authority observation can consume the remainder of the lease.  Re-read the
-        # clock and the locked row after it, immediately before any transport invocation.
+        # R12-F1: this is the final external authority observation. The exact-action fence
+        # and replacement-transaction protocol v2 make the transaction row captured above
+        # immutable until this method returns. Re-read the clock after authority, validate
+        # that captured row, then invoke transport without another DB/schema observation in
+        # between. A final connection here would recreate both the authority-move and lease-
+        # expiry windows while SQLite waits.
         effect_stamp = self._clock_stamp(clock)
         if not effect_stamp:
             return ContinuationConsumption(RESERVE_LEASE_LOST, state=OUTBOX_RESERVED)
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            row = self._owned_reserved(conn, send_key, token)
-            if row is None or str(row[0]) != OUTBOX_RESERVED or str(row[1]) != norm(token):
-                conn.execute("ROLLBACK")
-                return ContinuationConsumption(
-                    RESERVE_HELD, state=str(row[0]) if row is not None else ""
-                )
-            record = _locked_row(conn, transaction_key)
-            disposition = self._record_disposition(
-                record, send_key, holder, effect_stamp
-            )
-            if disposition != RESERVE_GRANTED:
-                conn.execute("ROLLBACK")
-                return ContinuationConsumption(disposition, state=OUTBOX_RESERVED)
-            if not authorized:
+        disposition = self._record_disposition(record, send_key, holder, effect_stamp)
+        if disposition != RESERVE_GRANTED:
+            return ContinuationConsumption(disposition, state=OUTBOX_RESERVED)
+
+        if not authorized:
+            # There is no effect to protect on refusal. Re-open only to perform the
+            # revert, and take a new clock stamp after acquiring the writer lock so a
+            # stale holder cannot release authority while waiting for SQLite.
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                release_stamp = self._clock_stamp(clock)
+                row = self._owned_reserved(conn, send_key, token)
+                record = _locked_row(conn, transaction_key)
+                if release_stamp:
+                    disposition = self._record_disposition(
+                        record, send_key, holder, release_stamp
+                    )
+                else:
+                    disposition = RESERVE_LEASE_LOST
+                if (
+                    row is None
+                    or str(row[0]) != OUTBOX_RESERVED
+                    or str(row[1]) != norm(token)
+                    or disposition != RESERVE_GRANTED
+                ):
+                    conn.execute("ROLLBACK")
+                    return ContinuationConsumption(
+                        disposition if disposition != RESERVE_GRANTED else RESERVE_HELD,
+                        state=str(row[0]) if row is not None else OUTBOX_RESERVED,
+                    )
                 if not self._release_owned_locked(
                     conn,
                     send_key,
                     token,
                     record,
                     holder=holder,
-                    stamp=effect_stamp,
+                    stamp=release_stamp,
                 ):
                     conn.execute("ROLLBACK")
                     return ContinuationConsumption(RESERVE_HELD, state=OUTBOX_RESERVED)
                 conn.execute("COMMIT")
                 return ContinuationConsumption(CONSUME_AUTHORITY_MOVED)
-            conn.execute("COMMIT")
-        except sqlite3.DatabaseError as exc:
-            try:
-                conn.execute("ROLLBACK")
-            except sqlite3.DatabaseError:
-                pass
-            raise ReplacementContinuationOutboxError(
-                f"continuation final validation failed ({type(exc).__name__}); fail closed"
-            ) from exc
-        finally:
-            conn.close()
+            except sqlite3.DatabaseError as exc:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.DatabaseError:
+                    pass
+                raise ReplacementContinuationOutboxError(
+                    f"continuation authority refusal release failed "
+                    f"({type(exc).__name__}); fail closed"
+                ) from exc
+            finally:
+                conn.close()
 
+        # No blocking operation belongs between the final joined authority/lease proof
+        # above and entry into the transport. send_fn's call boundary is the effect rail.
         try:
             sent = send_fn()
         except (Exception, SystemExit):

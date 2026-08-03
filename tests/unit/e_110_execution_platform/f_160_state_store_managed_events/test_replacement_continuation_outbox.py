@@ -40,6 +40,9 @@ from mozyo_bridge.core.state.replacement_transaction_model import (
     ReplacementTransactionKey,
     encode_participants,
 )
+from mozyo_bridge.core.state.replacement_transaction_schema import (
+    REPLACEMENT_TRANSACTION_COMPONENT,
+)
 
 
 NOW = "2026-08-03T00:00:00+00:00"
@@ -363,6 +366,109 @@ class ReplacementContinuationOutboxTest(unittest.TestCase):
         self.assertEqual(
             self.store.get(self.transaction_key).phase, PHASE_DRAINING_CONTINUATION
         )
+
+    def test_no_db_wait_remains_between_final_authority_lease_join_and_send(self):
+        """R12-F1: a final DB connection may move authority/clock only after send."""
+
+        with sqlite3.connect(self.store.path) as conn:
+            conn.execute(
+                "UPDATE replacement_transactions SET lease_expires_at=? "
+                "WHERE workspace_id=? AND action_id=?",
+                (NEAR_EXPIRY, *self.transaction_key.as_row()),
+            )
+        reservation = self.outbox.reserve(self.send_key, holder=HOLDER, now=NOW)
+        original_connect = self.outbox._connect
+        connect_calls = []
+        authority_live = [True]
+        current = [NOW]
+        sends = []
+
+        def observed_connect():
+            connect_calls.append("connect")
+            if len(connect_calls) == 2:
+                # This is the post-effect outcome write. In the buggy ordering it was a
+                # pre-effect final validation and caused an unauthorized expired send.
+                authority_live[0] = False
+                current[0] = AFTER_EXPIRY
+            return original_connect()
+
+        self.outbox._connect = observed_connect
+
+        def send():
+            self.assertEqual(connect_calls, ["connect"])
+            self.assertTrue(authority_live[0])
+            self.assertEqual(current[0], NOW)
+            sends.append("sent")
+            return "ok"
+
+        consumed = self.outbox.consume_reserved(
+            self.send_key,
+            reservation.token,
+            holder=HOLDER,
+            clock=lambda: current[0],
+            authority_fn=lambda: authority_live[0],
+            send_fn=send,
+            send_ok="ok",
+            send_zero="zero",
+        )
+
+        self.assertEqual(consumed.disposition, CONSUME_DELIVERED)
+        self.assertEqual(sends, ["sent"])
+        self.assertEqual(len(connect_calls), 2)
+
+    def test_v1_only_writer_cannot_mutate_same_action_during_v2_send(self):
+        """R12-F2: protocol v2 makes a fence-unaware writer fail before mutation."""
+
+        reservation = self.outbox.reserve(self.send_key, holder=HOLDER, now=NOW)
+        send_entered = threading.Event()
+        allow_send = threading.Event()
+        consumed = []
+
+        def send():
+            send_entered.set()
+            self.assertTrue(allow_send.wait(2))
+            return "ok"
+
+        def consume():
+            consumed.append(
+                self.outbox.consume_reserved(
+                    self.send_key,
+                    reservation.token,
+                    holder=HOLDER,
+                    clock=lambda: NOW,
+                    authority_fn=lambda: True,
+                    send_fn=send,
+                    send_ok="ok",
+                    send_zero="zero",
+                )
+            )
+
+        consumer = threading.Thread(target=consume)
+        consumer.start()
+        self.assertTrue(send_entered.wait(2))
+
+        with sqlite3.connect(self.store.path) as legacy:
+            version = legacy.execute(
+                "SELECT typeof(schema_version), schema_version "
+                "FROM state_schema_components WHERE component=?",
+                (REPLACEMENT_TRANSACTION_COMPONENT,),
+            ).fetchone()
+            self.assertNotEqual(version, ("integer", 1))
+            legacy_admitted = version == ("integer", 1)
+            if legacy_admitted:
+                legacy.execute(
+                    "UPDATE replacement_transactions SET phase=? "
+                    "WHERE workspace_id=? AND action_id=?",
+                    (PHASE_COMPLETED, *self.transaction_key.as_row()),
+                )
+
+        self.assertFalse(legacy_admitted)
+        self.assertEqual(
+            self.store.get(self.transaction_key).phase, PHASE_DRAINING_CONTINUATION
+        )
+        allow_send.set()
+        consumer.join(2)
+        self.assertEqual(consumed[0].disposition, CONSUME_DELIVERED)
 
     def test_zero_send_after_lease_expiry_does_not_stale_release(self):
         with sqlite3.connect(self.store.path) as conn:
