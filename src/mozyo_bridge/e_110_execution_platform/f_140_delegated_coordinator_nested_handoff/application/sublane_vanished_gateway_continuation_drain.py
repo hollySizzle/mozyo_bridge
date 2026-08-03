@@ -322,8 +322,11 @@ class VanishedGatewayContinuationDrain:
             return VanishedGatewayContinuationDrainResult(
                 CONTINUATION_UNREADABLE, preparation.action_id
             )
-        preconfirmed = self._confirmation(preparation, authority)
-        if preconfirmed is None:
+        # Read once before the lease mutation so an unreadable ledger never becomes
+        # permission to claim or send.  This value is deliberately NOT cached for the
+        # driver's idempotency-first check: a matching record may land while the lease is
+        # acquired/reclaimed, and the check adjacent to the attempted CAS must see it.
+        if self._confirmation(preparation, authority) is None:
             return VanishedGatewayContinuationDrainResult(
                 CONTINUATION_UNREADABLE, preparation.action_id
             )
@@ -333,17 +336,10 @@ class VanishedGatewayContinuationDrain:
                 lease_failure, preparation.action_id
             )
 
-        # `drive_continuation_once` asks once before its attempted CAS and once after a
-        # successful send.  The first answer is the readable precheck above; later answers
-        # are fresh authority + ledger reads.  This preserves its ordering without turning
-        # an unreadable ledger into permission to send.
-        first_confirmation = True
-
         def confirmed() -> bool:
-            nonlocal first_confirmation
-            if first_confirmation:
-                first_confirmation = False
-                return preconfirmed
+            # Every answer is fresh.  In particular, the driver's first call follows the
+            # lease acquisition and is adjacent to its attempted CAS, closing the window in
+            # which an already-landed continuation could otherwise be sent a second time.
             current = self.ops.current_authority(preparation)
             if not _authority_is_for_preparation(preparation, current):
                 return False

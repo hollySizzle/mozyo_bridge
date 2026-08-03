@@ -4346,6 +4346,13 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "handoff; names no marker token itself and reads no note directly — the durable "
             "read, the approval check and the recovery delivery each keep their own discipline",
         ),
+        f"{_D}/application/sublane_vanished_gateway_continuation_drain.py": (
+            ['handoff'],
+            "inherits via a used import of handoff; builds the canonical implementation-request "
+            "marker only to query exact delivery-ledger records, reads no durable note, and "
+            "requires every record axis plus a strict post-attestation timestamp before "
+            "confirmation (duplicate exact records do not change that boolean predicate)",
+        ),
         "src/mozyo_bridge/e_140_adapter_provider/f_110_ticket_adapter_common/domain/ticket_adapter.py": (
             ['handoff'],
             "inherits via a used import of handoff; names no marker token itself",

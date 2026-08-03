@@ -198,6 +198,23 @@ class VanishedGatewayContinuationDrainTest(_PrepareCase):
         self.assertEqual(self.ops.send_calls, 0)
         self.assertEqual(self._phase(), PHASE_COMPLETED)
 
+    def test_record_landing_during_lease_acquisition_completes_with_zero_send(self):
+        """The idempotency check next to attempted CAS is fresh, not pre-lease cached."""
+
+        drain = self.drain
+        original = drain._ensure_lease
+
+        def land_after_lease(key, *, holder):
+            outcome = original(key, holder=holder)
+            drain.records.append(self._record())
+            return outcome
+
+        drain._ensure_lease = land_after_lease
+        result = drain.drive(self.preparation)
+        self.assertEqual(result.status, CONTINUATION_CONFIRMED)
+        self.assertEqual(self.ops.send_calls, 0)
+        self.assertEqual(self._phase(), PHASE_COMPLETED)
+
     def test_rc_zero_without_ledger_is_uncertain_and_replay_never_resends(self):
         first = self.drain.drive(self.preparation)
         self.assertEqual(first.status, CONTINUATION_UNCERTAIN)
