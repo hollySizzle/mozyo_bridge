@@ -42,6 +42,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     CONTINUATION_UNCERTAIN,
     CONTINUATION_UNREADABLE,
     CONTINUATION_ZERO_SEND_REVERTED,
+    drive_continuation_once,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_vanished_gateway_continuation_drain import (  # noqa: E501
     VanishedGatewayContinuationDrain,
@@ -469,12 +470,193 @@ class VanishedGatewayContinuationDrainTest(_PrepareCase):
                 self.assertEqual(self.ops.authority_reads, 3)
                 self.assertEqual(self.ops.send_calls, 0)
 
+    def test_confirmation_authority_move_is_rejoined_before_shared_transport(self):
+        """Every shared caller gets a zero-send revert when confirmation moves authority."""
+
+        authority = True
+        confirmation_reads = 0
+        authority_reads = 0
+        send_calls = 0
+
+        def confirmed():
+            nonlocal authority, confirmation_reads
+            confirmation_reads += 1
+            if confirmation_reads == 2:
+                authority = False
+            return False
+
+        def current_authority():
+            nonlocal authority_reads
+            authority_reads += 1
+            return authority
+
+        def send():
+            nonlocal send_calls
+            send_calls += 1
+            return DRAIN_SEND_OK
+
+        status = drive_continuation_once(
+            self.store,
+            lambda: FIXED,
+            self._key(),
+            holder=self.preparation.holder,
+            gen=1,
+            authority_fn=current_authority,
+            send_fn=send,
+            confirmed_fn=confirmed,
+        )
+
+        self.assertEqual(status, CONTINUATION_AUTHORITY_MOVED)
+        self.assertEqual(confirmation_reads, 2)
+        self.assertEqual(authority_reads, 2)
+        self.assertEqual(send_calls, 0)
+        self.assertEqual(self._phase(), PHASE_REPLACING_NONSELF)
+
+    def test_transaction_fence_authority_move_is_rejoined_before_shared_transport(self):
+        """Authority movement inside the store observation is caught by the following join."""
+
+        authority = True
+        authority_reads = 0
+        send_calls = 0
+        store_reads = 0
+        original_get = self.store.get
+
+        def moving_get(key):
+            nonlocal authority, store_reads
+            store_reads += 1
+            record = original_get(key)
+            if store_reads == 3:
+                authority = False
+            return record
+
+        def current_authority():
+            nonlocal authority_reads
+            authority_reads += 1
+            return authority
+
+        def send():
+            nonlocal send_calls
+            send_calls += 1
+            return DRAIN_SEND_OK
+
+        self.store.get = moving_get
+        try:
+            status = drive_continuation_once(
+                self.store,
+                lambda: FIXED,
+                self._key(),
+                holder=self.preparation.holder,
+                gen=1,
+                authority_fn=current_authority,
+                send_fn=send,
+                confirmed_fn=lambda: False,
+            )
+        finally:
+            self.store.get = original_get
+
+        self.assertEqual(status, CONTINUATION_AUTHORITY_MOVED)
+        self.assertEqual(authority_reads, 2)
+        self.assertEqual(send_calls, 0)
+        self.assertEqual(self._phase(), PHASE_REPLACING_NONSELF)
+
+    def test_confirmed_fence_rejects_future_generation_and_unknown_phase(self):
+        """A ledger hit cannot complete another generation or a non-canonical phase."""
+
+        cases = (
+            (
+                "future generation",
+                "UPDATE replacement_transactions SET action_generation = 2, phase = ? "
+                "WHERE action_id = ?",
+                (PHASE_COMPLETED, self.preparation.action_id),
+                CONTINUATION_GENERATION_MISMATCH,
+            ),
+            (
+                "unknown phase",
+                "UPDATE replacement_transactions SET phase = ? WHERE action_id = ?",
+                ("replacing_self", self.preparation.action_id),
+                CONTINUATION_RELEASE_REFUSED,
+            ),
+        )
+        for label, statement, parameters, expected in cases:
+            with self.subTest(label=label):
+                self.setUp()
+                confirmation_reads = 0
+
+                def confirmed():
+                    nonlocal confirmation_reads
+                    confirmation_reads += 1
+                    if confirmation_reads == 2:
+                        with sqlite3.connect(self.home / "state.sqlite") as connection:
+                            connection.execute(statement, parameters)
+                        return True
+                    return False
+
+                status = drive_continuation_once(
+                    self.store,
+                    lambda: FIXED,
+                    self._key(),
+                    holder=self.preparation.holder,
+                    gen=1,
+                    authority_fn=lambda: True,
+                    send_fn=lambda: self.fail("confirmed fence must send nothing"),
+                    confirmed_fn=confirmed,
+                )
+
+                self.assertEqual(status, expected)
+                self.assertEqual(confirmation_reads, 2)
+
+    def test_confirmed_fence_preserves_absent_and_lease_refusals(self):
+        """Confirmed finalization retains typed row absence and live-holder authority."""
+
+        def delete_row():
+            with sqlite3.connect(self.home / "state.sqlite") as connection:
+                connection.execute(
+                    "DELETE FROM replacement_transactions WHERE action_id = ?",
+                    (self.preparation.action_id,),
+                )
+
+        cases = (
+            ("not found", delete_row, CONTINUATION_NOT_FOUND),
+            (
+                "foreign lease",
+                lambda: self._expire(holder="foreign-holder"),
+                CONTINUATION_LEASE_LOST,
+            ),
+            (
+                "expired lease",
+                lambda: self._expire(),
+                CONTINUATION_LEASE_LOST,
+            ),
+        )
+        for label, mutate, expected in cases:
+            with self.subTest(label=label):
+                self.setUp()
+                confirmation_reads = 0
+
+                def confirmed():
+                    nonlocal confirmation_reads
+                    confirmation_reads += 1
+                    if confirmation_reads == 2:
+                        mutate()
+                        return True
+                    return False
+
+                status = drive_continuation_once(
+                    self.store,
+                    lambda: FIXED,
+                    self._key(),
+                    holder=self.preparation.holder,
+                    gen=1,
+                    authority_fn=lambda: True,
+                    send_fn=lambda: self.fail("confirmed fence must send nothing"),
+                    confirmed_fn=confirmed,
+                )
+
+                self.assertEqual(status, expected)
+                self.assertEqual(confirmation_reads, 2)
+
     def test_shared_driver_projects_post_send_concurrent_completion(self):
         """All shared call sites see completed even when the final ledger read says false."""
-
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_continuation_drain import (  # noqa: E501
-            drive_continuation_once,
-        )
 
         confirmation_reads = 0
         send_calls = 0

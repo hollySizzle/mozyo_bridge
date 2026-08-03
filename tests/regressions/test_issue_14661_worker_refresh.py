@@ -610,16 +610,16 @@ class ExecuteTests(_RefreshCase):
         self.assertEqual(len(ops.resumes), 1)     # exactly one attempt, never a blind retry
 
     def test_an_authority_move_before_the_resume_is_a_typed_zero_send(self):
-        # A completed run reads the authority exactly three times — the preflight axis, the
-        # launch leg's re-join, and the resume leg's re-join. Scripting the THIRD read False
-        # moves the authority after the close/launch and before the send.
+        # A completed run re-joins the resume authority twice: once before the durable
+        # confirmation/fence reads and once after them, immediately before transport.
+        # Script the latter False to move authority after close/launch but before the send.
         probe = FakeWorkerOps()
         self._use_case(probe).run(self._request(), execute=True)
         # preflight axis, the action-time drift re-check (j#92487 F2), the launch leg's
-        # re-join, and the resume leg's re-join.
-        self.assertEqual(len(probe.authority_checks), 4)
+        # re-join, and the resume leg's two joined observations (#14741 R9-F1).
+        self.assertEqual(len(probe.authority_checks), 5)
         self.setUp()
-        ops = FakeWorkerOps(lane_authority=[True, True, True, False])
+        ops = FakeWorkerOps(lane_authority=[True, True, True, True, False])
         outcome = self._use_case(ops).run(self._request(), execute=True)
         self.assertEqual(outcome.status, WORKER_REFRESH_STATUS_STOPPED)
         self.assertEqual(outcome.resume_status, CONTINUATION_AUTHORITY_MOVED)

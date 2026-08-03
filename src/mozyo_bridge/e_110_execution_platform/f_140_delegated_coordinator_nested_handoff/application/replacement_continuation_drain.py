@@ -144,26 +144,32 @@ def drive_continuation_once(
         return _un_record_attempt(store, clock, key, holder=holder, gen=gen)
     # The authority observation above is external and may take long enough for the exact
     # continuation to land (and for another same-action drive to complete the transaction).
-    # Re-join both durable facts AFTER that observation and directly before the transport.
-    # The earlier post-CAS row check cannot close this window: completion may happen inside
-    # ``authority_fn`` itself (Redmine #14741 R8-F1).
-    if confirmed_fn():
+    # Re-join both durable facts AFTER that observation.  Keep the confirmation result local
+    # until the transaction row has also been validated: ``confirmed`` is evidence that the
+    # effect landed, not permission to complete a future generation or an unrelated phase
+    # (Redmine #14741 R9-F2).
+    confirmation_landed = confirmed_fn()
+    fenced = _transport_fence(
+        store, clock, key, holder=holder, gen=gen,
+    )
+    if fenced is not None:
+        return fenced
+    if confirmation_landed:
         return finalize_confirmed(store, clock, key, holder=holder, gen=gen)
-    transport_fence = store.get(key)
-    if transport_fence is None:
-        return CONTINUATION_NOT_FOUND
-    if transport_fence.action_generation != gen:
-        return CONTINUATION_GENERATION_MISMATCH
-    if transport_fence.phase == PHASE_COMPLETED:
-        return CONTINUATION_CONFIRMED
-    if transport_fence.phase != PHASE_DRAINING_CONTINUATION:
-        return CONTINUATION_RELEASE_REFUSED
-    transport_now = clock()
-    if (
-        transport_fence.lease_holder != holder
-        or not transport_fence.lease_is_live(transport_now)
-    ):
-        return CONTINUATION_LEASE_LOST
+    # Confirmation and the first transaction fence are themselves observations.  The lane
+    # authority may move while either is being read, so re-join it again afterwards.  A move
+    # still proves ZERO send and takes the same typed revert as the earlier authority fence
+    # (Redmine #14741 R9-F1).
+    if not authority_fn():
+        return _un_record_attempt(store, clock, key, holder=holder, gen=gen)
+    # The final transaction read closes completion / generation / phase / lease changes that
+    # happened inside the last lane-authority observation.  After this point the shared
+    # driver performs no other external observation before invoking the transport.
+    fenced = _transport_fence(
+        store, clock, key, holder=holder, gen=gen,
+    )
+    if fenced is not None:
+        return fenced
     sent = send_fn()
     if sent == DRAIN_SEND_ZERO:
         # A PROVEN zero-send: the rail established that nothing was transmitted (its own typed
@@ -244,6 +250,24 @@ def _un_record_attempt(
     return CONTINUATION_RELEASE_REFUSED  # cap exhausted (a lease-held revert converges quickly)
 
 
+def _transport_fence(store, clock, key, *, holder: str, gen: int):
+    """Return a typed stop for a non-sendable row, or ``None`` when transport may proceed."""
+
+    rec = store.get(key)
+    if rec is None:
+        return CONTINUATION_NOT_FOUND
+    if rec.action_generation != gen:
+        return CONTINUATION_GENERATION_MISMATCH
+    if rec.phase == PHASE_COMPLETED:
+        return CONTINUATION_CONFIRMED
+    if rec.phase != PHASE_DRAINING_CONTINUATION:
+        return CONTINUATION_RELEASE_REFUSED
+    now = clock()
+    if rec.lease_holder != holder or not rec.lease_is_live(now):
+        return CONTINUATION_LEASE_LOST
+    return None
+
+
 def finalize_confirmed(store, clock, key, *, holder: str, gen: int) -> str:
     """Advance a confirmed transaction to ``completed`` with ZERO send (idempotent).
 
@@ -251,28 +275,61 @@ def finalize_confirmed(store, clock, key, *, holder: str, gen: int) -> str:
     ``replacing_nonself -> draining_continuation -> completed`` as needed and releases the
     lease — never issues a send, so it can never duplicate the dispatch.
     """
-    rec = store.get(key)
+    # A confirmation can race with generation supersede, lease movement, or another phase
+    # writer.  Re-read on every transition and accept only this generation's two legal
+    # continuation phases (plus its already-completed terminal).  The bounded retry handles a
+    # benign stale revision without ever synthesising ``confirmed`` from an unverified row.
+    for _ in range(_UN_RECORD_RETRY_CAP):
+        rec = store.get(key)
+        status = _confirmed_record_status(rec, clock, holder=holder, gen=gen)
+        if status is not None:
+            if status != CONTINUATION_CONFIRMED:
+                return status
+            release_lease(store, clock, key, gen=gen, holder=holder)
+            final = store.get(key)
+            if final is None:
+                return CONTINUATION_NOT_FOUND
+            if final.action_generation != gen:
+                return CONTINUATION_GENERATION_MISMATCH
+            if final.phase != PHASE_COMPLETED:
+                return CONTINUATION_RELEASE_REFUSED
+            return CONTINUATION_CONFIRMED
+        target = (
+            PHASE_DRAINING_CONTINUATION
+            if rec.phase == PHASE_REPLACING_NONSELF
+            else PHASE_COMPLETED
+        )
+        outcome = store.transition_phase(
+            key, expected_revision=rec.revision, expected_action_generation=gen,
+            target=target, holder=holder, now=clock(),
+        )
+        if outcome.applied or outcome.reason == CAS_STALE_REVISION:
+            continue
+        if outcome.reason == CAS_NOT_FOUND:
+            return CONTINUATION_NOT_FOUND
+        if outcome.reason == CAS_GENERATION_MISMATCH:
+            return CONTINUATION_GENERATION_MISMATCH
+        if outcome.reason == CAS_LEASE_NOT_HELD:
+            return CONTINUATION_LEASE_LOST
+        return CONTINUATION_RELEASE_REFUSED
+    return CONTINUATION_RELEASE_REFUSED
+
+
+def _confirmed_record_status(rec, clock, *, holder: str, gen: int):
+    """Classify one fresh row for confirmed finalization; ``None`` means legal progress."""
+
     if rec is None:
         return CONTINUATION_NOT_FOUND
-    if rec.phase == PHASE_REPLACING_NONSELF:
-        attempt = store.transition_phase(
-            key, expected_revision=rec.revision, expected_action_generation=gen,
-            target=PHASE_DRAINING_CONTINUATION, holder=holder, now=clock(),
-        )
-        terminal = _terminal(attempt)
-        if terminal is not None:
-            return terminal
-        rec = store.get(key)
-    if rec is not None and rec.phase == PHASE_DRAINING_CONTINUATION:
-        done = store.transition_phase(
-            key, expected_revision=rec.revision, expected_action_generation=gen,
-            target=PHASE_COMPLETED, holder=holder, now=clock(),
-        )
-        terminal = _terminal(done)
-        if terminal is not None:
-            return terminal
-    release_lease(store, clock, key, gen=gen, holder=holder)
-    return CONTINUATION_CONFIRMED
+    if rec.action_generation != gen:
+        return CONTINUATION_GENERATION_MISMATCH
+    if rec.phase == PHASE_COMPLETED:
+        return CONTINUATION_CONFIRMED
+    if rec.phase not in (PHASE_REPLACING_NONSELF, PHASE_DRAINING_CONTINUATION):
+        return CONTINUATION_RELEASE_REFUSED
+    now = clock()
+    if rec.lease_holder != holder or not rec.lease_is_live(now):
+        return CONTINUATION_LEASE_LOST
+    return None
 
 
 def _terminal(outcome):
