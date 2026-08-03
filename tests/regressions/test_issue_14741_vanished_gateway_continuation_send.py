@@ -190,6 +190,22 @@ class VanishedGatewayContinuationSendTest(unittest.TestCase):
         for claim in ("complete", "confirm", "landed", "ledger"):
             self.assertNotIn(claim, f"{result.status} {result.detail}")
 
+    def test_current_authority_is_one_read_only_fresh_snapshot(self):
+        self._seed()
+        ops = self._ops()
+        authority = ops.current_authority(self.preparation)
+        self.assertIsNotNone(authority)
+        self.assertEqual(authority.fresh_locator, JOIN_FRESH)
+        self.assertEqual(authority.observed_at, OBSERVED)
+        self.assertEqual(ops.reads, 1)
+        self.assertEqual(ops.builds, 0)
+        self.assertEqual(self.dispatch.calls, [])
+
+    def test_send_context_requires_exact_root_and_upstream(self):
+        self.assertTrue(self._ops().context_is_exact())
+        self.assertFalse(self._ops(repo_root=Path(".")).context_is_exact())
+        self.assertFalse(self._ops(upstream_coordinator=" up ").context_is_exact())
+
     def test_actual_recognized_v1_side_binding_can_attempt_the_same_send(self):
         path = herdr_identity_attestation_path(self.home)
         path.parent.mkdir(parents=True, exist_ok=True)

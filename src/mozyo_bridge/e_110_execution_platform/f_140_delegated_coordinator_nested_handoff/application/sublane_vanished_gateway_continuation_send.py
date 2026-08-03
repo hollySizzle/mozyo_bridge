@@ -264,22 +264,32 @@ class VanishedGatewayContinuationOps:
             revision=revision,
         )
 
-    def send_once(self, preparation: object) -> VanishedGatewaySendResult:
-        """Attempt the original implementation request at most once.
+    def context_is_exact(self) -> bool:
+        """Whether the immutable send context is canonical and explicit."""
 
-        Every refusal before the canonical dispatch call is a proven zero-send.  Once that
-        call is invoked, an exception or nonzero/unknown result has unknown delivery fate
-        and is therefore ``DRAIN_SEND_ERROR``, never ``DRAIN_SEND_ZERO``.
+        return (
+            _canonical_root(self.repo_root) is not None
+            and bool(_plain(self.upstream_coordinator))
+        )
+
+    def current_authority(
+        self, preparation: object
+    ) -> Optional[VanishedGatewaySendAuthority]:
+        """Read one fresh inventory + attestation/action authority snapshot.
+
+        This is intentionally read-only.  It exposes no caller-supplied locator, provider,
+        anchor, inventory reader, or attestation home, and it never sends.  The continuation
+        drain uses it both for the pre-existing-ledger check and for the action-time fence;
+        :meth:`send_once` still performs its own two reads around the canonical call.
         """
+
         root = _canonical_root(self.repo_root)
-        upstream = _plain(self.upstream_coordinator)
         if (
             root is None
-            or not upstream
             or type(preparation) is not ContinuationPreparation
             or preparation.outcome != CONTINUATION_READY
         ):
-            return _result(DRAIN_SEND_ZERO, SEND_AUTHORITY_INVALID)
+            return None
         pointer = preparation.pointer
         pin = preparation.participant
         if (
@@ -291,11 +301,24 @@ class VanishedGatewayContinuationOps:
             != REDISPATCH_GATEWAY_ONCE
             or not _plain(getattr(pin, "lane_id", None))
         ):
-            return _result(DRAIN_SEND_ZERO, SEND_AUTHORITY_INVALID)
+            return None
+        return self._authority(preparation, root)
 
-        initial = self._authority(preparation, root)
+    def send_once(self, preparation: object) -> VanishedGatewaySendResult:
+        """Attempt the original implementation request at most once.
+
+        Every refusal before the canonical dispatch call is a proven zero-send.  Once that
+        call is invoked, an exception or nonzero/unknown result has unknown delivery fate
+        and is therefore ``DRAIN_SEND_ERROR``, never ``DRAIN_SEND_ZERO``.
+        """
+        root = _canonical_root(self.repo_root)
+        upstream = _plain(self.upstream_coordinator)
+        if root is None or not self.context_is_exact():
+            return _result(DRAIN_SEND_ZERO, SEND_AUTHORITY_INVALID)
+        initial = self.current_authority(preparation)
         if initial is None:
             return _result(DRAIN_SEND_ZERO, SEND_AUTHORITY_INVALID)
+        pointer = preparation.pointer
         try:
             dispatch_ops = self._dispatch_ops(preparation, root)
         except (Exception, SystemExit):
@@ -304,7 +327,7 @@ class VanishedGatewayContinuationOps:
         # The final external authority observation.  Never reuse ``initial`` as send
         # authority: a recycled locator, changed revision, or rewritten action binding
         # between the first check and this point is a known zero-send.
-        current = self._authority(preparation, root)
+        current = self.current_authority(preparation)
         if current is None or current != initial:
             return _result(DRAIN_SEND_ZERO, SEND_AUTHORITY_MOVED)
         try:
