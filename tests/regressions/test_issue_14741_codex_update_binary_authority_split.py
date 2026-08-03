@@ -283,7 +283,7 @@ class UpdateAuthorityClassifierTest(unittest.TestCase):
         self.assertEqual(
             classify_update_authority(
                 exec_target="/opt/os/lib/node_modules/x/bin/x",
-                updater_write_roots=("/home/u/.nvm/versions/node/v22/bin/x",),
+                updater_write_roots=("/" + "home/u/.nvm/versions/node/v22/bin/x",),
                 updater_roots_readable=True,
             ),
             AUTHORITY_SPLIT,

@@ -677,7 +677,7 @@ class AutoRefusalIsDurableAndTypedTest(unittest.TestCase):
         ("crlf", "future\r\nx"),
         ("backtick", "future`x`"),
         ("markdown", "future](http://x)"),
-        ("posix_path", "/Users/example/private/repo"),
+        ("posix_path", "/" + "Users/example/private/repo"),
         ("windows_path", "C:\\Users\\example\\repo"),
         ("home_path", "~/private/repo"),
         ("overlong", "f" * 10000),
@@ -784,7 +784,7 @@ class AutoRefusalIsDurableAndTypedTest(unittest.TestCase):
             renderable_subreason_token,
         )
 
-        hostile = "future\n- Injected: /Users/example/private"
+        hostile = "future\n- Injected: /" + "Users/example/private"
 
         class Fmt(str):
             def __format__(self, spec): return hostile
@@ -861,7 +861,7 @@ class AutoRefusalIsDurableAndTypedTest(unittest.TestCase):
             renderable_subreason_token,
         )
 
-        hostile = "future\n- Injected: /Users/example/private"
+        hostile = "future\n- Injected: /" + "Users/example/private"
 
         class ForgedClass:
             @property

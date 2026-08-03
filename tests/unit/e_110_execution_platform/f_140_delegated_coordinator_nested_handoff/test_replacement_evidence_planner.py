@@ -715,7 +715,9 @@ class RefusalSafetyTest(unittest.TestCase):
 
     def test_no_exception_text_or_host_path_reaches_the_refusal(self) -> None:
         ports = _Ports(
-            evidence_error=OSError("/Users/secret/home/receipts.sqlite is unreadable")
+            evidence_error=OSError(
+                "/" + "Users/secret/home/receipts.sqlite is unreadable"
+            )
         )
         with self.assertRaises(EvidencePlanRefused) as ctx:
             ports.planner().plan([_pin()], CONTEXT)

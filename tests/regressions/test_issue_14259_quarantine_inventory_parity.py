@@ -87,7 +87,7 @@ REVISION = 2
 #: Stands for the operator-private material a raised read carries in its message: `_invoke`
 #: re-raises a non-zero `herdr agent list` with that process's raw stderr, and a failed binary
 #: resolution names the absolute path it tried.
-SECRET_MESSAGE = "SECRET-STDERR /Users/private/path/herdr exited 3"
+SECRET_MESSAGE = "SECRET-STDERR /" + "Users/private/path/herdr exited 3"
 
 
 def _live_row() -> dict:

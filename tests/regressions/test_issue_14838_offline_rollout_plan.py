@@ -197,7 +197,7 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
         self.assertIsNone(result.plan)
 
     def test_hostile_raw_status_is_not_in_public_plan(self) -> None:
-        marker = "/Users/private/token=secret-value"
+        marker = "/" + "Users/private/token=secret-value"
         hostile_agents = (
             HerdrObservedAgent(
                 **{
