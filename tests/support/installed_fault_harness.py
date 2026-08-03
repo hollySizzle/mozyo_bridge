@@ -884,6 +884,42 @@ class InstalledFaultHarness:
             revision=worker_revision, detected_agent="", cwd=str(repo),
         )
         self._locators[name] = locator
+
+        # This scenario predates the #14741 identity-receipt launch protocol, but the
+        # evidence-aware replacement planner still requires the current launch-generation
+        # authority before it may classify that generation as legacy. Seed the row through
+        # the same reserve/finalize API as a managed launcher; omitting it makes the fixture
+        # fail earlier at ``generation_unavailable`` and never exercise stale-worker recovery.
+        from mozyo_bridge.core.state.herdr_launch_generation import (
+            HerdrLaunchGenerationStore,
+        )
+        from mozyo_bridge.core.state.startup_transaction_fence import (
+            StartupUnit,
+            startup_action_id,
+        )
+
+        legacy_action_id = startup_action_id(
+            StartupUnit(workspace_id=ws_id, lane_id=lane_id, providers=("claude",)),
+            "installed-fault-harness-legacy-generation",
+        )
+        generations = HerdrLaunchGenerationStore(home=self.home)
+        generations.reserve_pending(
+            assigned_name=name,
+            startup_action_id=legacy_action_id,
+            workspace_id=ws_id,
+            role="claude",
+            lane_id=lane_id,
+        )
+        generations.finalize(
+            assigned_name=name,
+            startup_action_id=legacy_action_id,
+            workspace_id=ws_id,
+            role="claude",
+            lane_id=lane_id,
+            locator=locator,
+            verdict="present",
+            observed_at="2026-01-01T00:00:00.000000+00:00",
+        )
         # The surviving same-lane codex gateway the heal adopts + pins the tab on (a heal never
         # splits the pair; without a live gateway the fresh worker launch has nothing to adopt).
         gateway_locator = self.fake.seed_agent(
