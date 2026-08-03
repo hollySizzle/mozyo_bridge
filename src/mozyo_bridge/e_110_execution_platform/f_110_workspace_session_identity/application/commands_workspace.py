@@ -252,3 +252,62 @@ def cmd_workspace_register(args: argparse.Namespace) -> int:
     for note in result.notes:
         print(f"  note: {note}")
     return 0
+
+
+def cmd_workspace_retire(args: argparse.Namespace) -> int:
+    """Plan or execute one exact, backup-first stale registry retirement."""
+    import json as _json
+    import os
+
+    from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.workspace_retirement import (
+        WorkspaceRetirementUseCase,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.infrastructure.workspace_retirement_registry import (
+        SQLiteWorkspaceRetirementRegistry,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.workspace_retirement_inventory import (
+        HerdrWorkspaceRetirementInventory,
+    )
+    from mozyo_bridge.workspace_registry import resolve_canonical_session
+
+    repo_root = repo_root_from_args(args)
+    current = resolve_canonical_session(repo_root, derive_unregistered=False)
+    use_case = WorkspaceRetirementUseCase(
+        registry=SQLiteWorkspaceRetirementRegistry(),
+        inventory=HerdrWorkspaceRetirementInventory(
+            repo_root=repo_root,
+            env=dict(os.environ),
+        ),
+    )
+    result = use_case.run(
+        workspace_id=args.workspace_id,
+        current_workspace_id=current.workspace_id or "",
+        execute=bool(getattr(args, "execute", False)),
+        expected_plan_digest=getattr(args, "expect_plan_digest", "") or "",
+    )
+    payload = result.as_payload()
+    if getattr(args, "as_json", False):
+        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0 if result.ok else 1
+
+    print(f"state: {result.state}")
+    if result.reason:
+        print(f"reason: {result.reason}")
+    if result.detail:
+        print(f"detail: {result.detail}")
+    if result.plan_digest:
+        print(f"plan_digest: {result.plan_digest}")
+    if result.plan is not None:
+        target = result.plan["target"]
+        print(f"workspace_id: {target['workspace_id']}")
+        print(f"project_name: {target['project_name']}")
+        print(f"updated_at: {target['updated_at']}")
+        print(f"record_digest: {target['record_digest']}")
+        print(f"path_state: {target['path_state']}")
+        print(
+            "live_agent_count: "
+            f"{result.plan['liveness']['live_agent_count']}"
+        )
+    if result.backup_receipt:
+        print(f"backup_receipt: {result.backup_receipt}")
+    return 0 if result.ok else 1

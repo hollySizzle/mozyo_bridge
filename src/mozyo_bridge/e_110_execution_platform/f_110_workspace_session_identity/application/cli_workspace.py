@@ -12,6 +12,7 @@ from mozyo_bridge.application.commands import (
     cmd_workspace_inspect,
     cmd_workspace_list,
     cmd_workspace_register,
+    cmd_workspace_retire,
 )
 
 
@@ -38,8 +39,7 @@ def register(sub) -> None:
             "write its local anchor. Idempotent: keeps the existing workspace "
             "id and canonical session name; the session name is derived from "
             "the path only on first registration. Restores identity from the "
-            "anchor when the home registry was lost. This is the only "
-            "registry write surface."
+            "anchor when the home registry was lost."
         ),
     )
     add_repo_option(workspace_register)
@@ -97,6 +97,45 @@ def register(sub) -> None:
         help="Emit all identity layers and the effective resolution as JSON.",
     )
     workspace_inspect.set_defaults(func=cmd_workspace_inspect)
+
+    workspace_retire = workspace_sub.add_parser(
+        "retire",
+        help=(
+            "Plan or execute removal of one stale missing-path registry row. "
+            "Dry-run is the default. Execution requires the exact fresh plan "
+            "digest, re-reads global Herdr inventory, creates a verified SQLite "
+            "backup, and deletes only the fenced row."
+        ),
+    )
+    add_repo_option(workspace_retire)
+    workspace_retire.add_argument(
+        "--workspace-id",
+        required=True,
+        help="Exact registered workspace id to inspect or retire.",
+    )
+    workspace_retire.add_argument(
+        "--expect-plan-digest",
+        default="",
+        help=(
+            "Exact SHA-256 digest from an approved fresh dry-run. Required with "
+            "--execute and revalidated immediately before the registry write."
+        ),
+    )
+    workspace_retire.add_argument(
+        "--execute",
+        action="store_true",
+        help=(
+            "Create the verified private backup and delete the exact row. "
+            "Without this flag the command is strictly read-only."
+        ),
+    )
+    workspace_retire.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit the path-redacted plan or retirement result as JSON.",
+    )
+    workspace_retire.set_defaults(func=cmd_workspace_retire)
 
     workspace_defaults = sub.add_parser(
         "workspace-defaults",

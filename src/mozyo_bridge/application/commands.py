@@ -110,6 +110,7 @@ from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.appl
     cmd_workspace_inspect,
     cmd_workspace_list,
     cmd_workspace_register,
+    cmd_workspace_retire,
 )
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.commands_session import (
     cmd_session_boundary_prompt,

@@ -156,6 +156,7 @@ from mozyo_bridge.application.commands import (  # noqa: F401,E402
     cmd_workspace_inspect,
     cmd_workspace_list,
     cmd_workspace_register,
+    cmd_workspace_retire,
 )
 from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application.release import (  # noqa: F401,E402
     cmd_release_bump,

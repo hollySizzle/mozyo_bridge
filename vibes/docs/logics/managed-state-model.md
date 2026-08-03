@@ -10,7 +10,7 @@ Redmine #11695 / #11697。mozyo-bridge 管理下の session / workspace につ�
 正本マップ:
   workspace_identity:        # workspace_id / canonical session / display path / preset
     正本: home registry (registry.sqlite) -> workspace anchor -> path derivation
-    根拠: #11429。registry が唯一の書込面。event log / projection に二重化しない
+    根拠: #11429。registry commandが唯一の書込面。event log / projection に二重化しない
   desired_state:             # mozyo が何を・どのコマンドで作ろう/操作しようとしたか
     正本: managed event log (本 doc で新設)
     根拠: 現状どこにも正本がない欠落層。mozyo コマンド境界で完全観測でき外部要因で変わらない
@@ -149,7 +149,7 @@ state kind は既に分離済みであり、single SQLite 統合時もこの分�
 
 | legacy file | schema | owner / writer | state kind | loss / corruption policy |
 | --- | --- | --- | --- | --- |
-| `registry.sqlite` | v1 | `workspace_registry.register_workspace()` / guarded `init` | `workspace_identity` 正本。`workspaces` と `workspace_activity` | identity 正本なので write path は corrupt / unknown schema で die。operator が退避し、workspace anchor から再登録する。read path は anchor / derivation へ degrade |
+| `registry.sqlite` | v1 | `workspace register` / guarded `init` / exact stale-row `workspace retire` | `workspace_identity` 正本。`workspaces` と `workspace_activity` | identity 正本なので write path は corrupt / unknown schema で die。retireはverified backup-first + exact row/digest + live-zeroに限定。operator が退避し、workspace anchorまたはretire backupから復旧する。read path は anchor / derivation へ degrade |
 | `managed-events.sqlite` | v1 | mozyo command boundary best-effort append | `desired_state` event log。`managed_events` append-only | loss は desired history loss として許容。identity / liveness / handoff は壊れない。append 失敗は caller を壊さない |
 | `inventory.sqlite` | v2 | runtime inventory listing の snapshot replace | `last_observed_projection` cache。`panes` と `inventory_meta` | regenerable。corrupt は write path が recreate。newer schema は downgrade CLI が壊さず write skip。read path は cache なし扱い |
 | `otel-events.sqlite` | v1 | loopback OTLP receiver single writer | activity / timeline cache。`otel_events` と `otel_meta` | `rebuildable_cache` / best-effort。receiver 停止中の event loss を許容。prompt / secret shaped attrs は保存しない。corrupt は operator が退避して receiver restart |
@@ -175,7 +175,7 @@ single SQLite 化では file 境界が消えるため、実装上の ownership �
 
 | state kind | table namespace | owner module / writer | allowed readers | recovery / rebuildability | prohibited promotion |
 | --- | --- | --- | --- | --- | --- |
-| `workspace_identity` | `registry_*` | `workspace_registry`。write は `workspace register` と guarded `init` のみ | session/name resolver、inventory identity join、doctor、target preflight | authoritative。backup / restore / workspace anchor re-register で復旧。drop/rebuild 自動化は禁止 | runtime pane/process/cwd、presentation grouping、workflow completion を持たない |
+| `workspace_identity` | `registry_*` | `workspace_registry`。write は `workspace register`、guarded `init`、exact stale-row `workspace retire` のみ | session/name resolver、inventory identity join、doctor、target preflight | authoritative。backup / restore / workspace anchor re-register で復旧。drop/rebuild 自動化は禁止 | runtime pane/process/cwd、presentation grouping、workflow completion を持たない |
 | `desired_state` | `managed_events`, future `managed_unit_events` | command boundary append。session/window/pane/unit を作成・採用・mark・rename した command が writer | recovery suggestion、presentation current table rebuild、doctor/audit | append-only lossy。partial corruption は quarantine + gap marker。identity/liveness は依存しない | current liveness / handoff availability / completion truth にしない |
 | `desired_current_state` | future `unit_*`, `presentation_*` | future presentation/unit commands。event fold or explicit command が writer | cockpit/grouping UI、launch planning、doctor/rebuild suggestion | rebuildable if source events are sufficient; otherwise operator-managed current stateとして backup restore。destructive auto reconcile 禁止 | routing authority、live target existence、private operator policy default にしない |
 | `last_observed_projection` | `inventory_*`, future `target_observations` | runtime listing / reload / observation command が snapshot replace | UI/diagnostics/candidate display、doctor | `rebuildable_cache`。drop/rebuild 可。ただし stale / observed_at / source を必ず出す | action permission、healthy/current 判定、pane existence 正本にしない |
@@ -185,6 +185,20 @@ single SQLite 化では file 境界が消えるため、実装上の ownership �
 | `workflow_truth` | DB table なし | Redmine / governed workflow | agent coordinator、review/close gate、doctor links | Redmine durable recordで復旧。runtime DB へ複製しない | DB health / event freshness から completion/approval を導出しない |
 
 ### writer rules
+
+- `workspace retire` (#14877) は一般的なregistry deleteではない。dry-runを既定とし、対象workspace id、
+  `updated_at`、private record全体のdigest、missing path、current workspaceでないこと、global Herdr inventoryの
+  lossless readとtarget live agent 0をcanonical planへ拘束する。executeはdirect ownerが承認したexact
+  plan digestを再提示した場合だけ、同じauthorityを二度読みし、SQLite backup APIでprivate
+  `${MOZYO_BRIDGE_HOME}/workspace-registry-backups/<plan_digest>.sqlite` を作成・検証してから
+  exact rowをtransactional deleteする。`workspace_activity` はforeign-key cascade、削除後はreadback、
+  同じdigestのverified backupがあるreplayはzero-write `already_retired` とする。path present、current
+  identity、live/unknown inventory、record/plan drift、backup/readback不成立は全てtyped refusalである。
+  public payloadへcanonical/display/backup absolute pathを出さない。tmux cacheはcurrent Herdr rolloutの
+  live consumer authorityへ昇格させない。
+  回復時はbackup DBを現行registryへ丸ごと上書きしない。退役対象pathが復元できる場合は、そのpath内の
+  workspace anchorを正本として `workspace register` を再実行し、元のidentityを復元する。backupはprivateな
+  監査・障害解析用証拠として保持し、現行registry全体を過去snapshotへ巻き戻す用途には使わない。
 
 - `registry_*` writer は identity 専用であり、projection / presentation / runtime cache を同 transaction で
   更新しない。identity write と cache refresh を混ぜると corruption 時の復旧判断が壊れる。
