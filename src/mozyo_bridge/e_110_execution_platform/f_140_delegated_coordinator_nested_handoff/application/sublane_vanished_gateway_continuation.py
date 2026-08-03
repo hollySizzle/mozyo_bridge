@@ -165,8 +165,6 @@ def resolve_vanished_gateway_inventory(
     *,
     repo_root: object,
     list_rows: Callable[[], object],
-    workspace_resolver: Callable[[Path], object] = repo_scope_workspace_id,
-    provider_resolver: Callable[[str], object] = resolve_gateway_provider,
 ) -> VanishedGatewayInventoryJoin:
     """Join one stored participant to one fresh live inventory row, with no actuation.
 
@@ -207,8 +205,8 @@ def resolve_vanished_gateway_inventory(
             "the lane runtime repository root is unavailable",
         )
     try:
-        workspace_id = workspace_resolver(root)
-        provider = provider_resolver(str(root))
+        workspace_id = repo_scope_workspace_id(root)
+        provider = resolve_gateway_provider(str(root))
     except Exception:  # noqa: BLE001 - resolver details are never exposed
         return _inventory_stopped(
             STOPPED_INVENTORY_UNAVAILABLE,

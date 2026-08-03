@@ -52,6 +52,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E402,E501
     resolve_gateway_provider,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E402,E501
+    sublane_vanished_gateway_continuation as continuation_module,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_vanished_gateway_recovery_live import (  # noqa: E402,E501
     STOPPED_PORTS_INCOMPLETE,
     recovery_lease_holder,
@@ -503,9 +506,9 @@ class RefusalTest(_PrepareCase):
         self.assertEqual(opens, [], "zero delivery-ledger opens")
 
 
-JOIN_WORKSPACE = "ws"
+JOIN_WORKSPACE = repo_scope_workspace_id(ROOT)
 JOIN_LANE = "issue_14741"
-JOIN_PROVIDER = "codex"
+JOIN_PROVIDER = resolve_gateway_provider(str(ROOT))
 JOIN_OLD = "w4B:p61"
 JOIN_FRESH = "w4B:p81"
 
@@ -593,13 +596,15 @@ class FreshInventoryJoinTest(unittest.TestCase):
             list_rows=changes.pop(
                 "list_rows", lambda: [_live_row()] if rows is None else rows
             ),
-            workspace_resolver=changes.pop(
-                "workspace_resolver", lambda root: JOIN_WORKSPACE
-            ),
-            provider_resolver=changes.pop(
-                "provider_resolver", lambda root: JOIN_PROVIDER
-            ),
             **changes,
+        )
+
+    def test_caller_cannot_supply_workspace_provider_locator_or_pin_authority(self) -> None:
+        import inspect
+
+        self.assertEqual(
+            tuple(inspect.signature(resolve_vanished_gateway_inventory).parameters),
+            ("preparation", "repo_root", "list_rows"),
         )
 
     def test_one_live_fresh_generation_is_joined_without_a_delivery_claim(self) -> None:
@@ -651,11 +656,19 @@ class FreshInventoryJoinTest(unittest.TestCase):
             calls["inventory"] += 1
             return [_live_row()]
 
-        result = self._resolve(
-            workspace_resolver=workspace,
-            provider_resolver=provider,
-            list_rows=inventory,
+        originals = (
+            continuation_module.repo_scope_workspace_id,
+            continuation_module.resolve_gateway_provider,
         )
+        continuation_module.repo_scope_workspace_id = workspace
+        continuation_module.resolve_gateway_provider = provider
+        try:
+            result = self._resolve(list_rows=inventory)
+        finally:
+            (
+                continuation_module.repo_scope_workspace_id,
+                continuation_module.resolve_gateway_provider,
+            ) = originals
         self.assertEqual(result.outcome, INVENTORY_JOINED)
         self.assertEqual(calls, {"workspace": 1, "provider": 1, "inventory": 1})
 
@@ -727,13 +740,21 @@ class FreshInventoryJoinTest(unittest.TestCase):
             raise RuntimeError(secret)
 
         cases = (
-            ("workspace", dict(workspace_resolver=broken)),
-            ("provider", dict(provider_resolver=broken)),
-            ("inventory", dict(list_rows=broken)),
+            ("workspace", "repo_scope_workspace_id"),
+            ("provider", "resolve_gateway_provider"),
+            ("inventory", ""),
         )
-        for label, kwargs in cases:
+        for label, attribute in cases:
             with self.subTest(label=label):
-                result = self._resolve(**kwargs)
+                if not attribute:
+                    result = self._resolve(list_rows=broken)
+                else:
+                    original = getattr(continuation_module, attribute)
+                    setattr(continuation_module, attribute, broken)
+                    try:
+                        result = self._resolve()
+                    finally:
+                        setattr(continuation_module, attribute, original)
                 self.assertEqual(result.stopped, STOPPED_INVENTORY_UNAVAILABLE)
                 self.assertNotIn(secret, f"{result.stopped}{result.detail}")
 
