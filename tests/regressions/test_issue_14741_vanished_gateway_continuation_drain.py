@@ -195,6 +195,51 @@ class VanishedGatewayContinuationDrainTest(_PrepareCase):
         self.assertEqual(self.ops.expected_authorities, [self.authority])
         self.assertEqual(self._phase(), PHASE_COMPLETED)
 
+    def test_completed_replay_stays_confirmed_after_ledger_history_is_lost(self):
+        """A lossy ledger cannot demote the durable completed transaction fact."""
+
+        self.ops.after_send = lambda: self.drain.records.append(self._record())
+        self.assertEqual(
+            self.drain.drive(self.preparation).status,
+            CONTINUATION_CONFIRMED,
+        )
+        self.drain.records.clear()
+        authority_reads = self.ops.authority_reads
+        marker_reads = len(self.drain.markers)
+
+        replay = self.drain.drive(self.preparation)
+
+        self.assertEqual(replay.status, CONTINUATION_CONFIRMED)
+        self.assertEqual(self.ops.send_calls, 1)
+        self.assertEqual(self.ops.authority_reads, authority_reads)
+        self.assertEqual(len(self.drain.markers), marker_reads)
+        self.assertEqual(self._phase(), PHASE_COMPLETED)
+
+    def test_completed_replay_ignores_unreadable_runtime_authority_and_ledger(self):
+        """Completed is confirmed before any live-context, authority, or ledger read."""
+
+        self.ops.after_send = lambda: self.drain.records.append(self._record())
+        self.assertEqual(
+            self.drain.drive(self.preparation).status,
+            CONTINUATION_CONFIRMED,
+        )
+        self.drain.records.clear()
+        self.drain.ledger_error = OSError("secret ledger diagnostic")
+
+        def unreadable():
+            raise RuntimeError("secret runtime diagnostic")
+
+        self.ops.context_is_exact = unreadable
+        self.ops.current_authority = lambda _preparation: unreadable()
+        marker_reads = len(self.drain.markers)
+
+        replay = self.drain.drive(self.preparation)
+
+        self.assertEqual(replay.status, CONTINUATION_CONFIRMED)
+        self.assertEqual(self.ops.send_calls, 1)
+        self.assertEqual(len(self.drain.markers), marker_reads)
+        self.assertEqual(self._phase(), PHASE_COMPLETED)
+
     def test_prelanded_exact_record_completes_with_zero_send(self):
         self.drain.records.append(self._record())
         result = self.drain.drive(self.preparation)

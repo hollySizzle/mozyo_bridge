@@ -276,7 +276,10 @@ class VanishedGatewayContinuationDrain:
                 ):
                     return CONTINUATION_GENERATION_MISMATCH
                 if record.phase == PHASE_COMPLETED:
-                    return None
+                    # Completion is a durable transaction fact.  A concurrent completion
+                    # between the entry check and this lease boundary must not fall through
+                    # to a ledger read that can only make the outcome less certain.
+                    return CONTINUATION_CONFIRMED
                 now = self.clock()
                 if record.lease_holder == holder and record.lease_is_live(now):
                     return None
@@ -309,6 +312,33 @@ class VanishedGatewayContinuationDrain:
                 return CONTINUATION_LEASE_LOST
             return CONTINUATION_UNREADABLE
         return CONTINUATION_UNREADABLE
+
+    def _completed_or_stop_status(
+        self, key: ReplacementTransactionKey
+    ) -> Optional[str]:
+        """Project a stored terminal fact before consulting lossy runtime evidence.
+
+        ``None`` means the exact generation is readable and still non-terminal.  Every
+        other value is a terminal disposition for this drive.  In particular, once the
+        transaction is ``completed`` its result is monotonic: an append-only-lossy ledger
+        or vanished/unreadable live authority cannot demote that durable fact to
+        ``uncertain``.
+        """
+
+        try:
+            record = self.store.get(key)
+        except (Exception, SystemExit):
+            return CONTINUATION_UNREADABLE
+        if record is None:
+            return CONTINUATION_NOT_FOUND
+        if (
+            type(record.action_generation) is not int
+            or record.action_generation != ACTION_GENERATION
+        ):
+            return CONTINUATION_GENERATION_MISMATCH
+        if record.phase == PHASE_COMPLETED:
+            return CONTINUATION_CONFIRMED
+        return None
 
     def _authority_stop_status(self, key: ReplacementTransactionKey) -> str:
         """Keep an attempted replay fenced when its current authority is unavailable."""
@@ -346,17 +376,6 @@ class VanishedGatewayContinuationDrain:
         ):
             return VanishedGatewayContinuationDrainResult(CONTINUATION_UNREADABLE)
         try:
-            context_exact = self.ops.context_is_exact()
-            authority = self.ops.current_authority(preparation)
-        except (Exception, SystemExit):
-            return VanishedGatewayContinuationDrainResult(
-                CONTINUATION_UNREADABLE, preparation.action_id
-            )
-        if not context_exact:
-            return VanishedGatewayContinuationDrainResult(
-                CONTINUATION_UNREADABLE, preparation.action_id
-            )
-        try:
             participant = preparation.participant
             if type(participant) is not ParticipantPin:
                 raise TypeError("invalid participant pin")
@@ -365,6 +384,22 @@ class VanishedGatewayContinuationDrain:
                 preparation.action_id,
             )
         except (Exception, SystemExit):
+            return VanishedGatewayContinuationDrainResult(
+                CONTINUATION_UNREADABLE, preparation.action_id
+            )
+        stored_status = self._completed_or_stop_status(key)
+        if stored_status is not None:
+            return VanishedGatewayContinuationDrainResult(
+                stored_status, preparation.action_id
+            )
+        try:
+            context_exact = self.ops.context_is_exact()
+            authority = self.ops.current_authority(preparation)
+        except (Exception, SystemExit):
+            return VanishedGatewayContinuationDrainResult(
+                CONTINUATION_UNREADABLE, preparation.action_id
+            )
+        if not context_exact:
             return VanishedGatewayContinuationDrainResult(
                 CONTINUATION_UNREADABLE, preparation.action_id
             )
@@ -397,6 +432,13 @@ class VanishedGatewayContinuationDrain:
             is_first = first_confirmation
             first_confirmation = False
             if is_first:
+                # Re-read the transaction immediately before the shared driver's
+                # idempotency barrier.  This closes the race where another holder completed
+                # after our entry check but before this callback; completed is never
+                # reinterpreted through a later lossy ledger observation.
+                terminal = self._completed_or_stop_status(key)
+                if terminal is not None:
+                    raise _PreAttemptConfirmationStop(terminal)
                 current = self.ops.current_authority(preparation)
                 if not _authority_is_for_preparation(preparation, current):
                     # The idempotency barrier cannot inspect the exact ledger without its
