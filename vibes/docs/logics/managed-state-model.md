@@ -1377,7 +1377,8 @@ observation に join し、次の typed decision を返す。
   したがって `state.sqlite` のatomic replacementでも同じlockを使い続ける。state-file symlink / hardlinkはfail-closed、
   parent-directory symlink aliasはcanonical pathnameへ収束し、same-thread alias re-entryもblocking前にfail-closedとなる。
   lock fileはcanonical DBの隣接owner-only private directoryに置き、秘密値を名前へ含めず、runtime中はunlinkしない。
-  final state pathはlock座標の算出時だけでなく、lock取得後、schema ensure前後、実SQLite connectionのopen後にも
+  final state pathはlock座標の算出時だけでなく、public/internal schema ensureのwrite-capable open前、lock取得後、
+  schema ensure前後、実SQLite connectionのopen後にも
   canonical regular file / single linkであることを再検証する。したがって座標確定後のregular→symlink / hardlink差替えは
   transaction mutationまたはcontinuation sendへ到達する前にfail-closedとなる。
   ★`replacement_transaction` component v2 はrow shapeをv2専用authority tableへ移し、旧table名をread-only互換viewとして残す。

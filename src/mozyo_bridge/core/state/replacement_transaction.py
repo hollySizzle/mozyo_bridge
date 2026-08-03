@@ -108,7 +108,7 @@ class ReplacementTransactionStore:
 
     def ensure_schema(self) -> None:
         """Create / validate this component's schema (see the schema module)."""
-        ensure_replacement_transaction_schema(self.path)
+        self._connect().close()
 
     def _connect(self) -> sqlite3.Connection:
         """An autocommit connection for the CAS (the container guard's is not)."""

@@ -51,6 +51,7 @@ from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
     load_replacement_transactions_readonly,
     replacement_transaction_path,
 )
+from mozyo_bridge.core.state import replacement_transaction as transaction_module  # noqa: E402,E501
 from mozyo_bridge.core.state import replacement_transaction_action_fence as action_fence_module  # noqa: E402,E501
 from mozyo_bridge.core.state.replacement_transaction_action_fence import (  # noqa: E402
     ReplacementTransactionActionFenceError,
@@ -1105,6 +1106,82 @@ class SchemaRegistrationTests(unittest.TestCase):
             self._components()[REPLACEMENT_TRANSACTION_COMPONENT][0],
             REPLACEMENT_TRANSACTION_SCHEMA_VERSION,
         )
+
+    def test_public_ensure_rejects_static_symlink_without_target_write(self):
+        from mozyo_bridge.core.state.state_store import connect_state_container_rw
+
+        target_home = Path(tempfile.mkdtemp())
+        target_path = replacement_transaction_path(target_home)
+        connect_state_container_rw(target_path).close()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.symlink_to(target_path)
+
+        with self.assertRaises(ReplacementTransactionError):
+            ReplacementTransactionStore(path=self.path).ensure_schema()
+
+        with sqlite3.connect(target_path) as target:
+            self.assertEqual(
+                target.execute(
+                    "SELECT COUNT(*) FROM state_schema_components WHERE component=?",
+                    (REPLACEMENT_TRANSACTION_COMPONENT,),
+                ).fetchone()[0],
+                0,
+            )
+            placeholders = ",".join("?" for _ in range(3))
+            self.assertEqual(
+                target.execute(
+                    f"SELECT COUNT(*) FROM sqlite_schema WHERE name IN ({placeholders})",
+                    (
+                        "replacement_transactions",
+                        REPLACEMENT_TABLE,
+                        REPLACEMENT_TRANSACTION_EFFECT_FENCE_TABLE,
+                    ),
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_internal_ensure_rechecks_after_validated_preflight(self):
+        from mozyo_bridge.core.state.state_store import connect_state_container_rw
+
+        source = ReplacementTransactionStore(path=self.path)
+        source.ensure_schema()
+        target_home = Path(tempfile.mkdtemp())
+        target_path = replacement_transaction_path(target_home)
+        connect_state_container_rw(target_path).close()
+        real_ensure = transaction_module.ensure_replacement_transaction_schema
+
+        def swap_then_ensure(path):
+            os.replace(self.path, self.home / "state-before-window.sqlite")
+            self.path.symlink_to(target_path)
+            return real_ensure(path)
+
+        with mock.patch.object(
+            transaction_module,
+            "ensure_replacement_transaction_schema",
+            side_effect=swap_then_ensure,
+        ):
+            with self.assertRaises(ReplacementTransactionError):
+                source.ensure_schema()
+
+        with sqlite3.connect(target_path) as target:
+            self.assertEqual(
+                target.execute(
+                    "SELECT COUNT(*) FROM state_schema_components WHERE component=?",
+                    (REPLACEMENT_TRANSACTION_COMPONENT,),
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                target.execute(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE name IN (?, ?, ?)",
+                    (
+                        "replacement_transactions",
+                        REPLACEMENT_TABLE,
+                        REPLACEMENT_TRANSACTION_EFFECT_FENCE_TABLE,
+                    ),
+                ).fetchone()[0],
+                0,
+            )
 
     def test_v1_to_v2_behavioral_protocol_migration_is_backup_first(self):
         ensure_replacement_transaction_schema(self.path)

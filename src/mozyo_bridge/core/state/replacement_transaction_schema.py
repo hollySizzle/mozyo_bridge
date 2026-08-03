@@ -26,6 +26,7 @@ explicit offline and backup-first, never a silent repair.
 from __future__ import annotations
 
 import sqlite3
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -231,6 +232,29 @@ class ReplacementTransactionError(RuntimeError):
 def replacement_transaction_path(home: Path | None = None) -> Path:
     """The consolidated single state DB this component lives in (state.sqlite)."""
     return state_store_path(home)
+
+
+def _validate_write_path(path: Path) -> None:
+    """Refuse write-capable opens through a non-canonical final file."""
+
+    path = Path(path)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ReplacementTransactionError(
+            f"replacement state authority unavailable ({type(exc).__name__}); "
+            "fail closed"
+        ) from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_nlink != 1
+    ):
+        raise ReplacementTransactionError(
+            "replacement state authority is not one regular linked file; fail closed"
+        )
 
 
 def _utc_now() -> str:
@@ -500,6 +524,8 @@ def ensure_replacement_transaction_schema(path: Path) -> None:
     understands is exactly how an old build starts moving state whose newer semantics it
     does not agree to.
     """
+    path = Path(path)
+    _validate_write_path(path)
     try:
         conn = connect_state_container_rw(path)
     except StateStoreError as exc:
@@ -509,6 +535,11 @@ def ensure_replacement_transaction_schema(path: Path) -> None:
             f"replacement transaction store {path} is unreadable "
             f"({type(exc).__name__}); fail closed"
         ) from exc
+    try:
+        _validate_write_path(path)
+    except BaseException:
+        conn.close()
+        raise
     # Serialize the whole migration under one exclusive write lock (the #13754 R4-F1
     # discipline): ``BEGIN IMMEDIATE`` takes the reserved lock BEFORE the version is read,
     # so a concurrent first-use caller cannot read the same pre-migration version, back up,
@@ -597,6 +628,7 @@ def migrate_replacement_transaction_schema_v2(path: Path) -> Optional[Path]:
     """
 
     path = Path(path)
+    _validate_write_path(path)
     if not path.exists():
         raise ReplacementTransactionError(
             "replacement transaction offline migration requires an existing v1 store; "
@@ -611,6 +643,11 @@ def migrate_replacement_transaction_schema_v2(path: Path) -> Optional[Path]:
             f"replacement transaction store {path} is unreadable "
             f"({type(exc).__name__}); fail closed"
         ) from exc
+    try:
+        _validate_write_path(path)
+    except BaseException:
+        conn.close()
+        raise
     conn.isolation_level = None
     locked = False
     try:
