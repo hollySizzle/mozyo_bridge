@@ -327,7 +327,9 @@ class SchemaGuardTest(unittest.TestCase):
         self.path = Path(self._tmp.name) / "ledger.sqlite"
 
     def test_reads_empty_when_absent(self) -> None:
-        self.assertEqual(HerdrDeliveryLedger(path=self.path).recent(), [])
+        ledger = HerdrDeliveryLedger(path=self.path)
+        self.assertEqual(ledger.recent(), [])
+        self.assertEqual(ledger.records_for_marker_strict("absent"), [])
 
     def test_newer_schema_version_fails_closed_on_write(self) -> None:
         # A file stamped with a future schema version is left untouched.
@@ -346,6 +348,21 @@ class SchemaGuardTest(unittest.TestCase):
         conn.commit()
         conn.close()
         self.assertEqual(HerdrDeliveryLedger(path=self.path).recent(), [])
+
+    def test_strict_marker_read_preserves_unknown_schema_as_unreadable(self) -> None:
+        conn = sqlite3.connect(self.path)
+        conn.execute(f"PRAGMA user_version = {HERDR_DELIVERY_LEDGER_SCHEMA_VERSION + 1}")
+        conn.commit()
+        conn.close()
+        ledger = HerdrDeliveryLedger(path=self.path)
+        with self.assertRaises(HerdrDeliveryLedgerError):
+            ledger.records_for_marker_strict("mkr-13296-abc")
+
+    def test_strict_marker_read_preserves_corrupt_sqlite_as_unreadable(self) -> None:
+        self.path.write_bytes(b"not a sqlite database")
+        ledger = HerdrDeliveryLedger(path=self.path)
+        with self.assertRaises(HerdrDeliveryLedgerError):
+            ledger.records_for_marker_strict("mkr-13296-abc")
 
 
 class RecordBoundaryTest(unittest.TestCase):

@@ -34,6 +34,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SEND_AUTHORITY_MOVED,
     SEND_FAILED,
     VanishedGatewayContinuationOps,
+    VanishedGatewaySendAuthority,
 )
 from tests.regressions.test_issue_14741_vanished_gateway_continuation import (
     JOIN_FRESH,
@@ -142,6 +143,21 @@ class VanishedGatewayContinuationSendTest(unittest.TestCase):
             **changes,
         )
 
+    def _expected_authority(self, **changes) -> VanishedGatewaySendAuthority:
+        values = dict(
+            action_id=self.preparation.action_id,
+            workspace_id=JOIN_WORKSPACE,
+            lane_id=JOIN_LANE,
+            provider=JOIN_PROVIDER,
+            assigned_name=self.preparation.participant.assigned_name,
+            fresh_locator=JOIN_FRESH,
+            old_locator=JOIN_OLD,
+            observed_at=OBSERVED,
+            revision=0,
+        )
+        values.update(changes)
+        return VanishedGatewaySendAuthority(**values)
+
     def test_exact_v2_authority_is_rechecked_then_canonical_send_is_attempted_once(self):
         record = self._seed()
         ops = self._ops()
@@ -189,6 +205,47 @@ class VanishedGatewayContinuationSendTest(unittest.TestCase):
         )
         for claim in ("complete", "confirm", "landed", "ledger"):
             self.assertNotIn(claim, f"{result.status} {result.detail}")
+
+    def test_continuation_send_is_pinned_to_its_ledger_barrier_authority(self):
+        self._seed()
+        ops = self._ops()
+        result = ops.send_once_for_authority(
+            self.preparation,
+            expected_authority=self._expected_authority(),
+        )
+        self.assertEqual(result.status, DRAIN_SEND_OK)
+        self.assertEqual(ops.reads, 2)
+        self.assertEqual(len(self.dispatch.calls), 1)
+
+    def test_continuation_send_refuses_a_new_valid_generation(self):
+        self._seed(locator=FRESH_TWO)
+        ops = self._ops(
+            rows=[
+                [self._row(pane_id=FRESH_TWO, revision=1)],
+                [self._row(pane_id=FRESH_TWO, revision=1)],
+            ]
+        )
+        result = ops.send_once_for_authority(
+            self.preparation,
+            expected_authority=self._expected_authority(),
+        )
+        self.assertEqual(result.status, DRAIN_SEND_ZERO)
+        self.assertEqual(result.detail, SEND_AUTHORITY_MOVED)
+        self.assertEqual(ops.reads, 1)
+        self.assertEqual(ops.builds, 0)
+        self.assertEqual(self.dispatch.calls, [])
+
+    def test_continuation_send_requires_a_typed_expected_authority(self):
+        self._seed()
+        ops = self._ops()
+        result = ops.send_once_for_authority(
+            self.preparation,
+            expected_authority=None,
+        )
+        self.assertEqual(result.status, DRAIN_SEND_ZERO)
+        self.assertEqual(result.detail, SEND_AUTHORITY_INVALID)
+        self.assertEqual(ops.reads, 0)
+        self.assertEqual(self.dispatch.calls, [])
 
     def test_current_authority_is_one_read_only_fresh_snapshot(self):
         self._seed()

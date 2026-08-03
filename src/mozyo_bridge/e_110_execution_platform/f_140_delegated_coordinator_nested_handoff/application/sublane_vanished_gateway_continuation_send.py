@@ -304,13 +304,19 @@ class VanishedGatewayContinuationOps:
             return None
         return self._authority(preparation, root)
 
-    def send_once(self, preparation: object) -> VanishedGatewaySendResult:
-        """Attempt the original implementation request at most once.
+    def _send_once(
+        self,
+        preparation: object,
+        *,
+        expected_authority: object = None,
+    ) -> VanishedGatewaySendResult:
+        """Attempt once, optionally pinned to a caller's exact ledger authority."""
 
-        Every refusal before the canonical dispatch call is a proven zero-send.  Once that
-        call is invoked, an exception or nonzero/unknown result has unknown delivery fate
-        and is therefore ``DRAIN_SEND_ERROR``, never ``DRAIN_SEND_ZERO``.
-        """
+        if (
+            expected_authority is not None
+            and type(expected_authority) is not VanishedGatewaySendAuthority
+        ):
+            return _result(DRAIN_SEND_ZERO, SEND_AUTHORITY_INVALID)
         root = _canonical_root(self.repo_root)
         upstream = _plain(self.upstream_coordinator)
         if root is None or not self.context_is_exact():
@@ -318,6 +324,8 @@ class VanishedGatewayContinuationOps:
         initial = self.current_authority(preparation)
         if initial is None:
             return _result(DRAIN_SEND_ZERO, SEND_AUTHORITY_INVALID)
+        if expected_authority is not None and initial != expected_authority:
+            return _result(DRAIN_SEND_ZERO, SEND_AUTHORITY_MOVED)
         pointer = preparation.pointer
         try:
             dispatch_ops = self._dispatch_ops(preparation, root)
@@ -326,9 +334,19 @@ class VanishedGatewayContinuationOps:
 
         # The final external authority observation.  Never reuse ``initial`` as send
         # authority: a recycled locator, changed revision, or rewritten action binding
-        # between the first check and this point is a known zero-send.
+        # between the first check and this point is a known zero-send.  A continuation
+        # additionally supplies the exact authority whose ledger was checked before its
+        # attempted CAS; moving to another otherwise-valid generation cannot inherit that
+        # earlier proof of ledger absence.
         current = self.current_authority(preparation)
-        if current is None or current != initial:
+        if (
+            current is None
+            or current != initial
+            or (
+                expected_authority is not None
+                and current != expected_authority
+            )
+        ):
             return _result(DRAIN_SEND_ZERO, SEND_AUTHORITY_MOVED)
         try:
             rc = dispatch_ops.dispatch_implementation_request(
@@ -355,6 +373,36 @@ class VanishedGatewayContinuationOps:
             old_locator=current.old_locator,
             observed_at=current.observed_at,
         )
+
+    def send_once_for_authority(
+        self,
+        preparation: object,
+        *,
+        expected_authority: object,
+    ) -> VanishedGatewaySendResult:
+        """Attempt only for the exact authority used by the caller's ledger barrier.
+
+        This is the continuation-drain entrypoint.  The expected authority is mandatory so
+        a newly valid locator/revision cannot inherit another generation's readable-empty
+        ledger observation.
+        """
+
+        if type(expected_authority) is not VanishedGatewaySendAuthority:
+            return _result(DRAIN_SEND_ZERO, SEND_AUTHORITY_INVALID)
+        return self._send_once(
+            preparation,
+            expected_authority=expected_authority,
+        )
+
+    def send_once(self, preparation: object) -> VanishedGatewaySendResult:
+        """Attempt the original implementation request at most once.
+
+        Every refusal before the canonical dispatch call is a proven zero-send.  Once that
+        call is invoked, an exception or nonzero/unknown result has unknown delivery fate
+        and is therefore ``DRAIN_SEND_ERROR``, never ``DRAIN_SEND_ZERO``.
+        """
+
+        return self._send_once(preparation)
 
 
 __all__ = (

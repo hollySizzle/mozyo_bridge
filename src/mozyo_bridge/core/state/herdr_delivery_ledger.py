@@ -29,8 +29,9 @@ Migration / recovery classification (required by #13296 for any new schema):
 
 - ``schema_version`` = 1; the ``PRAGMA user_version`` guard mirrors the sibling
   home-scoped stores. A newer schema is reported unsupported and left untouched
-  (downgrade-safe); an unreadable file degrades to empty reads rather than raising
-  into the caller.
+  (downgrade-safe). Observational readers preserve the legacy best-effort behavior and
+  degrade an unreadable file to empty. Control-plane readers whose next action depends on
+  proving absence use the explicit strict marker surface, where unreadable is never absence.
 - **recovery policy: ``append_only_lossy``** (the vocabulary of
   ``vibes/docs/logics/managed-state-model.md`` ``### recovery policy vocabulary``,
   the same class as ``managed_events``). Losing ``herdr-delivery-ledger.sqlite``
@@ -400,7 +401,17 @@ class HerdrDeliveryLedger:
             recorded_at=recorded_at,
         )
 
-    def _read(self, sql: str, params: tuple = ()) -> list[HerdrDeliveryLedgerRecord]:
+    def _read_strict(
+        self, sql: str, params: tuple = ()
+    ) -> list[HerdrDeliveryLedgerRecord]:
+        """Read records without collapsing an unreadable store into absence.
+
+        Observational callers retain the original best-effort ``_read`` contract below.
+        Control-plane callers whose next action depends on proving that no record exists
+        use this strict surface so an unknown schema or corrupt SQLite file cannot become
+        send authority.
+        """
+
         if not self.path.exists():
             return []
         try:
@@ -408,13 +419,27 @@ class HerdrDeliveryLedger:
             try:
                 version = conn.execute("PRAGMA user_version").fetchone()[0]
                 if version != HERDR_DELIVERY_LEDGER_SCHEMA_VERSION:
-                    return []
+                    raise HerdrDeliveryLedgerError(
+                        "herdr delivery ledger schema is unreadable by this version"
+                    )
                 rows = conn.execute(sql, params).fetchall()
             finally:
                 conn.close()
-        except sqlite3.DatabaseError:
-            return []
+        except HerdrDeliveryLedgerError:
+            raise
+        except sqlite3.DatabaseError as exc:
+            raise HerdrDeliveryLedgerError(
+                "herdr delivery ledger is unreadable"
+            ) from exc
         return [self._row_to_record(row) for row in rows]
+
+    def _read(self, sql: str, params: tuple = ()) -> list[HerdrDeliveryLedgerRecord]:
+        """Best-effort observational read; unreadable remains legacy-compatible empty."""
+
+        try:
+            return self._read_strict(sql, params)
+        except HerdrDeliveryLedgerError:
+            return []
 
     def recent(self, *, limit: int = 50) -> list[HerdrDeliveryLedgerRecord]:
         return self._read(
@@ -426,6 +451,17 @@ class HerdrDeliveryLedger:
     def records_for_marker(self, marker: str) -> list[HerdrDeliveryLedgerRecord]:
         """Causality lookup: every entry (outcome + retry + disposition) for a send."""
         return self._read(
+            f"SELECT {_SELECT_COLUMNS} FROM herdr_delivery_ledger "
+            "WHERE notification_marker = ? ORDER BY id",
+            (marker,),
+        )
+
+    def records_for_marker_strict(
+        self, marker: str
+    ) -> list[HerdrDeliveryLedgerRecord]:
+        """Causality lookup that preserves unreadable instead of reporting absence."""
+
+        return self._read_strict(
             f"SELECT {_SELECT_COLUMNS} FROM herdr_delivery_ledger "
             "WHERE notification_marker = ? ORDER BY id",
             (marker,),

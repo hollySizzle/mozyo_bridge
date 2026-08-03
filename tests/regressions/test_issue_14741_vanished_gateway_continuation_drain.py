@@ -10,6 +10,7 @@ from mozyo_bridge.core.state.herdr_delivery_ledger import (
     BACKEND_HERDR,
     RAIL_QUEUE_ENTER,
     HerdrDeliveryLedgerRecord,
+    herdr_delivery_ledger_path,
 )
 from mozyo_bridge.core.state.replacement_transaction import ReplacementTransactionKey
 from mozyo_bridge.core.state.replacement_transaction_model import (
@@ -76,6 +77,7 @@ class _Ops:
         self.after_send = after_send
         self.authority_reads = 0
         self.send_calls = 0
+        self.expected_authorities = []
         self.context = True
         self.send_error = None
 
@@ -87,8 +89,9 @@ class _Ops:
         self.authority_reads += 1
         return self.authorities[index]
 
-    def send_once(self, preparation):
+    def send_once_for_authority(self, preparation, *, expected_authority):
         self.send_calls += 1
+        self.expected_authorities.append(expected_authority)
         if self.send_error is not None:
             raise self.send_error
         if self.after_send is not None:
@@ -189,6 +192,7 @@ class VanishedGatewayContinuationDrainTest(_PrepareCase):
         self.assertEqual(result.status, CONTINUATION_CONFIRMED)
         self.assertTrue(result.completed)
         self.assertEqual(self.ops.send_calls, 1)
+        self.assertEqual(self.ops.expected_authorities, [self.authority])
         self.assertEqual(self._phase(), PHASE_COMPLETED)
 
     def test_prelanded_exact_record_completes_with_zero_send(self):
@@ -256,6 +260,23 @@ class VanishedGatewayContinuationDrainTest(_PrepareCase):
         self.assertEqual(self.ops.authority_reads, 2)
         self.assertEqual(len(self.drain.markers), 1)
 
+    def test_valid_authority_move_after_first_barrier_cannot_inherit_ledger_absence(self):
+        """Authority B cannot inherit authority A's readable-empty idempotency barrier."""
+
+        authority_b = dataclasses.replace(
+            self.authority,
+            fresh_locator="w9B:p99",
+            revision=3,
+        )
+        self.drain.records.append(self._record(target=authority_b.fresh_locator))
+        self.ops.authorities = [self.authority, self.authority, authority_b]
+        result = self.drain.drive(self.preparation)
+        self.assertEqual(result.status, CONTINUATION_AUTHORITY_MOVED)
+        self.assertEqual(self.ops.send_calls, 0)
+        self.assertEqual(self._phase(), PHASE_REPLACING_NONSELF)
+        self.assertEqual(self.ops.authority_reads, 3)
+        self.assertEqual(len(self.drain.markers), 2)
+
     def test_post_send_ledger_read_error_remains_uncertain(self):
         """Unreadable after an attempted send must retain the replay fence."""
 
@@ -284,6 +305,34 @@ class VanishedGatewayContinuationDrainTest(_PrepareCase):
         replay = self.drain.drive(self.preparation)
         self.assertEqual(replay.status, CONTINUATION_UNCERTAIN)
         self.assertEqual(self.ops.send_calls, 1, "attempted state is never blind-resendable")
+
+    def test_attempted_replay_with_moved_authority_remains_uncertain(self):
+        first = self.drain.drive(self.preparation)
+        self.assertEqual(first.status, CONTINUATION_UNCERTAIN)
+        self.ops.authorities = [None]
+        replay = self.drain.drive(self.preparation)
+        self.assertEqual(replay.status, CONTINUATION_UNCERTAIN)
+        self.assertEqual(self.ops.send_calls, 1)
+        self.assertEqual(self._phase(), PHASE_DRAINING_CONTINUATION)
+
+    def test_canonical_unknown_ledger_schema_fails_closed_before_cas(self):
+        path = herdr_delivery_ledger_path(self.home)
+        with sqlite3.connect(path) as connection:
+            connection.execute("PRAGMA user_version = 999")
+        original_home = drain_module.mozyo_bridge_home
+        drain_module.mozyo_bridge_home = lambda: self.home
+        try:
+            drain = VanishedGatewayContinuationDrain(
+                store=self.store,
+                ops=self.ops,
+                clock=lambda: FIXED,
+            )
+            result = drain.drive(self.preparation)
+        finally:
+            drain_module.mozyo_bridge_home = original_home
+        self.assertEqual(result.status, CONTINUATION_UNREADABLE)
+        self.assertEqual(self.ops.send_calls, 0)
+        self.assertEqual(self._phase(), PHASE_REPLACING_NONSELF)
 
     def test_late_ledger_with_expired_same_holder_completes_without_another_send(self):
         self.assertEqual(self.drain.drive(self.preparation).status, CONTINUATION_UNCERTAIN)
@@ -457,7 +506,7 @@ class VanishedGatewayContinuationDrainTest(_PrepareCase):
             def __init__(self, *, home):
                 self.home = home
 
-            def records_for_marker(self, marker):
+            def records_for_marker_strict(self, marker):
                 return list(records)
 
         self_record = self._record

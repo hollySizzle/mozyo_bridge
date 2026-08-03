@@ -30,6 +30,8 @@ from mozyo_bridge.core.state.replacement_transaction_model import (
     ContinuationPointer,
     ParticipantPin,
     PHASE_COMPLETED,
+    PHASE_DRAINING_CONTINUATION,
+    PHASE_REPLACING_NONSELF,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     RedmineAnchor,
@@ -47,6 +49,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     CONTINUATION_GENERATION_MISMATCH,
     CONTINUATION_LEASE_LOST,
     CONTINUATION_NOT_FOUND,
+    CONTINUATION_UNCERTAIN,
     CONTINUATION_UNREADABLE,
     drive_continuation_once,
 )
@@ -172,7 +175,12 @@ class VanishedGatewayContinuationPort(Protocol):
         self, preparation: object
     ) -> Optional[VanishedGatewaySendAuthority]: ...
 
-    def send_once(self, preparation: object) -> VanishedGatewaySendResult: ...
+    def send_once_for_authority(
+        self,
+        preparation: object,
+        *,
+        expected_authority: object,
+    ) -> VanishedGatewaySendResult: ...
 
 
 @dataclass
@@ -187,7 +195,9 @@ class VanishedGatewayContinuationDrain:
     def _records_for_marker(self, marker: str) -> object:
         """The only ledger read surface used by this continuation."""
 
-        return HerdrDeliveryLedger(home=mozyo_bridge_home()).records_for_marker(marker)
+        return HerdrDeliveryLedger(home=mozyo_bridge_home()).records_for_marker_strict(
+            marker
+        )
 
     def _confirmation(
         self,
@@ -300,6 +310,30 @@ class VanishedGatewayContinuationDrain:
             return CONTINUATION_UNREADABLE
         return CONTINUATION_UNREADABLE
 
+    def _authority_stop_status(self, key: ReplacementTransactionKey) -> str:
+        """Keep an attempted replay fenced when its current authority is unavailable."""
+
+        try:
+            record = self.store.get(key)
+        except (Exception, SystemExit):
+            return CONTINUATION_UNREADABLE
+        if record is None:
+            return CONTINUATION_NOT_FOUND
+        if (
+            type(record.action_generation) is not int
+            or record.action_generation != ACTION_GENERATION
+        ):
+            return CONTINUATION_GENERATION_MISMATCH
+        if record.phase == PHASE_COMPLETED:
+            return CONTINUATION_CONFIRMED
+        if record.phase == PHASE_DRAINING_CONTINUATION:
+            # A prior send may already have happened.  Authority movement cannot prove a
+            # zero-send or make the transaction re-sendable while the attempted fence stays.
+            return CONTINUATION_UNCERTAIN
+        if record.phase == PHASE_REPLACING_NONSELF:
+            return CONTINUATION_AUTHORITY_MOVED
+        return CONTINUATION_UNREADABLE
+
     def drive(self, preparation: object) -> VanishedGatewayContinuationDrainResult:
         """Drive one prepared continuation, completing only on exact ledger evidence."""
 
@@ -322,15 +356,21 @@ class VanishedGatewayContinuationDrain:
             return VanishedGatewayContinuationDrainResult(
                 CONTINUATION_UNREADABLE, preparation.action_id
             )
-        if not _authority_is_for_preparation(preparation, authority):
-            return VanishedGatewayContinuationDrainResult(
-                CONTINUATION_AUTHORITY_MOVED, preparation.action_id
-            )
         try:
-            key = ReplacementTransactionKey(authority.workspace_id, preparation.action_id)
+            participant = preparation.participant
+            if type(participant) is not ParticipantPin:
+                raise TypeError("invalid participant pin")
+            key = ReplacementTransactionKey(
+                participant.evidence_workspace_id,
+                preparation.action_id,
+            )
         except (Exception, SystemExit):
             return VanishedGatewayContinuationDrainResult(
                 CONTINUATION_UNREADABLE, preparation.action_id
+            )
+        if not _authority_is_for_preparation(preparation, authority):
+            return VanishedGatewayContinuationDrainResult(
+                self._authority_stop_status(key), preparation.action_id
             )
         # Read once before the lease mutation so an unreadable ledger never becomes
         # permission to claim or send.  This value is deliberately NOT cached for the
@@ -347,26 +387,31 @@ class VanishedGatewayContinuationDrain:
             )
 
         first_confirmation = True
+        pinned_authority: Optional[VanishedGatewaySendAuthority] = None
 
         def confirmed() -> bool:
-            nonlocal first_confirmation
+            nonlocal first_confirmation, pinned_authority
             # Every answer is fresh.  In particular, the driver's first call follows the
             # lease acquisition and is adjacent to its attempted CAS, closing the window in
             # which an already-landed continuation could otherwise be sent a second time.
             is_first = first_confirmation
             first_confirmation = False
-            current = self.ops.current_authority(preparation)
-            if not _authority_is_for_preparation(preparation, current):
-                if is_first:
+            if is_first:
+                current = self.ops.current_authority(preparation)
+                if not _authority_is_for_preparation(preparation, current):
                     # The idempotency barrier cannot inspect the exact ledger without its
-                    # exact target authority.  A transient move is not proof of ledger
-                    # absence and must not open an attempted-CAS/send path if the authority
-                    # happens to rejoin on the driver's next read.
+                    # exact target authority.  Phase-aware classification preserves a prior
+                    # attempted/send-unknown fence instead of claiming a reverted zero-send.
                     raise _PreAttemptConfirmationStop(
-                        CONTINUATION_AUTHORITY_MOVED
+                        self._authority_stop_status(key)
                     )
+                pinned_authority = current
+            if pinned_authority is None:
                 return False
-            confirmation = self._confirmation(preparation, current)
+            # The post-send confirmation is for the SAME exact authority whose ledger was
+            # readable-empty before the attempted CAS.  A later valid generation cannot
+            # supply completion evidence for this attempt.
+            confirmation = self._confirmation(preparation, pinned_authority)
             if confirmation is None and is_first:
                 # The driver's first confirmation is the idempotency barrier immediately
                 # before its attempted CAS.  Unreadable is not evidence of absence there:
@@ -376,13 +421,19 @@ class VanishedGatewayContinuationDrain:
             return confirmation is True
 
         def authority_current() -> bool:
-            return _authority_is_for_preparation(
-                preparation, self.ops.current_authority(preparation)
+            current = self.ops.current_authority(preparation)
+            return (
+                pinned_authority is not None
+                and _authority_is_for_preparation(preparation, current)
+                and current == pinned_authority
             )
 
         def send() -> str:
             try:
-                result = self.ops.send_once(preparation)
+                result = self.ops.send_once_for_authority(
+                    preparation,
+                    expected_authority=pinned_authority,
+                )
             except (Exception, SystemExit):
                 return DRAIN_SEND_ERROR
             if type(result) is not VanishedGatewaySendResult:
