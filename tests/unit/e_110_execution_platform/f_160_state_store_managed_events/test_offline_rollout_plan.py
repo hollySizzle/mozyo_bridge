@@ -231,6 +231,24 @@ class OfflineRolloutPlanTests(unittest.TestCase):
                 self.assertEqual(result.reason, "invalid_capture")
                 self.assertEqual(result.detail, detail)
 
+    def test_falsey_non_string_artifact_receipt_fields_refuse(self) -> None:
+        fields = {
+            "candidate_source_sha": "candidate_source_sha_invalid",
+            "candidate_source_ref": "candidate_source_ref_invalid",
+            "candidate_workflow_run_id": "candidate_workflow_run_id_invalid",
+            "candidate_wheel_sha256": "candidate_wheel_sha256_invalid",
+            "candidate_sdist_sha256": "candidate_sdist_sha256_invalid",
+        }
+        for field, detail in fields.items():
+            for value in (None, 0, False, [], {}):
+                with self.subTest(field=field, value_type=type(value).__name__):
+                    result = build_offline_rollout_plan(
+                        replace(_capture(), **{field: value})
+                    )
+                    self.assertFalse(result.ok)
+                    self.assertEqual(result.reason, "invalid_capture")
+                    self.assertEqual(result.detail, detail)
+
     def test_artifact_receipt_is_part_of_the_plan_digest(self) -> None:
         first = build_offline_rollout_plan(_capture())
         changed = build_offline_rollout_plan(

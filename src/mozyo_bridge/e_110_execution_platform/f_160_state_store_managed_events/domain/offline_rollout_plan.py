@@ -266,29 +266,33 @@ def _validate_capture(capture: OfflineRolloutCapture) -> Optional[OfflineRollout
     )
     if not all(_exact_nonempty(value) for value in identity_tokens):
         return refused(REASON_INVALID_CAPTURE, "identity_or_candidate_token_invalid")
-    if capture.candidate_source_sha and (
-        not isinstance(capture.candidate_source_sha, str)
-        or not _SHA40.fullmatch(capture.candidate_source_sha)
+    if not isinstance(capture.candidate_source_sha, str) or (
+        capture.candidate_source_sha
+        and not _SHA40.fullmatch(capture.candidate_source_sha)
     ):
         return refused(REASON_INVALID_CAPTURE, "candidate_source_sha_invalid")
     source_ref = capture.candidate_source_ref
-    if source_ref and not _valid_origin_head_ref(source_ref):
+    if not isinstance(source_ref, str) or (
+        source_ref and not _valid_origin_head_ref(source_ref)
+    ):
         return refused(REASON_INVALID_CAPTURE, "candidate_source_ref_invalid")
     run_id = capture.candidate_workflow_run_id
-    if run_id and (
-        not isinstance(run_id, str)
-        or not run_id.isascii()
-        or not run_id.isdecimal()
-        or int(run_id) < 1
-        or str(int(run_id)) != run_id
+    if not isinstance(run_id, str) or (
+        run_id
+        and (
+            not run_id.isascii()
+            or not run_id.isdecimal()
+            or int(run_id) < 1
+            or str(int(run_id)) != run_id
+        )
     ):
         return refused(REASON_INVALID_CAPTURE, "candidate_workflow_run_id_invalid")
     for name, digest in (
         ("wheel", capture.candidate_wheel_sha256),
         ("sdist", capture.candidate_sdist_sha256),
     ):
-        if digest and (
-            not isinstance(digest, str) or not _SHA256.fullmatch(digest)
+        if not isinstance(digest, str) or (
+            digest and not _SHA256.fullmatch(digest)
         ):
             return refused(REASON_INVALID_CAPTURE, f"candidate_{name}_sha256_invalid")
 
