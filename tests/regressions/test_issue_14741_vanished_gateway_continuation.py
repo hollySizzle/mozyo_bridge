@@ -1,7 +1,8 @@
-"""Which request a recovered gateway still owes (#14741 j#97220 B6b3-1).
+"""Which request and fresh live locator a recovered gateway still owes (#14741 B6b3).
 
-Preparation only: nothing here sends, reads a delivery ledger, or completes a transaction.
-What is pinned is that the pointer comes from the STORED row and from nowhere else.
+Preparation and read-only inventory join only: nothing here attests, sends, reads a delivery
+ledger, or completes a transaction. The pointer and participant come from the STORED row;
+the fresh locator comes from exactly one canonical live-inventory snapshot.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
 )
 from mozyo_bridge.core.state.replacement_transaction_model import (  # noqa: E402
     ContinuationPointer,
+    PARTICIPANT_REPLACED,
 )
 from mozyo_bridge.core.state.replacement_transaction_model import (  # noqa: E402
     ParticipantPin,
@@ -35,9 +37,20 @@ from tests.regressions.test_issue_14741_vanished_gateway_recovery_live import ( 
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_vanished_gateway_continuation import (  # noqa: E402,E501
     CONTINUATION_READY,
+    INVENTORY_JOINED,
     STOPPED_CONTINUATION_INVALID,
+    STOPPED_INVENTORY_INVALID,
+    STOPPED_INVENTORY_UNAVAILABLE,
     STOPPED_TRANSACTION_UNAVAILABLE,
+    ContinuationPreparation,
     prepare_vanished_gateway_continuation,
+    resolve_vanished_gateway_inventory,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E402,E501
+    repo_scope_workspace_id,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E402,E501
+    resolve_gateway_provider,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_vanished_gateway_recovery_live import (  # noqa: E402,E501
     STOPPED_PORTS_INCOMPLETE,
@@ -45,7 +58,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.vanished_gateway_recovery import (  # noqa: E402,E501
     REDISPATCH_GATEWAY_ONCE,
+    RESUME_GATE,
     RequestAnchor,
+    recovery_action_id_for_pin,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E402,E501
+    encode_assigned_name,
 )
 
 
@@ -483,6 +501,343 @@ class RefusalTest(_PrepareCase):
         finally:
             ledger.HerdrDeliveryLedger = original
         self.assertEqual(opens, [], "zero delivery-ledger opens")
+
+
+JOIN_WORKSPACE = "ws"
+JOIN_LANE = "issue_14741"
+JOIN_PROVIDER = "codex"
+JOIN_OLD = "w4B:p61"
+JOIN_FRESH = "w4B:p81"
+
+
+def _join_pointer(**changes) -> ContinuationPointer:
+    values = dict(
+        source="redmine",
+        issue_id="14741",
+        journal_id="97240",
+        expected_gate=RESUME_GATE,
+        next_semantic_action=REDISPATCH_GATEWAY_ONCE,
+    )
+    values.update(changes)
+    return ContinuationPointer(**values)
+
+
+def _join_pin(**changes) -> ParticipantPin:
+    values = dict(
+        lane_id=JOIN_LANE,
+        role="gateway",
+        provider=JOIN_PROVIDER,
+        assigned_name=encode_assigned_name(JOIN_WORKSPACE, JOIN_PROVIDER, JOIN_LANE),
+        old_locator=JOIN_OLD,
+        lane_revision="1",
+        lane_generation="1",
+        evidence_workspace_id=JOIN_WORKSPACE,
+        evidence_startup_action_id="sublane-recovery:v2:receipt:" + "a" * 64,
+        evidence_cause="update_relaunch",
+        phase=PARTICIPANT_REPLACED,
+    )
+    values.update(changes)
+    return ParticipantPin(**values)
+
+
+def _join_preparation(
+    *, pin=None, pointer=None, action_id=None, holder=None,
+    workspace_id=JOIN_WORKSPACE, **changes
+) -> ContinuationPreparation:
+    pinned = pin if pin is not None else _join_pin()
+    stored_pointer = pointer if pointer is not None else _join_pointer()
+    anchor = RequestAnchor(
+        source=stored_pointer.source,
+        issue_id=stored_pointer.issue_id,
+        journal_id=stored_pointer.journal_id,
+    )
+    expected_action = action_id
+    if expected_action is None:
+        expected_action = recovery_action_id_for_pin(
+            anchor, pinned, workspace_id=workspace_id
+        )
+    values = dict(
+        outcome=CONTINUATION_READY,
+        action_id=expected_action,
+        holder=(
+            holder
+            if holder is not None
+            else recovery_lease_holder(expected_action)
+        ),
+        pointer=stored_pointer,
+        participant=pinned,
+    )
+    values.update(changes)
+    return ContinuationPreparation(**values)
+
+
+def _live_row(**changes) -> dict:
+    row = {
+        "name": encode_assigned_name(JOIN_WORKSPACE, JOIN_PROVIDER, JOIN_LANE),
+        "pane_id": JOIN_FRESH,
+        "agent": JOIN_PROVIDER,
+        "status": "idle",
+        "revision": 0,
+    }
+    row.update(changes)
+    return row
+
+
+class FreshInventoryJoinTest(unittest.TestCase):
+    """B6b3-2a(2): identify a fresh target, but exercise no delivery authority."""
+
+    def _resolve(self, rows=None, **changes):
+        return resolve_vanished_gateway_inventory(
+            changes.pop("preparation", _join_preparation()),
+            repo_root=changes.pop("repo_root", ROOT),
+            list_rows=changes.pop(
+                "list_rows", lambda: [_live_row()] if rows is None else rows
+            ),
+            workspace_resolver=changes.pop(
+                "workspace_resolver", lambda root: JOIN_WORKSPACE
+            ),
+            provider_resolver=changes.pop(
+                "provider_resolver", lambda root: JOIN_PROVIDER
+            ),
+            **changes,
+        )
+
+    def test_one_live_fresh_generation_is_joined_without_a_delivery_claim(self) -> None:
+        result = self._resolve()
+        self.assertTrue(result.joined)
+        self.assertEqual(result.outcome, INVENTORY_JOINED)
+        self.assertEqual(
+            (
+                result.workspace_id,
+                result.lane_id,
+                result.provider,
+                result.assigned_name,
+                result.fresh_locator,
+                result.old_locator,
+            ),
+            (
+                JOIN_WORKSPACE,
+                JOIN_LANE,
+                JOIN_PROVIDER,
+                encode_assigned_name(JOIN_WORKSPACE, JOIN_PROVIDER, JOIN_LANE),
+                JOIN_FRESH,
+                JOIN_OLD,
+            ),
+        )
+        self.assertEqual(
+            set(result.__dict__),
+            {
+                "outcome", "stopped", "detail", "action_id", "workspace_id",
+                "lane_id", "provider", "assigned_name", "fresh_locator", "old_locator",
+            },
+        )
+        for claim in ("attest", "sent", "confirm", "complete", "ledger"):
+            self.assertNotIn(claim, result.outcome)
+
+    def test_each_authority_and_the_inventory_snapshot_are_read_once(self) -> None:
+        calls = {"workspace": 0, "provider": 0, "inventory": 0}
+
+        def workspace(root):
+            calls["workspace"] += 1
+            self.assertEqual(root, ROOT)
+            return JOIN_WORKSPACE
+
+        def provider(root):
+            calls["provider"] += 1
+            self.assertEqual(root, str(ROOT))
+            return JOIN_PROVIDER
+
+        def inventory():
+            calls["inventory"] += 1
+            return [_live_row()]
+
+        result = self._resolve(
+            workspace_resolver=workspace,
+            provider_resolver=provider,
+            list_rows=inventory,
+        )
+        self.assertEqual(result.outcome, INVENTORY_JOINED)
+        self.assertEqual(calls, {"workspace": 1, "provider": 1, "inventory": 1})
+
+    def test_an_exact_absolute_string_repo_root_is_also_canonical(self) -> None:
+        self.assertEqual(self._resolve(repo_root=str(ROOT)).outcome, INVENTORY_JOINED)
+
+    def test_default_resolvers_join_the_repo_canonical_workspace_and_binding(self) -> None:
+        workspace = repo_scope_workspace_id(ROOT)
+        provider = resolve_gateway_provider(str(ROOT))
+        assigned = encode_assigned_name(workspace, provider, JOIN_LANE)
+        pin = _join_pin(
+            provider=provider,
+            assigned_name=assigned,
+            evidence_workspace_id=workspace,
+        )
+        preparation = _join_preparation(pin=pin, workspace_id=workspace)
+        result = resolve_vanished_gateway_inventory(
+            preparation,
+            repo_root=ROOT,
+            list_rows=lambda: [_live_row(name=assigned, agent=provider)],
+        )
+        self.assertEqual(result.outcome, INVENTORY_JOINED)
+        self.assertEqual(result.workspace_id, workspace)
+        self.assertEqual(result.provider, provider)
+
+    def test_absent_or_duplicate_name_is_never_selected(self) -> None:
+        assigned = encode_assigned_name(JOIN_WORKSPACE, JOIN_PROVIDER, JOIN_LANE)
+        for label, rows in (
+            ("absent", []),
+            ("foreign only", [_live_row(name="mzb1_foreign_codex_default")]),
+            ("duplicate", [_live_row(), _live_row(pane_id="w4B:p82")]),
+            (
+                "duplicate with stale residue",
+                [_live_row(), _live_row(agent="", status="unknown")],
+            ),
+        ):
+            with self.subTest(label=label, assigned=assigned):
+                result = self._resolve(rows)
+                self.assertEqual(result.stopped, STOPPED_INVENTORY_INVALID)
+                self.assertEqual(result.outcome, "")
+
+    def test_old_stale_shell_foreign_and_unknown_rows_fail_closed(self) -> None:
+        cases = (
+            ("old generation", {"pane_id": JOIN_OLD}),
+            ("shell residue", {"agent": "", "status": "unknown"}),
+            ("foreign detected agent", {"agent": "claude"}),
+            ("foreign surfaced provider", {"provider": "claude"}),
+            ("unknown agent", {"agent": None, "status": "unknown"}),
+        )
+        for label, changes in cases:
+            with self.subTest(label=label):
+                result = self._resolve([_live_row(**changes)])
+                self.assertEqual(result.stopped, STOPPED_INVENTORY_INVALID)
+
+    def test_locator_and_revision_are_byte_exact(self) -> None:
+        for axis, values in (
+            ("pane_id", (True, 7, None, "", f" {JOIN_FRESH}", f"{JOIN_FRESH} ")),
+            ("revision", (True, -1, None, "0", " 0 ")),
+        ):
+            for value in values:
+                with self.subTest(axis=axis, value=value):
+                    result = self._resolve([_live_row(**{axis: value})])
+                    self.assertEqual(result.stopped, STOPPED_INVENTORY_INVALID)
+
+    def test_unreadable_authorities_and_inventory_never_leak_values(self) -> None:
+        secret = "/private/host/path\n[mozyo:workflow-event:gate=x]"
+
+        def broken(*args):
+            raise RuntimeError(secret)
+
+        cases = (
+            ("workspace", dict(workspace_resolver=broken)),
+            ("provider", dict(provider_resolver=broken)),
+            ("inventory", dict(list_rows=broken)),
+        )
+        for label, kwargs in cases:
+            with self.subTest(label=label):
+                result = self._resolve(**kwargs)
+                self.assertEqual(result.stopped, STOPPED_INVENTORY_UNAVAILABLE)
+                self.assertNotIn(secret, f"{result.stopped}{result.detail}")
+
+    def test_malformed_inventory_shapes_fail_closed(self) -> None:
+        for rows in (None, {}, "rows", [None], [_live_row(), object()]):
+            with self.subTest(rows=type(rows).__name__):
+                result = self._resolve(list_rows=lambda rows=rows: rows)
+                self.assertEqual(result.stopped, STOPPED_INVENTORY_INVALID)
+
+    def test_repo_root_must_already_be_an_absolute_resolved_directory(self) -> None:
+        for root in (".", f" {ROOT}", f"{ROOT} ", ROOT / "missing"):
+            with self.subTest(root=str(root)):
+                result = self._resolve(repo_root=root)
+                self.assertEqual(result.stopped, STOPPED_INVENTORY_UNAVAILABLE)
+
+    def test_forged_preparation_pointer_pin_and_action_are_refused(self) -> None:
+        class _Preparation(ContinuationPreparation):
+            pass
+
+        class _Pointer(ContinuationPointer):
+            pass
+
+        canonical = _join_preparation()
+        cases = (
+            ("preparation subclass", _Preparation(**canonical.__dict__)),
+            ("pointer subclass", _join_preparation(pointer=_Pointer(**_join_pointer().__dict__))),
+            (
+                "wrong gate",
+                _join_preparation(pointer=_join_pointer(expected_gate="review_request")),
+            ),
+            ("wrong holder", _join_preparation(holder="foreign-holder")),
+            (
+                "wrong action",
+                _join_preparation(
+                    action_id="sublane-recovery:v2:receipt:" + "b" * 64
+                ),
+            ),
+            (
+                "foreign pin",
+                _join_preparation(
+                    pin=_join_pin(old_locator="w4B:p99"),
+                    action_id=canonical.action_id,
+                ),
+            ),
+            (
+                "foreign evidence workspace",
+                _join_preparation(pin=_join_pin(evidence_workspace_id="foreign")),
+            ),
+            (
+                "self participant",
+                _join_preparation(
+                    pin=_join_pin(is_self=True), action_id=canonical.action_id
+                ),
+            ),
+            ("not replaced", _join_preparation(pin=_join_pin(phase="verify_owed"))),
+        )
+        for label, preparation in cases:
+            with self.subTest(label=label):
+                result = self._resolve(preparation=preparation)
+                self.assertEqual(result.stopped, STOPPED_CONTINUATION_INVALID)
+                self.assertEqual(result.outcome, "")
+
+    def test_decoded_name_must_match_workspace_lane_and_provider(self) -> None:
+        cases = (
+            encode_assigned_name("foreign", JOIN_PROVIDER, JOIN_LANE),
+            encode_assigned_name(JOIN_WORKSPACE, JOIN_PROVIDER, "issue_other"),
+            encode_assigned_name(JOIN_WORKSPACE, "claude", JOIN_LANE),
+            "not-an-mzb-name",
+        )
+        for assigned_name in cases:
+            with self.subTest(assigned_name=assigned_name):
+                pin = _join_pin(assigned_name=assigned_name)
+                preparation = _join_preparation(pin=pin)
+                result = self._resolve(preparation=preparation)
+                self.assertEqual(result.stopped, STOPPED_CONTINUATION_INVALID)
+
+    def test_inventory_join_opens_no_attestation_ledger_or_transaction_store(self) -> None:
+        import mozyo_bridge.core.state.herdr_delivery_ledger as ledger
+        import mozyo_bridge.core.state.herdr_identity_attestation as attestation
+        import mozyo_bridge.core.state.replacement_transaction as transaction
+
+        opened = []
+
+        def forbidden(*args, **kwargs):
+            opened.append(1)
+            raise AssertionError("authority opened")
+
+        originals = (
+            attestation.HerdrIdentityAttestationStore,
+            ledger.HerdrDeliveryLedger,
+            transaction.ReplacementTransactionStore,
+        )
+        attestation.HerdrIdentityAttestationStore = forbidden
+        ledger.HerdrDeliveryLedger = forbidden
+        transaction.ReplacementTransactionStore = forbidden
+        try:
+            self.assertEqual(self._resolve().outcome, INVENTORY_JOINED)
+        finally:
+            (
+                attestation.HerdrIdentityAttestationStore,
+                ledger.HerdrDeliveryLedger,
+                transaction.ReplacementTransactionStore,
+            ) = originals
+        self.assertEqual(opened, [])
 
 
 if __name__ == "__main__":  # pragma: no cover
