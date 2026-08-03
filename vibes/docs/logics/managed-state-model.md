@@ -528,6 +528,31 @@ Table naming:
         lifecycle v9→v10 backup-first migration / new runtime install / top coordinator
         first relaunch を含む **global rollout は別の durable work unit** であり、fleet の
         外側の非 consumer 主体を必要とする。本 plan はその window の中でだけ有効。
+    - **global offline rollout Phase A は副作用ゼロの単一 snapshot plan とする**
+      (#14838 j#97096)。public rail は
+      `mozyo-bridge herdr offline-rollout plan --candidate-version <exact> [--candidate-source-sha <40hex>]`
+      のみで、`delegate` / `run` / action store / process stop / migration / install / publish /
+      relaunch を持たない。実行 rail を同時に公開すると、snapshot 契約が未証明な段階で
+      global stop を呼べてしまうため、Phase A の parser に `run` / `--write` は存在させない。
+      - plan は home registry の **全 workspace id / project name**、global Herdr inventory の
+        **全 managed assigned name**、current top identity、両 supervisor の secret-safe status、
+        attestation / lane lifecycle / startup transaction の **3 store schema**、各 worktree の
+        content-sensitive WIP fingerprint を収集する。絶対 path、credential、pane text、WIP bytes は
+        public JSON に含めない。project name が current project と異なる workspace は
+        `unrelated_project` と明示し、黙って rollout 対象外にしない。
+      - registry / inventory / WIP / store / supervisor は前後 2 回 read し、canonical projection が
+        1 byte でも異なれば `snapshot_drift` で拒否する。unreadable / unknown schema、未登録
+        workspace を指す agent、duplicate assigned name、unmanaged inventory row、top identity の
+        exact-one join 不成立も **plan 無し**で拒否する。read-only SQLite probe が WAL の `-shm`
+        index を materialize しうる既知の bookkeeping 例外を除き、authority row / schema / process /
+        worktree を変更しない。
+      - canonical plan は top 以外を先に stop、top を最後に stopし、restore は top を最初にする。
+        schema transition は attestation `→v3`、lane lifecycle `→v10`、startup transaction `→v2`
+        を明示する。artifact source SHA が未確定なら `exact_pin_ready=false` であり、plan 作成には
+        成功しても実行承認には使えない。plan body の sorted compact JSON を SHA-256 して
+        `plan_digest` とし、後続の owner approval は exact digest・全 workspace/assigned name・
+        unrelated classification・schema transition・artifact pin・global stop・forward-only を列挙する。
+        旧 runtime への rollback は認めず、失敗時も新 runtime で前進復旧する。
   - **release generation observation (release が閉じた slot 集合の immutable 正本)**
     (schema v9、#14477 disposition j#94582)。追加 field `release_observation`。実装正本は
     `core/state/lane_release_observation.py` / `core/state/lane_release.py`。

@@ -66,6 +66,14 @@ def register_herdr_group(
     register_herdr_launch_generation_store_parser(
         herdr_sub, add_repo_option=add_repo_option
     )
+    # Redmine #14838 Phase A: one global, drift-checked, side-effect-zero rollout plan.
+    from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application.cli_herdr_offline_rollout import (  # noqa: E501
+        register_herdr_offline_rollout_parser,
+    )
+
+    register_herdr_offline_rollout_parser(
+        herdr_sub, add_repo_option=add_repo_option
+    )
     # Redmine #13892 / #13948: every herdr session recovery surface, in one call.
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_recovery import (  # noqa: E501
         register_herdr_recovery_surfaces,
