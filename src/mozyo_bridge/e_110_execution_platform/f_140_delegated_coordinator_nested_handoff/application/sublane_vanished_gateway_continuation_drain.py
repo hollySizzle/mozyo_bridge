@@ -141,6 +141,16 @@ def _authority_is_for_preparation(
         and authority.old_locator == pin.old_locator
         and authority.fresh_locator != authority.old_locator
     )
+
+
+class _PreAttemptConfirmationStop(RuntimeError):
+    """Typed internal short-circuit before the shared driver's attempted CAS."""
+
+    def __init__(self, status: str) -> None:
+        super().__init__(status)
+        self.status = status
+
+
 @dataclass(frozen=True)
 class VanishedGatewayContinuationDrainResult:
     """Closed continuation disposition; it carries no transport or host detail."""
@@ -347,6 +357,14 @@ class VanishedGatewayContinuationDrain:
             first_confirmation = False
             current = self.ops.current_authority(preparation)
             if not _authority_is_for_preparation(preparation, current):
+                if is_first:
+                    # The idempotency barrier cannot inspect the exact ledger without its
+                    # exact target authority.  A transient move is not proof of ledger
+                    # absence and must not open an attempted-CAS/send path if the authority
+                    # happens to rejoin on the driver's next read.
+                    raise _PreAttemptConfirmationStop(
+                        CONTINUATION_AUTHORITY_MOVED
+                    )
                 return False
             confirmation = self._confirmation(preparation, current)
             if confirmation is None and is_first:
@@ -354,7 +372,7 @@ class VanishedGatewayContinuationDrain:
                 # before its attempted CAS.  Unreadable is not evidence of absence there:
                 # fail closed before the transaction can become sendable.  Later (post-send)
                 # unreadable observations retain the driver's uncertain semantics.
-                raise RuntimeError(CONTINUATION_UNREADABLE)
+                raise _PreAttemptConfirmationStop(CONTINUATION_UNREADABLE)
             return confirmation is True
 
         def authority_current() -> bool:
@@ -382,6 +400,8 @@ class VanishedGatewayContinuationDrain:
                 send_fn=send,
                 confirmed_fn=confirmed,
             )
+        except _PreAttemptConfirmationStop as stopped:
+            status = stopped.status
         except (Exception, SystemExit):
             status = CONTINUATION_UNREADABLE
         return VanishedGatewayContinuationDrainResult(status, preparation.action_id)

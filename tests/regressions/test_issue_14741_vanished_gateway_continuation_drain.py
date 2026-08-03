@@ -244,6 +244,18 @@ class VanishedGatewayContinuationDrainTest(_PrepareCase):
         self.assertEqual(self._phase(), PHASE_REPLACING_NONSELF)
         self.assertEqual(state["reads"], 2)
 
+    def test_first_authority_move_with_prelanded_record_fails_before_cas(self):
+        """A transient authority move is not evidence that the ledger is empty."""
+
+        self.drain.records.append(self._record())
+        self.ops.authorities = [self.authority, None, self.authority]
+        result = self.drain.drive(self.preparation)
+        self.assertEqual(result.status, CONTINUATION_AUTHORITY_MOVED)
+        self.assertEqual(self.ops.send_calls, 0)
+        self.assertEqual(self._phase(), PHASE_REPLACING_NONSELF)
+        self.assertEqual(self.ops.authority_reads, 2)
+        self.assertEqual(len(self.drain.markers), 1)
+
     def test_post_send_ledger_read_error_remains_uncertain(self):
         """Unreadable after an attempted send must retain the replay fence."""
 
