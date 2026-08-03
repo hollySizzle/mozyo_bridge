@@ -186,6 +186,30 @@ class VanishedGatewayContinuationDrainTest(_PrepareCase):
                     (holder, LATER, self.preparation.action_id),
                 )
 
+    def _complete_current_transaction(self):
+        record = self.store.get(self._key())
+        if record.phase == PHASE_REPLACING_NONSELF:
+            moved = self.store.transition_phase(
+                self._key(),
+                expected_revision=record.revision,
+                expected_action_generation=1,
+                target=PHASE_DRAINING_CONTINUATION,
+                holder=self.preparation.holder,
+                now=FIXED,
+            )
+            self.assertTrue(moved.applied)
+            record = self.store.get(self._key())
+        if record.phase == PHASE_DRAINING_CONTINUATION:
+            moved = self.store.transition_phase(
+                self._key(),
+                expected_revision=record.revision,
+                expected_action_generation=1,
+                target=PHASE_COMPLETED,
+                holder=self.preparation.holder,
+                now=FIXED,
+            )
+            self.assertTrue(moved.applied)
+
     def test_happy_send_completes_only_after_the_post_attestation_ledger_lands(self):
         self.ops.after_send = lambda: self.drain.records.append(self._record())
         result = self.drain.drive(self.preparation)
@@ -238,6 +262,57 @@ class VanishedGatewayContinuationDrainTest(_PrepareCase):
         self.assertEqual(replay.status, CONTINUATION_CONFIRMED)
         self.assertEqual(self.ops.send_calls, 1)
         self.assertEqual(len(self.drain.markers), marker_reads)
+        self.assertEqual(self._phase(), PHASE_COMPLETED)
+
+    def test_completion_during_runtime_context_failure_wins_at_return_boundary(self):
+        """An early runtime refusal cannot overtake a completion after entry read."""
+
+        def complete_then_refuse():
+            self._complete_current_transaction()
+            return False
+
+        self.ops.context_is_exact = complete_then_refuse
+        result = self.drain.drive(self.preparation)
+
+        self.assertEqual(result.status, CONTINUATION_CONFIRMED)
+        self.assertEqual(self.ops.send_calls, 0)
+        self.assertEqual(len(self.drain.markers), 0)
+        self.assertEqual(self._phase(), PHASE_COMPLETED)
+
+    def test_completion_during_lease_failure_wins_at_return_boundary(self):
+        """A concurrent completion is stronger than a stale lease disposition."""
+
+        def complete_then_report_failure(_key, *, holder):
+            self.assertEqual(holder, self.preparation.holder)
+            self._complete_current_transaction()
+            return CONTINUATION_LEASE_LOST
+
+        self.drain._ensure_lease = complete_then_report_failure
+        result = self.drain.drive(self.preparation)
+
+        self.assertEqual(result.status, CONTINUATION_CONFIRMED)
+        self.assertEqual(self.ops.send_calls, 0)
+        self.assertEqual(self._phase(), PHASE_COMPLETED)
+
+    def test_completion_inside_first_ledger_barrier_wins_over_stale_cas(self):
+        """The final projection closes barrier-read to attempted-CAS completion races."""
+
+        original_records = self.drain._records_for_marker
+        reads = 0
+
+        def complete_on_second_read(marker):
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                self._complete_current_transaction()
+            return original_records(marker)
+
+        self.drain._records_for_marker = complete_on_second_read
+        result = self.drain.drive(self.preparation)
+
+        self.assertEqual(result.status, CONTINUATION_CONFIRMED)
+        self.assertEqual(self.ops.send_calls, 0)
+        self.assertEqual(reads, 2)
         self.assertEqual(self._phase(), PHASE_COMPLETED)
 
     def test_prelanded_exact_record_completes_with_zero_send(self):

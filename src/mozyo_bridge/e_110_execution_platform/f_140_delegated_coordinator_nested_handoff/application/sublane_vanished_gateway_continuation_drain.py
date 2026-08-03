@@ -340,6 +340,27 @@ class VanishedGatewayContinuationDrain:
             return CONTINUATION_CONFIRMED
         return None
 
+    def _result_with_completed_fact(
+        self,
+        key: ReplacementTransactionKey,
+        status: str,
+        action_id: str,
+    ) -> VanishedGatewayContinuationDrainResult:
+        """Never let a runtime result overtake a concurrent durable completion.
+
+        Runtime authority and the delivery ledger are intentionally lossy observations.
+        Re-read the transaction at the return boundary and override ``status`` only when
+        the exact generation now carries the stronger ``completed`` fact.  Absence,
+        unreadability, generation movement, and every non-terminal phase leave the caller's
+        already-derived disposition unchanged.
+        """
+
+        if status != CONTINUATION_CONFIRMED:
+            terminal = self._completed_or_stop_status(key)
+            if terminal == CONTINUATION_CONFIRMED:
+                status = CONTINUATION_CONFIRMED
+        return VanishedGatewayContinuationDrainResult(status, action_id)
+
     def _authority_stop_status(self, key: ReplacementTransactionKey) -> str:
         """Keep an attempted replay fenced when its current authority is unavailable."""
 
@@ -389,36 +410,36 @@ class VanishedGatewayContinuationDrain:
             )
         stored_status = self._completed_or_stop_status(key)
         if stored_status is not None:
-            return VanishedGatewayContinuationDrainResult(
-                stored_status, preparation.action_id
+            return self._result_with_completed_fact(
+                key, stored_status, preparation.action_id
             )
         try:
             context_exact = self.ops.context_is_exact()
             authority = self.ops.current_authority(preparation)
         except (Exception, SystemExit):
-            return VanishedGatewayContinuationDrainResult(
-                CONTINUATION_UNREADABLE, preparation.action_id
+            return self._result_with_completed_fact(
+                key, CONTINUATION_UNREADABLE, preparation.action_id
             )
         if not context_exact:
-            return VanishedGatewayContinuationDrainResult(
-                CONTINUATION_UNREADABLE, preparation.action_id
+            return self._result_with_completed_fact(
+                key, CONTINUATION_UNREADABLE, preparation.action_id
             )
         if not _authority_is_for_preparation(preparation, authority):
-            return VanishedGatewayContinuationDrainResult(
-                self._authority_stop_status(key), preparation.action_id
+            return self._result_with_completed_fact(
+                key, self._authority_stop_status(key), preparation.action_id
             )
         # Read once before the lease mutation so an unreadable ledger never becomes
         # permission to claim or send.  This value is deliberately NOT cached for the
         # driver's idempotency-first check: a matching record may land while the lease is
         # acquired/reclaimed, and the check adjacent to the attempted CAS must see it.
         if self._confirmation(preparation, authority) is None:
-            return VanishedGatewayContinuationDrainResult(
-                CONTINUATION_UNREADABLE, preparation.action_id
+            return self._result_with_completed_fact(
+                key, CONTINUATION_UNREADABLE, preparation.action_id
             )
         lease_failure = self._ensure_lease(key, holder=preparation.holder)
         if lease_failure is not None:
-            return VanishedGatewayContinuationDrainResult(
-                lease_failure, preparation.action_id
+            return self._result_with_completed_fact(
+                key, lease_failure, preparation.action_id
             )
 
         first_confirmation = True
@@ -497,7 +518,7 @@ class VanishedGatewayContinuationDrain:
             status = stopped.status
         except (Exception, SystemExit):
             status = CONTINUATION_UNREADABLE
-        return VanishedGatewayContinuationDrainResult(status, preparation.action_id)
+        return self._result_with_completed_fact(key, status, preparation.action_id)
 
 
 def drive_vanished_gateway_continuation(
