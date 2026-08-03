@@ -530,7 +530,9 @@ Table naming:
         外側の非 consumer 主体を必要とする。本 plan はその window の中でだけ有効。
     - **global offline rollout Phase A は副作用ゼロの単一 snapshot plan とする**
       (#14838 j#97096)。public rail は
-      `mozyo-bridge herdr offline-rollout plan --candidate-version <exact> [--candidate-source-sha <40hex>]`
+      `mozyo-bridge herdr offline-rollout plan --candidate-version <exact>` にcandidateの
+      source SHA / canonical origin ref / TestPyPI workflow run id / wheel・sdist SHA-256を
+      任意pinとして渡す
       のみで、`delegate` / `run` / action store / process stop / migration / install / publish /
       relaunch を持たない。実行 rail を同時に公開すると、snapshot 契約が未証明な段階で
       global stop を呼べてしまうため、Phase A の parser に `run` / `--write` は存在させない。
@@ -548,8 +550,10 @@ Table naming:
         worktree を変更しない。
       - canonical plan は top 以外を先に stop、top を最後に stopし、restore は top を最初にする。
         schema transition は attestation `→v3`、lane lifecycle `→v10`、startup transaction `→v2`
-        を明示する。artifact source SHA が未確定なら `exact_pin_ready=false` であり、plan 作成には
-        成功しても実行承認には使えない。plan body の sorted compact JSON を SHA-256 して
+        を明示する。artifactのsource SHA / `refs/heads/<branch>` / workflow run id / wheel SHA-256 /
+        sdist SHA-256の5者がすべて揃う場合だけ `exact_pin_ready=true` とする。不足pinがあっても
+        plan作成は成功するが実行承認には使えず、形式不正なpinはplan無しで拒否する。全pinは
+        canonical plan bodyとdigestへ含める。plan body の sorted compact JSON を SHA-256 して
         `plan_digest` とし、後続の owner approval は exact digest・全 workspace/assigned name・
         unrelated classification・schema transition・artifact pin・global stop・forward-only を列挙する。
         旧 runtime への rollback は認めず、失敗時も新 runtime で前進復旧する。

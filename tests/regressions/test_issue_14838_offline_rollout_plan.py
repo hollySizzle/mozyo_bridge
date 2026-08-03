@@ -98,6 +98,10 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
             "home": self.home,
             "candidate_version": "0.15.0a2",
             "candidate_source_sha": "d" * 40,
+            "candidate_source_ref": "refs/heads/main",
+            "candidate_workflow_run_id": "30821934713",
+            "candidate_wheel_sha256": "e" * 64,
+            "candidate_sdist_sha256": "f" * 64,
             "env": {
                 "MOZYO_WORKSPACE_ID": "ws_main",
                 "MOZYO_AGENT_ROLE": "codex",
@@ -235,10 +239,22 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
                 "plan",
                 "--candidate-version",
                 "0.15.0a2",
+                "--candidate-source-sha",
+                "d" * 40,
+                "--candidate-source-ref",
+                "refs/heads/main",
+                "--candidate-workflow-run-id",
+                "30821934713",
+                "--candidate-wheel-sha256",
+                "e" * 64,
+                "--candidate-sdist-sha256",
+                "f" * 64,
                 "--json",
             ]
         )
         self.assertEqual(parsed.offline_rollout_command, "plan")
+        self.assertEqual(parsed.candidate_source_ref, "refs/heads/main")
+        self.assertEqual(parsed.candidate_workflow_run_id, "30821934713")
         with self.assertRaises(SystemExit):
             parser.parse_args(["offline-rollout", "run"])
 

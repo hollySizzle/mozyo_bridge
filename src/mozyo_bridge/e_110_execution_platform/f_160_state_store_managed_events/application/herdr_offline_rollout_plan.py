@@ -18,6 +18,10 @@ def run_offline_rollout_plan(
     home: Path,
     candidate_version: str,
     candidate_source_sha: str = "",
+    candidate_source_ref: str = "",
+    candidate_workflow_run_id: str = "",
+    candidate_wheel_sha256: str = "",
+    candidate_sdist_sha256: str = "",
     env: Optional[Mapping[str, str]] = None,
     snapshot_reader: Optional[Callable] = None,
 ) -> OfflineRolloutPlanResult:
@@ -33,6 +37,10 @@ def run_offline_rollout_plan(
         home=home,
         candidate_version=candidate_version,
         candidate_source_sha=candidate_source_sha,
+        candidate_source_ref=candidate_source_ref,
+        candidate_workflow_run_id=candidate_workflow_run_id,
+        candidate_wheel_sha256=candidate_wheel_sha256,
+        candidate_sdist_sha256=candidate_sdist_sha256,
         env=env,
     )
     if isinstance(captured, OfflineRolloutPlanResult):

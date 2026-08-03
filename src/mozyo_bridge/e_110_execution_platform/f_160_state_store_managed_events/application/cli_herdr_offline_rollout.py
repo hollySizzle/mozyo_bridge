@@ -30,6 +30,10 @@ def cmd_herdr_offline_rollout_plan(args: argparse.Namespace) -> int:
         home=_home(args),
         candidate_version=args.candidate_version,
         candidate_source_sha=args.candidate_source_sha,
+        candidate_source_ref=args.candidate_source_ref,
+        candidate_workflow_run_id=args.candidate_workflow_run_id,
+        candidate_wheel_sha256=args.candidate_wheel_sha256,
+        candidate_sdist_sha256=args.candidate_sdist_sha256,
         env=dict(os.environ),
     )
     payload = result.as_payload()
@@ -80,6 +84,26 @@ def register_herdr_offline_rollout_parser(herdr_sub, *, add_repo_option=None) ->
             "Exact 40-hex source commit of the built artifact. Omit until the artifact "
             "exists; the plan then reports exact_pin_ready=false."
         ),
+    )
+    plan.add_argument(
+        "--candidate-source-ref",
+        default="",
+        help="Canonical approved origin ref, for example refs/heads/main.",
+    )
+    plan.add_argument(
+        "--candidate-workflow-run-id",
+        default="",
+        help="Exact successful TestPyPI workflow run id for the artifact receipt.",
+    )
+    plan.add_argument(
+        "--candidate-wheel-sha256",
+        default="",
+        help="Exact lowercase SHA-256 digest published for the candidate wheel.",
+    )
+    plan.add_argument(
+        "--candidate-sdist-sha256",
+        default="",
+        help="Exact lowercase SHA-256 digest published for the candidate sdist.",
     )
     plan.add_argument(
         "--home",

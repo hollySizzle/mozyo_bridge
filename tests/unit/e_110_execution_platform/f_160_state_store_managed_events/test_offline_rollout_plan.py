@@ -24,6 +24,10 @@ def _capture() -> OfflineRolloutCapture:
         current_project_name="mozyo_bridge",
         candidate_version="0.15.0a2",
         candidate_source_sha="a" * 40,
+        candidate_source_ref="refs/heads/main",
+        candidate_workflow_run_id="30821934713",
+        candidate_wheel_sha256="d" * 64,
+        candidate_sdist_sha256="e" * 64,
         workspaces=(
             WorkspaceSnapshot(
                 "ws_b",
@@ -179,12 +183,60 @@ class OfflineRolloutPlanTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.reason, "top_identity_unresolved")
 
-    def test_candidate_without_source_sha_is_explicitly_not_pin_ready(self) -> None:
-        result = build_offline_rollout_plan(
-            replace(_capture(), candidate_source_sha="")
+    def test_only_a_complete_artifact_receipt_is_pin_ready(self) -> None:
+        ready = build_offline_rollout_plan(_capture())
+        self.assertTrue(ready.ok)
+        self.assertTrue(ready.plan["candidate_artifact"]["exact_pin_ready"])
+        self.assertEqual(
+            ready.plan["candidate_artifact"],
+            {
+                "distribution": "testpypi",
+                "version": "0.15.0a2",
+                "source_sha": "a" * 40,
+                "source_ref": "refs/heads/main",
+                "workflow_run_id": "30821934713",
+                "wheel_sha256": "d" * 64,
+                "sdist_sha256": "e" * 64,
+                "exact_pin_ready": True,
+            },
         )
-        self.assertTrue(result.ok)
-        self.assertFalse(result.plan["candidate_artifact"]["exact_pin_ready"])
+        for field in (
+            "candidate_source_sha",
+            "candidate_source_ref",
+            "candidate_workflow_run_id",
+            "candidate_wheel_sha256",
+            "candidate_sdist_sha256",
+        ):
+            with self.subTest(missing=field):
+                result = build_offline_rollout_plan(replace(_capture(), **{field: ""}))
+                self.assertTrue(result.ok)
+                self.assertFalse(result.plan["candidate_artifact"]["exact_pin_ready"])
+
+    def test_malformed_artifact_receipt_fields_refuse(self) -> None:
+        cases = (
+            ("candidate_source_ref", "origin/main", "candidate_source_ref_invalid"),
+            ("candidate_source_ref", "refs/heads/.hidden", "candidate_source_ref_invalid"),
+            ("candidate_source_ref", "refs/heads/main.lock", "candidate_source_ref_invalid"),
+            ("candidate_workflow_run_id", "0", "candidate_workflow_run_id_invalid"),
+            ("candidate_workflow_run_id", "01", "candidate_workflow_run_id_invalid"),
+            ("candidate_wheel_sha256", "A" * 64, "candidate_wheel_sha256_invalid"),
+            ("candidate_sdist_sha256", "f" * 63, "candidate_sdist_sha256_invalid"),
+        )
+        for field, value, detail in cases:
+            with self.subTest(field=field):
+                result = build_offline_rollout_plan(
+                    replace(_capture(), **{field: value})
+                )
+                self.assertFalse(result.ok)
+                self.assertEqual(result.reason, "invalid_capture")
+                self.assertEqual(result.detail, detail)
+
+    def test_artifact_receipt_is_part_of_the_plan_digest(self) -> None:
+        first = build_offline_rollout_plan(_capture())
+        changed = build_offline_rollout_plan(
+            replace(_capture(), candidate_workflow_run_id="30821934714")
+        )
+        self.assertNotEqual(first.plan_digest, changed.plan_digest)
 
     def test_owned_supervisor_pair_is_exactly_required(self) -> None:
         source = _capture()
