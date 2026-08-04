@@ -8,7 +8,9 @@ barrier, not a process lock; any visible drift refuses rather than fabricating a
 
 from __future__ import annotations
 
+import hashlib
 import os
+import sqlite3
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
@@ -24,6 +26,10 @@ from mozyo_bridge.core.state.lane_lifecycle_readonly import (
     LIFECYCLE_SCHEMA_ABSENT,
     LIFECYCLE_SCHEMA_RECOGNIZED,
     probe_lane_lifecycle_schema,
+)
+from mozyo_bridge.core.state.lane_lifecycle_schema import lane_lifecycle_path
+from mozyo_bridge.core.state.startup_store_migration import (
+    startup_store_migration_plan_digest,
 )
 from mozyo_bridge.core.state.startup_action_capability import (
     STARTUP_TRANSACTION_FENCE_SUPPORTED_VERSIONS,
@@ -172,7 +178,9 @@ def _startup_store_snapshot(home: Path) -> StoreSnapshot:
         # snapshot.  A raw second connection would weaken that authority check.
         with fence._connection("ro") as conn:  # noqa: SLF001 - authority-owned verifier
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-    except (StartupTransactionError, TypeError, ValueError):
+            content_digest = _connection_content_digest(conn)
+            migration_digest = startup_store_migration_plan_digest(conn)
+    except (StartupTransactionError, sqlite3.DatabaseError, TypeError, ValueError):
         return StoreSnapshot(STORE_STARTUP_TRANSACTION, "unreadable", None)
     if (
         not isinstance(version, int)
@@ -180,11 +188,42 @@ def _startup_store_snapshot(home: Path) -> StoreSnapshot:
         or version not in STARTUP_TRANSACTION_FENCE_SUPPORTED_VERSIONS
     ):
         return StoreSnapshot(STORE_STARTUP_TRANSACTION, "unsupported", None)
-    return StoreSnapshot(STORE_STARTUP_TRANSACTION, STORE_RECOGNIZED, version)
+    return StoreSnapshot(
+        STORE_STARTUP_TRANSACTION,
+        STORE_RECOGNIZED,
+        version,
+        content_digest=content_digest,
+        migration_plan_digest=migration_digest,
+    )
+
+
+def _connection_content_digest(conn: sqlite3.Connection) -> str:
+    """Hash one logical SQLite read snapshot, including schema and committed rows."""
+    digest = hashlib.sha256()
+    for statement in conn.iterdump():
+        digest.update(statement.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _sqlite_content_digest(path: Path) -> str:
+    if not path.is_file():
+        return ""
+    try:
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            conn.execute("BEGIN")
+            return _connection_content_digest(conn)
+        finally:
+            conn.close()
+    except (OSError, sqlite3.DatabaseError, UnicodeError):
+        return ""
 
 
 def _store_snapshots(home: Path) -> tuple[StoreSnapshot, ...]:
-    attestation = probe_store_schema(herdr_identity_attestation_path(home))
+    attestation_path = herdr_identity_attestation_path(home)
+    lifecycle_path = lane_lifecycle_path(home)
+    attestation = probe_store_schema(attestation_path)
     lifecycle = probe_lane_lifecycle_schema(home=home)
     return (
         StoreSnapshot(
@@ -200,6 +239,11 @@ def _store_snapshots(home: Path) -> tuple[StoreSnapshot, ...]:
             ),
             attestation.version,
             attestation.upgrade_required,
+            content_digest=(
+                _sqlite_content_digest(attestation_path)
+                if attestation.state == ATTESTATION_RECOGNIZED
+                else ""
+            ),
         ),
         StoreSnapshot(
             STORE_LANE_LIFECYCLE,
@@ -214,6 +258,11 @@ def _store_snapshots(home: Path) -> tuple[StoreSnapshot, ...]:
             ),
             lifecycle.version,
             lifecycle.upgrade_required,
+            content_digest=(
+                _sqlite_content_digest(lifecycle_path)
+                if lifecycle.state == LIFECYCLE_SCHEMA_RECOGNIZED
+                else ""
+            ),
         ),
         _startup_store_snapshot(home),
     )

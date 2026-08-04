@@ -544,17 +544,17 @@ Table naming:
         lifecycle v9→v10 backup-first migration / new runtime install / top coordinator
         first relaunch を含む **global rollout は別の durable work unit** であり、fleet の
         外側の非 consumer 主体を必要とする。本 plan はその window の中でだけ有効。
-    - **global offline rollout Phase A は副作用ゼロの単一 snapshot plan とする**
-      (#14838 j#97096)。public rail は
-      `mozyo-bridge herdr offline-rollout plan --candidate-version <exact>` にcandidateの
-      source SHA / canonical origin ref / TestPyPI workflow run id / wheel・sdist SHA-256を
-      任意pinとして渡す
-      のみで、`delegate` / `run` / action store / process stop / migration / install / publish /
-      relaunch を持たない。実行 rail を同時に公開すると、snapshot 契約が未証明な段階で
-      global stop を呼べてしまうため、Phase A の parser に `run` / `--write` は存在させない。
+    - **global offline rollout は plan と外部 one-shot execution を分離する**
+      (#14838 j#97096 / execution rail)。public rail は
+      `mozyo-bridge herdr offline-rollout plan|delegate|run|status` の4 verb。
+      `plan` は副作用ゼロ、`delegate` は既定でpreflightのみ、`run` はconsumer外runnerへ
+      固定した内部actuation面であり、両mutation verbともliteral `--execute` がなければ
+      zero-writeで拒否する。TestPyPI publishは本railの責務外で、既に存在するexact artifactだけを
+      download/verify/installする。
       - plan は home registry の **全 workspace id / project name**、global Herdr inventory の
         **全 managed assigned name**、current top identity、両 supervisor の secret-safe status、
-        attestation / lane lifecycle / startup transaction の **3 store schema**、各 worktree の
+        attestation / lane lifecycle / startup transaction の **3 store schema + logical content
+        digest**（startupはpublic migration primitiveのmigration-plan digestも含む）、各 worktree の
         content-sensitive WIP fingerprint を収集する。絶対 path、credential、pane text、WIP bytes は
         public JSON に含めない。project name が current project と異なる workspace は
         `unrelated_project` と明示し、黙って rollout 対象外にしない。
@@ -573,6 +573,38 @@ Table naming:
         `plan_digest` とし、後続の owner approval は exact digest・全 workspace/assigned name・
         unrelated classification・schema transition・artifact pin・global stop・forward-only を列挙する。
         旧 runtime への rollback は認めず、失敗時も新 runtime で前進復旧する。
+      - `plan --json` は上記列挙をcanonicalな2行approval noteとして併記する。`delegate` はfresh
+        planを再生成してdigest一致を要求し、`ISSUE:JOURNAL` のjournal本文がその2行とbyte-exact、
+        かつjournal authorがissue authorと一致する場合だけdirect owner approvalと認める。prose、
+        wrapper、末尾改行、非canonical JSON、別digest/targetはapprovalではない。
+      - `delegate --execute` は全workspace pathと全agent locatorをpublic planへ混ぜずprivateに
+        再captureし、planのidentity集合とexact一致させる。`${MOZYO_BRIDGE_HOME}/
+        offline-rollout-actions-v1/<action-id>/` (0700、record 0600、payload SHA-256 seal、exclusive
+        nonblocking lock) にactionをreserveしてから、candidate wheelをexact SHA-256で検証した
+        独立venvとRunAtLoad/KeepAlive=falseのone-shot LaunchAgentを準備・bootstrapする。更新対象
+        pipx env自身をrunnerにしない。
+      - `run --execute` はLaunchAgentが注入したexact action tokenを持ち、かつ
+        `MOZYO_AGENT_ROLE` / `MOZYO_WORKSPACE_ID`を持たないconsumer外processだけをadmitする。
+        actionのphase prefixと各readback receiptを1 phaseごとにatomic保存し、crash/retryは未完
+        phaseから前進する。phase順はplanの
+        `supervisor stop → non-top stop → top stop → zero → backup → 3 migration → exact install →
+        top first → remaining → supervisor pair → final verify`から変更しない。
+      - 最初のagent closeより前に、dirty workspaceごとにtracked/index binary patch、Git index、
+        untracked path/archiveをprivate directoryへ保存し、planのcontent-sensitive WIP digestを
+        再照合する。stash/reset/checkoutは行わない。closeはplan時のassigned-name + locatorの
+        exact generationだけを対象とし、同名different locator、foreign/unmanaged row、inventory
+        unreadableはzero-progress refusal。既にabsentなexact planned nameはcrash replayとしてのみ
+        goal stateへ畳み、consumer=0をfresh raw/projection countの連言で確認する。
+      - backupはattestation/state container/startup seal+DBをSQLite logical snapshotとreadbackで
+        検証する。migrationは既存public primitiveをcomposeし、startup v2 replayはprivate actionの
+        typed completion receipt + recovery artifact再検証を必須にする。installはprivateに保持した
+        exact wheelをpipxへ渡し、通常PATH executableのversionをreadbackする。restoreはtop unitを
+        先に`herdr session-start`し、各nameをfresh inventory locator + v3 self-attestationでjoinして
+        からremaining unitへ進む。supervisorはpair install/statusの両方で2 agent loaded、home pin、
+        executable、credential readinessを確認する。
+      - `status` はaction/plan/phase/reason/timestampだけを返し、workspace path、locator、WIP bytes、
+        backup path、credentialを公開しない。status read成功は途中/blockedでもcommand successで、
+        rollout完了は別field `completed` で表す。
   - **release generation observation (release が閉じた slot 集合の immutable 正本)**
     (schema v9、#14477 disposition j#94582)。追加 field `release_observation`。実装正本は
     `core/state/lane_release_observation.py` / `core/state/lane_release.py`。

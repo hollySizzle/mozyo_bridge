@@ -163,6 +163,8 @@ class StoreSnapshot:
     state: str
     version: Optional[int]
     upgrade_required: bool = False
+    content_digest: str = ""
+    migration_plan_digest: str = ""
 
     def to_record(self) -> dict:
         return {
@@ -170,6 +172,8 @@ class StoreSnapshot:
             "version": self.version,
             "target_version": STORE_TARGET_VERSIONS[self.name],
             "upgrade_required": self.upgrade_required,
+            "content_digest": self.content_digest,
+            "migration_plan_digest": self.migration_plan_digest,
         }
 
 
@@ -368,6 +372,24 @@ def _validate_capture(capture: OfflineRolloutCapture) -> Optional[OfflineRollout
             return refused(REASON_STORE_UNREADABLE, store.name)
         if store.state == STORE_ABSENT and store.version is not None:
             return refused(REASON_INVALID_CAPTURE, "absent_store_has_version")
+        if store.state == STORE_RECOGNIZED and not _SHA256.fullmatch(
+            store.content_digest
+        ):
+            return refused(REASON_STORE_UNREADABLE, f"{store.name}_content_digest")
+        if store.state == STORE_ABSENT and (
+            store.content_digest or store.migration_plan_digest
+        ):
+            return refused(REASON_INVALID_CAPTURE, "absent_store_has_digest")
+        if store.migration_plan_digest and not _SHA256.fullmatch(
+            store.migration_plan_digest
+        ):
+            return refused(REASON_STORE_UNREADABLE, f"{store.name}_migration_digest")
+        if (
+            store.name == STORE_STARTUP_TRANSACTION
+            and store.state == STORE_RECOGNIZED
+            and not store.migration_plan_digest
+        ):
+            return refused(REASON_STORE_UNREADABLE, "startup_migration_digest")
     labels = [supervisor.label for supervisor in capture.supervisors]
     if (
         len(labels) != len(set(labels))

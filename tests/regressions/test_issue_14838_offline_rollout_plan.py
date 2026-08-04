@@ -117,9 +117,19 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
                 digest=("a" if path == self.repo else "b") * 64,
             ),
             "store_reader": lambda home: (
-                StoreSnapshot("attestation", "recognized", 1),
-                StoreSnapshot("lane_lifecycle", "recognized", 9),
-                StoreSnapshot("startup_transaction", "recognized", 1),
+                StoreSnapshot(
+                    "attestation", "recognized", 1, content_digest="1" * 64
+                ),
+                StoreSnapshot(
+                    "lane_lifecycle", "recognized", 9, content_digest="2" * 64
+                ),
+                StoreSnapshot(
+                    "startup_transaction",
+                    "recognized",
+                    1,
+                    content_digest="3" * 64,
+                    migration_plan_digest="4" * 64,
+                ),
             ),
             "supervisor_reader": lambda *, mozyo_home: {
                 "agents": [
@@ -178,6 +188,35 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
         self.assertEqual(result.reason, "snapshot_drift")
         self.assertIsNone(result.plan)
 
+    def test_store_content_drift_with_same_versions_refuses(self) -> None:
+        calls = []
+
+        def drifting_stores(home):
+            calls.append(1)
+            changed = "9" * 64 if len(calls) > 1 else "1" * 64
+            return (
+                StoreSnapshot(
+                    "attestation", "recognized", 1, content_digest=changed
+                ),
+                StoreSnapshot(
+                    "lane_lifecycle", "recognized", 9, content_digest="2" * 64
+                ),
+                StoreSnapshot(
+                    "startup_transaction",
+                    "recognized",
+                    1,
+                    content_digest="3" * 64,
+                    migration_plan_digest="4" * 64,
+                ),
+            )
+
+        kwargs = self._kwargs()
+        kwargs["store_reader"] = drifting_stores
+        result = capture_offline_rollout_snapshot(**kwargs)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, "snapshot_drift")
+        self.assertIsNone(result.plan)
+
     def test_unhealthy_registry_refuses_before_inventory(self) -> None:
         kwargs = self._kwargs()
         kwargs["registry_health_reader"] = lambda home: {"status": "unreadable"}
@@ -226,7 +265,7 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertNotIn(marker, str(result.as_payload()))
 
-    def test_parser_exposes_only_plan_in_phase_a(self) -> None:
+    def test_parser_exposes_plan_delegate_external_run_and_status(self) -> None:
         parser = argparse.ArgumentParser()
         herdr_sub = parser.add_subparsers(dest="command", required=True)
         register_herdr_offline_rollout_parser(
@@ -255,8 +294,27 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
         self.assertEqual(parsed.offline_rollout_command, "plan")
         self.assertEqual(parsed.candidate_source_ref, "refs/heads/main")
         self.assertEqual(parsed.candidate_workflow_run_id, "30821934713")
-        with self.assertRaises(SystemExit):
-            parser.parse_args(["offline-rollout", "run"])
+        delegated = parser.parse_args(
+            [
+                "offline-rollout",
+                "delegate",
+                "--candidate-version",
+                "0.15.0a2",
+                "--plan-digest",
+                "a" * 64,
+                "--owner-approval",
+                "14838:99999",
+            ]
+        )
+        self.assertEqual(delegated.offline_rollout_command, "delegate")
+        external = parser.parse_args(
+            ["offline-rollout", "run", "--action-id", "offline_" + "a" * 32]
+        )
+        self.assertEqual(external.offline_rollout_command, "run")
+        status = parser.parse_args(
+            ["offline-rollout", "status", "--action-id", "offline_" + "a" * 32]
+        )
+        self.assertEqual(status.offline_rollout_command, "status")
 
 
 if __name__ == "__main__":

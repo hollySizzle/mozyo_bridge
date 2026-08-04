@@ -57,9 +57,15 @@ def _capture() -> OfflineRolloutCapture:
         unmanaged_assigned_names=(),
         top_identity=TopIdentitySnapshot("ws_a", "default", "codex", top),
         stores=(
-            StoreSnapshot("startup_transaction", "recognized", 1),
-            StoreSnapshot("attestation", "recognized", 1),
-            StoreSnapshot("lane_lifecycle", "recognized", 9),
+            StoreSnapshot(
+                "startup_transaction",
+                "recognized",
+                1,
+                content_digest="1" * 64,
+                migration_plan_digest="2" * 64,
+            ),
+            StoreSnapshot("attestation", "recognized", 1, content_digest="3" * 64),
+            StoreSnapshot("lane_lifecycle", "recognized", 9, content_digest="4" * 64),
         ),
         supervisors=(
             SupervisorAgentSnapshot(
@@ -110,6 +116,10 @@ class OfflineRolloutPlanTests(unittest.TestCase):
         self.assertEqual(first.plan["stores"]["attestation"]["target_version"], 3)
         self.assertEqual(first.plan["stores"]["lane_lifecycle"]["target_version"], 10)
         self.assertEqual(first.plan["stores"]["startup_transaction"]["target_version"], 2)
+        self.assertEqual(
+            first.plan["stores"]["startup_transaction"]["migration_plan_digest"],
+            "2" * 64,
+        )
         phases = [row["phase"] for row in first.plan["phase_order"]]
         self.assertEqual(
             phases,
@@ -165,6 +175,17 @@ class OfflineRolloutPlanTests(unittest.TestCase):
         source = _capture()
         stores = (
             replace(source.stores[0], state="unsupported"),
+            source.stores[1],
+            source.stores[2],
+        )
+        result = build_offline_rollout_plan(replace(source, stores=stores))
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, "store_unreadable")
+
+    def test_recognized_store_without_content_pin_refuses(self) -> None:
+        source = _capture()
+        stores = (
+            replace(source.stores[0], content_digest=""),
             source.stores[1],
             source.stores[2],
         )
