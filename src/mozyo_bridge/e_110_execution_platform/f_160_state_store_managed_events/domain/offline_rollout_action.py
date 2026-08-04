@@ -13,6 +13,13 @@ import re
 from datetime import datetime, timezone
 from typing import Mapping, Optional
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.canonical_note_scan import (  # noqa: E501
+    canonical_marker_bodies,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+    MARKER_CHANNEL_WORKFLOW_EVENT,
+)
+
 
 ACTION_SCHEMA_VERSION = 1
 
@@ -25,7 +32,20 @@ ACTION_STATES = frozenset(
     {ACTION_PREPARED, ACTION_DELEGATED, ACTION_RUNNING, ACTION_BLOCKED, ACTION_COMPLETED}
 )
 
-APPROVAL_MARKER = "[mozyo:offline-rollout-approval:v1]"
+OFFLINE_ROLLOUT_APPROVAL_GATE = "herdr_offline_rollout_owner_approval"
+APPROVAL_VERSION = "1"
+APPROVAL_SOURCE = "direct_owner"
+APPROVAL_DECISION = "approved"
+APPROVAL_EFFECT = "global_herdr_offline_rollout"
+APPROVAL_FIELD_ORDER = (
+    "gate",
+    "version",
+    "approval_source",
+    "decision",
+    "effect",
+    "issue",
+    "action_digest",
+)
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _ACTION_ID = re.compile(r"offline_[0-9a-f]{32}")
 _POINTER = re.compile(r"([1-9][0-9]*):([1-9][0-9]*)")
@@ -59,6 +79,20 @@ def canonical_bytes(value: object) -> bytes:
 
 def canonical_digest(value: object) -> str:
     return hashlib.sha256(canonical_bytes(value)).hexdigest()
+
+
+def deterministic_action_id(plan_digest: object, approval_pointer: object) -> str:
+    """One action identity per exact plan+approval, preventing duplicate delegate races."""
+    digest = _token(plan_digest, "plan_digest")
+    if not _SHA256.fullmatch(digest):
+        raise OfflineRolloutActionError("plan_digest_invalid")
+    pointer = _token(approval_pointer, "owner_approval")
+    if _POINTER.fullmatch(pointer) is None:
+        raise OfflineRolloutActionError("owner_approval_invalid")
+    suffix = hashlib.sha256(
+        f"herdr-offline-rollout-v1\n{digest}\n{pointer}".encode("ascii")
+    ).hexdigest()[:32]
+    return f"offline_{suffix}"
 
 
 def _token(value: object, name: str) -> str:
@@ -188,35 +222,85 @@ def approval_manifest(plan: Mapping[str, object], plan_digest: str) -> dict:
     }
 
 
-def render_approval_note(manifest: Mapping[str, object]) -> str:
-    """Render the only approval-note shape accepted by the live verifier."""
-    return f"{APPROVAL_MARKER}\n{canonical_bytes(manifest).decode('ascii')}"
+def approval_action_digest(manifest: Mapping[str, object], issue: object) -> str:
+    """Bind the complete enumerated blast manifest to one Redmine issue."""
+    issue_s = _token(issue, "approval_issue")
+    if (
+        not issue_s.isascii()
+        or not issue_s.isdecimal()
+        or int(issue_s) < 1
+        or str(int(issue_s)) != issue_s
+    ):
+        raise OfflineRolloutActionError("approval_issue_invalid")
+    return canonical_digest(
+        {
+            "gate": OFFLINE_ROLLOUT_APPROVAL_GATE,
+            "version": APPROVAL_VERSION,
+            "issue": issue_s,
+            "approval_manifest": dict(manifest),
+        }
+    )
+
+
+def approval_fields(
+    manifest: Mapping[str, object], issue: object
+) -> dict[str, str]:
+    issue_s = _token(issue, "approval_issue")
+    return {
+        "gate": OFFLINE_ROLLOUT_APPROVAL_GATE,
+        "version": APPROVAL_VERSION,
+        "approval_source": APPROVAL_SOURCE,
+        "decision": APPROVAL_DECISION,
+        "effect": APPROVAL_EFFECT,
+        "issue": issue_s,
+        "action_digest": approval_action_digest(manifest, issue_s),
+    }
+
+
+def render_approval_note(manifest: Mapping[str, object], issue: object) -> str:
+    """Render the canonical structured marker the owner records after inspecting manifest."""
+    fields = approval_fields(manifest, issue)
+    body = ":".join(f"{key}={fields[key]}" for key in APPROVAL_FIELD_ORDER)
+    return f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:{body}]"
 
 
 def parse_approval_note(note: object) -> Mapping[str, object]:
-    """Parse one byte-strict two-line approval record; prose/wrappers are refused."""
+    """Parse exactly one canonical, quote-aware workflow-event approval marker."""
     if not isinstance(note, str):
         raise OfflineRolloutActionError("approval_note_invalid")
-    if note.endswith(("\n", "\r")):
-        raise OfflineRolloutActionError("approval_note_invalid")
-    lines = note.splitlines()
-    if len(lines) != 2 or lines[0] != APPROVAL_MARKER:
-        raise OfflineRolloutActionError("approval_note_invalid")
-    try:
-        decoded = json.loads(lines[1])
-    except (json.JSONDecodeError, TypeError) as exc:
-        raise OfflineRolloutActionError("approval_payload_invalid") from exc
-    if not isinstance(decoded, Mapping) or canonical_bytes(decoded).decode("ascii") != lines[1]:
-        raise OfflineRolloutActionError("approval_payload_noncanonical")
-    return decoded
+    parsed: list[dict[str, str]] = []
+    for _channel, body in canonical_marker_bodies(
+        note, channels=frozenset({MARKER_CHANNEL_WORKFLOW_EVENT})
+    ):
+        components = body.split(":")
+        if not any(
+            component.strip() == f"gate={OFFLINE_ROLLOUT_APPROVAL_GATE}"
+            for component in components
+        ):
+            continue
+        fields: dict[str, str] = {}
+        order: list[str] = []
+        for component in components:
+            key, separator, value = component.partition("=")
+            key, value = key.strip(), value.strip()
+            if not separator or not key or not value or key in fields:
+                raise OfflineRolloutActionError("approval_marker_malformed")
+            fields[key] = value
+            order.append(key)
+        if tuple(order) != APPROVAL_FIELD_ORDER:
+            raise OfflineRolloutActionError("approval_marker_noncanonical")
+        parsed.append(fields)
+    if len(parsed) != 1:
+        raise OfflineRolloutActionError("approval_marker_not_unique")
+    return parsed[0]
 
 
 def approval_matches(
-    note: object, plan: Mapping[str, object], plan_digest: str
+    note: object, plan: Mapping[str, object], plan_digest: str, issue: object
 ) -> bool:
     try:
         observed = parse_approval_note(note)
-        expected = approval_manifest(plan, plan_digest)
+        expected = approval_fields(approval_manifest(plan, plan_digest), issue)
     except OfflineRolloutActionError:
         return False
     return canonical_bytes(observed) == canonical_bytes(expected)
@@ -428,13 +512,21 @@ __all__ = (
     "ACTION_DELEGATED",
     "ACTION_PREPARED",
     "ACTION_RUNNING",
-    "APPROVAL_MARKER",
+    "APPROVAL_DECISION",
+    "APPROVAL_EFFECT",
+    "APPROVAL_FIELD_ORDER",
+    "APPROVAL_SOURCE",
+    "APPROVAL_VERSION",
     "EXECUTION_PHASES",
+    "OFFLINE_ROLLOUT_APPROVAL_GATE",
     "OfflineRolloutActionError",
+    "approval_action_digest",
+    "approval_fields",
     "approval_manifest",
     "approval_matches",
     "canonical_bytes",
     "canonical_digest",
+    "deterministic_action_id",
     "mark_blocked",
     "mark_delegated",
     "mark_phase_completed",

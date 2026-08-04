@@ -50,13 +50,21 @@ def cmd_herdr_offline_rollout_plan(args: argparse.Namespace) -> int:
     if result.ok and result.plan["candidate_artifact"]["exact_pin_ready"]:
         try:
             manifest = approval_manifest(result.plan, result.plan_digest)
+            approval_issue = str(getattr(args, "approval_issue", "") or "")
+            marker = (
+                render_approval_note(manifest, approval_issue)
+                if approval_issue
+                else ""
+            )
         except OfflineRolloutActionError as exc:
             payload["approval_ready"] = False
             payload["approval_reason"] = str(exc)
         else:
             payload["approval_manifest"] = manifest
-            payload["approval_note"] = render_approval_note(manifest)
-            payload["approval_ready"] = True
+            payload["required_approval_marker"] = marker or None
+            payload["approval_ready"] = bool(marker)
+            if not marker:
+                payload["approval_reason"] = "approval_issue_required"
     elif result.ok:
         payload["approval_ready"] = False
     if getattr(args, "json", False):
@@ -203,6 +211,15 @@ def register_herdr_offline_rollout_parser(herdr_sub, *, add_repo_option=None) ->
     if add_repo_option is not None:
         add_repo_option(plan)
     plan.add_argument("--json", action="store_true", help="Emit canonical structured JSON")
+    plan.add_argument(
+        "--approval-issue",
+        default="",
+        metavar="ISSUE",
+        help=(
+            "Bind the emitted required_approval_marker to this exact Redmine issue. "
+            "Without it the full manifest is emitted but approval_ready is false."
+        ),
+    )
     plan.set_defaults(func=cmd_herdr_offline_rollout_plan)
 
     delegate = sub.add_parser(

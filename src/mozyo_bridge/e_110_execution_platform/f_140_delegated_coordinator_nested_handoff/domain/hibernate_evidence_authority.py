@@ -59,6 +59,9 @@ MARKER_GATE_REVIEW_RESULT = "review_result"
 #: Redmine #14661: the guarded live-worker refresh's owner-approval gate (Design Answer j#92641).
 GATE_WORKER_REFRESH_OWNER_APPROVAL = "worker_refresh_owner_approval"
 
+#: Redmine #14838: the shared-home global offline-rollout approval gate (ruling j#97993).
+GATE_HERDR_OFFLINE_ROLLOUT_OWNER_APPROVAL = "herdr_offline_rollout_owner_approval"
+
 #: Redmine #14695: the direct-owner review waiver for a no-change investigation (Design
 #: Consultation Answer j#93406). Its token is defined in :mod:`.no_change_review_waiver`; it is
 #: re-declared as a literal here rather than imported, because that module imports this one for
@@ -69,6 +72,8 @@ GATE_NO_CHANGE_REVIEW_WAIVER = "no_change_review_waiver"
 HIBERNATE_EVIDENCE_RULING = "redmine:#14219:j#85530:Q3"
 #: The ruling that decided the worker-refresh owner-approval gate's writer contract.
 WORKER_REFRESH_APPROVAL_RULING = "redmine:#14661:j#92641"
+#: The ruling that binds the global offline-rollout approval record to the coordinator writer.
+HERDR_OFFLINE_ROLLOUT_APPROVAL_RULING = "redmine:#14838:j#97993"
 #: The ruling that decided the no-change review waiver gate's writer contract. It names THIS gate
 #: and decides its writer axis, which is what #14661 j#92715 requires of a ruling pointer: an
 #: anchor whose target is silent about the gate makes ``is_anchored`` pass while pointing at a
@@ -116,6 +121,10 @@ _KIND_ISSUER = {
     # writer pass as the owner. Registered HERE rather than in a second map, because this is
     # the single gate->role authority and a parallel table would drift from it.
     GATE_WORKER_REFRESH_OWNER_APPROVAL: ISSUER_COORDINATOR,
+    # Redmine #14838 ruling j#97993: the coordinator records the owner's exact global-cutover
+    # decision.  The marker's approval_source=direct_owner is the independent provenance axis;
+    # this mapping only establishes the canonical writer role.
+    GATE_HERDR_OFFLINE_ROLLOUT_OWNER_APPROVAL: ISSUER_COORDINATOR,
     # Redmine #14695 Design Consultation Answer j#93406: the no-change review waiver's canonical
     # writer is likewise the COORDINATOR, and for the same two-axis reason. The governed preset
     # aggregates owner decisions at the coordinator role, which records the durable journal; that
@@ -140,6 +149,7 @@ _KIND_RULING = {
     EVIDENCE_DOGFOOD_DELEGATED: HIBERNATE_EVIDENCE_RULING,
     EVIDENCE_PARK_DECLARED: HIBERNATE_EVIDENCE_RULING,
     GATE_WORKER_REFRESH_OWNER_APPROVAL: WORKER_REFRESH_APPROVAL_RULING,
+    GATE_HERDR_OFFLINE_ROLLOUT_OWNER_APPROVAL: HERDR_OFFLINE_ROLLOUT_APPROVAL_RULING,
     GATE_NO_CHANGE_REVIEW_WAIVER: NO_CHANGE_REVIEW_WAIVER_RULING,
 }
 
@@ -317,9 +327,11 @@ def check_issuer(kind: str, issuer: ResolvedIssuer, *, envelope) -> "str | None"
 
 
 __all__ = [
+    "GATE_HERDR_OFFLINE_ROLLOUT_OWNER_APPROVAL",
     "GATE_NO_CHANGE_REVIEW_WAIVER",
     "GATE_WORKER_REFRESH_OWNER_APPROVAL",
     "HIBERNATE_EVIDENCE_RULING",
+    "HERDR_OFFLINE_ROLLOUT_APPROVAL_RULING",
     "NO_CHANGE_REVIEW_WAIVER_RULING",
     "WORKER_REFRESH_APPROVAL_RULING",
     "contract_ruling_pointer",

@@ -573,25 +573,42 @@ Table naming:
         `plan_digest` とし、後続の owner approval は exact digest・全 workspace/assigned name・
         unrelated classification・schema transition・artifact pin・global stop・forward-only を列挙する。
         旧 runtime への rollback は認めず、失敗時も新 runtime で前進復旧する。
-      - `plan --json` は上記列挙をcanonicalな2行approval noteとして併記する。`delegate` はfresh
-        planを再生成してdigest一致を要求し、`ISSUE:JOURNAL` のjournal本文がその2行とbyte-exact、
-        かつjournal authorがissue authorと一致する場合だけdirect owner approvalと認める。prose、
-        wrapper、末尾改行、非canonical JSON、別digest/targetはapprovalではない。
+      - `plan --json --approval-issue <issue>` は上記列挙を `approval_manifest` として表示し、その
+        full manifest + issueをdigestへ畳んだcanonical `required_approval_marker` を併記する。
+        `delegate` はfresh planを再生成してdigest一致を要求し、`ISSUE:JOURNAL` のexact journalに
+        `gate=herdr_offline_rollout_owner_approval` / `approval_source=direct_owner` /
+        `decision=approved` / exact effect・issue・action digestを持つworkflow-event markerが
+        **ちょうど1個**ある場合だけ候補にする。quoted prose / code fence / duplicate・unknown・
+        reordered field / 別digestはapprovalではない。
+        issuer軸はsource-system author ID（このworkspaceでは全roleが同じID）から推定しない。
+        canonical writer `coordinator` を、gate固有ruling (`#14838 j#97993`) + committed
+        `.mozyo-bridge/config.yaml` blob + exact journal/gate evidenceの3部anchorで解決し、markerの
+        direct-owner判断軸と連言する。どちらか一方だけではglobal stopをauthorizeしない。
       - `delegate --execute` は全workspace pathと全agent locatorをpublic planへ混ぜずprivateに
         再captureし、planのidentity集合とexact一致させる。`${MOZYO_BRIDGE_HOME}/
         offline-rollout-actions-v1/<action-id>/` (0700、record 0600、payload SHA-256 seal、exclusive
-        nonblocking lock) にactionをreserveしてから、candidate wheelをexact SHA-256で検証した
+        nonblocking lock) にactionをreserveしてから、candidate wheelをexact SHA-256で検証する。
+        action idはexact plan digest + approval pointerから決定論的に導出し、同じ承認の並行delegateは
+        同じlock / recordへ収束して2本目のrunnerをlaunchしない。runner準備以前の失敗を新actionで
+        やり直す場合も、別journalのfresh owner approvalを要求する。
         独立venvとRunAtLoad/KeepAlive=falseのone-shot LaunchAgentを準備・bootstrapする。更新対象
-        pipx env自身をrunnerにしない。
+        pipx env自身をrunnerにしない。candidateのversion/capability probeはsource `PYTHONPATH` 等を
+        除去したenvで行い、versionはsubstringではなく単一exact tokenで照合する。
       - `run --execute` はLaunchAgentが注入したexact action tokenを持ち、かつ
         `MOZYO_AGENT_ROLE` / `MOZYO_WORKSPACE_ID`を持たないconsumer外processだけをadmitする。
+        expected launchd labelを副作用前にprivate actionへ固定し、run時に同labelのlive jobを
+        readbackする。同一OS user内での暗号的identity分離ではないため、sealed action / exact token /
+        managed-consumer不在 / launchd bindingの連言をこの境界の保証上限とする。
         actionのphase prefixと各readback receiptを1 phaseごとにatomic保存し、crash/retryは未完
-        phaseから前進する。phase順はplanの
+        phaseから前進する。effect前にactive intentが既にdurableだった場合だけreplayと分類し、同じ
+        runの最初の `mark_phase_started` はreplay authorityにしない。phase順はplanの
         `supervisor stop → non-top stop → top stop → zero → backup → 3 migration → exact install →
         top first → remaining → supervisor pair → final verify`から変更しない。
-      - 最初のagent closeより前に、dirty workspaceごとにtracked/index binary patch、Git index、
-        untracked path/archiveをprivate directoryへ保存し、planのcontent-sensitive WIP digestを
-        再照合する。stash/reset/checkoutは行わない。closeはplan時のassigned-name + locatorの
+      - 各stop phaseは、そのphaseが停止するworkspaceだけについてclose前にtracked/index binary
+        patch、Git index、untracked path/archiveをprivate directoryへ保存し、planの
+        content-sensitive WIP digestを再照合する。non-top phaseがまだliveなtop workspaceのsnapshotを
+        先取りしない。workspace idはpath componentに使わずhashしたprivate directoryへ格納する。
+        stash/reset/checkoutは行わない。closeはplan時のassigned-name + locatorの
         exact generationだけを対象とし、同名different locator、foreign/unmanaged row、inventory
         unreadableはzero-progress refusal。既にabsentなexact planned nameはcrash replayとしてのみ
         goal stateへ畳み、consumer=0をfresh raw/projection countの連言で確認する。

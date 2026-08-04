@@ -25,6 +25,8 @@ from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.appl
     PhaseExecutionResult,
 )
 from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.domain.offline_rollout_action import (  # noqa: E501
+    OFFLINE_ROLLOUT_APPROVAL_GATE,
+    approval_fields,
     canonical_bytes,
     parse_approval_note,
 )
@@ -70,6 +72,21 @@ def _bounded(result: subprocess.CompletedProcess[str]) -> str:
     return ((result.stderr or "") or (result.stdout or "")).strip()[:1000]
 
 
+def _sanitized_runtime_env(env: Mapping[str, str]) -> dict[str, str]:
+    """Keep source-tree injection from impersonating the installed candidate."""
+    clean = dict(env)
+    for name in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "__PYVENV_LAUNCHER__"):
+        clean.pop(name, None)
+    return clean
+
+
+def _reports_exact_version(stdout: object, expected: object) -> bool:
+    """Accept one exact CLI version token, never a substring such as a4 in a41."""
+    if not isinstance(stdout, str) or not isinstance(expected, str) or not expected:
+        return False
+    return stdout.splitlines() == [f"mozyo-bridge {expected}"]
+
+
 class LiveOfflineRolloutExecutionPort:
     def __init__(
         self,
@@ -85,30 +102,47 @@ class LiveOfflineRolloutExecutionPort:
     # -- owner authority / private target capture ---------------------------------
 
     def verify_owner_approval(self, *, issue: str, journal: str, manifest):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_lane_topology import (  # noqa: E501
+            committed_config_policy_pointer,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
+            check_issuer_resolution,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_issuer_policy import (  # noqa: E501
+            resolve_journal_issuer,
+        )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E501
             LiveRedmineJournalSource,
         )
 
+        if self.repo_root is None:
+            return _fail("owner_approval_policy_unavailable")
         try:
             source = LiveRedmineJournalSource.from_environment()
             entries = [
                 entry for entry in source.read_entries(issue) if entry.journal_id == journal
             ]
-            issue_author = source.read_issue_author_id(issue)
         except Exception as exc:  # noqa: BLE001 - unreadable authority is never approval
             return _fail("owner_approval_unreadable", type(exc).__name__)
-        if len(entries) != 1 or not issue_author:
+        if len(entries) != 1:
             return _fail("owner_approval_unresolved")
         entry = entries[0]
-        if not entry.author_id or entry.author_id != issue_author:
+        policy_pointer = committed_config_policy_pointer(self.repo_root)
+        issuer = resolve_journal_issuer(
+            journal_id=entry.journal_id,
+            notes=entry.notes,
+            policy_pointer=policy_pointer,
+        )
+        if check_issuer_resolution(OFFLINE_ROLLOUT_APPROVAL_GATE, issuer):
             return _fail("owner_approval_issuer_mismatch")
         try:
             observed = parse_approval_note(entry.notes)
         except Exception as exc:  # noqa: BLE001 - parser supplies the fail-closed contract
             return _fail("owner_approval_malformed", str(exc))
-        if canonical_bytes(observed) != canonical_bytes(manifest):
+        expected = approval_fields(manifest, issue)
+        if canonical_bytes(observed) != canonical_bytes(expected):
             return _fail("owner_approval_plan_mismatch")
-        return _ok(approval_verified=True)
+        return _ok(approval_verified=True, issuer_role=issuer.role)
 
     def capture_private_bindings(self, *, plan):
         from mozyo_bridge.core.state.workspace_registry import list_workspaces
@@ -179,12 +213,15 @@ class LiveOfflineRolloutExecutionPort:
         artifact = plan["candidate_artifact"]
         runner_root = action_directory / "runner"
         artifacts = action_directory / "artifacts"
+        clean_env = _sanitized_runtime_env(self.env)
         try:
             runner_root.mkdir(mode=0o700, exist_ok=False)
             artifacts.mkdir(mode=0o700, exist_ok=False)
             venv = runner_root / "venv"
             created = _run(
-                [sys.executable, "-m", "venv", str(venv)], timeout=_RUN_TIMEOUT
+                [sys.executable, "-m", "venv", str(venv)],
+                timeout=_RUN_TIMEOUT,
+                env=clean_env,
             )
             if created.returncode != 0:
                 return _fail("runner_venv_failed", _bounded(created))
@@ -203,6 +240,7 @@ class LiveOfflineRolloutExecutionPort:
                     f"mozyo-bridge=={artifact['version']}",
                 ],
                 timeout=_INSTALL_TIMEOUT,
+                env=clean_env,
             )
             if downloaded.returncode != 0:
                 return _fail("candidate_download_failed", _bounded(downloaded))
@@ -219,21 +257,30 @@ class LiveOfflineRolloutExecutionPort:
                     str(wheels[0]),
                 ],
                 timeout=_INSTALL_TIMEOUT,
+                env=clean_env,
             )
             if installed.returncode != 0:
                 return _fail("runner_install_failed", _bounded(installed))
             cli = venv / "bin" / "mozyo-bridge"
-            checked = _run([str(cli), "--version"], timeout=_RUN_TIMEOUT)
-            if checked.returncode != 0 or artifact["version"] not in checked.stdout:
+            checked = _run(
+                [str(cli), "--version"], timeout=_RUN_TIMEOUT, env=clean_env
+            )
+            if checked.returncode != 0 or not _reports_exact_version(
+                checked.stdout, artifact["version"]
+            ):
                 return _fail("runner_provenance_failed", _bounded(checked))
             capability = _run(
                 [str(cli), "herdr", "offline-rollout", "run", "--help"],
                 timeout=_RUN_TIMEOUT,
+                env=clean_env,
             )
             if capability.returncode != 0:
                 return _fail("runner_candidate_incompatible", _bounded(capability))
             return _ok(
-                cli=str(cli), wheel=str(wheels[0]), wheel_sha256=_sha256(wheels[0])
+                cli=str(cli),
+                wheel=str(wheels[0]),
+                wheel_sha256=_sha256(wheels[0]),
+                launchd_label=self._runner_label(action_id),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             return _fail("runner_prepare_failed", type(exc).__name__)
@@ -257,6 +304,8 @@ class LiveOfflineRolloutExecutionPort:
         if not Path(herdr_binary).is_file():
             return _fail("herdr_binary_unavailable")
         label = self._runner_label(action_id)
+        if action["private_bindings"].get("runner", {}).get("launchd_label") != label:
+            return _fail("runner_launch_binding_mismatch")
         plist_path = action_directory / "runner.plist"
         log_path = action_directory / "runner.log"
         plist = {
@@ -302,11 +351,31 @@ class LiveOfflineRolloutExecutionPort:
             return _fail("external_runner_token_mismatch")
         if self.env.get("MOZYO_AGENT_ROLE") or self.env.get("MOZYO_WORKSPACE_ID"):
             return _fail("runner_is_managed_consumer")
-        return _ok(external_runner=True)
+        if sys.platform != "darwin":
+            return _fail("unsupported_platform")
+        from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.infrastructure.offline_rollout_action_store import (  # noqa: E501
+            OfflineRolloutActionStore,
+        )
+
+        try:
+            action = OfflineRolloutActionStore(self.home).load(action_id)
+            expected = action["private_bindings"]["runner"]["launchd_label"]
+        except Exception as exc:  # noqa: BLE001 - no private binding means no runner authority
+            return _fail("runner_launch_binding_unreadable", type(exc).__name__)
+        if expected != self._runner_label(action_id):
+            return _fail("runner_launch_binding_mismatch")
+        observed = _run(
+            ["/bin/launchctl", "print", f"gui/{os.getuid()}/{expected}"],
+            timeout=30.0,
+            env=_sanitized_runtime_env(self.env),
+        )
+        if observed.returncode != 0:
+            return _fail("runner_launchd_job_unverified", _bounded(observed))
+        return _ok(external_runner=True, launchd_label=expected)
 
     # -- phase execution -----------------------------------------------------------
 
-    def execute_phase(self, *, phase, action, action_directory):
+    def execute_phase(self, *, phase, action, action_directory, replaying=False):
         name = str(phase.get("phase") or "")
         handlers = {
             "supervisor_stop": self._supervisor_stop,
@@ -328,6 +397,14 @@ class LiveOfflineRolloutExecutionPort:
         if handler is None:
             return _fail("unknown_phase", name)
         try:
+            if name in {
+                "migrate_attestation",
+                "migrate_lane_lifecycle",
+                "migrate_startup_transaction",
+            }:
+                return handler(
+                    phase, action, action_directory, replaying=bool(replaying)
+                )
             return handler(phase, action, action_directory)
         except subprocess.TimeoutExpired:
             return _fail("phase_timeout", name)
@@ -363,7 +440,9 @@ class LiveOfflineRolloutExecutionPort:
             return _fail("supervisor_stop_unverified", str(result.get("reason") or ""))
         return _ok(supervisors_stopped=True)
 
-    def _ensure_wip_snapshots(self, action, action_directory):
+    def _ensure_wip_snapshots(
+        self, action, action_directory, *, workspace_ids=None
+    ):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_boundary import (  # noqa: E501
             read_live_worktree_fingerprint,
         )
@@ -371,9 +450,15 @@ class LiveOfflineRolloutExecutionPort:
         root = action_directory / "wip"
         root.mkdir(mode=0o700, exist_ok=True)
         paths = self._bindings(action)["workspace_paths"]
+        selected = None if workspace_ids is None else set(workspace_ids)
         for row in action["plan"]["workspaces"]:
             workspace_id = row["workspace_id"]
-            target = root / workspace_id
+            if selected is not None and workspace_id not in selected:
+                continue
+            # Registry IDs are authority tokens, not trusted path segments.  Hashing keeps every
+            # snapshot inside the sealed action even if an old/imported registry row contains
+            # separators or dot components.
+            target = root / hashlib.sha256(workspace_id.encode("utf-8")).hexdigest()
             manifest_path = target / "manifest.json"
             current = read_live_worktree_fingerprint(Path(paths[workspace_id]), 30.0)
             if not current.readable or current.digest != row["wip"]["digest"]:
@@ -382,7 +467,10 @@ class LiveOfflineRolloutExecutionPort:
                 continue
             if manifest_path.is_file():
                 recorded = json.loads(manifest_path.read_text(encoding="utf-8"))
-                if recorded.get("wip_digest") != current.digest:
+                if (
+                    recorded.get("workspace_id") != workspace_id
+                    or recorded.get("wip_digest") != current.digest
+                ):
                     return _fail("wip_snapshot_mismatch", workspace_id)
                 files = recorded.get("files")
                 expected_files = {
@@ -446,7 +534,11 @@ class LiveOfflineRolloutExecutionPort:
                     tar.add(full, arcname=relative, recursive=False)
             archive.chmod(0o600)
             outputs["untracked.tar"] = _sha256(archive)
-            manifest = {"wip_digest": current.digest, "files": outputs}
+            manifest = {
+                "workspace_id": workspace_id,
+                "wip_digest": current.digest,
+                "files": outputs,
+            }
             manifest_path.write_bytes(canonical_bytes(manifest) + b"\n")
             manifest_path.chmod(0o600)
         return _ok(wip_snapshots_verified=True)
@@ -464,7 +556,18 @@ class LiveOfflineRolloutExecutionPort:
         settled = self._wait_for_settled_empty(action, names, bindings)
         if not settled.ok:
             return settled
-        preserved = self._ensure_wip_snapshots(action, action_directory)
+        current_workspace = action["plan"]["current_workspace_id"]
+        if phase.get("phase") == "top_workspace_stop":
+            workspace_ids = {current_workspace}
+        else:
+            workspace_ids = {
+                row["workspace_id"]
+                for row in action["plan"]["workspaces"]
+                if row["workspace_id"] != current_workspace
+            }
+        preserved = self._ensure_wip_snapshots(
+            action, action_directory, workspace_ids=workspace_ids
+        )
         if not preserved.ok:
             return preserved
         for name in names:
@@ -557,7 +660,9 @@ class LiveOfflineRolloutExecutionPort:
 
         return {row.name: row.to_record() for row in _store_snapshots(self.home)}
 
-    def _require_store_phase_authority(self, action, *, store_name, phase_name):
+    def _require_store_phase_authority(
+        self, action, *, store_name, phase_name, replaying
+    ):
         """Re-check the approved store immediately before its migration effect.
 
         A byte-exact predecessor is the normal first attempt.  The target version is
@@ -573,6 +678,7 @@ class LiveOfflineRolloutExecutionPort:
             isinstance(observed, Mapping)
             and observed.get("state") == "recognized"
             and observed.get("version") == planned.get("target_version")
+            and replaying is True
             and action.get("active_phase") == phase_name
             and "verified_backup" in action.get("completed_phases", ())
         ):
@@ -620,7 +726,9 @@ class LiveOfflineRolloutExecutionPort:
             startup_backup_digest=startup_digest,
         )
 
-    def _migrate_attestation(self, _phase, action, _directory):
+    def _migrate_attestation(
+        self, _phase, action, _directory, *, replaying=False
+    ):
         from mozyo_bridge.core.state.herdr_identity_attestation import (
             herdr_identity_attestation_path,
         )
@@ -634,6 +742,7 @@ class LiveOfflineRolloutExecutionPort:
             action,
             store_name="attestation",
             phase_name="migrate_attestation",
+            replaying=replaying,
         )
         if not authority.ok:
             return authority
@@ -644,7 +753,9 @@ class LiveOfflineRolloutExecutionPort:
             return _fail("attestation_migration_unverified")
         return _ok(outcome=result.outcome, to_version=observed.version)
 
-    def _migrate_lane_lifecycle(self, _phase, action, _directory):
+    def _migrate_lane_lifecycle(
+        self, _phase, action, _directory, *, replaying=False
+    ):
         from mozyo_bridge.core.state.lane_lifecycle_readonly import (
             probe_lane_lifecycle_schema,
         )
@@ -658,6 +769,7 @@ class LiveOfflineRolloutExecutionPort:
             action,
             store_name="lane_lifecycle",
             phase_name="migrate_lane_lifecycle",
+            replaying=replaying,
         )
         if not authority.ok:
             return authority
@@ -667,7 +779,17 @@ class LiveOfflineRolloutExecutionPort:
             return _fail("lane_lifecycle_migration_unverified")
         return _ok(action=outcome.action, to_version=observed.version)
 
-    def _migrate_startup_transaction(self, _phase, action, action_directory):
+    def _migrate_startup_transaction(
+        self, _phase, action, action_directory, *, replaying=False
+    ):
+        authority = self._require_store_phase_authority(
+            action,
+            store_name="startup_transaction",
+            phase_name="migrate_startup_transaction",
+            replaying=replaying,
+        )
+        if not authority.ok:
+            return authority
         from mozyo_bridge.core.state.startup_store_migration import (
             MigrationCompletionReceipt,
             artifact_digest_of,
@@ -714,15 +836,20 @@ class LiveOfflineRolloutExecutionPort:
         artifact = action["plan"]["candidate_artifact"]
         if _sha256(wheel) != artifact["wheel_sha256"]:
             return _fail("candidate_wheel_digest_mismatch")
+        clean_env = _sanitized_runtime_env(self.env)
         installed = _run(
             [bindings["pipx"], "install", "--force", str(wheel)],
             timeout=_INSTALL_TIMEOUT,
-            env=self.env,
+            env=clean_env,
         )
         if installed.returncode != 0:
             return _fail("runtime_install_failed", _bounded(installed))
-        checked = _run([bindings["target_cli"], "--version"], timeout=30.0)
-        if checked.returncode != 0 or artifact["version"] not in checked.stdout:
+        checked = _run(
+            [bindings["target_cli"], "--version"], timeout=30.0, env=clean_env
+        )
+        if checked.returncode != 0 or not _reports_exact_version(
+            checked.stdout, artifact["version"]
+        ):
             return _fail("runtime_install_unverified", _bounded(checked))
         return _ok(version=artifact["version"], wheel_sha256=artifact["wheel_sha256"])
 
@@ -747,7 +874,11 @@ class LiveOfflineRolloutExecutionPort:
                 argv += ["--lane", lane_id]
             for row in sorted(rows, key=lambda item: item["provider"]):
                 argv += ["--agent", row["provider"]]
-            result = _run(argv, timeout=_INSTALL_TIMEOUT, env=self.env)
+            result = _run(
+                argv,
+                timeout=_INSTALL_TIMEOUT,
+                env=_sanitized_runtime_env(self.env),
+            )
             if result.returncode != 0:
                 return _fail("workspace_restore_failed", _bounded(result))
             try:
@@ -841,10 +972,14 @@ class LiveOfflineRolloutExecutionPort:
         if not supervisors.ok:
             return supervisors
         checked = _run(
-            [self._bindings(action)["target_cli"], "--version"], timeout=30.0
+            [self._bindings(action)["target_cli"], "--version"],
+            timeout=30.0,
+            env=_sanitized_runtime_env(self.env),
         )
         version = action["plan"]["candidate_artifact"]["version"]
-        if checked.returncode != 0 or version not in checked.stdout:
+        if checked.returncode != 0 or not _reports_exact_version(
+            checked.stdout, version
+        ):
             return _fail("final_runtime_provenance_mismatch")
         return _ok(
             final_verified=True,

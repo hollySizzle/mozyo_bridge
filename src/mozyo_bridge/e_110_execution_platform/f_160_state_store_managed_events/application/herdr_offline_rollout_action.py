@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Optional, Protocol
@@ -10,6 +9,7 @@ from typing import Mapping, Optional, Protocol
 from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.domain.offline_rollout_action import (  # noqa: E501
     OfflineRolloutActionError,
     approval_manifest,
+    deterministic_action_id,
     mark_blocked,
     mark_delegated,
     mark_phase_completed,
@@ -90,6 +90,7 @@ class OfflineRolloutExecutionPort(Protocol):
         phase: Mapping[str, object],
         action: Mapping[str, object],
         action_directory: Path,
+        replaying: bool,
     ) -> PhaseExecutionResult: ...
 
 
@@ -119,7 +120,6 @@ def delegate_offline_rollout(
     repo_root: Path,
     execute: bool,
     ops: Optional[OfflineRolloutExecutionPort] = None,
-    action_id: str = "",
 ) -> OfflineRolloutCommandResult:
     """Validate exact approval, persist the private action, and launch the one-shot.
 
@@ -153,7 +153,10 @@ def delegate_offline_rollout(
     bindings = port.capture_private_bindings(plan=plan)
     if not bindings.ok:
         return _blocked(bindings.reason or "private_binding_capture_failed", bindings.detail)
-    token = action_id or f"offline_{secrets.token_hex(16)}"
+    # The plan is a host-global operation authority, so its action identity is deterministic.
+    # Concurrent delegates of the same plan therefore contend on one action lock/record instead
+    # of launching independent global-stop runners from the same approval.
+    token = deterministic_action_id(plan_digest, owner_approval)
     store = OfflineRolloutActionStore(home)
     try:
         action = new_action(
@@ -236,10 +239,14 @@ def run_offline_rollout_action(
                     return OfflineRolloutCommandResult(
                         ok=True, state="completed", payload=public_status(action)
                     )
+                replaying = action.get("active_phase") == phase["phase"]
                 action = mark_phase_started(action, str(phase["phase"]))
                 store.save_locked(directory, action)
                 result = port.execute_phase(
-                    phase=phase, action=action, action_directory=directory
+                    phase=phase,
+                    action=action,
+                    action_directory=directory,
+                    replaying=replaying,
                 )
                 if not result.ok:
                     action = mark_blocked(
