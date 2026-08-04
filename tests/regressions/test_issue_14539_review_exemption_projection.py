@@ -3926,6 +3926,21 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "also renders, through the shared closed-vocabulary reader and the lane envelope's "
             "own renderer",
         ),
+        f"{_D}/domain/superseded_failure_correlation.py": (
+            ["*", "*", "*", "*:MARKER_RE"],
+            "reads (Redmine #14755): the successor's supersession acknowledgement gate, and the "
+            "gate-token half of qualifying a review_finding_verdict journal. Exactly-one-marker "
+            "rule per note for the acknowledgement — a second declaration of that gate, or one it "
+            "names but cannot read, poisons the note for the gate rather than yielding the "
+            "readable sibling; also renders the acknowledgement through the shared "
+            "closed-vocabulary reader",
+        ),
+        f"{_D}/domain/superseded_failure_terminal.py": (
+            ["*", "*", "*", "*", "*"],
+            "reads (Redmine #14755): the superseded-failure terminal declaration gate, located and "
+            "parsed through superseded_failure_correlation's single-scan reader (so the "
+            "exactly-one-marker rule is that module's); renders the declaration marker itself",
+        ),
         f"{_D}/domain/hibernate_park_record.py": (["handoff", "handoff"], "reads one marker per record"),
         f"{_D}/application/operator_startup_resume_leg.py": (
             ["*", "operator-startup-gate"],
@@ -4197,9 +4212,11 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "inherits via a used import of handoff, recovery_anchor_delivery; names no marker token itself",
         ),
         f"{_D}/application/retire_admissibility.py": (
-            ['*', '*', '*', '*'],
-            "inherits via a used import of hibernate_evidence_integration, redmine_journal_source "
-            "and (Redmine #14695) no_change_review_waiver; names no marker token itself",
+            ['*', '*', '*', '*', '*', '*'],
+            "inherits via a used import of hibernate_evidence_integration, redmine_journal_source, "
+            "(Redmine #14695) no_change_review_waiver and (Redmine #14755) "
+            "superseded_failure_terminal / superseded_failure_correlation; names no marker token "
+            "itself",
         ),
         f"{_D}/application/sublane_gateway_recovery_live.py": (
             ['*', '*', 'handoff', 'recovery-delivery-authorization', 'recovery-delivery-zero-send'],

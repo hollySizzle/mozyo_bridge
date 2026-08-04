@@ -720,6 +720,10 @@ class GateFacts:
     review_round_gate: str = ""
     review_round_conclusion: str = ""
     review_round_blocker: bool = False
+    #: Redmine #14755: the round ids themselves. The derived facts above are computed HERE so
+    #: glance and retire cannot differ (#14539 j#90137 F3); that holds because the #14755 terminal
+    #: is retire-only with NO glance projection, so exporting ids adds no authority to this fold.
+    review_round_journals: Tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -929,6 +933,7 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
         review_round_gate=round_gate,
         review_round_conclusion=round_conclusion,
         review_round_blocker=round_blocker,
+        review_round_journals=tuple(round_ids),
     )
 
 
