@@ -27,10 +27,27 @@ Boundaries:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Protocol
+import json
+from pathlib import Path
+from typing import Optional, Protocol, Sequence
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
     render_gate_note,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_finding_manifest import (
+    REASON_APPROVED_WITH_FINDINGS,
+    REASON_CHANGES_WITHOUT_FINDINGS,
+    REASON_FINDINGS_INPUT_INVALID,
+    ReviewFinding,
+    ReviewFindingManifestError,
+    REASON_FINDINGS_INPUT_MISSING,
+    REASON_FINDINGS_INPUT_UNREADABLE,
+    review_findings_from_payload,
+    render_review_result_note,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
+    REVIEW_APPROVED,
+    REVIEW_CHANGES_REQUESTED,
 )
 
 #: Receipt reason for a successful post.
@@ -64,6 +81,82 @@ class GateRecordReceipt:
         return {"recorded": self.recorded, "reason": self.reason, "location": self.location}
 
 
+@dataclass(frozen=True)
+class GateRecordAttempt:
+    """A gate-record attempt whose producer refusal is data, never a CLI traceback."""
+
+    receipt: Optional[GateRecordReceipt] = None
+    refusal: str = ""
+
+    def refusal_payload(self, issue: str, gate: str) -> dict[str, object]:
+        return {
+            "action": "emit-gate",
+            "issue": issue,
+            "gate": gate,
+            "recorded": False,
+            "reason": self.refusal,
+        }
+
+    def refusal_lines(self, issue: str, gate: str) -> tuple[str, ...]:
+        return (
+            "action: emit-gate",
+            f"issue: #{issue}",
+            f"gate: {gate}",
+            "recorded: False",
+            f"reason: {self.refusal}",
+        )
+
+
+def _closed_json_object(pairs):
+    """Build one JSON object while refusing duplicate member names (#14971)."""
+
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"duplicate JSON member: {key}")
+        out[key] = value
+    return out
+
+
+def review_findings_json_input(
+    raw_path: object,
+    gate: str,
+    marker_fields: Optional[dict],
+) -> tuple[Optional[Sequence[ReviewFinding]], Optional[str]]:
+    """Read the closed #14971 JSON input, returning findings or a typed refusal.
+
+    ``None`` findings are reserved for a non-review gate. A ``review_result`` returns an explicit
+    empty tuple for approval or one-or-more findings for ``changes_requested``; omission can never
+    masquerade as the canonical empty set.
+    """
+
+    if gate != "review_result":
+        return (None, "review_findings_wrong_gate") if raw_path else (None, None)
+    conclusion = str((marker_fields or {}).get("conclusion", "") or "")
+    if not raw_path:
+        if conclusion == REVIEW_APPROVED:
+            return (), None
+        return None, REASON_FINDINGS_INPUT_MISSING
+    if type(raw_path) is not str or raw_path != raw_path.strip() or not raw_path:
+        return None, REASON_FINDINGS_INPUT_UNREADABLE
+    try:
+        payload = json.loads(
+            Path(raw_path).read_text(encoding="utf-8"),
+            object_pairs_hook=_closed_json_object,
+        )
+    except (OSError, UnicodeError, ValueError):
+        return None, REASON_FINDINGS_INPUT_UNREADABLE
+    try:
+        findings = review_findings_from_payload(payload)
+    except ReviewFindingManifestError as exc:
+        return None, exc.reason or REASON_FINDINGS_INPUT_INVALID
+    if conclusion == REVIEW_APPROVED and findings:
+        return None, REASON_APPROVED_WITH_FINDINGS
+    if conclusion == REVIEW_CHANGES_REQUESTED and not findings:
+        return None, REASON_CHANGES_WITHOUT_FINDINGS
+    return findings, None
+
+
 def emit_gate_record(
     issue: str,
     gate: str,
@@ -71,6 +164,7 @@ def emit_gate_record(
     body: str = "",
     transport: Optional[NoteWriteTransport],
     marker_fields: Optional[dict] = None,
+    review_findings: Optional[Sequence[ReviewFinding]] = None,
 ) -> GateRecordReceipt:
     """Render a canonical gate note and post it via ``transport`` (fail-closed, opt-in).
 
@@ -79,8 +173,42 @@ def emit_gate_record(
     a :class:`DeliveryTransportError` from the transport maps to its explicit reason. ``gate`` must
     be a callback-required kind, else ``render_gate_note`` raises (a programming error, surfaced).
     """
-    notes = render_gate_note(gate, body=body, **(marker_fields or {}))
+    fields = marker_fields or {}
+    if gate == "review_result":
+        # Redmine #14971: every NEW canonical review_result is one atomic note whose prose finding
+        # blocks and dedicated manifest come from this structured sequence.  ``None`` means the
+        # caller used the pre-contract writer shape and is refused; ``()`` is the explicit empty
+        # set required for an approved review.
+        if review_findings is None:
+            raise ReviewFindingManifestError(
+                REASON_FINDINGS_INPUT_MISSING,
+                "a canonical review_result requires structured review_findings",
+            )
+        notes = render_review_result_note(
+            issue=issue,
+            body=body,
+            findings=review_findings,
+            marker_fields=fields,
+        )
+    else:
+        if review_findings is not None:
+            raise ReviewFindingManifestError(
+                "review_findings_wrong_gate",
+                "structured review findings are valid only for a review_result gate",
+            )
+        notes = render_gate_note(gate, body=body, **fields)
     return _post(issue, notes, transport)
+
+
+def attempt_emit_gate_record(*args, **kwargs) -> GateRecordAttempt:
+    """Call :func:`emit_gate_record`, projecting a typed producer refusal as data."""
+
+    try:
+        return GateRecordAttempt(receipt=emit_gate_record(*args, **kwargs))
+    except ReviewFindingManifestError as exc:
+        return GateRecordAttempt(
+            refusal=exc.reason or REASON_FINDINGS_INPUT_INVALID,
+        )
 
 
 def emit_progress_record(
@@ -141,7 +269,10 @@ __all__ = (
     "GATE_RECORD_OK",
     "GATE_RECORD_WRITE_OPTIN_UNSET",
     "NoteWriteTransport",
+    "GateRecordAttempt",
     "GateRecordReceipt",
+    "attempt_emit_gate_record",
     "emit_gate_record",
     "emit_progress_record",
+    "review_findings_json_input",
 )

@@ -593,6 +593,20 @@ class EmitGateReviewApprovalFenceTest(_CliTestCase):
         base.update(over)
         return _args(**base)
 
+    def _findings_json(self, identities=("1",), *, name="findings.json"):
+        p = Path(self._tmp.name) / name
+        p.write_text(
+            _json.dumps({
+                "version": 1,
+                "findings": [
+                    {"id": identity, "summary": f"finding {identity}"}
+                    for identity in identities
+                ],
+            }),
+            encoding="utf-8",
+        )
+        return str(p)
+
     def _run_json(self, ns):
         import contextlib
         import io
@@ -667,11 +681,102 @@ class EmitGateReviewApprovalFenceTest(_CliTestCase):
         # A changes_requested / finding / progress review_result carries no generation-admission
         # obligation, so it is not fenced even with no observation (back-compat).
         for decision in ("changes_requested", "finding", "progress"):
-            rc, out = self._run_json(self._emit_args(review_decision=decision))
+            rc, out = self._run_json(self._emit_args(
+                review_decision=decision,
+                review_findings_json=self._findings_json(name=f"{decision}.json"),
+            ))
             self.assertNotEqual(
                 out.get("reason"), "approval_requires_generation_observation_and_consumer",
                 f"{decision} should be unfenced",
             )
+
+    def test_changes_requested_without_structured_findings_is_zero_write(self):
+        rc, out = self._run_json(self._emit_args(review_decision="changes_requested"))
+        self.assertEqual(rc, 1)
+        self.assertFalse(out["recorded"])
+        self.assertEqual(out["reason"], "review_findings_input_missing")
+
+    def test_approved_review_with_nonempty_findings_is_zero_write(self):
+        rc, out = self._run_json(self._emit_args(
+            review_decision="approval",
+            review_findings_json=self._findings_json(),
+        ))
+        self.assertEqual(rc, 1)
+        self.assertEqual(out["reason"], "approved_review_carries_findings")
+
+    def test_malformed_duplicate_or_empty_findings_are_zero_write(self):
+        malformed = Path(self._tmp.name) / "malformed-findings.json"
+        malformed.write_text("{not json", encoding="utf-8")
+        duplicate = Path(self._tmp.name) / "duplicate-findings.json"
+        duplicate.write_text(
+            '{"version":1,"version":1,"findings":[{"id":"1","summary":"one"}]}',
+            encoding="utf-8",
+        )
+        for name, path, reason in (
+            ("malformed", malformed, "review_findings_input_unreadable"),
+            ("duplicate", duplicate, "review_findings_input_unreadable"),
+            ("empty", Path(self._findings_json(())), "changes_requested_review_has_no_findings"),
+        ):
+            with self.subTest(name=name):
+                rc, out = self._run_json(
+                    self._emit_args(
+                        review_decision="changes_requested",
+                        review_findings_json=str(path),
+                    )
+                )
+                self.assertEqual(rc, 1)
+                self.assertFalse(out["recorded"])
+                self.assertEqual(out["reason"], reason)
+
+    def test_findings_input_on_a_non_review_gate_is_zero_write(self):
+        rc, out = self._run_json(
+            self._emit_args(
+                gate="implementation_done",
+                review_findings_json=self._findings_json(),
+            )
+        )
+        self.assertEqual(rc, 1)
+        self.assertFalse(out["recorded"])
+        self.assertEqual(out["reason"], "review_findings_wrong_gate")
+
+    def test_changes_requested_posts_one_atomic_manifest_note(self):
+        from unittest.mock import patch
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            RedmineJournalEntry,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_finding_manifest import (  # noqa: E501
+            read_review_finding_manifest,
+        )
+
+        class Transport:
+            def __init__(self):
+                self.posts = []
+
+            def post_issue_note(self, issue_id, notes):
+                self.posts.append((issue_id, notes))
+                return f"redmine:issue={issue_id}"
+
+        transport = Transport()
+        with patch(
+            "mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure."
+            "redmine_note_transport.redmine_delivery_transport_from_env",
+            return_value=transport,
+        ), patch.object(cli, "_best_effort_emit_supervisor_wake", lambda args, issue: None):
+            rc, out = self._run_json(self._emit_args(
+                review_decision="changes_requested",
+                review_findings_json=self._findings_json(("1", "2")),
+            ))
+        self.assertEqual(rc, 0)
+        self.assertTrue(out["recorded"])
+        self.assertEqual(len(transport.posts), 1)
+        facts = read_review_finding_manifest(
+            RedmineJournalEntry(
+                issue_id="13586", journal_id="90001", notes=transport.posts[0][1]
+            )
+        )
+        self.assertTrue(facts.valid)
+        self.assertEqual(facts.findings, ("1", "2"))
 
     def test_non_review_result_gate_is_not_fenced(self):
         rc, out = self._run_json(self._emit_args(gate="implementation_done"))

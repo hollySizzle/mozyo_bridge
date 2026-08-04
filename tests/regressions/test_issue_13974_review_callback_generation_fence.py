@@ -759,6 +759,20 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
         )
         return str(p)
 
+    def _write_findings(self, name="review-findings.json"):
+        """The #14971 canonical review producer's structured material-finding input."""
+        import json as _json
+
+        p = self.home / name
+        p.write_text(
+            _json.dumps({
+                "version": 1,
+                "findings": [{"id": "1", "summary": "generation fence finding"}],
+            }),
+            encoding="utf-8",
+        )
+        return str(p)
+
     def test_producer_cli_e2e_current_row_delivers_exactly_once(self) -> None:
         # j#81496 F2: the ACTUAL --emit-gate CLI emits the v2 marker fields (head + req + conclusion),
         # so a fresh structured review round flows CLI -> captured Redmine journal -> supervisor and
@@ -770,6 +784,7 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
         res_note = self._emit_gate_via_cli(
             writer, "review_result", "--target-head", CUR_HEAD,
             "--review-request-journal", "110", "--review-decision", "changes_requested",
+            "--review-findings-json", self._write_findings(),
         )
         # The CLI-emitted review_result marker carries conclusion + head + req (not head/req only).
         self.assertIn("head=" + CUR_HEAD, res_note)

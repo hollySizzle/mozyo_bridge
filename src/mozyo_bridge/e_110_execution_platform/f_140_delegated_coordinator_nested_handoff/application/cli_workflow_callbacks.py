@@ -29,7 +29,8 @@ Actions (mutually exclusive):
   ``[mozyo:workflow-event:...]`` marker embedded, through the credential-gated, opt-in note
   transport. This is the production **producer** the watcher discovers; a not-recorded gate
   (opt-in ``write_optin_unset`` / transport failure) exits **non-zero** (fail-closed at the process
-  gate — a caller can never treat an un-written gate as recorded).
+  gate — a caller can never treat an un-written gate as recorded). A ``review_result`` renders
+  finding prose plus a manifest from ``--review-findings-json``; omission fails closed (#14971).
 
 Always exits 0 for a successful read / record / pass (``--emit-gate`` exits non-zero when the gate
 was NOT recorded); a source / store error is a
@@ -539,7 +540,8 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
 
     if getattr(args, "emit_gate", False):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_gate_record import (
-            emit_gate_record,
+            attempt_emit_gate_record,
+            review_findings_json_input,
         )
         from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_note_transport import (
             redmine_delivery_transport_from_env,
@@ -549,19 +551,23 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
         gate = (getattr(args, "gate", None) or "").strip()
         if not issue or not gate:
             raise SystemExit("--emit-gate requires --issue and --gate")
-        # #13518 review R3-F2: a review_result APPROVAL write is fenced BEFORE it is recorded when a
-        # durable review observation (--review-generation-json) + a --consumer-id are supplied. The
-        # durable single-consumer generation lease + the pre-approval reread fence refuse a duplicate
-        # consumer or a stale approval (a snapshot predating a newer unresolved blocking finding —
-        # the #13586 case). Refusal fails closed: nothing is written, exit non-zero.
+        # #13518 R3-F2: approval uses the durable generation lease + pre-write reread fence; a
+        # duplicate consumer or stale observation is a zero-write, non-zero-exit refusal.
         # #13974 j#81487 F2: a review_request / review_result gate MUST carry the v2 marker fields
         # (exact full target_head; review_result also its answered review_request journal + conclusion).
-        # The canonical producer refuses to write a head-less / req-less / malformed review marker
-        # rather than emit one the callback generation fence would fail closed. j#81506 F2: an approval
-        # write additionally exact-matches its generation-admission observation to these marker fields —
-        # a lease for another generation must never write this one's approved marker.
+        # The producer refuses malformed fields; approval also exact-matches the admission identity.
         marker_fields, marker_refusal = _review_gate_marker_fields(args, gate)
-        refusal = marker_refusal or _review_approval_refusal(args, issue, gate, marker_fields)
+        review_findings, finding_refusal = (
+            (None, None)
+            if marker_refusal is not None
+            else review_findings_json_input(
+                getattr(args, "review_findings_json", None), gate, marker_fields)
+        )
+        refusal = (
+            marker_refusal
+            or finding_refusal
+            or _review_approval_refusal(args, issue, gate, marker_fields)
+        )
         if refusal is not None:
             payload = {"action": "emit-gate", "issue": issue, "gate": gate,
                        "recorded": False, "reason": refusal}
@@ -573,10 +579,15 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
         # Credential-gated, opt-in production writer (MOZYO_REDMINE_DELIVERY_WRITE). None ->
         # write_optin_unset (nothing written, fail-closed — never a silent success).
         transport = redmine_delivery_transport_from_env()
-        receipt = emit_gate_record(
+        attempt = attempt_emit_gate_record(
             issue, gate, body=(getattr(args, "body", None) or ""), transport=transport,
-            marker_fields=marker_fields,
-        )
+            marker_fields=marker_fields, review_findings=review_findings)
+        if attempt.refusal:
+            _emit(attempt.refusal_payload(issue, gate), as_json=as_json,
+                  text_lines=attempt.refusal_lines(issue, gate))
+            return 1
+        receipt = attempt.receipt
+        assert receipt is not None
         payload = {"action": "emit-gate", "issue": issue, "gate": gate, **receipt.as_payload()}
         lines = [
             "action: emit-gate",
@@ -905,6 +916,13 @@ def register_callbacks(sub) -> None:
              "non-approval decision (changes_requested / finding / progress) is unfenced.",
     )
     p.add_argument("--body", help="Optional human-readable prose body for --emit-gate (the marker is appended).")
+    p.add_argument(
+        "--review-findings-json", dest="review_findings_json",
+        help="Review Finding Manifest v1 (#14971): UTF-8 JSON file "
+             "{\"version\":1,\"findings\":[{\"id\":\"1\",\"summary\":\"...\","
+             "\"details\":\"...\"}]}. Required and non-empty for a changes_requested "
+             "review_result; omission is the explicit empty approval set. One input renders both surfaces.",
+    )
     p.add_argument(
         "--target-head", dest="target_head",
         help="Review Generation Marker Contract v2 (#13974): the exact full commit head this review "
