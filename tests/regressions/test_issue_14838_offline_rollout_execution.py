@@ -87,6 +87,11 @@ class OfflineRolloutExecutionRegressionTests(unittest.TestCase):
         completed = subprocess.CompletedProcess([], 0, stdout="job = ready\n", stderr="")
         with (
             patch(
+                "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+                "application.herdr_offline_rollout_executor.sys.platform",
+                "darwin",
+            ),
+            patch(
                 "mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events."
                 "infrastructure.offline_rollout_action_store.OfflineRolloutActionStore.load",
                 return_value=binding,
