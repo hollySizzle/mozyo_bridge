@@ -399,6 +399,27 @@ class Post14741InstalledFixtureTests(unittest.TestCase):
         ])
         self.assertEqual(first, second)
 
+    def test_callback_fixture_proves_issue_journal_ownership_to_the_live_adapter(self):
+        """The positive callback smoke must satisfy #14246, not bypass its ownership gate."""
+        from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_anchor_source import (  # noqa: E501
+            LiveRedmineAnchorSource,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self._driver()._fresh_redmine_approval(
+                issue="14097",
+                journal="84000",
+                marker="gate [mozyo:workflow-event:gate=implementation_done]",
+            ) as env:
+                source = LiveRedmineAnchorSource.from_environment(
+                    environ=env, home=Path(directory)
+                )
+                observed = source.read_anchor("14097", "84000")
+
+        self.assertTrue(observed.issue_exists)
+        self.assertEqual(observed.observed_issue, "14097")
+        self.assertEqual(observed.journal_ids, ("84000",))
+
     def test_recover_failure_diagnostics_are_content_free(self):
         diagnostics = {}
         self._driver()._record_recover_diag(

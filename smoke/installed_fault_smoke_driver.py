@@ -673,7 +673,7 @@ def _drive_callback_exactly_once(cli: Path, tmp: Path, diagnostics: "dict | None
     fake.arm_transition(coord, "working")
     state = _write_state(fake, tmp, "cb_state.json")
 
-    def env():
+    def env(redmine_env: "dict | None" = None):
         e = _base_env(home, herdr_state=state)
         # The lane-sender identity this drive REQUIRES, stated explicitly rather than inherited
         # (Redmine #14248). The scenario is a lane agent firing one callback, so the herdr-native
@@ -682,16 +682,41 @@ def _drive_callback_exactly_once(cli: Path, tmp: Path, diagnostics: "dict | None
         e["MOZYO_WORKSPACE_ID"] = ws_id
         e["MOZYO_AGENT_ROLE"] = "codex"
         e["MOZYO_LANE_ID"] = "default"
+        # The nested Redmine handoff now verifies issue/journal ownership at action time
+        # (#14246).  Feed that positive authority through the same loopback-only trusted-reader
+        # boundary used by the recovery shapes; never let this hermetic smoke borrow an operator
+        # credential or weaken the production gate.
+        e.update(redmine_env or {})
         return _with_aligned_fake_codex_updater(e, tmp)
 
     common = ["--candidate", "14097:84000:coordinator:implementation_done",
               "--redmine-json", str(snap), "--workspace-id", ws_id, "--cursor", "84001", "--json"]
     # The deliver's nested `handoff send` attests the sender from the CWD anchor, so run under the
     # herdr repo whose anchor is this workspace (else env-vs-anchor workspace mismatch blocks it).
-    ing = _run(cli, ["workflow", "callbacks", "--ingest", *common], env(), cwd=str(repo))
-    d1 = _run(cli, ["workflow", "callbacks", "--deliver", "--workspace-id", ws_id, "--json"], env(), cwd=str(repo))
-    d2 = _run(cli, ["workflow", "callbacks", "--deliver", "--workspace-id", ws_id, "--json"], env(), cwd=str(repo))
-    sw = _run(cli, ["workflow", "callbacks", "--sweep", "--workspace-id", ws_id, "--json"], env(), cwd=str(repo))
+    with _fresh_redmine_approval(
+        issue="14097",
+        journal="84000",
+        marker="gate [mozyo:workflow-event:gate=implementation_done]",
+    ) as redmine_env:
+        ing = _run(
+            cli, ["workflow", "callbacks", "--ingest", *common],
+            env(redmine_env), cwd=str(repo),
+        )
+        d1 = _run(
+            cli,
+            ["workflow", "callbacks", "--deliver", "--workspace-id", ws_id, "--json"],
+            env(redmine_env), cwd=str(repo),
+        )
+        d2 = _run(
+            cli,
+            ["workflow", "callbacks", "--deliver", "--workspace-id", ws_id, "--json"],
+            env(redmine_env), cwd=str(repo),
+        )
+        sw = _run(
+            cli,
+            ["workflow", "callbacks", "--sweep", "--workspace-id", ws_id, "--json"],
+            env(redmine_env), cwd=str(repo),
+        )
     record: dict = {
         "ingest_exit": ing.returncode,
         "deliver1_exit": d1.returncode,
