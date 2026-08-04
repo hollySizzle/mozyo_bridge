@@ -592,9 +592,10 @@ class PreV8CompatibilityTest(_Fixture):
     def test_an_unresolvable_boundary_does_not_veto_minted_epoch(self) -> None:
         """An absent timestamp is irrelevant once the exact epoch proves the generation.
 
-        ``evaluate_pair_attestation`` skips the freshness comparison on an empty
-        ``fresh_after``, so a row with no boundary would otherwise be admitted on the locator
-        pin alone — precisely the survivor hole the gate exists to close.
+        The hibernate transition mints the epoch that a fresh launch receives in its immutable
+        process environment.  A survivor cannot acquire that value, so an exact attestation
+        distinguishes the generation without substituting another clock when the legacy
+        timestamp is absent.  This test admits only that minted-exact shape.
         """
         conn = sqlite3.connect(self.path)
         try:
@@ -729,6 +730,24 @@ class ReleasedLocatorFenceTest(_Fixture):
             f"blocked: {outcome.preflight.blocked_reasons} "
             f"({outcome.preflight.pair_attestation_detail})",
         )
+        self.assertEqual(self._rec().lane_disposition, DISPOSITION_ACTIVE)
+
+    def test_exact_epoch_replaces_released_locator_reuse_fence(self) -> None:
+        """#14955 Acceptance 2: locator reuse cannot veto exact epoch authority."""
+        self._resumed_once()
+        self._hibernate_again(released=(_GW_LOC, _WK_LOC), now=T_BACKDATED)
+        fence_ok, fence_reason = released_locator_verdict(
+            self._rec(), (_GW_LOC, _WK_LOC)
+        )
+        self.assertFalse(fence_ok)
+        self.assertEqual(fence_reason, FENCE_LOCATOR_REUSED)
+
+        outcome = self._resume(
+            ops=_FakeOps(observed_at=T_SURVIVOR, lane_epoch=_SECOND_EPOCH)
+        )
+
+        self.assertFalse(outcome.is_blocked)
+        self.assertNotIn(FENCE_LOCATOR_REUSED, outcome.preflight.pair_attestation_detail)
         self.assertEqual(self._rec().lane_disposition, DISPOSITION_ACTIVE)
 
     def test_exact_epoch_replaces_absent_release_evidence(self) -> None:

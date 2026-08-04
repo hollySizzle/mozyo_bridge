@@ -138,6 +138,18 @@ class MintedEpochAuthorityPrecedenceTest(unittest.TestCase):
             self.assertIsNone(outcome.transition)
             self.assertEqual(store.get(key).lane_disposition, DISPOSITION_HIBERNATED)
 
+    def test_one_slot_without_current_epoch_refuses_the_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, key = _hibernated_store(tmp)
+            outcome = _run(store, _Ops(worker_epoch=""))
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(
+                "claude: lane_epoch_attestation_absent",
+                outcome.preflight.pair_attestation_detail,
+            )
+            self.assertIsNone(outcome.transition)
+            self.assertEqual(store.get(key).lane_disposition, DISPOSITION_HIBERNATED)
+
     def test_unminted_epoch_cannot_promote_legacy_evidence_to_authority(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store, key = _hibernated_store(tmp)
