@@ -64,7 +64,9 @@ from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.
     RepoLocalConfigError,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
+    RESOLVED_TARGET_CAPABILITY_ARG,
     explicit_tmux_pane_target,
+    validate_resolved_target_capability,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.transport_binding import (
     TransportBinding,
@@ -156,13 +158,29 @@ def _resolve_herdr_binding(
         if lister is None:  # defensive: herdr_enabled implies non-None
             die("herdr backend selected but no agent lister could be resolved")
             raise AssertionError("unreachable")
-        resolver = functools.partial(
-            _herdr_native_assigned_name,
-            receiver=receiver,
-            repo_root=repo_root,
-            coordinator_provider=coordinator_provider,
-            lister=lister,
-        )
+        resolved_target_capability = getattr(args, RESOLVED_TARGET_CAPABILITY_ARG, None)
+        if resolved_target_capability is not None:
+            capability = validate_resolved_target_capability(
+                resolved_target_capability,
+                repo_root=repo_root,
+                target=getattr(args, "target", None),
+                target_repo=getattr(args, "target_repo", None),
+                target_lane=getattr(args, "target_lane", None),
+                receiver=receiver,
+            )
+            # The generic herdr rail normally derives an assigned name from the launch-time sender
+            # identity.  The external proxy has no such identity; it supplies the already-resolved
+            # target capability instead.  The transport binding still rebinds this durable name
+            # against a fresh inventory snapshot before every effect.
+            resolver = lambda: capability.assigned_name
+        else:
+            resolver = functools.partial(
+                _herdr_native_assigned_name,
+                receiver=receiver,
+                repo_root=repo_root,
+                coordinator_provider=coordinator_provider,
+                lister=lister,
+            )
         return resolve_runtime_transport_binding(
             config,
             tmux_run_tmux=_tmux_run_tmux,

@@ -40,6 +40,10 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.workspace_registry import read_anchor, register_workspace
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
+    RESOLVED_TARGET_CAPABILITY_ARG,
+    ResolvedHerdrTargetCapability,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     encode_assigned_name,
 )
@@ -243,6 +247,9 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         observe_spy=False,
         submit_delay="0",
         extra_argv=None,
+        receiver="claude",
+        proxy_target_locator=None,
+        caller_identity=None,
     ):
         from mozyo_bridge.application import commands  # noqa: F401 (import side effects)
         from mozyo_bridge.application.cli import build_parser
@@ -270,7 +277,7 @@ class PureHerdrEndToEndTest(unittest.TestCase):
             )
 
             argv = [
-                "handoff", "send", "--to", "claude",
+                "handoff", "send", "--to", receiver,
                 "--source", "asana", "--kind", "implementation_request",
                 "--task-id", "T1", "--comment-id", "C1",
                 "--mode", mode,
@@ -279,6 +286,23 @@ class PureHerdrEndToEndTest(unittest.TestCase):
             ]
             args = build_parser().parse_args(argv)
             args.repo = str(repo)
+            if proxy_target_locator is not None:
+                args.target = proxy_target_locator
+                args.target_lane = "default"
+                args.target_repo = str(repo)
+                setattr(
+                    args,
+                    RESOLVED_TARGET_CAPABILITY_ARG,
+                    ResolvedHerdrTargetCapability(
+                        workspace_id=workspace_id,
+                        lane_id="default",
+                        provider=receiver,
+                        assigned_name=encode_assigned_name(
+                            workspace_id, receiver, "default"
+                        ),
+                        locator=proxy_target_locator,
+                    ),
+                )
 
             # Simulate a pure herdr session: no tmux server. TMUX_PANE is unset by
             # default; a test may set it (``tmux_pane``) to prove the send makes ZERO
@@ -294,6 +318,8 @@ class PureHerdrEndToEndTest(unittest.TestCase):
                 env["MOZYO_WORKSPACE_ID"] = workspace_id
                 env["MOZYO_AGENT_ROLE"] = "codex"
                 env["MOZYO_LANE_ID"] = "lane-1"
+            if caller_identity is not None:
+                env.update(caller_identity)
 
             observe_mock = mock.MagicMock(side_effect=AssertionError(
                 "_observe_standard_turn_start must not run on the herdr+standard rail"
@@ -349,6 +375,41 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         self.assertIn("outcome started", out)
         self.assertIn("snapshot awaiting_input", out)
         self.assertIn("wait changed", out)
+
+    def test_proxy_target_ignores_foreign_caller_env_and_delivers_once(self) -> None:
+        """Redmine #14979 live-shape regression: external caller env is never sender authority."""
+
+        target_locator = "wT:pT"
+
+        def rows(ws):
+            return [
+                {
+                    "name": encode_assigned_name(ws, "codex", "default"),
+                    "pane_id": target_locator,
+                }
+            ]
+
+        result, herdr, ws, out, err = self._run(
+            agent_rows_fn=rows,
+            set_sender_env=False,
+            mode="queue-enter",
+            receiver="codex",
+            proxy_target_locator=target_locator,
+            caller_identity={
+                "MOZYO_WORKSPACE_ID": "ffffffffffffffffffffffffffffffff",
+                "MOZYO_AGENT_ROLE": "claude",
+                "MOZYO_LANE_ID": "foreign-lane",
+            },
+        )
+
+        self.assertEqual(result, 0, msg=f"out={out}\nerr={err}")
+        outcome = _outcome_from(out)
+        self.assertEqual(outcome.get("status"), "sent", msg=out)
+        self.assertEqual(outcome.get("reason"), "queue_enter", msg=out)
+        sends = [op for op in herdr.sends if op[0] == "send_text"]
+        self.assertEqual(len(sends), 1, msg=herdr.sends)
+        self.assertEqual(sends[0][1], target_locator)
+        self.assertNotEqual(ws, "ffffffffffffffffffffffffffffffff")
 
     def test_cross_lane_worker_fails_closed_at_resolution_no_tmux(self) -> None:
         # Redmine #13305: the route-authority convergence makes the herdr send path

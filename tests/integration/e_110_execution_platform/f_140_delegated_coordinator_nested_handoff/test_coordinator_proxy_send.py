@@ -35,6 +35,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
@@ -48,7 +49,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     CALLER_ENV_KEYS_NEVER_AUTHORITY,
     SEND_DELIVERED,
     SEND_FAILED,
+    ProxyContext,
     ProxySendOutcome,
+    ProxyTarget,
+    OrchestrateHandoffProxySendPort,
     DECISION_ACTION_FIELD,
     canonical_decision_in_journal,
     canonical_note_text,
@@ -91,6 +95,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ZERO_SEND,
     DecisionRecord,
     LaneExpectation,
+    ProxyLinks,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (  # noqa: E501
     SCHEMA_NAME,
@@ -103,6 +108,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     AGENT_KEY_LOCATOR,
     AGENT_KEY_NAME,
     encode_assigned_name,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (  # noqa: E501
+    RESOLVED_TARGET_CAPABILITY_ARG,
+    ResolvedHerdrTargetCapability,
 )
 
 WS = "e1487dcb1f2d4412b28e825fdeccf9e8"
@@ -189,6 +198,68 @@ class CountingSendPort:
     def send(self, context, action_id, *, args):
         self.calls.append((context.issue, context.journal, action_id))
         return ProxySendOutcome(result=self._result, rc=0 if self._result == SEND_DELIVERED else 1)
+
+
+class ConcreteSendPortTest(unittest.TestCase):
+    """The concrete port conveys target authority without inventing sender authority (#14979)."""
+
+    def test_it_builds_one_internal_capability_from_the_resolved_context(self) -> None:
+        target = _row(WS, "codex")[AGENT_KEY_NAME]
+        context = ProxyContext(
+            links=ProxyLinks(
+                action="known",
+                workspace="resolved",
+                authority="resolved",
+                provider="resolved",
+                target="ok",
+                anchor="verified",
+                fence="open",
+            ),
+            workspace_id=WS,
+            role=ROLE_COORDINATOR,
+            provider="codex",
+            target=ProxyTarget(
+                status=TARGET_OK,
+                assigned_name=target,
+                locator="w3:p1",
+            ),
+            issue=ISSUE,
+            journal=CURRENT_JOURNAL,
+        )
+        observed = {}
+
+        def _orchestrate(send_args, *, default_kind):
+            observed["args"] = send_args
+            observed["default_kind"] = default_kind
+            return 0
+
+        with patch(
+            "mozyo_bridge.application.commands.orchestrate_handoff", _orchestrate
+        ):
+            outcome = OrchestrateHandoffProxySendPort(
+                repo_root="/repo", receiver_provider="codex"
+            ).send(
+                context,
+                "pxy_action_1",
+                args=argparse.Namespace(action="bootstrap_lane"),
+            )
+
+        self.assertEqual(outcome.result, SEND_DELIVERED)
+        send_args = observed["args"]
+        self.assertEqual(observed["default_kind"], "custom")
+        self.assertEqual(send_args.target, "w3:p1")
+        self.assertEqual(send_args.target_repo, "/repo")
+        self.assertEqual(send_args.target_lane, "default")
+        self.assertEqual(
+            getattr(send_args, RESOLVED_TARGET_CAPABILITY_ARG),
+            ResolvedHerdrTargetCapability(
+                workspace_id=WS,
+                lane_id="default",
+                provider="codex",
+                assigned_name=target,
+                locator="w3:p1",
+            ),
+        )
 
 
 class ProxySendTestBase(unittest.TestCase):

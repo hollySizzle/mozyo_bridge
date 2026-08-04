@@ -508,6 +508,16 @@ vocabulary は closed であり、委譲は implementation request でも review
 の記録が何を渡されたかを相関できるようにする。summary は **ack を要求しない** — 求める応答動作が
 無いことを明示する（§3b）。
 
+external client には launch-time sender identity が無いため、通常 handoff の sender-env resolver を
+proxy delivery の authority にしてはならない。proxy は §2 で解決・attest した **target capability**
+（workspace / default lane / provider / mzb1 assigned name / live locator）を public flag ではない内部値
+として通常 handoff rail へ渡す。handoff rail は current checkout の workspace anchor、explicit
+target / lane / repo、assigned-name decode、live inventory の locator を送信前に再照合し、1 軸でも
+変化していれば `resolved_target_capability_mismatch` で zero-send する。caller process に残っている
+foreign `MOZYO_*` は読まず、正しい値を一時 export することもしない。target capability は sender
+identity ではないため、target agent を架空の sender として downstream gate へ投影しない。通常の
+lane-agent handoff は従来どおり launch-time sender env を要求する。
+
 **outcome write の CAS 結果は必ず観測する。** `mark_delivered` / `mark_uncertain` は generation が
 まだ `reserved` の場合にだけ成功する CAS である。競合 retry が送信中に reserve へ再入すると row は
 `uncertain` へ遷移し、その後 positive delivery が戻っても CAS は False になる。この結果を無視すると

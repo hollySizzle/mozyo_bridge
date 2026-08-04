@@ -94,6 +94,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
     HerdrSendEntryError,
+    ResolvedHerdrTargetCapability,
 )
 
 
@@ -129,6 +130,7 @@ class TargetResolutionRequest:
     record_command: Optional[str]
     resolved_target_repo: Optional[str]
     herdr_send: bool
+    resolved_herdr_target_capability: Optional[ResolvedHerdrTargetCapability] = None
 
 
 @dataclass(frozen=True)
@@ -165,6 +167,7 @@ class TargetResolutionOps(Protocol):
         target_repo: Optional[str],
         target_lane: Optional[str],
         receiver: str,
+        resolved_target_capability: Optional[ResolvedHerdrTargetCapability] = None,
     ) -> Dict[str, str]:
         """Resolve the herdr-native send target + synthesize its pane record (raises on failure)."""
         ...
@@ -287,6 +290,7 @@ class TargetResolutionUseCase:
                     target_repo=request.target_repo,
                     target_lane=request.target_lane,
                     receiver=request.receiver,
+                    resolved_target_capability=request.resolved_herdr_target_capability,
                 )
             except HerdrSendEntryError as exc:
                 self._emit_blocked(
@@ -460,6 +464,7 @@ class LiveTargetResolutionOps:
         target_repo: Optional[str],
         target_lane: Optional[str],
         receiver: str,
+        resolved_target_capability: Optional[ResolvedHerdrTargetCapability] = None,
     ) -> Dict[str, str]:
         from mozyo_bridge.application import commands as _commands
 
@@ -469,6 +474,7 @@ class LiveTargetResolutionOps:
             target_repo=target_repo,
             target_lane=target_lane,
             receiver=receiver,
+            resolved_target_capability=resolved_target_capability,
         )
 
     def pane_info(self, target_arg: str) -> Dict[str, str]:

@@ -215,6 +215,7 @@ active_herdr_turn_start_rail = None
 # instead of via the tmux pane resolver, so a pure herdr session (no tmux server)
 # routes. Strictly config-guarded; the tmux path is untouched.
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
+    RESOLVED_TARGET_CAPABILITY_ARG,
     herdr_effective_backend_selected,
     resolve_herdr_send_target,
 )
@@ -1793,11 +1794,9 @@ def orchestrate_handoff(
     # Redmine #13729 tranche 5: the handoff target-resolution preflight slice owns the herdr /
     # tmux target resolution, the `target_unavailable` `<session>:codex` gateway diagnostic, the
     # same-lane duplicate diagnostics, the `--target-repo auto` resolution, and the canonical
-    # `project_preflight_target` projection. It is carved into the typed
-    # ``handoff_target_resolution`` use case — the facade only assembles the typed request (the
-    # resolved `repo_root` + `herdr_send` backend predicate + the raw target scalars + the
-    # terminal-outcome context) and reads the resolved values back off the typed result, so no
-    # downstream gate reads a mutated Namespace attribute. The emitted blocked outcomes, the
+    # `project_preflight_target` projection. It is carved into the typed use case — the facade only
+    # assembles the typed request (resolved repo/backend + raw target + terminal-outcome context)
+    # and reads its result; downstream gates never read a mutated Namespace. Blocked outcomes,
     # printed diagnostics, the re-raised tmux resolver ``SystemExit``, and every ``die`` message
     # are byte-identical to the original inline block.
     _target_resolution = run_target_resolution(
@@ -1815,6 +1814,7 @@ def orchestrate_handoff(
             record_command=record_command,
             resolved_target_repo=resolved_target_repo,
             herdr_send=herdr_send,
+            resolved_herdr_target_capability=getattr(args, RESOLVED_TARGET_CAPABILITY_ARG, None),
         ),
         emit=_emit,
     )

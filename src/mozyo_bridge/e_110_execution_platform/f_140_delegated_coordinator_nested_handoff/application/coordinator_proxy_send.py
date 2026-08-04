@@ -790,6 +790,10 @@ class OrchestrateHandoffProxySendPort:
         import io
 
         from mozyo_bridge.application.commands import orchestrate_handoff
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (  # noqa: E501
+            RESOLVED_TARGET_CAPABILITY_ARG,
+            ResolvedHerdrTargetCapability,
+        )
 
         send_args = argparse.Namespace(**vars(args))
         send_args.to = self._receiver_provider
@@ -802,6 +806,17 @@ class OrchestrateHandoffProxySendPort:
         send_args.issue = context.issue
         send_args.journal = context.journal
         send_args.kind = "custom"
+        setattr(
+            send_args,
+            RESOLVED_TARGET_CAPABILITY_ARG,
+            ResolvedHerdrTargetCapability(
+                workspace_id=context.workspace_id,
+                lane_id=DEFAULT_LANE,
+                provider=context.provider,
+                assigned_name=context.target.assigned_name,
+                locator=context.target.locator,
+            ),
+        )
         send_args.summary = (
             f"coordinator proxy delegation: action={normalize_action(getattr(args, 'action', ''))} "
             f"role={context.role} lane={DEFAULT_LANE} anchor=redmine:issue={context.issue}:"

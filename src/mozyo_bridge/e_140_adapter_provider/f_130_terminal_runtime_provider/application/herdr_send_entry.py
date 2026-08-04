@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -54,7 +55,11 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     herdr_workspace_segment,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+    AGENT_KEY_NAME,
+    _agent_locator,
     _norm,
+    _norm_lane,
+    decode_assigned_name,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
     AGENT_PROVIDERS,
@@ -105,6 +110,190 @@ class HerdrExplicitTargetMismatchError(HerdrSendEntryError):
 
     def __init__(self, message: str):
         super().__init__(message, reason=EXPLICIT_TARGET_MISMATCH_OUTCOME_REASON)
+
+
+RESOLVED_TARGET_CAPABILITY_PURPOSE: str = "external_coordinator_proxy"
+RESOLVED_TARGET_CAPABILITY_MISMATCH: str = "resolved_target_capability_mismatch"
+RESOLVED_TARGET_CAPABILITY_ARG: str = "_mozyo_resolved_herdr_target_capability"
+
+
+@dataclass(frozen=True)
+class ResolvedHerdrTargetCapability:
+    """Internal capability for a target the coordinator-proxy already resolved.
+
+    This is deliberately a *target* capability, never a synthetic sender identity.  The external
+    coordinator client has no launch-time ``MOZYO_*`` authority, so the ordinary sender-scoped
+    route resolver must not be fed invented env values.  Instead the proxy carries the exact live
+    target it derived from the checkout anchor, durable role binding, provider binding, mzb1 name,
+    and generation-bound startup attestation.  The handoff rail revalidates the checkout frame,
+    decoded name, explicit target fields, and live locator before using it.
+
+    No public CLI flag constructs this value.  Merely having an instance is still insufficient:
+    :func:`validate_resolved_target_capability` joins every field back to the current repo and the
+    live inventory before any send.
+    """
+
+    workspace_id: str
+    lane_id: str
+    provider: str
+    assigned_name: str
+    locator: str
+    purpose: str = RESOLVED_TARGET_CAPABILITY_PURPOSE
+
+
+def _resolved_target_capability_error(detail: str) -> HerdrSendEntryError:
+    return HerdrSendEntryError(detail, reason=RESOLVED_TARGET_CAPABILITY_MISMATCH)
+
+
+def validate_resolved_target_capability(
+    capability: object,
+    *,
+    repo_root: Path,
+    target: str | None,
+    target_repo: str | None,
+    target_lane: str | None,
+    receiver: str,
+) -> ResolvedHerdrTargetCapability:
+    """Rejoin an internal pre-resolved target to the current handoff request.
+
+    Every comparison is exact after the public request's normal path resolution.  A mismatch is a
+    zero-send invariant failure; it never falls back to ``os.environ`` or the ordinary route scan.
+    """
+
+    if type(capability) is not ResolvedHerdrTargetCapability:
+        raise _resolved_target_capability_error(
+            "the internal resolved-target capability has an unexpected type"
+        )
+    cap = capability
+    fields = {
+        "workspace_id": cap.workspace_id,
+        "lane_id": cap.lane_id,
+        "provider": cap.provider,
+        "assigned_name": cap.assigned_name,
+        "locator": cap.locator,
+        "purpose": cap.purpose,
+    }
+    for key, value in fields.items():
+        if not isinstance(value, str) or not value or value != value.strip():
+            raise _resolved_target_capability_error(
+                f"the internal resolved-target capability has an invalid {key}"
+            )
+    if cap.purpose != RESOLVED_TARGET_CAPABILITY_PURPOSE:
+        raise _resolved_target_capability_error(
+            "the internal resolved-target capability has an unknown purpose"
+        )
+
+    root = Path(repo_root).expanduser().resolve()
+    anchor_workspace = herdr_workspace_segment(root)
+    if not anchor_workspace or cap.workspace_id != anchor_workspace:
+        raise _resolved_target_capability_error(
+            "the internal resolved target does not belong to this checkout workspace"
+        )
+    if _norm(receiver) != cap.provider:
+        raise _resolved_target_capability_error(
+            "the internal resolved target provider does not match the handoff receiver"
+        )
+    if _norm_lane(target_lane) != _norm_lane(cap.lane_id):
+        raise _resolved_target_capability_error(
+            "the internal resolved target lane does not match --target-lane"
+        )
+    if _norm(target) not in {cap.locator, cap.assigned_name}:
+        raise _resolved_target_capability_error(
+            "the internal resolved target does not match the explicit --target"
+        )
+    if not target_repo or target_repo == AUTO_TARGET_REPO:
+        raise _resolved_target_capability_error(
+            "the internal resolved target requires an explicit --target-repo"
+        )
+    try:
+        requested_root = Path(target_repo).expanduser().resolve()
+    except (OSError, ValueError) as exc:
+        raise _resolved_target_capability_error(
+            "the internal resolved target's --target-repo is unreadable"
+        ) from exc
+    if requested_root != root:
+        raise _resolved_target_capability_error(
+            "the internal resolved target's --target-repo is not this checkout"
+        )
+
+    decoded = decode_assigned_name(cap.assigned_name)
+    identity = decoded.identity if decoded.ok else None
+    if (
+        identity is None
+        or identity.workspace_id != cap.workspace_id
+        or identity.role != cap.provider
+        or _norm_lane(identity.lane_id) != _norm_lane(cap.lane_id)
+    ):
+        raise _resolved_target_capability_error(
+            "the internal resolved target's assigned name does not encode its claimed unit"
+        )
+    return cap
+
+
+def _resolve_capability_target(
+    capability: object,
+    *,
+    repo_root: Path,
+    target: str | None,
+    target_repo: str | None,
+    target_lane: str | None,
+    receiver: str,
+    config: TerminalTransportConfig,
+) -> dict:
+    """Rebind a validated capability to one unchanged live row and synthesize its pane record."""
+
+    cap = validate_resolved_target_capability(
+        capability,
+        repo_root=repo_root,
+        target=target,
+        target_repo=target_repo,
+        target_lane=target_lane,
+        receiver=receiver,
+    )
+    try:
+        lister = resolve_agent_lister(config)
+        if lister is None:
+            raise _resolved_target_capability_error(
+                "herdr backend selected but no agent lister could be resolved"
+            )
+        rows = lister.list_agent_rows()
+    except TerminalTransportError as exc:
+        raise HerdrSendEntryError(
+            f"herdr inventory unavailable: {exc}", reason=getattr(exc, "reason", None)
+        ) from exc
+
+    matches = [
+        row
+        for row in rows
+        if isinstance(row, dict) and _norm(row.get(AGENT_KEY_NAME)) == cap.assigned_name
+    ]
+    if len(matches) != 1:
+        raise _resolved_target_capability_error(
+            "the internal resolved target no longer has exactly one live assigned-name row"
+        )
+    live_locator = _agent_locator(matches[0]) or ""
+    if not live_locator or live_locator != cap.locator:
+        raise _resolved_target_capability_error(
+            "the internal resolved target's live locator changed before handoff"
+        )
+
+    return {
+        "id": cap.locator,
+        "location": "",
+        "window_name": cap.provider,
+        "command": cap.provider,
+        "pane_active": "1",
+        "agent_role": "",
+        "workspace_id": cap.workspace_id,
+        "lane_id": _norm_lane(cap.lane_id),
+        "cwd": str(Path(repo_root).expanduser().resolve()),
+        "herdr_assigned_name": cap.assigned_name,
+        # An external proxy is intentionally NOT represented as a lane sender.  The proxy's
+        # durable decision/fence authority is upstream; these fields stay empty so no downstream
+        # gate can accidentally promote the target unit into a fabricated sender identity.
+        "herdr_sender_workspace_id": "",
+        "herdr_sender_lane_id": "",
+    }
 
 
 def _terminal_transport_config_for_root(
@@ -244,6 +433,7 @@ def resolve_herdr_send_target(
     target_repo: str | None,
     target_lane: str | None,
     receiver: str,
+    resolved_target_capability: ResolvedHerdrTargetCapability | None = None,
 ) -> dict:
     """Resolve the herdr-native send target and synthesize its pane record (fail-closed).
 
@@ -273,6 +463,20 @@ def resolve_herdr_send_target(
         raise HerdrSendEntryError(
             "herdr send target requested but the herdr backend is not selected",
             reason="backend_not_selected",
+        )
+    if resolved_target_capability is not None:
+        # External-client coordinator proxy only: the proxy already derived and startup-attested
+        # one exact target from authorities the caller cannot assert.  Revalidate that target and
+        # its live locator directly.  Do not read or synthesize a sender identity — the external
+        # client intentionally has none, and foreign caller MOZYO_* must be irrelevant.
+        return _resolve_capability_target(
+            resolved_target_capability,
+            repo_root=repo_root,
+            target=target,
+            target_repo=target_repo,
+            target_lane=target_lane,
+            receiver=receiver,
+            config=config,
         )
     # Redmine #13377 (design j#73613): the sender's own workspace segment. A lane agent
     # (gateway / worker) runs in a linked git worktree, whose segment now resolves to the
@@ -497,6 +701,11 @@ __all__ = (
     "HerdrSendEntryError",
     "HerdrExplicitTargetMismatchError",
     "EXPLICIT_TARGET_MISMATCH_OUTCOME_REASON",
+    "RESOLVED_TARGET_CAPABILITY_PURPOSE",
+    "RESOLVED_TARGET_CAPABILITY_MISMATCH",
+    "RESOLVED_TARGET_CAPABILITY_ARG",
+    "ResolvedHerdrTargetCapability",
+    "validate_resolved_target_capability",
     "explicit_tmux_pane_target",
     "herdr_backend_selected",
     "herdr_effective_backend_selected",

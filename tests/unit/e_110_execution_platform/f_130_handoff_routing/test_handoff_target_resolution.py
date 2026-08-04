@@ -58,6 +58,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
     HerdrSendEntryError,
+    ResolvedHerdrTargetCapability,
 )
 
 _AUTO = "auto"
@@ -127,6 +128,9 @@ class _FakeOps:
     herdr_auto_diag: List[tuple] = field(default_factory=list)
     herdr_auto_calls: List[tuple] = field(default_factory=list)
     workspace_root_calls: List[str] = field(default_factory=list)
+    resolved_capabilities: List[Optional[ResolvedHerdrTargetCapability]] = field(
+        default_factory=list
+    )
 
     def resolve_herdr_send_target(
         self,
@@ -136,8 +140,10 @@ class _FakeOps:
         target_repo: Optional[str],
         target_lane: Optional[str],
         receiver: str,
+        resolved_target_capability: Optional[ResolvedHerdrTargetCapability] = None,
     ) -> Dict[str, str]:
         self.events.append("herdr_resolve")
+        self.resolved_capabilities.append(resolved_target_capability)
         if self.herdr_error is not None:
             raise self.herdr_error
         assert self.herdr_target_info is not None
@@ -213,6 +219,7 @@ def _request(
     target: Optional[str] = "%pT",
     resolved_target_repo: Optional[str] = None,
     anchor: Optional[NormalizedAnchor] = None,
+    resolved_target_capability: Optional[ResolvedHerdrTargetCapability] = None,
 ) -> TargetResolutionRequest:
     return TargetResolutionRequest(
         repo_root=Path("/repo"),
@@ -228,6 +235,7 @@ def _request(
         record_command=None,
         resolved_target_repo=resolved_target_repo,
         herdr_send=herdr_send,
+        resolved_herdr_target_capability=resolved_target_capability,
     )
 
 
@@ -257,6 +265,30 @@ class HerdrResolutionTest(unittest.TestCase):
         self.assertIs(result.preflight_target, ops.projection)
         self.assertEqual(ops.dup_calls, [])
         self.assertEqual(ops.emitted, [])
+
+    def test_internal_resolved_target_capability_reaches_the_live_resolution_port(self) -> None:
+        capability = ResolvedHerdrTargetCapability(
+            workspace_id="ws-1",
+            lane_id="default",
+            provider="claude",
+            assigned_name="mzb1_wsZ2D1_claude_default",
+            locator="w3:p1",
+        )
+        ops = _FakeOps(herdr_target_info={"id": "w3:p1"})
+
+        result, raised = _run(
+            ops,
+            _request(
+                herdr_send=True,
+                target="w3:p1",
+                resolved_target_repo="/repo",
+                resolved_target_capability=capability,
+            ),
+        )
+
+        self.assertIsNone(raised)
+        self.assertIsNotNone(result)
+        self.assertEqual(ops.resolved_capabilities, [capability])
 
     def test_herdr_error_target_unavailable_emits_and_dies(self) -> None:
         ops = _FakeOps(herdr_error=HerdrSendEntryError("no live agent", reason="no_single_agent"))

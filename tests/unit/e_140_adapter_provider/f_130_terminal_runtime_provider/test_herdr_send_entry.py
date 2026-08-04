@@ -33,8 +33,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     encode_assigned_name,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
+    RESOLVED_TARGET_CAPABILITY_MISMATCH,
     HerdrExplicitTargetMismatchError,
     HerdrSendEntryError,
+    ResolvedHerdrTargetCapability,
     explicit_tmux_pane_target,
     herdr_backend_selected,
     herdr_effective_backend_selected,
@@ -60,13 +62,14 @@ def _effective_from_args(args):
     )
 
 
-def _resolve_from_args(args, *, receiver):
+def _resolve_from_args(args, *, receiver, resolved_target_capability=None):
     return resolve_herdr_send_target(
         repo_root=repo_root_from_args(args),
         target=getattr(args, "target", None),
         target_repo=getattr(args, "target_repo", None),
         target_lane=getattr(args, "target_lane", None),
         receiver=receiver,
+        resolved_target_capability=resolved_target_capability,
     )
 
 
@@ -261,6 +264,118 @@ class ResolveHerdrSendTargetTest(unittest.TestCase):
             with self.assertRaises(HerdrSendEntryError) as c:
                 self._resolve(ctx)
             self.assertEqual(c.exception.reason, "backend_not_selected")
+
+
+class ResolvedTargetCapabilityTest(unittest.TestCase):
+    """Redmine #14979: proxy delivery never inherits a foreign caller identity."""
+
+    @staticmethod
+    def _args(ctx, *, locator="wT:pT"):
+        ns = argparse.Namespace()
+        ns.repo = str(ctx.repo)
+        ns.to = "codex"
+        ns.target = locator
+        ns.target_repo = str(ctx.repo)
+        ns.target_lane = "default"
+        return ns
+
+    @staticmethod
+    def _capability(ctx, *, locator="wT:pT"):
+        return ResolvedHerdrTargetCapability(
+            workspace_id=ctx.workspace_id,
+            lane_id="default",
+            provider="codex",
+            assigned_name=encode_assigned_name(ctx.workspace_id, "codex", "default"),
+            locator=locator,
+        )
+
+    @staticmethod
+    def _foreign_env(ctx):
+        env = ctx.env(with_sender=False)
+        env.update(
+            {
+                "MOZYO_WORKSPACE_ID": "ffffffffffffffffffffffffffffffff",
+                "MOZYO_AGENT_ROLE": "claude",
+                "MOZYO_LANE_ID": "foreign-lane",
+            }
+        )
+        return env
+
+    def test_foreign_caller_env_is_irrelevant_to_pre_resolved_proxy_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(
+                tmp,
+                rows=lambda ws: [
+                    {
+                        "name": encode_assigned_name(ws, "codex", "default"),
+                        "pane_id": "wT:pT",
+                    }
+                ],
+            )
+            with patch("subprocess.run", ctx.run), patch.dict(
+                os.environ, self._foreign_env(ctx), clear=True
+            ):
+                pane = _resolve_from_args(
+                    self._args(ctx),
+                    receiver="codex",
+                    resolved_target_capability=self._capability(ctx),
+                )
+
+        self.assertEqual(pane["id"], "wT:pT")
+        self.assertEqual(pane["workspace_id"], ctx.workspace_id)
+        self.assertEqual(pane["lane_id"], "default")
+        # The proxy is not rewritten into a fictional lane sender.
+        self.assertEqual(pane["herdr_sender_workspace_id"], "")
+        self.assertEqual(pane["herdr_sender_lane_id"], "")
+
+    def test_locator_drift_is_zero_send_instead_of_rebinding_to_a_new_process(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(
+                tmp,
+                rows=lambda ws: [
+                    {
+                        "name": encode_assigned_name(ws, "codex", "default"),
+                        "pane_id": "wNEW:p9",
+                    }
+                ],
+            )
+            with patch("subprocess.run", ctx.run), patch.dict(
+                os.environ, self._foreign_env(ctx), clear=True
+            ):
+                with self.assertRaises(HerdrSendEntryError) as caught:
+                    _resolve_from_args(
+                        self._args(ctx),
+                        receiver="codex",
+                        resolved_target_capability=self._capability(ctx),
+                    )
+
+        self.assertEqual(caught.exception.reason, RESOLVED_TARGET_CAPABILITY_MISMATCH)
+        self.assertIn("locator changed", str(caught.exception))
+
+    def test_capability_cannot_be_replayed_against_another_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(tmp)
+            foreign_capability = ResolvedHerdrTargetCapability(
+                workspace_id="ffffffffffffffffffffffffffffffff",
+                lane_id="default",
+                provider="codex",
+                assigned_name=encode_assigned_name(
+                    "ffffffffffffffffffffffffffffffff", "codex", "default"
+                ),
+                locator="wT:pT",
+            )
+            with patch("subprocess.run", ctx.run), patch.dict(
+                os.environ, self._foreign_env(ctx), clear=True
+            ):
+                with self.assertRaises(HerdrSendEntryError) as caught:
+                    _resolve_from_args(
+                        self._args(ctx),
+                        receiver="codex",
+                        resolved_target_capability=foreign_capability,
+                    )
+
+        self.assertEqual(caught.exception.reason, RESOLVED_TARGET_CAPABILITY_MISMATCH)
+        self.assertIn("does not belong", str(caught.exception))
 
 
 class CrossWorkspaceHerdrSendTargetTest(unittest.TestCase):
