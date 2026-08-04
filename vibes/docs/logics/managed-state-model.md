@@ -442,8 +442,10 @@ Table naming:
       - **pane-id 再利用による false refusal は安全方向として受容** (A.4)。tmux が pane-id を
         再利用すると genuine relaunch が拒否され得る。typed detail に `released_locator_reuse` を
         出すので、operator は真の survivor と切り分けられる。
-      - resume は **この fence と既存の attestation / provider / multiplicity / declared-pin fence
-        すべて**を満たしたときのみ可 (A.3 / A.6)。いずれも緩めない。
+      - pre-#14756 resume は **この fence と既存の attestation / provider / multiplicity /
+        declared-pin fenceすべて**を満たしたときのみ可 (A.3 / A.6)。#14756 のmint済みlane epochは
+        timestamp / released-locatorというgeneration証明だけを置換する。identity / provider /
+        multiplicity / declared-pin / release-settled / ownership / CAS fenceは緩めない。
       - **fence の権威は `release_pins` 単体ではない** (#14477 review j#94570 R3-F1 →
         disposition j#94582 A″)。旧実装は locator 件数で「release が完全か」を判定していたが、
         件数は完全性を証明しない: **別 locator 2 件を記録すれば count は充足し交差も起きず、
@@ -481,10 +483,16 @@ Table naming:
       `open_next_generation`) は本 field を **UPDATE 列に含めない**ことで保存する。
       R4 review (j#94707 R4-F1) は「field を足したら reset する writer も同数ある」を検出したが、
       本 field はその **逆向きの義務** — reset してはならない writer を列挙する — を負う。
-    - **消費**: managed launch が read-only reader で読み `MOZYO_LANE_EPOCH` として注入し、agent が
-      自 env で観測した raw token を startup attestation (v3) に記録する。resume は両 slot の
-      attested epoch が hibernate epoch より strictly newer のときのみ admit する。詳細と
-      fail-closed vocabulary は `vibes/docs/specs/herdr-native-identity.md` §2 を読む。
+    - **消費 / authority precedence**: managed launch が read-only readerで読み
+      `MOZYO_LANE_EPOCH` として注入し、agentが自envで観測したraw tokenをstartup attestation
+      (v3)へ記録する。resumeはまずlifecycle rowのepoch authorityを分類する。mint済みなら、両slotの
+      attested epochがhibernate epochよりstrictly newer (= current epochとexact一致) のときのみ
+      admitし、legacy timestamp / released-locator generation fenceは評価しない。この置換が
+      clock rollback、pane-id再利用、release evidence absentでの恒久false refusalを除く。
+      unminted / malformedなstored epochはlegacy fenceを代替authorityへ格上げせず
+      `lane_epoch_authority_unavailable`でfail-closedする。identity / provider / multiplicity /
+      declared-pin / release-settled / ownership / CAS fenceは常に維持する。詳細とfail-closed vocabularyは
+      `vibes/docs/specs/herdr-native-identity.md` §2を読む。
     - **launch path は read のみ**。epoch は hibernate CAS でしか発行されないので、launch は
       write も migration も増やさない (`#### read-compatible / write-migrating split` の
       「read は migrate しない」契約を維持する)。store が読めない場合は注入せず launch は

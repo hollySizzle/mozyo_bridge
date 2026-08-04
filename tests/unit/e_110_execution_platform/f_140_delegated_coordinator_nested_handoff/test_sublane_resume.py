@@ -4,8 +4,8 @@ Drives :class:`SublaneResumeUseCase` over a fake IO port (fake live herdr invent
 fake attestation reads — resume closes nothing and launches nothing) and a real
 :class:`LaneLifecycleStore` over a temp home. Covers the fail-closed preflight (lane
 hibernated, release settled, issue not re-owned, fresh pair both-slots-live +
-generation-matched attested), the disposition CAS (hibernated -> active), the freshness
-guard (a lingering pre-hibernate pane with a stale locator never attests), the in-flight
+generation-matched attested), the disposition CAS (hibernated -> active), epoch precedence
+(minted exact epoch replaces timestamp/released-locator generation evidence), the in-flight
 release / owner-conflict guards, and idempotent already-active.
 """
 
@@ -91,9 +91,10 @@ def _attest(
     ``lane_epoch`` defaults to the epoch a lane hibernated ONCE has minted (Redmine #14756),
     because that is what a genuine relaunch of these fixtures' pairs would have received. It
     is a parameter so a test can attest a PRE-hibernate epoch — what a survivor carries.
-    Supplying it weakens nothing these tests pin: the epoch is an ADDITIONAL conjunct, so
-    every refusal asserted here is still asserted for the reason it was written for. Without
-    it those tests would pass for a second, unrelated reason, i.e. vacuously.
+    A minted exact epoch is the generation authority, so timestamp and released-locator
+    evidence are deliberately irrelevant to resume. Tests for a pre-hibernate survivor pass
+    an absent/old epoch explicitly; otherwise they would describe an impossible process that
+    survived while somehow receiving the post-hibernate environment.
     """
     return IdentityAttestationRecord(
         assigned_name=encode_assigned_name(WS, role, lane),
@@ -316,29 +317,22 @@ class SublaneResumeTest(unittest.TestCase):
                 store.get(LaneLifecycleKey(WS, LANE)).lane_disposition, DISPOSITION_ACTIVE
             )
 
-    def test_refuses_when_hibernate_left_no_release_evidence(self) -> None:
-        """A lane hibernated with NO release generation no longer resumes (Redmine #14477).
-
-        This inverts the previous expectation deliberately, under coordinator disposition
-        j#94544 A.2. The row cannot distinguish "no process existed at hibernate" from "a
-        survivor existed and no release evidence was recorded", and review j#94531 R2-F1 showed
-        the timestamp cannot separate them either. Absence of evidence is therefore not read as
-        freshness. The stated cost: such a lane needs a completed release generation before the
-        standard resume rail will admit it.
-        """
+    def test_minted_epoch_replaces_missing_release_evidence(self) -> None:
+        """#14955: exact epoch answers the question missing release evidence cannot."""
         with tempfile.TemporaryDirectory() as tmp:
             store = self._store(tmp)
             self._hibernated(store, released=False)
             outcome = SublaneResumeUseCase(ops=_fresh_pair_ops(), store=store).run(
                 _request(), execute=True
             )
-            self.assertTrue(outcome.is_blocked)
-            self.assertIn(
+            self.assertFalse(outcome.is_blocked)
+            self.assertTrue(outcome.transition.applied)
+            self.assertNotIn(
                 "release_evidence_absent", outcome.preflight.pair_attestation_detail
             )
             self.assertEqual(
                 store.get(LaneLifecycleKey(WS, LANE)).lane_disposition,
-                DISPOSITION_HIBERNATED,
+                DISPOSITION_ACTIVE,
             )
 
     def test_blocks_when_pair_not_both_slots_live(self) -> None:
@@ -464,14 +458,13 @@ class SublaneResumeTest(unittest.TestCase):
                 DISPOSITION_HIBERNATED,
             )
 
-    def test_survived_pane_with_matching_locator_is_not_fresh(self) -> None:
+    def test_survived_pane_with_matching_locator_has_no_minted_epoch(self) -> None:
         # The adversarial defect (Finding 4): a pane that SURVIVED hibernate's release keeps
         # its tmux pane-id locator and still matches its own PRE-hibernate attestation — the
         # locator alone cannot tell a survivor from a relaunch. Here both slots are live at
         # their original locators AND their attestations are locator-matched (would pass the
-        # #13637 join), but their `observed_at` PREDATES the hibernation. The temporal
-        # freshness anchor must reject it: resume must never flip a survivor to active as a
-        # "fresh pair" (that would return the OLD agent context, violating cold-restart).
+        # #13637 join), but they carry no epoch minted by the hibernate transition. That
+        # immutable process-env fact rejects the survivor without using its old timestamp.
         with tempfile.TemporaryDirectory() as tmp:
             store = self._store(tmp)
             self._hibernated(store, released=True)
@@ -483,10 +476,10 @@ class SublaneResumeTest(unittest.TestCase):
                 # Locators MATCH the live rows (the panes survived), but the records were
                 # written BEFORE hibernation (STALE_AT < HIBERNATE_AT).
                 encode_assigned_name(WS, "codex", LANE): _attest(
-                    "codex", LANE, f"{WS}:p12", observed_at=STALE_AT
+                    "codex", LANE, f"{WS}:p12", observed_at=STALE_AT, lane_epoch=""
                 ),
                 encode_assigned_name(WS, "claude", LANE): _attest(
-                    "claude", LANE, f"{WS}:p13", observed_at=STALE_AT
+                    "claude", LANE, f"{WS}:p13", observed_at=STALE_AT, lane_epoch=""
                 ),
             }
             ops = _FakeOps(rows=rows, attestations=attest)
@@ -495,7 +488,10 @@ class SublaneResumeTest(unittest.TestCase):
             )
             self.assertTrue(outcome.is_blocked)
             self.assertIn(BLOCK_PAIR_ATTESTATION, outcome.preflight.blocked_reasons)
-            self.assertIn("stale_generation", outcome.preflight.pair_attestation_detail)
+            self.assertIn(
+                "lane_epoch_attestation_absent",
+                outcome.preflight.pair_attestation_detail,
+            )
             self.assertIsNone(outcome.transition)
             self.assertEqual(
                 store.get(LaneLifecycleKey(WS, LANE)).lane_disposition,
@@ -542,15 +538,11 @@ class SublaneResumeTest(unittest.TestCase):
                 _request(), execute=True
             )
             self.assertTrue(outcome.is_blocked)
-            # Redmine #14477: an in-flight release is also INCOMPLETE release evidence, so the
-            # pair cannot be proven a post-release generation either. Both reasons are correct
-            # and both are asserted — the in-flight blocker is still named first.
+            # The exact epoch proves the pair generation, but release actuation is still in
+            # flight. That independent state-machine fence remains blocking.
             self.assertEqual(
                 outcome.preflight.blocked_reasons,
-                (BLOCK_RELEASE_IN_FLIGHT, BLOCK_PAIR_ATTESTATION),
-            )
-            self.assertIn(
-                "release_evidence_absent", outcome.preflight.pair_attestation_detail
+                (BLOCK_RELEASE_IN_FLIGHT,),
             )
             self.assertIsNone(outcome.transition)
             self.assertEqual(

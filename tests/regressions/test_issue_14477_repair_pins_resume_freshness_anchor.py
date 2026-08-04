@@ -19,14 +19,15 @@ with ``hibernated_at`` (schema v8) stamped ONLY at T0. Pinned here:
 1. **acceptance 1** — that exact ordering resumes through the standard semantic rail, with no
    glass-break, and the mechanism is pinned directly (the repair moves ``updated_at`` and
    leaves ``hibernated_at`` byte-equal) rather than only its outcome;
-2. **acceptance 2** — a REAL pre-hibernate survivor (attested before T0) still fails closed
-   ``stale_generation`` after the very same repair;
+2. **acceptance 2** — a REAL pre-hibernate survivor still fails closed. Redmine #14756 /
+   #14955 supersede the timestamp reason at the resume integration boundary: the survivor's
+   immutable process env lacks the epoch minted at T0, so the epoch verdict now refuses it;
 3. **acceptance 3** — metadata-only writes (declared-pin repair, release request / outcome)
    never move the boundary;
 4. **acceptance 4** — resume still atomically adopts the exact fresh declared pin snapshot,
    and the provider-binding fence still blocks;
 5. **acceptance 5** — a pre-v8 row (no anchor) stays readable WITHOUT migrating the store, and
-   gets NO substitute boundary: the freshness half fails CLOSED. Review j#94515 F1 / verdict
+   gets NO substitute boundary. Review j#94515 F1 / verdict
    j#94520 measured the alternative — standing ``updated_at`` in for the boundary admitted a
    genuine pre-hibernate survivor, because ``updated_at`` is not monotonic (no writer on this
    component validates its caller-supplied ``now`` against the row's prior stamp). That exact
@@ -34,11 +35,12 @@ with ``hibernated_at`` (schema v8) stamped ONLY at T0. Pinned here:
 6. the anchor's own lifecycle: cleared on rehydrate, re-stamped on the next hibernation, and
    its inbound-edge enumeration DERIVED from the public transition policy rather than recalled,
    so a future edge into ``hibernated`` cannot quietly bypass the stamp;
-7. the CLOCK-INDEPENDENT survivor fence (``ReleasedLocatorFenceTest``) — review j#94531 R2-F1,
+7. the historical CLOCK-INDEPENDENT survivor fence (``ReleasedLocatorFenceTest``) — review j#94531 R2-F1,
    disposition j#94544 A. A backdated stamp defeats the timestamp, so the generation is
    discriminated by the locators hibernate's release closed: the same locator refuses,
    all-different resumes, absent evidence refuses. The timestamp is a liveness boundary only;
-   it is never called the generation proof anywhere in this module.
+   it is never called the generation proof anywhere in this module. #14756/#14955 replace
+   this resume authority with lane epoch while retaining these pure helper characterizations.
 8. the fence's own REMAINING hole (``ReleaseObservationBindingTest``) — review j#94570 R3-F1.
    ``release_pins`` is driver-enumerated on the public hibernate rail but the store-level
    ``request_release`` accepts arbitrary pins, so a direct store caller can record locators
@@ -220,10 +222,9 @@ def _attest(
     ``lane_epoch`` defaults to the epoch a lane hibernated ONCE has minted (Redmine #14756),
     because that is what a genuine relaunch of these fixtures' pairs would have received. It
     is a parameter rather than a constant so a test can attest a PRE-hibernate epoch, which
-    is what a survivor carries. Supplying it does not weaken anything these tests pin: the
-    epoch is an additional conjunct, so every refusal asserted below is still asserted for
-    the reason it was originally written for — this only stops those tests refusing for a
-    second, unrelated reason and thereby passing vacuously.
+    is what a survivor carries. A minted exact epoch now replaces timestamp/released-locator
+    generation authority at the resume boundary (#14955), so tests that describe a survivor
+    must supply its actual pre-hibernate epoch rather than an impossible current one.
     """
     return IdentityAttestationRecord(
         assigned_name=encode_assigned_name(_WS, provider, _LANE),
@@ -421,18 +422,20 @@ class SurvivorStaysFailClosedTest(_Fixture):
         self.assertTrue(self._repair_pins().applied)
         # Same live locators, same repair — only the self-attestation predates T0. This is the
         # survivor the locator pin alone cannot tell from a relaunch.
-        outcome = self._resume(ops=_FakeOps(observed_at=T_SURVIVOR))
+        outcome = self._resume(ops=_FakeOps(observed_at=T_SURVIVOR, lane_epoch=""))
         self.assertTrue(outcome.is_blocked)
         self.assertIn(BLOCK_PAIR_ATTESTATION, outcome.preflight.blocked_reasons)
-        self.assertIn("stale_generation", outcome.preflight.pair_attestation_detail)
+        self.assertIn(
+            "lane_epoch_attestation_absent",
+            outcome.preflight.pair_attestation_detail,
+        )
         self.assertEqual(self._rec().lane_disposition, DISPOSITION_HIBERNATED)
         self.assertIsNone(outcome.transition)
 
-    def test_a_pane_attesting_exactly_at_the_boundary_is_not_fresh(self) -> None:
-        """``strictly after`` stays strict: equality is a survivor, not a relaunch."""
+    def test_exact_epoch_ignores_timestamp_equal_to_legacy_boundary(self) -> None:
+        """#14955: a caller-controlled clock no longer vetoes exact epoch authority."""
         outcome = self._resume(ops=_FakeOps(observed_at=T_HIBERNATE))
-        self.assertTrue(outcome.is_blocked)
-        self.assertIn("stale_generation", outcome.preflight.pair_attestation_detail)
+        self.assertFalse(outcome.is_blocked)
 
 
 class BoundaryLifecycleTest(_Fixture):
@@ -586,8 +589,8 @@ class PreV8CompatibilityTest(_Fixture):
         self.assertIn(ANCHOR_UNAVAILABLE, outcome.preflight.pair_attestation_detail)
         self.assertEqual(self._rec().lane_disposition, DISPOSITION_HIBERNATED)
 
-    def test_an_unresolvable_boundary_fails_the_freshness_half_closed(self) -> None:
-        """An absent threshold is not a proof of freshness.
+    def test_an_unresolvable_boundary_does_not_veto_minted_epoch(self) -> None:
+        """An absent timestamp is irrelevant once the exact epoch proves the generation.
 
         ``evaluate_pair_attestation`` skips the freshness comparison on an empty
         ``fresh_after``, so a row with no boundary would otherwise be admitted on the locator
@@ -605,10 +608,9 @@ class PreV8CompatibilityTest(_Fixture):
         self.assertEqual(resume_freshness_anchor(rec), ("", ANCHOR_UNAVAILABLE))
 
         outcome = self._resume()
-        self.assertTrue(outcome.is_blocked)
-        self.assertIn(BLOCK_PAIR_ATTESTATION, outcome.preflight.blocked_reasons)
-        self.assertIn(ANCHOR_UNAVAILABLE, outcome.preflight.pair_attestation_detail)
-        self.assertEqual(self._rec().lane_disposition, DISPOSITION_HIBERNATED)
+        self.assertFalse(outcome.is_blocked)
+        self.assertNotIn(ANCHOR_UNAVAILABLE, outcome.preflight.pair_attestation_detail)
+        self.assertEqual(self._rec().lane_disposition, DISPOSITION_ACTIVE)
 
     def test_an_absent_row_resolves_to_no_boundary_rather_than_a_guess(self) -> None:
         self.assertEqual(resume_freshness_anchor(None), ("", ANCHOR_UNAVAILABLE))
@@ -701,9 +703,9 @@ class ReleasedLocatorFenceTest(_Fixture):
 
         outcome = self._resume(ops=_FakeOps(observed_at=T_SURVIVOR))
 
-        self.assertTrue(outcome.is_blocked)  # ...and the locator half refuses anyway
+        self.assertTrue(outcome.is_blocked)  # ...and the immutable old epoch refuses
         self.assertIn(BLOCK_PAIR_ATTESTATION, outcome.preflight.blocked_reasons)
-        self.assertIn(FENCE_LOCATOR_REUSED, outcome.preflight.pair_attestation_detail)
+        self.assertIn(EPOCH_NOT_NEWER, outcome.preflight.pair_attestation_detail)
         self.assertEqual(self._rec().lane_disposition, DISPOSITION_HIBERNATED)
         self.assertIsNone(outcome.transition)
 
@@ -729,16 +731,16 @@ class ReleasedLocatorFenceTest(_Fixture):
         )
         self.assertEqual(self._rec().lane_disposition, DISPOSITION_ACTIVE)
 
-    def test_absent_release_evidence_refuses(self) -> None:
-        """j#94544 A.2: the row cannot tell "no process existed" from "a survivor was never
-        recorded", so absence of evidence is never read as freshness."""
+    def test_exact_epoch_replaces_absent_release_evidence(self) -> None:
+        """#14955: exact epoch answers what absent release evidence could not."""
         self._resumed_once()
         self._hibernate_again(released=None, now=T_RESUME)  # release never requested
         outcome = self._resume(ops=_FakeOps(observed_at=T_LATER, gw_locator=f"{_WS}:p9A",
-                                           wk_locator=f"{_WS}:p9B"))
-        self.assertTrue(outcome.is_blocked)
-        self.assertIn(FENCE_EVIDENCE_ABSENT, outcome.preflight.pair_attestation_detail)
-        self.assertEqual(self._rec().lane_disposition, DISPOSITION_HIBERNATED)
+                                           wk_locator=f"{_WS}:p9B",
+                                           lane_epoch=_SECOND_EPOCH))
+        self.assertFalse(outcome.is_blocked)
+        self.assertNotIn(FENCE_EVIDENCE_ABSENT, outcome.preflight.pair_attestation_detail)
+        self.assertEqual(self._rec().lane_disposition, DISPOSITION_ACTIVE)
 
 
 class ReleaseObservationBindingTest(_Fixture):
@@ -1543,7 +1545,7 @@ class DriverDerivedObservationE2ETest(_Fixture):
 
         self.assertTrue(outcome.is_blocked)
         self.assertIn(BLOCK_PAIR_ATTESTATION, outcome.preflight.blocked_reasons)
-        self.assertIn(FENCE_LOCATOR_REUSED, outcome.preflight.pair_attestation_detail)
+        self.assertIn(EPOCH_NOT_NEWER, outcome.preflight.pair_attestation_detail)
         self.assertEqual(self._rec().lane_disposition, DISPOSITION_HIBERNATED)
         self.assertIsNone(outcome.transition)
 

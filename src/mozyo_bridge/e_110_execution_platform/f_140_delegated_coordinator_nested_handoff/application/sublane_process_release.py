@@ -187,14 +187,16 @@ def evaluate_pair_attestation(
     discriminator lives in
     :mod:`mozyo_bridge.core.state.lane_released_locator_fence`.
 
-    ``epoch_record`` (Redmine #14756) is the lane's lifecycle row, and supplying it adds the
-    **authority-grade** conjunct the two above could not be: each slot's attested
+    ``epoch_record`` (Redmine #14756) is the lane's lifecycle row, and supplying it checks the
+    **authority-grade** proof the two above could not provide: each slot's attested
     ``lane_epoch`` must be strictly newer than the epoch the released generation held
-    (:mod:`mozyo_bridge.core.state.lane_epoch`). It is an ADDITIONAL conjunct, not a
-    replacement — every existing fence keeps its exact verdict, so this can only ever refuse
-    more, never admit something the pre-#14756 rail refused. ``None`` (supersede's fresh
-    recovery lane, where a survivor is impossible by construction) skips it, exactly as
-    ``fresh_after`` is skipped there.
+    (:mod:`mozyo_bridge.core.state.lane_epoch`). The arguments remain independently
+    composable: if a caller supplies both ``fresh_after`` and ``epoch_record``, both checks
+    apply. ``sublane resume`` deliberately omits ``fresh_after`` for every lifecycle row,
+    because #14756 removed the clock from generation authority: a minted exact epoch may pass,
+    while an unminted / malformed epoch fails closed and legacy evidence cannot substitute.
+    ``None`` (supersede's fresh recovery lane, where a survivor is impossible by construction)
+    skips the epoch check, exactly as ``fresh_after`` is skipped there.
     """
     slots = unit_slots(rows, workspace_id, lane)
     if GATEWAY_ROLE not in slots or WORKER_ROLE not in slots:
