@@ -3995,6 +3995,20 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "owns the quote-aware canonical scan: the token regex, the recognized channels and "
             "the per-line marker scan every reader of this grammar now shares",
         ),
+        f"{_D}/domain/review_finding_manifest.py": (
+            ['*', '*', '*', '*', '*:MARKER_RE', '*:prefix'],
+            "owns the #14971 dedicated review-finding-manifest sidecar: renders one sidecar and "
+            "reads it through canonical_note_lines + the shared MARKER_RE without adding the "
+            "channel to generic recognized channels. A malformed, duplicate, context/digest/"
+            "prose-mismatched sidecar makes the journal a typed zero; no readable subset is used",
+        ),
+        f"{_D}/domain/review_finding_legacy_authority.py": (
+            ['*', '*', '*', '*', '*', '*', '*:MARKER_RE', '*:prefix', '*:prefix'],
+            "owns the #14971 append-only attestation/ruling channels: renders each strict marker "
+            "and reads them through canonical_note_lines + the shared MARKER_RE. More than one "
+            "same-channel marker in a journal, an unreadable marker, an incomplete ruling chain "
+            "or an unanchored issuer fails closed rather than selecting a subset",
+        ),
         # #14667 moved the proxy decision's marker grammar — producer, shapes, reader — out of
         # ``application/coordinator_proxy_send.py`` and into the pure domain module below. The
         # rail no longer NAMES the token; it holds `workflow-event` only by inheriting the new
@@ -4101,8 +4115,10 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "inherits via a used import of handoff; names no marker token itself",
         ),
         f"{_D}/application/callback_gate_record.py": (
-            ['*', '*', '*', '*', 'workflow-event'],
-            "inherits via a used import of callback_sweep_watermark, redmine_journal_source; names no marker token itself",
+            ['*', '*', '*', '*', '*', '*', '*:prefix', 'workflow-event'],
+            "inherits via used imports of callback_sweep_watermark, redmine_journal_source and "
+            "review_finding_manifest; names no marker token itself. For review_result it delegates "
+            "one atomic note render to the manifest owner before the one transport post",
         ),
         f"{_D}/application/callback_outbox_processor.py": (
             ['*', '*'],
@@ -4138,7 +4154,9 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
         ),
         f"{_D}/application/cli_workflow_callbacks.py": (
             ['*', '*'],
-            "inherits via a used import of redmine_journal_source; names no marker token itself",
+            "inherits via a used import of redmine_journal_source; names no marker token itself. "
+            "The #14971 JSON edge delegates parsing and its single note render/write to "
+            "callback_gate_record, so this orchestration module gains no marker capability",
         ),
         f"{_D}/application/cli_workflow_dispatch_ir.py": (
             ['*', '*', 'handoff'],

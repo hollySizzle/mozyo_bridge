@@ -1853,15 +1853,21 @@ Three contracts follow, and they are deliberately separate:
    version), because path pinning alone cannot see an in-place rewrite and version pinning
    alone cannot see the split. A same-version reinstall is a *match*, not a drift —
    nothing the lane runs changed.
-3. **A split lane is fenced at the send and at the launch, and is never healthy residency.**
+3. **Update-derived actuation is fenced, while an ordinary ready send remains usable.**
 
-   The action-time preflight runs inside the shared pre-send gate
-   (`admit_receiver_startup_or_die`), immediately after the startup screen is found clear
-   and before the first injection, and inside `preflight_launch_providers` — the whole-plan
-   launch fence every launch and every self-heal re-launch passes before the first side
-   effect. Anything short of a positive authority refuses: `split`, `drifted`, **and
-   `unknown`**. The send refusal is `receiver_update_authority_split`, zero-send and
-   ledgered; the launch refusal raises before a workspace, tab, or agent exists.
+   The action-time pre-send gate (`admit_receiver_startup_or_die`) always classifies the
+   live screen before the first injection. An observed update, login, trust, or setup
+   screen remains zero-send. A clear input composer, however, is enough for an **ordinary
+   handoff**: the generic send does not query a package manager or require proof that the
+   provider's updater owns the running executable. Sending a message is not an update or
+   relaunch action, and updater ownership is not a general availability prerequisite.
+
+   The strict authority check remains inside `preflight_launch_providers` for a typed
+   update-derived launch/relaunch cause, before the first side effect. An explicit
+   update-scoped send caller may also pass `updater_targets` and get the same fence.
+   Anything short of positive authority then refuses: `split`, `drifted`, **and
+   `unknown`**. A refused send is `receiver_update_authority_split`, zero-send and
+   ledgered; a refused launch raises before a workspace, tab, or agent exists.
 
    **Scope: only providers with a trusted built-in updater binding** (Design Answer D2
    j#96288 item 1). A provider without one is `not_evaluated` — this gate does not apply to
@@ -1870,17 +1876,18 @@ Three contracts follow, and they are deliberately separate:
    refused every Claude send on every host while making 29 unrelated tests read the live
    host's `npm`. "Nobody asked" and "we asked and could not tell" are different facts.
 
-   The scope carve-out is confined to the *generic ready send*. An update screen actually
-   observed on the receiver is still refused by the #13760 blocker path whatever the
-   binding, and an update-caused exit / self-heal arms the fence explicitly (item 2): a
-   provider whose update state cannot be described must not be actuated on an
+   The scope carve-out is the *generic ready send itself*, including Codex. An update
+   screen actually observed on the receiver is still refused by the #13760 blocker path
+   whatever the binding, and an update-caused exit / self-heal arms the fence explicitly
+   (item 2): a provider whose update state cannot be described must not be actuated on an
    update-relevant path.
 
-   **Arming is a composition decision, never a gate default** (item 3). The generic gate
-   constructs no probe of its own; `startup_admission_composition` picks the typed resolver
-   for supported providers and `commands.py` takes that one neutral dependency, naming no
-   provider, manager, or query. (It also keeps the largest module under the module-health
-   gate byte-identical — the baseline is never self-approved to make room.)
+   **Arming is an update-cause decision, never a gate or provider default** (item 3). The
+   generic gate and ordinary `startup_admission_composition` construct no probe of their
+   own. A caller with a typed update cause supplies the resolver explicitly; `commands.py`
+   keeps one neutral dependency and names no provider, manager, or query. (It also keeps
+   the largest module under the module-health gate byte-identical — the baseline is never
+   self-approved to make room.)
 
    **Which `npm` gets asked** (item 4): the *effective* one — the first match on the trusted
    `PATH`, because that is what the updater's own shell lookup resolves. A shadowed second

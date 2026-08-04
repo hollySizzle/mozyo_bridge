@@ -80,6 +80,16 @@ structured field である。
 - event watcher: portが正規化したdurable eventを読み、mozyo DBのpending actionに変換する。現行adapterはRedmine journal updateを読む。
 - UI: workflow truth ではなく projection。DB / Redmine / live target の read model を表示する。
 
+### Review finding集合の正本と旧review移行
+
+Redmine #14971で、review finding verdictのcoverageを判定する母集合をmachine-readableにした。正本fieldとfail-closed条件はcentral preset `### Review Finding Manifest Contract v1`、実装readerは`review_finding_manifest.py` / `review_finding_legacy_authority.py`であり、本書は実行順序だけを固定する。
+
+1. 新規`review_result`は`workflow callbacks --emit-gate`へ`--review-findings-json`を渡す。producerは同じstructured inputから`finding_<id>` prose、従来の`workflow-event` review marker、専用manifest sidecarを1つのRedmine journalへ記録する。
+2. implementerはmanifestが供給したexact identity集合に対してfindingごとのverdictを記録する。review proseやverdict側の列挙から母集合を推測しない。
+3. manifest導入前のreviewは元journalを書換えない。後続attestationと、direct-owner decisionを記録するcoordinator rulingの完全なchainがある場合だけlegacy readerを使う。
+4. manifest / legacy chainがmissing、malformed、duplicate、conflicting、stale、unauthorizedならclose / terminal retire /自動統合へ進めない。typed reasonをcoordinatorへ返す。
+5. 専用sidecar channelはgeneric callback / glance / hibernate projectionへ追加しない。review callbackのgeneration fenceとfinding coverage authorityは別の連言であり、片方をもう片方へ読み替えない。
+
 ### ロードマップUS
 
 Redmine Version は semantic version number を含む名前にしない。Version 名は日本語を基本に、
