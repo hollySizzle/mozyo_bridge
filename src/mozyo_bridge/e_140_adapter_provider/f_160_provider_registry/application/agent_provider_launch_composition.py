@@ -8,10 +8,12 @@ j#96288 item 3). ``preflight_launch_providers`` therefore stays a pure resolver 
 evaluates authority only when a caller hands it one, and the production launch path
 (``herdr_session_start``) asks this module what to hand it.
 
-Scope is the same as the send side (D2 item 1): a provider with a trusted built-in updater
-binding is armed; a provider without one is left unarmed, which reaches the classifier as
-``not_evaluated`` — this ticket's gate does not apply to it. Promoting an unbound provider
-to ``unknown`` is what refused every Claude send on every host in R3 (j#96202).
+Unlike an ordinary send, a launch is armed only when its typed cause is
+``update_relaunch``. Within that update-scoped path (D2 item 1), a provider with a trusted
+built-in updater binding is armed; a provider without one is left unarmed, which reaches
+the classifier as ``not_evaluated`` — this ticket's gate does not apply to it. Promoting
+an unbound provider to ``unknown`` is what refused every Claude send on every host in R3
+(j#96202).
 
 Returning ``None`` when no provider in the plan is bound keeps a launch that involves no
 supported provider byte-invariant with the pre-#14741 path, including its cost: nothing

@@ -948,8 +948,10 @@ class D2CompositionScopeTest(unittest.TestCase):
 
     R3 armed the authority fence for every provider from an ambient default inside the
     generic gate. That refused every Claude send on every host and made 29 unrelated tests
-    read the live host's npm. These pin the corrected scope directly, and none of them
-    consults the host: the resolver is either absent by design or an explicit fake.
+    read the live host's npm. A later composition still armed every Codex send, even when
+    no update action was requested. These pin the corrected action scope directly: every
+    ordinary ready send is unarmed, while an explicit update-scoped resolver remains
+    fail-closed.
     """
 
     def setUp(self) -> None:
@@ -987,6 +989,19 @@ class D2CompositionScopeTest(unittest.TestCase):
         self.assertEqual(self.emitted, [], "an unbound provider is out of this gate's scope")
         self.assertEqual(consulted, [], "and the host's package manager is never consulted")
 
+    def test_ready_codex_generic_send_never_requires_updater_authority(self) -> None:
+        """An already-running input composer is sufficient for an ordinary handoff."""
+        import mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter as adapter
+
+        consulted: list = []
+        real = adapter.resolve_updater_target
+        adapter.resolve_updater_target = lambda *a, **k: consulted.append(True)
+        self.addCleanup(setattr, adapter, "resolve_updater_target", real)
+
+        self._admit("codex")
+        self.assertEqual(self.emitted, [])
+        self.assertEqual(consulted, [], "generic sends must not query a package manager")
+
     def test_unbound_provider_is_not_evaluated_never_unknown(self) -> None:
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.startup_admission_composition import (  # noqa: E501
             updater_target_resolver_for,
@@ -1009,12 +1024,12 @@ class D2CompositionScopeTest(unittest.TestCase):
             self._admit("codex", pane=CAPTURED_UPDATE_PROMPT)
         self.assertEqual(self.emitted[0].reason, "receiver_startup_interaction_required")
 
-    def test_supported_provider_is_armed_and_split_is_refused(self) -> None:
+    def test_explicit_update_scoped_split_is_refused(self) -> None:
         with self.assertRaises(SystemExit):
             self._admit("codex", updater_targets=lambda pid: ([self.tmp.name], True))
         self.assertEqual(self.emitted[0].reason, "receiver_update_authority_split")
 
-    def test_supported_provider_unknown_is_refused(self) -> None:
+    def test_explicit_update_scoped_unknown_is_refused(self) -> None:
         with self.assertRaises(SystemExit):
             self._admit("codex", updater_targets=lambda pid: ((), False))
         self.assertEqual(self.emitted[0].reason, "receiver_update_authority_split")
@@ -1111,19 +1126,18 @@ class ActualOrchestratorFenceTest(unittest.TestCase):
 
     Three rounds of this issue were reported as wired while the production caller supplied
     nothing, because every test measured a helper boundary (`admit_receiver_startup_or_die`,
-    `preflight_launch_providers`) that the tests themselves armed. These call the actual
-    orchestrator, so an unwired composition root shows up as a passing send instead of a
-    refusal — the failure mode that kept slipping through.
+    `preflight_launch_providers`) that the tests themselves armed. The ordinary production
+    send now deliberately supplies no update cause, so it must admit a ready Codex pane
+    without consulting updater ownership. Update-derived launch/relaunch has its own
+    cause-scoped production tests below.
     """
 
     def _orchestrate(self, *, receiver, pane, resolution):
         """Substitute the HOST boundary only — never the composition's own decision.
 
-        The first cut of this helper patched `updater_target_resolver_for`, which is the
-        decision under test, so unwiring the composition root left every assertion green:
-        the same mistake j#96360 F2 named. Patching `resolve_updater_target` instead keeps
-        the test hermetic while leaving "is the fence armed for this receiver?" to
-        production code.
+        If the generic composition accidentally arms the resolver, this unresolved fake
+        makes the send fail. A successful send therefore proves that production did not
+        turn package-manager ownership into a generic handoff prerequisite.
         """
         import mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.startup_admission_composition as comp
         import mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.infrastructure.update_manager_adapter as adapter
@@ -1148,13 +1162,13 @@ class ActualOrchestratorFenceTest(unittest.TestCase):
         except SystemExit:
             return "REFUSED", emitted
 
-    def test_real_send_path_refuses_a_split_codex_lane(self) -> None:
+    def test_real_generic_send_path_admits_ready_codex_without_update_authority(self) -> None:
         unresolved = UpdaterTargetResolution(roots=(), resolved=False, reason=REASON_QUERY_FAILED)
         verdict, emitted = self._orchestrate(
             receiver="codex", pane=READY_COMPOSER, resolution=unresolved
         )
-        self.assertEqual(verdict, "REFUSED")
-        self.assertEqual(emitted[0].reason, "receiver_update_authority_split")
+        self.assertEqual(verdict, "SENT")
+        self.assertEqual(emitted, [])
 
     def test_real_send_path_admits_an_unbound_provider(self) -> None:
         unresolved = UpdaterTargetResolution(roots=(), resolved=False, reason=REASON_QUERY_FAILED)
