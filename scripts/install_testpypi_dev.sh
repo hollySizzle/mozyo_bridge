@@ -81,12 +81,14 @@ echo "Installing TestPyPI dev artifact: $spec"
 # its dependencies. The exact dev version exists ONLY on TestPyPI (PyPI never
 # hosts dev releases), so the target resolves from TestPyPI even though PyPI is
 # an extra-index for dependencies. --pre lets pip accept the pre-release;
-# --force reinstalls / updates the existing pipx app in place on the normal PATH.
+# --no-cache-dir prevents a just-published exact version from being hidden by a
+# stale cached Simple Index response. --force reinstalls / updates the existing
+# pipx app in place on the normal PATH.
 pipx install \
   --force \
   --backend pip \
   --index-url https://test.pypi.org/simple/ \
-  --pip-args "--extra-index-url https://pypi.org/simple/ --pre" \
+  --pip-args "--extra-index-url https://pypi.org/simple/ --pre --no-cache-dir" \
   "$spec"
 
 echo

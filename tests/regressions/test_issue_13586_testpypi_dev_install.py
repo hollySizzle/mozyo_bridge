@@ -6,10 +6,11 @@ disagrees, instead of merely displaying `--version`. These tests exercise the
 script against a fake ``pipx`` and fake ``mozyo-bridge`` / ``mozyo`` CLIs on a
 shadowed PATH so no network, no real install, and no real package are needed.
 
-Three branches from the Start Gate acceptance (j#75722) are pinned:
+Four branches from the Start Gate acceptance (j#75722) and Redmine #14978 are pinned:
   (a) both CLIs report the requested version -> exit 0
   (b) `mozyo-bridge --version` mismatches      -> non-zero
   (c) `mozyo --version` mismatches             -> non-zero
+  (d) the pip backend bypasses stale index cache for a just-published exact version
 """
 
 import os
@@ -24,9 +25,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 _SCRIPT = ROOT / "scripts" / "install_testpypi_dev.sh"
 
-# Fake pipx: the runbook only shells out to `pipx install ... "$spec"`; a
-# no-op success is enough (the real install is out of scope for this unit).
-_FAKE_PIPX = "#!/bin/sh\nexit 0\n"
+# Fake pipx: echo every argument so tests can assert the exact pip backend
+# policy without touching the network or the real pipx environment.
+_FAKE_PIPX = (
+    "#!/bin/sh\n"
+    "for arg in \"$@\"; do\n"
+    "  printf 'FAKE_PIPX_ARG=%s\\n' \"$arg\"\n"
+    "done\n"
+    "exit 0\n"
+)
 
 # Fake console entry points. Each reports "<prog> <version>" for `--version`
 # (matching argparse's `%(prog)s {__version__}`) where the version is injected
@@ -87,6 +94,18 @@ class InstallTestPyPIDevScriptTest(unittest.TestCase):
         )
         self.assertIn("OK: mozyo-bridge --version == 0.10.0.dev123456", result.stdout)
         self.assertIn("OK: mozyo --version == 0.10.0.dev123456", result.stdout)
+
+    def test_install_disables_stale_simple_index_cache(self) -> None:
+        version = "0.10.0.dev123456"
+        result = self._run(version, mb_version=version, mz_version=version)
+        self.assertEqual(0, result.returncode, result.stderr)
+        pip_args = [
+            line.removeprefix("FAKE_PIPX_ARG=")
+            for line in result.stdout.splitlines()
+            if line.startswith("FAKE_PIPX_ARG=--extra-index-url ")
+        ]
+        self.assertEqual(1, len(pip_args), result.stdout)
+        self.assertIn("--no-cache-dir", pip_args[0].split())
 
     def test_mozyo_bridge_mismatch_fails(self) -> None:
         version = "0.10.0.dev123456"
