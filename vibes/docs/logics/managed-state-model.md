@@ -1543,6 +1543,14 @@ observation に join し、次の typed decision を返す。
   locator/provider/name/runtime-revision drift、missing/foreign attestation、generation/action drift、busy/unknown receiver、
   既送達または送達不確実を含む。それらはすべて zero-send / zero-close / no auto retry。replacement action id が空の
   normal launch は、exact declared process pin が一致する場合だけ lane generation binding を authority として使う。
+  ★work anchor と lifecycle decision は別 authority である。fresh create では両 journal が一致する従来のfast pathを
+  維持するが、hibernate/resume 後は lifecycle pointer が resume decision を指したまま、fresh gateway が新しい
+  implementation request を受け取るため一致しない。この限定形の standard `dispatch-worker` admission は、named
+  Redmine journal が current lane + generation の strict `implementation_request` であること、同じ journal の
+  queue-enter delivery receipt が **current gateway assigned-name / locator / provider** に一致すること、gateway startup
+  self-attestation がそのlive locatorへ一致することの連言を要求する。append-only / lossy ledger 単独、journal単独、
+  locator単独はいずれもauthorityではなく、source/receipt/attestationのどれかが unreadable / missing / staleなら
+  従来どおり `worker_liveness_authority_conflict` / zero-send。lifecycle pointerをwork journalへ上書きしない。
 
 queue-enter / transport ACK と worker uptake は別の causal fact である。`worker_dispatched=true` は admission=`healthy`、
 transport=`sent/ok`、かつ exact delivery に結び付く event-driven turn-start=`started` の連言だけで記録する。ACK 後に
@@ -1550,8 +1558,10 @@ turn-start が観測不能なら `turn_start_unconfirmed` とし、inject 済み
 
 #### Recovered pair の lifecycle decision と work anchor (#14203 R18)
 
-通常の `dispatch-worker` は current lane decision と dispatch anchor が一致する same-lane gateway
-flow のまま維持する。一方、hibernated lane を recovery approval で `active` へ戻した generation では、
+通常のfresh-create `dispatch-worker` は current lane decision と dispatch anchor が一致する same-lane gateway
+fast path のまま維持する。通常のhibernate/resume後にfresh gatewayへ新しいwork journalが実送達された場合は、
+直前節のstrict Redmine + current-gateway receipt + attestation joinをstandard pathとして使う。一方、hibernated lane を
+recovery approval で `active` へ戻した generation でcurrent gatewayへのその送達receipt自体が存在しない場合は、
 `lane_lifecycle.decision_journal` は **resume を決めた durable record** を指し、worker に渡す
 `implementation_request` journal とは異なる。ここで lifecycle pointer を work anchor へ上書きしては
 ならない。上の `lane_lifecycle_records` 契約どおり、pointer は「現在の state をどの durable record が
