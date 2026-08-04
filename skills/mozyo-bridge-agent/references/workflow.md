@@ -1137,6 +1137,7 @@ template 本文が名指しする durable gate heading の canonical literal (`#
 - durable anchor の `work_unit` 宣言を per-dispatch override > repo-local `work_unit.granularity` > built-in `user_story` fallback で解決した effective work unit と照合する。`user_story` では 1 US 配下の Task / Test / Bug を同一 lane の 1 dispatch で一気通貫に扱う。
 - 親 US を持つ `leaf_issue` dispatch は独立した durable owner/operator decision anchor を確認し、task-level review の必要性を leaf dispatch の根拠にしない。
 - same-lane の implementation_worker へ submit 完結で route する。`changes_requested` は same-lane worker へ単回送達し、blind re-send しない。
+- 初回の anchored `implementation_request` を worker へ渡すときは、検証済み <durable_anchor> から ISSUE / JOURNAL を、profile から <lane> を LANE として導出し、自 lane から高レベル `mozyo-bridge sublane dispatch-worker --issue ISSUE --lane-label LANE --journal JOURNAL --execute` を1回だけ実行する。専用 `dispatch-authorization` の無い初回 handoff を authorization-gated な `workflow step` auto-dispatch leg へ置き換えず、authorization marker を推測生成しない。
 - review 結論は durable journal へ canonical heading `## Gate: review` と明示 `結論: 承認 | 要修正 | blocker` の 1 組で記録する。この heading / 結論 語彙は `workflow glance` が最新 review を認識する契約であり、言い換えない。coordinator が後から pointer journal を足す前提にしない。
 - review_result が `approved` のときは上位 (<upstream_coordinator>) へ状態だけを callback し、diff review を main で重複させない。
 - blocked / review-ready / owner-action-needed を上位 (<upstream_coordinator>) へ callback する。

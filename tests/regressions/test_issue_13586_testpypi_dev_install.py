@@ -6,11 +6,14 @@ disagrees, instead of merely displaying `--version`. These tests exercise the
 script against a fake ``pipx`` and fake ``mozyo-bridge`` / ``mozyo`` CLIs on a
 shadowed PATH so no network, no real install, and no real package are needed.
 
-Four branches from the Start Gate acceptance (j#75722) and Redmine #14978 are pinned:
+Six branches from the Start Gate acceptance (j#75722), Redmine #14978, and
+Redmine #14980 are pinned:
   (a) both CLIs report the requested version -> exit 0
   (b) `mozyo-bridge --version` mismatches      -> non-zero
   (c) `mozyo --version` mismatches             -> non-zero
   (d) the pip backend bypasses stale index cache for a just-published exact version
+  (e) a delayed TestPyPI Simple listing is polled before pipx runs
+  (f) a bounded propagation timeout exits before pipx changes the environment
 """
 
 import os
@@ -33,6 +36,35 @@ _FAKE_PIPX = (
     "  printf 'FAKE_PIPX_ARG=%s\\n' \"$arg\"\n"
     "done\n"
     "exit 0\n"
+)
+
+# Fake TestPyPI Simple Index client. It stays empty until the configured call
+# count, then emits one filename containing the exact requested version. Every
+# argument is copied to stderr so the no-cache / PEP 691 request policy can be
+# asserted without a network call.
+_FAKE_CURL = (
+    "#!/bin/sh\n"
+    "for arg in \"$@\"; do\n"
+    "  printf 'FAKE_CURL_ARG=%s\\n' \"$arg\" >&2\n"
+    "done\n"
+    'count_file="$FAKE_CURL_COUNT_FILE"\n'
+    "count=0\n"
+    'if [ -f "$count_file" ]; then count="$(cat "$count_file")"; fi\n'
+    "count=$((count + 1))\n"
+    'printf "%s\\n" "$count" > "$count_file"\n'
+    'ready_after="${FAKE_SIMPLE_READY_AFTER:-1}"\n'
+    'if [ "$count" -ge "$ready_after" ]; then\n'
+    "  printf '{\"files\":[{\"filename\":\"mozyo_bridge-%s.whl\"}]}\\n' \"$FAKE_SIMPLE_VERSION\"\n"
+    "else\n"
+    "  printf '{\"files\":[]}\\n'\n"
+    "fi\n"
+)
+
+# Keep the production 15-second interval in the script while making polling
+# branches hermetic and instant in the regression suite.
+_FAKE_SLEEP = (
+    "#!/bin/sh\n"
+    "printf 'FAKE_SLEEP=%s\\n' \"$1\"\n"
 )
 
 # Fake console entry points. Each reports "<prog> <version>" for `--version`
@@ -62,11 +94,21 @@ def _write_exec(path: Path, body: str) -> None:
 
 
 class InstallTestPyPIDevScriptTest(unittest.TestCase):
-    def _run(self, requested: str, mb_version: str, mz_version: str):
+    def _run(
+        self,
+        requested: str,
+        mb_version: str,
+        mz_version: str,
+        *,
+        simple_version: str | None = None,
+        simple_ready_after: int = 1,
+    ):
         with tempfile.TemporaryDirectory() as tmp:
             fakebin = Path(tmp) / "bin"
             fakebin.mkdir()
             _write_exec(fakebin / "pipx", _FAKE_PIPX)
+            _write_exec(fakebin / "curl", _FAKE_CURL)
+            _write_exec(fakebin / "sleep", _FAKE_SLEEP)
             _write_exec(fakebin / "mozyo-bridge", _FAKE_MOZYO_BRIDGE)
             _write_exec(fakebin / "mozyo", _FAKE_MOZYO)
             env = {
@@ -76,6 +118,9 @@ class InstallTestPyPIDevScriptTest(unittest.TestCase):
                 "PATH": f"{fakebin}{os.pathsep}{os.environ.get('PATH', '')}",
                 "FAKE_MB_VERSION": mb_version,
                 "FAKE_MZ_VERSION": mz_version,
+                "FAKE_SIMPLE_VERSION": simple_version or requested,
+                "FAKE_SIMPLE_READY_AFTER": str(simple_ready_after),
+                "FAKE_CURL_COUNT_FILE": str(Path(tmp) / "curl-count"),
             }
             return subprocess.run(
                 ["sh", str(_SCRIPT), requested],
@@ -106,6 +151,38 @@ class InstallTestPyPIDevScriptTest(unittest.TestCase):
         ]
         self.assertEqual(1, len(pip_args), result.stdout)
         self.assertIn("--no-cache-dir", pip_args[0].split())
+        self.assertIn("FAKE_CURL_ARG=Cache-Control: no-cache", result.stderr)
+        self.assertIn(
+            "FAKE_CURL_ARG=Accept: application/vnd.pypi.simple.v1+json",
+            result.stderr,
+        )
+
+    def test_waits_for_simple_index_propagation_before_install(self) -> None:
+        version = "0.10.0.dev123456"
+        result = self._run(
+            version,
+            mb_version=version,
+            mz_version=version,
+            simple_ready_after=3,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(2, result.stdout.count("FAKE_SLEEP=15"), result.stdout)
+        self.assertIn("OK: TestPyPI Simple Index lists", result.stdout)
+        self.assertIn("FAKE_PIPX_ARG=install", result.stdout)
+
+    def test_simple_index_timeout_preserves_existing_environment(self) -> None:
+        version = "0.10.0.dev123456"
+        result = self._run(
+            version,
+            mb_version=version,
+            mz_version=version,
+            simple_version="0.10.0.dev-not-the-requested-version",
+            simple_ready_after=1,
+        )
+        self.assertEqual(75, result.returncode, result.stderr)
+        self.assertEqual(40, result.stdout.count("FAKE_SLEEP=15"), result.stdout)
+        self.assertNotIn("FAKE_PIPX_ARG=", result.stdout)
+        self.assertIn("existing pipx environment was not changed", result.stderr)
 
     def test_mozyo_bridge_mismatch_fails(self) -> None:
         version = "0.10.0.dev123456"
