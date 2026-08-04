@@ -4,15 +4,16 @@
 
 記載は Git の release commit と利用可能な tag を元にしています。一部の過去バージョンは release commit はありますが、現在の repository には対応する tag がありません。
 
-## v0.15.0 - 2026-08-04
+## v0.15.0 - 2026-08-05
 
-`v0.14.0` から 444 commit 進んだ、delegated coordinator と managed lane lifecycle の運用安定化 release です。人間または外部の top coordinator が単一の高レベル入口から project coordinator へ委譲し、実装 worker、durable callback、統合、drain までを扱うための実行経路を拡充しました。同時に、再起動・更新・世代交代・失敗後の cleanup で古い process や worktree を権威として誤採用しないよう、状態証明と fail-closed 判定を強化しています。
+`v0.14.0` 以降の delegated coordinator と managed lane lifecycle の運用安定化 release です。人間または外部の top coordinator が単一の高レベル入口から project coordinator へ委譲し、実装 worker、durable callback、統合、drain までを扱うための実行経路を拡充しました。同時に、再起動・更新・世代交代・失敗後の cleanup で古い process や worktree を権威として誤採用しないよう、状態証明と fail-closed 判定を強化しています。
 
 ### coordinator proxy と三層委譲
 
 - repo に記録した role authority、provider binding、workspace identity、startup attestation から live default coordinator を解決し、外部 coordinator が `workflow proxy` で `bootstrap_lane` / `dispatch_next` を一度だけ委譲できるようにしました。pane ID、raw backend、手作業の identity 環境変数を通常運用で選ぶ必要はありません。
 - strictly-newer な durable decision と送達 fence を結び、古い journal の再利用、同一決定の重複送信、別 workspace の caller 環境混入を拒否します。送信先は checkout と live inventory から再検証し、呼び出し元の `MOZYO_*` を送信権威として継承しません。
 - project coordinator / gateway、worker、review・callback の role profile と route を durable record に結び、top coordinator が worker の pane を直接操作しない構造を整備しました。
+- hibernate / resume 後の lane では lifecycle decision と新しい work anchor が異なる正当形を、current gateway の delivery receipt、startup attestation、lane / generation の一致で限定許可します。これにより resumed gateway から worker への初回配送を復旧しつつ、古い locator・別世代・読取不能な authority は引き続き zero-send になります。
 
 ### guarded auto-integration と cleanup
 
@@ -36,12 +37,13 @@
 
 - Python 3.10–3.13 の宣言 matrix を維持し、Python 3.10 の `tomllib` fallback と test compatibility を修正しました。
 - TestPyPI 固定版の install helper は Simple Index の古い cache を再利用せず、公開直後の完全指定版を通常 PATH の pipx runtime へ導入できます。
-- release tree / artifact scan、scaffold mirror、docs catalog、built wheel / sdist、fresh-install と installed fault-path smoke を更新しました。候補 source では 15,816 tests、module-health、docs validation、artifact install smoke が green です。最終 `0.15.0` commit では同じ gate と Python matrix を再実行します。
+- release tree / artifact scan、scaffold mirror、docs catalog、built wheel / sdist、fresh-install と installed fault-path smoke を更新しました。候補 source では 15,822 tests、module-health、docs validation、artifact install smoke が green です。最終 `0.15.0` commit では同じ gate と Python matrix を再実行します。
 
 ### リリース状況メモ
 
 - **version mirror**: 本ノートとは別の standalone commit で `pyproject.toml` と runtime `__version__` を `0.15.0` に確定します。
-- **公開手順**: fresh TestPyPI install と三層委譲 E2E、全 release check、version / tag / PyPI vacancy の action-time read-back後に、annotated `v0.15.0` tag、GitHub Release、OIDC Trusted Publishing を別 gate で実行します。
+- **公開前実証**: source `184dd60454a451f298afd0690d2ea558dc0b1f74` の TestPyPI 固定版 `0.15.0a4.dev2026080423152630958296238` を通常 PATH の pipx 環境へ導入し、両 CLI の版一致を確認しました。同じ fresh workspace で top coordinator → gateway → worker → 二段 callback → guarded retire を完走し、専用 worktree も削除済みです。
+- **公開手順**: standalone version bump 後の main CI、Python 3.10–3.13 matrix、全 release check、version / tag / PyPI vacancy の action-time read-backを再実行し、annotated `v0.15.0` tag、GitHub Release、OIDC Trusted Publishing を別 gate で実行します。
 - **互換性**: user-facing CLI の意図的な削除はありません。managed session の復旧・世代交代は、旧 state を直接編集せず公開された rollout / recovery / retirement command を使用してください。
 
 ## v0.9.2 - 2026-06-27
