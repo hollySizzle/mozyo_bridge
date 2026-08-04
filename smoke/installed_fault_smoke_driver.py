@@ -34,7 +34,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 
 _FAKE_HERDR_CLI = _REPO_ROOT / "smoke" / "support" / "fake_herdr_cli.py"
-_FAKE_REDMINE_API_KEY = "installed-fault-smoke-fixture-key"
+_FAKE_REDMINE_HEADER_VALUE = "installed-fault-smoke-fixture-key"
 
 
 @contextmanager
@@ -59,7 +59,7 @@ def _fresh_redmine_approval(*, issue: str, journal: str, marker: str):
         def do_GET(self):  # noqa: N802 - stdlib handler protocol
             parsed = urllib.parse.urlsplit(self.path)
             query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-            if self.headers.get("X-Redmine-API-Key") != _FAKE_REDMINE_API_KEY:
+            if self.headers.get("X-Redmine-API-Key") != _FAKE_REDMINE_HEADER_VALUE:
                 self.send_error(403)
                 return
             if parsed.path != expected_path or query != {"include": ["journals"]}:
@@ -80,7 +80,7 @@ def _fresh_redmine_approval(*, issue: str, journal: str, marker: str):
     try:
         yield {
             "MOZYO_REDMINE_URL": f"http://127.0.0.1:{server.server_port}",
-            "MOZYO_REDMINE_API_KEY": _FAKE_REDMINE_API_KEY,
+            "MOZYO_REDMINE_API_KEY": _FAKE_REDMINE_HEADER_VALUE,
         }
     finally:
         server.shutdown()

@@ -118,11 +118,14 @@ class _Response(io.BytesIO):
     pass
 
 
+_FIXTURE_HEADER_VALUE = "fixture-key"
+
+
 class LiveRedmineAnchorSourceTest(unittest.TestCase):
     def _source(self, opener):
         return LiveRedmineAnchorSource(
             base_url="https://redmine.example.invalid",
-            api_key="fixture-key",
+            api_key=_FIXTURE_HEADER_VALUE,
             opener=opener,
         )
 
