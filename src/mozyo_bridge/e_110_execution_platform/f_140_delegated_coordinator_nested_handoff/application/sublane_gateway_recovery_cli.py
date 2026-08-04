@@ -73,6 +73,8 @@ def format_recover_gateway_text(outcome: GatewayRefreshOutcome) -> str:
     # preflight would invite reading absence-of-failure as a diagnosis.
     if outcome.launch_failure_reason:
         lines.append(f"  launch_failure: {outcome.launch_failure_reason}")
+    if outcome.required_approval_marker:
+        lines.append(f"  required_approval_marker: {outcome.required_approval_marker}")
     if outcome.detail:
         lines.append(f"  detail: {outcome.detail}")
     return "\n".join(lines)

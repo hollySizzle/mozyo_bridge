@@ -107,6 +107,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     normalize_launch_failure_reason,
     port_launch_failure_reason,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_owner_approval import (  # noqa: E501
+    GATEWAY_RECOVERY_APPROVAL_EFFECT,
+    GATEWAY_RECOVERY_APPROVAL_GATE,
+    gateway_recovery_approval_operation,
+    render_recovery_owner_approval_marker,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.stale_worker_recovery import (  # noqa: E501
     worker_close_committed,
 )
@@ -229,6 +235,9 @@ class GatewayRefreshOutcome:
     #: locator, credential, or exception prose. :attr:`detail` keeps the compatibility
     #: ``launch:<reason>`` rendering for readers that predate this field.
     launch_failure_reason: str = LAUNCH_FAILURE_NONE
+    #: Canonical marker the owner-approval journal must carry. Present only on an actionable,
+    #: fully-pinned read-only preflight; an incomplete request cannot render authority.
+    required_approval_marker: str = ""
 
     @property
     def is_blocked(self) -> bool:
@@ -265,6 +274,7 @@ class GatewayRefreshOutcome:
             # rendered as ``None`` — "no launch fence fired" — matching the runbook field's
             # existing empty-to-null convention.
             "launch_failure_reason": self.launch_failure_reason or None,
+            "required_approval_marker": self.required_approval_marker or None,
         }
 
 
@@ -284,6 +294,12 @@ class GatewayRecoveryOps(Protocol):
 
     def observe_target(self, request: GatewayRefreshRequest) -> GatewayRefreshObservation:
         """Observe the live pinned gateway slot (read-only, all-positive-fact)."""
+        ...
+
+    def approval_verified(
+        self, request: GatewayRefreshRequest, *, journal: str
+    ) -> bool:
+        """Fresh-read one structured direct-owner approval for this exact operation."""
         ...
 
     def lane_authority_reason(self, request: GatewayRefreshRequest) -> str:
@@ -545,6 +561,17 @@ class GatewayRefreshUseCase:
 
         # 1. Positive durable owner approval + exact action id + generation + evidence,
         #    before any write.
+        try:
+            approved = self._ops.approval_verified(
+                request, journal=norm(request.journal)
+            )
+        except Exception:  # noqa: BLE001 - unreadable approval is never authority
+            approved = False
+        if not approved:
+            return refused(
+                "owner approval is absent, unreadable, non-canonical or targets another "
+                "gateway recovery; zero close"
+            )
         try:
             decision = DecisionPointer(
                 source="redmine", issue_id=request.effective_anchor_issue,
@@ -813,6 +840,18 @@ class GatewayRefreshUseCase:
         # Review j#88477 F2: the closed axis token + its runbook are TYPED fields on every
         # outcome the surface can return, not prose inside ``detail``.
         reason = normalize_launch_authority_reason(authority_reason)
+        required_marker = ""
+        if status == REFRESH_STATUS_PREFLIGHT and verdict == REFRESH_ACTIONABLE:
+            try:
+                required_marker = render_recovery_owner_approval_marker(
+                    gate=GATEWAY_RECOVERY_APPROVAL_GATE,
+                    effect=GATEWAY_RECOVERY_APPROVAL_EFFECT,
+                    issue=request.issue,
+                    lane=request.lane,
+                    operation=gateway_recovery_approval_operation(request),
+                )
+            except Exception:  # noqa: BLE001 - incomplete pin => no approval template
+                required_marker = ""
         return GatewayRefreshOutcome(
             issue=norm(request.issue),
             lane=norm(request.lane),
@@ -839,6 +878,7 @@ class GatewayRefreshUseCase:
             # Normalized at the composer so EVERY return path yields a well-shaped token,
             # including the ones that never touch the launch leg (they pass the default).
             launch_failure_reason=normalize_launch_failure_reason(launch_failure_reason),
+            required_approval_marker=required_marker,
         )
 
 

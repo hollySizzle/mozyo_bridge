@@ -95,6 +95,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     stale_worker_recovery_action_id,
     worker_close_committed,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_owner_approval import (  # noqa: E501
+    STALE_WORKER_RECOVERY_APPROVAL_EFFECT,
+    STALE_WORKER_RECOVERY_APPROVAL_GATE,
+    render_recovery_owner_approval_marker,
+    stale_worker_recovery_approval_operation,
+)
 
 # -- recovery / redispatch status vocabulary (closed) ---------------------------
 
@@ -238,6 +244,9 @@ class RecoveryOutcome:
     #: The resume RE-approval journal that governed a post-close resume, when one was supplied
     #: distinct from the stored anchor (§5). Empty for a fresh execute or a same-journal resume.
     resume_authorization: str = ""
+    #: Canonical marker the owner-approval journal must carry. Present only on an actionable,
+    #: fully-pinned read-only preflight.
+    required_approval_marker: str = ""
 
     @property
     def is_blocked(self) -> bool:
@@ -268,6 +277,7 @@ class RecoveryOutcome:
             "converged_supersede": self.converged_supersede,
             "post_close_resume": self.post_close_resume,
             "resume_authorization": self.resume_authorization or None,
+            "required_approval_marker": self.required_approval_marker or None,
         }
 
 
@@ -284,6 +294,10 @@ class StaleWorkerRecoveryOps(Protocol):
         unreadable / ambiguous inventory classifies as ``identity_unknown`` (never launched
         blind).
         """
+        ...
+
+    def approval_verified(self, request: RecoveryRequest, *, journal: str) -> bool:
+        """Fresh-read one structured direct-owner approval for this exact operation."""
         ...
 
     def redispatch_gate(self, continuation: ContinuationPointer) -> str:
@@ -484,6 +498,21 @@ class StaleWorkerRecoveryUseCase:
         resume_authorization = ""
         if norm(request.resume_journal):
             try:
+                resume_approved = self._ops.approval_verified(
+                    request, journal=norm(request.resume_journal)
+                )
+            except Exception:  # noqa: BLE001 - unreadable approval is never authority
+                resume_approved = False
+            if not resume_approved:
+                return self._outcome(
+                    request, verdict, status=RECOVERY_REFUSED, executed=True,
+                    observation=observation, post_close_resume=True,
+                    detail=(
+                        "resume owner approval is absent, unreadable, non-canonical or "
+                        "targets another recovery; zero close / launch / send"
+                    ),
+                )
+            try:
                 DecisionPointer(
                     source="redmine", issue_id=norm(request.issue),
                     journal_id=norm(request.resume_journal),
@@ -509,6 +538,30 @@ class StaleWorkerRecoveryUseCase:
         self, request: RecoveryRequest, verdict: str, observation: RecoveryObservation
     ) -> RecoveryOutcome:
         # 1. Positive durable owner approval + exact action id + generation, before any write.
+        if not norm(request.worker_revision):
+            return self._outcome(
+                request, verdict, status=RECOVERY_REFUSED, executed=True,
+                observation=observation,
+                detail=(
+                    "worker inventory revision evidence is required for a destructive "
+                    "recovery approval; zero close"
+                ),
+            )
+        try:
+            approved = self._ops.approval_verified(
+                request, journal=norm(request.journal)
+            )
+        except Exception:  # noqa: BLE001 - unreadable approval is never authority
+            approved = False
+        if not approved:
+            return self._outcome(
+                request, verdict, status=RECOVERY_REFUSED, executed=True,
+                observation=observation,
+                detail=(
+                    "owner approval is absent, unreadable, non-canonical or targets another "
+                    "stale-worker recovery; zero close"
+                ),
+            )
         try:
             decision = DecisionPointer(
                 source="redmine",
@@ -848,6 +901,18 @@ class StaleWorkerRecoveryUseCase:
         post_close_resume: bool = False,
         resume_authorization: str = "",
     ) -> RecoveryOutcome:
+        required_marker = ""
+        if status == RECOVERY_PREFLIGHT and verdict == RECOVER_ACTIONABLE:
+            try:
+                required_marker = render_recovery_owner_approval_marker(
+                    gate=STALE_WORKER_RECOVERY_APPROVAL_GATE,
+                    effect=STALE_WORKER_RECOVERY_APPROVAL_EFFECT,
+                    issue=request.issue,
+                    lane=request.lane,
+                    operation=stale_worker_recovery_approval_operation(request),
+                )
+            except Exception:  # noqa: BLE001 - incomplete pin => no approval template
+                required_marker = ""
         return RecoveryOutcome(
             issue=norm(request.issue),
             lane=norm(request.lane),
@@ -867,6 +932,7 @@ class StaleWorkerRecoveryUseCase:
             converged_supersede=converged_supersede,
             post_close_resume=post_close_resume,
             resume_authorization=norm(resume_authorization),
+            required_approval_marker=required_marker,
         )
 
 

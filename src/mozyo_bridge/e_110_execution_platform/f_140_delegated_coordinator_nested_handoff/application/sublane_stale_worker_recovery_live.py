@@ -43,6 +43,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DRAIN_SEND_ERROR,
     DRAIN_SEND_OK,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.recovery_owner_approval_live import (  # noqa: E501
+    verify_live_stale_worker_recovery_approval,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
     list_herdr_agent_rows,
     probe_worktree_resolved,
@@ -558,6 +561,12 @@ class LiveStaleWorkerRecoveryOps:
     #: The lane-lifecycle store home the post-close resume re-verification reads (Redmine #13806
     #: R3-F1). ``None`` = the real state home; tests inject an isolated one.
     lifecycle_home: Optional[Path] = None
+    journal_reader: Optional[object] = None
+    journal_reader_fresh: bool = False
+    issuer_resolver: Optional[object] = None
+
+    def approval_verified(self, request: RecoveryRequest, *, journal: str) -> bool:
+        return verify_live_stale_worker_recovery_approval(self, request, journal)
 
     def _ledger(self) -> HerdrDeliveryLedger:
         return self.ledger if self.ledger is not None else HerdrDeliveryLedger()

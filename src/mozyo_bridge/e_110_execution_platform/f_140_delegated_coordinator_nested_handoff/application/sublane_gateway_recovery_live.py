@@ -51,6 +51,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_gateway_recovery import (  # noqa: E501
     GatewayRefreshRequest,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.recovery_owner_approval_live import (  # noqa: E501
+    verify_live_gateway_recovery_approval,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_stale_worker_recovery import (  # noqa: E501
     RecoveryRequest,
 )
@@ -167,6 +170,13 @@ class LiveGatewayRecoveryOps:
     #: Marks the ``journal_reader`` as a FRESH (non-snapshot) source (#13889: only a source
     #: declaring freshness may back the absence-of-gate fact).
     journal_reader_fresh: bool = False
+    #: Test seam only; production resolves the issuer through the committed gate policy.
+    issuer_resolver: Optional[object] = None
+
+    def approval_verified(
+        self, request: GatewayRefreshRequest, *, journal: str
+    ) -> bool:
+        return verify_live_gateway_recovery_approval(self, request, journal)
 
     # -- delegation to the proven #13806 probes --------------------------------
 

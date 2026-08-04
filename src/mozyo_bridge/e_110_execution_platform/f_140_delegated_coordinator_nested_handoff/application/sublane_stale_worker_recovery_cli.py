@@ -57,6 +57,8 @@ def format_recover_text(outcome: RecoveryOutcome) -> str:
                 else ""
             )
         )
+    if outcome.required_approval_marker:
+        lines.append(f"  required_approval_marker: {outcome.required_approval_marker}")
     if outcome.detail:
         lines.append(f"  detail: {outcome.detail}")
     return "\n".join(lines)
@@ -105,7 +107,28 @@ def _run_live_recovery(
     actuation_port = LiveRecoveryActuatorPort(
         repo_root=repo_root, request=request, store=store, key=key,
     )
-    ops = LiveStaleWorkerRecoveryOps(repo_root=repo_root, request=request)
+    # A destructive approval is a durable fact, not a command-line assertion.  Wire the
+    # credential-gated live reader at action time; any credential/read gap leaves the reader
+    # unavailable and the use case refuses with zero close.
+    journal_reader = None
+    journal_reader_fresh = False
+    try:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E501
+            LiveRedmineJournalSource,
+        )
+
+        source = LiveRedmineJournalSource.from_environment()
+        journal_reader = source.read_entries
+        journal_reader_fresh = True
+    except Exception:  # noqa: BLE001 - no live durable boundary => no approval
+        journal_reader = None
+        journal_reader_fresh = False
+    ops = LiveStaleWorkerRecoveryOps(
+        repo_root=repo_root,
+        request=request,
+        journal_reader=journal_reader,
+        journal_reader_fresh=journal_reader_fresh,
+    )
     use_case = StaleWorkerRecoveryUseCase(
         store, actuation_port, ops, workspace_id=workspace_id,
     )

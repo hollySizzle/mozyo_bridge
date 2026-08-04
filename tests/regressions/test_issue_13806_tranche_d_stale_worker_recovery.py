@@ -178,6 +178,7 @@ class FakeRecoveryOps:
     def __init__(
         self, observation, *, send_result=DRAIN_SEND_OK, confirm_after_send=True,
         already_landed=False, resume_lane_authority=True, lane_free_of_live_process=True,
+        approval=True,
     ):
         self._observation = observation
         self.send_result = send_result
@@ -193,6 +194,13 @@ class FakeRecoveryOps:
         #: simulate a foreign live process (busy OR idle) holding the lane's name.
         self._lane_free_of_live_process = lane_free_of_live_process
         self.free_of_live_checks: list = []
+        self._approval = approval
+
+    def approval_verified(self, request, *, journal: str) -> bool:
+        return bool(
+            self._approval
+            and journal in {request.journal, request.resume_journal}
+        )
 
     def observe_target(self, request) -> RecoveryObservation:
         return self._observation
@@ -252,7 +260,8 @@ class _RecoveryCase(unittest.TestCase):
             issue="13806", lane=WORKER["lane_id"], role=WORKER["role"],
             provider=WORKER["provider"], assigned_name=WORKER["assigned_name"],
             locator=WORKER["old_locator"], journal="79485", action_id=ACTION_ID,
-            action_generation=GEN, lane_revision="3", lane_generation="2",
+            action_generation=GEN, worker_revision="4",
+            lane_revision="3", lane_generation="2",
             expected_gate="implementation_request", next_semantic_action="dispatch_once",
         )
         base.update(overrides)
@@ -441,6 +450,10 @@ class HappyPathTests(_RecoveryCase):
         self.assertEqual(outcome.status, RECOVERY_PREFLIGHT)
         self.assertEqual(outcome.verdict, RECOVER_ACTIONABLE)
         self.assertFalse(outcome.executed)
+        self.assertIn(
+            "gate=stale_worker_recovery_owner_approval",
+            outcome.required_approval_marker,
+        )
         self.assertFalse(outcome.is_blocked)
         # zero store write on preflight
         self.assertIsNone(self.store.get(ReplacementTransactionKey(self.workspace_id, ACTION_ID)))
@@ -569,6 +582,26 @@ class BlockerTests(_RecoveryCase):
 
 
 class ApprovalFenceTests(_RecoveryCase):
+    def test_missing_worker_revision_is_zero_close(self):
+        ops = FakeRecoveryOps(_all_clear())
+        outcome = self._use_case(ops).run(
+            self._request(worker_revision=""), execute=True
+        )
+        self.assertEqual(outcome.status, RECOVERY_REFUSED)
+        self.assertIn("worker inventory revision", outcome.detail)
+        self.assertEqual(self.port.closed, [])
+
+    def test_unverified_approval_is_zero_close(self):
+        ops = FakeRecoveryOps(_all_clear(), approval=False)
+        outcome = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(outcome.status, RECOVERY_REFUSED)
+        self.assertIn("owner approval", outcome.detail)
+        self.assertEqual(self.port.closed, [])
+        self.assertEqual(ops.sends, [])
+        self.assertIsNone(
+            self.store.get(ReplacementTransactionKey(self.workspace_id, ACTION_ID))
+        )
+
     def test_action_id_mismatch_refused_zero_close(self):
         ops = FakeRecoveryOps(_all_clear())
         outcome = self._use_case(ops).run(

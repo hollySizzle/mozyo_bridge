@@ -158,6 +158,7 @@ class FakeGatewayOps:
         lane_authority=True,
         name_free=True,
         rail_ready=True,
+        approval=True,
     ):
         self._turn = turn if turn is not None else _turn()
         self._target = target if target is not None else _target()
@@ -170,6 +171,10 @@ class FakeGatewayOps:
         self._name_free = name_free
         self.name_free_checks: list = []
         self._rail_ready = rail_ready
+        self._approval = approval
+
+    def approval_verified(self, request, *, journal: str) -> bool:
+        return bool(self._approval and journal == request.journal)
 
     def observe_turn(self, request) -> GatewayTurnObservation:
         return self._turn
@@ -274,6 +279,7 @@ class PreflightTests(_RefreshCase):
         self.assertEqual(outcome.verdict, REFRESH_ACTIONABLE)
         self.assertFalse(outcome.executed)
         self.assertFalse(outcome.is_blocked)
+        self.assertIn("gate=gateway_recovery_owner_approval", outcome.required_approval_marker)
         self.assertIsNone(self._row())          # zero writes
         self.assertEqual(self.port.closed, [])  # zero closes
         self.assertEqual(ops.resumes, [])       # zero sends
@@ -313,6 +319,13 @@ class ExecuteRefusalTests(_RefreshCase):
         self._refused(
             FakeGatewayOps(), self._request(journal=""), "not a complete Redmine pointer"
         )
+
+    def test_unverified_approval_is_zero_close(self):
+        outcome = self._refused(
+            FakeGatewayOps(approval=False), self._request(), "owner approval"
+        )
+        self.assertTrue(outcome.is_blocked)
+        self.assertIsNone(self._row())
 
     def test_a_mismatched_action_id_refuses(self):
         self._refused(

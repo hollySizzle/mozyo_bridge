@@ -501,11 +501,21 @@ class _FakeActuatorPort:
 
 
 class _FakeRecoveryOps:
-    def __init__(self, observation, *, landed_after_send=True, already_landed=False):
+    def __init__(
+        self, observation, *, landed_after_send=True, already_landed=False,
+        approval=True,
+    ):
         self._observation = observation
         self._landed = already_landed
         self._landed_after_send = landed_after_send
         self.sends: list = []
+        self._approval = approval
+
+    def approval_verified(self, request, *, journal: str) -> bool:
+        return bool(
+            self._approval
+            and journal in {request.journal, request.resume_journal}
+        )
 
     def observe_target(self, request) -> RecoveryObservation:
         return self._observation

@@ -52,9 +52,6 @@ from __future__ import annotations
 import hashlib
 from typing import Mapping, Sequence
 
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.canonical_note_scan import (  # noqa: E501
-    canonical_marker_bodies,
-)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
     ISSUER_COORDINATOR,
     ISSUER_UNKNOWN,
@@ -62,6 +59,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
     MARKER_CHANNEL_WORKFLOW_EVENT,
     RedmineJournalEntry,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_owner_approval import (  # noqa: E501
+    STRUCTURED_APPROVAL_FIELD_ORDER,
+    StructuredOwnerApprovalError,
+    parse_strict_owner_approval_markers,
 )
 
 #: This surface's approval gate token (the ``composer_discard_approval.APPROVAL_GATE``
@@ -167,10 +169,7 @@ def worker_refresh_approval_digest(
 #: extra field is refused rather than ignored: a marker the canonical producer could not have
 #: rendered is not a canonical marker, and silently tolerating unknown fields is how a future
 #: meaningful field gets ignored by an old verifier (review j#92533 F2).
-APPROVAL_FIELD_ORDER = (
-    "gate", "version", "approval_source", "decision", "effect", "issue", "lane",
-    "action_digest",
-)
+APPROVAL_FIELD_ORDER = STRUCTURED_APPROVAL_FIELD_ORDER
 
 
 def parse_strict_approval_markers(notes: str) -> list[dict[str, str]]:
@@ -189,44 +188,14 @@ def parse_strict_approval_markers(notes: str) -> list[dict[str, str]]:
     ``decision=declined`` verified as approved (review j#92601 F2). Location and exclusion are
     one authority; this module never re-derives either.
     """
-    parsed: list[dict[str, str]] = []
-    for _channel, body in canonical_marker_bodies(
-        notes, channels=frozenset({MARKER_CHANNEL_WORKFLOW_EVENT})
-    ):
-        components = body.split(":")
-        if not any(
-            component.strip() == f"gate={WORKER_REFRESH_APPROVAL_GATE}"
-            for component in components
-        ):
-            continue  # some other surface's marker; not this gate's approval
-        fields: dict[str, str] = {}
-        order: list[str] = []
-        for component in components:
-            # ``partition`` makes a missing ``=`` indistinguishable from an empty value
-            # (``"nonsense"`` -> key ``nonsense``, value ``""``), so the emptiness check covers
-            # both; a separate branch for it was measured unkillable and is not kept.
-            key, _, value = component.partition("=")
-            key, value = key.strip(), value.strip()
-            if not key or not value:
-                raise WorkerRefreshApprovalError(
-                    "the approval marker carries a malformed field "
-                    "(not a non-empty key=value pair)"
-                )
-            if key in fields:
-                raise WorkerRefreshApprovalError(
-                    f"the approval marker declares {key!r} more than once; a record that "
-                    "says two things has decided nothing"
-                )
-            fields[key] = value
-            order.append(key)
-        # The canonical producer emits exactly this sequence. Accepting a permutation would
-        # accept a marker no producer in this repo can render (review j#92601 F2).
-        if tuple(order) != APPROVAL_FIELD_ORDER:
-            raise WorkerRefreshApprovalError(
-                "the approval marker's field sequence is not the canonical one"
-            )
-        parsed.append(fields)
-    return parsed
+    try:
+        return parse_strict_owner_approval_markers(
+            notes, gate=WORKER_REFRESH_APPROVAL_GATE,
+            field_order=APPROVAL_FIELD_ORDER,
+        )
+    except StructuredOwnerApprovalError as exc:
+        # Preserve the established public exception type while sharing the byte parser.
+        raise WorkerRefreshApprovalError(str(exc)) from exc
 
 
 def expected_approval_fields(
