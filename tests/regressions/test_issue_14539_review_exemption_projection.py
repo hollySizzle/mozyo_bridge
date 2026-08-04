@@ -3875,12 +3875,19 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "third is the shared scan's",
         ),
         f"{_D}/domain/worker_refresh_approval.py": (
-            ["*", "*", "*", "*:MARKER_RE"],
+            ["*", "*", "*", "*"],
             "renders the worker-refresh owner-approval marker and reads it back through a "
             "deliberately STRICTER private parser: a repeated field, a malformed field or a "
             "non-canonical field order raises, and a note carrying more than one marker of this "
             "gate authorizes nothing (a record that declares the gate twice cannot say which is "
-            "authoritative)",
+            "authoritative). The marker regex/scan now comes from recovery_owner_approval",
+        ),
+        f"{_D}/domain/recovery_owner_approval.py": (
+            ["*", "*", "*", "*:MARKER_RE"],
+            "owns the shared gateway/stale-worker recovery owner-approval grammar: renders the "
+            "canonical workflow-event marker and scans it quote-aware through canonical_note_scan. "
+            "A malformed marker, non-canonical field order, duplicate field, or anything other "
+            "than exactly one operation-bound marker for the requested gate authorizes nothing",
         ),
         "src/mozyo_bridge/e_110_execution_platform/f_160_state_store_managed_events/domain/offline_rollout_action.py": (
             ["*", "*", "*", "*:MARKER_RE"],
@@ -4391,6 +4398,22 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "inherits via a used import of worker_refresh_approval; names no marker token "
             "itself, and reads no note — it plans the refresh and delegates approval "
             "verification to that module's strict parser",
+        ),
+        f"{_D}/application/recovery_owner_approval_live.py": (
+            ['*'],
+            "inherits via a used import of recovery_owner_approval; names no marker token itself "
+            "and delegates fresh journal reading, issuer resolution, and exact marker verification "
+            "to the shared recovery approval grammar",
+        ),
+        f"{_D}/application/sublane_gateway_recovery.py": (
+            ['*'],
+            "inherits via a used recovery_owner_approval renderer; names no marker token itself "
+            "and renders the exact required gateway approval marker only for the preflight plan",
+        ),
+        f"{_D}/application/sublane_stale_worker_recovery.py": (
+            ['*'],
+            "inherits via a used recovery_owner_approval renderer; names no marker token itself "
+            "and renders the exact required stale-worker approval marker only for the preflight plan",
         ),
         f"{_D}/application/sublane_worker_refresh_durable_read.py": (
             ['*', '*'],

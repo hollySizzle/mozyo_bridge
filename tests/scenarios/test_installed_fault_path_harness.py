@@ -53,9 +53,11 @@ scratch inventory drains to zero.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tests.support.installed_fault_harness import InstalledFaultHarness
 
@@ -68,6 +70,78 @@ _smoke = importlib.util.module_from_spec(_smoke_spec)
 assert _smoke_spec.loader is not None
 _smoke_spec.loader.exec_module(_smoke)
 recover_stale_accepts = _smoke.recover_stale_accepts
+
+
+class _FreshStaleRecoveryApprovalSource:
+    """A fresh-reader fixture carrying one operation-bound canonical approval journal."""
+
+    fresh_read = True
+
+    def __init__(self, *, issue: str, journal: str, marker: str) -> None:
+        self.issue = issue
+        self.journal = journal
+        self.marker = marker
+
+    def read_entries(self, issue: str):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            RedmineJournalEntry,
+        )
+
+        if str(issue) != self.issue:
+            return []
+        # Return a new projection on every call: this fixture models an action-time fresh read,
+        # not a cached object whose reuse could accidentally satisfy the destructive boundary.
+        return [RedmineJournalEntry(self.issue, self.journal, self.marker)]
+
+
+@contextlib.contextmanager
+def _fresh_stale_recovery_approval(ctx):
+    """Wire the exact canonical owner approval for ``ctx`` into the public CLI seam."""
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E501
+        LiveRedmineJournalSource,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_stale_worker_recovery import (  # noqa: E501
+        RecoveryRequest,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_owner_approval import (  # noqa: E501
+        STALE_WORKER_RECOVERY_APPROVAL_EFFECT,
+        STALE_WORKER_RECOVERY_APPROVAL_GATE,
+        render_recovery_owner_approval_marker,
+        stale_worker_recovery_approval_operation,
+    )
+
+    journal = "79485"
+    request = RecoveryRequest(
+        issue=ctx.issue,
+        lane=ctx.lane_id,
+        role="claude",
+        provider="claude",
+        assigned_name=ctx.worker_name,
+        locator=ctx.worker_locator,
+        journal=journal,
+        action_id=ctx.action_id,
+        action_generation=7,
+        worker_revision=ctx.worker_revision,
+        lane_revision=ctx.lane_revision,
+        lane_generation=ctx.lane_generation,
+        expected_gate="implementation_request",
+        next_semantic_action="dispatch_once",
+    )
+    marker = render_recovery_owner_approval_marker(
+        gate=STALE_WORKER_RECOVERY_APPROVAL_GATE,
+        effect=STALE_WORKER_RECOVERY_APPROVAL_EFFECT,
+        issue=ctx.issue,
+        lane=ctx.lane_id,
+        operation=stale_worker_recovery_approval_operation(request),
+    )
+
+    def _source(**_kwargs):
+        return _FreshStaleRecoveryApprovalSource(
+            issue=ctx.issue, journal=journal, marker=marker
+        )
+
+    with mock.patch.object(LiveRedmineJournalSource, "from_environment", side_effect=_source):
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -433,7 +507,8 @@ class StaleWorkerRecoveryThroughPublicCli(unittest.TestCase):
         ctx = h.recover_stale_git_lane("issue_14097_resume", issue="14097")
         self.assertEqual(h.live_locator_count(), 2)  # the stale worker + its surviving gateway
 
-        outcome = h.drive_recover_stale_to_completion(ctx)
+        with _fresh_stale_recovery_approval(ctx):
+            outcome = h.drive_recover_stale_to_completion(ctx)
 
         # THE single shared acceptance predicate — the same one the installed smoke's positive
         # drive scores and its negative control negates (review j#85253).
@@ -479,7 +554,8 @@ class StaleWorkerRecoveryThroughPublicCli(unittest.TestCase):
         # `--execute` pass owns and lands a fresh worker.
         capable = InstalledFaultHarness(self)
         cap_ctx = capable.recover_stale_git_lane("issue_14203_gen_capable", issue="14203")
-        capable.recover_stale_cli(cap_ctx, execute=True)
+        with _fresh_stale_recovery_approval(cap_ctx):
+            capable.recover_stale_cli(cap_ctx, execute=True)
         self.assertTrue(capable._fresh_worker_locator(cap_ctx))
 
         # Fault: the SAME heal through a generation-incapable launcher stops at effect_failed
@@ -488,7 +564,8 @@ class StaleWorkerRecoveryThroughPublicCli(unittest.TestCase):
         ctx = faulty.recover_stale_git_lane("issue_14203_gen_incapable", issue="14203")
         faulty.make_launcher_generation_incapable()
 
-        outcome = faulty.recover_stale_cli(ctx, execute=True).json()
+        with _fresh_stale_recovery_approval(ctx):
+            outcome = faulty.recover_stale_cli(ctx, execute=True).json()
         self.assertEqual(outcome["recovery_status"], "effect_failed")
         self.assertFalse(outcome["fresh_slot_attested"])
         self.assertFalse(faulty._fresh_worker_locator(ctx))
@@ -502,7 +579,8 @@ class StaleWorkerRecoveryThroughPublicCli(unittest.TestCase):
         h = InstalledFaultHarness(self)
         ctx = h.recover_stale_git_lane("issue_14097_uncertain", issue="14097")
 
-        outcome = h.drive_recover_stale_to_completion(ctx, inject_uncertain=True)
+        with _fresh_stale_recovery_approval(ctx):
+            outcome = h.drive_recover_stale_to_completion(ctx, inject_uncertain=True)
 
         # The injection actually landed the uncertain fault (guard against a vacuous negation)...
         self.assertNotEqual(outcome.second["status"], "completed")

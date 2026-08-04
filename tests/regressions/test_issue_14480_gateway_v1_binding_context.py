@@ -67,6 +67,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E402,E501
     sublane_actuator_v1_replacement as v1_drive,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.recovery_owner_approval_live import (  # noqa: E402,E501
+    verify_live_recovery_owner_approval,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_gateway_recovery import (  # noqa: E402,E501
     GatewayRefreshRequest,
     GatewayRefreshUseCase,
@@ -83,8 +86,21 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     GatewayRefreshObservation,
     GatewayTurnObservation,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E402,E501
+    ISSUER_COORDINATOR,
+    ResolvedIssuer,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_launch_authority import (  # noqa: E402,E501
     LAUNCH_AUTHORITY_OK,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_owner_approval import (  # noqa: E402,E501
+    GATEWAY_RECOVERY_APPROVAL_EFFECT,
+    GATEWAY_RECOVERY_APPROVAL_GATE,
+    gateway_recovery_approval_operation,
+    render_recovery_owner_approval_marker,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E402,E501
+    RedmineJournalEntry,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (  # noqa: E402,E501
     ATTEST_BOUND,
@@ -629,6 +645,40 @@ class _Ops:
 
     def resume_lane_authority(self, request) -> bool:
         return True
+
+    def approval_verified(self, request, *, journal: str) -> bool:
+        """Construct and verify the exact fresh approval this downstream fixture needs.
+
+        This is deliberately not an unconditional ``True``: the real shared verifier reads a
+        newly-created canonical marker and an anchored coordinator issuer, so any operation-field
+        drift fails before this fixture can reach the launch fence it is meant to measure.
+        """
+        operation = gateway_recovery_approval_operation(request)
+        anchor_issue = request.effective_anchor_issue
+        marker = render_recovery_owner_approval_marker(
+            gate=GATEWAY_RECOVERY_APPROVAL_GATE,
+            effect=GATEWAY_RECOVERY_APPROVAL_EFFECT,
+            issue=request.issue,
+            lane=request.lane,
+            operation=operation,
+        )
+        entry = RedmineJournalEntry(anchor_issue, journal, marker)
+        return verify_live_recovery_owner_approval(
+            repo_root=Path(__file__).resolve().parents[2],
+            journal_reader=lambda issue: [entry] if str(issue) == anchor_issue else [],
+            journal_reader_fresh=True,
+            journal=journal,
+            anchor_issue=anchor_issue,
+            gate=GATEWAY_RECOVERY_APPROVAL_GATE,
+            effect=GATEWAY_RECOVERY_APPROVAL_EFFECT,
+            issue=request.issue,
+            lane=request.lane,
+            operation=operation,
+            issuer_resolver=lambda _entry: ResolvedIssuer(
+                role=ISSUER_COORDINATOR,
+                authority_anchor="fixture:issue-14480:coordinator",
+            ),
+        )
 
     def replacement_store_admission(self, key, pin):
         """No store constraint in this fixture (Redmine #14756 j#96848).
