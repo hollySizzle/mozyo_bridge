@@ -34,6 +34,7 @@ observation is idempotent.
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 import tempfile
@@ -80,15 +81,24 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.superseded_failure_correlation import (  # noqa: E501
     ACK_INVALID,
+    ROUND_FINDINGS_DECLARED,
+    ROUND_FINDINGS_FIELD_ORDER,
+    ROUND_FINDINGS_INVALID,
+    ROUND_FINDINGS_NONE,
     SUCCESSOR_ACK_FIELD_ORDER,
     SUCCESSOR_ACK_GATE,
+    VERDICT_COVERAGE_MISMATCH,
     VERDICT_NOT_ACCEPTED,
     VERDICT_NOT_RECORDED,
+    VERDICT_PAIRING_UNREADABLE,
+    VERDICT_ROUND_FINDINGS_UNDECLARED,
     VERDICT_TARGET_MISMATCH,
     VERDICT_UNRESOLVED,
     fold_finding_verdicts,
     fold_successor_acknowledgement,
     journal_ref,
+    read_round_findings,
+    render_round_findings_marker,
     render_successor_acknowledgement_marker,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.superseded_failure_terminal import (  # noqa: E501
@@ -157,6 +167,16 @@ def declaration_marker(**overrides) -> str:
     return render_superseded_failure_marker(**kwargs)
 
 
+def round_findings_marker(**overrides) -> str:
+    """The failed round's own enumeration of the findings it raised (#14755 j#99057 finding_1).
+
+    The real #14577 j#93648 raised two, and j#93656 recorded a verdict for each.
+    """
+    kwargs = dict(review_journal=REVIEW_JOURNAL, findings=("1", "2"))
+    kwargs.update(overrides)
+    return render_round_findings_marker(**kwargs)
+
+
 def acknowledgement_marker(**overrides) -> str:
     kwargs = dict(
         issue=SUCCESSOR,
@@ -175,20 +195,30 @@ def source_journals(
     verdict_target: str = REVIEW_JOURNAL,
     review_conclusion: str = "要修正",
     close: bool = True,
+    findings_marker: "str | None" = "",
+    verdict_findings: "tuple[str, ...]" = ("1", "2"),
     extra: "list[tuple[str, str]] | None" = None,
 ) -> "list[tuple[str, str]]":
-    """The source issue's durable history, shaped like #14577's real one."""
+    """The source issue's durable history, shaped like #14577's real one.
+
+    ``findings_marker`` defaults to the canonical enumeration (``""`` -> the default marker);
+    ``None`` removes it, which is the pre-#99057 shape where the round stated no finding set.
+    ``verdict_findings`` chooses which of those findings the verdict journal actually answers.
+    """
+    enumeration = round_findings_marker() if findings_marker == "" else findings_marker
+    review_note = f"## Gate: review\n- 結論: {review_conclusion}\n"
+    if enumeration:
+        review_note += f"\n{enumeration}\n"
+    verdict_lines = "".join(
+        f"- finding_{fid}: 指摘 {fid}\n  - verdict: {verdict}\n" for fid in verdict_findings
+    )
     journals = [
         ("93628", "## Gate: review_request\n- commit_or_diff: `735a5f88`\n"),
-        ("93648", f"## Gate: review\n- 結論: {review_conclusion}\n"),
+        ("93648", review_note),
         (
             VERDICT_JOURNAL,
             "## Gate: review_finding_verdict\n"
-            f"- 対象review_journal: j#{verdict_target}\n"
-            "- finding_1: scope 2 は本 generation では成立不能\n"
-            f"  - verdict: {verdict}\n"
-            "- finding_2: 記述が測定を越えていた\n"
-            f"  - verdict: {verdict}\n",
+            f"- 対象review_journal: j#{verdict_target}\n" + verdict_lines,
         ),
     ]
     if close:
@@ -460,9 +490,12 @@ class FindingsMustHaveBeenReceived(unittest.TestCase):
             extra=[
                 (
                     "93900",
+                    # Covers the round's whole finding set, so what refuses is the DISPUTE and
+                    # not the coverage — the shadowing is what this pins.
                     "## Gate: review_finding_verdict\n"
                     f"- 対象review_journal: j#{REVIEW_JOURNAL}\n"
-                    "- finding_1: 再燃\n  - verdict: disputed\n",
+                    "- finding_1: 再燃\n  - verdict: disputed\n"
+                    "- finding_2: 再燃\n  - verdict: accepted\n",
                 ),
                 (
                     DECLARATION_JOURNAL,
@@ -557,6 +590,149 @@ class FindingsMustHaveBeenReceived(unittest.TestCase):
             VERDICT_UNRESOLVED,
         )
         self.assertEqual(admit(source=journals).reason, REASON_FINDINGS_NOT_ACCEPTED)
+
+
+class TheVerdictsMustCoverEveryFindingTheRoundRaised(unittest.TestCase):
+    """Redmine #14755 review j#99057 finding_1.
+
+    "Every verdict PRESENT is accepted" is satisfied by a verdict journal that answers one of the
+    round's two findings, and that opened the terminal — the acceptance refuses 未受領 finding
+    independently, and live-zero bounds repository change without bounding this. So the verdicts
+    are checked for coverage against the set the ROUND enumerated, in the round's own journal.
+    """
+
+    def test_a_verdict_covering_only_some_findings_is_refused(self):
+        # The exact reproduction: the round raised finding_1 and finding_2; the verdict journal
+        # answers finding_1 only, and every verdict it carries IS accepted.
+        journals = source_journals(marker=declaration_marker(), verdict_findings=("1",))
+        self.assertEqual(
+            fold_finding_verdicts(journals, review_journal=REVIEW_JOURNAL).reason,
+            VERDICT_COVERAGE_MISMATCH,
+        )
+        outcome = admit(source=journals)
+        self.assertFalse(outcome.admissible)
+        self.assertEqual(outcome.reason, REASON_FINDINGS_NOT_ACCEPTED)
+
+    def test_the_complete_verdict_still_admits(self):
+        # The control the refusal above is only meaningful against.
+        self.assertTrue(admit().admissible)
+
+    def test_a_verdict_answering_a_finding_the_round_never_raised_is_refused(self):
+        journals = source_journals(
+            marker=declaration_marker(), verdict_findings=("1", "2", "3")
+        )
+        self.assertEqual(
+            fold_finding_verdicts(journals, review_journal=REVIEW_JOURNAL).reason,
+            VERDICT_COVERAGE_MISMATCH,
+        )
+        self.assertEqual(admit(source=journals).reason, REASON_FINDINGS_NOT_ACCEPTED)
+
+    def test_a_round_that_enumerates_nothing_supplies_no_set_to_be_complete_against(self):
+        # The pre-fix shape. Refusing is the fail-closed direction: coverage cannot be checked
+        # against a set nobody stated, and inferring one from the round's prose would be this
+        # module minting a second definition of finding identity.
+        journals = source_journals(marker=declaration_marker(), findings_marker=None)
+        self.assertEqual(
+            fold_finding_verdicts(journals, review_journal=REVIEW_JOURNAL).reason,
+            VERDICT_ROUND_FINDINGS_UNDECLARED,
+        )
+        self.assertEqual(admit(source=journals).reason, REASON_FINDINGS_NOT_ACCEPTED)
+
+    def test_an_enumeration_about_another_round_does_not_supply_this_ones_set(self):
+        journals = source_journals(
+            marker=declaration_marker(),
+            findings_marker=round_findings_marker(review_journal="93628"),
+        )
+        self.assertEqual(
+            fold_finding_verdicts(journals, review_journal=REVIEW_JOURNAL).reason,
+            VERDICT_TARGET_MISMATCH,
+        )
+        self.assertEqual(admit(source=journals).reason, REASON_FINDINGS_NOT_ACCEPTED)
+
+    def test_findings_and_verdicts_must_pair_one_to_one(self):
+        # A finding opened and never answered, a verdict answering nothing named, and the same
+        # finding twice: each is unreadable AS this shape rather than a smaller readable record.
+        bodies = {
+            "finding with no verdict": "- finding_1: a\n- finding_2: b\n  - verdict: accepted\n",
+            "verdict with no finding": "- verdict: accepted\n- finding_1: a\n  - verdict: accepted\n",
+            "the same finding twice": (
+                "- finding_1: a\n  - verdict: accepted\n"
+                "- finding_1: a again\n  - verdict: accepted\n"
+            ),
+        }
+        for label, lines in bodies.items():
+            with self.subTest(label):
+                journals = source_journals(marker=declaration_marker(), extra=[
+                    (
+                        "93901",
+                        "## Gate: review_finding_verdict\n"
+                        f"- 対象review_journal: j#{REVIEW_JOURNAL}\n" + lines,
+                    )
+                ])
+                self.assertEqual(
+                    fold_finding_verdicts(journals, review_journal=REVIEW_JOURNAL).reason,
+                    VERDICT_PAIRING_UNREADABLE,
+                )
+                self.assertEqual(
+                    admit(source=journals).reason, REASON_FINDINGS_NOT_ACCEPTED
+                )
+
+    def test_the_enumeration_grammar_is_closed(self):
+        good = round_findings_marker()
+        self.assertEqual(read_round_findings(good).state, ROUND_FINDINGS_DECLARED)
+        self.assertEqual(read_round_findings(good).findings, ("1", "2"))
+        self.assertEqual(read_round_findings("no marker here").state, ROUND_FINDINGS_NONE)
+        # A DERIVED oracle over the whole contract, so a field added later is covered without
+        # editing this test. The invariant is that NO single-field mutation still reads back as
+        # this round's declared set — not that every mutation is `invalid`, because the two
+        # identity-bearing fields lose it differently and saying otherwise would be asserting a
+        # uniformity the contract does not have: mutating `gate` makes the marker name a
+        # different gate (so this gate is simply not declared) and mutating `findings` yields a
+        # well-formed enumeration of a DIFFERENT set, which the coverage check is what refuses.
+        declared = read_round_findings(good)
+        for field in ROUND_FINDINGS_FIELD_ORDER:
+            with self.subTest(field):
+                broken = re.sub(rf"{field}=[^:\]]*", f"{field}=zzz", good, count=1)
+                self.assertNotEqual(broken, good)
+                self.assertNotEqual(read_round_findings(broken), declared)
+        # `version` and `review_journal` are the ones whose mutation is unreadable AS this
+        # contract, and an unreadable declaration must SHADOW rather than be skipped.
+        for field in ("version", "review_journal"):
+            with self.subTest(f"{field} is invalid, not merely different"):
+                broken = re.sub(rf"{field}=[^:\]]*", f"{field}=zzz", good, count=1)
+                self.assertEqual(read_round_findings(broken).state, ROUND_FINDINGS_INVALID)
+
+    def test_the_renderer_refuses_what_its_own_reader_would(self):
+        for kwargs in (
+            {"review_journal": "", "findings": ("1",)},
+            {"review_journal": REVIEW_JOURNAL, "findings": ()},
+            {"review_journal": REVIEW_JOURNAL, "findings": ("1", "")},
+            {"review_journal": REVIEW_JOURNAL, "findings": ("1", "1")},
+            {"review_journal": REVIEW_JOURNAL, "findings": ("1,2",)},
+            {"review_journal": REVIEW_JOURNAL, "findings": ("a b",)},
+        ):
+            with self.subTest(str(kwargs)):
+                with self.assertRaises(ValueError):
+                    render_round_findings_marker(**kwargs)
+
+    def test_a_quoted_enumeration_is_not_a_declaration(self):
+        quoted = f"## Gate: review\n- 結論: 要修正\n\n```\n{round_findings_marker()}\n```\n"
+        self.assertEqual(read_round_findings(quoted).state, ROUND_FINDINGS_NONE)
+
+    def test_the_heading_spelling_the_real_verdict_uses_reads_the_same(self):
+        # #14577 j#93656 writes its findings as `### finding_1 — …` headings, not list items.
+        journals = source_journals(marker=declaration_marker(), extra=[
+            (
+                "93901",
+                "## Gate: review_finding_verdict\n"
+                f"- 対象review_journal: j#{REVIEW_JOURNAL}\n"
+                "### finding_1 — scope 2\n- **verdict: accepted**\n"
+                "### finding_2 — 記述\n- **verdict: accepted**\n",
+            )
+        ])
+        self.assertTrue(
+            fold_finding_verdicts(journals, review_journal=REVIEW_JOURNAL).accepted
+        )
 
 
 class TheSuccessorMustAcknowledgeAndHaveSucceeded(unittest.TestCase):

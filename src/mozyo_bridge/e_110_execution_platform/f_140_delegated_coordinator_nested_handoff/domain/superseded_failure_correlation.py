@@ -7,7 +7,11 @@ declaration does not control:
 - :func:`fold_finding_verdicts` — the implementer's ``review_finding_verdict`` gate on the SAME
   issue. The central preset makes a per-finding verdict mandatory once a review carries findings
   (``### Review Finding Verdict Obligation``), so "the findings were received and accepted" is
-  already a governed durable fact and does not need a new authority invented for it;
+  already a governed durable fact and does not need a new authority invented for it. What the
+  preset does NOT give it is a finding set to be complete against, so the verdicts are checked
+  for COVERAGE against :func:`read_round_findings` — the round's own enumeration, in the round's
+  own journal (#14755 review j#99057 finding_1: without it, a verdict journal answering one of
+  two findings satisfied "every verdict present is accepted" and opened the terminal);
 - :func:`fold_successor_acknowledgement` — the SUCCESSOR issue's own acknowledgement that it
   supersedes this one. A source-side declaration alone can name any issue in the tracker as its
   successor; requiring the named issue to say so too is what makes the pairing a correlation
@@ -210,6 +214,18 @@ _VERDICT_TARGET_FIELD_RE = re.compile(
 _VERDICT_FIELD_RE = re.compile(
     r"^\s*[-*]?\s*\**\s*verdict\**\s*[:：]\s*(?P<value>.+?)\s*$", re.IGNORECASE
 )
+#: The governed ``- finding_<id>: <要約>`` line that OPENS one finding's verdict block (central
+#: preset ``## Gate: review_finding_verdict``). Accepted as a heading too (``### finding_1 — …``),
+#: because that is the form the real records are written in (#14577 j#93656) and both surfaces
+#: mean the same declaration. The delimiter set is the same reason: the list form writes ``:`` and
+#: the heading form an em / en dash. What is NOT widened is the token itself — it must be the
+#: template's literal ``finding_<id>``, so a review's own ``F1`` / ``Finding 1`` prose is not
+#: silently read as this contract's identity (that normalization would be a second definition of
+#: finding identity, and this module refuses to mint one).
+_FINDING_DECL_RE = re.compile(
+    r"^\s*(?:[-*]\s*|#{1,6}\s*)?\**\s*finding_(?P<id>[A-Za-z0-9]+)\**\s*[:：—–-]",
+    re.IGNORECASE,
+)
 
 #: Every finding on the named review round has an ``accepted`` verdict.
 VERDICT_ALL_ACCEPTED = "review_findings_all_accepted"
@@ -221,6 +237,16 @@ VERDICT_TARGET_MISMATCH = "review_finding_verdict_names_another_review_round"
 VERDICT_NOT_ACCEPTED = "review_finding_not_accepted"
 #: The verdict gate is declared but its target / verdicts could not be read at all.
 VERDICT_UNRESOLVED = "review_finding_verdict_unresolved"
+#: The verdict gate's findings and verdicts do not pair one-to-one — a finding opened with no
+#: verdict under it, a verdict with no finding above it, or the same finding id twice.
+VERDICT_PAIRING_UNREADABLE = "review_finding_verdict_findings_do_not_pair"
+#: The failed round declares no readable finding ENUMERATION, so which findings it raised — and
+#: therefore whether the verdicts cover them — is not established by any record (#14755 review
+#: j#99057 finding_1).
+VERDICT_ROUND_FINDINGS_UNDECLARED = "review_round_findings_not_declared"
+#: The verdicts do not cover exactly the findings the round enumerated: one is missing, or one is
+#: answered that the round never raised.
+VERDICT_COVERAGE_MISMATCH = "review_findings_not_all_given_a_verdict"
 
 FINDING_VERDICT_REASONS: frozenset[str] = frozenset(
     {
@@ -229,8 +255,149 @@ FINDING_VERDICT_REASONS: frozenset[str] = frozenset(
         VERDICT_TARGET_MISMATCH,
         VERDICT_NOT_ACCEPTED,
         VERDICT_UNRESOLVED,
+        VERDICT_PAIRING_UNREADABLE,
+        VERDICT_ROUND_FINDINGS_UNDECLARED,
+        VERDICT_COVERAGE_MISMATCH,
     }
 )
+
+
+# ---------------------------------------------------------------------------
+# 1a. The failed round's OWN enumeration of the findings it raised.
+# ---------------------------------------------------------------------------
+
+#: The gate a REVIEW ROUND journal declares to enumerate the findings that round raised.
+#:
+#: #14755 review j#99057 finding_1 measured why this record has to exist. Without it the verdict
+#: fold could only ask "is every verdict PRESENT an ``accepted``", which a verdict journal listing
+#: one of two findings satisfies — so a partial disposition opened the terminal. Coverage cannot
+#: be checked against a set nobody states, and no such set exists today: the preset's ``## Gate:
+#: review`` template enumerates no per-finding identity, and the real records spell theirs three
+#: different ways (``#### F1`` in #14577 j#93648, ``### Finding 1`` in #14755 j#99057, ``###
+#: finding_1`` in the verdict j#93656). Inferring one identity from those three would be this
+#: module inventing a normalization the contract never defined.
+#:
+#: So the round states its own finding set, in the round's own journal, under this module's token.
+#: That keeps the enumeration with the authority that raised the findings (the reviewer) rather
+#: than with the declaration writer who benefits from under-counting them, and it changes NOTHING
+#: about the central review gate: this is an additive marker read only by this opt-in terminal
+#: route, exactly like :data:`SUCCESSOR_ACK_GATE`. A review that does not carry one simply cannot
+#: be terminalized this way — which is the fail-closed direction.
+#:
+#: It does NOT establish who wrote the enumeration; nothing in this workspace can (ruling #14219
+#: j#86718). What it establishes is that the verdicts answer a finding set stated in a DIFFERENT
+#: record than the verdict journal itself.
+ROUND_FINDINGS_GATE = "superseded_failure_round_findings"
+#: The schema version. An unknown version is refused rather than read under today's meanings.
+ROUND_FINDINGS_VERSION = "1"
+#: The COMPLETE, ORDERED field set, no more and no less, in this sequence.
+ROUND_FINDINGS_FIELD_ORDER: Tuple[str, ...] = (
+    "gate",
+    "version",
+    "review_journal",
+    "findings",
+)
+#: The separator between finding ids inside the single ``findings`` field. Not a marker separator,
+#: so it cannot split the field into two.
+ROUND_FINDINGS_SEPARATOR = ","
+
+#: The round declares no enumeration at all.
+ROUND_FINDINGS_NONE = "none"
+#: A valid enumeration: one canonical marker, contracted literals, a non-empty duplicate-free id set.
+ROUND_FINDINGS_DECLARED = "declared"
+#: An enumeration is DECLARED but cannot be read as one. Fail-closed: treated exactly like
+#: :data:`ROUND_FINDINGS_NONE`, and it SUPERSEDES an older valid one.
+ROUND_FINDINGS_INVALID = "invalid"
+
+ROUND_FINDINGS_STATES: frozenset[str] = frozenset(
+    {ROUND_FINDINGS_NONE, ROUND_FINDINGS_DECLARED, ROUND_FINDINGS_INVALID}
+)
+
+
+@dataclass(frozen=True)
+class RoundFindingsFacts:
+    """The finding set ONE review-round journal says that round raised.
+
+    ``findings`` is EMPTY unless the enumeration is valid — never guessed from the round's prose,
+    and never completed from what the verdicts happened to answer.
+    """
+
+    state: str = ROUND_FINDINGS_NONE
+    review_journal: str = ""
+    findings: Tuple[str, ...] = ()
+
+    @property
+    def in_force(self) -> bool:
+        """True ONLY for a VALID enumeration. :data:`ROUND_FINDINGS_INVALID` is False."""
+        return self.state == ROUND_FINDINGS_DECLARED
+
+
+def read_round_findings(notes: str) -> RoundFindingsFacts:
+    """The finding enumeration ONE review-round journal declares (pure).
+
+    Read from the round's own journal rather than folded latest-wins across the issue: the
+    enumeration is a property OF that round, so a later round's enumeration must not be able to
+    stand in for it. Which journal is the round is decided upstream, by the same glance grammar
+    every other consumer uses.
+    """
+    declared, fields = one_canonical_marker(
+        notes, gate=ROUND_FINDINGS_GATE, field_order=ROUND_FINDINGS_FIELD_ORDER
+    )
+    if not declared:
+        return RoundFindingsFacts()
+    if fields is None:
+        return RoundFindingsFacts(state=ROUND_FINDINGS_INVALID)
+    constants = {"gate": ROUND_FINDINGS_GATE, "version": ROUND_FINDINGS_VERSION}
+    if any(fields.get(key) != value for key, value in constants.items()):
+        return RoundFindingsFacts(state=ROUND_FINDINGS_INVALID)
+    review = journal_ref(fields.get("review_journal", ""))
+    if not review:
+        return RoundFindingsFacts(state=ROUND_FINDINGS_INVALID)
+    raw = str(fields.get("findings", "") or "")
+    parts = [part.strip().lower() for part in raw.split(ROUND_FINDINGS_SEPARATOR)]
+    if not parts or any(not part for part in parts):
+        # An empty id — from an empty field, a trailing separator, or two adjacent ones — means the
+        # producer could not render this list, so the list says nothing rather than saying less.
+        return RoundFindingsFacts(state=ROUND_FINDINGS_INVALID, review_journal=review)
+    if len(set(parts)) != len(parts):
+        # The same finding named twice cannot be covered "once each" by any verdict set.
+        return RoundFindingsFacts(state=ROUND_FINDINGS_INVALID, review_journal=review)
+    return RoundFindingsFacts(
+        state=ROUND_FINDINGS_DECLARED, review_journal=review, findings=tuple(parts)
+    )
+
+
+def render_round_findings_marker(*, review_journal: object, findings: Sequence[str]) -> str:
+    """The exact marker a valid round enumeration must carry (pure).
+
+    Every producer error raises ``ValueError`` rather than being written, for the reason
+    :func:`render_successor_acknowledgement_marker` states: a renderer that emits what its own
+    parser refuses produces durable records that read back as a typed zero.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_envelope import (  # noqa: E501
+        reject_marker_separator,
+    )
+
+    review = journal_ref(review_journal)
+    if not review:
+        raise ValueError("review_journal must be a journal reference")
+    ids = [str(value or "").strip().lower() for value in findings or ()]
+    if not ids or any(not value for value in ids):
+        raise ValueError("findings must be a non-empty list of non-empty ids")
+    if len(set(ids)) != len(ids):
+        raise ValueError("findings must not repeat an id")
+    if any(ROUND_FINDINGS_SEPARATOR in value for value in ids):
+        raise ValueError("a finding id must not contain the list separator")
+    for value in ids:
+        reject_marker_separator(value, field="findings")
+    fields = {
+        "gate": ROUND_FINDINGS_GATE,
+        "version": ROUND_FINDINGS_VERSION,
+        "review_journal": review,
+        "findings": ROUND_FINDINGS_SEPARATOR.join(ids),
+    }
+    body = ":".join(f"{key}={fields[key]}" for key in ROUND_FINDINGS_FIELD_ORDER)
+    return f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:{body}]"
 
 
 @dataclass(frozen=True)
@@ -275,6 +442,14 @@ def fold_finding_verdicts(
     fenced code block resolved a determination and the admission returned ``ok``.
     """
     wanted = journal_ref(review_journal)
+    # The round's OWN enumeration, read from the round's journal. Located by the id the
+    # declaration named, so the finding set is a property of that round and a later round's
+    # enumeration cannot stand in for it.
+    round_findings = RoundFindingsFacts()
+    for journal_id, notes in journals or ():
+        if wanted and journal_ref(journal_id) == wanted:
+            round_findings = read_round_findings(notes or "")
+            break
     latest: Optional[Tuple[int, FindingVerdictFacts]] = None
     for journal_id, notes in journals or ():
         jint = _int_journal(journal_id)
@@ -283,7 +458,7 @@ def fold_finding_verdicts(
         text = notes or ""
         if not _declares_verdict_gate(text):
             continue
-        facts = _journal_verdicts(text, wanted=wanted)
+        facts = _journal_verdicts(text, wanted=wanted, round_findings=round_findings)
         if latest is None or jint > latest[0]:
             latest = (
                 jint,
@@ -322,7 +497,50 @@ def _declares_verdict_gate(notes: str) -> bool:
     )
 
 
-def _journal_verdicts(notes: str, *, wanted: str) -> FindingVerdictFacts:
+def _paired_verdicts(notes: str) -> "Optional[dict[str, str]]":
+    """``{finding_id: verdict}`` for one verdict journal, or ``None`` if it does not pair (pure).
+
+    One pass, in document order: a ``finding_<id>`` line opens a block and the next ``verdict:``
+    line closes it. ``None`` — not a partial mapping — whenever the two do not pair one-to-one:
+
+    - a finding opened with no verdict beneath it (the preset's "一括 verdict は invalid": a
+      finding listed and left unanswered has decided nothing);
+    - a verdict with no finding above it (a bare verdict answers something unnamed, so it cannot
+      be counted toward covering any particular finding);
+    - the same finding id twice (which of the two verdicts is that finding's is unordered).
+
+    Returning ``None`` rather than the readable subset is the same rule
+    :func:`one_canonical_marker` applies to markers: a record that cannot be read as this shape
+    must not read exactly like a smaller record that can.
+    """
+    paired: "dict[str, str]" = {}
+    open_id = ""
+    for line in canonical_note_lines(notes or ""):
+        text = line or ""
+        decl = _FINDING_DECL_RE.match(text)
+        if decl is not None:
+            if open_id:
+                return None  # the previous finding was never answered
+            finding_id = decl.group("id").strip().lower()
+            if not finding_id or finding_id in paired:
+                return None
+            open_id = finding_id
+            continue
+        verdict = _VERDICT_FIELD_RE.match(text)
+        if verdict is None:
+            continue
+        if not open_id:
+            return None  # a verdict answering nothing named
+        paired[open_id] = _clean_field_value(verdict.group("value")).lower()
+        open_id = ""
+    if open_id:
+        return None
+    return paired or None
+
+
+def _journal_verdicts(
+    notes: str, *, wanted: str, round_findings: RoundFindingsFacts
+) -> FindingVerdictFacts:
     """What ONE verdict-gate journal says about ``wanted`` (pure)."""
     targets = {
         journal_ref(_clean_field_value(match.group("value")))
@@ -336,20 +554,32 @@ def _journal_verdicts(notes: str, *, wanted: str) -> FindingVerdictFacts:
         # therefore decided about neither.
         return FindingVerdictFacts(reason=VERDICT_UNRESOLVED)
     target = next(iter(targets))
-    verdicts = [
-        _clean_field_value(match.group("value")).lower()
-        for line in canonical_note_lines(notes or "")
-        for match in (_VERDICT_FIELD_RE.match(line or ""),)
-        if match is not None
-    ]
-    if not verdicts:
-        return FindingVerdictFacts(reason=VERDICT_UNRESOLVED, review_journal=target)
+    paired = _paired_verdicts(notes)
+    if paired is None:
+        return FindingVerdictFacts(
+            reason=VERDICT_PAIRING_UNREADABLE, review_journal=target
+        )
     if not wanted or target != wanted:
         # Reported BEFORE the verdict values are judged: "these verdicts are about another round"
         # is a different operational problem from "a finding was disputed", and collapsing them
         # would point an operator at the wrong record.
         return FindingVerdictFacts(reason=VERDICT_TARGET_MISMATCH, review_journal=target)
-    if any(value != VERDICT_ACCEPTED for value in verdicts):
+    # COVERAGE before content (#14755 review j#99057 finding_1). "every verdict present is
+    # accepted" is satisfied by a verdict journal that lists one of the round's two findings, so
+    # the set the verdicts answer must equal the set the ROUND said it raised — checked against
+    # the round's own enumeration, a record this journal did not write.
+    if not round_findings.in_force:
+        return FindingVerdictFacts(
+            reason=VERDICT_ROUND_FINDINGS_UNDECLARED, review_journal=target
+        )
+    if round_findings.review_journal != target:
+        # The enumeration read from the round names a different round than these verdicts do.
+        return FindingVerdictFacts(reason=VERDICT_TARGET_MISMATCH, review_journal=target)
+    if set(paired) != set(round_findings.findings):
+        return FindingVerdictFacts(
+            reason=VERDICT_COVERAGE_MISMATCH, review_journal=target
+        )
+    if any(value != VERDICT_ACCEPTED for value in paired.values()):
         return FindingVerdictFacts(reason=VERDICT_NOT_ACCEPTED, review_journal=target)
     return FindingVerdictFacts(
         accepted=True, reason=VERDICT_ALL_ACCEPTED, review_journal=target
@@ -558,6 +788,15 @@ __all__ = (
     "FINDING_VERDICT_GATE_TOKEN",
     "FINDING_VERDICT_REASONS",
     "FindingVerdictFacts",
+    "ROUND_FINDINGS_DECLARED",
+    "ROUND_FINDINGS_FIELD_ORDER",
+    "ROUND_FINDINGS_GATE",
+    "ROUND_FINDINGS_INVALID",
+    "ROUND_FINDINGS_NONE",
+    "ROUND_FINDINGS_SEPARATOR",
+    "ROUND_FINDINGS_STATES",
+    "ROUND_FINDINGS_VERSION",
+    "RoundFindingsFacts",
     "SUCCESSOR_ACK_DECISION",
     "SUCCESSOR_ACK_FIELD_ORDER",
     "SUCCESSOR_ACK_GATE",
@@ -566,8 +805,11 @@ __all__ = (
     "SuccessorAcknowledgementFacts",
     "VERDICT_ACCEPTED",
     "VERDICT_ALL_ACCEPTED",
+    "VERDICT_COVERAGE_MISMATCH",
     "VERDICT_NOT_ACCEPTED",
     "VERDICT_NOT_RECORDED",
+    "VERDICT_PAIRING_UNREADABLE",
+    "VERDICT_ROUND_FINDINGS_UNDECLARED",
     "VERDICT_TARGET_MISMATCH",
     "VERDICT_UNRESOLVED",
     "fold_finding_verdicts",
@@ -576,5 +818,7 @@ __all__ = (
     "journal_ref",
     "marker_declares_gate",
     "one_canonical_marker",
+    "read_round_findings",
+    "render_round_findings_marker",
     "render_successor_acknowledgement_marker",
 )

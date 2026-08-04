@@ -3927,16 +3927,17 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "own renderer",
         ),
         f"{_D}/domain/superseded_failure_correlation.py": (
-            ["*", "*", "*", "*:MARKER_RE"],
-            "reads (Redmine #14755): the successor's supersession acknowledgement gate, and the "
-            "gate-token half of qualifying a review_finding_verdict journal. Exactly-one-marker "
-            "rule per note for the acknowledgement — a second declaration of that gate, or one it "
-            "names but cannot read, poisons the note for the gate rather than yielding the "
-            "readable sibling; also renders the acknowledgement through the shared "
-            "closed-vocabulary reader",
+            ["*", "*", "*", "*", "*:MARKER_RE"],
+            "reads (Redmine #14755): the successor's supersession acknowledgement gate, the "
+            "failed round's own finding ENUMERATION gate (review j#99057 finding_1 — the set the "
+            "verdicts must cover), and the gate-token half of qualifying a review_finding_verdict "
+            "journal. Exactly-one-marker rule per note for both the acknowledgement and the "
+            "enumeration — a second declaration of that gate, or one it names but cannot read, "
+            "poisons the note for the gate rather than yielding the readable sibling; also "
+            "renders both markers through the shared closed-vocabulary reader",
         ),
         f"{_D}/domain/superseded_failure_terminal.py": (
-            ["*", "*", "*", "*", "*"],
+            ["*", "*", "*", "*", "*", "*"],
             "reads (Redmine #14755): the superseded-failure terminal declaration gate, located and "
             "parsed through superseded_failure_correlation's single-scan reader (so the "
             "exactly-one-marker rule is that module's); renders the declaration marker itself",
@@ -4212,11 +4213,11 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "inherits via a used import of handoff, recovery_anchor_delivery; names no marker token itself",
         ),
         f"{_D}/application/retire_admissibility.py": (
-            ['*', '*', '*', '*', '*', '*'],
+            ['*', '*', '*', '*', '*', '*', '*'],
             "inherits via a used import of hibernate_evidence_integration, redmine_journal_source, "
             "(Redmine #14695) no_change_review_waiver and (Redmine #14755) "
-            "superseded_failure_terminal / superseded_failure_correlation; names no marker token "
-            "itself",
+            "superseded_failure_terminal / superseded_failure_correlation — the latter now also "
+            "carrying the failed round's finding-enumeration gate; names no marker token itself",
         ),
         f"{_D}/application/sublane_gateway_recovery_live.py": (
             ['*', '*', 'handoff', 'recovery-delivery-authorization', 'recovery-delivery-zero-send'],
