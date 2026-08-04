@@ -469,6 +469,39 @@ class OfflineRolloutExecutionRegressionTests(unittest.TestCase):
         self.assertFalse(refused.ok)
         self.assertEqual(refused.reason, "attestation_plan_drift")
 
+    def test_startup_replay_authority_names_deferred_completion_check(self) -> None:
+        planned = {
+            "state": "recognized",
+            "version": 1,
+            "target_version": 2,
+            "upgrade_required": True,
+            "content_digest": "a" * 64,
+            "migration_plan_digest": "b" * 64,
+        }
+        target = dict(planned, version=2, upgrade_required=False)
+        action = {
+            "plan": {"stores": {"startup_transaction": planned}},
+            "completed_phases": ["verified_backup"],
+            "active_phase": "migrate_startup_transaction",
+        }
+        port = LiveOfflineRolloutExecutionPort(home=self.home, env={})
+        with patch.object(
+            port,
+            "_fresh_store_records",
+            return_value={"startup_transaction": target},
+        ):
+            authority = port._require_store_phase_authority(  # noqa: SLF001
+                action,
+                store_name="startup_transaction",
+                phase_name="migrate_startup_transaction",
+                replaying=True,
+            )
+        self.assertTrue(authority.ok)
+        self.assertEqual(
+            authority.receipt["store_authority"],
+            "startup_completion_check_deferred_to_primitive",
+        )
+
     def test_real_private_home_migrates_v1_v10_v1_to_v3_v10_v2_and_replays(self) -> None:
         from mozyo_bridge.core.state.herdr_identity_attestation import (
             herdr_identity_attestation_path,

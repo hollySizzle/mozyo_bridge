@@ -251,7 +251,12 @@ def expected_migration_post_digest(action, store_name: str) -> str:
 def store_phase_authority(
     action, observed, *, store_name: str, phase_name: str, replaying: bool
 ) -> PhaseExecutionResult:
-    """Admit predecessor bytes or an exact precomputed post-migration replay state."""
+    """Admit predecessor bytes or a replay candidate with store-specific proof.
+
+    Startup replay is only admitted to the startup migration primitive.  That
+    primitive, not this layer, must validate the typed completion receipt before
+    returning success.
+    """
     planned = action["plan"]["stores"][store_name]
     if observed == planned:
         return PhaseExecutionResult(
@@ -267,7 +272,10 @@ def store_phase_authority(
     )
     if replay_candidate and store_name == "startup_transaction":
         return PhaseExecutionResult(
-            True, receipt={"store_authority": "typed_completion_replay"}
+            True,
+            receipt={
+                "store_authority": "startup_completion_check_deferred_to_primitive"
+            },
         )
     expected = expected_migration_post_digest(action, store_name)
     if replay_candidate and expected and observed.get("content_digest") == expected:
