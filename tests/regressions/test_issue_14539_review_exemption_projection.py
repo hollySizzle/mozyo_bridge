@@ -3927,17 +3927,26 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "own renderer",
         ),
         f"{_D}/domain/superseded_failure_correlation.py": (
-            ["*", "*", "*", "*", "*:MARKER_RE"],
-            "reads (Redmine #14755): the successor's supersession acknowledgement gate, the "
-            "failed round's own finding ENUMERATION gate (review j#99057 finding_1 — the set the "
-            "verdicts must cover), and the gate-token half of qualifying a review_finding_verdict "
-            "journal. Exactly-one-marker rule per note for both the acknowledgement and the "
-            "enumeration — a second declaration of that gate, or one it names but cannot read, "
-            "poisons the note for the gate rather than yielding the readable sibling; also "
-            "renders both markers through the shared closed-vocabulary reader",
+            ["*", "*", "*", "*", "*", "*:MARKER_RE", "*:prefix"],
+            "reads (Redmine #14755): the successor's supersession acknowledgement gate, and the "
+            "gate-token half of qualifying a review_finding_verdict journal. Exactly-one-marker "
+            "rule per note for the acknowledgement — a second declaration of that gate, or one it "
+            "names but cannot read, poisons the note for the gate rather than yielding the "
+            "readable sibling; renders that marker through the shared closed-vocabulary reader. "
+            "The failed round's finding SET is no longer named here at all: #14971's canonical "
+            "authority owns it, and the dedicated-channel prefix arrives via a used import of "
+            "review_finding_legacy_authority",
+        ),
+        f"{_D}/domain/review_finding_legacy_issuer.py": (
+            ["*", "*", "*", "*", "*:MARKER_RE", "*:prefix"],
+            "names no marker token itself (Redmine #14755): it fills #14971's ruling_issuers port "
+            "by counting the gates a journal declares, and inherits the channels via used imports "
+            "of canonical_note_scan, redmine_journal_source and review_finding_legacy_authority. "
+            "A note carrying a marker the canonical producer could not render resolves NOTHING "
+            "rather than having that marker skipped",
         ),
         f"{_D}/domain/superseded_failure_terminal.py": (
-            ["*", "*", "*", "*", "*", "*"],
+            ["*", "*", "*", "*", "*"],
             "reads (Redmine #14755): the superseded-failure terminal declaration gate, located and "
             "parsed through superseded_failure_correlation's single-scan reader (so the "
             "exactly-one-marker rule is that module's); renders the declaration marker itself",
@@ -4231,11 +4240,18 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "inherits via a used import of handoff, recovery_anchor_delivery; names no marker token itself",
         ),
         f"{_D}/application/retire_admissibility.py": (
-            ['*', '*', '*', '*', '*', '*', '*'],
-            "inherits via a used import of hibernate_evidence_integration, redmine_journal_source, "
-            "(Redmine #14695) no_change_review_waiver and (Redmine #14755) "
-            "superseded_failure_terminal / superseded_failure_correlation — the latter now also "
-            "carrying the failed round's finding-enumeration gate; names no marker token itself",
+            ['*', '*', '*', '*'],
+            "inherits via a used import of hibernate_evidence_integration and (Redmine #14695) "
+            "no_change_review_waiver; names no marker token itself. #14755's route left for "
+            "retire_superseded_failure when the #14971 authority wiring pushed this module past "
+            "the oversized-module gate, and its channels left with it",
+        ),
+        f"{_D}/application/retire_superseded_failure.py": (
+            ['*', '*', '*', '*', '*:prefix'],
+            "inherits via used imports of (Redmine #14755) superseded_failure_terminal / "
+            "superseded_failure_correlation, plus #14971's review_finding_legacy_authority and the "
+            "review_finding_legacy_issuer that fills its ruling_issuers port — which is where the "
+            "dedicated-channel prefix comes from; names no marker token itself",
         ),
         f"{_D}/application/sublane_gateway_recovery_live.py": (
             ['*', '*', 'handoff', 'recovery-delivery-authorization', 'recovery-delivery-zero-send'],

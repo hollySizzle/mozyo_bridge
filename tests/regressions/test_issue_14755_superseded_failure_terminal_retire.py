@@ -34,7 +34,6 @@ observation is idempotent.
 from __future__ import annotations
 
 import argparse
-import re
 import subprocess
 import sys
 import tempfile
@@ -45,7 +44,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
-    retire_admissibility,
+    retire_superseded_failure,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.retire_admissibility import (  # noqa: E501
     REASON_SUPERSEDED_ROUTE_UNREADABLE,
@@ -79,26 +78,44 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SublaneIntegrationPolicy,
     decide_retire_integration,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+    RedmineJournalEntry,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_finding_legacy_authority import (  # noqa: E501
+    AUTHORITY_SOURCE_LEGACY,
+    AUTHORITY_SOURCE_MANIFEST,
+    REASON_ATTESTATION_CONFLICTING,
+    REASON_ATTESTATION_MISSING,
+    REASON_ATTESTATION_UNAUTHORIZED,
+    REASON_RULING_UNAUTHORIZED,
+    REASON_MANIFEST_LEGACY_CONFLICT,
+    render_legacy_review_finding_attestation,
+    render_legacy_review_finding_ruling,
+    resolve_review_finding_authority,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_finding_legacy_issuer import (  # noqa: E501
+    resolve_legacy_ruling_issuers,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_finding_manifest import (  # noqa: E501
+    REASON_MANIFEST_PROSE_MISMATCH,
+    ReviewFinding,
+    render_review_result_note,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.superseded_failure_correlation import (  # noqa: E501
     ACK_INVALID,
-    ROUND_FINDINGS_DECLARED,
-    ROUND_FINDINGS_FIELD_ORDER,
-    ROUND_FINDINGS_INVALID,
-    ROUND_FINDINGS_NONE,
+    FINDING_VERDICT_REASONS,
     SUCCESSOR_ACK_FIELD_ORDER,
     SUCCESSOR_ACK_GATE,
     VERDICT_COVERAGE_MISMATCH,
+    VERDICT_FINDING_AUTHORITY_UNRESOLVED,
     VERDICT_NOT_ACCEPTED,
     VERDICT_NOT_RECORDED,
     VERDICT_PAIRING_UNREADABLE,
-    VERDICT_ROUND_FINDINGS_UNDECLARED,
     VERDICT_TARGET_MISMATCH,
     VERDICT_UNRESOLVED,
     fold_finding_verdicts,
     fold_successor_acknowledgement,
     journal_ref,
-    read_round_findings,
-    render_round_findings_marker,
     render_successor_acknowledgement_marker,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.superseded_failure_terminal import (  # noqa: E501
@@ -142,6 +159,13 @@ REVIEW_JOURNAL = "93648"
 VERDICT_JOURNAL = "93656"
 SUCCESSOR_REVIEW_JOURNAL = "93727"
 DECLARATION_JOURNAL = "94400"
+REVIEW_REQUEST_JOURNAL = "93628"
+#: The append-only migration chain #14971 requires for a review that predates the manifest
+#: contract: an attestation, then a direct-owner ruling naming that exact attestation.
+ATTESTATION_JOURNAL = "99201"
+RULING_JOURNAL = "99202"
+#: What #14577 j#93648 raised, spelled the way its verdict journal j#93656 answers them.
+ROUND_FINDINGS = ("1", "2")
 HEAD = "735a5f88e7fa66a46f3da9316586f19ebb50bec0"
 WORKSPACE = "mozyo_bridge"
 LANE = "issue_14577_r8_delivery_terminal_acceptance"
@@ -167,14 +191,83 @@ def declaration_marker(**overrides) -> str:
     return render_superseded_failure_marker(**kwargs)
 
 
-def round_findings_marker(**overrides) -> str:
-    """The failed round's own enumeration of the findings it raised (#14755 j#99057 finding_1).
+#: The conclusion the review_result marker carries for each governed prose spelling. The two must
+#: agree or the record states one thing in prose and another in the machine token.
+_MARKER_CONCLUSION = {"要修正": "changes_requested", "承認": "approved"}
 
-    The real #14577 j#93648 raised two, and j#93656 recorded a verdict for each.
+
+def review_note(
+    *,
+    conclusion: str = "要修正",
+    authority: "str | None" = "manifest",
+    findings: "tuple[str, ...]" = ROUND_FINDINGS,
+) -> str:
+    """The failed round's journal, in one of the three shapes this route has to handle.
+
+    ``manifest`` is what #14971's canonical producer emits today: prose and sidecar rendered from
+    ONE structured input, so the finding identities in the marker are the identities in the text.
+    ``legacy`` is the reproduction's real pre-contract shape — #14577 j#93648 carries a
+    ``review_result`` marker and spells its findings ``#### F1`` / ``#### F2`` in prose, with no
+    sidecar and no way to add one (the journal is append-only). ``None`` is that same shape with
+    nothing later attesting to it, which must stay refused.
     """
-    kwargs = dict(review_journal=REVIEW_JOURNAL, findings=("1", "2"))
-    kwargs.update(overrides)
-    return render_round_findings_marker(**kwargs)
+    marker_conclusion = _MARKER_CONCLUSION[conclusion]
+    # An approved review carries no findings, and #14971's producer refuses to render one that
+    # does. The fixture obeys the same contract rather than routing around it.
+    findings = () if marker_conclusion == "approved" else findings
+    if authority == "manifest":
+        return render_review_result_note(
+            issue=ISSUE,
+            body=f"## Gate: review\n\n- 結論: {conclusion}",
+            findings=tuple(
+                ReviewFinding(identity=fid, summary=f"指摘 {fid}", details="")
+                for fid in findings
+            ),
+            marker_fields={
+                "conclusion": marker_conclusion,
+                "target_head": HEAD,
+                "review_request_journal": REVIEW_REQUEST_JOURNAL,
+            },
+        )
+    prose = "\n\n".join(f"#### F{index} — 指摘" for index, _ in enumerate(findings, 1))
+    return (
+        f"## Gate: review\n\n- 結論: {conclusion}\n\n"
+        f"[mozyo:workflow-event:gate=review_result:conclusion={marker_conclusion}"
+        f":head={HEAD}:req={REVIEW_REQUEST_JOURNAL}]\n\n"
+        f"### Findings\n\n{prose}\n"
+    )
+
+
+def attestation_note(*, findings: "tuple[str, ...]" = ROUND_FINDINGS, review=REVIEW_JOURNAL) -> str:
+    """A later journal naming the historical round's finding set. Authority 0 on its own."""
+    return "## Gate: review_finding_attestation\n\n" + render_legacy_review_finding_attestation(
+        issue=ISSUE, review_journal=review, findings=findings
+    )
+
+
+def ruling_note(
+    *,
+    findings: "tuple[str, ...]" = ROUND_FINDINGS,
+    attestation: str = ATTESTATION_JOURNAL,
+    review: str = REVIEW_JOURNAL,
+    heading: str = "## Gate: review_finding_legacy_ruling",
+    supersedes=None,
+) -> str:
+    """The direct-owner ruling that selects one exact attestation, and nothing else.
+
+    The heading is what makes the journal eligible at all: ``review_finding_legacy_ruling`` is not
+    a gate-bearing kind, so no workflow-event marker for it can be rendered, and the port resolves
+    the writer role from the governed heading exactly as the verdict gate is qualified.
+    """
+    kwargs = dict(
+        issue=ISSUE,
+        review_journal=review,
+        attestation_journal=attestation,
+        findings=findings,
+    )
+    if supersedes is not None:
+        kwargs["supersedes_ruling_journal"] = supersedes
+    return f"{heading}\n\n" + render_legacy_review_finding_ruling(**kwargs)
 
 
 def acknowledgement_marker(**overrides) -> str:
@@ -195,26 +288,34 @@ def source_journals(
     verdict_target: str = REVIEW_JOURNAL,
     review_conclusion: str = "要修正",
     close: bool = True,
-    findings_marker: "str | None" = "",
-    verdict_findings: "tuple[str, ...]" = ("1", "2"),
+    authority: "str | None" = "manifest",
+    review: "str | None" = None,
+    legacy_records: "list[tuple[str, str]] | None" = None,
+    verdict_findings: "tuple[str, ...]" = ROUND_FINDINGS,
     extra: "list[tuple[str, str]] | None" = None,
 ) -> "list[tuple[str, str]]":
     """The source issue's durable history, shaped like #14577's real one.
 
-    ``findings_marker`` defaults to the canonical enumeration (``""`` -> the default marker);
-    ``None`` removes it, which is the pre-#99057 shape where the round stated no finding set.
-    ``verdict_findings`` chooses which of those findings the verdict journal actually answers.
+    ``authority`` selects which shape supplies the round's finding set: ``manifest`` (#14971's
+    canonical producer), ``legacy`` (the pre-contract round plus its attestation / ruling chain),
+    or ``None`` (a pre-contract round nothing later attests to). ``review`` overrides the round's
+    note verbatim, ``legacy_records`` the migration journals. ``verdict_findings`` chooses which of
+    the round's findings the verdict journal actually answers.
     """
-    enumeration = round_findings_marker() if findings_marker == "" else findings_marker
-    review_note = f"## Gate: review\n- 結論: {review_conclusion}\n"
-    if enumeration:
-        review_note += f"\n{enumeration}\n"
+    note = review_note(conclusion=review_conclusion, authority=authority) if review is None else review
     verdict_lines = "".join(
         f"- finding_{fid}: 指摘 {fid}\n  - verdict: {verdict}\n" for fid in verdict_findings
     )
     journals = [
-        ("93628", "## Gate: review_request\n- commit_or_diff: `735a5f88`\n"),
-        ("93648", review_note),
+        (
+            REVIEW_REQUEST_JOURNAL,
+            # The round the result answers, with the head it pinned. Both markers are required
+            # for the glance grammar to read the result as CANONICAL rather than shadowing it to
+            # `pending`, and the real #14577 pair carries exactly this correlation.
+            "## Gate: review_request\n- commit_or_diff: `735a5f88`\n\n"
+            f"[mozyo:workflow-event:gate=review_request:head={HEAD}]\n",
+        ),
+        (REVIEW_JOURNAL, note),
         (
             VERDICT_JOURNAL,
             "## Gate: review_finding_verdict\n"
@@ -229,8 +330,46 @@ def source_journals(
         journals.append(
             (DECLARATION_JOURNAL, f"## Gate: superseded_failure\n\n{marker}\n")
         )
+    if legacy_records is None and authority == "legacy":
+        legacy_records = [
+            (ATTESTATION_JOURNAL, attestation_note()),
+            (RULING_JOURNAL, ruling_note()),
+        ]
+    journals.extend(legacy_records or [])
     journals.extend(extra or [])
     return journals
+
+
+def entries_of(journals, *, issue: str = ISSUE) -> "list[RedmineJournalEntry]":
+    """The pair fixtures as ENTRIES — the shape #14971's authority reads issue identity from."""
+    return [
+        RedmineJournalEntry(issue_id=issue, journal_id=str(jid), notes=notes or "")
+        for jid, notes in journals or ()
+    ]
+
+
+def finding_authority(journals, *, review_journal: str = REVIEW_JOURNAL, issue: str = ISSUE):
+    """Resolve the round's finding set exactly as the application route does.
+
+    Deliberately the real composition — #14971's resolver over the same entries, with the
+    ``ruling_issuers`` port filled by the same resolver ``retire_admissibility`` wires in. A
+    fixture that hand-built the facts would pin this route against a set no record can produce.
+    """
+    entries = entries_of(journals, issue=issue)
+    return resolve_review_finding_authority(
+        entries,
+        review_journal=review_journal,
+        ruling_issuers=resolve_legacy_ruling_issuers(entries),
+    )
+
+
+def verdicts(journals, *, review_journal: str = REVIEW_JOURNAL, issue: str = ISSUE):
+    """The verdict fold over the authority the same journals resolve to."""
+    return fold_finding_verdicts(
+        journals,
+        review_journal=review_journal,
+        authority=finding_authority(journals, review_journal=review_journal, issue=issue),
+    )
 
 
 def successor_journals(
@@ -284,7 +423,7 @@ def admit(
     return evaluate_superseded_failure_admissible(
         declaration,
         currently_current=declaration_current(declaration, rounds),
-        verdicts=fold_finding_verdicts(src, review_journal=declaration.review_journal),
+        verdicts=verdicts(src, review_journal=declaration.review_journal),
         acknowledgement=fold_successor_acknowledgement(suc),
         successor=SuccessorEvidence(
             review_journal=str(max(successor_rounds)) if successor_rounds else "",
@@ -344,6 +483,70 @@ class TheReproductionConverges(unittest.TestCase):
         # preflight that produced the operator's diagnosis.
         refusals = [admit(source=source_journals(marker=None)) for _ in range(3)]
         self.assertEqual({(r.admissible, r.reason) for r in refusals}, {(False, REASON_NOT_RECORDED)})
+
+
+class BothCanonicalAuthorityRoutesReachTheTerminal(unittest.TestCase):
+    """Redmine #14755 review j#99065, and the acceptance item R2 left unmet.
+
+    R2's route-local enumeration had to be written INTO the review round's own journal. #14577
+    j#93648 has no such marker, this workspace treats durable journals as append-only (a correction
+    is always a new journal, never a rewrite of an old one), and so R2 left the reproduction
+    permanently refused — the issue's main purpose unmet, not merely an unperformed live
+    acceptance. #14971 supplies both halves, and these pin that BOTH reach the terminal.
+    """
+
+    def test_a_manifest_produced_round_admits_and_names_its_authority(self):
+        journals = source_journals(marker=declaration_marker(), authority="manifest")
+        facts = verdicts(journals)
+        self.assertTrue(facts.accepted)
+        self.assertEqual(facts.authority_source, AUTHORITY_SOURCE_MANIFEST)
+        # In-journal: the manifest IS the review round's own record, emitted from the same input
+        # as the prose by the same producer, so there is no second journal to point at.
+        self.assertEqual(facts.authority_journal, REVIEW_JOURNAL)
+        self.assertTrue(admit(source=journals).admissible)
+
+    def test_the_manifest_identities_are_the_ones_the_prose_shows(self):
+        # What makes the manifest route different in kind from R2's enumeration: the identities
+        # are not separately writable. The producer renders prose and sidecar from one input, and
+        # the reader refuses the journal outright if they diverge.
+        note = review_note(authority="manifest")
+        self.assertIn("### finding_1 — 指摘 1", note)
+        self.assertIn("### finding_2 — 指摘 2", note)
+        self.assertEqual(
+            finding_authority(source_journals(marker=declaration_marker())).findings,
+            ROUND_FINDINGS,
+        )
+        drifted = note.replace("### finding_2 — 指摘 2", "### finding_3 — 指摘 3")
+        facts = verdicts(source_journals(marker=declaration_marker(), review=drifted))
+        self.assertEqual(facts.reason, VERDICT_FINDING_AUTHORITY_UNRESOLVED)
+        self.assertEqual(facts.authority_reason, REASON_MANIFEST_PROSE_MISMATCH)
+
+    def test_the_pre_contract_reproduction_reaches_the_terminal_without_a_journal_rewrite(self):
+        # #14577's real shape: a `review_result` marker, `#### F1` / `#### F2` prose, no sidecar.
+        # The round's journal is byte-identical to the shape with no migration at all — every new
+        # record is a LATER journal — and the route still converges.
+        journals = source_journals(marker=declaration_marker(), authority="legacy")
+        unmigrated = source_journals(marker=declaration_marker(), authority=None)
+        self.assertEqual(
+            dict(journals)[REVIEW_JOURNAL], dict(unmigrated)[REVIEW_JOURNAL]
+        )
+        facts = verdicts(journals)
+        self.assertTrue(facts.accepted)
+        self.assertEqual(facts.authority_source, AUTHORITY_SOURCE_LEGACY)
+        # The RULING is the authority, not the attestation that merely stated the set.
+        self.assertEqual(facts.authority_journal, RULING_JOURNAL)
+        outcome = admit(source=journals)
+        self.assertTrue(outcome.admissible, outcome.reason)
+        self.assertEqual(outcome.reason, REASON_OK)
+
+    def test_both_routes_replay_identically(self):
+        for label, authority in (("manifest", "manifest"), ("legacy", "legacy")):
+            with self.subTest(label):
+                journals = source_journals(marker=declaration_marker(), authority=authority)
+                replays = [admit(source=journals) for _ in range(3)]
+                self.assertEqual(
+                    {(r.admissible, r.reason) for r in replays}, {(True, REASON_OK)}
+                )
 
 
 class OrdinaryDevelopmentIsRefused(unittest.TestCase):
@@ -461,7 +664,7 @@ class FindingsMustHaveBeenReceived(unittest.TestCase):
     def test_verdicts_recorded_against_another_round_do_not_count(self):
         journals = source_journals(marker=declaration_marker(), verdict_target="90000")
         self.assertEqual(
-            fold_finding_verdicts(journals, review_journal=REVIEW_JOURNAL).reason,
+            verdicts(journals).reason,
             VERDICT_TARGET_MISMATCH,
         )
         outcome = admit(source=journals)
@@ -475,7 +678,7 @@ class FindingsMustHaveBeenReceived(unittest.TestCase):
             if entry[0] != VERDICT_JOURNAL
         ]
         self.assertEqual(
-            fold_finding_verdicts(journals, review_journal=REVIEW_JOURNAL).reason,
+            verdicts(journals).reason,
             VERDICT_NOT_RECORDED,
         )
         outcome = admit(source=journals)
@@ -504,7 +707,7 @@ class FindingsMustHaveBeenReceived(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            fold_finding_verdicts(journals, review_journal=REVIEW_JOURNAL).reason,
+            verdicts(journals).reason,
             VERDICT_NOT_ACCEPTED,
         )
         self.assertEqual(admit(source=journals).reason, REASON_FINDINGS_NOT_ACCEPTED)
@@ -545,7 +748,7 @@ class FindingsMustHaveBeenReceived(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            fold_finding_verdicts(journals, review_journal=REVIEW_JOURNAL).reason,
+            verdicts(journals).reason,
             VERDICT_UNRESOLVED,
         )
         self.assertEqual(admit(source=journals).reason, REASON_FINDINGS_NOT_ACCEPTED)
@@ -563,7 +766,7 @@ class FindingsMustHaveBeenReceived(unittest.TestCase):
                 ),
             ],
         )
-        facts = fold_finding_verdicts(journals, review_journal=REVIEW_JOURNAL)
+        facts = verdicts(journals)
         self.assertEqual(facts.journal, "93910")
         self.assertEqual(facts.reason, VERDICT_UNRESOLVED)
         self.assertEqual(admit(source=journals).reason, REASON_FINDINGS_NOT_ACCEPTED)
@@ -586,19 +789,27 @@ class FindingsMustHaveBeenReceived(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            fold_finding_verdicts(journals, review_journal=REVIEW_JOURNAL).reason,
+            verdicts(journals).reason,
             VERDICT_UNRESOLVED,
         )
         self.assertEqual(admit(source=journals).reason, REASON_FINDINGS_NOT_ACCEPTED)
 
 
 class TheVerdictsMustCoverEveryFindingTheRoundRaised(unittest.TestCase):
-    """Redmine #14755 review j#99057 finding_1.
+    """Redmine #14755 review j#99057 finding_1, closed against #14971's canonical authority.
 
     "Every verdict PRESENT is accepted" is satisfied by a verdict journal that answers one of the
     round's two findings, and that opened the terminal — the acceptance refuses 未受領 finding
     independently, and live-zero bounds repository change without bounding this. So the verdicts
-    are checked for coverage against the set the ROUND enumerated, in the round's own journal.
+    are checked for COVERAGE against the round's finding set.
+
+    Where that set comes from is what review j#99065 sent back. R2 had the round enumerate itself
+    in its own journal, which put the enumeration and the findings in ONE record written by ONE
+    actor at ONE time — no second record could contradict it, and the renderer had no production
+    caller, so a hand-written under-count admitted exactly as before, one level up. The set now
+    comes from #14971: a manifest the canonical review producer emits atomically with the review
+    prose, or — for a round that predates that contract and whose journal cannot be rewritten — an
+    append-only attestation that only counts once a distinct direct-owner ruling names it.
     """
 
     def test_a_verdict_covering_only_some_findings_is_refused(self):
@@ -606,7 +817,7 @@ class TheVerdictsMustCoverEveryFindingTheRoundRaised(unittest.TestCase):
         # answers finding_1 only, and every verdict it carries IS accepted.
         journals = source_journals(marker=declaration_marker(), verdict_findings=("1",))
         self.assertEqual(
-            fold_finding_verdicts(journals, review_journal=REVIEW_JOURNAL).reason,
+            verdicts(journals).reason,
             VERDICT_COVERAGE_MISMATCH,
         )
         outcome = admit(source=journals)
@@ -622,31 +833,249 @@ class TheVerdictsMustCoverEveryFindingTheRoundRaised(unittest.TestCase):
             marker=declaration_marker(), verdict_findings=("1", "2", "3")
         )
         self.assertEqual(
-            fold_finding_verdicts(journals, review_journal=REVIEW_JOURNAL).reason,
+            verdicts(journals).reason,
             VERDICT_COVERAGE_MISMATCH,
         )
         self.assertEqual(admit(source=journals).reason, REASON_FINDINGS_NOT_ACCEPTED)
 
-    def test_a_round_that_enumerates_nothing_supplies_no_set_to_be_complete_against(self):
-        # The pre-fix shape. Refusing is the fail-closed direction: coverage cannot be checked
-        # against a set nobody stated, and inferring one from the round's prose would be this
-        # module minting a second definition of finding identity.
-        journals = source_journals(marker=declaration_marker(), findings_marker=None)
-        self.assertEqual(
-            fold_finding_verdicts(journals, review_journal=REVIEW_JOURNAL).reason,
-            VERDICT_ROUND_FINDINGS_UNDECLARED,
-        )
+    def test_a_round_with_no_finding_authority_supplies_no_set_to_be_complete_against(self):
+        # The pre-contract shape with nothing later attesting to it. Refusing is the fail-closed
+        # direction: coverage cannot be checked against a set no record states, and inferring one
+        # from the round's `#### F1` prose would be a SECOND definition of finding identity — the
+        # normalization #14971 j#99084 explicitly declined.
+        journals = source_journals(marker=declaration_marker(), authority=None)
+        facts = verdicts(journals)
+        self.assertEqual(facts.reason, VERDICT_FINDING_AUTHORITY_UNRESOLVED)
+        # The canonical module's own token is CARRIED, not collapsed: "nothing attested" and
+        # "the ruling is unauthorized" are different records to go and look at.
+        self.assertEqual(facts.authority_reason, REASON_ATTESTATION_MISSING)
         self.assertEqual(admit(source=journals).reason, REASON_FINDINGS_NOT_ACCEPTED)
 
-    def test_an_enumeration_about_another_round_does_not_supply_this_ones_set(self):
+    def test_an_attestation_nobody_ruled_on_is_not_authority(self):
+        # #14971 j#99084: an attestation alone has authority 0. This is what keeps the migration
+        # path from being a third self-declaration — the record naming the set and the record
+        # authorizing it are distinct journals, and the latter must name the former exactly.
         journals = source_journals(
             marker=declaration_marker(),
-            findings_marker=round_findings_marker(review_journal="93628"),
+            authority="legacy",
+            legacy_records=[(ATTESTATION_JOURNAL, attestation_note())],
+        )
+        facts = verdicts(journals)
+        self.assertEqual(facts.reason, VERDICT_FINDING_AUTHORITY_UNRESOLVED)
+        self.assertEqual(facts.authority_reason, REASON_ATTESTATION_UNAUTHORIZED)
+        self.assertEqual(admit(source=journals).reason, REASON_FINDINGS_NOT_ACCEPTED)
+
+    def test_a_ruling_journal_that_declares_a_second_gate_resolves_no_writer(self):
+        # The port's one real constraint, stated for what it is. It does NOT authenticate the
+        # coordinator — nothing in this workspace can (ruling #14219 j#86718). What it refuses is a
+        # ruling smuggled into a journal written to be something else, because a note claiming two
+        # authority contracts at once proves neither.
+        journals = source_journals(
+            marker=declaration_marker(),
+            authority="legacy",
+            legacy_records=[
+                (ATTESTATION_JOURNAL, attestation_note()),
+                (
+                    RULING_JOURNAL,
+                    ruling_note(
+                        heading="## Gate: review_finding_legacy_ruling + integration_disposition"
+                    ),
+                ),
+            ],
+        )
+        facts = verdicts(journals)
+        self.assertEqual(facts.reason, VERDICT_FINDING_AUTHORITY_UNRESOLVED)
+        # The RULING is what became unauthorized — a distinct diagnosis from "nothing ruled on
+        # this attestation at all", and the one that points at the journal to fix.
+        self.assertEqual(facts.authority_reason, REASON_RULING_UNAUTHORIZED)
+        self.assertEqual(admit(source=journals).reason, REASON_FINDINGS_NOT_ACCEPTED)
+
+    def test_the_verdict_journal_cannot_be_its_own_finding_authority(self):
+        # The R2 defect in its most direct form (review j#99065): the record that answers the
+        # findings must not also be the record that says what the findings WERE. A verdict journal
+        # claiming the ruling gate declares two authority contracts, so it resolves neither — and
+        # the set it would have authorized itself against is never established.
+        journals = source_journals(
+            marker=declaration_marker(),
+            authority="legacy",
+            legacy_records=[(ATTESTATION_JOURNAL, attestation_note())],
+            extra=[
+                (
+                    RULING_JOURNAL,
+                    "## Gate: review_finding_verdict + review_finding_legacy_ruling\n"
+                    f"- 対象review_journal: j#{REVIEW_JOURNAL}\n"
+                    "- finding_1: a\n  - verdict: accepted\n"
+                    "- finding_2: b\n  - verdict: accepted\n\n"
+                    + ruling_note(heading="").strip(),
+                )
+            ],
+        )
+        self.assertEqual(resolve_legacy_ruling_issuers(entries_of(journals)), {})
+        facts = verdicts(journals)
+        self.assertFalse(facts.accepted)
+        self.assertEqual(facts.reason, VERDICT_FINDING_AUTHORITY_UNRESOLVED)
+        self.assertEqual(facts.authority_reason, REASON_RULING_UNAUTHORIZED)
+        self.assertEqual(admit(source=journals).reason, REASON_FINDINGS_NOT_ACCEPTED)
+
+    def test_an_attestation_cannot_rule_on_itself_in_one_journal(self):
+        # A ruling must be a LATER journal than the attestation it selects, so a single journal
+        # carrying both is not a two-record chain wearing one record's clothes.
+        journals = source_journals(
+            marker=declaration_marker(),
+            authority="legacy",
+            legacy_records=[
+                (
+                    RULING_JOURNAL,
+                    attestation_note() + "\n\n" + ruling_note(attestation=RULING_JOURNAL),
+                )
+            ],
+        )
+        facts = verdicts(journals)
+        self.assertFalse(facts.accepted)
+        self.assertEqual(facts.reason, VERDICT_FINDING_AUTHORITY_UNRESOLVED)
+
+    def test_every_declared_verdict_reason_is_reached_by_a_real_fixture(self):
+        # The母集合 guard the route's terminal reasons already carry: a reason nobody can reach is
+        # a refusal that does not exist, and one nobody declared is a token no operator can look up.
+        reached = {
+            verdicts(journals).reason
+            for journals in (
+                source_journals(marker=declaration_marker()),
+                source_journals(marker=declaration_marker(), verdict="disputed"),
+                source_journals(marker=declaration_marker(), verdict_target="90000"),
+                source_journals(marker=declaration_marker(), verdict_findings=("1",)),
+                source_journals(marker=declaration_marker(), authority=None),
+                [
+                    entry
+                    for entry in source_journals(marker=declaration_marker())
+                    if entry[0] != VERDICT_JOURNAL
+                ],
+                source_journals(
+                    marker=declaration_marker(),
+                    extra=[
+                        (
+                            "93901",
+                            "## Gate: review_finding_verdict\n"
+                            f"- 対象review_journal: j#{REVIEW_JOURNAL}\n"
+                            "- 対象review_journal: j#90000\n"
+                            "- verdict: accepted\n",
+                        )
+                    ],
+                ),
+                source_journals(
+                    marker=declaration_marker(),
+                    extra=[
+                        (
+                            "93901",
+                            "## Gate: review_finding_verdict\n"
+                            f"- 対象review_journal: j#{REVIEW_JOURNAL}\n"
+                            "- verdict: accepted\n- finding_1: a\n  - verdict: accepted\n",
+                        )
+                    ],
+                ),
+            )
+        }
+        self.assertEqual(reached, FINDING_VERDICT_REASONS)
+
+    def test_the_port_reads_the_qualified_heading_spelling_the_preset_invites(self):
+        # `## Gate: <token> — <qualifier>` is a canonical spelling, not a second gate. Counting
+        # the qualified form as its own token would make "declares exactly this gate" false for
+        # every heading a governed author actually writes (#14695 j#94110 finding 2, one level up).
+        journals = source_journals(
+            marker=declaration_marker(),
+            authority="legacy",
+            legacy_records=[
+                (ATTESTATION_JOURNAL, attestation_note()),
+                (
+                    RULING_JOURNAL,
+                    ruling_note(
+                        heading=f"## Gate: review_finding_legacy_ruling — #{ISSUE} j#{REVIEW_JOURNAL}"
+                    ),
+                ),
+            ],
         )
         self.assertEqual(
-            fold_finding_verdicts(journals, review_journal=REVIEW_JOURNAL).reason,
-            VERDICT_TARGET_MISMATCH,
+            set(resolve_legacy_ruling_issuers(entries_of(journals))), {RULING_JOURNAL}
         )
+        self.assertTrue(verdicts(journals).accepted)
+
+    def test_an_unrenderable_marker_anywhere_in_a_ruling_journal_resolves_no_writer(self):
+        # Fail-closed, not skip-and-continue: a note carrying a marker the canonical producer
+        # could not render resolves NOTHING, rather than having that marker passed over so a
+        # clean sibling decides for it.
+        journals = source_journals(
+            marker=declaration_marker(),
+            authority="legacy",
+            legacy_records=[
+                (ATTESTATION_JOURNAL, attestation_note()),
+                (
+                    RULING_JOURNAL,
+                    ruling_note() + "\n\n[mozyo:workflow-event: gate=close]\n",
+                ),
+            ],
+        )
+        self.assertEqual(resolve_legacy_ruling_issuers(entries_of(journals)), {})
+        facts = verdicts(journals)
+        self.assertEqual(facts.reason, VERDICT_FINDING_AUTHORITY_UNRESOLVED)
+        self.assertEqual(facts.authority_reason, REASON_RULING_UNAUTHORIZED)
+
+    def test_a_ruling_naming_a_different_set_than_its_attestation_is_fail_closed(self):
+        journals = source_journals(
+            marker=declaration_marker(),
+            authority="legacy",
+            legacy_records=[
+                (ATTESTATION_JOURNAL, attestation_note()),
+                (RULING_JOURNAL, ruling_note(findings=("1",))),
+            ],
+        )
+        facts = verdicts(journals)
+        self.assertEqual(facts.reason, VERDICT_FINDING_AUTHORITY_UNRESOLVED)
+        self.assertEqual(facts.authority_reason, REASON_ATTESTATION_CONFLICTING)
+
+    def test_an_under_declaring_legacy_chain_still_fails_the_coverage_check(self):
+        # A ruled attestation naming ONE of the two findings the verdict journal answers. The
+        # authority resolves — the owner ruling is what makes it resolve — and the coverage check
+        # is what refuses, so an owner-ruled under-count cannot admit merely by being ruled.
+        journals = source_journals(
+            marker=declaration_marker(),
+            authority="legacy",
+            legacy_records=[
+                (ATTESTATION_JOURNAL, attestation_note(findings=("1",))),
+                (RULING_JOURNAL, ruling_note(findings=("1",))),
+            ],
+        )
+        facts = verdicts(journals)
+        self.assertEqual(facts.authority_source, AUTHORITY_SOURCE_LEGACY)
+        self.assertEqual(facts.reason, VERDICT_COVERAGE_MISMATCH)
+        self.assertEqual(admit(source=journals).reason, REASON_FINDINGS_NOT_ACCEPTED)
+
+    def test_a_legacy_declaration_cannot_downgrade_a_journal_that_carries_a_manifest(self):
+        # #14971's conflict rule, reached through this route: a round that DID emit a manifest is
+        # not open to a later attestation claiming a smaller set for it.
+        journals = source_journals(
+            marker=declaration_marker(),
+            authority="manifest",
+            legacy_records=[
+                (ATTESTATION_JOURNAL, attestation_note(findings=("1",))),
+                (RULING_JOURNAL, ruling_note(findings=("1",))),
+            ],
+        )
+        facts = verdicts(journals)
+        self.assertEqual(facts.reason, VERDICT_FINDING_AUTHORITY_UNRESOLVED)
+        self.assertEqual(facts.authority_reason, REASON_MANIFEST_LEGACY_CONFLICT)
+        self.assertEqual(admit(source=journals).reason, REASON_FINDINGS_NOT_ACCEPTED)
+
+    def test_an_authority_about_another_round_does_not_supply_this_ones_set(self):
+        journals = source_journals(
+            marker=declaration_marker(),
+            authority="legacy",
+            legacy_records=[
+                (ATTESTATION_JOURNAL, attestation_note(review=REVIEW_REQUEST_JOURNAL)),
+                (RULING_JOURNAL, ruling_note(review=REVIEW_REQUEST_JOURNAL)),
+            ],
+        )
+        facts = verdicts(journals)
+        self.assertEqual(facts.reason, VERDICT_FINDING_AUTHORITY_UNRESOLVED)
         self.assertEqual(admit(source=journals).reason, REASON_FINDINGS_NOT_ACCEPTED)
 
     def test_findings_and_verdicts_must_pair_one_to_one(self):
@@ -670,54 +1099,12 @@ class TheVerdictsMustCoverEveryFindingTheRoundRaised(unittest.TestCase):
                     )
                 ])
                 self.assertEqual(
-                    fold_finding_verdicts(journals, review_journal=REVIEW_JOURNAL).reason,
+                    verdicts(journals).reason,
                     VERDICT_PAIRING_UNREADABLE,
                 )
                 self.assertEqual(
                     admit(source=journals).reason, REASON_FINDINGS_NOT_ACCEPTED
                 )
-
-    def test_the_enumeration_grammar_is_closed(self):
-        good = round_findings_marker()
-        self.assertEqual(read_round_findings(good).state, ROUND_FINDINGS_DECLARED)
-        self.assertEqual(read_round_findings(good).findings, ("1", "2"))
-        self.assertEqual(read_round_findings("no marker here").state, ROUND_FINDINGS_NONE)
-        # A DERIVED oracle over the whole contract, so a field added later is covered without
-        # editing this test. The invariant is that NO single-field mutation still reads back as
-        # this round's declared set — not that every mutation is `invalid`, because the two
-        # identity-bearing fields lose it differently and saying otherwise would be asserting a
-        # uniformity the contract does not have: mutating `gate` makes the marker name a
-        # different gate (so this gate is simply not declared) and mutating `findings` yields a
-        # well-formed enumeration of a DIFFERENT set, which the coverage check is what refuses.
-        declared = read_round_findings(good)
-        for field in ROUND_FINDINGS_FIELD_ORDER:
-            with self.subTest(field):
-                broken = re.sub(rf"{field}=[^:\]]*", f"{field}=zzz", good, count=1)
-                self.assertNotEqual(broken, good)
-                self.assertNotEqual(read_round_findings(broken), declared)
-        # `version` and `review_journal` are the ones whose mutation is unreadable AS this
-        # contract, and an unreadable declaration must SHADOW rather than be skipped.
-        for field in ("version", "review_journal"):
-            with self.subTest(f"{field} is invalid, not merely different"):
-                broken = re.sub(rf"{field}=[^:\]]*", f"{field}=zzz", good, count=1)
-                self.assertEqual(read_round_findings(broken).state, ROUND_FINDINGS_INVALID)
-
-    def test_the_renderer_refuses_what_its_own_reader_would(self):
-        for kwargs in (
-            {"review_journal": "", "findings": ("1",)},
-            {"review_journal": REVIEW_JOURNAL, "findings": ()},
-            {"review_journal": REVIEW_JOURNAL, "findings": ("1", "")},
-            {"review_journal": REVIEW_JOURNAL, "findings": ("1", "1")},
-            {"review_journal": REVIEW_JOURNAL, "findings": ("1,2",)},
-            {"review_journal": REVIEW_JOURNAL, "findings": ("a b",)},
-        ):
-            with self.subTest(str(kwargs)):
-                with self.assertRaises(ValueError):
-                    render_round_findings_marker(**kwargs)
-
-    def test_a_quoted_enumeration_is_not_a_declaration(self):
-        quoted = f"## Gate: review\n- 結論: 要修正\n\n```\n{round_findings_marker()}\n```\n"
-        self.assertEqual(read_round_findings(quoted).state, ROUND_FINDINGS_NONE)
 
     def test_the_heading_spelling_the_real_verdict_uses_reads_the_same(self):
         # #14577 j#93656 writes its findings as `### finding_1 — …` headings, not list items.
@@ -731,7 +1118,7 @@ class TheVerdictsMustCoverEveryFindingTheRoundRaised(unittest.TestCase):
             )
         ])
         self.assertTrue(
-            fold_finding_verdicts(journals, review_journal=REVIEW_JOURNAL).accepted
+            verdicts(journals).accepted
         )
 
 
@@ -1263,8 +1650,8 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
         self.assertEqual(outcome.reason, REASON_SUPERSEDED_TARGET_UNRESOLVED)
 
     def test_an_unreadable_live_record_refuses_rather_than_reading_silence_as_absence(self):
-        original = retire_admissibility._read_live_issue_journals
-        retire_admissibility._read_live_issue_journals = lambda issue: []
+        original = retire_superseded_failure._read_live_issue_entries
+        retire_superseded_failure._read_live_issue_entries = lambda issue: []
         try:
             outcome = _resolve_superseded_failure_admissible(
                 self._args(),
@@ -1272,7 +1659,7 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
                 repo_root=Path("."),
             )
         finally:
-            retire_admissibility._read_live_issue_journals = original
+            retire_superseded_failure._read_live_issue_entries = original
         self.assertFalse(outcome.admissible)
         self.assertEqual(outcome.reason, REASON_SUPERSEDED_ROUTE_UNREADABLE)
 
@@ -1350,8 +1737,8 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
 
     def test_a_supplied_measured_route_never_falls_back_to_the_hand_assert(self):
         args = self._args(latest_generation_admissible=True)
-        original = retire_admissibility._read_live_issue_journals
-        retire_admissibility._read_live_issue_journals = lambda issue: []
+        original = retire_superseded_failure._read_live_issue_entries
+        retire_superseded_failure._read_live_issue_entries = lambda issue: []
         try:
             outcome = _resolve_latest_generation_admissible(
                 args,
@@ -1359,7 +1746,7 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
                 repo_root=Path("."),
             )
         finally:
-            retire_admissibility._read_live_issue_journals = original
+            retire_superseded_failure._read_live_issue_entries = original
         self.assertFalse(outcome.admissible)
         self.assertEqual(outcome.reason, REASON_SUPERSEDED_ROUTE_UNREADABLE)
 
@@ -1388,9 +1775,11 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
         self.assertTrue(decision.may_retire)
 
     def _resolve_with(self, records, *, worktree: str, **overrides):
-        original = retire_admissibility._read_live_issue_journals
-        retire_admissibility._read_live_issue_journals = lambda issue: records.get(
-            str(issue), []
+        # The route reads ENTRIES now, because #14971's authority cross-checks each record's own
+        # issue identity. Stubbing the entry reader keeps the fixtures one hop from the real shape.
+        original = retire_superseded_failure._read_live_issue_entries
+        retire_superseded_failure._read_live_issue_entries = lambda issue: entries_of(
+            records.get(str(issue), []), issue=str(issue)
         )
         try:
             return _resolve_superseded_failure_admissible(
@@ -1399,7 +1788,7 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
                 repo_root=Path(worktree),
             )
         finally:
-            retire_admissibility._read_live_issue_journals = original
+            retire_superseded_failure._read_live_issue_entries = original
 
 
 def _git(path: Path, *argv: str) -> str:

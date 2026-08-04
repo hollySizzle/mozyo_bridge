@@ -8,10 +8,12 @@ declaration does not control:
   issue. The central preset makes a per-finding verdict mandatory once a review carries findings
   (``### Review Finding Verdict Obligation``), so "the findings were received and accepted" is
   already a governed durable fact and does not need a new authority invented for it. What the
-  preset does NOT give it is a finding set to be complete against, so the verdicts are checked
-  for COVERAGE against :func:`read_round_findings` — the round's own enumeration, in the round's
-  own journal (#14755 review j#99057 finding_1: without it, a verdict journal answering one of
-  two findings satisfied "every verdict present is accepted" and opened the terminal);
+  preset did NOT give it is a finding set to be complete against (#14755 review j#99057 finding_1:
+  without one, a verdict journal answering one of two findings satisfied "every verdict present is
+  accepted" and opened the terminal). That set now has a canonical authority of its own —
+  :func:`...review_finding_legacy_authority.resolve_review_finding_authority`, #14971 — and this
+  module CONSUMES it rather than declaring a route-local one: the caller resolves the authority
+  and the fold checks the verdicts for COVERAGE against it;
 - :func:`fold_successor_acknowledgement` — the SUCCESSOR issue's own acknowledgement that it
   supersedes this one. A source-side declaration alone can name any issue in the tracker as its
   successor; requiring the named issue to say so too is what makes the pairing a correlation
@@ -21,12 +23,14 @@ declaration does not control:
 through the same source system as the declaration, and this workspace has no way to authenticate
 a journal's writer (ruling #14219 j#86718 — every role posts under one account). So neither fold
 proves WHO wrote anything. What they do prove is that the terminal disposition is corroborated by
-two records the declaration did not author: a verdict that names the exact failed review journal,
-and a successor whose own record names this issue and this review journal back. That is
-correlation strength, not authentication, and :mod:`.superseded_failure_terminal` states in one
-place what the whole route rests on.
+records the declaration did not author: a finding set carried by #14971's canonical authority, a
+verdict that names the exact failed review journal and answers exactly that set, and a successor
+whose own record names this issue and this review journal back. That is correlation strength, not
+authentication, and :mod:`.superseded_failure_terminal` states in one place what the whole route
+rests on.
 
-Boundary: pure. A total function over ``(journal_id, notes)`` pairs; no IO, no Redmine, no git.
+Boundary: pure. A total function over ``(journal_id, notes)`` pairs and the finding authority the
+caller resolved; no IO, no Redmine, no git.
 """
 
 from __future__ import annotations
@@ -38,11 +42,15 @@ from typing import Optional, Sequence, Tuple
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.canonical_note_scan import (  # noqa: E501
     canonical_marker_bodies,
     canonical_note_lines,
+    heading_gate_tokens,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
     MARKER_CHANNEL_WORKFLOW_EVENT,
     MARKER_GATE_ALIASES,
     strict_marker_body_fields,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_finding_legacy_authority import (  # noqa: E501
+    ReviewFindingAuthorityFacts,
 )
 
 
@@ -80,56 +88,6 @@ _FIELD_DECORATION_RE = re.compile(r"^[`*\s\"']+|[`*\s\"']+$")
 
 def _clean_field_value(value: object) -> str:
     return _FIELD_DECORATION_RE.sub("", str(value or "").strip()).strip()
-
-
-#: A governed ``## Gate: <token>`` heading line, read for its RAW token. Kept here rather than
-#: imported from :mod:`.glance_journal_grammar` for the reason its siblings already are: that
-#: module imports this bounded context's authority folds, so the import would be a cycle.
-_GATE_HEADING_LINE_RE = re.compile(
-    r"^\s{0,3}#{2,}\s*Gate\s*[:：]\s*(?P<body>.+?)\s*$", re.MULTILINE | re.IGNORECASE
-)
-#: Separators a combined governed heading uses between gate names.
-_HEADING_PART_SPLIT_RE = re.compile(r"[+/,、]")
-#: A trailing parenthetical qualifier governed authors append to a heading part.
-_TRAILING_PAREN_RE = re.compile(r"\s*[（(][^）)]*[）)]\s*$")
-#: The bounded dash qualifier the canonical Gate heading grammar allows AFTER the gate token
-#: (``## Gate: review_finding_verdict — R3``). A sanctioned canonical spelling, not a deviation:
-#: the central preset's ``### Gate Heading Canonical Literal`` invites it. Review #14695 j#94110
-#: finding 2 measured what happens when a reader strips only the parenthetical form — the dash
-#: form silently stopped matching, and a fence opened for a spelling the 正本 recommends.
-_BOUNDED_QUALIFIER_RE = re.compile(r"\s+[—–]\s+")
-
-
-def _normalize_gate_token(value: object) -> str:
-    """One gate name in comparable form: lowercased, spaces / hyphens folded to ``_`` (pure)."""
-    text = " ".join(str(value or "").strip().lower().split())
-    return re.sub(r"[\s-]+", "_", text)
-
-
-def heading_gate_tokens(notes: str) -> frozenset[str]:
-    """Every gate token a note's CANONICAL ``## Gate:`` headings name (pure).
-
-    Quote-aware: a heading that exists only inside a fenced block, a blockquote or an inline code
-    span is not a declaration, because a note transcribing a past record or quoting the contract
-    would otherwise qualify itself. Combined headings are split and BOTH the whole part and its
-    bounded-qualifier head are emitted, so a qualified spelling qualifies exactly like a bare one.
-    """
-    tokens: set[str] = set()
-    for line in canonical_note_lines(notes or ""):
-        match = _GATE_HEADING_LINE_RE.match(line or "")
-        if match is None:
-            continue
-        for raw_part in _HEADING_PART_SPLIT_RE.split(match.group("body")):
-            part = _TRAILING_PAREN_RE.sub("", raw_part)
-            candidates = [part]
-            head = _BOUNDED_QUALIFIER_RE.split(part, maxsplit=1)[0]
-            if head != part:
-                candidates.append(_TRAILING_PAREN_RE.sub("", head))
-            for candidate in candidates:
-                token = _normalize_gate_token(candidate)
-                if token:
-                    tokens.add(token)
-    return frozenset(tokens)
 
 
 def marker_declares_gate(body: str, gate: str) -> bool:
@@ -240,11 +198,14 @@ VERDICT_UNRESOLVED = "review_finding_verdict_unresolved"
 #: The verdict gate's findings and verdicts do not pair one-to-one — a finding opened with no
 #: verdict under it, a verdict with no finding above it, or the same finding id twice.
 VERDICT_PAIRING_UNREADABLE = "review_finding_verdict_findings_do_not_pair"
-#: The failed round declares no readable finding ENUMERATION, so which findings it raised — and
-#: therefore whether the verdicts cover them — is not established by any record (#14755 review
-#: j#99057 finding_1).
-VERDICT_ROUND_FINDINGS_UNDECLARED = "review_round_findings_not_declared"
-#: The verdicts do not cover exactly the findings the round enumerated: one is missing, or one is
+#: The canonical finding authority (#14971) resolved nothing for the failed round, so which
+#: findings it raised — and therefore whether the verdicts cover them — is not established by any
+#: record (#14755 review j#99057 finding_1). ONE route token for every way that authority can
+#: refuse; WHICH way is carried verbatim in :attr:`FindingVerdictFacts.authority_reason` rather
+#: than collapsed, because "no attestation exists" and "the ruling is unauthorized" send an
+#: operator to different records (the diagnosis principle #14695 review j#93807 finding 2 fixed).
+VERDICT_FINDING_AUTHORITY_UNRESOLVED = "review_finding_authority_not_established"
+#: The verdicts do not cover exactly the findings the authority carries: one is missing, or one is
 #: answered that the round never raised.
 VERDICT_COVERAGE_MISMATCH = "review_findings_not_all_given_a_verdict"
 
@@ -256,148 +217,10 @@ FINDING_VERDICT_REASONS: frozenset[str] = frozenset(
         VERDICT_NOT_ACCEPTED,
         VERDICT_UNRESOLVED,
         VERDICT_PAIRING_UNREADABLE,
-        VERDICT_ROUND_FINDINGS_UNDECLARED,
+        VERDICT_FINDING_AUTHORITY_UNRESOLVED,
         VERDICT_COVERAGE_MISMATCH,
     }
 )
-
-
-# ---------------------------------------------------------------------------
-# 1a. The failed round's OWN enumeration of the findings it raised.
-# ---------------------------------------------------------------------------
-
-#: The gate a REVIEW ROUND journal declares to enumerate the findings that round raised.
-#:
-#: #14755 review j#99057 finding_1 measured why this record has to exist. Without it the verdict
-#: fold could only ask "is every verdict PRESENT an ``accepted``", which a verdict journal listing
-#: one of two findings satisfies — so a partial disposition opened the terminal. Coverage cannot
-#: be checked against a set nobody states, and no such set exists today: the preset's ``## Gate:
-#: review`` template enumerates no per-finding identity, and the real records spell theirs three
-#: different ways (``#### F1`` in #14577 j#93648, ``### Finding 1`` in #14755 j#99057, ``###
-#: finding_1`` in the verdict j#93656). Inferring one identity from those three would be this
-#: module inventing a normalization the contract never defined.
-#:
-#: So the round states its own finding set, in the round's own journal, under this module's token.
-#: That keeps the enumeration with the authority that raised the findings (the reviewer) rather
-#: than with the declaration writer who benefits from under-counting them, and it changes NOTHING
-#: about the central review gate: this is an additive marker read only by this opt-in terminal
-#: route, exactly like :data:`SUCCESSOR_ACK_GATE`. A review that does not carry one simply cannot
-#: be terminalized this way — which is the fail-closed direction.
-#:
-#: It does NOT establish who wrote the enumeration; nothing in this workspace can (ruling #14219
-#: j#86718). What it establishes is that the verdicts answer a finding set stated in a DIFFERENT
-#: record than the verdict journal itself.
-ROUND_FINDINGS_GATE = "superseded_failure_round_findings"
-#: The schema version. An unknown version is refused rather than read under today's meanings.
-ROUND_FINDINGS_VERSION = "1"
-#: The COMPLETE, ORDERED field set, no more and no less, in this sequence.
-ROUND_FINDINGS_FIELD_ORDER: Tuple[str, ...] = (
-    "gate",
-    "version",
-    "review_journal",
-    "findings",
-)
-#: The separator between finding ids inside the single ``findings`` field. Not a marker separator,
-#: so it cannot split the field into two.
-ROUND_FINDINGS_SEPARATOR = ","
-
-#: The round declares no enumeration at all.
-ROUND_FINDINGS_NONE = "none"
-#: A valid enumeration: one canonical marker, contracted literals, a non-empty duplicate-free id set.
-ROUND_FINDINGS_DECLARED = "declared"
-#: An enumeration is DECLARED but cannot be read as one. Fail-closed: treated exactly like
-#: :data:`ROUND_FINDINGS_NONE`, and it SUPERSEDES an older valid one.
-ROUND_FINDINGS_INVALID = "invalid"
-
-ROUND_FINDINGS_STATES: frozenset[str] = frozenset(
-    {ROUND_FINDINGS_NONE, ROUND_FINDINGS_DECLARED, ROUND_FINDINGS_INVALID}
-)
-
-
-@dataclass(frozen=True)
-class RoundFindingsFacts:
-    """The finding set ONE review-round journal says that round raised.
-
-    ``findings`` is EMPTY unless the enumeration is valid — never guessed from the round's prose,
-    and never completed from what the verdicts happened to answer.
-    """
-
-    state: str = ROUND_FINDINGS_NONE
-    review_journal: str = ""
-    findings: Tuple[str, ...] = ()
-
-    @property
-    def in_force(self) -> bool:
-        """True ONLY for a VALID enumeration. :data:`ROUND_FINDINGS_INVALID` is False."""
-        return self.state == ROUND_FINDINGS_DECLARED
-
-
-def read_round_findings(notes: str) -> RoundFindingsFacts:
-    """The finding enumeration ONE review-round journal declares (pure).
-
-    Read from the round's own journal rather than folded latest-wins across the issue: the
-    enumeration is a property OF that round, so a later round's enumeration must not be able to
-    stand in for it. Which journal is the round is decided upstream, by the same glance grammar
-    every other consumer uses.
-    """
-    declared, fields = one_canonical_marker(
-        notes, gate=ROUND_FINDINGS_GATE, field_order=ROUND_FINDINGS_FIELD_ORDER
-    )
-    if not declared:
-        return RoundFindingsFacts()
-    if fields is None:
-        return RoundFindingsFacts(state=ROUND_FINDINGS_INVALID)
-    constants = {"gate": ROUND_FINDINGS_GATE, "version": ROUND_FINDINGS_VERSION}
-    if any(fields.get(key) != value for key, value in constants.items()):
-        return RoundFindingsFacts(state=ROUND_FINDINGS_INVALID)
-    review = journal_ref(fields.get("review_journal", ""))
-    if not review:
-        return RoundFindingsFacts(state=ROUND_FINDINGS_INVALID)
-    raw = str(fields.get("findings", "") or "")
-    parts = [part.strip().lower() for part in raw.split(ROUND_FINDINGS_SEPARATOR)]
-    if not parts or any(not part for part in parts):
-        # An empty id — from an empty field, a trailing separator, or two adjacent ones — means the
-        # producer could not render this list, so the list says nothing rather than saying less.
-        return RoundFindingsFacts(state=ROUND_FINDINGS_INVALID, review_journal=review)
-    if len(set(parts)) != len(parts):
-        # The same finding named twice cannot be covered "once each" by any verdict set.
-        return RoundFindingsFacts(state=ROUND_FINDINGS_INVALID, review_journal=review)
-    return RoundFindingsFacts(
-        state=ROUND_FINDINGS_DECLARED, review_journal=review, findings=tuple(parts)
-    )
-
-
-def render_round_findings_marker(*, review_journal: object, findings: Sequence[str]) -> str:
-    """The exact marker a valid round enumeration must carry (pure).
-
-    Every producer error raises ``ValueError`` rather than being written, for the reason
-    :func:`render_successor_acknowledgement_marker` states: a renderer that emits what its own
-    parser refuses produces durable records that read back as a typed zero.
-    """
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_envelope import (  # noqa: E501
-        reject_marker_separator,
-    )
-
-    review = journal_ref(review_journal)
-    if not review:
-        raise ValueError("review_journal must be a journal reference")
-    ids = [str(value or "").strip().lower() for value in findings or ()]
-    if not ids or any(not value for value in ids):
-        raise ValueError("findings must be a non-empty list of non-empty ids")
-    if len(set(ids)) != len(ids):
-        raise ValueError("findings must not repeat an id")
-    if any(ROUND_FINDINGS_SEPARATOR in value for value in ids):
-        raise ValueError("a finding id must not contain the list separator")
-    for value in ids:
-        reject_marker_separator(value, field="findings")
-    fields = {
-        "gate": ROUND_FINDINGS_GATE,
-        "version": ROUND_FINDINGS_VERSION,
-        "review_journal": review,
-        "findings": ROUND_FINDINGS_SEPARATOR.join(ids),
-    }
-    body = ":".join(f"{key}={fields[key]}" for key in ROUND_FINDINGS_FIELD_ORDER)
-    return f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:{body}]"
 
 
 @dataclass(frozen=True)
@@ -407,16 +230,30 @@ class FindingVerdictFacts:
     ``accepted`` is the fail-closed predicate; ``reason`` names which condition refused and
     ``journal`` where the deciding declaration is, so a refusal is diagnosable rather than a bare
     False. ``review_journal`` is the round the deciding declaration says it is about.
+
+    The ``authority_*`` fields describe the finding set the verdicts were measured against, and
+    they are populated on refusals too: ``authority_source`` is #14971's ``manifest`` /
+    ``legacy_owner_ruling``, ``authority_journal`` the record carrying it, ``authority_reason`` that
+    module's own verbatim token. Carried rather than collapsed into
+    :data:`VERDICT_FINDING_AUTHORITY_UNRESOLVED` because "no attestation was recorded", "the ruling
+    chain is incomplete" and "an in-journal manifest conflicts with a legacy downgrade attempt" are
+    three different records for an operator to go and look at.
     """
 
     accepted: bool = False
     reason: str = VERDICT_NOT_RECORDED
     journal: str = ""
     review_journal: str = ""
+    authority_source: str = ""
+    authority_journal: str = ""
+    authority_reason: str = ""
 
 
 def fold_finding_verdicts(
-    journals: Sequence[Tuple[object, str]], *, review_journal: str
+    journals: Sequence[Tuple[object, str]],
+    *,
+    review_journal: str,
+    authority: ReviewFindingAuthorityFacts,
 ) -> FindingVerdictFacts:
     """Whether the LATEST verdict gate accepts every finding of ``review_journal`` (pure).
 
@@ -440,16 +277,16 @@ def fold_finding_verdicts(
     is read from. #14695 review j#93704 finding 2 measured the cost of the asymmetry: with the
     declaration quote-aware and the value read from the raw note, a field appearing only inside a
     fenced code block resolved a determination and the admission returned ``ok``.
+
+    ``authority`` is the finding set the verdicts must cover, ALREADY RESOLVED by the caller
+    through #14971's :func:`...review_finding_legacy_authority.resolve_review_finding_authority`.
+    It is a parameter rather than something this fold derives, for two reasons: the resolution
+    needs whole journal ENTRIES (issue identity, and the ``ruling_issuers`` port that decides which
+    records may carry a legacy ruling) which these ``(journal_id, notes)`` pairs have already
+    dropped, and a route that resolved its own copy would be free to resolve it differently from
+    the module that owns the contract. This route consumes that authority; it does not restate it.
     """
     wanted = journal_ref(review_journal)
-    # The round's OWN enumeration, read from the round's journal. Located by the id the
-    # declaration named, so the finding set is a property of that round and a later round's
-    # enumeration cannot stand in for it.
-    round_findings = RoundFindingsFacts()
-    for journal_id, notes in journals or ():
-        if wanted and journal_ref(journal_id) == wanted:
-            round_findings = read_round_findings(notes or "")
-            break
     latest: Optional[Tuple[int, FindingVerdictFacts]] = None
     for journal_id, notes in journals or ():
         jint = _int_journal(journal_id)
@@ -458,7 +295,7 @@ def fold_finding_verdicts(
         text = notes or ""
         if not _declares_verdict_gate(text):
             continue
-        facts = _journal_verdicts(text, wanted=wanted, round_findings=round_findings)
+        facts = _journal_verdicts(text, wanted=wanted, authority=authority)
         if latest is None or jint > latest[0]:
             latest = (
                 jint,
@@ -467,6 +304,9 @@ def fold_finding_verdicts(
                     reason=facts.reason,
                     journal=str(jint),
                     review_journal=facts.review_journal,
+                    authority_source=facts.authority_source,
+                    authority_journal=facts.authority_journal,
+                    authority_reason=facts.authority_reason,
                 ),
             )
     return latest[1] if latest is not None else FindingVerdictFacts()
@@ -539,9 +379,12 @@ def _paired_verdicts(notes: str) -> "Optional[dict[str, str]]":
 
 
 def _journal_verdicts(
-    notes: str, *, wanted: str, round_findings: RoundFindingsFacts
+    notes: str, *, wanted: str, authority: ReviewFindingAuthorityFacts
 ) -> FindingVerdictFacts:
     """What ONE verdict-gate journal says about ``wanted`` (pure)."""
+    source = authority.source
+    authority_journal = journal_ref(authority.authority_journal)
+    authority_reason = authority.reason
     targets = {
         journal_ref(_clean_field_value(match.group("value")))
         for line in canonical_note_lines(notes or "")
@@ -549,40 +392,51 @@ def _journal_verdicts(
         if match is not None
     }
     targets.discard("")
+
+    def _refusal(reason: str, *, review: str = "") -> FindingVerdictFacts:
+        return FindingVerdictFacts(
+            reason=reason,
+            review_journal=review,
+            authority_source=source,
+            authority_journal=authority_journal,
+            authority_reason=authority_reason,
+        )
+
     if len(targets) != 1:
         # Zero: the gate is declared with no readable target. Two: it has named two rounds and
         # therefore decided about neither.
-        return FindingVerdictFacts(reason=VERDICT_UNRESOLVED)
+        return _refusal(VERDICT_UNRESOLVED)
     target = next(iter(targets))
     paired = _paired_verdicts(notes)
     if paired is None:
-        return FindingVerdictFacts(
-            reason=VERDICT_PAIRING_UNREADABLE, review_journal=target
-        )
+        return _refusal(VERDICT_PAIRING_UNREADABLE, review=target)
     if not wanted or target != wanted:
         # Reported BEFORE the verdict values are judged: "these verdicts are about another round"
         # is a different operational problem from "a finding was disputed", and collapsing them
         # would point an operator at the wrong record.
-        return FindingVerdictFacts(reason=VERDICT_TARGET_MISMATCH, review_journal=target)
+        return _refusal(VERDICT_TARGET_MISMATCH, review=target)
     # COVERAGE before content (#14755 review j#99057 finding_1). "every verdict present is
     # accepted" is satisfied by a verdict journal that lists one of the round's two findings, so
-    # the set the verdicts answer must equal the set the ROUND said it raised — checked against
-    # the round's own enumeration, a record this journal did not write.
-    if not round_findings.in_force:
-        return FindingVerdictFacts(
-            reason=VERDICT_ROUND_FINDINGS_UNDECLARED, review_journal=target
-        )
-    if round_findings.review_journal != target:
-        # The enumeration read from the round names a different round than these verdicts do.
-        return FindingVerdictFacts(reason=VERDICT_TARGET_MISMATCH, review_journal=target)
-    if set(paired) != set(round_findings.findings):
-        return FindingVerdictFacts(
-            reason=VERDICT_COVERAGE_MISMATCH, review_journal=target
-        )
+    # the set the verdicts answer must equal the set #14971's canonical authority carries for that
+    # round — a set this verdict journal did not write, and (unlike the route-local enumeration
+    # R2 tried, review j#99065) one whose producer and whose legacy migration chain are owned by
+    # the review contract rather than by this route.
+    if not authority.valid:
+        return _refusal(VERDICT_FINDING_AUTHORITY_UNRESOLVED, review=target)
+    if journal_ref(authority.review_journal) != target:
+        # The authority resolved a different round than these verdicts name.
+        return _refusal(VERDICT_TARGET_MISMATCH, review=target)
+    if set(paired) != set(authority.findings):
+        return _refusal(VERDICT_COVERAGE_MISMATCH, review=target)
     if any(value != VERDICT_ACCEPTED for value in paired.values()):
-        return FindingVerdictFacts(reason=VERDICT_NOT_ACCEPTED, review_journal=target)
+        return _refusal(VERDICT_NOT_ACCEPTED, review=target)
     return FindingVerdictFacts(
-        accepted=True, reason=VERDICT_ALL_ACCEPTED, review_journal=target
+        accepted=True,
+        reason=VERDICT_ALL_ACCEPTED,
+        review_journal=target,
+        authority_source=source,
+        authority_journal=authority_journal,
+        authority_reason=authority_reason,
     )
 
 
@@ -788,15 +642,6 @@ __all__ = (
     "FINDING_VERDICT_GATE_TOKEN",
     "FINDING_VERDICT_REASONS",
     "FindingVerdictFacts",
-    "ROUND_FINDINGS_DECLARED",
-    "ROUND_FINDINGS_FIELD_ORDER",
-    "ROUND_FINDINGS_GATE",
-    "ROUND_FINDINGS_INVALID",
-    "ROUND_FINDINGS_NONE",
-    "ROUND_FINDINGS_SEPARATOR",
-    "ROUND_FINDINGS_STATES",
-    "ROUND_FINDINGS_VERSION",
-    "RoundFindingsFacts",
     "SUCCESSOR_ACK_DECISION",
     "SUCCESSOR_ACK_FIELD_ORDER",
     "SUCCESSOR_ACK_GATE",
@@ -806,19 +651,16 @@ __all__ = (
     "VERDICT_ACCEPTED",
     "VERDICT_ALL_ACCEPTED",
     "VERDICT_COVERAGE_MISMATCH",
+    "VERDICT_FINDING_AUTHORITY_UNRESOLVED",
     "VERDICT_NOT_ACCEPTED",
     "VERDICT_NOT_RECORDED",
     "VERDICT_PAIRING_UNREADABLE",
-    "VERDICT_ROUND_FINDINGS_UNDECLARED",
     "VERDICT_TARGET_MISMATCH",
     "VERDICT_UNRESOLVED",
     "fold_finding_verdicts",
     "fold_successor_acknowledgement",
-    "heading_gate_tokens",
     "journal_ref",
     "marker_declares_gate",
     "one_canonical_marker",
-    "read_round_findings",
-    "render_round_findings_marker",
     "render_successor_acknowledgement_marker",
 )
