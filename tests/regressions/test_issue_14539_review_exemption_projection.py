@@ -3882,6 +3882,14 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "gate authorizes nothing (a record that declares the gate twice cannot say which is "
             "authoritative)",
         ),
+        "src/mozyo_bridge/e_110_execution_platform/f_160_state_store_managed_events/domain/offline_rollout_action.py": (
+            ["*", "*", "*", "*:MARKER_RE"],
+            "owns the offline-rollout owner-approval grammar: renders the exact workflow-event "
+            "marker and reads exactly one matching gate with canonical field order and no "
+            "duplicate fields. A second marker for this gate refuses the note; another gate is "
+            "ignored by this parser but the executor's issuer-resolution conjunct rejects a "
+            "shared-marker approval journal",
+        ),
         # -- readers -------------------------------------------------------------------
         f"{_D}/domain/dispatch_authorization.py": (
             ["*", "*", "*", "*:_MARKER_RE"],
@@ -4352,6 +4360,35 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "marker only to query exact delivery-ledger records, reads no durable note, and "
             "requires every record axis plus a strict post-attestation timestamp before "
             "confirmation (duplicate exact records do not change that boolean predicate)",
+        ),
+        "src/mozyo_bridge/e_110_execution_platform/f_160_state_store_managed_events/application/cli_herdr_offline_rollout.py": (
+            ['*'],
+            "inherits via a used import of the offline-rollout approval grammar; names no "
+            "marker token itself, renders the required owner marker in a read-only plan, and "
+            "reads no durable note",
+        ),
+        "src/mozyo_bridge/e_110_execution_platform/f_160_state_store_managed_events/application/herdr_offline_rollout_action.py": (
+            ['*'],
+            "inherits via used imports of the offline-rollout action domain; names no marker "
+            "token and reads no note, instead passing the exact approval pointer and manifest "
+            "to the execution port that owns verification",
+        ),
+        "src/mozyo_bridge/e_110_execution_platform/f_160_state_store_managed_events/infrastructure/offline_rollout_action_store.py": (
+            ['*'],
+            "inherits via used canonical action-domain helpers; names no marker token and reads "
+            "no durable note, storing only the already-validated private action record",
+        ),
+        "src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_offline_rollout_executor.py": (
+            ['*'],
+            "inherits and uses the offline-rollout approval parser: reads one exact owner journal, "
+            "requires issuer resolution before parsing, and then requires the parser's unique "
+            "canonical marker to equal the action-bound expected fields; marker sharing or "
+            "multiplicity fails closed",
+        ),
+        "src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_offline_rollout_wip.py": (
+            ['*'],
+            "inherits via a used canonical action-domain helper; names no marker token and reads "
+            "no durable note, preserving only private WIP bytes bound by the action plan",
         ),
         "src/mozyo_bridge/e_140_adapter_provider/f_110_ticket_adapter_common/domain/ticket_adapter.py": (
             ['handoff'],
