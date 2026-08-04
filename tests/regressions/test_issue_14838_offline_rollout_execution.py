@@ -19,6 +19,9 @@ from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.appl
     cmd_herdr_offline_rollout_run,
     register_herdr_offline_rollout_parser,
 )
+from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application.herdr_offline_rollout_action import (  # noqa: E501
+    PhaseExecutionResult,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_offline_rollout_executor import (  # noqa: E501
     RUNNER_ENV,
     LiveOfflineRolloutExecutionPort,
@@ -137,6 +140,116 @@ class OfflineRolloutExecutionRegressionTests(unittest.TestCase):
             }
         )
         self.assertEqual(clean, {"PATH": "/bin"})
+
+    def test_global_window_adopts_one_exact_legacy_lane_and_replay_is_idempotent(self) -> None:
+        from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
+        from mozyo_bridge.core.state.lane_lifecycle_model import (
+            DISPOSITION_ACTIVE,
+            DISPOSITION_HIBERNATED,
+            DecisionPointer,
+            LaneLifecycleKey,
+        )
+
+        issue = "13842"
+        journal = "79411"
+        decision = DecisionPointer("redmine", issue, journal)
+        key = LaneLifecycleKey("ws_recovery", "issue_13842_recovery")
+        lifecycle = LaneLifecycleStore(home=self.home)
+        declared = lifecycle.declare_active(key, decision=decision, issue_id=issue)
+        moved = lifecycle.transition_disposition(
+            key,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=declared.revision,
+            target=DISPOSITION_HIBERNATED,
+            decision=decision,
+        )
+        self.assertTrue(moved.applied, moved.reason)
+        with sqlite3.connect(lifecycle.path) as conn:
+            conn.execute(
+                "UPDATE lane_lifecycle_records "
+                "SET process_release = 'released', lane_epoch = '0' "
+                "WHERE repo_workspace_id = ? AND lane_id = ?",
+                key.as_row(),
+            )
+        legacy = lifecycle.get(key)
+        target = {
+            "issue_id": issue,
+            "journal_id": journal,
+            "workspace_id": key.repo_workspace_id,
+            "lane_id": key.lane_id,
+            "expected_revision": legacy.revision,
+            "from_epoch": 0,
+            "to_epoch": 1,
+            "agents": [],
+        }
+        phase = {"phase": "legacy_lane_epoch_adoption", "targets": []}
+        action = {"plan": {"legacy_recoveries": [target]}}
+        port = LiveOfflineRolloutExecutionPort(home=self.home)
+
+        first = port.execute_phase(
+            phase=phase,
+            action=action,
+            action_directory=self.home / "private",
+            replaying=False,
+        )
+        self.assertTrue(first.ok, first)
+        adopted = lifecycle.get(key)
+        self.assertEqual(adopted.lane_epoch, "1")
+        self.assertEqual(adopted.revision, legacy.revision + 1)
+        replay = port.execute_phase(
+            phase=phase,
+            action=action,
+            action_directory=self.home / "private",
+            replaying=True,
+        )
+        self.assertTrue(replay.ok, replay)
+        self.assertEqual(lifecycle.get(key).revision, legacy.revision + 1)
+
+    def test_legacy_recovery_launch_uses_bound_lane_worktree_not_workspace_root(self) -> None:
+        name = "mzb1_ws_codex_issueZ5F13842"
+        action = {
+            "private_bindings": {
+                "agents": [
+                    {
+                        "assigned_name": name,
+                        "workspace_id": "ws",
+                        "lane_id": "issue_13842",
+                        "provider": "codex",
+                        "locator": "",
+                        "recovery_issue_id": "13842",
+                    }
+                ],
+                "workspace_paths": {"ws": "/private/workspace-root"},
+                "legacy_recovery_worktree_paths": {
+                    "legacy:13842": "/private/lane-worktree"
+                },
+                "target_cli": "/private/bin/mozyo-bridge",
+            },
+            "plan": {},
+        }
+        completed = subprocess.CompletedProcess(
+            [], 0, stdout='{"ok": true, "action_id": "startup-one"}\n', stderr=""
+        )
+        port = LiveOfflineRolloutExecutionPort(home=self.home, env={})
+        with (
+            patch(
+                "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+                "application.herdr_offline_rollout_executor._run",
+                return_value=completed,
+            ) as invoked,
+            patch.object(
+                port,
+                "_verify_live_names",
+                return_value=PhaseExecutionResult(True),
+            ),
+        ):
+            result = port._restore_agents(  # noqa: SLF001
+                {"assigned_names": [name]}, action, self.home / "private"
+            )
+        self.assertTrue(result.ok, result)
+        argv = invoked.call_args.args[0]
+        self.assertEqual(argv[argv.index("--repo") + 1], "/private/lane-worktree")
+        self.assertNotIn("/private/workspace-root", argv)
 
     def test_owner_approval_gate_uses_anchored_coordinator_policy(self) -> None:
         manifest = {"plan_digest": "a" * 64, "global_stop": True}
@@ -301,6 +414,11 @@ class OfflineRolloutExecutionRegressionTests(unittest.TestCase):
             "plan": {"stores": {"attestation": planned}},
             "completed_phases": ["verified_backup"],
             "active_phase": "migrate_attestation",
+            "phase_receipts": {
+                "verified_backup": {
+                    "migration_post_digests": {"attestation": "b" * 64}
+                }
+            },
         }
         port = LiveOfflineRolloutExecutionPort(home=self.home, env={})
         with patch.object(port, "_fresh_store_records", return_value={"attestation": planned}):
@@ -322,7 +440,24 @@ class OfflineRolloutExecutionRegressionTests(unittest.TestCase):
                 replaying=True,
             )
         self.assertTrue(replay.ok)
-        self.assertEqual(replay.receipt["store_authority"], "active_phase_replay")
+        self.assertEqual(
+            replay.receipt["store_authority"], "exact_post_digest_replay"
+        )
+
+        drifted_target = dict(target, content_digest="c" * 64)
+        with patch.object(
+            port,
+            "_fresh_store_records",
+            return_value={"attestation": drifted_target},
+        ):
+            drifted_replay = port._require_store_phase_authority(  # noqa: SLF001
+                action,
+                store_name="attestation",
+                phase_name="migrate_attestation",
+                replaying=True,
+            )
+        self.assertFalse(drifted_replay.ok)
+        self.assertEqual(drifted_replay.reason, "attestation_plan_drift")
 
         with patch.object(port, "_fresh_store_records", return_value={"attestation": target}):
             refused = port._require_store_phase_authority(  # noqa: SLF001
@@ -383,8 +518,13 @@ class OfflineRolloutExecutionRegressionTests(unittest.TestCase):
         backup = port._verified_backup({}, action, action_directory)  # noqa: SLF001
         self.assertTrue(backup.ok, backup)
         self.assertTrue(backup.receipt["startup_backup_digest"])
+        self.assertEqual(
+            set(backup.receipt["migration_post_digests"]),
+            {"attestation", "lane_lifecycle"},
+        )
 
         action["completed_phases"] = ["verified_backup"]
+        action["phase_receipts"] = {"verified_backup": dict(backup.receipt)}
         action["active_phase"] = "migrate_attestation"
         attested = port._migrate_attestation({}, action, action_directory)  # noqa: SLF001
         self.assertTrue(attested.ok, attested)

@@ -44,6 +44,7 @@ def cmd_herdr_offline_rollout_plan(args: argparse.Namespace) -> int:
         candidate_workflow_run_id=args.candidate_workflow_run_id,
         candidate_wheel_sha256=args.candidate_wheel_sha256,
         candidate_sdist_sha256=args.candidate_sdist_sha256,
+        legacy_recovery_pointers=tuple(args.legacy_recovery),
         env=dict(os.environ),
     )
     payload = result.as_payload()
@@ -94,6 +95,7 @@ def _fresh_plan(args: argparse.Namespace):
         candidate_workflow_run_id=args.candidate_workflow_run_id,
         candidate_wheel_sha256=args.candidate_wheel_sha256,
         candidate_sdist_sha256=args.candidate_sdist_sha256,
+        legacy_recovery_pointers=tuple(args.legacy_recovery),
         env=dict(os.environ),
     )
 
@@ -188,6 +190,20 @@ def _add_home(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_legacy_recoveries(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--legacy-recovery",
+        action="append",
+        default=[],
+        metavar="ISSUE:JOURNAL",
+        help=(
+            "Compose one already-approved #14756 legacy epoch recovery into the global "
+            "window. Repeat for each exact hibernated lane; the issue must resolve to "
+            "exactly one adoptable lifecycle row."
+        ),
+    )
+
+
 def register_herdr_offline_rollout_parser(herdr_sub, *, add_repo_option=None) -> None:
     """Register the plan plus external replayable execution rail."""
     offline = herdr_sub.add_parser(
@@ -207,6 +223,7 @@ def register_herdr_offline_rollout_parser(herdr_sub, *, add_repo_option=None) ->
         ),
     )
     _add_candidate_arguments(plan)
+    _add_legacy_recoveries(plan)
     _add_home(plan)
     if add_repo_option is not None:
         add_repo_option(plan)
@@ -230,6 +247,7 @@ def register_herdr_offline_rollout_parser(herdr_sub, *, add_repo_option=None) ->
         ),
     )
     _add_candidate_arguments(delegate)
+    _add_legacy_recoveries(delegate)
     _add_home(delegate)
     if add_repo_option is not None:
         add_repo_option(delegate)

@@ -1,10 +1,4 @@
-"""Host adapter for the external shared-home Herdr offline rollout (#14838).
-
-All destructive targets come from the sealed private action.  Every phase measures
-its goal state after the effect and is safe to re-enter: absence is accepted only for
-an exact planned name, replacement locator/name drift is refused, and migrations are
-forward-only.
-"""
+"""Sealed, read-back host adapter for the shared-home Herdr offline rollout (#14838)."""
 
 from __future__ import annotations
 
@@ -16,13 +10,17 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-import tarfile
 import time
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
 from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application.herdr_offline_rollout_action import (  # noqa: E501
     PhaseExecutionResult,
+    adopt_legacy_lanes,
+    merge_legacy_recovery_agent_bindings,
+    prepare_store_migration_proofs,
+    store_phase_authority,
+    verify_migrated_store,
 )
 from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.domain.offline_rollout_action import (  # noqa: E501
     OFFLINE_ROLLOUT_APPROVAL_GATE,
@@ -146,6 +144,15 @@ class LiveOfflineRolloutExecutionPort:
 
     def capture_private_bindings(self, *, plan):
         from mozyo_bridge.core.state.workspace_registry import list_workspaces
+        from mozyo_bridge.core.state.lane_epoch_adoption import legacy_adoption_refusal
+        from mozyo_bridge.core.state.lane_lifecycle_model import DecisionPointer
+        from mozyo_bridge.core.state.lane_lifecycle_readonly import LaneLifecycleReader
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_lane_topology import (  # noqa: E501
+            bind_lane_worktree,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_boundary import (  # noqa: E501
+            read_live_worktree_fingerprint,
+        )
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_observability import (  # noqa: E501
             read_herdr_inventory,
         )
@@ -154,6 +161,7 @@ class LiveOfflineRolloutExecutionPort:
             return _fail("repo_root_required")
         try:
             records = tuple(list_workspaces(home=self.home))
+            lifecycle_rows = LaneLifecycleReader(home=self.home).records()
             inventory = read_herdr_inventory(self.repo_root, env=self.env)
         except Exception as exc:  # noqa: BLE001
             return _fail("private_binding_capture_failed", type(exc).__name__)
@@ -182,12 +190,63 @@ class LiveOfflineRolloutExecutionPort:
                     "locator": agent.locator,
                 }
             )
+        merged = merge_legacy_recovery_agent_bindings(plan=plan, agents=agents)
+        if not merged.ok:
+            return merged
+        agents = list(merged.receipt["agents"])
+        recovery_paths = {}
+        for recovery in plan.get("legacy_recoveries", ()):
+            matches = [
+                row
+                for row in lifecycle_rows
+                if row.issue_id == recovery["issue_id"]
+                and row.repo_workspace_id == recovery["workspace_id"]
+                and row.lane_id == recovery["lane_id"]
+                and row.lane_generation == recovery["lane_generation"]
+            ]
+            if len(matches) != 1:
+                return _fail("legacy_recovery_row_drift", recovery["issue_id"])
+            row = matches[0]
+            decision = DecisionPointer(
+                "redmine", recovery["issue_id"], recovery["journal_id"]
+            )
+            refusal = legacy_adoption_refusal(
+                row,
+                expected_revision=recovery["expected_revision"],
+                issue_id=recovery["issue_id"],
+                decision=decision,
+            )
+            registry = by_workspace.get(recovery["workspace_id"])
+            bound = (
+                bind_lane_worktree(
+                    Path(registry.canonical_path),
+                    lifecycle_rows,
+                    workspace=recovery["workspace_id"],
+                    lane=recovery["lane_id"],
+                    generation=recovery["lane_generation"],
+                )
+                if registry is not None and refusal is None
+                else None
+            )
+            if bound is None or row.worktree_identity != recovery["worktree"]["identity"]:
+                return _fail("legacy_recovery_worktree_drift", recovery["issue_id"])
+            worktree, _branch = bound
+            fingerprint = read_live_worktree_fingerprint(worktree, 30.0)
+            expected_wip = recovery["worktree"]["wip"]
+            if (
+                not fingerprint.readable
+                or fingerprint.digest != expected_wip["digest"]
+                or fingerprint.dirty != expected_wip["dirty"]
+                or fingerprint.untracked != expected_wip["untracked"]
+            ):
+                return _fail("legacy_recovery_wip_drift", recovery["issue_id"])
+            recovery_paths[f"legacy:{recovery['issue_id']}"] = str(worktree.resolve())
         target_cli = shutil.which("mozyo-bridge", path=self.env.get("PATH"))
         pipx = shutil.which("pipx", path=self.env.get("PATH"))
         if not target_cli or not pipx:
             return _fail("runtime_installer_unavailable")
         try:
-            from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (  # noqa: E501
+            from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
                 resolve_herdr_binary,
             )
 
@@ -199,15 +258,12 @@ class LiveOfflineRolloutExecutionPort:
                 workspace_id: by_workspace[workspace_id].canonical_path
                 for workspace_id in sorted(wanted_workspaces)
             },
+            legacy_recovery_worktree_paths=recovery_paths,
             agents=sorted(agents, key=lambda row: row["assigned_name"]),
-            # Keep the stable pipx app symlink, not its current venv target: --force
-            # replaces that venv during the cutover and the old resolved path vanishes.
             target_cli=str(Path(target_cli).absolute()),
             pipx=str(Path(pipx).resolve()),
             herdr_binary=str(Path(herdr_binary).resolve()),
         )
-
-    # -- immutable external runner -------------------------------------------------
 
     def prepare_external_runner(self, *, action_id, action_directory, plan):
         artifact = plan["candidate_artifact"]
@@ -387,6 +443,7 @@ class LiveOfflineRolloutExecutionPort:
             "migrate_lane_lifecycle": self._migrate_lane_lifecycle,
             "migrate_startup_transaction": self._migrate_startup_transaction,
             "exact_runtime_install": self._exact_runtime_install,
+            "legacy_lane_epoch_adoption": lambda _p, action, _d, *, replaying=False: adopt_legacy_lanes(home=self.home, targets=action["plan"].get("legacy_recoveries", ()), replaying=bool(replaying)),  # noqa: E501
             "top_restore_action_bootstrap": self._restore_agents,
             "remaining_workspace_restore": self._restore_agents,
             "supervisor_pair_install": self._supervisor_install,
@@ -401,6 +458,7 @@ class LiveOfflineRolloutExecutionPort:
                 "migrate_attestation",
                 "migrate_lane_lifecycle",
                 "migrate_startup_transaction",
+                "legacy_lane_epoch_adoption",
             }:
                 return handler(
                     phase, action, action_directory, replaying=bool(replaying)
@@ -443,105 +501,38 @@ class LiveOfflineRolloutExecutionPort:
     def _ensure_wip_snapshots(
         self, action, action_directory, *, workspace_ids=None
     ):
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_boundary import (  # noqa: E501
-            read_live_worktree_fingerprint,
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_offline_rollout_wip import (  # noqa: E501
+            ensure_wip_snapshots,
         )
 
-        root = action_directory / "wip"
-        root.mkdir(mode=0o700, exist_ok=True)
         paths = self._bindings(action)["workspace_paths"]
         selected = None if workspace_ids is None else set(workspace_ids)
-        for row in action["plan"]["workspaces"]:
-            workspace_id = row["workspace_id"]
-            if selected is not None and workspace_id not in selected:
-                continue
-            # Registry IDs are authority tokens, not trusted path segments.  Hashing keeps every
-            # snapshot inside the sealed action even if an old/imported registry row contains
-            # separators or dot components.
-            target = root / hashlib.sha256(workspace_id.encode("utf-8")).hexdigest()
-            manifest_path = target / "manifest.json"
-            current = read_live_worktree_fingerprint(Path(paths[workspace_id]), 30.0)
-            if not current.readable or current.digest != row["wip"]["digest"]:
-                return _fail("wip_drift", workspace_id)
-            if not row["wip"]["dirty"] and not row["wip"]["untracked"]:
-                continue
-            if manifest_path.is_file():
-                recorded = json.loads(manifest_path.read_text(encoding="utf-8"))
-                if (
-                    recorded.get("workspace_id") != workspace_id
-                    or recorded.get("wip_digest") != current.digest
-                ):
-                    return _fail("wip_snapshot_mismatch", workspace_id)
-                files = recorded.get("files")
-                expected_files = {
-                    "worktree.patch",
-                    "index.patch",
-                    "untracked.list",
-                    "git-index",
-                    "untracked.tar",
-                }
-                if (
-                    not isinstance(files, Mapping)
-                    or set(files) != expected_files
-                    or any(
-                    not (target / name).is_file()
-                    or _sha256(target / name) != digest
-                    for name, digest in files.items()
-                    )
-                ):
-                    return _fail("wip_snapshot_readback_failed", workspace_id)
-                continue
-            target.mkdir(mode=0o700, exist_ok=False)
-            repo = Path(paths[workspace_id])
-            commands = {
-                "worktree.patch": ["git", "diff", "HEAD", "--binary", "--no-ext-diff"],
-                "index.patch": ["git", "diff", "--cached", "--binary", "--no-ext-diff"],
-                "untracked.list": [
-                    "git", "ls-files", "--others", "--exclude-standard", "-z"
-                ],
+        records = [
+            {"snapshot_id": row["workspace_id"], "wip": row["wip"]}
+            for row in action["plan"]["workspaces"]
+            if selected is None or row["workspace_id"] in selected
+        ]
+        return ensure_wip_snapshots(
+            records=records, paths=paths, action_directory=action_directory
+        )
+
+    def _ensure_recovery_wip_snapshots(self, action, action_directory):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_offline_rollout_wip import (  # noqa: E501
+            ensure_wip_snapshots,
+        )
+
+        records = [
+            {
+                "snapshot_id": f"legacy:{row['issue_id']}",
+                "wip": row["worktree"]["wip"],
             }
-            outputs = {}
-            for filename, argv in commands.items():
-                result = subprocess.run(
-                    argv, cwd=repo, capture_output=True, check=False, timeout=60.0
-                )
-                if result.returncode != 0:
-                    return _fail("wip_snapshot_failed", workspace_id)
-                path = target / filename
-                path.write_bytes(result.stdout)
-                path.chmod(0o600)
-                outputs[filename] = _sha256(path)
-            index_path_result = _run(
-                ["git", "rev-parse", "--git-path", "index"], timeout=30.0, cwd=repo
-            )
-            if index_path_result.returncode != 0:
-                return _fail("wip_index_unreadable", workspace_id)
-            index_path = Path(index_path_result.stdout.strip())
-            if not index_path.is_absolute():
-                index_path = repo / index_path
-            index_copy = target / "git-index"
-            index_copy.write_bytes(index_path.read_bytes())
-            index_copy.chmod(0o600)
-            outputs["git-index"] = _sha256(index_copy)
-            untracked = (target / "untracked.list").read_bytes().split(b"\0")
-            archive = target / "untracked.tar"
-            with tarfile.open(archive, "w", dereference=False) as tar:
-                for raw in untracked:
-                    if not raw:
-                        continue
-                    relative = os.fsdecode(raw)
-                    full = repo / relative
-                    tar.add(full, arcname=relative, recursive=False)
-            archive.chmod(0o600)
-            outputs["untracked.tar"] = _sha256(archive)
-            manifest = {
-                "workspace_id": workspace_id,
-                "wip_digest": current.digest,
-                "files": outputs,
-            }
-            manifest_path.write_bytes(canonical_bytes(manifest) + b"\n")
-            manifest_path.chmod(0o600)
-        return _ok(wip_snapshots_verified=True)
+            for row in action["plan"].get("legacy_recoveries", ())
+        ]
+        return ensure_wip_snapshots(
+            records=records,
+            paths=self._bindings(action).get("legacy_recovery_worktree_paths", {}),
+            action_directory=action_directory,
+        )
 
     def _stop_agents(self, phase, action, action_directory):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
@@ -570,6 +561,10 @@ class LiveOfflineRolloutExecutionPort:
         )
         if not preserved.ok:
             return preserved
+        if phase.get("phase") == "top_workspace_stop":
+            recovered_wip = self._ensure_recovery_wip_snapshots(action, action_directory)
+            if not recovered_wip.ok:
+                return recovered_wip
         for name in names:
             view = self._inventory(action)
             if not view.ok or view.invalid_row_count != 0 or view.unmanaged_agents:
@@ -663,27 +658,14 @@ class LiveOfflineRolloutExecutionPort:
     def _require_store_phase_authority(
         self, action, *, store_name, phase_name, replaying
     ):
-        """Re-check the approved store immediately before its migration effect.
-
-        A byte-exact predecessor is the normal first attempt.  The target version is
-        accepted only while replaying this action's durably active phase after its
-        verified-backup phase; this is the narrow crash window between the migration
-        commit and its action receipt.  No general "already current" shortcut exists.
-        """
         observed = self._fresh_store_records().get(store_name)
-        planned = action["plan"]["stores"][store_name]
-        if observed == planned:
-            return _ok(store_authority="planned_predecessor")
-        if (
-            isinstance(observed, Mapping)
-            and observed.get("state") == "recognized"
-            and observed.get("version") == planned.get("target_version")
-            and replaying is True
-            and action.get("active_phase") == phase_name
-            and "verified_backup" in action.get("completed_phases", ())
-        ):
-            return _ok(store_authority="active_phase_replay")
-        return _fail(f"{store_name}_plan_drift")
+        return store_phase_authority(
+            action,
+            observed,
+            store_name=store_name,
+            phase_name=phase_name,
+            replaying=bool(replaying),
+        )
 
     def _verified_backup(self, _phase, action, action_directory):
         from mozyo_bridge.core.state.herdr_identity_attestation import (
@@ -719,11 +701,21 @@ class LiveOfflineRolloutExecutionPort:
         startup_digest = artifact_digest_of(startup)
         if not startup_digest:
             return _fail("startup_backup_readback_failed")
+        proofs = prepare_store_migration_proofs(
+            action_directory=action_directory,
+            store_paths={
+                "attestation": herdr_identity_attestation_path(self.home),
+                "lane_lifecycle": lane_lifecycle_path(self.home),
+            },
+        )
+        if not proofs.ok:
+            return proofs
         return _ok(
             attestation_backup=bool(attestation),
             state_backup=bool(state),
             startup_backup=True,
             startup_backup_digest=startup_digest,
+            migration_post_digests=proofs.receipt["migration_post_digests"],
         )
 
     def _migrate_attestation(
@@ -733,9 +725,7 @@ class LiveOfflineRolloutExecutionPort:
             herdr_identity_attestation_path,
         )
         from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
-            HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
             migrate_attestation_store,
-            probe_store_schema,
         )
 
         authority = self._require_store_phase_authority(
@@ -748,19 +738,17 @@ class LiveOfflineRolloutExecutionPort:
             return authority
         path = herdr_identity_attestation_path(self.home)
         result = migrate_attestation_store(path)
-        observed = probe_store_schema(path)
-        if observed.version != HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION:
-            return _fail("attestation_migration_unverified")
-        return _ok(outcome=result.outcome, to_version=observed.version)
+        verified = verify_migrated_store(
+            action, "attestation", self._fresh_store_records().get("attestation")
+        )
+        if not verified.ok:
+            return verified
+        return _ok(outcome=result.outcome, to_version=result.to_version, **verified.receipt)
 
     def _migrate_lane_lifecycle(
         self, _phase, action, _directory, *, replaying=False
     ):
-        from mozyo_bridge.core.state.lane_lifecycle_readonly import (
-            probe_lane_lifecycle_schema,
-        )
         from mozyo_bridge.core.state.lane_lifecycle_schema import (
-            LANE_LIFECYCLE_SCHEMA_VERSION,
             ensure_lane_lifecycle_schema,
             lane_lifecycle_path,
         )
@@ -774,10 +762,12 @@ class LiveOfflineRolloutExecutionPort:
         if not authority.ok:
             return authority
         outcome = ensure_lane_lifecycle_schema(lane_lifecycle_path(self.home))
-        observed = probe_lane_lifecycle_schema(home=self.home)
-        if observed.version != LANE_LIFECYCLE_SCHEMA_VERSION:
-            return _fail("lane_lifecycle_migration_unverified")
-        return _ok(action=outcome.action, to_version=observed.version)
+        verified = verify_migrated_store(
+            action, "lane_lifecycle", self._fresh_store_records().get("lane_lifecycle")
+        )
+        if not verified.ok:
+            return verified
+        return _ok(action=outcome.action, to_version=outcome.to_version, **verified.receipt)
 
     def _migrate_startup_transaction(
         self, _phase, action, action_directory, *, replaying=False
@@ -859,15 +849,27 @@ class LiveOfflineRolloutExecutionPort:
         agents = [row for row in bindings["agents"] if row["assigned_name"] in names]
         groups = {}
         for row in agents:
-            groups.setdefault((row["workspace_id"], row["lane_id"]), []).append(row)
+            groups.setdefault(
+                (
+                    row["workspace_id"],
+                    row["lane_id"],
+                    row.get("recovery_issue_id", ""),
+                ),
+                [],
+            ).append(row)
         action_ids = []
-        for (workspace_id, lane_id), rows in sorted(groups.items()):
+        for (workspace_id, lane_id, recovery_issue), rows in sorted(groups.items()):
+            repo = (
+                bindings["legacy_recovery_worktree_paths"][f"legacy:{recovery_issue}"]
+                if recovery_issue
+                else bindings["workspace_paths"][workspace_id]
+            )
             argv = [
                 bindings["target_cli"],
                 "herdr",
                 "session-start",
                 "--repo",
-                bindings["workspace_paths"][workspace_id],
+                repo,
                 "--json",
             ]
             if lane_id != "default":
@@ -961,6 +963,11 @@ class LiveOfflineRolloutExecutionPort:
 
     def _final_verify(self, _phase, action, _directory):
         expected = {row["assigned_name"] for row in action["plan"]["agents"]}
+        expected.update(
+            agent["assigned_name"]
+            for recovery in action["plan"].get("legacy_recoveries", ())
+            for agent in recovery.get("agents", ())
+        )
         live = self._verify_live_names(action, expected)
         if not live.ok:
             return live

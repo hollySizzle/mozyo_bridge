@@ -142,6 +142,56 @@ class AgentSnapshot:
 
 
 @dataclass(frozen=True)
+class LegacyRecoveryAgentSnapshot:
+    assigned_name: str
+    provider: str
+
+    def to_record(self) -> dict:
+        return {
+            "assigned_name": self.assigned_name,
+            "provider": self.provider,
+        }
+
+
+@dataclass(frozen=True)
+class LegacyRecoverySnapshot:
+    issue_id: str
+    journal_id: str
+    workspace_id: str
+    lane_id: str
+    lane_generation: int
+    expected_revision: int
+    worktree_identity: str
+    wip_readable: bool
+    dirty: bool
+    untracked: bool
+    wip_digest: str
+    agents: tuple[LegacyRecoveryAgentSnapshot, ...]
+
+    def to_record(self) -> dict:
+        return {
+            "issue_id": self.issue_id,
+            "journal_id": self.journal_id,
+            "workspace_id": self.workspace_id,
+            "lane_id": self.lane_id,
+            "lane_generation": self.lane_generation,
+            "expected_revision": self.expected_revision,
+            "from_epoch": 0,
+            "to_epoch": 1,
+            "agents": [agent.to_record() for agent in sorted(self.agents, key=lambda row: row.assigned_name)],
+            "worktree": {
+                "identity": self.worktree_identity,
+                "wip": {
+                    "readable": self.wip_readable,
+                    "dirty": self.dirty,
+                    "untracked": self.untracked,
+                    "digest": self.wip_digest,
+                },
+            },
+        }
+
+
+@dataclass(frozen=True)
 class TopIdentitySnapshot:
     workspace_id: str
     lane_id: str
@@ -215,6 +265,7 @@ class OfflineRolloutCapture:
     top_identity: TopIdentitySnapshot
     stores: tuple[StoreSnapshot, ...]
     supervisors: tuple[SupervisorAgentSnapshot, ...] = ()
+    legacy_recoveries: tuple[LegacyRecoverySnapshot, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -342,6 +393,59 @@ def _validate_capture(capture: OfflineRolloutCapture) -> Optional[OfflineRollout
             return refused(REASON_INVALID_CAPTURE, "agent_record_invalid")
         if agent.workspace_id not in registered:
             return refused(REASON_UNREGISTERED_AGENT_WORKSPACE, agent.workspace_id)
+
+    recovery_issues: set[str] = set()
+    recovery_keys: set[tuple[str, str]] = set()
+    recovery_names: set[str] = set()
+    live_by_name = {agent.assigned_name: agent for agent in capture.agents}
+    for recovery in capture.legacy_recoveries:
+        if (
+            not _exact_nonempty(recovery.issue_id)
+            or not recovery.issue_id.isascii()
+            or not recovery.issue_id.isdecimal()
+            or str(int(recovery.issue_id)) != recovery.issue_id
+            or not _exact_nonempty(recovery.journal_id)
+            or not recovery.journal_id.isascii()
+            or not recovery.journal_id.isdecimal()
+            or str(int(recovery.journal_id)) != recovery.journal_id
+            or not _exact_nonempty(recovery.workspace_id)
+            or not _exact_nonempty(recovery.lane_id)
+            or not isinstance(recovery.lane_generation, int)
+            or isinstance(recovery.lane_generation, bool)
+            or recovery.lane_generation < 1
+            or not isinstance(recovery.expected_revision, int)
+            or isinstance(recovery.expected_revision, bool)
+            or recovery.expected_revision < 0
+            or not _exact_nonempty(recovery.worktree_identity)
+            or not recovery.wip_readable
+            or not _SHA256.fullmatch(recovery.wip_digest)
+        ):
+            return refused(REASON_INVALID_CAPTURE, "legacy_recovery_record_invalid")
+        key = (recovery.workspace_id, recovery.lane_id)
+        if recovery.issue_id in recovery_issues or key in recovery_keys:
+            return refused(REASON_INVALID_CAPTURE, "legacy_recovery_target_duplicate")
+        recovery_issues.add(recovery.issue_id)
+        recovery_keys.add(key)
+        if recovery.workspace_id not in registered:
+            return refused(REASON_UNREGISTERED_AGENT_WORKSPACE, recovery.workspace_id)
+        if (
+            len(recovery.agents) != 2
+            or {agent.provider for agent in recovery.agents} != {"claude", "codex"}
+        ):
+            return refused(REASON_INVALID_CAPTURE, "legacy_recovery_pair_invalid")
+        for agent in recovery.agents:
+            if not _exact_nonempty(agent.assigned_name):
+                return refused(REASON_INVALID_CAPTURE, "legacy_recovery_agent_invalid")
+            if agent.assigned_name in recovery_names:
+                return refused(REASON_DUPLICATE_ASSIGNED_NAME, agent.assigned_name)
+            recovery_names.add(agent.assigned_name)
+            live = live_by_name.get(agent.assigned_name)
+            if live is not None and (
+                live.workspace_id,
+                live.lane_id,
+                live.provider,
+            ) != (recovery.workspace_id, recovery.lane_id, agent.provider):
+                return refused(REASON_INVALID_CAPTURE, "legacy_recovery_live_identity_mismatch")
     if names.count(capture.top_identity.assigned_name) != 1:
         return refused(REASON_TOP_IDENTITY_UNRESOLVED, "top_not_exactly_once")
     top_agent = next(
@@ -410,9 +514,22 @@ def build_offline_rollout_plan(
 
     workspaces = sorted(capture.workspaces, key=lambda item: item.workspace_id)
     agents = sorted(capture.agents, key=lambda item: item.assigned_name)
+    recoveries = sorted(
+        capture.legacy_recoveries,
+        key=lambda item: (item.workspace_id, item.lane_id, item.issue_id),
+    )
     stores = {store.name: store for store in capture.stores}
     top_name = capture.top_identity.assigned_name
     non_top = [agent.assigned_name for agent in agents if agent.assigned_name != top_name]
+    desired_names = {
+        *(agent.assigned_name for agent in agents),
+        *(
+            agent.assigned_name
+            for recovery in recoveries
+            for agent in recovery.agents
+        ),
+    }
+    remaining_restore = sorted(desired_names - {top_name})
     supervisor_labels = sorted(OWNED_SUPERVISOR_LABELS)
     artifact_pins = (
         capture.candidate_source_sha,
@@ -439,13 +556,14 @@ def build_offline_rollout_plan(
         "top_identity": capture.top_identity.to_record(),
         "workspaces": [workspace.to_record() for workspace in workspaces],
         "agents": [agent.to_record() for agent in agents],
+        "legacy_recoveries": [recovery.to_record() for recovery in recoveries],
         "stores": {name: stores[name].to_record() for name in sorted(stores)},
         "supervisors": [
             supervisor.to_record()
             for supervisor in sorted(capture.supervisors, key=lambda item: item.label)
         ],
         "stop_order": [*non_top, top_name],
-        "restore_order": [top_name, *non_top],
+        "restore_order": [top_name, *remaining_restore],
         "schema_transitions": [
             {
                 "store": name,
@@ -469,10 +587,24 @@ def build_offline_rollout_plan(
             {"phase": "migrate_startup_transaction", "target_version": 2},
             {"phase": "exact_runtime_install"},
             {
+                "phase": "legacy_lane_epoch_adoption",
+                "targets": [
+                    {
+                        "issue_id": recovery.issue_id,
+                        "workspace_id": recovery.workspace_id,
+                        "lane_id": recovery.lane_id,
+                    }
+                    for recovery in recoveries
+                ],
+            },
+            {
                 "phase": "top_restore_action_bootstrap",
                 "assigned_names": [top_name],
             },
-            {"phase": "remaining_workspace_restore", "assigned_names": non_top},
+            {
+                "phase": "remaining_workspace_restore",
+                "assigned_names": remaining_restore,
+            },
             {
                 "phase": "supervisor_pair_install",
                 "supervisor_labels": supervisor_labels,
@@ -499,6 +631,8 @@ def build_offline_rollout_plan(
 
 __all__ = (
     "AgentSnapshot",
+    "LegacyRecoveryAgentSnapshot",
+    "LegacyRecoverySnapshot",
     "OfflineRolloutCapture",
     "OfflineRolloutPlanResult",
     "StoreSnapshot",

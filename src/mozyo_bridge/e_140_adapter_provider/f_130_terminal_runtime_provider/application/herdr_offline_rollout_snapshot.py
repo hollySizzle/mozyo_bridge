@@ -25,8 +25,11 @@ from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
 from mozyo_bridge.core.state.lane_lifecycle_readonly import (
     LIFECYCLE_SCHEMA_ABSENT,
     LIFECYCLE_SCHEMA_RECOGNIZED,
+    LaneLifecycleReader,
     probe_lane_lifecycle_schema,
 )
+from mozyo_bridge.core.state.lane_epoch_adoption import legacy_adoption_refusal
+from mozyo_bridge.core.state.lane_lifecycle_model import DecisionPointer
 from mozyo_bridge.core.state.lane_lifecycle_schema import lane_lifecycle_path
 from mozyo_bridge.core.state.startup_store_migration import (
     startup_store_migration_plan_digest,
@@ -48,11 +51,16 @@ from mozyo_bridge.core.state.workspace_registry import (
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_boundary import (  # noqa: E501
     read_live_worktree_fingerprint,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_lane_topology import (  # noqa: E501
+    bind_lane_worktree,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd import (  # noqa: E501
     service_status_pair,
 )
 from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.domain.offline_rollout_plan import (  # noqa: E501
     AgentSnapshot,
+    LegacyRecoveryAgentSnapshot,
+    LegacyRecoverySnapshot,
     OfflineRolloutCapture,
     OfflineRolloutPlanResult,
     SCOPE_TARGET_PROJECT,
@@ -81,6 +89,118 @@ REASON_INVENTORY_UNREADABLE = "inventory_unreadable"
 REASON_INVENTORY_PROJECTION_INCOMPLETE = "inventory_projection_incomplete"
 REASON_TOP_IDENTITY_UNRESOLVED = "top_identity_unresolved"
 REASON_SNAPSHOT_DRIFT = "snapshot_drift"
+REASON_LEGACY_RECOVERY_UNAVAILABLE = "legacy_recovery_unavailable"
+
+
+def _legacy_recovery_snapshots(
+    home: Path,
+    pointers,
+    records_reader,
+    registry_records,
+    worktree_reader,
+    timeout: float,
+    worktree_binder,
+):
+    if not pointers:
+        return ()
+    parsed = []
+    for raw in pointers:
+        if not isinstance(raw, str) or raw.count(":") != 1:
+            return refused(REASON_LEGACY_RECOVERY_UNAVAILABLE, "decision_pointer_invalid")
+        issue, journal = raw.split(":", 1)
+        if any(
+            not token.isascii()
+            or not token.isdecimal()
+            or int(token) < 1
+            or str(int(token)) != token
+            for token in (issue, journal)
+        ):
+            return refused(REASON_LEGACY_RECOVERY_UNAVAILABLE, "decision_pointer_invalid")
+        parsed.append((issue, journal))
+    if len({issue for issue, _journal in parsed}) != len(parsed):
+        return refused(REASON_LEGACY_RECOVERY_UNAVAILABLE, "decision_issue_duplicate")
+    try:
+        rows = tuple(records_reader(home))
+    except Exception as exc:  # noqa: BLE001 - unreadable authority is a typed refusal
+        return refused(REASON_LEGACY_RECOVERY_UNAVAILABLE, type(exc).__name__)
+    snapshots = []
+    for issue, journal in parsed:
+        matches = [row for row in rows if row.issue_id == issue]
+        if len(matches) != 1:
+            return refused(
+                REASON_LEGACY_RECOVERY_UNAVAILABLE,
+                f"issue_{issue}_row_count_{len(matches)}",
+            )
+        row = matches[0]
+        decision = DecisionPointer("redmine", issue, journal)
+        refusal = legacy_adoption_refusal(
+            row,
+            expected_revision=row.revision,
+            issue_id=issue,
+            decision=decision,
+        )
+        if refusal is not None:
+            return refused(
+                REASON_LEGACY_RECOVERY_UNAVAILABLE,
+                f"issue_{issue}_{refusal.reason}",
+            )
+        registry = next(
+            (
+                record
+                for record in registry_records
+                if record.workspace_id == row.repo_workspace_id
+            ),
+            None,
+        )
+        bound = (
+            worktree_binder(
+                Path(registry.canonical_path),
+                rows,
+                workspace=row.repo_workspace_id,
+                lane=row.lane_id,
+                generation=row.lane_generation,
+            )
+            if registry is not None
+            else None
+        )
+        if bound is None:
+            return refused(
+                REASON_LEGACY_RECOVERY_UNAVAILABLE,
+                f"issue_{issue}_worktree_unresolved",
+            )
+        worktree_path, _branch_ref = bound
+        fingerprint = worktree_reader(worktree_path, timeout)
+        if not fingerprint.readable or not fingerprint.digest:
+            return refused(
+                REASON_LEGACY_RECOVERY_UNAVAILABLE,
+                f"issue_{issue}_wip_unreadable",
+            )
+        agents = tuple(
+            LegacyRecoveryAgentSnapshot(
+                assigned_name=encode_assigned_name(
+                    row.repo_workspace_id, provider, row.lane_id
+                ),
+                provider=provider,
+            )
+            for provider in ("claude", "codex")
+        )
+        snapshots.append(
+            LegacyRecoverySnapshot(
+                issue_id=issue,
+                journal_id=journal,
+                workspace_id=row.repo_workspace_id,
+                lane_id=row.lane_id,
+                lane_generation=row.lane_generation,
+                expected_revision=row.revision,
+                worktree_identity=row.worktree_identity,
+                wip_readable=fingerprint.readable,
+                dirty=fingerprint.dirty,
+                untracked=fingerprint.untracked,
+                wip_digest=fingerprint.digest,
+                agents=agents,
+            )
+        )
+    return tuple(snapshots)
 
 
 def _registry_snapshot(home: Path, health_reader, workspace_reader):
@@ -297,6 +417,7 @@ def capture_offline_rollout_snapshot(
     candidate_workflow_run_id: str = "",
     candidate_wheel_sha256: str = "",
     candidate_sdist_sha256: str = "",
+    legacy_recovery_pointers: tuple[str, ...] = (),
     env: Optional[Mapping[str, str]] = None,
     timeout: float = 10.0,
     inventory_reader: Callable = read_herdr_inventory,
@@ -305,6 +426,8 @@ def capture_offline_rollout_snapshot(
     worktree_reader: Callable = read_live_worktree_fingerprint,
     store_reader: Callable = _store_snapshots,
     supervisor_reader: Callable = service_status_pair,
+    lifecycle_records_reader: Optional[Callable] = None,
+    lane_worktree_binder: Callable = bind_lane_worktree,
 ) -> OfflineRolloutCapture | OfflineRolloutPlanResult:
     """Capture one stable, path-redacted host view or return a typed refusal."""
     source_env = dict(os.environ if env is None else env)
@@ -339,6 +462,22 @@ def capture_offline_rollout_snapshot(
     if current is None:
         return refused(REASON_REGISTRY_UNREADABLE, "current_workspace_not_registered")
 
+    if lifecycle_records_reader is None:
+        lifecycle_records_reader = lambda selected_home: LaneLifecycleReader(
+            home=selected_home
+        ).records()
+    recoveries = _legacy_recovery_snapshots(
+        home,
+        legacy_recovery_pointers,
+        lifecycle_records_reader,
+        records,
+        worktree_reader,
+        timeout,
+        lane_worktree_binder,
+    )
+    if isinstance(recoveries, OfflineRolloutPlanResult):
+        return recoveries
+
     wip, wip_token = _worktree_snapshots(records, worktree_reader, timeout)
     stores = tuple(store_reader(home))
     supervisors = _supervisor_snapshots(home, supervisor_reader)
@@ -359,12 +498,24 @@ def capture_offline_rollout_snapshot(
     )
     stores_after = tuple(store_reader(home))
     supervisors_after = _supervisor_snapshots(home, supervisor_reader)
+    recoveries_after = _legacy_recovery_snapshots(
+        home,
+        legacy_recovery_pointers,
+        lifecycle_records_reader,
+        registry_after[0],
+        worktree_reader,
+        timeout,
+        lane_worktree_binder,
+    )
+    if isinstance(recoveries_after, OfflineRolloutPlanResult):
+        return refused(REASON_SNAPSHOT_DRIFT, "legacy_recovery_became_unreadable")
     if (
         registry_token != registry_after[1]
         or inventory_token != inventory_after[1]
         or wip_token != wip_after_token
         or stores != stores_after
         or supervisors != supervisors_after
+        or recoveries != recoveries_after
     ):
         return refused(REASON_SNAPSHOT_DRIFT, "snapshot_changed_during_capture")
     del wip_after  # proof-only second read; the first stable view is the plan input.
@@ -421,6 +572,7 @@ def capture_offline_rollout_snapshot(
         ),
         stores=stores,
         supervisors=supervisors,
+        legacy_recoveries=recoveries,
     )
 
 

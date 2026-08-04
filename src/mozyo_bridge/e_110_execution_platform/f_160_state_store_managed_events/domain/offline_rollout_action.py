@@ -59,6 +59,7 @@ EXECUTION_PHASES = (
     "migrate_lane_lifecycle",
     "migrate_startup_transaction",
     "exact_runtime_install",
+    "legacy_lane_epoch_adoption",
     "top_restore_action_bootstrap",
     "remaining_workspace_restore",
     "supervisor_pair_install",
@@ -163,6 +164,100 @@ def verify_plan(plan: object, expected_digest: object) -> Mapping[str, object]:
     ]
     if plan.get("schema_transitions") != expected_transitions:
         raise OfflineRolloutActionError("plan_schema_transitions_invalid")
+    recoveries = plan.get("legacy_recoveries")
+    if not isinstance(recoveries, list):
+        raise OfflineRolloutActionError("plan_legacy_recoveries_invalid")
+    plan_agents = plan.get("agents")
+    if not isinstance(plan_agents, list):
+        raise OfflineRolloutActionError("plan_agents_invalid")
+    live_by_name = {}
+    for agent in plan_agents:
+        if not isinstance(agent, Mapping):
+            raise OfflineRolloutActionError("plan_agent_invalid")
+        name = _token(agent.get("assigned_name"), "assigned_name")
+        if name in live_by_name:
+            raise OfflineRolloutActionError("plan_agent_duplicate")
+        live_by_name[name] = agent
+    recovery_names: set[str] = set()
+    recovery_targets = []
+    for recovery in recoveries:
+        if not isinstance(recovery, Mapping):
+            raise OfflineRolloutActionError("plan_legacy_recovery_invalid")
+        issue = _token(recovery.get("issue_id"), "legacy_recovery_issue")
+        journal = _token(recovery.get("journal_id"), "legacy_recovery_journal")
+        workspace = _token(recovery.get("workspace_id"), "legacy_recovery_workspace")
+        lane = _token(recovery.get("lane_id"), "legacy_recovery_lane")
+        generation = recovery.get("lane_generation")
+        revision = recovery.get("expected_revision")
+        recovery_agents = recovery.get("agents")
+        worktree = recovery.get("worktree")
+        worktree_wip = worktree.get("wip") if isinstance(worktree, Mapping) else None
+        if (
+            not issue.isascii()
+            or not issue.isdecimal()
+            or str(int(issue)) != issue
+            or not journal.isascii()
+            or not journal.isdecimal()
+            or str(int(journal)) != journal
+            or not isinstance(revision, int)
+            or isinstance(revision, bool)
+            or revision < 0
+            or not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation < 1
+            or recovery.get("from_epoch") != 0
+            or recovery.get("to_epoch") != 1
+            or not isinstance(recovery_agents, list)
+            or len(recovery_agents) != 2
+            or not isinstance(worktree, Mapping)
+            or not _token(worktree.get("identity"), "legacy_recovery_worktree")
+            or not isinstance(worktree_wip, Mapping)
+            or worktree_wip.get("readable") is not True
+            or not isinstance(worktree_wip.get("digest"), str)
+            or not _SHA256.fullmatch(worktree_wip["digest"])
+        ):
+            raise OfflineRolloutActionError("plan_legacy_recovery_invalid")
+        providers = set()
+        for agent in recovery_agents:
+            if not isinstance(agent, Mapping):
+                raise OfflineRolloutActionError("plan_legacy_recovery_agent_invalid")
+            name = _token(agent.get("assigned_name"), "legacy_recovery_assigned_name")
+            provider = _token(agent.get("provider"), "legacy_recovery_provider")
+            if name in recovery_names:
+                raise OfflineRolloutActionError("plan_legacy_recovery_agent_duplicate")
+            recovery_names.add(name)
+            providers.add(provider)
+            live = live_by_name.get(name)
+            if live is not None and (
+                live.get("workspace_id"),
+                live.get("lane_id"),
+                live.get("provider"),
+            ) != (workspace, lane, provider):
+                raise OfflineRolloutActionError(
+                    "plan_legacy_recovery_live_identity_mismatch"
+                )
+        if providers != {"claude", "codex"}:
+            raise OfflineRolloutActionError("plan_legacy_recovery_pair_invalid")
+        recovery_targets.append(
+            {"issue_id": issue, "workspace_id": workspace, "lane_id": lane}
+        )
+    adoption_phase = phases[EXECUTION_PHASES.index("legacy_lane_epoch_adoption")]
+    if adoption_phase.get("targets") != recovery_targets:
+        raise OfflineRolloutActionError("plan_legacy_recovery_phase_mismatch")
+    top = plan.get("top_identity")
+    if not isinstance(top, Mapping):
+        raise OfflineRolloutActionError("plan_top_identity_invalid")
+    top_name = _token(top.get("assigned_name"), "top_assigned_name")
+    desired_names = set(live_by_name) | recovery_names
+    remaining = sorted(desired_names - {top_name})
+    top_phase = phases[EXECUTION_PHASES.index("top_restore_action_bootstrap")]
+    remaining_phase = phases[EXECUTION_PHASES.index("remaining_workspace_restore")]
+    if top_phase.get("assigned_names") != [top_name]:
+        raise OfflineRolloutActionError("plan_top_restore_invalid")
+    if remaining_phase.get("assigned_names") != remaining:
+        raise OfflineRolloutActionError("plan_remaining_restore_invalid")
+    if plan.get("restore_order") != [top_name, *remaining]:
+        raise OfflineRolloutActionError("plan_restore_order_invalid")
     return plan
 
 
@@ -206,13 +301,27 @@ def approval_manifest(plan: Mapping[str, object], plan_digest: str) -> dict:
     ]
     if len(assigned_names) != len(agents):
         raise OfflineRolloutActionError("plan_agent_invalid")
+    recoveries = verified.get("legacy_recoveries")
+    if not isinstance(recoveries, list):
+        raise OfflineRolloutActionError("plan_legacy_recoveries_invalid")
+    for recovery in recoveries:
+        if not isinstance(recovery, Mapping) or not isinstance(recovery.get("agents"), list):
+            raise OfflineRolloutActionError("plan_legacy_recovery_invalid")
+        assigned_names.extend(
+            _token(agent.get("assigned_name"), "legacy_recovery_assigned_name")
+            for agent in recovery["agents"]
+            if isinstance(agent, Mapping)
+        )
+        if len(recovery["agents"]) != 2:
+            raise OfflineRolloutActionError("plan_legacy_recovery_pair_invalid")
     return {
         "plan_digest": plan_digest,
         "workspace_ids": sorted(workspace_ids),
         "workspace_projects": sorted(
             workspace_projects, key=lambda row: row["workspace_id"]
         ),
-        "assigned_names": sorted(assigned_names),
+        "assigned_names": sorted(set(assigned_names)),
+        "legacy_recoveries": recoveries,
         "unrelated_workspace_ids": sorted(unrelated),
         "schema_transitions": transitions,
         "candidate_artifact": dict(artifact),

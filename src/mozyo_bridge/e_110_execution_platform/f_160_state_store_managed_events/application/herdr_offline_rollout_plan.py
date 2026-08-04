@@ -22,6 +22,7 @@ def run_offline_rollout_plan(
     candidate_workflow_run_id: str = "",
     candidate_wheel_sha256: str = "",
     candidate_sdist_sha256: str = "",
+    legacy_recovery_pointers: tuple[str, ...] = (),
     env: Optional[Mapping[str, str]] = None,
     snapshot_reader: Optional[Callable] = None,
 ) -> OfflineRolloutPlanResult:
@@ -41,6 +42,7 @@ def run_offline_rollout_plan(
         candidate_workflow_run_id=candidate_workflow_run_id,
         candidate_wheel_sha256=candidate_wheel_sha256,
         candidate_sdist_sha256=candidate_sdist_sha256,
+        legacy_recovery_pointers=legacy_recovery_pointers,
         env=env,
     )
     if isinstance(captured, OfflineRolloutPlanResult):

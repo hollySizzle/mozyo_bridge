@@ -579,7 +579,8 @@ Table naming:
         `gate=herdr_offline_rollout_owner_approval` / `approval_source=direct_owner` /
         `decision=approved` / exact effect・issue・action digestを持つworkflow-event markerが
         **ちょうど1個**ある場合だけ候補にする。quoted prose / code fence / duplicate・unknown・
-        reordered field / 別digestはapprovalではない。
+        reordered field / 別digestはapprovalではない。issuer resolverも同じ単一markerをauthorityに
+        するため、approval journalは本markerだけを本文に持ち、別gate markerを同居させない。
         issuer軸はsource-system author ID（このworkspaceでは全roleが同じID）から推定しない。
         canonical writer `coordinator` を、gate固有ruling (`#14838 j#97993`) + committed
         `.mozyo-bridge/config.yaml` blob + exact journal/gate evidenceの3部anchorで解決し、markerの
@@ -603,7 +604,19 @@ Table naming:
         phaseから前進する。effect前にactive intentが既にdurableだった場合だけreplayと分類し、同じ
         runの最初の `mark_phase_started` はreplay authorityにしない。phase順はplanの
         `supervisor stop → non-top stop → top stop → zero → backup → 3 migration → exact install →
-        top first → remaining → supervisor pair → final verify`から変更しない。
+        legacy epoch adoption → top first → remaining → supervisor pair → final verify`から変更しない。
+      - pre-v10 hibernateでepoch未発行のlaneをこのwindowで復帰する場合は、plan/delegateの双方へ
+        repeatableな `--legacy-recovery ISSUE:JOURNAL` を同一順で指定する。issueはlifecycle authority上の
+        **exact 1 row**へ解決し、`hibernated + released + settled replacement + canonical epoch 0`を
+        #14756のpure adoption predicateで満たす場合だけplanへ入る。history上の全hibernated rowを
+        暗黙採用・復帰しない。target、expected revision、decision pointer、fresh codex/claude assigned
+        namesをplan digestとowner approval manifestへ含める。global consumer=0とv10 migration、exact
+        runtime installの後にepoch `0→1`をCASし、その後の`session-start`がepoch 1を自己attestする
+        fresh pairだけを復帰として認める。phase receipt前crashはstored revision/epoch/decision pointerの
+        exact一致時だけreplay成功へ畳み、別writerのepoch 1をlaunderしない。lane固有Git worktreeは
+        lifecycle `worktree_identity`をworkspace rootのlocal `git worktree list`へexact-one joinして解決し、
+        content-sensitive WIP fingerprintをpublic planへ、tracked/index/untracked bytesをtop stop前のprivate
+        snapshotへ固定する。復帰時の`session-start --repo`もregistry rootではなく同じbound worktreeを使う。
       - 各stop phaseは、そのphaseが停止するworkspaceだけについてclose前にtracked/index binary
         patch、Git index、untracked path/archiveをprivate directoryへ保存し、planの
         content-sensitive WIP digestを再照合する。non-top phaseがまだliveなtop workspaceのsnapshotを
@@ -613,7 +626,10 @@ Table naming:
         unreadableはzero-progress refusal。既にabsentなexact planned nameはcrash replayとしてのみ
         goal stateへ畳み、consumer=0をfresh raw/projection countの連言で確認する。
       - backupはattestation/state container/startup seal+DBをSQLite logical snapshotとreadbackで
-        検証する。migrationは既存public primitiveをcomposeし、startup v2 replayはprivate actionの
+        検証する。同じverified-backup phaseでattestation/lifecycleのprivate cloneをtarget schemaへ
+        migrationし、deterministic logical post-digestをphase receiptへ固定する。live migration後の
+        readbackとcrash replayはこのpost-digestとのexact一致を必須にし、`active_phase`だけではtarget
+        versionを受理しない。migrationは既存public primitiveをcomposeし、startup v2 replayはprivate actionの
         typed completion receipt + recovery artifact再検証を必須にする。installはprivateに保持した
         exact wheelをpipxへ渡し、通常PATH executableのversionをreadbackする。restoreはtop unitを
         先に`herdr session-start`し、各nameをfresh inventory locator + v3 self-attestationでjoinして

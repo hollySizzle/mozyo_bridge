@@ -7,6 +7,8 @@ from dataclasses import replace
 
 from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.domain.offline_rollout_plan import (  # noqa: E501
     AgentSnapshot,
+    LegacyRecoveryAgentSnapshot,
+    LegacyRecoverySnapshot,
     OfflineRolloutCapture,
     StoreSnapshot,
     SupervisorAgentSnapshot,
@@ -133,6 +135,7 @@ class OfflineRolloutPlanTests(unittest.TestCase):
                 "migrate_lane_lifecycle",
                 "migrate_startup_transaction",
                 "exact_runtime_install",
+                "legacy_lane_epoch_adoption",
                 "top_restore_action_bootstrap",
                 "remaining_workspace_restore",
                 "supervisor_pair_install",
@@ -140,6 +143,52 @@ class OfflineRolloutPlanTests(unittest.TestCase):
                 "final_verify",
             ],
         )
+
+    def test_explicit_legacy_recoveries_are_digest_bound_and_restore_after_adoption(self) -> None:
+        recovery = LegacyRecoverySnapshot(
+            issue_id="13842",
+            journal_id="79411",
+            workspace_id="ws_a",
+            lane_id="issue_13842_recovery",
+            lane_generation=1,
+            expected_revision=4,
+            worktree_identity="wt_1234567890abcdef",
+            wip_readable=True,
+            dirty=False,
+            untracked=False,
+            wip_digest="9" * 64,
+            agents=(
+                LegacyRecoveryAgentSnapshot(
+                    "mzb1_ws_a__claude__issue_13842_recovery", "claude"
+                ),
+                LegacyRecoveryAgentSnapshot(
+                    "mzb1_ws_a__codex__issue_13842_recovery", "codex"
+                ),
+            ),
+        )
+        result = build_offline_rollout_plan(
+            replace(_capture(), legacy_recoveries=(recovery,))
+        )
+
+        self.assertTrue(result.ok, result.as_payload())
+        self.assertEqual(result.plan["legacy_recoveries"][0]["from_epoch"], 0)
+        self.assertEqual(result.plan["legacy_recoveries"][0]["to_epoch"], 1)
+        phases = {row["phase"]: row for row in result.plan["phase_order"]}
+        self.assertEqual(
+            phases["legacy_lane_epoch_adoption"]["targets"],
+            [
+                {
+                    "issue_id": "13842",
+                    "workspace_id": "ws_a",
+                    "lane_id": "issue_13842_recovery",
+                }
+            ],
+        )
+        self.assertIn(
+            "mzb1_ws_a__codex__issue_13842_recovery",
+            phases["remaining_workspace_restore"]["assigned_names"],
+        )
+        self.assertNotEqual(result.plan_digest, build_offline_rollout_plan(_capture()).plan_digest)
 
     def test_payload_is_path_free_and_json_serializable(self) -> None:
         result = build_offline_rollout_plan(_capture())

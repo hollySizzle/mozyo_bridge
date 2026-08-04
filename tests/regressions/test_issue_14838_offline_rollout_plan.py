@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from mozyo_bridge.core.state.workspace_registry import WorkspaceRecord
+from mozyo_bridge.core.state.lane_lifecycle_model import LaneLifecycleRecord
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_toctou import (  # noqa: E501
     WorktreeMutationFingerprint,
 )
@@ -265,6 +266,60 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertNotIn(marker, str(result.as_payload()))
 
+    def test_named_legacy_recovery_is_exactly_resolved_without_restoring_history(self) -> None:
+        row = LaneLifecycleRecord(
+            repo_workspace_id="ws_other",
+            lane_id="issue_13842_recovery",
+            issue_id="13842",
+            lane_disposition="hibernated",
+            process_release="released",
+            revision=4,
+            worktree_identity="wt_1234567890abcdef",
+            lane_epoch="0",
+        )
+        kwargs = self._kwargs()
+        kwargs["legacy_recovery_pointers"] = ("13842:79411",)
+        kwargs["lifecycle_records_reader"] = lambda home: (row,)
+        kwargs["lane_worktree_binder"] = lambda *args, **kwargs: (
+            self.other,
+            "refs/heads/recovery",
+        )
+        captured = capture_offline_rollout_snapshot(**kwargs)
+        result = build_offline_rollout_plan(captured)
+
+        self.assertTrue(result.ok, result.as_payload())
+        recovery = result.plan["legacy_recoveries"]
+        self.assertEqual(len(recovery), 1)
+        self.assertEqual(recovery[0]["issue_id"], "13842")
+        self.assertEqual(recovery[0]["journal_id"], "79411")
+        self.assertEqual(recovery[0]["expected_revision"], 4)
+        self.assertEqual(recovery[0]["worktree"]["wip"]["digest"], "b" * 64)
+        self.assertEqual(
+            {agent["provider"] for agent in recovery[0]["agents"]},
+            {"claude", "codex"},
+        )
+
+    def test_named_legacy_recovery_refuses_ambiguous_issue_rows(self) -> None:
+        row = LaneLifecycleRecord(
+            repo_workspace_id="ws_other",
+            lane_id="one",
+            issue_id="13842",
+            lane_disposition="hibernated",
+            process_release="released",
+            revision=4,
+            worktree_identity="wt_1234567890abcdef",
+            lane_epoch="0",
+        )
+        kwargs = self._kwargs()
+        kwargs["legacy_recovery_pointers"] = ("13842:79411",)
+        kwargs["lifecycle_records_reader"] = lambda home: (
+            row,
+            LaneLifecycleRecord(**{**row.__dict__, "lane_id": "two"}),
+        )
+        result = capture_offline_rollout_snapshot(**kwargs)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, "legacy_recovery_unavailable")
+
     def test_parser_exposes_plan_delegate_external_run_and_status(self) -> None:
         parser = argparse.ArgumentParser()
         herdr_sub = parser.add_subparsers(dest="command", required=True)
@@ -288,12 +343,15 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
                 "e" * 64,
                 "--candidate-sdist-sha256",
                 "f" * 64,
+                "--legacy-recovery",
+                "13842:79411",
                 "--json",
             ]
         )
         self.assertEqual(parsed.offline_rollout_command, "plan")
         self.assertEqual(parsed.candidate_source_ref, "refs/heads/main")
         self.assertEqual(parsed.candidate_workflow_run_id, "30821934713")
+        self.assertEqual(parsed.legacy_recovery, ["13842:79411"])
         delegated = parser.parse_args(
             [
                 "offline-rollout",
@@ -304,9 +362,12 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
                 "a" * 64,
                 "--owner-approval",
                 "14838:99999",
+                "--legacy-recovery",
+                "13842:79411",
             ]
         )
         self.assertEqual(delegated.offline_rollout_command, "delegate")
+        self.assertEqual(delegated.legacy_recovery, ["13842:79411"])
         external = parser.parse_args(
             ["offline-rollout", "run", "--action-id", "offline_" + "a" * 32]
         )

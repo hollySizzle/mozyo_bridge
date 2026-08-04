@@ -86,6 +86,7 @@ def _plan() -> dict:
                 "runtime_state": "working",
             }
         ],
+        "legacy_recoveries": [],
         "stores": {
             "attestation": {
                 "state": "recognized",
@@ -130,6 +131,7 @@ def _plan() -> dict:
             {"phase": "migrate_lane_lifecycle", "target_version": 10},
             {"phase": "migrate_startup_transaction", "target_version": 2},
             {"phase": "exact_runtime_install"},
+            {"phase": "legacy_lane_epoch_adoption", "targets": []},
             {"phase": "top_restore_action_bootstrap", "assigned_names": [top]},
             {"phase": "remaining_workspace_restore", "assigned_names": []},
             {"phase": "supervisor_pair_install", "supervisor_labels": []},
