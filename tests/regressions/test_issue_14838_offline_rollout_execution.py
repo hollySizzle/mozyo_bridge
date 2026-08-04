@@ -7,6 +7,7 @@ import contextlib
 import gc
 import hashlib
 import io
+import plistlib
 import sqlite3
 import subprocess
 import tempfile
@@ -27,6 +28,11 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     LiveOfflineRolloutExecutionPort,
     _reports_exact_version,
     _sanitized_runtime_env,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_offline_rollout_runner import (  # noqa: E501
+    OfflineRolloutRunnerBindingError,
+    capture_provider_launch_bindings,
+    validate_provider_launch_bindings,
 )
 from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.domain.offline_rollout_action import (  # noqa: E501
     OFFLINE_ROLLOUT_APPROVAL_GATE,
@@ -140,6 +146,153 @@ class OfflineRolloutExecutionRegressionTests(unittest.TestCase):
             }
         )
         self.assertEqual(clean, {"PATH": "/bin"})
+
+    def test_provider_executables_are_sealed_before_stop_and_exactly_revalidated(self) -> None:
+        binary_dir = Path(self.temp.name) / "provider-bin"
+        binary_dir.mkdir()
+        for name in ("claude", "codex"):
+            path = binary_dir / name
+            path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            path.chmod(0o755)
+        agents = (
+            {"provider": "codex"},
+            {"provider": "claude"},
+            {"provider": "codex"},
+        )
+
+        captured = capture_provider_launch_bindings(
+            agents=agents, env={"PATH": str(binary_dir)}
+        )
+        self.assertEqual(
+            {key: value["argv0"] for key, value in captured.items()},
+            {
+                "MOZYO_AGENT_CLAUDE_BINARY": str(binary_dir / "claude"),
+                "MOZYO_AGENT_CODEX_BINARY": str(binary_dir / "codex"),
+            },
+        )
+        self.assertEqual(
+            validate_provider_launch_bindings(agents=agents, bindings=captured),
+            {key: value["argv0"] for key, value in captured.items()},
+        )
+        for invalid in (
+            {"MOZYO_AGENT_CODEX_BINARY": captured["MOZYO_AGENT_CODEX_BINARY"]},
+            {
+                **captured,
+                "MOZYO_AGENT_FOREIGN_BINARY": captured["MOZYO_AGENT_CODEX_BINARY"],
+            },
+            {
+                **captured,
+                "MOZYO_AGENT_CODEX_BINARY": {
+                    **captured["MOZYO_AGENT_CODEX_BINARY"],
+                    "argv0": "codex",
+                },
+            },
+        ):
+            with self.assertRaises(OfflineRolloutRunnerBindingError):
+                validate_provider_launch_bindings(agents=agents, bindings=invalid)
+
+        codex_alias = binary_dir / "codex"
+        codex_target_b = binary_dir / "codex-target-b"
+        codex_target_b.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        codex_target_b.chmod(0o755)
+        codex_alias.unlink()
+        codex_alias.symlink_to(codex_target_b)
+        with self.assertRaisesRegex(
+            OfflineRolloutRunnerBindingError, "provider_executable_drift"
+        ):
+            validate_provider_launch_bindings(agents=agents, bindings=captured)
+
+    def test_launchd_runner_receives_only_the_sealed_provider_bindings(self) -> None:
+        action_id = "offline_" + "e" * 32
+        action_directory = Path(self.temp.name) / "action"
+        cli = action_directory / "runner" / "venv" / "bin" / "mozyo-bridge"
+        cli.parent.mkdir(parents=True)
+        cli.write_text("runner\n", encoding="utf-8")
+        herdr = Path(self.temp.name) / "herdr"
+        herdr.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        herdr.chmod(0o755)
+        binary_dir = Path(self.temp.name) / "provider-bin"
+        binary_dir.mkdir()
+        for name in ("claude", "codex"):
+            path = binary_dir / name
+            path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            path.chmod(0o755)
+        agents = ({"provider": "claude"}, {"provider": "codex"})
+        provider_bindings = capture_provider_launch_bindings(
+            agents=agents, env={"PATH": str(binary_dir)}
+        )
+        provider_environment = {
+            key: value["argv0"] for key, value in provider_bindings.items()
+        }
+        port = LiveOfflineRolloutExecutionPort(home=self.home, env={})
+        action = {
+            "private_bindings": {
+                "agents": list(agents),
+                "herdr_binary": str(herdr),
+                "provider_executable_bindings": provider_bindings,
+                "runner": {"launchd_label": port._runner_label(action_id)},  # noqa: SLF001
+            }
+        }
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        load_path = (
+            "mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events."
+            "infrastructure.offline_rollout_action_store.OfflineRolloutActionStore.load"
+        )
+        with (
+            patch(
+                "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+                "application.herdr_offline_rollout_executor.sys.platform",
+                "darwin",
+            ),
+            patch(load_path, return_value=action),
+            patch(
+                "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+                "application.herdr_offline_rollout_executor._run",
+                return_value=completed,
+            ) as invoked,
+        ):
+            launched = port.launch_external_runner(
+                action_id=action_id, action_directory=action_directory
+            )
+        self.assertTrue(launched.ok, launched)
+        runner_env = plistlib.loads(
+            (action_directory / "runner.plist").read_bytes()
+        )["EnvironmentVariables"]
+        self.assertEqual(
+            {key: runner_env[key] for key in provider_environment},
+            provider_environment,
+        )
+        self.assertNotIn("PATH", runner_env)
+        self.assertEqual(invoked.call_count, 2)
+
+        invalid = {
+            "private_bindings": {
+                **action["private_bindings"],
+                "provider_executable_bindings": {
+                    "MOZYO_AGENT_CODEX_BINARY": provider_bindings[
+                        "MOZYO_AGENT_CODEX_BINARY"
+                    ]
+                },
+            }
+        }
+        with (
+            patch(
+                "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+                "application.herdr_offline_rollout_executor.sys.platform",
+                "darwin",
+            ),
+            patch(load_path, return_value=invalid),
+            patch(
+                "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+                "application.herdr_offline_rollout_executor._run"
+            ) as refused_run,
+        ):
+            refused = port.launch_external_runner(
+                action_id=action_id, action_directory=action_directory
+            )
+        self.assertFalse(refused.ok)
+        self.assertEqual(refused.reason, "agent_provider_binary_binding_invalid")
+        refused_run.assert_not_called()
 
     def test_global_window_adopts_one_exact_legacy_lane_and_replay_is_idempotent(self) -> None:
         from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import plistlib
@@ -12,7 +11,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Mapping, Optional, Sequence
+from typing import Mapping, Optional
 
 from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application.herdr_offline_rollout_action import (  # noqa: E501
     PhaseExecutionResult,
@@ -28,9 +27,18 @@ from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.doma
     canonical_bytes,
     parse_approval_note,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_offline_rollout_runner import (  # noqa: E501
+    RUNNER_ENV,
+    bounded_result as _bounded,
+    capture_provider_launch_bindings,
+    file_sha256 as _sha256,
+    reports_exact_version as _reports_exact_version,
+    run_command as _run,
+    sanitized_runtime_env as _sanitized_runtime_env,
+    validate_provider_launch_bindings,
+)
 
 
-RUNNER_ENV = "MOZYO_OFFLINE_ROLLOUT_RUNNER_ACTION_ID"
 _RUN_TIMEOUT = 120.0
 _INSTALL_TIMEOUT = 600.0
 
@@ -41,48 +49,6 @@ def _ok(**receipt) -> PhaseExecutionResult:
 
 def _fail(reason: str, detail: str = "") -> PhaseExecutionResult:
     return PhaseExecutionResult(ok=False, reason=reason, detail=detail[:1000])
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        while True:
-            chunk = source.read(1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _run(argv: Sequence[str], *, timeout: float, env=None, cwd=None):
-    return subprocess.run(
-        list(argv),
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=timeout,
-        env=env,
-        cwd=cwd,
-    )
-
-
-def _bounded(result: subprocess.CompletedProcess[str]) -> str:
-    return ((result.stderr or "") or (result.stdout or "")).strip()[:1000]
-
-
-def _sanitized_runtime_env(env: Mapping[str, str]) -> dict[str, str]:
-    """Keep source-tree injection from impersonating the installed candidate."""
-    clean = dict(env)
-    for name in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "__PYVENV_LAUNCHER__"):
-        clean.pop(name, None)
-    return clean
-
-
-def _reports_exact_version(stdout: object, expected: object) -> bool:
-    """Accept one exact CLI version token, never a substring such as a4 in a41."""
-    if not isinstance(stdout, str) or not isinstance(expected, str) or not expected:
-        return False
-    return stdout.splitlines() == [f"mozyo-bridge {expected}"]
 
 
 class LiveOfflineRolloutExecutionPort:
@@ -253,6 +219,12 @@ class LiveOfflineRolloutExecutionPort:
             herdr_binary = resolve_herdr_binary(self.env).path
         except Exception as exc:  # noqa: BLE001
             return _fail("herdr_binary_unavailable", type(exc).__name__)
+        try:
+            provider_executable_bindings = capture_provider_launch_bindings(
+                agents=agents, env=self.env
+            )
+        except Exception as exc:  # noqa: BLE001 - provider resolver is fail-closed
+            return _fail("agent_provider_binary_unavailable", type(exc).__name__)
         return _ok(
             workspace_paths={
                 workspace_id: by_workspace[workspace_id].canonical_path
@@ -263,6 +235,7 @@ class LiveOfflineRolloutExecutionPort:
             target_cli=str(Path(target_cli).absolute()),
             pipx=str(Path(pipx).resolve()),
             herdr_binary=str(Path(herdr_binary).resolve()),
+            provider_executable_bindings=provider_executable_bindings,
         )
 
     def prepare_external_runner(self, *, action_id, action_directory, plan):
@@ -359,6 +332,15 @@ class LiveOfflineRolloutExecutionPort:
         herdr_binary = action["private_bindings"].get("herdr_binary", "")
         if not Path(herdr_binary).is_file():
             return _fail("herdr_binary_unavailable")
+        try:
+            provider_environment = validate_provider_launch_bindings(
+                agents=action["private_bindings"].get("agents", ()),
+                bindings=action["private_bindings"].get(
+                    "provider_executable_bindings"
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - typed public refusal below
+            return _fail("agent_provider_binary_binding_invalid", type(exc).__name__)
         label = self._runner_label(action_id)
         if action["private_bindings"].get("runner", {}).get("launchd_label") != label:
             return _fail("runner_launch_binding_mismatch")
@@ -381,6 +363,7 @@ class LiveOfflineRolloutExecutionPort:
                 RUNNER_ENV: action_id,
                 "MOZYO_BRIDGE_HOME": str(self.home),
                 "MOZYO_HERDR_BINARY": herdr_binary,
+                **provider_environment,
             },
             "RunAtLoad": True,
             "KeepAlive": False,

@@ -595,6 +595,10 @@ Table naming:
         独立venvとRunAtLoad/KeepAlive=falseのone-shot LaunchAgentを準備・bootstrapする。更新対象
         pipx env自身をrunnerにしない。candidateのversion/capability probeはsource `PYTHONPATH` 等を
         除去したenvで行い、versionはsubstringではなく単一exact tokenで照合する。
+        stop前のtrusted envでplan内の全agent provider executableを既存resolverにより一意解決し、
+        env override名・verified absolute alias・symlink解決後のexec targetをprivate actionへ固定する。
+        one-shot LaunchAgentはこの固定済みprovider bindingだけを受け取り、欠落・過剰・relative path・
+        非実行可能化・symlink retargetをrestore時のambient PATHで補完せずtyped refusalにする。
       - `run --execute` はLaunchAgentが注入したexact action tokenを持ち、かつ
         `MOZYO_AGENT_ROLE` / `MOZYO_WORKSPACE_ID`を持たないconsumer外processだけをadmitする。
         expected launchd labelを副作用前にprivate actionへ固定し、run時に同labelのlive jobを
