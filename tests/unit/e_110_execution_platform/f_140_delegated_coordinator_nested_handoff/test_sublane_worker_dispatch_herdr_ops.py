@@ -184,16 +184,37 @@ class WorkerReadinessProbeTests(unittest.TestCase):
 
 
 class WorkerAdmissionObservationTests(unittest.TestCase):
-    def _observe(self, rows, attestation, *, lifecycle_overrides=None):
+    def _observe(
+        self,
+        rows,
+        attestation,
+        *,
+        lifecycle_overrides=None,
+        gateway_attestation=None,
+        delivery_records=(),
+        redmine_entries=None,
+        redmine_error=False,
+    ):
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
             encode_assigned_name,
         )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E501
+            LiveRedmineJournalError,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            RedmineJournalEntry,
+            render_dispatch_note,
+        )
 
         lane = SimpleNamespace(
-            workspace_id="ws", lane_id=LANE_LABEL, worker_pane="w28:p75"
+            workspace_id="ws",
+            lane_id=LANE_LABEL,
+            gateway_pane="w28:p74",
+            worker_pane="w28:p75",
         )
         request = WorkerDispatchRequest(ISSUE, LANE_LABEL, "/repo", "81683")
         worker_name = encode_assigned_name("ws", "claude", LANE_LABEL)
+        gateway_name = encode_assigned_name("ws", "codex", LANE_LABEL)
         lifecycle_values = dict(
             issue_id=ISSUE,
             lane_disposition="active",
@@ -217,6 +238,32 @@ class WorkerAdmissionObservationTests(unittest.TestCase):
         )
         lifecycle_values.update(lifecycle_overrides or {})
         lifecycle = SimpleNamespace(**lifecycle_values)
+        if redmine_entries is None:
+            redmine_entries = [
+                RedmineJournalEntry(
+                    issue_id=ISSUE,
+                    journal_id=request.journal,
+                    notes=render_dispatch_note(
+                        "implementation request",
+                        lane=LANE_LABEL,
+                        lane_generation=lifecycle.lane_generation,
+                    ),
+                )
+            ]
+        redmine_source = SimpleNamespace(
+            read_entries=lambda issue: list(redmine_entries) if issue == ISSUE else []
+        )
+
+        def read_attestation(assigned_name):
+            if assigned_name == gateway_name:
+                return gateway_attestation
+            return attestation
+
+        source_patch = (
+            {"side_effect": LiveRedmineJournalError("unreadable")}
+            if redmine_error
+            else {"return_value": redmine_source}
+        )
         ops = HerdrWorkerDispatchOps(Path("/repo"), LANE_LABEL, ISSUE)
         with patch.object(ops, "worker_provider", return_value="claude"), patch(
             "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection.list_herdr_agent_rows",
@@ -229,10 +276,16 @@ class WorkerAdmissionObservationTests(unittest.TestCase):
             return_value=lifecycle,
         ), patch(
             "mozyo_bridge.core.state.herdr_identity_attestation.HerdrIdentityAttestationStore.read",
-            return_value=attestation,
+            side_effect=read_attestation,
         ), patch(
             "mozyo_bridge.core.state.herdr_delivery_ledger.HerdrDeliveryLedger.records_for_issue",
-            return_value=[],
+            return_value=list(delivery_records),
+        ), patch(
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution.resolve_gateway_provider",
+            return_value="codex",
+        ), patch(
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source.LiveRedmineJournalSource.from_environment",
+            **source_patch,
         ):
             return ops.observe_worker_dispatch_admission(lane=lane, request=request)
 
@@ -250,6 +303,138 @@ class WorkerAdmissionObservationTests(unittest.TestCase):
             verdict="present",
             replacement_action_id="",
         )
+
+    def _gateway_attestation(self):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        return SimpleNamespace(
+            assigned_name=encode_assigned_name("ws", "codex", LANE_LABEL),
+            workspace_id="ws",
+            role="codex",
+            lane_id=LANE_LABEL,
+            locator="w28:p74",
+            verdict="present",
+            replacement_action_id="",
+        )
+
+    def _gateway_receipt(self, *, locator="w28:p74", generation_locator="w28:p74"):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        gateway_name = encode_assigned_name("ws", "codex", LANE_LABEL)
+        return SimpleNamespace(
+            issue_id=ISSUE,
+            journal_id="81683",
+            receiver="codex",
+            provider=None,
+            target=locator,
+            status="sent",
+            reason="ok",
+            queue_enter_observation={
+                "read_ok": True,
+                "runtime_state": "busy",
+                "gateway_binding": {
+                    "assigned_name": gateway_name,
+                    "locator": generation_locator,
+                    "provider": "codex",
+                    "startup_action_id": "startup-current",
+                    "row_revision": "1",
+                },
+            },
+        )
+
+    def _current_pair_rows(self):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        return [
+            {
+                "name": encode_assigned_name("ws", "codex", LANE_LABEL),
+                "pane_id": "w28:p74",
+                "provider": "codex",
+                "agent": "codex",
+                "agent_status": "working",
+            },
+            {
+                "name": encode_assigned_name("ws", "claude", LANE_LABEL),
+                "pane_id": "w28:p75",
+                "provider": "claude",
+                "agent": "claude",
+                "agent_status": "idle",
+            },
+        ]
+
+    def test_resumed_lane_uses_exact_current_gateway_receipt_as_work_anchor(self):
+        # #14981 installed E2E j#99261: hibernate/resume correctly leaves the lifecycle
+        # pointer on the RESUME decision, while a fresh coordinator dispatch delivers a
+        # different implementation_request to the current gateway.  The old equality check
+        # rejected that valid work before the worker send.  The named Redmine entry + current
+        # gateway-bound delivery receipt + startup attestation are the independent join that
+        # admits it without laundering the lifecycle pointer into a work pointer.
+        result = self._observe(
+            self._current_pair_rows(),
+            self._attestation(),
+            lifecycle_overrides={"decision_journal": "resume-journal"},
+            gateway_attestation=self._gateway_attestation(),
+            delivery_records=[self._gateway_receipt()],
+        )
+        self.assertEqual(result.decision, ADMISSION_HEALTHY)
+        self.assertTrue(result.facts.anchor_current)
+
+    def test_resumed_lane_work_anchor_fails_closed_without_all_three_authorities(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            RedmineJournalEntry,
+            render_dispatch_note,
+        )
+
+        wrong_generation = RedmineJournalEntry(
+            issue_id=ISSUE,
+            journal_id="81683",
+            notes=render_dispatch_note(
+                "implementation request", lane=LANE_LABEL, lane_generation=6
+            ),
+        )
+        cases = (
+            {"delivery_records": []},
+            {
+                "delivery_records": [
+                    self._gateway_receipt(
+                        locator="w28:p-old", generation_locator="w28:p-old"
+                    )
+                ]
+            },
+            {
+                "delivery_records": [self._gateway_receipt()],
+                "gateway_attestation": None,
+            },
+            {
+                "delivery_records": [self._gateway_receipt()],
+                "redmine_entries": [wrong_generation],
+            },
+            {
+                "delivery_records": [self._gateway_receipt()],
+                "redmine_error": True,
+            },
+        )
+        for changes in cases:
+            with self.subTest(changes=changes):
+                params = {
+                    "lifecycle_overrides": {"decision_journal": "resume-journal"},
+                    "gateway_attestation": self._gateway_attestation(),
+                    "delivery_records": [self._gateway_receipt()],
+                }
+                params.update(changes)
+                result = self._observe(
+                    self._current_pair_rows(), self._attestation(), **params
+                )
+                self.assertEqual(
+                    result.decision, ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT
+                )
+                self.assertFalse(result.facts.anchor_current)
 
     def test_current_live_attested_idle_receiver_is_healthy(self):
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (

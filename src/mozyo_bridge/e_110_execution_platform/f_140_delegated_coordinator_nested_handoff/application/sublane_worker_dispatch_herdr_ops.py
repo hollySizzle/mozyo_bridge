@@ -19,6 +19,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_ops import (  # noqa: E501
     HerdrSublaneActuatorOps,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_dispatch_work_anchor import (  # noqa: E501
+    received_work_anchor_is_current,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
     SublaneLaneView,
 )
@@ -202,9 +205,20 @@ class HerdrWorkerDispatchOps:
             and lifecycle.lane_disposition == "active"
             and lifecycle.lane_generation > 0
         )
+        delivery_records = HerdrDeliveryLedger().records_for_issue(request.issue)
         anchor_current = bool(
             lifecycle and lifecycle.decision_journal == (request.journal or "").strip()
         )
+        if lifecycle_current and not anchor_current:
+            anchor_current = received_work_anchor_is_current(
+                repo_root=self.repo_root,
+                env=self.env,
+                lane=lane,
+                request=request,
+                lifecycle=lifecycle,
+                rows=rows,
+                delivery_records=delivery_records,
+            )
         attestation = HerdrIdentityAttestationStore().read(assigned_name)
         joined = evaluate_attestation(
             attestation,
@@ -345,7 +359,7 @@ class HerdrWorkerDispatchOps:
             record.journal_id == (request.journal or "").strip()
             and (record.receiver == provider or record.provider == provider)
             and record.target in {assigned_name, locator}
-            for record in HerdrDeliveryLedger().records_for_issue(request.issue)
+            for record in delivery_records
         )
         terminal_absence = bool(
             (len(matches) == 0 and lifecycle_current and declared_identity_current)
