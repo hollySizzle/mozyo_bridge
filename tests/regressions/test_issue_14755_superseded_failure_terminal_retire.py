@@ -754,7 +754,21 @@ class ForeignEvidenceNeverUnlocksThisFence(unittest.TestCase):
             committed_integration_branch,
         )
 
-        self.assertEqual(committed_integration_branch(ROOT), INTEGRATION_BRANCH)
+        # WHICH branch a repository declares is operational and moves (#14761 renamed this
+        # repository's canonical integration branch), so pinning the literal would only pin the
+        # day's config. What the route needs is that the reader returns whatever the COMMITTED
+        # config declares — asserted against a value no fallback or guess would produce — and
+        # that this repository's own config is readable through that same path.
+        with tempfile.TemporaryDirectory() as tmp:
+            declared = "branch-declared-only-by-the-committed-config"
+            config = Path(tmp) / ".mozyo-bridge"
+            config.mkdir(parents=True)
+            (config / "config.yaml").write_text(
+                f"version: 2\nsublane_integration:\n  integration_branch: {declared}\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(committed_integration_branch(Path(tmp)), declared)
+        self.assertNotEqual(committed_integration_branch(ROOT), "")
         # An unreadable / absent config yields no expectation rather than a guess.
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(committed_integration_branch(Path(tmp)), "")
