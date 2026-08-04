@@ -15,7 +15,15 @@ kinds of durable evidence measured at action time, plus the operator's fallback 
   nothing today**: the record system cannot establish who WROTE a waiver, so the route always
   refuses with a typed reason (see ``no_change_review_waiver.WRITER_AUTHORITY_RESOLVABLE``). Its
   checks are implemented and tested so that a future writer-authority ruling wires in an authority
-  rather than a re-implementation.
+  rather than a re-implementation;
+- :func:`...retire_superseded_failure.resolve_superseded_failure_admissible` — the SUPERSEDED
+  FAILURE terminal (#14755), in its own module because adding the #14971 authority wiring pushed
+  this one past the oversized-module gate. Re-exported here under its original private name: a
+  lane whose latest review generation concluded ``changes_requested``, whose findings were all
+  accepted, and whose acceptance target was obtained by a successor issue that acknowledges the
+  supersession. Its round can never be approved, so the generation fence can only ever refuse it
+  — and the two escapes from that (a false ``--latest-generation-admissible`` assert, or reading
+  the successor's approval as this lane's) are exactly what the reproduction #14577 refused.
 
 The routes are independent and each can only ever admit; none can weaken another. A lane that
 fails all of them is blocked exactly as it was before any of them existed.
@@ -36,6 +44,13 @@ import argparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.retire_superseded_failure import (  # noqa: E501  (re-export)
+    REASON_SUPERSEDED_ROUTE_UNREADABLE,
+    REASON_SUPERSEDED_TARGET_UNRESOLVED,
+    committed_integration_branch,
+    resolve_superseded_failure_admissible as _resolve_superseded_failure_admissible,
+)
 
 
 @dataclass(frozen=True)
@@ -627,6 +642,32 @@ def _resolve_no_change_waiver_admissible(
         return GenerationAdmissibility(False, REASON_WAIVER_ROUTE_UNREADABLE)
 
 
+def _read_live_issue_journals(issue: str) -> "list[tuple[str, str]]":
+    """One issue's full durable history, read LIVE over the credential-gated Redmine read (IO).
+
+    #14695 needs it because its premise is NEGATIVE (nothing anywhere in the record declares
+    change) and a subset satisfies a negative claim by omission alone. #14755 needs the same live
+    history in its ENTRY form — see :func:`...retire_superseded_failure._read_live_issue_entries`
+    for why that route cannot use these pairs.
+
+    Returns ``[]`` on any failure (unconfigured credentials, an unreadable Redmine, a provider
+    error). An empty history is never "a record that says nothing is owed": each caller treats it
+    as unreadable evidence, not as evidence of absence.
+    """
+    try:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E501
+            LiveRedmineJournalSource,
+        )
+
+        entries = LiveRedmineJournalSource.from_environment().read_entries(str(issue))
+    except Exception:  # noqa: BLE001 - unreadable live state -> no evidence, never a crash
+        return []
+    return [
+        (str(getattr(e, "journal_id", "")), str(getattr(e, "notes", "") or ""))
+        for e in entries or ()
+    ]
+
+
 def _resolve_latest_generation_admissible(
     args: argparse.Namespace,
     *,
@@ -657,16 +698,31 @@ def _resolve_latest_generation_admissible(
     # than a path because its evidence is read live from the durable authority (see that
     # function's docstring for why a caller-supplied file cannot carry a negative claim).
     waiver = bool(getattr(args, "no_change_review_waiver", False))
-    if path or exemption_path or waiver:
+    # Redmine #14755: the superseded-failure terminal is a FOURTH, live for the same reason.
+    superseded = bool(getattr(args, "superseded_failure_terminal", False))
+    if path or exemption_path or waiver or superseded:
         if _resolve_review_generation_admissible(args):
             return GenerationAdmissibility(True, "")
         if _resolve_review_exemption_admissible(args, target=target):
             return GenerationAdmissibility(True, "")
-        # The waiver route is the only one that carries a typed reason today; the other two are
-        # historical booleans and keep the generic token when they refuse.
-        return _resolve_no_change_waiver_admissible(
-            args, target=target, repo_root=repo_root
-        )
+        # The two reason-carrying routes, in a fixed order. Each returns a BLANK reason when its
+        # own opt-in is absent, so a caller that opted into one never receives the other's
+        # diagnosis, and the FIRST non-blank reason is kept: a route that went to the trouble of
+        # producing a typed refusal must reach the operator rather than being overwritten by a
+        # route that was never asked (#14695 review j#93807 finding 2 established why the reason
+        # matters at all — collapsing a structural refusal into ``stale_review_generation`` sent
+        # an operator hunting for a review generation that cannot exist).
+        answer = GenerationAdmissibility(False, "")
+        for route in (
+            _resolve_no_change_waiver_admissible,
+            _resolve_superseded_failure_admissible,
+        ):
+            result = route(args, target=target, repo_root=repo_root)
+            if result.admissible:
+                return result
+            if not answer.reason and result.reason:
+                answer = result
+        return answer
     return GenerationAdmissibility(
         bool(getattr(args, "latest_generation_admissible", False)), ""
     )
@@ -729,14 +785,18 @@ REASON_WAIVER_ISSUER_UNRESOLVED = "waiver_issuer_unresolved"
 __all__ = (
     "GenerationAdmissibility",
     "LaneChangeMeasurement",
+    "REASON_SUPERSEDED_ROUTE_UNREADABLE",
+    "REASON_SUPERSEDED_TARGET_UNRESOLVED",
     "REASON_WAIVER_ISSUER_UNRESOLVED",
     "REASON_WAIVER_ROUTE_UNREADABLE",
     "REASON_WAIVER_TARGET_UNRESOLVED",
     "RetireEvidenceTarget",
+    "committed_integration_branch",
     "measure_lane_change",
     "resolve_retire_evidence_target",
     "_resolve_latest_generation_admissible",
     "_resolve_no_change_waiver_admissible",
     "_resolve_review_exemption_admissible",
     "_resolve_review_generation_admissible",
+    "_resolve_superseded_failure_admissible",
 )

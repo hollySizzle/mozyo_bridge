@@ -697,6 +697,85 @@ def canonical_marker_bodies(
     return tuple(found)
 
 
+# ---------------------------------------------------------------------------
+# The governed ``## Gate:`` heading, read over the SAME canonical lines.
+#
+# Lives here for the reason the marker scan does: two readers of one grammar with two notions of
+# "quoted" is a drift generator. Three authority modules ask "which gates does this note declare",
+# and the answer has to be the same in all of them — including for the gates whose template is a
+# heading with no marker producer at all (``review_finding_verdict``, and the #14971 legacy
+# ruling), where the heading is the only surface a governed author writes.
+# ---------------------------------------------------------------------------
+
+#: A governed ``## Gate: <token>`` heading line, read for its RAW token.
+_GATE_HEADING_LINE_RE = re.compile(
+    r"^\s{0,3}#{2,}\s*Gate\s*[:：]\s*(?P<body>.+?)\s*$", re.MULTILINE | re.IGNORECASE
+)
+#: Separators a combined governed heading uses between gate names.
+_HEADING_PART_SPLIT_RE = re.compile(r"[+/,、]")
+#: A trailing parenthetical qualifier governed authors append to a heading part.
+_TRAILING_PAREN_RE = re.compile(r"\s*[（(][^）)]*[）)]\s*$")
+#: The bounded dash qualifier the canonical Gate heading grammar allows AFTER the gate token
+#: (``## Gate: review_finding_verdict — R3``). A sanctioned canonical spelling, not a deviation:
+#: the central preset's ``### Gate Heading Canonical Literal`` invites it. Review #14695 j#94110
+#: finding 2 measured what happens when a reader strips only the parenthetical form — the dash
+#: form silently stopped matching, and a fence opened for a spelling the 正本 recommends.
+_BOUNDED_QUALIFIER_RE = re.compile(r"\s+[—–]\s+")
+
+
+def _normalize_gate_token(value: object) -> str:
+    """One gate name in comparable form: lowercased, spaces / hyphens folded to ``_`` (pure)."""
+    text = " ".join(str(value or "").strip().lower().split())
+    return re.sub(r"[\s-]+", "_", text)
+
+
+def _heading_parts(notes: str) -> "tuple[tuple[str, str], ...]":
+    """``(whole_part, qualifier_head)`` for every CANONICAL ``## Gate:`` heading part (pure).
+
+    Quote-aware: a heading that exists only inside a fenced block, a blockquote or an inline code
+    span is not a declaration, because a note transcribing a past record or quoting the contract
+    would otherwise qualify itself. Combined headings are split on the separators a governed author
+    uses, so ``## Gate: a + b`` is two parts.
+    """
+    parts: list[tuple[str, str]] = []
+    for line in canonical_note_lines(notes or ""):
+        match = _GATE_HEADING_LINE_RE.match(line or "")
+        if match is None:
+            continue
+        for raw_part in _HEADING_PART_SPLIT_RE.split(match.group("body")):
+            part = _TRAILING_PAREN_RE.sub("", raw_part)
+            head = _BOUNDED_QUALIFIER_RE.split(part, maxsplit=1)[0]
+            if head != part:
+                head = _TRAILING_PAREN_RE.sub("", head)
+            parts.append((_normalize_gate_token(part), _normalize_gate_token(head)))
+    return tuple(parts)
+
+
+def heading_gate_declarations(notes: str) -> "tuple[str, ...]":
+    """The ONE canonical gate token each heading part declares, in note order (pure).
+
+    The bounded dash qualifier the canonical grammar allows after a gate token
+    (``## Gate: review_finding_verdict — R3``) is a SPELLING of that gate, not a second one, so it
+    is stripped here rather than emitted alongside. Use this when the question is "which gates does
+    this note declare" — counting them, or requiring it declare exactly one.
+    :func:`heading_gate_tokens` answers the different question "would this note match a check for
+    gate X", and its extra spellings would make any set comparison wrong.
+    """
+    return tuple(head for _part, head in _heading_parts(notes) if head)
+
+
+def heading_gate_tokens(notes: str) -> frozenset[str]:
+    """Every gate token a note's CANONICAL ``## Gate:`` headings could be MATCHED by (pure).
+
+    BOTH the whole part and its bounded-qualifier head, so a qualified spelling qualifies exactly
+    like a bare one. This is a membership superset, not an enumeration — see
+    :func:`heading_gate_declarations` for the latter.
+    """
+    return frozenset(
+        token for part in _heading_parts(notes) for token in part if token
+    )
+
+
 __all__ = (
     "MARKER_CHANNEL_HANDOFF",
     "MARKER_CHANNEL_WORKFLOW_EVENT",
@@ -707,4 +786,6 @@ __all__ = (
     "parse_marker_fields",
     "canonical_marker_bodies",
     "canonical_marker_fields",
+    "heading_gate_declarations",
+    "heading_gate_tokens",
 )

@@ -187,6 +187,50 @@ def register_sublane_retire(
         ),
     )
     sublane_retire.add_argument(
+        "--superseded-failure-terminal",
+        dest="superseded_failure_terminal",
+        action="store_true",
+        help=(
+            "#14755: re-verify at action-time that this lane's latest review round FAILED and has "
+            "been durably terminalized as superseded, so it can converge to retired WITHOUT being "
+            "read as an approval. For a round that concluded `changes_requested` the ordinary "
+            "generation fence can only ever refuse, and the two escapes from that — asserting "
+            "--latest-generation-admissible about a failed round, or borrowing the successor "
+            "issue's approval for this lane — are both false (reproduction: #14577 j#93648 "
+            "changes_requested, terminal j#93757, blocked retires j#93759 / j#94006 / j#94319). "
+            "Nothing in this route ever reads `changes_requested` as approved: it REQUIRES the "
+            "failure. Deliberately a bare opt-in and NOT a JSON path, because its premise is a "
+            "CORRELATION across two issues and every part of it is falsifiable by dropping a "
+            "journal, so both issues' full histories are read LIVE over the credential-gated "
+            "Redmine read. Admits only when ALL of: one canonical `superseded_failure` marker "
+            "whose issue, whose workspace/lane/lane_generation envelope (exact-matched against "
+            "the retire TARGET's own lifecycle row, measured from durable state, never from a "
+            "flag) and whose integration_branch is the repository's COMMITTED "
+            "`sublane_integration.integration_branch` — which --integration-branch must also name, "
+            "because the live measurement is taken against it and a caller free to choose it "
+            "could point it at the lane's own branch and make the 0-commit conjunct vacuous; a "
+            "config declaring none supplies no expectation and refuses; no review round stands "
+            "at-or-after that declaration; the latest gate is Close; --callbacks-drained; the "
+            "record's NEWEST review round is the one the declaration names AND it concluded "
+            "`changes_requested`; the governed `review_finding_verdict` gate the declaration "
+            "names is the latest one, targets that round, and records `accepted` for every "
+            "finding; the named successor is a DIFFERENT issue whose own record carries a "
+            "`superseded_failure_successor` acknowledgement naming this issue and this round, and "
+            "whose newest round is the approval it names and which is itself closed; and the live "
+            "repository still agrees ABOUT THIS LANE — --branch is the declaration's own lane (any "
+            "checkout sitting on the head would otherwise do, which matters precisely when the "
+            "lane head is already the integration head), its head literal-equals the "
+            "declaration's head, the --worktree checkout is clean, and it carries 0 commits over "
+            "--integration-branch. That last conjunct is what BOUNDS this route: a lane still "
+            "holding unintegrated work never reaches the terminal, so admitting drains a process "
+            "without integrating anything or minting any approval. It does NOT establish who "
+            "wrote the declaration — no record in this workspace can (ruling #14219 j#86718) — "
+            "and it makes no issuer claim rather than manufacturing a ruling anchor that decided "
+            "no writer contract. Fail-closed on every gap, including unconfigured credentials and "
+            "an unmeasurable repository."
+        ),
+    )
+    sublane_retire.add_argument(
         "--review-generation-json",
         dest="review_generation_json",
         default=None,
