@@ -15,6 +15,10 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import urllib.parse
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +34,58 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 
 _FAKE_HERDR_CLI = _REPO_ROOT / "smoke" / "support" / "fake_herdr_cli.py"
+_FAKE_REDMINE_API_KEY = "installed-fault-smoke-fixture-key"
+
+
+@contextmanager
+def _fresh_redmine_approval(*, issue: str, journal: str, marker: str):
+    """Serve one secret-free approval journal over the real live-reader boundary.
+
+    The destructive recovery CLI intentionally has no snapshot or command-line approval
+    shortcut: it must construct ``LiveRedmineJournalSource`` and perform a fresh action-time
+    read.  A loopback-only HTTP fixture therefore exercises that installed boundary without
+    consulting an operator credential or an external Redmine service.
+    """
+
+    payload = json.dumps({
+        "issue": {
+            "id": issue,
+            "journals": [{"id": journal, "notes": marker}],
+        }
+    }).encode("utf-8")
+    expected_path = f"/issues/{urllib.parse.quote(issue, safe='')}.json"
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - stdlib handler protocol
+            parsed = urllib.parse.urlsplit(self.path)
+            query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+            if self.headers.get("X-Redmine-API-Key") != _FAKE_REDMINE_API_KEY:
+                self.send_error(403)
+                return
+            if parsed.path != expected_path or query != {"include": ["journals"]}:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, _format, *_args):
+            return  # no request/header text enters CI output
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield {
+            "MOZYO_REDMINE_URL": f"http://127.0.0.1:{server.server_port}",
+            "MOZYO_REDMINE_API_KEY": _FAKE_REDMINE_API_KEY,
+        }
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def _base_env(home: Path, *, herdr_state: Path | None = None) -> dict:
@@ -238,6 +294,7 @@ def _record_recover_diag(
         record["injected_uncertain"] = injected_uncertain
     if isinstance(outcome, dict):
         record["setup_error"] = outcome.get("setup_error")
+        record["approval_preflight_exit"] = outcome.get("approval_preflight_exit")
         record["pass1_exit"] = outcome.get("pass1_exit")
         record["pass2_exit"] = outcome.get("pass2_exit")
         axes = outcome.get("launch_authority_axes")
@@ -388,8 +445,37 @@ def _recover_stale_outcome(
         "--execute", "--json", "--repo", str(repo),
     ]
 
+    # Ask the INSTALLED producer for the byte-exact approval marker.  This is a read-only
+    # preflight: it neither needs an approval nor mutates the worker.  Rebuilding the digest in
+    # this checkout-side driver would let a source/wheel drift masquerade as a valid fixture.
+    preflight_argv = list(argv)
+    preflight_argv.remove("--execute")
+    preflight = _run(cli, preflight_argv, env(), cwd=str(repo))
+    try:
+        preflight_payload = json.loads(preflight.stdout)
+    except ValueError:
+        return {
+            "setup_error": "approval_preflight_json",
+            "approval_preflight_exit": preflight.returncode,
+        }
+    approval_marker = str(preflight_payload.get("required_approval_marker", "") or "")
+    if (
+        preflight.returncode != 0
+        or preflight_payload.get("status") != "preflight"
+        or not approval_marker
+    ):
+        return {
+            "setup_error": "approval_preflight_unavailable",
+            "approval_preflight_exit": preflight.returncode,
+        }
+
     # Pass 1: close the exact stale worker once, own the launch (attestation still owed).
-    first = _run(cli, argv, env(), cwd=str(repo))
+    with _fresh_redmine_approval(
+        issue="14097", journal="79485", marker=approval_marker
+    ) as approval_env:
+        first_env = env()
+        first_env.update(approval_env)
+        first = _run(cli, argv, first_env, cwd=str(repo))
     try:
         p1 = json.loads(first.stdout)
     except ValueError:
@@ -433,7 +519,12 @@ def _recover_stale_outcome(
     state.write_text(json.dumps(fake2.to_state()), encoding="utf-8")
 
     # Pass 2: the post-close resume driven to its terminal.
-    second = _run(cli, argv, env(), cwd=str(repo))
+    with _fresh_redmine_approval(
+        issue="14097", journal="79485", marker=approval_marker
+    ) as approval_env:
+        second_env = env()
+        second_env.update(approval_env)
+        second = _run(cli, argv, second_env, cwd=str(repo))
     try:
         p2 = json.loads(second.stdout)
     except ValueError:

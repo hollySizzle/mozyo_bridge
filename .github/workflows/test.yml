@@ -244,8 +244,9 @@ jobs:
         # `mozyo-bridge` subprocesses, proving installed provenance (venv, never the checkout or a
         # pipx global). The hermetic source-public-dispatch truth tables run in the unit `discover`
         # gate above; this is the artifact-provenance half the review required. Fake herdr backend
-        # over `MOZYO_HERDR_BINARY` only; no operator home / real Herdr / tmux / SQLite / network
-        # service. A build/runtime-dependency shortfall fails the gate (never a silent skip).
+        # over `MOZYO_HERDR_BINARY`; destructive approval crosses a secret-free loopback fake
+        # Redmine, never an operator credential or external service. No operator home / real Herdr /
+        # tmux / SQLite / managed lane. A dependency shortfall fails (never a silent skip).
         run: |
           set -euo pipefail
           WHEEL="$(ls dist/*.whl | head -n1)"

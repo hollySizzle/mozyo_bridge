@@ -377,6 +377,28 @@ class Post14741InstalledFixtureTests(unittest.TestCase):
         self.assertTrue(verdict.admits_actuation)
         self.assertEqual(verdict.authority, "aligned")
 
+    def test_recovery_fixture_crosses_the_fresh_live_redmine_boundary(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E501
+            LiveRedmineJournalSource,
+        )
+
+        marker = "[mozyo:workflow-event:gate=fixture_owner_approval]"
+        with tempfile.TemporaryDirectory() as directory:
+            with self._driver()._fresh_redmine_approval(
+                issue="14097", journal="79485", marker=marker
+            ) as env:
+                source = LiveRedmineJournalSource.from_environment(
+                    environ=env, home=Path(directory)
+                )
+                first = source.read_entries("14097")
+                second = source.read_entries("14097")
+
+        self.assertTrue(source.fresh_read)
+        self.assertEqual([(e.issue_id, e.journal_id, e.notes) for e in first], [
+            ("14097", "79485", marker)
+        ])
+        self.assertEqual(first, second)
+
     def test_recover_failure_diagnostics_are_content_free(self):
         diagnostics = {}
         self._driver()._record_recover_diag(

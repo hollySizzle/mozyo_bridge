@@ -18,8 +18,10 @@ existing ``Build wheel and sdist`` / ``Fresh-install smoke`` steps, reusing the 
 
 Isolation: every driven command runs under an isolated ``MOZYO_BRIDGE_HOME`` + a scratch
 herdr-backend repo + a secret-free temp state file served by ``smoke/support/fake_herdr_cli.py``
-(the canonical fake over the ``MOZYO_HERDR_BINARY`` boundary). No operator home, real Herdr,
-tmux, SQLite, credential, network service, or managed lane is ever touched.
+(the canonical fake over the ``MOZYO_HERDR_BINARY`` boundary). Destructive-recovery approval is
+fresh-read from a secret-free, loopback-only fake Redmine using the marker emitted by the installed
+CLI's own preflight. No operator home, real Herdr, tmux, SQLite, real credential, external network
+service, or managed lane is ever touched.
 """
 
 from __future__ import annotations
