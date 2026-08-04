@@ -66,6 +66,12 @@ if [ "$version" = "latest" ]; then
   exit 64
 fi
 
+if ! command -v curl >/dev/null 2>&1; then
+  echo "error: curl not found in PATH; it is required to verify TestPyPI" >&2
+  echo "       Simple Index propagation before changing the pipx environment." >&2
+  exit 1
+fi
+
 case "$version" in
   *.dev*) : ;;  # looks like a dev release; proceed
   *)
@@ -73,6 +79,46 @@ case "$version" in
     echo "         TestPyPI dev artifacts. Continuing with the exact pin." >&2
     ;;
 esac
+
+# TestPyPI's project JSON can expose a newly uploaded release before the
+# Simple Index used by pip has propagated through Warehouse/CDN caches. A
+# direct pipx attempt during that window reports "No matching distribution"
+# even with pip's local cache disabled. Poll the actual resolver surface before
+# asking pipx to mutate the existing environment. The bound covers the
+# Simple response's normal 10-minute max-age; a timeout is temporary failure
+# and leaves the previous pipx environment untouched.
+simple_url="https://test.pypi.org/simple/mozyo-bridge/"
+simple_max_attempts=41
+simple_attempt=1
+simple_interval_seconds=15
+
+echo "Waiting for TestPyPI Simple Index: $version"
+while :; do
+  if curl \
+    --fail \
+    --silent \
+    --show-error \
+    --location \
+    --header "Cache-Control: no-cache" \
+    --header "Accept: application/vnd.pypi.simple.v1+json" \
+    "${simple_url}?propagation_attempt=${simple_attempt}" \
+    | grep -F -q -- "$version"; then
+    echo "OK: TestPyPI Simple Index lists $version"
+    break
+  fi
+
+  if [ "$simple_attempt" -ge "$simple_max_attempts" ]; then
+    echo "error: TestPyPI JSON/publication may exist, but the Simple Index" >&2
+    echo "       still does not list '$version' after 10 minutes." >&2
+    echo "       The existing pipx environment was not changed; retry later" >&2
+    echo "       only after the Simple Index lists the exact version." >&2
+    exit 75
+  fi
+
+  echo "PENDING: Simple Index propagation (${simple_attempt}/${simple_max_attempts}); retrying in ${simple_interval_seconds}s"
+  sleep "$simple_interval_seconds"
+  simple_attempt=$((simple_attempt + 1))
+done
 
 spec="mozyo-bridge==$version"
 echo "Installing TestPyPI dev artifact: $spec"
