@@ -156,8 +156,13 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
         self.assertIsInstance(control, KeyboardInterrupt)
         self.assertEqual("first", str(control))
         self.assertEqual(["first", "second", "third"], ran)
-        notes = "\n".join(getattr(primary, "__notes__", []))
-        self.assertIn("SystemExit", notes, "the second control-flow failure was dropped")
+        self.assertTrue(
+            any(
+                isinstance(entry, SystemExit)
+                for entry in owned_descriptors.teardown_failures(primary)
+            ),
+            "the second control-flow failure was dropped",
+        )
 
     def test_a_secondary_that_cannot_be_stringified_is_still_retained(self) -> None:
         """j#90503 R15-F2. `_attach_secondary` swallows an ordinary exception as
@@ -199,11 +204,13 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
         self.assertIn(UnprintableFailure, kinds, "the unprintable ordinary failure was dropped")
         self.assertIn(UnprintableExit, kinds, "the unprintable control-flow failure was dropped")
 
-        # The note is presentation, and it degrades to the type name rather
-        # than disappearing — a reader still learns what arrived.
-        notes = "\n".join(getattr(primary, "__notes__", []))
-        self.assertIn("UnprintableFailure", notes)
-        self.assertIn("UnprintableExit", notes)
+        # Python 3.11+ also exposes the best-effort human presentation through
+        # exception notes.  On 3.10 the public ledger above is the authority;
+        # BaseException.add_note does not exist there.
+        if hasattr(primary, "add_note"):
+            notes = "\n".join(getattr(primary, "__notes__", []))
+            self.assertIn("UnprintableFailure", notes)
+            self.assertIn("UnprintableExit", notes)
 
     def test_an_interrupt_while_recording_a_later_failure_is_retained(self) -> None:
         """The innermost case: a later control-flow failure arrives, and the
@@ -325,13 +332,15 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
         primary = RuntimeError("write failed")
         owned_descriptors.teardown_during(primary, failing)
         self.assertNotEqual((), owned_descriptors.teardown_failures(primary))
+        string_keys = {
+            key
+            for key in object.__getattribute__(primary, "__dict__")
+            if isinstance(key, str)
+        }
+        expected_presentation_keys = {"__notes__"} if hasattr(primary, "add_note") else set()
         self.assertEqual(
-            ["__notes__"],
-            [
-                key
-                for key in object.__getattribute__(primary, "__dict__")
-                if isinstance(key, str)
-            ],
+            expected_presentation_keys,
+            string_keys,
             "the carrier took a name in the caller's namespace",
         )
 
@@ -428,8 +437,9 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
     def test_each_occurrence_is_one_ledger_entry(self) -> None:
         """j#90517 R17-F2. The ledger de-duplicated by object identity, so two
         independent actions returning the same singleton `False` — the whole
-        returned-failure channel — collapsed into one entry while the notes
-        correctly showed two. Occurrences are what the ledger counts."""
+        returned-failure channel — collapsed into one entry while the
+        best-effort notes correctly showed two on runtimes that support them.
+        Occurrences in the machine-readable ledger are the authority."""
 
         def returns_false() -> bool:
             return False
@@ -449,11 +459,12 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
                     len(owned_descriptors.teardown_failures(primary)),
                     f"{label}: two occurrences collapsed into one ledger entry",
                 )
-                self.assertEqual(
-                    2,
-                    len(getattr(primary, "__notes__", [])),
-                    f"{label}: the notes and the ledger disagree",
-                )
+                if hasattr(primary, "add_note"):
+                    self.assertEqual(
+                        2,
+                        len(getattr(primary, "__notes__", [])),
+                        f"{label}: the notes and the ledger disagree",
+                    )
 
     def test_a_carrier_failure_never_skips_a_remaining_action(self) -> None:
         """j#90508 R16-F1, second condition: acquiring or writing the record is

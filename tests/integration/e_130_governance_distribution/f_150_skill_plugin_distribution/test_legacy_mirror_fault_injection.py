@@ -486,9 +486,12 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
             with self.assertRaises(PrimaryFailure) as caught:
                 self._service(repo).sync()
 
-        notes = getattr(caught.exception, "__notes__", [])
         self.assertTrue(
-            any("secondary failure during teardown" in note for note in notes),
+            any(
+                isinstance(entry, RuntimeError)
+                and str(entry) == "injected close unwind"
+                for entry in owned_descriptors.teardown_failures(caught.exception)
+            ),
             "the close failure was dropped instead of being recorded",
         )
         self.assertEqual([], self._staging_names(repo))
@@ -571,9 +574,12 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
             with self.assertRaises(PrimaryFailure) as caught:
                 service.sync()
 
-        notes = getattr(caught.exception, "__notes__", [])
         self.assertTrue(
-            any("secondary failure during teardown" in note for note in notes),
+            any(
+                isinstance(entry, RuntimeError)
+                and str(entry) == "injected cleanup failure"
+                for entry in owned_descriptors.teardown_failures(caught.exception)
+            ),
             "the cleanup failure was dropped instead of being recorded",
         )
 
@@ -615,9 +621,11 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
         self.assertTrue(
             schedule.close_fired, "the staging close never ran after the release raised"
         )
-        notes = getattr(caught.exception, "__notes__", [])
         self.assertTrue(
-            any("SecondaryClose" in note for note in notes),
+            any(
+                isinstance(entry, SecondaryClose)
+                for entry in owned_descriptors.teardown_failures(caught.exception)
+            ),
             "the close failure was dropped",
         )
 
@@ -719,9 +727,11 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
                 with self.assertRaises(PreviousClose) as caught:
                     self._service(repo).audit()
 
-        notes = getattr(caught.exception, "__notes__", [])
         self.assertTrue(
-            any("CurrentClose" in note for note in notes),
+            any(
+                isinstance(entry, CurrentClose)
+                for entry in owned_descriptors.teardown_failures(caught.exception)
+            ),
             "the second close failure was dropped",
         )
 
@@ -745,8 +755,15 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
             with self.assertRaises(PrimaryWrite) as caught:
                 self._service(repo).sync()
 
-        notes = "\n".join(getattr(caught.exception, "__notes__", []))
-        self.assertIn(CLEANUP_FAILED, notes, "the typed cleanup failure was discarded")
+        retained = owned_descriptors.teardown_failures(caught.exception)
+        self.assertTrue(
+            any(
+                isinstance(entry, tuple)
+                and any(getattr(item, "kind", None) == CLEANUP_FAILED for item in entry)
+                for entry in retained
+            ),
+            "the typed cleanup failure was discarded",
+        )
         self.assertNotEqual(
             [], self._staging_names(repo), "the fixture did not actually leave residue"
         )
@@ -771,8 +788,13 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
                 self._service(repo).sync()
 
         self.assertTrue(schedule.close_fired, "the typed close injection never fired")
-        notes = "\n".join(getattr(caught.exception, "__notes__", []))
-        self.assertIn("close reported a failure", notes)
+        self.assertTrue(
+            any(
+                entry is False
+                for entry in owned_descriptors.teardown_failures(caught.exception)
+            ),
+            "the typed close failure was discarded",
+        )
 
     def test_an_interrupt_during_teardown_outranks_the_primary(self) -> None:
         """j#90487 R13-F3. `_teardown_during` caught `BaseException`, so a
@@ -879,8 +901,13 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
         self.assertTrue(schedule.close_fired, "the close injection never fired")
         primary = caught.exception.__context__
         self.assertIsInstance(primary, PrimaryWrite)
-        notes = "\n".join(getattr(primary, "__notes__", []))
-        self.assertIn("SystemExit", notes, "the second control-flow failure was dropped")
+        self.assertTrue(
+            any(
+                isinstance(entry, SystemExit)
+                for entry in owned_descriptors.teardown_failures(primary)
+            ),
+            "the second control-flow failure was dropped",
+        )
 
     def test_a_broken_note_still_leaves_the_cleanup_failure_reachable(self) -> None:
         """j#90503 R15-F1. Making `add_note` the ledger meant that an interrupt

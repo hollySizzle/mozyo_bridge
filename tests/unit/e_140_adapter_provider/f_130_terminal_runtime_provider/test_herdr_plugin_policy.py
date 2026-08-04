@@ -2063,7 +2063,9 @@ class CliTests(unittest.TestCase):
         sub = parser.add_subparsers(dest="cmd")
         register_herdr_plugin_policy_parser(sub)
         self.parser = parser
-        self.inventory = Path(self.enterContext(_temp_dir())) / "inventory.json"
+        temp_dir = _temp_dir()
+        self.addCleanup(temp_dir.cleanup)
+        self.inventory = Path(temp_dir.name) / "inventory.json"
 
     def _parse(self, *argv):
         return self.parser.parse_args(["plugin-policy", *argv])
