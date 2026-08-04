@@ -87,6 +87,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 
 from tests.support.herdr_fake import FakeHerdr
+from tests.support.redmine_anchor_authority import matching_redmine_anchor_source_patch
 
 
 # -- scenario grid cell (design §3.3 axes) ------------------------------------
@@ -292,6 +293,7 @@ class _Finding1World:
                 stack.enter_context(
                     mock.patch("mozyo_bridge.application.commands.time.sleep")
                 )
+                stack.enter_context(matching_redmine_anchor_source_patch())
                 stack.enter_context(mock.patch.dict(os.environ, env, clear=True))
                 yield stack
         finally:

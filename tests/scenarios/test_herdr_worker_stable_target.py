@@ -65,6 +65,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 
 from tests.support.herdr_fake import FakeHerdr
+from tests.support.redmine_anchor_authority import matching_redmine_anchor_source_patch
 from tests.scenarios.test_herdr_lane_choreography import _ScenarioRunner
 
 #: The target sublane the worker lives in — the stable lane the dispatch must resolve.
@@ -167,6 +168,7 @@ class _DivergentSenderWorld:
                 stack.enter_context(
                     mock.patch("mozyo_bridge.application.commands.time.sleep")
                 )
+                stack.enter_context(matching_redmine_anchor_source_patch())
                 stack.enter_context(
                     mock.patch.dict(os.environ, self.sender_env(), clear=True)
                 )

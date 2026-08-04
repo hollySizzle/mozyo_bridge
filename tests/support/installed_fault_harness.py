@@ -68,6 +68,7 @@ from tests.support.herdr_fake import (
     FakeHerdr,
     attest_capability_epilog,
 )
+from tests.support.redmine_anchor_authority import matching_redmine_anchor_source_patch
 
 #: A herdr ``agent_status`` that :func:`classify_named_slot` reads as a #13518 shell residue
 #: (``map_agent_status`` degrades an unrecognised token to ``unknown`` -> ``RUNTIME_UNKNOWN``
@@ -377,6 +378,7 @@ class InstalledFaultHarness:
             with contextlib.ExitStack() as stack:
                 stack.enter_context(mock.patch("subprocess.run", self._runner.run))
                 stack.enter_context(mock.patch("subprocess.Popen", self._runner.popen))
+                stack.enter_context(matching_redmine_anchor_source_patch())
                 stack.enter_context(mock.patch.dict(os.environ, self._env(), clear=True))
                 yield stack
         finally:

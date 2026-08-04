@@ -42,7 +42,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_
 )
 # Redmine #14232: the ONE injection-stage authority + the transport-failure family's wording
 # (see that module's `## Reason wording owned here` note). It imports nothing from here.
-from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import INJECT_FAILED_NARRATIVE, INJECT_FAILED_NEXT_ACTION, TRANSPORT_ERROR_NARRATIVE, TRANSPORT_ERROR_NEXT_ACTION, TRANSPORT_ERROR_RECEIVER_CONTRACT, injection_stage_telemetry  # noqa: E501
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import ANCHOR_AUTHORITY_NARRATIVE, ANCHOR_AUTHORITY_NEXT_ACTION, INJECT_FAILED_NARRATIVE, INJECT_FAILED_NEXT_ACTION, TRANSPORT_ERROR_NARRATIVE, TRANSPORT_ERROR_NEXT_ACTION, TRANSPORT_ERROR_RECEIVER_CONTRACT, injection_stage_telemetry  # noqa: E501
 
 if TYPE_CHECKING:
     from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import RoleProfileResolution
@@ -696,14 +696,7 @@ Reason = Literal[
     "turn_start_absent",
     "precondition_not_idle",
     "inject_failed",
-    # Redmine #13760: the receiver is showing a provider STARTUP screen (a trust
-    # confirmation / first-run theme picker / login prompt) that cannot accept a
-    # handoff body. Refused at the pre-send admission gate, BEFORE any injection:
-    # nothing was typed, no Enter was pressed, no ACK was produced. Distinct from
-    # `receiver_blocked` (a post-injection runtime block) and from
-    # `precondition_not_idle` (a busy pane): a startup screen renders as a live,
-    # non-blank, "ready-looking" pane, which is exactly why typing into it silently
-    # destroyed an Implementation Request (#13582 j#77917).
+    # #13760: a provider startup screen has no composer; refuse before injection.
     "receiver_startup_interaction_required",
     "receiver_update_authority_split",
     "cross_session_claude",
@@ -719,6 +712,9 @@ Reason = Literal[
     # Redmine #14249 pre-send refusals, NOT `target_repo_mismatch`: `gateway_route_wording`.
     "execution_root_outside_target_repo",
     "auto_target_repo_unresolved",
+    # Redmine #14246: action-time Redmine issue/journal ownership refusals.
+    "anchor_issue_not_found", "anchor_journal_not_found",
+    "anchor_issue_journal_mismatch", "anchor_provider_unreadable",
     # Redmine #14232: a terminal-transport primitive raised at or after the single body
     # injection (rationale, classification, and the pre-#14232 defect: `injection_stage`).
     "transport_error",
@@ -1161,6 +1157,8 @@ def next_action_for(
         return "sender", INJECT_FAILED_NEXT_ACTION.format(receiver=receiver)
     if reason == "transport_error":
         return "sender", TRANSPORT_ERROR_NEXT_ACTION  # Redmine #14232
+    if reason in ANCHOR_AUTHORITY_NEXT_ACTION:
+        return "sender", ANCHOR_AUTHORITY_NEXT_ACTION[reason]
     if reason == "target_unavailable":
         return (
             "sender",
@@ -1623,6 +1621,8 @@ def _outcome_narrative(
         return INJECT_FAILED_NARRATIVE  # relocated by #14232 (module health)
     if reason == "transport_error":
         return TRANSPORT_ERROR_NARRATIVE
+    if reason in ANCHOR_AUTHORITY_NARRATIVE:
+        return ANCHOR_AUTHORITY_NARRATIVE[reason]
     if reason == "target_unavailable":
         return (
             "Receiver pane could not be resolved; no notification was typed."

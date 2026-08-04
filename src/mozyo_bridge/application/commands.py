@@ -147,6 +147,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.han
     EnvelopePlanError,
     HandoffEnvelopePlanner,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_anchor_authority import AnchorAuthorityError, verify_live_handoff_anchor  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_herdr_standard_rail import (
     HerdrStandardRailRequest,
     run_herdr_standard_rail,
@@ -1762,20 +1763,19 @@ def orchestrate_handoff(
         die(f"--kind must be one of {sorted(KIND_LABELS)}; got {kind!r}")
 
     summary = inp.summary
-
-    # Redmine #13729 tranche 2: the Anchor/Profile Envelope Planner owns the typed
-    # anchor + ticketless payload build. On malformed input it raises with no extra
-    # outcome fields, matching the original early anchor block (target/anchor None).
+    # Plan the anchor, then #14246 verifies Redmine ownership before target resolution.
     try:
         _anchor_plan = envelope_planner.plan_anchor(inp)
-    except EnvelopePlanError as exc:
+        verify_live_handoff_anchor(_anchor_plan.anchor)
+    except (EnvelopePlanError, AnchorAuthorityError) as exc:
+        failed_anchor = getattr(exc, "anchor", None)
         _emit(
             make_outcome(
                 status="blocked",
                 reason=exc.reason,
                 receiver=receiver,
                 target=None,
-                anchor=None,
+                anchor=failed_anchor,
                 mode=mode,
                 kind=kind,
                 notification_marker=None,

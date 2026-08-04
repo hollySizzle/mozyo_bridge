@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from unittest import mock
 
+from tests.support.redmine_anchor_authority import matching_redmine_anchor_source_patch
+
 # --- tmux-rail transport isolation (Redmine #13254) -------------------------
 #
 # The legacy fake-tmux handoff-routing tests exercise the tmux send/capture rail
@@ -53,6 +55,7 @@ def setUpModule() -> None:
             "mozyo_bridge.application.commands.herdr_effective_backend_selected",
             return_value=False,
         ),
+        matching_redmine_anchor_source_patch(),
     ]
     for patch in _TMUX_RAIL_TRANSPORT_PATCHES:
         patch.start()

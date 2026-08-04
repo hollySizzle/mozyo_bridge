@@ -77,6 +77,29 @@ REASON_QUEUE_ENTER = "queue_enter"
 
 NON_BLOCKED_REASONS: frozenset[str] = frozenset({REASON_OK, REASON_QUEUE_ENTER})
 
+# Redmine #14246: action-time Redmine anchor authority refusals. All occur before
+# target resolution, body construction, or any transport primitive.
+ANCHOR_AUTHORITY_REASONS: frozenset[str] = frozenset(
+    {
+        "anchor_issue_not_found",
+        "anchor_journal_not_found",
+        "anchor_issue_journal_mismatch",
+        "anchor_provider_unreadable",
+    }
+)
+ANCHOR_AUTHORITY_NEXT_ACTION: dict[str, str] = {
+    "anchor_issue_not_found": "verify that the Redmine issue exists and is readable, then re-issue the same handoff",
+    "anchor_journal_not_found": "verify that the Redmine journal exists under the named issue, then re-issue the same handoff",
+    "anchor_issue_journal_mismatch": "use the issue that owns the Redmine journal (or a journal owned by the named issue), then re-issue the handoff",
+    "anchor_provider_unreadable": "restore the trusted Redmine credentials or provider availability, then retry the ownership check; do not send without it",
+}
+ANCHOR_AUTHORITY_NARRATIVE: dict[str, str] = {
+    "anchor_issue_not_found": "Redmine anchor authority (pre-send): the named issue does not exist or is not readable. No target was resolved and nothing was typed.",
+    "anchor_journal_not_found": "Redmine anchor authority (pre-send): the named journal was not present under the named issue. No target was resolved and nothing was typed.",
+    "anchor_issue_journal_mismatch": "Redmine anchor authority (pre-send): the observed journal owner differs from the named issue. No target was resolved and nothing was typed.",
+    "anchor_provider_unreadable": "Redmine anchor authority (pre-send): ownership could not be verified from the trusted provider, so the gate failed closed. No target was resolved and nothing was typed.",
+}
+
 # --- Blocked reasons that are DETERMINISTIC pre-injection refusals (zero bytes typed). -
 # Each member's own durable contract states that nothing was typed and Enter was never
 # pressed, so a bounded retry cannot duplicate. The docstring / narrative that establishes
@@ -124,6 +147,7 @@ PRE_INJECTION_BLOCKED_REASONS: frozenset[str] = frozenset(
         "reader_upgrade_required",
         "execution_root_outside_target_repo",
         "auto_target_repo_unresolved",
+        *ANCHOR_AUTHORITY_REASONS,
     }
 )
 
@@ -569,6 +593,9 @@ def injection_stage_record_lines(telemetry: object) -> list[str]:
 
 
 __all__: Iterable[str] = (
+    "ANCHOR_AUTHORITY_NARRATIVE",
+    "ANCHOR_AUTHORITY_NEXT_ACTION",
+    "ANCHOR_AUTHORITY_REASONS",
     "canonical_v2_generation_binding",
     "INJECT_FAILED_NARRATIVE",
     "INJECT_FAILED_NEXT_ACTION",
