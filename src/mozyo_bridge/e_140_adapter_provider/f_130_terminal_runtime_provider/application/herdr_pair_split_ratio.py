@@ -52,6 +52,9 @@ import json
 from dataclasses import dataclass
 from typing import Mapping, Optional, Sequence
 
+from pathlib import Path
+
+from mozyo_bridge.shared.paths import mozyo_bridge_home
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
     _close_base_pane,
     _invoke,
@@ -835,6 +838,7 @@ def finalize_container_geometry(
     timeout: float,
     env,
     project_coordinator: bool = False,
+    store_home: object = None,
 ) -> None:
     """Finish the container this run launched into: reclaim, column, divide the pair.
 
@@ -867,6 +871,7 @@ def finalize_container_geometry(
     result.column_outcome, result.column_detail = reflow_project_columns(
         result,
         project_coordinator=project_coordinator,
+        home=Path(store_home) if store_home else mozyo_bridge_home(),
         launched=launched,
         initial_occupancy=initial_occupancy,
         dry_run=dry_run,

@@ -34,10 +34,17 @@ Boundary — narrow, launch-time, verified (j#99845)
   freshly launched a FULL pair into a tab that already holds another project's
   coordinator panes. An adopt-only run, a single-provider heal, a dry run and a
   first-project launch all resolve :data:`COLUMN_NOT_APPLICABLE` and move nothing.
-- **Only identity-verified coordinator panes.** Every pane this plan names is
-  decoded from its herdr assigned name, so a foreign shell or an implementation
-  sublane slot can never be grabbed. Identity, cwd and route authority are
-  untouched: a bounce moves a pane, it never closes, restarts or renames one.
+- **Only panes proved to be coordinator panes.** A decodable assigned name is not
+  enough: its ``role`` field is a PROVIDER token (``codex`` / ``claude``), not a
+  workflow role, so decoding alone cannot tell a project coordinator from an
+  implementation slot that was mis-placed into (or lingered in) this workspace —
+  review j#99885 finding_2 reproduced exactly that, with an ``implementation``
+  lane chosen as the anchor and one of its panes bounced. The set that reaches a
+  plan is therefore joined against three authorities and is otherwise a zero-move
+  typed refusal: live-ness (:func:`classify_named_slot`), the mode's own default-
+  lane invariant, and the durable ``lane_kind`` of every NAMED lane. Identity and
+  route authority stay untouched — a bounce moves a pane, it never closes,
+  restarts or renames one.
 - **Every placement is explicitly targeted.** Each step passes ``--target-pane``,
   so the result does not depend on which pane happened to be active before the
   launch (j#99845: "起動前focus非依存").
@@ -56,8 +63,16 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
+from mozyo_bridge.core.state.lane_kind import LANE_KIND_DELEGATED_COORDINATOR
+from mozyo_bridge.core.state.lane_lifecycle_readonly import (
+    load_lane_lifecycle_readonly,
+)
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.lane_placement import (  # noqa: E501
+    LANE_PLACEMENT_PROVIDERS,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
     HerdrSessionStartError,
     _workspace_prefix,
@@ -80,6 +95,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _agent_locator,
     _norm,
     decode_assigned_name,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E501
+    SLOT_STALE,
+    classify_named_slot,
 )
 
 #: No project-column reflow was owed. The resting value: every non-role-grouped
@@ -155,11 +174,23 @@ class ColumnReflowPlan:
 def coordinator_panes_in(
     rows: Sequence[Mapping[str, object]], target_workspace: str
 ) -> "tuple[CoordinatorPane, ...]":
-    """Every identity-decoded slot whose live pane sits in ``target_workspace``.
+    """Every LIVE identity-decoded slot whose pane sits in ``target_workspace``.
 
     Identity is the herdr assigned name, never the pane position: a row we cannot
-    decode, or one located in another herdr workspace, contributes nothing. That
-    is what keeps a foreign shell or a sublane slot out of every plan below.
+    decode, or one located in another herdr workspace, contributes nothing.
+
+    A row :func:`classify_named_slot` reads as :data:`SLOT_STALE` contributes
+    nothing either (review j#99885 finding_2). Stale rows are shell residue whose
+    durable identity outlived its agent; letting one into a group would let this
+    module reason about — and bounce — a pane whose provider is gone. It is the
+    same liveness authority the sibling
+    :func:`...herdr_role_grouped_space.validate_role_grouped_inventory` applies to
+    this run's own lane, applied here to every project in the workspace.
+
+    Decoding is necessary but NOT sufficient to call a pane a coordinator: the
+    assigned name's ``role`` is a provider token. :func:`resolve_project_groups`
+    is what turns these panes into project pairs, and it is the only producer a
+    plan may consume.
     """
     panes: list = []
     for row in rows:
@@ -170,6 +201,8 @@ def coordinator_panes_in(
             continue
         locator = _agent_locator(row)
         if not locator or _workspace_prefix(locator) != target_workspace:
+            continue
+        if classify_named_slot(row) == SLOT_STALE:
             continue
         panes.append(
             CoordinatorPane(
@@ -186,11 +219,141 @@ def coordinator_panes_in(
 def group_by_pair(
     panes: Sequence[CoordinatorPane],
 ) -> "dict[tuple[str, str], tuple[CoordinatorPane, ...]]":
-    """Panes grouped into project pairs, keyed by ``(workspace_id, lane_id)``."""
+    """Panes grouped by ``(workspace_id, lane_id)`` — grouping only, no authority."""
     groups: dict = {}
     for pane in panes:
         groups.setdefault(pane.pair_key, []).append(pane)
     return {key: tuple(members) for key, members in groups.items()}
+
+
+def _provider_shape_refusal(
+    key: "tuple[str, str]", members: Sequence[CoordinatorPane]
+) -> str:
+    """``""`` iff this group's providers are a shape a coordinator pair can have.
+
+    A distinct, non-empty subset of the canonical providers. Review j#99885
+    finding_3 reproduced the hole this closes: two rows carrying the SAME assigned
+    name were grouped as a pair, so an identity conflict — which the sibling
+    resolver already fails closed on for this run's own lane — was reshaped as if
+    it were a healthy codex/claude pair.
+
+    A group of ONE live provider is deliberately allowed (finding_3 verdict
+    j#99888 / dispute j#99890): :func:`_column_span` proves a full-height column
+    from the layout regardless of how many panes stack in it, so a project that is
+    currently short a slot still owns a real column. Failing here would report a
+    neighbour's missing slot as THIS run's column failure — a mis-attribution, and
+    one the slot / health axes already own.
+    """
+    providers = [pane.role for pane in members]
+    unknown = sorted({p for p in providers if p not in LANE_PLACEMENT_PROVIDERS})
+    if unknown:
+        return (
+            f"project pair {key!r} carries unrecognised provider(s) {unknown!r}; "
+            "refusing to reshape a group this plan cannot identify"
+        )
+    if len(set(providers)) != len(providers):
+        return (
+            f"project pair {key!r} carries duplicate provider(s) {sorted(providers)!r} "
+            "— an identity conflict, not a coordinator pair"
+        )
+    if len(providers) > len(LANE_PLACEMENT_PROVIDERS):
+        return (
+            f"project pair {key!r} holds {len(providers)} live panes, more than a "
+            "coordinator pair can have"
+        )
+    return ""
+
+
+def _lane_kind_index(home: Path) -> "Optional[dict[tuple[str, str], str]]":
+    """``{(workspace_id, lane_id): lane_kind}`` from the durable lifecycle store.
+
+    ``None`` when the store cannot be read version-compatibly — the same
+    fail-closed disposition :func:`load_lane_lifecycle_readonly` defines, carried
+    through so an unreadable authority refuses the reflow instead of letting a
+    named lane default into "probably a coordinator".
+    """
+    records = load_lane_lifecycle_readonly(home=home)
+    if records is None:
+        return None
+    return {
+        (record.repo_workspace_id, _norm(record.lane_id) or DEFAULT_LANE): _norm(
+            record.lane_kind
+        )
+        for record in records
+    }
+
+
+def resolve_project_groups(
+    rows: Sequence[Mapping[str, object]],
+    target_workspace: str,
+    *,
+    home: Path,
+    own_key: "Optional[tuple[str, str]]" = None,
+) -> "tuple[dict[tuple[str, str], tuple[CoordinatorPane, ...]], str]":
+    """``(project pairs, refusal)`` — the only group producer a plan may consume.
+
+    Three authorities, in the order that keeps the common case free of the
+    heaviest one (review j#99885 finding_2 / finding_3):
+
+    1. **live-ness and provider shape** (:func:`coordinator_panes_in`,
+       :func:`_provider_shape_refusal`) — pure, from the inventory row.
+    2. **the mode's default-lane invariant** — under ``role_grouped_space`` every
+       DEFAULT lane is a coordinator; that is the same rule
+       :func:`...herdr_role_grouped_space.is_role_grouped_project_coordinator`
+       enforces on this run's own lane, and it needs no store read. A workspace
+       holding only default lanes — the ordinary case — therefore never opens the
+       lifecycle store at all.
+    3. **the durable ``lane_kind``** for every FOREIGN named lane, read from the
+       generation-bound lifecycle store. Only ``delegated_coordinator`` joins the
+       coordinator role group. An ``implementation`` lane in this workspace is a
+       mis-placement this axis must not silently reshape, and a missing / unknown
+       kind — or a store that cannot be read — is not evidence of one either. All
+       three are a refusal, which the caller turns into a ZERO-MOVE typed failure.
+
+    ``own_key`` is exempt from (3) and only from (3): this run's own lane kind was
+    already proved by the caller — ``role_grouped_space`` classified it through
+    :func:`...herdr_role_grouped_space.is_role_grouped_project_coordinator` before
+    anything launched, which is the authority that decided this workspace was its
+    placement at all. Re-deriving it from the lifecycle store would not strengthen
+    that; it would only fail a managed ``delegated_coordinator`` whose durable row
+    is written on a different edge than its launch, which is a live path (measured
+    against ``HerdrSublaneActuatorOps.append_lane_column``). The finding this
+    exemption preserves is about FOREIGN panes, and those keep the full join.
+
+    A non-empty refusal means no plan may be built; the groups returned with it
+    are not usable.
+    """
+    groups = group_by_pair(coordinator_panes_in(rows, target_workspace))
+    for key, members in sorted(groups.items()):
+        refusal = _provider_shape_refusal(key, members)
+        if refusal:
+            return {}, refusal
+    named = sorted(
+        key for key in groups if key[1] != DEFAULT_LANE and key != own_key
+    )
+    if not named:
+        return groups, ""
+    index = _lane_kind_index(home)
+    if index is None:
+        return {}, (
+            "the durable lane-kind authority is unreadable, so the named lane(s) "
+            f"{named!r} in this workspace cannot be proved to be project coordinators"
+        )
+    for key in named:
+        kind = index.get(key, "")
+        if kind == LANE_KIND_DELEGATED_COORDINATOR:
+            continue
+        if not kind:
+            return {}, (
+                f"named lane {key!r} has no durable lane-kind; refusing to treat it as "
+                "a project coordinator"
+            )
+        return {}, (
+            f"named lane {key!r} has durable lane-kind {kind!r}, not "
+            f"{LANE_KIND_DELEGATED_COORDINATOR!r}; a non-coordinator lane in the shared "
+            "project-coordinator workspace is a placement this plan will not reshape"
+        )
+    return groups, ""
 
 
 def _tab_bounds(layout: LayoutSnapshot) -> "Optional[tuple[int, int, int, int]]":
@@ -512,6 +675,7 @@ def reflow_project_columns(
     runner,
     timeout: float,
     env,
+    home: Path,
 ) -> "tuple[str, str]":
     """Give this run's appended pair its own column — ``(outcome, detail)``.
 
@@ -544,9 +708,12 @@ def reflow_project_columns(
         if getattr(slot, "outcome", "") == SLOT_LAUNCHED and getattr(slot, "locator", "")
     )
     rows = _list_rows(binary, runner, timeout)
-    panes = coordinator_panes_in(rows, target_workspace)
-    groups = group_by_pair(panes)
     own_key = (result.workspace_id, _norm(result.lane_id) or DEFAULT_LANE)
+    groups, group_refusal = resolve_project_groups(
+        rows, target_workspace, home=home, own_key=own_key
+    )
+    if group_refusal:
+        return COLUMN_FAILED, f"{group_refusal}; no live pane was moved"
     if not [key for key in groups if key != own_key]:
         return COLUMN_NOT_APPLICABLE, (
             "this project is the only coordinator pair in the shared workspace, so "
@@ -685,4 +852,5 @@ __all__ = (
     "plan_project_columns",
     "read_pane_layout",
     "reflow_project_columns",
+    "resolve_project_groups",
 )

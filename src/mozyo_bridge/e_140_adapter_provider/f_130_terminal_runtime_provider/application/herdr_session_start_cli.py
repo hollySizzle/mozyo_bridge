@@ -38,6 +38,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pair_split_ratio import (  # noqa: E501
     RATIO_NOT_APPLICABLE,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_reflow import (  # noqa: E501
+    COLUMN_NOT_APPLICABLE,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_health import (  # noqa: E501
     COMPENSATION_NOT_NEEDED,
 )
@@ -94,6 +97,16 @@ def _render_text(result: SessionStartResult) -> str:
             f"pair split ratio: {result.ratio_outcome}"
             + (f" ({result.ratio_detail})" if result.ratio_detail else "")
         )
+    if result.column_outcome != COLUMN_NOT_APPLICABLE:
+        # Redmine #14996 R2 review j#99885 finding_1: the column is its own exit-affecting
+        # axis, so it needs its own line for exactly the reason the ratio does — and more
+        # urgently, because a FAILED column is the only place the operator learns which
+        # pane was left outside the shared tab. Without this line the run failed while
+        # naming two causes that were both false, and named no recovery target at all.
+        lines.append(
+            f"project column: {result.column_outcome}"
+            + (f" ({result.column_detail})" if result.column_detail else "")
+        )
     if not result.ok:
         # Name the next action AND hand over the handle it needs. The text used to say
         # "converge it with the rollback rail" without ever printing the action id that
@@ -102,8 +115,9 @@ def _render_text(result: SessionStartResult) -> str:
         # the one argument of the recovery command is not a pointer.
         lines.append(
             "session-start did NOT fully succeed: at least one requested role is not "
-            "live-and-attested, or the declared pair split ratio was not applied "
-            "(see the lines above). This run closed nothing."
+            "live-and-attested, the declared pair split ratio was not applied, or this "
+            "project's column was not established (see the lines above). This run closed "
+            "nothing."
         )
         if result.action_id and any(
             s.compensation != COMPENSATION_NOT_NEEDED for s in result.slots

@@ -925,7 +925,7 @@ def _prepare_session_locked(
         pair_order=pair_order, requested=providers, config_ratio=config_ratio,
         launched=len(launch_plans), initial_occupancy=plan_of_container.occupancy,
         dry_run=dry_run, binary=binary, runner=runner, timeout=timeout, env=env,
-        project_coordinator=role_grouped_project_coordinator,
+        project_coordinator=role_grouped_project_coordinator, store_home=store_home,
     )
     # Pass 3 — observe what we started (Redmine #13948, Answer j#80989). `agent start`
     # returning a well-formed, correctly-located locator is the LAUNCHER's claim; it says

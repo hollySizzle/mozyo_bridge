@@ -15,7 +15,9 @@ was an L (j#99845).
 
 from __future__ import annotations
 
+import atexit
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -25,12 +27,28 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 from support.herdr_pane_tree import PaneTreeHerdr  # noqa: E402
 
+from mozyo_bridge.core.state.lane_kind import (  # noqa: E402
+    LANE_KIND_DELEGATED_COORDINATOR,
+    LANE_KIND_IMPLEMENTATION,
+)
+from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore  # noqa: E402
+from mozyo_bridge.core.state.lane_lifecycle_model import (  # noqa: E402
+    DecisionPointer,
+    LaneLifecycleKey,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_reflow import (  # noqa: E402,E501
     COLUMN_APPLIED,
     COLUMN_FAILED,
     COLUMN_MATCHED,
     COLUMN_NOT_APPLICABLE,
+    coordinator_panes_in,
     reflow_project_columns,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_cli import (  # noqa: E402,E501
+    _render_text,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_health import (  # noqa: E402,E501
+    HEALTH_HEALTHY,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_result import (  # noqa: E402,E501
     SLOT_ADOPTED,
@@ -66,6 +84,16 @@ def _result(workspace_id: str, launched: "list[str]") -> SessionStartResult:
     return result
 
 
+def _declare_lane(home: Path, workspace: str, lane: str, kind: str) -> None:
+    """Write the durable lane-kind fact the reflow's third authority reads."""
+    LaneLifecycleStore(home=home).declare_active(
+        LaneLifecycleKey(workspace, lane),
+        decision=DecisionPointer(source="redmine", issue_id="14996", journal_id="99885"),
+        issue_id="14996",
+        lane_kind=kind,
+    )
+
+
 def _seed_first_project(herdr: PaneTreeHerdr, workspace: str):
     """One project's coordinator pair, as a fresh launch leaves it: ``down`` split."""
     tab = herdr.new_tab()
@@ -83,12 +111,21 @@ def _append_pair_as_today(herdr: PaneTreeHerdr, tab, workspace: str):
     return first, second
 
 
+#: An empty operator home. Every scenario below is default-lane only, so the durable
+#: lane-kind store is never opened — which is itself part of the contract (#14996 R2
+#: review j#99885 finding_2: the ordinary case must not grow a store dependency).
+_HOME_TMP = tempfile.TemporaryDirectory()
+atexit.register(_HOME_TMP.cleanup)
+HOME = Path(_HOME_TMP.name)
+
+
 def _run(herdr: PaneTreeHerdr, result, workspace, **overrides):
     # The resolved shared herdr workspace the run landed in — session-start records it
     # on the result before the geometry step, and the reflow reads it from there.
     result.herdr_workspace_id = herdr.workspace_id
     kwargs = {
         "project_coordinator": True,
+        "home": HOME,
         "launched": 2,
         "initial_occupancy": 0,
         "dry_run": False,
@@ -342,6 +379,214 @@ class ProjectColumnFailClosedTest(unittest.TestCase):
         result = SessionStartResult(workspace_id=PROJECT_B, lane_id="default")
         result.column_outcome = "appllied"
         self.assertFalse(result.column_ok)
+
+
+class ColumnOperatorSurfaceTest(unittest.TestCase):
+    """Review j#99885 finding_1 — a failing column must be readable, not inferred.
+
+    The defect: the run exited non-zero on the column axis while the text named
+    only role health and the split ratio as possible causes, and never printed the
+    detail that carries the stranded pane. Both stated causes were false, so the
+    operator was pointed away from the only recoverable fact the run held.
+    """
+
+    def _healthy(self, **fields) -> SessionStartResult:
+        result = SessionStartResult(workspace_id=PROJECT_B, lane_id="default")
+        for provider in ("codex", "claude"):
+            result.slots.append(
+                SlotResult(
+                    provider=provider,
+                    assigned_name=_name(PROJECT_B, provider),
+                    outcome=SLOT_LAUNCHED,
+                    locator="w1:p4",
+                    health=HEALTH_HEALTHY,
+                )
+            )
+        for key, value in fields.items():
+            setattr(result, key, value)
+        return result
+
+    def test_a_failed_column_prints_its_detail_and_the_stranded_pane(self):
+        detail = "pane(s) ['w1:p5'] are NOT in the shared project-coordinator tab"
+        result = self._healthy(column_outcome=COLUMN_FAILED, column_detail=detail)
+        text = _render_text(result)
+        self.assertIn("project column: failed", text)
+        self.assertIn(detail, text)
+        self.assertIn("w1:p5", text)
+
+    def test_the_failure_sentence_names_the_column_as_a_possible_cause(self):
+        result = self._healthy(column_outcome=COLUMN_FAILED, column_detail="x")
+        self.assertFalse(result.ok)
+        sentence = [
+            line for line in _render_text(result).splitlines()
+            if line.startswith("session-start did NOT fully succeed")
+        ]
+        self.assertEqual(len(sentence), 1)
+        self.assertIn("column", sentence[0])
+
+    def test_a_successful_column_is_still_reported_so_the_measurement_is_visible(self):
+        result = self._healthy(column_outcome=COLUMN_APPLIED, column_detail="2 pair(s)")
+        text = _render_text(result)
+        self.assertIn("project column: applied (2 pair(s))", text)
+        self.assertNotIn("did NOT fully succeed", text)
+
+    def test_the_resting_value_prints_no_column_line(self):
+        text = _render_text(self._healthy())
+        self.assertNotIn("project column:", text)
+
+    def test_the_column_axis_reaches_the_json_payload(self):
+        payload = self._healthy(
+            column_outcome=COLUMN_FAILED, column_detail="stranded w1:p5"
+        ).as_payload()
+        self.assertEqual(payload["column_outcome"], COLUMN_FAILED)
+        self.assertEqual(payload["column_detail"], "stranded w1:p5")
+        self.assertFalse(payload["ok"])
+
+
+class ColumnPaneAuthorityTest(unittest.TestCase):
+    """Review j#99885 finding_2 / finding_3 — decoding a name is not a role proof.
+
+    An assigned name's ``role`` is a provider token, so a decodable row says
+    nothing about whether the pane belongs to a project coordinator. These pin the
+    three authorities that now stand between the inventory and a plan.
+    """
+
+    def _tab_with_extra(self, extra_lane: str):
+        """Two already-columnar projects — one of them a NAMED lane — plus an append.
+
+        The named lane's pair sits in the rightmost column, which is exactly where
+        the anchor is chosen, so an unproved lane kind reaches the plan if nothing
+        stops it (the finding_2 reproduction).
+        """
+        herdr = PaneTreeHerdr()
+        tab = herdr.new_tab()
+        herdr.seed_columns(
+            tab,
+            [
+                [_name(PROJECT_A, "codex"), _name(PROJECT_A, "claude")],
+                [
+                    encode_assigned_name(PROJECT_A, "codex", extra_lane),
+                    encode_assigned_name(PROJECT_A, "claude", extra_lane),
+                ],
+            ],
+        )
+        b1 = herdr.launch_into(tab, _name(PROJECT_B, "codex"), focus=True)
+        b2 = herdr.launch_into(tab, _name(PROJECT_B, "claude"), split="down")
+        return herdr, (b1, b2)
+
+    def _assert_zero_move_failure(self, herdr, outcome, detail, fragment):
+        self.assertEqual(outcome, COLUMN_FAILED, detail)
+        self.assertIn(fragment, detail)
+        self.assertIn("no live pane was moved", detail)
+        self.assertEqual([c for c in herdr.calls if c[:2] == ["pane", "move"]], [])
+
+    def test_a_named_lane_without_a_durable_kind_is_never_treated_as_coordinator(self):
+        herdr, launched = self._tab_with_extra("implementation-1")
+        outcome, detail = _run(herdr, _result(PROJECT_B, list(launched)), PROJECT_B)
+        self._assert_zero_move_failure(
+            herdr, outcome, detail, "has no durable lane-kind"
+        )
+
+    def test_an_implementation_lane_in_the_shared_tab_is_refused_not_reshaped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            _declare_lane(home, PROJECT_A, "implementation-1", LANE_KIND_IMPLEMENTATION)
+            herdr, launched = self._tab_with_extra("implementation-1")
+            outcome, detail = _run(
+                herdr, _result(PROJECT_B, list(launched)), PROJECT_B, home=home
+            )
+            self._assert_zero_move_failure(herdr, outcome, detail, "not 'delegated_coordinator'")
+
+    def test_a_delegated_coordinator_lane_joins_the_coordinator_role_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            _declare_lane(
+                home, PROJECT_A, "delegated-1", LANE_KIND_DELEGATED_COORDINATOR
+            )
+            herdr, launched = self._tab_with_extra("delegated-1")
+            outcome, detail = _run(
+                herdr, _result(PROJECT_B, list(launched)), PROJECT_B, home=home
+            )
+            self.assertEqual(outcome, COLUMN_APPLIED, detail)
+            self.assertIn("3 project pair(s)", detail)
+
+    def test_this_run_s_own_named_lane_is_not_re_derived_from_the_store(self):
+        """A managed ``delegated_coordinator`` appending its own column.
+
+        The lane kind was already proved by the caller before anything launched —
+        that authority is what routed this pair to the shared workspace at all —
+        and its durable row is written on a different edge than the launch. Asking
+        the lifecycle store to re-prove it here failed the live actuator path
+        (measured against ``HerdrSublaneActuatorOps.append_lane_column``), so the
+        store join is FOREIGN-only. Foreign named lanes keep the full join, which
+        the two tests above pin.
+        """
+        herdr = PaneTreeHerdr()
+        tab = herdr.new_tab()
+        herdr.seed_columns(tab, [[_name(PROJECT_A, "codex"), _name(PROJECT_A, "claude")]])
+        own = "delegated-b"
+        b1 = herdr.launch_into(
+            tab, encode_assigned_name(PROJECT_B, "codex", own), focus=True
+        )
+        b2 = herdr.launch_into(
+            tab, encode_assigned_name(PROJECT_B, "claude", own), split="down"
+        )
+        result = SessionStartResult(workspace_id=PROJECT_B, lane_id=own)
+        for provider, locator in zip(("codex", "claude"), (b1, b2)):
+            result.slots.append(
+                SlotResult(
+                    provider=provider,
+                    assigned_name=encode_assigned_name(PROJECT_B, provider, own),
+                    outcome=SLOT_LAUNCHED,
+                    locator=locator,
+                )
+            )
+        outcome, detail = _run(herdr, result, PROJECT_B)
+        self.assertEqual(outcome, COLUMN_APPLIED, detail)
+
+    def test_a_stale_row_is_not_a_coordinator_pane(self):
+        herdr = PaneTreeHerdr()
+        tab = herdr.new_tab()
+        base = herdr.seed_pane(tab)
+        a1 = herdr.split_pane(tab, base, "right", _name(PROJECT_A, "codex"), focus=True)
+        a2 = herdr.split_pane(tab, a1, "down", _name(PROJECT_A, "claude"))
+        tab.remove(base)
+        herdr.stale_panes.add(a2)  # shell residue: identity outlived its agent
+        rows = herdr._rows()
+        self.assertNotIn(
+            a2, [pane.locator for pane in coordinator_panes_in(rows, "w1")]
+        )
+
+    def test_duplicate_providers_in_one_group_are_an_identity_conflict(self):
+        herdr = PaneTreeHerdr()
+        tab = herdr.new_tab()
+        base = herdr.seed_pane(tab)
+        a1 = herdr.split_pane(tab, base, "right", _name(PROJECT_A, "codex"), focus=True)
+        herdr.split_pane(tab, a1, "down", _name(PROJECT_A, "codex"))  # same name twice
+        tab.remove(base)
+        b1 = herdr.launch_into(tab, _name(PROJECT_B, "codex"), focus=True)
+        b2 = herdr.launch_into(tab, _name(PROJECT_B, "claude"), split="down")
+        outcome, detail = _run(herdr, _result(PROJECT_B, [b1, b2]), PROJECT_B)
+        self._assert_zero_move_failure(herdr, outcome, detail, "duplicate provider")
+
+    def test_a_project_short_one_slot_still_owns_a_verified_column(self):
+        """The disputed half of finding_3 (verdict j#99888 / dispute j#99890).
+
+        A neighbour missing a slot is a slot-axis fact, not a geometry one: its
+        single pane still tiles a full-height column, which ``_column_span``
+        proves from the layout. Failing here would report another project's
+        missing slot as THIS run's column failure.
+        """
+        herdr = PaneTreeHerdr()
+        tab = herdr.new_tab()
+        alone = herdr.seed_pane(tab, _name(PROJECT_A, "codex"))
+        b1 = herdr.launch_into(tab, _name(PROJECT_B, "codex"), focus=True)
+        b2 = herdr.launch_into(tab, _name(PROJECT_B, "claude"), split="down")
+        outcome, detail = _run(herdr, _result(PROJECT_B, [b1, b2]), PROJECT_B)
+        self.assertEqual(outcome, COLUMN_MATCHED, detail)
+        rects = herdr.rects()
+        self.assertEqual(rects[alone][3], rects[b1][3] + rects[b2][3])
+        self.assertEqual([c for c in herdr.calls if c[:2] == ["pane", "move"]], [])
 
 
 if __name__ == "__main__":  # pragma: no cover

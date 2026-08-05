@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
@@ -34,6 +36,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     coordinator_panes_in,
     group_by_pair,
     plan_project_columns,
+    resolve_project_groups,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E402,E501
     encode_assigned_name,
@@ -234,6 +237,78 @@ class ColumnPlanTest(unittest.TestCase):
         )
         self.assertIsNone(plan)
         self.assertIn("no decodable pair identity", refusal)
+
+
+class ProjectGroupAuthorityTest(unittest.TestCase):
+    """Review j#99885 finding_2 / finding_3 — what may become a project pair.
+
+    ``resolve_project_groups`` is the only producer a plan may consume; these pin
+    the pure half of its contract (the durable lane-kind join is exercised against
+    a real store in the #14996 regression).
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = Path(self._tmp.name)
+
+    def _rows(self, *entries):
+        return [
+            {"name": encode_assigned_name(ws, role, lane), "pane_id": locator,
+             "agent_status": "idle"}
+            for ws, role, lane, locator in entries
+        ]
+
+    def test_default_lane_groups_need_no_durable_store_read(self):
+        rows = self._rows(
+            (A, "codex", "", "w1:p2"), (A, "claude", "", "w1:p3"),
+            (B, "codex", "", "w1:p4"), (B, "claude", "", "w1:p5"),
+        )
+        groups, refusal = resolve_project_groups(rows, "w1", home=self.home)
+        self.assertEqual(refusal, "")
+        self.assertEqual(sorted(groups), [(A, "default"), (B, "default")])
+
+    def test_an_unrecognised_provider_token_is_refused(self):
+        rows = self._rows((A, "codex", "", "w1:p2"), (A, "nethack", "", "w1:p3"))
+        groups, refusal = resolve_project_groups(rows, "w1", home=self.home)
+        self.assertEqual(groups, {})
+        self.assertIn("unrecognised provider", refusal)
+
+    def test_more_panes_than_a_pair_can_hold_is_refused(self):
+        rows = self._rows(
+            (A, "codex", "", "w1:p2"), (A, "claude", "", "w1:p3"),
+        ) + [{"name": encode_assigned_name(A, "codex"), "pane_id": "w1:p9",
+              "agent_status": "idle"}]
+        groups, refusal = resolve_project_groups(rows, "w1", home=self.home)
+        self.assertEqual(groups, {})
+        self.assertIn("duplicate provider", refusal)
+
+    def test_a_group_of_one_live_provider_is_accepted(self):
+        """The disputed half of finding_3 (verdict j#99888 / dispute j#99890)."""
+        rows = self._rows((A, "codex", "", "w1:p2"))
+        groups, refusal = resolve_project_groups(rows, "w1", home=self.home)
+        self.assertEqual(refusal, "")
+        self.assertEqual(sorted(groups), [(A, "default")])
+
+    def test_a_named_lane_with_no_durable_kind_refuses_the_whole_set(self):
+        rows = self._rows(
+            (A, "codex", "", "w1:p2"), (A, "claude", "", "w1:p3"),
+            (A, "codex", "impl-1", "w1:p4"),
+        )
+        groups, refusal = resolve_project_groups(rows, "w1", home=self.home)
+        self.assertEqual(groups, {})
+        self.assertIn("no durable lane-kind", refusal)
+
+    def test_an_unreadable_lane_kind_authority_refuses_rather_than_defaults(self):
+        rows = self._rows((A, "codex", "impl-1", "w1:p2"))
+        with patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_project_column_reflow.load_lane_lifecycle_readonly",
+            return_value=None,
+        ):
+            groups, refusal = resolve_project_groups(rows, "w1", home=self.home)
+        self.assertEqual(groups, {})
+        self.assertIn("unreadable", refusal)
 
 
 class ColumnVocabularyTest(unittest.TestCase):

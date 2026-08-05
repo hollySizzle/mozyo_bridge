@@ -215,6 +215,10 @@ class PaneTreeHerdr:
         #: Rename a pane's assigned name at this point in the sequence, to prove the
         #: closing identity check is real rather than decorative.
         self.rename_after_moves: dict = {}
+        #: Panes whose ``agent list`` row is shell residue — the durable identity is
+        #: there, the managed agent is not. Rendered as a present-but-blank ``agent``
+        #: field, which is the positive stale signal ``classify_named_slot`` reads.
+        self.stale_panes: set = set()
         self._moves = 0
         self._move_attempts = 0
 
@@ -250,6 +254,32 @@ class PaneTreeHerdr:
         if focus:
             tab.focused = pane_id
         return pane_id
+
+    def seed_columns(self, tab: Tab, columns: "list") -> list:
+        """Build a tab that is ALREADY project-columnar — one column per entry.
+
+        ``columns`` is a list of assigned-name lists, each becoming a ``down``-split
+        column, the columns nested left-to-right under ``right`` splits. This is
+        the state a tab is in after an earlier append reflowed, so a test can start
+        from it instead of replaying every prior launch.
+        """
+        built: list = []
+        nodes: list = []
+        for names in columns:
+            panes = [self._mint_pane() for _ in names]
+            for pane_id, name in zip(panes, names):
+                self.agents[pane_id] = name
+            node = Leaf(panes[-1])
+            for pane_id in reversed(panes[:-1]):
+                node = Split("down", 0.5, Leaf(pane_id), node)
+            nodes.append(node)
+            built.append(panes)
+        root = nodes[-1]
+        for node in reversed(nodes[:-1]):
+            root = Split("right", 0.5, node, root)
+        tab.root = root
+        tab.focused = built[0][0]
+        return built
 
     def launch_into(
         self, tab: Tab, assigned_name: str, *, split: str = "", focus: bool = False
@@ -297,14 +327,15 @@ class PaneTreeHerdr:
         rows = []
         for pane_id, name in self.agents.items():
             tab = self.tab_of(pane_id)
-            rows.append(
-                {
-                    "name": name,
-                    "pane_id": pane_id,
-                    "agent_status": "idle",
-                    "tab_id": tab.tab_id if tab else "",
-                }
-            )
+            row = {
+                "name": name,
+                "pane_id": pane_id,
+                "agent_status": "idle",
+                "tab_id": tab.tab_id if tab else "",
+            }
+            if pane_id in self.stale_panes:
+                row["agent"] = ""
+            rows.append(row)
         return rows
 
     def _pane_layout(self, argv, tail):

@@ -1159,14 +1159,33 @@ relayout を承認し、**推測ではなく実測で検証すること**を条�
 - 対象は exact label `project-coordinators` workspace のみ。かつ **fresh な full pair を、他 project の
   coordinator pane が既にいる tab へ append した run** だけ。adopt-only / 単一 provider heal / dry-run /
   最初の project は `not_applicable` で **layout も読まない**。
-- 動かす pane は identity decode 済み coordinator pane に限る。foreign shell や implementation sublane slot
-  は掴めない。**pane を close / restart / rename しない**ので assigned name / route authority / cwd は不変。
+- **decode できることは coordinator である証明ではない**。assigned name の `role` は provider token
+  (`codex` / `claude`) であって workflow role ではないため、decode だけでは project coordinator と、この
+  workspace へ誤配置・残留した implementation slot を区別できない (#14996 R2 review j#99885 finding_2 で、
+  implementation lane が anchor に選ばれ pane が bounce される再現を確認)。plan へ渡す集合は 3 つの
+  authority に join し、いずれかが解決できなければ **pane を 1 枚も動かさず typed refusal** とする。
+  1. **liveness**: `classify_named_slot` が `SLOT_STALE` を返す row を除外する。
+  2. **default lane 不変条件**: 本 mode では default lane は coordinator である (`is_role_grouped_project_coordinator`
+     が現 run に課すのと同じ規則)。default lane しか居ない通常状態では durable store を開かない。
+  3. **durable `lane_kind`**: foreign な named lane は lifecycle store の
+     `(repo_workspace_id, lane_id)` から解決し、`delegated_coordinator` だけを coordinator role group に
+     入れる。`implementation` / kind 無し / store 読取不可はいずれも refusal。**自 run の lane は (3) の
+     対象外**で、その kind は launch 前に caller が既に証明している (managed `delegated_coordinator` の
+     durable row は launch とは別 edge で書かれるため、ここで再導出すると live path を落とす)。
+- group の provider 形状は「canonical provider の重複なし部分集合 / 非空 / 2 以下」を要求する。重複 provider は
+  identity conflict、未知 provider・過大 cardinality は未知の形状であり、いずれも move 前に refusal。live pane
+  1 枚の group は、`_column_span` が全高 column を証明できる限り正当な column として扱う (slot 欠落は
+  slot / health 軸の所有であり、他 project の欠落を本 run の column 失敗として報告しない)。
+- **pane を close / restart / rename しない**ので assigned name / route authority / cwd は不変。
 - 全 placement が `--target-pane` を明示するため、**起動前 focus に依存しない**。
 - 移動する既存 pane は「新 column が split する column の下段 1 枚」だけで、元の相手 pane の直下へ戻す。
   他 column は触らない。
 - 失敗は typed fail-closed。退避済み pane は best-effort で戻し、戻せなかった pane を detail に明示する。
   identity 集合が前後で変化した場合、または最終 layout が columnar でない場合は成功と主張しない。
-  `SessionStartResult.ok` は `column_ok` を読むので、失敗は exit-code success にならない。
+  `SessionStartResult.ok` は `column_ok` を読むので、失敗は exit-code success にならない。**column axis は
+  `session-start` の text / JSON 双方に出す**。exit に効く軸が text に無いと、operator は失敗原因を
+  role health か split ratio と誤読し、detail が持つ唯一の回復対象 (shared tab の外に残った pane) に
+  到達できない (j#99885 finding_1)。
 - 2 組なら均等 2×2 になる。3 組目以降も各 project は独立した全高 column を持つが、**列幅は均等ではない**
   (最右 column を二分するため 1/2 : 1/4 : 1/4 になる)。列順・列幅の厳密指定は引き続き live-relayout
   runbook の領分で、本 mode は append 時の column 化だけを保証する。
