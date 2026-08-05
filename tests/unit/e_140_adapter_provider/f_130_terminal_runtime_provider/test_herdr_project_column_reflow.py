@@ -221,7 +221,7 @@ class InventoryRowClassificationTest(unittest.TestCase):
                 self.assertEqual(verdict.disposition, ROW_REFUSED)
                 self.assertIn("non-text field", verdict.refusal)
 
-    def test_every_text_field_this_module_reads_is_shape_checked(self):
+    def test_every_text_field_an_in_scope_row_offers_is_shape_checked(self):
         """The defect belongs to ``_norm``, so it belongs to all of its inputs.
 
         Closing it only on the two fields a review named would leave the next one
@@ -237,6 +237,32 @@ class InventoryRowClassificationTest(unittest.TestCase):
                 verdict = classify_inventory_row(row, "w1")
                 self.assertEqual(verdict.disposition, ROW_REFUSED)
                 self.assertIn("non-text field", verdict.refusal)
+
+    def test_a_foreign_row_is_not_refused_over_a_field_nobody_reads(self):
+        """The control for the check above (review j#99978 finding_1).
+
+        ``name`` / ``agent`` / the cwd pair are read only once a row is ours. A row
+        that has already proved it lives elsewhere is out of scope, and refusing
+        the whole read over the shape of a field nobody was going to read narrows
+        that boundary rather than widening the guard.
+        """
+        for key in ("name", "agent", "foreground_cwd", "cwd"):
+            with self.subTest(field=key):
+                row = {"workspace_id": "w9", "pane_id": "w9:p1", "name": "n"}
+                row[key] = 17
+                self.assertEqual(
+                    classify_inventory_row(row, "w1").disposition, ROW_OUT_OF_SCOPE
+                )
+
+    def test_a_foreign_row_whose_LOCATION_shape_is_unreadable_still_refuses(self):
+        """Location is what scope is decided on, so its shape is asked first."""
+        for key in ("workspace_id", "pane_id"):
+            with self.subTest(field=key):
+                row = {"workspace_id": "w9", "pane_id": "w9:p1", "name": "n"}
+                row[key] = 17
+                self.assertEqual(
+                    classify_inventory_row(row, "w1").disposition, ROW_REFUSED
+                )
 
     def test_a_row_naming_two_different_panes_refuses(self):
         """The canonical reader takes the first key that answers; disagreement is

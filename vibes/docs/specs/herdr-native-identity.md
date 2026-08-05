@@ -1217,6 +1217,12 @@ relayout を承認し、**推測ではなく実測で検証すること**を条�
   `workspace_id` 4 種がすべて out-of-scope として素通りし 6 枚 move する再現を確認した。
   **この欠陥は `_norm` の性質であって特定 field の性質ではない**ので、shape 検査は本 module が text として
   読む全 field（`workspace_id` / `name` / `agent` / `foreground_cwd` / `cwd` / locator key 3 種）に課す。
+  ただし **課す位置は「その field を evidence として使う直前」** であり、一律に scope 判定前ではない。
+  location を決めるのは `workspace_id` と locator だけなので、それらは scope 判定の前に検査する。
+  `name` / `agent` / cwd 2 種は in-scope 判定の**後**に検査する。前倒しすると、**別 workspace 所属を
+  既に証明した row の無関係な shape が target workspace の read を壊す**（j#99978 finding_1 で実測した
+  availability regression。out-of-scope は解決済みの境界であり、そこへ in-scope 用の evidence 要件を
+  課す根拠はない）。
   加えて、複数の locator key が**互いに異なる pane を述べている row** は refusal とする（canonical reader は
   最初に答えた key を採るので、放置すると「どちらを読むか」で結果が変わる）。
   回帰は個別事例でなく **declared × locator の入力空間の格子**で持ち（各軸は `absent` / `target` / `foreign` /

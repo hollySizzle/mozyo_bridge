@@ -313,18 +313,26 @@ _LOCATOR_KEYS: "tuple[str, ...]" = (
     AGENT_KEY_LOCATOR_ALIAS_2,
 )
 
-#: The row keys this module reads as text. EVERY one of them is shape-checked, not
-#: just the two a review happened to name: the defect is a property of ``_norm``
-#: (which stringifies anything non-``None``), so it belongs to the whole set of
-#: fields that pass through it, and closing it field-by-field would leave the next
-#: one open.
-_TEXT_FIELDS: "tuple[str, ...]" = (
-    AGENT_KEY_WORKSPACE,
+#: The text fields that decide WHERE a row lives. Shape-checked before scope,
+#: because scope is what they answer.
+_LOCATION_TEXT_FIELDS: "tuple[str, ...]" = (AGENT_KEY_WORKSPACE, *_LOCATOR_KEYS)
+
+#: The text fields this module reads only AFTER a row is in scope, to turn it into
+#: pane evidence. Shape-checked then, and not before: a row that has already proved
+#: it lives in another workspace is out of scope, and refusing the whole read over
+#: the shape of a field nobody was going to read narrows that boundary instead of
+#: widening the guard (review j#99978 finding_1).
+#:
+#: Both tuples exist because the defect they answer — ``_norm`` stringifying
+#: anything non-``None``, so a list becomes the workspace id ``"[]"`` — belongs to
+#: every field that passes through it. The generalisation is over WHICH fields are
+#: checked; it says nothing about WHEN, and applying it to both at once broke the
+#: out-of-scope boundary.
+_EVIDENCE_TEXT_FIELDS: "tuple[str, ...]" = (
     AGENT_KEY_NAME,
     _DETECTED_AGENT_KEY,
     "foreground_cwd",
     "cwd",
-    *_LOCATOR_KEYS,
 )
 
 
@@ -370,9 +378,12 @@ def classify_inventory_row(row: object, target_workspace: str) -> RowVerdict:
     its locator. The decision is taken over the FULL product of what those two can
     say — including what SHAPE they say it in — in this order:
 
-    0. **a field is present but is not text** -> refused. ``_norm`` turns anything
-       non-``None`` into a string, so a list, dict, int or bool would otherwise be
-       promoted into a perfectly good workspace id (:func:`_text_field_refusal`).
+    0. **a LOCATION field is present but is not text** -> refused. ``_norm`` turns
+       anything non-``None`` into a string, so a list, dict, int or bool would
+       otherwise be promoted into a perfectly good workspace id
+       (:func:`_text_field_refusal`). Only the fields that answer *where* are asked
+       here; the evidence fields are asked at step 5, once the row is known to be
+       ours to read at all.
     1. **both say something, and they disagree** -> refused. Self-consistency is
        asked before "is it ours?", because such a row has not established that it
        lives anywhere — including elsewhere (review j#99960 finding_1).
@@ -383,7 +394,9 @@ def classify_inventory_row(row: object, target_workspace: str) -> RowVerdict:
        refused; **a locator :func:`_workspace_prefix` cannot parse** -> refused
        (``""`` is that function's contract for a malformed handle, precisely so the
        caller fails closed rather than guessing).
-    4. otherwise **in scope**.
+    4. **two locator keys naming different panes** -> refused.
+    5. now that the row IS ours, its EVIDENCE fields must be text too; otherwise
+       **in scope**.
 
     ``tests/unit/.../test_herdr_project_column_reflow`` enumerates the declared x
     locator grid and asserts the table covers every cell — a table is a claim, and
@@ -394,7 +407,7 @@ def classify_inventory_row(row: object, target_workspace: str) -> RowVerdict:
             ROW_REFUSED,
             refusal="the herdr inventory contains a row this module cannot read",
         )
-    for key in _TEXT_FIELDS:
+    for key in _LOCATION_TEXT_FIELDS:
         shape = _text_field_refusal(row, key)
         if shape:
             return RowVerdict(ROW_REFUSED, refusal=shape)
@@ -456,6 +469,10 @@ def classify_inventory_row(row: object, target_workspace: str) -> RowVerdict:
                 f"unparseable pane handle {locator!r}; refusing to address it"
             ),
         )
+    for key in _EVIDENCE_TEXT_FIELDS:
+        shape = _text_field_refusal(row, key)
+        if shape:
+            return RowVerdict(ROW_REFUSED, refusal=shape)
     return RowVerdict(ROW_IN_SCOPE, locator=locator)
 
 

@@ -757,6 +757,15 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
              {"pane_id": "w9:p1", "workspace_id": "w9"}),
             ("declared foreign, no locator", {"pane_id": "", "workspace_id": "w9"}),
             ("locator foreign, no declared field", {"pane_id": "w9:p1"}),
+            # Review j#99978 finding_1: a row that has proved it lives elsewhere is
+            # out of scope, and the shape of a field only an in-scope row would be
+            # read for must not take the whole workspace down with it.
+            ("foreign row with a non-text name",
+             {"pane_id": "w9:p1", "workspace_id": "w9", "name": 17}),
+            ("foreign row with a non-text detected agent",
+             {"pane_id": "w9:p1", "workspace_id": "w9", "agent": {}}),
+            ("foreign row with a non-text cwd",
+             {"pane_id": "w9:p1", "workspace_id": "w9", "foreground_cwd": []}),
         ):
             with self.subTest(row=label):
                 env = _Env(self, PROJECT_A, PROJECT_B)
