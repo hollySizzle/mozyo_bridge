@@ -275,6 +275,44 @@ class InventoryRowClassificationTest(unittest.TestCase):
         self.assertEqual(verdict.disposition, ROW_REFUSED)
         self.assertIn("different pane locators", verdict.refusal)
 
+    def test_a_foreign_row_naming_two_panes_refuses_too(self):
+        """Location contradictions refuse wherever they are, unlike evidence ones.
+
+        The alias check sits with the LOCATION fields on purpose: a row that cannot
+        agree with itself about which pane it is has not proved it lives elsewhere
+        either, so it cannot be filed as out-of-scope.
+        """
+        verdict = classify_inventory_row(
+            {"name": encode_assigned_name(A, "codex"), "workspace_id": "w9",
+             "pane_id": "w9:p1", "pane": "w8:p1"},
+            "w1",
+        )
+        self.assertEqual(verdict.disposition, ROW_REFUSED)
+        self.assertIn("different pane locators", verdict.refusal)
+
+    def test_an_in_scope_row_may_omit_the_evidence_fields_entirely(self):
+        """Absent is not malformed: the later conjuncts judge what is missing."""
+        self.assertEqual(
+            classify_inventory_row(
+                {"name": encode_assigned_name(A, "codex"), "pane_id": "w1:p2",
+                 "workspace_id": "w1"},
+                "w1",
+            ).disposition,
+            ROW_IN_SCOPE,
+        )
+
+    def test_both_cwd_spellings_are_shape_checked(self):
+        for row in (
+            {"name": encode_assigned_name(A, "codex"), "pane_id": "w1:p2",
+             "workspace_id": "w1", "foreground_cwd": 17, "cwd": "/x"},
+            {"name": encode_assigned_name(A, "codex"), "pane_id": "w1:p2",
+             "workspace_id": "w1", "cwd": 17},
+        ):
+            with self.subTest(row=sorted(row)):
+                self.assertEqual(
+                    classify_inventory_row(row, "w1").disposition, ROW_REFUSED
+                )
+
     def test_locator_aliases_that_agree_are_fine(self):
         for row in (
             {"name": encode_assigned_name(A, "codex"), "pane": "w1:p2"},
