@@ -4,6 +4,27 @@
 
 記載は Git の release commit と利用可能な tag を元にしています。一部の過去バージョンは release commit はありますが、現在の repository には対応する tag がありません。
 
+## v0.16.0 - 2026-08-05
+
+`v0.15.1` からの後方互換な minor release です。トップコーディネーターを専用画面に保ちつつ、複数projectのproject coordinatorを1つの共有画面へ集約できる配置modeを追加しました。実装レーンは従来どおりproject別の画面に残るため、全レーンを1画面へ混在させずに、トップ層とproject管理層をそれぞれ俯瞰できます。
+
+### role別のcoordinator共有画面
+
+- operator-homeの `coordinator-placement.yaml` に `mode: role_grouped_space` とstableな `top_workspace_id` を指定できるようにしました。指定したtop workspaceのdefault coordinatorだけをtop専用画面に置き、それ以外のproject coordinatorとdelegated coordinatorを `project-coordinators` 共有画面へ配置します。
+- implementation laneはproject別のsublane hostとlane tabを維持します。role routing、review authority、durable stateの正本は変更しません。
+- top IDの欠落、workspace registryとの不一致、lane kindの欠落・矛盾、共有画面のlabel衝突など、配置を一意に証明できない状態は起動前に拒否します。誤った画面へ推測配置しません。
+- 設定はfresh launch / adopt時にだけ適用され、既存のlive paneを自動移動・削除しません。未設定時は従来の `per_project_space` が既定です。元へ戻す場合も `per_project_space` へ戻したうえでfresh起動します。
+
+### TestPyPI固定版確認の安定化
+
+- TestPyPI install helperが、projectのcanonical Simple API URLをcache回避付きでpollし、対象versionのwheel / sdist filenameを完全一致で確認するようにしました。version別の非canonical URLや古いcacheによって、公開済みartifactを見落とす事象を防ぎます。
+
+### リリース状況メモ
+
+- **version mirror**: standalone commitで `pyproject.toml` とruntime `__version__` を `0.16.0` に揃えます。
+- **互換性**: user-facing CLIの意図的な削除はありません。`role_grouped_space` はopt-inで、未設定の配置挙動は変わりません。
+- **公開gate**: 最終candidateのPython 3.10–3.13 matrix、release tree / scaffold / artifact / drift検査、TestPyPI固定版fresh-installを通した後、annotated tagとGitHub ReleaseからOIDC Trusted Publishingを実行します。
+
 ## v0.15.1 - 2026-08-05
 
 `v0.14.0` 以降の delegated coordinator と managed lane lifecycle の運用安定化 release です。人間または外部の top coordinator が単一の高レベル入口から project coordinator へ委譲し、実装 worker、durable callback、統合、drain までを扱うための実行経路を拡充しました。同時に、再起動・更新・世代交代・失敗後の cleanup で古い process や worktree を権威として誤採用しないよう、状態証明と fail-closed 判定を強化しています。`0.15.0` は TestPyPI 検証までで production PyPI には公開せず、最初の production workflow で見つかった release gate の問題を修正した `0.15.1` を最初の production 候補としています。
