@@ -285,6 +285,98 @@ def _detected_provider(row: Mapping[str, object]) -> str:
     return detected if detected in LANE_PLACEMENT_PROVIDERS else ""
 
 
+#: The row belongs to this workspace and may be decoded into a pane.
+ROW_IN_SCOPE = "in_scope"
+#: The row resolves to a DIFFERENT workspace. Out of scope is a boundary, not an
+#: exclusion: nothing about it is unresolved, it simply is not ours.
+ROW_OUT_OF_SCOPE = "out_of_scope"
+#: The row's location cannot be established, or it claims this workspace in a way
+#: this module cannot address. Unresolved evidence refuses.
+ROW_REFUSED = "refused"
+
+#: The closed disposition vocabulary. Every inventory row lands in exactly one —
+#: which is the property two reviews found missing. j#99938 finding_1 collapsed
+#: "claims us but unaddressable" into out-of-scope; j#99950 finding_1 then collapsed
+#: "resolves nowhere" into it too. Both had been written as the two-valued question
+#: "is this row ours?", and both cost six pane moves.
+ROW_DISPOSITIONS: "tuple[str, ...]" = (ROW_IN_SCOPE, ROW_OUT_OF_SCOPE, ROW_REFUSED)
+
+
+@dataclass(frozen=True)
+class RowVerdict:
+    """Where one inventory row stands, on the closed disposition vocabulary."""
+
+    disposition: str
+    locator: str = ""
+    refusal: str = ""
+
+
+def classify_inventory_row(row: object, target_workspace: str) -> RowVerdict:
+    """Place one ``agent list`` row on :data:`ROW_DISPOSITIONS` (pure, total).
+
+    A row states its workspace twice — explicitly in ``workspace_id``, and inside
+    its locator — and the two together admit exactly three outcomes. Enumerating
+    them here, rather than asking "is this row ours?" at the loop head, is what
+    makes the classification exhaustive over the input space instead of over the
+    inputs someone thought of:
+
+    - **out of scope** — either field resolves to a different workspace. Nothing is
+      unresolved about such a row; it just is not ours.
+    - **refused** — the row is not a mapping at all; or NEITHER field resolves
+      anywhere (its location cannot be established); or it claims this workspace
+      while carrying no locator, or one :func:`_workspace_prefix` cannot parse
+      (``""`` is that function's contract for a malformed handle, precisely so the
+      caller fails closed rather than guessing); or its two statements disagree.
+    - **in scope** — it claims this workspace with an addressable, self-consistent
+      locator.
+    """
+    if not isinstance(row, Mapping):
+        return RowVerdict(
+            ROW_REFUSED,
+            refusal="the herdr inventory contains a row this module cannot read",
+        )
+    locator = _agent_locator(row)
+    prefix = _workspace_prefix(locator)
+    declared = _norm(row.get(AGENT_KEY_WORKSPACE))
+    if declared != target_workspace and prefix != target_workspace:
+        if declared or prefix:
+            return RowVerdict(ROW_OUT_OF_SCOPE)
+        return RowVerdict(
+            ROW_REFUSED,
+            refusal=(
+                "the herdr inventory holds a row with neither a workspace nor a "
+                "resolvable pane locator; refusing to reshape a workspace whose "
+                "occupants this plan cannot enumerate"
+            ),
+        )
+    if not locator:
+        return RowVerdict(
+            ROW_REFUSED,
+            refusal=(
+                f"a row claiming workspace {target_workspace!r} carries no pane "
+                "locator; refusing to reshape a workspace holding a pane this plan "
+                "cannot address"
+            ),
+        )
+    if not prefix:
+        return RowVerdict(
+            ROW_REFUSED,
+            refusal=(
+                f"a row claiming workspace {target_workspace!r} carries the "
+                f"unparseable pane handle {locator!r}; refusing to address it"
+            ),
+        )
+    if declared and declared != prefix:
+        return RowVerdict(
+            ROW_REFUSED,
+            refusal=(
+                f"pane {locator!r} reports workspace {declared!r} while its locator "
+                f"says {prefix!r}; refusing to reason about a contradictory row"
+            ),
+        )
+    return RowVerdict(ROW_IN_SCOPE, locator=locator)
+
+
 def coordinator_panes_in(
     rows: Sequence[Mapping[str, object]], target_workspace: str
 ) -> "tuple[tuple[CoordinatorPane, ...], str]":
@@ -304,31 +396,12 @@ def coordinator_panes_in(
     panes: list = []
     seen: set = set()
     for row in rows:
-        if not isinstance(row, Mapping):
-            return (), "the herdr inventory contains a row this module cannot read"
-        locator = _agent_locator(row)
-        prefix = _workspace_prefix(locator)
-        # SCOPE is itself a conjunct, not a preamble to one. A row states its
-        # workspace TWICE — explicitly, and inside its locator — and a row that
-        # claims this workspace without a usable locator used to fall out of scope
-        # entirely, so an unexplained pane rode along until the closing tiling
-        # check failed six moves later (review j#99938 finding_1).
-        declared = _norm(row.get(AGENT_KEY_WORKSPACE))
-        if declared and declared != target_workspace and prefix != target_workspace:
+        verdict = classify_inventory_row(row, target_workspace)
+        if verdict.disposition == ROW_REFUSED:
+            return (), verdict.refusal
+        if verdict.disposition == ROW_OUT_OF_SCOPE:
             continue
-        if not declared and prefix != target_workspace:
-            continue
-        if not locator:
-            return (), (
-                f"a row claiming workspace {target_workspace!r} carries no pane "
-                "locator; refusing to reshape a workspace holding a pane this plan "
-                "cannot address"
-            )
-        if declared and prefix and declared != prefix:
-            return (), (
-                f"pane {locator!r} reports workspace {declared!r} while its locator "
-                f"says {prefix!r}; refusing to reason about a contradictory row"
-            )
+        locator = verdict.locator
         if locator in seen:
             return (), (
                 f"pane {locator!r} appears twice in the herdr inventory; refusing to "
@@ -406,7 +479,9 @@ class ProjectColumnAuthority:
         if refusal:
             return ProjectGroupDecision.refused(refusal)
         groups = group_by_pair(panes)
-        own_index = {slot.locator: slot for slot in own_slots if slot.locator}
+        own_index, refusal = self._own_index(own_slots)
+        if refusal:
+            return ProjectGroupDecision.refused(refusal)
 
         for key, members in sorted(groups.items()):
             refusal = self._provider_shape_refusal(key, members) or self._top_refusal(
@@ -491,6 +566,34 @@ class ProjectColumnAuthority:
                 "and this plan will not reshape it"
             )
         return ""
+
+    def _own_index(
+        self, own_slots: Sequence[OwnSlot]
+    ) -> "tuple[dict[str, OwnSlot], str]":
+        """``{locator: slot}`` for this run's launched slots — or a refusal.
+
+        Folding the slots into a mapping is itself a filter: an earlier cut let a
+        duplicate locator overwrite its predecessor, so a slot whose identity
+        contradicted the inventory simply vanished and the survivor alone carried
+        the exact join (review j#99950 finding_2). Two launches reporting one pane
+        is a backend contradiction, not a set to deduplicate, and a launched slot
+        with no locator cannot be joined at all.
+        """
+        index: dict = {}
+        for slot in own_slots:
+            if not slot.locator:
+                return {}, (
+                    f"this run reports a launched {slot.provider or 'slot'!r} with no "
+                    "pane locator; refusing to reason about a slot it cannot join"
+                )
+            if slot.locator in index:
+                return {}, (
+                    f"this run reports two launched slots on pane {slot.locator!r}; "
+                    "refusing to reason about a run whose own slots contradict "
+                    "each other"
+                )
+            index[slot.locator] = slot
+        return index, ""
 
     def _own_key(
         self,
@@ -649,6 +752,10 @@ def project_column_authority(home: Path) -> ProjectColumnAuthority:
 
 
 __all__ = (
+    "ROW_DISPOSITIONS",
+    "ROW_IN_SCOPE",
+    "ROW_OUT_OF_SCOPE",
+    "ROW_REFUSED",
     "AttestationPort",
     "CoordinatorPane",
     "IdentityWorkspaceResolver",
@@ -656,10 +763,12 @@ __all__ = (
     "LaneFactsPort",
     "OwnSlot",
     "ProjectColumnAuthority",
+    "RowVerdict",
     "ProjectGroupDecision",
     "StoreAttestationPort",
     "StoreLaneFactsPort",
     "WorkspaceResolverPort",
+    "classify_inventory_row",
     "coordinator_panes_in",
     "group_by_pair",
     "project_column_authority",

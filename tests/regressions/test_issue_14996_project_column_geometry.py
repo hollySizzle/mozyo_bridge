@@ -702,6 +702,131 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
         outcome, detail = env.run(env.result(PROJECT_B, list(launched)))
         self._assert_zero_move_failure(env, outcome, detail, "no decodable mozyo identity")
 
+    def test_every_malformed_inventory_row_refuses_before_any_move(self):
+        """Table-driven: the whole malformed-row space costs zero pane moves.
+
+        Reviews j#99938 and j#99950 each found one more branch of the same
+        two-valued scope question, so the point is no longer "these two inputs are
+        fixed" but "the space is enumerated and every member of it refuses before
+        a plan exists" (coordinator convergence note j#99953).
+        """
+        cases = (
+            ("no workspace, no locator", {"pane_id": "", "workspace_id": ""}),
+            ("no workspace, unparseable locator", {"pane_id": "nocolon"}),
+            ("claims this workspace, no locator",
+             {"pane_id": "", "workspace_id": "w1"}),
+            ("claims this workspace, unparseable locator",
+             {"pane_id": "nocolon", "workspace_id": "w1"}),
+            ("workspace contradicts locator",
+             {"pane_id": "w9:p1", "workspace_id": "w1"}),
+            ("undecodable name on an addressable pane",
+             {"pane_id": "w1:p90", "workspace_id": "w1"}),
+        )
+        for label, extra in cases:
+            with self.subTest(row=label):
+                env = _Env(self, PROJECT_A, PROJECT_B)
+                tab = env.herdr.new_tab()
+                env.seed_columns(tab, (PROJECT_A, ""))
+                launched = env.append_pair(tab, PROJECT_B)
+                row = {"name": "not-a-mzb1-name", "agent": "codex",
+                       "agent_status": "idle"}
+                row.update(extra)
+                env.herdr.extra_rows.append(row)
+                outcome, detail = env.run(env.result(PROJECT_B, list(launched)))
+                self.assertEqual(outcome, COLUMN_FAILED, detail)
+                self.assertEqual(env.moves(), [], f"{label} moved a pane")
+
+    def test_a_foreign_row_that_resolves_elsewhere_stays_out_of_scope(self):
+        """The control for the table above: out of scope is not a refusal."""
+        for label, extra in (
+            ("declared and locator both foreign",
+             {"pane_id": "w9:p1", "workspace_id": "w9"}),
+            ("declared foreign, no locator", {"pane_id": "", "workspace_id": "w9"}),
+            ("locator foreign, no declared field", {"pane_id": "w9:p1"}),
+        ):
+            with self.subTest(row=label):
+                env = _Env(self, PROJECT_A, PROJECT_B)
+                tab = env.herdr.new_tab()
+                env.seed_columns(tab, (PROJECT_A, ""))
+                launched = env.append_pair(tab, PROJECT_B)
+                row = {"name": "not-a-mzb1-name", "agent": "codex",
+                       "agent_status": "idle"}
+                row.update(extra)
+                env.herdr.extra_rows.append(row)
+                outcome, detail = env.run(env.result(PROJECT_B, list(launched)))
+                self.assertEqual(outcome, COLUMN_APPLIED, detail)
+
+    def test_two_launched_slots_on_one_pane_refuse_before_any_move(self):
+        """Review j#99950 finding_2 — folding them into a dict dropped one.
+
+        A duplicate locator meant the contradicting slot never reached the exact
+        join, and the survivor alone carried it. Two launches reporting one pane is
+        a backend contradiction, not a set to deduplicate.
+        """
+        env = _Env(self, PROJECT_A, PROJECT_B)
+        tab = env.herdr.new_tab()
+        (a_pair, _b) = env.seed_columns(tab, (PROJECT_A, ""), (PROJECT_B, ""))
+        result = SessionStartResult(
+            workspace_id=env.ids[PROJECT_A], lane_id=DEFAULT_LANE
+        )
+        result.herdr_workspace_id = env.herdr.workspace_id
+        for provider in ("codex", "claude"):
+            result.slots.append(
+                SlotResult(
+                    provider=provider,
+                    assigned_name=env.name(PROJECT_A, provider),
+                    outcome=SLOT_LAUNCHED,
+                    locator=a_pair[1],  # both slots point at the SAME pane
+                )
+            )
+        outcome, detail = env.run(result)
+        self._assert_zero_move_failure(
+            env, outcome, detail, "two launched slots on pane"
+        )
+
+    def test_a_launched_slot_without_a_locator_refuses(self):
+        """A launch this run reports but cannot address is a contradiction.
+
+        Dropping it on the way into the authority would be the same silent
+        exclusion the authority refuses on inside the workspace (coordinator note
+        j#99955), so every ``launched`` slot is handed over and a blank locator
+        refuses with zero moves.
+        """
+        env = _Env(self, PROJECT_A, PROJECT_B)
+        tab = env.herdr.new_tab()
+        env.seed_columns(tab, (PROJECT_A, ""))
+        launched = env.append_pair(tab, PROJECT_B)
+        result = env.result(PROJECT_B, list(launched))
+        result.slots.append(
+            SlotResult(
+                provider="codex",
+                assigned_name=env.name(PROJECT_B, "codex"),
+                outcome=SLOT_LAUNCHED,
+                locator="",
+            )
+        )
+        outcome, detail = env.run(result)
+        self._assert_zero_move_failure(env, outcome, detail, "with no pane locator")
+
+    def test_a_launched_slot_naming_an_identity_it_did_not_launch_refuses(self):
+        """Every launched slot is joined, not just the ones that happen to fit."""
+        env = _Env(self, PROJECT_A, PROJECT_B)
+        tab = env.herdr.new_tab()
+        env.seed_columns(tab, (PROJECT_A, ""))
+        launched = env.append_pair(tab, PROJECT_B)
+        result = env.result(PROJECT_B, list(launched))
+        # The codex slot claims the pane that is actually running claude.
+        result.slots[0] = SlotResult(
+            provider="codex",
+            assigned_name=env.name(PROJECT_B, "codex"),
+            outcome=SLOT_LAUNCHED,
+            locator=launched[1],
+        )
+        outcome, detail = env.run(result)
+        self._assert_zero_move_failure(
+            env, outcome, detail, "two launched slots on pane"
+        )
+
     def test_a_row_claiming_this_workspace_without_a_locator_refuses(self):
         """Review j#99938 finding_1 — scope is a conjunct, not a preamble.
 

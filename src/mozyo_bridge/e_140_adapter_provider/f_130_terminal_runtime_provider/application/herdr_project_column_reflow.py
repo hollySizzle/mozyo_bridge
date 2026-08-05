@@ -508,14 +508,18 @@ def reflow_project_columns(
     target_workspace = _norm(result.herdr_workspace_id)
     if not target_workspace:
         return COLUMN_FAILED, "the run reports no resolved shared herdr workspace"
+    # EVERY launched slot is handed over, including one whose locator is blank.
+    # Filtering those out here would be the same silent exclusion the authority
+    # refuses on inside the workspace: a launch this run reports but cannot address
+    # is a contradiction the run must fail on, not a row to drop on the way in.
     own_slots = tuple(
         OwnSlot(
-            locator=slot.locator,
+            locator=getattr(slot, "locator", ""),
             assigned_name=getattr(slot, "assigned_name", ""),
             provider=getattr(slot, "provider", ""),
         )
         for slot in result.slots
-        if getattr(slot, "outcome", "") == SLOT_LAUNCHED and getattr(slot, "locator", "")
+        if getattr(slot, "outcome", "") == SLOT_LAUNCHED
     )
     own_launched = tuple(slot.locator for slot in own_slots)
     rows = _list_rows(binary, runner, timeout)

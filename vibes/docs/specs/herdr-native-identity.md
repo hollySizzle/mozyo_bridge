@@ -1201,10 +1201,17 @@ relayout を承認し、**推測ではなく実測で検証すること**を条�
   読めない payload は skip せず whole-set refusal** とする。skip すると説明できない pane が集合に残ったまま
   plan が組まれ、6 枚動いた後の tiling 検査でしか落ちない (j#99931 finding_2 で実測)。他 herdr workspace の
   row は scope 外であり、これは除外ではない。
-- **scope 判定そのものが conjunct である**。production の `agent list` row は workspace を locator の中と
-  `workspace_id` field の両方で述べる。locator prefix だけで scope を決めると、`workspace_id` が当該
-  workspace を指しながら locator が空の row が scope から抜け落ち、同じ 6 枚 move を招く (j#99938 finding_1)。
-  両方を読み、target を主張する row の locator 欠損と `workspace_id` / locator の矛盾を refusal にする。
+- **scope 判定そのものが conjunct であり、その値域は 3 値である**。production の `agent list` row は
+  workspace を locator の中と `workspace_id` field の両方で述べる。row は (a) 当該 workspace を主張する、
+  (b) 別 workspace へ解決する、(c) どこにも解決しない、のいずれかであり、これを「自分のものか」の 2 値で
+  書くと (b) と (c) が畳まれる。実際 j#99938 finding_1 は「主張するが addressable でない row」を、
+  j#99950 finding_1 は「どこにも解決しない row」を、それぞれ scope 外へ落として 6 枚 move を招いた。
+  分類は closed vocabulary (`in_scope` / `out_of_scope` / `refused`) の total function とし、target を
+  主張する row の locator 欠損・unparseable locator (`_workspace_prefix` の `""` contract)・
+  `workspace_id` と locator の矛盾はすべて refusal にする。回帰は個別事例でなく**入力空間の表**で持つ。
+- **集合へ畳む操作そのものが filter になりうる**。run の launched slot を locator で dict 化すると、
+  duplicate locator が黙って上書きされ、矛盾する slot が exact join に到達しない (j#99950 finding_2)。
+  畳む前に cardinality を検査し、重複・locator 欠損を refusal にする。
 - **「どの pair が自分か」の source を 2 箇所に置かない**。run 側の主張 (`workspace_id` / `lane_id`) は
   authority への**入力**とし、authority が exact join で解決した own key を typed decision で返す。両者を
   別々に derive すると、inventory 内で自己整合しているだけの slot 群を別 project の pair として申告でき、

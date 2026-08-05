@@ -38,9 +38,14 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (  # noqa: E402
     DISPOSITION_ACTIVE,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_authority import (  # noqa: E402,E501
+    ROW_DISPOSITIONS,
+    ROW_IN_SCOPE,
+    ROW_OUT_OF_SCOPE,
+    ROW_REFUSED,
     LaneFact,
     OwnSlot,
     ProjectColumnAuthority,
+    classify_inventory_row,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_reflow import (  # noqa: E402,E501
     COLUMN_OUTCOMES,
@@ -61,12 +66,14 @@ B = "ws-b"
 C = "ws-c"
 
 
-def _row(workspace: str, role: str, locator: str, lane: str = "") -> dict:
-    return {
+def _row(workspace: str, role: str, locator: str, lane: str = "", **over) -> dict:
+    row = {
         "name": encode_assigned_name(workspace, role, lane),
         "pane_id": locator,
         "agent_status": "idle",
     }
+    row.update(over)
+    return row
 
 
 def _snapshot(tab: Tab):
@@ -83,26 +90,109 @@ def _pane(workspace: str, role: str, locator: str, lane: str = "default"):
     )
 
 
-class CoordinatorPaneReadTest(unittest.TestCase):
-    def test_only_panes_inside_the_target_workspace_are_read(self):
-        """Another workspace's rows are out of SCOPE; they are not exclusions."""
-        rows = [
-            _row(A, "codex", "w1:p2"),
-            _row(A, "claude", "w1:p3"),
-            _row(B, "codex", "w2:p2"),          # another herdr workspace
-            {"name": "not-a-mzb1-name", "pane_id": "w2:p9"},   # ditto, undecodable
-            {"name": encode_assigned_name(B, "claude"), "pane_id": ""},  # no locator
+#: The inventory-row input space, enumerated rather than sampled. Each entry is
+#: ``(label, row, expected disposition)``. Two reviews (j#99938 finding_1, j#99950
+#: finding_1) landed on branches nobody had written a case for, so the table is the
+#: specification: every combination of "declared workspace" x "locator" x "shape"
+#: is named here, and a guard below asserts the table exercises the whole closed
+#: vocabulary.
+_ROW_CLASSIFICATION_TABLE = (
+    ("declared+locator both ours",
+     _row(A, "codex", "w1:p2", workspace_id="w1"), ROW_IN_SCOPE),
+    ("locator ours, no declared field",
+     {"name": encode_assigned_name(A, "codex"), "pane_id": "w1:p2"}, ROW_IN_SCOPE),
+    ("declared ours, locator ours, undecodable name",
+     {"name": "not-mzb1", "pane_id": "w1:p9", "workspace_id": "w1"}, ROW_IN_SCOPE),
+    ("declared+locator both foreign",
+     _row(B, "codex", "w2:p2", workspace_id="w2"), ROW_OUT_OF_SCOPE),
+    ("locator foreign, no declared field",
+     {"name": encode_assigned_name(B, "codex"), "pane_id": "w2:p2"}, ROW_OUT_OF_SCOPE),
+    ("declared foreign, no locator",
+     {"name": encode_assigned_name(B, "codex"), "pane_id": "", "workspace_id": "w2"},
+     ROW_OUT_OF_SCOPE),
+    ("declared foreign, unparseable locator",
+     {"name": encode_assigned_name(B, "codex"), "pane_id": "nocolon",
+      "workspace_id": "w2"}, ROW_OUT_OF_SCOPE),
+    ("no declared field, no locator",
+     {"name": encode_assigned_name(B, "codex"), "pane_id": ""}, ROW_REFUSED),
+    ("no declared field, unparseable locator",
+     {"name": encode_assigned_name(B, "codex"), "pane_id": "nocolon"}, ROW_REFUSED),
+    ("declared ours, no locator",
+     {"name": "not-mzb1", "pane_id": "", "workspace_id": "w1"}, ROW_REFUSED),
+    ("declared ours, unparseable locator",
+     {"name": "not-mzb1", "pane_id": "nocolon", "workspace_id": "w1"}, ROW_REFUSED),
+    ("declared ours, locator foreign",
+     _row(A, "codex", "w9:p1", workspace_id="w1"), ROW_REFUSED),
+    ("not a mapping", ["not", "a", "row"], ROW_REFUSED),
+)
+
+
+class InventoryRowClassificationTest(unittest.TestCase):
+    """Every row lands on exactly one disposition — the table IS the spec.
+
+    Reviews j#99938 and j#99950 both found a branch that had been written as the
+    two-valued question "is this row ours?", which silently folded "claims us but
+    unaddressable" and "resolves nowhere" into out-of-scope. Enumerating the input
+    space is what stops the next such branch from being invisible.
+    """
+
+    def test_every_enumerated_row_lands_on_its_disposition(self):
+        for label, row, expected in _ROW_CLASSIFICATION_TABLE:
+            with self.subTest(row=label):
+                verdict = classify_inventory_row(row, "w1")
+                self.assertEqual(verdict.disposition, expected)
+                self.assertIn(verdict.disposition, ROW_DISPOSITIONS)
+                if expected == ROW_REFUSED:
+                    self.assertTrue(verdict.refusal, "a refusal must say why")
+                else:
+                    self.assertEqual(verdict.refusal, "")
+                if expected == ROW_IN_SCOPE:
+                    self.assertTrue(verdict.locator)
+
+    def test_the_table_exercises_the_whole_closed_vocabulary(self):
+        covered = {expected for _label, _row, expected in _ROW_CLASSIFICATION_TABLE}
+        self.assertEqual(covered, set(ROW_DISPOSITIONS))
+
+    def test_a_refused_row_anywhere_refuses_the_whole_read(self):
+        for label, row, expected in _ROW_CLASSIFICATION_TABLE:
+            if expected != ROW_REFUSED:
+                continue
+            with self.subTest(row=label):
+                panes, refusal = coordinator_panes_in(
+                    [_row(A, "codex", "w1:p2", workspace_id="w1"), row], "w1"
+                )
+                self.assertEqual(panes, ())
+                self.assertTrue(refusal)
+
+    def test_out_of_scope_rows_leave_the_read_intact(self):
+        rows = [_row(A, "codex", "w1:p2", workspace_id="w1")]
+        rows += [
+            row for _label, row, expected in _ROW_CLASSIFICATION_TABLE
+            if expected == ROW_OUT_OF_SCOPE
         ]
         panes, refusal = coordinator_panes_in(rows, "w1")
         self.assertEqual(refusal, "")
-        self.assertEqual([pane.locator for pane in panes], ["w1:p2", "w1:p3"])
-        self.assertEqual({pane.workspace_id for pane in panes}, {A})
+        self.assertEqual([pane.locator for pane in panes], ["w1:p2"])
 
+
+class CoordinatorPaneReadTest(unittest.TestCase):
     def test_an_undecodable_row_inside_the_target_workspace_refuses(self):
-        rows = [_row(A, "codex", "w1:p2"), {"name": "not-mzb1", "pane_id": "w1:p9"}]
+        rows = [
+            _row(A, "codex", "w1:p2", workspace_id="w1"),
+            {"name": "not-mzb1", "pane_id": "w1:p9", "workspace_id": "w1"},
+        ]
         panes, refusal = coordinator_panes_in(rows, "w1")
         self.assertEqual(panes, ())
         self.assertIn("no decodable mozyo identity", refusal)
+
+    def test_a_duplicate_locator_refuses(self):
+        rows = [
+            _row(A, "codex", "w1:p2", workspace_id="w1"),
+            _row(A, "claude", "w1:p2", workspace_id="w1"),
+        ]
+        panes, refusal = coordinator_panes_in(rows, "w1")
+        self.assertEqual(panes, ())
+        self.assertIn("appears twice", refusal)
 
     def test_pairs_group_by_workspace_and_lane(self):
         panes = (
