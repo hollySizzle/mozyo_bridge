@@ -313,6 +313,20 @@ _LOCATOR_KEYS: "tuple[str, ...]" = (
     AGENT_KEY_LOCATOR_ALIAS_2,
 )
 
+#: The row keys this module reads as text. EVERY one of them is shape-checked, not
+#: just the two a review happened to name: the defect is a property of ``_norm``
+#: (which stringifies anything non-``None``), so it belongs to the whole set of
+#: fields that pass through it, and closing it field-by-field would leave the next
+#: one open.
+_TEXT_FIELDS: "tuple[str, ...]" = (
+    AGENT_KEY_WORKSPACE,
+    AGENT_KEY_NAME,
+    _DETECTED_AGENT_KEY,
+    "foreground_cwd",
+    "cwd",
+    *_LOCATOR_KEYS,
+)
+
 
 @dataclass(frozen=True)
 class RowVerdict:
@@ -380,10 +394,24 @@ def classify_inventory_row(row: object, target_workspace: str) -> RowVerdict:
             ROW_REFUSED,
             refusal="the herdr inventory contains a row this module cannot read",
         )
-    for key in (AGENT_KEY_WORKSPACE, *_LOCATOR_KEYS):
+    for key in _TEXT_FIELDS:
         shape = _text_field_refusal(row, key)
         if shape:
             return RowVerdict(ROW_REFUSED, refusal=shape)
+    stated = {
+        _norm(row.get(key)) for key in _LOCATOR_KEYS if _norm(row.get(key))
+    }
+    if len(stated) > 1:
+        # The canonical reader takes the first key that answers, so a row naming
+        # two different panes would be read as whichever key came first. A row that
+        # cannot agree with itself about which pane it is has not identified one.
+        return RowVerdict(
+            ROW_REFUSED,
+            refusal=(
+                f"the herdr inventory row states {len(stated)} different pane "
+                f"locators {sorted(stated)!r}; refusing to pick one"
+            ),
+        )
     locator = _agent_locator(row)
     prefix = _workspace_prefix(locator)
     declared = _norm(row.get(AGENT_KEY_WORKSPACE))

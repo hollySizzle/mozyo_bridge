@@ -1215,6 +1215,10 @@ relayout を承認し、**推測ではなく実測で検証すること**を条�
   そのまま非空の workspace id へ昇格する。present かつ非 text の field は normalization より**前**に refusal
   とする（absent / null / 空白のみ string は従来どおり absent へ畳む）。j#99971 finding_1 で、非文字列
   `workspace_id` 4 種がすべて out-of-scope として素通りし 6 枚 move する再現を確認した。
+  **この欠陥は `_norm` の性質であって特定 field の性質ではない**ので、shape 検査は本 module が text として
+  読む全 field（`workspace_id` / `name` / `agent` / `foreground_cwd` / `cwd` / locator key 3 種）に課す。
+  加えて、複数の locator key が**互いに異なる pane を述べている row** は refusal とする（canonical reader は
+  最初に答えた key を採るので、放置すると「どちらを読むか」で結果が変わる）。
   回帰は個別事例でなく **declared × locator の入力空間の格子**で持ち（各軸は `absent` / `target` / `foreign` /
   `non_string` などの **shape を含む**値域）、**格子が全 cell を覆っていること自体を test が assert する**
   （表は主張であり、主張の方を検査する）。**軸の定義が入力空間を覆っていなければ、格子の網羅 assertion は

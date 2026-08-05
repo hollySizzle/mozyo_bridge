@@ -221,6 +221,47 @@ class InventoryRowClassificationTest(unittest.TestCase):
                 self.assertEqual(verdict.disposition, ROW_REFUSED)
                 self.assertIn("non-text field", verdict.refusal)
 
+    def test_every_text_field_this_module_reads_is_shape_checked(self):
+        """The defect belongs to ``_norm``, so it belongs to all of its inputs.
+
+        Closing it only on the two fields a review named would leave the next one
+        open — a stringified ``cwd`` or detected provider is the same promotion of
+        a malformed value into evidence.
+        """
+        for key in ("workspace_id", "name", "agent", "foreground_cwd", "cwd",
+                    "pane_id", "pane", "location"):
+            with self.subTest(field=key):
+                row = _row(A, "codex", "w1:p2", workspace_id="w1")
+                row["foreground_cwd"] = "/roots/" + A
+                row[key] = 17
+                verdict = classify_inventory_row(row, "w1")
+                self.assertEqual(verdict.disposition, ROW_REFUSED)
+                self.assertIn("non-text field", verdict.refusal)
+
+    def test_a_row_naming_two_different_panes_refuses(self):
+        """The canonical reader takes the first key that answers; disagreement is
+        not a preference order, it is a row that has not identified a pane."""
+        verdict = classify_inventory_row(
+            {"name": encode_assigned_name(A, "codex"), "pane_id": "w1:p2",
+             "pane": "w9:p9"},
+            "w1",
+        )
+        self.assertEqual(verdict.disposition, ROW_REFUSED)
+        self.assertIn("different pane locators", verdict.refusal)
+
+    def test_locator_aliases_that_agree_are_fine(self):
+        for row in (
+            {"name": encode_assigned_name(A, "codex"), "pane": "w1:p2"},
+            {"name": encode_assigned_name(A, "codex"), "pane_id": "w1:p2",
+             "pane": "w1:p2"},
+            {"name": encode_assigned_name(A, "codex"), "pane_id": "w1:p2",
+             "pane": ""},
+        ):
+            with self.subTest(row=sorted(row)):
+                self.assertEqual(
+                    classify_inventory_row(row, "w1").disposition, ROW_IN_SCOPE
+                )
+
     def test_absent_and_null_and_blank_stay_absent(self):
         """The shape check narrows nothing that ``_norm`` already folded away."""
         for row in (
