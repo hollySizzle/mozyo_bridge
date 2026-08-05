@@ -72,6 +72,12 @@ if ! command -v curl >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "error: python3 not found in PATH; it is required to parse the" >&2
+  echo "       TestPyPI Simple JSON response without substring matches." >&2
+  exit 1
+fi
+
 case "$version" in
   *.dev*) : ;;  # looks like a dev release; proceed
   *)
@@ -102,7 +108,34 @@ while :; do
     --header "Cache-Control: no-cache" \
     --header "Accept: application/vnd.pypi.simple.v1+json" \
     "${simple_url}?propagation_attempt=${simple_attempt}" \
-    | grep -F -q -- "$version"; then
+    | MOZYO_TESTPYPI_EXPECTED_VERSION="$version" python3 -c '
+import json
+import os
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except (json.JSONDecodeError, UnicodeError):
+    raise SystemExit(1)
+
+files = payload.get("files")
+if not isinstance(files, list):
+    raise SystemExit(1)
+
+version = os.environ["MOZYO_TESTPYPI_EXPECTED_VERSION"]
+wheel_prefix = f"mozyo_bridge-{version}-"
+sdist_names = {
+    f"mozyo_bridge-{version}.tar.gz",
+    f"mozyo_bridge-{version}.zip",
+}
+for item in files:
+    filename = item.get("filename") if isinstance(item, dict) else None
+    if isinstance(filename, str) and (
+        filename.startswith(wheel_prefix) or filename in sdist_names
+    ):
+        raise SystemExit(0)
+raise SystemExit(1)
+'; then
     echo "OK: TestPyPI Simple Index lists $version"
     break
   fi

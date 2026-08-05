@@ -54,7 +54,7 @@ _FAKE_CURL = (
     'printf "%s\\n" "$count" > "$count_file"\n'
     'ready_after="${FAKE_SIMPLE_READY_AFTER:-1}"\n'
     'if [ "$count" -ge "$ready_after" ]; then\n'
-    "  printf '{\"files\":[{\"filename\":\"mozyo_bridge-%s.whl\"}]}\\n' \"$FAKE_SIMPLE_VERSION\"\n"
+    "  printf '{\"files\":[{\"filename\":\"mozyo_bridge-%s-py3-none-any.whl\"}]}\\n' \"$FAKE_SIMPLE_VERSION\"\n"
     "else\n"
     "  printf '{\"files\":[]}\\n'\n"
     "fi\n"
@@ -183,6 +183,19 @@ class InstallTestPyPIDevScriptTest(unittest.TestCase):
         self.assertEqual(40, result.stdout.count("FAKE_SLEEP=15"), result.stdout)
         self.assertNotIn("FAKE_PIPX_ARG=", result.stdout)
         self.assertIn("existing pipx environment was not changed", result.stderr)
+
+    def test_stable_version_does_not_match_alpha_filename_substring(self) -> None:
+        requested = "0.15.0"
+        result = self._run(
+            requested,
+            mb_version=requested,
+            mz_version=requested,
+            simple_version="0.15.0a4",
+            simple_ready_after=1,
+        )
+        self.assertEqual(75, result.returncode, result.stderr)
+        self.assertEqual(40, result.stdout.count("FAKE_SLEEP=15"), result.stdout)
+        self.assertNotIn("FAKE_PIPX_ARG=", result.stdout)
 
     def test_mozyo_bridge_mismatch_fails(self) -> None:
         version = "0.10.0.dev123456"
