@@ -219,6 +219,15 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_pr
     AgentProviderProfileError,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pair_split_ratio import finalize_container_geometry  # noqa: E501
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_role_grouped_space import (  # noqa: E501
+    classify_role_grouped_placement,
+    preflight_project_coordinator_label_authority,
+    require_registered_top_workspace,
+    resolve_project_coordinator_container_plan,
+    resolve_project_coordinator_workspace,
+    resolve_role_grouped_implementation_target,
+    validate_role_grouped_inventory,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (
     _create_tab,
     _create_workspace,
@@ -249,6 +258,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.coordinator_placement_mode import (  # noqa: E501
     COORDINATOR_PLACEMENT_MODES,
     DEFAULT_COORDINATOR_PLACEMENT_MODE,
+    ROLE_GROUPED_SPACE,
     SHARED_SPACE,
 )
 from mozyo_bridge.core.state.coordinator_placement_fence import (
@@ -290,6 +300,7 @@ def prepare_session(
     lane_placement: "Optional[LanePlacementConfig]" = None,
     launch_context: "Optional[LaneLaunchContext]" = None,
     coordinator_placement_mode: str = DEFAULT_COORDINATOR_PLACEMENT_MODE,
+    coordinator_top_workspace_id: str = "",
     attestation_reader: "Optional[Callable[[str], Optional[IdentityAttestationRecord]]]" = None,
     replacement_action_id: str = "",
     probe: "Optional[StartupProbe]" = None,
@@ -339,6 +350,7 @@ def prepare_session(
         lane_placement=lane_placement,
         launch_context=launch_context,
         coordinator_placement_mode=coordinator_placement_mode,
+        coordinator_top_workspace_id=coordinator_top_workspace_id,
         attestation_reader=attestation_reader,
         replacement_action_id=replacement_action_id,
         probe=probe,
@@ -350,12 +362,18 @@ def prepare_session(
     # Before the lock: acquiring it creates the home dir and a lock file, and a malformed
     # ratio authority must cost neither (#14569 j#91331 R4-F1). The locked entry re-checks.
     validate_pair_order(pair_order, providers, error_type=HerdrSessionStartError)
+    validate_coordinator_placement_request(
+        coordinator_placement_mode, coordinator_top_workspace_id,
+        error_type=HerdrSessionStartError,
+    )
+    if coordinator_placement_mode == ROLE_GROUPED_SPACE:
+        require_registered_top_workspace(
+            coordinator_top_workspace_id, home=mozyo_bridge_home()
+        )
     if dry_run:
         return _prepare_session_locked(**call)
     try:
-        with attestation_store_lock(
-            mozyo_bridge_home(), exclusive=False, blocking=False
-        ):
+        with attestation_store_lock(mozyo_bridge_home(), exclusive=False, blocking=False):
             return _prepare_session_locked(**call)
     except AttestationStoreLockBusy as exc:
         raise HerdrLauncherIncompatibleError(
@@ -364,11 +382,9 @@ def prepare_session(
             f"is being rebuilt underneath it. No workspace / tab / agent was created. "
             f"Re-run once the maintenance command finishes.",
             reason=STORE_MAINTENANCE_IN_PROGRESS,
-        ) from exc
-
-
+    ) from exc
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_lifecycle_admission import admit_launch_against_lifecycle  # noqa: E501
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_preflight import validate_pair_order, validate_session_request  # noqa: E501
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_preflight import validate_coordinator_placement_request, validate_pair_order, validate_session_request  # noqa: E501
 
 
 def _prepare_session_locked(
@@ -386,6 +402,7 @@ def _prepare_session_locked(
     lane_placement: "Optional[LanePlacementConfig]" = None,
     launch_context: "Optional[LaneLaunchContext]" = None,
     coordinator_placement_mode: str = DEFAULT_COORDINATOR_PLACEMENT_MODE,
+    coordinator_top_workspace_id: str = "",
     attestation_reader: "Optional[Callable[[str], Optional[IdentityAttestationRecord]]]" = None,
     replacement_action_id: str = "",
     probe: "Optional[StartupProbe]" = None,
@@ -429,16 +446,10 @@ def _prepare_session_locked(
     split ``down``, and the coordinator pair launches ``(codex, claude)`` so the coordinator
     takes the upper pane. A workspace rolls a class back with ``split: right``.
 
-    ``coordinator_placement_mode`` (Redmine #14139) is the *operator-scoped* placement
-    knob the launch site resolved from the mozyo-bridge home (never a repo-committed
-    value). ``per_project_space`` (the default) is byte-for-byte the pre-#14139 launch:
-    the coordinator pair lives in its own project workspace (#13380). ``shared_space``
-    lands the coordinator pair (default lane ONLY) in one stable shared coordinators
-    herdr workspace across projects, each project a column, idempotently adopting the
-    space an earlier project created (`_shared_coordinator_target`). It is launch/adopt-
-    time only — an already-live pair is never moved — and it leaves every sublane
-    placement (#13380/#13411) untouched (the shared branch is default-lane only). An
-    unknown mode fails closed above, before any side effect.
+    ``coordinator_placement_mode`` is the operator-home placement policy (#14139,
+    #14996): per-project, all coordinators shared, or top dedicated with project
+    coordinators shared. ``coordinator_top_workspace_id`` names that stable top;
+    the policy acts only at launch/adopt and never moves live panes.
 
     ``claude_permission_mode_default`` is the launch-context policy default for the
     managed Claude permission mode (Redmine #11925 / #13360 / #13397): sublane lane
@@ -462,6 +473,7 @@ def _prepare_session_locked(
         providers=providers,
         lane_id=lane_id,
         coordinator_placement_mode=coordinator_placement_mode,
+        coordinator_top_workspace_id=coordinator_top_workspace_id,
         claude_permission_mode_default=claude_permission_mode_default,
         env=env,
         error_type=HerdrSessionStartError,
@@ -542,6 +554,15 @@ def _prepare_session_locked(
         launch_context=launch_context,
         dry_run=dry_run,
     )
+    role_grouped_project_coordinator = False
+    role_grouped_implementation = False
+    if coordinator_placement_mode == ROLE_GROUPED_SPACE:
+        role_grouped_project_coordinator, role_grouped_implementation = (
+            classify_role_grouped_placement(
+                lane_id=result.lane_id, lane_kind=lane_kind, workspace_id=workspace_id,
+                top_workspace_id=coordinator_top_workspace_id,
+            )
+        )
 
     # Config-driven pane placement (Redmine #13646, Design Answer j#76564): resolve the
     # lane's EFFECTIVE `(split, order)` ONCE, then reorder the requested providers so the
@@ -576,10 +597,6 @@ def _prepare_session_locked(
     )
     rows = _list_rows(binary, runner, timeout)
 
-    # Pass 1 — classify every slot (adopt / launch / dry-run plan) before launching,
-    # failing closed on a duplicate live name. Classifying up front is what lets us
-    # pick ONE launch-target workspace (and decide whether to create+reclaim a base
-    # pane) before the first `agent start`.
     plans: list = []
     for provider in providers:
         assigned_name = encode_assigned_name(workspace_id, provider, lane)
@@ -625,6 +642,12 @@ def _prepare_session_locked(
         else:
             plans.append(_SlotPlan(provider, assigned_name, "launch"))
 
+    if coordinator_placement_mode == ROLE_GROUPED_SPACE:
+        validate_role_grouped_inventory(
+            rows, workspace_id, result.lane_id,
+            [(p.kind, p.locator) for p in plans],
+            shared_project_coordinator=role_grouped_project_coordinator,
+        )
     # Whole-plan launch preflight — the LAST point before any herdr write (#13441 review
     # R1-F1). Every provider that will actually be launched has its profile, protocol,
     # capability, trusted executable, and managed policy resolved HERE, so a provider that
@@ -679,11 +702,11 @@ def _prepare_session_locked(
         replacement_action_id=replacement_action_id,
         launch_planned=bool(launch_plans),
     )
-
-    # Reserve BOTH pre-side-effect identity records — the immutable startup action (#13948,
-    # Answer j#80989) and each wrapped slot's launch generation (#14203 j#87472) — the LAST
-    # thing before the first herdr write, after every fail-closed preflight above. From here
-    # on, anything this run creates is that action's participant (see the binding module).
+    if role_grouped_project_coordinator:
+        preflight_project_coordinator_label_authority(
+            workspace_id=workspace_id, binary=binary, runner=runner, timeout=timeout,
+            acquire_lock=not dry_run)
+    # Reserve startup identities only after preflight; later effects belong to this action.
     transaction = open_startup_transaction_and_reserve_generations(
         workspace_id=workspace_id, lane_id=result.lane_id, providers=providers,
         dry_run=dry_run, home=Path(store_home), fence=startup_fence, nonce=action_nonce,
@@ -691,24 +714,7 @@ def _prepare_session_locked(
     )
     result.action_id = transaction.action_id if transaction else ""
 
-    # Resolve the launch-target workspace (Redmine #13330 / #13377 / #13380). Nothing
-    # to launch (all adopt / dry-run) means no workspace create and no reclaim —
-    # byte-invariant. Placement is lane-aware (#13380 dedicated sublane host): a
-    # lane's own live/adopted slots pin the target first (a heal never splits a
-    # pair); otherwise a lane slot joins the sublane host workspace the other lane
-    # slots occupy (never the coordinator's), and the default lane joins only its
-    # own pins — one mozyo workspace thus occupies a constant "project 1 + host 1"
-    # herdr workspaces. When nothing pins a target the workspace is created
-    # explicitly (labelled for a lane slot) so its empty root pane is a known
-    # handle to reclaim, not one we scan for.
-    #
-    # Operator placement mode (Redmine #14139): in `shared_space` mode the DEFAULT
-    # lane (coordinator pair) instead joins one stable shared coordinators
-    # workspace across projects (`_shared_coordinator_target`), created with the
-    # stable `SHARED_COORDINATOR_WORKSPACE_LABEL`. Only the default lane in shared
-    # mode diverges; `per_project_space` (the default) and every sublane path stay
-    # byte-for-byte the pre-#14139 resolution — the shared branch is never taken
-    # for a lane slot, so the #13380/#13411 sublane axes are untouched.
+    # Resolve workspace; role_grouped_space separates all three roles (#14996).
     launch_plans = [p for p in plans if p.kind == "launch"]
     target_workspace = ""
     if launch_plans:
@@ -718,38 +724,12 @@ def _prepare_session_locked(
         )
         adopt_locators = [p.locator for p in plans if p.kind == "adopt"]
         if shared_coordinator_space:
-            # The shared coordinators space is identified by its stable LABEL, the
-            # backend-readable authority (Redmine #14139 review j#83383 F1 / Design
-            # Answer j#83385 Decision 1) — never a locator-prefix guess that would
-            # adopt a per-project coordinator window on a mode transition.
-            #
-            # Resolve this project's OWN pin FIRST (R4 review j#83473 F2): an own-pin
-            # heal rejoins its own live space by identity and must NOT depend on the
-            # `workspace list` command succeeding, so the label read is skipped when
-            # an own pin exists. Only a fresh / mode-transition launch with no own pin
-            # reads the labels — and per_project / sublane launches never reach here,
-            # so they issue no extra `workspace list` (byte-invariant).
+            # Legacy shared_space: own identity pin first, exact label otherwise (#14139).
             target_workspace = _shared_coordinator_own_target(
                 rows, workspace_id, adopt_locators
             )
             if not target_workspace:
-                # No own pin -> the shared space must be adopted or created. Run the
-                # whole list->resolve->create under a home-scoped single-flight fence
-                # (R5 review j#83516 F1) so concurrent clean-slate launches converge to
-                # ONE workspace: the first creates it under the lock; the rest wait,
-                # re-read the labels under the lock and ADOPT it (double-checked). A
-                # partial-failure husk is adopted the same way (resolver F1). Own-pin
-                # heal above never takes the lock (it creates nothing). Unreadable
-                # labels / ambiguity / mode-transition all fail closed in the resolver.
-                #
-                # The fence's ACQUISITION runs before any herdr command, so an
-                # acquisition failure is zero-actuation; its RELEASE runs AFTER the
-                # body, so on the clean-slate path the shared `workspace create` has
-                # already happened. Both convert into the launch's typed error boundary
-                # (no raw traceback at the CLI, R6 review j#83569 F2), but the message
-                # must be phase-accurate: an acquisition failure created nothing, while
-                # a release failure may have left a labelled `coordinators` workspace a
-                # re-run adopts idempotently (R8 review j#83633 F1).
+                # Serialize list→resolve→create; release errors may leave a labelled husk.
                 try:
                     with coordinator_shared_create_lock(mozyo_bridge_home()):
                         workspace_labels = _list_workspace_labels(binary, runner, timeout)
@@ -790,13 +770,35 @@ def _prepare_session_locked(
                         f"coordinators single-flight lock ({exc}); no workspace / tab / "
                         "agent was created. Re-run once the home lock is reachable."
                     ) from exc
-        else:
-            target_workspace = _launch_target_for_lane(
-                rows,
-                workspace_id,
-                result.lane_id,
-                adopt_locators,
+        elif role_grouped_project_coordinator:
+            shared = resolve_project_coordinator_workspace(
+                rows=rows,
+                workspace_id=workspace_id,
+                lane_id=result.lane_id,
+                adopted_locators=adopt_locators,
+                binary=binary,
+                repo_root=repo_root,
+                runner=runner,
+                timeout=timeout,
+                env=env,
             )
+            target_workspace = shared.workspace_id
+            result.base_pane_id = shared.base_pane_id
+        else:
+            if role_grouped_implementation:
+                target_workspace = resolve_role_grouped_implementation_target(
+                    rows=rows,
+                    workspace_id=workspace_id,
+                    lane_id=result.lane_id,
+                    adopted_locators=adopt_locators,
+                    binary=binary,
+                    runner=runner,
+                    timeout=timeout,
+                )
+            else:
+                target_workspace = _launch_target_for_lane(
+                    rows, workspace_id, result.lane_id, adopt_locators
+                )
             if not target_workspace:
                 create_label = (
                     _host_workspace_label(resolved_root)
@@ -814,27 +816,15 @@ def _prepare_session_locked(
                 result.base_pane_id = base_pane_id
         result.herdr_workspace_id = target_workspace
 
-    # Resolve the launch-target tab within the host workspace (Redmine #13411,
-    # lane=tab). Only a non-default lane subdivides: its gateway + worker live in
-    # ONE dedicated tab, so a host with N lanes shows N tabs instead of 2N loose
-    # panes. The lane's own live/adopted slots pin their tab (a heal rejoins the
-    # SAME tab). When nothing pins a tab, mint one explicitly ONLY for a FRESH lane
-    # (no own live/adopted slots) — labelled with the lane key (cosmetic) so its
-    # empty root pane is a known handle to reclaim. A heal of a legacy pre-#13411
-    # lane whose live slots are LOOSE panes (own slots present, no tab pinned)
-    # launches loose too, keeping the pair together (it migrates to a tab on a full
-    # relaunch, the #13380 cohabiting precedent). The default lane never uses a tab,
-    # so the coordinator path stays byte-invariant.
-    #
-    # The fresh-vs-loose decision keys on the lane's WHOLE live inventory in the
-    # target workspace (`_lane_live_slot_tabs`), NOT this run's requested `plans`
-    # (review j#74433 finding 1): a single-provider heal requests only one provider,
-    # so the lane's OTHER live slot is in the inventory but never in `plans` —
-    # counting requested adopts alone would mint a fresh tab for a live loose sibling
-    # (splitting the pair).
+    # Non-default implementation lanes keep the #13411 lane=tab path. Project
+    # coordinators are intentionally loose pairs in their shared overview workspace.
     target_tab = ""
     lane_slot_tabs: list = []
-    if launch_plans and result.lane_id != DEFAULT_LANE:
+    if (
+        launch_plans
+        and result.lane_id != DEFAULT_LANE
+        and not role_grouped_project_coordinator
+    ):
         lane_slot_tabs = _lane_live_slot_tabs(
             rows, workspace_id, target_workspace, result.lane_id
         )
@@ -851,17 +841,27 @@ def _prepare_session_locked(
     # Split placement (#13411 tab axis + #13646 direction / #13646-R1-F1 focus). The first
     # slot occupies the container; later launching slots split beside it. Pure decisions —
     # see `herdr_lane_topology.resolve_container_plan` for the full contract.
-    plan_of_container = resolve_container_plan(
-        rows,
-        workspace_id,
-        target_workspace,
-        result.lane_id,
-        lane_class=lane_class,
-        target_tab=target_tab,
-        lane_slot_tabs=lane_slot_tabs,
-        config_split=config_split,
-        launch_count=len(launch_plans),
-    )
+    if role_grouped_project_coordinator:
+        plan_of_container = resolve_project_coordinator_container_plan(
+            rows,
+            workspace_id,
+            target_workspace,
+            result.lane_id,
+            config_split=config_split,
+            launch_count=len(launch_plans),
+        )
+    else:
+        plan_of_container = resolve_container_plan(
+            rows,
+            workspace_id,
+            target_workspace,
+            result.lane_id,
+            lane_class=lane_class,
+            target_tab=target_tab,
+            lane_slot_tabs=lane_slot_tabs,
+            config_split=config_split,
+            launch_count=len(launch_plans),
+        )
     occupancy = plan_of_container.occupancy  # grows per launch (first occupies, rest split)
 
     # Pass 2 — execute each slot's decision (adopt row, dry-run plan, or launch into the

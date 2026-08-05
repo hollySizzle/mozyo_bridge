@@ -90,12 +90,25 @@ def prepare_actuator_lane_session(
     from mozyo_bridge.application.repo_local_config_loader import (
         load_repo_local_config,
     )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.coordinator_placement_loader import (  # noqa: E501
+        load_coordinator_placement_for_launch,
+    )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
+        HerdrSessionStartError,
         _prepare_session_locked,
         prepare_session,
     )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.coordinator_placement_mode import (  # noqa: E501
+        CoordinatorPlacementError,
+    )
 
     repo_config = load_repo_local_config(config_repo_root)
+    try:
+        coordinator_placement = load_coordinator_placement_for_launch()
+    except CoordinatorPlacementError as exc:
+        raise HerdrSessionStartError(
+            f"invalid operator coordinator placement for managed lane launch: {exc}"
+        ) from exc
     session_start = _prepare_session_locked if admission_lock_held else prepare_session
     return session_start(
         repo_root=Path(worktree_path),
@@ -114,6 +127,8 @@ def prepare_actuator_lane_session(
         action_nonce=action_nonce,
         startup_fence=startup_fence,
         launch_context=launch_context,
+        coordinator_placement_mode=coordinator_placement.mode,
+        coordinator_top_workspace_id=coordinator_placement.top_workspace_id,
         launch_cause=launch_cause,
     )
 

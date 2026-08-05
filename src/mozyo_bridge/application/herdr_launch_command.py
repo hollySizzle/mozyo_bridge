@@ -259,7 +259,7 @@ class LiveHerdrLaunchOps:
             load_repo_local_config,
         )
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.coordinator_placement_loader import (  # noqa: E501
-            resolve_coordinator_placement_mode,
+            load_coordinator_placement_for_launch,
         )
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.coordinator_placement_mode import (  # noqa: E501
             CoordinatorPlacementError,
@@ -279,7 +279,7 @@ class LiveHerdrLaunchOps:
         # in a per-project workspace (default) or the shared coordinators space per this
         # operator's choice. A broken operator file fails closed with an actionable refusal.
         try:
-            coordinator_placement_mode = resolve_coordinator_placement_mode()
+            coordinator_placement = load_coordinator_placement_for_launch()
         except CoordinatorPlacementError as exc:
             self.die(f"mozyo launch failed: invalid operator coordinator placement: {exc}")
             raise AssertionError("unreachable")
@@ -302,7 +302,8 @@ class LiveHerdrLaunchOps:
             claude_permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
             agent_launch=repo_config.agent_launch,
             lane_placement=repo_config.lane_placement,
-            coordinator_placement_mode=coordinator_placement_mode,
+            coordinator_placement_mode=coordinator_placement.mode,
+            coordinator_top_workspace_id=coordinator_placement.top_workspace_id,
         )
 
     def attach(self, argv: list[str]) -> NoReturn:

@@ -560,6 +560,7 @@ class LaunchPreflightVocabularyWiringTest(unittest.TestCase):
                 providers=["claude"],
                 lane_id="lane-x",
                 coordinator_placement_mode="per_project_space",
+                coordinator_top_workspace_id="",
                 claude_permission_mode_default="auto",
                 env={},
                 error_type=RuntimeError,

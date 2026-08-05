@@ -27,6 +27,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.coordinator_placement_mode import (  # noqa: E501
     COORDINATOR_PLACEMENT_MODES,
+    CoordinatorPlacementConfig,
+    CoordinatorPlacementError,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     _norm,
@@ -100,6 +102,7 @@ def validate_session_request(
     providers: Sequence[str],
     lane_id: str,
     coordinator_placement_mode: str,
+    coordinator_top_workspace_id: str,
     claude_permission_mode_default,
     env: Mapping[str, str],
     error_type: type,
@@ -135,11 +138,11 @@ def validate_session_request(
       on an adopt-only run.
     """
     validate_pair_order(pair_order, providers, error_type=error_type)
-    if coordinator_placement_mode not in COORDINATOR_PLACEMENT_MODES:
-        raise error_type(
-            f"unknown coordinator placement mode {coordinator_placement_mode!r}; "
-            f"expected one of {sorted(COORDINATOR_PLACEMENT_MODES)}"
-        )
+    validate_coordinator_placement_request(
+        coordinator_placement_mode,
+        coordinator_top_workspace_id,
+        error_type=error_type,
+    )
     seen_slots: set = set()
     lane_norm = _norm(lane_id)
     for provider in providers:
@@ -161,6 +164,32 @@ def validate_session_request(
     _validate_slot_plan(
         providers=providers, lane_id=lane_id, launch_context=launch_context, error_type=error_type
     )
+
+
+def validate_coordinator_placement_request(
+    mode: str,
+    top_workspace_id: str,
+    *,
+    error_type: type,
+) -> None:
+    """Validate the complete operator placement authority without side effects.
+
+    The public session-start API is also called directly by tests and adapters,
+    bypassing the YAML loader. Constructing the domain config here keeps that
+    path fail-closed on a missing/inert top authority exactly like production.
+    """
+    if mode not in COORDINATOR_PLACEMENT_MODES:
+        raise error_type(
+            f"unknown coordinator placement mode {mode!r}; "
+            f"expected one of {sorted(COORDINATOR_PLACEMENT_MODES)}"
+        )
+    try:
+        CoordinatorPlacementConfig(
+            mode=mode,
+            top_workspace_id=top_workspace_id,
+        )
+    except CoordinatorPlacementError as exc:
+        raise error_type(str(exc)) from exc
 
 
 def _validate_slot_plan(

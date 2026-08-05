@@ -1,7 +1,7 @@
-"""Operator-scoped coordinator pair placement mode (Redmine #14139).
+"""Operator-scoped coordinator role placement mode (Redmine #14139 / #14996).
 
-The closed vocabulary + fail-closed field contract for *where the coordinator
-pair (default lane) is placed* on the herdr terminal — an **operator-scoped
+The closed vocabulary + fail-closed field contract for *where coordinator
+pairs are placed* on the herdr terminal — an **operator-scoped
 home-level** knob, deliberately distinct from the repo-committed
 ``lane_placement`` (Redmine #13646, pane geometry) and from the two placement
 *axes* (#13380 dedicated sublane host workspace, #13411 lane=tab) that this
@@ -27,6 +27,10 @@ Closed vocabulary (unknown value fails closed)
 - :data:`SHARED_SPACE` — every project's coordinator pair joins ONE stable
   *shared coordinators* herdr workspace, each project a column; the resolver and
   the launch site implement it (``herdr_lane_topology._shared_coordinator_target``).
+- :data:`ROLE_GROUPED_SPACE` — the explicitly identified top coordinator keeps
+  its dedicated workspace, every other project coordinator joins one shared
+  workspace, and implementation lanes keep the existing per-project sublane
+  host placement.
 
 Any other ``mode`` string — or an unsupported ``version`` / an unknown key / a
 non-mapping record — raises :class:`CoordinatorPlacementError` (fail-closed): a
@@ -35,8 +39,8 @@ accident.
 
 Launch-time only
 ----------------
-The mode is a launch/adopt-time policy: it decides where a *fresh* coordinator
-pair launch or an adopt lands. It never moves an already-live pair (herdr
+The mode is a launch/adopt-time policy: it decides where a *fresh* managed pair
+launch or an adopt lands. It never moves an already-live pair (herdr
 rejects same-tab re-split; live re-placement is the live-relayout runbook only,
 #13648). This module is pure — it parses and validates a record; the home-file
 IO lives in the application loader, and the placement decision in the topology
@@ -55,8 +59,14 @@ PER_PROJECT_SPACE = "per_project_space"
 #: workspace, each project a column (Redmine #14139).
 SHARED_SPACE = "shared_space"
 
+#: The top coordinator is dedicated, project coordinators share one workspace,
+#: and implementation lanes retain their per-project host (Redmine #14996).
+ROLE_GROUPED_SPACE = "role_grouped_space"
+
 #: The closed placement-mode vocabulary. Any other value fails closed.
-COORDINATOR_PLACEMENT_MODES: frozenset[str] = frozenset({PER_PROJECT_SPACE, SHARED_SPACE})
+COORDINATOR_PLACEMENT_MODES: frozenset[str] = frozenset(
+    {PER_PROJECT_SPACE, ROLE_GROUPED_SPACE, SHARED_SPACE}
+)
 
 #: The behavior-preserving default (file absent / mode unset): the historical
 #: per-project placement, byte-for-byte the pre-#14139 launch.
@@ -68,11 +78,14 @@ DEFAULT_COORDINATOR_PLACEMENT_MODE = PER_PROJECT_SPACE
 COORDINATOR_PLACEMENT_CONFIG_VERSION: int = 1
 
 #: The closed set of recognized top-level keys inside the operator placement
-#: record: an optional ``version`` plus the single ``mode`` knob. Deliberately
-#: minimal — this operator file carries the placement mode ONLY and never any
-#: routing / target / credential / approval surface (and it never adopts a
+#: record: an optional ``version``, the ``mode`` knob, and the stable logical
+#: workspace id that identifies the one top coordinator in role-grouped mode.
+#: Deliberately minimal — this operator file carries placement identity only and
+#: never any routing / target / credential / approval surface (and it never adopts a
 #: ``pane``-shaped live-addressing key).
-COORDINATOR_PLACEMENT_KEYS: frozenset[str] = frozenset({"version", "mode"})
+COORDINATOR_PLACEMENT_KEYS: frozenset[str] = frozenset(
+    {"version", "mode", "top_workspace_id"}
+)
 
 
 class CoordinatorPlacementError(ValueError):
@@ -94,6 +107,9 @@ class CoordinatorPlacementConfig:
     - :attr:`mode` — a :data:`COORDINATOR_PLACEMENT_MODES` value. Defaults to
       :data:`DEFAULT_COORDINATOR_PLACEMENT_MODE` (``per_project_space``), the
       historical placement, so an operator with no file launches unchanged.
+    - :attr:`top_workspace_id` — the exact stable logical workspace-registry id
+      of the one top coordinator. Required only by ``role_grouped_space`` and
+      rejected as an inert value in every other mode.
 
     Boundary, kept enforced in code (this is *placement intent*, not authority):
 
@@ -108,6 +124,7 @@ class CoordinatorPlacementConfig:
 
     version: int = COORDINATOR_PLACEMENT_CONFIG_VERSION
     mode: str = DEFAULT_COORDINATOR_PLACEMENT_MODE
+    top_workspace_id: str = ""
 
     def __post_init__(self) -> None:
         # Validate on construction too, so a directly-built config is checked as
@@ -130,6 +147,28 @@ class CoordinatorPlacementConfig:
             raise CoordinatorPlacementError(
                 f"operator coordinator placement 'mode' must be one of "
                 f"{sorted(COORDINATOR_PLACEMENT_MODES)}, got {self.mode!r}"
+            )
+        if not isinstance(self.top_workspace_id, str):
+            raise CoordinatorPlacementError(
+                "operator coordinator placement 'top_workspace_id' must be a string, "
+                f"got {type(self.top_workspace_id).__name__}"
+            )
+        if self.top_workspace_id != self.top_workspace_id.strip():
+            raise CoordinatorPlacementError(
+                "operator coordinator placement 'top_workspace_id' must be the exact "
+                "stable workspace id without surrounding whitespace"
+            )
+        if self.mode == ROLE_GROUPED_SPACE and not self.top_workspace_id:
+            raise CoordinatorPlacementError(
+                "operator coordinator placement mode 'role_grouped_space' requires "
+                "non-empty 'top_workspace_id'; obtain it from `mozyo-bridge workspace "
+                "inspect --repo <top-repo> --json`"
+            )
+        if self.mode != ROLE_GROUPED_SPACE and self.top_workspace_id:
+            raise CoordinatorPlacementError(
+                "operator coordinator placement 'top_workspace_id' is valid only when "
+                "mode is 'role_grouped_space'; remove the inert authority or select that "
+                "mode"
             )
 
     @classmethod
@@ -178,7 +217,17 @@ class CoordinatorPlacementConfig:
                 f"operator coordinator placement 'mode' must be one of "
                 f"{sorted(COORDINATOR_PLACEMENT_MODES)}, got {mode!r}"
             )
-        return cls(version=version, mode=mode)
+        top_workspace_id = record.get("top_workspace_id", "")
+        if not isinstance(top_workspace_id, str):
+            raise CoordinatorPlacementError(
+                "operator coordinator placement 'top_workspace_id' must be a string, "
+                f"got {type(top_workspace_id).__name__}"
+            )
+        return cls(
+            version=version,
+            mode=mode,
+            top_workspace_id=top_workspace_id,
+        )
 
 
 __all__ = (
@@ -187,6 +236,7 @@ __all__ = (
     "COORDINATOR_PLACEMENT_MODES",
     "DEFAULT_COORDINATOR_PLACEMENT_MODE",
     "PER_PROJECT_SPACE",
+    "ROLE_GROUPED_SPACE",
     "SHARED_SPACE",
     "CoordinatorPlacementConfig",
     "CoordinatorPlacementError",

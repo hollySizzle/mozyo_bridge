@@ -14,9 +14,14 @@ operator config is never read or written:
 
 from __future__ import annotations
 
+import json
+import os
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
@@ -25,6 +30,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     CoordinatorPlacementLoadError,
     coordinator_placement_path,
     load_coordinator_placement,
+    load_coordinator_placement_for_launch,
     resolve_coordinator_placement_mode,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
@@ -34,9 +40,16 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _shared_coordinator_own_target,
     _shared_coordinator_target,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_role_grouped_space import (  # noqa: E501
+    PROJECT_COORDINATOR_WORKSPACE_LABEL,
+    _shared_project_coordinator_own_target,
+    _shared_project_coordinator_target,
+    is_role_grouped_project_coordinator,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.coordinator_placement_mode import (  # noqa: E501
     DEFAULT_COORDINATOR_PLACEMENT_MODE,
     PER_PROJECT_SPACE,
+    ROLE_GROUPED_SPACE,
     SHARED_SPACE,
     CoordinatorPlacementConfig,
     CoordinatorPlacementError,
@@ -50,12 +63,16 @@ def _row(ws, role, lane, pane):
     return {"name": encode_assigned_name(ws, role, lane), "pane_id": pane}
 
 
+TOP_WORKSPACE_ID = "a" * 32
+PROJECT_WORKSPACE_ID = "b" * 32
+
+
 class CoordinatorPlacementConfigTest(unittest.TestCase):
     def test_default_is_per_project(self) -> None:
         self.assertEqual(CoordinatorPlacementConfig.default().mode, PER_PROJECT_SPACE)
         self.assertEqual(DEFAULT_COORDINATOR_PLACEMENT_MODE, PER_PROJECT_SPACE)
 
-    def test_both_modes_accepted(self) -> None:
+    def test_all_modes_accepted(self) -> None:
         self.assertEqual(
             CoordinatorPlacementConfig.from_record({"mode": PER_PROJECT_SPACE}).mode,
             PER_PROJECT_SPACE,
@@ -64,6 +81,42 @@ class CoordinatorPlacementConfigTest(unittest.TestCase):
             CoordinatorPlacementConfig.from_record({"mode": SHARED_SPACE}).mode,
             SHARED_SPACE,
         )
+        self.assertEqual(
+            CoordinatorPlacementConfig.from_record(
+                {
+                    "mode": ROLE_GROUPED_SPACE,
+                    "top_workspace_id": TOP_WORKSPACE_ID,
+                }
+            ).mode,
+            ROLE_GROUPED_SPACE,
+        )
+
+    def test_role_grouped_requires_exact_top_workspace_id(self) -> None:
+        with self.assertRaises(CoordinatorPlacementError):
+            CoordinatorPlacementConfig.from_record({"mode": ROLE_GROUPED_SPACE})
+        with self.assertRaises(CoordinatorPlacementError):
+            CoordinatorPlacementConfig.from_record(
+                {
+                    "mode": ROLE_GROUPED_SPACE,
+                    "top_workspace_id": f" {TOP_WORKSPACE_ID}",
+                }
+            )
+        config = CoordinatorPlacementConfig.from_record(
+            {
+                "mode": ROLE_GROUPED_SPACE,
+                "top_workspace_id": TOP_WORKSPACE_ID,
+            }
+        )
+        self.assertEqual(config.top_workspace_id, TOP_WORKSPACE_ID)
+
+    def test_top_workspace_id_is_rejected_as_inert_in_other_modes(self) -> None:
+        with self.assertRaises(CoordinatorPlacementError):
+            CoordinatorPlacementConfig.from_record(
+                {
+                    "mode": PER_PROJECT_SPACE,
+                    "top_workspace_id": TOP_WORKSPACE_ID,
+                }
+            )
 
     def test_empty_record_is_default(self) -> None:
         self.assertEqual(CoordinatorPlacementConfig.from_record(None).mode, PER_PROJECT_SPACE)
@@ -130,6 +183,16 @@ class CoordinatorPlacementLoaderTest(unittest.TestCase):
         coordinator_placement_path(home).write_text("mode: shared_space\n", encoding="utf-8")
         self.assertEqual(resolve_coordinator_placement_mode(home), SHARED_SPACE)
 
+    def test_role_grouped_space_file_is_read(self) -> None:
+        home = self._home()
+        coordinator_placement_path(home).write_text(
+            f"mode: role_grouped_space\ntop_workspace_id: {TOP_WORKSPACE_ID}\n",
+            encoding="utf-8",
+        )
+        config = load_coordinator_placement(home)
+        self.assertEqual(config.mode, ROLE_GROUPED_SPACE)
+        self.assertEqual(config.top_workspace_id, TOP_WORKSPACE_ID)
+
     def test_unknown_mode_file_fails_closed(self) -> None:
         home = self._home()
         coordinator_placement_path(home).write_text("mode: everywhere\n", encoding="utf-8")
@@ -164,8 +227,297 @@ class CoordinatorPlacementLoaderTest(unittest.TestCase):
         # One `except CoordinatorPlacementError` at the call site catches IO + schema.
         self.assertTrue(issubclass(CoordinatorPlacementLoadError, CoordinatorPlacementError))
 
+    def test_launch_load_requires_registered_top_workspace(self) -> None:
+        home = self._home()
+        coordinator_placement_path(home).write_text(
+            f"mode: role_grouped_space\ntop_workspace_id: {TOP_WORKSPACE_ID}\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(CoordinatorPlacementLoadError):
+            load_coordinator_placement_for_launch(home)
+
+    def test_launch_load_accepts_exact_registered_top_workspace(self) -> None:
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        home = self._home()
+        top = home / "top"
+        top.mkdir()
+        workspace_id = register_workspace(top, home=home).record.workspace_id
+        coordinator_placement_path(home).write_text(
+            f"mode: role_grouped_space\ntop_workspace_id: {workspace_id}\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            load_coordinator_placement_for_launch(home).top_workspace_id,
+            workspace_id,
+        )
+
+    def test_launch_load_rejects_registry_anchor_workspace_id_drift(self) -> None:
+        from mozyo_bridge.core.state.workspace_registry import (
+            ANCHOR_RELATIVE,
+            register_workspace,
+        )
+
+        home = self._home()
+        top = home / "top"
+        top.mkdir()
+        workspace_id = register_workspace(top, home=home).record.workspace_id
+        anchor_path = top / ANCHOR_RELATIVE
+        anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+        anchor["workspace_id"] = "c" * 32
+        anchor_path.write_text(json.dumps(anchor), encoding="utf-8")
+        coordinator_placement_path(home).write_text(
+            f"mode: role_grouped_space\ntop_workspace_id: {workspace_id}\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(CoordinatorPlacementLoadError):
+            load_coordinator_placement_for_launch(home)
+
+    def test_launch_load_rejects_both_anchor_names(self) -> None:
+        from mozyo_bridge.core.state.workspace_registry import (
+            ANCHOR_LEGACY_RELATIVE,
+            ANCHOR_RELATIVE,
+            register_workspace,
+        )
+
+        home = self._home()
+        top = home / "top"
+        top.mkdir()
+        workspace_id = register_workspace(top, home=home).record.workspace_id
+        shutil.copyfile(top / ANCHOR_RELATIVE, top / ANCHOR_LEGACY_RELATIVE)
+        coordinator_placement_path(home).write_text(
+            f"mode: role_grouped_space\ntop_workspace_id: {workspace_id}\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(CoordinatorPlacementLoadError):
+            load_coordinator_placement_for_launch(home)
+
+    def test_launch_load_rejects_invalid_present_anchor(self) -> None:
+        from mozyo_bridge.core.state.workspace_registry import (
+            ANCHOR_RELATIVE,
+            register_workspace,
+        )
+
+        home = self._home()
+        top = home / "top"
+        top.mkdir()
+        workspace_id = register_workspace(top, home=home).record.workspace_id
+        (top / ANCHOR_RELATIVE).write_text("not-json\n", encoding="utf-8")
+        coordinator_placement_path(home).write_text(
+            f"mode: role_grouped_space\ntop_workspace_id: {workspace_id}\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(CoordinatorPlacementLoadError):
+            load_coordinator_placement_for_launch(home)
+
+    def test_launch_load_rejects_stale_registered_top_workspace(self) -> None:
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        home = self._home()
+        top = home / "top"
+        top.mkdir()
+        workspace_id = register_workspace(top, home=home).record.workspace_id
+        coordinator_placement_path(home).write_text(
+            f"mode: role_grouped_space\ntop_workspace_id: {workspace_id}\n",
+            encoding="utf-8",
+        )
+        shutil.rmtree(top)
+        with self.assertRaises(CoordinatorPlacementLoadError):
+            load_coordinator_placement_for_launch(home)
+
+
+class ActuatorPlacementCompositionTest(unittest.TestCase):
+    """The managed project-coordinator launch reads the same operator mode as top."""
+
+    def test_actuator_forwards_role_grouped_operator_mode(self) -> None:
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_session_start as session_start,
+            herdr_session_start_v1_replacement_binding as binding,
+        )
+
+        seen = {}
+
+        def _capture(**kwargs):
+            seen.update(kwargs)
+            return object()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            top = root / "top"
+            home = root / "home"
+            repo.mkdir()
+            top.mkdir()
+            home.mkdir()
+            top_workspace_id = register_workspace(top, home=home).record.workspace_id
+            coordinator_placement_path(home).write_text(
+                f"mode: role_grouped_space\ntop_workspace_id: {top_workspace_id}\n",
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+            ), patch.object(session_start, "prepare_session", _capture):
+                binding.prepare_actuator_lane_session(
+                    worktree_path=str(repo),
+                    config_repo_root=repo,
+                    providers=["codex", "claude"],
+                    lane_id="project-accounting",
+                    env={},
+                    runner=None,
+                    timeout=1.0,
+                    replacement_action_id="",
+                )
+        self.assertEqual(seen["coordinator_placement_mode"], ROLE_GROUPED_SPACE)
+        self.assertEqual(seen["coordinator_top_workspace_id"], top_workspace_id)
+
+    def test_broken_operator_mode_refuses_before_session_start(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_session_start as session_start,
+            herdr_session_start_v1_replacement_binding as binding,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            home = root / "home"
+            repo.mkdir()
+            home.mkdir()
+            coordinator_placement_path(home).write_text(
+                "mode: unknown\n", encoding="utf-8"
+            )
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+            ), patch.object(session_start, "prepare_session") as start:
+                with self.assertRaises(HerdrSessionStartError):
+                    binding.prepare_actuator_lane_session(
+                        worktree_path=str(repo),
+                        config_repo_root=repo,
+                        providers=["codex", "claude"],
+                        lane_id="project-accounting",
+                        env={},
+                        runner=None,
+                        timeout=1.0,
+                        replacement_action_id="",
+                    )
+        start.assert_not_called()
+
 
 SHARED = SHARED_COORDINATOR_WORKSPACE_LABEL  # "coordinators"
+
+
+class RoleGroupedProjectCoordinatorTargetTest(unittest.TestCase):
+    """Role truth and exact-label adoption for Redmine #14996."""
+
+    def test_default_lane_is_top_not_shared_project_coordinator(self) -> None:
+        self.assertFalse(
+            is_role_grouped_project_coordinator(
+                "default",
+                "coordinator",
+                workspace_id=TOP_WORKSPACE_ID,
+                top_workspace_id=TOP_WORKSPACE_ID,
+            )
+        )
+        self.assertTrue(
+            is_role_grouped_project_coordinator(
+                "default",
+                "coordinator",
+                workspace_id=PROJECT_WORKSPACE_ID,
+                top_workspace_id=TOP_WORKSPACE_ID,
+            )
+        )
+        for kind in (None, "delegated_coordinator"):
+            with self.subTest(kind=kind), self.assertRaises(HerdrSessionStartError):
+                is_role_grouped_project_coordinator(
+                    "default",
+                    kind,
+                    workspace_id=TOP_WORKSPACE_ID,
+                    top_workspace_id=TOP_WORKSPACE_ID,
+                )
+
+    def test_named_lane_requires_canonical_project_or_implementation_kind(self) -> None:
+        self.assertTrue(
+            is_role_grouped_project_coordinator(
+                "project-accounting",
+                "delegated_coordinator",
+                workspace_id=PROJECT_WORKSPACE_ID,
+                top_workspace_id=TOP_WORKSPACE_ID,
+            )
+        )
+        self.assertFalse(
+            is_role_grouped_project_coordinator(
+                "worker-1",
+                "implementation",
+                workspace_id=PROJECT_WORKSPACE_ID,
+                top_workspace_id=TOP_WORKSPACE_ID,
+            )
+        )
+        for kind in (None, "coordinator"):
+            with self.subTest(kind=kind), self.assertRaises(HerdrSessionStartError):
+                is_role_grouped_project_coordinator(
+                    "unknown-lane",
+                    kind,
+                    workspace_id=PROJECT_WORKSPACE_ID,
+                    top_workspace_id=TOP_WORKSPACE_ID,
+                )
+
+    def test_missing_top_or_current_workspace_authority_fails_closed(self) -> None:
+        for current, top in (("", TOP_WORKSPACE_ID), (PROJECT_WORKSPACE_ID, "")):
+            with self.subTest(current=current, top=top), self.assertRaises(
+                HerdrSessionStartError
+            ):
+                is_role_grouped_project_coordinator(
+                    "default",
+                    "coordinator",
+                    workspace_id=current,
+                    top_workspace_id=top,
+                )
+
+    def test_exact_lane_own_pin_wins_without_label_read(self) -> None:
+        rows = [
+            _row("wsA", "claude", "project-accounting", "w7:p1"),
+            _row("wsA", "codex", "implementation-1", "w8:p1"),
+        ]
+        self.assertEqual(
+            _shared_project_coordinator_own_target(
+                rows, "wsA", "project-accounting", []
+            ),
+            "w7",
+        )
+
+    def test_own_slots_spanning_workspaces_fail_closed(self) -> None:
+        rows = [
+            _row("wsA", "claude", "project-accounting", "w7:p1"),
+            _row("wsA", "codex", "project-accounting", "w8:p1"),
+        ]
+        with self.assertRaises(HerdrSessionStartError):
+            _shared_project_coordinator_own_target(
+                rows, "wsA", "project-accounting", []
+            )
+
+    def test_exact_label_is_the_only_cross_project_adopt_authority(self) -> None:
+        label = PROJECT_COORDINATOR_WORKSPACE_LABEL
+        self.assertEqual(
+            _shared_project_coordinator_target(
+                {"w1": "", "w2": label}, workspace_id="wsA"
+            ),
+            "w2",
+        )
+        self.assertEqual(
+            _shared_project_coordinator_target(
+                {"w1": "", "w2": f" {label} "}, workspace_id="wsA"
+            ),
+            "",
+        )
+
+    def test_unreadable_or_ambiguous_label_authority_fails_closed(self) -> None:
+        label = PROJECT_COORDINATOR_WORKSPACE_LABEL
+        with self.assertRaises(HerdrSessionStartError):
+            _shared_project_coordinator_target(None, workspace_id="wsA")
+        with self.assertRaises(HerdrSessionStartError):
+            _shared_project_coordinator_target(
+                {"w2": label, "w3": label}, workspace_id="wsA"
+            )
 
 
 class SharedCoordinatorTargetTest(unittest.TestCase):

@@ -39,7 +39,7 @@ from support.agent_provider_binaries import (
     FakeAgentBinaries,
     neutralized_overrides,
 )
-from mozyo_bridge.core.state.workspace_registry import read_anchor
+from mozyo_bridge.core.state.workspace_registry import read_anchor, register_workspace
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     derive_lane_workspace_token,
     encode_assigned_name,
@@ -641,7 +641,9 @@ class _SessionStartHarness:
         extra_env=None,
         claude_permission_mode_default=None,
         agent_launch=None,
+        launch_context=None,
         coordinator_placement_mode="per_project_space",
+        coordinator_top_workspace_id=None,
     ):
         # `exist_ok`: a scenario may drive TWO runs through one tmp (Redmine #13948 pins
         # that a re-run of the same command in the same lane is a NEW action), and the
@@ -666,6 +668,12 @@ class _SessionStartHarness:
         # launcher resolves, so a wrapped launch in a test attests where the real one does.
         herdr.attest_home = home
         with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+            if (
+                coordinator_placement_mode == "role_grouped_space"
+                and coordinator_top_workspace_id is None
+            ):
+                register_workspace(repo, home=home)
+                coordinator_top_workspace_id = read_anchor(repo)["workspace_id"]
             result = prepare_session(
                 repo_root=repo,
                 providers=providers,
@@ -675,7 +683,9 @@ class _SessionStartHarness:
                 dry_run=dry_run,
                 claude_permission_mode_default=claude_permission_mode_default,
                 agent_launch=agent_launch,
+                launch_context=launch_context,
                 coordinator_placement_mode=coordinator_placement_mode,
+                coordinator_top_workspace_id=coordinator_top_workspace_id or "",
                 probe=_FAST_PROBE,
             )
             anchor = read_anchor(repo)
@@ -1968,6 +1978,953 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                 coordinator_placement_mode="per_project_space",
             )
         self.assertNotIn("--label", herdr.workspace_creates[0])
+
+    def test_role_grouped_top_coordinator_keeps_dedicated_workspace(self) -> None:
+        # Redmine #14996: top remains an unlabelled, dedicated workspace and does
+        # not consult the shared project-coordinator label authority.
+        herdr = _Herdr(created_workspace="wTop")
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._prepare(
+                tmp,
+                providers=["claude", "codex"],
+                herdr=herdr,
+                lane="",
+                launch_context=LaneLaunchContext(lane_kind="coordinator"),
+                coordinator_placement_mode="role_grouped_space",
+            )
+        self.assertEqual(result.herdr_workspace_id, "wTop")
+        self.assertNotIn("--label", herdr.workspace_creates[0])
+        self.assertEqual(herdr.workspace_lists, [])
+
+    def test_role_grouped_project_coordinator_creates_shared_loose_pair(self) -> None:
+        # A top workspace may already exist; it is deliberately ignored. The
+        # delegated coordinator mints a distinct labelled overview workspace and
+        # stays a loose pair (no per-lane tab), so all projects remain visible.
+        herdr = _Herdr(created_workspace="wProjects")
+        herdr.workspace_labels = {"wTop": ""}
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._prepare(
+                tmp,
+                providers=["claude", "codex"],
+                herdr=herdr,
+                lane="project-accounting",
+                launch_context=LaneLaunchContext(
+                    lane_kind="delegated_coordinator"
+                ),
+                coordinator_placement_mode="role_grouped_space",
+            )
+        create = herdr.workspace_creates[0]
+        self.assertEqual(
+            create[create.index("--label") + 1], "project-coordinators"
+        )
+        self.assertEqual(result.herdr_workspace_id, "wProjects")
+        self.assertEqual(result.herdr_tab_id, "")
+        self.assertEqual(herdr.tab_creates, [])
+        self.assertTrue(all("--tab" not in argv for argv in herdr.start_argvs))
+        self.assertEqual(
+            sum("--split" in argv for argv in herdr.start_argvs), 1,
+            "the second slot must split beside the first as one project column",
+        )
+
+    def test_role_grouped_project_coordinator_adopts_exact_label(self) -> None:
+        herdr = _Herdr(created_workspace="wUnexpected")
+        herdr.workspace_labels = {
+            "wTop": "",
+            "wProjects": "project-coordinators",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._prepare(
+                tmp,
+                providers=["claude", "codex"],
+                herdr=herdr,
+                lane="project-operations",
+                launch_context=LaneLaunchContext(
+                    lane_kind="delegated_coordinator"
+                ),
+                coordinator_placement_mode="role_grouped_space",
+            )
+        self.assertEqual(result.herdr_workspace_id, "wProjects")
+        self.assertEqual(herdr.workspace_creates, [])
+        self.assertEqual(herdr.tab_creates, [])
+        for argv in herdr.start_argvs:
+            self.assertEqual(argv[argv.index("--workspace") + 1], "wProjects")
+
+    def test_role_grouped_implementation_keeps_project_host_and_lane_tab(self) -> None:
+        herdr = _Herdr(created_workspace="wHost")
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, repo = self._prepare(
+                tmp,
+                providers=["claude", "codex"],
+                herdr=herdr,
+                lane="implementation-1",
+                launch_context=LaneLaunchContext(lane_kind="implementation"),
+                coordinator_placement_mode="role_grouped_space",
+            )
+        create = herdr.workspace_creates[0]
+        self.assertEqual(create[create.index("--label") + 1], f"{repo.name}_sublanes")
+        self.assertEqual(result.herdr_workspace_id, "wHost")
+        self.assertTrue(result.herdr_tab_id)
+        self.assertEqual(len(herdr.tab_creates), 1)
+
+    def test_role_grouped_multi_project_restart_keeps_three_role_surfaces(self) -> None:
+        """Three role surfaces survive restart and remain semantically operable.
+
+        This is the #14996 acceptance shape, driven through one persistent fake Herdr
+        backend and one operator home: one top workspace, two project coordinators in
+        one shared workspace, and one implementation lane in its project's host/tab.
+        A missing project-coordinator slot then restarts into the shared workspace by
+        its own durable identity. From that same realized state, the top-level UX sends
+        once to each explicit project repo and aggregates both projects without a pane
+        id supplied by the caller.
+        """
+        from mozyo_bridge.application.cli import build_parser
+        from mozyo_bridge.core.state.coordinator_proxy_fence import (
+            CoordinatorProxyFence,
+        )
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.coordinator_proxy_send import (  # noqa: E501
+            render_bootstrap_decision_marker,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.coordinator_proxy import (  # noqa: E501
+            IssueExpectation,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (  # noqa: E501
+            SCHEMA_NAME,
+            SCHEMA_VERSION,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_runtime import (  # noqa: E501
+            ROLE_COORDINATOR,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            home.mkdir()
+            binpath = root / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            launcher_env, _ = self._fake_launcher_env(tmp)
+            env = _launch_env(binpath, **launcher_env)
+            repos = {
+                name: root / name
+                for name in ("top", "project-accounting", "project-operations")
+            }
+            for repo in repos.values():
+                repo.mkdir()
+            for repo in (
+                repos["project-accounting"],
+                repos["project-operations"],
+            ):
+                (repo / ".mozyo-bridge").mkdir()
+                (repo / ".mozyo-bridge" / "workflow-role-bindings.json").write_text(
+                    json.dumps(
+                        {
+                            "schema": SCHEMA_NAME,
+                            "version": SCHEMA_VERSION,
+                            "bindings": [
+                                {
+                                    "role": ROLE_COORDINATOR,
+                                    "project_scope": "project",
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            herdr = _Herdr(created_workspace="wTop")
+            herdr.attest_home = home
+            proxy_sends = []
+            proxy_payloads = []
+
+            def _orchestrate(send_args, *, default_kind):
+                self.assertEqual(default_kind, "custom")
+                proxy_sends.append(send_args)
+                return 0
+
+            def _start(repo, lane, kind):
+                return prepare_session(
+                    repo_root=repo,
+                    providers=["codex", "claude"],
+                    lane_id=lane,
+                    launch_context=LaneLaunchContext(lane_kind=kind),
+                    coordinator_placement_mode="role_grouped_space",
+                    coordinator_top_workspace_id=top_workspace_id,
+                    env=env,
+                    runner=herdr.run,
+                    probe=_FAST_PROBE,
+                )
+
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+            ):
+                register_workspace(repos["top"], home=home)
+                top_workspace_id = read_anchor(repos["top"])["workspace_id"]
+                top = _start(repos["top"], "", "coordinator")
+
+                herdr.created_workspace = "wProjects"
+                accounting = _start(
+                    repos["project-accounting"],
+                    "",
+                    "coordinator",
+                )
+                operations = _start(
+                    repos["project-operations"],
+                    "",
+                    "coordinator",
+                )
+
+                herdr.created_workspace = "wAccountingHost"
+                implementation = _start(
+                    repos["project-accounting"],
+                    "implementation-1",
+                    "implementation",
+                )
+
+                accounting_ws = read_anchor(repos["project-accounting"])["workspace_id"]
+                missing_name = encode_assigned_name(
+                    accounting_ws, "codex", ""
+                )
+                herdr.started_rows = [
+                    row for row in herdr.started_rows if row.get("name") != missing_name
+                ]
+                lists_before_heal = len(herdr.workspace_lists)
+                healed = _start(
+                    repos["project-accounting"],
+                    "",
+                    "coordinator",
+                )
+                lists_after_heal = len(herdr.workspace_lists)
+
+                # A fully adopted restart still proves the global label authority.
+                # It must reject ambiguity before reserving startup state or issuing
+                # any Herdr write; an own pin is placement, not an ambiguity bypass.
+                herdr.workspace_labels["wDuplicateProjects"] = "project-coordinators"
+                effects_before = (
+                    len(herdr.workspace_creates),
+                    len(herdr.tab_creates),
+                    len(herdr.start_argvs),
+                )
+                transaction_path = (
+                    "mozyo_bridge.e_140_adapter_provider."
+                    "f_130_terminal_runtime_provider.application.herdr_session_start."
+                    "open_startup_transaction_and_reserve_generations"
+                )
+                with patch(transaction_path) as reserve:
+                    with self.assertRaisesRegex(
+                        HerdrSessionStartError,
+                        "multiple herdr workspaces carry the shared "
+                        "project-coordinator label",
+                    ):
+                        _start(repos["project-accounting"], "", "coordinator")
+                reserve.assert_not_called()
+                self.assertEqual(
+                    (
+                        len(herdr.workspace_creates),
+                        len(herdr.tab_creates),
+                        len(herdr.start_argvs),
+                    ),
+                    effects_before,
+                )
+                del herdr.workspace_labels["wDuplicateProjects"]
+
+                CoordinatorProxyFence(home=home).bootstrap()
+                proxy_module = (
+                    "mozyo_bridge.e_110_execution_platform."
+                    "f_140_delegated_coordinator_nested_handoff.application."
+                    "coordinator_proxy_send"
+                )
+                live_rows = herdr.existing_rows + herdr.started_rows
+                with (
+                    patch(
+                        f"{proxy_module}.live_agent_rows",
+                        return_value=live_rows,
+                    ),
+                    patch(
+                        f"{proxy_module}.live_named_journal_note",
+                        return_value=(render_bootstrap_decision_marker(), True),
+                    ),
+                    patch(
+                        f"{proxy_module}.live_attestation_join",
+                        return_value=(True, "present", "generation matched"),
+                    ),
+                    patch(
+                        f"{proxy_module}.live_issue_expectation",
+                        side_effect=lambda _repo, issue, _decisions, action="": (
+                            IssueExpectation(
+                                issue=issue,
+                                owns_active_lane=False,
+                                latest_decision_journal="",
+                            )
+                        ),
+                    ),
+                    patch(
+                        "mozyo_bridge.application.commands.orchestrate_handoff",
+                        side_effect=_orchestrate,
+                    ),
+                ):
+                    for repo in (
+                        repos["project-accounting"],
+                        repos["project-operations"],
+                    ):
+                        args = build_parser().parse_args(
+                            [
+                                "--repo",
+                                str(repo),
+                                "workflow",
+                                "proxy",
+                                "--action",
+                                "bootstrap_lane",
+                                "--issue",
+                                "14996",
+                                "--journal",
+                                "99499",
+                                "--execute",
+                                "--json",
+                            ]
+                        )
+                        stdout = io.StringIO()
+                        with contextlib.redirect_stdout(stdout):
+                            self.assertEqual(args.func(args), 0)
+                        proxy_payloads.append(json.loads(stdout.getvalue()))
+
+                glance_snapshot = root / "glance.json"
+                glance_snapshot.write_text(
+                    json.dumps(
+                        {
+                            "issues": [
+                                {
+                                    "issue": "14996",
+                                    "subject": "accounting project coordinator",
+                                },
+                                {
+                                    "issue": "15017",
+                                    "subject": "operations project coordinator",
+                                },
+                            ]
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                glance_args = build_parser().parse_args(
+                    [
+                        "workflow",
+                        "glance",
+                        "--snapshot-json",
+                        str(glance_snapshot),
+                        "--no-ledger",
+                        "--json",
+                        "--issue",
+                        "14996",
+                        "--issue",
+                        "15017",
+                    ]
+                )
+                glance_stdout = io.StringIO()
+                with contextlib.redirect_stdout(glance_stdout):
+                    self.assertEqual(glance_args.func(glance_args), 0)
+                glance_payload = json.loads(glance_stdout.getvalue())
+
+        self.assertEqual(top.herdr_workspace_id, "wTop")
+        self.assertEqual(accounting.herdr_workspace_id, "wProjects")
+        self.assertEqual(operations.herdr_workspace_id, "wProjects")
+        self.assertEqual(implementation.herdr_workspace_id, "wAccountingHost")
+        self.assertTrue(implementation.herdr_tab_id)
+        self.assertEqual(healed.herdr_workspace_id, "wProjects")
+        self.assertEqual(
+            lists_after_heal, lists_before_heal + 2,
+            "preflight and final resolution both prove the shared label is singular",
+        )
+        labels = [
+            call[call.index("--label") + 1]
+            for call in herdr.workspace_creates
+            if "--label" in call
+        ]
+        self.assertEqual(labels.count("project-coordinators"), 1)
+        self.assertIn("project-accounting_sublanes", labels)
+        implementation_starts = [
+            argv for argv in herdr.start_argvs
+            if "MOZYO_LANE_ID=implementation-1" in argv
+        ]
+        self.assertTrue(implementation_starts)
+        self.assertTrue(all("wProjects" not in argv for argv in implementation_starts))
+        self.assertEqual(len(proxy_sends), 2)
+        self.assertEqual(
+            [Path(send.target_repo) for send in proxy_sends],
+            [
+                repos["project-accounting"].resolve(),
+                repos["project-operations"].resolve(),
+            ],
+        )
+        self.assertEqual([send.target_lane for send in proxy_sends], ["default"] * 2)
+        self.assertTrue(all(payload["sent"] for payload in proxy_payloads))
+        self.assertEqual(
+            [payload["lane_id"] for payload in proxy_payloads],
+            ["default", "default"],
+        )
+        self.assertEqual(glance_payload["count"], 2)
+        self.assertEqual(
+            [row["issue_id"] for row in glance_payload["rows"]],
+            ["14996", "15017"],
+        )
+
+    def test_role_grouped_own_pin_rejects_duplicate_shared_labels_before_effects(self) -> None:
+        """An own heal cannot bypass the one-shared-workspace authority."""
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            repo = root / "project-accounting"
+            top = root / "top"
+            for path in (home, repo, top):
+                path.mkdir()
+            binary = root / "fake-herdr"
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(binary.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+            ):
+                top_workspace_id = register_workspace(
+                    top, home=home
+                ).record.workspace_id
+                workspace_id = register_workspace(repo, home=home).record.workspace_id
+                herdr = _Herdr(
+                    existing_rows=[
+                        {
+                            "name": encode_assigned_name(workspace_id, "codex", ""),
+                            "pane_id": "wOwn:p1",
+                            "agent_status": "idle",
+                        }
+                    ]
+                )
+                herdr.workspace_labels = {
+                    "wSharedA": "project-coordinators",
+                    "wSharedB": "project-coordinators",
+                }
+                transaction_path = (
+                    "mozyo_bridge.e_140_adapter_provider."
+                    "f_130_terminal_runtime_provider.application.herdr_session_start."
+                    "open_startup_transaction_and_reserve_generations"
+                )
+                with patch(transaction_path) as reserve:
+                    with self.assertRaisesRegex(
+                        HerdrSessionStartError,
+                        "multiple herdr workspaces carry the shared "
+                        "project-coordinator label",
+                    ):
+                        prepare_session(
+                            repo_root=repo,
+                            providers=["claude"],
+                            lane_id="",
+                            launch_context=LaneLaunchContext(lane_kind="coordinator"),
+                            coordinator_placement_mode="role_grouped_space",
+                            coordinator_top_workspace_id=top_workspace_id,
+                            env=_launch_env(binary),
+                            runner=herdr.run,
+                        )
+                reserve.assert_not_called()
+
+        effects = {
+            tuple(call[:2])
+            for call in herdr.calls
+            if tuple(call[:2])
+            in {("workspace", "create"), ("tab", "create"), ("agent", "start")}
+        }
+        self.assertEqual(effects, set())
+
+    def test_role_grouped_project_dry_run_does_not_create_shared_lock(self) -> None:
+        """Read-only label validation must preserve the public dry-run lock contract."""
+        from mozyo_bridge.core.state.coordinator_placement_fence import (
+            coordinator_shared_create_lock_path,
+        )
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            repo = root / "project-accounting"
+            top = root / "top"
+            for path in (home, repo, top):
+                path.mkdir()
+            binary = root / "fake-herdr"
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(binary.stat().st_mode | stat.S_IEXEC)
+            herdr = _Herdr()
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+            ):
+                top_workspace_id = register_workspace(
+                    top, home=home
+                ).record.workspace_id
+                register_workspace(repo, home=home)
+                lock_path = coordinator_shared_create_lock_path(home)
+                self.assertFalse(lock_path.exists())
+                result = prepare_session(
+                    repo_root=repo,
+                    providers=["claude"],
+                    lane_id="",
+                    dry_run=True,
+                    launch_context=LaneLaunchContext(lane_kind="coordinator"),
+                    coordinator_placement_mode="role_grouped_space",
+                    coordinator_top_workspace_id=top_workspace_id,
+                    env=_launch_env(binary),
+                    runner=herdr.run,
+                )
+                self.assertFalse(lock_path.exists())
+
+        self.assertEqual(result.slots[0].outcome, SLOT_PLANNED)
+        self.assertEqual(herdr.workspace_creates, [])
+        self.assertTrue(herdr.workspace_lists)
+
+    def test_role_grouped_partial_failure_husk_is_adopted(self) -> None:
+        run1 = _Herdr(created_workspace="wProjects", start_fails=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(HerdrSessionStartError):
+                self._prepare(
+                    tmp,
+                    providers=["claude", "codex"],
+                    herdr=run1,
+                    lane="project-accounting",
+                    launch_context=LaneLaunchContext(
+                        lane_kind="delegated_coordinator"
+                    ),
+                    coordinator_placement_mode="role_grouped_space",
+                )
+        self.assertEqual(
+            run1.workspace_labels, {"wProjects": "project-coordinators"}
+        )
+
+        run2 = _Herdr(created_workspace="wDuplicate")
+        run2.workspace_labels = dict(run1.workspace_labels)
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._prepare(
+                tmp,
+                providers=["claude", "codex"],
+                herdr=run2,
+                lane="project-accounting",
+                launch_context=LaneLaunchContext(
+                    lane_kind="delegated_coordinator"
+                ),
+                coordinator_placement_mode="role_grouped_space",
+            )
+        self.assertEqual(result.herdr_workspace_id, "wProjects")
+        self.assertEqual(run2.workspace_creates, [])
+
+    def test_role_grouped_lock_failure_is_typed_and_has_zero_actuation(self) -> None:
+        import contextlib
+
+        from mozyo_bridge.core.state.coordinator_placement_fence import (
+            CoordinatorSharedCreateLockUnavailable,
+        )
+
+        @contextlib.contextmanager
+        def _unavailable(home):
+            raise CoordinatorSharedCreateLockUnavailable("simulated")
+            yield  # pragma: no cover
+
+        herdr = _Herdr(created_workspace="wProjects")
+        lock_path = (
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_role_grouped_space.coordinator_shared_create_lock"
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch(lock_path, _unavailable):
+            with self.assertRaises(HerdrSessionStartError):
+                self._prepare(
+                    tmp,
+                    providers=["claude", "codex"],
+                    herdr=herdr,
+                    lane="project-accounting",
+                    launch_context=LaneLaunchContext(
+                        lane_kind="delegated_coordinator"
+                    ),
+                    coordinator_placement_mode="role_grouped_space",
+                )
+        self.assertEqual(herdr.workspace_creates, [])
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+
+    def test_role_grouped_concurrent_projects_create_one_shared_workspace(self) -> None:
+        import contextlib
+        import threading
+
+        from mozyo_bridge.core.state import coordinator_placement_fence as _fence
+        from mozyo_bridge.core.state.startup_transaction_fence import (
+            StartupTransactionFence,
+        )
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        real_lock = _fence.coordinator_shared_create_lock
+        barrier = threading.Barrier(2)
+
+        @contextlib.contextmanager
+        def _barriered(home):
+            barrier.wait(timeout=20)
+            with real_lock(home):
+                yield
+
+        class _ConcurrentHerdr(_Herdr):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self._run_lock = threading.Lock()
+
+            def run(self, argv, **kwargs):
+                with self._run_lock:
+                    return super().run(argv, **kwargs)
+
+        lock_path = (
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_role_grouped_space.coordinator_shared_create_lock"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            home.mkdir()
+            binary = root / "fake-herdr"
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(binary.stat().st_mode | stat.S_IEXEC)
+            herdr = _ConcurrentHerdr(created_workspace="wProjects")
+            herdr.attest_home = home
+            repos = [root / "accounting", root / "operations"]
+            top_repo = root / "top"
+            results = {}
+            errors = {}
+
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+            ):
+                top_repo.mkdir()
+                register_workspace(top_repo, home=home)
+                top_workspace_id = read_anchor(top_repo)["workspace_id"]
+                for repo in repos:
+                    repo.mkdir()
+                    register_workspace(repo, home=home)
+
+                def _launch(name, repo):
+                    try:
+                        results[name] = prepare_session(
+                            repo_root=repo,
+                            providers=["claude", "codex"],
+                            lane_id="",
+                            launch_context=LaneLaunchContext(lane_kind="coordinator"),
+                            coordinator_placement_mode="role_grouped_space",
+                            coordinator_top_workspace_id=top_workspace_id,
+                            env=_launch_env(binary),
+                            runner=herdr.run,
+                            startup_fence=StartupTransactionFence(
+                                path=root / f"startup-{name}.sqlite"
+                            ),
+                            probe=_FAST_PROBE,
+                        )
+                    except BaseException as exc:  # noqa: BLE001 - asserted below
+                        errors[name] = exc
+
+                with patch(lock_path, _barriered):
+                    threads = [
+                        threading.Thread(target=_launch, args=(name, repo))
+                        for name, repo in zip(("accounting", "operations"), repos)
+                    ]
+                    for thread in threads:
+                        thread.start()
+                    for thread in threads:
+                        thread.join(timeout=30)
+
+        self.assertEqual(errors, {}, msg=f"launch errors: {errors}")
+        self.assertEqual(len(herdr.workspace_creates), 1)
+        self.assertEqual(
+            {result.herdr_workspace_id for result in results.values()}, {"wProjects"}
+        )
+        self.assertEqual(
+            herdr.workspace_labels, {"wProjects": "project-coordinators"}
+        )
+
+    def test_role_grouped_production_actuator_reads_config_and_places_project(self) -> None:
+        """The managed actuator, not only prepare_session, composes the new mode."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_ops import (  # noqa: E501
+            HerdrSublaneActuatorOps,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.coordinator_placement_loader import (  # noqa: E501
+            coordinator_placement_path,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            coordinator = root / "coordinator"
+            worktree = root / "project-runtime"
+            home.mkdir()
+            coordinator.mkdir()
+            worktree.mkdir()
+            top = root / "top"
+            top.mkdir()
+            register_workspace(top, home=home)
+            top_workspace_id = read_anchor(top)["workspace_id"]
+            coordinator_placement_path(home).write_text(
+                "mode: role_grouped_space\n"
+                f"top_workspace_id: {top_workspace_id}\n",
+                encoding="utf-8",
+            )
+            binary = root / "fake-herdr"
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(binary.stat().st_mode | stat.S_IEXEC)
+            launcher_env, _ = self._fake_launcher_env(tmp)
+            env = _launch_env(binary, **launcher_env)
+            herdr = _Herdr(created_workspace="wProjects")
+            herdr.attest_home = home
+            actuator = HerdrSublaneActuatorOps(
+                repo_root=coordinator,
+                lane_label="project-accounting",
+                issue="14996",
+                lane_kind="delegated_coordinator",
+                env=env,
+                runner=herdr.run,
+            )
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+            ):
+                result = actuator.append_lane_column(str(worktree))
+
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            herdr.workspace_labels, {"wProjects": "project-coordinators"}
+        )
+        self.assertTrue(herdr.workspace_lists)
+        self.assertEqual(herdr.tab_creates, [])
+        self.assertEqual(len(herdr.start_argvs), 2)
+        self.assertTrue(all("--tab" not in argv for argv in herdr.start_argvs))
+        self.assertEqual(
+            {
+                argv[argv.index("--workspace") + 1]
+                for argv in herdr.start_argvs
+            },
+            {"wProjects"},
+        )
+
+    def test_role_grouped_named_lane_without_kind_fails_before_herdr(self) -> None:
+        herdr = _Herdr(created_workspace="wShouldNotExist")
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(HerdrSessionStartError):
+                self._prepare(
+                    tmp,
+                    providers=["claude", "codex"],
+                    herdr=herdr,
+                    lane="unknown-role",
+                    coordinator_placement_mode="role_grouped_space",
+                )
+        self.assertEqual(herdr.calls, [])
+
+    def test_role_grouped_unknown_top_refuses_before_current_repo_registration(self) -> None:
+        from mozyo_bridge.core.state.workspace_registry import (
+            ANCHOR_RELATIVE,
+            registry_path,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            home = Path(tmp) / "home"
+            repo.mkdir()
+            home.mkdir()
+            herdr = _Herdr(created_workspace="wShouldNotExist")
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+            ):
+                with self.assertRaises(HerdrSessionStartError):
+                    prepare_session(
+                        repo_root=repo,
+                        providers=["claude"],
+                        lane_id="",
+                        launch_context=LaneLaunchContext(lane_kind="coordinator"),
+                        coordinator_placement_mode="role_grouped_space",
+                        coordinator_top_workspace_id="d" * 32,
+                        env=_launch_env(Path(tmp) / "not-consulted-herdr"),
+                        runner=herdr.run,
+                    )
+            self.assertFalse((repo / ANCHOR_RELATIVE).exists())
+            self.assertFalse(registry_path(home).exists())
+        self.assertEqual(herdr.calls, [])
+
+    def test_role_grouped_unrequested_stale_project_identity_refuses_before_actuation(self) -> None:
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            home = Path(tmp) / "home"
+            repo.mkdir()
+            home.mkdir()
+            binary = Path(tmp) / "fake-herdr"
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(binary.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+            ):
+                register_workspace(repo, home=home)
+                workspace_id = read_anchor(repo)["workspace_id"]
+                herdr = _Herdr(
+                    existing_rows=[
+                        {
+                            "name": encode_assigned_name(
+                                workspace_id, "codex", "project-accounting"
+                            ),
+                            "pane_id": "wOld:p1",
+                            "agent_status": "unknown",
+                        }
+                    ]
+                )
+                with self.assertRaises(HerdrSessionStartError):
+                    prepare_session(
+                        repo_root=repo,
+                        providers=["claude"],
+                        lane_id="project-accounting",
+                        launch_context=LaneLaunchContext(
+                            lane_kind="delegated_coordinator"
+                        ),
+                        coordinator_placement_mode="role_grouped_space",
+                        coordinator_top_workspace_id=workspace_id,
+                        env=_launch_env(binary),
+                        runner=herdr.run,
+                    )
+        writes = {
+            tuple(call[:2])
+            for call in herdr.calls
+            if tuple(call[:2])
+            in {("workspace", "create"), ("tab", "create"), ("agent", "start")}
+        }
+        self.assertEqual(writes, set())
+
+    def test_role_grouped_unrequested_stale_top_identity_refuses_before_actuation(self) -> None:
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            home = Path(tmp) / "home"
+            repo.mkdir()
+            home.mkdir()
+            binary = Path(tmp) / "fake-herdr"
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(binary.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+            ):
+                register_workspace(repo, home=home)
+                workspace_id = read_anchor(repo)["workspace_id"]
+                herdr = _Herdr(
+                    existing_rows=[
+                        {
+                            "name": encode_assigned_name(workspace_id, "codex", ""),
+                            "pane_id": "wOld:p1",
+                            "agent_status": "unknown",
+                        }
+                    ]
+                )
+                with self.assertRaises(HerdrSessionStartError):
+                    prepare_session(
+                        repo_root=repo,
+                        providers=["claude"],
+                        lane_id="",
+                        launch_context=LaneLaunchContext(lane_kind="coordinator"),
+                        coordinator_placement_mode="role_grouped_space",
+                        coordinator_top_workspace_id=workspace_id,
+                        env=_launch_env(binary),
+                        runner=herdr.run,
+                    )
+        writes = {
+            tuple(call[:2])
+            for call in herdr.calls
+            if tuple(call[:2])
+            in {("workspace", "create"), ("tab", "create"), ("agent", "start")}
+        }
+        self.assertEqual(writes, set())
+
+    def test_role_grouped_unrequested_stale_default_project_refuses_before_actuation(self) -> None:
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            top = root / "top"
+            home = root / "home"
+            for path in (repo, top, home):
+                path.mkdir()
+            binary = root / "fake-herdr"
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(binary.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+            ):
+                top_workspace_id = register_workspace(top, home=home).record.workspace_id
+                workspace_id = register_workspace(repo, home=home).record.workspace_id
+                herdr = _Herdr(
+                    existing_rows=[
+                        {
+                            "name": encode_assigned_name(workspace_id, "codex", ""),
+                            "pane_id": "wOld:p1",
+                            "agent_status": "unknown",
+                        }
+                    ]
+                )
+                with self.assertRaises(HerdrSessionStartError):
+                    prepare_session(
+                        repo_root=repo,
+                        providers=["claude"],
+                        lane_id="",
+                        launch_context=LaneLaunchContext(lane_kind="coordinator"),
+                        coordinator_placement_mode="role_grouped_space",
+                        coordinator_top_workspace_id=top_workspace_id,
+                        env=_launch_env(binary),
+                        runner=herdr.run,
+                    )
+        writes = {
+            tuple(call[:2])
+            for call in herdr.calls
+            if tuple(call[:2])
+            in {("workspace", "create"), ("tab", "create"), ("agent", "start")}
+        }
+        self.assertEqual(writes, set())
+
+    def test_role_grouped_unrequested_stale_implementation_refuses_before_actuation(self) -> None:
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            top = root / "top"
+            home = root / "home"
+            for path in (repo, top, home):
+                path.mkdir()
+            binary = root / "fake-herdr"
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(binary.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+            ):
+                top_workspace_id = register_workspace(top, home=home).record.workspace_id
+                workspace_id = register_workspace(repo, home=home).record.workspace_id
+                lane = "implementation-1"
+                herdr = _Herdr(
+                    existing_rows=[
+                        {
+                            "name": encode_assigned_name(workspace_id, "codex", lane),
+                            "pane_id": "wOld:p1",
+                            "agent_status": "unknown",
+                        }
+                    ]
+                )
+                with self.assertRaises(HerdrSessionStartError):
+                    prepare_session(
+                        repo_root=repo,
+                        providers=["claude"],
+                        lane_id=lane,
+                        launch_context=LaneLaunchContext(lane_kind="implementation"),
+                        coordinator_placement_mode="role_grouped_space",
+                        coordinator_top_workspace_id=top_workspace_id,
+                        env=_launch_env(binary),
+                        runner=herdr.run,
+                    )
+        writes = {
+            tuple(call[:2])
+            for call in herdr.calls
+            if tuple(call[:2])
+            in {("workspace", "create"), ("tab", "create"), ("agent", "start")}
+        }
+        self.assertEqual(writes, set())
 
     def test_shared_space_leaves_sublane_placement_unchanged(self) -> None:
         # shared_space only diverges the DEFAULT lane; a sublane launch under the same

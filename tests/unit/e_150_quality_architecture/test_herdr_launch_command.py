@@ -490,10 +490,13 @@ class CoordinatorPermissionParityTests(unittest.TestCase):
     default is set — with ``prepare_session`` patched, so no live herdr binary runs.
     """
 
-    def _captured_prepare_kwargs(self) -> dict:
+    def _captured_prepare_kwargs(self, placement=None) -> dict:
         from unittest.mock import patch
 
         from mozyo_bridge.application import herdr_launch_command as mod
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.coordinator_placement_mode import (  # noqa: E501
+            CoordinatorPlacementConfig,
+        )
 
         seen: dict = {}
 
@@ -502,7 +505,15 @@ class CoordinatorPermissionParityTests(unittest.TestCase):
             return _ready_result()
 
         ops = mod.LiveHerdrLaunchOps(env={"MOZYO_HERDR_BINARY": "/usr/bin/true"})
-        with patch.object(mod, "prepare_session", _fake_prepare_session):
+        placement = placement or CoordinatorPlacementConfig.default()
+        loader = (
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.coordinator_placement_loader."
+            "load_coordinator_placement_for_launch"
+        )
+        with patch.object(mod, "prepare_session", _fake_prepare_session), patch(
+            loader, return_value=placement
+        ):
             ops.prepare(Path("/repo"))
         return seen
 
@@ -520,6 +531,22 @@ class CoordinatorPermissionParityTests(unittest.TestCase):
         # The coordinator pair is still claude + codex in the default (no-lane) session.
         self.assertEqual(list(seen.get("providers")), ["claude", "codex"])
         self.assertEqual(seen.get("lane_id"), "")
+
+    def test_prepare_forwards_complete_role_grouped_top_authority(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.coordinator_placement_mode import (  # noqa: E501
+            ROLE_GROUPED_SPACE,
+            CoordinatorPlacementConfig,
+        )
+
+        top_workspace_id = "a" * 32
+        seen = self._captured_prepare_kwargs(
+            CoordinatorPlacementConfig(
+                mode=ROLE_GROUPED_SPACE,
+                top_workspace_id=top_workspace_id,
+            )
+        )
+        self.assertEqual(seen["coordinator_placement_mode"], ROLE_GROUPED_SPACE)
+        self.assertEqual(seen["coordinator_top_workspace_id"], top_workspace_id)
 
 
 if __name__ == "__main__":

@@ -967,7 +967,7 @@ launch 側は単一の `except` でそれを typed zero-start に変換するた
 
 ## 5.1.1 coordinator placement mode — operator-scoped 配置 (Redmine #14139)
 
-coordinator pair (default lane) を **どの herdr workspace に置くか**を operator ごとに切り替える
+coordinator pair を **役割ごとにどの herdr workspace に置くか**を operator ごとに切り替える
 closed knob。§5.1 `lane_placement` (pair 内部の split 方向 / 役割順序、repo-committed) とは**別関心・別
 source**であり、`_launch_target_for_lane` (#13380) / `_tab_target_for_lane` (#13411) の sublane 配置軸は
 一切変えない。
@@ -983,8 +983,22 @@ schema とも将来の home-config schema (#14148) とも衝突させない。
 
 ```yaml
 # ~/.mozyo_bridge/coordinator-placement.yaml
-mode: shared_space          # per_project_space | shared_space
+version: 1
+mode: role_grouped_space    # per_project_space | shared_space | role_grouped_space
+top_workspace_id: <stable workspace_id of the top coordinator repo>
 ```
+
+`top_workspace_id` は workspace registry の durable ID であり、Herdr の `w5A` のような
+runtime workspace ID、pane ID、repo名、表示labelではない。top repoを先に
+`mozyo-bridge workspace register` し、
+`mozyo-bridge workspace inspect --repo <top-repo> --json` で得た exact
+`workspace_id` を設定する。production launchは同じoperator homeのregistryにこのIDが存在し、その
+`canonical_path` がlive directoryかつgit checkoutならmain worktreeであることをproduction composition
+rootとpublic `prepare_session` entryの両方で、lock取得・current repo登録より前にread-only照合する。
+canonical checkoutにworkspace anchorが存在する場合は、その有効な
+`workspace_id`もregistry値とbyte一致しなければならない。current/legacy両anchor名の同時存在、
+invalid anchor、registryとの不一致はfail-closedする。anchorが無いregistry-only workspaceは既存互換として
+許容する。不在・dead path・linked-worktree authorityならcurrent repoを登録・起動せずfail-closedする。
 
 ### Closed vocabulary (unknown fail-closed)
 
@@ -992,6 +1006,12 @@ mode: shared_space          # per_project_space | shared_space
   (#13380 の従来動作)。opt-in しない operator は pre-#14139 と byte 一致で起動する。
 - `shared_space`: 全 project の coordinator pair を **1 つの stable shared coordinators workspace** に置き、
   project ごとに column とする (tmux 時代の俯瞰運用の復元)。
+- `role_grouped_space` (#14996): exact `top_workspace_id` と一致するdefault coordinatorだけを
+  top専用workspaceに保ち、それ以外のproject repoのdefault coordinatorとdurable
+  `lane_kind=delegated_coordinator` を **1 つの shared `project-coordinators` workspace**へ置く。
+  `lane_kind=implementation` は従来のproject別sublane host + lane tabに置く。top IDの不在・
+  registry不一致、default laneのkind矛盾、named laneのdurable `lane_kind` 欠落・矛盾は、
+  provider名・repo名・現在位置から推測せずHerdr actuation前にfail-closedする。
 - それ以外の `mode` 文字列 / unknown key / 非 mapping / unsupported version は
   `CoordinatorPlacementError` で fail-closed (未知 shape が per_project_space に化けない)。
 
@@ -1056,6 +1076,41 @@ workspace に跨る場合は identity conflict として fail-closed (#13330 pos
 default-lane path でのみ発火し、`per_project_space` と全 sublane launch は `workspace list` も lock も発行せず
 byte-invariant を保つ。
 
+### role_grouped_space — top 専用 + project coordinator 共有
+
+`role_grouped_space` はrole routingを変更せず、operatorが明示したstable logical
+`top_workspace_id`と既存canonical `lane_kind`を配置判定にだけ使う。default laneはすべて
+`lane_kind=coordinator`でなければならず、そのうちcurrent `workspace_id == top_workspace_id`だけが
+top専用workspaceに残る。その他のdefault coordinatorとnamed `delegated_coordinator` laneは
+exact label `project-coordinators` のworkspaceをcross-project adoptする。topのunlabelled workspaceは
+正常な別workspaceなので、legacy `shared_space` の「foreign default pairはmode-transition conflict」
+という判定を流用しない。
+
+project coordinator pair はdefault/namedを問わずshared workspace内のloose pair
+(projectごとのcolumn)とし、
+implementation lane 用 tab を作らない。named `implementation` lane は従来どおり
+`<project>_sublanes` workspace と lane tab を使う。exact label が複数または unreadable なら
+fail-closed、無ければ home-scoped single-flight fence 内で 1 個だけ create する。
+fresh implementation lane の host 解決では、exact label `project-coordinators` にいる row を
+候補から除外してから既存の project host resolver を適用する。同じ project identity を持つ project
+coordinator が先に起動していても、それを implementation sibling と誤認して共有 workspace へ混在させない。
+
+本 mode も launch-time only であり、既存 live pane の move / swap / relabel / close はしない。
+すでに別 workspace で live な project coordinator は own identity pin を優先してその場で heal し、
+明示 retire 後の fresh relaunch から shared workspace へ収束する。ただし own pin がある heal でも
+single-flight fence 内で exact label inventory を読み、unreadable または複数なら agent start 前に
+fail-closed する。この検査は全slot adopt済みでも省略せず、startup action / launch generation の予約前に行う。
+dry-run はlock artifactを作らず同じinventoryをread-only検査する。inventory が readable かつ label が
+0 または 1 個の場合だけ、pane を移動せず own pin を返す。
+
+topからの通常操作はphysical paneをaddressしない。外部clientからprojectへ指示するときは対象ごとに
+`mozyo-bridge --repo <project-root> workflow proxy ...` を使う。このrailの送信先は対象repoのliveかつ
+attestedなdefault coordinatorだけであり、名前付き`delegated_coordinator`へ拡張しない。名前付き
+project coordinatorへの転送は既存のsame-lane role forwardを使い、placement modeはrouting authorityを
+変更しない。複数projectの進捗はrepeatable `workflow glance --issue <id> ...` で1つのread modelへ
+集約する。既存 `workflow step` が複数gatewayを `gateway_target_ambiguous` として拒否する契約は
+安全境界なので、本placement modeは暗黙broadcastへ変更しない。
+
 ### project 列順 — deterministic append order (not arbitrary live reorder)
 
 Herdr の public launch API は既存 workspace 内への任意 insert / reorder target を持たない (`agent start` に
@@ -1083,14 +1138,19 @@ stable project key 順に append する。これは今回、未使用 helper や
 mode は **launch / adopt 時のみ**読む。設定を変えても既存 live pair は自動で動かない (herdr は same-tab
 re-split を拒否する; live 再配置は live-relayout runbook のみ, #13648)。適用は **次回の fresh launch / adopt**
 から。config 読取りは composition root (`herdr_launch_command` の bare `mozyo` coordinator launch /
-`herdr_session_start_cli`) で行い、pure な `prepare_session` へ解決済み mode 文字列を渡す (ambient IO を pure core に
-持ち込まない)。壊れた operator file は composition root で actionable に fail-closed する。
+`herdr_session_start_cli` / managed lane の `prepare_actuator_lane_session`) で行い、configの
+`mode` と `top_workspace_id` を `prepare_session` へ渡す。composition rootはrole-grouped時に
+top IDのregistry存在・canonical checkout liveness・存在するworkspace anchorとのidentity一致を
+read-onlyで照合する。壊れたoperator file / unknown top / registry-anchor driftはactionableにfail-closedする。
 
 ### Compatibility
 
 - 未設定 = `per_project_space` = pre-#14139 と byte 一致 (project workspace は無 label で create)。
 - `shared_space` が分岐させるのは **default lane のみ**。同 mode 下でも sublane launch は #13380 host label
   (`<project>_sublanes`) を保ち、`coordinators` にはならない。
+- `role_grouped_space` が共有するのは **top以外のdefault coordinatorとnamed
+  `delegated_coordinator` lane**。exact top default laneとnamed `implementation` laneは、それぞれ
+  専用workspace / project別hostの既存配置を保つ。
 
 ### 高レベル isolated smoke harness (Redmine #14187)
 

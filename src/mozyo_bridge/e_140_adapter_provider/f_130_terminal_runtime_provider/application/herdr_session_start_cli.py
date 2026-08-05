@@ -141,19 +141,18 @@ def cmd_herdr_session_start(args: argparse.Namespace) -> int:
         raise AssertionError("unreachable")
     agent_launch = repo_config.agent_launch
     lane_placement = repo_config.lane_placement
-    # Operator-scoped coordinator placement mode (Redmine #14139): read from the
-    # mozyo-bridge HOME, not the repo. It only affects the default (coordinator) lane;
-    # a lane session-start passes it through harmlessly. A broken operator file fails
-    # closed with an actionable refusal, exactly like the repo-local config above.
+    # Operator-scoped placement mode (#14139 / #14996), read from HOME. The
+    # role-grouped mode places a named lane only when its durable lane_kind proves
+    # the role; a missing role fact fails closed instead of guessing.
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.coordinator_placement_loader import (  # noqa: E501
-        resolve_coordinator_placement_mode,
+        load_coordinator_placement_for_launch,
     )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.coordinator_placement_mode import (  # noqa: E501
         CoordinatorPlacementError,
     )
 
     try:
-        coordinator_placement_mode = resolve_coordinator_placement_mode()
+        coordinator_placement = load_coordinator_placement_for_launch()
     except CoordinatorPlacementError as exc:
         die(f"herdr session-start failed: invalid operator coordinator placement: {exc}")
         raise AssertionError("unreachable")
@@ -181,7 +180,8 @@ def cmd_herdr_session_start(args: argparse.Namespace) -> int:
             claude_permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
             agent_launch=agent_launch,
             lane_placement=lane_placement,
-            coordinator_placement_mode=coordinator_placement_mode,
+            coordinator_placement_mode=coordinator_placement.mode,
+            coordinator_top_workspace_id=coordinator_placement.top_workspace_id,
         )
     except HerdrSessionStartError as exc:
         die(f"herdr session-start failed: {exc}")

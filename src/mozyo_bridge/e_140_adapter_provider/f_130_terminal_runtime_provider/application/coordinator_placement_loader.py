@@ -39,8 +39,15 @@ from typing import Optional, Union
 import yaml
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.coordinator_placement_mode import (  # noqa: E501
+    ROLE_GROUPED_SPACE,
     CoordinatorPlacementConfig,
     CoordinatorPlacementError,
+)
+from mozyo_bridge.core.state.workspace_registry import (
+    anchor_resolution,
+    load_workspace_by_id,
+    probe_canonical_liveness,
+    read_anchor,
 )
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
@@ -181,11 +188,84 @@ def resolve_coordinator_placement_mode(home: Union[str, Path, None] = None) -> s
     return load_coordinator_placement(home).mode
 
 
+def load_coordinator_placement_for_launch(
+    home: Union[str, Path, None] = None,
+) -> CoordinatorPlacementConfig:
+    """Load config and prove its referenced top identity before launch effects.
+
+    Schema parsing and registry-reference validation are deliberately separate:
+    :func:`load_coordinator_placement` remains the pure file/config inspection
+    surface, while production composition roots use this function. A role-grouped
+    config whose top id is absent from the same operator home fails before
+    ``prepare_session`` can register the repository being launched.
+    """
+    config = load_coordinator_placement(home)
+    if config.mode != ROLE_GROUPED_SPACE:
+        return config
+    resolved_home = (
+        Path(home).expanduser().resolve() if home is not None else mozyo_bridge_home()
+    )
+    validate_top_workspace_reference(
+        config.top_workspace_id,
+        home=resolved_home,
+        error_type=CoordinatorPlacementLoadError,
+    )
+    return config
+
+
+def validate_top_workspace_reference(
+    top_workspace_id: str,
+    *,
+    home: Path,
+    error_type: type[Exception],
+) -> None:
+    """Prove the configured top is a live canonical workspace, read-only."""
+    record = load_workspace_by_id(top_workspace_id, home=home)
+    if record is None:
+        raise error_type(
+            "operator coordinator placement 'top_workspace_id' is not present in "
+            "this operator's workspace registry; register the top repository and "
+            "copy its stable workspace_id from `mozyo-bridge workspace inspect "
+            "--repo <top-repo> --json`"
+        )
+    liveness = probe_canonical_liveness(record.canonical_path)
+    if not liveness.get("is_dir") or liveness.get("is_main_worktree") is False:
+        raise error_type(
+            "operator coordinator placement 'top_workspace_id' resolves to a stale "
+            "canonical workspace (missing directory or linked worktree); repair the "
+            "workspace registry before launching role_grouped_space"
+        )
+    canonical_root = Path(record.canonical_path)
+    anchor_names = anchor_resolution(canonical_root)
+    if anchor_names.both_exist:
+        raise error_type(
+            "operator coordinator placement 'top_workspace_id' resolves to a canonical "
+            "workspace with both current and legacy workspace anchors; remove the "
+            "superseded legacy anchor after confirming the current anchor"
+        )
+    if not anchor_names.neither_exists:
+        anchor = read_anchor(canonical_root)
+        if anchor is None:
+            raise error_type(
+                "operator coordinator placement 'top_workspace_id' resolves to a canonical "
+                "workspace with an invalid workspace anchor; repair the anchor before "
+                "launching role_grouped_space"
+            )
+        if anchor.get("workspace_id") != record.workspace_id:
+            raise error_type(
+                "operator coordinator placement 'top_workspace_id' disagrees with the "
+                "canonical workspace anchor; repair the registry/anchor identity drift "
+                "before launching role_grouped_space"
+            )
+
+
 __all__ = (
     "COORDINATOR_PLACEMENT_RELPATH",
     "CoordinatorPlacementLoadError",
     "coordinator_placement_path",
     "load_coordinator_placement",
+    "load_coordinator_placement_for_launch",
     "load_coordinator_placement_from_path",
     "resolve_coordinator_placement_mode",
+    "validate_top_workspace_reference",
 )
