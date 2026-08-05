@@ -519,16 +519,21 @@ def reflow_project_columns(
     )
     own_launched = tuple(slot.locator for slot in own_slots)
     rows = _list_rows(binary, runner, timeout)
-    own_key = (result.workspace_id, _norm(result.lane_id) or DEFAULT_LANE)
     decision = (authority or project_column_authority(home)).resolve(
         rows,
         target_workspace=target_workspace,
         own_slots=own_slots,
+        # The run's own claim is an INPUT to the join, not a second derivation
+        # beside it: a result naming one project whose slots were another's live
+        # panes once reported a column for a project the workspace does not hold
+        # (review j#99938 finding_2).
+        expected_own_key=(result.workspace_id, _norm(result.lane_id) or DEFAULT_LANE),
         top_workspace_id=top_workspace_id,
     )
     if not decision.ok:
         return COLUMN_FAILED, f"{decision.refusal}; no live pane was moved"
     groups = decision.groups
+    own_key = decision.own_key
     if not [key for key in groups if key != own_key]:
         return COLUMN_NOT_APPLICABLE, (
             "this project is the only coordinator pair in the shared workspace, so "

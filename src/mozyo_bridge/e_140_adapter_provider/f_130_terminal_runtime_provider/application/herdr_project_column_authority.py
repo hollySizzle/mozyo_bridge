@@ -91,6 +91,12 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 #: rather than merely tested for emptiness.
 _DETECTED_AGENT_KEY = "agent"
 
+#: The ``agent list`` key naming the herdr workspace a row lives in. Live rows carry
+#: it alongside the locator (measured on the operator's running herdr), so a row can
+#: claim this workspace even when its locator is unusable — which is exactly the row
+#: a locator-only scope test walked past (review j#99938 finding_1).
+AGENT_KEY_WORKSPACE = "workspace_id"
+
 
 @dataclass(frozen=True)
 class CoordinatorPane:
@@ -157,6 +163,11 @@ class ProjectGroupDecision:
 
     groups: "Mapping[tuple[str, str], tuple[CoordinatorPane, ...]]"
     refusal: str = ""
+    #: The pair key this run's own launched panes decode to (``None`` when the run
+    #: launched none). The single source for "which pair is ours" — deriving a
+    #: second one beside it is what let a run claim a project the workspace does
+    #: not hold (review j#99938 finding_2).
+    own_key: "Optional[tuple[str, str]]" = None
 
     @property
     def ok(self) -> bool:
@@ -296,8 +307,28 @@ def coordinator_panes_in(
         if not isinstance(row, Mapping):
             return (), "the herdr inventory contains a row this module cannot read"
         locator = _agent_locator(row)
-        if not locator or _workspace_prefix(locator) != target_workspace:
+        prefix = _workspace_prefix(locator)
+        # SCOPE is itself a conjunct, not a preamble to one. A row states its
+        # workspace TWICE — explicitly, and inside its locator — and a row that
+        # claims this workspace without a usable locator used to fall out of scope
+        # entirely, so an unexplained pane rode along until the closing tiling
+        # check failed six moves later (review j#99938 finding_1).
+        declared = _norm(row.get(AGENT_KEY_WORKSPACE))
+        if declared and declared != target_workspace and prefix != target_workspace:
             continue
+        if not declared and prefix != target_workspace:
+            continue
+        if not locator:
+            return (), (
+                f"a row claiming workspace {target_workspace!r} carries no pane "
+                "locator; refusing to reshape a workspace holding a pane this plan "
+                "cannot address"
+            )
+        if declared and prefix and declared != prefix:
+            return (), (
+                f"pane {locator!r} reports workspace {declared!r} while its locator "
+                f"says {prefix!r}; refusing to reason about a contradictory row"
+            )
         if locator in seen:
             return (), (
                 f"pane {locator!r} appears twice in the herdr inventory; refusing to "
@@ -368,6 +399,7 @@ class ProjectColumnAuthority:
         *,
         target_workspace: str,
         own_slots: Sequence[OwnSlot] = (),
+        expected_own_key: "Optional[tuple[str, str]]" = None,
         top_workspace_id: str = "",
     ) -> ProjectGroupDecision:
         panes, refusal = coordinator_panes_in(rows, target_workspace)
@@ -383,7 +415,7 @@ class ProjectColumnAuthority:
             if refusal:
                 return ProjectGroupDecision.refused(refusal)
 
-        own_key, refusal = self._own_key(groups, own_index)
+        own_key, refusal = self._own_key(groups, own_index, expected_own_key)
         if refusal:
             return ProjectGroupDecision.refused(refusal)
 
@@ -405,7 +437,7 @@ class ProjectColumnAuthority:
                     f"pane {pane.locator!r} has no usable startup self-attestation "
                     f"({state})"
                 )
-        return ProjectGroupDecision(groups=groups)
+        return ProjectGroupDecision(groups=groups, own_key=own_key)
 
     # -- phases ------------------------------------------------------------
     def _provider_shape_refusal(
@@ -464,6 +496,7 @@ class ProjectColumnAuthority:
         self,
         groups: "Mapping[tuple[str, str], tuple[CoordinatorPane, ...]]",
         own_index: "Mapping[str, OwnSlot]",
+        expected_own_key: "Optional[tuple[str, str]]",
     ) -> "tuple[Optional[tuple[str, str]], str]":
         """``(own pair key, refusal)`` from the panes this run actually launched.
 
@@ -472,6 +505,14 @@ class ProjectColumnAuthority:
         is not exempt (review j#99931 finding_1). A locator this run claims that is
         absent from the workspace, or present under a different identity, is a
         contradiction rather than something to fall back from.
+
+        That join proves the slots are self-consistent WITHIN the inventory, which
+        is not the same as proving they are the project the run says it launched:
+        a result naming project C whose slots were project A's live panes passed it
+        and then reported a column for a project the workspace does not hold
+        (review j#99938 finding_2). ``expected_own_key`` closes that by making the
+        run's own claim part of the join, and the resolved key rides back on the
+        decision so no caller re-derives a second one.
         """
         if not own_index:
             return None, ""
@@ -497,7 +538,14 @@ class ProjectColumnAuthority:
                 f"this run's launched panes span {len(keys)} project pairs; refusing "
                 "to exempt an ambiguous set"
             )
-        return keys.pop(), ""
+        resolved = keys.pop()
+        if expected_own_key is not None and resolved != expected_own_key:
+            return None, (
+                f"this run reports project {expected_own_key!r} but the panes it "
+                f"launched decode to {resolved!r}; refusing to reason about a run "
+                "whose own identity the workspace does not corroborate"
+            )
+        return resolved, ""
 
     def _observable_refusal(self, pane: CoordinatorPane) -> str:
         """Facts every pane can answer from the inventory alone — own included.

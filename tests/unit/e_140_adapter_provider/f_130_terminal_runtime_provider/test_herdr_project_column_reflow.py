@@ -317,6 +317,7 @@ class ProjectColumnAuthorityTest(unittest.TestCase):
             "pane_id": locator,
             "agent_status": "idle",
             "agent": role,
+            "workspace_id": "w1",
             "foreground_cwd": f"/roots/{workspace}",
         }
         row.update(over)
@@ -494,6 +495,68 @@ class ProjectColumnAuthorityTest(unittest.TestCase):
         )
         self.assertFalse(decision.ok)
         self.assertIn("inventory does not hold it", decision.refusal)
+
+    def test_the_decision_carries_the_resolved_own_key(self):
+        """One source for "which pair is ours" (review j#99938 finding_2)."""
+        own = OwnSlot(
+            locator="w1:p4", assigned_name=encode_assigned_name(B, "codex"),
+            provider="codex",
+        )
+        authority = self._authority(workspaces=self._resolvable(A, B))
+        decision = authority.resolve(
+            [
+                self._row(A, "codex", "w1:p2"), self._row(A, "claude", "w1:p3"),
+                self._row(B, "codex", "w1:p4"),
+            ],
+            target_workspace="w1",
+            own_slots=[own],
+            expected_own_key=(B, "default"),
+        )
+        self.assertTrue(decision.ok, decision.refusal)
+        self.assertEqual(decision.own_key, (B, "default"))
+
+    def test_a_run_claiming_a_pair_its_panes_do_not_decode_to_is_refused(self):
+        own = OwnSlot(
+            locator="w1:p4", assigned_name=encode_assigned_name(B, "codex"),
+            provider="codex",
+        )
+        authority = self._authority(workspaces=self._resolvable(A, B))
+        decision = authority.resolve(
+            [
+                self._row(A, "codex", "w1:p2"), self._row(A, "claude", "w1:p3"),
+                self._row(B, "codex", "w1:p4"),
+            ],
+            target_workspace="w1",
+            own_slots=[own],
+            expected_own_key=(C, "default"),
+        )
+        self.assertFalse(decision.ok)
+        self.assertIn("the workspace does not corroborate", decision.refusal)
+
+    def test_a_row_claiming_the_target_workspace_without_a_locator_refuses(self):
+        """Review j#99938 finding_1 — scope itself is a conjunct."""
+        authority = self._authority(workspaces=self._resolvable(A))
+        decision = authority.resolve(
+            [
+                self._row(A, "codex", "w1:p2"),
+                {"name": "not-mzb1", "pane_id": "", "workspace_id": "w1"},
+            ],
+            target_workspace="w1",
+        )
+        self.assertFalse(decision.ok)
+        self.assertIn("carries no pane locator", decision.refusal)
+
+    def test_a_row_whose_declared_workspace_contradicts_its_locator_refuses(self):
+        authority = self._authority(workspaces=self._resolvable(A))
+        decision = authority.resolve(
+            [
+                self._row(A, "codex", "w1:p2"),
+                self._row(A, "claude", "w9:p3", workspace_id="w1"),
+            ],
+            target_workspace="w1",
+        )
+        self.assertFalse(decision.ok)
+        self.assertIn("while its locator says", decision.refusal)
 
     def test_a_group_of_one_live_provider_is_accepted_when_every_authority_resolves(self):
         """The disputed half of finding_3 (verdict j#99888 / Answer j#99900)."""

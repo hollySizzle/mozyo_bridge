@@ -231,6 +231,10 @@ class PaneTreeHerdr:
         #: test can express a pane whose live provider contradicts its assigned name
         #: (#14996 R2 review j#99913 finding_2) or one herdr does not recognise.
         self.detected_override: dict = {}
+        #: Extra ``agent list`` rows spliced in verbatim — the way a test expresses a
+        #: row the tree model itself cannot hold (a pane with no usable locator, a
+        #: contradictory workspace, a payload that is not a mapping).
+        self.extra_rows: list = []
         self._moves = 0
         self._move_attempts = 0
 
@@ -344,6 +348,10 @@ class PaneTreeHerdr:
             row = {
                 "name": name,
                 "pane_id": pane_id,
+                # Production rows state the workspace explicitly as well as inside
+                # the locator (measured on the operator's running herdr), and the
+                # authority's scope test reads both (#14996 R2 review j#99938).
+                "workspace_id": self.workspace_id,
                 "agent_status": "idle",
                 "tab_id": tab.tab_id if tab else "",
                 # The detected provider is herdr's POSITIVE liveness signal; a stale
@@ -359,7 +367,7 @@ class PaneTreeHerdr:
                 if cwd:
                     row["foreground_cwd"] = cwd
             rows.append(row)
-        return rows
+        return rows + list(self.extra_rows)
 
     def _pane_layout(self, argv, tail):
         pane_id = tail[tail.index("--pane") + 1] if "--pane" in tail else ""

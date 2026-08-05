@@ -1201,6 +1201,14 @@ relayout を承認し、**推測ではなく実測で検証すること**を条�
   読めない payload は skip せず whole-set refusal** とする。skip すると説明できない pane が集合に残ったまま
   plan が組まれ、6 枚動いた後の tiling 検査でしか落ちない (j#99931 finding_2 で実測)。他 herdr workspace の
   row は scope 外であり、これは除外ではない。
+- **scope 判定そのものが conjunct である**。production の `agent list` row は workspace を locator の中と
+  `workspace_id` field の両方で述べる。locator prefix だけで scope を決めると、`workspace_id` が当該
+  workspace を指しながら locator が空の row が scope から抜け落ち、同じ 6 枚 move を招く (j#99938 finding_1)。
+  両方を読み、target を主張する row の locator 欠損と `workspace_id` / locator の矛盾を refusal にする。
+- **「どの pair が自分か」の source を 2 箇所に置かない**。run 側の主張 (`workspace_id` / `lane_id`) は
+  authority への**入力**とし、authority が exact join で解決した own key を typed decision で返す。両者を
+  別々に derive すると、inventory 内で自己整合しているだけの slot 群を別 project の pair として申告でき、
+  存在しない project について `matched` を返せてしまう (j#99938 finding_2 で実測)。
 - **例外は、その根拠の幅までしか広げない**。自 run の pane が免除されるのは「まだ答えられない 2 つの事実」
   = durable lane kind と startup attestation だけである。stale 判定・detected provider・cwd は同じ
   inventory row から即座に読めるので自 run にも要求する。根拠 2 つで 5 つを免除した結果、own pane が

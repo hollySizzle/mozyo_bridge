@@ -702,6 +702,77 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
         outcome, detail = env.run(env.result(PROJECT_B, list(launched)))
         self._assert_zero_move_failure(env, outcome, detail, "no decodable mozyo identity")
 
+    def test_a_row_claiming_this_workspace_without_a_locator_refuses(self):
+        """Review j#99938 finding_1 — scope is a conjunct, not a preamble.
+
+        Production rows state their workspace explicitly as well as inside the
+        locator. A row that claims this workspace with an unusable locator fell
+        out of a locator-only scope test entirely, so it rode along until the
+        closing tiling check failed six moves later.
+        """
+        env = _Env(self, PROJECT_A, PROJECT_B)
+        tab = env.herdr.new_tab()
+        env.seed_columns(tab, (PROJECT_A, ""))
+        launched = env.append_pair(tab, PROJECT_B)
+        env.herdr.extra_rows.append(
+            {
+                "name": "not-a-mzb1-name",
+                "pane_id": "",
+                "workspace_id": env.herdr.workspace_id,
+                "agent": "codex",
+                "agent_status": "idle",
+            }
+        )
+        outcome, detail = env.run(env.result(PROJECT_B, list(launched)))
+        self._assert_zero_move_failure(env, outcome, detail, "carries no pane locator")
+
+    def test_a_row_whose_workspace_contradicts_its_locator_refuses(self):
+        env = _Env(self, PROJECT_A, PROJECT_B)
+        tab = env.herdr.new_tab()
+        env.seed_columns(tab, (PROJECT_A, ""))
+        launched = env.append_pair(tab, PROJECT_B)
+        env.herdr.extra_rows.append(
+            {
+                "name": env.name(PROJECT_A, "codex"),
+                "pane_id": "w9:p1",
+                "workspace_id": env.herdr.workspace_id,
+                "agent": "codex",
+                "agent_status": "idle",
+            }
+        )
+        outcome, detail = env.run(env.result(PROJECT_B, list(launched)))
+        self._assert_zero_move_failure(env, outcome, detail, "while its locator says")
+
+    def test_a_run_claiming_a_project_the_workspace_does_not_hold_refuses(self):
+        """Review j#99938 finding_2 — it reported a column for a phantom project.
+
+        The exact join proved the slots were self-consistent inside the inventory,
+        which is not the same as proving they are the project the run says it
+        launched. Two authorities for "which pair is ours" is what made that
+        possible, so there is one now and the run's claim is an input to it.
+        """
+        env = _Env(self, PROJECT_A, PROJECT_B, PROJECT_C)
+        tab = env.herdr.new_tab()
+        (a_pair, _b_pair) = env.seed_columns(tab, (PROJECT_A, ""), (PROJECT_B, ""))
+        # A result that names project C while carrying project A's live panes.
+        result = SessionStartResult(
+            workspace_id=env.ids[PROJECT_C], lane_id=DEFAULT_LANE
+        )
+        result.herdr_workspace_id = env.herdr.workspace_id
+        for provider, locator in zip(("codex", "claude"), a_pair):
+            result.slots.append(
+                SlotResult(
+                    provider=provider,
+                    assigned_name=env.name(PROJECT_A, provider),
+                    outcome=SLOT_LAUNCHED,
+                    locator=locator,
+                )
+            )
+        outcome, detail = env.run(result)
+        self._assert_zero_move_failure(
+            env, outcome, detail, "the workspace does not corroborate"
+        )
+
     def test_a_hibernated_delegated_lane_is_not_an_active_coordinator(self):
         """Review j#99931 finding_3 — the kind alone let its survivors be moved."""
         env, launched = self._with_named_lane("delegated-1")
