@@ -29,6 +29,31 @@ from mozyo_bridge import __version__
 from mozyo_bridge.application.cli import build_parser
 from tests.support.private_path_fixtures import linux_home_path, macos_home_path
 
+
+def _disable_background_git_maintenance(root: Path) -> None:
+    """Keep synthetic repos hermetic through TemporaryDirectory teardown.
+
+    Git 2.47+ may detach ``git maintenance run --auto`` after a commit and
+    continue writing under ``.git`` after the foreground command returns.  It
+    raced cleanup in the production release matrix (#14982), matching the
+    measured #14685 mechanism.  These fixtures do not test maintenance, so
+    every repository in this module opts out before its first commit; teardown
+    errors remain visible rather than being suppressed.
+    """
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "config",
+            "--local",
+            "maintenance.auto",
+            "false",
+        ],
+        check=True,
+    )
+
+
 class ReleaseHelperParserTest(unittest.TestCase):
     """The contract-admitted release helper subcommands must round-trip
     through ``build_parser``. Argparse will raise SystemExit if a required
@@ -136,6 +161,7 @@ class ReleaseCheckTreeTest(unittest.TestCase):
             "GIT_COMMITTER_EMAIL": "test@example.com",
         }
         subprocess.run(["git", "init", "-q", str(root)], check=True)
+        _disable_background_git_maintenance(root)
         subprocess.run(
             ["git", "-C", str(root), "commit", "--allow-empty", "-m", "init", "-q"],
             check=True,
@@ -1195,6 +1221,7 @@ class ReleaseBumpCheckTest(unittest.TestCase):
             "GIT_COMMITTER_EMAIL": "test@example.com",
         }
         subprocess.run(["git", "init", "-q", str(root)], check=True)
+        _disable_background_git_maintenance(root)
         (root / "pyproject.toml").write_text(
             f'[project]\nname = "fake"\nversion = "{pyproject_version}"\n',
             encoding="utf-8",
@@ -1302,6 +1329,7 @@ class ReleaseBumpToTest(unittest.TestCase):
             "GIT_COMMITTER_EMAIL": "test@example.com",
         }
         subprocess.run(["git", "init", "-q", str(root)], check=True)
+        _disable_background_git_maintenance(root)
         (root / "pyproject.toml").write_text(
             f'[project]\nname = "fake"\nversion = "{pyproject_version}"\n',
             encoding="utf-8",
@@ -1383,6 +1411,31 @@ class ReleaseBumpToTest(unittest.TestCase):
             self.assertIn("already at 0.4.0", out.getvalue())
             self.assertIn(
                 "no-op (mirror set was already at 0.4.0)", out.getvalue()
+            )
+
+    def test_fake_repo_disables_detached_auto_maintenance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._build_fake_repo(root)
+            configured = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "config",
+                    "--local",
+                    "--get",
+                    "maintenance.auto",
+                ],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip()
+            self.assertEqual(
+                "false",
+                configured,
+                "synthetic release-bump repo can spawn detached Git maintenance "
+                "and race TemporaryDirectory.cleanup",
             )
 
     def test_invalid_version_shape_is_rejected(self) -> None:
