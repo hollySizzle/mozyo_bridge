@@ -21,6 +21,7 @@ skipped the evidence would be testing a weaker rail than the one that ships.
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -74,6 +75,12 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_health import (  # noqa: E402,E501
     HEALTH_HEALTHY,
 )
+
+
+def _git(*args: str) -> None:
+    """A real git call — the linked-worktree regression needs a real worktree."""
+    subprocess.run(("git", *args), check=True, capture_output=True)
+
 
 TOP = "top"
 PROJECT_A = "project-a"
@@ -490,6 +497,70 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
         outcome, detail = env.run(env.result(PROJECT_B, list(launched), lane=own))
         self.assertEqual(outcome, COLUMN_APPLIED, detail)
 
+    def test_a_delegated_coordinator_in_a_linked_worktree_is_accepted(self):
+        """Review j#99913 finding_3 — the shape the cwd rule used to make impossible.
+
+        A named lane runs from a LINKED WORKTREE that inherits the main checkout's
+        registry identity while living beside it, so a containment test against
+        the registry root refused every legitimate managed
+        ``delegated_coordinator`` — and with it the issue's own acceptance that
+        one converges into this workspace. The cwd is resolved through the
+        identity model's own resolver instead, which maps a worktree back to the
+        workspace it inherits from.
+        """
+        env = _Env(self, PROJECT_B)
+        main = env.roots[PROJECT_B].parent / "mainrepo"
+        main.mkdir()
+        _git("init", "-q", str(main))
+        (main / "seed").write_text("x", encoding="utf-8")
+        _git("-C", str(main), "add", "-A")
+        _git(
+            "-C", str(main), "-c", "user.email=t@e", "-c", "user.name=t",
+            "commit", "-qm", "seed",
+        )
+        register_workspace(main, home=env.home)
+        main_ws = read_anchor(main)["workspace_id"]
+        worktree = main.parent / "worktrees" / "lane1"
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+        _git("-C", str(main), "worktree", "add", "-q", str(worktree))
+        self.assertNotIn(
+            main.resolve(), worktree.resolve().parents,
+            "the fixture must use a real sibling worktree, not a child directory",
+        )
+
+        lane = "delegated-1"
+        LaneLifecycleStore(home=env.home).declare_active(
+            LaneLifecycleKey(main_ws, lane),
+            decision=DecisionPointer(
+                source="redmine", issue_id="14996", journal_id="99913"
+            ),
+            issue_id="14996",
+            lane_kind=LANE_KIND_DELEGATED_COORDINATOR,
+        )
+        env.herdr.cwd_by_workspace[main_ws] = str(worktree)
+        tab = env.herdr.new_tab()
+        (pair,) = env.herdr.seed_columns(
+            tab,
+            [[
+                encode_assigned_name(main_ws, provider, lane)
+                for provider in ("codex", "claude")
+            ]],
+        )
+        for provider, pane in zip(("codex", "claude"), pair):
+            env.store.upsert(
+                IdentityAttestationRecord(
+                    assigned_name=encode_assigned_name(main_ws, provider, lane),
+                    workspace_id=main_ws,
+                    role=provider,
+                    lane_id=lane,
+                    locator=pane,
+                    verdict=VERDICT_PRESENT,
+                )
+            )
+        launched = env.append_pair(tab, PROJECT_B)
+        outcome, detail = env.run(env.result(PROJECT_B, list(launched)))
+        self.assertEqual(outcome, COLUMN_APPLIED, detail)
+
     def test_a_stale_sibling_refuses_the_whole_set_before_any_move(self):
         """Review j#99904 finding_2 — filtering it away moved four panes first."""
         env = _Env(self, PROJECT_A, PROJECT_B)
@@ -509,7 +580,7 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
         )
         launched = env.append_pair(tab, PROJECT_B)
         outcome, detail = env.run(env.result(PROJECT_B, list(launched)))
-        self._assert_zero_move_failure(env, outcome, detail, "no durable self-attestation")
+        self._assert_zero_move_failure(env, outcome, detail, "no usable startup self-attestation")
 
     def test_a_conflicting_self_attestation_is_not_a_proof(self):
         env = _Env(self, PROJECT_A, PROJECT_B)
@@ -518,16 +589,64 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
         env.attest(pair[1], PROJECT_A, "claude", verdict=VERDICT_CONFLICT)
         launched = env.append_pair(tab, PROJECT_B)
         outcome, detail = env.run(env.result(PROJECT_B, list(launched)))
-        self._assert_zero_move_failure(env, outcome, detail, "self-attested 'conflict'")
+        self._assert_zero_move_failure(env, outcome, detail, "self-attestation (conflict)")
 
-    def test_a_foreign_pane_running_outside_its_project_root_is_refused(self):
+    def test_a_foreign_pane_in_an_unregistered_directory_is_refused(self):
         env = _Env(self, PROJECT_A, PROJECT_B)
         tab = env.herdr.new_tab()
         env.seed_columns(tab, (PROJECT_A, ""))
         env.herdr.cwd_by_workspace[env.ids[PROJECT_A]] = str(Path("/"))
         launched = env.append_pair(tab, PROJECT_B)
         outcome, detail = env.run(env.result(PROJECT_B, list(launched)))
-        self._assert_zero_move_failure(env, outcome, detail, "runs outside the registry root")
+        self._assert_zero_move_failure(
+            env, outcome, detail, "resolves to no registered mozyo workspace"
+        )
+
+    def test_a_foreign_pane_running_in_another_project_is_refused(self):
+        """The name claims one project; the working directory is another's."""
+        env = _Env(self, PROJECT_A, PROJECT_B, PROJECT_C)
+        tab = env.herdr.new_tab()
+        env.seed_columns(tab, (PROJECT_A, ""))
+        env.herdr.cwd_by_workspace[env.ids[PROJECT_A]] = str(env.roots[PROJECT_C])
+        launched = env.append_pair(tab, PROJECT_B)
+        outcome, detail = env.run(env.result(PROJECT_B, list(launched)))
+        self._assert_zero_move_failure(env, outcome, detail, "while its assigned name claims")
+
+    def test_a_previous_generation_self_attestation_is_never_re_used(self):
+        """Review j#99913 finding_1 — six panes moved on a stale record before this.
+
+        The identity triplet and the verdict both matched; only the recorded
+        locator belonged to a process that is gone. ``evaluate_attestation`` calls
+        that ``stale`` and refuses to re-use it, which is exactly the conjunct the
+        hand-written join had dropped.
+        """
+        env = _Env(self, PROJECT_A, PROJECT_B)
+        tab = env.herdr.new_tab()
+        (pair,) = env.seed_columns(tab, (PROJECT_A, ""))
+        for provider in ("codex", "claude"):
+            env.attest("w1:pOLD", PROJECT_A, provider)
+        launched = env.append_pair(tab, PROJECT_B)
+        outcome, detail = env.run(env.result(PROJECT_B, list(launched)))
+        self._assert_zero_move_failure(env, outcome, detail, "(stale)")
+
+    def test_a_detected_provider_that_contradicts_the_assigned_name_is_refused(self):
+        """Review j#99913 finding_2 — a live marker is not a role proof."""
+        env = _Env(self, PROJECT_A, PROJECT_B)
+        tab = env.herdr.new_tab()
+        (pair,) = env.seed_columns(tab, (PROJECT_A, ""))
+        env.herdr.detected_override[pair[0]] = "claude"  # a Codex slot reporting claude
+        launched = env.append_pair(tab, PROJECT_B)
+        outcome, detail = env.run(env.result(PROJECT_B, list(launched)))
+        self._assert_zero_move_failure(env, outcome, detail, "while its assigned name claims")
+
+    def test_an_unrecognised_detected_provider_is_not_positive_liveness(self):
+        env = _Env(self, PROJECT_A, PROJECT_B)
+        tab = env.herdr.new_tab()
+        (pair,) = env.seed_columns(tab, (PROJECT_A, ""))
+        env.herdr.detected_override[pair[0]] = "nethack"
+        launched = env.append_pair(tab, PROJECT_B)
+        outcome, detail = env.run(env.result(PROJECT_B, list(launched)))
+        self._assert_zero_move_failure(env, outcome, detail, "no recognised provider")
 
     def test_duplicate_providers_in_one_group_are_an_identity_conflict(self):
         env = _Env(self, PROJECT_A, PROJECT_B)

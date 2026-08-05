@@ -271,12 +271,12 @@ class ProjectGroupAuthorityTest(unittest.TestCase):
         opened = []
         with patch(
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
-            "application.herdr_project_column_reflow.load_lane_lifecycle_readonly",
+            "application.herdr_project_column_authority.load_lane_lifecycle_readonly",
             side_effect=lambda **_: opened.append("lifecycle") or (),
         ), patch(
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
-            "application.herdr_project_column_reflow.load_workspace_by_id",
-            side_effect=lambda *a, **k: opened.append("registry"),
+            "application.herdr_project_column_authority.herdr_workspace_segment",
+            side_effect=lambda *a, **k: opened.append("registry") or "",
         ):
             groups, refusal = resolve_project_groups(rows, "w1", home=self.home)
         self.assertEqual(groups, {})
@@ -331,7 +331,7 @@ class ProjectGroupAuthorityTest(unittest.TestCase):
         rows = self._rows((A, "codex", "impl-1", "w1:p2"))
         with patch(
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
-            "application.herdr_project_column_reflow.load_lane_lifecycle_readonly",
+            "application.herdr_project_column_authority.load_lane_lifecycle_readonly",
             return_value=None,
         ):
             groups, refusal = resolve_project_groups(rows, "w1", home=self.home)

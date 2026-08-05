@@ -1177,10 +1177,20 @@ relayout を承認し、**推測ではなく実測で検証すること**を条�
      kind 無し / store 読取不可はいずれも refusal。**自 run の lane は本 phase の対象外**で、その kind は
      launch 前に caller が既に証明している (managed `delegated_coordinator` の durable row は launch とは
      別 edge で書かれるため、ここで再導出すると live path を落とす)。
-  4. **foreign pane の positive evidence**: 動かす相手となる foreign pane ごとに、(a) detected provider が
-     present かつ非空、(b) `HerdrIdentityAttestationStore` の self-attestation が `present` verdict で
-     `(workspace_id, role, lane_id)` 一致、(c) row の cwd が `load_workspace_by_id` の canonical root 配下、
-     の 3 者を要求する。
+  4. **foreign pane の positive evidence**: 動かす相手となる foreign pane ごとに次の 3 者を要求する。
+     いずれも **canonical authority へ委譲**し、等価物を手書きしない (j#99913 の 3 finding のうち 2 件は
+     手書き等価物が元の連言を落としたことに起因する)。
+     - (a) detected provider が canonical token であり、**decoded role と exact match** すること。非空
+       marker であることは role の証明にならない (j#99913 finding_2)。live 実測で `agent list` row の
+       `agent` は `codex` / `claude` を verbatim に持つ。
+     - (b) `evaluate_attestation()` が `ok` を返すこと。同関数は recorded locator による **process
+       generation pin** を含み、旧世代の `present` record を再利用しない (j#99913 finding_1)。
+     - (c) row の cwd を `herdr_workspace_segment()` で解決した workspace が name の主張と一致すること。
+       **registry root の containment 判定にしない**: named lane は main checkout の identity を継承する
+       linked worktree から起動されるため、containment では正規の `delegated_coordinator` を構造的に
+       拒否し、本 issue の Acceptance を実現不能にする (j#99913 finding_3)。cwd から祖先方向へ最初に
+       identity を解決できる地点を使うので、main checkout / その subdir / linked worktree / worktree の
+       subdir が 1 つの規則で扱われる。
 - **unresolved evidence は除外せず refusal する**。stale sibling を集合から落とすと pair が健全な 1-pane group
   に見え、closing verdict が落ちる前に 4 枚の pane が動いた (j#99904 finding_2 で実測)。`classify_named_slot`
   は positive shell-residue のみを STALE にする conservative predicate なので、「stale でない」は positive な

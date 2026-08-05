@@ -227,6 +227,10 @@ class PaneTreeHerdr:
         #: Real rows carry it (#13806) and the project-column authority reads it, so a
         #: fake that omitted it would let a test pass a check production cannot.
         self.cwd_by_workspace: dict = {}
+        #: ``{pane_id: provider}`` overriding the detected agent a row reports, so a
+        #: test can express a pane whose live provider contradicts its assigned name
+        #: (#14996 R2 review j#99913 finding_2) or one herdr does not recognise.
+        self.detected_override: dict = {}
         self._moves = 0
         self._move_attempts = 0
 
@@ -345,7 +349,9 @@ class PaneTreeHerdr:
                 # The detected provider is herdr's POSITIVE liveness signal; a stale
                 # pane reports the field present-but-blank (shell residue).
                 "agent": "" if pane_id in self.stale_panes else (
-                    identity.role if identity else ""
+                    self.detected_override.get(
+                        pane_id, identity.role if identity else ""
+                    )
                 ),
             }
             if identity:
