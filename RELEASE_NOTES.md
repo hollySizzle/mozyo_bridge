@@ -4,9 +4,9 @@
 
 記載は Git の release commit と利用可能な tag を元にしています。一部の過去バージョンは release commit はありますが、現在の repository には対応する tag がありません。
 
-## v0.15.0 - 2026-08-05
+## v0.15.1 - 2026-08-05
 
-`v0.14.0` 以降の delegated coordinator と managed lane lifecycle の運用安定化 release です。人間または外部の top coordinator が単一の高レベル入口から project coordinator へ委譲し、実装 worker、durable callback、統合、drain までを扱うための実行経路を拡充しました。同時に、再起動・更新・世代交代・失敗後の cleanup で古い process や worktree を権威として誤採用しないよう、状態証明と fail-closed 判定を強化しています。
+`v0.14.0` 以降の delegated coordinator と managed lane lifecycle の運用安定化 release です。人間または外部の top coordinator が単一の高レベル入口から project coordinator へ委譲し、実装 worker、durable callback、統合、drain までを扱うための実行経路を拡充しました。同時に、再起動・更新・世代交代・失敗後の cleanup で古い process や worktree を権威として誤採用しないよう、状態証明と fail-closed 判定を強化しています。`0.15.0` は TestPyPI 検証までで production PyPI には公開せず、最初の production workflow で見つかった release gate の問題を修正した `0.15.1` を最初の production 候補としています。
 
 ### coordinator proxy と三層委譲
 
@@ -36,14 +36,15 @@
 ### 配布・互換性・検証
 
 - Python 3.10–3.13 の宣言 matrix を維持し、Python 3.10 の `tomllib` fallback と test compatibility を修正しました。
-- TestPyPI 固定版の install helper は Simple Index の古い cache を再利用せず、公開直後の完全指定版を通常 PATH の pipx runtime へ導入できます。
-- release tree / artifact scan、scaffold mirror、docs catalog、built wheel / sdist、fresh-install と installed fault-path smoke を更新しました。候補 source では 15,822 tests、module-health、docs validation、artifact install smoke が green です。最終 `0.15.0` commit では同じ gate と Python matrix を再実行します。
+- TestPyPI 固定版の install helper は Simple Index の古い cache を再利用せず、PEP 691 JSON 内の wheel / sdist ファイル名を完全一致で判定します。stable `0.15.0` を待つ際に既存の `0.15.0a4` を誤って ready と判定する部分一致を廃止しました。
+- release test が作る一時 Git repository では最初の commit より前に background maintenance を無効化し、Git 2.47 以降で maintenance process と一時ディレクトリ削除が競合する teardown error を防ぎました。失敗の握り潰しではなく、fixture 内の非決定的な background process を発生源で止めています。
+- release tree / artifact scan、scaffold mirror、docs catalog、built wheel / sdist、fresh-install と installed fault-path smoke を更新しました。候補 source では 15,822 tests、module-health、docs validation、artifact install smoke が green です。最終 `0.15.1` commit では同じ gate と Python matrix を再実行します。
 
 ### リリース状況メモ
 
-- **version mirror**: 本ノートとは別の standalone commit で `pyproject.toml` と runtime `__version__` を `0.15.0` に確定します。
-- **公開前実証**: source `184dd60454a451f298afd0690d2ea558dc0b1f74` の TestPyPI 固定版 `0.15.0a4.dev2026080423152630958296238` を通常 PATH の pipx 環境へ導入し、両 CLI の版一致を確認しました。同じ fresh workspace で top coordinator → gateway → worker → 二段 callback → guarded retire を完走し、専用 worktree も削除済みです。
-- **公開手順**: standalone version bump 後の main CI、Python 3.10–3.13 matrix、全 release check、version / tag / PyPI vacancy の action-time read-backを再実行し、annotated `v0.15.0` tag、GitHub Release、OIDC Trusted Publishing を別 gate で実行します。
+- **version mirror**: 本ノートとは別の standalone commit で `pyproject.toml` と runtime `__version__` を `0.15.1` に確定します。
+- **公開前実証**: TestPyPI 固定版 `0.15.0` を通常 PATH の pipx 環境と隔離 venv の双方へ導入し、両 CLI、health、rules、asana / redmine / none scaffold を確認しました。最初の production workflow は Python 3.11 の一時 Git fixture cleanup error で publish 前に停止し、GitHub Release と tag を削除して production PyPI が未公開であることを再確認しました。その原因修正を含む `0.15.1` で TestPyPI 検証を再実行します。
+- **公開手順**: standalone version bump 後の main CI、Python 3.10–3.13 matrix、全 release check、version / tag / PyPI vacancy の action-time read-backを再実行し、annotated `v0.15.1` tag、GitHub Release、OIDC Trusted Publishing を別 gate で実行します。
 - **互換性**: user-facing CLI の意図的な削除はありません。managed session の復旧・世代交代は、旧 state を直接編集せず公開された rollout / recovery / retirement command を使用してください。
 
 ## v0.9.2 - 2026-06-27
