@@ -1162,20 +1162,33 @@ relayout を承認し、**推測ではなく実測で検証すること**を条�
 - **decode できることは coordinator である証明ではない**。assigned name の `role` は provider token
   (`codex` / `claude`) であって workflow role ではないため、decode だけでは project coordinator と、この
   workspace へ誤配置・残留した implementation slot を区別できない (#14996 R2 review j#99885 finding_2 で、
-  implementation lane が anchor に選ばれ pane が bounce される再現を確認)。plan へ渡す集合は 3 つの
-  authority に join し、いずれかが解決できなければ **pane を 1 枚も動かさず typed refusal** とする。
-  1. **liveness**: `classify_named_slot` が `SLOT_STALE` を返す row を除外する。
-  2. **default lane 不変条件**: 本 mode では default lane は coordinator である (`is_role_grouped_project_coordinator`
-     が現 run に課すのと同じ規則)。default lane しか居ない通常状態では durable store を開かない。
-  3. **durable `lane_kind`**: foreign な named lane は lifecycle store の
-     `(repo_workspace_id, lane_id)` から解決し、`delegated_coordinator` だけを coordinator role group に
-     入れる。`implementation` / kind 無し / store 読取不可はいずれも refusal。**自 run の lane は (3) の
-     対象外**で、その kind は launch 前に caller が既に証明している (managed `delegated_coordinator` の
-     durable row は launch とは別 edge で書かれるため、ここで再導出すると live path を落とす)。
-- group の provider 形状は「canonical provider の重複なし部分集合 / 非空 / 2 以下」を要求する。重複 provider は
-  identity conflict、未知 provider・過大 cardinality は未知の形状であり、いずれも move 前に refusal。live pane
-  1 枚の group は、`_column_span` が全高 column を証明できる限り正当な column として扱う (slot 欠落は
-  slot / health 軸の所有であり、他 project の欠落を本 run の column 失敗として報告しない)。
+  implementation lane が anchor に選ばれ pane が bounce される再現を確認)。同様に **top pair** も default lane
+  であるため、decode と「default lane である」ことだけでは project coordinator と区別できない (j#99904
+  finding_1 で top pair が group 化され pane が 6 回移動する再現を確認)。plan へ渡す集合は次の 4 phase を
+  この順に join し、いずれかが解決できなければ **最初の move の前に、pane を 1 枚も動かさず typed refusal**
+  とする。順序は意図的で、pure な phase が先に落ちる限り重い store を開かない。
+  1. **provider 形状**: group を「canonical provider の重複なし部分集合 / 非空 / 2 以下」として検証する。
+     重複 provider は identity conflict、未知 provider・過大 cardinality は未知の形状。
+  2. **default lane 不変条件の両側**: 本 mode で default lane が *project* coordinator なのは
+     `workspace_id != top_workspace_id` のときだけである (`is_role_grouped_project_coordinator` と同じ述語。
+     片側だけを写すと top pair を掴む)。target tab に top の default pair が居る場合は refusal。
+  3. **durable `lane_kind`**: foreign な named lane は lifecycle store の `(repo_workspace_id, lane_id)`
+     から解決し、`delegated_coordinator` だけを coordinator role group に入れる。`implementation` /
+     kind 無し / store 読取不可はいずれも refusal。**自 run の lane は本 phase の対象外**で、その kind は
+     launch 前に caller が既に証明している (managed `delegated_coordinator` の durable row は launch とは
+     別 edge で書かれるため、ここで再導出すると live path を落とす)。
+  4. **foreign pane の positive evidence**: 動かす相手となる foreign pane ごとに、(a) detected provider が
+     present かつ非空、(b) `HerdrIdentityAttestationStore` の self-attestation が `present` verdict で
+     `(workspace_id, role, lane_id)` 一致、(c) row の cwd が `load_workspace_by_id` の canonical root 配下、
+     の 3 者を要求する。
+- **unresolved evidence は除外せず refusal する**。stale sibling を集合から落とすと pair が健全な 1-pane group
+  に見え、closing verdict が落ちる前に 4 枚の pane が動いた (j#99904 finding_2 で実測)。`classify_named_slot`
+  は positive shell-residue のみを STALE にする conservative predicate なので、「stale でない」は positive な
+  liveness の証明ではない。したがって phase 4 は positive 側 (detected provider) を要求する。
+- live pane 1 枚の group は、**上記 evidence がすべて解決したうえで** `_column_span` が全高 column を証明できる
+  限り正当な column として扱う (Design Consultation Answer j#99900)。slot 欠落は slot / health 軸の所有であり、
+  他 project の欠落を本 run の column 失敗として報告しない。除外の結果として 1 枚に見える group は本例外の
+  対象外である。
 - **pane を close / restart / rename しない**ので assigned name / route authority / cwd は不変。
 - 全 placement が `--target-pane` を明示するため、**起動前 focus に依存しない**。
 - 移動する既存 pane は「新 column が split する column の下段 1 枚」だけで、元の相手 pane の直下へ戻す。

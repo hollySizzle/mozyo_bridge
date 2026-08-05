@@ -694,6 +694,11 @@ class _Herdr:
             row["agent_status"] = "unknown"
         else:
             row["agent"] = role
+        if "--cwd" in rest:
+            # Real rows carry the pane's working directory (#13806), and the
+            # project-column authority reads it to prove a foreign pane runs inside
+            # the project its name claims (#14996 R2 review j#99904 finding_2).
+            row["foreground_cwd"] = rest[rest.index("--cwd") + 1]
         self.started_rows.append(row)
         wrapped = "agent-attest" in rest
         if not wrapped or self.attest_home is None:

@@ -33,6 +33,10 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Optional
 
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+    decode_assigned_name,
+)
+
 
 @dataclass
 class Rect:
@@ -219,6 +223,10 @@ class PaneTreeHerdr:
         #: there, the managed agent is not. Rendered as a present-but-blank ``agent``
         #: field, which is the positive stale signal ``classify_named_slot`` reads.
         self.stale_panes: set = set()
+        #: ``{mozyo workspace_id: path}`` rendered as each pane's ``foreground_cwd``.
+        #: Real rows carry it (#13806) and the project-column authority reads it, so a
+        #: fake that omitted it would let a test pass a check production cannot.
+        self.cwd_by_workspace: dict = {}
         self._moves = 0
         self._move_attempts = 0
 
@@ -327,14 +335,23 @@ class PaneTreeHerdr:
         rows = []
         for pane_id, name in self.agents.items():
             tab = self.tab_of(pane_id)
+            decoded = decode_assigned_name(name)
+            identity = decoded.identity if decoded.ok else None
             row = {
                 "name": name,
                 "pane_id": pane_id,
                 "agent_status": "idle",
                 "tab_id": tab.tab_id if tab else "",
+                # The detected provider is herdr's POSITIVE liveness signal; a stale
+                # pane reports the field present-but-blank (shell residue).
+                "agent": "" if pane_id in self.stale_panes else (
+                    identity.role if identity else ""
+                ),
             }
-            if pane_id in self.stale_panes:
-                row["agent"] = ""
+            if identity:
+                cwd = self.cwd_by_workspace.get(identity.workspace_id, "")
+                if cwd:
+                    row["foreground_cwd"] = cwd
             rows.append(row)
         return rows
 

@@ -839,6 +839,7 @@ def finalize_container_geometry(
     env,
     project_coordinator: bool = False,
     store_home: object = None,
+    top_workspace_id: str = "",
 ) -> None:
     """Finish the container this run launched into: reclaim, column, divide the pair.
 
@@ -872,6 +873,7 @@ def finalize_container_geometry(
         result,
         project_coordinator=project_coordinator,
         home=Path(store_home) if store_home else mozyo_bridge_home(),
+        top_workspace_id=top_workspace_id,
         launched=launched,
         initial_occupancy=initial_occupancy,
         dry_run=dry_run,

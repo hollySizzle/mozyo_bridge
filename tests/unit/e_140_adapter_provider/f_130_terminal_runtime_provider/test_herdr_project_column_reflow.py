@@ -259,14 +259,37 @@ class ProjectGroupAuthorityTest(unittest.TestCase):
             for ws, role, lane, locator in entries
         ]
 
-    def test_default_lane_groups_need_no_durable_store_read(self):
-        rows = self._rows(
-            (A, "codex", "", "w1:p2"), (A, "claude", "", "w1:p3"),
-            (B, "codex", "", "w1:p4"), (B, "claude", "", "w1:p5"),
+    def test_a_malformed_group_is_refused_without_opening_any_store(self):
+        """The pure phases run first, so a store read is never the cheapest refusal.
+
+        The heavier authorities — the lifecycle store, the workspace registry and
+        the attestation store — are only consulted once the inventory is
+        well-formed on its face. Acceptance itself is proved end-to-end against
+        those real stores in ``tests/regressions/test_issue_14996_*``.
+        """
+        rows = self._rows((A, "codex", "", "w1:p2"), (A, "nethack", "", "w1:p3"))
+        opened = []
+        with patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_project_column_reflow.load_lane_lifecycle_readonly",
+            side_effect=lambda **_: opened.append("lifecycle") or (),
+        ), patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_project_column_reflow.load_workspace_by_id",
+            side_effect=lambda *a, **k: opened.append("registry"),
+        ):
+            groups, refusal = resolve_project_groups(rows, "w1", home=self.home)
+        self.assertEqual(groups, {})
+        self.assertIn("unrecognised provider", refusal)
+        self.assertEqual(opened, [])
+
+    def test_the_configured_top_pair_is_refused_before_any_foreign_join(self):
+        rows = self._rows((A, "codex", "", "w1:p2"), (A, "claude", "", "w1:p3"))
+        groups, refusal = resolve_project_groups(
+            rows, "w1", home=self.home, top_workspace_id=A
         )
-        groups, refusal = resolve_project_groups(rows, "w1", home=self.home)
-        self.assertEqual(refusal, "")
-        self.assertEqual(sorted(groups), [(A, "default"), (B, "default")])
+        self.assertEqual(groups, {})
+        self.assertIn("configured top coordinator", refusal)
 
     def test_an_unrecognised_provider_token_is_refused(self):
         rows = self._rows((A, "codex", "", "w1:p2"), (A, "nethack", "", "w1:p3"))
@@ -283,12 +306,17 @@ class ProjectGroupAuthorityTest(unittest.TestCase):
         self.assertEqual(groups, {})
         self.assertIn("duplicate provider", refusal)
 
-    def test_a_group_of_one_live_provider_is_accepted(self):
-        """The disputed half of finding_3 (verdict j#99888 / dispute j#99890)."""
+    def test_a_group_of_one_live_provider_passes_the_shape_phase(self):
+        """The disputed half of finding_3 (verdict j#99888 / Answer j#99900).
+
+        Cardinality alone does not refuse. The pane still has to carry positive
+        evidence before it can be moved beside, which is why this stops at the
+        foreign-evidence phase rather than at the shape one.
+        """
         rows = self._rows((A, "codex", "", "w1:p2"))
-        groups, refusal = resolve_project_groups(rows, "w1", home=self.home)
-        self.assertEqual(refusal, "")
-        self.assertEqual(sorted(groups), [(A, "default")])
+        _groups, refusal = resolve_project_groups(rows, "w1", home=self.home)
+        self.assertNotIn("pair", refusal)
+        self.assertIn("w1:p2", refusal)
 
     def test_a_named_lane_with_no_durable_kind_refuses_the_whole_set(self):
         rows = self._rows(
