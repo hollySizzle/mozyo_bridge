@@ -6,7 +6,7 @@ disagrees, instead of merely displaying `--version`. These tests exercise the
 script against a fake ``pipx`` and fake ``mozyo-bridge`` / ``mozyo`` CLIs on a
 shadowed PATH so no network, no real install, and no real package are needed.
 
-Six branches from the Start Gate acceptance (j#75722), Redmine #14978, and
+Nine branches from the Start Gate acceptance (j#75722), Redmine #14978, and
 Redmine #14980 are pinned:
   (a) both CLIs report the requested version -> exit 0
   (b) `mozyo-bridge --version` mismatches      -> non-zero
@@ -14,6 +14,9 @@ Redmine #14980 are pinned:
   (d) the pip backend bypasses stale index cache for a just-published exact version
   (e) a delayed TestPyPI Simple listing is polled before pipx runs
   (f) a bounded propagation timeout exits before pipx changes the environment
+  (g) stable versions do not substring-match alpha filenames
+  (h) readiness polls the same canonical Simple URL that pip resolves
+  (i) unpinned `latest` is rejected before any install
 """
 
 import os
@@ -155,6 +158,22 @@ class InstallTestPyPIDevScriptTest(unittest.TestCase):
         self.assertIn(
             "FAKE_CURL_ARG=Accept: application/vnd.pypi.simple.v1+json",
             result.stderr,
+        )
+
+    def test_readiness_uses_pips_canonical_simple_url(self) -> None:
+        version = "0.10.0.dev123456"
+        result = self._run(version, mb_version=version, mz_version=version)
+        self.assertEqual(0, result.returncode, result.stderr)
+        simple_urls = [
+            line.removeprefix("FAKE_CURL_ARG=")
+            for line in result.stderr.splitlines()
+            if line.startswith("FAKE_CURL_ARG=https://test.pypi.org/simple/mozyo-bridge/")
+        ]
+        self.assertEqual(
+            ["https://test.pypi.org/simple/mozyo-bridge/"],
+            simple_urls,
+            "readiness must not use a cache-busting query that can propagate "
+            "before the canonical URL used by pip",
         )
 
     def test_waits_for_simple_index_propagation_before_install(self) -> None:

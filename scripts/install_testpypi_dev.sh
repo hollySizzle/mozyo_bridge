@@ -89,10 +89,12 @@ esac
 # TestPyPI's project JSON can expose a newly uploaded release before the
 # Simple Index used by pip has propagated through Warehouse/CDN caches. A
 # direct pipx attempt during that window reports "No matching distribution"
-# even with pip's local cache disabled. Poll the actual resolver surface before
-# asking pipx to mutate the existing environment. The bound covers the
-# Simple response's normal 10-minute max-age; a timeout is temporary failure
-# and leaves the previous pipx environment untouched.
+# even with pip's local cache disabled. Poll the canonical resolver URL before
+# asking pipx to mutate the existing environment. Do not add a cache-busting
+# query: it creates a different CDN cache key that can expose the new release
+# before the query-free URL pip actually resolves. The bound covers the Simple
+# response's normal 10-minute max-age; a timeout is temporary failure and
+# leaves the previous pipx environment untouched.
 simple_url="https://test.pypi.org/simple/mozyo-bridge/"
 simple_max_attempts=41
 simple_attempt=1
@@ -107,7 +109,7 @@ while :; do
     --location \
     --header "Cache-Control: no-cache" \
     --header "Accept: application/vnd.pypi.simple.v1+json" \
-    "${simple_url}?propagation_attempt=${simple_attempt}" \
+    "${simple_url}" \
     | MOZYO_TESTPYPI_EXPECTED_VERSION="$version" python3 -c '
 import json
 import os
