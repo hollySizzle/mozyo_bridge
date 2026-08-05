@@ -1206,9 +1206,13 @@ relayout を承認し、**推測ではなく実測で検証すること**を条�
   (b) 別 workspace へ解決する、(c) どこにも解決しない、のいずれかであり、これを「自分のものか」の 2 値で
   書くと (b) と (c) が畳まれる。実際 j#99938 finding_1 は「主張するが addressable でない row」を、
   j#99950 finding_1 は「どこにも解決しない row」を、それぞれ scope 外へ落として 6 枚 move を招いた。
-  分類は closed vocabulary (`in_scope` / `out_of_scope` / `refused`) の total function とし、target を
-  主張する row の locator 欠損・unparseable locator (`_workspace_prefix` の `""` contract)・
-  `workspace_id` と locator の矛盾はすべて refusal にする。回帰は個別事例でなく**入力空間の表**で持つ。
+  分類は closed vocabulary (`in_scope` / `out_of_scope` / `refused`) の total function とし、
+  判定順序は **(1) 自己整合 → (2) target 判定 → (3) addressability** とする。**自己整合を先に問う**のは、
+  declared と locator が食い違う row は「別 workspace に居る」ことすら証明していないためで、target 判定を
+  先に置くと両方 foreign かつ相互に矛盾する row が out-of-scope として素通りする (j#99960 finding_1 で実測)。
+  target を主張する row の locator 欠損・unparseable locator (`_workspace_prefix` の `""` contract) も refusal。
+  回帰は個別事例でなく **declared × locator の入力空間の格子**で持ち、**格子が全 cell を覆っていること自体を
+  test が assert する**（表は主張であり、主張の方を検査する）。
 - **集合へ畳む操作そのものが filter になりうる**。run の launched slot を locator で dict 化すると、
   duplicate locator が黙って上書きされ、矛盾する slot が exact join に到達しない (j#99950 finding_2)。
   畳む前に cardinality を検査し、重複・locator 欠損を refusal にする。

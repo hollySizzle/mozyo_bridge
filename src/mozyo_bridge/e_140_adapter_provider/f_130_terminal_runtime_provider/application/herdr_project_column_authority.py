@@ -315,20 +315,24 @@ def classify_inventory_row(row: object, target_workspace: str) -> RowVerdict:
     """Place one ``agent list`` row on :data:`ROW_DISPOSITIONS` (pure, total).
 
     A row states its workspace twice — explicitly in ``workspace_id``, and inside
-    its locator — and the two together admit exactly three outcomes. Enumerating
-    them here, rather than asking "is this row ours?" at the loop head, is what
-    makes the classification exhaustive over the input space instead of over the
-    inputs someone thought of:
+    its locator. The decision is taken over the FULL product of what those two can
+    say, in this order:
 
-    - **out of scope** — either field resolves to a different workspace. Nothing is
-      unresolved about such a row; it just is not ours.
-    - **refused** — the row is not a mapping at all; or NEITHER field resolves
-      anywhere (its location cannot be established); or it claims this workspace
-      while carrying no locator, or one :func:`_workspace_prefix` cannot parse
-      (``""`` is that function's contract for a malformed handle, precisely so the
-      caller fails closed rather than guessing); or its two statements disagree.
-    - **in scope** — it claims this workspace with an addressable, self-consistent
-      locator.
+    1. **both say something, and they disagree** -> refused. Self-consistency is
+       asked before "is it ours?", because such a row has not established that it
+       lives anywhere — including elsewhere (review j#99960 finding_1).
+    2. **neither names this workspace** -> out of scope if either resolved
+       somewhere (a boundary, not an exclusion); refused if neither did, since its
+       location cannot be established at all.
+    3. it names this workspace, so it must be addressable: **no locator** ->
+       refused; **a locator :func:`_workspace_prefix` cannot parse** -> refused
+       (``""`` is that function's contract for a malformed handle, precisely so the
+       caller fails closed rather than guessing).
+    4. otherwise **in scope**.
+
+    ``tests/unit/.../test_herdr_project_column_reflow`` enumerates the declared x
+    locator grid and asserts the table covers every cell — a table is a claim, and
+    the claim is what is checked.
     """
     if not isinstance(row, Mapping):
         return RowVerdict(
@@ -338,6 +342,19 @@ def classify_inventory_row(row: object, target_workspace: str) -> RowVerdict:
     locator = _agent_locator(row)
     prefix = _workspace_prefix(locator)
     declared = _norm(row.get(AGENT_KEY_WORKSPACE))
+    if declared and prefix and declared != prefix:
+        # Self-consistency is asked BEFORE "is it ours?", because a row whose two
+        # statements disagree has not established that it lives anywhere — including
+        # elsewhere. Asking the target question first let a row declaring one foreign
+        # workspace while addressing another pass as out-of-scope, and six panes moved
+        # around an occupant nobody had accounted for (review j#99960 finding_1).
+        return RowVerdict(
+            ROW_REFUSED,
+            refusal=(
+                f"pane {locator!r} reports workspace {declared!r} while its locator "
+                f"says {prefix!r}; refusing to reason about a contradictory row"
+            ),
+        )
     if declared != target_workspace and prefix != target_workspace:
         if declared or prefix:
             return RowVerdict(ROW_OUT_OF_SCOPE)
@@ -364,14 +381,6 @@ def classify_inventory_row(row: object, target_workspace: str) -> RowVerdict:
             refusal=(
                 f"a row claiming workspace {target_workspace!r} carries the "
                 f"unparseable pane handle {locator!r}; refusing to address it"
-            ),
-        )
-    if declared and declared != prefix:
-        return RowVerdict(
-            ROW_REFUSED,
-            refusal=(
-                f"pane {locator!r} reports workspace {declared!r} while its locator "
-                f"says {prefix!r}; refusing to reason about a contradictory row"
             ),
         )
     return RowVerdict(ROW_IN_SCOPE, locator=locator)

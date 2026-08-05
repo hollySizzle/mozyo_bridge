@@ -719,6 +719,13 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
              {"pane_id": "nocolon", "workspace_id": "w1"}),
             ("workspace contradicts locator",
              {"pane_id": "w9:p1", "workspace_id": "w1"}),
+            # Review j#99960 finding_1: both sides foreign, and disagreeing. Such a
+            # row has not established that it lives ANYWHERE, so it cannot be filed
+            # as out-of-scope — it used to be, and six panes moved past it.
+            ("two foreign workspaces contradicting each other",
+             {"pane_id": "w3:p9", "workspace_id": "w2"}),
+            ("declared foreign, locator addresses this workspace",
+             {"pane_id": "w1:p90", "workspace_id": "w2"}),
             ("undecodable name on an addressable pane",
              {"pane_id": "w1:p90", "workspace_id": "w1"}),
         )

@@ -90,58 +90,87 @@ def _pane(workspace: str, role: str, locator: str, lane: str = "default"):
     )
 
 
-#: The inventory-row input space, enumerated rather than sampled. Each entry is
-#: ``(label, row, expected disposition)``. Two reviews (j#99938 finding_1, j#99950
-#: finding_1) landed on branches nobody had written a case for, so the table is the
-#: specification: every combination of "declared workspace" x "locator" x "shape"
-#: is named here, and a guard below asserts the table exercises the whole closed
-#: vocabulary.
-_ROW_CLASSIFICATION_TABLE = (
-    ("declared+locator both ours",
-     _row(A, "codex", "w1:p2", workspace_id="w1"), ROW_IN_SCOPE),
-    ("locator ours, no declared field",
-     {"name": encode_assigned_name(A, "codex"), "pane_id": "w1:p2"}, ROW_IN_SCOPE),
-    ("declared ours, locator ours, undecodable name",
-     {"name": "not-mzb1", "pane_id": "w1:p9", "workspace_id": "w1"}, ROW_IN_SCOPE),
-    ("declared+locator both foreign",
-     _row(B, "codex", "w2:p2", workspace_id="w2"), ROW_OUT_OF_SCOPE),
-    ("locator foreign, no declared field",
-     {"name": encode_assigned_name(B, "codex"), "pane_id": "w2:p2"}, ROW_OUT_OF_SCOPE),
-    ("declared foreign, no locator",
-     {"name": encode_assigned_name(B, "codex"), "pane_id": "", "workspace_id": "w2"},
-     ROW_OUT_OF_SCOPE),
-    ("declared foreign, unparseable locator",
-     {"name": encode_assigned_name(B, "codex"), "pane_id": "nocolon",
-      "workspace_id": "w2"}, ROW_OUT_OF_SCOPE),
-    ("no declared field, no locator",
-     {"name": encode_assigned_name(B, "codex"), "pane_id": ""}, ROW_REFUSED),
-    ("no declared field, unparseable locator",
-     {"name": encode_assigned_name(B, "codex"), "pane_id": "nocolon"}, ROW_REFUSED),
-    ("declared ours, no locator",
-     {"name": "not-mzb1", "pane_id": "", "workspace_id": "w1"}, ROW_REFUSED),
-    ("declared ours, unparseable locator",
-     {"name": "not-mzb1", "pane_id": "nocolon", "workspace_id": "w1"}, ROW_REFUSED),
-    ("declared ours, locator foreign",
-     _row(A, "codex", "w9:p1", workspace_id="w1"), ROW_REFUSED),
+#: The two things a row can say about where it lives. The classifier's decision is
+#: taken over the FULL product of these, so the table below must hold every cell —
+#: and the test asserts that, because a table is a claim and the claim is what is
+#: checked (review j#99960 finding_1: the previous guard only covered the OUTCOME
+#: vocabulary, which says nothing about the input space).
+_DECLARED_KINDS = ("absent", "target", "foreign")
+_LOCATOR_KINDS = ("absent", "unparseable", "target", "foreign", "other_foreign")
+
+#: ``(declared kind, locator kind) -> (row, expected disposition)``. ``other_foreign``
+#: is a SECOND foreign workspace, which is what makes "declared foreign + locator a
+#: different foreign" expressible at all — the cell that used to pass as out-of-scope
+#: while six panes moved around the row it described.
+_ROW_GRID = {
+    ("absent", "absent"): ({"name": "n", "pane_id": ""}, ROW_REFUSED),
+    ("absent", "unparseable"): ({"name": "n", "pane_id": "nocolon"}, ROW_REFUSED),
+    ("absent", "target"): (
+        {"name": encode_assigned_name(A, "codex"), "pane_id": "w1:p2"}, ROW_IN_SCOPE),
+    ("absent", "foreign"): (
+        {"name": encode_assigned_name(B, "codex"), "pane_id": "w2:p2"},
+        ROW_OUT_OF_SCOPE),
+    ("absent", "other_foreign"): (
+        {"name": encode_assigned_name(B, "codex"), "pane_id": "w3:p2"},
+        ROW_OUT_OF_SCOPE),
+    ("target", "absent"): (
+        {"name": "n", "pane_id": "", "workspace_id": "w1"}, ROW_REFUSED),
+    ("target", "unparseable"): (
+        {"name": "n", "pane_id": "nocolon", "workspace_id": "w1"}, ROW_REFUSED),
+    ("target", "target"): (
+        {"name": encode_assigned_name(A, "codex"), "pane_id": "w1:p2",
+         "workspace_id": "w1"}, ROW_IN_SCOPE),
+    ("target", "foreign"): (
+        {"name": "n", "pane_id": "w2:p9", "workspace_id": "w1"}, ROW_REFUSED),
+    ("target", "other_foreign"): (
+        {"name": "n", "pane_id": "w3:p9", "workspace_id": "w1"}, ROW_REFUSED),
+    ("foreign", "absent"): (
+        {"name": "n", "pane_id": "", "workspace_id": "w2"}, ROW_OUT_OF_SCOPE),
+    ("foreign", "unparseable"): (
+        {"name": "n", "pane_id": "nocolon", "workspace_id": "w2"}, ROW_OUT_OF_SCOPE),
+    ("foreign", "target"): (
+        {"name": "n", "pane_id": "w1:p9", "workspace_id": "w2"}, ROW_REFUSED),
+    ("foreign", "foreign"): (
+        {"name": encode_assigned_name(B, "codex"), "pane_id": "w2:p2",
+         "workspace_id": "w2"}, ROW_OUT_OF_SCOPE),
+    ("foreign", "other_foreign"): (
+        {"name": "n", "pane_id": "w3:p9", "workspace_id": "w2"}, ROW_REFUSED),
+}
+
+#: Shapes outside the declared x locator grid entirely.
+_ROW_SHAPES = (
     ("not a mapping", ["not", "a", "row"], ROW_REFUSED),
 )
 
 
 class InventoryRowClassificationTest(unittest.TestCase):
-    """Every row lands on exactly one disposition — the table IS the spec.
+    """Every row lands on exactly one disposition — the grid IS the spec.
 
-    Reviews j#99938 and j#99950 both found a branch that had been written as the
-    two-valued question "is this row ours?", which silently folded "claims us but
-    unaddressable" and "resolves nowhere" into out-of-scope. Enumerating the input
-    space is what stops the next such branch from being invisible.
+    Three reviews found a branch that had been written as a narrower question than
+    the input space: "is this row ours?" (j#99938, j#99950), and then "is it ours,
+    asked before whether it is even self-consistent?" (j#99960). Enumerating the
+    product and asserting the enumeration is complete is what stops the next such
+    branch from being invisible.
     """
 
-    def test_every_enumerated_row_lands_on_its_disposition(self):
-        for label, row, expected in _ROW_CLASSIFICATION_TABLE:
-            with self.subTest(row=label):
+    def test_the_grid_covers_the_whole_declared_by_locator_product(self):
+        expected = {
+            (declared, locator)
+            for declared in _DECLARED_KINDS
+            for locator in _LOCATOR_KINDS
+        }
+        self.assertEqual(set(_ROW_GRID), expected)
+
+    def test_the_grid_exercises_the_whole_disposition_vocabulary(self):
+        covered = {disposition for _row, disposition in _ROW_GRID.values()}
+        covered |= {disposition for _l, _r, disposition in _ROW_SHAPES}
+        self.assertEqual(covered, set(ROW_DISPOSITIONS))
+
+    def test_every_cell_lands_on_its_disposition(self):
+        for cell, (row, expected) in sorted(_ROW_GRID.items()):
+            with self.subTest(cell=cell):
                 verdict = classify_inventory_row(row, "w1")
                 self.assertEqual(verdict.disposition, expected)
-                self.assertIn(verdict.disposition, ROW_DISPOSITIONS)
                 if expected == ROW_REFUSED:
                     self.assertTrue(verdict.refusal, "a refusal must say why")
                 else:
@@ -149,15 +178,25 @@ class InventoryRowClassificationTest(unittest.TestCase):
                 if expected == ROW_IN_SCOPE:
                     self.assertTrue(verdict.locator)
 
-    def test_the_table_exercises_the_whole_closed_vocabulary(self):
-        covered = {expected for _label, _row, expected in _ROW_CLASSIFICATION_TABLE}
-        self.assertEqual(covered, set(ROW_DISPOSITIONS))
+    def test_every_non_grid_shape_lands_on_its_disposition(self):
+        for label, row, expected in _ROW_SHAPES:
+            with self.subTest(shape=label):
+                self.assertEqual(
+                    classify_inventory_row(row, "w1").disposition, expected
+                )
+
+    def test_a_contradictory_row_refuses_even_when_neither_side_is_ours(self):
+        """Review j#99960 finding_1 — it used to pass as out-of-scope."""
+        row, expected = _ROW_GRID[("foreign", "other_foreign")]
+        self.assertEqual(expected, ROW_REFUSED)
+        verdict = classify_inventory_row(row, "w1")
+        self.assertIn("while its locator says", verdict.refusal)
 
     def test_a_refused_row_anywhere_refuses_the_whole_read(self):
-        for label, row, expected in _ROW_CLASSIFICATION_TABLE:
+        for cell, (row, expected) in sorted(_ROW_GRID.items()):
             if expected != ROW_REFUSED:
                 continue
-            with self.subTest(row=label):
+            with self.subTest(cell=cell):
                 panes, refusal = coordinator_panes_in(
                     [_row(A, "codex", "w1:p2", workspace_id="w1"), row], "w1"
                 )
@@ -167,7 +206,7 @@ class InventoryRowClassificationTest(unittest.TestCase):
     def test_out_of_scope_rows_leave_the_read_intact(self):
         rows = [_row(A, "codex", "w1:p2", workspace_id="w1")]
         rows += [
-            row for _label, row, expected in _ROW_CLASSIFICATION_TABLE
+            row for row, expected in _ROW_GRID.values()
             if expected == ROW_OUT_OF_SCOPE
         ]
         panes, refusal = coordinator_panes_in(rows, "w1")
