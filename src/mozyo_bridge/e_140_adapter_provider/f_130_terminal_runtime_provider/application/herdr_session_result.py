@@ -198,6 +198,31 @@ class SessionStartResult:
     #: The measurement (or the refusal) behind :attr:`ratio_outcome`: declared vs observed
     #: ratio and first-pane extent on a success, the fixed reason on a failure / deferral.
     ratio_detail: str = ""
+    #: The project-column axis (Redmine #14996 R2) — one of
+    #: :data:`...herdr_project_column_reflow.COLUMN_OUTCOMES`. Its own axis for the same
+    #: reason the ratio is: a column is a property of how the shared coordinator TAB is
+    #: divided between projects, not of any one agent, and every pair can be healthy while
+    #: one project's pair spans another's. ``not_applicable`` is the resting value — every
+    #: launch path except a fresh pair appended to an occupied shared project-coordinator
+    #: workspace never claims anything about a column.
+    column_outcome: str = "not_applicable"
+    #: The measurement (or the refusal) behind :attr:`column_outcome`. On a failure it names
+    #: the refusing step and any pane left outside the shared tab.
+    column_detail: str = ""
+
+    @property
+    def column_ok(self) -> bool:
+        """True only for a RECOGNISED, non-failing project-column outcome.
+
+        Membership in the closed success vocabulary, not ``!= failed`` — the same
+        discipline :attr:`ratio_ok` adopted after the negative comparison reported every
+        unreadable token as a success (review j#91418 R5-F1).
+        """
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_reflow import (  # noqa: E501
+            COLUMN_SUCCESS_OUTCOMES,
+        )
+
+        return self.column_outcome in COLUMN_SUCCESS_OUTCOMES
 
     @property
     def ratio_ok(self) -> bool:
@@ -240,12 +265,22 @@ class SessionStartResult:
         and could not be established is not success either (Design Answer j#91127, "ratio
         適用失敗を成功扱いしない"). It stays out of :attr:`owes_rollback` on purpose —
         a mis-divided pair is fully usable, so nothing is owed a teardown for it.
+
+        Redmine #14996 R2 adds the third on exactly the same terms (j#99845, "途中失敗は
+        typed fail-closed"): a project column that was owed and could not be established —
+        including one that left a pane outside the shared tab — is not success. It is
+        likewise no rollback debt: every agent is live and correctly routed.
         """
         if self.dry_run:
             # Nothing was started, so no health claim is made or needed: the deliverable
             # of a dry run is the plan itself.
             return True
-        return bool(self.slots) and all(slot.healthy for slot in self.slots) and self.ratio_ok
+        return (
+            bool(self.slots)
+            and all(slot.healthy for slot in self.slots)
+            and self.ratio_ok
+            and self.column_ok
+        )
 
     @property
     def owes_rollback(self) -> bool:
@@ -283,6 +318,8 @@ class SessionStartResult:
             "tab_pane_detail": self.tab_pane_detail,
             "ratio_outcome": self.ratio_outcome,
             "ratio_detail": self.ratio_detail,
+            "column_outcome": self.column_outcome,
+            "column_detail": self.column_detail,
         }
 
 

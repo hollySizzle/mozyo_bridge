@@ -1122,7 +1122,8 @@ Design Answer j#83385 Decision 2 / premise 訂正 j#83433)。
 したがって **current-scope の acceptance** は次の realizable invariant である (j#83433):
 
 - 単独 project の coordinator launch は backend の既存列 **末尾へ append** する。
-- 既存 column の順序を変更せず、**live reorder / relayout を行わない** (既存 pane を move / swap / close しない)。
+- 既存 column の **順序を変更しない** (既存列を並べ替えない)。append される新 pair 自身が独立 column に
+  なるための最小 relayout は次節が定義する狭い例外であり、**それ以外の live reorder / relayout は行わない**。
 - resolver の adopt / create / fail-closed 判断は **inventory row の iteration 順に依存しない** (集合演算 + sorted)。
 - **duplicate workspace identity** は label 一致 / 不一致に関わらず fail-closed し、**順序を反転しても同一 verdict** となる
   (`_parse_workspace_list` は重複 `workspace_id` を検出したら `None` へ倒す)。
@@ -1133,11 +1134,53 @@ stable project key 順に append する。これは今回、未使用 helper や
 厳密左右順を望む operator の live 再配置は live-relayout runbook (#13648) の領分であり、本 mode は
 **deterministic append order であって arbitrary live reorder ではない**。
 
+### project column geometry — append 時の狭い verified relayout (#14996 R2)
+
+live rollout (#14996 j#99833) で、既存 pair のある `project-coordinators` workspace へ 2 組目を fresh
+launch すると L 字になることを実測した。既存 project の下段 pane が全幅を占め、追加 pair はその上段の
+内側へ入れ子になる。identity / cwd / routing は正常で、壊れているのは geometry だけである。
+
+**なぜ launch argv では届かないか** (herdr 0.7.4、disposable instance で実測):
+
+- `agent start` に pane-target flag が無く、split 対象は「その時点の active pane」である。
+- 最初の pair が立った時点で、tab の **root divider はその pair の 2 pane の間**にある。以後の split は
+  すべて leaf の細分なので、全幅を占める root `down` divider はどの launch でも残る。**leaf split の
+  組合せだけでは全高 column 2 本を作れない**。
+- `pane move --tab <同一 tab>` は `same_tab` の no-op、`pane swap` は位置交換のみ、`pane resize` は既存
+  divider を動かすだけ。別 tab からの `pane move` も `--target-pane` を省くと focused pane へ入れ子になる。
+
+したがって append 側が独立 column を得る唯一の経路は、**split 先 column の下段 pane を一時 tab へ退避して
+戻す 2 段 bounce** (live-relayout runbook recipe B と同じ操作) である。owner は #14996 j#99845 でこの狭い
+relayout を承認し、**推測ではなく実測で検証すること**を条件にした。実装は
+`herdr_project_column_reflow.py` が持つ。
+
+境界 (いずれも code で強制する):
+
+- 対象は exact label `project-coordinators` workspace のみ。かつ **fresh な full pair を、他 project の
+  coordinator pane が既にいる tab へ append した run** だけ。adopt-only / 単一 provider heal / dry-run /
+  最初の project は `not_applicable` で **layout も読まない**。
+- 動かす pane は identity decode 済み coordinator pane に限る。foreign shell や implementation sublane slot
+  は掴めない。**pane を close / restart / rename しない**ので assigned name / route authority / cwd は不変。
+- 全 placement が `--target-pane` を明示するため、**起動前 focus に依存しない**。
+- 移動する既存 pane は「新 column が split する column の下段 1 枚」だけで、元の相手 pane の直下へ戻す。
+  他 column は触らない。
+- 失敗は typed fail-closed。退避済み pane は best-effort で戻し、戻せなかった pane を detail に明示する。
+  identity 集合が前後で変化した場合、または最終 layout が columnar でない場合は成功と主張しない。
+  `SessionStartResult.ok` は `column_ok` を読むので、失敗は exit-code success にならない。
+- 2 組なら均等 2×2 になる。3 組目以降も各 project は独立した全高 column を持つが、**列幅は均等ではない**
+  (最右 column を二分するため 1/2 : 1/4 : 1/4 になる)。列順・列幅の厳密指定は引き続き live-relayout
+  runbook の領分で、本 mode は append 時の column 化だけを保証する。
+
+`lane_placement` (#13646 / #14568 / #14569) の「既存 live pair を暗黙再配置しない」境界は**変えていない**。
+そこが触るのは pair 内部の divider だけであり、本節が触るのは shared coordinator tab の **project 間**
+境界に限られる。
+
 ### Launch-time only (適用条件)
 
 mode は **launch / adopt 時のみ**読む。設定を変えても既存 live pair は自動で動かない (herdr は same-tab
-re-split を拒否する; live 再配置は live-relayout runbook のみ, #13648)。適用は **次回の fresh launch / adopt**
-から。config 読取りは composition root (`herdr_launch_command` の bare `mozyo` coordinator launch /
+re-split を拒否する; 設定変更を起点とする live 再配置は live-relayout runbook のみ, #13648)。適用は
+**次回の fresh launch / adopt** から。唯一の例外は前節の project column append で、これも「設定を読んだから
+動く」のではなく「その run が今 append した pair のために動く」launch-time の操作である。config 読取りは composition root (`herdr_launch_command` の bare `mozyo` coordinator launch /
 `herdr_session_start_cli` / managed lane の `prepare_actuator_lane_session`) で行い、configの
 `mode` と `top_workspace_id` を `prepare_session` へ渡す。composition rootはrole-grouped時に
 top IDのregistry存在・canonical checkout liveness・存在するworkspace anchorとのidentity一致を

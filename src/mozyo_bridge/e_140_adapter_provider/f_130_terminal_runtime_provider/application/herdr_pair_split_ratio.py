@@ -834,19 +834,47 @@ def finalize_container_geometry(
     runner: Runner,
     timeout: float,
     env,
+    project_coordinator: bool = False,
 ) -> None:
-    """Finish the container this run launched into: reclaim the roots, divide the pair.
+    """Finish the container this run launched into: reclaim, column, divide the pair.
 
-    The single call the session-start composition root makes. Reclaim comes first because
-    closing the created root pane collapses the split tree; measuring before it would read a
-    geometry that is about to change. Both halves record onto ``result`` rather than
-    raising: a reclaim failure has always been cosmetic residue, and a ratio failure leaves
-    a fully live pair whose only defect is its division — killing agents over that would be
-    a far worse outcome than reporting it (Design Answer j#91127, "既存agentをkill/closeせず").
-    The report is not cosmetic either: ``SessionStartResult.ok`` reads the ratio axis, so a
-    failure is not exit-code success.
+    The single call the session-start composition root makes, in the only order the three
+    steps compose in:
+
+    1. **reclaim** the root panes this run created — closing one collapses the split tree,
+       so anything measured before it would read a geometry about to change;
+    2. **project column** (Redmine #14996 R2) — a pair freshly appended to a shared
+       project-coordinator workspace is bounced into its own full-height column. It runs
+       BEFORE the ratio because it rebuilds the very divider the ratio is measured against;
+       ``project_coordinator`` is ``False`` on every other launch path, which is what keeps
+       this an opt-in step rather than a general live-relayout rail (see
+       :mod:`...herdr_project_column_reflow`);
+    3. **pair split ratio** (#14569) — divide the pair this run created at the declared
+       ratio, measured against the geometry the two steps above settled on.
+
+    All three record onto ``result`` rather than raising: a reclaim failure has always been
+    cosmetic residue, and a column / ratio failure leaves a fully live pair whose only
+    defect is its placement — killing agents over that would be a far worse outcome than
+    reporting it (Design Answer j#91127, "既存agentをkill/closeせず"). The report is not
+    cosmetic either: ``SessionStartResult.ok`` reads both axes, so a failure is not
+    exit-code success.
     """
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_reflow import (  # noqa: E501
+        reflow_project_columns,
+    )
+
     _reclaim_root_panes(result, binary=binary, runner=runner, timeout=timeout, env=env)
+    result.column_outcome, result.column_detail = reflow_project_columns(
+        result,
+        project_coordinator=project_coordinator,
+        launched=launched,
+        initial_occupancy=initial_occupancy,
+        dry_run=dry_run,
+        binary=binary,
+        runner=runner,
+        timeout=timeout,
+        env=env,
+    )
     result.ratio_outcome, result.ratio_detail = _pair_geometry(
         result,
         config_split=config_split,

@@ -34,6 +34,7 @@ from support.herdr_fake import (
     attest_capability_epilog,
     render_pane_layout,
 )
+from support.herdr_pane_tree import Leaf, Rect, Split, Tab
 from support.agent_provider_binaries import (
     DEFAULT_PROVIDER_COMMANDS,
     FakeAgentBinaries,
@@ -278,11 +279,18 @@ class _Herdr:
         # clamped to 0.5 per call, and the resulting ratio is clamped into 0.1..0.9.
         self.split_ratio = 0.5
         self.split_direction = ""
-        #: Live pane ids per container ("" -> no tab: keyed by workspace), in placement
-        #: order: the pane that OCCUPIED the container first, then the one that split it.
-        self.tab_panes: dict = {}
+        #: The live split TREE per container ("" -> no tab: keyed by workspace).
+        #: Redmine #14996 R2 replaced the flat pane list this used to be: a launch
+        #: subdivides the container's ACTIVE pane, so once a container holds more than a
+        #: pair the geometry is nested — and the flat model rendered every pane with the
+        #: same full-area rect, which is why the project-column L (#14996 j#99833) was
+        #: invisible to this suite while its `--split` argv assertions passed.
+        self.tab_trees: dict = {}
         self.pane_layouts: list = []
         self.pane_resizes: list = []
+        #: Every ``pane move`` the project-column reflow issued (#14996 R2).
+        self.pane_moves: list = []
+        self._detached_seq = 0
         #: `pane layout` exits non-zero (the unreadable-layout fail-closed path).
         self.layout_fails = False
         #: `pane layout` answers a payload the parser must refuse.
@@ -434,6 +442,9 @@ class _Herdr:
             return subprocess.CompletedProcess(
                 argv, 0, stdout=json.dumps(self._layout_payload(rest[3])), stderr=""
             )
+        if rest[:2] == ["pane", "move"]:
+            self.pane_moves.append(rest)
+            return self._pane_move(argv, rest)
         if rest[:2] == ["pane", "resize"]:
             self.pane_resizes.append(rest)
             if self.resize_fails:
@@ -504,47 +515,144 @@ class _Herdr:
         """What a split happens inside: the lane's tab, or the workspace for the default."""
         return tab_id or workspace_id
 
-    def _place_pane(self, rest, pane_id, workspace_id, tab_id):
-        """Record where this launch landed, exactly as herdr's own tree would.
-
-        A launch WITHOUT ``--split`` occupies the container; one WITH it lands beside the
-        pane already there. When the first pane of the container is not this run's (a heal
-        splitting beside a live sibling), the sibling is seeded from the live inventory —
-        otherwise the fake would report a one-pane layout for a pair that visibly has two,
-        and the ratio rail would look broken for a reason the production code never has.
-        """
+    def _tree_for(self, workspace_id, tab_id):
+        """The container's split tree, seeded from the live inventory on first touch."""
         key = self._container_key(workspace_id, tab_id)
-        panes = self.tab_panes.setdefault(key, [])
-        if not panes:
-            for row in self.existing_rows:
-                locator = str(row.get("pane_id") or "")
-                same_tab = (not tab_id) or str(row.get("tab_id") or "") == tab_id
-                if locator.startswith(f"{workspace_id}:") and same_tab:
-                    panes.append(locator)
+        tab = self.tab_trees.get(key)
+        if tab is not None:
+            return tab
+        # A default-lane container has no `--tab`, but herdr still reports the workspace's
+        # active tab in `pane layout` — and the id must be unique per workspace, or a
+        # `pane move --tab` would resolve to another workspace's tab of the same name.
+        tab = Tab(tab_id=tab_id or f"{workspace_id}:t1", workspace_id=workspace_id)
+        self.tab_trees[key] = tab
+        for row in self.existing_rows:
+            locator = str(row.get("pane_id") or "")
+            same_tab = (not tab_id) or str(row.get("tab_id") or "") == tab_id
+            if not locator.startswith(f"{workspace_id}:") or not same_tab:
+                continue
+            if tab.root is None:
+                tab.root = Leaf(locator)
+                # herdr splits the ACTIVE pane, and the live incident (#14996 j#99833)
+                # split the shared tab's FIRST pane: the appended pair nested inside the
+                # existing project's upper half while its lower pane kept the full width.
+                tab.focused = locator
+            else:
+                tab.subdivide(tab.panes()[-1], self.split_direction or "down", locator)
+        return tab
+
+    def _place_pane(self, rest, pane_id, workspace_id, tab_id):
+        """Subdivide the container exactly as herdr does — the ACTIVE pane splits.
+
+        A launch into an EMPTY container occupies it; every later launch subdivides the
+        container's focused pane, in the direction the argv asked for (herdr's own default
+        ``right`` when it asked for none). ``--focus`` moves the split target onto the pane
+        just launched, which is the #13646 R1-F1 mechanism that makes a fresh pair's second
+        slot split the first AGENT rather than the reclaimed root.
+        """
+        tab = self._tree_for(workspace_id, tab_id)
         if "--split" in rest:
             self.split_direction = rest[rest.index("--split") + 1]
-        if pane_id not in panes:
-            panes.append(pane_id)
+        if pane_id in tab.panes():
+            return
+        if tab.root is None:
+            tab.root = Leaf(pane_id)
+            tab.focused = pane_id
+        else:
+            direction = (
+                rest[rest.index("--split") + 1] if "--split" in rest else "right"
+            )
+            tab.subdivide(tab.focused, direction, pane_id)
+        if "--focus" in rest:
+            tab.focused = pane_id
+
+    def _tab_of(self, pane_id):
+        for tab in self.tab_trees.values():
+            if pane_id in tab.panes():
+                return tab
+        return None
 
     def _layout_payload(self, pane_id):
         """A `pane layout` payload for the container holding ``pane_id``.
 
-        Rendered by the SHARED producer (``support.herdr_fake.render_pane_layout``) rather
-        than a second hand-written envelope: two fakes that each describe herdr's layout
-        shape drift, and the one that drifts silently stops testing the parser it was
-        written for.
+        Rendered from the split TREE, whose one-split case is byte-equivalent to the
+        shared flat producer (``support.herdr_fake.render_pane_layout``) — the parity the
+        pane-tree test pins, so the two fakes still cannot drift while this one can also
+        describe a container that grew past a pair.
         """
-        panes = []
-        for group in self.tab_panes.values():
-            if pane_id in group:
-                panes = list(group)
-                break
-        return render_pane_layout(
-            pane_ids=panes,
-            direction=self.split_direction or "down",
-            ratio=self.split_ratio,
-            extent=self.split_extent,
-            cross=self.split_cross,
+        tab = self._tab_of(pane_id)
+        if tab is None:
+            return render_pane_layout(
+                pane_ids=[],
+                direction=self.split_direction or "down",
+                ratio=self.split_ratio,
+                extent=self.split_extent,
+                cross=self.split_cross,
+            )
+        tab.bounds = (
+            Rect(0, 0, self.split_cross, self.split_extent)
+            if (self.split_direction or "down") == "down"
+            else Rect(0, 0, self.split_extent, self.split_cross)
+        )
+        self._apply_tree_ratio(tab.root)
+        return tab.layout_payload()
+
+    def _apply_tree_ratio(self, node):
+        """Keep every divider on the container's single modelled ratio (#14569)."""
+        if isinstance(node, Split):
+            node.ratio = self.split_ratio
+            self._apply_tree_ratio(node.first)
+            self._apply_tree_ratio(node.second)
+
+    def _pane_move(self, argv, rest):
+        """herdr ``pane move`` — the detach / targeted re-placement the reflow uses."""
+        pane_id = rest[2]
+        source = self._tab_of(pane_id)
+        if source is None:
+            return subprocess.CompletedProcess(
+                argv, 1, stdout="", stderr=f"pane not found: {pane_id}"
+            )
+        if "--new-tab" in rest:
+            source.remove(pane_id)
+            self._detached_seq += 1
+            target = Tab(
+                tab_id=f"{source.workspace_id}:tmp{self._detached_seq}",
+                workspace_id=source.workspace_id,
+            )
+            target.root = Leaf(pane_id)
+            target.focused = pane_id
+            self.tab_trees[target.tab_id] = target
+        else:
+            tab_id = rest[rest.index("--tab") + 1]
+            direction = rest[rest.index("--split") + 1]
+            anchor = rest[rest.index("--target-pane") + 1]
+            target = next(
+                (tab for tab in self.tab_trees.values() if tab.tab_id == tab_id), None
+            )
+            if target is None or anchor not in target.panes():
+                return subprocess.CompletedProcess(
+                    argv, 1, stdout="", stderr=f"target not found: {tab_id}/{anchor}"
+                )
+            source.remove(pane_id)
+            target.subdivide(anchor, direction, pane_id)
+        if source is not target and not source.panes():
+            self.tab_trees = {
+                key: tab for key, tab in self.tab_trees.items() if tab is not source
+            }
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps(
+                {
+                    "result": {
+                        "move_result": {
+                            "changed": True,
+                            "pane": {"pane_id": pane_id, "tab_id": target.tab_id},
+                        }
+                    }
+                }
+            ),
+            stderr="",
         )
 
     def _apply_resize(self, direction, amount):
@@ -2172,6 +2280,15 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                     "",
                     "coordinator",
                 )
+                # Redmine #14996 R2: read the shared tab the moment the second project
+                # pair has landed — that is the exact state the live rollout found as an
+                # L (j#99833), and the later sublane launch / heal would blur it.
+                shared_rects = {
+                    entry["pane_id"]: entry["rect"]
+                    for entry in herdr._layout_payload(operations.slots[0].locator)[
+                        "result"
+                    ]["layout"]["panes"]
+                }
 
                 herdr.created_workspace = "wAccountingHost"
                 implementation = _start(
@@ -2327,6 +2444,28 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(top.herdr_workspace_id, "wTop")
         self.assertEqual(accounting.herdr_workspace_id, "wProjects")
         self.assertEqual(operations.herdr_workspace_id, "wProjects")
+        # Redmine #14996 R2: the FIRST project owns the whole shared tab, so it appends
+        # no column; the second one does, and the tab it leaves behind is two full-height
+        # project columns rather than the L the live rollout found (j#99833).
+        self.assertEqual(accounting.column_outcome, "not_applicable")
+        self.assertEqual(operations.column_outcome, "applied", operations.column_detail)
+        self.assertTrue(operations.column_ok)
+        columns = {}
+        for session in (accounting, operations):
+            spans = {
+                (shared_rects[slot.locator]["x"], shared_rects[slot.locator]["width"])
+                for slot in session.slots
+            }
+            self.assertEqual(
+                len(spans), 1, "a project pair must occupy one column, not an L"
+            )
+            heights = sum(shared_rects[slot.locator]["height"] for slot in session.slots)
+            self.assertEqual(heights, herdr.split_extent, "the column is not full height")
+            columns[session.workspace_id] = spans.pop()
+        self.assertEqual(len(set(columns.values())), 2, "the pairs share one column")
+        self.assertEqual(
+            sum(width for _x, width in columns.values()), herdr.split_cross
+        )
         self.assertEqual(implementation.herdr_workspace_id, "wAccountingHost")
         self.assertTrue(implementation.herdr_tab_id)
         self.assertEqual(healed.herdr_workspace_id, "wProjects")

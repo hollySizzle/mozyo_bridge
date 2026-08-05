@@ -917,15 +917,15 @@ def _prepare_session_locked(
                     ),
                 )
 
-    # Finish the container — reclaim the roots we created (#13330 / #13411), then divide the
-    # pair at the declared ratio (#14569). Only after EVERY launch succeeded, in that order
-    # (closing the root collapses the tree the ratio is measured against); records, not raises.
+    # Finish the container — reclaim the roots we created (#13330 / #13411), give an appended
+    # project pair its own column (#14996 R2), then divide the pair at the declared ratio
+    # (#14569). Only after EVERY launch succeeded, in that order; records, not raises.
     finalize_container_geometry(
         result, config_split=config_split, config_order=config_order,
         pair_order=pair_order, requested=providers, config_ratio=config_ratio,
-        launched=len(launch_plans),
-        initial_occupancy=plan_of_container.occupancy, dry_run=dry_run,
-        binary=binary, runner=runner, timeout=timeout, env=env,
+        launched=len(launch_plans), initial_occupancy=plan_of_container.occupancy,
+        dry_run=dry_run, binary=binary, runner=runner, timeout=timeout, env=env,
+        project_coordinator=role_grouped_project_coordinator,
     )
     # Pass 3 — observe what we started (Redmine #13948, Answer j#80989). `agent start`
     # returning a well-formed, correctly-located locator is the LAUNCHER's claim; it says
