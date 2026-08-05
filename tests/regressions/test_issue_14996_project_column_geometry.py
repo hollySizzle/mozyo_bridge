@@ -45,6 +45,8 @@ from mozyo_bridge.core.state.lane_kind import (  # noqa: E402
 )
 from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore  # noqa: E402
 from mozyo_bridge.core.state.lane_lifecycle_model import (  # noqa: E402
+    DISPOSITION_ACTIVE,
+    DISPOSITION_HIBERNATED,
     DecisionPointer,
     LaneLifecycleKey,
 )
@@ -658,6 +660,65 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
         launched = env.append_pair(tab, PROJECT_B)
         outcome, detail = env.run(env.result(PROJECT_B, list(launched)))
         self._assert_zero_move_failure(env, outcome, detail, "duplicate provider")
+
+    def test_this_run_s_own_pane_still_answers_what_its_row_already_says(self):
+        """Review j#99931 finding_1 — each of these moved six panes before.
+
+        The own exemption was argued from two facts a just-launched slot cannot
+        yet answer, then applied to three it can. Liveness, the detected provider
+        and the working directory come off the same inventory row for every pane
+        in the workspace, so they are owed by every pane in the workspace.
+        """
+        for label, mutate, fragment in (
+            ("stale", lambda env, own: env.herdr.stale_panes.add(own[0]),
+             "shell residue"),
+            ("provider",
+             lambda env, own: env.herdr.detected_override.__setitem__(own[0], "claude"),
+             "while its assigned name claims"),
+            ("cwd",
+             lambda env, own: env.herdr.cwd_by_workspace.__setitem__(
+                 env.ids[PROJECT_B], str(env.roots[PROJECT_A])
+             ),
+             "while its assigned name claims"),
+        ):
+            with self.subTest(case=label):
+                env = _Env(self, PROJECT_A, PROJECT_B)
+                tab = env.herdr.new_tab()
+                env.seed_columns(tab, (PROJECT_A, ""))
+                own = env.append_pair(tab, PROJECT_B)
+                mutate(env, own)
+                outcome, detail = env.run(env.result(PROJECT_B, list(own)))
+                self._assert_zero_move_failure(env, outcome, detail, fragment)
+
+    def test_an_undecodable_row_in_the_shared_tab_refuses_before_any_move(self):
+        """Review j#99931 finding_2 — skipping it cost six moves and a late failure."""
+        env = _Env(self, PROJECT_A, PROJECT_B)
+        tab = env.herdr.new_tab()
+        env.seed_columns(tab, (PROJECT_A, ""))
+        launched = env.append_pair(tab, PROJECT_B)
+        stray = env.herdr._mint_pane()
+        env.herdr.agents[stray] = "not-a-mzb1-name"
+        tab.subdivide(tab.panes()[0], "down", stray)
+        outcome, detail = env.run(env.result(PROJECT_B, list(launched)))
+        self._assert_zero_move_failure(env, outcome, detail, "no decodable mozyo identity")
+
+    def test_a_hibernated_delegated_lane_is_not_an_active_coordinator(self):
+        """Review j#99931 finding_3 — the kind alone let its survivors be moved."""
+        env, launched = self._with_named_lane("delegated-1")
+        env.declare_lane(PROJECT_A, "delegated-1", LANE_KIND_DELEGATED_COORDINATOR)
+        store = LaneLifecycleStore(home=env.home)
+        key = LaneLifecycleKey(env.ids[PROJECT_A], "delegated-1")
+        store.transition_disposition(
+            key,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=store.get(key).revision,
+            target=DISPOSITION_HIBERNATED,
+            decision=DecisionPointer(
+                source="redmine", issue_id="14996", journal_id="99931"
+            ),
+        )
+        outcome, detail = env.run(env.result(PROJECT_B, list(launched)))
+        self._assert_zero_move_failure(env, outcome, detail, "not 'active'")
 
     def test_a_project_short_one_slot_still_owns_a_verified_column(self):
         """The disputed half of j#99885 finding_3, accepted by Answer j#99900.

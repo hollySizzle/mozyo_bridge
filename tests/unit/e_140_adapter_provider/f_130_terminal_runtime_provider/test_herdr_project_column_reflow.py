@@ -23,8 +23,24 @@ sys.path.insert(0, str(ROOT / "tests"))
 from support.herdr_fake import render_pane_layout  # noqa: E402
 from support.herdr_pane_tree import Leaf, Rect, Split, Tab  # noqa: E402
 
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_authority import (  # noqa: E402,E501
+    group_by_pair,
+)
+
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pair_split_ratio import (  # noqa: E402,E501
     parse_pane_layout,
+)
+from mozyo_bridge.core.state.lane_kind import (  # noqa: E402
+    LANE_KIND_DELEGATED_COORDINATOR,
+    LANE_KIND_IMPLEMENTATION,
+)
+from mozyo_bridge.core.state.lane_lifecycle_model import (  # noqa: E402
+    DISPOSITION_ACTIVE,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_authority import (  # noqa: E402,E501
+    LaneFact,
+    OwnSlot,
+    ProjectColumnAuthority,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_reflow import (  # noqa: E402,E501
     COLUMN_OUTCOMES,
@@ -34,9 +50,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     CoordinatorPane,
     columnar_verdict,
     coordinator_panes_in,
-    group_by_pair,
     plan_project_columns,
-    resolve_project_groups,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E402,E501
     encode_assigned_name,
@@ -70,17 +84,25 @@ def _pane(workspace: str, role: str, locator: str, lane: str = "default"):
 
 
 class CoordinatorPaneReadTest(unittest.TestCase):
-    def test_only_decodable_panes_inside_the_target_workspace_are_read(self):
+    def test_only_panes_inside_the_target_workspace_are_read(self):
+        """Another workspace's rows are out of SCOPE; they are not exclusions."""
         rows = [
             _row(A, "codex", "w1:p2"),
             _row(A, "claude", "w1:p3"),
             _row(B, "codex", "w2:p2"),          # another herdr workspace
-            {"name": "not-a-mzb1-name", "pane_id": "w1:p9"},  # an operator's own shell
+            {"name": "not-a-mzb1-name", "pane_id": "w2:p9"},   # ditto, undecodable
             {"name": encode_assigned_name(B, "claude"), "pane_id": ""},  # no locator
         ]
-        panes = coordinator_panes_in(rows, "w1")
+        panes, refusal = coordinator_panes_in(rows, "w1")
+        self.assertEqual(refusal, "")
         self.assertEqual([pane.locator for pane in panes], ["w1:p2", "w1:p3"])
         self.assertEqual({pane.workspace_id for pane in panes}, {A})
+
+    def test_an_undecodable_row_inside_the_target_workspace_refuses(self):
+        rows = [_row(A, "codex", "w1:p2"), {"name": "not-mzb1", "pane_id": "w1:p9"}]
+        panes, refusal = coordinator_panes_in(rows, "w1")
+        self.assertEqual(panes, ())
+        self.assertIn("no decodable mozyo identity", refusal)
 
     def test_pairs_group_by_workspace_and_lane(self):
         panes = (
@@ -239,104 +261,248 @@ class ColumnPlanTest(unittest.TestCase):
         self.assertIn("no decodable pair identity", refusal)
 
 
-class ProjectGroupAuthorityTest(unittest.TestCase):
-    """Review j#99885 finding_2 / finding_3 — what may become a project pair.
+class _FakeAttestation:
+    """A fake attestation port: the specification, not a patched read."""
 
-    ``resolve_project_groups`` is the only producer a plan may consume; these pin
-    the pure half of its contract (the durable lane-kind join is exercised against
-    a real store in the #14996 regression).
+    def __init__(self, refuse: "dict | None" = None) -> None:
+        self.refuse = refuse or {}
+        self.asked: list = []
+
+    def attested(self, pane):
+        self.asked.append(pane.locator)
+        state = self.refuse.get(pane.locator)
+        return (state is None), (state or "ok")
+
+
+class _FakeLaneFacts:
+    def __init__(self, facts=None, unreadable: bool = False) -> None:
+        self.facts = facts or {}
+        self.unreadable = unreadable
+        self.reads = 0
+
+    def lane_facts(self):
+        self.reads += 1
+        return None if self.unreadable else self.facts
+
+
+class _FakeWorkspaces:
+    def __init__(self, mapping=None) -> None:
+        self.mapping = mapping or {}
+        self.asked: list = []
+
+    def workspace_of(self, cwd: str) -> str:
+        self.asked.append(cwd)
+        return self.mapping.get(cwd, "")
+
+
+class ProjectColumnAuthorityTest(unittest.TestCase):
+    """Reviews j#99885 / j#99904 / j#99913 / j#99931 — what may become a pair.
+
+    Driven through fake ports rather than monkeypatched module reads, so the
+    specification is stated in the doubles themselves (the architecture policy the
+    j#99931 finding_4 carve answers).
     """
 
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.home = Path(self._tmp.name)
+    def _authority(self, *, attestation=None, lanes=None, workspaces=None):
+        self.attestation = attestation or _FakeAttestation()
+        self.lanes = lanes or _FakeLaneFacts()
+        self.workspaces = workspaces or _FakeWorkspaces()
+        return ProjectColumnAuthority(
+            attestation=self.attestation, lanes=self.lanes, workspaces=self.workspaces
+        )
 
-    def _rows(self, *entries):
-        return [
-            {"name": encode_assigned_name(ws, role, lane), "pane_id": locator,
-             "agent_status": "idle"}
-            for ws, role, lane, locator in entries
+    def _row(self, workspace, role, locator, lane="", **over):
+        row = {
+            "name": encode_assigned_name(workspace, role, lane),
+            "pane_id": locator,
+            "agent_status": "idle",
+            "agent": role,
+            "foreground_cwd": f"/roots/{workspace}",
+        }
+        row.update(over)
+        return row
+
+    def _resolvable(self, *workspaces):
+        return _FakeWorkspaces({f"/roots/{ws}": ws for ws in workspaces})
+
+    def test_a_well_formed_pair_of_pairs_resolves(self):
+        authority = self._authority(workspaces=self._resolvable(A, B))
+        decision = authority.resolve(
+            [
+                self._row(A, "codex", "w1:p2"), self._row(A, "claude", "w1:p3"),
+                self._row(B, "codex", "w1:p4"), self._row(B, "claude", "w1:p5"),
+            ],
+            target_workspace="w1",
+        )
+        self.assertTrue(decision.ok, decision.refusal)
+        self.assertEqual(sorted(decision.groups), [(A, "default"), (B, "default")])
+        self.assertEqual(self.lanes.reads, 0, "default lanes need no lifecycle read")
+
+    def test_a_malformed_group_is_refused_without_touching_any_port(self):
+        authority = self._authority()
+        decision = authority.resolve(
+            [self._row(A, "codex", "w1:p2"), self._row(A, "nethack", "w1:p3")],
+            target_workspace="w1",
+        )
+        self.assertFalse(decision.ok)
+        self.assertIn("unrecognised provider", decision.refusal)
+        self.assertEqual(self.attestation.asked, [])
+        self.assertEqual(self.workspaces.asked, [])
+        self.assertEqual(self.lanes.reads, 0)
+
+    def test_the_configured_top_pair_is_refused(self):
+        authority = self._authority()
+        decision = authority.resolve(
+            [self._row(A, "codex", "w1:p2"), self._row(A, "claude", "w1:p3")],
+            target_workspace="w1",
+            top_workspace_id=A,
+        )
+        self.assertFalse(decision.ok)
+        self.assertIn("configured top coordinator", decision.refusal)
+
+    def test_an_undecodable_row_in_the_target_workspace_refuses_the_whole_set(self):
+        """Review j#99931 finding_2 — skipping it cost six pane moves."""
+        authority = self._authority(workspaces=self._resolvable(A))
+        decision = authority.resolve(
+            [
+                self._row(A, "codex", "w1:p2"), self._row(A, "claude", "w1:p3"),
+                {"name": "not-a-mzb1-name", "pane_id": "w1:p9"},
+            ],
+            target_workspace="w1",
+        )
+        self.assertFalse(decision.ok)
+        self.assertIn("no decodable mozyo identity", decision.refusal)
+
+    def test_a_row_in_another_workspace_is_out_of_scope_not_a_refusal(self):
+        authority = self._authority(workspaces=self._resolvable(A))
+        decision = authority.resolve(
+            [
+                self._row(A, "codex", "w1:p2"), self._row(A, "claude", "w1:p3"),
+                {"name": "not-a-mzb1-name", "pane_id": "w2:p9"},
+            ],
+            target_workspace="w1",
+        )
+        self.assertTrue(decision.ok, decision.refusal)
+
+    def test_a_duplicate_locator_refuses(self):
+        authority = self._authority(workspaces=self._resolvable(A))
+        decision = authority.resolve(
+            [self._row(A, "codex", "w1:p2"), self._row(A, "claude", "w1:p2")],
+            target_workspace="w1",
+        )
+        self.assertFalse(decision.ok)
+        self.assertIn("appears twice", decision.refusal)
+
+    def test_a_named_lane_needs_both_kind_and_active_disposition(self):
+        """Review j#99931 finding_3 — the kind alone let a hibernated lane through."""
+        rows = [
+            self._row(A, "codex", "w1:p2"), self._row(A, "claude", "w1:p3"),
+            self._row(A, "codex", "w1:p4", lane="impl-1"),
         ]
-
-    def test_a_malformed_group_is_refused_without_opening_any_store(self):
-        """The pure phases run first, so a store read is never the cheapest refusal.
-
-        The heavier authorities — the lifecycle store, the workspace registry and
-        the attestation store — are only consulted once the inventory is
-        well-formed on its face. Acceptance itself is proved end-to-end against
-        those real stores in ``tests/regressions/test_issue_14996_*``.
-        """
-        rows = self._rows((A, "codex", "", "w1:p2"), (A, "nethack", "", "w1:p3"))
-        opened = []
-        with patch(
-            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
-            "application.herdr_project_column_authority.load_lane_lifecycle_readonly",
-            side_effect=lambda **_: opened.append("lifecycle") or (),
-        ), patch(
-            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
-            "application.herdr_project_column_authority.herdr_workspace_segment",
-            side_effect=lambda *a, **k: opened.append("registry") or "",
+        for fact, fragment in (
+            (None, "no durable lane-kind"),
+            (LaneFact(kind=LANE_KIND_IMPLEMENTATION, disposition=DISPOSITION_ACTIVE),
+             "not 'delegated_coordinator'"),
+            (LaneFact(kind=LANE_KIND_DELEGATED_COORDINATOR, disposition="hibernated"),
+             "not 'active'"),
         ):
-            groups, refusal = resolve_project_groups(rows, "w1", home=self.home)
-        self.assertEqual(groups, {})
-        self.assertIn("unrecognised provider", refusal)
-        self.assertEqual(opened, [])
+            with self.subTest(fact=fact):
+                facts = {} if fact is None else {(A, "impl-1"): fact}
+                authority = self._authority(
+                    lanes=_FakeLaneFacts(facts), workspaces=self._resolvable(A)
+                )
+                decision = authority.resolve(rows, target_workspace="w1")
+                self.assertFalse(decision.ok)
+                self.assertIn(fragment, decision.refusal)
 
-    def test_the_configured_top_pair_is_refused_before_any_foreign_join(self):
-        rows = self._rows((A, "codex", "", "w1:p2"), (A, "claude", "", "w1:p3"))
-        groups, refusal = resolve_project_groups(
-            rows, "w1", home=self.home, top_workspace_id=A
+    def test_an_unreadable_lane_authority_refuses_rather_than_defaults(self):
+        authority = self._authority(
+            lanes=_FakeLaneFacts(unreadable=True), workspaces=self._resolvable(A)
         )
-        self.assertEqual(groups, {})
-        self.assertIn("configured top coordinator", refusal)
-
-    def test_an_unrecognised_provider_token_is_refused(self):
-        rows = self._rows((A, "codex", "", "w1:p2"), (A, "nethack", "", "w1:p3"))
-        groups, refusal = resolve_project_groups(rows, "w1", home=self.home)
-        self.assertEqual(groups, {})
-        self.assertIn("unrecognised provider", refusal)
-
-    def test_more_panes_than_a_pair_can_hold_is_refused(self):
-        rows = self._rows(
-            (A, "codex", "", "w1:p2"), (A, "claude", "", "w1:p3"),
-        ) + [{"name": encode_assigned_name(A, "codex"), "pane_id": "w1:p9",
-              "agent_status": "idle"}]
-        groups, refusal = resolve_project_groups(rows, "w1", home=self.home)
-        self.assertEqual(groups, {})
-        self.assertIn("duplicate provider", refusal)
-
-    def test_a_group_of_one_live_provider_passes_the_shape_phase(self):
-        """The disputed half of finding_3 (verdict j#99888 / Answer j#99900).
-
-        Cardinality alone does not refuse. The pane still has to carry positive
-        evidence before it can be moved beside, which is why this stops at the
-        foreign-evidence phase rather than at the shape one.
-        """
-        rows = self._rows((A, "codex", "", "w1:p2"))
-        _groups, refusal = resolve_project_groups(rows, "w1", home=self.home)
-        self.assertNotIn("pair", refusal)
-        self.assertIn("w1:p2", refusal)
-
-    def test_a_named_lane_with_no_durable_kind_refuses_the_whole_set(self):
-        rows = self._rows(
-            (A, "codex", "", "w1:p2"), (A, "claude", "", "w1:p3"),
-            (A, "codex", "impl-1", "w1:p4"),
+        decision = authority.resolve(
+            [self._row(A, "codex", "w1:p2", lane="impl-1")], target_workspace="w1"
         )
-        groups, refusal = resolve_project_groups(rows, "w1", home=self.home)
-        self.assertEqual(groups, {})
-        self.assertIn("no durable lane-kind", refusal)
+        self.assertFalse(decision.ok)
+        self.assertIn("unreadable", decision.refusal)
 
-    def test_an_unreadable_lane_kind_authority_refuses_rather_than_defaults(self):
-        rows = self._rows((A, "codex", "impl-1", "w1:p2"))
-        with patch(
-            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
-            "application.herdr_project_column_authority.load_lane_lifecycle_readonly",
-            return_value=None,
+    def test_own_panes_are_exempt_from_the_two_facts_they_cannot_answer(self):
+        """...and from nothing else (review j#99931 finding_1)."""
+        own = OwnSlot(
+            locator="w1:p4",
+            assigned_name=encode_assigned_name(B, "codex", "delegated-1"),
+            provider="codex",
+        )
+        authority = self._authority(
+            attestation=_FakeAttestation({"w1:p4": "absent"}),
+            workspaces=self._resolvable(A, B),
+        )
+        rows = [
+            self._row(A, "codex", "w1:p2"), self._row(A, "claude", "w1:p3"),
+            self._row(B, "codex", "w1:p4", lane="delegated-1"),
+        ]
+        decision = authority.resolve(
+            rows, target_workspace="w1", own_slots=[own]
+        )
+        self.assertTrue(decision.ok, decision.refusal)
+        self.assertNotIn("w1:p4", self.attestation.asked)
+        self.assertIn("/roots/" + B, self.workspaces.asked)
+
+    def test_an_own_pane_still_answers_what_its_row_already_says(self):
+        own = OwnSlot(
+            locator="w1:p4", assigned_name=encode_assigned_name(B, "codex"),
+            provider="codex",
+        )
+        for over, fragment in (
+            ({"agent": ""}, "shell residue"),
+            ({"agent": "claude"}, "while its assigned name claims"),
+            ({"foreground_cwd": "/roots/" + A}, "while its assigned name claims"),
         ):
-            groups, refusal = resolve_project_groups(rows, "w1", home=self.home)
-        self.assertEqual(groups, {})
-        self.assertIn("unreadable", refusal)
+            with self.subTest(over=over):
+                authority = self._authority(workspaces=self._resolvable(A, B))
+                rows = [
+                    self._row(A, "codex", "w1:p2"), self._row(A, "claude", "w1:p3"),
+                    self._row(B, "codex", "w1:p4", **over),
+                ]
+                decision = authority.resolve(
+                    rows, target_workspace="w1", own_slots=[own]
+                )
+                self.assertFalse(decision.ok)
+                self.assertIn(fragment, decision.refusal)
+
+    def test_the_own_exemption_is_bound_to_an_exact_identity_join(self):
+        own = OwnSlot(
+            locator="w1:p4", assigned_name=encode_assigned_name(B, "claude"),
+            provider="claude",
+        )
+        authority = self._authority(workspaces=self._resolvable(A, B))
+        rows = [
+            self._row(A, "codex", "w1:p2"), self._row(A, "claude", "w1:p3"),
+            self._row(B, "codex", "w1:p4"),
+        ]
+        decision = authority.resolve(rows, target_workspace="w1", own_slots=[own])
+        self.assertFalse(decision.ok)
+        self.assertIn("an identity this run did not launch there", decision.refusal)
+
+    def test_a_launched_locator_absent_from_the_workspace_refuses(self):
+        own = OwnSlot(
+            locator="w1:pGHOST", assigned_name=encode_assigned_name(B, "codex"),
+            provider="codex",
+        )
+        authority = self._authority(workspaces=self._resolvable(A))
+        decision = authority.resolve(
+            [self._row(A, "codex", "w1:p2")], target_workspace="w1", own_slots=[own]
+        )
+        self.assertFalse(decision.ok)
+        self.assertIn("inventory does not hold it", decision.refusal)
+
+    def test_a_group_of_one_live_provider_is_accepted_when_every_authority_resolves(self):
+        """The disputed half of finding_3 (verdict j#99888 / Answer j#99900)."""
+        authority = self._authority(workspaces=self._resolvable(A))
+        decision = authority.resolve(
+            [self._row(A, "codex", "w1:p2")], target_workspace="w1"
+        )
+        self.assertTrue(decision.ok, decision.refusal)
+        self.assertEqual(sorted(decision.groups), [(A, "default")])
 
 
 class ColumnVocabularyTest(unittest.TestCase):

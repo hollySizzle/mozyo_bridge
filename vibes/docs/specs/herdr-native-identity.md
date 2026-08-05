@@ -1172,9 +1172,11 @@ relayout を承認し、**推測ではなく実測で検証すること**を条�
   2. **default lane 不変条件の両側**: 本 mode で default lane が *project* coordinator なのは
      `workspace_id != top_workspace_id` のときだけである (`is_role_grouped_project_coordinator` と同じ述語。
      片側だけを写すと top pair を掴む)。target tab に top の default pair が居る場合は refusal。
-  3. **durable `lane_kind`**: foreign な named lane は lifecycle store の `(repo_workspace_id, lane_id)`
-     から解決し、`delegated_coordinator` だけを coordinator role group に入れる。`implementation` /
-     kind 無し / store 読取不可はいずれも refusal。**自 run の lane は本 phase の対象外**で、その kind は
+  3. **durable lane facts**: foreign な named lane は lifecycle store の `(repo_workspace_id, lane_id)`
+     から `lane_kind` と `lane_disposition` を**両方**解決し、`delegated_coordinator` かつ `active` の
+     ときだけ coordinator role group に入れる。kind だけを見ると hibernated lane の生き残り pane が
+     active coordinator として動かされる (j#99931 finding_3)。`implementation` / kind 無し /
+     non-active / store 読取不可はいずれも refusal。**自 run の lane は本 phase の対象外**で、その kind は
      launch 前に caller が既に証明している (managed `delegated_coordinator` の durable row は launch とは
      別 edge で書かれるため、ここで再導出すると live path を落とす)。
   4. **foreign pane の positive evidence**: 動かす相手となる foreign pane ごとに次の 3 者を要求する。
@@ -1195,6 +1197,16 @@ relayout を承認し、**推測ではなく実測で検証すること**を条�
   に見え、closing verdict が落ちる前に 4 枚の pane が動いた (j#99904 finding_2 で実測)。`classify_named_slot`
   は positive shell-residue のみを STALE にする conservative predicate なので、「stale でない」は positive な
   liveness の証明ではない。したがって phase 4 は positive 側 (detected provider) を要求する。
+  target workspace 内の row についても同じで、**assigned name を decode できない row、重複 locator、
+  読めない payload は skip せず whole-set refusal** とする。skip すると説明できない pane が集合に残ったまま
+  plan が組まれ、6 枚動いた後の tiling 検査でしか落ちない (j#99931 finding_2 で実測)。他 herdr workspace の
+  row は scope 外であり、これは除外ではない。
+- **例外は、その根拠の幅までしか広げない**。自 run の pane が免除されるのは「まだ答えられない 2 つの事実」
+  = durable lane kind と startup attestation だけである。stale 判定・detected provider・cwd は同じ
+  inventory row から即座に読めるので自 run にも要求する。根拠 2 つで 5 つを免除した結果、own pane が
+  shell residue / provider 不一致 / 別 project cwd のいずれでも 6 枚動いた (j#99931 finding_1 で実測)。
+  免除は pair key ではなく、本 run が launch した **locator + assigned name + provider の exact join** に
+  束縛する。
 - live pane 1 枚の group は、**上記 evidence がすべて解決したうえで** `_column_span` が全高 column を証明できる
   限り正当な column として扱う (Design Consultation Answer j#99900)。slot 欠落は slot / health 軸の所有であり、
   他 project の欠落を本 run の column 失敗として報告しない。除外の結果として 1 枚に見える group は本例外の

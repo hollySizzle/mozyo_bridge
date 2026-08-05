@@ -77,9 +77,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_authority import (  # noqa: E501
     CoordinatorPane,
+    OwnSlot,
+    ProjectColumnAuthority,
     coordinator_panes_in,
-    group_by_pair,
-    resolve_project_groups,
+    project_column_authority,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pair_split_ratio import (  # noqa: E501
     LayoutSnapshot,
@@ -422,11 +423,17 @@ def attach_pane(
 def _identity_map(
     rows: Sequence[Mapping[str, object]], target_workspace: str
 ) -> "dict[str, str]":
-    """``{locator: assigned_name}`` for the decoded panes in ``target_workspace``."""
-    return {
-        pane.locator: pane.assigned_name
-        for pane in coordinator_panes_in(rows, target_workspace)
-    }
+    """``{locator: assigned_name}`` for the panes in ``target_workspace``.
+
+    A read of what the workspace holds, taken before and after the bounce. A
+    refusal from the reader means the inventory changed into a shape the authority
+    would not accept, which is itself a difference worth failing on, so it is
+    folded into the map as a sentinel rather than swallowed.
+    """
+    panes, refusal = coordinator_panes_in(rows, target_workspace)
+    if refusal:
+        return {"": refusal}
+    return {pane.locator: pane.assigned_name for pane in panes}
 
 
 def _restore_detached(
@@ -474,6 +481,7 @@ def reflow_project_columns(
     env,
     home: Path,
     top_workspace_id: str = "",
+    authority: "Optional[ProjectColumnAuthority]" = None,
 ) -> "tuple[str, str]":
     """Give this run's appended pair its own column — ``(outcome, detail)``.
 
@@ -500,19 +508,27 @@ def reflow_project_columns(
     target_workspace = _norm(result.herdr_workspace_id)
     if not target_workspace:
         return COLUMN_FAILED, "the run reports no resolved shared herdr workspace"
-    own_launched = tuple(
-        slot.locator
+    own_slots = tuple(
+        OwnSlot(
+            locator=slot.locator,
+            assigned_name=getattr(slot, "assigned_name", ""),
+            provider=getattr(slot, "provider", ""),
+        )
         for slot in result.slots
         if getattr(slot, "outcome", "") == SLOT_LAUNCHED and getattr(slot, "locator", "")
     )
+    own_launched = tuple(slot.locator for slot in own_slots)
     rows = _list_rows(binary, runner, timeout)
     own_key = (result.workspace_id, _norm(result.lane_id) or DEFAULT_LANE)
-    groups, group_refusal = resolve_project_groups(
-        rows, target_workspace, home=home, own_key=own_key,
+    decision = (authority or project_column_authority(home)).resolve(
+        rows,
+        target_workspace=target_workspace,
+        own_slots=own_slots,
         top_workspace_id=top_workspace_id,
     )
-    if group_refusal:
-        return COLUMN_FAILED, f"{group_refusal}; no live pane was moved"
+    if not decision.ok:
+        return COLUMN_FAILED, f"{decision.refusal}; no live pane was moved"
+    groups = decision.groups
     if not [key for key in groups if key != own_key]:
         return COLUMN_NOT_APPLICABLE, (
             "this project is the only coordinator pair in the shared workspace, so "
@@ -647,9 +663,7 @@ __all__ = (
     "columnar_verdict",
     "coordinator_panes_in",
     "detach_pane",
-    "group_by_pair",
     "plan_project_columns",
     "read_pane_layout",
     "reflow_project_columns",
-    "resolve_project_groups",
 )

@@ -1,16 +1,18 @@
 """Who may be treated as a project-coordinator pane (Redmine #14996 R2).
 
-The authority half of :mod:`herdr_project_column_reflow`, split out when the two
-halves stopped fitting one module. The geometry half decides where a pane goes;
-this one decides whether a pane may be reasoned about at all — and three review
-rounds landed here rather than on the geometry, which is why it earns its own
-surface.
+The authority half of :mod:`herdr_project_column_reflow`. The geometry half
+decides where a pane goes; this one decides whether a pane may be reasoned about
+at all — and four review rounds landed here rather than on the geometry, which is
+why it is its own surface, and why that surface is a named policy with injected
+ports rather than a bag of functions over stores (review j#99931 finding_4,
+against ``logic-object-oriented-architecture-policy``).
 
 The question is harder than it looks because a herdr assigned name decodes to a
 PROVIDER token (``codex`` / ``claude``), not a workflow role. Decoding proves a
 slot is one of ours; it does not say whose, nor that the pane is alive, nor that
-the process behind it is the one that attested. Every conjunct below exists
-because a review reproduced a pane being moved without it:
+the process behind it is the one that attested, nor that its lane is still meant
+to exist. Every conjunct below is here because a review reproduced a pane being
+moved without it — or, once, refused with it:
 
 - an implementation lane mis-placed into this workspace was chosen as the anchor
   and bounced (j#99885 finding_2);
@@ -22,32 +24,45 @@ because a review reproduced a pane being moved without it:
   as this generation's authority (j#99913 finding_1);
 - a pane whose live provider contradicted its assigned name passed a
   liveness-only check (j#99913 finding_2);
-- and, in the other direction, a legitimate ``delegated_coordinator`` running
-  from its linked worktree was refused by a registry-root containment test that
-  the identity model never had (j#99913 finding_3).
+- a legitimate ``delegated_coordinator`` running from its linked worktree was
+  refused by a registry-root containment test the identity model never had
+  (j#99913 finding_3);
+- this run's OWN pair was exempted from stale / provider / cwd checks it could
+  have answered immediately, on the strength of an exemption argued only for the
+  two facts it cannot (j#99931 finding_1);
+- an undecodable row inside the target tab was skipped rather than refused, so
+  six panes moved before the tiling check failed (j#99931 finding_2);
+- a HIBERNATED lane's surviving panes were treated as an active coordinator
+  because the lane-kind projection dropped ``lane_disposition`` (j#99931
+  finding_3).
 
-Two rules follow, and every function here obeys them:
+Three rules follow, and every part of this module obeys them:
 
-1. **Delegate to the canonical authority; never re-derive an equivalent.** Two
-   of the six above were hand-written equivalents that had quietly dropped one of
-   the original's conjuncts. ``evaluate_attestation`` owns the generation pin;
-   ``herdr_workspace_segment`` owns what directory belongs to what workspace;
-   ``is_role_grouped_project_coordinator`` owns the default-lane predicate.
+1. **Delegate to the canonical authority; never re-derive an equivalent.** Two of
+   the findings above were hand-written equivalents that had quietly dropped one
+   of the original's conjuncts, and a third dropped a field off a canonical
+   record. :func:`evaluate_attestation` owns the generation pin;
+   :func:`herdr_workspace_segment` owns what directory belongs to what workspace;
+   a lifecycle record owns BOTH a lane's kind and its disposition.
 2. **Unresolved evidence refuses; it never disappears.** Excluding a row you
    cannot explain changes the shape of the set the next check reasons about.
+3. **An exemption is only as wide as the reason for it.** This run's own panes
+   skip exactly the two facts a just-launched slot cannot yet answer — its
+   durable lane kind and its startup attestation — and nothing else.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Optional, Sequence
+from typing import Mapping, Optional, Protocol, Sequence
 
 from mozyo_bridge.core.state.herdr_identity_attestation import (
     HerdrIdentityAttestationStore,
     evaluate_attestation,
 )
 from mozyo_bridge.core.state.lane_kind import LANE_KIND_DELEGATED_COORDINATOR
+from mozyo_bridge.core.state.lane_lifecycle_model import DISPOSITION_ACTIVE
 from mozyo_bridge.core.state.lane_lifecycle_readonly import (
     load_lane_lifecycle_readonly,
 )
@@ -81,8 +96,8 @@ _DETECTED_AGENT_KEY = "agent"
 class CoordinatorPane:
     """One identity-decoded pane in the shared workspace, plus its raw evidence.
 
-    The evidence fields are carried rather than pre-judged so the authority join
-    can REFUSE on what it cannot resolve instead of silently excluding it — the
+    The evidence fields are carried rather than pre-judged so the authority can
+    REFUSE on what it cannot resolve instead of silently excluding it — the
     distinction review j#99904 finding_2 turned on.
     """
 
@@ -93,8 +108,7 @@ class CoordinatorPane:
     role: str
     #: The pane's working directory as the inventory reports it (``""`` if absent).
     cwd: str = ""
-    #: The canonical provider herdr detected in the pane (``""`` when unrecognised).
-    #: The POSITIVE liveness signal, and — matched against :attr:`role` — a role proof.
+    #: The canonical provider herdr detected (``""`` when absent or unrecognised).
     detected_provider: str = ""
     #: herdr reported the pane as shell residue (identity outlived its agent).
     stale: bool = False
@@ -105,38 +119,198 @@ class CoordinatorPane:
         return (self.workspace_id, self.lane_id or DEFAULT_LANE)
 
 
+@dataclass(frozen=True)
+class OwnSlot:
+    """One slot THIS run launched, as the run itself knows it.
+
+    An exact triple rather than a lane key, because the exemption is bound to the
+    panes this run created and not to everything that happens to share their pair
+    key (review j#99931 finding_1).
+    """
+
+    locator: str
+    assigned_name: str
+    provider: str
+
+
+@dataclass(frozen=True)
+class LaneFact:
+    """A lane's durable geometry facts — BOTH of them.
+
+    ``disposition`` rides alongside ``kind`` because a projection that kept only
+    the kind let a hibernated lane's survivors act as an active coordinator
+    (review j#99931 finding_3).
+    """
+
+    kind: str
+    disposition: str
+
+
+@dataclass(frozen=True)
+class ProjectGroupDecision:
+    """The authority's verdict: the project pairs, or the reason there are none.
+
+    A typed result rather than a ``(dict, str)`` tuple: this is an
+    authority-bearing decision, and the repo's architecture policy keeps those off
+    raw payloads (review j#99931 finding_4).
+    """
+
+    groups: "Mapping[tuple[str, str], tuple[CoordinatorPane, ...]]"
+    refusal: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return not self.refusal
+
+    @classmethod
+    def refused(cls, reason: str) -> "ProjectGroupDecision":
+        return cls(groups={}, refusal=reason)
+
+
+class AttestationPort(Protocol):
+    """Reads a slot's startup self-attestation and judges it for a live pane."""
+
+    def attested(self, pane: "CoordinatorPane") -> "tuple[bool, str]":
+        """``(ok, state)`` — ``state`` names the refusal when ``ok`` is False."""
+
+
+class LaneFactsPort(Protocol):
+    """Reads every lane's durable geometry facts, or reports them unreadable."""
+
+    def lane_facts(self) -> "Optional[Mapping[tuple[str, str], LaneFact]]":
+        """``None`` when the authority cannot be read (the caller fails closed)."""
+
+
+class WorkspaceResolverPort(Protocol):
+    """Maps a working directory to the mozyo workspace it belongs to."""
+
+    def workspace_of(self, cwd: str) -> str:
+        """``""`` when no ancestor of ``cwd`` resolves a workspace identity."""
+
+
+class StoreAttestationPort:
+    """Live port over the #13637 attestation store.
+
+    The judgment itself is :func:`evaluate_attestation` — the join adopt and
+    doctor already share — so the generation pin cannot drift from theirs.
+    """
+
+    def __init__(self, home: Path) -> None:
+        self._store = HerdrIdentityAttestationStore(home=home)
+
+    def attested(self, pane: "CoordinatorPane") -> "tuple[bool, str]":
+        join = evaluate_attestation(
+            self._store.read(pane.assigned_name),
+            live_locator=pane.locator,
+            expected_workspace_id=pane.workspace_id,
+            expected_role=pane.role,
+            expected_lane=pane.lane_id,
+        )
+        return join.ok, join.state
+
+
+class StoreLaneFactsPort:
+    """Live port over the generation-bound lane lifecycle store."""
+
+    def __init__(self, home: Path) -> None:
+        self._home = home
+
+    def lane_facts(self) -> "Optional[Mapping[tuple[str, str], LaneFact]]":
+        records = load_lane_lifecycle_readonly(home=self._home)
+        if records is None:
+            return None
+        return {
+            (
+                record.repo_workspace_id,
+                _norm(record.lane_id) or DEFAULT_LANE,
+            ): LaneFact(
+                kind=_norm(record.lane_kind),
+                disposition=_norm(record.lane_disposition),
+            )
+            for record in records
+        }
+
+
+class IdentityWorkspaceResolver:
+    """Live port over the identity model's own workspace resolver.
+
+    Walking up to the nearest ancestor that resolves an identity covers a main
+    checkout, a subdirectory of one, a linked worktree and a subdirectory of that
+    with one rule — and it cannot drift from #13152 / #13377 because it IS that
+    rule. A containment test against the registry root refused every legitimate
+    managed ``delegated_coordinator`` (review j#99913 finding_3).
+    """
+
+    def __init__(self, home: Path) -> None:
+        self._home = home
+
+    def workspace_of(self, cwd: str) -> str:
+        try:
+            start = Path(cwd).expanduser().resolve()
+        except (OSError, ValueError, RuntimeError):
+            return ""
+        for candidate in (start, *start.parents):
+            try:
+                resolved = herdr_workspace_segment(candidate, home=self._home)
+            except (OSError, ValueError):
+                return ""
+            if resolved:
+                return resolved
+        return ""
+
+
+def _detected_provider(row: Mapping[str, object]) -> str:
+    """The canonical provider herdr detected in the pane, or ``""``.
+
+    :func:`classify_named_slot` is deliberately conservative in the other
+    direction — it returns ``live`` for a legacy / minimal row that carries no
+    liveness field at all, because its job is never to clobber a real agent. That
+    makes "not stale" the wrong predicate for deciding whether a pane may be moved
+    (review j#99904 finding_2). Returning the VALUE rather than a boolean is
+    review j#99913 finding_2: a non-blank marker is not a role proof. Anything
+    outside the canonical vocabulary is ``""`` — unknown, not "some provider".
+    """
+    detected = _norm(row.get(_DETECTED_AGENT_KEY))
+    return detected if detected in LANE_PLACEMENT_PROVIDERS else ""
+
 
 def coordinator_panes_in(
     rows: Sequence[Mapping[str, object]], target_workspace: str
-) -> "tuple[CoordinatorPane, ...]":
-    """Every identity-decoded slot whose pane sits in ``target_workspace``.
+) -> "tuple[tuple[CoordinatorPane, ...], str]":
+    """``(panes, refusal)`` for every inventory row inside ``target_workspace``.
 
-    Identity is the herdr assigned name, never the pane position: a row we cannot
-    decode, or one located in another herdr workspace, contributes nothing.
+    Rows located in ANOTHER herdr workspace are out of scope and contribute
+    nothing — that is a scope boundary, not an exclusion. Inside the target
+    workspace nothing is skipped: a row whose assigned name will not decode, or a
+    locator that appears twice, refuses the whole set. Review j#99931 finding_2
+    measured what skipping cost — an unexplained row rode along until the closing
+    tiling check failed, six pane moves later — and the rule it broke is this
+    module's own second one.
 
-    Nothing else is dropped here — deliberately. An earlier cut filtered out rows
-    :func:`classify_named_slot` read as :data:`SLOT_STALE`, which review j#99885
-    finding_2 asked for and review j#99904 finding_2 then showed to be the wrong
-    shape of fix: dropping a foreign pair's stale sibling made the pair *look*
-    like a healthy one-pane group, so a plan was built and four panes were moved
-    before the closing verdict failed. Unresolved evidence must REFUSE, not
-    disappear, and the refusal has to happen before the first move — so it lives
-    in :func:`resolve_project_groups`, which sees the whole set.
-
-    Decoding is necessary but NOT sufficient to call a pane a coordinator: the
-    assigned name's ``role`` is a provider token. :func:`resolve_project_groups`
-    is the only producer a plan may consume.
+    A non-mapping element means the inventory payload is not the shape this module
+    reasons about at all, so it refuses rather than being stepped over.
     """
     panes: list = []
+    seen: set = set()
     for row in rows:
         if not isinstance(row, Mapping):
-            continue
-        decoded = decode_assigned_name(row.get(AGENT_KEY_NAME))
-        if not decoded.ok or decoded.identity is None:
-            continue
+            return (), "the herdr inventory contains a row this module cannot read"
         locator = _agent_locator(row)
         if not locator or _workspace_prefix(locator) != target_workspace:
             continue
+        if locator in seen:
+            return (), (
+                f"pane {locator!r} appears twice in the herdr inventory; refusing to "
+                "reason about a workspace whose panes are not uniquely identified"
+            )
+        seen.add(locator)
+        decoded = decode_assigned_name(row.get(AGENT_KEY_NAME))
+        if not decoded.ok or decoded.identity is None:
+            return (), (
+                f"pane {locator!r} in the shared project-coordinator workspace carries "
+                "no decodable mozyo identity; refusing to reshape a workspace holding "
+                "a pane this plan cannot account for"
+            )
         panes.append(
             CoordinatorPane(
                 locator=locator,
@@ -149,29 +323,7 @@ def coordinator_panes_in(
                 stale=classify_named_slot(row) == SLOT_STALE,
             )
         )
-    return tuple(panes)
-
-
-def _detected_provider(row: Mapping[str, object]) -> str:
-    """The canonical provider herdr detected in the pane, or ``""``.
-
-    :func:`classify_named_slot` is deliberately conservative in the other
-    direction — it returns ``live`` for a legacy / minimal row that carries no
-    liveness field at all, because its job is never to clobber a real agent. That
-    makes "not stale" the wrong predicate for deciding whether a FOREIGN pane may
-    be moved (review j#99904 finding_2): absence of a residue signal is not
-    evidence of a live provider.
-
-    Returning the VALUE rather than a boolean is review j#99913 finding_2: a
-    non-blank marker is not a role proof, and a Codex slot whose row reported
-    ``claude`` passed the boolean form while its assigned name still decoded to
-    ``codex``. The caller matches this against the decoded role, the same
-    comparison ``sublane_adopt_declaration`` already makes against its wanted
-    provider. Anything outside the canonical vocabulary is ``""`` — unknown, not
-    "some provider".
-    """
-    detected = _norm(row.get(_DETECTED_AGENT_KEY))
-    return detected if detected in LANE_PLACEMENT_PROVIDERS else ""
+    return tuple(panes), ""
 
 
 def group_by_pair(
@@ -184,257 +336,283 @@ def group_by_pair(
     return {key: tuple(members) for key, members in groups.items()}
 
 
-def _provider_shape_refusal(
-    key: "tuple[str, str]", members: Sequence[CoordinatorPane]
-) -> str:
-    """``""`` iff this group's providers are a shape a coordinator pair can have.
+class ProjectColumnAuthority:
+    """Decides which panes in the shared workspace are project-coordinator pairs.
 
-    A distinct, non-empty subset of the canonical providers. Review j#99885
-    finding_3 reproduced the hole this closes: two rows carrying the SAME assigned
-    name were grouped as a pair, so an identity conflict — which the sibling
-    resolver already fails closed on for this run's own lane — was reshaped as if
-    it were a healthy codex/claude pair.
+    One named policy over three injected ports, so a test states the specification
+    with fakes rather than by monkeypatching module-level reads, and so what it
+    publishes is a value object rather than a payload.
 
-    A group of ONE live provider is deliberately allowed (finding_3 verdict
-    j#99888 / dispute j#99890): :func:`_column_span` proves a full-height column
-    from the layout regardless of how many panes stack in it, so a project that is
-    currently short a slot still owns a real column. Failing here would report a
-    neighbour's missing slot as THIS run's column failure — a mis-attribution, and
-    one the slot / health axes already own.
+    The phases run cheapest-first — inventory shape, provider shape, the top
+    exclusion, the facts every row already carries, then the two store-backed
+    joins — so an inventory that is malformed on its face is refused without
+    opening any store. Every phase completes before a plan exists, which is the
+    property reviews j#99904 and j#99931 both turn on: a refusal costs zero pane
+    moves.
     """
-    providers = [pane.role for pane in members]
-    unknown = sorted({p for p in providers if p not in LANE_PLACEMENT_PROVIDERS})
-    if unknown:
-        return (
-            f"project pair {key!r} carries unrecognised provider(s) {unknown!r}; "
-            "refusing to reshape a group this plan cannot identify"
-        )
-    if len(set(providers)) != len(providers):
-        return (
-            f"project pair {key!r} carries duplicate provider(s) {sorted(providers)!r} "
-            "— an identity conflict, not a coordinator pair"
-        )
-    if len(providers) > len(LANE_PLACEMENT_PROVIDERS):
-        return (
-            f"project pair {key!r} holds {len(providers)} live panes, more than a "
-            "coordinator pair can have"
-        )
-    return ""
 
+    def __init__(
+        self,
+        *,
+        attestation: AttestationPort,
+        lanes: LaneFactsPort,
+        workspaces: WorkspaceResolverPort,
+    ) -> None:
+        self._attestation = attestation
+        self._lanes = lanes
+        self._workspaces = workspaces
 
-def _lane_kind_index(home: Path) -> "Optional[dict[tuple[str, str], str]]":
-    """``{(workspace_id, lane_id): lane_kind}`` from the durable lifecycle store.
-
-    ``None`` when the store cannot be read version-compatibly — the same
-    fail-closed disposition :func:`load_lane_lifecycle_readonly` defines, carried
-    through so an unreadable authority refuses the reflow instead of letting a
-    named lane default into "probably a coordinator".
-    """
-    records = load_lane_lifecycle_readonly(home=home)
-    if records is None:
-        return None
-    return {
-        (record.repo_workspace_id, _norm(record.lane_id) or DEFAULT_LANE): _norm(
-            record.lane_kind
-        )
-        for record in records
-    }
-
-
-def _cwd_workspace(cwd: str, *, home: Path) -> str:
-    """The mozyo workspace the pane's working directory belongs to, or ``""``.
-
-    Resolved through :func:`herdr_workspace_segment` — the SAME read-only resolver
-    the identity model mints and resolves every slot with — rather than a
-    containment test against the registry root. Review j#99913 finding_3: a named
-    lane runs from a LINKED WORKTREE that inherits the main checkout's
-    ``workspace_id`` while living beside it, so "under the registry root" refused
-    every legitimate managed ``delegated_coordinator`` and made the issue's own
-    acceptance unreachable. Walking up to the nearest ancestor that resolves an
-    identity covers a main checkout, a subdirectory of one, a linked worktree and
-    a subdirectory of that with one rule, and it cannot drift from #13152 /
-    #13377 because it IS that rule.
-    """
-    try:
-        start = Path(cwd).expanduser().resolve()
-    except (OSError, ValueError, RuntimeError):
-        return ""
-    for candidate in (start, *start.parents):
-        try:
-            resolved = herdr_workspace_segment(candidate, home=home)
-        except (OSError, ValueError):
-            return ""
-        if resolved:
-            return resolved
-    return ""
-
-
-def _foreign_evidence_refusal(pane: CoordinatorPane, *, home: Path) -> str:
-    """``""`` iff a FOREIGN pane carries positive authority to be moved beside.
-
-    Three conjuncts, each a durable fact written by somebody other than this run
-    (review j#99904 finding_2 — "stale でない" proves nothing on its own), and
-    each delegated to the canonical authority that already owns the question
-    rather than re-derived here (review j#99913 findings 1 and 3 were both a
-    hand-written equivalent that had dropped one of the original's conjuncts):
-
-    - the detected provider **equals the role its assigned name decodes to**, so
-      a live marker is a role proof rather than merely a sign of life;
-    - :func:`evaluate_attestation` — the join adopt and doctor share — accepts the
-      slot's self-attestation, which pins the PROCESS GENERATION through the
-      recorded locator: a ``present`` record from a previous generation is never
-      re-used;
-    - the pane's cwd resolves, through the identity model's own resolver, to the
-      very workspace its name claims.
-
-    Any of the three being unresolvable is a refusal, never an exclusion.
-    """
-    if pane.stale:
-        return f"pane {pane.locator!r} is shell residue (its identity outlived its agent)"
-    if not pane.detected_provider:
-        return (
-            f"pane {pane.locator!r} reports no recognised provider, so its liveness is "
-            "unproved"
-        )
-    if pane.detected_provider != pane.role:
-        return (
-            f"pane {pane.locator!r} is running {pane.detected_provider!r} while its "
-            f"assigned name claims {pane.role!r}"
-        )
-    join = evaluate_attestation(
-        HerdrIdentityAttestationStore(home=home).read(pane.assigned_name),
-        live_locator=pane.locator,
-        expected_workspace_id=pane.workspace_id,
-        expected_role=pane.role,
-        expected_lane=pane.lane_id,
-    )
-    if not join.ok:
-        return (
-            f"pane {pane.locator!r} has no usable startup self-attestation "
-            f"({join.state})"
-        )
-    if not pane.cwd:
-        return f"pane {pane.locator!r} reports no working directory"
-    resolved = _cwd_workspace(pane.cwd, home=home)
-    if not resolved:
-        return (
-            f"pane {pane.locator!r} runs in a directory that resolves to no registered "
-            "mozyo workspace"
-        )
-    if resolved != pane.workspace_id:
-        return (
-            f"pane {pane.locator!r} runs in workspace {resolved!r} while its assigned "
-            f"name claims {pane.workspace_id!r}"
-        )
-    return ""
-
-
-def resolve_project_groups(
-    rows: Sequence[Mapping[str, object]],
-    target_workspace: str,
-    *,
-    home: Path,
-    own_key: "Optional[tuple[str, str]]" = None,
-    top_workspace_id: str = "",
-) -> "tuple[dict[tuple[str, str], tuple[CoordinatorPane, ...]], str]":
-    """``(project pairs, refusal)`` — the only group producer a plan may consume.
-
-    Three authorities, in the order that keeps the common case free of the
-    heaviest one (review j#99885 finding_2 / finding_3):
-
-    1. **live-ness and provider shape** (:func:`coordinator_panes_in`,
-       :func:`_provider_shape_refusal`) — pure, from the inventory row.
-    2. **the mode's default-lane invariant, BOTH halves of it** — under
-       ``role_grouped_space`` a default lane is a *project* coordinator exactly
-       when its workspace is not the configured top. An earlier cut copied only
-       the first half of
-       :func:`...herdr_role_grouped_space.is_role_grouped_project_coordinator`
-       and dropped its ``workspace_id != top_workspace_id`` conjunct, so a top
-       pair that had ended up in this workspace was grouped as a project pair and
-       six panes were moved (review j#99904 finding_1). The top pair belongs in
-       its own dedicated workspace; finding it here is a placement this axis
-       refuses rather than reshapes.
-    3. **the durable ``lane_kind``** for every FOREIGN named lane, read from the
-       generation-bound lifecycle store. Only ``delegated_coordinator`` joins the
-       coordinator role group. An ``implementation`` lane in this workspace is a
-       mis-placement this axis must not silently reshape, and a missing / unknown
-       kind — or a store that cannot be read — is not evidence of one either. All
-       three are a refusal, which the caller turns into a ZERO-MOVE typed failure.
-
-    ``own_key`` is exempt from (3) and only from (3): this run's own lane kind was
-    already proved by the caller — ``role_grouped_space`` classified it through
-    :func:`...herdr_role_grouped_space.is_role_grouped_project_coordinator` before
-    anything launched, which is the authority that decided this workspace was its
-    placement at all. Re-deriving it from the lifecycle store would not strengthen
-    that; it would only fail a managed ``delegated_coordinator`` whose durable row
-    is written on a different edge than its launch, which is a live path (measured
-    against ``HerdrSublaneActuatorOps.append_lane_column``). The finding this
-    exemption preserves is about FOREIGN panes, and those keep the full join.
-
-    4. **positive evidence for every FOREIGN pane** (:func:`_foreign_evidence_refusal`)
-       — a detected provider, a matching self-attestation, and a cwd under the
-       registry root of the project its name claims. This is the "identity / cwd /
-       role 検証済み" set j#99845 asks for, stated as facts other writers left
-       behind rather than as the absence of a residue signal.
-
-    The four run in that order deliberately: each is cheaper than the next, and
-    the pure ones need no store at all, so an inventory that is malformed on its
-    face is refused without opening the lifecycle store, the registry or the
-    attestation store.
-
-    A non-empty refusal means no plan may be built; the groups returned with it
-    are not usable. Every refusal here happens BEFORE the first pane move — that
-    is the property, not merely the outcome (review j#99904 finding_2 measured
-    four moves executed ahead of a closing failure).
-    """
-    groups = group_by_pair(coordinator_panes_in(rows, target_workspace))
-    top = _norm(top_workspace_id)
-    for key, members in sorted(groups.items()):
-        refusal = _provider_shape_refusal(key, members)
+    def resolve(
+        self,
+        rows: Sequence[Mapping[str, object]],
+        *,
+        target_workspace: str,
+        own_slots: Sequence[OwnSlot] = (),
+        top_workspace_id: str = "",
+    ) -> ProjectGroupDecision:
+        panes, refusal = coordinator_panes_in(rows, target_workspace)
         if refusal:
-            return {}, refusal
+            return ProjectGroupDecision.refused(refusal)
+        groups = group_by_pair(panes)
+        own_index = {slot.locator: slot for slot in own_slots if slot.locator}
+
+        for key, members in sorted(groups.items()):
+            refusal = self._provider_shape_refusal(key, members) or self._top_refusal(
+                key, top_workspace_id
+            )
+            if refusal:
+                return ProjectGroupDecision.refused(refusal)
+
+        own_key, refusal = self._own_key(groups, own_index)
+        if refusal:
+            return ProjectGroupDecision.refused(refusal)
+
+        for pane in panes:
+            refusal = self._observable_refusal(pane)
+            if refusal:
+                return ProjectGroupDecision.refused(refusal)
+
+        refusal = self._named_lane_refusal(groups, own_key)
+        if refusal:
+            return ProjectGroupDecision.refused(refusal)
+
+        for pane in panes:
+            if pane.locator in own_index:
+                continue
+            ok, state = self._attestation.attested(pane)
+            if not ok:
+                return ProjectGroupDecision.refused(
+                    f"pane {pane.locator!r} has no usable startup self-attestation "
+                    f"({state})"
+                )
+        return ProjectGroupDecision(groups=groups)
+
+    # -- phases ------------------------------------------------------------
+    def _provider_shape_refusal(
+        self, key: "tuple[str, str]", members: Sequence[CoordinatorPane]
+    ) -> str:
+        """``""`` iff this group's providers are a shape a coordinator pair can have.
+
+        A distinct, non-empty subset of the canonical providers. Two rows carrying
+        the SAME assigned name were once grouped as a pair, so an identity conflict
+        was reshaped as if it were a healthy one (review j#99885 finding_3).
+
+        A group of ONE live provider is deliberately allowed (Design Consultation
+        Answer j#99900): the layout proves a full-height column regardless of how
+        many panes stack in it, so a project currently short a slot still owns a
+        real column. That exception covers a GENUINE one — nothing filtered away,
+        every authority resolved — which is why nothing above this line skips a row.
+        """
+        providers = [pane.role for pane in members]
+        unknown = sorted({p for p in providers if p not in LANE_PLACEMENT_PROVIDERS})
+        if unknown:
+            return (
+                f"project pair {key!r} carries unrecognised provider(s) {unknown!r}; "
+                "refusing to reshape a group this plan cannot identify"
+            )
+        if len(set(providers)) != len(providers):
+            return (
+                f"project pair {key!r} carries duplicate provider(s) "
+                f"{sorted(providers)!r} — an identity conflict, not a coordinator pair"
+            )
+        if len(providers) > len(LANE_PLACEMENT_PROVIDERS):
+            return (
+                f"project pair {key!r} holds {len(providers)} live panes, more than a "
+                "coordinator pair can have"
+            )
+        return ""
+
+    def _top_refusal(self, key: "tuple[str, str]", top_workspace_id: str) -> str:
+        """Both halves of the mode's default-lane invariant, not just the first.
+
+        Under ``role_grouped_space`` a default lane is a *project* coordinator
+        exactly when its workspace is not the configured top — the same predicate
+        ``is_role_grouped_project_coordinator`` enforces. Copying only the first
+        half grouped the top pair as a project pair and moved six panes (review
+        j#99904 finding_1).
+        """
+        top = _norm(top_workspace_id)
         if top and key[0] == top and key[1] == DEFAULT_LANE:
-            return {}, (
+            return (
                 f"the configured top coordinator {key!r} occupies this shared "
                 "project-coordinator workspace; it belongs in its own dedicated one, "
                 "and this plan will not reshape it"
             )
-    named = sorted(
-        key for key in groups if key[1] != DEFAULT_LANE and key != own_key
-    )
-    index = _lane_kind_index(home) if named else {}
-    if index is None:
-        return {}, (
-            "the durable lane-kind authority is unreadable, so the named lane(s) "
-            f"{named!r} in this workspace cannot be proved to be project coordinators"
-        )
-    for key in named:
-        kind = index.get(key, "")
-        if kind == LANE_KIND_DELEGATED_COORDINATOR:
-            continue
-        if not kind:
-            return {}, (
-                f"named lane {key!r} has no durable lane-kind; refusing to treat it as "
-                "a project coordinator"
+        return ""
+
+    def _own_key(
+        self,
+        groups: "Mapping[tuple[str, str], tuple[CoordinatorPane, ...]]",
+        own_index: "Mapping[str, OwnSlot]",
+    ) -> "tuple[Optional[tuple[str, str]], str]":
+        """``(own pair key, refusal)`` from the panes this run actually launched.
+
+        The exemption is bound to an exact join — locator, assigned name and
+        provider — rather than to a pair key, so a pane that merely shares the key
+        is not exempt (review j#99931 finding_1). A locator this run claims that is
+        absent from the workspace, or present under a different identity, is a
+        contradiction rather than something to fall back from.
+        """
+        if not own_index:
+            return None, ""
+        by_locator = {
+            pane.locator: pane for members in groups.values() for pane in members
+        }
+        keys = set()
+        for locator, slot in sorted(own_index.items()):
+            pane = by_locator.get(locator)
+            if pane is None:
+                return None, (
+                    f"this run launched pane {locator!r} but the shared workspace "
+                    "inventory does not hold it"
+                )
+            if pane.assigned_name != slot.assigned_name or pane.role != slot.provider:
+                return None, (
+                    f"pane {locator!r} carries an identity this run did not launch "
+                    "there; refusing to treat it as this run's own"
+                )
+            keys.add(pane.pair_key)
+        if len(keys) != 1:
+            return None, (
+                f"this run's launched panes span {len(keys)} project pairs; refusing "
+                "to exempt an ambiguous set"
             )
-        return {}, (
-            f"named lane {key!r} has durable lane-kind {kind!r}, not "
-            f"{LANE_KIND_DELEGATED_COORDINATOR!r}; a non-coordinator lane in the shared "
-            "project-coordinator workspace is a placement this plan will not reshape"
+        return keys.pop(), ""
+
+    def _observable_refusal(self, pane: CoordinatorPane) -> str:
+        """Facts every pane can answer from the inventory alone — own included.
+
+        Review j#99931 finding_1: the own exemption was argued from two facts a
+        just-launched slot cannot yet answer (its durable lane kind, its startup
+        attestation) and then applied to three it can. Liveness, the detected
+        provider and the working directory are read off the same row for every pane
+        in the workspace, so they are required of every pane in the workspace.
+        """
+        if pane.stale:
+            return (
+                f"pane {pane.locator!r} is shell residue (its identity outlived its "
+                "agent)"
+            )
+        if not pane.detected_provider:
+            return (
+                f"pane {pane.locator!r} reports no recognised provider, so its "
+                "liveness is unproved"
+            )
+        if pane.detected_provider != pane.role:
+            return (
+                f"pane {pane.locator!r} is running {pane.detected_provider!r} while "
+                f"its assigned name claims {pane.role!r}"
+            )
+        if not pane.cwd:
+            return f"pane {pane.locator!r} reports no working directory"
+        resolved = self._workspaces.workspace_of(pane.cwd)
+        if not resolved:
+            return (
+                f"pane {pane.locator!r} runs in a directory that resolves to no "
+                "registered mozyo workspace"
+            )
+        if resolved != pane.workspace_id:
+            return (
+                f"pane {pane.locator!r} runs in workspace {resolved!r} while its "
+                f"assigned name claims {pane.workspace_id!r}"
+            )
+        return ""
+
+    def _named_lane_refusal(
+        self,
+        groups: "Mapping[tuple[str, str], tuple[CoordinatorPane, ...]]",
+        own_key: "Optional[tuple[str, str]]",
+    ) -> str:
+        """A foreign NAMED lane must be a delegated coordinator that still exists.
+
+        Both facts, off the same current record: ``delegated_coordinator`` says
+        what the lane is, ``active`` says it is still meant to be. A projection
+        that kept only the kind let a hibernated lane's surviving panes act as an
+        active coordinator (review j#99931 finding_3).
+
+        This run's own lane is exempt HERE and only here: a managed
+        ``delegated_coordinator`` writes its durable row on a different edge than
+        its launch, and its kind was already proved by the caller that routed the
+        pair to this workspace at all.
+        """
+        named = sorted(
+            key for key in groups if key[1] != DEFAULT_LANE and key != own_key
         )
-    for key, members in sorted(groups.items()):
-        if key == own_key:
-            continue
-        for pane in members:
-            refusal = _foreign_evidence_refusal(pane, home=home)
-            if refusal:
-                return {}, refusal
-    return groups, ""
+        if not named:
+            return ""
+        facts = self._lanes.lane_facts()
+        if facts is None:
+            return (
+                "the durable lane authority is unreadable, so the named lane(s) "
+                f"{named!r} in this workspace cannot be proved to be project "
+                "coordinators"
+            )
+        for key in named:
+            fact = facts.get(key)
+            if fact is None or not fact.kind:
+                return (
+                    f"named lane {key!r} has no durable lane-kind; refusing to treat "
+                    "it as a project coordinator"
+                )
+            if fact.kind != LANE_KIND_DELEGATED_COORDINATOR:
+                return (
+                    f"named lane {key!r} has durable lane-kind {fact.kind!r}, not "
+                    f"{LANE_KIND_DELEGATED_COORDINATOR!r}; a non-coordinator lane in "
+                    "the shared project-coordinator workspace is a placement this plan "
+                    "will not reshape"
+                )
+            if fact.disposition != DISPOSITION_ACTIVE:
+                return (
+                    f"named lane {key!r} is {fact.disposition or 'unknown'!r}, not "
+                    f"{DISPOSITION_ACTIVE!r}; its surviving panes are a conflict "
+                    "between the durable lane state and the live inventory, not an "
+                    "active coordinator"
+                )
+        return ""
+
+
+def project_column_authority(home: Path) -> ProjectColumnAuthority:
+    """The live authority, wired to the operator's durable stores."""
+    return ProjectColumnAuthority(
+        attestation=StoreAttestationPort(home),
+        lanes=StoreLaneFactsPort(home),
+        workspaces=IdentityWorkspaceResolver(home),
+    )
 
 
 __all__ = (
+    "AttestationPort",
     "CoordinatorPane",
+    "IdentityWorkspaceResolver",
+    "LaneFact",
+    "LaneFactsPort",
+    "OwnSlot",
+    "ProjectColumnAuthority",
+    "ProjectGroupDecision",
+    "StoreAttestationPort",
+    "StoreLaneFactsPort",
+    "WorkspaceResolverPort",
     "coordinator_panes_in",
     "group_by_pair",
-    "resolve_project_groups",
+    "project_column_authority",
 )
