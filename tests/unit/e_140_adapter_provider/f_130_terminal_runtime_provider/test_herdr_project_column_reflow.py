@@ -95,8 +95,16 @@ def _pane(workspace: str, role: str, locator: str, lane: str = "default"):
 #: and the test asserts that, because a table is a claim and the claim is what is
 #: checked (review j#99960 finding_1: the previous guard only covered the OUTCOME
 #: vocabulary, which says nothing about the input space).
-_DECLARED_KINDS = ("absent", "target", "foreign")
-_LOCATOR_KINDS = ("absent", "unparseable", "target", "foreign", "other_foreign")
+#: ``non_string`` is an axis value, not an edge case: ``_norm`` is
+#: ``str(value).strip()``, so a list / dict / int / bool does not stay malformed —
+#: it becomes a perfectly good workspace id, and four such rows classified as
+#: out-of-scope while six panes moved past them (review j#99971 finding_1). An axis
+#: that omits the SHAPE a field arrives in cannot cover the input space, however
+#: completely the grid covers the axis.
+_DECLARED_KINDS = ("absent", "target", "foreign", "non_string")
+_LOCATOR_KINDS = (
+    "absent", "unparseable", "target", "foreign", "other_foreign", "non_string",
+)
 
 #: ``(declared kind, locator kind) -> (row, expected disposition)``. ``other_foreign``
 #: is a SECOND foreign workspace, which is what makes "declared foreign + locator a
@@ -135,6 +143,24 @@ _ROW_GRID = {
          "workspace_id": "w2"}, ROW_OUT_OF_SCOPE),
     ("foreign", "other_foreign"): (
         {"name": "n", "pane_id": "w3:p9", "workspace_id": "w2"}, ROW_REFUSED),
+    ("absent", "non_string"): ({"name": "n", "pane_id": 17}, ROW_REFUSED),
+    ("target", "non_string"): (
+        {"name": "n", "pane_id": ["w1:p2"], "workspace_id": "w1"}, ROW_REFUSED),
+    ("foreign", "non_string"): (
+        {"name": "n", "pane_id": {"p": 1}, "workspace_id": "w2"}, ROW_REFUSED),
+    ("non_string", "absent"): (
+        {"name": "n", "pane_id": "", "workspace_id": []}, ROW_REFUSED),
+    ("non_string", "unparseable"): (
+        {"name": "n", "pane_id": "nocolon", "workspace_id": {}}, ROW_REFUSED),
+    ("non_string", "target"): (
+        {"name": encode_assigned_name(A, "codex"), "pane_id": "w1:p2",
+         "workspace_id": 17}, ROW_REFUSED),
+    ("non_string", "foreign"): (
+        {"name": "n", "pane_id": "w2:p2", "workspace_id": True}, ROW_REFUSED),
+    ("non_string", "other_foreign"): (
+        {"name": "n", "pane_id": "w3:p2", "workspace_id": 3.5}, ROW_REFUSED),
+    ("non_string", "non_string"): (
+        {"name": "n", "pane_id": 1, "workspace_id": []}, ROW_REFUSED),
 }
 
 #: Shapes outside the declared x locator grid entirely.
@@ -183,6 +209,30 @@ class InventoryRowClassificationTest(unittest.TestCase):
             with self.subTest(shape=label):
                 self.assertEqual(
                     classify_inventory_row(row, "w1").disposition, expected
+                )
+
+    def test_a_non_text_field_is_never_promoted_into_identity_evidence(self):
+        """Review j#99971 finding_1 — ``_norm`` would have stringified each of these."""
+        for raw in ([], {}, 17, True, 3.5):
+            with self.subTest(raw=raw):
+                verdict = classify_inventory_row(
+                    {"name": "n", "pane_id": "", "workspace_id": raw}, "w1"
+                )
+                self.assertEqual(verdict.disposition, ROW_REFUSED)
+                self.assertIn("non-text field", verdict.refusal)
+
+    def test_absent_and_null_and_blank_stay_absent(self):
+        """The shape check narrows nothing that ``_norm`` already folded away."""
+        for row in (
+            {"name": encode_assigned_name(A, "codex"), "pane_id": "w1:p2"},
+            {"name": encode_assigned_name(A, "codex"), "pane_id": "w1:p2",
+             "workspace_id": None},
+            {"name": encode_assigned_name(A, "codex"), "pane_id": "w1:p2",
+             "workspace_id": "   "},
+        ):
+            with self.subTest(row=sorted(row)):
+                self.assertEqual(
+                    classify_inventory_row(row, "w1").disposition, ROW_IN_SCOPE
                 )
 
     def test_a_contradictory_row_refuses_even_when_neither_side_is_ours(self):

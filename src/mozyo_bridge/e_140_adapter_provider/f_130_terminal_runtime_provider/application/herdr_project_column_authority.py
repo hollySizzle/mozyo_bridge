@@ -74,6 +74,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     herdr_workspace_segment,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+    AGENT_KEY_LOCATOR,
+    AGENT_KEY_LOCATOR_ALIAS,
+    AGENT_KEY_LOCATOR_ALIAS_2,
     AGENT_KEY_NAME,
     DEFAULT_LANE,
     _agent_locator,
@@ -302,6 +305,15 @@ ROW_REFUSED = "refused"
 ROW_DISPOSITIONS: "tuple[str, ...]" = (ROW_IN_SCOPE, ROW_OUT_OF_SCOPE, ROW_REFUSED)
 
 
+#: The row keys that can carry a pane locator, in the order the canonical reader
+#: consults them.
+_LOCATOR_KEYS: "tuple[str, ...]" = (
+    AGENT_KEY_LOCATOR,
+    AGENT_KEY_LOCATOR_ALIAS,
+    AGENT_KEY_LOCATOR_ALIAS_2,
+)
+
+
 @dataclass(frozen=True)
 class RowVerdict:
     """Where one inventory row stands, on the closed disposition vocabulary."""
@@ -311,13 +323,42 @@ class RowVerdict:
     refusal: str = ""
 
 
+def _text_field_refusal(row: Mapping[str, object], key: str) -> str:
+    """``""`` unless ``key`` is present holding something that is not text.
+
+    The canonical ``_norm`` is ``str(value).strip()`` for anything non-``None``, so
+    a malformed payload does not stay malformed — it becomes a *string*. A list
+    normalises to ``"[]"``, a dict to ``"{}"``, an int to ``"17"``, ``True`` to
+    ``"True"``, and every one of those reads as a perfectly good foreign workspace
+    id. Four such rows classified as out-of-scope and six panes moved past them
+    (review j#99971 finding_1).
+
+    So the raw shape is judged BEFORE normalisation. Absent and ``null`` stay
+    absent — the row simply does not state the field — and a whitespace-only
+    string still folds to absent, which is what ``_norm`` already means by it.
+    """
+    if key not in row:
+        return ""
+    value = row[key]
+    if value is None or isinstance(value, str):
+        return ""
+    return (
+        f"the herdr inventory row states {key!r} as "
+        f"{type(value).__name__}; refusing to read a non-text field as identity "
+        "evidence"
+    )
+
+
 def classify_inventory_row(row: object, target_workspace: str) -> RowVerdict:
     """Place one ``agent list`` row on :data:`ROW_DISPOSITIONS` (pure, total).
 
     A row states its workspace twice — explicitly in ``workspace_id``, and inside
     its locator. The decision is taken over the FULL product of what those two can
-    say, in this order:
+    say — including what SHAPE they say it in — in this order:
 
+    0. **a field is present but is not text** -> refused. ``_norm`` turns anything
+       non-``None`` into a string, so a list, dict, int or bool would otherwise be
+       promoted into a perfectly good workspace id (:func:`_text_field_refusal`).
     1. **both say something, and they disagree** -> refused. Self-consistency is
        asked before "is it ours?", because such a row has not established that it
        lives anywhere — including elsewhere (review j#99960 finding_1).
@@ -339,6 +380,10 @@ def classify_inventory_row(row: object, target_workspace: str) -> RowVerdict:
             ROW_REFUSED,
             refusal="the herdr inventory contains a row this module cannot read",
         )
+    for key in (AGENT_KEY_WORKSPACE, *_LOCATOR_KEYS):
+        shape = _text_field_refusal(row, key)
+        if shape:
+            return RowVerdict(ROW_REFUSED, refusal=shape)
     locator = _agent_locator(row)
     prefix = _workspace_prefix(locator)
     declared = _norm(row.get(AGENT_KEY_WORKSPACE))

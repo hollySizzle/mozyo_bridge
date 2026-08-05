@@ -726,6 +726,13 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
              {"pane_id": "w3:p9", "workspace_id": "w2"}),
             ("declared foreign, locator addresses this workspace",
              {"pane_id": "w1:p90", "workspace_id": "w2"}),
+            # Review j#99971 finding_1: `_norm` is `str(value).strip()`, so each of
+            # these would have become a perfectly good foreign workspace id.
+            ("workspace_id is a list", {"pane_id": "", "workspace_id": []}),
+            ("workspace_id is a dict", {"pane_id": "", "workspace_id": {}}),
+            ("workspace_id is an int", {"pane_id": "", "workspace_id": 17}),
+            ("workspace_id is a bool", {"pane_id": "", "workspace_id": True}),
+            ("pane_id is not text", {"pane_id": 17, "workspace_id": "w1"}),
             ("undecodable name on an addressable pane",
              {"pane_id": "w1:p90", "workspace_id": "w1"}),
         )

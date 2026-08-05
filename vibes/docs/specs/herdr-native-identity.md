@@ -1211,8 +1211,14 @@ relayout を承認し、**推測ではなく実測で検証すること**を条�
   declared と locator が食い違う row は「別 workspace に居る」ことすら証明していないためで、target 判定を
   先に置くと両方 foreign かつ相互に矛盾する row が out-of-scope として素通りする (j#99960 finding_1 で実測)。
   target を主張する row の locator 欠損・unparseable locator (`_workspace_prefix` の `""` contract) も refusal。
-  回帰は個別事例でなく **declared × locator の入力空間の格子**で持ち、**格子が全 cell を覆っていること自体を
-  test が assert する**（表は主張であり、主張の方を検査する）。
+  **field の shape も軸である**。canonical `_norm` は `str(value).strip()` なので、list / dict / int / bool が
+  そのまま非空の workspace id へ昇格する。present かつ非 text の field は normalization より**前**に refusal
+  とする（absent / null / 空白のみ string は従来どおり absent へ畳む）。j#99971 finding_1 で、非文字列
+  `workspace_id` 4 種がすべて out-of-scope として素通りし 6 枚 move する再現を確認した。
+  回帰は個別事例でなく **declared × locator の入力空間の格子**で持ち（各軸は `absent` / `target` / `foreign` /
+  `non_string` などの **shape を含む**値域）、**格子が全 cell を覆っていること自体を test が assert する**
+  （表は主張であり、主張の方を検査する）。**軸の定義が入力空間を覆っていなければ、格子の網羅 assertion は
+  網羅の証明にならない**。
 - **集合へ畳む操作そのものが filter になりうる**。run の launched slot を locator で dict 化すると、
   duplicate locator が黙って上書きされ、矛盾する slot が exact join に到達しない (j#99950 finding_2)。
   畳む前に cardinality を検査し、重複・locator 欠損を refusal にする。
