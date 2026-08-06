@@ -935,9 +935,16 @@ class OsBoundaryRefusesEveryKnownBypassTest(unittest.TestCase):
             self.control = context.allowed_control_root
             self.reused_outer = True
         else:
+            # The task root is the boundary's one host-backed writable hole on
+            # Linux. Putting the denied-home fixture below it asks for the same
+            # subtree to be writable and denied, an invalid topology the boundary
+            # now refuses. A real operator home is outside the task root, so keep
+            # the fixture in a second temporary tree as its sibling-equivalent.
+            self._guarded = tempfile.TemporaryDirectory()
+            self.addCleanup(self._guarded.cleanup)
             self.canary = task_root / "canary"
             self.control = task_root / "control"
-            home = task_root / "operator-home"
+            home = Path(self._guarded.name).resolve() / "operator-home"
             home.mkdir()
             try:
                 self.fence = resolve_os_fence(
