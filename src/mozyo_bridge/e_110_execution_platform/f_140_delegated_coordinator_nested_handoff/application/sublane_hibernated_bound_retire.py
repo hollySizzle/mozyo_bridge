@@ -258,6 +258,9 @@ def run_hibernated_bound_retire(
     worktree agreement, the worktree ↔ branch identity, head integration, a live-inventory zero
     read, and the released-bound-state CAS.
     """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+        declared_lane_root_identity,
+    )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
         list_herdr_agent_rows,
         repo_backend_is_herdr,
@@ -287,10 +290,6 @@ def run_hibernated_bound_retire(
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
         HerdrSessionStartError,
         herdr_workspace_segment,
-    )
-    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
-        derive_directory_lane_token,
-        derive_lane_workspace_token,
     )
 
     if not repo_backend_is_herdr(repo_root):
@@ -324,16 +323,14 @@ def run_hibernated_bound_retire(
             detail=f"--worktree does not resolve ({type(exc).__name__})",
             lane_id=lane_label,
         )
-    try:
-        collapsed_to_root = resolved_worktree == repo_root.expanduser().resolve()
-    except OSError:
-        collapsed_to_root = False
-    if collapsed_to_root:
-        legacy_token = ""
-        metadata_token = derive_directory_lane_token(str(resolved_worktree), lane_label)
-    else:
-        legacy_token = derive_lane_workspace_token(str(resolved_worktree))
-        metadata_token = legacy_token
+    # Redmine #14715: "the same way the create site recorded it" is now literal — the family
+    # comes from the canonical helper both writers use, probed on the ``--worktree`` root's
+    # own kind. The retired ``resolved_worktree == repo_root`` proxy keyed it on the
+    # operator's cwd, so a normal run from inside a linked worktree (``--repo`` omitted)
+    # derived ``dl_`` for a ``wt_``-bound row and this retire refused its own lane.
+    identity = declared_lane_root_identity(resolved_worktree, lane_label)
+    legacy_token = identity.legacy_token
+    metadata_token = identity.metadata_token
     if not workspace_id and not legacy_token:
         return _blocked(
             REASON_WORKSPACE_UNRESOLVED,

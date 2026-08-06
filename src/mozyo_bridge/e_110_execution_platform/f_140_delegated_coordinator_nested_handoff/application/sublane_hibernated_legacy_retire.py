@@ -208,6 +208,9 @@ def run_hibernated_legacy_retire_migration(
     CAS. Every success — including an idempotent already-retired replay — is action-time verified
     against the live inventory before it is reported (review j#79150 finding 2).
     """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+        declared_lane_root_identity,
+    )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
         list_herdr_agent_rows,
         repo_backend_is_herdr,
@@ -234,9 +237,6 @@ def run_hibernated_legacy_retire_migration(
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
         HerdrSessionStartError,
         herdr_workspace_segment,
-    )
-    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
-        derive_lane_workspace_token,
     )
 
     if not repo_backend_is_herdr(repo_root):
@@ -268,13 +268,13 @@ def run_hibernated_legacy_retire_migration(
             detail=f"--worktree does not resolve ({type(exc).__name__})",
             lane_id=lane_label,
         )
-    try:
-        collapsed_to_root = resolved_worktree == repo_root.expanduser().resolve()
-    except OSError:
-        collapsed_to_root = False
-    legacy_token = (
-        "" if collapsed_to_root else derive_lane_workspace_token(str(resolved_worktree))
-    )
+    # Redmine #14715: only the legacy per-lane workspace twin is needed here, but WHETHER the
+    # root has one is the same family question the create / adopt writers answer, so it is
+    # answered by the same canonical helper — probed on the ``--worktree`` root's own kind.
+    # The retired ``resolved_worktree == repo_root`` proxy answered it from the operator's
+    # cwd, which erased a linked worktree's ``wt_`` twin whenever the command ran from inside
+    # that worktree (``--repo`` omitted) and left the lane unit unidentifiable.
+    legacy_token = declared_lane_root_identity(resolved_worktree, lane_label).legacy_token
     if not workspace_id and not legacy_token:
         return _blocked(
             REASON_WORKSPACE_UNRESOLVED,

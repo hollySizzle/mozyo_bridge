@@ -37,10 +37,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LiveRecoveryAnchorDeliveryService,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+    declared_lane_root_identity,
     resolve_declared_pins,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
-    is_git_worktree_root,
     list_herdr_agent_rows,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
@@ -66,7 +66,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     AGENT_KEY_NAME,
     _agent_locator,
     _norm,
-    lane_runtime_identity,
 )
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
@@ -132,11 +131,11 @@ class LiveRecoveredPairPinReconciliationOps:
         try:
             root = Path(request.worktree).expanduser().resolve(strict=True)
             workspace = herdr_workspace_segment(root)
-            identity = lane_runtime_identity(
-                str(root),
-                _norm(request.lane),
-                git_worktree=is_git_worktree_root(root),
-            )
+            # #14715: one canonical derivation for every surface — the family is a fact
+            # about this root's kind, never about the caller's cwd.
+            identity = declared_lane_root_identity(
+                root, _norm(request.lane)
+            ).metadata_token
         except (OSError, ValueError):
             return None, "", ""
         return root, _norm(workspace), _norm(identity)

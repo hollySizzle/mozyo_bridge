@@ -192,8 +192,10 @@ def run_hibernated_pin_repair(
         lifecycle_migration_payload,
     )
     from mozyo_bridge.core.state.lane_pin_repair import LanePinRepairStore
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+        declared_lane_root_identity,
+    )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
-        is_git_worktree_root,
         repo_backend_is_herdr,
     )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
@@ -232,10 +234,6 @@ def run_hibernated_pin_repair(
         HerdrSessionStartError,
         herdr_workspace_segment,
     )
-    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
-        derive_directory_lane_token,
-        derive_lane_workspace_token,
-    )
 
     if not repo_backend_is_herdr(repo_root):
         return None
@@ -269,12 +267,11 @@ def run_hibernated_pin_repair(
     # Redmine #13933 j#81046 Decision 1: the token family is decided by whether the target
     # root IS a git worktree, probed on that root -- not by ``resolved == repo_root``, which
     # only holds when repo_root is the coordinator workspace root and otherwise flips the
-    # family on the caller's cwd (the #13846 j#81024 identity split).
-    collapsed_to_root = not is_git_worktree_root(resolved_worktree)
-    if collapsed_to_root:
-        metadata_token = derive_directory_lane_token(str(resolved_worktree), lane_label)
-    else:
-        metadata_token = derive_lane_workspace_token(str(resolved_worktree))
+    # family on the caller's cwd (the #13846 j#81024 identity split). #14715 folded the
+    # inline copy of that rule into the one canonical helper every surface now shares.
+    metadata_token = declared_lane_root_identity(
+        resolved_worktree, lane_label
+    ).metadata_token
     if not workspace_id:
         return _blocked(
             REASON_WORKSPACE_UNRESOLVED,

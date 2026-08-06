@@ -74,7 +74,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REASON_LANE_OWNER_UNVERIFIED,
     REASON_LIFECYCLE_UNREADABLE,
     REASON_NO_WORKTREE_ANCHOR,
-    REASON_WORKSPACE_UNRESOLVED,
     REASON_WORKTREE_BINDING_MISMATCH,
     REASON_WORKTREE_BINDING_UNVERIFIED,
     REASON_ZERO_CLOSE_UNPROVEN,
@@ -410,23 +409,34 @@ class RetireCommandFenceTests(unittest.TestCase):
     # -- the reported defect ------------------------------------------------
 
     def test_integration_worktree_root_blocks_instead_of_reporting_retire_ok(self) -> None:
-        # #13748 j#77473 verbatim: the mis-aimed root resolves no workspace identity. The
-        # preflight is green (`retire_ok`) — and that must NOT be the command's verdict.
+        # #13748 j#77473 verbatim: the mis-aimed root names no lane unit. The preflight is
+        # green (`retire_ok`) — and that must NOT be the command's verdict.
+        #
+        # The typed reason is `lane_owner_unverified` (the unit cannot be keyed), not the
+        # `workspace_unresolved` this asserted before Redmine #14715. The change is a
+        # consequence of removing the caller-anchor proxy, and it is a convergence rather
+        # than a loss: the sanctioned invocation (`--repo` = coordinator repo, `--worktree` =
+        # the mis-aimed root) ALWAYS produced `lane_owner_unverified`, because the early
+        # "no workspace and no lane token" pre-check never fired for a real git checkout —
+        # only the collapsed anchor suppressed its `wt_` token and reached the other branch.
+        # So the reason used to depend on where the operator stood; now it does not. Both are
+        # blocks, and the fence #13754 owns (unresolved identity is never a retire) is
+        # unchanged — asserted here on BOTH anchors so the invariance is the pin.
         self._declare_lane_active()
-        code, payload = self._retire(
-            repo=self.integration, worktree=self.integration
-        )
-        self.assertEqual(code, 1)
-        self.assertFalse(payload["retire_ok"])
-        close = payload["herdr_retire_close"]
-        self.assertEqual(close["state"], ACTUATION_BLOCKED)
-        self.assertEqual(close["reason"], REASON_WORKSPACE_UNRESOLVED)
-        # the preflight still says the retire was PERMITTED — the two are now distinct
-        self.assertEqual(payload["decision"]["state"], "retire_ok")
-        # and nothing was actuated: the lane's real pair is untouched
-        self.assertEqual(self.closed_calls, [])
-        self.assertEqual(len(self.rows), 4)
-        self.assertNotEqual(self._disposition(), DISPOSITION_RETIRED)
+        for repo in (self.integration, self.primary):
+            with self.subTest(repo=repo.name):
+                code, payload = self._retire(repo=repo, worktree=self.integration)
+                self.assertEqual(code, 1)
+                self.assertFalse(payload["retire_ok"])
+                close = payload["herdr_retire_close"]
+                self.assertEqual(close["state"], ACTUATION_BLOCKED)
+                self.assertEqual(close["reason"], REASON_LANE_OWNER_UNVERIFIED)
+                # the preflight still says the retire was PERMITTED — the two are distinct
+                self.assertEqual(payload["decision"]["state"], "retire_ok")
+                # and nothing was actuated: the lane's real pair is untouched
+                self.assertEqual(self.closed_calls, [])
+                self.assertEqual(len(self.rows), 4)
+                self.assertNotEqual(self._disposition(), DISPOSITION_RETIRED)
 
     def test_missing_worktree_anchor_blocks(self) -> None:
         code, payload = self._retire(repo=self.primary, worktree=None)
@@ -456,15 +466,20 @@ class RetireCommandFenceTests(unittest.TestCase):
         self.assertEqual(close["durable_retirement"], "recorded")
         self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
 
-    def test_lane_worktree_as_repo_root_fails_closed(self) -> None:
-        # Retire is a coordinator operation, run from the coordinator repo (--repo=.), with
-        # the lane's worktree passed as --worktree (covered by the test above). Passing the
-        # lane's OWN worktree as BOTH --repo and --worktree collapses the token derivation
-        # (the non-git-lane path) and yields a `dl_` token instead of the `wt_` token the
-        # create site bound — so the worktree-binding attestation fails CLOSED rather than
-        # closing on a divergent identity. A false block is safe (the runbook still works);
-        # a false close is the defect this whole issue exists to prevent.
-        self._declare_lane_active()
+    def test_a_divergent_recorded_binding_fails_closed_from_the_lane_worktree(self) -> None:
+        # The identity fence is not satisfied by *where the command ran*. Running with the
+        # lane's own worktree as BOTH --repo and --worktree — the shape the runbook produces
+        # — must still refuse when the lane's recorded binding names a DIFFERENT root.
+        #
+        # This replaces `test_lane_worktree_as_repo_root_fails_closed`, which asserted the
+        # block for a CORRECTLY bound lane on the theory that the collapse was a safe false
+        # block. Redmine #14715 measured it as a permanent one (the create writer records
+        # `wt_` and this reader derived `dl_`, so the lane could never retire from its own
+        # worktree) and repointed the derivation at the root's kind; that success case is
+        # pinned in `test_issue_14715_retire_worktree_identity_family.py`. What #13754 owns —
+        # a divergent binding is never closed over — is asserted here on the same anchor, so
+        # the fence stays non-vacuous rather than merely relaxed.
+        self._declare_lane_active(worktree=self.primary)
         code, payload = self._retire(
             repo=self.lane_worktree, worktree=self.lane_worktree
         )

@@ -76,11 +76,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_NAME,
+    LaneRootIdentity,
     _agent_locator,
     _norm,
     _norm_lane,
     decode_assigned_name,
-    lane_runtime_identity,
+    lane_root_identity,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E501
     SLOT_LIVE,
@@ -178,6 +179,30 @@ ADOPT_DECL_ZERO_WRITE = frozenset(
 )
 
 
+def declared_lane_root_identity(
+    resolved_root: Path, lane_label: str
+) -> LaneRootIdentity:
+    """The lane's canonical identity for an ALREADY-resolved runtime root (#14715).
+
+    THE one place the ``wt_`` / ``dl_`` family is decided for every public surface — the
+    create / adopt declaration writers, the destructive retire family
+    (``sublane retire`` guarded close / active live-zero / hibernated-bound /
+    hibernated-legacy / live-reconcile), and the read/repair rails. It probes the root
+    being named and derives both tokens from that one answer, so a writer and a reader
+    looking at the same root cannot disagree by construction.
+
+    Total by design: the caller has already resolved the path (every retire surface fails
+    closed on an unresolvable ``--worktree`` before reaching here), so there is no second
+    failure mode for callers to guard. Callers still holding a raw path use
+    :func:`declared_worktree_identity`.
+    """
+    return lane_root_identity(
+        str(resolved_root),
+        lane_label,
+        git_worktree=is_git_worktree_root(resolved_root),
+    )
+
+
 def declared_worktree_identity(worktree_path: str, lane_label: str) -> Optional[str]:
     """The lane's canonical worktree identity token, or ``None`` if unresolvable.
 
@@ -203,9 +228,7 @@ def declared_worktree_identity(worktree_path: str, lane_label: str) -> Optional[
         resolved = Path(worktree_path).expanduser().resolve()
     except OSError:
         return None
-    return lane_runtime_identity(
-        str(resolved), lane_label, git_worktree=is_git_worktree_root(resolved)
-    )
+    return declared_lane_root_identity(resolved, lane_label).metadata_token
 
 
 def _resolve_attested_slot(
@@ -645,6 +668,7 @@ def _binding_has_required_pins(record, providers: tuple[str, str]) -> bool:
 
 
 __all__ = (
+    "declared_lane_root_identity",
     "declared_worktree_identity",
     "declare_adopted_owner_row",
     "owner_bound_or",

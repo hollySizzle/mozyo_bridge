@@ -204,13 +204,18 @@ class ExecutionRootInvarianceTests(_GitFixture):
 
 
 class PerSurfaceContractTests(unittest.TestCase):
-    """The git-kind derivation is per-surface: read/repair adopt it, destructive retire does not.
+    """The read/repair rails derive the family from the target root's kind (#13933 R7).
 
-    Redmine #13933 R7 (design answer j#81046 Decision 4).  The retire family keeps the #13754
-    ``resolved == repo_root`` collapse as a DELIBERATE fail-closed guard (a false block is safe,
-    a false close is the defect the issue exists to prevent).  Repointing it silently to the
-    shared probe would change destructive behavior, so this contract test fails if any retire
-    module adopts the probe without the review that decision requires.
+    The companion assertion this class used to carry — that the destructive retire family
+    RETAINS the ``resolved == repo_root`` collapse (design answer j#81046 Decision 4) — was
+    superseded by Redmine #14715 and is deliberately gone rather than merely relaxed. That
+    per-surface carve-out assumed the collapse only ever produced a false *block*; the
+    measured behaviour is that it produced a permanent one, because a normal run from inside
+    a linked worktree (``--repo`` omitted) collapses the anchor and derives ``dl_`` for the
+    very worktree the create writer bound to ``wt_``. The replacement contract — every
+    surface, retire included, derives through the one canonical helper and no module carries
+    its own copy — is pinned by ``test_issue_14715_retire_worktree_identity_family.py``,
+    which is strictly stronger than the source grep removed here.
     """
 
     _APP = (
@@ -223,22 +228,34 @@ class PerSurfaceContractTests(unittest.TestCase):
         return (self._APP / name).read_text()
 
     def test_read_repair_rails_adopt_the_shared_probe(self):
+        # Via the canonical helper since #14715; before that each of these carried its own
+        # ``is_git_worktree_root`` call. What #13933 pins is the *rule* — the family is a
+        # fact about the target root — not which module spells the probe.
         for module in (
             "sublane_hibernated_bound_pair_convergence_live.py",  # prepare inherits this
             "sublane_hibernated_pin_repair.py",
         ):
-            self.assertIn("is_git_worktree_root", self._source(module), module)
+            self.assertIn(
+                "declared_lane_root_identity", self._source(module), module
+            )
 
-    def test_destructive_retire_rails_retain_the_deliberate_collapse(self):
+    def test_no_rail_keys_the_family_on_the_caller_anchor(self):
+        # The proxy #13933 diagnosed is absent from every rail it ever appeared in — the
+        # read/repair pair above and the destructive retire family that kept it until #14715.
+        # Matched on the code expression (``repo_root.expanduser()``), not on the name: the
+        # explanatory comments in those modules still quote the retired proxy on purpose.
         for module in (
+            "sublane_hibernated_bound_pair_convergence_live.py",
+            "sublane_hibernated_pin_repair.py",
             "sublane_retire_actuation.py",
+            "sublane_active_live_zero_retire.py",
             "sublane_hibernated_bound_retire.py",
             "sublane_hibernated_legacy_retire.py",
             "sublane_hibernated_live_reconcile.py",
         ):
-            source = self._source(module)
-            self.assertIn("resolved_worktree == repo_root", source, module)
-            self.assertNotIn("is_git_worktree_root", source, module)
+            self.assertNotIn(
+                "repo_root.expanduser()", self._source(module), module
+            )
 
 
 if __name__ == "__main__":  # pragma: no cover

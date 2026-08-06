@@ -86,8 +86,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_runtime_fence import (
     SublaneHealError,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+    declared_lane_root_identity,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (
-    is_git_worktree_root,
     list_herdr_agent_rows,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (
@@ -146,7 +148,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     AGENT_KEY_NAME,
     _agent_locator,
     decode_assigned_name,
-    lane_runtime_identity,
 )
 
 
@@ -449,13 +450,13 @@ class LiveBoundPairConvergenceOps:
         keying the token family off ``resolved == repo_root`` made the same lane resolve
         ``wt_`` from one directory and ``dl_`` from another, so its own row stopped matching
         itself when the command ran from the lane worktree (#13846 j#81024 / #13933 j#81043).
+        #14715 folded the inline copy of that rule into the one canonical helper every
+        surface — writers, read/repair and the destructive retire family — now shares.
         """
         try:
             resolved = Path(request.worktree).expanduser().resolve(strict=True)
             workspace = herdr_workspace_segment(resolved)
-            identity = lane_runtime_identity(
-                str(resolved), request.lane, git_worktree=is_git_worktree_root(resolved)
-            )
+            identity = declared_lane_root_identity(resolved, request.lane).metadata_token
         except (OSError, ValueError):
             return None, "", ""
         return resolved, workspace, identity

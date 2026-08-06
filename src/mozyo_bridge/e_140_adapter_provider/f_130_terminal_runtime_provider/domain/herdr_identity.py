@@ -276,6 +276,52 @@ def lane_runtime_identity(
     )
 
 
+@dataclass(frozen=True)
+class LaneRootIdentity:
+    """Every token a lane runtime root resolves to, from ONE family decision (#14715).
+
+    Callers need two different tokens off the same root and both are decided by the same
+    discriminant, so they are produced together rather than re-branched per token:
+
+    - :attr:`metadata_token` — the lane's canonical worktree identity (``wt_`` / ``dl_``),
+      the key the lane-metadata record and the fail-closed lifecycle ``worktree_identity``
+      binding are written and attested on;
+    - :attr:`legacy_token` — the *legacy pre-#13377 per-lane workspace* segment, or ``""``
+      when the root has none. Only a git worktree ever had one: a non-git
+      directory-scaffold lane runs in the shared workspace root, where the path-derived
+      ``wt_`` segment is the same for every lane on that root and therefore names no lane.
+
+    Keeping the two in one value makes the empty-``legacy_token`` case a *consequence* of
+    the family decision instead of a second branch each caller re-derives (the shape that
+    let the retire family drift away from the create/adopt writers, Redmine #14715).
+    """
+
+    git_worktree: bool
+    metadata_token: str
+    legacy_token: str
+
+
+def lane_root_identity(
+    canonical_root: str, lane_id: str, *, git_worktree: bool
+) -> LaneRootIdentity:
+    """Both lane tokens for a runtime root, chosen by that root's KIND (#13933 / #14715).
+
+    The pure half of the derivation: :func:`lane_runtime_identity` picks the family, and a
+    non-git root additionally has no legacy per-lane workspace twin. ``git_worktree`` stays
+    the ONLY discriminant and must be probed on the root being named — see
+    :func:`lane_runtime_identity` for why a caller-relative proxy (``resolved ==
+    repo_root``) is a defect rather than a shortcut.
+    """
+    metadata_token = lane_runtime_identity(
+        canonical_root, lane_id, git_worktree=git_worktree
+    )
+    return LaneRootIdentity(
+        git_worktree=git_worktree,
+        metadata_token=metadata_token,
+        legacy_token=metadata_token if git_worktree else "",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fail-closed decode reason vocabulary (core-owned, closed set).
 # ---------------------------------------------------------------------------

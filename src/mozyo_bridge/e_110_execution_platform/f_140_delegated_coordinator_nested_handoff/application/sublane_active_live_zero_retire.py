@@ -199,6 +199,9 @@ def run_active_live_zero_retire(
     worktree agreement, the worktree ↔ branch identity, head integration, the positive live-zero
     inventory read, and the active-bound-state CAS.
     """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+        declared_lane_root_identity,
+    )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
         repo_backend_is_herdr,
     )
@@ -211,10 +214,6 @@ def run_active_live_zero_retire(
     )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
         herdr_workspace_segment,
-    )
-    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
-        derive_directory_lane_token,
-        derive_lane_workspace_token,
     )
 
     if not repo_backend_is_herdr(repo_root):
@@ -243,16 +242,14 @@ def run_active_live_zero_retire(
             detail=f"--worktree does not resolve ({type(exc).__name__})",
             lane_id=lane_label,
         )
-    try:
-        collapsed_to_root = resolved_worktree == repo_root.expanduser().resolve()
-    except OSError:
-        collapsed_to_root = False
-    if collapsed_to_root:
-        legacy_token = ""
-        metadata_token = derive_directory_lane_token(str(resolved_worktree), lane_label)
-    else:
-        legacy_token = derive_lane_workspace_token(str(resolved_worktree))
-        metadata_token = legacy_token
+    # Redmine #14715: the ``wt_`` / ``dl_`` family comes from the SAME canonical helper the
+    # create / adopt writers recorded the binding with — probed on the ``--worktree`` root's
+    # own kind. The retired ``resolved_worktree == repo_root`` proxy described the operator's
+    # cwd instead, so a normal run from inside a linked worktree (``--repo`` omitted) derived
+    # ``dl_`` against a ``wt_`` row and this retire could never attest its own lane.
+    identity = declared_lane_root_identity(resolved_worktree, lane_label)
+    legacy_token = identity.legacy_token
+    metadata_token = identity.metadata_token
     if not workspace_id and not legacy_token:
         return _blocked(
             REASON_WORKSPACE_UNRESOLVED,

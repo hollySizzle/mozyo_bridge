@@ -366,6 +366,9 @@ def run_hibernated_live_reconcile(
         replacement_settled,
     )
     from mozyo_bridge.core.state.lane_reconcile_binding import LaneReconcileBindingStore
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+        declared_lane_root_identity,
+    )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
         repo_backend_is_herdr,
     )
@@ -392,10 +395,6 @@ def run_hibernated_live_reconcile(
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
         HerdrSessionStartError,
         herdr_workspace_segment,
-    )
-    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
-        derive_directory_lane_token,
-        derive_lane_workspace_token,
     )
 
     if not repo_backend_is_herdr(repo_root):
@@ -426,14 +425,15 @@ def run_hibernated_live_reconcile(
             detail=f"--worktree does not resolve ({type(exc).__name__})",
             lane_id=lane_label,
         )
-    try:
-        collapsed_to_root = resolved_worktree == repo_root.expanduser().resolve()
-    except OSError:
-        collapsed_to_root = False
-    if collapsed_to_root:
-        metadata_token = derive_directory_lane_token(str(resolved_worktree), lane_label)
-    else:
-        metadata_token = derive_lane_workspace_token(str(resolved_worktree))
+    # Redmine #14715: the binding this rebind re-establishes — and that the guarded close
+    # later attests against — is derived by the canonical helper the create / adopt writers
+    # use, probed on the ``--worktree`` root's own kind. The retired
+    # ``resolved_worktree == repo_root`` proxy keyed the family on the operator's cwd, so a
+    # normal run from inside a linked worktree (``--repo`` omitted) would have rebound a git
+    # worktree's row to a ``dl_`` token no other surface derives.
+    metadata_token = declared_lane_root_identity(
+        resolved_worktree, lane_label
+    ).metadata_token
     if not workspace_id:
         # The reconcile scopes the exact live pair to the SHARED project workspace unit
         # (#13377, the #13756 contradiction shape). A --worktree that carries no project

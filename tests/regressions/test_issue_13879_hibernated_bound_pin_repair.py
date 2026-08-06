@@ -112,6 +112,7 @@ from mozyo_bridge.core.state.lane_replacement import (  # noqa: E402
     LaneReplacementStore,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E402,E501
+    sublane_adopt_declaration as adopt_declaration,
     sublane_herdr_projection as herdr_projection,
     workflow_provider_resolution as provider_resolution,
 )
@@ -822,7 +823,12 @@ class PinRepairCommandTests(unittest.TestCase):
         # so stub that git anchor True -- like the herdr anchors above, it is unit resolution,
         # not a repair guard.  The real derivation is driven against real git worktrees in
         # tests/regressions/test_issue_13933_lane_identity_execution_root.py.
-        self._patch(herdr_projection, "is_git_worktree_root", lambda p: True)
+        #
+        # Patched on `sublane_adopt_declaration`, which is where the canonical derivation
+        # (`declared_lane_root_identity`) binds the probe since Redmine #14715 folded the six
+        # per-surface copies into one helper.  `repair-pins` no longer imports the probe
+        # itself, so stubbing it on the projection module would silently not apply.
+        self._patch(adopt_declaration, "is_git_worktree_root", lambda p: True)
         self._patch(provider_resolution, "resolve_gateway_provider", lambda r: _GW_PROVIDER)
         self._patch(provider_resolution, "resolve_worker_provider", lambda r: _WK_PROVIDER)
 

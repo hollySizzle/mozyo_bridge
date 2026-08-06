@@ -56,6 +56,9 @@ def run_guarded_retire_close(
     guessed pane); what changes is that a failure to resolve is no longer reported as a
     successful retire.
     """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+        declared_lane_root_identity,
+    )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
         list_herdr_agent_rows,
         repo_backend_is_herdr,
@@ -83,10 +86,6 @@ def run_guarded_retire_close(
         HerdrSessionStartError,
         herdr_workspace_segment,
     )
-    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
-        derive_directory_lane_token,
-        derive_lane_workspace_token,
-    )
 
     if not repo_backend_is_herdr(repo_root):
         return None
@@ -113,22 +112,20 @@ def run_guarded_retire_close(
             detail=f"--worktree does not resolve ({type(exc).__name__})",
             lane_id=lane_label,
         )
-    # #13392: a non-git (directory scaffold) lane runs in the workspace root itself — the
-    # ``--worktree`` anchor collapses to the workspace root (== ``repo_root``), exactly as
-    # the create site collapsed it. Such a lane has no ``wt_<hash>`` per-lane workspace
-    # twin, and its metadata record is keyed on the lane-scoped ``dl_`` token (matching the
-    # non-git create site). A Git lane's distinct worktree keeps the path-derived ``wt_``
-    # token both as the legacy twin and as the tombstone key.
-    try:
-        collapsed_to_root = resolved_worktree == repo_root.expanduser().resolve()
-    except OSError:
-        collapsed_to_root = False
-    if collapsed_to_root:
-        legacy_token = ""
-        metadata_token = derive_directory_lane_token(str(resolved_worktree), lane_label)
-    else:
-        legacy_token = derive_lane_workspace_token(str(resolved_worktree))
-        metadata_token = legacy_token
+    # #13392: a non-git (directory scaffold) lane runs in the workspace root itself, has no
+    # ``wt_<hash>`` per-lane workspace twin, and is keyed on the lane-scoped ``dl_`` token;
+    # a git lane's worktree keeps the path-derived ``wt_`` token both as the legacy twin and
+    # as the tombstone key. Redmine #14715: the family is decided by the SAME canonical
+    # helper the create / adopt writers record the binding with, probing the kind of the
+    # ``--worktree`` root itself. The retired ``resolved_worktree == repo_root`` proxy was a
+    # fact about where the operator ran the command, not about the lane: run normally from
+    # inside a linked worktree (``--repo`` omitted, ``--worktree .``) the two collapse, so
+    # this reader derived ``dl_`` for a git worktree whose row the writer had bound to
+    # ``wt_`` and every retire path dead-ended on ``worktree_binding_mismatch``
+    # (live evidence #14580 / #14996).
+    identity = declared_lane_root_identity(resolved_worktree, lane_label)
+    legacy_token = identity.legacy_token
+    metadata_token = identity.metadata_token
     # The #13748 j#77473 defect: an integration worktree carries no workspace anchor, so
     # the segment resolved EMPTY and the close matched nothing — yet exited 0. An
     # unresolved target identity is now a blocker, not a retire.

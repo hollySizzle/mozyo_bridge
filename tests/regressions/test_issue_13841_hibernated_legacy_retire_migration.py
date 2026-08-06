@@ -108,7 +108,6 @@ from mozyo_bridge.core.state.lane_lifecycle_schema import (  # noqa: E402
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E402,E501
     REASON_NO_WORKTREE_ANCHOR,
-    REASON_WORKSPACE_UNRESOLVED,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E402,E501
     encode_assigned_name,
@@ -682,13 +681,26 @@ class RetireMigrationCommandTests(unittest.TestCase):
         self.assertEqual(self._mig(payload)["reason"], REASON_NO_WORKTREE_ANCHOR)
         self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
 
-    def test_workspace_unresolved_root_blocks(self) -> None:
-        # The integration worktree carries no workspace anchor: identity is unresolvable.
-        self._seed_row()
-        code, payload = self._migrate(repo=self.integration, worktree=self.integration)
-        self.assertEqual(code, 1)
-        self.assertEqual(self._mig(payload)["reason"], REASON_WORKSPACE_UNRESOLVED)
-        self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
+    def test_mis_aimed_integration_root_blocks_from_either_anchor(self) -> None:
+        # The integration worktree carries no workspace anchor and is not the lane's checkout.
+        #
+        # The typed reason is `worktree_branch_mismatch`, not the `workspace_unresolved` this
+        # asserted before Redmine #14715 — and the change is a convergence, not a loss. The
+        # sanctioned invocation (`--repo` = coordinator repo) ALWAYS reported the branch axis,
+        # because the early "no workspace and no lane token" pre-check never fires for a real
+        # git checkout; only the retired caller-anchor collapse suppressed that root's `wt_`
+        # token and reached the other branch. So the diagnosis used to depend on where the
+        # operator stood. Both anchors are asserted here so the invariance is the pin, and the
+        # migration's own guarantee — zero-write, row still hibernated — is unchanged.
+        for repo in (self.integration, self.primary):
+            with self.subTest(repo=repo.name):
+                self._seed_row()
+                code, payload = self._migrate(repo=repo, worktree=self.integration)
+                self.assertEqual(code, 1)
+                self.assertEqual(
+                    self._mig(payload)["reason"], MIGRATE_WORKTREE_BRANCH_MISMATCH
+                )
+                self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
 
     def test_inventory_unreadable_blocks(self) -> None:
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501

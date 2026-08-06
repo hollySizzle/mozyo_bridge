@@ -24,10 +24,13 @@ Scope pins carried deliberately:
 
 - the ``dl_`` contract for non-git directory-scaffold lanes is preserved (#13392);
 - a non-empty **divergent** binding is still never overwritten (#14478 requirement 4 — no
-  general relaxation of ``declare_lane`` / ``backfill_active_binding``);
-- the destructive retire family keeps its #13754 collapse; that is a separate per-surface
-  decision (``managed-state-model.md`` #13933 R7 / design answer j#81046 Decision 4) and is
-  guarded by ``test_issue_13933_lane_identity_execution_root.PerSurfaceContractTests``.
+  general relaxation of ``declare_lane`` / ``backfill_active_binding``).
+
+Superseded scope note: this file originally also pinned that the destructive retire family
+KEEPS its #13754 collapse (the #13933 R7 / j#81046 Decision 4 per-surface carve-out). Redmine
+#14715 retired that carve-out after measuring it as a permanent false block, and moved the
+successor contract to ``test_issue_14715_retire_worktree_identity_family.py``. Nothing about
+the writer-side rule below changed.
 """
 
 from __future__ import annotations
@@ -563,20 +566,12 @@ class DeclarationWriterSurfaceContractTests(unittest.TestCase):
             "is_git_worktree_root", self._source("sublane_adopt_declaration.py")
         )
 
-    def test_the_destructive_retire_family_is_untouched_by_this_issue(self) -> None:
-        # ``managed-state-model.md`` (#13933 R7 / design answer j#81046 Decision 4): the retire
-        # rails keep the #13754 collapse as a DELIBERATE fail-closed guard, and switching them
-        # is a separate per-surface decision. #14478 changes producers only; if a later edit
-        # quietly repoints a retire rail here, this fails alongside the #13933 contract test.
-        for module in (
-            "sublane_retire_actuation.py",
-            "sublane_hibernated_bound_retire.py",
-            "sublane_hibernated_legacy_retire.py",
-            "sublane_hibernated_live_reconcile.py",
-        ):
-            source = self._source(module)
-            self.assertIn("resolved_worktree == repo_root", source, module)
-            self.assertNotIn("is_git_worktree_root", source, module)
+    # The former ``test_the_destructive_retire_family_is_untouched_by_this_issue`` pinned the
+    # #13933 j#81046 Decision 4 carve-out (retire rails keep the #13754 collapse). Redmine
+    # #14715 measured that carve-out producing a permanent false block and retired it: the
+    # retire family now derives through the same helper these writers use. The successor
+    # contract lives in ``test_issue_14715_retire_worktree_identity_family.py``; asserting it
+    # here would mix a second issue's symptom into this file (tests-placement R3-a / R3-c).
 
 
 if __name__ == "__main__":  # pragma: no cover

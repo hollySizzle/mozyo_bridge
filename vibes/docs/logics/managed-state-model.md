@@ -1236,17 +1236,43 @@ Table naming:
           recover-gateway / recover-stale、`lane_checkout_authority.worktree_binding_reason` = recover-pair) との join、
           non-git `dl_` 契約、divergent binding 非上書きを駆動する。recovery reader 側は**変更しない** — 既に anchor 非依存に `wt_` を
           derive しており、緩めれば #14475 の fence を弱める。
-        - **destructive retire 系** (`sublane retire` guarded close / hibernated-bound / hibernated-legacy / live-reconcile) は
-          この derive を採らない。#13754 は「lane worktree を `--repo` と `--worktree` の両方に渡すと token が collapse し、
-          worktree-binding attestation が **意図的に fail-closed** する」ことを安全弁として持つ (false block は安全、false close が
-          防ぐべき欠陥)。identity derive と authority が entangle しているため、git-kind derive への切替は destructive 挙動を
-          変える per-surface 設計判断であり、別 review を要する。**共有 probe は generic authority guard へ統合しない** (design
-          answer j#81046 Decision 4): 各 surface が identity family と fail-closed 条件を自分で決める。#14478 でも本 carve-out は
-          維持した。
+        - ★**destructive retire 系も同じ derive を採る。per-surface carve-out は撤回した** (#14715、live evidence #14580 /
+          #14996、原因訂正 j#100363)。#13933 j#81046 Decision 4 は「retire は `resolved == repo_root` collapse を安全弁として
+          残す (false block は安全、false close が防ぐべき欠陥)」としていたが、この前提が**誤り**だった。collapse が生むのは
+          *たまたまの* false block ではなく **恒久的な** false block である: linked worktree 内から通常実行すると
+          (`--repo` 省略で cwd = lane worktree、`--worktree .`) repo/worktree が一致するため、create/adopt writer が `wt_` で
+          bind した git worktree を reader が `dl_` と判定し、**全 retire path が `worktree_binding_mismatch` で恒久停止**する。
+          main checkout を `--repo` へ明示すると成功したのは誤分岐を偶然回避したためであり、通常操作で main checkout 絶対 path を
+          要求する設計根拠ではない。したがって 5 surface (`sublane retire` guarded close / active live-zero / hibernated-bound /
+          hibernated-legacy / live-reconcile) は read/repair・declaration writer と同一の canonical helper
+          `declared_lane_root_identity(resolved_root, lane_label)` を通す。同 helper は root の kind を 1 度 probe し、
+          `metadata_token` (`wt_`/`dl_`) と `legacy_token` (git root のみ非空。非 git lane は shared workspace root 上で
+          per-lane workspace twin を持たないため空) を **1 つの family 判断から**返す。writer と reader は構造的に食い違えない。
+          - **authority は緩めていない。** 変わったのは identity family の *derive* だけで、fail-closed 条件は非退行:
+            別 lane / sibling worktree / dirty / unintegrated head / inventory unreadable / generation・revision drift /
+            記録 binding 不一致は従来どおり zero-write で拒否し、remote branch / commit は削除しない。非 git `dl_` lane 互換と
+            explicit `--repo` precedence も維持する。
+          - **意図した挙動変化 2 件** (silent にせず記載する):
+            (1) #14478 以前に `dl_` で mis-bind された **git root 上の** row は、以前は「repo と worktree の双方を lane worktree に
+            向けた場合のみ」偶然 attest できたが、今後は **どの anchor からも `worktree_binding_mismatch`** になる。これは
+            下記 j#88645 F1 の裁定 (「収束経路と読んではならない」) を code 側で閉じたものであり、当該 row の扱いは従来どおり
+            fresh lane での再実行である。
+            (2) workspace anchor を持たない git checkout (#13748 の mis-aimed integration worktree) を `--repo`/`--worktree` 双方に
+            渡した場合の typed reason が `workspace_unresolved` から `lane_owner_unverified` へ収束する。従来 sanctioned
+            invocation (`--repo` = coordinator repo) では既に `lane_owner_unverified` であり、`workspace_unresolved` は
+            collapse 経路でのみ到達していた。block であることは不変で、reason が **実行位置に依存しなくなった**。
+          - regression: `test_issue_14715_retire_worktree_identity_family.py` が real main checkout + real linked worktree +
+            real 非 git scaffold root に対し、in-worktree invocation の成功、両 anchor での 5 intent の verdict 一致、
+            sibling / dirty / unintegrated / 別 root bind / pre-fix `dl_` bind の各 negative、非 git `dl_` retire 互換、
+            および「canonical helper 以外に family 判断が存在しない」構造契約を駆動する。#13933 / #14478 / #13754 側の
+            旧 carve-out assertion は同 issue で撤去し、後継契約はこの file に集約した。
         - ★**#14478 以前に `dl_` で mis-bind された既存 live row に、in-place で rebind する public rail は無い** (review j#88645 F1)。
-          measured なのは **identity axis 1 本だけ**である: `--repo` と `--worktree` の双方を lane worktree に向けると
-          destructive retire は row と同じ `dl_` を derive するため `attest_retire_target` が `attested=True` を返し、
-          primary-checkout anchor では `worktree_binding_mismatch` になる。**これを収束経路と読んではならない。**
+          > **#14715 で状況は変わった (下の観測は当時の code fact であり現行挙動ではない)。** 当時 measured だったのは
+          > **identity axis 1 本だけ**である: `--repo` と `--worktree` の双方を lane worktree に向けると destructive retire は
+          > row と同じ `dl_` を derive するため `attest_retire_target` が `attested=True` を返し、primary-checkout anchor では
+          > `worktree_binding_mismatch` になった。#14715 が derive を root の kind へ移したため、この偶然の一致は **消滅**し、
+          > 当該 row は **どの anchor からも `worktree_binding_mismatch`** になる。
+          **これを収束経路と読んではならない**という裁定自体は維持する (今は code 側でも閉じている)。
           `sublane retire` は `decide_retire_integration` の **hard invariant `issue_closed` を含む** 全 invariant
           (`target_identity_known` / `issue_closed` / `callbacks_drained` / `durable_record_recorded` / `verification_passed` /
           `latest_generation_admissible`) を無条件に要求し、これらは policy field で無効化できない (config schema に key が無い)。
