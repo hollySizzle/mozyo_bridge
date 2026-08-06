@@ -443,36 +443,80 @@ def resolve_os_fence(
         )
 
     if system == "Linux" and shutil.which("bwrap"):
-        # bubblewrap: keep the filesystem as-is, then re-bind each denied root
-        # read-only on top of itself. `--dev-bind /` preserves everything the suite
-        # needs (including /dev and the repo) while the later --ro-bind wins for
-        # the denied subtree.
+        # Start from a recursively read-only view of the host, then open exactly the
+        # task root for writes. This ordering matters: the rejected R3 argv first
+        # mounted `/` read-write and then asked bwrap to create a bind destination at
+        # an absent denied root. bwrap creates an ordinary --ro-bind destination
+        # before mounting over it, so that operation created the supposedly protected
+        # path on the host (review j#100507 finding 2).
         #
-        # A denied root need not EXIST on the host (j#100489 F6): a clean CI runner
-        # has no `~/.mozyo_bridge` until something creates it. `--ro-bind` fails when
-        # its *source* is missing, so binding the root onto itself would abort bwrap
-        # before a single test ran -- and the obvious repair, mkdir-ing the operator
-        # home, would have the test rail create operator state to protect it. Bind a
-        # task-local empty directory as the source instead: same read-only, empty
-        # destination inside the sandbox, and nothing made on the host (bwrap creates
-        # the destination in the mount namespace only).
-        prefix: list[str] = ["bwrap", "--dev-bind", "/", "/"]
-        empty_source: Path | None = None
-        for root in fenced:
-            source = root
-            if not root.exists():
-                if empty_source is None:
-                    empty_source = Path(work_dir).resolve() / "absent-denied-source"
-                    empty_source.mkdir(parents=True, exist_ok=True)
-                source = empty_source
-            prefix += ["--ro-bind", str(source), str(root)]
+        # With the host view read-only, an absent denied root outside a namespace-
+        # private writable mount needs no destination bind at all. `/tmp` is a
+        # private tmpfs because a small number of tests intentionally hard-code it;
+        # a denied root below that tmpfs is masked there (never on the host). The
+        # task root is the only host-backed writable mount, and the existing canary
+        # is rebound read-only after it.
+        task_root = Path(work_dir).resolve()
+        private_tmp = Path("/tmp").resolve()
+        if not private_tmp.is_dir():
+            raise OsFenceUnavailable(
+                "the Linux private temp mount source is not a directory"
+            )
+        for root in roots:
+            if (
+                root == task_root
+                or root in task_root.parents
+                or task_root in root.parents
+            ):
+                raise OsFenceUnavailable(
+                    "a denied root overlaps the writable test task root; opening the "
+                    "task root would punch a write hole through the boundary"
+                )
+            for private_mount in (Path("/dev"), Path("/proc")):
+                if root == private_mount or private_mount in root.parents:
+                    raise OsFenceUnavailable(
+                        "a denied root lies inside a namespace-private special mount; "
+                        "this boundary does not claim to protect that configuration"
+                    )
+        if canary_path == task_root or task_root not in canary_path.parents:
+            raise OsFenceUnavailable(
+                "the Linux boundary canary must be a strict child of the task root"
+            )
+        if not canary_path.exists():
+            raise OsFenceUnavailable(
+                "the Linux boundary canary must exist before it is rebound read-only"
+            )
+
+        prefix: list[str] = [
+            "bwrap",
+            "--ro-bind", "/", "/",
+            # A read-only recursive root also covers these mount points. Recreate
+            # the conventional device/proc views explicitly so the suite does not
+            # rely on inherited mount flags or a host proc mount.
+            "--dev", "/dev",
+            "--proc", "/proc",
+            "--perms", "01777", "--tmpfs", str(private_tmp),
+            "--bind", str(task_root), str(task_root),
+        ]
+        for root in roots:
+            if root == private_tmp or private_tmp in root.parents:
+                if root.exists():
+                    prefix += ["--ro-bind", str(root), str(root)]
+                else:
+                    # The destination is created inside the private tmpfs, so the
+                    # host path remains absent. A dedicated empty mount makes the
+                    # synthetic path read-only for children that use exist_ok=True.
+                    prefix += ["--tmpfs", str(root), "--remount-ro", str(root)]
+        # The canary is the one intentional denied subtree inside the task write
+        # hole. It exists before bwrap starts, preserving the victim fixtures.
+        prefix += ["--ro-bind", str(canary_path), str(canary_path)]
         return OsFence(
             backend=BACKEND_BWRAP,
             argv_prefix=tuple(prefix),
             denied=roots,
             canary=canary_path,
             control_root=control_path,
-            task_root=Path(work_dir).resolve(),
+            task_root=task_root,
             # Same rule as macOS: only this run's 4-probe check grants verified.
             verified=False,
         )

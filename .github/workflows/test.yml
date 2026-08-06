@@ -95,7 +95,7 @@ jobs:
           && !startsWith(github.ref, 'refs/heads/int_')
           && !startsWith(github.ref, 'refs/heads/integration_'))
       || (github.event_name == 'workflow_dispatch' && inputs.lane == 'quick')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@v6
@@ -151,8 +151,22 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y bubblewrap
-          bwrap --version
+          sudo apt-get install -y --no-install-recommends \
+            apparmor apparmor-profiles bubblewrap
+          profile=/usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          sudo aa-status --enabled
+          test -x /usr/bin/bwrap
+          test -r "$profile"
+          dpkg-query -S "$profile"
+          test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = 1
+          sudo apparmor_parser --replace --skip-cache "$profile"
+          sudo grep -Fqx 'bwrap (enforce)' \
+            /sys/kernel/security/apparmor/profiles
+          test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = 1
+          /usr/bin/bwrap \
+            --ro-bind / / --dev /dev --proc /proc \
+            --perms 01777 --tmpfs /tmp -- /usr/bin/true
+          /usr/bin/bwrap --version
 
       - name: Check the OS write boundary refuses every known bypass
         # The negative tests, run before the suite so a boundary that is present
@@ -162,7 +176,8 @@ jobs:
         run: |
           set -euo pipefail
           python -m unittest -v \
-            tests.integration.e_150_quality_architecture.f_150_ci_verification.test_test_home_isolation_runner.OsBoundaryRefusesEveryKnownBypassTest
+            tests.integration.e_150_quality_architecture.f_150_ci_verification.test_test_home_isolation_runner.OsBoundaryRefusesEveryKnownBypassTest \
+            tests.regressions.test_issue_14757_test_process_home_isolation.AbsentDeniedRootOnLinuxTest.test_live_bwrap_refuses_creation_and_leaves_the_host_root_absent
 
       - name: Run affected tests
         # Resolve the changed source paths to focused targets via the SAME
@@ -215,7 +230,7 @@ jobs:
       && (github.ref == 'refs/heads/main'
           || startsWith(github.ref, 'refs/heads/int_')
           || startsWith(github.ref, 'refs/heads/integration_'))
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@v6
@@ -242,8 +257,22 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y bubblewrap
-          bwrap --version
+          sudo apt-get install -y --no-install-recommends \
+            apparmor apparmor-profiles bubblewrap
+          profile=/usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          sudo aa-status --enabled
+          test -x /usr/bin/bwrap
+          test -r "$profile"
+          dpkg-query -S "$profile"
+          test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = 1
+          sudo apparmor_parser --replace --skip-cache "$profile"
+          sudo grep -Fqx 'bwrap (enforce)' \
+            /sys/kernel/security/apparmor/profiles
+          test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = 1
+          /usr/bin/bwrap \
+            --ro-bind / / --dev /dev --proc /proc \
+            --perms 01777 --tmpfs /tmp -- /usr/bin/true
+          /usr/bin/bwrap --version
 
       - name: Check the OS write boundary refuses every known bypass
         # NOTE: the name deliberately avoids the word "Verify". #13601 collects
@@ -263,7 +292,8 @@ jobs:
         run: |
           set -euo pipefail
           python -m unittest -v \
-            tests.integration.e_150_quality_architecture.f_150_ci_verification.test_test_home_isolation_runner.OsBoundaryRefusesEveryKnownBypassTest
+            tests.integration.e_150_quality_architecture.f_150_ci_verification.test_test_home_isolation_runner.OsBoundaryRefusesEveryKnownBypassTest \
+            tests.regressions.test_issue_14757_test_process_home_isolation.AbsentDeniedRootOnLinuxTest.test_live_bwrap_refuses_creation_and_leaves_the_host_root_absent
 
       - name: Run full suite (single Python, whole discover)
         # Clean single-Python FULL gate: `tests profile` runs the SAME discovery
@@ -348,7 +378,7 @@ jobs:
     if: >-
       github.event_name == 'schedule'
       || (github.event_name == 'workflow_dispatch' && inputs.lane == 'full')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -376,8 +406,22 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y bubblewrap
-          bwrap --version
+          sudo apt-get install -y --no-install-recommends \
+            apparmor apparmor-profiles bubblewrap
+          profile=/usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          sudo aa-status --enabled
+          test -x /usr/bin/bwrap
+          test -r "$profile"
+          dpkg-query -S "$profile"
+          test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = 1
+          sudo apparmor_parser --replace --skip-cache "$profile"
+          sudo grep -Fqx 'bwrap (enforce)' \
+            /sys/kernel/security/apparmor/profiles
+          test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = 1
+          /usr/bin/bwrap \
+            --ro-bind / / --dev /dev --proc /proc \
+            --perms 01777 --tmpfs /tmp -- /usr/bin/true
+          /usr/bin/bwrap --version
 
       - name: Check the OS write boundary refuses every known bypass
         # NOTE: the name deliberately avoids the word "Verify". #13601 collects
@@ -397,7 +441,8 @@ jobs:
         run: |
           set -euo pipefail
           python -m unittest -v \
-            tests.integration.e_150_quality_architecture.f_150_ci_verification.test_test_home_isolation_runner.OsBoundaryRefusesEveryKnownBypassTest
+            tests.integration.e_150_quality_architecture.f_150_ci_verification.test_test_home_isolation_runner.OsBoundaryRefusesEveryKnownBypassTest \
+            tests.regressions.test_issue_14757_test_process_home_isolation.AbsentDeniedRootOnLinuxTest.test_live_bwrap_refuses_creation_and_leaves_the_host_root_absent
 
       - name: Run unit tests (full discover with runtime summary)
         # Isolated from the operator's / runner's shared mozyo-bridge home

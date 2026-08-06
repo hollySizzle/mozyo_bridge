@@ -24,11 +24,14 @@ temp directory standing in for it.
 from __future__ import annotations
 
 import ast
+import errno
 import io
 import json
 import os
 import sqlite3
+import subprocess
 import sys
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -517,27 +520,30 @@ class IdentityDeltaIsDiagnosticButNeverDisclosingTest(unittest.TestCase):
         self.assertFalse(compare_snapshots(before, after).unchanged)
 
 
-def _bind_source_for(prefix: list[str], target: Path) -> str | None:
-    """The SOURCE bwrap binds onto ``target``, read as (flag, source, target) triples.
-
-    Scanning for the target by index is wrong when source == target: the first hit
-    is the source, and the check silently reads the flag instead.
-    """
+def _bind_source_for(prefix: list[str], flag: str, target: Path) -> str | None:
+    """The source mounted by one bwrap ``(flag, source, target)`` operation."""
     for i, token in enumerate(prefix):
-        if token == "--ro-bind" and i + 2 < len(prefix) and prefix[i + 2] == str(target):
+        if token == flag and i + 2 < len(prefix) and prefix[i + 2] == str(target):
             return prefix[i + 1]
     return None
 
 
+def _has_unary_mount(prefix: list[str], flag: str, target: Path) -> bool:
+    """Whether bwrap carries one ``(flag, target)`` operation."""
+    return any(
+        token == flag and i + 1 < len(prefix) and prefix[i + 1] == str(target)
+        for i, token in enumerate(prefix)
+    )
+
+
 class AbsentDeniedRootOnLinuxTest(unittest.TestCase):
-    """bwrap must not be handed a denied root that does not exist (j#100489 F6).
+    """bwrap must protect an absent root without materialising it on the host.
 
     A clean Linux runner has no ``~/.mozyo_bridge`` until something creates it, and
-    ``--ro-bind`` fails when its *source* is missing -- so binding the root onto
-    itself aborts bwrap before a single test runs. The CI pre-check passed because
-    its fixture root exists; the real suite would not. The repair must not be
-    "create the operator home": a test rail that creates operator state in order to
-    protect it has already lost the property it is guarding.
+    bwrap creates the destination of a normal ``--ro-bind`` before mounting it.
+    The rejected R3 argv performed that creation through a read-write host-root
+    bind. The corrected boundary starts with a read-only host view and opens only
+    the task root, so an absent external denied root needs no destination mount.
     """
 
     def _resolve_linux(self, denied, work_dir):
@@ -545,6 +551,9 @@ class AbsentDeniedRootOnLinuxTest(unittest.TestCase):
             test_home_os_fence as mod,
         )
 
+        canary = work_dir / "canary"
+        canary.mkdir(parents=True, exist_ok=True)
+        (work_dir / "control").mkdir(parents=True, exist_ok=True)
         # Also force the fresh branch: under `mozyo-bridge tests run` this process
         # is already inside a boundary, `resolve_os_fence` returns the prefix-less
         # inherited fence, and no bwrap argv is built at all -- so without this the
@@ -553,37 +562,154 @@ class AbsentDeniedRootOnLinuxTest(unittest.TestCase):
             mod.shutil, "which", return_value="/usr/bin/bwrap"
         ), patch.object(mod, "inherited_fence", return_value=None):
             return mod.resolve_os_fence(
-                denied, work_dir=work_dir, canary=work_dir / "canary"
+                denied, work_dir=work_dir, canary=canary
             )
 
-    def test_an_absent_root_binds_a_task_local_empty_source(self) -> None:
-        with TemporaryDirectory() as task:
-            work = Path(task).resolve()
-            absent = work / "no-such-home"
+    def test_an_absent_external_root_uses_the_read_only_host_view(self) -> None:
+        with TemporaryDirectory() as parent:
+            parent_path = Path(parent).resolve()
+            work = parent_path / "task"
+            work.mkdir()
+            absent = parent_path / "no-such-home"
             fence = self._resolve_linux((absent,), work)
+            prefix = list(fence.argv_prefix)
 
-            source = _bind_source_for(list(fence.argv_prefix), absent)
-            self.assertIsNotNone(source, "the denied root is not a bind target")
-            self.assertNotEqual(
-                source, str(absent), "a missing path was used as the bind SOURCE"
+            self.assertEqual(_bind_source_for(prefix, "--ro-bind", Path("/")), "/")
+            self.assertEqual(_bind_source_for(prefix, "--bind", work), str(work))
+            self.assertIsNone(
+                _bind_source_for(prefix, "--ro-bind", absent),
+                "bwrap would create the absent host destination before binding it",
             )
-            # The source is real, empty, and inside the task root.
-            self.assertTrue(Path(source).is_dir())
-            self.assertEqual(list(Path(source).iterdir()), [])
-            self.assertEqual(Path(source).parent, work)
-            # And nothing was created on the host side for the denied root.
+            private_tmp = Path("/tmp").resolve()
+            if private_tmp in absent.parents:
+                self.assertTrue(_has_unary_mount(prefix, "--tmpfs", absent))
+                self.assertTrue(_has_unary_mount(prefix, "--remount-ro", absent))
             self.assertFalse(
                 absent.exists(), "resolving the fence created the operator home"
             )
 
-    def test_an_existing_root_is_still_bound_onto_itself(self) -> None:
-        """The absent-root repair must not change the normal case."""
+    def test_the_existing_task_local_canary_is_rebound_read_only(self) -> None:
+        with TemporaryDirectory() as parent:
+            parent_path = Path(parent).resolve()
+            work = parent_path / "task"
+            work.mkdir()
+            canary = work / "canary"
+            canary.mkdir()
+            (work / "control").mkdir()
+            denied = parent_path / "operator-home"
+            denied.mkdir()
+            prefix = list(self._resolve_linux((denied,), work).argv_prefix)
+            self.assertEqual(
+                _bind_source_for(prefix, "--ro-bind", canary), str(canary)
+            )
+
+    def test_an_absent_denied_root_inside_the_write_hole_is_refused(self) -> None:
+        from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application import (  # noqa: E501
+            test_home_os_fence as mod,
+        )
+
         with TemporaryDirectory() as task:
             work = Path(task).resolve()
-            present = work / "real-home"
+            absent = work / "absent-denied"
+            with self.assertRaisesRegex(mod.OsFenceUnavailable, "overlaps"):
+                self._resolve_linux((absent,), work)
+
+    def test_a_task_root_inside_a_denied_root_is_refused(self) -> None:
+        from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application import (  # noqa: E501
+            test_home_os_fence as mod,
+        )
+
+        with TemporaryDirectory() as parent:
+            denied = Path(parent).resolve()
+            work = denied / "task"
+            work.mkdir()
+            with self.assertRaisesRegex(mod.OsFenceUnavailable, "overlaps"):
+                self._resolve_linux((denied,), work)
+
+    def test_live_bwrap_refuses_creation_and_leaves_the_host_root_absent(self) -> None:
+        """Observe the host while bwrap is live; argv inspection is not evidence."""
+        from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application import (  # noqa: E501
+            test_home_os_fence as mod,
+        )
+
+        if mod.platform.system() != "Linux" or not mod.shutil.which("bwrap"):
+            self.skipTest("live bubblewrap is a Linux CI contract")
+        if mod.load_outer_context() is not None:
+            self.skipTest("the bare CI hard check owns the non-nested live probe")
+
+        with TemporaryDirectory(dir="/tmp") as task, TemporaryDirectory(
+            dir="/var/tmp"
+        ) as guard_parent:
+            work = Path(task).resolve()
+            absent = Path(guard_parent).resolve() / "host-absent-denied"
+            fence = self._resolve_linux((absent,), work)
+            ready = work / "control" / "ready"
+            release = work / "control" / "release"
+            code = (
+                "import errno, os, pathlib, sys, time\n"
+                f"path = pathlib.Path({str(absent)!r})\n"
+                f"ready = pathlib.Path({str(ready)!r})\n"
+                f"release = pathlib.Path({str(release)!r})\n"
+                "try:\n"
+                "    os.mkdir(path)\n"
+                "except OSError as exc:\n"
+                "    print(f'REFUSED {exc.errno}')\n"
+                "    if exc.errno != errno.EROFS:\n"
+                "        sys.exit(2)\n"
+                "else:\n"
+                "    print('CREATED')\n"
+                "    sys.exit(3)\n"
+                "ready.write_text('ready', encoding='utf-8')\n"
+                "for _ in range(200):\n"
+                "    if release.is_file():\n"
+                "        sys.exit(0)\n"
+                "    time.sleep(0.05)\n"
+                "sys.exit(4)\n"
+            )
+            proc = subprocess.Popen(
+                fence.wrap([sys.executable, "-c", code]),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                deadline = time.monotonic() + 10
+                while (
+                    not ready.is_file()
+                    and proc.poll() is None
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.05)
+                self.assertTrue(ready.is_file(), "the live child never reached its hold point")
+                self.assertIsNone(proc.poll(), "the child was not live at host inspection")
+                self.assertFalse(
+                    absent.exists(), "bwrap transiently created the denied host root"
+                )
+                release.write_text("release", encoding="utf-8")
+                stdout, stderr = proc.communicate(timeout=10)
+                self.assertEqual(proc.returncode, 0, stderr or stdout)
+                self.assertEqual(stdout.strip(), f"REFUSED {errno.EROFS}")
+                self.assertFalse(absent.exists(), "bwrap left the denied host root")
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+
+    def test_an_existing_external_root_is_covered_by_the_read_only_host_view(self) -> None:
+        with TemporaryDirectory() as parent:
+            parent_path = Path(parent).resolve()
+            work = parent_path / "task"
+            work.mkdir()
+            present = parent_path / "real-home"
             present.mkdir()
             prefix = list(self._resolve_linux((present,), work).argv_prefix)
-            self.assertEqual(_bind_source_for(prefix, present), str(present))
+            self.assertEqual(_bind_source_for(prefix, "--ro-bind", Path("/")), "/")
+            expected = (
+                str(present) if Path("/tmp").resolve() in present.parents else None
+            )
+            self.assertEqual(
+                _bind_source_for(prefix, "--ro-bind", present), expected
+            )
 
 
 class MandatoryHardCheckCannotSkipTest(unittest.TestCase):

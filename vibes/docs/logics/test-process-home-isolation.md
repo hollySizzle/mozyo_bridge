@@ -104,7 +104,20 @@ acceptance 3「macOS `sandbox-exec` **だけに依存せず** Linux CI 相当境
 | platform | backend | 状態 |
 | --- | --- | --- |
 | macOS | `sandbox-exec -f <profile>`（`allow default` + 全 denied root へ `deny file-write*`） | **実測済み** |
-| Linux | `bwrap --dev-bind / / --ro-bind <root> <root>`（全 denied root） | **CI で実証するまで未実測**（`OsFence.verified=False`） |
+| Linux | `bwrap --ro-bind / / --dev /dev --perms 01777 --tmpfs /tmp --bind <task-root> <task-root>` + canary / private-tmp denied mask | **修正後の exact-head CI で実証するまで未実測**（`OsFence.verified=False`） |
+
+Linux は host root を再帰 read-only にしてから、namespace-private な `/dev` / `/tmp` と
+task root だけを書込み可能にする。R3 の `--dev-bind / /` は host root をread-writeで見せた後、
+不存在 denied root を通常の `--ro-bind` destination にした。bubblewrap 0.9.0 は bind 前に
+destination を作るため、保護対象をhost上へ作り得た（review j#100507 finding 2）。現行は:
+
+- base read-only領域の denied root は存在・不存在を問わずargvのdestinationへ出さない。
+- private `/tmp` 配下のdenied rootだけをprivate tmpfs上でmaskする。不存在なら空tmpfsを
+  `--remount-ro` し、host側pathは作らない。
+- task rootと実denied rootが祖先・子孫として重なる設定は、write holeとdenyの矛盾なので作用前拒否する。
+- task root内の既存canaryだけは最後にread-only bindし、controlはtask root内・canary外で書込み可能に保つ。
+- bare Linux checkはbwrap実行中にchildをholdし、その時点と終了後の両方で不存在host rootが
+  absentのまま、childの作成が`EROFS`で拒否されたことを確認する。argv検査を作用証拠にしない。
 
 - **`unshare` 等の未実証 fallback へ自動退避しない**。backend が無い / self-check が通らない
   場合は `OsFenceUnavailable` で **test を 1 件も実行せず拒否**する。in-process guard への
@@ -182,9 +195,16 @@ CI の **hard prerequisite** である。したがって suite を走らせる *
 | `publish.yml` | `verify` | ✓ | ✓ |
 | `testpypi.yml` | `build` | ✓ | ✓ |
 
-- **install**: `apt-get install -y bubblewrap` + `bwrap --version`。**存在を仮定しない。**
+- **install**: runnerを`ubuntu-24.04`へ固定し、`apparmor` / `apparmor-profiles` / `bubblewrap`を
+  packageからinstallする。Ubuntu同梱の
+  `/usr/share/apparmor/extra-profiles/bwrap-userns-restrict` だけを`apparmor_parser`で明示loadし、
+  `bwrap (enforce)`と最小live smokeを確認する。Ubuntu 24.04の
+  `kernel.apparmor_restrict_unprivileged_userns=1` はload前後で維持し、global制限を無効化しない。
+  初回run `31129109147` はprofile未loadのため4 probeすべてがuid map作成前に拒否された。
+  fail-closedは正しいがLinux合格ではないため、修正headのgreenを必須とする。
 - **check**: `OsBoundaryRefusesEveryKnownBypassTest` を suite の **前**に走らせる。境界が
   install 済みでも enforce していない場合に、suite の green が黙って意味を失うのを防ぐ。
+  同じbare stepで不存在denied rootのlive probeも実行し、host pathを実行中・終了後に照合する。
   この step は境界そのものを検査するので、**意図的に fence の外**で `python -m unittest` を
   直接呼ぶ。suite を非隔離で走らせる fallback ではない（自前の temp fence だけを使い、
   operator home に触れない）。
