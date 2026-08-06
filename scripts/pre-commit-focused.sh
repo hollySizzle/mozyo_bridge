@@ -37,21 +37,25 @@ fail() { say "FAIL: $*" >&2; exit 1; }
 
 PYTHON="${MOZYO_PYTHON:-python3}"
 
-# Resolve the mozyo-bridge CLI: installed entry point first, else the package
-# source next to this script (the script lives in <repo>/scripts/).
+# Resolve the mozyo-bridge CLI. This repo's own source wins over an installed
+# entry point (Redmine #14757 j#100490 item 3). Preferring whatever is on PATH
+# meant an OLDER build could satisfy the `tests run --help` probe while
+# implementing an earlier, weaker isolation contract -- the hook would then
+# report an isolated run under a contract this commit is changing. The source
+# beside this script is by construction the contract being committed. An operator
+# who deliberately sets MOZYO_BRIDGE_CMD still wins, and BOTH resolve and run use
+# the same CLI so the two halves cannot come from different builds.
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 if [ -n "${MOZYO_BRIDGE_CMD:-}" ]; then
     MOZYO="$MOZYO_BRIDGE_CMD"
+elif [ -d "$SCRIPT_DIR/../src/mozyo_bridge" ]; then
+    PYTHONPATH="$SCRIPT_DIR/../src${PYTHONPATH:+:$PYTHONPATH}"
+    export PYTHONPATH
+    MOZYO="$PYTHON -m mozyo_bridge"
 elif command -v mozyo-bridge >/dev/null 2>&1; then
     MOZYO="mozyo-bridge"
 else
-    SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-    if [ -d "$SCRIPT_DIR/../src/mozyo_bridge" ]; then
-        PYTHONPATH="$SCRIPT_DIR/../src${PYTHONPATH:+:$PYTHONPATH}"
-        export PYTHONPATH
-        MOZYO="$PYTHON -m mozyo_bridge"
-    else
-        fail "mozyo-bridge CLI not found (install it or set MOZYO_BRIDGE_CMD)"
-    fi
+    fail "mozyo-bridge CLI not found (install it or set MOZYO_BRIDGE_CMD)"
 fi
 
 # --- 1. whitespace / conflict-marker check over the staged diff. -------------

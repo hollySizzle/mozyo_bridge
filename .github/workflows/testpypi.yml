@@ -310,6 +310,37 @@ jobs:
       - name: Docs catalog validate (pre-publish)
         run: mozyo-bridge docs validate --repo .
 
+      - name: Install the OS write boundary (bubblewrap)
+        # `tests profile` runs inside the OS-level write boundary the isolation rail
+        # requires (Redmine #14757); on Linux that is bubblewrap, and the rail
+        # refuses to run without it rather than degrading to a weaker guard. So it
+        # is a hard prerequisite of any job that runs the suite.
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          bwrap --version
+
+      - name: Check the OS write boundary refuses every known bypass
+        # NOTE: the name deliberately avoids the word "Verify". #13601 collects
+        # every testpypi.yml step whose name contains "Verify" as a release gate
+        # and requires it to be workflow_dispatch-guarded; this boundary check is
+        # not a release gate and must run on every event. Renaming it back would
+        # break test_issue_13601_testpypi_exact_sha.
+        # Run in EVERY job that runs the suite (Redmine #14757 j#100430), not just
+        # the quick lane: a boundary that is installed but not enforcing would let
+        # the suite's green silently mean less than it claims. These are the exact
+        # bypasses that defeated the R2 in-process hook -- dir_fd, -S, and
+        # sys._base_executable. Each probe must exit ZERO carrying the exact
+        # refusal token for this backend's errno, and the victims must read back
+        # unchanged. A non-zero exit is NOT the contract: a boundary that failed to
+        # apply also exits non-zero (macOS nested sandbox-exec exits 71), which is
+        # how R1/R2 passed while proving nothing.
+        run: |
+          set -euo pipefail
+          python -m unittest -v \
+            tests.integration.e_150_quality_architecture.f_150_ci_verification.test_test_home_isolation_runner.OsBoundaryRefusesEveryKnownBypassTest
+
       - name: Run full suite (clean single-Python, pre-publish)
         # SAME discovery as `python -m unittest discover -s tests`; the suite
         # verdict drives the exit code. Single Python by design (the 4-version
@@ -318,7 +349,10 @@ jobs:
         # (Redmine #14757): `tests profile` re-execs itself into a process whose
         # home contract, temp dirs, and XDG roots are pinned to a task-specific
         # root, and fails the lane if the shared home changed -- even when every
-        # test passed. Identical on macOS and Linux; no OS sandbox involved.
+        # test passed. `tests profile` re-execs itself under the SAME OS write
+        # boundary as `tests run` (Seatbelt on macOS, bwrap on Linux) and refuses
+        # to run a single test without one -- the earlier "no OS sandbox involved"
+        # wording described the pre-boundary R1 rail and now contradicts it.
         run: mozyo-bridge tests profile --slowest 20
 
       - name: Install build tools

@@ -1514,7 +1514,7 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/test-process-home-isolation.md
-    purpose: "test process を operator 共有 mozyo-bridge home から隔離する verification rail (Redmine #14757) の設計正本。task-specific temp root への env pin (`MOZYO_BRIDGE_HOME` / `TMPDIR` / `XDG_*`) と live-session pin 除去、`os.environ` の clear に耐える process-local home fence (`mozyo_bridge_home()` が未 pin 解決を fence root へ落とし denied root を拒否する) と `HOME` を repurpose しない根拠、operator 共有 home の before/after 論理 snapshot による fail-closed guard (guarded tier = entries / schema / identity / backups / existence、`mode=ro` + backup API による consistent 読取、`immutable=1` 禁止、sidecar と row 内容の carve-out、修復しない契約)、3 入口 (`tests run` / `tests profile` / `tests parallel`) の re-exec 契約、対象 inventory の測り方を定義する。"
+    purpose: "test process を operator 共有 mozyo-bridge home から隔離する verification rail (Redmine #14757) の設計正本。task-specific temp root への env pin (`MOZYO_BRIDGE_HOME` / `TMPDIR` / `XDG_*`) と live-session pin 除去、`os.environ` の clear に耐える process-local home fence (`mozyo_bridge_home()` が未 pin 解決を fence root へ落とし denied root を拒否する) と `HOME` を repurpose しない根拠、operator 共有 home の before/after 論理 snapshot による fail-closed guard (guarded tier = entries / schema / identity / backups / existence、`mode=ro` + backup API による consistent 読取、`immutable=1` 禁止、sidecar と row 内容の carve-out、修復しない契約)、3 入口 (`tests run` / `tests profile` / `tests parallel`) の re-exec 契約、対象 inventory の測り方を定義する。さらに **OS-level write boundary** (macOS `sandbox-exec` / Linux `bwrap`、毎 run の 4 probe verification、nested boundary 禁止と inherited context 契約、backend 固有 refusal errno)、**CI の 3 workflow hard check** (`test.yml` quick / integration / full-matrix、`publish.yml` verify、`testpypi.yml` build) と非隔離 fallback 不在、**pre-commit helper** (`scripts/pre-commit-focused.sh`: repo source 優先・fail-closed)、既定出力の path 非開示 (role / ordinal / digest、`--reveal-paths` は local debug 専用) を、ひとつの governed feature として束ねる。"
     audit_role: test_process_home_isolation_logic
     related_document_refs:
       - logic-local-parallel-test-runner-policy
@@ -1522,6 +1522,7 @@ documents:
       - logic-tests-placement-discovery-policy
       - logic-workspace-registry
       - logic-pre-commit-focused-verification
+      - logic-tiered-ci-gate-policy
       - spec-project-map
 
   - id: logic-pre-commit-focused-verification
@@ -1923,13 +1924,17 @@ file_conventions:
       - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/domain/test_home_isolation.py
       - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/application/test_home_fence.py
       - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/application/test_home_audit_hook.py
+      - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/application/test_home_os_fence.py
       - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/application/commands_test_run.py
       - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/application/cli_test_run.py
+      - scripts/pre-commit-focused.sh
     severity: block
     document_refs:
       - logic-test-process-home-isolation
       - logic-local-parallel-test-runner-policy
       - logic-tests-placement-discovery-policy
+      - logic-pre-commit-focused-verification
+      - logic-tiered-ci-gate-policy
       - spec-project-map
 
   - id: fc-static-typing-gate

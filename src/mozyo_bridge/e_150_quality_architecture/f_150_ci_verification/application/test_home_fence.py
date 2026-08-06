@@ -33,11 +33,20 @@ from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.t
     install_audit_fence,
     verify_audit_fence,
 )
+from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.test_home_os_fence import (
+    OsFence,
+    OsFenceUnavailable,
+    create_boundary_fixtures,
+    load_outer_context,
+    resolve_os_fence,
+    verify_os_fence,
+)
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_home_isolation import (
     OPERATOR_DEFAULT_HOME,
     DenyLedger,
     HomeSnapshot,
     IsolationLayout,
+    TableCount,
     apply_isolation,
     digest,
     isolation_env,
@@ -108,8 +117,8 @@ def isolated_env(
     *,
     denied_homes: tuple[Path, ...],
     base_env: dict[str, str] | None = None,
-) -> tuple[IsolationLayout, dict[str, str], Path, Path]:
-    """Create the task root and return ``(layout, child_env, interpreter, ledger)``.
+) -> tuple[IsolationLayout, dict[str, str], Path, Path, OsFence]:
+    """Create the task root; return layout, env, interpreter, ledger, OS fence.
 
     ``HOME`` is inherited untouched (#14757 acceptance 1), so the fenced child
     keeps user site-packages and the operator's git identity without the
@@ -127,6 +136,36 @@ def isolated_env(
     layout = IsolationLayout(root=Path(root).resolve())
     for directory in layout.directories:
         directory.mkdir(parents=True, exist_ok=True)
+    canary = layout.root / "canary"
+    control = layout.root / "control"
+    for fixture in (canary, control):
+        fixture.mkdir(parents=True, exist_ok=True)
+    os_fence = resolve_os_fence(
+        denied_homes, work_dir=layout.root, canary=canary
+    )
+    if not os_fence.inherited:
+        # Fixtures BEFORE the boundary applies: afterwards the canary is denied, and
+        # a probe must fail because it was refused, not because the file is absent.
+        create_boundary_fixtures(os_fence.canary, os_fence.control_root)
+    # ONE authority, for inherited and fresh alike (j#100483 item 2). This used to
+    # re-read `load_outer_context()` here and rebuild the install arguments from a
+    # separate group of scalars, which made "the fence we verify" and "the context
+    # we publish" independently settable -- so they could disagree, and a nested run
+    # would resolve against a boundary that was not the one enforcing. Deriving
+    # every argument from `os_fence` removes the second reader rather than keeping
+    # the two copies in step.
+    #
+    # For an inherited fence these fields already ARE the outer boundary's
+    # (`inherited_fence` carries them); its canary is denied, so manufacturing
+    # fixtures of our own there would both fail and prove nothing.
+    canary = os_fence.canary
+    control = os_fence.control_root
+    denied_homes = os_fence.denied
+    # Build the env pins from the SAME final authority (j#100489 F2). They used to
+    # be computed up-front from the caller's requested roots, so an inherited run
+    # whose caller asked for a subset left the OS boundary, the audit hook and the
+    # published context on the outer full set while the in-process HomeFence env
+    # carried only the caller's -- three of four agreeing is not one authority.
     pins = isolation_env(
         layout,
         denied_homes=denied_homes,
@@ -135,20 +174,31 @@ def isolated_env(
         fence_deny_key=HOME_FENCE_DENY_ENV,
     )
     interpreter, ledger = install_audit_fence(
-        layout.root, denied_homes=denied_homes
+        layout.root,
+        denied_homes=denied_homes,
+        canary=canary,
+        origin_backend=os_fence.backend,
+        allowed_control_root=control,
+        task_root=os_fence.task_root,
     )
     pins[HOME_FENCE_LEDGER_ENV] = str(ledger)
     env = apply_isolation(dict(os.environ if base_env is None else base_env), pins)
     if denied_homes:
-        verify_audit_fence(interpreter, denied_homes[0])
-        # The self-check deliberately attempts a refused write, and the hook
-        # records it like any other. Reset the ledger so the run starts from a
-        # clean slate -- otherwise every run reports one attempt and fails, which
-        # is how this was caught. Truncating (rather than filtering the probe's
-        # target out at read time) keeps the reader from having a rule that could
-        # also mask a real attempt at the same path.
+        verify_audit_fence(interpreter, layout.root, ledger)
+        # The self-check deliberately attempts a refused write against the
+        # task-local audit canary, and the hook records it like any other. Reset
+        # the ledger so the run starts from a clean slate -- otherwise every run
+        # reports one attempt and fails, which is how this was caught. Truncating
+        # (rather than filtering the probe's target out at read time) keeps the
+        # reader from having a rule that could also mask a real attempt.
         ledger.write_text("", encoding="utf-8")
-    return layout, env, interpreter, ledger
+    # The OS boundary is the one acceptance 3/4 rests on (review j#100417); the
+    # in-process hook below it is defence in depth. Verified every run, because a
+    # boundary that quietly stopped holding is the R2 failure mode.
+    # `verified` is granted ONLY by this run's own 4-probe check (j#100449 item 6),
+    # so the returned fence replaces the resolved one.
+    os_fence = verify_os_fence(os_fence, interpreter)
+    return layout, env, interpreter, ledger, os_fence
 
 
 def read_deny_ledger(ledger: Path) -> DenyLedger:
@@ -223,7 +273,9 @@ def _schema_parts(conn: sqlite3.Connection, label: str) -> tuple[str, ...]:
     return tuple(parts)
 
 
-def _identity_parts(conn: sqlite3.Connection, store: Path) -> tuple[str, ...]:
+def _identity_parts(
+    conn: sqlite3.Connection, store: Path
+) -> tuple[tuple[str, ...], tuple[TableCount, ...]]:
     """Per-table row counts, plus the registry's workspace identity set.
 
     Row *counts* rather than row contents: the operator's own cockpit updates
@@ -240,19 +292,23 @@ def _identity_parts(conn: sqlite3.Connection, store: Path) -> tuple[str, ...]:
         ).fetchall()
     ]
     parts: list[str] = []
+    counts: list[TableCount] = []
     for table in tables:
         # Table names come from this store's own sqlite_master, not from user
         # input, and cannot be bound as parameters in a FROM clause.
         count = conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
-        parts.append(f"{label}\trows\t{table}\t{count}")
+        # `repr` the identifiers: a tab or newline inside a table name would
+        # otherwise let two distinct tables produce the same digest input.
+        parts.append(f"{label!r}\trows\t{table!r}\t{count}")
+        counts.append(TableCount(store=label, table=table, rows=count))
     registry_store, registry_table, registry_column = _REGISTRY_IDENTITY
     if label == registry_store and registry_table in tables:
         ids = conn.execute(
             f'SELECT "{registry_column}" FROM "{registry_table}" '
             f'ORDER BY "{registry_column}"'
         ).fetchall()
-        parts += [f"{label}\tid\t{value[0]}" for value in ids]
-    return tuple(parts)
+        parts += [f"{label!r}\tid\t{value[0]!r}" for value in ids]
+    return tuple(parts), tuple(counts)
 
 
 def _relative_names(root: Path) -> tuple[str, ...]:
@@ -286,6 +342,7 @@ def snapshot_home(home: Path) -> HomeSnapshot:
 
     schema_parts: list[str] = []
     identity_parts: list[str] = []
+    identity_counts: list[TableCount] = []
     unreadable: list[str] = []
     for store in stores:
         try:
@@ -297,7 +354,9 @@ def snapshot_home(home: Path) -> HomeSnapshot:
             continue
         try:
             schema_parts.extend(_schema_parts(copy, store.name))
-            identity_parts.extend(_identity_parts(copy, store))
+            parts, counts = _identity_parts(copy, store)
+            identity_parts.extend(parts)
+            identity_counts.extend(counts)
         except sqlite3.Error as exc:
             unreadable.append(f"{store.name} ({type(exc).__name__})")
         finally:
@@ -310,6 +369,8 @@ def snapshot_home(home: Path) -> HomeSnapshot:
         entry_digest=digest(tuple(entries)),
         schema_digest=digest(tuple(schema_parts)),
         identity_digest=digest(tuple(identity_parts)),
+        # Counts only (no ids): the value-free detail behind the digest.
+        identity_counts=tuple(identity_counts),
         backup_count=len(backups),
         backup_digest=digest(backups),
         store_count=len(stores),
@@ -347,6 +408,7 @@ def reexec_isolated(
     repo_root: Path,
     env: dict[str, str],
     interpreter: Path | None = None,
+    os_fence: OsFence | None = None,
     capture_stdout: dict | None = None,
 ) -> int:
     """Re-run this CLI invocation in a fenced child, returning its exit code.
@@ -364,6 +426,8 @@ def reexec_isolated(
     # site-packages, so launching with `sys.executable` would drop the hook.
     python = str(interpreter) if interpreter is not None else sys.executable
     command = [python, "-c", _BOOTSTRAP.format(runtime=runtime_root()), *argv]
+    if os_fence is not None:
+        command = os_fence.wrap(command)
     if capture_stdout is None:
         return subprocess.run(command, cwd=str(repo_root), env=env).returncode
     proc = subprocess.run(

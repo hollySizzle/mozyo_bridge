@@ -262,7 +262,14 @@ class IsolatedRunOutcomeTest(unittest.TestCase):
         self.assertFalse(payload["success"])
         self.assertTrue(payload["suite_success"])
         self.assertFalse(payload["home_guards"][0]["unchanged"])
-        self.assertEqual(payload["fence_root"], "/task/home")
+        # Default output is journal-safe: a role/ordinal/digest label, not the
+        # absolute task root (j#100490 item 4).
+        self.assertNotIn("/task/home", payload["fence_root"])
+        self.assertTrue(payload["fence_root"].startswith("fence-root["))
+        # The absolute paths remain available behind the explicit local-debug opt-in.
+        self.assertEqual(
+            outcome.as_dict(reveal_paths=True)["fence_root"], "/task/home"
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

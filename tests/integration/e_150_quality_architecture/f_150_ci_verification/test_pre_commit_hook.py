@@ -13,6 +13,7 @@ auto-install) is documentation — see
 from __future__ import annotations
 
 import os
+import site
 import subprocess
 import sys
 import tempfile
@@ -43,8 +44,26 @@ class PreCommitHookTest(unittest.TestCase):
             proc = _run(argv, self.repo)
             if proc.returncode != 0:
                 self.skipTest(f"git unavailable: {proc.stderr.strip()}")
+        # A task-local HOME for the hook's children (#14757 j#100496). The hook
+        # runs `tests run`, whose `ambient_homes()` always guards the operator
+        # default `~/.mozyo_bridge`. Inheriting the real HOME made these tests fail
+        # whenever the operator's cockpit wrote during the run -- a verdict that
+        # depended on unrelated activity. Production still guards every ambient
+        # home; only the home a TEST's child resolves is a fixture.
+        self.fake_home = self.repo / "fake-operator-account"
+        (self.fake_home / ".mozyo_bridge").mkdir(parents=True)
+        self.fixture_home = self.repo / "fixture-operator-home"
+        self.fixture_home.mkdir()
         self.env = dict(
             os.environ,
+            HOME=str(self.fake_home),
+            # See the note in the runner tests: a stand-in HOME loses user
+            # site-packages unless PYTHONUSERBASE names the real one.
+            PYTHONUSERBASE=site.getuserbase(),
+            # Item 5: name the fixture home explicitly. Relying only on the
+            # synthetic HOME would leave the explicit spelling unpinned, and the
+            # deny/guard set covers both spellings.
+            MOZYO_BRIDGE_HOME=str(self.fixture_home),
             MOZYO_BRIDGE_CMD=f"{sys.executable} -m mozyo_bridge",
             MOZYO_PYTHON=sys.executable,
             PYTHONPATH=str(ROOT / "src"),
@@ -202,6 +221,66 @@ class PreCommitHookTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0, combined)
         self.assertIn("cannot be isolated", combined)
         self.assertNotIn("NON-ISOLATED", combined)
+
+    def test_the_repo_source_cli_wins_over_an_installed_one_on_path(self) -> None:
+        """This repo's source beats whatever is installed (#14757 j#100490 item 3).
+
+        The hook used to prefer any `mozyo-bridge` on PATH that merely answered
+        `tests run --help`. An older build satisfies that probe while implementing
+        an earlier isolation contract, so the hook would report an isolated run
+        under rules this very commit is changing. The source beside the script is by
+        construction the contract being committed.
+        """
+        older = self.repo / "bin"
+        older.mkdir()
+        marker = self.repo / "older-was-used"
+        installed = older / "mozyo-bridge"
+        installed.write_text(
+            "#!/bin/sh\n"
+            f"touch {marker}\n"
+            "case \"$1 $2\" in\n"
+            "  'tests resolve') printf 'tests/test_ok.py\\n'; exit 0 ;;\n"
+            "esac\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        installed.chmod(0o755)
+        self._stage(
+            "tests/test_ok.py",
+            "import unittest\n\n\n"
+            "class OkTest(unittest.TestCase):\n"
+            "    def test_ok(self):\n"
+            "        self.assertTrue(True)\n",
+        )
+        env = dict(self.env, PATH=f"{older}:{os.environ['PATH']}")
+        env.pop("MOZYO_BRIDGE_CMD", None)
+        proc = _run(["sh", str(HOOK)], self.repo, env=env)
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, combined)
+        self.assertFalse(
+            marker.exists(), "the installed CLI on PATH was preferred over repo source"
+        )
+        self.assertIn("-- unchanged", combined)
+
+    def test_an_explicit_operator_override_still_wins(self) -> None:
+        """The precedence change must not take the override away from the operator."""
+        chosen = self.repo / "chosen-mozyo"
+        marker = self.repo / "override-was-used"
+        chosen.write_text(
+            "#!/bin/sh\n"
+            f"touch {marker}\n"
+            "case \"$1 $2\" in\n"
+            "  'tests resolve') printf '\\n'; exit 0 ;;\n"
+            "esac\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        chosen.chmod(0o755)
+        proc = _run(
+            ["sh", str(HOOK)], self.repo, env=dict(self.env, MOZYO_BRIDGE_CMD=str(chosen))
+        )
+        self.assertTrue(marker.exists(), "MOZYO_BRIDGE_CMD was ignored")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
     def test_clean_stage_with_no_targets_passes(self) -> None:
         # Nothing staged -> the resolver fail-closes to full (empty change

@@ -47,7 +47,9 @@ cannot acquire one silently.
 
 from __future__ import annotations
 
+import json as _json
 import subprocess
+from uuid import uuid4
 import sys
 from pathlib import Path
 
@@ -94,7 +96,25 @@ import os as _os
 import sys as _sys
 
 _DENIED = {denied!r}
+_AUDIT_CANARY = {audit_canary!r}
 _LEDGER = {ledger!r}
+
+# --- outer boundary context: versioned typed contract (j#100447 Phase A item 1) --
+# Recovered by `test_home_os_fence.load_outer_context()` in a nested run. Module
+# literals, not env: `env={{}}` is exactly the case that must keep working. Every
+# field is required; a missing or mistyped one is a typed refusal, never a fallback
+# to building a second boundary (j#100445 item 1).
+MOZYO_FENCE_CONTEXT_VERSION = 1
+MOZYO_FENCE_ORIGIN_BACKEND = {origin_backend!r}
+MOZYO_FENCE_OUTER_PROTECTED_ROOTS = {denied!r}
+MOZYO_FENCE_TASK_ROOT = {task_root!r}
+MOZYO_FENCE_CANARY_ROOT = {canary!r}
+MOZYO_FENCE_ALLOWED_CONTROL_ROOT = {allowed_control_root!r}
+
+# Legacy aliases (pre-j#100447). Kept so a half-updated reader cannot silently see
+# nothing; new readers use the versioned names above.
+MOZYO_FENCE_DENIED = _DENIED
+MOZYO_FENCE_CANARY = {canary!r}
 
 _MUTATING = {{
     "os.mkdir": (0,),
@@ -126,7 +146,11 @@ _WRITE_FLAGS = (
 
 def _install():
     roots = []
-    for entry in _DENIED:
+    # The audit canary is task-local scratch this hook also refuses, so the armed
+    # self-check has a target that is NOT the operator's shared home (j#100483
+    # item 4). It is deliberately absent from MOZYO_FENCE_OUTER_PROTECTED_ROOTS:
+    # it is this generation's probe target, not shared state a nested run inherits.
+    for entry in (*_DENIED, _AUDIT_CANARY):
         try:
             resolved = _os.path.realpath(_os.path.expanduser(entry))
         except Exception:
@@ -276,7 +300,13 @@ def venv_python(fence_root: Path) -> Path:
 
 
 def install_audit_fence(
-    fence_root: Path, *, denied_homes: tuple[Path, ...]
+    fence_root: Path,
+    *,
+    denied_homes: tuple[Path, ...],
+    canary: Path,
+    origin_backend: str,
+    allowed_control_root: Path,
+    task_root: Path | None = None,
 ) -> tuple[Path, Path]:
     """Build the task venv and arm the refusal hook inside it.
 
@@ -337,9 +367,19 @@ def install_audit_fence(
 
     target = Path(site_packages)
     target.mkdir(parents=True, exist_ok=True)
+    # Must exist before the self-check runs: against a missing directory an unarmed
+    # hook fails with ENOENT, which reads as "unprovable" rather than the true
+    # "not armed", and the two verdicts must stay distinguishable.
+    audit_canary_for(fence_root).mkdir(parents=True, exist_ok=True)
     (target / f"{FENCE_MODULE_NAME}.py").write_text(
         _FENCE_MODULE_TEMPLATE.format(
-            denied=tuple(str(path) for path in denied_homes), ledger=str(ledger)
+            denied=tuple(str(path) for path in denied_homes),
+            audit_canary=str(audit_canary_for(fence_root)),
+            ledger=str(ledger),
+            canary=str(canary),
+            origin_backend=str(origin_backend),
+            task_root=str(Path(task_root if task_root is not None else fence_root).resolve()),
+            allowed_control_root=str(allowed_control_root),
         ),
         encoding="utf-8",
     )
@@ -351,7 +391,43 @@ def install_audit_fence(
     return python, ledger
 
 
-def verify_audit_fence(python: Path, denied_home: Path) -> None:
+def _ledger_records_attempt(raw: str, nonce: str) -> bool:
+    """Does the ledger hold a well-formed record of exactly this attempt?
+
+    Parsed as JSONL, not substring-matched (j#100489 F5). A substring test passes
+    on a malformed line, on an unrelated record that merely quotes the name, and on
+    a truncated write -- none of which show the hook acted. Requires one record
+    with exactly ``event == "open"``, the exact nonce basename, and an int pid.
+    """
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = _json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        if (
+            record.get("event") == "open"
+            and record.get("target") == nonce
+            and type(record.get("pid")) is int
+        ):
+            return True
+    return False
+
+
+def audit_canary_for(fence_root: Path) -> Path:
+    """The task-local directory the audit hook refuses, for the armed self-check.
+
+    One definition, used by both the installer (which creates it) and the
+    self-check (which writes into it), so the two cannot name different paths.
+    """
+    return Path(fence_root).resolve() / "audit-canary"
+
+
+def verify_audit_fence(python: Path, fence_root: Path, ledger: Path) -> None:
     """Prove the hook is armed in ``python`` before trusting the run.
 
     Runs a probe with a **cleared environment** — the case that killed both
@@ -359,8 +435,20 @@ def verify_audit_fence(python: Path, denied_home: Path) -> None:
     self-check, not a test: it runs on every invocation, so a run can never report
     isolation that was silently absent (the failure mode of discarded mechanism 2,
     which reported success while the file was overwritten).
+
+    The target is the **task-local audit canary**, never the operator's shared home
+    (j#100483 item 4). Aiming a self-check at shared state means every run attempts
+    a write there and relies on the very mechanism under test to stop it — and the
+    earlier version of exactly this probe was removed for that reason (j#100445
+    item 3). Refusal alone is also not enough: an unwritable path refuses too, so
+    the hook must additionally be shown to have **recorded** the attempt in its own
+    ledger. That is provenance — evidence the hook acted, not merely that the write
+    did not land.
     """
-    probe = Path(denied_home) / ".mozyo-fence-selfcheck"
+    # A fresh name per self-check. The ledger deliberately records only the
+    # basename -- it must never carry directory paths -- so a unique name is what
+    # makes "the hook recorded THIS attempt" checkable without logging a path.
+    probe = audit_canary_for(fence_root) / f".mozyo-fence-selfcheck-{uuid4().hex}"
     code = (
         "import sys\n"
         f"target = {str(probe)!r}\n"
@@ -379,12 +467,28 @@ def verify_audit_fence(python: Path, denied_home: Path) -> None:
     except OSError as exc:
         raise AuditHookInstallError(f"could not run the fence self-check ({exc})") from exc
     if completed.returncode == 0:
+        # Refusal is necessary but not sufficient: prove the HOOK refused, by
+        # finding its own record of the attempt. Without this, an unwritable or
+        # missing path would read as a proven fence.
+        try:
+            recorded = Path(ledger).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise AuditHookInstallError(
+                f"the fence self-check was refused but its ledger could not be read "
+                f"({exc}); the refusal has no provenance"
+            ) from exc
+        if not _ledger_records_attempt(recorded, probe.name):
+            raise AuditHookInstallError(
+                "the fence self-check write was refused, but the hook did not record "
+                "a matching attempt in its ledger -- something other than the hook "
+                "blocked it, so the hook is not proven armed"
+            )
         return
     if completed.returncode == 4:
         raise AuditHookInstallError(
             "the write-refusal hook is NOT armed: a cleared-environment child was "
-            "allowed to write inside the operator's shared home. Refusing to report "
-            "this run as isolated."
+            "allowed to write inside the task-local audit canary this hook denies. "
+            "Refusing to report this run as isolated."
         )
     if completed.returncode == 3:
         # A non-PermissionError OSError means the path was unwritable for an
@@ -405,6 +509,7 @@ __all__ = (
     "LEDGER_FILENAME",
     "VENV_DIRNAME",
     "AuditHookInstallError",
+    "audit_canary_for",
     "install_audit_fence",
     "venv_python",
     "verify_audit_fence",

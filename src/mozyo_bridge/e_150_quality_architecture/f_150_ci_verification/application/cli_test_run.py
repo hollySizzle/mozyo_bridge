@@ -19,8 +19,30 @@ from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.c
 )
 
 
+def add_reveal_paths_flag(parser) -> None:
+    """Local-debug opt-in for absolute paths in the verdict (j#100490 item 4).
+
+    Default output identifies homes by role/ordinal/digest, because these verdicts
+    are pasted into Redmine journals and CI logs where an absolute path discloses
+    the operator's account name and local layout. An operator debugging on their
+    own machine can ask for the real paths.
+    """
+    parser.add_argument(
+        "--reveal-paths",
+        dest="reveal_paths",
+        action="store_true",
+        default=False,
+        help=(
+            "Local debug only: print absolute operator-home and task-root paths "
+            "instead of role/ordinal/digest labels. Do not use for output that "
+            "will be pasted into a ticket or CI log."
+        ),
+    )
+
+
 def add_no_isolate_flag(parser) -> None:
     """Add the escape hatch every isolated entry point shares."""
+    add_reveal_paths_flag(parser)
     parser.add_argument(
         "--no-isolate",
         dest="no_isolate",

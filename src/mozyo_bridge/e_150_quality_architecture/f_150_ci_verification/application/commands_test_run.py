@@ -37,6 +37,13 @@ from pathlib import Path
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.test_home_audit_hook import (
     AuditHookInstallError,
 )
+from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.test_home_os_fence import (
+    OsFence,
+    OsFenceUnavailable,
+    inherited_fence,
+    load_outer_context,
+    verify_os_fence,
+)
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.test_home_fence import (
     ambient_homes,
     isolated_env,
@@ -47,6 +54,7 @@ from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.t
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_home_isolation import (
     IsolatedRunOutcome,
     IsolationLayout,
+    path_label,
     compare_snapshots,
 )
 from mozyo_bridge.shared.paths import process_home_fence, resolve_repo_root
@@ -69,7 +77,7 @@ def _repo_root(args: argparse.Namespace) -> Path:
 def guarded_isolated_run(
     *,
     repo_root: Path,
-    child: Callable[[IsolationLayout, dict[str, str], Path], int],
+    child: Callable[[IsolationLayout, dict[str, str], Path, OsFence], int],
     guarded_homes: tuple[Path, ...] | None = None,
 ) -> IsolatedRunOutcome:
     """Run ``child`` behind the write-refusal fence, guarding every denied home.
@@ -90,14 +98,19 @@ def guarded_isolated_run(
     denied = ambient_homes() if guarded_homes is None else tuple(guarded_homes)
     before = {home: snapshot_home(home) for home in denied}
     with tempfile.TemporaryDirectory(prefix=_TEMP_PREFIX) as tmp:
-        layout, env, interpreter, ledger = isolated_env(
+        layout, env, interpreter, ledger, os_fence = isolated_env(
             Path(tmp), denied_homes=denied
         )
-        returncode = child(layout, env, interpreter)
+        returncode = child(layout, env, interpreter, os_fence)
         fence_root = str(layout.home)
+        backend = os_fence.backend
+        backend_verified = os_fence.verified
         attempts = read_deny_ledger(ledger)
     guards = tuple(
-        compare_snapshots(before[home], snapshot_home(home)) for home in denied
+        # Pass the ordinal: with absolute paths withheld from default output,
+        # two guarded homes would otherwise both render as `guarded-home[0]`.
+        compare_snapshots(before[home], snapshot_home(home), ordinal)
+        for ordinal, home in enumerate(denied)
     )
     return IsolatedRunOutcome(
         suite_success=returncode == 0,
@@ -105,12 +118,14 @@ def guarded_isolated_run(
         ledger=attempts,
         returncode=returncode,
         fence_root=fence_root,
+        os_backend=backend,
+        os_backend_verified=backend_verified,
     )
 
 
 def _unittest_child(
     repo_root: Path, unittest_args: tuple[str, ...]
-) -> Callable[[IsolationLayout, dict[str, str], Path], int]:
+) -> Callable[[IsolationLayout, dict[str, str], Path, OsFence], int]:
     """A child that runs the authoritative ``python -m unittest`` command.
 
     Launched with the fence interpreter rather than ``sys.executable`` so the
@@ -118,9 +133,14 @@ def _unittest_child(
     spawns through its own ``sys.executable``.
     """
 
-    def run(layout: IsolationLayout, env: dict[str, str], interpreter: Path) -> int:
+    def run(
+        layout: IsolationLayout,
+        env: dict[str, str],
+        interpreter: Path,
+        os_fence: OsFence,
+    ) -> int:
         proc = subprocess.run(
-            [str(interpreter), "-m", "unittest", *unittest_args],
+            os_fence.wrap([str(interpreter), "-m", "unittest", *unittest_args]),
             cwd=str(repo_root),
             env=env,
         )
@@ -159,7 +179,7 @@ def cmd_tests_run(args: argparse.Namespace) -> int:
         outcome = guarded_isolated_run(
             repo_root=repo_root, child=_unittest_child(repo_root, unittest_args)
         )
-    except AuditHookInstallError as exc:
+    except (AuditHookInstallError, OsFenceUnavailable) as exc:
         # Fail closed and run nothing: a suite executed without the refusal layer
         # would produce a verdict that looks isolated and is not.
         print(f"tests run: refusing to run without the write fence -- {exc}",
@@ -170,19 +190,35 @@ def cmd_tests_run(args: argparse.Namespace) -> int:
 
 
 def render_outcome(
-    outcome: IsolatedRunOutcome, *, label: str, fmt: str = "text"
+    outcome: IsolatedRunOutcome,
+    *,
+    label: str,
+    fmt: str = "text",
+    reveal_paths: bool = False,
 ) -> None:
     """Render one guarded run's verdict (shared with profile / parallel)."""
+    reveal = reveal_paths
     if fmt == "json":
-        payload = outcome.as_dict()
+        payload = outcome.as_dict(reveal_paths=reveal)
         payload["label"] = label
         print(_json.dumps(payload, ensure_ascii=False, indent=2))
         return
     print(f"=== isolated test run ({label}) ===")
-    print(f"fence root: {outcome.fence_root}")
+    print(
+        "fence root: "
+        + (
+            outcome.fence_root
+            if reveal
+            else path_label(outcome.fence_root, "fence-root")
+        )
+    )
+    print(
+        f"OS write boundary: {outcome.os_backend}"
+        + ("" if outcome.os_backend_verified else " (backend NOT measured in-repo)")
+    )
     for guard in outcome.guards:
         print(
-            f"guarded home: {guard.home} -- "
+            f"guarded home: {guard.home if reveal else guard.label} -- "
             + ("unchanged" if guard.unchanged else "CHANGED (fail-closed)")
         )
     ledger = outcome.ledger
@@ -214,6 +250,7 @@ def _render(
         outcome,
         label="python -m unittest " + " ".join(unittest_args),
         fmt=getattr(args, "format", "text"),
+        reveal_paths=bool(getattr(args, "reveal_paths", False)),
     )
 
 
@@ -227,6 +264,47 @@ def isolate_self(args: argparse.Namespace, *, label: str) -> int | None:
     explicitly declined.
     """
     if getattr(args, "already_isolated", False) or process_home_fence() is not None:
+        # Both of those are CLAIMS, not enforcement (j#100483 item 4): a hidden flag
+        # anyone can pass, and an in-process marker that says a home resolver was
+        # rebound. Proceeding in-process on a claim is how an unfenced run would
+        # report itself isolated. Confirm the OS boundary is actually present --
+        # `load_outer_context()` returns None only when there is genuinely none, and
+        # raises for a corrupted one.
+        try:
+            context = load_outer_context()
+        except OsFenceUnavailable as exc:
+            print(f"tests {label}: {exc}", file=sys.stderr)
+            return 2
+        if context is not None:
+            # A context is a DESCRIPTION of a boundary, not the boundary (F1). A
+            # task venv carries its generated context module wherever it goes, so a
+            # run started outside the OS wrapper -- with `--already-isolated` -- can
+            # present a perfectly valid one while nothing is enforcing. Measure it:
+            # build the prefix-less inherited fence the context describes and put it
+            # through the same 4 probes any fresh fence must pass. The probes hit the
+            # authority canary and its victims, never the operator's home.
+            try:
+                verify_os_fence(inherited_fence(context.outer_protected_roots),
+                                Path(sys.executable))
+            except OsFenceUnavailable as exc:
+                print(
+                    f"tests {label}: this process carries an OS boundary context but "
+                    f"the boundary is not enforcing ({exc}). Refusing to run.",
+                    file=sys.stderr,
+                )
+                return 2
+            return None
+        if context is None:
+            # A non-zero exit, not an exception: this is a refusal the CLI reports,
+            # and the other fence failures on this rail already surface as codes.
+            print(
+                f"tests {label}: this process is marked isolated (already_isolated / "
+                f"process home fence) but carries no OS boundary context, so nothing "
+                f"is enforcing. Refusing to run rather than reporting an unfenced run "
+                f"as isolated.",
+                file=sys.stderr,
+            )
+            return 2
         return None
     if getattr(args, "no_isolate", False):
         print(
@@ -254,23 +332,33 @@ def isolate_self(args: argparse.Namespace, *, label: str) -> int | None:
     as_json = getattr(args, "format", "text") == "json"
     captured: dict = {}
 
-    def child(layout: IsolationLayout, env: dict[str, str], interpreter: Path) -> int:
+    def child(
+        layout: IsolationLayout,
+        env: dict[str, str],
+        interpreter: Path,
+        os_fence: OsFence,
+    ) -> int:
         return reexec_isolated(
             argv,
             repo_root=repo_root,
             env=env,
             interpreter=interpreter,
+            os_fence=os_fence,
             capture_stdout=captured if as_json else None,
         )
 
     try:
         outcome = guarded_isolated_run(repo_root=repo_root, child=child)
-    except AuditHookInstallError as exc:
+    except (AuditHookInstallError, OsFenceUnavailable) as exc:
         print(f"tests {label}: refusing to run without the write fence -- {exc}",
               file=sys.stderr)
         return 1
     if as_json:
-        _emit_merged_json(captured.get("stdout", ""), outcome)
+        _emit_merged_json(
+            captured.get("stdout", ""),
+            outcome,
+            reveal_paths=bool(getattr(args, "reveal_paths", False)),
+        )
         return 0 if outcome.success else 1
     # The child already rendered its own summary; add only the guard verdict, so
     # `tests profile`'s runtime table and `tests parallel`'s shard table stay the
@@ -287,7 +375,9 @@ def isolate_self(args: argparse.Namespace, *, label: str) -> int | None:
     return 0 if outcome.success else 1
 
 
-def _emit_merged_json(child_stdout: str, outcome: IsolatedRunOutcome) -> None:
+def _emit_merged_json(
+    child_stdout: str, outcome: IsolatedRunOutcome, *, reveal_paths: bool = False
+) -> None:
     """Re-emit the child's JSON with the guard verdict merged in.
 
     A child document that does not parse is passed through verbatim rather than
@@ -296,9 +386,13 @@ def _emit_merged_json(child_stdout: str, outcome: IsolatedRunOutcome) -> None:
     unnoticed while the exit code still carries it.
     """
     guard = {
-        "home_guards": [g.as_dict() for g in outcome.guards],
+        "home_guards": [g.as_dict(reveal_paths=reveal_paths) for g in outcome.guards],
         "deny_ledger": outcome.ledger.as_dict(),
-        "fence_root": outcome.fence_root,
+        "fence_root": (
+            outcome.fence_root
+            if reveal_paths
+            else path_label(outcome.fence_root, "fence-root")
+        ),
         "isolated_success": outcome.success,
     }
     try:

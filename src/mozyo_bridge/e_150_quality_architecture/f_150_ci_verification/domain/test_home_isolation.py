@@ -222,6 +222,12 @@ class HomeSnapshot:
     entry_digest: str = ""
     schema_digest: str = ""
     identity_digest: str = ""
+    #: Typed rows behind ``identity_digest`` (j#100490 item 2). Counts only, so a
+    #: mismatch can name the table that moved without disclosing any row. Typed
+    #: rather than tab-delimited text: SQLite identifiers may contain tabs and
+    #: newlines, which made distinct tables collide on a re-parse and let control
+    #: bytes reach CI output.
+    identity_counts: tuple["TableCount", ...] = ()
     backup_count: int = 0
     backup_digest: str = ""
     store_count: int = 0
@@ -244,18 +250,39 @@ class HomeSnapshot:
 
 
 @dataclass(frozen=True)
+class TableCount:
+    """One SQLite table's row count, as a typed value rather than a text row."""
+
+    store: str
+    table: str
+    rows: int
+
+    def as_key(self) -> str:
+        """A collision-free key even when identifiers contain separators."""
+        return f"{self.store!r}/{self.table!r}"
+
+
+@dataclass(frozen=True)
 class HomeDelta:
     """One guarded tier that moved between two snapshots."""
 
     tier: str
     before: str
     after: str
+    #: Value-free diagnostic granularity (j#100487): which store/table moved and by
+    #: how many rows. Counts and names only — never row values, workspace ids or
+    #: anything else that could carry operator data into a journal or a CI log.
+    detail: str = ""
 
     def as_dict(self) -> dict:
-        return {"tier": self.tier, "before": self.before, "after": self.after}
+        payload = {"tier": self.tier, "before": self.before, "after": self.after}
+        if self.detail:
+            payload["detail"] = self.detail
+        return payload
 
     def __str__(self) -> str:  # pragma: no cover - rendering convenience
-        return f"{self.tier}: {self.before} -> {self.after}"
+        rendered = f"{self.tier}: {self.before} -> {self.after}"
+        return f"{rendered} ({self.detail})" if self.detail else rendered
 
 
 @dataclass(frozen=True)
@@ -265,6 +292,14 @@ class HomeGuardVerdict:
     home: str
     deltas: tuple[HomeDelta, ...] = ()
     unreadable: tuple[str, ...] = ()
+    #: Position in the guarded set, so two homes stay distinguishable once absolute
+    #: paths are withheld from default output.
+    ordinal: int = 0
+
+    @property
+    def label(self) -> str:
+        """The journal-safe identifier for this home (j#100490 item 4)."""
+        return path_label(self.home, "guarded-home", self.ordinal)
 
     @property
     def unchanged(self) -> bool:
@@ -277,9 +312,13 @@ class HomeGuardVerdict:
         reasons += [f"unreadable component: {name}" for name in self.unreadable]
         return tuple(reasons)
 
-    def as_dict(self) -> dict:
+    def as_dict(self, *, reveal_paths: bool = False) -> dict:
+        # Default output carries a role/ordinal/digest label, never the absolute
+        # operator home: these verdicts land in tickets and CI logs, where the path
+        # discloses the operator's account name and local layout. `reveal_paths` is
+        # the explicit local-debug opt-in.
         return {
-            "home": self.home,
+            "home": self.home if reveal_paths else self.label,
             "unchanged": self.unchanged,
             "deltas": [delta.as_dict() for delta in self.deltas],
             "unreadable": list(self.unreadable),
@@ -294,7 +333,57 @@ _COMPARED_FIELDS = (
 )
 
 
-def compare_snapshots(before: HomeSnapshot, after: HomeSnapshot) -> HomeGuardVerdict:
+def path_label(path: str, role: str, ordinal: int = 0) -> str:
+    """A journal- and CI-safe identifier for a path (j#100490 item 4).
+
+    Default output must not carry absolute operator-home or task-root paths: these
+    verdicts are pasted into tickets and CI logs, where an absolute path discloses
+    the operator's account name and local layout. A role, an ordinal and a short
+    digest identify the same home across a run's before/after pair and across two
+    runs, which is all the reader needs. Absolute paths remain available behind an
+    explicit local-debug option.
+    """
+    return f"{role}[{ordinal}] sha256:{digest((path,))[:12]}"
+
+
+def escape_identifier(name: str) -> str:
+    """Render a SQLite identifier safely for a log, a journal or CI output.
+
+    Control bytes in a table name would otherwise be emitted raw. Escaping is a
+    rendering concern only — the guard still compares the real names.
+    """
+    return name.encode("unicode_escape").decode("ascii")
+
+
+def _identity_detail(before: HomeSnapshot, after: HomeSnapshot) -> str:
+    """Name the store/table row counts that moved, and nothing else (j#100487).
+
+    The identity digest answers "did anything move" but not "what", which left a
+    red run un-attributable — the state j#100482 ended in. This narrows *the
+    report*, never the guard: every table is still compared, and any drift is
+    still non-zero. Only counts and names are emitted.
+    """
+
+    def counts(snapshot: HomeSnapshot) -> dict[tuple[str, str], int]:
+        return {(row.store, row.table): row.rows for row in snapshot.identity_counts}
+
+    was, now = counts(before), counts(after)
+    moved = [
+        f"{escape_identifier(store)}/{escape_identifier(table)} "
+        f"{was.get((store, table), 'absent')}->{now.get((store, table), 'absent')}"
+        for store, table in sorted(set(was) | set(now))
+        if was.get((store, table)) != now.get((store, table))
+    ]
+    if not moved:
+        # The digest moved but no row count did: the registry's workspace identity
+        # set changed (ids added or removed). Say so WITHOUT naming any id.
+        return "registry workspace identity set changed"
+    return "; ".join(moved)
+
+
+def compare_snapshots(
+    before: HomeSnapshot, after: HomeSnapshot, ordinal: int = 0
+) -> HomeGuardVerdict:
     """Fail-closed comparison of two snapshots of the same home.
 
     A home that did not exist before and does now is itself a violation: the
@@ -316,7 +405,12 @@ def compare_snapshots(before: HomeSnapshot, after: HomeSnapshot) -> HomeGuardVer
             continue
         if count_field is None:
             deltas.append(
-                HomeDelta(tier=tier, before=before_digest, after=after_digest)
+                HomeDelta(
+                    tier=tier,
+                    before=before_digest,
+                    after=after_digest,
+                    detail=_identity_detail(before, after),
+                )
             )
             continue
         deltas.append(
@@ -328,7 +422,10 @@ def compare_snapshots(before: HomeSnapshot, after: HomeSnapshot) -> HomeGuardVer
         )
     unreadable = tuple(sorted(set(before.unreadable) | set(after.unreadable)))
     return HomeGuardVerdict(
-        home=after.home, deltas=tuple(deltas), unreadable=unreadable
+        home=after.home,
+        deltas=tuple(deltas),
+        unreadable=unreadable,
+        ordinal=ordinal,
     )
 
 
@@ -399,6 +496,11 @@ class IsolatedRunOutcome:
     returncode: int | None = None
     detail: str | None = None
     fence_root: str = ""
+    #: Which OS-level write boundary enforced the run, and whether that backend has
+    #: actually been measured in this repository. An unmeasured backend still runs,
+    #: but nothing may report it as proven (Redmine #14757 j#100419).
+    os_backend: str = ""
+    os_backend_verified: bool = False
     reasons: tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -424,14 +526,22 @@ class IsolatedRunOutcome:
             ]
         return tuple(reasons)
 
-    def as_dict(self) -> dict:
+    def as_dict(self, *, reveal_paths: bool = False) -> dict:
         return {
             "success": self.success,
             "suite_success": self.suite_success,
             "returncode": self.returncode,
-            "fence_root": self.fence_root,
+            "fence_root": (
+                self.fence_root
+                if reveal_paths
+                else path_label(self.fence_root, "fence-root")
+            ),
+            "os_backend": self.os_backend,
+            "os_backend_verified": self.os_backend_verified,
             "deny_ledger": self.ledger.as_dict(),
-            "home_guards": [guard.as_dict() for guard in self.guards],
+            "home_guards": [
+                guard.as_dict(reveal_paths=reveal_paths) for guard in self.guards
+            ],
             "reasons": list(self.all_reasons),
         }
 

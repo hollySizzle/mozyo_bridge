@@ -24,18 +24,22 @@ temp directory standing in for it.
 from __future__ import annotations
 
 import ast
+import io
+import json
 import os
 import sqlite3
 import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application import (  # noqa: E402
+    commands_test_run,
     test_home_fence,
 )
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.test_home_fence import (  # noqa: E402,E501
@@ -46,6 +50,8 @@ from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.t
 )
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_home_isolation import (  # noqa: E402,E501
     LIVE_LANE_ENV_KEYS,
+    HomeGuardVerdict,
+    IsolatedRunOutcome,
     compare_snapshots,
 )
 from mozyo_bridge.shared import paths as shared_paths  # noqa: E402
@@ -342,10 +348,12 @@ class IsolationEnvContractTest(unittest.TestCase):
         synthetic committer. Isolation here comes from the resolver instead.
         """
         with TemporaryDirectory() as task:
+            denied = Path(task) / "denied-home"
+            denied.mkdir()
             base = {"HOME": "/operator/home", "PATH": "/usr/bin"}
-            layout, env, _interpreter, _ledger = isolated_env(
+            layout, env, _interp, _ledger, os_fence = isolated_env(
                 Path(task),
-                denied_homes=(Path(task) / "denied-home",),
+                denied_homes=(denied,),
                 base_env=base,
             )
             self.assertEqual(env["HOME"], "/operator/home")
@@ -362,18 +370,28 @@ class IsolationEnvContractTest(unittest.TestCase):
             self.assertEqual(
                 env[shared_paths.HOME_FENCE_ROOT_ENV], str(layout.home)
             )
-            self.assertIn(
-                str(Path(task) / "denied-home"),
-                env[shared_paths.HOME_FENCE_DENY_ENV],
+            # The deny pins come from the FINAL fence authority, not the caller's
+            # request (j#100489 F2) -- and under an inherited boundary those are the
+            # outer protected roots, not this caller's subset. Asserting the
+            # requested path here made the verdict depend on whether the suite was
+            # launched inside a fence. The contract is that all four consumers read
+            # ONE authority, so assert exactly that.
+            self.assertEqual(
+                env[shared_paths.HOME_FENCE_DENY_ENV].split(os.pathsep),
+                [str(path) for path in os_fence.denied],
             )
+            if not os_fence.inherited:
+                self.assertEqual(os_fence.denied, (denied.resolve(),))
             for directory in layout.directories:
                 self.assertTrue(directory.is_dir())
 
     def test_the_child_env_drops_the_live_lane_pins(self) -> None:
         with TemporaryDirectory() as task:
+            denied = Path(task) / "denied-home"
+            denied.mkdir()
             base = {key: "live" for key in LIVE_LANE_ENV_KEYS}
-            _layout, env, _interpreter, _ledger = isolated_env(
-                Path(task), denied_homes=(Path(task) / "denied-home",), base_env=base
+            _layout, env, _interp, _ledger, _os_fence = isolated_env(
+                Path(task), denied_homes=(denied,), base_env=base
             )
             for key in LIVE_LANE_ENV_KEYS:
                 self.assertNotIn(key, env)
@@ -417,6 +435,368 @@ class LaunchPreflightRegressionDoesNotRegisterIntoAmbientHomeTest(unittest.TestC
                 verdict.unchanged,
                 f"the regression wrote into the ambient home: {verdict.reasons}",
             )
+
+
+class IdentityDeltaIsDiagnosticButNeverDisclosingTest(unittest.TestCase):
+    """The identity delta names what moved, without disclosing a single row.
+
+    j#100482 produced a red run whose only evidence was two opaque digests, so it
+    could not be attributed. j#100487 rejected narrowing the guard to fix that --
+    every table still counts, and any drift is still non-zero -- and asked instead
+    for value-free granularity in the *report*.
+    """
+
+    def _snapshot(self, counts, **kw):
+        from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_home_isolation import (  # noqa: E501
+            HomeSnapshot,
+            TableCount,
+            digest,
+        )
+
+        parts = tuple(TableCount(store=s, table=t, rows=c) for s, t, c in counts)
+        return HomeSnapshot(
+            home="/nowhere",
+            identity_digest=digest(tuple(p.as_key() + f"={p.rows}" for p in parts)),
+            identity_counts=parts,
+            **kw,
+        )
+
+    def test_it_names_the_store_table_and_row_counts_that_moved(self) -> None:
+        from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_home_isolation import (  # noqa: E501
+            compare_snapshots,
+        )
+
+        before = self._snapshot(
+            [("registry.sqlite", "workspaces", 43), ("registry.sqlite", "events", 7)]
+        )
+        after = self._snapshot(
+            [("registry.sqlite", "workspaces", 44), ("registry.sqlite", "events", 7)]
+        )
+        verdict = compare_snapshots(before, after)
+        self.assertFalse(verdict.unchanged)
+        detail = next(d.detail for d in verdict.deltas if d.tier == "identity")
+        self.assertIn("registry.sqlite/workspaces 43->44", detail)
+        # The table that did NOT move stays out of the report.
+        self.assertNotIn("events", detail)
+
+    def test_a_changed_identity_set_is_reported_without_naming_any_id(self) -> None:
+        """Row counts equal, digest moved: say so, but never print a workspace id."""
+        from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_home_isolation import (  # noqa: E501
+            HomeSnapshot,
+            compare_snapshots,
+        )
+
+        from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_home_isolation import (  # noqa: E501
+            TableCount,
+        )
+
+        counts = (TableCount(store="registry.sqlite", table="workspaces", rows=2),)
+        before = HomeSnapshot(
+            home="/nowhere", identity_digest="aaa", identity_counts=counts
+        )
+        after = HomeSnapshot(
+            home="/nowhere", identity_digest="bbb", identity_counts=counts
+        )
+        verdict = compare_snapshots(before, after)
+        detail = next(d.detail for d in verdict.deltas if d.tier == "identity")
+        self.assertEqual(detail, "registry workspace identity set changed")
+
+    def test_the_guard_still_fails_on_any_drift(self) -> None:
+        """The report got finer; the guard did not get weaker (j#100487).
+
+        A single row appended anywhere is still a non-zero verdict -- including in a
+        high-churn table, which is exactly where a test-process append would hide if
+        the guard were narrowed to an authority allowlist.
+        """
+        from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_home_isolation import (  # noqa: E501
+            compare_snapshots,
+        )
+
+        before = self._snapshot([("telemetry.sqlite", "spans", 10_000)])
+        after = self._snapshot([("telemetry.sqlite", "spans", 10_001)])
+        self.assertFalse(compare_snapshots(before, after).unchanged)
+
+
+def _bind_source_for(prefix: list[str], target: Path) -> str | None:
+    """The SOURCE bwrap binds onto ``target``, read as (flag, source, target) triples.
+
+    Scanning for the target by index is wrong when source == target: the first hit
+    is the source, and the check silently reads the flag instead.
+    """
+    for i, token in enumerate(prefix):
+        if token == "--ro-bind" and i + 2 < len(prefix) and prefix[i + 2] == str(target):
+            return prefix[i + 1]
+    return None
+
+
+class AbsentDeniedRootOnLinuxTest(unittest.TestCase):
+    """bwrap must not be handed a denied root that does not exist (j#100489 F6).
+
+    A clean Linux runner has no ``~/.mozyo_bridge`` until something creates it, and
+    ``--ro-bind`` fails when its *source* is missing -- so binding the root onto
+    itself aborts bwrap before a single test runs. The CI pre-check passed because
+    its fixture root exists; the real suite would not. The repair must not be
+    "create the operator home": a test rail that creates operator state in order to
+    protect it has already lost the property it is guarding.
+    """
+
+    def _resolve_linux(self, denied, work_dir):
+        from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application import (  # noqa: E501
+            test_home_os_fence as mod,
+        )
+
+        # Also force the fresh branch: under `mozyo-bridge tests run` this process
+        # is already inside a boundary, `resolve_os_fence` returns the prefix-less
+        # inherited fence, and no bwrap argv is built at all -- so without this the
+        # test silently measures nothing when run under the rail it belongs to.
+        with patch.object(mod.platform, "system", return_value="Linux"), patch.object(
+            mod.shutil, "which", return_value="/usr/bin/bwrap"
+        ), patch.object(mod, "inherited_fence", return_value=None):
+            return mod.resolve_os_fence(
+                denied, work_dir=work_dir, canary=work_dir / "canary"
+            )
+
+    def test_an_absent_root_binds_a_task_local_empty_source(self) -> None:
+        with TemporaryDirectory() as task:
+            work = Path(task).resolve()
+            absent = work / "no-such-home"
+            fence = self._resolve_linux((absent,), work)
+
+            source = _bind_source_for(list(fence.argv_prefix), absent)
+            self.assertIsNotNone(source, "the denied root is not a bind target")
+            self.assertNotEqual(
+                source, str(absent), "a missing path was used as the bind SOURCE"
+            )
+            # The source is real, empty, and inside the task root.
+            self.assertTrue(Path(source).is_dir())
+            self.assertEqual(list(Path(source).iterdir()), [])
+            self.assertEqual(Path(source).parent, work)
+            # And nothing was created on the host side for the denied root.
+            self.assertFalse(
+                absent.exists(), "resolving the fence created the operator home"
+            )
+
+    def test_an_existing_root_is_still_bound_onto_itself(self) -> None:
+        """The absent-root repair must not change the normal case."""
+        with TemporaryDirectory() as task:
+            work = Path(task).resolve()
+            present = work / "real-home"
+            present.mkdir()
+            prefix = list(self._resolve_linux((present,), work).argv_prefix)
+            self.assertEqual(_bind_source_for(prefix, present), str(present))
+
+
+class MandatoryHardCheckCannotSkipTest(unittest.TestCase):
+    """Backend resolution failure must be non-zero, never a skip (j#100490 item 1).
+
+    `OsBoundaryRefusesEveryKnownBypassTest` is the mandatory OS-boundary hard check
+    and its own docstring says skipping is not an option -- but its setup reached
+    for `skipTest`, so on a host where the backend would not resolve the whole class
+    reported success while measuring nothing. This drives the real class with
+    resolution forced to fail and requires a failing result.
+    """
+
+    def test_a_backend_that_will_not_resolve_fails_the_hard_check(self) -> None:
+        from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application import (  # noqa: E501
+            test_home_os_fence as fence_mod,
+        )
+        from tests.integration.e_150_quality_architecture.f_150_ci_verification import (  # noqa: E501
+            test_test_home_isolation_runner as runner_mod,
+        )
+
+        case = runner_mod.OsBoundaryRefusesEveryKnownBypassTest(
+            "test_a_dir_fd_relative_write_is_refused"
+        )
+        with patch.object(
+            runner_mod, "load_outer_context", return_value=None
+        ), patch.object(
+            runner_mod,
+            "resolve_os_fence",
+            side_effect=fence_mod.OsFenceUnavailable("no backend on this host"),
+        ):
+            result = case.run()
+
+        self.assertEqual(len(result.skipped), 0, "the mandatory hard check skipped")
+        self.assertTrue(
+            result.failures or result.errors,
+            "an unresolvable backend produced a passing hard check",
+        )
+        self.assertFalse(result.wasSuccessful())
+
+
+class RealSqliteIdentityDiagnosticTest(unittest.TestCase):
+    """Real SQLite, not hand-built snapshots (j#100490 item 2).
+
+    The diagnostic is only trustworthy if it survives what SQLite actually permits:
+    identifiers containing tabs and newlines (which is why the surface is typed
+    rather than tab-delimited text), tables appearing and disappearing, and a
+    change that leaves every row count identical.
+    """
+
+    def _home(self, tables) -> Path:
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        home = Path(tmp.name)
+        conn = sqlite3.connect(home / "registry.sqlite")
+        try:
+            for name, rows in tables:
+                escaped = name.replace('"', '""')
+                conn.execute(f'CREATE TABLE "{escaped}" (workspace_id TEXT)')
+                for i in range(rows):
+                    conn.execute(
+                        f'INSERT INTO "{escaped}" VALUES (?)', (f"ws-{i}",)
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+        return home
+
+    def _snapshot(self, home: Path):
+        return test_home_fence.snapshot_home(home)
+
+    def test_a_created_table_is_named_in_the_detail(self) -> None:
+        home = self._home([("workspaces", 1)])
+        before = self._snapshot(home)
+        conn = sqlite3.connect(home / "registry.sqlite")
+        conn.execute("CREATE TABLE leases (id TEXT)")
+        conn.commit()
+        conn.close()
+        verdict = compare_snapshots(before, self._snapshot(home))
+        detail = next(d.detail for d in verdict.deltas if d.tier == "identity")
+        self.assertIn("registry.sqlite/leases absent->0", detail)
+
+    def test_a_dropped_table_is_named_in_the_detail(self) -> None:
+        home = self._home([("workspaces", 1), ("leases", 0)])
+        before = self._snapshot(home)
+        conn = sqlite3.connect(home / "registry.sqlite")
+        conn.execute("DROP TABLE leases")
+        conn.commit()
+        conn.close()
+        detail = next(
+            d.detail
+            for d in compare_snapshots(before, self._snapshot(home)).deltas
+            if d.tier == "identity"
+        )
+        self.assertIn("registry.sqlite/leases 0->absent", detail)
+
+    def test_a_renamed_table_shows_both_sides(self) -> None:
+        home = self._home([("workspaces", 2)])
+        before = self._snapshot(home)
+        conn = sqlite3.connect(home / "registry.sqlite")
+        conn.execute("ALTER TABLE workspaces RENAME TO tenants")
+        conn.commit()
+        conn.close()
+        detail = next(
+            d.detail
+            for d in compare_snapshots(before, self._snapshot(home)).deltas
+            if d.tier == "identity"
+        )
+        self.assertIn("registry.sqlite/workspaces 2->absent", detail)
+        self.assertIn("registry.sqlite/tenants absent->2", detail)
+
+    def test_an_identity_change_with_identical_counts_is_still_red(self) -> None:
+        """Delete one workspace, insert another: counts equal, identity moved.
+
+        This is the case a row-count-only guard would miss, and the reason the
+        registry's identity SET is digested alongside the counts.
+        """
+        home = self._home([("workspaces", 2)])
+        before = self._snapshot(home)
+        conn = sqlite3.connect(home / "registry.sqlite")
+        conn.execute("DELETE FROM workspaces WHERE workspace_id = 'ws-0'")
+        conn.execute("INSERT INTO workspaces VALUES ('ws-new')")
+        conn.commit()
+        conn.close()
+        verdict = compare_snapshots(before, self._snapshot(home))
+        self.assertFalse(verdict.unchanged)
+        detail = next(d.detail for d in verdict.deltas if d.tier == "identity")
+        # No count moved, so the detail says so -- and names no workspace id.
+        self.assertEqual(detail, "registry workspace identity set changed")
+        self.assertNotIn("ws-", detail)
+
+    def test_identifiers_with_control_bytes_do_not_collide_or_leak_raw(self) -> None:
+        """Tabs in table names broke the old delimited surface two ways.
+
+        `a\tb` and a table literally named with the separator produced the same
+        parsed key, and the raw control byte was rendered into output verbatim.
+        """
+        home = self._home([("odd\tname", 1), ("odd\nother", 1)])
+        before = self._snapshot(home)
+        conn = sqlite3.connect(home / "registry.sqlite")
+        conn.execute('INSERT INTO "odd\tname" VALUES (?)', ("x",))
+        conn.commit()
+        conn.close()
+        detail = next(
+            d.detail
+            for d in compare_snapshots(before, self._snapshot(home)).deltas
+            if d.tier == "identity"
+        )
+        # Escaped for output, and only the table that actually moved is named.
+        self.assertIn("odd\\tname 1->2", detail)
+        self.assertNotIn("\t", detail)
+        self.assertNotIn("\n", detail)
+        self.assertNotIn("odd\\nother", detail)
+
+
+class DefaultOutputCarriesNoOperatorPathTest(unittest.TestCase):
+    """Default text and JSON verdicts disclose no absolute path (j#100490 item 4).
+
+    These verdicts are pasted into Redmine journals and CI logs. An absolute
+    operator-home path discloses the account name and local layout, and a task root
+    discloses the same under a temp prefix. Both are withheld by default and
+    available only behind an explicit local-debug flag.
+    """
+
+    def _sample_outcome(self):
+        return IsolatedRunOutcome(
+            guards=(
+                HomeGuardVerdict(home="/Users/someone/.mozyo_bridge", ordinal=0),
+                HomeGuardVerdict(home="/Users/someone/other-home", ordinal=1),
+            ),
+            suite_success=True,
+            returncode=0,
+            fence_root="/Users/someone/task/mozyo-home",
+        )
+
+    def _render(self, fmt: str, **kwargs) -> str:
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            commands_test_run.render_outcome(
+                self._sample_outcome(), label="unittest x", fmt=fmt, **kwargs
+            )
+        return buffer.getvalue()
+
+    def test_text_output_hides_absolute_paths_by_default(self) -> None:
+        rendered = self._render("text")
+        self.assertNotIn("/Users/someone", rendered)
+        self.assertIn("guarded-home[0]", rendered)
+        # The two homes stay distinguishable without their paths.
+        self.assertIn("guarded-home[1]", rendered)
+        self.assertIn("fence-root[0]", rendered)
+
+    def test_json_output_hides_absolute_paths_by_default(self) -> None:
+        rendered = self._render("json")
+        self.assertNotIn("/Users/someone", rendered)
+        payload = json.loads(rendered)
+        self.assertTrue(payload["fence_root"].startswith("fence-root["))
+        labels = [guard["home"] for guard in payload["home_guards"]]
+        self.assertEqual(len(set(labels)), 2, "the two homes collapsed to one label")
+
+    def test_the_local_debug_flag_restores_absolute_paths(self) -> None:
+        """Withholding must be a default, not a loss of the debugging surface."""
+        for fmt in ("text", "json"):
+            with self.subTest(fmt=fmt):
+                rendered = self._render(fmt, reveal_paths=True)
+                self.assertIn("/Users/someone/.mozyo_bridge", rendered)
+                self.assertIn("/Users/someone/task/mozyo-home", rendered)
+
+    def test_the_same_home_gets_the_same_label_across_runs(self) -> None:
+        """A digest label is only useful if it is stable and comparable."""
+        first = HomeGuardVerdict(home="/Users/someone/.mozyo_bridge", ordinal=0).label
+        second = HomeGuardVerdict(home="/Users/someone/.mozyo_bridge", ordinal=0).label
+        other = HomeGuardVerdict(home="/Users/someone/elsewhere", ordinal=0).label
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, other)
 
 
 if __name__ == "__main__":  # pragma: no cover
