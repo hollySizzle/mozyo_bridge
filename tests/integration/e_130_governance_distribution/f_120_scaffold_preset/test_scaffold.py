@@ -1709,20 +1709,32 @@ class ScaffoldRulesTest(unittest.TestCase):
         shipped artifact and confirm the walker still surfaces the real
         files while dropping ``__pycache__`` / ``.pyc`` entries.
         """
-        from mozyo_bridge.scaffold.rules import render_preset_extra_files
+        from mozyo_bridge.scaffold import rules as scaffold_rules
 
-        rules_dir = (
+        packaged_root = (
             Path(__file__).resolve().parents[4]
             / "src/mozyo_bridge/scaffold/presets"
-            / "redmine-rails-governed/files/.mozyo-bridge/rules"
+            / "redmine-rails-governed"
         )
-        self.assertTrue(rules_dir.exists(), msg=f"rules dir missing: {rules_dir}")
-        fake_pycache = rules_dir / "__pycache__"
-        fake_pyc = fake_pycache / "fake_module.cpython-314.pyc"
-        fake_pycache.mkdir(exist_ok=True)
-        try:
+        self.assertTrue(packaged_root.exists(), msg=f"preset missing: {packaged_root}")
+
+        # A production test run deliberately mounts the source checkout read-only.
+        # Exercise the real packaged tree from a private copy instead of mutating
+        # the installed/source package just to manufacture bytecode cruft.
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture_root = Path(tmp) / "redmine-rails-governed"
+            shutil.copytree(packaged_root, fixture_root)
+            rules_dir = fixture_root / "files/.mozyo-bridge/rules"
+            fake_pycache = rules_dir / "__pycache__"
+            fake_pyc = fake_pycache / "fake_module.cpython-314.pyc"
+            fake_pycache.mkdir()
             fake_pyc.write_bytes(b"\x82\x82\x82bogus pyc bytes")
-            extras = render_preset_extra_files("redmine-rails-governed")
+            with patch.object(
+                scaffold_rules, "package_preset_root", return_value=fixture_root
+            ):
+                extras = scaffold_rules.render_preset_extra_files(
+                    "redmine-rails-governed"
+                )
             paths = {item.path.as_posix() for item in extras}
             # No __pycache__ entry and no .pyc entry leak through.
             self.assertFalse(
@@ -1736,10 +1748,6 @@ class ScaffoldRulesTest(unittest.TestCase):
             # The legitimate rule files under the same directory still
             # surface — we only filter cache cruft, not real artifacts.
             self.assertIn(".mozyo-bridge/rules/llm_rule_authoring.md", paths)
-        finally:
-            import shutil as _shutil
-
-            _shutil.rmtree(fake_pycache, ignore_errors=True)
 
     def test_governed_scaffold_apply_succeeds_after_wheel_install(self) -> None:
         """End-to-end: build wheel, pip install to a venv, run scaffold apply.

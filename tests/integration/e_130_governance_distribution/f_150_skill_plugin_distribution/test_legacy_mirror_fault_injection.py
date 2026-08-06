@@ -395,11 +395,20 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
 
         real_lstat = os.lstat
         fired: list[str] = []
+        mirror_info = self._mirror(repo).stat()
+        mirror_identity = (mirror_info.st_dev, mirror_info.st_ino)
 
         def failing_staging_lstat(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+            dir_fd = kwargs.get("dir_fd")
+            try:
+                anchor_info = os.fstat(dir_fd) if isinstance(dir_fd, int) else None
+            except OSError:
+                anchor_info = None
             if (
                 isinstance(path, str)
                 and path.startswith(".mozyo-legacy-mirror.")
+                and anchor_info is not None
+                and (anchor_info.st_dev, anchor_info.st_ino) == mirror_identity
                 and not fired
             ):
                 fired.append(path)
