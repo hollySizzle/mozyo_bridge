@@ -22,13 +22,14 @@ module-to-test impact resolver (`mozyo-bridge tests resolve`) を運用に接続
    渡し、task-specific temp root 下で走らせ、共有 home が変化していれば hook を
    fail させる。契約の正本は `test-process-home-isolation.md`。
 
-   **stale CLI fallback**: 本 hook は PATH 上の installed `mozyo-bridge` を repo 自身の
-   source より優先して解決する (下記 `## 実装 / 環境の詳細` の CLI 解決順)。したがって解決された CLI が
-   `tests run` を持たない (古い) ことがあり得る。その場合 hook は `tests run --help` の
-   probe で検出し、**非隔離の `python -m unittest` へ fallback する** — infrastructure
-   起因で毎 commit を止めないため。ただし fallback は隔離されていないので、
-   `WARNING: ... NON-ISOLATED ...` を明示出力して沈黙で verified run に見せない。
-   解消は mozyo-bridge の upgrade、または `MOZYO_BRIDGE_CMD` に本 repo の CLI を指定する。
+   **stale CLI の扱いは fail-closed** (review #14757 j#100408 finding_3): 本 hook は PATH 上の
+   installed `mozyo-bridge` を repo 自身の source より優先して解決するため、解決された CLI が
+   `tests run` を持たないことがあり得る。その場合 hook は (1) repo 同梱 source CLI へ切替を
+   試み、(2) それも不可なら **hook を fail させる**。**非隔離 `python -m unittest` への
+   fallback は行わない** — 旧版は warning を出して fallback していたが、warning は
+   shared-home mutation を防がず、j#94599 は documented helper が起動する全 test process の
+   隔離を要求している。解消は mozyo-bridge の upgrade、`MOZYO_BRIDGE_CMD` の指定、または
+   `git commit --no-verify`。
 
 実測の目安 (mozyo_bridge repo、2026-07-03): resolver ~0.3 秒、focused 選択の
 実行は数百 test / 1 秒未満。full suite (~4400 tests / ~35 秒) はここでは回らない。

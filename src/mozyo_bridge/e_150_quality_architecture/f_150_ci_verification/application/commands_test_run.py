@@ -34,10 +34,13 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
+from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.test_home_audit_hook import (
+    AuditHookInstallError,
+)
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.test_home_fence import (
     ambient_homes,
-    effective_home,
     isolated_env,
+    read_deny_ledger,
     reexec_isolated,
     snapshot_home,
 )
@@ -66,31 +69,40 @@ def _repo_root(args: argparse.Namespace) -> Path:
 def guarded_isolated_run(
     *,
     repo_root: Path,
-    child: Callable[[IsolationLayout, dict[str, str]], int],
-    guarded_home: Path | None = None,
+    child: Callable[[IsolationLayout, dict[str, str], Path], int],
+    guarded_homes: tuple[Path, ...] | None = None,
 ) -> IsolatedRunOutcome:
-    """Run ``child`` inside a fresh fence and guard the operator home around it.
+    """Run ``child`` behind the write-refusal fence, guarding every denied home.
 
-    ``child`` receives the layout and the child env and returns an exit code.
+    ``child`` receives the layout, the child env, and **the interpreter that
+    carries the refusal hook** — it must launch with that interpreter, not with
+    ``sys.executable``, or the hook does not ride along.
 
-    The guarded target defaults to :func:`effective_home` — the one shared home
-    *this* process would itself have resolved. From an unfenced parent (the normal
-    case) that is the operator's home. From an already-fenced parent (a nested
-    invocation) it is the outer fence's home, which is still the shared state the
-    inner run could damage, so the guard stays meaningful either way rather than
-    reaching past the fence to the operator's real home.
+    Every root the fence denies is also snapshotted. R1 denied two homes and
+    snapshotted one, so a child that lost the fence env could write the other and
+    still be reported green (review j#100408 finding_2); the deny set and the guard
+    set are now the same set by construction.
+
+    An un-armed fence raises out of :func:`isolated_env` rather than degrading to a
+    detect-only run: reporting isolation that is not there is the failure this round
+    exists to remove.
     """
-    denied = ambient_homes()
-    target = Path(guarded_home) if guarded_home is not None else effective_home()
-    before = snapshot_home(target)
+    denied = ambient_homes() if guarded_homes is None else tuple(guarded_homes)
+    before = {home: snapshot_home(home) for home in denied}
     with tempfile.TemporaryDirectory(prefix=_TEMP_PREFIX) as tmp:
-        layout, env = isolated_env(Path(tmp), denied_homes=denied)
-        returncode = child(layout, env)
+        layout, env, interpreter, ledger = isolated_env(
+            Path(tmp), denied_homes=denied
+        )
+        returncode = child(layout, env, interpreter)
         fence_root = str(layout.home)
-    after = snapshot_home(target)
+        attempts = read_deny_ledger(ledger)
+    guards = tuple(
+        compare_snapshots(before[home], snapshot_home(home)) for home in denied
+    )
     return IsolatedRunOutcome(
         suite_success=returncode == 0,
-        guard=compare_snapshots(before, after),
+        guards=guards,
+        ledger=attempts,
         returncode=returncode,
         fence_root=fence_root,
     )
@@ -98,12 +110,17 @@ def guarded_isolated_run(
 
 def _unittest_child(
     repo_root: Path, unittest_args: tuple[str, ...]
-) -> Callable[[IsolationLayout, dict[str, str]], int]:
-    """A child that runs the authoritative ``python -m unittest`` command."""
+) -> Callable[[IsolationLayout, dict[str, str], Path], int]:
+    """A child that runs the authoritative ``python -m unittest`` command.
 
-    def run(layout: IsolationLayout, env: dict[str, str]) -> int:
+    Launched with the fence interpreter rather than ``sys.executable`` so the
+    write-refusal hook is armed in the suite process and inherited by everything it
+    spawns through its own ``sys.executable``.
+    """
+
+    def run(layout: IsolationLayout, env: dict[str, str], interpreter: Path) -> int:
         proc = subprocess.run(
-            [sys.executable, "-m", "unittest", *unittest_args],
+            [str(interpreter), "-m", "unittest", *unittest_args],
             cwd=str(repo_root),
             env=env,
         )
@@ -138,9 +155,16 @@ def cmd_tests_run(args: argparse.Namespace) -> int:
         )
         return proc.returncode
 
-    outcome = guarded_isolated_run(
-        repo_root=repo_root, child=_unittest_child(repo_root, unittest_args)
-    )
+    try:
+        outcome = guarded_isolated_run(
+            repo_root=repo_root, child=_unittest_child(repo_root, unittest_args)
+        )
+    except AuditHookInstallError as exc:
+        # Fail closed and run nothing: a suite executed without the refusal layer
+        # would produce a verdict that looks isolated and is not.
+        print(f"tests run: refusing to run without the write fence -- {exc}",
+              file=sys.stderr)
+        return 1
     _render(args, outcome, unittest_args)
     return 0 if outcome.success else 1
 
@@ -154,19 +178,27 @@ def render_outcome(
         payload["label"] = label
         print(_json.dumps(payload, ensure_ascii=False, indent=2))
         return
-    guard = outcome.guard
     print(f"=== isolated test run ({label}) ===")
     print(f"fence root: {outcome.fence_root}")
-    print(f"guarded home: {guard.home}")
+    for guard in outcome.guards:
+        print(
+            f"guarded home: {guard.home} -- "
+            + ("unchanged" if guard.unchanged else "CHANGED (fail-closed)")
+        )
+    ledger = outcome.ledger
     print(
-        "operator shared home: "
-        + ("unchanged" if guard.unchanged else "CHANGED (fail-closed)")
+        "refused write attempts: "
+        + (
+            "none"
+            if ledger.clean
+            else ("LEDGER MISSING" if ledger.missing else str(len(ledger.attempts)))
+        )
     )
     print(f"suite: {'PASS' if outcome.suite_success else 'FAIL'}")
     print(f"result: {'PASS' if outcome.success else 'FAIL'}")
     for reason in outcome.all_reasons:
         print(f"  reason: {reason}")
-    if not guard.unchanged:
+    if not outcome.homes_unchanged:
         print(
             "  the guard never repairs or deletes operator state; inspect the "
             "reported tier and decide the disposition yourself."
@@ -222,25 +254,34 @@ def isolate_self(args: argparse.Namespace, *, label: str) -> int | None:
     as_json = getattr(args, "format", "text") == "json"
     captured: dict = {}
 
-    def child(layout: IsolationLayout, env: dict[str, str]) -> int:
+    def child(layout: IsolationLayout, env: dict[str, str], interpreter: Path) -> int:
         return reexec_isolated(
             argv,
             repo_root=repo_root,
             env=env,
+            interpreter=interpreter,
             capture_stdout=captured if as_json else None,
         )
 
-    outcome = guarded_isolated_run(repo_root=repo_root, child=child)
+    try:
+        outcome = guarded_isolated_run(repo_root=repo_root, child=child)
+    except AuditHookInstallError as exc:
+        print(f"tests {label}: refusing to run without the write fence -- {exc}",
+              file=sys.stderr)
+        return 1
     if as_json:
         _emit_merged_json(captured.get("stdout", ""), outcome)
         return 0 if outcome.success else 1
     # The child already rendered its own summary; add only the guard verdict, so
     # `tests profile`'s runtime table and `tests parallel`'s shard table stay the
     # primary output and the guard reads as an additional gate on top.
-    if outcome.guard.unchanged:
-        print(f"operator shared home: unchanged ({outcome.guard.home})")
+    if outcome.success:
+        print(
+            "operator shared homes: unchanged; refused write attempts: none "
+            f"({len(outcome.guards)} guarded)"
+        )
     else:
-        print(f"operator shared home: CHANGED (fail-closed) ({outcome.guard.home})")
+        print("operator shared home isolation: FAILED (fail-closed)")
         for reason in outcome.all_reasons:
             print(f"  reason: {reason}")
     return 0 if outcome.success else 1
@@ -255,7 +296,8 @@ def _emit_merged_json(child_stdout: str, outcome: IsolatedRunOutcome) -> None:
     unnoticed while the exit code still carries it.
     """
     guard = {
-        "home_guard": outcome.guard.as_dict(),
+        "home_guards": [g.as_dict() for g in outcome.guards],
+        "deny_ledger": outcome.ledger.as_dict(),
         "fence_root": outcome.fence_root,
         "isolated_success": outcome.success,
     }
@@ -273,7 +315,7 @@ def _emit_merged_json(child_stdout: str, outcome: IsolatedRunOutcome) -> None:
         payload.update(guard)
         # The document's own `success` must not claim a pass the guard refused.
         if "success" in payload:
-            payload["success"] = bool(payload["success"]) and outcome.guard.unchanged
+            payload["success"] = bool(payload["success"]) and outcome.success
     else:
         payload = {"child": payload, **guard}
     print(_json.dumps(payload, ensure_ascii=False, indent=2))

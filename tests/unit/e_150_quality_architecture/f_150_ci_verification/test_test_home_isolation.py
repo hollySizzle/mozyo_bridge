@@ -211,8 +211,11 @@ class IsolatedRunOutcomeTest(unittest.TestCase):
         """
         outcome = IsolatedRunOutcome(
             suite_success=True,
-            guard=HomeGuardVerdict(
-                home="/h", deltas=(HomeDelta(tier="schema", before="v7", after="v8"),)
+            guards=(
+                HomeGuardVerdict(
+                    home="/h",
+                    deltas=(HomeDelta(tier="schema", before="v7", after="v8"),),
+                ),
             ),
             returncode=0,
         )
@@ -224,21 +227,21 @@ class IsolatedRunOutcomeTest(unittest.TestCase):
 
     def test_a_red_suite_over_an_untouched_home_is_still_red(self) -> None:
         outcome = IsolatedRunOutcome(
-            suite_success=False, guard=HomeGuardVerdict(home="/h"), returncode=1
+            suite_success=False, guards=(HomeGuardVerdict(home="/h"),), returncode=1
         )
         self.assertFalse(outcome.success)
         self.assertTrue(outcome.all_reasons)
 
     def test_both_green_is_a_pass_with_no_reasons(self) -> None:
         outcome = IsolatedRunOutcome(
-            suite_success=True, guard=HomeGuardVerdict(home="/h"), returncode=0
+            suite_success=True, guards=(HomeGuardVerdict(home="/h"),), returncode=0
         )
         self.assertTrue(outcome.success)
         self.assertEqual(outcome.all_reasons, ())
 
     def test_a_red_suite_reports_its_returncode_when_no_detail_is_given(self) -> None:
         outcome = IsolatedRunOutcome(
-            suite_success=False, guard=HomeGuardVerdict(home="/h"), returncode=7
+            suite_success=False, guards=(HomeGuardVerdict(home="/h"),), returncode=7
         )
         self.assertTrue(any("returncode=7" in r for r in outcome.all_reasons))
 
@@ -246,9 +249,11 @@ class IsolatedRunOutcomeTest(unittest.TestCase):
         """A reader must see why a run failed, not just that it did."""
         outcome = IsolatedRunOutcome(
             suite_success=True,
-            guard=HomeGuardVerdict(
-                home="/h",
-                deltas=(HomeDelta(tier="identity", before="3", after="4"),),
+            guards=(
+                HomeGuardVerdict(
+                    home="/h",
+                    deltas=(HomeDelta(tier="identity", before="3", after="4"),),
+                ),
             ),
             returncode=0,
             fence_root="/task/home",
@@ -256,7 +261,7 @@ class IsolatedRunOutcomeTest(unittest.TestCase):
         payload = outcome.as_dict()
         self.assertFalse(payload["success"])
         self.assertTrue(payload["suite_success"])
-        self.assertFalse(payload["home_guard"]["unchanged"])
+        self.assertFalse(payload["home_guards"][0]["unchanged"])
         self.assertEqual(payload["fence_root"], "/task/home")
 
 

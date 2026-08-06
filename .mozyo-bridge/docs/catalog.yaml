@@ -1922,6 +1922,7 @@ file_conventions:
     patterns:
       - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/domain/test_home_isolation.py
       - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/application/test_home_fence.py
+      - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/application/test_home_audit_hook.py
       - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/application/commands_test_run.py
       - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/application/cli_test_run.py
     severity: block

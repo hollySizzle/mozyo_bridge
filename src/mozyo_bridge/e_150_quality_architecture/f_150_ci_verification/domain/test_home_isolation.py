@@ -27,11 +27,18 @@ identity, which the parallel runner had to patch around with ``PYTHONUSERBASE``
 and a synthetic committer (#13733). Isolation here comes from the resolver, so
 the fenced process keeps a working ``HOME``.
 
-The snapshot half is the fail-closed backstop for everything the pins and the
-fence cannot reach in-process — a grandchild launched with a scrubbed env, a
-``multiprocessing`` worker, an installed console script from a throwaway venv.
-It is deliberately *not* an OS sandbox: the same code path runs identically on
-macOS and Linux CI, where ``sandbox-exec`` does not exist (#14757 acceptance 3).
+- **the audit hook** (``application/test_home_audit_hook.py``) refuses the write
+  *before it happens*, in every Python process of the tree. R1 shipped without it
+  and argued from after-the-fact detection; review j#100407 R1-F1 rejected that,
+  because acceptance 4 asks for refusal and acceptance 7 for zero changes.
+
+The snapshot is the **coarse backstop** for writers the hook cannot reach (a
+non-Python process, an interpreter started with ``PYTHONPATH`` scrubbed). It is
+explicitly NOT the evidence for acceptance 7 any more — the refusal ledger is
+(:class:`DenyLedger`), because a directory comparison cannot see an in-place row
+update or an overwrite of an existing file (j#100408 finding_1). Neither layer is
+an OS sandbox: the same code path runs identically on macOS and Linux CI, where
+``sandbox-exec`` does not exist (#14757 acceptance 3).
 """
 
 from __future__ import annotations
@@ -326,25 +333,81 @@ def compare_snapshots(before: HomeSnapshot, after: HomeSnapshot) -> HomeGuardVer
 
 
 @dataclass(frozen=True)
-class IsolatedRunOutcome:
-    """The fail-closed verdict of one isolated run: suite AND home guard.
+class DenyLedger:
+    """Refused write attempts recorded by the injected audit hook (R2).
 
-    Kept as one value object because either half alone is misleading. A green
-    suite that mutated the operator's home is not a pass (that is exactly the
-    #14477 shape: the tests were green and the shared store was migrated), and a
-    red suite with an untouched home is still red.
+    This is the *primary* evidence for acceptance 7. R1 argued "zero changes from
+    this process tree" from a before/after snapshot, and review j#100408 finding_1
+    showed that argument does not hold: the snapshot's tiers miss an in-place row
+    update, a write inside an existing directory, and an overwrite of an existing
+    file. Attribution is the sound argument instead — the hook refuses each attempt
+    *and names it*, so an empty ledger says the tree attempted nothing, which no
+    amount of directory comparison can say.
+
+    ``missing`` is a failure, not an absence: the runner writes the ledger empty
+    before the run, so a ledger that is gone means the fence did not run.
+    """
+
+    attempts: tuple[str, ...] = ()
+    missing: bool = False
+
+    @property
+    def clean(self) -> bool:
+        return not self.attempts and not self.missing
+
+    @property
+    def reasons(self) -> tuple[str, ...]:
+        if self.missing:
+            return (
+                "the deny-attempt ledger is missing; the audit hook cannot be shown "
+                "to have run, so isolation is unproven",
+            )
+        return tuple(
+            f"refused write attempt to the operator's shared home: {attempt}"
+            for attempt in self.attempts
+        )
+
+    def as_dict(self) -> dict:
+        return {
+            "clean": self.clean,
+            "missing": self.missing,
+            "attempt_count": len(self.attempts),
+            "attempts": list(self.attempts),
+        }
+
+
+@dataclass(frozen=True)
+class IsolatedRunOutcome:
+    """The fail-closed verdict of one isolated run: suite AND refusals AND guards.
+
+    Kept as one value object because no part alone is sufficient. A green suite
+    that mutated the operator's home is not a pass (the #14477 shape: green tests,
+    migrated store). A green suite whose audit hook refused a write is not a pass
+    either — the write was prevented, but a test that tried is a defect that must
+    surface. And a red suite with everything else clean is still red.
+
+    ``guards`` is a tuple, not a single verdict: every root the fence denies is
+    also snapshotted. R1 denied both the operator default and an explicit
+    ``MOZYO_BRIDGE_HOME`` while snapshotting only one of them, so a child that lost
+    the fence env could write the other and still be reported green
+    (review j#100408 finding_2).
     """
 
     suite_success: bool
-    guard: HomeGuardVerdict
+    guards: tuple[HomeGuardVerdict, ...] = ()
+    ledger: DenyLedger = field(default_factory=DenyLedger)
     returncode: int | None = None
     detail: str | None = None
     fence_root: str = ""
     reasons: tuple[str, ...] = field(default_factory=tuple)
 
     @property
+    def homes_unchanged(self) -> bool:
+        return all(guard.unchanged for guard in self.guards)
+
+    @property
     def success(self) -> bool:
-        return self.suite_success and self.guard.unchanged
+        return self.suite_success and self.ledger.clean and self.homes_unchanged
 
     @property
     def all_reasons(self) -> tuple[str, ...]:
@@ -353,10 +416,12 @@ class IsolatedRunOutcome:
             reasons.append(
                 self.detail or f"test suite failed (returncode={self.returncode})"
             )
-        reasons += [
-            f"operator shared home changed during the run -- {reason}"
-            for reason in self.guard.reasons
-        ]
+        reasons += list(self.ledger.reasons)
+        for guard in self.guards:
+            reasons += [
+                f"operator shared home changed during the run -- {reason}"
+                for reason in guard.reasons
+            ]
         return tuple(reasons)
 
     def as_dict(self) -> dict:
@@ -365,13 +430,15 @@ class IsolatedRunOutcome:
             "suite_success": self.suite_success,
             "returncode": self.returncode,
             "fence_root": self.fence_root,
-            "home_guard": self.guard.as_dict(),
+            "deny_ledger": self.ledger.as_dict(),
+            "home_guards": [guard.as_dict() for guard in self.guards],
             "reasons": list(self.all_reasons),
         }
 
 
 __all__ = (
     "CHURN_CARVE_OUT",
+    "DenyLedger",
     "FENCE_SUBDIRS",
     "GUARDED_TIERS",
     "LIVE_LANE_ENV_KEYS",

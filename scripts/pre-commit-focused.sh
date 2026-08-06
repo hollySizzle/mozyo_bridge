@@ -100,21 +100,31 @@ printf '%s\n' "$TARGETS" | sed 's/^/  - /'
 # the identical `python -m unittest` invocation.
 #
 # The resolved CLI may predate `tests run` (this hook prefers an installed
-# `mozyo-bridge` on PATH over the repo's own source, per #13079). Probe once: a
-# stale CLI must not turn every commit into a hook failure, but the fallback is
-# UNISOLATED, so it is announced loudly rather than taken quietly.
-if $MOZYO tests run --help >/dev/null 2>&1; then
-    # shellcheck disable=SC2086  # targets are newline-separated unittest args
-    printf '%s\n' "$TARGETS" | xargs $MOZYO tests run --repo . -- \
-        || fail "focused tests failed"
-else
-    say "WARNING: the resolved mozyo-bridge CLI has no \`tests run\` subcommand."
-    say "WARNING: falling back to a NON-ISOLATED \`$PYTHON -m unittest\` run, which"
-    say "WARNING: can read and write your shared mozyo-bridge home (Redmine #14757)."
-    say "WARNING: upgrade mozyo-bridge, or set MOZYO_BRIDGE_CMD to this repo's CLI."
-    # shellcheck disable=SC2086  # targets are newline-separated unittest args
-    printf '%s\n' "$TARGETS" | xargs $PYTHON -m unittest \
-        || fail "focused tests failed"
+# `mozyo-bridge` on PATH over the repo's own source, per #13079). An earlier
+# version of this hook fell back to a bare `python -m unittest` with a warning;
+# review #14757 j#100408 finding_3 rejected that, because a warning does not
+# prevent a shared-home mutation and j#94599 requires EVERY test process a
+# documented helper starts to be isolated. So: try the repo's own committed CLI
+# next (it necessarily has the subcommand), and if that is unavailable too, FAIL —
+# never run un-isolated.
+if ! $MOZYO tests run --help >/dev/null 2>&1; then
+    say "resolved mozyo-bridge CLI has no \`tests run\`; trying this repo's source CLI"
+    SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+    if [ -d "$SCRIPT_DIR/../src/mozyo_bridge" ]; then
+        REPO_SRC=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)/src
+        MOZYO="env PYTHONPATH=$REPO_SRC${PYTHONPATH:+:$PYTHONPATH} $PYTHON -m mozyo_bridge"
+    fi
 fi
+
+if ! $MOZYO tests run --help >/dev/null 2>&1; then
+    fail "no mozyo-bridge CLI with \`tests run\` is available, so the focused tests
+  cannot be isolated from your shared mozyo-bridge home (Redmine #14757). This hook
+  will NOT run them un-isolated. Upgrade mozyo-bridge, or point MOZYO_BRIDGE_CMD at
+  a CLI that has \`tests run\`. To commit without this check: git commit --no-verify."
+fi
+
+# shellcheck disable=SC2086  # targets are newline-separated unittest args
+printf '%s\n' "$TARGETS" | xargs $MOZYO tests run --repo . -- \
+    || fail "focused tests failed"
 
 say "OK"

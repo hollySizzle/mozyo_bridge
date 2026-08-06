@@ -23,13 +23,19 @@ than being skipped.
 from __future__ import annotations
 
 import os
+import json as _json
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
+from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.test_home_audit_hook import (
+    install_audit_fence,
+    verify_audit_fence,
+)
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_home_isolation import (
     OPERATOR_DEFAULT_HOME,
+    DenyLedger,
     HomeSnapshot,
     IsolationLayout,
     apply_isolation,
@@ -39,6 +45,7 @@ from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_h
 from mozyo_bridge.shared.paths import (
     HOME_FENCE_DENY_ENV,
     HOME_FENCE_DENY_SEPARATOR,
+    HOME_FENCE_LEDGER_ENV,
     HOME_FENCE_ROOT_ENV,
 )
 
@@ -101,13 +108,21 @@ def isolated_env(
     *,
     denied_homes: tuple[Path, ...],
     base_env: dict[str, str] | None = None,
-) -> tuple[IsolationLayout, dict[str, str]]:
-    """Create the task-specific root and return ``(layout, child_env)``.
+) -> tuple[IsolationLayout, dict[str, str], Path, Path]:
+    """Create the task root and return ``(layout, child_env, interpreter, ledger)``.
 
     ``HOME`` is inherited untouched (#14757 acceptance 1), so the fenced child
     keeps user site-packages and the operator's git identity without the
     ``PYTHONUSERBASE`` / synthetic-committer repairs a repurposed ``HOME``
     forces.
+
+    Also arms the pre-effect refusal layer (R2) and **returns the interpreter that
+    carries it**. Callers must run the suite with that interpreter rather than
+    ``sys.executable``: the hook rides in the task venv's own site-packages, which
+    is what makes it survive a child started with ``env={}`` (see
+    :mod:`...application.test_home_audit_hook` for the two mechanisms that were
+    measured and discarded first). The hook is verified armed before returning, so
+    an un-armed run raises instead of reporting isolation it does not have.
     """
     layout = IsolationLayout(root=Path(root).resolve())
     for directory in layout.directories:
@@ -119,8 +134,51 @@ def isolated_env(
         fence_root_key=HOME_FENCE_ROOT_ENV,
         fence_deny_key=HOME_FENCE_DENY_ENV,
     )
+    interpreter, ledger = install_audit_fence(
+        layout.root, denied_homes=denied_homes
+    )
+    pins[HOME_FENCE_LEDGER_ENV] = str(ledger)
     env = apply_isolation(dict(os.environ if base_env is None else base_env), pins)
-    return layout, env
+    if denied_homes:
+        verify_audit_fence(interpreter, denied_homes[0])
+        # The self-check deliberately attempts a refused write, and the hook
+        # records it like any other. Reset the ledger so the run starts from a
+        # clean slate -- otherwise every run reports one attempt and fails, which
+        # is how this was caught. Truncating (rather than filtering the probe's
+        # target out at read time) keeps the reader from having a rule that could
+        # also mask a real attempt at the same path.
+        ledger.write_text("", encoding="utf-8")
+    return layout, env, interpreter, ledger
+
+
+def read_deny_ledger(ledger: Path) -> DenyLedger:
+    """Read the audit hook's refused-attempt ledger (primary acceptance-7 evidence).
+
+    A missing ledger is a failure, not an absence: :func:`isolated_env` creates it
+    empty, so its disappearance means the fence did not run as configured. Entries
+    are de-duplicated but their count is preserved in the text, because the same
+    call site attempting fifty times is one defect, not fifty.
+    """
+    path = Path(ledger)
+    if not path.is_file():
+        return DenyLedger(missing=True)
+    attempts: dict[str, int] = {}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = _json.loads(line)
+            key = f"{record.get('event', '?')} -> {record.get('target', '?')}"
+        except (ValueError, AttributeError):
+            # A malformed line still proves something was attempted; never drop it.
+            key = f"unparseable ledger entry: {line[:120]}"
+        attempts[key] = attempts.get(key, 0) + 1
+    rendered = tuple(
+        f"{key} (x{count})" if count > 1 else key
+        for key, count in sorted(attempts.items())
+    )
+    return DenyLedger(attempts=rendered)
 
 
 # --------------------------------------------------------------------------- #
@@ -288,6 +346,7 @@ def reexec_isolated(
     *,
     repo_root: Path,
     env: dict[str, str],
+    interpreter: Path | None = None,
     capture_stdout: dict | None = None,
 ) -> int:
     """Re-run this CLI invocation in a fenced child, returning its exit code.
@@ -301,7 +360,10 @@ def reexec_isolated(
     needs that only to merge a structured document; stderr is always inherited so
     a failing child's diagnostics stay visible in real time either way.
     """
-    command = [sys.executable, "-c", _BOOTSTRAP.format(runtime=runtime_root()), *argv]
+    # The fence interpreter, when given: the write-refusal hook rides in its own
+    # site-packages, so launching with `sys.executable` would drop the hook.
+    python = str(interpreter) if interpreter is not None else sys.executable
+    command = [python, "-c", _BOOTSTRAP.format(runtime=runtime_root()), *argv]
     if capture_stdout is None:
         return subprocess.run(command, cwd=str(repo_root), env=env).returncode
     proc = subprocess.run(
@@ -313,6 +375,7 @@ def reexec_isolated(
 
 __all__ = (
     "ambient_homes",
+    "read_deny_ledger",
     "effective_home",
     "isolated_env",
     "reexec_isolated",

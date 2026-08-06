@@ -76,81 +76,119 @@ env が無ければ `_PROCESS_HOME_FENCE is None` で、旧実装と同一の 1 
 symlink 経由 (`/var/...` ⇄ `/private/var/...`) なので、片側だけ resolve すると deny が
 一致せず fence が **黙って通してしまう**。
 
-## snapshot guard — pin と fence が届かない先の fail-closed backstop
+## 作用前拒否 — audit hook (R2 で追加、正本層)
 
-pin は env を scrub した grandchild に届かず、fence は `mozyo_bridge` を import しない
-process に届かない。そこで runner は run の前後で operator 共有 home の **論理 snapshot**
-を取り、guarded set が動いていれば **test が全部 green でも run を fail** させる。
+R1 は「変更を検出して run を red にする」だけだった。review j#100407 R1-F1 / j#100408
+はこれを退けた: acceptance 4 は **write attempt の拒否**、acceptance 7 は **変更 0** を
+要求しており、row が着地した後で赤くしてもどちらも満たさない。R2 で **作用前拒否**を
+第一級の層として追加した。
 
-**これは OS sandbox ではない。** 同じ code path が macOS と Linux CI で同一に走ることが
-要件 (acceptance 3) であり、`sandbox-exec` は Linux に無く、mount namespace は権限を要する。
-child / multiprocessing / installed harness を **一様に**覆えるのは、名前空間の除去では
-なく before/after の照合である。
+### 機構は実測で決めた (2 案を棄却)
 
-### guarded tier (何を「変化」と数えるか)
+| 案 | 結果 | 実測 |
+| --- | --- | --- |
+| `PYTHONPATH` 上の `sitecustomize.py` | **棄却** | `env={}` child は `PYTHONPATH` を継承せず、`sitecustomize.py` 自体が読まれない (j#100410) |
+| task venv の site-packages に `sitecustomize.py` | **棄却** | Homebrew python が **stdlib dir** に自前の `sitecustomize.py` を同梱しており、`sys.path` 上 stdlib が site-packages より前なので **shadow される**。`'sitecustomize' in sys.modules` は True になるのに `__file__` は Homebrew 版で、`env={}` child の既存 file 上書きが **成功した** (j#100411 実測 2) |
+| task venv の site-packages に **`.pth`** | **採用** | `site` は各 site-packages の **全 `.pth`** の `import` 行を実行するため、shadow される単一 name が無い。`env={}` child が既存 file を上書きしようとして **`PermissionError` / 内容不変** (j#100411 実測 3) |
+
+**2 案目は「効いているように見えて効いていない」形だった。** `sys.modules` に入っている
+ことを確認するだけで採用していたら、穴を「対策済み」と称して残していた。**injection
+channel は「読まれたか」ではなく「拒否が実際に起きたか」で検証する。**
+
+### 現行構成
+
+run ごとに fence root 内へ task venv (`--without-pip --system-site-packages`、実測
+0.06 秒) を作り、その site-packages へ
+
+- `_mozyo_test_fence.py` — audit hook 本体
+- `zz_mozyo_test_fence.pth` — `import _mozyo_test_fence` の 1 行
+
+を置き、**suite をその interpreter で実行する**。site-packages 探索は interpreter 相対で
+env に依存しないため、`env={}` の child でも hook が入る。**`PYTHONPATH` は使わない**ので、
+#13733 j#78390 F1 (`src/` が nested pip を壊した) の懸念面が設計から消える。
+
+- **denied root は生成 module 内の literal**。`os.environ` から読むと、この guard が
+  survive するために存在する `clear=True` 自身に無効化される。
+- hook は write 系 audit event (`open` の書込 mode / `os.mkdir` / `os.rename` /
+  `os.remove` / `sqlite3.connect` の非 read-only 等) を `PermissionError` で拒否し、試行を
+  fence root 内 ledger へ記録する。**read は拒否しない** (目的は「変更させない」であり、
+  read 拒否は parent の consistent snapshot を壊すだけで acceptance に寄与しない)。
+- **install 検証を毎 run 実行する** (`verify_audit_fence`)。`env={}` の probe child で拒否が
+  起きることを確認し、起きなければ `AuditHookInstallError` で **run 自体を拒否**する。
+  棄却案 2 の failure mode (成功したと報告しつつ実際は無防備) を再発させないため。
+  self-check 自身の試行は ledger をリセットして除く。
+
+### 「変更 0」の根拠は attribution に移した
+
+acceptance 7 の一次証拠は **ledger が空であること**である。snapshot の tier 粒度を根拠に
+しない — finding_1 が示したとおり、directory 比較では (a) 既存 row の in-place 更新、
+(b) 既存 directory 配下の write、(c) 既存 file の内容上書き のいずれも見えない。ledger は
+「この process tree が何も試みなかった」を言えるが、directory 比較はそれを言えない。
+
+**ledger が missing なら failure** として扱う (runner が空で作るので、消えていれば fence が
+設定どおり動いていない)。**拒否された試行も run を fail させる**: write は防げているが、
+試みた test は defect であり黙って通してはならない。
+
+## snapshot guard — hook が届かない writer 用の粗い backstop
+
+hook は **その interpreter で起動した process** に入る。非 Python process や、hook を持たない
+interpreter で起動された process は覆えないため、run の前後で **`ambient_homes()` の全 root**
+の論理 snapshot を照合する (R1 は deny 集合が複数なのに 1 件しか監視せず、fence env を失った
+child が他方へ書けた = finding_2)。
+
+**これは acceptance 7 の一次証拠ではない** (上記のとおり ledger が担う)。OS sandbox でもない:
+同じ code path が macOS と Linux CI で同一に走る (`sandbox-exec` は Linux に無い)。
+
+### guarded tier
 
 | tier | 内容 | 捕まえる形 |
 | --- | --- | --- |
-| `entries` | home 直下の child 名集合 (dir/file 区別つき) | 新しい store / lock / credential file の出現 |
-| `schema` | home 内全 SQLite の `PRAGMA user_version` + schema object 集合 | #14477 の v7→v8 |
-| `identity` | 全 SQLite の table ごと **row 数**、加えて `registry.sqlite` の `workspaces.workspace_id` **集合** | #14741 の row 挿入 |
-| `backups` | `backups/` 配下の相対 path 集合 | migration が pre-write backup を取って rollback しても残る痕跡 |
+| `entries` | home 直下の child 名集合 | 新しい store / lock / credential file の出現 |
+| `schema` | 全 SQLite の `PRAGMA user_version` + schema object 集合 | #14477 の v7→v8 |
+| `identity` | 全 SQLite の table ごと row 数 + `registry.sqlite` の `workspace_id` 集合 | #14741 の row 挿入 |
+| `backups` | `backups/` 配下の相対 path 集合 | migration の pre-write backup 痕跡 |
 | `existence` | home 自体の有無 | test process が operator home を新規作成した |
 
-snapshot は **値を持たない**。digest と count だけを載せる (journal に記録されるため、
-operator path / workspace 名 / credential を出さない)。
+snapshot は **値を持たない** (digest と count のみ。journal に記録されるため)。
 
 ### 読み取りは transactionally consistent、`immutable=1` は禁止 (acceptance 5)
 
-各 store は `file:<path>?mode=ro` で開き、online backup API で in-memory DB へ複写して、
-複写から読む。backup は read transaction 内で走るので、他 process が書いている live DB
-でも point-in-time で一貫する。
+各 store は `file:<path>?mode=ro` で開き、online backup API で in-memory DB へ複写して読む。
+backup は read transaction 内で走るので、他 process が書いている live DB でも point-in-time で
+一貫する。`immutable=1` は使わない — 「file は変化し得ない」は稼働中 cockpit では偽で、torn
+read を schema 変更として誤報する。読めなかった store は `unreadable` として **guard を fail**
+させる (「見られなかった」を「変わっていない」と読み替えない)。
 
-`immutable=1` は **使わない**。あれは「file は変化し得ない」という宣言であり、cockpit
-稼働中の operator home では偽である。torn read を schema 変更として報告してしまう。
+### backstop 側の既知の限界 (hook が覆う範囲では無関係)
 
-読めなかった store は `unreadable` として記録し、**guard を fail させる**。「見られなかった」
-を「変わっていない」と読み替えない。
+- SQLite sidecar (`-journal` / `-wal` / `-shm`) は `entries` tier から除外する。任意の
+  process が transaction を開くだけで出現・消滅し、**guard 自身の read も含む**ため。
+- row の内容は比較せず row 数を比較する。operator の cockpit が既存 row の timestamp を
+  継続的に更新するため。**この 2 つの carve-out で見逃す形は、いずれも hook が作用前に
+  拒否する**ので、acceptance の根拠が carve-out に依存しない。
+- guarded tier は operator 自身の live cockpit も動かし得る (lane 起動が registry へ 1 行)。
+  guard は出所を判定せず tier を報告する。red の attribution は人間が行う。
 
-### 意図的な carve-out (false positive を作らないため)
+## hook が届かない面の catalog (j#100410 item 3)
 
-- **SQLite sidecar file (`-journal` / `-wal` / `-shm`) は `entries` tier から除外する。**
-  任意の process が transaction を開くだけで出現・消滅する — guard 自身の read も含めて。
-  presence を比較すると operator の稼働中 cockpit (や guard 自身) を test の write として
-  報告する。committed state は `schema` / `identity` tier が一貫複写経由で読む。
-- **row の内容は比較しない。row 数を比較する。** operator の cockpit は既存 row の
-  `last_seen` / `updated_at` を継続的に更新する。content digest はそれを test の write
-  として flag し、guard は 1 週間で切られる。append (= #14741 の形) は row 数を動かす。
-- **残留 risk**: row 数も schema も動かさない write は検出できない。append は必ず count を
-  動かすので、該当するのは「既存 row を上書きする test」である。現行の 2 形 (#14477 /
-  #14741) はいずれも検出される。この carve-out は本節で明示し、狭める場合は所有 issue に
-  evidence を記録する。
-- **false negative の残り**: guard の粒度は「run 単位」である。差分を報告して run を red に
-  するが、write そのものを OS 層で阻止しない。
-- **false positive の残り**: guarded tier は operator 自身の live cockpit が動かすこともある
-  (lane 起動が registry へ 1 行足す、lock file が現れる)。それは guard の誤りではなく、
-  **まさに guard が対象にしている形**が別 actor から来た場合である。red になったら差分の
-  tier を読み、write の出所を判定する (guard は自動で判定しない)。
+`sys.executable` 経由の child は hook を継承する。次は継承しない:
 
-### 各層がどこまで届くか (誤読防止)
+- **hardcode された `python` / `python3`** — `env={}` では PATH も無く `os.defpath` の
+  system interpreter が選ばれる。**実測: corpus に 0 件。**
+- **test が自前で作る venv の interpreter** — 実測 3 file
+  (`test_scaffold.py` / `test_handoff_typed_outcome_cli_smoke.py` /
+  `test_issue_13733_shard_env_hermetic.py`)。いずれも wheel install / console script の
+  検証で、write 先は自分の temp venv であって mozyo-bridge home ではない。
 
-| 層 | 届く範囲 | 届かない範囲 |
-| --- | --- | --- |
-| env pin | 親 process と、`os.environ` を継承する child / grandchild すべて | 呼び出し側が env を **ゼロから組んだ** child (現行 corpus には explicit `env={...}` を渡す subprocess 呼び出しが多数ある) |
-| process fence | fenced process と、fence env を継承して `mozyo_bridge.shared.paths` を import する child。in-process の `clear=True` には耐える | `mozyo_bridge` を import しない process (git / shell script)、fence env を継承しない from-scratch env の child |
-| snapshot guard | child / grandchild / `multiprocessing` / installed harness / 非 Python process を **一様に**覆う。macOS と Linux CI で同一 | 上記 tier carve-out の範囲 (row 内容 / sidecar) |
-
-3 層は上から順に「防ぐ」→「防ぐ」→「必ず気付く」であり、いずれか 1 層だけを acceptance の
-根拠にしない。
-- **guard は決して修復・削除しない。** 差分を tier 名で報告して run を red にするだけで、
-  operator 共有 state の disposition は人間が決める (#14757 non-goals: downgrade / raw
-  repair / hand edit)。
+両方を `InterpreterBypassCatalogTest` が機械的に検査する。**新しい bypass spawn が入ると
+test が落ちる**ので、silent に穴が広がらない。これは syntactic な tripwire であり、
+列挙された file が安全であることの証明ではない (その判断は各 test の著者が持つ)。
 
 ## 3 つの入口 (どれも同じ fence を使う)
 
 | command | 何が isolated になるか |
 | --- | --- |
-| `mozyo-bridge tests run [-- <unittest args>]` | focused / full の正規入口。fence 下の child で **literal** `python -m unittest <args>` を走らせる (引数省略時 `discover -s tests`)。test 集合と verdict は serial 正本そのもの — 再実装ではない |
+| `mozyo-bridge tests run [-- <unittest args>]` | focused / full の正規入口。**task venv の interpreter**で **literal** `python -m unittest <args>` を走らせる (引数省略時 `discover -s tests`)。test 集合と verdict は serial 正本そのもの — 再実装ではない |
 | `mozyo-bridge tests profile` | in-process discovery なので、handler が最初に自分自身を fenced child へ re-exec する。CI full lane の入口はこれなので、CI も同時に isolated になる |
 | `mozyo-bridge tests parallel` | shard は既に isolated だったが **parent** の authoritative discovery が operator home 解決下で全 test module を import していた。parent も自分自身を re-exec し、shard はその fence を継承する |
 
@@ -180,6 +218,12 @@ divergence であり、oversight ではない。
 
 3 入口すべてが `--no-isolate` を持つ。fence も guard も張らずに走り、stderr に
 「これは verification record ではない」と告知する。**通常の verification でこれを選ばない。**
+
+**CI / pre-commit / release verification / documented standard command からは選ばない**
+(j#100402 item 3)。pre-commit hook は `tests run` を持たない CLI を解決した場合、repo 同梱
+source CLI へ切替を試み、それも不可なら **hook を fail させる** — R1 の「warning を出して
+非隔離 `python -m unittest` へ fallback」は review j#100408 finding_3 で退けられた。warning は
+shared-home mutation を防がない。
 
 ## 対象 inventory (acceptance 6)
 
@@ -224,6 +268,9 @@ operator state へ合わせること)。
 - **green な suite は隔離の証拠ではない。** run の verdict は suite verdict **と** home guard
   の連言である。片方だけを報告しない。
 - **guard は read-only。** operator 共有 state を修復・削除・downgrade しない。
+- **拒否層の install 失敗は run の拒否である。** 検証できない run を「隔離済み」と報告しない。
+- **injection channel は「拒否が起きたか」で検証する。** 「module が読まれたか」で判定すると
+  棄却案 2 の failure mode (shadow されて無防備なのに成功報告) を再生産する。
 - **`immutable=1` を mutable evidence に使わない。** 読めなければ `unreadable` として fail する。
 - **`HOME` を隔離の道具にしない。** 隔離は canonical resolver が担う。
 - **production は unfenced のまま。** fence env の無い process の home 解決は byte-invariant。
@@ -231,7 +278,9 @@ operator state へ合わせること)。
 ## 正本実装
 
 - pure core: `src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/domain/test_home_isolation.py`
-  (pin の決定 / snapshot 値オブジェクト / tier 比較 / run outcome の合成)。
+  (pin の決定 / snapshot 値オブジェクト / tier 比較 / deny ledger / run outcome の合成)。
+- 作用前拒否: `.../application/test_home_audit_hook.py` (task venv + `.pth` + audit hook
+  生成 / install 検証)。
 - resolver 側 fence: `src/mozyo_bridge/shared/paths.py` (`HomeFence` /
   `OperatorHomeFenceViolation` / `mozyo_bridge_home`)。
 - I/O: `.../application/test_home_fence.py` (task root 生成 / consistent snapshot / re-exec)。

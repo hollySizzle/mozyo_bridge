@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import itertools
 import json
+import re
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -28,8 +30,14 @@ sys.path.insert(0, str(ROOT / "src"))
 SRC = str(ROOT / "src")
 
 from mozyo_bridge.application.cli import main  # noqa: E402
+from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.commands_test_run import (  # noqa: E402,E501
+    guarded_isolated_run,
+)
+from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.test_home_audit_hook import (  # noqa: E402,E501
+    install_audit_fence,
+)
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.test_home_fence import (  # noqa: E402,E501
-    snapshot_home,
+    read_deny_ledger,
 )
 from mozyo_bridge.shared.paths import (  # noqa: E402
     HOME_FENCE_DENY_ENV,
@@ -246,49 +254,133 @@ class FenceReachesTheProcessThatRunsTheTestsTest(unittest.TestCase):
         )
 
 
-class GuardTurnsAGreenSuiteRedTest(unittest.TestCase):
-    def test_a_write_into_the_guarded_home_fails_the_run(self) -> None:
-        """#14477's shape: passing tests, mutated shared state, reported as PASS.
+class WritesAreRefusedBeforeTheyLandTest(unittest.TestCase):
+    """R2: the attempt is refused, not detected afterwards (j#100407 R1-F1).
 
-        The fence is switched off with ``--no-isolate`` so the writer actually
-        reaches the guarded home; the guard around it is what must refuse. Run
-        directly rather than through ``tests run`` (whose own escape hatch drops
-        the guard too), so the guard is the only thing under test.
+    R1 shipped a test here that let a row land in the guarded home and asserted the
+    run went red with the row still there. Review j#100407 R1-F1 rejected that
+    reading of acceptance 4/7, so the semantics it pinned are gone and these pin the
+    replacement: the write raises `PermissionError` inside the child and the bytes
+    on disk are untouched.
+    """
+
+    def test_a_cleared_env_child_is_refused_and_the_bytes_are_unchanged(self) -> None:
+        """The exact case j#100410 measured as uncovered by the discarded design.
+
+        `env={}` strips every pin, so the refusal has to come from the interpreter
+        itself. Both halves are asserted: the child fails, AND the target file still
+        holds its original bytes -- "the run went red" alone is what R1 did.
         """
-        from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.commands_test_run import (  # noqa: E501
-            guarded_isolated_run,
-        )
-        import subprocess
+        with tempfile.TemporaryDirectory() as task:
+            home = Path(task) / "operator-home"
+            home.mkdir()
+            victim = home / "coordinator-placement.yaml"
+            victim.write_text("original\n", encoding="utf-8")
+            before = victim.read_bytes()
 
-        fixture = _Fixture(self, _WRITER_MODULE)
-        before = snapshot_home(fixture.guarded_home)
+            interpreter, _ledger = install_audit_fence(
+                Path(task), denied_homes=(home,)
+            )
+            code = (
+                "import sys\n"
+                f"open({str(victim)!r}, 'w').write('MUTATED')\n"
+            )
+            proc = subprocess.run(
+                [str(interpreter), "-c", code], env={}, capture_output=True, text=True
+            )
+            # Read inside the context: the temp tree is gone once it exits.
+            after = victim.read_bytes()
 
-        def child(_layout, env) -> int:
-            # Deliberately unfenced-in-effect: point the child at the guarded
-            # home, which is what an un-isolated test process would have done.
-            leaky = dict(env)
-            leaky["MOZYO_BRIDGE_HOME"] = str(fixture.guarded_home)
-            leaky.pop(HOME_FENCE_ROOT_ENV, None)
-            leaky.pop(HOME_FENCE_DENY_ENV, None)
-            return subprocess.run(
-                [sys.executable, "-m", "unittest", "discover", "-s", "tests"],
-                cwd=str(fixture.repo),
-                env=leaky,
-                capture_output=True,
-            ).returncode
+        self.assertNotEqual(proc.returncode, 0, "the write was allowed")
+        self.assertIn("PermissionError", proc.stderr)
+        self.assertEqual(before, after, "the file was mutated")
 
-        outcome = guarded_isolated_run(
-            repo_root=fixture.repo, child=child, guarded_home=fixture.guarded_home
-        )
-        self.assertTrue(outcome.suite_success, "the fixture suite itself should pass")
-        self.assertFalse(outcome.success)
-        self.assertFalse(outcome.guard.unchanged)
-        self.assertTrue(
-            any("operator shared home changed" in r for r in outcome.all_reasons)
-        )
-        # The guard reports; it never repairs. The leaked row is still there.
-        after = snapshot_home(fixture.guarded_home)
-        self.assertNotEqual(before.identity_digest, after.identity_digest)
+    def test_an_in_place_sqlite_row_update_is_refused(self) -> None:
+        """finding_1's hardest shape: same row count, same ids, changed contents.
+
+        The snapshot cannot see this (that is the finding). Refusal does not need to
+        see it -- it never gets to happen.
+        """
+        with tempfile.TemporaryDirectory() as task:
+            home = Path(task) / "operator-home"
+            home.mkdir()
+            store = home / "registry.sqlite"
+            conn = sqlite3.connect(store)
+            try:
+                conn.execute("CREATE TABLE workspaces (workspace_id TEXT, seen TEXT)")
+                conn.execute("INSERT INTO workspaces VALUES ('ws-1','t0')")
+                conn.commit()
+            finally:
+                conn.close()
+            before = store.read_bytes()
+
+            interpreter, _ledger = install_audit_fence(
+                Path(task), denied_homes=(home,)
+            )
+            code = (
+                "import sqlite3\n"
+                f"c = sqlite3.connect({str(store)!r})\n"
+                "c.execute(\"UPDATE workspaces SET seen='t1'\")\n"
+                "c.commit()\n"
+            )
+            proc = subprocess.run(
+                [str(interpreter), "-c", code], env={}, capture_output=True, text=True
+            )
+            after = store.read_bytes()
+
+        self.assertNotEqual(proc.returncode, 0, "the in-place update was allowed")
+        self.assertEqual(before, after, "the store was mutated")
+
+    def test_an_attempt_is_recorded_so_the_run_fails_even_though_it_was_refused(
+        self,
+    ) -> None:
+        """A refused attempt is still a defect; the ledger is what surfaces it."""
+        with tempfile.TemporaryDirectory() as task:
+            home = Path(task) / "operator-home"
+            home.mkdir()
+            interpreter, ledger = install_audit_fence(
+                Path(task), denied_homes=(home,)
+            )
+            ledger.write_text("", encoding="utf-8")
+            code = (
+                "try:\n"
+                f"    open({str(home / 'x.txt')!r}, 'w')\n"
+                "except PermissionError:\n"
+                "    pass\n"
+            )
+            subprocess.run([str(interpreter), "-c", code], env={}, capture_output=True)
+            recorded = read_deny_ledger(ledger)
+        self.assertFalse(recorded.clean)
+        self.assertTrue(any("x.txt" in a for a in recorded.attempts))
+
+    def test_a_missing_ledger_is_a_failure_not_an_absence(self) -> None:
+        """\"No ledger\" must not read as \"nothing attempted\"."""
+        with tempfile.TemporaryDirectory() as task:
+            self.assertTrue(read_deny_ledger(Path(task) / "never-written.jsonl").missing)
+            self.assertFalse(read_deny_ledger(Path(task) / "never-written.jsonl").clean)
+
+    def test_every_denied_home_is_guarded_not_just_the_effective_one(self) -> None:
+        """finding_2: the deny set and the guard set are now the same set."""
+        with tempfile.TemporaryDirectory() as task:
+            first = Path(task) / "home-a"
+            second = Path(task) / "home-b"
+            for home in (first, second):
+                home.mkdir()
+
+            def child(_layout, _env, _interpreter) -> int:
+                # Simulate an un-hooked writer reaching the SECOND home -- the one
+                # R1 denied but never snapshotted.
+                (second / "leaked.txt").write_text("x", encoding="utf-8")
+                return 0
+
+            outcome = guarded_isolated_run(
+                repo_root=Path(task), child=child, guarded_homes=(first, second)
+            )
+        self.assertEqual(len(outcome.guards), 2)
+        self.assertTrue(outcome.suite_success)
+        self.assertFalse(outcome.success, "a write to the second home was not caught")
+        self.assertTrue(any(not g.unchanged for g in outcome.guards))
+
 
     def test_a_clean_run_reports_the_home_unchanged(self) -> None:
         fixture = _Fixture(self, _PASS_MODULE)
@@ -297,7 +389,7 @@ class GuardTurnsAGreenSuiteRedTest(unittest.TestCase):
             guarded_home=fixture.guarded_home,
         )
         self.assertEqual(code, 0)
-        self.assertIn("operator shared home: unchanged", out)
+        self.assertIn("unchanged", out)
 
     def test_a_failing_suite_is_red_even_with_an_untouched_home(self) -> None:
         fixture = _Fixture(
@@ -311,7 +403,7 @@ class GuardTurnsAGreenSuiteRedTest(unittest.TestCase):
             guarded_home=fixture.guarded_home,
         )
         self.assertEqual(code, 1)
-        self.assertIn("operator shared home: unchanged", out)
+        self.assertIn("unchanged", out)
         self.assertIn("result: FAIL", out)
         # The fixture's intentional failure is expected on the child's stderr;
         # asserted here rather than leaked to the parent terminal.
@@ -327,7 +419,8 @@ class GuardTurnsAGreenSuiteRedTest(unittest.TestCase):
         payload = json.loads(out)
         self.assertTrue(payload["success"])
         self.assertTrue(payload["suite_success"])
-        self.assertTrue(payload["home_guard"]["unchanged"])
+        self.assertTrue(all(g["unchanged"] for g in payload["home_guards"]))
+        self.assertTrue(payload["deny_ledger"]["clean"])
 
 
 class IsolatedByDefaultThroughTheCliTest(unittest.TestCase):
@@ -397,7 +490,7 @@ class IsolatedByDefaultThroughTheCliTest(unittest.TestCase):
                 )
                 self.assertEqual(code, 0)
                 payload = json.loads(out)  # one document, not two
-                self.assertTrue(payload["home_guard"]["unchanged"])
+                self.assertTrue(all(g["unchanged"] for g in payload["home_guards"]))
                 self.assertTrue(payload["fence_root"])
                 self.assertTrue(payload["success"])
 
@@ -423,6 +516,87 @@ class IsolatedByDefaultThroughTheCliTest(unittest.TestCase):
                     guarded_home=fixture.guarded_home,
                 )
                 self.assertEqual(code, 0)
+
+
+
+
+class InterpreterBypassCatalogTest(unittest.TestCase):
+    """What the refusal hook cannot reach, enumerated (j#100410 item 3).
+
+    The hook is armed by *this* interpreter, so it rides along only where the
+    fenced interpreter does. Two shapes escape it, and the point of these tests is
+    that the suite cannot acquire a new one *silently*: a spawn that bypasses the
+    fence must show up as a failure here and be dispositioned, rather than quietly
+    widening the gap while the rail still reports isolation.
+
+    Deliberately syntactic. These are tripwires over the corpus, not a proof that
+    the listed files are safe — that judgement stays with each test's author.
+    """
+
+    #: Tests that build their own virtualenv. Their interpreters do not carry the
+    #: hook. Each is a wheel-install / console-script test whose writes land in its
+    #: own temp venv, not in a mozyo-bridge home; that is why they are allowed.
+    #: Adding an entry is a deliberate act with a reason, not a silent drift.
+    KNOWN_VENV_BUILDERS = frozenset(
+        {
+            "tests/integration/e_130_governance_distribution/f_120_scaffold_preset/test_scaffold.py",
+            "tests/integration/e_110_execution_platform/f_130_handoff_routing/test_handoff_typed_outcome_cli_smoke.py",
+            "tests/regressions/test_issue_13733_shard_env_hermetic.py",
+        }
+    )
+
+    @staticmethod
+    def _test_sources() -> list[Path]:
+        """Every test source except this file.
+
+        This module is excluded because it *names* the patterns it searches for, so
+        it matches its own detector. Excluding the catalog is narrower than
+        loosening the pattern: a real offender elsewhere still trips.
+        """
+        me = Path(__file__).resolve()
+        return [
+            path
+            for path in sorted((ROOT / "tests").rglob("*.py"))
+            if path.resolve() != me
+        ]
+
+    def test_no_test_spawns_a_bare_python_interpreter(self) -> None:
+        """A hardcoded `python` / `python3` bypasses the fence entirely.
+
+        With `env={}` there is no PATH either, so `subprocess` falls back to
+        `os.defpath` and reaches the *system* interpreter — which has no hook and no
+        pins. Every spawn must go through `sys.executable` so it inherits the fenced
+        interpreter. Measured at this commit: zero occurrences.
+        """
+        pattern = re.compile(r"""\[\s*["']python3?["']""")
+        offenders = []
+        for path in self._test_sources():
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for number, line in enumerate(text.splitlines(), start=1):
+                if pattern.search(line):
+                    offenders.append(f"{path.relative_to(ROOT)}:{number}")
+        self.assertEqual(
+            offenders,
+            [],
+            "these spawn a bare interpreter, which does not carry the write-refusal "
+            "hook; use sys.executable so the fenced interpreter is inherited "
+            f"(Redmine #14757): {offenders}",
+        )
+
+    def test_the_set_of_venv_building_tests_is_the_known_set(self) -> None:
+        """A new self-built venv is a new un-hooked interpreter; decide it openly."""
+        builders = set()
+        for path in self._test_sources():
+            text = path.read_text(encoding="utf-8", errors="replace")
+            if "EnvBuilder" in text or re.search(r'"-m",\s*"venv"', text):
+                builders.add(str(path.relative_to(ROOT)))
+        self.assertEqual(
+            builders,
+            set(self.KNOWN_VENV_BUILDERS),
+            "the set of tests that build their own (un-hooked) interpreter changed. "
+            "Confirm the new one cannot write a mozyo-bridge home, then add it to "
+            "KNOWN_VENV_BUILDERS with that reason (Redmine #14757 / j#100410 item 3)",
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -92,6 +92,11 @@ HOME_FENCE_ROOT_ENV = "MOZYO_BRIDGE_TEST_HOME_FENCE"
 HOME_FENCE_DENY_ENV = "MOZYO_BRIDGE_TEST_HOME_DENY"
 #: Separator for the (possibly multiple) denied roots in `HOME_FENCE_DENY_ENV`.
 HOME_FENCE_DENY_SEPARATOR = os.pathsep
+#: Append-only ledger the injected audit hook writes refused write attempts to
+#: (Redmine #14757 R2, review j#100407 R1-F1). Read by the runner, which fails the
+#: run when it is non-empty or missing — an attempt that was refused is still an
+#: isolation failure worth surfacing, and "no ledger" must not read as "no attempt".
+HOME_FENCE_LEDGER_ENV = "MOZYO_BRIDGE_TEST_DENY_LEDGER"
 
 
 class OperatorHomeFenceViolation(RuntimeError):

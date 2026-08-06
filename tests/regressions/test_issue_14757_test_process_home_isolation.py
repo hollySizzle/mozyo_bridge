@@ -343,9 +343,9 @@ class IsolationEnvContractTest(unittest.TestCase):
         """
         with TemporaryDirectory() as task:
             base = {"HOME": "/operator/home", "PATH": "/usr/bin"}
-            layout, env = isolated_env(
+            layout, env, _interpreter, _ledger = isolated_env(
                 Path(task),
-                denied_homes=(Path("/operator/home/.mozyo_bridge"),),
+                denied_homes=(Path(task) / "denied-home",),
                 base_env=base,
             )
             self.assertEqual(env["HOME"], "/operator/home")
@@ -363,7 +363,7 @@ class IsolationEnvContractTest(unittest.TestCase):
                 env[shared_paths.HOME_FENCE_ROOT_ENV], str(layout.home)
             )
             self.assertIn(
-                "/operator/home/.mozyo_bridge",
+                str(Path(task) / "denied-home"),
                 env[shared_paths.HOME_FENCE_DENY_ENV],
             )
             for directory in layout.directories:
@@ -372,8 +372,8 @@ class IsolationEnvContractTest(unittest.TestCase):
     def test_the_child_env_drops_the_live_lane_pins(self) -> None:
         with TemporaryDirectory() as task:
             base = {key: "live" for key in LIVE_LANE_ENV_KEYS}
-            _layout, env = isolated_env(
-                Path(task), denied_homes=(Path("/nowhere"),), base_env=base
+            _layout, env, _interpreter, _ledger = isolated_env(
+                Path(task), denied_homes=(Path(task) / "denied-home",), base_env=base
             )
             for key in LIVE_LANE_ENV_KEYS:
                 self.assertNotIn(key, env)

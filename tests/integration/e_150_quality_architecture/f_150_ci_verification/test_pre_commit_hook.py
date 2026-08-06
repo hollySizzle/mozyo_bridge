@@ -125,16 +125,21 @@ class PreCommitHookTest(unittest.TestCase):
         proc = self._hook()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         combined = proc.stdout + proc.stderr
-        self.assertIn("operator shared home: unchanged", combined)
+        self.assertIn("-- unchanged", combined)
+        self.assertIn("refused write attempts: none", combined)
         self.assertNotIn("NON-ISOLATED", combined)
 
-    def test_a_cli_without_tests_run_warns_loudly_and_still_runs(self) -> None:
-        """A stale installed CLI must not break every commit — but must be loud.
+    def test_a_stale_cli_falls_back_to_the_repo_source_cli_and_stays_isolated(
+        self,
+    ) -> None:
+        """A stale installed CLI must not cost isolation (#14757 j#100408 finding_3).
 
-        The hook prefers an installed `mozyo-bridge` on PATH over this repo's own
-        source (#13079), so the resolved CLI can predate `tests run`. Falling back
-        is correct for a hook that never blocks on infrastructure, but the fallback
-        is UNISOLATED, so silence would misrepresent it as a verified run.
+        The hook prefers an installed `mozyo-bridge` on PATH over this repo's source
+        (#13079), so the resolved CLI can predate `tests run`. R1 fell back to a bare
+        `python -m unittest` with a warning; the review rejected that, because a
+        warning does not prevent a shared-home mutation. The hook now reaches for the
+        repo's own committed CLI, which necessarily has the subcommand, and the run
+        stays isolated.
         """
         stale = self.repo / "stale-mozyo"
         stale.write_text(
@@ -158,8 +163,45 @@ class PreCommitHookTest(unittest.TestCase):
         proc = _run(["sh", str(HOOK)], self.repo, env=env)
         combined = proc.stdout + proc.stderr
         self.assertEqual(proc.returncode, 0, combined)
-        self.assertIn("has no `tests run` subcommand", combined)
-        self.assertIn("NON-ISOLATED", combined)
+        self.assertIn("trying this repo's source CLI", combined)
+        # It ran isolated, not un-isolated: the fence reported in.
+        self.assertIn("-- unchanged", combined)
+        self.assertNotIn("NON-ISOLATED", combined)
+
+    def test_with_no_isolating_cli_available_at_all_the_hook_fails_closed(self) -> None:
+        """The end of the line is a failed hook, never an un-isolated run.
+
+        The repo-source fallback is reached through the hook's own location, so this
+        copies the hook somewhere with no `../src/mozyo_bridge` beside it and hands it
+        a stale CLI. With no way left to isolate, the hook must block the commit
+        rather than run the tests anyway (j#94599 / j#100402 item 3).
+        """
+        detached = self.repo / "detached-hook.sh"
+        detached.write_text(HOOK.read_text(encoding="utf-8"), encoding="utf-8")
+        stale = self.repo / "stale-mozyo"
+        stale.write_text(
+            "#!/bin/sh\n"
+            "case \"$1 $2\" in\n"
+            "  'tests resolve') printf 'tests/test_ok.py\\n'; exit 0 ;;\n"
+            "  'tests run') echo \"error: invalid choice: 'run'\" >&2; exit 2 ;;\n"
+            "esac\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        stale.chmod(0o755)
+        self._stage(
+            "tests/test_ok.py",
+            "import unittest\n\n\n"
+            "class OkTest(unittest.TestCase):\n"
+            "    def test_ok(self):\n"
+            "        self.assertTrue(True)\n",
+        )
+        env = dict(self.env, MOZYO_BRIDGE_CMD=str(stale))
+        proc = _run(["sh", str(detached)], self.repo, env=env)
+        combined = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0, combined)
+        self.assertIn("cannot be isolated", combined)
+        self.assertNotIn("NON-ISOLATED", combined)
 
     def test_clean_stage_with_no_targets_passes(self) -> None:
         # Nothing staged -> the resolver fail-closes to full (empty change
