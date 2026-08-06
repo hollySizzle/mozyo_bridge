@@ -78,7 +78,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     HEALTH_HEALTHY,
     HEALTH_NOT_PROBED,
     HEALTH_OUTCOMES,
-    HEALTH_SHELL_RESIDUE,
+    HEALTH_PROVIDER_EXITED,
 )
 
 
@@ -483,21 +483,27 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
         )
         self.assertIn("booting provider from shell residue", detail)
 
-    def test_every_health_verdict_the_probe_can_write_is_read_as_settled(self):
-        """The whole health axis, not the two tokens the fix happened to need.
+    def test_only_an_admitted_launch_places_a_column(self):
+        """Review j#100188 finding_1 — measured at 6 live pane moves per token.
 
-        The guard asks whether the canonical pass has RUN. Only ``not_probed``
-        answers "no"; every other member of the closed vocabulary is a verdict it
-        wrote, so every one of them must let the read through — otherwise the
-        ordering guard would quietly become a second, weaker liveness gate.
+        The first cut asked whether the canonical pass had RUN and let every
+        verdict it wrote through. But the authority exempts this run's own panes
+        from the startup attestation (that fact was unanswerable when the geometry
+        ran first), so an own-side ``attestation_mismatch`` / ``locator_drift`` /
+        ``provider_exited`` is not reconstructible from the next inventory read —
+        the pair was reflowed and only afterwards reported not ok.
+
+        The admitted set is the domain contract's own: ``healthy`` alone. The table
+        is the whole non-admitting vocabulary and asserts that it is the whole one,
+        because a sample would not have caught the token that was missing.
         """
-        settled = sorted(HEALTH_OUTCOMES - {HEALTH_NOT_PROBED})
+        refused = sorted(HEALTH_OUTCOMES - {HEALTH_HEALTHY})
         self.assertEqual(
             sorted(HEALTH_OUTCOMES),
-            sorted(settled + [HEALTH_NOT_PROBED]),
+            sorted(refused + [HEALTH_HEALTHY]),
             "the table must cover the health vocabulary, not a sample of it",
         )
-        for verdict in settled:
+        for verdict in refused:
             with self.subTest(health=verdict):
                 env = _Env(self, PROJECT_A, PROJECT_B)
                 tab = env.herdr.new_tab()
@@ -506,8 +512,58 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
                 outcome, detail = env.run(
                     env.result(PROJECT_B, list(launched), health=verdict)
                 )
-                self.assertNotIn("startup-liveness pass", detail)
-                self.assertEqual(outcome, COLUMN_APPLIED, detail)
+                self.assertEqual(outcome, COLUMN_FAILED, detail)
+                self.assertIn("no live pane was moved", detail)
+                self.assertEqual(env.moves(), [])
+                # Each refusal names ITS OWN cause: `not_probed` is the pass not
+                # having answered, everything else is the answer it gave.
+                if verdict == HEALTH_NOT_PROBED:
+                    self.assertIn("the startup-liveness pass has not settled", detail)
+                else:
+                    self.assertIn("did not pass startup admission", detail)
+                    self.assertIn(verdict, detail)
+
+    def test_an_unadmitted_first_project_reports_failed_not_not_applicable(self):
+        """A measured consequence of refusing before the read, pinned deliberately.
+
+        Whether a column is owed at all is a fact about the WORKSPACE, so it needs
+        the inventory read this guard is placed in front of. A run that may not
+        take that read cannot claim ``not_applicable`` — that would assert
+        something it did not establish — so the only pair in the workspace still
+        reports ``failed`` when its own launch was not admitted. It costs zero
+        moves and the run is already reporting failure on the health axis, so this
+        is a second true line about one failed launch, not the j#100135 shape
+        (there the pair was HEALTHY and the column axis invented a cause).
+        """
+        env = _Env(self, PROJECT_A)
+        tab = env.herdr.new_tab()
+        (pair,) = env.seed_columns(tab, (PROJECT_A, ""))
+        admitted = env.run(env.result(PROJECT_A, pair, health=HEALTH_HEALTHY))
+        self.assertEqual(admitted[0], COLUMN_NOT_APPLICABLE, admitted[1])
+        env = _Env(self, PROJECT_A)
+        tab = env.herdr.new_tab()
+        (pair,) = env.seed_columns(tab, (PROJECT_A, ""))
+        outcome, detail = env.run(
+            env.result(PROJECT_A, pair, health=HEALTH_PROVIDER_EXITED)
+        )
+        self._assert_zero_move_failure(env, outcome, detail, "startup admission")
+
+    def test_an_admitted_launch_is_the_positive_control(self):
+        """The one token that admits — and it must actually move panes.
+
+        Paired with the table above so the guard is shown separating inputs rather
+        than merely refusing: the same scenario, the same fixture, one axis
+        changed, and the effect the whole issue exists to produce still happens.
+        """
+        env = _Env(self, PROJECT_A, PROJECT_B)
+        tab = env.herdr.new_tab()
+        env.seed_columns(tab, (PROJECT_A, ""))
+        launched = env.append_pair(tab, PROJECT_B)
+        outcome, detail = env.run(
+            env.result(PROJECT_B, list(launched), health=HEALTH_HEALTHY)
+        )
+        self.assertEqual(outcome, COLUMN_APPLIED, detail)
+        self.assertTrue(env.moves(), "the admitted control must still reflow")
 
     def test_a_malformed_health_value_is_not_promoted_to_a_settled_verdict(self):
         """`_norm` is ``str(value).strip()``, so a non-token would read as settled.
@@ -544,14 +600,15 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
         )
         self.assertEqual(outcome, COLUMN_APPLIED, detail)
 
-    def test_a_settled_but_unhealthy_verdict_still_reaches_the_inventory(self):
-        """The guard is about the pass having RUN, not about its verdict.
+    def test_an_admitted_launch_is_still_judged_by_the_inventory(self):
+        """Admission is a precondition, not a replacement for the workspace read.
 
-        A slot the pass settled as shell residue has been decided, so the read is
-        not premature — and the pane's own inventory row, which is what proves
-        liveness here, refuses it on the axis that names it. Reading the health
-        verdict as the liveness proof would move that decision out of the
-        workspace, where the foreign panes are judged, and into this run's report.
+        A green startup verdict says this run's launch came up; it does not say
+        what the pane looks like now. Promoting it to the liveness proof would move
+        that decision out of the workspace — where the foreign panes are judged —
+        and into this run's own report, leaving the two halves of one pair proved
+        by different authorities. So an admitted pair whose inventory row is
+        residue is still refused, on the inventory's axis.
         """
         env = _Env(self, PROJECT_A, PROJECT_B)
         tab = env.herdr.new_tab()
@@ -559,7 +616,7 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
         launched = env.append_pair(tab, PROJECT_B)
         env.herdr.stale_panes.add(launched[0])
         outcome, detail = env.run(
-            env.result(PROJECT_B, list(launched), health=HEALTH_SHELL_RESIDUE)
+            env.result(PROJECT_B, list(launched), health=HEALTH_HEALTHY)
         )
         self._assert_zero_move_failure(env, outcome, detail, "is shell residue")
 

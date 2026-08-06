@@ -54,11 +54,14 @@ Boundary — narrow, launch-time, verified (j#99845)
 - **Every placement is explicitly targeted.** Each step passes ``--target-pane``,
   so the result does not depend on which pane happened to be active before the
   launch (j#99845: "起動前focus非依存").
-- **Only after the canonical startup-liveness pass has settled.** A booting pane
-  and a dead one report the same inventory row, so this pass reads the workspace
-  only once the bounded startup probe (#13948) has turned that ambiguity into a
-  verdict — see :func:`_premature_read_refusal`, which refuses the read rather
-  than judging it (#14996 R3, live finding j#100135).
+- **Only after the canonical startup pass has settled, and only if it admitted
+  this run's own launch.** A booting pane and a dead one report the same inventory
+  row, so this pass reads the workspace only once the bounded startup probe
+  (#13948) has turned that ambiguity into a verdict (:func:`_premature_read_refusal`
+  — #14996 R3, live finding j#100135); and because the authority exempts own panes
+  from the startup attestation, a verdict that is not ``healthy`` refuses the whole
+  step before the read rather than being lost (:func:`_unadmitted_launch_refusal` —
+  review j#100188 finding_1, which measured six live pane moves without it).
 - **Fail closed, and say what is still detached.** A refused step stops the
   sequence, best-effort re-attaches whatever this run had detached, and reports
   :data:`COLUMN_FAILED`. A pane that vanished, a temp tab that cannot be
@@ -104,6 +107,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _norm,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_health import (  # noqa: E501
+    HEALTH_HEALTHY,
     HEALTH_NOT_PROBED,
     HEALTH_OUTCOMES,
 )
@@ -486,6 +490,50 @@ def _is_settled_health(value: object) -> bool:
     )
 
 
+def _unadmitted_launch_refusal(launched_slots: Sequence[object]) -> str:
+    """Refuse to move live panes for a launch that did not pass startup admission.
+
+    Distinct from the ordering question above: the pass has RUN, and it said no.
+
+    Why this run's own verdict has to be a precondition here, when foreign panes
+    are judged from the workspace instead: the authority deliberately exempts this
+    run's own panes from the startup attestation, because a just-launched slot
+    could not yet answer it (review j#99931 finding_1). Moving the geometry pass
+    after pass 3 made it answerable — so keeping the exemption while declining to
+    read the verdict would exempt the fact twice. An own-side
+    ``attestation_mismatch`` / ``locator_drift`` / ``provider_exited`` is not
+    reconstructible from the next inventory read, and the measured result was six
+    live pane moves on a launch the run itself went on to report as not ok
+    (review j#100188 finding_1, reproduced here).
+
+    The admitted set is exactly ``{HEALTH_HEALTHY}`` — a closed policy, not a
+    carve-out list. :mod:`...domain.startup_health` states it: "Only
+    ``HEALTH_HEALTHY`` is a positive success verdict", and an unwrapped launch is
+    ``attestation_unavailable`` precisely so it cannot read as green. Tokens that
+    look merely informational (``startup_evidence_unavailable``,
+    ``attestation_unavailable``) are included for that reason: each one already
+    makes ``SessionStartResult.ok`` false, so admitting it here would only mean
+    causing a live geometry effect for a run that is reporting failure anyway.
+    Nothing is killed either way; the pair stays live and its placement is what
+    the run declines to change.
+    """
+    unadmitted = sorted(
+        (_norm(getattr(slot, "locator", "")), getattr(slot, "health", ""))
+        for slot in launched_slots
+        if _norm(getattr(slot, "locator", ""))
+        and _is_settled_health(getattr(slot, "health", None))
+        and getattr(slot, "health", "") != HEALTH_HEALTHY
+    )
+    if not unadmitted:
+        return ""
+    named = ", ".join(f"{locator!r} ({health})" for locator, health in unadmitted)
+    return (
+        f"this run's own launch did not pass startup admission — pane(s) {named}; "
+        "refusing to place a column for a launch the startup pass did not admit; "
+        "no live pane was moved"
+    )
+
+
 def _premature_read_refusal(launched_slots: Sequence[object]) -> str:
     """Refuse to read the inventory before the canonical liveness pass settled.
 
@@ -580,7 +628,12 @@ def reflow_project_columns(
     launched_slots = tuple(
         slot for slot in result.slots if getattr(slot, "outcome", "") == SLOT_LAUNCHED
     )
-    refusal = _premature_read_refusal(launched_slots)
+    # Two questions about this run's own launch, in the only order they compose in:
+    # whether the canonical pass has answered at all, then what it answered. Both
+    # land before the inventory read, so either costs zero pane moves.
+    refusal = _premature_read_refusal(launched_slots) or _unadmitted_launch_refusal(
+        launched_slots
+    )
     if refusal:
         return COLUMN_FAILED, refusal
     own_slots = tuple(

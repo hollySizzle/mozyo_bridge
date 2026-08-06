@@ -2350,7 +2350,11 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             )
         self.assertFalse(any(slot.healthy for slot in second.slots))
         self.assertEqual(second.column_outcome, "failed", second.column_detail)
-        self.assertIn("shell residue", second.column_detail)
+        # The pass ran and did not admit the launch, so the refusal names THAT —
+        # the run's own verdict — rather than re-deriving residue from the row it
+        # was already read off (review j#100188 finding_1).
+        self.assertIn("did not pass startup admission", second.column_detail)
+        self.assertIn("shell_residue", second.column_detail)
         self.assertIn("no live pane was moved", second.column_detail)
         self.assertEqual(herdr.pane_moves, [])
         self.assertFalse(second.ok)

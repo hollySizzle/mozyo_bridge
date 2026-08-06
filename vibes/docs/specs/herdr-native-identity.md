@@ -1256,10 +1256,29 @@ relayout を承認し、**推測ではなく実測で検証すること**を条�
   `pane 'wProjects:p2' is shell residue (its identity outlived its agent)` で、同 run の両 slot は
   `health=healthy`)。順序だけに頼ると位置の入れ替えで黙って再発するため、launched slot が
   `HEALTH_NOT_PROBED` のままの read は **0 move の typed refusal** とし、依存を検査済みにする。
-  この guard が問うのは **pass が走ったか**であって pass の verdict ではない。settled かつ unhealthy な
-  slot の liveness は従来どおり inventory row が決める（health verdict を liveness の証明に使うと、
-  foreign pane を裁いている workspace の外へ判断が移る）。locator を持たない slot は probe の対象に
-  なりえないので本 guard の対象外であり、authority が **その slot の実際の欠陥を名指しする軸**で拒否する。
+  locator を持たない slot は probe の対象になりえないので本 guard の対象外であり、authority が
+  **その slot の実際の欠陥を名指しする軸**で拒否する。
+- **さらに、pass が走っただけでは足りず、pass が本 run の launch を admit していること**。authority は
+  own launched pane の startup attestation を**意図的に免除**している（j#99931 finding_1。launch 直後には
+  まだ答えられない事実だから）。geometry を pass 3 の後へ移した結果その事実は答えられるようになったので、
+  免除を維持したまま verdict を読まないのは**同じ事実を二重に免除する**ことになる。own 側の
+  `attestation_mismatch` / `locator_drift` / `provider_exited` は次の inventory read から再構成できず、
+  実測では **非成功 verdict 全 14 種すべてで `applied` かつ live pane 6 枚移動**した（review j#100188
+  finding_1）。したがって admit 集合は **`{HEALTH_HEALTHY}` のみ**とする closed policy とする。
+  `startup_evidence_unavailable` / `attestation_unavailable`（unwrapped launch）のような一見 reporting-only
+  の token も含める。domain 側が「positive success は `HEALTH_HEALTHY` だけ」と宣言しており、これらは
+  いずれも既に `SessionStartResult.ok` を false にするため、ここで admit しても **失敗を報告している run に
+  live geometry effect を与えるだけ**になる。pane を kill/close はしないので、拒否の代償は placement を
+  変えないことに限られる。
+  **admission は前提条件であって workspace read の代替ではない**: green な startup verdict は「起動した」
+  であって「いま pane がどうなっているか」ではないため、admitted な pair でも inventory row が residue なら
+  従来どおり inventory の軸で拒否する（health を liveness の証明へ昇格させると、1 つの pair の両半分が
+  別々の authority で証明されることになる）。
+- **測定済みの副作用**: 「そもそも column が必要か」は workspace についての事実なので、本 guard が守っている
+  inventory read を必要とする。したがって **workspace 内で唯一の pair であっても、admit されなければ
+  `not_applicable` ではなく `failed`** になる（0 move）。read を取れない run が `not_applicable` を主張するのは
+  確立していない事実の主張になるため。j#100135 の形（**healthy** な pair に column axis が原因を捏造した）
+  とは別物で、こちらは同一の失敗した launch についての 2 行目である。
 - **pane を close / restart / rename しない**ので assigned name / route authority / cwd は不変。
 - 全 placement が `--target-pane` を明示するため、**起動前 focus に依存しない**。
 - 移動する既存 pane は「新 column が split する column の下段 1 枚」だけで、元の相手 pane の直下へ戻す。
