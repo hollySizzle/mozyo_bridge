@@ -87,7 +87,10 @@ hard stop: `.mozyo-bridge/docs/file_conventions.generated.yaml` 等の generator
 
 ## Verification And Commit
 
-- Use focused `python -m unittest ...` targets when `pytest` is unavailable. Do not install packages just to run tests unless the user approves.
+- Run tests through `mozyo-bridge tests run [-- <targets>]` (Redmine #14757): it runs the identical
+  `python -m unittest` invocation inside a task-specific temp root and fails if the operator's shared
+  mozyo-bridge home changed. Use focused targets when `pytest` is unavailable. Do not install packages
+  just to run tests unless the user approves.
 - For scaffold changes, run `mozyo-bridge scaffold status --target .` before commit.
 - For governed catalog changes, run `mozyo-bridge docs validate --repo .` and the relevant generator / coverage checks when `catalog.yaml` exists.
 - Run `git diff --check` or `git diff --cached --check` before commit.

@@ -496,4 +496,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _bare_mozyo_entry(args, argv)
     args = normalize_paths(args)
     _warn_deprecated_alias(args)
+    # The exact argument list this invocation parsed. A handler that has to
+    # re-run *itself* in a differently-configured child process (the test-home
+    # isolation rail, Redmine #14757) replays this instead of reconstructing
+    # arguments from the namespace — and unlike `sys.argv`, it is still correct
+    # when `main()` is called programmatically from a test.
+    args.invoked_argv = list(sys.argv[1:] if argv is None else argv)
     return args.func(args)

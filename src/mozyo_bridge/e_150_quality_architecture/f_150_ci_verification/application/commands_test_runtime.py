@@ -221,7 +221,24 @@ def _run_suite(
 
 
 def cmd_tests_profile(args: argparse.Namespace) -> int:
-    """Run the suite with timing, print a runtime summary, preserve the verdict."""
+    """Run the suite with timing, print a runtime summary, preserve the verdict.
+
+    The discovery is in-process, so an unfenced invocation would resolve the home
+    contract onto the operator's shared home for the whole suite (Redmine
+    #14757). The first thing this handler does is therefore re-run itself inside
+    a fenced child under the operator-home guard; the in-process body below is
+    what that child executes.
+    """
+    # Local import: `commands_test_run` imports this module for its discovery
+    # helpers, so importing it at module scope would be circular.
+    from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.commands_test_run import (
+        isolate_self,
+    )
+
+    isolated = isolate_self(args, label="profile")
+    if isolated is not None:
+        return isolated
+
     repo_root = _repo_root(args)
     budget = _resolve_budget(args, repo_root)
     result, timings = _run_suite(repo_root, args)

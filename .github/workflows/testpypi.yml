@@ -314,6 +314,11 @@ jobs:
         # SAME discovery as `python -m unittest discover -s tests`; the suite
         # verdict drives the exit code. Single Python by design (the 4-version
         # matrix stays the nightly/production tier, Redmine #13734).
+        # Isolated from the operator's / runner's shared mozyo-bridge home
+        # (Redmine #14757): `tests profile` re-execs itself into a process whose
+        # home contract, temp dirs, and XDG roots are pinned to a task-specific
+        # root, and fails the lane if the shared home changed -- even when every
+        # test passed. Identical on macOS and Linux; no OS sandbox involved.
         run: mozyo-bridge tests profile --slowest 20
 
       - name: Install build tools

@@ -43,8 +43,13 @@ single Python (3.12) で以下を順に実行する:
    ```bash
    git fetch --no-tags origin "$BASE_REF:refs/remotes/origin/$BASE_REF"
    mozyo-bridge tests resolve --base "origin/$BASE_REF" --format targets \
-     | xargs python -m unittest
+     | xargs mozyo-bridge tests run --repo . --
    ```
+   focused な選択でも `python -m unittest` を素で呼ばない (Redmine #14757): focused run
+   も full run と同様に operator / runner の共有 mozyo-bridge home へ到達する
+   (#14757 j#94599)。`tests run` は同一の unittest 呼び出しを task-specific temp root 下で
+   行い、共有 home が変化していれば test が全て緑でも lane を red にする。契約の正本は
+   `test-process-home-isolation.md`。
    `--base` は `git diff <REF>...HEAD` (merge-base diff) で PR 差分を取り、#12752 の
    pure resolver に渡す。`--format targets` は選択テストファイル、または
    fail-closed な `full` 推奨のとき `discover -s tests` を出力するので、未対応の
@@ -81,7 +86,7 @@ quick lane と local は同じ `mozyo-bridge tests resolve` を呼ぶ。差は c
 手元で CI と同じ選択を再現するには:
 
 ```bash
-mozyo-bridge tests resolve --base origin/main --format targets | xargs python -m unittest
+mozyo-bridge tests resolve --base origin/main --format targets | xargs mozyo-bridge tests run --repo . --
 ```
 
 ## full lane failure handling (受け入れ条件 #3)

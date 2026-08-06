@@ -15,6 +15,9 @@ and the per-lane verbosity knob (``-v`` / ``-q``).
 from __future__ import annotations
 
 from mozyo_bridge.application.cli_common import add_repo_option
+from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.cli_test_run import (
+    add_isolation_flags,
+)
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.commands_test_runtime import (
     cmd_tests_profile,
 )
@@ -28,10 +31,13 @@ def register_profile(tests_sub) -> None:
             "Run the test suite with per-test timing and print a runtime summary "
             "(slow tests vs the budget threshold/exceptions). Same discovery as "
             "`python -m unittest discover`; the suite verdict is authoritative — "
-            "slow tests only fail the lane under --enforce."
+            "slow tests only fail the lane under --enforce. The discovery runs in "
+            "a process isolated from the operator's shared mozyo-bridge home, and "
+            "the lane fails if that home changed (Redmine #14757)."
         ),
     )
     add_repo_option(profile)
+    add_isolation_flags(profile)
     profile.add_argument(
         "--start-dir",
         dest="start_dir",

@@ -84,15 +84,37 @@ case "$TARGETS" in
         # the full run belongs to pre-push / CI, not to a per-commit hook.
         say "resolver recommends the FULL suite for these staged paths."
         say "NOT running it in the hook; run it before push:"
-        say "  $MOZYO tests resolve --staged --format targets | xargs $PYTHON -m unittest"
+        say "  $MOZYO tests run"
         exit 0
         ;;
 esac
 
 say "running focused tests:"
 printf '%s\n' "$TARGETS" | sed 's/^/  - /'
-# shellcheck disable=SC2086  # targets are newline-separated unittest args
-printf '%s\n' "$TARGETS" | xargs $PYTHON -m unittest \
-    || fail "focused tests failed"
+
+# Focused tests run through `tests run` (Redmine #14757), not bare `python -m
+# unittest`: a focused run reaches the operator's shared mozyo-bridge home just as
+# a full one does (#14757 j#94599 recorded a focused run migrating the shared
+# store v8 -> v9). `tests run` pins a task-specific temp root for the run and
+# fails if the operator's home changed, and it passes these targets through to
+# the identical `python -m unittest` invocation.
+#
+# The resolved CLI may predate `tests run` (this hook prefers an installed
+# `mozyo-bridge` on PATH over the repo's own source, per #13079). Probe once: a
+# stale CLI must not turn every commit into a hook failure, but the fallback is
+# UNISOLATED, so it is announced loudly rather than taken quietly.
+if $MOZYO tests run --help >/dev/null 2>&1; then
+    # shellcheck disable=SC2086  # targets are newline-separated unittest args
+    printf '%s\n' "$TARGETS" | xargs $MOZYO tests run --repo . -- \
+        || fail "focused tests failed"
+else
+    say "WARNING: the resolved mozyo-bridge CLI has no \`tests run\` subcommand."
+    say "WARNING: falling back to a NON-ISOLATED \`$PYTHON -m unittest\` run, which"
+    say "WARNING: can read and write your shared mozyo-bridge home (Redmine #14757)."
+    say "WARNING: upgrade mozyo-bridge, or set MOZYO_BRIDGE_CMD to this repo's CLI."
+    # shellcheck disable=SC2086  # targets are newline-separated unittest args
+    printf '%s\n' "$TARGETS" | xargs $PYTHON -m unittest \
+        || fail "focused tests failed"
+fi
 
 say "OK"

@@ -87,6 +87,19 @@ spawn) や `git commit` を行う hermetic test を壊す (R1 dogfood で観測�
 `MOZYO_REPO` は **inherit** する (pin しない): repo 解決が serial と同じ cwd/env 規則に
 従い、pin すると divergent-cwd 解決を検証する test を壊すため。
 
+Redmine #14757 が本 runner に加えたのは次の 2 点で、shard の既存契約は変えない。正本は
+`test-process-home-isolation.md` を読む (本 doc に複製しない)。
+
+- **parent discovery も isolated process へ移した。** shard は隔離済みでも、parent は
+  authoritative discovery を自 process で行い、全 test module を operator home 解決下で
+  import していた。`cmd_tests_parallel` は最初に自分自身を fenced child へ re-exec し、
+  run の前後で operator 共有 home を照合する (変化していれば shard が全て緑でも red)。
+- **shard env に `XDG_*` pin と process home fence を additive に足した。** 本 runner の
+  **per-shard `HOME` pin は維持する** — #13733 自身の acceptance であり
+  `test_issue_13733_shard_env_hermetic.py` が pin している。#14757 の rail は `HOME` を
+  repurpose しない側なので、2 rail は `HOME` の 1 点でのみ異なる。この divergence は意図的
+  で、根拠は `test-process-home-isolation.md` の該当節にある。
+
 ### shard env は「serial env + isolation」であり、それ以外を足さない
 
 isolation のために足してよいのは、**shard の外へ意味が漏れない** pin だけである。

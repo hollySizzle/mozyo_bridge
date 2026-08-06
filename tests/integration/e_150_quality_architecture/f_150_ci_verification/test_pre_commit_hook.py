@@ -107,6 +107,60 @@ class PreCommitHookTest(unittest.TestCase):
         self.assertIn("NOT running it in the hook", proc.stdout)
         self.assertNotIn("running focused tests", proc.stdout)
 
+    def test_focused_tests_run_through_the_isolated_runner(self) -> None:
+        """Focused runs go through `tests run`, not bare unittest (#14757).
+
+        A focused run reaches the operator's shared mozyo-bridge home just as a
+        full one does — #14757 j#94599 recorded a focused run migrating the shared
+        store v8 -> v9 — so the hook must not invoke `python -m unittest` directly
+        when the CLI can isolate it.
+        """
+        self._stage(
+            "tests/test_ok.py",
+            "import unittest\n\n\n"
+            "class OkTest(unittest.TestCase):\n"
+            "    def test_ok(self):\n"
+            "        self.assertTrue(True)\n",
+        )
+        proc = self._hook()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("operator shared home: unchanged", combined)
+        self.assertNotIn("NON-ISOLATED", combined)
+
+    def test_a_cli_without_tests_run_warns_loudly_and_still_runs(self) -> None:
+        """A stale installed CLI must not break every commit — but must be loud.
+
+        The hook prefers an installed `mozyo-bridge` on PATH over this repo's own
+        source (#13079), so the resolved CLI can predate `tests run`. Falling back
+        is correct for a hook that never blocks on infrastructure, but the fallback
+        is UNISOLATED, so silence would misrepresent it as a verified run.
+        """
+        stale = self.repo / "stale-mozyo"
+        stale.write_text(
+            "#!/bin/sh\n"
+            "case \"$1 $2\" in\n"
+            "  'tests resolve') printf 'tests/test_ok.py\\n'; exit 0 ;;\n"
+            "  'tests run') echo \"error: invalid choice: 'run'\" >&2; exit 2 ;;\n"
+            "esac\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        stale.chmod(0o755)
+        self._stage(
+            "tests/test_ok.py",
+            "import unittest\n\n\n"
+            "class OkTest(unittest.TestCase):\n"
+            "    def test_ok(self):\n"
+            "        self.assertTrue(True)\n",
+        )
+        env = dict(self.env, MOZYO_BRIDGE_CMD=str(stale))
+        proc = _run(["sh", str(HOOK)], self.repo, env=env)
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, combined)
+        self.assertIn("has no `tests run` subcommand", combined)
+        self.assertIn("NON-ISOLATED", combined)
+
     def test_clean_stage_with_no_targets_passes(self) -> None:
         # Nothing staged -> the resolver fail-closes to full (empty change
         # set); the hook surfaces it and passes without running anything.

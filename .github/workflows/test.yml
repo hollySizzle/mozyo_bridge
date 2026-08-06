@@ -154,8 +154,13 @@ jobs:
           BASE_REF: ${{ steps.base.outputs.ref }}
         run: |
           set -euo pipefail
+          # Focused targets run through `tests run` (Redmine #14757), not bare
+          # `python -m unittest`: a focused run reaches the shared mozyo-bridge
+          # home just as a full one does (#14757 j#94599). `tests run` passes
+          # these targets through to the identical unittest invocation inside a
+          # task-specific temp root, and fails if the shared home changed.
           mozyo-bridge tests resolve --base "$BASE_REF" --format targets \
-            | xargs python -m unittest
+            | xargs mozyo-bridge tests run --repo . --
 
       - name: Quick lane summary
         if: always()
@@ -212,6 +217,11 @@ jobs:
         # as `python -m unittest discover -s tests`; the suite verdict drives the
         # exit code. Slow-test budget is reported, not enforced (no `--enforce`),
         # so timing variance never makes CI flaky (Redmine #12754).
+        # Isolated from the operator's / runner's shared mozyo-bridge home
+        # (Redmine #14757): `tests profile` re-execs itself into a process whose
+        # home contract, temp dirs, and XDG roots are pinned to a task-specific
+        # root, and fails the lane if the shared home changed -- even when every
+        # test passed. Identical on macOS and Linux; no OS sandbox involved.
         run: mozyo-bridge tests profile --slowest 20
 
       - name: Build wheel and sdist
@@ -303,6 +313,11 @@ jobs:
         run: mozyo-bridge health check
 
       - name: Run unit tests (full discover with runtime summary)
+        # Isolated from the operator's / runner's shared mozyo-bridge home
+        # (Redmine #14757): `tests profile` re-execs itself into a process whose
+        # home contract, temp dirs, and XDG roots are pinned to a task-specific
+        # root, and fails the lane if the shared home changed -- even when every
+        # test passed. Identical on macOS and Linux; no OS sandbox involved.
         run: mozyo-bridge tests profile --slowest 20
 
       - name: Build wheel

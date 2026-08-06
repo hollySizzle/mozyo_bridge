@@ -39,6 +39,13 @@ Version `モジュール分割・テスト影響範囲整備枠`)。テスト遅
 と同じ start dir・pattern・module 命名 (`unit.<context>.test_*` 等) を再現する。
 profiling は discovery 結果に手を加えない。
 
+> **discovery は isolated process で走る (Redmine #14757)。** discovery は in-process な
+> ので、素で走らせると全 test module の import が operator 共有 mozyo-bridge home 解決下で
+> 起きる。`cmd_tests_profile` は最初に自分自身を fenced child へ re-exec し、run の前後で
+> 共有 home を照合して、変化していれば suite が緑でも lane を red にする。CI full lane の
+> 入口はこの command なので、CI も同時に isolated になる。**discover の呼び出し・test 集合・
+> verdict は変わらない。** 契約の正本は `test-process-home-isolation.md`。
+
 ### 計測値 (runtime summary)
 
 - `total`: per-test wall clock の総和 (sum)。

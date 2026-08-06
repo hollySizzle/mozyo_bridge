@@ -77,14 +77,147 @@ ADOPTION_MARKERS = (REPO_LOCAL_CONFIG_MARKER,) + WORKSPACE_MARKERS
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "mozyo-bridge"
 
 
+# --- process-level home fence (Redmine #14757) ------------------------------ #
+#
+# Env vars a verification runner sets on a test process BEFORE the interpreter
+# starts. They are read exactly once, at import, into `_PROCESS_HOME_FENCE` —
+# which is why a test that does `patch.dict(os.environ, {}, clear=True)` cannot
+# unbind the fence. `MOZYO_BRIDGE_HOME` alone is not enough for that: clearing
+# the env drops it, and the bare `~/.mozyo_bridge` fallback then resolves
+# through `expanduser()` (which falls back to the passwd database when `HOME` is
+# also unset) straight onto the operator's shared home. That is the mechanism
+# that forward-migrated the operator's live store during a test run (#14477
+# j#94521 / j#94527 / j#94528).
+HOME_FENCE_ROOT_ENV = "MOZYO_BRIDGE_TEST_HOME_FENCE"
+HOME_FENCE_DENY_ENV = "MOZYO_BRIDGE_TEST_HOME_DENY"
+#: Separator for the (possibly multiple) denied roots in `HOME_FENCE_DENY_ENV`.
+HOME_FENCE_DENY_SEPARATOR = os.pathsep
+
+
+class OperatorHomeFenceViolation(RuntimeError):
+    """A fenced process tried to resolve the home root onto a denied root.
+
+    Raised instead of returning the denied path, so the attempt is a refusal at
+    the resolver rather than a silent mutation of shared state discovered later
+    (Redmine #14757 acceptance 4).
+    """
+
+
+class HomeFence:
+    """Process-local binding of the home root, immune to `os.environ` edits.
+
+    ``root`` is where an unpinned resolution lands. ``denied`` are roots the
+    fenced process must never resolve onto — typically the operator's shared
+    home, captured by the runner from the *real* environment before the pins are
+    applied. `HOME` is deliberately NOT repurposed: isolation comes from this
+    binding, so the fenced process keeps a working user site-packages and git
+    identity (#14757 acceptance 1).
+    """
+
+    __slots__ = ("root", "denied")
+
+    def __init__(self, root: Path, denied: tuple[Path, ...] = ()) -> None:
+        # Both sides are resolved here, not at the comparison: `admit()` receives
+        # an already-resolved path, and a denied root spelled through a symlink
+        # (`/var/folders/...` for `/private/var/folders/...` on macOS) would
+        # otherwise never match and the fence would silently admit it.
+        self.root = Path(root).expanduser().resolve()
+        self.denied = tuple(Path(entry).expanduser().resolve() for entry in denied)
+
+    def denied_ancestor(self, resolved: Path) -> Path | None:
+        """The denied root containing (or equal to) ``resolved``, else ``None``."""
+        for candidate in self.denied:
+            if resolved == candidate or candidate in resolved.parents:
+                return candidate
+        return None
+
+    def admit(self, resolved: Path) -> Path:
+        """Return ``resolved``, or raise when it lands on a denied root."""
+        denied = self.denied_ancestor(resolved)
+        if denied is not None:
+            raise OperatorHomeFenceViolation(
+                f"refusing to resolve the mozyo-bridge home onto the fenced-off "
+                f"root {denied} (process home fence root: {self.root}). A test "
+                f"process must not read or write operator shared state; give the "
+                f"call an explicit home= under the fence root."
+            )
+        return resolved
+
+
+def _fence_from_env(env: dict[str, str] | os._Environ) -> HomeFence | None:
+    """Build the fence from ``env``, or ``None`` when no fence is declared."""
+    raw_root = env.get(HOME_FENCE_ROOT_ENV)
+    if not raw_root:
+        return None
+    denied = tuple(
+        Path(entry)
+        for entry in (env.get(HOME_FENCE_DENY_ENV) or "").split(
+            HOME_FENCE_DENY_SEPARATOR
+        )
+        if entry
+    )
+    return HomeFence(Path(raw_root), denied)
+
+
+#: Captured once, at import. Never re-read from `os.environ` per call.
+_PROCESS_HOME_FENCE: HomeFence | None = _fence_from_env(os.environ)
+
+
+def process_home_fence() -> HomeFence | None:
+    """The fence bound to this process, or ``None`` when unfenced."""
+    return _PROCESS_HOME_FENCE
+
+
+def bind_process_home_fence(fence: HomeFence | None) -> HomeFence | None:
+    """Rebind the process fence, returning the previous binding.
+
+    The runner does not need this — it sets the env before the child interpreter
+    starts, so the child captures the fence at import. This exists for the fence's
+    own tests, and specifically for the negative probe (#14757 acceptance 4),
+    which *removes* the binding to show that the unfenced resolution then reaches
+    the denied root instead of failing silently.
+    """
+    global _PROCESS_HOME_FENCE
+    previous = _PROCESS_HOME_FENCE
+    _PROCESS_HOME_FENCE = fence
+    return previous
+
+
 def mozyo_bridge_home() -> Path:
     """Resolve the mozyo-bridge home root (``MOZYO_BRIDGE_HOME`` or ``~/.mozyo_bridge``).
 
     Canonical definition of the home contract (Redmine #11429); the
     scaffold rules store and the workspace registry both resolve through
     this single helper so the env override behaves identically everywhere.
+
+    Under a process home fence (Redmine #14757) the same helper is additionally
+    the enforcement point. The fence is deliberately **narrow**: it changes the
+    answer only where the answer would have been operator shared state.
+
+    - An explicit ``MOZYO_BRIDGE_HOME`` naming a denied root raises
+      :class:`OperatorHomeFenceViolation`. Naming shared state is a caller
+      mistake and deserves a loud refusal, not a quiet substitution.
+    - With no ``MOZYO_BRIDGE_HOME`` (cleared or never set), the tilde default is
+      expanded first and *kept when it is already safe* — a test that points
+      ``HOME`` at its own temp dir is characterising the documented
+      ``~/.mozyo_bridge`` fallback, and the fence must not overwrite that answer.
+      Only when the expansion lands on a denied root is the fence root
+      substituted. That is the cleared-env case, where ``expanduser()`` falls
+      through to the passwd database and reaches the operator's real home.
+
+    The asymmetry is intentional: an explicit value is a naming (refuse it), an
+    absent one is not (supply a safe default).
+
+    Unfenced processes — every production invocation — behave exactly as before.
     """
-    return Path(os.environ.get("MOZYO_BRIDGE_HOME", "~/.mozyo_bridge")).expanduser().resolve()
+    fence = _PROCESS_HOME_FENCE
+    explicit = os.environ.get("MOZYO_BRIDGE_HOME")
+    if fence is None:
+        return Path(explicit or "~/.mozyo_bridge").expanduser().resolve()
+    if explicit:
+        return fence.admit(Path(explicit).expanduser().resolve())
+    default = Path("~/.mozyo_bridge").expanduser().resolve()
+    return default if fence.denied_ancestor(default) is None else fence.root
 
 
 def infer_git_worktree_root(start: str | Path | None) -> Path | None:

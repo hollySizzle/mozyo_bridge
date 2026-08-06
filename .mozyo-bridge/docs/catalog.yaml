@@ -1510,6 +1510,20 @@ documents:
       - logic-module-health-gate
       - spec-project-map
 
+  - id: logic-test-process-home-isolation
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/test-process-home-isolation.md
+    purpose: "test process を operator 共有 mozyo-bridge home から隔離する verification rail (Redmine #14757) の設計正本。task-specific temp root への env pin (`MOZYO_BRIDGE_HOME` / `TMPDIR` / `XDG_*`) と live-session pin 除去、`os.environ` の clear に耐える process-local home fence (`mozyo_bridge_home()` が未 pin 解決を fence root へ落とし denied root を拒否する) と `HOME` を repurpose しない根拠、operator 共有 home の before/after 論理 snapshot による fail-closed guard (guarded tier = entries / schema / identity / backups / existence、`mode=ro` + backup API による consistent 読取、`immutable=1` 禁止、sidecar と row 内容の carve-out、修復しない契約)、3 入口 (`tests run` / `tests profile` / `tests parallel`) の re-exec 契約、対象 inventory の測り方を定義する。"
+    audit_role: test_process_home_isolation_logic
+    related_document_refs:
+      - logic-local-parallel-test-runner-policy
+      - logic-test-runtime-profiling-policy
+      - logic-tests-placement-discovery-policy
+      - logic-workspace-registry
+      - logic-pre-commit-focused-verification
+      - spec-project-map
+
   - id: logic-pre-commit-focused-verification
     type: logic
     status: active
@@ -1899,6 +1913,20 @@ file_conventions:
       - test_parallel_policy.yaml
     severity: block
     document_refs:
+      - logic-local-parallel-test-runner-policy
+      - logic-tests-placement-discovery-policy
+      - spec-project-map
+
+  - id: fc-test-process-home-isolation-source
+    name: test-process home isolation rail (fence, snapshot guard, isolated runner) source
+    patterns:
+      - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/domain/test_home_isolation.py
+      - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/application/test_home_fence.py
+      - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/application/commands_test_run.py
+      - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/application/cli_test_run.py
+    severity: block
+    document_refs:
+      - logic-test-process-home-isolation
       - logic-local-parallel-test-runner-policy
       - logic-tests-placement-discovery-policy
       - spec-project-map

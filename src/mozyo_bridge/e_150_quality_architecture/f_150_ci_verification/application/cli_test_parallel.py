@@ -16,6 +16,9 @@ test set as the authoritative serial discovery; the parallelism knobs
 from __future__ import annotations
 
 from mozyo_bridge.application.cli_common import add_repo_option
+from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.cli_test_run import (
+    add_isolation_flags,
+)
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.commands_test_parallel import (
     cmd_tests_parallel,
     cmd_tests_shard_worker,
@@ -33,10 +36,13 @@ def register_parallel(tests_sub) -> None:
             "(a shard failure / timeout / crash / import error never reads as "
             "green). Each shard runs in its own HOME/TMPDIR/MOZYO_BRIDGE_HOME "
             "(kept functional for nested python/git) and cannot touch the live "
-            "Herdr lane."
+            "Herdr lane. The parent discovery itself runs in a process isolated "
+            "from the operator's shared mozyo-bridge home, and the run fails if "
+            "that home changed (Redmine #14757)."
         ),
     )
     add_repo_option(parallel)
+    add_isolation_flags(parallel)
     parallel.add_argument(
         "--start-dir",
         dest="start_dir",

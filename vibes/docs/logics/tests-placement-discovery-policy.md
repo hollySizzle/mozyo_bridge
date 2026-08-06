@@ -234,6 +234,15 @@ python -m unittest discover -s tests -v
 
 (`.github/workflows/test.yml` の "Run unit tests" step。)
 
+> **隔離された走らせ方 (Redmine #14757)。** 上の command 文字列は正本のまま不変である。
+> ただし *素で* 走らせると test process が operator の共有 mozyo-bridge home へ解決して
+> しまうため、通常の実行入口は `mozyo-bridge tests run [-- <unittest args>]` である —
+> これは task-specific temp root を pin した child で **この literal command を**
+> 走らせ、run の前後で operator 共有 home を照合して変化があれば全 test が緑でも red に
+> する。`tests profile` / `tests parallel` も同じ fence 下へ自己 re-exec する。契約の
+> 正本は `test-process-home-isolation.md`。discovery 正本の文字列・test 集合・verdict は
+> 一切変わらない。
+
 ### nested discovery の必須条件 (検証済み)
 
 `unittest discover` は default pattern `test*.py` でサブディレクトリへ再帰するが、

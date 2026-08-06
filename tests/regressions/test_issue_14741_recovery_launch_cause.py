@@ -237,9 +237,19 @@ class PropagationTest(unittest.TestCase):
 
         A source-string assertion would be green for a hop that is never taken, so the last
         hop is taken: only the preflight itself is seamed, and it records what it was handed.
+
+        The `env=` argument is what the *rail* carries, not what the process resolves:
+        on the non-dry-run path `_prepare_session_locked` calls
+        `register_workspace(repo_root)` with no `home=`, so the home contract is read
+        from `os.environ`. Passing `MOZYO_BRIDGE_HOME` only in the kwarg therefore
+        registered a throwaway workspace into the operator's live registry on every
+        invocation -- two rows per run, which is the producer #14757 j#100381
+        identified in the real registry. The process environment is pinned here as
+        well, and `TMPDIR` with it so the temp dirs stay inside the same task root.
         """
         import tempfile
         from types import SimpleNamespace
+        from unittest.mock import patch
 
         import mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start as start
 
@@ -247,36 +257,50 @@ class PropagationTest(unittest.TestCase):
             pass
 
         seen = {}
-        home = Path(tempfile.mkdtemp())
-        herdr = home / "herdr"
-        herdr.write_text("#!/bin/sh\nexit 0\n")
-        herdr.chmod(0o755)
 
         def _spy(providers, env, **kw):
             seen.update(kw)
             raise _Stop()
 
-        original = start.preflight_launch_providers
-        start.preflight_launch_providers = _spy
-        try:
-            with self.assertRaises(_Stop):
-                start._prepare_session_locked(
-                    repo_root=Path(tempfile.mkdtemp()),
-                    providers=["codex"],
-                    lane_id="l",
-                    env={
-                        "MOZYO_HERDR_BINARY": str(herdr),
+        with tempfile.TemporaryDirectory() as task_root:
+            home = Path(task_root) / "mozyo-home"
+            tmp = Path(task_root) / "tmp"
+            repo = Path(task_root) / "repo"
+            for directory in (home, tmp, repo):
+                directory.mkdir(parents=True)
+            herdr = home / "herdr"
+            herdr.write_text("#!/bin/sh\nexit 0\n")
+            herdr.chmod(0o755)
+
+            original = start.preflight_launch_providers
+            start.preflight_launch_providers = _spy
+            try:
+                with patch.dict(
+                    "os.environ",
+                    {
                         "MOZYO_BRIDGE_HOME": str(home),
+                        "TMPDIR": str(tmp),
+                        "TMP": str(tmp),
+                        "TEMP": str(tmp),
                     },
-                    runner=lambda *a, **k: SimpleNamespace(
-                        returncode=0, stdout="[]", stderr=""
-                    ),
-                    timeout=1.0,
-                    dry_run=False,
-                    **kwargs,
-                )
-        finally:
-            start.preflight_launch_providers = original
+                ), self.assertRaises(_Stop):
+                    start._prepare_session_locked(
+                        repo_root=repo,
+                        providers=["codex"],
+                        lane_id="l",
+                        env={
+                            "MOZYO_HERDR_BINARY": str(herdr),
+                            "MOZYO_BRIDGE_HOME": str(home),
+                        },
+                        runner=lambda *a, **k: SimpleNamespace(
+                            returncode=0, stdout="[]", stderr=""
+                        ),
+                        timeout=1.0,
+                        dry_run=False,
+                        **kwargs,
+                    )
+            finally:
+                start.preflight_launch_providers = original
         return seen
 
     def test_the_update_cause_really_arrives_at_the_provider_preflight(self) -> None:

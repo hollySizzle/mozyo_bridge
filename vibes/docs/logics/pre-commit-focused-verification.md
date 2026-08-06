@@ -13,8 +13,22 @@ module-to-test impact resolver (`mozyo-bridge tests resolve`) を運用に接続
 2. `mozyo-bridge docs audit-impact --staged --check-generated` — staged の
    docs / catalog impact (docs catalog を持たない repo では skip)。
 3. `mozyo-bridge tests resolve --staged --format targets` — staged path から
-   focused tests を解決してその場で実行 (#13078 の分類精緻化により、典型的な
-   governed diff — src + tests + `vibes/docs/**` — は focused selection に乗る)。
+   focused tests を解決し、`mozyo-bridge tests run --repo . --` へ渡して実行
+   (#13078 の分類精緻化により、典型的な governed diff — src + tests +
+   `vibes/docs/**` — は focused selection に乗る)。**focused run でも
+   `python -m unittest` を素で呼ばない** (Redmine #14757): focused run も operator
+   共有 mozyo-bridge home へ到達し、実際に共有 store を v8→v9 へ migrate した実測が
+   ある (#14757 j#94599)。`tests run` は同一 targets を同一の unittest 呼び出しへ
+   渡し、task-specific temp root 下で走らせ、共有 home が変化していれば hook を
+   fail させる。契約の正本は `test-process-home-isolation.md`。
+
+   **stale CLI fallback**: 本 hook は PATH 上の installed `mozyo-bridge` を repo 自身の
+   source より優先して解決する (下記 `## 実装 / 環境の詳細` の CLI 解決順)。したがって解決された CLI が
+   `tests run` を持たない (古い) ことがあり得る。その場合 hook は `tests run --help` の
+   probe で検出し、**非隔離の `python -m unittest` へ fallback する** — infrastructure
+   起因で毎 commit を止めないため。ただし fallback は隔離されていないので、
+   `WARNING: ... NON-ISOLATED ...` を明示出力して沈黙で verified run に見せない。
+   解消は mozyo-bridge の upgrade、または `MOZYO_BRIDGE_CMD` に本 repo の CLI を指定する。
 
 実測の目安 (mozyo_bridge repo、2026-07-03): resolver ~0.3 秒、focused 選択の
 実行は数百 test / 1 秒未満。full suite (~4400 tests / ~35 秒) はここでは回らない。
@@ -67,7 +81,9 @@ sh scripts/pre-commit-focused.sh
 
 - CLI 解決順: `MOZYO_BRIDGE_CMD` env → PATH 上の `mozyo-bridge` → script 隣接の
   `src/mozyo_bridge` (この repo の checkout 内なら PYTHONPATH fallback)。
-- focused 実行の interpreter は `MOZYO_PYTHON` (default `python3`)。
+- focused 実行は `mozyo-bridge tests run --repo . --` 経由 (Redmine #14757)。`MOZYO_PYTHON`
+  (default `python3`) は CLI source fallback と、`tests run` 非対応 CLI の
+  非隔離 fallback で使う interpreter。
 - 失敗 (whitespace / docs impact / focused test の red) は非ゼロ exit で commit を
   block する。resolver の `full` 推奨と「選択 0 件」は block しない (上記境界)。
 - script の挙動は `tests/integration/e_150_quality_architecture/f_150_ci_verification/test_pre_commit_hook.py`

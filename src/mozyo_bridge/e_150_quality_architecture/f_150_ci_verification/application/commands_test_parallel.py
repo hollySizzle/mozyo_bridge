@@ -57,6 +57,13 @@ from pathlib import Path
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.commands_test_runtime import (
     _repo_root_importable,
 )
+from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.test_home_fence import (
+    ambient_homes,
+)
+from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_home_isolation import (
+    FENCE_SUBDIRS,
+    LIVE_LANE_ENV_KEYS,
+)
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_parallel import (
     DEFAULT_POLICY_RELPATH,
     SHARD_CRASHED,
@@ -79,17 +86,19 @@ from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_r
     OUTCOME_PASSED,
     OUTCOME_SKIPPED,
 )
-from mozyo_bridge.shared.paths import resolve_repo_root
+from mozyo_bridge.shared.paths import (
+    HOME_FENCE_DENY_ENV,
+    HOME_FENCE_DENY_SEPARATOR,
+    HOME_FENCE_ROOT_ENV,
+    resolve_repo_root,
+)
 
 # Live cockpit-session env pins removed from every shard subprocess so a test can
 # never attach to or act on the operator's running Herdr lane (acceptance #3).
-STRIPPED_ENV_KEYS = (
-    "TMUX",
-    "TMUX_PANE",
-    "MOZYO_WORKSPACE_ID",
-    "MOZYO_LANE_ID",
-    "MOZYO_AGENT_ROLE",
-)
+# The tuple is owned by the isolation domain module (Redmine #14757) so the shard
+# rail and the `tests run` / `tests profile` rail strip the identical set; the
+# name is kept as this module's public alias.
+STRIPPED_ENV_KEYS = LIVE_LANE_ENV_KEYS
 
 _OUTCOME_ORDER = (OUTCOME_PASSED, OUTCOME_FAILED, OUTCOME_ERRORED, OUTCOME_SKIPPED)
 
@@ -244,18 +253,52 @@ def _shard_env(repo_root: Path, shard_home: Path) -> dict[str, str]:
     same-version metadata already importable and skip the install (exit 0, no console
     script) — a verdict divergence from serial that no per-shard isolation can undo
     (Redmine #13733 / #13735 j#78390 F1).
+
+    Redmine #14757 adds two things on top, additively:
+
+    - the **XDG roots** are pinned into the shard, so config/cache/data/state
+      resolution (``paths.CONFIG_HOME``) lands in the shard rather than following
+      the real ``HOME`` the shard's own pin does not cover;
+    - the **process home fence** is bound to the shard's own ``mozyo`` dir, so a
+      shard test that clears the environment resolves the home contract there
+      instead of falling back through ``expanduser()`` onto the operator's home.
+
+    The per-shard ``HOME`` pin is deliberately *kept* here even though the
+    ``tests run`` rail does not repurpose ``HOME``: it is #13733's own documented
+    acceptance and is pinned by ``test_issue_13733_shard_env_hermetic.py``. The
+    two rails differ on ``HOME`` and agree on everything else; the divergence and
+    its rationale are recorded in
+    ``vibes/docs/logics/test-process-home-isolation.md``.
     """
     env = dict(os.environ)
+    # Capture the denied roots BEFORE the shard pins overwrite MOZYO_BRIDGE_HOME:
+    # a fenced parent already carries the operator homes it observed, and deriving
+    # them after the override would deny the shard its own home.
+    denied = os.environ.get(HOME_FENCE_DENY_ENV) or HOME_FENCE_DENY_SEPARATOR.join(
+        str(path) for path in ambient_homes()
+    )
     home = shard_home / "home"
     tmp = shard_home / "tmp"
     mozyo = shard_home / "mozyo"
-    for directory in (home, tmp, mozyo):
+    xdg = {
+        role: shard_home / relative
+        for role, relative in FENCE_SUBDIRS.items()
+        if role.startswith("xdg_")
+    }
+    for directory in (home, tmp, mozyo, *xdg.values()):
         directory.mkdir(parents=True, exist_ok=True)
     env["HOME"] = str(home)
     env["TMPDIR"] = str(tmp)
     env["TMP"] = str(tmp)
     env["TEMP"] = str(tmp)
     env["MOZYO_BRIDGE_HOME"] = str(mozyo)
+    for role, directory in xdg.items():
+        env[f"XDG_{role[len('xdg_'):].upper()}_HOME"] = str(directory)
+    # Bind the process home fence to this shard's own home (Redmine #14757): an
+    # env-clearing shard test resolves here, and a resolution onto the operator's
+    # shared home raises instead of returning it.
+    env[HOME_FENCE_ROOT_ENV] = str(mozyo)
+    env[HOME_FENCE_DENY_ENV] = denied
     # Keep the fresh HOME functional (see docstring): user-site deps + git identity.
     user_base = _user_base()
     if user_base:
@@ -622,7 +665,23 @@ def _policy_path(args: argparse.Namespace, repo_root: Path) -> Path:
 
 
 def cmd_tests_parallel(args: argparse.Namespace) -> int:
-    """Plan, run, and aggregate the isolated-shard parallel test run."""
+    """Plan, run, and aggregate the isolated-shard parallel test run.
+
+    The shards were already isolated (`_shard_env`), but the **parent** ran the
+    authoritative discovery in this process — importing every test module under
+    the operator's own home resolution, which is enough to migrate the shared
+    store at import time (Redmine #14757). So the parent re-runs itself inside a
+    fenced child under the operator-home guard first; the body below is what that
+    child executes, and its shards inherit the fence.
+    """
+    from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.commands_test_run import (
+        isolate_self,
+    )
+
+    isolated = isolate_self(args, label="parallel")
+    if isolated is not None:
+        return isolated
+
     repo_root = _repo_root(args)
     start_dir, pattern, top_level_dir = _discovery_params(args)
     try:

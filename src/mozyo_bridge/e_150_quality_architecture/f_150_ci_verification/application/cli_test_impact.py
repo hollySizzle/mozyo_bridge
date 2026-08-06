@@ -13,11 +13,17 @@ subcommands:
 - ``tests parallel`` — run the whole suite across isolated process shards with a
   fail-closed aggregate verdict (Redmine #13733); registered from
   :mod:`...application.cli_test_parallel` (plus a hidden ``_shard-worker``).
+- ``tests run`` — run focused or full ``unittest`` in a process isolated from
+  the operator's shared mozyo-bridge home, failing the run if that home changed
+  (Redmine #14757); registered from :mod:`...application.cli_test_run`.
 
-The family stays read-only with no routing / approval authority. Handlers live
-in :mod:`...application.commands_test_impact` and
-:mod:`...application.commands_test_runtime`; this module wires the parser,
-matching the ``health`` family shape.
+The family stays read-only with no routing / approval authority — the one write
+it performs is to its own task-specific temp root, and the operator-home guard
+only ever *reads* shared state (it never repairs or deletes it). Handlers live
+in :mod:`...application.commands_test_impact`,
+:mod:`...application.commands_test_runtime`, and
+:mod:`...application.commands_test_run`; this module wires the parser, matching
+the ``health`` family shape.
 """
 
 from __future__ import annotations
@@ -25,6 +31,9 @@ from __future__ import annotations
 from mozyo_bridge.application.cli_common import add_repo_option
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.cli_test_parallel import (
     register_parallel,
+)
+from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.cli_test_run import (
+    register_run,
 )
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.cli_test_runtime import (
     register_profile,
@@ -103,3 +112,4 @@ def register(sub) -> None:
 
     register_profile(tests_sub)
     register_parallel(tests_sub)
+    register_run(tests_sub)
