@@ -946,6 +946,10 @@ class OsBoundaryRefusesEveryKnownBypassTest(unittest.TestCase):
             self.control = task_root / "control"
             home = Path(self._guarded.name).resolve() / "operator-home"
             home.mkdir()
+            # Linux binds the canary read-only after opening the task root. The
+            # source and its victims must therefore exist before argv resolution,
+            # matching the production `isolated_env` ordering.
+            create_boundary_fixtures(self.canary, self.control)
             try:
                 self.fence = resolve_os_fence(
                     (home,), work_dir=task_root, canary=self.canary
@@ -959,7 +963,6 @@ class OsBoundaryRefusesEveryKnownBypassTest(unittest.TestCase):
                 # down: the rail refuses to run a single test without a boundary,
                 # so "no backend" can never be a green outcome here.
                 self.fail(f"no OS write boundary resolved: {exc}")
-            create_boundary_fixtures(self.canary, self.control)
             self.reused_outer = False
 
     def _victims(self) -> tuple[bytes, str]:
