@@ -76,6 +76,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_health import (  # noqa: E402,E501
     HEALTH_HEALTHY,
+    HEALTH_NOT_PROBED,
+    HEALTH_OUTCOMES,
+    HEALTH_SHELL_RESIDUE,
 )
 
 
@@ -167,7 +170,14 @@ class _Env:
         )
         return first, second
 
-    def result(self, label: str, launched, lane: str = "") -> SessionStartResult:
+    def result(self, label: str, launched, lane: str = "", health=HEALTH_HEALTHY):
+        """The run's own result, as the launcher hands it to the reflow.
+
+        ``health`` is the startup-liveness axis the canonical probe settles before
+        the geometry pass runs (#14996 R3): every scenario here is a pair that came
+        up, so the default is the settled, healthy verdict a real launch carries by
+        the time the reflow is reached.
+        """
         result = SessionStartResult(
             workspace_id=self.ids[label], lane_id=lane or DEFAULT_LANE
         )
@@ -179,6 +189,7 @@ class _Env:
                     assigned_name=self.name(label, provider, lane),
                     outcome=SLOT_LAUNCHED,
                     locator=locator,
+                    health=health,
                 )
             )
         return result
@@ -451,6 +462,128 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
         tab = env.herdr.new_tab()
         env.seed_columns(tab, (PROJECT_A, ""), (PROJECT_A, lane))
         return env, env.append_pair(tab, PROJECT_B)
+
+    def test_a_read_taken_before_the_liveness_pass_settled_is_refused(self):
+        """R3 live finding j#100135 — the ordering is checked, not assumed.
+
+        A pane herdr has just started reports the residue row shape until its
+        provider boots, so the canonical startup pass holds that shape as
+        *retryable* rather than as a verdict. This pass may only read the inventory
+        once that verdict exists; a launched slot still at ``not_probed`` says it
+        does not.
+        """
+        env = _Env(self, PROJECT_A, PROJECT_B)
+        tab = env.herdr.new_tab()
+        env.seed_columns(tab, (PROJECT_A, ""))
+        launched = env.append_pair(tab, PROJECT_B)
+        result = env.result(PROJECT_B, list(launched), health=HEALTH_NOT_PROBED)
+        outcome, detail = env.run(result)
+        self._assert_zero_move_failure(
+            env, outcome, detail, "the startup-liveness pass has not settled"
+        )
+        self.assertIn("booting provider from shell residue", detail)
+
+    def test_every_health_verdict_the_probe_can_write_is_read_as_settled(self):
+        """The whole health axis, not the two tokens the fix happened to need.
+
+        The guard asks whether the canonical pass has RUN. Only ``not_probed``
+        answers "no"; every other member of the closed vocabulary is a verdict it
+        wrote, so every one of them must let the read through — otherwise the
+        ordering guard would quietly become a second, weaker liveness gate.
+        """
+        settled = sorted(HEALTH_OUTCOMES - {HEALTH_NOT_PROBED})
+        self.assertEqual(
+            sorted(HEALTH_OUTCOMES),
+            sorted(settled + [HEALTH_NOT_PROBED]),
+            "the table must cover the health vocabulary, not a sample of it",
+        )
+        for verdict in settled:
+            with self.subTest(health=verdict):
+                env = _Env(self, PROJECT_A, PROJECT_B)
+                tab = env.herdr.new_tab()
+                env.seed_columns(tab, (PROJECT_A, ""))
+                launched = env.append_pair(tab, PROJECT_B)
+                outcome, detail = env.run(
+                    env.result(PROJECT_B, list(launched), health=verdict)
+                )
+                self.assertNotIn("startup-liveness pass", detail)
+                self.assertEqual(outcome, COLUMN_APPLIED, detail)
+
+    def test_a_malformed_health_value_is_not_promoted_to_a_settled_verdict(self):
+        """`_norm` is ``str(value).strip()``, so a non-token would read as settled.
+
+        The same promotion j#99971 found on the inventory side: ``None`` / ``0`` /
+        ``[]`` all normalise to something that is not ``not_probed``. Membership in
+        the closed vocabulary is the question, not emptiness.
+        """
+        for value in (None, 0, False, [], {}, "healthy ", "definitely_fine"):
+            with self.subTest(health=value):
+                env = _Env(self, PROJECT_A, PROJECT_B)
+                tab = env.herdr.new_tab()
+                env.seed_columns(tab, (PROJECT_A, ""))
+                launched = env.append_pair(tab, PROJECT_B)
+                outcome, detail = env.run(
+                    env.result(PROJECT_B, list(launched), health=value)
+                )
+                self._assert_zero_move_failure(
+                    env, outcome, detail, "the startup-liveness pass has not settled"
+                )
+
+    def test_the_same_pair_with_a_settled_verdict_is_reflowed(self):
+        """The control for the guard above: only the health axis differs.
+
+        Without it the refusal proves nothing about which input it separates —
+        a guard has to be shown passing what it must pass, in the same commit.
+        """
+        env = _Env(self, PROJECT_A, PROJECT_B)
+        tab = env.herdr.new_tab()
+        env.seed_columns(tab, (PROJECT_A, ""))
+        launched = env.append_pair(tab, PROJECT_B)
+        outcome, detail = env.run(
+            env.result(PROJECT_B, list(launched), health=HEALTH_HEALTHY)
+        )
+        self.assertEqual(outcome, COLUMN_APPLIED, detail)
+
+    def test_a_settled_but_unhealthy_verdict_still_reaches_the_inventory(self):
+        """The guard is about the pass having RUN, not about its verdict.
+
+        A slot the pass settled as shell residue has been decided, so the read is
+        not premature — and the pane's own inventory row, which is what proves
+        liveness here, refuses it on the axis that names it. Reading the health
+        verdict as the liveness proof would move that decision out of the
+        workspace, where the foreign panes are judged, and into this run's report.
+        """
+        env = _Env(self, PROJECT_A, PROJECT_B)
+        tab = env.herdr.new_tab()
+        env.seed_columns(tab, (PROJECT_A, ""))
+        launched = env.append_pair(tab, PROJECT_B)
+        env.herdr.stale_panes.add(launched[0])
+        outcome, detail = env.run(
+            env.result(PROJECT_B, list(launched), health=HEALTH_SHELL_RESIDUE)
+        )
+        self._assert_zero_move_failure(env, outcome, detail, "is shell residue")
+
+    def test_an_unaddressable_slot_is_refused_on_its_own_axis(self):
+        """A slot with no locator was never probeable, so it carries no ordering
+        evidence — and it is refused by the authority under its own cause rather
+        than under a premature-read cause that is not true of it (j#99955)."""
+        env = _Env(self, PROJECT_A, PROJECT_B)
+        tab = env.herdr.new_tab()
+        env.seed_columns(tab, (PROJECT_A, ""))
+        launched = env.append_pair(tab, PROJECT_B)
+        result = env.result(PROJECT_B, list(launched))
+        result.slots.append(
+            SlotResult(
+                provider="codex",
+                assigned_name=env.name(PROJECT_B, "codex"),
+                outcome=SLOT_LAUNCHED,
+                locator="",
+                health=HEALTH_NOT_PROBED,
+            )
+        )
+        outcome, detail = env.run(result)
+        self._assert_zero_move_failure(env, outcome, detail, "with no pane locator")
+        self.assertNotIn("startup-liveness pass", detail)
 
     def test_the_top_coordinator_in_the_shared_tab_is_refused_not_reshaped(self):
         """Review j#99904 finding_1 — six panes moved before this refusal existed."""
@@ -800,6 +933,7 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
                     assigned_name=env.name(PROJECT_A, provider),
                     outcome=SLOT_LAUNCHED,
                     locator=a_pair[1],  # both slots point at the SAME pane
+                    health=HEALTH_HEALTHY,
                 )
             )
         outcome, detail = env.run(result)
@@ -844,6 +978,7 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
             assigned_name=env.name(PROJECT_B, "codex"),
             outcome=SLOT_LAUNCHED,
             locator=launched[1],
+            health=HEALTH_HEALTHY,
         )
         outcome, detail = env.run(result)
         self._assert_zero_move_failure(
@@ -914,6 +1049,7 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
                     assigned_name=env.name(PROJECT_A, provider),
                     outcome=SLOT_LAUNCHED,
                     locator=locator,
+                    health=HEALTH_HEALTHY,
                 )
             )
         outcome, detail = env.run(result)

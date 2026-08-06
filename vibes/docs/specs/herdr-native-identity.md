@@ -1246,6 +1246,20 @@ relayout を承認し、**推測ではなく実測で検証すること**を条�
   限り正当な column として扱う (Design Consultation Answer j#99900)。slot 欠落は slot / health 軸の所有であり、
   他 project の欠落を本 run の column 失敗として報告しない。除外の結果として 1 枚に見える group は本例外の
   対象外である。
+- **inventory を読む時刻そのものが境界である**。herdr が起動した直後の pane は、shell residue と
+  **同じ row 形状**（`agent` field が present かつ空）を、provider が立ち上がるまで報告する。この曖昧さの
+  解決は startup health pass の所有であり、しかも *verdict* ではなく *deadline* として持つ
+  (`HEALTH_SHELL_RESIDUE` は retryable set に居る。#13948)。したがって project-column の read は
+  **canonical な startup liveness pass が settle した後**に置く。R2 の rollout では container geometry が
+  pass 3 より前に走り、healthy な fresh pair が shell residue と判定されて自分の最初の column を
+  `failed` にした (#14996 R3、live finding j#100135。実測 detail は
+  `pane 'wProjects:p2' is shell residue (its identity outlived its agent)` で、同 run の両 slot は
+  `health=healthy`)。順序だけに頼ると位置の入れ替えで黙って再発するため、launched slot が
+  `HEALTH_NOT_PROBED` のままの read は **0 move の typed refusal** とし、依存を検査済みにする。
+  この guard が問うのは **pass が走ったか**であって pass の verdict ではない。settled かつ unhealthy な
+  slot の liveness は従来どおり inventory row が決める（health verdict を liveness の証明に使うと、
+  foreign pane を裁いている workspace の外へ判断が移る）。locator を持たない slot は probe の対象に
+  なりえないので本 guard の対象外であり、authority が **その slot の実際の欠陥を名指しする軸**で拒否する。
 - **pane を close / restart / rename しない**ので assigned name / route authority / cwd は不変。
 - 全 placement が `--target-pane` を明示するため、**起動前 focus に依存しない**。
 - 移動する既存 pane は「新 column が split する column の下段 1 枚」だけで、元の相手 pane の直下へ戻す。

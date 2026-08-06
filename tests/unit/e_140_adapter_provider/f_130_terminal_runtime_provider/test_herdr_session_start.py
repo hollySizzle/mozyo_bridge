@@ -244,6 +244,15 @@ class _Herdr:
         # live #13882 shapes deterministically. Keyed by role token (`claude` / `codex`).
         self.exit_after_start: set = set()
         self.residue_after_start: set = set()
+        # Redmine #14996 R3 (live finding j#100135): providers that are still BOOTING.
+        # Real herdr reports a pane it has just started with the residue row shape — the
+        # `agent` field present and blank — until the provider is up in it, and only then
+        # names the provider. The two are indistinguishable in any single read, which is
+        # the whole reason the bounded startup pass owns the deadline; a fake that named
+        # the provider on the first read would make that window unobservable here.
+        self.booting_after_start: set = set()
+        #: Inventory reads that have SEEN this run's launches (the boot clock).
+        self._boot_round = 0
         # Visible pane text per locator, and the default for anything unlisted. The
         # default is deliberately a plain, blocker-free prompt: a *clear* screen.
         self.pane_text: dict = {}
@@ -340,10 +349,17 @@ class _Herdr:
             self._list_round += 1
             if self._on_list is not None:
                 self._on_list(self)
+            if self.started_rows:
+                self._boot_round += 1
             return subprocess.CompletedProcess(
                 argv,
                 0,
-                stdout=json.dumps({"agents": self.existing_rows + self.started_rows}),
+                stdout=json.dumps(
+                    {
+                        "agents": self.existing_rows
+                        + [self._as_reported(row) for row in self.started_rows]
+                    }
+                ),
                 stderr="",
             )
         if rest[:2] == ["workspace", "list"]:
@@ -671,6 +687,28 @@ class _Herdr:
                 out[key] = value
         return out
 
+    def _as_reported(self, row):
+        """One started row as herdr reports it on THIS inventory read.
+
+        Only a booting row differs between reads: the residue shape while the
+        provider is coming up, its own provider once ``_boot_live_at`` is reached.
+        The bookkeeping keys never reach the payload — the code under test must see
+        exactly the row shape herdr emits, or the fake would be handing it the
+        answer it is supposed to have to wait for.
+        """
+        live_at = row.get("_boot_live_at")
+        if live_at is None:
+            return row
+        reported = {
+            key: value
+            for key, value in row.items()
+            if key not in ("_boot_live_at", "_boot_role")
+        }
+        if self._boot_round >= live_at:
+            reported["agent"] = row["_boot_role"]
+            reported["agent_status"] = "idle"
+        return reported
+
     def _settle_launch(self, rest, pane_id):
         """Model the two after-effects of a real ``agent start``.
 
@@ -692,6 +730,15 @@ class _Herdr:
             # blank — the exact signal `classify_named_slot` calls SLOT_STALE (#13518).
             row["agent"] = ""
             row["agent_status"] = "unknown"
+        elif role in self.booting_after_start:
+            # The same shape, but only until the provider comes up: residue on the next
+            # inventory read, the named provider on the one after (#14996 R3). Recorded
+            # per row, so a project launched later boots on its own clock rather than
+            # inheriting the round count an earlier project already spent.
+            row["agent"] = ""
+            row["agent_status"] = "unknown"
+            row["_boot_role"] = role
+            row["_boot_live_at"] = self._boot_round + 2
         else:
             row["agent"] = role
         if "--cwd" in rest:
@@ -2178,6 +2225,167 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(result.herdr_workspace_id, "wHost")
         self.assertTrue(result.herdr_tab_id)
         self.assertEqual(len(herdr.tab_creates), 1)
+
+    def _role_grouped_projects(self, tmp, herdr, *, projects=("a", "b")):
+        """Launch ``projects`` coordinator pairs into one shared workspace.
+
+        The composed rail, not a slice of it: each project is a real
+        ``prepare_session`` against one persistent fake backend and one operator
+        home, so the launch, the bounded startup pass and the container geometry
+        run in the order the composition root actually puts them in — which is the
+        only thing #14996 R3 is about.
+        """
+        root = Path(tmp)
+        home = root / "home"
+        home.mkdir(exist_ok=True)
+        binpath = root / "fake-herdr"
+        binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+        launcher_env, _ = self._fake_launcher_env(tmp)
+        env = _launch_env(binpath, **launcher_env)
+        herdr.attest_home = home
+        repos = {}
+        results = []
+        with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+            top = root / "top"
+            top.mkdir(exist_ok=True)
+            register_workspace(top, home=home)
+            top_workspace_id = read_anchor(top)["workspace_id"]
+            herdr.created_workspace = "wProjects"
+            for label in projects:
+                repo = root / f"project-{label}"
+                repo.mkdir(exist_ok=True)
+                repos[label] = repo
+                results.append(
+                    prepare_session(
+                        repo_root=repo,
+                        providers=["codex", "claude"],
+                        lane_id="",
+                        launch_context=LaneLaunchContext(lane_kind="coordinator"),
+                        coordinator_placement_mode="role_grouped_space",
+                        coordinator_top_workspace_id=top_workspace_id,
+                        env=env,
+                        runner=herdr.run,
+                        probe=_FAST_PROBE,
+                    )
+                )
+        return results, repos, home, env, top_workspace_id
+
+    def _shared_rects(self, herdr, pane_id):
+        return {
+            entry["pane_id"]: entry["rect"]
+            for entry in herdr._layout_payload(pane_id)["result"]["layout"]["panes"]
+        }
+
+    def test_a_booting_first_pair_is_not_read_as_shell_residue(self) -> None:
+        """Redmine #14996 R3, live finding j#100135.
+
+        The installed rail placed the container geometry BEFORE the startup-health
+        pass, so the column authority read the inventory while the freshly started
+        panes still reported the residue row shape — `agent` present and blank —
+        and called a healthy fresh server-management pair shell residue. The pair
+        was the only one in the workspace, so it owed no column at all; it exited
+        non-zero over geometry it never needed.
+        """
+        herdr = _Herdr(created_workspace="wProjects")
+        herdr.booting_after_start = {"codex", "claude"}
+        with tempfile.TemporaryDirectory() as tmp:
+            (first,), _repos, _home, _env, _top = self._role_grouped_projects(
+                tmp, herdr, projects=("a",)
+            )
+        self.assertTrue(
+            all(slot.healthy for slot in first.slots),
+            [slot.health for slot in first.slots],
+        )
+        self.assertEqual(
+            first.column_outcome, "not_applicable", first.column_detail
+        )
+        self.assertTrue(first.column_ok)
+        self.assertTrue(first.ok)
+        self.assertEqual(herdr.pane_moves, [], "the first pair owes no pane move")
+
+    def test_a_booting_second_pair_still_gets_its_verified_column(self) -> None:
+        """The append case, through the same boot window.
+
+        Both projects come up slowly, so the shared workspace the second pair
+        reasons about holds a first pair that was itself booting one pass earlier.
+        The reflow still has to prove the foreign pair before it moves anything,
+        and the tab it leaves behind is the even 2x2 the owner accepted (j#99833).
+        """
+        herdr = _Herdr(created_workspace="wProjects")
+        herdr.booting_after_start = {"codex", "claude"}
+        with tempfile.TemporaryDirectory() as tmp:
+            (first, second), _repos, _home, _env, _top = self._role_grouped_projects(
+                tmp, herdr
+            )
+            rects = self._shared_rects(herdr, second.slots[0].locator)
+        self.assertEqual(first.column_outcome, "not_applicable", first.column_detail)
+        self.assertEqual(second.column_outcome, "applied", second.column_detail)
+        self.assertTrue(second.ok)
+        columns = {}
+        for session in (first, second):
+            spans = {
+                (rects[slot.locator]["x"], rects[slot.locator]["width"])
+                for slot in session.slots
+            }
+            self.assertEqual(len(spans), 1, "a project pair must own one column")
+            heights = sum(rects[slot.locator]["height"] for slot in session.slots)
+            self.assertEqual(heights, herdr.split_extent, "the column is not full height")
+            columns[session.workspace_id] = spans.pop()
+        self.assertEqual(len(set(columns.values())), 2, "the pairs share one column")
+        self.assertEqual(sum(width for _x, width in columns.values()), herdr.split_cross)
+
+    def test_a_pair_that_never_boots_still_fails_closed(self) -> None:
+        """The control the ordering fix must NOT have widened.
+
+        A row that keeps the residue shape past the bounded deadline is the #13518
+        shape, not a boot window. The startup pass reports it, and the geometry
+        pass — which now reads afterwards — still refuses to reason about it.
+        """
+        herdr = _Herdr(created_workspace="wProjects")
+        herdr.residue_after_start = {"codex", "claude"}
+        with tempfile.TemporaryDirectory() as tmp:
+            (first, second), _repos, _home, _env, _top = self._role_grouped_projects(
+                tmp, herdr
+            )
+        self.assertFalse(any(slot.healthy for slot in second.slots))
+        self.assertEqual(second.column_outcome, "failed", second.column_detail)
+        self.assertIn("shell residue", second.column_detail)
+        self.assertIn("no live pane was moved", second.column_detail)
+        self.assertEqual(herdr.pane_moves, [])
+        self.assertFalse(second.ok)
+
+    def test_an_adopt_only_restart_moves_no_pane(self) -> None:
+        """A restart that adopts both halves appends no column and moves nothing."""
+        herdr = _Herdr(created_workspace="wProjects")
+        herdr.booting_after_start = {"codex", "claude"}
+        with tempfile.TemporaryDirectory() as tmp:
+            (_first, second), repos, home, env, top_workspace_id = (
+                self._role_grouped_projects(tmp, herdr)
+            )
+            self.assertEqual(second.column_outcome, "applied", second.column_detail)
+            moves_after_append = len(herdr.pane_moves)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                restarted = prepare_session(
+                    repo_root=repos["b"],
+                    providers=["codex", "claude"],
+                    lane_id="",
+                    launch_context=LaneLaunchContext(lane_kind="coordinator"),
+                    coordinator_placement_mode="role_grouped_space",
+                    coordinator_top_workspace_id=top_workspace_id,
+                    env=env,
+                    runner=herdr.run,
+                    probe=_FAST_PROBE,
+                )
+        self.assertTrue(
+            all(slot.outcome == "adopted" for slot in restarted.slots),
+            [slot.outcome for slot in restarted.slots],
+        )
+        self.assertEqual(
+            restarted.column_outcome, "not_applicable", restarted.column_detail
+        )
+        self.assertTrue(restarted.column_ok)
+        self.assertEqual(len(herdr.pane_moves), moves_after_append)
 
     def test_role_grouped_multi_project_restart_keeps_three_role_surfaces(self) -> None:
         """Three role surfaces survive restart and remain semantically operable.

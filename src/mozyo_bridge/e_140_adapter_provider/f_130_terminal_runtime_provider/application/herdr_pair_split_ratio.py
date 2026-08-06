@@ -843,8 +843,17 @@ def finalize_container_geometry(
 ) -> None:
     """Finish the container this run launched into: reclaim, column, divide the pair.
 
-    The single call the session-start composition root makes, in the only order the three
-    steps compose in:
+    Runs as the LAST pass of a launch, after the bounded startup-health probe (#13948)
+    has settled — not before it, which is where it used to sit. herdr reports a pane it
+    has just started with the same row shape as shell residue (the ``agent`` field present
+    and blank) until the provider boots into it, and resolving that ambiguity is the
+    health pass's job: it holds ``shell_residue`` as *retryable* for a bounded deadline
+    rather than as a verdict. Reading the inventory before that pass ran made a fresh,
+    healthy project-coordinator pair fail its own first column in the live rollout
+    (#14996 R3, finding j#100135). The column step now also refuses a read taken before
+    that verdict exists, so the dependency is checked rather than merely positional.
+
+    Within this call, the three steps compose in one order:
 
     1. **reclaim** the root panes this run created — closing one collapses the split tree,
        so anything measured before it would read a geometry about to change;

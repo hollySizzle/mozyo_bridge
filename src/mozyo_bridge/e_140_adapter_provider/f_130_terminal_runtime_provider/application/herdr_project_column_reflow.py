@@ -54,6 +54,11 @@ Boundary — narrow, launch-time, verified (j#99845)
 - **Every placement is explicitly targeted.** Each step passes ``--target-pane``,
   so the result does not depend on which pane happened to be active before the
   launch (j#99845: "起動前focus非依存").
+- **Only after the canonical startup-liveness pass has settled.** A booting pane
+  and a dead one report the same inventory row, so this pass reads the workspace
+  only once the bounded startup probe (#13948) has turned that ambiguity into a
+  verdict — see :func:`_premature_read_refusal`, which refuses the read rather
+  than judging it (#14996 R3, live finding j#100135).
 - **Fail closed, and say what is still detached.** A refused step stops the
   sequence, best-effort re-attaches whatever this run had detached, and reports
   :data:`COLUMN_FAILED`. A pane that vanished, a temp tab that cannot be
@@ -97,6 +102,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     DEFAULT_LANE,
     _norm,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_health import (  # noqa: E501
+    HEALTH_NOT_PROBED,
+    HEALTH_OUTCOMES,
 )
 
 #: No project-column reflow was owed. The resting value: every non-role-grouped
@@ -468,6 +477,62 @@ def _restore_detached(
     return tuple(stranded)
 
 
+def _is_settled_health(value: object) -> bool:
+    """True only for a health verdict the canonical probe has actually written."""
+    return (
+        isinstance(value, str)
+        and value in HEALTH_OUTCOMES
+        and value != HEALTH_NOT_PROBED
+    )
+
+
+def _premature_read_refusal(launched_slots: Sequence[object]) -> str:
+    """Refuse to read the inventory before the canonical liveness pass settled.
+
+    A pane herdr has just started reports the SAME row shape as shell residue —
+    the ``agent`` field present and blank — until the provider boots into it. That
+    ambiguity is not this module's to resolve: the canonical startup pass already
+    owns it, and owns it as a *deadline* rather than a verdict, which is why
+    ``HEALTH_SHELL_RESIDUE`` sits in its retryable set (#13948) and is only
+    reported once a bounded number of re-observations still see it.
+
+    The live rollout ran this geometry pass BEFORE that one, so a fresh, healthy
+    server-management pair was called shell residue and its first column failed
+    (#14996 R3, live finding j#100135). The fix is the call order, and this is what
+    keeps it from being merely positional: a launched slot still carrying
+    :data:`HEALTH_NOT_PROBED` means the pass that decides liveness has not run over
+    it, so the read is premature and is refused — at zero pane moves — instead of
+    being judged. A slot missing the axis entirely is treated the same way; absent
+    evidence of the pass is not evidence that it ran.
+
+    Slots with no locator are outside this question rather than exempt from it:
+    the probe only ever targets a locator, so an unaddressable slot carries no
+    ordering evidence either way, and it is refused one step later by the authority
+    on the axis that names its actual defect (j#99955) rather than being reported
+    here under a cause that is not its own.
+
+    "Settled" is membership in the health vocabulary, not "some non-empty string":
+    the canonical `_norm` is ``str(value).strip()``, so ``None`` / ``0`` / ``[]``
+    would each normalise to something that is not ``not_probed`` and read as a
+    settled verdict — the same promotion of a malformed value that j#99971 found on
+    the inventory side. Every verdict a real probe writes is a member, so nothing
+    a launch legitimately produces is refused by asking.
+    """
+    premature = sorted(
+        _norm(getattr(slot, "locator", ""))
+        for slot in launched_slots
+        if _norm(getattr(slot, "locator", ""))
+        and not _is_settled_health(getattr(slot, "health", None))
+    )
+    if not premature:
+        return ""
+    return (
+        f"the startup-liveness pass has not settled pane(s) {premature!r}, so their "
+        "inventory rows cannot yet distinguish a booting provider from shell "
+        "residue; no live pane was moved"
+    )
+
+
 def reflow_project_columns(
     result,
     *,
@@ -512,14 +577,19 @@ def reflow_project_columns(
     # Filtering those out here would be the same silent exclusion the authority
     # refuses on inside the workspace: a launch this run reports but cannot address
     # is a contradiction the run must fail on, not a row to drop on the way in.
+    launched_slots = tuple(
+        slot for slot in result.slots if getattr(slot, "outcome", "") == SLOT_LAUNCHED
+    )
+    refusal = _premature_read_refusal(launched_slots)
+    if refusal:
+        return COLUMN_FAILED, refusal
     own_slots = tuple(
         OwnSlot(
             locator=getattr(slot, "locator", ""),
             assigned_name=getattr(slot, "assigned_name", ""),
             provider=getattr(slot, "provider", ""),
         )
-        for slot in result.slots
-        if getattr(slot, "outcome", "") == SLOT_LAUNCHED
+        for slot in launched_slots
     )
     own_launched = tuple(slot.locator for slot in own_slots)
     rows = _list_rows(binary, runner, timeout)

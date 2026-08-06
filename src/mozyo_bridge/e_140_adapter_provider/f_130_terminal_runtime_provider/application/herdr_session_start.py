@@ -917,16 +917,6 @@ def _prepare_session_locked(
                     ),
                 )
 
-    # Finish the container — reclaim the roots (#13330 / #13411), give an appended project
-    # pair its own column (#14996 R2), divide the pair (#14569). In that order; records.
-    finalize_container_geometry(
-        result, config_split=config_split, config_order=config_order,
-        pair_order=pair_order, requested=providers, config_ratio=config_ratio,
-        launched=len(launch_plans), initial_occupancy=plan_of_container.occupancy,
-        dry_run=dry_run, binary=binary, runner=runner, timeout=timeout, env=env,
-        project_coordinator=role_grouped_project_coordinator, store_home=store_home,
-        top_workspace_id=coordinator_top_workspace_id,
-    )
     # Pass 3 — observe what we started (Redmine #13948, Answer j#80989). `agent start`
     # returning a well-formed, correctly-located locator is the LAUNCHER's claim; it says
     # nothing about the process. This bounded read-only probe turns "accepted" into
@@ -942,6 +932,16 @@ def _prepare_session_locked(
             # so an unmanaged run (no transaction) composes the exact prior pipeline.
             action_id=transaction.action_id if transaction is not None else "",
         )
+    # Finish the container — reclaim, column, ratio; the callee owns that order and why it
+    # must follow pass 3 (#14996 R3, live finding j#100135). Records rather than raises.
+    finalize_container_geometry(
+        result, config_split=config_split, config_order=config_order,
+        pair_order=pair_order, requested=providers, config_ratio=config_ratio,
+        launched=len(launch_plans), initial_occupancy=plan_of_container.occupancy,
+        dry_run=dry_run, binary=binary, runner=runner, timeout=timeout, env=env,
+        project_coordinator=role_grouped_project_coordinator, store_home=store_home,
+        top_workspace_id=coordinator_top_workspace_id,
+    )
     # Finalize each launched slot's generation to `attested` — best-effort, once startup
     # health gathered the composite evidence (#14203 j#87472; see the binding module).
     finalize_session_launch_generations(
