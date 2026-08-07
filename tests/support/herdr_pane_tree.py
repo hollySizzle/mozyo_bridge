@@ -244,6 +244,7 @@ class PaneTreeHerdr:
         #: Refuse or accept-without-changing ``pane resize`` for fault injection.
         self.resize_refused = False
         self.resize_unchanged = False
+        self.layout_unreadable_after_resize = False
         self.resizes: list = []
         #: Panes whose ``agent list`` row is shell residue — the durable identity is
         #: there, the managed agent is not. Rendered as a present-but-blank ``agent``
@@ -398,6 +399,8 @@ class PaneTreeHerdr:
         return rows + list(self.extra_rows)
 
     def _pane_layout(self, argv, tail):
+        if self.layout_unreadable_after_resize and self.resizes:
+            return self._done(argv, {"result": {"type": "not_pane_layout"}})
         pane_id = tail[tail.index("--pane") + 1] if "--pane" in tail else ""
         tab = self.tab_of(pane_id)
         if tab is None:

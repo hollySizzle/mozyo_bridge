@@ -233,10 +233,12 @@ def _resize_column_ratio(
         measured = read_pane_layout(
             target.pane, binary=binary, runner=runner, timeout=timeout, env=env
         )
-        measured_rect = measured.panes.get(target.pane) if measured else None
+        if measured is None:
+            return changed, "pane layout could not be read after project-column resize"
+        measured_rect = measured.panes.get(target.pane)
         measured_split = (
             governing_split(measured, measured_rect, "right")
-            if measured is not None and measured_rect is not None
+            if measured_rect is not None
             else None
         )
         if measured_split is None:

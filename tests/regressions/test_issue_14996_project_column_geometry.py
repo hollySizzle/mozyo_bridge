@@ -348,6 +348,17 @@ class ProjectColumnGeometryTest(unittest.TestCase):
         self.assertEqual(outcome, COLUMN_FAILED)
         self.assertIn("stopped moving", detail)
 
+    def test_unreadable_layout_after_resize_reports_the_read_failure(self):
+        env = _Env(self, PROJECT_A, PROJECT_B, PROJECT_C)
+        tab = env.herdr.new_tab()
+        env.seed_columns(tab, (PROJECT_A, ""), (PROJECT_B, ""))
+        launched = env.append_pair(tab, PROJECT_C)
+        env.herdr.layout_unreadable_after_resize = True
+        outcome, detail = env.run(env.result(PROJECT_C, list(launched)))
+        self.assertEqual(outcome, COLUMN_FAILED)
+        self.assertIn("pane layout could not be read after project-column resize", detail)
+        self.assertNotIn("lost its right-axis divider", detail)
+
     def test_already_columnar_tab_moves_no_pane(self):
         env = _Env(self, PROJECT_A, PROJECT_B)
         tab = env.herdr.new_tab()
