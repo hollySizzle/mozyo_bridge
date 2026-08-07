@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -41,17 +42,50 @@ def _copy_release_source_snapshot(
         )
         return f"cannot enumerate release source: {detail}"
 
-    destination.mkdir(parents=True, exist_ok=True)
+    entries: list[tuple[str, Path]] = []
     for raw in dict.fromkeys(listed.stdout.split("\0")):
         if not raw:
             continue
         relative = Path(raw)
         if relative.is_absolute() or ".." in relative.parts:
             return f"unsafe release source path from git: {raw!r}"
+        entries.append((raw, relative))
+
+    listed_parent_paths = frozenset(
+        parent
+        for _raw, relative in entries
+        for parent in relative.parents
+        if parent != Path(".")
+    )
+    resolved_repo = repo_root.resolve()
+    destination.mkdir(parents=True, exist_ok=True)
+    for raw, relative in entries:
         source = repo_root / relative
         if not source.exists() and not source.is_symlink():
             continue
-        if not source.is_file() and not source.is_symlink():
+        if source.is_dir() and not source.is_symlink():
+            if relative in listed_parent_paths:
+                # A deleted cached file may now be a non-ignored directory.
+                # Git lists both the stale cached path and its current children;
+                # materialize the children and skip only this container entry.
+                continue
+            return f"release source entry is not a file or symlink: {raw!r}"
+        if source.is_symlink():
+            try:
+                link_target = os.readlink(source)
+            except OSError as exc:
+                return f"cannot inspect release source symlink {raw!r}: {exc}"
+            if Path(link_target).is_absolute():
+                return f"absolute symlink is unsafe in release source: {raw!r}"
+            try:
+                resolved_target = source.resolve(strict=False)
+                resolved_target.relative_to(resolved_repo)
+            except (OSError, RuntimeError, ValueError):
+                return (
+                    "release source symlink escapes the repository snapshot: "
+                    f"{raw!r}"
+                )
+        elif not source.is_file():
             return f"release source entry is not a file or symlink: {raw!r}"
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)

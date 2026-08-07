@@ -64,13 +64,15 @@ def resolve_release_plan_authority(
 
 
 def render_testpypi_command(
-    authority: ReleasePlanAuthority, *, version: str
+    authority: ReleasePlanAuthority, *, version: str, repo_root: Path
 ) -> str:
-    """Render the complete current TestPyPI CLI, shell-parseably."""
+    """Render the complete cwd-independent TestPyPI CLI, shell-parseably."""
     argv: Sequence[str] = (
         "mozyo-bridge",
         "release",
         "publish",
+        "--repo",
+        str(repo_root.resolve()),
         "--testpypi",
         "--source-sha",
         authority.source_sha,

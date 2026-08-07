@@ -1059,6 +1059,185 @@ class ReleaseCheckArtifactTest(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         build_cwds[0].relative_to(repo)
 
+    def test_artifact_check_rejects_absolute_symlink_without_running_build(
+        self,
+    ) -> None:
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        with tempfile.TemporaryDirectory() as repo_str:
+            repo = Path(repo_str).resolve()
+            self._init_artifact_repo(repo)
+            victim = repo / "src" / "victim.txt"
+            victim.write_text("source\n", encoding="utf-8")
+            link = repo / "src" / "absolute-link.txt"
+            link.symlink_to(victim)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "add",
+                    "src/victim.txt",
+                    "src/absolute-link.txt",
+                ],
+                check=True,
+            )
+            before = self._worktree_fingerprint(repo)
+            original_run = release_mod._run
+            build_called = False
+
+            def fake_run(argv, cwd=None, check=False, env=None):
+                nonlocal build_called
+                if list(argv[:2]) == ["git", "ls-files"]:
+                    return original_run(argv, cwd=cwd, check=check, env=env)
+                build_called = True
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=0, stdout="", stderr=""
+                )
+
+            with patch.object(release_mod, "_run", side_effect=fake_run):
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    rc = release_mod.cmd_release_check_artifact(
+                        argparse.Namespace(repo=str(repo))
+                    )
+
+            self.assertEqual(release_mod.EXIT_BLOCKER, rc)
+            self.assertFalse(build_called)
+            self.assertIn("absolute symlink", out.getvalue())
+            self.assertEqual(before, self._worktree_fingerprint(repo))
+
+    def test_artifact_check_rejects_relative_symlink_escape(self) -> None:
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        with tempfile.TemporaryDirectory() as outer_str:
+            outer = Path(outer_str).resolve()
+            repo = outer / "repo"
+            self._init_artifact_repo(repo)
+            (outer / "outside.txt").write_text("outside\n", encoding="utf-8")
+            link = repo / "escape.txt"
+            link.symlink_to("../outside.txt")
+            subprocess.run(
+                ["git", "-C", str(repo), "add", "escape.txt"], check=True
+            )
+            original_run = release_mod._run
+            build_called = False
+
+            def fake_run(argv, cwd=None, check=False, env=None):
+                nonlocal build_called
+                if list(argv[:2]) == ["git", "ls-files"]:
+                    return original_run(argv, cwd=cwd, check=check, env=env)
+                build_called = True
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=0, stdout="", stderr=""
+                )
+
+            with patch.object(release_mod, "_run", side_effect=fake_run):
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    rc = release_mod.cmd_release_check_artifact(
+                        argparse.Namespace(repo=str(repo))
+                    )
+
+            self.assertEqual(release_mod.EXIT_BLOCKER, rc)
+            self.assertFalse(build_called)
+            self.assertIn("escapes the repository snapshot", out.getvalue())
+            self.assertEqual("outside\n", (outer / "outside.txt").read_text())
+
+    def test_artifact_check_keeps_internal_relative_symlink_inside_snapshot(
+        self,
+    ) -> None:
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        with tempfile.TemporaryDirectory() as repo_str:
+            repo = Path(repo_str).resolve()
+            self._init_artifact_repo(repo)
+            victim = repo / "src" / "victim.txt"
+            victim.write_text("source\n", encoding="utf-8")
+            link = repo / "src" / "relative-link.txt"
+            link.symlink_to("victim.txt")
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "add",
+                    "src/victim.txt",
+                    "src/relative-link.txt",
+                ],
+                check=True,
+            )
+            before = self._worktree_fingerprint(repo)
+            original_run = release_mod._run
+
+            def fake_run(argv, cwd=None, check=False, env=None):
+                if list(argv[:2]) == ["git", "ls-files"]:
+                    return original_run(argv, cwd=cwd, check=check, env=env)
+                build_root = Path(cwd)
+                (build_root / "src" / "relative-link.txt").write_text(
+                    "snapshot\n", encoding="utf-8"
+                )
+                outdir = Path(argv[argv.index("--outdir") + 1])
+                outdir.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(
+                    outdir / "package-0.1-py3-none-any.whl", "w"
+                ) as archive:
+                    archive.writestr("package.py", "VALUE = 1\n")
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=0, stdout="", stderr=""
+                )
+
+            with patch.object(release_mod, "_run", side_effect=fake_run):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = release_mod.cmd_release_check_artifact(
+                        argparse.Namespace(repo=str(repo))
+                    )
+
+            self.assertEqual(release_mod.EXIT_CLEAN, rc)
+            self.assertEqual(before, self._worktree_fingerprint(repo))
+            self.assertEqual("source\n", victim.read_text(encoding="utf-8"))
+
+    def test_artifact_check_materializes_tracked_file_replaced_by_directory(
+        self,
+    ) -> None:
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        with tempfile.TemporaryDirectory() as repo_str:
+            repo = Path(repo_str).resolve()
+            self._init_artifact_repo(repo)
+            shape = repo / "shape"
+            shape.write_text("tracked file\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "shape"], check=True)
+            shape.unlink()
+            shape.mkdir()
+            (shape / "child.txt").write_text("current tree\n", encoding="utf-8")
+            before = self._worktree_fingerprint(repo)
+            original_run = release_mod._run
+            copied_child: list[bytes] = []
+
+            def fake_run(argv, cwd=None, check=False, env=None):
+                if list(argv[:2]) == ["git", "ls-files"]:
+                    return original_run(argv, cwd=cwd, check=check, env=env)
+                build_root = Path(cwd)
+                copied_child.append((build_root / "shape" / "child.txt").read_bytes())
+                outdir = Path(argv[argv.index("--outdir") + 1])
+                outdir.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(
+                    outdir / "package-0.1-py3-none-any.whl", "w"
+                ) as archive:
+                    archive.writestr("package.py", "VALUE = 1\n")
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=0, stdout="", stderr=""
+                )
+
+            with patch.object(release_mod, "_run", side_effect=fake_run):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = release_mod.cmd_release_check_artifact(
+                        argparse.Namespace(repo=str(repo))
+                    )
+
+            self.assertEqual(release_mod.EXIT_CLEAN, rc)
+            self.assertEqual([b"current tree\n"], copied_child)
+            self.assertEqual(before, self._worktree_fingerprint(repo))
+
 
 class ReleaseCheckWorkflowTest(unittest.TestCase):
     def test_success_exits_zero(self) -> None:
@@ -1760,6 +1939,7 @@ class ReleasePublishTest(unittest.TestCase):
                     args=argv, returncode=0, stdout="origin\n", stderr=""
                 )
             if list(argv[:3]) == ["gh", "run", "list"]:
+                self.assertEqual(ROOT.resolve(), Path(cwd).resolve())
                 return subprocess.CompletedProcess(
                     args=argv, returncode=0, stdout="[]", stderr=""
                 )
@@ -1792,6 +1972,7 @@ class ReleasePublishTest(unittest.TestCase):
         self.assertEqual(source_sha, parsed.source_sha)
         self.assertEqual(__version__, parsed.expected_version)
         self.assertEqual("refs/heads/main", parsed.source_ref)
+        self.assertEqual(str(ROOT.resolve()), parsed.repo)
         with patch.object(
             release_mod, "_publish_testpypi", return_value=0
         ) as handler:

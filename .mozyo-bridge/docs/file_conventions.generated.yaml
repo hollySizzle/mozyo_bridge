@@ -492,6 +492,8 @@ rules:
 - name: release helper source and workflows
   patterns:
   - src/mozyo_bridge/e_130_governance_distribution/f_160_release_version_governance/application/release.py
+  - src/mozyo_bridge/e_130_governance_distribution/f_160_release_version_governance/application/release_publish_plan.py
+  - src/mozyo_bridge/e_130_governance_distribution/f_160_release_version_governance/application/release_source_snapshot.py
   - .github/workflows/**
   - scripts/disposable_ubuntu_smoke.py
   - pyproject.toml

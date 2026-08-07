@@ -1303,7 +1303,8 @@ def _publish_plan(args: argparse.Namespace) -> int:
             "1",
             "--json",
             "databaseId,createdAt,status,conclusion,headSha,url",
-        ]
+        ],
+        cwd=repo_root,
     )
     if test_runs.returncode == 0:
         try:
@@ -1340,7 +1341,7 @@ def _publish_plan(args: argparse.Namespace) -> int:
 
     _print_section("operator options")
     testpypi_command = release_publish_plan.render_testpypi_command(
-        authority, version=current_version
+        authority, version=current_version, repo_root=repo_root
     )
     print(
         "- TestPyPI rehearsal: "
