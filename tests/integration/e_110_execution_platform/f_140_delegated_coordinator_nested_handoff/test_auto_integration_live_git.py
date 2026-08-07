@@ -112,6 +112,8 @@ class _FullyAuthorizedReader:
 
 _GIT = shutil.which("git")
 
+_NO_AUTO_MAINTENANCE = "maintenance.auto=false"
+
 
 def _git(repo: Path, *args: str) -> str:
     result = subprocess.run(
@@ -120,12 +122,44 @@ def _git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def _disable_background_git_maintenance(repo: Path) -> None:
+    """Keep a synthetic repository's writer lifetime inside the foreground call.
+
+    Git 2.47+ may detach ``git maintenance run --auto`` after a foreground command.
+    That writer can recreate ``.git`` entries while ``TemporaryDirectory`` removes the
+    fixture, producing the teardown race measured by Redmine #14685.  Nothing in this
+    module exercises background maintenance, so every repository it creates opts out.
+    """
+    key, _, value = _NO_AUTO_MAINTENANCE.partition("=")
+    _git(repo, "config", "--local", key, value)
+
+
 def _init(repo: Path) -> None:
     repo.mkdir(parents=True, exist_ok=True)
     _git(repo, "init", "-q", "-b", "main")
+    _disable_background_git_maintenance(repo)
     _git(repo, "config", "user.email", "actuator@example.invalid")
     _git(repo, "config", "user.name", "actuator")
     _git(repo, "config", "commit.gpgsign", "false")
+
+
+def _init_bare(repo: Path) -> None:
+    repo.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "-b", "main", str(repo)],
+        check=True,
+        capture_output=True,
+    )
+    _disable_background_git_maintenance(repo)
+
+
+def _clone(source: Path, destination: Path, *, bare: bool = False) -> None:
+    argv = ["git", "clone"]
+    if bare:
+        argv.append("--bare")
+    argv.extend(("-q", str(source), str(destination)))
+    subprocess.run(argv, check=True, capture_output=True)
+    _disable_background_git_maintenance(destination)
 
 
 def _commit(repo: Path, name: str, text: str) -> str:
@@ -133,6 +167,32 @@ def _commit(repo: Path, name: str, text: str) -> str:
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", f"add {name}")
     return _git(repo, "rev-parse", "HEAD")
+
+
+@unittest.skipIf(_GIT is None, "git is not available on PATH")
+class SyntheticRepositoryMaintenanceGuardTest(unittest.TestCase):
+    """Every fixture creation shape locally disables detached auto-maintenance."""
+
+    def test_all_creation_helpers_pin_the_repository_local_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            _init(source)
+            _commit(source, "base.txt", "base")
+
+            bare = root / "bare.git"
+            clone = root / "clone"
+            bare_clone = root / "bare-clone.git"
+            _init_bare(bare)
+            _clone(source, clone)
+            _clone(source, bare_clone, bare=True)
+
+            key, _, expected = _NO_AUTO_MAINTENANCE.partition("=")
+            for repo in (source, bare, clone, bare_clone):
+                with self.subTest(repo=repo.name):
+                    self.assertEqual(
+                        _git(repo, "config", "--local", "--get", key), expected
+                    )
 
 
 @unittest.skipIf(_GIT is None, "git is not available on PATH")
@@ -586,10 +646,7 @@ class DeterministicMergeCommitTest(unittest.TestCase):
             _git(repo, "branch", "work")
             _git(repo, "worktree", "add", "-q", str(linked), "work")
             bare = root / "bare.git"
-            subprocess.run(
-                ["git", "clone", "--bare", "-q", str(repo), str(bare)],
-                check=True, capture_output=True,
-            )
+            _clone(repo, bare, bare=True)
 
             results = {}
             for shape, root_path in (
@@ -868,9 +925,7 @@ class DeterministicMergeCommitTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             remote = root / "origin.git"
-            subprocess.run(
-                ["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True
-            )
+            _init_bare(remote)
             repo = root / "repo"
             _init(repo)
             base = _commit(repo, "a.txt", "base")
@@ -1055,9 +1110,7 @@ class PushFailureClassificationTest(unittest.TestCase):
 
     def _scene(self, root: Path) -> "tuple[Path, Path]":
         remote = root / "origin.git"
-        subprocess.run(
-            ["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True
-        )
+        _init_bare(remote)
         repo = root / "repo"
         _init(repo)
         _commit(repo, "a.txt", "base")
@@ -1081,7 +1134,7 @@ class PushFailureClassificationTest(unittest.TestCase):
             _git(repo, "push", "-q", str(remote), "main")
             # Somebody else advances the remote, so ours is no longer a fast-forward.
             other = root / "other"
-            subprocess.run(["git", "clone", "-q", str(remote), str(other)], check=True)
+            _clone(remote, other)
             _git(other, "config", "user.email", "o@example.invalid")
             _git(other, "config", "user.name", "other")
             _commit(other, "theirs.txt", "theirs")
@@ -1175,9 +1228,7 @@ class UseCaseWorktreeSwapRegressionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             remote = root / "origin.git"
-            subprocess.run(
-                ["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True
-            )
+            _init_bare(remote)
             repo = root / "repo"
             _init(repo)
             base = _commit(repo, "a.txt", "base")
