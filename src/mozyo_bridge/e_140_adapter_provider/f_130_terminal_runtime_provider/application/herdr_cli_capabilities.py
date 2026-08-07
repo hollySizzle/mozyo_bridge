@@ -115,7 +115,8 @@ def observe_herdr_cli_capabilities(
     pane_usage = " ".join(pane_help.split())
     explicit_target = bool(
         re.search(
-            r"\bUsage:\s*herdr\s+pane\s+split\s+\[PANE_ID\](?:\s|$)",
+            r"\bUsage:\s*herdr\s+pane\s+split(?:\s+\[OPTIONS\])?"
+            r"\s+\[PANE_ID\](?:\s|$)",
             pane_usage,
         )
     )

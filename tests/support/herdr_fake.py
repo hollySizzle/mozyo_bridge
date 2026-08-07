@@ -916,6 +916,7 @@ class FakeHerdr:
             "echo_composer": self.echo_composer,
             "composer": dict(self._composer),
             "armed_transitions": [list(t) for t in self._armed_transitions],
+            "prepared_provider_functions": dict(self._prepared_provider_functions),
             "workspace_seq": self._workspace_seq,
             "workspaces": [
                 {
@@ -954,6 +955,21 @@ class FakeHerdr:
                 pane_env=dict(wsd.get("pane_env", {})),
                 tab_seq=int(wsd.get("tab_seq", 0)),
             )
+        prepared = state.get("prepared_provider_functions", {})
+        if not isinstance(prepared, dict):
+            raise UnknownHerdrCommandError(
+                "prepared_provider_functions state must be an object"
+            )
+        for pane_id, provider in prepared.items():
+            if (
+                not isinstance(pane_id, str)
+                or provider not in {"claude", "codex"}
+                or fake._workspace_of_pane(pane_id) is None
+            ):
+                raise UnknownHerdrCommandError(
+                    "prepared_provider_functions contains an invalid pane/provider"
+                )
+            fake._prepared_provider_functions[pane_id] = provider
         for ad in state.get("agents", []):
             fake._agents[ad["pane_id"]] = _Agent(
                 name=ad["name"], logical_name=ad.get("logical_name", ad["name"]),

@@ -350,6 +350,52 @@ class AgentStartTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 1)
         self.assertIn("no matching prepared claude function", completed.stderr)
 
+    def test_pane_preparation_survives_json_state_roundtrip(self) -> None:
+        fake = FakeHerdr()
+        wid = fake.seed_workspace(cwd="/workspace/project")
+        prepared = _payload(
+            fake.run(
+                [
+                    BINARY,
+                    "pane",
+                    "split",
+                    f"{wid}:p1",
+                    "--direction",
+                    "down",
+                    "--cwd",
+                    "/workspace/project",
+                    "--no-focus",
+                ]
+            )
+        )["result"]["pane"]["pane_id"]
+        fake.run(
+            [
+                BINARY,
+                "pane",
+                "run",
+                prepared,
+                'claude() { exec /private/action/claude "$@"; }',
+            ]
+        )
+
+        restored = FakeHerdr.from_state(json.loads(json.dumps(fake.to_state())))
+        completed = restored.run(
+            [
+                BINARY,
+                "agent",
+                "start",
+                native_name_for("mzb1_ws_claude_lane"),
+                "--kind",
+                "claude",
+                "--pane",
+                prepared,
+                "--",
+            ]
+        )
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(_payload(completed)["result"]["type"], "agent_started")
+
     def test_start_missing_name_positional_is_unmodelled(self) -> None:
         fake = FakeHerdr()
         with self.assertRaises(UnknownHerdrCommandError):

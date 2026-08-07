@@ -213,7 +213,7 @@ class Herdr080CapabilityPreflightTest(unittest.TestCase):
                 )
             elif tail[:2] == ["pane", "split"]:
                 text = (
-                    "Usage: herdr pane split [PANE_ID] --direction right|down "
+                    "Usage: herdr pane split [OPTIONS] [PANE_ID] --direction right|down "
                     "--cwd PATH --env K=V --focus --no-focus"
                 )
             else:
