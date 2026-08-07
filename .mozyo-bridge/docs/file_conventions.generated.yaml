@@ -19,6 +19,7 @@ rules:
   - .mozyo-bridge/docs/catalog.yaml.example
   - .mozyo-bridge/docs/file_conventions.generated.yaml
   - .mozyo-bridge/scaffold.json
+  - .mozyo-bridge/config.yaml
   - .mozyo-bridge/project-defaults.yaml
   - .mozyo-bridge/workspace-defaults.yaml
   - .mozyo-bridge/workspace-anchor.json
