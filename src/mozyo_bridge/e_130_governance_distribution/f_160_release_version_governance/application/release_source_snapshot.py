@@ -19,6 +19,23 @@ ArtifactScanner = Callable[
 ]
 
 
+def _relative_symlink_stays_within_repo(
+    relative: Path, link_target: str
+) -> bool:
+    """Whether ``link_target`` never climbs above the repository root."""
+    stack = [part for part in relative.parent.parts if part != "."]
+    for part in Path(link_target).parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not stack:
+                return False
+            stack.pop()
+            continue
+        stack.append(part)
+    return True
+
+
 def _copy_release_source_snapshot(
     repo_root: Path, destination: Path, *, run: RunCommand
 ) -> str | None:
@@ -77,6 +94,11 @@ def _copy_release_source_snapshot(
                 return f"cannot inspect release source symlink {raw!r}: {exc}"
             if Path(link_target).is_absolute():
                 return f"absolute symlink is unsafe in release source: {raw!r}"
+            if not _relative_symlink_stays_within_repo(relative, link_target):
+                return (
+                    "release source symlink escapes the repository snapshot: "
+                    f"{raw!r}"
+                )
             try:
                 resolved_target = source.resolve(strict=False)
                 resolved_target.relative_to(resolved_repo)

@@ -1142,6 +1142,53 @@ class ReleaseCheckArtifactTest(unittest.TestCase):
             self.assertIn("escapes the repository snapshot", out.getvalue())
             self.assertEqual("outside\n", (outer / "outside.txt").read_text())
 
+    def test_artifact_check_rejects_relative_escape_that_reenters_repo(
+        self,
+    ) -> None:
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        with tempfile.TemporaryDirectory() as outer_str:
+            repo = (Path(outer_str) / "repo").resolve()
+            self._init_artifact_repo(repo)
+            victim = repo / "src" / "victim.txt"
+            victim.write_text("source\n", encoding="utf-8")
+            link = repo / "src" / "reenter.txt"
+            target = "../" * 64 + victim.as_posix().lstrip("/")
+            link.symlink_to(target)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "add",
+                    "src/victim.txt",
+                    "src/reenter.txt",
+                ],
+                check=True,
+            )
+            original_run = release_mod._run
+            build_called = False
+
+            def fake_run(argv, cwd=None, check=False, env=None):
+                nonlocal build_called
+                if list(argv[:2]) == ["git", "ls-files"]:
+                    return original_run(argv, cwd=cwd, check=check, env=env)
+                build_called = True
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=0, stdout="", stderr=""
+                )
+
+            with patch.object(release_mod, "_run", side_effect=fake_run):
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    rc = release_mod.cmd_release_check_artifact(
+                        argparse.Namespace(repo=str(repo))
+                    )
+
+            self.assertEqual(release_mod.EXIT_BLOCKER, rc)
+            self.assertFalse(build_called)
+            self.assertIn("escapes the repository snapshot", out.getvalue())
+            self.assertEqual("source\n", victim.read_text(encoding="utf-8"))
+
     def test_artifact_check_keeps_internal_relative_symlink_inside_snapshot(
         self,
     ) -> None:
