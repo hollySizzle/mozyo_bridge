@@ -17,7 +17,7 @@
 
 - 登録済みテストコマンドを実行する正式な入口として `mozyo-bridge tests run` を追加しました。
 - 各実行はprocess単位の一時homeと書込み境界を使い、通常の `MOZYO_BRIDGE_HOME`、workspace registry、Git設定へ試験副作用を残さないようにしました。境界を証明できない環境ではテストを開始せず拒否します。
-- GitHub Actionsでは影響範囲を絞った通常検査と、単一Pythonでの全件検査、Python 3.10–3.13の明示的なfull matrixを分離しました。
+- 既存のGitHub Actions各検査も `mozyo-bridge tests run` / `tests profile` の隔離された実行境界へ移し、単一Pythonの全件検査とPython 3.10–3.13 full matrixが共有homeを書き換えないことを検証するようにしました。
 
 ### 終了済みサブレーンの退役
 
