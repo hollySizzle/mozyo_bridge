@@ -363,26 +363,26 @@ def prepare_session(
         # In the dict too: signature-only left the public rail unarmed (audit j#97177 F1).
         launch_cause=launch_cause,
     )
-    # Before the lock: acquiring it creates the home dir and a lock file, and a malformed
-    # ratio authority must cost neither (#14569 j#91331 R4-F1). The locked entry re-checks.
-    validate_pair_order(pair_order, providers, error_type=HerdrSessionStartError)
-    validate_coordinator_placement_request(
-        coordinator_placement_mode, coordinator_top_workspace_id,
+    # Pure request validation precedes the home lock, home reads, binary resolution and
+    # capability probes; the locked entry re-checks before actuation.
+    validate_session_request(
+        providers=providers, lane_id=lane_id,
+        coordinator_placement_mode=coordinator_placement_mode,
+        coordinator_top_workspace_id=coordinator_top_workspace_id,
+        claude_permission_mode_default=claude_permission_mode_default, env=env,
+        launch_context=launch_context, pair_order=pair_order,
         error_type=HerdrSessionStartError,
     )
-    if coordinator_placement_mode == ROLE_GROUPED_SPACE:
-        require_registered_top_workspace(
-            coordinator_top_workspace_id, home=mozyo_bridge_home()
-        )
-    # #15101: the capability check precedes even acquisition of the home-scoped
-    # attestation lock, whose first use may create its lock file.  Therefore an old or
-    # ambiguous Herdr CLI leaves neither Herdr state nor new mozyo runtime state behind.
     for provider in providers:
         if provider not in AGENT_PROVIDERS:
             raise HerdrSessionStartError(
                 f"unknown provider {provider!r}; expected one of "
                 f"{sorted(AGENT_PROVIDERS)}"
             )
+    if coordinator_placement_mode == ROLE_GROUPED_SPACE:
+        require_registered_top_workspace(
+            coordinator_top_workspace_id, home=mozyo_bridge_home()
+        )
     binary = _resolve_binary_or_die(env)
     capability_runner = runner or subprocess.run
     require_herdr_cli_capabilities(

@@ -4461,7 +4461,13 @@ class SessionStartCliTest(_SessionStartHarness, unittest.TestCase):
                 ["herdr", "session-start", "--agent", "claude", "--agent", "claude"]
             )
             args.repo = str(repo)
-            with contextlib.redirect_stderr(stderr):
+            # Keep this assertion valid on a host that has Herdr installed too: pure
+            # duplicate-slot validation must win even when binary resolution cannot.
+            with patch.dict(
+                os.environ,
+                {"MOZYO_HERDR_BINARY": "", "PATH": ""},
+                clear=False,
+            ), contextlib.redirect_stderr(stderr):
                 with self.assertRaises(SystemExit) as ctx:
                     args.func(args)
             # Non-zero fail-closed exit (die), not a silent success.
