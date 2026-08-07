@@ -35,8 +35,14 @@ import argparse
 import json
 import os
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Sequence
+
+if TYPE_CHECKING:
+    from mozyo_bridge.core.state.lane_lifecycle_model import LaneLifecycleRecord
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.reboot_residue_convergence import (  # noqa: E501
     RebootLaneFacts,
@@ -49,6 +55,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 #: The default integration branch when the caller names none. Read from the repo's committed
 #: sublane config where available; this constant is only the last-resort literal.
 _DEFAULT_INTEGRATION_BRANCH = "main"
+
+# Redmine caps collection pages at 100. Explicit chunks keep every response complete
+# without turning one supervisor pass into one request per lane.
+_ISSUE_STATE_BATCH_LIMIT = 100
+_ISSUE_STATE_TIMEOUT_SECONDS = 5.0
 
 
 class RebootAuditUnavailable(RuntimeError):
@@ -66,37 +77,40 @@ def read_issue_closed_states(
     issue_ids: Sequence[str],
     *,
     fetch: Optional[Callable[..., Mapping[str, object]]] = None,
+    opener: Optional[Callable[..., object]] = None,
     environ: Optional[Mapping[str, str]] = None,
     home: Optional[Path] = None,
 ) -> dict[str, Optional[bool]]:
-    """Read each issue's durable open/closed state, or ``None`` where it cannot be read.
+    """Read issues' durable open/closed state in bounded batches.
 
-    Uses the same credential-gated, redirect-refusing read transport the callback intake
-    uses (:func:`...live_redmine_journal_source.urllib_issue_detail_fetch`), so the API key
-    only ever reaches the trusted base URL and never appears in a message. Credentials come
-    from env / the home-scoped credential file only — never a repo-local file.
+    The normal path uses Redmine's ``issues.json?issue_id=...`` collection endpoint in chunks
+    of at most 100, with the shared credential-gated, redirect-refusing transport. Thus a
+    47-lane frontier costs one provider read per snapshot, not 47. ``fetch`` preserves the
+    legacy injected issue-detail seam for callers/tests that explicitly provide it; production
+    does not use that N-request path.
 
     **Unconfigured or unreachable is ``None``, never ``False``.** An issue whose state could
     not be read must not be treated as open (which would suppress a legitimate terminal
     convergence) nor as closed (which would propose terminalizing live work); the pure
     planner refuses to plan at all for it.
     """
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E501
-        LiveRedmineJournalError,
-        urllib_issue_detail_fetch,
-    )
     from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_context import (  # noqa: E501
         normalize_base_url,
     )
     from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_credentials import (  # noqa: E501
         resolve_redmine_credentials,
     )
+    from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_read_transport import (  # noqa: E501
+        no_redirect_read,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E501
+        LiveRedmineJournalError,
+    )
 
     wanted = tuple(sorted({(i or "").strip() for i in issue_ids if (i or "").strip()}))
     states: dict[str, Optional[bool]] = {issue: None for issue in wanted}
     if not wanted:
         return states
-    transport = fetch or urllib_issue_detail_fetch
     try:
         credentials = resolve_redmine_credentials(home, environ=environ)
         base_url = normalize_base_url(credentials.base_url)
@@ -104,28 +118,75 @@ def read_issue_closed_states(
         return states
     if not credentials.api_key or not base_url:
         return states
-    for issue in wanted:
+
+    if fetch is not None:
+        # Compatibility seam only. Keep injected issue-detail transports working while the
+        # production path below performs one collection request per bounded chunk.
+        for issue in wanted:
+            try:
+                payload = fetch(
+                    base_url=base_url,
+                    api_key=credentials.api_key,
+                    issue_id=issue,
+                    since=None,
+                )
+            except (LiveRedmineJournalError, OSError, ValueError):
+                continue
+            detail = payload.get("issue") if isinstance(payload, Mapping) else None
+            status = detail.get("status") if isinstance(detail, Mapping) else None
+            closed = status.get("is_closed") if isinstance(status, Mapping) else None
+            if isinstance(closed, bool):
+                states[issue] = closed
+        return states
+
+    read = opener or no_redirect_read
+    for start in range(0, len(wanted), _ISSUE_STATE_BATCH_LIMIT):
+        chunk = wanted[start : start + _ISSUE_STATE_BATCH_LIMIT]
+        query = urllib.parse.urlencode(
+            {
+                "issue_id": ",".join(chunk),
+                "status_id": "*",
+                "offset": "0",
+                "limit": str(len(chunk)),
+            }
+        )
+        request = urllib.request.Request(
+            f"{base_url}/issues.json?{query}",
+            headers={"X-Redmine-API-Key": credentials.api_key},
+        )
         try:
-            payload = transport(
-                base_url=base_url,
-                api_key=credentials.api_key,
-                issue_id=issue,
-                since=None,
-            )
-        except (LiveRedmineJournalError, OSError, ValueError):
+            with read(request, _ISSUE_STATE_TIMEOUT_SECONDS) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, OSError, ValueError, TypeError):
             continue
-        if not isinstance(payload, Mapping):
+        rows = payload.get("issues") if isinstance(payload, Mapping) else None
+        total_count = payload.get("total_count") if isinstance(payload, Mapping) else None
+        offset = payload.get("offset") if isinstance(payload, Mapping) else None
+        if (
+            not isinstance(rows, list)
+            or not isinstance(total_count, int)
+            or not isinstance(offset, int)
+            or offset != 0
+            or total_count != len(rows)
+            or total_count > len(chunk)
+        ):
+            # Missing pagination proof means the response may be truncated. Do not accept a
+            # partial snapshot as authority for a state-changing retirement.
             continue
-        detail = payload.get("issue")
-        if not isinstance(detail, Mapping):
-            continue
-        status = detail.get("status")
-        if not isinstance(status, Mapping) or "is_closed" not in status:
-            # A payload shape that does not positively carry the flag stays unknown rather
-            # than defaulting: Redmine always sends it, so its absence means we did not read
-            # what we think we read.
-            continue
-        states[issue] = bool(status.get("is_closed"))
+        wanted_chunk = set(chunk)
+        parsed: dict[str, list[bool]] = {}
+        for row in rows:
+            if not isinstance(row, Mapping) or row.get("id") is None:
+                continue
+            issue = str(row.get("id")).strip()
+            status = row.get("status")
+            closed = status.get("is_closed") if isinstance(status, Mapping) else None
+            if issue in wanted_chunk and isinstance(closed, bool):
+                parsed.setdefault(issue, []).append(closed)
+        for issue, values in parsed.items():
+            # Duplicate/conflicting provider rows are not a usable identity snapshot.
+            if len(values) == 1:
+                states[issue] = values[0]
     return states
 
 
@@ -207,16 +268,19 @@ def _lane_slot_facts(
 def gather_reboot_facts(
     repo_root: Path,
     *,
+    home: Optional[Path] = None,
     integration_branch: str = "",
     issue_states: Optional[Mapping[str, Optional[bool]]] = None,
+    lifecycle_rows: Optional[Sequence["LaneLifecycleRecord"]] = None,
     rows: Optional[Sequence[Mapping[str, object]]] = None,
     environ: Optional[Mapping[str, str]] = None,
 ) -> tuple[RebootLaneFacts, ...]:
     """Join all four authorities into one :class:`RebootLaneFacts` per lane (#14499 RB2).
 
     Scoped to the lanes this repo's workspace owns: the lifecycle store is host-global, and
-    reporting another project's lanes would invite acting on them. ``issue_states`` and
-    ``rows`` are injectable so the join can be exercised without a network or a live herdr.
+    reporting another project's lanes would invite acting on them. ``issue_states``,
+    ``lifecycle_rows`` and ``rows`` are injectable so a caller can bound the join before
+    expensive per-lane Git probes and exercise it without a network or a live herdr.
 
     Every axis fails to *unknown* independently: an unreadable lifecycle store yields no
     lanes at all (there is nothing to describe), while an unreadable inventory yields lanes
@@ -255,7 +319,7 @@ def gather_reboot_facts(
     )
 
     environ = environ if environ is not None else os.environ
-    workspace_id = repo_scope_workspace_id(repo_root)
+    workspace_id = repo_scope_workspace_id(repo_root, home=home)
     if not workspace_id:
         # Redmine #14499 review j#89191 finding 4 (adjacent instance): an unresolvable
         # workspace identity used to make the `mine` filter match nothing, which rendered as
@@ -265,7 +329,11 @@ def gather_reboot_facts(
             "the repo's workspace identity could not be resolved, so the lanes this repo "
             "owns cannot be determined. This is an unreadable authority, not an empty one"
         )
-    records = load_lane_lifecycle_readonly()
+    records = (
+        tuple(lifecycle_rows)
+        if lifecycle_rows is not None
+        else load_lane_lifecycle_readonly(home=home)
+    )
     if records is None:
         # `load_lane_lifecycle_readonly` returns None for its fail-closed cases (an
         # unreadable / newer / malformed / partial component schema) and () only for a
@@ -280,7 +348,7 @@ def gather_reboot_facts(
     if not mine:
         return ()
 
-    metadata = lane_records_by_unit(load_lane_records())
+    metadata = lane_records_by_unit(load_lane_records(home=home))
     try:
         managed_roles = (
             resolve_gateway_provider(str(repo_root)),
@@ -296,7 +364,7 @@ def gather_reboot_facts(
 
     if issue_states is None:
         issue_states = read_issue_closed_states(
-            [r.issue_id for r in mine], environ=environ
+            [r.issue_id for r in mine], environ=environ, home=home
         )
 
     ops = LiveSublaneLifecycleOps(repo_root=repo_root)

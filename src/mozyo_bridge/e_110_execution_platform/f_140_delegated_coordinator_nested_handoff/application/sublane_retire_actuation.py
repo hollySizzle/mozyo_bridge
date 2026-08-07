@@ -105,7 +105,9 @@ def run_guarded_retire_close(
     # pre-#13377 per-lane workspace (compatibility close) plus the metadata tombstone key.
     try:
         resolved_worktree = Path(worktree).expanduser().resolve()
-        workspace_id = herdr_workspace_segment(resolved_worktree)
+        workspace_id = herdr_workspace_segment(
+            resolved_worktree, home=getattr(args, "home", None)
+        )
     except (OSError, ValueError) as exc:
         return blocked_actuation(
             REASON_WORKSPACE_UNRESOLVED,
@@ -169,6 +171,7 @@ def run_guarded_retire_close(
             worktree_identity=metadata_token,
             expected_generation=getattr(evidence_target, "lane_generation", None),
             expected_revision=getattr(evidence_target, "revision", None),
+            home=getattr(args, "home", None),
         )
 
     # The owner / worktree axes run FIRST so their precise #13754 diagnoses survive: a lane with
@@ -275,7 +278,9 @@ def run_guarded_retire_close(
         plan,
         result,
         expected_live=expected_live_slots(rows, plan, managed_roles=managed_roles),
-        already_retired=lane_retired_durably(workspace_id, lane_label),
+        already_retired=lane_retired_durably(
+            workspace_id, lane_label, home=getattr(args, "home", None)
+        ),
     )
     if actuation.state == ACTUATION_CLOSED:
         # A real close is what makes the lane retired; record that fact in the durable
@@ -288,6 +293,7 @@ def run_guarded_retire_close(
                 lane_label=lane_label,
                 issue=getattr(args, "issue", "") or "",
                 journal=getattr(args, "journal", "") or "",
+                home=getattr(args, "home", None),
             ),
         )
         # Best-effort lane metadata tombstone (Redmine #13356 j#73386 Q2): the retire
@@ -301,7 +307,7 @@ def run_guarded_retire_close(
         # lifecycle disposition recorded above.
         from mozyo_bridge.core.state.lane_metadata import record_lane_retired
 
-        record_lane_retired(metadata_token)
+        record_lane_retired(metadata_token, home=getattr(args, "home", None))
     return actuation
 
 
@@ -313,6 +319,7 @@ def attest_retire_target(
     worktree_identity: str,
     expected_generation: "int | None" = None,
     expected_revision: "int | None" = None,
+    home: "Path | None" = None,
 ) -> tuple[bool, str, str]:
     """Attest the requested ``(issue, lane, worktree)`` name ONE durable lane unit (#13754).
 
@@ -386,7 +393,7 @@ def attest_retire_target(
             "cannot be verified before a close",
         )
     try:
-        record = LaneLifecycleStore().get(key)
+        record = LaneLifecycleStore(home=home).get(key)
     except (LaneLifecycleError, OSError) as exc:
         return (
             False,
@@ -445,7 +452,9 @@ def attest_retire_target(
     return True, "", ""
 
 
-def lane_retired_durably(workspace_id: str, lane_label: str) -> bool:
+def lane_retired_durably(
+    workspace_id: str, lane_label: str, *, home: "Path | None" = None
+) -> bool:
     """Does the durable lifecycle record this lane ``retired``? (fail-closed).
 
     The proof half of the verified idempotent no-op (Redmine #13754). The authority is
@@ -465,14 +474,17 @@ def lane_retired_durably(workspace_id: str, lane_label: str) -> bool:
     )
 
     try:
-        record = LaneLifecycleStore().get(LaneLifecycleKey(workspace_id, lane_label))
+        record = LaneLifecycleStore(home=home).get(
+            LaneLifecycleKey(workspace_id, lane_label)
+        )
     except (LaneLifecycleError, ValueError, OSError):
         return False
     return record is not None and record.lane_disposition == DISPOSITION_RETIRED
 
 
 def record_lane_retired_disposition(
-    *, workspace_id: str, lane_label: str, issue: str, journal: str
+    *, workspace_id: str, lane_label: str, issue: str, journal: str,
+    home: "Path | None" = None,
 ) -> str:
     """CAS the lane's durable disposition to ``retired`` after a real close (#13754).
 
@@ -514,7 +526,7 @@ def record_lane_retired_disposition(
         )
     except DecisionPointerError:
         return "not_recorded:no_durable_decision_anchor"
-    store = LaneLifecycleStore()
+    store = LaneLifecycleStore(home=home)
     try:
         record = store.get(key)
     except (LaneLifecycleError, OSError) as exc:

@@ -418,7 +418,7 @@ def run_hibernated_live_reconcile(
     # re-establishes and the guarded close attests against.
     try:
         resolved_worktree = Path(worktree).expanduser().resolve()
-        workspace_id = herdr_workspace_segment(resolved_worktree)
+        workspace_id = herdr_workspace_segment(resolved_worktree, home=getattr(args, "home", None))
     except (OSError, ValueError) as exc:
         return _blocked(
             REASON_WORKSPACE_UNRESOLVED,
@@ -497,7 +497,7 @@ def run_hibernated_live_reconcile(
             lane_id=lane_label,
         )
     try:
-        record = LaneLifecycleStore().get(key)
+        record = LaneLifecycleStore(home=getattr(args, "home", None)).get(key)
     except (LaneLifecycleError, OSError) as exc:
         return _blocked(
             RECON_LIFECYCLE_UNREADABLE,
@@ -858,7 +858,7 @@ def run_hibernated_live_reconcile(
         lifecycle_migration_payload,
     )
 
-    reconcile_store = LaneReconcileBindingStore()
+    reconcile_store = LaneReconcileBindingStore(home=getattr(args, "home", None))
     try:
         outcome = reconcile_store.retire_reconciled_hibernated_legacy(
             key,

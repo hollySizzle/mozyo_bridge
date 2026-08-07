@@ -235,7 +235,9 @@ def run_active_live_zero_retire(
     # Lane-unit resolution, identical to the #13754 guarded close / #13845 bound retire.
     try:
         resolved_worktree = Path(worktree).expanduser().resolve()
-        workspace_id = herdr_workspace_segment(resolved_worktree)
+        workspace_id = herdr_workspace_segment(
+            resolved_worktree, home=getattr(args, "home", None)
+        )
     except (OSError, ValueError) as exc:
         return _blocked(
             REASON_WORKSPACE_UNRESOLVED,
@@ -313,6 +315,7 @@ def run_active_live_zero_retire(
         lane_label,
         issue=issue,
         worktree_identity=metadata_token,
+        home=getattr(args, "home", None),
     )
     if not attested:
         return _blocked(
@@ -353,7 +356,9 @@ def run_active_live_zero_retire(
     # fix that either — an old binary would not read it (j#85269).
     try:
         with attestation_store_lock(
-            mozyo_bridge_home(), exclusive=True, blocking=False
+            Path(getattr(args, "home", None) or mozyo_bridge_home()),
+            exclusive=True,
+            blocking=False,
         ):
             return _terminalize_under_exclusion(
                 args,
@@ -442,7 +447,7 @@ def _terminalize_under_exclusion(
             lane_id=lane_label,
         )
     try:
-        record = LaneLifecycleStore().get(key)
+        record = LaneLifecycleStore(home=getattr(args, "home", None)).get(key)
     except (LaneLifecycleError, OSError) as exc:
         return _blocked(
             ACTIVE_RETIRE_LIFECYCLE_UNREADABLE,
@@ -535,7 +540,7 @@ def _terminalize_under_exclusion(
             workspace_id=workspace_id,
             lane_id=lane_label,
         )
-    store = LaneActiveRetireStore()
+    store = LaneActiveRetireStore(home=getattr(args, "home", None))
     try:
         outcome = store.retire_active_live_zero(
             key,

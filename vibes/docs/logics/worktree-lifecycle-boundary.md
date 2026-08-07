@@ -5,6 +5,8 @@ Redmine #11889 / #12603。git worktree の生成・削除・命名・並列運�
 > 本 doc は責務境界の **方針正本 + 汎用 runbook** である。#11889 時点では新しい core CLI worktree command を追加しない。#12603 / `sublane lifecycle and worktree integration late window` roadmap group では、設定駆動の sublane lifecycle として core-managed Git worktree / retire-time merge を導入するかを再設計する。実運用 policy (削除条件・N 本並列の上限など) は operator 判断であり、OSS default に固定しない。
 
 > **決着済みの例外 (Redmine #13686 / owner decision j#96335)**: 「retire 時の live merge を guarded actuator へ接続する」は、本 doc `## scope 境界 / Design Consultation triggers` が要求していた個別 issue + Design Consultation を経て決着した (設計 j#77124 / owner j#96335)。**ただし例外の範囲は integration に限られる** — 同 issue が実装した worktree remove / local branch delete は review j#96396 / j#96401 (各 finding 1) で **すべて撤去**された。git の primitive が「対象の identity を、それを破壊する invocation 自身で検証する」ことを許さず、別 invocation での検証と実行の間に foreign lane の checkout / 到達不能 commit を破壊し得たためである。**post-close の worktree remove と branch delete は本 doc の operator runbook のまま**であり、core に取り込まれていない。本 doc の中核方針は撤回されていない — core が worktree lifecycle を**無条件に**取り込むことは引き続き避け、actuator は既定 `mode: disabled` の opt-in であり、統合 authority も coordinator のままである。以下の `## core に含めないもの` は、この設定駆動 actuator の **integration 部分のみを例外として除いた** 範囲で読む。
+
+> **自動退役の追加境界 (Redmine #15066)**: workspace callback supervisor は callback/backlog delivery 後・hibernate 前・同じ lease 下で、一意な終了済み候補を 2 回全面再照合し、既存 `sublane retire` と共通の typed application API で managed process / lifecycle disposition を 1 pass 1件だけ収束させる。この追加は worktree lifecycle manager 化ではない。worktree remove / local branch delete は `cleanup_blocked` と本 doc の operator runbook に残り、force と remote branch 削除は禁止される。
 >
 > 配布注記: 実装構成の設計正本 [[logic-auto-integration-actuator]] は **mozyo_bridge repo-local であり配布されない**。配布先 (adopter) が読むべき正本は central preset `agent-workflow.md` `### Commit Hash Origin 到達可能性` の `coordinator_owned_auto_integration` であり、そこに許可条件・実行形態・記録・close 後 cleanup の safety 条件が揃っている。
 
@@ -82,6 +84,8 @@ runbook の原則:
 Redmine #11959。sublane の退役は、原則として main coordinator Codex の運用責務である。owner は成果物・release・権限・破壊的な project state の判断者であり、routine な lane 清掃のたびに owner 承認を求めると、sublane 運用が owner の手作業に依存してしまう。
 
 ただし、これは無条件の削除権限ではない。coordinator は退役前に objective な check を実施し、結果を durable record に残す。条件を満たす退役は coordinator authority で実行でき、条件外は owner または設計判断へ escalate する。
+
+自動 supervisor 経路もこの authority を弱めない。close、callback drain、最新 review / integration / CI、clean worktree、origin 到達性、exact lane generation / revision がすべて確認でき、候補が1件、かつ実行直前の再読が最初の snapshot と完全一致するときだけ高レベル退役処理を呼ぶ。曖昧・不明・競合・lease loss・先行 external mutation は typed zero-mutation に倒す。自動化の完了範囲は managed process / lifecycle terminalization で、下記の Git 削除条件と runbook は引き続き人が実行する物理清掃に適用する。
 
 ### coordinator が owner 確認なしに退役してよい条件
 

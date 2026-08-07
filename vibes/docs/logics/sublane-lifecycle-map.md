@@ -96,10 +96,12 @@ retire_三義:
           patch_equivalent (明示 evidence) は別 disposition。
 
 [6] retire / cleanup     close 後に lane を退役する (managed process / worktree / branch)。
-                         owner 確認なしに退役してよい条件は所有 doc。**actuator が自動化するのは
-                         managed process の解放だけ**で、worktree remove と local branch delete は
-                         どちらも operator runbook 側に残る (#13686 j#96396 / j#96401: 破壊的
-                         primitive に対象 identity を束縛する git の手段が無いため撤去)。
+                         owner 確認なしに退役してよい条件は所有 doc。callback supervisor は
+                         callback/backlog delivery 後・hibernate 前・同一 lease 下で一意な候補を
+                         2回全面再照合し、managed process / lifecycle disposition を1 pass 1件だけ
+                         自動収束する (#15066)。worktree remove と local branch delete は
+                         `cleanup_blocked` と operator runbook 側に残る (#13686 j#96396 / j#96401:
+                         破壊的 primitive に対象 identity を束縛する git の手段が無いため撤去)。
                          hibernated / released / unbound でcheckout消失済みの行は、専用railが
                          lifecycle metadataだけをterminal化できる (#14716)。checkoutを復元・削除せず、
                          worktree/branchの物理清掃を完了した意味にも読み替えない。

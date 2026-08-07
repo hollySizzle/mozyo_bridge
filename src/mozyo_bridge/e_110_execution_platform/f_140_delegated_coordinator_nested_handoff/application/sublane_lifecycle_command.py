@@ -56,6 +56,20 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     decide_create_launch,
     default_nongit_worktree_request,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_retire_application import (  # noqa: E501
+    RETIRE_INTENT_ACTIVE_LIVE_ZERO,
+    RETIRE_INTENT_ACTIVE_UNBOUND_LIVE_ZERO,
+    RETIRE_INTENT_EXECUTE,
+    RETIRE_INTENT_HIBERNATED_BOUND,
+    RETIRE_INTENT_HIBERNATED_UNBOUND_LIVE_ZERO,
+    RETIRE_INTENT_MIGRATE_HIBERNATED_LEGACY,
+    RETIRE_INTENT_PREFLIGHT,
+    RETIRE_INTENT_RECONCILE_HIBERNATED_LIVE,
+    RetireApplicationRequest,
+    RetireAssertions,
+    RetireIdentity,
+    run_retire_application,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (
     LiveSublaneGitOperations,
 )
@@ -216,44 +230,6 @@ class LiveSublaneLifecycleOps:
 # ---------------------------------------------------------------------------
 # Durable-record invariants the operator asserts for a retire (flag-driven).
 # ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class RetireAssertions:
-    """The config-undisableable retire invariants, asserted from the durable record.
-
-    These mirror the #12604 :class:`RetireInvariants`: facts no probe can infer, supplied
-    by the coordinator from the Redmine issue / journal state. Every default is the
-    unsatisfied (safe-failing) value, so a caller that omits a flag fails closed.
-
-    Redmine #13602 (Design Consultation j#76403, Option A): there is deliberately no
-    ``owner_approval_present`` assertion / ``--owner-approved`` flag — routine
-    green-preflight retirement is coordinator authority. ``issue_closed`` abstracts over the
-    close contract that applied to the issue type (a child Task/Test/Bug via ``task_close``
-    with no owner_close_approval; a US / standalone issue via an owner_close_approval-backed
-    close — central preset ``US-Level Audit Model``); retire never re-collects the owner
-    close approval. An outstanding owner-approval-waiting still blocks via
-    ``callbacks_drained``.
-    """
-
-    issue_closed: bool = False
-    callbacks_drained: bool = False
-    verification_passed: bool = False
-    durable_record_recorded: bool = False
-    target_identity_known: bool = False
-    #: The latest review generation is admissible for integration (#13518 review R2-F7 / R3-F2).
-    #: FAIL-CLOSED default: the actual `sublane retire` integration decision no longer default-admits
-    #: a stale last-write-wins approval — the coordinator must positively assert (from the durable
-    #: review journals) OR the CLI must measure it via `evaluate_integration_admissible`.
-    #:
-    #: Redmine #14539: a review-EXEMPT lane (a valid `codex_direct_edit` gate with
-    #: `follow_up_review: false`) has NO review generation, so the assert could only be made
-    #: untruthfully for it. `--review-exemption-json` measures the equivalent durable evidence
-    #: (exemption + Close + complete integration) at action time instead.
-    latest_generation_admissible: bool = False
-    #: The TYPED reason the admissibility resolution refused, when a route produced one (Redmine
-    #: #14695 review j#93807 finding 2). Empty keeps the generic ``stale_review_generation``.
-    latest_generation_blocked_reason: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -719,10 +695,13 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    # Resolved ONCE, before the decision, and carried to the commit point: the same lane row the
-    # retire is admitted against must still be the row the destructive close acts on
-    # (Redmine #14539 review j#91847 finding 2).
-    evidence_target = resolve_retire_evidence_target(args, _repo_root(args))
+    # Resolve durable review admissibility before entering the shared typed facade.  The facade
+    # re-resolves the lane identity at the action edge and compares it byte-for-byte with this
+    # first snapshot, so CLI and supervisor now share the same preflight/intent fence (#15066).
+    state_home = getattr(args, "home", None)
+    evidence_target = resolve_retire_evidence_target(
+        args, _repo_root(args), home=state_home
+    )
     _generation_admissibility = _resolve_latest_generation_admissible(
         args, target=evidence_target, repo_root=_repo_root(args)
     )
@@ -750,76 +729,94 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
         latest_generation_blocked_reason=_generation_admissibility.reason,
     )
     repo_root = _repo_root(args)
-    # Redmine #13331 review j#73338: probe the TARGET lane worktree's dirty state (the
-    # thing being retired), not the repo the command runs in. A clean coordinator repo must
-    # not let a dirty lane worktree pass `may_retire` (and, under `--execute`, close its
-    # managed agents). `LiveSublaneGitOperations.worktree_dirty()` fails closed (an
-    # uninspectable / non-git path reads as dirty), so a missing / bad `--worktree` blocks.
     worktree = getattr(args, "worktree", None)
-    worktree_dirty_override = None
-    worktree_missing = False
-    # The two unbound live-zero rails have no checkout in scope. An optional --worktree only
-    # widens legacy inventory and, for the hibernated sibling, can refuse a metadata mismatch;
-    # it never authorizes cleanup or a Git probe.
-    checkout_in_scope = not any(
+    selected_intent = RETIRE_INTENT_PREFLIGHT
+    for enabled, token in (
+        (getattr(args, "execute", False), RETIRE_INTENT_EXECUTE),
         (
-            bool(getattr(args, "retire_active_unbound_live_zero", False)),
-            bool(getattr(args, "retire_hibernated_unbound_live_zero", False)),
+            getattr(args, "migrate_hibernated_legacy", False),
+            RETIRE_INTENT_MIGRATE_HIBERNATED_LEGACY,
+        ),
+        (
+            getattr(args, "reconcile_hibernated_live", False),
+            RETIRE_INTENT_RECONCILE_HIBERNATED_LIVE,
+        ),
+        (
+            getattr(args, "retire_hibernated_bound", False),
+            RETIRE_INTENT_HIBERNATED_BOUND,
+        ),
+        (
+            getattr(args, "retire_active_live_zero", False),
+            RETIRE_INTENT_ACTIVE_LIVE_ZERO,
+        ),
+        (
+            getattr(args, "retire_active_unbound_live_zero", False),
+            RETIRE_INTENT_ACTIVE_UNBOUND_LIVE_ZERO,
+        ),
+        (
+            getattr(args, "retire_hibernated_unbound_live_zero", False),
+            RETIRE_INTENT_HIBERNATED_UNBOUND_LIVE_ZERO,
+        ),
+    ):
+        if enabled:
+            selected_intent = token
+            break
+    identity = (
+        RetireIdentity(
+            workspace=evidence_target.workspace,
+            # Preserve the CLI's intent-specific issue/lane mismatch diagnosis. The
+            # supervisor supplies its independently selected issue as the expectation;
+            # the CLI pins the row it just measured and lets the existing intent rail
+            # produce its established mismatch reason/output shape.
+            issue=str(
+                getattr(evidence_target, "issue", None)
+                or getattr(args, "issue", "")
+                or ""
+            ),
+            lane=evidence_target.lane,
+            lane_generation=evidence_target.lane_generation,
+            revision=evidence_target.revision,
+        )
+        if evidence_target is not None
+        else None
+    )
+    application = run_retire_application(
+        RetireApplicationRequest(
+            repo_root=repo_root,
+            home=state_home,
+            issue=str(getattr(args, "issue", "") or ""),
+            lane_label=str(getattr(args, "lane_label", "") or ""),
+            assertions=assertions,
+            intent=selected_intent,
+            worktree=worktree,
+            branch=getattr(args, "branch", None),
+            integration_branch=getattr(args, "integration_branch", None),
+            journal=getattr(args, "journal", None),
+            expect_lane_generation=getattr(args, "expect_lane_generation", 0),
+            expect_lane_revision=getattr(args, "expect_lane_revision", 0),
+            integration_journal=getattr(args, "integration_journal", None),
+            expected_identity=identity,
         )
     )
-    if worktree and checkout_in_scope:
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (  # noqa: E501
-            LiveSublaneGitOperations,
+    outcome = application.preflight
+    if outcome is None:
+        payload = {
+            "retire_application": application.as_payload(),
+            "retire_ok": False,
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        else:
+            print(f"retire blocked: {application.reason}", file=sys.stderr)
+        return 1
+    if application.intents is None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_retire_intents import (  # noqa: E501
+            RetireIntentResults,
         )
 
-        # Redmine #14499: measure "is the recorded checkout still there?" BEFORE probing it.
-        # After a host reboot every lane worktree under `/private/tmp` is gone, and the dirty
-        # probe below used to raise `FileNotFoundError` straight out of this read-only
-        # preflight — `subprocess.run(cwd=<missing>)` raises rather than exiting non-zero
-        # (six production runs, effects 0: #14203 j#89077 / #14476 j#89076 / #14478 j#89078 /
-        # #14479 j#89079 / #14480 j#89080 / #14482 j#89081). The probe itself is now
-        # OSError-safe, so the traceback cannot escape from anywhere; this positive
-        # measurement additionally lets the preflight say `worktree_missing_after_reboot`
-        # instead of the fail-closed `dirty_worktree` the unreadable path would produce.
-        # A path that cannot be inspected at all (a permission error on an ancestor) stays
-        # `False` here — unknown is never reported as missing — and still blocks as dirty.
-        try:
-            worktree_missing = not Path(worktree).expanduser().is_dir()
-        except OSError:
-            worktree_missing = False
-        worktree_dirty_override = LiveSublaneGitOperations(
-            repo_root=Path(worktree)
-        ).worktree_dirty()
-    use_case = SublaneRetireUseCase(LiveSublaneLifecycleOps(repo_root=repo_root))
-    outcome = use_case.run(
-        issue=getattr(args, "issue", "") or "",
-        lane_label=getattr(args, "lane_label", "") or "",
-        worktree_path=worktree,
-        branch=getattr(args, "branch", None),
-        integration_branch=getattr(args, "integration_branch", None),
-        assertions=assertions,
-        worktree_dirty_override=worktree_dirty_override,
-        worktree_missing=worktree_missing,
-        checkout_in_scope=checkout_in_scope,
-    )
-    # The seven mutually exclusive retire intents (guarded close / hibernated-legacy migration /
-    # hibernated-live reconcile / hibernated-bound terminal retire / active live-zero terminal
-    # retire / active UNBOUND live-zero terminal retire / hibernated UNBOUND live-zero terminal
-    # retire) live in `sublane_retire_intents`, which
-    # runs exactly one of them — and only when the fail-closed preflight already permits
-    # retirement. Relocated there in Redmine #14499 when the sixth intent pushed this module
-    # over the module-health threshold; the dispatch is byte-for-byte the chain that was here.
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_retire_intents import (  # noqa: E501
-        dispatch_retire_intent,
-    )
-
-    intents = dispatch_retire_intent(
-        args,
-        repo_root,
-        may_retire=outcome.preflight.may_retire,
-        worktree=worktree,
-        evidence_target=evidence_target,
-    )
+        intents = RetireIntentResults()
+    else:
+        intents = application.intents
     close_result = intents.close_result
     migration_result = intents.migration_result
     reconcile_result = intents.reconcile_result
@@ -828,37 +825,30 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
     unbound_retire_result = intents.unbound_retire_result
     hibernated_unbound_retire_result = intents.hibernated_unbound_retire_result
     payload = outcome.as_payload()
+    payload["retire_application"] = application.as_payload()
     # Redmine #13754: the ACTUATION verdict — not the preflight — decides whether the lane
     # was actually retired. ``decision.state: retire_ok`` says the retire was *permitted*;
     # reading it as "the pair is gone" is exactly the #13748 j#77473 misread (empty close,
     # exit 0, pair still live). Under --execute / --migrate-hibernated-legacy the command's
     # success is the conjunction of the preflight AND the actuation / migration verdict,
     # surfaced as one unambiguous ``retire_ok`` and in the exit code.
-    actuated_ok = True
     if close_result is not None:
         payload["herdr_retire_close"] = close_result.as_payload()
-        actuated_ok = close_result.ok
     if migration_result is not None:
         payload["hibernated_legacy_retire_migration"] = migration_result.as_payload()
-        actuated_ok = migration_result.ok
     if reconcile_result is not None:
         payload["hibernated_live_reconcile"] = reconcile_result.as_payload()
-        actuated_ok = reconcile_result.ok
     if bound_retire_result is not None:
         payload["hibernated_bound_retire"] = bound_retire_result.as_payload()
-        actuated_ok = bound_retire_result.ok
     if active_retire_result is not None:
         payload["active_live_zero_retire"] = active_retire_result.as_payload()
-        actuated_ok = active_retire_result.ok
     if unbound_retire_result is not None:
         payload["active_unbound_live_zero_retire"] = unbound_retire_result.as_payload()
-        actuated_ok = unbound_retire_result.ok
     if hibernated_unbound_retire_result is not None:
         payload["hibernated_unbound_live_zero_retire"] = (
             hibernated_unbound_retire_result.as_payload()
         )
-        actuated_ok = hibernated_unbound_retire_result.ok
-    payload["retire_ok"] = bool(outcome.preflight.may_retire and actuated_ok)
+    payload["retire_ok"] = bool(application.legacy_cli_ok)
     if getattr(args, "json", False):
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     else:
@@ -909,7 +899,7 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
                     hibernated_unbound_retire_result
                 )
             )
-    return 0 if (outcome.preflight.may_retire and actuated_ok) else 1
+    return 0 if application.legacy_cli_ok else 1
 
 
 __all__ = (

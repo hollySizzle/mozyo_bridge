@@ -660,7 +660,7 @@ lane 数の叙述は `sublane_projection` (検証済み projection) からのみ
 8. sublane Claude が implementation_done / review_request を Redmine に記録する。commit hash を gate に書く場合は origin reachability を先に確認する。
 9. sublane は handoff-worthy state で管制塔 Codex へ callback する。callback は Redmine durable anchor への pointer であり、work log ではない。
 10. 管制塔 Codex が review / owner close approval / integration disposition / Close Gate を処理する。
-11. close 後、管制塔 Codex が retirement drain を実行する。retire_ready / retired journal で destructive 操作の前後を bracket する。
+11. close 後、管制塔 Codex が retirement drain を実行する。workspace callback supervisor は callback/backlog delivery 後・hibernate 前に、一意な候補を同じ lease と pass-wide mutation budget 下で自動 terminalize できる。物理 worktree / local branch 清掃は `cleanup_blocked` のまま operator runbook で行い、retire_ready / retired journal で destructive 操作の前後を bracket する。
 12. callback / review / owner / integration / close / retirement を drain してから、pipeline fill を再実行し、その後に後続 Version / US 提案へ進む。
 
 ### callback 欠落時の sweep
@@ -870,6 +870,14 @@ routine retirement の条件:
 - lane identity が明確で、削除対象 worktree を取り違えない。
 
 条件を満たす場合、管制塔は owner 確認なしに退役してよい。条件を外れる場合は Redmine に理由を残し、retirement を止める。
+
+### workspace supervisor の自動退役
+
+`workflow supervisor --run-once` / `--watch` の既存 bounded pass は、callback/backlog delivery 後・hibernate 前に退役 leg を実行する。第二 supervisor、第二 queue、`workflow step` の候補探索責務は追加しない。callback delivery / auto-integration / retire / hibernate は pass-wide の外部変更上限1件を共有し、先行 mutation または uncertain があれば退役を defer、退役が mutation または uncertain なら hibernate と後続 workspace を defer する。
+
+候補は durable issue close、callback debt 0、最新 review approval、integration disposition、exact integration CI green、owner gate 解消、clean worktree、branch tip一致、source/integration commit の `origin/<integration_branch>` 到達性、exact workspace/lane/generation/revisionを満たすものに限定する。候補生成時と effect 直前に全 evidence を再生成し、2 snapshot の完全一致と exactly one candidate を要求する。不明・複数・drift・lease lossは fixed reason の zero-mutationである。実行は公開 `sublane retire` と同じ typed application API / intent rail を使い、CLI subprocessや散文解析を使わない。
+
+自動退役の成功は managed process と lifecycle row の terminal dispositionを意味するが、Git worktree / local branch の削除完了を意味しない。Git 2.50.1 の実測では identity と path/tipを削除 invocation自身へ不可分に束縛できる通常系 primitiveがないため、physical cleanup は常に `cleanup_blocked` と既存 runbookへ残す。`git worktree remove` と `git branch -d` のみを人が実行し、forceとremote branch削除は禁止する。
 
 ### 退役 fixed fields
 

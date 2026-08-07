@@ -230,7 +230,9 @@ def run_active_unbound_live_zero_retire(
             lane_id=lane_label,
         )
 
-    workspace_id = repo_scope_workspace_id(repo_root)
+    workspace_id = repo_scope_workspace_id(
+        repo_root, home=getattr(args, "home", None)
+    )
     if not workspace_id:
         return _blocked(
             UNBOUND_RETIRE_WORKSPACE_UNRESOLVED,
@@ -313,7 +315,9 @@ def run_active_unbound_live_zero_retire(
     # releases it at the OS level, so there is no stale claim or TTL to get wrong.
     try:
         with attestation_store_lock(
-            mozyo_bridge_home(), exclusive=True, blocking=False
+            Path(getattr(args, "home", None) or mozyo_bridge_home()),
+            exclusive=True,
+            blocking=False,
         ):
             return _terminalize_under_exclusion(
                 args,
@@ -475,7 +479,7 @@ def _terminalize_under_exclusion(
             lane_id=lane_label,
         )
     try:
-        record = LaneLifecycleStore().get(key)
+        record = LaneLifecycleStore(home=getattr(args, "home", None)).get(key)
     except (LaneLifecycleError, OSError) as exc:
         return _blocked(
             UNBOUND_RETIRE_LIFECYCLE_UNREADABLE,
@@ -523,7 +527,9 @@ def _terminalize_under_exclusion(
     # CAS's ``not_active_unbound_state``, which names the disposition rather than blaming
     # lane selection for it.
     if record.lane_disposition == DISPOSITION_ACTIVE:
-        owner = LaneLifecycleStore().resolve_owner(workspace_id, issue)
+        owner = LaneLifecycleStore(home=getattr(args, "home", None)).resolve_owner(
+            workspace_id, issue
+        )
         if owner.status != OWNER_RESOLVED:
             return _blocked(
                 UNBOUND_RETIRE_LANE_SELECTION_UNPROVEN,
@@ -632,7 +638,7 @@ def _terminalize_under_exclusion(
             workspace_id=workspace_id,
             lane_id=lane_label,
         )
-    store = LaneActiveUnboundRetireStore()
+    store = LaneActiveUnboundRetireStore(home=getattr(args, "home", None))
     try:
         outcome = store.retire_active_unbound_live_zero(
             key,

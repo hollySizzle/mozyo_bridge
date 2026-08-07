@@ -47,6 +47,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
     workspace_hibernate_leg as _hibernate,
+    workspace_retire_leg as _retire,
     workspace_delivery_leg as _delivery,
     pass_external_budget as _pxb,
 )
@@ -181,6 +182,7 @@ class WorkspaceCallbackSupervisor:
             Callable[[str, Sequence[str]], "tuple[tuple[str, ...], tuple[str, ...], Callable[[Sequence[str]], None]]"]
         ] = None,
         hibernate_leg_fn: Optional[Callable[[SupervisedWorkspace, Callable[[], bool]], object]] = None,
+        retire_leg_fn: Optional[Callable[..., object]] = None,
         auto_integration_leg_fn: Optional[Callable[[str, str, object], object]] = None,
     ) -> None:
         holder = str(holder or "").strip()
@@ -211,6 +213,9 @@ class WorkspaceCallbackSupervisor:
         # Redmine #14219 T2c: the auto-hibernate mode leg — one bounded pass per leased
         # workspace (`workspace_hibernate_leg`). Optional: unwired -> the mode fails closed.
         self._hibernate_leg_fn = hibernate_leg_fn
+        # Redmine #15066: post-close terminal retire runs under the same workspace lease after
+        # callback/backlog delivery and before hibernate, sharing the pass mutation budget.
+        self._retire_leg_fn = retire_leg_fn
         # Redmine #14825: the durable registered-action / asynchronous-CI continuation owner.
         # It runs on the same leased issue path and shares the pass's one external-mutation
         # budget, so an accepted push never follows a callback wake in the same bounded pass.
@@ -390,10 +395,9 @@ class WorkspaceCallbackSupervisor:
                 self, ws, wsid, lease, mode=mode, wake_issues=wake_issues,
                 authoritative=authoritative, pass_budget=pass_budget,
             )
-            # Redmine #14219 T3 (Answer j#87108, review j#87154 R1-F1/F2/F3): fold the auto-
-            # hibernate after-leg into THIS pass under the lease we STILL HOLD (no release then
-            # re-acquire), sharing the pass's ONE external-mutation budget with the delivery legs
-            # and binding a local_wake candidate to the woken issues. One authority marks the budget.
+            # Fold post-close retire, then auto-hibernate, into THIS pass under the lease we STILL
+            # HOLD (no release/re-acquire). Both share the ONE external-mutation budget with the
+            # delivery legs and bind local-wake candidates to the woken issues.
             if pass_budget is not None:
                 def _renew() -> bool:
                     return bool(
@@ -402,6 +406,11 @@ class WorkspaceCallbackSupervisor:
                         )
                     )
 
+                outcome = _retire.run_folded_retire(
+                    self, ws, outcome, mode=mode, pass_budget=pass_budget,
+                    bound_issues=wake_issues, renew=_renew,
+                )
+                _retire.mark_pass_budget(pass_budget, outcome)
                 outcome = _hibernate.run_folded_hibernate(
                     self, ws, outcome, mode=mode, pass_budget=pass_budget,
                     bound_issues=wake_issues, renew=_renew,
@@ -632,8 +641,9 @@ class WorkspaceCallbackSupervisor:
         ):
             try:
                 self._reconcile_leg_fn(workspace_id, issue, source)
-            except Exception:  # noqa: BLE001 - a reconcile failure never breaks the sweep
-                pass
+            except Exception:  # noqa: BLE001 - effect may be unknown; stop later mutations
+                if pass_budget is not None:
+                    pass_budget["uncertain"] = True
 
         if self._auto_integration_leg_fn is not None and not (
             pass_budget is not None and _pxb.budget_spent(pass_budget)
@@ -645,8 +655,9 @@ class WorkspaceCallbackSupervisor:
                         pass_budget["mutated"] = True
                     if bool(getattr(auto_outcome, "uncertain", False)):
                         pass_budget["uncertain"] = True
-            except Exception:  # noqa: BLE001 - one continuation never breaks the sweep
-                pass
+            except Exception:  # noqa: BLE001 - effect may be unknown; stop later mutations
+                if pass_budget is not None:
+                    pass_budget["uncertain"] = True
 
         deliver = report.get("deliver") or {}
         sweep = report.get("sweep") or {}
@@ -864,6 +875,9 @@ def build_supervisor(
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.auto_integration_supervisor import (  # noqa: E501
         build_auto_integration_supervisor_leg,
     )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.retire_supervisor_wiring import (  # noqa: E501
+        default_retire_leg_fn,
+    )
 
     workspaces_fn = lambda: default_workspaces(home=home)
     auto_integration_leg_fn = build_auto_integration_supervisor_leg(
@@ -901,6 +915,7 @@ def build_supervisor(
             home=home, outbox=outbox, source_fn=lambda ws: default_redmine_source(ws, home=home),
             clock_fn=_utc_now_iso,
         ),
+        retire_leg_fn=default_retire_leg_fn(home=home, outbox=outbox),
         auto_integration_leg_fn=auto_integration_leg_fn,
     )
 

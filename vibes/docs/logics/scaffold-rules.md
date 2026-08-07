@@ -284,6 +284,9 @@ must not add another runbook file.
   paths, internal lane policy, or operator-specific N-lane rules into the
   shipped docs, and do not add a core `git worktree add/remove` lifecycle
   command — worktree lifecycle stays a runbook/recipe, not core CLI.
+- Redmine #15066 の supervisor 自動退役は managed process / lifecycle
+  terminalization までで、physical cleanup は `cleanup_blocked` と上記
+  runbook に残る。この境界は core worktree lifecycle command の追加ではない。
 
 ### Opt-in: sublane-flow
 

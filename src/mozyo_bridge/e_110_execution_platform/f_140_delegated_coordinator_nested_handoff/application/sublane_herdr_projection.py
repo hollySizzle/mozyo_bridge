@@ -148,7 +148,9 @@ def list_herdr_agent_rows(env: Mapping[str, str]) -> Sequence[Mapping[str, objec
     return _list_rows(binary, subprocess.run, 30.0)
 
 
-def repo_scope_workspace_id(repo_root: Path) -> str:
+def repo_scope_workspace_id(
+    repo_root: Path, *, home: Optional[Path] = None
+) -> str:
     """The caller repo's MAIN workspace identity — the record-scoping key (j#73469).
 
     ``sublane create`` stamps each lane record's ``repo_workspace_id`` with the
@@ -170,9 +172,13 @@ def repo_scope_workspace_id(repo_root: Path) -> str:
     try:
         resolved = Path(repo_root).expanduser().resolve()
         main_root = _main_worktree_root(resolved)
-        return herdr_workspace_segment(
-            main_root if main_root is not None else resolved
-        )
+        target = main_root if main_root is not None else resolved
+        # Keep the historical one-positional-argument call byte-for-byte when no
+        # explicit state home was supplied. Besides compatibility for injected
+        # adapters, this prevents an optional extension from changing the default rail.
+        if home is None:
+            return herdr_workspace_segment(target)
+        return herdr_workspace_segment(target, home=home)
     except (OSError, ValueError):
         return ""
 

@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 from typing import Iterable, Sequence
 
 from . import hibernate_report_rollup as _hib_rollup
+from . import retire_report_rollup as _retire_rollup
 
 # ---------------------------------------------------------------------------
 # Supervision modes (machine-readable; literal regardless of UI language).
@@ -116,6 +117,12 @@ SKIP_HIBERNATE_DELIVERY_UNCERTAIN = "hibernate_delivery_uncertain"
 #: woken for (lease-owned durable wake + explicit hint). A workspace with no wake binding this
 #: pass actuates nothing — only the timer/reconciliation fallback does full candidate selection.
 SKIP_HIBERNATE_WAKE_UNBOUND = "hibernate_wake_unbound"
+#: Automatic-retire after-leg outcomes (#15066).  These are deliberately separate from the
+#: hibernate vocabulary: retirement is post-close terminalization; hibernate keeps an open lane.
+SKIP_RETIRE_LEG_ERROR = "retire_leg_error"
+SKIP_RETIRE_BUDGET_DEFERRED = "retire_budget_deferred"
+SKIP_RETIRE_DELIVERY_UNCERTAIN = "retire_delivery_uncertain"
+SKIP_RETIRE_WAKE_UNBOUND = "retire_wake_unbound"
 #: The whole bounded pass already spent its ONE external mutation (Redmine #14219 T3 Final Design
 #: Disposition j#87188 = B): a callback delivery / reconcile side-effect / hibernate mutation (or an
 #: UNCERTAIN one) fired in an earlier workspace, so this workspace performs NO external side effect —
@@ -551,43 +558,27 @@ class WorkspaceSupervisionOutcome:
     lease_reason: str
     supervised_issues: tuple[str, ...] = ()
     ignored_wake_issues: tuple[str, ...] = ()
-    #: Roster issues dropped because this workspace is not their authoritative owner (#13968 F1):
-    #: another workspace owns the issue, or ownership is absent / ambiguous. Surfaced (not silently
-    #: dropped) so a fail-closed zero-supervise is operator-visible in the report.
+    #: Roster issues this workspace does not authoritatively own (#13968 F1).
     non_authoritative_issues: tuple[str, ...] = ()
     issues: tuple[IssueSupervisionOutcome, ...] = ()
     skipped_reason: str = ""
-    #: Roster issues the changed-work incremental read skipped this provider-reconcile pass (Redmine
-    #: #14150 review F2): unchanged externally (provider changed-work watermark) AND locally, with no
-    #: un-accounted local work — so no provider read fired for them (their safe pending is drained
-    #: locally). Surfaced so the incremental skip is operator-visible, never a silent drop.
+    #: Issues skipped by the changed-work incremental provider read (#14150).
     reconcile_skipped_issues: tuple[str, ...] = ()
-    #: The ACTUAL ticket-provider read count for this workspace (Redmine #14150 review F2): the number
-    #: of ``read_entries`` (one HTTP fetch each) the reconcile source served this pass — supply +
-    #: discovery + dispatch-anchor + review-identity + review_return / lane_gateway discovery +
-    #: own-workspace backlog drain. NOT the count of issues that touched the provider (which
-    #: under-counted a multi-read issue as 1). A local drain / downgraded workspace reads 0.
+    #: Actual ticket-provider read calls; a local drain reads zero (#14150).
     provider_calls: int = 0
-    #: Own-workspace review_return backlog dispositions (Redmine #13974 R2): rows reserved for a
-    #: now-hibernated / superseded lane whose issue is no longer in any active roster, drained under the
-    #: lease. ``backlog_fenced`` terminally converged (zero-send); ``backlog_delivered`` is a REAL send
-    #: side effect (review F4 — it must be rolled into ``delivered``, never reported as 0);
-    #: ``backlog_recovered`` reconciled a stale crashed inflight (review F1); ``backlog_transient_skipped``
-    #: was left pending because the provider was unreadable. All surfaced so no side effect is invisible.
+    #: Own-workspace review-return backlog outcomes (#13974).
     backlog_fenced: int = 0
     backlog_delivered: int = 0
-    #: Backlog-drain claimed rows that reached the send edge but did NOT positively deliver (Redmine
-    #: #13683 R2): the receipt-truth counterpart of ``backlog_delivered`` (busy / uncertain / reconciled
-    #: mid-send), rolled into the workspace ``blocked`` so a non-wake in the backlog drain is visible.
+    #: Claimed backlog rows that did not positively deliver (#13683).
     backlog_blocked: int = 0
     backlog_recovered: int = 0
     backlog_transient_skipped: int = 0
-    #: The hibernate mode leg (Redmine #14219 T2c). ``hibernate_ran`` marks that the leg executed
-    #: under this workspace's held lease (an EMPTY pass included — distinguishing "ran, nothing to
-    #: do" from every other mode's default); ``hibernate_mutations`` is the authoritative
-    #: ``transition.applied`` count for the bounded pass (0 or 1); ``hibernate_attempts`` carries
-    #: each candidate's redaction-safe typed attempt payload (issue / lane / kind / closed reason
-    #: token / revision — no paths, no secrets).
+    #: Automatic post-close retirement; attempts exclude worktree paths (#15066).
+    retire_ran: bool = False
+    retire_mutations: int = 0
+    retire_attempts: tuple[dict, ...] = ()
+    retire_disposition: str = ""
+    #: Auto-hibernate execution, mutation count, and redaction-safe attempts (#14219).
     hibernate_ran: bool = False
     hibernate_mutations: int = 0
     hibernate_attempts: tuple[dict, ...] = ()
@@ -648,6 +639,10 @@ class WorkspaceSupervisionOutcome:
             "backlog_blocked": self.backlog_blocked,
             "backlog_recovered": self.backlog_recovered,
             "backlog_transient_skipped": self.backlog_transient_skipped,
+            "retire_ran": self.retire_ran,
+            "retire_mutations": self.retire_mutations,
+            "retire_attempts": [dict(a) for a in self.retire_attempts],
+            "retire_disposition": self.retire_disposition,
             "hibernate_ran": self.hibernate_ran,
             "hibernate_mutations": self.hibernate_mutations,
             "hibernate_attempts": [dict(a) for a in self.hibernate_attempts],
@@ -706,19 +701,19 @@ class SupervisorReport:
 
     @property
     def empty_pass(self) -> bool:
-        """True iff this pass produced no delivery, supply, provider read, OR hibernate work.
+        """True iff this pass produced no delivery, supply, provider read, retire, or hibernate work.
 
         The observability signal the issue asks for: an empty drain pass (nothing to deliver) is
         visible as ``empty_pass`` with ``provider_calls == 0``. Redmine #14219 T3 (Answer j#87108
-        item 4): a folded hibernate leg that applied a mutation OR even evaluated a candidate is
-        NOT an empty pass — ``empty_pass`` must never falsely report a hibernate mutation/attempt
-        as empty.
+        item 4): a folded retire/hibernate leg that applied a mutation OR even evaluated a
+        candidate is NOT an empty pass.
         """
         return (
             self.delivered == 0
             and self.blocked == 0
             and self.events_supplied == 0
             and self.provider_calls == 0
+            and not _retire_rollup.has_work(self.workspaces)
             and self.hibernate_mutations == 0
             and self.hibernate_candidates == 0
             # R1-F3: a folded leg that RAISED consumed the budget under an unknown partial effect —
@@ -821,6 +816,7 @@ class SupervisorReport:
             "empty_pass": self.empty_pass,
             "backlog_fenced": self.backlog_fenced,
             "backlog_recovered": self.backlog_recovered,
+            "retire": _retire_rollup.payload(self.workspaces),
             "hibernate": self.hibernate_payload(),
             "workspaces": [w.as_payload() for w in self.workspaces],
         }
@@ -963,6 +959,10 @@ __all__ = (
     "SKIP_HIBERNATE_BUDGET_DEFERRED",
     "SKIP_HIBERNATE_DELIVERY_UNCERTAIN",
     "SKIP_HIBERNATE_WAKE_UNBOUND",
+    "SKIP_RETIRE_LEG_ERROR",
+    "SKIP_RETIRE_BUDGET_DEFERRED",
+    "SKIP_RETIRE_DELIVERY_UNCERTAIN",
+    "SKIP_RETIRE_WAKE_UNBOUND",
     "SKIP_PASS_BUDGET_SPENT",
     "ISSUE_SOURCE_UNREADABLE",
     "ISSUE_PASS_ERROR",

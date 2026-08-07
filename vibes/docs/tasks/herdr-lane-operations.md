@@ -221,7 +221,8 @@ host (Mac 等) が再起動されると lane pane の Claude/Codex TUI は exit 
 
 1. lane worktree の dirty を確認・復元: `git -C <worktree> checkout -- .claude/settings.local.json` (agent harness が触る唯一の常連 dirt)。**dirty のままだと retire は `dirty_worktree` で fail-closed する** (正常動作、#13331 j#73339 guard)。
 2. `sublane retire --issue <id> --lane-label <label> --worktree <path> --branch <branch> --issue-closed --callbacks-drained --verified --durable-record --target-identity-known --execute --json` → **対象 lane unit の managed slot のみ** close (#13602 Option A: routine green-preflight retirement は coordinator authority。`--owner-approved` flag は無い。`--issue-closed` は「対象 issue が種別ごとの close 契約を満たして closed」を表す — child Task/Test/Bug は `task_close`(owner_close_approval なし)、US / standalone issue は owner_close_approval-backed close (central preset `US-Level Audit Model`)。retire actuation はどの契約でも owner close approval を再収集しない。未解決の owner-approval-waiting は `--callbacks-drained` 側で block する) (#13377: project workspace・coordinator pair・他 lane は閉じない。最終 lane の close で sublane host workspace が herdr により自動消滅するのは無害な付随挙動で、retire の前提・完了条件ではない — #13380)。legacy lane (`wt_<hash>` workspace) は互換 plan で旧 slot も close される。
-3. worktree / local branch の除去は **統合後** (`git worktree remove` + `git branch -d|-D`)。remote branch は削除しない。
+3. `workflow supervisor --run-once` / `--watch` は callback/backlog delivery後・hibernate前に、同じleaseとpass-wide mutation budget下で一意な終了済み候補を自動的に上記と同じtyped退役処理へ渡す。全evidenceの2回完全一致、exactly-one、close/review/integration/CI/callback/clean/origin条件を満たさない場合はzero-mutation。
+4. worktree / local branch の除去は **統合後のoperator runbook** (`git worktree remove` + `git branch -d`)。自動退役の結果は常にphysical cleanupを`cleanup_blocked`として残す。forceとremote branch削除は禁止する。
 
 ## session-start が片role分だけ起動して失敗した場合 (#13948)
 

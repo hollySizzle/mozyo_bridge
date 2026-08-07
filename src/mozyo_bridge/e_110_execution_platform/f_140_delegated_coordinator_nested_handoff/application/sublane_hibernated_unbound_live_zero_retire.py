@@ -265,7 +265,9 @@ def run_hibernated_unbound_live_zero_retire(
             lane_id=lane_label,
         )
 
-    workspace_id = repo_scope_workspace_id(repo_root)
+    workspace_id = repo_scope_workspace_id(
+        repo_root, home=getattr(args, "home", None)
+    )
     if not workspace_id:
         return _blocked(
             HIBERNATED_UNBOUND_RETIRE_WORKSPACE_UNRESOLVED,
@@ -356,7 +358,9 @@ def run_hibernated_unbound_live_zero_retire(
 
     try:
         with attestation_store_lock(
-            mozyo_bridge_home(), exclusive=True, blocking=False
+            Path(getattr(args, "home", None) or mozyo_bridge_home()),
+            exclusive=True,
+            blocking=False,
         ):
             return _terminalize_under_exclusion(
                 args,
@@ -415,7 +419,7 @@ def _terminalize_under_exclusion(
 
     try:
         key = LaneLifecycleKey(workspace_id, lane_label)
-        record = LaneLifecycleStore().get(key)
+        record = LaneLifecycleStore(home=getattr(args, "home", None)).get(key)
     except (LaneLifecycleError, OSError, ValueError) as exc:
         return _blocked(
             HIBERNATED_UNBOUND_RETIRE_LIFECYCLE_UNREADABLE,
@@ -550,7 +554,7 @@ def _terminalize_under_exclusion(
     )
     from mozyo_bridge.core.state.lane_lifecycle_model import DecisionPointerError
 
-    store = LaneRetireMigrationStore()
+    store = LaneRetireMigrationStore(home=getattr(args, "home", None))
     try:
         outcome = store.retire_released_hibernated_legacy(
             key,

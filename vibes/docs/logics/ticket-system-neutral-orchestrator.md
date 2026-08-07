@@ -358,7 +358,7 @@ CLI helpをflagの正本とすることと、設計書からcommand名を省く�
 | `E10` | External Authority: owner decision保存 | 対象外: provider durable write | provider UI / API / MCP | provider-neutral append未実装。標準入口は承認を代行しない |
 | `A18` | Coordinator: Close Gate / close指示 | `mozyo-bridge workflow step → guidance / execute` | provider UI / API / MCP（provider-neutral `mozyo-bridge` close commandなし） | review、owner approval、commit evidenceを満たすclose operationが未実装 |
 | `E11` | External Authority: issue close保存 | `mozyo-bridge workflow step → execute`（authority充足後） | provider UI / API / MCP | provider-neutral close / append未実装 |
-| `A19` | Coordinator: closed sublane退役 | `mozyo-bridge workflow step → execute` | `mozyo-bridge sublane retire --issue <id> --journal <j> --lane-label <label> --branch <branch> --integration-branch main --issue-closed --callbacks-drained --verified --durable-record --target-identity-known --latest-generation-admissible --execute` | close / callback / generation preconditionからretire primitiveを選ぶ統合が未完成。remote branch / worktreeは削除しない |
+| `A19` | Coordinator: closed sublane退役 | `mozyo-bridge workflow supervisor --run-once`（自動）／高レベル `sublane retire`（手動） | supervisor は callback/backlog delivery 後・hibernate 前に一意候補を同一 lease 下で退役。手動 rail は `mozyo-bridge sublane retire --issue <id> --journal <j> --lane-label <label> --branch <branch> --integration-branch main --issue-closed --callbacks-drained --verified --durable-record --target-identity-known --latest-generation-admissible --execute` | 自動経路は shared typed API で1 pass 1 mutation、2回の完全 snapshot 一致を要求。worktree / local branch / remote branchは削除しない |
 
 ### 自動 hibernate（A16H auto path, #14219）
 
@@ -380,6 +380,15 @@ TOCTOU fence + lifecycle CAS）へ委譲する。
 - **public surface / tests**: 公開入口は `workflow supervisor` bounded pass と `sublane hibernate`
   で、新規 command は追加しない。実装・受入は #14219 の T3 tests（folded pass / pass-external-budget
   / time-to-drain / hibernate actuation）を正本とする。
+
+### 自動 retire（A19 auto path, #15066）
+
+既存 `workflow supervisor` bounded pass は、callback/backlog delivery 後・hibernate 前に、終了済み候補を最大1件だけ高レベル `sublane retire` と共通の typed application APIへ渡す。候補探索は `workflow step` へ追加せず、第二 supervisor / queue / schedulerも作らない。
+
+- **authority**: durable issue close、callback debt 0、owner gate解消、最新review approval、integration disposition、exact integration CI green、clean worktree、branch tip、origin到達性、workspace/lane/generation/revisionを読み、effect直前に同じ完全snapshotを再生成する。exactly oneかつ2回が完全一致するときだけactuateする。
+- **budget / ordering**: callback delivery / auto-integration / retire / hibernateが1 pass最大1件のexternal mutationを共有する。先行mutation/uncertainはretireをdeferし、retire mutation/uncertainはhibernateをdeferする。同じworkspace leaseを保持し、effect前にrenewできなければzero-mutation。
+- **result**: `retired | already_retired | blocked | deferred | uncertain`、fixed reason、mutation/uncertaintyをstructured reportへ載せる。例外や部分作用不明は後続mutationを止める。
+- **Git cleanup境界**: managed process/lifecycle terminalizationまでが自動範囲。worktree remove / local branch deleteはatomic identity guard不足のため`cleanup_blocked`とoperator runbookへ残し、forceとremote branch削除を禁止する。
 
 `docs validate`はcatalogを検査するcommandであり、関連文書を解決するcommandではない。解決は必ず
 `mozyo-bridge docs resolve`で行う。また`mozyo-bridge workflow admission`や

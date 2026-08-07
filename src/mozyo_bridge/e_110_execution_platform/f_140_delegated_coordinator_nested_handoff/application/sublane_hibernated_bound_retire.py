@@ -316,7 +316,9 @@ def run_hibernated_bound_retire(
     # same way the create site recorded it.
     try:
         resolved_worktree = Path(worktree).expanduser().resolve()
-        workspace_id = herdr_workspace_segment(resolved_worktree)
+        workspace_id = herdr_workspace_segment(
+            resolved_worktree, home=getattr(args, "home", None)
+        )
     except (OSError, ValueError) as exc:
         return _blocked(
             REASON_WORKSPACE_UNRESOLVED,
@@ -413,6 +415,7 @@ def run_hibernated_bound_retire(
         lane_label,
         issue=issue,
         worktree_identity=metadata_token,
+        home=getattr(args, "home", None),
     )
     if not attested:
         return _blocked(
@@ -445,7 +448,7 @@ def run_hibernated_bound_retire(
     # #13841 review j#79150 F2 invariant), so a persisted ``retired`` never reports success
     # while a pair was relaunched under it.
     try:
-        record = LaneLifecycleStore().get(key)
+        record = LaneLifecycleStore(home=getattr(args, "home", None)).get(key)
     except (LaneLifecycleError, OSError) as exc:
         return _blocked(
             BOUND_RETIRE_LIFECYCLE_UNREADABLE,
@@ -680,7 +683,7 @@ def run_hibernated_bound_retire(
         lifecycle_migration_payload,
     )
 
-    retire_store = LaneBoundRetireStore()
+    retire_store = LaneBoundRetireStore(home=getattr(args, "home", None))
     try:
         outcome = retire_store.retire_released_hibernated_bound(
             key,

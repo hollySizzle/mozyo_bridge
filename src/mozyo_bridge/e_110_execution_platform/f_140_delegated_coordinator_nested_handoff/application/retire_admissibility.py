@@ -78,10 +78,12 @@ class RetireEvidenceTarget:
     #: The row's CAS revision at resolution time. Carried so the destructive close can re-read the
     #: row at the commit point and refuse if it advanced (Redmine #14539 review j#91847 finding 2).
     revision: int = 0
+    #: The row's owner issue, independently measured rather than copied from the action request.
+    issue: str = ""
 
 
 def resolve_retire_evidence_target(
-    args: argparse.Namespace, repo_root: Path
+    args: argparse.Namespace, repo_root: Path, *, home: Optional[Path] = None
 ) -> Optional[RetireEvidenceTarget]:
     """Measure the retire target's lane identity from durable state, or ``None`` (fail-closed).
 
@@ -104,10 +106,12 @@ def resolve_retire_evidence_target(
             herdr_workspace_segment,
         )
 
-        workspace = str(herdr_workspace_segment(repo_root) or "").strip()
+        workspace = str(herdr_workspace_segment(repo_root, home=home) or "").strip()
         if not workspace:
             return None
-        record = LaneLifecycleStore().get(LaneLifecycleKey(workspace, lane_label))
+        record = LaneLifecycleStore(home=home).get(
+            LaneLifecycleKey(workspace, lane_label)
+        )
     except Exception:  # noqa: BLE001 - an unresolvable target is a typed zero, not a crash
         return None
     if record is None:
@@ -137,6 +141,7 @@ def resolve_retire_evidence_target(
         lane_generation=generation,
         policy_pointer=pointer,
         revision=revision,
+        issue=str(getattr(record, "issue_id", "") or ""),
     )
 
 
