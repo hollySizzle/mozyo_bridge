@@ -1,0 +1,11 @@
+{
+  "schema": "mozyo.workflow-role-bindings",
+  "version": 1,
+  "bindings": [
+    {
+      "role": "coordinator",
+      "project_scope": "giken-3800-mozyo-bridge",
+      "source_pointer": "redmine:#15098"
+    }
+  ]
+}
