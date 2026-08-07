@@ -2022,7 +2022,18 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             self.assertFalse(reg.exists())  # registry NOT created by the dry-run
             self.assertFalse(anc.exists())  # anchor NOT created by the dry-run
         self.assertIn("workspace register", str(ctx.exception))
-        self.assertEqual(_non_capability_calls(herdr), [])
+        writes = [
+            call
+            for call in _non_capability_calls(herdr)
+            if tuple(call[:2])
+            in {
+                ("workspace", "create"),
+                ("tab", "create"),
+                ("pane", "split"),
+                ("agent", "start"),
+            }
+        ]
+        self.assertEqual(writes, [])
 
     def test_dry_run_registry_only_resolves_from_row_without_rewriting_anchor(self) -> None:
         # Matrix: registry row present, anchor deleted. A --dry-run resolves the id
@@ -2223,6 +2234,31 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
 
         self.assertEqual(entered, ["codex", "claude"])
         self.assertEqual(exited, ["codex"])
+        writes = [
+            call
+            for call in _non_capability_calls(herdr)
+            if tuple(call[:2])
+            in {
+                ("workspace", "create"),
+                ("tab", "create"),
+                ("pane", "split"),
+                ("agent", "start"),
+            }
+        ]
+        self.assertEqual(writes, [])
+
+    def test_failed_shim_symlink_leaves_no_action_directory(self) -> None:
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "pathlib.Path.symlink_to", side_effect=OSError("symlink refused")
+        ):
+            with self.assertRaisesRegex(
+                HerdrSessionStartError, "could not create the action-private"
+            ):
+                self._prepare(tmp, providers=["codex"], herdr=herdr)
+            shim_root = Path(tmp) / "home" / "herdr-launch-shims"
+            self.assertTrue(shim_root.is_dir())
+            self.assertEqual(list(shim_root.iterdir()), [])
         writes = [
             call
             for call in _non_capability_calls(herdr)

@@ -136,7 +136,7 @@ class EndpointCapabilityTests(unittest.TestCase):
 
 
 class EndpointBoundRunnerTests(unittest.TestCase):
-    def test_binding_overrides_caller_env_and_restores_agent_xdg(self) -> None:
+    def test_binding_overrides_caller_env_and_restores_pane_xdg(self) -> None:
         calls = []
         root = Path("/tmp/owned-a")
 
@@ -153,7 +153,7 @@ class EndpointBoundRunnerTests(unittest.TestCase):
             operator_socket_paths=("/operator/socket",),
         )
         runner(
-            ["herdr", "agent", "start", "mzb1_x", "--", "/bin/true"],
+            ["herdr", "pane", "split", "w1:p1", "--direction", "down"],
             env={HERDR_SOCKET_PATH_ENV: "/operator/socket"},
         )
         argv, env = calls[0]
@@ -161,9 +161,8 @@ class EndpointBoundRunnerTests(unittest.TestCase):
         self.assertEqual(
             argv,
             [
-                "herdr", "agent", "start", "mzb1_x",
+                "herdr", "pane", "split", "w1:p1", "--direction", "down",
                 "--env", "XDG_CONFIG_HOME=/operator/config",
-                "--", "/bin/true",
             ],
         )
         self.assertTrue(runner.all_calls_bound)
@@ -567,8 +566,8 @@ class ControlSurfaceAllowlistTests(unittest.TestCase):
                 )
             self.assertEqual(dispatched, [])
 
-    def test_the_agent_env_injection_does_not_move_the_matched_pair(self) -> None:
-        """``agent start`` gains ``--env`` flags before ``--``; the pair must survive."""
+    def test_the_pane_env_injection_does_not_move_the_matched_pair(self) -> None:
+        """An actual ``pane split`` gains XDG env while the pair stays recognizable."""
         process = _Process()
         dispatched: list = []
         with tempfile.TemporaryDirectory() as tmp:
@@ -576,11 +575,31 @@ class ControlSurfaceAllowlistTests(unittest.TestCase):
             self.addCleanup(instance.shutdown)
             dispatched.clear()
             instance.runner(
-                ["/bin/true", "agent", "start", "mzb1_x", "--", "claude"],
+                [
+                    "/bin/true",
+                    "pane",
+                    "split",
+                    "w1:p1",
+                    "--direction",
+                    "down",
+                    "--no-focus",
+                ],
                 capture_output=True,
             )
             self.assertEqual(len(dispatched), 1)
-            self.assertEqual(dispatched[0][1:3], ["agent", "start"])
+            self.assertEqual(dispatched[0][1:3], ["pane", "split"])
+            self.assertIn("--env", dispatched[0])
+
+    def test_pane_split_help_is_allowlisted_without_environment_rewrite(self) -> None:
+        process = _Process()
+        dispatched: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self._instance(tmp, dispatched, process)
+            self.addCleanup(instance.shutdown)
+            dispatched.clear()
+            command = ["/bin/true", "pane", "split", "--help"]
+            instance.runner(command, capture_output=True)
+            self.assertEqual(dispatched, [command])
 
     def test_allowlisted_client_calls_survive_for_both_processes(self) -> None:
         """Baseline: the fence must not turn into a blanket refusal."""

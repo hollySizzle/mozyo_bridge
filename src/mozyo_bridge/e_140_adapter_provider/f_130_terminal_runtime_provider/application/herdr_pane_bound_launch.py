@@ -396,6 +396,8 @@ def action_private_launch_shim(
             "managed-launch shim target is not an absolute executable file"
         )
     parent = Path(store_home) / "herdr-launch-shims"
+    shim_dir: Optional[Path] = None
+    link: Optional[Path] = None
     try:
         parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if not parent.is_dir() or parent.is_symlink():
@@ -407,6 +409,15 @@ def action_private_launch_shim(
         link = shim_dir / provider
         link.symlink_to(target)
     except OSError as exc:
+        # Symlink creation can fail after the private directory exists. Remove only
+        # artifacts this call can prove it created; unexpected content remains visible.
+        try:
+            if link is not None and link.is_symlink() and os.readlink(link) == target:
+                link.unlink()
+            if shim_dir is not None:
+                shim_dir.rmdir()
+        except OSError:
+            pass
         raise HerdrSessionStartError(
             "could not create the action-private Herdr launch shim before pane creation"
         ) from exc
@@ -416,9 +427,10 @@ def action_private_launch_shim(
         # Exact, non-recursive cleanup only.  Unexpected content leaves a visible residue
         # instead of broadening this helper into a directory deletion authority.
         try:
-            if link.is_symlink() and os.readlink(link) == target:
+            if link is not None and link.is_symlink() and os.readlink(link) == target:
                 link.unlink()
-            shim_dir.rmdir()
+            if shim_dir is not None:
+                shim_dir.rmdir()
         except OSError:
             pass
 

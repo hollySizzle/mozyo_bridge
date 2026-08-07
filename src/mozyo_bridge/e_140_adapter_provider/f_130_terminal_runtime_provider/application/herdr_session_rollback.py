@@ -86,6 +86,7 @@ PREPARED_PANE_ABSENT = "absent"
 PREPARED_PANE_UNREADABLE = "unreadable"
 ROLLBACK_PREPARED_PANE_UNVERIFIABLE = "prepared_pane_unverifiable"
 ROLLBACK_PREPARED_RECEIPT_INVALID = "prepared_pane_receipt_invalid"
+ROLLBACK_PREPARED_NATIVE_MISMATCH = "prepared_pane_native_identity_mismatch"
 
 #: Phases from which a rollback may still act — every non-terminal phase that can have
 #: participants. A run is only unrecoverable once it has said, durably, how it ended.
@@ -499,11 +500,8 @@ def _observe(action, ops: StartupRollbackOps) -> tuple[list, bool]:
                 )
             )
             continue
-        if (
-            pane_receipt is not None
-            and inventory_readable
-            and not _name_matches(participant, rows)
-        ):
+        name_matches = _name_matches(participant, rows) if inventory_readable else []
+        if pane_receipt is not None and inventory_readable and not name_matches:
             verdicts.append(
                 _prepared_pane_verdict(
                     ops,
@@ -512,6 +510,29 @@ def _observe(action, ops: StartupRollbackOps) -> tuple[list, bool]:
                     inventory_readable=inventory_readable,
                     obligation_names=obligation_names,
                     obligation_unreadable=obligation_unreadable,
+                )
+            )
+            continue
+        if (
+            pane_receipt is not None
+            and not participant.closed
+            and len(name_matches) == 1
+            and name_matches[0].get("native_name") != pane_receipt.native_name
+        ):
+            # A pane-bound action launched the short native identity recorded in its
+            # receipt. Logical-name + locator equality alone cannot upgrade a legacy row
+            # (or another native generation) into that action's close authority.
+            verdicts.append(
+                ParticipantVerdict(
+                    role=participant.role,
+                    assigned_name=participant.assigned_name,
+                    locator=participant.locator,
+                    verdict=ROLLBACK_PREPARED_NATIVE_MISMATCH,
+                    detail=(
+                        "the live logical agent row does not carry the exact Herdr native "
+                        "identity recorded by this pane-bound startup action"
+                    ),
+                    closed=False,
                 )
             )
             continue
@@ -834,6 +855,7 @@ __all__ = (
     "PREPARED_PANE_PRESENT",
     "PREPARED_PANE_UNREADABLE",
     "ROLLBACK_PREPARED_PANE_UNVERIFIABLE",
+    "ROLLBACK_PREPARED_NATIVE_MISMATCH",
     "ROLLBACK_PREPARED_RECEIPT_INVALID",
     "ParticipantVerdict",
     "PreparedPaneObservation",

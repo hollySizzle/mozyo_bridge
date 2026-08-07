@@ -27,6 +27,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     PREPARED_PANE_ABSENT,
     PREPARED_PANE_PRESENT,
     REASON_INCOMPLETE,
+    ROLLBACK_PREPARED_NATIVE_MISMATCH,
     ROLLBACK_PREPARED_PANE_UNVERIFIABLE,
     ROLLBACK_PREPARED_RECEIPT_INVALID,
     PreparedPaneObservation,
@@ -177,30 +178,33 @@ class StartupTransactionRecordLaunchTest(unittest.TestCase):
 
 
 class _PreparedRollbackOps:
-    def __init__(self, observation, *, remove_after_close=True) -> None:
+    def __init__(self, observation, *, remove_after_close=True, agent_rows=()) -> None:
         self.observation = observation
         self.remove_after_close = remove_after_close
+        self.rows = list(agent_rows)
         self.prepared_calls = []
         self.prepared_close_calls = []
         self.agent_close_calls = []
 
     def agent_rows(self):
-        return []
+        return list(self.rows)
 
     def runtime_state(self, _locator):
-        raise AssertionError("an absent agent row has no runtime state")
+        return "idle"
 
     def observe_composer(self, _locator):
-        raise AssertionError("an absent agent row has no composer")
+        return True, False
 
     def startup_blocker(self, _provider, _locator):
-        raise AssertionError("an absent agent row has no startup UI")
+        return ""
 
     def open_obligations(self, _workspace_id, _assigned_names):
         return []
 
     def close(self, workspace_id, lane_id, targets):
         self.agent_close_calls.append((workspace_id, lane_id, tuple(targets)))
+        if self.remove_after_close:
+            self.rows = []
         return SimpleNamespace(failed=())
 
     def prepared_pane(self, *, locator, workspace_id, tab_id):
@@ -442,6 +446,37 @@ class PreparedPaneRollbackTest(unittest.TestCase):
             )
             self.assertEqual(ops.prepared_calls, [])
             self.assertEqual(ops.prepared_close_calls, [])
+
+    def test_pane_bound_agent_requires_exact_native_identity_before_close(self):
+        logical_name = "mzb1_logical_workspace_codex_default"
+        with tempfile.TemporaryDirectory() as directory:
+            fence, action_id = _rollback_action(Path(directory), self._receipt())
+            ops = _PreparedRollbackOps(
+                self._present(input_empty=True),
+                agent_rows=[
+                    {
+                        "name": logical_name,
+                        "pane_id": "w1:p2",
+                        "agent": "codex",
+                        "agent_status": "idle",
+                        # Deliberately no native_name: this is a legacy logical row,
+                        # not proof of the pane-bound action's native identity.
+                    }
+                ],
+            )
+
+            result = run_session_rollback(
+                action_id=action_id, ops=ops, fence=fence, execute=True
+            )
+
+            self.assertEqual(result.state, "blocked")
+            self.assertEqual(
+                result.participants[0].verdict,
+                ROLLBACK_PREPARED_NATIVE_MISMATCH,
+            )
+            self.assertEqual(ops.agent_close_calls, [])
+            self.assertEqual(ops.prepared_close_calls, [])
+            self.assertEqual(fence.read(action_id).phase, PHASE_ROLLBACK_OWED)
 
     def test_legacy_absent_agent_path_does_not_use_prepared_pane_ports(self):
         with tempfile.TemporaryDirectory() as directory:

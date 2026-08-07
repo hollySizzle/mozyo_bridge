@@ -159,6 +159,7 @@ CLIENT_CALL_SUBCOMMANDS: frozenset = frozenset(
         ("agent", "read"),
         ("agent", "pane"),
         ("agent", "target"),
+        ("pane", "split"),
         ("pane", "close"),
         ("pane", "layout"),
         ("pane", "resize"),
@@ -305,10 +306,10 @@ class EndpointBoundHerdrRunner:
 
     The wrapped runner keeps its normal ``subprocess.run`` signature.  A caller cannot
     accidentally drop the endpoint by passing another ``env`` mapping: the disposable
-    binding is always applied last.  For ``agent start`` only, the operator's original
-    XDG homes are explicitly restored on the child agent via Herdr's documented
-    repeated ``--env`` flags.  Thus Herdr's own config/state is disposable while real
-    Claude/Codex processes retain their normal auth/config.
+    binding is always applied last. For an actual ``pane split``, the operator's
+    original XDG homes are injected into the new pane via Herdr's repeated ``--env``
+    flags. Thus Herdr's own config/state is disposable while real Claude/Codex
+    processes retain their normal auth/config.
 
     Pre-actuation gate (Redmine #14187, blocker j#85754 / disposition j#85756)
     -------------------------------------------------------------------------
@@ -371,8 +372,8 @@ class EndpointBoundHerdrRunner:
 
     def __call__(self, argv, *args, **kwargs):
         command = list(argv)
-        if command[1:3] == ["agent", "start"]:
-            command = self._restore_agent_environment(command)
+        if command[1:3] == ["pane", "split"] and "--help" not in command:
+            command = self._restore_pane_environment(command)
         supplied = kwargs.get("env")
         merged = dict(os.environ if supplied is None else supplied)
         merged.update(self._binding_env)
@@ -437,20 +438,14 @@ class EndpointBoundHerdrRunner:
         """At least one request actually reached an operator endpoint (must stay False)."""
         return self.operator_endpoint_requests > 0
 
-    def _restore_agent_environment(self, argv: Sequence[str]) -> list[str]:
+    def _restore_pane_environment(self, argv: Sequence[str]) -> list[str]:
         command = list(argv)
-        try:
-            separator = command.index("--")
-        except ValueError:
-            # The production builder always emits ``--``.  Leave malformed input
-            # unchanged so the real command fails closed at its normal boundary.
-            return command
         flags: list[str] = []
         for key in _XDG_KEYS:
             value = self._agent_env.get(key, "")
             if value:
                 flags.extend(["--env", f"{key}={value}"])
-        return [*command[:separator], *flags, *command[separator:]]
+        return [*command, *flags]
 
 
 class DisposableHerdrInstance:
