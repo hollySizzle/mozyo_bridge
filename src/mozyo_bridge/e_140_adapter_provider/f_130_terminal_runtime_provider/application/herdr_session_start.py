@@ -564,12 +564,9 @@ def _prepare_session_locked(
             )
         )
     shared_space_project_coordinator = (
-        coordinator_placement_mode == SHARED_SPACE
-        and result.lane_id == DEFAULT_LANE
+        coordinator_placement_mode == SHARED_SPACE and result.lane_id == DEFAULT_LANE
     )
-    project_column_coordinator = (
-        role_grouped_project_coordinator or shared_space_project_coordinator
-    )
+    project_column_coordinator = role_grouped_project_coordinator or shared_space_project_coordinator
 
     # Config-driven pane placement (Redmine #13646, Design Answer j#76564): resolve the
     # lane's EFFECTIVE `(split, order)` ONCE, then reorder the requested providers so the
@@ -725,9 +722,8 @@ def _prepare_session_locked(
     launch_plans = [p for p in plans if p.kind == "launch"]
     target_workspace = ""
     if launch_plans:
-        shared_coordinator_space = shared_space_project_coordinator
         adopt_locators = [p.locator for p in plans if p.kind == "adopt"]
-        if shared_coordinator_space:
+        if shared_space_project_coordinator:
             # Legacy shared_space: own identity pin first, exact label otherwise (#14139).
             target_workspace = _shared_coordinator_own_target(
                 rows, workspace_id, adopt_locators
