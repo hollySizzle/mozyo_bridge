@@ -78,6 +78,7 @@ beneath its own partner.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
@@ -89,6 +90,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     CoordinatorPane,
     OwnSlot,
     ProjectColumnAuthority,
+    ProjectGroupDecision,
     coordinator_panes_in,
     project_column_authority,
 )
@@ -150,6 +152,16 @@ COLUMN_OUTCOMES: tuple[str, ...] = (
 COLUMN_SUCCESS_OUTCOMES: frozenset = frozenset(
     {COLUMN_NOT_APPLICABLE, COLUMN_MATCHED, COLUMN_APPLIED}
 )
+
+#: Herdr's stable pane ``cwd`` is independent of the foreground process cwd, but
+#: a fresh inventory read can still fail to resolve it.  The authority keeps
+#: requiring that stable value; this budget lets the caller re-read only an
+#: unresolved stable cwd on THIS run's fresh panes.  A missing cwd, a cwd resolving
+#: to the wrong registered workspace, and all foreign, malformed or conflicting
+#: evidence remain immediate fail-closed verdicts.
+OWN_OBSERVATION_RETRY_BUDGET_SECONDS = 1.0
+OWN_OBSERVATION_RETRY_INTERVAL_SECONDS = 0.05
+OWN_OBSERVATION_RETRY_MAX_READS = 20
 
 
 @dataclass(frozen=True)
@@ -499,6 +511,75 @@ def _premature_read_refusal(launched_slots: Sequence[object]) -> str:
     )
 
 
+def _resolve_project_groups_after_startup(
+    *,
+    binary: str,
+    runner,
+    timeout: float,
+    authority: ProjectColumnAuthority,
+    target_workspace: str,
+    own_slots: Sequence[OwnSlot],
+    expected_own_key: "tuple[str, str]",
+    top_workspace_id: str,
+    retry_budget_seconds: float,
+    retry_interval_seconds: float,
+    sleeper=None,
+    monotonic=None,
+) -> "tuple[Sequence[Mapping[str, object]], ProjectGroupDecision]":
+    """Resolve once, then briefly re-read only a typed own-cwd refusal.
+
+    Startup health proves the launched process and generation.  It does not make
+    an unresolved stable ``cwd`` into workspace evidence.  The dynamic
+    ``foreground_cwd`` is evaluated separately by the authority and never enters
+    this retry decision.
+
+    Retrying the authority as a whole is important.  Each read re-validates every
+    row, and anything except an unresolved cwd on an own fresh pane clears the
+    retryable flag and stops the loop before a pane move.  The first read retains
+    the caller's normal timeout; subsequent reads are capped to the remaining
+    one-second budget and a maximum count, so a changing backend cannot turn
+    stabilization into an unbounded wait.
+    """
+    clock = monotonic if monotonic is not None else time.monotonic
+    pause = sleeper if sleeper is not None else time.sleep
+
+    def read_and_resolve(read_timeout: float):
+        rows = _list_rows(binary, runner, read_timeout)
+        decision = authority.resolve(
+            rows,
+            target_workspace=target_workspace,
+            own_slots=own_slots,
+            expected_own_key=expected_own_key,
+            top_workspace_id=top_workspace_id,
+        )
+        return rows, decision
+
+    rows, decision = read_and_resolve(timeout)
+    if decision.ok or not decision.retryable_own_cwd_unresolved:
+        return rows, decision
+
+    budget = max(float(retry_budget_seconds), 0.0)
+    interval = max(float(retry_interval_seconds), 0.0)
+    deadline = clock() + budget
+    extra_reads = 0
+    while (
+        decision.retryable_own_cwd_unresolved
+        and extra_reads < OWN_OBSERVATION_RETRY_MAX_READS
+    ):
+        remaining = deadline - clock()
+        if remaining <= 0.0:
+            break
+        pause(min(interval, remaining))
+        remaining = deadline - clock()
+        if remaining <= 0.0:
+            break
+        rows, decision = read_and_resolve(min(float(timeout), remaining))
+        extra_reads += 1
+        if decision.ok or not decision.retryable_own_cwd_unresolved:
+            break
+    return rows, decision
+
+
 def reflow_project_columns(
     result,
     *,
@@ -513,6 +594,14 @@ def reflow_project_columns(
     home: Path,
     top_workspace_id: str = "",
     authority: "Optional[ProjectColumnAuthority]" = None,
+    own_observation_retry_budget_seconds: float = (
+        OWN_OBSERVATION_RETRY_BUDGET_SECONDS
+    ),
+    own_observation_retry_interval_seconds: float = (
+        OWN_OBSERVATION_RETRY_INTERVAL_SECONDS
+    ),
+    sleeper=None,
+    monotonic=None,
 ) -> "tuple[str, str]":
     """Give this run's appended pair its own column — ``(outcome, detail)``.
 
@@ -563,9 +652,11 @@ def reflow_project_columns(
         for slot in launched_slots
     )
     own_launched = tuple(slot.locator for slot in own_slots)
-    rows = _list_rows(binary, runner, timeout)
-    decision = (authority or project_column_authority(home)).resolve(
-        rows,
+    rows, decision = _resolve_project_groups_after_startup(
+        binary=binary,
+        runner=runner,
+        timeout=timeout,
+        authority=authority or project_column_authority(home),
         target_workspace=target_workspace,
         own_slots=own_slots,
         # The run's own claim is an INPUT to the join, not a second derivation
@@ -574,6 +665,10 @@ def reflow_project_columns(
         # (review j#99938 finding_2).
         expected_own_key=(result.workspace_id, _norm(result.lane_id) or DEFAULT_LANE),
         top_workspace_id=top_workspace_id,
+        retry_budget_seconds=own_observation_retry_budget_seconds,
+        retry_interval_seconds=own_observation_retry_interval_seconds,
+        sleeper=sleeper,
+        monotonic=monotonic,
     )
     if not decision.ok:
         return COLUMN_FAILED, f"{decision.refusal}; no live pane was moved"

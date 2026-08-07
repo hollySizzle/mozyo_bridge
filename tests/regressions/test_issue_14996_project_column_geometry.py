@@ -855,6 +855,92 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
         outcome, detail = env.run(env.result(PROJECT_B, list(launched)))
         self._assert_zero_move_failure(env, outcome, detail, "self-attestation (conflict)")
 
+    def test_an_unregistered_foreground_helper_uses_the_stable_pane_cwd(self):
+        """Herdr #1472: foreground helper cwd is not pane workspace identity."""
+        env = _Env(self, PROJECT_A, PROJECT_B)
+        tab = env.herdr.new_tab()
+        env.seed_columns(tab, (PROJECT_A, ""))
+        launched = env.append_pair(tab, PROJECT_B)
+        stable_rows = env.herdr._rows
+        reads = 0
+
+        def transient_rows():
+            nonlocal reads
+            reads += 1
+            rows = stable_rows()
+            if reads == 1:
+                for row in rows:
+                    if row.get("pane_id") == launched[1]:
+                        row["foreground_cwd"] = str(Path("/"))
+            return rows
+
+        env.herdr._rows = transient_rows
+        outcome, detail = env.run(
+            env.result(PROJECT_B, list(launched)), sleeper=lambda _seconds: None
+        )
+        self.assertEqual(outcome, COLUMN_APPLIED, detail)
+        self.assertGreaterEqual(reads, 1)
+        self.assertEqual(
+            env.herdr.calls[1][:2],
+            ["pane", "layout"],
+            "an unregistered helper cwd must not create a pointless retry",
+        )
+
+    def test_a_fresh_stable_cwd_that_settles_on_the_next_read_is_retried(self):
+        env = _Env(self, PROJECT_A, PROJECT_B)
+        tab = env.herdr.new_tab()
+        env.seed_columns(tab, (PROJECT_A, ""))
+        launched = env.append_pair(tab, PROJECT_B)
+        stable_rows = env.herdr._rows
+        reads = 0
+
+        def transient_rows():
+            nonlocal reads
+            reads += 1
+            rows = stable_rows()
+            if reads == 1:
+                for row in rows:
+                    if row.get("pane_id") == launched[1]:
+                        row["cwd"] = str(Path("/"))
+            return rows
+
+        env.herdr._rows = transient_rows
+        outcome, detail = env.run(
+            env.result(PROJECT_B, list(launched)), sleeper=lambda _seconds: None
+        )
+        self.assertEqual(outcome, COLUMN_APPLIED, detail)
+        self.assertGreaterEqual(reads, 2)
+        self.assertEqual(
+            env.herdr.calls[:2],
+            [["agent", "list"], ["agent", "list"]],
+            "the stable cwd must be re-read before the first layout or move",
+        )
+
+    def test_a_persistently_unresolved_own_cwd_exhausts_a_bounded_wait(self):
+        env = _Env(self, PROJECT_A, PROJECT_B)
+        tab = env.herdr.new_tab()
+        env.seed_columns(tab, (PROJECT_A, ""))
+        launched = env.append_pair(tab, PROJECT_B)
+        env.herdr.cwd_by_workspace[env.ids[PROJECT_B]] = str(Path("/"))
+        now = [0.0]
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        outcome, detail = env.run(
+            env.result(PROJECT_B, list(launched)),
+            own_observation_retry_budget_seconds=0.2,
+            own_observation_retry_interval_seconds=0.1,
+            sleeper=sleep,
+            monotonic=lambda: now[0],
+        )
+        self._assert_zero_move_failure(
+            env, outcome, detail, "resolves to no registered mozyo workspace"
+        )
+        reads = [call for call in env.herdr.calls if call[:2] == ["agent", "list"]]
+        self.assertEqual(len(reads), 2)
+        self.assertAlmostEqual(now[0], 0.2)
+
     def test_a_foreign_pane_in_an_unregistered_directory_is_refused(self):
         env = _Env(self, PROJECT_A, PROJECT_B)
         tab = env.herdr.new_tab()
@@ -865,6 +951,8 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
         self._assert_zero_move_failure(
             env, outcome, detail, "resolves to no registered mozyo workspace"
         )
+        reads = [call for call in env.herdr.calls if call[:2] == ["agent", "list"]]
+        self.assertEqual(len(reads), 1, "foreign evidence is never launch-retried")
 
     def test_a_foreign_pane_running_in_another_project_is_refused(self):
         """The name claims one project; the working directory is another's."""

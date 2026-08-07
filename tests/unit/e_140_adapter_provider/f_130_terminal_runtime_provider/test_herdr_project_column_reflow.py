@@ -370,6 +370,24 @@ class InventoryRowClassificationTest(unittest.TestCase):
 
 
 class CoordinatorPaneReadTest(unittest.TestCase):
+    def test_stable_and_foreground_cwd_are_preserved_as_distinct_evidence(self):
+        panes, refusal = coordinator_panes_in(
+            [
+                _row(
+                    A,
+                    "codex",
+                    "w1:p2",
+                    workspace_id="w1",
+                    cwd="/project",
+                    foreground_cwd="/plugin-cache",
+                )
+            ],
+            "w1",
+        )
+        self.assertEqual(refusal, "")
+        self.assertEqual(panes[0].cwd, "/project")
+        self.assertEqual(panes[0].foreground_cwd, "/plugin-cache")
+
     def test_an_undecodable_row_inside_the_target_workspace_refuses(self):
         rows = [
             _row(A, "codex", "w1:p2", workspace_id="w1"),
@@ -602,6 +620,7 @@ class ProjectColumnAuthorityTest(unittest.TestCase):
             "agent_status": "idle",
             "agent": role,
             "workspace_id": "w1",
+            "cwd": f"/roots/{workspace}",
             "foreground_cwd": f"/roots/{workspace}",
         }
         row.update(over)
@@ -753,6 +772,71 @@ class ProjectColumnAuthorityTest(unittest.TestCase):
                 )
                 self.assertFalse(decision.ok)
                 self.assertIn(fragment, decision.refusal)
+                self.assertFalse(decision.retryable_own_cwd_unresolved)
+
+    def test_only_an_unresolved_stable_cwd_on_an_own_fresh_pane_is_retryable(self):
+        own = OwnSlot(
+            locator="w1:p4", assigned_name=encode_assigned_name(B, "codex"),
+            provider="codex",
+        )
+        authority = self._authority(workspaces=self._resolvable(A, B))
+        rows = [
+            self._row(A, "codex", "w1:p2"),
+            self._row(B, "codex", "w1:p4", cwd="/not-registered"),
+        ]
+        decision = authority.resolve(
+            rows, target_workspace="w1", own_slots=[own]
+        )
+        self.assertFalse(decision.ok)
+        self.assertIn("no registered mozyo workspace", decision.refusal)
+        self.assertTrue(decision.retryable_own_cwd_unresolved)
+
+        # The same unresolved evidence on a pre-existing pane must stop on the
+        # first read.  A foreign pane is not entitled to this launch-local wait.
+        authority = self._authority(workspaces=self._resolvable(A, B))
+        decision = authority.resolve(
+            [
+                self._row(A, "codex", "w1:p2", cwd="/not-registered"),
+                self._row(B, "codex", "w1:p4"),
+            ],
+            target_workspace="w1",
+            own_slots=[own],
+        )
+        self.assertFalse(decision.ok)
+        self.assertIn("no registered mozyo workspace", decision.refusal)
+        self.assertFalse(decision.retryable_own_cwd_unresolved)
+
+    def test_an_unregistered_foreground_helper_does_not_replace_stable_cwd(self):
+        authority = self._authority(workspaces=self._resolvable(A))
+        decision = authority.resolve(
+            [
+                self._row(
+                    A,
+                    "codex",
+                    "w1:p2",
+                    foreground_cwd="/agent-plugin-cache/not-a-workspace",
+                )
+            ],
+            target_workspace="w1",
+        )
+        self.assertTrue(decision.ok, decision.refusal)
+        self.assertIn("/roots/" + A, self.workspaces.asked)
+        self.assertIn("/agent-plugin-cache/not-a-workspace", self.workspaces.asked)
+
+    def test_stable_cwd_is_required_but_foreground_cwd_is_optional(self):
+        missing_stable = self._row(A, "codex", "w1:p2")
+        missing_stable.pop("cwd")
+        authority = self._authority(workspaces=self._resolvable(A))
+        decision = authority.resolve([missing_stable], target_workspace="w1")
+        self.assertFalse(decision.ok)
+        self.assertIn("no stable working directory", decision.refusal)
+        self.assertFalse(decision.retryable_own_cwd_unresolved)
+
+        missing_foreground = self._row(A, "codex", "w1:p2")
+        missing_foreground.pop("foreground_cwd")
+        authority = self._authority(workspaces=self._resolvable(A))
+        decision = authority.resolve([missing_foreground], target_workspace="w1")
+        self.assertTrue(decision.ok, decision.refusal)
 
     def test_the_own_exemption_is_bound_to_an_exact_identity_join(self):
         own = OwnSlot(

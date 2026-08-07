@@ -250,9 +250,10 @@ class PaneTreeHerdr:
         #: there, the managed agent is not. Rendered as a present-but-blank ``agent``
         #: field, which is the positive stale signal ``classify_named_slot`` reads.
         self.stale_panes: set = set()
-        #: ``{mozyo workspace_id: path}`` rendered as each pane's ``foreground_cwd``.
-        #: Real rows carry it (#13806) and the project-column authority reads it, so a
-        #: fake that omitted it would let a test pass a check production cannot.
+        #: ``{mozyo workspace_id: path}`` rendered as each pane's stable ``cwd`` and,
+        #: by default, its ``foreground_cwd``.  Tests that exercise an agent helper
+        #: directory mutate only ``foreground_cwd`` in the rendered row; keeping the
+        #: two fields distinct mirrors Herdr's public API contract.
         self.cwd_by_workspace: dict = {}
         #: ``{pane_id: provider}`` overriding the detected agent a row reports, so a
         #: test can express a pane whose live provider contradicts its assigned name
@@ -394,6 +395,7 @@ class PaneTreeHerdr:
             if identity:
                 cwd = self.cwd_by_workspace.get(identity.workspace_id, "")
                 if cwd:
+                    row["cwd"] = cwd
                     row["foreground_cwd"] = cwd
             rows.append(row)
         return rows + list(self.extra_rows)

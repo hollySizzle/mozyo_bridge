@@ -738,10 +738,12 @@ class _Herdr:
         else:
             row["agent"] = role
         if "--cwd" in rest:
-            # Real rows carry the pane's working directory (#13806), and the
-            # project-column authority reads it to prove a foreign pane runs inside
-            # the project its name claims (#14996 R2 review j#99904 finding_2).
-            row["foreground_cwd"] = rest[rest.index("--cwd") + 1]
+            # Herdr exposes the stable pane/workspace cwd separately from the
+            # foreground process cwd.  They start equal in this fake; individual
+            # project-column tests vary the dynamic value independently.
+            cwd = rest[rest.index("--cwd") + 1]
+            row["cwd"] = cwd
+            row["foreground_cwd"] = cwd
         self.started_rows.append(row)
         wrapped = "agent-attest" in rest
         if not wrapped or self.attest_home is None:

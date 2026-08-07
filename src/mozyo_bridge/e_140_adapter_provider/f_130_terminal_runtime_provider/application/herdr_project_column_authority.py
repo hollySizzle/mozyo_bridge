@@ -115,8 +115,11 @@ class CoordinatorPane:
     workspace_id: str
     lane_id: str
     role: str
-    #: The pane's working directory as the inventory reports it (``""`` if absent).
+    #: Herdr's stable pane/workspace cwd (``cwd``; ``""`` if absent).
     cwd: str = ""
+    #: The cwd of the current foreground process.  This may legitimately be an
+    #: agent helper/plugin directory and is not the pane's workspace authority.
+    foreground_cwd: str = ""
     #: The canonical provider herdr detected (``""`` when absent or unrecognised).
     detected_provider: str = ""
     #: herdr reported the pane as shell residue (identity outlived its agent).
@@ -171,14 +174,25 @@ class ProjectGroupDecision:
     #: second one beside it is what let a run claim a project the workspace does
     #: not hold (review j#99938 finding_2).
     own_key: "Optional[tuple[str, str]]" = None
+    #: ``True`` only when the cwd on one of THIS run's freshly launched panes
+    #: resolves to no workspace.  The caller may re-read that row for a bounded
+    #: interval, but must never retry a missing/mismatched cwd, a foreign row, or
+    #: structurally invalid evidence.
+    retryable_own_cwd_unresolved: bool = False
 
     @property
     def ok(self) -> bool:
         return not self.refusal
 
     @classmethod
-    def refused(cls, reason: str) -> "ProjectGroupDecision":
-        return cls(groups={}, refusal=reason)
+    def refused(
+        cls, reason: str, *, retryable_own_cwd_unresolved: bool = False
+    ) -> "ProjectGroupDecision":
+        return cls(
+            groups={},
+            refusal=reason,
+            retryable_own_cwd_unresolved=retryable_own_cwd_unresolved,
+        )
 
 
 class AttestationPort(Protocol):
@@ -521,7 +535,8 @@ def coordinator_panes_in(
                 workspace_id=decoded.identity.workspace_id,
                 lane_id=decoded.identity.lane_id or DEFAULT_LANE,
                 role=decoded.identity.role,
-                cwd=_norm(row.get("foreground_cwd") or row.get("cwd")),
+                cwd=_norm(row.get("cwd")),
+                foreground_cwd=_norm(row.get("foreground_cwd")),
                 detected_provider=_detected_provider(row),
                 stale=classify_named_slot(row) == SLOT_STALE,
             )
@@ -594,9 +609,14 @@ class ProjectColumnAuthority:
             return ProjectGroupDecision.refused(refusal)
 
         for pane in panes:
-            refusal = self._observable_refusal(pane)
+            refusal, cwd_unresolved = self._observable_refusal(pane)
             if refusal:
-                return ProjectGroupDecision.refused(refusal)
+                return ProjectGroupDecision.refused(
+                    refusal,
+                    retryable_own_cwd_unresolved=(
+                        cwd_unresolved and pane.locator in own_index
+                    ),
+                )
 
         refusal = self._named_lane_refusal(groups, own_key)
         if refusal:
@@ -749,8 +769,8 @@ class ProjectColumnAuthority:
             )
         return resolved, ""
 
-    def _observable_refusal(self, pane: CoordinatorPane) -> str:
-        """Facts every pane can answer from the inventory alone — own included.
+    def _observable_refusal(self, pane: CoordinatorPane) -> "tuple[str, bool]":
+        """``(refusal, cwd_unresolved)`` for row facts — own included.
 
         Review j#99931 finding_1: the own exemption was argued from two facts a
         just-launched slot cannot yet answer (its durable lane kind, its startup
@@ -761,32 +781,46 @@ class ProjectColumnAuthority:
         if pane.stale:
             return (
                 f"pane {pane.locator!r} is shell residue (its identity outlived its "
-                "agent)"
+                "agent)",
+                False,
             )
         if not pane.detected_provider:
             return (
                 f"pane {pane.locator!r} reports no recognised provider, so its "
-                "liveness is unproved"
+                "liveness is unproved",
+                False,
             )
         if pane.detected_provider != pane.role:
             return (
                 f"pane {pane.locator!r} is running {pane.detected_provider!r} while "
-                f"its assigned name claims {pane.role!r}"
+                f"its assigned name claims {pane.role!r}",
+                False,
             )
         if not pane.cwd:
-            return f"pane {pane.locator!r} reports no working directory"
+            return f"pane {pane.locator!r} reports no stable working directory", False
         resolved = self._workspaces.workspace_of(pane.cwd)
         if not resolved:
             return (
-                f"pane {pane.locator!r} runs in a directory that resolves to no "
-                "registered mozyo workspace"
+                f"pane {pane.locator!r} has a stable directory that resolves to no "
+                "registered mozyo workspace",
+                True,
             )
         if resolved != pane.workspace_id:
             return (
-                f"pane {pane.locator!r} runs in workspace {resolved!r} while its "
-                f"assigned name claims {pane.workspace_id!r}"
+                f"pane {pane.locator!r} has stable workspace {resolved!r} while "
+                f"its assigned name claims {pane.workspace_id!r}",
+                False,
             )
-        return ""
+        if pane.foreground_cwd and pane.foreground_cwd != pane.cwd:
+            foreground = self._workspaces.workspace_of(pane.foreground_cwd)
+            if foreground and foreground != pane.workspace_id:
+                return (
+                    f"pane {pane.locator!r} has a foreground process in workspace "
+                    f"{foreground!r} while its assigned name claims "
+                    f"{pane.workspace_id!r}",
+                    False,
+                )
+        return "", False
 
     def _named_lane_refusal(
         self,

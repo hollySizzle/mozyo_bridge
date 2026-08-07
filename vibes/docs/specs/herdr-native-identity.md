@@ -1197,12 +1197,21 @@ relayout を承認し、**推測ではなく実測で検証すること**を条�
        `agent` は `codex` / `claude` を verbatim に持つ。
      - (b) `evaluate_attestation()` が `ok` を返すこと。同関数は recorded locator による **process
        generation pin** を含み、旧世代の `present` record を再利用しない (j#99913 finding_1)。
-     - (c) row の cwd を `herdr_workspace_segment()` で解決した workspace が name の主張と一致すること。
+     - (c) Herdr row の **安定した pane/workspace cwd (`cwd`)** を
+       `herdr_workspace_segment()` で解決した workspace が name の主張と一致すること。
+       `foreground_cwd` と `cwd` を `foreground_cwd or cwd` へ畳まない。Herdr の公開契約では前者は
+       foreground process の cwd、後者は pane/workspace の cwd であり、Claude の plugin/helper が
+       project 外の cache directory を foreground として報告する正規の形がある (Herdr #1472、
+       #15098 Z690 dogfood)。`foreground_cwd` は workspace authority へ昇格させない。ただし同値を
+       捨てるのでもなく、別の**登録済み** workspace へ解決した場合は assigned name との contradiction
+       として refusal する。どの登録 workspace にも解決しない helper/plugin path は workspace identity
+       の positive evidence でも contradiction でもないため、安定 `cwd` + provider + attestation の
+       連言を置換せず、そのまま通す。absent な `foreground_cwd` も同じく authority を欠損させない。
        **registry root の containment 判定にしない**: named lane は main checkout の identity を継承する
        linked worktree から起動されるため、containment では正規の `delegated_coordinator` を構造的に
-       拒否し、本 issue の Acceptance を実現不能にする (j#99913 finding_3)。cwd から祖先方向へ最初に
-       identity を解決できる地点を使うので、main checkout / その subdir / linked worktree / worktree の
-       subdir が 1 つの規則で扱われる。
+       拒否し、本 issue の Acceptance を実現不能にする (j#99913 finding_3)。安定 `cwd` から祖先方向へ
+       最初に identity を解決できる地点を使うので、main checkout / その subdir / linked worktree /
+       worktree の subdir が 1 つの規則で扱われる。
 - **unresolved evidence は除外せず refusal する**。stale sibling を集合から落とすと pair が健全な 1-pane group
   に見え、closing verdict が落ちる前に 4 枚の pane が動いた (j#99904 finding_2 で実測)。`classify_named_slot`
   は positive shell-residue のみを STALE にする conservative predicate なので、「stale でない」は positive な
@@ -1247,9 +1256,12 @@ relayout を承認し、**推測ではなく実測で検証すること**を条�
   別々に derive すると、inventory 内で自己整合しているだけの slot 群を別 project の pair として申告でき、
   存在しない project について `matched` を返せてしまう (j#99938 finding_2 で実測)。
 - **例外は、その根拠の幅までしか広げない**。自 run の pane が免除されるのは「まだ答えられない 2 つの事実」
-  = durable lane kind と startup attestation だけである。stale 判定・detected provider・cwd は同じ
-  inventory row から即座に読めるので自 run にも要求する。根拠 2 つで 5 つを免除した結果、own pane が
-  shell residue / provider 不一致 / 別 project cwd のいずれでも 6 枚動いた (j#99931 finding_1 で実測)。
+  = durable lane kind と startup attestation だけである。stale 判定・detected provider・安定 `cwd`・
+  `foreground_cwd` の登録 workspace contradiction は同じ inventory row から読めるので自 run にも要求する。
+  安定 `cwd` がどこにも解決しない自 run の fresh pane に限り、全 authority を短い bounded interval 内で
+  再読する。deadline 後も未解決なら refusal であり、dynamic `foreground_cwd` への fallback はしない。
+  根拠 2 つで 5 つを免除した結果、own pane が shell residue / provider 不一致 / 別 project cwd の
+  いずれでも 6 枚動いた (j#99931 finding_1 で実測)。
   免除は pair key ではなく、本 run が launch した **locator + assigned name + provider の exact join** に
   束縛する。
 - live pane 1 枚の group は、**上記 evidence がすべて解決したうえで** `_column_span` が全高 column を証明できる
