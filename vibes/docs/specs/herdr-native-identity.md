@@ -1299,9 +1299,9 @@ relayout を承認し、**推測ではなく実測で検証すること**を条�
   `session-start` の text / JSON 双方に出す**。exit に効く軸が text に無いと、operator は失敗原因を
   role health か split ratio と誤読し、detail が持つ唯一の回復対象 (shared tab の外に残った pane) に
   到達できない (j#99885 finding_1)。
-- 2 組なら均等 2×2 になる。3 組目以降も各 project は独立した全高 column を持つが、**列幅は均等ではない**
-  (最右 column を二分するため 1/2 : 1/4 : 1/4 になる)。列順・列幅の厳密指定は引き続き live-relayout
-  runbook の領分で、本 mode は append 時の column 化だけを保証する。
+- 2 組なら均等 2×2 になる。3 組目以降も各 project は独立した全高 column を持ち、上記の
+  `1/N`, `1/(N-1)`, ... resize と最終検証により **全 project の列幅差を 1 cell 以内**にする。
+  列順は append 順を維持する。arbitrary live reorder は引き続き live-relayout runbook の領分である。
 
 `lane_placement` (#13646 / #14568 / #14569) の「既存 live pair を暗黙再配置しない」境界は**変えていない**。
 そこが触るのは pair 内部の divider だけであり、本節が触るのは shared coordinator tab の **project 間**
