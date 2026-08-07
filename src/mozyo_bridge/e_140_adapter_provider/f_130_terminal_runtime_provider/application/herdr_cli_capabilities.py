@@ -112,8 +112,12 @@ def observe_herdr_cli_capabilities(
     required_pane = frozenset(
         {"--direction", "--cwd", "--env", "--focus", "--no-focus"}
     )
-    explicit_target = "--pane" in pane_options or bool(
-        re.search(r"[\[<](?:PANE_ID|ID)[\]>]", pane_help)
+    pane_usage = " ".join(pane_help.split())
+    explicit_target = bool(
+        re.search(
+            r"\bUsage:\s*herdr\s+pane\s+split\s+\[PANE_ID\](?:\s|$)",
+            pane_usage,
+        )
     )
     if not required_pane.issubset(pane_options) or not explicit_target:
         raise HerdrCliCapabilityError(

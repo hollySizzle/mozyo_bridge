@@ -165,6 +165,16 @@ class RecordingHerdrRunnerTests(unittest.TestCase):
         )
         recorder(
             [
+                binary,
+                "pane",
+                "run",
+                "w1:p2",
+                'claude() { exec /private/action/claude "$@"; }',
+            ],
+            capture_output=True, text=True, timeout=5, env={},
+        )
+        recorder(
+            [
                 binary, "agent", "start", "mza1_aaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "--kind", "claude", "--pane", "w1:p2", "--",
             ],

@@ -83,6 +83,8 @@ sibling ``support.delegation_route_fakes``.
 from __future__ import annotations
 
 import json
+import re
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -127,6 +129,10 @@ WAIT_TIMEOUT_MESSAGE = "timed out waiting for agent status change"
 #: fails as a pane-get error). Contains ``no such pane`` so the rail classifies it
 #: absent, distinct from a timeout.
 WAIT_ABSENT_MESSAGE = "no such pane: pane get failed"
+
+_PROVIDER_FUNCTION_RE = re.compile(
+    r'^(claude|codex)\(\) \{ exec (.+) "\$@"; \}$'
+)
 
 
 class UnknownHerdrCommandError(AssertionError):
@@ -207,6 +213,7 @@ class FakeHerdr:
     def __init__(self, *, read_text: str = "codex composer rendered") -> None:
         self._workspaces: dict = {}
         self._agents: dict = {}  # pane_id -> _Agent
+        self._prepared_provider_functions: dict = {}  # pane_id -> provider
         self._workspace_seq = 0
         #: Rendered pane text served by ``agent read`` (set to ``""`` to simulate a
         #: live-but-still-booting TUI, #13378).
@@ -537,6 +544,12 @@ class FakeHerdr:
         ws = self._workspace_of_pane(parsed.pane_id)
         if ws is None:
             return _err(argv, f"no such pane: {parsed.pane_id}")
+        if self._prepared_provider_functions.get(parsed.pane_id) != parsed.provider:
+            return _err(
+                argv,
+                f"pane has no matching prepared {parsed.provider} function: "
+                f"{parsed.pane_id}",
+            )
         if parsed.pane_id in self._agents:
             return _err(argv, f"pane already has an agent: {parsed.pane_id}")
         pane_id = parsed.pane_id
@@ -736,6 +749,7 @@ class FakeHerdr:
         ws.pane_tab.pop(pane_id, None)
         ws.pane_cwd.pop(pane_id, None)
         ws.pane_env.pop(pane_id, None)
+        self._prepared_provider_functions.pop(pane_id, None)
         self._agents.pop(pane_id, None)
         # E: the last pane closing auto-vanishes the workspace (no husk, #13380).
         if not ws.panes:
@@ -761,6 +775,23 @@ class FakeHerdr:
             raise UnknownHerdrCommandError(
                 f"pane run requires one exact pane and command: {rest!r}"
             )
+        matched = _PROVIDER_FUNCTION_RE.fullmatch(command)
+        if matched is None:
+            raise UnknownHerdrCommandError(
+                f"pane run requires one canonical provider function: {command!r}"
+            )
+        try:
+            (target,) = shlex.split(matched.group(2))
+        except (TypeError, ValueError) as exc:
+            raise UnknownHerdrCommandError(
+                f"pane run provider target is not one shell word: {command!r}"
+            ) from exc
+        provider = matched.group(1)
+        if not Path(target).is_absolute() or Path(target).name != provider:
+            raise UnknownHerdrCommandError(
+                f"pane run provider target does not match {provider!r}: {command!r}"
+            )
+        self._prepared_provider_functions[pane_id] = provider
         return _ok(argv, {"result": {"type": "ok"}})
 
     # -- wait resolution (change-semantics, no real time) ---------------------

@@ -218,7 +218,14 @@ def _parse_pane(stdout: object) -> PreparedPane | None:
     locator = _norm(pane.get("pane_id"))
     workspace_id = _norm(pane.get("workspace_id"))
     tab_id = _norm(pane.get("tab_id"))
-    if not valid_target(locator) or not workspace_id or not tab_id:
+    if (
+        not valid_target(locator)
+        or not valid_target(workspace_id)
+        or not valid_target(tab_id)
+        or _workspace_prefix(locator) != workspace_id
+        or not tab_id.startswith(f"{workspace_id}:t")
+        or tab_id == f"{workspace_id}:t"
+    ):
         return None
     return PreparedPane(locator, workspace_id, tab_id)
 
@@ -344,20 +351,35 @@ def prepare_provider_shell_function(
 
 
 def _agent_pane_busy(completed: object) -> bool:
-    """Whether Herdr typed this failed start as a not-yet-ready shell pane."""
+    """Whether one canonical failure envelope authorizes a safe exact retry."""
     if getattr(completed, "returncode", 1) == 0:
         return False
-    for raw in (getattr(completed, "stderr", ""), getattr(completed, "stdout", "")):
-        if not isinstance(raw, str) or not raw.strip():
-            continue
-        try:
-            payload = json.loads(raw)
-        except (TypeError, ValueError):
-            continue
-        error = payload.get("error") if isinstance(payload, Mapping) else None
-        if isinstance(error, Mapping) and error.get("code") == "agent_pane_busy":
-            return True
-    return False
+    stdout = getattr(completed, "stdout", "")
+    stderr = getattr(completed, "stderr", "")
+    if (
+        not isinstance(stdout, str)
+        or not isinstance(stderr, str)
+        or stdout.strip()
+        or not stderr.strip()
+    ):
+        return False
+    try:
+        payload = json.loads(stderr)
+    except (TypeError, ValueError):
+        return False
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != {"error", "id"}
+        or payload.get("id") != "cli:agent:start"
+    ):
+        return False
+    error = payload.get("error")
+    return (
+        isinstance(error, Mapping)
+        and error.get("code") == "agent_pane_busy"
+        and isinstance(error.get("message"), str)
+        and bool(error["message"].strip())
+    )
 
 
 def start_agent_in_prepared_pane(

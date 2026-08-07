@@ -68,10 +68,13 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_cli_capabilities import (  # noqa: E501
     HerdrCliCapabilityError,
     REASON_AGENT_START_SURFACE_MISMATCH,
+    REASON_PANE_SPLIT_SURFACE_MISMATCH,
     observe_herdr_cli_capabilities,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_bound_launch import (  # noqa: E501
+    _agent_pane_busy,
     build_provider_shell_function_command,
+    start_agent_in_prepared_pane,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_health import (  # noqa: E501
     HEALTH_ATTESTATION_UNAVAILABLE,
@@ -304,6 +307,28 @@ class Herdr080CapabilityPreflightTest(unittest.TestCase):
                 "/bin/herdr", runner=runner, timeout=1.0, env={}
             )
         self.assertEqual(caught.exception.reason, "herdr_pane_run_surface_mismatch")
+
+    def test_pane_split_option_cannot_replace_the_positional_target(self) -> None:
+        def runner(argv, **_kwargs):
+            if argv[1:3] == ["agent", "start"]:
+                text = (
+                    "Usage: herdr agent start <NAME> --kind <KIND> --pane <ID> "
+                    "[OPTIONS] [-- [AGENT_ARG]...]"
+                )
+            elif argv[1:3] == ["pane", "split"]:
+                text = (
+                    "Usage: herdr pane split --pane <PANE_ID> --direction right|down "
+                    "--cwd PATH --env K=V --focus --no-focus"
+                )
+            else:
+                text = "Usage: herdr pane run <PANE_ID> <COMMAND>..."
+            return subprocess.CompletedProcess(argv, 0, stdout=text, stderr="")
+
+        with self.assertRaises(HerdrCliCapabilityError) as caught:
+            observe_herdr_cli_capabilities(
+                "/bin/herdr", runner=runner, timeout=1.0, env={}
+            )
+        self.assertEqual(caught.exception.reason, REASON_PANE_SPLIT_SURFACE_MISMATCH)
 
     def test_session_refuses_legacy_surface_before_home_lock_or_registration(self) -> None:
         calls = []
@@ -1391,6 +1416,92 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(len(starts), 2)
         self.assertEqual(starts[0], starts[1])
         sleep.assert_called_once_with(0.1)
+
+    def test_busy_error_with_a_success_payload_is_not_retried(self) -> None:
+        calls = []
+
+        def runner(argv, **_kwargs):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(
+                argv,
+                1,
+                stdout=json.dumps(
+                    {"result": {"type": "agent_started", "agent": {"pane_id": "w1:p2"}}}
+                ),
+                stderr=json.dumps(
+                    {
+                        "error": {
+                            "code": "agent_pane_busy",
+                            "message": "pane is busy",
+                        }
+                    }
+                ),
+            )
+
+        with self.assertRaises(HerdrSessionStartError):
+            start_agent_in_prepared_pane(
+                binary="/bin/herdr",
+                launch_argv=[
+                    "agent",
+                    "start",
+                    "n",
+                    "--kind",
+                    "codex",
+                    "--pane",
+                    "w1:p2",
+                    "--",
+                ],
+                runner=runner,
+                timeout=1.0,
+                env={},
+                sleeper=lambda _seconds: None,
+            )
+        self.assertEqual(len(calls), 1)
+
+    def test_busy_error_on_stdout_does_not_authorize_a_retry(self) -> None:
+        busy = json.dumps(
+            {
+                "error": {"code": "agent_pane_busy", "message": "pane is busy"},
+                "id": "cli:agent:start",
+            }
+        )
+        completed = subprocess.CompletedProcess(
+            ["herdr", "agent", "start"], 1, stdout=busy, stderr=""
+        )
+        self.assertFalse(_agent_pane_busy(completed))
+
+    def test_contradictory_split_container_is_refused_before_pane_run(self) -> None:
+        herdr = _Herdr()
+
+        def contradictory_split(argv, *args, **kwargs):
+            completed = herdr.run(argv, *args, **kwargs)
+            if (
+                argv[1:3] != ["pane", "split"]
+                or argv[1:] == ["pane", "split", "--help"]
+                or completed.returncode != 0
+            ):
+                return completed
+            payload = json.loads(completed.stdout)
+            payload["result"]["pane"]["pane_id"] = "wFOREIGN:p9"
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(payload),
+                stderr="",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(HerdrSessionStartError) as caught:
+                self._prepare(
+                    tmp,
+                    providers=["claude"],
+                    herdr=herdr,
+                    herdr_runner=contradictory_split,
+                )
+
+        self.assertIn("no parseable pane identity", str(caught.exception))
+        self.assertEqual(herdr.pane_runs, [])
+        self.assertEqual(herdr.start_argvs, [])
 
     def test_generation_incapable_launcher_refuses_before_any_actuation(self) -> None:
         # #14203 review j#87479 F1: a launcher that carries `agent-attest` + a matching

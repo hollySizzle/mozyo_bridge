@@ -79,6 +79,15 @@ def _start(fake, workspace, provider, *, lane="lane-x", extra=()):
             ]
         )
     )["result"]["pane"]["pane_id"]
+    fake.run(
+        [
+            BINARY,
+            "pane",
+            "run",
+            prepared,
+            f'{provider}() {{ exec /private/action/{provider} "$@"; }}',
+        ]
+    )
     completed = fake.run([
         BINARY,
         "agent",
@@ -216,6 +225,15 @@ class AgentStartTest(unittest.TestCase):
             )
         )["result"]["pane"]
         native = "mza1_aaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        fake.run(
+            [
+                BINARY,
+                "pane",
+                "run",
+                prepared["pane_id"],
+                'codex() { exec /private/action/codex "$@"; }',
+            ]
+        )
         started = _payload(
             fake.run(
                 [
@@ -282,6 +300,55 @@ class AgentStartTest(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 1)
         self.assertIn("no such pane", completed.stderr)
+
+    def test_start_without_matching_pane_function_fails_closed(self) -> None:
+        fake = FakeHerdr()
+        wid = fake.seed_workspace()
+        pane = fake.panes_of(wid)[0]
+        completed = fake.run(
+            [
+                BINARY,
+                "agent",
+                "start",
+                native_name_for("mzb1_ws_claude_lane"),
+                "--kind",
+                "claude",
+                "--pane",
+                pane,
+                "--",
+            ]
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("no matching prepared claude function", completed.stderr)
+
+    def test_start_rejects_a_function_prepared_for_the_other_provider(self) -> None:
+        fake = FakeHerdr()
+        wid = fake.seed_workspace()
+        pane = fake.panes_of(wid)[0]
+        fake.run(
+            [
+                BINARY,
+                "pane",
+                "run",
+                pane,
+                'codex() { exec /private/action/codex "$@"; }',
+            ]
+        )
+        completed = fake.run(
+            [
+                BINARY,
+                "agent",
+                "start",
+                native_name_for("mzb1_ws_claude_lane"),
+                "--kind",
+                "claude",
+                "--pane",
+                pane,
+                "--",
+            ]
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("no matching prepared claude function", completed.stderr)
 
     def test_start_missing_name_positional_is_unmodelled(self) -> None:
         fake = FakeHerdr()
