@@ -42,6 +42,7 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     classify_identity_env,
     record_identity_attestation,
 )
+from mozyo_bridge.core.state.herdr_native_identity_binding import native_name_for
 from mozyo_bridge.core.state.lane_epoch import MOZYO_LANE_EPOCH_ENV
 from mozyo_bridge.core.state.startup_execution_events import (
     STAGE_ATTESTATION_WRITE_FAILED,
@@ -56,6 +57,7 @@ from mozyo_bridge.core.state.startup_execution_events import (
     STAGE_WRAPPER_ENTERED,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
+    MOZYO_HERDR_NATIVE_NAME_ENV,
     MOZYO_PROVIDER_ARGV0_ENV,
     MOZYO_STARTUP_ACTION_ID_ENV,
 )
@@ -99,6 +101,7 @@ ATTESTATION_REASON_LOCATOR_UNAVAILABLE = "locator_unavailable"
 #: The attestation store write itself failed (the best-effort writer returned no
 #: persisted record). Value-free: names the step, never the store error text.
 ATTESTATION_REASON_STORE_WRITE_FAILED = "store_write_failed"
+ATTESTATION_REASON_NATIVE_IDENTITY_MISMATCH = "native_identity_mismatch"
 
 #: The launch declared a lane epoch but the value that actually landed in this process's own
 #: env differs from it, or is absent (Redmine #14756). Value-free: names the DISAGREEMENT,
@@ -322,8 +325,26 @@ def perform_self_attestation(
         env=env,
     )
     emit(STAGE_SELF_LOOKUP_STARTED)
+    # Herdr 0.8 stores a short native name in its raw inventory.  A managed launch
+    # injects that value into this process, and the deterministic derivation proves
+    # it belongs to the launcher-declared logical identity.  Callers that do not select
+    # the 0.8 native-name path retain the logical lookup behavior; the managed 0.8 launch
+    # always supplies this value.
+    observed_native = env.get(MOZYO_HERDR_NATIVE_NAME_ENV, "")
+    if observed_native:
+        try:
+            expected_native = native_name_for(assigned_name)
+        except Exception:  # noqa: BLE001 — the wrapper must still exec the provider
+            expected_native = ""
+        if observed_native != expected_native:
+            emit(
+                STAGE_ATTESTATION_WRITE_FAILED,
+                ATTESTATION_REASON_NATIVE_IDENTITY_MISMATCH,
+            )
+            return None
+    lookup_name = observed_native or assigned_name
     locator, stage, reason = bounded_self_lookup(
-        assigned_name,
+        lookup_name,
         env,
         runner=runner,
         monotonic=monotonic,
@@ -578,6 +599,7 @@ def cmd_herdr_agent_attest(args: argparse.Namespace) -> int:
 __all__ = (
     "ATTESTATION_REASON_LANE_EPOCH_NOT_INJECTED",
     "ATTESTATION_REASON_LOCATOR_UNAVAILABLE",
+    "ATTESTATION_REASON_NATIVE_IDENTITY_MISMATCH",
     "ATTESTATION_REASON_STORE_WRITE_FAILED",
     "EXEC_REASON_ARGV0_ALIAS_UNBOUND",
     "EXEC_REASON_EXEC_RAISED",

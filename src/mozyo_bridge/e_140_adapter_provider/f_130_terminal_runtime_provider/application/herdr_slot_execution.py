@@ -22,21 +22,29 @@ Closing what a run started is the explicit public rollback rail's authority alon
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Mapping, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
+
+from mozyo_bridge.core.state.herdr_native_identity_binding import (
+    HerdrNativeIdentityBindingStore,
+)
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
     HerdrSessionStartError,
-    _parse_started_agent,
+    _parse_started_agent_identity,
     _workspace_prefix,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (  # noqa: E501
     build_agent_start_argv,
+    build_pane_launch_env,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_epoch import (  # noqa: E501
     resolve_launch_lane_epoch,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
     _invoke,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_bound_launch import (  # noqa: E501
+    split_prepared_pane,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_result import (  # noqa: E501
     SLOT_ADOPTED,
@@ -68,6 +76,7 @@ def _execute_slot(
     target_tab: str = "",
     split: str = "",
     focus: bool = False,
+    anchor_locator: str = "",
     binary: str,
     attest_launcher: str = "",
     store_home: str = "",
@@ -79,6 +88,10 @@ def _execute_slot(
     order_deferred: bool = False,
     replacement_action_id: str = "",
     action_id: str = "",
+    prepared_callback: Optional[Callable[..., None]] = None,
+    native_store: Optional[HerdrNativeIdentityBindingStore] = None,
+    native_name: str = "",
+    shim_dir: str = "",
 ) -> SlotResult:
     if plan.kind == "adopt":
         return SlotResult(
@@ -137,45 +150,99 @@ def _execute_slot(
     # `_invoke` would verify one binary and exec another. An unresolvable / ambiguous
     # provider binary raises here — before `agent start` runs — so a failed resolution
     # never leaves a live pane behind.
-    launch_argv = build_agent_start_argv(
-        assigned_name=plan.assigned_name,
+    if resolved is None:
+        raise HerdrSessionStartError(
+            f"launch plan for {plan.provider!r} has no preflighted provider executable"
+        )
+    if prepared_callback is None:
+        raise HerdrSessionStartError(
+            "Herdr 0.8 launch has no startup participant recorder; refuse to create an "
+            "untracked pane"
+        )
+    if not shim_dir:
+        raise HerdrSessionStartError(
+            "Herdr 0.8 launch has no preflighted provider shim; refuse to create a "
+            "pane after an incomplete whole-plan preflight"
+        )
+    binding = (native_store or HerdrNativeIdentityBindingStore(home=Path(store_home))).bind(
+        plan.assigned_name
+    )
+    if native_name and native_name != binding.native_name:
+        raise HerdrSessionStartError(
+            "preflighted Herdr native identity changed before pane creation"
+        )
+    lane_epoch = resolve_launch_lane_epoch(workspace_id, lane, store_home=store_home)
+    pane_env = build_pane_launch_env(
         provider=plan.provider,
-        repo_root=repo_root,
+        native_name=binding.native_name,
         workspace_id=workspace_id,
         lane=lane,
-        target_workspace=target_workspace,
-        target_tab=target_tab,
-        split=split,
-        focus=focus,
         binary=binary,
+        shim_dir=shim_dir,
+        source_path=str(env.get("PATH") or ""),
+        resolved=resolved,
         attest_launcher=attest_launcher,
         store_home=store_home,
+        action_id=action_id,
+        lane_epoch=lane_epoch,
+    )
+    prepared = split_prepared_pane(
+        binary=binary,
+        anchor_locator=anchor_locator,
+        direction=split or "right",
+        repo_root=repo_root,
+        env_entries=pane_env,
+        target_workspace=target_workspace,
+        target_tab=target_tab,
+        runner=runner,
+        timeout=timeout,
+        env=env,
+    )
+    # This callback is intentionally adjacent to the successful split parse.  Herdr
+    # exposes no atomic "split + durable receipt" primitive, so this is the smallest
+    # possible unrecorded interval; agent start is never attempted before it returns.
+    prepared_callback(
+        role=plan.provider,
+        assigned_name=plan.assigned_name,
+        locator=prepared.locator,
+        native_name=binding.native_name,
+        target_workspace=target_workspace,
+        target_tab=prepared.tab_id or target_tab,
+    )
+    launch_argv = build_agent_start_argv(
+        assigned_name=plan.assigned_name,
+        native_name=binding.native_name,
+        pane_locator=prepared.locator,
+        provider=plan.provider,
+        workspace_id=workspace_id,
+        lane=lane,
+        attest_launcher=attest_launcher,
         resolved=resolved,
         launch_argv_extra=launch_argv_extra,
         replacement_action_id=replacement_action_id,
         action_id=action_id,
-        # Redmine #14756: read (never mint) the lane's current epoch and hand it to the
-        # wrapper + the injected env, so this process generation can later PROVE it is
-        # post-hibernate without consulting a clock or a reusable pane-id.
-        lane_epoch=resolve_launch_lane_epoch(
-            workspace_id, lane, store_home=store_home
-        ),
+        lane_epoch=lane_epoch,
     )
     started = _invoke(
         binary,
         launch_argv,
         runner,
-        timeout,
+        max(timeout, 31.0),
         env=dict(env),
     )
-    started_agent = _parse_started_agent(started.stdout)
+    started_agent = _parse_started_agent_identity(started.stdout)
     if started_agent is None:
         raise HerdrSessionStartError(
             f"herdr agent start for {plan.provider!r} returned no usable live locator "
             "(expected result.agent.pane_id in an agent_started payload); refuse to "
             "return a blank handle"
         )
-    locator, landed_tab = started_agent
+    locator, landed_tab, returned_native_name = started_agent
+    if returned_native_name != binding.native_name:
+        raise HerdrSessionStartError(
+            f"herdr agent start for {plan.provider!r} returned a different native "
+            "identity than the collision-checked launch binding"
+        )
     if not valid_target(locator):
         raise HerdrSessionStartError(
             f"herdr agent start for {plan.provider!r} returned an invalid live locator "
@@ -188,6 +255,11 @@ def _execute_slot(
     # us close our created root pane while an auto-created base pane survives elsewhere,
     # unseen — exactly the failure this US must prevent. Fail closed instead (before
     # any reclaim), so the mislocated launch is surfaced rather than papered over.
+    if locator != prepared.locator:
+        raise HerdrSessionStartError(
+            f"herdr agent start for {plan.provider!r} reported pane {locator!r} after "
+            f"the startup action prepared {prepared.locator!r}; refuse a changed target"
+        )
     landed = _workspace_prefix(locator)
     if landed != target_workspace:
         raise HerdrSessionStartError(
@@ -215,7 +287,10 @@ def _execute_slot(
     # `order_deferred` (see `slot_placement`): the configured primary could only be placed
     # as a split beside an already-live sibling, so the physical order waits for a full
     # relaunch. Say so rather than silently claim the order was applied.
-    detail = "launched with the durable name and self-identity env (--env) at start"
+    detail = (
+        "launched in an action-recorded Herdr 0.8 pane; logical identity and "
+        "self-identity env retained"
+    )
     if order_deferred:
         detail += "; order_deferred_until_full_relaunch (no swap/bounce)"
     return SlotResult(

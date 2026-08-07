@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import itertools
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
@@ -52,6 +54,14 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (  # noqa: E501
     valid_target,
+)
+from mozyo_bridge.core.state.herdr_native_identity_binding import (
+    HerdrNativeIdentityBindingError,
+    HerdrNativeIdentityBindingStore,
+    NATIVE_NAME_MAX_LENGTH,
+    is_native_name,
+    logicalize_agent_rows,
+    native_name_for,
 )
 from tests.support.private_path_fixtures import macos_home_path
 
@@ -381,6 +391,79 @@ class LaneWorkspaceTokenTest(unittest.TestCase):
         self.assertEqual(decoded.identity.role, "codex")
         self.assertEqual(decoded.identity.lane_id, DEFAULT_LANE)
         self.assertLessEqual(len(name), NAME_MAX_LENGTH)
+
+
+class HerdrNativeIdentityBindingTest(unittest.TestCase):
+    """Redmine #15101: Herdr 0.8's short name is an adapter-only identity."""
+
+    def test_native_name_is_deterministic_and_herdr_080_safe(self) -> None:
+        logical = encode_assigned_name("a" * 32, "claude", "default")
+        first = native_name_for(logical)
+        self.assertEqual(first, native_name_for(logical))
+        self.assertEqual(len(first), NATIVE_NAME_MAX_LENGTH)
+        self.assertTrue(is_native_name(first))
+        self.assertRegex(first, r"^mza1_[a-z2-7]{27}$")
+
+    def test_native_name_codec_rejects_noncanonical_managed_shapes(self) -> None:
+        self.assertFalse(is_native_name("mza1_" + "0" * 27))
+        self.assertFalse(is_native_name("mza1_" + "a" * 26))
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(HerdrNativeIdentityBindingError):
+                logicalize_agent_rows(
+                    ({"name": "mza1_" + "0" * 27, "pane_id": "w1:p2"},),
+                    store=HerdrNativeIdentityBindingStore(home=Path(td)),
+                )
+
+    def test_bind_is_idempotent_and_inventory_restores_logical_name(self) -> None:
+        logical = encode_assigned_name("a" * 32, "codex", "default")
+        with tempfile.TemporaryDirectory() as td:
+            store = HerdrNativeIdentityBindingStore(home=Path(td))
+            first = store.bind(logical)
+            second = store.bind(logical)
+            self.assertEqual(first, second)
+            rows = logicalize_agent_rows(
+                ({"name": first.native_name, "pane_id": "w1:p2"},), store=store
+            )
+            self.assertEqual(rows[0]["name"], logical)
+            self.assertEqual(rows[0]["native_name"], first.native_name)
+            self.assertEqual(rows[0]["pane_id"], "w1:p2")
+            self.assertEqual(store.path.stat().st_mode & 0o777, 0o600)
+
+    def test_unbound_native_inventory_fails_closed_without_creating_store(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = HerdrNativeIdentityBindingStore(home=Path(td))
+            with self.assertRaises(HerdrNativeIdentityBindingError):
+                logicalize_agent_rows(
+                    ({"name": native_name_for("mzb1_ws_codex_default")},),
+                    store=store,
+                )
+            self.assertFalse(store.path.exists())
+
+    def test_digest_collision_is_explicitly_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = HerdrNativeIdentityBindingStore(home=Path(td))
+            native = native_name_for("mzb1_ws_codex_default")
+            with mock.patch(
+                "mozyo_bridge.core.state.herdr_native_identity_binding.native_name_for",
+                return_value=native,
+            ):
+                store.bind("mzb1_ws_codex_default")
+                with self.assertRaises(HerdrNativeIdentityBindingError):
+                    store.bind("mzb1_ws_claude_default")
+
+    def test_whole_launch_collision_is_refused_before_store_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = HerdrNativeIdentityBindingStore(home=Path(td))
+            collision = "mza1_" + "a" * 27
+            with mock.patch(
+                "mozyo_bridge.core.state.herdr_native_identity_binding.native_name_for",
+                return_value=collision,
+            ):
+                with self.assertRaises(HerdrNativeIdentityBindingError):
+                    store.bind_many(
+                        ("mzb1_ws_codex_default", "mzb1_ws_claude_default")
+                    )
+            self.assertFalse(store.path.exists())
 
 
 if __name__ == "__main__":  # pragma: no cover

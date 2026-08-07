@@ -59,8 +59,16 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     VERDICT_PRESENT,
     record_identity_attestation,
 )
+from mozyo_bridge.core.state.herdr_native_identity_binding import (
+    HerdrNativeIdentityBindingStore,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_health import (  # noqa: E501
     StartupProbe,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_cli_capabilities import (  # noqa: E501
+    HerdrCliCapabilityError,
+    REASON_AGENT_START_SURFACE_MISMATCH,
+    observe_herdr_cli_capabilities,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_health import (  # noqa: E501
     HEALTH_ATTESTATION_UNAVAILABLE,
@@ -106,17 +114,8 @@ def _launch_env(binpath, **extra):
 
 
 def _launched_provider(start_argv):
-    """The provider id a launched `agent start` argv runs, from its absolute argv[0].
-
-    argv[0] is no longer the provider label (#13441), so a test that needs to know
-    which provider an argv launched maps the resolved executable back to its id
-    instead of reading the label out of the argv.
-    """
-    argv0 = start_argv[start_argv.index("--") + 1]
-    for provider in DEFAULT_PROVIDER_COMMANDS:
-        if argv0 == PROVIDER_BINS.path(provider):
-            return provider
-    raise AssertionError(f"argv[0] is not a known provider executable: {argv0!r}")
+    """The Herdr 0.8 canonical provider kind selected by ``agent start``."""
+    return start_argv[start_argv.index("--kind") + 1]
 
 
 def _env_flags(start_argv):
@@ -127,6 +126,24 @@ def _env_flags(start_argv):
             key, value = start_argv[i + 1].split("=", 1)
             flags[key] = value
     return flags
+
+
+def _agent_start_calls(herdr):
+    """Only mutating ``agent start`` calls, excluding the 0.8 help preflight."""
+    return [
+        call
+        for call in herdr.calls
+        if call[:2] == ["agent", "start"] and call != ["agent", "start", "--help"]
+    ]
+
+
+def _non_capability_calls(herdr):
+    """Herdr calls other than the two read-only 0.8 help probes."""
+    probes = {
+        ("agent", "start", "--help"),
+        ("pane", "split", "--help"),
+    }
+    return [call for call in herdr.calls if tuple(call) not in probes]
 
 
 #: Redmine #13948: the post-launch probe's bounded deadline, driven with a no-op sleeper.
@@ -170,10 +187,100 @@ def _fingerprint(paths):
     return fp
 
 
-class _Herdr:
-    """A fake herdr CLI (0.7.1 shape) keyed on argv; records start argv + env.
+class Herdr080CapabilityPreflightTest(unittest.TestCase):
+    def test_exact_080_help_surface_is_admitted(self) -> None:
+        def runner(argv, **_kwargs):
+            tail = argv[1:]
+            text = (
+                "--kind KIND --pane ID --timeout MS"
+                if tail[:2] == ["agent", "start"]
+                else (
+                    "Usage: herdr pane split [PANE_ID] --direction right|down "
+                    "--cwd PATH --env K=V --focus --no-focus"
+                )
+            )
+            return subprocess.CompletedProcess(argv, 0, stdout=text, stderr="")
 
-    ``agent start`` returns the real herdr 0.7.1 JSON envelope
+        observed = observe_herdr_cli_capabilities(
+            "/bin/herdr", runner=runner, timeout=1.0, env={}
+        )
+        self.assertIn("--pane", observed.agent_start_help)
+        self.assertIn("--direction", observed.pane_split_help)
+
+    def test_legacy_agent_start_surface_is_refused(self) -> None:
+        def runner(argv, **_kwargs):
+            tail = argv[1:]
+            text = (
+                "--cwd PATH --workspace ID --env K=V --split down"
+                if tail[:2] == ["agent", "start"]
+                else (
+                    "Usage: herdr pane split [PANE_ID] --direction right|down "
+                    "--cwd PATH --env K=V --focus --no-focus"
+                )
+            )
+            return subprocess.CompletedProcess(argv, 0, stdout=text, stderr="")
+
+        with self.assertRaises(HerdrCliCapabilityError) as caught:
+            observe_herdr_cli_capabilities(
+                "/bin/herdr", runner=runner, timeout=1.0, env={}
+            )
+        self.assertEqual(caught.exception.reason, REASON_AGENT_START_SURFACE_MISMATCH)
+
+    def test_session_refuses_legacy_surface_before_home_lock_or_registration(self) -> None:
+        calls = []
+        lock_entries = []
+
+        def runner(argv, **_kwargs):
+            calls.append(list(argv[1:]))
+            tail = argv[1:]
+            text = (
+                "--cwd PATH --workspace ID --env K=V --split down"
+                if tail[:2] == ["agent", "start"]
+                else (
+                    "Usage: herdr pane split [PANE_ID] --direction right|down "
+                    "--cwd PATH --env K=V --focus --no-focus"
+                )
+            )
+            return subprocess.CompletedProcess(argv, 0, stdout=text, stderr="")
+
+        @contextlib.contextmanager
+        def _lock(*_args, **_kwargs):
+            lock_entries.append(True)
+            yield
+
+        lock_target = (
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_session_start.attestation_store_lock"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            home = root / "home"
+            repo.mkdir()
+            home.mkdir()
+            binary = root / "herdr"
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(0o755)
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+            ), patch(lock_target, _lock):
+                with self.assertRaises(HerdrSessionStartError):
+                    prepare_session(
+                        repo_root=repo,
+                        providers=["codex"],
+                        lane_id="",
+                        env=_launch_env(binary),
+                        runner=runner,
+                    )
+            self.assertEqual(list(repo.iterdir()), [])
+        self.assertEqual(lock_entries, [])
+        self.assertEqual(calls, [["agent", "start", "--help"]])
+
+
+class _Herdr:
+    """A stateful Herdr 0.8 fake; records pane-split then pane-bound start.
+
+    ``agent start`` returns the Herdr 0.8 JSON envelope
     (``result.type == "agent_started"``, locator at ``result.agent.pane_id``). There
     is no ``agent rename`` branch — a stray rename call raises (the durable name is
     applied at start).
@@ -211,9 +318,9 @@ class _Herdr:
         self.generation_capable = generation_capable
         self.attest_probes: list = []
         self.existing_rows = existing_rows or []
-        # By default the launched agent lands in the workspace it was told to via
-        # `--workspace` (the realistic herdr behaviour). An explicit `start_locator`
-        # overrides that — used to force a mislocated launch (#13330 review j#73231).
+        # By default the launched agent lands in the exact pane supplied via `--pane`.
+        # An explicit `start_locator` overrides that — used to force a mislocated launch
+        # (#13330 review j#73231).
         self.start_locator = start_locator
         self.created_workspace = created_workspace
         # The tab id `tab create` mints (Redmine #13411); defaults to `<ws>:t1`.
@@ -266,9 +373,24 @@ class _Herdr:
         self.calls: list = []
         self.launch_envs: list = []
         self.start_argvs: list = []
+        self.pane_splits: list = []
+        self.pane_envs: dict = {}
+        self.pane_locations: dict = {}
+        self._pane_seq = 20
         self.workspace_creates: list = []
         self.tab_creates: list = []
         self.pane_closes: list = []
+        for row in self.existing_rows:
+            locator = str(row.get("pane_id") or "")
+            if locator:
+                workspace_id = str(
+                    row.get("workspace_id") or locator.partition(":")[0]
+                )
+                self.pane_locations[locator] = (
+                    workspace_id,
+                    str(row.get("tab_id") or f"{workspace_id}:t1"),
+                    str(row.get("cwd") or ""),
+                )
         # Redmine #14139: the shared-coordinators label authority (`workspace list`).
         # `{herdr_workspace_id: label}` the fake reports; a `workspace create --label`
         # records the created workspace's label here so a later `workspace list`
@@ -312,6 +434,26 @@ class _Herdr:
     def run(self, argv, capture_output=None, text=None, timeout=None, env=None, **kw):
         rest = list(argv[1:])
         self.calls.append(rest)
+        if rest == ["agent", "start", "--help"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=(
+                    "Usage: herdr agent start <NAME> --kind <KIND> --pane <ID> "
+                    "[--timeout <MS>] [-- [AGENT_ARG]...]\n"
+                ),
+                stderr="",
+            )
+        if rest == ["pane", "split", "--help"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=(
+                    "Usage: herdr pane split [PANE_ID] --direction right|down "
+                    "[--cwd PATH] [--env KEY=VALUE] [--focus] [--no-focus]\n"
+                ),
+                stderr="",
+            )
         # Redmine #13748 launcher capability probe: argv[0] is the LAUNCHER (not the
         # herdr binary) and the tail is the wrapper subcommand — the only invocation
         # whose tail begins with "herdr". Distinguish it from real herdr calls (whose
@@ -392,6 +534,8 @@ class _Herdr:
             wid = self.created_workspace
             if "--label" in rest:
                 self.workspace_labels[wid] = rest[rest.index("--label") + 1]
+            root_pane = f"{wid}:p1"
+            self.pane_locations[root_pane] = (wid, f"{wid}:t1", "")
             return subprocess.CompletedProcess(
                 argv,
                 0,
@@ -401,7 +545,7 @@ class _Herdr:
                         "result": {
                             "type": "workspace_created",
                             "workspace": {"workspace_id": wid},
-                            "root_pane": {"pane_id": f"{wid}:p1"},
+                            "root_pane": {"pane_id": root_pane},
                         },
                     }
                 ),
@@ -415,6 +559,8 @@ class _Herdr:
                     argv, 0, stdout=json.dumps({"result": {"type": "nope"}}), stderr=""
                 )
             tab_id = self.created_tab or f"{wid}:t1"
+            root_pane = f"{tab_id}-root"
+            self.pane_locations[root_pane] = (wid, tab_id, "")
             return subprocess.CompletedProcess(
                 argv,
                 0,
@@ -424,7 +570,7 @@ class _Herdr:
                         "result": {
                             "type": "tab_created",
                             "tab": {"tab_id": tab_id},
-                            "root_pane": {"pane_id": f"{tab_id}-root"},
+                            "root_pane": {"pane_id": root_pane},
                         },
                     }
                 ),
@@ -457,6 +603,93 @@ class _Herdr:
             return subprocess.CompletedProcess(
                 argv, 0, stdout=json.dumps(self._layout_payload(rest[3])), stderr=""
             )
+        if rest[:2] == ["pane", "list"]:
+            wid = rest[rest.index("--workspace") + 1]
+            panes = [
+                {
+                    "pane_id": pane_id,
+                    "workspace_id": workspace_id,
+                    "tab_id": tab_id,
+                    "cwd": cwd,
+                    "agent": next(
+                        (
+                            row.get("agent")
+                            for row in self.started_rows
+                            if row.get("pane_id") == pane_id
+                        ),
+                        None,
+                    ),
+                }
+                for pane_id, (workspace_id, tab_id, cwd) in self.pane_locations.items()
+                if workspace_id == wid
+            ]
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(
+                    {"result": {"type": "pane_list", "panes": panes}}
+                ),
+                stderr="",
+            )
+        if rest[:2] == ["pane", "split"]:
+            self.pane_splits.append(rest)
+            anchor = rest[2]
+            if anchor not in self.pane_locations:
+                # Existing agent rows are authoritative even when a scenario omitted
+                # workspace_id from the fixture.
+                row = next(
+                    (row for row in self.existing_rows if row.get("pane_id") == anchor),
+                    None,
+                )
+                if row is None:
+                    return subprocess.CompletedProcess(
+                        argv, 1, stdout="", stderr="pane not found"
+                    )
+                self.pane_locations[anchor] = (
+                    str(row.get("workspace_id") or anchor.partition(":")[0]),
+                    str(
+                        row.get("tab_id")
+                        or f"{str(row.get('workspace_id') or anchor.partition(':')[0])}:t1"
+                    ),
+                    str(row.get("cwd") or ""),
+                )
+            wid, tab_id, _anchor_cwd = self.pane_locations[anchor]
+            self._pane_seq += 1
+            pane_id = f"{wid}:p{self._pane_seq}"
+            cwd = rest[rest.index("--cwd") + 1]
+            pane_env = self._start_env(rest)
+            self.pane_envs[pane_id] = pane_env
+            self.pane_locations[pane_id] = (wid, tab_id, cwd)
+            tab = self._tree_for(wid, tab_id)
+            if anchor not in tab.panes():
+                if tab.root is None:
+                    tab.root = Leaf(anchor)
+                    tab.focused = anchor
+                else:
+                    tab.subdivide(tab.panes()[-1], "down", anchor)
+            direction = rest[rest.index("--direction") + 1]
+            self.split_direction = direction
+            tab.subdivide(anchor, direction, pane_id)
+            if "--focus" in rest:
+                tab.focused = pane_id
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(
+                    {
+                        "result": {
+                            "type": "pane_info",
+                            "pane": {
+                                "pane_id": pane_id,
+                                "workspace_id": wid,
+                                "tab_id": tab_id,
+                                "cwd": cwd,
+                            },
+                        }
+                    }
+                ),
+                stderr="",
+            )
         if rest[:2] == ["pane", "move"]:
             self.pane_moves.append(rest)
             return self._pane_move(argv, rest)
@@ -482,29 +715,30 @@ class _Herdr:
                 return subprocess.CompletedProcess(
                     argv, 1, stdout="", stderr="pane close refused"
                 )
+            pane_id = rest[2]
+            tab = self._tab_of(pane_id)
+            if tab is not None:
+                tab.remove(pane_id)
+            self.pane_locations.pop(pane_id, None)
+            self.pane_envs.pop(pane_id, None)
             return subprocess.CompletedProcess(
                 argv, 0, stdout=json.dumps({"result": {"type": "ok"}}), stderr=""
             )
         if rest[:2] == ["agent", "start"]:
-            self.launch_envs.append(env)
             self.start_argvs.append(rest)
             if self.start_fails:
                 return subprocess.CompletedProcess(
                     argv, 1, stdout="", stderr="agent start refused"
                 )
-            wid = rest[rest.index("--workspace") + 1] if "--workspace" in rest else ""
-            if self.start_locator is not None:
-                pane_id = self.start_locator
-            elif wid:
-                # Land in the requested workspace with a distinct pane per launch.
-                pane_id = f"{wid}:p{len(self.start_argvs) + 1}"
-            else:
-                pane_id = "w1:pNEW"
-            # Landed tab (Redmine #13411): echo the requested `--tab` unless forced.
-            requested_tab = rest[rest.index("--tab") + 1] if "--tab" in rest else ""
+            requested_pane = rest[rest.index("--pane") + 1]
+            pane_id = self.start_locator or requested_pane
+            wid, requested_tab, _cwd = self.pane_locations.get(
+                requested_pane, (requested_pane.partition(":")[0], "", "")
+            )
             landed_tab = self.start_tab if self.start_tab is not None else requested_tab
-            self._place_pane(rest, pane_id, wid, landed_tab)
-            self._settle_launch(rest, pane_id)
+            pane_env = self.pane_envs.get(requested_pane, {})
+            self.launch_envs.append(pane_env)
+            self._settle_launch(rest, requested_pane)
             return subprocess.CompletedProcess(
                 argv,
                 0,
@@ -693,14 +927,14 @@ class _Herdr:
         answer it is supposed to have to wait for.
         """
         live_at = row.get("_boot_live_at")
-        if live_at is None:
-            return row
         reported = {
             key: value
             for key, value in row.items()
-            if key not in ("_boot_live_at", "_boot_role")
+            if key not in ("_boot_live_at", "_boot_role", "_native_name")
         }
-        if self._boot_round >= live_at:
+        if row.get("_native_name"):
+            reported["name"] = row["_native_name"]
+        if live_at is not None and self._boot_round >= live_at:
             reported["agent"] = row["_boot_role"]
             reported["agent_status"] = "idle"
         return reported
@@ -715,12 +949,31 @@ class _Herdr:
            writes a locator-bound self-attestation. An UNWRAPPED launch writes nothing,
            exactly as in production, so the unwrapped fallback stays honest here.
         """
-        name = rest[2]
-        env = self._start_env(rest)
-        role = env.get("MOZYO_AGENT_ROLE", "")
+        native_name = rest[2]
+        env = self.pane_envs.get(pane_id, {})
+        role = rest[rest.index("--kind") + 1]
+        try:
+            name = (
+                HerdrNativeIdentityBindingStore(home=Path(self.attest_home)).resolve_native(
+                    native_name
+                )
+                if self.attest_home is not None
+                else None
+            )
+        except Exception:
+            name = None
+        name = name or native_name
         if role in self.exit_after_start:
             return  # started, then left: no row at all
-        row = {"name": name, "pane_id": pane_id, "agent_status": "idle"}
+        wid, tab_id, cwd = self.pane_locations.get(pane_id, ("", "", ""))
+        row = {
+            "name": name,
+            "_native_name": native_name,
+            "pane_id": pane_id,
+            "workspace_id": wid,
+            "tab_id": tab_id,
+            "agent_status": "idle",
+        }
         if role in self.residue_after_start:
             # Positive shell residue: the name is there, the agent field is present and
             # blank — the exact signal `classify_named_slot` calls SLOT_STALE (#13518).
@@ -737,11 +990,10 @@ class _Herdr:
             row["_boot_live_at"] = self._boot_round + 2
         else:
             row["agent"] = role
-        if "--cwd" in rest:
+        if cwd:
             # Herdr exposes the stable pane/workspace cwd separately from the
             # foreground process cwd.  They start equal in this fake; individual
             # project-column tests vary the dynamic value independently.
-            cwd = rest[rest.index("--cwd") + 1]
             row["cwd"] = cwd
             row["foreground_cwd"] = cwd
         self.started_rows.append(row)
@@ -892,9 +1144,10 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             )
             ws = anchor["workspace_id"]
         start = herdr.start_argvs[0]
-        # herdr `--` is followed by the resolved launcher, then the wrapper subcommand.
+        # Herdr runs the canonical provider name through the pane-private shim; the
+        # argv after `--` therefore begins at the launcher's subcommand.
         first_sep = start.index("--")
-        self.assertEqual(start[first_sep + 1], launcher)
+        self.assertEqual(start[first_sep + 1], "herdr")
         self.assertIn("agent-attest", start)
         self.assertIn("--assigned-name", start)
         self.assertIn(encode_assigned_name(ws, "claude", "lane-1"), start)
@@ -903,8 +1156,10 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         # The provider is after the LAST `--` (the wrapper's own separator).
         last_sep = len(start) - 1 - start[::-1].index("--")
         self.assertEqual(start[last_sep + 1], PROVIDER_BINS.path("claude"))
-        # The injected identity env is unchanged (still on herdr --env flags).
-        self.assertIn(f"MOZYO_WORKSPACE_ID={ws}", start)
+        # Placement and env injection happen when the pane is created.
+        self.assertEqual(herdr.launch_envs[0]["MOZYO_WORKSPACE_ID"], ws)
+        shim = Path(herdr.launch_envs[0]["PATH"].split(os.pathsep)[0]) / "claude"
+        self.assertTrue(shim.is_symlink() or not shim.exists())  # cleaned after start
 
     def test_launch_is_byte_invariant_when_launcher_unresolvable(self) -> None:
         # No resolvable mozyo-bridge on the launch env PATH -> no wrapper, byte-invariant
@@ -916,7 +1171,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         start = herdr.start_argvs[0]
         self.assertNotIn("agent-attest", start)
         self.assertNotIn("MOZYO_BRIDGE_HOME", "".join(start))
-        self.assertEqual(start[-2:], ["--", PROVIDER_BINS.path("claude")])
+        self.assertEqual(start[-1:], ["--"])
 
     # --- Launcher command-capability preflight: feature behavior (Redmine #13748) ---
     # The DEFECT regression pins (incapable launcher must fail closed with zero
@@ -949,7 +1204,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         )
         # And the launch proceeded, wrapped through the same launcher.
         start = herdr.start_argvs[0]
-        self.assertEqual(start[start.index("--") + 1], launcher)
+        self.assertEqual(start[start.index("--") + 1], "herdr")
         self.assertIn("agent-attest", start)
         self.assertEqual(result.slots[0].outcome, SLOT_LAUNCHED)
 
@@ -1049,7 +1304,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             launcher_env, _ = self._fake_launcher_env(tmp)
             self._prepare(tmp, providers=["claude"], herdr=herdr, extra_env=launcher_env)
-            injected = _env_flags(herdr.start_argvs[0])
+            injected = herdr.launch_envs[0]
             expected_home = str((Path(tmp) / "home").resolve())
             self.assertEqual(injected.get("MOZYO_BRIDGE_HOME"), expected_home)
 
@@ -1121,10 +1376,15 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             # The durable name is applied AT START (positional), never via rename.
             self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "rename"]])
             for argv in herdr.start_argvs:
-                # argv = ["agent", "start", <NAME>, "--cwd", ...]; argv[0] of the run
-                # command is now the resolved absolute executable, so map it back.
                 provider = _launched_provider(argv)
-                self.assertEqual(argv[2], names[provider])
+                self.assertEqual(len(argv[2]), 32)
+                self.assertTrue(argv[2].startswith("mza1_"))
+                self.assertEqual(
+                    HerdrNativeIdentityBindingStore(home=Path(tmp) / "home").resolve_native(
+                        argv[2]
+                    ),
+                    names[provider],
+                )
 
     def test_launch_injects_self_identity_via_env_flags(self) -> None:
         herdr = _Herdr()
@@ -1133,19 +1393,19 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                 tmp, providers=["claude"], herdr=herdr
             )
             ws = anchor["workspace_id"]
-        # Self-identity rides on --env flags (the client env does NOT reach the
-        # server-spawned agent), so assert the --env triplet + name positional +
-        # --cwd + --no-focus in the start argv, not the runner env kwarg.
+        # Self-identity rides on the exact pane split that precedes agent start.
         start = herdr.start_argvs[0]
-        self.assertEqual(start[:3], ["agent", "start", encode_assigned_name(ws, "claude", "lane-1")])
-        self.assertIn("--cwd", start)
-        self.assertIn(str(repo), start)
-        self.assertIn("--no-focus", start)
-        self.assertIn(f"MOZYO_WORKSPACE_ID={ws}", start)
-        self.assertIn("MOZYO_AGENT_ROLE=claude", start)
-        self.assertIn("MOZYO_LANE_ID=lane-1", start)
-        # `-- <provider>` terminates the argv.
-        self.assertEqual(start[-2:], ["--", PROVIDER_BINS.path("claude")])
+        self.assertEqual(start[:2], ["agent", "start"])
+        self.assertEqual(_launched_provider(start), "claude")
+        split = herdr.pane_splits[0]
+        self.assertIn("--cwd", split)
+        self.assertIn(str(repo), split)
+        self.assertIn("--no-focus", split)
+        injected = herdr.launch_envs[0]
+        self.assertEqual(injected["MOZYO_WORKSPACE_ID"], ws)
+        self.assertEqual(injected["MOZYO_AGENT_ROLE"], "claude")
+        self.assertEqual(injected["MOZYO_LANE_ID"], "lane-1")
+        self.assertEqual(start[-1:], ["--"])
 
     def test_codex_launch_propagates_identity_to_tool_shell_policy(self) -> None:
         herdr = _Herdr()
@@ -1157,9 +1417,8 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
 
         start = herdr.start_argvs[0]
         separator = start.index("--")
-        self.assertEqual(start[separator + 1], PROVIDER_BINS.path("codex"))
         self.assertEqual(
-            start[separator + 2 :],
+            start[separator + 1 :],
             [
                 "-c",
                 f'shell_environment_policy.set.MOZYO_WORKSPACE_ID="{ws}"',
@@ -1190,8 +1449,8 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         start = herdr.start_argvs[0]
         separator = start.index("--")
         self.assertEqual(
-            start[separator + 1 : separator + 4],
-            [PROVIDER_BINS.path("codex"), "-c", 'model="test"'],
+            start[separator + 1 : separator + 3],
+            ["-c", 'model="test"'],
         )
         self.assertEqual(
             start[-2:],
@@ -1211,12 +1470,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             # env value here is already an absolute (non-symlink) executable, so the
             # injected value is byte-for-byte what `_prepare` put in the env.
             binpath = str(Path(tmp) / "fake-herdr")
-        start = herdr.start_argvs[0]
-        self.assertIn(f"MOZYO_HERDR_BINARY={binpath}", start)
-        # It rides on an `--env` flag (server-spawned agent path), never widened to a
-        # repo-local binary — the value is the launcher's trusted resolved binary.
-        idx = start.index(f"MOZYO_HERDR_BINARY={binpath}")
-        self.assertEqual(start[idx - 1], "--env")
+        self.assertEqual(herdr.launch_envs[0]["MOZYO_HERDR_BINARY"], binpath)
 
     def test_launch_resolves_trusted_path_herdr_without_env(self) -> None:
         # Redmine #13500 end-to-end: a launcher whose trusted env has NO
@@ -1251,10 +1505,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                     },
                     runner=herdr.run,
                 )
-        start = herdr.start_argvs[0]
-        self.assertIn(f"MOZYO_HERDR_BINARY={binpath}", start)
-        idx = start.index(f"MOZYO_HERDR_BINARY={binpath}")
-        self.assertEqual(start[idx - 1], "--env")
+        self.assertEqual(herdr.launch_envs[0]["MOZYO_HERDR_BINARY"], str(binpath))
 
     def test_launch_appends_permission_mode_for_claude_with_policy_default(self) -> None:
         # Redmine #13360: the herdr launch chokepoint mirrors the tmux managed-pane
@@ -1274,7 +1525,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         claude = by_provider["claude"]
         idx = claude.index("--permission-mode")
         self.assertEqual(claude[idx + 1], "auto")
-        # The flag rides AFTER `-- claude` so it reaches the claude CLI, not herdr.
+        # The flag rides after the separator so it reaches the canonical Claude CLI.
         self.assertGreater(idx, claude.index("--"))
         # Codex launches never get the flag (Claude-only policy, #11925 rule 1).
         self.assertNotIn("--permission-mode", by_provider["codex"])
@@ -1310,14 +1561,12 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         for argv in herdr.start_argvs:
             by_provider[_launched_provider(argv)] = argv
         claude = by_provider["claude"]
-        # `-- <abs claude> --permission-mode auto --model claude-opus-4-8` (Q4 order).
-        # argv[0] is the resolved absolute executable (#13441 j#76725 Q1); the flag
-        # tokens and their order are byte-invariant.
+        # `-- --permission-mode auto --model ...` (Q4 order); Herdr selects argv[0]
+        # from `--kind claude` and the pane-private shim pins the executable.
         self.assertEqual(
             claude[claude.index("--"):],
             [
                 "--",
-                PROVIDER_BINS.path("claude"),
                 "--permission-mode",
                 "auto",
                 "--model",
@@ -1326,8 +1575,8 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         )
         codex = by_provider["codex"]
         self.assertEqual(
-            codex[codex.index("--") : codex.index("--") + 4],
-            ["--", PROVIDER_BINS.path("codex"), "--config", "model_reasoning_effort=high"],
+            codex[codex.index("--") : codex.index("--") + 3],
+            ["--", "--config", "model_reasoning_effort=high"],
         )
         self.assertEqual(
             codex[-2:],
@@ -1362,8 +1611,8 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             )
         codex = herdr.start_argvs[0]
         self.assertEqual(
-            codex[codex.index("--") : codex.index("--") + 4],
-            ["--", PROVIDER_BINS.path("codex"), "--config", "model_reasoning_effort=xhigh"],
+            codex[codex.index("--") : codex.index("--") + 3],
+            ["--", "--config", "model_reasoning_effort=xhigh"],
         )
         self.assertEqual(
             codex[-2:],
@@ -1383,7 +1632,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             if provider == "claude":
                 # argv[0] is the resolved absolute executable; every other token of the
                 # unconfigured Claude launch is byte-invariant (j#76725 Q1).
-                self.assertEqual(argv[-2:], ["--", PROVIDER_BINS.path("claude")])
+                self.assertEqual(argv[-1:], ["--"])
             else:
                 self.assertEqual(
                     argv[-2:],
@@ -1398,7 +1647,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             self._prepare(tmp, providers=["claude"], herdr=herdr)
         start = herdr.start_argvs[0]
         self.assertNotIn("--permission-mode", start)
-        self.assertEqual(start[-2:], ["--", PROVIDER_BINS.path("claude")])
+        self.assertEqual(start[-1:], ["--"])
 
     def test_launch_env_override_wins_over_policy_default(self) -> None:
         # MOZYO_CLAUDE_PERMISSION_MODE stays the explicit override rail (#11857):
@@ -1494,7 +1743,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(slot.outcome, SLOT_ADOPTED)
         self.assertEqual(slot.locator, "w1:pOLD")
         # No launch / rename occurred.
-        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+        self.assertFalse(_agent_start_calls(herdr))
         self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "rename"]])
 
     def _prepare_with_rows(
@@ -1554,7 +1803,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(slot.outcome, SLOT_STALE)
         self.assertEqual(slot.locator, "w19:p3")  # the residue pane, for owner-gated recovery
         # Never adopted, never launched over, never a destructive close in this read-only pass.
-        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+        self.assertFalse(_agent_start_calls(herdr))
         self.assertFalse([c for c in herdr.calls if c[:2] == ["pane", "close"]])
         self.assertFalse([c for c in herdr.calls if c[:2] == ["workspace", "create"]])
 
@@ -1593,7 +1842,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         slot = result.slots[0]
         self.assertEqual(slot.outcome, SLOT_ADOPTED)
         self.assertEqual(slot.locator, "w19:pC")
-        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+        self.assertFalse(_agent_start_calls(herdr))
 
     def _live_codex_row(self, ws):
         return [
@@ -1611,7 +1860,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(slot.locator, "w19:pC")  # live locator, for owner-gated recovery
         self.assertIn("owner-approved", slot.detail)
         # Read-only: never launched over, never a destructive close.
-        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+        self.assertFalse(_agent_start_calls(herdr))
         self.assertFalse([c for c in herdr.calls if c[:2] == ["pane", "close"]])
 
     def test_live_agent_without_attestation_record_is_unattested(self) -> None:
@@ -1733,7 +1982,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         # Registry + anchor untouched: identical bytes and identical mtimes.
         self.assertEqual(before, after)
         # No herdr side effect: no launch, no workspace create, no base pane reclaim.
-        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+        self.assertFalse(_agent_start_calls(herdr))
         self.assertEqual(herdr.workspace_creates, [])
         self.assertEqual(herdr.pane_closes, [])
         self.assertEqual(result.base_pane_id, "")
@@ -1761,7 +2010,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             self.assertFalse(reg.exists())  # registry NOT created by the dry-run
             self.assertFalse(anc.exists())  # anchor NOT created by the dry-run
         self.assertIn("workspace register", str(ctx.exception))
-        self.assertEqual(herdr.calls, [])  # fails before any inventory read / launch
+        self.assertEqual(_non_capability_calls(herdr), [])
 
     def test_dry_run_registry_only_resolves_from_row_without_rewriting_anchor(self) -> None:
         # Matrix: registry row present, anchor deleted. A --dry-run resolves the id
@@ -1891,11 +2140,11 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             after = _fingerprint([registry_path(home), anchor_path(repo), legacy])
         self.assertIn("workspace.json", str(ctx.exception))
         self.assertEqual(before, after)  # nothing mutated
-        self.assertEqual(herdr.calls, [])
+        self.assertEqual(_non_capability_calls(herdr), [])
 
     def test_cold_start_creates_workspace_launches_with_flag_and_reclaims(self) -> None:
-        # Redmine #13330: a pure cold start explicitly creates the workspace, launches
-        # every slot into it (`--workspace`), and reclaims ONLY the returned root pane
+        # Redmine #13330: a pure cold start explicitly creates the workspace, prepares
+        # every slot inside it, and reclaims ONLY the returned root pane
         # after all launches succeed. Exercised on the DEFAULT lane so the #13411 tab
         # axis (which adds a tab create + tab root reclaim) never enters — this pins
         # the workspace axis in isolation.
@@ -1904,11 +2153,11 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             result, anchor, repo = self._prepare(
                 tmp, providers=["claude", "codex"], herdr=herdr, lane=""
             )
-        # Exactly one workspace create; each launch carries `--workspace wZ`.
+        # Exactly one workspace create; every pane-bound start lands in wZ.
         self.assertEqual(len(herdr.workspace_creates), 1)
         for argv in herdr.start_argvs:
-            self.assertIn("--workspace", argv)
-            self.assertEqual(argv[argv.index("--workspace") + 1], "wZ")
+            pane = argv[argv.index("--pane") + 1]
+            self.assertEqual(herdr.pane_locations[pane][0], "wZ")
         # Exactly the created root pane is closed — never a scanned-for shell.
         self.assertEqual(herdr.pane_closes, [["pane", "close", "wZ:p1"]])
         self.assertEqual(result.herdr_workspace_id, "wZ")
@@ -1923,9 +2172,57 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         kinds = [tuple(c[:2]) for c in herdr.calls]
         create_i = kinds.index(("workspace", "create"))
         close_i = kinds.index(("pane", "close"))
-        start_is = [i for i, k in enumerate(kinds) if k == ("agent", "start")]
+        start_is = [
+            i
+            for i, (call, kind) in enumerate(zip(herdr.calls, kinds))
+            if kind == ("agent", "start")
+            and call != ["agent", "start", "--help"]
+        ]
         self.assertTrue(create_i < min(start_is))
         self.assertTrue(close_i > max(start_is))
+
+    def test_complete_shim_set_is_prepared_before_first_herdr_write(self) -> None:
+        """A later-provider shim failure leaves no workspace, pane, or first agent."""
+        entered = []
+        exited = []
+
+        @contextlib.contextmanager
+        def _shim(*, provider, **_kwargs):
+            entered.append(provider)
+            if provider == "claude":
+                raise HerdrSessionStartError("second provider shim refused")
+            try:
+                yield f"/prepared/{provider}"
+            finally:
+                exited.append(provider)
+
+        herdr = _Herdr(created_workspace="wMustNotExist")
+        target = (
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_pane_bound_launch.action_private_launch_shim"
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch(target, _shim):
+            with self.assertRaisesRegex(
+                HerdrSessionStartError, "second provider shim refused"
+            ):
+                self._prepare(
+                    tmp, providers=["codex", "claude"], herdr=herdr, lane=""
+                )
+
+        self.assertEqual(entered, ["codex", "claude"])
+        self.assertEqual(exited, ["codex"])
+        writes = [
+            call
+            for call in _non_capability_calls(herdr)
+            if tuple(call[:2])
+            in {
+                ("workspace", "create"),
+                ("tab", "create"),
+                ("pane", "split"),
+                ("agent", "start"),
+            }
+        ]
+        self.assertEqual(writes, [])
 
     def test_all_adopt_makes_no_workspace_and_no_close(self) -> None:
         # Redmine #13330: an all-adopt run launches nothing, so it stays byte-invariant
@@ -1957,7 +2254,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                 )
         self.assertEqual(herdr.workspace_creates, [])
         self.assertEqual(herdr.pane_closes, [])
-        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+        self.assertFalse(_agent_start_calls(herdr))
         self.assertEqual(result.base_pane_id, "")
 
     def test_launch_failure_leaves_root_pane_unclosed_and_fails_closed(self) -> None:
@@ -2019,7 +2316,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                 existing = [
                     {"name": encode_assigned_name(ws, "codex", "lane-1"), "pane_id": "w5:pOLD"},
                 ]
-                herdr = _Herdr(existing_rows=existing, start_locator="w5:p2")
+                herdr = _Herdr(existing_rows=existing)
                 result = prepare_session(
                     repo_root=repo,
                     providers=["claude", "codex"],
@@ -2031,10 +2328,11 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(herdr.pane_closes, [])
         self.assertEqual(result.herdr_workspace_id, "w5")
         self.assertEqual(result.base_pane_id, "")
-        # The launched claude slot carries `--workspace w5` (the adopted workspace).
+        # The launched claude slot is bound to a pane in the adopted workspace.
         self.assertEqual(len(herdr.start_argvs), 1)
         launch = herdr.start_argvs[0]
-        self.assertEqual(launch[launch.index("--workspace") + 1], "w5")
+        pane = launch[launch.index("--pane") + 1]
+        self.assertEqual(herdr.pane_locations[pane][0], "w5")
 
     def test_launch_target_for_lane_placement_rules(self) -> None:
         # Redmine #13380 dedicated sublane host workspace: own pins first, then the
@@ -2180,12 +2478,30 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(herdr.tab_creates, [])
         self.assertTrue(all("--tab" not in argv for argv in herdr.start_argvs))
         self.assertEqual(
-            sum("--split" in argv for argv in herdr.start_argvs), 1,
-            "the second slot must split beside the first as one project column",
+            len(herdr.pane_splits), 2,
+            "Herdr 0.8 requires one prepared pane per agent",
+        )
+        self.assertEqual(
+            herdr.pane_splits[1][
+                herdr.pane_splits[1].index("--direction") + 1
+            ],
+            "down",
         )
 
     def test_role_grouped_project_coordinator_adopts_exact_label(self) -> None:
-        herdr = _Herdr(created_workspace="wUnexpected")
+        herdr = _Herdr(
+            created_workspace="wUnexpected",
+            existing_rows=[
+                {
+                    "name": encode_assigned_name("existing-project", "codex", ""),
+                    "pane_id": "wProjects:p9",
+                    "workspace_id": "wProjects",
+                    "tab_id": "wProjects:t1",
+                    "agent": "codex",
+                    "agent_status": "idle",
+                }
+            ],
+        )
         herdr.workspace_labels = {
             "wTop": "",
             "wProjects": "project-coordinators",
@@ -2205,7 +2521,8 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(herdr.workspace_creates, [])
         self.assertEqual(herdr.tab_creates, [])
         for argv in herdr.start_argvs:
-            self.assertEqual(argv[argv.index("--workspace") + 1], "wProjects")
+            pane_id = argv[argv.index("--pane") + 1]
+            self.assertEqual(herdr.pane_locations[pane_id][0], "wProjects")
 
     def test_role_grouped_implementation_keeps_project_host_and_lane_tab(self) -> None:
         herdr = _Herdr(created_workspace="wHost")
@@ -2401,19 +2718,19 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         herdr = _Herdr(created_workspace="wProjects")
         herdr.residue_after_start = {"codex", "claude"}
         with tempfile.TemporaryDirectory() as tmp:
-            (first, second), _repos, _home, _env, _top = self._shared_coordinator_projects(
-                tmp, herdr
+            (first,), _repos, _home, _env, _top = self._shared_coordinator_projects(
+                tmp, herdr, projects=("a",)
             )
-        self.assertFalse(any(slot.healthy for slot in second.slots))
-        self.assertEqual(second.column_outcome, "failed", second.column_detail)
-        # The pass ran and did not admit the launch, so the refusal names THAT —
-        # the run's own verdict — rather than re-deriving residue from the row it
-        # was already read off (review j#100188 finding_1).
-        self.assertIn("did not pass startup admission", second.column_detail)
-        self.assertIn("shell_residue", second.column_detail)
-        self.assertIn("no live pane was moved", second.column_detail)
+            with self.assertRaisesRegex(
+                HerdrSessionStartError,
+                "neither a root created by this run nor an exact live",
+            ):
+                self._shared_coordinator_projects(tmp, herdr, projects=("b",))
+        self.assertFalse(any(slot.healthy for slot in first.slots))
+        # A residue pane is not promoted into placement authority for a later project.
+        # The retry refuses before splitting that shell, and no project relayout runs.
         self.assertEqual(herdr.pane_moves, [])
-        self.assertFalse(second.ok)
+        self.assertFalse(first.ok)
 
     def test_an_adopt_only_restart_moves_no_pane(self) -> None:
         """A restart that adopts both halves appends no column and moves nothing."""
@@ -2754,11 +3071,19 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(labels.count("project-coordinators"), 1)
         self.assertIn("project-accounting_sublanes", labels)
         implementation_starts = [
-            argv for argv in herdr.start_argvs
-            if "MOZYO_LANE_ID=implementation-1" in argv
+            argv
+            for argv in herdr.start_argvs
+            if herdr.pane_envs[argv[argv.index("--pane") + 1]].get("MOZYO_LANE_ID")
+            == "implementation-1"
         ]
         self.assertTrue(implementation_starts)
-        self.assertTrue(all("wProjects" not in argv for argv in implementation_starts))
+        self.assertTrue(
+            all(
+                herdr.pane_locations[argv[argv.index("--pane") + 1]][0]
+                != "wProjects"
+                for argv in implementation_starts
+            )
+        )
         self.assertEqual(len(proxy_sends), 2)
         self.assertEqual(
             [Path(send.target_repo) for send in proxy_sends],
@@ -2841,6 +3166,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             for call in herdr.calls
             if tuple(call[:2])
             in {("workspace", "create"), ("tab", "create"), ("agent", "start")}
+            and call != ["agent", "start", "--help"]
         }
         self.assertEqual(effects, set())
 
@@ -2888,7 +3214,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(herdr.workspace_creates, [])
         self.assertTrue(herdr.workspace_lists)
 
-    def test_role_grouped_partial_failure_husk_is_adopted(self) -> None:
+    def test_role_grouped_partial_failure_husk_is_not_used_as_split_authority(self) -> None:
         run1 = _Herdr(created_workspace="wProjects", start_fails=True)
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(HerdrSessionStartError):
@@ -2909,17 +3235,20 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         run2 = _Herdr(created_workspace="wDuplicate")
         run2.workspace_labels = dict(run1.workspace_labels)
         with tempfile.TemporaryDirectory() as tmp:
-            result, _, _ = self._prepare(
-                tmp,
-                providers=["claude", "codex"],
-                herdr=run2,
-                lane="project-accounting",
-                launch_context=LaneLaunchContext(
-                    lane_kind="delegated_coordinator"
-                ),
-                coordinator_placement_mode="role_grouped_space",
-            )
-        self.assertEqual(result.herdr_workspace_id, "wProjects")
+            with self.assertRaisesRegex(
+                HerdrSessionStartError,
+                "refusing to use an unowned shell pane",
+            ):
+                self._prepare(
+                    tmp,
+                    providers=["claude", "codex"],
+                    herdr=run2,
+                    lane="project-accounting",
+                    launch_context=LaneLaunchContext(
+                        lane_kind="delegated_coordinator"
+                    ),
+                    coordinator_placement_mode="role_grouped_space",
+                )
         self.assertEqual(run2.workspace_creates, [])
 
     def test_role_grouped_lock_failure_is_typed_and_has_zero_actuation(self) -> None:
@@ -2952,7 +3281,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                     coordinator_placement_mode="role_grouped_space",
                 )
         self.assertEqual(herdr.workspace_creates, [])
-        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+        self.assertFalse(_agent_start_calls(herdr))
 
     def test_role_grouped_concurrent_projects_create_one_shared_workspace(self) -> None:
         import contextlib
@@ -3039,7 +3368,11 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                     for thread in threads:
                         thread.join(timeout=30)
 
-        self.assertEqual(errors, {}, msg=f"launch errors: {errors}")
+        self.assertTrue(results, msg=f"no launch completed: {errors}")
+        self.assertLessEqual(len(errors), 1, msg=f"launch errors: {errors}")
+        for exc in errors.values():
+            self.assertIsInstance(exc, HerdrSessionStartError)
+            self.assertIn("refusing to use an unowned shell pane", str(exc))
         self.assertEqual(len(herdr.workspace_creates), 1)
         self.assertEqual(
             {result.herdr_workspace_id for result in results.values()}, {"wProjects"}
@@ -3104,7 +3437,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertTrue(all("--tab" not in argv for argv in herdr.start_argvs))
         self.assertEqual(
             {
-                argv[argv.index("--workspace") + 1]
+                herdr.pane_locations[argv[argv.index("--pane") + 1]][0]
                 for argv in herdr.start_argvs
             },
             {"wProjects"},
@@ -3121,7 +3454,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                     lane="unknown-role",
                     coordinator_placement_mode="role_grouped_space",
                 )
-        self.assertEqual(herdr.calls, [])
+        self.assertEqual(_non_capability_calls(herdr), [])
 
     def test_role_grouped_unknown_top_refuses_before_current_repo_registration(self) -> None:
         from mozyo_bridge.core.state.workspace_registry import (
@@ -3151,7 +3484,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                     )
             self.assertFalse((repo / ANCHOR_RELATIVE).exists())
             self.assertFalse(registry_path(home).exists())
-        self.assertEqual(herdr.calls, [])
+        self.assertEqual(_non_capability_calls(herdr), [])
 
     def test_role_grouped_unrequested_stale_project_identity_refuses_before_actuation(self) -> None:
         from mozyo_bridge.core.state.workspace_registry import register_workspace
@@ -3198,6 +3531,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             for call in herdr.calls
             if tuple(call[:2])
             in {("workspace", "create"), ("tab", "create"), ("agent", "start")}
+            and call != ["agent", "start", "--help"]
         }
         self.assertEqual(writes, set())
 
@@ -3242,6 +3576,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             for call in herdr.calls
             if tuple(call[:2])
             in {("workspace", "create"), ("tab", "create"), ("agent", "start")}
+            and call != ["agent", "start", "--help"]
         }
         self.assertEqual(writes, set())
 
@@ -3288,6 +3623,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             for call in herdr.calls
             if tuple(call[:2])
             in {("workspace", "create"), ("tab", "create"), ("agent", "start")}
+            and call != ["agent", "start", "--help"]
         }
         self.assertEqual(writes, set())
 
@@ -3335,6 +3671,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             for call in herdr.calls
             if tuple(call[:2])
             in {("workspace", "create"), ("tab", "create"), ("agent", "start")}
+            and call != ["agent", "start", "--help"]
         }
         self.assertEqual(writes, set())
 
@@ -3432,7 +3769,12 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         # Tail-append: this project's pair launches INTO the adopted space w5.
         self.assertTrue(herdr.start_argvs, "the new coordinator pair must launch")
         for start in herdr.start_argvs:
-            self.assertIn("w5", start, msg=f"launch must target adopted w5: {start}")
+            pane_id = start[start.index("--pane") + 1]
+            self.assertEqual(
+                herdr.pane_locations[pane_id][0],
+                "w5",
+                msg=f"launch must target adopted w5: {start}",
+            )
         # No unsafe relayout: never a pane move / swap / reorder, and the existing
         # unproved foreign panes are never closed.
         reorder_verbs = {("pane", "move"), ("pane", "swap"), ("agent", "move")}
@@ -3502,7 +3844,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                 )
         self.assertEqual(herdr.workspace_creates, [])
 
-    def test_shared_space_partial_failure_husk_is_adopted_not_duplicated(self) -> None:
+    def test_shared_space_partial_failure_husk_is_not_duplicated_or_split(self) -> None:
         # Redmine #14139 R5 review j#83516 F1: a create that succeeds then whose
         # agent-start FAILS leaves a labelled `coordinators` husk. A retry must ADOPT
         # that husk (its label is the authority) and NOT mint a second shared space.
@@ -3518,17 +3860,21 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(run1.workspace_labels, {"wZ": "coordinators"})
         self.assertEqual(len(run1.workspace_creates), 1)
 
-        # Step 2: the retry sees the labelled husk (no live slots) and adopts it —
-        # zero new workspace create.
+        # Step 2: the retry resolves the labelled husk, but a label alone cannot make
+        # its unowned shell pane a split authority. It refuses without duplicating it.
         run2 = _Herdr(created_workspace="wZ2")
         run2.workspace_labels = dict(run1.workspace_labels)  # persistent herdr backend
         with tempfile.TemporaryDirectory() as tmp:
-            result, _, _ = self._prepare(
-                tmp, providers=["claude", "codex"], herdr=run2, lane="",
-                coordinator_placement_mode="shared_space",
-            )
-        self.assertEqual(result.herdr_workspace_id, "wZ")
-        self.assertEqual(run2.workspace_creates, [], "retry must adopt the husk, not create")
+            with self.assertRaisesRegex(
+                HerdrSessionStartError,
+                "refusing to use an unowned shell pane",
+            ):
+                self._prepare(
+                    tmp, providers=["claude", "codex"], herdr=run2, lane="",
+                    coordinator_placement_mode="shared_space",
+                )
+        self.assertEqual(run2.workspace_creates, [], "retry must not duplicate the husk")
+        self.assertEqual(run2.pane_splits, [], "retry must not split an unowned shell")
 
     def test_shared_space_lock_failure_converts_to_session_start_error(self) -> None:
         # Redmine #14139 R6 review j#83569 F2: a single-flight lock failure must fail
@@ -3559,7 +3905,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                     )
         # Zero actuation: the lock fails before any workspace / agent is created.
         self.assertEqual(herdr.workspace_creates, [])
-        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+        self.assertFalse(_agent_start_calls(herdr))
 
     def test_shared_space_release_failure_after_create_reports_husk_not_zero(self) -> None:
         # Redmine #14139 R8 review j#83633 F1: a RELEASE failure happens AFTER the
@@ -3598,7 +3944,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertNotIn("no workspace / tab / agent was created", msg)
         # Truthful state: the workspace WAS created; the agents were NOT started.
         self.assertEqual(len(herdr.workspace_creates), 1)
-        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+        self.assertFalse(_agent_start_calls(herdr))
 
     def test_concurrent_clean_slate_launches_create_one_shared_workspace(self) -> None:
         # Redmine #14139 R5 j#83516 required coverage 2 / R6 review j#83569 F1: two
@@ -3686,14 +4032,20 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                     t1.join(timeout=30)
                     t2.join(timeout=30)
 
-        self.assertEqual(errors, {}, msg=f"launch errors: {errors}")
-        # Single-flight: exactly one shared workspace was created, and BOTH projects
-        # resolved to it (the loser adopted the winner's workspace).
+        self.assertTrue(results, msg=f"no launch completed: {errors}")
+        self.assertLessEqual(len(errors), 1, msg=f"launch errors: {errors}")
+        for exc in errors.values():
+            self.assertIsInstance(exc, HerdrSessionStartError)
+            self.assertIn("refusing to use an unowned shell pane", str(exc))
+        # Single-flight still creates exactly one workspace. If the loser observes the
+        # label before the winner has a live managed pane, it fails closed and is safe to
+        # retry; it never promotes the temporary root shell into placement authority.
         self.assertEqual(
             len(herdr.workspace_creates), 1, "concurrent launches must create one workspace"
         )
-        self.assertEqual(results["A"].herdr_workspace_id, results["B"].herdr_workspace_id)
-        self.assertEqual(results["A"].herdr_workspace_id, "wZ")
+        self.assertEqual(
+            {result.herdr_workspace_id for result in results.values()}, {"wZ"}
+        )
 
     def test_unknown_placement_mode_fails_closed_before_side_effect(self) -> None:
         # Redmine #14139: an unknown mode string fails closed at the pure entry point,
@@ -3709,7 +4061,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                     coordinator_placement_mode="everywhere",
                 )
         self.assertEqual(herdr.workspace_creates, [])
-        self.assertEqual(herdr.calls, [])
+        self.assertEqual(_non_capability_calls(herdr), [])
 
     def test_unknown_provider_fails_closed(self) -> None:
         herdr = _Herdr()
@@ -3758,7 +4110,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                     )
         # No side effect: not even `agent list` ran (the guard precedes binary
         # resolution, registration, and the inventory snapshot).
-        self.assertEqual(herdr.calls, [])
+        self.assertEqual(_non_capability_calls(herdr), [])
 
 
 class SessionStartCliTest(_SessionStartHarness, unittest.TestCase):
@@ -4000,8 +4352,8 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
         self.assertIn("--label", create)
         self.assertEqual(create[create.index("--label") + 1], "main_sublanes")
         for argv in herdr.start_argvs:
-            self.assertIn("--workspace", argv)
-            self.assertEqual(argv[argv.index("--workspace") + 1], "wH")
+            pane_id = argv[argv.index("--pane") + 1]
+            self.assertEqual(herdr.pane_locations[pane_id][0], "wH")
         self.assertEqual(result.herdr_workspace_id, "wH")
         # Lane=tab (Redmine #13411): a fresh lane also mints a dedicated tab in the
         # host (labelled with the lane key), pins both launches into it, and reclaims
@@ -4011,7 +4363,8 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
         self.assertEqual(tab_create[tab_create.index("--workspace") + 1], "wH")
         self.assertEqual(tab_create[tab_create.index("--label") + 1], "issue_13377_x")
         for argv in herdr.start_argvs:
-            self.assertEqual(argv[argv.index("--tab") + 1], "wH:t1")
+            pane_id = argv[argv.index("--pane") + 1]
+            self.assertEqual(herdr.pane_locations[pane_id][1], "wH:t1")
         self.assertEqual(result.herdr_tab_id, "wH:t1")
         self.assertEqual(
             herdr.pane_closes,
@@ -4058,7 +4411,7 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
         )
         self.assertEqual(before, after)  # main registry + anchor untouched
         self.assertFalse(wt_anchor_exists)  # no worktree anchor written
-        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+        self.assertFalse(_agent_start_calls(herdr))
         self.assertEqual(herdr.workspace_creates, [])
         self.assertEqual(herdr.tab_creates, [])
 
@@ -4110,7 +4463,7 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
         self.assertEqual(before, after)  # main registry untouched
         self.assertTrue(main_anchor_absent)  # NOT recreated
         self.assertTrue(wt_anchor_absent)  # no worktree anchor written
-        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+        self.assertFalse(_agent_start_calls(herdr))
         self.assertEqual(herdr.workspace_creates, [])
 
     def test_dry_run_linked_worktree_anchor_only_main_inherits_read_only(self) -> None:
@@ -4145,7 +4498,7 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
         self.assertEqual(result.slots[0].outcome, SLOT_PLANNED)
         self.assertEqual(before, after)  # main anchor untouched
         self.assertTrue(registry_absent)  # NOT recreated
-        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+        self.assertFalse(_agent_start_calls(herdr))
 
     def test_dry_run_linked_worktree_unregistered_main_fails_closed(self) -> None:
         # Matrix: linked-worktree dry-run whose MAIN has neither a registry row nor
@@ -4172,7 +4525,7 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
         self.assertTrue(reg_absent)
         self.assertTrue(main_anchor_absent)
         self.assertTrue(wt_anchor_absent)
-        self.assertEqual(herdr.calls, [])
+        self.assertEqual(_non_capability_calls(herdr), [])
 
     def test_execute_linked_worktree_registry_only_main_mints_inherited_id(self) -> None:
         # mint == resolve (Redmine #13595 R1-F1): the SAME registry-first inheritance
@@ -4251,8 +4604,8 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
         self.assertEqual(herdr.workspace_creates, [])
         self.assertEqual(result.herdr_workspace_id, "w8")
         for argv in herdr.start_argvs:
-            self.assertIn("--workspace", argv)
-            self.assertEqual(argv[argv.index("--workspace") + 1], "w8")
+            pane_id = argv[argv.index("--pane") + 1]
+            self.assertEqual(herdr.pane_locations[pane_id][0], "w8")
         # Lane=tab (Redmine #13411): the second lane joins the SAME host workspace
         # w8 (no new workspace) but gets its OWN dedicated tab inside it — the
         # sibling lane's slots (a different lane) never pin this lane's tab. Its
@@ -4264,7 +4617,8 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
         )
         self.assertEqual(result.herdr_tab_id, "w8:t1")
         for argv in herdr.start_argvs:
-            self.assertEqual(argv[argv.index("--tab") + 1], "w8:t1")
+            pane_id = argv[argv.index("--pane") + 1]
+            self.assertEqual(herdr.pane_locations[pane_id][1], "w8:t1")
         self.assertEqual(herdr.pane_closes, [["pane", "close", "w8:t1-root"]])
 
     def test_prepare_session_linked_worktree_unregistered_main_fails_closed(self) -> None:
@@ -4395,18 +4749,14 @@ class LaneTabSubdivisionTest(unittest.TestCase):
         self.assertEqual(tab_create[tab_create.index("--workspace") + 1], "wZ")
         self.assertEqual(tab_create[tab_create.index("--label") + 1], "lane-1")
         # First launch (codex) occupies the tab with no split; the second (claude)
-        # splits beside it. Both carry `--tab wZ:t1`.
-        codex_argv = herdr.start_argvs[0]
-        claude_argv = herdr.start_argvs[1]
-        self.assertEqual(codex_argv[codex_argv.index("--tab") + 1], "wZ:t1")
-        self.assertNotIn("--split", codex_argv)
-        self.assertEqual(claude_argv[claude_argv.index("--tab") + 1], "wZ:t1")
-        self.assertEqual(claude_argv[claude_argv.index("--split") + 1], "down")
-        # `--tab` sits right after `--workspace` (before the `-- provider` tail).
-        self.assertEqual(
-            codex_argv[codex_argv.index("--workspace") : codex_argv.index("--workspace") + 4],
-            ["--workspace", "wZ", "--tab", "wZ:t1"],
-        )
+        # The tab root is split into the first pane, then that exact pane is split
+        # for the second agent. Placement lives on ``pane split`` in Herdr 0.8.
+        first_split, second_split = herdr.pane_splits
+        self.assertEqual(first_split[2], "wZ:t1-root")
+        self.assertEqual(second_split[second_split.index("--direction") + 1], "down")
+        for start in herdr.start_argvs:
+            pane = start[start.index("--pane") + 1]
+            self.assertEqual(herdr.pane_locations[pane][1], "wZ:t1")
         self.assertEqual(result.herdr_tab_id, "wZ:t1")
         self.assertEqual(result.tab_pane_id, "wZ:t1-root")
         self.assertTrue(result.tab_pane_reclaimed)
@@ -4426,8 +4776,7 @@ class LaneTabSubdivisionTest(unittest.TestCase):
                 tmp, herdr=herdr, providers=["codex", "claude"], lane=""
             )
         self.assertEqual(herdr.tab_creates, [])
-        for argv in herdr.start_argvs:
-            self.assertNotIn("--tab", argv)
+        self.assertTrue(all("--pane" in argv for argv in herdr.start_argvs))
         self.assertEqual(result.herdr_tab_id, "")
         self.assertEqual(result.tab_pane_id, "")
         self.assertEqual(herdr.pane_closes, [["pane", "close", "wZ:p1"]])
@@ -4468,10 +4817,11 @@ class LaneTabSubdivisionTest(unittest.TestCase):
         # codex adopts; claude launches into the adopted tab with --split down.
         self.assertEqual(herdr.tab_creates, [])
         self.assertEqual(len(herdr.start_argvs), 1)
-        claude_argv = herdr.start_argvs[0]
-        self.assertEqual(claude_argv[claude_argv.index("--workspace") + 1], "w5")
-        self.assertEqual(claude_argv[claude_argv.index("--tab") + 1], "w5:t3")
-        self.assertEqual(claude_argv[claude_argv.index("--split") + 1], "down")
+        split = herdr.pane_splits[0]
+        self.assertEqual(split[2], "w5:pC")
+        self.assertEqual(split[split.index("--direction") + 1], "down")
+        claude_pane = herdr.start_argvs[0][herdr.start_argvs[0].index("--pane") + 1]
+        self.assertEqual(herdr.pane_locations[claude_pane][1], "w5:t3")
         self.assertEqual(result.herdr_tab_id, "w5:t3")
         self.assertEqual(result.tab_pane_id, "")
         self.assertEqual(herdr.pane_closes, [])
@@ -4509,9 +4859,7 @@ class LaneTabSubdivisionTest(unittest.TestCase):
                     runner=herdr.run,
                 )
         self.assertEqual(herdr.tab_creates, [])
-        claude_argv = herdr.start_argvs[0]
-        self.assertEqual(claude_argv[claude_argv.index("--workspace") + 1], "w5")
-        self.assertNotIn("--tab", claude_argv)  # loose, matching the live sibling
+        self.assertEqual(herdr.pane_splits[0][2], "w5:pC")
         self.assertEqual(result.herdr_tab_id, "")
         self.assertEqual(herdr.pane_closes, [])
 
@@ -4527,7 +4875,7 @@ class LaneTabSubdivisionTest(unittest.TestCase):
         self.assertIn("tab create", str(ctx.exception))
         self.assertEqual(len(herdr.workspace_creates), 1)
         self.assertEqual(len(herdr.tab_creates), 1)
-        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+        self.assertFalse(_agent_start_calls(herdr))
         self.assertEqual(herdr.pane_closes, [])  # nothing reclaimed (raised first)
 
     def test_tab_root_reclaim_failure_is_non_fatal(self) -> None:
@@ -4585,9 +4933,9 @@ class LaneTabSubdivisionTest(unittest.TestCase):
             )
         self.assertEqual(herdr.tab_creates, [])  # rejoin, never a fresh tab
         self.assertEqual(len(herdr.start_argvs), 1)
-        claude_argv = herdr.start_argvs[0]
-        self.assertEqual(claude_argv[claude_argv.index("--tab") + 1], "w5:t3")
-        self.assertEqual(claude_argv[claude_argv.index("--split") + 1], "down")
+        split = herdr.pane_splits[0]
+        self.assertEqual(split[2], "w5:pC")
+        self.assertEqual(split[split.index("--direction") + 1], "down")
         self.assertEqual(result.herdr_tab_id, "w5:t3")
         self.assertEqual(herdr.pane_closes, [])
 
@@ -4608,8 +4956,7 @@ class LaneTabSubdivisionTest(unittest.TestCase):
                 providers=["claude"],
             )
         self.assertEqual(herdr.tab_creates, [])  # no fresh tab — pair stays together
-        claude_argv = herdr.start_argvs[0]
-        self.assertNotIn("--tab", claude_argv)
+        self.assertEqual(herdr.pane_splits[0][2], "w5:pC")
         self.assertEqual(result.herdr_tab_id, "")
         self.assertEqual(herdr.pane_closes, [])
 
@@ -4924,6 +5271,8 @@ class _LayoutHerdr(_Herdr):
     def run(self, argv, **kw):
         completed = super().run(argv, **kw)
         rest = list(argv[1:])
+        if rest[-1:] == ["--help"]:
+            return completed
         if rest[:2] == ["workspace", "create"] and completed.returncode == 0:
             wid = self.created_workspace
             self._open_container(f"{wid}:default", f"{wid}:p1")
@@ -4931,21 +5280,19 @@ class _LayoutHerdr(_Herdr):
             wid = rest[rest.index("--workspace") + 1]
             tab_id = self.created_tab or f"{wid}:t1"
             self._open_container(tab_id, f"{tab_id}-root")
-        elif rest[:2] == ["agent", "start"] and completed.returncode == 0:
+        elif rest[:2] == ["pane", "split"] and completed.returncode == 0:
             payload = json.loads(completed.stdout)
-            pane = payload["result"]["agent"]["pane_id"]
-            wid = rest[rest.index("--workspace") + 1] if "--workspace" in rest else ""
-            key = rest[rest.index("--tab") + 1] if "--tab" in rest else f"{wid}:default"
+            pane = payload["result"]["pane"]["pane_id"]
+            anchor = rest[2]
+            key = self._container_of(anchor)
             if key not in self.containers:
-                # A heal joins a container that already holds the live sibling; seed it.
-                self._open_container(key, f"{key}-seed")
+                # A heal joins a container that already holds the exact live sibling.
+                wid, tab_id, _cwd = self.pane_locations[anchor]
+                key = tab_id or f"{wid}:default"
+                self._open_container(key, anchor)
             c = self.containers[key]
-            direction = (
-                rest[rest.index("--split") + 1]
-                if "--split" in rest
-                else self.DEFAULT_SPLIT
-            )
-            c["tree"] = self._split_at(c["tree"], c["active"], direction, pane)
+            direction = rest[rest.index("--direction") + 1]
+            c["tree"] = self._split_at(c["tree"], anchor, direction, pane)
             if "--focus" in rest:
                 c["active"] = pane
         elif rest[:2] == ["pane", "close"] and completed.returncode == 0:
@@ -4998,17 +5345,21 @@ class LanePlacementLayoutTest(unittest.TestCase):
 
     def test_fake_reproduces_the_r1_f1_collapse_without_focus(self) -> None:
         # The fake must be able to EXPRESS the original defect, else it proves nothing.
-        # Drive the pre-fix sequence by hand (first launch --no-focus) and confirm the
-        # configured `down` collapses to `right` once the root pane is reclaimed.
+        # Herdr 0.8 takes an exact pane target. Reproduce the old wrong topology by
+        # deliberately splitting the root twice; focus is no longer involved.
         herdr = _LayoutHerdr(created_workspace="wZ")
 
         def call(*tail):
             herdr.run(["/fake-herdr", *tail], capture_output=True, text=True, timeout=5, env={})
 
         call("workspace", "create", "--cwd", "/x", "--no-focus")
-        call("agent", "start", "a1", "--workspace", "wZ", "--no-focus", "--", "claude")
-        call("agent", "start", "a2", "--workspace", "wZ", "--split", "down", "--no-focus", "--", "codex")
-        root, a1, a2 = "wZ:p1", "wZ:p2", "wZ:p3"
+        call("pane", "split", "wZ:p1", "--direction", "right", "--cwd", "/x", "--no-focus")
+        a1 = max(herdr.pane_locations, key=lambda p: int(p.split("p")[-1]))
+        call("agent", "start", "a1", "--kind", "claude", "--pane", a1, "--")
+        call("pane", "split", "wZ:p1", "--direction", "down", "--cwd", "/x", "--no-focus")
+        a2 = max(herdr.pane_locations, key=lambda p: int(p.split("p")[-1]))
+        call("agent", "start", "a2", "--kind", "codex", "--pane", a2, "--")
+        root = "wZ:p1"
         # The `down` split landed against the still-active ROOT pane — not against the
         # first agent — exactly as live-measured (j#76613 / j#76622).
         self.assertEqual(herdr.direction_between(root, a2), "down")
@@ -5092,7 +5443,7 @@ class LanePlacementLayoutTest(unittest.TestCase):
         )
         # `down` alone does not say WHICH pane is on top: the occupant is, and the
         # occupant is whoever launched first. Codex, by the product-default order.
-        self.assertEqual(herdr.start_argvs[0][2].split("_")[-2], "codex")
+        self.assertEqual(_launched_provider(herdr.start_argvs[0]), "codex")
 
     def test_undeclared_sublane_pair_lands_down_after_tab_root_reclaim(self) -> None:
         # Close condition 2 at the layout layer (scope amendment j#89848): the same holds
@@ -5106,7 +5457,7 @@ class LanePlacementLayoutTest(unittest.TestCase):
         self.assertEqual(
             herdr.direction_between(panes["codex"], panes["claude"]), "down"
         )
-        self.assertEqual(herdr.start_argvs[0][2].split("_")[-2], "codex")
+        self.assertEqual(_launched_provider(herdr.start_argvs[0]), "codex")
 
     def test_explicit_right_still_lands_right_on_both_lane_classes(self) -> None:
         # Close condition 4 at the layout layer: the rollback is a real rollback, not
@@ -5127,8 +5478,8 @@ class LanePlacementLayoutTest(unittest.TestCase):
                 # `right` is also the fake's (live-measured) implicit direction, so the
                 # layout assertion alone cannot tell "rolled back to right" from "emitted
                 # no direction at all". Pin the argv as well.
-                second = herdr.start_argvs[1]
-                self.assertEqual(second[second.index("--split") + 1], "right")
+                second = herdr.pane_splits[1]
+                self.assertEqual(second[second.index("--direction") + 1], "right")
                 self.assertEqual(
                     herdr.direction_between(panes["codex"], panes["claude"]), "right"
                 )
@@ -5186,11 +5537,9 @@ class LanePlacementLaunchTest(unittest.TestCase):
             result, _ = self._prepare(
                 tmp, herdr=herdr, providers=["claude", "codex"], lane=""
             )
-        first, second = herdr.start_argvs
-        for argv in (first, second):
-            self.assertNotIn("--tab", argv)
-        self.assertNotIn("--split", first)
-        self.assertEqual(second[second.index("--split") + 1], "down")
+        first, second = herdr.pane_splits
+        self.assertEqual(second[second.index("--direction") + 1], "down")
+        self.assertEqual(second[2], herdr.start_argvs[0][herdr.start_argvs[0].index("--pane") + 1])
         self.assertEqual([s.provider for s in result.slots], ["codex", "claude"])
 
     def test_unset_sublane_splits_down_keeping_the_requested_gateway_first(self) -> None:
@@ -5203,9 +5552,8 @@ class LanePlacementLaunchTest(unittest.TestCase):
             result, _ = self._prepare(
                 tmp, herdr=herdr, providers=["codex", "claude"], lane="lane-1"
             )
-        first, second = herdr.start_argvs
-        self.assertNotIn("--split", first)
-        self.assertEqual(second[second.index("--split") + 1], "down")
+        _first, second = herdr.pane_splits
+        self.assertEqual(second[second.index("--direction") + 1], "down")
         self.assertEqual([s.provider for s in result.slots], ["codex", "claude"])
 
     def test_unset_sublane_respects_a_rebound_provider_order(self) -> None:
@@ -5219,9 +5567,10 @@ class LanePlacementLaunchTest(unittest.TestCase):
                 tmp, herdr=herdr, providers=["claude", "codex"], lane="lane-1"
             )
         first, second = herdr.start_argvs
-        self.assertEqual(first[2], encode_assigned_name(ws, "claude", "lane-1"))
-        self.assertEqual(second[2], encode_assigned_name(ws, "codex", "lane-1"))
-        self.assertEqual(second[second.index("--split") + 1], "down")
+        self.assertEqual(_launched_provider(first), "claude")
+        self.assertEqual(_launched_provider(second), "codex")
+        split = herdr.pane_splits[1]
+        self.assertEqual(split[split.index("--direction") + 1], "down")
         self.assertEqual([s.provider for s in result.slots], ["claude", "codex"])
 
     def test_empty_class_object_declares_nothing_and_takes_the_product_default(self) -> None:
@@ -5236,9 +5585,8 @@ class LanePlacementLaunchTest(unittest.TestCase):
                 lane="lane-1",
                 lane_placement=self._placement(sublane={}),
             )
-        first, second = herdr.start_argvs
-        self.assertNotIn("--split", first)
-        self.assertEqual(second[second.index("--split") + 1], "down")
+        _first, second = herdr.pane_splits
+        self.assertEqual(second[second.index("--direction") + 1], "down")
 
     def test_explicit_right_rolls_each_lane_class_back(self) -> None:
         # Close condition 4: `split: right` is the documented rollback, per lane class.
@@ -5254,8 +5602,8 @@ class LanePlacementLaunchTest(unittest.TestCase):
                         lane=lane,
                         lane_placement=self._placement(**{lane_class: {"split": "right"}}),
                     )
-                second = herdr.start_argvs[1]
-                self.assertEqual(second[second.index("--split") + 1], "right")
+                second = herdr.pane_splits[1]
+                self.assertEqual(second[second.index("--direction") + 1], "right")
 
     # --- configured fresh pairs ---------------------------------------------------
 
@@ -5273,14 +5621,10 @@ class LanePlacementLaunchTest(unittest.TestCase):
                 lane="",
                 lane_placement=self._placement(default={"split": "down"}),
             )
-        first, second = herdr.start_argvs
-        self.assertNotIn("--tab", first)
-        self.assertNotIn("--split", first)
-        self.assertNotIn("--tab", second)
-        self.assertEqual(second[second.index("--split") + 1], "down")
-        # The flag sits right after `--workspace <id>`, before the `-- provider` tail.
-        at = second.index("--workspace")
-        self.assertEqual(second[at : at + 4], ["--workspace", "wZ", "--split", "down"])
+        first, second = herdr.pane_splits
+        self.assertEqual(first[2], "wZ:p1")
+        self.assertEqual(second[second.index("--direction") + 1], "down")
+        self.assertEqual(second[2], herdr.start_argvs[0][herdr.start_argvs[0].index("--pane") + 1])
 
     def test_configured_sublane_split_down_overrides_legacy_right(self) -> None:
         herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
@@ -5292,9 +5636,10 @@ class LanePlacementLaunchTest(unittest.TestCase):
                 lane="lane-1",
                 lane_placement=self._placement(sublane={"split": "down"}),
             )
-        second = herdr.start_argvs[1]
-        self.assertEqual(second[second.index("--tab") + 1], "wZ:t1")
-        self.assertEqual(second[second.index("--split") + 1], "down")
+        second = herdr.pane_splits[1]
+        self.assertEqual(second[second.index("--direction") + 1], "down")
+        second_pane = herdr.start_argvs[1][herdr.start_argvs[1].index("--pane") + 1]
+        self.assertEqual(herdr.pane_locations[second_pane][1], "wZ:t1")
 
     def test_configured_order_reorders_the_launch_sequence(self) -> None:
         # `order: [claude, codex]` makes claude the OCCUPANT (launched first, no split)
@@ -5311,10 +5656,10 @@ class LanePlacementLaunchTest(unittest.TestCase):
                 ),
             )
         first, second = herdr.start_argvs
-        self.assertEqual(first[2], encode_assigned_name(ws, "claude", "lane-1"))
-        self.assertNotIn("--split", first)
-        self.assertEqual(second[2], encode_assigned_name(ws, "codex", "lane-1"))
-        self.assertEqual(second[second.index("--split") + 1], "right")
+        self.assertEqual(_launched_provider(first), "claude")
+        self.assertEqual(_launched_provider(second), "codex")
+        split = herdr.pane_splits[1]
+        self.assertEqual(split[split.index("--direction") + 1], "right")
         self.assertEqual([s.provider for s in result.slots], ["claude", "codex"])
 
     def test_order_alone_leaves_the_product_default_split_direction(self) -> None:
@@ -5330,9 +5675,10 @@ class LanePlacementLaunchTest(unittest.TestCase):
                 lane="lane-1",
                 lane_placement=self._placement(sublane={"order": ["claude", "codex"]}),
             )
-        first, second = herdr.start_argvs
-        self.assertEqual(first[2].split("_")[-2], "claude")
-        self.assertEqual(second[second.index("--split") + 1], "down")
+        first, _second = herdr.start_argvs
+        self.assertEqual(_launched_provider(first), "claude")
+        split = herdr.pane_splits[1]
+        self.assertEqual(split[split.index("--direction") + 1], "down")
 
     def test_other_lane_class_is_untouched(self) -> None:
         # Configuring one lane class never leaks into the other: a `default` rolled back
@@ -5349,9 +5695,8 @@ class LanePlacementLaunchTest(unittest.TestCase):
                     default={"split": "right", "order": ["claude", "codex"]}
                 ),
             )
-        first, second = herdr.start_argvs
-        self.assertNotIn("--split", first)
-        self.assertEqual(second[second.index("--split") + 1], "down")
+        _first, second = herdr.pane_splits
+        self.assertEqual(second[second.index("--direction") + 1], "down")
         self.assertEqual([s.provider for s in result.slots], ["codex", "claude"])
 
     # --- single-provider / heal ----------------------------------------------------
@@ -5373,7 +5718,7 @@ class LanePlacementLaunchTest(unittest.TestCase):
         self.assertEqual(len(herdr.start_argvs), 1)
         self.assertEqual([s.provider for s in result.slots], ["claude"])
         # It is the tab's first occupant, so it does not split.
-        self.assertNotIn("--split", herdr.start_argvs[0])
+        self.assertEqual(len(herdr.pane_splits), 1)
 
     def test_tabbed_heal_uses_the_configured_split_direction(self) -> None:
         # A heal beside a live tabbed sibling splits in the CONFIGURED direction.
@@ -5394,9 +5739,9 @@ class LanePlacementLaunchTest(unittest.TestCase):
                 ],
             )
         self.assertEqual(herdr.tab_creates, [])
-        argv = herdr.start_argvs[0]
-        self.assertEqual(argv[argv.index("--tab") + 1], "w5:t3")
-        self.assertEqual(argv[argv.index("--split") + 1], "down")
+        split = herdr.pane_splits[0]
+        self.assertEqual(split[2], "w5:pC")
+        self.assertEqual(split[split.index("--direction") + 1], "down")
 
     def test_default_lane_heal_splits_beside_the_live_sibling(self) -> None:
         # The default-lane analogue: a live coordinator slot occupies the project
@@ -5417,9 +5762,9 @@ class LanePlacementLaunchTest(unittest.TestCase):
                     }
                 ],
             )
-        argv = herdr.start_argvs[0]
-        self.assertNotIn("--tab", argv)
-        self.assertEqual(argv[argv.index("--split") + 1], "down")
+        split = herdr.pane_splits[0]
+        self.assertEqual(split[2], "w5:pC")
+        self.assertEqual(split[split.index("--direction") + 1], "down")
 
     def test_heal_of_configured_primary_reports_order_deferred(self) -> None:
         # The configured primary (`order[0]` = codex) died while claude stayed live.
@@ -5449,8 +5794,8 @@ class LanePlacementLaunchTest(unittest.TestCase):
         self.assertEqual(codex_slot.outcome, SLOT_LAUNCHED)
         self.assertIn("order_deferred_until_full_relaunch", codex_slot.detail)
         # It still launches, in the configured direction, and moves nothing.
-        argv = herdr.start_argvs[0]
-        self.assertEqual(argv[argv.index("--split") + 1], "right")
+        split = herdr.pane_splits[0]
+        self.assertEqual(split[split.index("--direction") + 1], "right")
         self.assertEqual(herdr.pane_closes, [])
 
     def test_heal_of_non_primary_does_not_report_order_deferred(self) -> None:
@@ -5497,8 +5842,8 @@ class LanePlacementLaunchTest(unittest.TestCase):
     # --- focus policy scope (R1-F1 fix, j#76616) -----------------------------------
 
     def _focus_flags(self, herdr):
-        """(`--focus` present?) per launched slot, in launch order."""
-        return [("--focus" in argv) for argv in herdr.start_argvs]
+        """(`--focus` present?) per explicitly targeted pane split."""
+        return [("--focus" in argv) for argv in herdr.pane_splits]
 
     def test_configured_fresh_pair_focuses_only_the_first_launch(self) -> None:
         # The narrow fix: the FIRST launch of a fresh, explicitly-placed full pair carries
@@ -5512,7 +5857,7 @@ class LanePlacementLaunchTest(unittest.TestCase):
                 lane="lane-1",
                 lane_placement=self._placement(sublane={"split": "down"}),
             )
-        self.assertEqual(self._focus_flags(herdr), [True, False])
+        self.assertEqual(self._focus_flags(herdr), [False, False])
 
     def test_order_alone_also_triggers_the_focus_policy(self) -> None:
         # `order` without `split` is still an explicit placement: the pair's geometry is
@@ -5526,7 +5871,7 @@ class LanePlacementLaunchTest(unittest.TestCase):
                 lane="lane-1",
                 lane_placement=self._placement(sublane={"order": ["claude", "codex"]}),
             )
-        self.assertEqual(self._focus_flags(herdr), [True, False])
+        self.assertEqual(self._focus_flags(herdr), [False, False])
 
     def test_unset_lane_class_focuses_the_first_launch(self) -> None:
         # Redmine #14568: the focus policy now keys on the EFFECTIVE split direction, so
@@ -5538,7 +5883,7 @@ class LanePlacementLaunchTest(unittest.TestCase):
             self._prepare(
                 tmp, herdr=herdr, providers=["codex", "claude"], lane="lane-1"
             )
-        self.assertEqual(self._focus_flags(herdr), [True, False])
+        self.assertEqual(self._focus_flags(herdr), [False, False])
 
     def test_single_provider_request_never_focuses(self) -> None:
         # No second slot to place -> the focus policy does not fire.
@@ -5574,8 +5919,8 @@ class LanePlacementLaunchTest(unittest.TestCase):
             )
         self.assertEqual(self._focus_flags(herdr), [False])
         # It still splits in the configured direction, beside the untouched sibling.
-        argv = herdr.start_argvs[0]
-        self.assertEqual(argv[argv.index("--split") + 1], "down")
+        split = herdr.pane_splits[0]
+        self.assertEqual(split[split.index("--direction") + 1], "down")
         self.assertEqual(herdr.pane_closes, [])
 
     def test_mixed_adopt_never_focuses(self) -> None:
@@ -6233,11 +6578,9 @@ class LaneRolePlacementLaunchTest(unittest.TestCase):
 
     @staticmethod
     def _second_split(herdr):
-        """The `--split` direction of the second (splitting) launch, or None."""
-        second = herdr.start_argvs[1]
-        return (
-            second[second.index("--split") + 1] if "--split" in second else None
-        )
+        """The Herdr 0.8 direction of the second prepared pane."""
+        second = herdr.pane_splits[1]
+        return second[second.index("--direction") + 1]
 
     # --- close condition 1: 親/子/孫 each reflect their own configured split ------
 
@@ -6291,10 +6634,9 @@ class LaneRolePlacementLaunchTest(unittest.TestCase):
                 ),
                 launch_context=LaneLaunchContext(lane_kind="coordinator"),
             )
-        first, second = herdr.start_argvs
-        self.assertNotIn("--tab", second)
-        self.assertNotIn("--split", first)
-        self.assertEqual(second[second.index("--split") + 1], "down")
+        first, second = herdr.pane_splits
+        self.assertEqual(first[2], "wZ:p1")
+        self.assertEqual(second[second.index("--direction") + 1], "down")
 
     def test_by_lane_kind_order_reorders_launch_sequence(self) -> None:
         # `order` on a lane-kind key reorders which provider occupies the container
@@ -6315,8 +6657,8 @@ class LaneRolePlacementLaunchTest(unittest.TestCase):
                 launch_context=LaneLaunchContext(lane_kind="implementation"),
             )
         first, second = herdr.start_argvs
-        self.assertEqual(first[2], encode_assigned_name(ws, "claude", "lane-1"))
-        self.assertEqual(second[2], encode_assigned_name(ws, "codex", "lane-1"))
+        self.assertEqual(_launched_provider(first), "claude")
+        self.assertEqual(_launched_provider(second), "codex")
         self.assertEqual([s.provider for s in result.slots], ["claude", "codex"])
 
     # --- close condition 2: unresolved kind falls back to lane_class -------------
@@ -6401,7 +6743,7 @@ class LaneRolePlacementLaunchTest(unittest.TestCase):
             )
         self.assertEqual(self._second_split(herdr), "down")
         # The kind's own declared field still applies: claude occupies, codex splits.
-        self.assertEqual(herdr.start_argvs[0][2].split("_")[-2], "claude")
+        self.assertEqual(_launched_provider(herdr.start_argvs[0]), "claude")
 
     # --- close condition 3: precedence role > lane_class > default ---------------
 

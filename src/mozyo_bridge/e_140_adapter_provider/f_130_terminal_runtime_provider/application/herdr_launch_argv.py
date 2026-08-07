@@ -1,14 +1,9 @@
-"""herdr managed-launch argv assembly — the cohesive sibling of session-start.
+"""Herdr 0.8 managed-launch command and pane-environment assembly.
 
-The `agent start` argv a managed launch runs is a cohesive block with several
-overlays (self-identity `--env`, the trusted `MOZYO_HERDR_BINARY` injection, the
-managed Claude `--permission-mode`, config-driven launch tokens, the Codex
-tool-shell `-c` overrides, the lane `--tab` / `--split` placement, and the #13637
-startup self-attestation wrapper). Homing it here — instead of inlining it in
-:mod:`...herdr_session_start` — keeps the session-start composition root focused on
-classification / placement / reclaim (the scheduled module-health reduction, see
-``module_health.yaml``), and gives the argv assembly a single pure, directly-testable
-function.
+Herdr 0.8 separates placement from process launch. ``build_pane_launch_env`` renders
+the identity, trusted binary, PATH shim and wrapper state injected by ``pane split``;
+``build_agent_start_argv`` then starts the canonical provider kind in that exact pane.
+Keeping both renderers here gives session-start one directly testable launch contract.
 
 Pure: :func:`build_agent_start_argv` is a total string-list transform (no I/O), and
 :func:`resolve_attest_launcher` reads only the passed ``env`` mapping.
@@ -23,8 +18,9 @@ resolution used to leave behind.
 
 Redmine #14017: the provider command always keeps that realpath as its exec target, but
 a wrapped launch of a provider whose trusted alias differs from the realpath (a
-symlinked ``claude``) also carries the alias on a ``MOZYO_PROVIDER_ARGV0`` ``--env``
-flag, and the wrapper (:mod:`herdr_agent_attest`) execs the realpath while handing the
+symlinked ``claude``) also carries the alias in the pane's
+``MOZYO_PROVIDER_ARGV0`` environment, and the wrapper (:mod:`herdr_agent_attest`)
+execs the realpath while handing the
 process ``argv[0]=<alias>`` — the exec target stays the realpath, only the invocation
 identity is the alias.
 """
@@ -63,28 +59,33 @@ MOZYO_BRIDGE_LAUNCHER_ENV = "MOZYO_BRIDGE_LAUNCHER"
 #: The launch-env key carrying the provider's trusted ``argv[0]`` alias to the #13637
 #: self-attestation wrapper (Redmine #14017). The provider command after ``--`` keeps
 #: the verified realpath as its first token (the exec target the wrapper runs); this
-#: var, injected via herdr ``--env`` and read from the wrapper's ``os.environ``, tells
+#: var, injected by ``pane split --env`` and read from the wrapper's ``os.environ``, tells
 #: the wrapper to hand the process ``argv[0]=<alias>`` instead — decoupling the exec
 #: target (realpath, the trust boundary) from the invocation identity (the trusted
 #: symlink alias Claude requires to stay resident). Emitted ONLY when wrapping AND the
 #: alias actually differs from the realpath, so an unsymlinked provider stays
 #: byte-invariant. A launcher predating this contract simply does not read the var and
 #: execs the realpath on both — the honest unwrapped-equivalent fallback that never
-#: weakens the exec-target trust boundary (a herdr ``--env`` key an older wrapper does
+#: weakens the exec-target trust boundary (a pane environment key an older wrapper does
 #: not know is inherited, not an argparse error, so no launch dies of version skew).
 MOZYO_PROVIDER_ARGV0_ENV = "MOZYO_PROVIDER_ARGV0"
 
 #: The launch-env key carrying the reserved startup-transaction ``action_id`` to the
 #: #13637 wrapper (Redmine #14231, Design Consultation Answer j#84724). Unlike
 #: ``--replacement-action-id`` (a CLI flag emitted only on the rare replacement-recovery
-#: path), this value is non-empty on EVERY managed launch, so it rides an ``--env`` key —
+#: path), this value is non-empty on EVERY managed launch, so it rides a pane env key —
 #: exactly the :data:`MOZYO_PROVIDER_ARGV0_ENV` precedent (docstring above): a herdr
-#: ``--env`` key an older wrapper does not read is silently inherited, not an argparse
+#: environment key an older wrapper does not read is silently inherited, not an argparse
 #: error, so a version-skewed wrapper (a different install resolved for `attest_launcher`)
 #: degrades to "no execution-event evidence" rather than a hard launch failure. Always
 #: injected (never conditional on non-empty) because, unlike the replacement id, this one
 #: always has a value once ``reserve()`` has run.
 MOZYO_STARTUP_ACTION_ID_ENV = "MOZYO_STARTUP_ACTION_ID"
+
+#: Herdr 0.8's short process-local name.  The long ``mzb1`` identity remains the
+#: routing and attestation authority; the wrapper uses this value only to find its
+#: own raw ``agent list`` row before recording the long logical identity.
+MOZYO_HERDR_NATIVE_NAME_ENV = "MOZYO_HERDR_NATIVE_NAME"
 
 #: The wrapper subcommand every managed launch execs the provider THROUGH (Redmine
 #: #13637): ``<launcher> herdr agent-attest ...``. Named once so the wrapper argv
@@ -231,7 +232,7 @@ def _provider_command(
     the exec-time ``PATH`` decide which binary runs. It is the one token exempted from
     byte-invariance; every remaining token, and the render order, are unchanged. Redmine
     #14017 keeps the realpath here (it is what the wrapper actually ``exec``s) and carries
-    any distinct trusted alias out-of-band on a ``--env`` flag, so this builder holds no
+    any distinct trusted alias out-of-band in the pane environment, so this builder holds no
     provider branch and the exec target is never the alias.
 
     Reproducible permission mode for managed agents (Redmine #11925 / #13360): without the
@@ -256,91 +257,32 @@ def _provider_command(
 def build_agent_start_argv(
     *,
     assigned_name: str,
+    native_name: str,
+    pane_locator: str,
     provider: str,
-    repo_root: Path,
     workspace_id: str,
     lane: str,
-    target_workspace: str,
-    target_tab: str,
-    split: str,
-    focus: bool,
-    binary: str,
     attest_launcher: str,
-    store_home: str,
     resolved: ResolvedProviderLaunch,
     launch_argv_extra: Sequence[str],
     replacement_action_id: str = "",
     action_id: str = "",
     lane_epoch: str = "",
 ) -> list[str]:
-    """Assemble the full ``herdr agent start`` argv for one launched slot (pure).
+    """Assemble the Herdr 0.8 pane-bound ``agent start`` argv (pure).
 
-    The durable ``assigned_name`` is applied at start (positional), so no separate
-    ``agent rename``. ``--workspace`` pins placement (Redmine #13330) so herdr never
-    auto-creates a second workspace; the self-identity triplet + the trusted
-    ``MOZYO_HERDR_BINARY`` ride on ``--env`` flags (the server-spawned agent does not
-    inherit the client env). ``--no-focus`` keeps the operator's focus.
+    ``native_name`` is the collision-checked 32-character Herdr identity; the longer
+    ``assigned_name`` stays inside the self-attestation wrapper as mozyo's routing
+    authority. Placement and environment injection are deliberately absent here: the
+    caller has already created one exact pane with ``pane split`` and passes that locator
+    through ``--pane``.
 
-    Startup self-attestation wrap (Redmine #13637, Design Answer j#76462): when
-    ``attest_launcher`` resolves, the provider is run THROUGH ``mozyo-bridge herdr
-    agent-attest`` so the agent's own process records a generation-bound
-    self-attestation of its injected identity env before ``exec``ing the provider.
-    When it does not resolve the run command is the bare provider (byte-invariant
-    pre-#13637 launch) — a launch is never risked on a dead pane; the absent record
-    then makes the adopt / doctor read side fail closed.
-
-    ``store_home`` is the launcher's resolved mozyo-bridge home; it rides on
-    ``--env MOZYO_BRIDGE_HOME=<home>`` (review j#76492 Finding 1). The wrapper writes
-    the self-attestation to whatever home IT resolves, and a herdr-spawned process
-    does NOT inherit the launching client's ``MOZYO_BRIDGE_HOME`` — so without this
-    the wrapper would write to a different store than the launcher / adopt / doctor
-    read, and a fresh launch's record would read as permanently ``absent``. Injecting
-    the launcher's home pins writer and reader to one store. It is always injected
-    (harmless when it equals the wrapper's default home).
-
-    Provider argv[0] alias (Redmine #14017): a wrapped launch of a provider whose trusted
-    absolute alias differs from its exec-target realpath additionally injects ``--env
-    MOZYO_PROVIDER_ARGV0=<alias>``; the wrapper reads it and execs the realpath while
-    handing the process ``argv[0]=<alias>``. It rides ``--env`` (not the provider command)
-    so the exec target stays the realpath and an older wrapper that does not read it simply
-    execs the realpath on both. Emitted only when wrapping AND the alias differs, so an
-    unwrapped or unsymlinked launch is byte-invariant.
-
-    Lane=tab placement (Redmine #13411) + config-driven split (Redmine #13646): a
-    non-default lane's ``--tab`` is inserted right after ``--workspace``, and ``--split
-    <dir>`` is appended for a slot that splits beside an occupant. ``split`` is the
-    resolved direction the caller already decided (``""`` = emit no ``--split``): the
-    session-start composition root resolves it from the lane class + ``lane_placement``
-    config, so this pure builder never reads config and only renders the placement flags.
-    Since Redmine #14568 the caller resolves a direction for EVERY lane class, declared or
-    not — the product default is ``split="down"`` on both — so a splitting slot normally
-    arrives with a direction and ``split=""`` is reached only by a caller that resolved no
-    placement policy at all. (Pre-#14568 an undeclared ``sublane`` arrived as ``"right"``
-    and an undeclared ``default`` as ``""``; both rendered horizontally on real herdr.) The
-    ``default`` lane still passes no ``target_tab``, because the TAB axis is unchanged.
-    ``--split`` is rendered independently of ``--tab`` (herdr 0.7.1 accepts them as
-    independent optional flags, live ``--help`` j#76559), which is what lets the tab-less
-    default pair split.
-
-    ``focus`` selects ``--focus`` over the default ``--no-focus`` (Redmine #13646 review
-    R1-F1 j#76613, Design Answer R1 j#76616). **herdr splits the container's ACTIVE pane —
-    ``agent start`` has no pane-target flag** — so with every launch ``--no-focus`` the
-    container's empty root pane stays active and the second slot's ``--split <dir>`` splits
-    *the root*, not the first agent. Reclaiming that root (after all launches, #13330) then
-    collapses the nested split away and leaves only the outer default ``right`` split the
-    first agent implicitly created — i.e. the intended direction silently never applied
-    (live-measured on both the tab-less default pair and the lane tab). Focusing the FIRST
-    launch pins the container's split target to that agent, so the second slot splits the
-    agent and the direction survives the reclaim (live-measured ``direction: down``). The
-    caller fires this narrowly — fresh container, a full pair, and a non-empty effective
-    split direction — so a single-provider / heal / mixed-adopt launch keeps ``--no-focus``
-    and a live pane is never focused / moved / swapped.
-
-    Redmine #14568 widened the third condition from "the operator declared a placement" to
-    "there is an effective direction". An UNDECLARED lane class now does get ``--focus`` on
-    its first launch, and must: with a product default of ``down`` it is precisely the case
-    that would otherwise render ``--split down`` and still collapse to ``right`` on the
-    reclaim — the defect this flag exists to prevent.
+    When ``attest_launcher`` is present, the pane's canonical provider name resolves to
+    that launcher through an action-private PATH shim. Consequently the tokens after
+    Herdr's ``--`` begin at ``herdr agent-attest`` and the wrapper eventually execs the
+    verified provider command. Without the wrapper, the shim resolves directly to the
+    verified provider executable and only its arguments follow ``--``. This function
+    performs no filesystem or provider lookup.
     """
     provider_cmd = _provider_command(
         workspace_id=workspace_id,
@@ -378,74 +320,61 @@ def build_agent_start_argv(
         run_cmd += ["--", *provider_cmd]
     else:
         run_cmd = provider_cmd
-    env_flags = [
-        "--env",
-        f"{MOZYO_WORKSPACE_ID_ENV}={workspace_id}",
-        "--env",
-        f"{MOZYO_AGENT_ROLE_ENV}={provider}",
-        "--env",
-        f"{MOZYO_LANE_ID_ENV}={lane}",
-        "--env",
-        f"{HERDR_BINARY_ENV}={binary}",
-    ]
-    # MOZYO_BRIDGE_HOME rides along ONLY when wrapping (review j#76492 Finding 1): the
-    # wrapper writes its self-attestation to the home it resolves, so it must resolve
-    # the launcher's home — but a herdr-spawned process does not inherit the client's
-    # MOZYO_BRIDGE_HOME. The unwrapped fallback writes no record, so it stays
-    # byte-for-byte the pre-#13637 env set (no extra --env).
-    if attest_launcher:
-        env_flags += ["--env", f"MOZYO_BRIDGE_HOME={store_home}"]
-    # Reserved startup-transaction action_id (Redmine #14231, Design Answer j#84724):
-    # rides along ONLY when wrapping, same reasoning as MOZYO_BRIDGE_HOME above — only the
-    # wrapper reads it (to append typed execution-stage events), so an unwrapped launch
-    # stays byte-for-byte the pre-#14231 env set. Emitted whenever wrapping AND a caller
-    # supplied one (empty on a caller that has no transaction, e.g. some test harnesses);
-    # never gates or fails the launch either way.
-    if attest_launcher and (action_id or "").strip():
-        env_flags += ["--env", f"{MOZYO_STARTUP_ACTION_ID_ENV}={action_id.strip()}"]
-    # Lane epoch (Redmine #14756): the one value that makes a resume's generation proof
-    # clock- and locator-independent. It must reach the process as an ENV var, not merely as
-    # a wrapper flag, because the proof rests on a property only the environment has — a live
-    # process's env is immutable to every other process (POSIX), so a pane that SURVIVED
-    # hibernate's release cannot be handed the post-hibernate epoch without being relaunched.
-    # A wrapper argument would prove only what the launcher intended. Rides along ONLY when
-    # wrapping (the unwrapped fallback writes no attestation at all, so an injected epoch
-    # would be unobservable) AND when the lane has a minted epoch, keeping every other launch
-    # byte-for-byte the pre-#14756 env set.
-    if attest_launcher and (lane_epoch or "").strip():
-        env_flags += ["--env", f"{MOZYO_LANE_EPOCH_ENV}={lane_epoch.strip()}"]
-    # Provider argv[0] alias (Redmine #14017): the provider command keeps the verified
-    # realpath as its exec target (argv[0] token after `--`), but a symlinked provider
-    # whose stable trusted alias differs from that realpath is handed argv[0]=<alias> by
-    # the wrapper. Rides an `--env` flag so it survives herdr's non-inheriting spawn and
-    # is read from the wrapper's own os.environ. Emitted ONLY when wrapping AND the alias
-    # differs, so an unwrapped launch or an unsymlinked provider stays byte-invariant and
-    # the exec target is never the alias.
-    argv0_alias = resolved.argv0 or resolved.executable
-    if attest_launcher and argv0_alias != resolved.executable:
-        env_flags += ["--env", f"{MOZYO_PROVIDER_ARGV0_ENV}={argv0_alias}"]
-    launch_argv = [
+    # Herdr 0.8 launches the canonical executable selected by ``--kind``.  When the
+    # pane PATH points that canonical name at our attestation launcher, the executable
+    # token itself must not be repeated: the args begin at the mozyo subcommand.  The
+    # unwrapped shim points at the verified provider executable, so its args likewise
+    # exclude argv[0].
+    agent_args = run_cmd[1:] if attest_launcher else provider_cmd[1:]
+    return [
         "agent",
         "start",
-        assigned_name,
-        "--cwd",
-        str(repo_root),
-        "--workspace",
-        target_workspace,
-        *env_flags,
-        "--focus" if focus else "--no-focus",
+        native_name,
+        "--kind",
+        provider,
+        "--pane",
+        pane_locator,
         "--",
-        *run_cmd,
+        *agent_args,
     ]
-    placement_flags: list[str] = []
-    if target_tab:
-        placement_flags += ["--tab", target_tab]
-    if split:
-        placement_flags += ["--split", split]
-    if placement_flags:
-        insert_at = launch_argv.index("--workspace") + 2
-        launch_argv[insert_at:insert_at] = placement_flags
-    return launch_argv
+
+
+def build_pane_launch_env(
+    *,
+    provider: str,
+    native_name: str,
+    workspace_id: str,
+    lane: str,
+    binary: str,
+    shim_dir: str,
+    source_path: str,
+    attest_launcher: str,
+    store_home: str,
+    resolved: ResolvedProviderLaunch,
+    action_id: str = "",
+    lane_epoch: str = "",
+) -> list[str]:
+    """Return ``KEY=VALUE`` entries injected when the 0.8 pane is created."""
+    if not source_path:
+        raise ValueError("managed Herdr pane launch requires a non-empty trusted PATH")
+    entries = [
+        f"{MOZYO_WORKSPACE_ID_ENV}={workspace_id}",
+        f"{MOZYO_AGENT_ROLE_ENV}={provider}",
+        f"{MOZYO_LANE_ID_ENV}={lane}",
+        f"{HERDR_BINARY_ENV}={binary}",
+        f"PATH={shim_dir}{os.pathsep}{source_path}",
+    ]
+    if attest_launcher:
+        entries.append(f"{MOZYO_HERDR_NATIVE_NAME_ENV}={native_name}")
+        entries.append(f"MOZYO_BRIDGE_HOME={store_home}")
+    if attest_launcher and (action_id or "").strip():
+        entries.append(f"{MOZYO_STARTUP_ACTION_ID_ENV}={action_id.strip()}")
+    if attest_launcher and (lane_epoch or "").strip():
+        entries.append(f"{MOZYO_LANE_EPOCH_ENV}={lane_epoch.strip()}")
+    argv0_alias = resolved.argv0 or resolved.executable
+    if attest_launcher and argv0_alias != resolved.executable:
+        entries.append(f"{MOZYO_PROVIDER_ARGV0_ENV}={argv0_alias}")
+    return entries
 
 
 __all__ = (
@@ -453,8 +382,10 @@ __all__ = (
     "ATTEST_WRAPPER_SUBCOMMAND",
     "MOZYO_BRIDGE_LAUNCHER_ENV",
     "MOZYO_LANE_EPOCH_ENV",
+    "MOZYO_HERDR_NATIVE_NAME_ENV",
     "MOZYO_PROVIDER_ARGV0_ENV",
     "build_agent_start_argv",
+    "build_pane_launch_env",
     "CONFIG_PARSE_REJECTED_EXIT",
     "CONFIG_PARSE_SUBCOMMAND",
     "build_attest_capability_probe_argv",

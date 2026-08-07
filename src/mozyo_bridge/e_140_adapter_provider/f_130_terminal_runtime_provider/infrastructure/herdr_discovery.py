@@ -3,7 +3,7 @@
 The provider half of the herdr-native target-resolution boundary
 (:mod:`...domain.herdr_target_resolution`): the concrete implementation of
 :class:`~...domain.herdr_target_resolution.HerdrAgentDiscoveryPort`. It runs herdr
-``agent list`` and returns its raw rows (each carrying the durable ``name`` and the
+``agent list`` and returns logicalized rows (each carrying the durable ``name`` and the
 transient ``pane_id`` locator) so core can decode + match them.
 
 It reuses the existing herdr plumbing rather than duplicating it: the shared
@@ -71,7 +71,7 @@ class HerdrCliAgentLister:
         self._timeout = timeout
 
     def list_agent_rows(self) -> Sequence[Mapping[str, object]]:
-        """Run herdr ``agent list`` and return its raw rows (fail closed)."""
+        """Return logicalized rows; retain Herdr's raw name as ``native_name``."""
         argv = [self._binary, "agent", "list"]
         try:
             completed = self._runner(
@@ -104,7 +104,18 @@ class HerdrCliAgentLister:
                 "object",
                 reason=REASON_INVALID_PAYLOAD,
             )
-        return rows
+        from mozyo_bridge.core.state.herdr_native_identity_binding import (
+            HerdrNativeIdentityBindingError,
+            logicalize_agent_rows,
+        )
+
+        try:
+            return logicalize_agent_rows(rows)
+        except HerdrNativeIdentityBindingError as exc:
+            raise TerminalTransportError(
+                "herdr agent inventory contains an unresolved managed native name",
+                reason=REASON_INVALID_PAYLOAD,
+            ) from exc
 
 
 def resolve_agent_lister(

@@ -167,9 +167,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     StartupProbe,
     attach_startup_health,
 )
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
-    launch_receipt,
-)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_generation_binding import (  # noqa: E501
     finalize_session_launch_generations,
     open_startup_transaction_and_reserve_generations,
@@ -192,9 +189,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
     valid_target,
 )
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_state import (
-    _extract_list_rows,
-)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (
     COMMAND_TIMEOUT_SECONDS,
     Runner,
@@ -207,8 +201,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_preflight import (  # noqa: E501
     preflight_managed_launch,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_cli_capabilities import (  # noqa: E501
+    require_herdr_cli_capabilities,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
-    build_agent_start_argv,
     resolve_attest_launcher,
 )
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_launch_composition import (
@@ -235,6 +231,13 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _list_rows,
     _list_workspace_labels,
     HerdrLauncherIncompatibleError,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_bound_launch import (  # noqa: E501
+    ActionPrivateLaunchShimSet,
+    bind_native_launch_set,
+    prepare_complete_launch_shims,
+    prepared_pane_recorder,
+    resolve_required_split_anchor,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (
     HerdrSessionStartError,
@@ -370,19 +373,45 @@ def prepare_session(
         require_registered_top_workspace(
             coordinator_top_workspace_id, home=mozyo_bridge_home()
         )
-    if dry_run:
-        return _prepare_session_locked(**call)
+    # #15101: the capability check precedes even acquisition of the home-scoped
+    # attestation lock, whose first use may create its lock file.  Therefore an old or
+    # ambiguous Herdr CLI leaves neither Herdr state nor new mozyo runtime state behind.
+    for provider in providers:
+        if provider not in AGENT_PROVIDERS:
+            raise HerdrSessionStartError(
+                f"unknown provider {provider!r}; expected one of "
+                f"{sorted(AGENT_PROVIDERS)}"
+            )
+    binary = _resolve_binary_or_die(env)
+    capability_runner = runner or subprocess.run
+    require_herdr_cli_capabilities(
+        binary,
+        runner=capability_runner,
+        timeout=timeout,
+        env=env,
+        error_type=HerdrSessionStartError,
+    )
+    launch_shims = ActionPrivateLaunchShimSet()
+    call["_launch_shims"] = launch_shims
+    call["_capabilities_observed"] = True
     try:
-        with attestation_store_lock(mozyo_bridge_home(), exclusive=False, blocking=False):
+        if dry_run:
             return _prepare_session_locked(**call)
-    except AttestationStoreLockBusy as exc:
-        raise HerdrLauncherIncompatibleError(
-            f"managed-launch admission refused: the selected attestation store is being "
-            f"maintained right now ({exc}), so this launch would attest into a store that "
-            f"is being rebuilt underneath it. No workspace / tab / agent was created. "
-            f"Re-run once the maintenance command finishes.",
-            reason=STORE_MAINTENANCE_IN_PROGRESS,
-    ) from exc
+        try:
+            with attestation_store_lock(
+                mozyo_bridge_home(), exclusive=False, blocking=False
+            ):
+                return _prepare_session_locked(**call)
+        except AttestationStoreLockBusy as exc:
+            raise HerdrLauncherIncompatibleError(
+                f"managed-launch admission refused: the selected attestation store is "
+                f"being maintained right now ({exc}), so this launch would attest into "
+                f"a store that is being rebuilt underneath it. No workspace / tab / "
+                f"agent was created. Re-run once the maintenance command finishes.",
+                reason=STORE_MAINTENANCE_IN_PROGRESS,
+            ) from exc
+    finally:
+        launch_shims.close()
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_lifecycle_admission import admit_launch_against_lifecycle  # noqa: E501
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_preflight import validate_coordinator_placement_request, validate_pair_order, validate_session_request  # noqa: E501
 
@@ -409,57 +438,13 @@ def _prepare_session_locked(
     startup_fence: "Optional[StartupTransactionFence]" = None,
     action_nonce: str = "",
     launch_cause: str = LAUNCH_CAUSE_GENERIC_FRESH,
+    _launch_shims: "Optional[ActionPrivateLaunchShimSet]" = None,
+    _capabilities_observed: bool = False,
 ) -> SessionStartResult:
-    """Mint (or adopt) durable herdr identities for ``providers`` (fail-closed).
+    """Mint or adopt the requested durable Herdr identities, fail-closed.
 
-    Pure orchestration over the injected ``runner`` + ``env`` (no ambient I/O beyond
-    ``register_workspace`` / ``read_anchor``). Raises :class:`HerdrSessionStartError`
-    on any fail-closed condition (unknown provider, unconfigured binary, duplicate
-    assigned name, a launch that yields no usable locator).
-
-    ``dry_run`` is side-effect free by contract (Redmine #13595): it resolves the
-    workspace identity read-only (:func:`_resolve_workspace_id_readonly` — never
-    ``register_workspace``), classifies each slot as ``planned`` (or adopts /
-    surfaces a live / stale slot read-only), and issues no ``herdr`` workspace /
-    tab / agent write. A workspace with no durable identity yet fails closed with
-    actionable guidance rather than being silently registered.
-
-    ``agent_launch`` (Redmine #13425) is the repo-local launch-argv override the launch
-    site resolved from ``.mozyo-bridge/config.yaml``. When provided, each launched slot's
-    ``-- {provider}`` argv is extended with
-    ``agent_launch.resolve_launch_argv(provider, lane_class)`` — the config's per-agent x
-    lane-class tokens (model, reasoning-effort flag, …) appended verbatim (mozyo hardcodes
-    no provider flag spec). ``lane_class`` is derived from the resolved lane: ``default``
-    for the coordinator pair (no-lane session), ``sublane`` for a lane worker / gateway.
-    ``None`` (the default) appends nothing — byte-for-byte the pre-#13425 launch, so the
-    ``sublane_claude_model`` regression fix is opt-in on the launch site passing a config.
-
-    ``lane_placement`` (Redmine #13646, Design Answer j#76564) is the repo-local herdr
-    pane-pair placement policy the launch site resolved from ``.mozyo-bridge/config.yaml``.
-    It reorders the requested ``providers`` (the resolved primary launches first and
-    occupies; the rest split beside it) and supplies each splitting launch's ``--split
-    <dir>`` — including the tab-less ``default`` pair, which before #13646 was left to the
-    herdr server default. ``order`` never adds an unrequested peer; a configured primary that can only
-    split beside a live sibling is reported ``order_deferred_until_full_relaunch`` rather
-    than silently claimed (no swap / bounce — Non-goal: no live relayout). ``None`` — and
-    an undeclared lane class — resolve to the PRODUCT default (Redmine #14568): both pairs
-    split ``down``, and the coordinator pair launches ``(codex, claude)`` so the coordinator
-    takes the upper pane. A workspace rolls a class back with ``split: right``.
-
-    ``coordinator_placement_mode`` is the operator-home placement policy (#14139,
-    #14996): per-project, all coordinators shared, or top dedicated with project
-    coordinators shared. ``coordinator_top_workspace_id`` names that stable top;
-    the policy acts only at launch/adopt and never moves live panes.
-
-    ``claude_permission_mode_default`` is the launch-context policy default for the
-    managed Claude permission mode (Redmine #11925 / #13360 / #13397): sublane lane
-    creation passes ``auto`` so lane workers are reproducibly auto (tmux parity), and
-    the bare ``mozyo`` coordinator-pair launch (``herdr_launch_command``) also passes
-    ``auto`` so the coordinator Claude has the same headless-capable posture as its lane
-    workers (Redmine #13397 finding 3 — the pre-#13397 flagless coordinator booted
-    prompt-gated in an external project). A caller that passes ``None`` still gets the
-    historical flagless bare ``claude`` launch. The ``MOZYO_CLAUDE_PERMISSION_MODE``
-    env override rail wins over the default either way (resolved from ``env``).
+    The cataloged native-identity spec owns the full contract. This private entry
+    point validates the plan before writes; the public caller owns lock and rollback.
     """
     for provider in providers:
         if provider not in AGENT_PROVIDERS:
@@ -481,6 +466,16 @@ def _prepare_session_locked(
         pair_order=pair_order,
     )
     binary = _resolve_binary_or_die(env)
+    runner = runner or subprocess.run
+    # Probe both Herdr 0.8 write surfaces before registration or any Herdr write.
+    if not _capabilities_observed:
+        require_herdr_cli_capabilities(
+            binary,
+            runner=runner,
+            timeout=timeout,
+            env=env,
+            error_type=HerdrSessionStartError,
+        )
     # The mozyo-bridge launcher the #13637 self-check wraps the provider through
     # (resolved once, shared by every launched slot; "" disables wrapping).
     attest_launcher = resolve_attest_launcher(env)
@@ -490,15 +485,8 @@ def _prepare_session_locked(
     # (review j#76492 Finding 1). Resolved via `mozyo_bridge_home()` to match the reader.
     store_home = str(mozyo_bridge_home())
 
-    # Redmine #13377 (design j#73613, Opt3 — shared project workspace): the mzb1
-    # `workspace` segment. A linked git worktree (a sublane lane checkout) inherits the
-    # main checkout's registry identity (#13152), and its slots are launched INTO the
-    # project workspace as `mzb1_<project-ws>_<role>_<lane>` — the lane segment, not a
-    # per-lane workspace, is the discriminant (supersedes the #13331 j#73357 `wt_<hash>`
-    # per-lane workspace; that token survives only as the legacy/compat + metadata key).
-    # A standalone / main checkout is registered and named by its registry workspace_id
-    # (byte-for-byte the prior path, incl. the fail-closed-on-empty guard). Both use the
-    # single shared resolver so mint here and resolve at send/retire/projection agree.
+    # Linked worktrees inherit the main checkout's workspace identity; the lane segment
+    # remains the slot discriminant. The shared resolver keeps every consumer aligned.
     resolved_root = Path(repo_root).expanduser().resolve()
     lane = _norm(lane_id)
     if _is_linked_worktree(resolved_root):
@@ -592,7 +580,6 @@ def _prepare_session_locked(
     )
     providers = resolve_launch_order(providers, config_order)
 
-    runner = runner or subprocess.run
     # Startup self-attestation reader (Redmine #13637): the adopt gate joins each live
     # name-match with its record. Injectable for tests; defaults to the store pinned to
     # the SAME `store_home` the wrapper writes to (j#76492 F1), fail-open None.
@@ -693,6 +680,12 @@ def _prepare_session_locked(
                 f"unresolved or mismatched provider"
             )
 
+    native_admission = bind_native_launch_set(
+        tuple(plan.assigned_name for plan in launch_plans),
+        store_home=Path(store_home),
+        source_path=env.get("PATH"),
+    )
+
     # Managed-launch compatibility boundary — the LAST fail-closed point before any herdr
     # write. The whole conjunction, its gating and its derived flags live beside it in
     # `herdr_launch_preflight.preflight_managed_launch`, shared with the `sublane create`
@@ -717,6 +710,15 @@ def _prepare_session_locked(
         launch_plans=launch_plans, attest_launcher=attest_launcher, env=env, resolved=resolved_launches,
     )
     result.action_id = transaction.action_id if transaction else ""
+
+    launch_shim_dirs = prepare_complete_launch_shims(
+        _launch_shims,
+        providers=tuple(plan.provider for plan in launch_plans),
+        resolved_launches=resolved_launches,
+        attest_launcher=attest_launcher,
+        store_home=Path(store_home),
+        action_id=result.action_id,
+    )
 
     # Resolve workspace; role_grouped_space separates all three roles (#14996).
     launch_plans = [p for p in plans if p.kind == "launch"]
@@ -864,13 +866,21 @@ def _prepare_session_locked(
         )
     occupancy = plan_of_container.occupancy  # grows per launch (first occupies, rest split)
 
-    # Pass 2 — execute each slot's decision (adopt row, dry-run plan, or launch into the
-    # resolved target workspace/tab). A launch failure raises here, before reclaim.
-    # `occupancy` grows per launch so the first launched slot occupies and the rest split.
+    split_anchor = resolve_required_split_anchor(
+        rows,
+        launch_required=bool(launch_plans),
+        created_root=result.tab_pane_id or result.base_pane_id,
+        target_workspace=target_workspace,
+        target_tab=target_tab,
+        preferred_locator=next(
+            (p.locator for p in plans if p.kind == "adopt" and p.locator), ""
+        ),
+    )
+    record_prepared = prepared_pane_recorder(transaction)
+
+    # Execute each adopt/plan/launch decision. Occupancy grows after every launch.
     for plan in plans:
-        # Config-driven launch argv (Redmine #13425): per-slot `-- {provider}` extras from
-        # the single-source resolver; `None` config yields `[]`, so an unconfigured launch
-        # is byte-for-byte the pre-#13425 command. `lane_class` is resolved once above.
+        # Resolve provider-specific argv once per slot from the project config.
         launch_argv_extra = (
             agent_launch.resolve_launch_argv(plan.provider, lane_class)
             if agent_launch is not None
@@ -894,6 +904,7 @@ def _prepare_session_locked(
                 target_tab=target_tab,
                 split=slot_split,
                 focus=slot_focus,
+                anchor_locator=split_anchor,
                 binary=binary,
                 attest_launcher=attest_launcher,
                 store_home=store_home,
@@ -905,23 +916,17 @@ def _prepare_session_locked(
                 order_deferred=order_deferred,
                 replacement_action_id=replacement_action_id,
                 action_id=transaction.action_id if transaction is not None else "",
+                prepared_callback=record_prepared,
+                native_store=native_admission.store,
+                native_name=native_admission.native_names.get(plan.assigned_name, ""),
+                shim_dir=launch_shim_dirs.get(plan.provider, ""),
             )
         )
         if plan.kind == "launch":
+            split_anchor = result.slots[-1].locator
             occupancy += 1
-            if transaction is not None:
-                transaction.record_launch(
-                    result.slots[-1],
-                    receipt=launch_receipt(
-                        target_workspace=target_workspace, target_tab=target_tab
-                    ),
-                )
 
-    # Pass 3 — observe what we started (Redmine #13948, Answer j#80989). `agent start`
-    # returning a well-formed, correctly-located locator is the LAUNCHER's claim; it says
-    # nothing about the process. This bounded read-only probe turns "accepted" into
-    # "live there, screen-clear, self-attested", per role, after every launch so the
-    # providers boot concurrently. A dry run started nothing, so it observes nothing.
+    # Observe every fresh process after concurrent launch; dry-run has none to observe.
     if not dry_run:
         attach_startup_health(
             result, workspace_id=workspace_id, binary=binary, runner=runner,
@@ -950,12 +955,7 @@ def _prepare_session_locked(
         attest_launcher=attest_launcher, launch_plans=launch_plans, dry_run=dry_run,
     )
     if transaction is not None:
-        # Record the debt, never discharge it: closing what this run started is the
-        # explicit public rollback rail's authority alone (Answer j#80991). The debt is
-        # scoped to what THIS run freshly launched, not the pair aggregate (Redmine #13933
-        # R13, j#82038): a healthy fresh launch that adopted a non-green sibling owes no
-        # rollback, so the transaction must not strand it at `rollback_owed` — the v1
-        # replacement bind reads that phase and stalled the whole a14 convergence on it.
+        # Only the public rollback rail may discharge debt from this run's fresh slots.
         transaction.settle(owed=result.owes_rollback, launched=bool(launch_plans))
     return result
 

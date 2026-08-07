@@ -24,11 +24,14 @@ failure must not destroy them either — it is surfaced, and the panes stay.
 
 from __future__ import annotations
 
+import re
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
 
+from mozyo_bridge.core.state.herdr_native_identity_binding import is_native_name
 from mozyo_bridge.core.state.startup_execution_events import (
     ensure_execution_events_table,
 )
@@ -51,6 +54,22 @@ from mozyo_bridge.core.state.startup_transaction_fence import (
 RECORD_LAUNCH_BUSY_RETRY_BUDGET_SECONDS = 1.0
 #: Short pause between non-blocking lock attempts, kept well below the total budget.
 RECORD_LAUNCH_BUSY_RETRY_SLEEP_SECONDS = 0.002
+
+_HERDR_WORKSPACE_ID = re.compile(r"^w[A-Za-z0-9]+$")
+_HERDR_TAB_ID = re.compile(r"^(w[A-Za-z0-9]+):t[A-Za-z0-9]+$")
+
+
+class PaneBoundReceiptError(ValueError):
+    """A prepared-pane receipt is not the exact v1 authority shape."""
+
+
+@dataclass(frozen=True)
+class PaneBoundReceipt:
+    """The exact Herdr container and native identity recorded before agent start."""
+
+    workspace_id: str
+    tab_id: str
+    native_name: str
 
 
 def new_action_nonce() -> str:
@@ -121,17 +140,21 @@ class StartupTransaction:
         contention inside a short budget; every other authority error still fails on its
         first attempt, and destructive rollback/close paths retain their no-wait rule.
         """
+        self._record_participant(
+            Participant(
+                role=slot.provider,
+                assigned_name=slot.assigned_name,
+                locator=slot.locator,
+                receipt=receipt,
+            )
+        )
+
+    def _record_participant(self, participant: Participant) -> None:
         if self._action is None:
             raise StartupTransactionError(
-                "a launch was recorded before its startup action was reserved; the "
-                "reserve must precede every side effect"
+                "a participant was recorded before its startup action was reserved; "
+                "the reserve must precede every side effect"
             )
-        participant = Participant(
-            role=slot.provider,
-            assigned_name=slot.assigned_name,
-            locator=slot.locator,
-            receipt=receipt,
-        )
         deadline = self._monotonic() + self._busy_retry_budget_seconds
         while True:
             try:
@@ -144,6 +167,30 @@ class StartupTransaction:
                 if remaining <= 0:
                     raise
                 self._sleep(min(RECORD_LAUNCH_BUSY_RETRY_SLEEP_SECONDS, remaining))
+
+    def record_prepared_pane(
+        self,
+        *,
+        role: str,
+        assigned_name: str,
+        locator: str,
+        receipt: str,
+    ) -> None:
+        """Record the exact pane immediately after Herdr 0.8 creates it.
+
+        In 0.8 the pane exists before ``agent start``.  Waiting for agent readiness to
+        record it loses the very failure window rollback needs to recover.  The existing
+        participant schema already carries the complete close authority, so only the
+        recording point changes.
+        """
+        self._record_participant(
+            Participant(
+                role=role,
+                assigned_name=assigned_name,
+                locator=locator,
+                receipt=receipt,
+            )
+        )
 
     def settle(self, *, owed: bool, launched: bool) -> None:
         """Close the run's books: success, or a debt only the rollback rail may clear.
@@ -224,11 +271,83 @@ def launch_receipt(*, target_workspace: str, target_tab: str) -> str:
     return receipt
 
 
+def pane_bound_receipt(
+    *, target_workspace: str, target_tab: str, native_name: str
+) -> str:
+    """Strict receipt identifying a Herdr 0.8 pane prepared before agent start."""
+    receipt = PaneBoundReceipt(
+        workspace_id=target_workspace,
+        tab_id=target_tab,
+        native_name=native_name,
+    )
+    _validate_pane_bound_receipt(receipt)
+    return (
+        f"pane_bound_v1 workspace={receipt.workspace_id} tab={receipt.tab_id} "
+        f"native={receipt.native_name}"
+    )
+
+
+def parse_pane_bound_receipt(value: object) -> Optional[PaneBoundReceipt]:
+    """Decode only the byte-exact ``pane_bound_v1`` receipt grammar.
+
+    A legacy launch receipt is outside this codec and returns ``None``.  Anything that
+    claims to be a pane-bound receipt — including an unknown future version — but is not
+    this exact field order and token grammar is an error.  Rollback must not reinterpret
+    malformed or newer authority as the legacy agent-only form.
+    """
+    if not isinstance(value, str):
+        raise PaneBoundReceiptError("prepared-pane receipt must be a string")
+    if "pane_bound" not in value:
+        return None
+    if not value.startswith("pane_bound_"):
+        raise PaneBoundReceiptError(
+            "prepared-pane receipt marker is not in its canonical byte position"
+        )
+    parts = value.split(" ")
+    if (
+        len(parts) != 4
+        or parts[0] != "pane_bound_v1"
+        or not parts[1].startswith("workspace=")
+        or not parts[2].startswith("tab=")
+        or not parts[3].startswith("native=")
+    ):
+        raise PaneBoundReceiptError(
+            "prepared-pane receipt is not the exact pane_bound_v1 field shape"
+        )
+    receipt = PaneBoundReceipt(
+        workspace_id=parts[1][len("workspace=") :],
+        tab_id=parts[2][len("tab=") :],
+        native_name=parts[3][len("native=") :],
+    )
+    _validate_pane_bound_receipt(receipt)
+    return receipt
+
+
+def _validate_pane_bound_receipt(receipt: PaneBoundReceipt) -> None:
+    if not _HERDR_WORKSPACE_ID.fullmatch(receipt.workspace_id):
+        raise PaneBoundReceiptError(
+            "prepared-pane receipt has an invalid Herdr workspace id"
+        )
+    tab_match = _HERDR_TAB_ID.fullmatch(receipt.tab_id)
+    if tab_match is None or tab_match.group(1) != receipt.workspace_id:
+        raise PaneBoundReceiptError(
+            "prepared-pane receipt tab is invalid or belongs to another workspace"
+        )
+    if not is_native_name(receipt.native_name):
+        raise PaneBoundReceiptError(
+            "prepared-pane receipt has an invalid canonical Herdr native name"
+        )
+
+
 __all__ = (
     "RECORD_LAUNCH_BUSY_RETRY_BUDGET_SECONDS",
     "RECORD_LAUNCH_BUSY_RETRY_SLEEP_SECONDS",
+    "PaneBoundReceipt",
+    "PaneBoundReceiptError",
     "StartupTransaction",
     "launch_receipt",
     "new_action_nonce",
     "open_startup_transaction",
+    "pane_bound_receipt",
+    "parse_pane_bound_receipt",
 )

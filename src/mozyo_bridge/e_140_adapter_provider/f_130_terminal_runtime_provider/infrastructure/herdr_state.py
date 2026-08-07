@@ -198,6 +198,18 @@ class HerdrCliAgentStateReader:
                 "herdr agent list payload was not a recognised JSON array or "
                 "agents object",
             )
+        from mozyo_bridge.core.state.herdr_native_identity_binding import (
+            HerdrNativeIdentityBindingError,
+            logicalize_agent_rows,
+        )
+
+        try:
+            rows = list(logicalize_agent_rows(rows))
+        except HerdrNativeIdentityBindingError:
+            return AgentStateListResult.failure(
+                REASON_INVALID_PAYLOAD,
+                "herdr agent inventory contains an unresolved managed native name",
+            )
         pairs, skipped = _rows_to_state_pairs(rows)
         detail = f"skipped {skipped} row(s) with an invalid handle" if skipped else ""
         return AgentStateListResult.observed(pairs, detail=detail)

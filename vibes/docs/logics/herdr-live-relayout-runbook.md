@@ -2,6 +2,13 @@
 
 live な herdr pane pair (coordinator + auditor / gateway + worker 等) の **位置交換 (swap)** と **split 方向変換 (左右 ⇔ 上下)** を、実機で検証済みの手順として replay 可能な形で固定する。2026-07-12 の live 実測 (herdr 0.7.1) で確立した recipe と、その安全境界・herdr 側 gap を記録する (Redmine #13648 / #13664)。
 
+> **Herdr 0.8移行注記 (#15101、2026-08-08):** managed launchは`pane split <exact pane>`で
+> 新paneを作り、そのpaneへ`agent start <mza1> --kind <provider> --pane <pane>`を実行する方式へ
+> 移行した。したがってfresh launchはactive paneへの暗黙splitに依存しない。本runbookのA–Dは
+> 既存live paneを動かす別操作であり、記載された実測versionは0.7.1/0.7.4のままである。
+> 0.8で再実行する際は各`--help`とread-only layoutを先に照合し、未再実測のsignatureを推測で
+> 実行しない。
+
 対象は **手動 CLI での live 再配置** のみ。設定駆動の恒久配置 (`lane_placement`) は本書の非 scope で、境界は下記「設定駆動配置との境界」を読む。設計正本は [[spec-herdr-native-identity]] (target authority = herdr assigned name)、lane 運用手順の正本は [[task-herdr-lane-operations]]、pane identity / marker の意味構造は [[logic-pane-centric-cockpit-semantics]]。本書は手順のみを扱い規約本文を複製しない。
 
 ## 適用範囲と非 scope
@@ -16,7 +23,10 @@ live な herdr pane pair (coordinator + auditor / gateway + worker 等) の **�
 
 ## 前提 / 用語
 
-- **target identity は assigned name 権威**: pane の route authority は herdr assigned name (durable identity) + live inventory であり、pane 位置・tab 配置・pane id は権威ではない ([[spec-herdr-native-identity]])。再配置は表示位置を変えるだけで、assigned name / route / projection を変えない。操作前に必ず対象 pane の assigned name と live 状態を確認し、pane id を durable な target として扱わない。
+- **target identity はlogical identity権威**: paneのroute authorityはmozyoの`mzb1` logical identity
+  + live inventoryである。Herdr 0.8内部では32文字の`mza1`を使うが、binding storeで`mzb1`へ
+  復元してからroute判定する。pane位置・tab配置・pane id・raw `mza1`はdurable authorityではない
+  ([[spec-herdr-native-identity]])。操作前にlogical identityとlive状態を確認する。
 - **tab join の権威は `tab_id`**: どの pane が同一 tab に属するかは live inventory の `tab_id` のみが authority で、tab label は cosmetic (#13411)。bounce で「元の tab へ戻す」際は label ではなく元 tab の `tab_id` を指定する。
 - **live pair の即時再配置経路はこの recipe のみ**: herdr は same-tab re-split を拒否するため (下記)、`lane_placement` 設定 (#13646 / #13647 / #14569) も、その未設定既定 (#14568 の product default `split: down`、#14569 の `ratio: 0.5`) も、**既存 live pair の配置を変えない**。設定が決めるのは次の fresh launch / heal の geometry だけである (方向・順序は argv、比率はその launch 自身が作った divider への 1 度の resize)。live で今すぐ入れ替える唯一の経路が本 recipe である (#13648)。
   - **製品側の唯一の例外 (#14996 R2 / #15098)**: `role_grouped_space` の shared `project-coordinators` または `shared_space` の `coordinators` workspace へ **fresh な coordinator pair を append する launch** は、その pair を独立 column にするために recipe B と同じ 2 段 bounce を自動で 1 回だけ行う。続けてRIGHT軸dividerを対象指定でresizeし、全project列の幅差を1cell以内へ揃える。動かすpaneはsplit先columnの下段1枚で、元の相手paneの直下へ戻す。identity / process / cwdは不変で、resizeを含む各結果はlayout再読で検証し、失敗はtyped fail-closed。境界の正本は [[spec-herdr-native-identity]] の `### project column geometry — append 時の狭い verified relayout (#14996 R2)`。それ以外の live 再配置は引き続き本 recipe (operator の手動 CLI) の領分である。

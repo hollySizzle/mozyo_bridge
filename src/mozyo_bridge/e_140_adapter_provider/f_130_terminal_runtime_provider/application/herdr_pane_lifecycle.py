@@ -790,14 +790,25 @@ def preflight_generation_protocol_capability(
 
 
 def _list_rows(binary: str, runner: Runner, timeout: float) -> Sequence[Mapping[str, object]]:
-    """Run herdr ``agent list`` and return raw rows (fail-closed)."""
+    """Return logicalized inventory rows; preserve the raw name as ``native_name``."""
     completed = _invoke(binary, ["agent", "list"], runner, timeout, env=None)
     rows = _extract_list_rows(completed.stdout)
     if rows is None:
         raise HerdrSessionStartError(
             "herdr agent list payload was not a recognised JSON array or agents object"
         )
-    return rows
+    from mozyo_bridge.core.state.herdr_native_identity_binding import (
+        HerdrNativeIdentityBindingError,
+        logicalize_agent_rows,
+    )
+
+    try:
+        return logicalize_agent_rows(rows)
+    except HerdrNativeIdentityBindingError as exc:
+        raise HerdrSessionStartError(
+            "herdr agent inventory contains a managed native name whose logical "
+            "identity binding is unavailable"
+        ) from exc
 
 
 def _list_workspace_labels(

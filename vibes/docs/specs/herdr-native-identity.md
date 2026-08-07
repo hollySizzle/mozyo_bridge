@@ -12,9 +12,14 @@ sender env** に置き換える。
 
 ## 1. Identity model
 
-- **durable identity** = herdr **assigned name** の `mzb1_<workspace>_<role>_<lane>` scheme
+- **logical durable identity** = mozyo の `mzb1_<workspace>_<role>_<lane>` scheme
   (`domain/herdr_identity.py` の `encode_assigned_name` / `decode_assigned_name`, Redmine
-  #13247)。PoC #13175 E10 実測で `agent rename` 付与名は `server stop`/restart を越えて永続。
+  #13247)。routing / self-attestation / lifecycle はこの完全な identity を authority とする。
+- **Herdr native identity** = `mza1_<sha256-base32先頭27文字>` (全体32文字、Redmine
+  #15101)。Herdr 0.8の名前長上限へ収める adapter identity であり、logical identity の代わりでは
+  ない。home-scoped `herdr-native-identity.sqlite3` が logical/native の1対1 bindingを保持し、digest
+  衝突・未binding・壊れたrowを fail-closed で拒否する。`agent list` は adapter 境界で `mza1` を
+  `mzb1` へ戻し、raw値は `native_name` として観測用に残す。
   - `workspace` = mozyo workspace_id (registry / anchor が持つ workspace identity)。
     **linked git worktree (sublane lane checkout) も main checkout の registry identity を
     継承した同じ project workspace_id を使う (Redmine #13377 / design j#73613, shared
@@ -25,7 +30,7 @@ sender env** に置き換える。
     host workspace** に着地し、herdr workspace 数は「project 1 + host 1」の定数 (lane 数に
     比例しない)。**Redmine #13411 はこの host workspace 内をさらに lane=tab で細分化する:
     非 default lane ごとに専用 herdr tab を割り当て、gateway + worker を同 tab 内 split pair
-    として並置する (`herdr tab create` + `agent start --tab [--split right]`)。tab join は
+    として並置する (`herdr tab create` + `pane split` + `agent start --pane`)。tab join は
     live inventory の `tab_id` のみを authority とし (label は cosmetic)、fresh lane は tab を
     mint、heal は生存 slot の `tab_id` を読んで同一 tab へ復帰する。** identity model はこの
     配置分離・細分化で変わらない (mzb1 名は workspace segment に project identity を持ち続け、
@@ -288,6 +293,45 @@ ledger と同じ match key `(workspace_id, lane_id, role, pane_name)` に収束�
 `mozyo-bridge herdr session-start` (`application/herdr_session_start.py`)。明示 opt-in。backend
 flag には結合しない (別々に選べる) が、純 herdr 運用では両者を併用する。
 
+### 5.0 Herdr 0.8 launch contract (Redmine #15101)
+
+本節は、後続に残る0.7系のCLI literalを上書きする現行contractである。配置・identity・healthの
+判断規則は引き続き有効だが、`agent start --workspace/--tab/--env/--split` は現行launchに使わない。
+
+1. `agent start --help` と `pane split --help` をworkspace登録やHerdr writeより前に読み、0.8の
+   pane-bound surfaceを機能単位で確認する。旧形式・曖昧なhelp・読取不能はzero-Herdr-writeで拒否。
+2. 全launch slotの`mzb1`を一括で`mza1`へbindingする。全件を単一SQLite transactionで検証・記録し、
+   2人目の衝突を1人目の起動後に発見しない。
+3. provider executable、self-attestation launcher、全provider用のaction-private PATH shimを、最初の
+   Herdr writeより前に全件準備する。shim directoryは0700、canonical provider名のsymlinkだけを持ち、
+   session終了時にexact/non-recursiveで片付ける。
+4. このrunが得たworkspace/tab root、または同じcontainer内のexact live mozyo-managed agent paneだけを
+   anchorにして、次を実行する。labelだけで見つけたshell paneをsplit authorityへ昇格しない。
+
+   ```text
+   herdr pane split <ANCHOR_PANE> --direction right|down --cwd <repo> \
+     --env KEY=VALUE ... --no-focus
+   ```
+
+   `result.type=pane_info`と`result.pane.{pane_id,workspace_id,tab_id}`をexactに検証する。成功直後、
+   `pane_bound_v1` receipt（workspace/tab/native identity）をstartup transactionへ記録し、それ以前に
+   `agent start`を実行しない。
+5. 作成したexact paneへ次を実行する。
+
+   ```text
+   herdr agent start <MZA1_NATIVE_NAME> --kind claude|codex --pane <PANE_ID> -- <AGENT_ARG>...
+   ```
+
+   `result.type=agent_started`、返却pane、tab、native nameを準備済み値と照合する。長い`mzb1`はwrapper
+   の`--assigned-name`とself-attestation recordへ保持し、Herdrへ直接渡さない。
+6. pane作成後・agent起動前の失敗は、receiptのexact paneだけをrollback候補にする。closeには
+   container一致、agent不在、shell-only、入力なしの明示的なpositive proofをすべて要求し、close後も
+   pane不在を再読する。Herdr 0.8は現時点でauthoritativeなinput-empty APIを公開しないため、live cleanup
+   は安全側に`prepared_pane_unverifiable`で停止し、prompt文字列から推定して閉じない。
+
+この移行はHerdr downgradeや旧CLI fallbackを持たない。0.8 surfaceが確認できないruntimeは修復対象で
+あり、別形式へ自動分岐しない。
+
 flow:
 
 1. herdr binary を trusted env から解決 (未設定 / 未解決 → fail-closed)。
@@ -324,8 +368,9 @@ flow:
    で tab を mint する (label は cosmetic、join key は `tab_id`)。自 slot が loose pane (pre-#13411、
    tab_id 無し) の heal は loose のまま launch する (pair を新 tab へ分裂させない。full relaunch で
    tab へ移行)。自 slot が複数 tab に split したら fail-closed。default lane は tab を使わない
-   (byte-invariant)。launch は `agent start --workspace <host> --tab <tab_id>` で行い、tab 内 2
-   slot 目 (fresh pair の第 2、または heal で生存 slot の隣) は `--split <dir>` を付ける。方向と
+   (byte-invariant)。launch は §5.0 の `pane split` でexact tab内paneを先に作り、`agent start
+   --pane <pane_id>`で行う。tab 内 2 slot 目 (fresh pair の第 2、または heal で生存 slot の隣) は
+   直前のslot paneをanchorにする。方向と
    provider 順序は `lane_placement` config で lane class 別に宣言できる (Redmine #13646、下記
    §lane_placement)。**未設定時は product default `--split down` を出す (Redmine #14568)**。
    default lane は `--tab` を出さないままだが `--split` は出す (両者は独立 flag)。tab root pane は
@@ -458,9 +503,9 @@ flow:
    mint し read side が `multiple_matches` で落ちるため。CLI の `--agent` は repeatable のままでよい
    (重複入力を die で弾く)。
 
-### launch contract (herdr 0.7.1 live-measured, coordinator pre-smoke)
+### 旧 launch contract (herdr 0.7.1、履歴)
 
-staged assumption は解消済み。実 herdr 0.7.1 で計測した確定仕様:
+以下は#15101より前の計測履歴であり、現行実装のcommand contractではない。現行は§5.0を使う。
 
 ```
 herdr agent start <NAME> [--cwd PATH] [--env KEY=VALUE]... [--no-focus] -- <argv...>
@@ -502,8 +547,8 @@ herdr workspace は生成時に必ず `root_pane` (agent 無しの空 base shell
 2. launch する slot があり、かつ adopted agent が既存 workspace を pin していない (pure cold start) 場合は
    **明示的に** `herdr workspace create --cwd <repo> --no-focus` を呼び、応答の `workspace_id` と
    `root_pane.pane_id` を保持する。応答が parse 不能なら fail-closed (推測で pane を閉じない)。
-3. 各 launch slot を `agent start --workspace <workspace_id>` で起動する (herdr が second workspace を
-   暗黙生成しない)。
+3. 各launch slot用paneを、保持したrootまたは直前のlive managed paneをanchorに`pane split`で作成し、
+   `agent start --pane <pane_id>`で起動する (§5.0)。
 4. **全 launch 成功後に限り** `herdr pane close <root_pane_id>` で、この run が生成した root pane
    **のみ**を閉じる。
 
@@ -511,9 +556,9 @@ fail-closed / safety 不変条件:
 
 - 閉じる対象は **この run が `workspace create` で得た `root_pane.pane_id` 一点のみ**。scan で「空
   shell らしき pane」を探して閉じることは禁止 (user 自身の shell を誤 close しない構造的保証)。
-- **launched locator は target workspace 内であることを fail-closed 検証する** (#13330 review j#73231)。
-  `agent start --workspace <id>` の返す `result.agent.pane_id` の workspace prefix が要求 workspace と
-  一致しない場合 (herdr が flag を無視 / 仕様差分で別 workspace に auto-create した場合) は
+- **prepared / launched locator は target workspace 内であることを fail-closed 検証する** (#13330
+  review j#73231 / #15101)。`pane split`の`pane_info`と`agent start --pane`の
+  `result.agent.pane_id`が要求workspace・tab・exact paneと一致しない場合は
   `HerdrSessionStartError` で raise する。検証は reclaim step より前で発火するため、mislocated launch
   時は created root pane を close せず、別 workspace 側の残存 base pane を見逃さない。
 - launch 失敗は reclaim より前に raise する (created workspace / root pane は残骸として残し、実装失敗

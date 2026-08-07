@@ -52,11 +52,19 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     COMPOSER_UNREADABLE,
     ROLLBACK_CLOSE_TARGETS,
     ROLLBACK_DETAIL,
+    ROLLBACK_ABSENT,
+    ROLLBACK_ALREADY_CLOSED,
     ROLLBACK_ELIGIBLE,
     ROLLBACK_INVENTORY_UNREADABLE,
+    ROLLBACK_OBLIGATION_UNREADABLE,
     ROLLBACK_SETTLED,
+    ROLLBACK_WORK_OBLIGATION,
     ParticipantFacts,
     classify_rollback,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
+    PaneBoundReceiptError,
+    parse_pane_bound_receipt,
 )
 
 #: Refusals that are about the ACTION, not about any one participant.
@@ -69,6 +77,15 @@ REASON_BUSY = "rollback_busy"
 REASON_BLOCKED = "rollback_blocked"
 REASON_INCOMPLETE = "rollback_incomplete"
 REASON_PREFLIGHT = "preflight_only"
+
+#: Prepared-pane observation states.  ``unreadable`` includes a missing positive
+#: input-empty fact: Herdr 0.8 has no public input-buffer field, so an empty historical
+#: read or a prompt-shaped screen is not accepted as proof.
+PREPARED_PANE_PRESENT = "present"
+PREPARED_PANE_ABSENT = "absent"
+PREPARED_PANE_UNREADABLE = "unreadable"
+ROLLBACK_PREPARED_PANE_UNVERIFIABLE = "prepared_pane_unverifiable"
+ROLLBACK_PREPARED_RECEIPT_INVALID = "prepared_pane_receipt_invalid"
 
 #: Phases from which a rollback may still act — every non-terminal phase that can have
 #: participants. A run is only unrecoverable once it has said, durably, how it ended.
@@ -108,6 +125,35 @@ class StartupRollbackOps(Protocol):
     def close(self, workspace_id: str, lane_id: str, targets):
         """Close exactly ``targets`` (``(role, locator)``); returns the close result."""
 
+    def prepared_pane(
+        self, *, locator: str, workspace_id: str, tab_id: str
+    ) -> "PreparedPaneObservation":
+        """Observe one action-recorded shell pane without interpreting its contents."""
+
+    def close_prepared_pane(
+        self, *, locator: str, workspace_id: str, tab_id: str
+    ) -> tuple[bool, str]:
+        """Close a still-eligible prepared pane; the caller re-proves absence."""
+
+
+@dataclass(frozen=True)
+class PreparedPaneObservation:
+    """Positive facts about a pane that exists before ``agent start``.
+
+    ``input_empty`` is deliberately a three-valued fact.  Only literal ``True`` may
+    authorize close; ``None`` means the selected Herdr runtime exposes no authoritative
+    input-state surface and therefore fails closed.
+    """
+
+    state: str
+    locator: str = ""
+    workspace_id: str = ""
+    tab_id: str = ""
+    agent_absent: bool = False
+    shell_only: bool = False
+    input_empty: Optional[bool] = None
+    detail: str = ""
+
 
 @dataclass(frozen=True)
 class ParticipantVerdict:
@@ -119,6 +165,8 @@ class ParticipantVerdict:
     blocker_id: str = ""
     closed: bool = False
     close_detail: str = ""
+    #: Internal execution mode only.  The public payload remains byte-compatible.
+    prepared_pane: bool = False
 
     def as_payload(self) -> dict:
         return {
@@ -238,6 +286,94 @@ def _facts_for(
     return ParticipantFacts(**base), blocker
 
 
+def _name_matches(participant, rows) -> list[Mapping[str, object]]:
+    return [
+        row
+        for row in rows
+        if isinstance(row, Mapping)
+        and _norm(row.get(AGENT_KEY_NAME)) == _norm(participant.assigned_name)
+    ]
+
+
+def _prepared_pane_verdict(
+    ops: StartupRollbackOps,
+    participant,
+    receipt,
+    *,
+    inventory_readable: bool,
+    obligation_names: set,
+    obligation_unreadable: bool,
+) -> ParticipantVerdict:
+    """Classify a receipt-bound pane whose logical agent row is absent.
+
+    The old agent-only rule treated an absent agent row as a settled participant.  That
+    is false during Herdr 0.8's split-before-start interval: the shell pane is already a
+    side effect.  It is closeable only from every positive fact below; an unavailable
+    input-state fact therefore preserves the pane.
+    """
+    if participant.closed:
+        verdict = ROLLBACK_ALREADY_CLOSED
+        detail = ROLLBACK_DETAIL[verdict]
+    elif not inventory_readable:
+        verdict = ROLLBACK_INVENTORY_UNREADABLE
+        detail = ROLLBACK_DETAIL[verdict]
+    elif obligation_unreadable:
+        verdict = ROLLBACK_OBLIGATION_UNREADABLE
+        detail = ROLLBACK_DETAIL[verdict]
+    elif participant.assigned_name in obligation_names:
+        verdict = ROLLBACK_WORK_OBLIGATION
+        detail = ROLLBACK_DETAIL[verdict]
+    else:
+        try:
+            observation = ops.prepared_pane(
+                locator=participant.locator,
+                workspace_id=receipt.workspace_id,
+                tab_id=receipt.tab_id,
+            )
+        except Exception:  # noqa: BLE001 - absence of a positive pane read blocks close
+            observation = PreparedPaneObservation(
+                state=PREPARED_PANE_UNREADABLE,
+                detail="prepared pane inventory could not be read",
+            )
+        if observation.state == PREPARED_PANE_ABSENT:
+            verdict = ROLLBACK_ABSENT
+            detail = (
+                "the pane_bound_v1 locator is positively absent from the complete Herdr "
+                "pane inventory; there is nothing to close"
+            )
+        elif (
+            observation.state == PREPARED_PANE_PRESENT
+            and observation.locator == participant.locator
+            and observation.workspace_id == receipt.workspace_id
+            and observation.tab_id == receipt.tab_id
+            and observation.agent_absent is True
+            and observation.shell_only is True
+            and observation.input_empty is True
+        ):
+            verdict = ROLLBACK_ELIGIBLE
+            detail = (
+                "the exact action-recorded pane is still present with no agent, only its "
+                "shell, and an authoritative empty-input observation"
+            )
+        else:
+            verdict = ROLLBACK_PREPARED_PANE_UNVERIFIABLE
+            detail = observation.detail or (
+                "the action-recorded prepared pane could not be proven to have the same "
+                "container, no agent, only its shell, and no input; refusing to close it"
+            )
+    return ParticipantVerdict(
+        role=participant.role,
+        assigned_name=participant.assigned_name,
+        locator=participant.locator,
+        verdict=verdict,
+        detail=detail,
+        closed=participant.closed,
+        # A durable closed flag is replay authority.  Do not revisit the recorded pane
+        # address after that proof; Herdr may legitimately have reused it for a new pane.
+        prepared_pane=not participant.closed,
+    )
+
+
 def run_session_rollback(
     *,
     action_id: str,
@@ -342,6 +478,43 @@ def _observe(action, ops: StartupRollbackOps) -> tuple[list, bool]:
             }
     verdicts = []
     for participant in action.participants:
+        try:
+            pane_receipt = parse_pane_bound_receipt(participant.receipt)
+        except PaneBoundReceiptError as exc:
+            verdicts.append(
+                ParticipantVerdict(
+                    role=participant.role,
+                    assigned_name=participant.assigned_name,
+                    locator=participant.locator,
+                    verdict=ROLLBACK_PREPARED_RECEIPT_INVALID,
+                    detail=(
+                        "the participant claims pane-bound authority but its receipt is "
+                        f"invalid ({exc}); refusing to reinterpret it as a legacy launch"
+                    ),
+                    closed=participant.closed,
+                    # A durable closed flag is replay authority even when an old or
+                    # corrupted receipt can no longer be decoded. Never revisit a
+                    # locator that Herdr may since have reused.
+                    prepared_pane=not participant.closed,
+                )
+            )
+            continue
+        if (
+            pane_receipt is not None
+            and inventory_readable
+            and not _name_matches(participant, rows)
+        ):
+            verdicts.append(
+                _prepared_pane_verdict(
+                    ops,
+                    participant,
+                    pane_receipt,
+                    inventory_readable=inventory_readable,
+                    obligation_names=obligation_names,
+                    obligation_unreadable=obligation_unreadable,
+                )
+            )
+            continue
         facts, blocker = _facts_for(
             ops,
             participant,
@@ -475,7 +648,19 @@ def _execute_rollback(action_id, action, ops, fence, verdicts):
     targets = [
         (v.role, v.locator)
         for v in verdicts
-        if not v.closed and v.locator and _live_target(action, v)
+        if not v.prepared_pane
+        and not v.closed
+        and v.locator
+        and _live_target(action, v)
+    ]
+    participants = {p.role: p for p in action.participants}
+    prepared_targets = [
+        v
+        for v in verdicts
+        if v.prepared_pane
+        and not v.closed
+        and v.locator
+        and _live_target(action, v)
     ]
     settled = list(verdicts)
     failed: dict = {}
@@ -490,13 +675,28 @@ def _execute_rollback(action_id, action, ops, fence, verdicts):
         except Exception as exc:  # noqa: BLE001 - a close that raised is a close that may
             # have partially acted; the remeasure, not this exception, decides the outcome.
             failed = {role: f"close raised: {exc}" for role, _ in targets}
+    for verdict in prepared_targets:
+        participant = participants[verdict.role]
+        try:
+            receipt = parse_pane_bound_receipt(participant.receipt)
+            if receipt is None:
+                raise PaneBoundReceiptError("pane-bound execution lost its typed receipt")
+            ok, detail = ops.close_prepared_pane(
+                locator=participant.locator,
+                workspace_id=receipt.workspace_id,
+                tab_id=receipt.tab_id,
+            )
+            if not ok:
+                failed[verdict.role] = detail or "prepared pane close was refused"
+        except Exception as exc:  # noqa: BLE001 - remeasure decides any partial effect
+            failed[verdict.role] = f"prepared pane close raised: {exc}"
     # A close's return code is not evidence of absence (#13892 j#80506 F3), so the durable
     # `closed` flag is written from the REMEASURE, never from the close's own report
     # (review j#81070 R1-F4). Believing the report first recorded `closed=True` for a pane
     # that was still live, and the next replay then skipped it as already-settled — the
     # participant could never be closed again. Absence is the only thing that proves a
     # close, and only the remeasure can see it.
-    residue, remeasure_ok = _residual_participants(action, ops)
+    residue, remeasure_ok = _residual_participants(action, ops, verdicts)
     if remeasure_ok:
         proven_gone = {
             v.role
@@ -576,7 +776,7 @@ def _live_target(action, verdict) -> bool:
     return verdict.verdict in ROLLBACK_CLOSE_TARGETS and not verdict.closed
 
 
-def _residual_participants(action, ops) -> tuple[set, bool]:
+def _residual_participants(action, ops, verdicts=()) -> tuple[set, bool]:
     """Fresh whole-unit re-measure: which participants are STILL live (positive proof)."""
     try:
         rows = list(ops.agent_rows())
@@ -587,7 +787,36 @@ def _residual_participants(action, ops) -> tuple[set, bool]:
         for row in rows
         if isinstance(row, Mapping) and _norm(row.get(AGENT_KEY_NAME))
     }
-    return {p.assigned_name for p in action.participants if p.assigned_name in live}, True
+    residue = {p.assigned_name for p in action.participants if p.assigned_name in live}
+    verdict_by_role = {v.role: v for v in verdicts}
+    for participant in action.participants:
+        verdict = verdict_by_role.get(participant.role)
+        if participant.assigned_name in residue or not getattr(
+            verdict, "prepared_pane", False
+        ):
+            continue
+        try:
+            receipt = parse_pane_bound_receipt(participant.receipt)
+            if receipt is None:
+                return residue, False
+            observation = ops.prepared_pane(
+                locator=participant.locator,
+                workspace_id=receipt.workspace_id,
+                tab_id=receipt.tab_id,
+            )
+        except Exception:  # noqa: BLE001 - an unreadable post-close pane proves nothing
+            return residue, False
+        if observation.state == PREPARED_PANE_ABSENT:
+            continue
+        residue.add(participant.assigned_name)
+        if observation.state not in {
+            PREPARED_PANE_PRESENT,
+            PREPARED_PANE_UNREADABLE,
+        }:
+            return residue, False
+        if observation.state == PREPARED_PANE_UNREADABLE:
+            return residue, False
+    return residue, True
 
 
 __all__ = (
@@ -601,7 +830,13 @@ __all__ = (
     "REASON_NOTHING_OWED",
     "REASON_OK",
     "REASON_PREFLIGHT",
+    "PREPARED_PANE_ABSENT",
+    "PREPARED_PANE_PRESENT",
+    "PREPARED_PANE_UNREADABLE",
+    "ROLLBACK_PREPARED_PANE_UNVERIFIABLE",
+    "ROLLBACK_PREPARED_RECEIPT_INVALID",
     "ParticipantVerdict",
+    "PreparedPaneObservation",
     "SessionRollbackVerdict",
     "StartupRollbackOps",
     "run_session_rollback",

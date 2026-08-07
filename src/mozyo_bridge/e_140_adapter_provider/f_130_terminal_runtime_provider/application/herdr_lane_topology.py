@@ -865,6 +865,29 @@ def _parse_workspace_created(stdout: object) -> Optional[tuple[str, str]]:
     return workspace_id, root_pane_id
 
 
+def _parse_started_agent_identity(stdout: object) -> Optional[tuple[str, str, str]]:
+    """``(pane_id, tab_id, native_name)`` from Herdr 0.8 ``agent start``."""
+    if not isinstance(stdout, str):
+        return None
+    try:
+        payload = json.loads(stdout)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    result = payload.get("result")
+    if not isinstance(result, Mapping) or _norm(result.get("type")) != "agent_started":
+        return None
+    agent = result.get("agent")
+    if not isinstance(agent, Mapping):
+        return None
+    pane_id = _norm(agent.get("pane_id"))
+    native_name = _norm(agent.get("name"))
+    if not pane_id or not native_name:
+        return None
+    return pane_id, _norm(agent.get("tab_id")), native_name
+
+
 def _parse_started_agent(stdout: object) -> Optional[tuple[str, str]]:
     """``(pane_id, tab_id)`` from a herdr ``agent start`` payload (fail-closed).
 
@@ -882,26 +905,8 @@ def _parse_started_agent(stdout: object) -> Optional[tuple[str, str]]:
     ``result.type`` is not ``agent_started``, or the ``pane_id`` is missing / blank —
     never a blank handle. The caller separately verifies the landed workspace / tab.
     """
-    if not isinstance(stdout, str):
-        return None
-    try:
-        payload = json.loads(stdout)
-    except (ValueError, TypeError):
-        return None
-    if not isinstance(payload, Mapping):
-        return None
-    result = payload.get("result")
-    if not isinstance(result, Mapping):
-        return None
-    if _norm(result.get("type")) != "agent_started":
-        return None
-    agent = result.get("agent")
-    if not isinstance(agent, Mapping):
-        return None
-    pane_id = _norm(agent.get("pane_id"))
-    if not pane_id:
-        return None
-    return pane_id, _norm(agent.get("tab_id"))
+    identity = _parse_started_agent_identity(stdout)
+    return (identity[0], identity[1]) if identity is not None else None
 
 
 def _parse_tab_created(stdout: object) -> Optional[tuple[str, str]]:
@@ -962,6 +967,7 @@ __all__ = (
     "resolve_placement_policy_for_role",
     "slot_placement",
     "_parse_started_agent",
+    "_parse_started_agent_identity",
     "_parse_tab_created",
     "_parse_workspace_created",
     "_parse_workspace_list",

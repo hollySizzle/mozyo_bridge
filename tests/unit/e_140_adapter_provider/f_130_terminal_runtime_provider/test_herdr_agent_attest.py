@@ -24,7 +24,9 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     VERDICT_MISSING,
     VERDICT_PRESENT,
 )
+from mozyo_bridge.core.state.herdr_native_identity_binding import native_name_for
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_agent_attest import (
+    ATTESTATION_REASON_NATIVE_IDENTITY_MISMATCH,
     SELF_LOOKUP_TOTAL_BUDGET_SECONDS,
     _argv0_alias_binds_to_exec_target,
     bounded_self_lookup,
@@ -35,6 +37,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
     TerminalTransportError,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
+    MOZYO_HERDR_NATIVE_NAME_ENV,
     MOZYO_PROVIDER_ARGV0_ENV,
 )
 
@@ -201,6 +204,49 @@ class PerformSelfAttestationTest(unittest.TestCase):
             got = HerdrIdentityAttestationStore(home=home).read(NAME)
             self.assertEqual(got.verdict, VERDICT_PRESENT)
             self.assertEqual(got.locator, "wY:p2")
+
+    def test_native_identity_resolves_short_row_and_records_logical_authority(self) -> None:
+        native = native_name_for(NAME)
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            rec = perform_self_attestation(
+                assigned_name=NAME,
+                workspace_id="ws1",
+                role="claude",
+                lane="default",
+                env={**_GOOD_ENV, MOZYO_HERDR_NATIVE_NAME_ENV: native},
+                runner=_runner({"name": native, "pane_id": "wY:p2"}),
+                home=home,
+            )
+            self.assertEqual(rec.verdict, VERDICT_PRESENT)
+            self.assertEqual(rec.assigned_name, NAME)
+            self.assertEqual(rec.locator, "wY:p2")
+
+    def test_native_identity_mismatch_writes_no_attestation(self) -> None:
+        events = []
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            rec = perform_self_attestation(
+                assigned_name=NAME,
+                workspace_id="ws1",
+                role="claude",
+                lane="default",
+                env={
+                    **_GOOD_ENV,
+                    MOZYO_HERDR_NATIVE_NAME_ENV: native_name_for(NAME + "-other"),
+                },
+                runner=_runner(
+                    {"name": native_name_for(NAME), "pane_id": "wY:p2"}
+                ),
+                home=home,
+                append_event=lambda stage, reason="": events.append((stage, reason)),
+            )
+            self.assertIsNone(rec)
+            self.assertIsNone(HerdrIdentityAttestationStore(home=home).read(NAME))
+        self.assertIn(
+            ("attestation_write_failed", ATTESTATION_REASON_NATIVE_IDENTITY_MISMATCH),
+            events,
+        )
 
     def test_envless_boot_records_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
