@@ -610,6 +610,7 @@ class BoundRetireDoesNotErodeSiblings(unittest.TestCase):
         out = self.legacy.retire_released_hibernated_legacy(
             self.key,
             expected_revision=self.store.get(self.key).revision,
+            expected_generation=self.store.get(self.key).lane_generation,
             issue_id=_ISSUE,
             decision=_decision(),
         )
@@ -665,6 +666,7 @@ class BoundRetireDoesNotErodeSiblings(unittest.TestCase):
         migrated = self.legacy.retire_released_hibernated_legacy(
             self.key,
             expected_revision=self.store.get(self.key).revision,
+            expected_generation=self.store.get(self.key).lane_generation,
             issue_id=_ISSUE,
             decision=_decision(),
         )

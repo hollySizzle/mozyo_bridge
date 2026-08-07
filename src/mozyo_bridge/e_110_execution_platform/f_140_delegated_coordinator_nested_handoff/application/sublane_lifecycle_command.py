@@ -705,6 +705,10 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
                 "--retire-active-unbound-live-zero",
                 "retire_active_unbound_live_zero",
             ),
+            (
+                "--retire-hibernated-unbound-live-zero",
+                "retire_hibernated_unbound_live_zero",
+            ),
         )
         if getattr(args, flag, False)
     ]
@@ -754,14 +758,14 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
     worktree = getattr(args, "worktree", None)
     worktree_dirty_override = None
     worktree_missing = False
-    # Redmine #14499 j#89291: `--retire-active-unbound-live-zero` is metadata-only and has no
-    # checkout in scope — its whole effect is a lifecycle CAS. It takes `--worktree` solely to
-    # widen the legacy live-zero inventory scan (never to attest, never as a cleanup target),
-    # so the generic checkout gates and the cleanup runbook must not consume it. Skipping the
-    # probes outright — rather than probing and ignoring the result — also means this intent
-    # performs no git inspection of an unrelated checkout at all.
-    checkout_in_scope = not bool(
-        getattr(args, "retire_active_unbound_live_zero", False)
+    # The two unbound live-zero rails have no checkout in scope. An optional --worktree only
+    # widens legacy inventory and, for the hibernated sibling, can refuse a metadata mismatch;
+    # it never authorizes cleanup or a Git probe.
+    checkout_in_scope = not any(
+        (
+            bool(getattr(args, "retire_active_unbound_live_zero", False)),
+            bool(getattr(args, "retire_hibernated_unbound_live_zero", False)),
+        )
     )
     if worktree and checkout_in_scope:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (  # noqa: E501
@@ -798,9 +802,10 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
         worktree_missing=worktree_missing,
         checkout_in_scope=checkout_in_scope,
     )
-    # The six mutually exclusive retire intents (guarded close / hibernated-legacy migration /
+    # The seven mutually exclusive retire intents (guarded close / hibernated-legacy migration /
     # hibernated-live reconcile / hibernated-bound terminal retire / active live-zero terminal
-    # retire / active UNBOUND live-zero terminal retire) live in `sublane_retire_intents`, which
+    # retire / active UNBOUND live-zero terminal retire / hibernated UNBOUND live-zero terminal
+    # retire) live in `sublane_retire_intents`, which
     # runs exactly one of them — and only when the fail-closed preflight already permits
     # retirement. Relocated there in Redmine #14499 when the sixth intent pushed this module
     # over the module-health threshold; the dispatch is byte-for-byte the chain that was here.
@@ -821,6 +826,7 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
     bound_retire_result = intents.bound_retire_result
     active_retire_result = intents.active_retire_result
     unbound_retire_result = intents.unbound_retire_result
+    hibernated_unbound_retire_result = intents.hibernated_unbound_retire_result
     payload = outcome.as_payload()
     # Redmine #13754: the ACTUATION verdict — not the preflight — decides whether the lane
     # was actually retired. ``decision.state: retire_ok`` says the retire was *permitted*;
@@ -847,6 +853,11 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
     if unbound_retire_result is not None:
         payload["active_unbound_live_zero_retire"] = unbound_retire_result.as_payload()
         actuated_ok = unbound_retire_result.ok
+    if hibernated_unbound_retire_result is not None:
+        payload["hibernated_unbound_live_zero_retire"] = (
+            hibernated_unbound_retire_result.as_payload()
+        )
+        actuated_ok = hibernated_unbound_retire_result.ok
     payload["retire_ok"] = bool(outcome.preflight.may_retire and actuated_ok)
     if getattr(args, "json", False):
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
@@ -888,6 +899,16 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
             )
 
             print(format_unbound_retire_text(unbound_retire_result))
+        if hibernated_unbound_retire_result is not None:
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_unbound_live_zero_retire import (  # noqa: E501
+                format_hibernated_unbound_retire_text,
+            )
+
+            print(
+                format_hibernated_unbound_retire_text(
+                    hibernated_unbound_retire_result
+                )
+            )
     return 0 if (outcome.preflight.may_retire and actuated_ok) else 1
 
 

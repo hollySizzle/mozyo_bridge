@@ -362,15 +362,30 @@ def register_sublane_retire(
         ),
     )
     sublane_retire.add_argument(
+        "--retire-hibernated-unbound-live-zero",
+        dest="retire_hibernated_unbound_live_zero",
+        action="store_true",
+        help=(
+            "Redmine #14716: metadata-only TERMINAL retire for a HIBERNATED + RELEASED "
+            "issue-bound row with an EMPTY canonical worktree binding and a positively "
+            "absent managed pair. Requires exact generation/revision, lane metadata branch, "
+            "integrated head, one fresh Redmine snapshot proving the exact issue closed and "
+            "--journal present, exclusive launch exclusion, and live-zero. --worktree is "
+            "optional and can only refuse on metadata mismatch; it never authorizes the "
+            "write. Restores/removes no checkout and changes no Git ref. Mutually exclusive "
+            "with every other retire intent."
+        ),
+    )
+    sublane_retire.add_argument(
         "--expect-lane-generation",
         dest="expect_lane_generation",
         type=int,
         default=0,
         help=(
             "Redmine #14499: the exact positive lane_generation the caller measured the "
-            "live-zero read against. Mandatory with --retire-active-unbound-live-zero (it "
-            "replaces the worktree attestation that surface cannot perform); ignored by every "
-            "other intent."
+            "live-zero read against. Mandatory with --retire-active-unbound-live-zero and "
+            "--retire-hibernated-unbound-live-zero (it replaces the worktree attestation "
+            "those surfaces cannot perform); ignored by every other intent."
         ),
     )
     sublane_retire.add_argument(
@@ -380,8 +395,8 @@ def register_sublane_retire(
         default=0,
         help=(
             "Redmine #14499: the exact positive lifecycle revision the caller measured the "
-            "live-zero read against. Mandatory with --retire-active-unbound-live-zero; ignored "
-            "by every other intent."
+            "live-zero read against. Mandatory with both unbound live-zero retire intents; "
+            "ignored by every other intent."
         ),
     )
     sublane_retire.add_argument(

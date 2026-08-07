@@ -100,6 +100,9 @@ retire_三義:
                          managed process の解放だけ**で、worktree remove と local branch delete は
                          どちらも operator runbook 側に残る (#13686 j#96396 / j#96401: 破壊的
                          primitive に対象 identity を束縛する git の手段が無いため撤去)。
+                         hibernated / released / unbound でcheckout消失済みの行は、専用railが
+                         lifecycle metadataだけをterminal化できる (#14716)。checkoutを復元・削除せず、
+                         worktree/branchの物理清掃を完了した意味にも読み替えない。
       正本: logic-worktree-lifecycle-boundary (sublane retirement authority / record),
             logic-auto-integration-actuator (integration とは別 state machine としての
             cleanup 段階別 outcome と、破壊的操作を持たない理由),

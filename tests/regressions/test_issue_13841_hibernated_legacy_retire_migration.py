@@ -208,8 +208,13 @@ class RetireMigrationCasMatrix(unittest.TestCase):
         rev = expected_revision if expected_revision is not None else (
             rec.revision if rec is not None else 1
         )
+        generation = rec.lane_generation if rec is not None else 1
         return self.migration.retire_released_hibernated_legacy(
-            self.key, expected_revision=rev, issue_id=issue, decision=_decision(issue)
+            self.key,
+            expected_revision=rev,
+            expected_generation=generation,
+            issue_id=issue,
+            decision=_decision(issue),
         )
 
     def test_exact_legacy_signature_migrates_to_retired(self) -> None:
@@ -265,6 +270,7 @@ class RetireMigrationCasMatrix(unittest.TestCase):
         out = self.migration.retire_released_hibernated_legacy(
             self.key,
             expected_revision=self.store.get(self.key).revision,
+            expected_generation=self.store.get(self.key).lane_generation,
             issue_id=_OTHER_ISSUE,
             decision=_decision(_OTHER_ISSUE),
         )
@@ -308,9 +314,27 @@ class RetireMigrationCasMatrix(unittest.TestCase):
         self.assertEqual(out.reason, CAS_STALE_REVISION)
         self.assertEqual(self.store.get(self.key).lane_disposition, DISPOSITION_HIBERNATED)
 
+    def test_generation_race_loses_even_when_revision_matches(self) -> None:
+        self._seed()
+        rec = self.store.get(self.key)
+        out = self.migration.retire_released_hibernated_legacy(
+            self.key,
+            expected_revision=rec.revision,
+            expected_generation=rec.lane_generation + 1,
+            issue_id=_ISSUE,
+            decision=_decision(),
+        )
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_STALE_REVISION)
+        self.assertEqual(self.store.get(self.key).lane_disposition, DISPOSITION_HIBERNATED)
+
     def test_absent_row_is_not_found(self) -> None:
         out = self.migration.retire_released_hibernated_legacy(
-            self.key, expected_revision=1, issue_id=_ISSUE, decision=_decision()
+            self.key,
+            expected_revision=1,
+            expected_generation=1,
+            issue_id=_ISSUE,
+            decision=_decision(),
         )
         self.assertFalse(out.applied)
         self.assertEqual(out.reason, CAS_NOT_FOUND)
@@ -319,13 +343,18 @@ class RetireMigrationCasMatrix(unittest.TestCase):
         self._seed()
         with self.assertRaises(ValueError):
             self.migration.retire_released_hibernated_legacy(
-                self.key, expected_revision=2, issue_id="", decision=_decision()
+                self.key,
+                expected_revision=2,
+                expected_generation=1,
+                issue_id="",
+                decision=_decision(),
             )
         with self.assertRaises(Exception):
             # A decision anchored to a different issue cannot authorize this binding.
             self.migration.retire_released_hibernated_legacy(
                 self.key,
                 expected_revision=2,
+                expected_generation=1,
                 issue_id=_ISSUE,
                 decision=_decision(_OTHER_ISSUE),
             )
@@ -336,11 +365,19 @@ class RetireMigrationCasMatrix(unittest.TestCase):
         self._seed()
         rec = self.store.get(self.key)
         first = self.migration.retire_released_hibernated_legacy(
-            self.key, expected_revision=rec.revision, issue_id=_ISSUE, decision=_decision()
+            self.key,
+            expected_revision=rec.revision,
+            expected_generation=rec.lane_generation,
+            issue_id=_ISSUE,
+            decision=_decision(),
         )
         self.assertTrue(first.applied)
         second = self.migration.retire_released_hibernated_legacy(
-            self.key, expected_revision=rec.revision, issue_id=_ISSUE, decision=_decision()
+            self.key,
+            expected_revision=rec.revision,
+            expected_generation=rec.lane_generation,
+            issue_id=_ISSUE,
+            decision=_decision(),
         )
         self.assertFalse(second.applied)
         self.assertEqual(second.reason, CAS_STALE_REVISION)

@@ -581,6 +581,7 @@ def run_hibernated_legacy_retire_migration(
         outcome = retire_store.retire_released_hibernated_legacy(
             key,
             expected_revision=record.revision,
+            expected_generation=record.lane_generation,
             issue_id=issue,
             decision=decision,
         )

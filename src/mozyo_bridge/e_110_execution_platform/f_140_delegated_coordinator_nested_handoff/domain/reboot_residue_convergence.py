@@ -44,7 +44,9 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     DISPOSITION_RETIRED,
     DISPOSITION_SUPERSEDED,
     RELEASE_NOT_REQUESTED,
+    RELEASE_PARTIAL,
     RELEASE_RELEASED,
+    RELEASE_REQUESTED,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (  # noqa: E501
     RUNTIME_UNKNOWN,
@@ -64,6 +66,9 @@ CONVERGE_UNKNOWN = "unknown"
 #: The lifecycle row is already ``retired``. Nothing to converge; worktree / administrative
 #: cleanup is now permitted (Required behavior 8).
 CONVERGE_ALREADY_TERMINAL = "already_terminal"
+#: An open issue whose lifecycle row is already hibernated needs no repeated hibernate or
+#: active-only supersede action. The row is already in the desired non-terminal state.
+CONVERGE_ALREADY_HIBERNATED = "already_hibernated"
 #: Closed issue, live managed pair present: drain it the ordinary way
 #: (``sublane retire --execute``). Never a metadata terminalize — there are processes.
 CONVERGE_GUARDED_CLOSE = "guarded_close"
@@ -82,6 +87,11 @@ CONVERGE_TERMINALIZE_BOUND = "terminalize_bound_metadata"
 #: shape that every existing terminal rail refuses. Converged by
 #: ``--retire-active-unbound-live-zero``.
 CONVERGE_TERMINALIZE_UNBOUND = "terminalize_unbound_metadata"
+#: Closed issue, live-zero, HIBERNATED + RELEASED + UNBOUND row. This is deliberately a
+#: distinct rail from the active-only unbound terminalization above.
+CONVERGE_TERMINALIZE_HIBERNATED_UNBOUND = (
+    "terminalize_hibernated_unbound_metadata"
+)
 #: Open issue with a live managed pair: the lane is working. Route the next action to it.
 CONVERGE_RESUME = "resume"
 #: Open issue, no live agent: record the desired hibernated state so capacity accounting
@@ -97,11 +107,13 @@ CONVERGENCES = frozenset(
     {
         CONVERGE_UNKNOWN,
         CONVERGE_ALREADY_TERMINAL,
+        CONVERGE_ALREADY_HIBERNATED,
         CONVERGE_GUARDED_CLOSE,
         CONVERGE_CLOSE_RESIDUE,
         CONVERGE_RESTORE_WORKTREE,
         CONVERGE_TERMINALIZE_BOUND,
         CONVERGE_TERMINALIZE_UNBOUND,
+        CONVERGE_TERMINALIZE_HIBERNATED_UNBOUND,
         CONVERGE_RESUME,
         CONVERGE_HIBERNATE,
         CONVERGE_SUPERSEDE,
@@ -128,8 +140,17 @@ REASON_SUPERSEDED_ROW = "superseded_row"
 #: A release generation is open (``requested`` / ``partial``), so liveness reads may be
 #: observing a mid-actuation state.
 REASON_RELEASE_IN_FLIGHT = "release_in_flight"
+#: A process release token outside the lifecycle schema cannot be treated as settled or live.
+REASON_UNKNOWN_PROCESS_RELEASE = "unknown_process_release"
 #: The lane owns no issue, so its Redmine axis is not even askable.
 REASON_LANE_OWNS_NO_ISSUE = "lane_owns_no_issue"
+#: A lifecycle disposition outside the version understood by this planner is never treated
+#: as active or hibernated by default.
+REASON_UNKNOWN_LIFECYCLE_DISPOSITION = "unknown_lifecycle_disposition"
+#: Hibernated terminalization requires the independent durable release witness.
+REASON_HIBERNATED_RELEASE_UNPROVEN = "hibernated_release_unproven"
+#: A hibernated row with a live pair needs the dedicated reconcile path, not active close.
+REASON_HIBERNATED_LIVE_PAIR_PRESENT = "hibernated_live_pair_present"
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +305,7 @@ class RebootLanePlan:
         return self.convergence not in (
             CONVERGE_UNKNOWN,
             CONVERGE_BLOCKED,
+            CONVERGE_ALREADY_HIBERNATED,
             CONVERGE_ALREADY_TERMINAL,
         )
 
@@ -389,7 +411,7 @@ def plan_lane_convergence(facts: RebootLaneFacts) -> RebootLanePlan:
     abandoned. It is deliberately NOT required for ``resume`` / ``hibernate`` /
     ``close_shell_residue``, none of which are terminal.
     """
-    disposition = (facts.lane_disposition or "").strip()
+    disposition = facts.lane_disposition or ""
 
     # 1. Already terminal. Cleanup becomes available here and ONLY here.
     if disposition == DISPOSITION_RETIRED:
@@ -438,13 +460,22 @@ def plan_lane_convergence(facts: RebootLaneFacts) -> RebootLanePlan:
     common = dict(live_slots=live, residue_slots=residue, foreign_slots=foreign)
 
     # 3. A release generation in flight makes every liveness read provisional.
-    if facts.process_release not in (RELEASE_NOT_REQUESTED, RELEASE_RELEASED):
+    if facts.process_release in (RELEASE_REQUESTED, RELEASE_PARTIAL):
         return _blocked(
             facts,
             REASON_RELEASE_IN_FLIGHT,
             f"a process release is in flight (process_release={facts.process_release}); "
             "a liveness read taken now may be observing a mid-actuation state. Let the "
             "release settle, then re-audit",
+            **common,
+        )
+    if facts.process_release not in (RELEASE_NOT_REQUESTED, RELEASE_RELEASED):
+        return _blocked(
+            facts,
+            REASON_UNKNOWN_PROCESS_RELEASE,
+            f"the lifecycle row carries an unknown process_release token "
+            f"{facts.process_release!r}; the planner will not normalize a future or "
+            "malformed release state into settled authority",
             **common,
         )
 
@@ -459,8 +490,45 @@ def plan_lane_convergence(facts: RebootLaneFacts) -> RebootLanePlan:
             **common,
         )
 
-    # 5. Open issue: resume / hibernate / supersede. Never terminal, never workspace-wide.
+    known_dispositions = {
+        DISPOSITION_ACTIVE,
+        DISPOSITION_HIBERNATED,
+        DISPOSITION_RETIRED,
+        DISPOSITION_SUPERSEDED,
+    }
+    if disposition not in known_dispositions:
+        return _blocked(
+            facts,
+            REASON_UNKNOWN_LIFECYCLE_DISPOSITION,
+            f"the lifecycle row carries an unknown disposition {disposition!r}; this "
+            "planner will not normalize a future or malformed state into an existing "
+            "destructive rail",
+            **common,
+        )
+
+    # 5. Open issue: disposition first, then active-only resume/hibernate/supersede.
     if not facts.issue_closed:
+        if disposition == DISPOSITION_HIBERNATED:
+            return RebootLanePlan(
+                workspace_id=facts.workspace_id,
+                lane_id=facts.lane_id,
+                issue_id=facts.issue_id,
+                convergence=CONVERGE_ALREADY_HIBERNATED,
+                detail=(
+                    f"issue #{facts.issue_id} is open and the lane is already hibernated; "
+                    "no lifecycle action is needed. An active successor does not make this "
+                    "hibernated original eligible for the active-only supersede rail"
+                ),
+                **common,
+            )
+        if disposition == DISPOSITION_SUPERSEDED:
+            return _blocked(
+                facts,
+                REASON_SUPERSEDED_ROW,
+                "the row is superseded and can never return to active; it converges only "
+                "to retired, and only once its issue is closed",
+                **common,
+            )
         if facts.peer_active_lanes:
             return RebootLanePlan(
                 workspace_id=facts.workspace_id,
@@ -478,14 +546,6 @@ def plan_lane_convergence(facts: RebootLaneFacts) -> RebootLanePlan:
                     f"{facts.issue_id} --from-lane {facts.lane_id} "
                     "--to-lane <successor> --execute",
                 ),
-                **common,
-            )
-        if disposition == DISPOSITION_SUPERSEDED:
-            return _blocked(
-                facts,
-                REASON_SUPERSEDED_ROW,
-                "the row is superseded and can never return to active; it converges only "
-                "to retired, and only once its issue is closed",
                 **common,
             )
         if live:
@@ -520,8 +580,38 @@ def plan_lane_convergence(facts: RebootLaneFacts) -> RebootLanePlan:
             **common,
         )
 
-    # 6. Closed issue.
+    # 6. Closed issue. Disposition and release authority still precede liveness routing.
+    if disposition == DISPOSITION_SUPERSEDED:
+        return _blocked(
+            facts,
+            REASON_SUPERSEDED_ROW,
+            "the row is superseded; no active- or hibernated-owner terminal rail applies "
+            "to it. Preserve the row until a dedicated superseded-to-retired authority is "
+            "available",
+            **common,
+        )
+    if (
+        disposition == DISPOSITION_HIBERNATED
+        and facts.process_release != RELEASE_RELEASED
+    ):
+        return _blocked(
+            facts,
+            REASON_HIBERNATED_RELEASE_UNPROVEN,
+            "the row is hibernated but its process release is not durably `released`; the "
+            "independent release witness required by the hibernated terminal rails is "
+            "missing, so the planner refuses a terminal action",
+            **common,
+        )
     if live:
+        if disposition == DISPOSITION_HIBERNATED:
+            return _blocked(
+                facts,
+                REASON_HIBERNATED_LIVE_PAIR_PRESENT,
+                "the row is hibernated but a managed pair is live; the active-only guarded "
+                "close is not a valid rail for this state. Reconcile the hibernated/live "
+                "contradiction before terminalization",
+                **common,
+            )
         return RebootLanePlan(
             workspace_id=facts.workspace_id,
             lane_id=facts.lane_id,
@@ -570,25 +660,37 @@ def plan_lane_convergence(facts: RebootLaneFacts) -> RebootLanePlan:
             **common,
         )
     if not facts.is_bound:
-        # The #14456 j#87973 shape: ACTIVE + issue-bound + EMPTY worktree binding +
-        # live-zero. Every pre-#14499 terminal rail refuses it (the ordinary retire needs a
-        # binding to attest, `--retire-active-live-zero` is BOUND-only, and the legacy
-        # migration is hibernated+released-only).
+        hibernated = disposition == DISPOSITION_HIBERNATED
+        retire_flag = (
+            "--retire-hibernated-unbound-live-zero"
+            if hibernated
+            else "--retire-active-unbound-live-zero"
+        )
         return RebootLanePlan(
             workspace_id=facts.workspace_id,
             lane_id=facts.lane_id,
             issue_id=facts.issue_id,
-            convergence=CONVERGE_TERMINALIZE_UNBOUND,
+            convergence=(
+                CONVERGE_TERMINALIZE_HIBERNATED_UNBOUND
+                if hibernated
+                else CONVERGE_TERMINALIZE_UNBOUND
+            ),
             detail=(
                 f"issue #{facts.issue_id} is closed, the lane measures live-zero, and its "
                 "row records NO canonical worktree binding (a pre-#13754 row). No "
                 "worktree can be attested, so the terminal write is fenced on the row's "
                 f"exact generation ({facts.lane_generation}) and revision "
-                f"({facts.revision}) instead. Metadata only"
+                f"({facts.revision}) instead. "
+                + (
+                    "The hibernated/released-specific unbound rail also re-reads the exact "
+                    "closed issue and decision journal. Metadata only"
+                    if hibernated
+                    else "Metadata only"
+                )
             ),
             steps=(
                 f"mozyo-bridge sublane retire --issue {facts.issue_id} "
-                f"--lane-label {facts.lane_id} --retire-active-unbound-live-zero "
+                f"--lane-label {facts.lane_id} {retire_flag} "
                 f"--expect-lane-generation {facts.lane_generation} "
                 f"--expect-lane-revision {facts.revision} ...",
             ),
@@ -648,7 +750,11 @@ def plan_lane_convergence(facts: RebootLaneFacts) -> RebootLanePlan:
             restore_step,
             f"mozyo-bridge sublane retire --issue {facts.issue_id} "
             f"--lane-label {facts.lane_id} --worktree {facts.recorded_worktree} "
-            "--retire-active-live-zero ...",
+            + (
+                "--retire-hibernated-bound ..."
+                if disposition == DISPOSITION_HIBERNATED
+                else "--retire-active-live-zero ..."
+            ),
         ),
         **common,
     )
@@ -694,6 +800,7 @@ def summarize_convergences(plans: Sequence[RebootLanePlan]) -> dict:
 
 __all__ = (
     "CONVERGENCES",
+    "CONVERGE_ALREADY_HIBERNATED",
     "CONVERGE_ALREADY_TERMINAL",
     "CONVERGE_BLOCKED",
     "CONVERGE_CLOSE_RESIDUE",
@@ -703,15 +810,20 @@ __all__ = (
     "CONVERGE_RESUME",
     "CONVERGE_SUPERSEDE",
     "CONVERGE_TERMINALIZE_BOUND",
+    "CONVERGE_TERMINALIZE_HIBERNATED_UNBOUND",
     "CONVERGE_TERMINALIZE_UNBOUND",
     "CONVERGE_UNKNOWN",
     "REASON_FOREIGN_OCCUPANT",
     "REASON_HEAD_NOT_INTEGRATED",
+    "REASON_HIBERNATED_LIVE_PAIR_PRESENT",
+    "REASON_HIBERNATED_RELEASE_UNPROVEN",
     "REASON_INVENTORY_UNREADABLE",
     "REASON_ISSUE_STATE_UNREADABLE",
     "REASON_LANE_OWNS_NO_ISSUE",
     "REASON_RELEASE_IN_FLIGHT",
     "REASON_SUPERSEDED_ROW",
+    "REASON_UNKNOWN_LIFECYCLE_DISPOSITION",
+    "REASON_UNKNOWN_PROCESS_RELEASE",
     "REASON_WORKTREE_PRESENCE_UNKNOWN",
     "RebootLaneFacts",
     "RebootLanePlan",

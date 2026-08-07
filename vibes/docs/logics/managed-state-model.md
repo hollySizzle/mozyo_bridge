@@ -900,11 +900,12 @@ Table naming:
       new pair を起動して再退役するのは不要な actuation ゆえ採らず、この surface は該当 row を
       **直接** #13689 terminal `retired` disposition へ 1 本の bounded CAS で移す — **metadata only**、
       process launch/close/resume も worktree/branch 削除も伴わない。書込は「row 存在 かつ exact
-      `expected_revision` 一致」かつ「`hibernated` / `binding_kind='issue'` / この exact issue 所有 /
+      `expected_generation` と `expected_revision` の両方が一致」かつ「`hibernated` /
+      `binding_kind='issue'` / この exact issue 所有 /
       project scope 無し / `worktree_identity` **空**」かつ「process release が durable に `released`
       (unproven / in-flight は fail-closed) / replacement settled」の全成立時のみ。それ以外の shape
       (active/superseded/retired、別 issue、**non-empty (既 #13754-bound) worktree**、release 未証明、
-      revision race、row 不在) は zero-write。`transition_disposition` の generic edge を使わない理由は、
+      generation/revision race、row 不在) は zero-write。`transition_disposition` の generic edge を使わない理由は、
       release proof と empty-worktree signature が **guard の一部**であって caller の promise ではないため。
       `released` は「release command 完了」であって slots 消滅の証明ではない (`### 正本境界`) ので、
       public high-level path (`sublane retire --migrate-hibernated-legacy`) は durable proof を
@@ -935,6 +936,16 @@ Table naming:
       unit scope(別 lane occupant / default-lane coordinator pair は foreign 扱いしない)。idempotent replay も
       同 gate を通過してから success(persisted `retired` + foreign 稼働 → success withhold)。#13842 reconcile /
       #13845 bound-retire / #13754 guarded close は非退行。
+    - **hibernated unbound live-zero terminal retire**
+      (`sublane retire --retire-hibernated-unbound-live-zero`, #14716)。`sublane reboot-audit` が
+      `hibernated` / `released` / issue-bound / worktree binding 空 / issue closed の行を見つけた場合、
+      missing checkoutを復元せず、上記migration CASへ到達できる専用public railを提示する。action時に
+      canonical repoからworkspaceを解決し、lane metadata branch、integration、freshな単一Redmine issue
+      snapshot内のexact closed issue+journal、exclusive launch lock、exact generation+revision、settled
+      replacement、live-zeroを連言検証する。任意の`--worktree`は一致しない入力を拒否するためだけに使い、
+      authorityには昇格させない。成功時の変更はlifecycle metadataのterminal dispositionだけで、process、
+      checkout、worktree、branch、commitを作成・復元・削除しない。open issue、unknown/padded state、
+      release未証明、bound row、identity/integration/state race、Redmineまたはinventory不読はzero-write。
     - **hibernated live-contradiction reconcile (retire-first)** (`LaneReconcileBindingStore.retire_reconciled_hibernated_legacy`,
       #13842、live evidence #13756 j#79188)。#13841 migration が **拒否**する側の隙間: **hibernated / released
       legacy** row（`worktree_identity` 空）だが action-time Herdr inventory に exact managed pair が **live** で

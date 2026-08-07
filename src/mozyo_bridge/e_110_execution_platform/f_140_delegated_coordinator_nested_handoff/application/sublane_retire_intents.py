@@ -1,12 +1,12 @@
-"""Retire-intent dispatch: which of the six retire intents runs, and with what probes.
+"""Retire-intent dispatch: which of the seven retire intents runs, and with what probes.
 
 Extracted from ``cmd_sublane_retire`` (Redmine #14499). The command module sat just under the
 module-health threshold, so the sixth intent (``--retire-active-unbound-live-zero``) pushed it
 over; the gate's remedy is to reduce, and the dispatch's home is the retire feature. This is a
 pure relocation of the existing chain — every branch, guard, probe and ordering is byte-for-byte
-what ``cmd_sublane_retire`` ran, plus the new sixth branch.
+what ``cmd_sublane_retire`` ran, plus the later sixth and seventh branches.
 
-The six intents are mutually exclusive (the caller rejects any combination up front, before this
+The seven intents are mutually exclusive (the caller rejects any combination up front, before this
 runs), and each runs ONLY when the fail-closed preflight already permits retirement. The
 patch-equivalent resolver is imported and called only when the literal ancestry probe did not
 pass, so a literal-ancestor lane performs no extra Redmine read or git probe (#14066 review
@@ -31,6 +31,7 @@ class RetireIntentResults:
     bound_retire_result: Optional[object] = None
     active_retire_result: Optional[object] = None
     unbound_retire_result: Optional[object] = None
+    hibernated_unbound_retire_result: Optional[object] = None
 
     @property
     def actuated(self) -> Optional[object]:
@@ -42,6 +43,7 @@ class RetireIntentResults:
             self.bound_retire_result,
             self.active_retire_result,
             self.unbound_retire_result,
+            self.hibernated_unbound_retire_result,
         ):
             if value is not None:
                 return value
@@ -88,6 +90,7 @@ def dispatch_retire_intent(
     bound_retire_result = None
     active_retire_result = None
     unbound_retire_result = None
+    hibernated_unbound_retire_result = None
     if getattr(args, "migrate_hibernated_legacy", False):
         if may_retire:
             from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_legacy_retire import (  # noqa: E501
@@ -247,6 +250,35 @@ def dispatch_retire_intent(
                 head_integrated=head_integrated,
                 patch_equivalent=patch_equivalent,
             )
+    elif getattr(args, "retire_hibernated_unbound_live_zero", False):
+        # Redmine #14716: HIBERNATED + RELEASED sibling of the active-unbound rail. It
+        # retains a distinct state signature and CAS while sharing only the branch/inventory
+        # measurements. No checkout is required or restored.
+        if may_retire:
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_unbound_live_zero_retire import (  # noqa: E501
+                run_hibernated_unbound_live_zero_retire,
+            )
+
+            ops = LiveSublaneLifecycleOps(repo_root=repo_root)
+            head_integrated = ops.branch_integrated(
+                getattr(args, "branch", None) or "",
+                getattr(args, "integration_branch", None) or "",
+            )
+            patch_equivalent = None
+            if head_integrated is not True:
+                from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_patch_equivalent_integration import (  # noqa: E501
+                    resolve_patch_equivalent_integration,
+                )
+
+                patch_equivalent = resolve_patch_equivalent_integration(args, repo_root)
+            hibernated_unbound_retire_result = (
+                run_hibernated_unbound_live_zero_retire(
+                    args,
+                    repo_root,
+                    head_integrated=head_integrated,
+                    patch_equivalent=patch_equivalent,
+                )
+            )
     elif getattr(args, "execute", False) and may_retire:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_retire_actuation import (  # noqa: E501
             run_guarded_retire_close,
@@ -263,6 +295,7 @@ def dispatch_retire_intent(
         bound_retire_result=bound_retire_result,
         active_retire_result=active_retire_result,
         unbound_retire_result=unbound_retire_result,
+        hibernated_unbound_retire_result=hibernated_unbound_retire_result,
     )
 
 

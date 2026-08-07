@@ -1379,6 +1379,7 @@ class ComposingStoreMigrationSurfaceTest(unittest.TestCase):
         store.retire_released_hibernated_legacy(
             LaneLifecycleKey(WS, LANE),
             expected_revision=1,
+            expected_generation=1,
             issue_id=ISSUE,
             decision=_issue_decision(),
         )

@@ -86,6 +86,7 @@ class LaneRetireMigrationStore:
         key: LaneLifecycleKey,
         *,
         expected_revision: int,
+        expected_generation: int,
         issue_id: str,
         decision: DecisionPointer,
         now: Optional[str] = None,
@@ -97,9 +98,10 @@ class LaneRetireMigrationStore:
         pair, an unproven release, a non-empty (already #13754-bound) worktree, a different
         issue / binding, or a concurrent write never migrates:
 
-        - the row exists (:data:`CAS_NOT_FOUND`) and its ``expected_revision`` still matches
-          (:data:`CAS_STALE_REVISION` — a concurrent declare / transition that moved the row
-          loses rather than clobbering the newer state);
+        - the row exists (:data:`CAS_NOT_FOUND`) and its ``expected_revision`` **and**
+          ``expected_generation`` still match (:data:`CAS_STALE_REVISION` — a concurrent
+          declare / transition or a newer lane incarnation loses rather than clobbering the
+          newer state);
         - it is ``hibernated`` (an ``active`` lane still holds its work; a ``superseded`` /
           already ``retired`` row is not this migration's target), is an ``issue`` binding,
           owns **this exact** issue, and owns no project scope
@@ -136,6 +138,11 @@ class LaneRetireMigrationStore:
                 "a hibernated legacy retire migration requires the exact issue the row "
                 "must already own"
             )
+        if expected_generation < 1:
+            raise ValueError(
+                "a hibernated legacy retire migration requires the positive lane generation "
+                "the caller measured before the live-zero read"
+            )
         if not decision.authorizes_binding(issue):
             raise DecisionPointerError(
                 f"decision is anchored to issue {decision.issue_id!r} but the migration "
@@ -149,7 +156,10 @@ class LaneRetireMigrationStore:
             if current is None:
                 conn.execute("ROLLBACK")
                 return CasOutcome(applied=False, reason=CAS_NOT_FOUND)
-            if current.revision != expected_revision:
+            if (
+                current.revision != expected_revision
+                or current.lane_generation != expected_generation
+            ):
                 conn.execute("ROLLBACK")
                 return CasOutcome(
                     applied=False, reason=CAS_STALE_REVISION, revision=current.revision
@@ -202,7 +212,8 @@ class LaneRetireMigrationStore:
                 f"UPDATE {_TABLE} SET lane_disposition = ?, revision = ?, "
                 "decision_source = ?, decision_issue_id = ?, decision_journal = ?, "
                 "updated_at = ? "
-                "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ?",
+                "WHERE repo_workspace_id = ? AND lane_id = ? "
+                "AND lane_generation = ? AND revision = ?",
                 (
                     DISPOSITION_RETIRED,
                     revision,
@@ -212,6 +223,7 @@ class LaneRetireMigrationStore:
                     stamp,
                     key.repo_workspace_id,
                     key.lane_id,
+                    current.lane_generation,
                     current.revision,
                 ),
             )

@@ -256,7 +256,7 @@ def run_active_unbound_live_zero_retire(
     # to empty, which would normally disqualify it as an authority. It is sound here because
     # it is used ONLY to REFUSE: an unreadable/absent/empty record blocks, and a mismatch
     # blocks. A fail-open read used to narrow can never widen what is permitted.
-    branch_ok, branch_detail = _verify_branch_binds_to_lane(
+    branch_ok, branch_detail = verify_branch_binds_to_lane(
         args, workspace_id=workspace_id, lane_label=lane_label
     )
     if not branch_ok:
@@ -350,7 +350,7 @@ def run_active_unbound_live_zero_retire(
         )
 
 
-def _verify_branch_binds_to_lane(
+def verify_branch_binds_to_lane(
     args: argparse.Namespace, *, workspace_id: str, lane_label: str
 ) -> tuple[bool, str]:
     """Is ``--branch`` the branch this lane's durable metadata records? (#14499 finding 2)
@@ -411,6 +411,11 @@ def _verify_branch_binds_to_lane(
             "head-integration evidence would describe a different branch's history"
         )
     return True, ""
+
+
+# Private compatibility name retained for existing callers while the hibernated-unbound
+# sibling adopts the public helper. Both names execute the same refusal-only check.
+_verify_branch_binds_to_lane = verify_branch_binds_to_lane
 
 
 def _terminalize_under_exclusion(
@@ -735,4 +740,5 @@ __all__ = (
     "ActiveUnboundLiveZeroRetireVerdict",
     "format_unbound_retire_text",
     "run_active_unbound_live_zero_retire",
+    "verify_branch_binds_to_lane",
 )
