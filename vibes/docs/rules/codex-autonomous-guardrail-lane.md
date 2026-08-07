@@ -31,6 +31,15 @@ preset が listing する **lane 不可** path を本 project でも継続して
 
 これらに変更が必要な場合は `codex_direct_edit` gate (Codex が直接編集する場合) または Claude handoff (default) を使う。
 
+### 本 lane と混同しない別 carve-out
+
+`.mozyo-bridge/config.yaml`、`.mozyo-bridge/project-defaults.yaml`、`.mozyo-bridge/workflow-role-bindings.json` は **本 lane の path ではない**。preset の 2 つめの carve-out `### Coordinator-Owned Operational Config Direct Edit` (完全一致 allowlist) が所有する。どちらも事前 gate journal を不要にするため混同しやすいが、要求される記録と検証が違う。
+
+- 本 lane: `codex_autonomous_edit` journal + `docs validate` 系の共通検証。
+- operational config carve-out: `coordinator_operational_config_edit` journal + **path 固有**検証 (config parse/status、workspace-defaults renderer check、role-authority readback)。
+
+operational config の edit を `codex_autonomous_edit` journal で代替しない (path 固有検証が落ちる)。本 repo での採用記録は `vibes/docs/rules/agent-workflow.md` `## Policy / Skill Authoring Boundary` を読む (Redmine #15095)。
+
 ## Guardrail Health Check Scope
 
 guardrail health check は lane の編集可否確認ではなく、guardrail とその配布 mirror / 隣接 spec が矛盾していないかを読む点検である。したがって、health check の読取対象は editable lane scope より広く取る。

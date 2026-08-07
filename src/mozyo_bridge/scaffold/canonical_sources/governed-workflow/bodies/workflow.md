@@ -172,6 +172,19 @@ repo_local_guardrail_lane:
     target project の Project-Local Additions または project-local rule で patterns を
     拡張または縮小してよいが、distributed surface (`AGENTS.md` / `CLAUDE.md` /
     `.mozyo-bridge/rules/**` / skills / plugins / scaffold preset templates / {{DISTRIBUTED_SURFACE_SHORT}}) を本 lane に含めない。詳細は Repo-Local Guardrail Autonomous Lane を読む。
+coordinator_operational_config:
+  patterns:
+    - .mozyo-bridge/config.yaml
+    - .mozyo-bridge/project-defaults.yaml
+    - .mozyo-bridge/workflow-role-bindings.json
+  一致方式: 完全一致 (exact match)。glob へ展開しない。上記以外の
+    `.mozyo-bridge/` 配下 path は同 directory でも本 carve-out の対象外。
+  既定編集者: coordinator role (反復事前承認なしで直接編集可)
+  codex編集条件: `codex_direct_edit` gate journal は不要。代わりに edit と同時または
+    commit 直後に active issue へ `coordinator_operational_config_edit` journal を残し、
+    commit 前に path 固有検証を通す。carve-out するのは反復事前承認だけで、active issue /
+    差分確認 / path 固有検証 / commit / journal 記録は維持する。詳細は
+    Coordinator-Owned Operational Config Direct Edit を読む。
 generated物:
   patterns:
     - .mozyo-bridge/docs/file_conventions.generated.yaml
@@ -494,6 +507,8 @@ origin到達可能性:
 
 ただし `### Repo-Local Guardrail Autonomous Lane` で定義する path 集合 (default では `vibes/docs/rules/**` / `vibes/docs/logics/**` / `vibes/docs/specs/**` / `.mozyo-bridge/docs/catalog.yaml`) は本 gate の例外として **Codex 自律編集を許可する carve-out** である。`codex_direct_edit` gate journal は不要。代わりに `codex_autonomous_edit` journal を edit と同時または commit 直後に残す。distributed surface (上述の `AGENTS.md` 等) は引き続き本 gate の対象。
 
+2 つめの carve-out は `### Coordinator-Owned Operational Config Direct Edit` が定義する **完全一致 allowlist** (`.mozyo-bridge/config.yaml` / `.mozyo-bridge/project-defaults.yaml` / `.mozyo-bridge/workflow-role-bindings.json`) である。coordinator 責務に属する repo-local 運用設定で、こちらも `codex_direct_edit` gate journal を不要にする。ただし carve-out するのは **反復事前承認だけ** であり、active issue、変更前の差分確認、path 固有検証、commit、`coordinator_operational_config_edit` journal は維持する。allowlist は完全一致で読み、`.mozyo-bridge/**` へ展開しない。allowlist 外の `.mozyo-bridge/` 配下 path (`rules/**`、生成物、managed identity / state、DB、secret 保持 file、未登録の新規 file) は引き続き本 gate の対象。
+
 `.mozyo-bridge/docs/file_conventions.generated.yaml` をはじめとする generator 出力は **誰も手編集しない** (Claude / Codex / owner いずれも不可)。catalog を変更し、`mozyo-bridge docs generate-file-conventions` で再生成、`--check` で drift 確認の流れに乗せる。手編集された場合は generated 物を破棄し、catalog 起点で再生成する。
 
 direct edit を行った場合、適用した例外、ユーザー指示の引用、変更 files、verification、follow-up review 要否を Redmine journal に記録する。例外なき監査者の通常実装 (`着手:codex` / `実装完了:codex` / `担当:codex` / `codex対応`) は invalid marker として扱い、reopen + correction journal を起票する。ガードレール / docs / catalog scope での gate 不在 commit (例: chat の短い指示を根拠に Codex が `AGENTS.md` / `CLAUDE.md` / `.mozyo-bridge/rules/**` / `README.md` を直接 commit した場合) も同じ correction flow に乗せる。autonomous lane の path はこの correction の対象外だが、`codex_autonomous_edit` journal を欠いた commit は監査記録不足として follow-up correction journal を起票する。
@@ -536,6 +551,7 @@ target project は Project-Local Additions または project-local rule (例: `v
 - {{LANE_DISTRIBUTED_SURFACE_FULL}} (implementation lane)
 - `src/mozyo_bridge/scaffold/presets/**` (packaged preset / router templates)
 - generator 出力 (`.mozyo-bridge/docs/file_conventions.generated.yaml` 等)
+- `.mozyo-bridge/config.yaml`, `.mozyo-bridge/project-defaults.yaml`, `.mozyo-bridge/workflow-role-bindings.json` (別 carve-out `### Coordinator-Owned Operational Config Direct Edit` が所有する。本 lane の `codex_autonomous_edit` journal で代替せず、同節の path 固有検証と `coordinator_operational_config_edit` journal を使う)
 
 これらを lane に含める project-local override は preset 提供責任の範囲外として **明確に reject** する (target project は本 preset の `### Codex Direct Edit Gate` をそのまま適用する)。
 
@@ -591,6 +607,89 @@ drift が出たら `mozyo-bridge docs generate-file-conventions --repo .` で re
 - 検証 task は本 lane を直接変更しない通常開発タスクとする。
 - 検証 task では Claude が実装し、Codex は lane を実際に 1 回以上利用して repo-local guardrail を更新する。`codex_autonomous_edit` journal が破綻なく回ることを durable record として残す。
 - 結果を Redmine issue に記録する。lane policy 自身に gap が見つかれば follow-up issue を起票する。
+
+### Coordinator-Owned Operational Config Direct Edit
+
+repo-local の運用設定 — どの provider がどの role を担うか、どの branch へ統合するか、pane をどう並べるか — は coordinator 責務そのものである。bootstrap や配置変更のたびに 1 file ずつ `codex_direct_edit` gate の事前承認を取り直す運用は、承認の量に見合う安全を生まず作業を止める。本 preset は **Codex Direct Edit Gate の 2 つめの carve-out** として、下記 **完全一致 allowlist** の repo-local operational config を coordinator role が反復事前承認なしで直接編集できるものとする。
+
+carve-out するのは **反復事前承認だけ** である。active issue、変更前の差分確認、path 固有検証、commit、journal 記録は従来どおり必須で、一つでも欠けたら本 carve-out は成立しない。
+
+#### 完全一致 allowlist
+
+```yaml
+coordinator_operational_config_allowlist:
+  - .mozyo-bridge/config.yaml
+  - .mozyo-bridge/project-defaults.yaml
+  - .mozyo-bridge/workflow-role-bindings.json
+```
+
+allowlist は **完全一致 (exact match)** で読む。`.mozyo-bridge/**` のような glob へ展開しない。上記 3 file 以外の path は、同じ directory 配下であっても本 carve-out の対象外である。
+
+`.mozyo-bridge/workspace-defaults.yaml` は `project-defaults.yaml` の legacy read-only 互換名であり、本 carve-out の新規直接編集対象にしない。legacy 名側の内容を変える必要が生じた場合は、legacy file を直接編集せず `project-defaults.yaml` へ移行してから編集する。
+
+#### 対象外 (本 carve-out へ拡張しない)
+
+- `.mozyo-bridge/rules/**` (配布 governance package artifact)
+- `.mozyo-bridge/docs/**` (既存の `.mozyo-bridge/docs/catalog.yaml` carve-out は `### Repo-Local Guardrail Autonomous Lane` の枠で維持し、本 carve-out へ移さない)
+- `.mozyo-bridge/scaffold.json`、ticket-system defaults doc、`.mozyo-bridge/tmux/**` 等の scaffold 生成物
+- `.mozyo-bridge/workspace-anchor.json` / `.mozyo-bridge/workspace.json` 等の managed identity / state
+- 名前に `generated` を含む file、DB / SQLite file、credential / secret / token / key を保持する file
+- `.mozyo-bridge/` 配下に将来追加される **未登録 file** (本 allowlist へ明示追加する変更が済むまで対象外。既定は deny)
+- {{LANE_DISTRIBUTED_SURFACE_FULL}}、skill / plugin / preset の配布実装
+
+未登録 file の既定を deny にするのは、allowlist の意味を「この 3 file について owner が承認済み」に固定するためである。同じ directory に置かれたことは承認の根拠にならない。
+
+#### 必須 path 固有検証
+
+allowlist 内 edit では **commit 前** に対象 path ごとの fail-closed 検証を実行し、結果を journal の `verification` に残す。いずれかが fail した場合は commit せず、`verification_failed` を記録して Claude / owner へ escalate する。
+
+```yaml
+.mozyo-bridge/config.yaml:
+  - mozyo-bridge config check-parse --file <repo>/.mozyo-bridge/config.yaml   # closed schema parse
+  - mozyo-bridge config status --repo .                                       # schema version / deprecation
+.mozyo-bridge/project-defaults.yaml:
+  - mozyo-bridge workspace-defaults --check --repo .                          # renderer drift check
+.mozyo-bridge/workflow-role-bindings.json:
+  - mozyo-bridge workflow role-authority --json                               # authority readback
+共通:
+  - git diff --check
+```
+
+#### 役割設定 (`workflow-role-bindings.json`) の追加条件
+
+`workflow-role-bindings.json` は routing authority を持つため、上記に加えて次を必須とする。一つでも満たせない場合は本 carve-out を使わず、`codex_direct_edit` gate または owner 判断へ escalate する。
+
+- active issue と変更理由を durable record に書く。
+- 各 binding に durable な `source_pointer` を付ける。pointer なしの binding を残さない。
+- closed schema validation を通す (schema / version / role token が closed 語彙に収まること)。unparseable な declaration は fail-closed であり、部分適用しない。
+- `mozyo-bridge workflow role-authority --json` の readback で、書いた declaration がその通り読み戻せることを確認する。書けたことは読めることの証明ではない。
+- live role を変える場合、**既存 process へ遡及適用しない**。適用は owner 承認済みの再起動境界でのみ行い、その境界 (どの process をいつ再起動するか、承認の anchor) を durable record に書く。再起動境界を決めずに live role を書き換えない。
+
+#### `coordinator_operational_config_edit` Journal
+
+allowlist 内で編集した場合、active Redmine issue に以下を記録する。pre-approval は不要 (post-or-concurrent 記録で足りる)。
+
+```yaml
+coordinator_operational_config_edit:
+  actor: coordinator
+  必須:
+    - allowlist_paths (完全一致 allowlist のどれを触ったか)
+    - intent (何を変えたか、なぜ coordinator 責務か)
+    - diff_confirmed: true (commit 前に差分を読んだこと)
+    - verification (上記 path 固有検証の実行結果)
+    - commit_hash (commit 後; staging で止めた場合は pending: staged-not-committed)
+    - role_binding_conditions: n/a | (source_pointer / closed_schema / readback / restart_boundary の充足内容)
+```
+
+journal を欠いた allowlist 内 commit は監査記録不足として correction journal を起票する。
+
+#### 本 carve-out が緩めないもの
+
+- 本 carve-out は **編集権限** の carve-out であって review exemption ではない。`### Codex Direct Edit Gate` の `follow_up_review: false` による review exemption は `codex_direct_edit` gate journal に紐づく判断であり、`coordinator_operational_config_edit` journal はそれを代替しない。review 要否は従来の規約どおりに決める。
+- allowlist file の編集ついでに allowlist 外 path を触る必要が生じた場合、その変更は本 carve-out の外である。Claude handoff または `codex_direct_edit` gate へ escalate し、allowlist file だけを本 carve-out で先行 commit しない (片方だけ land して整合が壊れる)。
+- credential / token / 個人情報を allowlist file へ書かない。設定値が秘密を要する場合は承認済みの秘密管理経路を使い、config には参照だけを置く。
+- `#### lane を起動しない条件` の escalate 条件 (owner 指示との矛盾、同一 issue で同じ path について `要修正` / `block` review を受けている) は本 carve-out にも同じく適用する。
+- 本 allowlist 自体の変更は運用設定ではなく guardrail 変更である。本 carve-out では行わず、通常の実装 → US-level audit 経路を通す。
 
 ### Owner Close Approval Delegation
 
@@ -677,6 +776,15 @@ if ($対象pathが分かる()) then (yes)
   $解決docs本文を読む()
 endif
 if ($agentがcodex()) then (yes)
+  if ($対象がoperational_config_allowlist完全一致()) then (yes)
+    $commit前に差分を確認()
+    $path固有検証を実行(config_parse, workspace_defaults_check, role_authority_readback)
+    if ($path固有検証がfail()) then (yes)
+      $verification_failedを記録()
+      stop
+    endif
+    $coordinator_operational_config_editを記録()
+  endif
   if ($対象が実装ファイル()) then (yes)
     if ($gate有効("codex_direct_edit")) then (yes)
       $allowed_pathsだけ編集()
@@ -792,6 +900,18 @@ stop
   - id: notify_without_redmine_gate
     条件: [handoff_or_review_notification:requested, journal_gate:missing]
     action: gate作成または作成依頼を先に行う
+  - id: operational_config_carve_out_widened_beyond_exact_allowlist
+    条件: [carve_out:coordinator_operational_config, 対象path:完全一致allowlist外]
+    action: 直接編集禁止 (glob へ展開しない); Claude handoff または codex_direct_edit gate へ escalate
+  - id: role_binding_edit_without_authority_readback
+    条件: [changed_path:.mozyo-bridge/workflow-role-bindings.json, 次のいずれか欠落:[source_pointer, closed_schema_validation, role_authority_readback]]
+    action: commit禁止 (欠落条件を満たすか codex_direct_edit gate へ escalate)
+  - id: live_role_change_applied_retroactively
+    条件: [changed_path:.mozyo-bridge/workflow-role-bindings.json, live_role:変更あり, owner承認済み再起動境界:missing]
+    action: 既存processへの遡及適用禁止 (再起動境界をowner承認付きでdurable記録するのが先)
+  - id: operational_config_commit_without_journal
+    条件: [carve_out:coordinator_operational_config, commit:present, coordinator_operational_config_edit_journal:missing]
+    action: 監査記録不足としてcorrection journalを起票
   - id: use_retired_transport
     条件: [transport: .agent_handoff/tasks.yaml or read-next --wait or Stop hook]
     action: 拒否してRedmine journalを使う
@@ -891,6 +1011,15 @@ durable gate journal の heading は canonical literal `## Gate: <gate>` に固�
 - allowed_paths:
 - reason:
 - follow_up_review: false (既定) | true (owner が独立 review を明示要求した場合。reviewer / 理由を併記)
+
+## Gate: coordinator_operational_config_edit
+- actor: coordinator
+- allowlist_paths: (完全一致 allowlist のどれを触ったか)
+- intent:
+- diff_confirmed: true
+- verification: (path 固有検証の実行結果。fail したら commit せず verification_failed)
+- commit_hash: (commit 後; staging で止めた場合は pending: staged-not-committed)
+- role_binding_conditions: n/a | (source_pointer / closed_schema / readback / restart_boundary)
 
 ## Gate: review_request (US-level audit request; Task-level は例外時のみ)
 - 対象US: #<us_id>
