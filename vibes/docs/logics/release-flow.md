@@ -338,19 +338,7 @@ entry は「何が変わったか」「adopter は何もしないとどうなる
 
 ### 未反映 entry
 
-- **`lane_placement` 未設定時の pair 配置が左右 → 上下になった (Redmine #14568)**
-  - 変更: `lane_placement` を宣言していない workspace でも、coordinator pair と sublane の
-    gateway/worker pair が `--split down` で縦に並ぶ。coordinator pair の launch 順は
-    `[codex, claude]` に固定され、codex が上段になる (sublane は role binding の
-    `(gateway, worker)` 順を尊重するため、既定 binding では gateway = codex が上段)。
-    #13646 が固定した「未設定は byte 一致」は意図的に置換された。
-  - 何もしない場合: **既存の live pair は動かない**。次の fresh launch / heal から縦になる。
-    live pane の move / swap / kill は一切行わない。
-  - 戻し方: `.mozyo-bridge/config.yaml` に `lane_placement.default.split: right` (coordinator pair) /
-    `lane_placement.sublane.split: right` (全 sublane) / `lane_placement.by_lane_kind.<kind>.split: right`
-    (特定 lane role のみ) を明示宣言する。`mozyo-bridge config status` の
-    `lane_placement.<class>.split` row で effective 値と `declared` / `default` の別を確認できる。
-  - 詳細: [[spec-herdr-native-identity]] §5.1 Product default。
+- なし。
 
 ## Tag and Release
 

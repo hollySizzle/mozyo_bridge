@@ -4,6 +4,39 @@
 
 記載は Git の release commit と利用可能な tag を元にしています。一部の過去バージョンは release commit はありますが、現在の repository には対応する tag がありません。
 
+## v0.17.0 - 2026-08-07
+
+`v0.16.0` からの後方互換な minor release です。共有画面で複数project coordinatorを運用する際の配置を安定させ、テスト実行を通常の利用環境から隔離する正式な入口を追加しました。また、終了済みサブレーンを安全条件に従って自動退役へ進めることで、長時間運用後に残るprocessとlifecycle状態を減らします。
+
+### project coordinator共有画面の安定化
+
+- 共有画面へproject coordinator pairを追加するとき、projectごとに独立した列を割り当て、再実行時にも同じ列構成を保つようにしました。
+- 既存paneのidentity、role、workspace、形状、起動結果を移動前後に検証します。欠落・矛盾・別projectのpane・不完全な起動は推測で補わず、変更前に拒否します。
+
+### テスト実行環境の隔離
+
+- 登録済みテストコマンドを実行する正式な入口として `mozyo-bridge tests run` を追加しました。
+- 各実行はprocess単位の一時homeと書込み境界を使い、通常の `MOZYO_BRIDGE_HOME`、workspace registry、Git設定へ試験副作用を残さないようにしました。境界を証明できない環境ではテストを開始せず拒否します。
+- GitHub Actionsでは影響範囲を絞った通常検査と、単一Pythonでの全件検査、Python 3.10–3.13の明示的なfull matrixを分離しました。
+
+### 終了済みサブレーンの退役
+
+- linked worktree内からの退役で対象worktreeを誤判定する問題を修正しました。
+- hibernate済みでlive processとのbindingが無いlaneを、durableなissue・journal・世代・release証明に基づいて安全にterminal化できるようにしました。Herdr管理外、未知状態、古い世代、証明不一致では変更しません。
+- workspace supervisorがcallback処理後に終了済み候補を1件だけ選び、同じleaseと1回1変更の上限を守って既存の退役処理を呼べるようにしました。候補生成時と実行直前の状態が完全一致しない場合は何も変更しません。
+- Git worktreeとlocal branchの物理削除は、検査後の差し替えを単一操作で防ぐ仕組みがないため自動化していません。clean確認後の通常操作をrunbookに残し、forceとremote branch削除は禁止しています。
+
+### リリース検査の強化
+
+- release helperがsource snapshot、配布物、workflow定義、version、commitを公開直前に再照合し、symlink経由のroot外参照、空の置換directory、検査後のsource差し替えを拒否するようにしました。
+- TestPyPIとProduction PyPIはOIDC Trusted Publishingだけを使用し、候補commit・version・refを完全指定して検証します。
+
+### リリース状況メモ
+
+- **version mirror**: 本ノートとは別のstandalone commitで `pyproject.toml` とruntime `__version__` を `0.17.0` に揃えます。
+- **互換性**: user-facing CLIの意図的な削除はありません。追加機能を含むためpatchではなくminor versionとします。
+- **公開gate**: 最終candidateのmain CI、Python 3.10–3.13 full matrix、release tree / scaffold / artifact / drift検査、TestPyPI完全指定版の新規installを通した後、annotated tagとGitHub ReleaseからProduction PyPIへ公開します。
+
 ## v0.16.0 - 2026-08-05
 
 `v0.15.1` からの後方互換な minor release です。トップコーディネーターを専用画面に保ちつつ、複数projectのproject coordinatorを1つの共有画面へ集約できる配置modeを追加しました。実装レーンは従来どおりproject別の画面に残るため、全レーンを1画面へ混在させずに、トップ層とproject管理層をそれぞれ俯瞰できます。
@@ -14,6 +47,12 @@
 - implementation laneはproject別のsublane hostとlane tabを維持します。role routing、review authority、durable stateの正本は変更しません。
 - top IDの欠落、workspace registryとの不一致、lane kindの欠落・矛盾、共有画面のlabel衝突など、配置を一意に証明できない状態は起動前に拒否します。誤った画面へ推測配置しません。
 - 設定はfresh launch / adopt時にだけ適用され、既存のlive paneを自動移動・削除しません。未設定時は従来の `per_project_space` が既定です。元へ戻す場合も `per_project_space` へ戻したうえでfresh起動します。
+
+### 未指定時のpane pair配置
+
+- `lane_placement` を宣言していないworkspaceでは、coordinator pairとsublaneのgateway/worker pairを左右ではなく上下に配置する既定へ変更しました。coordinator pairはCodexを上段、Claudeを下段に起動し、sublaneはrole bindingのgateway/worker順を保ちます。
+- 既存のlive paneは移動・入替・終了しません。変更は次のfresh launchまたはhealから反映されます。
+- 左右配置へ戻す場合は `.mozyo-bridge/config.yaml` の `lane_placement.default.split` または対象classの `split` を `right` と明示します。実効値と宣言有無は `mozyo-bridge config status` で確認できます。
 
 ### TestPyPI固定版確認の安定化
 

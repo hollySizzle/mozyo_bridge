@@ -72,6 +72,7 @@ _WORKSPACE = "wIssue14716"
 _LANE = "issue_13822_startup_admission_r3"
 _ISSUE = "13822"
 _JOURNAL = "100001"
+_FAKE_API_KEY = "fake-api-key"
 
 
 def _decision() -> DecisionPointer:
@@ -103,7 +104,7 @@ class _FakeTransport:
 def _source_for(transport: _FakeTransport):
     return SimpleNamespace(
         base_url="https://redmine.invalid",
-        api_key="test-only-value",
+        api_key=_FAKE_API_KEY,
         transport=transport,
     )
 
