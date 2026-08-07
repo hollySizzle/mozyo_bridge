@@ -1285,6 +1285,138 @@ class ReleaseCheckArtifactTest(unittest.TestCase):
             self.assertEqual([b"current tree\n"], copied_child)
             self.assertEqual(before, self._worktree_fingerprint(repo))
 
+    def _assert_replaced_directory_without_current_content_is_omitted(
+        self, *, ignored_child: bool
+    ) -> None:
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        with tempfile.TemporaryDirectory() as repo_str:
+            repo = Path(repo_str).resolve()
+            self._init_artifact_repo(repo)
+            shape = repo / "shape"
+            shape.write_text("tracked file\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "shape"], check=True)
+            shape.unlink()
+            shape.mkdir()
+            if ignored_child:
+                with (repo / ".gitignore").open("a", encoding="utf-8") as stream:
+                    stream.write("shape/\n")
+                (shape / "ignored.txt").write_text("ignored\n", encoding="utf-8")
+
+            listed = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "ls-files",
+                    "-z",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                ],
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.split("\0")
+            self.assertIn("shape", listed, "the stale cached file path remains listed")
+            self.assertFalse(
+                any(item.startswith("shape/") for item in listed if item),
+                "Git lists no current source child for an empty/ignored-only directory",
+            )
+
+            before = self._worktree_fingerprint(repo)
+            original_run = release_mod._run
+            copied_shape: list[bool] = []
+
+            def fake_run(argv, cwd=None, check=False, env=None):
+                if list(argv[:2]) == ["git", "ls-files"]:
+                    return original_run(argv, cwd=cwd, check=check, env=env)
+                build_root = Path(cwd)
+                copied_shape.append((build_root / "shape").exists())
+                outdir = Path(argv[argv.index("--outdir") + 1])
+                outdir.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(
+                    outdir / "package-0.1-py3-none-any.whl", "w"
+                ) as archive:
+                    archive.writestr("package.py", "VALUE = 1\n")
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=0, stdout="", stderr=""
+                )
+
+            with patch.object(release_mod, "_run", side_effect=fake_run):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = release_mod.cmd_release_check_artifact(
+                        argparse.Namespace(repo=str(repo))
+                    )
+
+            self.assertEqual(release_mod.EXIT_CLEAN, rc)
+            self.assertEqual([False], copied_shape)
+            self.assertEqual(before, self._worktree_fingerprint(repo))
+
+    def test_artifact_check_omits_tracked_file_replaced_by_empty_directory(
+        self,
+    ) -> None:
+        self._assert_replaced_directory_without_current_content_is_omitted(
+            ignored_child=False
+        )
+
+    def test_artifact_check_omits_tracked_file_replaced_by_ignored_only_directory(
+        self,
+    ) -> None:
+        self._assert_replaced_directory_without_current_content_is_omitted(
+            ignored_child=True
+        )
+
+    def test_artifact_check_still_rejects_a_tracked_gitlink_directory(self) -> None:
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        with tempfile.TemporaryDirectory() as repo_str:
+            repo = Path(repo_str).resolve()
+            self._init_artifact_repo(repo)
+            nested = repo / "nested-repository"
+            subprocess.run(["git", "init", "-q", str(nested)], check=True)
+            subprocess.run(
+                ["git", "-C", str(nested), "config", "user.email", "test@example.com"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(nested), "config", "user.name", "Test"],
+                check=True,
+            )
+            (nested / "content.txt").write_text("nested\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(nested), "add", "content.txt"], check=True
+            )
+            subprocess.run(
+                ["git", "-C", str(nested), "commit", "-qm", "nested"], check=True
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "add", "nested-repository"],
+                check=True,
+                capture_output=True,
+            )
+            original_run = release_mod._run
+            build_called = False
+
+            def fake_run(argv, cwd=None, check=False, env=None):
+                nonlocal build_called
+                if list(argv[:2]) == ["git", "ls-files"]:
+                    return original_run(argv, cwd=cwd, check=check, env=env)
+                build_called = True
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=0, stdout="", stderr=""
+                )
+
+            with patch.object(release_mod, "_run", side_effect=fake_run):
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    rc = release_mod.cmd_release_check_artifact(
+                        argparse.Namespace(repo=str(repo))
+                    )
+
+            self.assertEqual(release_mod.EXIT_BLOCKER, rc)
+            self.assertFalse(build_called)
+            self.assertIn("gitlink", output.getvalue())
+
 
 class ReleaseCheckWorkflowTest(unittest.TestCase):
     def test_success_exits_zero(self) -> None:

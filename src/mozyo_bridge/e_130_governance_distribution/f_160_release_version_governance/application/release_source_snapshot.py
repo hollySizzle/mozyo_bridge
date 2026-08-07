@@ -18,6 +18,8 @@ ArtifactScanner = Callable[
     [Path, re.Pattern[str]], list[tuple[Path, int, str]]
 ]
 
+_CACHED_FILE_MODES = frozenset({"100644", "100755", "120000"})
+
 
 def _relative_symlink_stays_within_repo(
     relative: Path, link_target: str
@@ -34,6 +36,32 @@ def _relative_symlink_stays_within_repo(
             continue
         stack.append(part)
     return True
+
+
+def _cached_modes_for_path(
+    repo_root: Path, raw: str, *, run: RunCommand
+) -> tuple[frozenset[str], str | None]:
+    """Return exact index modes for one path, or a fail-closed diagnostic."""
+    staged = run(
+        ["git", "ls-files", "-z", "--stage", "--", raw],
+        cwd=repo_root,
+    )
+    if staged.returncode != 0:
+        detail = staged.stderr.strip() or staged.stdout.strip() or "git ls-files failed"
+        return frozenset(), f"cannot inspect release source index entry {raw!r}: {detail}"
+    modes: set[str] = set()
+    for entry in staged.stdout.split("\0"):
+        if not entry:
+            continue
+        try:
+            header, path = entry.split("\t", 1)
+            mode, _object_id, _stage = header.split()
+        except ValueError:
+            return frozenset(), f"malformed release source index entry for {raw!r}"
+        if path != raw:
+            return frozenset(), f"mismatched release source index entry for {raw!r}"
+        modes.add(mode)
+    return frozenset(modes), None
 
 
 def _copy_release_source_snapshot(
@@ -81,11 +109,23 @@ def _copy_release_source_snapshot(
         if not source.exists() and not source.is_symlink():
             continue
         if source.is_dir() and not source.is_symlink():
-            if relative in listed_parent_paths:
-                # A deleted cached file may now be a non-ignored directory.
-                # Git lists both the stale cached path and its current children;
-                # materialize the children and skip only this container entry.
+            cached_modes, mode_error = _cached_modes_for_path(
+                repo_root, raw, run=run
+            )
+            if mode_error is not None:
+                return mode_error
+            if cached_modes and cached_modes <= _CACHED_FILE_MODES:
+                # A cached regular file or symlink may now be a directory. The cached
+                # path is deleted current-source content; Git lists non-ignored children
+                # separately when they exist, so skip this container even when it is
+                # empty or contains ignored-only children.
                 continue
+            if not cached_modes and relative in listed_parent_paths:
+                # Defensive support for a directory-like parent emitted by a future Git
+                # listing mode: its separately listed children remain the content.
+                continue
+            if "160000" in cached_modes:
+                return f"release source gitlink is not supported: {raw!r}"
             return f"release source entry is not a file or symlink: {raw!r}"
         if source.is_symlink():
             try:
