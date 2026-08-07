@@ -26,30 +26,13 @@ Flow (per requested provider agent, ``claude`` / ``codex``):
 Duplicate requested ``(provider, lane)`` slots fail closed **before any side effect**
 (spec §5 slot-uniqueness) so the same durable name is never minted twice.
 
-Empty base-pane reclaim (Redmine #13330)
------------------------------------------
-A herdr workspace is *born with a ``root_pane``* — an empty base shell (measured:
-``workspace create`` returns ``result.root_pane.pane_id`` on a fresh ``pane_count: 1``
-workspace). On a cold start the first ``agent start`` used to auto-create the
-workspace implicitly, leaving that root pane as an unused, agent-less shell beside the
-launched agent panes. To reclaim it deterministically, a pure cold start now:
-
-1. classifies every requested slot (adopt vs launch) *before* launching;
-2. if any slot must launch and none of the adopted agents pin an existing workspace,
-   **explicitly** ``herdr workspace create --no-focus`` and captures the returned
-   ``workspace_id`` + ``root_pane.pane_id``;
-3. launches every slot with ``agent start --workspace <workspace_id>`` (so herdr never
-   auto-creates a second workspace); and
-4. after **every** launch succeeds, ``herdr pane close <root_pane_id>`` — closing only
-   that exact captured handle.
-
-Fail-closed guarantees: only the root pane *this run created* is ever a reclaim target
-(never a scanned-for shell, so a user's own shell can't be mis-closed); a launch
-failure raises before any reclaim (residue left, treated as an implementation
-failure); a ``pane close`` failure is recorded non-fatally (the agents are already
-live and an empty base pane is only cosmetic). All-adopt and launches into an
-already-existing workspace create no new base pane, so they stay byte-invariant. The
-tmux path (:mod:`mozyo_bridge.application.launch_command`) is untouched.
+Pane-bound launch and root reclaim (Redmine #13330, #15101)
+-----------------------------------------------------------
+Herdr 0.8 no longer places a process while starting it. A cold run explicitly creates
+the workspace or tab, splits its run-owned root pane (or an exact live managed pane),
+and starts each provider in that prepared pane. After every launch succeeds, geometry
+finalization closes only the root captured by this run. A failure retains typed startup
+debt for the public rollback path; it never scans for or closes an unowned shell pane.
 
 Placement: dedicated sublane host workspace (Redmine #13380)
 ------------------------------------------------------------
@@ -69,26 +52,18 @@ backend flag: you may prepare herdr identities without selecting the herdr trans
 and vice versa (documented in ``vibes/docs/specs/herdr-native-identity.md``). In pure
 herdr operation you run both.
 
-Live-measured launch contract (herdr 0.7.1, coordinator pre-smoke)
------------------------------------------------------------------
-The ``agent start`` shape is no longer a staged assumption — it was validated against
-a running herdr 0.7.1::
+Live-measured launch contract (Herdr 0.8)
+-----------------------------------------
+The compatibility preflight requires the two-stage 0.8 surface used here::
 
-    herdr agent start <NAME> [--cwd PATH] [--env KEY=VALUE]... [--no-focus] -- <argv...>
+    herdr pane split <ANCHOR> --direction <right|down> --cwd <PATH> \
+        [--env KEY=VALUE]... --no-focus
+    herdr agent start <NATIVE_NAME> --kind <claude|codex> --pane <PANE_ID> -- <argv...>
 
-- ``<NAME>`` is a required positional and is applied directly at start (probe:
-  ``result.agent.name == <NAME>``), so mozyo mints the durable ``mzb1_...`` name here
-  and does **not** issue a separate ``agent rename``.
-- the self-identity vars ride on repeated ``--env`` flags, **not** the client process
-  env: the server-spawned agent does not inherit the launching client's environment
-  (coordinator-measured), so ``MOZYO_WORKSPACE_ID`` / ``MOZYO_AGENT_ROLE`` /
-  ``MOZYO_LANE_ID`` are passed as ``--env KEY=VALUE``.
-- ``--no-focus`` avoids stealing the operator's focus. The one exception is the first
-  launch of a fresh, explicitly-placed pair, which must own the container's split target
-  (Redmine #13646 R1-F1 — see ``herdr_lane_topology.resolve_focus_first_launch``).
-- output is a single JSON object on stdout; the transient locator for rebind/read is
-  ``result.agent.pane_id`` under a ``result.type == "agent_started"`` envelope
-  (:func:`herdr_lane_topology._parse_started_agent`, fail-closed).
+Pane creation carries cwd, injected identity environment, placement and focus policy;
+``agent start`` binds the canonical provider kind to that exact pane. Herdr's short
+native name is collision-checked and durably bound to mozyo's full ``mzb1_...`` logical
+identity. JSON receipts are parsed fail-closed before routing or startup settlement.
 
 Tests exercise the argv + JSON parsing through an injected subprocess ``runner`` (no
 live herdr binary); the end-to-end live smoke stays the coordinator's post-review step.
@@ -100,9 +75,10 @@ import argparse
 import json
 import os
 import subprocess
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Iterator, Mapping, Optional, Sequence
 
 if TYPE_CHECKING:
     from mozyo_bridge.core.state.startup_transaction_fence import StartupTransactionFence
@@ -219,8 +195,8 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     classify_role_grouped_placement,
     preflight_project_coordinator_label_authority,
     require_registered_top_workspace,
+    _resolve_project_coordinator_workspace_under_lock,
     resolve_project_coordinator_container_plan,
-    resolve_project_coordinator_workspace,
     resolve_role_grouped_implementation_target,
     validate_role_grouped_inventory,
 )
@@ -286,6 +262,34 @@ def _resolve_binary_or_die(env: Mapping[str, str]) -> str:
         return resolve_herdr_binary(env).path
     except TerminalTransportError as exc:
         raise HerdrSessionStartError(str(exc)) from exc
+
+
+@contextmanager
+def _coordinator_launch_lock(surface: str) -> Iterator[None]:
+    """Hold one shared coordinator surface through the complete pair launch.
+
+    Herdr 0.8 starts an agent only in an already prepared pane.  A labelled shared
+    workspace is therefore not yet joinable while its creator has only made the root
+    pane: a concurrent project needs one exact managed pane as its split anchor.  Keep
+    the existing home-scoped fence until this session call completes, so a waiter
+    re-observes the creator's live panes instead of racing the create/launch gap.
+    """
+    try:
+        with coordinator_shared_create_lock(mozyo_bridge_home()):
+            yield
+    except CoordinatorSharedCreateReleaseError as exc:
+        raise HerdrSessionStartError(
+            f"managed launch completed its {surface} critical section but "
+            f"could not release the single-flight lock ({exc}); workspace and agent "
+            "creation may already have completed. Re-run to re-observe the exact live "
+            "state before taking any recovery action."
+        ) from exc
+    except CoordinatorSharedCreateLockUnavailable as exc:
+        raise HerdrSessionStartError(
+            f"managed-launch admission could not acquire the {surface} "
+            f"single-flight lock ({exc}); no workspace / tab / agent was created. "
+            "Re-run once the home lock is reachable."
+        ) from exc
 
 
 def prepare_session(
@@ -391,10 +395,9 @@ def prepare_session(
         env=env,
         error_type=HerdrSessionStartError,
     )
-    launch_shims = ActionPrivateLaunchShimSet()
-    call["_launch_shims"] = launch_shims
-    call["_capabilities_observed"] = True
-    try:
+    with ActionPrivateLaunchShimSet() as launch_shims:
+        call["_launch_shims"] = launch_shims
+        call["_capabilities_observed"] = True
         if dry_run:
             return _prepare_session_locked(**call)
         try:
@@ -410,8 +413,6 @@ def prepare_session(
                 f"agent was created. Re-run once the maintenance command finishes.",
                 reason=STORE_MAINTENANCE_IN_PROGRESS,
             ) from exc
-    finally:
-        launch_shims.close()
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_lifecycle_admission import admit_launch_against_lifecycle  # noqa: E501
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_preflight import validate_coordinator_placement_request, validate_pair_order, validate_session_request  # noqa: E501
 
@@ -731,49 +732,46 @@ def _prepare_session_locked(
                 rows, workspace_id, adopt_locators
             )
             if not target_workspace:
-                # Serialize list→resolve→create; release errors may leave a labelled husk.
-                try:
-                    with coordinator_shared_create_lock(mozyo_bridge_home()):
-                        workspace_labels = _list_workspace_labels(binary, runner, timeout)
-                        target_workspace = _shared_coordinator_target(
-                            rows,
-                            workspace_id,
-                            adopt_locators,
-                            workspace_labels,
-                            SHARED_COORDINATOR_WORKSPACE_LABEL,
-                        )
-                        if not target_workspace:
-                            target_workspace, base_pane_id = _create_workspace(
-                                binary,
-                                repo_root,
-                                runner,
-                                timeout,
-                                env,
-                                label=SHARED_COORDINATOR_WORKSPACE_LABEL,
-                            )
-                            result.base_pane_id = base_pane_id
-                except CoordinatorSharedCreateReleaseError as exc:
-                    # Release runs AFTER the body: the shared workspace was already
-                    # resolved (created on a clean slate, or adopted), and the
-                    # coordinator agents were NOT started. A labelled `coordinators`
-                    # workspace may exist as an empty husk; a re-run adopts it
-                    # idempotently (no duplicate is created).
+                if _launch_shims is None:
                     raise HerdrSessionStartError(
-                        "managed-launch admission resolved the shared coordinators "
-                        f"workspace but could not release the single-flight lock ({exc}); "
-                        "the coordinator agents were NOT started. A labelled "
-                        "'coordinators' workspace may have been created and remain as an "
-                        "empty husk — re-run to adopt it idempotently (no duplicate is "
-                        "created)."
-                    ) from exc
-                except CoordinatorSharedCreateLockUnavailable as exc:
-                    raise HerdrSessionStartError(
-                        "managed-launch admission could not acquire the shared "
-                        f"coordinators single-flight lock ({exc}); no workspace / tab / "
-                        "agent was created. Re-run once the home lock is reachable."
-                    ) from exc
+                        "shared-space launch has no launch-scoped resource owner; "
+                        "refusing to enter the single-flight section"
+                    )
+                # Herdr 0.8 needs a concrete managed pane as a split anchor.  Hold the
+                # fence through this call's launch/finalization, then make a waiter
+                # refresh inventory under the lock before resolving the shared target.
+                _launch_shims.hold(_coordinator_launch_lock("shared coordinators"))
+                rows = _list_rows(binary, runner, timeout)
+                workspace_labels = _list_workspace_labels(binary, runner, timeout)
+                target_workspace = _shared_coordinator_target(
+                    rows,
+                    workspace_id,
+                    adopt_locators,
+                    workspace_labels,
+                    SHARED_COORDINATOR_WORKSPACE_LABEL,
+                )
+                if not target_workspace:
+                    target_workspace, base_pane_id = _create_workspace(
+                        binary,
+                        repo_root,
+                        runner,
+                        timeout,
+                        env,
+                        label=SHARED_COORDINATOR_WORKSPACE_LABEL,
+                    )
+                    result.base_pane_id = base_pane_id
         elif role_grouped_project_coordinator:
-            shared = resolve_project_coordinator_workspace(
+            if _launch_shims is None:
+                raise HerdrSessionStartError(
+                    "role-grouped project-coordinator launch has no launch-scoped "
+                    "resource owner; refusing to enter the single-flight section"
+                )
+            # The label alone is not a Herdr 0.8 split authority. Hold the shared
+            # fence until this pair has produced live managed panes, then make the
+            # waiter refresh inventory while it owns the fence.
+            _launch_shims.hold(_coordinator_launch_lock("project coordinators"))
+            rows = _list_rows(binary, runner, timeout)
+            shared = _resolve_project_coordinator_workspace_under_lock(
                 rows=rows,
                 workspace_id=workspace_id,
                 lane_id=result.lane_id,

@@ -427,7 +427,7 @@ def _resolve_herdr_binary(
 def _fetch_agent_list_rows(
     binary: str, runner: Optional[Runner]
 ) -> Sequence[Mapping[str, object]]:
-    """Run herdr ``agent list`` (JSON is the default output) and return its raw rows (fail-closed).
+    """Return logicalized ``agent list`` rows for standard target rebinding.
 
     The rows carry the durable ``name`` and the transient ``pane`` locator that
     :func:`rebind_by_name` matches; the row extraction reuses the #13246 defensive
@@ -457,7 +457,17 @@ def _fetch_agent_list_rows(
         raise TransportBindingError(
             "herdr agent list payload was not a recognised JSON array or agents object"
         )
-    return rows
+    from mozyo_bridge.core.state.herdr_native_identity_binding import (
+        HerdrNativeIdentityBindingError,
+        logicalize_agent_rows,
+    )
+
+    try:
+        return logicalize_agent_rows(rows)
+    except HerdrNativeIdentityBindingError as exc:
+        raise TransportBindingError(
+            "herdr agent list contains an unresolved managed native identity"
+        ) from exc
 
 
 def resolve_runtime_transport_binding(

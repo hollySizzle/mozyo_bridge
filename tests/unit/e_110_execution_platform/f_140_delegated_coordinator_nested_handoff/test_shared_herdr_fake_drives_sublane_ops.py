@@ -40,7 +40,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 
 from support.herdr_fake import FakeHerdr  # noqa: E402
-from tests.support.agent_provider_binaries import provider_bin_path, with_provider_path
+from tests.support.agent_provider_binaries import with_provider_path
 
 HERDR_ENV = "MOZYO_HERDR_BINARY"
 
@@ -98,7 +98,8 @@ class SharedFakeDrivesSublaneOpsTest(unittest.TestCase):
 
     def test_real_ops_launch_claude_worker_auto_via_shared_fake(self) -> None:
         # The real launch sequence flows through the shared fake: the recorded
-        # `agent start` argvs show the Claude worker gets `--permission-mode auto`
+        # Herdr 0.8 `agent start --kind` argvs show the Claude worker gets
+        # `--permission-mode auto` after the separator
         # (Redmine #13360) and Codex does not — proving the shared fake carries the
         # real launch argv end to end, not a stubbed shape.
         fake = FakeHerdr()
@@ -110,13 +111,8 @@ class SharedFakeDrivesSublaneOpsTest(unittest.TestCase):
                 ops.append_lane_column(str(worktree))
         by_provider = {}
         for argv in fake.start_argvs:
-            # argv[0] is the resolved absolute executable (#13441), not the label.
-            argv0 = argv[argv.index("--") + 1]
-            provider = next(
-                (p for p in ("claude", "codex") if argv0 == provider_bin_path(p)),
-                argv0,
-            )
-            by_provider[provider] = argv
+            provider = argv[argv.index("--kind") + 1]
+            by_provider[provider] = argv[argv.index("--") + 1 :]
         self.assertIn("--permission-mode", by_provider["claude"])
         self.assertEqual(
             by_provider["claude"][by_provider["claude"].index("--permission-mode") + 1],

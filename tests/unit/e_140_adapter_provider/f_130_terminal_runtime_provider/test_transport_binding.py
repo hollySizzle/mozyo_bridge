@@ -16,10 +16,14 @@ The port is an in-memory fake, so no subprocess spawns.
 
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
@@ -27,7 +31,11 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.transport_binding import (
     TransportBinding,
     TransportBindingError,
+    _fetch_agent_list_rows,
     resolve_runtime_transport_binding,
+)
+from mozyo_bridge.core.state.herdr_native_identity_binding import (
+    HerdrNativeIdentityBindingStore,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     encode_assigned_name,
@@ -378,6 +386,49 @@ class HerdrTargetTranslationTest(unittest.TestCase):
 
 
 class HerdrResolutionFailClosedTest(unittest.TestCase):
+    def test_live_inventory_restores_native_name_before_standard_rebind(self) -> None:
+        logical = "mzb1_workspace_codex_default"
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            native = HerdrNativeIdentityBindingStore(home=home).bind(logical).native_name
+
+            def runner(argv, **_kwargs):
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    json.dumps(
+                        {"agents": [{"name": native, "pane_id": "w1:p2"}]}
+                    ),
+                    "",
+                )
+
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+            ):
+                rows = _fetch_agent_list_rows("/fake/herdr", runner)
+
+        self.assertEqual(rows[0]["name"], logical)
+        self.assertEqual(rows[0]["native_name"], native)
+
+    def test_unbound_native_inventory_refuses_standard_rebind(self) -> None:
+        native = "mza1_aaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+        def runner(argv, **_kwargs):
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps({"agents": [{"name": native, "pane_id": "w1:p2"}]}),
+                "",
+            )
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {"MOZYO_BRIDGE_HOME": str(Path(directory))},
+            clear=False,
+        ):
+            with self.assertRaises(TransportBindingError):
+                _fetch_agent_list_rows("/fake/herdr", runner)
+
     def test_herdr_selected_without_binary_fails_closed(self) -> None:
         run_tmux, capture_pane = _sentinel_tmux()
         # No injected port and an empty trusted environment -> the #13245 resolver

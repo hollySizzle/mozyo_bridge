@@ -62,7 +62,6 @@ if str(_TESTS_ROOT) not in sys.path:
     sys.path.insert(0, str(_TESTS_ROOT))
 
 from support.agent_provider_binaries import (  # noqa: E402
-    provider_bin_path,
     with_provider_path,
 )
 from support.herdr_fake import FakeHerdr  # noqa: E402
@@ -249,23 +248,18 @@ class EffectiveManagedLaunchArgvTest(unittest.TestCase):
                     agent_launch=config.agent_launch,
                     probe=_FAST_PROBE,
                 )
-        starts = [call for call in herdr.calls if call[:2] == ["agent", "start"]]
+        starts = herdr.start_argvs
         self.assertEqual(1, len(starts), f"expected exactly one launch, got {starts!r}")
         return starts[0]
 
     def _provider_command(self, start_argv):
-        """The tokens after ``--``: what the pane runs, as opposed to what herdr is told."""
-        return list(start_argv[start_argv.index("--") :])
+        """The provider arguments after Herdr 0.8's pane-bound launch separator."""
+        return list(start_argv[start_argv.index("--") + 1 :])
 
     def test_delegated_coordinator_lane_launches_on_the_pinned_model_and_effort(self) -> None:
-        argv = self._provider_command(
-            self._start_argv(lane_id=DELEGATED_COORDINATOR_LANE)
-        )
-        self.assertEqual(
-            provider_bin_path("codex"),
-            argv[1],
-            "argv[0] of the provider command must be the hermetic codex stub",
-        )
+        start = self._start_argv(lane_id=DELEGATED_COORDINATOR_LANE)
+        self.assertEqual("codex", start[start.index("--kind") + 1])
+        argv = self._provider_command(start)
         pairs = _flag_pairs(argv)
         for flag, value in OWNER_PINNED_COORDINATION_SUBLANE:
             self.assertIn(

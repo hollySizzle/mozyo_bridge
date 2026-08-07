@@ -149,13 +149,21 @@ class LaneKindHealAuthorityLaunchTest(unittest.TestCase):
         return [
             c
             for c in herdr.calls
-            if c[:2] in (["agent", "start"], ["workspace", "create"], ["tab", "create"])
+            if c != ["agent", "start", "--help"]
+            and c != ["pane", "split", "--help"]
+            and c[:2]
+            in (
+                ["agent", "start"],
+                ["workspace", "create"],
+                ["tab", "create"],
+                ["pane", "split"],
+            )
         ]
 
     @staticmethod
     def _second_split(herdr):
-        second = herdr.start_argvs[1]
-        return second[second.index("--split") + 1] if "--split" in second else None
+        second = herdr.pane_split_argvs[1]
+        return second[second.index("--direction") + 1]
 
     # -- heal -----------------------------------------------------------------
 
@@ -436,7 +444,11 @@ class WholePlanLaunchPreflightTest(LaneKindHealAuthorityLaunchTest):
         """Every launched argv with this run's temp root / workspace id redacted."""
         return [
             [
-                token.replace(str(root), "<ROOT>").replace(workspace_id, "<WS>")
+                (
+                    "<NATIVE>"
+                    if token.startswith("mza1_")
+                    else token.replace(str(root), "<ROOT>").replace(workspace_id, "<WS>")
+                )
                 for token in argv
             ]
             for argv in herdr.start_argvs

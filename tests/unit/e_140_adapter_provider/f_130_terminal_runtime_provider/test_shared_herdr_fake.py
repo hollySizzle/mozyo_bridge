@@ -3,8 +3,8 @@
 These tests exercise the fake **directly** — the fake is the subject-under-test
 here (design §5-A deliverable: "fake の state 遷移を直接検証"). They pin every
 modelled face (A–F of ``herdr-scenario-test-foundation.md`` §1.1): workspace
-create + base pane, ``agent start`` placement / locator mint, ``--workspace``
-prefix behaviour and its mislocated-launch injection, ``pane close`` →
+create + base pane, ``pane split`` placement, pane-bound ``agent start`` / locator
+mint and its mislocated-launch injection, ``pane close`` →
 workspace auto-vanish (E), ``agent list`` decode + malformed/alias faces (B),
 ``agent get`` / ``agent read`` (C), ``wait`` change-semantics (F), and the
 fail-closed posture on an unmodelled argv (§2.3).
@@ -30,7 +30,9 @@ if str(_TESTS_ROOT) not in sys.path:
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E402
     _agent_locator,
+    encode_assigned_name,
 )
+from mozyo_bridge.core.state.herdr_native_identity_binding import native_name_for  # noqa: E402
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_discovery import (  # noqa: E402
     HerdrCliAgentLister,
 )
@@ -52,23 +54,44 @@ def _payload(completed):
     return json.loads(completed.stdout)
 
 
-def _start_argv(name, workspace, provider, *, extra=()):
-    return [
+def _start(fake, workspace, provider, *, lane="lane-x", extra=()):
+    logical = encode_assigned_name("ws", provider, lane)
+    native = native_name_for(logical)
+    anchor = fake.panes_of(workspace)[-1]
+    prepared = _payload(
+        fake.run(
+            [
+                BINARY,
+                "pane",
+                "split",
+                anchor,
+                "--direction",
+                "down",
+                "--cwd",
+                "/workspace/project",
+                "--env",
+                "MOZYO_WORKSPACE_ID=ws",
+                "--env",
+                f"MOZYO_AGENT_ROLE={provider}",
+                "--env",
+                f"MOZYO_LANE_ID={lane}",
+                "--no-focus",
+            ]
+        )
+    )["result"]["pane"]["pane_id"]
+    completed = fake.run([
         BINARY,
         "agent",
         "start",
-        name,
-        "--cwd",
-        "/workspace/project",
-        "--workspace",
-        workspace,
-        "--env",
-        "MOZYO_LANE_ID=lane-x",
-        "--no-focus",
-        "--",
+        native,
+        "--kind",
         provider,
+        "--pane",
+        prepared,
+        "--",
         *extra,
-    ]
+    ])
+    return completed, logical, prepared
 
 
 # -- D: workspace create -------------------------------------------------------
@@ -129,57 +152,171 @@ class WorkspaceListTest(unittest.TestCase):
 
 
 class AgentStartTest(unittest.TestCase):
+    def test_split_from_explicit_seeded_tab_stays_in_that_tab(self) -> None:
+        fake = FakeHerdr()
+        wid = fake.seed_workspace(cwd="/workspace/project")
+        tab_id = f"{wid}:t1"
+        anchor = fake.seed_agent(
+            "mzb1_ws_codex_lane-x",
+            workspace_id=wid,
+            provider="codex",
+            tab_id=tab_id,
+        )
+
+        prepared = _payload(
+            fake.run(
+                [
+                    BINARY,
+                    "pane",
+                    "split",
+                    anchor,
+                    "--direction",
+                    "down",
+                    "--cwd",
+                    "/workspace/project",
+                    "--no-focus",
+                ]
+            )
+        )["result"]["pane"]
+
+        self.assertEqual(prepared["tab_id"], tab_id)
+        self.assertEqual(fake.tab_of(anchor), tab_id)
+        self.assertEqual(fake.tab_of(prepared["pane_id"]), tab_id)
+
+    def test_herdr_080_help_and_pane_bound_launch(self) -> None:
+        fake = FakeHerdr()
+        self.assertIn(
+            "--pane",
+            fake.run([BINARY, "agent", "start", "--help"]).stdout,
+        )
+        self.assertIn(
+            "--direction",
+            fake.run([BINARY, "pane", "split", "--help"]).stdout,
+        )
+        wid = fake.seed_workspace(cwd="/workspace/project")
+        prepared = _payload(
+            fake.run(
+                [
+                    BINARY,
+                    "pane",
+                    "split",
+                    f"{wid}:p1",
+                    "--direction",
+                    "down",
+                    "--cwd",
+                    "/workspace/project",
+                    "--env",
+                    "MOZYO_WORKSPACE_ID=ws",
+                    "--env",
+                    "MOZYO_AGENT_ROLE=codex",
+                    "--env",
+                    "MOZYO_LANE_ID=default",
+                    "--no-focus",
+                ]
+            )
+        )["result"]["pane"]
+        native = "mza1_aaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        started = _payload(
+            fake.run(
+                [
+                    BINARY,
+                    "agent",
+                    "start",
+                    native,
+                    "--kind",
+                    "codex",
+                    "--pane",
+                    prepared["pane_id"],
+                    "--",
+                    "--model",
+                    "gpt-test",
+                ]
+            )
+        )["result"]["agent"]
+        self.assertEqual(started["name"], native)
+        self.assertEqual(started["pane_id"], prepared["pane_id"])
+        logical = fake.agent_named("mzb1_ws_codex_default")
+        self.assertEqual(logical["native_name"], native)
+
     def test_start_lands_in_requested_workspace_and_applies_name(self) -> None:
         fake = FakeHerdr()
         wid = fake.seed_workspace()
-        completed = fake.run(_start_argv("mzb1_ws_claude_lane", wid, "claude"))
+        completed, logical, prepared = _start(fake, wid, "claude")
         agent = _payload(completed)["result"]["agent"]
         self.assertEqual(_payload(completed)["result"]["type"], "agent_started")
-        # NAME applies directly (result.agent.name == NAME) and the locator is
-        # minted inside the requested --workspace.
-        self.assertEqual(agent["name"], "mzb1_ws_claude_lane")
-        self.assertTrue(agent["pane_id"].startswith(f"{wid}:"))
-        self.assertNotEqual(agent["pane_id"], f"{wid}:p1")  # not the base pane
-        # State records the live agent in that workspace.
-        live = fake.agent_named("mzb1_ws_claude_lane")
+        self.assertEqual(agent["name"], native_name_for(logical))
+        self.assertEqual(agent["pane_id"], prepared)
+        # State restores the long logical identity from the prepared pane env.
+        live = fake.agent_named(logical)
         self.assertEqual(live["pane_id"], agent["pane_id"])
         self.assertEqual(live["status"], STATUS_IDLE)
 
-    def test_start_without_workspace_auto_creates_one(self) -> None:
-        # Real herdr with no --workspace auto-creates a workspace (the empty
-        # base-pane source, #13330); the fake reproduces that so a scenario can
-        # observe the auto-created workspace.
+    def test_legacy_start_without_kind_and_pane_is_rejected(self) -> None:
         fake = FakeHerdr()
-        argv = [BINARY, "agent", "start", "solo", "--", "claude"]
-        agent = _payload(fake.run(argv))["result"]["agent"]
-        self.assertTrue(agent["pane_id"])
-        self.assertEqual(len(fake.workspace_ids), 1)
+        with self.assertRaises(UnknownHerdrCommandError):
+            fake.run([BINARY, "agent", "start", "solo", "--", "claude"])
+        self.assertEqual(fake.workspace_ids, [])
 
     def test_start_records_launch_argv_after_separator(self) -> None:
         fake = FakeHerdr()
         wid = fake.seed_workspace()
-        fake.run(_start_argv("n", wid, "claude", extra=["--permission-mode", "auto"]))
+        _start(fake, wid, "claude", extra=["--permission-mode", "auto"])
         (started,) = fake.start_argvs
         tail = started[started.index("--") + 1 :]
-        self.assertEqual(tail, ["claude", "--permission-mode", "auto"])
+        self.assertEqual(tail, ["--permission-mode", "auto"])
 
-    def test_start_in_unknown_workspace_fails_closed(self) -> None:
+    def test_start_in_unknown_pane_fails_closed(self) -> None:
         fake = FakeHerdr()
-        completed = fake.run(_start_argv("n", "w999", "claude"))
+        completed = fake.run(
+            [
+                BINARY,
+                "agent",
+                "start",
+                native_name_for("mzb1_ws_claude_lane"),
+                "--kind",
+                "claude",
+                "--pane",
+                "w999:p2",
+                "--",
+            ]
+        )
         self.assertEqual(completed.returncode, 1)
-        self.assertIn("unknown workspace", completed.stderr)
+        self.assertIn("no such pane", completed.stderr)
 
     def test_start_missing_name_positional_is_unmodelled(self) -> None:
         fake = FakeHerdr()
         with self.assertRaises(UnknownHerdrCommandError):
-            fake.run([BINARY, "agent", "start", "--workspace", "w1", "--", "claude"])
+            fake.run(
+                [
+                    BINARY,
+                    "agent",
+                    "start",
+                    "--kind",
+                    "claude",
+                    "--pane",
+                    "w1:p2",
+                    "--",
+                ]
+            )
 
     def test_start_with_unmodelled_flag_fails_closed(self) -> None:
         fake = FakeHerdr()
         wid = fake.seed_workspace()
         with self.assertRaises(UnknownHerdrCommandError):
-            fake.run([BINARY, "agent", "start", "n", "--frobnicate", "--", "claude"])
-        # (wid seeded to prove the failure is the flag, not a missing workspace)
+            fake.run(
+                [
+                    BINARY,
+                    "agent",
+                    "start",
+                    native_name_for("mzb1_ws_claude_lane"),
+                    "--kind",
+                    "claude",
+                    "--pane",
+                    f"{wid}:p1",
+                    "--frobnicate",
+                    "--",
+                ]
+            )
         self.assertIn(wid, fake.workspace_ids)
 
 
@@ -189,12 +326,13 @@ class AgentStartTest(unittest.TestCase):
 class LaunchInjectionTest(unittest.TestCase):
     def test_misplace_next_launch_renders_a_mismatched_prefix(self) -> None:
         # The stimulus for the #13330 review j#73231 fail-closed guard: herdr
-        # ignored --workspace and the launch landed elsewhere. The fake renders the
+        # returned a locator in the wrong workspace. The fake renders the
         # mislocated locator; the real session-start code renders the verdict.
         fake = FakeHerdr()
         wid = fake.seed_workspace()
         fake.misplace_next_launch("wOTHER")
-        agent = _payload(fake.run(_start_argv("n", wid, "claude")))["result"]["agent"]
+        completed, _logical, _prepared = _start(fake, wid, "claude")
+        agent = _payload(completed)["result"]["agent"]
         self.assertTrue(agent["pane_id"].startswith("wOTHER:"))
         self.assertFalse(agent["pane_id"].startswith(f"{wid}:"))
 
@@ -202,15 +340,17 @@ class LaunchInjectionTest(unittest.TestCase):
         fake = FakeHerdr()
         wid = fake.seed_workspace()
         fake.misplace_next_launch("wOTHER")
-        fake.run(_start_argv("a", wid, "claude"))
-        second = _payload(fake.run(_start_argv("b", wid, "claude")))["result"]["agent"]
+        _start(fake, wid, "claude", lane="a")
+        second, _logical, _prepared = _start(fake, wid, "claude", lane="b")
+        second = _payload(second)["result"]["agent"]
         self.assertTrue(second["pane_id"].startswith(f"{wid}:"))
 
     def test_drop_next_locator_renders_blank_pane_id(self) -> None:
         fake = FakeHerdr()
         wid = fake.seed_workspace()
         fake.drop_next_locator()
-        agent = _payload(fake.run(_start_argv("n", wid, "claude")))["result"]["agent"]
+        completed, _logical, _prepared = _start(fake, wid, "claude")
+        agent = _payload(completed)["result"]["agent"]
         self.assertEqual(agent["pane_id"], "")
 
 

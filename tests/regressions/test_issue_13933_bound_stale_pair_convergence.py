@@ -873,7 +873,19 @@ def _agent_list_rows(fake: FakeHerdr):
     import json
 
     out = fake.run(["herdr", "agent", "list"]).stdout
-    return json.loads(out).get("agents", [])
+    rows = json.loads(out).get("agents", [])
+    logical_by_native = {
+        agent.name: agent.logical_name for agent in fake._agents.values()
+    }
+    restored = []
+    for row in rows:
+        logical_name = logical_by_native.get(row.get("name"), "")
+        if logical_name and logical_name != row.get("name"):
+            row = dict(row)
+            row["native_name"] = row["name"]
+            row["name"] = logical_name
+        restored.append(row)
+    return restored
 
 
 class _CloseResult:
@@ -921,7 +933,7 @@ class _FakeBackedRollbackOps:
             closed.append((role, locator))
             name = by_locator.get(locator)
             for pane, agent in list(self.fake._agents.items()):
-                if agent.name == name:
+                if agent.logical_name == name:
                     del self.fake._agents[pane]
         return _CloseResult(closed=closed, failed=())
 
@@ -975,25 +987,28 @@ class _AttestingHerdr(FakeHerdr):
     def _cmd_agent_start(self, argv, rest):
         import json
 
-        name = rest[2] if len(rest) > 2 else ""
-        decoded = decode_assigned_name(name)
-        provider = decoded.identity.role if (decoded.ok and decoded.identity) else ""
+        native_name = rest[2] if len(rest) > 2 else ""
+        provider = rest[rest.index("--kind") + 1] if "--kind" in rest else ""
         if self.fail_launch_provider and provider == self.fail_launch_provider:
             self.fail_launch_provider = ""
-            wid = rest[rest.index("--workspace") + 1] if "--workspace" in rest else "w1"
-            tab = rest[rest.index("--tab") + 1] if "--tab" in rest else ""
+            pane = rest[rest.index("--pane") + 1] if "--pane" in rest else ""
+            workspace = self._workspace_of_pane(pane)
+            wid = workspace.workspace_id if workspace is not None else "w1"
+            tab = workspace.pane_tab.get(pane, "") if workspace is not None else ""
             return __import__("subprocess").CompletedProcess(
                 argv, 0,
                 stdout=json.dumps({"result": {"type": "agent_started", "agent": {
-                    "name": name, "pane_id": f"{wid}:pX", "workspace_id": wid, "tab_id": tab}}}),
+                    "name": native_name, "pane_id": pane, "workspace_id": wid, "tab_id": tab}}}),
                 stderr="",
             )
         result = super()._cmd_agent_start(argv, rest)
-        live = self.agent_named(name)
+        live = self.agent_named(native_name)
+        logical_name = live["name"] if live else ""
+        decoded = decode_assigned_name(logical_name)
         if live and self.action_id and decoded.ok and decoded.identity is not None:
             HerdrIdentityAttestationStore(home=self._attestation_home).upsert(
                 IdentityAttestationRecord(
-                    assigned_name=name,
+                    assigned_name=logical_name,
                     workspace_id=decoded.identity.workspace_id,
                     role=decoded.identity.role,
                     lane_id=decoded.identity.lane_id,
@@ -1006,12 +1021,13 @@ class _AttestingHerdr(FakeHerdr):
         # Redmine #14222 j#85125 F2: a real wrapped launch appends its attributed
         # execution-stage rows before exec'ing, and the health probe now demands them
         # before a green. Model that per launch, keyed by the injected startup action.
-        launch_action = ""
-        for index, token in enumerate(rest):
-            if token == "--env" and index + 1 < len(rest):
-                key, _, value = rest[index + 1].partition("=")
-                if key == "MOZYO_STARTUP_ACTION_ID":
-                    launch_action = value
+        pane = rest[rest.index("--pane") + 1] if "--pane" in rest else ""
+        workspace = self._workspace_of_pane(pane)
+        launch_action = (
+            workspace.pane_env.get(pane, {}).get("MOZYO_STARTUP_ACTION_ID", "")
+            if workspace is not None
+            else ""
+        )
         if live and launch_action:
             from mozyo_bridge.core.state.startup_execution_events import (
                 STAGE_PROVIDER_EXEC_CALL_REACHED,
@@ -1025,7 +1041,7 @@ class _AttestingHerdr(FakeHerdr):
             events_fence = StartupTransactionFence(home=self._attestation_home)
             for stage in (STAGE_WRAPPER_ENTERED, STAGE_PROVIDER_EXEC_CALL_REACHED):
                 append_execution_event(
-                    events_fence, launch_action, stage, participant=name
+                    events_fence, launch_action, stage, participant=logical_name
                 )
         return result
 
@@ -1068,10 +1084,11 @@ class _V1AttestingHerdr(_AttestingHerdr):
             result = super()._cmd_agent_start(argv, rest)
         finally:
             self.action_id = desired_action
-        name = rest[2] if len(rest) > 2 else ""
-        decoded = decode_assigned_name(name)
-        live = self.agent_named(name)
-        provider = decoded.identity.role if (decoded.ok and decoded.identity) else ""
+        native_name = rest[2] if len(rest) > 2 else ""
+        live = self.agent_named(native_name)
+        logical_name = live["name"] if live else ""
+        decoded = decode_assigned_name(logical_name)
+        provider = rest[rest.index("--kind") + 1] if "--kind" in rest else ""
         if provider in self.skip_attestation_for:
             # A launched-but-non-green target: the live row exists (so the slot is
             # ``launched`` with a locator), yet no self-attestation lands, so the real probe
@@ -1080,7 +1097,7 @@ class _V1AttestingHerdr(_AttestingHerdr):
         if live and decoded.ok and decoded.identity is not None:
             HerdrIdentityAttestationStore(home=self._attestation_home).upsert(
                 IdentityAttestationRecord(
-                    assigned_name=name,
+                    assigned_name=logical_name,
                     workspace_id=decoded.identity.workspace_id,
                     role=decoded.identity.role,
                     lane_id=decoded.identity.lane_id,
@@ -1276,7 +1293,7 @@ class RealLauncherCompositionTests(unittest.TestCase):
 
                 # Partial shape: gateway absent, worker stale-live.
                 for pane, agent in list(fake._agents.items()):
-                    if agent.name == gw_name:
+                    if agent.logical_name == gw_name:
                         del fake._agents[pane]
                 fake.action_id = self.ACTION
 
@@ -1433,7 +1450,7 @@ class RealLauncherCompositionTests(unittest.TestCase):
                 )
                 self.assertEqual(len(fake.start_calls), 2)
                 for pane, agent in list(fake._agents.items()):
-                    if agent.name == gw_name:
+                    if agent.logical_name == gw_name:
                         del fake._agents[pane]
 
                 maintenance_attempts: list[str] = []
@@ -1652,7 +1669,7 @@ class PartialStartupBindingHealthTests(unittest.TestCase):
                     )
                 )
                 for pane, agent in list(fake._agents.items()):
-                    if agent.name == gw_name:
+                    if agent.logical_name == gw_name:
                         del fake._agents[pane]
 
                 # The bind must SUCCEED on the healthy target — no aggregate stop.
@@ -1682,7 +1699,7 @@ class PartialStartupBindingHealthTests(unittest.TestCase):
             )
             with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
                 for pane, agent in list(fake._agents.items()):
-                    if agent.name in {gw_name, wk_name}:
+                    if agent.logical_name in {gw_name, wk_name}:
                         del fake._agents[pane]
 
                 self._heal_target(
@@ -1744,7 +1761,7 @@ class PartialStartupBindingHealthTests(unittest.TestCase):
             fake.skip_attestation_for = {"codex"}
             with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
                 for pane, agent in list(fake._agents.items()):
-                    if agent.name == gw_name:
+                    if agent.logical_name == gw_name:
                         del fake._agents[pane]
                 with self.assertRaises(SublaneHealError) as caught:
                     self._heal_gateway(home, coord, worktree, env, fake, gw_name, gw_old)
@@ -1800,7 +1817,7 @@ class PartialStartupBindingHealthTests(unittest.TestCase):
 
                 # The rolled-back target is absent (the rollback closed it).
                 for pane, agent in list(fake._agents.items()):
-                    if agent.name == gw_name:
+                    if agent.logical_name == gw_name:
                         del fake._agents[pane]
 
                 # Replay the SAME action: a fresh relaunch + bind, no re-use of the old attempt.
@@ -2532,8 +2549,16 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
             legacy_locator = legacy_startup.participant_for("claude").locator
             self.assertNotIn(legacy_locator, {wk_old, gw_old})
             reference = fake._agents[gw_old]
+            from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
+                parse_pane_bound_receipt,
+            )
+
+            pane_receipt = parse_pane_bound_receipt(
+                legacy_startup.participant_for("claude").receipt
+            )
             fake._agents[legacy_locator] = _FakeAgent(
-                name=wk_name, pane_id=legacy_locator, workspace_id=reference.workspace_id,
+                name=pane_receipt.native_name, logical_name=wk_name,
+                pane_id=legacy_locator, workspace_id=reference.workspace_id,
                 provider="claude", tab_id=reference.tab_id,
             )
             HerdrIdentityAttestationStore(home=home).upsert(

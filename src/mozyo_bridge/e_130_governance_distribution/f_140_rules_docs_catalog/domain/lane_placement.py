@@ -69,9 +69,9 @@ LANE_PLACEMENT_LANE_CLASSES: frozenset[str] = frozenset({"default", "sublane"})
 #: duplicate, or unknown provider (Design Answer j#76564 Q1).
 LANE_PLACEMENT_PROVIDERS: frozenset[str] = frozenset({"claude", "codex"})
 
-#: The closed split-direction vocabulary. herdr 0.7.1 ``agent start`` accepts exactly
-#: ``--split right|down`` (live ``--help`` characterization j#76559), so a config ``split``
-#: is one of these two literals or fails closed.
+#: The closed split-direction vocabulary. Herdr 0.8 ``pane split`` accepts exactly
+#: ``--direction right|down`` (live capability surface), so a config ``split`` is one
+#: of these two literals or fails closed.
 LANE_PLACEMENT_SPLIT_DIRECTIONS: frozenset[str] = frozenset({"right", "down"})
 
 #: The closed set of recognized keys inside a lane-class placement object. All three are
@@ -87,7 +87,7 @@ LANE_PLACEMENT_CLASS_KEYS: frozenset[str] = frozenset({"split", "order", "ratio"
 
 #: The inclusive bounds a declared ``ratio`` must fall in (Redmine #14569, Design Answer
 #: j#91127). Deliberately herdr's OWN effective domain rather than the wider ``0..1`` its
-#: CLI parser accepts: herdr 0.7.4's layout clamps a split ratio into ``0.1..0.9``
+#: CLI parser accepts: Herdr's layout clamps a split ratio into ``0.1..0.9``
 #: (live-measured j#91140 — driving a 0.5 split down by 0.9 lands on 0.1, not 0.0), so a
 #: config value outside it could never be the geometry the pair actually takes. Narrowing
 #: the schema to the effective domain is what keeps a DECLARED value and the EFFECTIVE
@@ -265,7 +265,7 @@ def _normalize_split(split: object, *, lane_class: str, source: str) -> Optional
     """Return a validated split direction, or ``None`` when the field is absent.
 
     Redmine #13646: ``split`` is one of :data:`LANE_PLACEMENT_SPLIT_DIRECTIONS`
-    (``right`` / ``down``, the herdr 0.7.1 ``agent start --split`` vocabulary). Anything
+    (``right`` / ``down``, the Herdr 0.8 ``pane split --direction`` vocabulary). Anything
     else fails closed.
     """
     if split is None:

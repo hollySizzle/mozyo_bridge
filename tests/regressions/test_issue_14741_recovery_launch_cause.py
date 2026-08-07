@@ -35,6 +35,7 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.age
     LAUNCH_CAUSE_GENERIC_FRESH,
     LAUNCH_CAUSE_UPDATE_RELAUNCH,
 )
+from tests.support.herdr_fake import FakeHerdr  # noqa: E402
 
 ACTION = "startup-ir1-" + "a" * 64
 
@@ -188,20 +189,28 @@ class PropagationTest(unittest.TestCase):
         while still going through the public wrapper's own argument binding and call dict --
         which is where the token was being dropped.
         """
+        import stat
         import tempfile
 
         import mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start as start
 
         seen = {}
-        original = start._prepare_session_locked
-        start._prepare_session_locked = lambda **kw: seen.update(kw)
-        try:
-            start.prepare_session(
-                repo_root=Path(tempfile.mkdtemp()), providers=["codex"], lane_id="l",
-                env={}, dry_run=True, **kwargs,
-            )
-        finally:
-            start._prepare_session_locked = original
+        with tempfile.TemporaryDirectory() as task_root:
+            binary = Path(task_root) / "herdr"
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(binary.stat().st_mode | stat.S_IEXEC)
+            original = start._prepare_session_locked
+            start._prepare_session_locked = lambda **kw: seen.update(kw)
+            try:
+                start.prepare_session(
+                    repo_root=Path(task_root), providers=["codex"], lane_id="l",
+                    env={"MOZYO_HERDR_BINARY": str(binary)},
+                    runner=FakeHerdr().run,
+                    dry_run=True,
+                    **kwargs,
+                )
+            finally:
+                start._prepare_session_locked = original
         return seen
 
     def test_the_binding_rail_hands_the_cause_to_the_locked_entry(self) -> None:
@@ -292,9 +301,7 @@ class PropagationTest(unittest.TestCase):
                             "MOZYO_HERDR_BINARY": str(herdr),
                             "MOZYO_BRIDGE_HOME": str(home),
                         },
-                        runner=lambda *a, **k: SimpleNamespace(
-                            returncode=0, stdout="[]", stderr=""
-                        ),
+                        runner=FakeHerdr().run,
                         timeout=1.0,
                         dry_run=False,
                         **kwargs,

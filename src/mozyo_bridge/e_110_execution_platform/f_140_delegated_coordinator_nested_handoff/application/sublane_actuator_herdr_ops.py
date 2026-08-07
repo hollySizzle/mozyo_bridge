@@ -7,8 +7,8 @@ answer j#73613, **Opt3 — shared project workspace**) gives herdr the same iden
 the lane worktree stays a linked git worktree and its two managed agents are launched as
 ``mzb1_<project-ws>_codex_<lane>`` / ``mzb1_<project-ws>_claude_<lane>`` by the #13330
 :func:`~...terminal_runtime_provider.application.herdr_session_start.prepare_session`
-(join-or-create workspace + ``agent start --workspace --cwd <lane-worktree>`` + root-pane
-reclaim). Placement refined by Redmine #13380 (dedicated sublane host workspace): lane
+(join-or-create workspace + pane-bound ``agent start`` + root-pane reclaim). Placement
+refined by Redmine #13380 (dedicated sublane host workspace): lane
 slots land in a single sublane host workspace separate from the coordinator pair's project
 workspace, so the herdr workspace count is a constant "project 1 + host 1" — never scaling
 with the lane count. This supersedes the #13331 j#73314 per-lane ``wt_<hash>`` workspace

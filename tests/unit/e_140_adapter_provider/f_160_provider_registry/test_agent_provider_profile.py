@@ -250,17 +250,12 @@ class SyntheticProviderLaunchArgvTest(unittest.TestCase):
             )[provider_id]
             argv = herdr_launch_argv.build_agent_start_argv(
                 assigned_name=f"mzb1_ws_{provider_id}_lane",
+                native_name="mza1_aaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                pane_locator="wsname:p1",
                 provider=provider_id,
-                repo_root=Path(tmp),
                 workspace_id="ws",
                 lane="lane-1",
-                target_workspace="wsname",
-                target_tab="",
-                split="",
-                focus=False,
-                binary="/usr/bin/herdr",
                 attest_launcher="",
-                store_home=str(Path(tmp) / "home"),
                 resolved=resolved,
                 launch_argv_extra=[],
             )
@@ -272,7 +267,8 @@ class SyntheticProviderLaunchArgvTest(unittest.TestCase):
         # The managed argv is resolved from the SAME injected registry (not empty), and
         # the builder does not raise `unknown agent provider`.
         self.assertEqual(("--approval", "auto"), resolved.managed_argv)
-        self.assertEqual([expected_argv0, "--approval", "auto"], run_cmd)
+        self.assertEqual(expected_argv0, resolved.executable)
+        self.assertEqual(["--approval", "auto"], run_cmd)
 
     def test_injected_only_tool_shell_capability_is_pinned_and_rendered(self) -> None:
         # A provider that declares tool_shell_env_overrides ONLY in the injected registry
@@ -288,8 +284,8 @@ class SyntheticProviderLaunchArgvTest(unittest.TestCase):
         record["_id"] = "mistral-cli"
         resolved, expected_argv0, run_cmd = self._launch(record)
         self.assertTrue(resolved.tool_shell_env_overrides)
-        self.assertEqual(expected_argv0, run_cmd[0])
-        self.assertEqual(["--approval", "auto"], run_cmd[1:3])
+        self.assertEqual(expected_argv0, resolved.executable)
+        self.assertEqual(["--approval", "auto"], run_cmd[:2])
         self.assertTrue(
             any("shell_environment_policy" in token for token in run_cmd),
             run_cmd,
@@ -320,45 +316,39 @@ class ArgvZeroCompatibilityTest(unittest.TestCase):
         )[provider]
         kwargs = dict(
             assigned_name="mzb1_ws_x_lane",
+            native_name="mza1_aaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            pane_locator="wsname:p1",
             provider=provider,
-            repo_root=Path("/repo"),
             workspace_id="ws",
             lane="lane-1",
-            target_workspace="wsname",
-            target_tab="",
-            split="",
-            focus=False,
-            binary="/usr/bin/herdr",
             attest_launcher="",
-            store_home="/home",
             resolved=resolved,
             launch_argv_extra=[],
         )
         kwargs.update(over)
-        return build_agent_start_argv(**kwargs)
+        return resolved, build_agent_start_argv(**kwargs)
 
     def test_claude_argv0_is_the_injected_absolute_executable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bindir = Path(tmp) / "bin"
             expected = _install_binary(bindir, "claude")
             _install_binary(bindir, "codex")
-            argv = self._argv("claude", bindir, permission_mode_default="auto")
+            resolved, argv = self._argv("claude", bindir, permission_mode_default="auto")
         run_cmd = argv[argv.index("--") + 1 :]
-        # argv[0] is the resolved absolute realpath — never the bare name, and never a
-        # host path literal in the assertion: it is the path this test injected.
-        self.assertEqual(expected, run_cmd[0])
-        self.assertTrue(os.path.isabs(run_cmd[0]))
-        # ...and the REMAINING tokens are byte-invariant.
-        self.assertEqual(["--permission-mode", "auto"], run_cmd[1:])
+        # Herdr 0.8 selects the executable through the action-private provider shim;
+        # only provider arguments follow the agent-start separator.
+        self.assertEqual(expected, resolved.executable)
+        self.assertTrue(os.path.isabs(resolved.executable))
+        self.assertEqual(["--permission-mode", "auto"], run_cmd)
 
     def test_codex_suffix_is_byte_invariant_after_argv0(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bindir = Path(tmp) / "bin"
             _install_binary(bindir, "claude")
             expected = _install_binary(bindir, "codex")
-            argv = self._argv("codex", bindir)
+            resolved, argv = self._argv("codex", bindir)
         run_cmd = argv[argv.index("--") + 1 :]
-        self.assertEqual(expected, run_cmd[0])
+        self.assertEqual(expected, resolved.executable)
         # The Codex tool-shell identity overrides (#13614) still render, unchanged.
         self.assertEqual(
             [
@@ -369,7 +359,7 @@ class ArgvZeroCompatibilityTest(unittest.TestCase):
                 "-c",
                 'shell_environment_policy.set.MOZYO_LANE_ID="lane-1"',
             ],
-            run_cmd[1:],
+            run_cmd,
         )
 
     def test_codex_never_receives_the_claude_permission_flag(self) -> None:
@@ -378,7 +368,7 @@ class ArgvZeroCompatibilityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             bindir = Path(tmp) / "bin"
             _install_binary(bindir, "codex")
-            argv = self._argv("codex", bindir, permission_mode_default="auto")
+            _resolved, argv = self._argv("codex", bindir, permission_mode_default="auto")
         self.assertNotIn("--permission-mode", argv)
 
 
@@ -826,9 +816,10 @@ class R1F1PreflightBeforeSideEffectsTest(unittest.TestCase):
         return [
             c
             for c in calls
+            if not c.endswith(" --help")
             if any(
                 verb in c
-                for verb in ("workspace create", "tab create", "agent start")
+                for verb in ("workspace create", "tab create", "pane split", "agent start")
             )
         ]
 

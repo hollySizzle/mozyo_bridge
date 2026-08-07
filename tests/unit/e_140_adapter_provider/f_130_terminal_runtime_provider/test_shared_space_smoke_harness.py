@@ -155,8 +155,19 @@ class RecordingHerdrRunnerTests(unittest.TestCase):
         )
         self.assertEqual(recorder.created_coordinators_workspaces, ["w1"])
         recorder(
-            [binary, "agent", "start", "mzb1_x_claude_default", "--workspace", "w1",
-             "--", "claude"],
+            [
+                binary, "pane", "split", "w1:p1", "--direction", "down",
+                "--cwd", "/project", "--env", "MOZYO_WORKSPACE_ID=x",
+                "--env", "MOZYO_AGENT_ROLE=claude",
+                "--env", "MOZYO_LANE_ID=default", "--no-focus",
+            ],
+            capture_output=True, text=True, timeout=5, env={},
+        )
+        recorder(
+            [
+                binary, "agent", "start", "mza1_aaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--kind", "claude", "--pane", "w1:p2", "--",
+            ],
             capture_output=True, text=True, timeout=5, env={},
         )
         self.assertEqual(recorder.launched_locators, ["w1:p2"])

@@ -156,12 +156,12 @@ class SublaneCreateLaneKindCommandRouteTest(unittest.TestCase):
 
     @staticmethod
     def _second_split(herdr):
-        second = herdr.start_argvs[1]
-        return second[second.index("--split") + 1] if "--split" in second else None
+        second = herdr.pane_split_argvs[1]
+        return second[second.index("--direction") + 1]
 
     @staticmethod
     def _launch_order(herdr):
-        return [argv[2].rsplit("_", 2)[1] for argv in herdr.start_argvs]
+        return [argv[argv.index("--kind") + 1] for argv in herdr.start_argvs]
 
     def test_grandchild_command_places_and_orders_its_first_launch(self) -> None:
         self._write_config(

@@ -103,7 +103,7 @@ class FreshCreateLaunchThreadingTest(unittest.TestCase):
     inverts the owner intent (the placement is wanted on the panes being created).
 
     These drive the real `HerdrSublaneActuatorOps.append_lane_column` over the shared fake
-    herdr and assert the `agent start` argv the lane is actually launched with.
+    herdr and assert the `pane split` placement and pane-bound launch actually driven.
     """
 
     def setUp(self) -> None:
@@ -165,8 +165,8 @@ class FreshCreateLaunchThreadingTest(unittest.TestCase):
 
     @staticmethod
     def _second_split(herdr: FakeHerdr):
-        second = herdr.start_argvs[1]
-        return second[second.index("--split") + 1] if "--split" in second else None
+        second = herdr.pane_split_argvs[1]
+        return second[second.index("--direction") + 1]
 
     def test_fresh_create_places_the_first_launch_by_the_declared_kind(self) -> None:
         self._config(
@@ -204,7 +204,9 @@ class FreshCreateLaunchThreadingTest(unittest.TestCase):
             self._config(config)
             herdr = self._create(lane_kind=kind)
             splits[kind] = self._second_split(herdr)
-            orders[kind] = [argv[2].rsplit("_", 2)[1] for argv in herdr.start_argvs]
+            orders[kind] = [
+                argv[argv.index("--kind") + 1] for argv in herdr.start_argvs
+            ]
         self.assertEqual(
             splits,
             {LANE_KIND_DELEGATED_COORDINATOR: "down", LANE_KIND_IMPLEMENTATION: "right"},

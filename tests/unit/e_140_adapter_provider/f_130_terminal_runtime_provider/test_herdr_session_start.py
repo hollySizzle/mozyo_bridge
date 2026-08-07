@@ -192,7 +192,8 @@ class Herdr080CapabilityPreflightTest(unittest.TestCase):
         def runner(argv, **_kwargs):
             tail = argv[1:]
             text = (
-                "--kind KIND --pane ID --timeout MS"
+                "Usage: herdr agent start <NAME> --kind <KIND> --pane <ID> "
+                "[OPTIONS] [-- [AGENT_ARG]...]"
                 if tail[:2] == ["agent", "start"]
                 else (
                     "Usage: herdr pane split [PANE_ID] --direction right|down "
@@ -206,6 +207,41 @@ class Herdr080CapabilityPreflightTest(unittest.TestCase):
         )
         self.assertIn("--pane", observed.agent_start_help)
         self.assertIn("--direction", observed.pane_split_help)
+
+    def test_agent_start_without_required_name_is_refused(self) -> None:
+        def runner(argv, **_kwargs):
+            text = (
+                "Usage: herdr agent start --kind <KIND> --pane <ID> "
+                "[OPTIONS] [-- [AGENT_ARG]...]"
+                if argv[1:3] == ["agent", "start"]
+                else (
+                    "Usage: herdr pane split [PANE_ID] --direction right|down "
+                    "--cwd PATH --env K=V --focus --no-focus"
+                )
+            )
+            return subprocess.CompletedProcess(argv, 0, stdout=text, stderr="")
+
+        with self.assertRaises(HerdrCliCapabilityError):
+            observe_herdr_cli_capabilities(
+                "/bin/herdr", runner=runner, timeout=1.0, env={}
+            )
+
+    def test_agent_start_without_separator_tail_is_refused(self) -> None:
+        def runner(argv, **_kwargs):
+            text = (
+                "Usage: herdr agent start <NAME> --kind <KIND> --pane <ID>"
+                if argv[1:3] == ["agent", "start"]
+                else (
+                    "Usage: herdr pane split [PANE_ID] --direction right|down "
+                    "--cwd PATH --env K=V --focus --no-focus"
+                )
+            )
+            return subprocess.CompletedProcess(argv, 0, stdout=text, stderr="")
+
+        with self.assertRaises(HerdrCliCapabilityError):
+            observe_herdr_cli_capabilities(
+                "/bin/herdr", runner=runner, timeout=1.0, env={}
+            )
 
     def test_legacy_agent_start_surface_is_refused(self) -> None:
         def runner(argv, **_kwargs):
@@ -3395,6 +3431,33 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(herdr.workspace_creates, [])
         self.assertFalse(_agent_start_calls(herdr))
 
+    def test_role_grouped_release_failure_reports_possible_completed_launch(self) -> None:
+        import contextlib
+
+        from mozyo_bridge.core.state.coordinator_placement_fence import (
+            CoordinatorSharedCreateReleaseError,
+        )
+
+        @contextlib.contextmanager
+        def _release_boom(home):
+            yield
+            raise CoordinatorSharedCreateReleaseError("simulated release failure")
+
+        lock_path = (
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_session_start.coordinator_shared_create_lock"
+        )
+        herdr = _Herdr(created_workspace="wProjects")
+        with tempfile.TemporaryDirectory() as tmp, patch(lock_path, _release_boom):
+            with self.assertRaises(HerdrSessionStartError) as caught:
+                self._shared_coordinator_projects(tmp, herdr, projects=("a",))
+
+        message = str(caught.exception)
+        self.assertIn("agent creation may already have completed", message)
+        self.assertIn("re-observe", message)
+        self.assertEqual(len(herdr.workspace_creates), 1)
+        self.assertEqual(len(_agent_start_calls(herdr)), 2)
+
     def test_role_grouped_concurrent_projects_create_one_shared_workspace(self) -> None:
         import contextlib
         import threading
@@ -3425,7 +3488,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
 
         lock_path = (
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
-            "application.herdr_role_grouped_space.coordinator_shared_create_lock"
+            "application.herdr_session_start.coordinator_shared_create_lock"
         )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3480,12 +3543,15 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                     for thread in threads:
                         thread.join(timeout=30)
 
-        self.assertTrue(results, msg=f"no launch completed: {errors}")
-        self.assertLessEqual(len(errors), 1, msg=f"launch errors: {errors}")
-        for exc in errors.values():
-            self.assertIsInstance(exc, HerdrSessionStartError)
-            self.assertIn("refusing to use an unowned shell pane", str(exc))
+                self.assertTrue(
+                    all(not thread.is_alive() for thread in threads),
+                    "role-grouped launch deadlocked while holding the shared fence",
+                )
+
+        self.assertEqual(errors, {}, msg=f"launch errors: {errors}")
+        self.assertEqual(set(results), {"accounting", "operations"})
         self.assertEqual(len(herdr.workspace_creates), 1)
+        self.assertEqual(len(_agent_start_calls(herdr)), 4)
         self.assertEqual(
             {result.herdr_workspace_id for result in results.values()}, {"wProjects"}
         )
@@ -4019,11 +4085,11 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(herdr.workspace_creates, [])
         self.assertFalse(_agent_start_calls(herdr))
 
-    def test_shared_space_release_failure_after_create_reports_husk_not_zero(self) -> None:
+    def test_shared_space_release_failure_after_launch_reports_possible_actuation(self) -> None:
         # Redmine #14139 R8 review j#83633 F1: a RELEASE failure happens AFTER the
-        # guarded body, so on the clean-slate path the shared `workspace create` has
-        # already run. session-start must NOT report "no workspace was created"; it
-        # must report the labelled husk + un-started agents so a retry adopts it.
+        # guarded body.  Herdr 0.8 extends that body through launch so a concurrent
+        # project never observes a labelled workspace without a managed split anchor;
+        # the error must therefore report possible completed actuation, not a husk.
         import contextlib
 
         from mozyo_bridge.core.state.coordinator_placement_fence import (
@@ -4032,8 +4098,8 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
 
         @contextlib.contextmanager
         def _release_boom(home):
-            # Run the body (list -> resolve -> create) to completion, THEN fail on
-            # release (only when the body succeeded — mirrors the real fence).
+            # Run the whole guarded launch to completion, THEN fail on release (only
+            # when the body succeeded — mirrors the real fence).
             yield
             raise CoordinatorSharedCreateReleaseError("release failed (simulated)")
 
@@ -4050,13 +4116,13 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                         coordinator_placement_mode="shared_space",
                     )
         msg = str(cm.exception)
-        # Phase-accurate: agents NOT started, labelled husk may exist, retry adopts.
-        self.assertIn("were NOT started", msg)
-        self.assertIn("adopt", msg)
+        # Phase-accurate: launch may be complete, so recovery must first re-observe.
+        self.assertIn("agent creation may already have completed", msg)
+        self.assertIn("re-observe", msg)
         self.assertNotIn("no workspace / tab / agent was created", msg)
-        # Truthful state: the workspace WAS created; the agents were NOT started.
+        # Truthful state: both the workspace and requested pair were started.
         self.assertEqual(len(herdr.workspace_creates), 1)
-        self.assertFalse(_agent_start_calls(herdr))
+        self.assertEqual(len(_agent_start_calls(herdr)), 2)
 
     def test_concurrent_clean_slate_launches_create_one_shared_workspace(self) -> None:
         # Redmine #14139 R5 j#83516 required coverage 2 / R6 review j#83569 F1: two
@@ -4144,14 +4210,10 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                     t1.join(timeout=30)
                     t2.join(timeout=30)
 
-        self.assertTrue(results, msg=f"no launch completed: {errors}")
-        self.assertLessEqual(len(errors), 1, msg=f"launch errors: {errors}")
-        for exc in errors.values():
-            self.assertIsInstance(exc, HerdrSessionStartError)
-            self.assertIn("refusing to use an unowned shell pane", str(exc))
-        # Single-flight still creates exactly one workspace. If the loser observes the
-        # label before the winner has a live managed pane, it fails closed and is safe to
-        # retry; it never promotes the temporary root shell into placement authority.
+        self.assertEqual(errors, {}, msg=f"launch errors: {errors}")
+        self.assertEqual(set(results), {"A", "B"})
+        # Single-flight creates exactly one workspace and holds until the winner has
+        # provided a managed split anchor, so the waiting project completes in one run.
         self.assertEqual(
             len(herdr.workspace_creates), 1, "concurrent launches must create one workspace"
         )
@@ -5721,9 +5783,8 @@ class LanePlacementLaunchTest(unittest.TestCase):
 
     def test_configured_default_pair_splits_down_without_a_tab(self) -> None:
         # The primary close condition: `lane_placement.default.split: down` makes the
-        # tab-less coordinator pair split vertically — the 1st slot occupies (no flag),
-        # the 2nd carries `--split down`. `--split` is emitted independently of `--tab`
-        # (herdr 0.7.1 accepts them as independent optional flags).
+        # tab-less coordinator pair split vertically. Herdr 0.8 expresses placement on
+        # each prepared `pane split`; `agent start --pane` then binds the provider.
         herdr = _Herdr(created_workspace="wZ")
         with tempfile.TemporaryDirectory() as tmp:
             self._prepare(
@@ -5880,8 +5941,8 @@ class LanePlacementLaunchTest(unittest.TestCase):
 
     def test_heal_of_configured_primary_reports_order_deferred(self) -> None:
         # The configured primary (`order[0]` = codex) died while claude stayed live.
-        # herdr `agent start` has no pane-target flag, so codex can only be placed as a
-        # split beside the live claude — the physical order cannot be satisfied without
+        # The replacement pane must be split beside the live claude; its physical order
+        # cannot be satisfied without
         # moving a live pane (forbidden). The slot detail says so rather than silently
         # claiming the order was applied; no swap/bounce is issued.
         herdr = _Herdr()

@@ -637,9 +637,13 @@ class LaunchArgvActionIdTest(unittest.TestCase):
         )
 
         return build_agent_start_argv(
-            assigned_name=NAME, provider=ROLE, repo_root=ROOT, workspace_id=WS, lane=LANE,
-            target_workspace="wZ", target_tab="", split="", focus=False, binary="/x/herdr",
-            attest_launcher="/x/mozyo-bridge", store_home="/tmp/h",
+            assigned_name=NAME,
+            native_name="mza1_aaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            pane_locator="wZ:p1",
+            provider=ROLE,
+            workspace_id=WS,
+            lane=LANE,
+            attest_launcher="/x/mozyo-bridge",
             resolved=ResolvedProviderLaunch(
                 provider_id=ROLE, executable="/x/claude", managed_argv=("/x/claude",)
             ),

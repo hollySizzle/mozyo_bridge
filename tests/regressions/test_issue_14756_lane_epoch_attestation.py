@@ -313,6 +313,7 @@ class TheEpochSurvivesTheLaunchToAttestationRoundTrip(unittest.TestCase):
         # what the launcher intended.
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (  # noqa: E501
             build_agent_start_argv,
+            build_pane_launch_env,
         )
         from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_executable import (  # noqa: E501
             ResolvedProviderLaunch,
@@ -323,22 +324,30 @@ class TheEpochSurvivesTheLaunchToAttestationRoundTrip(unittest.TestCase):
         )
         argv = build_agent_start_argv(
             assigned_name="n",
+            native_name="mza1_aaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            pane_locator="w:p1",
             provider="claude",
-            repo_root=Path("/tmp"),
             workspace_id=WS,
             lane=LANE,
-            target_workspace="w",
-            target_tab="",
-            split="",
-            focus=False,
-            binary="/usr/bin/true",
             attest_launcher="/usr/bin/mozyo-bridge",
-            store_home="/tmp/home",
             resolved=resolved,
             launch_argv_extra=(),
             lane_epoch="7",
         )
-        self.assertIn(f"{MOZYO_LANE_EPOCH_ENV}=7", argv)
+        pane_env = build_pane_launch_env(
+            provider="claude",
+            native_name="mza1_aaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            workspace_id=WS,
+            lane=LANE,
+            binary="/usr/bin/true",
+            shim_dir="/tmp/shim",
+            source_path="/usr/bin",
+            attest_launcher="/usr/bin/mozyo-bridge",
+            store_home="/tmp/home",
+            resolved=resolved,
+            lane_epoch="7",
+        )
+        self.assertIn(f"{MOZYO_LANE_EPOCH_ENV}=7", pane_env)
         self.assertIn("--lane-epoch", argv)
 
     def test_an_epochless_lane_keeps_the_launch_byte_invariant(self) -> None:
@@ -346,6 +355,7 @@ class TheEpochSurvivesTheLaunchToAttestationRoundTrip(unittest.TestCase):
         # it did before #14756, or every pre-existing lane becomes unstartable.
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (  # noqa: E501
             build_agent_start_argv,
+            build_pane_launch_env,
         )
         from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_executable import (  # noqa: E501
             ResolvedProviderLaunch,
@@ -356,17 +366,12 @@ class TheEpochSurvivesTheLaunchToAttestationRoundTrip(unittest.TestCase):
         )
         kwargs = dict(
             assigned_name="n",
+            native_name="mza1_aaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            pane_locator="w:p1",
             provider="claude",
-            repo_root=Path("/tmp"),
             workspace_id=WS,
             lane=LANE,
-            target_workspace="w",
-            target_tab="",
-            split="",
-            focus=False,
-            binary="/usr/bin/true",
             attest_launcher="/usr/bin/mozyo-bridge",
-            store_home="/tmp/home",
             resolved=resolved,
             launch_argv_extra=(),
         )
@@ -374,7 +379,26 @@ class TheEpochSurvivesTheLaunchToAttestationRoundTrip(unittest.TestCase):
             build_agent_start_argv(**kwargs),
             build_agent_start_argv(**kwargs, lane_epoch=""),
         )
-        self.assertNotIn(MOZYO_LANE_EPOCH_ENV, " ".join(build_agent_start_argv(**kwargs)))
+        env_kwargs = dict(
+            provider="claude",
+            native_name="mza1_aaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            workspace_id=WS,
+            lane=LANE,
+            binary="/usr/bin/true",
+            shim_dir="/tmp/shim",
+            source_path="/usr/bin",
+            attest_launcher="/usr/bin/mozyo-bridge",
+            store_home="/tmp/home",
+            resolved=resolved,
+        )
+        self.assertEqual(
+            build_pane_launch_env(**env_kwargs),
+            build_pane_launch_env(**env_kwargs, lane_epoch=""),
+        )
+        self.assertNotIn(
+            MOZYO_LANE_EPOCH_ENV,
+            " ".join(build_pane_launch_env(**env_kwargs)),
+        )
 
     def test_a_disagreeing_epoch_is_recorded_as_neither_side(self) -> None:
         # Two properties at once, and the second is Redmine #14756 review j#96949 F1.

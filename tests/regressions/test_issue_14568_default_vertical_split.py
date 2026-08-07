@@ -30,16 +30,15 @@ The fix lives in ``lane_placement.py`` (``product_default_placement`` +
 policy adapter and the focus policy, now keyed on the effective split direction rather than
 on "did the operator declare a block"), and ``repo_local_config_status.py`` (the leaf rows).
 
-The focus policy is load-bearing here and is easy to under-test: herdr splits a container's
-ACTIVE pane, so a pair that renders ``--split down`` but leaves the empty root pane active
-splits the ROOT, and reclaiming that root collapses the split away — leaving herdr's default
-``right`` with the argv still looking correct (R1-F1, j#76613 / j#76622). Every layout
-assertion below therefore runs against ``_LayoutHerdr``, the fake that models that geometry,
-and is taken AFTER the reclaim.
+Herdr 0.8 makes the split target explicit: mozyo first runs ``pane split <anchor>
+--direction down`` and then binds the provider with ``agent start --pane``. The historical
+active-pane/focus failure is retained below as a negative geometry control, but production
+assertions now pin the exact anchor and are taken after root reclaim.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import stat
@@ -134,13 +133,13 @@ def _prepare(
 
 
 def _second_split(herdr) -> str:
-    second = herdr.start_argvs[1]
-    return second[second.index("--split") + 1] if "--split" in second else ""
+    second = herdr.pane_splits[1]
+    return second[second.index("--direction") + 1]
 
 
 def _launched_role(start_argv) -> str:
-    """The provider the durable assigned name in an ``agent start`` argv belongs to."""
-    return start_argv[2].split("_")[-2]
+    """The provider selected explicitly by a Herdr 0.8 ``agent start`` argv."""
+    return start_argv[start_argv.index("--kind") + 1]
 
 
 class ProductDefaultPolicyTest(unittest.TestCase):
@@ -269,24 +268,34 @@ class UndeclaredPairLandsVerticalTest(unittest.TestCase):
         self.assertEqual(herdr.direction_between(panes["codex"], panes["claude"]), "down")
         self.assertEqual(_launched_role(herdr.start_argvs[0]), "codex")
 
-    def test_the_pre_14568_focus_gate_would_have_lost_the_direction(self) -> None:
-        # The negative control for the focus change: replay the pre-#14568 sequence for an
-        # undeclared pair (every launch `--no-focus`, which is what a gate keyed on "the
-        # operator declared a block" would still produce) and confirm the `down` really is
-        # discarded by the reclaim. Without this, the two tests above could pass for the
-        # wrong reason and nobody would notice the focus flag being dropped.
+    def test_splitting_the_second_pane_from_root_would_lose_the_direction(self) -> None:
+        # Herdr 0.8 removed the implicit active-pane dependency, but the anchor still
+        # matters: deliberately splitting both panes from the disposable root makes the
+        # inner `down` collapse when that root is reclaimed. This negative control keeps
+        # the final-layout assertions above from passing on argv alone.
         herdr = _LayoutHerdr(created_workspace="wZ")
 
         def call(*tail):
-            herdr.run(["/fake-herdr", *tail], capture_output=True, text=True, timeout=5, env={})
+            return herdr.run(
+                ["/fake-herdr", *tail],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                env={},
+            )
 
         call("workspace", "create", "--cwd", "/x", "--no-focus")
-        call("agent", "start", "a1", "--workspace", "wZ", "--no-focus", "--", "codex")
-        call(
-            "agent", "start", "a2", "--workspace", "wZ",
-            "--split", "down", "--no-focus", "--", "claude",
+        first = call(
+            "pane", "split", "wZ:p1", "--direction", "right",
+            "--cwd", "/x", "--no-focus",
         )
-        root, a1, a2 = "wZ:p1", "wZ:p2", "wZ:p3"
+        second = call(
+            "pane", "split", "wZ:p1", "--direction", "down",
+            "--cwd", "/x", "--no-focus",
+        )
+        root = "wZ:p1"
+        a1 = json.loads(first.stdout)["result"]["pane"]["pane_id"]
+        a2 = json.loads(second.stdout)["result"]["pane"]["pane_id"]
         call("pane", "close", root)
         self.assertEqual(herdr.direction_between(a1, a2), "right")
 
@@ -344,15 +353,14 @@ class RollbackAndSafetyContractsTest(unittest.TestCase):
 
     def test_single_provider_request_stays_single_and_never_splits_first(self) -> None:
         # The product-default `order` names both providers; a single-provider request must
-        # not grow a peer, and as the container's first occupant it emits no `--split` and
-        # never takes the pair-only focus.
+        # not grow a peer. Herdr 0.8 still prepares exactly one pane for that one process;
+        # there is no second, pair-forming split.
         herdr = _Herdr(created_workspace="wZ")
         with tempfile.TemporaryDirectory() as tmp:
             result, _, _ = _prepare(tmp, herdr=herdr, providers=["claude"], lane="")
         self.assertEqual(len(herdr.start_argvs), 1)
+        self.assertEqual(len(herdr.pane_splits), 1)
         self.assertEqual([s.provider for s in result.slots], ["claude"])
-        self.assertNotIn("--split", herdr.start_argvs[0])
-        self.assertNotIn("--focus", herdr.start_argvs[0])
 
     def test_heal_splits_down_beside_the_live_sibling_and_moves_nothing(self) -> None:
         # An undeclared default-lane heal: the relaunched slot joins the live sibling with
@@ -369,9 +377,10 @@ class RollbackAndSafetyContractsTest(unittest.TestCase):
                     {"name": encode_assigned_name(ws, "codex", ""), "pane_id": "w5:pC"}
                 ],
             )
-        argv = herdr.start_argvs[0]
-        self.assertEqual(argv[argv.index("--split") + 1], "down")
-        self.assertNotIn("--focus", argv)
+        split = herdr.pane_splits[0]
+        self.assertEqual(split[2], "w5:pC")
+        self.assertEqual(split[split.index("--direction") + 1], "down")
+        self.assertNotIn("--focus", split)
         self.assertEqual(herdr.pane_closes, [])
 
     def test_an_undeclared_fresh_pair_still_reclaims_the_root_pane(self) -> None:

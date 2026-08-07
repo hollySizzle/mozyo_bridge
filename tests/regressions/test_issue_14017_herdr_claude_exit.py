@@ -91,32 +91,46 @@ def _symlinked_alias(root: Path, name: str) -> tuple[str, str]:
     return str(alias), real
 
 
-def _env_pairs(argv: list[str]) -> dict[str, str]:
+def _env_pairs(entries: list[str]) -> dict[str, str]:
     out: dict[str, str] = {}
-    for i, tok in enumerate(argv):
-        if tok == "--env" and i + 1 < len(argv) and "=" in argv[i + 1]:
-            key, _, value = argv[i + 1].partition("=")
+    for entry in entries:
+        if "=" in entry:
+            key, _, value = entry.partition("=")
             out[key] = value
     return out
 
 
-def _build(resolved: ResolvedProviderLaunch, *, attest_launcher: str) -> list[str]:
-    return build_agent_start_argv(
+def _build(
+    resolved: ResolvedProviderLaunch, *, attest_launcher: str
+) -> tuple[list[str], list[str]]:
+    argv = build_agent_start_argv(
         assigned_name=NAME,
+        native_name="mza1_aaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        pane_locator="wsX:p1",
         provider=resolved.provider_id,
-        repo_root=Path("/repo"),
         workspace_id="ws1",
         lane="default",
-        target_workspace="wsX",
-        target_tab="",
-        split="",
-        focus=False,
-        binary="/x/herdr",
         attest_launcher=attest_launcher,
-        store_home="/home/store",
         resolved=resolved,
         launch_argv_extra=[],
     )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (  # noqa: E501
+        build_pane_launch_env,
+    )
+
+    pane_env = build_pane_launch_env(
+        provider=resolved.provider_id,
+        native_name="mza1_aaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        workspace_id="ws1",
+        lane="default",
+        binary="/x/herdr",
+        shim_dir="/tmp/shim",
+        source_path="/usr/bin",
+        attest_launcher=attest_launcher,
+        store_home="/home/store",
+        resolved=resolved,
+    )
+    return argv, pane_env
 
 
 class Argv0DecouplingResolverTest(unittest.TestCase):
@@ -197,8 +211,8 @@ class Argv0LaunchArgvTest(unittest.TestCase):
             argv0="/usr/local/bin/claude",
             managed_argv=("--permission-mode", "auto"),
         )
-        argv = _build(resolved, attest_launcher="/abs/mozyo-bridge")
-        env = _env_pairs(argv)
+        argv, pane_env = _build(resolved, attest_launcher="/abs/mozyo-bridge")
+        env = _env_pairs(pane_env)
         self.assertEqual(env.get(MOZYO_PROVIDER_ARGV0_ENV), "/usr/local/bin/claude")
         # The provider command after the LAST `--` (the wrapper's provider separator; the
         # first `--` is herdr's own run-command separator) still starts with the realpath
@@ -215,8 +229,8 @@ class Argv0LaunchArgvTest(unittest.TestCase):
             argv0="/opt/codex",
             tool_shell_env_overrides=True,
         )
-        argv = _build(resolved, attest_launcher="/abs/mozyo-bridge")
-        self.assertNotIn(MOZYO_PROVIDER_ARGV0_ENV, _env_pairs(argv))
+        _argv, pane_env = _build(resolved, attest_launcher="/abs/mozyo-bridge")
+        self.assertNotIn(MOZYO_PROVIDER_ARGV0_ENV, _env_pairs(pane_env))
 
     def test_unwrapped_launch_never_injects_argv0_env(self) -> None:
         # No wrapper to honor the alias -> emit nothing and keep the realpath as argv[0]:
@@ -228,11 +242,12 @@ class Argv0LaunchArgvTest(unittest.TestCase):
             argv0="/usr/local/bin/claude",
             managed_argv=("--permission-mode", "auto"),
         )
-        argv = _build(resolved, attest_launcher="")
-        self.assertNotIn(MOZYO_PROVIDER_ARGV0_ENV, _env_pairs(argv))
+        argv, pane_env = _build(resolved, attest_launcher="")
+        self.assertNotIn(MOZYO_PROVIDER_ARGV0_ENV, _env_pairs(pane_env))
         dd = argv.index("--")
-        # Unwrapped: the run command IS the provider command, argv[0] = realpath.
-        self.assertEqual(argv[dd + 1], "/opt/claude/2.1.214/cli")
+        # Herdr 0.8 selects the canonical executable from ``--kind`` through the
+        # action-private shim. Only provider arguments follow the separator.
+        self.assertEqual(argv[dd + 1 :], ["--permission-mode", "auto"])
 
 
 class Argv0WrapperExecTest(unittest.TestCase):

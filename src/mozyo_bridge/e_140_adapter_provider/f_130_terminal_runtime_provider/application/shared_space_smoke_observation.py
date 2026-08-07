@@ -22,6 +22,7 @@ from typing import Sequence
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     _norm,
+    encode_assigned_name,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
     SHARED_COORDINATOR_WORKSPACE_LABEL,
@@ -30,6 +31,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
     HerdrLauncherIncompatibleError,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_bound_launch import (  # noqa: E501
+    _parse_pane,
 )
 from mozyo_bridge.core.state.coordinator_placement_fence import (
     CoordinatorSharedCreateLockUnavailable,
@@ -114,8 +118,8 @@ class RecordingHerdrRunner:
     - ``workspace create`` — the ``--label`` only (``coordinators`` is a fixed,
       non-secret vocabulary token, never a path);
     - ``workspace list`` — a bare count (the label read the shared path performs);
-    - ``agent start`` — the durable ``mzb1_...`` NAME positional only (a mozyo
-      identity token, not a secret);
+    - ``agent start`` — the durable ``mzb1_...`` identity recovered from the
+      run-owned prepared pane (a mozyo identity token, not a secret);
     - ``pane close`` — the exact ``wN:pM`` handle.
 
     It never records ``--env`` values, ``--cwd`` paths, or any full payload, so the
@@ -153,6 +157,10 @@ class RecordingHerdrRunner:
         #: RECEIPT — ``{workspace_id: label}`` every SUCCESSFUL ``workspace create``
         #: minted (id from the response, label from the request).
         self.created_workspaces: dict = {}
+        #: Prepared Herdr 0.8 pane locator -> logical mozyo identity.  The mapping is
+        #: derived only from this runner's successful ``pane split`` receipt and its
+        #: non-secret MOZYO identity env, never from ambient process state.
+        self._prepared_logical_by_pane: dict[str, str] = {}
 
     def __call__(self, argv, *args, **kwargs):
         rest = list(argv[1:])
@@ -173,10 +181,17 @@ class RecordingHerdrRunner:
             self.workspace_create_labels.append(_flag_value(rest, "--label"))
         elif head == ["workspace", "list"]:
             self.workspace_list_count += 1
-        elif head == ["agent", "start"]:
-            # argv is ["agent", "start", NAME, ...]; NAME is the durable identity.
-            name = rest[2] if len(rest) > 2 and not str(rest[2]).startswith("--") else ""
-            self.agent_start_names.append(_norm(name))
+        elif head == ["agent", "start"] and list(rest) != ["agent", "start", "--help"]:
+            # Herdr 0.8 receives only its bounded native name; the logical mzb1
+            # identity was injected on the exact pane prepared immediately before it.
+            pane = _flag_value(rest, "--pane")
+            name = self._prepared_logical_by_pane.get(pane, "")
+            # Preserve the old direct-runner fixture shape as a compatibility-only
+            # fallback; production 0.8 requests always take the pane-bound branch.
+            if not name and len(rest) > 2 and not str(rest[2]).startswith("--"):
+                name = _norm(rest[2])
+            if name:
+                self.agent_start_names.append(name)
         elif head == ["pane", "close"]:
             self.pane_close_handles.append(rest[2] if len(rest) > 2 else "")
 
@@ -186,7 +201,25 @@ class RecordingHerdrRunner:
             return
         stdout = getattr(result, "stdout", "")
         head = list(rest[:2])
-        if head == ["agent", "start"]:
+        if head == ["pane", "split"]:
+            pane = _parse_pane(stdout)
+            identity_env = {
+                key: value
+                for entry in _flag_values(rest, "--env")
+                for key, separator, value in [entry.partition("=")]
+                if separator and key in {
+                    "MOZYO_WORKSPACE_ID", "MOZYO_AGENT_ROLE", "MOZYO_LANE_ID"
+                }
+            }
+            if pane is not None and set(identity_env) == {
+                "MOZYO_WORKSPACE_ID", "MOZYO_AGENT_ROLE", "MOZYO_LANE_ID"
+            }:
+                self._prepared_logical_by_pane[pane.locator] = encode_assigned_name(
+                    identity_env["MOZYO_WORKSPACE_ID"],
+                    identity_env["MOZYO_AGENT_ROLE"],
+                    identity_env["MOZYO_LANE_ID"],
+                )
+        elif head == ["agent", "start"] and list(rest) != ["agent", "start", "--help"]:
             parsed = _parse_started_agent(stdout)
             if parsed is not None and parsed[0]:
                 self.launched_locators.append(parsed[0])
@@ -257,6 +290,16 @@ def _flag_value(rest: Sequence[str], flag: str) -> str:
     except ValueError:
         return ""
     return tokens[index + 1] if index + 1 < len(tokens) else ""
+
+
+def _flag_values(rest: Sequence[str], flag: str) -> tuple[str, ...]:
+    """Every token following repeated ``flag`` occurrences in ``rest``."""
+    tokens = list(rest)
+    return tuple(
+        tokens[index + 1]
+        for index, token in enumerate(tokens[:-1])
+        if token == flag
+    )
 
 
 # -- per-project + aggregate observations (redaction-safe) ---------------------

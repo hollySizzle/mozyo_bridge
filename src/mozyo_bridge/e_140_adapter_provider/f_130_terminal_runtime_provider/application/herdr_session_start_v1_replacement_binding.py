@@ -98,6 +98,9 @@ def prepare_actuator_lane_session(
         _prepare_session_locked,
         prepare_session,
     )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_bound_launch import (  # noqa: E501
+        ActionPrivateLaunchShimSet,
+    )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.coordinator_placement_mode import (  # noqa: E501
         CoordinatorPlacementError,
     )
@@ -109,8 +112,7 @@ def prepare_actuator_lane_session(
         raise HerdrSessionStartError(
             f"invalid operator coordinator placement for managed lane launch: {exc}"
         ) from exc
-    session_start = _prepare_session_locked if admission_lock_held else prepare_session
-    return session_start(
+    call = dict(
         repo_root=Path(worktree_path),
         providers=list(providers),
         # Redmine #14569 R2-F1: `providers` may be a target-only SUBSET, so the ratio's
@@ -131,6 +133,14 @@ def prepare_actuator_lane_session(
         coordinator_top_workspace_id=coordinator_placement.top_workspace_id,
         launch_cause=launch_cause,
     )
+    if not admission_lock_held:
+        return prepare_session(**call)
+
+    # This path already owns the shared attestation-store lock, so it must not
+    # re-enter the public lock wrapper.  It still owns the same Herdr 0.8
+    # action-private provider shims and deterministic cleanup as that wrapper.
+    with ActionPrivateLaunchShimSet() as launch_shims:
+        return _prepare_session_locked(**call, _launch_shims=launch_shims)
 
 
 # Stable, value-free reasons surfaced through the coordinator's typed heal error.

@@ -549,8 +549,8 @@ class LaunchRatioTest(unittest.TestCase):
     """Close conditions 3 / 4 / 7 / 8: what a real launch does with the declared ratio.
 
     Driven through the shared stateful fake herdr at the subprocess ``Runner`` boundary, so
-    ``prepare_session`` runs for real end to end: the divider is created by an
-    ``agent start --split``, the root pane is reclaimed, and only then does the ratio rail
+    ``prepare_session`` runs for real end to end: the divider is created by a Herdr 0.8
+    ``pane split --direction``, the root pane is reclaimed, and only then does the ratio rail
     read and move herdr's own layout. The fake's ``pane resize`` reproduces herdr's measured
     arithmetic (0.5 amount cap, 0.1..0.9 clamp), so a pass here means the code converged
     against the real clamps rather than against a compliant stub.
@@ -711,8 +711,8 @@ class LaunchRatioTest(unittest.TestCase):
     def test_a_target_only_secondary_heal_divides_the_divider_it_just_created(self) -> None:
         # Review j#91217 R1-F1. The production `replacement_target_only` path calls
         # `prepare_session(providers=(one,))`, so the run's ONLY slot is the replacement and
-        # the surviving sibling belongs to an earlier run. That run still emits `--split`
-        # and therefore creates the pair's divider — the earlier cut skipped it as
+        # the surviving sibling belongs to an earlier run. That run still emits a
+        # pane-bound split and therefore creates the pair's divider — the earlier cut skipped it as
         # `not_applicable`, dropping the declared ratio while reporting success.
         herdr = FakeHerdr()
         config = LanePlacementConfig.from_record({"sublane": {"ratio": 0.8}})
@@ -1261,10 +1261,11 @@ class TargetOnlyProductionSeamTest(unittest.TestCase):
                 tmp, healed_provider="claude", spy=spy, results=results
             )
             live_ratio = fake.split_ratio_of(pane)
-            starts = [c for c in fake.calls if c[:2] == ["agent", "start"]]
+            splits = fake.pane_split_argvs
         # The heal really created the divider — otherwise the rail is out of scope and this
         # would prove nothing about forwarding.
-        self.assertIn("--split", starts[-1])
+        self.assertIn("--direction", splits[-1])
+        self.assertEqual(splits[-1][splits[-1].index("--direction") + 1], "down")
         # The exact value that crossed the last hop, so a silently dropped forwarding is
         # named rather than merely inferred from the geometry.
         self.assertEqual([list(o or ()) for o in spy[-1:]], [["codex", "claude"]])

@@ -56,6 +56,26 @@ class _RebootHerdr:
     def run(self, argv, capture_output=None, text=None, timeout=None, env=None, **kw):
         rest = list(argv[1:])
         self.calls.append(rest)
+        if rest == ["agent", "start", "--help"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=(
+                    "Usage: herdr agent start <NAME> --kind <KIND> --pane <ID> "
+                    "[--timeout <MS>] [-- [AGENT_ARG]...]\n"
+                ),
+                stderr="",
+            )
+        if rest == ["pane", "split", "--help"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=(
+                    "Usage: herdr pane split [PANE_ID] --direction right|down "
+                    "[--cwd PATH] [--env KEY=VALUE] [--focus] [--no-focus]\n"
+                ),
+                stderr="",
+            )
         if rest == ["agent", "list"]:
             return subprocess.CompletedProcess(
                 argv, 0, stdout=json.dumps({"agents": self._rows}), stderr=""
@@ -133,7 +153,22 @@ class HostRestartRecoveryScenarioTest(unittest.TestCase):
         self.assertEqual(by_provider["claude"].outcome, SLOT_ADOPTED)
         self.assertEqual(by_provider["claude"].locator, "w19:p4")
         # never-clobber consistency: the pass is read-only — no destructive herdr side effect.
-        self.assertEqual([c for c in herdr.calls if c[:2] == ["agent", "start"]], [])
+        self.assertEqual(
+            [
+                c for c in herdr.calls
+                if c[:2] == ["agent", "start"]
+                and c != ["agent", "start", "--help"]
+            ],
+            [],
+        )
+        self.assertEqual(
+            [
+                c for c in herdr.calls
+                if c[:2] == ["pane", "split"]
+                and c != ["pane", "split", "--help"]
+            ],
+            [],
+        )
         self.assertEqual([c for c in herdr.calls if c[:2] == ["pane", "close"]], [])
         self.assertEqual([c for c in herdr.calls if c[:2] == ["workspace", "create"]], [])
 

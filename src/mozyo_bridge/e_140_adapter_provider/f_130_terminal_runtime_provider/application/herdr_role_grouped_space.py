@@ -280,6 +280,46 @@ class SharedProjectCoordinatorWorkspace:
     base_pane_id: str = ""
 
 
+def _resolve_project_coordinator_workspace_under_lock(
+    *,
+    rows: Sequence[Mapping[str, object]],
+    workspace_id: str,
+    lane_id: str,
+    adopted_locators: Sequence[str],
+    binary: str,
+    repo_root: Path,
+    runner,
+    timeout: float,
+    env: Mapping[str, str],
+) -> SharedProjectCoordinatorWorkspace:
+    """Resolve/create while the session or public wrapper owns the shared fence."""
+    own_target = _shared_project_coordinator_own_target(
+        rows, workspace_id, lane_id, adopted_locators
+    )
+    labels = _list_workspace_labels(binary, runner, timeout)
+    target = _shared_project_coordinator_target(
+        labels, workspace_id=workspace_id
+    )
+    if own_target:
+        # Launch-time-only migration rule: a live lane stays pinned until it
+        # is explicitly retired and relaunched; this function never moves a
+        # live pane.  The global exact-label authority must still be readable
+        # and singular before any heal, otherwise a duplicate shared surface
+        # would survive undetected merely because this project has an own pin.
+        return SharedProjectCoordinatorWorkspace(own_target)
+    if target:
+        return SharedProjectCoordinatorWorkspace(target)
+    target, base_pane = _create_workspace(
+        binary,
+        repo_root,
+        runner,
+        timeout,
+        env,
+        label=PROJECT_COORDINATOR_WORKSPACE_LABEL,
+    )
+    return SharedProjectCoordinatorWorkspace(target, base_pane)
+
+
 def resolve_project_coordinator_workspace(
     *,
     rows: Sequence[Mapping[str, object]],
@@ -292,34 +332,20 @@ def resolve_project_coordinator_workspace(
     timeout: float,
     env: Mapping[str, str],
 ) -> SharedProjectCoordinatorWorkspace:
-    """Resolve/adopt/create the role-grouped shared project-coordinator workspace."""
-    own_target = _shared_project_coordinator_own_target(
-        rows, workspace_id, lane_id, adopted_locators
-    )
+    """Resolve/adopt/create beneath this call's short shared-create fence."""
     try:
         with coordinator_shared_create_lock(mozyo_bridge_home()):
-            labels = _list_workspace_labels(binary, runner, timeout)
-            target = _shared_project_coordinator_target(
-                labels, workspace_id=workspace_id
+            return _resolve_project_coordinator_workspace_under_lock(
+                rows=rows,
+                workspace_id=workspace_id,
+                lane_id=lane_id,
+                adopted_locators=adopted_locators,
+                binary=binary,
+                repo_root=repo_root,
+                runner=runner,
+                timeout=timeout,
+                env=env,
             )
-            if own_target:
-                # Launch-time-only migration rule: a live lane stays pinned until it
-                # is explicitly retired and relaunched; this function never moves a
-                # live pane.  The global exact-label authority must still be readable
-                # and singular before any heal, otherwise a duplicate shared surface
-                # would survive undetected merely because this project has an own pin.
-                return SharedProjectCoordinatorWorkspace(own_target)
-            if target:
-                return SharedProjectCoordinatorWorkspace(target)
-            target, base_pane = _create_workspace(
-                binary,
-                repo_root,
-                runner,
-                timeout,
-                env,
-                label=PROJECT_COORDINATOR_WORKSPACE_LABEL,
-            )
-            return SharedProjectCoordinatorWorkspace(target, base_pane)
     except CoordinatorSharedCreateReleaseError as exc:
         raise HerdrSessionStartError(
             "managed launch resolved the shared project-coordinator workspace but "

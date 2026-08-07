@@ -881,9 +881,10 @@ class InstalledFaultHarness:
         # The locator-present shell-residue worker: a real inventory row (revision-carrying,
         # foreground_cwd a real checkout) whose detected agent is blank => stale.
         name = encode_assigned_name(ws_id, "claude", lane_id)
+        lane_tab = f"{lane_ws}:t1"
         locator = self.fake.seed_agent(
             name, workspace_id=lane_ws, provider="", status=STALE_SLOT_STATUS,
-            revision=worker_revision, detected_agent="", cwd=str(repo),
+            revision=worker_revision, detected_agent="", cwd=str(repo), tab_id=lane_tab,
         )
         self._locators[name] = locator
 
@@ -926,7 +927,7 @@ class InstalledFaultHarness:
         # splits the pair; without a live gateway the fresh worker launch has nothing to adopt).
         gateway_locator = self.fake.seed_agent(
             encode_assigned_name(ws_id, "codex", lane_id), workspace_id=lane_ws,
-            provider="codex", cwd=str(repo),
+            provider="codex", cwd=str(repo), tab_id=lane_tab,
         )
         action_id = stale_worker_recovery_action_id(
             lane_id=lane_id, role="claude", provider="claude", assigned_name=name, locator=locator,

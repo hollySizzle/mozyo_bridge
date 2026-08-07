@@ -9,9 +9,9 @@ Why this module exists
 ----------------------
 Today's herdr test doubles are inline per-file fakes (``_StatefulHerdr`` /
 ``RecordingRunner`` / ``FakePort`` / ``_CloseHerdr`` / …) redefined across 50+
-modules; none of them share a workspace↔pane↔agent state machine, so the herdr
-0.7.1 lifecycle contracts (pane-close→workspace auto-vanish, ``--workspace``
-prefix placement, ``agent list`` decode, ``wait`` change-semantics) drift
+modules; none of them share a workspace↔pane↔agent state machine, so the Herdr
+lifecycle contracts (pane-close→workspace auto-vanish, pane-bound placement,
+``agent list`` decode, ``wait`` change-semantics) drift
 independently and no single canonical model exists (design §1.2). This module is
 that single canonical model: a stateful fake injected at the **same ``Runner``
 port the real code uses** (:data:`~...infrastructure.herdr_transport.Runner` =
@@ -22,16 +22,15 @@ collaborator).
 
 Contract faithfulness (design §1.1, modelled faces A–F)
 ------------------------------------------------------
-- **A ``agent start``** — parses ``agent start <NAME> [--cwd] [--workspace <id>]
-  [--env K=V]... [--no-focus] [--permission-mode M] -- <provider> [argv…]``,
-  applies ``NAME`` directly (``result.agent.name == NAME``), mints a live locator
-  ``<workspace>:p<n>`` inside the requested ``--workspace``, and returns the single
-  ``type: agent_started`` envelope whose locator is ``result.agent.pane_id``.
+- **A ``pane split`` + ``agent start``** — models Herdr 0.8's two-step launch:
+  ``pane split <PANE_ID> --direction ... --cwd ... --env ...`` creates the exact
+  pane, then ``agent start <NAME> --kind <KIND> --pane <PANE_ID> -- [argv…]``
+  binds the process to it and returns ``result.agent.pane_id``.
 - **B ``agent list``** — renders the live inventory from state; each row carries
-  the durable ``name`` and the transient locator under ``pane_id`` (alias
+  the managed ``name`` and the transient locator under ``pane_id`` (alias
   ``pane`` / ``location`` selectable, matching the real decode aliases).
 - **C ``agent get`` / name persistence** — a started agent's assigned name is
-  stable; ``agent get`` nests the status token under ``result.agent`` (live 0.7.1
+  stable; ``agent get`` nests the status token under ``result.agent`` (live Herdr
   shape). The locator is transient (re-minted per launch), never the identity.
 - **D ``workspace create``** — mints a fresh ``w<n>`` workspace born with exactly
   one empty base ``root_pane`` (``pane_count: 1``), reproducing the cold-start base
@@ -41,17 +40,18 @@ Contract faithfulness (design §1.1, modelled faces A–F)
   workspace has no husk). Symmetrically, when a **tab** has zero panes left the
   tab auto-vanishes (live-measured #13411 j#73668), the tab analogue of E.
 - **H ``workspace list``** (Redmine #14139) — renders each live workspace as
-  ``{workspace_id, label}`` in the real 0.7.1 ``workspace_list`` envelope, where the
+  ``{workspace_id, label}`` in the live ``workspace_list`` envelope, where the
   ``label`` is the verbatim value a ``workspace create --label`` set. This is the
   backend-readable adopt authority the shared ``coordinators`` space keys on, so a
   create carrying ``--label coordinators`` is visible to a later project's adopt, and
   a vanished workspace is absent (residue verification, Redmine #14187).
-- **G ``tab create`` / ``agent start --tab [--split right]``** (Redmine #13411) —
+- **G ``tab create`` / ``pane split``** (Redmine #13411) —
   ``tab create --workspace <id>`` mints a fresh ``<id>:t<n>`` tab born with one
   empty ``root_pane`` (the tab analogue of D), returned in a ``tab_created``
-  envelope. ``agent start --tab <tab_id>`` places the launched pane in that tab;
-  ``--split right`` places it beside the tab's live pane. Each ``agent list`` row
-  carries its ``tab_id`` (real 0.7.1 rows expose it alongside ``workspace_id``),
+  envelope. ``pane split <pane_id> --direction right`` creates the exact launch
+  pane beside the tab's live pane before ``agent start --pane`` binds it. Each
+  ``agent list`` row
+  carries its ``tab_id`` (live rows expose it alongside ``workspace_id``),
   so a heal reads the live slot's tab to rejoin it.
 - **F ``wait agent-status``** — **change-semantics** (PoC E9): a wait returns only
   on a *change into* the requested status; already being in it does **not** return
@@ -97,7 +97,7 @@ if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 
-# -- herdr status tokens (the real 0.7.1 vocabulary the wait/get faces speak) ----
+# -- Herdr status tokens (the live vocabulary the wait/get faces speak) ----------
 #: Runtime status tokens a herdr agent reports (PoC E9 / E12–E14). These are the
 #: raw herdr tokens, not mozyo runtime states — the real ``agent_state`` reader
 #: maps them; the fake only echoes whichever the state machine holds.
@@ -152,6 +152,8 @@ class _Workspace:
     cwd: str = ""
     pane_seq: int = 0  # monotonic per-workspace pane counter (never reused)
     pane_tab: dict = field(default_factory=dict)  # pane_id -> tab_id ("" = default)
+    pane_cwd: dict = field(default_factory=dict)  # pane_id -> inherited cwd
+    pane_env: dict = field(default_factory=dict)  # pane_id -> injected environment
     tab_seq: int = 0  # monotonic per-workspace tab counter (never reused)
     #: The stable operator-readable label set at ``workspace create --label`` (Redmine
     #: #13380 sublane host / #14139 shared ``coordinators`` space). Verbatim; ``""``
@@ -165,6 +167,7 @@ class _Agent:
     """One launched agent: durable name + transient locator + snapshot status."""
 
     name: str
+    logical_name: str
     pane_id: str
     workspace_id: str
     provider: str = ""
@@ -264,6 +267,7 @@ class FakeHerdr:
         cwd: str = "",
         revision: str = "",
         detected_agent: "str | None" = None,
+        tab_id: str = "",
     ) -> str:
         """Place a live agent directly in ``workspace_id``, returning its locator.
 
@@ -271,7 +275,9 @@ class FakeHerdr:
         scenario can stand up an existing lane slot without replaying its launch.
         ``revision`` / ``detected_agent`` pin the richer ``agent list`` row fields a
         recover-stale generation gate / shell-residue classification reads; both default to
-        the legacy minimal shape (field absent).
+        the legacy minimal shape (field absent). ``tab_id`` lets a scenario seed the Herdr 0.8
+        inventory shape, where an existing agent reports its concrete tab and a pane split on
+        that agent must remain in the same container.
         """
         ws = self._workspaces.get(workspace_id)
         if ws is None:
@@ -279,13 +285,17 @@ class FakeHerdr:
                 f"seed_agent: unknown workspace {workspace_id!r}"
             )
         pane_id = self._mint_pane(ws)
+        if tab_id:
+            ws.pane_tab[pane_id] = tab_id
         self._agents[pane_id] = _Agent(
             name=name,
+            logical_name=name,
             pane_id=pane_id,
             workspace_id=workspace_id,
             provider=provider,
             status=status,
             cwd=cwd,
+            tab_id=tab_id,
             revision=revision,
             detected_agent=detected_agent,
         )
@@ -294,7 +304,7 @@ class FakeHerdr:
     def misplace_next_launch(self, workspace_id: str) -> None:
         """Make the next ``agent start`` return a locator in ``workspace_id``.
 
-        Reproduces herdr ignoring ``--workspace`` (spec drift) so the *real*
+        Reproduces Herdr reporting a pane in the wrong workspace so the *real*
         session-start code sees a launch that landed outside the requested
         workspace and fails closed (the #13330 review j#73231 guard). The fake
         renders the mislocated locator; it renders no verdict.
@@ -353,6 +363,26 @@ class FakeHerdr:
         """
         rest = list(argv[1:])
         self.calls.append(rest)
+        if rest == ["agent", "start", "--help"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=(
+                    "Usage: herdr agent start <NAME> --kind <KIND> --pane <ID> "
+                    "[--timeout <MS>] [-- [AGENT_ARG]...]\n"
+                ),
+                stderr="",
+            )
+        if rest == ["pane", "split", "--help"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=(
+                    "Usage: herdr pane split [PANE_ID] --direction right|down "
+                    "[--cwd PATH] [--env KEY=VALUE] [--focus] [--no-focus]\n"
+                ),
+                stderr="",
+            )
         head = rest[:2]
         if head == ["workspace", "create"]:
             return self._cmd_workspace_create(argv, rest)
@@ -360,6 +390,8 @@ class FakeHerdr:
             return self._cmd_workspace_list(argv)
         if head == ["tab", "create"]:
             return self._cmd_tab_create(argv, rest)
+        if head == ["pane", "split"]:
+            return self._cmd_pane_split(argv, rest)
         if head == ["agent", "start"]:
             return self._cmd_agent_start(argv, rest)
         if head == ["agent", "list"]:
@@ -421,7 +453,7 @@ class FakeHerdr:
 
     def _cmd_workspace_list(self, argv):
         # H (Redmine #14139): the live workspace label authority. Each live workspace
-        # contributes `{workspace_id, label}` in the real 0.7.1 envelope shape, so the
+        # contributes `{workspace_id, label}` in the live envelope shape, so the
         # shared-`coordinators`-space resolver can be exercised end-to-end (a create
         # carrying `--label coordinators` is visible to a later project's adopt). A
         # vanished workspace (its last pane closed) is absent — residue verification.
@@ -462,34 +494,48 @@ class FakeHerdr:
             },
         )
 
+    def _cmd_pane_split(self, argv, rest):
+        parsed = _parse_pane_split(rest)
+        ws = self._workspace_of_pane(parsed.anchor_pane)
+        if ws is None:
+            return _err(argv, f"no such pane: {parsed.anchor_pane}")
+        tab_id = ws.pane_tab.get(parsed.anchor_pane, "")
+        pane_id = self._mint_pane(ws, cwd=parsed.cwd, env=parsed.env)
+        if tab_id:
+            ws.pane_tab[pane_id] = tab_id
+        key = (ws.workspace_id, tab_id)
+        self._split_direction[key] = parsed.direction
+        self._split_ratio.setdefault(key, 0.5)
+        return _ok(
+            argv,
+            {
+                "result": {
+                    "type": "pane_info",
+                    "pane": {
+                        "pane_id": pane_id,
+                        "workspace_id": ws.workspace_id,
+                        "tab_id": tab_id or f"{ws.workspace_id}:t1",
+                        "cwd": ws.pane_cwd[pane_id],
+                    },
+                }
+            },
+        )
+
     def _cmd_agent_start(self, argv, rest):
         parsed = _parse_agent_start(rest)
-        # Resolve (or auto-create) the target workspace. Real herdr with no
-        # ``--workspace`` auto-creates one (the empty-base-pane source, #13330);
-        # with ``--workspace`` it lands in that existing workspace.
-        if parsed.workspace_id:
-            ws = self._workspaces.get(parsed.workspace_id)
-            if ws is None:
-                return _err(argv, f"unknown workspace: {parsed.workspace_id}")
-        else:
-            ws = self._mint_workspace(cwd=parsed.cwd)
-        # A `--tab` must name a live tab in the workspace (its root pane exists at
-        # launch time, before the reclaim). Fail closed on an unknown tab so the
-        # real code sees a launch failure rather than a fabricated placement (#13411).
-        if parsed.tab_id and parsed.tab_id not in set(ws.pane_tab.values()):
-            return _err(argv, f"unknown tab: {parsed.tab_id}")
-        pane_id = self._mint_pane(ws)
-        if parsed.tab_id:
-            ws.pane_tab[pane_id] = parsed.tab_id
-        if parsed.split:
-            # G (#14569): this launch is what CREATES the container's divider, so the
-            # container's split direction is whatever this argv asked for. herdr's own
-            # `agent start` has no `--ratio`, so the fresh divider starts at herdr's even
-            # default and only a later `pane resize` moves it.
-            self._split_direction[(ws.workspace_id, parsed.tab_id)] = parsed.split
-            self._split_ratio.setdefault((ws.workspace_id, parsed.tab_id), 0.5)
+        ws = self._workspace_of_pane(parsed.pane_id)
+        if ws is None:
+            return _err(argv, f"no such pane: {parsed.pane_id}")
+        if parsed.pane_id in self._agents:
+            return _err(argv, f"pane already has an agent: {parsed.pane_id}")
+        pane_id = parsed.pane_id
+        parsed.workspace_id = ws.workspace_id
+        parsed.tab_id = ws.pane_tab.get(pane_id, "") or f"{ws.workspace_id}:t1"
+        parsed.cwd = ws.pane_cwd.get(pane_id, ws.cwd)
+        parsed.env = dict(ws.pane_env.get(pane_id, {}))
         self._agents[pane_id] = _Agent(
             name=parsed.name,
+            logical_name=_logical_name_from_env(parsed.env) or parsed.name,
             pane_id=pane_id,
             workspace_id=ws.workspace_id,
             provider=parsed.provider,
@@ -507,7 +553,7 @@ class FakeHerdr:
         elif self._misplace_next is not None:
             rendered_locator = f"{self._misplace_next}:p1"
             self._misplace_next = None
-        # Tab-axis rendering (Redmine #13411): live 0.7.1 `agent_started` returns the
+        # Tab-axis rendering (Redmine #13411): live `agent_started` returns the
         # landed `workspace_id` / `tab_id` alongside `pane_id`. Echo the requested tab
         # (faithful placement) unless a misplacement / missing-tab stimulus is armed.
         rendered_tab = parsed.tab_id
@@ -539,7 +585,7 @@ class FakeHerdr:
         for agent in self._agents.values():
             row = {"name": agent.name, "agent_status": agent.status}
             row[self.locator_render_key] = agent.pane_id
-            # Real 0.7.1 rows carry the slot's tab (#13411); render it when the
+            # Live rows carry the slot's tab (#13411); render it when the
             # agent lives in one so a heal can rejoin the same tab.
             if agent.tab_id:
                 row["tab_id"] = agent.tab_id
@@ -668,7 +714,7 @@ class FakeHerdr:
         if len(panes) <= 2:
             # G (#14569): a divider exists only while two panes share it. Closing one
             # collapses the split, so the stored ratio must go with it — a later
-            # `agent start --split` builds a FRESH divider at herdr's even default rather
+            # A later `pane split` builds a FRESH divider at herdr's even default rather
             # than inheriting the dead one's share. Keeping it would let a heal report
             # `matched` without ever having divided anything.
             self._split_ratio.pop((ws.workspace_id, tab), None)
@@ -677,6 +723,8 @@ class FakeHerdr:
         # another pane still references it. `pane_tab` is the sole tab registry, so a
         # tab with no remaining panes simply stops being referenced (auto-vanish).
         ws.pane_tab.pop(pane_id, None)
+        ws.pane_cwd.pop(pane_id, None)
+        ws.pane_env.pop(pane_id, None)
         self._agents.pop(pane_id, None)
         # E: the last pane closing auto-vanishes the workspace (no husk, #13380).
         if not ws.panes:
@@ -718,14 +766,21 @@ class FakeHerdr:
         ws = _Workspace(workspace_id=wid, cwd=cwd)
         # Born with exactly one empty base pane (pane_count: 1), #13330.
         ws.pane_seq = 1
-        ws.panes.append(f"{wid}:p1")
+        root_pane = f"{wid}:p1"
+        ws.panes.append(root_pane)
+        ws.pane_cwd[root_pane] = cwd
+        ws.pane_env[root_pane] = {}
         self._workspaces[wid] = ws
         return ws
 
-    def _mint_pane(self, ws: _Workspace) -> str:
+    def _mint_pane(
+        self, ws: _Workspace, *, cwd: str = "", env: Optional[dict] = None
+    ) -> str:
         ws.pane_seq += 1
         pane_id = f"{ws.workspace_id}:p{ws.pane_seq}"
         ws.panes.append(pane_id)
+        ws.pane_cwd[pane_id] = cwd or ws.cwd
+        ws.pane_env[pane_id] = dict(env or {})
         return pane_id
 
     def _workspace_of_pane(self, pane_id: str) -> Optional[_Workspace]:
@@ -742,7 +797,7 @@ class FakeHerdr:
         if agent is not None:
             return agent
         for candidate in self._agents.values():
-            if candidate.name == target:
+            if candidate.name == target or candidate.logical_name == target:
                 return candidate
         return None
 
@@ -785,7 +840,11 @@ class FakeHerdr:
     def agents(self) -> list:
         """The live agents as ``{"name", "pane_id", "status"}`` dicts (list order)."""
         return [
-            {"name": a.name, "pane_id": a.pane_id, "status": a.status}
+            {
+                "name": a.logical_name or a.name,
+                "pane_id": a.pane_id,
+                "status": a.status,
+            }
             for a in self._agents.values()
         ]
 
@@ -808,13 +867,16 @@ class FakeHerdr:
             "workspaces": [
                 {
                     "workspace_id": ws.workspace_id, "cwd": ws.cwd, "panes": list(ws.panes),
-                    "pane_seq": ws.pane_seq, "pane_tab": dict(ws.pane_tab), "tab_seq": ws.tab_seq,
+                    "pane_seq": ws.pane_seq, "pane_tab": dict(ws.pane_tab),
+                    "pane_cwd": dict(ws.pane_cwd), "pane_env": dict(ws.pane_env),
+                    "tab_seq": ws.tab_seq,
                 }
                 for ws in self._workspaces.values()
             ],
             "agents": [
                 {
-                    "name": a.name, "pane_id": a.pane_id, "workspace_id": a.workspace_id,
+                    "name": a.name, "logical_name": a.logical_name,
+                    "pane_id": a.pane_id, "workspace_id": a.workspace_id,
                     "provider": a.provider, "cwd": a.cwd, "status": a.status, "tab_id": a.tab_id,
                     "revision": a.revision, "detected_agent": a.detected_agent,
                 }
@@ -834,11 +896,15 @@ class FakeHerdr:
             fake._workspaces[wsd["workspace_id"]] = _Workspace(
                 workspace_id=wsd["workspace_id"], panes=list(wsd.get("panes", [])),
                 cwd=wsd.get("cwd", ""), pane_seq=int(wsd.get("pane_seq", 0)),
-                pane_tab=dict(wsd.get("pane_tab", {})), tab_seq=int(wsd.get("tab_seq", 0)),
+                pane_tab=dict(wsd.get("pane_tab", {})),
+                pane_cwd=dict(wsd.get("pane_cwd", {})),
+                pane_env=dict(wsd.get("pane_env", {})),
+                tab_seq=int(wsd.get("tab_seq", 0)),
             )
         for ad in state.get("agents", []):
             fake._agents[ad["pane_id"]] = _Agent(
-                name=ad["name"], pane_id=ad["pane_id"], workspace_id=ad["workspace_id"],
+                name=ad["name"], logical_name=ad.get("logical_name", ad["name"]),
+                pane_id=ad["pane_id"], workspace_id=ad["workspace_id"],
                 provider=ad.get("provider", ""), cwd=ad.get("cwd", ""),
                 status=ad.get("status", DEFAULT_START_STATUS), tab_id=ad.get("tab_id", ""),
                 revision=ad.get("revision", ""), detected_agent=ad.get("detected_agent"),
@@ -847,7 +913,11 @@ class FakeHerdr:
 
     def agent_named(self, name: str) -> Optional[dict]:
         """The single live agent carrying ``name``, or ``None`` (fail on duplicate)."""
-        matches = [a for a in self._agents.values() if a.name == name]
+        matches = [
+            a
+            for a in self._agents.values()
+            if a.name == name or a.logical_name == name
+        ]
         if len(matches) > 1:
             raise UnknownHerdrCommandError(
                 f"agent_named({name!r}): {len(matches)} live agents share the name"
@@ -855,12 +925,30 @@ class FakeHerdr:
         if not matches:
             return None
         a = matches[0]
-        return {"name": a.name, "pane_id": a.pane_id, "status": a.status}
+        return {
+            "name": a.logical_name or a.name,
+            "native_name": a.name if a.logical_name and a.logical_name != a.name else "",
+            "pane_id": a.pane_id,
+            "status": a.status,
+        }
 
     @property
     def start_argvs(self) -> list:
         """Every ``agent start`` argv tail driven so far (launch-argv assertions)."""
-        return [c for c in self.calls if c[:2] == ["agent", "start"]]
+        return [
+            c
+            for c in self.calls
+            if c[:2] == ["agent", "start"] and c != ["agent", "start", "--help"]
+        ]
+
+    @property
+    def pane_split_argvs(self) -> list:
+        """Every mutating ``pane split`` argv tail driven so far."""
+        return [
+            c
+            for c in self.calls
+            if c[:2] == ["pane", "split"] and c != ["pane", "split", "--help"]
+        ]
 
 
 class _FakeWaitProcess:
@@ -893,18 +981,12 @@ class _FakeWaitProcess:
 @dataclass
 class _StartArgs:
     name: str
+    pane_id: str = ""
+    kind: str = ""
     workspace_id: str = ""
     tab_id: str = ""
-    split: str = ""
     cwd: str = ""
     provider: str = ""
-    no_focus: bool = False
-    #: The explicit-placement first launch (Redmine #13646 R1-F1) passes ``--focus`` so the
-    #: container's split target is the 1st agent rather than the empty root pane. A real
-    #: herdr 0.7.1 flag; modelled here (Redmine #13647 T1b) because the create path now
-    #: reaches that branch whenever a lane declares an explicit placement.
-    focus: bool = False
-    permission_mode: str = ""
     env: dict = field(default_factory=dict)
     launch_argv: list = field(default_factory=list)
 
@@ -924,45 +1006,97 @@ def _parse_agent_start(rest: list) -> _StartArgs:
     args = _StartArgs(name=rest[2])
     i = 3
     n = len(rest)
+    if len(args.name) > 32:
+        raise UnknownHerdrCommandError(
+            f"Herdr 0.8 agent name exceeds 32 characters: {args.name!r}"
+        )
     while i < n:
         token = rest[i]
         if token == "--":
-            tail = rest[i + 1 :]
-            args.provider = tail[0] if tail else ""
-            args.launch_argv = tail
+            args.provider = args.kind
+            args.launch_argv = [args.kind, *rest[i + 1 :]]
+            if not args.kind or not args.pane_id:
+                raise UnknownHerdrCommandError(
+                    f"agent start requires --kind and --pane: {rest!r}"
+                )
             return args
-        if token == "--workspace":
-            args.workspace_id = rest[i + 1]
+        if token == "--kind":
+            args.kind = rest[i + 1]
             i += 2
-        elif token == "--tab":
-            args.tab_id = rest[i + 1]
+        elif token == "--pane":
+            args.pane_id = rest[i + 1]
             i += 2
-        elif token == "--split":
-            args.split = rest[i + 1]
+        elif token == "--timeout":
+            i += 2
+        else:
+            raise UnknownHerdrCommandError(
+                f"Herdr 0.8 agent start: unmodelled flag {token!r} in {rest!r}"
+            )
+    raise UnknownHerdrCommandError(
+        f"Herdr 0.8 agent start missing '--' separator: {rest!r}"
+    )
+
+
+@dataclass
+class _PaneSplitArgs:
+    anchor_pane: str
+    direction: str = ""
+    cwd: str = ""
+    env: dict = field(default_factory=dict)
+    focus: bool = False
+
+
+def _parse_pane_split(rest: list) -> _PaneSplitArgs:
+    if len(rest) < 3 or rest[2].startswith("--"):
+        raise UnknownHerdrCommandError(
+            f"pane split requires an anchor pane positional: {rest!r}"
+        )
+    args = _PaneSplitArgs(anchor_pane=rest[2])
+    i = 3
+    while i < len(rest):
+        token = rest[i]
+        if token == "--direction":
+            args.direction = rest[i + 1]
             i += 2
         elif token == "--cwd":
             args.cwd = rest[i + 1]
             i += 2
-        elif token == "--permission-mode":
-            args.permission_mode = rest[i + 1]
-            i += 2
         elif token == "--env":
-            key, _, value = rest[i + 1].partition("=")
+            key, separator, value = rest[i + 1].partition("=")
+            if not key or not separator:
+                raise UnknownHerdrCommandError(
+                    f"pane split received a malformed environment entry: {rest!r}"
+                )
             args.env[key] = value
             i += 2
-        elif token == "--no-focus":
-            args.no_focus = True
-            i += 1
         elif token == "--focus":
             args.focus = True
             i += 1
+        elif token == "--no-focus":
+            args.focus = False
+            i += 1
         else:
             raise UnknownHerdrCommandError(
-                f"agent start: unmodelled flag {token!r} in {rest!r}"
+                f"pane split: unmodelled flag {token!r} in {rest!r}"
             )
-    # No ``--`` separator: a launch with no provider argv is not a shape real
-    # herdr emits, so fail closed rather than invent one.
-    raise UnknownHerdrCommandError(f"agent start missing '--' provider separator: {rest!r}")
+    if args.direction not in {"right", "down"}:
+        raise UnknownHerdrCommandError(
+            f"pane split requires right/down direction: {rest!r}"
+        )
+    return args
+
+
+def _logical_name_from_env(env: dict) -> str:
+    workspace_id = str(env.get("MOZYO_WORKSPACE_ID") or "").strip()
+    role = str(env.get("MOZYO_AGENT_ROLE") or "").strip()
+    lane = str(env.get("MOZYO_LANE_ID") or "").strip() or "default"
+    if not workspace_id or not role:
+        return ""
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+        encode_assigned_name,
+    )
+
+    return encode_assigned_name(workspace_id, role, lane)
 
 
 def _flag_value(rest: list, flag: str) -> str:
@@ -978,8 +1112,8 @@ def _flag_value(rest: list, flag: str) -> str:
 #: which keeps a geometry assertion about the CODE rather than about rounding.
 HERDR_SPLIT_EXTENT = 100
 HERDR_SPLIT_CROSS = 80
-#: The per-call ``--amount`` cap and the ratio clamp herdr 0.7.4 applies (live-measured,
-#: Redmine #14569 j#91140). Both are silent: the CLI exits 0 either way, which is exactly
+#: The per-call ``--amount`` cap and Herdr's live-measured ratio clamp
+#: (Redmine #14569 j#91140). Both are silent: the CLI exits 0 either way, which is exactly
 #: why the production code re-reads ``pane layout`` instead of trusting the exit status.
 HERDR_RESIZE_MAX_AMOUNT = 0.5
 HERDR_MIN_SPLIT_RATIO = 0.1
@@ -1011,7 +1145,7 @@ def render_pane_layout(
 ) -> dict:
     """A ``herdr pane layout`` payload for a container — the one shape both fakes share.
 
-    Reproduces the live 0.7.4 envelope (measured j#91140): panes carry rects, splits carry
+    Reproduces the live envelope (measured j#91140): panes carry rects, splits carry
     ``direction`` / ``ratio`` / ``rect`` and — deliberately, as the real one does — **no
     child pane ids**, so a consumer must identify a pair's divider geometrically. The first
     pane in ``pane_ids`` is the container's occupant (left / top) and the second is the one

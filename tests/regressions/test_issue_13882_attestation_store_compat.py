@@ -89,6 +89,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     HerdrLauncherIncompatibleError,
     preflight_attest_store_schema,
 )
+from support.herdr_fake import FakeHerdr  # noqa: E402
 
 _V2 = HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION
 _NAME = "mzb1_ws1_claude_default"
@@ -1533,16 +1534,29 @@ class ReviewJ80190LockProtocolTest(unittest.TestCase):
             home.mkdir()
             repo = Path(tmp) / "repo"
             repo.mkdir()
+            herdr = FakeHerdr()
             holder = self._hold(home, exclusive=True)
             try:
                 with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}):
                     with self.assertRaises(HerdrLauncherIncompatibleError) as ctx:
                         herdr_session_start.prepare_session(
                             repo_root=repo, providers=["claude"], lane_id="x",
-                            env={"PATH": "/usr/bin"}, runner=None,
+                            env={
+                                "PATH": "/usr/bin",
+                                "MOZYO_HERDR_BINARY": sys.executable,
+                            },
+                            runner=herdr.run,
                         )
                 self.assertEqual(ctx.exception.reason, STORE_MAINTENANCE_IN_PROGRESS)
                 self.assertIn("No workspace / tab / agent", str(ctx.exception))
+                self.assertEqual(
+                    herdr.calls,
+                    [
+                        ["agent", "start", "--help"],
+                        ["pane", "split", "--help"],
+                    ],
+                    "only the read-only Herdr 0.8 capability probes may precede the lock",
+                )
             finally:
                 holder.wait()
 

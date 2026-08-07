@@ -83,9 +83,21 @@ def observe_herdr_cli_capabilities(
         binary, ["agent", "start"], runner=runner, timeout=timeout, env=env
     )
     agent_options = _option_tokens(agent_help)
+    agent_usage = " ".join(agent_help.split())
     required_agent = frozenset({"--kind", "--pane"})
     forbidden_agent = frozenset({"--cwd", "--workspace", "--env", "--split"})
-    if not required_agent.issubset(agent_options) or agent_options & forbidden_agent:
+    required_name = bool(
+        re.search(r"\bUsage:\s*herdr\s+agent\s+start\s+<NAME>(?:\s|$)", agent_usage)
+    )
+    required_agent_tail = bool(
+        re.search(r"\[\s*--\s+\[AGENT_ARG\]\.\.\.\s*\]", agent_usage)
+    )
+    if (
+        not required_agent.issubset(agent_options)
+        or agent_options & forbidden_agent
+        or not required_name
+        or not required_agent_tail
+    ):
         raise HerdrCliCapabilityError(
             "Herdr agent start is not the required 0.8 pane-bound surface; no pane was created",
             reason=REASON_AGENT_START_SURFACE_MISMATCH,

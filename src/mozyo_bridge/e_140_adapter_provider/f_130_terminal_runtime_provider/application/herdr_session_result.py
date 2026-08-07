@@ -64,7 +64,7 @@ class _SlotPlan:
 
     Classifying every slot up front lets the run pick a single launch-target
     workspace (and decide whether to create+reclaim a base pane) before it starts
-    launching, so ``agent start`` can pass an explicit ``--workspace``.
+    launching, so Herdr 0.8 can split and prepare an exact pane before ``agent start``.
     """
 
     provider: str

@@ -1,6 +1,6 @@
 """herdr sublane actuation adapter tests (Redmine #13377 shared project workspace).
 
-Drives :class:`HerdrSublaneActuatorOps` through a stateful fake herdr CLI (0.7.1 shape)
+Drives :class:`HerdrSublaneActuatorOps` through a stateful fake Herdr 0.8 CLI
 and a real (temp) workspace registry — no live herdr, no tmux. Covers the lane-slot
 stand-up inside the shared project workspace (``append_lane_column`` =
 ``prepare_session`` with ``lane_id=lane_label``), the live-inventory read-back
@@ -58,6 +58,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
     build_attest_capability_epilog,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+    encode_assigned_name,
+)
 
 from tests.support.agent_provider_binaries import provider_bin_path, with_provider_path
 
@@ -95,8 +98,12 @@ class _StatefulHerdr:
         self.created_workspace = created_workspace
         self.agents: list[dict] = []  # {"name", "pane_id", "tab_id"}
         self.start_argvs: list[list] = []
+        self.pane_split_argvs: list[list] = []
         self._pane_seq = 1
         self._tab_seq = 0  # monotonic tab counter (Redmine #13411 lane=tab)
+        self._pane_workspace = {f"{created_workspace}:p1": created_workspace}
+        self._pane_tab = {f"{created_workspace}:p1": ""}
+        self._pane_env: dict[str, dict[str, str]] = {}
         # Redmine #14569: the lane pair's live split ratio + direction. `pane resize`
         # MOVES the ratio and `pane layout` reports it, so the geometry rail is
         # exercised rather than answered by a frozen payload.
@@ -110,6 +117,26 @@ class _StatefulHerdr:
 
     def run(self, argv, capture_output=None, text=None, timeout=None, env=None, **kw):
         rest = list(argv[1:])
+        if rest == ["agent", "start", "--help"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=(
+                    "Usage: herdr agent start <NAME> --kind <KIND> --pane <ID> "
+                    "[--timeout <MS>] [-- [AGENT_ARG]...]\n"
+                ),
+                stderr="",
+            )
+        if rest == ["pane", "split", "--help"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=(
+                    "Usage: herdr pane split [PANE_ID] --direction right|down "
+                    "[--cwd PATH] [--env KEY=VALUE] [--focus] [--no-focus]\n"
+                ),
+                stderr="",
+            )
         if rest[:2] == ["herdr", "agent-attest"]:
             return subprocess.CompletedProcess(
                 argv,
@@ -142,6 +169,9 @@ class _StatefulHerdr:
             )
         if rest[:2] == ["workspace", "create"]:
             wid = self.created_workspace
+            root_pane = f"{wid}:p1"
+            self._pane_workspace[root_pane] = wid
+            self._pane_tab[root_pane] = ""
             return subprocess.CompletedProcess(
                 argv,
                 0,
@@ -162,6 +192,9 @@ class _StatefulHerdr:
             self._tab_seq += 1
             tab_id = f"{wid}:t{self._tab_seq}"
             self._pane_seq += 1
+            root_pane = f"{wid}:p{self._pane_seq}"
+            self._pane_workspace[root_pane] = wid
+            self._pane_tab[root_pane] = tab_id
             return subprocess.CompletedProcess(
                 argv,
                 0,
@@ -170,13 +203,57 @@ class _StatefulHerdr:
                         "result": {
                             "type": "tab_created",
                             "tab": {"tab_id": tab_id},
-                            "root_pane": {"pane_id": f"{wid}:p{self._pane_seq}"},
+                            "root_pane": {"pane_id": root_pane},
+                        }
+                    }
+                ),
+                stderr="",
+            )
+        if rest[:2] == ["pane", "split"]:
+            self.pane_split_argvs.append(rest)
+            anchor = rest[2] if len(rest) > 2 else ""
+            wid = self._pane_workspace.get(anchor, "")
+            if not wid:
+                return subprocess.CompletedProcess(
+                    argv, 1, stdout="", stderr="no such pane"
+                )
+            tab_id = self._pane_tab.get(anchor, "")
+            self._pane_seq += 1
+            pane_id = f"{wid}:p{self._pane_seq}"
+            self._pane_workspace[pane_id] = wid
+            self._pane_tab[pane_id] = tab_id
+            launch_env = {}
+            for index, token in enumerate(rest):
+                if token == "--env" and index + 1 < len(rest):
+                    key, separator, value = rest[index + 1].partition("=")
+                    if separator:
+                        launch_env[key] = value
+            self._pane_env[pane_id] = launch_env
+            if "--direction" in rest:
+                self.split_direction = rest[rest.index("--direction") + 1]
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(
+                    {
+                        "result": {
+                            "type": "pane_info",
+                            "pane": {
+                                "pane_id": pane_id,
+                                "workspace_id": wid,
+                                "tab_id": tab_id or f"{wid}:t1",
+                            },
                         }
                     }
                 ),
                 stderr="",
             )
         if rest[:2] == ["pane", "close"]:
+            pane = rest[2] if len(rest) > 2 else ""
+            self._pane_workspace.pop(pane, None)
+            self._pane_tab.pop(pane, None)
+            self._pane_env.pop(pane, None)
+            self.agents = [agent for agent in self.agents if agent["pane_id"] != pane]
             return subprocess.CompletedProcess(
                 argv, 0, stdout=json.dumps({"result": {"type": "ok"}}), stderr=""
             )
@@ -213,26 +290,28 @@ class _StatefulHerdr:
             )
         if rest[:2] == ["agent", "start"]:
             self.start_argvs.append(rest)
-            name = rest[2]
-            wid = rest[rest.index("--workspace") + 1] if "--workspace" in rest else "w1"
-            tab_id = rest[rest.index("--tab") + 1] if "--tab" in rest else ""
-            if "--split" in rest:
-                self.split_direction = rest[rest.index("--split") + 1]
-            self._pane_seq += 1
-            pane_id = f"{wid}:p{self._pane_seq}"
-            row = {"name": name, "pane_id": pane_id}
+            native_name = rest[2]
+            pane_id = rest[rest.index("--pane") + 1]
+            wid = self._pane_workspace.get(pane_id, "")
+            tab_id = self._pane_tab.get(pane_id, "")
+            launch_env = dict(self._pane_env.get(pane_id, {}))
+            logical_name = encode_assigned_name(
+                launch_env.get("MOZYO_WORKSPACE_ID", ""),
+                launch_env.get("MOZYO_AGENT_ROLE", ""),
+                launch_env.get("MOZYO_LANE_ID", ""),
+            )
+            row = {
+                "name": logical_name,
+                "native_name": native_name,
+                "pane_id": pane_id,
+            }
             if tab_id:
                 row["tab_id"] = tab_id
             self.agents.append(row)
-            launch_env = {}
-            for index, token in enumerate(rest):
-                if token == "--env" and index + 1 < len(rest):
-                    key, _, value = rest[index + 1].partition("=")
-                    launch_env[key] = value
             if "agent-attest" in rest and self.attest_home is not None:
                 record_identity_attestation(
                     IdentityAttestationRecord(
-                        assigned_name=name,
+                        assigned_name=logical_name,
                         workspace_id=launch_env.get("MOZYO_WORKSPACE_ID", ""),
                         role=launch_env.get("MOZYO_AGENT_ROLE", ""),
                         lane_id=launch_env.get("MOZYO_LANE_ID", ""),
@@ -262,7 +341,7 @@ class _StatefulHerdr:
                         STAGE_PROVIDER_EXEC_CALL_REACHED,
                     ):
                         append_execution_event(
-                            events_fence, action_id, stage, participant=name
+                            events_fence, action_id, stage, participant=logical_name
                         )
             return subprocess.CompletedProcess(
                 argv,
@@ -271,7 +350,7 @@ class _StatefulHerdr:
                     {
                         "result": {
                             "agent": {
-                                "name": name,
+                                "name": native_name,
                                 "pane_id": pane_id,
                                 "workspace_id": wid,
                                 # #13411: echo the requested tab so the landing guard
@@ -346,7 +425,11 @@ class _SplitOnHealHerdr(_StatefulHerdr):
 
     def run(self, argv, **kw):
         rest = list(argv[1:])
-        if rest[:2] == ["agent", "start"] and self.split_next_start and "--tab" in rest:
+        if (
+            rest[:2] == ["agent", "start"]
+            and "--pane" in rest
+            and self.split_next_start
+        ):
             self.split_next_start = False
             result = super().run(argv, **kw)
             # The live row we just appended is split into a different tab.
@@ -852,9 +935,12 @@ class HerdrSublaneOpsTest(unittest.TestCase):
         relaunch = herdr.start_argvs[-1]
         last_sep = len(relaunch) - 1 - relaunch[::-1].index("--")
         self.assertEqual(relaunch[last_sep + 1], provider_bin_path("codex"))
-        # The relaunch is pinned into the surviving worker's workspace (adopt pin),
-        # so no second workspace (and no new base pane) is created.
-        self.assertEqual(relaunch[relaunch.index("--workspace") + 1], "wL")
+        # Herdr 0.8 binds the process to the pane prepared beside the surviving
+        # worker.  The prepared pane, rather than an agent-start workspace flag, is
+        # the placement receipt and remains in that same workspace.
+        relaunched_pane = relaunch[relaunch.index("--pane") + 1]
+        self.assertEqual(herdr._pane_workspace[relaunched_pane], "wL")
+        self.assertTrue(herdr.pane_split_argvs[-1][2].startswith("wL:"))
         self.assertIsNotNone(view)
         self.assertEqual(view.state, SUBLANE_STATE_ACTIVE)
         self.assertTrue(view.gateway_pane.startswith("wL:"))

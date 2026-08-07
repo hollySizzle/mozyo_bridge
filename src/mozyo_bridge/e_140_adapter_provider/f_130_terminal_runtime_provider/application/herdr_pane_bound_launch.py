@@ -59,19 +59,30 @@ class NativeLaunchAdmission:
 
 
 class ActionPrivateLaunchShimSet:
-    """Prepare every provider shim before the first Herdr write, then clean exactly.
+    """Own launch-scoped resources from preflight through deterministic cleanup.
 
     The session composition root owns one instance for its whole call.  ``prepare`` is
     all-or-nothing: if any provider shim cannot be created, previously prepared siblings
     are removed immediately and no path is returned to the caller.  This closes the
     second-provider preflight gap where the first agent could already be running before
-    a later shim failure was discovered.
+    a later shim failure was discovered.  Other context-managed launch resources may be
+    held on the same stack so their ``__exit__`` receives the real body exception rather
+    than masking it during cleanup.
     """
 
     def __init__(self) -> None:
         self._stack = ExitStack()
         self._paths: dict[str, str] = {}
         self._prepared = False
+
+    def __enter__(self) -> "ActionPrivateLaunchShimSet":
+        return self
+
+    def __exit__(self, *exc_details: object) -> bool:
+        try:
+            return bool(self._stack.__exit__(*exc_details))
+        finally:
+            self._paths.clear()
 
     def prepare(
         self,
@@ -100,9 +111,15 @@ class ActionPrivateLaunchShimSet:
             raise
         return dict(self._paths)
 
+    def hold(self, context_manager: object) -> object:
+        """Hold one launch-scoped context until the composition root exits."""
+        return self._stack.enter_context(context_manager)  # type: ignore[arg-type]
+
     def close(self) -> None:
-        self._stack.close()
-        self._paths.clear()
+        try:
+            self._stack.close()
+        finally:
+            self._paths.clear()
 
 
 def bind_native_launch_set(
