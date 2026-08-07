@@ -160,6 +160,7 @@ CLIENT_CALL_SUBCOMMANDS: frozenset = frozenset(
         ("agent", "pane"),
         ("agent", "target"),
         ("pane", "split"),
+        ("pane", "run"),
         ("pane", "close"),
         ("pane", "layout"),
         ("pane", "resize"),

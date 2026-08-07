@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import tempfile
+import time
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,6 +58,10 @@ class PreparedPane:
 @dataclass(frozen=True)
 class NativeLaunchAdmission:
     bindings: Mapping[str, HerdrNativeIdentityBinding]
+
+
+AGENT_PANE_BUSY_RETRIES = 30
+AGENT_PANE_BUSY_RETRY_SECONDS = 0.1
 
 
 class ActionPrivateLaunchShimSet:
@@ -279,6 +285,119 @@ def split_prepared_pane(
     return pane
 
 
+def build_provider_shell_function_command(*, provider: str, shim_dir: str) -> str:
+    """Define the canonical provider name only in the prepared pane's shell.
+
+    Herdr 0.8 starts a supported kind by submitting its canonical executable name to
+    the pane's already-running interactive shell.  On macOS that shell is a login shell
+    and can replace the ``PATH`` supplied when the pane was created, so a PATH-only shim
+    is not an execution authority.  A shell function survives that startup step and is
+    scoped to this one pane.  Its target remains the action-private symlink prepared
+    before any Herdr write.
+    """
+    if provider not in {"claude", "codex"}:
+        raise HerdrSessionStartError(
+            f"provider {provider!r} has no canonical Herdr managed-launch kind"
+        )
+    target = os.path.join(shim_dir, provider)
+    if (
+        not os.path.isabs(target)
+        or not shim_dir
+        or any(character in target for character in ("\x00", "\r", "\n"))
+    ):
+        raise HerdrSessionStartError(
+            "managed-launch shell function requires an absolute control-free shim path"
+        )
+    return f'{provider}() {{ exec {shlex.quote(target)} "$@"; }}'
+
+
+def prepare_provider_shell_function(
+    *,
+    binary: str,
+    pane_locator: str,
+    provider: str,
+    shim_dir: str,
+    runner: Runner,
+    timeout: float,
+    env: Mapping[str, str],
+) -> None:
+    """Install the action-private canonical function in one exact prepared pane."""
+    if not valid_target(pane_locator):
+        raise HerdrSessionStartError(
+            "pane-local provider preparation requires one exact valid pane locator"
+        )
+    _invoke(
+        binary,
+        [
+            "pane",
+            "run",
+            pane_locator,
+            build_provider_shell_function_command(
+                provider=provider,
+                shim_dir=shim_dir,
+            ),
+        ],
+        runner,
+        timeout,
+        env=dict(env),
+    )
+
+
+def _agent_pane_busy(completed: object) -> bool:
+    """Whether Herdr typed this failed start as a not-yet-ready shell pane."""
+    if getattr(completed, "returncode", 1) == 0:
+        return False
+    for raw in (getattr(completed, "stderr", ""), getattr(completed, "stdout", "")):
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        error = payload.get("error") if isinstance(payload, Mapping) else None
+        if isinstance(error, Mapping) and error.get("code") == "agent_pane_busy":
+            return True
+    return False
+
+
+def start_agent_in_prepared_pane(
+    *,
+    binary: str,
+    launch_argv: Sequence[str],
+    runner: Runner,
+    timeout: float,
+    env: Mapping[str, str],
+    sleeper: Optional[Callable[[float], None]] = None,
+) -> object:
+    """Start in this run's exact pane, tolerating only the shell-startup race.
+
+    Herdr 0.8 can return ``agent_pane_busy`` immediately after ``pane split`` while
+    the new pane's login shell is still becoming interactive.  Repeating the same
+    pane-bound command is safe only for that typed refusal: Herdr has stated that it
+    did not start the agent, and the locator is the pane this run just recorded.
+    Every other error is returned to :func:`_invoke` unchanged and fails immediately.
+    """
+    sleep = sleeper or time.sleep
+    retries = 0
+
+    def _retrying_runner(argv, *args, **kwargs):
+        nonlocal retries
+        while True:
+            completed = runner(argv, *args, **kwargs)
+            if not _agent_pane_busy(completed) or retries >= AGENT_PANE_BUSY_RETRIES:
+                return completed
+            retries += 1
+            sleep(AGENT_PANE_BUSY_RETRY_SECONDS)
+
+    return _invoke(
+        binary,
+        list(launch_argv),
+        _retrying_runner,
+        max(timeout, 31.0),
+        env=dict(env),
+    )
+
+
 def choose_split_anchor(
     rows: Sequence[Mapping[str, object]],
     *,
@@ -458,12 +577,15 @@ __all__ = (
     "PreparedPane",
     "action_private_launch_shim",
     "bind_native_launch_set",
+    "build_provider_shell_function_command",
     "build_pane_split_argv",
     "choose_split_anchor",
     "choose_workspace_pane_anchor",
     "list_workspace_panes",
     "prepare_complete_launch_shims",
     "prepared_pane_recorder",
+    "prepare_provider_shell_function",
     "resolve_required_split_anchor",
     "split_prepared_pane",
+    "start_agent_in_prepared_pane",
 )

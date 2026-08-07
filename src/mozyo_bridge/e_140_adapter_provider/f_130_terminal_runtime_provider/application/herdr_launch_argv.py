@@ -1,8 +1,9 @@
 """Herdr 0.8 managed-launch command and pane-environment assembly.
 
 Herdr 0.8 separates placement from process launch. ``build_pane_launch_env`` renders
-the identity, trusted binary, PATH shim and wrapper state injected by ``pane split``;
-``build_agent_start_argv`` then starts the canonical provider kind in that exact pane.
+the identity, trusted binary, trusted source PATH and wrapper state injected by
+``pane split``; ``build_agent_start_argv`` then starts the canonical provider kind in
+that exact pane.
 Keeping both renderers here gives session-start one directly testable launch contract.
 
 Pure: :func:`build_agent_start_argv` is a total string-list transform (no I/O), and
@@ -278,11 +279,11 @@ def build_agent_start_argv(
     through ``--pane``.
 
     When ``attest_launcher`` is present, the pane's canonical provider name resolves to
-    that launcher through an action-private PATH shim. Consequently the tokens after
-    Herdr's ``--`` begin at ``herdr agent-attest`` and the wrapper eventually execs the
-    verified provider command. Without the wrapper, the shim resolves directly to the
-    verified provider executable and only its arguments follow ``--``. This function
-    performs no filesystem or provider lookup.
+    that launcher through an action-private pane-local shell function. Consequently the
+    tokens after Herdr's ``--`` begin at ``herdr agent-attest`` and the wrapper eventually
+    execs the verified provider command. Without the wrapper, the function resolves
+    directly to the verified provider executable and only its arguments follow ``--``.
+    This function performs no filesystem or provider lookup.
     """
     provider_cmd = _provider_command(
         workspace_id=workspace_id,
@@ -321,10 +322,10 @@ def build_agent_start_argv(
     else:
         run_cmd = provider_cmd
     # Herdr 0.8 launches the canonical executable selected by ``--kind``.  When the
-    # pane PATH points that canonical name at our attestation launcher, the executable
-    # token itself must not be repeated: the args begin at the mozyo subcommand.  The
-    # unwrapped shim points at the verified provider executable, so its args likewise
-    # exclude argv[0].
+    # pane-local shell function points that canonical name at our attestation launcher,
+    # the executable token itself must not be repeated: the args begin at the mozyo
+    # subcommand.  The unwrapped function points at the verified provider executable, so
+    # its args likewise exclude argv[0].
     agent_args = run_cmd[1:] if attest_launcher else provider_cmd[1:]
     return [
         "agent",
@@ -346,7 +347,6 @@ def build_pane_launch_env(
     workspace_id: str,
     lane: str,
     binary: str,
-    shim_dir: str,
     source_path: str,
     attest_launcher: str,
     store_home: str,
@@ -362,7 +362,12 @@ def build_pane_launch_env(
         f"{MOZYO_AGENT_ROLE_ENV}={provider}",
         f"{MOZYO_LANE_ID_ENV}={lane}",
         f"{HERDR_BINARY_ENV}={binary}",
-        f"PATH={shim_dir}{os.pathsep}{source_path}",
+        # Do not prepend the shim here. macOS login shells can replace this value during
+        # startup, which made PATH an unreliable launch authority. The exact pane gets a
+        # shell-local canonical provider function before `agent start`; retaining only the
+        # caller's trusted PATH here avoids a fallback through the shim if that preparation
+        # is ever rejected.
+        f"PATH={source_path}",
     ]
     if attest_launcher:
         entries.append(f"{MOZYO_HERDR_NATIVE_NAME_ENV}={native_name}")

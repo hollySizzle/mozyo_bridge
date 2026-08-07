@@ -124,7 +124,6 @@ def _build(
         workspace_id="ws1",
         lane="default",
         binary="/x/herdr",
-        shim_dir="/tmp/shim",
         source_path="/usr/bin",
         attest_launcher=attest_launcher,
         store_home="/home/store",

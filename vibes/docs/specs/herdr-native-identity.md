@@ -298,13 +298,15 @@ flag には結合しない (別々に選べる) が、純 herdr 運用では両�
 本節は、後続に残る0.7系のCLI literalを上書きする現行contractである。配置・identity・healthの
 判断規則は引き続き有効だが、`agent start --workspace/--tab/--env/--split` は現行launchに使わない。
 
-1. `agent start --help` と `pane split --help` をworkspace登録やHerdr writeより前に読み、0.8の
-   pane-bound surfaceを機能単位で確認する。旧形式・曖昧なhelp・読取不能はzero-Herdr-writeで拒否。
+1. `agent start --help`、`pane split --help`、`pane run --help` をworkspace登録やHerdr writeより
+   前に読み、0.8のpane-bound surfaceを機能単位で確認する。旧形式・曖昧なhelp・読取不能は
+   zero-Herdr-writeで拒否。
 2. 全launch slotの`mzb1`を一括で`mza1`へbindingする。全件を単一SQLite transactionで検証・記録し、
    2人目の衝突を1人目の起動後に発見しない。
-3. provider executable、self-attestation launcher、全provider用のaction-private PATH shimを、最初の
-   Herdr writeより前に全件準備する。shim directoryは0700、canonical provider名のsymlinkだけを持ち、
-   session終了時にexact/non-recursiveで片付ける。
+3. provider executable、self-attestation launcher、全provider用のaction-private executable shimを、
+   最初のHerdr writeより前に全件準備する。shim directoryは0700、canonical provider名のsymlinkだけを
+   持ち、session終了時にexact/non-recursiveで片付ける。pane作成時の`PATH` prependはlaunch authorityに
+   しない。macOSのlogin shellが起動時に`PATH`を再構成するためである。
 4. このrunが得たworkspace/tab root、または同じcontainer内のexact live mozyo-managed agent paneだけを
    anchorにして、次を実行する。labelだけで見つけたshell paneをsplit authorityへ昇格しない。
 
@@ -316,14 +318,21 @@ flag には結合しない (別々に選べる) が、純 herdr 運用では両�
    `result.type=pane_info`と`result.pane.{pane_id,workspace_id,tab_id}`をexactに検証する。成功直後、
    `pane_bound_v1` receipt（workspace/tab/native identity）をstartup transactionへ記録し、それ以前に
    `agent start`を実行しない。
-5. 作成したexact paneへ次を実行する。
+5. 作成したexact paneへ`pane run`でcanonical provider名のshell functionを定義する。関数は
+   action-private shimをabsolute pathで`exec`し、当該paneのshellだけに存在する。これによりlogin-shell
+   startup後にもshimを解決でき、global PATH・他pane・provider子processへaliasを漏らさない。その後、
+   同じexact paneへ次を実行する。
 
    ```text
    herdr agent start <MZA1_NATIVE_NAME> --kind claude|codex --pane <PANE_ID> -- <AGENT_ARG>...
    ```
 
-   `result.type=agent_started`、返却pane、tab、native nameを準備済み値と照合する。長い`mzb1`はwrapper
-   の`--assigned-name`とself-attestation recordへ保持し、Herdrへ直接渡さない。
+   `pane run`の非zeroまたは`agent start`の非zeroはfail-closed。split直後のshell準備中にHerdrがtyped
+   `agent_pane_busy`を返した場合だけ、同一pane・同一argvを最大30回、0.1秒間隔で再試行する。他の理由は
+   再試行しない。`result.type=agent_started`、返却pane、tab、native nameを準備済み値と照合する。長い`mzb1`はwrapper
+   の`--assigned-name`とself-attestation recordへ保持し、Herdrへ直接渡さない。split直後のlogin shell
+   準備中だけHerdr 0.8が返すtyped `agent_pane_busy`は、同じexact pane・同じargvに限り0.1秒間隔、
+   最大30回で再試行する。他のerror、typed codeを読めない応答、上限到達は即時fail-closedとする。
 6. pane作成後・agent起動前の失敗は、receiptのexact paneだけをrollback候補にする。closeには
    container一致、agent不在、shell-only、入力なしの明示的なpositive proofをすべて要求し、close後も
    pane不在を再読する。Herdr 0.8は現時点でauthoritativeなinput-empty APIを公開しないため、live cleanup

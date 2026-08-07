@@ -16,6 +16,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
 REASON_HELP_UNAVAILABLE = "herdr_help_unavailable"
 REASON_AGENT_START_SURFACE_MISMATCH = "herdr_agent_start_surface_mismatch"
 REASON_PANE_SPLIT_SURFACE_MISMATCH = "herdr_pane_split_surface_mismatch"
+REASON_PANE_RUN_SURFACE_MISMATCH = "herdr_pane_run_surface_mismatch"
 
 
 class HerdrCliCapabilityError(RuntimeError):
@@ -28,6 +29,7 @@ class HerdrCliCapabilityError(RuntimeError):
 class HerdrCliCapabilities:
     agent_start_help: str
     pane_split_help: str
+    pane_run_help: str
 
 
 def _option_tokens(help_text: str) -> frozenset[str]:
@@ -76,7 +78,7 @@ def observe_herdr_cli_capabilities(
     """Require the exact 0.8 pane-bound launch surface before any Herdr write.
 
     Version text is deliberately not the authority.  A repackaged binary can retain a
-    version string while changing flags; these two help surfaces are the operations the
+    version string while changing flags; these three help surfaces are the operations the
     launch will actually issue.
     """
     agent_help = _help(
@@ -119,7 +121,21 @@ def observe_herdr_cli_capabilities(
             "no pane was created",
             reason=REASON_PANE_SPLIT_SURFACE_MISMATCH,
         )
-    return HerdrCliCapabilities(agent_help, pane_help)
+
+    pane_run_help = _help(
+        binary, ["pane", "run"], runner=runner, timeout=timeout, env=env
+    )
+    pane_run_usage = " ".join(pane_run_help.split())
+    if not re.search(
+        r"\bUsage:\s*herdr\s+pane\s+run\s+<PANE_ID>\s+<COMMAND>\.\.\.(?:\s|$)",
+        pane_run_usage,
+    ):
+        raise HerdrCliCapabilityError(
+            "Herdr pane run does not expose the required exact-pane command surface; "
+            "no pane was created",
+            reason=REASON_PANE_RUN_SURFACE_MISMATCH,
+        )
+    return HerdrCliCapabilities(agent_help, pane_help, pane_run_help)
 
 
 def require_herdr_cli_capabilities(
@@ -144,6 +160,7 @@ __all__ = (
     "HerdrCliCapabilityError",
     "REASON_AGENT_START_SURFACE_MISMATCH",
     "REASON_HELP_UNAVAILABLE",
+    "REASON_PANE_RUN_SURFACE_MISMATCH",
     "REASON_PANE_SPLIT_SURFACE_MISMATCH",
     "observe_herdr_cli_capabilities",
     "require_herdr_cli_capabilities",

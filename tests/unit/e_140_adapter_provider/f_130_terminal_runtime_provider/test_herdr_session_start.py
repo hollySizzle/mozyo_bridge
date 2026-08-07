@@ -70,6 +70,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     REASON_AGENT_START_SURFACE_MISMATCH,
     observe_herdr_cli_capabilities,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_bound_launch import (  # noqa: E501
+    build_provider_shell_function_command,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_health import (  # noqa: E501
     HEALTH_ATTESTATION_UNAVAILABLE,
     HEALTH_HEALTHY,
@@ -138,10 +141,11 @@ def _agent_start_calls(herdr):
 
 
 def _non_capability_calls(herdr):
-    """Herdr calls other than the two read-only 0.8 help probes."""
+    """Herdr calls other than the three read-only 0.8 help probes."""
     probes = {
         ("agent", "start", "--help"),
         ("pane", "split", "--help"),
+        ("pane", "run", "--help"),
     }
     return [call for call in herdr.calls if tuple(call) not in probes]
 
@@ -188,18 +192,29 @@ def _fingerprint(paths):
 
 
 class Herdr080CapabilityPreflightTest(unittest.TestCase):
+    def test_pane_local_function_quotes_its_action_private_target(self) -> None:
+        self.assertEqual(
+            build_provider_shell_function_command(
+                provider="codex", shim_dir="/private/action with space"
+            ),
+            'codex() { exec \'/private/action with space/codex\' "$@"; }',
+        )
+
     def test_exact_080_help_surface_is_admitted(self) -> None:
         def runner(argv, **_kwargs):
             tail = argv[1:]
-            text = (
-                "Usage: herdr agent start <NAME> --kind <KIND> --pane <ID> "
-                "[OPTIONS] [-- [AGENT_ARG]...]"
-                if tail[:2] == ["agent", "start"]
-                else (
+            if tail[:2] == ["agent", "start"]:
+                text = (
+                    "Usage: herdr agent start <NAME> --kind <KIND> --pane <ID> "
+                    "[OPTIONS] [-- [AGENT_ARG]...]"
+                )
+            elif tail[:2] == ["pane", "split"]:
+                text = (
                     "Usage: herdr pane split [PANE_ID] --direction right|down "
                     "--cwd PATH --env K=V --focus --no-focus"
                 )
-            )
+            else:
+                text = "Usage: herdr pane run <PANE_ID> <COMMAND>..."
             return subprocess.CompletedProcess(argv, 0, stdout=text, stderr="")
 
         observed = observe_herdr_cli_capabilities(
@@ -207,18 +222,22 @@ class Herdr080CapabilityPreflightTest(unittest.TestCase):
         )
         self.assertIn("--pane", observed.agent_start_help)
         self.assertIn("--direction", observed.pane_split_help)
+        self.assertIn("<COMMAND>...", observed.pane_run_help)
 
     def test_agent_start_without_required_name_is_refused(self) -> None:
         def runner(argv, **_kwargs):
-            text = (
-                "Usage: herdr agent start --kind <KIND> --pane <ID> "
-                "[OPTIONS] [-- [AGENT_ARG]...]"
-                if argv[1:3] == ["agent", "start"]
-                else (
+            if argv[1:3] == ["agent", "start"]:
+                text = (
+                    "Usage: herdr agent start --kind <KIND> --pane <ID> "
+                    "[OPTIONS] [-- [AGENT_ARG]...]"
+                )
+            elif argv[1:3] == ["pane", "split"]:
+                text = (
                     "Usage: herdr pane split [PANE_ID] --direction right|down "
                     "--cwd PATH --env K=V --focus --no-focus"
                 )
-            )
+            else:
+                text = "Usage: herdr pane run <PANE_ID> <COMMAND>..."
             return subprocess.CompletedProcess(argv, 0, stdout=text, stderr="")
 
         with self.assertRaises(HerdrCliCapabilityError):
@@ -228,14 +247,15 @@ class Herdr080CapabilityPreflightTest(unittest.TestCase):
 
     def test_agent_start_without_separator_tail_is_refused(self) -> None:
         def runner(argv, **_kwargs):
-            text = (
-                "Usage: herdr agent start <NAME> --kind <KIND> --pane <ID>"
-                if argv[1:3] == ["agent", "start"]
-                else (
+            if argv[1:3] == ["agent", "start"]:
+                text = "Usage: herdr agent start <NAME> --kind <KIND> --pane <ID>"
+            elif argv[1:3] == ["pane", "split"]:
+                text = (
                     "Usage: herdr pane split [PANE_ID] --direction right|down "
                     "--cwd PATH --env K=V --focus --no-focus"
                 )
-            )
+            else:
+                text = "Usage: herdr pane run <PANE_ID> <COMMAND>..."
             return subprocess.CompletedProcess(argv, 0, stdout=text, stderr="")
 
         with self.assertRaises(HerdrCliCapabilityError):
@@ -246,14 +266,15 @@ class Herdr080CapabilityPreflightTest(unittest.TestCase):
     def test_legacy_agent_start_surface_is_refused(self) -> None:
         def runner(argv, **_kwargs):
             tail = argv[1:]
-            text = (
-                "--cwd PATH --workspace ID --env K=V --split down"
-                if tail[:2] == ["agent", "start"]
-                else (
+            if tail[:2] == ["agent", "start"]:
+                text = "--cwd PATH --workspace ID --env K=V --split down"
+            elif tail[:2] == ["pane", "split"]:
+                text = (
                     "Usage: herdr pane split [PANE_ID] --direction right|down "
                     "--cwd PATH --env K=V --focus --no-focus"
                 )
-            )
+            else:
+                text = "Usage: herdr pane run <PANE_ID> <COMMAND>..."
             return subprocess.CompletedProcess(argv, 0, stdout=text, stderr="")
 
         with self.assertRaises(HerdrCliCapabilityError) as caught:
@@ -261,6 +282,28 @@ class Herdr080CapabilityPreflightTest(unittest.TestCase):
                 "/bin/herdr", runner=runner, timeout=1.0, env={}
             )
         self.assertEqual(caught.exception.reason, REASON_AGENT_START_SURFACE_MISMATCH)
+
+    def test_missing_pane_run_surface_is_refused(self) -> None:
+        def runner(argv, **_kwargs):
+            if argv[1:3] == ["agent", "start"]:
+                text = (
+                    "Usage: herdr agent start <NAME> --kind <KIND> --pane <ID> "
+                    "[OPTIONS] [-- [AGENT_ARG]...]"
+                )
+            elif argv[1:3] == ["pane", "split"]:
+                text = (
+                    "Usage: herdr pane split [PANE_ID] --direction right|down "
+                    "--cwd PATH --env K=V --focus --no-focus"
+                )
+            else:
+                text = "Usage: herdr pane send-text <PANE_ID> <TEXT>"
+            return subprocess.CompletedProcess(argv, 0, stdout=text, stderr="")
+
+        with self.assertRaises(HerdrCliCapabilityError) as caught:
+            observe_herdr_cli_capabilities(
+                "/bin/herdr", runner=runner, timeout=1.0, env={}
+            )
+        self.assertEqual(caught.exception.reason, "herdr_pane_run_surface_mismatch")
 
     def test_session_refuses_legacy_surface_before_home_lock_or_registration(self) -> None:
         calls = []
@@ -340,6 +383,7 @@ class _Herdr:
         tab_bad_payload=False,
         start_tab=None,
         start_fails=False,
+        start_busy_attempts=0,
         close_fails=False,
         attest_capable=True,
         generation_capable=True,
@@ -376,6 +420,7 @@ class _Herdr:
         # fail-closed guard.
         self.start_tab = start_tab
         self.start_fails = start_fails
+        self.start_busy_attempts = int(start_busy_attempts)
         self.close_fails = close_fails
         # Redmine #13948: the fake is stateful about its OWN launches. Real herdr surfaces
         # a started agent in the next `agent list`, and the #13637 wrapper attests it — so
@@ -416,6 +461,7 @@ class _Herdr:
         self.launch_envs: list = []
         self.start_argvs: list = []
         self.pane_splits: list = []
+        self.pane_runs: list = []
         self.pane_envs: dict = {}
         self.pane_locations: dict = {}
         self._pane_seq = 20
@@ -494,6 +540,13 @@ class _Herdr:
                     "Usage: herdr pane split [PANE_ID] --direction right|down "
                     "[--cwd PATH] [--env KEY=VALUE] [--focus] [--no-focus]\n"
                 ),
+                stderr="",
+            )
+        if rest == ["pane", "run", "--help"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout="Usage: herdr pane run <PANE_ID> <COMMAND>...\n",
                 stderr="",
             )
         # Redmine #13748 launcher capability probe: argv[0] is the LAUNCHER (not the
@@ -757,6 +810,16 @@ class _Herdr:
             return subprocess.CompletedProcess(
                 argv, 0, stdout=json.dumps({"result": {"type": "ok"}}), stderr=""
             )
+        if rest[:2] == ["pane", "run"]:
+            self.pane_runs.append(rest)
+            pane_id = rest[2] if len(rest) > 2 else ""
+            if pane_id not in self.pane_locations or len(rest) != 4 or not rest[3]:
+                return subprocess.CompletedProcess(
+                    argv, 1, stdout="", stderr="pane run refused"
+                )
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=json.dumps({"result": {"type": "ok"}}), stderr=""
+            )
         if rest[:2] == ["pane", "close"]:
             self.pane_closes.append(rest)
             if self.close_fails:
@@ -774,6 +837,22 @@ class _Herdr:
             )
         if rest[:2] == ["agent", "start"]:
             self.start_argvs.append(rest)
+            if self.start_busy_attempts > 0:
+                self.start_busy_attempts -= 1
+                return subprocess.CompletedProcess(
+                    argv,
+                    1,
+                    stdout="",
+                    stderr=json.dumps(
+                        {
+                            "error": {
+                                "code": "agent_pane_busy",
+                                "message": "agent target pane is not an available shell",
+                            },
+                            "id": "cli:agent:start",
+                        }
+                    ),
+                )
             if self.start_fails:
                 return subprocess.CompletedProcess(
                     argv, 1, stdout="", stderr="agent start refused"
@@ -1102,6 +1181,8 @@ class _SessionStartHarness:
         launch_context=None,
         coordinator_placement_mode="per_project_space",
         coordinator_top_workspace_id=None,
+        herdr_runner=None,
+        launcher_runner=None,
     ):
         # `exist_ok`: a scenario may drive TWO runs through one tmp (Redmine #13948 pins
         # that a re-run of the same command in the same lane is a NEW action), and the
@@ -1137,7 +1218,8 @@ class _SessionStartHarness:
                 providers=providers,
                 lane_id=lane,
                 env=env,
-                runner=herdr.run,
+                runner=herdr_runner or herdr.run,
+                launcher_runner=launcher_runner,
                 dry_run=dry_run,
                 claude_permission_mode_default=claude_permission_mode_default,
                 agent_launch=agent_launch,
@@ -1255,6 +1337,60 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(start[start.index("--") + 1], "herdr")
         self.assertIn("agent-attest", start)
         self.assertEqual(result.slots[0].outcome, SLOT_LAUNCHED)
+
+    def test_launcher_probe_uses_a_separate_runner_from_herdr_control(self) -> None:
+        """A Herdr endpoint gate must never receive a local launcher command."""
+        herdr = _Herdr(attest_capable=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher_env, launcher = self._fake_launcher_env(tmp)
+            herdr_binary = str(Path(tmp) / "fake-herdr")
+            herdr_calls = []
+            launcher_calls = []
+
+            def herdr_only(argv, *args, **kwargs):
+                self.assertEqual(argv[0], herdr_binary)
+                herdr_calls.append(list(argv))
+                return herdr.run(argv, *args, **kwargs)
+
+            def launcher_only(argv, *args, **kwargs):
+                self.assertEqual(argv[0], launcher)
+                launcher_calls.append(list(argv))
+                return herdr.run(argv, *args, **kwargs)
+
+            result, _, _ = self._prepare(
+                tmp,
+                providers=["claude"],
+                herdr=herdr,
+                extra_env=launcher_env,
+                herdr_runner=herdr_only,
+                launcher_runner=launcher_only,
+            )
+
+        self.assertEqual(result.slots[0].outcome, SLOT_LAUNCHED)
+        self.assertTrue(herdr_calls)
+        self.assertTrue(launcher_calls)
+        self.assertTrue(
+            all(call[1:3] != ["herdr", "agent-attest"] for call in herdr_calls)
+        )
+        self.assertTrue(
+            all(call[1:3] in (["herdr", "agent-attest"], ["config", "check-parse"])
+                for call in launcher_calls)
+        )
+
+    def test_new_pane_busy_is_retried_without_changing_the_exact_start_argv(self) -> None:
+        herdr = _Herdr(start_busy_attempts=1)
+        busy_sleep = (
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_pane_bound_launch.time.sleep"
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch(busy_sleep) as sleep:
+            result, _, _ = self._prepare(tmp, providers=["claude"], herdr=herdr)
+
+        self.assertEqual(result.slots[0].outcome, SLOT_LAUNCHED)
+        starts = _agent_start_calls(herdr)
+        self.assertEqual(len(starts), 2)
+        self.assertEqual(starts[0], starts[1])
+        sleep.assert_called_once_with(0.1)
 
     def test_generation_incapable_launcher_refuses_before_any_actuation(self) -> None:
         # #14203 review j#87479 F1: a launcher that carries `agent-attest` + a matching
@@ -2239,6 +2375,32 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         ]
         self.assertTrue(create_i < min(start_is))
         self.assertTrue(close_i > max(start_is))
+
+    def test_each_pane_is_prepared_before_its_exact_agent_start(self) -> None:
+        herdr = _Herdr(created_workspace="wPrepared")
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._prepare(
+                tmp, providers=["claude", "codex"], herdr=herdr, lane=""
+            )
+
+        self.assertEqual(
+            [slot.outcome for slot in result.slots],
+            [SLOT_LAUNCHED, SLOT_LAUNCHED],
+        )
+        self.assertEqual(len(herdr.pane_runs), 2)
+        for pane_run in herdr.pane_runs:
+            pane = pane_run[2]
+            matching_start = next(
+                call
+                for call in herdr.start_argvs
+                if call[call.index("--pane") + 1] == pane
+            )
+            self.assertLess(herdr.calls.index(pane_run), herdr.calls.index(matching_start))
+            provider = matching_start[matching_start.index("--kind") + 1]
+            self.assertTrue(pane_run[3].startswith(f"{provider}() {{ exec "))
+            self.assertTrue(pane_run[3].endswith(' "$@"; }'))
+        for pane_env in herdr.pane_envs.values():
+            self.assertNotIn("herdr-launch-shims", pane_env.get("PATH", ""))
 
     def test_complete_shim_set_is_prepared_before_first_herdr_write(self) -> None:
         """A later-provider shim failure leaves no workspace, pane, or first agent."""

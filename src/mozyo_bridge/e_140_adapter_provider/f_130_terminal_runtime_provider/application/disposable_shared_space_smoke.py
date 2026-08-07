@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import multiprocessing
 import queue
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -469,6 +470,7 @@ def run_disposable_shared_space_smoke(
                     SharedSpaceSmokeHarness(
                         capability=capability,
                         runner=instance.runner,
+                        launcher_runner=subprocess.run,
                         env=instance.child_env(),
                         providers=providers,
                     )
@@ -477,6 +479,7 @@ def run_disposable_shared_space_smoke(
                 cleanup_harness = SharedSpaceSmokeHarness(
                     capability=capability,
                     runner=instance.runner,
+                    launcher_runner=subprocess.run,
                     env=instance.child_env(),
                     providers=providers,
                 )

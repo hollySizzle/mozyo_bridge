@@ -76,6 +76,13 @@ class _RebootHerdr:
                 ),
                 stderr="",
             )
+        if rest == ["pane", "run", "--help"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout="Usage: herdr pane run <PANE_ID> <COMMAND>...\n",
+                stderr="",
+            )
         if rest == ["agent", "list"]:
             return subprocess.CompletedProcess(
                 argv, 0, stdout=json.dumps({"agents": self._rows}), stderr=""
@@ -158,6 +165,14 @@ class HostRestartRecoveryScenarioTest(unittest.TestCase):
                 c for c in herdr.calls
                 if c[:2] == ["agent", "start"]
                 and c != ["agent", "start", "--help"]
+            ],
+            [],
+        )
+        self.assertEqual(
+            [
+                c
+                for c in herdr.calls
+                if c[:2] == ["pane", "run"] and c != ["pane", "run", "--help"]
             ],
             [],
         )

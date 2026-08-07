@@ -137,6 +137,13 @@ class _StatefulHerdr:
                 ),
                 stderr="",
             )
+        if rest == ["pane", "run", "--help"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout="Usage: herdr pane run <PANE_ID> <COMMAND>...\n",
+                stderr="",
+            )
         if rest[:2] == ["herdr", "agent-attest"]:
             return subprocess.CompletedProcess(
                 argv,
@@ -254,6 +261,15 @@ class _StatefulHerdr:
             self._pane_tab.pop(pane, None)
             self._pane_env.pop(pane, None)
             self.agents = [agent for agent in self.agents if agent["pane_id"] != pane]
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=json.dumps({"result": {"type": "ok"}}), stderr=""
+            )
+        if rest[:2] == ["pane", "run"]:
+            pane = rest[2] if len(rest) > 2 else ""
+            if pane not in self._pane_workspace or len(rest) != 4 or not rest[3]:
+                return subprocess.CompletedProcess(
+                    argv, 1, stdout="", stderr="pane run refused"
+                )
             return subprocess.CompletedProcess(
                 argv, 0, stdout=json.dumps({"result": {"type": "ok"}}), stderr=""
             )

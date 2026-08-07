@@ -41,11 +41,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_epoch import (  # noqa: E501
     resolve_launch_lane_epoch,
 )
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
-    _invoke,
-)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_bound_launch import (  # noqa: E501
+    prepare_provider_shell_function,
     split_prepared_pane,
+    start_agent_in_prepared_pane,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_result import (  # noqa: E501
     SLOT_ADOPTED,
@@ -181,7 +180,6 @@ def _execute_slot(
         workspace_id=workspace_id,
         lane=lane,
         binary=binary,
-        shim_dir=shim_dir,
         source_path=str(env.get("PATH") or ""),
         resolved=resolved,
         attest_launcher=attest_launcher,
@@ -222,6 +220,21 @@ def _execute_slot(
             "herdr pane split landed outside the requested tab; the exact pane was "
             "recorded and agent start was refused"
         )
+    # Herdr 0.8 submits the canonical provider name to the pane's interactive shell.
+    # A macOS login shell may replace pane-split's PATH before that submission, so bind
+    # the canonical name to this action's private shim in the exact pane itself.  The
+    # command is sent before `agent start`; terminal input ordering keeps the definition
+    # ahead of the provider invocation, and the typed busy retry below waits for the
+    # shell to become available without broadening any global PATH or config.
+    prepare_provider_shell_function(
+        binary=binary,
+        pane_locator=prepared.locator,
+        provider=plan.provider,
+        shim_dir=shim_dir,
+        runner=runner,
+        timeout=timeout,
+        env=env,
+    )
     launch_argv = build_agent_start_argv(
         assigned_name=plan.assigned_name,
         native_name=binding.native_name,
@@ -236,12 +249,12 @@ def _execute_slot(
         action_id=action_id,
         lane_epoch=lane_epoch,
     )
-    started = _invoke(
-        binary,
-        launch_argv,
-        runner,
-        max(timeout, 31.0),
-        env=dict(env),
+    started = start_agent_in_prepared_pane(
+        binary=binary,
+        launch_argv=launch_argv,
+        runner=runner,
+        timeout=timeout,
+        env=env,
     )
     started_agent = _parse_started_agent_identity(started.stdout)
     if started_agent is None:

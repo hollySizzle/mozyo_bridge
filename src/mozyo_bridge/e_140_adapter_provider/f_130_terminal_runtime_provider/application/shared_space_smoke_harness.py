@@ -282,6 +282,7 @@ class SharedSpaceSmokeHarness:
         *,
         capability: IsolationCapability,
         runner,
+        launcher_runner=None,
         env: Mapping[str, str],
         timeout: float = COMMAND_TIMEOUT_SECONDS,
         providers: Sequence[str] = ("claude", "codex"),
@@ -303,6 +304,7 @@ class SharedSpaceSmokeHarness:
         self._capability = capability
         self.home = capability.isolated_home
         self.recorder = RecordingHerdrRunner(runner)
+        self.launcher_runner = launcher_runner
         self.env = dict(env)
         self.timeout = timeout
         self.providers = tuple(providers)
@@ -426,6 +428,7 @@ class SharedSpaceSmokeHarness:
                 lane_id="",
                 env=self.env,
                 runner=self.recorder,
+                launcher_runner=self.launcher_runner,
                 timeout=self.timeout,
                 coordinator_placement_mode=SHARED_SPACE,
                 startup_fence=self._startup_fence_factory(spec.project_key),

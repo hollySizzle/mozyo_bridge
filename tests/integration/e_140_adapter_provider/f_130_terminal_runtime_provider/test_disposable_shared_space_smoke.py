@@ -79,6 +79,16 @@ class DisposableSharedSpaceLiveIntegrationTests(unittest.TestCase):
                 script = bindir / provider
                 script.write_text("#!/bin/sh\nsleep 30\n", encoding="utf-8")
                 script.chmod(script.stat().st_mode | stat.S_IEXEC)
+            launcher = bindir / "mozyo-bridge"
+            launcher.write_text(
+                f"#!{sys.executable}\n"
+                "import sys\n"
+                f"sys.path.insert(0, {str(ROOT / 'src')!r})\n"
+                "from mozyo_bridge.application.cli import main\n"
+                "raise SystemExit(main())\n",
+                encoding="utf-8",
+            )
+            launcher.chmod(launcher.stat().st_mode | stat.S_IEXEC)
             herdr = shutil.which("herdr")
             assert herdr is not None
             path = os.pathsep.join(
@@ -100,9 +110,9 @@ class DisposableSharedSpaceLiveIntegrationTests(unittest.TestCase):
                 env.update(
                     {
                         "MOZYO_HERDR_BINARY": herdr,
-                        # Disable the attestation wrapper for the harmless provider
-                        # stubs; production/built-artifact E2E exercises the real one.
-                        "MOZYO_BRIDGE_LAUNCHER": str(base / "absent-launcher"),
+                        # Exercise the exact source wrapper too.  Disabling it masked
+                        # the endpoint-runner/launcher-runner boundary in #15101.
+                        "MOZYO_BRIDGE_LAUNCHER": str(launcher),
                         "PATH": path,
                         # The ambient endpoint the smoke inherits. Every request the
                         # smoke makes must be redirected away from it, and the gate

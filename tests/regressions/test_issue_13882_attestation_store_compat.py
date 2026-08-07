@@ -1554,6 +1554,7 @@ class ReviewJ80190LockProtocolTest(unittest.TestCase):
                     [
                         ["agent", "start", "--help"],
                         ["pane", "split", "--help"],
+                        ["pane", "run", "--help"],
                     ],
                     "only the read-only Herdr 0.8 capability probes may precede the lock",
                 )

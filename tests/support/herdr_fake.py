@@ -22,10 +22,12 @@ collaborator).
 
 Contract faithfulness (design §1.1, modelled faces A–F)
 ------------------------------------------------------
-- **A ``pane split`` + ``agent start``** — models Herdr 0.8's two-step launch:
+- **A ``pane split`` + ``pane run`` + ``agent start``** — models Herdr 0.8's
+  prepared-pane launch:
   ``pane split <PANE_ID> --direction ... --cwd ... --env ...`` creates the exact
-  pane, then ``agent start <NAME> --kind <KIND> --pane <PANE_ID> -- [argv…]``
-  binds the process to it and returns ``result.agent.pane_id``.
+  pane, ``pane run`` installs its pane-local canonical provider function, then
+  ``agent start <NAME> --kind <KIND> --pane <PANE_ID> -- [argv…]`` binds the
+  process to it and returns ``result.agent.pane_id``.
 - **B ``agent list``** — renders the live inventory from state; each row carries
   the managed ``name`` and the transient locator under ``pane_id`` (alias
   ``pane`` / ``location`` selectable, matching the real decode aliases).
@@ -383,6 +385,13 @@ class FakeHerdr:
                 ),
                 stderr="",
             )
+        if rest == ["pane", "run", "--help"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout="Usage: herdr pane run <PANE_ID> <COMMAND>...\n",
+                stderr="",
+            )
         head = rest[:2]
         if head == ["workspace", "create"]:
             return self._cmd_workspace_create(argv, rest)
@@ -392,6 +401,8 @@ class FakeHerdr:
             return self._cmd_tab_create(argv, rest)
         if head == ["pane", "split"]:
             return self._cmd_pane_split(argv, rest)
+        if head == ["pane", "run"]:
+            return self._cmd_pane_run(argv, rest)
         if head == ["agent", "start"]:
             return self._cmd_agent_start(argv, rest)
         if head == ["agent", "list"]:
@@ -741,6 +752,17 @@ class FakeHerdr:
             self._composer[target] = self._composer.get(target, self.read_text) + "\n" + rest[3]
         return _ok(argv, {"result": {"type": "ok"}})
 
+    def _cmd_pane_run(self, argv, rest):
+        pane_id = rest[2] if len(rest) > 2 else ""
+        command = rest[3] if len(rest) > 3 else ""
+        if self._workspace_of_pane(pane_id) is None:
+            return _err(argv, f"no such pane: {pane_id}")
+        if not command or len(rest) != 4:
+            raise UnknownHerdrCommandError(
+                f"pane run requires one exact pane and command: {rest!r}"
+            )
+        return _ok(argv, {"result": {"type": "ok"}})
+
     # -- wait resolution (change-semantics, no real time) ---------------------
 
     def _resolve_wait(self, target: str, want_status: str):
@@ -948,6 +970,15 @@ class FakeHerdr:
             c
             for c in self.calls
             if c[:2] == ["pane", "split"] and c != ["pane", "split", "--help"]
+        ]
+
+    @property
+    def pane_run_argvs(self) -> list:
+        """Every pane-local preparation command, excluding its help probe."""
+        return [
+            c
+            for c in self.calls
+            if c[:2] == ["pane", "run"] and c != ["pane", "run", "--help"]
         ]
 
 

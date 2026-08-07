@@ -52,18 +52,13 @@ backend flag: you may prepare herdr identities without selecting the herdr trans
 and vice versa (documented in ``vibes/docs/specs/herdr-native-identity.md``). In pure
 herdr operation you run both.
 
-Live-measured launch contract (Herdr 0.8)
------------------------------------------
-The compatibility preflight requires the two-stage 0.8 surface used here::
+Herdr 0.8 requires this preflighted prepared-pane launch surface::
 
-    herdr pane split <ANCHOR> --direction <right|down> --cwd <PATH> \
-        [--env KEY=VALUE]... --no-focus
+    herdr pane split <ANCHOR> --direction <right|down> --cwd <PATH> [--env KEY=VALUE]... --no-focus
+    herdr pane run <PANE_ID> '<provider>() { exec <ACTION_PRIVATE_SHIM> "$@"; }'
     herdr agent start <NATIVE_NAME> --kind <claude|codex> --pane <PANE_ID> -- <argv...>
-
-Pane creation carries cwd, injected identity environment, placement and focus policy;
-``agent start`` binds the canonical provider kind to that exact pane. Herdr's short
-native name is collision-checked and durably bound to mozyo's full ``mzb1_...`` logical
-identity. JSON receipts are parsed fail-closed before routing or startup settlement.
+``pane run`` binds the canonical provider name only after login-shell startup. Herdr's
+short native name is collision-checked and bound to ``mzb1_...``; receipts fail closed.
 
 Tests exercise the argv + JSON parsing through an injected subprocess ``runner`` (no
 live herdr binary); the end-to-end live smoke stays the coordinator's post-review step.
@@ -300,6 +295,7 @@ def prepare_session(
     env: Mapping[str, str],
     pair_order: Optional[Sequence[str]] = None,
     runner: Optional[Runner] = None,
+    launcher_runner: Optional[Runner] = None,
     timeout: float = COMMAND_TIMEOUT_SECONDS,
     dry_run: bool = False,
     claude_permission_mode_default: Optional[str] = None,
@@ -350,6 +346,7 @@ def prepare_session(
         env=env,
         pair_order=pair_order,
         runner=runner,
+        launcher_runner=launcher_runner,
         timeout=timeout,
         dry_run=dry_run,
         claude_permission_mode_default=claude_permission_mode_default,
@@ -425,6 +422,7 @@ def _prepare_session_locked(
     env: Mapping[str, str],
     pair_order: Optional[Sequence[str]] = None,
     runner: Optional[Runner] = None,
+    launcher_runner: Optional[Runner] = None,
     timeout: float = COMMAND_TIMEOUT_SECONDS,
     dry_run: bool = False,
     claude_permission_mode_default: Optional[str] = None,
@@ -468,6 +466,11 @@ def _prepare_session_locked(
     )
     binary = _resolve_binary_or_die(env)
     runner = runner or subprocess.run
+    # The Herdr transport and the local mozyo-bridge launcher are distinct authority
+    # surfaces.  Production uses subprocess.run for both, while endpoint-bound smoke
+    # injects a Herdr-only runner that must never receive launcher probes.  Preserve the
+    # historical single-runner test seam when no explicit launcher runner is supplied.
+    launcher_runner = launcher_runner or runner
     # Probe both Herdr 0.8 write surfaces before registration or any Herdr write.
     if not _capabilities_observed:
         require_herdr_cli_capabilities(
@@ -692,7 +695,7 @@ def _prepare_session_locked(
     # `herdr_launch_preflight.preflight_managed_launch`, shared with the `sublane create`
     # pre-worktree gate so a conjunct can never be present at only one of the two boundaries.
     preflight_managed_launch(
-        attest_launcher, runner, timeout, env,
+        attest_launcher, launcher_runner, timeout, env,
         repo_root=repo_root,
         store_home=Path(store_home),
         workspace_id=workspace_id,
