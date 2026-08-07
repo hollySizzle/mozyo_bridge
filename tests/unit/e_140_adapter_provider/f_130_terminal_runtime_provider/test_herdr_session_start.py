@@ -299,6 +299,8 @@ class _Herdr:
         start_locator=None,
         created_workspace="wZ",
         created_tab=None,
+        split_workspace=None,
+        split_tab=None,
         tab_bad_payload=False,
         start_tab=None,
         start_fails=False,
@@ -327,6 +329,10 @@ class _Herdr:
         # ``tab_bad_payload`` returns an unparseable `tab create` payload so the
         # real code fails closed (the tab analogue of a malformed workspace create).
         self.created_tab = created_tab
+        # Optional exact location returned by ``pane split``. These stimuli model a
+        # server that creates a pane but violates the requested container placement.
+        self.split_workspace = split_workspace
+        self.split_tab = split_tab
         self.tab_bad_payload = tab_bad_payload
         # Landed tab reported by `agent start` (Redmine #13411 review j#74434 finding
         # 2): `None` echoes the requested `--tab` (faithful placement); a string
@@ -653,7 +659,13 @@ class _Herdr:
                     ),
                     str(row.get("cwd") or ""),
                 )
-            wid, tab_id, _anchor_cwd = self.pane_locations[anchor]
+            anchor_wid, anchor_tab_id, _anchor_cwd = self.pane_locations[anchor]
+            wid = self.split_workspace or anchor_wid
+            tab_id = (
+                self.split_tab
+                if self.split_tab is not None
+                else (f"{wid}:t1" if wid != anchor_wid else anchor_tab_id)
+            )
             self._pane_seq += 1
             pane_id = f"{wid}:p{self._pane_seq}"
             cwd = rest[rest.index("--cwd") + 1]
@@ -2267,6 +2279,70 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         # The workspace was created (residue) but the base pane was NOT closed.
         self.assertEqual(len(herdr.workspace_creates), 1)
         self.assertEqual(herdr.pane_closes, [])
+
+    def test_slot_execution_does_not_reopen_binding_store_after_whole_plan_bind(self) -> None:
+        # The whole launch set is collision-checked atomically before any Herdr write.
+        # A per-slot re-bind would reopen the DB between sibling starts and could leave
+        # only the first agent live if that second write failed.
+        herdr = _Herdr()
+        bind_path = (
+            "mozyo_bridge.core.state.herdr_native_identity_binding."
+            "HerdrNativeIdentityBindingStore.bind"
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            bind_path, side_effect=AssertionError("per-slot bind is forbidden")
+        ):
+            result, _, _ = self._prepare(
+                tmp, providers=["codex", "claude"], herdr=herdr
+            )
+        self.assertTrue(all(slot.outcome == SLOT_LAUNCHED for slot in result.slots))
+        self.assertEqual(len(herdr.start_argvs), 2)
+
+    def test_mislocated_split_is_recorded_before_agent_start_is_refused(self) -> None:
+        from mozyo_bridge.core.state.startup_action_capability import startup_action_id
+        from mozyo_bridge.core.state.startup_transaction_fence import (
+            StartupTransactionFence,
+            StartupUnit,
+        )
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        herdr = _Herdr(split_workspace="w9", split_tab="w9:t7")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            home = root / "home"
+            repo.mkdir()
+            home.mkdir()
+            binary = root / "fake-herdr"
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(binary.stat().st_mode | stat.S_IEXEC)
+            nonce = "mislocated-split"
+            fence = StartupTransactionFence(home=home)
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+            ):
+                register_workspace(repo, home=home)
+                workspace_id = read_anchor(repo)["workspace_id"]
+                with self.assertRaises(HerdrSessionStartError):
+                    prepare_session(
+                        repo_root=repo,
+                        providers=["codex"],
+                        lane_id="lane-1",
+                        env=_launch_env(binary),
+                        runner=herdr.run,
+                        startup_fence=fence,
+                        action_nonce=nonce,
+                        probe=_FAST_PROBE,
+                    )
+            action_id = startup_action_id(
+                StartupUnit(workspace_id, "lane-1", ("codex",)), nonce
+            )
+            action = fence.read(action_id)
+        self.assertIsNotNone(action)
+        participant = action.participant_for("codex")
+        self.assertEqual(participant.locator.partition(":")[0], "w9")
+        self.assertIn("workspace=w9 tab=w9:t7", participant.receipt)
+        self.assertEqual(herdr.start_argvs, [])
 
     def test_mislocated_launch_fails_closed_and_leaves_base_pane(self) -> None:
         # Redmine #13330 review j#73231: if `agent start` lands in a DIFFERENT

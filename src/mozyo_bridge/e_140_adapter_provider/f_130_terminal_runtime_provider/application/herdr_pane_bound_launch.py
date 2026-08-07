@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Callable, Iterator, Mapping, Optional, Sequence
 
 from mozyo_bridge.core.state.herdr_native_identity_binding import (
+    HerdrNativeIdentityBinding,
     HerdrNativeIdentityBindingStore,
 )
 
@@ -54,8 +55,7 @@ class PreparedPane:
 
 @dataclass(frozen=True)
 class NativeLaunchAdmission:
-    store: HerdrNativeIdentityBindingStore
-    native_names: Mapping[str, str]
+    bindings: Mapping[str, HerdrNativeIdentityBinding]
 
 
 class ActionPrivateLaunchShimSet:
@@ -123,8 +123,7 @@ def bind_native_launch_set(
             "launch set; no Herdr workspace, tab, pane, or agent was created"
         ) from exc
     return NativeLaunchAdmission(
-        store=store,
-        native_names={item.logical_name: item.native_name for item in bindings},
+        bindings={item.logical_name: item for item in bindings},
     )
 
 
@@ -238,8 +237,6 @@ def split_prepared_pane(
     direction: str,
     repo_root: Path,
     env_entries: Sequence[str],
-    target_workspace: str,
-    target_tab: str,
     runner: Runner,
     timeout: float,
     env: Mapping[str, str],
@@ -261,16 +258,6 @@ def split_prepared_pane(
         raise HerdrSessionStartError(
             "herdr pane split returned no parseable pane identity; refuse to start an "
             "agent in an untracked pane"
-        )
-    if pane.workspace_id != target_workspace:
-        raise HerdrSessionStartError(
-            "herdr pane split landed outside the requested workspace; refuse to bind "
-            "the startup action to a mislocated pane"
-        )
-    if target_tab and pane.tab_id != target_tab:
-        raise HerdrSessionStartError(
-            "herdr pane split landed outside the requested tab; refuse to bind the "
-            "startup action to a mislocated pane"
         )
     return pane
 

@@ -25,7 +25,8 @@ from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
 from mozyo_bridge.core.state.herdr_native_identity_binding import (
-    HerdrNativeIdentityBindingStore,
+    HerdrNativeIdentityBinding,
+    native_name_for,
 )
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
@@ -89,8 +90,7 @@ def _execute_slot(
     replacement_action_id: str = "",
     action_id: str = "",
     prepared_callback: Optional[Callable[..., None]] = None,
-    native_store: Optional[HerdrNativeIdentityBindingStore] = None,
-    native_name: str = "",
+    native_binding: Optional[HerdrNativeIdentityBinding] = None,
     shim_dir: str = "",
 ) -> SlotResult:
     if plan.kind == "adopt":
@@ -164,13 +164,16 @@ def _execute_slot(
             "Herdr 0.8 launch has no preflighted provider shim; refuse to create a "
             "pane after an incomplete whole-plan preflight"
         )
-    binding = (native_store or HerdrNativeIdentityBindingStore(home=Path(store_home))).bind(
-        plan.assigned_name
-    )
-    if native_name and native_name != binding.native_name:
+    if (
+        native_binding is None
+        or native_binding.logical_name != plan.assigned_name
+        or native_binding.native_name != native_name_for(plan.assigned_name)
+    ):
         raise HerdrSessionStartError(
-            "preflighted Herdr native identity changed before pane creation"
+            "the complete launch preflight supplied no matching collision-checked "
+            "Herdr native identity; no pane was created"
         )
+    binding = native_binding
     lane_epoch = resolve_launch_lane_epoch(workspace_id, lane, store_home=store_home)
     pane_env = build_pane_launch_env(
         provider=plan.provider,
@@ -192,8 +195,6 @@ def _execute_slot(
         direction=split or "right",
         repo_root=repo_root,
         env_entries=pane_env,
-        target_workspace=target_workspace,
-        target_tab=target_tab,
         runner=runner,
         timeout=timeout,
         env=env,
@@ -206,9 +207,21 @@ def _execute_slot(
         assigned_name=plan.assigned_name,
         locator=prepared.locator,
         native_name=binding.native_name,
-        target_workspace=target_workspace,
-        target_tab=prepared.tab_id or target_tab,
+        target_workspace=prepared.workspace_id,
+        target_tab=prepared.tab_id,
     )
+    # Record the exact returned pane before validating its placement. A mislocated
+    # split is still this run's side effect and must remain reachable by rollback.
+    if prepared.workspace_id != target_workspace:
+        raise HerdrSessionStartError(
+            "herdr pane split landed outside the requested workspace; the exact pane "
+            "was recorded and agent start was refused"
+        )
+    if target_tab and prepared.tab_id != target_tab:
+        raise HerdrSessionStartError(
+            "herdr pane split landed outside the requested tab; the exact pane was "
+            "recorded and agent start was refused"
+        )
     launch_argv = build_agent_start_argv(
         assigned_name=plan.assigned_name,
         native_name=binding.native_name,

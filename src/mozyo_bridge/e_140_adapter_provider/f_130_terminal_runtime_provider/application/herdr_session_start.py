@@ -917,8 +917,7 @@ def _prepare_session_locked(
                 replacement_action_id=replacement_action_id,
                 action_id=transaction.action_id if transaction is not None else "",
                 prepared_callback=record_prepared,
-                native_store=native_admission.store,
-                native_name=native_admission.native_names.get(plan.assigned_name, ""),
+                native_binding=native_admission.bindings.get(plan.assigned_name),
                 shim_dir=launch_shim_dirs.get(plan.provider, ""),
             )
         )
