@@ -964,6 +964,43 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
         outcome, detail = env.run(env.result(PROJECT_B, list(launched)))
         self._assert_zero_move_failure(env, outcome, detail, "while its assigned name claims")
 
+    def test_a_later_foreign_conflict_outranks_an_own_retryable_cwd(self):
+        """Inventory order cannot hide a non-retryable foreign contradiction."""
+        env = _Env(self, PROJECT_A, PROJECT_B)
+        tab = env.herdr.new_tab()
+        (foreign_pair,) = env.seed_columns(tab, (PROJECT_A, ""))
+        launched = env.append_pair(tab, PROJECT_B)
+        env.herdr.detected_override[foreign_pair[0]] = "claude"
+        stable_rows = env.herdr._rows
+        reads = 0
+
+        def own_first_transient_rows():
+            nonlocal reads
+            reads += 1
+            rows = stable_rows()
+            if reads == 1:
+                for row in rows:
+                    if row.get("pane_id") == launched[0]:
+                        row["cwd"] = str(Path("/"))
+            rows.sort(
+                key=lambda row: 0 if row.get("pane_id") in launched else 1
+            )
+            return rows
+
+        env.herdr._rows = own_first_transient_rows
+        outcome, detail = env.run(
+            env.result(PROJECT_B, list(launched)), sleeper=lambda _seconds: None
+        )
+        self._assert_zero_move_failure(
+            env, outcome, detail, "while its assigned name claims"
+        )
+        reads_seen = [
+            call for call in env.herdr.calls if call[:2] == ["agent", "list"]
+        ]
+        self.assertEqual(
+            len(reads_seen), 1, "foreign contradiction must stop the first full read"
+        )
+
     def test_a_previous_generation_self_attestation_is_never_re_used(self):
         """Review j#99913 finding_1 — six panes moved on a stale record before this.
 

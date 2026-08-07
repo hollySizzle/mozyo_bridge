@@ -608,15 +608,25 @@ class ProjectColumnAuthority:
         if refusal:
             return ProjectGroupDecision.refused(refusal)
 
+        retryable_own_refusal = ""
         for pane in panes:
             refusal, cwd_unresolved = self._observable_refusal(pane)
-            if refusal:
-                return ProjectGroupDecision.refused(
-                    refusal,
-                    retryable_own_cwd_unresolved=(
-                        cwd_unresolved and pane.locator in own_index
-                    ),
-                )
+            if not refusal:
+                continue
+            if cwd_unresolved and pane.locator in own_index:
+                # Do not return yet: a later foreign/conflicting row is a
+                # stronger, non-retryable refusal and must not be hidden by
+                # inventory ordering.  Retry is allowed only if this full pass
+                # finds nothing except fresh-own unresolved stable cwd rows.
+                if not retryable_own_refusal:
+                    retryable_own_refusal = refusal
+                continue
+            return ProjectGroupDecision.refused(refusal)
+        if retryable_own_refusal:
+            return ProjectGroupDecision.refused(
+                retryable_own_refusal,
+                retryable_own_cwd_unresolved=True,
+            )
 
         refusal = self._named_lane_refusal(groups, own_key)
         if refusal:
