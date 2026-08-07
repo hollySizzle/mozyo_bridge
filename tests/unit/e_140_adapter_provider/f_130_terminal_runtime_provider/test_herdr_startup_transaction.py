@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import sys
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+
+ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.startup_transaction_fence import (
     StartupTransactionBusy,
