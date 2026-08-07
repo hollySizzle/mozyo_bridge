@@ -622,12 +622,6 @@ class ProjectColumnAuthority:
                     retryable_own_refusal = refusal
                 continue
             return ProjectGroupDecision.refused(refusal)
-        if retryable_own_refusal:
-            return ProjectGroupDecision.refused(
-                retryable_own_refusal,
-                retryable_own_cwd_unresolved=True,
-            )
-
         refusal = self._named_lane_refusal(groups, own_key)
         if refusal:
             return ProjectGroupDecision.refused(refusal)
@@ -641,6 +635,11 @@ class ProjectColumnAuthority:
                     f"pane {pane.locator!r} has no usable startup self-attestation "
                     f"({state})"
                 )
+        if retryable_own_refusal:
+            return ProjectGroupDecision.refused(
+                retryable_own_refusal,
+                retryable_own_cwd_unresolved=True,
+            )
         return ProjectGroupDecision(groups=groups, own_key=own_key)
 
     # -- phases ------------------------------------------------------------
