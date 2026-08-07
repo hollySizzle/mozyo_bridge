@@ -455,6 +455,32 @@ class PublicRailTests(unittest.TestCase):
         after = self._row()
         self.assertEqual((after.lane_disposition, after.revision), (before.lane_disposition, before.revision))
 
+    def test_non_herdr_backend_is_typed_refusal_without_writing(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_herdr_projection as projection,
+        )
+
+        before = self._row()
+        with mock.patch.object(
+            projection, "repo_backend_is_herdr", return_value=False
+        ):
+            code, payload = self._run(self._args())
+
+        self.assertEqual(code, 1, payload)
+        self.assertFalse(payload["retire_ok"])
+        verdict = payload["hibernated_unbound_live_zero_retire"]
+        self.assertEqual(verdict["state"], rail.HIBERNATED_UNBOUND_RETIRE_BLOCKED)
+        self.assertEqual(
+            verdict["reason"], rail.HIBERNATED_UNBOUND_RETIRE_NOT_HERDR_BACKEND
+        )
+        after = self._row()
+        self.assertEqual(
+            (after.lane_disposition, after.revision),
+            (before.lane_disposition, before.revision),
+        )
+        self.assertEqual(self.transport.calls, [])
+        self.close_spy.assert_not_called()
+
     def test_open_issue_or_missing_journal_refuses_without_writing(self) -> None:
         for payload, expected in (
             (

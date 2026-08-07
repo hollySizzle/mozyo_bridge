@@ -28,6 +28,7 @@ HIBERNATED_UNBOUND_RETIRE_ALREADY_RETIRED = "already_retired"
 HIBERNATED_UNBOUND_RETIRE_BLOCKED = "blocked"
 
 HIBERNATED_UNBOUND_RETIRE_FENCE_NOT_DECLARED = "generation_fence_not_declared"
+HIBERNATED_UNBOUND_RETIRE_NOT_HERDR_BACKEND = "not_herdr_backend"
 HIBERNATED_UNBOUND_RETIRE_WORKSPACE_UNRESOLVED = "workspace_unresolved"
 HIBERNATED_UNBOUND_RETIRE_BRANCH_NOT_LANE_BOUND = "branch_not_lane_bound"
 HIBERNATED_UNBOUND_RETIRE_WORKTREE_CONFLICT = "worktree_conflict"
@@ -235,9 +236,16 @@ def run_hibernated_unbound_live_zero_retire(
         repo_scope_workspace_id,
     )
 
-    if not repo_backend_is_herdr(repo_root):
-        return None
     lane_label = (getattr(args, "lane_label", "") or "").strip()
+    if not repo_backend_is_herdr(repo_root):
+        return _blocked(
+            HIBERNATED_UNBOUND_RETIRE_NOT_HERDR_BACKEND,
+            detail=(
+                "the hibernated-unbound terminal retire is a Herdr lifecycle "
+                "operation and cannot actuate for this repository backend"
+            ),
+            lane_id=lane_label,
+        )
     issue = (getattr(args, "issue", "") or "").strip()
     journal = (getattr(args, "journal", "") or "").strip()
     try:
