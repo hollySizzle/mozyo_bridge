@@ -4,6 +4,31 @@
 
 記載は Git の release commit と利用可能な tag を元にしています。一部の過去バージョンは release commit はありますが、現在の repository には対応する tag がありません。
 
+## v0.18.0 - 2026-08-08
+
+`v0.17.0` からの後方互換な minor release です。Herdr 0.8 の pane-bound launch契約へmanaged agent起動を移行し、Herdrの名前長上限を満たしながらmozyo-bridgeの論理identityを維持します。また、共有画面へproject coordinatorを追加した後の列幅を再調整し、複数projectを並べても各列を同程度の幅で表示します。
+
+### Herdr 0.8 managed launch
+
+- 起動前に `agent start` と `pane split` の必要機能を読み取り、対象paneを明示してsplit・provider command準備・agent startを行う方式へ移行しました。旧形式、曖昧なhelp、読取不能なruntimeは、paneを作る前に拒否します。
+- Herdr内部では32文字の短縮名 `mza1` を使い、home-scoped binding storeから従来の論理名 `mzb1` へ復元します。衝突、未登録、壊れたbindingは推測で補わず拒否し、route・lifecycle・attestationのauthorityは論理名のまま保ちます。
+- 起動処理をtransactionとして記録し、失敗時は今回作成したpaneだけをrollbackします。既存paneは保持し、準備中paneのbusy応答だけを同一対象・同一commandへ限定して再試行します。
+
+### 共有coordinator画面の列幅安定化
+
+- 既存のproject coordinator共有画面へ新しいpairを追加した後、対象を明示したresizeとlayout再読を行い、全project列の幅差を1 cell以内へ揃えます。
+- workspace、pane、role、attestation、lane stateのいずれかを一意に証明できない場合は、既存paneを動かさず拒否します。project間の列調整だけを対象とし、pair内部の上下配置や任意のlive並べ替えは変更しません。
+
+### 配布物検査
+
+- built wheelから起動する異常系smokeをHerdr 0.8の同一tab pairとnative/logical name roundtripへ揃え、stale worker recoveryの正・負ケースを配布物境界で検査します。
+
+### リリース状況メモ
+
+- **version mirror**: 本ノートとは別のstandalone commitで `pyproject.toml` とruntime `__version__` を `0.18.0` に揃えます。
+- **互換性**: user-facing CLIの意図的な削除はありません。managed launchはHerdr 0.8 surfaceを必須とし、Herdr 0.7へのfallbackは行いません。利用環境は先にHerdr 0.8へ更新する必要があります。
+- **公開gate**: 最終candidateのmain CI、Python 3.10–3.13 full matrix、release tree / scaffold / artifact / drift検査、TestPyPI完全指定版の新規installを通した後、annotated tagとGitHub ReleaseからProduction PyPIへ公開します。
+
 ## v0.17.0 - 2026-08-07
 
 `v0.16.0` からの後方互換な minor release です。共有画面で複数project coordinatorを運用する際の配置を安定させ、テスト実行を通常の利用環境から隔離する正式な入口を追加しました。また、終了済みサブレーンを安全条件に従って自動退役へ進めることで、長時間運用後に残るprocessとlifecycle状態を減らします。
