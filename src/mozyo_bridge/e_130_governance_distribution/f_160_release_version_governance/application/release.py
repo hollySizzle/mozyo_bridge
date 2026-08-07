@@ -43,6 +43,8 @@ from mozyo_bridge.scaffold.rules import (
     write_scaffold,
 )
 from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import (
+    release_publish_plan,
+    release_source_snapshot,
     source_ref as source_ref_policy,
     version_mirror,
 )
@@ -578,73 +580,25 @@ def cmd_release_check_artifact(args: argparse.Namespace) -> int:
 
     Honors the `release check` family's read-only / no-mutation invariant:
     the helper never touches the repo's ``dist/`` directory. Instead it
-    asks the current Python interpreter to run ``-m build`` into an
-    isolated tmp outdir, then
+    copies the tracked plus non-ignored current source into an isolated
+    temporary tree, asks the current Python interpreter to run ``-m build``
+    there and write into an isolated tmp outdir, then
     extracts every produced wheel / sdist and scans the extracted trees
     for personal home paths and secret-shape tokens. The scan is
     strict-fail; matches are printed so the operator can record
     disposition in the Asana task. False-positive disposition stays with
     the operator — the helper does not auto-dismiss any hit.
     """
+    _require_command("git")
     repo_root = resolve_repo_root(getattr(args, "repo", None))
-
-    blockers: list[str] = []
-    with tempfile.TemporaryDirectory(prefix="mozyo-release-artifact-") as tmp_str:
-        tmp = Path(tmp_str)
-        build_outdir = tmp / "dist"
-        build_outdir.mkdir(parents=True, exist_ok=True)
-        extract_root = tmp / "extracted"
-        extract_root.mkdir(parents=True, exist_ok=True)
-
-        _print_section("python -m build --outdir <tmp>")
-        print(f"outdir: {build_outdir}")
-        build = _run(
-            [sys.executable, "-m", "build", "--outdir", str(build_outdir)],
-            cwd=repo_root,
-        )
-        if build.stdout:
-            print(build.stdout, end="" if build.stdout.endswith("\n") else "\n")
-        if build.returncode != 0:
-            if build.stderr:
-                print(build.stderr, end="" if build.stderr.endswith("\n") else "\n")
-            print("")
-            print("result: blocker")
-            print("- python -m build failed")
-            return EXIT_BLOCKER
-
-        artifacts = sorted(p for p in build_outdir.iterdir() if p.is_file())
-        _print_section("dist artifacts")
-        for artifact in artifacts:
-            print(f"artifact: {artifact}")
-        if not artifacts:
-            print("")
-            print("result: blocker")
-            print("- python -m build produced no artifacts")
-            return EXIT_BLOCKER
-
-        personal_pattern = re.compile("|".join(_PERSONAL_PATH_PATTERNS))
-        for artifact in artifacts:
-            extracted = _extract_artifact(artifact, extract_root)
-            _print_section(f"scan {artifact.name}")
-            hits = _grep_artifact_tree(extracted, personal_pattern)
-            if not hits:
-                print("(no matches)")
-                continue
-            for path, lineno, line in hits:
-                rel = path.relative_to(extract_root)
-                print(f"{rel}:{lineno}: {line.rstrip()}")
-            blockers.append(
-                f"{artifact.name}: personal path or secret-shape match"
-            )
-
-    print("")
-    if blockers:
-        print("result: blocker (false-positive disposition stays with operator)")
-        for item in blockers:
-            print(f"- {item}")
-        return EXIT_BLOCKER
-    print("result: clean")
-    return EXIT_CLEAN
+    return release_source_snapshot.run_artifact_check(
+        repo_root=repo_root,
+        run=_run,
+        extract_artifact=_extract_artifact,
+        scan_artifact=_grep_artifact_tree,
+        personal_path_patterns=_PERSONAL_PATH_PATTERNS,
+        python_executable=sys.executable,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1300,6 +1254,7 @@ def _testpypi_existing_version(version: str) -> str | None:
 
 def _publish_plan(args: argparse.Namespace) -> int:
     repo_root = resolve_repo_root(getattr(args, "repo", None))
+    _require_command("git")
     mirror = _load_mirror_set(repo_root)
     pyproject_path = None
     for path, _handler in mirror:
@@ -1317,11 +1272,20 @@ def _publish_plan(args: argparse.Namespace) -> int:
     )
     current_version = _extract_current_version(pyproject_path, pyproject_handler)
 
+    try:
+        authority = release_publish_plan.resolve_release_plan_authority(
+            repo_root, run=_run
+        )
+    except release_publish_plan.ReleasePlanAuthorityError as exc:
+        die(str(exc))
+        raise AssertionError("unreachable")
+    _validate_source_sha(authority.source_sha)
+    source_ref_policy.validate(authority.source_ref, repo_root=repo_root)
+
     _print_section("git ref")
-    head = _run(["git", "rev-parse", "HEAD"], cwd=repo_root)
-    branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_root)
-    print(f"head: {head.stdout.strip()}")
-    print(f"branch: {branch.stdout.strip()}")
+    print(f"head: {authority.source_sha}")
+    print(f"branch: {authority.branch}")
+    print(f"source_ref: {authority.source_ref}")
 
     _print_section("pyproject version")
     print(f"version: {current_version}")
@@ -1375,9 +1339,12 @@ def _publish_plan(args: argparse.Namespace) -> int:
         print(f"version {current_version}: {testpypi_status} on TestPyPI")
 
     _print_section("operator options")
+    testpypi_command = release_publish_plan.render_testpypi_command(
+        authority, version=current_version
+    )
     print(
         "- TestPyPI rehearsal: "
-        f"`mozyo-bridge release publish --testpypi --version {current_version}`"
+        f"`{testpypi_command}`"
     )
     print(
         "- production publish dry-run: "

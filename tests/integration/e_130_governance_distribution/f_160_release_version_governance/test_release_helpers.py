@@ -13,12 +13,14 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -877,13 +879,17 @@ class ReleaseCheckArtifactTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as repo_str:
             repo = Path(repo_str).resolve()
+            self._init_artifact_repo(repo)
             (repo / "dist").mkdir()
             sentinel = repo / "dist" / "preexisting.whl"
             sentinel.write_bytes(b"preexisting")
 
             recorded: list[dict] = []
+            original_run = release_mod._run
 
             def fake_run(argv, cwd=None, check=False, env=None):
+                if list(argv[:2]) == ["git", "ls-files"]:
+                    return original_run(argv, cwd=cwd, check=check, env=env)
                 recorded.append(
                     {"argv": list(argv), "cwd": str(cwd) if cwd else None}
                 )
@@ -926,6 +932,132 @@ class ReleaseCheckArtifactTest(unittest.TestCase):
             # the load-bearing assertions are the sentinel + outdir checks
             # above.
             self.assertEqual(release_mod.EXIT_BLOCKER, rc)
+
+    @staticmethod
+    def _init_artifact_repo(root: Path) -> None:
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        _disable_background_git_maintenance(root)
+        (root / ".gitignore").write_text(
+            "dist/\n*.egg-info/\n", encoding="utf-8"
+        )
+        (root / "src").mkdir()
+        (root / "src" / "package.py").write_text(
+            "VALUE = 1\n", encoding="utf-8"
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "add", ".gitignore", "src/package.py"],
+            check=True,
+        )
+
+    @staticmethod
+    def _worktree_fingerprint(root: Path) -> tuple[tuple[object, ...], ...]:
+        rows: list[tuple[object, ...]] = []
+        for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
+            relative = path.relative_to(root)
+            if relative.parts and relative.parts[0] == ".git":
+                continue
+            if path.is_symlink():
+                rows.append((relative.as_posix(), "symlink", os.readlink(path)))
+            elif path.is_file():
+                rows.append(
+                    (
+                        relative.as_posix(),
+                        "file",
+                        path.stat().st_mode,
+                        path.read_bytes(),
+                    )
+                )
+            elif path.is_dir():
+                rows.append((relative.as_posix(), "dir", path.stat().st_mode))
+        return tuple(rows)
+
+    @staticmethod
+    def _status_with_ignored(root: Path) -> str:
+        return subprocess.run(
+            ["git", "-C", str(root), "status", "--short", "--ignored"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout
+
+    def test_artifact_check_preserves_repo_on_success_failure_and_scan_blocker(
+        self,
+    ) -> None:
+        """The build may write metadata, but only inside the temporary source.
+
+        Exercise all three exits that previously risked leaking
+        ``src/*.egg-info`` into the caller's checkout: clean artifact, build
+        failure, and an artifact-scan blocker.  Byte/mode identity and git's
+        ignored-status projection must survive every path.
+        """
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        original_run = release_mod._run
+        for outcome, expected in (
+            ("success", release_mod.EXIT_CLEAN),
+            ("build_failure", release_mod.EXIT_BLOCKER),
+            ("scan_blocker", release_mod.EXIT_BLOCKER),
+        ):
+            with self.subTest(outcome=outcome):
+                with tempfile.TemporaryDirectory() as repo_str:
+                    repo = Path(repo_str).resolve()
+                    self._init_artifact_repo(repo)
+                    (repo / "dist").mkdir()
+                    (repo / "dist" / "preexisting.whl").write_bytes(b"sentinel")
+                    before = self._worktree_fingerprint(repo)
+                    status_before = self._status_with_ignored(repo)
+                    build_cwds: list[Path] = []
+
+                    def fake_run(argv, cwd=None, check=False, env=None):
+                        if list(argv[:2]) == ["git", "ls-files"]:
+                            return original_run(
+                                argv, cwd=cwd, check=check, env=env
+                            )
+                        self.assertIn("build", argv)
+                        build_cwd = Path(cwd).resolve()
+                        build_cwds.append(build_cwd)
+                        (build_cwd / "src" / "package.egg-info").mkdir(
+                            parents=True, exist_ok=True
+                        )
+                        metadata = (
+                            build_cwd / "src" / "package.egg-info" / "PKG-INFO"
+                        )
+                        metadata.write_text("generated\n", encoding="utf-8")
+                        outdir = Path(argv[argv.index("--outdir") + 1])
+                        outdir.mkdir(parents=True, exist_ok=True)
+                        if outcome == "build_failure":
+                            return subprocess.CompletedProcess(
+                                args=argv,
+                                returncode=1,
+                                stdout="",
+                                stderr="build failed",
+                            )
+                        wheel = outdir / "package-0.1-py3-none-any.whl"
+                        body = "VALUE = 1\n"
+                        if outcome == "scan_blocker":
+                            body = (
+                                "home = "
+                                + macos_home_path("example", "project")
+                                + "\n"
+                            )
+                        with zipfile.ZipFile(wheel, "w") as archive:
+                            archive.writestr("package.py", body)
+                        return subprocess.CompletedProcess(
+                            args=argv, returncode=0, stdout="", stderr=""
+                        )
+
+                    with patch.object(release_mod, "_run", side_effect=fake_run):
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            rc = release_mod.cmd_release_check_artifact(
+                                argparse.Namespace(repo=str(repo))
+                            )
+
+                    self.assertEqual(expected, rc)
+                    self.assertEqual(before, self._worktree_fingerprint(repo))
+                    self.assertEqual(status_before, self._status_with_ignored(repo))
+                    self.assertEqual(1, len(build_cwds))
+                    with self.assertRaises(ValueError):
+                        build_cwds[0].relative_to(repo)
 
 
 class ReleaseCheckWorkflowTest(unittest.TestCase):
@@ -1605,6 +1737,100 @@ class ReleasePublishTest(unittest.TestCase):
     # Exact-candidate dispatch inputs (Redmine #13601).
     SOURCE_SHA = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
     NONCE = "deadbeefcafef00d"
+
+    def test_plan_renders_a_complete_reparseable_testpypi_command(self) -> None:
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        source_sha = self.SOURCE_SHA
+
+        def fake_run(argv, cwd=None, check=False, env=None):
+            if list(argv[:4]) == ["git", "rev-parse", "--verify", "HEAD"]:
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=0, stdout=source_sha + "\n", stderr=""
+                )
+            if list(argv[:4]) == ["git", "symbolic-ref", "--quiet", "HEAD"]:
+                return subprocess.CompletedProcess(
+                    args=argv,
+                    returncode=0,
+                    stdout="refs/heads/main\n",
+                    stderr="",
+                )
+            if list(argv[:3]) == ["git", "remote"]:
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=0, stdout="origin\n", stderr=""
+                )
+            if list(argv[:3]) == ["gh", "run", "list"]:
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=0, stdout="[]", stderr=""
+                )
+            self.fail(f"unexpected command: {argv!r}")
+
+        with patch.object(release_mod, "_run", side_effect=fake_run):
+            with patch.object(release_mod, "_require_command"):
+                with patch.object(
+                    release_mod, "_testpypi_existing_version", return_value="absent"
+                ):
+                    with contextlib.redirect_stdout(io.StringIO()) as out:
+                        rc = release_mod.cmd_release_publish(
+                            argparse.Namespace(
+                                testpypi=False,
+                                pypi=False,
+                                plan=True,
+                                repo=str(ROOT),
+                            )
+                        )
+        self.assertEqual(release_mod.EXIT_CLEAN, rc)
+        option_line = next(
+            line
+            for line in out.getvalue().splitlines()
+            if line.startswith("- TestPyPI rehearsal:")
+        )
+        command = re.search(r"`([^`]+)`", option_line).group(1)
+        argv = shlex.split(command)
+        self.assertEqual("mozyo-bridge", argv[0])
+        parsed = build_parser().parse_args(argv[1:])
+        self.assertEqual(source_sha, parsed.source_sha)
+        self.assertEqual(__version__, parsed.expected_version)
+        self.assertEqual("refs/heads/main", parsed.source_ref)
+        with patch.object(
+            release_mod, "_publish_testpypi", return_value=0
+        ) as handler:
+            self.assertEqual(0, parsed.func(parsed))
+        handler.assert_called_once_with(parsed)
+
+    def test_plan_refuses_detached_head_without_printing_incomplete_command(
+        self,
+    ) -> None:
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        def fake_run(argv, cwd=None, check=False, env=None):
+            if list(argv[:4]) == ["git", "rev-parse", "--verify", "HEAD"]:
+                return subprocess.CompletedProcess(
+                    args=argv,
+                    returncode=0,
+                    stdout=self.SOURCE_SHA + "\n",
+                    stderr="",
+                )
+            if list(argv[:4]) == ["git", "symbolic-ref", "--quiet", "HEAD"]:
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=1, stdout="", stderr=""
+                )
+            self.fail(f"unexpected command: {argv!r}")
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(release_mod, "_run", side_effect=fake_run):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit):
+                    release_mod.cmd_release_publish(
+                        argparse.Namespace(
+                            testpypi=False,
+                            pypi=False,
+                            plan=True,
+                            repo=str(ROOT),
+                        )
+                    )
+        self.assertIn("detached HEAD", stderr.getvalue())
+        self.assertNotIn("TestPyPI rehearsal", stdout.getvalue())
 
     def _stub_source_ref_policy(self) -> None:
         """Neutralize the origin preflight for dispatch-shape tests.
