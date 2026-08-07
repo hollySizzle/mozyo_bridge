@@ -1139,6 +1139,12 @@ stable project key 順に append する。これは今回、未使用 helper や
 live rollout (#14996 j#99833) で、既存 pair のある `project-coordinators` workspace へ 2 組目を fresh
 launch すると L 字になることを実測した。既存 project の下段 pane が全幅を占め、追加 pair はその上段の
 内側へ入れ子になる。identity / cwd / routing は正常で、壊れているのは geometry だけである。
+同じ Herdr の leaf split を使う `shared_space` の exact `coordinators` workspace にも同じ幾何制約が
+あるため、同一の verified relayout を適用する。workspace routing と role authority は各 mode の既存判定を
+維持し、ここで共有するのは append 後の geometry 処理だけである。
+column化後はRIGHT軸のancestor dividerを左から `1/N`, `1/(N-1)`, ... の比率へ順にresizeし、
+最終layoutで各project列の幅差が1cell以内であることも検証する。これにより3組目以降が
+`1/2, 1/4, 1/4, ...` と逓減する入れ子を成功扱いしない。
 
 **なぜ launch argv では届かないか** (herdr 0.7.4、disposable instance で実測):
 
@@ -1156,9 +1162,13 @@ relayout を承認し、**推測ではなく実測で検証すること**を条�
 
 境界 (いずれも code で強制する):
 
-- 対象は exact label `project-coordinators` workspace のみ。かつ **fresh な full pair を、他 project の
+- 対象は各 mode が exact label で解決した `project-coordinators` または `coordinators` workspace のみ。
+  かつ **fresh な full pair を、他 project の
   coordinator pane が既にいる tab へ append した run** だけ。adopt-only / 単一 provider heal / dry-run /
   最初の project は `not_applicable` で **layout も読まない**。
+- 列数 `N` はHerdrが表現できる最小ratio `0.1`から最大10とする。11組目以降は最初のpane move前に
+  fail-closedする。各resizeは指定paneの最近RIGHT軸ancestorが「現在列からtab右端まで」のrectであることを
+  再確認し、command成功ではなく再読したratioのstrict progressと最終幅差で判定する。
 - **decode できることは coordinator である証明ではない**。assigned name の `role` は provider token
   (`codex` / `claude`) であって workflow role ではないため、decode だけでは project coordinator と、この
   workspace へ誤配置・残留した implementation slot を区別できない (#14996 R2 review j#99885 finding_2 で、

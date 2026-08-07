@@ -36,6 +36,7 @@ from typing import Optional
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     decode_assigned_name,
 )
+from .herdr_fake import apply_resize_amount
 
 
 @dataclass
@@ -131,6 +132,27 @@ class Tab:
             self.focused = remaining[0] if remaining else ""
         return True
 
+    def resize(self, pane_id: str, direction: str, amount: float) -> bool:
+        """Resize the nearest ancestor divider whose axis matches ``direction``."""
+        axis = "down" if direction in {"up", "down"} else "right"
+
+        def locate(node):
+            if isinstance(node, Leaf):
+                return (node.pane_id == pane_id, None)
+            first_has, first_split = locate(node.first)
+            second_has, second_split = locate(node.second)
+            contains = first_has or second_has
+            nearest = first_split or second_split
+            if contains and nearest is None and node.direction == axis:
+                nearest = node
+            return contains, nearest
+
+        contains, split = locate(self.root)
+        if not contains or split is None:
+            return False
+        split.ratio = apply_resize_amount(split.ratio, direction, amount)
+        return True
+
     # -- read model -------------------------------------------------------
     def layout_payload(self) -> dict:
         panes: list = []
@@ -219,6 +241,10 @@ class PaneTreeHerdr:
         #: Rename a pane's assigned name at this point in the sequence, to prove the
         #: closing identity check is real rather than decorative.
         self.rename_after_moves: dict = {}
+        #: Refuse or accept-without-changing ``pane resize`` for fault injection.
+        self.resize_refused = False
+        self.resize_unchanged = False
+        self.resizes: list = []
         #: Panes whose ``agent list`` row is shell residue — the durable identity is
         #: there, the managed agent is not. Rendered as a present-but-blank ``agent``
         #: field, which is the positive stale signal ``classify_named_slot`` reads.
@@ -337,6 +363,8 @@ class PaneTreeHerdr:
             return self._pane_layout(argv, tail)
         if tail[:2] == ["pane", "move"]:
             return self._pane_move(argv, tail)
+        if tail[:2] == ["pane", "resize"]:
+            return self._pane_resize(argv, tail)
         raise AssertionError(f"unmodelled herdr command: {tail!r}")
 
     def _rows(self) -> list:
@@ -431,6 +459,20 @@ class PaneTreeHerdr:
                 }
             },
         )
+
+    def _pane_resize(self, argv, tail):
+        self.resizes.append(tail)
+        if self.resize_refused:
+            return self._failed(argv, "pane resize refused")
+        pane_id = tail[tail.index("--pane") + 1]
+        direction = tail[tail.index("--direction") + 1]
+        amount = float(tail[tail.index("--amount") + 1])
+        tab = self.tab_of(pane_id)
+        if tab is None:
+            return self._failed(argv, f"pane not found: {pane_id}")
+        if not self.resize_unchanged and not tab.resize(pane_id, direction, amount):
+            return self._failed(argv, f"matching divider not found: {pane_id}")
+        return self._done(argv, {"result": {"type": "ok"}})
 
     @staticmethod
     def _done(argv, payload):

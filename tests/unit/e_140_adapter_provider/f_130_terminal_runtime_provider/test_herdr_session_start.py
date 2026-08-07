@@ -30,7 +30,6 @@ if str(_TESTS_ROOT) not in sys.path:
 
 from support.herdr_fake import (
     FakeHerdr,
-    apply_resize_amount,
     attest_capability_epilog,
     render_pane_layout,
 )
@@ -469,7 +468,11 @@ class _Herdr:
                 )
             direction = rest[rest.index("--direction") + 1]
             amount = float(rest[rest.index("--amount") + 1])
-            self._apply_resize(direction, amount)
+            pane_id = rest[rest.index("--pane") + 1]
+            if not self._apply_resize(pane_id, direction, amount):
+                return subprocess.CompletedProcess(
+                    argv, 1, stdout="", stderr="matching divider not found"
+                )
             return subprocess.CompletedProcess(
                 argv, 0, stdout=json.dumps({"result": {"type": "ok"}}), stderr=""
             )
@@ -610,15 +613,7 @@ class _Herdr:
             if (self.split_direction or "down") == "down"
             else Rect(0, 0, self.split_extent, self.split_cross)
         )
-        self._apply_tree_ratio(tab.root)
         return tab.layout_payload()
-
-    def _apply_tree_ratio(self, node):
-        """Keep every divider on the container's single modelled ratio (#14569)."""
-        if isinstance(node, Split):
-            node.ratio = self.split_ratio
-            self._apply_tree_ratio(node.first)
-            self._apply_tree_ratio(node.second)
 
     def _pane_move(self, argv, rest):
         """herdr ``pane move`` — the detach / targeted re-placement the reflow uses."""
@@ -671,9 +666,10 @@ class _Herdr:
             stderr="",
         )
 
-    def _apply_resize(self, direction, amount):
-        """herdr's measured resize arithmetic — the shared model (0.5 cap, 0.1..0.9 clamp)."""
-        self.split_ratio = apply_resize_amount(self.split_ratio, direction, amount)
+    def _apply_resize(self, pane_id, direction, amount):
+        """Resize only the nearest same-axis ancestor selected by ``--pane``."""
+        tab = self._tab_of(pane_id)
+        return bool(tab and tab.resize(pane_id, direction, amount))
 
     # -- what a real launch leaves behind (Redmine #13948) -------------------------
 
@@ -2226,7 +2222,14 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertTrue(result.herdr_tab_id)
         self.assertEqual(len(herdr.tab_creates), 1)
 
-    def _role_grouped_projects(self, tmp, herdr, *, projects=("a", "b")):
+    def _shared_coordinator_projects(
+        self,
+        tmp,
+        herdr,
+        *,
+        projects=("a", "b"),
+        placement_mode="role_grouped_space",
+    ):
         """Launch ``projects`` coordinator pairs into one shared workspace.
 
         The composed rail, not a slice of it: each project is a real
@@ -2247,10 +2250,12 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         repos = {}
         results = []
         with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
-            top = root / "top"
-            top.mkdir(exist_ok=True)
-            register_workspace(top, home=home)
-            top_workspace_id = read_anchor(top)["workspace_id"]
+            top_workspace_id = ""
+            if placement_mode == "role_grouped_space":
+                top = root / "top"
+                top.mkdir(exist_ok=True)
+                register_workspace(top, home=home)
+                top_workspace_id = read_anchor(top)["workspace_id"]
             herdr.created_workspace = "wProjects"
             for label in projects:
                 repo = root / f"project-{label}"
@@ -2262,7 +2267,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                         providers=["codex", "claude"],
                         lane_id="",
                         launch_context=LaneLaunchContext(lane_kind="coordinator"),
-                        coordinator_placement_mode="role_grouped_space",
+                        coordinator_placement_mode=placement_mode,
                         coordinator_top_workspace_id=top_workspace_id,
                         env=env,
                         runner=herdr.run,
@@ -2290,7 +2295,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         herdr = _Herdr(created_workspace="wProjects")
         herdr.booting_after_start = {"codex", "claude"}
         with tempfile.TemporaryDirectory() as tmp:
-            (first,), _repos, _home, _env, _top = self._role_grouped_projects(
+            (first,), _repos, _home, _env, _top = self._shared_coordinator_projects(
                 tmp, herdr, projects=("a",)
             )
         self.assertTrue(
@@ -2315,7 +2320,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         herdr = _Herdr(created_workspace="wProjects")
         herdr.booting_after_start = {"codex", "claude"}
         with tempfile.TemporaryDirectory() as tmp:
-            (first, second), _repos, _home, _env, _top = self._role_grouped_projects(
+            (first, second), _repos, _home, _env, _top = self._shared_coordinator_projects(
                 tmp, herdr
             )
             rects = self._shared_rects(herdr, second.slots[0].locator)
@@ -2331,9 +2336,58 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             self.assertEqual(len(spans), 1, "a project pair must own one column")
             heights = sum(rects[slot.locator]["height"] for slot in session.slots)
             self.assertEqual(heights, herdr.split_extent, "the column is not full height")
+            codex = next(slot for slot in session.slots if slot.provider == "codex")
+            claude = next(slot for slot in session.slots if slot.provider == "claude")
+            self.assertLess(rects[codex.locator]["y"], rects[claude.locator]["y"])
             columns[session.workspace_id] = spans.pop()
         self.assertEqual(len(set(columns.values())), 2, "the pairs share one column")
         self.assertEqual(sum(width for _x, width in columns.values()), herdr.split_cross)
+
+    def test_shared_space_three_projects_each_gets_a_verified_column(self) -> None:
+        """The legacy shared overview applies the same verified project columns.
+
+        Z690 uses ``shared_space`` for peer project coordinators. Before #15098 the
+        routing correctly joined all three pairs to ``coordinators``, but the caller
+        classified every run as ineligible for project-column reflow and left the tab
+        as a shrinking nested split. The final layout must instead be three full-height
+        columns, with each project's providers stacked within its own column.
+        """
+        herdr = _Herdr(created_workspace="wProjects")
+        herdr.booting_after_start = {"codex", "claude"}
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions, _repos, _home, _env, _top = self._shared_coordinator_projects(
+                tmp,
+                herdr,
+                projects=("development", "operations", "mozyo-bridge"),
+                placement_mode="shared_space",
+            )
+            rects = self._shared_rects(herdr, sessions[-1].slots[0].locator)
+
+        self.assertEqual(sessions[0].column_outcome, "not_applicable")
+        for session in sessions[1:]:
+            self.assertEqual(session.column_outcome, "applied", session.column_detail)
+            self.assertTrue(session.ok)
+        columns = {}
+        for session in sessions:
+            spans = {
+                (rects[slot.locator]["x"], rects[slot.locator]["width"])
+                for slot in session.slots
+            }
+            self.assertEqual(len(spans), 1, "a project pair must own one column")
+            heights = sum(rects[slot.locator]["height"] for slot in session.slots)
+            self.assertEqual(heights, herdr.split_extent, "the column is not full height")
+            codex = next(slot for slot in session.slots if slot.provider == "codex")
+            claude = next(slot for slot in session.slots if slot.provider == "claude")
+            self.assertLess(rects[codex.locator]["y"], rects[claude.locator]["y"])
+            columns[session.workspace_id] = spans.pop()
+        self.assertEqual(len(set(columns.values())), 3, "projects share a column")
+        self.assertEqual(sum(width for _x, width in columns.values()), herdr.split_cross)
+        widths = [width for _x, width in columns.values()]
+        self.assertLessEqual(
+            max(widths) - min(widths),
+            1,
+            "later projects must not inherit progressively smaller columns",
+        )
 
     def test_a_pair_that_never_boots_still_fails_closed(self) -> None:
         """The control the ordering fix must NOT have widened.
@@ -2345,7 +2399,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         herdr = _Herdr(created_workspace="wProjects")
         herdr.residue_after_start = {"codex", "claude"}
         with tempfile.TemporaryDirectory() as tmp:
-            (first, second), _repos, _home, _env, _top = self._role_grouped_projects(
+            (first, second), _repos, _home, _env, _top = self._shared_coordinator_projects(
                 tmp, herdr
             )
         self.assertFalse(any(slot.healthy for slot in second.slots))
@@ -2365,7 +2419,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         herdr.booting_after_start = {"codex", "claude"}
         with tempfile.TemporaryDirectory() as tmp:
             (_first, second), repos, home, env, top_workspace_id = (
-                self._role_grouped_projects(tmp, herdr)
+                self._shared_coordinator_projects(tmp, herdr)
             )
             self.assertEqual(second.column_outcome, "applied", second.column_detail)
             moves_after_append = len(herdr.pane_moves)
@@ -3354,11 +3408,10 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(herdr.workspace_creates, [], "must adopt, not create")
         self.assertEqual(result.herdr_workspace_id, "w5")
 
-    def test_shared_space_adopt_appends_without_relayout(self) -> None:
-        # Redmine #14139 F2 / Design Answer j#83385 Decision 2: adopting an existing
-        # labelled shared space APPENDS this project's column and NEVER reorders /
-        # moves / swaps the existing columns (no live relayout). Existing foreign
-        # panes are neither closed nor moved.
+    def test_shared_space_unattested_foreign_pair_blocks_relayout(self) -> None:
+        # A labelled shared workspace is routing evidence, not permission to move
+        # its panes. This deliberately minimal foreign fixture has no attestation or
+        # cwd proof, so the project-column authority must fail before the first move.
         foreign = [
             {"name": encode_assigned_name("foreignws", "claude", ""), "pane_id": "w5:p1"},
             {"name": encode_assigned_name("foreignws", "codex", ""), "pane_id": "w5:p2"},
@@ -3372,12 +3425,14 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             )
         self.assertEqual(result.herdr_workspace_id, "w5")
         self.assertEqual(herdr.workspace_creates, [])
+        self.assertEqual(result.column_outcome, "failed")
+        self.assertIn("no live pane was moved", result.column_detail)
         # Tail-append: this project's pair launches INTO the adopted space w5.
         self.assertTrue(herdr.start_argvs, "the new coordinator pair must launch")
         for start in herdr.start_argvs:
             self.assertIn("w5", start, msg=f"launch must target adopted w5: {start}")
-        # No live relayout: never a pane move / swap / reorder, and the existing
-        # foreign panes are never closed.
+        # No unsafe relayout: never a pane move / swap / reorder, and the existing
+        # unproved foreign panes are never closed.
         reorder_verbs = {("pane", "move"), ("pane", "swap"), ("agent", "move")}
         for call in herdr.calls:
             self.assertNotIn(tuple(call[:2]), reorder_verbs, msg=f"unexpected relayout: {call}")

@@ -857,11 +857,12 @@ def finalize_container_geometry(
 
     1. **reclaim** the root panes this run created — closing one collapses the split tree,
        so anything measured before it would read a geometry about to change;
-    2. **project column** (Redmine #14996 R2) — a pair freshly appended to a shared
-       project-coordinator workspace is bounced into its own full-height column. It runs
+    2. **project column** (Redmine #14996 R2) — a pair freshly appended to either shared
+       coordinator placement workspace is bounced into its own full-height column. It runs
        BEFORE the ratio because it rebuilds the very divider the ratio is measured against;
-       ``project_coordinator`` is ``False`` on every other launch path, which is what keeps
-       this an opt-in step rather than a general live-relayout rail (see
+       ``project_coordinator`` is ``True`` only for a ``shared_space`` default coordinator
+       or a ``role_grouped_space`` project coordinator, which keeps this an opt-in step
+       rather than a general live-relayout rail (see
        :mod:`...herdr_project_column_reflow`);
     3. **pair split ratio** (#14569) — divide the pair this run created at the declared
        ratio, measured against the geometry the two steps above settled on.

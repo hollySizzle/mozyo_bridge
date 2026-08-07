@@ -1,7 +1,8 @@
 """Project-column geometry for the shared coordinator workspace (Redmine #14996 R2).
 
-``role_grouped_space`` collects every project's coordinator pair in ONE herdr
-workspace so an operator oversees them all at once. The pairs converge correctly
+``shared_space`` and the project-coordinator surface of ``role_grouped_space``
+collect every project's coordinator pair in ONE herdr workspace so an operator
+oversees them all at once. The pairs converge correctly
 — identity, cwd and workspace are right — but the *geometry* did not: a second
 project's pair landed as an L rather than its own column (live finding j#99833 —
 the first project's Codex in the top left, the appended pair stacked in the top
@@ -30,7 +31,8 @@ relayout for this one case and requires it to be verified rather than assumed.
 
 Boundary — narrow, launch-time, verified (j#99845)
 --------------------------------------------------
-- **Only the exact-labelled project-coordinator workspace**, only when this run
+- **Only the exact-labelled shared coordinator workspace** (``coordinators`` or
+  ``project-coordinators``), only when this run
   freshly launched a FULL pair into a tab that already holds another project's
   coordinator panes. An adopt-only run, a single-provider heal, a dry run and a
   first-project launch all resolve :data:`COLUMN_NOT_APPLICABLE` and move nothing.
@@ -91,9 +93,13 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     project_column_authority,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pair_split_ratio import (  # noqa: E501
+    MAX_RESIZE_PASSES,
     LayoutSnapshot,
     PaneRect,
+    governing_split,
     parse_pane_layout,
+    ratio_verdict,
+    resize_step,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
     _invoke,
@@ -112,9 +118,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     HEALTH_OUTCOMES,
 )
 
-#: No project-column reflow was owed. The resting value: every non-role-grouped
-#: placement, a dry run, an adopt-only run, a single-provider heal, and the first
-#: project to reach the shared workspace all land here without reading a layout.
+#: No project-column reflow was owed. The resting value: every non-shared coordinator
+#: placement, a dry run, an adopt-only run, a single-provider heal, and the first project
+#: to reach the shared workspace all land here without reading a layout.
 COLUMN_NOT_APPLICABLE = "not_applicable"
 #: The tab was ALREADY columnar after the launch, so nothing was moved. A success
 #: that costs zero pane moves — checked before any bounce, never assumed.
@@ -142,6 +148,11 @@ COLUMN_SUCCESS_OUTCOMES: frozenset = frozenset(
     {COLUMN_NOT_APPLICABLE, COLUMN_MATCHED, COLUMN_APPLIED}
 )
 
+#: Herdr clamps a divider ratio into ``0.1..0.9``. Equal columns need the root
+#: ratio ``1 / column_count``, so eleven columns cannot be represented and must
+#: be refused before a pane is moved rather than silently clamped unevenly.
+MAX_EQUAL_PROJECT_COLUMNS = 10
+
 
 @dataclass(frozen=True)
 class ColumnAttach:
@@ -164,6 +175,14 @@ class ColumnReflowPlan:
     detach: "tuple[str, ...]"
     attach: "tuple[ColumnAttach, ...]"
     anchor_pane: str
+
+
+@dataclass(frozen=True)
+class ColumnRatioTarget:
+    """One right-axis divider and the equal-share ratio it must reach."""
+
+    pane: str
+    ratio: float
 
 
 
@@ -242,6 +261,80 @@ def columnar_verdict(
     if cursor != x1:
         return False, "the project columns do not span the full tab width"
     return True, ""
+
+
+def balanced_column_verdict(
+    layout: LayoutSnapshot,
+    groups: "Mapping[tuple[str, str], tuple[CoordinatorPane, ...]]",
+) -> "tuple[bool, str]":
+    """Whether the full-height project columns differ in width by at most one cell."""
+    columnar, reason = columnar_verdict(layout, groups)
+    if not columnar:
+        return False, reason
+    bounds = _tab_bounds(layout)
+    assert bounds is not None  # proved by ``columnar_verdict``
+    widths = []
+    for members in groups.values():
+        span = _column_span(
+            [layout.panes[pane.locator] for pane in members], bounds
+        )
+        assert span is not None  # proved by ``columnar_verdict``
+        widths.append(span[1])
+    if max(widths) - min(widths) > 1:
+        return False, f"project column widths are not equal within one cell: {sorted(widths)}"
+    return True, ""
+
+
+def plan_equal_column_ratios(
+    layout: LayoutSnapshot,
+    groups: "Mapping[tuple[str, str], tuple[CoordinatorPane, ...]]",
+) -> "tuple[Optional[tuple[ColumnRatioTarget, ...]], str]":
+    """Plan left-to-right ratios for a right-nested project-column tree.
+
+    For ``N`` columns, the leftmost divider gives its first column ``1/N`` of
+    the full tab, the next gives its column ``1/(N-1)`` of the remaining
+    subtree, and so on. The structure is proved before the first resize: each
+    addressed pane's nearest right-axis ancestor must span from that column to
+    the tab's right edge. An unfamiliar tree is refused rather than resized by
+    analogy.
+    """
+    columnar, reason = columnar_verdict(layout, groups)
+    if not columnar:
+        return None, reason
+    count = len(groups)
+    if count > MAX_EQUAL_PROJECT_COLUMNS:
+        return None, (
+            f"{count} project columns require a root ratio below Herdr's 0.1 minimum"
+        )
+    if count < 2:
+        return (), ""
+    bounds = _tab_bounds(layout)
+    assert bounds is not None
+    x0, y0, x1, y1 = bounds
+    ordered = []
+    for key, members in groups.items():
+        panes = sorted(
+            members,
+            key=lambda pane: (layout.panes[pane.locator].y, pane.locator),
+        )
+        rect = layout.panes[panes[0].locator]
+        ordered.append((rect.x, key, panes[0].locator, rect))
+    ordered.sort(key=lambda entry: (entry[0], entry[1]))
+    targets = []
+    for index, (_x, key, pane_id, rect) in enumerate(ordered[:-1]):
+        split = governing_split(layout, rect, "right")
+        expected = PaneRect(rect.x, y0, x1 - rect.x, y1 - y0)
+        if split is None or split.rect != expected:
+            return None, (
+                f"project column {key!r} is not the first child of the expected "
+                "right-nested divider"
+            )
+        targets.append(
+            ColumnRatioTarget(pane=pane_id, ratio=1.0 / (count - index))
+        )
+    if ordered[0][0] != x0:
+        return None, "the leftmost project column does not start at the tab boundary"
+    return tuple(targets), ""
 
 
 def _anchor_group(
@@ -344,6 +437,111 @@ def read_pane_layout(
     except HerdrSessionStartError:
         return None
     return parse_pane_layout(completed.stdout)
+
+
+def _resize_column_ratio(
+    target: ColumnRatioTarget,
+    *,
+    binary: str,
+    runner,
+    timeout: float,
+    env,
+) -> "tuple[bool, str]":
+    """Drive one right-axis project divider to its planned ratio.
+
+    The addressed split is re-derived from every measured layout. A successful
+    command is not evidence that the divider moved: lack of strict progress is a
+    typed refusal, matching the pair-ratio rail's clamp discipline.
+    """
+    changed = False
+    detail = ""
+    for pass_index in range(MAX_RESIZE_PASSES + 1):
+        layout = read_pane_layout(
+            target.pane, binary=binary, runner=runner, timeout=timeout, env=env
+        )
+        if layout is None:
+            return changed, "pane layout could not be read after project-column resize"
+        rect = layout.panes.get(target.pane)
+        bounds = _tab_bounds(layout)
+        if rect is None or bounds is None:
+            return changed, f"project-column target pane {target.pane!r} is absent"
+        x0, y0, x1, y1 = bounds
+        split = governing_split(layout, rect, "right")
+        expected = PaneRect(rect.x, y0, x1 - rect.x, y1 - y0)
+        if split is None or split.rect != expected or rect.x < x0:
+            return changed, (
+                f"pane {target.pane!r} no longer resolves to its expected "
+                "right-nested project divider"
+            )
+        matched, detail = ratio_verdict(split, rect, target.ratio)
+        if matched:
+            return changed, ""
+        if pass_index == MAX_RESIZE_PASSES:
+            break
+        distance = abs(split.ratio - target.ratio)
+        direction, amount = resize_step(split.ratio, target.ratio, "right")
+        try:
+            _invoke(
+                binary,
+                [
+                    "pane", "resize", "--pane", target.pane,
+                    "--direction", direction,
+                    "--amount", f"{amount:.6f}",
+                ],
+                runner,
+                timeout,
+                env=env,
+            )
+        except HerdrSessionStartError as exc:
+            return changed, (
+                f"herdr refused project-column resize for pane {target.pane!r} ({exc})"
+            )
+        changed = True
+        measured = read_pane_layout(
+            target.pane, binary=binary, runner=runner, timeout=timeout, env=env
+        )
+        if measured is None:
+            return changed, "pane layout could not be read after project-column resize"
+        measured_rect = measured.panes.get(target.pane)
+        measured_split = (
+            governing_split(measured, measured_rect, "right")
+            if measured_rect is not None
+            else None
+        )
+        if measured_split is None:
+            return changed, (
+                f"pane {target.pane!r} lost its right-axis divider after resize"
+            )
+        if abs(measured_split.ratio - target.ratio) >= distance:
+            return changed, (
+                "herdr stopped moving a project divider toward its equal-width "
+                f"target; {detail}"
+            )
+    return changed, f"project divider did not reach its equal-width target; {detail}"
+
+
+def _balance_project_columns(
+    layout: LayoutSnapshot,
+    groups: "Mapping[tuple[str, str], tuple[CoordinatorPane, ...]]",
+    *,
+    binary: str,
+    runner,
+    timeout: float,
+    env,
+) -> "tuple[bool, str]":
+    """Equalise a proved right-nested column layout — ``(changed, refusal)``."""
+    targets, refusal = plan_equal_column_ratios(layout, groups)
+    if targets is None:
+        return False, refusal
+    changed = False
+    for target in targets:
+        target_changed, refusal = _resize_column_ratio(
+            target, binary=binary, runner=runner, timeout=timeout, env=env
+        )
+        changed = changed or target_changed
+        if refusal:
+            return changed, refusal
+    return changed, ""
 
 
 def _move_result(stdout: object) -> "Optional[tuple[str, str]]":
@@ -611,7 +809,7 @@ def reflow_project_columns(
     """
     if not project_coordinator or dry_run:
         return COLUMN_NOT_APPLICABLE, (
-            "this run is not a fresh role-grouped project-coordinator launch"
+            "this run is not a fresh shared project-coordinator launch"
         )
     if launched < 2 or initial_occupancy != 0:
         return COLUMN_NOT_APPLICABLE, (
@@ -666,6 +864,11 @@ def reflow_project_columns(
             "this project is the only coordinator pair in the shared workspace, so "
             "its pair already owns the whole tab"
         )
+    if len(groups) > MAX_EQUAL_PROJECT_COLUMNS:
+        return COLUMN_FAILED, (
+            f"{len(groups)} project columns require a root ratio below Herdr's "
+            "0.1 minimum; no live pane was moved"
+        )
     if not own_launched:
         return COLUMN_FAILED, "this run launched a pair but reports no live locator"
     layout = read_pane_layout(
@@ -677,14 +880,23 @@ def reflow_project_columns(
     if not tab_id:
         return COLUMN_FAILED, "the shared project-coordinator tab id is unreadable"
     columnar, reason = columnar_verdict(layout, groups)
+    before = _identity_map(rows, target_workspace)
     if columnar:
-        return COLUMN_MATCHED, (
-            "every project pair already owns one full-height column; no pane was moved"
+        return _verify_reflow(
+            before,
+            groups,
+            target_workspace,
+            tab_id,
+            anchor=own_launched[0],
+            geometry_changed=False,
+            binary=binary,
+            runner=runner,
+            timeout=timeout,
+            env=env,
         )
     plan, refusal = plan_project_columns(layout, groups, own_key, own_launched)
     if plan is None:
         return COLUMN_FAILED, f"{refusal} (observed geometry: {reason})"
-    before = _identity_map(rows, target_workspace)
     detached: list = []
     for pane_id in plan.detach:
         _temp_tab, step_refusal = detach_pane(
@@ -717,6 +929,7 @@ def reflow_project_columns(
         target_workspace,
         tab_id,
         anchor=plan.anchor_pane,
+        geometry_changed=True,
         binary=binary,
         runner=runner,
         timeout=timeout,
@@ -741,12 +954,13 @@ def _verify_reflow(
     tab_id: str,
     *,
     anchor: str,
+    geometry_changed: bool,
     binary: str,
     runner,
     timeout: float,
     env,
 ) -> "tuple[str, str]":
-    """Measure what the bounce actually produced — identity first, then geometry.
+    """Measure and equalise the produced columns — identity first, then geometry.
 
     Identity comes first deliberately: a layout that looks right tells us nothing
     if a pane came back under a different assigned name, and that is the property
@@ -776,8 +990,36 @@ def _verify_reflow(
     columnar, reason = columnar_verdict(layout, groups)
     if not columnar:
         return COLUMN_FAILED, f"the reflowed tab is still not columnar: {reason}"
-    return COLUMN_APPLIED, (
-        f"{len(groups)} project pair(s) each own one full-height column in tab {tab_id}"
+    resized, refusal = _balance_project_columns(
+        layout,
+        groups,
+        binary=binary,
+        runner=runner,
+        timeout=timeout,
+        env=env,
+    )
+    if refusal:
+        return COLUMN_FAILED, refusal
+    closing = read_pane_layout(
+        anchor, binary=binary, runner=runner, timeout=timeout, env=env
+    )
+    if closing is None:
+        return COLUMN_FAILED, "the balanced pane layout could not be read or parsed"
+    balanced, reason = balanced_column_verdict(closing, groups)
+    if not balanced:
+        return COLUMN_FAILED, f"the project columns are still not balanced: {reason}"
+    final_inventory = _identity_map(
+        _list_rows(binary, runner, timeout), target_workspace
+    )
+    if final_inventory != before:
+        return COLUMN_FAILED, (
+            "the shared workspace inventory changed during project-column balancing"
+        )
+    outcome = COLUMN_APPLIED if geometry_changed or resized else COLUMN_MATCHED
+    action = "now own" if outcome == COLUMN_APPLIED else "already own"
+    return outcome, (
+        f"{len(groups)} project pair(s) {action} equal-width full-height columns "
+        f"in tab {tab_id}"
     )
 
 
@@ -789,13 +1031,16 @@ __all__ = (
     "COLUMN_OUTCOMES",
     "COLUMN_SUCCESS_OUTCOMES",
     "ColumnAttach",
+    "ColumnRatioTarget",
     "ColumnReflowPlan",
     "CoordinatorPane",
     "attach_pane",
+    "balanced_column_verdict",
     "columnar_verdict",
     "coordinator_panes_in",
     "detach_pane",
     "plan_project_columns",
+    "plan_equal_column_ratios",
     "read_pane_layout",
     "reflow_project_columns",
 )

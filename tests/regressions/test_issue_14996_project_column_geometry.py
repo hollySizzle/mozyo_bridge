@@ -91,6 +91,7 @@ TOP = "top"
 PROJECT_A = "project-a"
 PROJECT_B = "project-b"
 PROJECT_C = "project-c"
+PROJECT_D = "project-d"
 
 
 class _Env:
@@ -254,6 +255,7 @@ class ProjectColumnGeometryTest(unittest.TestCase):
         # Two equal columns that tile the tab: the even 2x2 the owner accepted.
         self.assertEqual(columns[PROJECT_A], (0, 27))
         self.assertEqual(columns[PROJECT_B], (27, 27))
+        self.assertEqual(env.herdr.resizes, [], "two equal columns need no resize")
         rects = env.herdr.rects()
         self.assertLess(rects[a_top][1], rects[a_bottom][1])
         self.assertLess(rects[b_top][1], rects[b_bottom][1])
@@ -298,6 +300,53 @@ class ProjectColumnGeometryTest(unittest.TestCase):
         # The newest project is appended on the right; existing columns keep their order.
         self.assertEqual(max(columns, key=lambda key: columns[key][0]), PROJECT_C)
         self.assertLess(columns[PROJECT_A][0], columns[PROJECT_B][0])
+        widths = [width for _x, width in columns.values()]
+        self.assertLessEqual(max(widths) - min(widths), 1)
+        self.assertTrue(env.herdr.resizes, "the 1/2 + 1/4 + 1/4 tree must be balanced")
+
+    def test_four_columns_are_balanced_without_reordering_projects(self):
+        env = _Env(self, PROJECT_A, PROJECT_B, PROJECT_C, PROJECT_D)
+        tab = env.herdr.new_tab()
+        a_pair, b_pair, c_pair = env.seed_columns(
+            tab, (PROJECT_A, ""), (PROJECT_B, ""), (PROJECT_C, "")
+        )
+        d_top, d_bottom = env.append_pair(tab, PROJECT_D)
+        outcome, detail = env.run(env.result(PROJECT_D, [d_top, d_bottom]))
+        self.assertEqual(outcome, COLUMN_APPLIED, detail)
+
+        columns = self._columns(
+            env,
+            {
+                PROJECT_A: a_pair,
+                PROJECT_B: b_pair,
+                PROJECT_C: c_pair,
+                PROJECT_D: [d_top, d_bottom],
+            },
+        )
+        ordered = [key for key, _span in sorted(columns.items(), key=lambda item: item[1])]
+        self.assertEqual(ordered, [PROJECT_A, PROJECT_B, PROJECT_C, PROJECT_D])
+        widths = [width for _x, width in columns.values()]
+        self.assertLessEqual(max(widths) - min(widths), 1)
+
+    def test_resize_refusal_is_a_typed_column_failure(self):
+        env = _Env(self, PROJECT_A, PROJECT_B, PROJECT_C)
+        tab = env.herdr.new_tab()
+        env.seed_columns(tab, (PROJECT_A, ""), (PROJECT_B, ""))
+        launched = env.append_pair(tab, PROJECT_C)
+        env.herdr.resize_refused = True
+        outcome, detail = env.run(env.result(PROJECT_C, list(launched)))
+        self.assertEqual(outcome, COLUMN_FAILED)
+        self.assertIn("refused project-column resize", detail)
+
+    def test_resize_success_without_progress_is_a_typed_column_failure(self):
+        env = _Env(self, PROJECT_A, PROJECT_B, PROJECT_C)
+        tab = env.herdr.new_tab()
+        env.seed_columns(tab, (PROJECT_A, ""), (PROJECT_B, ""))
+        launched = env.append_pair(tab, PROJECT_C)
+        env.herdr.resize_unchanged = True
+        outcome, detail = env.run(env.result(PROJECT_C, list(launched)))
+        self.assertEqual(outcome, COLUMN_FAILED)
+        self.assertIn("stopped moving", detail)
 
     def test_already_columnar_tab_moves_no_pane(self):
         env = _Env(self, PROJECT_A, PROJECT_B)
@@ -366,6 +415,18 @@ class ProjectColumnRestraintTest(unittest.TestCase):
         tab = env.herdr.new_tab()
         (pair,) = env.seed_columns(tab, (PROJECT_A, ""))
         self._assert_untouched(env, env.run(env.result(PROJECT_A, pair))[0])
+
+    def test_eleventh_project_is_refused_before_any_geometry_actuation(self):
+        labels = tuple(f"project-{index}" for index in range(11))
+        env = _Env(self, *labels)
+        tab = env.herdr.new_tab()
+        env.seed_columns(tab, *((label, "") for label in labels[:-1]))
+        launched = env.append_pair(tab, labels[-1])
+        outcome, detail = env.run(env.result(labels[-1], list(launched)))
+        self.assertEqual(outcome, COLUMN_FAILED)
+        self.assertIn("below Herdr's 0.1 minimum", detail)
+        self.assertEqual(env.moves(), [])
+        self.assertEqual(env.herdr.resizes, [])
 
 
 class ColumnOperatorSurfaceTest(unittest.TestCase):
