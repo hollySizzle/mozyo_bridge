@@ -31,6 +31,7 @@ from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_h
     digest,
     isolation_env,
 )
+from tests.support.private_path_fixtures import macos_home_path  # noqa: E402
 
 
 def _snapshot(**overrides) -> HomeSnapshot:
@@ -121,7 +122,9 @@ class IsolationEnvTest(unittest.TestCase):
 class DigestTest(unittest.TestCase):
     def test_the_digest_carries_no_operator_value(self) -> None:
         """Snapshots are recorded in journals, so they must disclose nothing."""
-        secret = "/Users/someone/.mozyo_bridge/redmine-credentials.yaml"
+        secret = macos_home_path(
+            "someone", ".mozyo_bridge", "redmine-credentials.yaml"
+        )
         self.assertNotIn("someone", digest((secret,)))
         self.assertNotIn("mozyo_bridge", digest((secret,)))
 

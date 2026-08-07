@@ -64,6 +64,7 @@ from mozyo_bridge.shared.paths import (  # noqa: E402
     bind_process_home_fence,
     mozyo_bridge_home,
 )
+from tests.support.private_path_fixtures import macos_home_path  # noqa: E402
 
 
 def _write_store(path: Path, *, user_version: int, rows: int) -> None:
@@ -876,12 +877,16 @@ class DefaultOutputCarriesNoOperatorPathTest(unittest.TestCase):
     def _sample_outcome(self):
         return IsolatedRunOutcome(
             guards=(
-                HomeGuardVerdict(home="/Users/someone/.mozyo_bridge", ordinal=0),
-                HomeGuardVerdict(home="/Users/someone/other-home", ordinal=1),
+                HomeGuardVerdict(
+                    home=macos_home_path("someone", ".mozyo_bridge"), ordinal=0
+                ),
+                HomeGuardVerdict(
+                    home=macos_home_path("someone", "other-home"), ordinal=1
+                ),
             ),
             suite_success=True,
             returncode=0,
-            fence_root="/Users/someone/task/mozyo-home",
+            fence_root=macos_home_path("someone", "task", "mozyo-home"),
         )
 
     def _render(self, fmt: str, **kwargs) -> str:
@@ -894,7 +899,7 @@ class DefaultOutputCarriesNoOperatorPathTest(unittest.TestCase):
 
     def test_text_output_hides_absolute_paths_by_default(self) -> None:
         rendered = self._render("text")
-        self.assertNotIn("/Users/someone", rendered)
+        self.assertNotIn(macos_home_path("someone"), rendered)
         self.assertIn("guarded-home[0]", rendered)
         # The two homes stay distinguishable without their paths.
         self.assertIn("guarded-home[1]", rendered)
@@ -902,7 +907,7 @@ class DefaultOutputCarriesNoOperatorPathTest(unittest.TestCase):
 
     def test_json_output_hides_absolute_paths_by_default(self) -> None:
         rendered = self._render("json")
-        self.assertNotIn("/Users/someone", rendered)
+        self.assertNotIn(macos_home_path("someone"), rendered)
         payload = json.loads(rendered)
         self.assertTrue(payload["fence_root"].startswith("fence-root["))
         labels = [guard["home"] for guard in payload["home_guards"]]
@@ -913,14 +918,24 @@ class DefaultOutputCarriesNoOperatorPathTest(unittest.TestCase):
         for fmt in ("text", "json"):
             with self.subTest(fmt=fmt):
                 rendered = self._render(fmt, reveal_paths=True)
-                self.assertIn("/Users/someone/.mozyo_bridge", rendered)
-                self.assertIn("/Users/someone/task/mozyo-home", rendered)
+                self.assertIn(
+                    macos_home_path("someone", ".mozyo_bridge"), rendered
+                )
+                self.assertIn(
+                    macos_home_path("someone", "task", "mozyo-home"), rendered
+                )
 
     def test_the_same_home_gets_the_same_label_across_runs(self) -> None:
         """A digest label is only useful if it is stable and comparable."""
-        first = HomeGuardVerdict(home="/Users/someone/.mozyo_bridge", ordinal=0).label
-        second = HomeGuardVerdict(home="/Users/someone/.mozyo_bridge", ordinal=0).label
-        other = HomeGuardVerdict(home="/Users/someone/elsewhere", ordinal=0).label
+        first = HomeGuardVerdict(
+            home=macos_home_path("someone", ".mozyo_bridge"), ordinal=0
+        ).label
+        second = HomeGuardVerdict(
+            home=macos_home_path("someone", ".mozyo_bridge"), ordinal=0
+        ).label
+        other = HomeGuardVerdict(
+            home=macos_home_path("someone", "elsewhere"), ordinal=0
+        ).label
         self.assertEqual(first, second)
         self.assertNotEqual(first, other)
 
