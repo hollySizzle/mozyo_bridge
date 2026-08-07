@@ -24,6 +24,7 @@ failure must not destroy them either — it is surfaced, and the panes stay.
 
 from __future__ import annotations
 
+import time
 import uuid
 from pathlib import Path
 from typing import Optional, Sequence
@@ -37,10 +38,19 @@ from mozyo_bridge.core.state.startup_transaction_fence import (
     PHASE_ROLLBACK_OWED,
     PHASE_SUCCESS_OWED,
     Participant,
+    StartupTransactionBusy,
     StartupTransactionError,
     StartupTransactionFence,
     StartupUnit,
 )
+
+
+#: Total wall-clock budget for the launcher's participant write to wait out a wrapper's
+#: single-row startup-event append.  This retry belongs only to the post-launch recording
+#: boundary: rollback/close authority continues to refuse lock contention immediately.
+RECORD_LAUNCH_BUSY_RETRY_BUDGET_SECONDS = 1.0
+#: Short pause between non-blocking lock attempts, kept well below the total budget.
+RECORD_LAUNCH_BUSY_RETRY_SLEEP_SECONDS = 0.002
 
 
 def new_action_nonce() -> str:
@@ -61,11 +71,17 @@ class StartupTransaction:
         fence: StartupTransactionFence,
         unit: StartupUnit,
         nonce: str,
+        busy_retry_budget_seconds: float = RECORD_LAUNCH_BUSY_RETRY_BUDGET_SECONDS,
+        sleep=None,
+        monotonic=None,
     ) -> None:
         self._fence = fence
         self._unit = unit
         self._nonce = nonce
         self._action = None
+        self._busy_retry_budget_seconds = max(float(busy_retry_budget_seconds), 0.0)
+        self._sleep = sleep if sleep is not None else time.sleep
+        self._monotonic = monotonic if monotonic is not None else time.monotonic
 
     @property
     def action_id(self) -> str:
@@ -94,21 +110,40 @@ class StartupTransaction:
         ensure_execution_events_table(self._fence, self._action.action_id)
 
     def record_launch(self, slot, *, receipt: str = "") -> None:
-        """Record one completed ``agent start`` as a participant of this action."""
+        """Record one completed ``agent start`` as a participant of this action.
+
+        The child startup wrapper can append a diagnostic event to the same SQLite store
+        immediately after ``agent start`` returns.  Both writers use the store's
+        non-blocking advisory lock, so the launcher's authority write can lose that
+        millisecond-scale race even though neither store nor launch is unhealthy.  Once
+        the pane exists, abandoning its participant record would create the untracked
+        side effect this transaction is meant to prevent.  Retry only that typed lock
+        contention inside a short budget; every other authority error still fails on its
+        first attempt, and destructive rollback/close paths retain their no-wait rule.
+        """
         if self._action is None:
             raise StartupTransactionError(
                 "a launch was recorded before its startup action was reserved; the "
                 "reserve must precede every side effect"
             )
-        self._action = self._fence.record_participant(
-            self._action.action_id,
-            Participant(
-                role=slot.provider,
-                assigned_name=slot.assigned_name,
-                locator=slot.locator,
-                receipt=receipt,
-            ),
+        participant = Participant(
+            role=slot.provider,
+            assigned_name=slot.assigned_name,
+            locator=slot.locator,
+            receipt=receipt,
         )
+        deadline = self._monotonic() + self._busy_retry_budget_seconds
+        while True:
+            try:
+                self._action = self._fence.record_participant(
+                    self._action.action_id, participant
+                )
+                return
+            except StartupTransactionBusy:
+                remaining = deadline - self._monotonic()
+                if remaining <= 0:
+                    raise
+                self._sleep(min(RECORD_LAUNCH_BUSY_RETRY_SLEEP_SECONDS, remaining))
 
     def settle(self, *, owed: bool, launched: bool) -> None:
         """Close the run's books: success, or a debt only the rollback rail may clear.
@@ -190,6 +225,8 @@ def launch_receipt(*, target_workspace: str, target_tab: str) -> str:
 
 
 __all__ = (
+    "RECORD_LAUNCH_BUSY_RETRY_BUDGET_SECONDS",
+    "RECORD_LAUNCH_BUSY_RETRY_SLEEP_SECONDS",
     "StartupTransaction",
     "launch_receipt",
     "new_action_nonce",
