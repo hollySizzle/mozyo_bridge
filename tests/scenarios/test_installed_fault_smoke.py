@@ -399,6 +399,77 @@ class Post14741InstalledFixtureTests(unittest.TestCase):
         ])
         self.assertEqual(first, second)
 
+    def test_recovery_fixture_seeds_one_herdr08_lane_tab(self):
+        """Installed and source recovery fixtures must model the same adoptable pair."""
+
+        driver = self._driver()
+        fake = driver.FakeHerdr()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "lane"
+            herdr_workspace = fake.seed_workspace(cwd=str(repo))
+            worker_name, worker_locator = driver._seed_recover_stale_pair(
+                fake,
+                workspace_id="fixture-workspace",
+                lane_id="issue_15107_worker",
+                herdr_workspace_id=herdr_workspace,
+                repo=repo,
+            )
+
+        expected_tab = f"{herdr_workspace}:t1"
+        gateway_name = driver.encode_assigned_name(
+            "fixture-workspace", "codex", "issue_15107_worker"
+        )
+        gateway_locator = next(
+            row["pane_id"] for row in fake.agents if row["name"] == gateway_name
+        )
+        self.assertEqual(
+            worker_name,
+            driver.encode_assigned_name(
+                "fixture-workspace", "claude", "issue_15107_worker"
+            ),
+        )
+        self.assertEqual(fake.tab_of(worker_locator), expected_tab)
+        self.assertEqual(fake.tab_of(gateway_locator), expected_tab)
+        self.assertEqual(fake.tab_ids(herdr_workspace), [expected_tab])
+
+    def test_recovery_fixture_resolves_fresh_native_name_after_state_roundtrip(self):
+        """The standalone fake persists mza1 while recovery targets the logical mzb1 name."""
+
+        driver = self._driver()
+        fake = driver.FakeHerdr()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "lane"
+            herdr_workspace = fake.seed_workspace(cwd=str(repo))
+            worker_name, old_locator = driver._seed_recover_stale_pair(
+                fake,
+                workspace_id="fixture-workspace",
+                lane_id="issue_15107_worker",
+                herdr_workspace_id=herdr_workspace,
+                repo=repo,
+            )
+            fresh_locator = fake.seed_agent(
+                "mza1_fixture_native",
+                workspace_id=herdr_workspace,
+                provider="claude",
+                cwd=str(repo),
+                tab_id=f"{herdr_workspace}:t1",
+            )
+
+        state = fake.to_state()
+        fresh_row = next(
+            row for row in state["agents"] if row["pane_id"] == fresh_locator
+        )
+        fresh_row["logical_name"] = worker_name
+        self.assertNotEqual(fresh_row["name"], worker_name)
+        self.assertEqual(
+            driver._fresh_worker_candidates(
+                state,
+                logical_name=worker_name,
+                old_locator=old_locator,
+            ),
+            [fresh_locator],
+        )
+
     def test_callback_fixture_proves_issue_journal_ownership_to_the_live_adapter(self):
         """The positive callback smoke must satisfy #14246, not bypass its ownership gate."""
         from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_anchor_source import (  # noqa: E501

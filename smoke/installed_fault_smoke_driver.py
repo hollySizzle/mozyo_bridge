@@ -365,14 +365,18 @@ def _recover_stale_outcome(
                           # checkout look moved and stops before the recovery launch.
                           worktree_identity=derive_lane_workspace_token(str(repo.resolve())))
     lrec = lstore.get(lkey)
-    name = encode_assigned_name(ws_id, "claude", lane)
     fake = FakeHerdr(read_text="idle\n> ")
     # A live-composer echo so the queue-enter landing marker is observable in the fresh worker's
     # pane read — the signal that promotes the redispatch to reason=ok (the confirm oracle).
     fake.echo_composer = True
     fws = fake.seed_workspace(cwd=str(repo))
-    locator = fake.seed_agent(name, workspace_id=fws, provider="", status="unknown",
-                              detected_agent="", revision="3", cwd=str(repo))
+    name, locator = _seed_recover_stale_pair(
+        fake,
+        workspace_id=ws_id,
+        lane_id=lane,
+        herdr_workspace_id=fws,
+        repo=repo,
+    )
     # The stale-worker scenario predates #14741 identity receipts, but the replacement
     # planner now requires the current launch-generation authority before it may classify
     # that process as legacy.  The hermetic source harness already seeds this exact row;
@@ -408,9 +412,6 @@ def _recover_stale_outcome(
         verdict="present",
         observed_at="2026-01-01T00:00:00.000000+00:00",
     )
-    # The surviving gateway slot the heal adopts + pins the tab on (a heal never splits the pair).
-    fake.seed_agent(encode_assigned_name(ws_id, "codex", lane), workspace_id=fws, provider="codex",
-                    cwd=str(repo))
     action_id = stale_worker_recovery_action_id(lane_id=lane, role="claude", provider="claude",
                                                 assigned_name=name, locator=locator)
     bins = FakeAgentBinaries(tmp / f"rs_bins_{tag}")
@@ -483,8 +484,11 @@ def _recover_stale_outcome(
 
     # The heal-launched fresh worker (same assigned name, a new pane) and its attestation.
     st = json.loads(state.read_text(encoding="utf-8"))
-    fresh_candidates = [a["pane_id"] for a in st["agents"]
-                        if a["name"] == name and a["pane_id"] != locator]
+    fresh_candidates = _fresh_worker_candidates(
+        st,
+        logical_name=name,
+        old_locator=locator,
+    )
     if not fresh_candidates:
         post = lstore.get(lkey)
         return {
@@ -561,6 +565,60 @@ def _recover_stale_outcome(
         "redispatch_attempt_count": len(attempts),
         "redispatch_ok_count": ok_count,
     }
+
+
+def _seed_recover_stale_pair(
+    fake: FakeHerdr,
+    *,
+    workspace_id: str,
+    lane_id: str,
+    herdr_workspace_id: str,
+    repo: Path,
+) -> tuple[str, str]:
+    """Seed the stale worker and surviving gateway in one Herdr 0.8 lane tab.
+
+    Recovery heal adopts the surviving gateway's existing tab and never invents or
+    splits a replacement pair.  The installed smoke must therefore model the same
+    same-tab lane shape as :class:`tests.support.installed_fault_harness.InstalledFaultHarness`;
+    allowing the fake to mint a default tab independently for each pane makes a valid
+    product launch fail at the fixture boundary before a fresh worker can exist.
+    """
+
+    lane_tab = f"{herdr_workspace_id}:t1"
+    worker_name = encode_assigned_name(workspace_id, "claude", lane_id)
+    worker_locator = fake.seed_agent(
+        worker_name,
+        workspace_id=herdr_workspace_id,
+        provider="",
+        status="unknown",
+        detected_agent="",
+        revision="3",
+        cwd=str(repo),
+        tab_id=lane_tab,
+    )
+    fake.seed_agent(
+        encode_assigned_name(workspace_id, "codex", lane_id),
+        workspace_id=herdr_workspace_id,
+        provider="codex",
+        cwd=str(repo),
+        tab_id=lane_tab,
+    )
+    return worker_name, worker_locator
+
+
+def _fresh_worker_candidates(
+    state: dict,
+    *,
+    logical_name: str,
+    old_locator: str,
+) -> list[str]:
+    """Project serialized Herdr 0.8 native names through the canonical fake view."""
+
+    return [
+        row["pane_id"]
+        for row in FakeHerdr.from_state(state).agents
+        if row["name"] == logical_name and row["pane_id"] != old_locator
+    ]
 
 
 def _redispatch_marker(*, issue: str, journal: str) -> str:
