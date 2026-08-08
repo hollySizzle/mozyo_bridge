@@ -1,4 +1,4 @@
-"""Unit tests for the Herdr coordinator Unit board adapter (Redmine #15114)."""
+"""CLI and runtime tests for the Herdr coordinator Unit board (Redmine #15114)."""
 
 from __future__ import annotations
 
