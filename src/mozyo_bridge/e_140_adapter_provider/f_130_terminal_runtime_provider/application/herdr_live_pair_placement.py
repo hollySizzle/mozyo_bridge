@@ -643,7 +643,9 @@ class HerdrLivePairPlacement:
         )
 
     def preview(self, workspace_id: str, lane_id: str = "default") -> PlacementPlan:
-        return self._observe(workspace_id, lane_id or "default")
+        if not isinstance(lane_id, str) or not lane_id.strip():
+            return _refused(workspace_id, "", REASON_CONFIG_INVALID, "lane identity must not be empty")
+        return self._observe(workspace_id, lane_id)
 
     def _swap(self, tail: Sequence[str]) -> str:
         """Return a typed swap effect; process exit zero is not enough."""
@@ -833,18 +835,16 @@ class HerdrLivePairPlacement:
             if status == APPLY_PARTIAL
             else "Resolve the reported refusal and run preview again before apply."
         )
-        return PlacementApplyResult(
-            status, reason, detail, before, after, recovery
-        )
+        return PlacementApplyResult(status, reason, detail, before, after, recovery)
 
     def apply(self, workspace_id: str, lane_id: str = "default") -> PlacementApplyResult:
-        before = self._observe(workspace_id, lane_id or "default")
+        before = self.preview(workspace_id, lane_id)
         if before.status == PLAN_MATCHED:
             return PlacementApplyResult(APPLY_MATCHED, REASON_OK, "live placement already matches", before, before)
         if not before.can_apply or before.evidence is None or before.target is None:
             return PlacementApplyResult(APPLY_REFUSED, before.reason, before.detail, before, before)
 
-        fresh = self._observe(workspace_id, lane_id or "default")
+        fresh = self._observe(workspace_id, lane_id)
         if (
             not fresh.can_apply
             or fresh.evidence is None
@@ -922,7 +922,7 @@ class HerdrLivePairPlacement:
                 )
             changed = True
 
-        after_order = self._observe(workspace_id, lane_id or "default")
+        after_order = self._observe(workspace_id, lane_id)
         if (
             after_order.status == PLAN_REFUSED
             or after_order.evidence is None
@@ -963,7 +963,7 @@ class HerdrLivePairPlacement:
                 )
             changed = changed or ratio_effect == MOVE_CHANGED
 
-        final = self._observe(workspace_id, lane_id or "default")
+        final = self._observe(workspace_id, lane_id)
         if (
             final.status != PLAN_MATCHED
             or final.evidence is None

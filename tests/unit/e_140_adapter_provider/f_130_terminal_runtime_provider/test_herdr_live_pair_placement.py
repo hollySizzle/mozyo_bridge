@@ -35,6 +35,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     PLAN_MATCHED,
     PLAN_READY,
     REASON_GENERATION_UNVERIFIED,
+    REASON_CONFIG_INVALID,
     REASON_LAYOUT_UNAVAILABLE,
     REASON_NOT_DEDICATED_PAIR,
     REASON_PAIR_INVALID,
@@ -304,6 +305,20 @@ class HerdrLivePairPlacementTests(unittest.TestCase):
         for private_runtime_value in (*panes.values(), "generation-codex", "generation-claude"):
             self.assertNotIn(private_runtime_value, payload)
         self.assertEqual(self._mutations(herdr), [])
+
+    def test_explicit_empty_lane_refuses_preview_and_apply_before_herdr_io(self) -> None:
+        service, herdr, _, _ = self._build(split="right")
+
+        for lane_id in ("", " ", "\t"):
+            with self.subTest(lane_id=repr(lane_id)):
+                herdr.calls.clear()
+                preview = service.preview(WORKSPACE_ID, lane_id)
+                result = service.apply(WORKSPACE_ID, lane_id)
+
+                self.assertEqual(preview.reason, REASON_CONFIG_INVALID)
+                self.assertEqual(result.status, APPLY_REFUSED)
+                self.assertEqual(result.reason, REASON_CONFIG_INVALID)
+                self.assertEqual(herdr.calls, [])
 
     def test_preview_refuses_a_tab_with_a_foreign_third_pane_without_mutation(self) -> None:
         service, herdr, _, _ = self._build(third_pane=True)
@@ -672,6 +687,35 @@ class HerdrLivePairPlacementTests(unittest.TestCase):
         ].format_help()
 
         self.assertNotIn("--pane", help_text + preview_help)
+
+    def test_cli_explicit_empty_lane_never_targets_the_default_pair(self) -> None:
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="command", required=True)
+
+        def add_repo_option(command) -> None:
+            command.add_argument("--repo", default=None)
+
+        register_herdr_pair_placement_parser(sub, add_repo_option=add_repo_option)
+        service, herdr, _, _ = self._build(split="right")
+
+        for command in ("preview", "apply"):
+            for lane_id in ("", "   "):
+                with self.subTest(command=command, lane_id=repr(lane_id)):
+                    args = parser.parse_args(
+                        ["pair-placement", command, "--lane", lane_id]
+                    )
+                    herdr.calls.clear()
+                    with patch(
+                        "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_live_pair_placement._workspace_id",
+                        return_value=WORKSPACE_ID,
+                    ), patch(
+                        "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_live_pair_placement.production_live_pair_placement",
+                        return_value=service,
+                    ), patch("builtins.print"):
+                        result = args.func(args)
+
+                    self.assertEqual(result, 1)
+                    self.assertEqual(herdr.calls, [])
 
 
 if __name__ == "__main__":
