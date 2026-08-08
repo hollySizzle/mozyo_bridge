@@ -457,14 +457,7 @@ def _restore_detached(
     timeout: float,
     env,
 ) -> "tuple[tuple[str, ...], str]":
-    """Best-effort return followed by a fresh inventory/layout verification.
-
-    A failed reflow must not leave an agent parked in an invisible temp tab with
-    no record of it.  Move responses alone are insufficient evidence: a response
-    can be malformed after geometry changed, or say no change because the pane
-    never left.  The closing inventory, tab and saved internal ratios decide
-    whether recovery was actually completed.
-    """
+    """Best-effort return, then verify inventory, tab and saved ratios afresh."""
     stranded: list = []
     pending = set(detached)
     for attach in planned:
