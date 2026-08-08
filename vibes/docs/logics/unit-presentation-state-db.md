@@ -452,6 +452,33 @@ registry pathはwriterが保存するabsolute canonical表現だけを受理し�
 本sliceはpaneを動かさず、後続actionはそのfingerprintとidentity・generation・同一tab・
 geometryをapply直前に再確認する。
 
+#### fresh launchからのUnit列配置 (#15123)
+
+shared coordinator tabへ正常なfull pairを新規追加した場合は、既存のappend reflowと
+pair内ratio調整を終え、launch generationを確定し、startup transactionを
+`completed_success`へ確定した後に限り、上記planをlive geometryへ適用する。最初の変更
+直前にsource config / registry、全Unitのidentityとcurrent generation、tab全体のlayout、
+desired order / ratio targetを別々に再照合する。1つでも変化・未解決があればzero-writeで
+拒否する。
+
+11列以上では均等幅のroot ratioがHerdrの下限を外れるため、append reflowはfull-height
+列形状だけを実測して`prepared_for_configured_placement`で引き渡す。この中間値は成功では
+なく、後続planが設定済みratioを実測して`matched` / `applied`へ置換した場合だけ起動成功と
+なる。したがって列数を理由に拒否せず、実際のweightから得た全ratioの可否で判断する。
+
+列順変更は隣接する2つのfull Unitだけを対象に、双方のlower paneを一時tabへ退避し、
+top pane同士を明示targetでswapし、各lower paneを元のpair内ratio付きで自分のtop paneへ
+戻す。各commandはHerdrのtyped `changed`応答と全体のauthority / layout再観測を要求する。
+順序確定後にright-nested dividerを設定済みweightへresizeし、毎回目標へ近づいたことを
+実測する。途中失敗はblind retryせず、同じgenerationと一時tabを証明できるlower paneだけ
+1回戻し、回復しても`partial_failure`のままとする。
+
+全Unitが2-paneでない場合は`deferred_until_full_pair_set`としてpaneを動かさない。これは
+startup成功を保つ明示的な延期であり、1-pane Unitを隣接列の移動から推測して配置しない。
+adopt-only、single-provider heal、dry-run、startup health / append geometry / pair ratioの失敗も
+本pathを実行しない。既存live Unitをoperator操作で動かすUIは別actionであり、このfresh
+launch pathを暗黙に再利用しない。
+
 ### projection_preferences
 
 Unit ごとの preferred projection。`cockpit_pane` を primary としつつ、

@@ -139,8 +139,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     attach_startup_health,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_generation_binding import (  # noqa: E501
-    finalize_session_launch_generations,
     open_startup_transaction_and_reserve_generations,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_completion import (  # noqa: E501
+    complete_session_start,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_result import (
     SLOT_ADOPTED,
@@ -947,16 +949,14 @@ def _prepare_session_locked(
         project_coordinator=project_column_coordinator, store_home=store_home,
         top_workspace_id=coordinator_top_workspace_id,
     )
-    # Finalize each launched slot's generation to `attested` — best-effort, once startup
-    # health gathered the composite evidence (#14203 j#87472; see the binding module).
-    finalize_session_launch_generations(
-        store_home=Path(store_home), transaction=transaction, slots=result.slots,
-        workspace_id=workspace_id, lane_id=result.lane_id, attestation_read=attestation_read,
+    complete_session_start(
+        result, store_home=store_home, transaction=transaction,
+        workspace_id=workspace_id, attestation_read=attestation_read,
         attest_launcher=attest_launcher, launch_plans=launch_plans, dry_run=dry_run,
+        project_column_coordinator=project_column_coordinator,
+        coordinator_top_workspace_id=coordinator_top_workspace_id, binary=binary,
+        runner=runner, timeout=timeout, env=env,
     )
-    if transaction is not None:
-        # Only the public rollback rail may discharge debt from this run's fresh slots.
-        transaction.settle(owed=result.owes_rollback, launched=bool(launch_plans))
     return result
 
 

@@ -29,6 +29,7 @@ a disposable instance:
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 from dataclasses import dataclass, field
 from typing import Optional
@@ -101,13 +102,44 @@ class Tab:
             node.second = self._replace(node.second, pane_id, replacement)
         return node
 
-    def subdivide(self, target: str, direction: str, pane_id: str) -> bool:
+    def subdivide(
+        self,
+        target: str,
+        direction: str,
+        pane_id: str,
+        ratio: float = 0.5,
+    ) -> bool:
         """Turn the ``target`` leaf into ``Split(direction, target, pane_id)``."""
-        if target not in self.panes():
+        if (
+            target not in self.panes()
+            or direction not in {"right", "down"}
+            or not math.isfinite(ratio)
+            or not 0.1 <= ratio <= 0.9
+        ):
             return False
         self.root = self._replace(
-            self.root, target, Split(direction, 0.5, Leaf(target), Leaf(pane_id))
+            self.root, target, Split(direction, ratio, Leaf(target), Leaf(pane_id))
         )
+        return True
+
+    def swap(self, first: str, second: str) -> bool:
+        """Exchange two leaf identities without changing any divider."""
+
+        if first == second or first not in self.panes() or second not in self.panes():
+            return False
+
+        def exchange(node) -> None:
+            if isinstance(node, Leaf):
+                if node.pane_id == first:
+                    node.pane_id = second
+                elif node.pane_id == second:
+                    node.pane_id = first
+                return
+            if isinstance(node, Split):
+                exchange(node.first)
+                exchange(node.second)
+
+        exchange(self.root)
         return True
 
     def remove(self, pane_id: str) -> bool:
@@ -238,6 +270,8 @@ class PaneTreeHerdr:
         self.refuse_from_move: Optional[int] = None
         #: Panes whose next ``pane move`` should report ``changed:false``.
         self.move_unchanged: set = set()
+        #: Complete the move but return no parseable typed move result.
+        self.move_malformed_after_geometry: set = set()
         #: Rename a pane's assigned name at this point in the sequence, to prove the
         #: closing identity check is real rather than decorative.
         self.rename_after_moves: dict = {}
@@ -247,6 +281,12 @@ class PaneTreeHerdr:
         self.resize_malformed = False
         self.layout_unreadable_after_resize = False
         self.resizes: list = []
+        #: Typed ``pane swap`` fault injection shared by pair and column tests.
+        self.swap_refused = False
+        self.swap_unchanged = False
+        self.swap_malformed = False
+        self.swap_without_geometry = False
+        self.swaps: list = []
         #: Panes whose ``agent list`` row is shell residue — the durable identity is
         #: there, the managed agent is not. Rendered as a present-but-blank ``agent``
         #: field, which is the positive stale signal ``classify_named_slot`` reads.
@@ -366,6 +406,8 @@ class PaneTreeHerdr:
             return self._pane_layout(argv, tail)
         if tail[:2] == ["pane", "move"]:
             return self._pane_move(argv, tail)
+        if tail[:2] == ["pane", "swap"]:
+            return self._pane_swap(argv, tail)
         if tail[:2] == ["pane", "resize"]:
             return self._pane_resize(argv, tail)
         raise AssertionError(f"unmodelled herdr command: {tail!r}")
@@ -445,8 +487,23 @@ class PaneTreeHerdr:
             )
             if anchor not in target_tab.panes():
                 return self._failed(argv, f"target pane not found: {anchor}")
+            try:
+                ratio = (
+                    float(tail[tail.index("--ratio") + 1])
+                    if "--ratio" in tail
+                    else 0.5
+                )
+            except (IndexError, ValueError):
+                return self._failed(argv, "invalid pane move ratio")
+            if (
+                direction not in {"right", "down"}
+                or not math.isfinite(ratio)
+                or not 0.1 <= ratio <= 0.9
+            ):
+                return self._failed(argv, "invalid pane move placement")
             source.remove(pane_id)
-            target_tab.subdivide(anchor, direction, pane_id)
+            if not target_tab.subdivide(anchor, direction, pane_id, ratio):
+                return self._failed(argv, f"target pane cannot be subdivided: {anchor}")
         if source is not target_tab and not source.panes():
             # herdr auto-closes a tab whose last pane leaves.
             self.tabs.pop(source.tab_id, None)
@@ -454,6 +511,8 @@ class PaneTreeHerdr:
         rename = self.rename_after_moves.get(self._moves)
         if rename:
             self.agents[rename[0]] = rename[1]
+        if pane_id in self.move_malformed_after_geometry:
+            return self._done(argv, {"result": {"type": "pane_move"}})
         return self._done(
             argv,
             {
@@ -464,6 +523,32 @@ class PaneTreeHerdr:
                     }
                 }
             },
+        )
+
+    def _pane_swap(self, argv, tail):
+        self.swaps.append(tail)
+        if self.swap_refused:
+            return self._failed(argv, "pane swap refused")
+        if self.swap_unchanged:
+            return self._done(
+                argv,
+                {"result": {"type": "pane_swap", "swap": {"changed": False}}},
+            )
+        try:
+            first = tail[tail.index("--source-pane") + 1]
+            second = tail[tail.index("--target-pane") + 1]
+        except (IndexError, ValueError):
+            return self._failed(argv, "pane swap requires explicit source and target")
+        tab = self.tab_of(first)
+        if tab is None or tab is not self.tab_of(second):
+            return self._failed(argv, "pane swap targets are not in one tab")
+        if not self.swap_without_geometry and not tab.swap(first, second):
+            return self._failed(argv, "pane swap could not exchange the targets")
+        if self.swap_malformed:
+            return self._done(argv, {"result": {"type": "pane_swap"}})
+        return self._done(
+            argv,
+            {"result": {"type": "pane_swap", "swap": {"changed": True}}},
         )
 
     def _pane_resize(self, argv, tail):

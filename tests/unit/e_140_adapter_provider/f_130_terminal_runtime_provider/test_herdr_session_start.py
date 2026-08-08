@@ -20,7 +20,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
@@ -533,6 +534,8 @@ class _Herdr:
         self.pane_resizes: list = []
         #: Every ``pane move`` the project-column reflow issued (#14996 R2).
         self.pane_moves: list = []
+        #: Every explicit top-pane swap the configured Unit-column rail issued.
+        self.pane_swaps: list = []
         self._detached_seq = 0
         #: `pane layout` exits non-zero (the unreadable-layout fail-closed path).
         self.layout_fails = False
@@ -605,6 +608,10 @@ class _Herdr:
                 )
             return subprocess.CompletedProcess(
                 argv, 2, stdout="", stderr="invalid choice: 'agent-attest'"
+            )
+        if rest[:2] == ["config", "check-parse"]:
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=json.dumps({"ok": True}), stderr=""
             )
         if rest == ["agent", "list"]:
             self._list_round += 1
@@ -819,6 +826,33 @@ class _Herdr:
         if rest[:2] == ["pane", "move"]:
             self.pane_moves.append(rest)
             return self._pane_move(argv, rest)
+        if rest[:2] == ["pane", "swap"]:
+            self.pane_swaps.append(rest)
+            try:
+                source = rest[rest.index("--source-pane") + 1]
+                target = rest[rest.index("--target-pane") + 1]
+            except (ValueError, IndexError):
+                return subprocess.CompletedProcess(
+                    argv, 1, stdout="", stderr="explicit swap targets required"
+                )
+            tab = self._tab_of(source)
+            if tab is None or tab is not self._tab_of(target) or not tab.swap(source, target):
+                return subprocess.CompletedProcess(
+                    argv, 1, stdout="", stderr="pane swap refused"
+                )
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(
+                    {
+                        "result": {
+                            "type": "pane_swap",
+                            "swap": {"changed": True},
+                        }
+                    }
+                ),
+                stderr="",
+            )
         if rest[:2] == ["pane", "resize"]:
             self.pane_resizes.append(rest)
             if self.resize_fails:
@@ -1040,8 +1074,13 @@ class _Herdr:
                 return subprocess.CompletedProcess(
                     argv, 1, stdout="", stderr=f"target not found: {tab_id}/{anchor}"
                 )
+            ratio = (
+                float(rest[rest.index("--ratio") + 1])
+                if "--ratio" in rest
+                else 0.5
+            )
             source.remove(pane_id)
-            target.subdivide(anchor, direction, pane_id)
+            target.subdivide(anchor, direction, pane_id, ratio)
         if source is not target and not source.panes():
             self.tab_trees = {
                 key: tab for key, tab in self.tab_trees.items() if tab is not source
@@ -1182,6 +1221,7 @@ class _Herdr:
         action_id = env.get("MOZYO_STARTUP_ACTION_ID", "")
         if action_id:
             from mozyo_bridge.core.state.startup_execution_events import (
+                STAGE_ATTESTATION_WRITE_SUCCEEDED,
                 STAGE_PROVIDER_EXEC_CALL_REACHED,
                 STAGE_WRAPPER_ENTERED,
                 append_execution_event,
@@ -1191,7 +1231,11 @@ class _Herdr:
             )
 
             fence = StartupTransactionFence(home=Path(self.attest_home))
-            for stage in (STAGE_WRAPPER_ENTERED, STAGE_PROVIDER_EXEC_CALL_REACHED):
+            for stage in (
+                STAGE_WRAPPER_ENTERED,
+                STAGE_ATTESTATION_WRITE_SUCCEEDED,
+                STAGE_PROVIDER_EXEC_CALL_REACHED,
+            ):
                 append_execution_event(fence, action_id, stage, participant=name)
 
 
@@ -2979,6 +3023,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         *,
         projects=("a", "b"),
         placement_mode="role_grouped_space",
+        presentation=None,
     ):
         """Launch ``projects`` coordinator pairs into one shared workspace.
 
@@ -3011,6 +3056,20 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                 repo = root / f"project-{label}"
                 repo.mkdir(exist_ok=True)
                 repos[label] = repo
+                if presentation and label in presentation:
+                    register_workspace(repo, home=home)
+                    workspace_id = read_anchor(repo)["workspace_id"]
+                    position, relative_width = presentation[label]
+                    (repo / ".mozyo-bridge" / "config.yaml").write_text(
+                        "presentation:\n"
+                        "  grouping:\n"
+                        "    unit_overrides:\n"
+                        f"      - workspace_id: '{workspace_id}'\n"
+                        "        lane_id: 'default'\n"
+                        f"        position: {position}\n"
+                        f"        relative_width: {relative_width}\n",
+                        encoding="utf-8",
+                    )
                 results.append(
                     prepare_session(
                         repo_root=repo,
@@ -3092,6 +3151,41 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             columns[session.workspace_id] = spans.pop()
         self.assertEqual(len(set(columns.values())), 2, "the pairs share one column")
         self.assertEqual(sum(width for _x, width in columns.values()), herdr.split_cross)
+
+    def test_fresh_pair_applies_repo_configured_unit_order_and_relative_width(self) -> None:
+        """The production session path consumes #14606's real repo config plan."""
+
+        herdr = _Herdr(created_workspace="wProjects")
+        herdr.booting_after_start = {"codex", "claude"}
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions, _repos, _home, _env, _top = self._shared_coordinator_projects(
+                tmp,
+                herdr,
+                projects=("accounting", "operations"),
+                presentation={
+                    "accounting": (20, 1),
+                    "operations": (10, 2),
+                },
+            )
+            rects = self._shared_rects(herdr, sessions[-1].slots[0].locator)
+
+        spans = {}
+        for label, session in zip(("accounting", "operations"), sessions):
+            unit_spans = {
+                (rects[slot.locator]["x"], rects[slot.locator]["width"])
+                for slot in session.slots
+            }
+            self.assertEqual(1, len(unit_spans))
+            spans[label] = unit_spans.pop()
+        self.assertLess(spans["operations"][0], spans["accounting"][0])
+        self.assertAlmostEqual(
+            2.0,
+            spans["operations"][1] / spans["accounting"][1],
+            delta=0.15,
+        )
+        self.assertEqual(1, len(herdr.pane_swaps))
+        self.assertEqual("applied", sessions[-1].column_outcome)
+        self.assertTrue(sessions[-1].ok, sessions[-1].column_detail)
 
     def test_shared_space_three_projects_each_gets_a_verified_column(self) -> None:
         """The legacy shared overview applies the same verified project columns.
@@ -7292,6 +7386,260 @@ class LaneKindPlacementSchemaTest(unittest.TestCase):
         self.assertEqual(config.resolve_by_lane_kind("coordinator"), ResolvedPlacement())
         # The lane-class axis is untouched.
         self.assertEqual(config.resolve("sublane"), ResolvedPlacement(split="down"))
+
+
+class SessionStartCompletionOrderTest(unittest.TestCase):
+    """Configured columns may read generation authority only after settlement."""
+
+    def test_generation_then_settle_then_configured_placement(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_session_start_completion as completion,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_placement import (  # noqa: E501
+            PLACEMENT_MATCHED,
+        )
+
+        events = []
+
+        class _Transaction:
+            action_id = "action"
+
+            def settle(self, *, owed, launched):
+                events.append(("settle", owed, launched))
+
+        class _Placement:
+            def __init__(self, **_kwargs):
+                self.assert_settled = events[-1] == ("settle", False, True)
+                events.append("placement_init")
+
+            def converge(self):
+                self_test.assertTrue(self.assert_settled)
+                events.append("placement")
+                return SimpleNamespace(
+                    status=PLACEMENT_MATCHED,
+                    detail="configured placement matched",
+                )
+
+        self_test = self
+        slots = [
+            SimpleNamespace(
+                outcome=SLOT_LAUNCHED,
+                healthy=True,
+                locator=f"w:p{index}",
+                assigned_name=f"name-{index}",
+                provider=provider,
+            )
+            for index, provider in enumerate(("codex", "claude"), start=1)
+        ]
+        result = SimpleNamespace(
+            slots=slots,
+            workspace_id="project",
+            lane_id="default",
+            herdr_workspace_id="w",
+            owes_rollback=False,
+            column_ok=True,
+            ratio_ok=True,
+            column_outcome="applied",
+            column_detail="",
+        )
+        with patch.object(
+            completion,
+            "finalize_session_launch_generations",
+            side_effect=lambda **_kwargs: events.append("generation"),
+        ), patch.object(completion, "HerdrProjectColumnPlacement", _Placement):
+            completion.complete_session_start(
+                result,
+                store_home=Path("/unused"),
+                transaction=_Transaction(),
+                workspace_id="project",
+                attestation_read=lambda _name: None,
+                attest_launcher="launcher",
+                launch_plans=(object(), object()),
+                dry_run=False,
+                project_column_coordinator=True,
+                coordinator_top_workspace_id="top",
+                binary="herdr",
+                runner=lambda *_args, **_kwargs: None,
+                timeout=1.0,
+                env={},
+            )
+
+        self.assertEqual(
+            [
+                "generation",
+                ("settle", False, True),
+                "placement_init",
+                "placement",
+            ],
+            events,
+        )
+
+    def test_unhealthy_launch_settles_but_does_not_place_columns(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_session_start_completion as completion,
+        )
+
+        events = []
+
+        class _Transaction:
+            action_id = "action"
+
+            def settle(self, *, owed, launched):
+                events.append(("settle", owed, launched))
+
+        result = SimpleNamespace(
+            slots=[SimpleNamespace(outcome=SLOT_LAUNCHED, healthy=False)],
+            workspace_id="project",
+            lane_id="default",
+            herdr_workspace_id="w",
+            owes_rollback=True,
+            column_ok=False,
+            ratio_ok=True,
+            column_outcome="failed",
+            column_detail="",
+        )
+        with patch.object(
+            completion,
+            "finalize_session_launch_generations",
+            side_effect=lambda **_kwargs: events.append("generation"),
+        ), patch.object(completion, "HerdrProjectColumnPlacement") as placement:
+            completion.complete_session_start(
+                result,
+                store_home=Path("/unused"),
+                transaction=_Transaction(),
+                workspace_id="project",
+                attestation_read=lambda _name: None,
+                attest_launcher="launcher",
+                launch_plans=(object(),),
+                dry_run=False,
+                project_column_coordinator=True,
+                coordinator_top_workspace_id="top",
+                binary="herdr",
+                runner=lambda *_args, **_kwargs: None,
+                timeout=1.0,
+                env={},
+            )
+
+        self.assertEqual(["generation", ("settle", True, True)], events)
+        placement.assert_not_called()
+
+    def test_prepared_large_set_must_finish_configured_placement(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_session_start_completion as completion,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_placement import (  # noqa: E501
+            PLACEMENT_APPLIED,
+            PLACEMENT_DEFERRED,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_reflow import (  # noqa: E501
+            COLUMN_APPLIED,
+            COLUMN_FAILED,
+            COLUMN_PREPARED,
+        )
+
+        slots = [
+            SimpleNamespace(
+                outcome=SLOT_LAUNCHED,
+                healthy=True,
+                locator=f"w:p{index}",
+                assigned_name=f"name-{index}",
+                provider=provider,
+            )
+            for index, provider in enumerate(("codex", "claude"), start=1)
+        ]
+        result = SimpleNamespace(
+            slots=slots,
+            workspace_id="project",
+            lane_id="default",
+            herdr_workspace_id="w",
+            owes_rollback=False,
+            column_ok=False,
+            ratio_ok=True,
+            column_outcome=COLUMN_PREPARED,
+            column_detail="",
+        )
+        placement = MagicMock()
+        placement.converge.return_value = SimpleNamespace(
+            status=PLACEMENT_APPLIED,
+            detail="configured widths measured",
+            recovery="",
+        )
+        with patch.object(completion, "finalize_session_launch_generations"), patch.object(
+            completion, "HerdrProjectColumnPlacement", return_value=placement
+        ):
+            completion.complete_session_start(
+                result, store_home=Path("/unused"), transaction=None,
+                workspace_id="project", attestation_read=lambda _name: None,
+                attest_launcher="launcher", launch_plans=(object(), object()),
+                dry_run=False, project_column_coordinator=True,
+                coordinator_top_workspace_id="top", binary="herdr",
+                runner=lambda *_args, **_kwargs: None, timeout=1.0, env={},
+            )
+            self.assertEqual(COLUMN_APPLIED, result.column_outcome)
+            self.assertEqual("configured widths measured", result.column_detail)
+
+            result.column_outcome = COLUMN_PREPARED
+            result.column_detail = ""
+            placement.converge.return_value = SimpleNamespace(
+                status=PLACEMENT_DEFERRED,
+                detail="one Unit is incomplete",
+                recovery="",
+            )
+            completion.complete_session_start(
+                result, store_home=Path("/unused"), transaction=None,
+                workspace_id="project", attestation_read=lambda _name: None,
+                attest_launcher="launcher", launch_plans=(object(), object()),
+                dry_run=False, project_column_coordinator=True,
+                coordinator_top_workspace_id="top", binary="herdr",
+                runner=lambda *_args, **_kwargs: None, timeout=1.0, env={},
+            )
+
+        self.assertEqual(COLUMN_FAILED, result.column_outcome)
+        self.assertIn("relative widths remain unverified", result.column_detail)
+
+    def test_placement_failure_exposes_the_recovery_instruction(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_session_start_completion as completion,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_placement import (  # noqa: E501
+            PLACEMENT_PARTIAL,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_reflow import (  # noqa: E501
+            COLUMN_FAILED,
+        )
+
+        slots = [
+            SimpleNamespace(
+                outcome=SLOT_LAUNCHED, healthy=True, locator=f"w:p{index}",
+                assigned_name=f"name-{index}", provider=provider,
+            )
+            for index, provider in enumerate(("codex", "claude"), start=1)
+        ]
+        result = SimpleNamespace(
+            slots=slots, workspace_id="project", lane_id="default",
+            herdr_workspace_id="w", owes_rollback=False, column_ok=True,
+            ratio_ok=True, column_outcome="applied", column_detail="",
+        )
+        placement = MagicMock()
+        placement.converge.return_value = SimpleNamespace(
+            status=PLACEMENT_PARTIAL,
+            detail="move response was unproven",
+            recovery="Inspect the Unit before retrying.",
+        )
+        with patch.object(completion, "finalize_session_launch_generations"), patch.object(
+            completion, "HerdrProjectColumnPlacement", return_value=placement
+        ):
+            completion.complete_session_start(
+                result, store_home=Path("/unused"), transaction=None,
+                workspace_id="project", attestation_read=lambda _name: None,
+                attest_launcher="launcher", launch_plans=(object(), object()),
+                dry_run=False, project_column_coordinator=True,
+                coordinator_top_workspace_id="top", binary="herdr",
+                runner=lambda *_args, **_kwargs: None, timeout=1.0, env={},
+            )
+
+        self.assertEqual(COLUMN_FAILED, result.column_outcome)
+        self.assertIn("Inspect the Unit before retrying.", result.column_detail)
 
 
 if __name__ == "__main__":  # pragma: no cover

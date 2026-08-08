@@ -133,6 +133,16 @@ COLUMN_MATCHED = "matched"
 #: The bounce ran and the closing ``pane layout`` read confirms every project pair
 #: owns one full-height column. Only a measured layout produces this token.
 COLUMN_APPLIED = "applied"
+#: The append bounce produced and measured full-height columns, but equal-width
+#: balancing is not representable for more than ten columns.  This is deliberately
+#: not a success token: the configured placement completion must replace it with a
+#: measured matched/applied/deferred verdict before session-start may succeed.
+COLUMN_PREPARED = "prepared_for_configured_placement"
+#: Configured ordering is intentionally postponed because at least one Unit has
+#: only one admitted provider pane.  Moving the complete neighbours around that
+#: mixed set would make the missing half's eventual position ambiguous.  This is
+#: a successful, zero-write deferral; a later full-pair launch may converge it.
+COLUMN_DEFERRED = "deferred_until_full_pair_set"
 #: The reflow was owed and could not be established. Never reported as success;
 #: the detail names the refusing step and any pane left outside the tab.
 COLUMN_FAILED = "failed"
@@ -142,6 +152,8 @@ COLUMN_OUTCOMES: tuple[str, ...] = (
     COLUMN_NOT_APPLICABLE,
     COLUMN_MATCHED,
     COLUMN_APPLIED,
+    COLUMN_PREPARED,
+    COLUMN_DEFERRED,
     COLUMN_FAILED,
 )
 
@@ -150,7 +162,7 @@ COLUMN_OUTCOMES: tuple[str, ...] = (
 #: :data:`...herdr_pair_split_ratio.RATIO_SUCCESS_OUTCOMES` adopted after a typo
 #: in the negative comparison reported unknown tokens as success (j#91418 R5-F1).
 COLUMN_SUCCESS_OUTCOMES: frozenset = frozenset(
-    {COLUMN_NOT_APPLICABLE, COLUMN_MATCHED, COLUMN_APPLIED}
+    {COLUMN_NOT_APPLICABLE, COLUMN_MATCHED, COLUMN_APPLIED, COLUMN_DEFERRED}
 )
 
 #: Herdr's stable pane ``cwd`` is independent of the foreground process cwd, but
@@ -679,11 +691,6 @@ def reflow_project_columns(
             "this project is the only coordinator pair in the shared workspace, so "
             "its pair already owns the whole tab"
         )
-    if len(groups) > MAX_EQUAL_PROJECT_COLUMNS:
-        return COLUMN_FAILED, (
-            f"{len(groups)} project columns require a root ratio below Herdr's "
-            "0.1 minimum; no live pane was moved"
-        )
     if not own_launched:
         return COLUMN_FAILED, "this run launched a pair but reports no live locator"
     layout = read_pane_layout(
@@ -805,6 +812,13 @@ def _verify_reflow(
     columnar, reason = columnar_verdict(layout, groups)
     if not columnar:
         return COLUMN_FAILED, f"the reflowed tab is still not columnar: {reason}"
+    if len(groups) > MAX_EQUAL_PROJECT_COLUMNS:
+        outcome = COLUMN_PREPARED
+        action = "now own" if geometry_changed else "already own"
+        return outcome, (
+            f"{len(groups)} project pair(s) {action} full-height columns; "
+            "configured placement must establish their final relative widths"
+        )
     resized, refusal = balance_project_columns(
         layout,
         groups,
@@ -840,9 +854,11 @@ def _verify_reflow(
 
 __all__ = (
     "COLUMN_APPLIED",
+    "COLUMN_DEFERRED",
     "COLUMN_FAILED",
     "COLUMN_MATCHED",
     "COLUMN_NOT_APPLICABLE",
+    "COLUMN_PREPARED",
     "COLUMN_OUTCOMES",
     "COLUMN_SUCCESS_OUTCOMES",
     "ColumnAttach",

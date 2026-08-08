@@ -50,7 +50,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_reflow import (  # noqa: E402,E501
     COLUMN_OUTCOMES,
     COLUMN_SUCCESS_OUTCOMES,
+    COLUMN_DEFERRED,
     COLUMN_FAILED,
+    COLUMN_PREPARED,
     ColumnAttach,
     CoordinatorPane,
     columnar_verdict,
@@ -937,14 +939,17 @@ class ProjectColumnAuthorityTest(unittest.TestCase):
 
 
 class ColumnVocabularyTest(unittest.TestCase):
-    def test_the_success_set_is_the_vocabulary_minus_failed(self):
+    def test_the_success_set_excludes_failure_and_intermediate_preparation(self):
         self.assertEqual(
-            set(COLUMN_OUTCOMES), COLUMN_SUCCESS_OUTCOMES | {COLUMN_FAILED}
+            set(COLUMN_OUTCOMES),
+            COLUMN_SUCCESS_OUTCOMES | {COLUMN_FAILED, COLUMN_PREPARED},
         )
 
     def test_failed_is_the_only_non_success_token(self):
         self.assertNotIn(COLUMN_FAILED, COLUMN_SUCCESS_OUTCOMES)
-        self.assertEqual(len(COLUMN_SUCCESS_OUTCOMES), 3)
+        self.assertNotIn(COLUMN_PREPARED, COLUMN_SUCCESS_OUTCOMES)
+        self.assertIn(COLUMN_DEFERRED, COLUMN_SUCCESS_OUTCOMES)
+        self.assertEqual(len(COLUMN_SUCCESS_OUTCOMES), 4)
 
 
 class LayoutProducerParityTest(unittest.TestCase):
