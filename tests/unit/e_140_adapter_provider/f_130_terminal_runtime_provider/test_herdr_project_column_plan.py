@@ -602,6 +602,66 @@ class CanonicalConfigResolutionTest(unittest.TestCase):
         self.assertTrue(first.executable)
         self.assertTrue(changed.executable)
 
+    def test_source_fingerprint_changes_with_canonical_liveness_facts(self) -> None:
+        common = {
+            "workspace_loader": lambda _workspace_id, *, home=None: _workspace(
+                "ws-a", "/canonical/a"
+            ),
+            "config_loader": lambda _path: RepoLocalConfig.default(),
+        }
+        git_main = resolve_project_column_plan(
+            (_observed("ws-a", 0),),
+            **common,
+            canonical_probe=lambda _path: {
+                "exists": True,
+                "is_dir": True,
+                "is_git": True,
+                "is_main_worktree": True,
+            },
+        )
+        plain_directory = resolve_project_column_plan(
+            (_observed("ws-a", 0),),
+            **common,
+            canonical_probe=lambda _path: {
+                "exists": True,
+                "is_dir": True,
+                "is_git": False,
+                "is_main_worktree": None,
+            },
+        )
+        self.assertTrue(git_main.executable)
+        self.assertTrue(plain_directory.executable)
+        self.assertNotEqual(
+            git_main.source_fingerprint,
+            plain_directory.source_fingerprint,
+        )
+
+    def test_relative_or_noncanonical_registry_path_never_reads_cwd_config(self) -> None:
+        config_reads: list[Path] = []
+        probe_reads: list[str | None] = []
+        for canonical_path in (
+            ".",
+            "relative/repo",
+            "/canonical/../other",
+            "/canonical//other",
+            "/canonical/other/",
+        ):
+            with self.subTest(canonical_path=canonical_path):
+                plan = resolve_project_column_plan(
+                    (_observed("ws-a", 0),),
+                    workspace_loader=lambda _workspace_id, *, home=None: _workspace(
+                        "ws-a", canonical_path
+                    ),
+                    config_loader=lambda path: config_reads.append(path),
+                    canonical_probe=lambda path: probe_reads.append(path)
+                    or _healthy_canonical(path),
+                )
+                self.assertEqual(plan.quality, QUALITY_DEGRADED)
+                self.assertIn(REASON_WORKSPACE_UNRESOLVED, plan.reasons)
+                self.assertFalse(plan.executable)
+        self.assertEqual(config_reads, [])
+        self.assertEqual(probe_reads, [])
+
     def test_dead_or_linked_canonical_path_is_zero_inference(self) -> None:
         config_reads = []
         for probe in (
@@ -675,6 +735,10 @@ class CanonicalConfigResolutionTest(unittest.TestCase):
             UnitColumnKey("ws-a", "default", "remote"),
             UnitColumnKey("", "default"),
             UnitColumnKey("ws-a", ""),
+            UnitColumnKey(" ", "default"),
+            UnitColumnKey("ws-a", " "),
+            UnitColumnKey(" ws-a", "default"),
+            UnitColumnKey("ws-a", "default "),
         ):
             with self.subTest(key=key):
                 plan = plan_project_columns(

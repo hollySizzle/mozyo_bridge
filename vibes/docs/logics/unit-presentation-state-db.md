@@ -445,6 +445,9 @@ Unit keyを保持する。現local Herdr resolverではhostを`local`に正規�
 non-local host・registry workspace不一致を拒否する。registry canonical liveness、
 正規化済みconfig、rule facts、計算algorithm versionからprivate pathを公開しない
 opaque source fingerprintを作る。fingerprintがないpure math planはapply可能としない。
+registry pathはwriterが保存するabsolute canonical表現だけを受理し、相対pathをcwdで
+解決しない。canonical livenessは既知fieldを型検査してfingerprint入力へ含めるため、
+同一path/configでもprobe結果が変われば同じsourceとして扱わない。
 本sliceはpaneを動かさず、後続actionはそのfingerprintとidentity・generation・同一tab・
 geometryをapply直前に再確認する。
 

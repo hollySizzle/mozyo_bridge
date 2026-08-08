@@ -76,7 +76,13 @@ HERDR_MIN_DIVIDER_RATIO = 0.1
 HERDR_MAX_DIVIDER_RATIO = 0.9
 _HERDR_MIN_DIVIDER_FRACTION = Fraction(1, 10)
 _HERDR_MAX_DIVIDER_FRACTION = Fraction(9, 10)
-SOURCE_FINGERPRINT_VERSION = 1
+SOURCE_FINGERPRINT_VERSION = 2
+_LIVENESS_FINGERPRINT_FIELDS = (
+    "exists",
+    "is_dir",
+    "is_git",
+    "is_main_worktree",
+)
 
 
 @dataclass(frozen=True, order=True)
@@ -176,9 +182,11 @@ def _valid_preference(preference: UnitColumnPreference) -> bool:
     observed = preference.observed
     if (
         not isinstance(observed.key.workspace_id, str)
-        or not observed.key.workspace_id
+        or not observed.key.workspace_id.strip()
+        or observed.key.workspace_id != observed.key.workspace_id.strip()
         or not isinstance(observed.key.lane_id, str)
-        or not observed.key.lane_id
+        or not observed.key.lane_id.strip()
+        or observed.key.lane_id != observed.key.lane_id.strip()
         or observed.key.host_id != "local"
         or isinstance(observed.current_index, bool)
         or not isinstance(observed.current_index, int)
@@ -200,6 +208,42 @@ def _valid_preference(preference: UnitColumnPreference) -> bool:
         if not math.isfinite(normalized_width) or normalized_width <= 0.0:
             return False
     return True
+
+
+def _canonical_registry_path(value: object) -> Path | None:
+    """Accept only the absolute, already-canonical path stored by the registry writer.
+
+    Calling ``Path.resolve`` on an untrusted relative row would turn the process cwd
+    into workspace authority.  The registry writer stores a resolved absolute path,
+    so legacy or tampered rows that do not have that shape must fail closed.
+    """
+
+    if not isinstance(value, str) or not value or value != value.strip():
+        return None
+    candidate = Path(value)
+    if not candidate.is_absolute() or str(candidate) != value:
+        return None
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        return None
+    if candidate != resolved:
+        return None
+    return resolved
+
+
+def _normalized_liveness_facts(value: object) -> Mapping[str, object] | None:
+    """Reduce the canonical probe result to stable, typed fingerprint inputs."""
+
+    if not isinstance(value, Mapping):
+        return None
+    facts: dict[str, object] = {}
+    for field in _LIVENESS_FINGERPRINT_FIELDS:
+        fact = value.get(field)
+        if fact is not None and not isinstance(fact, bool):
+            return None
+        facts[field] = fact
+    return facts
 
 
 def _right_nested_ratio(weights: Sequence[float]) -> Fraction:
@@ -379,24 +423,36 @@ def resolve_project_column_plan(
     observed_columns = tuple(observed_columns)
     preferences: list[UnitColumnPreference] = []
     reasons: list[str] = []
-    workspace_cache: dict[str, tuple[WorkspaceRecord, Path] | None] = {}
+    workspace_cache: dict[
+        str, tuple[WorkspaceRecord, Path, Mapping[str, object]] | None
+    ] = {}
     config_cache: dict[Path, RepoLocalConfig | None] = {}
     fingerprint_entries: list[Mapping[str, object]] = []
 
     for observed in observed_columns:
         workspace_id = observed.key.workspace_id
         if workspace_id not in workspace_cache:
-            authority: tuple[WorkspaceRecord, Path] | None = None
+            authority: tuple[
+                WorkspaceRecord, Path, Mapping[str, object]
+            ] | None = None
             try:
                 record = workspace_loader(workspace_id, home=home)
                 if record is not None and record.workspace_id == workspace_id:
-                    liveness = canonical_probe(record.canonical_path)
-                    if liveness.get("is_dir") is True and liveness.get(
+                    canonical_path = _canonical_registry_path(record.canonical_path)
+                    liveness = (
+                        _normalized_liveness_facts(canonical_probe(str(canonical_path)))
+                        if canonical_path is not None
+                        else None
+                    )
+                    if liveness is not None and liveness.get(
+                        "is_dir"
+                    ) is True and liveness.get(
                         "is_main_worktree"
                     ) is not False:
                         authority = (
                             record,
-                            Path(record.canonical_path).expanduser().resolve(),
+                            canonical_path,
+                            liveness,
                         )
             except Exception:  # noqa: BLE001 - registry/probe is an IO boundary
                 authority = None
@@ -407,7 +463,7 @@ def resolve_project_column_plan(
             reasons.append(REASON_WORKSPACE_UNRESOLVED)
             preferences.append(UnitColumnPreference(observed=observed))
             continue
-        record, canonical_path = authority
+        record, canonical_path, liveness = authority
 
         if canonical_path not in config_cache:
             try:
@@ -468,6 +524,7 @@ def resolve_project_column_plan(
                 "repo_label": rule_facts.repo_label,
                 "project_id": rule_facts.project_id,
                 "fixed_version_id": rule_facts.fixed_version_id,
+                "canonical_liveness": liveness,
                 "grouping": asdict(grouping),
             }
         )
