@@ -1414,10 +1414,18 @@ resolver と `coordinator_shared_create_lock` fence をそのまま使う。
 - **observation (Acceptance 4)**: `RecordingHerdrRunner` が command 種別と非秘匿 identity token (`coordinators` label /
   `mzb1_...` name / `wN:pM` handle) のみ記録し、`--env` 値 / home path / payload 全文は記録しない。evidence 要約は
   count / bool / closed phase token のみ (durable journal 安全)。
+- **project 成功の authority**: `prepare_session` が例外を投げず返ったこと自体は成功ではない。
+  `SessionStartResult.ok` が true の場合だけ project を `created` / `adopted` とし、false は
+  `failed` (`failure_phase=session_start`) とする。semantic failure でも実際に launch 済みの role / name /
+  pane handle と workspace create receipt は内部 cleanup tape に保持するが、公開 evidence へ identity / raw detail /
+  path を出さない。create count も成功 project 数から逆算せず、recorder の実 create request 数を使う。
 - **concurrent 収束 (Acceptance 3)**: `run_concurrent` が project ごと 1 thread を `threading.Barrier` で同時 release し、
   isolated home 共有で実 `coordinator_shared_create_lock` を競合させる (§5.1.1 create fence と同じ deterministic 手法)。
-  **create count 1 / duplicate agent 0** を実測する。orthogonal な #13948 startup-transaction fence は project ごと
-  per-fence 隔離する (収束 test を coordinator create lock に集中、R7 j#83573 と同方針)。
+  **create count 1 / duplicate agent 0** を実測する。#13948 startup-transaction は managed wrapper の write と
+  health reader が使う **同じ isolated-home canonical store** を使う。project 別 store へ分けると action reservation と
+  execution evidence が別 authority になり、正常 launch も `startup_evidence_unavailable` になるため禁止する。
+  同時開始で生じる短い lock 競合だけは、owned smoke 専用 fence が bounded retry する。これは隔離済み診断内の
+  非破壊 write に限り、通常 operator command / rollback の fail-fast policy は変更しない。
 - **cleanup + residue (Acceptance 5)**: launch した exact pane handle のみ close し (workspace は最終 pane で auto-vanish、
   #13380)、`workspace list` / `agent list` を読み返して residue 0 を証明する。generic kill は行わない。
 

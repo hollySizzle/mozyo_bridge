@@ -52,7 +52,8 @@ Safety posture (Redmine #14187 Acceptance 1/5/6)
 from __future__ import annotations
 
 import threading
-from contextlib import contextmanager
+import time
+from contextlib import ExitStack, contextmanager
 from dataclasses import InitVar, dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator, Mapping, Optional, Sequence
@@ -60,6 +61,7 @@ from typing import Callable, Iterator, Mapping, Optional, Sequence
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 from mozyo_bridge.core.state.workspace_registry import register_workspace
 from mozyo_bridge.core.state.startup_transaction_fence import StartupTransactionFence
+from mozyo_bridge.core.state.startup_action_capability import StartupTransactionBusy
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_health import (  # noqa: E501
     StartupProbe,
 )
@@ -115,6 +117,37 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _flag_value,
 )
 # -- isolation authority (fail-closed before actuation) ------------------------
+
+
+class _OwnedSmokeStartupTransactionFence(StartupTransactionFence):
+    """Bounded contention tolerance for the smoke's owned startup authority.
+
+    Normal operator commands intentionally fail fast on this lock.  The smoke starts
+    multiple owned projects together, so millisecond overlap is an expected stimulus,
+    not evidence of a foreign writer.  Retry only lock acquisition, inside the already
+    isolated smoke home, for a short bound; every store-shape or write failure still
+    propagates immediately and no destructive rollback path uses this subclass.
+    """
+
+    _BUSY_BUDGET_SECONDS = 2.0
+    _BUSY_SLEEP_SECONDS = 0.01
+
+    @contextmanager
+    def _hold(self):  # noqa: SLF001 - this subclass is the injected fence authority
+        deadline = time.monotonic() + self._BUSY_BUDGET_SECONDS
+        while True:
+            stack = ExitStack()
+            try:
+                stack.enter_context(super()._hold())
+                break
+            except StartupTransactionBusy:
+                stack.close()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(min(self._BUSY_SLEEP_SECONDS, remaining))
+        with stack:
+            yield
 
 
 def prove_smoke_isolation(isolated_home: Path, *, operator_home: Path) -> Path:
@@ -308,17 +341,14 @@ class SharedSpaceSmokeHarness:
         self.env = dict(env)
         self.timeout = timeout
         self.providers = tuple(providers)
-        # Isolate the ORTHOGONAL home-scoped startup-transaction fence (#13948, a brief
-        # non-blocking per-DB-write lock) per project, so concurrent projects never
-        # collide on IT — this harness targets the shared-coordinators create
-        # single-flight, which still uses the shared home lock (Redmine #14139 R7
-        # j#83573 established this isolation for the convergence test). Injectable so
-        # the #14185 live smoke can substitute a home-scoped fence if it wants the real
-        # cross-process contention on this axis too.
+        # Use the same home-scoped startup authority the managed wrapper writes and the
+        # health reader observes.  A per-project database made the action reservation
+        # invisible to both of those production consumers, so even a correctly wrapped
+        # process could only report startup evidence unavailable.  The factory remains
+        # injectable for fault tests, but the public/default smoke now exercises the
+        # real shared authority (including its concurrency behaviour).
         self._startup_fence_factory = startup_fence_factory or (
-            lambda key: StartupTransactionFence(
-                path=self.home / f"smoke-startup-{key}.sqlite"
-            )
+            lambda _key: _OwnedSmokeStartupTransactionFence(home=self.home)
         )
         # A fast, timeless startup health probe by default (no real sleep), so the
         # smoke does not wall-clock on the per-role liveness poll; #14185 live may pass
@@ -452,6 +482,25 @@ class SharedSpaceSmokeHarness:
             for s in result.slots
             if s.outcome == _session.SLOT_LAUNCHED and s.locator
         )
+        # ``prepare_session`` reports several fail-closed outcomes as a returned
+        # ``SessionStartResult`` rather than an exception: startup evidence may be
+        # unavailable, only part of a pair may be healthy, or ratio / column
+        # finalisation may fail.  The smoke must consume the aggregate verdict before
+        # classifying create-vs-adopt; otherwise ``base_pane_id`` turns a returned
+        # failure into a false green.  Keep the public-safe role projection and the
+        # private cleanup locators on the observation, but expose no runtime detail.
+        if not result.ok:
+            return ProjectSmokeObservation(
+                project_key=spec.project_key,
+                workspace_id=result.workspace_id,
+                outcome="failed",
+                coordinators_workspace_id=result.herdr_workspace_id,
+                launched_roles=launched,
+                adopted_roles=adopted,
+                launched_names=launched_names,
+                launched_locators=launched_locators,
+                failure_phase=PHASE_SESSION_START,
+            )
         # A fresh clean-slate launch captured a base pane when it CREATED the shared
         # workspace (`_create_workspace`); an adopt reused an existing one and captured
         # none. That per-result signal attributes create-vs-adopt without racing the
@@ -650,9 +699,10 @@ class SharedSpaceSmokeHarness:
         self.preflight_clean_slate()
         observations = self.run_concurrent(specs)
         duplicate_agents = _count_duplicate_agents(observations)
-        coordinators_create_count = sum(
-            1 for o in observations if o.created_coordinators_space
-        )
+        # Count actual create requests from the mutation tape.  A semantically failed
+        # session may still have created the one owned shared workspace; deriving this
+        # count from successful project observations would erase that actuation.
+        coordinators_create_count = self.recorder.coordinators_create_count
         self.cleanup(observations)
         residue_verified = True
         residue_workspaces, residue_agents = -1, -1

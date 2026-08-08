@@ -59,8 +59,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     run_disposable_shared_space_smoke,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.shared_space_smoke_observation import (  # noqa: E402,E501
+    PHASE_SESSION_START,
     ProjectSmokeObservation,
     SharedSpaceSmokeError,
+    SharedSpaceSmokeObservation,
 )
 
 
@@ -176,10 +178,18 @@ class _StubRecorder:
 class _StubHarness:
     """The seam ``_run_forked_projects`` actually uses — no Herdr, no isolation home."""
 
-    def __init__(self, *, calls: int = 0, die: bool = False, gate_runner=None) -> None:
+    def __init__(
+        self,
+        *,
+        calls: int = 0,
+        die: bool = False,
+        semantic_failure: bool = False,
+        gate_runner=None,
+    ) -> None:
         self.recorder = _StubRecorder()
         self._calls = calls
         self._die = die
+        self._semantic_failure = semantic_failure
         self._gate_runner = gate_runner
 
     def run_project(self, spec) -> ProjectSmokeObservation:
@@ -189,6 +199,21 @@ class _StubHarness:
             # Not an exception: the worker vanishes without ever reporting, which is
             # the case the parent must not read as "this process made zero requests".
             os._exit(9)
+        if self._semantic_failure:
+            self.recorder.launched_locators.append("w1:p7")
+            self.recorder.created_workspaces["w1"] = "coordinators"
+            self.recorder.agent_start_names.append("mzb1_project_codex_default")
+            self.recorder.coordinators_create_count = 1
+            return ProjectSmokeObservation(
+                project_key=spec.project_key,
+                workspace_id="project",
+                outcome="failed",
+                coordinators_workspace_id="w1",
+                launched_roles=("codex",),
+                launched_names=("mzb1_project_codex_default",),
+                launched_locators=("w1:p7",),
+                failure_phase=PHASE_SESSION_START,
+            )
         return ProjectSmokeObservation(
             project_key=spec.project_key,
             workspace_id="w1",
@@ -265,6 +290,29 @@ class ForkedGateReceiptTests(unittest.TestCase):
             gate.proven_zero_external,
             "a lost snapshot must not read as a proven-zero process",
         )
+
+    def test_semantic_session_failure_keeps_a_complete_cleanup_receipt(self) -> None:
+        forked, gate, _runner = self._drive(
+            [{"calls": 1, "semantic_failure": True}]
+        )
+
+        self.assertFalse(forked.round_failed)
+        self.assertEqual(forked.orphaned_workers, 0)
+        self.assertEqual(len(forked.receipts), 1)
+        receipt = forked.receipts[0]
+        self.assertIsNotNone(receipt.endpoint_gate)
+        self.assertEqual(receipt.observation.outcome, "failed")
+        self.assertEqual(receipt.observation.failure_phase, PHASE_SESSION_START)
+        self.assertEqual(receipt.launched_locators, ("w1:p7",))
+        self.assertEqual(receipt.coordinators_create_count, 1)
+        self.assertTrue(gate.receipts_complete)
+        summary = SharedSpaceSmokeObservation(
+            projects=(receipt.observation,),
+            requested_projects=1,
+            coordinators_create_count=receipt.coordinators_create_count,
+        )
+        self.assertFalse(summary.converged)
+        self.assertFalse(summary.residue_clear)
 
 
 class PartialReceiptRetentionTests(unittest.TestCase):

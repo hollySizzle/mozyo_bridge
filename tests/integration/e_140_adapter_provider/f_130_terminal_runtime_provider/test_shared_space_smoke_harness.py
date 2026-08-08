@@ -15,6 +15,7 @@ Proves the #14185 blocker is resolved AND the R1 review j#83870 findings are clo
 from __future__ import annotations
 
 import os
+import json
 import stat
 import subprocess
 import sys
@@ -28,9 +29,28 @@ for _p in (ROOT / "src", ROOT / "tests"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from support.herdr_fake import FakeHerdr  # noqa: E402
+from support.herdr_fake import FakeHerdr, attest_capability_epilog  # noqa: E402
+
+from mozyo_bridge.core.state.herdr_identity_attestation import (  # noqa: E402
+    IdentityAttestationRecord,
+    VERDICT_PRESENT,
+    record_identity_attestation,
+)
+from mozyo_bridge.core.state.startup_execution_events import (  # noqa: E402
+    STAGE_ATTESTATION_WRITE_SUCCEEDED,
+    STAGE_PROVIDER_EXEC_CALL_REACHED,
+    STAGE_WRAPPER_ENTERED,
+    append_execution_event,
+)
+from mozyo_bridge.core.state.startup_transaction_fence import (  # noqa: E402
+    StartupTransactionFence,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E402,E501
+    ATTEST_CAPABILITY_MARKER,
+)
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.shared_space_smoke_harness import (  # noqa: E402,E501
+    PHASE_SESSION_START,
     PHASE_WORKER_ERROR,
     IsolationCapability,
     ProjectSmokeObservation,
@@ -43,6 +63,22 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     isolated_smoke_home,
     smoke_shared_space_preflight,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_result import (  # noqa: E402,E501
+    SLOT_LAUNCHED,
+    SessionStartResult,
+    SlotResult,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_reflow import (  # noqa: E402,E501
+    COLUMN_FAILED,
+    COLUMN_NOT_APPLICABLE,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pair_split_ratio import (  # noqa: E402,E501
+    RATIO_MATCHED,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_health import (  # noqa: E402,E501
+    HEALTH_HEALTHY,
+    HEALTH_NOT_PROBED,
+)
 
 
 def _make_env(bindir: Path) -> "dict[str, str]":
@@ -54,11 +90,24 @@ def _make_env(bindir: Path) -> "dict[str, str]":
     harness never resolves a binary itself. No secret-shaped literal.
     """
     bindir.mkdir(parents=True, exist_ok=True)
-    for name in ("herdr", "claude", "codex"):
+    for name in ("herdr", "claude", "codex", "mozyo-bridge"):
         path = bindir / name
         path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return {"MOZYO_HERDR_BINARY": str(bindir / "herdr"), "PATH": str(bindir)}
+
+
+def _launcher_run(argv, **_kwargs):
+    """Faithful positive response for the managed-launch capability probe."""
+    if list(argv[1:4]) == ["herdr", "agent-attest", "--help"]:
+        help_text = (
+            "usage: mozyo-bridge herdr agent-attest "
+            f"[{ATTEST_CAPABILITY_MARKER} ASSIGNED_NAME]\n\n"
+            + attest_capability_epilog()
+            + "\n"
+        )
+        return subprocess.CompletedProcess(list(argv), 0, stdout=help_text, stderr="")
+    raise AssertionError(f"unexpected launcher subprocess: {list(argv)!r}")
 
 
 class _HarnessFixture:
@@ -83,9 +132,30 @@ class _HarnessFixture:
         self._ctx = isolated_smoke_home(self.isolated)
         self.capability = self._ctx.__enter__()
         self.home = self.capability.isolated_home
+        # This suite exercises the smoke harness, shared-space creation/adoption,
+        # startup evidence and cleanup.  The nested pane-tree geometry collaborator
+        # has its own full regression suite; isolate it here so this fake need not
+        # fabricate pane-move/layout semantics it does not model.
+        self._column_patch = patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_project_column_reflow.reflow_project_columns",
+            return_value=(
+                COLUMN_NOT_APPLICABLE,
+                "geometry collaborator isolated by this harness test",
+            ),
+        )
+        self._column_patch.start()
+        self._ratio_patch = patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_pair_split_ratio._pair_geometry",
+            return_value=(RATIO_MATCHED, "ratio collaborator accepted"),
+        )
+        self._ratio_patch.start()
         return self
 
     def __exit__(self, *exc):
+        self._ratio_patch.stop()
+        self._column_patch.stop()
         self._ctx.__exit__(*exc)
         self._env_patch.stop()
         self._tmp.cleanup()
@@ -101,8 +171,61 @@ class _HarnessFixture:
 
     def harness(self) -> SharedSpaceSmokeHarness:
         return SharedSpaceSmokeHarness(
-            capability=self.capability, runner=self.fake.run, env=self.env
+            capability=self.capability,
+            runner=self._herdr_run,
+            launcher_runner=_launcher_run,
+            env=self.env,
         )
+
+    def _herdr_run(self, argv, *args, **kwargs):
+        """Drive FakeHerdr and model the managed wrapper's durable after-effects."""
+        result = self.fake.run(argv, *args, **kwargs)
+        rest = list(argv[1:])
+        if result.returncode == 0 and rest[:2] == ["agent", "list"]:
+            payload = json.loads(result.stdout)
+            for row in payload.get("agents", []):
+                pane = row.get("pane_id", "")
+                agent = self.fake._agents.get(pane)
+                if agent is not None and agent.cwd:
+                    row["cwd"] = agent.cwd
+            result = subprocess.CompletedProcess(
+                list(argv), 0, stdout=json.dumps(payload), stderr=""
+            )
+        if (
+            result.returncode == 0
+            and rest[:2] == ["agent", "start"]
+            and rest != ["agent", "start", "--help"]
+        ):
+            pane = rest[rest.index("--pane") + 1]
+            agent = self.fake._agents[pane]
+            if "agent-attest" in agent.launch_argv:
+                # A managed provider that reached its wrapper is visible as that
+                # provider in the live Herdr inventory (not as an anonymous shell).
+                agent.detected_agent = agent.provider
+                name = agent.logical_name
+                record_identity_attestation(
+                    IdentityAttestationRecord(
+                        assigned_name=name,
+                        workspace_id=agent.env.get("MOZYO_WORKSPACE_ID", ""),
+                        role=agent.provider,
+                        lane_id=agent.env.get("MOZYO_LANE_ID", ""),
+                        locator=pane,
+                        verdict=VERDICT_PRESENT,
+                        observed_at="2026-08-08T00:00:00+00:00",
+                    ),
+                    home=self.home,
+                )
+                action_id = agent.env.get("MOZYO_STARTUP_ACTION_ID", "")
+                fence = StartupTransactionFence(home=self.home)
+                for stage in (
+                    STAGE_WRAPPER_ENTERED,
+                    STAGE_ATTESTATION_WRITE_SUCCEEDED,
+                    STAGE_PROVIDER_EXEC_CALL_REACHED,
+                ):
+                    append_execution_event(
+                        fence, action_id, stage, participant=name
+                    )
+        return result
 
 
 class SharedSpaceSmokeIntegrationTests(unittest.TestCase):
@@ -185,6 +308,140 @@ class SharedSpaceSmokeIntegrationTests(unittest.TestCase):
                 first.coordinators_workspace_id, second.coordinators_workspace_id
             )
             self.assertEqual(harness.recorder.coordinators_create_count, 1)
+
+    def _assert_returned_session_failure_is_not_green(
+        self, result: SessionStartResult
+    ) -> None:
+        """A returned (non-exception) session failure stays a smoke failure."""
+        self.assertFalse(result.ok, "the fixture must exercise the returned-failure path")
+        with _HarnessFixture() as fx:
+            harness = fx.harness()
+            [spec] = fx.specs(1)
+            with patch(
+                "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+                "application.shared_space_smoke_harness._session.prepare_session",
+                return_value=result,
+            ):
+                observation = harness.run_project(spec)
+
+            self.assertEqual(observation.outcome, "failed")
+            self.assertEqual(observation.failure_phase, PHASE_SESSION_START)
+            self.assertEqual(
+                observation.coordinators_workspace_id, result.herdr_workspace_id
+            )
+            summary = SharedSpaceSmokeObservation(
+                projects=(observation,),
+                requested_projects=1,
+                coordinators_create_count=1,
+            )
+            self.assertFalse(summary.all_projects_completed)
+            self.assertFalse(summary.converged)
+            self.assertFalse(summary.residue_clear)
+            evidence = summary.as_evidence()
+            self.assertEqual(evidence["projects"][0]["outcome"], "failed")
+            self.assertEqual(
+                evidence["projects"][0]["failure_phase"], PHASE_SESSION_START
+            )
+            blob = repr(evidence)
+            self.assertNotIn(result.herdr_workspace_id, blob)
+            for slot in result.slots:
+                self.assertIn(slot.provider, observation.launched_roles)
+                self.assertIn(slot.assigned_name, observation.launched_names)
+                if slot.locator:
+                    self.assertIn(slot.locator, observation.launched_locators)
+                    self.assertNotIn(slot.locator, blob)
+                self.assertNotIn(slot.assigned_name, blob)
+
+    def test_returned_failure_keeps_actual_create_count_without_green(self) -> None:
+        """A failed session may have actuated; the tape, not success, counts it."""
+        with _HarnessFixture() as fx:
+            env = dict(fx.env)
+            env["MOZYO_BRIDGE_LAUNCHER"] = str(fx.tmp / "missing-launcher")
+            harness = SharedSpaceSmokeHarness(
+                capability=fx.capability,
+                runner=fx._herdr_run,
+                launcher_runner=_launcher_run,
+                env=env,
+            )
+            summary = harness.smoke(fx.specs(1))
+
+            self.assertEqual(summary.projects[0].outcome, "failed")
+            self.assertEqual(summary.projects[0].failure_phase, PHASE_SESSION_START)
+            self.assertEqual(summary.coordinators_create_count, 1)
+            self.assertFalse(summary.all_projects_completed)
+            self.assertFalse(summary.converged)
+            self.assertFalse(summary.residue_clear)
+            evidence = summary.as_evidence()
+            self.assertEqual(evidence["coordinators_create_count"], 1)
+            self.assertNotIn("w1:p", repr(evidence))
+
+    def test_returned_startup_evidence_failure_is_not_green(self) -> None:
+        self._assert_returned_session_failure_is_not_green(
+            SessionStartResult(
+                workspace_id="project-ws",
+                lane_id="default",
+                herdr_workspace_id="shared-ws",
+                base_pane_id="root-pane",
+                slots=[
+                    SlotResult(
+                        provider=provider,
+                        assigned_name=f"agent-{provider}",
+                        outcome=SLOT_LAUNCHED,
+                        locator=f"shared-ws:pane-{provider}",
+                        health=HEALTH_NOT_PROBED,
+                    )
+                    for provider in ("claude", "codex")
+                ],
+            )
+        )
+
+    def test_returned_column_failure_is_not_green(self) -> None:
+        self._assert_returned_session_failure_is_not_green(
+            SessionStartResult(
+                workspace_id="project-ws",
+                lane_id="default",
+                herdr_workspace_id="shared-ws",
+                base_pane_id="root-pane",
+                slots=[
+                    SlotResult(
+                        provider=provider,
+                        assigned_name=f"agent-{provider}",
+                        outcome=SLOT_LAUNCHED,
+                        locator=f"shared-ws:pane-{provider}",
+                        health=HEALTH_HEALTHY,
+                    )
+                    for provider in ("claude", "codex")
+                ],
+                column_outcome=COLUMN_FAILED,
+                column_detail="private runtime detail must not enter evidence",
+            )
+        )
+
+    def test_returned_partial_launch_is_not_green(self) -> None:
+        self._assert_returned_session_failure_is_not_green(
+            SessionStartResult(
+                workspace_id="project-ws",
+                lane_id="default",
+                herdr_workspace_id="shared-ws",
+                base_pane_id="root-pane",
+                slots=[
+                    SlotResult(
+                        provider="claude",
+                        assigned_name="agent-claude",
+                        outcome=SLOT_LAUNCHED,
+                        locator="shared-ws:pane-claude",
+                        health=HEALTH_HEALTHY,
+                    ),
+                    SlotResult(
+                        provider="codex",
+                        assigned_name="agent-codex",
+                        outcome=SLOT_LAUNCHED,
+                        locator="shared-ws:pane-codex",
+                        health=HEALTH_NOT_PROBED,
+                    ),
+                ],
+            )
+        )
 
     def test_preexisting_coordinators_space_fails_closed_before_create(self) -> None:
         # Acceptance 5 (herdr dimension): a workspace already labelled `coordinators`
