@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -40,6 +41,9 @@ from mozyo_bridge.application.repo_local_config_loader import load_repo_local_co
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     AUTO_TARGET_REPO,
     is_explicit_pane_target,
+)
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.project_scope import (
+    path_under_repo_relative,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.main_lane_guard_gate import (
     resolve_coordinator_provider,
@@ -55,6 +59,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     herdr_workspace_segment,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+    AGENT_KEY_LOCATOR,
+    AGENT_KEY_LOCATOR_ALIAS,
+    AGENT_KEY_LOCATOR_ALIAS_2,
     AGENT_KEY_NAME,
     _agent_locator,
     _norm,
@@ -68,10 +75,15 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     RECEIVER_COORDINATOR,
     resolve_sender_identity,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (
+    SLOT_LIVE,
+    classify_named_slot,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
     BACKEND_HERDR,
     TerminalTransportConfig,
     TerminalTransportError,
+    valid_target,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_discovery import (
     resolve_agent_lister,
@@ -113,24 +125,47 @@ class HerdrExplicitTargetMismatchError(HerdrSendEntryError):
 
 
 RESOLVED_TARGET_CAPABILITY_PURPOSE: str = "external_coordinator_proxy"
+PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE: str = "project_gateway"
+_RESOLVED_TARGET_CAPABILITY_PURPOSES: frozenset[str] = frozenset(
+    {
+        RESOLVED_TARGET_CAPABILITY_PURPOSE,
+        PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
+    }
+)
 RESOLVED_TARGET_CAPABILITY_MISMATCH: str = "resolved_target_capability_mismatch"
 RESOLVED_TARGET_CAPABILITY_ARG: str = "_mozyo_resolved_herdr_target_capability"
+
+_LOCATOR_KEYS = (
+    AGENT_KEY_LOCATOR,
+    AGENT_KEY_LOCATOR_ALIAS,
+    AGENT_KEY_LOCATOR_ALIAS_2,
+)
+
+
+def _locator_claims(row: Mapping[str, object]) -> tuple[bool, frozenset[str]]:
+    """Return readable locator aliases without hiding conflicting row claims."""
+
+    claims: set[str] = set()
+    readable = True
+    for key in _LOCATOR_KEYS:
+        if key not in row or row.get(key) is None:
+            continue
+        value = row.get(key)
+        if not isinstance(value, str):
+            readable = False
+            continue
+        normalized = value.strip()
+        if normalized:
+            claims.add(normalized)
+    return readable, frozenset(claims)
 
 
 @dataclass(frozen=True)
 class ResolvedHerdrTargetCapability:
-    """Internal capability for a target the coordinator-proxy already resolved.
+    """Internal, non-sender capability for an already-resolved live target.
 
-    This is deliberately a *target* capability, never a synthetic sender identity.  The external
-    coordinator client has no launch-time ``MOZYO_*`` authority, so the ordinary sender-scoped
-    route resolver must not be fed invented env values.  Instead the proxy carries the exact live
-    target it derived from the checkout anchor, durable role binding, provider binding, mzb1 name,
-    and generation-bound startup attestation.  The handoff rail revalidates the checkout frame,
-    decoded name, explicit target fields, and live locator before using it.
-
-    No public CLI flag constructs this value.  Merely having an instance is still insufficient:
-    :func:`validate_resolved_target_capability` joins every field back to the current repo and the
-    live inventory before any send.
+    No public CLI flag constructs it.  Validation rejoins its checkout, binding,
+    mzb1 identity, locator, and (for project gateway) generation before any send.
     """
 
     workspace_id: str
@@ -139,6 +174,15 @@ class ResolvedHerdrTargetCapability:
     assigned_name: str
     locator: str
     purpose: str = RESOLVED_TARGET_CAPABILITY_PURPOSE
+    # Project-gateway capabilities are generation-bound.  The external proxy's
+    # older capability remains byte-compatible (empty additive fields) because its
+    # generation fence is owned by the proxy flow upstream.
+    generation_token: str = ""
+    project_scope: str = ""
+    target_repo_root: str = ""
+    target_cwd: str = ""
+    project_path: str = ""
+    project_scope_root_fallback: bool = False
 
 
 def _resolved_target_capability_error(detail: str) -> HerdrSendEntryError:
@@ -178,14 +222,17 @@ def validate_resolved_target_capability(
             raise _resolved_target_capability_error(
                 f"the internal resolved-target capability has an invalid {key}"
             )
-    if cap.purpose != RESOLVED_TARGET_CAPABILITY_PURPOSE:
+    if cap.purpose not in _RESOLVED_TARGET_CAPABILITY_PURPOSES:
         raise _resolved_target_capability_error(
             "the internal resolved-target capability has an unknown purpose"
         )
 
     root = Path(repo_root).expanduser().resolve()
     anchor_workspace = herdr_workspace_segment(root)
-    if not anchor_workspace or cap.workspace_id != anchor_workspace:
+    if (
+        cap.purpose != PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE
+        and (not anchor_workspace or cap.workspace_id != anchor_workspace)
+    ):
         raise _resolved_target_capability_error(
             "the internal resolved target does not belong to this checkout workspace"
         )
@@ -211,7 +258,63 @@ def validate_resolved_target_capability(
         raise _resolved_target_capability_error(
             "the internal resolved target's --target-repo is unreadable"
         ) from exc
-    if requested_root != root:
+    if cap.purpose == PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE:
+        project_fields = {
+            "generation_token": cap.generation_token,
+            "project_scope": cap.project_scope,
+            "target_repo_root": cap.target_repo_root,
+            "target_cwd": cap.target_cwd,
+            "project_path": cap.project_path,
+        }
+        for key, value in project_fields.items():
+            if not isinstance(value, str) or not value or value != value.strip():
+                raise _resolved_target_capability_error(
+                    f"the project-gateway resolved-target capability has an invalid {key}"
+                )
+        if type(cap.project_scope_root_fallback) is not bool:
+            raise _resolved_target_capability_error(
+                "the project-gateway resolved-target capability has invalid root-fallback provenance"
+            )
+        if cap.project_scope_root_fallback and cap.project_path != ".":
+            raise _resolved_target_capability_error(
+                "the project-gateway root-fallback provenance requires project_path='.'"
+            )
+        try:
+            capability_target_root = Path(cap.target_repo_root).expanduser().resolve()
+            capability_target_cwd = Path(cap.target_cwd).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise _resolved_target_capability_error(
+                "the project-gateway resolved target's repo/cwd is unreadable"
+            ) from exc
+        if requested_root != capability_target_root:
+            raise _resolved_target_capability_error(
+                "the project-gateway resolved target's --target-repo changed"
+            )
+        try:
+            capability_target_cwd.relative_to(capability_target_root)
+        except ValueError as exc:
+            raise _resolved_target_capability_error(
+                "the project-gateway resolved target cwd is outside its target repo"
+            ) from exc
+        target_in_project = (
+            capability_target_cwd == capability_target_root
+            if cap.project_scope_root_fallback
+            else path_under_repo_relative(
+                str(capability_target_cwd),
+                repo_root=str(capability_target_root),
+                project_path=cap.project_path,
+            )
+        )
+        if not target_in_project:
+            raise _resolved_target_capability_error(
+                "the project-gateway resolved target cwd is outside its project scope path"
+            )
+        target_workspace = herdr_workspace_segment(capability_target_root)
+        if not target_workspace or target_workspace != cap.workspace_id:
+            raise _resolved_target_capability_error(
+                "the project-gateway target repo does not belong to the capability workspace"
+            )
+    elif requested_root != root:
         raise _resolved_target_capability_error(
             "the internal resolved target's --target-repo is not this checkout"
         )
@@ -228,6 +331,191 @@ def validate_resolved_target_capability(
             "the internal resolved target's assigned name does not encode its claimed unit"
         )
     return cap
+
+
+def _project_gateway_inventory_config(
+    cap: ResolvedHerdrTargetCapability,
+    source_config: TerminalTransportConfig,
+) -> TerminalTransportConfig:
+    """Rejoin a project-gateway capability to one unchanged Herdr runtime."""
+
+    try:
+        target_config = load_repo_local_config(Path(cap.target_repo_root)).terminal_transport
+    except Exception as exc:  # noqa: BLE001 - target config is an IO boundary
+        raise _resolved_target_capability_error(
+            "the project-gateway target transport config is unreadable"
+        ) from exc
+    # Selection and delivery must address the same Herdr runtime.  A target repo
+    # that changed backend (or points at a different future transport config) is
+    # a zero-send rather than a cross-server guess.
+    if (
+        source_config.backend != BACKEND_HERDR
+        or target_config.backend != BACKEND_HERDR
+        or target_config != source_config
+    ):
+        raise _resolved_target_capability_error(
+            "the project-gateway target transport changed before handoff"
+        )
+    return target_config
+
+
+def _resolve_current_capability_row(
+    cap: ResolvedHerdrTargetCapability,
+    inventory_config: TerminalTransportConfig,
+) -> Mapping[str, object]:
+    """Resolve one exact current row and, for project gateway, its generation."""
+
+    try:
+        lister = resolve_agent_lister(inventory_config)
+        if lister is None:
+            raise _resolved_target_capability_error(
+                "herdr backend selected but no agent lister could be resolved"
+            )
+        rows = lister.list_agent_rows()
+    except HerdrSendEntryError:
+        raise
+    except TerminalTransportError as exc:
+        raise HerdrSendEntryError(
+            f"herdr inventory unavailable: {exc}", reason=getattr(exc, "reason", None)
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - inventory is an IO boundary
+        if cap.purpose == PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE:
+            raise _resolved_target_capability_error(
+                "the project-gateway live inventory is unreadable at the send boundary"
+            ) from exc
+        raise
+
+    matches = [
+        row
+        for row in rows
+        if isinstance(row, Mapping) and _norm(row.get(AGENT_KEY_NAME)) == cap.assigned_name
+    ]
+    if len(matches) != 1:
+        raise _resolved_target_capability_error(
+            "the internal resolved target no longer has exactly one live assigned-name row"
+        )
+    row = matches[0]
+    if cap.purpose != PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE:
+        live_locator = _agent_locator(row) or ""
+        if not live_locator or live_locator != cap.locator:
+            raise _resolved_target_capability_error(
+                "the internal resolved target's live locator changed before handoff"
+            )
+        return row
+
+    readable_locator, locator_claims = _locator_claims(row)
+    if (
+        not readable_locator
+        or len(locator_claims) != 1
+        or cap.locator not in locator_claims
+        or not valid_target(cap.locator)
+    ):
+        raise _resolved_target_capability_error(
+            "the internal resolved target's live locator changed or became contradictory"
+        )
+
+    locator_rows = [
+        candidate_row
+        for candidate_row in rows
+        if isinstance(candidate_row, Mapping)
+        and cap.locator in _locator_claims(candidate_row)[1]
+    ]
+    if len(locator_rows) != 1 or locator_rows[0] is not row:
+        raise _resolved_target_capability_error(
+            "the project-gateway resolved target locator is aliased by another live row"
+        )
+
+    # Project-gateway delivery is the generation-bound capability.  Preserve the
+    # existing external-proxy capability's historical behavior by applying these
+    # additional live-row predicates only to the new purpose.
+    if classify_named_slot(row) != SLOT_LIVE:
+        raise _resolved_target_capability_error(
+            "the project-gateway resolved target is no longer a live managed agent"
+        )
+    detected_provider = _norm(row.get("agent"))
+    if not detected_provider or detected_provider != cap.provider:
+        raise _resolved_target_capability_error(
+            "the project-gateway resolved target's detected live provider changed"
+        )
+    live_cwd = _norm(row.get("cwd"))
+    try:
+        canonical_live_cwd = (
+            str(Path(live_cwd).expanduser().resolve()) if live_cwd else ""
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise _resolved_target_capability_error(
+            "the project-gateway resolved target cwd is unreadable at the send boundary"
+        ) from exc
+    if not canonical_live_cwd or canonical_live_cwd != cap.target_cwd:
+        raise _resolved_target_capability_error(
+            "the project-gateway resolved target cwd changed before handoff"
+        )
+    from mozyo_bridge.core.state.herdr_launch_generation import (
+        verified_generation_token,
+    )
+
+    try:
+        live_generation = verified_generation_token(
+            None,
+            assigned_name=cap.assigned_name,
+            workspace_id=cap.workspace_id,
+            role=cap.provider,
+            lane_id=cap.lane_id,
+            locator=cap.locator,
+            norm=_norm,
+            norm_lane=_norm_lane,
+        )
+    except Exception as exc:  # noqa: BLE001 - generation store is an IO boundary
+        raise _resolved_target_capability_error(
+            "the project-gateway launch-generation authority is unreadable"
+        ) from exc
+    if not live_generation or live_generation != cap.generation_token:
+        raise _resolved_target_capability_error(
+            "the project-gateway resolved target generation changed before handoff"
+        )
+    return row
+
+
+def verify_project_gateway_target_effect(
+    capability: object,
+    *,
+    repo_root: Path,
+) -> None:
+    """Re-attest the exact project-gateway generation immediately before an effect.
+
+    The command inventory and target resolver both run earlier admission checks.
+    Handoff planning/startup reads may take time, however, so those checks cannot
+    authorize the later body/Enter effects.  The transport wiring calls this
+    guard immediately before every mutating send primitive.  It re-reads source
+    and target backend config, one exact live row, its detected provider/cwd, and
+    the launch-generation store.  Any drift raises before that primitive runs.
+    """
+
+    if (
+        type(capability) is not ResolvedHerdrTargetCapability
+        or capability.purpose != PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE
+    ):
+        raise _resolved_target_capability_error(
+            "the send-effect guard requires a project-gateway target capability"
+        )
+    cap = validate_resolved_target_capability(
+        capability,
+        repo_root=repo_root,
+        target=capability.assigned_name,
+        target_repo=capability.target_repo_root,
+        target_lane=capability.lane_id,
+        receiver=capability.provider,
+    )
+    try:
+        source_config = load_repo_local_config(
+            Path(repo_root).expanduser().resolve()
+        ).terminal_transport
+    except Exception as exc:  # noqa: BLE001 - source config is an IO boundary
+        raise _resolved_target_capability_error(
+            "the project-gateway source transport config is unreadable"
+        ) from exc
+    inventory_config = _project_gateway_inventory_config(cap, source_config)
+    _resolve_current_capability_row(cap, inventory_config)
 
 
 def _resolve_capability_target(
@@ -250,32 +538,12 @@ def _resolve_capability_target(
         target_lane=target_lane,
         receiver=receiver,
     )
-    try:
-        lister = resolve_agent_lister(config)
-        if lister is None:
-            raise _resolved_target_capability_error(
-                "herdr backend selected but no agent lister could be resolved"
-            )
-        rows = lister.list_agent_rows()
-    except TerminalTransportError as exc:
-        raise HerdrSendEntryError(
-            f"herdr inventory unavailable: {exc}", reason=getattr(exc, "reason", None)
-        ) from exc
-
-    matches = [
-        row
-        for row in rows
-        if isinstance(row, dict) and _norm(row.get(AGENT_KEY_NAME)) == cap.assigned_name
-    ]
-    if len(matches) != 1:
-        raise _resolved_target_capability_error(
-            "the internal resolved target no longer has exactly one live assigned-name row"
-        )
-    live_locator = _agent_locator(matches[0]) or ""
-    if not live_locator or live_locator != cap.locator:
-        raise _resolved_target_capability_error(
-            "the internal resolved target's live locator changed before handoff"
-        )
+    inventory_config = (
+        _project_gateway_inventory_config(cap, config)
+        if cap.purpose == PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE
+        else config
+    )
+    _resolve_current_capability_row(cap, inventory_config)
 
     return {
         "id": cap.locator,
@@ -286,7 +554,21 @@ def _resolve_capability_target(
         "agent_role": "",
         "workspace_id": cap.workspace_id,
         "lane_id": _norm_lane(cap.lane_id),
-        "cwd": str(Path(repo_root).expanduser().resolve()),
+        "cwd": (
+            cap.target_cwd
+            if cap.purpose == PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE
+            else str(Path(repo_root).expanduser().resolve())
+        ),
+        "project_scope": (
+            cap.project_scope
+            if cap.purpose == PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE
+            else ""
+        ),
+        "project_path": (
+            cap.project_path
+            if cap.purpose == PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE
+            else ""
+        ),
         "herdr_assigned_name": cap.assigned_name,
         # An external proxy is intentionally NOT represented as a lane sender.  The proxy's
         # durable decision/fence authority is upstream; these fields stay empty so no downstream
@@ -701,11 +983,13 @@ __all__ = (
     "HerdrSendEntryError",
     "HerdrExplicitTargetMismatchError",
     "EXPLICIT_TARGET_MISMATCH_OUTCOME_REASON",
+    "PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE",
     "RESOLVED_TARGET_CAPABILITY_PURPOSE",
     "RESOLVED_TARGET_CAPABILITY_MISMATCH",
     "RESOLVED_TARGET_CAPABILITY_ARG",
     "ResolvedHerdrTargetCapability",
     "validate_resolved_target_capability",
+    "verify_project_gateway_target_effect",
     "explicit_tmux_pane_target",
     "herdr_backend_selected",
     "herdr_effective_backend_selected",

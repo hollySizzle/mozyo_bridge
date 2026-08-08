@@ -33,6 +33,14 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     ChildIntakeRouteError,
     resolve_child_intake_route,
 )
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.project_gateway_backend_inventory import (
+    ProjectGatewayInventoryError,
+    SELECT_CHILD_INTAKE,
+    discover_project_gateway_inventory,
+    normalize_child_intake_caller,
+    prepare_project_gateway_delivery,
+    render_inventory_error,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli_handoff_ticketless import (
     _add_ticketless_delivery_options,
 )
@@ -53,7 +61,13 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.
 from mozyo_bridge.shared.errors import die
 
 
-def _discover_candidates() -> list:
+def _discover_candidates(
+    *,
+    repo_root: str | None = None,
+    project_scope: str | None = None,
+    provider: str = AGENT_KIND_CODEX,
+    session: str | None = None,
+) -> list:
     """All classified target candidates across every session (no pre-filter).
 
     Mirrors ``cli_project_gateway._discover_candidates`` (kept local to avoid an
@@ -61,7 +75,15 @@ def _discover_candidates() -> list:
     same-lane / child resolver applies the role / repo / project / session
     predicates itself and its near-miss reasons stay visible. Patched in tests.
     """
-    return _agents_target_candidates(argparse.Namespace(agent=None, session=None))
+    if repo_root is None or project_scope is None:
+        return _agents_target_candidates(argparse.Namespace(agent=None, session=None))
+    return discover_project_gateway_inventory(
+        repo_root=repo_root,
+        project_scope=project_scope,
+        provider=provider,
+        session=session,
+        selector=SELECT_CHILD_INTAKE,
+    )
 
 
 def cmd_project_gateway_child_intake(args: argparse.Namespace) -> int:
@@ -95,8 +117,6 @@ def cmd_project_gateway_child_intake(args: argparse.Namespace) -> int:
     ``callback_to_role=project_gateway``). The worker-dispatch Redmine-anchor gate is
     NOT relaxed (this rail forwards a work-intake only; no anchor, no dispatch token).
     """
-    require_tmux()
-
     # The child / implementation gateway is a Codex coordinator unit (the same live
     # identity as the project gateway). The grandchild worker (Claude) is reached
     # only after the child mints a Redmine anchor, so a direct project-Claude
@@ -142,12 +162,23 @@ def cmd_project_gateway_child_intake(args: argparse.Namespace) -> int:
         )
 
     try:
+        inventory = _discover_candidates(
+            repo_root=args.target_repo,
+            project_scope=args.target_project,
+            provider=args.to,
+            session=getattr(args, "gateway_session", None),
+        )
+        caller_pane = normalize_child_intake_caller(inventory, caller_pane)
         route = resolve_child_intake_route(
-            _discover_candidates(),
+            inventory,
             repo_root=args.target_repo,
             project_scope=args.target_project,
             caller_pane=caller_pane,
             session=getattr(args, "gateway_session", None),
+        )
+    except ProjectGatewayInventoryError as exc:
+        return render_inventory_error(
+            exc, as_json=getattr(args, "as_json", False)
         )
     except ChildIntakeRouteError as exc:
         die(str(exc))
@@ -192,7 +223,23 @@ def cmd_project_gateway_child_intake(args: argparse.Namespace) -> int:
     # Inject the resolved CHILD pane and the forward work-intake payload, then
     # delegate to the gated no-anchor orchestrator. The repo + project gates in
     # orchestrate_handoff re-verify the resolved pane before any send.
-    args.target = route.selected.pane_id
+    try:
+        prepared = prepare_project_gateway_delivery(inventory, route.selected)
+    except ProjectGatewayInventoryError as exc:
+        return render_inventory_error(
+            exc, as_json=getattr(args, "as_json", False)
+        )
+    args.target = prepared.target
+    if prepared.target_repo:
+        args.target_repo = prepared.target_repo
+    if prepared.target_lane:
+        args.target_lane = prepared.target_lane
+    if prepared.capability is not None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
+            RESOLVED_TARGET_CAPABILITY_ARG,
+        )
+
+        setattr(args, RESOLVED_TARGET_CAPABILITY_ARG, prepared.capability)
     # Redmine #12748: the forward work-intake payload, built programmatically (not
     # operator-typed) so it is product evidence, not a hand-asserted role payload.
     # The parent forwards a work shape, names that the child (delegated_coordinator)

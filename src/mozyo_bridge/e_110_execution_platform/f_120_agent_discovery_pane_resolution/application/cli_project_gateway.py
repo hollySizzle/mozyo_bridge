@@ -63,6 +63,14 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     cockpit_visible_from_candidate,
     resolve_relative_route,
 )
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.project_gateway_backend_inventory import (
+    ProjectGatewayInventoryError,
+    SELECT_CHILD_ROUTE,
+    SELECT_GATEWAY,
+    SELECT_NONE,
+    prepare_project_gateway_delivery,
+    render_inventory_error,
+)
 # Redmine #12751: the resolve / consult handler bodies moved to bounded sibling
 # modules, but the pre-split public import surface of this module included the
 # `cmd_project_gateway_resolve` / `cmd_project_gateway_consult` handler symbols
@@ -100,6 +108,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
     ROLE_GRANDPARENT_COORDINATOR,
+    ROLE_PROJECT_GATEWAY,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import (
     require_tmux,
@@ -175,10 +184,21 @@ def cmd_project_gateway_adopt(args: argparse.Namespace) -> int:
     launch is the named ``start_project_gateway`` command (cockpit), and delivery
     to an adopted gateway stays ``project-gateway handoff``.
     """
-    require_tmux()
+    try:
+        inventory = _discover_candidates(
+            repo_root=args.repo,
+            project_scope=args.project,
+            provider=AGENT_KIND_CODEX,
+            session=getattr(args, "session", None),
+            selector=SELECT_GATEWAY,
+        )
+    except ProjectGatewayInventoryError as exc:
+        return render_inventory_error(
+            exc, as_json=getattr(args, "as_json", False)
+        )
     identity = _gateway_identity(args.repo, args.project)
     decision = resolve_launch_or_adopt(
-        _discover_candidates(),
+        inventory,
         identity,
         session=getattr(args, "session", None),
     )
@@ -283,8 +303,6 @@ def cmd_project_gateway_handoff(args: argparse.Namespace) -> int:
     :func:`orchestrate_handoff`, where the Git repo + project-scope gates re-verify
     the pane before delivery.
     """
-    require_tmux()
-
     # The project gateway role is codex (design doc `role="codex"` route). This
     # command must NOT direct-send to the project Claude worker: the root ->
     # project gateway -> implementation worker boundary requires the gateway
@@ -325,7 +343,19 @@ def cmd_project_gateway_handoff(args: argparse.Namespace) -> int:
         role=args.to,
         session=getattr(args, "gateway_session", None),
     )
-    resolution = resolve_project_gateway(_discover_candidates(), route)
+    try:
+        inventory = _discover_candidates(
+            repo_root=args.target_repo,
+            project_scope=args.target_project,
+            provider=args.to,
+            session=getattr(args, "gateway_session", None),
+            selector=SELECT_GATEWAY,
+        )
+    except ProjectGatewayInventoryError as exc:
+        return render_inventory_error(
+            exc, as_json=getattr(args, "as_json", False)
+        )
+    resolution = resolve_project_gateway(inventory, route)
 
     if resolution.status != STATUS_FOUND or resolution.selected is None:
         # Fail closed; do not deliver. Reuse the shared pure renderer over the
@@ -337,7 +367,23 @@ def cmd_project_gateway_handoff(args: argparse.Namespace) -> int:
 
     # Inject the resolved pane and delegate to the gated handoff orchestrator. The
     # repo + project gates in orchestrate_handoff re-verify the resolved pane.
-    args.target = resolution.selected.pane_id
+    try:
+        prepared = prepare_project_gateway_delivery(inventory, resolution.selected)
+    except ProjectGatewayInventoryError as exc:
+        return render_inventory_error(
+            exc, as_json=getattr(args, "as_json", False)
+        )
+    args.target = prepared.target
+    if prepared.target_repo:
+        args.target_repo = prepared.target_repo
+    if prepared.target_lane:
+        args.target_lane = prepared.target_lane
+    if prepared.capability is not None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
+            RESOLVED_TARGET_CAPABILITY_ARG,
+        )
+
+        setattr(args, RESOLVED_TARGET_CAPABILITY_ARG, prepared.capability)
     # Redmine #12706: this command IS the grandparent (department-root) ->
     # project-gateway transition, so auto-inject the grandparent_coordinator
     # boundary onto the standard transition payload only now — after a successful
@@ -373,9 +419,27 @@ def cmd_project_gateway_route_plan(args: argparse.Namespace) -> int:
     evidence; for the implementation worker it returns the anchor-gated dispatch
     contract (a worker is never launched as a cockpit gateway).
     """
-    require_tmux()
+    selector = (
+        SELECT_GATEWAY
+        if args.from_role == ROLE_GRANDPARENT_COORDINATOR
+        else SELECT_CHILD_ROUTE
+        if args.from_role == ROLE_PROJECT_GATEWAY
+        else SELECT_NONE
+    )
+    try:
+        inventory = _discover_candidates(
+            repo_root=args.repo,
+            project_scope=args.project,
+            provider=AGENT_KIND_CODEX,
+            session=getattr(args, "session", None),
+            selector=selector,
+        )
+    except ProjectGatewayInventoryError as exc:
+        return render_inventory_error(
+            exc, as_json=getattr(args, "as_json", False)
+        )
     plan = resolve_relative_route(
-        _discover_candidates(),
+        inventory,
         caller_role=args.from_role,
         repo_root=args.repo,
         project_scope=args.project,

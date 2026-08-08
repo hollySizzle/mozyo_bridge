@@ -64,9 +64,12 @@ from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.
     RepoLocalConfigError,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
+    PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
     RESOLVED_TARGET_CAPABILITY_ARG,
+    ResolvedHerdrTargetCapability,
     explicit_tmux_pane_target,
     validate_resolved_target_capability,
+    verify_project_gateway_target_effect,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.transport_binding import (
     TransportBinding,
@@ -80,7 +83,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
     BACKEND_HERDR,
+    REASON_TRANSPORT_ERROR,
     TerminalTransportError,
+    TransportResult,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_rail import (
     HerdrTurnStartRail,
@@ -195,6 +200,146 @@ def _resolve_herdr_binding(
         raise AssertionError("unreachable")
 
 
+class _ProjectGatewayEffectGuardTransport:
+    """Guard a standard-rail transport immediately before each mutating effect.
+
+    ``HerdrTurnStartRail`` is intentionally transport-injected.  Wiring replaces
+    only that injected port for the internal project-gateway capability; reads,
+    state snapshots, waits, and every non-project send remain unchanged.  A
+    generation/provider/backend drift becomes ``transport_error`` before the
+    delegate sees body bytes or keys, preserving the rail's structured
+    ``inject_failed`` zero-send path.
+    """
+
+    def __init__(self, delegate: object, verifier: Callable[[], None]) -> None:
+        self._delegate = delegate
+        self._verifier = verifier
+        self.backend = getattr(delegate, "backend", BACKEND_HERDR)
+
+    def _guard(self) -> Optional[TransportResult]:
+        try:
+            self._verifier()
+        except Exception:  # noqa: BLE001 - any attestation failure blocks the effect
+            return TransportResult.failure(
+                REASON_TRANSPORT_ERROR,
+                "project-gateway target capability changed before the send effect",
+            )
+        return None
+
+    def send_text(self, target: str, text: str) -> TransportResult:
+        refused = self._guard()
+        if refused is not None:
+            return refused
+        return self._delegate.send_text(target, text)
+
+    def send_keys(self, target: str, keys: str) -> TransportResult:
+        refused = self._guard()
+        if refused is not None:
+            return refused
+        return self._delegate.send_keys(target, keys)
+
+    def __getattr__(self, name: str):
+        # Read-only capabilities such as ``read_pane`` / ``read_pane_render``
+        # remain the exact resolved transport implementation.
+        return getattr(self._delegate, name)
+
+
+def _guard_project_gateway_binding_effects(
+    binding: TransportBinding,
+    verifier: Callable[[], None],
+) -> TransportBinding:
+    """Guard each non-standard shim send effect before it reaches the binding."""
+
+    unguarded_run_tmux = binding.run_tmux
+
+    def guarded_run_tmux(*args: str, check: bool = True):
+        # Every mapped Herdr mutation enters through ``send-keys -t``: body,
+        # Enter, or C-u rollback.  Re-attest before each one so a generation swap
+        # cannot inherit a later key effect after an earlier body check.
+        if len(args) >= 3 and args[0] == "send-keys" and args[1] == "-t":
+            try:
+                verifier()
+            except Exception as exc:  # noqa: BLE001 - effect guard is fail-closed
+                raise TransportBindingError(
+                    "project-gateway target capability changed before the send effect"
+                ) from exc
+        return unguarded_run_tmux(*args, check=check)
+
+    return TransportBinding(
+        backend=binding.backend,
+        run_tmux=guarded_run_tmux,
+        capture_pane=binding.capture_pane,
+    )
+
+
+def _guard_project_gateway_standard_rail_effects(
+    rail: HerdrTurnStartRail,
+    verifier: Callable[[], None],
+) -> HerdrTurnStartRail:
+    """Install the effect guard on the standard rail's injected transport port."""
+
+    transport = getattr(rail, "_transport", None)
+    if transport is None:
+        raise TransportBindingError(
+            "project-gateway send rail exposes no transport effect boundary; refusing to send"
+        )
+    rail._transport = _ProjectGatewayEffectGuardTransport(transport, verifier)
+    return rail
+
+
+def _project_gateway_capability(
+    args: argparse.Namespace,
+) -> Optional[ResolvedHerdrTargetCapability]:
+    """Return the exact internal project-gateway capability, if present."""
+
+    capability = getattr(args, RESOLVED_TARGET_CAPABILITY_ARG, None)
+    if (
+        type(capability) is ResolvedHerdrTargetCapability
+        and capability.purpose == PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE
+    ):
+        return capability
+    return None
+
+
+def _require_project_gateway_herdr_transport_frame(
+    args: argparse.Namespace,
+    source_config,
+) -> Optional[ResolvedHerdrTargetCapability]:
+    """Refuse a project capability before any source-to-target backend fallback.
+
+    Project-gateway inventory is selected from ``--target-repo`` while the legacy
+    handoff decorator selects its rail from the sender repo.  Until those configs
+    are proven to name the same Herdr backend, the capability must never fall
+    through to the sender's tmux default.  The send-effect verifier repeats this
+    backend join immediately before every later mutation.
+    """
+
+    capability = _project_gateway_capability(args)
+    if capability is None:
+        return None
+    try:
+        target_config = load_repo_local_config(
+            Path(capability.target_repo_root)
+        ).terminal_transport
+    except Exception:  # noqa: BLE001 - target config is an IO boundary
+        die(
+            "project-gateway target transport config is unreadable; refusing a "
+            "cross-backend fallback before delivery"
+        )
+        raise AssertionError("unreachable")
+    if (
+        source_config.backend != BACKEND_HERDR
+        or target_config.backend != BACKEND_HERDR
+        or target_config != source_config
+    ):
+        die(
+            "project-gateway sender/target terminal backends do not resolve to the "
+            "same Herdr transport; refusing cross-backend fallback before delivery"
+        )
+        raise AssertionError("unreachable")
+    return capability
+
+
 def resolve_handoff_transport_binding(
     args: argparse.Namespace,
 ) -> Optional[TransportBinding]:
@@ -212,12 +357,20 @@ def resolve_handoff_transport_binding(
     unconfigured / unresolvable, the sender identity is un-attested, or the receiver
     does not resolve to a single live agent (never a silent tmux fallback).
     """
+    capability = _project_gateway_capability(args)
     try:
         config = load_repo_local_config(repo_root_from_args(args)).terminal_transport
     except RepoLocalConfigError:
+        if capability is not None:
+            die(
+                "project-gateway sender transport config is unreadable; refusing a "
+                "cross-backend fallback before delivery"
+            )
+            raise AssertionError("unreachable")
         # A present-but-broken / unreadable config is "no usable selection", not a
         # herdr opt-in — resolve to the tmux default rather than failing the send.
         return None
+    _require_project_gateway_herdr_transport_frame(args, config)
     if config.backend != BACKEND_HERDR:
         return None
     # Redmine #13320 (a-narrow, j#73114): an explicit tmux `%pane` target routes on
@@ -252,10 +405,18 @@ def resolve_handoff_transport_runtime(
     herdr+standard branch in ``orchestrate_handoff`` — queue-enter / pending herdr
     sends ignore it and stay on the shim-backed choreography (decision 5).
     """
+    capability = _project_gateway_capability(args)
     try:
         config = load_repo_local_config(repo_root_from_args(args)).terminal_transport
     except RepoLocalConfigError:
+        if capability is not None:
+            die(
+                "project-gateway sender transport config is unreadable; refusing a "
+                "cross-backend fallback before delivery"
+            )
+            raise AssertionError("unreachable")
         return None, None
+    _require_project_gateway_herdr_transport_frame(args, config)
     if config.backend != BACKEND_HERDR:
         return None, None
     # Redmine #13320 (a-narrow, j#73114): the decorator's branch point. An explicit
@@ -276,6 +437,22 @@ def resolve_handoff_transport_runtime(
     except TerminalTransportError as exc:
         die(f"terminal transport backend 'herdr' is selected but unavailable: {exc}")
         raise AssertionError("unreachable")
+    resolved_target_capability = capability
+    if resolved_target_capability is not None:
+        repo_root = Path(repo_root_from_args(args)).expanduser().resolve()
+        verifier = functools.partial(
+            verify_project_gateway_target_effect,
+            resolved_target_capability,
+            repo_root=repo_root,
+        )
+        binding = _guard_project_gateway_binding_effects(binding, verifier)
+        if rail is None:
+            die(
+                "project-gateway capability resolved under Herdr but no standard send rail "
+                "was installed; refusing to send"
+            )
+            raise AssertionError("unreachable")
+        rail = _guard_project_gateway_standard_rail_effects(rail, verifier)
     return binding, rail
 
 

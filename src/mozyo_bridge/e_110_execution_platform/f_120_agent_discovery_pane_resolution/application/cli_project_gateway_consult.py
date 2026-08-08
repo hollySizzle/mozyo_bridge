@@ -38,6 +38,13 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     _route_from_args,
     render_gateway_resolution,
 )
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.project_gateway_backend_inventory import (
+    ProjectGatewayInventoryError,
+    SELECT_GATEWAY,
+    discover_project_gateway_inventory,
+    prepare_project_gateway_delivery,
+    render_inventory_error,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli_handoff_ticketless import (
     _add_ticketless_delivery_options,
 )
@@ -55,7 +62,13 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.
 from mozyo_bridge.shared.errors import die
 
 
-def _discover_candidates() -> list:
+def _discover_candidates(
+    *,
+    repo_root: str | None = None,
+    project_scope: str | None = None,
+    provider: str = AGENT_KIND_CODEX,
+    session: str | None = None,
+) -> list:
     """All classified target candidates across every session (no pre-filter).
 
     Mirrors ``cli_project_gateway_resolve._discover_candidates`` (kept local to
@@ -64,7 +77,15 @@ def _discover_candidates() -> list:
     applies the role / repo / project / session predicates itself and its
     near-miss reasons stay visible. Patched in tests.
     """
-    return _agents_target_candidates(argparse.Namespace(agent=None, session=None))
+    if repo_root is None or project_scope is None:
+        return _agents_target_candidates(argparse.Namespace(agent=None, session=None))
+    return discover_project_gateway_inventory(
+        repo_root=repo_root,
+        project_scope=project_scope,
+        provider=provider,
+        session=session,
+        selector=SELECT_GATEWAY,
+    )
 
 
 def cmd_project_gateway_consult(args: argparse.Namespace) -> int:
@@ -91,8 +112,6 @@ def cmd_project_gateway_consult(args: argparse.Namespace) -> int:
     consultation_callback`` (#12703 / #12705 / #12737). Fails closed (no delivery,
     no payload injected) when no unique project gateway exists.
     """
-    require_tmux()
-
     # Same boundary as `project-gateway handoff`: the gateway is a Codex unit. The
     # implementation worker (Claude) is reached only after the gateway mints a
     # Redmine anchor, so a direct project-Claude consultation send is forbidden.
@@ -130,7 +149,18 @@ def cmd_project_gateway_consult(args: argparse.Namespace) -> int:
         role=args.to,
         session=getattr(args, "gateway_session", None),
     )
-    resolution = resolve_project_gateway(_discover_candidates(), route)
+    try:
+        inventory = _discover_candidates(
+            repo_root=args.target_repo,
+            project_scope=args.target_project,
+            provider=args.to,
+            session=getattr(args, "gateway_session", None),
+        )
+    except ProjectGatewayInventoryError as exc:
+        return render_inventory_error(
+            exc, as_json=getattr(args, "as_json", False)
+        )
+    resolution = resolve_project_gateway(inventory, route)
 
     if resolution.status != STATUS_FOUND or resolution.selected is None:
         # Fail closed; do not deliver and inject no forward-consultation payload.
@@ -143,7 +173,23 @@ def cmd_project_gateway_consult(args: argparse.Namespace) -> int:
     # Inject the resolved pane and the forward-consultation payload, then delegate
     # to the gated no-anchor orchestrator. The repo + project gates in
     # orchestrate_handoff re-verify the resolved pane before any send.
-    args.target = resolution.selected.pane_id
+    try:
+        prepared = prepare_project_gateway_delivery(inventory, resolution.selected)
+    except ProjectGatewayInventoryError as exc:
+        return render_inventory_error(
+            exc, as_json=getattr(args, "as_json", False)
+        )
+    args.target = prepared.target
+    if prepared.target_repo:
+        args.target_repo = prepared.target_repo
+    if prepared.target_lane:
+        args.target_lane = prepared.target_lane
+    if prepared.capability is not None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
+            RESOLVED_TARGET_CAPABILITY_ARG,
+        )
+
+        setattr(args, RESOLVED_TARGET_CAPABILITY_ARG, prepared.capability)
     # Redmine #12706 / #12700: this command IS the grandparent (department-root) ->
     # project-gateway transition, so auto-inject the grandparent_coordinator
     # transition boundary and workflow-contract bundle on `found` (the operator
