@@ -222,8 +222,8 @@ def configure_ticketless_callback_parser(parser_: argparse.ArgumentParser) -> No
         choices=list(READ_CONTRACT_TOKENS),
         help=(
             "Which workflow-contract set governed this result "
-            "(`grandparent_coordinator` / `project_gateway`); resolvable via the "
-            "#12700 workflow contract refs / #12706 transition role payload tokens."
+            "(`grandparent_coordinator` / `project_gateway` / `coordinator`); "
+            "resolvable via the workflow contract refs."
         ),
     )
     parser_.add_argument(

@@ -377,6 +377,18 @@ class CompletionHookTest(unittest.TestCase):
         # completed -> the next reserve mints a fresh generation.
         self.assertTrue(self.fence.reserve(self.route).won)
 
+    def test_coordinator_callback_completes_managed_gateway_forward(self):
+        route = ForwardRouteKey(
+            WS, "default", "coordinator", "delegated_coordinator", "infra-platform"
+        )
+        reserved = self.fence.reserve(route)
+        self.assertTrue(reserved.won)
+        self.assertTrue(self.fence.mark_delivered(route, reserved.action_id))
+        self.assertTrue(
+            self._call(action_id=reserved.action_id, read_contract="coordinator")
+        )
+        self.assertTrue(self.fence.reserve(route).won)
+
     def test_failed_delivery_does_not_complete(self):
         self.assertFalse(self._call(action_id=self.action_id, delivered=False))
         self.assertFalse(self.fence.reserve(self.route).won)  # still delivered / active

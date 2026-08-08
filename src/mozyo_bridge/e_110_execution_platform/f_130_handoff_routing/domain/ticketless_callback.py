@@ -136,12 +136,16 @@ CALLBACK_REASONS: tuple[str, ...] = (
 )
 
 # --- Read-contract tokens: which workflow-contract set the receiver should have
-# read / re-read. Pinned to the #12700 / #12706 transition-role tokens so a
-# receiver can resolve the named contract bundle (the callback names WHICH
-# contract governed the result, not a doc body). ---
+# read / re-read. The two legacy transition-role tokens remain accepted; the
+# provider-neutral ``coordinator`` role is also a first-class workflow contract
+# for the Herdr coordinator -> delegated-coordinator leg. The callback names
+# WHICH contract governed the result, not a doc body. Kept literal here instead
+# of importing the later f_140 feature into this f_130 domain module.
+ROLE_COORDINATOR = "coordinator"
 READ_CONTRACT_TOKENS: tuple[str, ...] = (
     ROLE_GRANDPARENT_COORDINATOR,
     ROLE_PROJECT_GATEWAY,
+    ROLE_COORDINATOR,
 )
 
 
