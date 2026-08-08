@@ -260,12 +260,17 @@ enable を拒否するか、unpinned fetch を追認するかのどちらかに�
 | `agent_input_writer` | agent input へ書き、handoff rail と durable anchor を迂回する | deny `agent_input_writer` |
 | `unknown` | この identity を review していない。**fail-closed の既定** | deny `unreviewed_pin` |
 
-### ★allow は commit pin、deny は repository scope (非対称は意図的)
+### ★allow は subdir + commit pin + manifest digest、deny は repository scope (非対称は意図的)
 
-- **allow は exact `(kind, owner, repo, commit)` に固定する。** 「この code は安全」は読んだ
-  bytes についての言明である。repository 単位の allow は upstream の**将来の全 commit**へ
-  黙って延長され、それこそが本 policy の塞ぐべき穴になる。review 済み以外の commit は
-  `unknown` に落ちて deny される。
+- **allow は exact `(kind, owner, repo, subdir, commit)` と、現在inventoryが返した実行可能
+  manifest面のdigestに固定する。** 「この code は安全」は読んだbytesとreviewしたmanifest面についての
+  言明である。repository 単位の allow は upstream の**将来の全 commit**へ
+  黙って延長され、同じrepositoryの別pluginまで許可する。Herdr 0.8 inventoryの
+  `source.subdir` と `resolved_commit` を別々に読み、root・sibling・child-prefix・別commitは
+  すべて `unknown` に落としてdenyする。install後にmanifestのcommandやhookが変わった場合も、
+  source metadataだけが以前のpinを名乗り続けてもdigest不一致でdenyする。
+- GitHubのowner / repoはASCII lowercaseへ正規化して比較する。GitHub上で同一repositoryを指す
+  大文字小文字違いを、別のallowやrepository-wide denyとして扱わない。
 - **deny は `(kind, owner, repo)` に固定する (commit なし)。** `herdr-reviewr` が不可なのは
   *project* が agent input へ書くからで、新しい commit がそれをやめるわけではない。commit 単位の
   deny は「誰も見ていない commit を install する」ことで迂回でき (それも `unknown` で deny される
@@ -278,6 +283,7 @@ enable を拒否するか、unpinned fetch を追認するかのどちらかに�
 
 | plugin | ref | class | build provenance | enable | install |
 |---|---|---|---|---|---|
+| `mozyo.unit-board` | `hollySizzle/mozyo_bridge/herdr-plugins/mozyo-unit-board` + commit pin `aa39b4c9…` | `ux_only` | `no_build` | admit | admit |
 | `smarzban/herdr-file-viewer` | commit pin `96fcc0a2…` | `ux_only` | `remote_artifact_same_origin_checksum` | admit | deny `unpinned_remote_build` |
 | `yuk1ty/herdr-spreader` | repository | `test_oracle` | `unreviewed_build_provenance` | deny `no_lane_authority` | deny `unreviewed_build` |
 | `persiyanov/herdr-reviewr` | repository | `agent_input_writer` | `remote_artifact_same_origin_checksum` | deny `agent_input_writer` | deny `unpinned_remote_build` |
@@ -299,6 +305,9 @@ mozyo-bridge herdr plugin-policy --from-json ./captured-plugin-list.json
 mozyo-bridge herdr plugin-policy --plan-enable herdr-file-viewer
 
 # PLAN INSTALL: install を実行してよいかだけ答える。install はしない。
+mozyo-bridge herdr plugin-policy \
+    --plan-install hollySizzle/mozyo_bridge/herdr-plugins/mozyo-unit-board \
+    --ref aa39b4c9e9c3f43bf054649916a4803bb9a75c7f
 mozyo-bridge herdr plugin-policy --plan-install smarzban/herdr-file-viewer \
     --ref 96fcc0a2bdd2727ec88c38f8c8806f97b7ca0ea0
 ```
@@ -312,23 +321,25 @@ breach ではない** (policy が機能している状態)。enable 済み か�
 
 | reason | 意味 |
 |---|---|
-| `unpinned_source` | exact な upstream commit が無い (`plugin link` の local、非 `github` kind、欠落 / 不正な commit、malformed な owner/repo)。**abbreviated commit は identity ではない**ので pin としては拒否する |
+| `unpinned_source` | exact な upstream subdir + commit identity が無い (`plugin link` の local、非 `github` kind、欠落 / 不正な commit、malformed な owner/repo/subdir)。**abbreviated commit は identity ではない**ので pin としては拒否する |
 | `unreviewed_pin` | source は pin されているが、**その identity** を review した記録が無い |
 | `identity_mismatch` | pin は review 済みだが、local manifest が別の `plugin_id` を名乗る |
-| `manifest_drift` | local manifest の `[[build]]` の有無が review 記録と食い違う。**commit pin が固定するのは upstream が publish した内容であって、install 後に operator の plugin directory に置かれた bytes ではない** |
+| `manifest_drift` | 現在の正規化済みmanifest capability digestがreview記録と食い違う。比較面はminimum Herdr version、platform、build、startup、action、event、pane、link handler。command文字列自体はreportへ出さない。**commit pinだけではinstall後にdisk上のmanifestが差し替わった場合を固定できない** |
+| `manifest_unavailable` | Herdr が manifest warning を返し、現在実行される面をclean reloadから完全に確立できない。plugin identityは読めるため、そのplugin固有のdenyとして保持する |
 | `agent_input_writer` | agent input へ書く |
 | `no_lane_authority` | test oracle として認識済み。live lane に対する authority を持たない |
 | `unpinned_remote_build` | `[[build]]` が remote artifact を download し、その整合性証明が同一 origin からしか得られない |
 | `unreviewed_build` | `[[build]]` が何を実行するかを review が確立していない |
-| `malformed_record` | plugin record として読めない。**読み飛ばさず**報告し、report を fail させる |
-| `inventory_incomplete` | inventory に読めない record が 1 件以上ある。**enable plan は残りから答えを作らない** |
+| `malformed_record` | plugin record として読めない。未知のtop-level fieldまたは正規化不能なcapability値もこの分類になる。**読み飛ばさず**報告し、report を fail させる |
+| `inventory_incomplete` | inventory に `malformed_record` が 1 件以上ある。**enable plan は残りから答えを作らず**、plugin固有verdictより先にこのreasonで拒否する |
 | `ambiguous_target` | 同一 `plugin_id` に複数の installed plugin が該当する。先頭一致で黙って解決しない |
 | `target_not_installed` | 該当 `plugin_id` の plugin が無い |
 | `invalid_target_id` | operand が bounded identifier でない。**生値は echo しない**（closed token で表示） |
 
-### ★abbreviated commit は pin を壊すが repository identity は壊さない
+### ★malformed commit・subdir は pin を壊すが repository deny は壊さない
 
-`(kind, owner, repo)` が valid なら、commit が不正でも **repository-scoped reference は保持する**。
+`(kind, owner, repo)` が valid なら、commitまたはsubdirが不正でも
+**repository-scoped reference は保持する**。
 これが無いと、abbreviated commit を与えられた `reviewr` が `agent_input_writer` ではなく
 `unknown` に落ち、**deny は残るのに class も reason も真でなくなる** — repository-scoped deny を
 置いた目的そのものが失われる。deny の理由が間違っている deny は、自分を説明しなくなった deny
@@ -336,9 +347,16 @@ breach ではない** (policy が機能している状態)。enable 済み か�
 unpinned identity では成立しない**（file-viewer に abbreviated commit を与えると
 `unpinned_source` で deny）。
 
+subdirは相対segment列として閉じ、空segment、`.`、`..`、絶対path、backslash、control、
+非文字列、長すぎるsegment、深すぎる列を拒否する。拒否時にroot pluginのallowへfallbackしては
+ならない。commitとsubdirを落とした`repo_key`だけがrepository-wide denyを解決する。
+
 reference の構築は `source_ref_from_parts` **1 つ**で、observed inventory と operator が
 名指した候補の両方が通る。以前は候補側にだけ「pinned 失敗 → repository へ fallback」があり、
 observed 側に無かった。**同じ概念を 2 箇所で書くと、片方だけが古くなる。**
+
+`--plan-enable` / `--plan-install` はflagの**存在**でmodeを決める。空文字を「flagなし」と同じに
+扱ってstatusへfallbackしてはならず、invalid operandとしてnon-zero・inventory未取得で拒否する。
 
 ### enable plan は「答えが一意に定まらない」全経路で fail-closed
 

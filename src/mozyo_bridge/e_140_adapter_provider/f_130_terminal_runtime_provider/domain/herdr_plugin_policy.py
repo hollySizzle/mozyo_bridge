@@ -58,12 +58,15 @@ Boundary (enforced in code, not merely asserted here):
 The registry is asymmetric on purpose, because the two directions have opposite
 failure modes.
 
-An **allow** is keyed on the exact ``(kind, owner, repo, commit)`` pin. A review
-that concluded "this code is safe" is a statement about the bytes that were read.
+An **allow** is keyed on the exact ``(kind, owner, repo, subdir, commit)`` pin and
+the reviewed normalized manifest-capability digest. A review that concluded
+"this code is safe" is a statement about the bytes and executable manifest surface
+that were read. GitHub owner/repository spelling is ASCII-lowercased before lookup.
 An allow keyed on the repository alone would silently extend to every future
 upstream commit, which is precisely the supply-chain hole the policy exists to
-close. A plugin observed at any other commit resolves to
-:data:`CLASS_UNKNOWN` and is denied.
+close. A plugin observed at any other commit resolves to :data:`CLASS_UNKNOWN` and
+is denied. The same pin with a different current manifest remains identifiable,
+but both admission axes are denied as ``manifest_drift``.
 
 A **deny** is keyed on the repository ``(kind, owner, repo)``, with no commit. The
 reason ``herdr-reviewr`` is inadmissible is that the *project* writes into agent
@@ -191,6 +194,9 @@ REASON_IDENTITY_MISMATCH = "identity_mismatch"
 #: fixes what upstream published; it does not fix the bytes sitting in the
 #: operator's plugin directory after install.
 REASON_MANIFEST_DRIFT = "manifest_drift"
+#: Herdr could not reload the current manifest cleanly.  The cached source pin is
+#: not evidence for commands that could not be observed from the current file.
+REASON_MANIFEST_UNAVAILABLE = "manifest_unavailable"
 #: The plugin writes into agent input.
 REASON_AGENT_INPUT_WRITER = "agent_input_writer"
 #: Recognized as a test oracle / reference schema, which carries no lane authority.
@@ -221,6 +227,7 @@ DENY_REASONS: frozenset[str] = frozenset(
         REASON_UNREVIEWED_PIN,
         REASON_IDENTITY_MISMATCH,
         REASON_MANIFEST_DRIFT,
+        REASON_MANIFEST_UNAVAILABLE,
         REASON_AGENT_INPUT_WRITER,
         REASON_NO_LANE_AUTHORITY,
         REASON_UNPINNED_REMOTE_BUILD,
@@ -274,6 +281,7 @@ class ReviewedPlugin:
     build_provenance: str
     review_anchor: str
     rationale: str
+    manifest_digest: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.plugin_class not in PLUGIN_CLASSES:
@@ -305,11 +313,27 @@ class ReviewedPlugin:
         # happens to pick up — the exact assumption that failed in j#92141 F1.
         require_renderable_field(self.review_anchor, "review anchor")
         require_renderable_field(self.rationale, "rationale")
+        if self.manifest_digest is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", self.manifest_digest
+        ):
+            raise HerdrPluginPolicyError(
+                "reviewed manifest digest must be a 64-character lowercase SHA-256"
+            )
+        if self.plugin_class not in DENY_CLASSES and self.manifest_digest is None:
+            raise HerdrPluginPolicyError(
+                "an enable-capable exact review needs the normalized manifest "
+                "capability digest it approved"
+            )
         if not self.ref.is_pinned and self.plugin_class not in DENY_CLASSES:
             raise HerdrPluginPolicyError(
                 f"a repository-scoped entry may only carry a deny class "
                 f"{sorted(DENY_CLASSES)}; {self.plugin_class!r} would extend an allow "
                 f"to every future commit of {self.ref.describe()}"
+            )
+        if not self.ref.is_pinned and self.ref.subdir:
+            raise HerdrPluginPolicyError(
+                "a repository-scoped review entry must not name one subdirectory; "
+                "repository deny classifications apply to every subdirectory"
             )
 
     @property
@@ -369,6 +393,28 @@ REVIEWED_PLUGINS: "MappingProxyType[PluginSourceRef, ReviewedPlugin]" = build_re
         ReviewedPlugin(
             ref=PluginSourceRef.pinned(
                 SOURCE_KIND_GITHUB,
+                "hollySizzle",
+                "mozyo_bridge",
+                "aa39b4c9e9c3f43bf054649916a4803bb9a75c7f",
+                subdir=("herdr-plugins", "mozyo-unit-board"),
+            ),
+            plugin_id="mozyo.unit-board",
+            plugin_class=CLASS_UX_ONLY,
+            build_provenance=BUILD_NONE,
+            review_anchor="#15114 j#101219",
+            rationale=(
+                "A read-only terminal Unit board that projects bounded project, role, "
+                "responsibility, work, and runtime labels. Its only Herdr mutation is "
+                "namespaced presentation metadata; it writes no agent input, workflow "
+                "authority, or durable record. The reviewed manifest declares no build."
+            ),
+            manifest_digest=(
+                "f90a2facdd03327b5bcdd300fd984678c3602e7cfbbfcd9b053cbcca1c76fa70"
+            ),
+        ),
+        ReviewedPlugin(
+            ref=PluginSourceRef.pinned(
+                SOURCE_KIND_GITHUB,
                 "smarzban",
                 "herdr-file-viewer",
                 "96fcc0a2bdd2727ec88c38f8c8806f97b7ca0ea0",
@@ -387,6 +433,9 @@ REVIEWED_PLUGINS: "MappingProxyType[PluginSourceRef, ReviewedPlugin]" = build_re
                 "SHA256SUMS file served from that same origin, falling back to a cargo "
                 "build on any miss. Running that install is therefore an unpinned "
                 "remote execution; the already-installed plugin is unaffected."
+            ),
+            manifest_digest=(
+                "6e6bc1bb27f621b1d223f4b23cb9bd70dc036181e0d357b4f0283162d31b1c1f"
             ),
         ),
         ReviewedPlugin(
@@ -520,8 +569,8 @@ def resolve_reference(
     if not ref.is_pinned:
         return None, PolicyDecision.deny(
             REASON_UNPINNED_SOURCE,
-            f"{ref.describe()} names no exact commit, so what this code is cannot "
-            f"be established",
+            f"{ref.describe()} does not establish an exact plugin path and commit "
+            f"identity, so what this code is cannot be established",
         )
     return None, PolicyDecision.deny(
         REASON_UNREVIEWED_PIN, f"{ref.describe()} has no reviewed classification"
@@ -552,6 +601,22 @@ def _identity_decision(
             REASON_IDENTITY_MISMATCH,
             f"{observation.ref.describe()} was reviewed as {review.plugin_id!r} but "
             f"the local manifest declares {observation.plugin_id!r}",
+        )
+    if observation.manifest_warnings:
+        return PolicyDecision.deny(
+            REASON_MANIFEST_UNAVAILABLE,
+            "Herdr reports a manifest warning, so the current execution surface "
+            "cannot be established from a clean reload",
+        )
+    if (
+        review.manifest_digest is not None
+        and observation.manifest_digest != review.manifest_digest
+    ):
+        return PolicyDecision.deny(
+            REASON_MANIFEST_DRIFT,
+            "the current normalized manifest execution surface differs from the "
+            "independently reviewed surface; source metadata alone does not pin "
+            "mutable manifest commands",
         )
     reviewed_build = review.declares_build
     # ``None`` means the review established nothing about the build surface, so
@@ -777,6 +842,7 @@ __all__ = (
     "REASON_IDENTITY_MISMATCH",
     "REASON_MALFORMED_RECORD",
     "REASON_MANIFEST_DRIFT",
+    "REASON_MANIFEST_UNAVAILABLE",
     "REASON_NO_LANE_AUTHORITY",
     "REASON_UNPINNED_REMOTE_BUILD",
     "REASON_UNPINNED_SOURCE",

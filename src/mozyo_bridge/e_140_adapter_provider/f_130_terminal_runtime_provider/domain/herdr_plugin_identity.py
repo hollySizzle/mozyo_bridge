@@ -16,8 +16,9 @@ than a line count:
 The disclosure boundary lives here, because this is where third-party data stops
 being third-party data. :class:`PluginObservation` is a **closed representation**:
 every field is a core-owned value — a projected vocabulary token, a validated
-reference, a strict boolean — except the plugin id, which is a *bounded*
-identifier and is echoed only because it is the operand an operator types.
+reference, a strict boolean, or a canonical capability digest — except the
+plugin id, which is a *bounded* identifier and is echoed only because it is the
+operand an operator types.
 ``__post_init__`` checks every field against a validator table and refuses to
 construct a record whose field has no validator, so the guarantee does not depend
 on anyone remembering to extend a hand-written check.
@@ -43,6 +44,8 @@ Pure: no file IO, no subprocess, no network.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 import re
 from types import MappingProxyType
 
@@ -53,7 +56,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     keeps_absolute_root,
 )
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 #: The one source kind herdr resolves to an immutable commit.
@@ -87,6 +90,51 @@ REDACTED_TOKEN = "<withheld>"
 #: operator types at ``herdr plugin enable``), so the remedy here is a bound rather
 #: than suppression.
 MAX_SEGMENT_LENGTH = 64
+
+#: A plugin may live below a repository root, but the identity remains a bounded
+#: sequence of ordinary GitHub-style segments rather than an arbitrary path.  The
+#: depth bound prevents a syntactically valid third-party value from becoming an
+#: unbounded report channel.
+MAX_SUBDIR_SEGMENTS = 16
+
+#: Canonical, path-free fingerprint of the Herdr fields that can execute code or
+#: decide where that code executes.  The digest is compared with the value recorded
+#: by an independent review; command strings themselves never cross the public
+#: policy-report boundary.
+MANIFEST_CAPABILITY_DIGEST_SCHEMA = "herdr-plugin-capability-v1"
+MAX_MANIFEST_CAPABILITY_BYTES = 65_536
+MAX_MANIFEST_CAPABILITY_DEPTH = 8
+MAX_MANIFEST_CAPABILITY_NODES = 1_024
+_MANIFEST_CAPABILITY_LIST_FIELDS = (
+    "platforms",
+    "build",
+    "startup",
+    "actions",
+    "events",
+    "panes",
+    "link_handlers",
+)
+_KNOWN_INSTALLED_PLUGIN_FIELDS = frozenset(
+    {
+        "plugin_id",
+        "name",
+        "version",
+        "min_herdr_version",
+        "description",
+        "manifest_path",
+        "plugin_root",
+        "enabled",
+        "platforms",
+        "build",
+        "startup",
+        "actions",
+        "events",
+        "panes",
+        "link_handlers",
+        "source",
+        "warnings",
+    }
+)
 
 #: Upper bound on any single rendered text field (a diagnostic sentence, not an
 #: essay). Bounds are part of the boundary: an unbounded field is a channel.
@@ -204,9 +252,39 @@ def require_segment(value: object, field: str) -> str:
 _require_segment = require_segment
 
 
+def _require_subdir_segments(value: object) -> tuple[str, ...]:
+    """Validate the immutable relative segments of a plugin source subdirectory."""
+    if not isinstance(value, tuple):
+        raise HerdrPluginPolicyError(
+            f"source subdir must be a tuple, got {type(value).__name__}"
+        )
+    if len(value) > MAX_SUBDIR_SEGMENTS:
+        raise HerdrPluginPolicyError(
+            f"source subdir exceeds {MAX_SUBDIR_SEGMENTS} segments"
+        )
+    for index, segment in enumerate(value):
+        if segment in {"", ".", ".."}:
+            raise HerdrPluginPolicyError(
+                f"source subdir segment {index} is empty or navigational"
+            )
+        _require_segment(segment, f"source subdir segment {index}")
+    return value
+
+
+def _parse_source_subdir(value: object) -> tuple[str, ...]:
+    """Parse Herdr's optional slash-joined ``source.subdir`` field strictly."""
+    if value is None:
+        return ()
+    if not isinstance(value, str):
+        raise HerdrPluginPolicyError(
+            f"source subdir must be a string or null, got {type(value).__name__}"
+        )
+    return _require_subdir_segments(tuple(value.split("/")))
+
+
 @dataclass(frozen=True)
 class PluginSourceRef:
-    """Where a plugin's code came from: a repository, optionally at an exact commit.
+    """Where a plugin's code came from: repository, subdirectory, and commit.
 
     ``commit`` is ``None`` for a *repository-scoped* reference — the shape a
     deny-classification uses, and the shape an allow may never use (see the module
@@ -219,6 +297,7 @@ class PluginSourceRef:
     owner: str
     repo: str
     commit: Optional[str] = None
+    subdir: tuple[str, ...] = field(default=(), kw_only=True)
 
     def __post_init__(self) -> None:
         if self.kind != SOURCE_KIND_GITHUB:
@@ -226,8 +305,18 @@ class PluginSourceRef:
                 f"source kind {self.kind!r} is not a pinnable upstream identity; "
                 f"only {SOURCE_KIND_GITHUB!r} resolves to an immutable commit"
             )
-        _require_segment(self.owner, "source owner")
-        _require_segment(self.repo, "source repo")
+        owner = _require_segment(self.owner, "source owner")
+        repo = _require_segment(self.repo, "source repo")
+        if self.owner in {".", ".."} or self.repo in {".", ".."}:
+            raise HerdrPluginPolicyError(
+                "source owner and repo must not be navigational segments"
+            )
+        # GitHub repository identity is ASCII case-insensitive.  Keeping Herdr's
+        # input spelling here made one repository acquire several policy keys and
+        # let a repository-wide deny miss a case variant (review j#101228 C2-F3).
+        object.__setattr__(self, "owner", owner.lower())
+        object.__setattr__(self, "repo", repo.lower())
+        _require_subdir_segments(self.subdir)
         if self.commit is not None:
             if not isinstance(self.commit, str):
                 raise HerdrPluginPolicyError(
@@ -245,14 +334,28 @@ class PluginSourceRef:
         return cls(kind=kind, owner=owner, repo=repo)
 
     @classmethod
-    def pinned(cls, kind: str, owner: str, repo: str, commit: str) -> "PluginSourceRef":
+    def pinned(
+        cls,
+        kind: str,
+        owner: str,
+        repo: str,
+        commit: str,
+        *,
+        subdir: tuple[str, ...] = (),
+    ) -> "PluginSourceRef":
         """A reference pinned to an exact immutable commit."""
-        return cls(kind=kind, owner=owner, repo=repo, commit=commit)
+        return cls(
+            kind=kind,
+            owner=owner,
+            repo=repo,
+            commit=commit,
+            subdir=subdir,
+        )
 
     @property
     def repo_key(self) -> "PluginSourceRef":
-        """This reference with the commit dropped — the repository-scoped key."""
-        if self.commit is None:
+        """This reference with both commit and subdirectory dropped."""
+        if self.commit is None and not self.subdir:
             return self
         return PluginSourceRef(kind=self.kind, owner=self.owner, repo=self.repo)
 
@@ -260,19 +363,29 @@ class PluginSourceRef:
     def is_pinned(self) -> bool:
         return self.commit is not None
 
+    @property
+    def install_spec(self) -> str:
+        """The bounded Herdr ``owner/repo[/subdir...]`` install operand."""
+        base = f"{self.owner}/{self.repo}"
+        return f"{base}/{'/'.join(self.subdir)}" if self.subdir else base
+
     def describe(self) -> str:
-        """A short, path-free description (``github:owner/repo@commit``)."""
-        base = f"{self.kind}:{self.owner}/{self.repo}"
+        """A short, bounded description including the exact plugin subdirectory."""
+        base = f"{self.kind}:{self.install_spec}"
         return f"{base}@{self.commit}" if self.commit else base
 
 
 def source_ref_from_parts(
-    kind: object, owner: object, repo: object, commit: object
+    kind: object,
+    owner: object,
+    repo: object,
+    commit: object,
+    subdir: object = None,
 ) -> Optional[PluginSourceRef]:
     """Build the strongest reference these parts support (review j#92053 F3).
 
-    **Repository identity and pin validity are separate facts, so a bad commit may
-    not discard the repository.** The original version collapsed them: any
+    **Repository identity and exact plugin identity are separate facts, so a bad
+    commit or subdirectory may not discard the repository.** The original version collapsed them: any
     :class:`HerdrPluginPolicyError` — including one raised solely by a malformed
     commit — returned ``None``, throwing away a perfectly good ``owner/repo``.
     Measured consequence: ``persiyanov/herdr-reviewr`` observed with an
@@ -284,7 +397,10 @@ def source_ref_from_parts(
     stops explaining itself.
 
     So: a valid ``github`` owner/repo yields at least a repository-scoped
-    reference; the commit only decides whether that reference is *also* pinned.
+    reference; subdirectory and commit together decide whether that reference is
+    *also* an exact pin. A malformed subdirectory falls back only to the repository
+    identity, never to a root-plugin allow. A valid subdirectory remains on an
+    unpinned reference when only the commit is malformed.
     ``None`` is returned only when there is no usable repository identity at all —
     a non-``github`` kind, or an owner / repo that is not a bare segment.
 
@@ -300,9 +416,29 @@ def source_ref_from_parts(
     except HerdrPluginPolicyError:
         return None
     try:
-        return PluginSourceRef.pinned(SOURCE_KIND_GITHUB, owner, repo, commit)
+        subdir_segments = _parse_source_subdir(subdir)
     except HerdrPluginPolicyError:
+        # Subdirectory validity cannot erase an independently valid repository
+        # identity.  Keeping only the repository preserves repository-wide deny
+        # classifications while remaining unpinned, so it can never fall through
+        # to a root-plugin allow.
         return repository
+    unpinned = PluginSourceRef(
+        kind=SOURCE_KIND_GITHUB,
+        owner=repository.owner,
+        repo=repository.repo,
+        subdir=subdir_segments,
+    )
+    try:
+        return PluginSourceRef.pinned(
+            SOURCE_KIND_GITHUB,
+            repository.owner,
+            repository.repo,
+            commit,
+            subdir=subdir_segments,
+        )
+    except HerdrPluginPolicyError:
+        return unpinned
 
 
 def read_source_ref(source: object) -> Optional[PluginSourceRef]:
@@ -323,6 +459,7 @@ def read_source_ref(source: object) -> Optional[PluginSourceRef]:
         source.get("owner"),
         source.get("repo"),
         source.get("resolved_commit"),
+        source.get("subdir"),
     )
 
 
@@ -358,6 +495,109 @@ def _check_optional_ref(value: object, name: str) -> None:
         )
 
 
+def _check_manifest_digest(value: object, name: str) -> None:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise HerdrPluginPolicyError(
+            f"{name} must be a 64-character lowercase SHA-256 digest"
+        )
+
+
+def _validate_manifest_json_node(
+    value: object,
+    *,
+    depth: int,
+    budget: list[int],
+) -> None:
+    """Validate one bounded JSON value without retaining third-party text."""
+    if depth > MAX_MANIFEST_CAPABILITY_DEPTH:
+        raise HerdrPluginPolicyError("plugin manifest capability surface is too deep")
+    budget[0] += 1
+    if budget[0] > MAX_MANIFEST_CAPABILITY_NODES:
+        raise HerdrPluginPolicyError("plugin manifest capability surface is too large")
+    if value is None or isinstance(value, (str, bool)):
+        return
+    if isinstance(value, int) and not isinstance(value, bool):
+        return
+    if isinstance(value, list):
+        for item in value:
+            _validate_manifest_json_node(item, depth=depth + 1, budget=budget)
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise HerdrPluginPolicyError(
+                    "plugin manifest capability object has a non-string key"
+                )
+            _validate_manifest_json_node(item, depth=depth + 1, budget=budget)
+        return
+    raise HerdrPluginPolicyError(
+        "plugin manifest capability surface is not canonical JSON"
+    )
+
+
+def manifest_capability_digest(record: Mapping[object, object]) -> str:
+    """Hash the current normalized Herdr execution surface, fail-closed.
+
+    Herdr 0.8 reloads the manifest from disk but retains the old ``source`` pin.
+    Therefore the pin alone does not prove which commands will run.  This digest
+    binds the normalized command-bearing fields returned by ``plugin list`` to the
+    independently reviewed surface.  Unknown top-level fields are refused so a
+    future Herdr capability cannot silently sit outside this vocabulary.
+    """
+    if any(not isinstance(key, str) for key in record):
+        raise HerdrPluginPolicyError("plugin record has a non-string field name")
+    unknown = set(record) - _KNOWN_INSTALLED_PLUGIN_FIELDS
+    if unknown:
+        raise HerdrPluginPolicyError(
+            "plugin record contains a field outside the supported Herdr 0.8 schema"
+        )
+    minimum = record.get("min_herdr_version", "")
+    if not isinstance(minimum, str):
+        raise HerdrPluginPolicyError(
+            "plugin record field 'min_herdr_version' must be a string"
+        )
+    surface: dict[str, object] = {
+        "schema": MANIFEST_CAPABILITY_DIGEST_SCHEMA,
+        "min_herdr_version": minimum,
+    }
+    for key in _MANIFEST_CAPABILITY_LIST_FIELDS:
+        value = record.get(key, [])
+        if not isinstance(value, list):
+            raise HerdrPluginPolicyError(
+                f"plugin record field {key!r} must be a list"
+            )
+        surface[key] = value
+    _validate_manifest_json_node(surface, depth=0, budget=[0])
+    try:
+        canonical = json.dumps(
+            surface,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise HerdrPluginPolicyError(
+            "plugin manifest capability surface cannot be canonicalized"
+        ) from exc
+    if len(canonical) > MAX_MANIFEST_CAPABILITY_BYTES:
+        raise HerdrPluginPolicyError("plugin manifest capability surface is too large")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _manifest_has_warnings(record: Mapping[object, object]) -> bool:
+    if "warnings" not in record:
+        return False
+    warnings = record["warnings"]
+    if not isinstance(warnings, list) or any(
+        not isinstance(warning, str) for warning in warnings
+    ):
+        raise HerdrPluginPolicyError(
+            "plugin record field 'warnings' must be a list of strings"
+        )
+    return bool(warnings)
+
+
 #: One validator per :class:`PluginObservation` field. ``__post_init__`` walks the
 #: dataclass's own field list against this table and refuses to construct anything
 #: when a field has no entry, so a field added later cannot slip through
@@ -375,6 +615,8 @@ _OBSERVATION_FIELD_CHECKS = MappingProxyType(
         "declares_build": _check_strict_bool,
         "declares_panes": _check_strict_bool,
         "declares_actions": _check_strict_bool,
+        "manifest_digest": _check_manifest_digest,
+        "manifest_warnings": _check_strict_bool,
     }
 )
 
@@ -392,8 +634,9 @@ class PluginObservation:
 
     What remains is a plugin id (a bounded identifier, which must be echoed because
     it is the operand an operator types), a projected source kind, a validated
-    reference, and three booleans recording only *whether* the local manifest
-    declares each surface — never the commands, which are third-party strings.
+    reference, three booleans recording only *whether* the local manifest
+    declares each surface, a warning bit, and a SHA-256 digest of the normalized
+    execution surface. Command strings are hashed but never retained or rendered.
     """
 
     plugin_id: str
@@ -403,6 +646,8 @@ class PluginObservation:
     declares_build: bool
     declares_panes: bool
     declares_actions: bool
+    manifest_digest: str
+    manifest_warnings: bool
 
     def __post_init__(self) -> None:
         missing = {
@@ -482,6 +727,8 @@ def observe_plugin(record: object) -> PluginObservation:
         declares_build=_declares(record, "build"),
         declares_panes=_declares(record, "panes"),
         declares_actions=_declares(record, "actions"),
+        manifest_digest=manifest_capability_digest(record),
+        manifest_warnings=_manifest_has_warnings(record),
     )
 
 
@@ -493,12 +740,16 @@ __all__ = (
     "SOURCE_KIND_UNRECOGNIZED",
     "MAX_RENDERED_FIELD_LENGTH",
     "MAX_SEGMENT_LENGTH",
+    "MAX_SUBDIR_SEGMENTS",
+    "MANIFEST_CAPABILITY_DIGEST_SCHEMA",
+    "MAX_MANIFEST_CAPABILITY_BYTES",
     "REDACTED_TOKEN",
     "HerdrPluginPolicyError",
     "PluginObservation",
     "PluginSourceRef",
     "contains_absolute_path",
     "normalize_source_kind",
+    "manifest_capability_digest",
     "observe_plugin",
     "read_source_ref",
     "require_renderable_field",
