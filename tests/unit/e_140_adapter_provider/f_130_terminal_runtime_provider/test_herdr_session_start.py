@@ -3024,6 +3024,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         projects=("a", "b"),
         placement_mode="role_grouped_space",
         presentation=None,
+        lane_placement=None,
     ):
         """Launch ``projects`` coordinator pairs into one shared workspace.
 
@@ -3078,6 +3079,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                         launch_context=LaneLaunchContext(lane_kind="coordinator"),
                         coordinator_placement_mode=placement_mode,
                         coordinator_top_workspace_id=top_workspace_id,
+                        lane_placement=lane_placement,
                         env=env,
                         runner=herdr.run,
                         probe=_FAST_PROBE,
@@ -3184,6 +3186,38 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             delta=0.15,
         )
         self.assertEqual(1, len(herdr.pane_swaps))
+        self.assertEqual("applied", sessions[-1].column_outcome)
+        self.assertTrue(sessions[-1].ok, sessions[-1].column_detail)
+
+    def test_configured_column_placement_preserves_each_unit_pair_ratio(self) -> None:
+        """#15126: legacy column reflow must not erase the first Unit's 0.35."""
+
+        herdr = _Herdr(created_workspace="wProjects")
+        herdr.booting_after_start = {"codex", "claude"}
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions, _repos, _home, _env, _top = self._shared_coordinator_projects(
+                tmp,
+                herdr,
+                projects=("accounting", "operations"),
+                presentation={
+                    "accounting": (20, 1),
+                    "operations": (10, 2),
+                },
+                lane_placement=LanePlacementConfig.from_record(
+                    {"default": {"ratio": 0.35}}
+                ),
+            )
+            rects = self._shared_rects(herdr, sessions[-1].slots[0].locator)
+
+        for session in sessions:
+            top = next(slot for slot in session.slots if slot.provider == "codex")
+            lower = next(slot for slot in session.slots if slot.provider == "claude")
+            extent = rects[top.locator]["height"] + rects[lower.locator]["height"]
+            self.assertAlmostEqual(
+                0.35,
+                rects[top.locator]["height"] / extent,
+                delta=1 / extent,
+            )
         self.assertEqual("applied", sessions[-1].column_outcome)
         self.assertTrue(sessions[-1].ok, sessions[-1].column_detail)
 

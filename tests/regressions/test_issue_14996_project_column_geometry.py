@@ -264,6 +264,45 @@ class ProjectColumnGeometryTest(unittest.TestCase):
         self.assertEqual(len(env.herdr.tabs), 1)
         self.assertEqual(sorted(tab.panes()), sorted([a_top, a_bottom, b_top, b_bottom]))
 
+    def test_appending_a_column_preserves_the_existing_unit_internal_ratio(self):
+        """#15126: the bounce must not reset the existing Unit to Herdr's 0.5."""
+
+        env = _Env(self, PROJECT_A, PROJECT_B)
+        tab = env.herdr.new_tab()
+        (a_top, a_bottom), = env.seed_columns(tab, (PROJECT_A, ""))
+        self.assertTrue(tab.resize(a_top, "up", 0.15))
+        before = env.herdr.rects()
+        self.assertEqual(before[a_top][3], 8)
+        self.assertEqual(before[a_bottom][3], 15)
+
+        b_top, b_bottom = env.append_pair(tab, PROJECT_B)
+        outcome, detail = env.run(env.result(PROJECT_B, [b_top, b_bottom]))
+        self.assertEqual(outcome, COLUMN_APPLIED, detail)
+
+        after = env.herdr.rects()
+        self.assertEqual(after[a_top][3], before[a_top][3])
+        self.assertEqual(after[a_bottom][3], before[a_bottom][3])
+        restore = next(
+            call
+            for call in env.moves()
+            if call[2] == a_bottom and "--tab" in call
+        )
+        self.assertEqual(restore[restore.index("--ratio") + 1], "0.35")
+
+    def test_opening_split_ratio_that_disagrees_with_rendered_cells_refuses_before_move(self):
+        env = _Env(self, PROJECT_A, PROJECT_B)
+        tab = env.herdr.new_tab()
+        (a_top, _a_bottom), = env.seed_columns(tab, (PROJECT_A, ""))
+        self.assertTrue(tab.resize(a_top, "up", 0.15))
+        launched = env.append_pair(tab, PROJECT_B)
+        env.herdr.layout_split_ratio_overrides_once["split_0_root"] = 0.5
+
+        outcome, detail = env.run(env.result(PROJECT_B, list(launched)))
+
+        self.assertEqual(outcome, COLUMN_FAILED)
+        self.assertIn("opening divider disagrees with rendered geometry", detail)
+        self.assertEqual(env.moves(), [])
+
     def test_result_is_independent_of_which_pane_was_active_before_launch(self):
         """j#99845: the geometry must not depend on pre-launch focus."""
         geometries = []
@@ -432,6 +471,7 @@ class ProjectColumnRestraintTest(unittest.TestCase):
         labels = tuple(f"project-{index}" for index in range(11))
         env = _Env(self, *labels)
         tab = env.herdr.new_tab()
+        tab.bounds.width = 1100
         env.seed_columns(tab, *((label, "") for label in labels[:-1]))
         launched = env.append_pair(tab, labels[-1])
         outcome, detail = env.run(env.result(labels[-1], list(launched)))
@@ -440,6 +480,25 @@ class ProjectColumnRestraintTest(unittest.TestCase):
         self.assertTrue(env.moves())
         self.assertEqual(env.herdr.resizes, [])
         self.assertEqual(len(env.herdr.tabs), 1)
+
+    def test_eleventh_project_does_not_prepare_when_internal_ratio_is_lost(self):
+        labels = tuple(f"project-{index}" for index in range(11))
+        env = _Env(self, *labels)
+        tab = env.herdr.new_tab()
+        tab.bounds.width = 1100
+        existing = env.seed_columns(
+            tab, *((label, "") for label in labels[:-1])
+        )
+        rightmost = existing[-1]
+        self.assertTrue(tab.resize(rightmost[0], "up", 0.15))
+        env.herdr.move_ratio_ignored.add(rightmost[1])
+        launched = env.append_pair(tab, labels[-1])
+
+        outcome, detail = env.run(env.result(labels[-1], list(launched)))
+
+        self.assertEqual(outcome, COLUMN_FAILED)
+        self.assertNotEqual(outcome, COLUMN_PREPARED)
+        self.assertIn("internal ratio changed", detail)
 
 
 class ColumnOperatorSurfaceTest(unittest.TestCase):
@@ -1429,6 +1488,99 @@ class ProjectColumnFailClosedTest(unittest.TestCase):
         self.assertEqual(sorted(tab.panes()), sorted(list(project_a) + list(project_b)))
         result.column_outcome, result.column_detail = outcome, detail
         self.assertFalse(result.column_ok)
+
+    def test_failed_attach_recovery_restores_the_existing_unit_ratio(self):
+        env, tab, project_a, project_b = self._scenario()
+        self.assertTrue(tab.resize(project_a[0], "up", 0.15))
+        before = env.herdr.rects()
+        env.herdr.refuse_move_attempts.add(4)
+
+        outcome, detail = env.run(env.result(PROJECT_B, list(project_b)))
+
+        self.assertEqual(outcome, COLUMN_FAILED)
+        self.assertIn("every detached pane was returned", detail)
+        after = env.herdr.rects()
+        self.assertEqual(after[project_a[0]][3], before[project_a[0]][3])
+        self.assertEqual(after[project_a[1]][3], before[project_a[1]][3])
+        restore = next(
+            call
+            for call in env.moves()
+            if call[2] == project_a[1] and "--tab" in call
+        )
+        self.assertEqual(restore[restore.index("--ratio") + 1], "0.35")
+
+    def test_failed_attach_recovery_that_loses_ratio_is_reported_unverified(self):
+        env, _tab, project_a, project_b = self._scenario()
+        self.assertTrue(env.herdr.tab_of(project_a[0]).resize(project_a[0], "up", 0.15))
+        env.herdr.refuse_move_attempts.add(4)
+        env.herdr.move_ratio_ignored.add(project_a[1])
+
+        outcome, detail = env.run(env.result(PROJECT_B, list(project_b)))
+
+        self.assertEqual(outcome, COLUMN_FAILED)
+        self.assertNotIn("every detached pane was returned", detail)
+        self.assertIn("recovery could not be verified", detail)
+        self.assertIn("observed_ratio=0.5", detail)
+
+    def test_failed_attach_recovery_rechecks_inventory_before_claiming_success(self):
+        env, _tab, project_a, project_b = self._scenario()
+        env.herdr.refuse_move_attempts.add(4)
+        env.herdr.rename_after_moves[6] = (
+            project_a[0], encode_assigned_name("ws-impostor", "codex"),
+        )
+
+        outcome, detail = env.run(env.result(PROJECT_B, list(project_b)))
+
+        self.assertEqual(outcome, COLUMN_FAILED)
+        self.assertNotIn("every detached pane was returned", detail)
+        self.assertIn("recovery could not be verified", detail)
+        self.assertIn("inventory changed", detail)
+
+    def test_failed_attach_recovery_with_unreadable_inventory_returns_typed_failure(self):
+        env, _tab, _project_a, project_b = self._scenario()
+        env.herdr.refuse_move_attempts.add(4)
+        agent_list_calls = 0
+
+        def runner(argv, **kwargs):
+            nonlocal agent_list_calls
+            if list(argv[1:3]) == ["agent", "list"]:
+                agent_list_calls += 1
+                if agent_list_calls == 2:
+                    return subprocess.CompletedProcess(
+                        argv, 1, stdout="", stderr="inventory unavailable"
+                    )
+            return env.herdr(argv, **kwargs)
+
+        outcome, detail = env.run(
+            env.result(PROJECT_B, list(project_b)), runner=runner
+        )
+
+        self.assertEqual(outcome, COLUMN_FAILED)
+        self.assertIn("recovery could not be verified", detail)
+        self.assertIn("inventory could not be read", detail)
+
+    def test_malformed_detach_result_is_reobserved_and_recovered(self):
+        env, tab, project_a, project_b = self._scenario()
+        env.herdr.move_malformed_after_geometry.add(project_b[1])
+
+        outcome, detail = env.run(env.result(PROJECT_B, list(project_b)))
+
+        self.assertEqual(outcome, COLUMN_FAILED)
+        self.assertIn("returned to the shared tab", detail)
+        self.assertIn("identities and internal ratios were verified", detail)
+        self.assertEqual(len(env.herdr.tabs), 1)
+        self.assertEqual(sorted(tab.panes()), sorted(list(project_a) + list(project_b)))
+
+    def test_accepted_move_that_ignores_ratio_is_not_reported_as_applied(self):
+        env, tab, project_a, project_b = self._scenario()
+        self.assertTrue(tab.resize(project_a[0], "up", 0.15))
+        env.herdr.move_ratio_ignored.add(project_a[1])
+
+        outcome, detail = env.run(env.result(PROJECT_B, list(project_b)))
+
+        self.assertEqual(outcome, COLUMN_FAILED)
+        self.assertIn("internal ratio changed", detail)
+        self.assertIn("observed_ratio=0.5", detail)
 
     def test_a_pane_left_outside_the_shared_tab_is_named_in_the_detail(self):
         env, tab, _project_a, project_b = self._scenario()

@@ -518,8 +518,12 @@ class ColumnPlanTest(unittest.TestCase):
             plan.attach,
             (
                 ColumnAttach(pane="w1:p4", direction="right", target="w1:p2"),
-                ColumnAttach(pane="w1:p5", direction="down", target="w1:p4"),
-                ColumnAttach(pane="w1:p3", direction="down", target="w1:p2"),
+                ColumnAttach(
+                    pane="w1:p5", direction="down", target="w1:p4", ratio=0.5
+                ),
+                ColumnAttach(
+                    pane="w1:p3", direction="down", target="w1:p2", ratio=0.5
+                ),
             ),
         )
 
