@@ -159,6 +159,57 @@ class FailClosedSchemaTest(unittest.TestCase):
     def test_allowed_projections_are_exactly_the_two_builtins(self) -> None:
         self.assertEqual(ALLOWED_PROJECTIONS, frozenset({"cockpit_pane", "normal_window"}))
 
+    def test_relative_width_accepts_positive_finite_number_for_rule_and_override(self) -> None:
+        config = PresentationGroupingConfig.from_record(
+            {
+                "grouping": {
+                    "membership_rules": [
+                        {"when": {"repo_label": "alpha"}, "relative_width": 2}
+                    ],
+                    "unit_overrides": [
+                        {
+                            "workspace_id": "ws-a",
+                            "lane_id": "default",
+                            "relative_width": 1.5,
+                        }
+                    ],
+                }
+            }
+        )
+        self.assertEqual(config.membership_rules[0].relative_width, 2.0)
+        self.assertEqual(config.unit_overrides[0].relative_width, 1.5)
+
+    def test_relative_width_rejects_non_positive_non_finite_bool_and_text(self) -> None:
+        for value in (
+            0,
+            -1,
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            10**10000,
+            True,
+            "2",
+        ):
+            for collection, record in (
+                (
+                    "membership_rules",
+                    {"when": {"repo_label": "alpha"}, "relative_width": value},
+                ),
+                (
+                    "unit_overrides",
+                    {
+                        "workspace_id": "ws-a",
+                        "lane_id": "default",
+                        "relative_width": value,
+                    },
+                ),
+            ):
+                with self.subTest(value=value, collection=collection):
+                    with self.assertRaises(PresentationGroupingConfigError):
+                        PresentationGroupingConfig.from_record(
+                            {"grouping": {collection: [record]}}
+                        )
+
 
 class NoRoutingAuthorityLeakageTest(unittest.TestCase):
     """Authority / routing / credential-shaped config never parses (fail closed)."""

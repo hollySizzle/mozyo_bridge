@@ -41,7 +41,15 @@ GROUPING_KEYS: frozenset[str] = frozenset(
 
 #: Closed keys of one ``membership_rules[]`` entry.
 MEMBERSHIP_RULE_KEYS: frozenset[str] = frozenset(
-    {"when", "group_id", "position", "pinned", "hidden", "preferred_projection"}
+    {
+        "when",
+        "group_id",
+        "position",
+        "relative_width",
+        "pinned",
+        "hidden",
+        "preferred_projection",
+    }
 )
 
 #: Public-safe facts a rule ``when`` predicate may match. Each is derivable from
@@ -67,6 +75,7 @@ UNIT_OVERRIDE_KEYS: frozenset[str] = frozenset(
         "host_id",
         "preferred_group",
         "position",
+        "relative_width",
         "pinned",
         "hidden",
         "preferred_projection",

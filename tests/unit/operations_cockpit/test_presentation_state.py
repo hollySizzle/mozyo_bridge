@@ -85,6 +85,7 @@ class SeedBasicsTest(PresentationStateStoreBase):
                     "lane_id": "default",
                     "preferred_group": "project:alpha",
                     "position": 10,
+                    "relative_width": 2.5,
                     "pinned": True,
                     "preferred_projection": "cockpit_pane",
                 }
@@ -105,6 +106,7 @@ class SeedBasicsTest(PresentationStateStoreBase):
         self.assertEqual(row.group_id, "project:alpha")
         self.assertEqual(row.unit_id, unit_id_for("ws-alpha", "default"))
         self.assertEqual(row.position, 10)
+        self.assertEqual(row.width_weight, 2.5)
         self.assertTrue(row.pinned)
         self.assertFalse(row.hidden)
 
@@ -123,7 +125,13 @@ class SeedBasicsTest(PresentationStateStoreBase):
 
     def test_override_with_nothing_to_seed_is_skipped(self) -> None:
         config = _config(
-            [{"workspace_id": "ws-x", "lane_id": "default"}]
+            [
+                {
+                    "workspace_id": "ws-x",
+                    "lane_id": "default",
+                    "relative_width": 2,
+                }
+            ]
         )
         result = self.store.seed_from_grouping_config(
             config, source_config_version=1
@@ -204,6 +212,35 @@ class IdempotencyTest(PresentationStateStoreBase):
         self.assertEqual(row.position, 20)
         self.assertEqual(row.updated_at, "2026-06-21T00:00:00+00:00")
 
+    def test_removing_seeded_width_clears_the_existing_seed_value(self) -> None:
+        self.store.seed_from_grouping_config(
+            _config(
+                [
+                    {
+                        "workspace_id": "ws-alpha",
+                        "lane_id": "default",
+                        "preferred_group": "project:alpha",
+                        "relative_width": 3,
+                    }
+                ]
+            ),
+            source_config_version=1,
+        )
+        result = self.store.seed_from_grouping_config(
+            _config(
+                [
+                    {
+                        "workspace_id": "ws-alpha",
+                        "lane_id": "default",
+                        "preferred_group": "project:alpha",
+                    }
+                ]
+            ),
+            source_config_version=1,
+        )
+        self.assertEqual(result.membership_updated, 1)
+        self.assertIsNone(self.store.list_group_membership()[0].width_weight)
+
 
 class NonDestructiveTest(PresentationStateStoreBase):
     def test_removed_override_row_survives_reseed(self) -> None:
@@ -257,6 +294,7 @@ class LiveGeometryBoundaryTest(PresentationStateStoreBase):
                         {
                             "when": {"repo_label": "alpha"},
                             "group_id": "project:alpha",
+                            "relative_width": 2,
                         }
                     ]
                 },
@@ -393,6 +431,22 @@ class SchemaVersionFailClosedTest(PresentationStateStoreBase):
             self.store.seed_from_grouping_config(
                 _config([]), source_config_version=1
             )
+
+    def test_schema_v1_reads_null_width_without_migration(self) -> None:
+        self.assertEqual(PRESENTATION_STATE_SCHEMA_VERSION, 1)
+        self.store.seed_from_grouping_config(
+            _config(
+                [
+                    {
+                        "workspace_id": "ws-a",
+                        "lane_id": "default",
+                        "preferred_group": "project:alpha",
+                    }
+                ]
+            ),
+            source_config_version=1,
+        )
+        self.assertIsNone(self.store.list_group_membership()[0].width_weight)
 
     def test_read_path_unknown_schema_version_fails_closed(self) -> None:
         # Regression for #12304 review j#62220: the read-only path must NOT read

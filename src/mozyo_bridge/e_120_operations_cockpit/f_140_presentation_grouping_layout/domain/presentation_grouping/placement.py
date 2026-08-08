@@ -48,23 +48,91 @@ from .errors import PresentationGroupingConfigError
 class GroupPlacement:
     """The resolved desired placement of a launching sublane.
 
-    Display-only: ``group_id`` / ``label`` / ``position`` / ``pinned`` /
-    ``hidden`` / ``collapsed`` / ``preferred_projection`` describe *where and how*
-    the Unit is shown, never a routing target or an approval. ``status`` records
-    whether the placement came from config, the behavior-preserving default, or a
-    visible degraded condition; ``diagnostic`` carries human-facing degraded
-    wording when present.
+    Display-only: ``group_id`` / ``label`` / ``position`` /
+    ``relative_width`` / ``pinned`` / ``hidden`` / ``collapsed`` /
+    ``preferred_projection`` describe *where and how* the Unit is shown, never a
+    routing target or an approval. ``status`` records whether the placement came
+    from config, the behavior-preserving default, or a visible degraded condition;
+    ``diagnostic`` carries human-facing degraded wording when present.
     """
 
     status: str
     group_id: Optional[str] = None
     label: Optional[str] = None
     position: Optional[int] = None
+    relative_width: Optional[float] = None
     pinned: bool = False
     hidden: bool = False
     collapsed: bool = False
     preferred_projection: Optional[str] = None
     diagnostic: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class UnitColumnPreferences:
+    """Column-only preferences resolved independently of group placement.
+
+    Existing launch grouping keeps its record-level override/rule behavior.
+    Column order and width use field-level precedence so a label-only override
+    cannot erase a rule's explicit column preference.  ``context_incomplete``
+    prevents an unknown project/version fact from silently falling through to a
+    later catch-all rule.
+    """
+
+    position: Optional[int] = None
+    relative_width: Optional[float] = None
+    context_incomplete: bool = False
+
+
+def resolve_unit_column_preferences(
+    config: "Optional[PresentationGroupingConfig]",
+    context: LaunchContext,
+) -> UnitColumnPreferences:
+    """Resolve position and width with safe field-level precedence.
+
+    For each field independently: the single matching override's non-null value,
+    then the first fully matching rule that supplies the field, then unspecified.
+    Multiple matching overrides are ambiguous and fail closed.  A prior rule that
+    could match except for an unavailable fact blocks fall-through only for the
+    fields it supplies.
+    """
+
+    if config is None:
+        return UnitColumnPreferences()
+
+    matching_overrides = tuple(
+        override for override in config.unit_overrides if override.selects(context)
+    )
+    if len(matching_overrides) > 1:
+        raise PresentationGroupingConfigError(
+            "multiple unit_overrides select the same Unit column context"
+        )
+    override = matching_overrides[0] if matching_overrides else None
+    position = override.position if override is not None else None
+    relative_width = override.relative_width if override is not None else None
+    context_incomplete = False
+
+    for rule in config.membership_rules:
+        needs_position = position is None and rule.position is not None
+        needs_width = relative_width is None and rule.relative_width is not None
+        if not needs_position and not needs_width:
+            continue
+        match_state = rule.match_state(context)
+        if match_state is False:
+            continue
+        if match_state is None:
+            context_incomplete = True
+            continue
+        if needs_position:
+            position = rule.position
+        if needs_width:
+            relative_width = rule.relative_width
+
+    return UnitColumnPreferences(
+        position=position,
+        relative_width=relative_width,
+        context_incomplete=context_incomplete,
+    )
 
 
 def _placement_from_group(
@@ -73,6 +141,7 @@ def _placement_from_group(
     status: str,
     group_id: Optional[str],
     position: Optional[int],
+    relative_width: Optional[float],
     pinned: Optional[bool],
     hidden: Optional[bool],
     preferred_projection: Optional[str],
@@ -100,6 +169,7 @@ def _placement_from_group(
         group_id=group_id,
         label=label,
         position=position,
+        relative_width=relative_width,
         pinned=bool(pinned) if pinned is not None else False,
         hidden=bool(hidden) if hidden is not None else False,
         collapsed=collapsed,
@@ -162,6 +232,7 @@ def resolve_launch_placement(
                 status=status,
                 group_id=override.preferred_group,
                 position=override.position,
+                relative_width=override.relative_width,
                 pinned=override.pinned,
                 hidden=override.hidden,
                 preferred_projection=override.preferred_projection,
@@ -176,6 +247,7 @@ def resolve_launch_placement(
                 status=status,
                 group_id=rule.group_id,
                 position=rule.position,
+                relative_width=rule.relative_width,
                 pinned=rule.pinned,
                 hidden=rule.hidden,
                 preferred_projection=rule.preferred_projection,
@@ -189,6 +261,7 @@ def resolve_launch_placement(
             status=status,
             group_id=unknown_unit_group,
             position=None,
+            relative_width=None,
             pinned=None,
             hidden=None,
             preferred_projection=None,

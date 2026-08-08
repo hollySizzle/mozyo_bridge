@@ -10,7 +10,8 @@ presentation block into those tables.
 What this store **is** (the doc's "presentation state DB"):
 
 - ``cockpit_group_membership`` — which Project Group a Unit is *desired* to be
-  displayed under, plus display ``position`` / ``pinned`` / ``hidden``.
+  displayed under, plus display ``position`` / ``width_weight`` / ``pinned`` /
+  ``hidden``.
 - ``projection_preferences`` — a Unit's *preferred* projection
   (``cockpit_pane`` / ``normal_window`` / …).
 - ``presentation_seed_provenance`` — which static config version last seeded the
@@ -690,8 +691,9 @@ class PresentationStateStore:
 
         For each override:
 
-        - ``preferred_group`` (+ ``position`` / ``pinned`` / ``hidden``) upserts a
-          :class:`GroupMembershipRow`;
+        - ``preferred_group`` (+ ``position`` / ``relative_width`` / ``pinned`` /
+          ``hidden``) upserts a :class:`GroupMembershipRow`. The config's
+          ``relative_width`` is stored in the existing ``width_weight`` column;
         - ``preferred_projection`` upserts a :class:`ProjectionPreferenceRow`.
 
         An override with neither is counted in ``skipped_overrides`` (nothing to
@@ -743,6 +745,7 @@ class PresentationStateStore:
                             group_id=override.preferred_group,
                             unit_id=unit_id,
                             position=override.position,
+                            width_weight=override.relative_width,
                             pinned=bool(override.pinned),
                             hidden=bool(override.hidden),
                         ),

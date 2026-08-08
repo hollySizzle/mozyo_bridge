@@ -13,6 +13,7 @@ diagnostic values) is a separate concern and lives in
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from typing import Optional
 
@@ -95,6 +96,33 @@ def _optional_int(value: object, *, source: str, field_name: str) -> Optional[in
             f"{source} '{field_name}' must be an integer when present, got {value!r}"
         )
     return value
+
+
+def _optional_positive_finite_number(
+    value: object, *, source: str, field_name: str
+) -> Optional[float]:
+    """Normalize a positive finite display weight, rejecting bool and NaN/inf."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise PresentationGroupingConfigError(
+            f"{source} '{field_name}' must be a positive finite number when "
+            f"present, got {value!r}"
+        )
+    try:
+        normalized = float(value)
+    except (OverflowError, ValueError):
+        raise PresentationGroupingConfigError(
+            f"{source} '{field_name}' must be a positive finite number when "
+            f"present; the supplied {type(value).__name__} is outside the "
+            "finite float range"
+        ) from None
+    if not math.isfinite(normalized) or normalized <= 0.0:
+        raise PresentationGroupingConfigError(
+            f"{source} '{field_name}' must be a positive finite number when "
+            f"present, got {value!r}"
+        )
+    return normalized
 
 
 def _optional_projection(

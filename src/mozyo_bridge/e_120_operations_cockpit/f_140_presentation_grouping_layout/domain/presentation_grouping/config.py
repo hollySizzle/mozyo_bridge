@@ -55,6 +55,7 @@ from .validation import (
     _checked_version,
     _optional_bool,
     _optional_int,
+    _optional_positive_finite_number,
     _optional_projection,
     _optional_str,
     _require_mapping,
@@ -115,6 +116,7 @@ class MembershipRule:
     when: "tuple[tuple[str, str], ...]"  # predicate (key, value) pairs, AND-ed
     group_id: Optional[str] = None
     position: Optional[int] = None
+    relative_width: Optional[float] = None
     pinned: Optional[bool] = None
     hidden: Optional[bool] = None
     preferred_projection: Optional[str] = None
@@ -146,6 +148,11 @@ class MembershipRule:
             position=_optional_int(
                 mapping.get("position"), source=source, field_name="position"
             ),
+            relative_width=_optional_positive_finite_number(
+                mapping.get("relative_width"),
+                source=source,
+                field_name="relative_width",
+            ),
             pinned=_optional_bool(
                 mapping.get("pinned"), source=source, field_name="pinned"
             ),
@@ -159,23 +166,35 @@ class MembershipRule:
             ),
         )
 
-    def matches(self, context: "LaunchContext") -> bool:
-        """True when every ``when`` predicate is satisfied by ``context``.
+    def match_state(self, context: "LaunchContext") -> Optional[bool]:
+        """Return true, false, or unknown for this rule and ``context``.
 
-        A predicate whose context fact is unknown (``None``) cannot match, so a
-        rule never fires on a fact the launch context does not actually carry. An
-        empty ``when`` matches everything (an explicit catch-all rule).
+        A known mismatch makes the rule false even when another predicate fact is
+        unavailable.  If every known predicate matches but at least one required
+        fact is unavailable, the result is ``None``: a caller that could otherwise
+        fall through to a catch-all rule must not silently treat the earlier rule
+        as false.  An empty ``when`` is an explicit match.
         """
+        context_incomplete = False
         for pkey, pvalue in self.when:
             if pkey == "lane_prefix":
                 lane = context.lane_id
-                if lane is None or not lane.startswith(pvalue):
+                if lane is None:
+                    context_incomplete = True
+                elif not lane.startswith(pvalue):
                     return False
                 continue
             actual = context.predicate_fact(pkey)
-            if actual is None or actual != pvalue:
+            if actual is None:
+                context_incomplete = True
+            elif actual != pvalue:
                 return False
-        return True
+        return None if context_incomplete else True
+
+    def matches(self, context: "LaunchContext") -> bool:
+        """True only when every predicate is known and satisfied."""
+
+        return self.match_state(context) is True
 
 
 @dataclass(frozen=True)
@@ -187,6 +206,7 @@ class UnitOverride:
     host_id: Optional[str] = None
     preferred_group: Optional[str] = None
     position: Optional[int] = None
+    relative_width: Optional[float] = None
     pinned: Optional[bool] = None
     hidden: Optional[bool] = None
     preferred_projection: Optional[str] = None
@@ -213,6 +233,11 @@ class UnitOverride:
             ),
             position=_optional_int(
                 mapping.get("position"), source=source, field_name="position"
+            ),
+            relative_width=_optional_positive_finite_number(
+                mapping.get("relative_width"),
+                source=source,
+                field_name="relative_width",
             ),
             pinned=_optional_bool(
                 mapping.get("pinned"), source=source, field_name="pinned"

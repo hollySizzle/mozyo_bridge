@@ -117,6 +117,9 @@ hidden
 preferred_projection
 ```
 
+Repo-local schemaではこの`width_weight`を`relative_width`として宣言する。
+どちらもdesired display weightであり、live幅やrouting authorityではない。
+
 これは `unit-presentation-state-db.md` の `cockpit_group_membership` /
 `projection_preferences` の責務である。実装済みではないが、今後の column move /
 rebalance / reconcile はこの table 境界に従う。
@@ -318,9 +321,11 @@ plan を適用する。境界:
 - column model は `window_layout` top-level cell。**identity authority ではない**
   (Live Geometry Contract どおり observed state)。Unit 所属 / role / lane は
   pane option / registry のまま。
-- target は equal fair-share。`width_weight` desired-presentation table
-  (`unit-presentation-state-db.md`) は未実装のため、interim target は
-  `even_column_share` と同じ equal fair-share。table 実装後はそちらへ寄せる。
+- 本commandのtargetは引き続きequal fair-share。#14606で`relative_width` schemaと
+  weighted right-nested planは実装したが、本`cockpit rebalance` actuatorへはまだ
+  接続しない。weighted applyはlive identity / generation / column geometryを
+  再確認する後続actionを通す。plan targetはpane locatorではなくUnit keyで保持し、
+  source fingerprintもapply直前に再確認する。
 - column 幅のみを `resize-pane -x` で変える。`set-option` は出さない —
   identity pane option (`@mozyo_workspace_id` / `@mozyo_agent_role` /
   `@mozyo_lane_id`) は不変更。
@@ -404,6 +409,8 @@ OSS default に入れてよいもの:
    flatten する structural repair。**実装済み (Redmine #12136)** —
    `### Structural Reconcile` を読む。
 4. `cockpit move`: Unit column reorder primitive。
+4a. repo-local `position` / `relative_width` とweighted divider plan:
+   **実装済み (Redmine #14606)**。pane mutationは行わず、live actionは後続。
 5. `presentation-state DB`: `cockpit_group_membership` current table。
 6. display prefix projection: pane title / border label に `mozyo:` prefix を追加。
 7. drift-safe iTerm/WebViewer controls: raw pane move ではなく Unit move を呼ぶ UI。

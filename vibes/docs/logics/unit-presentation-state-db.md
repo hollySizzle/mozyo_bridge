@@ -204,7 +204,7 @@ Config が管理してよい値:
   declarative rule。rule は built-in predicate 語彙だけを使い、module path /
   callable / script を持たない。
 - `unit_overrides`: known workspace/lane の `preferred_group`, `position`,
-  `pinned`, `hidden`, `preferred_projection`。
+  `relative_width`, `pinned`, `hidden`, `preferred_projection`。
 - `defaults`: unknown / missing group の display fallback、collapsed 初期値、
   degraded display wording。
 
@@ -262,6 +262,7 @@ presentation:
         lane_id: "default"
         preferred_group: "project:<public-label>"
         position: 10
+        relative_width: 2
         pinned: false
         hidden: false
         preferred_projection: "cockpit_pane"
@@ -290,15 +291,19 @@ surface, and not a dynamic predicate language.
   facts that can be derived from registry / repo-local metadata without reading
   live pane identity: `workspace_id`, `repo_label`, `project_id`,
   `fixed_version_id`, `lane_id`, and `lane_prefix`. A rule result may set
-  `group_id`, `position`, `pinned`, `hidden`, and `preferred_projection`. A rule
+  `group_id`, `position`, `relative_width`, `pinned`, `hidden`, and
+  `preferred_projection`. `relative_width` is a positive finite number. A rule
   must not name Python modules, callables, shell commands, dynamic predicates,
   target panes, or send routes.
 
 `presentation.grouping.unit_overrides[]`
 : Explicit desired display override for a known Unit. The selector is limited to
   `workspace_id` + `lane_id` (+ optional `host_id` for future host-aware
-  projection). Allowed desired fields are `preferred_group`, `position`, `pinned`,
-  `hidden`, `preferred_projection`, and `label_override` (public-safe only).
+  projection). Allowed desired fields are `preferred_group`, `position`,
+  `relative_width`, `pinned`, `hidden`, `preferred_projection`, and
+  `label_override` (public-safe only). `relative_width` is stored as
+  `cockpit_group_membership.width_weight` when the override also declares a
+  group; it never identifies a Unit or pane.
   `role_set` / `target` / `pane_id` / `session` / `window` are not configurable;
   they are runtime / registry facts.
 
@@ -411,6 +416,37 @@ Group / Unit の durable membership を live geometry から逆算して保存�
 reconcile / rebalance / move のような future command は、desired presentation state
 と live TargetRecord を照合して plan を出す。実行は preview / confirm gate を持ち、
 private operator layout を OSS default にしない。
+
+#### shared-tab Unit列順・相対幅plan (#14606)
+
+Repo-local declarationは既存のUnit `position`を列順に使い、別のorder schemaを
+作らない。`membership_rules[]` / `unit_overrides[]` の正の有限数
+`relative_width`を既存DBの`width_weight`へ対応させる。列planに限り、`position`と
+`relative_width`を項目ごとに解決し、各項目の優先順位は「一致する単一のUnit
+overrideにある値、最初に完全一致するruleにある値、未指定」の順である。labelだけの
+overrideがruleの列順・幅を消さない。既存launch時のgroup placementはrecord単位の
+優先順位を維持する。
+
+非変更のHerdr planは、registryの`workspace_id`から各canonical repoを解決して
+configを同じplan内でworkspaceごとに一度だけ読む。repo名、隣接列、cwdから別workspace
+の設定を推測しない。registryだけでは`project_id` / `fixed_version_id`を確定できないため、
+その事実が必要な先行ruleはcatch-allへ黙ってfall-throughせず`degraded`にする。専用の
+正本resolverを注入した場合だけそれらのruleを解決する。
+
+position未指定・同順位はlive順を維持し、width未指定は1として計算するが、結果を
+`best_effort`として理由を表示する。正規化済み数値のdecimal表現から有理数で
+right-nested ratioを計算し、overflowと閉区間境界の丸め誤判定を避けて全dividerを
+先に検証する。Herdr 0.8の閉区間
+`0.1..0.9`外が1つでもあれば、`degraded / ratio_unrepresentable`として実行targetを
+1件も返さない。列数による任意の上限は設けない。
+
+planのorder / ratio targetはpane locatorではなく`host_id + workspace_id + lane_id`の
+Unit keyを保持する。現local Herdr resolverではhostを`local`に正規化し、空identity・
+non-local host・registry workspace不一致を拒否する。registry canonical liveness、
+正規化済みconfig、rule facts、計算algorithm versionからprivate pathを公開しない
+opaque source fingerprintを作る。fingerprintがないpure math planはapply可能としない。
+本sliceはpaneを動かさず、後続actionはそのfingerprintとidentity・generation・同一tab・
+geometryをapply直前に再確認する。
 
 ### projection_preferences
 
@@ -543,9 +579,14 @@ first slice を `src/mozyo_bridge/presentation_state.py` に実装した
   `presentation_seed_provenance` table を持つ。
 - seed / migration: 静的 repo-local `.mozyo-bridge/config.yaml` の `presentation`
   block (`PresentationGroupingConfig`) の **`unit_overrides` のみ** を current tables へ
-  seed する (`seed_from_grouping_config`)。`preferred_group` (+ `position` / `pinned` /
-  `hidden`) → membership、`preferred_projection` → projection preference。`unit_id` は
+  seed する (`seed_from_grouping_config`)。`preferred_group` (+ `position` /
+  `relative_width` / `pinned` / `hidden`) → membership (`relative_width`は既存
+  `width_weight`列)、`preferred_projection` → projection preference。`unit_id` は
   `(host_id, workspace_id, lane_id)` から決定的に導出する public-safe join key。
+- `preferred_group`を持たないwidth-only overrideと`membership_rules`はcurrent rowを
+  捏造せず、列plan時にrepo-local configから解決する。group付きoverrideから
+  `relative_width`を削除して再seedした場合は、以前seedした`width_weight`をNULLへ戻す。
+  schema versionは既存のv1を維持する。
 - idempotent: content-comparing upsert。desired 内容が一致する row は `updated_at` も
   書き換えない。無変更 config の再 seed は完全な no-op。
 - non-destructive: seed は insert / update のみで **delete しない**。config から消えた

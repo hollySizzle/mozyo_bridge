@@ -43,7 +43,7 @@ Herdr-hosted plugin の存在を理由に、その境界を緩めない。
 | workspace / lane / role identity | registry / workspace anchor / managed lane record | stable keyとして参照。再定義しない |
 | runtime target / liveness | action-time live Herdr inventory + process preflight | observed stateを表示。cached stateだけで送信しない |
 | desired portable presentation | repo-local typed config | default / seedとして読む |
-| operator-local presentation | home-scoped presentation state | position、pin、hide、collapse等を保存 |
+| operator-local presentation | home-scoped presentation state | position、relative width、pin、hide、collapse等を保存 |
 | live geometry | observed Herdr pane / tab geometry | drift表示。identityへ昇格しない |
 | delivery authorization / exact-once / generation | mozyo-bridge workflow engine | safe actionの結果を表示。consumer独自送信をしない |
 
@@ -81,7 +81,7 @@ operator の主な表示像は、1 Unit を縦長の pair とし、複数 Unit �
 presentation consumer が扱ってよい候補:
 
 - Project / coordinator / sublane の grouping。
-- Unit の `position` / `pinned` / `hidden` / `collapsed`。
+- Unit の `position` / `relative_width` / `pinned` / `hidden` / `collapsed`。
 - public-safe `label_override`、attention badge、delegation depth / tree。
 - `implementing` / `review_waiting` / `blocked` / callback due 等の filter。
 - focus / navigation。
@@ -163,7 +163,8 @@ UX 実装を先行させない。ただし、engine を UI から利用不能な
 | --- | --- |
 | Unit / Target、event、attentionの基本projection | existing |
 | repo-local presentation seed / home-scoped presentation state first slice | existing |
-| shared / separate表示方針、position / pin / hide等のschema | existing |
+| shared / separate表示方針、position / relative_width / pin / hide等のschema | existing |
+| Unit列順・相対幅のnon-mutating Herdr plan | existing (#14606) |
 | Herdr 0.7.5 pane-target launch | proposed in #14617 |
 | native atomic prompt transport | proposed in #14618 |
 | Herdr plugin allow / deny preflight | proposed in #14619 |
@@ -176,8 +177,12 @@ Redmine #15114 で、Herdr 0.8.0 の display metadata と plugin-owned popup を
 `mozyo Unit board` を最初の presentation consumer として実装した。Redmine #15116
 では #14608 のpreview-first safe actionを接続し、選択した専用2-pane Unitを明示操作時だけ
 宣言済みsplit / order / ratioへ収束する。plugin自身はraw pane APIを呼ばず、agent input、
-workflow / Redmine / DBへwriteしない。shared tab上の複数Unit列の自由移動は #14604 / #14606
-のbackend成立後に接続する別段階である。詳細は `herdr-unit-board.md` を読む。
+workflow / Redmine / DBへwriteしない。#14606で既存`position`と`relative_width`から
+desired order / weighted divider ratioを作るnon-mutating planを追加した。shared tab上の
+既存Unit列を実際に移動するactionとUnit board接続は、apply直前のlive再照合を持つ
+後続段階である。planはpane locatorを公開せずUnit keyとopaque source fingerprintを
+保持し、全ratioを検証できない場合は操作targetを返さない。詳細は
+`herdr-unit-board.md` を読む。
 
 ## Non-Goals
 

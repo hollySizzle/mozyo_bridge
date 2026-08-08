@@ -50,6 +50,9 @@ from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.do
     resolve_launch_placement,
     resolve_sublane_window_placement,
 )
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping.placement import (  # noqa: E501
+    resolve_unit_column_preferences,
+)
 
 
 def _full_config() -> PresentationGroupingConfig:
@@ -73,6 +76,7 @@ def _full_config() -> PresentationGroupingConfig:
                         "when": {"repo_label": "alpha"},
                         "group_id": "project:alpha",
                         "position": 5,
+                        "relative_width": 2,
                         "preferred_projection": "cockpit_pane",
                     },
                     {
@@ -87,6 +91,7 @@ def _full_config() -> PresentationGroupingConfig:
                         "lane_id": "default",
                         "preferred_group": "project:beta",
                         "position": 1,
+                        "relative_width": 3.5,
                         "hidden": True,
                         "label_override": "Special",
                     }
@@ -147,6 +152,7 @@ class ConfiguredPlacementTest(unittest.TestCase):
         self.assertEqual(placement.group_id, "project:alpha")
         self.assertEqual(placement.label, "Alpha")
         self.assertEqual(placement.position, 5)
+        self.assertEqual(placement.relative_width, 2.0)
         self.assertEqual(placement.preferred_projection, "cockpit_pane")
 
     def test_membership_rule_by_lane_prefix(self) -> None:
@@ -174,6 +180,7 @@ class ConfiguredPlacementTest(unittest.TestCase):
         self.assertEqual(placement.status, STATUS_CONFIGURED)
         self.assertEqual(placement.group_id, "project:beta")
         self.assertEqual(placement.position, 1)
+        self.assertEqual(placement.relative_width, 3.5)
         self.assertTrue(placement.hidden)
         self.assertEqual(placement.label, "Special")  # label_override
 
@@ -246,6 +253,85 @@ class ConfiguredPlacementTest(unittest.TestCase):
             LaunchContext(workspace_id="ws1", repo_label="alpha", project_id="100"),
         )
         self.assertEqual(hit.group_id, "project:alpha")
+
+    def test_column_fields_fall_through_a_label_only_override(self) -> None:
+        config = PresentationGroupingConfig.from_record(
+            {
+                "grouping": {
+                    "membership_rules": [
+                        {
+                            "when": {"repo_label": "alpha"},
+                            "position": 7,
+                            "relative_width": 2,
+                        }
+                    ],
+                    "unit_overrides": [
+                        {
+                            "workspace_id": "ws-special",
+                            "lane_id": "default",
+                            "label_override": "Special",
+                        }
+                    ],
+                }
+            }
+        )
+        preferences = resolve_unit_column_preferences(
+            config,
+            LaunchContext(
+                workspace_id="ws-special",
+                lane_id="default",
+                repo_label="alpha",
+            ),
+        )
+        self.assertEqual(preferences.position, 7)
+        self.assertEqual(preferences.relative_width, 2.0)
+        self.assertFalse(preferences.context_incomplete)
+
+    def test_column_rule_unknown_fact_is_not_a_silent_miss(self) -> None:
+        config = PresentationGroupingConfig.from_record(
+            {
+                "grouping": {
+                    "membership_rules": [
+                        {
+                            "when": {"project_id": "100"},
+                            "position": 1,
+                        },
+                        {"when": {}, "position": 2},
+                    ]
+                }
+            }
+        )
+        preferences = resolve_unit_column_preferences(
+            config,
+            LaunchContext(workspace_id="ws", lane_id="default"),
+        )
+        self.assertEqual(preferences.position, 2)
+        self.assertTrue(preferences.context_incomplete)
+
+    def test_multiple_matching_column_overrides_fail_closed(self) -> None:
+        config = PresentationGroupingConfig.from_record(
+            {
+                "grouping": {
+                    "unit_overrides": [
+                        {
+                            "workspace_id": "ws",
+                            "lane_id": "default",
+                            "position": 1,
+                        },
+                        {
+                            "workspace_id": "ws",
+                            "lane_id": "default",
+                            "relative_width": 2,
+                        },
+                    ]
+                }
+            }
+        )
+        with self.assertRaises(PresentationGroupingConfigError):
+            resolve_unit_column_preferences(
+                config,
+                LaunchContext(workspace_id="ws", lane_id="default"),
+            )
 
 
 class ResolveGroupWindowPlacementTest(unittest.TestCase):
