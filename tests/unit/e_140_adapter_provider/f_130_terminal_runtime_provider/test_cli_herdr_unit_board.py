@@ -295,7 +295,13 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
         self.assertNotIn("--token", clear)
 
     def test_sync_clears_metadata_after_managed_agent_disappears_from_agent_list(self) -> None:
-        tokens = {"mozyo_unit": "previous-unit", "unrelated": "preserved"}
+        tokens = {
+            **{
+                key: f"previous-{index}"
+                for index, key in enumerate(METADATA_TOKEN_KEYS)
+            },
+            "unrelated": "preserved",
+        }
         calls: list[list[str]] = []
 
         def runner(argv, **kwargs):
@@ -337,8 +343,73 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
         ]
         self.assertEqual(len(clear_calls), 1)
         self.assertIn("--clear-title", clear_calls[0])
-        self.assertNotIn("mozyo_unit", tokens)
+        cleared = {
+            clear_calls[0][index + 1]
+            for index, value in enumerate(clear_calls[0])
+            if value == "--clear-token"
+        }
+        self.assertEqual(cleared, set(METADATA_TOKEN_KEYS))
+        self.assertTrue(all(key not in tokens for key in METADATA_TOKEN_KEYS))
         self.assertEqual(tokens["unrelated"], "preserved")
+
+    def test_sync_reconciles_a_new_managed_identity_that_starts_before_stale_clear(self) -> None:
+        current_agents: list[tuple[dict[str, object], ...]] = [()]
+        tokens = {key: "stale-value" for key in METADATA_TOKEN_KEYS}
+        calls: list[list[str]] = []
+
+        class CurrentLister:
+            def list_agent_rows(self):
+                return current_agents[0]
+
+        def runner(argv, **kwargs):
+            calls.append(list(argv))
+            if "--clear-token" in argv:
+                current_agents[0] = (row("codex", "w1:p2"),)
+                for index, value in enumerate(argv):
+                    if value == "--clear-token":
+                        tokens.pop(argv[index + 1], None)
+            else:
+                for index, value in enumerate(argv):
+                    if value == "--token":
+                        key, token_value = argv[index + 1].split("=", 1)
+                        tokens[key] = token_value
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        board = HerdrUnitBoardRuntime(
+            "/bin/herdr",
+            lister=CurrentLister(),
+            runner=runner,
+            workspace_loader=lambda workspace_id: workspace_record(),
+            role_loader=lambda repo: role_bindings(),
+            lane_records_loader=lambda: {},
+            pane_rows_loader=lambda: pane_rows("w1:p2", tokens=tokens),
+            sync_lock_factory=nullcontext,
+        )
+
+        report = board.sync_metadata()
+
+        self.assertTrue(report.ok)
+        self.assertEqual(report.attempted, 2)
+        self.assertEqual(report.updated, 2)
+        self.assertIn("--clear-token", calls[0])
+        self.assertIn("--token", calls[1])
+        self.assertTrue(all(tokens[key] != "stale-value" for key in METADATA_TOKEN_KEYS))
+
+    def test_duplicate_complete_pane_locator_fails_closed_without_metadata_write(self) -> None:
+        runner = mock.Mock()
+        board = HerdrUnitBoardRuntime(
+            "/bin/herdr",
+            lister=FakeLister(()),
+            runner=runner,
+            pane_rows_loader=lambda: pane_rows("w1:p2", "w1:p2"),
+            sync_lock_factory=nullcontext,
+        )
+
+        report = board.sync_metadata()
+
+        self.assertFalse(report.ok)
+        self.assertEqual(report.attempted, 0)
+        runner.assert_not_called()
 
     def test_unreadable_complete_pane_inventory_fails_closed_without_metadata_write(self) -> None:
         calls: list[list[str]] = []
