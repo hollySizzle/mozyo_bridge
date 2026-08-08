@@ -7,6 +7,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -15,6 +16,11 @@ from mozyo_bridge.core.state.herdr_identity_attestation import VERDICT_PRESENT
 from mozyo_bridge.core.state.herdr_launch_generation import (
     GENERATION_ATTESTED,
     LaunchGeneration,
+)
+from mozyo_bridge.core.state.lane_lifecycle import (
+    DISPOSITION_ACTIVE,
+    DISPOSITION_HIBERNATED,
+    ProcessGenerationPin,
 )
 from mozyo_bridge.core.state.workspace_registry import WorkspaceRecord
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_live_pair_placement import (
@@ -35,6 +41,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     REASON_STALE,
     HerdrLivePairPlacement,
     PlacementPlan,
+    PlacementTarget,
     _target_for,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
@@ -72,9 +79,34 @@ class PairPlacementHerdr(PaneTreeHerdr):
         self.swap_unchanged = False
         self.third_pane_after_first_move = False
         self.reported_temp_tab = ""
+        self.extra_layout_split = False
 
     def __call__(self, argv, capture_output=None, text=None, timeout=None, env=None, **kwargs):
         tail = list(argv[1:])
+        if tail[:2] == ["pane", "layout"] and self.extra_layout_split:
+            completed = super().__call__(
+                argv,
+                capture_output=capture_output,
+                text=text,
+                timeout=timeout,
+                env=env,
+                **kwargs,
+            )
+            payload = json.loads(completed.stdout)
+            payload["result"]["layout"]["splits"].append(
+                {
+                    "id": "foreign-split",
+                    "direction": "right",
+                    "ratio": 0.5,
+                    "rect": {"x": 0, "y": 0, "width": 54, "height": 23},
+                }
+            )
+            return subprocess.CompletedProcess(
+                completed.args,
+                completed.returncode,
+                stdout=json.dumps(payload),
+                stderr=completed.stderr,
+            )
         if tail[:2] == ["pane", "move"]:
             completed = super().__call__(
                 argv,
@@ -423,6 +455,31 @@ class HerdrLivePairPlacementTests(unittest.TestCase):
         self.assertEqual(plan.reason, REASON_PAIR_INVALID)
         self.assertFalse(any(call[:2] == ["pane", "layout"] for call in herdr.calls))
 
+    def test_foreign_inventory_row_cannot_duplicate_target_locator(self) -> None:
+        service, herdr, _, panes = self._build(split="right")
+        herdr.extra_rows.append(
+            {
+                "name": "foreign-agent",
+                "pane_id": panes["codex"],
+                "agent": "codex",
+                "cwd": self.record.canonical_path,
+            }
+        )
+
+        plan = service.preview(WORKSPACE_ID)
+
+        self.assertEqual(plan.reason, REASON_PAIR_INVALID)
+        self.assertEqual(self._mutations(herdr), [])
+
+    def test_extra_layout_split_refuses_before_mutation(self) -> None:
+        service, herdr, _, _ = self._build(split="right")
+        herdr.extra_layout_split = True
+
+        plan = service.preview(WORKSPACE_ID)
+
+        self.assertEqual(plan.reason, "geometry_unsupported")
+        self.assertEqual(self._mutations(herdr), [])
+
     def test_invalid_tab_locator_refuses_before_mutation(self) -> None:
         service, herdr, _, _ = self._build(split="right")
         next(iter(herdr.tabs.values())).tab_id = "--synthetic-option"
@@ -450,12 +507,22 @@ class HerdrLivePairPlacementTests(unittest.TestCase):
             self.assertIn("[redacted]", public)
 
     def test_sublane_default_order_comes_from_declared_pair_not_current_binding(self) -> None:
+        gateway = ProcessGenerationPin(
+            role="gateway",
+            provider="claude",
+            assigned_name=encode_assigned_name(WORKSPACE_ID, "claude", "issue_14608"),
+            locator="w1:p1",
+        )
+        worker = ProcessGenerationPin(
+            role="worker",
+            provider="codex",
+            assigned_name=encode_assigned_name(WORKSPACE_ID, "codex", "issue_14608"),
+            locator="w1:p2",
+        )
         lifecycle = SimpleNamespace(
+            lane_disposition=DISPOSITION_ACTIVE,
             lane_kind="implementation",
-            declared_pins=(
-                SimpleNamespace(role="gateway", provider="claude"),
-                SimpleNamespace(role="worker", provider="codex"),
-            ),
+            declared_pins=(gateway, worker),
         )
         reader_path = (
             "mozyo_bridge.e_140_adapter_provider."
@@ -468,6 +535,79 @@ class HerdrLivePairPlacementTests(unittest.TestCase):
             target = _target_for(self.record, "issue_14608")
 
         self.assertEqual(target.order, ("claude", "codex"))
+        self.assertEqual(target.declared_pins, (gateway, worker))
+
+    def test_sublane_hibernated_lifecycle_is_not_a_placement_target(self) -> None:
+        lifecycle = SimpleNamespace(
+            lane_disposition=DISPOSITION_HIBERNATED,
+            lane_kind="implementation",
+            declared_pins=(),
+        )
+        reader_path = (
+            "mozyo_bridge.e_140_adapter_provider."
+            "f_130_terminal_runtime_provider.application."
+            "herdr_live_pair_placement.LaneLifecycleReader"
+        )
+
+        with patch(reader_path) as reader:
+            reader.return_value.get.return_value = lifecycle
+            with self.assertRaises(ValueError):
+                _target_for(self.record, "issue_14608")
+
+    def test_declared_generation_mismatch_refuses_before_mutation(self) -> None:
+        service, herdr, _, panes = self._build(split="right")
+        rows = tuple(herdr._rows())
+        gateway = ProcessGenerationPin(
+            role="gateway",
+            provider="codex",
+            assigned_name=encode_assigned_name(WORKSPACE_ID, "codex", LANE_ID),
+            locator=panes["codex"],
+        )
+        worker = ProcessGenerationPin(
+            role="worker",
+            provider="claude",
+            assigned_name=encode_assigned_name(WORKSPACE_ID, "claude", LANE_ID),
+            locator=panes["claude"],
+        )
+        mismatches = (
+            replace(gateway, assigned_name=encode_assigned_name(WORKSPACE_ID, "codex", "foreign")),
+            replace(gateway, locator="w1:p999"),
+            replace(gateway, provider="other"),
+        )
+        for mismatched in mismatches:
+            with self.subTest(pin=mismatched.match_key):
+                target = PlacementTarget(
+                    "down", PROVIDERS, 0.5, (mismatched, worker)
+                )
+                slots, reason, _ = service._resolve_slots(
+                    workspace_id=WORKSPACE_ID,
+                    lane_id=LANE_ID,
+                    target=target,
+                    rows=rows,
+                )
+                self.assertIsNone(slots)
+                self.assertEqual(reason, REASON_PAIR_INVALID)
+        revision_rows = tuple(
+            {**row, "runtime_revision": "live-r2"}
+            if row.get("name") == gateway.assigned_name
+            else row
+            for row in rows
+        )
+        target = PlacementTarget(
+            "down",
+            PROVIDERS,
+            0.5,
+            (replace(gateway, runtime_revision="declared-r1"), worker),
+        )
+        slots, reason, _ = service._resolve_slots(
+            workspace_id=WORKSPACE_ID,
+            lane_id=LANE_ID,
+            target=target,
+            rows=revision_rows,
+        )
+        self.assertIsNone(slots)
+        self.assertEqual(reason, REASON_PAIR_INVALID)
+        self.assertEqual(self._mutations(herdr), [])
 
     def test_cli_surface_has_no_pane_id_input(self) -> None:
         parser = argparse.ArgumentParser()

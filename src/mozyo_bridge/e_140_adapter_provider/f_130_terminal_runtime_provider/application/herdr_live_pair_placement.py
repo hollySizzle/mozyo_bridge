@@ -23,7 +23,11 @@ from mozyo_bridge.core.state.herdr_launch_generation import (
     HerdrLaunchGenerationStore,
 )
 from mozyo_bridge.core.state.lane_kind import LANE_KIND_COORDINATOR
-from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleKey
+from mozyo_bridge.core.state.lane_lifecycle import (
+    DISPOSITION_ACTIVE,
+    LaneLifecycleKey,
+    ProcessGenerationPin,
+)
 from mozyo_bridge.core.state.lane_lifecycle_readonly import LaneLifecycleReader
 from mozyo_bridge.core.state.lane_pin_role import read_declared_pin_pair
 from mozyo_bridge.core.state.workspace_registry import WorkspaceRecord, load_workspace_by_id
@@ -58,6 +62,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     HerdrSessionStartError,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+    AGENT_KEY_LOCATOR,
+    AGENT_KEY_LOCATOR_ALIAS,
+    AGENT_KEY_LOCATOR_ALIAS_2,
     decode_assigned_name,
     encode_assigned_name,
     rebind_by_name,
@@ -113,6 +120,9 @@ class PlacementTarget:
     split: str
     order: tuple[str, str]
     ratio: float
+    declared_pins: tuple[ProcessGenerationPin, ...] = field(
+        default=(), repr=False
+    )
 
     def as_payload(self) -> dict[str, object]:
         return {
@@ -128,10 +138,17 @@ class LiveSlot:
     assigned_name: str = field(repr=False)
     pane_id: str = field(repr=False)
     generation: str = field(repr=False)
+    runtime_revision: str = field(default="", repr=False)
 
     @property
-    def fingerprint(self) -> tuple[str, str, str, str]:
-        return (self.provider, self.assigned_name, self.pane_id, self.generation)
+    def fingerprint(self) -> tuple[str, str, str, str, str]:
+        return (
+            self.provider,
+            self.assigned_name,
+            self.pane_id,
+            self.generation,
+            self.runtime_revision,
+        )
 
 
 @dataclass(frozen=True)
@@ -259,8 +276,14 @@ def _target_for(record: WorkspaceRecord, lane_id: str) -> PlacementTarget:
     lane_class = "default" if lane_id == "default" else "sublane"
     lane_kind: Optional[str] = LANE_KIND_COORDINATOR if lane_class == "default" else None
     lifecycle = None
+    declared_pins: tuple[ProcessGenerationPin, ...] = ()
     if lane_class == "sublane":
         lifecycle = LaneLifecycleReader().get(LaneLifecycleKey(record.workspace_id, lane_id))
+        if (
+            lifecycle is None
+            or getattr(lifecycle, "lane_disposition", None) != DISPOSITION_ACTIVE
+        ):
+            raise ValueError("sublane placement requires an active lifecycle")
         lane_kind = (lifecycle.lane_kind or None) if lifecycle is not None else None
     resolved = config.lane_placement.resolve_effective(lane_class, lane_kind)
     if lane_class == "default":
@@ -269,6 +292,11 @@ def _target_for(record: WorkspaceRecord, lane_id: str) -> PlacementTarget:
         declared = read_declared_pin_pair(lifecycle) if lifecycle is not None else None
         if declared is None or not declared.ok:
             raise ValueError("sublane placement requires one declared live pair")
+        if not isinstance(declared.gateway, ProcessGenerationPin) or not isinstance(
+            declared.worker, ProcessGenerationPin
+        ):
+            raise ValueError("sublane placement requires typed generation pins")
+        declared_pins = (declared.gateway, declared.worker)
         pair_order = (
             getattr(declared.gateway, "provider", ""),
             getattr(declared.worker, "provider", ""),
@@ -280,12 +308,23 @@ def _target_for(record: WorkspaceRecord, lane_id: str) -> PlacementTarget:
         or len(order or ()) != 2
         or not all(isinstance(value, str) and value for value in order or ())
         or len(set(order or ())) != 2
+        or (
+            declared_pins
+            and set(order or ()) != {pin.provider for pin in declared_pins}
+        )
     ):
         raise ValueError("effective lane placement is not one exact two-provider target")
-    return PlacementTarget(resolved.split, tuple(order), float(resolved.ratio))  # type: ignore[arg-type]
+    return PlacementTarget(
+        resolved.split,
+        tuple(order),  # type: ignore[arg-type]
+        float(resolved.ratio),
+        declared_pins,
+    )
 
 
 def _current_split(layout, pane_to_provider: Mapping[str, str]):
+    if len(layout.splits) != 1:
+        return None
     pane_ids = tuple(pane_to_provider)
     candidates = []
     for direction in ("down", "right"):
@@ -303,6 +342,16 @@ def _current_split(layout, pane_to_provider: Mapping[str, str]):
         if governing is not None and governing.rect == split.rect:
             candidates.append((split, first, pane_to_provider[first_id], pane_to_provider[second_id]))
     return candidates[0] if len(candidates) == 1 else None
+
+
+def _row_locator_claims(row: Mapping[str, object]) -> frozenset[str]:
+    """Return every non-empty locator alias one inventory row claims."""
+    claims: set[str] = set()
+    for key in (AGENT_KEY_LOCATOR, AGENT_KEY_LOCATOR_ALIAS, AGENT_KEY_LOCATOR_ALIAS_2):
+        value = row.get(key)
+        if isinstance(value, str) and value.strip():
+            claims.add(value.strip())
+    return frozenset(claims)
 
 
 def decide_plan(
@@ -391,6 +440,21 @@ class HerdrLivePairPlacement:
 
         slots: list[LiveSlot] = []
         locators: set[str] = set()
+        pin_by_provider: dict[str, ProcessGenerationPin] = {}
+        for pin in target.declared_pins:
+            if not isinstance(pin, ProcessGenerationPin) or pin.provider in pin_by_provider:
+                return (
+                    None,
+                    REASON_PAIR_INVALID,
+                    "the declared provider generation is ambiguous",
+                )
+            pin_by_provider[pin.provider] = pin
+        if pin_by_provider and set(pin_by_provider) != set(target.order):
+            return (
+                None,
+                REASON_PAIR_INVALID,
+                "the declared provider pair does not match the placement target",
+            )
         for provider in target.order:
             name = encode_assigned_name(workspace_id, provider, lane_id)
             matching = [row for row in exact_rows if row.get("name") == name]
@@ -402,10 +466,18 @@ class HerdrLivePairPlacement:
                 )
             row = matching[0]
             rebound = rebind_by_name(name, rows)
+            owners = [
+                candidate
+                for candidate in rows
+                if rebound.locator and rebound.locator in _row_locator_claims(candidate)
+            ]
             if (
                 not rebound.is_rebound
                 or not valid_target(rebound.locator)
                 or rebound.locator in locators
+                or _row_locator_claims(row) != {rebound.locator}
+                or len(owners) != 1
+                or owners[0] is not row
             ):
                 return (
                     None,
@@ -413,6 +485,33 @@ class HerdrLivePairPlacement:
                     "a managed provider locator is missing, duplicated, or invalid",
                 )
             locators.add(rebound.locator)
+
+            raw_runtime_revision = row.get("runtime_revision")
+            if raw_runtime_revision is None:
+                runtime_revision = ""
+            elif isinstance(raw_runtime_revision, str):
+                runtime_revision = raw_runtime_revision.strip()
+            else:
+                return (
+                    None,
+                    REASON_PAIR_INVALID,
+                    "a managed provider has malformed runtime revision evidence",
+                )
+            declared_pin = pin_by_provider.get(provider)
+            if declared_pin is not None:
+                live_pin = ProcessGenerationPin(
+                    role=declared_pin.role,
+                    provider=provider,
+                    assigned_name=name,
+                    locator=rebound.locator,
+                    runtime_revision=runtime_revision,
+                )
+                if not declared_pin.binds_same_generation(live_pin):
+                    return (
+                        None,
+                        REASON_PAIR_INVALID,
+                        "a managed provider does not match its declared generation",
+                    )
 
             if row.get("agent") != provider or classify_named_slot(row) != SLOT_LIVE:
                 return (
@@ -481,6 +580,7 @@ class HerdrLivePairPlacement:
                     name,
                     rebound.locator,
                     generation.startup_action_id,
+                    runtime_revision,
                 )
             )
         return tuple(slots), REASON_OK, ""  # type: ignore[return-value]
