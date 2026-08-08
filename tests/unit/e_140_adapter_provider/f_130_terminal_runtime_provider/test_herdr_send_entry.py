@@ -80,9 +80,10 @@ class _Ctx:
     """A prepared herdr workspace: config, anchor, fake binary + runner."""
 
     def __init__(self, tmp, *, backend="herdr", rows=None, sender_role="codex", sender_lane="lane-1"):
-        self.repo = Path(tmp) / "repo"
+        canonical_tmp = Path(tmp).resolve()
+        self.repo = canonical_tmp / "repo"
         self.repo.mkdir()
-        self.home = Path(tmp) / "home"
+        self.home = canonical_tmp / "home"
         self.home.mkdir()
         (self.repo / ".mozyo-bridge").mkdir()
         (self.repo / ".mozyo-bridge" / "config.yaml").write_text(
@@ -91,7 +92,7 @@ class _Ctx:
         register_workspace(self.repo, home=self.home)
         self.workspace_id = read_anchor(self.repo)["workspace_id"]
         self.rows = rows(self.workspace_id) if rows else []
-        binpath = Path(tmp) / "fake-herdr"
+        binpath = canonical_tmp / "fake-herdr"
         binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
         self.binpath = binpath
@@ -306,7 +307,7 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
 
     @staticmethod
     def _target_repo(ctx, tmp, *, backend="herdr"):
-        target = Path(tmp) / "target-repo"
+        target = Path(tmp).resolve() / "target-repo"
         target.mkdir()
         (target / ".mozyo-bridge").mkdir()
         (target / ".mozyo-bridge" / "config.yaml").write_text(
