@@ -16,8 +16,9 @@ than a line count:
 The disclosure boundary lives here, because this is where third-party data stops
 being third-party data. :class:`PluginObservation` is a **closed representation**:
 every field is a core-owned value — a projected vocabulary token, a validated
-reference, a strict boolean — except the plugin id, which is a *bounded*
-identifier and is echoed only because it is the operand an operator types.
+reference, a strict boolean, or a canonical capability digest — except the
+plugin id, which is a *bounded* identifier and is echoed only because it is the
+operand an operator types.
 ``__post_init__`` checks every field against a validator table and refuses to
 construct a record whose field has no validator, so the guarantee does not depend
 on anyone remembering to extend a hand-written check.
@@ -43,6 +44,8 @@ Pure: no file IO, no subprocess, no network.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 import re
 from types import MappingProxyType
 
@@ -93,6 +96,45 @@ MAX_SEGMENT_LENGTH = 64
 #: depth bound prevents a syntactically valid third-party value from becoming an
 #: unbounded report channel.
 MAX_SUBDIR_SEGMENTS = 16
+
+#: Canonical, path-free fingerprint of the Herdr fields that can execute code or
+#: decide where that code executes.  The digest is compared with the value recorded
+#: by an independent review; command strings themselves never cross the public
+#: policy-report boundary.
+MANIFEST_CAPABILITY_DIGEST_SCHEMA = "herdr-plugin-capability-v1"
+MAX_MANIFEST_CAPABILITY_BYTES = 65_536
+MAX_MANIFEST_CAPABILITY_DEPTH = 8
+MAX_MANIFEST_CAPABILITY_NODES = 1_024
+_MANIFEST_CAPABILITY_LIST_FIELDS = (
+    "platforms",
+    "build",
+    "startup",
+    "actions",
+    "events",
+    "panes",
+    "link_handlers",
+)
+_KNOWN_INSTALLED_PLUGIN_FIELDS = frozenset(
+    {
+        "plugin_id",
+        "name",
+        "version",
+        "min_herdr_version",
+        "description",
+        "manifest_path",
+        "plugin_root",
+        "enabled",
+        "platforms",
+        "build",
+        "startup",
+        "actions",
+        "events",
+        "panes",
+        "link_handlers",
+        "source",
+        "warnings",
+    }
+)
 
 #: Upper bound on any single rendered text field (a diagnostic sentence, not an
 #: essay). Bounds are part of the boundary: an unbounded field is a channel.
@@ -263,12 +305,17 @@ class PluginSourceRef:
                 f"source kind {self.kind!r} is not a pinnable upstream identity; "
                 f"only {SOURCE_KIND_GITHUB!r} resolves to an immutable commit"
             )
-        _require_segment(self.owner, "source owner")
-        _require_segment(self.repo, "source repo")
+        owner = _require_segment(self.owner, "source owner")
+        repo = _require_segment(self.repo, "source repo")
         if self.owner in {".", ".."} or self.repo in {".", ".."}:
             raise HerdrPluginPolicyError(
                 "source owner and repo must not be navigational segments"
             )
+        # GitHub repository identity is ASCII case-insensitive.  Keeping Herdr's
+        # input spelling here made one repository acquire several policy keys and
+        # let a repository-wide deny miss a case variant (review j#101228 C2-F3).
+        object.__setattr__(self, "owner", owner.lower())
+        object.__setattr__(self, "repo", repo.lower())
         _require_subdir_segments(self.subdir)
         if self.commit is not None:
             if not isinstance(self.commit, str):
@@ -448,6 +495,109 @@ def _check_optional_ref(value: object, name: str) -> None:
         )
 
 
+def _check_manifest_digest(value: object, name: str) -> None:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise HerdrPluginPolicyError(
+            f"{name} must be a 64-character lowercase SHA-256 digest"
+        )
+
+
+def _validate_manifest_json_node(
+    value: object,
+    *,
+    depth: int,
+    budget: list[int],
+) -> None:
+    """Validate one bounded JSON value without retaining third-party text."""
+    if depth > MAX_MANIFEST_CAPABILITY_DEPTH:
+        raise HerdrPluginPolicyError("plugin manifest capability surface is too deep")
+    budget[0] += 1
+    if budget[0] > MAX_MANIFEST_CAPABILITY_NODES:
+        raise HerdrPluginPolicyError("plugin manifest capability surface is too large")
+    if value is None or isinstance(value, (str, bool)):
+        return
+    if isinstance(value, int) and not isinstance(value, bool):
+        return
+    if isinstance(value, list):
+        for item in value:
+            _validate_manifest_json_node(item, depth=depth + 1, budget=budget)
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise HerdrPluginPolicyError(
+                    "plugin manifest capability object has a non-string key"
+                )
+            _validate_manifest_json_node(item, depth=depth + 1, budget=budget)
+        return
+    raise HerdrPluginPolicyError(
+        "plugin manifest capability surface is not canonical JSON"
+    )
+
+
+def manifest_capability_digest(record: Mapping[object, object]) -> str:
+    """Hash the current normalized Herdr execution surface, fail-closed.
+
+    Herdr 0.8 reloads the manifest from disk but retains the old ``source`` pin.
+    Therefore the pin alone does not prove which commands will run.  This digest
+    binds the normalized command-bearing fields returned by ``plugin list`` to the
+    independently reviewed surface.  Unknown top-level fields are refused so a
+    future Herdr capability cannot silently sit outside this vocabulary.
+    """
+    if any(not isinstance(key, str) for key in record):
+        raise HerdrPluginPolicyError("plugin record has a non-string field name")
+    unknown = set(record) - _KNOWN_INSTALLED_PLUGIN_FIELDS
+    if unknown:
+        raise HerdrPluginPolicyError(
+            "plugin record contains a field outside the supported Herdr 0.8 schema"
+        )
+    minimum = record.get("min_herdr_version", "")
+    if not isinstance(minimum, str):
+        raise HerdrPluginPolicyError(
+            "plugin record field 'min_herdr_version' must be a string"
+        )
+    surface: dict[str, object] = {
+        "schema": MANIFEST_CAPABILITY_DIGEST_SCHEMA,
+        "min_herdr_version": minimum,
+    }
+    for key in _MANIFEST_CAPABILITY_LIST_FIELDS:
+        value = record.get(key, [])
+        if not isinstance(value, list):
+            raise HerdrPluginPolicyError(
+                f"plugin record field {key!r} must be a list"
+            )
+        surface[key] = value
+    _validate_manifest_json_node(surface, depth=0, budget=[0])
+    try:
+        canonical = json.dumps(
+            surface,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise HerdrPluginPolicyError(
+            "plugin manifest capability surface cannot be canonicalized"
+        ) from exc
+    if len(canonical) > MAX_MANIFEST_CAPABILITY_BYTES:
+        raise HerdrPluginPolicyError("plugin manifest capability surface is too large")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _manifest_has_warnings(record: Mapping[object, object]) -> bool:
+    if "warnings" not in record:
+        return False
+    warnings = record["warnings"]
+    if not isinstance(warnings, list) or any(
+        not isinstance(warning, str) for warning in warnings
+    ):
+        raise HerdrPluginPolicyError(
+            "plugin record field 'warnings' must be a list of strings"
+        )
+    return bool(warnings)
+
+
 #: One validator per :class:`PluginObservation` field. ``__post_init__`` walks the
 #: dataclass's own field list against this table and refuses to construct anything
 #: when a field has no entry, so a field added later cannot slip through
@@ -465,6 +615,8 @@ _OBSERVATION_FIELD_CHECKS = MappingProxyType(
         "declares_build": _check_strict_bool,
         "declares_panes": _check_strict_bool,
         "declares_actions": _check_strict_bool,
+        "manifest_digest": _check_manifest_digest,
+        "manifest_warnings": _check_strict_bool,
     }
 )
 
@@ -482,8 +634,9 @@ class PluginObservation:
 
     What remains is a plugin id (a bounded identifier, which must be echoed because
     it is the operand an operator types), a projected source kind, a validated
-    reference, and three booleans recording only *whether* the local manifest
-    declares each surface — never the commands, which are third-party strings.
+    reference, three booleans recording only *whether* the local manifest
+    declares each surface, a warning bit, and a SHA-256 digest of the normalized
+    execution surface. Command strings are hashed but never retained or rendered.
     """
 
     plugin_id: str
@@ -493,6 +646,8 @@ class PluginObservation:
     declares_build: bool
     declares_panes: bool
     declares_actions: bool
+    manifest_digest: str
+    manifest_warnings: bool
 
     def __post_init__(self) -> None:
         missing = {
@@ -572,6 +727,8 @@ def observe_plugin(record: object) -> PluginObservation:
         declares_build=_declares(record, "build"),
         declares_panes=_declares(record, "panes"),
         declares_actions=_declares(record, "actions"),
+        manifest_digest=manifest_capability_digest(record),
+        manifest_warnings=_manifest_has_warnings(record),
     )
 
 
@@ -584,12 +741,15 @@ __all__ = (
     "MAX_RENDERED_FIELD_LENGTH",
     "MAX_SEGMENT_LENGTH",
     "MAX_SUBDIR_SEGMENTS",
+    "MANIFEST_CAPABILITY_DIGEST_SCHEMA",
+    "MAX_MANIFEST_CAPABILITY_BYTES",
     "REDACTED_TOKEN",
     "HerdrPluginPolicyError",
     "PluginObservation",
     "PluginSourceRef",
     "contains_absolute_path",
     "normalize_source_kind",
+    "manifest_capability_digest",
     "observe_plugin",
     "read_source_ref",
     "require_renderable_field",

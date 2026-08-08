@@ -57,6 +57,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_plugin_policy_ops import (
     InventoryReadError,
+    PolicyStatus,
     RenderGuardError,
     guard_rendered_payload,
     guard_rendered_text,
@@ -68,6 +69,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     parse_inventory,
     plan_candidate_install,
     plan_enable,
+    normalize_operand,
     query_inventory,
     read_inventory_document,
 )
@@ -266,7 +268,7 @@ def cmd_herdr_plugin_policy(args: argparse.Namespace) -> int:
     local inventory would only introduce a dependency on an unrelated surface.
     """
     as_json = bool(getattr(args, "json", False))
-    if getattr(args, "plan_install", None):
+    if getattr(args, "plan_install", None) is not None:
         install_plan = plan_candidate_install(
             args.plan_install, getattr(args, "ref", None)
         )
@@ -276,6 +278,20 @@ def cmd_herdr_plugin_policy(args: argparse.Namespace) -> int:
             as_json=as_json,
         )
         return blocked or (0 if install_plan.ok else 1)
+    raw_plan_enable = getattr(args, "plan_enable", None)
+    if raw_plan_enable is not None and normalize_operand(raw_plan_enable) is None:
+        # Operand validity is independent of the installed inventory.  In
+        # particular, ``--plan-enable ''`` must remain an invalid plan rather than
+        # becoming an inventory-status query that can exit zero (j#101228 C2-F2).
+        enable_plan = plan_enable(
+            PolicyStatus(verdicts=(), malformed=()), raw_plan_enable
+        )
+        blocked = _emit(
+            enable_plan.as_payload(),
+            format_enable_plan_text(enable_plan),
+            as_json=as_json,
+        )
+        return blocked or 1
     try:
         if getattr(args, "from_json", None):
             document = read_inventory_document(Path(args.from_json))
@@ -289,8 +305,8 @@ def cmd_herdr_plugin_policy(args: argparse.Namespace) -> int:
             as_json=as_json,
         )
         return 1
-    if getattr(args, "plan_enable", None):
-        enable_plan = plan_enable(status, args.plan_enable)
+    if raw_plan_enable is not None:
+        enable_plan = plan_enable(status, raw_plan_enable)
         blocked = _emit(
             enable_plan.as_payload(),
             format_enable_plan_text(enable_plan),
