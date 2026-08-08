@@ -158,6 +158,60 @@ class UnitBoardReadModelTests(unittest.TestCase):
             REDACTED_TEXT,
         )
 
+    def test_public_safe_projection_redacts_common_credential_shapes_on_every_rail(self) -> None:
+        access_key = "_".join(("AWS", "ACCESS", "KEY", "ID"))
+        access_assignment = "=".join(
+            (access_key, "-".join(("synthetic", "material", "123456")))
+        )
+        camel_access_assignment = "=".join(
+            ("".join(("access", "Key", "Id")), "synthetic-material-654321")
+        )
+        authorization = "".join(("Author", "ization"))
+        basic_header = ": ".join(
+            (authorization, " ".join(("Ba" + "sic", "c3ludGhldGljLW1hdGVyaWFs")))
+        )
+        jwt_assignment = "=".join(
+            (
+                "session",
+                ".".join(
+                    (
+                        "eyJzeW50aGV0aWMiOiJ0ZXN0In0",
+                        "eyJ2YWx1ZSI6InRlc3QifQ",
+                        "c3ludGhldGljc2lnbmF0dXJl",
+                    )
+                ),
+            )
+        )
+
+        for credential_shape in (
+            access_assignment,
+            camel_access_assignment,
+            basic_header,
+            jwt_assignment,
+        ):
+            with self.subTest(shape=credential_shape.split("=", 1)[0][:8]):
+                observation_with_credential = observation(
+                    "codex",
+                    "w1:p1",
+                    responsibility=credential_shape,
+                )
+                snapshot = build_unit_board(
+                    (observation_with_credential,), observed_at="now"
+                )
+                unit = snapshot.units[0]
+                payload = repr(unit.as_payload())
+                text = format_board(snapshot, width=120)
+                metadata = repr(metadata_for_unit(unit))
+
+                self.assertEqual(unit.responsibility, REDACTED_TEXT)
+                self.assertNotIn(credential_shape, payload)
+                self.assertNotIn(credential_shape, text)
+                self.assertNotIn(credential_shape, metadata)
+                self.assertEqual(
+                    metadata_for_unit(unit)[0]["mozyo_responsibility"],
+                    REDACTED_TEXT,
+                )
+
     def test_long_distinct_lane_identities_keep_distinct_unit_and_metadata_ids(self) -> None:
         common = "lane-" + ("x" * 90)
         snapshot = build_unit_board(

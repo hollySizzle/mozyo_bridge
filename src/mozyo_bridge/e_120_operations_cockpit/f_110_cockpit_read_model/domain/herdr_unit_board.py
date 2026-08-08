@@ -46,13 +46,25 @@ _CREDENTIAL_ASSIGNMENT_RE = re.compile(
 )
 _CREDENTIAL_KEY_PARTS = frozenset(
     {
+        "access_key",
+        "access_token",
         "api_key",
         "apikey",
+        "api_token",
+        "authorization",
         "auth_token",
+        "bearer",
+        "client_secret",
+        "cookie",
         "credential",
+        "jwt",
         "password",
+        "passwd",
         "private_key",
+        "refresh_token",
         "secret",
+        "secret_key",
+        "session_token",
         "token",
     }
 )
@@ -69,6 +81,10 @@ _OPAQUE_CREDENTIAL_RE = re.compile(
     r"\bsk-[A-Za-z0-9_-]{16,}\b|"
     r"\bAKIA[A-Z0-9]{16}\b|"
     r"\bbearer\s+\S{8,}|"
+    r"\bbasic\s+[A-Za-z0-9+/=._-]{8,}|"
+    r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{8,}\."
+    r"[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
+    r"(?![A-Za-z0-9_-])|"
     r"://[^/\s:@]+:[^/@\s]+@)",
     re.IGNORECASE,
 )
@@ -113,7 +129,11 @@ def _is_credential_shaped(value: str) -> bool:
         return True
     for match in _CREDENTIAL_ASSIGNMENT_RE.finditer(value):
         key = match.group("key").casefold().replace("-", "_").replace(".", "_")
-        if any(part in key for part in _CREDENTIAL_KEY_PARTS):
+        compact_key = key.replace("_", "")
+        if any(
+            part in key or part.replace("_", "") in compact_key
+            for part in _CREDENTIAL_KEY_PARTS
+        ):
             return True
     return False
 

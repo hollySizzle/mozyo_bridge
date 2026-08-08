@@ -165,45 +165,95 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
         self.assertEqual(report.failures[0].reason, "metadata_update_failed")
         self.assertNotIn("/private/x", repr(report.as_payload()))
 
+    def test_invalid_pane_locator_requires_reload_and_never_runs_metadata_command(self) -> None:
+        for locator in ("--help", "w1:p1 extra", "w1:p1;next"):
+            with self.subTest(locator=locator):
+                runner = mock.Mock()
+                board = runtime((row("codex", locator),), runner=runner)
+
+                snapshot = board.snapshot()
+                report = board.sync_metadata()
+
+                self.assertFalse(snapshot.ok)
+                self.assertEqual(snapshot.source_state, "reload_required")
+                self.assertFalse(report.ok)
+                self.assertEqual(report.source_state, "reload_required")
+                self.assertEqual(report.attempted, 0)
+                self.assertEqual(report.updated, 0)
+                runner.assert_not_called()
+
     def test_runtime_redacts_unsafe_authority_from_json_text_and_metadata_argv(self) -> None:
         private_path = "/" + "/".join(("synthetic", "private", "project"))
-        credential_key = "_".join(("AUTH", "TOKEN"))
-        credential_shape = "=".join((credential_key, "synthetic-value"))
-        calls: list[list[str]] = []
-
-        def runner(argv, **kwargs):
-            calls.append(list(argv))
-            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-
-        parsed = ParsedRoleBindings.valid(
-            (
-                WorkflowRoleBinding(
-                    role="coordinator",
-                    project_scope=credential_shape,
-                    lane_id="default",
-                ),
-            )
-        )
-        board = HerdrUnitBoardRuntime(
-            "/bin/herdr",
-            lister=FakeLister((row("codex", "w1:p2"),)),
-            runner=runner,
-            workspace_loader=lambda workspace_id: SimpleNamespace(
-                project_name=private_path,
-                canonical_path="/reviewable/repo",
+        credential_shapes = (
+            "=".join(("_".join(("AUTH", "TOKEN")), "synthetic-value")),
+            "=".join(
+                (
+                    "_".join(("AWS", "ACCESS", "KEY", "ID")),
+                    "synthetic-material-123456",
+                )
             ),
-            role_loader=lambda repo: parsed,
-            lane_records_loader=lambda: {},
+            ": ".join(
+                (
+                    "".join(("Author", "ization")),
+                    " ".join(("Ba" + "sic", "c3ludGhldGljLW1hdGVyaWFs")),
+                )
+            ),
+            "=".join(
+                (
+                    "session",
+                    ".".join(
+                        (
+                            "eyJzeW50aGV0aWMiOiJ0ZXN0In0",
+                            "eyJ2YWx1ZSI6InRlc3QifQ",
+                            "c3ludGhldGljc2lnbmF0dXJl",
+                        )
+                    ),
+                )
+            ),
         )
 
-        snapshot = board.snapshot()
-        public_output = repr(snapshot.as_payload()) + format_board(snapshot, width=80)
-        report = board.sync_metadata()
-        metadata_argv = repr(calls)
-        self.assertTrue(report.ok)
-        for private_value in (private_path, credential_shape):
-            self.assertNotIn(private_value, public_output)
-            self.assertNotIn(private_value, metadata_argv)
+        for credential_shape in credential_shapes:
+            with self.subTest(shape=credential_shape.split("=", 1)[0][:8]):
+                calls: list[list[str]] = []
+
+                def runner(argv, **kwargs):
+                    calls.append(list(argv))
+                    return subprocess.CompletedProcess(
+                        argv, 0, stdout="", stderr=""
+                    )
+
+                parsed = ParsedRoleBindings.valid(
+                    (
+                        WorkflowRoleBinding(
+                            role="coordinator",
+                            project_scope=credential_shape,
+                            lane_id="default",
+                        ),
+                    )
+                )
+                board = HerdrUnitBoardRuntime(
+                    "/bin/herdr",
+                    lister=FakeLister((row("codex", "w1:p2"),)),
+                    runner=runner,
+                    workspace_loader=lambda workspace_id: SimpleNamespace(
+                        project_name=private_path,
+                        canonical_path="/reviewable/repo",
+                    ),
+                    role_loader=lambda repo: parsed,
+                    lane_records_loader=lambda: {},
+                )
+
+                snapshot = board.snapshot()
+                public_output = repr(snapshot.as_payload()) + format_board(
+                    snapshot, width=80
+                )
+                report = board.sync_metadata()
+                metadata_argv = repr(calls)
+                self.assertTrue(report.ok)
+                for private_value in (private_path, credential_shape):
+                    self.assertNotIn(private_value, public_output)
+                    self.assertNotIn(private_value, metadata_argv)
+                self.assertIn("mozyo_responsibility=[redacted]", metadata_argv)
 
 
 class HerdrUnitBoardCliTests(unittest.TestCase):

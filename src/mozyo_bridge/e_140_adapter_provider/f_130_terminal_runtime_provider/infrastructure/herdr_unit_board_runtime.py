@@ -43,6 +43,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
     TerminalTransportError,
+    valid_target,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_discovery import (
     HerdrCliAgentLister,
@@ -201,11 +202,11 @@ class HerdrUnitBoardRuntime:
                 continue
             identity = decoded.identity
             pane_id = row.get("pane_id")
-            if not isinstance(pane_id, str) or not pane_id.strip():
+            if not valid_target(pane_id):
                 return unavailable_snapshot(
                     SOURCE_RELOAD_REQUIRED,
                     observed_at=observed_at,
-                    detail="managed Herdr agent has no live pane locator; reload required",
+                    detail="managed Herdr agent has no valid live pane locator; reload required",
                 )
             record = self._workspace_loader(identity.workspace_id)
             if record is None:

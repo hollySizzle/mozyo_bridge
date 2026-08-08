@@ -35,11 +35,15 @@ mozyo-bridge herdr unit-board watch
 JSON payload は transient `pane_id`、absolute path、ticket本文、agent本文を含めない。
 `pane_id` は同一process内の `sync` が action-time locator として使うだけで、projection
 や durable state へ保存しない。
+action-time locator は共通の `terminal_transport.valid_target` を満たす場合だけliveと
+扱う。option形状、空白、metacharacterを含むlocatorは `reload_required` とし、metadata
+commandを実行せず同期失敗として返す。
 
 project / responsibility / work など外部由来の表示値は、JSON、text、Herdr display
 metadataへ渡す前に同じpublic-safe projectionを通す。C0/C1とUnicodeの方向制御文字は
 無害化し、POSIX / Windows / homeのabsolute path形状とcredential形状は固定値
 `[redacted]`へ畳み、入力のbasename・key・valueを反映しない。
+credential形状にはaccess-key assignment、authorization header、JWT形状を含める。
 absolute path判定はrepo共通の
 `terminal_runtime_provider/domain/absolute_path_rule.py`を再利用し、別の弱い判定を作らない。
 
