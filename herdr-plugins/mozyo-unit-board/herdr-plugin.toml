@@ -1,8 +1,8 @@
 id = "mozyo.unit-board"
 name = "mozyo Unit board"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.8.0"
-description = "Shows each managed coordinator Unit's project, role, work label, and runtime state"
+description = "Shows managed Unit responsibilities and offers preview-first pair placement"
 platforms = ["linux", "macos"]
 
 [[startup]]
@@ -32,4 +32,4 @@ title = "mozyo Unit board"
 placement = "popup"
 width = "92%"
 height = "75%"
-command = ["mozyo-bridge", "herdr", "unit-board", "watch"]
+command = ["mozyo-bridge", "herdr", "unit-board", "interact"]

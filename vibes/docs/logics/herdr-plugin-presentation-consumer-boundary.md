@@ -173,9 +173,11 @@ UX 実装を先行させない。ただし、engine を UI から利用不能な
 | 本格 UI / UX implementation | future separate US |
 
 Redmine #15114 で、Herdr 0.8.0 の display metadata と plugin-owned popup を使う
-read-only `mozyo Unit board` を最初の presentation consumer として実装した。
-責務・role・project・lane work label の projection と display metadata 更新のみを
-扱い、pane movement は #14605 系へ分離する。詳細は `herdr-unit-board.md` を読む。
+`mozyo Unit board` を最初の presentation consumer として実装した。Redmine #15116
+では #14608 のpreview-first safe actionを接続し、選択した専用2-pane Unitを明示操作時だけ
+宣言済みsplit / order / ratioへ収束する。plugin自身はraw pane APIを呼ばず、agent input、
+workflow / Redmine / DBへwriteしない。shared tab上の複数Unit列の自由移動は #14604 / #14606
+のbackend成立後に接続する別段階である。詳細は `herdr-unit-board.md` を読む。
 
 ## Non-Goals
 

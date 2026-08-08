@@ -1101,6 +1101,44 @@ class HerdrUnitBoardCliTests(unittest.TestCase):
         sleep.assert_not_called()
         self.assertIn("source=unavailable", output.getvalue())
 
+    def test_interact_composes_board_and_placement_clients(self) -> None:
+        args = self.parser().parse_args(["herdr", "unit-board", "interact"])
+        board = runtime((row("codex", "w1:p2"),))
+        placement = object()
+        ui = mock.Mock()
+        ui.run.return_value = 0
+
+        with mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board._runtime",
+            return_value=board,
+        ), mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board.production_live_pair_placement",
+            return_value=placement,
+        ), mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board.HerdrUnitBoardPlacementUI",
+            return_value=ui,
+        ) as factory:
+            result = args.func(args)
+
+        self.assertEqual(result, 0)
+        factory.assert_called_once_with(board, placement)
+        ui.run.assert_called_once_with()
+
+    def test_interact_runtime_failure_never_resolves_placement(self) -> None:
+        args = self.parser().parse_args(["herdr", "unit-board", "interact"])
+        output = StringIO()
+        with mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board._runtime",
+            side_effect=OSError("/synthetic/private/herdr"),
+        ), mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board.production_live_pair_placement"
+        ) as placement, redirect_stdout(output):
+            result = args.func(args)
+
+        self.assertEqual(result, 1)
+        placement.assert_not_called()
+        self.assertNotIn("/synthetic/private/herdr", output.getvalue())
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

@@ -25,6 +25,7 @@ mozyo-bridge herdr unit-board show
 mozyo-bridge herdr unit-board show --json
 mozyo-bridge herdr unit-board sync
 mozyo-bridge herdr unit-board watch
+mozyo-bridge herdr unit-board interact
 ```
 
 - `show` は一度だけ public-safe projection を表示する。
@@ -32,6 +33,9 @@ mozyo-bridge herdr unit-board watch
   Herdr display metadataを更新する。agent終了後にshellへ戻ってagent inventoryから
   消えたpaneも、残存するnamespaced `mozyo_*` tokenから検出してclearする。
 - `watch` は plugin-owned popup 内の terminal board を定期更新する。
+- `interact` は同じpublic-safe Unit一覧をキーボードで選択し、`p`で専用2-pane
+  pairの配置をpreview、previewが実行可能な場合だけ`a`で明示applyする。`j` / `k`は
+  選択、`r`は再読取、`q`は変更せず閉じる。
 - inventory を読めない場合や managed identity が壊れている場合は非0で終了する。
 
 JSON payload は transient `pane_id`、absolute path、ticket本文、agent本文を含めない。
@@ -80,9 +84,12 @@ packaged manifest は `herdr-plugins/mozyo-unit-board/herdr-plugin.toml` に置�
   旧title/tokenをclearする。`pane.exited` はpane自体の終了通知であり、shellへ戻る
   agent終了とは同一視しない。
 - cold restart 後も metadata を再構成し、過去の pane locator を再利用しない。
-- popup action は `watch` だけを起動する。
+- popup pane は `interact` を起動する。選択変更・refresh・cancelは保留previewを破棄し、
+  previewのないapply、refused / matched previewはpane commandを実行しない。
 - plugin command は `mozyo-bridge herdr unit-board` のみを呼ぶ。
-- agent input、Redmine、workflow state、mozyo state DB、pane geometry は変更しない。
+- agent input、Redmine、workflow state、mozyo state DBは変更しない。pane geometryの変更は
+  pluginがraw pane APIを呼ばず、#14608のpreview-first serviceへUnit identityを渡した
+  明示apply時だけ行う。serviceはapply直前にidentity・generation・geometryを再照合する。
 
 plugin は user-global に install / enable されるため、reviewed commit pin と manifest
 identity を Herdr plugin policy で検査してから導入する。local development link は
@@ -107,6 +114,10 @@ UI が表示した pane の位置を delivery authority に使わない。
 Redmine #15114 は識別表示のみを実装する。pane の配置変更は #14605 系の
 preview-first safe action が所有する。
 
+Redmine #15116 の最初の操作sliceは、#14608が扱う**1つの専用2-pane Unit内**の
+split / provider順 / ratioを宣言済み設定へ収束する。shared tab内の複数Unit列の
+swap / move / reorderやdrag-and-dropを実装済みとは扱わない。
+
 - 同一 tab 内の入替は Herdr `pane swap`、別 tab / workspace への移動は `pane move`
   という異なる操作である。
 - apply 前に live pane と managed Unit identity を再照合する。
@@ -119,7 +130,7 @@ preview-first safe action が所有する。
 
 - pure grouping / ambiguity / control-character / terminal-width unit tests
 - live inventory join と metadata command allowlist unit tests
-- plugin manifest の UX-only static contract test
+- plugin manifest のpresentation-consumer static contract test
 - independently reviewed commit pin の検査
 - Z690 で3 coordinator Unitの識別、再起動後の再同期、既存agent input非変更を smoke
 

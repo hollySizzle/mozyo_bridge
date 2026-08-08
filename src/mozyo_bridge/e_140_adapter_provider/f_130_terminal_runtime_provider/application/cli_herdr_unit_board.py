@@ -22,6 +22,12 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
     MetadataSyncReport,
     resolve_unit_board_binary,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_live_pair_placement import (
+    production_live_pair_placement,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_unit_board_placement_ui import (
+    HerdrUnitBoardPlacementUI,
+)
 
 
 def _runtime() -> HerdrUnitBoardRuntime:
@@ -142,17 +148,32 @@ def cmd_herdr_unit_board_watch(args: argparse.Namespace) -> int:
         return 0
 
 
+def cmd_herdr_unit_board_interact(args: argparse.Namespace) -> int:
+    runtime, failure = _load_runtime()
+    if failure is not None:
+        print("Herdr Unit board is unavailable or has no managed Units.")
+        return 1
+    assert runtime is not None
+    try:
+        placement = production_live_pair_placement()
+    except Exception:
+        print("Herdr Unit board placement actions are unavailable.")
+        return 1
+    return HerdrUnitBoardPlacementUI(runtime, placement).run()
+
+
 def register_herdr_unit_board_parser(herdr_sub) -> None:
     board = herdr_sub.add_parser(
         "unit-board",
         help=(
             "Display managed Herdr Units by project, workflow role, work label, and "
-            "runtime state; optionally refresh display-only pane metadata."
+            "runtime state; optionally refresh labels or open preview-first placement."
         ),
         description=(
             "Read the live Herdr inventory and reviewable mozyo identity metadata, "
-            "then render a public-safe Unit board. This is presentation only: it "
-            "does not send agent input, move panes, or write Redmine/workflow state."
+            "then render a public-safe Unit board. The interactive command may call "
+            "the identity-bound pair-placement service after preview; it does not send "
+            "agent input or write Redmine/workflow state."
         ),
     )
     sub = board.add_subparsers(dest="unit_board_command", required=True)
@@ -191,10 +212,20 @@ def register_herdr_unit_board_parser(herdr_sub) -> None:
     )
     watch.set_defaults(func=cmd_herdr_unit_board_watch)
 
+    interact = sub.add_parser(
+        "interact",
+        help=(
+            "Open the keyboard Unit board; preview a selected managed pair and "
+            "apply only after an explicit confirmation key."
+        ),
+    )
+    interact.set_defaults(func=cmd_herdr_unit_board_interact)
+
 
 __all__ = (
     "cmd_herdr_unit_board_show",
     "cmd_herdr_unit_board_sync",
     "cmd_herdr_unit_board_watch",
+    "cmd_herdr_unit_board_interact",
     "register_herdr_unit_board_parser",
 )
