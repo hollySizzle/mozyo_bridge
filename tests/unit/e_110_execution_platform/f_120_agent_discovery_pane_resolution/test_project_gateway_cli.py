@@ -20,7 +20,8 @@ import json
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
@@ -35,14 +36,44 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     CONFIDENCE_STRONG,
     ROLE_SOURCE_PANE_OPTION,
     VIEW_KIND_COCKPIT_PANE,
+    VIEW_KIND_NORMAL_WINDOW,
     TargetCandidate,
+)
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.project_gateway_backend_inventory import (
+    LiveProjectGatewayInventoryOps,
+    ProjectGatewayBackendInventoryUseCase,
+    ProjectGatewayInventoryError,
+    ProjectGatewayInventoryRequest,
+    ProjectPathAuthority,
+    SELECT_CHILD_INTAKE,
+    SELECT_CHILD_ROUTE,
+    SELECT_GATEWAY,
+    prepare_project_gateway_delivery,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
+    RoleProviderBinding,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (
+    ParsedRoleBindings,
+    WorkflowRoleBinding,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+    encode_assigned_name,
 )
 
 REPO = "/work/gk-3500-it-operations"
 PROJECT = "giken-cloud-drive-management"
 
 
-def _candidate(pane_id, *, role="codex", repo_root=REPO, project_scope=PROJECT, session="gw"):
+def _candidate(
+    pane_id,
+    *,
+    role="codex",
+    repo_root=REPO,
+    project_scope=PROJECT,
+    session="gw",
+    view_kind=VIEW_KIND_COCKPIT_PANE,
+):
     return TargetCandidate(
         pane_id=pane_id, role=role, role_source=ROLE_SOURCE_PANE_OPTION,
         confidence=CONFIDENCE_STRONG, ambiguous=False, session=session,
@@ -50,7 +81,7 @@ def _candidate(pane_id, *, role="codex", repo_root=REPO, project_scope=PROJECT, 
         workspace_id="ws", workspace_label="gk", lane_id="default", lane_label=None,
         repo_short="gk-3500-it-operations", repo_root=repo_root,
         cwd=f"{repo_root}/projects/{project_scope}", host="local",
-        view_kind=VIEW_KIND_COCKPIT_PANE, branch="main",
+        view_kind=view_kind, branch="main",
         project_scope=project_scope, project_path=f"projects/{project_scope}",
         project_label="label",
     )
@@ -60,6 +91,407 @@ def _resolve_args(**overrides):
     base = dict(repo=REPO, project=PROJECT, role="codex", session=None, as_json=False)
     base.update(overrides)
     return argparse.Namespace(**base)
+
+
+class _HerdrInventory(list):
+    """Small backend-tagged sequence used to pin the no-tmux CLI branch."""
+
+    backend = "herdr"
+
+
+class _InventoryOps:
+    """Deterministic no-runtime fake for the shared backend inventory."""
+
+    def __init__(self, *, backend="herdr", rows=(), generation="generation-1"):
+        self.backend_value = backend
+        self.rows = list(rows)
+        self.generation = generation
+        self.workspace = "workspace-1"
+        self.target_root = ""
+        self.target_root_unavailable = False
+        self.project_path_value = "projects/giken-cloud-drive-management"
+        self.project_path_fallback = False
+        self.foreign_roots = set()
+        self.herdr_reads = 0
+        self.tmux_reads = 0
+        self.parsed = ParsedRoleBindings.valid(
+            [
+                WorkflowRoleBinding(
+                    role="coordinator",
+                    project_scope=PROJECT,
+                    lane_id="default",
+                )
+            ]
+        )
+        self.binding = RoleProviderBinding.default()
+
+    def backend(self, repo_root):
+        return self.backend_value
+
+    def tmux_candidates(self):
+        self.tmux_reads += 1
+        return [_candidate("%tmux")]
+
+    def parsed_role_bindings(self, repo_root):
+        return self.parsed
+
+    def provider_binding(self, repo_root):
+        return self.binding
+
+    def workspace_id(self, repo_root):
+        if str(repo_root) in self.foreign_roots:
+            return "foreign-workspace"
+        return self.workspace
+
+    def herdr_rows(self, repo_root):
+        self.herdr_reads += 1
+        return self.rows
+
+    def generation_token(self, **kwargs):
+        return self.generation
+
+    def project_path(self, repo_root, project_scope):
+        if self.project_path_fallback:
+            return ProjectPathAuthority(
+                self.project_path_value,
+                fallback_root_scope=True,
+            )
+        return self.project_path_value
+
+    def target_repo_root(self, cwd, fallback):
+        if self.target_root_unavailable:
+            return ""
+        return self.target_root or str(fallback)
+
+
+class BackendInventoryTest(unittest.TestCase):
+    def _request(self, **overrides):
+        values = dict(
+            repo_root=REPO,
+            project_scope=PROJECT,
+            provider="codex",
+            selector=SELECT_GATEWAY,
+        )
+        values.update(overrides)
+        return ProjectGatewayInventoryRequest(**values)
+
+    @staticmethod
+    def _row(workspace, lane="default", *, locator="w1:p1", role="codex"):
+        return {
+            "name": encode_assigned_name(workspace, role, lane),
+            "pane_id": locator,
+            "agent": role,
+            "agent_status": "idle",
+            "cwd": f"{REPO}/projects/{PROJECT}",
+        }
+
+    def test_tmux_branch_is_unchanged_and_never_reads_herdr(self):
+        ops = _InventoryOps(backend="tmux")
+        inventory = ProjectGatewayBackendInventoryUseCase(ops).discover(self._request())
+        self.assertEqual(inventory.backend, "tmux")
+        self.assertEqual(inventory[0].pane_id, "%tmux")
+        self.assertEqual(ops.tmux_reads, 1)
+        self.assertEqual(ops.herdr_reads, 0)
+
+    def test_default_coordinator_binding_projects_truthful_herdr_candidate(self):
+        ops = _InventoryOps()
+        ops.rows = [self._row(ops.workspace)]
+        inventory = ProjectGatewayBackendInventoryUseCase(ops).discover(self._request())
+        self.assertEqual(len(inventory), 1)
+        candidate = inventory[0]
+        self.assertEqual(candidate.pane_id, encode_assigned_name(ops.workspace, "codex", "default"))
+        payload = candidate.to_dict()
+        self.assertEqual(payload["runtime"]["provider"], "herdr")
+        self.assertEqual(payload["runtime"]["pane_id"], "w1:p1")
+        self.assertEqual(payload["runtime"]["assigned_name"], candidate.pane_id)
+        self.assertEqual(inventory.observations[0].generation_token, "generation-1")
+
+    def test_herdr_session_selector_fails_before_inventory_read(self):
+        ops = _InventoryOps()
+        with self.assertRaises(ProjectGatewayInventoryError) as caught:
+            ProjectGatewayBackendInventoryUseCase(ops).discover(
+                self._request(session="tmux-only-selector")
+            )
+        self.assertEqual(caught.exception.reason, "herdr_session_selector_unsupported")
+        self.assertEqual(ops.herdr_reads, 0)
+
+    def test_duplicate_assigned_name_is_typed_failure(self):
+        ops = _InventoryOps()
+        row = self._row(ops.workspace)
+        ops.rows = [row, dict(row)]
+        with self.assertRaises(ProjectGatewayInventoryError) as caught:
+            ProjectGatewayBackendInventoryUseCase(ops).discover(self._request())
+        self.assertEqual(caught.exception.reason, "herdr_assigned_name_ambiguous")
+
+    def test_duplicate_locator_across_durable_names_is_typed_failure(self):
+        ops = _InventoryOps()
+        ops.rows = [
+            self._row(ops.workspace, locator="w1:p1"),
+            self._row(ops.workspace, "child-lane", locator="w1:p1"),
+        ]
+        with self.assertRaises(ProjectGatewayInventoryError) as caught:
+            ProjectGatewayBackendInventoryUseCase(ops).discover(
+                self._request(selector=SELECT_CHILD_INTAKE)
+            )
+        self.assertEqual(caught.exception.reason, "herdr_locator_ambiguous")
+
+    def test_unselected_malformed_alias_cannot_hide_duplicate_locator(self):
+        ops = _InventoryOps()
+        alias = self._row(ops.workspace, "other-lane", locator="w1:p1")
+        alias["pane"] = []
+        ops.rows = [self._row(ops.workspace, locator="w1:p1"), alias]
+        with self.assertRaises(ProjectGatewayInventoryError) as caught:
+            ProjectGatewayBackendInventoryUseCase(ops).discover(self._request())
+        self.assertEqual(caught.exception.reason, "herdr_locator_ambiguous")
+
+    def test_conflicting_locator_aliases_are_typed_failure(self):
+        ops = _InventoryOps()
+        row = self._row(ops.workspace)
+        row["pane"] = "w9:p9"
+        ops.rows = [row]
+        with self.assertRaises(ProjectGatewayInventoryError) as caught:
+            ProjectGatewayBackendInventoryUseCase(ops).discover(self._request())
+        self.assertEqual(caught.exception.reason, "herdr_locator_evidence_invalid")
+
+    def test_non_text_locator_evidence_is_typed_failure(self):
+        ops = _InventoryOps()
+        row = self._row(ops.workspace)
+        row["pane_id"] = 123
+        ops.rows = [row]
+        with self.assertRaises(ProjectGatewayInventoryError) as caught:
+            ProjectGatewayBackendInventoryUseCase(ops).discover(self._request())
+        self.assertEqual(caught.exception.reason, "herdr_locator_evidence_invalid")
+
+    def test_unverified_generation_is_typed_failure(self):
+        ops = _InventoryOps(generation="")
+        ops.rows = [self._row(ops.workspace)]
+        with self.assertRaises(ProjectGatewayInventoryError) as caught:
+            ProjectGatewayBackendInventoryUseCase(ops).discover(self._request())
+        self.assertEqual(caught.exception.reason, "herdr_generation_unverified")
+
+    def test_unreadable_generation_authority_is_typed_failure(self):
+        ops = _InventoryOps()
+        ops.rows = [self._row(ops.workspace)]
+        ops.generation_token = Mock(side_effect=OSError("unreadable"))
+        with self.assertRaises(ProjectGatewayInventoryError) as caught:
+            ProjectGatewayBackendInventoryUseCase(ops).discover(self._request())
+        self.assertEqual(caught.exception.reason, "herdr_generation_unavailable")
+
+    def test_detected_live_provider_must_match_durable_name(self):
+        ops = _InventoryOps()
+        row = self._row(ops.workspace)
+        row["agent"] = "claude"
+        ops.rows = [row]
+        with self.assertRaises(ProjectGatewayInventoryError) as caught:
+            ProjectGatewayBackendInventoryUseCase(ops).discover(self._request())
+        self.assertEqual(caught.exception.reason, "herdr_live_provider_mismatch")
+
+    def test_missing_target_cwd_is_typed_failure(self):
+        ops = _InventoryOps()
+        row = self._row(ops.workspace)
+        row["cwd"] = ""
+        ops.rows = [row]
+        with self.assertRaises(ProjectGatewayInventoryError) as caught:
+            ProjectGatewayBackendInventoryUseCase(ops).discover(self._request())
+        self.assertEqual(caught.exception.reason, "herdr_target_cwd_unavailable")
+
+    def test_unestablished_target_repo_is_typed_failure(self):
+        ops = _InventoryOps()
+        ops.rows = [self._row(ops.workspace)]
+        ops.target_root_unavailable = True
+        with self.assertRaises(ProjectGatewayInventoryError) as caught:
+            ProjectGatewayBackendInventoryUseCase(ops).discover(self._request())
+        self.assertEqual(caught.exception.reason, "herdr_target_repo_unavailable")
+
+    def test_project_scope_must_resolve_to_one_adopted_path(self):
+        ops = _InventoryOps()
+        ops.rows = [self._row(ops.workspace)]
+        ops.project_path_value = ""
+        with self.assertRaises(ProjectGatewayInventoryError) as caught:
+            ProjectGatewayBackendInventoryUseCase(ops).discover(self._request())
+        self.assertEqual(caught.exception.reason, "project_scope_path_unavailable")
+
+    def test_repo_level_durable_scope_requires_exact_repo_root_cwd(self):
+        ops = _InventoryOps()
+        row = self._row(ops.workspace)
+        row["cwd"] = REPO
+        ops.rows = [row]
+        ops.project_path_value = "."
+        ops.project_path_fallback = True
+        inventory = ProjectGatewayBackendInventoryUseCase(ops).discover(
+            self._request()
+        )
+        self.assertEqual(inventory[0].project_path, ".")
+
+        row["cwd"] = f"{REPO}/projects/another-project"
+        with self.assertRaises(ProjectGatewayInventoryError) as caught:
+            ProjectGatewayBackendInventoryUseCase(ops).discover(self._request())
+        self.assertEqual(
+            caught.exception.reason, "herdr_target_project_scope_mismatch"
+        )
+
+    def test_adopted_repo_root_scope_allows_a_target_subdirectory(self):
+        ops = _InventoryOps()
+        row = self._row(ops.workspace)
+        row["cwd"] = f"{REPO}/projects/{PROJECT}"
+        ops.rows = [row]
+        ops.project_path_value = "."
+
+        inventory = ProjectGatewayBackendInventoryUseCase(ops).discover(
+            self._request()
+        )
+
+        self.assertEqual(inventory[0].project_path, ".")
+        self.assertFalse(inventory.observations[0].project_scope_root_fallback)
+
+    def test_child_target_cwd_must_be_inside_requested_project_path(self):
+        ops = _InventoryOps()
+        child = self._row(ops.workspace, "child-lane")
+        child["cwd"] = f"{REPO}/projects/another-project"
+        ops.rows = [child]
+        with self.assertRaises(ProjectGatewayInventoryError) as caught:
+            ProjectGatewayBackendInventoryUseCase(ops).discover(
+                self._request(selector=SELECT_CHILD_ROUTE)
+            )
+        self.assertEqual(
+            caught.exception.reason, "herdr_target_project_scope_mismatch"
+        )
+
+    def test_target_cwd_in_foreign_workspace_is_typed_failure(self):
+        ops = _InventoryOps()
+        ops.rows = [self._row(ops.workspace)]
+        ops.target_root = "/foreign/repo"
+        ops.foreign_roots.add(ops.target_root)
+        with self.assertRaises(ProjectGatewayInventoryError) as caught:
+            ProjectGatewayBackendInventoryUseCase(ops).discover(self._request())
+        self.assertEqual(caught.exception.reason, "herdr_target_workspace_mismatch")
+
+    def test_child_selectors_exclude_default_parent_and_worker(self):
+        ops = _InventoryOps()
+        ops.rows = [
+            self._row(ops.workspace),
+            self._row(ops.workspace, "lane-child", locator="w1:p2"),
+            self._row(
+                ops.workspace,
+                "lane-child",
+                locator="w1:p3",
+                role="claude",
+            ),
+        ]
+        route_inventory = ProjectGatewayBackendInventoryUseCase(ops).discover(
+            self._request(selector=SELECT_CHILD_ROUTE)
+        )
+        self.assertEqual([c.lane_id for c in route_inventory], ["lane-child"])
+        intake_inventory = ProjectGatewayBackendInventoryUseCase(ops).discover(
+            self._request(selector=SELECT_CHILD_INTAKE)
+        )
+        self.assertEqual(
+            {c.lane_id for c in intake_inventory}, {"default", "lane-child"}
+        )
+        self.assertEqual(
+            intake_inventory.gateway_assigned_name,
+            encode_assigned_name(ops.workspace, "codex", "default"),
+        )
+
+    def test_child_intake_honors_distinct_parent_and_child_provider_bindings(self):
+        ops = _InventoryOps()
+        ops.parsed = ParsedRoleBindings.valid(
+            [
+                WorkflowRoleBinding(
+                    role="project_gateway",
+                    project_scope=PROJECT,
+                    lane_id="gateway-lane",
+                )
+            ]
+        )
+        ops.binding = ops.binding.with_overrides({"project_gateway": "grok"})
+        ops.rows = [
+            self._row(
+                ops.workspace,
+                "gateway-lane",
+                locator="w1:p1",
+                role="grok",
+            ),
+            self._row(ops.workspace, "child-lane", locator="w1:p2"),
+        ]
+        inventory = ProjectGatewayBackendInventoryUseCase(ops).discover(
+            self._request(selector=SELECT_CHILD_INTAKE)
+        )
+        self.assertEqual({candidate.role for candidate in inventory}, {"codex", "grok"})
+        self.assertEqual(
+            inventory.gateway_assigned_name,
+            encode_assigned_name(ops.workspace, "grok", "gateway-lane"),
+        )
+
+    def test_required_herdr_backend_drift_refuses_before_tmux_read(self):
+        ops = _InventoryOps(backend="tmux")
+        with self.assertRaises(ProjectGatewayInventoryError) as caught:
+            ProjectGatewayBackendInventoryUseCase(ops).discover(
+                self._request(required_backend="herdr")
+            )
+        self.assertEqual(caught.exception.reason, "backend_changed")
+        self.assertEqual(ops.tmux_reads, 0)
+
+    def test_delivery_revalidation_carries_generation_bound_capability(self):
+        ops = _InventoryOps()
+        ops.rows = [self._row(ops.workspace)]
+        inventory = ProjectGatewayBackendInventoryUseCase(ops).discover(self._request())
+        with patch(
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution."
+            "application.project_gateway_backend_inventory.discover_project_gateway_inventory",
+            return_value=inventory,
+        ):
+            prepared = prepare_project_gateway_delivery(inventory, inventory[0])
+        self.assertEqual(prepared.target, inventory[0].pane_id)
+        self.assertEqual(prepared.target_lane, "default")
+        self.assertEqual(prepared.capability.generation_token, "generation-1")
+        self.assertEqual(prepared.capability.purpose, "project_gateway")
+
+    def test_delivery_revalidation_refuses_generation_drift(self):
+        ops = _InventoryOps()
+        ops.rows = [self._row(ops.workspace)]
+        inventory = ProjectGatewayBackendInventoryUseCase(ops).discover(self._request())
+        drift_ops = _InventoryOps(generation="generation-2")
+        drift_ops.rows = [self._row(drift_ops.workspace)]
+        fresh = ProjectGatewayBackendInventoryUseCase(drift_ops).discover(self._request())
+        with patch(
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution."
+            "application.project_gateway_backend_inventory.discover_project_gateway_inventory",
+            return_value=fresh,
+        ):
+            with self.assertRaises(ProjectGatewayInventoryError) as caught:
+                prepare_project_gateway_delivery(inventory, inventory[0])
+        self.assertEqual(caught.exception.reason, "herdr_inventory_generation_changed")
+
+
+class LiveProjectPathAuthorityTest(unittest.TestCase):
+    def test_repo_root_fallback_requires_no_adopted_project_descriptors(self):
+        ops = LiveProjectGatewayInventoryOps()
+        resolver = (
+            "mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity."
+            "application.project_discovery.resolve_project_scopes"
+        )
+        with patch(resolver, return_value=([], [])):
+            authority = ops.project_path(Path(REPO), PROJECT)
+            self.assertEqual(authority.path, ".")
+            self.assertTrue(authority.fallback_root_scope)
+
+        other = SimpleNamespace(scope="another-project", path="projects/another")
+        with patch(resolver, return_value=([other], [])):
+            with self.assertRaises(ValueError):
+                ops.project_path(Path(REPO), PROJECT)
+
+        exact = SimpleNamespace(scope=PROJECT, path=f"projects/{PROJECT}")
+        with patch(resolver, return_value=([other, exact], [])):
+            authority = ops.project_path(Path(REPO), PROJECT)
+            self.assertEqual(authority.path, f"projects/{PROJECT}")
+            self.assertFalse(authority.fallback_root_scope)
+
+        adopted_root = SimpleNamespace(scope=PROJECT, path=".")
+        with patch(resolver, return_value=([adopted_root], [])):
+            authority = ops.project_path(Path(REPO), PROJECT)
+            self.assertEqual(authority.path, ".")
+            self.assertFalse(authority.fallback_root_scope)
 
 
 @patch.object(cli_project_gateway_resolve, "require_tmux", lambda: None)
@@ -123,6 +555,106 @@ class ResolveCliTest(unittest.TestCase):
         self.assertIn("%gw2", text)
         self.assertIn("--session", text)
 
+    def test_herdr_inventory_never_requires_tmux(self):
+        out = io.StringIO()
+        with patch.object(cli_project_gateway_resolve, "require_tmux") as require:
+            with patch.object(
+                cli_project_gateway_resolve,
+                "_discover_candidates",
+                return_value=_HerdrInventory([_candidate("mzb1_gateway")]),
+            ):
+                with contextlib.redirect_stdout(out):
+                    rc = cli_project_gateway_resolve.cmd_project_gateway_resolve(
+                        _resolve_args()
+                    )
+        self.assertEqual(rc, 0)
+        require.assert_not_called()
+        self.assertIn("status: found", out.getvalue())
+
+
+@patch.object(cli_project_gateway, "require_tmux", lambda: None)
+class AdoptAndRoutePlanBackendTest(unittest.TestCase):
+    """The three read-only reproductions use the shared backend inventory."""
+
+    @staticmethod
+    def _adopt_args():
+        return argparse.Namespace(
+            repo=REPO,
+            project=PROJECT,
+            session=None,
+            as_json=True,
+        )
+
+    @staticmethod
+    def _route_args(from_role):
+        return argparse.Namespace(
+            from_role=from_role,
+            repo=REPO,
+            project=PROJECT,
+            session=None,
+            as_json=True,
+        )
+
+    def test_adopt_herdr_inventory_never_requires_tmux(self):
+        inventory = _HerdrInventory(
+            [_candidate("mzb1_gateway", view_kind=VIEW_KIND_NORMAL_WINDOW)]
+        )
+        out = io.StringIO()
+        with patch.object(cli_project_gateway, "require_tmux") as require, patch.object(
+            cli_project_gateway,
+            "_discover_candidates",
+            return_value=inventory,
+        ) as discover, contextlib.redirect_stdout(out):
+            rc = cli_project_gateway.cmd_project_gateway_adopt(self._adopt_args())
+
+        # A truthful Herdr target is not a tmux cockpit pane, so the historical
+        # startup-evidence contract remains non-green even though identity resolves.
+        self.assertEqual(rc, 1)
+        self.assertEqual(json.loads(out.getvalue())["action"], "adopt")
+        require.assert_not_called()
+        self.assertEqual(discover.call_args.kwargs["selector"], SELECT_GATEWAY)
+
+    def test_route_plan_grandparent_uses_gateway_inventory_without_tmux(self):
+        out = io.StringIO()
+        with patch.object(cli_project_gateway, "require_tmux") as require, patch.object(
+            cli_project_gateway,
+            "_discover_candidates",
+            return_value=_HerdrInventory(
+                [_candidate("mzb1_gateway", view_kind=VIEW_KIND_NORMAL_WINDOW)]
+            ),
+        ) as discover, contextlib.redirect_stdout(out):
+            rc = cli_project_gateway.cmd_project_gateway_route_plan(
+                self._route_args("grandparent_coordinator")
+            )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            json.loads(out.getvalue())["launch_or_adopt"]["action"], "adopt"
+        )
+        require.assert_not_called()
+        self.assertEqual(discover.call_args.kwargs["selector"], SELECT_GATEWAY)
+
+    def test_route_plan_project_gateway_uses_child_inventory_without_tmux(self):
+        out = io.StringIO()
+        with patch.object(cli_project_gateway, "require_tmux") as require, patch.object(
+            cli_project_gateway,
+            "_discover_candidates",
+            return_value=_HerdrInventory(
+                [_candidate("mzb1_child", view_kind=VIEW_KIND_NORMAL_WINDOW)]
+            ),
+        ) as discover, contextlib.redirect_stdout(out):
+            rc = cli_project_gateway.cmd_project_gateway_route_plan(
+                self._route_args("project_gateway")
+            )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            json.loads(out.getvalue())["step"]["target_binding"],
+            "delegated_coordinator",
+        )
+        require.assert_not_called()
+        self.assertEqual(discover.call_args.kwargs["selector"], SELECT_CHILD_ROUTE)
+
 
 @patch.object(cli_project_gateway, "require_tmux", lambda: None)
 class HandoffCliTest(unittest.TestCase):
@@ -158,6 +690,24 @@ class HandoffCliTest(unittest.TestCase):
                 rc = cli_project_gateway.cmd_project_gateway_handoff(self._handoff_args())
         self.assertEqual(rc, 0)
         self.assertEqual(captured["target"], "%gw")
+
+    def test_action_time_inventory_drift_is_zero_send(self):
+        inventory = _HerdrInventory([_candidate("mzb1_gateway")])
+        error = ProjectGatewayInventoryError(
+            "herdr_inventory_generation_changed",
+            "generation changed",
+            backend="herdr",
+        )
+        with patch.object(
+            cli_project_gateway, "_discover_candidates", return_value=inventory
+        ), patch.object(
+            cli_project_gateway,
+            "prepare_project_gateway_delivery",
+            side_effect=error,
+        ), patch.object(cli_project_gateway, "orchestrate_handoff") as orchestrate:
+            rc = cli_project_gateway.cmd_project_gateway_handoff(self._handoff_args())
+        self.assertEqual(rc, 1)
+        orchestrate.assert_not_called()
 
     def test_found_auto_injects_grandparent_transition_role(self):
         # Redmine #12706: project-gateway handoff IS the grandparent ->
@@ -352,6 +902,29 @@ class ConsultCliTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(captured["target"], "%gw")
 
+    def test_action_time_inventory_drift_is_zero_send(self):
+        args = self._consult_args()
+        error = ProjectGatewayInventoryError(
+            "herdr_inventory_generation_changed",
+            "generation changed",
+            backend="herdr",
+        )
+        with patch.object(
+            cli_project_gateway_consult,
+            "_discover_candidates",
+            return_value=_HerdrInventory([_candidate("mzb1_gateway")]),
+        ), patch.object(
+            cli_project_gateway_consult,
+            "prepare_project_gateway_delivery",
+            side_effect=error,
+        ), patch.object(
+            cli_project_gateway_consult, "orchestrate_handoff"
+        ) as orchestrate:
+            rc = cli_project_gateway_consult.cmd_project_gateway_consult(args)
+        self.assertEqual(rc, 1)
+        orchestrate.assert_not_called()
+        self.assertIsNone(getattr(args, "consultation_kind", None))
+
     def test_fail_closed_does_not_inject_consultation_payload(self):
         args = self._consult_args()
         out = io.StringIO()
@@ -453,6 +1026,32 @@ class ChildIntakeCliTest(unittest.TestCase):
         self.assertIsNone(captured["source"])
         self.assertIsNone(captured["issue"])
         self.assertIsNone(captured["journal"])
+
+    def test_action_time_inventory_drift_is_zero_send(self):
+        args = self._intake_args()
+        error = ProjectGatewayInventoryError(
+            "herdr_inventory_generation_changed",
+            "generation changed",
+            backend="herdr",
+        )
+        with patch.object(
+            cli_project_gateway_child_intake,
+            "_discover_candidates",
+            return_value=_HerdrInventory(
+                [_candidate("%parent"), _candidate("mzb1_child")]
+            ),
+        ), patch.object(
+            cli_project_gateway_child_intake,
+            "prepare_project_gateway_delivery",
+            side_effect=error,
+        ), patch.object(
+            cli_project_gateway_child_intake, "orchestrate_handoff"
+        ) as orchestrate:
+            rc = cli_project_gateway_child_intake.cmd_project_gateway_child_intake(args)
+        self.assertEqual(rc, 1)
+        orchestrate.assert_not_called()
+        self.assertIsNone(getattr(args, "work_shape", None))
+        self.assertIsNone(getattr(args, "read_contract", None))
 
     def test_same_lane_fails_closed_no_delivery(self):
         # The only coordinator lane is the caller itself -> same_lane; do not adopt

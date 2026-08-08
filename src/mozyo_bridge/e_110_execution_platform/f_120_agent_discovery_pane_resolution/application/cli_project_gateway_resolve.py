@@ -39,12 +39,25 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     resolve_project_gateway,
     start_project_gateway_command,
 )
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.project_gateway_backend_inventory import (
+    ProjectGatewayInventoryError,
+    SELECT_GATEWAY,
+    discover_project_gateway_inventory,
+    render_inventory_error,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import (
     require_tmux,
 )
 
 
-def _discover_candidates() -> list:
+def _discover_candidates(
+    *,
+    repo_root: str | None = None,
+    project_scope: str | None = None,
+    provider: str = AGENT_KIND_CODEX,
+    session: str | None = None,
+    selector: str = SELECT_GATEWAY,
+) -> list:
     """All classified target candidates across every session (no pre-filter).
 
     Discovery is intentionally unfiltered: the resolver applies the
@@ -52,7 +65,17 @@ def _discover_candidates() -> list:
     stay visible (a session pre-filter would hide cross-session gateways, which
     are the normal separate-window/session path). Patched in tests.
     """
-    return _agents_target_candidates(argparse.Namespace(agent=None, session=None))
+    if repo_root is None or project_scope is None:
+        # Compatibility seam for direct callers/tests predating backend-aware
+        # discovery. Command handlers always supply the semantic request below.
+        return _agents_target_candidates(argparse.Namespace(agent=None, session=None))
+    return discover_project_gateway_inventory(
+        repo_root=repo_root,
+        project_scope=project_scope,
+        provider=provider,
+        session=session,
+        selector=selector,
+    )
 
 
 def _route_from_args(
@@ -148,14 +171,24 @@ def cmd_project_gateway_resolve(args: argparse.Namespace) -> int:
     implementation is needed. So this command never resolves a Claude target
     (Redmine #12668 review j#66626 blocker 2).
     """
-    require_tmux()
     route = _route_from_args(
         repo_root=args.repo,
         project_scope=args.project,
         role=AGENT_KIND_CODEX,
         session=getattr(args, "session", None),
     )
-    resolution = resolve_project_gateway(_discover_candidates(), route)
+    try:
+        inventory = _discover_candidates(
+            repo_root=args.repo,
+            project_scope=args.project,
+            provider=AGENT_KIND_CODEX,
+            session=getattr(args, "session", None),
+        )
+    except ProjectGatewayInventoryError as exc:
+        return render_inventory_error(
+            exc, as_json=getattr(args, "as_json", False)
+        )
+    resolution = resolve_project_gateway(inventory, route)
     return render_gateway_resolution(
         resolution, route, as_json=getattr(args, "as_json", False)
     )

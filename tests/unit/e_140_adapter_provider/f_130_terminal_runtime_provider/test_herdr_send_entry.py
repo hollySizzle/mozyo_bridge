@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -33,6 +34,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     encode_assigned_name,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
+    PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
     RESOLVED_TARGET_CAPABILITY_MISMATCH,
     HerdrExplicitTargetMismatchError,
     HerdrSendEntryError,
@@ -41,6 +43,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     herdr_backend_selected,
     herdr_effective_backend_selected,
     resolve_herdr_send_target,
+    verify_project_gateway_target_effect,
 )
 
 HERDR_ENV = "MOZYO_HERDR_BINARY"
@@ -77,9 +80,10 @@ class _Ctx:
     """A prepared herdr workspace: config, anchor, fake binary + runner."""
 
     def __init__(self, tmp, *, backend="herdr", rows=None, sender_role="codex", sender_lane="lane-1"):
-        self.repo = Path(tmp) / "repo"
+        canonical_tmp = Path(tmp).resolve()
+        self.repo = canonical_tmp / "repo"
         self.repo.mkdir()
-        self.home = Path(tmp) / "home"
+        self.home = canonical_tmp / "home"
         self.home.mkdir()
         (self.repo / ".mozyo-bridge").mkdir()
         (self.repo / ".mozyo-bridge" / "config.yaml").write_text(
@@ -88,7 +92,7 @@ class _Ctx:
         register_workspace(self.repo, home=self.home)
         self.workspace_id = read_anchor(self.repo)["workspace_id"]
         self.rows = rows(self.workspace_id) if rows else []
-        binpath = Path(tmp) / "fake-herdr"
+        binpath = canonical_tmp / "fake-herdr"
         binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
         self.binpath = binpath
@@ -301,6 +305,18 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
         )
         return env
 
+    @staticmethod
+    def _target_repo(ctx, tmp, *, backend="herdr"):
+        target = Path(tmp).resolve() / "target-repo"
+        target.mkdir()
+        (target / ".mozyo-bridge").mkdir()
+        (target / ".mozyo-bridge" / "config.yaml").write_text(
+            f"version: 1\nterminal_transport:\n  backend: {backend}\n",
+            encoding="utf-8",
+        )
+        register_workspace(target, home=ctx.home)
+        return target, read_anchor(target)["workspace_id"]
+
     def test_foreign_caller_env_is_irrelevant_to_pre_resolved_proxy_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ctx = _Ctx(
@@ -376,6 +392,430 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
 
         self.assertEqual(caught.exception.reason, RESOLVED_TARGET_CAPABILITY_MISMATCH)
         self.assertIn("does not belong", str(caught.exception))
+
+    def test_project_gateway_capability_rechecks_same_generation_at_effect_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(
+                tmp,
+                rows=lambda ws: [
+                    {
+                        "name": encode_assigned_name(ws, "codex", "default"),
+                        "pane_id": "wT:pT",
+                        "agent": "codex",
+                        "cwd": str(Path(tmp) / "repo"),
+                    }
+                ],
+            )
+            capability = ResolvedHerdrTargetCapability(
+                workspace_id=ctx.workspace_id,
+                lane_id="default",
+                provider="codex",
+                assigned_name=encode_assigned_name(ctx.workspace_id, "codex", "default"),
+                locator="wT:pT",
+                purpose=PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
+                generation_token="generation-1",
+                project_scope="infra-platform",
+                target_repo_root=str(ctx.repo),
+                target_cwd=str(ctx.repo),
+                project_path=".",
+            )
+            with patch("subprocess.run", ctx.run), patch.dict(
+                os.environ, self._foreign_env(ctx), clear=True
+            ), patch(
+                "mozyo_bridge.core.state.herdr_launch_generation.verified_generation_token",
+                return_value="generation-1",
+            ) as generation:
+                pane = _resolve_from_args(
+                    self._args(ctx),
+                    receiver="codex",
+                    resolved_target_capability=capability,
+                )
+
+        self.assertEqual(pane["id"], "wT:pT")
+        self.assertEqual(pane["project_scope"], "infra-platform")
+        generation.assert_called_once()
+
+    def test_project_gateway_root_scope_provenance_distinguishes_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(tmp)
+            nested = ctx.repo / "nested"
+            nested.mkdir()
+            ctx.rows = [
+                {
+                    "name": encode_assigned_name(
+                        ctx.workspace_id, "codex", "default"
+                    ),
+                    "pane_id": "wT:pT",
+                    "agent": "codex",
+                    "cwd": str(nested),
+                }
+            ]
+            adopted_root_capability = ResolvedHerdrTargetCapability(
+                workspace_id=ctx.workspace_id,
+                lane_id="default",
+                provider="codex",
+                assigned_name=encode_assigned_name(
+                    ctx.workspace_id, "codex", "default"
+                ),
+                locator="wT:pT",
+                purpose=PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
+                generation_token="generation-1",
+                project_scope="infra-platform",
+                target_repo_root=str(ctx.repo),
+                target_cwd=str(nested),
+                project_path=".",
+            )
+            with patch("subprocess.run", ctx.run), patch.dict(
+                os.environ, self._foreign_env(ctx), clear=True
+            ), patch(
+                "mozyo_bridge.core.state.herdr_launch_generation.verified_generation_token",
+                return_value="generation-1",
+            ):
+                pane = _resolve_from_args(
+                    self._args(ctx),
+                    receiver="codex",
+                    resolved_target_capability=adopted_root_capability,
+                )
+                with self.assertRaises(HerdrSendEntryError) as caught:
+                    _resolve_from_args(
+                        self._args(ctx),
+                        receiver="codex",
+                        resolved_target_capability=replace(
+                            adopted_root_capability,
+                            project_scope_root_fallback=True,
+                        ),
+                    )
+
+        self.assertEqual(pane["cwd"], str(nested))
+        self.assertEqual(caught.exception.reason, RESOLVED_TARGET_CAPABILITY_MISMATCH)
+        self.assertIn("outside its project scope path", str(caught.exception))
+
+    def test_project_gateway_root_fallback_provenance_is_typed_and_path_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(tmp)
+            base = ResolvedHerdrTargetCapability(
+                workspace_id=ctx.workspace_id,
+                lane_id="default",
+                provider="codex",
+                assigned_name=encode_assigned_name(
+                    ctx.workspace_id, "codex", "default"
+                ),
+                locator="wT:pT",
+                purpose=PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
+                generation_token="generation-1",
+                project_scope="infra-platform",
+                target_repo_root=str(ctx.repo),
+                target_cwd=str(ctx.repo),
+                project_path=".",
+            )
+            invalid_capabilities = {
+                "non_bool": replace(base, project_scope_root_fallback=1),
+                "non_root_path": replace(
+                    base,
+                    project_scope_root_fallback=True,
+                    project_path="projects/infra-platform",
+                ),
+            }
+            with patch("subprocess.run", ctx.run), patch.dict(
+                os.environ, self._foreign_env(ctx), clear=True
+            ):
+                for label, capability in invalid_capabilities.items():
+                    with self.subTest(label=label):
+                        with self.assertRaises(HerdrSendEntryError) as caught:
+                            _resolve_from_args(
+                                self._args(ctx),
+                                receiver="codex",
+                                resolved_target_capability=capability,
+                            )
+                        self.assertEqual(
+                            caught.exception.reason,
+                            RESOLVED_TARGET_CAPABILITY_MISMATCH,
+                        )
+
+    def test_project_gateway_generation_drift_is_zero_send(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(
+                tmp,
+                rows=lambda ws: [
+                    {
+                        "name": encode_assigned_name(ws, "codex", "default"),
+                        "pane_id": "wT:pT",
+                        "agent": "codex",
+                        "cwd": str(Path(tmp) / "repo"),
+                    }
+                ],
+            )
+            capability = ResolvedHerdrTargetCapability(
+                workspace_id=ctx.workspace_id,
+                lane_id="default",
+                provider="codex",
+                assigned_name=encode_assigned_name(ctx.workspace_id, "codex", "default"),
+                locator="wT:pT",
+                purpose=PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
+                generation_token="generation-1",
+                project_scope="infra-platform",
+                target_repo_root=str(ctx.repo),
+                target_cwd=str(ctx.repo),
+                project_path=".",
+            )
+            with patch("subprocess.run", ctx.run), patch.dict(
+                os.environ, self._foreign_env(ctx), clear=True
+            ), patch(
+                "mozyo_bridge.core.state.herdr_launch_generation.verified_generation_token",
+                return_value="generation-2",
+            ):
+                with self.assertRaises(HerdrSendEntryError) as caught:
+                    _resolve_from_args(
+                        self._args(ctx),
+                        receiver="codex",
+                        resolved_target_capability=capability,
+                    )
+
+        self.assertEqual(caught.exception.reason, RESOLVED_TARGET_CAPABILITY_MISMATCH)
+        self.assertIn("generation changed", str(caught.exception))
+
+    def test_project_gateway_effect_guard_rechecks_after_target_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(
+                tmp,
+                rows=lambda ws: [
+                    {
+                        "name": encode_assigned_name(ws, "codex", "default"),
+                        "pane_id": "wT:pT",
+                        "agent": "codex",
+                        "cwd": str(Path(tmp) / "repo"),
+                    }
+                ],
+            )
+            capability = ResolvedHerdrTargetCapability(
+                workspace_id=ctx.workspace_id,
+                lane_id="default",
+                provider="codex",
+                assigned_name=encode_assigned_name(
+                    ctx.workspace_id, "codex", "default"
+                ),
+                locator="wT:pT",
+                purpose=PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
+                generation_token="generation-1",
+                project_scope="infra-platform",
+                target_repo_root=str(ctx.repo),
+                target_cwd=str(ctx.repo),
+                project_path=".",
+            )
+            with patch("subprocess.run", ctx.run), patch.dict(
+                os.environ, self._foreign_env(ctx), clear=True
+            ), patch(
+                "mozyo_bridge.core.state.herdr_launch_generation.verified_generation_token",
+                return_value="generation-1",
+            ) as generation:
+                _resolve_from_args(
+                    self._args(ctx),
+                    receiver="codex",
+                    resolved_target_capability=capability,
+                )
+                generation.return_value = "generation-2"
+                with self.assertRaises(HerdrSendEntryError) as caught:
+                    verify_project_gateway_target_effect(
+                        capability, repo_root=ctx.repo
+                    )
+
+        self.assertEqual(caught.exception.reason, RESOLVED_TARGET_CAPABILITY_MISMATCH)
+        self.assertIn("generation changed", str(caught.exception))
+        self.assertEqual(generation.call_count, 2)
+
+    def test_project_gateway_effect_guard_rechecks_detected_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(
+                tmp,
+                rows=lambda ws: [
+                    {
+                        "name": encode_assigned_name(ws, "codex", "default"),
+                        "pane_id": "wT:pT",
+                        "agent": "codex",
+                        "cwd": str(Path(tmp) / "repo"),
+                    }
+                ],
+            )
+            capability = ResolvedHerdrTargetCapability(
+                workspace_id=ctx.workspace_id,
+                lane_id="default",
+                provider="codex",
+                assigned_name=encode_assigned_name(
+                    ctx.workspace_id, "codex", "default"
+                ),
+                locator="wT:pT",
+                purpose=PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
+                generation_token="generation-1",
+                project_scope="infra-platform",
+                target_repo_root=str(ctx.repo),
+                target_cwd=str(ctx.repo),
+                project_path=".",
+            )
+            with patch("subprocess.run", ctx.run), patch.dict(
+                os.environ, self._foreign_env(ctx), clear=True
+            ), patch(
+                "mozyo_bridge.core.state.herdr_launch_generation.verified_generation_token",
+                return_value="generation-1",
+            ):
+                _resolve_from_args(
+                    self._args(ctx),
+                    receiver="codex",
+                    resolved_target_capability=capability,
+                )
+                ctx.rows[0]["agent"] = "claude"
+                with self.assertRaises(HerdrSendEntryError) as caught:
+                    verify_project_gateway_target_effect(
+                        capability, repo_root=ctx.repo
+                    )
+
+        self.assertEqual(caught.exception.reason, RESOLVED_TARGET_CAPABILITY_MISMATCH)
+        self.assertIn("provider changed", str(caught.exception))
+
+    def test_project_gateway_effect_guard_refuses_locator_contradictions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(tmp)
+            assigned_name = encode_assigned_name(
+                ctx.workspace_id, "codex", "default"
+            )
+            base_row = {
+                "name": assigned_name,
+                "pane_id": "wT:pT",
+                "agent": "codex",
+                "cwd": str(ctx.repo),
+            }
+            capability = ResolvedHerdrTargetCapability(
+                workspace_id=ctx.workspace_id,
+                lane_id="default",
+                provider="codex",
+                assigned_name=assigned_name,
+                locator="wT:pT",
+                purpose=PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
+                generation_token="generation-1",
+                project_scope="infra-platform",
+                target_repo_root=str(ctx.repo),
+                target_cwd=str(ctx.repo),
+                project_path=".",
+            )
+            contradictions = {
+                "conflicting_alias": [{**base_row, "pane": "w9:p9"}],
+                "duplicate_locator": [
+                    base_row,
+                    {
+                        **base_row,
+                        "name": encode_assigned_name(
+                            ctx.workspace_id, "codex", "other-lane"
+                        ),
+                    },
+                ],
+                "duplicate_locator_with_malformed_alias": [
+                    base_row,
+                    {
+                        **base_row,
+                        "name": encode_assigned_name(
+                            ctx.workspace_id, "codex", "other-lane"
+                        ),
+                        "pane": [],
+                    },
+                ],
+                "non_text_locator": [{**base_row, "pane_id": 123}],
+            }
+            with patch("subprocess.run", ctx.run), patch.dict(
+                os.environ, self._foreign_env(ctx), clear=True
+            ), patch(
+                "mozyo_bridge.core.state.herdr_launch_generation.verified_generation_token",
+                return_value="generation-1",
+            ):
+                for label, rows in contradictions.items():
+                    with self.subTest(label=label):
+                        ctx.rows = rows
+                        with self.assertRaises(HerdrSendEntryError) as caught:
+                            verify_project_gateway_target_effect(
+                                capability, repo_root=ctx.repo
+                            )
+                        self.assertEqual(
+                            caught.exception.reason,
+                            RESOLVED_TARGET_CAPABILITY_MISMATCH,
+                        )
+
+    def test_project_gateway_capability_may_target_another_attested_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(tmp)
+            target, target_workspace = self._target_repo(ctx, tmp)
+            ctx.rows = [
+                {
+                    "name": encode_assigned_name(
+                        target_workspace, "codex", "default"
+                    ),
+                    "pane_id": "wT:pT",
+                    "agent": "codex",
+                    "cwd": str(target),
+                }
+            ]
+            args = self._args(ctx)
+            args.target_repo = str(target)
+            capability = ResolvedHerdrTargetCapability(
+                workspace_id=target_workspace,
+                lane_id="default",
+                provider="codex",
+                assigned_name=encode_assigned_name(
+                    target_workspace, "codex", "default"
+                ),
+                locator="wT:pT",
+                purpose=PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
+                generation_token="generation-1",
+                project_scope="infra-platform",
+                target_repo_root=str(target),
+                target_cwd=str(target),
+                project_path=".",
+            )
+            with patch("subprocess.run", ctx.run), patch.dict(
+                os.environ, self._foreign_env(ctx), clear=True
+            ), patch(
+                "mozyo_bridge.core.state.herdr_launch_generation.verified_generation_token",
+                return_value="generation-1",
+            ):
+                pane = _resolve_from_args(
+                    args,
+                    receiver="codex",
+                    resolved_target_capability=capability,
+                )
+
+        self.assertEqual(pane["workspace_id"], target_workspace)
+        self.assertEqual(pane["cwd"], str(target))
+
+    def test_project_gateway_target_backend_drift_is_zero_send(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(tmp)
+            target, target_workspace = self._target_repo(ctx, tmp, backend="tmux")
+            args = self._args(ctx)
+            args.target_repo = str(target)
+            capability = ResolvedHerdrTargetCapability(
+                workspace_id=target_workspace,
+                lane_id="default",
+                provider="codex",
+                assigned_name=encode_assigned_name(
+                    target_workspace, "codex", "default"
+                ),
+                locator="wT:pT",
+                purpose=PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
+                generation_token="generation-1",
+                project_scope="infra-platform",
+                target_repo_root=str(target),
+                target_cwd=str(target),
+                project_path=".",
+            )
+            with patch("subprocess.run", ctx.run), patch.dict(
+                os.environ, self._foreign_env(ctx), clear=True
+            ):
+                with self.assertRaises(HerdrSendEntryError) as caught:
+                    _resolve_from_args(
+                        args,
+                        receiver="codex",
+                        resolved_target_capability=capability,
+                    )
+
+        self.assertEqual(caught.exception.reason, RESOLVED_TARGET_CAPABILITY_MISMATCH)
+        self.assertIn("transport changed", str(caught.exception))
 
 
 class CrossWorkspaceHerdrSendTargetTest(unittest.TestCase):
