@@ -76,6 +76,8 @@ control をそのまま反映しない。pane id、tab id、launch generation �
 - **tab join の権威は `tab_id`**: どの pane が同一 tab に属するかは live inventory の `tab_id` のみが authority で、tab label は cosmetic (#13411)。bounce で「元の tab へ戻す」際は label ではなく元 tab の `tab_id` を指定する。
 - **設定だけでは live pair を動かさない**: herdr は same-tab re-split を拒否するため (下記)、`lane_placement` 設定 (#13646 / #13647 / #14569) を保存しただけでは既存 live pair の配置は変わらない。設定は fresh launch / heal の geometry と、`pair-placement apply` が既存 dedicated pair へ適用する目標値を決める。方向変換で製品 command が内部利用する検証済み低レベル手順が recipe B / C である。
   - **fresh coordinator append の自動 reflow (#14996 R2 / #15098)**: `role_grouped_space` の shared `project-coordinators` または `shared_space` の `coordinators` workspace へ **fresh な coordinator pair を append する launch** は、その pair を独立 column にするために recipe B と同じ 2 段 bounce を自動で 1 回だけ行う。続けてRIGHT軸dividerを対象指定でresizeし、全project列の幅差を1cell以内へ揃える。これは dedicated two-pane tab を対象とする `pair-placement` とは別の shared-tab launch-time path である。境界の正本は [[spec-herdr-native-identity]] の `### project column geometry — append 時の狭い verified relayout (#14996 R2)`。
+  - **fresh full-pairの設定列順・相対幅 (#15123)**: 上記reflow、pair内ratio、launch generation、startup transactionが全て成功した後、全Unitが2-paneなら`position`順と`relative_width`を自動適用する。隣接Unitのlower paneを退避してtop同士をswapし、lowerを元の内部ratioで戻した後、RIGHT軸dividerを設定weightへresizeする。commandごとにtyped変更結果と全Unitの世代・layoutを再確認する。1-pane混在は`deferred_until_full_pair_set`でzero-write、途中失敗はblind retry禁止である。これは既存live Unitを任意に動かすplugin actionではない。
+    - 11列以上は均等幅にせず、reflowがfull-height列形状だけを確認して後続設定planへ引き渡す。中間結果だけでは起動成功にせず、設定ratioの実測成功が必要である。
   - #14568 で未設定既定が縦 (`down`) になったため、**既定変更より前に立ち上げた live pair は左右のまま残る**。左右のまま使い続けても不整合ではない (設定と live 配置は別 authority)。今すぐ縦に揃えたい場合は下記 recipe B を使い、pair を再起動できる場面なら fresh launch に任せる方が安全である (live 操作を伴わない)。
 
 ## herdr 0.7.1 の制約 (2026-07-12 実測)
@@ -192,6 +194,7 @@ herdr pane layout --pane <pane-id>
 
 - 恒久的な pair 配置 (どの lane class を左右 / 上下、どちらの provider を先に置くか、その pair をどんな比率で割るか) を宣言駆動にする作業は別 US: `.mozyo-bridge/config.yaml` への閉集合 `lane_placement` block 追加が #13646、親子孫 3 層別 (lane-role 別) の keying が #13647、pair 内部の相対 split 比率 (`ratio`) が #14569。config key は `lane_placement` であり `pane_placement` では **ない** — repo-local schema boundary は `pane` を含む key を allowed-key 判定より前に拒否するため、旧名で書いた config は fail-closed で拒否される (正本: [[spec-herdr-native-identity]] §5.1)。
 - `lane_placement` の保存自体は既存 live pair を動かさない。新規 launch / heal は設定を自動利用し、既存 dedicated pair へは operator が `pair-placement preview` で差分を確認してから `apply` を明示する。partial failure の調査・復旧では本書の低レベル recipe を使う。
+- Unit列の`position` / `relative_width`は別軸で、fresh full-pair append時だけ#15123がshared tab全体へ自動適用する。adopt-only / heal / 既存live tabへの任意操作では動かない。既存Unit列をUIから移動する場合は、全体previewと再照合を持つ後続plugin actionを使い、本fresh-launch処理を手動反復しない。
 - **`ratio` (#14569) も同じ境界**である。`lane_placement.<class>.ratio` を変えても既存 live pair は自動 resize されない。設定が pane を触るのは **その launch 自身が今作った divider に対して 1 度だけ**で、既に立っている pair の divider には届かない。今すぐ live で比率を変えるなら本書 **recipe D** を使い、pair を再起動できる場面なら fresh launch に任せる方が安全である (live 操作を伴わない)。
 - 設定した比率と実機の食い違いを疑ったら、まず `mozyo-bridge config status` の `lane_placement.<class>.ratio` leaf row で **宣言値 (`declared`) か既定 (`default`) か**を読み、次に `herdr pane layout` で **実 ratio** を読む。両者は別 authority なので、片方だけを見て「設定が効いていない」と判断しない (設定は次の fresh launch / heal の geometry を決め、layout は今の geometry を報告する)。
 

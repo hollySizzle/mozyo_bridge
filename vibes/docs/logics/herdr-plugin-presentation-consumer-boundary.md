@@ -165,6 +165,7 @@ UX 実装を先行させない。ただし、engine を UI から利用不能な
 | repo-local presentation seed / home-scoped presentation state first slice | existing |
 | shared / separate表示方針、position / relative_width / pin / hide等のschema | existing |
 | Unit列順・相対幅のnon-mutating Herdr plan | existing (#14606) |
+| fresh full-pair launch時のUnit列順・相対幅actuator | existing (#15123) |
 | Herdr 0.7.5 pane-target launch | proposed in #14617 |
 | native atomic prompt transport | proposed in #14618 |
 | Herdr plugin allow / deny preflight | proposed in #14619 |
@@ -179,8 +180,10 @@ Redmine #15114 で、Herdr 0.8.0 の display metadata と plugin-owned popup を
 宣言済みsplit / order / ratioへ収束する。plugin自身はraw pane APIを呼ばず、agent input、
 workflow / Redmine / DBへwriteしない。#14606で既存`position`と`relative_width`から
 desired order / weighted divider ratioを作るnon-mutating planを追加した。shared tab上の
-既存Unit列を実際に移動するactionとUnit board接続は、apply直前のlive再照合を持つ
-後続段階である。planはpane locatorを公開せずUnit keyとopaque source fingerprintを
+既存Unit列を実際に移動するoperator actionとUnit board接続は、apply直前のlive再照合を持つ
+後続段階である。一方#15123はfresh full-pair launchの完了処理に限り、そのplanを世代・
+authority・tab layoutの再照合後に自動適用する。1-pane混在時はzero-writeで延期し、pluginの
+任意操作にはならない。planはpane locatorを公開せずUnit keyとopaque source fingerprintを
 保持し、全ratioを検証できない場合は操作targetを返さない。詳細は
 `herdr-unit-board.md` を読む。
 

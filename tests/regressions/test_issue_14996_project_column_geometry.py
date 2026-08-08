@@ -59,6 +59,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     COLUMN_FAILED,
     COLUMN_MATCHED,
     COLUMN_NOT_APPLICABLE,
+    COLUMN_PREPARED,
     reflow_project_columns,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_result import (  # noqa: E402,E501
@@ -427,17 +428,18 @@ class ProjectColumnRestraintTest(unittest.TestCase):
         (pair,) = env.seed_columns(tab, (PROJECT_A, ""))
         self._assert_untouched(env, env.run(env.result(PROJECT_A, pair))[0])
 
-    def test_eleventh_project_is_refused_before_any_geometry_actuation(self):
+    def test_eleventh_project_is_prepared_for_configured_widths(self):
         labels = tuple(f"project-{index}" for index in range(11))
         env = _Env(self, *labels)
         tab = env.herdr.new_tab()
         env.seed_columns(tab, *((label, "") for label in labels[:-1]))
         launched = env.append_pair(tab, labels[-1])
         outcome, detail = env.run(env.result(labels[-1], list(launched)))
-        self.assertEqual(outcome, COLUMN_FAILED)
-        self.assertIn("below Herdr's 0.1 minimum", detail)
-        self.assertEqual(env.moves(), [])
+        self.assertEqual(outcome, COLUMN_PREPARED)
+        self.assertIn("configured placement", detail)
+        self.assertTrue(env.moves())
         self.assertEqual(env.herdr.resizes, [])
+        self.assertEqual(len(env.herdr.tabs), 1)
 
 
 class ColumnOperatorSurfaceTest(unittest.TestCase):
