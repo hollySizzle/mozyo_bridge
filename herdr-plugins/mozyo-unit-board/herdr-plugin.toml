@@ -22,6 +22,10 @@ command = ["mozyo-bridge", "herdr", "unit-board", "sync", "--quiet"]
 on = "pane.agent_detected"
 command = ["mozyo-bridge", "herdr", "unit-board", "sync", "--quiet"]
 
+[[events]]
+on = "pane.exited"
+command = ["mozyo-bridge", "herdr", "unit-board", "sync", "--quiet"]
+
 [[panes]]
 id = "board"
 title = "mozyo Unit board"

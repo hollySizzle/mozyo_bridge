@@ -10,6 +10,7 @@ import time
 from datetime import datetime, timezone
 
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.herdr_unit_board import (
+    MAX_BOARD_WIDTH,
     SOURCE_UNAVAILABLE,
     UnitBoardSnapshot,
     format_board,
@@ -25,6 +26,18 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
 
 def _runtime() -> HerdrUnitBoardRuntime:
     return HerdrUnitBoardRuntime(resolve_unit_board_binary())
+
+
+def _board_width_arg(value: str) -> int:
+    try:
+        width = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("width must be an integer") from exc
+    if not 1 <= width <= MAX_BOARD_WIDTH:
+        raise argparse.ArgumentTypeError(
+            f"width must be between 1 and {MAX_BOARD_WIDTH}"
+        )
+    return width
 
 
 def _runtime_failure_snapshot() -> UnitBoardSnapshot:
@@ -148,7 +161,7 @@ def register_herdr_unit_board_parser(herdr_sub) -> None:
     show.add_argument("--json", action="store_true", help="Emit structured JSON.")
     show.add_argument(
         "--width",
-        type=int,
+        type=_board_width_arg,
         default=0,
         help="Render width for text output (default: current terminal width).",
     )

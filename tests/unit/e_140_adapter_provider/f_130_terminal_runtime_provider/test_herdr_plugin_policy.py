@@ -1311,6 +1311,10 @@ SPEC_ABSOLUTE_PATHS = (
     "C:\\Users\\x",            # drive root, backslash
     "\\\\server\\share",       # UNC root
     "config:/Users/x",         # labelled absolute path
+    "~/private/project",       # current-user POSIX home shorthand
+    "~synthetic-user/private/project",  # named-user POSIX home shorthand
+    "~\\synthetic\\private\\project",  # PowerShell home shorthand
+    "config:~synthetic-user/private",  # labelled home shorthand
 )
 
 #: Strings that must NOT be read as absolute paths, or the guard becomes a denial
@@ -1319,6 +1323,7 @@ SPEC_NON_PATHS = (
     "github:smarzban/herdr-file-viewer@" + FILE_VIEWER_COMMIT,
     "install/enable",
     "relative/path.yaml",
+    "prefix~synthetic-user/private",  # tilde is inside a relative token
     "owner/repo",
     "plain diagnostic prose with no separator",
     "",

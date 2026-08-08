@@ -83,6 +83,32 @@ class UnitBoardReadModelTests(unittest.TestCase):
         self.assertEqual(unit.project_label, "ambiguous")
         self.assertEqual(unit.authority_state, "ambiguous")
 
+    def test_lossy_public_projection_never_hides_unit_field_conflicts(self) -> None:
+        field_fallbacks = {
+            "project_label": "unknown-project",
+            "workflow_role": "unknown",
+            "responsibility": "unknown",
+            "work_label": "unknown",
+        }
+        collisions = (
+            ("/synthetic/private/a", "/synthetic/private/b"),
+            (("x" * 80) + "a", ("x" * 80) + "b"),
+        )
+        for field, fallback in field_fallbacks.items():
+            for first, second in collisions:
+                with self.subTest(field=field, collision=first[:1]):
+                    snapshot = build_unit_board(
+                        (
+                            observation("claude", "w1:p1", **{field: first}),
+                            observation("codex", "w1:p2", **{field: second}),
+                        ),
+                        observed_at="now",
+                    )
+                    unit = snapshot.units[0]
+                    self.assertEqual(getattr(unit, field), "ambiguous")
+                    self.assertEqual(unit.identity_state, "ambiguous")
+                    self.assertNotEqual(getattr(unit, field), fallback)
+
     def test_issue_lane_label_keeps_readable_words_beside_id(self) -> None:
         self.assertEqual(
             lane_work_label("issue_15114_herdr_unit_board"),
@@ -159,6 +185,8 @@ class UnitBoardReadModelTests(unittest.TestCase):
             safe_text("https://example.invalid/project"),
             REDACTED_TEXT,
         )
+        self.assertEqual(safe_text("\ud800"), "unknown")
+        self.assertEqual(safe_text("public\ud800label"), "publiclabel")
 
     def test_public_safe_projection_redacts_common_credential_shapes_on_every_rail(self) -> None:
         access_key = "_".join(("AWS", "ACCESS", "KEY", "ID"))
@@ -201,6 +229,19 @@ class UnitBoardReadModelTests(unittest.TestCase):
         )
         empty_claims_unsigned_jwt = "session=eyJhbGciOiJub25lIn0.e30."
         empty_claims_signed_jwt = "session=eyJhbGciOiJIUzI1NiJ9.e30.c2ln"
+        jwe_header = base64.urlsafe_b64encode(
+            b'{"alg":"dir","enc":"A256GCM"}'
+        ).decode().rstrip("=")
+        encrypted_jwt = ".".join(
+            (jwe_header, "", "aXY", "Y2lwaGVy", "dGFn")
+        )
+        nested_header = base64.urlsafe_b64encode(
+            b'{"alg":"HS256","cty":"JWT"}'
+        ).decode().rstrip("=")
+        nested_payload = base64.urlsafe_b64encode(
+            b"eyJhbGciOiJub25lIn0.e30."
+        ).decode().rstrip("=")
+        nested_signed_jwt = ".".join((nested_header, nested_payload, "c2ln"))
         quoted_json_token = '{"token":"synthetic-material-112233"}'
         quoted_json_password = '{"password": "synthetic-material-223344"}'
         quoted_python_api_key = "{'api_key':'synthetic-material-334455'}"
@@ -264,6 +305,41 @@ class UnitBoardReadModelTests(unittest.TestCase):
         camel_mysql_password_json = (
             '{"mysqlPwd":"synthetic-material-525354"}'
         )
+        named_home_path = "~synthetic-user/private/project"
+        powershell_home_path = "~\\synthetic\\private\\project"
+        slack_token_shape = "xoxb-" + ("s" * 20)
+        google_api_key_shape = "AIza" + ("g" * 35)
+        gitlab_token_shape = "glpat-" + ("g" * 20)
+        npm_token_shape = "npm_" + ("n" * 20)
+        pypi_token_shape = "pypi-" + ("p" * 20)
+        stripe_token_shape = "sk_live_" + ("s" * 20)
+        github_fine_grained_pat_shape = "github_pat_" + ("g" * 70)
+        github_installation_token_shape = (
+            "ghs_123456_" + ("g" * 30)
+        )
+        stripe_restricted_token_shape = "rk_live_" + ("r" * 20)
+        stripe_test_token_shape = "sk_test_" + ("t" * 20)
+        slack_app_token_shape = "xapp-1-" + ("a" * 20)
+        aws_temporary_access_key_shape = "ASIA" + ("A" * 16)
+        top_level_json_bearer = (
+            r'"Bearer\u0020synthetic-material-55565758"'
+        )
+        top_level_json_assignment = (
+            r'"session\u003dsynthetic-material-59606162"'
+        )
+        top_level_json_child = (
+            r'"{\"token\":\"synthetic-material-63646566\"}"'
+        )
+        short_bearer = "Bearer a"
+        short_basic = "Basic YTpi"
+        prefixed_compact_keys = (
+            "".join(("MY", "API", "KEY", "=synthetic-material-676869")),
+            "".join(("REDMINE", "API", "KEY", "=synthetic-material-707172")),
+            "".join(("GITHUB", "TOKEN", "=synthetic-material-737475")),
+            "".join(("DB", "PASSWORD", "=synthetic-material-767778")),
+            "".join(("OAUTH", "TOKEN", "=synthetic-material-798081")),
+            "".join(("SSH", "PRIVATE", "KEY", "=synthetic-material-828384")),
+        )
 
         for credential_shape in (
             access_assignment,
@@ -274,6 +350,8 @@ class UnitBoardReadModelTests(unittest.TestCase):
             unsigned_jwt_assignment,
             empty_claims_unsigned_jwt,
             empty_claims_signed_jwt,
+            encrypted_jwt,
+            nested_signed_jwt,
             quoted_json_token,
             quoted_json_password,
             quoted_python_api_key,
@@ -305,6 +383,26 @@ class UnitBoardReadModelTests(unittest.TestCase):
             camel_mysql_password_alias,
             camel_database_password_json,
             camel_mysql_password_json,
+            named_home_path,
+            powershell_home_path,
+            slack_token_shape,
+            google_api_key_shape,
+            gitlab_token_shape,
+            npm_token_shape,
+            pypi_token_shape,
+            stripe_token_shape,
+            github_fine_grained_pat_shape,
+            github_installation_token_shape,
+            stripe_restricted_token_shape,
+            stripe_test_token_shape,
+            slack_app_token_shape,
+            aws_temporary_access_key_shape,
+            top_level_json_bearer,
+            top_level_json_assignment,
+            top_level_json_child,
+            short_bearer,
+            short_basic,
+            *prefixed_compact_keys,
         ):
             with self.subTest(shape=credential_shape.split("=", 1)[0][:8]):
                 observation_with_credential = observation(
@@ -334,10 +432,28 @@ class UnitBoardReadModelTests(unittest.TestCase):
             safe_text("release=20260808.20260809.20260810"),
             "release=20260808.20260809.20260810",
         )
+        self.assertEqual(
+            safe_text("release=1.2.3.4.5"), "release=1.2.3.4.5"
+        )
+        self.assertEqual(safe_text("basic mode"), "basic mode")
+        for benign_compact_word in (
+            "tokenizer=enabled",
+            "passwordless=enabled",
+            "secretary=available",
+            "cookiecutter=available",
+        ):
+            self.assertEqual(safe_text(benign_compact_word), benign_compact_word)
         benign_json = json.dumps(
             [{"id": index} for index in range(100)], separators=(",", ":")
         )
         self.assertNotEqual(safe_text(benign_json), REDACTED_TEXT)
+
+    def test_extreme_width_is_bounded_before_render_allocation(self) -> None:
+        snapshot = build_unit_board((observation("codex", "w1:p1"),), observed_at="now")
+
+        rendered = format_board(snapshot, width=2**63 - 1)
+
+        self.assertLessEqual(max(map(len, rendered.splitlines())), 1000)
         self.assertEqual(safe_text("[" * 16_383), REDACTED_TEXT)
         for benign in (
             "private keyboard layout",

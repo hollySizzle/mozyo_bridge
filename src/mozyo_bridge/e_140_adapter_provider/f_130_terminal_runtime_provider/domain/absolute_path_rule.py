@@ -38,15 +38,19 @@ from __future__ import annotations
 
 import re
 
-#: Where an absolute filesystem path can BEGIN: a UNC root, a drive root, or a
-#: POSIX ``/``. Every occurrence is a candidate; :func:`keeps_absolute_root`
+#: Where an absolute filesystem path can BEGIN: a home shorthand, a UNC root, a
+#: drive root, or a POSIX ``/``. Every occurrence is a candidate;
+#: :func:`keeps_absolute_root`
 #: decides whether a particular one is proven not to be a path.
 #:
 #: The drive alternative requires its letter to stand alone, because a drive root
 #: IS a single letter — so the ``s:/`` inside ``https://`` is not one. That is a
 #: rule about the SHAPE of the root, not a safety allowlist, and it costs nothing:
 #: the ``/`` alternative still finds that position.
-ABSOLUTE_ROOT_RE = re.compile(r"\\\\|(?<![A-Za-z0-9_.\-])[A-Za-z]:[\\/]|/")
+ABSOLUTE_ROOT_RE = re.compile(
+    r"(?<![A-Za-z0-9_.\-])~[A-Za-z0-9_.\-]*[\\/]"
+    r"|\\\\|(?<![A-Za-z0-9_.\-])[A-Za-z]:[\\/]|/"
+)
 
 #: The only positive proof that a root occurrence is not an absolute path: the
 #: ``/`` sits INSIDE a token (``relative/path.yaml``, ``github:owner/repo@sha``),
@@ -85,9 +89,10 @@ def contains_absolute_path(text: str) -> bool:
 
     Catches a single-component path (``/etc``), the root itself (``/``), a
     non-ASCII path (``/秘密``), a mixed-alphabet path (``/tmp-☃/secret``), a
-    labelled path (``config:/Users/x``), a drive root and a UNC root. Does *not*
-    flag a relative token (``relative/path.yaml``) or an identity spelling whose
-    ``/`` continues a word (``github:owner/repo@sha``, ``install/enable``).
+    labelled path (``config:/Users/x``), ``~/`` / ``~user/`` / ``~\\`` home
+    shorthand, a drive root and a UNC root. Does *not* flag a relative token
+    (``relative/path.yaml``) or an identity spelling whose ``/`` continues a word
+    (``github:owner/repo@sha``, ``install/enable``).
 
     A bare ``/`` used as prose punctuation (``HOME / XDG_CONFIG_HOME``) *is*
     flagged. Prose is rewritten to suit the boundary; the boundary is not widened

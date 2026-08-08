@@ -40,6 +40,7 @@ AUTHORITY_STATES = frozenset(
 )
 
 MAX_PRESENTATION_TEXT = 80
+MAX_BOARD_WIDTH = 1000
 REDACTED_TEXT = "[redacted]"
 _SPACE_RE = re.compile(r"\s+")
 _ISSUE_LANE_RE = re.compile(r"^issue_(\d+)(?:_(.*))?$")
@@ -97,6 +98,23 @@ _CREDENTIAL_COMPACT_KEYS = frozenset(
         "sessiontoken",
     }
 )
+_CREDENTIAL_COMPACT_SUFFIXES = frozenset(
+    {
+        "accesskey",
+        "accesstoken",
+        "apikey",
+        "apitoken",
+        "authtoken",
+        "clientsecret",
+        "password",
+        "privatekey",
+        "refreshtoken",
+        "secretkey",
+        "sessionid",
+        "sessiontoken",
+        "token",
+    }
+)
 _MAX_CREDENTIAL_JSON_LENGTH = 16_384
 _MAX_CREDENTIAL_JSON_DEPTH = 8
 _MAX_CREDENTIAL_JSON_NODES = 256
@@ -112,18 +130,39 @@ _CREDENTIAL_FILE_RE = re.compile(
     re.IGNORECASE,
 )
 _OPAQUE_CREDENTIAL_RE = re.compile(
-    r"(?:\bgh[pousr]_[A-Za-z0-9]{20,}\b|"
+    r"(?:\bgithub_pat_[A-Za-z0-9_]{20,}\b|"
+    r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b|"
+    r"\bglpat-[A-Za-z0-9_-]{20,}\b|"
+    r"\bnpm_[A-Za-z0-9_-]{20,}\b|"
+    r"\bpypi-[A-Za-z0-9_-]{20,}\b|"
+    r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9_-]{16,}\b|"
+    r"\bx(?:ox[baprs]|app)-[A-Za-z0-9-]{10,}\b|"
+    r"\bAIza[0-9A-Za-z_-]{30,}\b|"
     r"\bsk-[A-Za-z0-9_-]{16,}\b|"
-    r"\bAKIA[A-Z0-9]{16}\b|"
-    r"\bbearer\s+\S{8,}|"
+    r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|"
     r"\bbasic\s+[A-Za-z0-9+/=._-]{8,}|"
     r"://[^/\s:@]+:[^/@\s]+@)",
+    re.IGNORECASE,
+)
+_BEARER_CREDENTIAL_RE = re.compile(
+    r"(?<![A-Za-z0-9])bearer[ \t]+[A-Za-z0-9._~+/-]+=*"
+    r"(?![A-Za-z0-9._~+/=-])",
+    re.IGNORECASE,
+)
+_BASIC_CREDENTIAL_RE = re.compile(
+    r"(?<![A-Za-z0-9])basic[ \t]+(?P<token>[A-Za-z0-9+/]+={0,2})"
+    r"(?![A-Za-z0-9+/=])",
     re.IGNORECASE,
 )
 _COMPACT_JWT_RE = re.compile(
     r"(?<![A-Za-z0-9_-])(?P<header>[A-Za-z0-9_-]+)\."
     r"(?P<claims>[A-Za-z0-9_-]+)\.[A-Za-z0-9_-]*"
     r"(?![A-Za-z0-9_-])"
+)
+_COMPACT_JWE_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?P<header>[A-Za-z0-9_-]+)\."
+    r"[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\."
+    r"[A-Za-z0-9_-]+(?![A-Za-z0-9_-])"
 )
 _BIDI_CONTROLS = frozenset(
     {
@@ -154,7 +193,7 @@ def _without_terminal_controls(value: str) -> str:
             ord(char) < 0x20
             or 0x7F <= ord(char) <= 0x9F
             or ord(char) in _BIDI_CONTROLS
-            or unicodedata.category(char) == "Cf"
+            or unicodedata.category(char) in {"Cf", "Cs"}
         ):
             continue
         projected.append(char)
@@ -167,32 +206,54 @@ def _normalized_untrusted_text(value: str) -> str:
     return _SPACE_RE.sub(" ", normalized).strip()
 
 
-def _is_json_object_segment(segment: str) -> bool:
-    """Return whether one base64url segment decodes to a JSON object."""
+def _decode_json_object_segment(
+    segment: str,
+) -> tuple[Mapping[str, object] | None, bool]:
+    """Return a decoded object and whether JSON parsing hit a resource limit."""
     padded = segment + ("=" * (-len(segment) % 4))
     try:
         decoded = base64.b64decode(padded, altchars=b"-_", validate=True)
     except (binascii.Error, ValueError):
-        return False
+        return None, False
     try:
         text = decoded.decode("utf-8")
     except UnicodeDecodeError:
-        return False
+        return None, False
     try:
-        return isinstance(json.loads(text), dict)
+        parsed = json.loads(text)
     except json.JSONDecodeError:
-        return False
+        return None, False
     except (RecursionError, ValueError):
-        return True
+        return None, True
+    return (parsed, False) if isinstance(parsed, dict) else (None, False)
 
 
 def _contains_compact_jwt(value: str) -> bool:
-    """Recognize compact JWTs without assuming a minimum encoded JSON length."""
-    return any(
-        _is_json_object_segment(match.group("header"))
-        and _is_json_object_segment(match.group("claims"))
-        for match in _COMPACT_JWT_RE.finditer(value)
-    )
+    """Recognize plain and nested compact JWTs without encoded-length guesses."""
+    for match in _COMPACT_JWT_RE.finditer(value):
+        header, header_unknown = _decode_json_object_segment(match.group("header"))
+        claims, claims_unknown = _decode_json_object_segment(match.group("claims"))
+        if header_unknown or claims_unknown:
+            return True
+        if header is None:
+            continue
+        if claims is not None:
+            return True
+        for marker in (header.get("cty"), header.get("typ")):
+            if isinstance(marker, str) and marker.casefold() == "jwt":
+                return True
+    return False
+
+
+def _contains_compact_jwe(value: str) -> bool:
+    """Recognize 5-part encrypted JWTs from their protected ``enc`` header."""
+    for match in _COMPACT_JWE_RE.finditer(value):
+        header, resource_unknown = _decode_json_object_segment(
+            match.group("header")
+        )
+        if resource_unknown or (header is not None and "enc" in header):
+            return True
+    return False
 
 
 def _credential_key(key: str) -> bool:
@@ -214,7 +275,34 @@ def _credential_key(key: str) -> bool:
             for index in range(len(components) - width + 1)
         ):
             return True
-    return len(components) == 1 and components[0] in _CREDENTIAL_COMPACT_KEYS
+    if len(components) != 1:
+        return False
+    compact = components[0]
+    if compact in _CREDENTIAL_COMPACT_KEYS:
+        return True
+    return any(
+        len(compact) > len(suffix) and compact.endswith(suffix)
+        for suffix in _CREDENTIAL_COMPACT_SUFFIXES
+    )
+
+
+def _contains_authorization_credential(value: str) -> bool:
+    """Recognize standards-valid authorization credentials without length guesses."""
+    if _BEARER_CREDENTIAL_RE.search(value):
+        return True
+    for match in _BASIC_CREDENTIAL_RE.finditer(value):
+        token = match.group("token")
+        if len(token) % 4 == 1:
+            continue
+        try:
+            decoded = base64.b64decode(
+                token + ("=" * (-len(token) % 4)), validate=True
+            )
+        except (binascii.Error, ValueError):
+            continue
+        if b":" in decoded:
+            return True
+    return False
 
 
 def _contains_non_json_credential(value: str) -> bool:
@@ -222,7 +310,9 @@ def _contains_non_json_credential(value: str) -> bool:
     if (
         _CREDENTIAL_FILE_RE.search(value)
         or _OPAQUE_CREDENTIAL_RE.search(value)
+        or _contains_authorization_credential(value)
         or _contains_compact_jwt(value)
+        or _contains_compact_jwe(value)
     ):
         return True
     for match in _CREDENTIAL_ASSIGNMENT_RE.finditer(value):
@@ -240,17 +330,32 @@ def _contains_credential_json(value: str) -> bool:
     or a fresh budget.
     """
     stripped = value.strip()
-    if not stripped or not any(marker in stripped for marker in "[{"):
+    if not stripped:
         return False
     if len(stripped) > _MAX_CREDENTIAL_JSON_LENGTH:
         return True
 
     decoder = json.JSONDecoder()
-    pending_text: list[tuple[str, int]] = [(stripped, 0)]
+    pending_text: list[tuple[str, int]] = []
     pending_nodes: list[tuple[object, int]] = []
     parse_attempts = 0
     scanned_chars = 0
     visited = 0
+    if stripped.startswith('"'):
+        try:
+            root, end = decoder.raw_decode(stripped, 0)
+        except json.JSONDecodeError:
+            root, end = None, -1
+        except (RecursionError, ValueError):
+            return True
+        if end == len(stripped) and isinstance(root, str):
+            pending_nodes.append((root, 0))
+            parse_attempts = 1
+            scanned_chars = len(stripped)
+    if not pending_nodes:
+        if not any(marker in stripped for marker in "[{"):
+            return False
+        pending_text.append((stripped, 0))
 
     while pending_text or pending_nodes:
         while pending_text:
@@ -467,11 +572,16 @@ class UnitBoardSnapshot:
 
 
 def _choose_unit_field(values: Iterable[str], *, fallback: str) -> tuple[str, bool]:
-    distinct = {safe_text(value, fallback=fallback) for value in values}
+    distinct = {
+        (_normalized_untrusted_text(value) or fallback)
+        if isinstance(value, str)
+        else fallback
+        for value in values
+    }
     if not distinct:
         return fallback, False
     if len(distinct) == 1:
-        return next(iter(distinct)), False
+        return safe_text(next(iter(distinct)), fallback=fallback), False
     return "ambiguous", True
 
 
@@ -618,7 +728,7 @@ def clip_display(value: object, width: int) -> str:
 
 def format_board(snapshot: UnitBoardSnapshot, *, width: int = 120) -> str:
     """Render a compact terminal table.  JSON callers use ``as_payload`` instead."""
-    usable = max(1, int(width))
+    usable = min(MAX_BOARD_WIDTH, max(1, int(width)))
     heading = (
         f"mozyo Unit board  source={snapshot.source_state}  "
         f"observed={snapshot.observed_at or 'unknown'}"
@@ -716,6 +826,7 @@ __all__ = (
     "AUTHORITY_INVALID",
     "AUTHORITY_MISSING",
     "AUTHORITY_RESOLVED",
+    "MAX_BOARD_WIDTH",
     "REDACTED_TEXT",
     "AgentObservation",
     "SOURCE_LIVE",

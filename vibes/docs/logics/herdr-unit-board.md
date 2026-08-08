@@ -39,6 +39,18 @@ action-time locator は共通の `terminal_transport.valid_target` を満たす�
 扱う。option形状、空白、metacharacterを含むlocatorは `reload_required` とし、metadata
 commandを実行せず同期失敗として返す。
 
+Herdr 0.8 はplugin hookを別processで非同期実行するため、`sync` はoperator homeの
+privateな空lock fileを `flock` し、inventory取得、metadata更新、inventory再照合を
+1つのcross-process critical sectionとして直列化する。lockを取得・解放できない場合は
+更新せず（解放失敗は既に行った更新件数を保持して）非0で返す。agent identityが更新中に
+変わった場合は固定回数だけ最新inventoryへ収束させ、安定しなければ
+`reload_required` とする。
+
+metadata reportにwall clock由来の `--seq` は使わない。lock下の到着順をそのまま採用する
+ことで、時計の後退・同値や古いprocessの遅延完了をHerdrがexit 0のまま無視する経路を
+作らない。過去に同じsourceへseq付きreportが残っていても、Herdr 0.8はseqなしreportを
+受理する。
+
 project / responsibility / work など外部由来の表示値は、JSON、text、Herdr display
 metadataへ渡す前に同じpublic-safe projectionを通す。C0/C1とUnicodeの方向制御文字は
 無害化し、POSIX / Windows / homeのabsolute path形状とcredential形状は固定値
@@ -59,7 +71,9 @@ text表示へ正の `--width` が与えられた場合、各出力行はそのte
 
 packaged manifest は `herdr-plugins/mozyo-unit-board/herdr-plugin.toml` に置く。
 
-- startup と `pane.created` / `pane.agent_detected` event で display metadata を再同期する。
+- startup と `pane.created` / `pane.agent_detected` / `pane.exited` event で display
+  metadataを再同期する。agent終了後に残るshell paneは `pane.exited` で旧title/tokenを
+  clearする。
 - cold restart 後も metadata を再構成し、過去の pane locator を再利用しない。
 - popup action は `watch` だけを起動する。
 - plugin command は `mozyo-bridge herdr unit-board` のみを呼ぶ。

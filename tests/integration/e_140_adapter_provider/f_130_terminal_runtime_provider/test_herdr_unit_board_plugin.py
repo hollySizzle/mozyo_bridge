@@ -44,7 +44,7 @@ class HerdrUnitBoardPluginTests(unittest.TestCase):
         events = {event["on"]: event["command"] for event in self.document["events"]}
         self.assertEqual(
             set(events),
-            {"pane.created", "pane.agent_detected"},
+            {"pane.created", "pane.agent_detected", "pane.exited"},
         )
         self.assertTrue(all(command[-1] == "--quiet" for command in events.values()))
 
