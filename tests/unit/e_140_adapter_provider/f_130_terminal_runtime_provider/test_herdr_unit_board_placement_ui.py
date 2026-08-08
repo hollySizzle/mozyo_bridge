@@ -14,11 +14,13 @@ from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.herdr
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_live_pair_placement import (
     APPLY_APPLIED,
+    APPLY_PARTIAL,
     APPLY_REFUSED,
     PLAN_MATCHED,
     PLAN_READY,
     PLAN_REFUSED,
     REASON_OK,
+    REASON_POSTCONDITION_FAILED,
     REASON_STALE,
     PlacementApplyResult,
     PlacementPlan,
@@ -33,11 +35,18 @@ WORKSPACE_A = "a" * 32
 WORKSPACE_B = "b" * 32
 
 
-def row(workspace_id: str, project: str, pane: str) -> UnitBoardRow:
+def row(
+    workspace_id: str,
+    project: str,
+    pane: str,
+    *,
+    lane_id: str = "default",
+    unit_id: str | None = None,
+) -> UnitBoardRow:
     return UnitBoardRow(
-        unit_id=f"unit-{workspace_id[:8]}",
+        unit_id=unit_id or f"unit-{workspace_id[:8]}",
         workspace_id=workspace_id,
-        lane_id="default",
+        lane_id=lane_id,
         project_label=project,
         workflow_role="coordinator",
         responsibility=f"operate {project}",
@@ -68,15 +77,39 @@ def ready(workspace_id: str, *, detail: str = "placement differs") -> PlacementP
 
 
 class FakeBoard:
-    def __init__(self, *snapshots: UnitBoardSnapshot) -> None:
+    def __init__(
+        self,
+        *snapshots: UnitBoardSnapshot | Exception,
+        identities: dict[str, tuple[str, str]] | None = None,
+    ) -> None:
         self.snapshots = list(snapshots)
         self.calls = 0
+        first = snapshots[0] if snapshots else None
+        self.identities = (
+            identities
+            if identities is not None
+            else (
+                {
+                    item.unit_id: (item.workspace_id, item.lane_id)
+                    for item in first.units
+                }
+                if isinstance(first, UnitBoardSnapshot)
+                else {}
+            )
+        )
 
     def snapshot(self) -> UnitBoardSnapshot:
         self.calls += 1
         if len(self.snapshots) > 1:
-            return self.snapshots.pop(0)
-        return self.snapshots[0]
+            current = self.snapshots.pop(0)
+        else:
+            current = self.snapshots[0]
+        if isinstance(current, Exception):
+            raise current
+        return current
+
+    def action_identity(self, unit_id: str) -> tuple[str, str] | None:
+        return self.identities.get(unit_id)
 
 
 class FakePlacement:
@@ -163,6 +196,50 @@ class HerdrUnitBoardPlacementUITests(unittest.TestCase):
         self.assertIn("apply: status=applied", output)
         self.assertNotIn("w1:p2", output)
 
+    def test_truncated_display_identity_never_selects_the_wrong_long_lane(self) -> None:
+        lane_a = "x" * 80
+        lane_b = "x" * 81
+        unit_a = "unit-long-a"
+        unit_b = "unit-long-b"
+        units = snapshot(
+            row(WORKSPACE_A, "accounting", "w1:p1", lane_id=lane_a, unit_id=unit_a),
+            row(WORKSPACE_A, "accounting", "w1:p2", lane_id=lane_a, unit_id=unit_b),
+        )
+        plan = PlacementPlan(
+            PLAN_READY,
+            REASON_OK,
+            "placement differs",
+            WORKSPACE_A,
+            lane_b,
+            target=PlacementTarget("down", ("codex", "claude"), 0.5),
+        )
+        placement = FakePlacement(plan)
+        board = FakeBoard(
+            units,
+            identities={
+                unit_a: (WORKSPACE_A, lane_a),
+                unit_b: (WORKSPACE_A, lane_b),
+            },
+        )
+
+        result, _ = run_ui(board, placement, "j\np\nq\n")
+
+        self.assertEqual(result, 0)
+        self.assertEqual(placement.preview_calls, [(WORKSPACE_A, lane_b)])
+
+    def test_unresolved_action_identity_is_zero_io(self) -> None:
+        unit = row(WORKSPACE_A, "accounting", "w1:p1")
+        placement = FakePlacement(ready(WORKSPACE_A))
+
+        result, output = run_ui(
+            FakeBoard(snapshot(unit), identities={}), placement, "p\na\nq\n"
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(placement.preview_calls, [])
+        self.assertEqual(placement.apply_calls, [])
+        self.assertIn("Placement preview is unavailable", output)
+
     def test_apply_without_ready_preview_is_zero_write(self) -> None:
         placement = FakePlacement(ready(WORKSPACE_A))
 
@@ -226,7 +303,39 @@ class HerdrUnitBoardPlacementUITests(unittest.TestCase):
         self.assertNotIn(private_path, output)
         self.assertNotIn("/synthetic/private/apply", output)
         self.assertIn("[redacted]", output)
+        self.assertIn(f"apply: status={APPLY_PARTIAL}", output)
+        self.assertIn(f"reason={REASON_POSTCONDITION_FAILED}", output)
+        self.assertIn("Do not retry", output)
         self.assertEqual(placement.apply_calls, [(WORKSPACE_A, "default")])
+
+    def test_apply_result_survives_board_refresh_failure_without_blind_retry(self) -> None:
+        plan = ready(WORKSPACE_A)
+        after = PlacementPlan(
+            PLAN_MATCHED,
+            REASON_OK,
+            "matched",
+            WORKSPACE_A,
+            "default",
+            target=plan.target,
+        )
+        placement = FakePlacement(
+            plan, PlacementApplyResult(APPLY_APPLIED, REASON_OK, "measured", plan, after)
+        )
+
+        result, output = run_ui(
+            FakeBoard(
+                snapshot(row(WORKSPACE_A, "accounting", "w1:p1")),
+                RuntimeError("/synthetic/private/refresh"),
+            ),
+            placement,
+            "p\na\nq\n",
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(placement.apply_calls, [(WORKSPACE_A, "default")])
+        self.assertIn("apply: status=applied", output)
+        self.assertIn("do not retry until refresh succeeds", output)
+        self.assertNotIn("/synthetic/private/refresh", output)
 
     def test_unavailable_or_empty_board_exits_without_placement_io(self) -> None:
         cases = (

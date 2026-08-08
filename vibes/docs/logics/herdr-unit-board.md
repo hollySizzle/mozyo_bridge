@@ -36,6 +36,12 @@ mozyo-bridge herdr unit-board interact
 - `interact` は同じpublic-safe Unit一覧をキーボードで選択し、`p`で専用2-pane
   pairの配置をpreview、previewが実行可能な場合だけ`a`で明示applyする。`j` / `k`は
   選択、`r`は再読取、`q`は変更せず閉じる。
+- `interact` の選択keyは完全なidentityから作ったopaque `unit_id`とし、表示用に
+  切り詰めた`workspace_id` / `lane_id`をaction入力へ戻さない。preview直前にlive
+  inventoryから`unit_id`を完全なidentityへ一意に再解決できない場合はzero-writeで拒否する。
+- apply呼出しが例外になった場合は、書込み前か書込み後かをUIから判定できないため
+  `partial_failure / postcondition_failed`として表示し、refresh・状態確認まで再実行を
+  禁止する。apply結果取得後のboard refresh失敗でも結果を失わず、同じくblind retryを促さない。
 - inventory を読めない場合や managed identity が壊れている場合は非0で終了する。
 
 JSON payload は transient `pane_id`、absolute path、ticket本文、agent本文を含めない。

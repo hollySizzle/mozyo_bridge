@@ -1,9 +1,10 @@
 """Keyboard UI for preview-first placement of one Unit Board row (#15116).
 
-The UI keeps volatile pane locators out of its contract.  A selection retains
-only the managed ``(workspace_id, lane_id)`` identity already carried by the
-public-safe board row, while the placement service resolves and revalidates the
-live panes at preview and again at apply time.
+The UI keeps volatile pane locators and exact durable identities out of its
+public board contract.  A selection retains the row's opaque ``unit_id`` and
+asks the runtime to resolve that id to the exact managed identity before a
+preview.  The placement service then resolves and revalidates the live panes at
+preview and again at apply time.
 """
 
 from __future__ import annotations
@@ -18,6 +19,9 @@ from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.herdr
     safe_text,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_live_pair_placement import (
+    APPLY_PARTIAL,
+    PLAN_REFUSED,
+    REASON_POSTCONDITION_FAILED,
     PlacementApplyResult,
     PlacementPlan,
 )
@@ -25,6 +29,8 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 
 class UnitBoardSource(Protocol):
     def snapshot(self) -> UnitBoardSnapshot: ...
+
+    def action_identity(self, unit_id: str) -> tuple[str, str] | None: ...
 
 
 class PairPlacementActions(Protocol):
@@ -47,10 +53,6 @@ def _order(values: object) -> str:
         return "unknown"
     rendered = [safe_text(value) for value in values]
     return ",".join(rendered) if rendered else "none"
-
-
-def _unit_key(row: UnitBoardRow) -> tuple[str, str]:
-    return row.workspace_id, row.lane_id
 
 
 def _unit_line(row: UnitBoardRow, *, selected: bool, number: int) -> str:
@@ -172,7 +174,8 @@ class HerdrUnitBoardPlacementUI:
             return 1
         selected = 0
         preview: PlacementPlan | None = None
-        preview_key: tuple[str, str] | None = None
+        preview_unit_id: str | None = None
+        preview_identity: tuple[str, str] | None = None
         result: PlacementApplyResult | None = None
         message = ""
         while True:
@@ -188,54 +191,82 @@ class HerdrUnitBoardPlacementUI:
             if command in {"j", "down"}:
                 selected = min(selected + 1, len(snapshot.units) - 1)
                 preview = None
-                preview_key = None
+                preview_unit_id = None
+                preview_identity = None
                 continue
             if command in {"k", "up"}:
                 selected = max(selected - 1, 0)
                 preview = None
-                preview_key = None
+                preview_unit_id = None
+                preview_identity = None
                 continue
             if command == "r":
-                selected_key = _unit_key(snapshot.units[selected])
+                selected_unit_id = snapshot.units[selected].unit_id
                 refreshed = self._snapshot()
                 if refreshed is None:
                     message = "Unit board refresh was unavailable; no pane was changed."
                     preview = None
-                    preview_key = None
+                    preview_unit_id = None
+                    preview_identity = None
                     continue
                 snapshot = refreshed
                 selected = next(
                     (
                         index
                         for index, row in enumerate(snapshot.units)
-                        if _unit_key(row) == selected_key
+                        if row.unit_id == selected_unit_id
                     ),
                     0,
                 )
                 preview = None
-                preview_key = None
+                preview_unit_id = None
+                preview_identity = None
                 continue
             row = snapshot.units[selected]
-            selected_key = _unit_key(row)
+            selected_unit_id = row.unit_id
             if command == "p":
                 try:
-                    preview = self._placement.preview(*selected_key)
-                    preview_key = selected_key
+                    identity = self._board.action_identity(selected_unit_id)
+                    if identity is None:
+                        raise LookupError("Unit action identity is unavailable")
+                    preview = self._placement.preview(*identity)
+                    preview_unit_id = selected_unit_id
+                    preview_identity = identity
                 except Exception:
                     preview = None
-                    preview_key = None
+                    preview_unit_id = None
+                    preview_identity = None
                     message = "Placement preview is unavailable; no pane was changed."
                 continue
             if command == "a":
-                if preview is None or preview_key != selected_key or not preview.can_apply:
+                if (
+                    preview is None
+                    or preview_unit_id != selected_unit_id
+                    or preview_identity is None
+                    or not preview.can_apply
+                ):
                     message = "Preview this selected Unit before applying a change."
                     continue
                 try:
-                    result = self._placement.apply(*selected_key)
+                    result = self._placement.apply(*preview_identity)
                 except Exception:
-                    message = "Placement apply is unavailable; inspect the Unit and preview again."
+                    after = PlacementPlan(
+                        PLAN_REFUSED,
+                        REASON_POSTCONDITION_FAILED,
+                        "post-apply state could not be established",
+                        *preview_identity,
+                    )
+                    result = PlacementApplyResult(
+                        APPLY_PARTIAL,
+                        REASON_POSTCONDITION_FAILED,
+                        "the apply outcome is unknown; panes may have changed",
+                        preview,
+                        after,
+                        "Do not retry; refresh and inspect the selected Unit first.",
+                    )
                 preview = None
-                preview_key = None
+                preview_unit_id = None
+                preview_identity = None
                 refreshed = self._snapshot()
                 if refreshed is not None:
                     snapshot = refreshed
@@ -243,9 +274,14 @@ class HerdrUnitBoardPlacementUI:
                         (
                             index
                             for index, item in enumerate(snapshot.units)
-                            if _unit_key(item) == selected_key
+                            if item.unit_id == selected_unit_id
                         ),
                         0,
+                    )
+                else:
+                    message = (
+                        "Unit board refresh failed after apply; do not retry until "
+                        "refresh succeeds."
                     )
                 continue
             message = "Unknown key; no pane was changed."
