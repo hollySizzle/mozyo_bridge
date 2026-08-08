@@ -353,6 +353,21 @@ class CallbackStepTest(unittest.TestCase):
         self.assertEqual(out.target_pane, "%pgw")
         self.assertTrue(out.executable)
 
+    def test_explicit_coordinator_callback_contract_is_preserved(self):
+        out = resolve_workflow_step(
+            [
+                _cand("%self", project_scope=PROJECT, lane_kind="delegated_coordinator"),
+                self._gateway_caller(),
+            ],
+            self_pane="%self",
+            pending_callback=PendingCallback(
+                classification="no_dispatch", callback_to_role="coordinator"
+            ),
+        )
+        self.assertEqual(out.callback_to_role, "coordinator")
+        self.assertEqual(out.target_pane, "%pgw")
+        self.assertTrue(out.executable)
+
     def test_caller_missing_fails_closed(self):
         out = resolve_workflow_step(
             [_cand("%self", project_scope=PROJECT)],  # no grandparent caller present

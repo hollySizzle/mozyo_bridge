@@ -130,7 +130,7 @@ def configure_q_enter_parser(parser_: argparse.ArgumentParser) -> None:
         choices=list(READ_CONTRACT_TOKENS),
         help=(
             "consultation_callback governing workflow-contract set "
-            "(`grandparent_coordinator` / `project_gateway`)."
+            "(`grandparent_coordinator` / `project_gateway` / `coordinator`)."
         ),
     )
     parser_.add_argument(
