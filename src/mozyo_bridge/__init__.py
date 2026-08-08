@@ -15,3 +15,10 @@ __version__ = "0.18.0"
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application import (  # noqa: E402,F401
     agent_provider_runtime as _agent_provider_runtime_bootstrap,
 )
+
+# Redmine #15118: register the terminal-runtime implementation behind the
+# core-owned project-gateway inventory port.  This preserves the sanctioned
+# adapter -> core dependency direction; no e_110 f_120 module imports e_140.
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E402,F401
+    project_gateway_backend_support as _project_gateway_backend_support_bootstrap,
+)

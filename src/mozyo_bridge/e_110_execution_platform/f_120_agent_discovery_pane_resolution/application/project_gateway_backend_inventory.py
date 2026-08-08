@@ -1,12 +1,13 @@
 """Backend-aware project-gateway inventory and Herdr delivery pinning.
 
 The project-gateway command family historically discovered only tmux panes.  This
-adapter keeps that tmux branch unchanged while projecting the Herdr backend's
-durable workflow-role binding plus live, generation-attested agent rows onto the
-same ``TargetCandidate`` resolver vocabulary.  Herdr locators remain transient:
+core boundary keeps that tmux branch unchanged while an e_140 implementation,
+registered by package composition, projects the Herdr backend's durable
+workflow-role binding plus live, generation-attested agent rows onto the same
+``TargetCandidate`` resolver vocabulary.  Herdr locators remain transient:
 selection uses the logical assigned name, and every delivery re-reads the backend,
 binding, provider, inventory row, liveness, and launch generation before handing an
-internal capability to the send rail.
+opaque internal capability to the send rail.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ import argparse
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, Protocol
 
 from mozyo_bridge.application.repo_local_config_loader import load_repo_local_config
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
@@ -44,31 +45,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.project_scope import (
     path_under_repo_relative,
 )
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (
-    herdr_workspace_segment,
-)
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
-    AGENT_KEY_LOCATOR,
-    AGENT_KEY_LOCATOR_ALIAS,
-    AGENT_KEY_LOCATOR_ALIAS_2,
-    AGENT_KEY_NAME,
-    _norm,
-    _norm_lane,
-    decode_assigned_name,
-)
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (
-    SLOT_LIVE,
-    classify_named_slot,
-)
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
-    BACKEND_HERDR,
-    BACKEND_TMUX,
-    TerminalTransportError,
-    valid_target,
-)
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_discovery import (
-    resolve_agent_lister,
-)
 from mozyo_bridge.shared.paths import (
     find_repo_root,
     infer_git_worktree_root,
@@ -89,19 +65,85 @@ INVENTORY_SELECTORS = frozenset(
 
 STATUS_INVENTORY_UNAVAILABLE = "gateway_inventory_unavailable"
 
-_LOCATOR_KEYS = (
-    AGENT_KEY_LOCATOR,
-    AGENT_KEY_LOCATOR_ALIAS,
-    AGENT_KEY_LOCATOR_ALIAS_2,
-)
+# These are transport protocol values, not adapter imports.  The e_140 adapter
+# registers the operations that interpret Herdr rows; this core boundary only
+# compares the already-selected backend and carries the opaque capability.
+BACKEND_HERDR = "herdr"
+BACKEND_TMUX = "tmux"
+RESOLVED_TARGET_CAPABILITY_ARG = "_mozyo_resolved_herdr_target_capability"
+
+
+class ProjectGatewayBackendSupport(Protocol):
+    """Adapter operations required by the core inventory use case."""
+
+    agent_name_key: str
+    locator_keys: tuple[str, ...]
+
+    def normalize(self, value: object) -> str: ...
+
+    def normalize_lane(self, value: object) -> str: ...
+
+    def decode_assigned_name(self, value: object) -> Any: ...
+
+    def slot_is_live(self, row: object) -> bool: ...
+
+    def valid_target(self, value: object) -> bool: ...
+
+    def workspace_segment(self, repo_root: Path) -> str: ...
+
+    def list_agent_rows(self, config: object) -> Any: ...
+
+    def generation_token(
+        self,
+        *,
+        assigned_name: str,
+        workspace_id: str,
+        provider: str,
+        lane_id: str,
+        locator: str,
+    ) -> str: ...
+
+    def build_project_gateway_capability(self, observation: object) -> object: ...
+
+
+_backend_support: ProjectGatewayBackendSupport | None = None
+
+
+def register_project_gateway_backend_support(
+    support: ProjectGatewayBackendSupport,
+) -> None:
+    """Register the e_140 adapter implementation from the composition root."""
+
+    if support is None:
+        raise TypeError("project-gateway backend support must not be None")
+    global _backend_support
+    _backend_support = support
+
+
+def _require_backend_support() -> ProjectGatewayBackendSupport:
+    support = _backend_support
+    if support is None:
+        raise RuntimeError(
+            "project-gateway backend support is not registered by composition"
+        )
+    return support
+
+
+def _norm(value: object) -> str:
+    return _require_backend_support().normalize(value)
+
+
+def _norm_lane(value: object) -> str:
+    return _require_backend_support().normalize_lane(value)
 
 
 def _locator_claims(row: Mapping[str, object]) -> tuple[bool, frozenset[str]]:
     """Return readable non-empty locator aliases without first-key collapse."""
 
+    support = _require_backend_support()
     claims: set[str] = set()
     readable = True
-    for key in _LOCATOR_KEYS:
+    for key in support.locator_keys:
         if key not in row or row.get(key) is None:
             continue
         value = row.get(key)
@@ -266,16 +308,11 @@ class LiveProjectGatewayInventoryOps:
         return binding
 
     def workspace_id(self, repo_root: Path) -> str:
-        return herdr_workspace_segment(repo_root)
+        return _require_backend_support().workspace_segment(repo_root)
 
     def herdr_rows(self, repo_root: Path):
         config = load_repo_local_config(repo_root).terminal_transport
-        lister = resolve_agent_lister(config)
-        if lister is None:
-            raise TerminalTransportError(
-                "Herdr backend selected but no agent lister resolved"
-            )
-        return lister.list_agent_rows()
+        return _require_backend_support().list_agent_rows(config)
 
     def generation_token(
         self,
@@ -286,19 +323,12 @@ class LiveProjectGatewayInventoryOps:
         lane_id: str,
         locator: str,
     ) -> str:
-        from mozyo_bridge.core.state.herdr_launch_generation import (
-            verified_generation_token,
-        )
-
-        return verified_generation_token(
-            None,
+        return _require_backend_support().generation_token(
             assigned_name=assigned_name,
             workspace_id=workspace_id,
-            role=provider,
+            provider=provider,
             lane_id=lane_id,
             locator=locator,
-            norm=_norm,
-            norm_lane=_norm_lane,
         )
 
     def project_path(
@@ -532,12 +562,17 @@ class ProjectGatewayBackendInventoryUseCase:
         for row in rows:
             if not isinstance(row, Mapping):
                 continue
-            decoded = decode_assigned_name(row.get(AGENT_KEY_NAME))
+            decoded = _require_backend_support().decode_assigned_name(
+                row.get(_require_backend_support().agent_name_key)
+            )
             identity = decoded.identity if decoded.ok else None
             if identity is None or identity.workspace_id != workspace_id:
                 continue
             lane = _norm_lane(identity.lane_id)
-            is_gateway = lane == _norm_lane(authority.lane_id) and identity.role == gateway_provider
+            is_gateway = (
+                lane == _norm_lane(authority.lane_id)
+                and identity.role == gateway_provider
+            )
             is_child = (
                 lane != DEFAULT_LANE
                 and lane not in gateway_lane_ids
@@ -551,7 +586,14 @@ class ProjectGatewayBackendInventoryUseCase:
                 else is_gateway or is_child
             )
             if include:
-                selected_rows.append((row, identity, lane, _norm(row.get(AGENT_KEY_NAME))))
+                selected_rows.append(
+                    (
+                        row,
+                        identity,
+                        lane,
+                        _norm(row.get(_require_backend_support().agent_name_key)),
+                    )
+                )
 
         names = [item[3] for item in selected_rows]
         if len(names) != len(set(names)):
@@ -587,7 +629,7 @@ class ProjectGatewayBackendInventoryUseCase:
         observations: list[HerdrTargetObservation] = []
         candidates: list[TargetCandidate] = []
         for row, identity, lane, assigned_name in selected_rows:
-            if classify_named_slot(row) != SLOT_LIVE:
+            if not _require_backend_support().slot_is_live(row):
                 self._error(
                     "herdr_slot_not_live",
                     "a matching durable Herdr slot is stale rather than a live managed agent",
@@ -605,7 +647,7 @@ class ProjectGatewayBackendInventoryUseCase:
                     "a matching Herdr row has malformed or conflicting locator aliases",
                 )
             locator = next(iter(locator_claims))
-            if not valid_target(locator):
+            if not _require_backend_support().valid_target(locator):
                 self._error(
                     "herdr_locator_missing",
                     "a matching durable Herdr slot has no valid live locator",
@@ -845,24 +887,8 @@ def prepare_project_gateway_delivery(
             backend=BACKEND_HERDR,
         )
 
-    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
-        PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
-        ResolvedHerdrTargetCapability,
-    )
-
-    capability = ResolvedHerdrTargetCapability(
-        workspace_id=observation.workspace_id,
-        lane_id=observation.lane_id,
-        provider=observation.provider,
-        assigned_name=observation.assigned_name,
-        locator=observation.locator,
-        purpose=PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
-        generation_token=observation.generation_token,
-        project_scope=observation.project_scope,
-        target_repo_root=observation.target_repo_root,
-        target_cwd=observation.target_cwd,
-        project_path=observation.project_path,
-        project_scope_root_fallback=observation.project_scope_root_fallback,
+    capability = _require_backend_support().build_project_gateway_capability(
+        observation
     )
     return PreparedProjectGatewayDelivery(
         target=observation.assigned_name,
@@ -895,9 +921,11 @@ __all__ = (
     "PreparedProjectGatewayDelivery",
     "ProjectGatewayBackendInventory",
     "ProjectGatewayBackendInventoryUseCase",
+    "ProjectGatewayBackendSupport",
     "ProjectGatewayInventoryError",
     "ProjectGatewayInventoryRequest",
     "ProjectPathAuthority",
+    "RESOLVED_TARGET_CAPABILITY_ARG",
     "SELECT_CHILD_INTAKE",
     "SELECT_CHILD_ROUTE",
     "SELECT_GATEWAY",
@@ -906,5 +934,6 @@ __all__ = (
     "discover_project_gateway_inventory",
     "normalize_child_intake_caller",
     "prepare_project_gateway_delivery",
+    "register_project_gateway_backend_support",
     "render_inventory_error",
 )

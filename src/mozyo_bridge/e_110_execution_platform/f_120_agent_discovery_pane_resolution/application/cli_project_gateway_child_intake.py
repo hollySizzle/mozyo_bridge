@@ -35,6 +35,7 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
 )
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.project_gateway_backend_inventory import (
     ProjectGatewayInventoryError,
+    RESOLVED_TARGET_CAPABILITY_ARG,
     SELECT_CHILD_INTAKE,
     discover_project_gateway_inventory,
     normalize_child_intake_caller,
@@ -235,10 +236,6 @@ def cmd_project_gateway_child_intake(args: argparse.Namespace) -> int:
     if prepared.target_lane:
         args.target_lane = prepared.target_lane
     if prepared.capability is not None:
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
-            RESOLVED_TARGET_CAPABILITY_ARG,
-        )
-
         setattr(args, RESOLVED_TARGET_CAPABILITY_ARG, prepared.capability)
     # Redmine #12748: the forward work-intake payload, built programmatically (not
     # operator-typed) so it is product evidence, not a hand-asserted role payload.

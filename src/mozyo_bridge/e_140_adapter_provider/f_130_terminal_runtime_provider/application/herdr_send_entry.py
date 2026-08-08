@@ -38,6 +38,9 @@ from typing import Optional
 
 from mozyo_bridge.application.commands_common import repo_root_from_args
 from mozyo_bridge.application.repo_local_config_loader import load_repo_local_config
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.project_gateway_backend_inventory import (
+    RESOLVED_TARGET_CAPABILITY_ARG,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     AUTO_TARGET_REPO,
     is_explicit_pane_target,
@@ -133,7 +136,6 @@ _RESOLVED_TARGET_CAPABILITY_PURPOSES: frozenset[str] = frozenset(
     }
 )
 RESOLVED_TARGET_CAPABILITY_MISMATCH: str = "resolved_target_capability_mismatch"
-RESOLVED_TARGET_CAPABILITY_ARG: str = "_mozyo_resolved_herdr_target_capability"
 
 _LOCATOR_KEYS = (
     AGENT_KEY_LOCATOR,
