@@ -38,6 +38,7 @@ handoff-routing contexts), so per the tests-placement policy it lives in
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -92,6 +93,13 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketle
     CONSULTATION_PROJECT_DOMAIN,
     CONSULTATION_ROUTING,
     TicketlessConsultation,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_callback import (  # noqa: E402
+    TicketlessCallback,
+)
+from mozyo_bridge.core.state.forward_outbox_fence import (  # noqa: E402
+    ForwardOutboxFence,
+    ForwardRouteKey,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_work_intake import (  # noqa: E402
     ROLE_DELEGATED_COORDINATOR as ROLE_CHILD_COORDINATOR,
@@ -490,6 +498,43 @@ class StandardPathNeedsNoPaneIdScenarioTest(unittest.TestCase):
             _route(), project_path=PROJECT_PATH
         )
         self.assertNotIn("%", launch_command)
+
+
+class CoordinatorForwardCallbackScenarioTest(unittest.TestCase):
+    """A coordinator callback closes only its correlated managed-forward generation."""
+
+    def test_coordinator_contract_completes_the_correlated_generation(self) -> None:
+        workspace_id = "factual-z690-smoke-workspace"
+        route = ForwardRouteKey(
+            workspace_id,
+            "default",
+            "coordinator",
+            "delegated_coordinator",
+            "infra-platform",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            fence = ForwardOutboxFence(home=Path(tmp))
+            fence.bootstrap()
+            reserved = fence.reserve(route)
+            self.assertTrue(reserved.won)
+            self.assertTrue(fence.mark_delivered(route, reserved.action_id))
+
+            callback = TicketlessCallback(
+                classification="no_dispatch",
+                dispatch_decision="hand_back_to_caller",
+                next_action_owner="caller",
+                callback_reason="no_dispatch_decided",
+                read_contract="coordinator",
+                forward_action_id=reserved.action_id,
+            )
+            self.assertTrue(
+                fence.complete_by_correlation(
+                    callback.forward_action_id,
+                    workspace_id=workspace_id,
+                    from_role=callback.read_contract,
+                )
+            )
+            self.assertEqual(fence.active(route).state, "completed")
 
 
 if __name__ == "__main__":

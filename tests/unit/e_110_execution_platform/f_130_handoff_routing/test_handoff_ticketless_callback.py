@@ -9,6 +9,7 @@ delivery rail WITHOUT a Redmine anchor and without fabricating one, while keepin
 the child -> grandchild worker-dispatch anchor requirement intact.
 """
 
+import argparse
 import sys
 import unittest
 from pathlib import Path
@@ -38,6 +39,12 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketle
     TicketlessCallback,
     TicketlessCallbackError,
     ticketless_callback_from_payload,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli_handoff_q_enter import (
+    configure_q_enter_parser,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli_handoff_ticketless import (
+    configure_ticketless_callback_parser,
 )
 
 
@@ -111,6 +118,28 @@ class TicketlessCallbackConstructionTest(unittest.TestCase):
             _callback(classification="   ")
 
 
+class TicketlessCallbackCliVocabularyTest(unittest.TestCase):
+    def _read_contract_choices(self, configure) -> tuple[str, ...]:
+        parser = argparse.ArgumentParser(add_help=False)
+        configure(parser)
+        action = next(
+            action for action in parser._actions if action.dest == "read_contract"
+        )
+        return tuple(action.choices or ())
+
+    def test_ticketless_callback_cli_accepts_coordinator_contract(self) -> None:
+        self.assertEqual(
+            self._read_contract_choices(configure_ticketless_callback_parser),
+            ("grandparent_coordinator", "project_gateway", "coordinator"),
+        )
+
+    def test_q_enter_cli_accepts_coordinator_contract(self) -> None:
+        self.assertEqual(
+            self._read_contract_choices(configure_q_enter_parser),
+            ("grandparent_coordinator", "project_gateway", "coordinator"),
+        )
+
+
 class TicketlessWorkerDispatchBoundaryTest(unittest.TestCase):
     """The child -> grandchild worker dispatch anchor requirement is not relaxed."""
 
@@ -157,6 +186,11 @@ class TicketlessCallbackRoundTripTest(unittest.TestCase):
                         READ_CONTRACT_TOKENS, TICKETLESS_DISPATCH_DECISIONS):
             self.assertTrue(choices)
             self.assertEqual(len(choices), len(set(choices)))
+
+    def test_coordinator_read_contract_roundtrips(self) -> None:
+        cb = _callback(read_contract="coordinator")
+        rebuilt = ticketless_callback_from_payload(cb.to_structured_dict())
+        self.assertEqual(rebuilt.read_contract, "coordinator")
 
 
 class TicketlessCallbackRenderTest(unittest.TestCase):

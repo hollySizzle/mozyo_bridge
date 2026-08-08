@@ -475,11 +475,11 @@ def _callback_to_role_for_lane(lane: WorkflowLane, pending: PendingCallback) -> 
 
     A project gateway returns up to the grandparent coordinator; a delegated
     coordinator returns up to the project gateway. The ticketless callback
-    ``read_contract`` only resolves ``grandparent_coordinator`` / ``project_gateway``
-    (#12700 / #12706), so this maps to one of those. An explicit
+    ``read_contract`` resolves the two legacy transition roles plus the
+    provider-neutral ``coordinator`` role used by Herdr managed forwards. An explicit
     ``pending.callback_to_role`` that is a valid read-contract token wins.
     """
-    if pending.callback_to_role in (ROLE_GRANDPARENT_COORDINATOR, ROLE_PROJECT_GATEWAY):
+    if pending.callback_to_role in (ROLE_GRANDPARENT_COORDINATOR, ROLE_PROJECT_GATEWAY, "coordinator"):
         # The caller supplied a concrete read-contract role; only override the
         # default placeholder, not an explicit project_gateway return.
         if not (
