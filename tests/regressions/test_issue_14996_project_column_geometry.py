@@ -1536,6 +1536,29 @@ class ProjectColumnFailClosedTest(unittest.TestCase):
         self.assertIn("recovery could not be verified", detail)
         self.assertIn("inventory changed", detail)
 
+    def test_failed_attach_recovery_with_unreadable_inventory_returns_typed_failure(self):
+        env, _tab, _project_a, project_b = self._scenario()
+        env.herdr.refuse_move_attempts.add(4)
+        agent_list_calls = 0
+
+        def runner(argv, **kwargs):
+            nonlocal agent_list_calls
+            if list(argv[1:3]) == ["agent", "list"]:
+                agent_list_calls += 1
+                if agent_list_calls == 2:
+                    return subprocess.CompletedProcess(
+                        argv, 1, stdout="", stderr="inventory unavailable"
+                    )
+            return env.herdr(argv, **kwargs)
+
+        outcome, detail = env.run(
+            env.result(PROJECT_B, list(project_b)), runner=runner
+        )
+
+        self.assertEqual(outcome, COLUMN_FAILED)
+        self.assertIn("recovery could not be verified", detail)
+        self.assertIn("inventory could not be read", detail)
+
     def test_malformed_detach_result_is_reobserved_and_recovered(self):
         env, tab, project_a, project_b = self._scenario()
         env.herdr.move_malformed_after_geometry.add(project_b[1])

@@ -475,7 +475,10 @@ def _restore_detached(
             stranded.append(attach.pane)
         pending.remove(attach.pane)
     stranded.extend(sorted(pending))
-    after = _identity_map(_list_rows(binary, runner, timeout), target_workspace)
+    try:
+        after = _identity_map(_list_rows(binary, runner, timeout), target_workspace)
+    except HerdrSessionStartError:
+        return tuple(stranded), "the shared workspace inventory could not be read during recovery"
     if after != before:
         lost = sorted(set(before) - set(after))
         changed = sorted(
