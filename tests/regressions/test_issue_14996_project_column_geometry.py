@@ -264,6 +264,31 @@ class ProjectColumnGeometryTest(unittest.TestCase):
         self.assertEqual(len(env.herdr.tabs), 1)
         self.assertEqual(sorted(tab.panes()), sorted([a_top, a_bottom, b_top, b_bottom]))
 
+    def test_appending_a_column_preserves_the_existing_unit_internal_ratio(self):
+        """#15126: the bounce must not reset the existing Unit to Herdr's 0.5."""
+
+        env = _Env(self, PROJECT_A, PROJECT_B)
+        tab = env.herdr.new_tab()
+        (a_top, a_bottom), = env.seed_columns(tab, (PROJECT_A, ""))
+        self.assertTrue(tab.resize(a_top, "up", 0.15))
+        before = env.herdr.rects()
+        self.assertEqual(before[a_top][3], 8)
+        self.assertEqual(before[a_bottom][3], 15)
+
+        b_top, b_bottom = env.append_pair(tab, PROJECT_B)
+        outcome, detail = env.run(env.result(PROJECT_B, [b_top, b_bottom]))
+        self.assertEqual(outcome, COLUMN_APPLIED, detail)
+
+        after = env.herdr.rects()
+        self.assertEqual(after[a_top][3], before[a_top][3])
+        self.assertEqual(after[a_bottom][3], before[a_bottom][3])
+        restore = next(
+            call
+            for call in env.moves()
+            if call[2] == a_bottom and "--tab" in call
+        )
+        self.assertEqual(restore[restore.index("--ratio") + 1], "0.35")
+
     def test_result_is_independent_of_which_pane_was_active_before_launch(self):
         """j#99845: the geometry must not depend on pre-launch focus."""
         geometries = []
@@ -1429,6 +1454,37 @@ class ProjectColumnFailClosedTest(unittest.TestCase):
         self.assertEqual(sorted(tab.panes()), sorted(list(project_a) + list(project_b)))
         result.column_outcome, result.column_detail = outcome, detail
         self.assertFalse(result.column_ok)
+
+    def test_failed_attach_recovery_restores_the_existing_unit_ratio(self):
+        env, tab, project_a, project_b = self._scenario()
+        self.assertTrue(tab.resize(project_a[0], "up", 0.15))
+        before = env.herdr.rects()
+        env.herdr.refuse_move_attempts.add(4)
+
+        outcome, detail = env.run(env.result(PROJECT_B, list(project_b)))
+
+        self.assertEqual(outcome, COLUMN_FAILED)
+        self.assertIn("every detached pane was returned", detail)
+        after = env.herdr.rects()
+        self.assertEqual(after[project_a[0]][3], before[project_a[0]][3])
+        self.assertEqual(after[project_a[1]][3], before[project_a[1]][3])
+        restore = next(
+            call
+            for call in env.moves()
+            if call[2] == project_a[1] and "--tab" in call
+        )
+        self.assertEqual(restore[restore.index("--ratio") + 1], "0.35")
+
+    def test_accepted_move_that_ignores_ratio_is_not_reported_as_applied(self):
+        env, tab, project_a, project_b = self._scenario()
+        self.assertTrue(tab.resize(project_a[0], "up", 0.15))
+        env.herdr.move_ratio_ignored.add(project_a[1])
+
+        outcome, detail = env.run(env.result(PROJECT_B, list(project_b)))
+
+        self.assertEqual(outcome, COLUMN_FAILED)
+        self.assertIn("internal ratio changed", detail)
+        self.assertIn("observed_ratio=0.5", detail)
 
     def test_a_pane_left_outside_the_shared_tab_is_named_in_the_detail(self):
         env, tab, _project_a, project_b = self._scenario()

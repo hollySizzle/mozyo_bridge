@@ -268,10 +268,14 @@ class PaneTreeHerdr:
         #: move dies too. A per-pane refusal cannot produce it, because the pane the
         #: recovery would move is by construction one that moved successfully.
         self.refuse_from_move: Optional[int] = None
+        #: Refuse only these 1-based move attempts, then allow recovery attempts.
+        self.refuse_move_attempts: set = set()
         #: Panes whose next ``pane move`` should report ``changed:false``.
         self.move_unchanged: set = set()
         #: Complete the move but return no parseable typed move result.
         self.move_malformed_after_geometry: set = set()
+        #: Accept a ratio-bearing move but apply Herdr's default 0.5 instead.
+        self.move_ratio_ignored: set = set()
         #: Rename a pane's assigned name at this point in the sequence, to prove the
         #: closing identity check is real rather than decorative.
         self.rename_after_moves: dict = {}
@@ -455,6 +459,8 @@ class PaneTreeHerdr:
     def _pane_move(self, argv, tail):
         pane_id = tail[2]
         self._move_attempts += 1
+        if self._move_attempts in self.refuse_move_attempts:
+            return self._failed(argv, f"pane move refused: {pane_id}")
         if (
             self.refuse_from_move is not None
             and self._move_attempts >= self.refuse_from_move
@@ -501,6 +507,8 @@ class PaneTreeHerdr:
                 or not 0.1 <= ratio <= 0.9
             ):
                 return self._failed(argv, "invalid pane move placement")
+            if pane_id in self.move_ratio_ignored and "--ratio" in tail:
+                ratio = 0.5
             source.remove(pane_id)
             if not target_tab.subdivide(anchor, direction, pane_id, ratio):
                 return self._failed(argv, f"target pane cannot be subdivided: {anchor}")

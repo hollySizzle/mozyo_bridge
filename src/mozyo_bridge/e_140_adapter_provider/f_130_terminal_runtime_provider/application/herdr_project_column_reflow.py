@@ -56,6 +56,10 @@ Boundary — narrow, launch-time, verified (j#99845)
 - **Every placement is explicitly targeted.** Each step passes ``--target-pane``,
   so the result does not depend on which pane happened to be active before the
   launch (j#99845: "起動前focus非依存").
+- **A moved Unit keeps its measured internal ratio.** Detaching its lower pane
+  destroys that divider, so both the normal return and failure recovery pass the
+  saved ratio to Herdr and the closing layout must reproduce the stored ratio and
+  rendered cell extent (#15126).
 - **Only after the canonical startup pass has settled, and only if it admitted
   this run's own launch.** A booting pane and a dead one report the same inventory
   row, so this pass reads the workspace only once the bounded startup probe
@@ -109,6 +113,11 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     columnar_verdict,
     plan_equal_column_ratios,
     read_pane_layout,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_internal_ratio import (  # noqa: E501
+    ColumnInternalRatio,
+    capture_internal_ratios,
+    internal_ratios_match,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_result import (  # noqa: E501
     SLOT_LAUNCHED,
@@ -183,6 +192,7 @@ class ColumnAttach:
     pane: str
     direction: str
     target: str
+    ratio: "Optional[float]" = None
 
 
 @dataclass(frozen=True)
@@ -197,7 +207,7 @@ class ColumnReflowPlan:
     detach: "tuple[str, ...]"
     attach: "tuple[ColumnAttach, ...]"
     anchor_pane: str
-
+    internal_ratios: "tuple[ColumnInternalRatio, ...]"
 
 
 def _anchor_group(
@@ -269,21 +279,60 @@ def plan_project_columns(
     anchor_top, anchor_rest, refusal = _anchor_group(layout, foreign)
     if refusal:
         return None, refusal
+    anchor_keys = [
+        key
+        for key, members in foreign.items()
+        if anchor_top in {member.locator for member in members}
+    ]
+    if len(anchor_keys) != 1:
+        return None, "the rightmost anchor pane does not identify one Unit"
     for locator in own:
         if layout.panes.get(locator) is None:
             return None, f"launched pane {locator!r} is not in the tab layout"
+    internal_ratios, refusal = capture_internal_ratios(
+        layout,
+        {
+            own_key: groups[own_key],
+            anchor_keys[0]: foreign[anchor_keys[0]],
+        },
+    )
+    if refusal:
+        return None, refusal
+    internal_by_lower = {
+        item.lower: item.ratio for item in internal_ratios
+    }
+    own_internal = next(
+        (item for item in internal_ratios if item.key == own_key), None
+    )
+    if (
+        own_internal is None
+        or own_internal.top != own[0]
+        or own_internal.lower != own[1]
+    ):
+        return None, (
+            "the fresh pair's measured top/lower order does not match its launch order"
+        )
     return (
         ColumnReflowPlan(
             detach=(own[1], own[0]) + anchor_rest,
             attach=(
                 ColumnAttach(pane=own[0], direction="right", target=anchor_top),
-                ColumnAttach(pane=own[1], direction="down", target=own[0]),
+                ColumnAttach(
+                    pane=own[1], direction="down", target=own[0],
+                    ratio=own_internal.ratio,
+                ),
             )
             + tuple(
-                ColumnAttach(pane=locator, direction="down", target=anchor_top)
+                ColumnAttach(
+                    pane=locator,
+                    direction="down",
+                    target=anchor_top,
+                    ratio=internal_by_lower.get(locator),
+                )
                 for locator in anchor_rest
             ),
             anchor_pane=anchor_top,
+            internal_ratios=internal_ratios,
         ),
         "",
     )
@@ -345,16 +394,18 @@ def attach_pane(
     attach: ColumnAttach, tab_id: str, *, binary: str, runner, timeout: float, env
 ) -> str:
     """Place one detached pane against an explicit target — ``""`` iff it landed."""
+    placement = [
+        "pane", "move", attach.pane,
+        "--tab", tab_id,
+        "--split", attach.direction,
+    ]
+    if attach.ratio is not None:
+        placement.extend(("--ratio", f"{attach.ratio:.9g}"))
+    placement.extend(("--target-pane", attach.target, "--no-focus"))
     try:
         completed = _invoke(
             binary,
-            [
-                "pane", "move", attach.pane,
-                "--tab", tab_id,
-                "--split", attach.direction,
-                "--target-pane", attach.target,
-                "--no-focus",
-            ],
+            placement,
             runner,
             timeout,
             env=env,
@@ -394,7 +445,7 @@ def _identity_map(
 def _restore_detached(
     detached: Sequence[str],
     tab_id: str,
-    anchor: str,
+    planned: Sequence[ColumnAttach],
     *,
     binary: str,
     runner,
@@ -404,14 +455,17 @@ def _restore_detached(
     """Best-effort return of still-detached panes; the ones that stayed out.
 
     A failed reflow must not leave an agent parked in an invisible temp tab with
-    no record of it. Each pane is placed back beneath the anchor — not its
-    original divider, which no longer exists — and whatever could not be placed is
-    named in the failure detail rather than silently abandoned.
+    no record of it. Each pane is returned using the same target, direction and
+    measured ratio as the normal plan. Whatever could not be placed is named in
+    the failure detail rather than silently abandoned.
     """
     stranded: list = []
-    for pane_id in detached:
+    pending = set(detached)
+    for attach in planned:
+        if attach.pane not in pending:
+            continue
         refusal = attach_pane(
-            ColumnAttach(pane=pane_id, direction="down", target=anchor),
+            attach,
             tab_id,
             binary=binary,
             runner=runner,
@@ -419,7 +473,9 @@ def _restore_detached(
             env=env,
         )
         if refusal:
-            stranded.append(pane_id)
+            stranded.append(attach.pane)
+        pending.remove(attach.pane)
+    stranded.extend(sorted(pending))
     return tuple(stranded)
 
 
@@ -711,6 +767,7 @@ def reflow_project_columns(
             tab_id,
             anchor=own_launched[0],
             geometry_changed=False,
+            internal_ratios=(),
             binary=binary,
             runner=runner,
             timeout=timeout,
@@ -726,7 +783,7 @@ def reflow_project_columns(
         )
         if step_refusal:
             stranded = _restore_detached(
-                detached, tab_id, plan.anchor_pane,
+                detached, tab_id, plan.attach,
                 binary=binary, runner=runner, timeout=timeout, env=env,
             )
             return COLUMN_FAILED, _stranded_detail(step_refusal, stranded)
@@ -737,10 +794,10 @@ def reflow_project_columns(
         )
         if step_refusal:
             # `attach.pane` is still detached (it is removed only on success), so it
-            # is restored beneath the anchor along with the rest rather than being
+            # is restored with its planned target/direction/ratio rather than being
             # dropped from the accounting the failure detail is built from.
             stranded = _restore_detached(
-                tuple(detached), tab_id, plan.anchor_pane,
+                tuple(detached), tab_id, plan.attach,
                 binary=binary, runner=runner, timeout=timeout, env=env,
             )
             return COLUMN_FAILED, _stranded_detail(step_refusal, stranded)
@@ -752,6 +809,7 @@ def reflow_project_columns(
         tab_id,
         anchor=plan.anchor_pane,
         geometry_changed=True,
+        internal_ratios=plan.internal_ratios,
         binary=binary,
         runner=runner,
         timeout=timeout,
@@ -777,6 +835,7 @@ def _verify_reflow(
     *,
     anchor: str,
     geometry_changed: bool,
+    internal_ratios: Sequence[ColumnInternalRatio],
     binary: str,
     runner,
     timeout: float,
@@ -819,6 +878,12 @@ def _verify_reflow(
             f"{len(groups)} project pair(s) {action} full-height columns; "
             "configured placement must establish their final relative widths"
         )
+    ratios_ok, ratio_detail = internal_ratios_match(layout, internal_ratios)
+    if not ratios_ok:
+        return COLUMN_FAILED, (
+            "a Unit's internal ratio changed across project-column reflow: "
+            f"{ratio_detail}"
+        )
     resized, refusal = balance_project_columns(
         layout,
         groups,
@@ -837,6 +902,12 @@ def _verify_reflow(
     balanced, reason = balanced_column_verdict(closing, groups)
     if not balanced:
         return COLUMN_FAILED, f"the project columns are still not balanced: {reason}"
+    ratios_ok, ratio_detail = internal_ratios_match(closing, internal_ratios)
+    if not ratios_ok:
+        return COLUMN_FAILED, (
+            "a Unit's internal ratio changed during project-column balancing: "
+            f"{ratio_detail}"
+        )
     final_inventory = _identity_map(
         _list_rows(binary, runner, timeout), target_workspace
     )
