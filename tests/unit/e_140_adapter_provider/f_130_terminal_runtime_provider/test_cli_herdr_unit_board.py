@@ -353,21 +353,19 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
         self.assertEqual(tokens["unrelated"], "preserved")
 
     def test_sync_reconciles_a_new_managed_identity_that_starts_before_stale_clear(self) -> None:
-        current_agents: list[tuple[dict[str, object], ...]] = [()]
+        managed = (row("codex", "w1:p2"),)
+        agent_snapshots = [(), managed, managed, managed]
         tokens = {key: "stale-value" for key in METADATA_TOKEN_KEYS}
         calls: list[list[str]] = []
 
         class CurrentLister:
             def list_agent_rows(self):
-                return current_agents[0]
+                return agent_snapshots.pop(0)
 
         def runner(argv, **kwargs):
             calls.append(list(argv))
             if "--clear-token" in argv:
-                current_agents[0] = (row("codex", "w1:p2"),)
-                for index, value in enumerate(argv):
-                    if value == "--clear-token":
-                        tokens.pop(argv[index + 1], None)
+                self.fail("a new managed identity must be re-observed before stale clear")
             else:
                 for index, value in enumerate(argv):
                     if value == "--token":
@@ -389,10 +387,11 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
         report = board.sync_metadata()
 
         self.assertTrue(report.ok)
-        self.assertEqual(report.attempted, 2)
-        self.assertEqual(report.updated, 2)
-        self.assertIn("--clear-token", calls[0])
-        self.assertIn("--token", calls[1])
+        self.assertEqual(report.attempted, 1)
+        self.assertEqual(report.updated, 1)
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("--clear-token", calls[0])
+        self.assertIn("--token", calls[0])
         self.assertTrue(all(tokens[key] != "stale-value" for key in METADATA_TOKEN_KEYS))
 
     def test_duplicate_complete_pane_locator_fails_closed_without_metadata_write(self) -> None:
@@ -470,6 +469,8 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
             events,
             [
                 "lock-enter",
+                "inventory",
+                "panes",
                 "inventory",
                 "panes",
                 "metadata",
@@ -595,7 +596,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
                 name=encode_assigned_name(new_workspace, "codex", "default"),
             ),
         )
-        snapshots = [old, new, new]
+        snapshots = [old, new, new, new]
 
         class TransitioningLister:
             def list_agent_rows(self):
@@ -623,9 +624,9 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
         report = board.sync_metadata()
 
         self.assertTrue(report.ok)
-        self.assertEqual(report.attempted, 2)
-        self.assertEqual(report.updated, 2)
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(report.attempted, 1)
+        self.assertEqual(report.updated, 1)
+        self.assertEqual(len(calls), 1)
         self.assertTrue(all("--seq" not in argv for argv in calls))
         unit_tokens = [
             value
@@ -635,7 +636,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
             and argv[index - 1] == "--token"
             and value.startswith("mozyo_unit=")
         ]
-        self.assertEqual(len(set(unit_tokens)), 2)
+        self.assertEqual(len(unit_tokens), 1)
 
     def test_concurrent_hook_processes_converge_to_the_newest_live_identity(self) -> None:
         old = (row("codex", "w1:p2"),)
@@ -755,8 +756,8 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
 
         self.assertFalse(report.ok)
         self.assertEqual(report.source_state, "reload_required")
-        self.assertEqual(report.attempted, 3)
-        self.assertEqual(report.updated, 3)
+        self.assertEqual(report.attempted, 0)
+        self.assertEqual(report.updated, 0)
         self.assertEqual(report.failures[-1].reason, "inventory_changed_during_sync")
 
     def test_sync_failure_is_nonzero_quality_signal_without_path_disclosure(self) -> None:

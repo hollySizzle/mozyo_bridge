@@ -45,7 +45,8 @@ Herdr 0.8 はplugin hookを別processで非同期実行するため、`sync` は
 privateな空lock fileを `flock` し、inventory取得、metadata更新、inventory再照合を
 1つのcross-process critical sectionとして直列化する。lockを取得・解放できない場合は
 更新せず（解放失敗は既に行った更新件数を保持して）非0で返す。agent identityが更新中に
-変わった場合は固定回数だけ最新inventoryへ収束させ、安定しなければ
+変わった場合はmutation直前の再取得で旧identityへのwriteを見送り、更新後にも再取得する。
+固定回数だけ最新inventoryへ収束させ、安定しなければ
 `reload_required` とする。
 
 metadata reportにwall clock由来の `--seq` は使わない。lock下の到着順をそのまま採用する

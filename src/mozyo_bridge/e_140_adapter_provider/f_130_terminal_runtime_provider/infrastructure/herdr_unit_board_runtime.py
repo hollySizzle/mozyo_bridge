@@ -589,6 +589,24 @@ class HerdrUnitBoardRuntime:
                     updated=updated,
                     failures=tuple(failures) + inventory_failure.failures,
                 )
+            # Re-read immediately before mutation.  The cross-process lock orders
+            # plugin writers, but it cannot stop Herdr from releasing one agent and
+            # starting another on the same pane.  If that happened since the first
+            # observation, do not clear or overwrite either generation; retry from
+            # the newer authority instead.  The post-write observation below still
+            # closes the unavoidable race after this check.
+            preflight = self._observe()
+            if not preflight.snapshot.ok:
+                inventory_failure = self._inventory_failure(preflight)
+                return MetadataSyncReport(
+                    source_state=inventory_failure.source_state,
+                    attempted=attempted,
+                    updated=updated,
+                    failures=tuple(failures) + inventory_failure.failures,
+                )
+            if preflight.metadata_authority != observed.metadata_authority:
+                observed = preflight
+                continue
             applied = self._apply_metadata(observed)
             attempted += applied.attempted
             updated += applied.updated
