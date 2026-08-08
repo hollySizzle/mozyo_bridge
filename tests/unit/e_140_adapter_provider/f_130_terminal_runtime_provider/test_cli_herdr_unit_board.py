@@ -166,7 +166,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
         self.assertNotIn("/private/x", repr(report.as_payload()))
 
     def test_invalid_pane_locator_requires_reload_and_never_runs_metadata_command(self) -> None:
-        for locator in ("--help", "w1:p1 extra", "w1:p1;next"):
+        for locator in ("--help", "w1:p1 extra", "w1:p1;next", "w1:p1\n"):
             with self.subTest(locator=locator):
                 runner = mock.Mock()
                 board = runtime((row("codex", locator),), runner=runner)
@@ -206,6 +206,19 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
                             "eyJzeW50aGV0aWMiOiJ0ZXN0In0",
                             "eyJ2YWx1ZSI6InRlc3QifQ",
                             "c3ludGhldGljc2lnbmF0dXJl",
+                        )
+                    ),
+                )
+            ),
+            " = ".join(("AWS ACCESS KEY ID", "synthetic-material-765432")),
+            "=".join(
+                (
+                    "session",
+                    ".".join(
+                        (
+                            "eyJhbGciOiJub25lIn0",
+                            "eyJzdWIiOiJzeW50aGV0aWMifQ",
+                            "",
                         )
                     ),
                 )

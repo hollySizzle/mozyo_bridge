@@ -182,12 +182,29 @@ class UnitBoardReadModelTests(unittest.TestCase):
                 ),
             )
         )
+        spaced_access_assignment = " = ".join(
+            ("AWS ACCESS KEY ID", "synthetic-material-765432")
+        )
+        unsigned_jwt_assignment = "=".join(
+            (
+                "session",
+                ".".join(
+                    (
+                        "eyJhbGciOiJub25lIn0",
+                        "eyJzdWIiOiJzeW50aGV0aWMifQ",
+                        "",
+                    )
+                ),
+            )
+        )
 
         for credential_shape in (
             access_assignment,
             camel_access_assignment,
             basic_header,
             jwt_assignment,
+            spaced_access_assignment,
+            unsigned_jwt_assignment,
         ):
             with self.subTest(shape=credential_shape.split("=", 1)[0][:8]):
                 observation_with_credential = observation(

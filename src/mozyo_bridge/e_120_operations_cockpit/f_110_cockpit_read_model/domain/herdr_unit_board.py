@@ -41,7 +41,8 @@ REDACTED_TEXT = "[redacted]"
 _SPACE_RE = re.compile(r"\s+")
 _ISSUE_LANE_RE = re.compile(r"^issue_(\d+)(?:_(.*))?$")
 _CREDENTIAL_ASSIGNMENT_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?P<key>[A-Za-z0-9_.-]+)\s*[:=]\s*(?P<value>\S+)",
+    r"(?<![A-Za-z0-9_])(?P<key>[A-Za-z0-9_.-]+"
+    r"(?:[ \t]+[A-Za-z0-9_.-]+){0,5})[ \t]*[:=][ \t]*(?P<value>\S+)",
     re.IGNORECASE,
 )
 _CREDENTIAL_KEY_PARTS = frozenset(
@@ -83,7 +84,7 @@ _OPAQUE_CREDENTIAL_RE = re.compile(
     r"\bbearer\s+\S{8,}|"
     r"\bbasic\s+[A-Za-z0-9+/=._-]{8,}|"
     r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{8,}\."
-    r"[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
+    r"[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*"
     r"(?![A-Za-z0-9_-])|"
     r"://[^/\s:@]+:[^/@\s]+@)",
     re.IGNORECASE,
@@ -128,7 +129,9 @@ def _is_credential_shaped(value: str) -> bool:
     ):
         return True
     for match in _CREDENTIAL_ASSIGNMENT_RE.finditer(value):
-        key = match.group("key").casefold().replace("-", "_").replace(".", "_")
+        key = re.sub(
+            r"[ \t.-]+", "_", match.group("key").casefold()
+        )
         compact_key = key.replace("_", "")
         if any(
             part in key or part.replace("_", "") in compact_key

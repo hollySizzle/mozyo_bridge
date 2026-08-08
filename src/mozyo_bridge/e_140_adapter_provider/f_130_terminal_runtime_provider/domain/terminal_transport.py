@@ -171,7 +171,7 @@ _RESOLVED_BINARY_SOURCES: frozenset[str] = frozenset(
 #: metacharacters, or flags, so a target can never smuggle an extra argv token
 #: or an option into a subprocess call. Validated in core so *every* provider
 #: gets the same fail-closed target guard.
-_TARGET_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._-]*$")
+_TARGET_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._-]*")
 
 
 class TerminalTransportError(ValueError):
@@ -197,7 +197,7 @@ class TerminalTransportError(ValueError):
 
 def valid_target(target: object) -> bool:
     """True iff ``target`` is a well-formed target handle (see :data:`_TARGET_TOKEN_RE`)."""
-    return isinstance(target, str) and bool(_TARGET_TOKEN_RE.match(target))
+    return isinstance(target, str) and bool(_TARGET_TOKEN_RE.fullmatch(target))
 
 
 @dataclass(frozen=True)
