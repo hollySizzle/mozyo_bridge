@@ -117,6 +117,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_internal_ratio import (  # noqa: E501
     ColumnInternalRatio,
     capture_internal_ratios,
+    effective_internal_ratios_match,
     internal_ratios_match,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_result import (  # noqa: E501
@@ -447,17 +448,22 @@ def _restore_detached(
     tab_id: str,
     planned: Sequence[ColumnAttach],
     *,
+    before: "Mapping[str, str]",
+    target_workspace: str,
+    anchor: str,
+    internal_ratios: Sequence[ColumnInternalRatio],
     binary: str,
     runner,
     timeout: float,
     env,
-) -> "tuple[str, ...]":
-    """Best-effort return of still-detached panes; the ones that stayed out.
+) -> "tuple[tuple[str, ...], str]":
+    """Best-effort return followed by a fresh inventory/layout verification.
 
     A failed reflow must not leave an agent parked in an invisible temp tab with
-    no record of it. Each pane is returned using the same target, direction and
-    measured ratio as the normal plan. Whatever could not be placed is named in
-    the failure detail rather than silently abandoned.
+    no record of it.  Move responses alone are insufficient evidence: a response
+    can be malformed after geometry changed, or say no change because the pane
+    never left.  The closing inventory, tab and saved internal ratios decide
+    whether recovery was actually completed.
     """
     stranded: list = []
     pending = set(detached)
@@ -476,7 +482,36 @@ def _restore_detached(
             stranded.append(attach.pane)
         pending.remove(attach.pane)
     stranded.extend(sorted(pending))
-    return tuple(stranded)
+    after = _identity_map(_list_rows(binary, runner, timeout), target_workspace)
+    if after != before:
+        lost = sorted(set(before) - set(after))
+        changed = sorted(
+            locator
+            for locator in set(before) & set(after)
+            if before[locator] != after[locator]
+        )
+        return tuple(stranded), (
+            "the shared workspace inventory changed during recovery "
+            f"(missing: {lost!r}, renamed: {changed!r})"
+        )
+    layout = read_pane_layout(
+        anchor, binary=binary, runner=runner, timeout=timeout, env=env
+    )
+    if layout is None:
+        return tuple(stranded), "the recovery pane layout could not be read or parsed"
+    if _norm(layout.tab_id) != tab_id:
+        return tuple(stranded), (
+            f"the recovery layout reports tab {layout.tab_id!r}, not {tab_id!r}"
+        )
+    ratios_ok, ratio_detail = effective_internal_ratios_match(
+        layout, internal_ratios
+    )
+    if not ratios_ok:
+        return tuple(stranded), (
+            "a Unit's internal ratio changed during recovery: "
+            f"{ratio_detail}"
+        )
+    return (), ""
 
 
 def _is_settled_health(value: object) -> bool:
@@ -782,11 +817,17 @@ def reflow_project_columns(
             pane_id, binary=binary, runner=runner, timeout=timeout, env=env
         )
         if step_refusal:
-            stranded = _restore_detached(
-                detached, tab_id, plan.attach,
+            stranded, recovery_refusal = _restore_detached(
+                tuple(detached) + (pane_id,), tab_id, plan.attach,
+                before=before,
+                target_workspace=target_workspace,
+                anchor=plan.anchor_pane,
+                internal_ratios=plan.internal_ratios,
                 binary=binary, runner=runner, timeout=timeout, env=env,
             )
-            return COLUMN_FAILED, _stranded_detail(step_refusal, stranded)
+            return COLUMN_FAILED, _stranded_detail(
+                step_refusal, stranded, recovery_refusal
+            )
         detached.append(pane_id)
     for attach in plan.attach:
         step_refusal = attach_pane(
@@ -796,11 +837,17 @@ def reflow_project_columns(
             # `attach.pane` is still detached (it is removed only on success), so it
             # is restored with its planned target/direction/ratio rather than being
             # dropped from the accounting the failure detail is built from.
-            stranded = _restore_detached(
+            stranded, recovery_refusal = _restore_detached(
                 tuple(detached), tab_id, plan.attach,
+                before=before,
+                target_workspace=target_workspace,
+                anchor=plan.anchor_pane,
+                internal_ratios=plan.internal_ratios,
                 binary=binary, runner=runner, timeout=timeout, env=env,
             )
-            return COLUMN_FAILED, _stranded_detail(step_refusal, stranded)
+            return COLUMN_FAILED, _stranded_detail(
+                step_refusal, stranded, recovery_refusal
+            )
         detached.remove(attach.pane)
     return _verify_reflow(
         before,
@@ -817,13 +864,21 @@ def reflow_project_columns(
     )
 
 
-def _stranded_detail(refusal: str, stranded: Sequence[str]) -> str:
-    """A failure detail that never hides a pane left outside the shared tab."""
+def _stranded_detail(
+    refusal: str, stranded: Sequence[str], recovery_refusal: str
+) -> str:
+    """A failure detail that claims recovery only after fresh observation."""
+    if not recovery_refusal:
+        return (
+            f"{refusal}; every detached pane was returned to the shared tab, "
+            "and identities and internal ratios were verified"
+        )
     if not stranded:
-        return f"{refusal}; every detached pane was returned to the shared tab"
+        return f"{refusal}; recovery could not be verified: {recovery_refusal}"
     return (
         f"{refusal}; pane(s) {sorted(stranded)!r} are NOT in the shared "
-        "project-coordinator tab and need the live-relayout runbook to be replaced"
+        "project-coordinator tab or their return could not be verified "
+        f"({recovery_refusal}); the live-relayout runbook is required"
     )
 
 
@@ -871,18 +926,18 @@ def _verify_reflow(
     columnar, reason = columnar_verdict(layout, groups)
     if not columnar:
         return COLUMN_FAILED, f"the reflowed tab is still not columnar: {reason}"
+    ratios_ok, ratio_detail = internal_ratios_match(layout, internal_ratios)
+    if not ratios_ok:
+        return COLUMN_FAILED, (
+            "a Unit's internal ratio changed across project-column reflow: "
+            f"{ratio_detail}"
+        )
     if len(groups) > MAX_EQUAL_PROJECT_COLUMNS:
         outcome = COLUMN_PREPARED
         action = "now own" if geometry_changed else "already own"
         return outcome, (
             f"{len(groups)} project pair(s) {action} full-height columns; "
             "configured placement must establish their final relative widths"
-        )
-    ratios_ok, ratio_detail = internal_ratios_match(layout, internal_ratios)
-    if not ratios_ok:
-        return COLUMN_FAILED, (
-            "a Unit's internal ratio changed across project-column reflow: "
-            f"{ratio_detail}"
         )
     resized, refusal = balance_project_columns(
         layout,

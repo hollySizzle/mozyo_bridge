@@ -274,6 +274,10 @@ class PaneTreeHerdr:
         self.move_unchanged: set = set()
         #: Complete the move but return no parseable typed move result.
         self.move_malformed_after_geometry: set = set()
+        #: Override named split ratios in the next matching layout response only.
+        #: Rectangles remain derived from the real tree so callers can prove that
+        #: a stored ratio and the rendered cells disagree.
+        self.layout_split_ratio_overrides_once: dict[str, float] = {}
         #: Accept a ratio-bearing move but apply Herdr's default 0.5 instead.
         self.move_ratio_ignored: set = set()
         #: Rename a pane's assigned name at this point in the sequence, to prove the
@@ -454,7 +458,17 @@ class PaneTreeHerdr:
         tab = self.tab_of(pane_id)
         if tab is None:
             return self._failed(argv, f"pane not found: {pane_id}")
-        return self._done(argv, tab.layout_payload())
+        payload = tab.layout_payload()
+        splits = payload["result"]["layout"]["splits"]
+        applied = []
+        for split in splits:
+            split_id = split["id"]
+            if split_id in self.layout_split_ratio_overrides_once:
+                split["ratio"] = self.layout_split_ratio_overrides_once[split_id]
+                applied.append(split_id)
+        for split_id in applied:
+            self.layout_split_ratio_overrides_once.pop(split_id, None)
+        return self._done(argv, payload)
 
     def _pane_move(self, argv, tail):
         pane_id = tail[2]
