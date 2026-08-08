@@ -58,8 +58,8 @@ Boundary (enforced in code, not merely asserted here):
 The registry is asymmetric on purpose, because the two directions have opposite
 failure modes.
 
-An **allow** is keyed on the exact ``(kind, owner, repo, commit)`` pin. A review
-that concluded "this code is safe" is a statement about the bytes that were read.
+An **allow** is keyed on the exact ``(kind, owner, repo, subdir, commit)`` pin. A
+review that concluded "this code is safe" is a statement about the bytes that were read.
 An allow keyed on the repository alone would silently extend to every future
 upstream commit, which is precisely the supply-chain hole the policy exists to
 close. A plugin observed at any other commit resolves to
@@ -311,6 +311,11 @@ class ReviewedPlugin:
                 f"{sorted(DENY_CLASSES)}; {self.plugin_class!r} would extend an allow "
                 f"to every future commit of {self.ref.describe()}"
             )
+        if not self.ref.is_pinned and self.ref.subdir:
+            raise HerdrPluginPolicyError(
+                "a repository-scoped review entry must not name one subdirectory; "
+                "repository deny classifications apply to every subdirectory"
+            )
 
     @property
     def declares_build(self) -> Optional[bool]:
@@ -366,6 +371,25 @@ def build_review_registry(
 #: be trusted to declare that it writes into agent input.
 REVIEWED_PLUGINS: "MappingProxyType[PluginSourceRef, ReviewedPlugin]" = build_review_registry(
     (
+        ReviewedPlugin(
+            ref=PluginSourceRef.pinned(
+                SOURCE_KIND_GITHUB,
+                "hollySizzle",
+                "mozyo_bridge",
+                "aa39b4c9e9c3f43bf054649916a4803bb9a75c7f",
+                subdir=("herdr-plugins", "mozyo-unit-board"),
+            ),
+            plugin_id="mozyo.unit-board",
+            plugin_class=CLASS_UX_ONLY,
+            build_provenance=BUILD_NONE,
+            review_anchor="#15114 j#101219",
+            rationale=(
+                "A read-only terminal Unit board that projects bounded project, role, "
+                "responsibility, work, and runtime labels. Its only Herdr mutation is "
+                "namespaced presentation metadata; it writes no agent input, workflow "
+                "authority, or durable record. The reviewed manifest declares no build."
+            ),
+        ),
         ReviewedPlugin(
             ref=PluginSourceRef.pinned(
                 SOURCE_KIND_GITHUB,

@@ -53,7 +53,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     keeps_absolute_root,
 )
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 #: The one source kind herdr resolves to an immutable commit.
@@ -87,6 +87,12 @@ REDACTED_TOKEN = "<withheld>"
 #: operator types at ``herdr plugin enable``), so the remedy here is a bound rather
 #: than suppression.
 MAX_SEGMENT_LENGTH = 64
+
+#: A plugin may live below a repository root, but the identity remains a bounded
+#: sequence of ordinary GitHub-style segments rather than an arbitrary path.  The
+#: depth bound prevents a syntactically valid third-party value from becoming an
+#: unbounded report channel.
+MAX_SUBDIR_SEGMENTS = 16
 
 #: Upper bound on any single rendered text field (a diagnostic sentence, not an
 #: essay). Bounds are part of the boundary: an unbounded field is a channel.
@@ -204,9 +210,39 @@ def require_segment(value: object, field: str) -> str:
 _require_segment = require_segment
 
 
+def _require_subdir_segments(value: object) -> tuple[str, ...]:
+    """Validate the immutable relative segments of a plugin source subdirectory."""
+    if not isinstance(value, tuple):
+        raise HerdrPluginPolicyError(
+            f"source subdir must be a tuple, got {type(value).__name__}"
+        )
+    if len(value) > MAX_SUBDIR_SEGMENTS:
+        raise HerdrPluginPolicyError(
+            f"source subdir exceeds {MAX_SUBDIR_SEGMENTS} segments"
+        )
+    for index, segment in enumerate(value):
+        if segment in {"", ".", ".."}:
+            raise HerdrPluginPolicyError(
+                f"source subdir segment {index} is empty or navigational"
+            )
+        _require_segment(segment, f"source subdir segment {index}")
+    return value
+
+
+def _parse_source_subdir(value: object) -> tuple[str, ...]:
+    """Parse Herdr's optional slash-joined ``source.subdir`` field strictly."""
+    if value is None:
+        return ()
+    if not isinstance(value, str):
+        raise HerdrPluginPolicyError(
+            f"source subdir must be a string or null, got {type(value).__name__}"
+        )
+    return _require_subdir_segments(tuple(value.split("/")))
+
+
 @dataclass(frozen=True)
 class PluginSourceRef:
-    """Where a plugin's code came from: a repository, optionally at an exact commit.
+    """Where a plugin's code came from: repository, subdirectory, and commit.
 
     ``commit`` is ``None`` for a *repository-scoped* reference — the shape a
     deny-classification uses, and the shape an allow may never use (see the module
@@ -219,6 +255,7 @@ class PluginSourceRef:
     owner: str
     repo: str
     commit: Optional[str] = None
+    subdir: tuple[str, ...] = field(default=(), kw_only=True)
 
     def __post_init__(self) -> None:
         if self.kind != SOURCE_KIND_GITHUB:
@@ -228,6 +265,11 @@ class PluginSourceRef:
             )
         _require_segment(self.owner, "source owner")
         _require_segment(self.repo, "source repo")
+        if self.owner in {".", ".."} or self.repo in {".", ".."}:
+            raise HerdrPluginPolicyError(
+                "source owner and repo must not be navigational segments"
+            )
+        _require_subdir_segments(self.subdir)
         if self.commit is not None:
             if not isinstance(self.commit, str):
                 raise HerdrPluginPolicyError(
@@ -245,14 +287,28 @@ class PluginSourceRef:
         return cls(kind=kind, owner=owner, repo=repo)
 
     @classmethod
-    def pinned(cls, kind: str, owner: str, repo: str, commit: str) -> "PluginSourceRef":
+    def pinned(
+        cls,
+        kind: str,
+        owner: str,
+        repo: str,
+        commit: str,
+        *,
+        subdir: tuple[str, ...] = (),
+    ) -> "PluginSourceRef":
         """A reference pinned to an exact immutable commit."""
-        return cls(kind=kind, owner=owner, repo=repo, commit=commit)
+        return cls(
+            kind=kind,
+            owner=owner,
+            repo=repo,
+            commit=commit,
+            subdir=subdir,
+        )
 
     @property
     def repo_key(self) -> "PluginSourceRef":
-        """This reference with the commit dropped — the repository-scoped key."""
-        if self.commit is None:
+        """This reference with both commit and subdirectory dropped."""
+        if self.commit is None and not self.subdir:
             return self
         return PluginSourceRef(kind=self.kind, owner=self.owner, repo=self.repo)
 
@@ -260,19 +316,29 @@ class PluginSourceRef:
     def is_pinned(self) -> bool:
         return self.commit is not None
 
+    @property
+    def install_spec(self) -> str:
+        """The bounded Herdr ``owner/repo[/subdir...]`` install operand."""
+        base = f"{self.owner}/{self.repo}"
+        return f"{base}/{'/'.join(self.subdir)}" if self.subdir else base
+
     def describe(self) -> str:
-        """A short, path-free description (``github:owner/repo@commit``)."""
-        base = f"{self.kind}:{self.owner}/{self.repo}"
+        """A short, bounded description including the exact plugin subdirectory."""
+        base = f"{self.kind}:{self.install_spec}"
         return f"{base}@{self.commit}" if self.commit else base
 
 
 def source_ref_from_parts(
-    kind: object, owner: object, repo: object, commit: object
+    kind: object,
+    owner: object,
+    repo: object,
+    commit: object,
+    subdir: object = None,
 ) -> Optional[PluginSourceRef]:
     """Build the strongest reference these parts support (review j#92053 F3).
 
-    **Repository identity and pin validity are separate facts, so a bad commit may
-    not discard the repository.** The original version collapsed them: any
+    **Repository identity and exact plugin identity are separate facts, so a bad
+    commit or subdirectory may not discard the repository.** The original version collapsed them: any
     :class:`HerdrPluginPolicyError` — including one raised solely by a malformed
     commit — returned ``None``, throwing away a perfectly good ``owner/repo``.
     Measured consequence: ``persiyanov/herdr-reviewr`` observed with an
@@ -284,7 +350,10 @@ def source_ref_from_parts(
     stops explaining itself.
 
     So: a valid ``github`` owner/repo yields at least a repository-scoped
-    reference; the commit only decides whether that reference is *also* pinned.
+    reference; subdirectory and commit together decide whether that reference is
+    *also* an exact pin. A malformed subdirectory falls back only to the repository
+    identity, never to a root-plugin allow. A valid subdirectory remains on an
+    unpinned reference when only the commit is malformed.
     ``None`` is returned only when there is no usable repository identity at all —
     a non-``github`` kind, or an owner / repo that is not a bare segment.
 
@@ -300,9 +369,29 @@ def source_ref_from_parts(
     except HerdrPluginPolicyError:
         return None
     try:
-        return PluginSourceRef.pinned(SOURCE_KIND_GITHUB, owner, repo, commit)
+        subdir_segments = _parse_source_subdir(subdir)
     except HerdrPluginPolicyError:
+        # Subdirectory validity cannot erase an independently valid repository
+        # identity.  Keeping only the repository preserves repository-wide deny
+        # classifications while remaining unpinned, so it can never fall through
+        # to a root-plugin allow.
         return repository
+    unpinned = PluginSourceRef(
+        kind=SOURCE_KIND_GITHUB,
+        owner=repository.owner,
+        repo=repository.repo,
+        subdir=subdir_segments,
+    )
+    try:
+        return PluginSourceRef.pinned(
+            SOURCE_KIND_GITHUB,
+            repository.owner,
+            repository.repo,
+            commit,
+            subdir=subdir_segments,
+        )
+    except HerdrPluginPolicyError:
+        return unpinned
 
 
 def read_source_ref(source: object) -> Optional[PluginSourceRef]:
@@ -323,6 +412,7 @@ def read_source_ref(source: object) -> Optional[PluginSourceRef]:
         source.get("owner"),
         source.get("repo"),
         source.get("resolved_commit"),
+        source.get("subdir"),
     )
 
 
@@ -493,6 +583,7 @@ __all__ = (
     "SOURCE_KIND_UNRECOGNIZED",
     "MAX_RENDERED_FIELD_LENGTH",
     "MAX_SEGMENT_LENGTH",
+    "MAX_SUBDIR_SEGMENTS",
     "REDACTED_TOKEN",
     "HerdrPluginPolicyError",
     "PluginObservation",

@@ -346,11 +346,11 @@ def register_herdr_plugin_policy_parser(herdr_sub) -> None:
     parser.add_argument(
         "--plan-install",
         dest="plan_install",
-        metavar="OWNER/REPO",
+        metavar="OWNER/REPO[/SUBDIR...]",
         default=None,
         help=(
-            "Answer whether `herdr plugin install OWNER/REPO --ref COMMIT` may be run "
-            "(needs --ref). Installs nothing."
+            "Answer whether `herdr plugin install OWNER/REPO[/SUBDIR...] --ref "
+            "COMMIT` may be run (needs --ref). Installs nothing."
         ),
     )
     parser.add_argument(

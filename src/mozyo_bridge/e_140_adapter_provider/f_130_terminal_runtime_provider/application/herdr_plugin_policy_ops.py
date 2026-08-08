@@ -595,12 +595,8 @@ class InstallPlan:
     decision: PolicyDecision
 
     def __post_init__(self) -> None:
-        if self.spec is not None:
-            owner, separator, repo = self.spec.partition("/")
-            if not separator:
-                raise HerdrPluginPolicyError("install plan spec must be owner/repo")
-            require_segment(owner, "install plan spec owner")
-            require_segment(repo, "install plan spec repo")
+        if self.spec is not None and not isinstance(self.spec, str):
+            raise HerdrPluginPolicyError("install plan spec must be a string or None")
         if self.ref is not None and not isinstance(self.ref, PluginSourceRef):
             raise HerdrPluginPolicyError("ref must be a PluginSourceRef or None")
         if not isinstance(self.decision, PolicyDecision):
@@ -624,10 +620,10 @@ class InstallPlan:
                 "an install plan names a target and its reference, or neither"
             )
         if self.spec is not None and self.ref is not None:
-            if self.spec != f"{self.ref.owner}/{self.ref.repo}":
+            if self.spec != self.ref.install_spec:
                 raise HerdrPluginPolicyError(
-                    "install plan spec must name the repository its reference "
-                    "resolves to"
+                    "install plan spec must name the exact repository and "
+                    "subdirectory its reference resolves to"
                 )
 
     @property
@@ -648,10 +644,10 @@ class InstallPlan:
 
 
 def plan_candidate_install(spec: str, ref: Optional[str]) -> InstallPlan:
-    """Decide a candidate ``herdr plugin install <owner>/<repo> --ref <commit>``.
+    """Decide ``herdr plugin install owner/repo[/subdir...] --ref commit``.
 
-    ``spec`` mirrors herdr's own ``<owner>/<repo>`` argument. A spec or ref that
-    cannot be read as an exact pinned identity is not an error here: it resolves to
+    ``spec`` mirrors herdr's own ``owner/repo[/subdir...]`` argument. A spec or
+    ref that cannot be read as an exact pinned identity is not an error here: it resolves to
     the strongest reference the parts support (possibly repository-scoped, possibly
     ``None``) and is denied accordingly — the same answer an installed plugin with
     the same parts gets, because both go through ``source_ref_from_parts``. That
@@ -664,19 +660,16 @@ def plan_candidate_install(spec: str, ref: Optional[str]) -> InstallPlan:
     (review j#92092 finding 2 — the raw ``spec`` reached both the text and the JSON,
     so a path or a newline in it reached a pasteable record).
     """
-    owner, separator, repo = str(spec).partition("/") if isinstance(spec, str) else ("", "", "")
+    parts = spec.split("/") if isinstance(spec, str) else []
+    owner = parts[0] if len(parts) >= 2 else ""
+    repo = parts[1] if len(parts) >= 2 else ""
+    subdir = "/".join(parts[2:]) if len(parts) > 2 else None
     source_ref: Optional[PluginSourceRef] = (
-        source_ref_from_parts(SOURCE_KIND_GITHUB, owner, repo, ref)
-        if separator
+        source_ref_from_parts(SOURCE_KIND_GITHUB, owner, repo, ref, subdir)
+        if len(parts) >= 2
         else None
     )
-    safe_owner = normalize_operand(owner)
-    safe_repo = normalize_operand(repo)
-    safe_spec = (
-        f"{safe_owner}/{safe_repo}"
-        if separator and safe_owner is not None and safe_repo is not None
-        else None
-    )
+    safe_spec = source_ref.install_spec if source_ref is not None else None
     return InstallPlan(spec=safe_spec, ref=source_ref, decision=plan_install(source_ref))
 
 

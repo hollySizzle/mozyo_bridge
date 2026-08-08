@@ -68,6 +68,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     observe_plugin,
     plan_install,
     resolve_review,
+    source_ref_from_parts,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E402
     herdr_plugin_policy_ops as ops,
@@ -82,6 +83,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 # catch the registry changing.
 FILE_VIEWER_COMMIT = "96fcc0a2bdd2727ec88c38f8c8806f97b7ca0ea0"
 OTHER_COMMIT = "0123456789abcdef0123456789abcdef01234567"
+UNIT_BOARD_COMMIT = "aa39b4c9e9c3f43bf054649916a4803bb9a75c7f"
+UNIT_BOARD_SUBDIR = ("herdr-plugins", "mozyo-unit-board")
+UNIT_BOARD_SPEC = "hollySizzle/mozyo_bridge/herdr-plugins/mozyo-unit-board"
 
 #: Abstract placeholder paths standing in for the three absolute operator-home
 #: paths herdr's real payload carries. Never an operator path.
@@ -171,6 +175,7 @@ def plugin_record(
     commit: str = FILE_VIEWER_COMMIT,
     kind: str = SOURCE_KIND_GITHUB,
     build: bool = True,
+    subdir: object = None,
     source: object = ...,
 ) -> dict:
     """A herdr ``plugin list --json`` plugin record, shaped like the real payload."""
@@ -186,17 +191,16 @@ def plugin_record(
     }
     if build:
         record["build"] = [{"command": ["/bin/sh", "scripts/fetch-or-build.sh"]}]
-    record["source"] = (
-        {
-            "kind": kind,
-            "owner": owner,
-            "repo": repo,
-            "resolved_commit": commit,
-            "managed_path": PLACEHOLDER_ROOT,
-        }
-        if source is ...
-        else source
-    )
+    source_record = {
+        "kind": kind,
+        "owner": owner,
+        "repo": repo,
+        "resolved_commit": commit,
+        "managed_path": PLACEHOLDER_ROOT,
+    }
+    if subdir is not None:
+        source_record["subdir"] = subdir
+    record["source"] = source_record if source is ... else source
     return record
 
 
@@ -244,7 +248,14 @@ class SourceRefTests(unittest.TestCase):
     def test_owner_or_repo_carrying_a_separator_is_refused(self):
         # A segment that can hold a '/' can hold a second path component, which is
         # how an identity turns into a path.
-        for owner, repo in (("a/b", "r"), ("o", "r/s"), ("o ", "r"), ("", "r")):
+        for owner, repo in (
+            ("a/b", "r"),
+            ("o", "r/s"),
+            ("o ", "r"),
+            ("", "r"),
+            (".", "r"),
+            ("o", ".."),
+        ):
             with self.subTest(owner=owner, repo=repo):
                 with self.assertRaises(HerdrPluginPolicyError):
                     PluginSourceRef.repository(SOURCE_KIND_GITHUB, owner, repo)
@@ -253,9 +264,105 @@ class SourceRefTests(unittest.TestCase):
         with self.assertRaises(HerdrPluginPolicyError):
             PluginSourceRef.repository("link", "o", "r")
 
-    def test_repo_key_drops_the_commit(self):
-        ref = PluginSourceRef.pinned(SOURCE_KIND_GITHUB, "o", "r", FILE_VIEWER_COMMIT)
-        self.assertEqual(ref.repo_key, PluginSourceRef.repository(SOURCE_KIND_GITHUB, "o", "r"))
+    def test_repo_key_drops_the_commit_and_subdir(self):
+        ref = PluginSourceRef.pinned(
+            SOURCE_KIND_GITHUB,
+            "o",
+            "r",
+            FILE_VIEWER_COMMIT,
+            subdir=("plugins", "viewer"),
+        )
+        self.assertEqual(
+            ref.repo_key,
+            PluginSourceRef.repository(SOURCE_KIND_GITHUB, "o", "r"),
+        )
+
+    def test_subdir_is_part_of_the_exact_identity_and_description(self):
+        ref = PluginSourceRef.pinned(
+            SOURCE_KIND_GITHUB,
+            "o",
+            "r",
+            FILE_VIEWER_COMMIT,
+            subdir=("plugins", "viewer"),
+        )
+        other = PluginSourceRef.pinned(
+            SOURCE_KIND_GITHUB,
+            "o",
+            "r",
+            FILE_VIEWER_COMMIT,
+            subdir=("plugins", "other"),
+        )
+        self.assertNotEqual(ref, other)
+        self.assertEqual(ref.install_spec, "o/r/plugins/viewer")
+        self.assertEqual(
+            ref.describe(),
+            f"github:o/r/plugins/viewer@{FILE_VIEWER_COMMIT}",
+        )
+
+    def test_invalid_subdir_falls_back_only_to_the_repository_identity(self):
+        invalid = (
+            "",
+            "/plugins/viewer",
+            "plugins/",
+            "plugins//viewer",
+            ".",
+            "..",
+            "plugins/../viewer",
+            "plugins\\viewer",
+            "plugins/with space",
+            "plugins/with:colon",
+            "plugins/with\x00nul",
+            "plugins/with\ncontrol",
+            "x" * 65,
+            "/".join("x" for _ in range(17)),
+            7,
+            ["plugins", "viewer"],
+        )
+        for subdir in invalid:
+            with self.subTest(subdir=repr(subdir)[:40]):
+                ref = source_ref_from_parts(
+                    SOURCE_KIND_GITHUB,
+                    "o",
+                    "r",
+                    FILE_VIEWER_COMMIT,
+                    subdir,
+                )
+                self.assertEqual(
+                    ref,
+                    PluginSourceRef.repository(SOURCE_KIND_GITHUB, "o", "r"),
+                )
+                self.assertFalse(ref.is_pinned)
+
+    def test_invalid_repository_identity_has_no_reference(self):
+        for owner, repo in ((".", "r"), ("o", ".."), ("bad/owner", "r")):
+            with self.subTest(owner=owner, repo=repo):
+                self.assertIsNone(
+                    source_ref_from_parts(
+                        SOURCE_KIND_GITHUB,
+                        owner,
+                        repo,
+                        FILE_VIEWER_COMMIT,
+                        "plugins/viewer",
+                    )
+                )
+
+    def test_bad_commit_keeps_a_valid_subdir_on_an_unpinned_reference(self):
+        ref = source_ref_from_parts(
+            SOURCE_KIND_GITHUB,
+            "persiyanov",
+            "herdr-reviewr",
+            "not-a-commit",
+            "plugins/reviewr",
+        )
+        self.assertIsNotNone(ref)
+        self.assertFalse(ref.is_pinned)
+        self.assertEqual(ref.subdir, ("plugins", "reviewr"))
+        self.assertEqual(
+            ref.repo_key,
+            PluginSourceRef.repository(
+                SOURCE_KIND_GITHUB, "persiyanov", "herdr-reviewr"
+            ),
+        )
 
 
 class RegistryInvariantTests(unittest.TestCase):
@@ -286,6 +393,16 @@ class RegistryInvariantTests(unittest.TestCase):
                     PluginSourceRef.repository(SOURCE_KIND_GITHUB, "o", "r"), deny_class
                 )
                 self.assertEqual(entry.plugin_class, deny_class)
+
+    def test_repository_scoped_review_entry_cannot_name_one_subdir(self):
+        ref = PluginSourceRef(
+            kind=SOURCE_KIND_GITHUB,
+            owner="o",
+            repo="r",
+            subdir=("plugins", "one"),
+        )
+        with self.assertRaises(HerdrPluginPolicyError):
+            self._entry(ref, CLASS_AGENT_INPUT_WRITER)
 
     def test_unknown_class_is_not_recordable(self):
         with self.assertRaises(HerdrPluginPolicyError):
@@ -329,11 +446,12 @@ class RegistryInvariantTests(unittest.TestCase):
                 )
             )
 
-    def test_shipped_registry_holds_the_three_reviewed_projects(self):
+    def test_shipped_registry_holds_the_reviewed_projects_and_exact_unit_board(self):
         described = {ref.describe() for ref in REVIEWED_PLUGINS}
         self.assertEqual(
             described,
             {
+                f"github:{UNIT_BOARD_SPEC}@{UNIT_BOARD_COMMIT}",
                 f"github:smarzban/herdr-file-viewer@{FILE_VIEWER_COMMIT}",
                 "github:yuk1ty/herdr-spreader",
                 "github:persiyanov/herdr-reviewr",
@@ -363,6 +481,112 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(verdict.plugin_class, CLASS_UNKNOWN)
         self.assertEqual(verdict.enable.reason, REASON_UNREVIEWED_PIN)
         self.assertEqual(verdict.install.reason, REASON_UNREVIEWED_PIN)
+
+    def test_unit_board_exact_subdir_and_commit_is_admitted_on_both_axes(self):
+        verdict = classify_plugin(
+            observe_plugin(
+                plugin_record(
+                    plugin_id="mozyo.unit-board",
+                    owner="hollySizzle",
+                    repo="mozyo_bridge",
+                    commit=UNIT_BOARD_COMMIT,
+                    subdir="/".join(UNIT_BOARD_SUBDIR),
+                    build=False,
+                )
+            )
+        )
+        self.assertEqual(verdict.plugin_class, CLASS_UX_ONLY)
+        self.assertEqual(verdict.build_provenance, BUILD_NONE)
+        self.assertTrue(verdict.enable.admitted)
+        self.assertTrue(verdict.install.admitted)
+
+    def test_unit_board_allow_does_not_match_root_sibling_child_or_other_commit(self):
+        variants = (
+            (None, UNIT_BOARD_COMMIT),
+            ("herdr-plugins/another-plugin", UNIT_BOARD_COMMIT),
+            ("herdr-plugins/mozyo-unit-board/child", UNIT_BOARD_COMMIT),
+            ("/".join(UNIT_BOARD_SUBDIR), OTHER_COMMIT),
+        )
+        for subdir, commit in variants:
+            with self.subTest(subdir=subdir, commit=commit):
+                verdict = classify_plugin(
+                    observe_plugin(
+                        plugin_record(
+                            plugin_id="mozyo.unit-board",
+                            owner="hollySizzle",
+                            repo="mozyo_bridge",
+                            commit=commit,
+                            subdir=subdir,
+                            build=False,
+                        )
+                    )
+                )
+                self.assertEqual(verdict.plugin_class, CLASS_UNKNOWN)
+                self.assertFalse(verdict.enable.admitted)
+                self.assertFalse(verdict.install.admitted)
+
+    def test_unit_board_manifest_id_and_build_surface_are_rechecked(self):
+        common = dict(
+            owner="hollySizzle",
+            repo="mozyo_bridge",
+            commit=UNIT_BOARD_COMMIT,
+            subdir="/".join(UNIT_BOARD_SUBDIR),
+        )
+        wrong_id = classify_plugin(
+            observe_plugin(plugin_record(plugin_id="another-plugin", build=False, **common))
+        )
+        self.assertEqual(wrong_id.enable.reason, REASON_IDENTITY_MISMATCH)
+        unexpected_build = classify_plugin(
+            observe_plugin(plugin_record(plugin_id="mozyo.unit-board", build=True, **common))
+        )
+        self.assertEqual(unexpected_build.enable.reason, REASON_MANIFEST_DRIFT)
+        self.assertEqual(unexpected_build.install.reason, REASON_MANIFEST_DRIFT)
+
+    def test_requested_ref_does_not_override_the_resolved_commit_identity(self):
+        record = plugin_record(
+            plugin_id="mozyo.unit-board",
+            owner="hollySizzle",
+            repo="mozyo_bridge",
+            commit=UNIT_BOARD_COMMIT,
+            subdir="/".join(UNIT_BOARD_SUBDIR),
+            build=False,
+        )
+        record["source"]["requested_ref"] = "main"
+        verdict = classify_plugin(observe_plugin(record))
+        self.assertTrue(verdict.enable.admitted)
+
+    def test_invalid_subdir_never_falls_through_to_the_unit_board_allow(self):
+        verdict = classify_plugin(
+            observe_plugin(
+                plugin_record(
+                    plugin_id="mozyo.unit-board",
+                    owner="hollySizzle",
+                    repo="mozyo_bridge",
+                    commit=UNIT_BOARD_COMMIT,
+                    subdir="herdr-plugins/../mozyo-unit-board",
+                    build=False,
+                )
+            )
+        )
+        self.assertEqual(verdict.plugin_class, CLASS_UNKNOWN)
+        self.assertEqual(verdict.enable.reason, REASON_UNPINNED_SOURCE)
+
+    def test_repository_deny_applies_to_valid_and_malformed_subdirs(self):
+        for subdir in ("plugins/reviewr", "plugins/../reviewr", "bad space"):
+            with self.subTest(subdir=subdir):
+                verdict = classify_plugin(
+                    observe_plugin(
+                        plugin_record(
+                            plugin_id="herdr-reviewr",
+                            owner="persiyanov",
+                            repo="herdr-reviewr",
+                            commit=OTHER_COMMIT,
+                            subdir=subdir,
+                        )
+                    )
+                )
+                self.assertEqual(verdict.plugin_class, CLASS_AGENT_INPUT_WRITER)
+                self.assertEqual(verdict.enable.reason, REASON_AGENT_INPUT_WRITER)
 
     def test_spreader_is_a_test_oracle_with_no_lane_authority(self):
         # Its build provenance is unreviewed, which asserts nothing about whether a
@@ -672,6 +896,46 @@ class InstallPlanTests(unittest.TestCase):
 
     def test_a_candidate_with_no_reference_is_denied(self):
         self.assertEqual(plan_install(None).reason, REASON_UNPINNED_SOURCE)
+
+    def test_exact_unit_board_candidate_is_admitted(self):
+        plan = ops.plan_candidate_install(UNIT_BOARD_SPEC, UNIT_BOARD_COMMIT)
+        self.assertTrue(plan.ok)
+        self.assertEqual(plan.spec, UNIT_BOARD_SPEC)
+        self.assertEqual(plan.ref.subdir, UNIT_BOARD_SUBDIR)
+        self.assertEqual(plan.decision, plan_install(plan.ref))
+
+    def test_unit_board_candidate_requires_exact_subdir_and_commit(self):
+        variants = (
+            ("hollySizzle/mozyo_bridge", UNIT_BOARD_COMMIT),
+            ("hollySizzle/mozyo_bridge/herdr-plugins/other", UNIT_BOARD_COMMIT),
+            (UNIT_BOARD_SPEC + "/child", UNIT_BOARD_COMMIT),
+            (UNIT_BOARD_SPEC, OTHER_COMMIT),
+            (UNIT_BOARD_SPEC, "not-a-commit"),
+        )
+        for spec, commit in variants:
+            with self.subTest(spec=spec, commit=commit):
+                self.assertFalse(ops.plan_candidate_install(spec, commit).ok)
+
+    def test_invalid_subdir_is_not_echoed_and_never_reaches_an_allow(self):
+        hostile_subdirs = (
+            "../escape",
+            "bad space",
+            "bad\nZZFORGEDLINEZZ",
+            "~private",
+            "C:\\private",
+        )
+        repository = PluginSourceRef.repository(SOURCE_KIND_GITHUB, "o", "r")
+        for subdir in hostile_subdirs:
+            with self.subTest(subdir=repr(subdir)):
+                plan = ops.plan_candidate_install(f"o/r/{subdir}", OTHER_COMMIT)
+                rendered = json.dumps(plan.as_payload()) + ops.format_install_plan_text(
+                    plan
+                )
+                self.assertEqual(plan.ref, repository)
+                self.assertEqual(plan.spec, "o/r")
+                self.assertFalse(plan.ok)
+                self.assertNotIn(subdir, rendered)
+                self.assertNotIn("ZZFORGEDLINEZZ", rendered)
 
     def test_a_deny_classified_project_reports_the_project_reason_without_a_commit(self):
         # Reporting "you did not name a commit" here would invite the operator to
@@ -1692,6 +1956,19 @@ class RelationalInvariantTests(unittest.TestCase):
                 ref=reviewed,
                 decision=plan_install(reviewed),
             )
+        unit_board = PluginSourceRef.pinned(
+            SOURCE_KIND_GITHUB,
+            "hollySizzle",
+            "mozyo_bridge",
+            UNIT_BOARD_COMMIT,
+            subdir=UNIT_BOARD_SUBDIR,
+        )
+        with self.assertRaises(HerdrPluginPolicyError):
+            ops.InstallPlan(
+                spec="hollySizzle/mozyo_bridge/herdr-plugins/another-plugin",
+                ref=unit_board,
+                decision=plan_install(unit_board),
+            )
 
     def test_the_real_install_plan_still_constructs(self):
         for spec, ref in (
@@ -2128,6 +2405,14 @@ class CliTests(unittest.TestCase):
         args = self._parse("--plan-install", "smarzban/herdr-file-viewer")
         self.assertEqual(cmd_herdr_plugin_policy(args), 1)
 
+    def test_exact_unit_board_plan_install_exits_zero_without_subprocess(self):
+        args = self._parse(
+            "--plan-install", UNIT_BOARD_SPEC, "--ref", UNIT_BOARD_COMMIT
+        )
+        with mock.patch.object(ops.subprocess, "run") as run:
+            self.assertEqual(cmd_herdr_plugin_policy(args), 0)
+        run.assert_not_called()
+
     def test_no_mode_ever_issues_a_mutating_herdr_subcommand(self):
         # The adversarial guard: whatever the mode, the only subprocess this surface
         # may reach for is the read-only inventory query.
@@ -2135,6 +2420,7 @@ class CliTests(unittest.TestCase):
         modes = (
             ["--from-json", path],
             ["--from-json", path, "--plan-enable", "herdr-file-viewer"],
+            ["--plan-install", UNIT_BOARD_SPEC, "--ref", UNIT_BOARD_COMMIT],
             ["--plan-install", "smarzban/herdr-file-viewer", "--ref", FILE_VIEWER_COMMIT],
         )
         completed = mock.Mock(returncode=0, stdout=inventory_document(), stderr="")
