@@ -325,13 +325,13 @@ breach ではない** (policy が機能している状態)。enable 済み か�
 | `unreviewed_pin` | source は pin されているが、**その identity** を review した記録が無い |
 | `identity_mismatch` | pin は review 済みだが、local manifest が別の `plugin_id` を名乗る |
 | `manifest_drift` | 現在の正規化済みmanifest capability digestがreview記録と食い違う。比較面はminimum Herdr version、platform、build、startup、action、event、pane、link handler。command文字列自体はreportへ出さない。**commit pinだけではinstall後にdisk上のmanifestが差し替わった場合を固定できない** |
-| `manifest_unavailable` | manifest warning、未知のtop-level field、または正規化不能なcapability値があり、現在実行される面を完全に確立できない |
+| `manifest_unavailable` | Herdr が manifest warning を返し、現在実行される面をclean reloadから完全に確立できない。plugin identityは読めるため、そのplugin固有のdenyとして保持する |
 | `agent_input_writer` | agent input へ書く |
 | `no_lane_authority` | test oracle として認識済み。live lane に対する authority を持たない |
 | `unpinned_remote_build` | `[[build]]` が remote artifact を download し、その整合性証明が同一 origin からしか得られない |
 | `unreviewed_build` | `[[build]]` が何を実行するかを review が確立していない |
-| `malformed_record` | plugin record として読めない。**読み飛ばさず**報告し、report を fail させる |
-| `inventory_incomplete` | inventory に読めない record が 1 件以上ある。**enable plan は残りから答えを作らない** |
+| `malformed_record` | plugin record として読めない。未知のtop-level fieldまたは正規化不能なcapability値もこの分類になる。**読み飛ばさず**報告し、report を fail させる |
+| `inventory_incomplete` | inventory に `malformed_record` が 1 件以上ある。**enable plan は残りから答えを作らず**、plugin固有verdictより先にこのreasonで拒否する |
 | `ambiguous_target` | 同一 `plugin_id` に複数の installed plugin が該当する。先頭一致で黙って解決しない |
 | `target_not_installed` | 該当 `plugin_id` の plugin が無い |
 | `invalid_target_id` | operand が bounded identifier でない。**生値は echo しない**（closed token で表示） |

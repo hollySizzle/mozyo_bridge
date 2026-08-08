@@ -44,6 +44,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     REASON_IDENTITY_MISMATCH,
     REASON_MANIFEST_DRIFT,
     REASON_MANIFEST_UNAVAILABLE,
+    REASON_MALFORMED_RECORD,
     REASON_NO_LANE_AUTHORITY,
     REASON_UNPINNED_REMOTE_BUILD,
     REASON_UNPINNED_SOURCE,
@@ -795,6 +796,54 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(verdict.enable.reason, REASON_MANIFEST_UNAVAILABLE)
         rendered = json.dumps(ops.PolicyStatus((verdict,), ()).as_payload())
         self.assertNotIn(LEAK_MARKER, rendered)
+
+    def test_unknown_or_noncanonical_manifest_is_unreadable_and_blocks_enable_plan(self):
+        variants = {}
+        unknown = plugin_record(
+            plugin_id="mozyo.unit-board",
+            owner="hollySizzle",
+            repo="mozyo_bridge",
+            commit=UNIT_BOARD_COMMIT,
+            subdir="/".join(UNIT_BOARD_SUBDIR),
+            build=False,
+        )
+        unknown["future_capability"] = [{"command": [LEAK_MARKER]}]
+        variants["unknown-top-level"] = unknown
+
+        noncanonical = copy.deepcopy(unknown)
+        noncanonical.pop("future_capability")
+        noncanonical["events"] = {"command": [LEAK_MARKER]}
+        variants["non-list-capability"] = noncanonical
+
+        for label, record in variants.items():
+            with self.subTest(label=label):
+                status = ops.classify_inventory([record])
+                self.assertEqual(status.verdicts, ())
+                self.assertEqual(len(status.malformed), 1)
+                self.assertEqual(
+                    status.as_payload()["malformed"][0]["reason"],
+                    REASON_MALFORMED_RECORD,
+                )
+                status_text = ops.format_status_text(status)
+                self.assertIn(f"[{REASON_MALFORMED_RECORD}]", status_text)
+
+                plan = ops.plan_enable(status, "mozyo.unit-board")
+                self.assertEqual(plan.decision.reason, REASON_INVENTORY_INCOMPLETE)
+                self.assertEqual(
+                    plan.as_payload()["decision"]["reason"],
+                    REASON_INVENTORY_INCOMPLETE,
+                )
+                self.assertIn(
+                    f"[{REASON_INVENTORY_INCOMPLETE}]",
+                    ops.format_enable_plan_text(plan),
+                )
+                rendered = (
+                    json.dumps(status.as_payload())
+                    + status_text
+                    + json.dumps(plan.as_payload())
+                    + ops.format_enable_plan_text(plan)
+                )
+                self.assertNotIn(LEAK_MARKER, rendered)
 
     def test_repository_deny_is_case_insensitive(self):
         verdict = classify_plugin(
