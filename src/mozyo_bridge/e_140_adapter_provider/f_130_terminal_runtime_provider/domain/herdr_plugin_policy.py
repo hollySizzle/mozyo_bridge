@@ -137,10 +137,14 @@ FORBIDDEN_PLUGIN_AUTHORITIES: frozenset[str] = (
 )
 
 # --- capability classes (closed vocabulary) ----------------------------------
-#: A read-only UX surface. It renders, it does not write to agent input, lane
-#: state, or any durable record. The only class admissible for enable while
-#: managed lanes exist.
+#: A read-only UX surface. It renders, it does not write to agent input, pane
+#: geometry, lane state, or any durable record.
 CLASS_UX_ONLY = "ux_only"
+#: A bounded presentation controller. It may update namespaced display metadata
+#: and request pane geometry changes only through a reviewed preview-first service
+#: that revalidates managed identity and generation. It never owns agent input,
+#: routing, lifecycle, workflow, review, approval, or a durable record.
+CLASS_PRESENTATION_CONTROL = "presentation_control"
 #: Useful as a reference schema / expected-layout oracle in tests, but carrying no
 #: lane identity, generation, occupancy, or retire concept. Recognized, and *not*
 #: admissible for enable — a test oracle has no authority over a live lane.
@@ -153,7 +157,20 @@ CLASS_AGENT_INPUT_WRITER = "agent_input_writer"
 CLASS_UNKNOWN = "unknown"
 
 PLUGIN_CLASSES: frozenset[str] = frozenset(
-    {CLASS_UX_ONLY, CLASS_TEST_ORACLE, CLASS_AGENT_INPUT_WRITER, CLASS_UNKNOWN}
+    {
+        CLASS_UX_ONLY,
+        CLASS_PRESENTATION_CONTROL,
+        CLASS_TEST_ORACLE,
+        CLASS_AGENT_INPUT_WRITER,
+        CLASS_UNKNOWN,
+    }
+)
+
+#: Capability classes that an exact independently reviewed plugin may enable.
+#: This is deliberately explicit: adding a class to ``PLUGIN_CLASSES`` must not
+#: make it admitted through a permissive default branch.
+ENABLE_ADMITTED_CLASSES: frozenset[str] = frozenset(
+    {CLASS_UX_ONLY, CLASS_PRESENTATION_CONTROL}
 )
 
 #: Classes that may be carried by a repository-scoped (commit-less) entry. An
@@ -380,8 +397,8 @@ def build_review_registry(
     # Read-only: construction-time checks are worth nothing if the result can be
     # rewritten afterwards. Self-reported alongside review j#92330 and heavier
     # than the finding that prompted it — injecting one entry made an arbitrary
-    # plugin `ux_only` and enable-admitted, which is the close condition "admit is
-    # reviewed ux_only x established identity, and nothing else" broken outright.
+    # plugin enable-admitted, which breaks the close condition "admit is an
+    # explicitly allowed class x reviewed established identity" outright.
     return MappingProxyType(indexed)
 
 
@@ -395,21 +412,24 @@ REVIEWED_PLUGINS: "MappingProxyType[PluginSourceRef, ReviewedPlugin]" = build_re
                 SOURCE_KIND_GITHUB,
                 "hollySizzle",
                 "mozyo_bridge",
-                "aa39b4c9e9c3f43bf054649916a4803bb9a75c7f",
+                "19e4ac6ff63197aa5b255a37ecb3472da8b4886e",
                 subdir=("herdr-plugins", "mozyo-unit-board"),
             ),
             plugin_id="mozyo.unit-board",
-            plugin_class=CLASS_UX_ONLY,
+            plugin_class=CLASS_PRESENTATION_CONTROL,
             build_provenance=BUILD_NONE,
-            review_anchor="#15114 j#101219",
+            review_anchor="#15116 j#101270",
             rationale=(
-                "A read-only terminal Unit board that projects bounded project, role, "
-                "responsibility, work, and runtime labels. Its only Herdr mutation is "
-                "namespaced presentation metadata; it writes no agent input, workflow "
-                "authority, or durable record. The reviewed manifest declares no build."
+                "A bounded terminal Unit board that projects public-safe responsibility "
+                "labels, writes only namespaced Herdr display metadata, and requests pane "
+                "geometry changes only through the reviewed preview-first pair-placement "
+                "service. The service revalidates managed identity, generation, and "
+                "geometry before mutation. The plugin writes no agent input, routing, "
+                "lifecycle, workflow authority, Redmine, or durable record. The reviewed "
+                "manifest declares no build."
             ),
             manifest_digest=(
-                "f90a2facdd03327b5bcdd300fd984678c3602e7cfbbfcd9b053cbcca1c76fa70"
+                "1bd86a85d625afae4863964c653145ad77eb57d01500e9166b1e2c73051d6d56"
             ),
         ),
         ReviewedPlugin(
@@ -655,8 +675,26 @@ def decide_enable(
             "identity, generation, occupancy, or retire concept, so it holds no "
             "authority over a live lane",
         )
-    return PolicyDecision.admit(
-        "read-only UX surface; writes to no agent input, lane state, or durable record"
+    if review.plugin_class not in ENABLE_ADMITTED_CLASSES:
+        return PolicyDecision.deny(
+            REASON_NO_LANE_AUTHORITY,
+            "the reviewed capability class is not in the explicit managed-lane "
+            "enable allowlist",
+        )
+    if review.plugin_class == CLASS_UX_ONLY:
+        return PolicyDecision.admit(
+            "read-only UX surface; writes to no agent input, pane geometry, lane "
+            "state, or durable record"
+        )
+    if review.plugin_class == CLASS_PRESENTATION_CONTROL:
+        return PolicyDecision.admit(
+            "bounded presentation controller; writes only namespaced display metadata "
+            "and requests geometry through a reviewed preview-first identity and "
+            "generation checked service"
+        )
+    return PolicyDecision.deny(
+        REASON_NO_LANE_AUTHORITY,
+        "the enable allowlist contains no decision text for this reviewed class",
     )
 
 
@@ -691,6 +729,12 @@ def _decide_install_from_review(review: ReviewedPlugin) -> PolicyDecision:
             REASON_NO_LANE_AUTHORITY,
             "recognized as a test oracle; its schema is used as a reference, which "
             "needs no install into the operator config root",
+        )
+    if review.plugin_class not in ENABLE_ADMITTED_CLASSES:
+        return PolicyDecision.deny(
+            REASON_NO_LANE_AUTHORITY,
+            "the reviewed capability class is not in the explicit managed-lane "
+            "enable allowlist",
         )
     return PolicyDecision.admit(
         f"{review.build_provenance}: the install executes nothing outside the pinned "
@@ -829,11 +873,13 @@ __all__ = (
     "BUILD_SOURCE_ONLY",
     "BUILD_UNREVIEWED",
     "CLASS_AGENT_INPUT_WRITER",
+    "CLASS_PRESENTATION_CONTROL",
     "CLASS_TEST_ORACLE",
     "CLASS_UNKNOWN",
     "CLASS_UX_ONLY",
     "DENY_CLASSES",
     "DENY_REASONS",
+    "ENABLE_ADMITTED_CLASSES",
     "ENABLE_SCOPE",
     "ENABLE_SCOPE_STATEMENT",
     "FORBIDDEN_PLUGIN_AUTHORITIES",
