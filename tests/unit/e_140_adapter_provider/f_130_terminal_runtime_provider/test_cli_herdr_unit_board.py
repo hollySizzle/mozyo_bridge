@@ -431,6 +431,39 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
         self.assertEqual(report.attempted, 0)
         self.assertEqual(calls, [["/bin/herdr", "pane", "list"]])
 
+    def test_non_string_pane_token_value_fails_closed_without_metadata_write(self) -> None:
+        for tokens in ({"mozyo_unit": 7}, {"unrelated": 7}):
+            with self.subTest(tokens=tokens):
+                calls: list[list[str]] = []
+
+                def runner(argv, **kwargs):
+                    calls.append(list(argv))
+                    payload = {
+                        "id": "cli:pane:list",
+                        "result": {
+                            "type": "pane_list",
+                            "panes": [{"pane_id": "w1:p2", "tokens": tokens}],
+                        },
+                    }
+                    return subprocess.CompletedProcess(
+                        argv, 0, stdout=json.dumps(payload), stderr=""
+                    )
+
+                board = HerdrUnitBoardRuntime(
+                    "/bin/herdr",
+                    lister=FakeLister(()),
+                    runner=runner,
+                    lane_records_loader=lambda: {},
+                    sync_lock_factory=nullcontext,
+                )
+
+                report = board.sync_metadata()
+
+                self.assertFalse(report.ok)
+                self.assertEqual(report.attempted, 0)
+                self.assertEqual(report.updated, 0)
+                self.assertEqual(calls, [["/bin/herdr", "pane", "list"]])
+
     def test_sync_holds_writer_lock_across_observe_report_and_verification(self) -> None:
         events: list[str] = []
 

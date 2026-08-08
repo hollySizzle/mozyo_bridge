@@ -276,7 +276,10 @@ class HerdrUnitBoardRuntime:
                 not valid_target(pane_id)
                 or pane_id in pane_ids
                 or not isinstance(tokens, Mapping)
-                or any(not isinstance(key, str) for key in tokens)
+                or any(
+                    not isinstance(key, str) or not isinstance(value, str)
+                    for key, value in tokens.items()
+                )
             ):
                 raise ValueError("pane inventory contains an invalid identity")
             pane_ids.add(pane_id)
