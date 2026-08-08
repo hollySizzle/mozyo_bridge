@@ -1,25 +1,71 @@
 # herdr live pane 再配置 runbook (operator 向け)
 
-live な herdr pane pair (coordinator + auditor / gateway + worker 等) の **位置交換 (swap)** と **split 方向変換 (左右 ⇔ 上下)** を、実機で検証済みの手順として replay 可能な形で固定する。2026-07-12 の live 実測 (herdr 0.7.1) で確立した recipe と、その安全境界・herdr 側 gap を記録する (Redmine #13648 / #13664)。
+live な herdr pane pair (coordinator + auditor / gateway + worker 等) の **位置交換 (swap)** と **split 方向変換 (左右 ⇔ 上下)** を、実機で検証済みの手順として replay 可能な形で固定する。2026-07-12 の live 実測 (herdr 0.7.1) で確立した recovery recipe と、その安全境界・herdr 側 gap、および identity-bound な製品 command を記録する (Redmine #13648 / #13664 / #14608)。
 
 > **Herdr 0.8移行注記 (#15101、2026-08-08):** managed launchは`pane split <exact pane>`で
 > 新paneを作り、そのpaneへ`agent start <mza1> --kind <provider> --pane <pane>`を実行する方式へ
 > 移行した。したがってfresh launchはactive paneへの暗黙splitに依存しない。本runbookのA–Dは
 > 既存live paneを動かす別操作であり、記載された実測versionは0.7.1/0.7.4のままである。
-> 0.8で再実行する際は各`--help`とread-only layoutを先に照合し、未再実測のsignatureを推測で
-> 実行しない。
+> 製品commandが使うswap / resizeのsignatureと応答schemaは0.8のbundled schemaで再照合済み。
+> 下記の手動recipeを0.8で追加実行する際は各`--help`とread-only layoutを先に照合し、未再実測の
+> signatureを推測で実行しない。
 
-対象は **手動 CLI での live 再配置** のみ。設定駆動の恒久配置 (`lane_placement`) は本書の非 scope で、境界は下記「設定駆動配置との境界」を読む。設計正本は [[spec-herdr-native-identity]] (target authority = herdr assigned name)、lane 運用手順の正本は [[task-herdr-lane-operations]]、pane identity / marker の意味構造は [[logic-pane-centric-cockpit-semantics]]。本書は手順のみを扱い規約本文を複製しない。
+対象は **既存 live pair の再配置**。標準入口は下記の preview-first 製品 command、低レベルの Herdr command は部分失敗時の調査・復旧 recipe である。設定駆動の恒久配置 (`lane_placement`) との境界は下記「設定駆動配置との境界」を読む。設計正本は [[spec-herdr-native-identity]] (target authority = herdr assigned name)、lane 運用手順の正本は [[task-herdr-lane-operations]]、pane identity / marker の意味構造は [[logic-pane-centric-cockpit-semantics]]。本書は手順のみを扱い規約本文を複製しない。
 
 ## 適用範囲と非 scope
 
-- **scope**: 既に launch 済みの live pane pair を、operator が herdr の CLI で **その場で** swap / split 方向変換する手順と安全性の根拠。
+- **scope**: 既に launch 済みの dedicated live pane pair を Unit identity から preview / apply する製品 command、および operator が Herdr CLI で状態を調査・復旧する手順と安全性の根拠。
 - **非 scope**:
-  - source / runtime 変更 (mozyo-bridge への wrapper command 追加は #13646 系の別 US)。
   - herdr 本体の改修 (same-tab re-split / rotate action の追加)。
-  - 設定駆動の恒久配置 (`.mozyo-bridge/config.yaml` の `lane_placement`。#13646 / #13647)。
-  - live pane actuation の自動化、外部送信、release、origin/main への push。
-- herdr の pane 操作は外部 binary (`herdr`) の CLI であり mozyo-bridge の command ではない。argv の細部は実行時に `herdr pane --help` / 各 subcommand の `--help` を正本にする (本書は 2026-07-12 実測の verified 形のみ literal に固定し、未記録の signature は推測で埋めない)。
+  - shared tab の一部だけを動かすこと、3 pane 以上の tab の自動組み替え。
+  - agent の kill / relaunch、workflow role / route / durable state の変更。
+  - 設定駆動の恒久配置 (`.mozyo-bridge/config.yaml` の `lane_placement`。#13646 / #13647) 自体の編集。
+- 製品 command は外部 binary (`herdr`) の pane API を呼ぶ。対応 signature は実行時の Herdr 0.8契約とテストで固定し、未記録の signature は推測で埋めない。低レベル復旧では `herdr pane --help` / 各 subcommand の `--help` を実機正本にする。
+
+## 標準入口: identity-bound preview / apply (#14608)
+
+対象は pane id ではなく、登録済み workspace と exact lane id で指定する。command は live inventory
+から現在の pane id を都度解決するため、pane id を引数へ渡す面は持たない。
+
+```sh
+# read-only。現在値、設定上の目標値、必要な操作だけを表示する
+mozyo-bridge herdr pair-placement preview --repo <project-root> --lane default
+
+# preview と同じ検査を直前に再実行してから、明示的に適用する
+mozyo-bridge herdr pair-placement apply --repo <project-root> --lane default
+```
+
+`--workspace <registered-workspace-id>` も使える。ただし `--repo` と同時指定した場合は、両者が
+同じ登録 workspace を指すことを要求する。`--json` は同じ判定を機械可読で返す。
+
+適用前の必須条件:
+
+1. Unit に exact 2 agent だけがあり、assigned name、provider、live 状態、workspace directory が一致する。
+2. 2 agent の現在の launch generation が attested で、現在の locator と一致する。
+3. 2 pane が同じ tab を排他的に占有し、1 本の `down` または `right` divider を形成する。
+4. 目標 split / order / ratio が現在の `lane_placement` から一意に解決できる。sublane の既定 order は現在の provider binding ではなく、その lane に保存された gateway / worker pair を使う。
+
+apply は検査結果が preview 後に変わっていれば mutation 前に拒否する。split 方向変更の 2 段 bounce
+では、退避後に元 tab と一時 tab がそれぞれ expected singleton であること、agent identity / generation / target
+設定が不変であることを確認してから戻す。swap / bounce の後と resize の各 pass 前、最後にも live layout を
+読み直す。pane の kill / relaunch は行わない。
+
+Herdr 0.8では、process exit 0だけを変更証拠にしない。swapは
+`result.type = pane_swap`かつ`result.swap.changed`、resizeは
+`result.type = pane_resize`かつ`result.resize.changed`を厳密に読む。`changed: false`は既知の
+無変更、field欠落・型違い・別result typeは効果不明として扱い、生の応答本文は公開出力へ出さない。
+resizeの試行回数も変更証拠には使わない。
+
+結果の扱い:
+
+- `matched`: 変更不要。
+- `applied`: 操作後の再計測が目標値と一致。
+- `refused`: identity、generation、liveness、layout、設定の前提が成立せず、mutation 無し。
+- `failed`: command が変更しなかったことを確認済み。原因を解消し、再度 preview してから apply する。
+- `partial_failure`: 既に変更した、または外部 command の効果を確定できない。blind retry せず、workspace / lane で Unit を再確認し、下記 recipe で live layout を調査してから preview へ戻る。
+
+公開出力は workspace / lane / provider label を表示用に正規化し、credential 形・絶対 path・terminal
+control をそのまま反映しない。pane id、tab id、launch generation は出力しない。
 
 ## 前提 / 用語
 
@@ -28,8 +74,8 @@ live な herdr pane pair (coordinator + auditor / gateway + worker 等) の **�
   復元してからroute判定する。pane位置・tab配置・pane id・raw `mza1`はdurable authorityではない
   ([[spec-herdr-native-identity]])。操作前にlogical identityとlive状態を確認する。
 - **tab join の権威は `tab_id`**: どの pane が同一 tab に属するかは live inventory の `tab_id` のみが authority で、tab label は cosmetic (#13411)。bounce で「元の tab へ戻す」際は label ではなく元 tab の `tab_id` を指定する。
-- **live pair の即時再配置経路はこの recipe のみ**: herdr は same-tab re-split を拒否するため (下記)、`lane_placement` 設定 (#13646 / #13647 / #14569) も、その未設定既定 (#14568 の product default `split: down`、#14569 の `ratio: 0.5`) も、**既存 live pair の配置を変えない**。設定が決めるのは次の fresh launch / heal の geometry だけである (方向・順序は argv、比率はその launch 自身が作った divider への 1 度の resize)。live で今すぐ入れ替える唯一の経路が本 recipe である (#13648)。
-  - **製品側の唯一の例外 (#14996 R2 / #15098)**: `role_grouped_space` の shared `project-coordinators` または `shared_space` の `coordinators` workspace へ **fresh な coordinator pair を append する launch** は、その pair を独立 column にするために recipe B と同じ 2 段 bounce を自動で 1 回だけ行う。続けてRIGHT軸dividerを対象指定でresizeし、全project列の幅差を1cell以内へ揃える。動かすpaneはsplit先columnの下段1枚で、元の相手paneの直下へ戻す。identity / process / cwdは不変で、resizeを含む各結果はlayout再読で検証し、失敗はtyped fail-closed。境界の正本は [[spec-herdr-native-identity]] の `### project column geometry — append 時の狭い verified relayout (#14996 R2)`。それ以外の live 再配置は引き続き本 recipe (operator の手動 CLI) の領分である。
+- **設定だけでは live pair を動かさない**: herdr は same-tab re-split を拒否するため (下記)、`lane_placement` 設定 (#13646 / #13647 / #14569) を保存しただけでは既存 live pair の配置は変わらない。設定は fresh launch / heal の geometry と、`pair-placement apply` が既存 dedicated pair へ適用する目標値を決める。方向変換で製品 command が内部利用する検証済み低レベル手順が recipe B / C である。
+  - **fresh coordinator append の自動 reflow (#14996 R2 / #15098)**: `role_grouped_space` の shared `project-coordinators` または `shared_space` の `coordinators` workspace へ **fresh な coordinator pair を append する launch** は、その pair を独立 column にするために recipe B と同じ 2 段 bounce を自動で 1 回だけ行う。続けてRIGHT軸dividerを対象指定でresizeし、全project列の幅差を1cell以内へ揃える。これは dedicated two-pane tab を対象とする `pair-placement` とは別の shared-tab launch-time path である。境界の正本は [[spec-herdr-native-identity]] の `### project column geometry — append 時の狭い verified relayout (#14996 R2)`。
   - #14568 で未設定既定が縦 (`down`) になったため、**既定変更より前に立ち上げた live pair は左右のまま残る**。左右のまま使い続けても不整合ではない (設定と live 配置は別 authority)。今すぐ縦に揃えたい場合は下記 recipe B を使い、pair を再起動できる場面なら fresh launch に任せる方が安全である (live 操作を伴わない)。
 
 ## herdr 0.7.1 の制約 (2026-07-12 実測)
@@ -145,7 +191,7 @@ herdr pane layout --pane <pane-id>
 ## 設定駆動配置との境界
 
 - 恒久的な pair 配置 (どの lane class を左右 / 上下、どちらの provider を先に置くか、その pair をどんな比率で割るか) を宣言駆動にする作業は別 US: `.mozyo-bridge/config.yaml` への閉集合 `lane_placement` block 追加が #13646、親子孫 3 層別 (lane-role 別) の keying が #13647、pair 内部の相対 split 比率 (`ratio`) が #14569。config key は `lane_placement` であり `pane_placement` では **ない** — repo-local schema boundary は `pane` を含む key を allowed-key 判定より前に拒否するため、旧名で書いた config は fail-closed で拒否される (正本: [[spec-herdr-native-identity]] §5.1)。
-- ただし `lane_placement` 設定は **新規 launch / heal 経路のみ** に効く。herdr が same-tab re-split を拒否するため、既存 live pair の即時再配置は設定変更では起きない。live で今すぐ入れ替える唯一の経路が本書の recipe である (#13646 Non-goals / #13648)。
+- `lane_placement` の保存自体は既存 live pair を動かさない。新規 launch / heal は設定を自動利用し、既存 dedicated pair へは operator が `pair-placement preview` で差分を確認してから `apply` を明示する。partial failure の調査・復旧では本書の低レベル recipe を使う。
 - **`ratio` (#14569) も同じ境界**である。`lane_placement.<class>.ratio` を変えても既存 live pair は自動 resize されない。設定が pane を触るのは **その launch 自身が今作った divider に対して 1 度だけ**で、既に立っている pair の divider には届かない。今すぐ live で比率を変えるなら本書 **recipe D** を使い、pair を再起動できる場面なら fresh launch に任せる方が安全である (live 操作を伴わない)。
 - 設定した比率と実機の食い違いを疑ったら、まず `mozyo-bridge config status` の `lane_placement.<class>.ratio` leaf row で **宣言値 (`declared`) か既定 (`default`) か**を読み、次に `herdr pane layout` で **実 ratio** を読む。両者は別 authority なので、片方だけを見て「設定が効いていない」と判断しない (設定は次の fresh launch / heal の geometry を決め、layout は今の geometry を報告する)。
 

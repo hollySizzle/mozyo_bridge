@@ -72,6 +72,25 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
+- name: Herdr identity-bound live pair placement preview and apply
+  patterns:
+  - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_live_pair_placement.py
+  - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_command_effect.py
+  - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/cli_herdr_live_pair_placement.py
+  - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/cli_herdr_group.py
+  - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_pair_split_ratio.py
+  - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_herdr_live_pair_placement.py
+  - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_herdr_command_effect.py
+  - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_herdr_pair_split_ratio.py
+  - vibes/docs/logics/herdr-live-relayout-runbook.md
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/herdr-live-relayout-runbook.md と @vibes/docs/logics/pane-centric-cockpit-semantics.md
+    と @vibes/docs/specs/herdr-native-identity.md と @vibes/docs/rules/public-private-boundary.md と @vibes/docs/rules/agent-workflow.md
+    と @vibes/docs/specs/project-map.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
 - name: legacy project skill partial-mirror sync source and tests
   patterns:
   - src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/application/legacy_mirror_sync.py

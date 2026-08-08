@@ -833,7 +833,17 @@ class _Herdr:
                     argv, 1, stdout="", stderr="matching divider not found"
                 )
             return subprocess.CompletedProcess(
-                argv, 0, stdout=json.dumps({"result": {"type": "ok"}}), stderr=""
+                argv,
+                0,
+                stdout=json.dumps(
+                    {
+                        "result": {
+                            "type": "pane_resize",
+                            "resize": {"changed": True},
+                        }
+                    }
+                ),
+                stderr="",
             )
         if rest[:2] == ["pane", "run"]:
             self.pane_runs.append(rest)

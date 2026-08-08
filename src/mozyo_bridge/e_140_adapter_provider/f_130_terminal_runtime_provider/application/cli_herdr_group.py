@@ -88,6 +88,14 @@ def register_herdr_group(
     )
 
     register_herdr_distribution_surfaces(herdr_sub, add_repo_option=add_repo_option)
+    # Redmine #14608: preview-first, identity/generation-bound live pair placement.
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_live_pair_placement import (  # noqa: E501
+        register_herdr_pair_placement_parser,
+    )
+
+    register_herdr_pair_placement_parser(
+        herdr_sub, add_repo_option=add_repo_option
+    )
     # Redmine #14065: the read-only composer-render measurement diagnostic (phase 1).
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_composer_render_cli import (  # noqa: E501
         register_herdr_composer_render_parser,
