@@ -7,12 +7,18 @@ import json
 import shutil
 import sys
 import time
+from datetime import datetime, timezone
 
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.herdr_unit_board import (
+    SOURCE_UNAVAILABLE,
+    UnitBoardSnapshot,
     format_board,
+    unavailable_snapshot,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_unit_board_runtime import (
     HerdrUnitBoardRuntime,
+    MetadataSyncFailure,
+    MetadataSyncReport,
     resolve_unit_board_binary,
 )
 
@@ -21,8 +27,52 @@ def _runtime() -> HerdrUnitBoardRuntime:
     return HerdrUnitBoardRuntime(resolve_unit_board_binary())
 
 
+def _runtime_failure_snapshot() -> UnitBoardSnapshot:
+    return unavailable_snapshot(
+        SOURCE_UNAVAILABLE,
+        observed_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        detail="Herdr Unit board runtime is unavailable",
+    )
+
+
+def _load_runtime(
+) -> tuple[HerdrUnitBoardRuntime | None, UnitBoardSnapshot | None]:
+    """Resolve the runtime without reflecting an exception or injected path."""
+    try:
+        return _runtime(), None
+    except Exception:
+        return None, _runtime_failure_snapshot()
+
+
+def _snapshot(runtime: HerdrUnitBoardRuntime) -> UnitBoardSnapshot:
+    try:
+        return runtime.snapshot()
+    except Exception:
+        return _runtime_failure_snapshot()
+
+
+def _runtime_failure_report() -> MetadataSyncReport:
+    return MetadataSyncReport(
+        source_state=SOURCE_UNAVAILABLE,
+        attempted=0,
+        updated=0,
+        failures=(
+            MetadataSyncFailure(
+                unit_id="board",
+                provider="unknown",
+                reason="runtime_unavailable",
+            ),
+        ),
+    )
+
+
 def cmd_herdr_unit_board_show(args: argparse.Namespace) -> int:
-    snapshot = _runtime().snapshot()
+    runtime, failure = _load_runtime()
+    if failure is not None:
+        snapshot = failure
+    else:
+        assert runtime is not None
+        snapshot = _snapshot(runtime)
     if getattr(args, "json", False):
         print(json.dumps(snapshot.as_payload(), ensure_ascii=False, sort_keys=True))
     else:
@@ -32,7 +82,15 @@ def cmd_herdr_unit_board_show(args: argparse.Namespace) -> int:
 
 
 def cmd_herdr_unit_board_sync(args: argparse.Namespace) -> int:
-    report = _runtime().sync_metadata()
+    runtime, failure = _load_runtime()
+    if failure is not None:
+        report = _runtime_failure_report()
+    else:
+        assert runtime is not None
+        try:
+            report = runtime.sync_metadata()
+        except Exception:
+            report = _runtime_failure_report()
     quiet = bool(getattr(args, "quiet", False))
     if getattr(args, "json", False):
         print(json.dumps(report.as_payload(), ensure_ascii=False, sort_keys=True))
@@ -51,13 +109,21 @@ def cmd_herdr_unit_board_watch(args: argparse.Namespace) -> int:
     if not 0.5 <= interval <= 60.0:
         print("error: --interval must be between 0.5 and 60 seconds")
         return 2
+    runtime, failure = _load_runtime()
+    if failure is not None:
+        width = shutil.get_terminal_size((120, 24)).columns
+        print(format_board(failure, width=width), flush=True)
+        return 1
+    assert runtime is not None
     try:
         while True:
-            snapshot = _runtime().snapshot()
+            snapshot = _snapshot(runtime)
             width = shutil.get_terminal_size((120, 24)).columns
             if sys.stdout.isatty():
                 print("\x1b[2J\x1b[H", end="")
             print(format_board(snapshot, width=width), flush=True)
+            if not snapshot.ok:
+                return 1
             time.sleep(interval)
     except KeyboardInterrupt:
         return 0

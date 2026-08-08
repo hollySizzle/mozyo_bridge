@@ -36,6 +36,21 @@ JSON payload は transient `pane_id`、absolute path、ticket本文、agent本�
 `pane_id` は同一process内の `sync` が action-time locator として使うだけで、projection
 や durable state へ保存しない。
 
+project / responsibility / work など外部由来の表示値は、JSON、text、Herdr display
+metadataへ渡す前に同じpublic-safe projectionを通す。C0/C1とUnicodeの方向制御文字は
+無害化し、POSIX / Windows / homeのabsolute path形状とcredential形状は固定値
+`[redacted]`へ畳み、入力のbasename・key・valueを反映しない。
+absolute path判定はrepo共通の
+`terminal_runtime_provider/domain/absolute_path_rule.py`を再利用し、別の弱い判定を作らない。
+
+`unit_id` とdisplay metadataの `mozyo_unit` は、raw identityを表示用の文字数で
+切り詰めず、完全な `(workspace_id, lane_id)` から作る固定長のopaque digest keyとする。
+project名やlane名の表示をidentityへ昇格させない。
+
+text表示へ正の `--width` が与えられた場合、各出力行はそのterminal cell幅を超えない。
+`watch` を含む全railはruntime解決失敗またはunavailable snapshotを非0で終了し、
+例外本文・traceback・binary pathを表示せず、固定されたunavailable結果だけを返す。
+
 ## Herdr plugin
 
 packaged manifest は `herdr-plugins/mozyo-unit-board/herdr-plugin.toml` に置く。

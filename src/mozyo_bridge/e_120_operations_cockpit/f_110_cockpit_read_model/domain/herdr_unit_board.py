@@ -13,10 +13,15 @@ authority.  Missing or contradictory inputs stay visible as ``unknown`` /
 
 from __future__ import annotations
 
+import hashlib
 import re
 import unicodedata
 from dataclasses import dataclass
 from typing import Iterable, Mapping, Sequence
+
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.absolute_path_rule import (
+    contains_absolute_path,
+)
 
 
 SOURCE_LIVE = "live"
@@ -32,19 +37,113 @@ AUTHORITY_STATES = frozenset(
 )
 
 MAX_PRESENTATION_TEXT = 80
-_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+REDACTED_TEXT = "[redacted]"
 _SPACE_RE = re.compile(r"\s+")
 _ISSUE_LANE_RE = re.compile(r"^issue_(\d+)(?:_(.*))?$")
+_CREDENTIAL_ASSIGNMENT_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?P<key>[A-Za-z0-9_.-]+)\s*[:=]\s*(?P<value>\S+)",
+    re.IGNORECASE,
+)
+_CREDENTIAL_KEY_PARTS = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "auth_token",
+        "credential",
+        "password",
+        "private_key",
+        "secret",
+        "token",
+    }
+)
+_CREDENTIAL_FILE_PARTS = (
+    ".credentials",
+    ".pem",
+    "id_rsa",
+    "private key",
+    "private-key",
+    "private_key",
+)
+_OPAQUE_CREDENTIAL_RE = re.compile(
+    r"(?:\bgh[pousr]_[A-Za-z0-9]{20,}\b|"
+    r"\bsk-[A-Za-z0-9_-]{16,}\b|"
+    r"\bAKIA[A-Z0-9]{16}\b|"
+    r"\bbearer\s+\S{8,}|"
+    r"://[^/\s:@]+:[^/@\s]+@)",
+    re.IGNORECASE,
+)
+_BIDI_CONTROLS = frozenset(
+    {
+        0x061C,
+        0x200E,
+        0x200F,
+        0x202A,
+        0x202B,
+        0x202C,
+        0x202D,
+        0x202E,
+        0x2066,
+        0x2067,
+        0x2068,
+        0x2069,
+    }
+)
+
+
+def _without_terminal_controls(value: str) -> str:
+    """Remove terminal and direction controls before any safety classification."""
+    return "".join(
+        char
+        for char in value
+        if not (
+            ord(char) < 0x20
+            or 0x7F <= ord(char) <= 0x9F
+            or ord(char) in _BIDI_CONTROLS
+            or unicodedata.category(char) == "Cf"
+        )
+    )
+
+
+def _is_credential_shaped(value: str) -> bool:
+    lowered = value.casefold()
+    if (
+        any(part in lowered for part in _CREDENTIAL_FILE_PARTS)
+        or _OPAQUE_CREDENTIAL_RE.search(value)
+    ):
+        return True
+    for match in _CREDENTIAL_ASSIGNMENT_RE.finditer(value):
+        key = match.group("key").casefold().replace("-", "_").replace(".", "_")
+        if any(part in key for part in _CREDENTIAL_KEY_PARTS):
+            return True
+    return False
 
 
 def safe_text(value: object, *, fallback: str = "unknown") -> str:
-    """Normalize one inert display value and enforce Herdr's 80-char cap."""
+    """Project one untrusted value into bounded, inert, public-safe text.
+
+    Control and bidi codepoints are removed before classification so they cannot
+    split an unsafe shape.  Absolute paths and credential-shaped values collapse
+    to one fixed token; their basename, key, and value are never reflected.
+    """
     if not isinstance(value, str):
         return fallback
-    normalized = _SPACE_RE.sub(" ", _CONTROL_RE.sub("", value)).strip()
+    normalized = unicodedata.normalize("NFKC", _without_terminal_controls(value))
+    normalized = _SPACE_RE.sub(" ", normalized).strip()
     if not normalized:
         return fallback
+    if contains_absolute_path(normalized) or _is_credential_shaped(normalized):
+        return REDACTED_TEXT
     return normalized[:MAX_PRESENTATION_TEXT]
+
+
+def _unit_public_id(workspace_id: str, lane_id: str) -> str:
+    """Return a bounded opaque key without truncating or disclosing identity input."""
+    digest = hashlib.sha256()
+    for component in (workspace_id, lane_id):
+        encoded = component.encode("utf-8", errors="surrogatepass")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return f"unit-{digest.hexdigest()[:32]}"
 
 
 def lane_work_label(lane_id: object, issue_id: object = "", label: object = "") -> str:
@@ -108,8 +207,8 @@ class AgentCell:
 
     def as_payload(self) -> dict[str, object]:
         return {
-            "provider": self.provider,
-            "runtime_state": self.runtime_state,
+            "provider": safe_text(self.provider),
+            "runtime_state": safe_text(self.runtime_state),
             "interactive_ready": self.interactive_ready,
         }
 
@@ -129,15 +228,15 @@ class UnitBoardRow:
 
     def as_payload(self) -> dict[str, object]:
         return {
-            "unit_id": self.unit_id,
-            "workspace_id": self.workspace_id,
-            "lane_id": self.lane_id,
-            "project_label": self.project_label,
-            "workflow_role": self.workflow_role,
-            "responsibility": self.responsibility,
-            "work_label": self.work_label,
-            "authority_state": self.authority_state,
-            "identity_state": self.identity_state,
+            "unit_id": safe_text(self.unit_id),
+            "workspace_id": safe_text(self.workspace_id),
+            "lane_id": safe_text(self.lane_id),
+            "project_label": safe_text(self.project_label),
+            "workflow_role": safe_text(self.workflow_role),
+            "responsibility": safe_text(self.responsibility),
+            "work_label": safe_text(self.work_label),
+            "authority_state": safe_text(self.authority_state),
+            "identity_state": safe_text(self.identity_state),
             "agents": [agent.as_payload() for agent in self.agents],
         }
 
@@ -161,7 +260,7 @@ class UnitBoardSnapshot:
     def as_payload(self) -> dict[str, object]:
         return {
             "source_state": self.source_state,
-            "observed_at": self.observed_at,
+            "observed_at": safe_text(self.observed_at, fallback=""),
             "unmanaged_agents": self.unmanaged_agents,
             "detail": safe_text(self.detail, fallback="") if self.detail else "",
             "units": [unit.as_payload() for unit in self.units],
@@ -236,7 +335,7 @@ def build_unit_board(
         )
         rows.append(
             UnitBoardRow(
-                unit_id=safe_text(f"{workspace_id}:{lane_id}"),
+                unit_id=_unit_public_id(workspace_id, lane_id),
                 workspace_id=safe_text(workspace_id),
                 lane_id=safe_text(lane_id),
                 project_label=project,
@@ -320,15 +419,22 @@ def clip_display(value: object, width: int) -> str:
 
 def format_board(snapshot: UnitBoardSnapshot, *, width: int = 120) -> str:
     """Render a compact terminal table.  JSON callers use ``as_payload`` instead."""
-    usable = max(60, int(width))
+    usable = max(1, int(width))
     heading = (
         f"mozyo Unit board  source={snapshot.source_state}  "
         f"observed={snapshot.observed_at or 'unknown'}"
     )
     if not snapshot.ok:
-        return f"{clip_display(heading, usable)}\n  {clip_display(snapshot.detail, usable - 2)}"
+        return "\n".join(
+            (
+                clip_display(heading, usable),
+                clip_display(f"detail: {snapshot.detail}", usable),
+            )
+        )
     if not snapshot.units:
-        return f"{clip_display(heading, usable)}\n  no managed Units"
+        return "\n".join(
+            (clip_display(heading, usable), clip_display("no managed Units", usable))
+        )
 
     if usable < 90:
         lines = [clip_display(heading, usable), "-" * usable]
@@ -392,10 +498,18 @@ def format_board(snapshot: UnitBoardSnapshot, *, width: int = 120) -> str:
         )
         if unit.identity_state != "resolved" or unit.authority_state != "resolved":
             lines.append(
-                f"  ! identity={unit.identity_state} authority={unit.authority_state} "
+                clip_display(
+                    f"  ! identity={unit.identity_state} "
+                    f"authority={unit.authority_state}",
+                    usable,
+                )
             )
     if snapshot.unmanaged_agents:
-        lines.append(f"unmanaged agents omitted: {snapshot.unmanaged_agents}")
+        lines.append(
+            clip_display(
+                f"unmanaged agents omitted: {snapshot.unmanaged_agents}", usable
+            )
+        )
     return "\n".join(lines)
 
 
@@ -403,6 +517,7 @@ __all__ = (
     "AUTHORITY_INVALID",
     "AUTHORITY_MISSING",
     "AUTHORITY_RESOLVED",
+    "REDACTED_TEXT",
     "AgentObservation",
     "SOURCE_LIVE",
     "SOURCE_RELOAD_REQUIRED",

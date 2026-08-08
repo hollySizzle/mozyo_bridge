@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import unittest
 from contextlib import redirect_stdout
@@ -13,6 +14,10 @@ from unittest import mock
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (
     ParsedRoleBindings,
     WorkflowRoleBinding,
+)
+from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.herdr_unit_board import (
+    format_board,
+    unavailable_snapshot,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board import (
     register_herdr_unit_board_parser,
@@ -160,6 +165,46 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
         self.assertEqual(report.failures[0].reason, "metadata_update_failed")
         self.assertNotIn("/private/x", repr(report.as_payload()))
 
+    def test_runtime_redacts_unsafe_authority_from_json_text_and_metadata_argv(self) -> None:
+        private_path = "/" + "/".join(("synthetic", "private", "project"))
+        credential_key = "_".join(("AUTH", "TOKEN"))
+        credential_shape = "=".join((credential_key, "synthetic-value"))
+        calls: list[list[str]] = []
+
+        def runner(argv, **kwargs):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        parsed = ParsedRoleBindings.valid(
+            (
+                WorkflowRoleBinding(
+                    role="coordinator",
+                    project_scope=credential_shape,
+                    lane_id="default",
+                ),
+            )
+        )
+        board = HerdrUnitBoardRuntime(
+            "/bin/herdr",
+            lister=FakeLister((row("codex", "w1:p2"),)),
+            runner=runner,
+            workspace_loader=lambda workspace_id: SimpleNamespace(
+                project_name=private_path,
+                canonical_path="/reviewable/repo",
+            ),
+            role_loader=lambda repo: parsed,
+            lane_records_loader=lambda: {},
+        )
+
+        snapshot = board.snapshot()
+        public_output = repr(snapshot.as_payload()) + format_board(snapshot, width=80)
+        report = board.sync_metadata()
+        metadata_argv = repr(calls)
+        self.assertTrue(report.ok)
+        for private_value in (private_path, credential_shape):
+            self.assertNotIn(private_value, public_output)
+            self.assertNotIn(private_value, metadata_argv)
+
 
 class HerdrUnitBoardCliTests(unittest.TestCase):
     def parser(self) -> argparse.ArgumentParser:
@@ -189,12 +234,66 @@ class HerdrUnitBoardCliTests(unittest.TestCase):
         args = self.parser().parse_args(
             ["herdr", "unit-board", "watch", "--interval", "0.1"]
         )
+        output = StringIO()
         with mock.patch(
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board._runtime"
-        ) as factory:
+        ) as factory, redirect_stdout(output):
             result = args.func(args)
         self.assertEqual(result, 2)
         factory.assert_not_called()
+
+    def test_show_json_turns_runtime_resolution_error_into_path_free_failure(self) -> None:
+        args = self.parser().parse_args(["herdr", "unit-board", "show", "--json"])
+        private_path = "/" + "/".join(("synthetic", "private", "herdr"))
+        output = StringIO()
+        with mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board._runtime",
+            side_effect=ValueError(private_path),
+        ), redirect_stdout(output):
+            result = args.func(args)
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(result, 1)
+        self.assertEqual(payload["source_state"], "unavailable")
+        self.assertNotIn(private_path, output.getvalue())
+
+    def test_sync_json_turns_runtime_resolution_error_into_structured_failure(self) -> None:
+        args = self.parser().parse_args(["herdr", "unit-board", "sync", "--json"])
+        private_path = "/" + "/".join(("synthetic", "private", "herdr"))
+        output = StringIO()
+        with mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board._runtime",
+            side_effect=OSError(private_path),
+        ), redirect_stdout(output):
+            result = args.func(args)
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(result, 1)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["source_state"], "unavailable")
+        self.assertEqual(payload["failures"][0]["reason"], "runtime_unavailable")
+        self.assertNotIn(private_path, output.getvalue())
+
+    def test_watch_exits_nonzero_on_unavailable_snapshot(self) -> None:
+        args = self.parser().parse_args(
+            ["herdr", "unit-board", "watch", "--interval", "0.5"]
+        )
+        board = mock.Mock()
+        board.snapshot.return_value = unavailable_snapshot(
+            "unavailable", observed_at="now", detail="inventory unavailable"
+        )
+        output = StringIO()
+        with mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board._runtime",
+            return_value=board,
+        ), mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board.time.sleep"
+        ) as sleep, redirect_stdout(output):
+            result = args.func(args)
+
+        self.assertEqual(result, 1)
+        sleep.assert_not_called()
+        self.assertIn("source=unavailable", output.getvalue())
 
 
 if __name__ == "__main__":  # pragma: no cover
