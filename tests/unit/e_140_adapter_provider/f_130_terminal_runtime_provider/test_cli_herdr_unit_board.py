@@ -112,6 +112,49 @@ def runtime(rows, *, runner=None, parsed=None) -> HerdrUnitBoardRuntime:
 
 
 class HerdrUnitBoardRuntimeTests(unittest.TestCase):
+    def test_action_identity_preserves_exact_long_lane_after_public_truncation(self) -> None:
+        lane_a = "x" * 80
+        lane_b = "x" * 81
+        rows = (
+            row(
+                "claude",
+                "w1:p1",
+                name=encode_assigned_name(WORKSPACE_ID, "claude", lane_a),
+            ),
+            row(
+                "codex",
+                "w1:p2",
+                name=encode_assigned_name(WORKSPACE_ID, "codex", lane_b),
+            ),
+        )
+        parsed = ParsedRoleBindings.valid(
+            tuple(
+                WorkflowRoleBinding(
+                    role="coordinator",
+                    project_scope="giken-3800-mozyo-bridge",
+                    lane_id=lane,
+                )
+                for lane in (lane_a, lane_b)
+            )
+        )
+        board = HerdrUnitBoardRuntime(
+            "/bin/herdr",
+            lister=FakeLister(rows),
+            workspace_loader=lambda workspace_id: workspace_record(),
+            role_loader=lambda repo: parsed,
+            lane_records_loader=lambda: {},
+            pane_rows_loader=lambda: pane_rows("w1:p1", "w1:p2"),
+        )
+
+        snapshot = board.snapshot()
+
+        self.assertTrue(snapshot.ok)
+        self.assertEqual(len(snapshot.units), 2)
+        self.assertEqual({unit.lane_id for unit in snapshot.units}, {lane_a})
+        resolved = {board.action_identity(unit.unit_id) for unit in snapshot.units}
+        self.assertEqual(resolved, {(WORKSPACE_ID, lane_a), (WORKSPACE_ID, lane_b)})
+        self.assertIsNone(board.action_identity("unit-unknown"))
+
     def test_snapshot_joins_declared_project_role_and_responsibility(self) -> None:
         snapshot = runtime(
             (row("claude", "w1:p1"), row("codex", "w1:p2"))
@@ -1100,6 +1143,44 @@ class HerdrUnitBoardCliTests(unittest.TestCase):
         self.assertEqual(result, 1)
         sleep.assert_not_called()
         self.assertIn("source=unavailable", output.getvalue())
+
+    def test_interact_composes_board_and_placement_clients(self) -> None:
+        args = self.parser().parse_args(["herdr", "unit-board", "interact"])
+        board = runtime((row("codex", "w1:p2"),))
+        placement = object()
+        ui = mock.Mock()
+        ui.run.return_value = 0
+
+        with mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board._runtime",
+            return_value=board,
+        ), mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board.production_live_pair_placement",
+            return_value=placement,
+        ), mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board.HerdrUnitBoardPlacementUI",
+            return_value=ui,
+        ) as factory:
+            result = args.func(args)
+
+        self.assertEqual(result, 0)
+        factory.assert_called_once_with(board, placement)
+        ui.run.assert_called_once_with()
+
+    def test_interact_runtime_failure_never_resolves_placement(self) -> None:
+        args = self.parser().parse_args(["herdr", "unit-board", "interact"])
+        output = StringIO()
+        with mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board._runtime",
+            side_effect=OSError("/synthetic/private/herdr"),
+        ), mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board.production_live_pair_placement"
+        ) as placement, redirect_stdout(output):
+            result = args.func(args)
+
+        self.assertEqual(result, 1)
+        placement.assert_not_called()
+        self.assertNotIn("/synthetic/private/herdr", output.getvalue())
 
 
 if __name__ == "__main__":  # pragma: no cover

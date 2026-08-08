@@ -34,6 +34,7 @@ from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.herdr
     AgentObservation,
     SOURCE_RELOAD_REQUIRED,
     UnitBoardSnapshot,
+    _unit_public_id,
     build_unit_board,
     lane_work_label,
     metadata_for_unit,
@@ -204,6 +205,7 @@ class _ObservedBoard:
     snapshot: UnitBoardSnapshot
     unmanaged_panes: tuple[str, ...]
     metadata_authority: tuple[tuple[str, ...], ...]
+    action_identities: tuple[tuple[str, str, str], ...] = ()
 
 
 class HerdrUnitBoardRuntime:
@@ -470,10 +472,40 @@ class HerdrUnitBoardRuntime:
             ),
             unmanaged_panes=tuple(sorted(clear_panes - managed_panes)),
             metadata_authority=tuple(sorted(metadata_authority)),
+            action_identities=tuple(
+                sorted(
+                    (
+                        _unit_public_id(workspace_id, lane_id),
+                        workspace_id,
+                        lane_id,
+                    )
+                    for workspace_id, lane_id in display_by_unit
+                )
+            ),
         )
 
     def snapshot(self) -> UnitBoardSnapshot:
         return self._observe().snapshot
+
+    def action_identity(self, unit_id: str) -> Optional[tuple[str, str]]:
+        """Resolve one opaque public Unit id to its exact current identity.
+
+        The exact values stay process-local and are never copied into the board
+        payload.  A fresh observation prevents a stale row from becoming action
+        authority, while the placement service still performs its own live
+        generation and geometry checks before any write.
+        """
+        if not isinstance(unit_id, str) or not unit_id:
+            return None
+        observed = self._observe()
+        if not observed.snapshot.ok:
+            return None
+        matches = [
+            (workspace_id, lane_id)
+            for public_id, workspace_id, lane_id in observed.action_identities
+            if public_id == unit_id
+        ]
+        return matches[0] if len(matches) == 1 else None
 
     @staticmethod
     def _inventory_failure(observed: _ObservedBoard) -> MetadataSyncReport:

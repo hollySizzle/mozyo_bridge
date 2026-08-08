@@ -255,7 +255,8 @@ enable を拒否するか、unpinned fetch を追認するかのどちらかに�
 
 | class | 意味 | enable |
 |---|---|---|
-| `ux_only` | read-only な UX 面。agent input・lane state・durable record のいずれにも書かない | **admit** |
+| `ux_only` | read-only な UX 面。agent input・pane geometry・lane state・durable record のいずれにも書かない | **admit** |
+| `presentation_control` | namespaced表示metadataと、review済みpreview-first service経由のpane geometryだけを扱う。identity / generationをapply直前に再照合し、agent input・routing・lifecycle・workflow / Redmine / DBへ書かない | **admit** |
 | `test_oracle` | 参照 schema / 期待 layout の対照物としては有用。lane identity・generation・occupancy・retire の概念を持たない | deny `no_lane_authority` |
 | `agent_input_writer` | agent input へ書き、handoff rail と durable anchor を迂回する | deny `agent_input_writer` |
 | `unknown` | この identity を review していない。**fail-closed の既定** | deny `unreviewed_pin` |
@@ -283,7 +284,7 @@ enable を拒否するか、unpinned fetch を追認するかのどちらかに�
 
 | plugin | ref | class | build provenance | enable | install |
 |---|---|---|---|---|---|
-| `mozyo.unit-board` | `hollySizzle/mozyo_bridge/herdr-plugins/mozyo-unit-board` + commit pin `aa39b4c9…` | `ux_only` | `no_build` | admit | admit |
+| `mozyo.unit-board` | `hollySizzle/mozyo_bridge/herdr-plugins/mozyo-unit-board` + commit pin `19e4ac6f…` | `presentation_control` | `no_build` | admit | admit |
 | `smarzban/herdr-file-viewer` | commit pin `96fcc0a2…` | `ux_only` | `remote_artifact_same_origin_checksum` | admit | deny `unpinned_remote_build` |
 | `yuk1ty/herdr-spreader` | repository | `test_oracle` | `unreviewed_build_provenance` | deny `no_lane_authority` | deny `unreviewed_build` |
 | `persiyanov/herdr-reviewr` | repository | `agent_input_writer` | `remote_artifact_same_origin_checksum` | deny `agent_input_writer` | deny `unpinned_remote_build` |
@@ -307,7 +308,7 @@ mozyo-bridge herdr plugin-policy --plan-enable herdr-file-viewer
 # PLAN INSTALL: install を実行してよいかだけ答える。install はしない。
 mozyo-bridge herdr plugin-policy \
     --plan-install hollySizzle/mozyo_bridge/herdr-plugins/mozyo-unit-board \
-    --ref aa39b4c9e9c3f43bf054649916a4803bb9a75c7f
+    --ref 19e4ac6ff63197aa5b255a37ecb3472da8b4886e
 mozyo-bridge herdr plugin-policy --plan-install smarzban/herdr-file-viewer \
     --ref 96fcc0a2bdd2727ec88c38f8c8806f97b7ca0ea0
 ```

@@ -17,11 +17,13 @@ class HerdrUnitBoardPluginTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.document = tomllib.loads(MANIFEST.read_text(encoding="utf-8"))
 
-    def test_manifest_declares_reviewable_ux_only_plugin(self) -> None:
+    def test_manifest_declares_reviewable_presentation_consumer(self) -> None:
         self.assertEqual(self.document["id"], "mozyo.unit-board")
+        self.assertEqual(self.document["version"], "0.2.0")
         self.assertEqual(self.document["min_herdr_version"], "0.8.0")
         self.assertNotIn("build", self.document)
         self.assertEqual(self.document["panes"][0]["placement"], "popup")
+        self.assertEqual(self.document["panes"][0]["command"][-1], "interact")
 
     def test_every_hook_invokes_only_the_public_unit_board_cli(self) -> None:
         records = (

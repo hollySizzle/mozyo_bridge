@@ -34,10 +34,12 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     BUILD_SOURCE_ONLY,
     BUILD_UNREVIEWED,
     CLASS_AGENT_INPUT_WRITER,
+    CLASS_PRESENTATION_CONTROL,
     CLASS_TEST_ORACLE,
     CLASS_UNKNOWN,
     CLASS_UX_ONLY,
     DENY_REASONS,
+    ENABLE_ADMITTED_CLASSES,
     ENABLE_SCOPE,
     FORBIDDEN_PLUGIN_AUTHORITIES,
     REASON_AGENT_INPUT_WRITER,
@@ -88,12 +90,12 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 # catch the registry changing.
 FILE_VIEWER_COMMIT = "96fcc0a2bdd2727ec88c38f8c8806f97b7ca0ea0"
 OTHER_COMMIT = "0123456789abcdef0123456789abcdef01234567"
-UNIT_BOARD_COMMIT = "aa39b4c9e9c3f43bf054649916a4803bb9a75c7f"
+UNIT_BOARD_COMMIT = "19e4ac6ff63197aa5b255a37ecb3472da8b4886e"
 UNIT_BOARD_SUBDIR = ("herdr-plugins", "mozyo-unit-board")
 UNIT_BOARD_SPEC = "hollySizzle/mozyo_bridge/herdr-plugins/mozyo-unit-board"
 UNIT_BOARD_CANONICAL_SPEC = "hollysizzle/mozyo_bridge/herdr-plugins/mozyo-unit-board"
 UNIT_BOARD_MANIFEST_DIGEST = (
-    "f90a2facdd03327b5bcdd300fd984678c3602e7cfbbfcd9b053cbcca1c76fa70"
+    "1bd86a85d625afae4863964c653145ad77eb57d01500e9166b1e2c73051d6d56"
 )
 FILE_VIEWER_MANIFEST_DIGEST = (
     "6e6bc1bb27f621b1d223f4b23cb9bd70dc036181e0d357b4f0283162d31b1c1f"
@@ -203,6 +205,7 @@ def plugin_record(
     if plugin_id == "mozyo.unit-board":
         record.update(
             {
+                "version": "0.2.0",
                 "min_herdr_version": "0.8.0",
                 "platforms": ["linux", "macos"],
                 "startup": [
@@ -248,7 +251,7 @@ def plugin_record(
                             "mozyo-bridge",
                             "herdr",
                             "unit-board",
-                            "watch",
+                            "interact",
                         ],
                         "height": "75%",
                         "id": "board",
@@ -721,7 +724,7 @@ class ClassificationTests(unittest.TestCase):
         )
         self.assertEqual(observation.manifest_digest, UNIT_BOARD_MANIFEST_DIGEST)
         verdict = classify_plugin(observation)
-        self.assertEqual(verdict.plugin_class, CLASS_UX_ONLY)
+        self.assertEqual(verdict.plugin_class, CLASS_PRESENTATION_CONTROL)
         self.assertEqual(verdict.build_provenance, BUILD_NONE)
         self.assertTrue(verdict.enable.admitted)
         self.assertTrue(verdict.install.admitted)
@@ -1389,10 +1392,18 @@ class AuthorityBoundaryTests(unittest.TestCase):
             with self.subTest(plugin_id=entry.plugin_id):
                 self.assertNotIn(entry.plugin_class, FORBIDDEN_PLUGIN_AUTHORITIES)
 
-    def test_only_the_ux_only_class_can_be_admitted_for_enable(self):
+    def test_only_explicit_presentation_classes_can_be_admitted_for_enable(self):
         admitted_classes = set()
         for record in (
             plugin_record(),
+            plugin_record(
+                plugin_id="mozyo.unit-board",
+                owner="hollySizzle",
+                repo="mozyo_bridge",
+                commit=UNIT_BOARD_COMMIT,
+                subdir="/".join(UNIT_BOARD_SUBDIR),
+                build=False,
+            ),
             plugin_record(
                 plugin_id="herdr-spreader",
                 owner="yuk1ty",
@@ -1411,7 +1422,7 @@ class AuthorityBoundaryTests(unittest.TestCase):
             verdict = classify_plugin(observe_plugin(record))
             if verdict.enable.admitted:
                 admitted_classes.add(verdict.plugin_class)
-        self.assertEqual(admitted_classes, {CLASS_UX_ONLY})
+        self.assertEqual(admitted_classes, set(ENABLE_ADMITTED_CLASSES))
 
 
 class InventoryReadTests(unittest.TestCase):
