@@ -218,7 +218,7 @@ def _canonical_registry_path(value: object) -> Path | None:
     so legacy or tampered rows that do not have that shape must fail closed.
     """
 
-    if not isinstance(value, str) or not value or value != value.strip():
+    if not isinstance(value, str) or not value:
         return None
     candidate = Path(value)
     if not candidate.is_absolute() or str(candidate) != value:

@@ -662,6 +662,21 @@ class CanonicalConfigResolutionTest(unittest.TestCase):
         self.assertEqual(config_reads, [])
         self.assertEqual(probe_reads, [])
 
+    def test_canonical_registry_path_preserves_legal_whitespace_characters(self) -> None:
+        canonical_path = Path("/canonical/repo-with-trailing-space ")
+        config_reads: list[Path] = []
+        plan = resolve_project_column_plan(
+            (_observed("ws-a", 0),),
+            workspace_loader=lambda _workspace_id, *, home=None: _workspace(
+                "ws-a", str(canonical_path)
+            ),
+            config_loader=lambda path: config_reads.append(path)
+            or RepoLocalConfig.default(),
+            canonical_probe=_healthy_canonical,
+        )
+        self.assertEqual(config_reads, [canonical_path])
+        self.assertTrue(plan.executable)
+
     def test_dead_or_linked_canonical_path_is_zero_inference(self) -> None:
         config_reads = []
         for probe in (
