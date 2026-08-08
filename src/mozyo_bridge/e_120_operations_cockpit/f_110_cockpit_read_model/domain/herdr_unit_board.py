@@ -13,7 +13,10 @@ authority.  Missing or contradictory inputs stay visible as ``unknown`` /
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
+import json
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -41,41 +44,72 @@ REDACTED_TEXT = "[redacted]"
 _SPACE_RE = re.compile(r"\s+")
 _ISSUE_LANE_RE = re.compile(r"^issue_(\d+)(?:_(.*))?$")
 _CREDENTIAL_ASSIGNMENT_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?P<key>[A-Za-z0-9_.-]+"
-    r"(?:[ \t]+[A-Za-z0-9_.-]+){0,5})[ \t]*[:=][ \t]*(?P<value>\S+)",
+    r"(?<![A-Za-z0-9_])(?P<quote>[\"']?)(?P<key>[A-Za-z0-9_.-]+"
+    r"(?:[ \t]+[A-Za-z0-9_.-]+){0,5})(?P=quote)"
+    r"[ \t]*[:=][ \t]*(?P<value>\S+)",
     re.IGNORECASE,
 )
-_CREDENTIAL_KEY_PARTS = frozenset(
+_CREDENTIAL_SINGLE_COMPONENTS = frozenset(
     {
-        "access_key",
-        "access_token",
-        "api_key",
-        "apikey",
-        "api_token",
+        "auth",
         "authorization",
-        "auth_token",
         "bearer",
-        "client_secret",
         "cookie",
         "credential",
         "jwt",
+        "pass",
         "password",
+        "passphrase",
         "passwd",
-        "private_key",
-        "refresh_token",
+        "pwd",
         "secret",
-        "secret_key",
-        "session_token",
+        "session",
         "token",
     }
 )
-_CREDENTIAL_FILE_PARTS = (
-    ".credentials",
-    ".pem",
-    "id_rsa",
-    "private key",
-    "private-key",
-    "private_key",
+_CREDENTIAL_COMPONENT_SEQUENCES = (
+    ("access", "key"),
+    ("access", "token"),
+    ("api", "key"),
+    ("api", "token"),
+    ("auth", "token"),
+    ("client", "secret"),
+    ("private", "key"),
+    ("refresh", "token"),
+    ("secret", "key"),
+    ("session", "id"),
+    ("session", "token"),
+)
+_CREDENTIAL_COMPACT_KEYS = frozenset(
+    {
+        "accesskey",
+        "accesstoken",
+        "apikey",
+        "apitoken",
+        "authtoken",
+        "awsaccesskeyid",
+        "awssecretaccesskey",
+        "clientsecret",
+        "privatekey",
+        "refreshtoken",
+        "secretkey",
+        "sessionid",
+        "sessiontoken",
+    }
+)
+_MAX_CREDENTIAL_JSON_LENGTH = 16_384
+_MAX_CREDENTIAL_JSON_DEPTH = 8
+_MAX_CREDENTIAL_JSON_NODES = 256
+_MAX_CREDENTIAL_JSON_PARSE_ATTEMPTS = 64
+_MAX_CREDENTIAL_JSON_SCANNED_CHARS = _MAX_CREDENTIAL_JSON_LENGTH * 2
+_CREDENTIAL_FILE_RE = re.compile(
+    r"(?:"
+    r"(?<![A-Za-z0-9])\.credentials(?![A-Za-z0-9])|"
+    r"\.pem(?![A-Za-z0-9])|"
+    r"(?<![A-Za-z0-9])id_rsa(?![A-Za-z0-9])|"
+    r"(?<![A-Za-z0-9])private[ _-]+key(?![A-Za-z0-9])"
+    r")",
+    re.IGNORECASE,
 )
 _OPAQUE_CREDENTIAL_RE = re.compile(
     r"(?:\bgh[pousr]_[A-Za-z0-9]{20,}\b|"
@@ -83,11 +117,13 @@ _OPAQUE_CREDENTIAL_RE = re.compile(
     r"\bAKIA[A-Z0-9]{16}\b|"
     r"\bbearer\s+\S{8,}|"
     r"\bbasic\s+[A-Za-z0-9+/=._-]{8,}|"
-    r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{8,}\."
-    r"[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*"
-    r"(?![A-Za-z0-9_-])|"
     r"://[^/\s:@]+:[^/@\s]+@)",
     re.IGNORECASE,
+)
+_COMPACT_JWT_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?P<header>[A-Za-z0-9_-]+)\."
+    r"(?P<claims>[A-Za-z0-9_-]+)\.[A-Za-z0-9_-]*"
+    r"(?![A-Za-z0-9_-])"
 )
 _BIDI_CONTROLS = frozenset(
     {
@@ -108,37 +144,178 @@ _BIDI_CONTROLS = frozenset(
 
 
 def _without_terminal_controls(value: str) -> str:
-    """Remove terminal and direction controls before any safety classification."""
-    return "".join(
-        char
-        for char in value
-        if not (
+    """Make whitespace inert and remove other terminal/direction controls."""
+    projected: list[str] = []
+    for char in value:
+        if char.isspace():
+            projected.append(" ")
+            continue
+        if (
             ord(char) < 0x20
             or 0x7F <= ord(char) <= 0x9F
             or ord(char) in _BIDI_CONTROLS
             or unicodedata.category(char) == "Cf"
-        )
+        ):
+            continue
+        projected.append(char)
+    return "".join(projected)
+
+
+def _normalized_untrusted_text(value: str) -> str:
+    """Apply the same classification normalization at every decoding depth."""
+    normalized = unicodedata.normalize("NFKC", _without_terminal_controls(value))
+    return _SPACE_RE.sub(" ", normalized).strip()
+
+
+def _is_json_object_segment(segment: str) -> bool:
+    """Return whether one base64url segment decodes to a JSON object."""
+    padded = segment + ("=" * (-len(segment) % 4))
+    try:
+        decoded = base64.b64decode(padded, altchars=b"-_", validate=True)
+    except (binascii.Error, ValueError):
+        return False
+    try:
+        text = decoded.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    try:
+        return isinstance(json.loads(text), dict)
+    except json.JSONDecodeError:
+        return False
+    except (RecursionError, ValueError):
+        return True
+
+
+def _contains_compact_jwt(value: str) -> bool:
+    """Recognize compact JWTs without assuming a minimum encoded JSON length."""
+    return any(
+        _is_json_object_segment(match.group("header"))
+        and _is_json_object_segment(match.group("claims"))
+        for match in _COMPACT_JWT_RE.finditer(value)
     )
 
 
-def _is_credential_shaped(value: str) -> bool:
-    lowered = value.casefold()
+def _credential_key(key: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", key)
+    camel_split = re.sub(
+        r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", "_", normalized
+    )
+    components = tuple(
+        part for part in re.split(r"[^a-z0-9]+", camel_split.casefold()) if part
+    )
+    if not components:
+        return False
+    if any(part in _CREDENTIAL_SINGLE_COMPONENTS for part in components):
+        return True
+    for sequence in _CREDENTIAL_COMPONENT_SEQUENCES:
+        width = len(sequence)
+        if any(
+            components[index : index + width] == sequence
+            for index in range(len(components) - width + 1)
+        ):
+            return True
+    return len(components) == 1 and components[0] in _CREDENTIAL_COMPACT_KEYS
+
+
+def _contains_non_json_credential(value: str) -> bool:
+    """Classify credential shapes after any surrounding JSON is decoded."""
     if (
-        any(part in lowered for part in _CREDENTIAL_FILE_PARTS)
+        _CREDENTIAL_FILE_RE.search(value)
         or _OPAQUE_CREDENTIAL_RE.search(value)
+        or _contains_compact_jwt(value)
     ):
         return True
     for match in _CREDENTIAL_ASSIGNMENT_RE.finditer(value):
-        key = re.sub(
-            r"[ \t.-]+", "_", match.group("key").casefold()
-        )
-        compact_key = key.replace("_", "")
-        if any(
-            part in key or part.replace("_", "") in compact_key
-            for part in _CREDENTIAL_KEY_PARTS
-        ):
+        if _credential_key(match.group("key")):
             return True
     return False
+
+
+def _contains_credential_json(value: str) -> bool:
+    """Inspect decoded JSON with one shared, bounded, fail-closed budget.
+
+    Successful roots advance the scanner to their end, so nested objects are not
+    decoded and counted twice.  JSON strings are scanned again only after decoding;
+    this catches escaped assignments and encoded child JSON without recursive calls
+    or a fresh budget.
+    """
+    stripped = value.strip()
+    if not stripped or not any(marker in stripped for marker in "[{"):
+        return False
+    if len(stripped) > _MAX_CREDENTIAL_JSON_LENGTH:
+        return True
+
+    decoder = json.JSONDecoder()
+    pending_text: list[tuple[str, int]] = [(stripped, 0)]
+    pending_nodes: list[tuple[object, int]] = []
+    parse_attempts = 0
+    scanned_chars = 0
+    visited = 0
+
+    while pending_text or pending_nodes:
+        while pending_text:
+            text, depth = pending_text.pop()
+            if depth > _MAX_CREDENTIAL_JSON_DEPTH:
+                return True
+            scanned_chars += len(text)
+            if scanned_chars > _MAX_CREDENTIAL_JSON_SCANNED_CHARS:
+                return True
+            index = 0
+            while index < len(text):
+                object_at = text.find("{", index)
+                array_at = text.find("[", index)
+                candidates = [at for at in (object_at, array_at) if at >= 0]
+                if not candidates:
+                    break
+                candidate = min(candidates)
+                parse_attempts += 1
+                if parse_attempts > _MAX_CREDENTIAL_JSON_PARSE_ATTEMPTS:
+                    return True
+                try:
+                    root, end = decoder.raw_decode(text, candidate)
+                except json.JSONDecodeError:
+                    index = candidate + 1
+                    continue
+                except (RecursionError, ValueError):
+                    return True
+                if isinstance(root, (dict, list)):
+                    pending_nodes.append((root, depth))
+                    index = max(end, candidate + 1)
+                else:
+                    index = candidate + 1
+
+        if not pending_nodes:
+            continue
+        node, depth = pending_nodes.pop()
+        visited += 1
+        if visited > _MAX_CREDENTIAL_JSON_NODES or depth > _MAX_CREDENTIAL_JSON_DEPTH:
+            return True
+        if isinstance(node, dict):
+            for key, child in node.items():
+                if isinstance(key, str):
+                    decoded_key = _normalized_untrusted_text(key)
+                    if (
+                        contains_absolute_path(decoded_key)
+                        or _credential_key(decoded_key)
+                        or _contains_non_json_credential(decoded_key)
+                    ):
+                        return True
+                    if any(marker in decoded_key for marker in "[{"):
+                        pending_text.append((decoded_key, depth + 1))
+                pending_nodes.append((child, depth + 1))
+        elif isinstance(node, list):
+            pending_nodes.extend((child, depth + 1) for child in node)
+        elif isinstance(node, str):
+            decoded = _normalized_untrusted_text(node)
+            if contains_absolute_path(decoded) or _contains_non_json_credential(decoded):
+                return True
+            if any(marker in decoded for marker in "[{"):
+                pending_text.append((decoded, depth + 1))
+    return False
+
+
+def _is_credential_shaped(value: str) -> bool:
+    return _contains_non_json_credential(value) or _contains_credential_json(value)
 
 
 def safe_text(value: object, *, fallback: str = "unknown") -> str:
@@ -150,8 +327,7 @@ def safe_text(value: object, *, fallback: str = "unknown") -> str:
     """
     if not isinstance(value, str):
         return fallback
-    normalized = unicodedata.normalize("NFKC", _without_terminal_controls(value))
-    normalized = _SPACE_RE.sub(" ", normalized).strip()
+    normalized = _normalized_untrusted_text(value)
     if not normalized:
         return fallback
     if contains_absolute_path(normalized) or _is_credential_shaped(normalized):

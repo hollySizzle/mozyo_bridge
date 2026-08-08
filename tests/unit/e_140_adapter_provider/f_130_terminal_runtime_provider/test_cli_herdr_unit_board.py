@@ -223,6 +223,43 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
                     ),
                 )
             ),
+            "session=eyJhbGciOiJub25lIn0.e30.",
+            "session=eyJhbGciOiJIUzI1NiJ9.e30.c2ln",
+            '{"token":"synthetic-material-112233"}',
+            '{"password": "synthetic-material-223344"}',
+            "{'api_key':'synthetic-material-334455'}",
+            "session=synthetic-material-445566",
+            "session_id=synthetic-material-556677",
+            "auth=synthetic-material-667788",
+            '{"sessionId":"synthetic-material-778899"}',
+            r'{"to\u006ben":"synthetic-material-889900"}',
+            r'{"public":[{"pass\u0077ord":"synthetic-material-990011"}]}',
+            r'{"public":"Bearer\u0020synthetic-material-12345678"}',
+            r'{"public":"ghp_\u0078xxxxxxxxxxxxxxxxxxxxxxx"}',
+            r'{"\uff54oken":"synthetic-material-101112"}',
+            r'prefix={"to\u006ben":"synthetic-material-121314"}',
+            r'{"public":"session\u003dsynthetic-material-141516"}',
+            r'{"public":"api_key\u003dsynthetic-material-161718"}',
+            r'{"public":"{\"token\":\"synthetic-material-181920\"}"}',
+            "Bearer\tsynthetic-material-20212223",
+            "Basic\tc3ludGhldGljLW1hdGVyaWFs",
+            r'{"public":"Bearer\u0009synthetic-material-24252627"}',
+            (
+                r'{"to\u006ben":"synthetic-material-282930","n":'
+                + ("9" * 5_000)
+                + "}"
+            ),
+            r'{"\u002fsynthetic\u002fprivate\u002fproject":"value"}',
+            r'{"\u0043\u003a\u005csynthetic\u005cprivate":"value"}',
+            r'{"ghp_\u0078xxxxxxxxxxxxxxxxxxxxxxx":"value"}',
+            "MYSQL_PWD=synthetic-material-313233",
+            "DB_PASS=synthetic-material-343536",
+            "pwd=synthetic-material-373839",
+            "pass=synthetic-material-404142",
+            "dbPass=synthetic-material-434445",
+            "mysqlPwd=synthetic-material-464748",
+            '{"dbPass":"synthetic-material-495051"}',
+            '{"mysqlPwd":"synthetic-material-525354"}',
         )
 
         for credential_shape in credential_shapes:

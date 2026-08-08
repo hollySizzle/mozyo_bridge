@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 import unicodedata
 import unittest
 
@@ -197,6 +199,71 @@ class UnitBoardReadModelTests(unittest.TestCase):
                 ),
             )
         )
+        empty_claims_unsigned_jwt = "session=eyJhbGciOiJub25lIn0.e30."
+        empty_claims_signed_jwt = "session=eyJhbGciOiJIUzI1NiJ9.e30.c2ln"
+        quoted_json_token = '{"token":"synthetic-material-112233"}'
+        quoted_json_password = '{"password": "synthetic-material-223344"}'
+        quoted_python_api_key = "{'api_key':'synthetic-material-334455'}"
+        session_alias = "session=synthetic-material-445566"
+        session_id_alias = "session_id=synthetic-material-556677"
+        auth_alias = "auth=synthetic-material-667788"
+        camel_session_json = '{"sessionId":"synthetic-material-778899"}'
+        escaped_token_json = r'{"to\u006ben":"synthetic-material-889900"}'
+        nested_escaped_password_json = (
+            r'{"public":[{"pass\u0077ord":"synthetic-material-990011"}]}'
+        )
+        escaped_bearer_json_value = (
+            r'{"public":"Bearer\u0020synthetic-material-12345678"}'
+        )
+        escaped_opaque_json_value = (
+            r'{"public":"ghp_\u0078xxxxxxxxxxxxxxxxxxxxxxx"}'
+        )
+        normalized_fullwidth_token_key = (
+            r'{"\uff54oken":"synthetic-material-101112"}'
+        )
+        embedded_escaped_token_json = (
+            r'prefix={"to\u006ben":"synthetic-material-121314"}'
+        )
+        escaped_session_assignment_value = (
+            r'{"public":"session\u003dsynthetic-material-141516"}'
+        )
+        escaped_api_key_assignment_value = (
+            r'{"public":"api_key\u003dsynthetic-material-161718"}'
+        )
+        encoded_child_credential_json = (
+            r'{"public":"{\"token\":\"synthetic-material-181920\"}"}'
+        )
+        tab_separated_bearer = "Bearer\tsynthetic-material-20212223"
+        tab_separated_basic = "Basic\tc3ludGhldGljLW1hdGVyaWFs"
+        escaped_tab_bearer_json = (
+            r'{"public":"Bearer\u0009synthetic-material-24252627"}'
+        )
+        parser_limited_number_json = (
+            r'{"to\u006ben":"synthetic-material-282930","n":'
+            + ("9" * 5_000)
+            + "}"
+        )
+        escaped_posix_path_key = (
+            r'{"\u002fsynthetic\u002fprivate\u002fproject":"value"}'
+        )
+        escaped_windows_path_key = (
+            r'{"\u0043\u003a\u005csynthetic\u005cprivate":"value"}'
+        )
+        escaped_opaque_credential_key = (
+            r'{"ghp_\u0078xxxxxxxxxxxxxxxxxxxxxxx":"value"}'
+        )
+        mysql_password_alias = "MYSQL_PWD=synthetic-material-313233"
+        database_password_alias = "DB_PASS=synthetic-material-343536"
+        short_password_alias = "pwd=synthetic-material-373839"
+        short_pass_alias = "pass=synthetic-material-404142"
+        camel_database_password_alias = "dbPass=synthetic-material-434445"
+        camel_mysql_password_alias = "mysqlPwd=synthetic-material-464748"
+        camel_database_password_json = (
+            '{"dbPass":"synthetic-material-495051"}'
+        )
+        camel_mysql_password_json = (
+            '{"mysqlPwd":"synthetic-material-525354"}'
+        )
 
         for credential_shape in (
             access_assignment,
@@ -205,6 +272,39 @@ class UnitBoardReadModelTests(unittest.TestCase):
             jwt_assignment,
             spaced_access_assignment,
             unsigned_jwt_assignment,
+            empty_claims_unsigned_jwt,
+            empty_claims_signed_jwt,
+            quoted_json_token,
+            quoted_json_password,
+            quoted_python_api_key,
+            session_alias,
+            session_id_alias,
+            auth_alias,
+            camel_session_json,
+            escaped_token_json,
+            nested_escaped_password_json,
+            escaped_bearer_json_value,
+            escaped_opaque_json_value,
+            normalized_fullwidth_token_key,
+            embedded_escaped_token_json,
+            escaped_session_assignment_value,
+            escaped_api_key_assignment_value,
+            encoded_child_credential_json,
+            tab_separated_bearer,
+            tab_separated_basic,
+            escaped_tab_bearer_json,
+            parser_limited_number_json,
+            escaped_posix_path_key,
+            escaped_windows_path_key,
+            escaped_opaque_credential_key,
+            mysql_password_alias,
+            database_password_alias,
+            short_password_alias,
+            short_pass_alias,
+            camel_database_password_alias,
+            camel_mysql_password_alias,
+            camel_database_password_json,
+            camel_mysql_password_json,
         ):
             with self.subTest(shape=credential_shape.split("=", 1)[0][:8]):
                 observation_with_credential = observation(
@@ -228,6 +328,36 @@ class UnitBoardReadModelTests(unittest.TestCase):
                     metadata_for_unit(unit)[0]["mozyo_responsibility"],
                     REDACTED_TEXT,
                 )
+
+        self.assertEqual(safe_text("release=1.2.3"), "release=1.2.3")
+        self.assertEqual(
+            safe_text("release=20260808.20260809.20260810"),
+            "release=20260808.20260809.20260810",
+        )
+        benign_json = json.dumps(
+            [{"id": index} for index in range(100)], separators=(",", ":")
+        )
+        self.assertNotEqual(safe_text(benign_json), REDACTED_TEXT)
+        self.assertEqual(safe_text("[" * 16_383), REDACTED_TEXT)
+        for benign in (
+            "private keyboard layout",
+            "private-keyboard support",
+            "private_keynote draft",
+            "tokenizer=gpt",
+            "secretary=office",
+            "passwordless=enabled",
+            "cookiecutter=template",
+            '{"tokenizer":"gpt"}',
+            '{"secretary":"office"}',
+            '{"passwordless":"enabled"}',
+            '{"cookiecutter":"template"}',
+        ):
+            self.assertEqual(safe_text(benign), benign)
+        jwt_header = base64.urlsafe_b64encode(b'{"alg":"none"}').decode().rstrip("=")
+        jwt_claims = base64.urlsafe_b64encode(
+            ('{"n":' + ("9" * 5_000) + "}").encode()
+        ).decode().rstrip("=")
+        self.assertEqual(safe_text(f"{jwt_header}.{jwt_claims}."), REDACTED_TEXT)
 
     def test_long_distinct_lane_identities_keep_distinct_unit_and_metadata_ids(self) -> None:
         common = "lane-" + ("x" * 90)
