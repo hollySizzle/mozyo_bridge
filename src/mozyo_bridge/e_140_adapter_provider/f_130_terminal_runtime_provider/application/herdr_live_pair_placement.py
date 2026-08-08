@@ -39,6 +39,8 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     RATIO_APPLIED,
     RATIO_FAILED,
     RATIO_MATCHED,
+    RESIZE_CHANGED,
+    RESIZE_UNCHANGED,
     PaneRect,
     SplitInfo,
     _read_layout,
@@ -48,6 +50,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     order_pair,
     ratio_verdict,
     resize_step,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_command_effect import (
+    parse_changed_effect,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (
     _invoke,
@@ -648,15 +653,9 @@ class HerdrLivePairPlacement:
             )
         except HerdrSessionStartError:
             return MOVE_UNKNOWN
-        try:
-            changed = json.loads(completed.stdout)["result"]["changed"]
-        except (KeyError, TypeError, ValueError):
-            return MOVE_UNKNOWN
-        if changed is True:
-            return MOVE_CHANGED
-        if changed is False:
-            return MOVE_UNCHANGED
-        return MOVE_UNKNOWN
+        return parse_changed_effect(
+            completed.stdout, result_type="pane_swap", envelope="swap"
+        )
 
     def _move(
         self,
@@ -767,12 +766,12 @@ class HerdrLivePairPlacement:
         *,
         opening: PairEvidence,
         target: PlacementTarget,
-    ) -> tuple[str, str, int]:
-        """Resize with a fresh full pair-authority fence before every pass."""
-        attempts = 0
+    ) -> tuple[str, str, str]:
+        """Resize with a fresh authority fence and retain the proven effect."""
+        effect = MOVE_UNCHANGED
         previous_distance: Optional[float] = None
         detail = "the divider was not measured"
-        for _ in range(MAX_RESIZE_PASSES + 1):
+        for pass_index in range(MAX_RESIZE_PASSES + 1):
             current = self._observe(opening.workspace_id, opening.lane_id)
             if (
                 current.status == PLAN_REFUSED
@@ -782,30 +781,23 @@ class HerdrLivePairPlacement:
                 or current.evidence.split.direction != target.split
                 or current.evidence.current_order != target.order
             ):
-                return RATIO_FAILED, "pair authority changed before ratio actuation", attempts
+                return RATIO_FAILED, "pair authority changed before ratio actuation", effect
             first = current.evidence.rect_by_provider[target.order[0]]
             matched, detail = ratio_verdict(current.evidence.split, first, target.ratio)
             if matched:
-                return (
-                    RATIO_APPLIED if attempts else RATIO_MATCHED,
-                    detail,
-                    attempts,
-                )
+                outcome = RATIO_APPLIED if effect == MOVE_CHANGED else RATIO_MATCHED
+                return outcome, detail, effect
             distance = abs(current.evidence.split.ratio - target.ratio)
             if previous_distance is not None and distance >= previous_distance:
-                return (
-                    RATIO_FAILED,
-                    f"Herdr stopped moving the divider toward the target; {detail}",
-                    attempts,
-                )
-            if attempts >= MAX_RESIZE_PASSES:
+                detail = f"Herdr stopped moving the divider toward the target; {detail}"
+                return RATIO_FAILED, detail, effect
+            if pass_index >= MAX_RESIZE_PASSES:
                 break
             token, amount = resize_step(
                 current.evidence.split.ratio, target.ratio, target.split
             )
             previous_distance = distance
-            attempts += 1
-            if not _resize(
+            resize_effect = _resize(
                 current.evidence.by_provider[target.order[0]].pane_id,
                 token,
                 amount,
@@ -813,9 +805,17 @@ class HerdrLivePairPlacement:
                 runner=self.runner,
                 timeout=self.timeout,
                 env=None,
-            ):
-                return RATIO_FAILED, "Herdr refused the ratio adjustment", attempts
-        return RATIO_FAILED, f"the divider did not reach the target; {detail}", attempts
+            )
+            if resize_effect == RESIZE_CHANGED:
+                effect = MOVE_CHANGED
+                continue
+            if resize_effect == RESIZE_UNCHANGED:
+                detail = "Herdr reported that the ratio adjustment changed nothing"
+                return RATIO_FAILED, detail, effect
+            unknown_effect = MOVE_CHANGED if effect == MOVE_CHANGED else MOVE_UNKNOWN
+            return RATIO_FAILED, "Herdr did not prove the ratio adjustment effect", unknown_effect
+        detail = f"the divider did not reach the target; {detail}"
+        return RATIO_FAILED, detail, effect
 
     def _result_after_failure(
         self,
@@ -947,7 +947,7 @@ class HerdrLivePairPlacement:
             )
 
         if "resize_ratio" in after_order.operations:
-            outcome, detail, attempts = self._apply_ratio_guarded(
+            outcome, detail, ratio_effect = self._apply_ratio_guarded(
                 opening=evidence,
                 target=target,
             )
@@ -956,12 +956,12 @@ class HerdrLivePairPlacement:
                     before,
                     effect=(
                         MOVE_CHANGED
-                        if changed or attempts
-                        else MOVE_UNCHANGED
+                        if changed or ratio_effect == MOVE_CHANGED
+                        else ratio_effect
                     ),
                     detail=detail,
                 )
-            changed = changed or outcome == RATIO_APPLIED
+            changed = changed or ratio_effect == MOVE_CHANGED
 
         final = self._observe(workspace_id, lane_id or "default")
         if (

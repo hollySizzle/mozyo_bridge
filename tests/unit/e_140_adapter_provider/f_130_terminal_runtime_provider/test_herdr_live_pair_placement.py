@@ -77,6 +77,7 @@ class PairPlacementHerdr(PaneTreeHerdr):
         super().__init__(workspace_id)
         self.swap_refused = False
         self.swap_unchanged = False
+        self.swap_malformed = False
         self.third_pane_after_first_move = False
         self.reported_temp_tab = ""
         self.extra_layout_split = False
@@ -158,7 +159,13 @@ class PairPlacementHerdr(PaneTreeHerdr):
             return self._failed(argv, "swap refused")
         if self.swap_unchanged:
             return self._done(
-                argv, {"result": {"type": "pane_swap", "changed": False}}
+                argv,
+                {
+                    "result": {
+                        "type": "pane_swap",
+                        "swap": {"changed": False},
+                    }
+                },
             )
         first = tail[tail.index("--source-pane") + 1]
         second = tail[tail.index("--target-pane") + 1]
@@ -166,7 +173,17 @@ class PairPlacementHerdr(PaneTreeHerdr):
         if tab is None or tab is not self.tab_of(second):
             return self._failed(argv, "swap target is not one live pair")
         _swap_leaf_ids(tab.root, first, second)
-        return self._done(argv, {"result": {"type": "pane_swap", "changed": True}})
+        if self.swap_malformed:
+            return self._done(argv, {"result": {"type": "pane_swap"}})
+        return self._done(
+            argv,
+            {
+                "result": {
+                    "type": "pane_swap",
+                    "swap": {"changed": True},
+                }
+            },
+        )
 
 
 class FakeGenerationStore:
@@ -347,6 +364,15 @@ class HerdrLivePairPlacementTests(unittest.TestCase):
         self.assertEqual(result.status, APPLY_FAILED)
         self.assertTrue(result.as_payload()["retryable"])
 
+    def test_swap_malformed_effect_is_conservatively_partial(self) -> None:
+        service, herdr, _, _ = self._build(order=("claude", "codex"))
+        herdr.swap_malformed = True
+
+        result = service.apply(WORKSPACE_ID)
+
+        self.assertEqual(result.status, APPLY_PARTIAL)
+        self.assertFalse(result.as_payload()["retryable"])
+
     def test_apply_resizes_ratio_and_remeasures(self) -> None:
         service, herdr, _, _ = self._build(ratio=0.7)
 
@@ -355,6 +381,24 @@ class HerdrLivePairPlacementTests(unittest.TestCase):
         self.assertEqual(result.status, APPLY_APPLIED, result)
         self.assertEqual(result.after.status, PLAN_MATCHED)
         self.assertTrue(herdr.resizes)
+
+    def test_resize_changed_false_is_known_failed_without_mutation(self) -> None:
+        service, herdr, _, _ = self._build(ratio=0.7)
+        herdr.resize_unchanged = True
+
+        result = service.apply(WORKSPACE_ID)
+
+        self.assertEqual(result.status, APPLY_FAILED)
+        self.assertTrue(result.as_payload()["retryable"])
+
+    def test_resize_malformed_effect_is_conservatively_partial(self) -> None:
+        service, herdr, _, _ = self._build(ratio=0.7)
+        herdr.resize_malformed = True
+
+        result = service.apply(WORKSPACE_ID)
+
+        self.assertEqual(result.status, APPLY_PARTIAL)
+        self.assertFalse(result.as_payload()["retryable"])
 
     def test_zero_exit_without_changed_move_stops_before_second_move(self) -> None:
         service, herdr, _, panes = self._build(split="right")

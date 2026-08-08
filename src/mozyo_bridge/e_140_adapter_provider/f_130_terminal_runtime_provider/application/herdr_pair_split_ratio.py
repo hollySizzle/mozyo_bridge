@@ -55,6 +55,12 @@ from typing import Mapping, Optional, Sequence
 from pathlib import Path
 
 from mozyo_bridge.shared.paths import mozyo_bridge_home
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_command_effect import (  # noqa: E501
+    EFFECT_CHANGED as RESIZE_CHANGED,
+    EFFECT_UNCHANGED as RESIZE_UNCHANGED,
+    EFFECT_UNKNOWN as RESIZE_UNKNOWN,
+    parse_changed_effect,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
     _close_base_pane,
     _invoke,
@@ -95,6 +101,10 @@ RATIO_DEFERRED = "deferred_until_full_relaunch"
 #: reported as success; the pair is left exactly as herdr placed it (no agent is closed).
 RATIO_FAILED = "failed"
 
+#: Typed effect reported by Herdr 0.8 for ``pane resize``.  Process exit zero is
+#: not mutation evidence: the authoritative value is
+#: ``result.resize.changed`` in the bundled response schema.
+RESIZE_REFUSED = "refused"
 #: The closed outcome vocabulary, in the order a reader should read it.
 RATIO_OUTCOMES: tuple[str, ...] = (
     RATIO_NOT_APPLICABLE,
@@ -619,20 +629,25 @@ def _resize(
     runner: Runner,
     timeout: float,
     env,
-) -> bool:
-    """Issue one ``pane resize``; ``False`` when herdr refused it.
+) -> str:
+    """Issue one ``pane resize`` and return its typed Herdr 0.8 effect.
 
     ``--amount`` is rendered with fixed precision rather than Python's ``repr``: herdr parses
     it as an ``f32`` and rejects anything non-finite outright (measured j#91140 —
     ``invalid amount: nan`` / exit 2, layout unchanged), so a compact, unambiguous decimal is
     what the CLI is guaranteed to accept.
+
+    Exit zero alone proves no mutation.  Herdr 0.8 reports the authoritative
+    boolean at ``result.resize.changed``; a refused command, malformed envelope,
+    wrong result type, or non-boolean value is ``unknown`` rather than a guessed
+    success.
     """
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
         HerdrSessionStartError,
     )
 
     try:
-        _invoke(
+        completed = _invoke(
             binary,
             ["pane", "resize", "--pane", pane_id, "--direction", direction,
              "--amount", f"{amount:.6f}"],
@@ -641,8 +656,10 @@ def _resize(
             env=env,
         )
     except HerdrSessionStartError:
-        return False
-    return True
+        return RESIZE_REFUSED
+    return parse_changed_effect(
+        completed.stdout, result_type="pane_resize", envelope="resize"
+    )
 
 
 def _measure_pair(
@@ -711,11 +728,24 @@ def _apply_ratio(
     for _ in range(MAX_RESIZE_PASSES):
         distance = abs(split.ratio - target)
         token, amount = resize_step(split.ratio, target, direction)
-        if not _resize(
+        resize_effect = _resize(
             pair.first_pane, token, amount,
             binary=binary, runner=runner, timeout=timeout, env=env,
-        ):
-            return RATIO_FAILED, f"herdr refused 'pane resize --direction {token}'; {detail}"
+        )
+        if resize_effect == RESIZE_UNCHANGED:
+            return RATIO_FAILED, (
+                f"herdr reported no change for 'pane resize --direction {token}'; "
+                f"{detail}"
+            )
+        if resize_effect == RESIZE_REFUSED:
+            return RATIO_FAILED, (
+                f"herdr refused 'pane resize --direction {token}'; {detail}"
+            )
+        if resize_effect != RESIZE_CHANGED:
+            return RATIO_FAILED, (
+                f"herdr did not prove the effect of 'pane resize --direction {token}'; "
+                f"{detail}"
+            )
         split, first, reason = _measure_pair(
             _read_layout(
                 pair.first_pane, binary=binary, runner=runner, timeout=timeout, env=env

@@ -6,8 +6,9 @@ live な herdr pane pair (coordinator + auditor / gateway + worker 等) の **�
 > 新paneを作り、そのpaneへ`agent start <mza1> --kind <provider> --pane <pane>`を実行する方式へ
 > 移行した。したがってfresh launchはactive paneへの暗黙splitに依存しない。本runbookのA–Dは
 > 既存live paneを動かす別操作であり、記載された実測versionは0.7.1/0.7.4のままである。
-> 0.8で再実行する際は各`--help`とread-only layoutを先に照合し、未再実測のsignatureを推測で
-> 実行しない。
+> 製品commandが使うswap / resizeのsignatureと応答schemaは0.8のbundled schemaで再照合済み。
+> 下記の手動recipeを0.8で追加実行する際は各`--help`とread-only layoutを先に照合し、未再実測の
+> signatureを推測で実行しない。
 
 対象は **既存 live pair の再配置**。標準入口は下記の preview-first 製品 command、低レベルの Herdr command は部分失敗時の調査・復旧 recipe である。設定駆動の恒久配置 (`lane_placement`) との境界は下記「設定駆動配置との境界」を読む。設計正本は [[spec-herdr-native-identity]] (target authority = herdr assigned name)、lane 運用手順の正本は [[task-herdr-lane-operations]]、pane identity / marker の意味構造は [[logic-pane-centric-cockpit-semantics]]。本書は手順のみを扱い規約本文を複製しない。
 
@@ -48,6 +49,12 @@ apply は検査結果が preview 後に変わっていれば mutation 前に拒�
 では、退避後に元 tab と一時 tab がそれぞれ expected singleton であること、agent identity / generation / target
 設定が不変であることを確認してから戻す。swap / bounce の後と resize の各 pass 前、最後にも live layout を
 読み直す。pane の kill / relaunch は行わない。
+
+Herdr 0.8では、process exit 0だけを変更証拠にしない。swapは
+`result.type = pane_swap`かつ`result.swap.changed`、resizeは
+`result.type = pane_resize`かつ`result.resize.changed`を厳密に読む。`changed: false`は既知の
+無変更、field欠落・型違い・別result typeは効果不明として扱い、生の応答本文は公開出力へ出さない。
+resizeの試行回数も変更証拠には使わない。
 
 結果の扱い:
 

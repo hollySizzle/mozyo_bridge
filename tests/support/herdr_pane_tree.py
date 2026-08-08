@@ -244,6 +244,7 @@ class PaneTreeHerdr:
         #: Refuse or accept-without-changing ``pane resize`` for fault injection.
         self.resize_refused = False
         self.resize_unchanged = False
+        self.resize_malformed = False
         self.layout_unreadable_after_resize = False
         self.resizes: list = []
         #: Panes whose ``agent list`` row is shell residue — the durable identity is
@@ -477,7 +478,17 @@ class PaneTreeHerdr:
             return self._failed(argv, f"pane not found: {pane_id}")
         if not self.resize_unchanged and not tab.resize(pane_id, direction, amount):
             return self._failed(argv, f"matching divider not found: {pane_id}")
-        return self._done(argv, {"result": {"type": "ok"}})
+        if self.resize_malformed:
+            return self._done(argv, {"result": {"type": "pane_resize"}})
+        return self._done(
+            argv,
+            {
+                "result": {
+                    "type": "pane_resize",
+                    "resize": {"changed": not self.resize_unchanged},
+                }
+            },
+        )
 
     @staticmethod
     def _done(argv, payload):

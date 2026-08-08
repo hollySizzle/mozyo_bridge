@@ -719,7 +719,15 @@ class FakeHerdr:
         self._split_ratio[key] = apply_resize_amount(
             self._split_ratio.get(key, 0.5), direction, value
         )
-        return _ok(argv, {"result": {"type": "ok"}})
+        return _ok(
+            argv,
+            {
+                "result": {
+                    "type": "pane_resize",
+                    "resize": {"changed": True},
+                }
+            },
+        )
 
     def split_ratio_of(self, pane_id: str) -> float:
         """The live split ratio of the container ``pane_id`` lives in (test read helper)."""
