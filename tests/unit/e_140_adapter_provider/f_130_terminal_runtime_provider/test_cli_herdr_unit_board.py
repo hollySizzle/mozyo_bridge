@@ -30,6 +30,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     encode_assigned_name,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
+    valid_target,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_unit_board_runtime import (
     HerdrUnitBoardRuntime,
     METADATA_SYNC_LOCK_FILENAME,
@@ -79,7 +82,15 @@ def row(provider: str, pane: str, *, name: str = "") -> dict[str, object]:
     }
 
 
+def pane_rows(*pane_ids: str, tokens=None) -> tuple[dict[str, object], ...]:
+    token_map = {} if tokens is None else dict(tokens)
+    return tuple(
+        {"pane_id": pane_id, "tokens": dict(token_map)} for pane_id in pane_ids
+    )
+
+
 def runtime(rows, *, runner=None, parsed=None) -> HerdrUnitBoardRuntime:
+    rows = tuple(rows)
     return HerdrUnitBoardRuntime(
         "/bin/herdr",
         lister=FakeLister(rows),
@@ -89,6 +100,13 @@ def runtime(rows, *, runner=None, parsed=None) -> HerdrUnitBoardRuntime:
         ),
         role_loader=lambda repo: parsed if parsed is not None else role_bindings(),
         lane_records_loader=lambda: {},
+        pane_rows_loader=lambda: pane_rows(
+            *dict.fromkeys(
+                row.get("pane_id")
+                for row in rows
+                if isinstance(row, dict) and valid_target(row.get("pane_id"))
+            )
+        ),
         sync_lock_factory=nullcontext,
     )
 
@@ -144,6 +162,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
             ),
             role_loader=lambda repo: parsed,
             lane_records_loader=lambda: {},
+            pane_rows_loader=lambda: pane_rows("w1:p2"),
         )
 
         snapshot = board.snapshot()
@@ -204,6 +223,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
             workspace_loader=load_workspace,
             role_loader=load_roles,
             lane_records_loader=lambda: {},
+            pane_rows_loader=lambda: pane_rows("w1:p1", "w1:p2"),
         )
 
         snapshot = board.snapshot()
@@ -274,6 +294,73 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
         self.assertEqual(cleared, set(METADATA_TOKEN_KEYS))
         self.assertNotIn("--token", clear)
 
+    def test_sync_clears_metadata_after_managed_agent_disappears_from_agent_list(self) -> None:
+        tokens = {"mozyo_unit": "previous-unit", "unrelated": "preserved"}
+        calls: list[list[str]] = []
+
+        def runner(argv, **kwargs):
+            calls.append(list(argv))
+            if argv[1:3] == ["pane", "list"]:
+                payload = {
+                    "id": "cli:pane:list",
+                    "result": {
+                        "type": "pane_list",
+                        "panes": [{"pane_id": "w1:p2", "tokens": dict(tokens)}],
+                    },
+                }
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout=json.dumps(payload), stderr=""
+                )
+            self.assertEqual(
+                argv[:4], ["/bin/herdr", "pane", "report-metadata", "w1:p2"]
+            )
+            for index, value in enumerate(argv):
+                if value == "--clear-token":
+                    tokens.pop(argv[index + 1], None)
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        board = HerdrUnitBoardRuntime(
+            "/bin/herdr",
+            lister=FakeLister(()),
+            runner=runner,
+            lane_records_loader=lambda: {},
+            sync_lock_factory=nullcontext,
+        )
+
+        report = board.sync_metadata()
+
+        self.assertTrue(report.ok)
+        self.assertEqual(report.attempted, 1)
+        self.assertEqual(report.updated, 1)
+        clear_calls = [
+            argv for argv in calls if argv[1:3] == ["pane", "report-metadata"]
+        ]
+        self.assertEqual(len(clear_calls), 1)
+        self.assertIn("--clear-title", clear_calls[0])
+        self.assertNotIn("mozyo_unit", tokens)
+        self.assertEqual(tokens["unrelated"], "preserved")
+
+    def test_unreadable_complete_pane_inventory_fails_closed_without_metadata_write(self) -> None:
+        calls: list[list[str]] = []
+
+        def runner(argv, **kwargs):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, stdout="not-json", stderr="")
+
+        board = HerdrUnitBoardRuntime(
+            "/bin/herdr",
+            lister=FakeLister((row("codex", "w1:p2"),)),
+            runner=runner,
+            lane_records_loader=lambda: {},
+            sync_lock_factory=nullcontext,
+        )
+
+        report = board.sync_metadata()
+
+        self.assertFalse(report.ok)
+        self.assertEqual(report.attempted, 0)
+        self.assertEqual(calls, [["/bin/herdr", "pane", "list"]])
+
     def test_sync_holds_writer_lock_across_observe_report_and_verification(self) -> None:
         events: list[str] = []
 
@@ -301,13 +388,24 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
             workspace_loader=lambda workspace_id: workspace_record(),
             role_loader=lambda repo: role_bindings(),
             lane_records_loader=lambda: {},
+            pane_rows_loader=lambda: (
+                events.append("panes") or pane_rows("w1:p2")
+            ),
             sync_lock_factory=lock,
         )
 
         self.assertTrue(board.sync_metadata().ok)
         self.assertEqual(
             events,
-            ["lock-enter", "inventory", "metadata", "inventory", "lock-exit"],
+            [
+                "lock-enter",
+                "inventory",
+                "panes",
+                "metadata",
+                "inventory",
+                "panes",
+                "lock-exit",
+            ],
         )
 
     def test_sync_lock_failure_is_typed_and_runs_no_inventory_or_metadata_io(self) -> None:
@@ -319,10 +417,12 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
             yield
 
         runner = mock.Mock()
+        pane_rows_loader = mock.Mock()
         board = HerdrUnitBoardRuntime(
             "/bin/herdr",
             lister=lister,
             runner=runner,
+            pane_rows_loader=pane_rows_loader,
             sync_lock_factory=unavailable_lock,
         )
 
@@ -332,6 +432,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
         self.assertEqual(report.attempted, 0)
         self.assertEqual(report.failures[0].reason, "metadata_sync_lock_acquire_failed")
         lister.list_agent_rows.assert_not_called()
+        pane_rows_loader.assert_not_called()
         runner.assert_not_called()
 
     def test_sync_lock_release_failure_preserves_already_attempted_updates(self) -> None:
@@ -353,6 +454,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
             workspace_loader=lambda workspace_id: workspace_record(),
             role_loader=lambda repo: role_bindings(),
             lane_records_loader=lambda: {},
+            pane_rows_loader=lambda: pane_rows("w1:p2"),
             sync_lock_factory=release_failure,
         )
 
@@ -443,6 +545,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
             ),
             role_loader=lambda repo: role_bindings(),
             lane_records_loader=lambda: {},
+            pane_rows_loader=lambda: pane_rows("w1:p2"),
             sync_lock_factory=nullcontext,
         )
 
@@ -505,6 +608,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
                     ),
                     role_loader=lambda repo: role_bindings(),
                     lane_records_loader=lambda: {},
+                    pane_rows_loader=lambda: pane_rows("w1:p2"),
                     sync_lock_factory=lambda: unit_board_metadata_lock(home),
                 )
 
@@ -572,6 +676,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
             workspace_loader=lambda workspace_id: None,
             role_loader=lambda repo: role_bindings(),
             lane_records_loader=lambda: {},
+            pane_rows_loader=lambda: pane_rows("w1:p2"),
             sync_lock_factory=nullcontext,
         )
 
@@ -778,6 +883,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
                     ),
                     role_loader=lambda repo: parsed,
                     lane_records_loader=lambda: {},
+                    pane_rows_loader=lambda: pane_rows("w1:p2"),
                 )
 
                 snapshot = board.snapshot()

@@ -28,7 +28,9 @@ mozyo-bridge herdr unit-board watch
 ```
 
 - `show` は一度だけ public-safe projection を表示する。
-- `sync` は各 live pane の Herdr display metadata を更新する。
+- `sync` は managed agent inventory と完全な pane inventory を照合し、各 live pane の
+  Herdr display metadataを更新する。agent終了後にshellへ戻ってagent inventoryから
+  消えたpaneも、残存するnamespaced `mozyo_*` tokenから検出してclearする。
 - `watch` は plugin-owned popup 内の terminal board を定期更新する。
 - inventory を読めない場合や managed identity が壊れている場合は非0で終了する。
 
@@ -72,8 +74,10 @@ text表示へ正の `--width` が与えられた場合、各出力行はそのte
 packaged manifest は `herdr-plugins/mozyo-unit-board/herdr-plugin.toml` に置く。
 
 - startup と `pane.created` / `pane.agent_detected` / `pane.exited` event で display
-  metadataを再同期する。agent終了後に残るshell paneは `pane.exited` で旧title/tokenを
-  clearする。
+  metadataを再同期する。agent releaseを通知する `pane.agent_detected` hook後は完全な
+  pane inventoryのnamespaced tokenを照合し、agent inventoryから消えたshell paneの
+  旧title/tokenをclearする。`pane.exited` はpane自体の終了通知であり、shellへ戻る
+  agent終了とは同一視しない。
 - cold restart 後も metadata を再構成し、過去の pane locator を再利用しない。
 - popup action は `watch` だけを起動する。
 - plugin command は `mozyo-bridge herdr unit-board` のみを呼ぶ。

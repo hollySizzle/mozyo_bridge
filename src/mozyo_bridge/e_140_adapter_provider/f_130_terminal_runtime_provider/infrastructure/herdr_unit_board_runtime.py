@@ -8,6 +8,7 @@ input, Redmine, workflow state, or a mozyo state database.
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import subprocess
@@ -76,6 +77,7 @@ METADATA_TOKEN_KEYS = (
 WorkspaceLoader = Callable[[str], Optional[WorkspaceRecord]]
 RoleLoader = Callable[[Path], ParsedRoleBindings]
 LaneRecordsLoader = Callable[[], Mapping[str, LaneMetadataRecord]]
+PaneRowsLoader = Callable[[], Sequence[Mapping[str, object]]]
 SyncLockFactory = Callable[[], ContextManager[None]]
 
 
@@ -216,6 +218,7 @@ class HerdrUnitBoardRuntime:
         workspace_loader: WorkspaceLoader = _default_workspace_loader,
         role_loader: RoleLoader = load_parsed_role_bindings,
         lane_records_loader: LaneRecordsLoader = _default_lane_records_loader,
+        pane_rows_loader: Optional[PaneRowsLoader] = None,
         sync_lock_factory: SyncLockFactory = unit_board_metadata_lock,
     ) -> None:
         if not isinstance(binary, str) or not binary:
@@ -226,7 +229,60 @@ class HerdrUnitBoardRuntime:
         self._workspace_loader = workspace_loader
         self._role_loader = role_loader
         self._lane_records_loader = lane_records_loader
+        self._pane_rows_loader = pane_rows_loader or self._list_live_pane_rows
         self._sync_lock_factory = sync_lock_factory
+
+    def _list_live_pane_rows(self) -> Sequence[Mapping[str, object]]:
+        """Read Herdr's complete pane inventory, including metadata tokens."""
+        try:
+            completed = self._runner(
+                [self._binary, "pane", "list"],
+                capture_output=True,
+                text=True,
+                timeout=METADATA_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise TerminalTransportError("Herdr pane inventory is unavailable") from exc
+        if completed.returncode != 0 or not isinstance(completed.stdout, str):
+            raise TerminalTransportError("Herdr pane inventory is unavailable")
+        try:
+            payload = json.loads(completed.stdout)
+        except (TypeError, ValueError) as exc:
+            raise TerminalTransportError("Herdr pane inventory is invalid") from exc
+        result = payload.get("result") if isinstance(payload, Mapping) else None
+        rows = result.get("panes") if isinstance(result, Mapping) else None
+        if (
+            not isinstance(result, Mapping)
+            or result.get("type") != "pane_list"
+            or not isinstance(rows, list)
+            or any(not isinstance(row, Mapping) for row in rows)
+        ):
+            raise TerminalTransportError("Herdr pane inventory is invalid")
+        return tuple(rows)
+
+    @staticmethod
+    def _metadata_owner_panes(
+        rows: Sequence[Mapping[str, object]],
+    ) -> frozenset[str]:
+        """Return panes carrying this plugin's namespaced metadata tokens."""
+        pane_ids: set[str] = set()
+        owners: set[str] = set()
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise ValueError("pane inventory contains a non-object row")
+            pane_id = row.get("pane_id")
+            tokens = row.get("tokens", {})
+            if (
+                not valid_target(pane_id)
+                or pane_id in pane_ids
+                or not isinstance(tokens, Mapping)
+                or any(not isinstance(key, str) for key in tokens)
+            ):
+                raise ValueError("pane inventory contains an invalid identity")
+            pane_ids.add(pane_id)
+            if any(key in tokens for key in METADATA_TOKEN_KEYS):
+                owners.add(pane_id)
+        return frozenset(owners)
 
     @staticmethod
     def _role_display(
@@ -266,6 +322,9 @@ class HerdrUnitBoardRuntime:
         observed_at = _utc_now()
         try:
             rows = self._lister.list_agent_rows()
+            metadata_owner_panes = self._metadata_owner_panes(
+                self._pane_rows_loader()
+            )
         except (TerminalTransportError, OSError, ValueError):
             return _ObservedBoard(
                 snapshot=unavailable_snapshot(
@@ -324,7 +383,6 @@ class HerdrUnitBoardRuntime:
                 unmanaged += 1
                 if valid_target(pane_id):
                     unmanaged_panes.add(pane_id)
-                    metadata_authority.append((pane_id, "unmanaged"))
                 continue
             identity = decoded.identity
             if not valid_target(pane_id):
@@ -397,13 +455,17 @@ class HerdrUnitBoardRuntime:
                     authority_state=authority,
                 )
             )
+        clear_panes = unmanaged_panes | (metadata_owner_panes - managed_panes)
+        metadata_authority.extend(
+            (pane_id, "clear") for pane_id in sorted(clear_panes)
+        )
         return _ObservedBoard(
             snapshot=build_unit_board(
                 observations,
                 observed_at=observed_at,
                 unmanaged_agents=unmanaged,
             ),
-            unmanaged_panes=tuple(sorted(unmanaged_panes - managed_panes)),
+            unmanaged_panes=tuple(sorted(clear_panes - managed_panes)),
             metadata_authority=tuple(sorted(metadata_authority)),
         )
 
