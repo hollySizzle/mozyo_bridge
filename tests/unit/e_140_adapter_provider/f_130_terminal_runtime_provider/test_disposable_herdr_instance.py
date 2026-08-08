@@ -601,6 +601,56 @@ class ControlSurfaceAllowlistTests(unittest.TestCase):
             instance.runner(command, capture_output=True)
             self.assertEqual(dispatched, [command])
 
+    def test_configured_column_move_and_swap_are_endpoint_bound(self) -> None:
+        """The #15123 placement primitives stay inside the owned instance."""
+        process = _Process()
+        dispatched: list = []
+
+        def _runner(argv, **kwargs):
+            dispatched.append((list(argv), dict(kwargs.get("env") or {})))
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = DisposableHerdrInstance(
+                binary="/bin/true",
+                root=Path(tmp) / "instance",
+                base_env={"HOME": str(Path(tmp) / "operator")},
+                runner=_runner,
+                popen_factory=lambda argv, **kwargs: process,
+                sleeper=lambda _seconds: None,
+                ambient_env={},
+            )
+            instance.start()
+            self.addCleanup(instance.shutdown)
+            dispatched.clear()
+
+            commands = [
+                ["/bin/true", "pane", "move", "w1:p2", "--new-tab"],
+                [
+                    "/bin/true",
+                    "pane",
+                    "swap",
+                    "--source-pane",
+                    "w1:p1",
+                    "--target-pane",
+                    "w1:p3",
+                ],
+            ]
+            for command in commands:
+                instance.runner(command, capture_output=True)
+
+            self.assertEqual([argv for argv, _env in dispatched], commands)
+            self.assertTrue(
+                {("pane", "move"), ("pane", "swap")}.issubset(
+                    live_module.CLIENT_CALL_SUBCOMMANDS
+                )
+            )
+            for _argv, effective_env in dispatched:
+                self.assertEqual(
+                    effective_env[HERDR_SOCKET_PATH_ENV],
+                    str(instance.binding.socket_path),
+                )
+
     def test_allowlisted_client_calls_survive_for_both_processes(self) -> None:
         """Baseline: the fence must not turn into a blanket refusal."""
         process = _Process()
