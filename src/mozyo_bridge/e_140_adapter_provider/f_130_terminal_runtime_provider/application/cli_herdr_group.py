@@ -101,6 +101,13 @@ def register_herdr_group(
     )
 
     register_herdr_smoke_shared_space_parser(herdr_sub)
+    # Redmine #15114: read-only coordinator Unit board + display-only metadata.
+    # Kept feature-local so the shared CLI composition root gains no surface.
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board import (
+        register_herdr_unit_board_parser,
+    )
+
+    register_herdr_unit_board_parser(herdr_sub)
     herdr_session_start = herdr_sub.add_parser(
         "session-start",
         help=(

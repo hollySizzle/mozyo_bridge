@@ -1,15 +1,15 @@
 # Herdr Plugin Presentation Consumer Boundary
 
-Redmine #14631。Herdr 0.7.5 の plugin surface を、mozyo-bridge の
+Redmine #14631。Herdr の plugin surface を、mozyo-bridge の
 workflow / provider plugin ではなく **presentation consumer** として扱う境界、
 sublane UX の方向、engine-first の実装順序を固定する設計正本。
 
 ## Status
 
-本書は design-only である。Herdr plugin、UI、safe action API を実装した記録では
-ない。0.7.5 の実測事実は #14614 journal #91226、採用する実装分割は
-#14617 / #14618 / #14619、本書に記録する owner UX intent は #14631 を durable
-anchor とする。
+本書は presentation consumer の設計境界である。識別表示の最初の実装は
+`herdr-unit-board.md`、safe pane movement は #14605 系を正本とする。0.7.5 の
+初期実測事実は #14614 journal #91226、採用した実装分割は #14617 / #14618 /
+#14619、本書に記録した owner UX intent は #14631 を durable anchor とする。
 
 ## Decision
 
@@ -172,6 +172,11 @@ UX 実装を先行させない。ただし、engine を UI から利用不能な
 | read-only sublane UX plugin spike | proposed |
 | 本格 UI / UX implementation | future separate US |
 
+Redmine #15114 で、Herdr 0.8.0 の display metadata と plugin-owned popup を使う
+read-only `mozyo Unit board` を最初の presentation consumer として実装した。
+責務・role・project・lane work label の projection と display metadata 更新のみを
+扱い、pane movement は #14605 系へ分離する。詳細は `herdr-unit-board.md` を読む。
+
 ## Non-Goals
 
 - 本書で UI / plugin runtime を実装すること。
@@ -189,5 +194,6 @@ UX 実装を先行させない。ただし、engine を UI から利用不能な
 - `vibes/docs/logics/iterm-webviewer-presentation-boundary.md`
 - `vibes/docs/logics/pane-centric-cockpit-semantics.md`
 - `vibes/docs/logics/delegated-coordinator-cockpit-display.md`
+- `vibes/docs/logics/herdr-unit-board.md`
 - Redmine #14614 journal #91226
 - Redmine #14617 / #14618 / #14619 / #14604

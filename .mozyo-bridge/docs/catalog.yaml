@@ -10,6 +10,7 @@ coverage_roots:
   - .claude-plugin
   - .github
   - experimental
+  - herdr-plugins
   - src
   - tests
   - scripts
@@ -594,7 +595,7 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/herdr-plugin-presentation-consumer-boundary.md
-    purpose: Herdr 0.7.5 pluginをmozyo-bridgeのexternal providerではなくpresentation consumerとして扱い、sublane UX intent、state ownership、safe customization、user-global plugin境界、engine-first実装順序を固定する設計正本。
+    purpose: Herdr pluginをmozyo-bridgeのexternal providerではなくpresentation consumerとして扱い、sublane UX intent、state ownership、safe customization、user-global plugin境界、engine-first実装順序を固定する設計正本。
     audit_role: herdr_plugin_presentation_consumer_boundary_logic
     related_document_refs:
       - logic-plugin-ready-adapter-boundary
@@ -604,9 +605,27 @@ documents:
       - logic-iterm-webviewer-presentation-boundary
       - logic-pane-centric-cockpit-semantics
       - logic-delegated-coordinator-cockpit-display
+      - logic-herdr-unit-board
       - logic-cockpit-attention-state
       - logic-event-timeline-source
       - spec-herdr-native-identity
+      - rule-public-private-boundary
+      - spec-project-map
+
+  - id: logic-herdr-unit-board
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/herdr-unit-board.md
+    purpose: managed Herdr agent pairをproject・workflow role・責務・lane work label・runtime stateで識別するpublic-safe Unit board、display metadata再同期、plugin境界、pane移動USとの分離を固定する実装正本。
+    audit_role: herdr_unit_board_logic
+    related_document_refs:
+      - logic-herdr-plugin-presentation-consumer-boundary
+      - logic-plugin-ready-adapter-boundary
+      - logic-delegated-coordinator-cockpit-display
+      - logic-unit-presentation-state-db
+      - logic-pane-centric-cockpit-semantics
+      - spec-herdr-native-identity
+      - spec-herdr-default-lane-workflow-role-authority
       - rule-public-private-boundary
       - spec-project-map
 
@@ -1605,6 +1624,28 @@ file_conventions:
       - rule-project-agent-workflow
       - logic-object-oriented-architecture-policy
       - skill-workflow-reference
+
+  - id: fc-herdr-unit-board
+    name: Herdr Unit board projection, runtime adapter, plugin, and tests
+    patterns:
+      - herdr-plugins/mozyo-unit-board/**
+      - src/mozyo_bridge/e_120_operations_cockpit/f_110_cockpit_read_model/domain/herdr_unit_board.py
+      - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/cli_herdr_unit_board.py
+      - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/infrastructure/herdr_unit_board_runtime.py
+      - tests/unit/e_120_operations_cockpit/f_110_cockpit_read_model/test_herdr_unit_board.py
+      - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_cli_herdr_unit_board.py
+      - tests/integration/e_140_adapter_provider/f_130_terminal_runtime_provider/test_herdr_unit_board_plugin.py
+      - vibes/docs/logics/herdr-unit-board.md
+    severity: block
+    document_refs:
+      - logic-herdr-unit-board
+      - logic-herdr-plugin-presentation-consumer-boundary
+      - logic-plugin-ready-adapter-boundary
+      - logic-delegated-coordinator-cockpit-display
+      - rule-public-private-boundary
+      - rule-project-agent-workflow
+      - spec-herdr-native-identity
+      - spec-project-map
 
   - id: fc-legacy-mirror-sync
     name: legacy project skill partial-mirror sync source and tests

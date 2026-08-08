@@ -1,0 +1,35 @@
+id = "mozyo.unit-board"
+name = "mozyo Unit board"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Shows each managed coordinator Unit's project, role, work label, and runtime state"
+platforms = ["linux", "macos"]
+
+[[startup]]
+command = ["mozyo-bridge", "herdr", "unit-board", "sync", "--quiet"]
+
+[[actions]]
+id = "sync"
+title = "Refresh mozyo Unit labels"
+contexts = ["workspace"]
+command = ["mozyo-bridge", "herdr", "unit-board", "sync"]
+
+[[events]]
+on = "pane.created"
+command = ["mozyo-bridge", "herdr", "unit-board", "sync", "--quiet"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["mozyo-bridge", "herdr", "unit-board", "sync", "--quiet"]
+
+[[events]]
+on = "pane.exited"
+command = ["mozyo-bridge", "herdr", "unit-board", "sync", "--quiet"]
+
+[[panes]]
+id = "board"
+title = "mozyo Unit board"
+placement = "popup"
+width = "92%"
+height = "75%"
+command = ["mozyo-bridge", "herdr", "unit-board", "watch"]

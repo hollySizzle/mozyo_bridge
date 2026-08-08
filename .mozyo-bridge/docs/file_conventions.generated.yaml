@@ -53,6 +53,25 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
+- name: Herdr Unit board projection, runtime adapter, plugin, and tests
+  patterns:
+  - herdr-plugins/mozyo-unit-board/**
+  - src/mozyo_bridge/e_120_operations_cockpit/f_110_cockpit_read_model/domain/herdr_unit_board.py
+  - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/cli_herdr_unit_board.py
+  - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/infrastructure/herdr_unit_board_runtime.py
+  - tests/unit/e_120_operations_cockpit/f_110_cockpit_read_model/test_herdr_unit_board.py
+  - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_cli_herdr_unit_board.py
+  - tests/integration/e_140_adapter_provider/f_130_terminal_runtime_provider/test_herdr_unit_board_plugin.py
+  - vibes/docs/logics/herdr-unit-board.md
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/herdr-unit-board.md と @vibes/docs/logics/herdr-plugin-presentation-consumer-boundary.md
+    と @vibes/docs/logics/plugin-ready-adapter-boundary.md と @vibes/docs/logics/delegated-coordinator-cockpit-display.md と
+    @vibes/docs/rules/public-private-boundary.md と @vibes/docs/rules/agent-workflow.md と @vibes/docs/specs/herdr-native-identity.md
+    と @vibes/docs/specs/project-map.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
 - name: legacy project skill partial-mirror sync source and tests
   patterns:
   - src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/application/legacy_mirror_sync.py
