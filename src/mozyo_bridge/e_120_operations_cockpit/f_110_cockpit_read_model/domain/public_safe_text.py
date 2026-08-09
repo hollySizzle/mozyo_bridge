@@ -440,12 +440,6 @@ def safe_text(value: object, *, fallback: str = "unknown") -> str:
     return normalized[:MAX_PRESENTATION_TEXT]
 
 
-#: Domain separator for host-qualified Unit keys.  The local shape starts with
-#: an 8-byte big-endian length whose first byte is ``0x00`` for any real
-#: identity, so a stream that starts with these bytes can never be produced by
-#: the local shape.  That is what lets local Units keep their historical opaque
-
-
 __all__ = (
     "MAX_PRESENTATION_TEXT",
     "REDACTED_TEXT",

@@ -158,6 +158,42 @@ def _reject_unknown_keys(
         )
 
 
+def _connection_values(source: "UnitBoardSource") -> tuple[str, ...]:
+    """One source's operator-supplied connection values (never displayed)."""
+    return tuple(
+        dict.fromkeys(
+            value
+            for value in (source.ssh_target, source.container, source.mozyo_binary)
+            if value and value != DEFAULT_MOZYO_BINARY
+        )
+    )
+
+
+def _disclosed_value(text: str, values: Sequence[str]) -> Optional[str]:
+    """Return the first of ``values`` that ``text`` would disclose, or ``None``.
+
+    Two complementary tests, because a value can be disclosed two ways: as a
+    whole word (which is what catches a short value inside a sentence, without
+    firing on an unrelated word that merely starts the same way), and embedded
+    anywhere for values specific enough that appearing inside a longer token is
+    a disclosure rather than a coincidence.  Compared after the same projection
+    the board renders, so a Unicode form or a whitespace run cannot smuggle one
+    past.
+    """
+    if not isinstance(text, str) or not text:
+        return None
+    folded = safe_text(text, fallback="").casefold() or text.casefold()
+    for value in values:
+        candidate = safe_text(value, fallback="").casefold() or value.casefold()
+        if not candidate:
+            continue
+        if len(candidate) >= 3 and candidate in folded:
+            return value
+        if re.search(rf"(?<![0-9a-z]){re.escape(candidate)}(?![0-9a-z])", folded):
+            return value
+    return None
+
+
 @dataclass(frozen=True)
 class UnitBoardSource:
     """One observable Herdr server plus the fixed argv shape that reaches it.
@@ -204,6 +240,17 @@ class UnitBoardSource:
             raise UnitBoardSourceError(
                 "a Unit board source label must already be its public-safe value"
             )
+        # This source's own connection values, checked here so a single source
+        # is safe on its own; the config checks every source against every
+        # other's (review j#102018 finding_2).
+        own = _connection_values(self)
+        for field, value in (("host_id", self.host_id), ("label", self.label)):
+            if _disclosed_value(value, own) is not None:
+                raise UnitBoardSourceError(
+                    f"a Unit board source publishes a '{field}' that repeats its "
+                    "own connection value; the board displays both fields, so "
+                    "neither may carry one"
+                )
 
     @property
     def is_local(self) -> bool:
@@ -399,6 +446,21 @@ class UnitBoardSourcesConfig:
             raise UnitBoardSourceError(
                 f"at most {MAX_SOURCES} Unit board sources are supported"
             )
+        # ``host_id`` and ``label`` are the two values the board publishes.  A
+        # connection value repeated in either of them walks straight back onto
+        # the public surface the operator source file exists to keep it off —
+        # including through the default, where an undeclared label becomes the
+        # host_id (review j#102018 finding_2).  Checked against every source's
+        # values, because disclosing another host's destination is no better.
+        for source in self.sources:
+            for field, value in (("host_id", source.host_id), ("label", source.label)):
+                disclosed = self.disclosed_connection_value(value)
+                if disclosed is not None:
+                    raise UnitBoardSourceError(
+                        f"Unit board source {source.host_id!r} publishes a "
+                        f"'{field}' that repeats a configured connection value; "
+                        "the board displays both fields, so neither may carry one"
+                    )
 
     @property
     def by_id(self) -> dict[str, UnitBoardSource]:
@@ -436,9 +498,7 @@ class UnitBoardSourcesConfig:
         """
         values: list[str] = []
         for source in self.sources:
-            for value in (source.ssh_target, source.container, source.mozyo_binary):
-                if value and value != DEFAULT_MOZYO_BINARY:
-                    values.append(value)
+            values.extend(_connection_values(source))
         return tuple(dict.fromkeys(values))
 
     def disclosed_connection_value(self, text: str) -> Optional[str]:
@@ -461,20 +521,7 @@ class UnitBoardSourcesConfig:
         value cannot be smuggled past by a Unicode form or a whitespace run that
         the display would normalize away.
         """
-        if not isinstance(text, str) or not text:
-            return None
-        folded = safe_text(text, fallback="").casefold() or text.casefold()
-        for value in self.private_connection_values:
-            candidate = safe_text(value, fallback="").casefold() or value.casefold()
-            if not candidate:
-                continue
-            if len(candidate) >= 3 and candidate in folded:
-                return value
-            if re.search(
-                rf"(?<![0-9a-z]){re.escape(candidate)}(?![0-9a-z])", folded
-            ):
-                return value
-        return None
+        return _disclosed_value(text, self.private_connection_values)
 
     @classmethod
     def default(cls) -> "UnitBoardSourcesConfig":

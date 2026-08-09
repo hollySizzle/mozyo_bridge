@@ -65,6 +65,10 @@ sources:
   fail-closed。`yaml.safe_load` の duplicate key は宣言順で解決せず拒否する。
 - 接続値 (`ssh_target` / `container` / `mozyo_binary`) は argv 構築の入力にすぎない。
   payload、描画行、refusal detail のいずれにも出さない。
+- **公開 field (`host_id` / `label`) が接続値を繰り返す設定は拒否する。** 両 field は board が
+  publish するため、そこに接続値が入れば operator-scoped file へ隔離した意味が失われる。
+  same-source（自分の接続値）と cross-source（他 source の接続値）の双方を検査し、label 未指定時に
+  host_id を既定にする経路も同じ検査を通す。
 - source 数と接続 timeout は bound する (`MAX_SOURCES` / `MAX_CONNECT_TIMEOUT_SECONDS`)。
   1 refresh あたり source ごとに 1 接続が発生するため。
 
@@ -107,7 +111,11 @@ Unit identity は `host_id + workspace_id + lane_id` である。
   padded / 全角の identity が canonical に見えてしまう。それを action 入力にすることは、
   **source が送っていない identity を client が合成して操作権限へ昇格させる**ことに等しい。
   `workspace_id` は **raw がそのまま canonical lowercase 32 hex である場合のみ** action 候補とし、
-  raw identity を持たない row は addressable でない。cross-source duplicate の判定も raw identity で行う。
+  **`lane_id` も raw が bounded public-safe projection と byte 一致する場合のみ** action 候補とする。
+  **両方が揃って初めて addressable** であり、raw identity を持たない row は addressable でない。
+  cross-source duplicate の判定も raw identity で行う。
+- **可変値を描く surface は payload 経由に統一する。** JSON を projection で通し text を raw 属性から
+  描くと、同じ値が面によって別物になる（redact されるはずの値が端末に生で出る）。
 - **1 source 内で `(workspace_id, lane_id)` は一意でなければならない。** 同一 identity を別 key で
   2 行返す応答は、1 つの Unit に操作可能な別名を 2 つ与える。key の一意性検査だけでは足りず、
   identity そのものの重複を境界で検出して `reload_required` とする。
@@ -129,6 +137,14 @@ Unit identity は `host_id + workspace_id + lane_id` である。
 - remote 応答は**untrusted input として再検証する**。向こう側が同じ code を動かしている
   ことは検証を省く理由にならない。全 text は client 側で同じ public-safe projection を
   通し、absolute path / credential 形状は `[redacted]` へ畳む。
+- **untrusted JSON は duplicate key を拒否して decode する**（remote board / workspace registry /
+  gateway outcome のすべて）。`json.loads` は重複 key を後勝ちで畳むため、拒否される値を先に、
+  canonical な値を後に置くだけで **decode 後のあらゆる検査を迂回できる**。operator YAML に課した
+  duplicate-key 拒否と同じ規律を、より信頼できない remote JSON にも課す。
+- **source からの出力は byte 上限で bound する**（共有 subprocess seam）。unit 件数・agent 数・
+  timeout はいずれも decode 後の bound であり、それだけでは到達可能な source が decode 前に
+  client の memory を枯渇させられる。上限は**読み取り時点**で効かせ（超過分を読まない）、
+  超過時は board / registry を `reload_required`、配送を `delivery_failed` の固定結果にする。
 - freshness は **2 つの独立した dimension の連言**である。両方が成り立って初めて action
   authority になる。**未来時刻の扱いは dimension ごとに異なり、以下がその唯一の記述である**
   （全面適用の一般則として読まない）。

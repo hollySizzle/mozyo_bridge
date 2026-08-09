@@ -17,7 +17,7 @@ import hashlib
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.public_safe_text import (
     MAX_PRESENTATION_TEXT,
@@ -28,9 +28,14 @@ from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.publi
 
 
 #: The reserved host id of the client's own Herdr server within the Unit key
-#: space.  Defined here, with the key function that depends on it, so the
-#: operator source schema can import this module's display projection without a
-#: cycle; the schema re-exports the name for its own callers.
+#: space.  It lives here, beside :func:`_unit_public_id` which depends on it, so
+#: the operator source schema can import the display projection without a cycle;
+#: the schema re-exports the name for its own callers.
+#:
+#: Local Units keep the opaque key they had before multi-source observation
+#: existed, because that key is written into Herdr's pane metadata.  A
+#: host-qualified key is domain-separated from it, so no configured source can
+#: mint a value that lands in the local key space.
 LOCAL_HOST_ID = "local"
 
 #: Widest terminal render this module will allocate for.
@@ -70,6 +75,11 @@ AUTHORITY_STATES = frozenset(
 )
 
 #: key while remote Units get a distinct one from the same function.
+#: Domain separator for host-qualified Unit keys.  The local shape starts with
+#: an 8-byte big-endian length whose first byte is ``0x00`` for any real
+#: identity, so a stream beginning with these bytes can never be produced by the
+#: local shape — which is what lets local Units keep their historical key while
+#: remote Units get a distinct one from the same function.
 _HOST_QUALIFIED_TAG = b"host"
 
 

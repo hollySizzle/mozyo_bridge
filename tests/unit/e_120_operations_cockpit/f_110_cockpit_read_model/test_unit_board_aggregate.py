@@ -17,6 +17,9 @@ from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.herdr
 )
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.unit_board_aggregate import (
     DEFAULT_SOURCE_FRESHNESS_SECONDS,
+    MAX_ACTION_LANE_LENGTH,
+    actionable_identity,
+    actionable_lane_id,
     MAX_REMOTE_CLOCK_SKEW_SECONDS,
     MAX_REMOTE_PAYLOAD_AGE_SECONDS,
     MAX_SOURCE_UNITS,
@@ -47,7 +50,7 @@ STAMP = NOW.isoformat(timespec="seconds")
 
 LOCAL = UnitBoardSource.local_default()
 REMOTE = UnitBoardSource.from_record(
-    {"host_id": "devbox", "kind": "ssh", "ssh_target": "devbox", "label": "dev host"}
+    {"host_id": "devbox", "kind": "ssh", "ssh_target": "SSH-DESTINATION-SENTINEL", "label": "dev host"}
 )
 
 
@@ -134,7 +137,7 @@ class RemotePayloadTests(unittest.TestCase):
 
     def test_remote_unit_key_differs_per_source_for_the_same_remote_key(self) -> None:
         other = UnitBoardSource.from_record(
-            {"host_id": "buildbox", "kind": "ssh", "ssh_target": "buildbox"}
+            {"host_id": "buildbox", "kind": "ssh", "ssh_target": "OTHER-DEST"}
         )
 
         self.assertNotEqual(
@@ -411,6 +414,38 @@ class RawIdentityActionInputTests(unittest.TestCase):
                     self.assertEqual(row.workspace_id, WORKSPACE_A)
                 self.assertEqual(row.raw_workspace_id, value)
                 self.assertIsNone(actionable_workspace_id(row))
+
+    def test_a_lane_the_projection_would_rewrite_is_not_an_action_input(self) -> None:
+        # The workspace half of this rule landed first; a lane carrying
+        # whitespace, a full-width form, a control codepoint, a path, or a
+        # credential shape stayed addressable while displaying as something else.
+        for name, lane in (
+            ("padded", "  default  "),
+            ("full-width", "ｄｅｆａｕｌｔ"),
+            ("bidi control", "default\u202e"),
+            ("absolute path", "/srv/private/lane"),
+            ("credential shape", "token=DROP-TOKEN-SENTINEL"),
+            ("over the bound", "l" * (MAX_ACTION_LANE_LENGTH + 1)),
+        ):
+            with self.subTest(case=name):
+                payload = remote_payload()
+                payload["units"][0]["lane_id"] = lane
+
+                row = parse_remote_board_payload(
+                    payload, source=REMOTE, observed_at=STAMP, now=NOW
+                ).rows[0]
+
+                self.assertIsNone(actionable_lane_id(row))
+                self.assertIsNone(actionable_identity(row))
+
+    def test_a_plain_lane_is_addressable_with_its_workspace(self) -> None:
+        row = parse_remote_board_payload(
+            remote_payload(lane_id="issue_15138"), source=REMOTE,
+            observed_at=STAMP, now=NOW,
+        ).rows[0]
+
+        self.assertEqual(actionable_lane_id(row), "issue_15138")
+        self.assertEqual(actionable_identity(row), (WORKSPACE_A, "issue_15138"))
 
     def test_the_raw_lane_is_kept_beside_the_displayed_one(self) -> None:
         payload = remote_payload()

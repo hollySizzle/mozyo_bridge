@@ -14,7 +14,7 @@ from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.unit_
 
 
 def ssh_record(host_id: str = "devbox", **overrides) -> dict:
-    record = {"host_id": host_id, "kind": "ssh", "ssh_target": "devbox"}
+    record = {"host_id": host_id, "kind": "ssh", "ssh_target": "SSH-DESTINATION-SENTINEL"}
     record.update(overrides)
     return record
 
@@ -80,7 +80,7 @@ class SourceSchemaTests(unittest.TestCase):
                     "version": 1,
                     "sources": [
                         ssh_record(host_id="devbox", label="dev"),
-                        ssh_record(host_id="buildbox", ssh_target="b", label="DEV"),
+                        ssh_record(host_id="buildbox", ssh_target="OTHER-DEST", label="DEV"),
                     ],
                 }
             )
@@ -98,7 +98,7 @@ class SourceSchemaTests(unittest.TestCase):
                             "sources": [
                                 ssh_record(host_id="devbox", label="dev host"),
                                 ssh_record(
-                                    host_id="buildbox", ssh_target="b", label=other
+                                    host_id="buildbox", ssh_target="OTHER-DEST", label=other
                                 ),
                             ],
                         }
@@ -121,10 +121,10 @@ class SourceSchemaTests(unittest.TestCase):
     def test_misplaced_kind_fields_fail_closed(self) -> None:
         with self.assertRaises(UnitBoardSourceError):
             UnitBoardSource.from_record(
-                {"host_id": "devbox", "kind": "local", "ssh_target": "devbox"}
+                {"host_id": "devbox", "kind": "local", "ssh_target": "SSH-DESTINATION-SENTINEL"}
             )
         with self.assertRaises(UnitBoardSourceError):
-            UnitBoardSource.from_record(container_record(ssh_target="devbox"))
+            UnitBoardSource.from_record(container_record(ssh_target="SSH-DESTINATION-SENTINEL"))
 
     def test_connection_values_reject_option_and_metacharacter_shapes(self) -> None:
         for target in ("-oProxyCommand=x", "host;rm -rf /", "host name", "a$b"):
@@ -210,7 +210,8 @@ class CanonicalLabelTests(unittest.TestCase):
     def test_a_raw_label_cannot_be_installed_by_direct_construction(self) -> None:
         with self.assertRaises(UnitBoardSourceError):
             UnitBoardSource(
-                host_id="devbox", label="dev  host", kind="ssh", ssh_target="devbox"
+                host_id="devbox", label="dev  host", kind="ssh",
+                ssh_target="SSH-DESTINATION-SENTINEL"
             )
 
 
@@ -254,6 +255,27 @@ class ConnectionValueDisclosureTests(unittest.TestCase):
         self.assertIsNone(config.disclosed_connection_value("dbus daemon restart"))
         self.assertIsNone(config.disclosed_connection_value("adb logcat"))
 
+    def test_a_public_identity_repeating_a_connection_value_is_rejected(self) -> None:
+        # host_id and label are the two values the board publishes; a connection
+        # value in either walks back onto the surface the source file keeps it
+        # off — including through the default, where an undeclared label becomes
+        # the host_id.
+        with self.assertRaises(UnitBoardSourceError):
+            UnitBoardSource.from_record(
+                {"host_id": "devbox", "kind": "ssh", "ssh_target": "devbox"}
+            )
+        with self.assertRaises(UnitBoardSourceError):
+            UnitBoardSource.from_record(
+                ssh_record(label="SSH-DESTINATION-SENTINEL")
+            )
+
+    def test_a_public_identity_repeating_another_sources_value_is_rejected(self) -> None:
+        with self.assertRaises(UnitBoardSourceError):
+            UnitBoardSourcesConfig.from_record({"version": 1, "sources": [
+                ssh_record(host_id="devbox", ssh_target="OTHER-DEST"),
+                ssh_record(host_id="buildbox", ssh_target="b-dest", label="OTHER-DEST"),
+            ]})
+
     def test_text_embedding_a_connection_value_is_flagged(self) -> None:
         config = self.config()
 
@@ -286,7 +308,7 @@ class SourceArgvTests(unittest.TestCase):
         self.assertEqual(argv[0], "ssh")
         self.assertIn("BatchMode=yes", argv)
         self.assertIn("--", argv)
-        self.assertEqual(argv[argv.index("--") + 1], "devbox")
+        self.assertEqual(argv[argv.index("--") + 1], "SSH-DESTINATION-SENTINEL")
         self.assertEqual(
             argv[-1], "mozyo-bridge herdr unit-board show --json"
         )

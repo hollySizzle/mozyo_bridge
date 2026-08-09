@@ -19,6 +19,10 @@ from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.unit_
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_multi_source_unit_board import (
     MAX_REMOTE_PATH_LENGTH,
+    MAX_SOURCE_OUTPUT_BYTES,
+    UntrustedJsonError,
+    bounded_capture_run,
+    loads_untrusted_json,
     REMOTE_BOARD_ARGS,
     REMOTE_WORKSPACE_ARGS,
     MultiSourceUnitBoardRuntime,
@@ -278,6 +282,105 @@ class ObservationTests(unittest.TestCase):
         states = {status.host_id: status for status in snapshot.sources}
         self.assertEqual(states["devbox"].source_state, SOURCE_STALE)
         self.assertFalse(states["devbox"].actionable)
+
+
+class UntrustedJsonTests(unittest.TestCase):
+    def test_a_duplicate_key_is_refused_rather_than_last_wins(self) -> None:
+        # json.loads keeps the last value, so a source could put a rejected
+        # value first and a canonical one second and have every later check see
+        # only the second.
+        with self.assertRaises(UntrustedJsonError):
+            loads_untrusted_json('{"workspace_id": "bad", "workspace_id": "good"}')
+
+    def test_a_duplicate_key_nested_in_an_object_is_refused(self) -> None:
+        with self.assertRaises(UntrustedJsonError):
+            loads_untrusted_json('{"a": {"b": 1, "b": 2}}')
+
+    def test_a_duplicate_key_inside_an_array_element_is_refused(self) -> None:
+        with self.assertRaises(UntrustedJsonError):
+            loads_untrusted_json('{"units": [{"x": 1, "x": 2}]}')
+
+    def test_ordinary_documents_still_decode(self) -> None:
+        self.assertEqual(
+            loads_untrusted_json('{"a": 1, "b": {"c": [1, 2]}}'),
+            {"a": 1, "b": {"c": [1, 2]}},
+        )
+
+    def test_a_board_with_a_duplicated_identity_key_is_unreadable(self) -> None:
+        duplicated = (
+            '{"source_state":"live","observed_at":"' + STAMP + '",'
+            '"unmanaged_agents":0,"detail":"","units":[{"unit_id":"unit-x",'
+            '"workspace_id":"NOT-CANONICAL","workspace_id":"' + WORKSPACE_A + '",'
+            '"lane_id":"default","project_label":"p","workflow_role":"c",'
+            '"responsibility":"p","work_label":"w","authority_state":"resolved",'
+            '"identity_state":"resolved","agents":[{"provider":"codex",'
+            '"runtime_state":"idle","interactive_ready":true}]}]}'
+        )
+
+        def answering(argv, **kwargs):
+            if "unit-board show" in argv[-1]:
+                return subprocess.CompletedProcess(argv, 0, duplicated, "")
+            return subprocess.CompletedProcess(argv, 0, json.dumps(WORKSPACE_PAYLOAD), "")
+
+        multi = MultiSourceUnitBoardRuntime(
+            REMOTE_CONFIG, local_runtime=FakeLocalRuntime(), runner=answering,
+            clock=lambda: NOW,
+        )
+
+        states = {s.host_id: s for s in multi.snapshot().sources}
+        self.assertEqual(states["devbox"].source_state, SOURCE_RELOAD_REQUIRED)
+
+
+class OutputBoundTests(unittest.TestCase):
+    def test_output_over_the_ceiling_is_a_typed_failure(self) -> None:
+        def oversized(argv, **kwargs):
+            return subprocess.CompletedProcess(
+                argv, 0, "y" * (MAX_SOURCE_OUTPUT_BYTES + 1), ""
+            )
+
+        multi = MultiSourceUnitBoardRuntime(REMOTE_CONFIG, runner=oversized)
+
+        self.assertIsNone(
+            multi.run_source_command(REMOTE_CONFIG.by_id["devbox"], ("workspace", "list"))
+        )
+
+    def test_output_exactly_at_the_ceiling_is_accepted(self) -> None:
+        def at_limit(argv, **kwargs):
+            return subprocess.CompletedProcess(
+                argv, 0, "y" * MAX_SOURCE_OUTPUT_BYTES, ""
+            )
+
+        multi = MultiSourceUnitBoardRuntime(REMOTE_CONFIG, runner=at_limit)
+        completed = multi.run_source_command(
+            REMOTE_CONFIG.by_id["devbox"], ("workspace", "list")
+        )
+
+        self.assertIsNotNone(completed)
+        assert completed is not None
+        self.assertEqual(len(completed.stdout), MAX_SOURCE_OUTPUT_BYTES)
+
+    def test_the_production_runner_stops_reading_at_the_ceiling(self) -> None:
+        # The bound has to live where the reading happens: capturing everything
+        # first and measuring afterwards does not stop the allocation.
+        import sys
+
+        completed = bounded_capture_run(
+            [sys.executable, "-c",
+             f"import sys; sys.stdout.write('z' * {MAX_SOURCE_OUTPUT_BYTES * 2})"],
+            timeout=60,
+        )
+
+        self.assertLessEqual(len(completed.stdout), MAX_SOURCE_OUTPUT_BYTES + 1)
+
+    def test_the_production_runner_passes_ordinary_output_through(self) -> None:
+        import sys
+
+        completed = bounded_capture_run(
+            [sys.executable, "-c", "print('hello')"], timeout=60
+        )
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout.strip(), "hello")
 
 
 class UnitResolutionTests(unittest.TestCase):

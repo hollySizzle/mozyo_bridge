@@ -35,7 +35,7 @@ from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.herdr
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.unit_board_aggregate import (
     DEFAULT_SOURCE_FRESHNESS_SECONDS,
     SourceObservation,
-    actionable_workspace_id,
+    actionable_identity,
     aggregate_sources,
     local_source_observation,
     mark_stale,
@@ -74,6 +74,69 @@ REMOTE_WORKSPACE_ARGS = ("workspace", "list", "--json")
 ANSWER_OK = "ok"
 ANSWER_UNREACHABLE = "unreachable"
 ANSWER_UNREADABLE = "unreadable"
+
+#: Ceiling on what one source command may return.  Every other bound in this
+#: module — unit count, agent count, timeout — applies *after* decoding, so
+#: without this a reachable source could exhaust the client's memory before any
+#: of them ran (review j#102018 finding_5).
+MAX_SOURCE_OUTPUT_BYTES = 4 * 1024 * 1024
+
+
+class UntrustedJsonError(ValueError):
+    """An untrusted JSON document could not be read under the strict rules."""
+
+
+def _reject_duplicate_keys(pairs: Sequence[tuple[str, object]]) -> dict:
+    seen: dict = {}
+    for key, value in pairs:
+        if key in seen:
+            # ``json.loads`` keeps the last value for a repeated key, so a
+            # source could put a rejected value first and a canonical one second
+            # and have every later check see only the second (review j#102018
+            # finding_3).  Two claims for one field are not a document this
+            # client can act on.
+            raise UntrustedJsonError(f"duplicate key {key!r} in untrusted JSON")
+        seen[key] = value
+    return seen
+
+
+def loads_untrusted_json(text: object) -> object:
+    """Decode untrusted JSON, refusing duplicate keys at every object depth."""
+    if not isinstance(text, str):
+        raise UntrustedJsonError("untrusted JSON must be text")
+    try:
+        return json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    except UntrustedJsonError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise UntrustedJsonError("untrusted JSON could not be decoded") from exc
+
+
+def bounded_capture_run(argv, *, timeout, **_ignored):
+    """Run one command, reading at most :data:`MAX_SOURCE_OUTPUT_BYTES` of output.
+
+    The production runner.  ``subprocess.run(capture_output=True)`` buffers
+    everything the child writes before any caller can look at it, so the bound
+    has to live where the reading happens rather than in a length check
+    afterwards.  Output at or under the ceiling behaves exactly as before; past
+    it the read stops and the process is killed, and the over-length marker
+    makes the caller fail closed.
+    """
+    with subprocess.Popen(
+        list(argv), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    ) as process:
+        try:
+            assert process.stdout is not None
+            captured = process.stdout.read(MAX_SOURCE_OUTPUT_BYTES + 1)
+            process.stdout.close()
+            process.wait(timeout=timeout)
+        except BaseException:
+            process.kill()
+            process.wait()
+            raise
+    return subprocess.CompletedProcess(
+        list(argv), process.returncode, captured.decode("utf-8", errors="replace"), ""
+    )
 
 #: Bound on a remote repository root.  The value comes from another host's
 #: registry — untrusted input that becomes an argv element — so it is checked
@@ -143,7 +206,7 @@ class MultiSourceUnitBoardRuntime:
     ) -> None:
         self._config = config
         self._local_runtime = local_runtime
-        self._runner: Runner = runner if runner is not None else subprocess.run
+        self._runner: Runner = runner if runner is not None else bounded_capture_run
         self._clock = clock
         self._freshness_seconds = freshness_seconds
 
@@ -174,7 +237,7 @@ class MultiSourceUnitBoardRuntime:
         except UnitBoardSourceError:
             return None
         try:
-            return self._runner(
+            completed = self._runner(
                 list(argv),
                 capture_output=True,
                 text=True,
@@ -188,6 +251,13 @@ class MultiSourceUnitBoardRuntime:
             # refusal every other failure here produces (review j#101846
             # finding_5).
             return None
+        # Also enforced here, not only inside the production runner, so an
+        # injected runner cannot hand back an unbounded answer.
+        if isinstance(completed.stdout, str) and len(completed.stdout.encode(
+            "utf-8", errors="replace"
+        )) > MAX_SOURCE_OUTPUT_BYTES:
+            return None
+        return completed
 
     def _run_source_json(
         self, source: UnitBoardSource, args: Sequence[str]
@@ -211,8 +281,8 @@ class MultiSourceUnitBoardRuntime:
         if not isinstance(completed.stdout, str):
             return ANSWER_UNREADABLE, None
         try:
-            return ANSWER_OK, json.loads(completed.stdout)
-        except (TypeError, ValueError):
+            return ANSWER_OK, loads_untrusted_json(completed.stdout)
+        except UntrustedJsonError:
             return ANSWER_UNREADABLE, None
 
     def _observe_source(self, source: UnitBoardSource) -> SourceObservation:
@@ -276,6 +346,8 @@ class MultiSourceUnitBoardRuntime:
         - the source is not live (unreachable, unreadable, or stale);
         - the key does not resolve to exactly one Unit on exactly one source;
         - the Unit's identity is ambiguous within its own source;
+        - the workspace or the lane is not addressable as the source stated it
+          (review j#102018 finding_1);
         - the Unit's display authority did not resolve, so the far host could
           not read the durable role binding that describes it (Redmine #15138
           review j#101787 f3);
@@ -299,9 +371,12 @@ class MultiSourceUnitBoardRuntime:
             return None
         if row.authority_state != AUTHORITY_RESOLVED:
             return None
-        workspace_id = actionable_workspace_id(row)
-        if workspace_id is None:
+        # Both halves or neither: a lane the projection would rewrite is as
+        # unusable an action input as a non-canonical workspace.
+        identity = actionable_identity(row)
+        if identity is None:
             return None
+        workspace_id, lane_id = identity
         source = self._config.by_id.get(observation.status.host_id)
         if source is None:
             return None
@@ -315,10 +390,10 @@ class MultiSourceUnitBoardRuntime:
             remote_unit_id=remote_unit_id,
             source=source,
             workspace_id=workspace_id,
-            # The un-projected lane, so the preview-to-apply identity comparison
-            # comes from what the source said rather than from a normalized
-            # display value (review j#101928 finding_2).
-            lane_id=row.raw_lane_id,
+            # The source's own lane, already proven to survive the public-safe
+            # projection unchanged, so the preview-to-apply comparison and the
+            # rendered preview agree on one value.
+            lane_id=lane_id,
             project_label=row.project_label,
             observed_at=observation.status.observed_at,
         )
@@ -382,6 +457,10 @@ class SourceWorkspace:
 __all__ = (
     "ANSWER_OK",
     "MAX_REMOTE_PATH_LENGTH",
+    "MAX_SOURCE_OUTPUT_BYTES",
+    "UntrustedJsonError",
+    "bounded_capture_run",
+    "loads_untrusted_json",
     "ANSWER_UNREACHABLE",
     "ANSWER_UNREADABLE",
     "COMMAND_GRACE_SECONDS",

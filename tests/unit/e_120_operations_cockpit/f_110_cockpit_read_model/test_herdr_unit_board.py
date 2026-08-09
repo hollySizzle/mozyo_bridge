@@ -48,6 +48,29 @@ def terminal_width(value: str) -> int:
     )
 
 
+class ModuleSplitIntegrityTests(unittest.TestCase):
+    def test_every_public_callable_resolves_its_type_hints(self) -> None:
+        # Splitting a module can drop an import while leaving the annotation
+        # that needs it: `from __future__ import annotations` keeps the import
+        # working and only tooling that evaluates the hints notices.
+        from typing import get_type_hints
+
+        from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain import (
+            herdr_unit_board,
+            public_safe_text,
+        )
+
+        for module in (herdr_unit_board, public_safe_text):
+            for name in dir(module):
+                member = getattr(module, name)
+                if not callable(member):
+                    continue
+                if getattr(member, "__module__", None) != module.__name__:
+                    continue
+                with self.subTest(module=module.__name__, member=name):
+                    get_type_hints(member)
+
+
 class UnitBoardReadModelTests(unittest.TestCase):
     def test_groups_pair_and_never_exposes_transient_pane_ids(self) -> None:
         snapshot = build_unit_board(

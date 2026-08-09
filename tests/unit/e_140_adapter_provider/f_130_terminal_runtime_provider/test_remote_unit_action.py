@@ -164,6 +164,41 @@ class PreviewTests(unittest.TestCase):
 
         self.assertEqual(preview.reason, REASON_WORKSPACE_UNRESOLVED)
 
+    def test_a_non_canonical_redmine_anchor_refuses(self) -> None:
+        # str.isdigit() is true for full-width digits, and the preview projects
+        # them to ASCII while the delivery would send the raw string — so the
+        # operator would confirm one anchor and another would be delivered.
+        action, runtime, runner = rail()
+        unit_id = remote_unit_id(runtime)
+        before = len(runner.argvs)
+
+        for name, override in (
+            ("full-width issue", {"issue": "１５１３８"}),
+            ("full-width journal", {"journal": "１０１９８１"}),
+            ("leading zero", {"issue": "0015138"}),
+            ("over-long", {"issue": "1" * 120}),
+            ("zero", {"issue": "0"}),
+        ):
+            with self.subTest(case=name):
+                preview = action.preview(request(unit_id, **override))
+
+                self.assertEqual(preview.reason, REASON_INVALID_REQUEST)
+        self.assertEqual(len(runner.argvs), before)
+
+    def test_a_canonical_anchor_is_shown_and_delivered_byte_identical(self) -> None:
+        action, runtime, runner = rail()
+        unit_id = remote_unit_id(runtime)
+
+        preview = action.preview(request(unit_id, issue="999999999", journal="1"))
+        action.apply(preview)
+
+        self.assertEqual(preview.as_payload()["issue"], "999999999")
+        command = next(
+            argv[-1] for argv in runner.argvs if "project-gateway" in argv[-1]
+        )
+        self.assertIn("--issue 999999999", command)
+        self.assertIn("--journal 1", command)
+
     def test_malformed_requests_refuse_before_any_observation(self) -> None:
         action, runtime, runner = rail()
         unit_id = remote_unit_id(runtime)
@@ -187,6 +222,20 @@ class PreviewTests(unittest.TestCase):
                 self.assertEqual(preview.reason, REASON_INVALID_REQUEST)
         self.assertEqual(len(runner.argvs), before)
 
+
+    def test_the_rendered_preview_shows_only_projected_values(self) -> None:
+        # The text surface renders from the payload, so a value the projection
+        # would redact cannot print verbatim on the terminal while the JSON
+        # surface hides it.
+        action, runtime, _ = rail()
+        unit_id = remote_unit_id(runtime)
+        preview = action.preview(request(unit_id))
+        payload = preview.as_payload()
+
+        lines = "\n".join(render_preview(preview))
+
+        for key in ("host_label", "project_label", "lane_id", "summary", "target_project"):
+            self.assertIn(str(payload[key]), lines)
 
     def test_previewed_summary_is_byte_identical_to_the_delivered_one(self) -> None:
         action, runtime, runner = rail()

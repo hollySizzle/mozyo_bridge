@@ -21,6 +21,7 @@ connection value, a remote path, or an exception body.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Sequence
@@ -43,6 +44,8 @@ from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.unit_
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_multi_source_unit_board import (
     MultiSourceUnitBoardRuntime,
+    UntrustedJsonError,
+    loads_untrusted_json,
     SourceUnitTarget,
     SourceWorkspace,
 )
@@ -79,6 +82,13 @@ DEFAULT_ACTION_KIND = "design_consultation"
 #: sent in full, so the operator would be confirming something other than what
 #: is delivered.
 MAX_SUMMARY_LENGTH = MAX_PRESENTATION_TEXT
+
+#: A Redmine id as the durable record spells it: ASCII decimal, no leading zero,
+#: and short enough that the preview shows it whole.  ``str.isdigit`` is true for
+#: full-width digits, and the projection folds those to ASCII while the delivery
+#: sends the raw string — so the operator would confirm one anchor and another
+#: would be delivered (review j#102018 finding_4).
+_REDMINE_ID_RE = re.compile(r"^[1-9][0-9]{0,8}$")
 
 _DETAIL_BY_REASON = {
     REASON_UNIT_UNRESOLVED: (
@@ -139,10 +149,13 @@ class RemoteUnitActionRequest:
         if not isinstance(self.unit_id, str) or not self.unit_id:
             return "a Unit selection is required"
         if not all(
-            isinstance(value, str) and value.isdigit()
+            isinstance(value, str) and _REDMINE_ID_RE.fullmatch(value)
             for value in (self.issue, self.journal)
         ):
-            return "a Redmine issue id and journal id are required"
+            return (
+                "a Redmine issue id and journal id are required as plain decimal "
+                "numbers without a leading zero, short enough to show in full"
+            )
         if self.kind not in ACTION_KINDS:
             return "the requested handoff kind is not supported by this route"
         if not isinstance(self.target_project, str) or not self.target_project.strip():
@@ -505,8 +518,8 @@ def _delivery_outcome_record(stdout: object) -> Optional[dict]:
     if not (line.startswith("{") and line.endswith("}")):
         return None
     try:
-        payload = json.loads(line)
-    except (TypeError, ValueError):
+        payload = loads_untrusted_json(line)
+    except UntrustedJsonError:
         return None
     if not isinstance(payload, dict):
         return None
@@ -538,21 +551,30 @@ def _gateway_confirmed_submission(stdout: object) -> bool:
 
 
 def render_preview(preview: RemoteUnitActionPreview) -> Sequence[str]:
-    """Operator-facing lines for one preview.  Public-safe by construction."""
+    """Operator-facing lines for one preview.  Public-safe by construction.
+
+    Rendered from the payload, never from the raw attributes.  Reading the
+    attributes directly meant the JSON surface was projected while the terminal
+    surface was not, so a value the projection would have redacted printed
+    verbatim (review j#102018 finding_1).  Taking both from one place makes them
+    agree by construction.
+    """
+    payload = preview.as_payload()
     if not preview.applicable:
         return (
-            f"remote Unit action: refused ({preview.reason})",
-            f"  {preview.detail}",
+            f"remote Unit action: refused ({payload['reason']})",
+            f"  {payload['detail']}",
         )
     return (
         "remote Unit action: preview",
-        f"  source:  {preview.host_label} [{preview.host_kind}]",
-        f"  project: {preview.project_label}",
-        f"  scope:   {preview.target_project}",
-        f"  lane:    {preview.lane_id}",
-        f"  route:   target-source project gateway -> codex",
-        f"  anchor:  Redmine #{preview.issue} j#{preview.journal} ({preview.kind})",
-        f"  summary: {preview.summary}",
+        f"  source:  {payload['host_label']} [{payload['host_kind']}]",
+        f"  project: {payload['project_label']}",
+        f"  scope:   {payload['target_project']}",
+        f"  lane:    {payload['lane_id']}",
+        "  route:   target-source project gateway -> codex",
+        f"  anchor:  Redmine #{payload['issue']} j#{payload['journal']} "
+        f"({payload['kind']})",
+        f"  summary: {payload['summary']}",
         "  the remote worker is never direct-sent; apply re-verifies source, "
         "Unit, and repository identity",
     )

@@ -612,6 +612,39 @@ def aggregate_sources(
     )
 
 
+#: A lane a client may address.  Bounded, and byte-identical to its own
+#: public-safe projection: a lane the projection would rewrite is one whose
+#: displayed form differs from what the source sent, and acting on it means
+#: acting on an identity nobody confirmed (review j#102018 finding_1).
+MAX_ACTION_LANE_LENGTH = 128
+
+
+def actionable_lane_id(row: UnitBoardRow) -> Optional[str]:
+    """Return the row's lane only when the source's own value is addressable.
+
+    The workspace half of this rule landed in R4; the lane half did not, and a
+    lane carrying whitespace, a full-width form, a control codepoint, an
+    absolute path, or a credential shape stayed actionable while displaying as
+    something else entirely.  Both halves are checked here so neither can be
+    fixed without the other.
+    """
+    lane = row.raw_lane_id
+    if not isinstance(lane, str) or not lane or len(lane) > MAX_ACTION_LANE_LENGTH:
+        return None
+    if safe_text(lane, fallback="") != lane:
+        return None
+    return lane
+
+
+def actionable_identity(row: UnitBoardRow) -> Optional[tuple[str, str]]:
+    """The row's ``(workspace_id, lane_id)`` when BOTH halves are addressable."""
+    workspace_id = actionable_workspace_id(row)
+    lane_id = actionable_lane_id(row)
+    if workspace_id is None or lane_id is None:
+        return None
+    return (workspace_id, lane_id)
+
+
 def actionable_workspace_id(row: UnitBoardRow) -> Optional[str]:
     """Return the row's workspace id only when the SOURCE sent a whole identity.
 
@@ -692,6 +725,9 @@ def format_multi_source_board(snapshot: UnitBoardSnapshot, *, width: int = 120) 
 
 __all__ = (
     "DEFAULT_SOURCE_FRESHNESS_SECONDS",
+    "MAX_ACTION_LANE_LENGTH",
+    "actionable_identity",
+    "actionable_lane_id",
     "MAX_REMOTE_CLOCK_SKEW_SECONDS",
     "MAX_REMOTE_PAYLOAD_AGE_SECONDS",
     "remote_payload_freshness",
