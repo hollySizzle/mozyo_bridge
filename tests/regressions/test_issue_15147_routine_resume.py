@@ -146,6 +146,15 @@ ESCALATION_RECORD_ANCHOR = (
     "**詳細調査の最初の操作より前に** durable record へ記録する。事後の記録は本条件を"
     "満たさない"
 )
+# The escalation record is a structured decision, not any journal that happens to be in
+# the turn (#15147 review j#101761 finding 1).
+ESCALATION_RECORD_CONTENT_ANCHOR = (
+    "記録は **該当条件を名指しし**、何を確認するために何を読むかを含む"
+)
+ESCALATION_RECORD_NOT_GENERIC_ANCHOR = "通常の再開判断 journal はこの記録を兼ねない"
+ESCALATION_KEEPS_STEP_ORDER_ANCHOR = (
+    "**詳細調査の解禁は 4 step の順序を解除しない。**"
+)
 NO_FULL_REREAD_ANCHOR = (
     "同一 session の通常再開は、既に読んだ central preset / skill reference の全文再読を"
     " **要求しない**"
@@ -166,6 +175,12 @@ class ResumePolicy:
     # True when the doc requires the escalation decision to be recorded BEFORE the first
     # detailed-investigation operation, not merely somewhere in the turn.
     escalation_record_precedes_investigation: bool
+    # True when the doc requires that record to name the applicable condition and the
+    # read scope, so a generic resume journal cannot stand in for it.
+    escalation_record_is_structured: bool
+    # True when the doc says unlocking detailed investigation does NOT dissolve the
+    # ordering among the four steps (no action before the decision is recorded).
+    escalation_preserves_step_order: bool
 
     @classmethod
     def from_workflow_body(cls, body: str) -> "ResumePolicy":
@@ -198,7 +213,24 @@ class ResumePolicy:
             escalation_record_precedes_investigation=(
                 ESCALATION_RECORD_ANCHOR in section
             ),
+            escalation_record_is_structured=(
+                ESCALATION_RECORD_CONTENT_ANCHOR in section
+                and ESCALATION_RECORD_NOT_GENERIC_ANCHOR in section
+            ),
+            escalation_preserves_step_order=(
+                ESCALATION_KEEPS_STEP_ORDER_ANCHOR in section
+            ),
         )
+
+    def pre_decision_steps(self) -> tuple[str, ...]:
+        """The steps that may legitimately precede the decision record.
+
+        Derived from the doc's own step order: everything before ``journal_add``. Every
+        later operation — the high-level action AND any detailed investigation — is
+        gated behind the record.
+        """
+
+        return self.normal_path[: self.normal_path.index("journal_add")]
 
 
 def _resolve(text: str, anchors: Mapping[str, str], label: str) -> str:
@@ -223,10 +255,18 @@ class ResumeOp:
 
     ``target`` identifies *what* a high-level action acted on, so a re-send of an
     already-delivered dispatch is distinguishable from a second, different action.
+
+    ``declares_condition`` / ``read_scope`` are only meaningful on a ``journal_add``. They
+    carry the two things the doc requires an escalation decision to state — which of the
+    four conditions applies, and what will be read to check what. A journal that leaves
+    them blank is an ordinary resume decision, not permission to investigate
+    (#15147 review j#101761 finding 1).
     """
 
     kind: str
     target: str = ""
+    declares_condition: str = ""
+    read_scope: str = ""
 
 
 @dataclass(frozen=True)
@@ -264,30 +304,52 @@ def evaluate_resume_turn(
             violations.append(f"duplicate_action_resend:{op.target}")
         seen_actions.add(op.target)
 
-    # The first operation outside the four steps IS the start of detailed investigation,
-    # whichever mode the turn claimed.
-    first_investigation = next(
-        (i for i, op in enumerate(history) if op.kind not in policy.normal_path),
-        None,
-    )
-
     if escalated:
         # Detailed investigation is unlocked, but the decision to leave the routine path
-        # is a durable-record obligation that PRECEDES the investigation: the record is
-        # the permission to investigate, not a summary of it.
-        recorded_at = next(
-            (i for i, op in enumerate(history) if op.kind == "journal_add"), None
+        # is a durable-record obligation that PRECEDES it: the record is the permission
+        # to investigate, not a summary of it. A generic resume journal does not qualify
+        # — the record must name the applicable condition and the read scope.
+        decision_at: int | None = None
+        for i, op in enumerate(history):
+            if op.kind != "journal_add":
+                continue
+            if not policy.escalation_record_is_structured:
+                decision_at = i
+                break
+            if not op.declares_condition:
+                continue
+            if op.declares_condition != escalation:
+                violations.append(
+                    f"escalation_decision_condition_mismatch:{op.declares_condition}"
+                )
+                continue
+            if not op.read_scope:
+                violations.append("escalation_decision_missing_read_scope")
+                continue
+            decision_at = i
+            break
+
+        # Everything after step 2 is gated behind the record: the detailed investigation
+        # AND the high-level action. Unlocking investigation does not dissolve the order
+        # among the four steps.
+        gated_kinds = (
+            policy.pre_decision_steps()
+            if policy.escalation_preserves_step_order
+            else policy.normal_path
         )
-        if recorded_at is None:
-            violations.append("escalation_not_recorded")
+        first_gated = next(
+            (i for i, op in enumerate(history) if op.kind not in gated_kinds), None
+        )
+
+        if decision_at is None:
+            violations.append("escalation_decision_not_recorded")
         elif (
             policy.escalation_record_precedes_investigation
-            and first_investigation is not None
-            and recorded_at > first_investigation
+            and first_gated is not None
+            and decision_at > first_gated
         ):
             violations.append(
-                f"escalation_recorded_after_investigation:"
-                f"{history[first_investigation].kind}"
+                f"escalation_decision_after:{history[first_gated].kind}"
             )
         return ResumeVerdict(conforms=not violations, violations=tuple(violations))
 
@@ -398,12 +460,25 @@ UNREAD_RESUME = (
     ResumeOp("high_level_action", "sublane dispatch-worker --execute"),
 )
 
-# Under an escalation condition recorded BEFORE the first detailed operation, the same
-# investigation stops being a violation.
+ESCALATION_CONDITION = "lane_unknown_or_ambiguous"
+
+
+def _escalation_decision(condition: str = ESCALATION_CONDITION) -> ResumeOp:
+    """A journal that states the condition AND what will be read to check what."""
+
+    return ResumeOp(
+        "journal_add",
+        "#15147 escalation decision",
+        declares_condition=condition,
+        read_scope="lane resolution: sublane list output + worktree binding",
+    )
+
+
+# A structured escalation decision recorded BEFORE anything it unlocks.
 ESCALATED_INVESTIGATION = (
     ResumeOp("ticket_read", "#15147 j#101693"),
     ResumeOp("high_level_status", "sublane list --repo ."),
-    ResumeOp("journal_add", "#15147 escalation decision"),
+    _escalation_decision(),
     ResumeOp("source_full_scan", "grep -r src/"),
     ResumeOp("doc_full_dump", "vibes/docs/logics/*.md"),
     ResumeOp("help_lookup", "sublane --help"),
@@ -420,7 +495,45 @@ ESCALATION_RECORDED_AFTERWARDS = (
     ResumeOp("source_full_scan", "grep -r src/"),
     ResumeOp("doc_full_dump", "vibes/docs/logics/*.md"),
     ResumeOp("raw_herdr_or_tmux", "herdr agent read"),
-    ResumeOp("journal_add", "#15147 escalation decision"),
+    _escalation_decision(),
+)
+
+# The two histories #15147 review j#101761 finding 1 reported as wrongly conforming.
+# (1) An ordinary resume journal standing in for an escalation decision.
+GENERIC_JOURNAL_THEN_INVESTIGATION = (
+    ResumeOp("ticket_read", "#15147 j#101693"),
+    ResumeOp("high_level_status", "sublane list --repo ."),
+    ResumeOp("journal_add", "resume decision only"),
+    ResumeOp("source_full_scan", "grep -r src/"),
+)
+
+# (2) The high-level action taken before the decision was recorded. Escalation unlocks
+# investigation, not a reordering of the four steps.
+ESCALATED_ACTION_BEFORE_JOURNAL = (
+    ResumeOp("ticket_read", "#15147 j#101693"),
+    ResumeOp("high_level_status", "sublane list --repo ."),
+    ResumeOp("high_level_action", "sublane dispatch-worker --execute"),
+    _escalation_decision(),
+)
+
+# A decision naming a condition other than the one the turn escalated under.
+ESCALATION_CONDITION_MISMATCH = (
+    ResumeOp("ticket_read", "#15147 j#101693"),
+    ResumeOp("high_level_status", "sublane list --repo ."),
+    _escalation_decision("destructive_privilege_or_secret"),
+    ResumeOp("source_full_scan", "grep -r src/"),
+)
+
+# A decision that names the condition but never says what it will read.
+ESCALATION_WITHOUT_READ_SCOPE = (
+    ResumeOp("ticket_read", "#15147 j#101693"),
+    ResumeOp("high_level_status", "sublane list --repo ."),
+    ResumeOp(
+        "journal_add",
+        "#15147 escalation decision",
+        declares_condition=ESCALATION_CONDITION,
+    ),
+    ResumeOp("source_full_scan", "grep -r src/"),
 )
 
 
@@ -453,6 +566,9 @@ class RoutineResumeStandardDocTest(unittest.TestCase):
                     ESCALATION_RECORD_ANCHOR,
                     CLOSED_SET_ANCHOR,
                     NAMED_LIST_IS_NOT_RESIDUE_ANCHOR,
+                    ESCALATION_RECORD_CONTENT_ANCHOR,
+                    ESCALATION_RECORD_NOT_GENERIC_ANCHOR,
+                    ESCALATION_KEEPS_STEP_ORDER_ANCHOR,
                 ):
                     self.assertIn(anchor, section, msg=f"{label} lost {anchor!r}")
 
@@ -486,6 +602,21 @@ class RoutineResumeStandardDocTest(unittest.TestCase):
 
         policy = ResumePolicy.from_workflow_body(_bodies()[0][1])
         self.assertTrue(policy.escalation_record_precedes_investigation)
+
+    def test_escalation_record_is_a_structured_decision(self) -> None:
+        """#15147 review j#101761 finding 1: a generic journal is not permission."""
+
+        policy = ResumePolicy.from_workflow_body(_bodies()[0][1])
+        self.assertTrue(policy.escalation_record_is_structured)
+
+    def test_escalation_does_not_dissolve_the_step_order(self) -> None:
+        """#15147 review j#101761 finding 1: step 3 still precedes step 4."""
+
+        policy = ResumePolicy.from_workflow_body(_bodies()[0][1])
+        self.assertTrue(policy.escalation_preserves_step_order)
+        self.assertEqual(
+            policy.pre_decision_steps(), ("ticket_read", "high_level_status")
+        )
 
     def test_standard_is_not_duplicated_into_other_rule_surfaces(self) -> None:
         """One rule, one home (#15147 implementation policy / ``## Workflow docs の正本境界``)."""
@@ -587,7 +718,11 @@ class RoutineResumeOperationHistoryTest(unittest.TestCase):
     def test_each_documented_condition_unlocks_detailed_investigation(self) -> None:
         for condition in sorted(self.policy.escalation_conditions):
             with self.subTest(condition=condition):
-                verdict = self._verdict(ESCALATED_INVESTIGATION, escalation=condition)
+                history = tuple(
+                    _escalation_decision(condition) if op.kind == "journal_add" else op
+                    for op in ESCALATED_INVESTIGATION
+                )
+                verdict = self._verdict(history, escalation=condition)
                 self.assertTrue(verdict.conforms, msg=verdict.violations)
 
     def test_undocumented_condition_does_not_unlock_investigation(self) -> None:
@@ -600,29 +735,58 @@ class RoutineResumeOperationHistoryTest(unittest.TestCase):
 
     def test_escalation_must_be_recorded_on_the_durable_record(self) -> None:
         unrecorded = tuple(op for op in ESCALATED_INVESTIGATION if op.kind != "journal_add")
-        verdict = self._verdict(
-            unrecorded, escalation="durable_state_conflict_or_unreadable"
-        )
+        verdict = self._verdict(unrecorded, escalation=ESCALATION_CONDITION)
         self.assertFalse(verdict.conforms)
-        self.assertIn("escalation_not_recorded", verdict.violations)
+        self.assertIn("escalation_decision_not_recorded", verdict.violations)
 
     def test_recording_the_escalation_afterwards_is_rejected(self) -> None:
         verdict = self._verdict(
-            ESCALATION_RECORDED_AFTERWARDS,
-            escalation="durable_state_conflict_or_unreadable",
+            ESCALATION_RECORDED_AFTERWARDS, escalation=ESCALATION_CONDITION
+        )
+        self.assertFalse(verdict.conforms)
+        self.assertIn("escalation_decision_after:source_full_scan", verdict.violations)
+
+    def test_a_generic_resume_journal_is_not_an_escalation_decision(self) -> None:
+        """#15147 review j#101761 finding 1, reported history (1)."""
+
+        verdict = self._verdict(
+            GENERIC_JOURNAL_THEN_INVESTIGATION, escalation=ESCALATION_CONDITION
+        )
+        self.assertFalse(verdict.conforms)
+        self.assertIn("escalation_decision_not_recorded", verdict.violations)
+
+    def test_escalation_does_not_permit_acting_before_recording(self) -> None:
+        """#15147 review j#101761 finding 1, reported history (2)."""
+
+        verdict = self._verdict(
+            ESCALATED_ACTION_BEFORE_JOURNAL, escalation=ESCALATION_CONDITION
+        )
+        self.assertFalse(verdict.conforms)
+        self.assertIn("escalation_decision_after:high_level_action", verdict.violations)
+
+    def test_decision_naming_a_different_condition_is_rejected(self) -> None:
+        verdict = self._verdict(
+            ESCALATION_CONDITION_MISMATCH, escalation=ESCALATION_CONDITION
         )
         self.assertFalse(verdict.conforms)
         self.assertIn(
-            "escalation_recorded_after_investigation:source_full_scan",
+            "escalation_decision_condition_mismatch:destructive_privilege_or_secret",
             verdict.violations,
         )
+
+    def test_decision_without_a_read_scope_is_rejected(self) -> None:
+        verdict = self._verdict(
+            ESCALATION_WITHOUT_READ_SCOPE, escalation=ESCALATION_CONDITION
+        )
+        self.assertFalse(verdict.conforms)
+        self.assertIn("escalation_decision_missing_read_scope", verdict.violations)
 
     def test_escalation_still_does_not_permit_a_blind_resend(self) -> None:
         history = ESCALATED_INVESTIGATION + (
             ResumeOp("high_level_action", "sublane dispatch-worker --execute"),
             ResumeOp("high_level_action", "sublane dispatch-worker --execute"),
         )
-        verdict = self._verdict(history, escalation="lane_unknown_or_ambiguous")
+        verdict = self._verdict(history, escalation=ESCALATION_CONDITION)
         self.assertFalse(verdict.conforms)
         self.assertIn(
             "duplicate_action_resend:sublane dispatch-worker --execute",
