@@ -190,6 +190,12 @@ workflow truthへ昇格させず、desired / observed を区別した public-saf
 として読む。operator-local UX state、plugin action、engine-first sequence の境界は
 `herdr-plugin-presentation-consumer-boundary.md` を正本とする。
 
+Redmine #15122 の Unit boardから行う左右移動・幅変更は、既存live geometryへの
+preview-firstな1回操作であり、本DB、repo-local config、managed eventへ書き込まない。
+したがって再起動後の恒久配置を更新する操作ではない。永続化するlayout editorを追加する
+場合は、operator-local current tableの明示transaction、preview、競合検出、rollbackを
+別taskで設計し、live操作の成功をDB更新の暗黙承認にしない。
+
 #### repo-local config boundary (#12254)
 
 Project Group / sublane placement の repo-local config は、runtime state の保存先では

@@ -33,9 +33,11 @@ mozyo-bridge herdr unit-board interact
   Herdr display metadataを更新する。agent終了後にshellへ戻ってagent inventoryから
   消えたpaneも、残存するnamespaced `mozyo_*` tokenから検出してclearする。
 - `watch` は plugin-owned popup 内の terminal board を定期更新する。
-- `interact` は同じpublic-safe Unit一覧をキーボードで選択し、`p`で専用2-pane
-  pairの配置をpreview、previewが実行可能な場合だけ`a`で明示applyする。`j` / `k`は
-  選択、`r`は再読取、`q`は変更せず閉じる。
+- `interact` は同じpublic-safe Unit一覧をキーボードで選択する。`p`は専用2-pane
+  pairの配置、`h` / `l`はshared tab内のUnit列の左 / 右移動、`-` / `+`はUnit列の
+  相対幅の縮小 / 拡大をpreviewする。previewが実行可能な場合だけ`a`で明示applyする。
+  previewは選択Unitの現在位置→目標位置と、実測幅share→目標幅shareを表示する。
+  `j` / `k`は選択、`r`は再読取、`q`は変更せず閉じる。
 - `interact` の選択keyは完全なidentityから作ったopaque `unit_id`とし、表示用に
   切り詰めた`workspace_id` / `lane_id`をaction入力へ戻さない。preview直前にlive
   inventoryから`unit_id`を完全なidentityへ一意に再解決できない場合はzero-writeで拒否する。
@@ -96,6 +98,9 @@ packaged manifest は `herdr-plugins/mozyo-unit-board/herdr-plugin.toml` に置�
 - agent input、Redmine、workflow state、mozyo state DBは変更しない。pane geometryの変更は
   pluginがraw pane APIを呼ばず、#14608のpreview-first serviceへUnit identityを渡した
   明示apply時だけ行う。serviceはapply直前にidentity・generation・geometryを再照合する。
+- Unit列の左右移動と幅変更はlive geometryだけを1段階変更する。repo-local configと
+  operator-local presentation stateへ暗黙保存しないため、再起動後の恒久配置は既存の
+  `position` / `relative_width` 宣言が決める。
 
 plugin は user-global に install / enable されるため、reviewed commit pin と manifest
 identity を Herdr plugin policy で検査してから導入する。local development link は
@@ -121,14 +126,21 @@ Redmine #15114 は識別表示のみを実装する。pane の配置変更は #1
 preview-first safe action が所有する。
 
 Redmine #15116 の最初の操作sliceは、#14608が扱う**1つの専用2-pane Unit内**の
-split / provider順 / ratioを宣言済み設定へ収束する。shared tab内の複数Unit列の
-swap / move / reorderやdrag-and-dropを実装済みとは扱わない。
+split / provider順 / ratioを宣言済み設定へ収束する。Redmine #15122 はその次の
+操作sliceとして、shared tab内の既存full-pair Unit列をkeyboardで選び、左右へ1列移動、
+または相対幅を1段階変更するpreview-first actionを実装する。drag-and-drop、別tab / 別
+workspaceへの移動、任意座標指定、配置の暗黙保存は実装済みとは扱わない。
 
 - 同一 tab 内の入替は Herdr `pane swap`、別 tab / workspace への移動は `pane move`
   という異なる操作である。
 - apply 前に live pane と managed Unit identity を再照合する。
-- native plugin API に drag-and-drop chrome はないため、最初の操作UIは keyboard で
-  source / destination を選び、preview 後に実行する。
+- native plugin API にdrag-and-dropの操作面はないため、現在の操作UIはkeyboardで
+  Unitと1段階の変更を選び、preview後に実行する。
+- shared tabの全managed Unitが完全な2-pane列として同じHerdr workspaceに存在しない
+  場合は変更しない。apply時にはUnit identity、generation、tab、geometryを再照合する。
+- repo-local `position` / `relative_width` が欠落・不正でも、one-shot actionのpreviewは
+  現在のlive順と実測幅だけから作る。preview形成中に順序・幅・authorityが変わった場合も
+  zero-writeで拒否し、古い観測から別の隣接Unitを動かさない。
 - `layout apply` は live process と scrollback を作り直しうるため、既存 pane の自由な
   移動手段として使わない。
 

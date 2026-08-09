@@ -26,6 +26,20 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     PlacementPlan,
     PlacementTarget,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_placement import (
+    COLUMN_MOVE_LEFT,
+    COLUMN_MOVE_RIGHT,
+    PLACEMENT_APPLIED,
+    PREVIEW_MATCHED,
+    PREVIEW_READY,
+    PREVIEW_REFUSED,
+    REASON_ADJUSTMENT_INVALID,
+    ProjectColumnPlacementPreview,
+    ProjectColumnPlacementResult,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_plan import (
+    UnitColumnKey,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_unit_board_placement_ui import (
     HerdrUnitBoardPlacementUI,
 )
@@ -136,11 +150,67 @@ class FakePlacement:
         return self.result
 
 
-def run_ui(board, placement, commands: str) -> tuple[int, str]:
+class FakeColumnPlacement:
+    def __init__(
+        self,
+        plan: ProjectColumnPlacementPreview,
+        result: ProjectColumnPlacementResult | None = None,
+    ) -> None:
+        self.plan = plan
+        self.result = result
+        self.preview_calls: list[tuple[str, str]] = []
+        self.apply_calls: list[ProjectColumnPlacementPreview] = []
+        self.raise_preview = False
+        self.raise_apply = False
+
+    def preview(
+        self, unit_id: str, adjustment: str
+    ) -> ProjectColumnPlacementPreview:
+        self.preview_calls.append((unit_id, adjustment))
+        if self.raise_preview:
+            raise RuntimeError("/synthetic/private/column-preview")
+        return self.plan
+
+    def apply(
+        self, preview: ProjectColumnPlacementPreview
+    ) -> ProjectColumnPlacementResult:
+        self.apply_calls.append(preview)
+        if self.raise_apply:
+            raise RuntimeError("/synthetic/private/column-apply")
+        if self.result is None:
+            raise AssertionError("test did not provide a column apply result")
+        return self.result
+
+
+def column_ready() -> ProjectColumnPlacementPreview:
+    key_a = UnitColumnKey(WORKSPACE_A, "default")
+    key_b = UnitColumnKey(WORKSPACE_B, "default")
+    return ProjectColumnPlacementPreview(
+        PREVIEW_READY,
+        REASON_OK,
+        "Unit-column adjustment is ready",
+        current_order=(key_a, key_b),
+        desired_order=(key_b, key_a),
+        operations=(COLUMN_MOVE_RIGHT, "reorder_unit_columns"),
+        evidence=object(),  # type: ignore[arg-type]
+        selected_current_position=1,
+        selected_target_position=2,
+        selected_current_width_share=0.4,
+        selected_target_width_share=0.4,
+    )
+
+
+def run_ui(
+    board,
+    placement,
+    commands: str,
+    column_placement=None,
+) -> tuple[int, str]:
     output = StringIO()
     result = HerdrUnitBoardPlacementUI(
         board,
         placement,
+        column_placement,
         input_stream=StringIO(commands),
         output_stream=output,
     ).run()
@@ -351,6 +421,99 @@ class HerdrUnitBoardPlacementUITests(unittest.TestCase):
                 self.assertIn("unavailable or has no managed Units", output)
                 self.assertEqual(placement.preview_calls, [])
                 self.assertEqual(placement.apply_calls, [])
+
+    def test_column_move_preview_then_apply_uses_opaque_selected_unit(self) -> None:
+        plan = column_ready()
+        after = ProjectColumnPlacementPreview(
+            PREVIEW_MATCHED,
+            REASON_OK,
+            "matched",
+            current_order=plan.desired_order,
+            desired_order=plan.desired_order,
+        )
+        columns = FakeColumnPlacement(
+            plan,
+            ProjectColumnPlacementResult(
+                PLACEMENT_APPLIED, REASON_OK, "measured", plan, after
+            ),
+        )
+        unit = row(
+            WORKSPACE_A,
+            "accounting",
+            "w1:p-private",
+            unit_id="unit-opaque-a",
+        )
+
+        result, output = run_ui(
+            FakeBoard(snapshot(unit)),
+            FakePlacement(ready(WORKSPACE_A)),
+            "l\na\nq\n",
+            columns,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            columns.preview_calls, [("unit-opaque-a", COLUMN_MOVE_RIGHT)]
+        )
+        self.assertEqual(columns.apply_calls, [plan])
+        self.assertIn("preview: status=ready", output)
+        self.assertIn("selected Unit: position=1/2 -> 2/2", output)
+        self.assertIn("selected Unit width share: 0.4 -> 0.4", output)
+        self.assertIn("apply: status=applied", output)
+        self.assertNotIn("w1:p-private", output)
+
+    def test_column_refusal_and_selection_change_are_zero_write(self) -> None:
+        refused = ProjectColumnPlacementPreview(
+            PREVIEW_REFUSED,
+            REASON_ADJUSTMENT_INVALID,
+            "not applicable",
+        )
+        units = snapshot(
+            row(WORKSPACE_A, "accounting", "w1:p1", unit_id="unit-a"),
+            row(WORKSPACE_B, "it-operations", "w1:p2", unit_id="unit-b"),
+        )
+        for plan, commands in (
+            (refused, "h\na\nq\n"),
+            (column_ready(), "h\nj\na\nq\n"),
+            (column_ready(), "h\nr\na\nq\n"),
+        ):
+            with self.subTest(commands=commands):
+                columns = FakeColumnPlacement(plan)
+                result, _ = run_ui(
+                    FakeBoard(units, units),
+                    FakePlacement(ready(WORKSPACE_A)),
+                    commands,
+                    columns,
+                )
+                self.assertEqual(result, 0)
+                self.assertEqual(columns.apply_calls, [])
+
+    def test_column_apply_exception_is_partial_and_not_blindly_retried(self) -> None:
+        columns = FakeColumnPlacement(column_ready())
+        columns.raise_apply = True
+
+        result, output = run_ui(
+            FakeBoard(snapshot(row(WORKSPACE_A, "accounting", "w1:p1"))),
+            FakePlacement(ready(WORKSPACE_A)),
+            "-\na\nq\n",
+            columns,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(columns.apply_calls), 1)
+        self.assertIn("apply: status=partial_failure", output)
+        self.assertIn("Do not retry", output)
+        self.assertNotIn("/synthetic/private/column-apply", output)
+
+    def test_column_actions_missing_from_runtime_are_reported_without_write(self) -> None:
+        result, output = run_ui(
+            FakeBoard(snapshot(row(WORKSPACE_A, "accounting", "w1:p1"))),
+            FakePlacement(ready(WORKSPACE_A)),
+            "+\na\nq\n",
+        )
+
+        self.assertEqual(result, 0)
+        self.assertIn("Unit-column placement actions are unavailable", output)
 
 
 if __name__ == "__main__":  # pragma: no cover

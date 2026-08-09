@@ -25,6 +25,16 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     PlacementApplyResult,
     PlacementPlan,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_placement import (
+    COLUMN_MOVE_LEFT,
+    COLUMN_MOVE_RIGHT,
+    COLUMN_WIDTH_DECREASE,
+    COLUMN_WIDTH_INCREASE,
+    PLACEMENT_PARTIAL,
+    PREVIEW_REFUSED,
+    ProjectColumnPlacementPreview,
+    ProjectColumnPlacementResult,
+)
 
 
 class UnitBoardSource(Protocol):
@@ -39,6 +49,16 @@ class PairPlacementActions(Protocol):
     def apply(
         self, workspace_id: str, lane_id: str = "default"
     ) -> PlacementApplyResult: ...
+
+
+class ColumnPlacementActions(Protocol):
+    def preview(
+        self, unit_id: str, adjustment: str
+    ) -> ProjectColumnPlacementPreview: ...
+
+    def apply(
+        self, preview: ProjectColumnPlacementPreview
+    ) -> ProjectColumnPlacementResult: ...
 
 
 def _ratio(value: object) -> str:
@@ -98,6 +118,37 @@ def _result_lines(result: PlacementApplyResult) -> tuple[str, ...]:
     return lines
 
 
+def _column_plan_lines(plan: ProjectColumnPlacementPreview) -> tuple[str, ...]:
+    lines = (
+        f"preview: status={safe_text(plan.status)} reason={safe_text(plan.reason)}",
+        f"detail: {safe_text(plan.detail)}",
+        f"current: columns={len(plan.current_order)}",
+        f"target: columns={len(plan.desired_order)}",
+    )
+    if (
+        plan.selected_current_position is not None
+        and plan.selected_target_position is not None
+    ):
+        lines += (
+            "selected Unit: "
+            f"position={plan.selected_current_position}/{len(plan.current_order)} "
+            f"-> {plan.selected_target_position}/{len(plan.desired_order)}",
+        )
+    if (
+        plan.selected_current_width_share is not None
+        and plan.selected_target_width_share is not None
+    ):
+        lines += (
+            "selected Unit width share: "
+            f"{_ratio(plan.selected_current_width_share)} "
+            f"-> {_ratio(plan.selected_target_width_share)}",
+        )
+    return lines + (
+        "operations: "
+        + (", ".join(safe_text(item) for item in plan.operations) or "none"),
+    )
+
+
 class HerdrUnitBoardPlacementUI:
     """Small terminal interaction loop owned by the Unit Board plugin pane."""
 
@@ -105,12 +156,14 @@ class HerdrUnitBoardPlacementUI:
         self,
         board: UnitBoardSource,
         placement: PairPlacementActions,
+        column_placement: ColumnPlacementActions | None = None,
         *,
         input_stream: TextIO | None = None,
         output_stream: TextIO | None = None,
     ) -> None:
         self._board = board
         self._placement = placement
+        self._column_placement = column_placement
         self._input = input_stream or sys.stdin
         self._output = output_stream or sys.stdout
 
@@ -147,8 +200,8 @@ class HerdrUnitBoardPlacementUI:
         self,
         snapshot: UnitBoardSnapshot,
         selected: int,
-        preview: PlacementPlan | None,
-        result: PlacementApplyResult | None,
+        preview: PlacementPlan | ProjectColumnPlacementPreview | None,
+        result: PlacementApplyResult | ProjectColumnPlacementResult | None,
         message: str,
     ) -> None:
         if self._output.isatty():
@@ -158,9 +211,17 @@ class HerdrUnitBoardPlacementUI:
             self._output.write(
                 _unit_line(row, selected=index == selected, number=index + 1) + "\n"
             )
-        self._output.write("\nkeys: j/k select, p preview, a apply, r refresh, q close\n")
+        self._output.write(
+            "\nkeys: j/k select, p pair preview, h/l column left/right, "
+            "-/+ width, a apply, r refresh, q close\n"
+        )
         if preview is not None:
-            self._output.write("\n" + "\n".join(_plan_lines(preview)) + "\n")
+            preview_lines = (
+                _column_plan_lines(preview)
+                if isinstance(preview, ProjectColumnPlacementPreview)
+                else _plan_lines(preview)
+            )
+            self._output.write("\n" + "\n".join(preview_lines) + "\n")
         if result is not None:
             self._output.write("\n" + "\n".join(_result_lines(result)) + "\n")
         if message:
@@ -173,10 +234,11 @@ class HerdrUnitBoardPlacementUI:
             self._output.write("Herdr Unit board is unavailable or has no managed Units.\n")
             return 1
         selected = 0
-        preview: PlacementPlan | None = None
+        preview: PlacementPlan | ProjectColumnPlacementPreview | None = None
+        preview_kind = ""
         preview_unit_id: str | None = None
         preview_identity: tuple[str, str] | None = None
-        result: PlacementApplyResult | None = None
+        result: PlacementApplyResult | ProjectColumnPlacementResult | None = None
         message = ""
         while True:
             self._render(snapshot, selected, preview, result, message)
@@ -191,12 +253,14 @@ class HerdrUnitBoardPlacementUI:
             if command in {"j", "down"}:
                 selected = min(selected + 1, len(snapshot.units) - 1)
                 preview = None
+                preview_kind = ""
                 preview_unit_id = None
                 preview_identity = None
                 continue
             if command in {"k", "up"}:
                 selected = max(selected - 1, 0)
                 preview = None
+                preview_kind = ""
                 preview_unit_id = None
                 preview_identity = None
                 continue
@@ -206,6 +270,7 @@ class HerdrUnitBoardPlacementUI:
                 if refreshed is None:
                     message = "Unit board refresh was unavailable; no pane was changed."
                     preview = None
+                    preview_kind = ""
                     preview_unit_id = None
                     preview_identity = None
                     continue
@@ -219,6 +284,7 @@ class HerdrUnitBoardPlacementUI:
                     0,
                 )
                 preview = None
+                preview_kind = ""
                 preview_unit_id = None
                 preview_identity = None
                 continue
@@ -230,41 +296,102 @@ class HerdrUnitBoardPlacementUI:
                     if identity is None:
                         raise LookupError("Unit action identity is unavailable")
                     preview = self._placement.preview(*identity)
+                    preview_kind = "pair"
                     preview_unit_id = selected_unit_id
                     preview_identity = identity
                 except Exception:
                     preview = None
+                    preview_kind = ""
                     preview_unit_id = None
                     preview_identity = None
                     message = "Placement preview is unavailable; no pane was changed."
+                continue
+            column_commands = {
+                "h": COLUMN_MOVE_LEFT,
+                "l": COLUMN_MOVE_RIGHT,
+                "-": COLUMN_WIDTH_DECREASE,
+                "+": COLUMN_WIDTH_INCREASE,
+                "=": COLUMN_WIDTH_INCREASE,
+            }
+            if command in column_commands:
+                if self._column_placement is None:
+                    preview = None
+                    preview_kind = ""
+                    preview_unit_id = None
+                    preview_identity = None
+                    message = "Unit-column placement actions are unavailable."
+                    continue
+                try:
+                    preview = self._column_placement.preview(
+                        selected_unit_id, column_commands[command]
+                    )
+                    preview_kind = "column"
+                    preview_unit_id = selected_unit_id
+                    preview_identity = None
+                except Exception:
+                    preview = None
+                    preview_kind = ""
+                    preview_unit_id = None
+                    preview_identity = None
+                    message = (
+                        "Unit-column preview is unavailable; no pane was changed."
+                    )
                 continue
             if command == "a":
                 if (
                     preview is None
                     or preview_unit_id != selected_unit_id
-                    or preview_identity is None
                     or not preview.can_apply
+                    or (
+                        preview_kind == "pair" and preview_identity is None
+                    )
+                    or preview_kind not in {"pair", "column"}
                 ):
                     message = "Preview this selected Unit before applying a change."
                     continue
                 try:
-                    result = self._placement.apply(*preview_identity)
+                    if preview_kind == "column":
+                        assert self._column_placement is not None
+                        assert isinstance(preview, ProjectColumnPlacementPreview)
+                        result = self._column_placement.apply(preview)
+                    else:
+                        assert preview_identity is not None
+                        result = self._placement.apply(*preview_identity)
                 except Exception:
-                    after = PlacementPlan(
-                        PLAN_REFUSED,
-                        REASON_POSTCONDITION_FAILED,
-                        "post-apply state could not be established",
-                        *preview_identity,
-                    )
-                    result = PlacementApplyResult(
-                        APPLY_PARTIAL,
-                        REASON_POSTCONDITION_FAILED,
-                        "the apply outcome is unknown; panes may have changed",
-                        preview,
-                        after,
-                        "Do not retry; refresh and inspect the selected Unit first.",
-                    )
+                    if preview_kind == "column":
+                        assert isinstance(preview, ProjectColumnPlacementPreview)
+                        after = ProjectColumnPlacementPreview(
+                            PREVIEW_REFUSED,
+                            REASON_POSTCONDITION_FAILED,
+                            "post-apply state could not be established",
+                        )
+                        result = ProjectColumnPlacementResult(
+                            PLACEMENT_PARTIAL,
+                            REASON_POSTCONDITION_FAILED,
+                            "the apply outcome is unknown; panes may have changed",
+                            preview,
+                            after,
+                            "Do not retry; refresh and inspect the selected Unit first.",
+                        )
+                    else:
+                        assert preview_identity is not None
+                        assert isinstance(preview, PlacementPlan)
+                        after = PlacementPlan(
+                            PLAN_REFUSED,
+                            REASON_POSTCONDITION_FAILED,
+                            "post-apply state could not be established",
+                            *preview_identity,
+                        )
+                        result = PlacementApplyResult(
+                            APPLY_PARTIAL,
+                            REASON_POSTCONDITION_FAILED,
+                            "the apply outcome is unknown; panes may have changed",
+                            preview,
+                            after,
+                            "Do not retry; refresh and inspect the selected Unit first.",
+                        )
                 preview = None
+                preview_kind = ""
                 preview_unit_id = None
                 preview_identity = None
                 refreshed = self._snapshot()
@@ -288,6 +415,7 @@ class HerdrUnitBoardPlacementUI:
 
 
 __all__ = (
+    "ColumnPlacementActions",
     "HerdrUnitBoardPlacementUI",
     "PairPlacementActions",
     "UnitBoardSource",
