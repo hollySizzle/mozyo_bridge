@@ -69,17 +69,85 @@ resolve_workflow_step / lane lifecycle store）
 3. **CLI が通す gate を skip せず、CLI が通さない gate を足さない**
    （`cli-mcp-shared-application-api.md` Invariant 2 / 3 を継承）。例:
    `workflow_step_plan` の anchor 規則は CLI の `_anchor_from_args` と同一
-   （`issue` 必須、`journal` 任意）。
+   （`issue` 必須、`journal` 任意）。**backend 選択も判断であり複製しない**
+   （`## Backend 選択の共有`）。
 4. **stdout は MCP frame 専用。** 診断は stderr。frame は改行を含まないことを
    producer 側で検査し、書けない response は internal error frame へ degrade する。
-5. **受理した request には必ず 1 応答。** handler が例外を投げても tool execution
-   error として応答する。notification には応答しない。
+5. **受理した request には必ず 1 応答。notification には 1 応答も返さない。**
+   handler が例外を投げても tool execution error として応答する。notification か否かは
+   `id` member の**存在**で決まり、値では決まらない（`## Lifecycle と id 契約`）。
 6. **outcome は構造化。** caller に stdout prose の parse を要求しない。
-   protocol error（unknown tool / schema 違反）は JSON-RPC error、tool execution
-   error（source 読めず / selector 拒否）は `isError: true` の result。
+   protocol error（unknown tool / schema 違反 / lifecycle 違反）は JSON-RPC error、
+   tool execution error（source 読めず / selector 拒否 / path 契約違反）は
+   `isError: true` の result。
 7. **external plugin API を公開しない**（`plugin-ready-adapter-boundary.md` の
    非目標を継承）。tool catalog は import 時に決まる frozen table で、registration
    hook を持たない。
+8. **tool result に private path と exception 本文を出さない。** 拒否理由は固定
+   token とその固定文言で表す（`## Path 契約`）。
+
+## Lifecycle と id 契約
+
+（review j#102186 finding_1 / finding_4 で確定。）
+
+lifecycle は **3 状態の phase machine** で持つ。bool は「initialize 未着」と
+「initialize 済み・client 未確認」を区別できず、`notifications/initialized` 単独で
+tool surface 全体が開いてしまった。
+
+| phase | 応答する request |
+| --- | --- |
+| `uninitialized` | `initialize` / `ping` のみ。他は fail-closed |
+| `initializing` | `ping` のみ（spec が許す唯一の先行 request） |
+| `ready` | 全 surface |
+
+- `initialize` は `protocolVersion` / `capabilities` / `clientInfo` の存在と型を検証する。
+  欠落・型不一致は `ERROR_INVALID_PARAMS`。2 度目の `initialize` は拒否する
+  （再 negotiation を許すと、既に応答済みの request がどの version で処理されたか
+  client が決定できない）。
+- version negotiation は未対応 version を error にせず server 側 version を返す
+  （MCP lifecycle 仕様どおり。client が使えなければ切断する）。
+- **notification 判定は `id` member の存在で行う。** JSON-RPC 2.0 は
+  「A Notification is a Request object *without an "id" member*」「id ... MUST contain
+  a String, Number, or NULL value *if included*」と定める。したがって明示
+  `"id": null` は Request であり null id で応答する。member 不在のみが notification。
+  値だけで判定すると、client が待っている call を黙って捨てる。
+- `id` の値域は String / Number / NULL。**Boolean は拒否する**（Python では `bool` が
+  `int` の subclass なので `isinstance(x, int)` を素通りする）。
+- id を読めなかった frame（parse error / batch / 非 object / 過大）は null id で応答する。
+  notification だったと仮定して黙るより、request を hang させない方を採る。
+
+## Backend 選択の共有
+
+（review j#102186 finding_2 で確定。）
+
+`workflow step` は repo の `terminal_transport.backend` で lane 解決 rail を選ぶ。
+MCP 側がこれを持たず tmux rail を無条件に呼ぶと、herdr backend の repo では CLI が
+lane を解決できるのに MCP だけ `lane_unresolved` を返す — **backend を知らない第二の
+状態機械**になる。
+
+したがって選択は `f_140_.../application/workflow_step_plan_resolution.py` に 1 本化し、
+`herdr_backend_active()`（CLI と同じ共有 selector）で rail を選んでから各 rail の
+resolver へ委譲する。この entry は **resolution 専用**で、dispatch / delivery /
+lifecycle mutation / durable write を一切行わない。CLI 側の実行経路（store reconcile、
+startup-resume gate、disposition intake、forward leg）はそのまま CLI が持つ。
+
+`resolve_herdr_step_outcome` が Namespace を取る点は CLI 隣接層で終端させ、MCP feature
+へ Namespace を持ち込まない（`cli-mcp-shared-application-api.md`「Namespace はここで
+終端」）。同 resolver が read するのは `repo` のみで、これは test で pin する。
+
+## Path 契約
+
+（review j#102186 finding_3 で確定。）
+
+`docs_resolve` の `paths` は **repo-relative** であり、resolver に渡す前に
+`domain/repo_path.py` が強制する。絶対 path（POSIX / Windows drive / UNC）、`..` で
+repo root を出る path、非文字列、空を閉じた token（`absolute` / `escapes_repo` /
+`not_text` / `empty`）で拒否する。正規化は **字句的**で filesystem を触らない。
+
+拒否文言は **固定**であり exception 本文を使わない。以前は catalog resolver の
+`ValueError` を全文返しており、caller が知らない **server 側の絶対 repo root** が
+structured result に出ていた。catalog / overlay 読み取り失敗も同様に固定 reason と
+exception **型名**のみを返す。
 
 ## Unit 状態 read model（#15162）
 
@@ -125,7 +193,7 @@ record** から導出されたものであって沈黙からではない。durab
 fold 自身が `unknown` を返す。したがって composer 側で `idle` を再度伏せない
 （伏せると durable record が支持している状態を隠す）。
 
-### `blocked` の admission
+### `blocked` の admission と解除
 
 `blocked` は次の 3 つが揃ったときだけ返す。
 
@@ -146,6 +214,25 @@ claim ではなく、workflow state は `unknown` へ degrade し、何が欠け
 callback outcome 部分は含めない。後者は「誰かに伝えたか」という別の問いであり、
 auto-hibernate の evidence bar としては正しいが、「この Unit は blocked か」の
 bar としては過剰で、retry command が不完全な宣言まで `unknown` に落としてしまう。
+
+**解除も同じ強さで扱う**（review j#102186 finding_5 で確定）。宣言を読むだけでは
+「blocked が宣言された」ことしか分からず、それが今も継続しているかは別の事実である。
+2 つの authority を連言する。
+
+1. **journal 走査**（`latest_blocker_claim`）: 新しい順に読み、`blocked` 以外の値を
+   持つ governed `state:` 宣言に当たったらそこで打ち切って `None` を返す。`state:` を
+   持たない無関係な journal は skip する（進捗 log が standing block を隠さないため）。
+   `state:` が相異なる値で重複する記録も打ち切る（2 つのことを言う記録は継続も解除も
+   証明しない）。
+2. **durable fold との一致**（`compose_unit_state`）: 現在の gate fold が `blocked`
+   でなければ claim を落とす。fold が `unknown`（Redmine 読めず）の場合も落とす —
+   継続を確認できない block を「現在の block」として報告しない。
+
+解除済みの block を報告することは、本 US が防ごうとしている欠陥を逆方向に犯すこと
+であり、docstring に設計意図を書いても出力がそう振る舞わなければ意味がない。
+
+claim も他の field と**同じ観測 envelope**（`observed_at` / `freshness`）を持つ。
+live adapter はその read の実時刻を stamp する。
 
 ### Unit identity
 
@@ -220,6 +307,9 @@ behavior 差分（意図的、#15151）: workflow-runtime store の構築が fai
 - `tests/integration/.../test_mcp_stdio_session.py`: lifecycle、未初期化拒否、
   unknown method / tool / malformed 引数、stdout 規律、EOF での終了、
   installed package（`python -m mozyo_bridge mcp serve`）の stdio smoke。
+- `tests/regressions/test_issue_15151_mcp_review_findings.py`: review j#102186 の
+  5 finding を finding ごとの class として pin する（lifecycle bypass / backend
+  選択 / path 契約と leak / id member 契約 / blocked claim の解除と envelope）。
 - `mozyo-bridge health check`、`mozyo-bridge docs validate --repo .`。
 
 ## Next

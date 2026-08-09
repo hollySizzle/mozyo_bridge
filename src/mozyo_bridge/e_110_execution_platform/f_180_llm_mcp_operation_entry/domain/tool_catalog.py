@@ -222,7 +222,11 @@ _DOCS_RESOLVE = ToolDefinition(
                     "type": "array",
                     "minItems": 1,
                     "items": {"type": "string", "minLength": 1},
-                    "description": "Repo-relative paths to resolve documents for.",
+                    "description": (
+                        "Repo-relative paths to resolve documents for. Must stay "
+                        "inside the repo: an absolute path, or one that escapes "
+                        "the repo root via `..`, is refused."
+                    ),
                 },
                 "include_local": {
                     "type": "boolean",

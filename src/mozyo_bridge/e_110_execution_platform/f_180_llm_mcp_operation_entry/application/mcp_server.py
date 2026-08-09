@@ -43,6 +43,7 @@ from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.applica
 from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.domain.jsonrpc import (  # noqa: E501
     ERROR_INTERNAL,
     ERROR_INVALID_PARAMS,
+    ERROR_INVALID_REQUEST,
     ERROR_METHOD_NOT_FOUND,
     ERROR_NOT_INITIALIZED,
     FrameEncodingError,
@@ -89,6 +90,25 @@ SERVER_INSTRUCTIONS = (
 )
 
 
+# --- lifecycle phases (closed) --------------------------------------------- #
+
+#: No usable `initialize` has been received. Only `initialize` and `ping` are
+#: answerable; every other request is refused.
+PHASE_UNINITIALIZED = "uninitialized"
+
+#: `initialize` succeeded; the client has not yet sent `notifications/initialized`.
+#: The spec lets the client send pings here but not ordinary requests.
+PHASE_INITIALIZING = "initializing"
+
+#: The handshake completed. The full surface is available.
+PHASE_READY = "ready"
+
+#: Params `initialize` must carry. Absent / wrong-typed members are refused
+#: rather than defaulted: a client that did not declare its protocol version or
+#: identity has not performed the negotiation the phase exists to perform.
+REQUIRED_INITIALIZE_PARAMS = ("protocolVersion", "capabilities", "clientInfo")
+
+
 class CatalogSurfaceError(RuntimeError):
     """The tool catalog would publish a forbidden capability. Startup aborts."""
 
@@ -105,7 +125,12 @@ class McpServer:
     stdin: IO[str] = field(default_factory=lambda: sys.stdin)
     stdout: IO[str] = field(default_factory=lambda: sys.stdout)
     stderr: IO[str] = field(default_factory=lambda: sys.stderr)
-    _initialized: bool = field(default=False, init=False)
+    #: The lifecycle phase. A three-state machine, not a boolean (review j#102186
+    #: finding_1): a boolean cannot distinguish "initialize has not been sent"
+    #: from "initialize succeeded but the client has not confirmed", so an
+    #: `initialized` notification arriving first flipped it and opened the whole
+    #: tool surface without any handshake.
+    _phase: str = field(default=PHASE_UNINITIALIZED, init=False)
     _negotiated_version: str = field(default=PROTOCOL_VERSION, init=False)
 
     # -- lifecycle ---------------------------------------------------------- #
@@ -143,36 +168,38 @@ class McpServer:
         self._handle_request(parsed)
 
     def _handle_request(self, request: JsonRpcRequest) -> None:
+        """Route one parsed message through the lifecycle phase machine.
+
+        Notifications are separated from requests **first**. That ordering is the
+        finding_1 fix: `initialize` used to be answered before the notification
+        check, so an `initialize` sent without an id — a notification, which the
+        spec says the server MUST NOT reply to — got a response with a null id.
+        """
         method = request.method
-        if method == "initialize":
-            self._send(
-                success_response(request.id, self._initialize(request.arguments()))
-            )
-            return
-        if method == "notifications/initialized":
-            self._initialized = True
-            return
-        if method.startswith("notifications/"):
-            # Unknown notifications are ignored by contract: there is no channel to
-            # report them on, and refusing a session over one would be worse.
-            return
         if request.is_notification:
+            self._handle_notification(method)
             return
 
-        if not self._initialized and method != "ping":
+        if method == "initialize":
+            self._send(self._initialize_response(request))
+            return
+        if method == "ping":
+            # Allowed in every phase: the spec names ping as the one request a
+            # client may send before initialization completes.
+            self._send(success_response(request.id, {}))
+            return
+        if self._phase != PHASE_READY:
             self._send(
                 error_response(
                     request.id,
                     ERROR_NOT_INITIALIZED,
-                    "the session is not initialized; send `initialize` then the "
-                    "`notifications/initialized` notification first",
+                    "the session is not initialized; send `initialize` and then the "
+                    "`notifications/initialized` notification before any other request",
+                    {"phase": self._phase},
                 )
             )
             return
 
-        if method == "ping":
-            self._send(success_response(request.id, {}))
-            return
         if method == "tools/list":
             self._send(success_response(request.id, {"tools": list_tools_payload()}))
             return
@@ -183,21 +210,92 @@ class McpServer:
             error_response(request.id, ERROR_METHOD_NOT_FOUND, f"unknown method: {method}")
         )
 
-    def _initialize(self, params: Mapping[str, Any]) -> dict:
-        requested = str(params.get("protocolVersion", "") or "")
+    def _handle_notification(self, method: str) -> None:
+        """Handle a notification. Never sends anything — that is the contract."""
+        if method == "notifications/initialized":
+            if self._phase == PHASE_INITIALIZING:
+                self._phase = PHASE_READY
+            else:
+                # Out of order: the handshake has not reached this point, and the
+                # notification carries no id to refuse on. Log and stay put rather
+                # than opening the surface — this is exactly the bypass finding_1
+                # reported, where the notification alone was enough.
+                self._log(
+                    "ignored `notifications/initialized` in phase "
+                    f"{self._phase}: `initialize` must succeed first"
+                )
+            return
+        if method == "initialize":
+            self._log(
+                "ignored `initialize` sent as a notification: it is a request and "
+                "must carry an id; the server may not reply to a notification"
+            )
+            return
+        # Unknown notifications are ignored by contract: there is no channel to
+        # report them on, and refusing a session over one would be worse.
+
+    def _initialize_response(self, request: JsonRpcRequest) -> dict:
+        """Validate and apply `initialize`, or refuse it.
+
+        Fail-closed on a malformed or repeated handshake. A second `initialize`
+        is refused rather than silently re-negotiating: the client would have no
+        way to know which version the already-answered requests were served under.
+        """
+        if self._phase != PHASE_UNINITIALIZED:
+            return error_response(
+                request.id,
+                ERROR_INVALID_REQUEST,
+                "the session is already initialized; `initialize` is sent once",
+                {"phase": self._phase},
+            )
+        params = request.arguments()
+        missing = [name for name in REQUIRED_INITIALIZE_PARAMS if name not in params]
+        if missing:
+            return error_response(
+                request.id,
+                ERROR_INVALID_PARAMS,
+                "`initialize` is missing required params",
+                {"missing": missing, "required": list(REQUIRED_INITIALIZE_PARAMS)},
+            )
+        requested = params.get("protocolVersion")
+        if not isinstance(requested, str) or not requested.strip():
+            return error_response(
+                request.id,
+                ERROR_INVALID_PARAMS,
+                '"protocolVersion" must be a non-empty string',
+                {"supported": list(SUPPORTED_PROTOCOL_VERSIONS)},
+            )
+        if not isinstance(params.get("capabilities"), Mapping):
+            return error_response(
+                request.id, ERROR_INVALID_PARAMS, '"capabilities" must be an object'
+            )
+        if not isinstance(params.get("clientInfo"), Mapping):
+            return error_response(
+                request.id, ERROR_INVALID_PARAMS, '"clientInfo" must be an object'
+            )
+
+        # Version negotiation: echo a version we both support, else answer with
+        # ours. The spec makes that the correct reply — the client disconnects if
+        # it cannot use it — rather than an error.
         self._negotiated_version = (
-            requested if requested in SUPPORTED_PROTOCOL_VERSIONS else PROTOCOL_VERSION
+            requested
+            if requested in SUPPORTED_PROTOCOL_VERSIONS
+            else PROTOCOL_VERSION
         )
-        return {
-            "protocolVersion": self._negotiated_version,
-            "capabilities": dict(SERVER_CAPABILITIES),
-            "serverInfo": {
-                "name": SERVER_NAME,
-                "title": "mozyo-bridge local read/plan tools",
-                "version": __version__,
+        self._phase = PHASE_INITIALIZING
+        return success_response(
+            request.id,
+            {
+                "protocolVersion": self._negotiated_version,
+                "capabilities": dict(SERVER_CAPABILITIES),
+                "serverInfo": {
+                    "name": SERVER_NAME,
+                    "title": "mozyo-bridge local read/plan tools",
+                    "version": __version__,
+                },
+                "instructions": SERVER_INSTRUCTIONS,
             },
-            "instructions": SERVER_INSTRUCTIONS,
-        }
+        )
 
     def _tools_call(self, request: JsonRpcRequest) -> dict:
         params = request.arguments()
@@ -277,7 +375,11 @@ def serve_stdio(
 __all__ = (
     "CatalogSurfaceError",
     "McpServer",
+    "PHASE_INITIALIZING",
+    "PHASE_READY",
+    "PHASE_UNINITIALIZED",
     "PROTOCOL_VERSION",
+    "REQUIRED_INITIALIZE_PARAMS",
     "SERVER_CAPABILITIES",
     "SERVER_INSTRUCTIONS",
     "SERVER_NAME",

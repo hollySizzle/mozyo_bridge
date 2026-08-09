@@ -70,19 +70,34 @@ class FrameEncodingError(RuntimeError):
 
 @dataclass(frozen=True)
 class JsonRpcRequest:
-    """One well-formed inbound JSON-RPC request or notification."""
+    """One well-formed inbound JSON-RPC request or notification.
+
+    Notification-ness is decided by whether the ``id`` **member was present**, not
+    by its value (review j#102186 finding_4). The spec is explicit on both halves:
+
+    - "A Notification is a Request object *without an 'id' member*." /
+      "If it is not included it is assumed to be a notification."
+    - "An identifier ... MUST contain a String, Number, or NULL value *if
+      included*."
+
+    So an explicit ``"id": null`` is a **Request** — discouraged, but a Request —
+    and it must be answered with a null-id response. Reading it as a notification
+    silently drops a call the client is waiting on. Value and presence are
+    therefore carried in separate fields: ``id`` alone cannot express the
+    difference between "absent" and "present and null".
+    """
 
     method: str
-    #: ``None`` for a notification. Note that ``id`` may legitimately be the JSON
-    #: value ``null`` only for responses; a request with an explicit ``null`` id is
-    #: treated as a notification, matching the "no response expected" reading.
+    #: The id value. Meaningless unless :attr:`has_id` is true.
     id: Optional[Any] = None
     params: Mapping[str, Any] = None  # type: ignore[assignment]
+    #: Whether the ``id`` member was present in the frame at all.
+    has_id: bool = False
 
     @property
     def is_notification(self) -> bool:
         """True when no response may be sent for this message."""
-        return self.id is None
+        return not self.has_id
 
     def arguments(self) -> Mapping[str, Any]:
         """``params`` as a mapping, never ``None``."""
@@ -95,20 +110,31 @@ class FrameError:
 
     ``id`` is the request id when one could still be recovered from the payload
     (so an invalid-request response can be correlated), else ``None``.
+
+    ``respond`` is decided by the parser, not re-derived from ``id`` here: a
+    refused frame that carried an explicit ``"id": null`` is answerable with a
+    null-id response, and a refused frame that carried no id at all is a
+    notification that must stay unanswered. Those two cases have the same ``id``
+    value and opposite dispositions, so the flag has to be carried.
     """
 
     code: int
     message: str
     id: Optional[Any] = None
+    #: Whether the peer expects an error response. Defaults to ``False`` so a
+    #: caller that forgets to set it stays silent rather than injecting an
+    #: uncorrelatable frame.
+    respond: bool = False
 
     @property
     def respondable(self) -> bool:
         """True when the peer expects an error response for this frame.
 
-        A malformed *notification* gets no response — replying to a message that
-        carried no id would inject an uncorrelatable frame into the stream.
+        A parse error is always answered: the frame could not be read at all, so
+        the peer cannot be assumed to have meant a notification, and leaving it
+        unanswered would hang a request that merely had a syntax error.
         """
-        return self.code == ERROR_PARSE or self.id is not None
+        return self.code == ERROR_PARSE or self.respond
 
 
 def parse_frame(line: str) -> "JsonRpcRequest | FrameError":
@@ -120,43 +146,65 @@ def parse_frame(line: str) -> "JsonRpcRequest | FrameError":
     line, and accepting a batch here would answer with a shape the peer's framing
     does not expect.
     """
+    # For these four the id could not be read at all. The spec's rule for that
+    # case is to answer with a null id rather than stay silent — the frame may
+    # well have been a request, and dropping it would hang the peer.
     if len(line) > MAX_FRAME_CHARS:
         return FrameError(
             ERROR_INVALID_REQUEST,
             f"frame exceeds the {MAX_FRAME_CHARS}-character limit",
+            respond=True,
         )
     try:
         payload = json.loads(line)
     except ValueError as exc:
-        return FrameError(ERROR_PARSE, f"invalid JSON: {exc}")
+        return FrameError(ERROR_PARSE, f"invalid JSON: {exc}", respond=True)
     if isinstance(payload, list):
         return FrameError(
             ERROR_INVALID_REQUEST,
             "JSON-RPC batches are not supported over the stdio transport",
+            respond=True,
         )
     if not isinstance(payload, dict):
-        return FrameError(ERROR_INVALID_REQUEST, "message must be a JSON object")
+        return FrameError(
+            ERROR_INVALID_REQUEST, "message must be a JSON object", respond=True
+        )
 
-    # Recover the id first so every subsequent refusal can be correlated.
+    # Recover the id first so every subsequent refusal can be correlated. Presence
+    # and value are read separately: `"id": null` is a Request with a null id, and
+    # an absent `id` is a notification. Collapsing them loses that distinction.
+    has_id = "id" in payload
     raw_id = payload.get("id")
-    request_id = raw_id if isinstance(raw_id, (str, int)) else None
+    id_is_legal = raw_id is None or (
+        isinstance(raw_id, (str, int)) and not isinstance(raw_id, bool)
+    )
+    request_id = raw_id if (has_id and id_is_legal) else None
 
     if payload.get("jsonrpc") != JSONRPC_VERSION:
         return FrameError(
             ERROR_INVALID_REQUEST,
             f'"jsonrpc" must be exactly "{JSONRPC_VERSION}"',
             request_id,
+            respond=has_id and id_is_legal,
         )
-    if raw_id is not None and request_id is None:
-        # A float / bool / object id is not a legal JSON-RPC id. Refuse rather
-        # than coercing, since the peer correlates on the exact value.
+    if has_id and not id_is_legal:
+        # A float / bool / object id is outside the spec's "String, Number, or
+        # NULL" value set. Refuse rather than coercing: the peer correlates on the
+        # exact value, and `bool` in particular would slip through an
+        # `isinstance(x, int)` check because it subclasses int.
         return FrameError(
-            ERROR_INVALID_REQUEST, '"id" must be a string or an integer', None
+            ERROR_INVALID_REQUEST,
+            '"id" must be a string, a number, or null',
+            None,
+            respond=True,
         )
     method = payload.get("method")
     if not isinstance(method, str) or not method:
         return FrameError(
-            ERROR_INVALID_REQUEST, '"method" must be a non-empty string', request_id
+            ERROR_INVALID_REQUEST,
+            '"method" must be a non-empty string',
+            request_id,
+            respond=has_id,
         )
     params = payload.get("params")
     if params is None:
@@ -164,9 +212,14 @@ def parse_frame(line: str) -> "JsonRpcRequest | FrameError":
     if not isinstance(params, dict):
         # Positional (array) params have no meaning for any MCP method.
         return FrameError(
-            ERROR_INVALID_PARAMS, '"params" must be an object', request_id
+            ERROR_INVALID_PARAMS,
+            '"params" must be an object',
+            request_id,
+            respond=has_id,
         )
-    return JsonRpcRequest(method=method, id=request_id, params=params)
+    return JsonRpcRequest(
+        method=method, id=request_id, params=params, has_id=has_id
+    )
 
 
 def success_response(request_id: Any, result: Mapping[str, Any]) -> dict:

@@ -114,18 +114,25 @@ def latest_blocker_claim(
     observed_at: Optional[str] = None,
     freshness: str = FRESHNESS_UNKNOWN,
 ) -> Optional[BlockedClaim]:
-    """The most recent admissible blocker claim across ``journals``, or ``None``.
+    """The blocker claim **still in force** across ``journals``, or ``None``.
 
     ``journals`` is the ``(journal_id, notes)`` sequence the glance Redmine source
     already produces, so no second fetch and no second journal shape is introduced.
-    Scanned newest-first by journal id, because a later declaration supersedes an
-    earlier one — and a note that is *not* a claim is skipped rather than ending
-    the scan, so an unrelated later journal does not hide a standing block.
+    Scanned newest-first by journal id, because a later record supersedes an
+    earlier one.
 
-    Note what this does and does not answer: it reports the latest *declaration*.
-    Whether a later gate resolved it is workflow truth carried by the issue's gate
-    fold, which is why the caller reports the claim **alongside** the folded
-    workflow state rather than instead of it.
+    A note that is not a governed ``state:`` declaration at all is skipped, so an
+    unrelated later journal (a progress log, a gate note) does not hide a standing
+    block. But a later note that **does** declare a non-blocked ``state:`` is a
+    supersession and ends the scan with ``None`` (review j#102186 finding_5): the
+    earlier version returned the latest *declaration* regardless of what came
+    after, so a Unit that had resumed still reported the old block. An
+    unresolvable duplicate (``state:`` declared twice with differing values) is
+    also a stop — a record that says two things cannot clear or sustain anything.
+
+    This is one of the two authorities on whether a block is current. The other is
+    the caller's folded workflow state, which is checked independently; a claim
+    survives only if both agree.
     """
 
     def _key(pair) -> int:
@@ -136,8 +143,9 @@ def latest_blocker_claim(
 
     pairs = [p for p in (journals or ()) if isinstance(p, (tuple, list)) and len(p) >= 2]
     for journal_id, notes in sorted(pairs, key=_key, reverse=True):
+        body = str(notes or "")
         claim = read_blocker_claim(
-            str(notes or ""),
+            body,
             issue_id=issue_id,
             journal_id=str(journal_id or "").strip(),
             observed_at=observed_at,
@@ -145,7 +153,23 @@ def latest_blocker_claim(
         )
         if claim is not None:
             return claim
+        if _declares_non_blocked_state(body):
+            return None
     return None
+
+
+def _declares_non_blocked_state(notes: str) -> bool:
+    """True when this note declares a governed ``state:`` other than ``blocked``.
+
+    A conflicting duplicate counts too: ``governed_field`` returns its non-string
+    conflict sentinel, and a record that declares the state twice with differing
+    values cannot be read as sustaining the block either.
+    """
+    raw = governed_field(notes or "", "state")
+    if not isinstance(raw, str):
+        return True
+    value = raw.strip().lower()
+    return bool(value) and value != PARK_STATE_BLOCKED
 
 
 __all__ = (

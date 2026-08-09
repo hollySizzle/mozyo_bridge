@@ -83,6 +83,9 @@ _ANOMALY_NONE = "none"
 #: are reported verbatim on the runtime axis and never lifted anywhere else.
 _RUNTIME_UNKNOWN = "unknown"
 
+#: The folded workflow state token that a blocker claim must agree with.
+_STATE_BLOCKED = "blocked"
+
 
 def _utc_now_iso() -> str:
     """The current UTC instant, in the ISO8601 shape the snapshot envelope parses."""
@@ -242,8 +245,24 @@ def compose_unit_state(
     blocked = admit_blocked(
         facts.workflow_blocked, authoritative_sources=WORKFLOW_BLOCKER_SOURCES
     )
+    # The durable fold decides whether the block is STILL in force (review j#102186
+    # finding_5). A claim read from an older journal is evidence that a block was
+    # declared, not that it persists; if the current gate fold says anything other
+    # than `blocked` — including `unknown`, where we cannot confirm it — the claim
+    # is dropped rather than reported next to a contradicting state. Reporting a
+    # resolved block is the same failure this Unit read model exists to prevent,
+    # pointed the other way.
+    superseded_note: Optional[str] = None
+    if blocked is not None and facts.workflow_state != _STATE_BLOCKED:
+        superseded_note = (
+            "a blocker declaration exists in the durable record but the current "
+            "gate no longer reports blocked; the claim is not reported as current"
+        )
+        blocked = None
     workflow = WorkflowAxis(
-        state=_withhold_underivable(workflow_field(facts.workflow_state), blocked),
+        state=_withhold_underivable(
+            workflow_field(facts.workflow_state, superseded_note), blocked
+        ),
         issue_status=workflow_field(facts.issue_status),
         issue_id=workflow_field(facts.issue_id),
         latest_gate=workflow_field(facts.latest_gate),
@@ -571,8 +590,16 @@ class LiveUnitStateSource:
         workflow_readable = bool(snapshot.durable_facts_available)
         claim = None
         if workflow_readable and sources.redmine_source is not None:
+            # The claim carries the SAME observation envelope as the other durable
+            # fields (review j#102186 finding_5): it was read in this call, from the
+            # same live fetch, so it gets this read's timestamp and freshness rather
+            # than the resting `None` / `unknown` the earlier version always returned.
             claim = self._blocker_claim(
-                sources.redmine_source, issue_id, latest_blocker_claim
+                sources.redmine_source,
+                issue_id,
+                latest_blocker_claim,
+                observed_at=observed_at,
+                freshness=FRESHNESS_FRESH,
             )
 
         delivery_source_token = str(row.delivery_source or "")
@@ -614,13 +641,25 @@ class LiveUnitStateSource:
         )
 
     @staticmethod
-    def _blocker_claim(redmine_source, issue_id: str, reader):
-        """Read the latest admissible blocker claim from the issue's journals."""
+    def _blocker_claim(
+        redmine_source,
+        issue_id: str,
+        reader,
+        *,
+        observed_at: Optional[str] = None,
+        freshness: str = FRESHNESS_UNKNOWN,
+    ):
+        """Read the blocker claim still in force, with this read's envelope."""
         try:
             record = redmine_source.read_issue(issue_id)
         except Exception:  # noqa: BLE001 - an unreadable issue yields no claim
             return None
-        return reader(getattr(record, "journals", ()) or (), issue_id=issue_id)
+        return reader(
+            getattr(record, "journals", ()) or (),
+            issue_id=issue_id,
+            observed_at=observed_at,
+            freshness=freshness,
+        )
 
 
 __all__ = (

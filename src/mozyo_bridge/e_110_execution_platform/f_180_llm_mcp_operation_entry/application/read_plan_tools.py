@@ -88,27 +88,54 @@ def run_docs_resolve(
     CLI's job on top of this is rendering (text / markdown / JSON) and printing a
     stderr overlay notice; both are presentation, so the API reports
     ``overlay_applied`` as a field instead.
+
+    The published ``paths`` contract is *repo-relative*, and it is now enforced
+    before the resolver sees anything (review j#102186 finding_3). An absolute or
+    repo-escaping path is refused with a fixed reason token; previously it reached
+    the resolver, whose ``ValueError`` named the server's own absolute repo root
+    and was returned verbatim to the caller.
     """
     from mozyo_bridge.docs_tools import (
         CatalogContext,
         OverlayError,
         resolve_paths_detailed,
     )
+    from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.domain.repo_path import (  # noqa: E501
+        normalize_repo_relative_paths,
+    )
 
-    paths = [str(p) for p in arguments.get("paths", ())]
+    normalized = normalize_repo_relative_paths(list(arguments.get("paths", ()) or ()))
+    if not normalized.ok:
+        return ToolOutcome(
+            payload={
+                "error": "invalid_path",
+                "rejected": [r.as_payload() for r in normalized.rejected],
+                "resolutions": [],
+                "overlay_applied": False,
+            },
+            is_error=True,
+            summary=(
+                f"{len(normalized.rejected)} path(s) are not repo-relative; "
+                "`paths` must stay inside the repo"
+            ),
+        )
+
     include_local = bool(arguments.get("include_local", True))
     catalog_context = CatalogContext.build(
         context.repo_root, context.catalog_path, context.overlay_path
     )
     try:
         results, overlay = resolve_paths_detailed(
-            catalog_context, paths, include_local=include_local
+            catalog_context, list(normalized.accepted), include_local=include_local
         )
-    except OverlayError as exc:
+    except OverlayError:
+        # Fixed reason, never the exception text: a catalog / overlay error message
+        # routinely embeds the absolute path it failed on, and that path is the
+        # server's, not the caller's.
         return ToolOutcome(
             payload={
                 "error": "docs_overlay",
-                "message": str(exc),
+                "reason": "the local catalog overlay could not be read",
                 "resolutions": [],
                 "overlay_applied": False,
             },
@@ -119,7 +146,8 @@ def run_docs_resolve(
         return ToolOutcome(
             payload={
                 "error": "docs_catalog",
-                "message": f"{type(exc).__name__}: {exc}",
+                "reason": "the docs catalog could not be read",
+                "exception": type(exc).__name__,
                 "resolutions": [],
                 "overlay_applied": False,
             },
@@ -132,7 +160,7 @@ def run_docs_resolve(
             "overlay_applied": bool(overlay.applied),
             "overlay_document_count": int(getattr(overlay, "document_count", 0) or 0),
         },
-        summary=f"resolved governing docs for {len(paths)} path(s)",
+        summary=f"resolved governing docs for {len(normalized.accepted)} path(s)",
     )
 
 
@@ -240,92 +268,61 @@ def run_workflow_step_plan(
 ) -> ToolOutcome:
     """Resolve — and only resolve — the next safe workflow step for this lane.
 
-    The lane is resolved from the live runtime the same way ``workflow step``
-    resolves it, then handed to the pure ``resolve_workflow_step`` state machine.
-    The resolved outcome is reported with ``execution="plan_only"``.
+    The lane is resolved through the **shared** ``resolve_step_plan`` entry, which
+    performs the same backend selection the CLI's ``workflow step`` performs
+    (herdr-native resolution under ``terminal_transport.backend: herdr``, the tmux
+    pane rail otherwise) and then runs that backend's resolver. Review j#102186
+    finding_2 caught this handler calling the tmux rail unconditionally, which made
+    it report ``lane_unresolved`` on a herdr-backed repo where the CLI resolves a
+    real lane — a second, backend-blind state machine.
 
     Nothing is dispatched. Deliberately: the resolved outcome for an executable
     leg names a *primitive* that would deliver a handoff, and delivering it is a
     mutating operation with its own authority gates (#15152). Reporting the plan
     is read-only; running it is not, and this Feature's tools are read-only.
     """
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (  # noqa: E501
-        resolve_workflow_step,
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_step_plan_resolution import (  # noqa: E501
+        LaneUnavailable,
+        resolve_step_plan,
     )
 
     notes: list[str] = []
+    anchor = _anchor_from(arguments, notes)
     try:
-        candidates, self_pane = _lane_candidates()
-    except _LaneUnavailable as exc:
+        resolution = resolve_step_plan(context.repo_root, anchor=anchor)
+    except LaneUnavailable as exc:
         return ToolOutcome(
             payload={
                 "error": "lane_unresolved",
                 "message": str(exc),
                 "plan": {},
                 "execution": EXECUTION_PLAN_ONLY,
-                "source_health": _health(True, [str(exc)]),
+                "executed": False,
+                "source_health": _health(True, [str(exc)] + notes),
             },
             is_error=True,
             summary="the current lane could not be resolved from the live runtime",
         )
 
-    anchor = _anchor_from(arguments, notes)
-    outcome = resolve_workflow_step(candidates, self_pane=self_pane, anchor=anchor)
-    plan = outcome.as_payload()
+    plan = resolution.outcome.as_payload()
     # The plan describes what *would* be safe next. Strip nothing, but state the
     # boundary in the payload so a reader cannot mistake a resolved executable leg
     # for a performed one.
     return ToolOutcome(
         payload={
             "plan": plan,
+            "backend": resolution.backend,
             "execution": EXECUTION_PLAN_ONLY,
             "executed": False,
             "source_health": _health(bool(notes), notes),
         },
-        is_error=not bool(getattr(outcome, "ok", True)),
+        is_error=not bool(getattr(resolution.outcome, "ok", True)),
         summary=(
-            f"next step resolved: {plan.get('next_action') or plan.get('reason') or 'unknown'} "
+            f"next step resolved on the {resolution.backend} backend: "
+            f"{plan.get('next_action') or plan.get('reason') or 'unknown'} "
             "(plan only; nothing was dispatched)"
         ),
     )
-
-
-class _LaneUnavailable(RuntimeError):
-    """The live lane could not be resolved (no tmux runtime, no self pane)."""
-
-
-def _lane_candidates():
-    """Discover the lane's target candidates + this pane, or fail closed.
-
-    Reads the live runtime through the same discovery the ``workflow step`` CLI
-    uses. A server started outside a managed pane has no lane, and that is a
-    refusal — never a default lane, which would resolve a step for somebody else's
-    work.
-    """
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
-        cli_workflow,
-    )
-
-    try:
-        cli_workflow.require_tmux()
-        self_pane = cli_workflow.current_pane()
-    except SystemExit as exc:
-        raise _LaneUnavailable(
-            f"no live terminal runtime for this server process ({exc})"
-        ) from exc
-    except Exception as exc:  # noqa: BLE001 - a runtime read failure is a refusal, not a crash
-        raise _LaneUnavailable(
-            f"the current pane could not be resolved ({type(exc).__name__})"
-        ) from exc
-    if not self_pane:
-        raise _LaneUnavailable("the current pane could not be resolved")
-    try:
-        candidates = cli_workflow._discover_candidates()
-    except Exception as exc:  # noqa: BLE001
-        raise _LaneUnavailable(
-            f"lane candidates could not be discovered ({type(exc).__name__})"
-        ) from exc
-    return candidates, self_pane
 
 
 def _anchor_from(arguments: Mapping[str, Any], notes: list):

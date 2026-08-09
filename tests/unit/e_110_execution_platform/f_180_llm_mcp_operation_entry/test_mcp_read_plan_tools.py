@@ -184,17 +184,26 @@ class WorkflowGlanceTests(unittest.TestCase):
 
 
 class WorkflowStepPlanTests(unittest.TestCase):
-    def test_no_live_lane_is_a_structured_refusal_not_a_default_lane(self) -> None:
-        """A server with no lane must refuse, never resolve somebody else's step."""
+    def test_the_plan_only_contract_holds_on_every_outcome(self) -> None:
+        """Whatever the environment resolves, nothing is ever executed.
+
+        Three outcomes are possible here depending on the host: no lane at all
+        (a structured ``lane_unresolved`` refusal), a resolved-but-fail-closed
+        step, or a resolved forward step. The plan-only contract is the invariant
+        common to all three, so it is asserted unconditionally and the
+        refusal-specific shape only where it applies.
+        """
         outcome = run_workflow_step_plan({}, ReadPlanContext(repo_root=ROOT))
-        if outcome.is_error:
+        self.assertEqual(outcome.payload["execution"], EXECUTION_PLAN_ONLY)
+        self.assertFalse(outcome.payload["executed"])
+        if outcome.payload.get("error"):
+            # A lane could not be resolved: refuse, never substitute a default
+            # lane, which would resolve a step for somebody else's work.
             self.assertEqual(outcome.payload["error"], "lane_unresolved")
-            self.assertEqual(outcome.payload["execution"], EXECUTION_PLAN_ONLY)
+            self.assertEqual(outcome.payload["plan"], {})
         else:
-            # A lane WAS resolvable in this environment; the plan-only contract
-            # still holds, which is the invariant that matters either way.
-            self.assertEqual(outcome.payload["execution"], EXECUTION_PLAN_ONLY)
-            self.assertFalse(outcome.payload["executed"])
+            self.assertIn("backend", outcome.payload)
+            self.assertIn(outcome.payload["backend"], ("herdr", "tmux"))
 
     def test_the_execution_token_is_fixed_so_absence_is_never_inferred(self) -> None:
         self.assertEqual(EXECUTION_PLAN_ONLY, "plan_only")
