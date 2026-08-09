@@ -42,14 +42,28 @@ from __future__ import annotations
 import argparse
 from typing import Any, Protocol
 
-CONSULT_DEFAULT_KIND = "design_consultation"
-"""Default ``--kind`` for `handoff cross-workspace-consult` (Redmine #11779).
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_operation import (
+    CONSULT_DEFAULT_KIND,
+    OP_CROSS_WORKSPACE_CONSULT,
+    OP_REPLY,
+    OP_SEND,
+    OP_TICKETLESS_CALLBACK,
+    entry_policy_for,
+)
 
-The cross-workspace primitive exists to carry design-consultation requests
-through the target workspace's Codex gateway, so it defaults to
-``design_consultation`` while still accepting any other ``KIND_LABELS`` value
-(e.g. a cross-workspace ``review_request``) via an explicit ``--kind``.
-"""
+# Redmine #15149: the four entry policies below are no longer restated here. They
+# are read from the core-owned ``handoff_operation`` table, which the typed shared
+# application API (the boundary a local MCP server calls) reads too — so the CLI
+# entry and the API entry cannot drift on a receiver pin, a default kind, or a
+# forced receiver-binding gate. ``CONSULT_DEFAULT_KIND`` is re-exported so the
+# existing ``handoff_command.CONSULT_DEFAULT_KIND`` / ``commands.CONSULT_DEFAULT_KIND``
+# importers stay valid.
+__all__ = (
+    "CONSULT_DEFAULT_KIND",
+    "HandoffCommandOps",
+    "HandoffCommandUseCase",
+    "LiveHandoffCommandOps",
+)
 
 
 class HandoffCommandOps(Protocol):
@@ -128,12 +142,16 @@ class HandoffCommandUseCase:
 
     def run_send(self, args: argparse.Namespace) -> int:
         """`handoff send`: apply semantic target selection, then orchestrate."""
-        self._ops.apply_handoff_selection(args)
+        policy = entry_policy_for(OP_SEND)
+        if policy.semantic_selection:
+            self._ops.apply_handoff_selection(args)
         return self._ops.orchestrate_handoff(args)
 
     def run_reply(self, args: argparse.Namespace) -> int:
         """`handoff reply`: orchestrate with the reply default kind."""
-        return self._ops.orchestrate_handoff(args, default_kind="reply")
+        return self._ops.orchestrate_handoff(
+            args, default_kind=entry_policy_for(OP_REPLY).default_kind
+        )
 
     def run_ticketless_callback(self, args: argparse.Namespace) -> int:
         """`handoff ticketless-callback`: standard ticketless no-anchor callback.
@@ -152,8 +170,9 @@ class HandoffCommandUseCase:
         the dispatch decision is an actual child -> grandchild worker dispatch
         (which still requires a real anchor via ``handoff send``).
         """
+        policy = entry_policy_for(OP_TICKETLESS_CALLBACK)
         return self._ops.orchestrate_handoff(
-            args, default_kind="reply", ticketless=True
+            args, default_kind=policy.default_kind, ticketless=policy.ticketless
         )
 
     def run_cross_workspace_consult(self, args: argparse.Namespace) -> int:
@@ -189,7 +208,10 @@ class HandoffCommandUseCase:
         typed into under a ``to=codex`` marker — exactly the gateway bypass this
         primitive promises to prevent.
         """
-        args.to = "codex"
+        policy = entry_policy_for(OP_CROSS_WORKSPACE_CONSULT)
+        args.to = policy.pinned_receiver
         if getattr(args, "kind", None) is None:
-            args.kind = CONSULT_DEFAULT_KIND
-        return self._ops.orchestrate_handoff(args, require_receiver_binding=True)
+            args.kind = policy.pinned_kind
+        return self._ops.orchestrate_handoff(
+            args, require_receiver_binding=policy.require_receiver_binding
+        )

@@ -276,10 +276,10 @@ rules:
   - src/mozyo_bridge/application/cli.py
   - src/mozyo_bridge/application/commands.py
   severity: block
-  message: 'このファイルを変更する場合は､ @vibes/docs/specs/project-map.md と @vibes/docs/rules/agent-workflow.md と @vibes/docs/logics/refactor-split-strategy.md
-    と @vibes/docs/logics/object-oriented-architecture-policy.md と @skills/mozyo-bridge-agent/references/safety.md と @vibes/docs/logics/scaffold-rules.md
-    と @vibes/docs/logics/release-helper-contract.md と @vibes/docs/logics/tmux-send-safety-contract.md と @vibes/docs/logics/managed-state-model.md
-    と @vibes/docs/logics/runtime-observability-boundary.md をよく確認し従うこと
+  message: 'このファイルを変更する場合は､ @vibes/docs/specs/project-map.md と @vibes/docs/rules/agent-workflow.md と @vibes/docs/logics/cli-mcp-shared-application-api.md
+    と @vibes/docs/logics/refactor-split-strategy.md と @vibes/docs/logics/object-oriented-architecture-policy.md と @skills/mozyo-bridge-agent/references/safety.md
+    と @vibes/docs/logics/scaffold-rules.md と @vibes/docs/logics/release-helper-contract.md と @vibes/docs/logics/tmux-send-safety-contract.md
+    と @vibes/docs/logics/managed-state-model.md と @vibes/docs/logics/runtime-observability-boundary.md をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
@@ -486,13 +486,19 @@ rules:
   - src/mozyo_bridge/domain/handoff_route_identity.py
   - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/infrastructure/tmux_client.py
   - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/infrastructure/queue_reader.py
+  - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff_operation.py
+  - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/handoff_application_service.py
+  - src/mozyo_bridge/application/handoff_transport_wiring.py
   - tests/unit/e_110_execution_platform/f_130_handoff_routing/test_handoff_same_lane_gateway.py
+  - tests/unit/e_110_execution_platform/f_130_handoff_routing/test_handoff_operation_policy.py
+  - tests/unit/e_110_execution_platform/f_130_handoff_routing/test_handoff_application_service.py
+  - tests/integration/e_110_execution_platform/f_130_handoff_routing/test_handoff_application_api_parity.py
   - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_route_identity_ledger.py
   severity: block
-  message: 'このファイルを変更する場合は､ @vibes/docs/logics/tmux-send-safety-contract.md と @vibes/docs/specs/route-identity-ledger.md と
-    @vibes/docs/logics/unit-target-model.md と @vibes/docs/logics/managed-state-model.md と @vibes/docs/logics/workspace-defaults-renderer.md
-    と @vibes/docs/logics/autonomous-ticket-entrypoint.md と @vibes/docs/logics/ack-completion-receiver-state.md と @skills/mozyo-bridge-agent/references/safety.md
-    をよく確認し従うこと
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/cli-mcp-shared-application-api.md と @vibes/docs/logics/tmux-send-safety-contract.md
+    と @vibes/docs/specs/route-identity-ledger.md と @vibes/docs/logics/unit-target-model.md と @vibes/docs/logics/managed-state-model.md
+    と @vibes/docs/logics/workspace-defaults-renderer.md と @vibes/docs/logics/autonomous-ticket-entrypoint.md と @vibes/docs/logics/ack-completion-receiver-state.md
+    と @skills/mozyo-bridge-agent/references/safety.md をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
