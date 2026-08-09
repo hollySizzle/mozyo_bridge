@@ -35,7 +35,14 @@ from . import (  # noqa: E402,F401
     tearDownModule,
 )
 
+from mozyo_bridge.application import commands  # noqa: E402
 from mozyo_bridge.application.cli import build_parser  # noqa: E402
+from mozyo_bridge.application.handoff_transport_wiring import (  # noqa: E402
+    runtime_transport_binding,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (  # noqa: E402,E501
+    BACKEND_HERDR,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_application_service import (  # noqa: E402,E501
     STATUS_FAIL_CLOSED,
     HandoffRequest,
@@ -47,6 +54,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_operation import (  # noqa: E402,E501
     OP_SEND,
 )
+from mozyo_bridge.shared.errors import CommandAbort  # noqa: E402
 
 
 @contextlib.contextmanager
@@ -223,6 +231,119 @@ class CliApplicationApiParityTest(unittest.TestCase):
 
         self.assertEqual(STATUS_FAIL_CLOSED, result.status)
         self.assertEqual("blocked", result.outcome.status)
+
+
+class TransportBindingOverlapTest(unittest.TestCase):
+    """#15149 review j#102080 finding_f1: no two handoff runs share the process slots.
+
+    ``runtime_transport_binding`` installs the herdr shim by swapping ``commands``
+    module globals. Overlapping scopes therefore cannot each own them: an
+    A-enter / B-enter / A-exit / B-exit interleaving hands B the *pre-A* values
+    while B is mid-flight, and leaves A's shim installed after both scopes have
+    exited — a leak across requests. Under the CLI one process ran one command so
+    the interleaving was unreachable; the in-process application API makes it
+    reachable, so the non-overlap invariant is enforced fail-closed.
+    """
+
+    class _Binding:
+        def __init__(self, tag: str) -> None:
+            self.backend = BACKEND_HERDR
+            self.run_tmux = f"run_tmux::{tag}"
+            self.capture_pane = f"capture_pane::{tag}"
+
+    @contextlib.contextmanager
+    def _scripted_bindings(self, *tags: str):
+        resolved = [(self._Binding(tag), f"rail::{tag}") for tag in tags]
+        with patch(
+            "mozyo_bridge.application.handoff_transport_wiring."
+            "resolve_handoff_transport_runtime",
+            side_effect=lambda _source: resolved.pop(0),
+        ):
+            yield
+
+    @contextlib.contextmanager
+    def _pristine_globals(self):
+        saved = (
+            commands.run_tmux,
+            commands.capture_pane,
+            commands.active_herdr_turn_start_rail,
+        )
+        commands.run_tmux = "ORIGINAL_RUN_TMUX"
+        commands.capture_pane = "ORIGINAL_CAPTURE_PANE"
+        commands.active_herdr_turn_start_rail = None
+        try:
+            yield
+        finally:
+            (
+                commands.run_tmux,
+                commands.capture_pane,
+                commands.active_herdr_turn_start_rail,
+            ) = saved
+
+    def test_an_overlapping_scope_is_refused_and_nothing_leaks(self) -> None:
+        with self._pristine_globals(), self._scripted_bindings("A", "B"):
+            outer = runtime_transport_binding(object())
+            outer.__enter__()
+            self.assertEqual("run_tmux::A", commands.run_tmux)
+
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(CommandAbort) as refused:
+                    runtime_transport_binding(object()).__enter__()
+
+            self.assertIn("already active in this process", refused.exception.message)
+            self.assertEqual(2, refused.exception.code)
+            # The refused scope installed nothing: A still owns the slots.
+            self.assertEqual("run_tmux::A", commands.run_tmux)
+
+            outer.__exit__(None, None, None)
+            # ... and after the only real scope exits, the slots are pristine again.
+            self.assertEqual("ORIGINAL_RUN_TMUX", commands.run_tmux)
+            self.assertEqual("ORIGINAL_CAPTURE_PANE", commands.capture_pane)
+            self.assertIsNone(commands.active_herdr_turn_start_rail)
+
+    def test_sequential_scopes_still_install_and_restore(self) -> None:
+        with self._pristine_globals(), self._scripted_bindings("A", "B"):
+            for tag in ("A", "B"):
+                with runtime_transport_binding(object()):
+                    self.assertEqual(f"run_tmux::{tag}", commands.run_tmux)
+                self.assertEqual("ORIGINAL_RUN_TMUX", commands.run_tmux)
+
+    def test_a_refusal_releases_the_guard_for_the_next_run(self) -> None:
+        """A refused overlap must not poison the process for every later send."""
+        with self._pristine_globals(), self._scripted_bindings("A", "B"):
+            outer = runtime_transport_binding(object())
+            outer.__enter__()
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(CommandAbort):
+                    runtime_transport_binding(object()).__enter__()
+            outer.__exit__(None, None, None)
+
+            with runtime_transport_binding(object()):
+                self.assertEqual("run_tmux::B", commands.run_tmux)
+            self.assertEqual("ORIGINAL_RUN_TMUX", commands.run_tmux)
+
+    def test_the_api_surfaces_an_overlap_as_a_typed_fail_closed_result(self) -> None:
+        """The MCP-facing caller gets a typed refusal, not an exception or a leak."""
+        with tempfile.TemporaryDirectory() as repo:
+            request = HandoffRequest(
+                operation=OP_SEND,
+                input=HandoffCommandInput(**SEND_SEMANTICS_REFUSAL.input_fields),
+                repo_root=Path(repo),
+            )
+            with self._pristine_globals(), self._scripted_bindings("A"):
+                outer = runtime_transport_binding(object())
+                outer.__enter__()
+                try:
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        result = run_handoff(request)
+                finally:
+                    outer.__exit__(None, None, None)
+
+        self.assertEqual(STATUS_FAIL_CLOSED, result.status)
+        self.assertEqual(2, result.exit_code)
+        self.assertIn("already active in this process", result.error_message)
+        self.assertIsNone(result.outcome)  # zero send: no outcome was ever emitted
+        self.assertFalse(result.delivered)
 
 
 if __name__ == "__main__":

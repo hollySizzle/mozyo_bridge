@@ -35,7 +35,7 @@ identically for both callers.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Literal, Mapping
 
 #: `handoff send` — the anchored cross-agent send. Applies semantic target
 #: selection (Redmine #12663) before the unchanged identity gates.
@@ -50,6 +50,19 @@ OP_TICKETLESS_CALLBACK = "ticketless_callback"
 #: `handoff cross-workspace-consult` — the cross-workspace design consult that
 #: always lands on the target workspace's Codex gateway (Redmine #11779).
 OP_CROSS_WORKSPACE_CONSULT = "cross_workspace_consult"
+
+HandoffOperation = Literal[
+    "send", "reply", "ticketless_callback", "cross_workspace_consult"
+]
+"""The operation vocabulary as a *statically checkable* closed type (#15149 j#102080 f2).
+
+``Literal`` cannot be built from the ``OP_*`` constants (it takes literal values
+only), so this restates them. That restatement is not allowed to drift: a test
+pins ``typing.get_args(HandoffOperation) == HANDOFF_OPERATIONS``, so adding an
+operation to the policy table without widening this type fails the suite. The
+runtime gate stays :func:`entry_policy_for`, which fails closed regardless of
+whether a caller is type-checked.
+"""
 
 CONSULT_DEFAULT_KIND = "design_consultation"
 """Default ``--kind`` for `handoff cross-workspace-consult` (Redmine #11779).
@@ -77,7 +90,7 @@ class HandoffEntryPolicy:
     what it was before the policy was extracted.
     """
 
-    operation: str
+    operation: HandoffOperation
     default_kind: str | None = None
     pinned_kind: str | None = None
     pinned_receiver: str | None = None
@@ -86,7 +99,7 @@ class HandoffEntryPolicy:
     semantic_selection: bool = False
 
 
-ENTRY_POLICIES: Mapping[str, HandoffEntryPolicy] = {
+ENTRY_POLICIES: Mapping[HandoffOperation, HandoffEntryPolicy] = {
     OP_SEND: HandoffEntryPolicy(operation=OP_SEND, semantic_selection=True),
     OP_REPLY: HandoffEntryPolicy(operation=OP_REPLY, default_kind="reply"),
     OP_TICKETLESS_CALLBACK: HandoffEntryPolicy(
@@ -101,7 +114,7 @@ ENTRY_POLICIES: Mapping[str, HandoffEntryPolicy] = {
 }
 
 #: The closed high-level operation vocabulary.
-HANDOFF_OPERATIONS: tuple[str, ...] = tuple(ENTRY_POLICIES)
+HANDOFF_OPERATIONS: tuple[HandoffOperation, ...] = tuple(ENTRY_POLICIES)
 
 
 def entry_policy_for(operation: str) -> HandoffEntryPolicy:
@@ -120,6 +133,7 @@ __all__ = (
     "ENTRY_POLICIES",
     "HANDOFF_OPERATIONS",
     "HandoffEntryPolicy",
+    "HandoffOperation",
     "OP_CROSS_WORKSPACE_CONSULT",
     "OP_REPLY",
     "OP_SEND",

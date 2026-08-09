@@ -52,6 +52,7 @@ import argparse
 import contextlib
 import functools
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
@@ -517,6 +518,25 @@ def resolve_handoff_transport_runtime(
     return binding, rail
 
 
+#: Guards the process-global transport slots against overlapping handoff runs
+#: (Redmine #15149 review j#102080 finding_f1). The binding installs itself by
+#: swapping ``commands`` module globals, so two orchestrations in flight at once
+#: in the SAME process cannot each own the slots: an A-enter / B-enter / A-exit /
+#: B-exit interleaving both hands B the pre-A values mid-flight AND leaves A's
+#: shim installed after both scopes exit. Under the CLI one process ran one
+#: command, so the interleaving was unreachable; the #15149 in-process
+#: application API (a long-lived local MCP server) makes it reachable, so the
+#: non-overlap invariant has to be enforced rather than assumed.
+_TRANSPORT_BINDING_GUARD = threading.Lock()
+
+BINDING_OVERLAP_MESSAGE = (
+    "another handoff transport binding is already active in this process; "
+    "refusing to overlap two handoff runs because the terminal transport is "
+    "installed process-globally. Nothing was sent. Run handoff operations one at "
+    "a time (a local MCP server must serialize its handoff tool calls)."
+)
+
+
 @contextlib.contextmanager
 def runtime_transport_binding(
     source: "argparse.Namespace | HandoffTransportContext",
@@ -539,25 +559,44 @@ def runtime_transport_binding(
     CLI-entry wrapper. The selection still runs before any send gate, and it still
     resolves through the module-level :func:`resolve_handoff_transport_runtime`
     seam.
-    """
-    binding, turn_start_rail = resolve_handoff_transport_runtime(source)
-    if binding is None or binding.backend != BACKEND_HERDR:
-        yield
-        return
-    from mozyo_bridge.application import commands
 
-    saved_run_tmux = commands.run_tmux
-    saved_capture_pane = commands.capture_pane
-    saved_rail = commands.active_herdr_turn_start_rail
-    commands.run_tmux = binding.run_tmux
-    commands.capture_pane = binding.capture_pane
-    commands.active_herdr_turn_start_rail = turn_start_rail
+    **Non-overlap is enforced, fail-closed** (review j#102080 finding_f1). The
+    scope is guarded process-wide, and the guard covers the tmux-default path too:
+    a tmux-default run overlapping an installed herdr run would install nothing
+    yet still send through the *other* run's herdr shim, which is the same defect
+    seen from the other side. A second concurrent (or accidentally nested) scope
+    is refused with :func:`die` — zero bytes typed, a structured refusal for the
+    CLI and a typed ``fail_closed`` result for the application API — rather than
+    blocking, so a same-thread re-entry surfaces immediately instead of
+    deadlocking. Making the transport request-scoped (removing the module-global
+    swap entirely) is the real fix and needs the deep rails to take an injected
+    transport port; that is a separate change, and until then this invariant is
+    checked rather than assumed.
+    """
+    if not _TRANSPORT_BINDING_GUARD.acquire(blocking=False):
+        die(BINDING_OVERLAP_MESSAGE)
+        raise AssertionError("unreachable")
     try:
-        yield
+        binding, turn_start_rail = resolve_handoff_transport_runtime(source)
+        if binding is None or binding.backend != BACKEND_HERDR:
+            yield
+            return
+        from mozyo_bridge.application import commands
+
+        saved_run_tmux = commands.run_tmux
+        saved_capture_pane = commands.capture_pane
+        saved_rail = commands.active_herdr_turn_start_rail
+        commands.run_tmux = binding.run_tmux
+        commands.capture_pane = binding.capture_pane
+        commands.active_herdr_turn_start_rail = turn_start_rail
+        try:
+            yield
+        finally:
+            commands.run_tmux = saved_run_tmux
+            commands.capture_pane = saved_capture_pane
+            commands.active_herdr_turn_start_rail = saved_rail
     finally:
-        commands.run_tmux = saved_run_tmux
-        commands.capture_pane = saved_capture_pane
-        commands.active_herdr_turn_start_rail = saved_rail
+        _TRANSPORT_BINDING_GUARD.release()
 
 
 def bind_runtime_transport(fn: Callable[..., int]) -> Callable[..., int]:
@@ -578,6 +617,7 @@ def bind_runtime_transport(fn: Callable[..., int]) -> Callable[..., int]:
 
 
 __all__ = (
+    "BINDING_OVERLAP_MESSAGE",
     "HandoffTransportContext",
     "bind_runtime_transport",
     "resolve_handoff_transport_binding",

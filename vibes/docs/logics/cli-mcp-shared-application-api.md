@@ -78,12 +78,23 @@ selection を走らせるか」だけを表す。**authority は与えない**�
 
 ### Typed input / output
 
+型は **static に検査可能** にする（`object-oriented-architecture-policy.md` の
+static typing policy、review j#102080 finding_f2）。公開境界の field を `Any` に
+しない。
+
 - 入力: `HandoffCommandInput`（#13729 の frozen value object）。
+- operation: `HandoffOperation`（`Literal`）。`Literal` は定数から生成できないため
+  語彙を再記述するが、`get_args(HandoffOperation) == HANDOFF_OPERATIONS` を test で
+  pin して drift を防ぐ。runtime gate は `entry_policy_for` の fail closed。
 - 出力: `HandoffResult`
   - `status`: `completed` / `fail_closed`
   - `exit_code`
-  - `outcome`: 最後に publish された `DeliveryOutcome`
-  - `emissions`: 各 terminal path の `DeliveryOutcome` + 構造化 emit context
+  - `outcome`: 最後に publish された `Optional[DeliveryOutcome]`
+  - `emissions`: `HandoffEmission` の tuple。emit context は緩い mapping ではなく
+    **名前付きの型付き field**（`record_format` / `recovery_command` /
+    `duplicate_lane_panes` / `retry` / `activation` / ...）で持つ。field 集合は
+    delivery record sink の signature と test で突き合わせる。未知 keyword は
+    `extra` に退避し、完了済み send を壊さずに欠落も起こさない。
   - `delivered`: **共有 injection-stage authority** の判定
     （`injection_stage_for_outcome(outcome) == STAGE_SUBMITTED_CONFIRMED`）。
     `exit_code == 0` は配達の証明ではない（#13583 / #14232）。
@@ -104,6 +115,26 @@ terminal transport backend の選択（#13253 / #13255 / #13261 / #13320）は
 Namespace decorator を context manager `runtime_transport_binding` へ移した。
 選択 logic は 1 つであり、CLI send と API send が別 backend に解決することはない。
 
+#### Process-global slot の非重複（fail closed）
+
+binding は `commands` module の global（`run_tmux` / `capture_pane` /
+`active_herdr_turn_start_rail`）を差し替えて install する。したがって **同一 process
+内で 2 つの handoff run が同時に slot を所有することはできない**。A enter → B enter
+→ A exit → B exit の interleaving は、B の実行中に A 以前の値を掴ませ、かつ両 scope
+終了後に A の shim を残す（review j#102080 finding_f1 の再現）。
+
+CLI では 1 process 1 command のため到達不能だったが、in-process application API
+（長寿命の local MCP server）では到達する。よって `runtime_transport_binding` は
+scope 全体を process-wide に guard し、重複 scope を `die` で **fail closed に拒否**
+する（zero send。CLI には構造化拒否、API には typed `fail_closed` result）。tmux
+default の run も guard 対象とする — install しないだけで、他 run の herdr shim を
+使って送ってしまうため。blocking せず即拒否するのは、同一 thread の再入を deadlock
+ではなく即時のエラーとして表面化させるためである。
+
+transport を request-scoped injection にする（module-global 差し替え自体をやめる）の
+が本来の解であり、深い rail 群が injected transport port を取る変更を要する。それは
+別 change であり、それまでは本不変条件を **仮定せず検査する**。
+
 ## Invariants
 
 1. **判断を二重実装しない。** entry policy は core 表 1 つ。gate は orchestration 1 つ。
@@ -120,6 +151,11 @@ Namespace decorator を context manager `runtime_transport_binding` へ移した
    adapter の責務であり、API は同じ情報を typed data で返す。
 6. **pane message は正本ではない。** durable anchor（Redmine issue / journal）が正本で
    ある点は変わらない。API は notification を送るだけで workflow 判断を持たない。
+7. **同一 process で handoff run を重ねない。** transport slot が process-global で
+   ある限り、重複は fail closed で拒否する（上記「Process-global slot の非重複」）。
+8. **公開境界の field を `Any` にしない。** result / emission / request / port の型は
+   具体型で表し、restatement（`Literal` 語彙、emission の context field 集合）は
+   source と test で突き合わせる。
 
 ## Non-goals
 
@@ -136,10 +172,12 @@ Namespace decorator を context manager `runtime_transport_binding` へ移した
   operation 語彙・entry policy が CLI entry と一致すること、smuggling の fail-closed。
 - `tests/unit/.../f_130_handoff_routing/test_handoff_application_service.py`:
   typed result、injection-stage による delivery 判定、fail-closed carrier、
-  argparse / subprocess / TTY 非依存。
+  argparse / subprocess / TTY 非依存、公開境界に `Any` が無いこと、`Literal` 語彙と
+  emission context field 集合の drift gate。
 - `tests/integration/.../f_130_handoff_routing/test_handoff_application_api_parity.py`:
   同一の拒否を CLI と API の双方から実 orchestration に通し、構造化 outcome と exit code
-  が一致すること、API が stdout へ何も書かないこと。
+  が一致すること、API が stdout へ何も書かないこと、binding 重複が fail closed で拒否
+  され slot が leak しないこと。
 - `mozyo-bridge health check`（module-health）、`mozyo-bridge docs validate --repo .`。
 
 ## Next

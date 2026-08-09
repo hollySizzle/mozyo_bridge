@@ -6,7 +6,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
 # ``run_doctor`` / ``format_doctor_text`` stay importable here as the preserved
 # ``commands.run_doctor`` / ``commands.format_doctor_text`` monkeypatch seams:
@@ -132,6 +132,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     MODE_QUEUE_ENTER,
     MODE_STANDARD,
     MODES,
+    DeliveryOutcome,
     QueueEnterRetryOutcome,
     RECEIVERS,
     SOURCES,
@@ -220,6 +221,7 @@ active_herdr_turn_start_rail = None
 # routes. Strictly config-guarded; the tmux path is untouched.
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
     RESOLVED_TARGET_CAPABILITY_ARG,
+    ResolvedHerdrTargetCapability,
     herdr_effective_backend_selected,
     resolve_herdr_send_target,
 )
@@ -1551,9 +1553,8 @@ def cmd_notify_claude_legacy_task(args: argparse.Namespace) -> int:
 
 
 # The delivery-record output/persistence helper tail (``_emit_outcome`` /
-# ``_submit_lines_for`` / ``_record_format_from_args`` /
-# ``_record_command_from_args`` / ``_emit_receipt`` /
-# ``_maybe_persist_delivery_record``) moved bodily into the
+# ``_submit_lines_for`` / ``_record_format_from_args`` / ``_record_command_from_args`` /
+# ``_emit_receipt`` / ``_maybe_persist_delivery_record``) moved bodily into the
 # ``handoff_delivery_command`` boundary (#13123) and is re-exported at the top of
 # this module, so the ``orchestrate_handoff`` terminal paths below keep calling
 # the historical names unchanged.
@@ -1619,20 +1620,20 @@ def run_handoff_orchestration(
     inp: HandoffCommandInput,
     *,
     repo_root: Path,
-    publish: Callable[[Any], None],
-    resolved_herdr_target_capability: Any = None,
+    publish: Callable[[DeliveryOutcome], None],
+    resolved_herdr_target_capability: ResolvedHerdrTargetCapability | None = None,
     emit_outcome: Callable[..., None] | None = None,
 ) -> int:
     """High-level handoff/reply primitive.
 
     Redmine #15149: the **shared application processing** the CLI and the typed
     application API (the boundary a local MCP server calls) both run. It takes the
-    typed ``HandoffCommandInput`` — never a Namespace — plus the resolved repo
-    root, the caller's delivery-outcome ``publish`` hand-back, the stashed
-    project-gateway capability, and the record ``emit_outcome`` sink (the printing
-    CLI one by default), so every gate below is reached identically by both
-    callers. Both enter through ``handoff_application_service`` /
-    ``orchestrate_handoff_input``, which installs the transport binding.
+    typed ``HandoffCommandInput`` — never a Namespace — plus the resolved repo root,
+    the caller's delivery-outcome ``publish`` hand-back, the stashed project-gateway
+    capability, and the record ``emit_outcome`` sink (the printing CLI one by
+    default), so every gate below is reached identically by both callers. Both enter
+    through ``handoff_application_service.orchestrate_handoff_input``, which installs
+    the transport binding.
 
     Owns: receiver-pane resolution, agent-target validation, internal pane
     snapshot, marker-prefixed type, landing wait, fail-closed C-u rollback,
@@ -1674,8 +1675,7 @@ def run_handoff_orchestration(
     # R3-F1: every terminal outcome (incl. the herdr event rail) publishes via this emitter.
     # Redmine #13729 / #15149: the emitter takes caller-owned `publish` + `emit_outcome`
     # callbacks (not the Namespace). The CLI writes the outcome onto its own `args` and
-    # prints the record; the typed API captures both into its typed result without a
-    # stdout channel. The gate sequence below is identical for either.
+    # prints the record; the typed API captures both into its typed result. Same gates.
     _emit = _make_publishing_emitter(publish, emit_outcome or _emit_outcome)
     herdr_send = herdr_effective_backend_selected(repo_root=repo_root, target=inp.target)
     if not herdr_send:
@@ -2045,9 +2045,9 @@ def orchestrate_handoff(
 ) -> int:
     """CLI Namespace adapter over the shared orchestration (Redmine #15149).
 
-    The Namespace ends here: the parsed scalars + entry policy convert once into
-    the typed ``HandoffCommandInput`` (#13729 tranche 1), the last two Namespace
-    reads (repo root, stashed project-gateway capability) resolve here, and the
+    The Namespace ends here: the parsed scalars + entry policy convert once into the
+    typed ``HandoffCommandInput`` (#13729 tranche 1), the last two Namespace reads
+    (repo root, stashed project-gateway capability) resolve here, and the
     delivery-outcome hand-back goes down as the ``publish`` callback so the caller
     wrappers keep reading it off ``args`` via ``delivery_was_positive(args)``.
     Behaviour, exit codes, printed records, and every gate are unchanged.

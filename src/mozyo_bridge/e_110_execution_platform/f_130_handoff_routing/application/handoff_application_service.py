@@ -43,16 +43,22 @@ can skip none the CLI runs.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Callable, Mapping, Optional, Protocol
+from typing import Callable, Mapping, Optional, Protocol
 
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+    DeliveryOutcome,
+    QueueEnterRetryOutcome,
+    TargetActivationOutcome,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_command_input import (
     HandoffCommandInput,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_operation import (
     HandoffEntryPolicy,
+    HandoffOperation,
     entry_policy_for,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (
@@ -64,6 +70,16 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injectio
     injection_stage_for_outcome,
 )
 from mozyo_bridge.shared.errors import CommandAbort
+
+# The two adapter-owned records the boundary names in its types. Imported for real
+# rather than under ``TYPE_CHECKING`` (review j#102080 finding_f2): a boundary whose
+# annotations do not resolve at runtime cannot be introspected, so the drift tests
+# that pin these types would have nothing to check. Neither import cycles — this
+# module is itself imported lazily by ``commands``.
+from mozyo_bridge.application.commands_target_select import SelectedTarget
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (  # noqa: E501
+    ResolvedHerdrTargetCapability,
+)
 
 #: The run reached a typed terminal path and returned an exit code.
 STATUS_COMPLETED = "completed"
@@ -82,8 +98,8 @@ def orchestrate_handoff_input(
     inp: HandoffCommandInput,
     *,
     repo_root: Path,
-    publish: Callable[[Any], None],
-    resolved_herdr_target_capability: Any = None,
+    publish: Callable[[DeliveryOutcome], None],
+    resolved_herdr_target_capability: Optional[ResolvedHerdrTargetCapability] = None,
     emit_outcome: Optional[Callable[..., None]] = None,
 ) -> int:
     """Run the shared handoff orchestration over a typed input.
@@ -147,36 +163,92 @@ class HandoffTargetSelection:
 class HandoffRequest:
     """A typed high-level handoff invocation."""
 
-    operation: str
+    operation: HandoffOperation
     input: HandoffCommandInput
     repo_root: Path
     selection: Optional[HandoffTargetSelection] = None
-    resolved_herdr_target_capability: Any = None
+    resolved_herdr_target_capability: Optional[ResolvedHerdrTargetCapability] = None
 
 
 @dataclass(frozen=True)
 class HandoffEmission:
     """One structured record the orchestration emitted, with its context.
 
-    ``outcome`` is the ``DeliveryOutcome``; ``context`` is the emit context the
-    CLI would have rendered alongside it (recovery command, duplicate lane panes,
-    role-profile contract, retry / activation telemetry, submit / turn-start /
-    startup-admission lines). Captured as data so a non-CLI caller needs no
-    rendered text.
+    The emit context the CLI would have *rendered* alongside the outcome is
+    carried here as named, typed fields rather than a loose mapping (review
+    j#102080 finding_f2): a value object with field names and types is what the
+    OOP-first static-typing policy asks of a new public boundary, and it lets a
+    caller reach ``emission.recovery_command`` instead of guessing a string key.
+
+    ``extra`` exists only so a *future* emit keyword cannot be silently dropped
+    on the floor by this capture. It is empty for every keyword the delivery
+    record sink accepts today, and a test pins that against the sink's own
+    signature — so a new keyword shows up as a failing test first, never as a
+    runtime error that would break an already-completed send.
     """
 
-    outcome: Any
-    context: Mapping[str, Any]
+    outcome: DeliveryOutcome
+    record_format: Optional[str] = None
+    command: Optional[str] = None
+    recovery_command: Optional[str] = None
+    duplicate_lane_panes: Optional[tuple[str, ...]] = None
+    role_profile_contract: Optional[str] = None
+    retry: Optional[QueueEnterRetryOutcome] = None
+    activation: Optional[TargetActivationOutcome] = None
+    submit_lines: Optional[tuple[str, ...]] = None
+    turn_start_lines: Optional[tuple[str, ...]] = None
+    startup_admission_lines: Optional[tuple[str, ...]] = None
+    extra: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
+
+    #: The named context fields, in the delivery record sink's own order.
+    CONTEXT_FIELDS = (
+        "record_format",
+        "command",
+        "recovery_command",
+        "duplicate_lane_panes",
+        "role_profile_contract",
+        "retry",
+        "activation",
+        "submit_lines",
+        "turn_start_lines",
+        "startup_admission_lines",
+    )
+
+    #: Context fields captured as an immutable tuple snapshot.
+    _SEQUENCE_FIELDS = (
+        "duplicate_lane_panes",
+        "submit_lines",
+        "turn_start_lines",
+        "startup_admission_lines",
+    )
+
+    @classmethod
+    def from_emit(cls, outcome: DeliveryOutcome, **context: object) -> "HandoffEmission":
+        """Build one emission from an emit call's outcome + keyword context."""
+        named = {}
+        for name in cls.CONTEXT_FIELDS:
+            if name not in context:
+                continue
+            value = context[name]
+            if name in cls._SEQUENCE_FIELDS and value is not None:
+                value = tuple(value)  # type: ignore[arg-type]
+            named[name] = value
+        unknown = {k: v for k, v in context.items() if k not in cls.CONTEXT_FIELDS}
+        return cls(
+            outcome=outcome,
+            extra=MappingProxyType(unknown),
+            **named,  # type: ignore[arg-type]
+        )
 
 
 @dataclass(frozen=True)
 class HandoffResult:
     """The typed result of a high-level handoff operation."""
 
-    operation: str
+    operation: HandoffOperation
     status: str
     exit_code: int
-    outcome: Any = None
+    outcome: Optional[DeliveryOutcome] = None
     emissions: tuple[HandoffEmission, ...] = ()
     delivered: bool = False
     error_message: Optional[str] = None
@@ -204,8 +276,8 @@ class HandoffApplicationOps(Protocol):
         inp: HandoffCommandInput,
         *,
         repo_root: Path,
-        publish: Callable[[Any], None],
-        resolved_herdr_target_capability: Any,
+        publish: Callable[[DeliveryOutcome], None],
+        resolved_herdr_target_capability: Optional[ResolvedHerdrTargetCapability],
         emit_outcome: Callable[..., None],
     ) -> int: ...
 
@@ -217,7 +289,7 @@ class HandoffApplicationOps(Protocol):
         session: Optional[str],
         project: Optional[str],
         sender_cwd: str,
-    ) -> Any: ...
+    ) -> SelectedTarget: ...
 
 
 class LiveHandoffApplicationOps:
@@ -233,8 +305,8 @@ class LiveHandoffApplicationOps:
         inp: HandoffCommandInput,
         *,
         repo_root: Path,
-        publish: Callable[[Any], None],
-        resolved_herdr_target_capability: Any,
+        publish: Callable[[DeliveryOutcome], None],
+        resolved_herdr_target_capability: Optional[ResolvedHerdrTargetCapability],
         emit_outcome: Callable[..., None],
     ) -> int:
         return orchestrate_handoff_input(
@@ -253,7 +325,7 @@ class LiveHandoffApplicationOps:
         session: Optional[str],
         project: Optional[str],
         sender_cwd: str,
-    ) -> Any:
+    ) -> SelectedTarget:
         from mozyo_bridge.application.commands_target_select import (
             select_semantic_target,
         )
@@ -317,16 +389,14 @@ def run_handoff(
     policy = entry_policy_for(request.operation)
     inp = apply_entry_policy(request.input, policy)
 
-    published: list[Any] = []
+    published: list[DeliveryOutcome] = []
     emissions: list[HandoffEmission] = []
 
-    def _publish(outcome: Any) -> None:
+    def _publish(outcome: DeliveryOutcome) -> None:
         published.append(outcome)
 
-    def _emit(outcome: Any, **context: Any) -> None:
-        emissions.append(
-            HandoffEmission(outcome=outcome, context=MappingProxyType(dict(context)))
-        )
+    def _emit(outcome: DeliveryOutcome, **context: object) -> None:
+        emissions.append(HandoffEmission.from_emit(outcome, **context))
 
     def _result(status: str, exit_code: int, error_message: Optional[str]) -> HandoffResult:
         outcome = published[-1] if published else None

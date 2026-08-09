@@ -17,12 +17,14 @@ subprocess — and pin the contract #15156 accepts:
 from __future__ import annotations
 
 import ast
+import inspect
 import io
 import re
 import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from typing import Optional, get_args, get_type_hints
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
@@ -30,25 +32,38 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application import (  # noqa: E402,E501
     handoff_application_service as service,
 )
+from mozyo_bridge.application.commands_target_select import SelectedTarget  # noqa: E402
+from mozyo_bridge.application.handoff_delivery_command import (  # noqa: E402
+    deliver_outcome,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_application_service import (  # noqa: E402,E501
     STATUS_COMPLETED,
     STATUS_FAIL_CLOSED,
+    HandoffApplicationOps,
+    HandoffEmission,
     HandoffRequest,
+    HandoffResult,
     HandoffTargetSelection,
     run_handoff,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (  # noqa: E402,E501
+    DeliveryOutcome,
     make_outcome,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_command_input import (  # noqa: E402,E501
     HandoffCommandInput,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_operation import (  # noqa: E402,E501
+    HANDOFF_OPERATIONS,
+    HandoffOperation,
     OP_CROSS_WORKSPACE_CONSULT,
     OP_REPLY,
     OP_SEND,
     OP_TICKETLESS_CALLBACK,
     UnknownHandoffOperation,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (  # noqa: E402,E501
+    ResolvedHerdrTargetCapability,
 )
 from mozyo_bridge.shared.errors import CommandAbort, die  # noqa: E402
 
@@ -157,11 +172,16 @@ class TypedResultTest(unittest.TestCase):
         result = run_handoff(_request(to="claude"), ops=ops)
         self.assertTrue(result.delivered)
 
-    def test_emissions_capture_the_record_context_as_data(self) -> None:
+    def test_emissions_capture_the_record_context_as_named_typed_fields(self) -> None:
         outcome = _sent_outcome()
         ops = _FakeOps(
             behaviour=lambda emit, publish: (
-                emit(outcome, recovery_command="mozyo-bridge read %7"),
+                emit(
+                    outcome,
+                    record_format="json",
+                    recovery_command="mozyo-bridge read %7",
+                    duplicate_lane_panes=["%7", "%8"],
+                ),
                 0,
             )[1]
         )
@@ -169,10 +189,39 @@ class TypedResultTest(unittest.TestCase):
         result = run_handoff(_request(to="claude"), ops=ops)
 
         self.assertEqual(1, len(result.emissions))
-        self.assertIs(outcome, result.emissions[0].outcome)
-        self.assertEqual(
-            "mozyo-bridge read %7", result.emissions[0].context["recovery_command"]
+        emission = result.emissions[0]
+        self.assertIs(outcome, emission.outcome)
+        # Named fields, not string keys into a bag (review j#102080 finding_f2).
+        self.assertEqual("json", emission.record_format)
+        self.assertEqual("mozyo-bridge read %7", emission.recovery_command)
+        # Sequence context is snapshotted immutably.
+        self.assertEqual(("%7", "%8"), emission.duplicate_lane_panes)
+        # Unsupplied context stays None; nothing unknown was dropped on the floor.
+        self.assertIsNone(emission.activation)
+        self.assertEqual({}, dict(emission.extra))
+
+    def test_a_mutated_context_list_cannot_mutate_a_captured_emission(self) -> None:
+        panes = ["%7"]
+        ops = _FakeOps(
+            behaviour=lambda emit, publish: (
+                emit(_sent_outcome(), duplicate_lane_panes=panes),
+                0,
+            )[1]
         )
+        result = run_handoff(_request(to="claude"), ops=ops)
+        panes.append("%9")
+        self.assertEqual(("%7",), result.emissions[0].duplicate_lane_panes)
+
+    def test_an_unknown_emit_keyword_is_preserved_not_dropped(self) -> None:
+        """A future emit keyword must not vanish, and must not break a done send."""
+        ops = _FakeOps(
+            behaviour=lambda emit, publish: (
+                emit(_sent_outcome(), some_future_field="x"),
+                0,
+            )[1]
+        )
+        result = run_handoff(_request(to="claude"), ops=ops)
+        self.assertEqual({"some_future_field": "x"}, dict(result.emissions[0].extra))
 
     def test_the_last_published_outcome_wins_and_all_are_kept(self) -> None:
         first = _sent_outcome(status="blocked", reason="invalid_args")
@@ -340,6 +389,67 @@ class SemanticSelectionTest(unittest.TestCase):
         )
         self.assertIsNone(ops.selection_kwargs)
         self.assertIsNone(ops.orchestrated.target)
+
+
+class TypedBoundaryContractTest(unittest.TestCase):
+    """#15149 review j#102080 finding_f2: the public boundary is type-checkable.
+
+    The Acceptance ("入力・出力が型付きapplication APIになる") and the OOP-first
+    static typing policy both ask a new public object boundary to be expressed in
+    types, not in ``Any``. These pin that the result / emission / request fields
+    resolve to concrete types, and that the two restatements which could silently
+    drift — the ``Literal`` operation type and the emission's context field set —
+    are checked against their sources.
+    """
+
+    def _hints(self, cls):
+        return get_type_hints(cls, include_extras=True)
+
+    def test_no_public_boundary_field_is_Any(self) -> None:
+        for cls in (HandoffRequest, HandoffResult, HandoffEmission, HandoffTargetSelection):
+            for name, hint in self._hints(cls).items():
+                with self.subTest(cls=cls.__name__, field=name):
+                    self.assertNotIn(
+                        "typing.Any", str(hint), f"{cls.__name__}.{name} is Any-typed"
+                    )
+
+    def test_the_outcome_fields_resolve_to_delivery_outcome(self) -> None:
+        self.assertEqual(
+            Optional[DeliveryOutcome], self._hints(HandoffResult)["outcome"]
+        )
+        self.assertEqual(DeliveryOutcome, self._hints(HandoffEmission)["outcome"])
+
+    def test_the_request_capability_field_resolves_to_its_concrete_type(self) -> None:
+        self.assertEqual(
+            Optional[ResolvedHerdrTargetCapability],
+            self._hints(HandoffRequest)["resolved_herdr_target_capability"],
+        )
+
+    def test_the_operation_type_cannot_drift_from_the_policy_table(self) -> None:
+        self.assertEqual(sorted(get_args(HandoffOperation)), sorted(HANDOFF_OPERATIONS))
+        self.assertEqual(HandoffOperation, self._hints(HandoffRequest)["operation"])
+        self.assertEqual(HandoffOperation, self._hints(HandoffResult)["operation"])
+
+    def test_the_emission_context_fields_match_the_record_sink_signature(self) -> None:
+        """The capture must name exactly the sink's keyword context, in its order."""
+        params = list(inspect.signature(deliver_outcome).parameters.values())
+        sink_keywords = tuple(
+            p.name for p in params if p.kind is inspect.Parameter.KEYWORD_ONLY
+        )
+        self.assertEqual(sink_keywords, HandoffEmission.CONTEXT_FIELDS)
+        hints = self._hints(HandoffEmission)
+        for name in HandoffEmission.CONTEXT_FIELDS:
+            self.assertIn(name, hints)
+
+    def test_the_port_return_types_are_concrete(self) -> None:
+        orchestrate = get_type_hints(HandoffApplicationOps.orchestrate)
+        self.assertEqual(int, orchestrate["return"])
+        self.assertEqual(
+            Optional[ResolvedHerdrTargetCapability],
+            orchestrate["resolved_herdr_target_capability"],
+        )
+        select = get_type_hints(HandoffApplicationOps.select_semantic_target)
+        self.assertEqual(SelectedTarget, select["return"])
 
 
 class NoCliDependencyTest(unittest.TestCase):
