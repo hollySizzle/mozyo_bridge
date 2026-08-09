@@ -313,6 +313,21 @@ class UnitBoardSourcesConfig:
                     f"duplicate Unit board source host_id {source.host_id!r}"
                 )
             seen.add(source.host_id)
+        # Labels must be unique too, and for a different reason than host ids
+        # (Redmine #15138 review j#101787 f7): the label is the *only* source
+        # identity the board renders, so two sources sharing one label make two
+        # different servers' rows indistinguishable on screen — the same
+        # confusion the cross-source identity work exists to prevent, reached
+        # through the display layer instead of the identity layer.
+        labels: set[str] = set()
+        for source in self.sources:
+            folded = source.label.casefold()
+            if folded in labels:
+                raise UnitBoardSourceError(
+                    f"duplicate Unit board source label {source.label!r}; the label "
+                    "is what the board displays, so it must identify one source"
+                )
+            labels.add(folded)
         for source in self.sources:
             if source.kind != HOST_KIND_CONTAINER or not source.via:
                 continue
@@ -354,6 +369,47 @@ class UnitBoardSourcesConfig:
         operator who never opts in sees byte-identical output.
         """
         return not self.remote_sources
+
+    @property
+    def private_connection_values(self) -> tuple[str, ...]:
+        """Every operator-supplied connection value across all sources.
+
+        These are the strings that must never reach a payload or a rendered
+        line.  Callers use this to reject *operator-typed* text that would put
+        one back on a public surface — a summary is free text, and a free-text
+        field that happens to contain an ssh destination re-exposes exactly what
+        the source file exists to keep private (Redmine #15138 review j#101787
+        f8).  The default binary name is excluded: it is a published default,
+        not an operator secret, and treating it as one would reject any text
+        that merely names this tool.
+        """
+        values: list[str] = []
+        for source in self.sources:
+            for value in (source.ssh_target, source.container, source.mozyo_binary):
+                if value and value != DEFAULT_MOZYO_BINARY:
+                    values.append(value)
+        return tuple(dict.fromkeys(values))
+
+    def disclosed_connection_value(self, text: str) -> Optional[str]:
+        """Return the first configured connection value ``text`` would disclose.
+
+        Containment rather than equality, because a value embedded in a sentence
+        is disclosed just as fully as one on its own.  Values shorter than three
+        characters are compared whole: a two-character container name would
+        otherwise match almost any text and turn a privacy guard into an
+        unusable one.
+        """
+        if not isinstance(text, str) or not text:
+            return None
+        folded = text.casefold()
+        for value in self.private_connection_values:
+            candidate = value.casefold()
+            if len(candidate) < 3:
+                if folded == candidate:
+                    return value
+            elif candidate in folded:
+                return value
+        return None
 
     @classmethod
     def default(cls) -> "UnitBoardSourcesConfig":

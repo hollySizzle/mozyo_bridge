@@ -77,6 +77,15 @@ class LoaderTests(unittest.TestCase):
         with self.assertRaises(UnitBoardSourcesLoadError):
             load_unit_board_sources(self.home)
 
+    def test_non_scalar_key_fails_closed_as_a_domain_error(self) -> None:
+        # A YAML complex key is unhashable, so the duplicate-key check raises
+        # before any schema rule runs; left bare it escapes the loader's
+        # YAMLError guard as a TypeError.
+        self.write("version: 1\n? [a, b]\n: value\n")
+
+        with self.assertRaises(UnitBoardSourcesLoadError):
+            load_unit_board_sources(self.home)
+
     def test_malformed_yaml_fails_closed_as_a_domain_error(self) -> None:
         self.write("version: 1\nsources: [\n")
 

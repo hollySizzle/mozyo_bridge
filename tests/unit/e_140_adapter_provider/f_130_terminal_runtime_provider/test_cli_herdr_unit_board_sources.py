@@ -43,9 +43,16 @@ def parse(argv):
     return parser.parse_args(argv)
 
 
+def fresh_remote_board():
+    """The remote answer stamped now: the CLI runs on the real wall clock."""
+    payload = remote_board_payload()
+    payload["observed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return payload
+
+
 def answers(overrides=None):
     base = {
-        REMOTE_BOARD_ARGS: remote_board_payload(),
+        REMOTE_BOARD_ARGS: fresh_remote_board(),
         REMOTE_WORKSPACE_ARGS: WORKSPACE_PAYLOAD,
         GATEWAY_ARGS: {"result": "sent"},
     }
@@ -59,15 +66,14 @@ class _Wiring:
     def __init__(self, config=REMOTE_CONFIG, answer_map=None, local=None) -> None:
         self.runner = RecordingRunner(answer_map if answer_map is not None else answers())
         self.config = config
+        self.local = local if local is not None else FakeLocalRuntime(
+            local_snapshot(
+                observed_at=datetime.now(timezone.utc).isoformat(timespec="seconds")
+            )
+        )
         self.runtime = MultiSourceUnitBoardRuntime(
             config,
-            local_runtime=local
-            if local is not None
-            else FakeLocalRuntime(
-                local_snapshot(
-                    observed_at=datetime.now(timezone.utc).isoformat(timespec="seconds")
-                )
-            ),
+            local_runtime=self.local,
             # Real wall clock: the CLI builds its own action rail with the
             # production clock, so a frozen observation clock would make every
             # apply read as a stale preview for reasons the code never has.
@@ -80,8 +86,11 @@ class _Wiring:
             mock.patch.object(
                 cli, "_multi_source_runtime", return_value=self.runtime
             ),
+            # The single-server path resolves the LOCAL runtime, not the
+            # aggregating one; conflating them would hide whether `--local-only`
+            # really bypasses the configured sources.
             mock.patch.object(
-                cli, "_load_runtime", return_value=(self.runtime, None)
+                cli, "_load_runtime", return_value=(self.local, None)
             ),
         ]
         for patch in self._patches:
@@ -138,6 +147,22 @@ class ShowTests(unittest.TestCase):
         self.assertEqual(out, "")
         self.assertIn("bad source file", err)
 
+    def test_local_only_flag_ignores_configured_sources_entirely(self) -> None:
+        # A client aggregating this host asks with the flag; the answer must
+        # describe exactly one server even though sources are configured, and
+        # must not reach out to any of them.
+        wiring = _Wiring()
+        with wiring:
+            code, out, _ = run(
+                cli.cmd_herdr_unit_board_show,
+                parse(["unit-board", "show", "--json", "--local-only"]),
+            )
+
+        payload = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertNotIn("sources", payload)
+        self.assertEqual(wiring.runner.argvs, [])
+
     def test_local_only_show_keeps_the_single_server_rendering(self) -> None:
         wiring = _Wiring(config=UnitBoardSourcesConfig.default())
         with wiring:
@@ -182,6 +207,23 @@ class SourcesTests(unittest.TestCase):
         self.assertIn("!! local [local] unavailable", out)
         self.assertIn("ok dev host [ssh] live", out)
 
+    def test_action_requires_an_explicit_project_scope(self) -> None:
+        with self.assertRaises(SystemExit), redirect_stderr(StringIO()):
+            parse(
+                [
+                    "unit-board",
+                    "action",
+                    "--unit",
+                    "unit-x",
+                    "--issue",
+                    "1",
+                    "--journal",
+                    "2",
+                    "--summary",
+                    "s",
+                ]
+            )
+
     def test_sources_json_is_public_safe(self) -> None:
         with _Wiring():
             code, out, _ = run(
@@ -223,6 +265,8 @@ class ActionTests(unittest.TestCase):
                         "101633",
                         "--summary",
                         "board pointer",
+                        "--target-project",
+                        "scope-alpha",
                     ]
                 ),
             )
@@ -251,6 +295,8 @@ class ActionTests(unittest.TestCase):
                         "101633",
                         "--summary",
                         "board pointer",
+                        "--target-project",
+                        "scope-alpha",
                         "--apply",
                     ]
                 ),
@@ -280,6 +326,8 @@ class ActionTests(unittest.TestCase):
                         "101633",
                         "--summary",
                         "board pointer",
+                        "--target-project",
+                        "scope-alpha",
                         "--apply",
                     ]
                 ),
@@ -305,6 +353,8 @@ class ActionTests(unittest.TestCase):
                     "2",
                     "--summary",
                     "s",
+                    "--target-project",
+                    "scope-alpha",
                     "--to",
                     "claude",
                 ]

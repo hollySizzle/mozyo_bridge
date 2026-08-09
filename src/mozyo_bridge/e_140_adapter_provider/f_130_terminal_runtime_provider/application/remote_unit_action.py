@@ -56,6 +56,7 @@ REASON_PREVIEW_STALE = "preview_stale"
 REASON_IDENTITY_CHANGED = "identity_changed"
 REASON_INVALID_REQUEST = "invalid_request"
 REASON_DELIVERY_FAILED = "delivery_failed"
+REASON_CONNECTION_VALUE_DISCLOSED = "connection_value_disclosed"
 
 #: Durable-anchor intents this rail may carry.  Deliberately the canonical
 #: handoff vocabulary and nothing new: a remote Unit action is an ordinary
@@ -97,6 +98,10 @@ _DETAIL_BY_REASON = {
         "apply; nothing was sent"
     ),
     REASON_INVALID_REQUEST: "the requested remote Unit action is not well formed",
+    REASON_CONNECTION_VALUE_DISCLOSED: (
+        "the request text repeats a configured connection value; the preview and "
+        "the delivered handoff are public surfaces and must not carry one"
+    ),
     REASON_DELIVERY_FAILED: (
         "the target environment's project gateway did not accept the handoff; "
         "read its durable record before retrying"
@@ -116,6 +121,13 @@ class RemoteUnitActionRequest:
     issue: str
     journal: str
     summary: str
+    #: The adopted project scope of the target repository, as declared by the
+    #: operator.  It is NOT derived from the board or the registry: the registry
+    #: ``project_name`` is display metadata and must not become a scope
+    #: authority (Redmine #15138 review j#101787 f1), and a board label has
+    #: already been through the public-safe projection.  Requiring it keeps the
+    #: client from synthesizing an authority it does not hold.
+    target_project: str = ""
     kind: str = DEFAULT_ACTION_KIND
 
     def validated(self) -> Optional[str]:
@@ -129,6 +141,15 @@ class RemoteUnitActionRequest:
             return "a Redmine issue id and journal id are required"
         if self.kind not in ACTION_KINDS:
             return "the requested handoff kind is not supported by this route"
+        if not isinstance(self.target_project, str) or not self.target_project.strip():
+            return (
+                "the target repository's adopted project scope is required; the "
+                "board label and the registry project name are display values and "
+                "cannot stand in for it"
+            )
+        scope = self.target_project.strip()
+        if safe_text(scope, fallback="") != scope:
+            return "the target project scope must be plain, public-safe text"
         if not isinstance(self.summary, str):
             return "a summary is required"
         summary = self.summary.strip()
@@ -175,6 +196,7 @@ class RemoteUnitActionPreview:
     host_label: str = ""
     host_kind: str = ""
     project_label: str = ""
+    target_project: str = ""
     lane_id: str = ""
     workspace_id: str = ""
     kind: str = ""
@@ -197,6 +219,7 @@ class RemoteUnitActionPreview:
             "host_label": safe_text(self.host_label, fallback=""),
             "host_kind": safe_text(self.host_kind, fallback=""),
             "project_label": safe_text(self.project_label, fallback=""),
+            "target_project": safe_text(self.target_project, fallback=""),
             "lane_id": safe_text(self.lane_id, fallback=""),
             "workspace_id": safe_text(self.workspace_id, fallback=""),
             "kind": safe_text(self.kind, fallback=""),
@@ -232,7 +255,19 @@ class RemoteUnitActionResult:
         }
 
 
-def _refused(reason: str, request: Optional[RemoteUnitActionRequest] = None, detail: str = "") -> RemoteUnitActionPreview:
+def _refused(
+    reason: str,
+    request: Optional[RemoteUnitActionRequest] = None,
+    detail: str = "",
+) -> RemoteUnitActionPreview:
+    """Build a refusal that carries the anchor but never the operator's free text.
+
+    A refused preview is still a payload, so echoing the request back would make
+    the refusal itself a disclosure surface — including for the refusal whose
+    whole purpose is that the text disclosed a connection value.  The durable
+    anchor and the kind identify which request was refused; the operator already
+    has what they typed.
+    """
     return RemoteUnitActionPreview(
         state=ACTION_REFUSED,
         reason=reason,
@@ -240,7 +275,6 @@ def _refused(reason: str, request: Optional[RemoteUnitActionRequest] = None, det
         kind=request.kind if request else "",
         issue=request.issue if request else "",
         journal=request.journal if request else "",
-        summary=request.summary if request else "",
     )
 
 
@@ -266,6 +300,16 @@ class RemoteUnitActionRail:
         problem = request.validated()
         if problem is not None:
             return _refused(REASON_INVALID_REQUEST, request, problem)
+        # Operator-typed text reaches the preview payload and the delivered
+        # handoff, both public surfaces.  A configured ssh destination or
+        # container name repeated there re-exposes exactly what the operator
+        # source file exists to keep off them (Redmine #15138 review j#101787
+        # f8).  Checked against every configured source, not just the target:
+        # disclosing another host's connection value is no better.
+        for text in (request.summary, request.target_project):
+            disclosed = self._runtime.config.disclosed_connection_value(text)
+            if disclosed is not None:
+                return _refused(REASON_CONNECTION_VALUE_DISCLOSED, request)
         target = self._runtime.resolve_unit_target(request.unit_id)
         if target is None:
             return _refused(REASON_UNIT_UNRESOLVED, request)
@@ -287,6 +331,7 @@ class RemoteUnitActionRail:
             host_label=target.source.label,
             host_kind=target.source.kind,
             project_label=target.project_label,
+            target_project=request.target_project.strip(),
             lane_id=target.lane_id,
             workspace_id=target.workspace_id,
             kind=request.kind,
@@ -318,7 +363,7 @@ class RemoteUnitActionRail:
             "--target-repo",
             workspace.canonical_path,
             "--target-project",
-            workspace.project_name,
+            preview.target_project,
             "--mode",
             "standard",
             "--summary",
@@ -367,10 +412,7 @@ class RemoteUnitActionRail:
         )
         if workspace is None:
             return self._refuse(preview, REASON_WORKSPACE_UNRESOLVED)
-        if (
-            workspace.canonical_path != preview.evidence.workspace.canonical_path
-            or workspace.project_name != preview.evidence.workspace.project_name
-        ):
+        if workspace.canonical_path != preview.evidence.workspace.canonical_path:
             return self._refuse(preview, REASON_IDENTITY_CHANGED)
 
         return self._deliver(preview, target.source, workspace)
@@ -437,6 +479,7 @@ def render_preview(preview: RemoteUnitActionPreview) -> Sequence[str]:
         "remote Unit action: preview",
         f"  source:  {preview.host_label} [{preview.host_kind}]",
         f"  project: {preview.project_label}",
+        f"  scope:   {preview.target_project}",
         f"  lane:    {preview.lane_id}",
         f"  route:   target-source project gateway -> codex",
         f"  anchor:  Redmine #{preview.issue} j#{preview.journal} ({preview.kind})",
@@ -453,6 +496,7 @@ __all__ = (
     "ACTION_REFUSED",
     "DEFAULT_ACTION_KIND",
     "MAX_SUMMARY_LENGTH",
+    "REASON_CONNECTION_VALUE_DISCLOSED",
     "REASON_DELIVERY_FAILED",
     "REASON_IDENTITY_CHANGED",
     "REASON_INVALID_REQUEST",

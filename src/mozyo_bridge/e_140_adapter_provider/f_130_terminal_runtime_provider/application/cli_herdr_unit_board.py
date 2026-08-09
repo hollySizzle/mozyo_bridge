@@ -213,7 +213,16 @@ def _runtime_failure_report() -> MetadataSyncReport:
 
 
 def cmd_herdr_unit_board_show(args: argparse.Namespace) -> int:
-    config, config_error = _sources_config()
+    if getattr(args, "local_only", False):
+        # This host answering for itself alone.  A client aggregating several
+        # servers asks with this flag so the answer describes one server; without
+        # it, a host that has its own sources would answer with *its* merged
+        # board and its rows would describe servers the caller never asked about
+        # (Redmine #15138 review j#101787 f2).
+        config: UnitBoardSourcesConfig | None = UnitBoardSourcesConfig.default()
+        config_error = ""
+    else:
+        config, config_error = _sources_config()
     if config is None:
         print(f"error: {config_error}", file=sys.stderr)
         return 2
@@ -291,6 +300,7 @@ def cmd_herdr_unit_board_action(args: argparse.Namespace) -> int:
         issue=str(getattr(args, "issue", "") or ""),
         journal=str(getattr(args, "journal", "") or ""),
         summary=str(getattr(args, "summary", "") or ""),
+        target_project=str(getattr(args, "target_project", "") or ""),
         kind=str(getattr(args, "kind", DEFAULT_ACTION_KIND)),
     )
     rail = RemoteUnitActionRail(multi)
@@ -420,6 +430,16 @@ def register_herdr_unit_board_parser(herdr_sub) -> None:
     show = sub.add_parser("show", help="Print one read-only Unit board snapshot.")
     show.add_argument("--json", action="store_true", help="Emit structured JSON.")
     show.add_argument(
+        "--local-only",
+        action="store_true",
+        dest="local_only",
+        help=(
+            "Report only this host's own Herdr server, ignoring any configured "
+            "observation sources. Used by a client aggregating this host, so the "
+            "answer always describes exactly one server."
+        ),
+    )
+    show.add_argument(
         "--width",
         type=_board_width_arg,
         default=0,
@@ -494,6 +514,16 @@ def register_herdr_unit_board_parser(herdr_sub) -> None:
         "--unit",
         required=True,
         help="Opaque unit_id from `unit-board show --json`.",
+    )
+    action.add_argument(
+        "--target-project",
+        dest="target_project",
+        required=True,
+        help=(
+            "Adopted project scope of the target repository. Declared, never "
+            "derived: the registry project name and the board label are display "
+            "values and cannot stand in for a scope authority."
+        ),
     )
     action.add_argument("--issue", required=True, help="Redmine issue id.")
     action.add_argument("--journal", required=True, help="Redmine journal id.")

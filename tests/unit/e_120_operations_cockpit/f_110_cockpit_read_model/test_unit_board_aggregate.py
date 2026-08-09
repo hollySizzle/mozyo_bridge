@@ -16,7 +16,11 @@ from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.herdr
     build_unit_board,
 )
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.unit_board_aggregate import (
+    DEFAULT_SOURCE_FRESHNESS_SECONDS,
+    MAX_REMOTE_CLOCK_SKEW_SECONDS,
+    MAX_REMOTE_PAYLOAD_AGE_SECONDS,
     MAX_SOURCE_UNITS,
+    remote_payload_freshness,
     actionable_workspace_id,
     aggregate_sources,
     format_multi_source_board,
@@ -94,6 +98,12 @@ def remote_payload(
             }
         ],
     }
+
+
+def remote_payload_at(observed_at: str):
+    payload = remote_payload()
+    payload["observed_at"] = observed_at
+    return payload
 
 
 class RemotePayloadTests(unittest.TestCase):
@@ -218,6 +228,98 @@ class RemotePayloadTests(unittest.TestCase):
         self.assertFalse(observation.status.actionable)
 
 
+class NestedAnswerTests(unittest.TestCase):
+    def test_a_merged_answer_is_rejected_rather_than_re_tagged(self) -> None:
+        # A source must answer for its own server only.  A merged answer holds
+        # rows from servers this client never asked about, and adopting them
+        # would attribute another host's Units to this source.
+        payload = remote_payload()
+        payload["sources"] = [
+            {
+                "host_id": "third",
+                "host_label": "third host",
+                "host_kind": "ssh",
+                "source_state": SOURCE_LIVE,
+                "observed_at": STAMP,
+                "unit_count": 1,
+                "unmanaged_agents": 0,
+                "actionable": True,
+                "detail": "",
+            }
+        ]
+
+        observation = parse_remote_board_payload(
+            payload, source=REMOTE, observed_at=STAMP, now=NOW
+        )
+
+        self.assertEqual(observation.status.source_state, SOURCE_RELOAD_REQUIRED)
+        self.assertEqual(observation.rows, ())
+        self.assertFalse(observation.status.actionable)
+
+    def test_an_empty_sources_envelope_is_still_a_merged_answer(self) -> None:
+        payload = remote_payload()
+        payload["sources"] = []
+
+        observation = parse_remote_board_payload(
+            payload, source=REMOTE, observed_at=STAMP, now=NOW
+        )
+
+        self.assertEqual(observation.status.source_state, SOURCE_RELOAD_REQUIRED)
+
+
+class RemotePayloadFreshnessTests(unittest.TestCase):
+    def test_a_payload_from_another_era_is_not_action_authority(self) -> None:
+        observation = parse_remote_board_payload(
+            remote_payload_at("2000-01-01T00:00:00+00:00"),
+            source=REMOTE,
+            observed_at=STAMP,
+            now=NOW,
+        )
+
+        self.assertEqual(observation.status.source_state, SOURCE_STALE)
+        self.assertFalse(observation.status.actionable)
+        self.assertEqual(len(observation.rows), 1)
+
+    def test_an_undated_or_unparsable_payload_is_not_action_authority(self) -> None:
+        for stamp in ("", "not-a-time", "2026-08-09T12:00:00"):
+            with self.subTest(stamp=stamp):
+                observation = parse_remote_board_payload(
+                    remote_payload_at(stamp),
+                    source=REMOTE,
+                    observed_at=STAMP,
+                    now=NOW,
+                )
+
+                self.assertEqual(observation.status.source_state, SOURCE_STALE)
+
+    def test_ordinary_clock_skew_does_not_disable_a_source(self) -> None:
+        ahead = (NOW + timedelta(seconds=MAX_REMOTE_CLOCK_SKEW_SECONDS - 5)).isoformat(
+            timespec="seconds"
+        )
+
+        observation = parse_remote_board_payload(
+            remote_payload_at(ahead), source=REMOTE, observed_at=STAMP, now=NOW
+        )
+
+        self.assertEqual(observation.status.source_state, SOURCE_LIVE)
+
+    def test_the_bound_is_looser_than_the_client_side_one(self) -> None:
+        # The client times its own round trip; this dimension compares two
+        # machines' clocks, so it must tolerate more before failing closed.
+        self.assertGreater(
+            MAX_REMOTE_PAYLOAD_AGE_SECONDS, DEFAULT_SOURCE_FRESHNESS_SECONDS
+        )
+        self.assertEqual(
+            remote_payload_freshness(STAMP, NOW + timedelta(seconds=60)), SOURCE_LIVE
+        )
+        self.assertEqual(
+            remote_payload_freshness(
+                STAMP, NOW + timedelta(seconds=MAX_REMOTE_PAYLOAD_AGE_SECONDS + 60)
+            ),
+            SOURCE_STALE,
+        )
+
+
 class FreshnessTests(unittest.TestCase):
     def test_recent_observation_is_live(self) -> None:
         self.assertEqual(freshness_state(STAMP, NOW + timedelta(seconds=5)), SOURCE_LIVE)
@@ -330,6 +432,22 @@ class AggregateTests(unittest.TestCase):
 
     def test_local_only_snapshot_payload_has_no_source_envelope(self) -> None:
         self.assertNotIn("sources", local_snapshot().as_payload())
+
+    def test_merged_rows_carry_host_identity(self) -> None:
+        snapshot = aggregate_sources(
+            (
+                local_source_observation(local_snapshot(), source=LOCAL),
+                parse_remote_board_payload(
+                    remote_payload(), source=REMOTE, observed_at=STAMP, now=NOW
+                ),
+            ),
+            observed_at=STAMP,
+        )
+
+        for row in snapshot.as_payload()["units"]:
+            self.assertIn("host_id", row)
+            self.assertIn("host_label", row)
+            self.assertIn("duplicate_scope", row)
 
 
 class ActionInputTests(unittest.TestCase):

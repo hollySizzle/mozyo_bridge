@@ -11,6 +11,7 @@ from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.unit_
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.remote_unit_action import (
     ACTION_DELIVERED,
     ACTION_REFUSED,
+    REASON_CONNECTION_VALUE_DISCLOSED,
     REASON_DELIVERY_FAILED,
     REASON_IDENTITY_CHANGED,
     REASON_INVALID_REQUEST,
@@ -83,6 +84,7 @@ def request(unit_id: str, **overrides) -> RemoteUnitActionRequest:
         "issue": "15138",
         "journal": "101633",
         "summary": "board pointer",
+        "target_project": "giken-3800-mozyo-bridge",
         "kind": "design_consultation",
     }
     values.update(overrides)
@@ -151,6 +153,8 @@ class PreviewTests(unittest.TestCase):
             {"summary": "   "},
             {"summary": "x" * 5000},
             {"summary": "line\nbreak"},
+            {"target_project": ""},
+            {"target_project": "   "},
             {"summary": "see /workspace/project-alpha for context"},
             {"summary": "token=DROP-TOKEN-SENTINEL"},
             {"kind": "close"},
@@ -178,6 +182,49 @@ class PreviewTests(unittest.TestCase):
 
 
 class ApplyTests(unittest.TestCase):
+    def test_declared_project_scope_is_what_gets_delivered(self) -> None:
+        # The registry project name is display metadata; the scope authority is
+        # the operator's declaration and nothing derived from the board.
+        action, runtime, runner = rail()
+        unit_id = remote_unit_id(runtime)
+
+        preview = action.preview(request(unit_id, target_project="scope-alpha"))
+        action.apply(preview)
+
+        self.assertEqual(preview.as_payload()["target_project"], "scope-alpha")
+        command = next(
+            argv[-1] for argv in runner.argvs if "project-gateway" in argv[-1]
+        )
+        self.assertIn("--target-project scope-alpha", command)
+        self.assertNotIn("--target-project mozyo_bridge", command)
+
+
+class ConnectionValueDisclosureTests(unittest.TestCase):
+    def test_a_summary_repeating_a_connection_value_refuses(self) -> None:
+        action, runtime, runner = rail()
+        unit_id = remote_unit_id(runtime)
+        before = len(runner.argvs)
+
+        preview = action.preview(
+            request(unit_id, summary="ping SSH-DESTINATION-SENTINEL first")
+        )
+
+        self.assertEqual(preview.reason, REASON_CONNECTION_VALUE_DISCLOSED)
+        self.assertNotIn("SSH-DESTINATION-SENTINEL", json.dumps(preview.as_payload()))
+        self.assertEqual(len(runner.argvs), before)
+
+    def test_a_project_scope_repeating_a_connection_value_refuses(self) -> None:
+        action, runtime, _ = rail()
+        unit_id = remote_unit_id(runtime)
+
+        preview = action.preview(
+            request(unit_id, target_project="ssh-destination-sentinel")
+        )
+
+        self.assertEqual(preview.reason, REASON_CONNECTION_VALUE_DISCLOSED)
+
+
+class ApplyDeliveryTests(unittest.TestCase):
     def test_apply_delivers_through_the_source_project_gateway(self) -> None:
         action, runtime, runner = rail()
         unit_id = remote_unit_id(runtime)
@@ -192,7 +239,7 @@ class ApplyTests(unittest.TestCase):
         self.assertIn("project-gateway handoff", command)
         self.assertIn("--to codex", command)
         self.assertIn("--target-repo /srv/checkouts/mozyo_bridge", command)
-        self.assertIn("--target-project mozyo_bridge", command)
+        self.assertIn("--target-project giken-3800-mozyo-bridge", command)
         self.assertIn("--issue 15138", command)
         self.assertNotIn("--to claude", command)
         self.assertNotIn("--target %", command)

@@ -24,8 +24,10 @@ from datetime import datetime, timezone
 from typing import Callable, Optional, Sequence
 
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.herdr_unit_board import (
+    AUTHORITY_RESOLVED,
     IDENTITY_RESOLVED,
     SOURCE_LIVE,
+    SOURCE_RELOAD_REQUIRED,
     UnitBoardRow,
     UnitBoardSnapshot,
 )
@@ -53,11 +55,24 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
 
 #: The read-only command a remote source is asked for.  Fixed argv, no operator
 #: substitution: the client asks every host the same question.
-REMOTE_BOARD_ARGS = ("herdr", "unit-board", "show", "--json")
+#:
+#: ``--local-only`` is load-bearing, not a convenience: without it a host that
+#: has its own observation sources answers with *its* merged board, so its rows
+#: describe servers this client never asked about (Redmine #15138 review
+#: j#101787 f2).  Mutually registered hosts would also fan out recursively.  The
+#: parser independently rejects a merged answer, so an old remote that ignores
+#: the flag fails closed rather than being trusted.
+REMOTE_BOARD_ARGS = ("herdr", "unit-board", "show", "--json", "--local-only")
 
 #: The read-only registry projection used to turn a Unit's ``workspace_id`` into
 #: the repository root the gateway resolution needs on that host.
 REMOTE_WORKSPACE_ARGS = ("workspace", "list", "--json")
+
+#: Outcomes of one read-only source query, kept distinct so a source that never
+#: answered is not reported the same way as one whose answer could not be read.
+ANSWER_OK = "ok"
+ANSWER_UNREACHABLE = "unreachable"
+ANSWER_UNREADABLE = "unreadable"
 
 #: Extra seconds allowed beyond a source's connection timeout for the remote
 #: command itself to run and answer.
@@ -149,23 +164,29 @@ class MultiSourceUnitBoardRuntime:
 
     def _run_source_json(
         self, source: UnitBoardSource, args: Sequence[str]
-    ) -> Optional[object]:
+    ) -> tuple[str, Optional[object]]:
         """Run one read-only command on a source and decode its JSON answer.
 
-        Returns ``None`` for a non-zero exit or unreadable output too.  The
-        caller turns that into a visible ``unavailable`` source rather than an
-        empty one, so a host that cannot be reached never reads as a host with
-        nothing running.
+        Returns the *reason* alongside the payload, because "the host did not
+        answer" and "the host answered something unreadable" are different
+        source states and collapsing them mislabels a schema break as a
+        connection failure (Redmine #15138 review j#101787 f6):
+
+        - :data:`ANSWER_UNREACHABLE` — argv unresolvable, spawn error, timeout,
+          or a non-zero exit: the source did not answer.
+        - :data:`ANSWER_UNREADABLE` — the source answered, but the answer could
+          not be decoded.
+        - :data:`ANSWER_OK` — a decoded payload.
         """
         completed = self.run_source_command(source, args)
-        if completed is None:
-            return None
-        if completed.returncode != 0 or not isinstance(completed.stdout, str):
-            return None
+        if completed is None or completed.returncode != 0:
+            return ANSWER_UNREACHABLE, None
+        if not isinstance(completed.stdout, str):
+            return ANSWER_UNREADABLE, None
         try:
-            return json.loads(completed.stdout)
+            return ANSWER_OK, json.loads(completed.stdout)
         except (TypeError, ValueError):
-            return None
+            return ANSWER_UNREADABLE, None
 
     def _observe_source(self, source: UnitBoardSource) -> SourceObservation:
         if source.is_local:
@@ -176,12 +197,20 @@ class MultiSourceUnitBoardRuntime:
                     source, observed_at=_stamp(self._clock())
                 )
             return local_source_observation(snapshot, source=source)
-        payload = self._run_source_json(source, REMOTE_BOARD_ARGS)
-        observed_at = _stamp(self._clock())
-        if payload is None:
+        answer, payload = self._run_source_json(source, REMOTE_BOARD_ARGS)
+        now = self._clock()
+        observed_at = _stamp(now)
+        if answer == ANSWER_UNREACHABLE:
             return unavailable_source_observation(source, observed_at=observed_at)
+        if answer == ANSWER_UNREADABLE:
+            return unavailable_source_observation(
+                source,
+                observed_at=observed_at,
+                source_state=SOURCE_RELOAD_REQUIRED,
+                detail="source returned an unreadable Unit board payload",
+            )
         return parse_remote_board_payload(
-            payload, source=source, observed_at=observed_at
+            payload, source=source, observed_at=observed_at, now=now
         )
 
     def observe(self) -> tuple[SourceObservation, ...]:
@@ -220,6 +249,9 @@ class MultiSourceUnitBoardRuntime:
         - the source is not live (unreachable, unreadable, or stale);
         - the key does not resolve to exactly one Unit on exactly one source;
         - the Unit's identity is ambiguous within its own source;
+        - the Unit's display authority did not resolve, so the far host could
+          not read the durable role binding that describes it (Redmine #15138
+          review j#101787 f3);
         - the workspace id is not a whole registry identity, so it may be a
           value that was bounded for display rather than the identity itself.
         """
@@ -237,6 +269,8 @@ class MultiSourceUnitBoardRuntime:
             return None
         observation, row = matches[0]
         if row.identity_state != IDENTITY_RESOLVED:
+            return None
+        if row.authority_state != AUTHORITY_RESOLVED:
             return None
         workspace_id = actionable_workspace_id(row)
         if workspace_id is None:
@@ -264,15 +298,20 @@ class MultiSourceUnitBoardRuntime:
     ) -> Optional["SourceWorkspace"]:
         """Resolve a workspace id against the registry *on that source's host*.
 
-        Returns the canonical root and the registry project name in one round
-        trip, because both are needed together and asking twice would let the
-        two answers come from different registry states.  ``canonical_path``
-        exists only to be an argv value on the far host: it is never rendered,
-        journalled, or stored.  Resolution is fail-closed — an unreadable
-        registry, a missing row, or more than one row for the same id yields
-        ``None`` and the action refuses.
+        Returns the canonical Git root only.  The registry also carries a
+        ``project_name``, and this deliberately does not read it: that field is
+        display metadata and a directory-name default, never a role or scope
+        authority (``workflow-step-command-design.md`` "registry project_name を
+        role/scope authority にしない"; Redmine #15138 review j#101787 f1).  The
+        repository root *is* the workspace authority, so it is the one value
+        taken from here.
+
+        ``canonical_path`` exists only to be an argv value on the far host: it
+        is never rendered, journalled, or stored.  Resolution is fail-closed —
+        an unreadable registry, a missing row, or more than one row for the same
+        id yields ``None`` and the action refuses.
         """
-        payload = self._run_source_json(source, REMOTE_WORKSPACE_ARGS)
+        _, payload = self._run_source_json(source, REMOTE_WORKSPACE_ARGS)
         if not isinstance(payload, dict):
             return None
         rows = payload.get("workspaces")
@@ -286,21 +325,20 @@ class MultiSourceUnitBoardRuntime:
         if len(matches) != 1:
             return None
         canonical_path = matches[0].get("canonical_path")
-        project_name = matches[0].get("project_name")
         if not isinstance(canonical_path, str) or not canonical_path.startswith("/"):
             return None
-        if not isinstance(project_name, str) or not project_name:
-            return None
         return SourceWorkspace(
-            workspace_id=workspace_id,
-            canonical_path=canonical_path,
-            project_name=project_name,
+            workspace_id=workspace_id, canonical_path=canonical_path
         )
 
 
 @dataclass(frozen=True)
 class SourceWorkspace:
     """A workspace as the *source host's* registry describes it.
+
+    Only the Git worktree root, which is the workspace authority.  The registry
+    project name is intentionally absent so it cannot be mistaken for a project
+    scope authority further down the call chain.
 
     ``canonical_path`` is a path on that host.  It is an argv input for a
     command executed there and must not reach any rendered, stored, or
@@ -309,10 +347,12 @@ class SourceWorkspace:
 
     workspace_id: str
     canonical_path: str
-    project_name: str
 
 
 __all__ = (
+    "ANSWER_OK",
+    "ANSWER_UNREACHABLE",
+    "ANSWER_UNREADABLE",
     "COMMAND_GRACE_SECONDS",
     "REMOTE_BOARD_ARGS",
     "REMOTE_WORKSPACE_ARGS",

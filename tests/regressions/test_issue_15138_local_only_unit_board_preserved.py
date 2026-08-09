@@ -27,7 +27,7 @@ from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.herdr
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.unit_board_sources import (
     LOCAL_HOST_ID,
     UnitBoardSourcesConfig,
-)
+)  # noqa: F401  (LOCAL_HOST_ID pins the key the local digest branch depends on)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_unit_board_runtime import (
     METADATA_TOKEN_KEYS,
 )
@@ -40,6 +40,24 @@ STAMP = "2026-08-09T12:00:00+00:00"
 #: from the historical algorithm, not copied from the current implementation.
 PINNED_DEFAULT_LANE_UNIT_ID = "unit-f5bab7c512f3d490f8a1809d88b36b20"
 PINNED_ISSUE_LANE_UNIT_ID = "unit-475fc0a512c35213cc4e7cf49a68c16e"
+
+#: The row payload keys emitted by parent commit 1e11b537, transcribed from that
+#: commit's ``UnitBoardRow.as_payload``.  Pinning the parent's key set — rather
+#: than asserting the fields this issue added — is what makes this a
+#: re-occurrence detector instead of a description of the new behaviour
+#: (Redmine #15138 review j#101787 f5).
+PARENT_ROW_PAYLOAD_KEYS = (
+    "agents",
+    "authority_state",
+    "identity_state",
+    "lane_id",
+    "project_label",
+    "responsibility",
+    "unit_id",
+    "work_label",
+    "workflow_role",
+    "workspace_id",
+)
 
 
 def local_board(lane_id: str = "default"):
@@ -93,11 +111,17 @@ class LocalOnlyBoardPreservedTests(unittest.TestCase):
             PINNED_DEFAULT_LANE_UNIT_ID,
         )
 
-    def test_local_board_payload_has_no_source_envelope(self) -> None:
+    def test_local_board_payload_matches_the_parent_shape(self) -> None:
         payload = local_board().as_payload()
 
         self.assertNotIn("sources", payload)
-        self.assertEqual(payload["units"][0]["host_id"], LOCAL_HOST_ID)
+        self.assertEqual(
+            sorted(payload["units"][0]), sorted(PARENT_ROW_PAYLOAD_KEYS)
+        )
+        self.assertEqual(
+            sorted(payload["units"][0]["agents"][0]),
+            ["interactive_ready", "provider", "runtime_state"],
+        )
 
     def test_local_board_text_keeps_its_columns(self) -> None:
         text = format_board(local_board(), width=120)

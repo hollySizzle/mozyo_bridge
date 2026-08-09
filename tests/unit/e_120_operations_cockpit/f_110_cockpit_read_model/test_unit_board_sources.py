@@ -71,6 +71,26 @@ class SourceSchemaTests(unittest.TestCase):
                 {"version": 1, "sources": [ssh_record(), ssh_record()]}
             )
 
+    def test_duplicate_display_labels_fail_closed(self) -> None:
+        # The label is the only source identity the board renders, so two
+        # sources sharing one make their rows indistinguishable on screen.
+        with self.assertRaises(UnitBoardSourceError):
+            UnitBoardSourcesConfig.from_record(
+                {
+                    "version": 1,
+                    "sources": [
+                        ssh_record(host_id="devbox", label="dev"),
+                        ssh_record(host_id="buildbox", ssh_target="b", label="DEV"),
+                    ],
+                }
+            )
+
+    def test_a_remote_label_may_not_shadow_the_local_one(self) -> None:
+        with self.assertRaises(UnitBoardSourceError):
+            UnitBoardSourcesConfig.from_record(
+                {"version": 1, "sources": [ssh_record(label="local")]}
+            )
+
     def test_unknown_keys_and_versions_fail_closed(self) -> None:
         with self.assertRaises(UnitBoardSourceError):
             UnitBoardSourcesConfig.from_record({"version": 2, "sources": []})
@@ -146,6 +166,46 @@ class SourceSchemaTests(unittest.TestCase):
             payload, {"host_id": "devbox", "host_label": "dev host", "host_kind": "ssh"}
         )
         self.assertNotIn("SSH-DESTINATION-SENTINEL", str(payload))
+
+
+class ConnectionValueDisclosureTests(unittest.TestCase):
+    def config(self) -> UnitBoardSourcesConfig:
+        return UnitBoardSourcesConfig.from_record(
+            {
+                "version": 1,
+                "sources": [
+                    ssh_record(ssh_target="SSH-DESTINATION-SENTINEL"),
+                    container_record(container="CONTAINER-SENTINEL"),
+                ],
+            }
+        )
+
+    def test_configured_values_are_reported(self) -> None:
+        self.assertEqual(
+            set(self.config().private_connection_values),
+            {"SSH-DESTINATION-SENTINEL", "CONTAINER-SENTINEL"},
+        )
+
+    def test_the_published_default_binary_is_not_treated_as_private(self) -> None:
+        self.assertNotIn("mozyo-bridge", self.config().private_connection_values)
+
+    def test_text_embedding_a_connection_value_is_flagged(self) -> None:
+        config = self.config()
+
+        self.assertEqual(
+            config.disclosed_connection_value("see ssh-destination-sentinel please"),
+            "SSH-DESTINATION-SENTINEL",
+        )
+        self.assertEqual(
+            config.disclosed_connection_value("CONTAINER-SENTINEL"),
+            "CONTAINER-SENTINEL",
+        )
+
+    def test_unrelated_text_is_not_flagged(self) -> None:
+        self.assertIsNone(
+            self.config().disclosed_connection_value("pointer to the durable record")
+        )
+        self.assertIsNone(self.config().disclosed_connection_value(""))
 
 
 class SourceArgvTests(unittest.TestCase):

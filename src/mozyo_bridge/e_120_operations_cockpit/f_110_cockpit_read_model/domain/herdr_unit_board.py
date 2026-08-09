@@ -580,11 +580,18 @@ class UnitBoardRow:
     host_label: str = LOCAL_HOST_ID
     duplicate_scope: str = DUPLICATE_SCOPE_NONE
 
-    def as_payload(self) -> dict[str, object]:
-        return {
+    def as_payload(self, *, host_qualified: bool = False) -> dict[str, object]:
+        """Project one row.  Host identity appears only in a merged board.
+
+        A client observing several servers needs every row to say where it
+        lives.  A client observing only its own server does not, and adding the
+        fields there would change a payload that existing consumers already
+        read — the local-only surface is required to stay byte-compatible
+        (Redmine #15138 review j#101787 f5).  So the merged projection asks for
+        the host fields and the single-server projection does not.
+        """
+        payload: dict[str, object] = {
             "unit_id": safe_text(self.unit_id),
-            "host_id": safe_text(self.host_id),
-            "host_label": safe_text(self.host_label),
             "workspace_id": safe_text(self.workspace_id),
             "lane_id": safe_text(self.lane_id),
             "project_label": safe_text(self.project_label),
@@ -593,9 +600,13 @@ class UnitBoardRow:
             "work_label": safe_text(self.work_label),
             "authority_state": safe_text(self.authority_state),
             "identity_state": safe_text(self.identity_state),
-            "duplicate_scope": safe_text(self.duplicate_scope),
             "agents": [agent.as_payload() for agent in self.agents],
         }
+        if host_qualified:
+            payload["host_id"] = safe_text(self.host_id)
+            payload["host_label"] = safe_text(self.host_label)
+            payload["duplicate_scope"] = safe_text(self.duplicate_scope)
+        return payload
 
 
 @dataclass(frozen=True)
@@ -671,10 +682,14 @@ class UnitBoardSnapshot:
             "observed_at": safe_text(self.observed_at, fallback=""),
             "unmanaged_agents": self.unmanaged_agents,
             "detail": safe_text(self.detail, fallback="") if self.detail else "",
-            "units": [unit.as_payload() for unit in self.units],
+            "units": [
+                unit.as_payload(host_qualified=bool(self.sources))
+                for unit in self.units
+            ],
         }
-        # Additive and only when multi-source observation actually ran, so a
-        # single-server payload keeps the shape its existing consumers read.
+        # The source envelope is what makes this a merged board, and it is the
+        # same condition under which rows carry host identity: a single-server
+        # payload keeps exactly the shape its existing consumers read.
         if self.sources:
             payload["sources"] = [source.as_payload() for source in self.sources]
         return payload

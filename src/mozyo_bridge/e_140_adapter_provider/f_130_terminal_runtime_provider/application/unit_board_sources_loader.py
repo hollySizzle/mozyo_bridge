@@ -59,7 +59,19 @@ def _construct_mapping_no_duplicates(
     mapping: dict = {}
     for key_node, value_node in node.value:
         key = loader.construct_object(key_node, deep=deep)
-        if key in mapping:
+        try:
+            duplicate = key in mapping
+        except TypeError as exc:
+            # A YAML complex key (`? [a, b]`) is unhashable, so the duplicate
+            # check itself raises before any schema rule runs.  Left bare it
+            # escapes as a TypeError past the loader's `yaml.YAMLError` guard
+            # and reaches the CLI as an unhandled error rather than a
+            # fail-closed diagnostic (Redmine #15138 review j#101787 f9).
+            raise UnitBoardSourcesLoadError(
+                "operator Unit board sources file has a non-scalar mapping key; "
+                "keys must be plain strings"
+            ) from exc
+        if duplicate:
             raise UnitBoardSourcesLoadError(
                 f"operator Unit board sources file has a duplicate key {key!r}; a "
                 "conflicting value is rejected rather than resolved by declaration order"

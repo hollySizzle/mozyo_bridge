@@ -64,6 +64,21 @@ MAX_SOURCE_AGENTS = 16
 #: allowed to render a slightly older answer — but only render it.
 DEFAULT_SOURCE_FRESHNESS_SECONDS = 30
 
+#: Bounds for the *remote answer's own* observation timestamp, a separate
+#: dimension from the client-side freshness above (Redmine #15138 review
+#: j#101787 f4).  The client timing its own round trip proves when the answer
+#: arrived, not when the far host observed what it reported; an answer that is
+#: undated, unparsable, or self-dated far in the past is one whose age the
+#: client cannot establish, and it must not be action authority.
+#:
+#: The bound here is deliberately looser than the client-side one and carries an
+#: explicit skew allowance, because it compares two machines' clocks.  A tight
+#: bound would make every mildly skewed host permanently unactionable, which is
+#: fail-closed but useless; a loose one still rejects the case that matters — an
+#: answer reporting an observation from another era.
+MAX_REMOTE_PAYLOAD_AGE_SECONDS = 600
+MAX_REMOTE_CLOCK_SKEW_SECONDS = 300
+
 #: The canonical registry workspace identifier shape.  Checked explicitly before
 #: a remote identity is used as an action input, so the client can never act on
 #: a value that was reshaped for display.
@@ -72,6 +87,8 @@ _WORKSPACE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _DETAIL_UNREACHABLE = "source Herdr observation is unavailable"
 _DETAIL_INVALID = "source returned an unreadable Unit board payload"
 _DETAIL_STALE = "source observation is older than the action freshness bound"
+_DETAIL_NESTED = "source returned a merged board instead of its own single server"
+_DETAIL_PAYLOAD_STALE = "source reported an observation time it cannot be acted on from"
 
 #: Domain separator for a remote Unit's client-side key.  The remote already
 #: hashed its full ``(workspace_id, lane_id)``; re-hashing that opaque key with
@@ -133,6 +150,25 @@ def freshness_state(
         return SOURCE_STALE
     age = (now - stamp).total_seconds()
     if age < 0 or age > max_age_seconds:
+        return SOURCE_STALE
+    return SOURCE_LIVE
+
+
+def remote_payload_freshness(observed_at: object, now: datetime) -> str:
+    """Classify the *remote answer's own* observation time (Redmine #15138 f4).
+
+    Separate from :func:`freshness_state`, which times the client's own round
+    trip.  Both must hold for a source to be action authority: the client must
+    know when the answer arrived *and* the answer must claim an observation the
+    client can still justify acting on.
+    """
+    stamp = _parsed_timestamp(observed_at)
+    if stamp is None or stamp.tzinfo is None or now.tzinfo is None:
+        return SOURCE_STALE
+    age = (now - stamp).total_seconds()
+    if age > MAX_REMOTE_PAYLOAD_AGE_SECONDS:
+        return SOURCE_STALE
+    if age < -MAX_REMOTE_CLOCK_SKEW_SECONDS:
         return SOURCE_STALE
     return SOURCE_LIVE
 
@@ -249,7 +285,11 @@ def _agent_cells(raw: object) -> tuple[AgentCell, ...]:
 
 
 def parse_remote_board_payload(
-    payload: object, *, source: UnitBoardSource, observed_at: str
+    payload: object,
+    *,
+    source: UnitBoardSource,
+    observed_at: str,
+    now: Optional[datetime] = None,
 ) -> SourceObservation:
     """Validate one remote ``unit-board show --json`` answer into rows.
 
@@ -262,6 +302,21 @@ def parse_remote_board_payload(
     try:
         if not isinstance(payload, Mapping):
             raise ValueError("unreadable payload")
+        if "sources" in payload:
+            # A source must answer for its own server only.  A merged answer
+            # means the far host aggregated *its* sources, so its rows describe
+            # servers this client never asked about — and tagging them with the
+            # outer source id would attribute another host's Units to this one
+            # (Redmine #15138 review j#101787 f2).  Mutually registered hosts
+            # would also fan out recursively.
+            return SourceObservation(
+                status=source_status(
+                    source,
+                    source_state=SOURCE_RELOAD_REQUIRED,
+                    observed_at=observed_at,
+                    detail=_DETAIL_NESTED,
+                )
+            )
         state = payload.get("source_state")
         if state != SOURCE_LIVE:
             return SourceObservation(
@@ -332,6 +387,11 @@ def parse_remote_board_payload(
         unmanaged_count = (
             unmanaged if isinstance(unmanaged, int) and not isinstance(unmanaged, bool) else 0
         )
+        payload_state = (
+            SOURCE_LIVE
+            if now is None
+            else remote_payload_freshness(payload.get("observed_at"), now)
+        )
     except (ValueError, TypeError):
         return SourceObservation(
             status=source_status(
@@ -344,10 +404,11 @@ def parse_remote_board_payload(
     return SourceObservation(
         status=source_status(
             source,
-            source_state=SOURCE_LIVE,
+            source_state=payload_state,
             observed_at=observed_at,
             unit_count=len(rows),
             unmanaged_agents=max(0, unmanaged_count),
+            detail="" if payload_state == SOURCE_LIVE else _DETAIL_PAYLOAD_STALE,
         ),
         rows=tuple(rows),
         remote_unit_ids=remote_unit_ids,
@@ -537,6 +598,9 @@ def format_multi_source_board(snapshot: UnitBoardSnapshot, *, width: int = 120) 
 
 __all__ = (
     "DEFAULT_SOURCE_FRESHNESS_SECONDS",
+    "MAX_REMOTE_CLOCK_SKEW_SECONDS",
+    "MAX_REMOTE_PAYLOAD_AGE_SECONDS",
+    "remote_payload_freshness",
     "MAX_SOURCE_AGENTS",
     "MAX_SOURCE_UNITS",
     "SourceObservation",
