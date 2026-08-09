@@ -521,15 +521,30 @@ EnvironmentVariables なし）契約を維持する。
 
 **停止は「試みた」ではなく「確認した」でなければならない**（review j#102151 Finding 1）。plist の unlink は
 registration の削除ではない: launchd は bootstrap 済み job を **label** で保持するため、file を消しても job は
-logout まで走り続ける。したがって migration は bootout 後に **当該 label が loaded でないことを読み直し**、
-まだ loaded なら `legacy_drain_still_loaded` で拒否して新 agent を導入しない（live registration 2 個を作らな
-いため）。このとき退役 plist は**あえて残す**: それが operator にとって「まだ生きている登録がある」ことを示す
-唯一の durable な手掛かりであり、消せば live job を隠すことになる。
+logout まで走り続ける。したがって退役 plist の削除は **「退役 job が消えている」という positive な証拠**が
+得られた場合に限る。証拠の取り方は次の 2 つだけである:
 
-**判定に bootout の return code を使わない。** `launchctl bootout` は未 load の label に対しても非ゼロを返す
-——これは既に停止済みの退役 agent の通常状態であり、return code を失敗と読むと **正常な migration をすべて
-拒否する**。authority は bootout 後の load 状態であり、「bootout が効いた」と「そもそも load されていなかった」
-は同じ検証済み結果へ収束し、本当に生きている job だけが blocking となる。
+1. `launchctl bootout` が **rc 0 で成功した** —— 自分でいま unload したのだから確実であり、error taxonomy の
+   解釈に一切依存しない。
+2. bootout が失敗し、続く `launchctl print` が **「そのような service は無い」と明示的に報告した** —— 元から
+   load されていなかった場合であり、既に停止済みの退役 agent の通常状態である。
+
+bootout の return code **単体**は判定に使わない（未 load の label にも非ゼロを返すため、失敗と読むと正常な
+migration をすべて拒否する）。ただしその **成功は事実として使う**。これにより通常経路は error 解釈を経由せず
+確定し、推測に依存するのは「元から load されていなかった」case だけになる。
+
+**「読めなかった」を「無かった」に畳まない**（review j#102180 finding 1）。probe は `loaded` /
+`confirmed_absent` / `unreadable` の 3 値であり、**`confirmed_absent` だけが削除を許可する**。権限不足・
+service manager 異常・認識できない失敗・launchctl 不在はすべて `unreadable` であり、
+`legacy_drain_state_unreadable` で拒否する。以前の版は `launchctl print` の非ゼロをすべて「not loaded」へ畳んで
+いたため、**実際には読めていない状態を検証済みの停止として** plist を削除できてしまった。`still_loaded` と
+`state_unreadable` は事実が異なる（「動いている」と「判別できない」）ため token を分ける。どちらの拒否でも退役
+plist は**あえて残す**: それが operator にとって「まだ生きている登録があるかもしれない」ことを示す唯一の
+durable な手掛かりであり、消せば live job を隠すことになる。
+
+not-found の認識は `launchctl` の exit code（113）と message（`could not find service` 等）の **両方**を signal
+とする（どちらも単独では安定契約ではないため）。**認識漏れの失敗方向は over-refusal**（typed reason 付きで
+install を拒否）であり、under-refusal（二重登録）ではない。実 macOS の signal との突合は #15194 の検証項目。
 
 **順序は「先に退役、後に install」**であり、これが partial failure 下で不変条件を保つ順序である。逆順（install
 してから migration）にすると途中失敗時に **登録が 2 個** 残る——本変更が終わらせようとしている状態そのものであ

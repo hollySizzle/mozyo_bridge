@@ -37,9 +37,11 @@ Design boundary (design preflight j#78995 / Implementation Request j#79005):
   (bootout-then-bootstrap), restart acts only on a *loaded* service, uninstall removes exactly the
   owned label / plist and touches nothing else.
 - **Fail-closed, zero-mutation refusals.** ``install`` / ``restart`` refuse — *before* writing any
-  file or invoking launchctl — on a non-darwin host, a missing executable, or a Redmine credential
-  that is missing / incomplete / unsafe / malformed. ``uninstall`` and status stay usable with no
-  credential at all (you must be able to tear an agent down without configured credentials).
+  file or invoking launchctl — on a non-darwin host, a missing executable, or a retired drain plist
+  that cannot be identified as ours. A non-ready Redmine credential is **not** among them since
+  #15192 (review j#102151 Finding 4): readiness is projected, not gated, matching the Linux adapter,
+  because a tick does useful local work with no provider at all. ``uninstall`` and status stay
+  usable with no credential at all.
 - **Redacted status projection.** Status reports plist existence / loaded / pid / scheduled interval /
   executable-match / credential-readiness as booleans, counts, and fixed-vocabulary tokens only — no
   credential value, no request header, no repo-local path, no pane text.
@@ -50,9 +52,7 @@ installing / restarting / uninstalling the agent is orthogonal to what the agent
 
 from __future__ import annotations
 
-import dataclasses
 import os
-import plistlib
 import shutil
 import subprocess
 import sys
@@ -62,8 +62,6 @@ from typing import Callable, Optional, Sequence
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
     DEFAULT_OS_TICK_INTERVAL_SECONDS,
     DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
-    DEFAULT_SUPERVISOR_DRAIN_SERVICE_LABEL,
-    DEFAULT_SUPERVISOR_SERVICE_LABEL,
 )
 from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_context import (
     normalize_base_url,
@@ -71,81 +69,41 @@ from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.re
 from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_credentials import (
     resolve_redmine_credentials,
 )
-from mozyo_bridge.shared.paths import mozyo_bridge_home
-
-# ---------------------------------------------------------------------------
-# Owned identity (a reverse-DNS label + owned plist/log paths; not operator-private).
-#
-# Two DISTINCT roots must never be conflated (review j#79092 R2-F1):
-#   - the **OS user home** (``Path.home()``) owns the plist + log under ``~/Library`` — this is
-#     where launchd looks for LaunchAgents, independent of any mozyo config;
-#   - the **mozyo home** (``mozyo_bridge_home()``: ``MOZYO_BRIDGE_HOME`` or ``~/.mozyo_bridge``)
-#     owns the registry / store / credential root the supervisor reads at run time.
-# ---------------------------------------------------------------------------
-
-SUPERVISOR_LAUNCHD_LABEL = DEFAULT_SUPERVISOR_SERVICE_LABEL
-PLIST_RELATIVE = Path("Library/LaunchAgents") / f"{SUPERVISOR_LAUNCHD_LABEL}.plist"
-LOG_RELATIVE = Path("Library/Logs/mozyo-bridge/callback-supervisor.log")
-
-#: The executable name resolved from PATH at install time (never a shell string).
-SUPERVISOR_EXECUTABLE_NAME = "mozyo-bridge"
-#: The structured argv tail the scheduled agent runs each tick (one bounded sweep, then exit). The
-#: resolved mozyo home is pinned onto this as ``--home <root>`` at install time (see
-#: :func:`resolve_supervisor_command`) so the launchd daemon reads the *same* credential / registry
-#: root the install preflight validated — launchd carries no ``MOZYO_BRIDGE_HOME`` (j#79092 R2-F1).
-SUPERVISOR_ARGV_TAIL = ("workflow", "supervisor", "--run-once")
-#: The structured flag that pins the mozyo home root onto the daemon argv (non-secret; a config
-#: directory, resolved by the supervisor CLI's ``--home``).
-SUPERVISOR_HOME_FLAG = "--home"
-
-# ---------------------------------------------------------------------------
-# Owned agent (Redmine #15192): exactly ONE. The retired ``--drain-only`` agent's identity is kept
-# below purely so an upgrade can RECOGNIZE and remove what a pre-#15192 install left behind — it is a
-# migration target, never something a verb installs.
-# ---------------------------------------------------------------------------
-
-#: The retired local-drain agent's owned identity (#14150, retired by #15192). Kept so
-#: :func:`classify_legacy_drain` can tell "our old registration" from "a stranger's plist that
-#: happens to sit at this path" — the removal fence needs both the path and the label.
-SUPERVISOR_DRAIN_LAUNCHD_LABEL = DEFAULT_SUPERVISOR_DRAIN_SERVICE_LABEL
-DRAIN_PLIST_RELATIVE = Path("Library/LaunchAgents") / f"{SUPERVISOR_DRAIN_LAUNCHD_LABEL}.plist"
-DRAIN_LOG_RELATIVE = Path("Library/Logs/mozyo-bridge/callback-supervisor-drain.log")
-SUPERVISOR_DRAIN_ARGV_TAIL = ("workflow", "supervisor", "--drain-only")
-
-
-@dataclasses.dataclass(frozen=True)
-class SupervisorAgent:
-    """One owned launchd agent's identity (label + plist/log paths + the bounded argv tail it runs)."""
-
-    label: str
-    argv_tail: tuple[str, ...]
-    plist_relative: Path
-    log_relative: Path
-    default_interval_seconds: int
-
-
-#: The single owned agent: one bounded ``workflow supervisor --run-once`` per tick, at the shared
-#: portable OS cadence both host adapters register at (#15192).
-SUPERVISOR_AGENT = SupervisorAgent(
-    label=SUPERVISOR_LAUNCHD_LABEL,
-    argv_tail=SUPERVISOR_ARGV_TAIL,
-    plist_relative=PLIST_RELATIVE,
-    log_relative=LOG_RELATIVE,
-    default_interval_seconds=DEFAULT_OS_TICK_INTERVAL_SECONDS,
-)
-#: The owned agents an install/uninstall/status sweep manages. Exactly one since #15192; the tuple
-#: shape is kept because the CLI renders an ``agents`` roster on every backend.
-SUPERVISOR_AGENTS = (SUPERVISOR_AGENT,)
-
-#: The retired drain agent, as a migration target only. Deliberately NOT in
-#: :data:`SUPERVISOR_AGENTS`: no verb installs, restarts, or reports it as owned — ``install`` and
-#: ``uninstall`` only *remove* it.
-LEGACY_DRAIN_AGENT = SupervisorAgent(
-    label=SUPERVISOR_DRAIN_LAUNCHD_LABEL,
-    argv_tail=SUPERVISOR_DRAIN_ARGV_TAIL,
-    plist_relative=DRAIN_PLIST_RELATIVE,
-    log_relative=DRAIN_LOG_RELATIVE,
-    default_interval_seconds=DEFAULT_OS_TICK_INTERVAL_SECONDS,
+# The pure layer (owned identity, path / argv resolution, plist rendering and read-back, and the
+# vocabularies those produce) lives in the sibling module so neither side exceeds the module-health
+# line budget — the same split the Linux adapter carries (review j#102069 F7). Everything is
+# re-exported here, so this module remains the single import for the whole macOS adapter and no
+# caller or test had to change.
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd_agent import (  # noqa: E501
+    DRAIN_LOG_RELATIVE,
+    DRAIN_PLIST_RELATIVE,
+    HOME_PIN_DUPLICATE,
+    HOME_PIN_MALFORMED,
+    HOME_PIN_MISSING,
+    HOME_PIN_NO_ARGV,
+    HOME_PIN_NOT_ABSOLUTE,
+    HOME_PIN_NOT_INSTALLED,
+    HOME_PIN_OK,
+    HOME_PIN_UNREADABLE,
+    LEGACY_DRAIN_AGENT,
+    LOG_RELATIVE,
+    PLIST_RELATIVE,
+    SUPERVISOR_AGENT,
+    SUPERVISOR_AGENTS,
+    SUPERVISOR_ARGV_TAIL,
+    SUPERVISOR_DRAIN_ARGV_TAIL,
+    SUPERVISOR_DRAIN_LAUNCHD_LABEL,
+    SUPERVISOR_EXECUTABLE_NAME,
+    SUPERVISOR_HOME_FLAG,
+    SUPERVISOR_LAUNCHD_LABEL,
+    SupervisorAgent,
+    extract_pinned_home as _extract_pinned_home,
+    log_path,
+    plist_path,
+    read_installed_plist as _read_installed_plist,
+    render_plist,
+    resolve_mozyo_home,
+    resolve_supervisor_command,
 )
 
 # ---------------------------------------------------------------------------
@@ -192,6 +150,18 @@ REASON_LEGACY_DRAIN_REMOVAL_FAILED = "legacy_drain_removal_failed"
 #: alongside a live retired one: two registrations, the exact state this change exists to end.
 REASON_LEGACY_DRAIN_STILL_LOADED = "legacy_drain_still_loaded"
 
+#: install refused: the retired agent's run state could not be READ (permission denied, a broken
+#: service manager, an unrecognized launchctl failure). Distinct from ``still_loaded`` because the
+#: facts differ — one says "it is running", this one says "I cannot tell" — and identical only in
+#: consequence: neither may authorize deleting a registration or adding a second (j#102180 F1).
+REASON_LEGACY_DRAIN_STATE_UNREADABLE = "legacy_drain_state_unreadable"
+
+#: ``launchctl print`` probe outcomes (see :func:`_probe`). Three values, not a boolean: "I could
+#: not read it" is a different answer from "it is not there", and only the latter is safe.
+PROBE_LOADED = "loaded"
+PROBE_CONFIRMED_ABSENT = "confirmed_absent"
+PROBE_UNREADABLE = "unreadable"
+
 #: Retired-drain classification vocabulary (see :func:`classify_legacy_drain`).
 LEGACY_DRAIN_ABSENT = "absent"  # nothing at the retired path: a clean or already-migrated host
 LEGACY_DRAIN_OWNED = "owned"  # our retired registration, safe to remove
@@ -217,20 +187,6 @@ NEXT_ELAPSE_UNKNOWN = ""
 LAST_RESULT_SUCCESS = "success"
 LAST_RESULT_EXIT_CODE = "exit-code"
 
-#: ``home_pin`` extraction status vocabulary (see :func:`_extract_pinned_home`).
-HOME_PIN_OK = "ok"
-HOME_PIN_MISSING = "missing"
-HOME_PIN_DUPLICATE = "duplicate"
-HOME_PIN_MALFORMED = "malformed"
-#: The pin value is present but not an absolute, lexically-canonical path (relative / ``~`` / has
-#: ``..`` etc.) — a launchd daemon resolves it from a different cwd than the installer (j#79136 R4-F1).
-HOME_PIN_NOT_ABSOLUTE = "not_absolute"
-HOME_PIN_NO_ARGV = "no_argv"
-#: The owned plist file exists but could not be parsed / is not a mapping (distinct from absence,
-#: which is ``not_installed``) — j#79136 R4-F3.
-HOME_PIN_UNREADABLE = "unreadable_plist"
-HOME_PIN_NOT_INSTALLED = "not_installed"
-
 #: Credential-readiness tokens (the exact readiness the live supervisor needs to reach Redmine).
 CREDENTIAL_READY = "ready"  # api key + usable base url present
 CREDENTIAL_INCOMPLETE = "incomplete"  # exactly one of key / usable url present
@@ -241,94 +197,6 @@ CREDENTIAL_UNSAFE = "unsafe"  # a present credential file is unsafe/malformed (p
 _LAUNCHCTL = "launchctl"
 
 Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
-
-
-# ---------------------------------------------------------------------------
-# Path + command + plist rendering (pure; no host mutation, no secrets).
-# ---------------------------------------------------------------------------
-
-
-def plist_path(os_home: Optional[Path] = None, *, agent: SupervisorAgent = SUPERVISOR_AGENT) -> Path:
-    """The owned plist path under the **OS user home** (``~/Library/LaunchAgents``)."""
-    return (os_home or Path.home()) / agent.plist_relative
-
-
-def log_path(os_home: Optional[Path] = None, *, agent: SupervisorAgent = SUPERVISOR_AGENT) -> Path:
-    """The owned log path under the **OS user home** (``~/Library/Logs``)."""
-    return (os_home or Path.home()) / agent.log_relative
-
-
-def resolve_mozyo_home(mozyo_home: Optional[Path] = None) -> Path:
-    """Resolve the exact **mozyo home** root (credential / registry / store) as an absolute path.
-
-    ``mozyo_home`` (the supervisor CLI's ``--home``) wins; otherwise the package's home contract
-    (:func:`mozyo_bridge_home`: ``MOZYO_BRIDGE_HOME`` or ``~/.mozyo_bridge``). An explicit value is
-    ``expanduser().resolve()``-normalized to an **absolute canonical root** — a relative / ``~``
-    input must never be pinned onto the daemon argv, since a LaunchAgent's working directory is not
-    the installer shell's, so a relative pin would re-diverge the credential / registry root
-    (j#79125 R3-F2). ``mozyo_bridge_home()`` already returns an absolute resolved path.
-    """
-    if mozyo_home is not None:
-        return Path(mozyo_home).expanduser().resolve()
-    return mozyo_bridge_home()
-
-
-def resolve_supervisor_command(
-    *,
-    mozyo_home: Optional[Path] = None,
-    which: Callable[[str], Optional[str]] = shutil.which,
-    agent: SupervisorAgent = SUPERVISOR_AGENT,
-) -> Optional[list[str]]:
-    """The exact argv the agent runs, or ``None`` when the executable is not on PATH.
-
-    The executable is PATH-resolved at install time (so the plist survives shell-env differences)
-    and normalized to an **absolute canonical path** (``os.path.abspath``): a relative PATH entry
-    makes ``shutil.which`` return a relative path, which a LaunchAgent would resolve from its own
-    working directory rather than the installer's — the same cwd divergence closed for the ``--home``
-    pin (j#79149 R5-F1). The **resolved mozyo home** is likewise pinned as ``--home <root>`` so the
-    daemon reads the credential / registry root the preflight validated (j#79092 R2-F1). A missing
-    executable is a fail-closed condition the caller turns into a zero-mutation refusal (install the
-    package first) — never a shell string and never a guessed path.
-    """
-    executable = which(SUPERVISOR_EXECUTABLE_NAME)
-    if not executable:
-        return None
-    return [
-        os.path.abspath(executable),
-        *agent.argv_tail,
-        SUPERVISOR_HOME_FLAG,
-        str(resolve_mozyo_home(mozyo_home)),
-    ]
-
-
-def render_plist(
-    command: Sequence[str],
-    *,
-    interval_seconds: int,
-    os_home: Optional[Path] = None,
-    agent: SupervisorAgent = SUPERVISOR_AGENT,
-) -> bytes:
-    """Render the LaunchAgent plist for the one-shot scheduled supervisor sweep.
-
-    Structurally minimal and secret-free:
-
-    - **No** ``EnvironmentVariables`` key exists in the output, so no secret can be serialized in.
-    - **No** ``KeepAlive`` key: the command is a bounded ``--run-once`` sweep that exits;
-      ``RunAtLoad`` runs it once at load and ``StartInterval`` re-runs it every ``interval_seconds``.
-      KeepAlive would be a tight restart loop for a one-shot command, so it is absent by design.
-    - ``ProgramArguments`` is the exact structured argv (PATH-resolved executable + fixed tail +
-      the pinned ``--home <mozyo root>``). The log lives under the OS user home (``os_home``).
-    """
-    payload = {
-        "Label": agent.label,
-        "ProgramArguments": list(command),
-        "RunAtLoad": True,
-        "StartInterval": max(1, int(interval_seconds)),
-        "StandardOutPath": str(log_path(os_home, agent=agent)),
-        "StandardErrorPath": str(log_path(os_home, agent=agent)),
-        "ProcessType": "Background",
-    }
-    return plistlib.dumps(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -404,12 +272,31 @@ def _launchctl(runner: Runner, args: Sequence[str]) -> "subprocess.CompletedProc
 #: prefix silently costs the whole 直近の終了結果 projection (#15192).
 _LAST_EXIT_PREFIXES = ("last exit code = ", "last exit status = ")
 
+#: ``launchctl print`` exit codes that positively mean "no such service in this domain". 113 is the
+#: code launchctl returns for an unknown label; it is listed rather than assumed stable, and a miss
+#: falls through to the phrase check and then to :data:`PROBE_UNREADABLE`.
+_LAUNCHCTL_NOT_FOUND_CODES = (113,)
+#: Lowercased fragments of launchctl's "unknown service" message. A second, independent signal for
+#: the same fact, because the exit code is not a documented contract.
+_LAUNCHCTL_NOT_FOUND_PHRASES = ("could not find service", "no such process", "not find service")
+
 
 def _probe(runner: Runner, agent: SupervisorAgent = SUPERVISOR_AGENT) -> dict:
-    """Read-only ``launchctl print`` → ``{loaded, pid, last_exit_status}``. Never raises.
+    """Read-only ``launchctl print`` → ``{state, loaded, pid, last_exit_status}``. Never raises.
 
-    A missing launchctl (non-darwin / minimal host) or a non-zero exit (unknown label) reads as not
-    loaded with nothing known about it.
+    ``state`` is the THREE-valued answer the migration fence needs (review j#102180 finding 1):
+    :data:`PROBE_LOADED`, :data:`PROBE_CONFIRMED_ABSENT`, or :data:`PROBE_UNREADABLE`. Collapsing
+    every non-zero exit into "not loaded" is what let a permission-denied / manager-error read pass
+    as a verified stop — "I could not see it" is not "it is not there", and only the second one may
+    authorize deleting a registration.
+
+    A non-zero exit is classified as *confirmed absent* ONLY when launchctl positively says the
+    service is unknown (:data:`_LAUNCHCTL_NOT_FOUND_CODES` / :data:`_LAUNCHCTL_NOT_FOUND_PHRASES`).
+    Anything else — an unrecognized code, an unreadable message, a missing launchctl binary, an OS
+    error — is :data:`PROBE_UNREADABLE`, so the caller fails closed rather than guessing.
+
+    ``loaded`` is kept as the boolean the status projection and ``restart`` already consume; it is
+    true only for :data:`PROBE_LOADED`, so an unreadable probe never reads as "running".
 
     Every integer here is read as an ASCII decimal inside POSIX ``pid_t`` width, NOT via
     ``str.isdigit()``, which does not mean "a number ``int()`` can read": measured (Redmine #14753),
@@ -417,13 +304,17 @@ def _probe(runner: Runner, agent: SupervisorAgent = SUPERVISOR_AGENT) -> dict:
     function's "never raises" promise and the typed status dict its callers consume. An unreadable
     value reads as ``None`` — the same value returned when launchctl reports none at all.
     """
-    unknown = {"loaded": False, "pid": None, "last_exit_status": None}
+    def _result(state: str) -> dict:
+        return {"state": state, "loaded": False, "pid": None, "last_exit_status": None}
+
     try:
         result = _launchctl(runner, ["print", _service_target(agent)])
-    except FileNotFoundError:  # launchctl absent (non-darwin / minimal host)
-        return unknown
+    except (FileNotFoundError, OSError):  # launchctl absent / not executable — unknowable, not absent
+        return _result(PROBE_UNREADABLE)
     if result.returncode != 0:
-        return unknown
+        return _result(
+            PROBE_CONFIRMED_ABSENT if _says_not_found(result) else PROBE_UNREADABLE
+        )
     pid: Optional[int] = None
     last_exit: Optional[int] = None
     seen_pid = False
@@ -437,7 +328,29 @@ def _probe(runner: Runner, agent: SupervisorAgent = SUPERVISOR_AGENT) -> dict:
             if stripped.startswith(prefix):
                 last_exit = _small_int_or_none(stripped[len(prefix):])
                 break
-    return {"loaded": True, "pid": pid, "last_exit_status": last_exit}
+    return {
+        "state": PROBE_LOADED, "loaded": True, "pid": pid, "last_exit_status": last_exit,
+    }
+
+
+def _says_not_found(result) -> bool:
+    """Whether a non-zero ``launchctl print`` positively reports an UNKNOWN service.
+
+    Deliberately narrow. This is the only path that can authorize deleting a registration on the
+    strength of an *error*, so it recognizes launchctl's "no such service" outcome and nothing else:
+    an unrecognized failure means the state could not be read, which is a different answer from
+    "there is nothing there" (review j#102180 finding 1).
+
+    Both a code and a phrase are accepted because neither alone is dependable — the exit code is not
+    documented as stable across macOS releases, and the message is user-facing text. A miss on both
+    falls to :data:`PROBE_UNREADABLE`, i.e. the install refuses with a typed reason rather than
+    removing something it cannot account for: **over-refusal is recoverable, a second live
+    registration is the defect this whole migration exists to prevent.**
+    """
+    if result.returncode in _LAUNCHCTL_NOT_FOUND_CODES:
+        return True
+    message = f"{getattr(result, 'stderr', '') or ''}\n{getattr(result, 'stdout', '') or ''}".lower()
+    return any(phrase in message for phrase in _LAUNCHCTL_NOT_FOUND_PHRASES)
 
 
 def _small_int_or_none(token: str) -> Optional[int]:
@@ -508,15 +421,26 @@ def remove_legacy_drain(
 
     **The stop is verified, not assumed** (review j#102151 Finding 1). Unlinking the plist does not
     unregister anything: launchd keys a bootstrapped job off its *label*, so a job whose file is gone
-    keeps running until logout. This function therefore boots the agent out and then **re-reads
-    whether the label is still loaded**, refusing with :data:`REASON_LEGACY_DRAIN_STILL_LOADED` when
-    it is — the caller must not add a second registration next to a live retired one.
+    keeps running until logout. The removal therefore proceeds only on **positive evidence that the
+    retired job is gone**, and there are exactly two ways to obtain it:
 
-    The bootout **return code is deliberately not the test**. ``launchctl bootout`` exits non-zero
-    for a label that was never loaded, which is the ordinary case on a host whose retired agent is
-    already stopped; treating that as failure would refuse every clean migration. The load state
-    read afterwards is the authority, so both "bootout worked" and "there was nothing to boot out"
-    converge on the same verified outcome, and only a genuinely still-loaded job blocks.
+    1. ``launchctl bootout`` **succeeds** — we just unloaded it ourselves. This is the strongest
+       evidence available and it depends on nothing but the exit status of the action we took.
+    2. bootout fails, and a follow-up ``launchctl print`` **positively reports an unknown service**
+       — it was never loaded, which is the ordinary state of an already stopped retired agent.
+
+    The bootout return code alone is deliberately not the test, because it also exits non-zero for a
+    never-loaded label; treating that as failure would refuse every clean migration. But its
+    *success* is a fact worth using, and reading it first means the common path never depends on
+    interpreting an error at all.
+
+    Anything else refuses. A still-loaded job gives :data:`REASON_LEGACY_DRAIN_STILL_LOADED`; a state
+    that could not be read — permission denied, a broken service manager, an unrecognized failure —
+    gives :data:`REASON_LEGACY_DRAIN_STATE_UNREADABLE` (review j#102180 finding 1). The earlier
+    version collapsed that second case into "not loaded" and deleted the plist on the strength of a
+    read that never happened; **"I could not see it" is not "it is not there"**. In both refusals the
+    retired plist is kept on purpose: it is the operator's only durable trace of a registration that
+    may still be live, and removing it would hide the very thing they need to act on.
     """
     state = classify_legacy_drain(os_home)
     if state == LEGACY_DRAIN_ABSENT:
@@ -524,12 +448,21 @@ def remove_legacy_drain(
     if state != LEGACY_DRAIN_OWNED:
         return {"state": state, "removed": False, "reason": _LEGACY_DRAIN_REFUSAL_REASON[state]}
     # Unload before unlinking: removing the file leaves a bootstrapped service running until logout.
-    _launchctl(runner, ["bootout", _service_target(LEGACY_DRAIN_AGENT)])
-    still_loaded, _pid = _is_loaded(runner, agent=LEGACY_DRAIN_AGENT)
-    if still_loaded:
-        # The file is left in place on purpose: it is the only durable record of the registration
-        # the operator still has to deal with, and deleting it would hide a live job.
-        return {"state": state, "removed": False, "reason": REASON_LEGACY_DRAIN_STILL_LOADED}
+    try:
+        booted_out = _launchctl(runner, ["bootout", _service_target(LEGACY_DRAIN_AGENT)])
+        unloaded_by_us = booted_out.returncode == 0
+    except (FileNotFoundError, OSError):
+        unloaded_by_us = False
+    if not unloaded_by_us:
+        # We did not stop it ourselves, so the run state has to be READ — and read strictly.
+        probe_state = _probe(runner, agent=LEGACY_DRAIN_AGENT)["state"]
+        if probe_state == PROBE_LOADED:
+            return {"state": state, "removed": False, "reason": REASON_LEGACY_DRAIN_STILL_LOADED}
+        if probe_state != PROBE_CONFIRMED_ABSENT:
+            return {
+                "state": state, "removed": False,
+                "reason": REASON_LEGACY_DRAIN_STATE_UNREADABLE,
+            }
     try:
         plist_path(os_home, agent=LEGACY_DRAIN_AGENT).unlink()
     except OSError:
@@ -579,11 +512,12 @@ def install(
     already does the drain leg's work.
 
     Every *preflight* refusal — platform, executable, and an unidentifiable retired plist — is
-    evaluated before **either** mutation, so a refused install is zero-mutation. Two refusals are
-    not, and both stop **before the owned agent is touched**: ``legacy_drain_still_loaded`` (the
-    retired job survived its bootout, so adding a second registration is exactly what must not
-    happen) and ``legacy_drain_removal_failed`` (the unlink failed after the job was stopped). These
-    are reported honestly rather than described as zero-mutation.
+    evaluated before **either** mutation, so a refused install is zero-mutation. Three refusals are
+    not, and all three stop **before the owned agent is written or bootstrapped**:
+    ``legacy_drain_still_loaded`` (the retired job survived its bootout),
+    ``legacy_drain_state_unreadable`` (its run state could not be read at all), and
+    ``legacy_drain_removal_failed`` (the unlink failed after the job was confirmed gone). These are
+    reported honestly rather than described as zero-mutation.
     """
     if not _running_on_darwin():
         return _refused("install", REASON_UNSUPPORTED_PLATFORM, label=agent.label)
@@ -879,47 +813,6 @@ def service_status(
     }
 
 
-def _read_installed_plist(target: Path) -> Optional[dict]:
-    """Best-effort parse of the installed plist; ``None`` if unreadable/malformed (never raises)."""
-    try:
-        raw = target.read_bytes()
-        parsed = plistlib.loads(raw)
-    except (OSError, ValueError, plistlib.InvalidFileException):
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-def _extract_pinned_home(installed_argv: object) -> tuple[Optional[str], str]:
-    """Extract the ``--home`` pin from an installed plist's ``ProgramArguments`` (strict).
-
-    Returns ``(pinned_home, status)``. The installed plist — not the caller's current shell — is the
-    authority on the daemon's mozyo home, so restart / status read the pin from here (j#79125 R3-F1).
-    A missing / duplicated / value-less pin is *not* trusted (the daemon-effective root is unknowable),
-    and a pin that is not an **absolute, lexically-canonical** path (relative / ``~`` / containing
-    ``..``) is rejected too: a LaunchAgent resolves such a pin from a different working directory than
-    the installer, re-opening the R3-F2 divergence in the installed service (j#79136 R4-F1). Every
-    non-``ok`` case is surfaced (fail-closed for restart, unhealthy for status), never guessed.
-    """
-    if not isinstance(installed_argv, list):
-        return None, HOME_PIN_NO_ARGV
-    indices = [i for i, arg in enumerate(installed_argv) if arg == SUPERVISOR_HOME_FLAG]
-    if not indices:
-        return None, HOME_PIN_MISSING
-    if len(indices) > 1:
-        return None, HOME_PIN_DUPLICATE
-    value_index = indices[0] + 1
-    if value_index >= len(installed_argv):
-        return None, HOME_PIN_MALFORMED
-    value = installed_argv[value_index]
-    if not isinstance(value, str) or not value.strip() or value.startswith("--"):
-        return None, HOME_PIN_MALFORMED
-    # An install always pins ``str(resolve_mozyo_home(...))`` — absolute + canonical. Anything else
-    # (relative, ``~``, ``/a/../b``) would be resolved from launchd's cwd, not the installer's.
-    if not os.path.isabs(value) or value != os.path.normpath(value):
-        return None, HOME_PIN_NOT_ABSOLUTE
-    return value, HOME_PIN_OK
-
-
 def _refused(action: str, reason: str, **extra: object) -> dict:
     """A fail-closed, zero-mutation refusal result (fixed vocabulary; no host detail)."""
     return {"action": action, "performed": False, "reason": reason, **extra}
@@ -943,6 +836,10 @@ __all__ = (
     "REASON_LEGACY_DRAIN_UNREADABLE",
     "REASON_LEGACY_DRAIN_REMOVAL_FAILED",
     "REASON_LEGACY_DRAIN_STILL_LOADED",
+    "REASON_LEGACY_DRAIN_STATE_UNREADABLE",
+    "PROBE_LOADED",
+    "PROBE_CONFIRMED_ABSENT",
+    "PROBE_UNREADABLE",
     "LEGACY_DRAIN_ABSENT",
     "LEGACY_DRAIN_OWNED",
     "LEGACY_DRAIN_FOREIGN",

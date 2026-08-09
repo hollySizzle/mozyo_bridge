@@ -754,8 +754,16 @@ class _LegacyStaysLoaded:
         return [c[1] for c in self.calls if len(c) >= 2]
 
 
+#: What launchctl actually answers for a label it does not know: a distinct exit code AND a message
+#: naming the condition. The fake carries BOTH because the adapter accepts either as the positive
+#: "no such service" signal — and because a bare non-zero (what this fake used to return) is the
+#: AMBIGUOUS case, not the absent one. Modelling it as ambiguous is what review j#102180 finding 1
+#: showed was missing: an under-specified fake made an unreadable state look like a verified stop.
+_NOT_FOUND = (113, 'Could not find service "org.mozyo-bridge.callback-supervisor.drain" in domain')
+
+
 class _LegacyNeverLoaded:
-    """launchctl where the RETIRED label was never loaded: bootout AND print both exit non-zero."""
+    """launchctl where the RETIRED label was never loaded: bootout fails, print says NOT FOUND."""
 
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
@@ -765,7 +773,31 @@ class _LegacyNeverLoaded:
         self.calls.append(argv)
         target = argv[2] if len(argv) > 2 else ""
         if sl.LEGACY_DRAIN_AGENT.label in target:
-            return _result(1)
+            code, message = _NOT_FOUND
+            return _result(code, stderr=message)
+        return _result(0)
+
+    @property
+    def verbs(self) -> list[str]:
+        return [c[1] for c in self.calls if len(c) >= 2]
+
+
+class _LegacyUnreadable:
+    """launchctl where the RETIRED label's state cannot be READ (permission denied / manager error).
+
+    The exact shape review j#102180 finding 1 reproduced: bootout AND the follow-up print both fail
+    without saying the service is unknown. "I could not see it" must not read as "it is gone".
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv):
+        argv = list(argv)
+        self.calls.append(argv)
+        target = argv[2] if len(argv) > 2 else ""
+        if sl.LEGACY_DRAIN_AGENT.label in target:
+            return _result(1, stderr="Operation not permitted")
         return _result(0)
 
     @property
@@ -885,9 +917,18 @@ class LegacyDrainMigrationTest(_DarwinCase):
         # can leave zero or one registration — never the two-agent state #15192 exists to end.
         _write_home_credential(self.mozyo_home)
         legacy = _legacy_drain_plist(self.os_home)
+
+        class _MigrationOkBootstrapFails(_LegacyNeverLoaded):
+            def __call__(self, argv):
+                result = super().__call__(argv)
+                argv = list(argv)
+                if len(argv) >= 2 and argv[1] == "bootstrap":
+                    return _result(1)
+                return result
+
         result = sl.install(
             os_home=self.os_home, mozyo_home=self.mozyo_home,
-            runner=FakeRunner(default=_result(1)), which=_which_found,
+            runner=_MigrationOkBootstrapFails(), which=_which_found,
         )
         self.assertFalse(result["performed"])
         self.assertEqual(result["reason"], sl.REASON_BOOTSTRAP_FAILED)
@@ -934,6 +975,74 @@ class LegacyDrainMigrationTest(_DarwinCase):
         # ...and the legacy plist is deliberately KEPT: it is the operator's only durable record of
         # the live registration still to deal with, and deleting it would hide a running job.
         self.assertTrue(legacy.exists())
+
+    def test_an_unreadable_legacy_state_blocks_the_install(self) -> None:
+        # Review j#102180 finding 1. The previous fix verified "not loaded" through a probe that
+        # collapsed EVERY non-zero read into that answer, so a permission-denied read passed as a
+        # verified stop and the plist was deleted on the strength of a read that never happened.
+        _write_home_credential(self.mozyo_home)
+        legacy = _legacy_drain_plist(self.os_home)
+        runner = _LegacyUnreadable()
+        result = sl.install(
+            os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found,
+        )
+        self.assertFalse(result["performed"])
+        self.assertEqual(result["reason"], sl.REASON_LEGACY_DRAIN_STATE_UNREADABLE)
+        # Nothing was removed and nothing was added: an unreadable state cannot authorize either.
+        self.assertTrue(legacy.exists())
+        self.assertFalse(sl.plist_path(self.os_home).exists())
+        self.assertNotIn("bootstrap", runner.verbs)
+
+    def test_unreadable_is_a_distinct_answer_from_still_loaded(self) -> None:
+        # Two different facts — "it is running" and "I cannot tell" — must not share a token, or the
+        # operator cannot tell which one they are looking at.
+        self.assertNotEqual(
+            sl.REASON_LEGACY_DRAIN_STATE_UNREADABLE, sl.REASON_LEGACY_DRAIN_STILL_LOADED
+        )
+        self.assertEqual(
+            {sl.PROBE_LOADED, sl.PROBE_CONFIRMED_ABSENT, sl.PROBE_UNREADABLE},
+            {"loaded", "confirmed_absent", "unreadable"},
+        )
+
+    def test_only_a_positively_reported_absence_counts_as_absent(self) -> None:
+        # The probe classification itself: a bare non-zero says nothing, a recognized not-found says
+        # the service is unknown, and a zero exit says it is loaded.
+        cases = {
+            _result(0, "\tpid = 5\n"): sl.PROBE_LOADED,
+            _result(113): sl.PROBE_CONFIRMED_ABSENT,
+            _result(1, stderr='Could not find service "x" in domain'): sl.PROBE_CONFIRMED_ABSENT,
+            _result(1, stderr="Operation not permitted"): sl.PROBE_UNREADABLE,
+            _result(1): sl.PROBE_UNREADABLE,
+        }
+        for scripted, expected in cases.items():
+            state = sl._probe(FakeRunner(print_result=scripted))["state"]
+            self.assertEqual(state, expected, scripted.stderr or scripted.returncode)
+
+    def test_an_absent_launchctl_is_unreadable_not_absent(self) -> None:
+        # No launchctl means no answer about the job — emphatically not "the job is gone".
+        def _no_launchctl(argv):
+            raise FileNotFoundError("launchctl")
+
+        self.assertEqual(sl._probe(_no_launchctl)["state"], sl.PROBE_UNREADABLE)
+        self.assertFalse(sl._probe(_no_launchctl)["loaded"])
+
+    def test_a_successful_bootout_is_positive_evidence_without_reading_an_error(self) -> None:
+        # The common clean path must not depend on interpreting launchctl's error taxonomy at all:
+        # a bootout that EXITS ZERO means we just unloaded it ourselves.
+        _write_home_credential(self.mozyo_home)
+        legacy = _legacy_drain_plist(self.os_home)
+        runner = FakeRunner()  # every command succeeds, including the legacy bootout
+        result = sl.install(
+            os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found,
+        )
+        self.assertTrue(result["performed"], result)
+        self.assertTrue(result["legacy_drain_removed"])
+        self.assertFalse(legacy.exists())
+        # No `print` of the retired label was needed to reach that conclusion.
+        self.assertNotIn(
+            f"{_GUI_DOMAIN}/{sl.LEGACY_DRAIN_AGENT.label}",
+            [c[2] for c in runner.calls if len(c) >= 3 and c[1] == "print"],
+        )
 
     def test_a_legacy_agent_that_was_never_loaded_migrates_cleanly(self) -> None:
         # The complement, and the reason the bootout RETURN CODE is not the test: `launchctl bootout`
