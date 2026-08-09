@@ -93,6 +93,20 @@ REASON_PARENT_UNSAFE = "declaration_parent_unsafe"
 REASON_PARENT_DRIFT = "declaration_parent_drift"
 REASON_MULTIPLE_LINKS = "declaration_multiple_links"
 REASON_WRITE_FAILED = "declaration_write_failed"
+# The existing declaration could not be captured before it would be replaced, so
+# a later verification failure would have nothing to restore (review j#102230
+# Finding 1). Refused ahead of the replace rather than discovered after it.
+REASON_SNAPSHOT_FAILED = "declaration_snapshot_failed"
+# The declaration exceeds :data:`MAX_DECLARATION_BYTES`. A declaration is a
+# handful of short fields; anything larger is a repository-controlled file being
+# used to force an unbounded allocation in a process that only wanted to decide
+# whether to launch (review j#102230 Finding 2).
+REASON_TOO_LARGE = "declaration_too_large"
+
+#: Hard ceiling on a declaration's on-disk size. Generous next to the ~300 bytes
+#: a real declaration occupies, small enough that reading one can never be a
+#: memory-pressure event.
+MAX_DECLARATION_BYTES = 64 * 1024
 REASON_READBACK_FAILED = "declaration_readback_failed"
 REASON_REMOVE_FAILED = "declaration_remove_failed"
 REASON_TARGET_NOT_DECLARED = "alias_target_not_declared"
@@ -469,6 +483,10 @@ def build_alias_resolution(
 __all__ = (
     "ALIAS_RELATIVE",
     "ALIAS_SCHEMA_VERSION",
+    "MAX_DECLARATION_BYTES",
+    "REASON_PARENT_DRIFT",
+    "REASON_SNAPSHOT_FAILED",
+    "REASON_TOO_LARGE",
     "AliasResolution",
     "AliasTargetObservation",
     "DECLARED_MODES",

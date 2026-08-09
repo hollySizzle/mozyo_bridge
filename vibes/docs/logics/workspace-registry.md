@@ -207,6 +207,17 @@ descriptor** に固定し、判定は全て `lstat` で行う。
   失敗はすべて固定 typed refusal へ変換する。さらに `O_NONBLOCK` で開いた上で `fstat` により
   同一 object が regular file であることを再確認するので、`lstat` と `open` の間に
   regular file が FIFO へ差し替えられても reader が無限に停止しない。
+- **restore できない mutation を「変更なし」と報告しない** (review j#102230 F1)。
+  既存 entry を snapshot できない場合は replace の**前**に `declaration_snapshot_failed` で
+  拒否する (snapshot 無しで進むと、後段の検証失敗時に rollback が新 entry を消すだけとなり、
+  旧宣言が失われたまま no-op として報告される)。`clear` も削除前に entry を捕捉し、
+  削除後の effective 確認が失敗したら復元する。復元できたときだけ `mutated=false`。
+- **宣言の読み取りは常に bounded** (review j#102230 F2)。`MAX_DECLARATION_BYTES` (64 KiB) を
+  `fstat` で allocation 前に enforce し、読み出し自体も chunk 単位で上限を超えたら
+  `declaration_too_large` にする。`st_size` は単独では信頼できない (sparse file は実体を
+  持たずに巨大 size を宣言でき、read 中に成長もしうる) ため、両方を課す。旧実装の
+  `os.read(fd, st_size + 1)` は 512 MiB の sparse 宣言だけで reader を raw `MemoryError` に
+  追い込めた。`MemoryError` も typed refusal へ変換する。
 - **schema の型検査は exact** (review j#102140 F4)。Python では `True == 1` / `1.0 == 1` が
   成立し、`bool` は `int` の subclass なので、値比較だけでは bool / float が整数 1 として
   通ってしまう。`schema_version` は `type(v) is int` を要求し、optional な文字列 field は

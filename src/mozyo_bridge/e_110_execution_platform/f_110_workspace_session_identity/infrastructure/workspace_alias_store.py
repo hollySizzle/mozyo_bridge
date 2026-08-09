@@ -57,6 +57,7 @@ from typing import Optional, Tuple
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.workspace_alias import (  # noqa: E501
     ALIAS_RELATIVE,
     ALIAS_SCHEMA_VERSION,
+    MAX_DECLARATION_BYTES,
     REASON_DECLARATION_UNREADABLE,
     REASON_MULTIPLE_LINKS,
     REASON_NOT_REGULAR_FILE,
@@ -64,6 +65,8 @@ from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.doma
     REASON_PARENT_UNSAFE,
     REASON_READBACK_FAILED,
     REASON_REMOVE_FAILED,
+    REASON_SNAPSHOT_FAILED,
+    REASON_TOO_LARGE,
     REASON_WRITE_FAILED,
     AliasResolution,
     WorkspaceAliasDeclaration,
@@ -73,6 +76,9 @@ from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.doma
 
 _ALIAS_PARENT = Path(ALIAS_RELATIVE).parent.as_posix()
 _ALIAS_NAME = Path(ALIAS_RELATIVE).name
+
+#: Read granularity for the bounded declaration read.
+_READ_CHUNK = 8192
 
 #: Outcomes of :func:`clear_declaration`.
 CLEAR_REMOVED = "removed"
@@ -251,9 +257,36 @@ def _read_bytes(dirfd: int) -> Optional[bytes] | AliasResolution:
                 f"{ALIAS_RELATIVE} changed type while it was being opened "
                 f"(now {stat.filemode(opened.st_mode)}); refusing to read it",
             )
-        return os.read(fd, max(opened.st_size, 0) + 1)
-    except OSError as exc:
-        return refused(REASON_DECLARATION_UNREADABLE, f"{ALIAS_RELATIVE}: {exc}")
+        # Size is checked BEFORE any allocation, and the read is still bounded
+        # afterwards (review j#102230 Finding 2). `st_size` is not trustworthy on
+        # its own: the file may grow between the fstat and the read, and a sparse
+        # file can declare a huge size while occupying nothing — the previous
+        # `os.read(fd, st_size + 1)` turned that into one unbounded allocation,
+        # which a 512 MiB sparse declaration escalated into a raw `MemoryError`
+        # from what is supposed to be a fail-closed reader.
+        if opened.st_size > MAX_DECLARATION_BYTES:
+            return refused(
+                REASON_TOO_LARGE,
+                f"{ALIAS_RELATIVE} is {opened.st_size} bytes; the maximum is "
+                f"{MAX_DECLARATION_BYTES}",
+            )
+        chunks: list[bytes] = []
+        total = 0
+        while total <= MAX_DECLARATION_BYTES:
+            chunk = os.read(fd, min(_READ_CHUNK, MAX_DECLARATION_BYTES + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > MAX_DECLARATION_BYTES:
+            return refused(
+                REASON_TOO_LARGE,
+                f"{ALIAS_RELATIVE} exceeds the maximum of "
+                f"{MAX_DECLARATION_BYTES} bytes while it was being read",
+            )
+        return b"".join(chunks)
+    except (OSError, MemoryError) as exc:
+        return refused(REASON_DECLARATION_UNREADABLE, f"{ALIAS_RELATIVE}: {exc!r}")
     finally:
         os.close(fd)
 
@@ -330,7 +363,16 @@ def _discard(dirfd: int, name: str) -> None:
 
 
 def _restore(dirfd: int, backup: Optional[str], had_previous: bool) -> bool:
-    """Undo a landed replace. True when the effective state was restored."""
+    """Undo a landed replace. True when the effective state was restored.
+
+    ``had_previous`` without a ``backup`` is NOT restorable and must not report
+    success (review j#102230 Finding 1): unlinking then would remove the new
+    entry *and* leave the previous declaration destroyed, while telling the
+    caller nothing was lost. The write path refuses before the replace when it
+    cannot snapshot, so this is the belt to that braces.
+    """
+    if had_previous and backup is None:
+        return False
     try:
         if had_previous and backup is not None:
             os.replace(backup, _ALIAS_NAME, src_dir_fd=dirfd, dst_dir_fd=dirfd)
@@ -384,9 +426,23 @@ def write_declaration(
                     f"to write a declaration whose inode is shared.",
                 )
 
-        previous = _read_bytes(dirfd)
-        previous_bytes = previous if isinstance(previous, bytes) else None
+        # An existing entry that cannot be captured is refused HERE, before the
+        # replace (review j#102230 Finding 1). Proceeding would put the write in
+        # a state where a later verification failure has nothing to restore: the
+        # rollback would unlink the new entry and the previous declaration would
+        # be gone, reported as an unchanged no-op.
         had_previous = entry is not None
+        previous_bytes: Optional[bytes] = None
+        if had_previous:
+            previous = _read_bytes(dirfd)
+            if isinstance(previous, AliasResolution):
+                raise WorkspaceAliasStoreError(
+                    REASON_SNAPSHOT_FAILED,
+                    f"the existing {ALIAS_RELATIVE} could not be captured "
+                    f"({previous.reason}: {previous.detail}), so it could not be "
+                    f"restored if this write failed verification",
+                )
+            previous_bytes = previous
 
         created_at = declaration.created_at
         if not created_at:
@@ -495,6 +551,22 @@ def clear_declaration(repo_root: Path | str) -> str:
             _require_parent_visible(repo_root, anchor)
         except WorkspaceAliasStoreError as exc:
             raise WorkspaceAliasStoreError(REASON_REMOVE_FAILED, exc.detail) from exc
+        # Capture the entry before removing it, so a failed post-removal
+        # verification can put it back (review j#102230 Finding 1). Only a
+        # regular file is capturable; a symlink / directory is not, and removing
+        # one is reported honestly as a mutation if it cannot be confirmed.
+        try:
+            entry = _lstat_entry(dirfd)
+        except OSError as exc:
+            raise WorkspaceAliasStoreError(
+                REASON_REMOVE_FAILED, f"{ALIAS_RELATIVE}: {exc}"
+            ) from exc
+        snapshot: Optional[bytes] = None
+        if entry is not None and stat.S_ISREG(entry.st_mode):
+            captured = _read_bytes(dirfd)
+            if isinstance(captured, bytes):
+                snapshot = captured
+
         try:
             os.unlink(_ALIAS_NAME, dir_fd=dirfd)
         except FileNotFoundError:
@@ -505,16 +577,34 @@ def clear_declaration(repo_root: Path | str) -> str:
             ) from exc
         else:
             outcome = CLEAR_REMOVED
+
         # Confirm through a fresh path-based open that the effective state really
         # is "no declaration" — a drifted parent would have removed the entry
         # from a directory the workspace can no longer see.
-        if read_declaration(repo_root) is not None:
-            raise WorkspaceAliasStoreError(
-                REASON_REMOVE_FAILED,
-                f"a declaration is still effective at {alias_path(repo_root)} "
-                f"after the removal",
-            )
-        return outcome
+        effective = read_declaration(repo_root)
+        if effective is None:
+            return outcome
+
+        # The removal is not confirmed. Once the unlink landed, this IS a
+        # mutation, so put the entry back and only report an unchanged workspace
+        # when that actually succeeded.
+        restored = False
+        if outcome == CLEAR_REMOVED and snapshot is not None:
+            try:
+                recovery = _write_temp(dirfd, snapshot)
+                os.replace(recovery, _ALIAS_NAME, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+                restored = True
+            except (WorkspaceAliasStoreError, OSError):
+                restored = False
+        detail = (
+            f"the removal of {alias_path(repo_root)} could not be confirmed "
+            f"({getattr(effective, 'reason', 'a declaration is still effective')})"
+        )
+        raise WorkspaceAliasStoreError(
+            REASON_REMOVE_FAILED,
+            detail,
+            mutated=outcome == CLEAR_REMOVED and not restored,
+        )
     finally:
         os.close(dirfd)
 

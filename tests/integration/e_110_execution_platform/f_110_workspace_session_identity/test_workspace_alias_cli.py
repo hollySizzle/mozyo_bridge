@@ -26,6 +26,7 @@ from unittest import mock
 from mozyo_bridge.application.cli import build_parser
 from mozyo_bridge.core.state.workspace_registry import ANCHOR_SCHEMA_VERSION
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.workspace_alias import (  # noqa: E501
+    MAX_DECLARATION_BYTES,
     REASON_ALIAS_CYCLE,
     REASON_CROSS_REPOSITORY,
     REASON_DECLARATION_INVALID,
@@ -34,6 +35,8 @@ from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.doma
     REASON_PARENT_DRIFT,
     REASON_READBACK_FAILED,
     REASON_REMOVE_FAILED,
+    REASON_SNAPSHOT_FAILED,
+    REASON_TOO_LARGE,
     REASON_UNSUPPORTED_SCHEMA,
     REASON_TARGET_IDENTITY_UNRESOLVED,
     REASON_TARGET_MISSING,
@@ -543,6 +546,143 @@ class WorkspaceAliasRaceAndTypeTests(WorkspaceAliasCliTestCase):
         )
         self.assertEqual(code, 1)
         self.assertEqual(payload["reason"], REASON_DECLARATION_INVALID)
+
+
+class WorkspaceAliasRollbackAndSizeTests(WorkspaceAliasCliTestCase):
+    """Review j#102230 Findings 1–2, driven through the public CLI."""
+
+    # --- F1: no mutation may be reported as an unchanged no-op --------------
+
+    def test_unsnapshottable_previous_declaration_is_refused_before_the_replace(
+        self,
+    ) -> None:
+        """A previous entry that cannot be captured must block the write.
+
+        Letting it through leaves a state where a later verification failure has
+        nothing to restore: the rollback removes the new entry and the previous
+        declaration is gone, reported as if nothing had happened.
+        """
+        self.run_cli(
+            "workspace", "alias", "disable",
+            "--repo", str(self.nested), "--reason", "ORIGINAL",
+        )
+        before = alias_path(self.nested).read_text(encoding="utf-8")
+
+        with mock.patch.object(
+            store, "_read_bytes",
+            return_value=store.refused("simulated", "snapshot failed"),
+        ), mock.patch.object(
+            store, "_read_with_dirfd",
+            return_value=store.refused("simulated", "verification failed"),
+        ):
+            code, payload = self.run_cli(
+                "workspace", "alias", "disable",
+                "--repo", str(self.nested), "--reason", "REPLACEMENT",
+            )
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["reason"], REASON_SNAPSHOT_FAILED)
+        self.assertFalse(payload["mutated"])
+        self.assertEqual(alias_path(self.nested).read_text(encoding="utf-8"), before)
+
+    def test_clear_restores_the_entry_when_removal_cannot_be_confirmed(self) -> None:
+        self.run_cli(
+            "workspace", "alias", "disable",
+            "--repo", str(self.nested), "--reason", "ORIGINAL",
+        )
+        before = alias_path(self.nested).read_text(encoding="utf-8")
+
+        with mock.patch.object(
+            store, "read_declaration",
+            return_value=store.refused("simulated", "verification failed"),
+        ):
+            code, payload = self.run_cli(
+                "workspace", "alias", "clear", "--repo", str(self.nested)
+            )
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["reason"], REASON_REMOVE_FAILED)
+        self.assertFalse(payload["mutated"])
+        # Restored, so "unchanged" is now a true statement.
+        self.assertTrue(alias_path(self.nested).is_file())
+        self.assertEqual(alias_path(self.nested).read_text(encoding="utf-8"), before)
+        self.assertIn("unchanged", payload["detail"])
+
+    def test_clear_reports_mutation_when_the_entry_cannot_be_restored(self) -> None:
+        """An unrestorable removal must be reported as a real mutation."""
+        self.run_cli(
+            "workspace", "alias", "disable", "--repo", str(self.nested)
+        )
+        with mock.patch.object(
+            store, "read_declaration",
+            return_value=store.refused("simulated", "verification failed"),
+        ), mock.patch.object(
+            store, "_write_temp", side_effect=OSError("no space")
+        ):
+            code, payload = self.run_cli(
+                "workspace", "alias", "clear", "--repo", str(self.nested)
+            )
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["reason"], REASON_REMOVE_FAILED)
+        self.assertTrue(payload["mutated"])
+        self.assertFalse(alias_path(self.nested).exists())
+        self.assertIn("could NOT be restored", payload["detail"])
+
+    # --- F2: a declaration can never force an unbounded allocation ---------
+
+    def test_oversized_declaration_is_a_typed_refusal(self) -> None:
+        path = alias_path(self.nested)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x" * (MAX_DECLARATION_BYTES + 1))
+        code, payload = self.run_cli(
+            "workspace", "alias", "show", "--repo", str(self.nested)
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["reason"], REASON_TOO_LARGE)
+
+    def test_huge_sparse_declaration_is_refused_without_allocating_it(self) -> None:
+        """A sparse file costs no disk but used to cost its full size in RAM.
+
+        The read is bounded before any allocation, so the refusal is reached
+        without materializing the declared size.
+        """
+        path = alias_path(self.nested)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.truncate(512 * 1024 * 1024)
+        code, payload = self.run_cli(
+            "workspace", "alias", "show", "--repo", str(self.nested)
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["reason"], REASON_TOO_LARGE)
+
+    def test_oversized_declaration_blocks_the_launch(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_alias import (  # noqa: E501
+            apply_workspace_alias,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
+            HerdrSessionStartError,
+        )
+
+        path = alias_path(self.nested)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.truncate(512 * 1024 * 1024)
+        with self.assertRaises(HerdrSessionStartError) as caught:
+            apply_workspace_alias(self.nested)
+        self.assertIn(REASON_TOO_LARGE, str(caught.exception))
+
+    def test_a_declaration_at_the_size_limit_still_reads(self) -> None:
+        """The bound must not reject a legitimate declaration."""
+        code, _ = self.run_cli(
+            "workspace", "alias", "set",
+            "--repo", str(self.nested), "--to", str(self.canonical),
+            "--reason", "x" * 1024,
+        )
+        self.assertEqual(code, 0)
+        code, payload = self.run_cli(
+            "workspace", "alias", "show", "--repo", str(self.nested)
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["state"], "aliased")
 
 
 class WorkspaceAliasLaunchRefusalTests(WorkspaceAliasCliTestCase):
