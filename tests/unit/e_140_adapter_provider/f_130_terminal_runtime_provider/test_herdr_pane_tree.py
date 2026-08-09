@@ -6,6 +6,32 @@ from tests.support.herdr_pane_tree import PaneTreeHerdr, Split
 
 
 class PaneTreeHerdrContractTest(unittest.TestCase):
+    def test_resize_selects_the_requested_nested_edge_then_axis_fallback(self):
+        herdr = PaneTreeHerdr("w1")
+        tab = herdr.new_tab()
+        columns = herdr.seed_columns(
+            tab,
+            [["a-top", "a-lower"], ["b-top", "b-lower"], ["c-top", "c-lower"]],
+        )
+        root = tab.root
+        self.assertIsInstance(root, Split)
+        nested = root.second
+        self.assertIsInstance(nested, Split)
+
+        self.assertTrue(tab.resize(columns[1][0], "left", 0.1))
+        self.assertAlmostEqual(0.4, root.ratio)
+        self.assertAlmostEqual(0.5, nested.ratio)
+
+        root.ratio = 0.5
+        self.assertTrue(tab.resize(columns[2][0], "left", 0.1))
+        self.assertAlmostEqual(0.5, root.ratio)
+        self.assertAlmostEqual(0.4, nested.ratio)
+
+        nested.ratio = 0.5
+        self.assertTrue(tab.resize(columns[0][0], "left", 0.1))
+        self.assertAlmostEqual(0.4, root.ratio)
+        self.assertAlmostEqual(0.5, nested.ratio)
+
     def test_ratio_move_and_temp_tab_auto_close(self):
         herdr = PaneTreeHerdr("w1")
         main = herdr.new_tab()

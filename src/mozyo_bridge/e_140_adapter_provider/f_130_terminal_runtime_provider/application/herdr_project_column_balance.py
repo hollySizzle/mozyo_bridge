@@ -40,6 +40,7 @@ class ColumnRatioTarget:
     """One right-axis divider and the equal-share ratio it must reach."""
 
     pane: str
+    right_pane: str
     ratio: float
 
 
@@ -164,7 +165,13 @@ def plan_equal_column_ratios(
                 f"project column {key!r} is not the first child of the expected "
                 "right-nested divider"
             )
-        targets.append(ColumnRatioTarget(pane_id, 1.0 / (count - index)))
+        targets.append(
+            ColumnRatioTarget(
+                pane_id,
+                ordered[index + 1][2],
+                1.0 / (count - index),
+            )
+        )
     if ordered[0][0] != x0:
         return None, "the leftmost project column does not start at the tab boundary"
     return tuple(targets), ""
@@ -214,11 +221,26 @@ def _resize_column_ratio(
             break
         distance = abs(split.ratio - target.ratio)
         direction, amount = resize_step(split.ratio, target.ratio, "right")
+        boundary_x = rect.x + rect.width
+        immediate_right = [
+            pane_id
+            for pane_id, pane_rect in layout.panes.items()
+            if pane_rect.x == boundary_x
+            and pane_rect.y == y0
+            and pane_rect.x + pane_rect.width <= x1
+            and pane_rect.y + pane_rect.height <= y1
+        ]
+        if immediate_right != [target.right_pane]:
+            return changed, (
+                "the planned right-side resize actuator is no longer the "
+                "immediate project column"
+            )
+        actuator_pane = target.pane if direction == "right" else target.right_pane
         try:
             _invoke(
                 binary,
                 [
-                    "pane", "resize", "--pane", target.pane,
+                    "pane", "resize", "--pane", actuator_pane,
                     "--direction", direction, "--amount", f"{amount:.6f}",
                 ],
                 runner,

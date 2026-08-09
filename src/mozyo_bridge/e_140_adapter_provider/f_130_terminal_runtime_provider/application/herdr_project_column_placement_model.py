@@ -167,6 +167,24 @@ def outer_ratio(
     return matched, split
 
 
+def column_resize_actuator_key(
+    current_order: Sequence[UnitColumnKey],
+    left_unit: UnitColumnKey,
+    direction: str,
+) -> Optional[UnitColumnKey]:
+    """Select the pane-side Unit whose live edge owns one planned divider."""
+
+    try:
+        left_index = current_order.index(left_unit)
+    except ValueError:
+        return None
+    if direction == "right":
+        return left_unit
+    if direction == "left" and left_index + 1 < len(current_order):
+        return current_order[left_index + 1]
+    return None
+
+
 @dataclass(frozen=True)
 class ColumnSlot:
     """One admitted live slot. Runtime handles stay private to the result."""
@@ -333,6 +351,43 @@ class ProjectColumnPlacementResult:
         }
 
 
+def placement_failure_result(
+    before: ProjectColumnPlacementPreview,
+    after: ProjectColumnPlacementPreview,
+    *,
+    changed: bool,
+    detail: str,
+    reason: str,
+    stranded: int = 0,
+    recovery_attempted: bool = False,
+) -> ProjectColumnPlacementResult:
+    """Build one truthful refused or partially-applied placement result."""
+
+    if not changed:
+        status = PLACEMENT_REFUSED
+        recovery = "Resolve the refusal and run preview again."
+    else:
+        status = PLACEMENT_PARTIAL
+        if stranded:
+            recovery = (
+                "One or more panes remain outside the shared tab; use the live "
+                "relayout runbook before retrying."
+            )
+        elif recovery_attempted:
+            recovery = (
+                "The safe return was attempted; inspect the Unit and preview "
+                "again before retrying."
+            )
+        else:
+            recovery = (
+                "The live Unit-column layout may be partially changed; inspect "
+                "the current Unit board and preview again before retrying."
+            )
+    return ProjectColumnPlacementResult(
+        status, reason, detail, before, after, recovery
+    )
+
+
 def _layout_fingerprint(layout: LayoutSnapshot) -> tuple[object, ...]:
     return (
         layout.tab_id,
@@ -361,6 +416,7 @@ def _layout_fingerprint(layout: LayoutSnapshot) -> tuple[object, ...]:
 
 __all__ = (
     "ColumnSlot",
+    "column_resize_actuator_key",
     "LiveUnitColumn",
     "PLACEMENT_APPLIED",
     "PLACEMENT_DEFERRED",
@@ -374,6 +430,7 @@ __all__ = (
     "ProjectColumnPlacementEvidence",
     "ProjectColumnPlacementPreview",
     "ProjectColumnPlacementResult",
+    "placement_failure_result",
     "REASON_AUTHORITY_UNVERIFIED",
     "REASON_ADJUSTMENT_INVALID",
     "REASON_ADJUSTMENT_UNREPRESENTABLE",

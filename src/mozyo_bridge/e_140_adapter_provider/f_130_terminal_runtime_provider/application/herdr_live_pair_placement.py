@@ -800,7 +800,7 @@ class HerdrLivePairPlacement:
             )
             previous_distance = distance
             resize_effect = _resize(
-                current.evidence.by_provider[target.order[0]].pane_id,
+                current.evidence.by_provider[target.order[token != target.split]].pane_id,
                 token,
                 amount,
                 binary=self.binary,

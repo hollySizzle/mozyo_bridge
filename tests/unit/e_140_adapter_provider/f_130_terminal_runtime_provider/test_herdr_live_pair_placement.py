@@ -388,14 +388,17 @@ class HerdrLivePairPlacementTests(unittest.TestCase):
         self.assertEqual(result.status, APPLY_PARTIAL)
         self.assertFalse(result.as_payload()["retryable"])
 
-    def test_apply_resizes_ratio_and_remeasures(self) -> None:
-        service, herdr, _, _ = self._build(ratio=0.7)
+    def test_apply_resizes_ratio_from_the_second_pane_and_remeasures(self) -> None:
+        service, herdr, _, panes = self._build(ratio=0.7)
 
         result = service.apply(WORKSPACE_ID)
 
         self.assertEqual(result.status, APPLY_APPLIED, result)
         self.assertEqual(result.after.status, PLAN_MATCHED)
-        self.assertTrue(herdr.resizes)
+        self.assertEqual(1, len(herdr.resizes))
+        resize = herdr.resizes[0]
+        self.assertEqual(panes["claude"], resize[resize.index("--pane") + 1])
+        self.assertEqual("up", resize[resize.index("--direction") + 1])
 
     def test_resize_changed_false_is_known_failed_without_mutation(self) -> None:
         service, herdr, _, _ = self._build(ratio=0.7)

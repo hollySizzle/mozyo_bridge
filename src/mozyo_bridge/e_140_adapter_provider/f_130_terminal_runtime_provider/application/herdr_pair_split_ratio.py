@@ -149,9 +149,9 @@ RATIO_TOLERANCE = 1e-3
 #: strict-progress check below are what stop an unreachable target from spinning.
 MAX_RESIZE_PASSES = 4
 
-#: The herdr resize direction that INCREASES the first child's share, per split direction
-#: (measured j#91140: ``--direction down`` moved a ``down`` split's divider down, growing
-#: the top pane, from either member pane).
+#: The Herdr resize direction that INCREASES the first child's share, per split direction.
+#: Herdr 0.8 selects a direction-facing pane edge first, so the first pane actuates this
+#: direction while the second pane actuates the inverse direction in a nested same-axis tree.
 _GROW_DIRECTION: Mapping[str, str] = {"down": "down", "right": "right"}
 #: ...and the one that decreases it.
 _SHRINK_DIRECTION: Mapping[str, str] = {"down": "up", "right": "left"}
@@ -342,18 +342,18 @@ def _contains(outer: PaneRect, inner: PaneRect) -> bool:
 def governing_split(
     layout: LayoutSnapshot, pane: PaneRect, direction: str
 ) -> Optional[SplitInfo]:
-    """The split ``pane resize --pane <pane> --direction <dir>`` will actually move.
+    """The nearest same-axis split containing ``pane``.
 
-    herdr resolves a resize to the **nearest ancestor split whose axis matches the
-    direction**, regardless of which side of it the addressed pane sits on (measured
-    j#91140: from either member of a ``down`` split, ``--direction down`` grew the top
-    pane). Nearest-ancestor is reconstructed here as the SMALLEST same-axis split whose
-    rect contains the pane, since ``pane layout`` exposes rects rather than a tree.
+    ``pane layout`` exposes rectangles rather than the split tree, so the nearest
+    ancestor on one axis is reconstructed as the smallest containing rectangle.
+    This is the split Herdr uses only after its direction-facing edge search has no
+    match.  In a nested same-axis layout, a resize toward the first side must address
+    a pane on that side and a resize toward the second side must address a pane on the
+    opposite side; callers that actuate such a divider must select that pane explicitly.
 
-    The caller compares this against the pair's own split before issuing anything. That
-    comparison is the shared-tab guard (Redmine #14567 lands every sublane in one tab): if
-    the pair's divider is not the one herdr would move, the run refuses instead of silently
-    resizing an OUTER divider and rearranging a neighbouring lane.
+    Pair-only callers use this helper to prove the pair's own nearest split.  Shared
+    multi-column callers additionally choose the pane on the requested divider edge
+    before issuing ``pane resize``.
     """
     candidates = [
         split
@@ -728,8 +728,13 @@ def _apply_ratio(
     for _ in range(MAX_RESIZE_PASSES):
         distance = abs(split.ratio - target)
         token, amount = resize_step(split.ratio, target, direction)
+        actuator_pane = (
+            pair.first_pane
+            if token == _GROW_DIRECTION[direction]
+            else pair.second_pane
+        )
         resize_effect = _resize(
-            pair.first_pane, token, amount,
+            actuator_pane, token, amount,
             binary=binary, runner=runner, timeout=timeout, env=env,
         )
         if resize_effect == RESIZE_UNCHANGED:

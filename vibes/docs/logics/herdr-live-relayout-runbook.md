@@ -158,13 +158,15 @@ herdr pane layout --pane <pane-id>
 
 - **`splits[].ratio` は first child の占有率**。`direction: down` なら上 pane、`right` なら左 pane。
   pane の実 extent は `round(split_extent * ratio)` (extent 75 で ratio 0.5 → 38/37、0.6 → 45/30)。
-- **`--direction` は divider を動かす向き**であり、`--pane` がどちら側かに依らない。`down` / `right` が
-  first child の取り分を増やし、`up` / `left` が減らす。pair のどちらの pane を `--pane` に渡しても
-  同じ divider が同じ向きに動く。
-- **`--pane` は「どの divider か」だけを選ぶ**。herdr は指定 pane の祖先のうち **direction と軸が一致する
-  最も近い split** を動かす。nested layout ではこれが外側の divider になりうるので、**動かす前に
-  `pane layout` の rect を読んで、狙った divider が最近祖先であることを確認する**。確認せずに撃つと
-  隣の pane / lane を再配置する。
+- **`--direction` は divider を動かす向き**である。`down` / `right` が first child の取り分を増やし、
+  `up` / `left` が減らす。ただしHerdr 0.8.0では、`--pane`がその向きに面する祖先dividerを先に選ぶため、
+  nestedな同軸splitではpaneの側も結果を左右する。
+- **`--pane` は狙うdividerの対応側から選ぶ**。first childを増やす`down` / `right`はfirst側、減らす
+  `up` / `left`はsecond側のpaneを指定する。その向きに面する祖先dividerが無い場合だけ、Herdrは
+  最も近い同軸splitへfallbackする。3列の中央paneに`left`を指定すると外側dividerを選ぶ一方、右隣paneの
+  `left`は中央とのdividerを選ぶことを2026-08-09のHerdr 0.8.0隔離実測で確認した。**動かす前に
+  `pane layout`のrectとpaneの側を照合し、操作後も同じdividerのratioを再計測する**。確認せずに撃つと
+  隣のpane / laneを再配置する。
 - **`--amount` は 1 回あたり 0.5 に clamp される**。0.1 → 0.9 のような大きな移動は 2 回に分ける
   (実測: ratio 0.1 に対し `+0.55` / `+0.79` / `+0.8` はいずれも 0.6 で止まる)。**毎回 layout を読み直して
   残差から次の amount を決める**。exit 0 は「動いた」証拠にならない。

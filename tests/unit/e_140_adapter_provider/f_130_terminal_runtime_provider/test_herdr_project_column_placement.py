@@ -83,13 +83,13 @@ class ProjectColumnPlacementTest(unittest.TestCase):
             ],
         )
 
-    def service(self, plan_resolver, *, generation_resolver=None):
+    def service(self, plan_resolver, *, generation_resolver=None, runner=None):
         return HerdrProjectColumnPlacement(
             home=Path("/unused"),
             target_workspace="w1",
             top_workspace_id="",
             binary="herdr",
-            runner=self.herdr,
+            runner=runner or self.herdr,
             timeout=1.0,
             authority=_Authority(),
             generation_resolver=(
@@ -201,6 +201,7 @@ class ProjectColumnPlacementTest(unittest.TestCase):
         self.assertEqual(1, len(self.herdr.tabs))
         self.assertEqual(set(self.herdr.agents), set(self.tab.panes()))
         self.assertNotIn("remain outside", result.recovery)
+        self.assertIn("safe return was attempted", result.recovery)
 
     def test_generation_drift_after_preview_refuses_before_mutation(self):
         reads = {}
@@ -422,6 +423,93 @@ class ProjectColumnPlacementTest(unittest.TestCase):
         self.assertAlmostEqual(0.8 / 1.8, root.ratio, places=3)
         self.assertFalse(self.herdr.swaps)
         self.assertEqual(1, len(self.herdr.resizes))
+        resize = self.herdr.resizes[0]
+        self.assertEqual(
+            self.columns[1][0],
+            resize[resize.index("--pane") + 1],
+        )
+        self.assertEqual("left", resize[resize.index("--direction") + 1])
+
+    def test_middle_unit_width_decrease_addresses_the_right_sibling_divider(self):
+        herdr = PaneTreeHerdr("w1")
+        tab = herdr.new_tab()
+        key_c = UnitColumnKey("project-c", DEFAULT_LANE)
+        columns = herdr.seed_columns(
+            tab,
+            [
+                [_name("project-a", "codex"), _name("project-a", "claude")],
+                [_name("project-b", "codex"), _name("project-b", "claude")],
+                [_name("project-c", "codex"), _name("project-c", "claude")],
+            ],
+        )
+        service = HerdrProjectColumnPlacement(
+            home=Path("/unused"),
+            target_workspace="w1",
+            top_workspace_id="",
+            binary="herdr",
+            runner=herdr,
+            timeout=1.0,
+            authority=_Authority(),
+            generation_resolver=lambda pane: f"generation:{pane.assigned_name}",
+            plan_resolver=_plan(
+                (self.key_a, self.key_b, key_c),
+                ((self.key_a, 0.5), (self.key_b, 0.5)),
+            ),
+        )
+
+        preview = service.preview_adjustment(self.key_b, COLUMN_WIDTH_DECREASE)
+        result = service.apply_adjustment(preview)
+
+        self.assertEqual(PREVIEW_READY, preview.status)
+        self.assertEqual(PLACEMENT_APPLIED, result.status)
+        self.assertEqual(2, len(herdr.resizes))
+        first, second = herdr.resizes
+        self.assertEqual(columns[0][0], first[first.index("--pane") + 1])
+        self.assertEqual("right", first[first.index("--direction") + 1])
+        self.assertEqual(columns[2][0], second[second.index("--pane") + 1])
+        self.assertEqual("left", second[second.index("--direction") + 1])
+
+    def test_partial_width_failure_does_not_claim_an_unattempted_safe_return(self):
+        herdr = PaneTreeHerdr("w1")
+        tab = herdr.new_tab()
+        key_c = UnitColumnKey("project-c", DEFAULT_LANE)
+        herdr.seed_columns(
+            tab,
+            [
+                [_name("project-a", "codex"), _name("project-a", "claude")],
+                [_name("project-b", "codex"), _name("project-b", "claude")],
+                [_name("project-c", "codex"), _name("project-c", "claude")],
+            ],
+        )
+
+        def refuse_second_resize(argv, **kwargs):
+            tail = list(argv[1:])
+            if tail[:2] == ["pane", "resize"] and herdr.resizes:
+                herdr.resize_unchanged = True
+            return herdr(argv, **kwargs)
+
+        service = HerdrProjectColumnPlacement(
+            home=Path("/unused"),
+            target_workspace="w1",
+            top_workspace_id="",
+            binary="herdr",
+            runner=refuse_second_resize,
+            timeout=1.0,
+            authority=_Authority(),
+            generation_resolver=lambda pane: f"generation:{pane.assigned_name}",
+            plan_resolver=_plan(
+                (self.key_a, self.key_b, key_c),
+                ((self.key_a, 0.5), (self.key_b, 0.5)),
+            ),
+        )
+
+        result = service.apply_adjustment(
+            service.preview_adjustment(self.key_b, COLUMN_WIDTH_DECREASE)
+        )
+
+        self.assertEqual(PLACEMENT_PARTIAL, result.status)
+        self.assertNotIn("safe return was attempted", result.recovery)
+        self.assertIn("may be partially changed", result.recovery)
 
     def test_move_at_edge_is_a_measured_zero_write(self):
         service = self.service(
