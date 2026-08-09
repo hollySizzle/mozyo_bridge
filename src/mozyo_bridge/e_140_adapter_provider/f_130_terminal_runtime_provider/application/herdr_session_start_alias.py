@@ -27,16 +27,25 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 def apply_workspace_alias(repo_root: Path) -> Path:
     """Fold an explicitly-supplied nested root into its canonical root.
 
-    Called at the top of :func:`...herdr_session_start.prepare_session`, which is
-    the one entry every launch caller funnels through — the ``session-start``
-    CLI, the bare-``mozyo`` herdr branch, the v1 replacement binding, and the
-    shared-space smoke harness. So the rail holds identically at plan time
-    (``--dry-run``) and at live action time, which is what the acceptance
-    boundary requires.
+    Called from **both** launch entries, which is deliberate (review j#102107
+    Finding 4):
 
-    It runs ahead of request validation, the home lock, binary resolution and the
-    capability probe, so a declined workspace is zero-launch *and*
-    zero-side-effect.
+    - :func:`...herdr_session_start.prepare_session` — the public entry. Calling
+      it there, ahead of request validation, the home lock, binary resolution and
+      the capability probe, is what makes a declined workspace zero-launch *and*
+      zero-side-effect.
+    - :func:`...herdr_session_start._prepare_session_locked` — the entry every
+      launch actually reaches. The v1 replacement driver
+      (``sublane_actuator_herdr_ops`` via
+      ``prepare_actuator_lane_session(admission_lock_held=True)``) calls it
+      directly, skipping the public lock wrapper it already holds the lock for,
+      so a rail placed only on the public entry is bypassed by exactly the live
+      replacement path.
+
+    Re-applying is idempotent — a canonical root declares nothing, so an
+    already-folded root resolves to itself — and the duplication is load-bearing:
+    removing either call re-opens a bypass. So the rail holds identically at plan
+    time (``--dry-run``) and at live action time.
 
     Returns the root a launch should use:
 
@@ -53,9 +62,19 @@ def apply_workspace_alias(repo_root: Path) -> Path:
     from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.workspace_alias import (  # noqa: E501
         ALIAS_RELATIVE,
         STATE_LAUNCH_DISABLED,
+        STATE_NO_DECLARATION,
     )
 
     resolution = resolve_launch_root(repo_root)
+    if resolution.state == STATE_NO_DECLARATION:
+        # Return the caller's OWN path object, not the resolver's normalized one.
+        # `resolve_launch_root` resolves symlinks and `..` to compare roots, but an
+        # undeclared workspace must come back byte-identical: the launch cwd is
+        # spelled into the `herdr pane split --cwd` argv, and silently
+        # canonicalizing it would change that argv for every workspace in the
+        # world that declares nothing — the exact opposite of this rail's promise
+        # to leave the common path untouched.
+        return repo_root
     if resolution.ok:
         return Path(resolution.launch_root) if resolution.launch_root else repo_root
     if resolution.state == STATE_LAUNCH_DISABLED:

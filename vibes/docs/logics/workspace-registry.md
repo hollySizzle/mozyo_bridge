@@ -140,11 +140,18 @@ declaration:
 - **anchor と分離する理由**: anchor は identity recovery record (#11429) であり意味を 1 つに
   保つ。本 file は launch authority routing の宣言で、identity provenance に触れずに
   追加・削除できる。
-- **chokepoint**: `herdr_session_start.prepare_session` の最初。session-start CLI / bare
-  `mozyo` herdr branch / v1 replacement binding / shared-space smoke harness の 4 caller が
-  ここを通るため、`--dry-run` と live action-time が同一 rail になる。request validation・
-  home lock・binary 解決・capability probe より前に評価するので、拒否は zero-launch かつ
-  zero-side-effect。
+- **chokepoint は 2 箇所**であり、これは意図的な重複である (#15190 / review j#102107 F4):
+  - `herdr_session_start.prepare_session` の最初 — public entry。request validation・
+    home lock・binary 解決・capability probe より**前**に評価するので、拒否は zero-launch
+    かつ zero-side-effect になる。
+  - `herdr_session_start._prepare_session_locked` の最初 — **実際に全 launch が到達する
+    境界**。v1 replacement driver (`sublane_actuator_herdr_ops`) は
+    `prepare_actuator_lane_session(admission_lock_held=True)` 経由で public wrapper を
+    通さず本 entry を直接呼ぶため、public entry だけに rail を置くと live replacement 経路が
+    素通りする。
+  再適用は idempotent (canonical root は宣言を持たないので、既に畳まれた root は自分自身へ
+  解決する)。後続の読者が「重複」と見なして 2 つ目を削除すると bypass が復活するため、
+  docstring と本節の双方に理由を残す。`--dry-run` と live action-time は同一 rail。
 - **`resolve_repo_root()` を書き換えない理由**: 同 resolver は約 57 箇所から呼ばれ、release
   tooling・doctor・discovery・config load を含む。nested root を *それ自体として* 報告するのが
   仕事の read-only surface (`workspace inspect` / `docs resolve` / `scaffold status`) まで
@@ -156,7 +163,35 @@ declaration:
   `alias_target_not_ancestor` / `alias_target_identity_unresolved` /
   `alias_target_identity_mismatch` / `alias_target_cross_repository` /
   `alias_target_declares_alias` / `declaration_unreadable` / `declaration_invalid` /
-  `declaration_unsupported_schema`。
+  `declaration_unsupported_schema` / `declaration_not_regular_file`。
+- **未知 field は拒否する** (`declaration_invalid`)。schema v1 が mode ごとに定義する key
+  集合は exact であり、余剰 key を無視して部分解釈しない。将来の schema 拡張は
+  `schema_version` の bump で表現する。無版の余剰 key を旧 reader が黙って落とすと、
+  「起動を gate する」という宣言の目的そのものが部分適用になる (review j#102104 F3)。
+
+### 宣言 file の filesystem 安全性 (review j#102104 F1 / F2)
+
+宣言 file は repository が内容を支配する path にあるため、writer / reader は path 解決を
+follow-through helper に任せない。`.mozyo-bridge` を `O_NOFOLLOW` で開いた **directory file
+descriptor** に固定し、判定は全て `lstat` で行う。
+
+- **書き込みは symlink を辿らない**。`Path.write_text` は symlink を辿るため、
+  workspace 外を指す `workspace-alias.json` symlink があると `workspace alias disable` が
+  workspace 外の file を上書きできた。現在は「既存 entry が通常 file でない」「hard link が
+  複数」「親が実 directory でない (symlink 含む)」をいずれも zero-mutation で拒否する
+  (`declaration_not_regular_file` / `declaration_multiple_links` /
+  `declaration_parent_unsafe`)。
+- **書き込みは同一 directory 内の private temp file → `os.replace` → readback 照合**で行う。
+  途中のどの失敗でも既存宣言は変化しない (`declaration_write_failed` /
+  `declaration_readback_failed`)。
+- **「不在」と「存在するが通常 file でない」を分離する**。`is_file()` は directory / FIFO /
+  dangling symlink でも false になるため、破損・すり替えられた宣言が「宣言なし」と読まれ
+  nested root の起動を許していた。現在は不在のみ `no_declaration`、非通常 entry・stat/read
+  失敗は typed zero-launch。
+- **`clear` は「存在するが削除不能」を成功と報告しない** (`declaration_remove_failed`)。
+  symlink の `clear` は link だけを外し、その target には触れない。
+- alias cycle 判定は「読める宣言」ではなく **entry の存在**で行うので、target 側の宣言が
+  壊れている場合も fail closed する。
 - **cross-repository 判定は `git_common_dir` の一致**で行う。linked worktree は main checkout と
   共通なので同一 repository (sublane worktree は従来どおり launch 可能)、**submodule** は
   親の tree 内に物理的に存在しても別 repository として拒否する。観測事例の

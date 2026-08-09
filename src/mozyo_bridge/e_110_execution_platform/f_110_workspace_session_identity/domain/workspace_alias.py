@@ -79,6 +79,17 @@ GIT_BINDINGS = (GIT_BINDING_SAME, GIT_BINDING_DIFFERENT, GIT_BINDING_NOT_MEASURA
 REASON_DECLARATION_UNREADABLE = "declaration_unreadable"
 REASON_DECLARATION_INVALID = "declaration_invalid"
 REASON_UNSUPPORTED_SCHEMA = "declaration_unsupported_schema"
+# The declaration path exists but is not a regular file (symlink, directory,
+# FIFO, device). Distinct from "absent" on purpose (review j#102104 Finding 2):
+# treating a non-regular node as "nothing declared" is what would let a broken
+# or substituted declaration re-enable the nested launch.
+REASON_NOT_REGULAR_FILE = "declaration_not_regular_file"
+# Write-path refusals (review j#102104 Finding 1). Each is zero-mutation.
+REASON_PARENT_UNSAFE = "declaration_parent_unsafe"
+REASON_MULTIPLE_LINKS = "declaration_multiple_links"
+REASON_WRITE_FAILED = "declaration_write_failed"
+REASON_READBACK_FAILED = "declaration_readback_failed"
+REASON_REMOVE_FAILED = "declaration_remove_failed"
 REASON_TARGET_NOT_DECLARED = "alias_target_not_declared"
 REASON_TARGET_MISSING = "alias_target_missing"
 REASON_TARGET_NOT_DIRECTORY = "alias_target_not_directory"
@@ -88,6 +99,15 @@ REASON_TARGET_IDENTITY_UNRESOLVED = "alias_target_identity_unresolved"
 REASON_TARGET_IDENTITY_MISMATCH = "alias_target_identity_mismatch"
 REASON_CROSS_REPOSITORY = "alias_target_cross_repository"
 REASON_ALIAS_CYCLE = "alias_target_declares_alias"
+
+
+#: The exact key set each mode defines. Anything else is refused by
+#: :func:`parse_declaration` (review j#102104 Finding 3).
+_COMMON_KEYS = ("schema_version", "mode", "reason", "created_at", "updated_at")
+_ALLOWED_KEYS = {
+    MODE_ALIAS: _COMMON_KEYS + ("canonical_path", "canonical_workspace_id"),
+    MODE_DISABLED: _COMMON_KEYS,
+}
 
 
 def _exact_token(value: object) -> bool:
@@ -119,15 +139,26 @@ class WorkspaceAliasDeclaration:
     updated_at: str = ""
 
     def as_payload(self) -> dict:
-        return {
+        """The on-disk form — mode-appropriate keys only.
+
+        A ``disabled`` declaration does not carry the alias target keys at all,
+        rather than carrying them empty. The written form has to round-trip
+        through :func:`parse_declaration`, which rejects keys a mode does not
+        define (review j#102104 Finding 3), so emitting empty target fields for
+        a disabled declaration would make this writer produce files its own
+        reader refuses.
+        """
+        payload = {
             "schema_version": ALIAS_SCHEMA_VERSION,
             "mode": self.mode,
-            "canonical_path": self.canonical_path,
-            "canonical_workspace_id": self.canonical_workspace_id,
             "reason": self.reason,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
+        if self.mode == MODE_ALIAS:
+            payload["canonical_path"] = self.canonical_path
+            payload["canonical_workspace_id"] = self.canonical_workspace_id
+        return payload
 
 
 @dataclass(frozen=True)
@@ -220,6 +251,21 @@ def parse_declaration(raw: object) -> AliasResolution | WorkspaceAliasDeclaratio
         return refused(
             REASON_DECLARATION_INVALID,
             f"mode={mode!r} expected one of {list(DECLARED_MODES)}",
+        )
+
+    # Unknown / surplus keys are refused, not ignored (review j#102104 Finding 3).
+    # A future schema may attach meaning to a key this reader does not know —
+    # `future_semantics: launch-anyway` is the shape that motivated this — and a
+    # reader that silently drops it would apply a *partial* interpretation of a
+    # declaration whose whole point is to gate launching. The schema_version bump
+    # is the sanctioned way to extend; an unversioned extra key is malformed.
+    allowed = set(_ALLOWED_KEYS[mode])
+    surplus = sorted(set(raw.keys()) - allowed)
+    if surplus:
+        return refused(
+            REASON_DECLARATION_INVALID,
+            f"unknown key(s) for mode={mode!r}: {surplus}; "
+            f"schema v{ALIAS_SCHEMA_VERSION} defines {sorted(allowed)}",
         )
 
     reason = raw.get("reason") or ""
@@ -409,6 +455,12 @@ __all__ = (
     "REASON_CROSS_REPOSITORY",
     "REASON_DECLARATION_INVALID",
     "REASON_DECLARATION_UNREADABLE",
+    "REASON_MULTIPLE_LINKS",
+    "REASON_NOT_REGULAR_FILE",
+    "REASON_PARENT_UNSAFE",
+    "REASON_READBACK_FAILED",
+    "REASON_REMOVE_FAILED",
+    "REASON_WRITE_FAILED",
     "REASON_TARGET_IDENTITY_MISMATCH",
     "REASON_TARGET_IDENTITY_UNRESOLVED",
     "REASON_TARGET_IS_SELF",

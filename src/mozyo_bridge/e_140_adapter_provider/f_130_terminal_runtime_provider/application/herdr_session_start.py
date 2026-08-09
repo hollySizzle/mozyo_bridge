@@ -448,7 +448,19 @@ def _prepare_session_locked(
 
     The cataloged native-identity spec owns the full contract. This private entry
     point validates the plan before writes; the public caller owns lock and rollback.
+
+    Nested-workspace alias / launch-disable is re-evaluated HERE as well as in
+    :func:`prepare_session` (review j#102107 Finding 4). This entry — not the
+    public wrapper — is the boundary every launch actually reaches: the v1
+    replacement driver calls it directly with ``admission_lock_held=True`` to
+    avoid re-entering the lock wrapper, so a rail placed only on the public entry
+    is bypassed by exactly the live replacement path. Re-applying is idempotent:
+    a canonical root declares nothing, so an already-folded root resolves to
+    itself unchanged. The public entry keeps its own call so a declined workspace
+    is still refused *before* the home lock, binary resolution and the capability
+    probe — the zero-side-effect ordering this rail promises.
     """
+    repo_root = apply_workspace_alias(repo_root)
     for provider in providers:
         if provider not in AGENT_PROVIDERS:
             raise HerdrSessionStartError(

@@ -41,6 +41,8 @@ from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.doma
     WorkspaceAliasDeclaration,
 )
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.infrastructure.workspace_alias_store import (  # noqa: E501
+    CLEAR_ABSENT,
+    CLEAR_REMOVED,
     alias_path,
     clear_declaration,
     read_declaration,
@@ -294,13 +296,14 @@ class StoreTests(AliasFixtureTestCase):
 
     def test_clear_removes_only_the_declaration(self) -> None:
         self._declare_alias()
-        self.assertTrue(clear_declaration(self.nested))
+        self.assertEqual(clear_declaration(self.nested), CLEAR_REMOVED)
         self.assertIsNone(read_declaration(self.nested))
         # Identity and tracked workspace content are untouched.
         self.assertTrue(
             (self.nested / ".mozyo-bridge" / "workspace-anchor.json").is_file()
         )
-        self.assertFalse(clear_declaration(self.nested))
+        # A second clear reports "absent", never a false "removed".
+        self.assertEqual(clear_declaration(self.nested), CLEAR_ABSENT)
 
     def test_absent_declaration_reads_as_none(self) -> None:
         self.assertIsNone(read_declaration(self.nested))
@@ -325,6 +328,19 @@ class LaunchChokepointTests(AliasFixtureTestCase):
 
     def test_undeclared_root_is_passed_through_unchanged(self) -> None:
         self.assertEqual(Path(self._apply(self.nested)), self.nested)
+
+    def test_undeclared_root_is_returned_byte_identical(self) -> None:
+        """An undeclared root must not be silently canonicalized.
+
+        The launch cwd is spelled straight into the ``herdr pane split --cwd``
+        argv, so normalizing symlinks / ``..`` here would change that argv for
+        every workspace that declares nothing.
+        """
+        link = self.base / "linked-root"
+        link.symlink_to(self.nested, target_is_directory=True)
+        unnormalized = link / "." / ".."  / "linked-root"
+        self.assertEqual(str(self._apply(unnormalized)), str(unnormalized))
+        self.assertEqual(str(self._apply(link)), str(link))
 
     def test_declared_alias_is_folded_into_the_canonical_root(self) -> None:
         self._declare_alias()

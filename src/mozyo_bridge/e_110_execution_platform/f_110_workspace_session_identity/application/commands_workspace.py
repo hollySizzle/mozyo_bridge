@@ -280,6 +280,8 @@ def cmd_workspace_alias(args: argparse.Namespace) -> int:
         build_alias_resolution,
     )
     from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.infrastructure.workspace_alias_store import (  # noqa: E501
+        CLEAR_REMOVED,
+        WorkspaceAliasStoreError,
         alias_path,
         clear_declaration,
         read_declaration,
@@ -313,7 +315,23 @@ def cmd_workspace_alias(args: argparse.Namespace) -> int:
         return _emit(payload, resolution.ok)
 
     if action == "clear":
-        removed = clear_declaration(repo_root)
+        # A present-but-unremovable declaration must never be reported as
+        # "nothing was declared" (review j#102104 Finding 2): that would tell the
+        # operator this workspace launches independently again when it does not.
+        try:
+            outcome = clear_declaration(repo_root)
+        except WorkspaceAliasStoreError as exc:
+            return _emit(
+                {
+                    "state": "refused",
+                    "reason": exc.reason,
+                    "detail": f"{exc.detail} — the declaration is still in place.",
+                    "repo_root": str(repo_root),
+                    "declaration_path": str(alias_path(repo_root)),
+                },
+                False,
+            )
+        removed = outcome == CLEAR_REMOVED
         return _emit(
             {
                 "state": "cleared" if removed else "no_declaration",
@@ -333,7 +351,19 @@ def cmd_workspace_alias(args: argparse.Namespace) -> int:
             mode=MODE_DISABLED,
             reason=getattr(args, "reason", "") or "",
         )
-        written = write_declaration(repo_root, declaration)
+        try:
+            written = write_declaration(repo_root, declaration)
+        except WorkspaceAliasStoreError as exc:
+            return _emit(
+                {
+                    "state": "refused",
+                    "reason": exc.reason,
+                    "detail": f"{exc.detail} — nothing was written.",
+                    "repo_root": str(repo_root),
+                    "declaration_path": str(alias_path(repo_root)),
+                },
+                False,
+            )
         return _emit(
             {
                 "state": "declared",
@@ -392,7 +422,19 @@ def cmd_workspace_alias(args: argparse.Namespace) -> int:
         ).strip(" —")
         return _emit(payload, False)
 
-    written = write_declaration(source, declaration)
+    try:
+        written = write_declaration(source, declaration)
+    except WorkspaceAliasStoreError as exc:
+        return _emit(
+            {
+                "state": "refused",
+                "reason": exc.reason,
+                "detail": f"{exc.detail} — nothing was written.",
+                "repo_root": str(source),
+                "declaration_path": str(alias_path(source)),
+            },
+            False,
+        )
     readback = resolve_launch_root(source)
     payload: dict = readback.as_payload()
     payload["repo_root"] = str(source)

@@ -123,7 +123,11 @@ def register(sub) -> None:
         "show",
         help=(
             "Show the declaration this workspace carries and how a launch root "
-            "would resolve, including a typed refusal reason. Read-only."
+            "would resolve, including a typed refusal reason. Read-only. Exits 0 "
+            "when a launch would proceed (no declaration, or a verified alias) "
+            "and 1 when it would not (launch-disabled, or a declaration that "
+            "fails verification) — so the exit code answers the same question "
+            "session-start asks."
         ),
     )
     add_repo_option(alias_show)

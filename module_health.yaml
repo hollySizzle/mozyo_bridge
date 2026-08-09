@@ -1452,19 +1452,24 @@ allowlist:
     expires: "2027-10-08"
 
   - path: src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_session_start.py
-    lines: 1002
+    lines: 1014
     reason: >-
-      Re-added at 1002 by Redmine #15190 (nested-workspace alias / launch-disable).
+      Re-added by Redmine #15190 (nested-workspace alias / launch-disable).
       The file was at EXACTLY 1000 — the threshold itself — before this change, so
-      it had zero headroom and any addition at all crosses it. #15190 needs one
-      chokepoint inside `prepare_session`, because that entry is what all four
-      launch callers funnel through (session-start CLI, the bare-`mozyo` herdr
-      branch, the v1 replacement binding, the shared-space smoke harness);
-      applying the rail at the callers instead would leave a future fifth caller
-      able to plan a duplicate default pair, which is the defect being fixed.
-      The addition here is therefore the minimum possible: ONE import and ONE
-      call line (+2). The decision body, its typed refusals and its operator
-      guidance all live in the new cohesive sibling
+      it had zero headroom and any addition at all crosses it. #15190 needs the
+      rail on BOTH launch entries: `prepare_session` (the public one, where the
+      refusal must land ahead of the home lock, binary resolution and the
+      capability probe so a decline is zero-side-effect) and
+      `_prepare_session_locked` (the one every launch actually reaches — the v1
+      replacement driver calls it directly with `admission_lock_held=True` to
+      avoid re-entering the lock wrapper, so a rail only on the public entry is
+      bypassed by exactly the live replacement path; review j#102107 Finding 4).
+      Re-applying is idempotent: a canonical root declares nothing, so an
+      already-folded root resolves to itself. The addition is two import lines
+      and two call lines plus the docstring paragraph recording why the
+      duplication is deliberate — without it a later reader would "clean up" the
+      second call and silently restore the bypass. The decision body, its typed
+      refusals and its operator guidance all live in the new cohesive sibling
       `e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_session_start_alias.py`,
       and the pure model / store / use case live under
       `e_110_execution_platform/f_110_workspace_session_identity/`.
