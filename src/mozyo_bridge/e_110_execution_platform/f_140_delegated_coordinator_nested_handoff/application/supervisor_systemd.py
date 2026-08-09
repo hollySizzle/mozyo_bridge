@@ -229,8 +229,21 @@ def user_manager_available(runner: Runner = _default_runner) -> bool:
 _MAX_PID_DIGITS = len(str(2**31 - 1))
 
 
+#: Whether the host manager's answer could be READ, in the vocabulary the macOS adapter publishes
+#: (review j#102200 finding r3f2). The same three tokens on both hosts, so `probe_state` means one
+#: thing in the common status contract. The drift guard is a test, not an import, so neither OS
+#: adapter has to import the other.
+PROBE_LOADED = "loaded"
+PROBE_CONFIRMED_ABSENT = "confirmed_absent"
+PROBE_UNREADABLE = "unreadable"
+
+
 def _show(runner: Runner, unit_name: str, properties: Sequence[str]) -> dict[str, str]:
-    """Read-only ``systemctl --user show`` → ``{property: value}``. Never raises."""
+    """Read-only ``systemctl --user show`` → ``{property: value}``. Never raises.
+
+    An empty result means the read FAILED, which :func:`_probe_state` keeps distinct from a
+    successful read of an inactive unit — those are different facts.
+    """
     args = ["show", unit_name, *[f"--property={p}" for p in properties]]
     try:
         result = _systemctl(runner, args)
@@ -244,6 +257,19 @@ def _show(runner: Runner, unit_name: str, properties: Sequence[str]) -> dict[str
         if sep:
             values[key.strip()] = value.strip()
     return values
+
+
+def _probe_state(shown: dict[str, str], *, manager_available: bool) -> str:
+    """Classify the host manager read into the shared three-token vocabulary.
+
+    ``systemctl show`` answers for a unit it does not know (with empty / inactive values), so an
+    EMPTY mapping here does not mean "no such unit" — it means the read itself failed, which is the
+    unreadable case. An unreachable user manager is unreadable for the same reason: nothing was
+    read, so nothing about the unit is known (review j#102200 finding r3f2).
+    """
+    if not manager_available or not shown:
+        return PROBE_UNREADABLE
+    return PROBE_LOADED if shown.get("ActiveState") == "active" else PROBE_CONFIRMED_ABSENT
 
 
 def _refused(action: str, reason: str, **extra: object) -> dict:
@@ -483,6 +509,7 @@ def service_status(
     service_exists = service_target.exists()
     timer_exists = timer_target.exists()
 
+    manager_available = user_manager_available(runner)
     timer_shown = _show(runner, SUPERVISOR_UNIT.timer_unit, _TIMER_PROPERTIES)
     service_shown = _show(runner, SUPERVISOR_UNIT.service_unit, _SERVICE_PROPERTIES)
 
@@ -530,7 +557,11 @@ def service_status(
         "action": "service-status",
         "label": SUPERVISOR_UNIT.label,
         "platform_supported": _running_on_linux(),
-        "user_manager_available": user_manager_available(runner),
+        "user_manager_available": manager_available,
+        # Whether the host manager's answer could be READ, in the same fixed vocabulary the macOS
+        # adapter publishes (review j#102200 finding r3f2): a failed read must not be reported as a
+        # confirmed state. The timer is the unit that answers "is anything scheduling this".
+        "probe_state": _probe_state(timer_shown, manager_available=manager_available),
         # Installed only when BOTH owned units are present: a lone service has no cadence and a lone
         # timer has nothing to start.
         "installed": service_exists and timer_exists,
@@ -606,6 +637,9 @@ __all__ = (
     "DEFAULT_TICK_INTERVAL_SECONDS",
     "REASON_UNSUPPORTED_PLATFORM",
     "REASON_USER_MANAGER_UNAVAILABLE",
+    "PROBE_LOADED",
+    "PROBE_CONFIRMED_ABSENT",
+    "PROBE_UNREADABLE",
     "REASON_EXECUTABLE_NOT_FOUND",
     "REASON_COMMAND_NOT_RENDERABLE",
     "REASON_SERVICE_NOT_LOADED",

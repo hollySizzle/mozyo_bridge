@@ -256,6 +256,100 @@ class CredentialContractParityTest(unittest.TestCase):
                 )
 
 
+class ProbeStateProjectionTest(unittest.TestCase):
+    """Review j#102200 finding r3f2: status must distinguish a verified state from an unreadable one.
+
+    Both hosts collapsed a failed read into the same shape a successful "not running" read produces,
+    so an operator could not tell "confirmed stopped" from "I could not look". The projection now
+    carries a fixed-vocabulary ``probe_state`` — and it must carry the SAME vocabulary on both, or
+    the common CLI contract is split again by the very key that was added to unify it.
+    """
+
+    def test_the_probe_vocabulary_is_identical_on_both_adapters(self) -> None:
+        # A drift guard, not an import: neither OS adapter imports the other.
+        self.assertEqual(sl.PROBE_LOADED, ss.PROBE_LOADED)
+        self.assertEqual(sl.PROBE_CONFIRMED_ABSENT, ss.PROBE_CONFIRMED_ABSENT)
+        self.assertEqual(sl.PROBE_UNREADABLE, ss.PROBE_UNREADABLE)
+
+    def test_macos_status_separates_confirmed_absence_from_an_unreadable_read(self) -> None:
+        owned = sl.SUPERVISOR_AGENT.label
+        denied = _launchd_status(_fake_result(113, stderr="Operation not permitted"))
+        absent = _launchd_status(
+            _fake_result(113, stderr=f'Could not find service "{owned}" in domain for gui')
+        )
+        # The exact defect: these two used to be byte-identical dictionaries.
+        self.assertNotEqual(denied, absent)
+        self.assertEqual(denied["probe_state"], sl.PROBE_UNREADABLE)
+        self.assertEqual(absent["probe_state"], sl.PROBE_CONFIRMED_ABSENT)
+        # ...and neither claims the service is running.
+        self.assertFalse(denied["loaded"])
+        self.assertFalse(absent["loaded"])
+
+    def test_linux_status_separates_an_unreadable_manager_from_a_read_unit(self) -> None:
+        readable = _systemd_status(manager_available=True)
+        unreadable = _systemd_status(manager_available=False)
+        self.assertNotEqual(readable, unreadable)
+        self.assertEqual(unreadable["probe_state"], ss.PROBE_UNREADABLE)
+        self.assertIn(
+            readable["probe_state"], (ss.PROBE_LOADED, ss.PROBE_CONFIRMED_ABSENT)
+        )
+
+    def test_the_projection_leaks_no_raw_manager_text(self) -> None:
+        # `probe_state` is a fixed token, never the launchctl / systemctl message it came from.
+        status = _launchd_status(_fake_result(113, stderr="Operation not permitted"))
+        self.assertNotIn("not permitted", json.dumps(status).lower())
+        self.assertIn(
+            status["probe_state"],
+            (sl.PROBE_LOADED, sl.PROBE_CONFIRMED_ABSENT, sl.PROBE_UNREADABLE),
+        )
+
+
+def _fake_result(returncode: int, stdout: str = "", stderr: str = ""):
+    return type("R", (), {"returncode": returncode, "stdout": stdout, "stderr": stderr})()
+
+
+def _launchd_status(print_result) -> dict:
+    """A macOS status projection with an owned plist installed and ``print`` scripted."""
+    os_home = Path(tempfile.mkdtemp())
+    mozyo_home = Path(tempfile.mkdtemp())
+    target = sl.plist_path(os_home)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    argv = [
+        "/opt/bin/mozyo-bridge", "workflow", "supervisor", "--run-once",
+        "--home", str(sl.resolve_mozyo_home(mozyo_home)),
+    ]
+    target.write_bytes(sl.render_plist(argv, interval_seconds=180, os_home=os_home))
+
+    def runner(command):
+        return print_result if list(command)[1] == "print" else _fake_result(0)
+
+    with patch.object(sl, "_running_on_darwin", return_value=True):
+        return sl.service_status(
+            os_home=os_home, mozyo_home=mozyo_home, runner=runner,
+            which=lambda _n: "/opt/bin/mozyo-bridge",
+        )
+
+
+def _systemd_status(*, manager_available: bool) -> dict:
+    """A Linux status projection where the user manager is reachable, or is not."""
+    os_home = Path(tempfile.mkdtemp())
+    mozyo_home = Path(tempfile.mkdtemp())
+
+    def runner(command):
+        argv = list(command)
+        if argv[2] == "show" and any(a.startswith("--property=Version") for a in argv):
+            return _fake_result(0 if manager_available else 1)
+        if argv[2] == "show":
+            return _fake_result(0 if manager_available else 1, "ActiveState=inactive\n")
+        return _fake_result(0)
+
+    with patch.object(sys, "platform", "linux"):
+        return ss.service_status(
+            os_home=os_home, mozyo_home=mozyo_home, runner=runner,
+            which=lambda _n: "/opt/bin/mozyo-bridge",
+        )
+
+
 class OfflineRolloutSeamTest(_HostCase):
     """Review j#102151 Finding 2: the capture side and the plan side must agree on the roster size.
 

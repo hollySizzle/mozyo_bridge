@@ -542,9 +542,25 @@ service manager 異常・認識できない失敗・launchctl 不在はすべて
 plist は**あえて残す**: それが operator にとって「まだ生きている登録があるかもしれない」ことを示す唯一の
 durable な手掛かりであり、消せば live job を隠すことになる。
 
-not-found の認識は `launchctl` の exit code（113）と message（`could not find service` 等）の **両方**を signal
-とする（どちらも単独では安定契約ではないため）。**認識漏れの失敗方向は over-refusal**（typed reason 付きで
-install を拒否）であり、under-refusal（二重登録）ではない。実 macOS の signal との突合は #15194 の検証項目。
+not-found の認識は **連言**である（review j#102200 finding r3f1）。`confirmed_absent` は次の**すべて**を要求する:
+(1) `launchctl` の exit code が unknown label のもの、(2) 認識可能な not-found 語を含む、(3) その出力が
+**自分の domain/label を名指ししている**、(4) 権限エラー等「不存在以外の理由で読めなかった」signal を含まない。
+
+以前は (1) **または** (2) で足りるとしていたため、`113` + `Operation not permitted`（権限失敗）が不存在と判定され
+所有 plist を削除した。単独の signal はこの帰結を負うには弱すぎる: launchctl の man page は成功=0 / 失敗=非0 しか
+定めておらず **113 を不存在の契約としていない**し、`print` 出力は **API ではなく変更され得ると明記**されている。
+自分の label に束縛した連言にして初めて「行動してよいだけの具体性」を持ち、権限 signal の非存在を要求して初めて
+「読めなかった理由」が「見るものが無い」として通らなくなる。
+
+**認識漏れの失敗方向は over-refusal**（typed reason 付きで install を拒否し plist を保持）であり、under-refusal
+（二重登録）ではない。実機で契約を確定できるまでは拒否側が正直な答えである。実 macOS signal との突合は #15194。
+
+**状態は投影にも出す**（review j#102200 finding r3f2）。内部で 3 値化しても結果を `loaded` / `pid` へ縮約すると、
+「停止確認済み」と「読めなかった」が**同一の辞書**になり operator も共通 CLI も識別できない。status は固定語彙の
+`probe_state`（`loaded` / `confirmed_absent` / `unreadable`）を返す。**両 OS で同じ key・同じ語彙**とする（macOS
+だけに出すと、共通契約を統一するために足した key が逆に契約を host 別に割る）。Linux 側は `systemctl show` が
+読めたか否かから同じ語彙へ写す（`show` は未知 unit にも応答するため、空の結果は「unit 不在」ではなく
+**読み取り失敗**である）。生の launchctl / systemctl 文面と秘密値は投影に出さない。
 
 **順序は「先に退役、後に install」**であり、これが partial failure 下で不変条件を保つ順序である。逆順（install
 してから migration）にすると途中失敗時に **登録が 2 個** 残る——本変更が終わらせようとしている状態そのものであ

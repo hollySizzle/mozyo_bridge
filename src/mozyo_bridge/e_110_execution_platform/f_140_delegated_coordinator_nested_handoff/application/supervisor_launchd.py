@@ -272,13 +272,26 @@ def _launchctl(runner: Runner, args: Sequence[str]) -> "subprocess.CompletedProc
 #: prefix silently costs the whole 直近の終了結果 projection (#15192).
 _LAST_EXIT_PREFIXES = ("last exit code = ", "last exit status = ")
 
-#: ``launchctl print`` exit codes that positively mean "no such service in this domain". 113 is the
-#: code launchctl returns for an unknown label; it is listed rather than assumed stable, and a miss
-#: falls through to the phrase check and then to :data:`PROBE_UNREADABLE`.
+#: ``launchctl print`` exit codes seen for an unknown label. **Necessary, never sufficient** (review
+#: j#102200 finding r3f1): launchctl's man page documents only "0 on success, non-zero on failure"
+#: and does not make 113 a stable not-found contract, so this corroborates label-bound evidence and
+#: cannot authorize a removal by itself.
 _LAUNCHCTL_NOT_FOUND_CODES = (113,)
-#: Lowercased fragments of launchctl's "unknown service" message. A second, independent signal for
-#: the same fact, because the exit code is not a documented contract.
+#: Lowercased fragments of launchctl's "unknown service" message. Also necessary-but-not-sufficient:
+#: the man page states ``print`` output is not an API and may change.
 _LAUNCHCTL_NOT_FOUND_PHRASES = ("could not find service", "no such process", "not find service")
+#: Lowercased fragments meaning "this read failed for a reason OTHER than absence". Their presence
+#: disqualifies a not-found reading outright — a permission error names why we could not look, which
+#: is the opposite of evidence that there is nothing to look at.
+_LAUNCHCTL_UNREADABLE_PHRASES = (
+    "not permitted",
+    "permission denied",
+    "not privileged",
+    "denied",
+    "unauthori",  # unauthorised / unauthorized
+    "could not connect",
+    "connection invalid",
+)
 
 
 def _probe(runner: Runner, agent: SupervisorAgent = SUPERVISOR_AGENT) -> dict:
@@ -313,7 +326,9 @@ def _probe(runner: Runner, agent: SupervisorAgent = SUPERVISOR_AGENT) -> dict:
         return _result(PROBE_UNREADABLE)
     if result.returncode != 0:
         return _result(
-            PROBE_CONFIRMED_ABSENT if _says_not_found(result) else PROBE_UNREADABLE
+            PROBE_CONFIRMED_ABSENT
+            if _says_not_found(result, _service_target(agent))
+            else PROBE_UNREADABLE
         )
     pid: Optional[int] = None
     last_exit: Optional[int] = None
@@ -333,24 +348,43 @@ def _probe(runner: Runner, agent: SupervisorAgent = SUPERVISOR_AGENT) -> dict:
     }
 
 
-def _says_not_found(result) -> bool:
-    """Whether a non-zero ``launchctl print`` positively reports an UNKNOWN service.
+def _says_not_found(result, service_target: str) -> bool:
+    """Whether a non-zero ``launchctl print`` positively reports THIS service as unknown.
 
-    Deliberately narrow. This is the only path that can authorize deleting a registration on the
-    strength of an *error*, so it recognizes launchctl's "no such service" outcome and nothing else:
-    an unrecognized failure means the state could not be read, which is a different answer from
-    "there is nothing there" (review j#102180 finding 1).
+    This is the only path that can authorize deleting a registration on the strength of an *error*,
+    so the evidence is a **conjunction**, not a choice (review j#102200 finding r3f1). All of:
 
-    Both a code and a phrase are accepted because neither alone is dependable — the exit code is not
-    documented as stable across macOS releases, and the message is user-facing text. A miss on both
-    falls to :data:`PROBE_UNREADABLE`, i.e. the install refuses with a typed reason rather than
-    removing something it cannot account for: **over-refusal is recoverable, a second live
-    registration is the defect this whole migration exists to prevent.**
+    1. the exit code is one launchctl uses for an unknown label, **and**
+    2. the output carries a recognized "no such service" phrase, **and**
+    3. the output names the exact service target we asked about, **and**
+    4. the output carries no signal that the read failed for some *other* reason.
+
+    The earlier version accepted the code **or** the phrase, which is how ``113`` +
+    ``Operation not permitted`` — a permission failure — read as absence and deleted an owned plist.
+    Either signal alone is too weak to carry that consequence: launchctl's man page documents only
+    "0 on success, non-zero on failure", so 113 is not a not-found contract, and it states that
+    ``print`` output is not an API, so the wording may change. Requiring both, bound to our own
+    domain/label, is what makes the reading specific enough to act on; requiring the *absence* of a
+    permission signal is what stops "the reason we could not look" from passing as "nothing to see".
+
+    A miss on any conjunct yields :data:`PROBE_UNREADABLE`: the install refuses with a typed reason
+    and keeps the plist. That is the deliberate failure direction — **over-refusal is recoverable
+    and visible, a second live registration is the defect this migration exists to prevent** — and
+    until the contract can be confirmed against a real launchd, refusing is the honest answer.
     """
-    if result.returncode in _LAUNCHCTL_NOT_FOUND_CODES:
-        return True
+    if result.returncode not in _LAUNCHCTL_NOT_FOUND_CODES:
+        return False
     message = f"{getattr(result, 'stderr', '') or ''}\n{getattr(result, 'stdout', '') or ''}".lower()
-    return any(phrase in message for phrase in _LAUNCHCTL_NOT_FOUND_PHRASES)
+    if any(phrase in message for phrase in _LAUNCHCTL_UNREADABLE_PHRASES):
+        return False
+    if not any(phrase in message for phrase in _LAUNCHCTL_NOT_FOUND_PHRASES):
+        return False
+    # Bind the reading to what we actually asked about: a not-found message naming some OTHER label
+    # says nothing about ours. The full target (gui/<uid>/<label>) or the bare label both count,
+    # since the exact wording is not a contract.
+    target = (service_target or "").lower()
+    label = target.rsplit("/", 1)[-1]
+    return bool(label) and (target in message or label in message)
 
 
 def _small_int_or_none(token: str) -> Optional[int]:
@@ -722,6 +756,7 @@ def service_status(
     plist_exists = target.exists()
     probe = _probe(runner, agent=agent)
     loaded, pid = bool(probe["loaded"]), probe["pid"]
+    probe_state = probe["state"]
 
     installed = _read_installed_plist(target) if plist_exists else None
     # Three distinct states: absent (not_installed), present-but-unreadable (unreadable_plist), and
@@ -801,6 +836,12 @@ def service_status(
         ),
         "last_exit_status": last_exit_status,
         "last_exit_at": "",
+        # Whether the host manager's answer could be READ, in the shared fixed vocabulary (review
+        # j#102200 finding r3f2). Without it, "confirmed stopped" and "I could not tell" produced
+        # byte-identical projections — both `loaded: False`, `pid: None` — so neither an operator
+        # nor the common CLI could distinguish a verified state from an unreadable one. A fixed
+        # token only: no raw launchctl text and no secret ever reaches this projection.
+        "probe_state": probe_state,
         # 実行内容: the exact argv the scheduled agent runs. Non-secret by construction — a
         # PATH-resolved executable, fixed flags, and a config directory; never an environment block.
         "installed_command": list(installed_argv) if isinstance(installed_argv, list) else [],

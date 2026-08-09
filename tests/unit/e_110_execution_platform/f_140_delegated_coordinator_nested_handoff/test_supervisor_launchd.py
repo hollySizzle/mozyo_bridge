@@ -1004,19 +1004,59 @@ class LegacyDrainMigrationTest(_DarwinCase):
             {"loaded", "confirmed_absent", "unreadable"},
         )
 
-    def test_only_a_positively_reported_absence_counts_as_absent(self) -> None:
-        # The probe classification itself: a bare non-zero says nothing, a recognized not-found says
-        # the service is unknown, and a zero exit says it is loaded.
-        cases = {
-            _result(0, "\tpid = 5\n"): sl.PROBE_LOADED,
-            _result(113): sl.PROBE_CONFIRMED_ABSENT,
-            _result(1, stderr='Could not find service "x" in domain'): sl.PROBE_CONFIRMED_ABSENT,
-            _result(1, stderr="Operation not permitted"): sl.PROBE_UNREADABLE,
-            _result(1): sl.PROBE_UNREADABLE,
-        }
-        for scripted, expected in cases.items():
+    def test_absence_needs_the_whole_conjunction_not_any_one_signal(self) -> None:
+        # Review j#102200 finding r3f1. Deleting a registration on the strength of an ERROR needs
+        # evidence specific enough to act on, so absence requires ALL of: a not-found exit code, a
+        # recognized not-found phrase, our own label named in it, and no signal that the read failed
+        # for another reason. Any one of those alone is too weak — `113` + `Operation not permitted`
+        # is a PERMISSION failure, and reading it as absence is what deleted an owned plist.
+        owned = sl.SUPERVISOR_AGENT.label
+        not_found = f'Could not find service "{owned}" in domain for gui'
+        cases = [
+            (_result(0, "\tpid = 5\n"), sl.PROBE_LOADED, "zero exit is loaded"),
+            (_result(113, stderr=not_found), sl.PROBE_CONFIRMED_ABSENT, "full conjunction"),
+            (_result(113), sl.PROBE_UNREADABLE, "code alone is not enough"),
+            (_result(1, stderr=not_found), sl.PROBE_UNREADABLE, "phrase alone is not enough"),
+            (
+                _result(113, stderr="Operation not permitted"),
+                sl.PROBE_UNREADABLE,
+                "the r3f1 reproduction: code matches but the read was denied",
+            ),
+            (
+                _result(113, stderr=f"{not_found}; Operation not permitted"),
+                sl.PROBE_UNREADABLE,
+                "a denial signal disqualifies even alongside a not-found phrase",
+            ),
+            (
+                _result(113, stderr='Could not find service "com.example.other" in domain'),
+                sl.PROBE_UNREADABLE,
+                "not-found about SOMEONE ELSE says nothing about ours",
+            ),
+            (_result(1), sl.PROBE_UNREADABLE, "a bare non-zero says nothing"),
+        ]
+        for scripted, expected, why in cases:
             state = sl._probe(FakeRunner(print_result=scripted))["state"]
-            self.assertEqual(state, expected, scripted.stderr or scripted.returncode)
+            self.assertEqual(state, expected, why)
+
+    def test_the_r3f1_reproduction_keeps_the_plist_and_refuses(self) -> None:
+        # End-to-end shape of the same defect: exit 113 with a permission error must not remove the
+        # owned retired plist.
+        _write_home_credential(self.mozyo_home)
+        legacy = _legacy_drain_plist(self.os_home)
+
+        class _Code113ButDenied:
+            def __call__(self, argv):
+                argv = list(argv)
+                target = argv[2] if len(argv) > 2 else ""
+                if sl.LEGACY_DRAIN_AGENT.label in target:
+                    code = 113 if argv[1] == "print" else 1
+                    return _result(code, stderr="Operation not permitted")
+                return _result(0)
+
+        result = sl.remove_legacy_drain(os_home=self.os_home, runner=_Code113ButDenied())
+        self.assertFalse(result["removed"])
+        self.assertEqual(result["reason"], sl.REASON_LEGACY_DRAIN_STATE_UNREADABLE)
+        self.assertTrue(legacy.exists())
 
     def test_an_absent_launchctl_is_unreadable_not_absent(self) -> None:
         # No launchctl means no answer about the job — emphatically not "the job is gone".
