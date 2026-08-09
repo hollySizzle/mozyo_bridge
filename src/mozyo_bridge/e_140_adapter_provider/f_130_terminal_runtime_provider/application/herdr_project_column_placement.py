@@ -81,9 +81,11 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     REASON_OK,
     REASON_POSTCONDITION_FAILED,
     REASON_STALE_PREVIEW,
+    column_resize_actuator_key,
     deferred_preview,
     internal_pair_matches,
     outer_ratio,
+    placement_failure_result,
     refused_preview,
     row_by_locator,
     runtime_revision,
@@ -568,26 +570,11 @@ class HerdrProjectColumnPlacement(ProjectColumnAdjustmentMixin):
         detail: str,
         reason: str,
         stranded: int = 0,
+        recovery_attempted: bool = False,
     ) -> ProjectColumnPlacementResult:
-        after = self._observe()
-        if changed:
-            recovery = (
-                "One or more panes remain outside the shared tab; use the live relayout "
-                "runbook before retrying."
-                if stranded
-                else "The safe return was attempted; inspect the Unit and preview again before retrying."
-            )
-            status = PLACEMENT_PARTIAL
-        else:
-            recovery = "Resolve the refusal and run preview again."
-            status = PLACEMENT_REFUSED
-        return ProjectColumnPlacementResult(
-            status,
-            reason,
-            detail,
-            before,
-            after,
-            recovery,
+        return placement_failure_result(
+            before, self._observe(), changed=changed, detail=detail, reason=reason,
+            stranded=stranded, recovery_attempted=recovery_attempted,
         )
 
     def _swap_adjacent(
@@ -644,6 +631,7 @@ class HerdrProjectColumnPlacement(ProjectColumnAdjustmentMixin):
                     reason=REASON_COMMAND_UNPROVEN,
                     detail="Herdr did not prove a temporary lower-pane move",
                     stranded=stranded,
+                    recovery_attempted=True,
                 )
             detached[column.lower.pane_id] = (
                 column.top.pane_id,
@@ -669,6 +657,7 @@ class HerdrProjectColumnPlacement(ProjectColumnAdjustmentMixin):
                     reason=REASON_POSTCONDITION_FAILED,
                     detail="live authority changed after a temporary lower-pane move",
                     stranded=stranded,
+                    recovery_attempted=True,
                 )
         top_order[left_index], top_order[right_index] = (
             top_order[right_index],
@@ -702,6 +691,7 @@ class HerdrProjectColumnPlacement(ProjectColumnAdjustmentMixin):
                 ),
                 detail="Herdr did not prove the adjacent Unit-column swap",
                 stranded=stranded,
+                recovery_attempted=True,
             )
 
         for column in (left, right):
@@ -731,6 +721,7 @@ class HerdrProjectColumnPlacement(ProjectColumnAdjustmentMixin):
                     reason=REASON_COMMAND_UNPROVEN,
                     detail="Herdr did not prove a lower pane returned to its Unit",
                     stranded=stranded,
+                    recovery_attempted=True,
                 )
             detached.pop(column.lower.pane_id, None)
             attached[column.lower.pane_id] = (
@@ -757,6 +748,7 @@ class HerdrProjectColumnPlacement(ProjectColumnAdjustmentMixin):
                     reason=REASON_POSTCONDITION_FAILED,
                     detail="live authority changed while restoring a Unit column",
                     stranded=stranded,
+                    recovery_attempted=True,
                 )
         return None
 
@@ -809,7 +801,17 @@ class HerdrProjectColumnPlacement(ProjectColumnAdjustmentMixin):
                         detail="Herdr stopped moving a Unit divider toward its configured width",
                     )
                 direction, amount = resize_step(split.ratio, target.ratio, "right")
-                column = evidence.by_key[target.left_unit]
+                actuator_key = column_resize_actuator_key(
+                    evidence.current_order, target.left_unit, direction
+                )
+                if actuator_key is None:
+                    return self._failure(
+                        before,
+                        changed=changed,
+                        reason=REASON_POSTCONDITION_FAILED,
+                        detail="a Unit divider has no right-side resize actuator",
+                    )
+                column = evidence.by_key[actuator_key]
                 try:
                     completed = _invoke(
                         self.binary,

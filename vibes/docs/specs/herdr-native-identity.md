@@ -747,10 +747,12 @@ geometry が直後に変わるため)。
   root split の rect と一致した)。候補が 0 個または 2 個以上なら fail-closed。
   herdr は split した pane を **second 側**へ置くため、起点 slot が first 側に居る layout は
   予測しない形として fail-closed とする。
-- **shared tab 安全弁 (#14567 との組合せ)**: herdr の `pane resize` は「指定 pane の、direction と軸が
-  一致する最も近い祖先 split」を動かす。したがって actuate 前に「その最近祖先 split が pair 自身の
-  divider か」を照合し、一致しない場合は **resize を発行せず fail-closed** にする。これが無いと、
-  全 sublane を単一 tab へ集約した構成で外側の divider を動かし隣の lane を再配置しうる。
+- **shared tab 安全弁 (#14567 との組合せ)**: Herdr 0.8の`pane resize`は、指定paneが要求方向に面する
+  祖先splitを先に選び、該当しない場合だけ最も近い同軸splitへfallbackする。したがってfirst childを
+  増やす`down` / `right`はfirst pane、減らす`up` / `left`はsecond paneをactuatorにし、actuate前に
+  pair自身のdividerとpane側を照合する。一致しない場合は**resizeを発行せずfail-closed**にする。
+  これが無いと、全sublaneを単一tabへ集約した同軸入れ子構成で外側のdividerを動かし、隣のlaneを
+  再配置しうる。
 - **収束と検証**: `--amount` は 1 回あたり 0.5 に clamp される (実測) ため、観測 ratio から毎回 delta を
   再計算する有界ループ (最大 4 pass、進捗が止まったら中断) で寄せ、最後に `pane layout` を読み直して
   判定する。判定は 2 本立てで、split ratio が宣言値と `f32` 誤差内 (`1e-3`) であること、かつ first-child

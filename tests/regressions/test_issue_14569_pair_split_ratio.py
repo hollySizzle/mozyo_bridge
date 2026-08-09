@@ -45,6 +45,7 @@ from support.herdr_fake import (  # noqa: E402
     apply_resize_amount,
     render_pane_layout,
 )
+from support.herdr_pane_tree import PaneTreeHerdr  # noqa: E402
 from support.agent_provider_binaries import (  # noqa: E402
     FakeAgentBinaries,
     neutralized_overrides,
@@ -76,6 +77,8 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     RATIO_OUTCOMES,
     RATIO_SUCCESS_OUTCOMES,
     PaneRect,
+    PairPanes,
+    _apply_ratio,
     find_pair_split,
     governing_split,
     order_pair,
@@ -461,10 +464,9 @@ class PaneGeometryDecisionTest(unittest.TestCase):
         )
 
     def test_governing_split_is_the_nearest_same_axis_ancestor(self) -> None:
-        # herdr resolves `pane resize --pane P --direction D` to the nearest ancestor split
-        # on D's axis (measured j#91140). Reconstructed from rects as the SMALLEST same-axis
-        # split containing the pane — which is what lets the caller refuse when that is not
-        # the pair's own divider.
+        # Reconstruct the nearest same-axis fallback from rects as the SMALLEST
+        # containing split. Herdr 0.8 first searches the pane's requested edge;
+        # an actuator must therefore choose the correct pane side separately.
         snapshot = parse_pane_layout(
             json.dumps(
                 {
@@ -506,6 +508,42 @@ class PaneGeometryDecisionTest(unittest.TestCase):
             governing_split(snapshot, snapshot.panes["inner_a"], "down").split_id, "inner"
         )
         self.assertIsNone(governing_split(snapshot, snapshot.panes["inner_a"], "right"))
+
+    def test_nested_same_axis_shrink_addresses_the_pairs_second_pane(self) -> None:
+        herdr = PaneTreeHerdr("w1")
+        tab = herdr.new_tab()
+        (a,), (b,), (c,) = herdr.seed_columns(tab, [["a"], ["b"], ["c"]])
+        opening = parse_pane_layout(json.dumps(tab.layout_payload()))
+        self.assertIsNotNone(opening)
+        pair = PairPanes(first_pane=b, second_pane=c)
+        split = find_pair_split(
+            opening, opening.panes[b], opening.panes[c], "right"
+        )
+        self.assertIsNotNone(split)
+
+        outcome, detail = _apply_ratio(
+            pair,
+            split,
+            opening.panes[b],
+            direction="right",
+            target=0.4,
+            binary="herdr",
+            runner=herdr,
+            timeout=1.0,
+            env=None,
+        )
+
+        self.assertEqual(RATIO_APPLIED, outcome, detail)
+        self.assertEqual(1, len(herdr.resizes))
+        resize = herdr.resizes[0]
+        self.assertEqual(c, resize[resize.index("--pane") + 1])
+        self.assertEqual("left", resize[resize.index("--direction") + 1])
+        closing = parse_pane_layout(json.dumps(tab.layout_payload()))
+        self.assertIsNotNone(closing)
+        outer = governing_split(closing, closing.panes[a], "right")
+        nested = governing_split(closing, closing.panes[b], "right")
+        self.assertAlmostEqual(0.5, outer.ratio)
+        self.assertAlmostEqual(0.4, nested.ratio)
 
     def test_ratio_is_always_the_first_child_share_on_both_axes(self) -> None:
         for direction in ("down", "right"):

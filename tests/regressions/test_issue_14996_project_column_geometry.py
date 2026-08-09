@@ -62,6 +62,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     COLUMN_PREPARED,
     reflow_project_columns,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_balance import (  # noqa: E402,E501
+    ColumnRatioTarget,
+    _resize_column_ratio,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_result import (  # noqa: E402,E501
     SLOT_ADOPTED,
     SLOT_LAUNCHED,
@@ -367,6 +371,18 @@ class ProjectColumnGeometryTest(unittest.TestCase):
         self.assertEqual(ordered, [PROJECT_A, PROJECT_B, PROJECT_C, PROJECT_D])
         widths = [width for _x, width in columns.values()]
         self.assertLessEqual(max(widths) - min(widths), 1)
+        resize_edges = [
+            (
+                call[call.index("--pane") + 1],
+                call[call.index("--direction") + 1],
+            )
+            for call in env.herdr.resizes
+        ]
+        self.assertEqual(
+            resize_edges,
+            [(b_pair[0], "left"), (c_pair[0], "left")],
+            "a shrinking divider must be addressed from its immediate right column",
+        )
 
     def test_resize_refusal_is_a_typed_column_failure(self):
         env = _Env(self, PROJECT_A, PROJECT_B, PROJECT_C)
@@ -377,6 +393,27 @@ class ProjectColumnGeometryTest(unittest.TestCase):
         outcome, detail = env.run(env.result(PROJECT_C, list(launched)))
         self.assertEqual(outcome, COLUMN_FAILED)
         self.assertIn("refused project-column resize", detail)
+
+    def test_stale_right_actuator_refuses_before_resize(self):
+        herdr = PaneTreeHerdr("w1")
+        tab = herdr.new_tab()
+        (_a,), (b,), (c,), (d,) = herdr.seed_columns(
+            tab, [["a"], ["b"], ["c"], ["d"]]
+        )
+        target = ColumnRatioTarget(b, c, 1.0 / 3.0)
+        self.assertTrue(tab.swap(c, d))
+
+        changed, detail = _resize_column_ratio(
+            target,
+            binary="herdr",
+            runner=herdr,
+            timeout=1.0,
+            env=None,
+        )
+
+        self.assertFalse(changed)
+        self.assertIn("no longer the immediate project column", detail)
+        self.assertEqual([], herdr.resizes)
 
     def test_resize_success_without_progress_is_a_typed_column_failure(self):
         env = _Env(self, PROJECT_A, PROJECT_B, PROJECT_C)

@@ -165,21 +165,37 @@ class Tab:
         return True
 
     def resize(self, pane_id: str, direction: str, amount: float) -> bool:
-        """Resize the nearest ancestor divider whose axis matches ``direction``."""
+        """Resize the nearest divider on the requested live pane edge.
+
+        Herdr resolves ``right`` / ``down`` through an ancestor whose first
+        child contains the pane, and ``left`` / ``up`` through one whose second
+        child contains it.  When the requested outer edge has no divider it
+        falls back to the nearest divider on that axis.  Axis-only matching is
+        insufficient for nested columns: a middle pane's left edge belongs to
+        the outer divider while its right edge belongs to the inner divider.
+        """
         axis = "down" if direction in {"up", "down"} else "right"
+        first_side = direction in {"right", "down"}
 
         def locate(node):
             if isinstance(node, Leaf):
-                return (node.pane_id == pane_id, None)
-            first_has, first_split = locate(node.first)
-            second_has, second_split = locate(node.second)
+                return (node.pane_id == pane_id, None, None)
+            first_has, first_sided, first_fallback = locate(node.first)
+            second_has, second_sided, second_fallback = locate(node.second)
             contains = first_has or second_has
-            nearest = first_split or second_split
-            if contains and nearest is None and node.direction == axis:
-                nearest = node
-            return contains, nearest
+            sided = first_sided or second_sided
+            fallback = first_fallback or second_fallback
+            if contains and node.direction == axis:
+                if fallback is None:
+                    fallback = node
+                if sided is None and (
+                    (first_side and first_has) or (not first_side and second_has)
+                ):
+                    sided = node
+            return contains, sided, fallback
 
-        contains, split = locate(self.root)
+        contains, sided, fallback = locate(self.root)
+        split = sided or fallback
         if not contains or split is None:
             return False
         split.ratio = apply_resize_amount(split.ratio, direction, amount)
