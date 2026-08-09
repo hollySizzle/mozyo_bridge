@@ -103,13 +103,18 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REASON_NOT_RECORDED,
     REASON_RECORD_DECLARES_CHANGE,
     REASON_REVIEW_ROUND_RECORDED,
+    REASON_SOURCE_OPEN_IN_TRACKER,
     REASON_SUCCESSOR_IS_SELF,
     REASON_SUCCESSOR_NOT_ACKNOWLEDGED,
+    REASON_SUCCESSOR_OPEN_IN_TRACKER,
+    REASON_SUCCESSOR_REVIEW_HEAD_MISMATCH,
+    REASON_TRACKER_STATUS_UNREADABLE,
     SUCCESSOR_ACK_FIELD_ORDER,
     SUCCESSOR_ACK_GATE,
     SUPERSEDED_AUDIT_FAILURE_FIELD_ORDER,
     SUPERSEDED_AUDIT_FAILURE_GATE,
     SUPERSEDED_AUDIT_FAILURE_REFUSAL_REASONS,
+    TrackerIssueStatus,
     evaluate_superseded_audit_failure_admissible,
     fold_audit_supersession_acknowledgement,
     fold_superseded_audit_failure,
@@ -236,17 +241,39 @@ def source_journals(
     return journals
 
 
+#: The conclusion the canonical ``review_result`` marker carries for each governed prose spelling.
+_MARKER_CONCLUSION = {"承認": "approved", "要修正": "changes_requested"}
+
+
 def successor_journals(
     *,
     ack: "str | None" = None,
     conclusion: str = "承認",
     close: bool = True,
+    reviewed_head: str = HEAD,
+    canonical_markers: bool = True,
     extra: "list[tuple[str, str]] | None" = None,
 ) -> "list[tuple[str, str]]":
-    """The successor issue's durable history, shaped like #15165's real one."""
+    """The successor issue's durable history, shaped like #15165's real one.
+
+    ``reviewed_head`` is the head the round's markers pin — #15165's real pair carries the same
+    ``83a65e6d…`` on both the request and the result. ``canonical_markers=False`` drops them, which
+    is how a fixture reaches "the approval examined nothing this workspace can name": the glance
+    grammar populates ``review_round_head`` only for a round whose result head was correlated
+    against its request head.
+    """
+    request = "## Gate: review_request\n"
+    result = f"## Gate: review\n- 結論: {conclusion}\n"
+    if canonical_markers:
+        request += f"\n[mozyo:workflow-event:gate=review_request:head={reviewed_head}]\n"
+        result += (
+            f"\n[mozyo:workflow-event:gate=review_result:"
+            f"conclusion={_MARKER_CONCLUSION[conclusion]}:head={reviewed_head}:"
+            f"req={SUCCESSOR_REVIEW_REQUEST_JOURNAL}]\n"
+        )
     journals = [
-        (SUCCESSOR_REVIEW_REQUEST_JOURNAL, "## Gate: review_request\n"),
-        (SUCCESSOR_REVIEW_JOURNAL, f"## Gate: review\n- 結論: {conclusion}\n"),
+        (SUCCESSOR_REVIEW_REQUEST_JOURNAL, request),
+        (SUCCESSOR_REVIEW_JOURNAL, result),
     ]
     if close:
         journals.append((SUCCESSOR_CLOSE_JOURNAL, "## Gate: task_close\n"))
@@ -280,6 +307,8 @@ def admit(
     commits_ahead: "int | None" = 0,
     worktree_clean: bool = True,
     callbacks_drained: bool = True,
+    source_closed_in_tracker: "bool | None" = True,
+    successor_closed_in_tracker: "bool | None" = True,
 ):
     """Fold both records with the SHARED grammar and evaluate — the whole route, minus IO.
 
@@ -308,6 +337,13 @@ def admit(
             close_recorded=bool(
                 successor_facts is not None and successor_facts.latest_gate == GATE_CLOSE
             ),
+        ),
+        successor_review_head=(
+            successor_facts.review_round_head if successor_facts else ""
+        ),
+        tracker=TrackerIssueStatus(
+            source_closed=source_closed_in_tracker,
+            successor_closed=successor_closed_in_tracker,
         ),
         review_round_journals=(
             tuple(gate_facts.review_round_journals or ()) if gate_facts else ()
@@ -693,6 +729,120 @@ class TheSuccessorMustAcknowledgeAndHaveSucceeded(unittest.TestCase):
                     acknowledgement_marker(**kwargs)
 
 
+class TheApprovalMustHaveExaminedThisLaneHead(unittest.TestCase):
+    """Review j#101880 finding 1: the conjunct two self-written markers cannot manufacture."""
+
+    def test_two_markers_agreeing_with_each_other_are_not_enough_on_their_own(self):
+        # The finding's own reduction. The declaration and the acknowledgement can be placed by ONE
+        # unauthenticatable actor across two issues, so a route whose safety rests on them agreeing
+        # rests on nothing. Strip the successor's canonical review markers — everything the R1
+        # design required is still present and still agrees — and the admission is gone.
+        outcome = admit(
+            successor=successor_journals(
+                ack=acknowledgement_marker(), canonical_markers=False
+            )
+        )
+        self.assertFalse(outcome.admissible)
+        self.assertEqual(outcome.reason, REASON_SUCCESSOR_REVIEW_HEAD_MISMATCH)
+
+    def test_an_approval_about_another_head_does_not_cover_this_lane(self):
+        outcome = admit(
+            successor=successor_journals(ack=acknowledgement_marker(), reviewed_head="c" * 40)
+        )
+        self.assertFalse(outcome.admissible)
+        self.assertEqual(outcome.reason, REASON_SUCCESSOR_REVIEW_HEAD_MISMATCH)
+
+    def test_a_shadowed_review_marker_is_not_an_approval_and_names_no_head(self):
+        # A result whose ``req`` does not correlate to its request is shadowed by the shared
+        # grammar: it folds to ``pending`` with NO body fallback, so the successor refuses as
+        # INCOMPLETE before head coverage is even asked — and it names no head either. Both halves
+        # are pinned, because the second is what this route added and the first is what already
+        # kept a broken marker from reading as an approval.
+        broken = (
+            "## Gate: review\n- 結論: 承認\n\n"
+            f"[mozyo:workflow-event:gate=review_result:conclusion=approved:head={HEAD}:req=999999]\n"
+        )
+        successor = successor_journals(ack=acknowledgement_marker())
+        successor[1] = (SUCCESSOR_REVIEW_JOURNAL, broken)
+        self.assertEqual(admit(successor=successor).reason, REASON_SUCCESSOR_INCOMPLETE)
+        self.assertEqual(fold_issue_gate_facts(successor).review_round_head, "")
+
+    def test_the_reviewed_head_is_read_through_the_shared_grammar(self):
+        # Not a route-local parse: the same fold every other consumer uses exposes it, and it is
+        # populated only for a round whose result head correlated against its request head.
+        facts = fold_issue_gate_facts(successor_journals(ack=acknowledgement_marker()))
+        self.assertEqual(facts.review_round_head, HEAD)
+        shadowed = fold_issue_gate_facts(
+            successor_journals(ack=acknowledgement_marker(), canonical_markers=False)
+        )
+        self.assertEqual(shadowed.review_round_head, "")
+
+    def test_the_head_coverage_is_a_three_way_equality_with_the_live_lane(self):
+        # The declaration head is compared against BOTH the reviewed head and (below, in the live
+        # half) the lane's actual head, so "a real approved review covers exactly the state this
+        # lane holds" is a measurement rather than a claim.
+        moved = admit(live_head="0" * 40)
+        self.assertEqual(moved.reason, REASON_POST_DECLARATION_MUTATION)
+        self.assertTrue(admit().admissible)
+
+    def test_an_arbitrary_non_audit_journal_no_longer_carries_admission_weight(self):
+        # The finding's other repro: a plain progress memo named as the audit record. The route
+        # still admits it — and that is now CORRECT rather than a hole, because the admission rests
+        # on head coverage plus zero-change plus live-zero, not on the pointer's prose. Pinned so
+        # the claim in the docstring is measured rather than asserted.
+        memo = source_journals(
+            marker=declaration_marker(),
+            audit="## 進捗メモ\n\n単なる進捗メモです。監査結果ではありません。\n",
+        )
+        self.assertTrue(admit(source=memo).admissible)
+        # …and stripping the head coverage from that same record refuses it, which is the point:
+        # the pointer never was what made it safe.
+        self.assertEqual(
+            admit(
+                source=memo,
+                successor=successor_journals(
+                    ack=acknowledgement_marker(), canonical_markers=False
+                ),
+            ).reason,
+            REASON_SUCCESSOR_REVIEW_HEAD_MISMATCH,
+        )
+
+
+class TheTrackerStatusIsReadNotInferred(unittest.TestCase):
+    """Review j#101880 finding 2: a Close gate is a belief, the tracker is the fact."""
+
+    def test_a_status_only_reopen_of_the_source_is_refused(self):
+        # The shape the journal fold structurally cannot see: Redmine's status changes and no
+        # ``## Gate:`` note is added, so every journal-derived conjunct still passes.
+        outcome = admit(source_closed_in_tracker=False)
+        self.assertFalse(outcome.admissible)
+        self.assertEqual(outcome.reason, REASON_SOURCE_OPEN_IN_TRACKER)
+
+    def test_a_status_only_reopen_of_the_successor_is_refused(self):
+        # The successor had NO current-status input at all before this: a re-opened successor
+        # counted as complete on the strength of its past Close gate.
+        outcome = admit(successor_closed_in_tracker=False)
+        self.assertFalse(outcome.admissible)
+        self.assertEqual(outcome.reason, REASON_SUCCESSOR_OPEN_IN_TRACKER)
+
+    def test_an_unreadable_status_refuses_as_its_own_reason(self):
+        # Never a silent fall-through to the journal answer, and never collapsed into "open":
+        # "the tracker says open" and "we could not ask" send an operator to different places.
+        for kwargs in (
+            {"source_closed_in_tracker": None},
+            {"successor_closed_in_tracker": None},
+        ):
+            with self.subTest(**kwargs):
+                self.assertEqual(admit(**kwargs).reason, REASON_TRACKER_STATUS_UNREADABLE)
+
+    def test_the_journal_close_gate_alone_no_longer_admits(self):
+        # The control that proves the new conjunct is load-bearing: the record's Close gate is
+        # present and unchanged in every one of these fixtures.
+        facts = fold_issue_gate_facts(source_journals(marker=declaration_marker()))
+        self.assertEqual(facts.latest_gate, GATE_CLOSE)
+        self.assertFalse(admit(source_closed_in_tracker=False).admissible)
+
+
 class TheLiveHalfBoundsTheRoute(unittest.TestCase):
     """Zero commits over the integration branch is what makes admitting cost nothing."""
 
@@ -978,6 +1128,14 @@ def _EVERY_REFUSAL_FIXTURE():
         admit(source=source_journals(marker=self_successor)),
         admit(successor=successor_journals(ack=None)),
         admit(successor=successor_journals(ack=acknowledgement_marker(), close=False)),
+        admit(
+            successor=successor_journals(
+                ack=acknowledgement_marker(), canonical_markers=False
+            )
+        ),
+        admit(source_closed_in_tracker=None),
+        admit(source_closed_in_tracker=False),
+        admit(successor_closed_in_tracker=False),
         admit(measured_branch=INTEGRATION_BRANCH),
         admit(worktree_clean=False),
         admit(live_head=""),
@@ -1148,7 +1306,7 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
             head = _make_lane_checkout(Path(tmp))
             records = {
                 ISSUE: source_journals(marker=declaration_marker(head=head)),
-                SUCCESSOR: successor_journals(ack=acknowledgement_marker()),
+                SUCCESSOR: successor_journals(ack=acknowledgement_marker(), reviewed_head=head),
             }
             outcome = self._resolve_with(records, worktree=tmp)
             self.assertTrue(outcome.admissible, outcome.reason)
@@ -1160,7 +1318,7 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
             (Path(tmp) / "scratch.txt").write_text("uncommitted", encoding="utf-8")
             records = {
                 ISSUE: source_journals(marker=declaration_marker(head=head)),
-                SUCCESSOR: successor_journals(ack=acknowledgement_marker()),
+                SUCCESSOR: successor_journals(ack=acknowledgement_marker(), reviewed_head=head),
             }
             outcome = self._resolve_with(records, worktree=tmp)
             self.assertFalse(outcome.admissible)
@@ -1172,7 +1330,9 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
             head = _commit(Path(tmp), "extra.txt", "work")
             records = {
                 ISSUE: source_journals(marker=declaration_marker(head=head)),
-                SUCCESSOR: successor_journals(ack=acknowledgement_marker()),
+                SUCCESSOR: successor_journals(
+                    ack=acknowledgement_marker(), reviewed_head=head
+                ),
             }
             outcome = self._resolve_with(records, worktree=tmp)
             self.assertFalse(outcome.admissible)
@@ -1184,7 +1344,7 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
             _git(Path(tmp), "branch", "-D", INTEGRATION_BRANCH)
             records = {
                 ISSUE: source_journals(marker=declaration_marker(head=head)),
-                SUCCESSOR: successor_journals(ack=acknowledgement_marker()),
+                SUCCESSOR: successor_journals(ack=acknowledgement_marker(), reviewed_head=head),
             }
             outcome = self._resolve_with(records, worktree=tmp)
             self.assertFalse(outcome.admissible)
@@ -1206,18 +1366,84 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
             _git(Path(tmp), "checkout", "--quiet", LANE)
             records = {
                 ISSUE: source_journals(marker=declaration_marker(head=head)),
-                SUCCESSOR: successor_journals(ack=acknowledgement_marker()),
+                SUCCESSOR: successor_journals(ack=acknowledgement_marker(), reviewed_head=head),
             }
             outcome = self._resolve_with(records, worktree=tmp)
             self.assertFalse(outcome.admissible)
             self.assertEqual(outcome.reason, REASON_LANE_NOT_INTEGRATED)
+
+    def test_a_status_only_reopen_refuses_end_to_end_for_either_issue(self):
+        # The effect terminal for review j#101880 finding 2: not only does the pure fence refuse,
+        # the route ASKS the tracker. Both issues are covered because the successor had no
+        # current-status input at all before this round.
+        for issue, reason in (
+            (ISSUE, REASON_SOURCE_OPEN_IN_TRACKER),
+            (SUCCESSOR, REASON_SUCCESSOR_OPEN_IN_TRACKER),
+        ):
+            with self.subTest(reopened=issue), tempfile.TemporaryDirectory() as tmp:
+                head = _make_lane_checkout(Path(tmp))
+                records = {
+                    ISSUE: source_journals(marker=declaration_marker(head=head)),
+                    SUCCESSOR: successor_journals(
+                        ack=acknowledgement_marker(), reviewed_head=head
+                    ),
+                }
+                outcome = self._resolve_with(
+                    records, worktree=tmp, closed={issue: False}
+                )
+                self.assertFalse(outcome.admissible)
+                self.assertEqual(outcome.reason, reason)
+
+    def test_an_unreadable_tracker_status_refuses_end_to_end(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            head = _make_lane_checkout(Path(tmp))
+            records = {
+                ISSUE: source_journals(marker=declaration_marker(head=head)),
+                SUCCESSOR: successor_journals(
+                    ack=acknowledgement_marker(), reviewed_head=head
+                ),
+            }
+            outcome = self._resolve_with(records, worktree=tmp, closed={ISSUE: None})
+            self.assertFalse(outcome.admissible)
+            self.assertEqual(outcome.reason, REASON_TRACKER_STATUS_UNREADABLE)
+
+    def test_the_status_reader_requires_the_response_to_identify_the_exact_issue(self):
+        # The reader's own discipline, exercised against its real body with a fake transport: a
+        # payload about a DIFFERENT issue, or with no status, testifies about nothing.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E501
+            LiveRedmineJournalSource,
+        )
+
+        def _reader(payload):
+            source = LiveRedmineJournalSource(
+                base_url="https://example.invalid",
+                api_key="k",
+                transport=lambda **_: payload,
+            )
+            original = LiveRedmineJournalSource.from_environment
+            LiveRedmineJournalSource.from_environment = classmethod(
+                lambda cls, **kwargs: source
+            )
+            try:
+                return retire_superseded_audit_failure._read_live_issue_closed(ISSUE)
+            finally:
+                LiveRedmineJournalSource.from_environment = original
+
+        closed = {"issue": {"id": ISSUE, "status": {"is_closed": True}}}
+        self.assertIs(_reader(closed), True)
+        self.assertIs(_reader({"issue": {"id": ISSUE, "status": {"is_closed": False}}}), False)
+        # A response about another issue, an absent status, and a non-mapping payload each yield
+        # the unmeasured value — never a silent True.
+        self.assertIsNone(_reader({"issue": {"id": "99999", "status": {"is_closed": True}}}))
+        self.assertIsNone(_reader({"issue": {"id": ISSUE}}))
+        self.assertIsNone(_reader(["not", "an", "issue"]))
 
     def test_the_opt_in_is_required_for_the_route_to_run_at_all(self):
         with tempfile.TemporaryDirectory() as tmp:
             head = _make_lane_checkout(Path(tmp))
             records = {
                 ISSUE: source_journals(marker=declaration_marker(head=head)),
-                SUCCESSOR: successor_journals(ack=acknowledgement_marker()),
+                SUCCESSOR: successor_journals(ack=acknowledgement_marker(), reviewed_head=head),
             }
             outcome = self._resolve_with(
                 records, worktree=tmp, superseded_audit_failure_terminal=False
@@ -1230,7 +1456,7 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
             head = _make_lane_checkout(Path(tmp))
             records = {
                 ISSUE: source_journals(marker=declaration_marker(head=head)),
-                SUCCESSOR: successor_journals(ack=acknowledgement_marker()),
+                SUCCESSOR: successor_journals(ack=acknowledgement_marker(), reviewed_head=head),
             }
             with _stub_live(records):
                 outcome = _resolve_latest_generation_admissible(
@@ -1283,8 +1509,8 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
         )
         self.assertTrue(decision.may_retire)
 
-    def _resolve_with(self, records, *, worktree: str, **overrides):
-        with _stub_live(records):
+    def _resolve_with(self, records, *, worktree: str, closed=None, **overrides):
+        with _stub_live(records, closed=closed):
             return _resolve_superseded_audit_failure_admissible(
                 self._args(worktree=worktree, **overrides),
                 target=RetireEvidenceTarget(WORKSPACE, LANE, GENERATION, "pointer", 1),
@@ -1293,23 +1519,38 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
 
 
 class _stub_live:
-    """Replace the route's live Redmine read with a fixture map, restoring it afterwards."""
+    """Replace BOTH of the route's live Redmine reads with fixtures, restoring them afterwards.
 
-    def __init__(self, records):
+    Two reads, two stubs (review j#101880 finding 2 added the second): the journal histories and
+    each issue's CURRENT tracker status. ``closed`` maps an issue id to the tri-state the tracker
+    read yields; anything not named defaults to ``True`` so the existing fixtures keep asserting
+    what they were written to assert. Both are stubbed unconditionally so no test in this suite can
+    reach the network — an unstubbed status read would silently resolve to ``None`` and every
+    end-to-end assertion would degrade into "the tracker was unreadable".
+    """
+
+    def __init__(self, records, closed=None):
         self._records = records
-        self._original = None
+        self._closed = closed or {}
+        self._original_journals = None
+        self._original_closed = None
 
     def __enter__(self):
-        self._original = retire_superseded_audit_failure._read_live_issue_journals
+        self._original_journals = retire_superseded_audit_failure._read_live_issue_journals
+        self._original_closed = retire_superseded_audit_failure._read_live_issue_closed
         retire_superseded_audit_failure._read_live_issue_journals = (
             lambda issue: [
                 (str(jid), notes) for jid, notes in self._records.get(str(issue), [])
             ]
         )
+        retire_superseded_audit_failure._read_live_issue_closed = (
+            lambda issue: self._closed.get(str(issue), True)
+        )
         return self
 
     def __exit__(self, *exc):
-        retire_superseded_audit_failure._read_live_issue_journals = self._original
+        retire_superseded_audit_failure._read_live_issue_journals = self._original_journals
+        retire_superseded_audit_failure._read_live_issue_closed = self._original_closed
         return False
 
 

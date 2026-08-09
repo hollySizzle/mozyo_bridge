@@ -26,40 +26,62 @@ So this is a FOURTH independent route to the same one boolean, and like the othe
 only ever ADMIT — none of them can weaken another, and a lane that fails all four is blocked
 exactly as it was before any of them existed.
 
-**What this route rests on, stated in one place rather than implied.** Every conjunct is either
-measured from live git or folded from a durable record, and the declaration marker is a POINTER,
-never a substitute: it names WHICH audit record and WHICH successor, and each is then re-read from
-the record itself.
+**What this route rests on, stated in one place rather than implied.** Review j#101880 finding 1
+measured the R1 answer to that question and refuted it: R1 said the safety weight was carried by
+the SOURCE declaration plus the SUCCESSOR acknowledgement corroborating each other. It is not.
+Neither record can be authenticated (ruling #14219 j#86718 — every role posts under one
+source-system account), and the correlation those two markers assert exists NOWHERE ELSE, so one
+writer could place both. That is the exact shape :mod:`.no_change_review_waiver` refuses
+permanently (``WRITER_AUTHORITY_RESOLVABLE``), and #14755's own docstring draws the line at it:
+that route is admissible because "the facts exist independently of the declaration, and the
+declaration only correlates them". R1 quoted the line and then landed on the wrong side of it.
 
-**And what it deliberately does NOT establish.** It does not establish that the named audit record
-CONCLUDED a failure. That conclusion is prose, and prose is not a governed surface — inventing a
-grammar for it here would be the #14755 review j#99065 defect one level over: a claim whose only
-witness is the record that makes it. What is established instead, and what actually carries the
-safety weight, is the conjunction:
+So the safety weight is moved onto a fact that exists independently of BOTH markers:
+
+**the successor's approved Review Gate examined THIS LANE'S EXACT HEAD.** The successor's
+``review_result`` marker carries the head it reviewed, the shared glance grammar has already
+verified under the Marker Contract v2 correlation that it equals the head its ``review_request``
+pinned, and this route requires that head to literal-equal the head the declaration was recorded at
+— which the live probe in turn requires to be the lane's actual head. A real, governed, approved
+Review Gate therefore covers precisely the repository state this lane holds. That is a
+gate-structured fact read from the successor's own record with the same grammar every other
+consumer uses; deleting the correlation markers does not change it, and no marker this route reads
+can manufacture it.
+
+The remaining conjuncts bound what admitting can cost:
 
 1. **no approval exists anywhere on this issue** — the record carries ZERO review rounds
    (:data:`REASON_REVIEW_ROUND_RECORDED`), so there is no approval to be stale, borrowed or
    misread, and this route can never become a second way past the ordinary fence;
-2. **the named audit record is real and is not a gate** — it exists in the issue's own history and
-   declares no lifecycle gate (:data:`REASON_AUDIT_JOURNAL_IS_A_GATE`), which is what keeps the
-   source-side failure and the successor-side approval two SEPARATE facts: a record that is not a
-   gate cannot be projected as an approval by any consumer;
-3. **the successor names this issue and this audit record back** — a source-side declaration alone
-   can name any approved issue in the tracker as its successor, so the bidirectional
-   acknowledgement is what makes the pairing a correlation rather than a claim, and it is written
-   into a DIFFERENT issue's record, by a different actor, at a different time;
-4. **the consequence is bounded** — the record declares zero repository change AND the live lane
-   carries zero commits over the integration branch with a clean worktree, so admitting drains a
-   process and terminalizes lifecycle metadata without integrating anything, minting any approval,
-   or draining a lane that holds unreviewed work.
+2. **the lane holds nothing of its own** — the durable record declares zero repository change AND
+   the live lane carries zero commits over the integration branch with a clean worktree. Combined
+   with head coverage this is the whole argument: the state is reviewed, and there is no other
+   state;
+3. **both issues are closed IN THE TRACKER, not merely in their own prose** — a ``close`` gate
+   journal says the lane BELIEVES it is closed; the tracker says whether it is (review j#101880
+   finding 2). Both current statuses are read fresh at action time;
+4. **the correlation records still have to line up** — the declaration names the audit record and
+   the successor, and the successor's own record names this issue and this audit record back. This
+   is retained as an INTEGRITY check on the pointers, NOT as the authority: it establishes that the
+   terminal is about the records it claims to be about, and it establishes nothing about who wrote
+   them.
 
-Nor does it establish WHO wrote anything. This workspace cannot authenticate a journal's writer:
-every role posts under one source-system account (ruling #14219 j#86718) and
-:func:`...hibernate_issuer_policy.resolve_journal_issuer` is a POLICY binding that takes no author
-input and says so. This gate is therefore deliberately NOT registered in
+**And what it deliberately does NOT establish.** It does not establish that the named audit record
+CONCLUDED a failure. That conclusion is prose, and prose is not a governed surface — inventing a
+grammar for it here would be the #14755 review j#99065 defect one level over: a claim whose only
+witness is the record that makes it. Review j#101880 measured the consequence directly (an audit
+note replaced by a plain progress memo still admitted), and the answer is not to parse the prose
+but to stop the admission from depending on it: the ``audit_journal`` field is a POINTER for the
+operator, and after this round it carries no admission weight that head coverage does not already
+carry.
+
+Nor does it establish WHO wrote anything. That gap is UNCHANGED and unclosable from a durable
+record; :func:`...hibernate_issuer_policy.resolve_journal_issuer` is a POLICY binding that takes no
+author input and says so. This gate is therefore deliberately NOT registered in
 :mod:`.hibernate_evidence_authority` — registering one needs a ruling that NAMES it, and
 manufacturing an anchor from a record that decided no writer contract is the #14661 j#92715 defect.
-That premise is stated here so a reviewer can accept or reject it, not buried.
+What changed in response to finding 1 is not that the gap closed, but that the admission no longer
+rests on it.
 
 Boundary: pure. No IO, no Redmine, no git. The live repository half, the gate folds and the
 successor issue's own facts are necessarily measured by the application layer and arrive here as
@@ -86,6 +108,19 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (  # noqa: E501
     GATE_REVIEW,
     REVIEW_APPROVED,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.superseded_audit_failure_correlation import (  # noqa: E501  (re-export)
+    ACK_ACKNOWLEDGED,
+    ACK_INVALID,
+    ACK_NONE,
+    SUCCESSOR_ACK_DECISION,
+    SUCCESSOR_ACK_FIELD_ORDER,
+    SUCCESSOR_ACK_GATE,
+    SUCCESSOR_ACK_STATES,
+    SUCCESSOR_ACK_VERSION,
+    AuditSupersessionAcknowledgementFacts,
+    fold_audit_supersession_acknowledgement,
+    render_audit_supersession_acknowledgement_marker,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.superseded_failure_correlation import (  # noqa: E501
     journal_ref,
@@ -298,146 +333,28 @@ def fold_superseded_audit_failure(
 
 
 # ---------------------------------------------------------------------------
-# The successor issue's own acknowledgement of THIS supersession shape.
+# The audit record the declaration points at, as the caller measured it.
 # ---------------------------------------------------------------------------
-
-#: The gate token the SUCCESSOR issue declares to acknowledge that it supersedes another issue's
-#: independent-audit failure. A SEPARATE token from #14755's ``superseded_failure_successor``
-#: rather than a shared one, for the same reason every authority gate here is named per surface: an
-#: acknowledgement written about a failed Review Gate answers a different question than one written
-#: about an audit record that never was a gate, and a record must never satisfy a contract it was
-#: not written under. The field sets differ accordingly.
-SUCCESSOR_ACK_GATE = "superseded_audit_failure_successor"
-#: The schema version. An unknown version is REFUSED rather than interpreted under today's field
-#: meanings.
-SUCCESSOR_ACK_VERSION = "1"
-#: The only admissible decision. A record written to DECLINE the pairing carries a different token
-#: and therefore cannot corroborate anything.
-SUCCESSOR_ACK_DECISION = "supersedes"
-
-#: The COMPLETE, ORDERED field set a canonical acknowledgement carries — no more, no less, in this
-#: sequence. There is deliberately NO lane envelope: the acknowledgement is about the SUCCESSOR's
-#: work, whose lane is not the retire target's, so an envelope here could not be exact-matched
-#: against anything the retire measures and would be a field that looks like a fence but is not.
-SUCCESSOR_ACK_FIELD_ORDER: Tuple[str, ...] = (
-    "gate",
-    "version",
-    "decision",
-    "issue",
-    "superseded_issue",
-    "superseded_audit_journal",
-    "review_journal",
-)
-
-#: No acknowledgement is in the successor's durable record at all.
-ACK_NONE = "none"
-#: A VALID acknowledgement: one canonical marker with every literal at its contracted value.
-ACK_ACKNOWLEDGED = "acknowledged"
-#: An acknowledgement is DECLARED but cannot be read as one. Fail-closed: treated exactly like
-#: :data:`ACK_NONE` by every consumer, and it SUPERSEDES an older valid one.
-ACK_INVALID = "invalid"
-
-SUCCESSOR_ACK_STATES: frozenset[str] = frozenset({ACK_NONE, ACK_ACKNOWLEDGED, ACK_INVALID})
 
 
 @dataclass(frozen=True)
-class AuditSupersessionAcknowledgementFacts:
-    """The LATEST audit-supersession acknowledgement in one SUCCESSOR issue's journals.
+class TrackerIssueStatus:
+    """What the TRACKER currently says about the two issues, from a fresh action-time read.
 
-    ``state`` is a closed :data:`SUCCESSOR_ACK_STATES` token; ``journal`` is where it was recorded.
-    The identity fields are projected from the canonical marker and are EMPTY unless the
-    acknowledgement is valid — never guessed from prose, and never completed from whatever the
-    caller happened to ask about.
+    Review j#101880 finding 2: a ``## Gate: close`` journal is the lane's own statement that it
+    believes it is closed. Redmine's status is a separate axis — a status-only reopen changes the
+    issue's ``is_closed`` without adding any ``## Gate:`` note — so the journal fold cannot see it,
+    and the source side had only the caller's ``--issue-closed`` assertion while the successor side
+    had nothing at all.
+
+    Each field is a TRI-STATE and the distinction matters for diagnosis: ``True`` the tracker
+    reports it closed, ``False`` the tracker reports it open, ``None`` the status could not be read.
+    ``None`` is not ``False`` — "the tracker says this is open" and "we could not ask the tracker"
+    send an operator to different places — but both refuse.
     """
 
-    state: str = ACK_NONE
-    journal: str = ""
-    issue: str = ""
-    superseded_issue: str = ""
-    superseded_audit_journal: str = ""
-    review_journal: str = ""
-
-    @property
-    def recorded(self) -> bool:
-        """True when any acknowledgement (valid or not) is in the successor's record."""
-        return self.state != ACK_NONE
-
-    @property
-    def in_force(self) -> bool:
-        """True ONLY for a VALID acknowledgement. :data:`ACK_INVALID` is False, like absent."""
-        return self.state == ACK_ACKNOWLEDGED
-
-
-def _journal_acknowledgement(notes: str) -> Optional[AuditSupersessionAcknowledgementFacts]:
-    """The acknowledgement ONE journal declares, or ``None`` if it declares none (pure)."""
-    declared, fields = one_canonical_marker(
-        notes, gate=SUCCESSOR_ACK_GATE, field_order=SUCCESSOR_ACK_FIELD_ORDER
-    )
-    if not declared:
-        return None
-    if fields is None:
-        return AuditSupersessionAcknowledgementFacts(state=ACK_INVALID)
-    constants = {
-        "gate": SUCCESSOR_ACK_GATE,
-        "version": SUCCESSOR_ACK_VERSION,
-        "decision": SUCCESSOR_ACK_DECISION,
-    }
-    if any(fields.get(key) != value for key, value in constants.items()):
-        return AuditSupersessionAcknowledgementFacts(state=ACK_INVALID)
-    issue = str(fields.get("issue", "") or "").strip()
-    superseded_issue = str(fields.get("superseded_issue", "") or "").strip()
-    superseded_audit = journal_ref(fields.get("superseded_audit_journal", ""))
-    review = journal_ref(fields.get("review_journal", ""))
-    if not issue or not superseded_issue or not superseded_audit or not review:
-        return AuditSupersessionAcknowledgementFacts(state=ACK_INVALID)
-    if issue == superseded_issue:
-        # An issue cannot acknowledge that it supersedes itself; a self-referential supersession
-        # orders nothing (the #14695 j#94260 shape, one level down).
-        return AuditSupersessionAcknowledgementFacts(state=ACK_INVALID)
-    return AuditSupersessionAcknowledgementFacts(
-        state=ACK_ACKNOWLEDGED,
-        issue=issue,
-        superseded_issue=superseded_issue,
-        superseded_audit_journal=superseded_audit,
-        review_journal=review,
-    )
-
-
-def fold_audit_supersession_acknowledgement(
-    journals: Sequence[Tuple[object, str]],
-) -> AuditSupersessionAcknowledgementFacts:
-    """The LATEST audit-supersession acknowledgement across the successor's journals (pure).
-
-    Latest-wins by journal id, supersede-by-EXISTING. A successor that later withdrew the pairing
-    by recording a malformed or superseding acknowledgement therefore shadows the older valid one,
-    rather than being skipped so the stale one keeps corroborating.
-    """
-    latest: Optional[Tuple[int, AuditSupersessionAcknowledgementFacts]] = None
-    for journal_id, notes in journals or ():
-        jint = _int_journal(journal_id)
-        if jint is None:
-            continue
-        facts = _journal_acknowledgement(notes or "")
-        if facts is None:
-            continue
-        if latest is None or jint > latest[0]:
-            latest = (
-                jint,
-                AuditSupersessionAcknowledgementFacts(
-                    state=facts.state,
-                    journal=str(jint),
-                    issue=facts.issue,
-                    superseded_issue=facts.superseded_issue,
-                    superseded_audit_journal=facts.superseded_audit_journal,
-                    review_journal=facts.review_journal,
-                ),
-            )
-    return latest[1] if latest is not None else AuditSupersessionAcknowledgementFacts()
-
-
-# ---------------------------------------------------------------------------
-# The audit record the declaration points at, as the caller measured it.
-# ---------------------------------------------------------------------------
+    source_closed: Optional[bool] = None
+    successor_closed: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -498,6 +415,20 @@ REASON_SUCCESSOR_IS_SELF = "superseded_audit_failure_successor_is_the_same_issue
 #: The named successor's own record does not acknowledge superseding THIS issue and THIS audit
 #: record.
 REASON_SUCCESSOR_NOT_ACKNOWLEDGED = "successor_does_not_acknowledge_the_audit_supersession"
+#: The successor's approved Review Gate did not examine this lane's head. THE conjunct this route
+#: rests on after review j#101880 finding 1: without it the admission would depend only on two
+#: unauthenticatable markers agreeing with each other, which is the shape #14695 refuses forever.
+REASON_SUCCESSOR_REVIEW_HEAD_MISMATCH = "successor_review_did_not_examine_this_lane_head"
+#: A current issue status could not be read from the tracker. Separate from "the tracker says it is
+#: open" because the remedy differs: this one says ask again, that one says the issue re-opened.
+REASON_TRACKER_STATUS_UNREADABLE = "tracker_issue_status_unreadable"
+#: The tracker currently reports the SOURCE issue open — a status-only reopen the journal fold
+#: cannot see, because it adds no ``## Gate:`` note (review j#101880 finding 2).
+REASON_SOURCE_OPEN_IN_TRACKER = "tracker_reports_the_source_issue_open"
+#: The tracker currently reports the SUCCESSOR issue open. Before this conjunct the successor had
+#: no current-status input at all: a re-opened successor still counted as complete on the strength
+#: of its past Close gate.
+REASON_SUCCESSOR_OPEN_IN_TRACKER = "tracker_reports_the_successor_issue_open"
 
 SUPERSEDED_AUDIT_FAILURE_REFUSAL_REASONS: frozenset[str] = frozenset(
     {
@@ -518,6 +449,10 @@ SUPERSEDED_AUDIT_FAILURE_REFUSAL_REASONS: frozenset[str] = frozenset(
         REASON_SUCCESSOR_IS_SELF,
         REASON_SUCCESSOR_NOT_ACKNOWLEDGED,
         REASON_SUCCESSOR_INCOMPLETE,
+        REASON_SUCCESSOR_REVIEW_HEAD_MISMATCH,
+        REASON_TRACKER_STATUS_UNREADABLE,
+        REASON_SOURCE_OPEN_IN_TRACKER,
+        REASON_SUCCESSOR_OPEN_IN_TRACKER,
         REASON_MEASURED_BRANCH_MISMATCH,
         REASON_WORKTREE_NOT_CLEAN,
         REASON_LANE_HEAD_UNMEASURED,
@@ -533,6 +468,8 @@ def evaluate_superseded_audit_failure_admissible(
     audit: AuditRecordEvidence,
     acknowledgement: AuditSupersessionAcknowledgementFacts,
     successor: SuccessorEvidence,
+    successor_review_head: str = "",
+    tracker: TrackerIssueStatus = TrackerIssueStatus(),
     review_round_journals: Sequence[int] = (),
     latest_gate_journal: object = "",
     close_recorded: bool = False,
@@ -568,31 +505,43 @@ def evaluate_superseded_audit_failure_admissible(
        gate stands at-or-after the declaration. That last conjunct subsumes the review-round
        ordering question (a round IS a gate) and additionally catches a lane that re-opened by
        recording any other gate after the terminal was declared;
-    4. the journal the declaration names as the audit record EXISTS in this issue's history, is
+    4. **the TRACKER currently reports both issues closed.** A ``close`` gate journal is the lane's
+       own belief; a status-only reopen adds no ``## Gate:`` note, so the fold above cannot see it
+       (review j#101880 finding 2). Both statuses are read fresh at action time, and an unreadable
+       status refuses rather than deferring to the journals;
+    5. the journal the declaration names as the audit record EXISTS in this issue's history, is
        NOT a recognized lifecycle gate, and is OLDER than the declaration;
-    5. the durable record declares ZERO repository change;
-    6. the SUCCESSOR is a different issue, its own record ACKNOWLEDGES superseding this issue and
+    6. the durable record declares ZERO repository change;
+    7. the SUCCESSOR is a different issue, its own record ACKNOWLEDGES superseding this issue and
        this audit record, and it has itself completed: its newest round is the approval the
        acknowledgement names, and it is durably closed;
-    7. the live repository still agrees, and the measurement is about THIS lane: the probed branch
+    8. **that approved Review Gate examined THIS LANE'S HEAD** — the head its own
+       ``review_result`` marker carries, which the shared grammar has already correlated against
+       the head its ``review_request`` pinned, literal-equals the head the declaration was recorded
+       at;
+    9. the live repository still agrees, and the measurement is about THIS lane: the probed branch
        is the lane the declaration names, its head is exactly the head the declaration was recorded
        against, the worktree is proven CLEAN, and it carries no commit the integration branch lacks.
 
-    **Why (5) and (7) together are what bound this route.** The declaration cannot be
-    authenticated — no record in this workspace can (ruling #14219 j#86718). What they establish is
-    that there is nothing to lose: a record that declares no change AND a lane at zero commits over
-    the integration branch with a clean worktree holds no unintegrated work, so admitting drains a
-    process and terminalizes lifecycle metadata without integrating anything, minting any approval,
-    or bypassing any review. (5) is required beside (7) because a zero ahead-count alone does not
-    mean the lane produced nothing — already-merged work is also zero ahead (#14695's own boundary)
-    — and merged-work-without-a-review is precisely what must never reach this terminal.
+    **Why (8) is what this route rests on, and (6) + (9) what bound it.** Review j#101880 finding 1
+    refuted the R1 answer: the source declaration and the successor acknowledgement corroborating
+    each other is not independent evidence, because neither can be authenticated and the
+    correlation they assert exists nowhere else — one writer could place both, which is the #14695
+    shape. (8) replaces that with a fact neither marker can manufacture: a real, governed, approved
+    Review Gate on another issue examined the exact commit state this lane holds. (6) and (9) then
+    bound the consequence — the record declares no change and the lane carries zero commits over
+    the integration branch with a clean worktree, so there is no OTHER state to be released, and
+    admitting drains a process without integrating anything or minting any approval. (6) is
+    required beside (9) because a zero ahead-count alone does not mean the lane produced nothing:
+    already-merged work is also zero ahead (#14695's own boundary).
 
     **What this never does.** It never reads the audit record as an approval — it requires that
-    record to not be a gate at all. It never lets the successor's approval stand in for this lane's
-    — the successor's approval is read only as the SUCCESSOR's, and this lane is admitted on the
-    terminal, not on a review. It never widens the ordinary review-generation fence, the #14539
-    exemption, the #14695 waiver or the #14755 terminal: those are independent routes to the same
-    boolean and none of them can weaken another.
+    record to not be a gate at all, and after this round the audit pointer carries no admission
+    weight. It never asserts that THIS issue passed a review: (8) is a statement about which commit
+    state was examined, not about which issue's acceptance was met, and this lane is admitted on the
+    terminal plus zero-change, never on a verdict transferred from the successor. It never widens
+    the ordinary review-generation fence, the #14539 exemption, the #14695 waiver or the #14755
+    terminal: those are independent routes to the same boolean and none of them can weaken another.
 
     Every refusal is a typed :data:`SUPERSEDED_AUDIT_FAILURE_REFUSAL_REASONS` token. There is no
     input that turns an unreadable, foreign, stale, re-opened, change-bearing or unintegrated
@@ -655,6 +604,18 @@ def evaluate_superseded_audit_failure_admissible(
     if not callbacks_drained:
         return AdmissionResult(False, REASON_CALLBACK_OWED)
 
+    # The TRACKER's own current answer, on a separate axis from the journals above. Asked here,
+    # right beside the journal-derived Close, so a reader sees the two are different questions:
+    # a status-only reopen changes ``is_closed`` without adding a ``## Gate:`` note, so the fold
+    # cannot see it and the caller's ``--issue-closed`` assertion is not a measurement of it.
+    # Unreadable is its own refusal, never a silent fall-through to the journal answer.
+    if tracker.source_closed is None or tracker.successor_closed is None:
+        return AdmissionResult(False, REASON_TRACKER_STATUS_UNREADABLE)
+    if tracker.source_closed is not True:
+        return AdmissionResult(False, REASON_SOURCE_OPEN_IN_TRACKER)
+    if tracker.successor_closed is not True:
+        return AdmissionResult(False, REASON_SUCCESSOR_OPEN_IN_TRACKER)
+
     # No recognized lifecycle gate at-or-after the declaration. The tie is the STRICT reading, the
     # same one #14755's ``declaration_current`` names explicitly: one journal carrying both a
     # terminal declaration and a lifecycle gate claims "this lane is finished forever" and "here is
@@ -704,6 +665,19 @@ def evaluate_superseded_audit_failure_admissible(
         or not successor.close_recorded
     ):
         return AdmissionResult(False, REASON_SUCCESSOR_INCOMPLETE)
+
+    # THE conjunct this route rests on (review j#101880 finding 1). Everything above this line can
+    # be written by one unauthenticatable actor across two issues; this cannot. The head comes from
+    # the successor's own ``review_result`` marker, and the shared grammar populates it ONLY for a
+    # round whose result head was correlated against its request head under the Marker Contract v2
+    # — so an empty value means the successor's approval examined nothing this workspace can name,
+    # which refuses. Compared as a literal against the declaration's head, which the live probe
+    # below independently requires to be the lane's actual head: the three-way equality is what
+    # makes "a real approved review covers exactly the state this lane holds" a measurement rather
+    # than a claim.
+    reviewed_head = str(successor_review_head or "").strip().lower()
+    if not reviewed_head or reviewed_head != envelope.head.strip().lower():
+        return AdmissionResult(False, REASON_SUCCESSOR_REVIEW_HEAD_MISMATCH)
 
     # The live half must be about THIS lane's checkout. ``measure_lane_change`` already refuses a
     # checkout that is not on the branch it was told to measure, but which branch that is stays a
@@ -829,56 +803,6 @@ def render_superseded_audit_failure_marker(
     return f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:{body}]"
 
 
-def render_audit_supersession_acknowledgement_marker(
-    *,
-    issue: str,
-    superseded_issue: str,
-    superseded_audit_journal: object,
-    review_journal: object,
-) -> str:
-    """The exact marker a valid successor acknowledgement must carry (pure).
-
-    Field order is :data:`SUCCESSOR_ACK_FIELD_ORDER`, so what this emits is what the strict reader
-    accepts, by construction. Every producer error raises ``ValueError`` rather than being written.
-    """
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_envelope import (  # noqa: E501
-        reject_marker_separator,
-    )
-
-    issue_s = str(issue or "").strip()
-    superseded_s = str(superseded_issue or "").strip()
-    if not issue_s or not superseded_s:
-        raise ValueError(
-            "an audit-supersession acknowledgement requires a non-empty issue and superseded_issue"
-        )
-    if issue_s == superseded_s:
-        raise ValueError("an issue cannot acknowledge that it supersedes itself")
-    reject_marker_separator(issue_s, field="issue")
-    reject_marker_separator(superseded_s, field="superseded_issue")
-    superseded_audit = journal_ref(superseded_audit_journal)
-    review = journal_ref(review_journal)
-    if not superseded_audit:
-        raise ValueError(
-            "an audit-supersession acknowledgement requires the superseded audit journal id, got "
-            f"{superseded_audit_journal!r}"
-        )
-    if not review:
-        raise ValueError(
-            "an audit-supersession acknowledgement requires its own approved review journal id, "
-            f"got {review_journal!r}"
-        )
-    body = ":".join(
-        [
-            f"gate={SUCCESSOR_ACK_GATE}",
-            f"version={SUCCESSOR_ACK_VERSION}",
-            f"decision={SUCCESSOR_ACK_DECISION}",
-            f"issue={issue_s}",
-            f"superseded_issue={superseded_s}",
-            f"superseded_audit_journal={superseded_audit}",
-            f"review_journal={review}",
-        ]
-    )
-    return f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:{body}]"
 
 
 __all__ = (
@@ -901,8 +825,12 @@ __all__ = (
     "REASON_NOT_RECORDED",
     "REASON_RECORD_DECLARES_CHANGE",
     "REASON_REVIEW_ROUND_RECORDED",
+    "REASON_SOURCE_OPEN_IN_TRACKER",
     "REASON_SUCCESSOR_IS_SELF",
     "REASON_SUCCESSOR_NOT_ACKNOWLEDGED",
+    "REASON_SUCCESSOR_OPEN_IN_TRACKER",
+    "REASON_SUCCESSOR_REVIEW_HEAD_MISMATCH",
+    "REASON_TRACKER_STATUS_UNREADABLE",
     "SUCCESSOR_ACK_DECISION",
     "SUCCESSOR_ACK_FIELD_ORDER",
     "SUCCESSOR_ACK_GATE",
@@ -915,6 +843,7 @@ __all__ = (
     "SUPERSEDED_AUDIT_FAILURE_STATES",
     "SUPERSEDED_AUDIT_FAILURE_VERSION",
     "SupersededAuditFailureFacts",
+    "TrackerIssueStatus",
     "evaluate_superseded_audit_failure_admissible",
     "fold_audit_supersession_acknowledgement",
     "fold_superseded_audit_failure",

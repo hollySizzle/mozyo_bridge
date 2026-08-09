@@ -66,6 +66,51 @@ def _read_live_issue_journals(issue: str) -> "list[tuple[str, str]]":
     ]
 
 
+def _read_live_issue_closed(issue: str) -> Optional[bool]:
+    """Whether the TRACKER currently reports ``issue`` closed, from one fresh GET (IO).
+
+    Review j#101880 finding 2. The journal fold answers "did this issue record a Close gate"; this
+    answers "is it closed right now". A status-only reopen changes ``status.is_closed`` and adds no
+    ``## Gate:`` note, so the two axes cannot substitute for one another — and the successor side
+    had no current-status input at all, so a re-opened successor still counted as complete on the
+    strength of its past Close gate.
+
+    Same discipline as :func:`...sublane_hibernated_unbound_live_zero_retire._fresh_closed_decision_snapshot`
+    (#14716): one read-only issue-detail GET per call — never a cached or reused payload, so this is
+    a real action-time observation — and the response must IDENTIFY the exact issue that was asked
+    for before its status is believed. ``None`` on any failure (unconfigured credentials, an
+    unreadable Redmine, a response that is not an issue-detail object, a response about a different
+    issue, an absent or non-mapping status): the pure fence treats that as its own refusal rather
+    than as "not closed", because the two send an operator to different places.
+    """
+    from typing import Mapping
+
+    wanted = str(issue or "").strip()
+    if not wanted:
+        return None
+    try:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E501
+            LiveRedmineJournalSource,
+        )
+
+        source = LiveRedmineJournalSource.from_environment()
+        payload = source.transport(
+            base_url=source.base_url, api_key=source.api_key, issue_id=wanted, since=None
+        )
+    except Exception:  # noqa: BLE001 - unreadable live state -> unmeasured, never a crash
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    record = payload.get("issue")
+    if not isinstance(record, Mapping) or str(record.get("id", "")).strip() != wanted:
+        # A response that does not identify the exact issue asked for cannot testify about it.
+        return None
+    status = record.get("status")
+    if not isinstance(status, Mapping):
+        return None
+    return status.get("is_closed") is True
+
+
 def _measure_audit_record(journals, audit_journal: str):
     """What the issue's OWN history says about the journal the declaration names (pure).
 
@@ -161,6 +206,7 @@ def resolve_superseded_audit_failure_admissible(
             GATE_CLOSE,
         )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.superseded_audit_failure_terminal import (  # noqa: E501
+            TrackerIssueStatus,
             evaluate_superseded_audit_failure_admissible,
             fold_audit_supersession_acknowledgement,
             fold_superseded_audit_failure,
@@ -218,6 +264,22 @@ def resolve_superseded_audit_failure_admissible(
             audit=_measure_audit_record(journals, declaration.audit_journal),
             acknowledgement=fold_audit_supersession_acknowledgement(successor_journals),
             successor=successor,
+            # The head the successor's approved round actually examined, from the SAME grammar and
+            # the SAME Marker Contract v2 correlation that decided its conclusion — the conjunct
+            # this route rests on after review j#101880 finding 1.
+            successor_review_head=(
+                successor_facts.review_round_head if successor_facts else ""
+            ),
+            # The tracker's own current answer for BOTH issues, each from its own fresh read. The
+            # successor's is not optional: it had no current-status input at all before finding 2.
+            tracker=TrackerIssueStatus(
+                source_closed=_read_live_issue_closed(issue),
+                successor_closed=(
+                    _read_live_issue_closed(declaration.successor_issue)
+                    if declaration.successor_issue
+                    else None
+                ),
+            ),
             review_round_journals=tuple(gate_facts.review_round_journals or ()),
             latest_gate_journal=gate_facts.latest_gate_journal,
             close_recorded=gate_facts.latest_gate == GATE_CLOSE,
@@ -248,3 +310,7 @@ __all__ = (
     "REASON_AUDIT_TARGET_UNRESOLVED",
     "resolve_superseded_audit_failure_admissible",
 )
+
+# The two live reads this route performs are named in the module docstring's boundary paragraph:
+# both issues' full journal histories, and both issues' CURRENT tracker status. Nothing else
+# touches the network, and every failure of either read resolves to a typed refusal.
