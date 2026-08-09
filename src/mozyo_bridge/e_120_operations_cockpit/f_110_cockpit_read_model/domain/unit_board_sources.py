@@ -159,14 +159,20 @@ def _reject_unknown_keys(
 
 
 def _connection_values(source: "UnitBoardSource") -> tuple[str, ...]:
-    """One source's operator-supplied connection values (never displayed)."""
-    return tuple(
-        dict.fromkeys(
-            value
-            for value in (source.ssh_target, source.container, source.mozyo_binary)
-            if value and value != DEFAULT_MOZYO_BINARY
-        )
-    )
+    """One source's operator-supplied connection values (never displayed).
+
+    Classified by **field**, not by value.  ``mozyo_binary`` is excluded only
+    while it holds the published default, because then it names this tool rather
+    than anything about the operator's topology.  ``ssh_target`` and
+    ``container`` are private whatever they contain — a destination that happens
+    to be spelled ``mozyo-bridge`` is still a destination, and excluding it by
+    value let exactly that string reach a public payload (review j#102129
+    finding_3).
+    """
+    values = [source.ssh_target, source.container]
+    if source.mozyo_binary and source.mozyo_binary != DEFAULT_MOZYO_BINARY:
+        values.append(source.mozyo_binary)
+    return tuple(dict.fromkeys(value for value in values if value))
 
 
 def _disclosed_value(text: str, values: Sequence[str]) -> Optional[str]:

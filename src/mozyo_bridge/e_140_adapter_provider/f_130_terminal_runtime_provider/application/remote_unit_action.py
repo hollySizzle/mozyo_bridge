@@ -21,11 +21,13 @@ connection value, a remote path, or an exception body.
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Sequence
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (
+    is_canonical_positive_decimal,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (
     STAGE_SUBMITTED_CONFIRMED,
     injection_stage_for_outcome,
@@ -83,12 +85,12 @@ DEFAULT_ACTION_KIND = "design_consultation"
 #: is delivered.
 MAX_SUMMARY_LENGTH = MAX_PRESENTATION_TEXT
 
-#: A Redmine id as the durable record spells it: ASCII decimal, no leading zero,
-#: and short enough that the preview shows it whole.  ``str.isdigit`` is true for
-#: full-width digits, and the projection folds those to ASCII while the delivery
-#: sends the raw string — so the operator would confirm one anchor and another
-#: would be delivered (review j#102018 finding_4).
-_REDMINE_ID_RE = re.compile(r"^[1-9][0-9]{0,8}$")
+#: A Redmine id is judged by the repository's shared canonical-decimal
+#: predicate, not by a bound invented here.  ``str.isdigit`` is true for
+#: full-width digits and the projection folds those to ASCII while the delivery
+#: sends the raw string, so the shape does have to be checked (review j#102018
+#: finding_4) — but the shape is already defined, and a narrower local rule
+#: rejected ids the rest of the repository accepts (review j#102129 finding_6).
 
 _DETAIL_BY_REASON = {
     REASON_UNIT_UNRESOLVED: (
@@ -149,12 +151,13 @@ class RemoteUnitActionRequest:
         if not isinstance(self.unit_id, str) or not self.unit_id:
             return "a Unit selection is required"
         if not all(
-            isinstance(value, str) and _REDMINE_ID_RE.fullmatch(value)
+            is_canonical_positive_decimal(value)
             for value in (self.issue, self.journal)
         ):
             return (
-                "a Redmine issue id and journal id are required as plain decimal "
-                "numbers without a leading zero, short enough to show in full"
+                "a Redmine issue id and journal id are required as canonical "
+                "positive decimal numbers, without a leading zero and within the "
+                "width every runtime can convert"
             )
         if self.kind not in ACTION_KINDS:
             return "the requested handoff kind is not supported by this route"
@@ -457,10 +460,11 @@ class RemoteUnitActionRail:
         source: UnitBoardSource,
         workspace: SourceWorkspace,
     ) -> RemoteUnitActionResult:
-        completed = self._runtime.run_source_command(
+        result = self._runtime.run_source_command(
             source, self._gateway_args(preview, workspace)
         )
-        if completed is None or completed.returncode != 0:
+        completed = result.completed
+        if not result.ok or completed is None or completed.returncode != 0:
             return self._refuse(preview, REASON_DELIVERY_FAILED)
         if not _gateway_confirmed_submission(completed.stdout):
             return self._refuse(preview, REASON_DELIVERY_FAILED)

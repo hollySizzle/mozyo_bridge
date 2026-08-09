@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -19,6 +21,9 @@ from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.unit_
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_multi_source_unit_board import (
     MAX_REMOTE_PATH_LENGTH,
+    ANSWER_OK,
+    ANSWER_UNREACHABLE,
+    ANSWER_UNREADABLE,
     MAX_SOURCE_OUTPUT_BYTES,
     UntrustedJsonError,
     bounded_capture_run,
@@ -300,6 +305,20 @@ class UntrustedJsonTests(unittest.TestCase):
         with self.assertRaises(UntrustedJsonError):
             loads_untrusted_json('{"units": [{"x": 1, "x": 2}]}')
 
+    def test_a_decoder_resource_failure_becomes_a_typed_error(self) -> None:
+        # Deeply nested input raises RecursionError on Python 3.10 / 3.11 and
+        # decodes on 3.12+, so the mapping is asserted directly rather than
+        # through input that only misbehaves on some supported interpreters.
+        from unittest import mock
+
+        with mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "infrastructure.herdr_multi_source_unit_board.json.loads",
+            side_effect=RecursionError("too deep"),
+        ):
+            with self.assertRaises(UntrustedJsonError):
+                loads_untrusted_json('{"a": 1}')
+
     def test_ordinary_documents_still_decode(self) -> None:
         self.assertEqual(
             loads_untrusted_json('{"a": 1, "b": {"c": [1, 2]}}'),
@@ -332,17 +351,45 @@ class UntrustedJsonTests(unittest.TestCase):
 
 
 class OutputBoundTests(unittest.TestCase):
-    def test_output_over_the_ceiling_is_a_typed_failure(self) -> None:
+    def test_output_over_the_ceiling_is_unreadable_not_unreachable(self) -> None:
+        # The source did answer; calling that a connection failure mislabels it.
         def oversized(argv, **kwargs):
             return subprocess.CompletedProcess(
                 argv, 0, "y" * (MAX_SOURCE_OUTPUT_BYTES + 1), ""
             )
 
         multi = MultiSourceUnitBoardRuntime(REMOTE_CONFIG, runner=oversized)
-
-        self.assertIsNone(
-            multi.run_source_command(REMOTE_CONFIG.by_id["devbox"], ("workspace", "list"))
+        result = multi.run_source_command(
+            REMOTE_CONFIG.by_id["devbox"], ("workspace", "list")
         )
+
+        self.assertEqual(result.outcome, ANSWER_UNREADABLE)
+        self.assertIsNone(result.completed)
+
+    def test_an_over_bound_board_degrades_the_source_to_reload_required(self) -> None:
+        def oversized(argv, **kwargs):
+            return subprocess.CompletedProcess(
+                argv, 0, "y" * (MAX_SOURCE_OUTPUT_BYTES + 1), ""
+            )
+
+        multi = MultiSourceUnitBoardRuntime(
+            REMOTE_CONFIG, local_runtime=FakeLocalRuntime(), runner=oversized,
+            clock=lambda: NOW,
+        )
+
+        states = {s.host_id: s.source_state for s in multi.snapshot().sources}
+        self.assertEqual(states["devbox"], SOURCE_RELOAD_REQUIRED)
+
+    def test_a_mechanical_failure_stays_unreachable(self) -> None:
+        def refusing(argv, **kwargs):
+            raise OSError("no route")
+
+        multi = MultiSourceUnitBoardRuntime(REMOTE_CONFIG, runner=refusing)
+        result = multi.run_source_command(
+            REMOTE_CONFIG.by_id["devbox"], ("workspace", "list")
+        )
+
+        self.assertEqual(result.outcome, ANSWER_UNREACHABLE)
 
     def test_output_exactly_at_the_ceiling_is_accepted(self) -> None:
         def at_limit(argv, **kwargs):
@@ -351,36 +398,82 @@ class OutputBoundTests(unittest.TestCase):
             )
 
         multi = MultiSourceUnitBoardRuntime(REMOTE_CONFIG, runner=at_limit)
-        completed = multi.run_source_command(
+        result = multi.run_source_command(
             REMOTE_CONFIG.by_id["devbox"], ("workspace", "list")
         )
 
-        self.assertIsNotNone(completed)
-        assert completed is not None
-        self.assertEqual(len(completed.stdout), MAX_SOURCE_OUTPUT_BYTES)
+        self.assertEqual(result.outcome, ANSWER_OK)
+        assert result.completed is not None
+        self.assertEqual(len(result.completed.stdout), MAX_SOURCE_OUTPUT_BYTES)
 
-    def test_the_production_runner_stops_reading_at_the_ceiling(self) -> None:
-        # The bound has to live where the reading happens: capturing everything
-        # first and measuring afterwards does not stop the allocation.
-        import sys
 
-        completed = bounded_capture_run(
-            [sys.executable, "-c",
-             f"import sys; sys.stdout.write('z' * {MAX_SOURCE_OUTPUT_BYTES * 2})"],
-            timeout=60,
-        )
+class ProductionRunnerTests(unittest.TestCase):
+    """The real runner, exercised against real child processes.
 
-        self.assertLessEqual(len(completed.stdout), MAX_SOURCE_OUTPUT_BYTES + 1)
+    Both bounds have to hold at once, and the natural composition of them does
+    not: a single blocking read for the ceiling leaves the deadline unreachable.
+    """
 
-    def test_the_production_runner_passes_ordinary_output_through(self) -> None:
-        import sys
-
+    def test_ordinary_output_passes_through(self) -> None:
         completed = bounded_capture_run(
             [sys.executable, "-c", "print('hello')"], timeout=60
         )
 
         self.assertEqual(completed.returncode, 0)
         self.assertEqual(completed.stdout.strip(), "hello")
+
+    def test_reading_stops_at_the_ceiling_without_waiting_for_the_child(self) -> None:
+        # Once we stop consuming, a child with more to write blocks on a full
+        # pipe; waiting for it would turn the ceiling into a hang.
+        started = time.monotonic()
+
+        completed = bounded_capture_run(
+            [sys.executable, "-c",
+             f"import sys; sys.stdout.write('z' * {MAX_SOURCE_OUTPUT_BYTES * 4})"],
+            timeout=30,
+        )
+
+        self.assertLessEqual(len(completed.stdout), MAX_SOURCE_OUTPUT_BYTES + 1)
+        self.assertGreater(len(completed.stdout), MAX_SOURCE_OUTPUT_BYTES)
+        self.assertLess(time.monotonic() - started, 20)
+
+    def test_a_silent_child_hits_the_deadline(self) -> None:
+        started = time.monotonic()
+
+        with self.assertRaises(subprocess.TimeoutExpired):
+            bounded_capture_run(
+                [sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.2
+            )
+
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_a_child_that_writes_a_little_then_stalls_hits_the_deadline(self) -> None:
+        # Under the ceiling forever: the case a blocking read never escapes.
+        started = time.monotonic()
+
+        with self.assertRaises(subprocess.TimeoutExpired):
+            bounded_capture_run(
+                [sys.executable, "-c",
+                 "import sys, time; sys.stdout.write('x'); sys.stdout.flush(); time.sleep(30)"],
+                timeout=0.2,
+            )
+
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_a_deadline_hit_through_the_shared_seam_is_unreachable(self) -> None:
+        multi = MultiSourceUnitBoardRuntime(REMOTE_CONFIG)
+        source = REMOTE_CONFIG.by_id["devbox"]
+
+        def stalling(argv, **kwargs):
+            return bounded_capture_run(
+                [sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.2
+            )
+
+        multi = MultiSourceUnitBoardRuntime(REMOTE_CONFIG, runner=stalling)
+        self.assertEqual(
+            multi.run_source_command(source, ("workspace", "list")).outcome,
+            ANSWER_UNREACHABLE,
+        )
 
 
 class UnitResolutionTests(unittest.TestCase):
@@ -566,8 +659,11 @@ class SourceWorkspaceTests(unittest.TestCase):
             clock=lambda: NOW,
         )
 
-        self.assertIsNone(
-            multi.run_source_command(REMOTE_CONFIG.by_id["devbox"], ("workspace", "list"))
+        self.assertEqual(
+            multi.run_source_command(
+                REMOTE_CONFIG.by_id["devbox"], ("workspace", "list")
+            ).outcome,
+            ANSWER_UNREACHABLE,
         )
 
     def test_relative_canonical_path_is_rejected(self) -> None:

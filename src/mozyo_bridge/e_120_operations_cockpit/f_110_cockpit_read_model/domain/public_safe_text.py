@@ -206,10 +206,31 @@ def normalized_untrusted_text(value: str) -> str:
     return _SPACE_RE.sub(" ", normalized).strip()
 
 
+class _DuplicateJsonKey(ValueError):
+    """A JSON object repeated a key, so it makes two claims about one field."""
+
+
+def _reject_duplicate_pairs(pairs):
+    seen: dict = {}
+    for key, value in pairs:
+        if key in seen:
+            raise _DuplicateJsonKey(key)
+        seen[key] = value
+    return seen
+
+
 def _decode_json_object_segment(
     segment: str,
 ) -> tuple[Mapping[str, object] | None, bool]:
-    """Return a decoded object and whether JSON parsing hit a resource limit."""
+    """Return a decoded object and whether the segment must be treated as unsafe.
+
+    The second element is the fail-closed flag.  It covers a resource limit and,
+    equally, a repeated key: ``json.loads`` keeps the last value, so a header of
+    ``{"cty":"JWT","cty":"text"}`` would read as innocuous and the credential it
+    heads would print verbatim (review j#102129 finding_1).  A segment making two
+    claims about one field is not one this classifier can clear, so it degrades
+    to unsafe rather than to "not a credential".
+    """
     padded = segment + ("=" * (-len(segment) % 4))
     try:
         decoded = base64.b64decode(padded, altchars=b"-_", validate=True)
@@ -220,7 +241,9 @@ def _decode_json_object_segment(
     except UnicodeDecodeError:
         return None, False
     try:
-        parsed = json.loads(text)
+        parsed = json.loads(text, object_pairs_hook=_reject_duplicate_pairs)
+    except _DuplicateJsonKey:
+        return None, True
     except json.JSONDecodeError:
         return None, False
     except (RecursionError, ValueError):
@@ -335,7 +358,7 @@ def _contains_credential_json(value: str) -> bool:
     if len(stripped) > _MAX_CREDENTIAL_JSON_LENGTH:
         return True
 
-    decoder = json.JSONDecoder()
+    decoder = json.JSONDecoder(object_pairs_hook=_reject_duplicate_pairs)
     pending_text: list[tuple[str, int]] = []
     pending_nodes: list[tuple[object, int]] = []
     parse_attempts = 0
@@ -344,6 +367,8 @@ def _contains_credential_json(value: str) -> bool:
     if stripped.startswith('"'):
         try:
             root, end = decoder.raw_decode(stripped, 0)
+        except _DuplicateJsonKey:
+            return True
         except json.JSONDecodeError:
             root, end = None, -1
         except (RecursionError, ValueError):
@@ -378,6 +403,8 @@ def _contains_credential_json(value: str) -> bool:
                     return True
                 try:
                     root, end = decoder.raw_decode(text, candidate)
+                except _DuplicateJsonKey:
+                    return True
                 except json.JSONDecodeError:
                     index = candidate + 1
                     continue

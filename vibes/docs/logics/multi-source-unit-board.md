@@ -64,7 +64,9 @@ sources:
 - `kind` ごとに許可 key を固定し、未知 key・misplaced key・重複 key・version 不一致は
   fail-closed。`yaml.safe_load` の duplicate key は宣言順で解決せず拒否する。
 - 接続値 (`ssh_target` / `container` / `mozyo_binary`) は argv 構築の入力にすぎない。
-  payload、描画行、refusal detail のいずれにも出さない。
+  payload、描画行、refusal detail のいずれにも出さない。private かどうかは **field で決める**。
+  `mozyo_binary` は既定値を保持しているときだけ「この tool の名前」として除外し、
+  `ssh_target` / `container` は**内容に関わらず常に private**（既定 binary と同じ綴りの宛先も宛先である）。
 - **公開 field (`host_id` / `label`) が接続値を繰り返す設定は拒否する。** 両 field は board が
   publish するため、そこに接続値が入れば operator-scoped file へ隔離した意味が失われる。
   same-source（自分の接続値）と cross-source（他 source の接続値）の双方を検査し、label 未指定時に
@@ -134,6 +136,9 @@ Unit identity は `host_id + workspace_id + lane_id` である。
   unactionable にする。
 - 1 つでも live な source があれば merged board は `live` である。remote 1 台の不調で
   local の board を止めない。degraded 内訳は `sources` に残る。
+- **credential 検出器が内部で行う embedded JSON decode も duplicate key を拒否する**。
+  後勝ちの `cty` / `typ` / `enc` は JWT / JWE の marker を無害な値へ置き換えられるため、
+  重複を検出したら「credential ではない」ではなく **unsafe（redact）** へ倒す。
 - remote 応答は**untrusted input として再検証する**。向こう側が同じ code を動かしている
   ことは検証を省く理由にならない。全 text は client 側で同じ public-safe projection を
   通し、absolute path / credential 形状は `[redacted]` へ畳む。
@@ -141,10 +146,18 @@ Unit identity は `host_id + workspace_id + lane_id` である。
   gateway outcome のすべて）。`json.loads` は重複 key を後勝ちで畳むため、拒否される値を先に、
   canonical な値を後に置くだけで **decode 後のあらゆる検査を迂回できる**。operator YAML に課した
   duplicate-key 拒否と同じ規律を、より信頼できない remote JSON にも課す。
-- **source からの出力は byte 上限で bound する**（共有 subprocess seam）。unit 件数・agent 数・
-  timeout はいずれも decode 後の bound であり、それだけでは到達可能な source が decode 前に
-  client の memory を枯渇させられる。上限は**読み取り時点**で効かせ（超過分を読まない）、
-  超過時は board / registry を `reload_required`、配送を `delivery_failed` の固定結果にする。
+- **source からの出力は byte 上限で bound する**（共有 subprocess seam）。unit 件数・agent 数は
+  decode 後の bound であり、それだけでは到達可能な source が decode 前に client の memory を
+  枯渇させられる。上限は**読み取り時点**で効かせ（超過分を読まない）、超過時は board / registry を
+  `reload_required`、配送を `delivery_failed` の固定結果にする。**「到達不能」とは区別する** —
+  上限超過は source が応答した結果であり、connection failure ではない。
+- **byte 上限と timeout は同時に成り立たせる。** 上限までの単一 blocking read は、上限未満のまま
+  stdout を開き続ける source に対して**永久に待つ**（timeout はその後ろにあり到達しない）。
+  読み取りは **deadline-aware な incremental read** とし、期限超過時は kill / wait / stream close
+  を行う。上限で読み止めた場合は、pipe が満ちて終了できない child を待たずに kill する。
+- **untrusted JSON の decode 失敗は resource failure も含めて typed に倒す。** 深い入れ子は
+  対応 interpreter のうち Python 3.10 / 3.11 で `RecursionError` を送出し（3.12 以降は decode 成功）、
+  `ValueError` だけを包むと caller の fail-closed 経路を迂回する。
 - freshness は **2 つの独立した dimension の連言**である。両方が成り立って初めて action
   authority になる。**未来時刻の扱いは dimension ごとに異なり、以下がその唯一の記述である**
   （全面適用の一般則として読まない）。

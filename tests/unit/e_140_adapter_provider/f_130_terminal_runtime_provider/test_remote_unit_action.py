@@ -176,7 +176,7 @@ class PreviewTests(unittest.TestCase):
             ("full-width issue", {"issue": "１５１３８"}),
             ("full-width journal", {"journal": "１０１９８１"}),
             ("leading zero", {"issue": "0015138"}),
-            ("over-long", {"issue": "1" * 120}),
+            ("over the canonical width", {"issue": "1" * 120}),
             ("zero", {"issue": "0"}),
         ):
             with self.subTest(case=name):
@@ -184,6 +184,47 @@ class PreviewTests(unittest.TestCase):
 
                 self.assertEqual(preview.reason, REASON_INVALID_REQUEST)
         self.assertEqual(len(runner.argvs), before)
+
+    def test_the_anchor_bound_matches_the_repository_wide_contract(self) -> None:
+        # The shape is already defined; a narrower local rule rejected ids the
+        # rest of the repository accepts.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (
+            MAX_CANONICAL_DECIMAL_VALUE,
+            is_canonical_positive_decimal,
+        )
+
+        for value in ("1", "999999999", "1000000000", str(MAX_CANONICAL_DECIMAL_VALUE)):
+            with self.subTest(value=value):
+                self.assertTrue(is_canonical_positive_decimal(value))
+                accepted = RemoteUnitActionRequest(
+                    unit_id="unit-x", issue=value, journal="1", summary="s",
+                    target_project="scope",
+                ).validated() is None
+
+                self.assertTrue(accepted)
+
+        for value in (str(MAX_CANONICAL_DECIMAL_VALUE + 1), "0015138", "１５１３８"):
+            with self.subTest(value=value):
+                self.assertFalse(is_canonical_positive_decimal(value))
+
+    def test_a_wide_canonical_anchor_is_shown_and_delivered_byte_identical(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (
+            MAX_CANONICAL_DECIMAL_VALUE,
+        )
+
+        widest = str(MAX_CANONICAL_DECIMAL_VALUE)
+        action, runtime, runner = rail()
+        unit_id = remote_unit_id(runtime)
+
+        preview = action.preview(request(unit_id, issue=widest, journal=widest))
+        action.apply(preview)
+
+        self.assertEqual(preview.as_payload()["issue"], widest)
+        command = next(
+            argv[-1] for argv in runner.argvs if "project-gateway" in argv[-1]
+        )
+        self.assertIn(f"--issue {widest}", command)
+        self.assertIn(f"--journal {widest}", command)
 
     def test_a_canonical_anchor_is_shown_and_delivered_byte_identical(self) -> None:
         action, runtime, runner = rail()

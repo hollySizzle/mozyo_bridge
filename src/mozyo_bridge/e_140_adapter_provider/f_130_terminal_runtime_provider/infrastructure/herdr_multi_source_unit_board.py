@@ -18,7 +18,10 @@ observation plus one routed, preview-first action.
 from __future__ import annotations
 
 import json
+import os
+import selectors
 import subprocess
+import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -108,34 +111,82 @@ def loads_untrusted_json(text: object) -> object:
         return json.loads(text, object_pairs_hook=_reject_duplicate_keys)
     except UntrustedJsonError:
         raise
+    except RecursionError as exc:
+        # A deeply nested document exhausts the decoder's stack rather than
+        # raising ValueError, and it does so only on some supported
+        # interpreters — 3.10 and 3.11 raise here where 3.12+ decode the same
+        # input (review j#102129 finding_5).  A failure the caller cannot catch
+        # is a failure that skips the fail-closed path entirely.
+        raise UntrustedJsonError("untrusted JSON exceeded the decoder's limits") from exc
     except (TypeError, ValueError) as exc:
         raise UntrustedJsonError("untrusted JSON could not be decoded") from exc
 
 
 def bounded_capture_run(argv, *, timeout, **_ignored):
-    """Run one command, reading at most :data:`MAX_SOURCE_OUTPUT_BYTES` of output.
+    """Run one command under BOTH a byte ceiling and a deadline.
 
-    The production runner.  ``subprocess.run(capture_output=True)`` buffers
-    everything the child writes before any caller can look at it, so the bound
-    has to live where the reading happens rather than in a length check
-    afterwards.  Output at or under the ceiling behaves exactly as before; past
-    it the read stops and the process is killed, and the over-length marker
-    makes the caller fail closed.
+    The production runner.  Two bounds that have to hold at once, and the
+    obvious composition of them does not: ``subprocess.run(capture_output=True)``
+    buffers everything before the caller sees it, while a single blocking
+    ``read(ceiling + 1)`` waits for the child to reach the ceiling or close its
+    output — so a source that stays under the ceiling and never closes hangs
+    forever, and the timeout that was supposed to cover that sits behind the
+    read (review j#102129 finding_2).
+
+    So the read is incremental and deadline-aware: poll with the time remaining,
+    stop at the ceiling, and on either limit kill the child and raise
+    :class:`subprocess.TimeoutExpired` for the deadline — the same exception the
+    shared seam already treats as a mechanical failure.
     """
+    deadline = time.monotonic() + float(timeout)
+    chunks: list[bytes] = []
+    captured = 0
     with subprocess.Popen(
         list(argv), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
     ) as process:
+        assert process.stdout is not None
+        stream = process.stdout
+        os.set_blocking(stream.fileno(), False)
+        timed_out = False
         try:
-            assert process.stdout is not None
-            captured = process.stdout.read(MAX_SOURCE_OUTPUT_BYTES + 1)
-            process.stdout.close()
-            process.wait(timeout=timeout)
+            with selectors.DefaultSelector() as selector:
+                selector.register(stream, selectors.EVENT_READ)
+                while captured <= MAX_SOURCE_OUTPUT_BYTES:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        timed_out = True
+                        break
+                    if not selector.select(remaining):
+                        timed_out = True
+                        break
+                    chunk = stream.read(MAX_SOURCE_OUTPUT_BYTES + 1 - captured)
+                    if chunk is None:
+                        continue
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    captured += len(chunk)
+            if timed_out:
+                raise subprocess.TimeoutExpired(list(argv), timeout)
+            if captured > MAX_SOURCE_OUTPUT_BYTES:
+                # We stopped consuming on purpose, so a child with more to say
+                # is now blocked on a full pipe and will never exit.  Waiting
+                # for it would turn the ceiling into a hang.
+                process.kill()
+                process.wait()
+            else:
+                process.wait(timeout=max(0.0, deadline - time.monotonic()))
         except BaseException:
             process.kill()
             process.wait()
             raise
+        finally:
+            stream.close()
     return subprocess.CompletedProcess(
-        list(argv), process.returncode, captured.decode("utf-8", errors="replace"), ""
+        list(argv),
+        process.returncode,
+        b"".join(chunks).decode("utf-8", errors="replace"),
+        "",
     )
 
 #: Bound on a remote repository root.  The value comes from another host's
@@ -221,7 +272,7 @@ class MultiSourceUnitBoardRuntime:
 
     def run_source_command(
         self, source: UnitBoardSource, args: Sequence[str]
-    ) -> Optional[subprocess.CompletedProcess]:
+    ) -> "SourceCommandResult":
         """Run one mozyo-bridge command on ``source`` through its fixed argv.
 
         The single subprocess seam for everything that crosses a host boundary,
@@ -229,13 +280,14 @@ class MultiSourceUnitBoardRuntime:
         place applies the timeout, and a test that injects a runner cannot leave
         a second real-subprocess path behind.
 
-        Returns ``None`` for every mechanical failure — unresolvable argv, spawn
-        error, timeout — so callers never mistake "could not run" for an answer.
+        The outcome distinguishes "could not run" from "answered too much": a
+        source that overflowed the ceiling did respond, and reporting that as a
+        connection failure mislabels it (review j#102129 finding_4).
         """
         try:
             argv = source_command_argv(source, tuple(args), by_id=self._config.by_id)
         except UnitBoardSourceError:
-            return None
+            return SourceCommandResult(ANSWER_UNREACHABLE, None)
         try:
             completed = self._runner(
                 list(argv),
@@ -250,14 +302,14 @@ class MultiSourceUnitBoardRuntime:
             # uncaught it escapes as a raw exception instead of the fixed typed
             # refusal every other failure here produces (review j#101846
             # finding_5).
-            return None
+            return SourceCommandResult(ANSWER_UNREACHABLE, None)
         # Also enforced here, not only inside the production runner, so an
         # injected runner cannot hand back an unbounded answer.
         if isinstance(completed.stdout, str) and len(completed.stdout.encode(
             "utf-8", errors="replace"
         )) > MAX_SOURCE_OUTPUT_BYTES:
-            return None
-        return completed
+            return SourceCommandResult(ANSWER_UNREADABLE, None)
+        return SourceCommandResult(ANSWER_OK, completed)
 
     def _run_source_json(
         self, source: UnitBoardSource, args: Sequence[str]
@@ -275,7 +327,10 @@ class MultiSourceUnitBoardRuntime:
           not be decoded.
         - :data:`ANSWER_OK` — a decoded payload.
         """
-        completed = self.run_source_command(source, args)
+        result = self.run_source_command(source, args)
+        if result.outcome != ANSWER_OK:
+            return result.outcome, None
+        completed = result.completed
         if completed is None or completed.returncode != 0:
             return ANSWER_UNREACHABLE, None
         if not isinstance(completed.stdout, str):
@@ -438,6 +493,18 @@ class MultiSourceUnitBoardRuntime:
 
 
 @dataclass(frozen=True)
+class SourceCommandResult:
+    """One source command's mechanical outcome and, when it ran, its result."""
+
+    outcome: str
+    completed: Optional[subprocess.CompletedProcess] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.outcome == ANSWER_OK
+
+
+@dataclass(frozen=True)
 class SourceWorkspace:
     """A workspace as the *source host's* registry describes it.
 
@@ -467,6 +534,7 @@ __all__ = (
     "REMOTE_BOARD_ARGS",
     "REMOTE_WORKSPACE_ARGS",
     "MultiSourceUnitBoardRuntime",
+    "SourceCommandResult",
     "SourceUnitTarget",
     "SourceWorkspace",
 )

@@ -269,6 +269,28 @@ class ConnectionValueDisclosureTests(unittest.TestCase):
                 ssh_record(label="SSH-DESTINATION-SENTINEL")
             )
 
+    def test_a_connection_value_spelled_like_the_default_binary_is_private(self) -> None:
+        # The default binary name is excluded because of the FIELD it sits in,
+        # not because of the characters it contains: a destination that happens
+        # to be spelled the same way is still a destination.
+        for record in (
+            {"host_id": "devbox", "kind": "ssh", "ssh_target": "mozyo-bridge",
+             "label": "mozyo-bridge"},
+            {"host_id": "devbox", "kind": "container", "container": "mozyo-bridge",
+             "label": "mozyo-bridge"},
+        ):
+            with self.subTest(kind=record["kind"]):
+                with self.assertRaises(UnitBoardSourceError):
+                    UnitBoardSource.from_record(record)
+
+    def test_the_default_binary_field_itself_is_not_treated_as_private(self) -> None:
+        # Otherwise a label mentioning this tool by name would be refused.
+        source = UnitBoardSource.from_record(
+            ssh_record(label="mozyo-bridge lane", mozyo_binary="mozyo-bridge")
+        )
+
+        self.assertEqual(source.as_payload()["host_label"], "mozyo-bridge lane")
+
     def test_a_public_identity_repeating_another_sources_value_is_rejected(self) -> None:
         with self.assertRaises(UnitBoardSourceError):
             UnitBoardSourcesConfig.from_record({"version": 1, "sources": [
