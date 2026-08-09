@@ -7,6 +7,9 @@ from __future__ import annotations
 import argparse
 
 from mozyo_bridge.application.cli_common import add_repo_option
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.commands_workspace import (  # noqa: E501
+    cmd_workspace_alias,
+)
 from mozyo_bridge.application.commands import (
     cmd_workspace_defaults,
     cmd_workspace_inspect,
@@ -97,6 +100,102 @@ def register(sub) -> None:
         help="Emit all identity layers and the effective resolution as JSON.",
     )
     workspace_inspect.set_defaults(func=cmd_workspace_inspect)
+
+    workspace_alias = workspace_sub.add_parser(
+        "alias",
+        help=(
+            "Declare how a NESTED workspace's explicit launch root resolves "
+            "(Redmine #15190). When one Git repository holds both a canonical "
+            "repo-root workspace and a nested application-root workspace, "
+            "`herdr session-start --repo <nested>` would otherwise plan a second "
+            "default Codex/Claude pair for the same repository. Declare the "
+            "nested root as an alias of its canonical parent, or as "
+            "launch-disabled, and session-start adopts the canonical root or "
+            "fails closed with a fixed typed reason. Read-only surfaces "
+            "(`workspace inspect`, `docs resolve`, `scaffold status`) keep "
+            "addressing the nested root as itself, so it stays usable as a "
+            "code/docs working root."
+        ),
+    )
+    alias_sub = workspace_alias.add_subparsers(dest="alias_command", required=True)
+
+    alias_show = alias_sub.add_parser(
+        "show",
+        help=(
+            "Show the declaration this workspace carries and how a launch root "
+            "would resolve, including a typed refusal reason. Read-only."
+        ),
+    )
+    add_repo_option(alias_show)
+    alias_show.add_argument(
+        "--json", action="store_true", dest="as_json",
+        help="Emit the declaration and resolution as JSON.",
+    )
+    alias_show.set_defaults(func=cmd_workspace_alias, alias_command="show")
+
+    alias_set = alias_sub.add_parser(
+        "set",
+        help=(
+            "Declare this workspace an alias of a canonical parent workspace. "
+            "Verified before anything is written: the target must exist, be a "
+            "strict ancestor, live in the same repository, carry a durable "
+            "workspace identity, and declare no alias of its own. Any failure "
+            "writes nothing."
+        ),
+    )
+    add_repo_option(alias_set)
+    alias_set.add_argument(
+        "--to",
+        required=True,
+        help=(
+            "Canonical parent workspace root this nested root folds into. Its "
+            "current workspace id is recorded as the verification binding, so a "
+            "later re-registration cannot silently re-point the alias."
+        ),
+    )
+    alias_set.add_argument(
+        "--reason", default="",
+        help="Operator note recorded in the declaration for later readback.",
+    )
+    alias_set.add_argument(
+        "--json", action="store_true", dest="as_json",
+        help="Emit the written declaration and its readback as JSON.",
+    )
+    alias_set.set_defaults(func=cmd_workspace_alias, alias_command="set")
+
+    alias_disable = alias_sub.add_parser(
+        "disable",
+        help=(
+            "Declare this workspace launch-disabled: session-start fails closed "
+            "here with a fixed typed reason and launches nothing. Use when there "
+            "is no canonical parent to fold into."
+        ),
+    )
+    add_repo_option(alias_disable)
+    alias_disable.add_argument(
+        "--reason", default="",
+        help="Operator note recorded in the declaration for later readback.",
+    )
+    alias_disable.add_argument(
+        "--json", action="store_true", dest="as_json",
+        help="Emit the written declaration as JSON.",
+    )
+    alias_disable.set_defaults(func=cmd_workspace_alias, alias_command="disable")
+
+    alias_clear = alias_sub.add_parser(
+        "clear",
+        help=(
+            "Remove this workspace's declaration, restoring independent-workspace "
+            "launch behavior. Removes only the declaration file — never the "
+            "identity anchor, the registry row, or tracked workspace content."
+        ),
+    )
+    add_repo_option(alias_clear)
+    alias_clear.add_argument(
+        "--json", action="store_true", dest="as_json",
+        help="Emit the outcome as JSON.",
+    )
+    alias_clear.set_defaults(func=cmd_workspace_alias, alias_command="clear")
 
     workspace_retire = workspace_sub.add_parser(
         "retire",

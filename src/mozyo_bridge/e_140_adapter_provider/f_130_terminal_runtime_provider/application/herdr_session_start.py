@@ -141,6 +141,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_generation_binding import (  # noqa: E501
     open_startup_transaction_and_reserve_generations,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_alias import apply_workspace_alias  # noqa: E501
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_completion import (  # noqa: E501
     complete_session_start,
 )
@@ -335,6 +336,7 @@ def prepare_session(
     ``pair_order`` is the lane's STABLE managed pair order, for a caller that shrank
     ``providers`` to a subset (contract: :func:`...validate_pair_order`, #14569).
     """
+    repo_root = apply_workspace_alias(repo_root)  # nested-workspace alias (#15190)
     # The signature is spelled out rather than `**kwargs` (review j#80305 R8-F2): the
     # explicit keyword-only contract is public (introspection / typing / IDE / wrapping
     # callers), and Python's argument binding at THIS entry is what rejects a malformed

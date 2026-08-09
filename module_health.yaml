@@ -1451,6 +1451,35 @@ allowlist:
     resolution_version: "v0.12.0 (Version #301 ワークフロー単一ステップ実行入口整備枠)"
     expires: "2027-10-08"
 
+  - path: src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_session_start.py
+    lines: 1002
+    reason: >-
+      Re-added at 1002 by Redmine #15190 (nested-workspace alias / launch-disable).
+      The file was at EXACTLY 1000 — the threshold itself — before this change, so
+      it had zero headroom and any addition at all crosses it. #15190 needs one
+      chokepoint inside `prepare_session`, because that entry is what all four
+      launch callers funnel through (session-start CLI, the bare-`mozyo` herdr
+      branch, the v1 replacement binding, the shared-space smoke harness);
+      applying the rail at the callers instead would leave a future fifth caller
+      able to plan a duplicate default pair, which is the defect being fixed.
+      The addition here is therefore the minimum possible: ONE import and ONE
+      call line (+2). The decision body, its typed refusals and its operator
+      guidance all live in the new cohesive sibling
+      `e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_session_start_alias.py`,
+      and the pure model / store / use case live under
+      `e_110_execution_platform/f_110_workspace_session_identity/`.
+      A reduction is deliberately NOT bundled here: the two candidates measured
+      were `_resolve_binary_or_die` (imported by ~10 modules and monkeypatched by
+      name in 5 test modules — high blast radius) and `_coordinator_launch_lock`
+      (cohesive with `herdr_pane_lifecycle.py`, but that sibling is already 951
+      lines and would land at ~985, leaving it no headroom of its own).
+      Refactoring launch-critical code inside a Bug lane, mid review cycle, is
+      disproportionate risk for a +2-line fix; the reduction is deferred to a
+      follow-up under this issue's Version.
+    owner_issue: "#15190"
+    resolution_version: "v0.12.0 (Version #301 ワークフロー単一ステップ実行入口整備枠)"
+    expires: "2027-10-08"
+
 
 # sublane_actuator_herdr_ops.py was allowlisted at a 1029-line baseline (owner_issue
 # #13847). Redmine #14258 removed the entry by carrying out a reduction rather than

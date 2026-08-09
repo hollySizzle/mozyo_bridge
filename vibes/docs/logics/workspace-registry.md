@@ -110,6 +110,66 @@ CREATE TABLE workspace_activity (       -- cache。identity と分離
 
 canonical session / defaults 解決そのものが目的の command (`session name`、smart `init` の adoption など) は既定 (`derive_unregistered=True`) のまま、フル derivation を使う。`session_inventory.collect_runtime_inventory(..., derive_unregistered=False)` も同じ degrading 契約 (lightweight inventory、#12032) を共有する。
 
+## Nested workspace の launch routing (Redmine #15190)
+
+同一 Git repository 内に canonical repo root workspace と nested application root
+workspace の両 anchor が実在しうる (観測事例: repo root が default coordinator pair を
+持ち、その配下 `Source/rails` が独自 scaffold/anchor を持つ)。通常の cwd 解決は
+Git-root-first (#13641) なので `cd <nested>` は repo root を adopt する。穴は**明示 root**
+側にある: `resolve_repo_root()` は `--repo` / `MOZYO_REPO` を canonicalization の**前**に
+short-circuit するため、nested anchor が独立 workspace として解決し、1 repository に
+2 組目の default Codex/Claude pair を `planned` にできる。
+
+`workspace retire` は missing-path registry row 専用で、実在する nested path には使えない。
+そこで **workspace-local な宣言 file** を rail として追加する。
+
+```yaml
+declaration:
+  path: "<nested-workspace>/.mozyo-bridge/workspace-alias.json"
+  schema_version: 1
+  modes:
+    alias:    canonical parent workspace へ解決する
+    disabled: fixed typed reason で zero-launch する
+  writer: "mozyo-bridge workspace alias set / disable / clear"
+  reader: "mozyo-bridge workspace alias show" と launch chokepoint
+```
+
+- **格納先が workspace-local である理由**: registry 喪失・復旧を跨いで宣言が生き残る必要が
+  ある。`registry.sqlite` の row は、その宣言が耐えるべき復旧手順そのもので消える。identity
+  store への schema 追加も不要になる。
+- **anchor と分離する理由**: anchor は identity recovery record (#11429) であり意味を 1 つに
+  保つ。本 file は launch authority routing の宣言で、identity provenance に触れずに
+  追加・削除できる。
+- **chokepoint**: `herdr_session_start.prepare_session` の最初。session-start CLI / bare
+  `mozyo` herdr branch / v1 replacement binding / shared-space smoke harness の 4 caller が
+  ここを通るため、`--dry-run` と live action-time が同一 rail になる。request validation・
+  home lock・binary 解決・capability probe より前に評価するので、拒否は zero-launch かつ
+  zero-side-effect。
+- **`resolve_repo_root()` を書き換えない理由**: 同 resolver は約 57 箇所から呼ばれ、release
+  tooling・doctor・discovery・config load を含む。nested root を *それ自体として* 報告するのが
+  仕事の read-only surface (`workspace inspect` / `docs resolve` / `scaffold status`) まで
+  巻き込むと、nested tree を code/docs 作業 root として使えるという受入条件を壊す。#15190 は
+  default coordinator pair の *launch* が repository 単位で重複しないことだけを要求する。
+- **fail-closed 条件** (いずれも typed reason 付き zero-launch。nested root への degrade は
+  しない — その degrade が除去対象の欠陥そのもの):
+  `alias_target_missing` / `alias_target_not_directory` / `alias_target_is_self` /
+  `alias_target_not_ancestor` / `alias_target_identity_unresolved` /
+  `alias_target_identity_mismatch` / `alias_target_cross_repository` /
+  `alias_target_declares_alias` / `declaration_unreadable` / `declaration_invalid` /
+  `declaration_unsupported_schema`。
+- **cross-repository 判定は `git_common_dir` の一致**で行う。linked worktree は main checkout と
+  共通なので同一 repository (sublane worktree は従来どおり launch 可能)、**submodule** は
+  親の tree 内に物理的に存在しても別 repository として拒否する。観測事例の
+  `projects/nihonidenshi` が submodule であるため、path 包含だけでは不十分。
+  両者とも非 git の場合のみ包含関係が binding を担う (#11301 の非 git scaffolded workspace)。
+- **identity binding**: 宣言は canonical の `workspace_id` を記録する。同一 path で identity が
+  再発行・復元された場合は `alias_target_identity_mismatch` で fail closed し、alias が別
+  workspace へ黙って向き直ることを防ぐ。
+- alias chain は 1 hop に固定 (`alias_target_declares_alias`) するので cycle は成立しない。
+- canonical 側の role binding / workspace id / live attestation は本 rail では一切変更しない。
+  `clear` は宣言 file だけを削除し、anchor・registry row・nested の tracked scaffold /
+  catalog / skills には触れない。
+
 ## 検証
 
 - registry tests: `tests/integration/e_110_execution_platform/f_110_workspace_session_identity/test_workspace_registry.py` と `test_workspace_retirement_store.py`、`tests/unit/e_110_execution_platform/f_110_workspace_session_identity/test_workspace_retirement.py`。
