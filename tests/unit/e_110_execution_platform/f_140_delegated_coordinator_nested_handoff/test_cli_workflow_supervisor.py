@@ -98,6 +98,8 @@ class CliServiceStatusLaunchdTest(_ServiceCliCase):
         self.assertEqual(payload["definition"]["command"][-1], "--run-once")
         self.assertEqual(payload["drain_definition"]["command"][-1], "--drain-only")
         self.assertFalse(payload["definition"]["keep_alive"])
+        # macOS keeps its own two-row shape; #15183 does not reorganize it.
+        self.assertEqual(len(agents), 2)
         # The two agents are distinct owned labels.
         self.assertNotEqual(reconcile["label"], drain["label"])
         # Secret-free and path-free.
@@ -134,44 +136,53 @@ class CliServiceStatusLaunchdTest(_ServiceCliCase):
 
 
 class CliServiceStatusSystemdTest(_ServiceCliCase):
-    """The Linux dispatch (Redmine #15183): the owned systemd user pair answers the same verbs."""
+    """The Linux dispatch (Redmine #15183): ONE owned systemd user service + timer, same verbs."""
 
     def test_service_status_reports_the_systemd_projection_exit_zero(self) -> None:
         rc, out = self._service_status("linux")
         self.assertEqual(rc, 0)
         payload = json.loads(out)
         self.assertEqual(payload["backend"], sb.BACKEND_SYSTEMD)
-        reconcile, drain = payload["agents"]
-        self.assertFalse(reconcile["installed"])
-        self.assertFalse(reconcile["loaded"])
-        self.assertEqual(reconcile["service_unit"], ss.SERVICE_UNIT_NAME)
-        self.assertEqual(drain["timer_unit"], ss.DRAIN_TIMER_UNIT_NAME)
-        self.assertNotEqual(reconcile["label"], drain["label"])
-        # The declarative definitions are the same secret-free pair on both backends.
+        # ONE owned service on Linux -- not the macOS two-row roster.
+        self.assertEqual(len(payload["agents"]), 1)
+        row = payload["agents"][0]
+        self.assertFalse(row["installed"])
+        self.assertFalse(row["loaded"])
+        self.assertEqual(row["service_unit"], ss.SERVICE_UNIT_NAME)
+        self.assertEqual(row["timer_unit"], ss.TIMER_UNIT_NAME)
+        # The declarative definition stays the secret-free bounded command on both backends.
         self.assertEqual(payload["definition"]["command"][-1], "--run-once")
-        self.assertEqual(payload["drain_definition"]["command"][-1], "--drain-only")
         self.assertNotIn("api_key", out.lower())
         self.assertNotIn(self.home, out)
 
-    def test_service_status_reports_installed_when_owned_units_present(self) -> None:
-        for unit in ss.SUPERVISOR_UNITS:
-            path = ss.service_unit_path(self.os_home, unit=unit)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                ss.render_service_unit(
-                    ["/opt/bin/mozyo-bridge", *unit.argv_tail, "--home", self.home], unit=unit
-                ),
-                encoding="utf-8",
-            )
-            ss.timer_unit_path(self.os_home, unit=unit).write_text(
-                ss.render_timer_unit(interval_seconds=unit.default_interval_seconds, unit=unit),
-                encoding="utf-8",
-            )
+    def test_service_status_shows_next_run_and_last_exit_result(self) -> None:
+        # The acceptance contract asks status to show 次回起動 / 直近の終了結果 without secrets.
+        rc, out = self._service_status("linux")
+        self.assertEqual(rc, 0)
+        row = json.loads(out)["agents"][0]
+        for key in ("next_elapse", "next_elapse_basis", "last_trigger",
+                    "last_result", "last_exit_status", "last_exit_at"):
+            self.assertIn(key, row)
+
+    def test_service_status_reports_installed_when_the_owned_units_are_present(self) -> None:
+        unit = ss.SUPERVISOR_UNIT
+        path = ss.service_unit_path(self.os_home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            ss.render_service_unit(
+                ["/opt/bin/mozyo-bridge", *unit.argv_tail, "--home", self.home]
+            ),
+            encoding="utf-8",
+        )
+        ss.timer_unit_path(self.os_home).write_text(
+            ss.render_timer_unit(interval_seconds=unit.default_interval_seconds), encoding="utf-8"
+        )
         rc, out = self._service_status("linux")
         self.assertEqual(rc, 0)
         payload = json.loads(out)
         self.assertTrue(payload["agents"][0]["installed"])
-        self.assertTrue(payload["agents"][1]["installed"])
+        self.assertEqual(payload["agents"][0]["scheduled_interval_seconds"], 60)
+        self.assertEqual(payload["agents"][0]["installed_command"][-1], self.home)
 
     def test_mutating_verbs_fail_closed_zero_mutation_with_no_user_manager(self) -> None:
         # A container with no user bus is explicitly unsupported, never a silent degrade to

@@ -1,34 +1,37 @@
-"""Linux systemd user service+timer lifecycle tests for the callback supervisor (Redmine #15183).
+"""Linux systemd user service+timer tests for the callback supervisor (Redmine #15183).
 
 Real ``systemctl`` is never invoked and the real host unit directory is never touched: every
 subprocess call goes through an injected fake runner, and temp roots stand in for the OS user home
 (``os_home``: unit files) and the mozyo home (``mozyo_home``: credential/registry root) — two roots
-that are kept **distinct** (the launchd adapter's review j#79092 R2-F1 applies unchanged). These pin
-the Linux adapter's safety boundary —
+kept **distinct**. These pin the Linux adapter's contract as the updated issue body defines it
+(scope correction j#101996, review findings j#102000) —
 
+- **one** owned service + **one** owned timer, ticking ``--run-once`` every 60s. There is no second
+  cadence, no ``--drain-only`` unit, and no atomic pair install: those were removed from the
+  acceptance contract, and a test here fails if they come back;
+- a 60s tick is not a 60s Redmine poll — the provider cadence stays the supervisor body's own ~300s
+  watermark, which this adapter surfaces but never sets;
 - unit structure: ``Type=oneshot`` with **no** ``Restart=`` / ``RemainAfterExit=`` (the KeepAlive
   equivalent is structurally absent), **no** ``Environment=`` / ``EnvironmentFile=``, no
   ``[Install]`` on the service (only the timer is enabled), and ``OnActiveSec=0s`` +
-  ``OnUnitActiveSec=<N>s`` as the RunAtLoad + StartInterval equivalent;
+  ``OnUnitActiveSec=60s`` as the run-at-load + fixed-interval pair;
 - ``ExecStart`` is the exact PATH-resolved absolute executable argv with the resolved mozyo home
   pinned as ``--home``, systemd-quoted per token and round-tripping back to the same argv;
-- structured ``systemctl --user`` argv (daemon-reload + enable --now install, restart on the
-  service, disable --now + file removal uninstall), idempotent install;
-- fail-closed **zero-mutation** refusals: non-Linux host, no reachable systemd user manager (the
-  container case is unsupported, never a silent degrade), missing executable, and the Redmine
-  credential matrix — daemon-effective readiness (neither a shell key/URL nor a shell
-  ``MOZYO_BRIDGE_HOME`` can make it ``ready``);
-- the installed unit's ``--home`` pin is the authority for restart / status — never the caller's
-  current shell — and a drifted installed command is never re-run;
-- atomic-or-nothing pair install (a drain failure rolls the reconcile pair back);
-- a redacted status projection (booleans / counts / fixed tokens; no secret, no path).
+- **an unconfigured / incomplete / unsafe Redmine credential does NOT block installing the timer**
+  (review finding 2). Readiness is projected, never gated, so local-only work keeps running;
+- status is non-destructive and answers the required observations: installed / enabled state, the
+  **next run**, the **last exit result**, and the **installed command** (review finding 3);
+- fail-closed zero-mutation refusals remain for a non-Linux host, an unreachable systemd user
+  manager (the container case is unsupported, never a silent degrade), and a missing executable;
+- the installed unit's ``--home`` pin is the authority for restart / status, and a drifted installed
+  command is never re-run.
 
-without touching the host. Live systemd operation is recorded as a separate installed-artifact
-smoke on the issue (never here).
+Live systemd operation is recorded as a separate installed-artifact smoke on the issue (never here).
 """
 
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 import tempfile
@@ -42,6 +45,9 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
     supervisor_service_backend as sb,
     supervisor_systemd as ss,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
+    DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
 )
 from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_context import (
     API_KEY_ENV,
@@ -91,13 +97,11 @@ class FakeRunner:
     def __call__(self, argv):
         argv = list(argv)
         self.calls.append(argv)
-        # argv is always ["systemctl", "--user", <verb>, ...]
-        verb = argv[2] if len(argv) > 2 else ""
+        verb = argv[2] if len(argv) > 2 else ""  # argv is ["systemctl", "--user", <verb>, ...]
         if verb == "show":
             if any(a.startswith("--property=Version") for a in argv):
                 return _result(0 if self._manager_available else 1)
-            unit = argv[3] if len(argv) > 3 else ""
-            return _result(0, self._show_map.get(unit, ""))
+            return _result(0, self._show_map.get(argv[3] if len(argv) > 3 else "", ""))
         if verb in self._fail_verbs:
             return _result(1, stderr="redacted")
         return _result(0)
@@ -107,8 +111,36 @@ class FakeRunner:
         return [c[2] for c in self.calls if len(c) > 2]
 
 
-def _timer_show(*, active="active", enabled="enabled") -> str:
-    return f"ActiveState={active}\nUnitFileState={enabled}\n"
+def _timer_show(
+    *,
+    active="active",
+    enabled="enabled",
+    next_monotonic="4w 1d 5h 2min 6.063752s",
+    next_realtime="",
+    last_trigger="Sun 2026-08-09 22:50:24 JST",
+):
+    """A timer ``show`` response shaped like a real MONOTONIC timer's.
+
+    The defaults matter: systemd populates ``NextElapseUSecRealtime`` only for calendar timers, and
+    this adapter's ``OnActiveSec`` / ``OnUnitActiveSec`` pair is monotonic — so a live timer leaves
+    the realtime property EMPTY and answers in ``NextElapseUSecMonotonic``. The original fake echoed
+    back whichever key the adapter happened to ask for, which is why reading the wrong property
+    passed hermetically and only failed against a real user manager (Redmine #15183 smoke). These
+    defaults reproduce the real shape, so a wrong property name fails here first.
+    """
+    return (
+        f"ActiveState={active}\nUnitFileState={enabled}\n"
+        f"NextElapseUSecRealtime={next_realtime}\n"
+        f"NextElapseUSecMonotonic={next_monotonic}\n"
+        f"LastTriggerUSec={last_trigger}\n"
+    )
+
+
+def _service_show(*, main_pid="0", result="success", status="0", exit_at="Sun 2026-08-09 22:30:35 JST"):
+    return (
+        f"MainPID={main_pid}\nResult={result}\n"
+        f"ExecMainStatus={status}\nExecMainExitTimestamp={exit_at}\n"
+    )
 
 
 def _which_found(_name: str):
@@ -120,7 +152,7 @@ def _which_missing(_name: str):
 
 
 def _which_relative(_name: str):
-    # A relative PATH entry makes shutil.which return a relative path (the launchd R5-F1 case).
+    # A relative PATH entry makes shutil.which return a relative path.
     return "bin/mozyo-bridge"
 
 
@@ -138,36 +170,130 @@ class _LinuxCase(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def _ready_runner(self, **kwargs) -> FakeRunner:
-        """A runner whose owned timers report active+enabled (the installed-and-scheduled case)."""
+    def _runner(self, **kwargs) -> FakeRunner:
+        """A runner whose owned timer reports active+enabled (the installed-and-scheduled case)."""
         show_map = kwargs.pop("show_map", None) or {
-            u.timer_unit: _timer_show() for u in ss.SUPERVISOR_UNITS
+            ss.SUPERVISOR_UNIT.timer_unit: _timer_show(),
+            ss.SUPERVISOR_UNIT.service_unit: _service_show(),
         }
         return FakeRunner(show_map=show_map, **kwargs)
 
-    def _install_reconcile(self, *, runner=None, interval=300) -> dict:
-        _write_home_credential(self.mozyo_home)
+    def _install(self, *, runner=None, interval=None, credential=True) -> dict:
+        if credential:
+            _write_home_credential(self.mozyo_home)
+        kwargs = {} if interval is None else {"interval_seconds": interval}
         return ss.install(
-            os_home=self.os_home, mozyo_home=self.mozyo_home, interval_seconds=interval,
-            runner=runner or self._ready_runner(), which=_which_found,
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            runner=runner or self._runner(), which=_which_found, **kwargs,
         )
 
 
 # ---------------------------------------------------------------------------
-# Unit rendering: the secret-free, no-relaunch-loop, one-shot structure.
+# Finding 1: ONE service + ONE timer. The retired dual-cadence shape must not come back.
+# ---------------------------------------------------------------------------
+
+
+class SingleOwnedUnitTest(_LinuxCase):
+    def test_exactly_one_owned_service_and_one_owned_timer_exist(self) -> None:
+        self.assertEqual(ss.SUPERVISOR_UNIT.service_unit, ss.SERVICE_UNIT_NAME)
+        self.assertEqual(ss.SUPERVISOR_UNIT.timer_unit, ss.TIMER_UNIT_NAME)
+        # No roster of units, and no second cadence hiding behind a different name.
+        self.assertFalse(hasattr(ss, "SUPERVISOR_UNITS"))
+        self.assertFalse(hasattr(ss, "DRAIN_UNIT"))
+        self.assertFalse(hasattr(ss, "RECONCILE_UNIT"))
+
+    def test_the_adapter_registers_no_drain_only_unit(self) -> None:
+        # The retired requirement was registering BOTH --run-once and --drain-only with the OS.
+        # Asserted against what the adapter actually EMITS and names, not its prose: the module
+        # docstring legitimately explains the retired shape, and a guard that greps documentation
+        # would fail on an accurate comment while still passing on a real regression.
+        self.assertNotIn("--drain-only", ss.SUPERVISOR_UNIT.argv_tail)
+        self.assertNotIn("drain", ss.SUPERVISOR_UNIT.service_unit)
+        self.assertNotIn("drain", ss.SUPERVISOR_UNIT.timer_unit)
+        rendered = ss.render_service_unit(
+            ss.resolve_supervisor_command(mozyo_home=self.mozyo_home, which=_which_found)
+        )
+        self.assertNotIn("--drain-only", rendered)
+        # No module-level name declares a second cadence.
+        self.assertEqual([n for n in dir(ss) if "DRAIN" in n.upper()], [])
+
+    def test_the_adapter_exposes_no_atomic_pair_install(self) -> None:
+        # "install both at once, roll both back on failure" was removed from the contract.
+        for retired in ("install_pair", "uninstall_pair", "restart_pair", "service_status_pair"):
+            self.assertFalse(hasattr(ss, retired), retired)
+
+    def test_installing_writes_exactly_two_files(self) -> None:
+        self._install()
+        written = sorted(p.name for p in ss.unit_dir(self.os_home).iterdir())
+        self.assertEqual(written, sorted([ss.SERVICE_UNIT_NAME, ss.TIMER_UNIT_NAME]))
+
+    def test_the_scheduled_command_is_run_once(self) -> None:
+        self.assertEqual(ss.SUPERVISOR_UNIT.argv_tail, ("workflow", "supervisor", "--run-once"))
+
+
+# ---------------------------------------------------------------------------
+# Cadence: a 60s OS tick, with the Redmine cadence left to the supervisor body.
+# ---------------------------------------------------------------------------
+
+
+class TickCadenceTest(_LinuxCase):
+    def test_the_default_os_tick_is_sixty_seconds(self) -> None:
+        self.assertEqual(ss.DEFAULT_TICK_INTERVAL_SECONDS, 60)
+        self.assertIn("OnUnitActiveSec=60s", ss.render_timer_unit())
+
+    def test_the_tick_cadence_is_not_the_redmine_cadence(self) -> None:
+        # The acceptance contract: tick every 60s, but read Redmine on the existing ~300s cadence.
+        # This adapter must not conflate them by scheduling the provider interval on the timer.
+        self.assertNotEqual(ss.DEFAULT_TICK_INTERVAL_SECONDS, DEFAULT_RECONCILIATION_INTERVAL_SECONDS)
+        self.assertEqual(DEFAULT_RECONCILIATION_INTERVAL_SECONDS, 300)
+
+    def test_the_adapter_does_not_set_or_enforce_the_provider_cadence(self) -> None:
+        # Gating provider reads is the supervisor body's durable watermark, not this module's job.
+        # Asserted structurally (the adapter neither imports nor calls the cadence policy) rather
+        # than by grepping prose, which the docstring legitimately mentions.
+        self.assertFalse(hasattr(ss, "should_reconcile_source"))
+        self.assertFalse(hasattr(ss, "reconcile_backoff_seconds"))
+        self.assertFalse(hasattr(ss, "ReconcileCadenceStore"))
+        # ...and the provider interval never reaches a rendered timer.
+        self.assertNotIn(
+            f"OnUnitActiveSec={DEFAULT_RECONCILIATION_INTERVAL_SECONDS}s", ss.render_timer_unit()
+        )
+
+    def test_status_surfaces_the_provider_cadence_for_the_operator(self) -> None:
+        status = ss.service_status(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            runner=self._runner(), which=_which_found,
+        )
+        self.assertEqual(
+            status["provider_reconcile_interval_seconds"], DEFAULT_RECONCILIATION_INTERVAL_SECONDS
+        )
+
+    def test_an_explicit_tick_interval_is_honoured(self) -> None:
+        self._install(interval=90)
+        self.assertIn(
+            "OnUnitActiveSec=90s", ss.timer_unit_path(self.os_home).read_text(encoding="utf-8")
+        )
+
+    def test_a_non_positive_interval_is_floored_to_one_second(self) -> None:
+        self.assertIn("OnUnitActiveSec=1s", ss.render_timer_unit(interval_seconds=0))
+        self.assertIn("OnUnitActiveSec=1s", ss.render_timer_unit(interval_seconds=-5))
+
+
+# ---------------------------------------------------------------------------
+# Unit rendering: secret-free, no relaunch loop, one-shot.
 # ---------------------------------------------------------------------------
 
 
 class UnitRenderingTest(_LinuxCase):
     def _service_text(self) -> str:
-        command = ss.resolve_supervisor_command(mozyo_home=self.mozyo_home, which=_which_found)
-        return ss.render_service_unit(command)
+        return ss.render_service_unit(
+            ss.resolve_supervisor_command(mozyo_home=self.mozyo_home, which=_which_found)
+        )
 
     def test_the_service_unit_is_a_one_shot_with_no_relaunch_directive(self) -> None:
         text = self._service_text()
         self.assertIn("Type=oneshot", text)
-        # The KeepAlive equivalent must be structurally ABSENT, not set to a falsy value: a
-        # Restart= / RemainAfterExit= on a one-shot is a tight relaunch loop.
+        # Structurally ABSENT, not set to a falsy value: either would be a tight relaunch loop.
         self.assertNotIn("Restart=", text)
         self.assertNotIn("RemainAfterExit=", text)
 
@@ -181,7 +307,7 @@ class UnitRenderingTest(_LinuxCase):
         # again, silently replacing the cadence.
         self.assertNotIn("[Install]", self._service_text())
 
-    def test_the_service_execstart_is_the_exact_pinned_argv(self) -> None:
+    def test_the_execstart_is_the_exact_pinned_argv(self) -> None:
         command = ss.resolve_supervisor_command(mozyo_home=self.mozyo_home, which=_which_found)
         self.assertEqual(
             command,
@@ -201,35 +327,18 @@ class UnitRenderingTest(_LinuxCase):
         self.assertNotIn("/bin/sh", text)
         self.assertNotIn("-c ", text)
 
-    def test_the_drain_unit_renders_the_drain_argv_tail(self) -> None:
-        command = ss.resolve_supervisor_command(
-            mozyo_home=self.mozyo_home, which=_which_found, unit=ss.DRAIN_UNIT
-        )
-        self.assertEqual(command[1:4], ["workflow", "supervisor", "--drain-only"])
-
     def test_the_timer_pairs_run_at_load_with_the_fixed_interval(self) -> None:
-        text = ss.render_timer_unit(interval_seconds=300)
-        self.assertIn(f"OnActiveSec={ss.RUN_AT_LOAD_DELAY}", text)  # RunAtLoad equivalent
-        self.assertIn("OnUnitActiveSec=300s", text)  # StartInterval equivalent
-        self.assertIn("Unit=mozyo-bridge-callback-supervisor.service", text)
+        text = ss.render_timer_unit(interval_seconds=60)
+        self.assertIn(f"OnActiveSec={ss.RUN_AT_LOAD_DELAY}", text)  # run one tick on activation
+        self.assertIn("OnUnitActiveSec=60s", text)
+        self.assertIn(f"Unit={ss.SERVICE_UNIT_NAME}", text)
         self.assertIn("WantedBy=timers.target", text)
 
     def test_the_timer_declares_no_calendar_catch_up(self) -> None:
-        # There is no missed-run to replay: the next tick reconciles whatever the last one missed.
-        text = ss.render_timer_unit(interval_seconds=300)
+        # There is no missed run to replay: the next tick reconciles whatever the last one missed.
+        text = ss.render_timer_unit()
         self.assertNotIn("OnCalendar=", text)
         self.assertNotIn("Persistent=", text)
-
-    def test_a_non_positive_interval_is_floored_to_one_second(self) -> None:
-        self.assertIn("OnUnitActiveSec=1s", ss.render_timer_unit(interval_seconds=0))
-        self.assertIn("OnUnitActiveSec=1s", ss.render_timer_unit(interval_seconds=-5))
-
-    def test_the_two_owned_pairs_have_distinct_unit_names(self) -> None:
-        names = {u.service_unit for u in ss.SUPERVISOR_UNITS} | {
-            u.timer_unit for u in ss.SUPERVISOR_UNITS
-        }
-        self.assertEqual(len(names), 4)
-        self.assertEqual(len(ss.SUPERVISOR_UNITS), 2)  # reconcile + drain only; no third cadence
 
 
 class ExecArgvQuotingTest(unittest.TestCase):
@@ -258,11 +367,6 @@ class ExecArgvQuotingTest(unittest.TestCase):
         self.assertEqual(ss.parse_exec_argv("-/opt/bin/mozyo-bridge"), ["-/opt/bin/mozyo-bridge"])
 
 
-# ---------------------------------------------------------------------------
-# Unit directory resolution: write where the user manager actually reads.
-# ---------------------------------------------------------------------------
-
-
 class UnitDirectoryTest(_LinuxCase):
     def test_an_explicit_os_home_uses_the_xdg_default_under_it(self) -> None:
         self.assertEqual(ss.unit_dir(self.os_home), self.os_home / ".config/systemd/user")
@@ -278,7 +382,65 @@ class UnitDirectoryTest(_LinuxCase):
 
 
 # ---------------------------------------------------------------------------
-# Install: fail-closed zero-mutation refusals, then the structured systemctl sequence.
+# Finding 2: an unconfigured Redmine must NOT block installing the timer.
+# ---------------------------------------------------------------------------
+
+
+class CredentialIsProjectedNotGatedTest(_LinuxCase):
+    def _assert_installed(self, result: dict, expected_readiness: str) -> None:
+        self.assertTrue(result["performed"], result)
+        self.assertEqual(result["credential_readiness"], expected_readiness)
+        self.assertTrue(ss.service_unit_path(self.os_home).exists())
+        self.assertTrue(ss.timer_unit_path(self.os_home).exists())
+
+    def test_a_missing_credential_still_installs_the_timer(self) -> None:
+        # The acceptance contract: local-only work must keep running when Redmine is unconfigured.
+        result = self._install(credential=False)
+        self._assert_installed(result, ss.CREDENTIAL_MISSING)
+
+    def test_an_incomplete_credential_still_installs_the_timer(self) -> None:
+        _write_home_credential(self.mozyo_home, url=None)
+        result = self._install(credential=False)
+        self._assert_installed(result, ss.CREDENTIAL_INCOMPLETE)
+
+    def test_an_unsafe_credential_still_installs_the_timer(self) -> None:
+        _write_home_credential(self.mozyo_home, mode=0o644)
+        result = self._install(credential=False)
+        self._assert_installed(result, ss.CREDENTIAL_UNSAFE)
+
+    def test_an_unsafe_credential_is_never_read_into_the_unit(self) -> None:
+        # The safety boundary is preserved by NOT using the value, not by refusing the install:
+        # the resolver withholds an unsafe file's contents, so nothing can reach the unit.
+        _write_home_credential(self.mozyo_home, api_key="super-secret-key", mode=0o644)
+        self._install(credential=False)
+        text = ss.service_unit_path(self.os_home).read_text(encoding="utf-8")
+        self.assertNotIn("super-secret-key", text)
+        self.assertNotIn("redmine.example.test", text)
+
+    def test_no_credential_refusal_token_exists_on_this_adapter(self) -> None:
+        text = inspect.getsource(ss)
+        self.assertNotIn("redmine_credential_missing", text)
+        self.assertNotIn("redmine_credential_incomplete", text)
+        self.assertNotIn("redmine_credential_unsafe", text)
+
+    def test_a_shell_environment_can_never_make_readiness_ready(self) -> None:
+        # A systemd unit carries no Environment block and inherits no interactive shell.
+        with patch.dict(os.environ, SHELL_ENV, clear=False):
+            result = self._install(credential=False)
+        self.assertEqual(result["credential_readiness"], ss.CREDENTIAL_MISSING)
+        self.assertTrue(result["performed"])  # ...and it still installs
+
+    def test_a_shell_mozyo_bridge_home_can_never_redirect_the_readiness_root(self) -> None:
+        other = Path(tempfile.mkdtemp())
+        _write_home_credential(other)  # a READY credential in a DIFFERENT root
+        with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(other)}, clear=False):
+            result = self._install(credential=False)
+        # The explicit --home root is what the unit pins, so ITS readiness is what gets reported.
+        self.assertEqual(result["credential_readiness"], ss.CREDENTIAL_MISSING)
+
+
+# ---------------------------------------------------------------------------
+# Install: the refusals that remain are the ones that make the install meaningless.
 # ---------------------------------------------------------------------------
 
 
@@ -288,7 +450,7 @@ class InstallRefusalTest(_LinuxCase):
         self.assertEqual([v for v in runner.verbs if v != "show"], [])
 
     def test_a_non_linux_host_refuses_before_any_mutation(self) -> None:
-        runner = self._ready_runner()
+        runner = self._runner()
         with patch.object(sys, "platform", "darwin"):
             result = ss.install(
                 os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found
@@ -298,8 +460,7 @@ class InstallRefusalTest(_LinuxCase):
         self._assert_zero_mutation(runner)
 
     def test_an_unreachable_user_manager_refuses_before_any_mutation(self) -> None:
-        _write_home_credential(self.mozyo_home)
-        runner = self._ready_runner(manager_available=False)
+        runner = self._runner(manager_available=False)
         result = ss.install(
             os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found
         )
@@ -318,8 +479,7 @@ class InstallRefusalTest(_LinuxCase):
         self.assertFalse(ss.unit_dir(self.os_home).exists())
 
     def test_a_missing_executable_refuses_before_any_mutation(self) -> None:
-        _write_home_credential(self.mozyo_home)
-        runner = self._ready_runner()
+        runner = self._runner()
         result = ss.install(
             os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_missing
         )
@@ -327,92 +487,39 @@ class InstallRefusalTest(_LinuxCase):
         self.assertEqual(result["reason"], ss.REASON_EXECUTABLE_NOT_FOUND)
         self._assert_zero_mutation(runner)
 
-    def test_a_missing_credential_refuses_before_any_mutation(self) -> None:
-        runner = self._ready_runner()
-        result = ss.install(
-            os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found
-        )
-        self.assertFalse(result["performed"])
-        self.assertEqual(result["reason"], "redmine_credential_missing")
-        self.assertEqual(result["credential_readiness"], ss.CREDENTIAL_MISSING)
-        self._assert_zero_mutation(runner)
-
-    def test_an_incomplete_credential_refuses(self) -> None:
-        _write_home_credential(self.mozyo_home, url=None)
-        result = ss.install(
-            os_home=self.os_home, mozyo_home=self.mozyo_home,
-            runner=self._ready_runner(), which=_which_found,
-        )
-        self.assertEqual(result["credential_readiness"], ss.CREDENTIAL_INCOMPLETE)
-        self.assertEqual(result["reason"], "redmine_credential_incomplete")
-
-    def test_an_unsafe_credential_file_refuses(self) -> None:
-        _write_home_credential(self.mozyo_home, mode=0o644)
-        result = ss.install(
-            os_home=self.os_home, mozyo_home=self.mozyo_home,
-            runner=self._ready_runner(), which=_which_found,
-        )
-        self.assertEqual(result["credential_readiness"], ss.CREDENTIAL_UNSAFE)
-        self.assertEqual(result["reason"], "redmine_credential_unsafe")
-
-    def test_a_shell_environment_can_never_make_readiness_ready(self) -> None:
-        # A systemd unit carries no Environment block and inherits no interactive shell, so the
-        # installer's exported MOZYO_REDMINE_* must not produce a false ``ready``.
-        with patch.dict(os.environ, SHELL_ENV, clear=False):
-            result = ss.install(
-                os_home=self.os_home, mozyo_home=self.mozyo_home,
-                runner=self._ready_runner(), which=_which_found,
-            )
-        self.assertEqual(result["credential_readiness"], ss.CREDENTIAL_MISSING)
-        self.assertFalse(result["performed"])
-
-    def test_a_shell_mozyo_bridge_home_can_never_redirect_the_readiness_root(self) -> None:
-        other = Path(tempfile.mkdtemp())
-        self.addCleanup(lambda: None)
-        _write_home_credential(other)  # a READY credential in a DIFFERENT root
-        with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(other)}, clear=False):
-            result = ss.install(
-                os_home=self.os_home, mozyo_home=self.mozyo_home,
-                runner=self._ready_runner(), which=_which_found,
-            )
-        # The explicit --home root is what the unit pins, so ITS readiness decides.
-        self.assertEqual(result["credential_readiness"], ss.CREDENTIAL_MISSING)
-
 
 class InstallSuccessTest(_LinuxCase):
     def test_install_writes_both_units_then_reloads_and_enables_the_timer(self) -> None:
-        runner = self._ready_runner()
-        result = self._install_reconcile(runner=runner)
+        runner = self._runner()
+        result = self._install(runner=runner)
         self.assertTrue(result["performed"], result)
-        self.assertEqual(result["scheduled_interval_seconds"], 300)
-        self.assertTrue(ss.service_unit_path(self.os_home).exists())
-        self.assertTrue(ss.timer_unit_path(self.os_home).exists())
-        mutating = [c for c in runner.calls if c[2] != "show"]
+        self.assertEqual(result["scheduled_interval_seconds"], 60)
         self.assertEqual(
-            mutating,
+            [c for c in runner.calls if c[2] != "show"],
             [
                 ["systemctl", "--user", "daemon-reload"],
-                ["systemctl", "--user", "enable", "--now", "mozyo-bridge-callback-supervisor.timer"],
+                ["systemctl", "--user", "enable", "--now", ss.TIMER_UNIT_NAME],
             ],
         )
 
     def test_install_is_idempotent(self) -> None:
-        self._install_reconcile()
+        self._install()
         first = ss.service_unit_path(self.os_home).read_text(encoding="utf-8")
-        self._install_reconcile()
+        self._install()
         self.assertEqual(ss.service_unit_path(self.os_home).read_text(encoding="utf-8"), first)
 
     def test_the_installed_unit_pins_the_absolute_canonical_mozyo_home(self) -> None:
-        self._install_reconcile()
-        text = ss.service_unit_path(self.os_home).read_text(encoding="utf-8")
-        self.assertIn(str(self.mozyo_home.resolve()), text)
+        self._install()
+        self.assertIn(
+            str(self.mozyo_home.resolve()),
+            ss.service_unit_path(self.os_home).read_text(encoding="utf-8"),
+        )
 
     def test_a_relative_executable_is_pinned_as_an_absolute_path(self) -> None:
-        # A relative PATH entry would be resolved from the systemd process's cwd, not the installer's.
-        _write_home_credential(self.mozyo_home)
+        # A relative PATH entry would be resolved from systemd's cwd, not the installer's.
         ss.install(
             os_home=self.os_home, mozyo_home=self.mozyo_home,
-            runner=self._ready_runner(), which=_which_relative,
+            runner=self._runner(), which=_which_relative,
         )
         argv = ss.parse_exec_argv(
             [
@@ -423,15 +530,15 @@ class InstallSuccessTest(_LinuxCase):
         self.assertTrue(os.path.isabs(argv[0]), argv)
 
     def test_a_failed_daemon_reload_reports_a_redacted_token(self) -> None:
-        runner = self._ready_runner(fail_verbs=("daemon-reload",))
-        result = self._install_reconcile(runner=runner)
+        runner = self._runner(fail_verbs=("daemon-reload",))
+        result = self._install(runner=runner)
         self.assertFalse(result["performed"])
         self.assertEqual(result["reason"], ss.REASON_DAEMON_RELOAD_FAILED)
         self.assertNotIn("enable", runner.verbs)
 
     def test_a_failed_enable_reports_a_redacted_token(self) -> None:
-        runner = self._ready_runner(fail_verbs=("enable",))
-        result = self._install_reconcile(runner=runner)
+        runner = self._runner(fail_verbs=("enable",))
+        result = self._install(runner=runner)
         self.assertFalse(result["performed"])
         self.assertEqual(result["reason"], ss.REASON_ENABLE_FAILED)
 
@@ -443,27 +550,34 @@ class InstallSuccessTest(_LinuxCase):
 
 class RestartTest(_LinuxCase):
     def test_restart_runs_the_service_when_the_owned_timer_is_active(self) -> None:
-        self._install_reconcile()
-        runner = self._ready_runner()
+        self._install()
+        runner = self._runner()
         result = ss.restart(
             os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found
         )
         self.assertTrue(result["performed"], result)
-        self.assertIn(
-            ["systemctl", "--user", "restart", "mozyo-bridge-callback-supervisor.service"],
-            runner.calls,
+        self.assertIn(["systemctl", "--user", "restart", ss.SERVICE_UNIT_NAME], runner.calls)
+
+    def test_restart_works_without_a_configured_credential(self) -> None:
+        # Same reason install does: a non-ready Redmine must not stop local-safe work.
+        self._install(credential=False)
+        result = ss.restart(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            runner=self._runner(), which=_which_found,
         )
+        self.assertTrue(result["performed"], result)
+        self.assertEqual(result["credential_readiness"], ss.CREDENTIAL_MISSING)
 
     def test_restart_refuses_when_nothing_is_installed(self) -> None:
-        runner = self._ready_runner()
+        runner = self._runner()
         result = ss.restart(os_home=self.os_home, runner=runner, which=_which_found)
         self.assertEqual(result["reason"], ss.REASON_NOT_INSTALLED)
         self.assertNotIn("restart", runner.verbs)
 
     def test_restart_refuses_when_the_owned_timer_is_not_active(self) -> None:
-        self._install_reconcile()
-        runner = self._ready_runner(
-            show_map={u.timer_unit: _timer_show(active="inactive") for u in ss.SUPERVISOR_UNITS}
+        self._install()
+        runner = self._runner(
+            show_map={ss.SUPERVISOR_UNIT.timer_unit: _timer_show(active="inactive")}
         )
         result = ss.restart(
             os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found
@@ -472,80 +586,75 @@ class RestartTest(_LinuxCase):
         self.assertNotIn("restart", runner.verbs)
 
     def test_restart_refuses_an_unreadable_service_unit(self) -> None:
-        self._install_reconcile()
+        self._install()
         ss.service_unit_path(self.os_home).write_text("not a unit at all\n", encoding="utf-8")
-        runner = self._ready_runner()
+        runner = self._runner()
         result = ss.restart(os_home=self.os_home, runner=runner, which=_which_found)
         self.assertEqual(result["reason"], ss.REASON_HOME_PIN_UNHEALTHY)
         self.assertEqual(result["home_pin"], ss.HOME_PIN_UNREADABLE)
         self.assertNotIn("restart", runner.verbs)
 
     def test_restart_refuses_a_unit_with_two_execstart_lines(self) -> None:
-        self._install_reconcile()
+        self._install()
         target = ss.service_unit_path(self.os_home)
         target.write_text(
             target.read_text(encoding="utf-8") + 'ExecStart="/opt/bin/other"\n', encoding="utf-8"
         )
-        result = ss.restart(
-            os_home=self.os_home, runner=self._ready_runner(), which=_which_found
-        )
+        result = ss.restart(os_home=self.os_home, runner=self._runner(), which=_which_found)
         self.assertEqual(result["home_pin"], ss.HOME_PIN_UNREADABLE)
 
     def test_restart_refuses_a_missing_home_pin(self) -> None:
-        self._install_reconcile()
-        target = ss.service_unit_path(self.os_home)
-        target.write_text(
+        self._install()
+        ss.service_unit_path(self.os_home).write_text(
             ss.render_service_unit(["/opt/bin/mozyo-bridge", "workflow", "supervisor", "--run-once"]),
             encoding="utf-8",
         )
-        result = ss.restart(os_home=self.os_home, runner=self._ready_runner(), which=_which_found)
+        result = ss.restart(os_home=self.os_home, runner=self._runner(), which=_which_found)
         self.assertEqual(result["reason"], ss.REASON_HOME_PIN_UNHEALTHY)
         self.assertEqual(result["home_pin"], ss.HOME_PIN_MISSING)
 
     def test_restart_refuses_a_relative_home_pin(self) -> None:
-        self._install_reconcile()
+        self._install()
         ss.service_unit_path(self.os_home).write_text(
             ss.render_service_unit(
                 ["/opt/bin/mozyo-bridge", "workflow", "supervisor", "--run-once", "--home", "rel/root"]
             ),
             encoding="utf-8",
         )
-        result = ss.restart(os_home=self.os_home, runner=self._ready_runner(), which=_which_found)
+        result = ss.restart(os_home=self.os_home, runner=self._runner(), which=_which_found)
         self.assertEqual(result["home_pin"], ss.HOME_PIN_NOT_ABSOLUTE)
 
     def test_restart_refuses_a_requested_home_that_disagrees_with_the_pin(self) -> None:
-        self._install_reconcile()
-        other = Path(tempfile.mkdtemp())
-        runner = self._ready_runner()
+        self._install()
+        runner = self._runner()
         result = ss.restart(
-            os_home=self.os_home, mozyo_home=other, runner=runner, which=_which_found
+            os_home=self.os_home, mozyo_home=Path(tempfile.mkdtemp()),
+            runner=runner, which=_which_found,
         )
         self.assertEqual(result["reason"], ss.REASON_HOME_PIN_MISMATCH)
         self.assertNotIn("restart", runner.verbs)
 
     def test_restart_refuses_a_drifted_installed_command(self) -> None:
-        self._install_reconcile()
-        runner = self._ready_runner()
+        self._install()
+        runner = self._runner()
         result = ss.restart(
             os_home=self.os_home, runner=runner, which=lambda _n: "/somewhere/else/mozyo-bridge"
         )
         self.assertEqual(result["reason"], ss.REASON_INSTALLED_COMMAND_DRIFT)
         self.assertNotIn("restart", runner.verbs)
 
-    def test_restart_judges_readiness_against_the_pinned_home_not_the_caller_shell(self) -> None:
-        self._install_reconcile()
+    def test_restart_reads_readiness_from_the_pinned_home_not_the_caller_shell(self) -> None:
+        self._install()
         credentials_path(self.mozyo_home).unlink()  # the PINNED root is no longer ready
         ready_elsewhere = Path(tempfile.mkdtemp())
         _write_home_credential(ready_elsewhere)
-        runner = self._ready_runner()
         with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(ready_elsewhere)}, clear=False):
-            result = ss.restart(os_home=self.os_home, runner=runner, which=_which_found)
+            result = ss.restart(os_home=self.os_home, runner=self._runner(), which=_which_found)
         self.assertEqual(result["credential_readiness"], ss.CREDENTIAL_MISSING)
-        self.assertNotIn("restart", runner.verbs)
 
     def test_a_failed_restart_reports_a_redacted_token(self) -> None:
-        self._install_reconcile()
-        runner = self._ready_runner(fail_verbs=("restart",))
+        self._install()
+        runner = self._runner(fail_verbs=("restart",))
         result = ss.restart(
             os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found
         )
@@ -554,16 +663,16 @@ class RestartTest(_LinuxCase):
 
 
 # ---------------------------------------------------------------------------
-# Uninstall: no credential required; removes exactly the owned files.
+# Uninstall: no credential required; removes exactly the owned artifacts, files AND manager state.
 # ---------------------------------------------------------------------------
 
 
 class UninstallTest(_LinuxCase):
-    def test_uninstall_disables_stops_and_removes_exactly_the_owned_units(self) -> None:
-        self._install_reconcile()
+    def test_uninstall_disables_stops_removes_and_clears_manager_state(self) -> None:
+        self._install()
         foreign = ss.unit_dir(self.os_home) / "someone-elses.service"
         foreign.write_text("[Unit]\n", encoding="utf-8")
-        runner = self._ready_runner()
+        runner = self._runner()
         result = ss.uninstall(os_home=self.os_home, runner=runner)
         self.assertTrue(result["performed"])
         self.assertTrue(result["removed"])
@@ -573,65 +682,148 @@ class UninstallTest(_LinuxCase):
         self.assertEqual(
             [c for c in runner.calls if c[2] != "show"],
             [
-                ["systemctl", "--user", "disable", "--now", "mozyo-bridge-callback-supervisor.timer"],
-                ["systemctl", "--user", "stop", "mozyo-bridge-callback-supervisor.service"],
+                ["systemctl", "--user", "disable", "--now", ss.TIMER_UNIT_NAME],
+                ["systemctl", "--user", "stop", ss.SERVICE_UNIT_NAME],
                 ["systemctl", "--user", "daemon-reload"],
-                [
-                    "systemctl", "--user", "reset-failed",
-                    "mozyo-bridge-callback-supervisor.service",
-                    "mozyo-bridge-callback-supervisor.timer",
-                ],
+                ["systemctl", "--user", "reset-failed", ss.SERVICE_UNIT_NAME, ss.TIMER_UNIT_NAME],
             ],
         )
 
-    def test_uninstall_clears_the_manager_side_failed_record(self) -> None:
-        # Measured live (Redmine #15183 smoke): ``stop`` on a mid-flight sweep SIGTERMs it, so the
-        # one-shot exits on a signal and systemd keeps a ``failed`` record that survives the file
-        # removal as a ``not-found``/``failed`` entry in ``list-units``. launchd's ``bootout``
-        # leaves no such trace, so uninstall must clear the manager state too.
-        self._install_reconcile()
-        runner = self._ready_runner()
-        ss.uninstall(os_home=self.os_home, runner=runner)
-        reset = [c for c in runner.calls if c[2] == "reset-failed"]
-        self.assertEqual(len(reset), 1)
-        self.assertEqual(
-            reset[0][3:],
-            [ss.RECONCILE_UNIT.service_unit, ss.RECONCILE_UNIT.timer_unit],
-        )
-
     def test_the_manager_state_is_cleared_after_the_files_are_gone(self) -> None:
-        # Ordering matters: a reset-failed BEFORE daemon-reload would be re-dirtied by the reload
-        # re-reading a still-present unit. It must be the last step.
-        self._install_reconcile()
-        runner = self._ready_runner()
+        # Measured live (#15183 smoke): ``stop`` on a mid-flight sweep SIGTERMs it, so systemd keeps
+        # a ``failed`` record that survives file removal as a ``not-found``/``failed`` list-units
+        # entry. Ordering matters: a reset-failed BEFORE daemon-reload would be re-dirtied.
+        self._install()
+        runner = self._runner()
         ss.uninstall(os_home=self.os_home, runner=runner)
         verbs = [c[2] for c in runner.calls if c[2] != "show"]
         self.assertLess(verbs.index("daemon-reload"), verbs.index("reset-failed"))
 
     def test_uninstall_works_with_no_credential_at_all(self) -> None:
-        # You must be able to tear a service down without configured credentials.
-        result = ss.uninstall(os_home=self.os_home, runner=self._ready_runner())
+        result = ss.uninstall(os_home=self.os_home, runner=self._runner())
         self.assertTrue(result["performed"])
         self.assertFalse(result["removed"])
 
     def test_uninstall_refuses_on_a_non_linux_host(self) -> None:
         with patch.object(sys, "platform", "darwin"):
-            result = ss.uninstall(os_home=self.os_home, runner=self._ready_runner())
+            result = ss.uninstall(os_home=self.os_home, runner=self._runner())
         self.assertEqual(result["reason"], ss.REASON_UNSUPPORTED_PLATFORM)
 
 
 # ---------------------------------------------------------------------------
-# Status: read-only, redacted, and honest about what it cannot verify.
+# Finding 3: status must show next run, last exit result, and the installed command.
 # ---------------------------------------------------------------------------
 
 
 class ServiceStatusTest(_LinuxCase):
-    def test_status_projects_the_installed_and_scheduled_service(self) -> None:
-        self._install_reconcile()
-        runner = self._ready_runner(
+    def test_status_reports_the_next_scheduled_run_of_a_monotonic_timer(self) -> None:
+        # The real shape: this adapter's timer is monotonic, so systemd leaves the REALTIME property
+        # empty. Reading only that one reported a blank "next run" against a live scheduled timer
+        # (Redmine #15183 smoke); the projection must fall through to the monotonic property.
+        self._install()
+        status = ss.service_status(
+            os_home=self.os_home, runner=self._runner(), which=_which_found
+        )
+        self.assertEqual(status["next_elapse"], "4w 1d 5h 2min 6.063752s")
+        self.assertEqual(status["next_elapse_basis"], ss.NEXT_ELAPSE_MONOTONIC)
+        self.assertNotEqual(status["next_elapse"], "")
+
+    def test_a_calendar_timer_next_run_is_reported_as_realtime(self) -> None:
+        self._install()
+        runner = self._runner(
             show_map={
-                ss.RECONCILE_UNIT.timer_unit: _timer_show(),
-                ss.RECONCILE_UNIT.service_unit: "MainPID=4321\n",
+                ss.SUPERVISOR_UNIT.timer_unit: _timer_show(
+                    next_realtime="Sun 2026-08-09 22:31:05 JST", next_monotonic=""
+                ),
+                ss.SUPERVISOR_UNIT.service_unit: _service_show(),
+            }
+        )
+        status = ss.service_status(os_home=self.os_home, runner=runner, which=_which_found)
+        self.assertEqual(status["next_elapse"], "Sun 2026-08-09 22:31:05 JST")
+        self.assertEqual(status["next_elapse_basis"], ss.NEXT_ELAPSE_REALTIME)
+
+    def test_the_next_elapse_basis_is_empty_when_systemd_reports_neither(self) -> None:
+        # A basis is required to read the value: a monotonic figure is since-boot, not a wall clock,
+        # so an unlabelled value could be misread as a wall-clock time.
+        self._install()
+        runner = self._runner(
+            show_map={
+                ss.SUPERVISOR_UNIT.timer_unit: _timer_show(next_realtime="", next_monotonic=""),
+                ss.SUPERVISOR_UNIT.service_unit: _service_show(),
+            }
+        )
+        status = ss.service_status(os_home=self.os_home, runner=runner, which=_which_found)
+        self.assertEqual(status["next_elapse"], "")
+        self.assertEqual(status["next_elapse_basis"], ss.NEXT_ELAPSE_UNKNOWN)
+
+    def test_status_asks_systemd_for_both_next_elapse_properties(self) -> None:
+        # Pins the exact property names. A rename or a drop to one property reintroduces the
+        # blank-next-run defect, and this fails before a live host ever sees it.
+        self._install()
+        runner = self._runner()
+        ss.service_status(os_home=self.os_home, runner=runner, which=_which_found)
+        asked = {
+            arg[len("--property="):]
+            for call in runner.calls if call[2] == "show"
+            for arg in call if arg.startswith("--property=")
+        }
+        self.assertIn("NextElapseUSecRealtime", asked)
+        self.assertIn("NextElapseUSecMonotonic", asked)
+        self.assertIn("LastTriggerUSec", asked)
+
+    def test_status_reports_the_last_trigger_wall_clock(self) -> None:
+        self._install()
+        status = ss.service_status(
+            os_home=self.os_home, runner=self._runner(), which=_which_found
+        )
+        self.assertEqual(status["last_trigger"], "Sun 2026-08-09 22:50:24 JST")
+
+    def test_status_reports_the_last_exit_result(self) -> None:
+        self._install()
+        runner = self._runner(
+            show_map={
+                ss.SUPERVISOR_UNIT.timer_unit: _timer_show(),
+                ss.SUPERVISOR_UNIT.service_unit: _service_show(
+                    result="exit-code", status="2", exit_at="Sun 2026-08-09 22:30:35 JST"
+                ),
+            }
+        )
+        status = ss.service_status(os_home=self.os_home, runner=runner, which=_which_found)
+        self.assertEqual(status["last_result"], "exit-code")
+        self.assertEqual(status["last_exit_status"], 2)
+        self.assertEqual(status["last_exit_at"], "Sun 2026-08-09 22:30:35 JST")
+
+    def test_status_reports_a_signal_killed_last_run(self) -> None:
+        self._install()
+        runner = self._runner(
+            show_map={
+                ss.SUPERVISOR_UNIT.timer_unit: _timer_show(),
+                ss.SUPERVISOR_UNIT.service_unit: _service_show(result="signal", status="-1"),
+            }
+        )
+        status = ss.service_status(os_home=self.os_home, runner=runner, which=_which_found)
+        self.assertEqual(status["last_result"], "signal")
+        self.assertEqual(status["last_exit_status"], -1)
+
+    def test_status_reports_the_installed_command(self) -> None:
+        self._install()
+        status = ss.service_status(
+            os_home=self.os_home, runner=self._runner(), which=_which_found
+        )
+        self.assertEqual(
+            status["installed_command"],
+            [
+                "/opt/bin/mozyo-bridge", "workflow", "supervisor", "--run-once",
+                "--home", str(self.mozyo_home.resolve()),
+            ],
+        )
+
+    def test_status_projects_the_installed_and_scheduled_service(self) -> None:
+        self._install()
+        runner = self._runner(
+            show_map={
+                ss.SUPERVISOR_UNIT.timer_unit: _timer_show(),
+                ss.SUPERVISOR_UNIT.service_unit: _service_show(main_pid="4321"),
             }
         )
         status = ss.service_status(
@@ -641,7 +833,7 @@ class ServiceStatusTest(_LinuxCase):
         self.assertTrue(status["loaded"])
         self.assertTrue(status["timer_enabled"])
         self.assertEqual(status["pid"], 4321)
-        self.assertEqual(status["scheduled_interval_seconds"], 300)
+        self.assertEqual(status["scheduled_interval_seconds"], 60)
         self.assertTrue(status["run_at_load"])
         self.assertFalse(status["keep_alive_present"])
         self.assertTrue(status["no_environment_block"])
@@ -650,203 +842,109 @@ class ServiceStatusTest(_LinuxCase):
         self.assertEqual(status["credential_readiness"], ss.CREDENTIAL_READY)
 
     def test_status_mutates_nothing(self) -> None:
-        runner = self._ready_runner()
+        runner = self._runner()
         ss.service_status(os_home=self.os_home, runner=runner, which=_which_found)
         self.assertEqual([v for v in runner.verbs if v != "show"], [])
         self.assertFalse(ss.unit_dir(self.os_home).exists())
 
-    def test_status_emits_only_tokens_counts_and_booleans(self) -> None:
-        self._install_reconcile()
+    def test_status_emits_no_secret(self) -> None:
         _write_home_credential(self.mozyo_home, api_key="super-secret-key")
-        status = ss.service_status(
-            os_home=self.os_home, mozyo_home=self.mozyo_home,
-            runner=self._ready_runner(), which=_which_found,
+        self._install(credential=False)
+        blob = repr(
+            ss.service_status(
+                os_home=self.os_home, mozyo_home=self.mozyo_home,
+                runner=self._runner(), which=_which_found,
+            )
         )
-        blob = repr(status)
         self.assertNotIn("super-secret-key", blob)
         self.assertNotIn("redmine.example.test", blob)
 
     def test_an_uninstalled_host_reports_the_would_be_root_readiness(self) -> None:
         status = ss.service_status(
             os_home=self.os_home, mozyo_home=self.mozyo_home,
-            runner=self._ready_runner(), which=_which_found,
+            runner=self._runner(), which=_which_found,
         )
         self.assertFalse(status["installed"])
         self.assertEqual(status["home_pin"], ss.HOME_PIN_NOT_INSTALLED)
         self.assertEqual(status["credential_readiness"], ss.CREDENTIAL_MISSING)
-        self.assertEqual(status["scheduled_interval_seconds"], 300)  # the hint
+        self.assertEqual(status["scheduled_interval_seconds"], 60)  # the hint
+        self.assertEqual(status["installed_command"], [])
 
     def test_a_present_but_unreadable_unit_is_distinct_from_absence(self) -> None:
-        self._install_reconcile()
+        self._install()
         ss.service_unit_path(self.os_home).write_text("garbage\n", encoding="utf-8")
         status = ss.service_status(
-            os_home=self.os_home, runner=self._ready_runner(), which=_which_found
+            os_home=self.os_home, runner=self._runner(), which=_which_found
         )
         self.assertEqual(status["home_pin"], ss.HOME_PIN_UNREADABLE)
         self.assertEqual(status["credential_readiness"], "")  # unknowable, never guessed
         self.assertFalse(status["executable_matches"])
 
     def test_a_lone_service_file_is_not_reported_as_installed(self) -> None:
-        self._install_reconcile()
+        self._install()
         ss.timer_unit_path(self.os_home).unlink()  # no cadence left
         status = ss.service_status(
-            os_home=self.os_home, runner=self._ready_runner(), which=_which_found
+            os_home=self.os_home, runner=self._runner(), which=_which_found
         )
         self.assertFalse(status["installed"])
         self.assertTrue(status["service_unit_exists"])
         self.assertFalse(status["timer_unit_exists"])
 
     def test_a_hand_added_restart_directive_surfaces_as_keep_alive_present(self) -> None:
-        self._install_reconcile()
+        self._install()
         target = ss.service_unit_path(self.os_home)
         target.write_text(target.read_text(encoding="utf-8") + "Restart=always\n", encoding="utf-8")
         status = ss.service_status(
-            os_home=self.os_home, runner=self._ready_runner(), which=_which_found
+            os_home=self.os_home, runner=self._runner(), which=_which_found
         )
         self.assertTrue(status["keep_alive_present"])
 
     def test_a_hand_added_environment_key_surfaces_as_an_environment_block(self) -> None:
-        self._install_reconcile()
+        self._install()
         target = ss.service_unit_path(self.os_home)
         target.write_text(
             target.read_text(encoding="utf-8") + "Environment=FOO=bar\n", encoding="utf-8"
         )
         status = ss.service_status(
-            os_home=self.os_home, runner=self._ready_runner(), which=_which_found
+            os_home=self.os_home, runner=self._runner(), which=_which_found
         )
         self.assertFalse(status["no_environment_block"])
 
     def test_an_unparseable_cadence_is_reported_as_unknown_not_reinterpreted(self) -> None:
-        self._install_reconcile()
+        self._install()
         target = ss.timer_unit_path(self.os_home)
         target.write_text(
-            target.read_text(encoding="utf-8").replace("OnUnitActiveSec=300s", "OnUnitActiveSec=5min"),
+            target.read_text(encoding="utf-8").replace("OnUnitActiveSec=60s", "OnUnitActiveSec=5min"),
             encoding="utf-8",
         )
         status = ss.service_status(
-            os_home=self.os_home, runner=self._ready_runner(), which=_which_found
+            os_home=self.os_home, runner=self._runner(), which=_which_found
         )
         self.assertIsNone(status["scheduled_interval_seconds"])
 
     def test_a_non_ascii_pid_reads_as_none_instead_of_raising(self) -> None:
-        # The Redmine #14753 defect class: ``str.isdigit()`` accepts characters ``int()`` may read
-        # differently (or not at all). An unreadable pid must degrade, never raise.
-        self._install_reconcile()
-        runner = self._ready_runner(
+        # The Redmine #14753 defect class: ``str.isdigit()`` accepts characters that are not pids.
+        self._install()
+        runner = self._runner(
             show_map={
-                ss.RECONCILE_UNIT.timer_unit: _timer_show(),
-                ss.RECONCILE_UNIT.service_unit: "MainPID=²\n",
+                ss.SUPERVISOR_UNIT.timer_unit: _timer_show(),
+                ss.SUPERVISOR_UNIT.service_unit: _service_show(main_pid="²", status="²"),
             }
         )
         status = ss.service_status(os_home=self.os_home, runner=runner, which=_which_found)
         self.assertIsNone(status["pid"])
+        self.assertIsNone(status["last_exit_status"])
 
     def test_a_zero_main_pid_reads_as_no_running_sweep(self) -> None:
-        self._install_reconcile()
-        runner = self._ready_runner(
-            show_map={
-                ss.RECONCILE_UNIT.timer_unit: _timer_show(),
-                ss.RECONCILE_UNIT.service_unit: "MainPID=0\n",
-            }
+        self._install()
+        status = ss.service_status(
+            os_home=self.os_home, runner=self._runner(), which=_which_found
         )
-        self.assertIsNone(
-            ss.service_status(os_home=self.os_home, runner=runner, which=_which_found)["pid"]
-        )
+        self.assertIsNone(status["pid"])
 
 
 # ---------------------------------------------------------------------------
-# Pair orchestration: atomic-or-nothing install over both cadences.
-# ---------------------------------------------------------------------------
-
-
-class PairTest(_LinuxCase):
-    def test_install_pair_installs_both_cadences(self) -> None:
-        _write_home_credential(self.mozyo_home)
-        result = ss.install_pair(
-            os_home=self.os_home, mozyo_home=self.mozyo_home,
-            runner=self._ready_runner(), which=_which_found,
-        )
-        self.assertTrue(result["performed"], result)
-        self.assertEqual(len(result["agents"]), 2)
-        for unit in ss.SUPERVISOR_UNITS:
-            self.assertTrue(ss.service_unit_path(self.os_home, unit=unit).exists())
-            self.assertTrue(ss.timer_unit_path(self.os_home, unit=unit).exists())
-
-    def test_the_two_cadences_are_installed_at_their_distinct_intervals(self) -> None:
-        _write_home_credential(self.mozyo_home)
-        ss.install_pair(
-            os_home=self.os_home, mozyo_home=self.mozyo_home,
-            reconcile_interval_seconds=300, drain_interval_seconds=60,
-            runner=self._ready_runner(), which=_which_found,
-        )
-        self.assertIn(
-            "OnUnitActiveSec=300s",
-            ss.timer_unit_path(self.os_home, unit=ss.RECONCILE_UNIT).read_text(encoding="utf-8"),
-        )
-        self.assertIn(
-            "OnUnitActiveSec=60s",
-            ss.timer_unit_path(self.os_home, unit=ss.DRAIN_UNIT).read_text(encoding="utf-8"),
-        )
-
-    def test_a_refused_reconcile_install_touches_nothing_else(self) -> None:
-        result = ss.install_pair(  # no credential written
-            os_home=self.os_home, mozyo_home=self.mozyo_home,
-            runner=self._ready_runner(), which=_which_found,
-        )
-        self.assertFalse(result["performed"])
-        self.assertEqual(len(result["agents"]), 1)
-        self.assertFalse(ss.unit_dir(self.os_home).exists())
-
-    def test_a_failed_drain_install_rolls_the_whole_pair_back(self) -> None:
-        _write_home_credential(self.mozyo_home)
-
-        class DrainFailingRunner(FakeRunner):
-            def __call__(self, argv):
-                argv = list(argv)
-                if argv[2] == "enable" and "drain" in argv[-1]:
-                    self.calls.append(argv)
-                    return _result(1)
-                return super().__call__(argv)
-
-        runner = DrainFailingRunner(
-            show_map={u.timer_unit: _timer_show() for u in ss.SUPERVISOR_UNITS}
-        )
-        result = ss.install_pair(
-            os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found
-        )
-        self.assertFalse(result["performed"])
-        self.assertTrue(result["rolled_back"])
-        self.assertEqual(result["reason"], ss.REASON_ENABLE_FAILED)
-        # No half-installed set is left behind — neither cadence's units survive.
-        for unit in ss.SUPERVISOR_UNITS:
-            self.assertFalse(ss.service_unit_path(self.os_home, unit=unit).exists())
-            self.assertFalse(ss.timer_unit_path(self.os_home, unit=unit).exists())
-
-    def test_status_pair_projects_both_cadences_without_mutating(self) -> None:
-        runner = self._ready_runner()
-        status = ss.service_status_pair(
-            os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found
-        )
-        self.assertEqual(len(status["agents"]), 2)
-        self.assertEqual(
-            [a["label"] for a in status["agents"]],
-            [ss.SUPERVISOR_SYSTEMD_LABEL, ss.SUPERVISOR_DRAIN_SYSTEMD_LABEL],
-        )
-        self.assertEqual([v for v in runner.verbs if v != "show"], [])
-
-    def test_uninstall_pair_removes_both_cadences(self) -> None:
-        _write_home_credential(self.mozyo_home)
-        ss.install_pair(
-            os_home=self.os_home, mozyo_home=self.mozyo_home,
-            runner=self._ready_runner(), which=_which_found,
-        )
-        result = ss.uninstall_pair(os_home=self.os_home, runner=self._ready_runner())
-        self.assertTrue(result["performed"])
-        self.assertFalse(any(p.suffix in (".service", ".timer") for p in ss.unit_dir(self.os_home).iterdir()))
-
-
-# ---------------------------------------------------------------------------
-# Backend selection: one contract, the host's adapter, typed refusal otherwise.
+# Backend selection: one operator contract over two deliberately different host shapes.
 # ---------------------------------------------------------------------------
 
 
@@ -858,70 +956,83 @@ class BackendSelectionTest(unittest.TestCase):
         self.assertEqual(sb.resolve_backend_name("win32"), sb.BACKEND_UNSUPPORTED)
 
     def test_the_resolved_modules_are_the_two_adapters(self) -> None:
-        self.assertEqual(sb.resolve_backend("linux")[1].__name__.rsplit(".", 1)[-1], "supervisor_systemd")
-        self.assertEqual(sb.resolve_backend("darwin")[1].__name__.rsplit(".", 1)[-1], "supervisor_launchd")
+        self.assertEqual(
+            sb.resolve_backend("linux")[1].__name__.rsplit(".", 1)[-1], "supervisor_systemd"
+        )
+        self.assertEqual(
+            sb.resolve_backend("darwin")[1].__name__.rsplit(".", 1)[-1], "supervisor_launchd"
+        )
         self.assertIsNone(sb.resolve_backend("win32")[1])
 
-    def test_an_unsupported_host_gets_a_typed_zero_mutation_refusal(self) -> None:
-        result = sb.unsupported_result("install")
-        self.assertFalse(result["performed"])
-        self.assertEqual(result["reason"], sb.REASON_NO_BACKEND)
-        self.assertEqual(result["agents"], [])
-
-    def test_the_dispatched_verbs_route_to_the_hosts_adapter_and_stamp_the_backend(self) -> None:
-        seen = {}
-
-        def fake_install_pair(**kwargs):
-            seen.update(kwargs)
-            return {"action": "install", "performed": True, "reason": "", "agents": []}
-
-        with patch.object(sys, "platform", "linux"), patch.object(
-            ss, "install_pair", fake_install_pair
-        ):
-            result = sb.install_pair(mozyo_home=Path("/tmp/x"))
-        self.assertTrue(result["performed"])
-        self.assertEqual(result["backend"], sb.BACKEND_SYSTEMD)
-        self.assertEqual(seen["mozyo_home"], Path("/tmp/x"))
-
-    def test_the_dispatched_verbs_refuse_on_an_unsupported_host(self) -> None:
-        with patch.object(sys, "platform", "win32"):
-            for verb in (sb.install_pair, sb.restart_pair, sb.uninstall_pair):
-                result = verb()
-                self.assertFalse(result["performed"], verb)
-                self.assertEqual(result["reason"], sb.REASON_NO_BACKEND, verb)
-            status = sb.service_status_pair()
-        self.assertEqual(status["agents"], [])
-        self.assertEqual(status["backend"], sb.BACKEND_UNSUPPORTED)
-
-    def test_the_dispatched_status_never_mutates_on_an_unsupported_host(self) -> None:
-        with patch.object(sys, "platform", "win32"):
-            self.assertFalse(sb.service_status_pair().get("platform_supported"))
-
-    def test_both_adapters_expose_the_same_pair_verb_surface(self) -> None:
-        # The CLI drives whichever adapter owns the host without branching, so the surfaces must
-        # not drift apart.
+    def test_the_macos_adapter_keeps_its_own_dual_agent_shape(self) -> None:
+        # #15183 must not reorganize macOS: its pair verbs stay exactly where they were.
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
             supervisor_launchd,
         )
 
         for verb in ("install_pair", "restart_pair", "uninstall_pair", "service_status_pair"):
             self.assertTrue(hasattr(supervisor_launchd, verb), verb)
-            self.assertTrue(hasattr(ss, verb), verb)
+        self.assertEqual(len(supervisor_launchd.SUPERVISOR_AGENTS), 2)
+
+    def test_a_linux_result_is_normalized_to_a_single_row_roster(self) -> None:
+        def fake_install(**kwargs):
+            return {"action": "install", "performed": True, "reason": "", "label": "L"}
+
+        with patch.object(sys, "platform", "linux"), patch.object(ss, "install", fake_install):
+            result = sb.install(mozyo_home=Path("/tmp/x"))
+        self.assertEqual(result["backend"], sb.BACKEND_SYSTEMD)
+        self.assertEqual(len(result["agents"]), 1)
+        self.assertTrue(result["performed"])
+
+    def test_a_macos_result_keeps_its_two_row_roster(self) -> None:
+        def fake_install_pair(**kwargs):
+            return {"action": "install", "performed": True, "reason": "",
+                    "agents": [{"label": "a"}, {"label": "b"}]}
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            supervisor_launchd,
+        )
+
+        with patch.object(sys, "platform", "darwin"), patch.object(
+            supervisor_launchd, "install_pair", fake_install_pair
+        ):
+            result = sb.install()
+        self.assertEqual(result["backend"], sb.BACKEND_LAUNCHD)
+        self.assertEqual(len(result["agents"]), 2)
+
+    def test_the_tick_interval_reaches_only_the_linux_adapter(self) -> None:
+        seen = {}
+
+        def fake_install(**kwargs):
+            seen.update(kwargs)
+            return {"action": "install", "performed": True, "reason": ""}
+
+        with patch.object(sys, "platform", "linux"), patch.object(ss, "install", fake_install):
+            sb.install(interval_seconds=90)
+        self.assertEqual(seen["interval_seconds"], 90)
+
+    def test_an_unsupported_host_gets_a_typed_zero_mutation_refusal(self) -> None:
+        with patch.object(sys, "platform", "win32"):
+            for verb in (sb.install, sb.restart, sb.uninstall):
+                result = verb()
+                self.assertFalse(result["performed"], verb)
+                self.assertEqual(result["reason"], sb.REASON_NO_BACKEND, verb)
+                self.assertEqual(result["agents"], [], verb)
+            status = sb.service_status()
+        self.assertEqual(status["backend"], sb.BACKEND_UNSUPPORTED)
+        self.assertFalse(status["platform_supported"])
 
 
 class NoResidentDaemonTest(unittest.TestCase):
     """The adapter must never introduce a resident daemon / infinite poll (issue #15183 scope)."""
 
     def test_the_adapter_declares_no_always_on_directive(self) -> None:
-        import inspect
-
         text = inspect.getsource(ss)
         for directive in ("Restart=always", "Restart=on-failure", "RemainAfterExit=yes"):
             self.assertNotIn(directive, text)
 
-    def test_the_adapter_has_no_third_cadence(self) -> None:
-        self.assertEqual(len(ss.SUPERVISOR_UNITS), 2)
-        self.assertNotIn("--hibernate", __import__("inspect").getsource(ss))
+    def test_the_adapter_declares_no_hibernate_cadence(self) -> None:
+        self.assertNotIn("--hibernate", inspect.getsource(ss))
 
 
 if __name__ == "__main__":  # pragma: no cover

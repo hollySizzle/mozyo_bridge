@@ -495,12 +495,11 @@ sleep/poll を要求しない。reconciliation 経路（`--run-once`）と drain
 別 service definition（`build_service_definition(local_drain=...)`）として表現し、portable default は
 測定に基づく neutral 値（固定の私的運用値を OSS 既定へ焼かない）を持つ。
 
-この adapter 契約は **platform-neutral core + host realization** に分かれる（#15183）。platform-neutral core
-（`supervisor_service_common`）は、scheduled tick が実行する argv（PATH 解決済みの絶対 executable + bounded
-argv tail + pin された `--home <mozyo root>`）、**daemon-effective** credential readiness（empty environ +
-pin された mozyo home で判定するため、installer の shell env / `MOZYO_BRIDGE_HOME` が false ready を作れない）、
-installed 側 `--home` pin の健全性語彙、fail-closed refusal token 語彙を持つ。host realization はこの core を
-共有し、host 固有の「installed とは何か」だけを実装する。したがって片方の adapter だけが直る drift が起きない。
+host realization は operator 契約（`status` / `install` / `restart` / `uninstall`）を共有するが、**内部形状ま
+で同一にはしない**（#15183）。どちらを使うかは `supervisor_service_backend` が platform で解決し（darwin ->
+LaunchAgent、Linux -> systemd user、それ以外 -> typed zero-mutation refusal）、結果 envelope だけを
+`{action, performed, reason, backend, agents: [...]}` に正規化する。`agents` は host adapter が返す owned
+service 行（macOS は 2 行、Linux は 1 行）であり、CLI は platform 分岐なしに両方を描画する。
 
 **macOS LaunchAgent** の realization は **owned dual-agent lifecycle**（`supervisor_launchd` の `install_pair` /
 `uninstall_pair` / `restart_pair` / `service_status_pair`）: 二つの独立した owned label / plist / log
@@ -508,44 +507,62 @@ installed 側 `--home` pin の健全性語彙、fail-closed refusal token 語彙
 reconcile agent が失敗すれば何もせず、reconcile 成功後に drain agent が失敗すれば両 agent を rollback
 （partial failure で half-installed pair を残さない fail-closed）。各 verb は非 darwin / 実行ファイル欠落 /
 credential 未整備 / not-loaded で zero-mutation 拒否し、既存の RunAtLoad + StartInterval（KeepAlive なし、
-EnvironmentVariables なし）契約を両 agent で維持する。
+EnvironmentVariables なし）契約を両 agent で維持する。この構成は #15183 で変更しない。
 
-**Linux systemd user timer** の realization（`supervisor_systemd`）は同じ dual-pair lifecycle を同じ verb 名で
-提供する。owned artifact は XDG user unit directory（`$XDG_CONFIG_HOME/systemd/user`、既定
-`~/.config/systemd/user`）下の service + timer 2 組である。対応関係は次の 1 対 1 である:
+**Linux systemd user timer** の realization（`supervisor_systemd`）は **owned service 1 個 + timer 1 個**であ
+る。timer は 60 秒ごとに `workflow supervisor --run-once` を 1 回起動し、process は毎 tick 終了する。macOS の
+dual-agent 形状は複製しない: `--drain-only` の別 unit 登録、2 組の atomic install / 一括 rollback、macOS 内部
+構造との同等性は、いずれも受入条件から削除された。
+
+**60 秒 tick は 60 秒 Redmine poll ではない。** provider 読み取りは supervisor 本体が持つ durable な
+per-workspace cadence watermark（`reconcile_cadence` / `should_reconcile_source`、portable default 300 秒 +
+empty pass での指数 backoff と jitter）で gate される。window 内の tick は provider 読み取り **0** の local pass
+へ downgrade されるので、頻繁な tick は SQLite + Herdr で動き、Redmine は低頻度の取りこぼし回収に留まる。この
+gating は supervisor 本体の責務であり、scheduler adapter 側は cadence を供給するだけで再実装しない。
+
+owned artifact は XDG user unit directory（`$XDG_CONFIG_HOME/systemd/user`、既定 `~/.config/systemd/user`）下の
+service + timer である。対応関係:
 
 | LaunchAgent | systemd user | 意味 |
 | --- | --- | --- |
-| `RunAtLoad` | `[Timer] OnActiveSec=0s` | timer が active になった瞬間に 1 回実行（`enable --now` と以後の user manager 起動の両方を覆う） |
-| `StartInterval=<N>` | `[Timer] OnUnitActiveSec=<N>s` | 前回実行から N 秒後に再実行 |
+| `RunAtLoad` | `[Timer] OnActiveSec=0s` | timer が active になった瞬間に 1 tick（`enable --now` と以後の user manager 起動の両方を覆う） |
+| `StartInterval=<N>` | `[Timer] OnUnitActiveSec=60s` | 前回実行から N 秒後に再実行 |
 | `KeepAlive` 不在 | `Restart=` / `RemainAfterExit=` 不在 + `Type=oneshot` | bounded one-shot を常駐化・tight relaunch loop 化しない（false 設定ではなく **構造的に不在**） |
 | `EnvironmentVariables` 不在 | `Environment=` / `EnvironmentFile=` 不在 | unit に secret を書き込む code path が存在しない |
 | `ProgramArguments` | `ExecStart`（token ごとに systemd quote） | shell string ではない構造化 argv。`/bin/sh -c` を経由しない |
 
 service unit は `[Install]` を持たない（enable するのは timer のみ。service を直接 enable すると login 時 1 回
 だけ実行され cadence が消える）。timer は `OnCalendar` / `Persistent=` を持たない（取りこぼしの replay は不要で、
-次 tick が前 tick の未処理を reconcile する）。log は systemd journal に出るため owned log path を作らず、unit
-directory 以外へ書かない。systemctl 呼び出しは常に構造化 argv（`daemon-reload` / `enable --now` /
-`disable --now` / `stop` / `restart` / `show`）で、shell を経由しない。zero-mutation 拒否条件は macOS と同じ集合
-に、**systemd user manager 到達不能**（`systemctl` 不在、または user bus に到達できない container / no-session
-環境）を加えたものである。uninstall は unit file を消すだけでは足りず、最後に `reset-failed` で manager 側の
-状態も消す: 実行中の sweep を `stop` すると one-shot は SIGTERM で終了するため systemd が `failed` を記録し、
-file 削除後もその記録が `not-found`/`failed` entry として manager に残る（#15183 の installed-artifact smoke で
-実測。fake runner の hermetic test では manager 側状態を観測できない）。launchd の `bootout` は痕跡を残さない
-ため、「owned artifact だけを正確に消す」は manager 側 residue も残さないことを含む。user manager を持たない環境は「install したが永久に schedule されない」に degrade
-させず、明示的に unsupported として拒否する。restart は owned timer が active な場合だけ作用し、installed
-`ExecStart` が今 install するはずの command と一致しない場合は drift として拒否する（reinstall が正道）。
+次 tick が前 tick の未処理を reconcile する）。log は systemd journal に出るため owned log path を作らない。
+systemctl 呼び出しは常に構造化 argv（`daemon-reload` / `enable --now` / `disable --now` / `stop` / `restart` /
+`show` / `reset-failed`）で、shell を経由しない。
 
-どちらの realization を使うかは `supervisor_service_backend` が platform で解決する（darwin -> LaunchAgent、
-Linux -> systemd user、それ以外 -> typed zero-mutation refusal）。同 module が dispatch 済みの
-`install_pair` / `restart_pair` / `uninstall_pair` / `service_status_pair` を公開し、consumer は adapter module
-を直接 import しない（直接 import は process の寿命の間 consumer を単一 OS へ縛るため）。すべての結果と status
-投影は解決された `backend` token を持つので、どの adapter が答えたかは常に読める。
-`workflow supervisor --service-status` は解決された backend、両 service の redacted host 投影、両 definition を
-表示する。
+**Redmine 未設定は timer 導入の拒否理由にしない**（macOS adapter との意図的な差異）。credential readiness は
+zero-mutation refusal の gate ではなく **projection** として `missing` / `incomplete` / `unsafe` / `ready` の
+token で報告する。ローカル情報だけで安全に行える処理を止めないためである。安全境界は破れない —
+値を読むのは `resolve_redmine_credentials` であり、unsafe な file には警告を返して値を渡さないので、timer を
+導入しても不正な credential が使用されることはない。install は unsafe file の修復も迂回もしない。
+zero-mutation 拒否が残るのは install 自体が無意味になる条件だけ、すなわち非 Linux host、**systemd user manager
+到達不能**（`systemctl` 不在、または user bus に到達できない container / no-session 環境）、実行ファイル欠落で
+ある。user manager を持たない環境は「install したが永久に schedule されない」に degrade させず、明示的に
+unsupported として拒否する。
 
-いずれの realization も独自常駐 daemon・無限 poll を導入せず、worktree / local branch / remote branch を削除せず、
-#15066 の managed process / lifecycle 退役境界を変更しない。
+status は非破壊で、受入条件が求める観測値を秘密非表示で返す: 導入・有効化状態（`installed` / `timer_enabled` /
+`loaded`）、**次回起動**（`next_elapse`）、**直近の終了結果**（`last_result` / `last_exit_status` /
+`last_exit_at`）、**実行内容**（`installed_command`、`scheduled_interval_seconds`、`home_pin`、
+`executable_matches`）、および参考値としての `provider_reconcile_interval_seconds`。restart は owned timer が
+active な場合だけ作用し、installed command が今 install するはずの command と一致しない場合は drift として拒否
+する（reinstall が正道）。
+
+uninstall は unit file を消すだけでは足りず、最後に `reset-failed` で manager 側の状態も消す: 実行中の sweep を
+`stop` すると one-shot は SIGTERM で終了するため systemd が `failed` を記録し、file 削除後もその記録が
+`not-found`/`failed` entry として manager に残る（#15183 の installed-artifact smoke で実測。fake runner の
+hermetic test では manager 側状態を観測できない）。launchd の `bootout` は痕跡を残さないため、「owned artifact
+だけを正確に消す」は manager 側 residue も残さないことを含む。
+
+`workflow supervisor --service-status` は解決された backend、owned service の redacted host 投影、secret-free な
+definition を表示する。いずれの realization も独自常駐 daemon・無限 poll を導入せず、worktree / local branch /
+remote branch を削除せず、#15066 の managed process / lifecycle 退役境界を変更しない。
 
 ## 現行0.12.2と目標状態の差
 

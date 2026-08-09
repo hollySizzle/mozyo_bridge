@@ -45,47 +45,19 @@ import sys
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_service_common import (
-    CREDENTIAL_INCOMPLETE,
-    CREDENTIAL_MISSING,
-    CREDENTIAL_READY,
-    CREDENTIAL_REFUSAL_REASON as _CREDENTIAL_REFUSAL_REASON,
-    CREDENTIAL_UNSAFE,
-    HOME_PIN_DUPLICATE,
-    HOME_PIN_MALFORMED,
-    HOME_PIN_MISSING,
-    HOME_PIN_NO_ARGV,
-    HOME_PIN_NOT_ABSOLUTE,
-    HOME_PIN_NOT_INSTALLED,
-    HOME_PIN_OK,
-    HOME_PIN_UNREADABLE,
-    REASON_EXECUTABLE_NOT_FOUND,
-    REASON_HOME_PIN_MISMATCH,
-    REASON_HOME_PIN_UNHEALTHY,
-    REASON_INSTALLED_COMMAND_DRIFT,
-    REASON_NOT_INSTALLED,
-    REASON_SERVICE_NOT_LOADED,
-    SUPERVISOR_ARGV_TAIL,
-    SUPERVISOR_DRAIN_ARGV_TAIL,
-    SUPERVISOR_EXECUTABLE_NAME,
-    SUPERVISOR_HOME_FLAG,
-    Runner,
-    classify_credential_readiness,
-    default_runner as _default_runner,
-    extract_pinned_home as _extract_pinned_home,
-    first_failure_reason as _first_failure_reason,
-    refused as _refused,
-    resolve_mozyo_home,
-)
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_service_common import (
-    resolve_supervisor_command as _resolve_command_for_tail,
-)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
     DEFAULT_LOCAL_DRAIN_INTERVAL_SECONDS,
     DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
     DEFAULT_SUPERVISOR_DRAIN_SERVICE_LABEL,
     DEFAULT_SUPERVISOR_SERVICE_LABEL,
 )
+from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_context import (
+    normalize_base_url,
+)
+from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_credentials import (
+    resolve_redmine_credentials,
+)
+from mozyo_bridge.shared.paths import mozyo_bridge_home
 
 # ---------------------------------------------------------------------------
 # Owned identity (a reverse-DNS label + owned plist/log paths; not operator-private).
@@ -101,12 +73,16 @@ SUPERVISOR_LAUNCHD_LABEL = DEFAULT_SUPERVISOR_SERVICE_LABEL
 PLIST_RELATIVE = Path("Library/LaunchAgents") / f"{SUPERVISOR_LAUNCHD_LABEL}.plist"
 LOG_RELATIVE = Path("Library/Logs/mozyo-bridge/callback-supervisor.log")
 
-# The executable name, the bounded argv tails, and the ``--home`` pin flag are the PLATFORM-NEUTRAL
-# part of the OS scheduler adapter contract and live in ``supervisor_service_common`` (Redmine
-# #15183), imported above and re-exported here so this module's public surface is unchanged. The
-# resolved mozyo home is pinned onto the argv tail as ``--home <root>`` at install time (see
-# :func:`resolve_supervisor_command`) so the launchd daemon reads the *same* credential / registry
-# root the install preflight validated — launchd carries no ``MOZYO_BRIDGE_HOME`` (j#79092 R2-F1).
+#: The executable name resolved from PATH at install time (never a shell string).
+SUPERVISOR_EXECUTABLE_NAME = "mozyo-bridge"
+#: The structured argv tail the scheduled agent runs each tick (one bounded sweep, then exit). The
+#: resolved mozyo home is pinned onto this as ``--home <root>`` at install time (see
+#: :func:`resolve_supervisor_command`) so the launchd daemon reads the *same* credential / registry
+#: root the install preflight validated — launchd carries no ``MOZYO_BRIDGE_HOME`` (j#79092 R2-F1).
+SUPERVISOR_ARGV_TAIL = ("workflow", "supervisor", "--run-once")
+#: The structured flag that pins the mozyo home root onto the daemon argv (non-secret; a config
+#: directory, resolved by the supervisor CLI's ``--home``).
+SUPERVISOR_HOME_FLAG = "--home"
 
 # ---------------------------------------------------------------------------
 # Agent variants (Redmine #14150): the split runs TWO owned bounded one-shot agents at distinct
@@ -120,6 +96,7 @@ LOG_RELATIVE = Path("Library/Logs/mozyo-bridge/callback-supervisor.log")
 SUPERVISOR_DRAIN_LAUNCHD_LABEL = DEFAULT_SUPERVISOR_DRAIN_SERVICE_LABEL
 DRAIN_PLIST_RELATIVE = Path("Library/LaunchAgents") / f"{SUPERVISOR_DRAIN_LAUNCHD_LABEL}.plist"
 DRAIN_LOG_RELATIVE = Path("Library/Logs/mozyo-bridge/callback-supervisor-drain.log")
+SUPERVISOR_DRAIN_ARGV_TAIL = ("workflow", "supervisor", "--drain-only")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -158,18 +135,59 @@ SUPERVISOR_AGENTS = (RECONCILE_AGENT, DRAIN_AGENT)
 
 #: A mutating verb (install/restart/uninstall) was refused because the host is not macOS.
 REASON_UNSUPPORTED_PLATFORM = "launchd_unsupported_platform"
+#: install/restart refused: the `mozyo-bridge` executable is not resolvable on PATH.
+REASON_EXECUTABLE_NOT_FOUND = "supervisor_executable_not_found"
+#: restart refused: the service is not currently loaded (restart acts only on a loaded service).
+REASON_SERVICE_NOT_LOADED = "service_not_loaded"
+#: restart refused: no owned plist is installed (nothing to restart; run install first).
+REASON_NOT_INSTALLED = "service_not_installed"
+#: restart/status: the installed plist's ``--home`` pin is missing / malformed / duplicated / not an
+#: absolute canonical path, so the daemon-effective root cannot be trusted (fail-closed for restart;
+#: unhealthy for status). Also used when the owned plist file exists but is unreadable / non-mapping.
+REASON_HOME_PIN_UNHEALTHY = "home_pin_unhealthy"
+#: restart refused: the requested mozyo home differs from the installed plist pin (a home change
+#: must go through ``install``, which rewrites the plist — restart never silently re-points).
+REASON_HOME_PIN_MISMATCH = "home_pin_mismatch"
+#: restart refused: the installed ``ProgramArguments`` no longer match the command an install would
+#: write now (executable moved / argv drift). An executable / home change must reinstall (rewrite the
+#: plist); restart never kickstarts a drifted command (j#79136 R4-F2).
+REASON_INSTALLED_COMMAND_DRIFT = "installed_command_drift"
 #: A launchctl bootstrap failed (message redacted to a fixed token; no host detail leaks).
 REASON_BOOTSTRAP_FAILED = "launchctl_bootstrap_failed"
 #: A launchctl kickstart failed (message redacted to a fixed token).
 REASON_KICKSTART_FAILED = "launchctl_kickstart_failed"
 
-# The executable-not-found / not-installed / home-pin / command-drift refusal tokens, the
-# ``home_pin`` status vocabulary, and the credential-readiness tokens + refusal map are the
-# platform-neutral part of the adapter contract: they live in ``supervisor_service_common``
-# (Redmine #15183), are imported above, and are re-exported here unchanged.
+#: ``home_pin`` extraction status vocabulary (see :func:`_extract_pinned_home`).
+HOME_PIN_OK = "ok"
+HOME_PIN_MISSING = "missing"
+HOME_PIN_DUPLICATE = "duplicate"
+HOME_PIN_MALFORMED = "malformed"
+#: The pin value is present but not an absolute, lexically-canonical path (relative / ``~`` / has
+#: ``..`` etc.) — a launchd daemon resolves it from a different cwd than the installer (j#79136 R4-F1).
+HOME_PIN_NOT_ABSOLUTE = "not_absolute"
+HOME_PIN_NO_ARGV = "no_argv"
+#: The owned plist file exists but could not be parsed / is not a mapping (distinct from absence,
+#: which is ``not_installed``) — j#79136 R4-F3.
+HOME_PIN_UNREADABLE = "unreadable_plist"
+HOME_PIN_NOT_INSTALLED = "not_installed"
+
+#: Credential-readiness tokens (the exact readiness the live supervisor needs to reach Redmine).
+CREDENTIAL_READY = "ready"  # api key + usable base url present
+CREDENTIAL_INCOMPLETE = "incomplete"  # exactly one of key / usable url present
+CREDENTIAL_MISSING = "missing"  # neither present, and nothing unsafe (the plain unconfigured case)
+CREDENTIAL_UNSAFE = "unsafe"  # a present credential file is unsafe/malformed (permission / YAML)
+
+#: The install/restart refusal reason for each non-ready credential state.
+_CREDENTIAL_REFUSAL_REASON = {
+    CREDENTIAL_INCOMPLETE: "redmine_credential_incomplete",
+    CREDENTIAL_MISSING: "redmine_credential_missing",
+    CREDENTIAL_UNSAFE: "redmine_credential_unsafe",
+}
 
 # A launchctl "print" for an unknown label exits non-zero; treat any non-zero as "not loaded".
 _LAUNCHCTL = "launchctl"
+
+Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +205,21 @@ def log_path(os_home: Optional[Path] = None, *, agent: SupervisorAgent = RECONCI
     return (os_home or Path.home()) / agent.log_relative
 
 
+def resolve_mozyo_home(mozyo_home: Optional[Path] = None) -> Path:
+    """Resolve the exact **mozyo home** root (credential / registry / store) as an absolute path.
+
+    ``mozyo_home`` (the supervisor CLI's ``--home``) wins; otherwise the package's home contract
+    (:func:`mozyo_bridge_home`: ``MOZYO_BRIDGE_HOME`` or ``~/.mozyo_bridge``). An explicit value is
+    ``expanduser().resolve()``-normalized to an **absolute canonical root** — a relative / ``~``
+    input must never be pinned onto the daemon argv, since a LaunchAgent's working directory is not
+    the installer shell's, so a relative pin would re-diverge the credential / registry root
+    (j#79125 R3-F2). ``mozyo_bridge_home()`` already returns an absolute resolved path.
+    """
+    if mozyo_home is not None:
+        return Path(mozyo_home).expanduser().resolve()
+    return mozyo_bridge_home()
+
+
 def resolve_supervisor_command(
     *,
     mozyo_home: Optional[Path] = None,
@@ -195,15 +228,24 @@ def resolve_supervisor_command(
 ) -> Optional[list[str]]:
     """The exact argv the agent runs, or ``None`` when the executable is not on PATH.
 
-    Thin launchd-side binding of the shared
-    :func:`...supervisor_service_common.resolve_supervisor_command` (Redmine #15183): the resolution
-    rules (PATH-resolved + absolute-canonical executable, the pinned ``--home <root>``, the
-    fail-closed ``None`` on a missing executable) are the same for every OS scheduler adapter; this
-    wrapper only supplies the launchd agent's argv tail.
+    The executable is PATH-resolved at install time (so the plist survives shell-env differences)
+    and normalized to an **absolute canonical path** (``os.path.abspath``): a relative PATH entry
+    makes ``shutil.which`` return a relative path, which a LaunchAgent would resolve from its own
+    working directory rather than the installer's — the same cwd divergence closed for the ``--home``
+    pin (j#79149 R5-F1). The **resolved mozyo home** is likewise pinned as ``--home <root>`` so the
+    daemon reads the credential / registry root the preflight validated (j#79092 R2-F1). A missing
+    executable is a fail-closed condition the caller turns into a zero-mutation refusal (install the
+    package first) — never a shell string and never a guessed path.
     """
-    return _resolve_command_for_tail(
-        argv_tail=agent.argv_tail, mozyo_home=mozyo_home, which=which
-    )
+    executable = which(SUPERVISOR_EXECUTABLE_NAME)
+    if not executable:
+        return None
+    return [
+        os.path.abspath(executable),
+        *agent.argv_tail,
+        SUPERVISOR_HOME_FLAG,
+        str(resolve_mozyo_home(mozyo_home)),
+    ]
 
 
 def render_plist(
@@ -237,12 +279,48 @@ def render_plist(
 
 
 # ---------------------------------------------------------------------------
-# launchctl seam (structured argv only; no shell).
-#
-# Credential readiness (:func:`classify_credential_readiness`) is platform-neutral and lives in
-# ``supervisor_service_common``: every adapter judges what the *scheduler-managed* supervisor will
-# have at run time (empty environ + the pinned mozyo home), never the installer's shell.
+# Credential readiness (the exact readiness the live supervisor needs; secret-safe token only).
 # ---------------------------------------------------------------------------
+
+
+def classify_credential_readiness(*, mozyo_home: Optional[Path] = None) -> str:
+    """Classify **daemon-effective** Redmine credential readiness into a fixed, secret-safe token.
+
+    Judges what the *launchd-managed* supervisor will actually have at run time, not what the
+    installer's interactive shell happens to hold. Two independent leaks are closed:
+
+    - **shell key/URL** — the plist carries no ``EnvironmentVariables`` and launchd inherits no
+      shell environment, so readiness resolves with an **empty environ**: an installer's exported
+      ``MOZYO_REDMINE_*`` can never produce a false ``ready`` (Redmine #13683 review j#79059 F1).
+    - **shell home root** — the credential file's root is the resolved **mozyo home**
+      (:func:`resolve_mozyo_home`), the exact root pinned onto the daemon argv, not whatever
+      ``mozyo_bridge_home()`` a later launchd process (with no ``MOZYO_BRIDGE_HOME``) would
+      re-derive (j#79092 R2-F1).
+
+    Ready needs an api key **and** a normalizable base URL from that home file; a present-but-unsafe
+    / malformed file surfaces as :data:`CREDENTIAL_UNSAFE` (the resolver refuses to read it and
+    returns a redacted warning), so a fail-closed refusal is visibly deliberate. Returns only a
+    token — never the key, the URL, or the warning text.
+    """
+    creds = resolve_redmine_credentials(resolve_mozyo_home(mozyo_home), environ={})
+    if creds.warnings:
+        return CREDENTIAL_UNSAFE
+    has_key = bool(creds.api_key)
+    has_url = bool(normalize_base_url(creds.base_url))
+    if has_key and has_url:
+        return CREDENTIAL_READY
+    if has_key or has_url:
+        return CREDENTIAL_INCOMPLETE
+    return CREDENTIAL_MISSING
+
+
+# ---------------------------------------------------------------------------
+# launchctl seam (structured argv only; no shell).
+# ---------------------------------------------------------------------------
+
+
+def _default_runner(argv: Sequence[str]) -> "subprocess.CompletedProcess[str]":
+    return subprocess.run(list(argv), capture_output=True, text=True, check=False)
 
 
 def _running_on_darwin() -> bool:
@@ -566,6 +644,14 @@ def service_status(
 # ---------------------------------------------------------------------------
 
 
+def _first_failure_reason(results: Sequence[dict]) -> str:
+    """The reason token of the first non-performed agent (secret-safe), or '' when all performed."""
+    for r in results:
+        if not r.get("performed"):
+            return str(r.get("reason", ""))
+    return ""
+
+
 def install_pair(
     *,
     os_home: Optional[Path] = None,
@@ -675,6 +761,42 @@ def _read_installed_plist(target: Path) -> Optional[dict]:
     except (OSError, ValueError, plistlib.InvalidFileException):
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _extract_pinned_home(installed_argv: object) -> tuple[Optional[str], str]:
+    """Extract the ``--home`` pin from an installed plist's ``ProgramArguments`` (strict).
+
+    Returns ``(pinned_home, status)``. The installed plist — not the caller's current shell — is the
+    authority on the daemon's mozyo home, so restart / status read the pin from here (j#79125 R3-F1).
+    A missing / duplicated / value-less pin is *not* trusted (the daemon-effective root is unknowable),
+    and a pin that is not an **absolute, lexically-canonical** path (relative / ``~`` / containing
+    ``..``) is rejected too: a LaunchAgent resolves such a pin from a different working directory than
+    the installer, re-opening the R3-F2 divergence in the installed service (j#79136 R4-F1). Every
+    non-``ok`` case is surfaced (fail-closed for restart, unhealthy for status), never guessed.
+    """
+    if not isinstance(installed_argv, list):
+        return None, HOME_PIN_NO_ARGV
+    indices = [i for i, arg in enumerate(installed_argv) if arg == SUPERVISOR_HOME_FLAG]
+    if not indices:
+        return None, HOME_PIN_MISSING
+    if len(indices) > 1:
+        return None, HOME_PIN_DUPLICATE
+    value_index = indices[0] + 1
+    if value_index >= len(installed_argv):
+        return None, HOME_PIN_MALFORMED
+    value = installed_argv[value_index]
+    if not isinstance(value, str) or not value.strip() or value.startswith("--"):
+        return None, HOME_PIN_MALFORMED
+    # An install always pins ``str(resolve_mozyo_home(...))`` — absolute + canonical. Anything else
+    # (relative, ``~``, ``/a/../b``) would be resolved from launchd's cwd, not the installer's.
+    if not os.path.isabs(value) or value != os.path.normpath(value):
+        return None, HOME_PIN_NOT_ABSOLUTE
+    return value, HOME_PIN_OK
+
+
+def _refused(action: str, reason: str, **extra: object) -> dict:
+    """A fail-closed, zero-mutation refusal result (fixed vocabulary; no host detail)."""
+    return {"action": action, "performed": False, "reason": reason, **extra}
 
 
 __all__ = (

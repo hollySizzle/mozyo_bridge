@@ -18,15 +18,18 @@ Actions (mutually exclusive):
 - ``--service-status`` / ``--install`` / ``--restart`` / ``--uninstall`` — the **service lifecycle
   command contract**, realized by whichever OS scheduler owns the host
   (:mod:`...application.supervisor_service_backend`): the owned macOS LaunchAgent pair
-  (:mod:`...application.supervisor_launchd`) or the owned Linux systemd **user** service+timer pair
-  (:mod:`...application.supervisor_systemd`, Redmine #15183). ``--service-status`` prints a redacted
-  host-service projection (installed / loaded / pid / scheduled interval / executable-match /
-  credential readiness) + the secret-free declarative definition. ``--install`` / ``--restart`` /
-  ``--uninstall`` drive the owned services: the scheduled sweep is wired run-at-load +
-  fixed-interval (never a KeepAlive / ``Restart=`` relaunch loop) with **no** environment block in
-  any unit. They exit 0 on a performed action and non-zero on a fail-closed refusal (wrong platform,
-  no host service manager, missing executable, non-ready credential, restart-not-scheduled),
-  touching nothing but the owned labels / unit files.
+  (:mod:`...application.supervisor_launchd`, unchanged) or the owned Linux systemd **user** service
+  + timer (:mod:`...application.supervisor_systemd`, Redmine #15183 — ONE service + ONE timer
+  ticking ``--run-once`` every 60s). ``--service-status`` prints a redacted host projection
+  (installed / enabled / loaded / pid / next run / last exit result / scheduled interval /
+  executable-match / credential readiness / installed command) + the secret-free declarative
+  definition. ``--install`` / ``--restart`` / ``--uninstall`` drive the owned services: the
+  scheduled sweep is wired run-at-load + fixed-interval (never a KeepAlive / ``Restart=`` relaunch
+  loop) with **no** environment block in any unit. They exit 0 on a performed action and non-zero on
+  a fail-closed refusal (wrong platform, no host service manager, missing executable,
+  restart-not-scheduled), touching nothing but the owned labels / unit files. On Linux an
+  unconfigured Redmine does **not** block installing the timer: readiness is projected, not gated,
+  so the local work a tick can safely do keeps running.
 
 A source / store error is a ``SystemExit`` with a redacted message (never a credential / URL /
 pane id / absolute path).
@@ -275,24 +278,64 @@ def _drain_service_definition(args: argparse.Namespace):
     return build_service_definition(reconciliation_interval_seconds=interval, local_drain=True)
 
 
+def _service_status_lines(host: dict, index: int) -> list:
+    """The redacted text rows for one owned service in the status projection.
+
+    Reads only keys the adapter is guaranteed to emit, and shows the systemd-only observability
+    (next run, last exit result) when the host adapter supplies it — the acceptance contract asks an
+    operator to be able to see 導入・有効化状態 / 次回起動 / 直近の終了結果 / 実行内容 without secrets
+    (Redmine #15183). Every value here is a boolean, count, fixed token, timestamp, or a non-secret
+    argv (executable path + fixed flags + a config directory).
+    """
+    tag = f"[{index}]"
+    lines = [
+        f"{tag} service_label: {host.get('label', '')}",
+        f"{tag} installed: {host.get('installed')} loaded: {host.get('loaded')} "
+        f"pid: {host.get('pid')}",
+        f"{tag} scheduled_interval_seconds: {host.get('scheduled_interval_seconds')}",
+        f"{tag} home_pin: {host.get('home_pin')} "
+        f"executable_matches: {host.get('executable_matches')}",
+        f"{tag} keep_alive_present: {host.get('keep_alive_present')}",
+        f"{tag} credential_readiness: {host.get('credential_readiness')}",
+    ]
+    if "timer_enabled" in host:
+        lines.append(f"{tag} timer_enabled: {host['timer_enabled']}")
+    if "next_elapse" in host:
+        lines.append(f"{tag} next_elapse: {host['next_elapse']}")
+    if "last_result" in host:
+        lines.append(
+            f"{tag} last_result: {host['last_result']} "
+            f"exit_status: {host.get('last_exit_status')} at: {host.get('last_exit_at')}"
+        )
+    if "provider_reconcile_interval_seconds" in host:
+        lines.append(
+            f"{tag} provider_reconcile_interval_seconds: "
+            f"{host['provider_reconcile_interval_seconds']} (Redmine cadence; the OS tick is local)"
+        )
+    if host.get("installed_command"):
+        lines.append(f"{tag} installed_command: {' '.join(host['installed_command'])}")
+    return lines
+
+
 def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
     """The service lifecycle command contract, on whichever OS scheduler owns this host.
 
-    Redmine #14150: the split runs TWO owned bounded one-shot services — the coarse
-    provider-reconciliation one (``--run-once``) and the finer local-drain one (``--drain-only``).
-    Redmine #15183: which host adapter realizes them is resolved by platform
-    (:mod:`...application.supervisor_service_backend`) — the macOS LaunchAgent pair on darwin, the
-    systemd **user** service+timer pair on Linux — so one operator command means the same thing on
-    both, and a host with neither is a typed zero-mutation refusal rather than a silent no-op. Both
-    adapters expose the identical ``*_pair`` surface, so nothing below branches on platform; the
-    resolved ``backend`` token is carried in every payload so a reader can tell which one answered.
+    Redmine #15183: the host adapter is resolved by platform
+    (:mod:`...application.supervisor_service_backend`) so one operator command means the same thing
+    everywhere, and a host with neither adapter is a typed zero-mutation refusal rather than a
+    silent no-op. The two realizations are deliberately NOT the same shape inside — macOS keeps its
+    existing owned reconcile+drain LaunchAgent pair (out of scope to change here), while Linux runs
+    ONE systemd user service + ONE timer ticking ``--run-once`` every 60s. The backend module
+    normalizes both into an ``agents`` roster (two rows on macOS, one on Linux), so the rendering
+    below never branches on platform; the resolved ``backend`` token rides in every payload.
 
-    ``--service-status`` reports the redacted host projection of BOTH services + both secret-free
-    definitions (exit 0, mutates nothing). ``--install`` / ``--restart`` / ``--uninstall`` drive the
-    owned PAIR: install is atomic-or-nothing (a partial failure rolls the first one back), so an
-    operator never ends up with a half-installed pair. They exit 0 only when BOTH performed, and
-    non-zero on any fail-closed refusal (wrong platform / no host service manager / missing
-    executable / non-ready credential / not-scheduled), touching nothing but the owned units.
+    A 60s Linux tick is not a 60s Redmine poll: the supervisor body gates provider reads behind its
+    own durable ~300s cadence, so an in-window tick works from local state with zero provider calls.
+
+    ``--service-status`` is a redacted projection + the secret-free declarative definitions (exit 0,
+    mutates nothing). ``--install`` / ``--restart`` / ``--uninstall`` drive the owned services and
+    exit non-zero on a fail-closed refusal (wrong platform / no host service manager / missing
+    executable / not-scheduled), touching nothing but the owned artifacts.
     """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
         supervisor_service_backend,
@@ -305,37 +348,24 @@ def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
     mozyo_home = _home_from_args(args)
     definition = _service_definition(args)
     drain_definition = _drain_service_definition(args)
+    tick_interval = getattr(args, "tick_interval", None)
 
     if verb == "service-status":
-        status = supervisor_service_backend.service_status_pair(
-            mozyo_home=mozyo_home,
-            reconcile_interval_hint=definition.reconciliation_interval_seconds,
-            drain_interval_hint=drain_definition.reconciliation_interval_seconds,
+        status = supervisor_service_backend.service_status(
+            mozyo_home=mozyo_home, interval_hint=tick_interval
         )
         backend = status["backend"]
         payload = dict(status)
+        # ``phase`` names the supervisor lifecycle phase of the product (Redmine #13683 Phase B1),
+        # not the adapter shape, so it is preserved verbatim: #15183 adds a host realization and has
+        # no reason to drop a key an existing reader may consume.
         payload["phase"] = "B1"
         payload["definition"] = definition.as_payload()
         payload["drain_definition"] = drain_definition.as_payload()
-        lines = [
-            "action: service-status",
-            f"backend: {backend}",
-            "phase: B1 (dual owned one-shot service pair; #14150 / #15183)",
-        ]
-        for host, defn, kind in zip(
-            status.get("agents", ()),
-            (definition, drain_definition),
-            ("reconciliation", "drain"),
-        ):
-            lines += [
-                f"[{kind}] service_label: {host['label']}",
-                f"[{kind}] installed: {host['installed']} loaded: {host['loaded']} pid: {host['pid']}",
-                f"[{kind}] scheduled_interval_seconds: {host['scheduled_interval_seconds']}",
-                f"[{kind}] home_pin: {host['home_pin']} executable_matches: {host['executable_matches']}",
-                f"[{kind}] keep_alive_present: {host['keep_alive_present']}",
-                f"[{kind}] credential_readiness: {host['credential_readiness']}",
-                f"[{kind}] command: {' '.join(defn.command)}",
-            ]
+        lines = ["action: service-status", f"backend: {backend}"]
+        for index, host in enumerate(status.get("agents", ())):
+            lines += _service_status_lines(host, index)
+        lines.append(f"definition_command: {' '.join(definition.command)}")
         if backend == supervisor_service_backend.BACKEND_UNSUPPORTED:
             lines.append(
                 f"reason: {supervisor_service_backend.REASON_NO_BACKEND} "
@@ -345,15 +375,13 @@ def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
         return 0
 
     if verb == "install":
-        result = supervisor_service_backend.install_pair(
-            mozyo_home=mozyo_home,
-            reconcile_interval_seconds=definition.reconciliation_interval_seconds,
-            drain_interval_seconds=drain_definition.reconciliation_interval_seconds,
+        result = supervisor_service_backend.install(
+            mozyo_home=mozyo_home, interval_seconds=tick_interval
         )
     elif verb == "restart":
-        result = supervisor_service_backend.restart_pair(mozyo_home=mozyo_home)
+        result = supervisor_service_backend.restart(mozyo_home=mozyo_home)
     else:  # uninstall
-        result = supervisor_service_backend.uninstall_pair()
+        result = supervisor_service_backend.uninstall()
 
     payload = dict(result)
     performed = bool(result.get("performed"))
@@ -366,13 +394,17 @@ def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
         lines.append(f"reason: {result['reason']}")
     if result.get("rolled_back"):
         lines.append("rolled_back: True (partial-failure fail-closed)")
+    if result.get("scheduled_interval_seconds"):
+        lines.append(f"scheduled_interval_seconds: {result['scheduled_interval_seconds']}")
     for a in result.get("agents", []):
-        detail = f"  agent {a.get('label', '')}: performed={a.get('performed')}"
+        detail = f"  service {a.get('label', '')}: performed={a.get('performed')}"
         if a.get("reason"):
             detail += f" reason={a['reason']}"
         if "removed" in a:
             detail += f" removed={a['removed']}"
         if "credential_readiness" in a:
+            # Reported, not gated on Linux: an unconfigured Redmine does not block installing the
+            # timer, so an operator sees the state without the install being refused (#15183).
             detail += f" credential_readiness={a['credential_readiness']}"
         lines.append(detail)
     _emit(payload, as_json=as_json, text_lines=lambda: lines)
@@ -500,12 +532,15 @@ def register_supervisor(workflow_sub) -> None:
             "duplicate-supervisor fence); `--wake WORKSPACE:ISSUE` switches to local_wake mode. "
             "`--status` is a read-only registry / lease / backlog view. The service lifecycle "
             "contract (`--service-status` / `--install` / `--restart` / `--uninstall`) runs on the "
-            "OS scheduler that owns this host: the macOS LaunchAgent pair, or the Linux systemd "
-            "user service+timer pair (#15183). `--service-status` is a redacted projection + "
-            "secret-free definition; the mutating verbs drive the one-shot run-at-load + "
-            "fixed-interval services (no KeepAlive / Restart= relaunch loop, no environment block) "
-            "and fail-closed on a wrong platform / no host service manager / missing executable / "
-            "non-ready credential."
+            "OS scheduler that owns this host: the macOS LaunchAgent pair, or ONE Linux systemd "
+            "user service + timer ticking `--run-once` every 60s (#15183; Redmine reads stay on "
+            "the supervisor's own ~300s cadence, so an in-window tick is local-only). "
+            "`--service-status` is a redacted projection (installed / enabled / next run / last "
+            "exit result / installed command) + secret-free definition; the mutating verbs drive "
+            "the one-shot run-at-load + fixed-interval services (no KeepAlive / Restart= relaunch "
+            "loop, no environment block) and fail-closed on a wrong platform / no host service "
+            "manager / missing executable. An unconfigured Redmine does not block installing the "
+            "Linux timer."
         ),
         help=(
             "Workspace callback supervisor: run-once / status / service lifecycle contract. "
@@ -591,6 +626,15 @@ def register_supervisor(workflow_sub) -> None:
         help="Local-drain interval seconds for the service definition (Redmine #14150; default: "
              "portable default). Finer than the reconciliation cadence — the local drain reads no "
              "provider, so it delivers already-safe pending rows more promptly at zero provider cost.",
+    )
+    p.add_argument(
+        "--tick-interval", dest="tick_interval", type=int, default=None,
+        help="OS tick cadence in seconds for the installed scheduler (Redmine #15183; Linux "
+             "systemd user timer default 60). This is the LOCAL cadence: each tick runs one bounded "
+             "`--run-once` sweep over SQLite + Herdr. It does NOT set the Redmine cadence — the "
+             "supervisor gates provider reads behind its own ~300s watermark, so a tick inside that "
+             "window makes zero provider calls. Ignored by the macOS LaunchAgent pair, which keeps "
+             "its own reconcile / drain cadences.",
     )
     p.add_argument("--json", action="store_true", dest="as_json", help="Emit a structured JSON result.")
     p.add_argument("--home", default=None, help=argparse.SUPPRESS)  # test/debug: override mozyo home

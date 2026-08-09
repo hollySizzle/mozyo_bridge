@@ -466,9 +466,7 @@ class LiveOfflineRolloutExecutionPort:
         return read_herdr_inventory(repo, env=self.env)
 
     def _supervisor_stop(self, _phase, _action, _directory):
-        # Redmine #15183: dispatch to whichever OS scheduler owns this host (LaunchAgent /
-        # systemd user timer) instead of binding the rollout to macOS.
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_service_backend import (  # noqa: E501
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd import (  # noqa: E501
             service_status_pair,
             uninstall_pair,
         )
@@ -906,7 +904,7 @@ class LiveOfflineRolloutExecutionPort:
         return _ok(live_names_verified=True)
 
     def _supervisor_install(self, _phase, action, _directory):
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_service_backend import (  # noqa: E501
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd import (  # noqa: E501
             install_pair,
         )
 
@@ -921,12 +919,10 @@ class LiveOfflineRolloutExecutionPort:
         return _ok(supervisors_installed=True)
 
     def _supervisor_readback(self, _phase, action, _directory):
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_service_backend import (  # noqa: E501
-            service_status_pair,
-        )
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_service_common import (  # noqa: E501
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd import (  # noqa: E501
             CREDENTIAL_READY,
             HOME_PIN_OK,
+            service_status_pair,
         )
 
         target_cli = self._bindings(action)["target_cli"]
