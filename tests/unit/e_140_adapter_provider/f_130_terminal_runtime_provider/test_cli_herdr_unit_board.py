@@ -1174,6 +1174,7 @@ class HerdrUnitBoardCliTests(unittest.TestCase):
         args = self.parser().parse_args(["herdr", "unit-board", "interact"])
         board = runtime((row("codex", "w1:p2"),))
         placement = object()
+        column_actions = object()
         ui = mock.Mock()
         ui.run.return_value = 0
 
@@ -1184,17 +1185,27 @@ class HerdrUnitBoardCliTests(unittest.TestCase):
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board.production_live_pair_placement",
             return_value=placement,
         ), mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board.load_coordinator_placement_for_launch",
+            return_value=SimpleNamespace(top_workspace_id="top-workspace"),
+        ), mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board.resolve_unit_board_binary",
+            return_value="/bin/herdr",
+        ), mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board._UnitColumnPlacementActions",
+            return_value=column_actions,
+        ) as column_factory, mock.patch(
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board.HerdrUnitBoardPlacementUI",
             return_value=ui,
         ) as factory:
             result = args.func(args)
 
         self.assertEqual(result, 0)
-        factory.assert_called_once()
-        composed = factory.call_args.args
-        self.assertEqual(composed[:2], (board, placement))
-        self.assertEqual(len(composed), 3)
-        self.assertIsNotNone(composed[2])
+        column_factory.assert_called_once_with(
+            board,
+            binary="/bin/herdr",
+            top_workspace_id="top-workspace",
+        )
+        factory.assert_called_once_with(board, placement, column_actions)
         ui.run.assert_called_once_with()
 
     def test_interact_runtime_failure_never_resolves_placement(self) -> None:
