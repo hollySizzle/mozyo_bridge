@@ -3958,14 +3958,21 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "parsed through superseded_failure_correlation's single-scan reader (so the "
             "exactly-one-marker rule is that module's); renders the declaration marker itself",
         ),
+        f"{_D}/domain/superseded_audit_failure_producer.py": (
+            ["*", "*", "*", "*"],
+            "renders (Redmine #15166): the audit-failure terminal declaration marker, split out of "
+            "the terminal module when the j#102184 typed-refusal wiring pushed it past the "
+            "oversized-module gate. Reads no note; the emitted body is byte-identical to what the "
+            "terminal module's strict reader accepts, by construction",
+        ),
         f"{_D}/domain/superseded_audit_failure_terminal.py": (
-            ["*", "*", "*", "*", "*", "*"],
+            ["*", "*", "*"],
             "reads (Redmine #15166): the audit-failure terminal declaration gate, located and "
             "parsed through superseded_failure_correlation's single-scan reader (so the "
             "exactly-one-marker rule is that module's — a second declaration of the gate, or one "
             "it names but cannot read, poisons the note for the gate rather than yielding the "
-            "readable sibling); renders that marker itself through the lane envelope's own "
-            "renderer and the shared separator guard. It also RE-EXPORTS the successor "
+            "readable sibling). The declaration RENDERER now lives in the producer module above "
+            "and is re-exported here. It also RE-EXPORTS the successor "
             "acknowledgement names from the sibling correlation module below, which is where that "
             "second gate's grammar now lives",
         ),
@@ -4078,7 +4085,7 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
     #: over-detection costs a declaration line, a missed reader costs a silent gate.
     INHERITED = {
         f"{_D}/application/retire_superseded_audit_failure.py": (
-            ['*', '*'],
+            ['*'],
             "inherits via a used import of superseded_audit_failure_terminal (Redmine #15166); "
             "names no marker token itself and reads no note directly — it measures the live "
             "histories, both issues' current tracker status, the named audit journal's shape and "

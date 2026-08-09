@@ -26,45 +26,34 @@ So this is a FIFTH independent route to the same one boolean, and like the other
 ever ADMIT — none of them can weaken another, and a lane that fails all five is blocked exactly as
 it was before any of them existed.
 
-**What this route rests on: a coordinator DECISION recorded at the mozyo command boundary.** Three
-review rounds established why nothing read from the journals can carry that weight, each refuting
-the previous answer with a measurement:
+**CURRENT STATE: this route admits NOTHING.** See :data:`RECEIPT_AUTHORITY_RESOLVABLE`. Everything
+below is fully implemented and tested but deliberately inert, because the one fact it depends on —
+that the writer of the coordinator decision REALLY WAS the coordinator runtime — cannot be
+established with any primitive this workspace has today. Five rounds of review each refuted a
+different answer to that question by measurement; the coordinator's ruling on design consultation
+j#102184 is to hold the route as a typed refusal until #15195 "Herdr runtime 発行の action-bound
+coordinator receipt を実装する" supplies a receipt the writer can verify. #15195 blocks this issue
+(relation #3308). The rest of this docstring therefore describes the contract that will admit once
+that receipt exists — not a working admission path, and nothing here currently defends anything.
 
-- R1 rested the admission on the SOURCE declaration and the SUCCESSOR acknowledgement corroborating
-  each other. Review j#101880 finding 1 refuted it: neither record can be authenticated (ruling
-  #14219 j#86718 — every role posts under one source-system account) and the correlation they
-  assert exists NOWHERE ELSE, so one writer can place both. That is the exact shape
-  :mod:`.no_change_review_waiver` refuses permanently (``WRITER_AUTHORITY_RESOLVABLE``).
-- R2 moved the weight onto "the successor's approved Review Gate examined this lane's exact head".
-  Review j#101909 finding 1 refuted that too, and the refutation is the decisive one: **on a
-  zero-change lane, head equality is nearly free.** A lane that never committed sits ON the
-  integration head, so every approved review of every unrelated issue based on that head shares it.
-  The reviewer reproduced it — a successor review whose body names entirely unrelated work still
-  admitted. Head coverage bounds WHICH REPOSITORY STATE is involved; it says nothing about WHOSE
-  work was reviewed.
+**What this route rests on: a coordinator DECISION recorded at the mozyo command boundary.** The
+binding between "this audit failure" and "that successor's acceptance" is a coordinator judgement,
+not something derivable from the journals — five review rounds each refuted a different attempt to
+derive it, and the measurements, the options weighed and the ruling live in one place rather than
+being restated here: ``vibes/docs/logics/coordinator-sublane-development-flow.md``, section
+"正式 Review Gate を持たない audit failure lane の terminal retire (#15166)".
 
-- R3 enumerated the permitted tuples in code. Review j#102074 finding 1 found the enumeration was
-  ALSO reachable as a keyword argument on the decision API, and scope decision j#102081 then ruled
-  the enumeration itself out on different grounds: fixing issue ids in the package makes every
-  future lane of this shape a product change, which is an individual migration rather than a
-  supported rail.
-
-What remains, after all three, is that **no durable record in this workspace can bind "this audit
-failure" to "that successor's acceptance"**. That binding is a coordinator JUDGEMENT — and
-``managed-state-model.md`` already says where a judgement taken at a mozyo command boundary lives.
-Its ``state_kinds`` table makes ``desired_state`` ("mozyo が command 境界で作成/採用/mark/rename
-しようとした構成・意図") authoritative for mozyo-owned persisted state, and defines
-``side_effect_permission`` as exactly the conjunction this route needs: "persisted desired state +
-durable workflow gate + action-time live preflight を照合した結果".
-
-So the binding is a :class:`CoordinatorTerminalDecision`, recorded through
-``mozyo-bridge sublane audit-failure-terminal record`` into the mozyo-owned store
-:mod:`mozyo_bridge.core.state.audit_failure_terminal_decision`, and re-measured here against every
-independent source. A lane with no recorded decision is refused
-(:data:`REASON_NO_COORDINATOR_DECISION`); a decision that does not match what the retire measures
-is refused as drift. **No sequence of Redmine journal writes produces such a record** — that is the
-property all three refuted attempts lacked, and it is the whole of the claim. It does NOT
-authenticate a human; nothing here can, and the gap is unchanged.
+What the code needs to say is where the judgement lives. ``managed-state-model.md``'s
+``state_kinds`` table makes ``desired_state`` — "mozyo が command 境界で作成/採用/mark/rename
+しようとした構成・意図" — authoritative for mozyo-owned persisted state, and defines
+``side_effect_permission`` as exactly this route's conjunction: "persisted desired state + durable
+workflow gate + action-time live preflight を照合した結果". So the binding is a
+:class:`CoordinatorTerminalDecision`, recorded through
+``mozyo-bridge sublane audit-failure-terminal record`` into
+:mod:`mozyo_bridge.core.state.audit_failure_terminal_decision` and re-measured here against every
+independent source. No sequence of Redmine journal writes produces such a record. What it does NOT
+do is authenticate the writer — that is the gap :data:`RECEIPT_AUTHORITY_RESOLVABLE` names, and the
+reason this route is inert.
 
 **Single use is the lifecycle revision, not a second ledger.** The decision is bound to the lane's
 exact ``lane_generation`` AND ``revision`` at decision time, and every retire that mutates the lane
@@ -72,11 +61,9 @@ row advances that revision through the existing CAS. One decision therefore auth
 mutation, using the lifecycle generation the design direction (j#102092) names as a canonical
 source rather than a consumption ledger that could disagree with it.
 
-**The domain holds no authority a caller can replace** (review j#102074 finding 1). R3 exposed the
-enumeration as a keyword argument, arguing the application never passed it; the reviewer passed one
-and it admitted. The decision now arrives as a MEASUREMENT, exactly like ``live_head`` and
-``expected_workspace`` — the application reads it from the store and from nowhere else — and this
-module keeps no default authority at all.
+**The domain holds no authority a caller can replace** (review j#102074 finding 1). The decision
+arrives as a MEASUREMENT, exactly like ``live_head`` and ``expected_workspace`` — the application
+reads it from the store and from nowhere else — and this module keeps no default authority at all.
 
 Everything below is retained as a CONJUNCT on top of that decision — never a substitute for it. The
 decision says which lane may converge; the conjuncts say the record and the repository still agree
@@ -153,6 +140,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     fold_audit_supersession_acknowledgement,
     render_audit_supersession_acknowledgement_marker,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.superseded_audit_failure_producer import (  # noqa: E501  (re-export)
+    render_superseded_audit_failure_marker,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.superseded_failure_correlation import (  # noqa: E501
     journal_ref,
     one_canonical_marker,
@@ -169,6 +159,21 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REASON_WORKTREE_NOT_CLEAN,
     SuccessorEvidence,
 )
+
+#: Whether a receipt establishing that the decision's WRITER was the coordinator runtime can be
+#: verified here. It cannot, so this route admits nothing (coordinator ruling on consultation
+#: j#102184, following the #14695 ``WRITER_AUTHORITY_RESOLVABLE`` precedent).
+#:
+#: The measurements that ruled out every alternative — mutual acknowledgement, head coverage, an
+#: in-package enumeration, and a decision store whose writer attestation reads only material the
+#: caller can itself create — are recorded once, in the canonical doc section the module docstring
+#: names. They are not restated here.
+#:
+#: This is deliberately ONE flag rather than a condition spread through the consumers: when #15195
+#: lands, flipping this — and verifying that receipt inside the writer — is the whole change. Every
+#: fold, fence and probe below stays live and tested meanwhile, so a record can still be diagnosed
+#: and what lands then is an authority check, not a re-implementation.
+RECEIPT_AUTHORITY_RESOLVABLE = False
 
 #: The gate token this authority is declared under. Named per SURFACE, like every other authority
 #: gate in this context: a terminal for a lane that never had a Review Gate can never be read as a
@@ -489,6 +494,12 @@ REASON_SUCCESSOR_IS_SELF = "superseded_audit_failure_successor_is_the_same_issue
 #: surface itself could not be trusted. This is the ONE refusal no durable record can talk its way
 #: past, because no sequence of journal writes produces a decision record.
 REASON_NO_COORDINATOR_DECISION = "no_recorded_coordinator_terminal_decision"
+#: The PERMANENT, structural refusal (:data:`RECEIPT_AUTHORITY_RESOLVABLE`): every other conjunct
+#: passed, and the route still cannot admit because nothing here can establish that the decision's
+#: writer was the coordinator runtime. Reported LAST so a record's own defects are diagnosed on
+#: their own terms first — this reason means "the record is fine; the authority is not available",
+#: which sends an operator to #15195 rather than back to the record.
+REASON_RECEIPT_AUTHORITY_UNRESOLVED = "coordinator_receipt_authority_unresolvable"
 #: A decision IS recorded, but it is not about the world the retire measured — a different issue,
 #: audit journal, successor, review journal, lane, generation, head or integration branch. Drift
 #: since the decision was taken, or a decision about another terminal entirely.
@@ -533,6 +544,7 @@ SUPERSEDED_AUDIT_FAILURE_REFUSAL_REASONS: frozenset[str] = frozenset(
         REASON_RECORD_DECLARES_CHANGE,
         REASON_SUCCESSOR_IS_SELF,
         REASON_NO_COORDINATOR_DECISION,
+        REASON_RECEIPT_AUTHORITY_UNRESOLVED,
         REASON_DECISION_DRIFTED,
         REASON_DECISION_STALE_REVISION,
         REASON_SUCCESSOR_NOT_ACKNOWLEDGED,
@@ -616,16 +628,10 @@ def evaluate_superseded_audit_failure_admissible(
         recorded against, the worktree is proven CLEAN, and it carries no commit the integration
         branch lacks.
 
-    **Why (8) is a decision and not a rule.** Three rounds tried to derive the binding between this
-    audit failure and that successor's acceptance, and each was refuted: R1's mutual acknowledgement
-    (review j#101880 finding 1 — one unauthenticatable writer can place both halves), R2's head
-    coverage (review j#101909 finding 1 — on a zero-change lane the lane head IS the integration
-    head, so every unrelated approved issue on that base shares it), and R3's in-package
-    enumeration (review j#102074 finding 1 reached it as an argument; scope decision j#102081 ruled
-    out enumerating issue ids at all, since that makes every future lane a product change). The
-    binding is a coordinator judgement, and ``managed-state-model.md`` places a judgement taken at
-    a mozyo command boundary in ``desired_state``, whose authority is mozyo-owned persisted state —
-    so it is recorded there, where no journal write can reach it.
+    **Why (8) is a decision and not a rule.** Three attempts to derive that binding from records
+    were each refuted by measurement, and the module docstring points at the canonical doc section
+    that records them. The binding is a coordinator judgement, and ``managed-state-model.md`` places
+    a judgement taken at a mozyo command boundary in ``desired_state``.
 
     (6) and (9) and (10) still bound the consequence: the record declares no change, the reviewed
     head is the lane head, and the lane carries zero commits over the integration branch with a
@@ -835,106 +841,18 @@ def evaluate_superseded_audit_failure_admissible(
     if live_commits_ahead != 0:
         return AdmissionResult(False, REASON_LANE_NOT_INTEGRATED)
 
+    # LAST, so every conjunct above reports its own reason first and a record stays diagnosable.
+    # What this refuses is not the record but the missing authority: nothing here can establish
+    # that the decision's writer was the coordinator runtime (:data:`RECEIPT_AUTHORITY_RESOLVABLE`).
+    if not RECEIPT_AUTHORITY_RESOLVABLE:
+        return AdmissionResult(False, REASON_RECEIPT_AUTHORITY_UNRESOLVED)
+
     return AdmissionResult(True, REASON_OK)
 
 
 # ---------------------------------------------------------------------------
 # The producers. A contract nobody can write is a contract nobody will use.
 # ---------------------------------------------------------------------------
-
-
-def render_superseded_audit_failure_marker(
-    *,
-    issue: str,
-    audit_journal: object,
-    successor_issue: str,
-    successor_review_journal: object,
-    integration_branch: str,
-    workspace: str,
-    lane: str,
-    lane_generation: object,
-    head: str,
-) -> str:
-    """The exact marker a valid audit-failure terminal declaration must carry (pure).
-
-    Field order is :data:`SUPERSEDED_AUDIT_FAILURE_FIELD_ORDER`, so what this emits is what the
-    strict reader accepts, by construction.
-
-    Every producer error raises ``ValueError`` rather than being written. A renderer that accepts
-    what its own parser refuses is not a strict grammar: it produces durable records that read back
-    as a typed zero, so the authority silently does not count. The envelope's own
-    :func:`...hibernate_evidence_envelope.render_lane_envelope` enforces the workspace / lane /
-    generation / head rules and the marker-separator rejection; this adds the identities.
-    """
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_envelope import (  # noqa: E501
-        reject_marker_separator,
-        render_lane_envelope,
-    )
-
-    issue_s = str(issue or "").strip()
-    successor_s = str(successor_issue or "").strip()
-    branch_s = str(integration_branch or "").strip()
-    if not issue_s or not successor_s:
-        raise ValueError(
-            "an audit-failure terminal requires a non-empty issue and successor_issue"
-        )
-    if issue_s == successor_s:
-        raise ValueError("an issue cannot supersede its own independent-audit failure")
-    if not branch_s:
-        raise ValueError("an audit-failure terminal requires the integration branch")
-    for value, field in (
-        (issue_s, "issue"),
-        (successor_s, "successor_issue"),
-        (branch_s, "integration_branch"),
-    ):
-        reject_marker_separator(value, field=field)
-
-    supplied = {
-        "audit_journal": audit_journal,
-        "successor_review_journal": successor_review_journal,
-    }
-    references = {field: journal_ref(raw) for field, raw in supplied.items()}
-    for field, value in references.items():
-        if not value:
-            raise ValueError(
-                f"an audit-failure terminal requires a decimal {field}, got {supplied[field]!r}"
-            )
-
-    if isinstance(lane_generation, bool):
-        raise ValueError("an audit-failure terminal requires an integer lane_generation")
-    try:
-        generation = int(lane_generation)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        raise ValueError(
-            "an audit-failure terminal requires an integer lane_generation, "
-            f"got {lane_generation!r}"
-        ) from None
-    if not str(head or "").strip():
-        raise ValueError(
-            "an audit-failure terminal requires the lane head it was recorded at"
-        )
-    envelope_body = render_lane_envelope(
-        LaneEvidenceEnvelope(
-            workspace=str(workspace or "").strip(),
-            lane=str(lane or "").strip(),
-            lane_generation=generation,
-            head=str(head or "").strip(),
-        )
-    )
-    body = ":".join(
-        [
-            f"gate={SUPERSEDED_AUDIT_FAILURE_GATE}",
-            f"version={SUPERSEDED_AUDIT_FAILURE_VERSION}",
-            f"decision={SUPERSEDED_AUDIT_FAILURE_DECISION}",
-            f"issue={issue_s}",
-            f"audit_journal={references['audit_journal']}",
-            f"successor_issue={successor_s}",
-            f"successor_review_journal={references['successor_review_journal']}",
-            f"integration_branch={branch_s}",
-            envelope_body,
-        ]
-    )
-    return f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:{body}]"
 
 
 
@@ -959,6 +877,7 @@ __all__ = (
     "REASON_DECISION_DRIFTED",
     "REASON_DECISION_STALE_REVISION",
     "REASON_NO_COORDINATOR_DECISION",
+    "REASON_RECEIPT_AUTHORITY_UNRESOLVED",
     "REASON_NOT_RECORDED",
     "REASON_RECORD_DECLARES_CHANGE",
     "REASON_REVIEW_ROUND_RECORDED",
@@ -980,6 +899,7 @@ __all__ = (
     "SUPERSEDED_AUDIT_FAILURE_STATES",
     "SUPERSEDED_AUDIT_FAILURE_VERSION",
     "CoordinatorTerminalDecision",
+    "RECEIPT_AUTHORITY_RESOLVABLE",
     "SupersededAuditFailureFacts",
     "TrackerIssueStatus",
     "evaluate_superseded_audit_failure_admissible",

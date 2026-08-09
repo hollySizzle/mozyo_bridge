@@ -122,6 +122,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REASON_DECISION_DRIFTED,
     REASON_DECISION_STALE_REVISION,
     REASON_NO_COORDINATOR_DECISION,
+    REASON_RECEIPT_AUTHORITY_UNRESOLVED,
     REASON_NOT_RECORDED,
     REASON_RECORD_DECLARES_CHANGE,
     REASON_REVIEW_ROUND_RECORDED,
@@ -135,6 +136,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SUCCESSOR_ACK_GATE,
     SUPERSEDED_AUDIT_FAILURE_FIELD_ORDER,
     SUPERSEDED_AUDIT_FAILURE_GATE,
+    RECEIPT_AUTHORITY_RESOLVABLE,
     CoordinatorTerminalDecision,
     SUPERSEDED_AUDIT_FAILURE_REFUSAL_REASONS,
     TrackerIssueStatus,
@@ -428,10 +430,15 @@ def admit(
 class TheReproductionConverges(unittest.TestCase):
     """#15164's shape, once declared and correlated, reaches the terminal."""
 
-    def test_the_positive_control_actually_admits(self):
+    def test_the_fully_correlated_record_reaches_the_authority_and_stops_there(self):
+        # The route admits NOTHING today (coordinator ruling on j#102184). What the reproduction
+        # still demonstrates is that every OTHER conjunct passes — the refusal is the missing
+        # receipt authority, not the record — which is exactly what makes flipping
+        # ``RECEIPT_AUTHORITY_RESOLVABLE`` when #15195 lands an authority check rather than a
+        # re-implementation.
         outcome = admit()
-        self.assertTrue(outcome.admissible, outcome.reason)
-        self.assertEqual(outcome.reason, REASON_OK)
+        self.assertFalse(outcome.admissible)
+        self.assertEqual(outcome.reason, REASON_RECEIPT_AUTHORITY_UNRESOLVED)
 
     def test_the_record_still_carries_no_approval_of_its_own(self):
         # The point of the whole route: admitting must not have minted, borrowed or implied an
@@ -733,7 +740,7 @@ class TheSuccessorMustAcknowledgeAndHaveSucceeded(unittest.TestCase):
 
     def test_every_single_acknowledgement_field_mutation_breaks_the_correlation(self):
         base = acknowledgement_marker()
-        self.assertTrue(admit().admissible)
+        self.assertEqual(admit().reason, REASON_RECEIPT_AUTHORITY_UNRESOLVED)
         for field in SUCCESSOR_ACK_FIELD_ORDER:
             with self.subTest(field=field):
                 mutated = _mutate(base, field, _ACK_REPLACEMENTS)
@@ -870,6 +877,49 @@ class OnlyARecordedCoordinatorDecisionConverges(unittest.TestCase):
     def test_the_decision_default_is_the_unrecorded_one(self):
         # A fence input whose default admitted would be a fence that defaults open.
         self.assertFalse(CoordinatorTerminalDecision().recorded)
+
+
+class TheRouteAdmitsNothingUntilTheReceiptAuthorityExists(unittest.TestCase):
+    """Coordinator ruling on consultation j#102184: hold as a typed refusal, do not guess again."""
+
+    def test_the_receipt_authority_is_declared_unresolvable(self):
+        self.assertFalse(RECEIPT_AUTHORITY_RESOLVABLE)
+
+    def test_no_input_admits(self):
+        # The whole point of the ruling: there is no record, no live state and no decision that
+        # turns this route into an admission today.
+        for kwargs in (
+            {},
+            {"source": source_journals(marker=declaration_marker())},
+            {"successor": successor_journals(ack=acknowledgement_marker())},
+        ):
+            with self.subTest(**{k: "…" for k in kwargs}):
+                self.assertFalse(admit(**kwargs).admissible)
+
+    def test_the_permanent_refusal_is_reported_last(self):
+        # A record's own defect is diagnosed on its own terms; only a record with nothing left to
+        # fix reports the missing authority. Getting this backwards would send an operator to
+        # #15195 for a problem that is actually in their record.
+        self.assertEqual(admit(worktree_clean=False).reason, REASON_WORKTREE_NOT_CLEAN)
+        self.assertEqual(admit(commits_ahead=1).reason, REASON_LANE_NOT_INTEGRATED)
+        self.assertEqual(
+            admit(decision=CoordinatorTerminalDecision()).reason,
+            REASON_NO_COORDINATOR_DECISION,
+        )
+        self.assertEqual(admit().reason, REASON_RECEIPT_AUTHORITY_UNRESOLVED)
+
+    def test_flipping_the_flag_would_be_the_whole_change(self):
+        # The contract stays live and tested underneath, so #15195 lands an authority check rather
+        # than a re-implementation. Measured by patching the ONE flag: everything else already
+        # passes for the reproduction.
+        with mock.patch.object(terminal_module, "RECEIPT_AUTHORITY_RESOLVABLE", True):
+            outcome = admit()
+        self.assertTrue(outcome.admissible, outcome.reason)
+        self.assertEqual(outcome.reason, REASON_OK)
+
+    def test_the_other_routes_are_still_untouched(self):
+        # An inert route must not have weakened its siblings on the way in.
+        self.assertFalse(WRITER_AUTHORITY_RESOLVABLE)
 
 
 class TheDecisionStoreIsTheWriterHalf(unittest.TestCase):
@@ -1200,7 +1250,7 @@ class TheApprovalMustHaveExaminedThisLaneHead(unittest.TestCase):
         # lane holds" is a measurement rather than a claim.
         moved = admit(live_head="0" * 40)
         self.assertEqual(moved.reason, REASON_POST_DECLARATION_MUTATION)
-        self.assertTrue(admit().admissible)
+        self.assertEqual(admit().reason, REASON_RECEIPT_AUTHORITY_UNRESOLVED)
 
     def test_an_arbitrary_non_audit_journal_no_longer_carries_admission_weight(self):
         # The finding's other repro: a plain progress memo named as the audit record. The route
@@ -1211,7 +1261,7 @@ class TheApprovalMustHaveExaminedThisLaneHead(unittest.TestCase):
             marker=declaration_marker(),
             audit="## 進捗メモ\n\n単なる進捗メモです。監査結果ではありません。\n",
         )
-        self.assertTrue(admit(source=memo).admissible)
+        self.assertEqual(admit(source=memo).reason, REASON_RECEIPT_AUTHORITY_UNRESOLVED)
         # …and stripping the head coverage from that same record refuses it, which is the point:
         # the pointer never was what made it safe.
         self.assertEqual(
@@ -1339,7 +1389,7 @@ class TheDeclarationGrammarIsClosed(unittest.TestCase):
         # A DERIVED oracle, not a list of examples: the field set comes from the contract itself,
         # so a field added later is covered without editing this test.
         base = declaration_marker()
-        self.assertTrue(admit().admissible)
+        self.assertEqual(admit().reason, REASON_RECEIPT_AUTHORITY_UNRESOLVED)
         for field in SUPERSEDED_AUDIT_FAILURE_FIELD_ORDER:
             with self.subTest(field=field):
                 mutated = _mutate(base, field, _DECLARATION_REPLACEMENTS)
@@ -1543,6 +1593,7 @@ def _EVERY_REFUSAL_FIXTURE():
         ),
         admit(source=source_journals(marker=declaration_marker(), implementation_commit="a" * 40)),
         admit(source=source_journals(marker=self_successor)),
+        admit(),
         admit(decision=CoordinatorTerminalDecision()),
         admit(
             source=source_journals(marker=declaration_marker(successor_issue="14999")),
@@ -1735,8 +1786,8 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
                 SUCCESSOR: successor_journals(ack=acknowledgement_marker(), reviewed_head=head),
             }
             outcome = self._resolve_with(records, worktree=tmp, home=_home(tmp, head))
-            self.assertTrue(outcome.admissible, outcome.reason)
-            self.assertEqual(outcome.reason, REASON_OK)
+            self.assertFalse(outcome.admissible)
+            self.assertEqual(outcome.reason, REASON_RECEIPT_AUTHORITY_UNRESOLVED)
 
     def test_a_dirty_real_checkout_refuses_end_to_end(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1890,7 +1941,8 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
                     target=RetireEvidenceTarget(WORKSPACE, LANE, GENERATION, "pointer", 1),
                     repo_root=Path(tmp),
                 )
-        self.assertTrue(outcome.admissible, outcome.reason)
+        self.assertFalse(outcome.admissible)
+        self.assertEqual(outcome.reason, REASON_RECEIPT_AUTHORITY_UNRESOLVED)
 
     def test_without_any_measured_route_the_operator_assertion_still_decides(self):
         # The pre-existing contract, unchanged: no measured input supplied -> the durable-record
