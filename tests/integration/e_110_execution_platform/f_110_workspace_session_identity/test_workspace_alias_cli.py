@@ -14,11 +14,14 @@ from __future__ import annotations
 import io
 import json
 import os
+import stat
 import subprocess
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 from mozyo_bridge.application.cli import build_parser
 from mozyo_bridge.core.state.workspace_registry import ANCHOR_SCHEMA_VERSION
@@ -28,9 +31,15 @@ from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.doma
     REASON_DECLARATION_INVALID,
     REASON_DECLARATION_UNREADABLE,
     REASON_NOT_REGULAR_FILE,
+    REASON_PARENT_DRIFT,
+    REASON_READBACK_FAILED,
     REASON_REMOVE_FAILED,
+    REASON_UNSUPPORTED_SCHEMA,
     REASON_TARGET_IDENTITY_UNRESOLVED,
     REASON_TARGET_MISSING,
+)
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.infrastructure import (  # noqa: E501
+    workspace_alias_store as store,
 )
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.infrastructure.workspace_alias_store import (  # noqa: E501
     alias_path,
@@ -365,6 +374,175 @@ class WorkspaceAliasCliFilesystemSafetyTests(WorkspaceAliasCliTestCase):
         )
         self.assertEqual(code, 1)
         self.assertEqual(payload["reason"], REASON_DECLARATION_UNREADABLE)
+
+
+class WorkspaceAliasRaceAndTypeTests(WorkspaceAliasCliTestCase):
+    """Review j#102140 Findings 1–4, driven through the public CLI."""
+
+    def _write_raw(self, payload: object) -> None:
+        path = alias_path(self.nested)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    # --- F1: the pinned parent stopped being the visible one ----------------
+
+    def test_parent_directory_drift_is_refused_and_leaves_nothing_visible(self) -> None:
+        """A dirfd survives a rename, so a write can land in a detached directory.
+
+        Without the drift check the CLI reported success while the
+        workspace-visible path had no declaration at all.
+        """
+        real_open = store._open_parent
+
+        def drifting(repo_root, *, create):
+            fd = real_open(repo_root, create=create)
+            parent = Path(repo_root) / ".mozyo-bridge"
+            os.rename(parent, Path(repo_root) / ".mozyo-bridge.detached")
+            parent.mkdir()
+            return fd
+
+        (self.nested / ".mozyo-bridge").mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(store, "_open_parent", drifting):
+            code, payload = self.run_cli(
+                "workspace", "alias", "disable", "--repo", str(self.nested)
+            )
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["reason"], REASON_PARENT_DRIFT)
+        self.assertFalse(payload["mutated"])
+        self.assertFalse(alias_path(self.nested).exists())
+
+    # --- F2: a post-replace verification failure must not destroy content ---
+
+    def test_readback_failure_restores_the_previous_declaration(self) -> None:
+        self.run_cli(
+            "workspace", "alias", "disable",
+            "--repo", str(self.nested), "--reason", "ORIGINAL",
+        )
+        before = alias_path(self.nested).read_text(encoding="utf-8")
+
+        with mock.patch.object(
+            store, "_read_with_dirfd",
+            return_value=store.refused("simulated", "verification failed"),
+        ):
+            code, payload = self.run_cli(
+                "workspace", "alias", "disable",
+                "--repo", str(self.nested), "--reason", "REPLACEMENT",
+            )
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["reason"], REASON_READBACK_FAILED)
+        self.assertFalse(payload["mutated"])
+        self.assertEqual(alias_path(self.nested).read_text(encoding="utf-8"), before)
+        self.assertNotIn("REPLACEMENT", before)
+        # The operator-facing wording must describe the real effective state.
+        self.assertIn("unchanged", payload["detail"])
+
+    def test_readback_failure_with_no_previous_declaration_stays_absent(self) -> None:
+        (self.nested / ".mozyo-bridge").mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(
+            store, "_read_with_dirfd",
+            return_value=store.refused("simulated", "verification failed"),
+        ):
+            code, payload = self.run_cli(
+                "workspace", "alias", "disable", "--repo", str(self.nested)
+            )
+        self.assertEqual(code, 1)
+        self.assertFalse(payload["mutated"])
+        self.assertFalse(alias_path(self.nested).exists())
+
+    # --- F3: stat/open failures are typed, and reads cannot block -----------
+
+    def test_stat_permission_error_is_a_typed_refusal_not_an_exception(self) -> None:
+        self.run_cli(
+            "workspace", "alias", "disable", "--repo", str(self.nested)
+        )
+        with mock.patch.object(
+            store.os, "stat", side_effect=PermissionError(13, "denied")
+        ):
+            code, payload = self.run_cli(
+                "workspace", "alias", "show", "--repo", str(self.nested)
+            )
+        self.assertEqual(code, 1)
+        self.assertIn(
+            payload["reason"], {REASON_DECLARATION_UNREADABLE, REASON_PARENT_DRIFT}
+        )
+
+    def test_regular_to_fifo_swap_does_not_block_the_reader(self) -> None:
+        """The lstat says regular; the open must not hang on a swapped-in FIFO."""
+        path = alias_path(self.nested)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(path)
+        regular = os.stat_result(
+            (stat.S_IFREG | 0o644, 0, 0, 1, 0, 0, 10, 0, 0, 0)
+        )
+        outcome: list = []
+
+        def _read() -> None:
+            with mock.patch.object(store, "_lstat_entry", return_value=regular):
+                outcome.append(store.read_declaration(self.nested))
+
+        worker = threading.Thread(target=_read, daemon=True)
+        worker.start()
+        worker.join(10.0)
+        self.assertTrue(outcome, "the reader blocked on a FIFO instead of refusing")
+        self.assertEqual(outcome[0].reason, REASON_NOT_REGULAR_FILE)
+
+    # --- F4: exact type validation -----------------------------------------
+
+    def test_boolean_schema_version_is_refused(self) -> None:
+        self._write_raw(
+            {
+                "schema_version": True,
+                "mode": "alias",
+                "canonical_path": str(self.canonical),
+                "canonical_workspace_id": CANONICAL_ID,
+            }
+        )
+        code, payload = self.run_cli(
+            "workspace", "alias", "show", "--repo", str(self.nested)
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["reason"], REASON_UNSUPPORTED_SCHEMA)
+
+    def test_float_schema_version_is_refused(self) -> None:
+        self._write_raw(
+            {
+                "schema_version": 1.0,
+                "mode": "alias",
+                "canonical_path": str(self.canonical),
+                "canonical_workspace_id": CANONICAL_ID,
+            }
+        )
+        code, payload = self.run_cli(
+            "workspace", "alias", "show", "--repo", str(self.nested)
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["reason"], REASON_UNSUPPORTED_SCHEMA)
+
+    def test_non_string_optional_fields_are_refused(self) -> None:
+        for field, value in (("reason", False), ("created_at", 0), ("updated_at", 1.5)):
+            with self.subTest(field=field):
+                self._write_raw(
+                    {
+                        "schema_version": 1,
+                        "mode": "alias",
+                        "canonical_path": str(self.canonical),
+                        "canonical_workspace_id": CANONICAL_ID,
+                        field: value,
+                    }
+                )
+                code, payload = self.run_cli(
+                    "workspace", "alias", "show", "--repo", str(self.nested)
+                )
+                self.assertEqual(code, 1)
+                self.assertEqual(payload["reason"], REASON_DECLARATION_INVALID)
+
+    def test_non_string_mode_is_refused(self) -> None:
+        self._write_raw({"schema_version": 1, "mode": 1})
+        code, payload = self.run_cli(
+            "workspace", "alias", "show", "--repo", str(self.nested)
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["reason"], REASON_DECLARATION_INVALID)
 
 
 class WorkspaceAliasLaunchRefusalTests(WorkspaceAliasCliTestCase):

@@ -192,6 +192,26 @@ descriptor** に固定し、判定は全て `lstat` で行う。
   symlink の `clear` は link だけを外し、その target には触れない。
 - alias cycle 判定は「読める宣言」ではなく **entry の存在**で行うので、target 側の宣言が
   壊れている場合も fail closed する。
+- **pin した dirfd は「見えている directory」と同じとは限らない** (review j#102140 F1)。
+  dirfd は directory の rename を跨いで生き残るため、これを検証しないと書き込みが
+  *detached* な directory に着地したまま成功を返し、workspace から見える path には宣言が
+  存在しない、という状態になる。そこで全 mutation は (1) root から見える `.mozyo-bridge` が
+  pin した inode と同一であることを replace の前後で再検証し、(2) 完了判定を **fresh な
+  path 経由の read-back** (= effective state) で行う。drift は `declaration_parent_drift` で
+  zero-effective-mutation。`clear` も同様に effective state を確認する。
+- **検証失敗は既存宣言を壊さない** (review j#102140 F2)。`os.replace` は read-back が
+  失敗する時点で既に着地しているため、直前の内容を同一 directory 内へ stage しておき、
+  失敗時に戻す (元が無ければ新 entry を削除する)。`WorkspaceAliasStoreError` は `mutated`
+  を持ち、CLI は「何も書かれていない」と決め打ちせず実際の effective state を報告する。
+- **read は raise せず、block もしない** (review j#102140 F3)。`stat` / `open` / `read` の
+  失敗はすべて固定 typed refusal へ変換する。さらに `O_NONBLOCK` で開いた上で `fstat` により
+  同一 object が regular file であることを再確認するので、`lstat` と `open` の間に
+  regular file が FIFO へ差し替えられても reader が無限に停止しない。
+- **schema の型検査は exact** (review j#102140 F4)。Python では `True == 1` / `1.0 == 1` が
+  成立し、`bool` は `int` の subclass なので、値比較だけでは bool / float が整数 1 として
+  通ってしまう。`schema_version` は `type(v) is int` を要求し、optional な文字列 field は
+  正規化の**前**に型を検査する (旧実装の `raw.get(k) or ""` は `false` / `0` / `None` を
+  黙って `""` に潰していた)。
 - **cross-repository 判定は `git_common_dir` の一致**で行う。linked worktree は main checkout と
   共通なので同一 repository (sublane worktree は従来どおり launch 可能)、**submodule** は
   親の tree 内に物理的に存在しても別 repository として拒否する。観測事例の

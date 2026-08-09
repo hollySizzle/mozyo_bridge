@@ -292,6 +292,30 @@ def cmd_workspace_alias(args: argparse.Namespace) -> int:
     repo_root = repo_root_from_args(args)
     as_json = bool(getattr(args, "as_json", False))
 
+    def _store_refusal(exc: WorkspaceAliasStoreError, root) -> dict:
+        """Render a store refusal saying what the effective state actually is.
+
+        The wording is driven by ``exc.mutated``, not hardcoded: a rolled-back
+        failure genuinely left nothing behind, but a failed rollback did not, and
+        telling the operator "nothing was written" in that case is a false report
+        about durable state (review j#102140 Finding 2).
+        """
+        if exc.mutated:
+            tail = (
+                " — the declaration could NOT be restored; inspect "
+                f"{alias_path(root)} by hand before relying on this workspace."
+            )
+        else:
+            tail = " — the effective declaration is unchanged."
+        return {
+            "state": "refused",
+            "reason": exc.reason,
+            "detail": f"{exc.detail}{tail}",
+            "mutated": exc.mutated,
+            "repo_root": str(root),
+            "declaration_path": str(alias_path(root)),
+        }
+
     def _emit(payload: dict, ok: bool) -> int:
         if as_json:
             print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
@@ -321,16 +345,7 @@ def cmd_workspace_alias(args: argparse.Namespace) -> int:
         try:
             outcome = clear_declaration(repo_root)
         except WorkspaceAliasStoreError as exc:
-            return _emit(
-                {
-                    "state": "refused",
-                    "reason": exc.reason,
-                    "detail": f"{exc.detail} — the declaration is still in place.",
-                    "repo_root": str(repo_root),
-                    "declaration_path": str(alias_path(repo_root)),
-                },
-                False,
-            )
+            return _emit(_store_refusal(exc, repo_root), False)
         removed = outcome == CLEAR_REMOVED
         return _emit(
             {
@@ -354,16 +369,7 @@ def cmd_workspace_alias(args: argparse.Namespace) -> int:
         try:
             written = write_declaration(repo_root, declaration)
         except WorkspaceAliasStoreError as exc:
-            return _emit(
-                {
-                    "state": "refused",
-                    "reason": exc.reason,
-                    "detail": f"{exc.detail} — nothing was written.",
-                    "repo_root": str(repo_root),
-                    "declaration_path": str(alias_path(repo_root)),
-                },
-                False,
-            )
+            return _emit(_store_refusal(exc, repo_root), False)
         return _emit(
             {
                 "state": "declared",
@@ -425,16 +431,7 @@ def cmd_workspace_alias(args: argparse.Namespace) -> int:
     try:
         written = write_declaration(source, declaration)
     except WorkspaceAliasStoreError as exc:
-        return _emit(
-            {
-                "state": "refused",
-                "reason": exc.reason,
-                "detail": f"{exc.detail} — nothing was written.",
-                "repo_root": str(source),
-                "declaration_path": str(alias_path(source)),
-            },
-            False,
-        )
+        return _emit(_store_refusal(exc, source), False)
     readback = resolve_launch_root(source)
     payload: dict = readback.as_payload()
     payload["repo_root"] = str(source)

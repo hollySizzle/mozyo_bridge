@@ -86,6 +86,11 @@ REASON_UNSUPPORTED_SCHEMA = "declaration_unsupported_schema"
 REASON_NOT_REGULAR_FILE = "declaration_not_regular_file"
 # Write-path refusals (review j#102104 Finding 1). Each is zero-mutation.
 REASON_PARENT_UNSAFE = "declaration_parent_unsafe"
+# The `.mozyo-bridge` directory visible from the workspace root stopped being the
+# one this operation pinned (review j#102140 Finding 1). A pinned dirfd survives a
+# rename of its directory, so without this check a write lands in a *detached*
+# directory and reports success while the effective path has no declaration.
+REASON_PARENT_DRIFT = "declaration_parent_drift"
 REASON_MULTIPLE_LINKS = "declaration_multiple_links"
 REASON_WRITE_FAILED = "declaration_write_failed"
 REASON_READBACK_FAILED = "declaration_readback_failed"
@@ -240,14 +245,26 @@ def parse_declaration(raw: object) -> AliasResolution | WorkspaceAliasDeclaratio
     """
     if not isinstance(raw, Mapping):
         return refused(REASON_DECLARATION_INVALID, "declaration_is_not_a_mapping")
+
+    # Exact TYPE checks, not just value equality (review j#102140 Finding 4).
+    # Python's numeric tower makes `True == 1` and `1.0 == 1`, so a plain `!=`
+    # against the schema version admits a bool and a float as if they were the
+    # integer 1. `bool` is a subclass of `int`, so it has to be excluded
+    # explicitly rather than by an isinstance check.
     version = raw.get("schema_version")
+    if type(version) is not int:
+        return refused(
+            REASON_UNSUPPORTED_SCHEMA,
+            f"schema_version must be an integer, got {type(version).__name__} "
+            f"({version!r})",
+        )
     if version != ALIAS_SCHEMA_VERSION:
         return refused(
             REASON_UNSUPPORTED_SCHEMA,
             f"declared_schema_version={version!r} expected={ALIAS_SCHEMA_VERSION}",
         )
     mode = raw.get("mode")
-    if mode not in DECLARED_MODES:
+    if not isinstance(mode, str) or mode not in DECLARED_MODES:
         return refused(
             REASON_DECLARATION_INVALID,
             f"mode={mode!r} expected one of {list(DECLARED_MODES)}",
@@ -268,16 +285,25 @@ def parse_declaration(raw: object) -> AliasResolution | WorkspaceAliasDeclaratio
             f"schema v{ALIAS_SCHEMA_VERSION} defines {sorted(allowed)}",
         )
 
-    reason = raw.get("reason") or ""
-    created_at = raw.get("created_at") or ""
-    updated_at = raw.get("updated_at") or ""
-    for label, value in (
-        ("reason", reason),
-        ("created_at", created_at),
-        ("updated_at", updated_at),
-    ):
+    # Absent optional fields default to ""; a PRESENT one must already be a
+    # string. The previous `raw.get(k) or ""` normalized before checking, so
+    # `false` / `0` / `None` silently became "" and passed the type check they
+    # were supposed to fail (review j#102140 Finding 4).
+    optional = {}
+    for label in ("reason", "created_at", "updated_at"):
+        if label not in raw:
+            optional[label] = ""
+            continue
+        value = raw[label]
         if not isinstance(value, str):
-            return refused(REASON_DECLARATION_INVALID, f"{label}_is_not_a_string")
+            return refused(
+                REASON_DECLARATION_INVALID,
+                f"{label} must be a string, got {type(value).__name__} ({value!r})",
+            )
+        optional[label] = value
+    reason = optional["reason"]
+    created_at = optional["created_at"]
+    updated_at = optional["updated_at"]
 
     if mode == MODE_DISABLED:
         return WorkspaceAliasDeclaration(
