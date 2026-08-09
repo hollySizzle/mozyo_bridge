@@ -105,35 +105,78 @@ class AuditFailureTerminalDecisionError(RuntimeError):
     """The decision store is absent, replaced, unreachable, or the writer is not attested."""
 
 
-def _reject_unsafe_path(path: Path, *, label: str) -> None:
-    """Refuse a store artifact that is a symlink or a non-regular file (review j#102147 finding 2).
+def _reject_unsafe_path(path: Path, *, label: str, home: Path) -> None:
+    """Refuse a store artifact reachable only through a link, at ANY component (j#102181 f2).
 
-    An authority-bearing store must write inside the home it declares. R4 opened the DB with
-    ``sqlite3.connect`` and the sidecar with ``write_text`` and checked neither, so a symlink at
-    either path wrote outside the home entirely (reproduced: ``db_written_outside_home=True`` /
-    ``nonce_written_outside_home=True``) — which also defeats the nonce's own purpose, since the
-    identity pair can then be redirected independently of the store it is supposed to identify.
+    R5 checked ``lstat`` on the FINAL artifact paths alone. The reviewer made ``home`` itself a
+    symlink to an external directory and both the DB and the nonce were written outside the
+    declared home (``symlinked_home_db_written_outside=True`` /
+    ``symlinked_home_nonce_written_outside=True``). Checking the leaf cannot establish "inside the
+    mozyo home" when an ancestor is the link.
 
-    Checked with ``lstat`` so the LINK is examined rather than its target, and applied to both
-    artifacts before every open and every write. A dangling symlink is refused for the same reason
-    a live one is: what matters is that the path is not the regular file this store owns.
+    So every component from the filesystem root down to the artifact is examined with ``lstat`` —
+    the LINK, never its target — and any symlink or non-regular / non-directory entry refuses. The
+    artifact must additionally live directly under the canonical ``home``.
+
+    **What this does and does not close, stated rather than overclaimed.** It closes a symlinked
+    home, a symlinked ancestor, a symlinked or non-regular artifact, and a dangling link at any of
+    them. It does NOT by itself close a check-to-open race — an attacker with write access inside
+    the home could swap a component between the check and the open. :meth:`_open_sidecar_fd` uses
+    ``O_NOFOLLOW`` so the sidecar can never be opened through a link at all, and the DB open
+    re-verifies the artifact's ``(st_dev, st_ino)`` after connecting, which detects a swap rather
+    than preventing it. A fully race-free guarantee needs ``openat2(RESOLVE_BENEATH)``, which the
+    Python standard library does not expose; that residual is named here rather than papered over.
     """
+    import stat as stat_module
+
+    home = Path(home)
+    resolved_parent = path.parent
+    if resolved_parent != home:
+        raise AuditFailureTerminalDecisionError(
+            f"decision store {label} {path} is not directly under the declared home {home}; "
+            "fail closed"
+        )
+    # Root-down, so a link high in the chain is caught before anything below it is trusted.
+    components: list[Path] = []
+    cursor = home
+    while True:
+        components.append(cursor)
+        if cursor.parent == cursor:
+            break
+        cursor = cursor.parent
+    for component in reversed(components):
+        try:
+            component_stat = component.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise AuditFailureTerminalDecisionError(
+                f"decision store path component {component} is unreadable "
+                f"({type(exc).__name__}); fail closed"
+            ) from exc
+        if stat_module.S_ISLNK(component_stat.st_mode):
+            raise AuditFailureTerminalDecisionError(
+                f"decision store path component {component} is a symlink; refusing to write an "
+                "authority record through a link that can point outside the mozyo-bridge home"
+            )
+        if not stat_module.S_ISDIR(component_stat.st_mode):
+            raise AuditFailureTerminalDecisionError(
+                f"decision store path component {component} is not a directory; fail closed"
+            )
     try:
-        stat = path.lstat()
+        artifact_stat = path.lstat()
     except FileNotFoundError:
         return
     except OSError as exc:
         raise AuditFailureTerminalDecisionError(
             f"decision store {label} {path} is unreadable ({type(exc).__name__}); fail closed"
         ) from exc
-    import stat as stat_module
-
-    if stat_module.S_ISLNK(stat.st_mode):
+    if stat_module.S_ISLNK(artifact_stat.st_mode):
         raise AuditFailureTerminalDecisionError(
             f"decision store {label} {path} is a symlink; refusing to write an authority record "
             "through a link that can point outside the mozyo-bridge home"
         )
-    if not stat_module.S_ISREG(stat.st_mode):
+    if not stat_module.S_ISREG(artifact_stat.st_mode):
         raise AuditFailureTerminalDecisionError(
             f"decision store {label} {path} is not a regular file; fail closed"
         )
@@ -261,19 +304,58 @@ class AuditFailureTerminalDecisionStore:
         self.path = (
             Path(path) if path is not None else audit_failure_terminal_decision_path(home)
         )
+        #: The DECLARED home every artifact must live directly under. Kept so the path guard can
+        #: check the whole chain rather than the leaf (review j#102181 finding 2).
+        self.home = self.path.parent
         self.sidecar_path = self.path.with_name(
             self.path.name + AUDIT_FAILURE_TERMINAL_DECISION_SIDECAR_SUFFIX
         )
 
+    # -- no-follow artifact IO ---------------------------------------------
+
+    def _read_sidecar_text(self) -> Optional[str]:
+        """Read the sidecar through ``O_NOFOLLOW``, so a link is never followed at all."""
+        import os
+
+        try:
+            fd = os.open(self.sidecar_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise AuditFailureTerminalDecisionError(
+                f"decision store sidecar {self.sidecar_path} could not be opened without "
+                f"following a link ({type(exc).__name__}); fail closed"
+            ) from exc
+        try:
+            with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                return handle.read()
+        except (OSError, ValueError) as exc:
+            raise AuditFailureTerminalDecisionError(
+                f"decision store sidecar {self.sidecar_path} is unreadable "
+                f"({type(exc).__name__}); fail closed"
+            ) from exc
+
+    def _write_sidecar_text(self, value: str) -> None:
+        """Create the sidecar with ``O_NOFOLLOW``; an existing link is never written through."""
+        import os
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(self.sidecar_path, flags, 0o600)
+        except OSError as exc:
+            raise AuditFailureTerminalDecisionError(
+                f"decision store sidecar {self.sidecar_path} could not be created without "
+                f"following a link ({type(exc).__name__}); fail closed"
+            ) from exc
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(value)
+
     # -- store identity (DB-external sidecar) ------------------------------
 
     def _read_sidecar_nonce(self) -> Optional[str]:
-        _reject_unsafe_path(self.sidecar_path, label="sidecar")
-        try:
-            value = self.sidecar_path.read_text(encoding="utf-8").strip()
-        except (OSError, ValueError):
-            return None
-        return value or None
+        _reject_unsafe_path(self.sidecar_path, label="sidecar", home=self.home)
+        value = self._read_sidecar_text()
+        return (value or "").strip() or None
 
     @staticmethod
     def _db_nonce(conn: sqlite3.Connection) -> Optional[str]:
@@ -287,8 +369,8 @@ class AuditFailureTerminalDecisionStore:
 
     def _create_fresh(self, nonce: str) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        _reject_unsafe_path(self.path, label="DB")
-        _reject_unsafe_path(self.sidecar_path, label="sidecar")
+        _reject_unsafe_path(self.path, label="DB", home=self.home)
+        _reject_unsafe_path(self.sidecar_path, label="sidecar", home=self.home)
         conn = sqlite3.connect(self.path, isolation_level=None)
         try:
             conn.execute("PRAGMA busy_timeout = 2000")
@@ -303,7 +385,7 @@ class AuditFailureTerminalDecisionStore:
             )
         finally:
             conn.close()
-        self.sidecar_path.write_text(nonce, encoding="utf-8")
+        self._write_sidecar_text(nonce)
 
     def is_initialized(self) -> bool:
         sidecar_nonce = self._read_sidecar_nonce()
@@ -344,10 +426,23 @@ class AuditFailureTerminalDecisionStore:
             )
         # Before the open, and on the LINK rather than its target: an authority record must not be
         # read or written through a path that can point outside the home (review j#102147 f2).
-        _reject_unsafe_path(self.path, label="DB")
-        _reject_unsafe_path(self.sidecar_path, label="sidecar")
+        _reject_unsafe_path(self.path, label="DB", home=self.home)
+        _reject_unsafe_path(self.sidecar_path, label="sidecar", home=self.home)
+        import os
+
+        before = os.lstat(self.path)
         conn = sqlite3.connect(self.path, isolation_level=None)
         try:
+            # sqlite3 cannot be handed an fd, so the artifact identity is re-verified after the
+            # open: a component swapped between the check and the connect yields a different
+            # (device, inode) and refuses. This DETECTS a race rather than preventing one — see
+            # ``_reject_unsafe_path`` for the residual this deliberately does not overclaim.
+            after = os.lstat(self.path)
+            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                raise AuditFailureTerminalDecisionError(
+                    f"decision store {self.path} changed identity between the safety check and "
+                    "the open (replaced store); fail closed"
+                )
             conn.execute("PRAGMA busy_timeout = 2000")
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             if version != AUDIT_FAILURE_TERMINAL_DECISION_SCHEMA_VERSION:

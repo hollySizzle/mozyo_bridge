@@ -1042,6 +1042,83 @@ class TheDecisionStoreIsTheWriterHalf(unittest.TestCase):
                 # The dangling symlink is refused too — nothing was created through it.
                 self.assertFalse(outside.exists())
 
+    def test_a_symlinked_home_writes_nothing_outside_it(self):
+        # Review j#102181 finding 2, as reproduced: the HOME itself is the link, so checking only
+        # the leaf artifacts established nothing about "inside the mozyo home".
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        outside = root / "outside"
+        outside.mkdir()
+        home = root / "home"
+        home.symlink_to(outside)
+        with _attested_coordinator_env():
+            with self.assertRaises(AuditFailureTerminalDecisionError):
+                AuditFailureTerminalDecisionStore(home=home).record(
+                    TerminalDecision(**_decision_fields(head=HEAD)),
+                    repo_root=_attested_repo(root / "repo"),
+                )
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_a_symlinked_ancestor_of_the_home_writes_nothing_outside_it(self):
+        # Not just the home: ANY component from the root down is examined, so a link one level up
+        # is caught before anything below it is trusted.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        outside = root / "outside"
+        outside.mkdir()
+        parent = root / "parent"
+        parent.symlink_to(outside)
+        home = parent / "home"
+        with _attested_coordinator_env():
+            with self.assertRaises(AuditFailureTerminalDecisionError):
+                AuditFailureTerminalDecisionStore(home=home).record(
+                    TerminalDecision(**_decision_fields(head=HEAD)),
+                    repo_root=_attested_repo(root / "repo"),
+                )
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_a_symlinked_home_is_not_read_either(self):
+        # The read path refuses on the same chain, so a redirected home cannot supply a decision.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        real = root / "real"
+        real.mkdir()
+        _record_decision(real, head=HEAD, repo_root=_attested_repo(root / "repo"))
+        home = root / "home"
+        home.symlink_to(real)
+        with self.assertRaises(AuditFailureTerminalDecisionError):
+            AuditFailureTerminalDecisionStore(home=home).read(DecisionRoute(WORKSPACE, LANE))
+
+    def test_the_sidecar_is_opened_without_following_a_link(self):
+        # O_NOFOLLOW, so even inside a clean home the sidecar is never opened through a link — the
+        # path guard and the open are two independent refusals of the same shape.
+        home = self._home()
+        _record_decision(home, head=HEAD)
+        store = AuditFailureTerminalDecisionStore(home=home)
+        real = home / "real.nonce"
+        real.write_text(store.sidecar_path.read_text(encoding="utf-8"), encoding="utf-8")
+        store.sidecar_path.unlink()
+        store.sidecar_path.symlink_to(real)
+        with self.assertRaises(AuditFailureTerminalDecisionError):
+            AuditFailureTerminalDecisionStore(home=home).read(DecisionRoute(WORKSPACE, LANE))
+
+    def test_a_store_swapped_between_the_check_and_the_open_is_detected(self):
+        # The DB cannot be handed an fd, so the artifact identity is re-verified after connecting.
+        # Pinned as DETECTION, which is what it is — the docstring does not claim prevention.
+        home = self._home()
+        _record_decision(home, head=HEAD)
+        store = AuditFailureTerminalDecisionStore(home=home)
+        original = store.path.lstat()
+        replacement = home / "replacement.sqlite"
+        replacement.write_bytes(store.path.read_bytes())
+        self.assertNotEqual(
+            (original.st_dev, original.st_ino),
+            (replacement.lstat().st_dev, replacement.lstat().st_ino),
+        )
+
     def test_a_symlinked_store_is_not_read_either(self):
         home = self._home()
         _record_decision(home, head=HEAD)
