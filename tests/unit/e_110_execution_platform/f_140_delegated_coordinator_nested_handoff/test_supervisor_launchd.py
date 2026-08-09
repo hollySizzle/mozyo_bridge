@@ -1038,6 +1038,58 @@ class LegacyDrainMigrationTest(_DarwinCase):
             state = sl._probe(FakeRunner(print_result=scripted))["state"]
             self.assertEqual(state, expected, why)
 
+    def test_a_not_found_about_a_LONGER_label_is_not_about_ours(self) -> None:
+        # Review j#102235 finding r4f1. `label in message` is a substring test, and our label is a
+        # PREFIX of any longer one, so a not-found about `<label>.helper` satisfied the check for
+        # `<label>` — and deleted its plist while that agent may still have been running.
+        owned = sl.LEGACY_DRAIN_AGENT.label
+        for other, why in (
+            (f"{owned}.helper", "suffix: ours is a prefix of theirs"),
+            (f"{owned}-secondary", "suffix via a label-continuation character"),
+            ("com.example.other", "an unrelated label"),
+        ):
+            for rendered, form in (
+                (f'Could not find service "{other}" in domain for gui', "quoted"),
+                (f"Could not find service {other} in domain for gui", "bare"),
+            ):
+                state = sl._probe(FakeRunner(print_result=_result(113, stderr=rendered)))["state"]
+                self.assertEqual(state, sl.PROBE_UNREADABLE, f"{why} ({form})")
+
+    def test_a_not_found_about_our_own_label_still_counts(self) -> None:
+        # The complement: the fence must not have become so tight that a genuine absence is refused.
+        owned = sl.LEGACY_DRAIN_AGENT.label
+        for rendered, form in (
+            (f'Could not find service "{owned}" in domain for gui', "quoted"),
+            (f"Could not find service {owned} in domain for gui", "bare, delimited"),
+            (f"Could not find service gui/501/{owned} in domain", "full service target"),
+        ):
+            state = sl._probe(
+                FakeRunner(print_result=_result(113, stderr=rendered)),
+                agent=sl.LEGACY_DRAIN_AGENT,
+            )["state"]
+            self.assertEqual(state, sl.PROBE_CONFIRMED_ABSENT, form)
+
+    def test_a_longer_label_not_found_keeps_the_plist_end_to_end(self) -> None:
+        _write_home_credential(self.mozyo_home)
+        legacy = _legacy_drain_plist(self.os_home)
+        other = f"{sl.LEGACY_DRAIN_AGENT.label}.helper"
+
+        class _OtherLabelNotFound:
+            def __call__(self, argv):
+                argv = list(argv)
+                target = argv[2] if len(argv) > 2 else ""
+                if sl.LEGACY_DRAIN_AGENT.label in target:
+                    code = 113 if argv[1] == "print" else 1
+                    return _result(
+                        code, stderr=f'Could not find service "{other}" in domain for gui'
+                    )
+                return _result(0)
+
+        result = sl.remove_legacy_drain(os_home=self.os_home, runner=_OtherLabelNotFound())
+        self.assertFalse(result["removed"])
+        self.assertEqual(result["reason"], sl.REASON_LEGACY_DRAIN_STATE_UNREADABLE)
+        self.assertTrue(legacy.exists())
+
     def test_the_r3f1_reproduction_keeps_the_plist_and_refuses(self) -> None:
         # End-to-end shape of the same defect: exit 113 with a permission error must not remove the
         # owned retired plist.

@@ -294,6 +294,24 @@ class ProbeStateProjectionTest(unittest.TestCase):
             readable["probe_state"], (ss.PROBE_LOADED, ss.PROBE_CONFIRMED_ABSENT)
         )
 
+    def test_a_partial_linux_read_is_unreadable_not_a_confirmed_state(self) -> None:
+        # Review j#102235 finding r4f2. Reading SOME property is not reading the SCHEDULE state: a
+        # timer answer carrying only `UnitFileState` was reported as `confirmed_absent`, asserting a
+        # fact nothing in that response established.
+        for timer_output, why in (
+            ("UnitFileState=enabled\n", "no ActiveState at all"),
+            ("ActiveState=\nUnitFileState=enabled\n", "ActiveState present but empty"),
+        ):
+            status = _systemd_status(manager_available=True, timer_output=timer_output)
+            self.assertEqual(status["probe_state"], ss.PROBE_UNREADABLE, why)
+
+    def test_a_complete_linux_read_still_classifies(self) -> None:
+        # The complement: the stricter rule must not make every real read unreadable.
+        active = _systemd_status(manager_available=True, timer_output="ActiveState=active\n")
+        inactive = _systemd_status(manager_available=True, timer_output="ActiveState=inactive\n")
+        self.assertEqual(active["probe_state"], ss.PROBE_LOADED)
+        self.assertEqual(inactive["probe_state"], ss.PROBE_CONFIRMED_ABSENT)
+
     def test_the_projection_leaks_no_raw_manager_text(self) -> None:
         # `probe_state` is a fixed token, never the launchctl / systemctl message it came from.
         status = _launchd_status(_fake_result(113, stderr="Operation not permitted"))
@@ -330,7 +348,7 @@ def _launchd_status(print_result) -> dict:
         )
 
 
-def _systemd_status(*, manager_available: bool) -> dict:
+def _systemd_status(*, manager_available: bool, timer_output: str = "ActiveState=inactive\n") -> dict:
     """A Linux status projection where the user manager is reachable, or is not."""
     os_home = Path(tempfile.mkdtemp())
     mozyo_home = Path(tempfile.mkdtemp())
@@ -340,7 +358,7 @@ def _systemd_status(*, manager_available: bool) -> dict:
         if argv[2] == "show" and any(a.startswith("--property=Version") for a in argv):
             return _fake_result(0 if manager_available else 1)
         if argv[2] == "show":
-            return _fake_result(0 if manager_available else 1, "ActiveState=inactive\n")
+            return _fake_result(0 if manager_available else 1, timer_output)
         return _fake_result(0)
 
     with patch.object(sys, "platform", "linux"):

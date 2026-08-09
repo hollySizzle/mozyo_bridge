@@ -381,10 +381,53 @@ def _says_not_found(result, service_target: str) -> bool:
         return False
     # Bind the reading to what we actually asked about: a not-found message naming some OTHER label
     # says nothing about ours. The full target (gui/<uid>/<label>) or the bare label both count,
-    # since the exact wording is not a contract.
+    # since the exact wording is not a contract — but the match must be an EXACT token, not a
+    # substring (review j#102235 finding r4f1).
     target = (service_target or "").lower()
     label = target.rsplit("/", 1)[-1]
-    return bool(label) and (target in message or label in message)
+    if not label:
+        return False
+    return _names_exactly(message, target) or _names_exactly(message, label)
+
+
+#: Characters that continue a launchd label. A reverse-DNS label is alphanumerics plus these, so a
+#: match bounded by anything else is a whole label rather than a piece of a longer one.
+_LABEL_CONTINUATION = set(".-_")
+
+
+def _names_exactly(message: str, token: str) -> bool:
+    """Whether ``message`` names ``token`` as a WHOLE label, not as part of a longer one.
+
+    ``label in message`` was the bug: ``org.…callback-supervisor.drain`` is a prefix of
+    ``org.…callback-supervisor.drain.helper``, so a not-found about the *helper* satisfied the check
+    for the *drain* agent and its plist was deleted while it may still have been running (review
+    j#102235 finding r4f1). A not-found about someone else's label is not evidence about ours, so
+    the containment has to respect label boundaries.
+
+    Two accepted forms, both exact:
+
+    - **quoted** — ``"<token>"``, which is how launchctl actually renders the name it could not find;
+    - **delimited** — the token bounded on both sides by something that cannot continue a label
+      (start/end of text, whitespace, a quote, a slash, …), so neither a longer suffix nor a longer
+      prefix can satisfy it.
+    """
+    if not token:
+        return False
+    if f'"{token}"' in message:
+        return True
+    start = 0
+    while True:
+        index = message.find(token, start)
+        if index < 0:
+            return False
+        before = message[index - 1] if index > 0 else ""
+        after_index = index + len(token)
+        after = message[after_index] if after_index < len(message) else ""
+        bounded_left = not (before.isalnum() or before in _LABEL_CONTINUATION)
+        bounded_right = not (after.isalnum() or after in _LABEL_CONTINUATION)
+        if bounded_left and bounded_right:
+            return True
+        start = index + 1
 
 
 def _small_int_or_none(token: str) -> Optional[int]:

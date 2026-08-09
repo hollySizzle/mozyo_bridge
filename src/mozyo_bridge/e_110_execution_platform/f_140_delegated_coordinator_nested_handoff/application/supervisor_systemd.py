@@ -266,10 +266,20 @@ def _probe_state(shown: dict[str, str], *, manager_available: bool) -> str:
     EMPTY mapping here does not mean "no such unit" — it means the read itself failed, which is the
     unreadable case. An unreachable user manager is unreadable for the same reason: nothing was
     read, so nothing about the unit is known (review j#102200 finding r3f2).
+
+    The classification hangs on **``ActiveState`` specifically**, not on the mapping being non-empty
+    (review j#102235 finding r4f2). Reading *some* property is not the same as reading the *schedule
+    state*: a partial answer carrying only ``UnitFileState`` used to be reported as
+    ``confirmed_absent``, which asserts a fact nothing in that response established. Absent or empty
+    ``ActiveState`` is therefore unreadable — the same rule the macOS side applies when it cannot
+    read the run state.
     """
-    if not manager_available or not shown:
+    if not manager_available:
         return PROBE_UNREADABLE
-    return PROBE_LOADED if shown.get("ActiveState") == "active" else PROBE_CONFIRMED_ABSENT
+    active_state = (shown.get("ActiveState") or "").strip()
+    if not active_state:
+        return PROBE_UNREADABLE
+    return PROBE_LOADED if active_state == "active" else PROBE_CONFIRMED_ABSENT
 
 
 def _refused(action: str, reason: str, **extra: object) -> dict:
