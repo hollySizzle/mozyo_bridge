@@ -225,6 +225,51 @@ handoff / notify の運用判断は、しばしば三つの別概念を取り違
 - **効率化は fail-closed / gate の bypass ではない。** poll を減らすことは、gate journal の記録義務 (`## Sublane 完了 guardrail`) や callback outcome の記録を省く口実にならない。待機コストの削減は監査可能性を下げない。
 - **LLM turn は zero-wait、45–55 秒 cadence は watcher / operator 固有である。** dispatch 後の LLM agent turn は待たずに終了し、進捗再開は durable callback に委ねる。user commentary SLA 内の 45–55 秒基本 cadence は portable な default だが、その置き場は LLM turn ではなく background watcher / operator debug であり、その base を超える project 固有の緩和・延長、どの signal を「異常」とみなすかの private な閾値、escalation 順序は operator の runtime policy に留まる (採用 repo の public / private 境界 rule を参照。`mozyo_bridge` では `vibes/docs/rules/public-private-boundary.md`)。portable な部分は *dispatch 後は LLM turn を zero-wait で終了し進捗再開を durable callback に委ねる / 通常運用は mozyo facade のみを使い raw Herdr・tmux を通常 turn の道具にしない / blocking wait を token 消費と誤認しない / 短周期 poll と scrollback 再読を標準にしない / bounded wait を user commentary SLA 内の 45–55 秒基本 cadence に収める (watcher / operator 面) / timeout・不変時に pane history を掘らない / 通常 finding を gate journal にまとめ即時 interrupt を Critical に限定する / durable record を正本に保つ* ことである。
 
+## 既知停止からの通常再開
+
+`## Wait / polling 効率標準` は dispatch 後の turn の *終わり方* を固定する (zero-wait / yield)。本標準はその対になる turn の *始まり方* を固定する: 既知の停止原因が解消され、operator または durable callback が継続を指示した通常ケースで、agent が何をどれだけ確認してよいかである (Redmine #15147 owner intent j#101691)。通常再開の手順はここが唯一の置き場であり、同じ注意を他の doc へ重複させない (`## Workflow docs の正本境界` の one rule, one home)。
+
+観測された failure mode は次である: 確認画面を通過した後 operator が継続を指示しただけの再開で、agent が central preset 全文・skill 文書・source・複数 command の `--help` を広く読み直してから、結局は高レベル入口 1 回で足りる操作を実行した (Redmine #15140 Claude coordinator gateway が Claude 実体を起動せず Codex が誤代行する、j#101676)。これは安全性を上げていない。停止原因は既に既知であり、判断材料は durable record にある。増えたのは待ち時間と context 消費だけである。
+
+### 通常再開の 4 step
+
+既知の停止から再開する通常ケースでは、次の 4 step **だけ**をこの順で行い、turn を終える。
+
+1. **最新の durable journal を読む。** 再開の根拠は durable record であり、pane scrollback / `status` / `doctor` / 記憶ではない。
+2. **高レベルの状態確認を 1 回行う。** その判断に必要な mozyo semantic facade の状態 command を 1 つだけ実行する (`workflow glance` / `sublane list` など)。同じ状態を別 command で取り直さない。
+3. **新しい判断を journal に記録する。** 何を根拠に、どの lane / target へ、どの操作を 1 回行うかを durable record に書く。
+4. **高レベル入口から操作を 1 回実行する。** 高レベル `mozyo-bridge` command を 1 回だけ実行し、`## Wait / polling 効率標準` に従って zero-wait で turn を終える。
+
+同一 session の通常再開は、既に読んだ central preset / skill reference の全文再読を **要求しない**。step 1 が要求するのは durable journal であって規約本文の読み直しではない。
+
+### 通常再開で行わないこと
+
+4 step は上限であって最低限ではない。次は通常再開の経路では **選ばない**。必要になった場合は、下の詳細調査条件のどれに該当するかを durable record に記録してから行う。
+
+- **既読の central preset / skill reference の全文再読。** 特定の gate / 節を確認する必要があるなら、その節だけを読む。
+- **source 全文検索と文書全文 dump。** repo 全体の grep や doc 全文の出力を再開の準備作業にしない。
+- **複数 command の `--help` 収集。** 実行する高レベル command が分かっているなら `--help` を並べない。command 選択自体が不明なら、それは lane / 手順が不明という詳細調査条件であって、help の総当たりではない。
+- **raw Herdr / tmux 操作と低レベル `read` / `message` / `type` / `keys`。** これらは adapter test と operator debug のための primitive であり、通常再開の道具ではない (`## Wait / polling 効率標準` / `## Workspace 横断 handoff`)。
+- **同一操作の再送。** 送達済みの dispatch / handoff / callback を「念のため」再実行しない。delivery が uncertain なときは blind retry ではなく fail-closed で停止し、durable record に記録する。
+
+### 詳細調査へ移れる条件
+
+次の **いずれか** に該当するときに限り、通常再開を離れて詳細調査へ移ってよい。移る判断と、何を確認するために何を読むかを durable record に記録する。
+
+1. **durable state が競合・欠落・読取不能。** 期待する journal が無い、内容が相互に矛盾する、または取得できない。
+2. **lane が不明または曖昧。** target lane / pane / worktree が一意に解決しない (`## 自然名 target への handoff` の fail-closed 該当)。
+3. **高レベル CLI が想定外のエラーを返す。** 記録済みの recovery path で解決しない error / blocked が返る。
+4. **破壊的操作、権限変更、秘密情報の利用が必要。** 退役 drain の destructive 操作、権限境界の変更、credential を要する操作。
+
+この 4 条件以外は詳細調査の根拠にならない。「念のため」「確実を期して」「context を作り直すため」は条件ではない。
+
+### 本標準が緩めない境界
+
+- **source-of-truth 確認と gate は省略しない。** step 1 は durable record を読むことであり、`## Ticket-ID 入口` / `## Handoff ライフサイクル` の entrypoint 義務も gate journal の記録義務も変わらない。効率化は fail-closed の緩和ではない。
+- **debug command は削除されない。** raw Herdr / tmux / 低レベル command は operator debug と adapter test のために残る。本標準が変えるのは *通常経路でそれを選ばない* ことだけである。
+- **一律のコマンド回数上限ではない。** 「状態確認 1 回 / 操作 1 回」は通常再開ケースの形であり、上の 4 条件に該当する turn や、新規着手・review・release のような別種の turn に一律の回数上限を課すものではない。
+- **不確実なまま進む許可ではない。** 判断材料が足りないと分かったなら、4 条件のどれに当たるかを durable record に書いて詳細調査へ移る。読まずに推測で操作することは本標準が許す短縮ではない。
+
 ## Workspace 横断 handoff
 
 sender (Claude または Codex) が、別の tmux session — 例えば別 repo の workspace — にいる agent へ通知する必要がある場合、routing は workflow レベルだけでなく CLI でも制約される (Redmine #10332)。

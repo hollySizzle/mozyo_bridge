@@ -157,6 +157,12 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         # operator debug に限る。45–55 秒 cadence は LLM turn ではなく
         # background watcher / operator debug へ再帰属した。
         "### dispatch / handoff 後は LLM turn を zero-wait で終了する",
+        # Redmine #15147 (owner intent j#101691): the routine-resume standard is
+        # the counterpart of the zero-wait turn ending. Its load-bearing phrases
+        # and the operation-history contract are pinned in
+        # tests/regressions/test_issue_15147_routine_resume.py; the heading is
+        # listed here so the primary-topic inventory stays complete.
+        "## 既知停止からの通常再開",
     )
 
     PHRASE_MARKERS: tuple[str, ...] = (
