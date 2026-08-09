@@ -37,6 +37,11 @@ from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.unit_
 
 
 WORKSPACE_A = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+#: The same id with full-width digits.  The display projection folds these to
+#: ASCII, so it is the shape that proves an action reads the raw identity.
+WORKSPACE_A_FULLWIDTH = "".join(
+    chr(ord(ch) + 0xFEE0) if "0" <= ch <= "9" else ch for ch in WORKSPACE_A
+)
 NOW = datetime(2026, 8, 9, 12, 0, 0, tzinfo=timezone.utc)
 STAMP = NOW.isoformat(timespec="seconds")
 
@@ -347,6 +352,111 @@ class RemotePayloadFreshnessTests(unittest.TestCase):
         )
 
 
+class RemoteIdentityUniquenessTests(unittest.TestCase):
+    def test_one_identity_returned_under_two_keys_fails_the_answer(self) -> None:
+        # A Unit is host + workspace + lane.  Two keys for one identity would
+        # make the same Unit addressable under two names.
+        payload = remote_payload()
+        payload["units"] = [
+            dict(payload["units"][0], unit_id="unit-a"),
+            dict(payload["units"][0], unit_id="unit-b"),
+        ]
+
+        observation = parse_remote_board_payload(
+            payload, source=REMOTE, observed_at=STAMP, now=NOW
+        )
+
+        self.assertEqual(observation.status.source_state, SOURCE_RELOAD_REQUIRED)
+        self.assertEqual(observation.rows, ())
+
+    def test_two_distinct_identities_are_both_kept(self) -> None:
+        payload = remote_payload()
+        payload["units"] = [
+            dict(payload["units"][0], unit_id="unit-a"),
+            dict(payload["units"][0], unit_id="unit-b", lane_id="issue_15138"),
+        ]
+
+        observation = parse_remote_board_payload(
+            payload, source=REMOTE, observed_at=STAMP, now=NOW
+        )
+
+        self.assertEqual(observation.status.source_state, SOURCE_LIVE)
+        self.assertEqual(len(observation.rows), 2)
+
+
+class RawIdentityActionInputTests(unittest.TestCase):
+    def test_a_projection_normalized_workspace_is_not_an_action_input(self) -> None:
+        # The projection folds Unicode form and whitespace, so these display as
+        # a canonical id.  Acting on that would mean acting on an identity the
+        # source never sent.
+        for name, value, displays_canonical in (
+            ("padded", "  " + WORKSPACE_A + "  ", True),
+            ("full-width", WORKSPACE_A_FULLWIDTH, True),
+            # Not normalized by the projection, but still not the canonical
+            # registry shape, so it is equally not an action input.
+            ("upper case", WORKSPACE_A.upper(), False),
+        ):
+            with self.subTest(case=name):
+                payload = remote_payload()
+                payload["units"][0]["workspace_id"] = value
+
+                observation = parse_remote_board_payload(
+                    payload, source=REMOTE, observed_at=STAMP, now=NOW
+                )
+                row = observation.rows[0]
+
+                if displays_canonical:
+                    # The display value looks like a whole identity; the raw one
+                    # is what keeps it out of the action path.
+                    self.assertEqual(row.workspace_id, WORKSPACE_A)
+                self.assertEqual(row.raw_workspace_id, value)
+                self.assertIsNone(actionable_workspace_id(row))
+
+    def test_the_raw_lane_is_kept_beside_the_displayed_one(self) -> None:
+        payload = remote_payload()
+        payload["units"][0]["lane_id"] = "  default  "
+
+        row = parse_remote_board_payload(
+            payload, source=REMOTE, observed_at=STAMP, now=NOW
+        ).rows[0]
+
+        self.assertEqual(row.lane_id, "default")
+        self.assertEqual(row.raw_lane_id, "  default  ")
+
+    def test_a_row_without_a_raw_identity_is_not_addressable(self) -> None:
+        from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.herdr_unit_board import (
+            UnitBoardRow,
+        )
+
+        row = UnitBoardRow(
+            unit_id="unit-x", workspace_id=WORKSPACE_A, lane_id="default",
+            project_label="p", workflow_role="c", responsibility="p",
+            work_label="w", authority_state=AUTHORITY_RESOLVED,
+            identity_state="resolved", agents=(),
+        )
+
+        self.assertIsNone(actionable_workspace_id(row))
+
+    def test_cross_source_duplicates_are_grouped_on_the_raw_identity(self) -> None:
+        # Two rows whose displayed ids match only because the projection
+        # normalized them are not the same Unit.
+        payload = remote_payload()
+        payload["units"][0]["workspace_id"] = WORKSPACE_A_FULLWIDTH
+
+        snapshot = aggregate_sources(
+            (
+                local_source_observation(local_snapshot(), source=LOCAL),
+                parse_remote_board_payload(
+                    payload, source=REMOTE, observed_at=STAMP, now=NOW
+                ),
+            ),
+            observed_at=STAMP,
+        )
+
+        for unit in snapshot.units:
+            self.assertEqual(unit.duplicate_scope, DUPLICATE_SCOPE_NONE)
+
+
 class RemoteIdentityRecomputationTests(unittest.TestCase):
     def test_a_row_declaring_resolved_with_a_duplicate_provider_degrades(self) -> None:
         # The local producer calls this contradiction ambiguous; a remote row
@@ -404,6 +514,48 @@ class RemoteIdentityRecomputationTests(unittest.TestCase):
                     observation.status.source_state, SOURCE_RELOAD_REQUIRED
                 )
                 self.assertEqual(observation.rows, ())
+
+    def test_a_missing_readiness_key_is_a_shape_violation(self) -> None:
+        # A default for the absent key would report a readiness the source never
+        # stated.
+        payload = remote_payload()
+        del payload["units"][0]["agents"][0]["interactive_ready"]
+
+        observation = parse_remote_board_payload(
+            payload, source=REMOTE, observed_at=STAMP, now=NOW
+        )
+
+        self.assertEqual(observation.status.source_state, SOURCE_RELOAD_REQUIRED)
+
+    def test_the_unmanaged_count_must_be_present_and_a_non_negative_int(self) -> None:
+        for name, value in (
+            ("absent", None), ("string", "3"), ("bool", True),
+            ("negative", -5), ("float", 1.5),
+        ):
+            with self.subTest(case=name):
+                payload = remote_payload()
+                if value is None:
+                    del payload["unmanaged_agents"]
+                else:
+                    payload["unmanaged_agents"] = value
+
+                observation = parse_remote_board_payload(
+                    payload, source=REMOTE, observed_at=STAMP, now=NOW
+                )
+
+                self.assertEqual(
+                    observation.status.source_state, SOURCE_RELOAD_REQUIRED
+                )
+
+    def test_a_reported_unmanaged_count_is_carried_verbatim(self) -> None:
+        payload = remote_payload()
+        payload["unmanaged_agents"] = 3
+
+        observation = parse_remote_board_payload(
+            payload, source=REMOTE, observed_at=STAMP, now=NOW
+        )
+
+        self.assertEqual(observation.status.unmanaged_agents, 3)
 
     def test_an_exact_boolean_readiness_is_carried_through(self) -> None:
         payload = remote_payload()

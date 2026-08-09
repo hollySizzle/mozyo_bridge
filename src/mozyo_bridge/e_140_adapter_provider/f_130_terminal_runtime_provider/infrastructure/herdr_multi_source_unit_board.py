@@ -315,7 +315,10 @@ class MultiSourceUnitBoardRuntime:
             remote_unit_id=remote_unit_id,
             source=source,
             workspace_id=workspace_id,
-            lane_id=row.lane_id,
+            # The un-projected lane, so the preview-to-apply identity comparison
+            # comes from what the source said rather than from a normalized
+            # display value (review j#101928 finding_2).
+            lane_id=row.raw_lane_id,
             project_label=row.project_label,
             observed_at=observation.status.observed_at,
         )

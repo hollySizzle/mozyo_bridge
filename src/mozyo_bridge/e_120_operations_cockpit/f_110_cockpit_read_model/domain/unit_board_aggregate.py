@@ -247,6 +247,8 @@ def local_source_observation(
             unit_id=row.unit_id,
             workspace_id=row.workspace_id,
             lane_id=row.lane_id,
+            raw_workspace_id=row.raw_workspace_id,
+            raw_lane_id=row.raw_lane_id,
             project_label=row.project_label,
             workflow_role=row.workflow_role,
             responsibility=row.responsibility,
@@ -313,12 +315,15 @@ def _agent_cells(raw: object) -> tuple[AgentCell, ...]:
             raise ValueError("unreadable agent row")
         provider = item.get("provider")
         runtime_state = item.get("runtime_state")
-        ready = item.get("interactive_ready", False)
         if not isinstance(provider, str) or not isinstance(runtime_state, str):
             raise ValueError("unreadable agent row")
-        # An exact bool, not a truthy value: JSON carries ``"false"`` as a
-        # string, and ``bool("false")`` is True — a readiness display that says
-        # the opposite of what the source reported.
+        # Present AND an exact bool.  A default for the absent key would report
+        # a readiness the source never stated, and ``bool("false")`` is True, so
+        # a truthy read of the JSON string would display the opposite of what it
+        # did state (review j#101928 finding_3).
+        if "interactive_ready" not in item:
+            raise ValueError("unreadable agent readiness")
+        ready = item["interactive_ready"]
         if not isinstance(ready, bool):
             raise ValueError("unreadable agent readiness")
         # The provider names which half of the pair this is; an empty one leaves
@@ -391,6 +396,7 @@ def parse_remote_board_payload(
             raise ValueError("unreadable unit list")
         rows: list[UnitBoardRow] = []
         remote_unit_ids: dict[str, str] = {}
+        seen_identities: set[tuple[str, str]] = set()
         for raw in raw_units:
             if not isinstance(raw, Mapping):
                 raise ValueError("unreadable unit row")
@@ -417,12 +423,23 @@ def parse_remote_board_payload(
                 # Two rows claiming one key cannot both be addressed; the whole
                 # answer is ambiguous rather than half-usable.
                 raise ValueError("duplicate unit key")
+            # Checking the *keys* is not enough: a source can return one
+            # identity twice under two different keys, which would make one Unit
+            # addressable under two names (review j#101928 finding_1).  A Unit
+            # is ``host_id + workspace_id + lane_id``, so that pair is what must
+            # be unique within a source.
+            identity = (workspace_id, lane_id)
+            if identity in seen_identities:
+                raise ValueError("duplicate unit identity")
+            seen_identities.add(identity)
             remote_unit_ids[unit_id] = remote_unit_id
             rows.append(
                 UnitBoardRow(
                     unit_id=unit_id,
                     workspace_id=safe_text(workspace_id),
                     lane_id=safe_text(lane_id),
+                    raw_workspace_id=workspace_id,
+                    raw_lane_id=lane_id,
                     project_label=safe_text(
                         raw.get("project_label"), fallback="unknown-project"
                     ),
@@ -444,10 +461,18 @@ def parse_remote_board_payload(
                     host_label=source.label,
                 )
             )
-        unmanaged = payload.get("unmanaged_agents")
-        unmanaged_count = (
-            unmanaged if isinstance(unmanaged, int) and not isinstance(unmanaged, bool) else 0
-        )
+        # Required, typed, and non-negative.  Coercing an absent, textual, or
+        # negative count to zero would present a number the source never
+        # reported as an observed fact (review j#101928 finding_3).
+        if "unmanaged_agents" not in payload:
+            raise ValueError("unreadable unmanaged agent count")
+        unmanaged_count = payload["unmanaged_agents"]
+        if (
+            isinstance(unmanaged_count, bool)
+            or not isinstance(unmanaged_count, int)
+            or unmanaged_count < 0
+        ):
+            raise ValueError("unreadable unmanaged agent count")
         # Required, not optional: an optional clock means this boundary parser
         # can be called in a mode where an undated answer is live, and a
         # fail-open default at a trust boundary is the defect itself
@@ -468,7 +493,7 @@ def parse_remote_board_payload(
             source_state=payload_state,
             observed_at=observed_at,
             unit_count=len(rows),
-            unmanaged_agents=max(0, unmanaged_count),
+            unmanaged_agents=unmanaged_count,
             detail="" if payload_state == SOURCE_LIVE else _DETAIL_PAYLOAD_STALE,
         ),
         rows=tuple(rows),
@@ -529,9 +554,10 @@ def aggregate_sources(
 
     identity_hosts: dict[tuple[str, str], set[str]] = {}
     for row in rows:
-        identity_hosts.setdefault((row.workspace_id, row.lane_id), set()).add(
-            row.host_id
-        )
+        # Grouped on the un-projected identity: two rows whose displayed values
+        # only match because the projection normalized them are not the same
+        # Unit.
+        identity_hosts.setdefault(row.identity_key, set()).add(row.host_id)
     marked = tuple(
         UnitBoardRow(
             unit_id=row.unit_id,
@@ -548,9 +574,11 @@ def aggregate_sources(
             host_label=row.host_label,
             duplicate_scope=(
                 DUPLICATE_SCOPE_CROSS_SOURCE
-                if len(identity_hosts[(row.workspace_id, row.lane_id)]) > 1
+                if len(identity_hosts[row.identity_key]) > 1
                 else DUPLICATE_SCOPE_NONE
             ),
+            raw_workspace_id=row.raw_workspace_id,
+            raw_lane_id=row.raw_lane_id,
         )
         for row in rows
     )
@@ -585,14 +613,19 @@ def aggregate_sources(
 
 
 def actionable_workspace_id(row: UnitBoardRow) -> Optional[str]:
-    """Return the row's workspace id only when it is a whole registry identity.
+    """Return the row's workspace id only when the SOURCE sent a whole identity.
 
-    The board bounds text for display.  A workspace id that does not match the
-    canonical registry shape may therefore be a *display* value rather than the
-    identity itself, and handing it to an action would address a prefix.  In
-    that case there is no action input at all.
+    Read from the raw field, never the displayed one.  The display projection
+    normalizes Unicode form and collapses whitespace, so a padded or full-width
+    workspace id comes out looking canonical — and accepting that would mean the
+    client had synthesized an identity its source never sent and then acted on
+    it (review j#101928 finding_2).  The raw value must already be the canonical
+    registry shape, byte for byte.
+
+    A row carrying no raw identity (a legacy construction) is not addressable:
+    an absent identity is not a permissive one.
     """
-    workspace_id = row.workspace_id
+    workspace_id = row.raw_workspace_id
     if isinstance(workspace_id, str) and _WORKSPACE_ID_RE.fullmatch(workspace_id):
         return workspace_id
     return None

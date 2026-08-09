@@ -397,6 +397,26 @@ class ApplyDeliveryTests(unittest.TestCase):
         self.assertNotIn("%1075", rendered)
         self.assertNotIn("/srv/checkouts", rendered)
 
+    def test_output_after_the_outcome_line_is_not_ignored(self) -> None:
+        # The contract picks the LAST line; scanning past it for something
+        # parseable would let a stale success survive whatever followed it.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.remote_unit_action import (
+            _gateway_confirmed_submission,
+        )
+
+        good = '{"status": "sent", "reason": "ok"}'
+        self.assertTrue(_gateway_confirmed_submission(good))
+        self.assertTrue(_gateway_confirmed_submission(delivery_record()))
+        for name, tail in (
+            ("another object", '{"receipt": "later"}'),
+            ("malformed", "{bad}"),
+            ("array", "[]"),
+            ("null", "null"),
+            ("prose", "done."),
+        ):
+            with self.subTest(trailing=name):
+                self.assertFalse(_gateway_confirmed_submission(good + "\n" + tail))
+
     def test_the_gateway_is_asked_for_a_deterministic_output_shape(self) -> None:
         # The gateway's own --json only shapes a fail-closed resolution; without
         # this the success path returns the markdown-plus-JSON default.

@@ -494,17 +494,25 @@ def _delivery_outcome_record(stdout: object) -> Optional[dict]:
     """
     if not isinstance(stdout, str):
         return None
-    for line in reversed(stdout.splitlines()):
-        line = line.strip()
-        if not (line.startswith("{") and line.endswith("}")):
-            continue
-        try:
-            payload = json.loads(line)
-        except (TypeError, ValueError):
-            continue
-        if isinstance(payload, dict) and "status" in payload and "reason" in payload:
-            return payload
-    return None
+    candidates = [line.strip() for line in stdout.splitlines() if line.strip()]
+    if not candidates:
+        return None
+    # Exactly one candidate: the last non-empty line.  Scanning further back for
+    # something parseable would let output that follows the outcome be ignored,
+    # so a stale success line would survive whatever came after it — a
+    # fail-open reading of a fail-closed contract (review j#101928 finding_4).
+    line = candidates[-1]
+    if not (line.startswith("{") and line.endswith("}")):
+        return None
+    try:
+        payload = json.loads(line)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if "status" not in payload or "reason" not in payload:
+        return None
+    return payload
 
 
 def _gateway_confirmed_submission(stdout: object) -> bool:

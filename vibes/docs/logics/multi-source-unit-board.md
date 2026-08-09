@@ -102,8 +102,15 @@ Unit identity は `host_id + workspace_id + lane_id` である。
 - **同一 `(workspace_id, lane_id)` が複数 source に存在するのは正常である。** local と
   remote に同じ repo が checkout されていれば必ず起きる。これらは別 Unit として残し、
   `duplicate_scope: cross_source` で可視化する。`host_id` で区別できるので操作は禁止しない。
-- action 入力に使う `workspace_id` は canonical registry 形状 (32 hex) を明示的に検査する。
-  形状が違えば「表示値かもしれない」ため action 入力は存在しないものとして扱う。
+- **row は identity を 2 系統で持つ。表示用 projection を通した値と、source が送ったままの raw 値である。
+  action 判定は raw 値だけを読む。** display projection は NFKC 正規化と空白圧縮を行うため、
+  padded / 全角の identity が canonical に見えてしまう。それを action 入力にすることは、
+  **source が送っていない identity を client が合成して操作権限へ昇格させる**ことに等しい。
+  `workspace_id` は **raw がそのまま canonical lowercase 32 hex である場合のみ** action 候補とし、
+  raw identity を持たない row は addressable でない。cross-source duplicate の判定も raw identity で行う。
+- **1 source 内で `(workspace_id, lane_id)` は一意でなければならない。** 同一 identity を別 key で
+  2 行返す応答は、1 つの Unit に操作可能な別名を 2 つ与える。key の一意性検査だけでは足りず、
+  identity そのものの重複を境界で検出して `reload_required` とする。
 
 ## Source state と fail-closed
 
@@ -139,9 +146,12 @@ Unit identity は `host_id + workspace_id + lane_id` である。
 - **remote 応答の identity invariant は client 側で再計算する。** 文字列の再 projection だけでは
   不十分で、遠隔が自己申告する `identity_state` をそのまま採用してはならない。degrade 先は
   **次の 2 分岐で一意に決める**。
-  - **shape 違反 → source 全体を `reload_required`**: `interactive_ready` が exact bool でない
-    （JSON 文字列 `"false"` は truthy であり、そのまま採ると表示が事実の逆になる）、provider が空、
-    identity field (`workspace_id` / `lane_id`) が空。これらは「応答が読めない」に属する。
+  - **shape 違反 → source 全体を `reload_required`**: `interactive_ready` が **欠落または exact bool
+    でない**（JSON 文字列 `"false"` は truthy であり、そのまま採ると表示が事実の逆になる。欠落に
+    既定値を与えることも、source が述べていない状態を述べたことにする）、`unmanaged_agents` が
+    **欠落 / bool / 非 int / 負数**、provider が空、identity field (`workspace_id` / `lane_id`) が空、
+    1 source 内での identity 重複。これらは「応答が読めない」に属する。**欠けた値を既定値へ、
+    不正な値を 0 へ変換しない** — 観測していない数値を観測した事実として表示しないため。
   - **well-formed だが矛盾 → 当該 row を `ambiguous`**: agent 0 件、同一 Unit 内の provider 重複。
     local producer が生成し得ない row を表示には残し、action 不可にする。
 - **source `label` は取込時に 1 回だけ public-safe 値へ投影し、以後その値だけを持つ。** 投影後が
@@ -199,6 +209,9 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   documented scrape target である **末尾の JSON-looking line** を読む。`record_format` の既定は
   `both`（人間可読 record → 空行 → 単一行 JSON）であり、stdout 全体を 1 つの JSON として
   parse すると **実配送成功を失敗と誤判定する**。
+  候補は **末尾の非空行ちょうど 1 件**であり、それが parse 不能 / 非 object / required field 欠落なら
+  即座に未確認とする。**parse できる行を求めて遡らない** — 遡ると outcome の後に続いた出力が無視され、
+  古い成功が生き残る（fail-closed 契約の fail-open な読み方になる）。
   exit 0 でも composer に置いただけの `pending_input` や marker 未観測の `queue_enter` は未配送で
   あり、正本は `delivery_outcome_gate` / `injection_stage`（同一の問いに複数箇所が別答を出した
   #14232 の経緯を持つ）。status / reason token を局所で再検査せず、**共有 authority を評価する**。
