@@ -74,6 +74,23 @@ ANSWER_OK = "ok"
 ANSWER_UNREACHABLE = "unreachable"
 ANSWER_UNREADABLE = "unreadable"
 
+#: Bound on a remote repository root.  The value comes from another host's
+#: registry — untrusted input that becomes an argv element — so it is checked
+#: for shape here rather than at the subprocess boundary, where the failure mode
+#: is an exception instead of a refusal (review j#101846 finding_5).
+MAX_REMOTE_PATH_LENGTH = 4096
+
+
+def _usable_remote_path(value: object) -> bool:
+    """True when a remote registry path is safe to pass as an argv element."""
+    if not isinstance(value, str) or not value.startswith("/"):
+        return False
+    if len(value) > MAX_REMOTE_PATH_LENGTH:
+        return False
+    # Any control codepoint, NUL included.  A path is a filesystem location; a
+    # control character in one means the registry answer is not what it claims.
+    return not any(ord(char) < 0x20 or ord(char) == 0x7F for char in value)
+
 #: Extra seconds allowed beyond a source's connection timeout for the remote
 #: command itself to run and answer.
 COMMAND_GRACE_SECONDS = 20
@@ -159,7 +176,13 @@ class MultiSourceUnitBoardRuntime:
                 text=True,
                 timeout=source.connect_timeout + COMMAND_GRACE_SECONDS,
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError, ValueError):
+            # ``ValueError`` is the subprocess layer refusing the argv itself —
+            # an embedded NUL is the reachable case, since part of the argv comes
+            # from a remote registry this client does not control.  Left
+            # uncaught it escapes as a raw exception instead of the fixed typed
+            # refusal every other failure here produces (review j#101846
+            # finding_5).
             return None
 
     def _run_source_json(
@@ -325,7 +348,7 @@ class MultiSourceUnitBoardRuntime:
         if len(matches) != 1:
             return None
         canonical_path = matches[0].get("canonical_path")
-        if not isinstance(canonical_path, str) or not canonical_path.startswith("/"):
+        if not _usable_remote_path(canonical_path):
             return None
         return SourceWorkspace(
             workspace_id=workspace_id, canonical_path=canonical_path
@@ -351,6 +374,7 @@ class SourceWorkspace:
 
 __all__ = (
     "ANSWER_OK",
+    "MAX_REMOTE_PATH_LENGTH",
     "ANSWER_UNREACHABLE",
     "ANSWER_UNREADABLE",
     "COMMAND_GRACE_SECONDS",

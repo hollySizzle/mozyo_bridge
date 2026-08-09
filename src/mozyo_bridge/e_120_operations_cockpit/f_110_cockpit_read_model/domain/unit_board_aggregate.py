@@ -135,13 +135,17 @@ def freshness_state(
     *,
     max_age_seconds: int = DEFAULT_SOURCE_FRESHNESS_SECONDS,
 ) -> str:
-    """Classify one observation timestamp as ``live`` or ``stale``.
+    """Classify one *client-side* observation timestamp as ``live`` or ``stale``.
+
+    This dimension times the client's own round trip, so both timestamps come
+    from one clock and skew cannot arise.  A future timestamp is therefore not
+    skew but a contradiction, and is stale.  (The remote-payload dimension is a
+    different question and has its own rule — see
+    :func:`remote_payload_freshness`.)
 
     An unparsable or absent timestamp is stale, not live: the client cannot
     prove the age of an answer it cannot date, and an undated answer is exactly
-    the case where acting on it would be least justified.  A timestamp in the
-    future is equally stale — a clock the client does not share is not a
-    freshness proof.
+    the case where acting on it would be least justified.
     """
     stamp = _parsed_timestamp(observed_at)
     if stamp is None:
@@ -161,6 +165,14 @@ def remote_payload_freshness(observed_at: object, now: datetime) -> str:
     trip.  Both must hold for a source to be action authority: the client must
     know when the answer arrived *and* the answer must claim an observation the
     client can still justify acting on.
+
+    **The future rule differs from the client-side one on purpose, and this is
+    the single statement of it** (review j#101846 finding_6).  Here two machines'
+    clocks are being compared, so a small forward offset is ordinary skew rather
+    than a contradiction: a future timestamp within
+    :data:`MAX_REMOTE_CLOCK_SKEW_SECONDS` is live, and beyond it is stale.
+    Rejecting every future timestamp would make any host whose clock runs
+    slightly ahead permanently unactionable — fail-closed, but useless.
     """
     stamp = _parsed_timestamp(observed_at)
     if stamp is None or stamp.tzinfo is None or now.tzinfo is None:
@@ -259,6 +271,24 @@ def local_source_observation(
     )
 
 
+def _recomputed_identity_state(declared: object, cells: Sequence[AgentCell]) -> str:
+    """Conjoin the remote's declared identity state with the client's own check.
+
+    A remote answer is untrusted input, and that has to mean its *invariants*
+    too — not only its text (review j#101846 finding_2).  The local producer
+    marks a Unit ``ambiguous`` when one provider appears twice in it; a remote
+    row asserting ``resolved`` while carrying the same contradiction would
+    otherwise walk straight past the client's action gate on its own say-so.
+
+    Recomputed at the same granularity the local producer uses, so the
+    contradictory row degrades and the rest of the board stays usable.
+    """
+    providers = [cell.provider for cell in cells]
+    if len(providers) != len(set(providers)):
+        return IDENTITY_AMBIGUOUS
+    return declared if declared in IDENTITY_STATES else IDENTITY_AMBIGUOUS
+
+
 def _agent_cells(raw: object) -> tuple[AgentCell, ...]:
     if not isinstance(raw, list) or len(raw) > MAX_SOURCE_AGENTS:
         raise ValueError("unreadable agent list")
@@ -289,7 +319,7 @@ def parse_remote_board_payload(
     *,
     source: UnitBoardSource,
     observed_at: str,
-    now: Optional[datetime] = None,
+    now: datetime,
 ) -> SourceObservation:
     """Validate one remote ``unit-board show --json`` answer into rows.
 
@@ -351,6 +381,7 @@ def parse_remote_board_payload(
                 or authority_state not in AUTHORITY_STATES
             ):
                 raise ValueError("unreadable unit row")
+            cells = _agent_cells(raw.get("agents"))
             unit_id = remote_unit_public_id(source.host_id, remote_unit_id)
             if unit_id in remote_unit_ids:
                 # Two rows claiming one key cannot both be addressed; the whole
@@ -373,12 +404,12 @@ def parse_remote_board_payload(
                     # ``ambiguous`` rather than being displayed verbatim: only
                     # ``resolved`` unlocks an action, so an unknown state must
                     # never read as one and never paint a remote string here.
-                    identity_state=(
-                        raw.get("identity_state")
-                        if raw.get("identity_state") in IDENTITY_STATES
-                        else IDENTITY_AMBIGUOUS
+                    # The declared value is additionally conjoined with the
+                    # client's own recomputation of the invariant.
+                    identity_state=_recomputed_identity_state(
+                        raw.get("identity_state"), cells
                     ),
-                    agents=_agent_cells(raw.get("agents")),
+                    agents=cells,
                     host_id=source.host_id,
                     host_label=source.label,
                 )
@@ -387,11 +418,11 @@ def parse_remote_board_payload(
         unmanaged_count = (
             unmanaged if isinstance(unmanaged, int) and not isinstance(unmanaged, bool) else 0
         )
-        payload_state = (
-            SOURCE_LIVE
-            if now is None
-            else remote_payload_freshness(payload.get("observed_at"), now)
-        )
+        # Required, not optional: an optional clock means this boundary parser
+        # can be called in a mode where an undated answer is live, and a
+        # fail-open default at a trust boundary is the defect itself
+        # (review j#101846 finding_6).
+        payload_state = remote_payload_freshness(payload.get("observed_at"), now)
     except (ValueError, TypeError):
         return SourceObservation(
             status=source_status(

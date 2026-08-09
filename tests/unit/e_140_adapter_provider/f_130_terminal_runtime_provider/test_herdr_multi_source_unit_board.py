@@ -18,6 +18,7 @@ from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.unit_
     UnitBoardSourcesConfig,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_multi_source_unit_board import (
+    MAX_REMOTE_PATH_LENGTH,
     REMOTE_BOARD_ARGS,
     REMOTE_WORKSPACE_ARGS,
     MultiSourceUnitBoardRuntime,
@@ -406,6 +407,48 @@ class SourceWorkspaceTests(unittest.TestCase):
                         REMOTE_CONFIG.by_id["devbox"], WORKSPACE_A
                     )
                 )
+
+    def test_a_registry_path_with_a_control_character_is_rejected(self) -> None:
+        # The path is untrusted input that becomes an argv element; checked here
+        # rather than at the subprocess boundary, where the failure mode is an
+        # exception instead of a refusal.
+        for path in ("/srv/ok\x00evil", "/srv/tab\tx", "/" + "a" * (MAX_REMOTE_PATH_LENGTH + 1)):
+            with self.subTest(path=path[:16]):
+                multi, _ = runtime(
+                    {
+                        REMOTE_BOARD_ARGS: remote_board_payload(),
+                        REMOTE_WORKSPACE_ARGS: {
+                            "workspaces": [
+                                {
+                                    "workspace_id": WORKSPACE_A,
+                                    "canonical_path": path,
+                                    "project_name": "mozyo_bridge",
+                                }
+                            ]
+                        },
+                    }
+                )
+
+                self.assertIsNone(
+                    multi.resolve_source_workspace(
+                        REMOTE_CONFIG.by_id["devbox"], WORKSPACE_A
+                    )
+                )
+
+    def test_an_argv_the_subprocess_layer_refuses_is_a_typed_failure(self) -> None:
+        def refusing(argv, **kw):
+            raise ValueError("embedded null byte")
+
+        multi = MultiSourceUnitBoardRuntime(
+            REMOTE_CONFIG,
+            local_runtime=FakeLocalRuntime(),
+            runner=refusing,
+            clock=lambda: NOW,
+        )
+
+        self.assertIsNone(
+            multi.run_source_command(REMOTE_CONFIG.by_id["devbox"], ("workspace", "list"))
+        )
 
     def test_relative_canonical_path_is_rejected(self) -> None:
         multi, _ = runtime(

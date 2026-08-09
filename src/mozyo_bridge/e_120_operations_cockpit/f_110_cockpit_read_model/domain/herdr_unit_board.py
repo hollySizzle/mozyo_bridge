@@ -22,12 +22,16 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Iterable, Mapping, Sequence
 
-from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.unit_board_sources import (
-    LOCAL_HOST_ID,
-)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.absolute_path_rule import (
     contains_absolute_path,
 )
+
+
+#: The reserved host id of the client's own Herdr server within the Unit key
+#: space.  Defined here, with the key function that depends on it, so the
+#: operator source schema can import this module's display projection without a
+#: cycle; the schema re-exports the name for its own callers.
+LOCAL_HOST_ID = "local"
 
 
 SOURCE_LIVE = "live"
@@ -960,6 +964,7 @@ def format_board(snapshot: UnitBoardSnapshot, *, width: int = 120) -> str:
 
 __all__ = (
     "AUTHORITY_INVALID",
+    "LOCAL_HOST_ID",
     "AUTHORITY_MISSING",
     "AUTHORITY_RESOLVED",
     "DUPLICATE_SCOPE_CROSS_SOURCE",

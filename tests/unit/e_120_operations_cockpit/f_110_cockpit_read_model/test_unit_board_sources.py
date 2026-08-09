@@ -85,6 +85,25 @@ class SourceSchemaTests(unittest.TestCase):
                 }
             )
 
+    def test_labels_that_render_identically_are_duplicates(self) -> None:
+        # The board renders projected labels, and the projection collapses
+        # whitespace runs and normalizes Unicode form, so raw inequality is not
+        # the question anyone asks of a source label.
+        for other in ("dev  host", "ｄｅｖ host", "dev host "):
+            with self.subTest(other=other):
+                with self.assertRaises(UnitBoardSourceError):
+                    UnitBoardSourcesConfig.from_record(
+                        {
+                            "version": 1,
+                            "sources": [
+                                ssh_record(host_id="devbox", label="dev host"),
+                                ssh_record(
+                                    host_id="buildbox", ssh_target="b", label=other
+                                ),
+                            ],
+                        }
+                    )
+
     def test_a_remote_label_may_not_shadow_the_local_one(self) -> None:
         with self.assertRaises(UnitBoardSourceError):
             UnitBoardSourcesConfig.from_record(
@@ -188,6 +207,25 @@ class ConnectionValueDisclosureTests(unittest.TestCase):
 
     def test_the_published_default_binary_is_not_treated_as_private(self) -> None:
         self.assertNotIn("mozyo-bridge", self.config().private_connection_values)
+
+    def test_a_short_connection_value_inside_a_sentence_is_flagged(self) -> None:
+        # A two-character value is not exempt from "connection values never
+        # reach a public surface"; it just needs a token-boundary test.
+        config = UnitBoardSourcesConfig.from_record(
+            {"version": 1, "sources": [container_record(container="db")]}
+        )
+
+        self.assertEqual(config.disclosed_connection_value("restart db now"), "db")
+        self.assertEqual(config.disclosed_connection_value("db"), "db")
+        self.assertEqual(config.disclosed_connection_value("(db)"), "db")
+
+    def test_a_short_value_inside_an_unrelated_word_is_not_flagged(self) -> None:
+        config = UnitBoardSourcesConfig.from_record(
+            {"version": 1, "sources": [container_record(container="db")]}
+        )
+
+        self.assertIsNone(config.disclosed_connection_value("dbus daemon restart"))
+        self.assertIsNone(config.disclosed_connection_value("adb logcat"))
 
     def test_text_embedding_a_connection_value_is_flagged(self) -> None:
         config = self.config()

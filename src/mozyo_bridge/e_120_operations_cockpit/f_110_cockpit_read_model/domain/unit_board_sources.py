@@ -31,11 +31,17 @@ import shlex
 from dataclasses import dataclass, field
 from typing import Iterable, Mapping, Optional, Sequence
 
+from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.herdr_unit_board import (
+    LOCAL_HOST_ID,
+    safe_text,
+)
 
-#: The implicit source every client always has: the Herdr server this process
-#: can already reach.  Its id is fixed so a Unit observed with no configured
-#: source keeps the identity it had before multi-source observation existed.
-LOCAL_HOST_ID = "local"
+
+#: Re-exported: the implicit source every client always has is the Herdr server
+#: this process can already reach.  Its id is fixed so a Unit observed with no
+#: configured source keeps the identity it had before multi-source observation
+#: existed, and it lives beside the Unit key function that depends on it.
+_LOCAL_HOST_ID = LOCAL_HOST_ID
 
 HOST_KIND_LOCAL = "local"
 HOST_KIND_SSH = "ssh"
@@ -319,15 +325,22 @@ class UnitBoardSourcesConfig:
         # different servers' rows indistinguishable on screen — the same
         # confusion the cross-source identity work exists to prevent, reached
         # through the display layer instead of the identity layer.
+        #
+        # Compared *after* the public-safe projection, not on the raw strings
+        # (review j#101846 finding_3).  The board renders projected labels, and
+        # the projection normalizes Unicode form, drops control codepoints, and
+        # collapses whitespace runs — so two raw labels that differ can render
+        # identically.  Checking the raw values answers a question nobody asks.
         labels: set[str] = set()
         for source in self.sources:
-            folded = source.label.casefold()
-            if folded in labels:
+            projected = safe_text(source.label, fallback="").casefold()
+            if projected in labels:
                 raise UnitBoardSourceError(
-                    f"duplicate Unit board source label {source.label!r}; the label "
-                    "is what the board displays, so it must identify one source"
+                    f"duplicate Unit board source label {source.label!r}; labels are "
+                    "compared as the board displays them, so two labels that render "
+                    "the same identify the same source on screen"
                 )
-            labels.add(folded)
+            labels.add(projected)
         for source in self.sources:
             if source.kind != HOST_KIND_CONTAINER or not source.via:
                 continue
@@ -393,21 +406,35 @@ class UnitBoardSourcesConfig:
     def disclosed_connection_value(self, text: str) -> Optional[str]:
         """Return the first configured connection value ``text`` would disclose.
 
-        Containment rather than equality, because a value embedded in a sentence
-        is disclosed just as fully as one on its own.  Values shorter than three
-        characters are compared whole: a two-character container name would
-        otherwise match almost any text and turn a privacy guard into an
-        unusable one.
+        Two complementary tests, because a value can be disclosed two ways
+        (review j#101846 finding_4):
+
+        - **as a word** — bounded by anything that is not alphanumeric.  This is
+          what catches a short value inside a sentence (``restart db now``
+          discloses a container named ``db``) while leaving an unrelated word
+          that merely starts with the same letters alone (``dbus``).  Length
+          does not enter into it: the contract is that a connection value must
+          not reach a public surface, and a short value is not exempt from it.
+        - **embedded anywhere** — for values of three characters or more, which
+          are specific enough that appearing inside a longer token is still a
+          disclosure rather than a coincidence.
+
+        The text is compared after the same projection the board renders, so a
+        value cannot be smuggled past by a Unicode form or a whitespace run that
+        the display would normalize away.
         """
         if not isinstance(text, str) or not text:
             return None
-        folded = text.casefold()
+        folded = safe_text(text, fallback="").casefold() or text.casefold()
         for value in self.private_connection_values:
-            candidate = value.casefold()
-            if len(candidate) < 3:
-                if folded == candidate:
-                    return value
-            elif candidate in folded:
+            candidate = safe_text(value, fallback="").casefold() or value.casefold()
+            if not candidate:
+                continue
+            if len(candidate) >= 3 and candidate in folded:
+                return value
+            if re.search(
+                rf"(?<![0-9a-z]){re.escape(candidate)}(?![0-9a-z])", folded
+            ):
                 return value
         return None
 

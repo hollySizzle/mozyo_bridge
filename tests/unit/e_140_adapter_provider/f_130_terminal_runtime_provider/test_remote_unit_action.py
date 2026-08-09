@@ -57,7 +57,7 @@ def answers(overrides=None):
     base = {
         REMOTE_BOARD_ARGS: remote_board_payload(),
         REMOTE_WORKSPACE_ARGS: WORKSPACE_PAYLOAD,
-        GATEWAY_ARGS: {"result": "sent"},
+        GATEWAY_ARGS: {"status": "sent", "reason": "ok"},
     }
     base.update(overrides or {})
     return base
@@ -316,6 +316,85 @@ class ApplyDeliveryTests(unittest.TestCase):
 
         self.assertEqual(result.reason, REASON_UNIT_UNRESOLVED)
 
+    def test_a_zero_exit_with_a_non_delivered_outcome_is_not_delivered(self) -> None:
+        # rc 0 is not proof of delivery: a parked composer and a
+        # marker-unobserved queue-enter both exit 0 without reaching a receiver.
+        for label, outcome in (
+            ("blocked", {"status": "blocked", "reason": "turn_start_unconfirmed"}),
+            ("pending_input", {"status": "pending_input", "reason": "ok"}),
+            ("queue_enter", {"status": "sent", "reason": "queue_enter"}),
+            ("empty object", {}),
+        ):
+            with self.subTest(outcome=label):
+                action, runtime, _ = rail(answers({GATEWAY_ARGS: outcome}))
+                unit_id = remote_unit_id(runtime)
+
+                result = action.apply(action.preview(request(unit_id)))
+
+                self.assertEqual(result.state, ACTION_REFUSED)
+                self.assertEqual(result.reason, REASON_DELIVERY_FAILED)
+
+    def test_an_unreadable_gateway_answer_is_not_delivered(self) -> None:
+        class Unreadable(RecordingRunner):
+            def __call__(self, argv, **kwargs):
+                if "project-gateway" in argv[-1]:
+                    self.argvs.append(list(argv))
+                    return subprocess.CompletedProcess(argv, 0, "not json", "")
+                return super().__call__(argv, **kwargs)
+
+        runner = Unreadable(answers())
+        runtime = MultiSourceUnitBoardRuntime(
+            REMOTE_CONFIG, local_runtime=FakeLocalRuntime(), runner=runner, clock=MovableClock()
+        )
+        action = RemoteUnitActionRail(runtime, clock=MovableClock())
+        unit_id = next(
+            unit.unit_id for unit in runtime.snapshot().units if unit.host_id == "devbox"
+        )
+
+        result = action.apply(action.preview(request(unit_id)))
+
+        self.assertEqual(result.reason, REASON_DELIVERY_FAILED)
+
+    def test_a_confirmed_submission_is_delivered_without_echoing_the_record(self) -> None:
+        action, runtime, _ = rail(
+            answers(
+                {
+                    GATEWAY_ARGS: {
+                        "status": "sent",
+                        "reason": "ok",
+                        "target": "%1075",
+                        "repo_root": "/srv/checkouts/mozyo_bridge",
+                    }
+                }
+            )
+        )
+        unit_id = remote_unit_id(runtime)
+
+        result = action.apply(action.preview(request(unit_id)))
+
+        self.assertEqual(result.state, ACTION_DELIVERED)
+        rendered = json.dumps(result.as_payload())
+        self.assertNotIn("%1075", rendered)
+        self.assertNotIn("/srv/checkouts", rendered)
+
+    def test_a_unit_whose_identity_the_client_recomputed_as_ambiguous_refuses(self) -> None:
+        payload = remote_board_payload()
+        payload["units"][0]["agents"] = [
+            {"provider": "codex", "runtime_state": "idle", "interactive_ready": True},
+            {"provider": "codex", "runtime_state": "idle", "interactive_ready": True},
+        ]
+        action, runtime, runner = rail(answers({REMOTE_BOARD_ARGS: payload}))
+        unit_id = next(
+            unit.unit_id for unit in runtime.snapshot().units if unit.host_id == "devbox"
+        )
+
+        preview = action.preview(request(unit_id))
+
+        self.assertEqual(preview.reason, REASON_UNIT_UNRESOLVED)
+        self.assertFalse(
+            [argv for argv in runner.argvs if "project-gateway" in argv[-1]]
+        )
+
     def test_gateway_refusal_is_reported_without_echoing_its_record(self) -> None:
         action, runtime, _ = rail(answers({GATEWAY_ARGS: None}))
         unit_id = remote_unit_id(runtime)
@@ -337,25 +416,6 @@ class ApplyDeliveryTests(unittest.TestCase):
 
         self.assertEqual(result.reason, REASON_DELIVERY_FAILED)
 
-    def test_delivery_detail_reflects_only_the_result_token(self) -> None:
-        action, runtime, _ = rail(
-            answers(
-                {
-                    GATEWAY_ARGS: {
-                        "result": "sent",
-                        "target": "%1075",
-                        "repo_root": "/srv/checkouts/mozyo_bridge",
-                    }
-                }
-            )
-        )
-        unit_id = remote_unit_id(runtime)
-
-        result = action.apply(action.preview(request(unit_id)))
-
-        self.assertIn("result=sent", result.detail)
-        self.assertNotIn("%1075", result.detail)
-        self.assertNotIn("/srv/checkouts", json.dumps(result.as_payload()))
 
 
 if __name__ == "__main__":

@@ -109,7 +109,7 @@ def remote_payload_at(observed_at: str):
 class RemotePayloadTests(unittest.TestCase):
     def test_remote_rows_are_tagged_with_their_source(self) -> None:
         observation = parse_remote_board_payload(
-            remote_payload(), source=REMOTE, observed_at=STAMP
+            remote_payload(), source=REMOTE, observed_at=STAMP, now=NOW
         )
 
         self.assertEqual(observation.status.source_state, SOURCE_LIVE)
@@ -120,7 +120,7 @@ class RemotePayloadTests(unittest.TestCase):
 
     def test_remote_unit_key_is_derived_from_the_remote_opaque_key(self) -> None:
         observation = parse_remote_board_payload(
-            remote_payload(), source=REMOTE, observed_at=STAMP
+            remote_payload(), source=REMOTE, observed_at=STAMP, now=NOW
         )
         unit_id = observation.rows[0].unit_id
 
@@ -153,7 +153,7 @@ class RemotePayloadTests(unittest.TestCase):
         payload["units"][0]["agents"][0]["pane_id"] = "w9:p9"
 
         observation = parse_remote_board_payload(
-            payload, source=REMOTE, observed_at=STAMP
+            payload, source=REMOTE, observed_at=STAMP, now=NOW
         )
 
         self.assertEqual(observation.rows[0].agents[0].pane_id, "")
@@ -162,8 +162,8 @@ class RemotePayloadTests(unittest.TestCase):
         for payload in (None, {}, {"source_state": SOURCE_LIVE}, {"source_state": SOURCE_LIVE, "units": {}}):
             with self.subTest(payload=payload):
                 observation = parse_remote_board_payload(
-                    payload, source=REMOTE, observed_at=STAMP
-                )
+                    payload, source=REMOTE, observed_at=STAMP, now=NOW
+        )
 
                 self.assertEqual(
                     observation.status.source_state, SOURCE_RELOAD_REQUIRED
@@ -176,7 +176,7 @@ class RemotePayloadTests(unittest.TestCase):
         del payload["units"][0]["workspace_id"]
 
         observation = parse_remote_board_payload(
-            payload, source=REMOTE, observed_at=STAMP
+            payload, source=REMOTE, observed_at=STAMP, now=NOW
         )
 
         self.assertEqual(observation.status.source_state, SOURCE_RELOAD_REQUIRED)
@@ -187,7 +187,7 @@ class RemotePayloadTests(unittest.TestCase):
         payload["units"].append(dict(payload["units"][0]))
 
         observation = parse_remote_board_payload(
-            payload, source=REMOTE, observed_at=STAMP
+            payload, source=REMOTE, observed_at=STAMP, now=NOW
         )
 
         self.assertEqual(observation.status.source_state, SOURCE_RELOAD_REQUIRED)
@@ -200,7 +200,7 @@ class RemotePayloadTests(unittest.TestCase):
         ]
 
         observation = parse_remote_board_payload(
-            payload, source=REMOTE, observed_at=STAMP
+            payload, source=REMOTE, observed_at=STAMP, now=NOW
         )
 
         self.assertEqual(observation.status.source_state, SOURCE_RELOAD_REQUIRED)
@@ -211,7 +211,7 @@ class RemotePayloadTests(unittest.TestCase):
         payload["units"][0]["work_label"] = "token=DROP-TOKEN-SENTINEL"
 
         observation = parse_remote_board_payload(
-            payload, source=REMOTE, observed_at=STAMP
+            payload, source=REMOTE, observed_at=STAMP, now=NOW
         )
 
         self.assertEqual(observation.rows[0].project_label, "[redacted]")
@@ -222,6 +222,7 @@ class RemotePayloadTests(unittest.TestCase):
             {"source_state": SOURCE_UNAVAILABLE, "units": []},
             source=REMOTE,
             observed_at=STAMP,
+            now=NOW,
         )
 
         self.assertEqual(observation.status.source_state, SOURCE_UNAVAILABLE)
@@ -303,6 +304,32 @@ class RemotePayloadFreshnessTests(unittest.TestCase):
 
         self.assertEqual(observation.status.source_state, SOURCE_LIVE)
 
+    def test_the_clock_is_required_so_the_parser_cannot_fail_open(self) -> None:
+        # An optional clock would mean a mode in which an undated remote answer
+        # reads as live; a fail-open default at a trust boundary is the defect.
+        with self.assertRaises(TypeError):
+            parse_remote_board_payload(
+                remote_payload(), source=REMOTE, observed_at=STAMP
+            )
+
+    def test_future_beyond_the_skew_allowance_is_stale(self) -> None:
+        beyond = (NOW + timedelta(seconds=MAX_REMOTE_CLOCK_SKEW_SECONDS + 30)).isoformat(
+            timespec="seconds"
+        )
+
+        observation = parse_remote_board_payload(
+            remote_payload_at(beyond), source=REMOTE, observed_at=STAMP, now=NOW
+        )
+
+        self.assertEqual(observation.status.source_state, SOURCE_STALE)
+
+    def test_the_client_side_dimension_still_rejects_every_future_stamp(self) -> None:
+        # One clock measures the round trip, so a future stamp there is a
+        # contradiction rather than skew — a deliberately different rule.
+        self.assertEqual(
+            freshness_state(STAMP, NOW - timedelta(seconds=5)), SOURCE_STALE
+        )
+
     def test_the_bound_is_looser_than_the_client_side_one(self) -> None:
         # The client times its own round trip; this dimension compares two
         # machines' clocks, so it must tolerate more before failing closed.
@@ -318,6 +345,40 @@ class RemotePayloadFreshnessTests(unittest.TestCase):
             ),
             SOURCE_STALE,
         )
+
+
+class RemoteIdentityRecomputationTests(unittest.TestCase):
+    def test_a_row_declaring_resolved_with_a_duplicate_provider_degrades(self) -> None:
+        # The local producer calls this contradiction ambiguous; a remote row
+        # must not walk past the action gate on its own say-so.
+        payload = remote_payload()
+        payload["units"][0]["agents"] = [
+            {"provider": "codex", "runtime_state": "idle", "interactive_ready": True},
+            {"provider": "codex", "runtime_state": "idle", "interactive_ready": True},
+        ]
+
+        observation = parse_remote_board_payload(
+            payload, source=REMOTE, observed_at=STAMP, now=NOW
+        )
+
+        self.assertEqual(observation.rows[0].identity_state, "ambiguous")
+
+    def test_a_consistent_row_keeps_its_declared_state(self) -> None:
+        observation = parse_remote_board_payload(
+            remote_payload(), source=REMOTE, observed_at=STAMP, now=NOW
+        )
+
+        self.assertEqual(observation.rows[0].identity_state, "resolved")
+
+    def test_a_declared_ambiguous_row_is_never_upgraded(self) -> None:
+        payload = remote_payload()
+        payload["units"][0]["identity_state"] = "ambiguous"
+
+        observation = parse_remote_board_payload(
+            payload, source=REMOTE, observed_at=STAMP, now=NOW
+        )
+
+        self.assertEqual(observation.rows[0].identity_state, "ambiguous")
 
 
 class FreshnessTests(unittest.TestCase):
@@ -341,7 +402,7 @@ class FreshnessTests(unittest.TestCase):
 
     def test_mark_stale_keeps_rows_but_removes_action_authority(self) -> None:
         observation = parse_remote_board_payload(
-            remote_payload(), source=REMOTE, observed_at=STAMP
+            remote_payload(), source=REMOTE, observed_at=STAMP, now=NOW
         )
 
         stale = mark_stale(observation, NOW + timedelta(seconds=120))
@@ -357,8 +418,8 @@ class AggregateTests(unittest.TestCase):
             (
                 local_source_observation(local_snapshot(), source=LOCAL),
                 parse_remote_board_payload(
-                    remote_payload(), source=REMOTE, observed_at=STAMP
-                ),
+                    remote_payload(), source=REMOTE, observed_at=STAMP, now=NOW
+        ),
             ),
             observed_at=STAMP,
         )
@@ -379,6 +440,7 @@ class AggregateTests(unittest.TestCase):
                     remote_payload(lane_id="issue_15138"),
                     source=REMOTE,
                     observed_at=STAMP,
+                    now=NOW,
                 ),
             ),
             observed_at=STAMP,

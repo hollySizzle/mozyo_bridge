@@ -25,6 +25,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Sequence
 
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (
+    STAGE_SUBMITTED_CONFIRMED,
+    injection_stage_for_outcome,
+)
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.herdr_unit_board import (
     MAX_PRESENTATION_TEXT,
     SOURCE_LIVE,
@@ -438,34 +442,58 @@ class RemoteUnitActionRail:
         )
         if completed is None or completed.returncode != 0:
             return self._refuse(preview, REASON_DELIVERY_FAILED)
+        if not _gateway_confirmed_submission(completed.stdout):
+            return self._refuse(preview, REASON_DELIVERY_FAILED)
         return RemoteUnitActionResult(
             ACTION_DELIVERED,
             REASON_OK,
-            _delivery_detail(completed.stdout),
+            "the target environment's project gateway confirmed the submission",
             preview,
         )
 
 
-def _delivery_detail(stdout: object) -> str:
-    """Summarize the gateway's own answer without echoing it.
+class _OutcomeView:
+    """Attribute view over a decoded delivery outcome.
 
-    The gateway prints a delivery record that can carry a pane id and a repo
-    root.  Only its ``result`` token is reflected here; the record itself stays
-    on the host that produced it, where the durable anchor already points.
+    The shared injection-stage authority reads an outcome by attribute, and the
+    outcome arrives here as JSON across a process and a host boundary.  This
+    adapts the shape without restating any of the authority's rules.
     """
-    default = "the target environment's project gateway accepted the handoff"
+
+    __slots__ = ("_record",)
+
+    def __init__(self, record: dict) -> None:
+        self._record = record
+
+    def __getattr__(self, name: str) -> object:
+        return self._record.get(name)
+
+
+def _gateway_confirmed_submission(stdout: object) -> bool:
+    """True only when the target gateway's own outcome says it was submitted.
+
+    A zero exit code is **not** proof of delivery — ``delivery_outcome_gate``
+    documents the two rc-0 shapes that never reached a receiver (a ``pending``
+    send that parks the body in the composer, and a marker-unobserved
+    ``queue-enter``).  So the structured outcome is read, and it is read through
+    the *shared* :func:`injection_stage_for_outcome` authority rather than by
+    re-testing status/reason tokens locally: #14232 records what happened when
+    three places answered "was it delivered?" with their own private tables.
+
+    Everything unreadable — absent output, non-JSON, a non-object, an outcome
+    the authority cannot place — resolves to not-confirmed, which is the same
+    direction the authority itself takes for an outcome it cannot see
+    (review j#101846 finding_1).
+    """
     if not isinstance(stdout, str) or not stdout.strip():
-        return default
+        return False
     try:
         payload = json.loads(stdout)
     except (TypeError, ValueError):
-        return default
+        return False
     if not isinstance(payload, dict):
-        return default
-    result = payload.get("result")
-    if not isinstance(result, str) or not result:
-        return default
-    return f"{default} (result={safe_text(result)})"
+        return False
+    return injection_stage_for_outcome(_OutcomeView(payload)) == STAGE_SUBMITTED_CONFIRMED
 
 
 def render_preview(preview: RemoteUnitActionPreview) -> Sequence[str]:

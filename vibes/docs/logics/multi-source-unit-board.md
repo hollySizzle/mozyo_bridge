@@ -58,7 +58,9 @@ sources:
   衝突するため拒否する。local source を別名にしたい場合は `label` を使う。
 - **`label` は source 間で一意でなければならない**。label は board が表示する唯一の source
   identity なので、重複すると 2 つの server の行が画面上で区別できなくなる。identity 層では
-  なく表示層を経由して同じ混同に到達する経路であり、config で閉じる。
+  なく表示層を経由して同じ混同に到達する経路であり、config で閉じる。一意性は **public-safe
+  projection を通した値**で判定する（board が描画するのは projection 後の値であり、raw が違っても
+  Unicode 正規化・空白圧縮で同一表示になりうる）。
 - `kind` ごとに許可 key を固定し、未知 key・misplaced key・重複 key・version 不一致は
   fail-closed。`yaml.safe_load` の duplicate key は宣言順で解決せず拒否する。
 - 接続値 (`ssh_target` / `container` / `mozyo_binary`) は argv 構築の入力にすぎない。
@@ -120,17 +122,28 @@ Unit identity は `host_id + workspace_id + lane_id` である。
 - remote 応答は**untrusted input として再検証する**。向こう側が同じ code を動かしている
   ことは検証を省く理由にならない。全 text は client 側で同じ public-safe projection を
   通し、absolute path / credential 形状は `[redacted]` へ畳む。
-- 観測 timestamp が無い / parse できない / 未来である場合は `stale` とする。client が
-  age を証明できない応答を action authority にしない。
 - freshness は **2 つの独立した dimension の連言**である。両方が成り立って初めて action
-  authority になる。
-  - **client 側 round trip** — 応答が「いつ届いたか」。client 自身の時計だけで判定でき、
-    bound は短い。
-  - **remote 応答自身の `observed_at`** — 応答が「いつ観測したと主張しているか」。client が
-    round trip を計っても、遠隔 host が *いつ観測したか* は証明できない。欠落・parse 不能・
-    過大な過去は `stale` とする。この dimension は 2 台の時計を比較するため、bound は client
-    側より緩く取り、明示の skew 許容を持たせる。厳しくすると軽微な skew を持つ host が恒久的に
-    unactionable になり、fail-closed ではあるが役に立たない。
+  authority になる。**未来時刻の扱いは dimension ごとに異なり、以下がその唯一の記述である**
+  （全面適用の一般則として読まない）。
+  - **client 側 round trip** — 応答が「いつ届いたか」。**単一の時計**で測るため skew は原理的に
+    生じない。したがって負の age（未来）は skew ではなく矛盾であり、**未来は一律 `stale`**。
+    bound は短い。欠落・parse 不能も `stale`。
+  - **remote 応答自身の `observed_at`** — 応答が「いつ観測したと主張しているか」。**2 台の時計の
+    比較**であり、小さな前倒しは通常の skew である。したがって **明示 bound
+    (`MAX_REMOTE_CLOCK_SKEW_SECONDS`) 内の未来は `live`、それを超えれば `stale`**。過去側の bound
+    (`MAX_REMOTE_PAYLOAD_AGE_SECONDS`) は client 側より緩く取る。厳しくすると軽微な skew を持つ
+    host が恒久的に unactionable になり、fail-closed ではあるが役に立たない。欠落・parse 不能は
+    `stale`。
+  - 境界 parser は **clock を必須引数として受け取る**。省略できる形にすると「undated な応答が
+    live になる」呼び出し方が残り、trust boundary の fail-open そのものになる。
+- **remote 応答の identity invariant は client 側で再計算する。** 文字列の再 projection だけでは
+  不十分で、遠隔が自己申告する `identity_state` をそのまま採用してはならない。local producer が
+  `ambiguous` にする矛盾（同一 Unit 内の provider 重複）は client 側でも検出し、declared 値と
+  連言する。degrade は local producer と同じ粒度（当該 row のみ）とし、board の残りは使えるまま
+  にする。
+- **remote registry の `canonical_path` は argv 投入前に厳格検証する**（絶対 path・制御文字なし・
+  長さ bound）。他 host の registry は untrusted input であり、その値が argv 要素になる。
+  subprocess 境界に到達してから例外で落ちると、固定 reason の refusal 契約を破る。
 - **action 対象は `authority_state=resolved` の Unit に限る**。これは「対象 repo の durable な
   workflow role binding を遠隔 host が読めた」ことの表明であり、それが無い Unit は表示に留める。
 
@@ -168,6 +181,16 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   payload は貼り付け可能な出力面であり、そこに接続値が載れば source file を非 tracked に
   置いた意味が失われる。対象 source だけでなく **全 source** の値を対象にする。**refusal 自身も
   出力面**なので、refused preview は operator の自由文を反映せず durable anchor と kind だけを持つ。
+  検出は **token 境界**（前後が英数字でない位置）で行い、**値の長さで例外を作らない**。契約は
+  「接続値を公開面へ出さない」であり、短い値だけ契約外にする根拠は無い（`restart db now` は
+  container `db` の開示、`dbus` は非開示）。3 文字以上の値は語中への埋め込みも検出する。
+- **配送成否は exit code で判定しない。** 対象 gateway の **構造化 outcome** を読み、共有 authority
+  (`injection_stage_for_outcome`) が `submitted_confirmed` を返した場合のみ `delivered` とする。
+  exit 0 でも composer に置いただけの `pending_input` や marker 未観測の `queue_enter` は未配送で
+  あり、正本は `delivery_outcome_gate` / `injection_stage`（同一の問いに複数箇所が別答を出した
+  #14232 の経緯を持つ）。status / reason token を局所で再検査せず、**共有 authority を評価する**。
+  欠落・非 JSON・非 object・authority が位置づけられない outcome はすべて typed `delivery_failed`
+  とし、remote stdout の値を detail へ反射しない。
 - `--summary` は **public-safe projection を素通りする文字列だけを受け付ける**。preview は
   projection を通した文字列を表示するため、projection が書き換える文字列 (control 文字 /
   absolute path / credential 形状 / 正規化される形) を許すと「preview で確認した文字列」と
@@ -194,8 +217,11 @@ read-only observation + 1 本の routed な preview-first action に限る。
 
 - source schema / argv 形状 / 予約 host_id / label 一意性 / 接続値開示判定 / bound の unit tests
 - operator home loader の fail-closed (missing = local-only default / present-but-broken = error)
-- remote payload の再検証、nested envelope 拒否、cross-source duplicate、2 dimension の freshness、
-  degraded source（到達不能 / 読めない応答の分離）の unit tests
+- remote payload の再検証（text の再 projection + identity invariant の再計算）、nested envelope 拒否、
+  cross-source duplicate、2 dimension の freshness（欠落 / parse 不能 / 過去・未来の境界）、
+  degraded source（到達不能 / 読めない応答の分離）、remote registry path の厳格検証の unit tests
+- 配送判定が共有 injection-stage authority を評価していること（exit 0 の非配送 outcome を
+  `delivered` にしない）の unit tests
 - 多 source runtime と action rail の injected-runner tests (live host を使わない)
 - local-only 不変の regression pin (`tests/regressions/test_issue_15138_local_only_unit_board_preserved.py`)
 - local / remote host / remote Dev Container を使った軽量実機確認は #15140 が所有する

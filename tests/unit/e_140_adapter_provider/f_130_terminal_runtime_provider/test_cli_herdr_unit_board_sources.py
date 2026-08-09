@@ -54,7 +54,7 @@ def answers(overrides=None):
     base = {
         REMOTE_BOARD_ARGS: fresh_remote_board(),
         REMOTE_WORKSPACE_ARGS: WORKSPACE_PAYLOAD,
-        GATEWAY_ARGS: {"result": "sent"},
+        GATEWAY_ARGS: {"status": "sent", "reason": "ok"},
     }
     base.update(overrides or {})
     return base
