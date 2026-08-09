@@ -143,15 +143,10 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
                         "executable_matches": True,
                         "credential_readiness": "ready",
                     },
-                    {
-                        "label": "org.mozyo-bridge.callback-supervisor.drain",
-                        "installed": True,
-                        "loaded": True,
-                        "pid": 43,
-                        "home_pin": "ok",
-                        "executable_matches": True,
-                        "credential_readiness": "ready",
-                    },
+                    # The `--drain-only` agent was retired by #15192: each host now owns exactly ONE
+                    # registration, and the backend this reader stands in for returns a one-row
+                    # roster. A capture still showing two agents comes from an un-migrated host and
+                    # is refused as an invalid supervisor set (review j#102151 Finding 2).
                 ]
             },
         }

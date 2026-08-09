@@ -519,6 +519,18 @@ EnvironmentVariables なし）契約を維持する。
 `unreadable` の 4 値で、`owned` だけが削除可能、`foreign` / `unreadable` は typed zero-mutation 拒否とする
 （identity は推測しない）。
 
+**停止は「試みた」ではなく「確認した」でなければならない**（review j#102151 Finding 1）。plist の unlink は
+registration の削除ではない: launchd は bootstrap 済み job を **label** で保持するため、file を消しても job は
+logout まで走り続ける。したがって migration は bootout 後に **当該 label が loaded でないことを読み直し**、
+まだ loaded なら `legacy_drain_still_loaded` で拒否して新 agent を導入しない（live registration 2 個を作らな
+いため）。このとき退役 plist は**あえて残す**: それが operator にとって「まだ生きている登録がある」ことを示す
+唯一の durable な手掛かりであり、消せば live job を隠すことになる。
+
+**判定に bootout の return code を使わない。** `launchctl bootout` は未 load の label に対しても非ゼロを返す
+——これは既に停止済みの退役 agent の通常状態であり、return code を失敗と読むと **正常な migration をすべて
+拒否する**。authority は bootout 後の load 状態であり、「bootout が効いた」と「そもそも load されていなかった」
+は同じ検証済み結果へ収束し、本当に生きている job だけが blocking となる。
+
 **順序は「先に退役、後に install」**であり、これが partial failure 下で不変条件を保つ順序である。逆順（install
 してから migration）にすると途中失敗時に **登録が 2 個** 残る——本変更が終わらせようとしている状態そのものであ
 る。退役を先に行えば残るのは 0 個か 1 個にしかならず、install の再実行は idempotent で、退役した drain leg は
@@ -584,7 +596,14 @@ service unit は `[Install]` を持たない（enable するのは timer のみ�
 systemctl 呼び出しは常に構造化 argv（`daemon-reload` / `enable --now` / `disable --now` / `stop` / `restart` /
 `show` / `reset-failed`）で、shell を経由しない。
 
-**Redmine 未設定は timer 導入の拒否理由にしない**（macOS adapter との意図的な差異）。credential readiness は
+**Redmine 未設定は導入の拒否理由にしない（両 OS 共通）。** #15192 以前は macOS のみ credential 未整備で
+`install` / `restart` を拒否していたが、これは **install できるか否かという operator から見える答え**が host に
+よって違う状態であり、#15192 が解消しようとしている差そのものだった（review j#102151 Finding 4）。macOS の
+gate は supervisor の目的が Redmine reconciliation のみだった #13683 当時の前提の残存であり、#14150 の local
+drain leg 以降、tick は provider 無しでも SQLite + Herdr から有用な仕事をする。よって macOS を #15183 で承認済
+みの local-capable semantics へ揃えた。credential の扱いは一切緩めない: 値を読むのは
+`resolve_redmine_credentials` のみで、unsafe file には警告を返して値を渡さず、plist / unit / status / log の
+いずれにも credential は出ない。credential readiness は
 zero-mutation refusal の gate ではなく **projection** として `missing` / `incomplete` / `unsafe` / `ready` の
 token で報告する。ローカル情報だけで安全に行える処理を止めないためである。安全境界は破れない —
 値を読むのは `resolve_redmine_credentials` であり、unsafe な file には警告を返して値を渡さないので、timer を
@@ -625,13 +644,29 @@ host の manager が公開する情報に従い、**足りない分は key を�
 （human-readable path だけが解釈手段を失う状態を作らない）。
 
 宣言的 definition は backend が実際に **owned する service** に対応させる。`definitions` を owned service と 1 対 1
-の roster とし、`--drain-only` の definition は **どの host でも出さない**（#15192）。これは #15183 review
-Finding 6（「導入しない service の存在を示唆しない」）と同じ規則であり、drain 登録がどの host にも無くなった今、
-例外を適用する host が残っていないだけである。`--drain-only` は manual action として残るが、action に
-definition は要らない。したがって `drain_definition` key と、それだけを設定していた `--drain-interval` flag も
-削除する（何も設定しない flag を「同一設定 surface」として残さない）。CLI help も同様に、host 共通の事実
-（各 1 登録・共通 cadence）と唯一の意図的差異（Linux は credential 未整備でも導入可、macOS は credential gate）
-を書き分け、撤回済み条件を host 共通の事実として書かない。
+の roster とし、`--drain-only` の definition は **どの host の roster にも出さない**（#15192）。これは #15183
+review Finding 6（「導入しない service の存在を示唆しない」）と同じ規則であり、drain 登録がどの host にも無く
+なった今、例外を適用する host が残っていないだけである。`--drain-only` は manual action として残るが、action に
+definition は要らない。CLI help も同様に、host 共通の事実（各 1 登録・共通 cadence・credential 非 gate）を書き、
+撤回済み条件を host 共通の事実として書かない。
+
+### 撤回した surface の互換扱い（#15192 review j#102151 Finding 3）
+
+`drain_definition` key と `--drain-interval` / `--reconciliation-interval` flag は **即時削除しない**。いずれも
+「実登録を設定していなかった」ことは削除の理由になるが、**互換性を不要にする理由にはならない**。`release.md` は
+minor（feature 追加）を後方互換、major を breaking contract と定義し、#15192 は feature であって major decision
+は存在しない。したがって previous release の parser surface を維持する:
+
+| surface | 扱い | 根拠 |
+| --- | --- | --- |
+| `--tick-interval` | 正規の唯一の cadence knob | 受入条件「同じ設定surface」 |
+| `--reconciliation-interval` | deprecated。`--tick-interval` 未指定時は **その synonym として採用** | previous release では definition の interval を実際に設定していたため、無視すると既存 invocation の設定内容が黙って変わる |
+| `--drain-interval` | deprecated。受理するが **inert**（deprecation 通知を出して値を無視） | 設定対象の drain 登録が存在しないため、採用すると嘘になる |
+| `drain_definition` | key は維持するが **retired marker**（`retired: true` / `registered: false`、`command` を持たない） | key を落とすと index する reader が壊れ、従来の内容のままだと F6 が消した「存在の示唆」に戻る |
+
+deprecation は payload の `deprecations` と text 出力の `deprecation:` 行に出す。**沈黙して読み替えない**（何が
+起きたか operator に伝える）。retired marker が「存在の示唆」に当たらないのは、F6 が禁じたのは *service が存在
+するという主張* であって key そのものではなく、`registered: false` は主張ではないためである。
 
 uninstall は unit file を消すだけでは足りず、最後に `reset-failed` で manager 側の状態も消す: 実行中の sweep を
 `stop` すると one-shot は SIGTERM で終了するため systemd が `failed` を記録し、file 削除後もその記録が

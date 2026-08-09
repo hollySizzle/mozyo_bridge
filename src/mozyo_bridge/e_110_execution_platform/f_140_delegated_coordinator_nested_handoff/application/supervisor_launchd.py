@@ -186,6 +186,11 @@ REASON_LEGACY_DRAIN_UNREADABLE = "legacy_drain_unreadable"
 #: failed. Reported instead of proceeding, because proceeding would leave TWO registrations — the
 #: exact state #15192 exists to end.
 REASON_LEGACY_DRAIN_REMOVAL_FAILED = "legacy_drain_removal_failed"
+#: install refused: the retired drain agent is STILL LOADED after the bootout attempt (review
+#: j#102151 Finding 1). Unlinking a plist does not unregister a bootstrapped job — launchd keys the
+#: running job off its label, not off the file — so proceeding here would bootstrap the new agent
+#: alongside a live retired one: two registrations, the exact state this change exists to end.
+REASON_LEGACY_DRAIN_STILL_LOADED = "legacy_drain_still_loaded"
 
 #: Retired-drain classification vocabulary (see :func:`classify_legacy_drain`).
 LEGACY_DRAIN_ABSENT = "absent"  # nothing at the retired path: a clean or already-migrated host
@@ -231,13 +236,6 @@ CREDENTIAL_READY = "ready"  # api key + usable base url present
 CREDENTIAL_INCOMPLETE = "incomplete"  # exactly one of key / usable url present
 CREDENTIAL_MISSING = "missing"  # neither present, and nothing unsafe (the plain unconfigured case)
 CREDENTIAL_UNSAFE = "unsafe"  # a present credential file is unsafe/malformed (permission / YAML)
-
-#: The install/restart refusal reason for each non-ready credential state.
-_CREDENTIAL_REFUSAL_REASON = {
-    CREDENTIAL_INCOMPLETE: "redmine_credential_incomplete",
-    CREDENTIAL_MISSING: "redmine_credential_missing",
-    CREDENTIAL_UNSAFE: "redmine_credential_unsafe",
-}
 
 # A launchctl "print" for an unknown label exits non-zero; treat any non-zero as "not loaded".
 _LAUNCHCTL = "launchctl"
@@ -507,6 +505,18 @@ def remove_legacy_drain(
     reports the refusal token, so the caller can fail closed rather than delete something it cannot
     identify. Its owned log is deliberately left alone: a log is evidence of what the retired agent
     did, and this migration retires a *registration*, not an audit trail.
+
+    **The stop is verified, not assumed** (review j#102151 Finding 1). Unlinking the plist does not
+    unregister anything: launchd keys a bootstrapped job off its *label*, so a job whose file is gone
+    keeps running until logout. This function therefore boots the agent out and then **re-reads
+    whether the label is still loaded**, refusing with :data:`REASON_LEGACY_DRAIN_STILL_LOADED` when
+    it is — the caller must not add a second registration next to a live retired one.
+
+    The bootout **return code is deliberately not the test**. ``launchctl bootout`` exits non-zero
+    for a label that was never loaded, which is the ordinary case on a host whose retired agent is
+    already stopped; treating that as failure would refuse every clean migration. The load state
+    read afterwards is the authority, so both "bootout worked" and "there was nothing to boot out"
+    converge on the same verified outcome, and only a genuinely still-loaded job blocks.
     """
     state = classify_legacy_drain(os_home)
     if state == LEGACY_DRAIN_ABSENT:
@@ -515,6 +525,11 @@ def remove_legacy_drain(
         return {"state": state, "removed": False, "reason": _LEGACY_DRAIN_REFUSAL_REASON[state]}
     # Unload before unlinking: removing the file leaves a bootstrapped service running until logout.
     _launchctl(runner, ["bootout", _service_target(LEGACY_DRAIN_AGENT)])
+    still_loaded, _pid = _is_loaded(runner, agent=LEGACY_DRAIN_AGENT)
+    if still_loaded:
+        # The file is left in place on purpose: it is the only durable record of the registration
+        # the operator still has to deal with, and deleting it would hide a live job.
+        return {"state": state, "removed": False, "reason": REASON_LEGACY_DRAIN_STILL_LOADED}
     try:
         plist_path(os_home, agent=LEGACY_DRAIN_AGENT).unlink()
     except OSError:
@@ -539,11 +554,21 @@ def install(
     """Write the owned plist and (re)bootstrap the single agent. Idempotent; fail-closed.
 
     Refuses — before any filesystem write or launchctl call — on a non-darwin host, a missing
-    executable, a non-ready **daemon-effective** Redmine credential (the mozyo-home file the launchd
-    agent will actually see; an installer's shell env / ``MOZYO_BRIDGE_HOME`` do not leak in), or a
-    retired drain plist that cannot be identified as ours. The mozyo home is resolved **once** and
-    used for both the readiness check and the pinned ``--home`` argv, so the daemon reads the exact
-    root the preflight validated. The plist / log live under the OS user home (``os_home``).
+    executable, or a retired drain plist that cannot be identified as ours. The mozyo home is
+    resolved **once** and used for both the readiness projection and the pinned ``--home`` argv, so
+    the daemon reads the exact root the preflight validated. The plist / log live under the OS user
+    home (``os_home``).
+
+    **An unconfigured Redmine does not block the install** (review j#102151 Finding 4). Readiness is
+    resolved against the pinned home and *reported* as ``credential_readiness``, never used as a
+    gate — the same contract the Linux adapter has carried since #15183. It used to refuse here, a
+    rule inherited from #13683 when a supervisor tick meant nothing but a Redmine reconciliation.
+    Since #14150 gave the sweep a local drain leg, a tick does useful work from SQLite + Herdr with
+    no provider at all, so refusing to schedule anything left the local work unrun and made the
+    *operator-visible* meaning of ``install`` differ per host — which is what #15192 exists to end.
+    Nothing about credential handling loosens: values are still read only by
+    ``resolve_redmine_credentials``, an unsafe file still yields a redacted warning and no value, and
+    no credential reaches the plist, the status projection, or a log.
 
     **Ordering: the retired drain agent is removed BEFORE the owned agent is written** (#15192).
     That is the ordering that makes the acceptance invariant hold under partial failure. Installing
@@ -553,11 +578,12 @@ def install(
     idempotent), and the removed drain leg is not a capability loss, since a ``--run-once`` tick
     already does the drain leg's work.
 
-    Every *preflight* refusal — platform, executable, credential, and an unidentifiable retired
-    plist — is evaluated before **either** mutation, so a refused install is zero-mutation. The one
-    refusal that is not is ``legacy_drain_removal_failed``: by then the retired agent has been booted
-    out, which is reported honestly rather than described as zero-mutation, and the owned agent is
-    still untouched.
+    Every *preflight* refusal — platform, executable, and an unidentifiable retired plist — is
+    evaluated before **either** mutation, so a refused install is zero-mutation. Two refusals are
+    not, and both stop **before the owned agent is touched**: ``legacy_drain_still_loaded`` (the
+    retired job survived its bootout, so adding a second registration is exactly what must not
+    happen) and ``legacy_drain_removal_failed`` (the unlink failed after the job was stopped). These
+    are reported honestly rather than described as zero-mutation.
     """
     if not _running_on_darwin():
         return _refused("install", REASON_UNSUPPORTED_PLATFORM, label=agent.label)
@@ -565,12 +591,9 @@ def install(
     command = resolve_supervisor_command(mozyo_home=resolved_mozyo, which=which, agent=agent)
     if command is None:
         return _refused("install", REASON_EXECUTABLE_NOT_FOUND, label=agent.label)
+    # Projected, NOT gated: an unconfigured Redmine must not stop the agent being installed, or the
+    # local work a tick can safely do never runs (j#102151 Finding 4; matches the Linux adapter).
     readiness = classify_credential_readiness(mozyo_home=resolved_mozyo)
-    if readiness != CREDENTIAL_READY:
-        return _refused(
-            "install", _CREDENTIAL_REFUSAL_REASON[readiness],
-            credential_readiness=readiness, label=agent.label,
-        )
     # Classified (read-only) as part of the preflight, so an unidentifiable legacy plist refuses with
     # zero mutation instead of being discovered halfway through the install.
     legacy_state = classify_legacy_drain(os_home)
@@ -640,8 +663,11 @@ def restart(
     absent), an owned plist that exists but is unreadable / non-mapping, an unhealthy ``--home`` pin
     (missing / malformed / duplicated / not an absolute canonical path), a requested ``mozyo_home``
     that differs from the pin, installed ``ProgramArguments`` that no longer match the command an
-    install would write now (executable / argv drift — reinstall to change), a missing executable, a
-    non-ready pinned-home credential, or a service that is not loaded.
+    install would write now (executable / argv drift — reinstall to change), a missing executable, or
+    a service that is not loaded.
+
+    A non-ready credential does **not** block a restart, for the same reason it no longer blocks an
+    install (j#102151 Finding 4): readiness is reported, not gated, and matches the Linux adapter.
     """
     if not _running_on_darwin():
         return _refused("restart", REASON_UNSUPPORTED_PLATFORM, label=agent.label)
@@ -671,12 +697,8 @@ def restart(
     # service runs a stale command — reinstall to change it, never kickstart the drift (j#79136 R4-F2).
     if installed_argv != expected:
         return _refused("restart", REASON_INSTALLED_COMMAND_DRIFT, label=agent.label)
+    # Projected, NOT gated (j#102151 Finding 4).
     readiness = classify_credential_readiness(mozyo_home=pinned_home)
-    if readiness != CREDENTIAL_READY:
-        return _refused(
-            "restart", _CREDENTIAL_REFUSAL_REASON[readiness],
-            credential_readiness=readiness, label=agent.label,
-        )
     loaded, _pid = _is_loaded(runner, agent=agent)
     if not loaded:
         return _refused(
@@ -920,6 +942,7 @@ __all__ = (
     "REASON_LEGACY_DRAIN_FOREIGN_LABEL",
     "REASON_LEGACY_DRAIN_UNREADABLE",
     "REASON_LEGACY_DRAIN_REMOVAL_FAILED",
+    "REASON_LEGACY_DRAIN_STILL_LOADED",
     "LEGACY_DRAIN_ABSENT",
     "LEGACY_DRAIN_OWNED",
     "LEGACY_DRAIN_FOREIGN",

@@ -79,15 +79,6 @@ def _capture() -> OfflineRolloutCapture:
                 True,
                 "ready",
             ),
-            SupervisorAgentSnapshot(
-                "org.mozyo-bridge.callback-supervisor.drain",
-                True,
-                True,
-                124,
-                "ok",
-                True,
-                "ready",
-            ),
         ),
     )
 
@@ -326,22 +317,45 @@ class OfflineRolloutPlanTests(unittest.TestCase):
         )
         self.assertNotEqual(first.plan_digest, changed.plan_digest)
 
-    def test_owned_supervisor_pair_is_exactly_required(self) -> None:
+    def test_the_owned_supervisor_set_is_exactly_required(self) -> None:
+        # #15192: the owned roster is ONE registration per host. An empty set, a foreign label, and
+        # a capture still carrying the RETIRED drain agent are all invalid — the last one because it
+        # comes from an un-migrated host, and a rollout must not plan against a host still running
+        # two registrations (review j#102151 Finding 2).
         source = _capture()
-        missing = build_offline_rollout_plan(
-            replace(source, supervisors=source.supervisors[:1])
-        )
+        empty = build_offline_rollout_plan(replace(source, supervisors=()))
         foreign = build_offline_rollout_plan(
+            replace(source, supervisors=(replace(source.supervisors[0], label="foreign"),))
+        )
+        un_migrated = build_offline_rollout_plan(
             replace(
                 source,
                 supervisors=(
                     source.supervisors[0],
-                    replace(source.supervisors[1], label="foreign"),
+                    replace(
+                        source.supervisors[0],
+                        label="org.mozyo-bridge.callback-supervisor.drain",
+                    ),
                 ),
             )
         )
-        self.assertEqual(missing.reason, "supervisor_set_invalid")
+        self.assertEqual(empty.reason, "supervisor_set_invalid")
         self.assertEqual(foreign.reason, "supervisor_set_invalid")
+        self.assertEqual(un_migrated.reason, "supervisor_set_invalid")
+        self.assertEqual(un_migrated.detail, "owned_supervisor_set_required")
+
+    def test_a_single_owned_supervisor_capture_plans_successfully(self) -> None:
+        # The positive half: the post-migration one-row roster the backend actually produces must
+        # PLAN, not merely fail differently. This is the seam that #15192 broke.
+        result = build_offline_rollout_plan(_capture())
+        self.assertTrue(result.ok, getattr(result, "detail", result))
+        by_phase = {row["phase"]: row for row in result.plan["phase_order"]}
+        for phase in ("supervisor_stop", "supervisor_pair_install", "supervisor_pair_readback"):
+            self.assertEqual(
+                by_phase[phase]["supervisor_labels"],
+                ["org.mozyo-bridge.callback-supervisor"],
+                phase,
+            )
 
     def test_public_plan_copy_cannot_mutate_digest_authority(self) -> None:
         result = build_offline_rollout_plan(_capture())

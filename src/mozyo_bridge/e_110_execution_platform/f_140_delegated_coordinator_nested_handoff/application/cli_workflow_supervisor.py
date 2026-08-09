@@ -265,18 +265,55 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+#: The deprecated cadence flag and what now carries its meaning (Redmine #15192 / j#102151 F3).
+DEPRECATED_INTERVAL_FLAGS = {
+    "reconciliation_interval": (
+        "--reconciliation-interval",
+        "--reconciliation-interval is deprecated; the OS registration cadence is --tick-interval. "
+        "Using the supplied value as the tick interval.",
+    ),
+    "drain_interval": (
+        "--drain-interval",
+        "--drain-interval is deprecated and ignored; no OS scheduler registers a --drain-only "
+        "service (a --run-once tick already does the drain leg).",
+    ),
+}
+
+
+def _effective_tick_interval(args: argparse.Namespace) -> Optional[int]:
+    """The OS tick cadence, honouring the deprecated ``--reconciliation-interval`` synonym.
+
+    An explicit ``--tick-interval`` always wins. Otherwise a supplied ``--reconciliation-interval``
+    is used, because on the previous release that flag DID set the interval carried by the service
+    definition — so silently ignoring it would change what an existing invocation configures.
+    """
+    explicit = getattr(args, "tick_interval", None)
+    if explicit:
+        return int(explicit)
+    legacy = getattr(args, "reconciliation_interval", None)
+    return int(legacy) if legacy else None
+
+
+def _deprecation_notices(args: argparse.Namespace) -> list:
+    """Fixed, secret-free notices for any deprecated flag the caller supplied."""
+    notices = []
+    for dest, (_flag, message) in DEPRECATED_INTERVAL_FLAGS.items():
+        if getattr(args, dest, None):
+            notices.append(message)
+    return notices
+
+
 def _service_definition(args: argparse.Namespace):
     """The declarative definition of the service this host would own.
 
-    Its interval is the **OS tick** (``--tick-interval``, else the shared portable default), because
-    the definition describes the owned registration — and since #15192 that registration ticks on
-    the OS cadence, not the provider one. Carrying the provider cadence here would advertise 300s
-    beside a `scheduled_interval_seconds` of 180s for the same service. The provider cadence keeps
-    its own key in the status projection (`provider_reconcile_interval_seconds`).
+    Its interval is the **OS tick** (``--tick-interval``, else the deprecated synonym, else the
+    shared portable default), because the definition describes the owned registration — and since
+    #15192 that registration ticks on the OS cadence, not the provider one. Carrying the provider
+    cadence here would advertise 300s beside a `scheduled_interval_seconds` of 180s for the same
+    service. The provider cadence keeps its own key in the status projection
+    (`provider_reconcile_interval_seconds`).
     """
-    interval = int(
-        getattr(args, "tick_interval", None) or DEFAULT_OS_TICK_INTERVAL_SECONDS
-    )
+    interval = int(_effective_tick_interval(args) or DEFAULT_OS_TICK_INTERVAL_SECONDS)
     return build_service_definition(reconciliation_interval_seconds=interval)
 
 
@@ -358,7 +395,8 @@ def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
     # resolve from ``Path.home()`` (never relocated by ``--home``) — j#79092 R2-F1.
     mozyo_home = _home_from_args(args)
     definition = _service_definition(args)
-    tick_interval = getattr(args, "tick_interval", None)
+    tick_interval = _effective_tick_interval(args)
+    deprecations = _deprecation_notices(args)
 
     if verb == "service-status":
         status = supervisor_service_backend.service_status(
@@ -395,7 +433,24 @@ def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
         # the would-be primary definition, not a claim that a service is installed.
         payload["definition"] = definition.as_payload()
         payload["definitions"] = [d.as_payload() for d in owned_definitions]
+        # `drain_definition` was a public key on the previous release, so it is still emitted rather
+        # than dropped (j#102151 Finding 3) — but it must not re-assert that a drain service exists,
+        # which is the claim review j#102053 Finding 6 removed. The honest compatibility shape is a
+        # RETIRED marker: the key survives for readers that index it, and says plainly that nothing
+        # registers it, instead of describing a service no host owns.
+        payload["drain_definition"] = {
+            "retired": True,
+            "retired_by": "issue_15192",
+            "registered": False,
+            "note": (
+                "no OS scheduler registers a --drain-only service on any host; a --run-once tick "
+                "already performs the drain leg. --drain-only remains a manual action."
+            ),
+        }
+        if deprecations:
+            payload["deprecations"] = list(deprecations)
         lines = ["action: service-status", f"backend: {backend}"]
+        lines += [f"deprecation: {n}" for n in deprecations]
         for index, host in enumerate(status.get("agents", ())):
             lines += _service_status_lines(host, index)
         lines.append(f"definition_command: {' '.join(definition.command)}")
@@ -417,12 +472,15 @@ def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
         result = supervisor_service_backend.uninstall()
 
     payload = dict(result)
+    if deprecations:
+        payload["deprecations"] = list(deprecations)
     performed = bool(result.get("performed"))
     lines = [
         f"action: {result.get('action', verb)}",
         f"backend: {result['backend']}",
         f"performed: {performed}",
     ]
+    lines += [f"deprecation: {n}" for n in deprecations]
     if result.get("reason"):
         lines.append(f"reason: {result['reason']}")
     if result.get("rolled_back"):
@@ -580,8 +638,8 @@ def register_supervisor(workflow_sub) -> None:
             "exit result / installed command) + secret-free definition; the mutating verbs drive "
             "the one-shot run-at-load + fixed-interval services (no KeepAlive / Restart= relaunch "
             "loop, no environment block) and fail-closed on a wrong platform / no host service "
-            "manager / missing executable. An unconfigured Redmine does not block installing the "
-            "Linux timer."
+            "manager / missing executable. An unconfigured Redmine blocks the install on neither "
+            "host: readiness is reported, not gated."
         ),
         help=(
             "Workspace callback supervisor: run-once / status / service lifecycle contract. "
@@ -630,17 +688,17 @@ def register_supervisor(workflow_sub) -> None:
         help="Install the ONE owned scheduled one-shot service on this host's OS scheduler: a macOS "
              "LaunchAgent, or a Linux systemd user service + timer, both running `--run-once` every "
              "--tick-interval seconds (default 180). Both fail-closed on a wrong platform / no host "
-             "service manager / missing executable. One difference remains intentional: on Linux an "
-             "unconfigured Redmine does NOT block the install (readiness is reported, not gated) so "
-             "local-only work keeps running, while macOS refuses on a non-ready credential. On "
-             "macOS a retired pre-#15192 `--drain-only` agent is removed as part of the install; an "
-             "unidentifiable plist at that path refuses with zero mutation.",
+             "service manager / missing executable. On NEITHER host does an unconfigured Redmine "
+             "block the install: readiness is reported, not gated, so the local work a tick can "
+             "safely do keeps running. On macOS a retired pre-#15192 `--drain-only` agent is removed "
+             "as part of the install; an unidentifiable plist at that path, or a retired agent that "
+             "is still loaded after its bootout, refuses instead of leaving two registrations.",
     )
     action.add_argument(
         "--restart", action="store_true",
         help="Re-run the scheduled bounded sweep now. Fail-closed if the service is not scheduled "
-             "or the installed command drifted (reinstall to change it). On macOS a non-ready "
-             "credential also refuses; on Linux it does not.",
+             "or the installed command drifted (reinstall to change it). A non-ready credential "
+             "does not refuse on either host; readiness is reported, not gated.",
     )
     action.add_argument(
         "--uninstall", action="store_true",
@@ -662,6 +720,26 @@ def register_supervisor(workflow_sub) -> None:
     p.add_argument(
         "--holder", default=None,
         help="Override the supervisor lease holder id (default: host:pid). One holder per supervisor process.",
+    )
+    # Compatibility inputs (Redmine #15192 review j#102151 Finding 3). Neither ever configured an
+    # OS registration — both only shaped a declarative display — but they were public parser surface
+    # on the previous release, and `release.md` binds a minor feature to backward compatibility. They
+    # are therefore still ACCEPTED, with `--reconciliation-interval` folded onto the one cadence knob
+    # it is a synonym for and `--drain-interval` recorded as inert, so an existing invocation keeps
+    # working and the operator is told what actually happened rather than being failed at parse time.
+    p.add_argument(
+        "--reconciliation-interval", dest="reconciliation_interval", type=int, default=None,
+        help="DEPRECATED (#15192): the OS registration's cadence is now --tick-interval, which this "
+             "is treated as a synonym for when --tick-interval is not given. It never set the "
+             "Redmine cadence; the supervisor body gates provider reads behind its own ~300s "
+             "watermark, reported as provider_reconcile_interval_seconds.",
+    )
+    p.add_argument(
+        "--drain-interval", dest="drain_interval", type=int, default=None,
+        help="DEPRECATED and inert (#15192): no OS scheduler registers a `--drain-only` service on "
+             "any host — a `--run-once` tick already does the drain leg — so there is no drain "
+             "cadence to configure. Accepted so existing invocations keep working; a deprecation "
+             "notice is emitted and the value is ignored.",
     )
     p.add_argument(
         "--tick-interval", dest="tick_interval", type=int, default=None,

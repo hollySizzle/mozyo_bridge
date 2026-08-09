@@ -36,6 +36,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application.cli import build_parser
+
+# Both OS adapters are imported EAGERLY, here, on purpose. Several tests below patch
+# ``sys.platform`` to ``darwin`` on this Linux runner; if the launchd module were first imported
+# under that patch, stdlib ``urllib.request`` would follow it and try the macOS-only ``_scproxy``,
+# failing the test for a reason that has nothing to do with the contract under test. Importing
+# before any patch keeps the platform seam a *behaviour* switch, not an import-time one.
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
     supervisor_launchd as sl,
     supervisor_service_backend as sb,
@@ -100,12 +106,21 @@ class OneRegistrationPerHostTest(_HostCase):
     def test_no_host_registers_a_drain_or_watch_timer(self) -> None:
         # Acceptance 3: they stay MANUAL / event-driven entry points. A registered drain unit is
         # what #15192 retired; a registered `--watch` would be a resident process by another name.
+        #
+        # Asserted against what is REGISTERED — the owned argv tails and the owned definition roster
+        # — not against a substring of the whole payload. A blob grep also matches prose that
+        # correctly *explains* the retirement, so it would fail on an accurate note while still
+        # passing on a real regression that used a different spelling.
         self.assertNotIn("--drain-only", sl.SUPERVISOR_AGENT.argv_tail)
         self.assertNotIn("--drain-only", ss.SUPERVISOR_UNIT.argv_tail)
+        self.assertNotIn("--watch", sl.SUPERVISOR_AGENT.argv_tail)
+        self.assertNotIn("--watch", ss.SUPERVISOR_UNIT.argv_tail)
         for platform in ("darwin", "linux"):
-            blob = json.dumps(self._status(platform))
-            self.assertNotIn("--drain-only", blob, platform)
-            self.assertNotIn("--watch", blob, platform)
+            payload = self._status(platform)
+            registered = [d["command"][-1] for d in payload["definitions"]]
+            self.assertEqual(registered, ["--run-once"], platform)
+            # The retired drain key may exist for compatibility, but must never claim registration.
+            self.assertFalse(payload["drain_definition"]["registered"], platform)
 
     def test_the_manual_entry_points_are_still_reachable(self) -> None:
         # Retiring the drain REGISTRATION must not retire the drain ACTION.
@@ -198,6 +213,97 @@ class CommonStatusVocabularyTest(_HostCase):
             blob = json.dumps(self._status(platform)).lower()
             self.assertNotIn("api_key", blob, platform)
             self.assertNotIn("x-redmine-api-key", blob, platform)
+
+
+class CredentialContractParityTest(unittest.TestCase):
+    """Review j#102151 Finding 4: `install` must mean the same thing on both hosts.
+
+    macOS used to refuse the install outright on a non-ready Redmine credential while Linux
+    installed and projected the readiness. That is not an internals difference — it is the
+    operator-visible answer to "can I install this?", which is precisely what #15192 unifies. The
+    macOS gate was inherited from #13683, when a supervisor tick meant nothing but a Redmine
+    reconciliation; since #14150 a tick does real local work with no provider at all.
+    """
+
+    #: Every non-ready state, so the parity is asserted across the whole matrix, not one sample.
+    NON_READY = ("missing", "incomplete", "unsafe")
+
+    def test_neither_adapter_gates_install_on_credential_readiness(self) -> None:
+        # Asserted structurally against BOTH adapters: no install path may turn a readiness token
+        # into a refusal. A reintroduced gate on either host re-splits the contract.
+        import inspect
+
+        for adapter in (sl, ss):
+            source = inspect.getsource(adapter.install)
+            self.assertNotIn("_CREDENTIAL_REFUSAL_REASON", source, adapter.__name__)
+            self.assertNotIn("!= CREDENTIAL_READY", source, adapter.__name__)
+
+    def test_the_readiness_vocabulary_is_identical_and_complete_on_both(self) -> None:
+        for token in self.NON_READY:
+            self.assertIn(token, (sl.CREDENTIAL_MISSING, sl.CREDENTIAL_INCOMPLETE, sl.CREDENTIAL_UNSAFE))
+            self.assertIn(token, (ss.CREDENTIAL_MISSING, ss.CREDENTIAL_INCOMPLETE, ss.CREDENTIAL_UNSAFE))
+        self.assertEqual(sl.CREDENTIAL_READY, ss.CREDENTIAL_READY)
+
+    def test_no_adapter_reintroduces_a_credential_refusal_token(self) -> None:
+        # The old tokens named the gate. If one comes back as a module constant, the gate came back.
+        for adapter in (sl, ss):
+            for retired in ("redmine_credential_missing", "redmine_credential_incomplete",
+                            "redmine_credential_unsafe"):
+                self.assertNotIn(
+                    retired,
+                    {v for v in vars(adapter).values() if isinstance(v, str)},
+                    f"{adapter.__name__}:{retired}",
+                )
+
+
+class OfflineRolloutSeamTest(_HostCase):
+    """Review j#102151 Finding 2: the capture side and the plan side must agree on the roster size.
+
+    The original defect was a *seam* defect, not a logic one: each half was internally consistent —
+    the snapshot read the backend's one-row roster, the plan required the retired two-label set — so
+    both halves' own tests passed while every real post-migration capture was refused. These tests
+    therefore run the REAL producer into the REAL validator instead of hand-writing a roster, which
+    is the only shape that would have caught it.
+    """
+
+    def _observed_labels(self, platform: str) -> list:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_offline_rollout_snapshot import (  # noqa: E501
+            _supervisor_snapshots,
+            read_supervisor_status,
+        )
+
+        def _fake_run(argv, *a, **k):
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with patch.object(sys, "platform", platform), patch("subprocess.run", _fake_run):
+            snapshots = _supervisor_snapshots(Path(self.home), read_supervisor_status)
+        return [s.label for s in snapshots]
+
+    def test_the_captured_roster_satisfies_the_plan_contract_on_both_hosts(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.domain.offline_rollout_plan import (  # noqa: E501
+            OWNED_SUPERVISOR_LABELS,
+        )
+
+        for platform in ("darwin", "linux"):
+            labels = self._observed_labels(platform)
+            self.assertEqual(len(labels), 1, platform)
+            # The exact predicate the plan validator applies. Asserting the SET equality (not just
+            # the count) is what ties the two halves together.
+            self.assertEqual(set(labels), set(OWNED_SUPERVISOR_LABELS), platform)
+
+    def test_the_capture_side_names_the_same_authority_the_plan_side_enforces(self) -> None:
+        # Deliberately NOT a re-implementation of the plan's predicate here: a test that copies the
+        # rule cannot detect the rule drifting. The producer's output is compared against the
+        # validator's own constant, and the validator's ACCEPTANCE of that roster is pinned where
+        # the real `build_offline_rollout_plan` runs against a full valid capture —
+        # `test_offline_rollout_plan.test_a_single_owned_supervisor_capture_plans_successfully`.
+        # Together the two cover producer -> authority -> validator with no duplicated logic.
+        from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.domain.offline_rollout_plan import (  # noqa: E501
+            OWNED_SUPERVISOR_LABELS,
+        )
+
+        self.assertEqual(len(OWNED_SUPERVISOR_LABELS), 1)
+        self.assertNotIn("org.mozyo-bridge.callback-supervisor.drain", OWNED_SUPERVISOR_LABELS)
 
 
 class UnsupportedHostTest(_HostCase):

@@ -15,7 +15,6 @@ from dataclasses import dataclass, field
 from typing import Mapping, Optional, Sequence
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (  # noqa: E501
-    DEFAULT_SUPERVISOR_DRAIN_SERVICE_LABEL,
     DEFAULT_SUPERVISOR_SERVICE_LABEL,
 )
 
@@ -59,12 +58,14 @@ _SCOPES = frozenset({SCOPE_TARGET_PROJECT, SCOPE_UNRELATED_PROJECT})
 _SHA40 = re.compile(r"[0-9a-f]{40}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _ORIGIN_HEAD_REF = re.compile(r"refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]*")
-OWNED_SUPERVISOR_LABELS = frozenset(
-    {
-        DEFAULT_SUPERVISOR_SERVICE_LABEL,
-        DEFAULT_SUPERVISOR_DRAIN_SERVICE_LABEL,
-    }
-)
+#: The owned supervisor registrations a valid capture must show — exactly ONE per host since
+#: Redmine #15192 retired the second macOS (`--drain-only`) LaunchAgent. This is the *plan-side*
+#: half of that contract: the capture side reads the platform-resolving backend's one-row roster, so
+#: requiring the retired pair here refused every post-migration capture with
+#: `owned_supervisor_pair_required` (review j#102151 Finding 2). A capture that still shows the
+#: retired drain label comes from an un-migrated host, and is refused as an invalid supervisor set:
+#: the rollout must not plan against a host that still runs two registrations.
+OWNED_SUPERVISOR_LABELS = frozenset({DEFAULT_SUPERVISOR_SERVICE_LABEL})
 
 
 def _exact_nonempty(value: object) -> bool:
@@ -500,7 +501,7 @@ def _validate_capture(capture: OfflineRolloutCapture) -> Optional[OfflineRollout
         or not all(_exact_nonempty(label) for label in labels)
         or set(labels) != OWNED_SUPERVISOR_LABELS
     ):
-        return refused(REASON_SUPERVISOR_SET_INVALID, "owned_supervisor_pair_required")
+        return refused(REASON_SUPERVISOR_SET_INVALID, "owned_supervisor_set_required")
     return None
 
 

@@ -336,15 +336,17 @@ class InstallTest(_DarwinCase):
         second = sl.plist_path(self.os_home).read_bytes()
         self.assertEqual(first, second)
 
-    def test_install_refuses_zero_mutation_on_env_only_credential(self) -> None:
+    def test_install_is_not_gated_on_a_shell_only_credential(self) -> None:
+        # A launchd agent never sees the installer's shell env, so readiness resolves against the
+        # home file and reads `missing` here. Since j#102151 Finding 4 that is REPORTED, not gated:
+        # a tick still does useful local work from SQLite + Herdr with no provider at all.
         runner = FakeRunner()
         with patch.dict("os.environ", SHELL_ENV, clear=False):
             result = sl.install(os_home=self.os_home, mozyo_home=self.mozyo_home,
                                 runner=runner, which=_which_found)
-        self.assertFalse(result["performed"])
-        self.assertEqual("redmine_credential_missing", result["reason"])
-        self.assertEqual([], runner.calls)
-        self.assertFalse(sl.plist_path(self.os_home).exists())
+        self.assertTrue(result["performed"], result)
+        self.assertEqual(sl.CREDENTIAL_MISSING, result["credential_readiness"])
+        self.assertTrue(sl.plist_path(self.os_home).exists())
 
     def test_install_refuses_zero_mutation_on_non_darwin(self) -> None:
         _write_home_credential(self.mozyo_home)
@@ -367,25 +369,25 @@ class InstallTest(_DarwinCase):
         self.assertEqual([], runner.calls)
         self.assertFalse(sl.plist_path(self.os_home).exists())
 
-    def test_install_refuses_zero_mutation_on_missing_credential(self) -> None:
+    def test_install_is_not_gated_on_a_missing_credential(self) -> None:
         runner = FakeRunner()
         result = sl.install(os_home=self.os_home, mozyo_home=self.mozyo_home,
                             runner=runner, which=_which_found)
-        self.assertFalse(result["performed"])
-        self.assertEqual("redmine_credential_missing", result["reason"])
-        self.assertEqual([], runner.calls)
-        self.assertFalse(sl.plist_path(self.os_home).exists())
+        self.assertTrue(result["performed"], result)
+        self.assertEqual(sl.CREDENTIAL_MISSING, result["credential_readiness"])
+        self.assertTrue(sl.plist_path(self.os_home).exists())
 
-    def test_install_refuses_zero_mutation_on_incomplete_credential(self) -> None:
+    def test_install_is_not_gated_on_an_incomplete_credential(self) -> None:
         _write_home_credential(self.mozyo_home, url=None)
         runner = FakeRunner()
         result = sl.install(os_home=self.os_home, mozyo_home=self.mozyo_home,
                             runner=runner, which=_which_found)
-        self.assertFalse(result["performed"])
-        self.assertEqual("redmine_credential_incomplete", result["reason"])
-        self.assertEqual([], runner.calls)
+        self.assertTrue(result["performed"], result)
+        self.assertEqual(sl.CREDENTIAL_INCOMPLETE, result["credential_readiness"])
 
-    def test_install_refuses_zero_mutation_on_unsafe_credential(self) -> None:
+    def test_install_is_not_gated_on_an_unsafe_credential(self) -> None:
+        # An unsafe file is reported, and installing does not "use" it: the resolver refuses to read
+        # it and hands back no value, so the timer runs local-only work exactly as with none at all.
         cred = credentials_path(self.mozyo_home)
         cred.parent.mkdir(parents=True, exist_ok=True)
         cred.write_text("- not a mapping\n", encoding="utf-8")
@@ -393,10 +395,10 @@ class InstallTest(_DarwinCase):
         runner = FakeRunner()
         result = sl.install(os_home=self.os_home, mozyo_home=self.mozyo_home,
                             runner=runner, which=_which_found)
-        self.assertFalse(result["performed"])
-        self.assertEqual("redmine_credential_unsafe", result["reason"])
-        self.assertEqual([], runner.calls)
-        self.assertFalse(sl.plist_path(self.os_home).exists())
+        self.assertTrue(result["performed"], result)
+        self.assertEqual(sl.CREDENTIAL_UNSAFE, result["credential_readiness"])
+        # The install neither repairs nor bypasses the unsafe file, and leaks nothing from it.
+        self.assertNotIn("not a mapping", str(result))
 
     def test_install_pins_absolute_executable_for_relative_which(self) -> None:
         # R5-F1: even a relative PATH resolution is pinned as an absolute path in the plist.
@@ -449,17 +451,21 @@ class RestartTest(_DarwinCase):
         self.assertEqual(sl.REASON_NOT_INSTALLED, result["reason"])
         self.assertEqual([], runner.calls)
 
-    def test_restart_checks_the_pinned_home_not_the_current_shell(self) -> None:
-        # R3-F1 core: the plist is pinned to A (no credential); a caller with no --home must NOT
-        # kickstart just because some other current home would be ready.
+    def test_restart_reports_the_pinned_home_readiness_not_the_current_shell(self) -> None:
+        # R3-F1 core, carried into the non-gating contract (j#102151 Finding 4). Readiness no longer
+        # decides whether restart runs, but it must still DESCRIBE the home the loaded service is
+        # actually pinned to. The plist is pinned to A (no credential) while a different, fully
+        # ready home exists; reporting `ready` here would mean the projection had drifted back to
+        # the caller's home, which is the exact defect R3-F1 closed.
+        _write_home_credential(self.mozyo_home)  # a DIFFERENT home that IS ready
         with tempfile.TemporaryDirectory() as a:
             a = Path(a)  # A has NO credential
             _pinned_plist(self.os_home, _resolved(a))
             runner = FakeRunner(print_result=_result(0, stdout="pid = 9\n"))
             result = sl.restart(os_home=self.os_home, runner=runner, which=_which_found)
-        self.assertFalse(result["performed"])
-        self.assertEqual("redmine_credential_missing", result["reason"])
-        self.assertNotIn("kickstart", runner.verbs)
+        self.assertTrue(result["performed"], result)
+        self.assertEqual(sl.CREDENTIAL_MISSING, result["credential_readiness"])
+        self.assertIn("kickstart", runner.verbs)
 
     def test_restart_refuses_on_requested_home_that_differs_from_pin(self) -> None:
         # R3-F1: a --home that disagrees with the installed pin is a re-point attempt -> fail-closed.
@@ -727,6 +733,46 @@ def _legacy_drain_plist(os_home: Path, *, label: str | None = None) -> Path:
     return target
 
 
+class _LegacyStaysLoaded:
+    """launchctl where the RETIRED label is still loaded after its bootout (j#102151 Finding 1)."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv):
+        argv = list(argv)
+        self.calls.append(argv)
+        target = argv[2] if len(argv) > 2 else ""
+        if argv[1] == "bootout" and sl.LEGACY_DRAIN_AGENT.label in target:
+            return _result(1)  # bootout failed
+        if argv[1] == "print" and sl.LEGACY_DRAIN_AGENT.label in target:
+            return _result(0, "\tstate = running\n\tpid = 999\n")  # ...and it is STILL loaded
+        return _result(0)
+
+    @property
+    def verbs(self) -> list[str]:
+        return [c[1] for c in self.calls if len(c) >= 2]
+
+
+class _LegacyNeverLoaded:
+    """launchctl where the RETIRED label was never loaded: bootout AND print both exit non-zero."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv):
+        argv = list(argv)
+        self.calls.append(argv)
+        target = argv[2] if len(argv) > 2 else ""
+        if sl.LEGACY_DRAIN_AGENT.label in target:
+            return _result(1)
+        return _result(0)
+
+    @property
+    def verbs(self) -> list[str]:
+        return [c[1] for c in self.calls if len(c) >= 2]
+
+
 class SingleOwnedAgentTest(_DarwinCase):
     """Redmine #15192: macOS registers exactly ONE LaunchAgent, running the bounded ``--run-once``."""
 
@@ -791,11 +837,11 @@ class LegacyDrainMigrationTest(_DarwinCase):
     def test_install_removes_an_owned_legacy_agent_and_leaves_one_registration(self) -> None:
         _write_home_credential(self.mozyo_home)
         legacy = _legacy_drain_plist(self.os_home)
-        runner = FakeRunner()
+        runner = _LegacyNeverLoaded()
         result = sl.install(
             os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found,
         )
-        self.assertTrue(result["performed"])
+        self.assertTrue(result["performed"], result)
         self.assertEqual(result["legacy_drain"], sl.LEGACY_DRAIN_OWNED)
         self.assertTrue(result["legacy_drain_removed"])
         self.assertFalse(legacy.exists())
@@ -852,7 +898,7 @@ class LegacyDrainMigrationTest(_DarwinCase):
         sl.install(os_home=self.os_home, mozyo_home=self.mozyo_home,
                    runner=FakeRunner(), which=_which_found)
         legacy = _legacy_drain_plist(self.os_home)  # e.g. re-created by an old build
-        result = sl.uninstall(os_home=self.os_home, runner=FakeRunner())
+        result = sl.uninstall(os_home=self.os_home, runner=_LegacyNeverLoaded())
         self.assertTrue(result["performed"])
         self.assertTrue(result["legacy_drain_removed"])
         self.assertFalse(sl.plist_path(self.os_home).exists())
@@ -869,6 +915,54 @@ class LegacyDrainMigrationTest(_DarwinCase):
         self.assertFalse(sl.plist_path(self.os_home).exists())
         self.assertTrue(foreign.exists())
         self.assertEqual(result["legacy_drain_reason"], sl.REASON_LEGACY_DRAIN_FOREIGN_LABEL)
+
+    def test_a_legacy_agent_that_survives_bootout_blocks_the_install(self) -> None:
+        # Review j#102151 Finding 1. Unlinking a plist does NOT unregister a bootstrapped job —
+        # launchd keys it off the label — so if the retired job is still loaded after the bootout,
+        # installing the new agent would produce TWO live registrations. The stop must be verified.
+        _write_home_credential(self.mozyo_home)
+        legacy = _legacy_drain_plist(self.os_home)
+        runner = _LegacyStaysLoaded()
+        result = sl.install(
+            os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found,
+        )
+        self.assertFalse(result["performed"])
+        self.assertEqual(result["reason"], sl.REASON_LEGACY_DRAIN_STILL_LOADED)
+        # The owned agent was never written or bootstrapped...
+        self.assertFalse(sl.plist_path(self.os_home).exists())
+        self.assertNotIn("bootstrap", runner.verbs)
+        # ...and the legacy plist is deliberately KEPT: it is the operator's only durable record of
+        # the live registration still to deal with, and deleting it would hide a running job.
+        self.assertTrue(legacy.exists())
+
+    def test_a_legacy_agent_that_was_never_loaded_migrates_cleanly(self) -> None:
+        # The complement, and the reason the bootout RETURN CODE is not the test: `launchctl bootout`
+        # exits non-zero for a label that was never loaded, which is the ordinary state of an already
+        # stopped retired agent. Gating on the return code would refuse every clean migration.
+        _write_home_credential(self.mozyo_home)
+        legacy = _legacy_drain_plist(self.os_home)
+        runner = _LegacyNeverLoaded()
+        result = sl.install(
+            os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found,
+        )
+        self.assertTrue(result["performed"], result)
+        self.assertTrue(result["legacy_drain_removed"])
+        self.assertFalse(legacy.exists())
+        self.assertTrue(sl.plist_path(self.os_home).exists())
+
+    def test_an_unlinkable_legacy_plist_blocks_the_install_after_a_verified_stop(self) -> None:
+        _write_home_credential(self.mozyo_home)
+        _legacy_drain_plist(self.os_home)
+        runner = _LegacyNeverLoaded()
+        with patch.object(sl.Path, "unlink", side_effect=OSError("read-only")):
+            result = sl.install(
+                os_home=self.os_home, mozyo_home=self.mozyo_home,
+                runner=runner, which=_which_found,
+            )
+        self.assertFalse(result["performed"])
+        self.assertEqual(result["reason"], sl.REASON_LEGACY_DRAIN_REMOVAL_FAILED)
+        self.assertFalse(sl.plist_path(self.os_home).exists())
+        self.assertNotIn("bootstrap", runner.verbs)
 
     def test_migration_is_darwin_only_and_status_reports_a_pending_one(self) -> None:
         _write_home_credential(self.mozyo_home)

@@ -277,8 +277,11 @@ class CliServiceDefinitionRosterTest(_ServiceCliCase):
         self.assertEqual(payload["backend"], sb.BACKEND_SYSTEMD)
         self.assertEqual(len(payload["agents"]), 1)
         # The Linux host installs ONE `--run-once` timer, so advertising a `--drain-only`
-        # definition told the reader a service exists that does not.
-        self.assertNotIn("drain_definition", payload)
+        # definition told the reader a service exists that does not. The key itself survives for
+        # compatibility (j#102151 Finding 3), but only as a retired marker that makes no such claim
+        # — what F6 forbade is the CLAIM, not the key, and `registered: False` is not a claim.
+        self.assertFalse(payload["drain_definition"]["registered"])
+        self.assertNotIn("command", payload["drain_definition"])
         self.assertEqual(len(payload["definitions"]), 1)
         self.assertEqual(payload["definitions"][0]["command"][-1], "--run-once")
 
@@ -298,22 +301,69 @@ class CliServiceDefinitionRosterTest(_ServiceCliCase):
         self.assertEqual(payload["backend"], sb.BACKEND_UNSUPPORTED)
         self.assertEqual(payload["agents"], [])
         self.assertEqual(payload["definitions"], [])
-        self.assertNotIn("drain_definition", payload)
+        # Nothing is owned here, and the retired marker says exactly that too.
+        self.assertFalse(payload["drain_definition"]["registered"])
         # The would-be primary definition stays available to readers that predate the roster; it is
         # not a claim that anything is installed.
         self.assertEqual(payload["definition"]["command"][-1], "--run-once")
 
     def test_no_host_declares_a_drain_service_it_does_not_own(self) -> None:
         # #15192: neither host registers a `--drain-only` service any more, so neither declares one
-        # — not in the roster and not as a stray scalar. Emitting a definition for a service nobody
-        # owns is the defect review j#102053 Finding 6 removed for Linux; the rule now simply has
-        # no host left to exempt. `--drain-only` remains a MANUAL action, which needs no definition.
+        # in the owned roster. Emitting a definition for a service nobody owns is the defect review
+        # j#102053 Finding 6 removed for Linux; the rule now has no host left to exempt.
         for platform in ("darwin", "linux"):
             payload = self._json_status(platform)
             self.assertEqual(len(payload["definitions"]), 1, platform)
             self.assertEqual(payload["definitions"][0]["command"][-1], "--run-once", platform)
-            self.assertNotIn("drain_definition", payload, platform)
-            self.assertNotIn("--drain-only", json.dumps(payload), platform)
+            self.assertNotIn(
+                "--drain-only", [d["command"][-1] for d in payload["definitions"]], platform
+            )
+
+    def test_the_drain_definition_key_survives_as_an_honest_retired_marker(self) -> None:
+        # Compatibility (j#102151 Finding 3) without re-asserting the removed claim: the key stays
+        # for readers that index it, but says it is retired and registered nowhere rather than
+        # describing a service no host owns.
+        for platform in ("darwin", "linux"):
+            drain = self._json_status(platform)["drain_definition"]
+            self.assertTrue(drain["retired"], platform)
+            self.assertFalse(drain["registered"], platform)
+            self.assertNotIn("command", drain, platform)
+
+
+class CliDeprecatedIntervalFlagsTest(_ServiceCliCase):
+    """j#102151 Finding 3: a minor feature keeps the previous release's parser surface working."""
+
+    def _status_with(self, *extra) -> dict:
+        with self._isolated_host("linux"):
+            rc, out = _run(
+                ["workflow", "supervisor", "--service-status", "--home", self.home, "--json", *extra]
+            )
+        self.assertEqual(rc, 0)
+        return json.loads(out)
+
+    def test_the_previous_release_flags_still_parse(self) -> None:
+        # The regression this closes: both flags exited 2 with `unrecognized arguments`.
+        payload = self._status_with("--drain-interval", "60", "--reconciliation-interval", "240")
+        self.assertEqual(len(payload["deprecations"]), 2)
+
+    def test_reconciliation_interval_is_folded_onto_the_one_cadence_knob(self) -> None:
+        # It set the definition's interval on the previous release, so ignoring it would silently
+        # change what an existing invocation configures.
+        payload = self._status_with("--reconciliation-interval", "240")
+        self.assertEqual(payload["definition"]["reconciliation_interval_seconds"], 240)
+        self.assertEqual(payload["agents"][0]["scheduled_interval_seconds"], 240)
+
+    def test_an_explicit_tick_interval_wins_over_the_deprecated_synonym(self) -> None:
+        payload = self._status_with("--reconciliation-interval", "240", "--tick-interval", "90")
+        self.assertEqual(payload["definition"]["reconciliation_interval_seconds"], 90)
+
+    def test_drain_interval_is_accepted_but_inert_and_says_so(self) -> None:
+        payload = self._status_with("--drain-interval", "60")
+        self.assertEqual(payload["definition"]["reconciliation_interval_seconds"], 180)
+        self.assertIn("ignored", " ".join(payload["deprecations"]))
+
+    def test_no_deprecation_noise_when_the_flags_are_not_used(self) -> None:
+        self.assertNotIn("deprecations", self._status_with())
 
 
 class CliServiceHelpContractTest(unittest.TestCase):
@@ -346,17 +396,21 @@ class CliServiceHelpContractTest(unittest.TestCase):
         # The retired two-agent macOS shape must not be advertised anywhere in help.
         self.assertNotIn("LaunchAgent pair", text)
 
-    def test_help_states_that_an_unconfigured_redmine_does_not_block_linux_install(self) -> None:
+    def test_help_states_the_non_gating_install_as_a_host_common_fact(self) -> None:
+        # Previously this was stated as a Linux-only property. Since j#102151 Finding 4 it is the
+        # contract on both hosts, and help must not re-split it.
         text = self._supervisor_help()
-        self.assertIn("unconfigured Redmine does NOT block the install", text)
+        self.assertIn("An unconfigured Redmine blocks the install on neither host", text)
         self.assertIn("readiness is reported, not gated", text)
+        self.assertNotIn("does not block installing the Linux timer", text)
 
-    def test_help_still_states_the_macos_credential_gate(self) -> None:
-        # The one deliberate host difference that survives #15192: macOS gates the install on a
-        # ready credential, Linux projects readiness instead. Help must keep saying so.
+    def test_help_states_the_credential_contract_as_host_common(self) -> None:
+        # j#102151 Finding 4 removed the macOS-only credential gate, so help must no longer describe
+        # one — an install-time difference is operator-visible, which is what #15192 unifies.
         text = self._supervisor_help()
-        self.assertIn("macOS refuses on a non-ready credential", text)
-        self.assertIn("unconfigured Redmine does NOT block the install", text)
+        self.assertIn("On NEITHER host does an unconfigured Redmine block the install", text)
+        self.assertIn("readiness is reported, not gated", text)
+        self.assertNotIn("macOS refuses on a non-ready credential", text)
 
 
 class CliServiceUnsupportedHostTest(_ServiceCliCase):

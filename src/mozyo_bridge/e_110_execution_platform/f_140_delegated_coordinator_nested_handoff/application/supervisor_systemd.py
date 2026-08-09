@@ -29,9 +29,11 @@ Design boundary (Redmine #15183 scope correction j#101996 — the issue body is 
   through the daemon-trusted home-scoped credential file, never a unit. ``ExecStart`` is the exact
   PATH-resolved ``mozyo-bridge`` executable + structured argv, systemd-quoted per token — never a
   shell string, and never ``/bin/sh -c``.
-- **An unconfigured Redmine does not block installing the timer.** This is the sharpest divergence
-  from the macOS adapter and it is deliberate (acceptance: 「Redmine設定が未整備でもtimerの導入自体は
-  拒否しない」). Credential readiness is *projected* as a fixed token, never used as an install gate:
+- **An unconfigured Redmine does not block installing the timer** (acceptance: 「Redmine設定が未整備でも
+  timerの導入自体は拒否しない」). This was the sharpest divergence from the macOS adapter until Redmine
+  #15192 aligned that host to the same contract, so it is now shared rather than a divergence: the
+  operator-visible answer to "can I install this?" no longer depends on the host (j#102151 Finding
+  4). Credential readiness is *projected* as a fixed token, never used as an install gate:
   the local work a tick can safely do from SQLite + Herdr must keep running, and an unreachable
   Redmine surfaces as an explicit result rather than as a refusal to schedule anything at all.
 - **Fail-closed, zero-mutation refusals** remain for the conditions that make the install itself
