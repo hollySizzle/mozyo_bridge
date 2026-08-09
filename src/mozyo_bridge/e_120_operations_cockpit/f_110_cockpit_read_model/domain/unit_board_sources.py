@@ -33,6 +33,7 @@ from typing import Iterable, Mapping, Optional, Sequence
 
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.herdr_unit_board import (
     LOCAL_HOST_ID,
+    REDACTED_TEXT,
     safe_text,
 )
 
@@ -88,8 +89,36 @@ _BINARY_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
 _BINARY_PATH_RE = re.compile(r"^/[A-Za-z0-9_./-]{1,255}$")
 
 
+#: Projected label values that cannot identify a source.  ``unknown`` is the
+#: public-safe projection's own fallback token, so a label equal to it is
+#: indistinguishable from an absent one; ``[redacted]`` is what the projection
+#: emits for a path- or credential-shaped value.  Rejecting them at ingest is
+#: what lets every later surface use the stored label directly.
+_UNUSABLE_LABELS = frozenset({"", "unknown", REDACTED_TEXT})
+
+
 class UnitBoardSourceError(ValueError):
     """An operator source declaration is missing, unknown, or contradictory."""
+
+
+def _canonical_label(value: str, *, where: str) -> str:
+    """Project one operator label to the single value every surface will use.
+
+    Projected **once, at ingest** (review j#101891 finding_3).  Before this, the
+    uniqueness check projected the label while the payload, the board text, and
+    the action preview each rendered the raw string — so the same label had more
+    than one meaning depending on which surface asked, and a path-shaped label
+    reached a public payload unredacted.  Storing the projected value makes the
+    surfaces agree by construction rather than by each remembering to project.
+    """
+    projected = safe_text(value, fallback="")
+    if projected in _UNUSABLE_LABELS:
+        raise UnitBoardSourceError(
+            f"{where} 'label' does not survive the public-safe projection as a "
+            "usable name; choose a short plain label that is not a path, a "
+            "credential shape, or a projection fallback token"
+        )
+    return _validated(projected, _LABEL_RE, key="label", where=where)
 
 
 def _require_str(record: Mapping[str, object], key: str, *, where: str) -> str:
@@ -168,6 +197,13 @@ class UnitBoardSource:
             raise UnitBoardSourceError(
                 f"host_id {LOCAL_HOST_ID!r} is reserved for the local source"
             )
+        # The stored label IS the public value.  Enforced on every construction
+        # path, not just the record loader, so no caller can install a raw label
+        # that later surfaces would render differently.
+        if _canonical_label(self.label, where="a Unit board source") != self.label:
+            raise UnitBoardSourceError(
+                "a Unit board source label must already be its public-safe value"
+            )
 
     @property
     def is_local(self) -> bool:
@@ -220,7 +256,7 @@ class UnitBoardSource:
         raw_label = record.get("label", host_id)
         if not isinstance(raw_label, str) or not raw_label:
             raise UnitBoardSourceError(f"{where} 'label' must be a non-empty string")
-        label = _validated(raw_label, _LABEL_RE, key="label", where=where)
+        label = _canonical_label(raw_label, where=where)
 
         mozyo_binary = DEFAULT_MOZYO_BINARY
         if "mozyo_binary" in record:
@@ -331,9 +367,11 @@ class UnitBoardSourcesConfig:
         # the projection normalizes Unicode form, drops control codepoints, and
         # collapses whitespace runs — so two raw labels that differ can render
         # identically.  Checking the raw values answers a question nobody asks.
+        # The stored label is already the public value (``_canonical_label``),
+        # so comparing it directly IS comparing what the board displays.
         labels: set[str] = set()
         for source in self.sources:
-            projected = safe_text(source.label, fallback="").casefold()
+            projected = source.label.casefold()
             if projected in labels:
                 raise UnitBoardSourceError(
                     f"duplicate Unit board source label {source.label!r}; labels are "

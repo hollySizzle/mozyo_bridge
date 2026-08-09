@@ -363,6 +363,58 @@ class RemoteIdentityRecomputationTests(unittest.TestCase):
 
         self.assertEqual(observation.rows[0].identity_state, "ambiguous")
 
+    def test_a_row_with_no_agents_degrades_to_ambiguous(self) -> None:
+        # A Unit groups at least one observed agent; the local producer cannot
+        # emit an empty one, so the row stays visible but unactionable.
+        payload = remote_payload()
+        payload["units"][0]["agents"] = []
+
+        observation = parse_remote_board_payload(
+            payload, source=REMOTE, observed_at=STAMP, now=NOW
+        )
+
+        self.assertEqual(observation.status.source_state, SOURCE_LIVE)
+        self.assertEqual(observation.rows[0].identity_state, "ambiguous")
+
+    def test_shape_violations_degrade_the_whole_source(self) -> None:
+        # The other half of the split: a field of the wrong type or an empty
+        # identity field means the answer cannot be interpreted at all.
+        cases = {
+            "empty provider": {"agents": [
+                {"provider": "", "runtime_state": "idle", "interactive_ready": True}
+            ]},
+            "empty lane": {"lane_id": ""},
+            "empty workspace": {"workspace_id": ""},
+            # JSON carries "false" as a string and bool("false") is True, so a
+            # truthy read would display the opposite of what the source said.
+            "string readiness": {"agents": [
+                {"provider": "codex", "runtime_state": "idle", "interactive_ready": "false"}
+            ]},
+        }
+        for label, override in cases.items():
+            with self.subTest(case=label):
+                payload = remote_payload()
+                payload["units"][0].update(override)
+
+                observation = parse_remote_board_payload(
+                    payload, source=REMOTE, observed_at=STAMP, now=NOW
+                )
+
+                self.assertEqual(
+                    observation.status.source_state, SOURCE_RELOAD_REQUIRED
+                )
+                self.assertEqual(observation.rows, ())
+
+    def test_an_exact_boolean_readiness_is_carried_through(self) -> None:
+        payload = remote_payload()
+        payload["units"][0]["agents"][0]["interactive_ready"] = False
+
+        observation = parse_remote_board_payload(
+            payload, source=REMOTE, observed_at=STAMP, now=NOW
+        )
+
+        self.assertIs(observation.rows[0].agents[0].interactive_ready, False)
+
     def test_a_consistent_row_keeps_its_declared_state(self) -> None:
         observation = parse_remote_board_payload(
             remote_payload(), source=REMOTE, observed_at=STAMP, now=NOW

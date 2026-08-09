@@ -137,12 +137,19 @@ Unit identity は `host_id + workspace_id + lane_id` である。
   - 境界 parser は **clock を必須引数として受け取る**。省略できる形にすると「undated な応答が
     live になる」呼び出し方が残り、trust boundary の fail-open そのものになる。
 - **remote 応答の identity invariant は client 側で再計算する。** 文字列の再 projection だけでは
-  不十分で、遠隔が自己申告する `identity_state` をそのまま採用してはならない。local producer が
-  `ambiguous` にする矛盾（同一 Unit 内の provider 重複）は client 側でも検出し、declared 値と
-  連言する。degrade は local producer と同じ粒度（当該 row のみ）とし、board の残りは使えるまま
-  にする。
+  不十分で、遠隔が自己申告する `identity_state` をそのまま採用してはならない。degrade 先は
+  **次の 2 分岐で一意に決める**。
+  - **shape 違反 → source 全体を `reload_required`**: `interactive_ready` が exact bool でない
+    （JSON 文字列 `"false"` は truthy であり、そのまま採ると表示が事実の逆になる）、provider が空、
+    identity field (`workspace_id` / `lane_id`) が空。これらは「応答が読めない」に属する。
+  - **well-formed だが矛盾 → 当該 row を `ambiguous`**: agent 0 件、同一 Unit 内の provider 重複。
+    local producer が生成し得ない row を表示には残し、action 不可にする。
+- **source `label` は取込時に 1 回だけ public-safe 値へ投影し、以後その値だけを持つ。** 投影後が
+  空 / 投影の fallback token (`unknown`) / `[redacted]` になる label は config で拒否する。
+  surface ごとに投影し直す設計は、一意性判定と payload で別の値を使うという不整合を生む。
 - **remote registry の `canonical_path` は argv 投入前に厳格検証する**（絶対 path・制御文字なし・
-  長さ bound）。他 host の registry は untrusted input であり、その値が argv 要素になる。
+  長さ bound）。制御文字は **Unicode category (`Cc` / `Cs`)** で判定する。ASCII 範囲の手書き検査は
+  C1 block (U+0080–U+009F) を取りこぼす。他 host の registry は untrusted input であり、その値が argv 要素になる。
   subprocess 境界に到達してから例外で落ちると、固定 reason の refusal 契約を破る。
 - **action 対象は `authority_state=resolved` の Unit に限る**。これは「対象 repo の durable な
   workflow role binding を遠隔 host が読めた」ことの表明であり、それが無い Unit は表示に留める。
@@ -172,8 +179,8 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   source / Unit / repository identity を再観測し、freshness → identity → 配送の順に検査する。
   いずれかが変わっていれば zero-send で refuse する。
 - `--target-repo` に渡す canonical path は対象 host 上の path である。argv 値としてのみ
-  存在し、payload / 描画 / journal には出さない。gateway の応答も `result` token だけを
-  反映し、その delivery record (pane id / repo root を含む) は生成 host 側に残す。
+  存在し、payload / 描画 / journal には出さない。gateway の delivery record (pane id /
+  repo root を含む) も生成 host 側に残し、client へは一切反映しない。
 - local Unit はこの route の対象外である (`local_source_not_routed`)。local には通常の
   same-host handoff command があり、同じことを 2 経路にしない。
 - **operator が入力する自由文（`--summary` / `--target-project`）が、設定済みの接続値
@@ -186,6 +193,12 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   container `db` の開示、`dbus` は非開示）。3 文字以上の値は語中への埋め込みも検出する。
 - **配送成否は exit code で判定しない。** 対象 gateway の **構造化 outcome** を読み、共有 authority
   (`injection_stage_for_outcome`) が `submitted_confirmed` を返した場合のみ `delivered` とする。
+  **構造化 outcome は判定にのみ使い、client の表示は固定の public-safe 文言とする**（remote の値を
+  一切反映しない。これが本項の唯一の契約である）。
+  出力形状は決定的にする: gateway 呼び出しで `--record-format json` を明示し、読み取りは
+  documented scrape target である **末尾の JSON-looking line** を読む。`record_format` の既定は
+  `both`（人間可読 record → 空行 → 単一行 JSON）であり、stdout 全体を 1 つの JSON として
+  parse すると **実配送成功を失敗と誤判定する**。
   exit 0 でも composer に置いただけの `pending_input` や marker 未観測の `queue_enter` は未配送で
   あり、正本は `delivery_outcome_gate` / `injection_stage`（同一の問いに複数箇所が別答を出した
   #14232 の経緯を持つ）。status / reason token を局所で再検査せず、**共有 authority を評価する**。

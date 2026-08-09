@@ -23,6 +23,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
     MultiSourceUnitBoardRuntime,
 )
 
+from tests.unit.e_140_adapter_provider.f_130_terminal_runtime_provider.test_remote_unit_action import (
+    delivery_record,
+)
 from tests.unit.e_140_adapter_provider.f_130_terminal_runtime_provider.test_herdr_multi_source_unit_board import (
     REMOTE_CONFIG,
     WORKSPACE_PAYLOAD,
@@ -54,7 +57,7 @@ def answers(overrides=None):
     base = {
         REMOTE_BOARD_ARGS: fresh_remote_board(),
         REMOTE_WORKSPACE_ARGS: WORKSPACE_PAYLOAD,
-        GATEWAY_ARGS: {"status": "sent", "reason": "ok"},
+        GATEWAY_ARGS: delivery_record(),
     }
     base.update(overrides or {})
     return base

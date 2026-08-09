@@ -134,9 +134,12 @@ class RecordingRunner:
                     raise answer
                 if answer is None:
                     return subprocess.CompletedProcess(argv, 1, "", "")
-                return subprocess.CompletedProcess(
-                    argv, 0, json.dumps(answer), ""
-                )
+                # A ``str`` answer is already-rendered stdout, so a test can
+                # hand over the shape a CLI really prints (a human-readable
+                # record, a blank line, then the JSON outcome last).  A mapping
+                # is the JSON-only shape.
+                stdout = answer if isinstance(answer, str) else json.dumps(answer)
+                return subprocess.CompletedProcess(argv, 0, stdout, "")
         return subprocess.CompletedProcess(argv, 127, "", "")
 
 
@@ -434,6 +437,20 @@ class SourceWorkspaceTests(unittest.TestCase):
                         REMOTE_CONFIG.by_id["devbox"], WORKSPACE_A
                     )
                 )
+
+    def test_control_characters_are_rejected_across_the_whole_category(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_multi_source_unit_board import (
+            _usable_remote_path,
+        )
+
+        self.assertTrue(_usable_remote_path("/srv/checkouts/mozyo_bridge"))
+        for name, char in (
+            ("NUL", "\x00"), ("C0", "\x1f"), ("DEL", "\x7f"),
+            # The C1 block is what an ASCII-range check silently passes.
+            ("C1 lower", "\x80"), ("NEL", "\x85"), ("C1 upper", "\x9f"),
+        ):
+            with self.subTest(control=name):
+                self.assertFalse(_usable_remote_path("/srv/" + char + "x"))
 
     def test_an_argv_the_subprocess_layer_refuses_is_a_typed_failure(self) -> None:
         def refusing(argv, **kw):

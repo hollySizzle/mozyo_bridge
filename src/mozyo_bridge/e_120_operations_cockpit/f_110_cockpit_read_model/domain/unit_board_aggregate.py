@@ -280,9 +280,17 @@ def _recomputed_identity_state(declared: object, cells: Sequence[AgentCell]) -> 
     row asserting ``resolved`` while carrying the same contradiction would
     otherwise walk straight past the client's action gate on its own say-so.
 
-    Recomputed at the same granularity the local producer uses, so the
-    contradictory row degrades and the rest of the board stays usable.
+    This half handles the **well-formed but contradictory** case: the answer
+    parses and its fields have the right types, yet it describes something the
+    local producer could not have produced.  Those rows stay visible and become
+    unactionable.  A *shape* violation is the other half and is raised instead,
+    degrading the whole source to ``reload_required`` — the split is stated in
+    ``multi-source-unit-board.md`` (review j#101891 finding_2).
     """
+    if not cells:
+        # A Unit is a grouping of at least one observed agent; the local
+        # producer cannot emit an empty one.
+        return IDENTITY_AMBIGUOUS
     providers = [cell.provider for cell in cells]
     if len(providers) != len(set(providers)):
         return IDENTITY_AMBIGUOUS
@@ -290,6 +298,13 @@ def _recomputed_identity_state(declared: object, cells: Sequence[AgentCell]) -> 
 
 
 def _agent_cells(raw: object) -> tuple[AgentCell, ...]:
+    """Decode the agent list, or raise so the whole source reads as unreadable.
+
+    Everything here is a *shape* question — a field of the wrong type or an
+    identity field that is empty.  A remote answer that fails one of these is
+    not a board the client can interpret at all, so it degrades the source
+    rather than one row (review j#101891 finding_2).
+    """
     if not isinstance(raw, list) or len(raw) > MAX_SOURCE_AGENTS:
         raise ValueError("unreadable agent list")
     cells: list[AgentCell] = []
@@ -298,13 +313,23 @@ def _agent_cells(raw: object) -> tuple[AgentCell, ...]:
             raise ValueError("unreadable agent row")
         provider = item.get("provider")
         runtime_state = item.get("runtime_state")
+        ready = item.get("interactive_ready", False)
         if not isinstance(provider, str) or not isinstance(runtime_state, str):
             raise ValueError("unreadable agent row")
+        # An exact bool, not a truthy value: JSON carries ``"false"`` as a
+        # string, and ``bool("false")`` is True — a readiness display that says
+        # the opposite of what the source reported.
+        if not isinstance(ready, bool):
+            raise ValueError("unreadable agent readiness")
+        # The provider names which half of the pair this is; an empty one leaves
+        # the Unit's own membership undefined.
+        if not safe_text(provider, fallback=""):
+            raise ValueError("unreadable agent provider")
         cells.append(
             AgentCell(
                 provider=safe_text(provider),
                 runtime_state=safe_text(runtime_state),
-                interactive_ready=bool(item.get("interactive_ready", False)),
+                interactive_ready=ready,
                 # A remote pane locator is meaningless in this process and is
                 # deliberately absent from the remote payload; nothing on the
                 # client may address a pane on another server.
@@ -376,8 +401,13 @@ def parse_remote_board_payload(
             if (
                 not isinstance(remote_unit_id, str)
                 or not remote_unit_id
+                # Identity fields must be present, not merely of the right type:
+                # an empty workspace or lane is a row with no identity to join
+                # on (review j#101891 finding_2).
                 or not isinstance(workspace_id, str)
+                or not workspace_id.strip()
                 or not isinstance(lane_id, str)
+                or not lane_id.strip()
                 or authority_state not in AUTHORITY_STATES
             ):
                 raise ValueError("unreadable unit row")

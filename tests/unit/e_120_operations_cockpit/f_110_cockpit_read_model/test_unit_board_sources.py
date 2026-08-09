@@ -187,6 +187,33 @@ class SourceSchemaTests(unittest.TestCase):
         self.assertNotIn("SSH-DESTINATION-SENTINEL", str(payload))
 
 
+class CanonicalLabelTests(unittest.TestCase):
+    def test_the_stored_label_is_already_the_public_value(self) -> None:
+        # Projected once at ingest, so every surface reads the same string
+        # without each having to remember to project it.
+        source = UnitBoardSource.from_record(ssh_record(label="dev  host"))
+
+        self.assertEqual(source.label, "dev host")
+        self.assertEqual(source.as_payload()["host_label"], "dev host")
+
+    def test_a_label_the_projection_would_rewrite_is_rejected(self) -> None:
+        for label in (
+            "/srv/private/path",   # renders as [redacted]
+            "\u202e",              # renders as nothing at all
+            "unknown",             # the projection's own fallback token
+            "   ",
+        ):
+            with self.subTest(label=label):
+                with self.assertRaises(UnitBoardSourceError):
+                    UnitBoardSource.from_record(ssh_record(label=label))
+
+    def test_a_raw_label_cannot_be_installed_by_direct_construction(self) -> None:
+        with self.assertRaises(UnitBoardSourceError):
+            UnitBoardSource(
+                host_id="devbox", label="dev  host", kind="ssh", ssh_target="devbox"
+            )
+
+
 class ConnectionValueDisclosureTests(unittest.TestCase):
     def config(self) -> UnitBoardSourcesConfig:
         return UnitBoardSourcesConfig.from_record(

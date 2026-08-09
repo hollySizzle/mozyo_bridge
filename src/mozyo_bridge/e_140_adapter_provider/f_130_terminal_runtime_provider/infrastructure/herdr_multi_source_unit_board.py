@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Optional, Sequence
@@ -87,9 +88,12 @@ def _usable_remote_path(value: object) -> bool:
         return False
     if len(value) > MAX_REMOTE_PATH_LENGTH:
         return False
-    # Any control codepoint, NUL included.  A path is a filesystem location; a
-    # control character in one means the registry answer is not what it claims.
-    return not any(ord(char) < 0x20 or ord(char) == 0x7F for char in value)
+    # Any control codepoint, by Unicode category rather than by an ASCII range.
+    # A hand-written range check covered C0 and DEL but silently passed the C1
+    # block (U+0080-U+009F), so the comment claimed more than the code did
+    # (review j#101891 finding_4).  Surrogates are rejected on the same ground:
+    # a path is a filesystem location, and neither belongs in one.
+    return not any(unicodedata.category(char) in {"Cc", "Cs"} for char in value)
 
 #: Extra seconds allowed beyond a source's connection timeout for the remote
 #: command itself to run and answer.

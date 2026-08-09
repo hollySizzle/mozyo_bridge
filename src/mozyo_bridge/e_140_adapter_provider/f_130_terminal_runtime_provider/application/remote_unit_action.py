@@ -372,7 +372,14 @@ class RemoteUnitActionRail:
             "standard",
             "--summary",
             preview.summary,
-            "--json",
+            # The gateway's own ``--json`` only shapes a *fail-closed resolution*
+            # payload; a successful handoff still uses the ``both`` record format
+            # by default and prints a markdown record before the JSON.  Asking
+            # for the single-line shape makes the answer deterministic instead
+            # of leaving the reader to cope with two of them (review j#101891
+            # finding_1).
+            "--record-format",
+            "json",
         )
 
     def apply(self, preview: RemoteUnitActionPreview) -> RemoteUnitActionResult:
@@ -469,6 +476,37 @@ class _OutcomeView:
         return self._record.get(name)
 
 
+def _delivery_outcome_record(stdout: object) -> Optional[dict]:
+    """The structured delivery outcome from a handoff CLI's stdout, or ``None``.
+
+    The documented scrape target is the **last JSON-looking line**: the default
+    ``record_format=both`` prints a human-readable record first, a blank line,
+    and the single-line outcome last, precisely so that callers reading the last
+    JSON line keep working (``handoff_delivery_command``).  Parsing the whole
+    stdout as one document therefore fails on the shape the CLI actually emits,
+    which is how a real delivery came to be reported as a failure (review
+    j#101891 finding_1).
+
+    Every existing consumer of this contract scans the lines in reverse locally;
+    there is no shared export to import, and adding one would create a fourth
+    place that answers this question.  So the same documented scan lives here,
+    while the *verdict* stays with the shared authority below.
+    """
+    if not isinstance(stdout, str):
+        return None
+    for line in reversed(stdout.splitlines()):
+        line = line.strip()
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            payload = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and "status" in payload and "reason" in payload:
+            return payload
+    return None
+
+
 def _gateway_confirmed_submission(stdout: object) -> bool:
     """True only when the target gateway's own outcome says it was submitted.
 
@@ -480,18 +518,13 @@ def _gateway_confirmed_submission(stdout: object) -> bool:
     re-testing status/reason tokens locally: #14232 records what happened when
     three places answered "was it delivered?" with their own private tables.
 
-    Everything unreadable — absent output, non-JSON, a non-object, an outcome
-    the authority cannot place — resolves to not-confirmed, which is the same
-    direction the authority itself takes for an outcome it cannot see
+    Everything unreadable — absent output, no JSON line, a non-object, an
+    outcome the authority cannot place — resolves to not-confirmed, which is the
+    same direction the authority itself takes for an outcome it cannot see
     (review j#101846 finding_1).
     """
-    if not isinstance(stdout, str) or not stdout.strip():
-        return False
-    try:
-        payload = json.loads(stdout)
-    except (TypeError, ValueError):
-        return False
-    if not isinstance(payload, dict):
+    payload = _delivery_outcome_record(stdout)
+    if payload is None:
         return False
     return injection_stage_for_outcome(_OutcomeView(payload)) == STAGE_SUBMITTED_CONFIRMED
 

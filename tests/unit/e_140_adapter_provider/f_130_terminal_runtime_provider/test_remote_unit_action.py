@@ -43,6 +43,28 @@ from tests.unit.e_140_adapter_provider.f_130_terminal_runtime_provider.test_herd
 GATEWAY_ARGS = ("project-gateway", "handoff")
 
 
+def delivery_record(**outcome) -> str:
+    """The shape a handoff CLI actually prints.
+
+    ``record_format`` defaults to ``both``: a human-readable record, a blank
+    line, then the single-line JSON outcome last.  The R3 fixture returned only
+    the bare JSON, which is why a reader that parsed the whole stdout as one
+    document passed its tests and failed against the real CLI (review j#101891
+    finding_1).
+    """
+    payload = {"status": "sent", "reason": "ok"}
+    payload.update(outcome)
+    return (
+        "Delivery result — sent\n"
+        "\n"
+        "- Receiver: `codex`\n"
+        "- Source: `redmine`\n"
+        f"- Status: `{payload['status']}` (reason: `{payload['reason']}`)\n"
+        "\n"
+        + json.dumps(payload)
+    )
+
+
 class MovableClock:
     """A clock the test advances explicitly, shared by runtime and rail."""
 
@@ -57,7 +79,7 @@ def answers(overrides=None):
     base = {
         REMOTE_BOARD_ARGS: remote_board_payload(),
         REMOTE_WORKSPACE_ARGS: WORKSPACE_PAYLOAD,
-        GATEWAY_ARGS: {"status": "sent", "reason": "ok"},
+        GATEWAY_ARGS: delivery_record(),
     }
     base.update(overrides or {})
     return base
@@ -320,10 +342,11 @@ class ApplyDeliveryTests(unittest.TestCase):
         # rc 0 is not proof of delivery: a parked composer and a
         # marker-unobserved queue-enter both exit 0 without reaching a receiver.
         for label, outcome in (
-            ("blocked", {"status": "blocked", "reason": "turn_start_unconfirmed"}),
-            ("pending_input", {"status": "pending_input", "reason": "ok"}),
-            ("queue_enter", {"status": "sent", "reason": "queue_enter"}),
+            ("blocked", delivery_record(status="blocked", reason="turn_start_unconfirmed")),
+            ("pending_input", delivery_record(status="pending_input", reason="ok")),
+            ("queue_enter", delivery_record(status="sent", reason="queue_enter")),
             ("empty object", {}),
+            ("record with no JSON line", "Delivery result — sent\n\n- Status: `sent`"),
         ):
             with self.subTest(outcome=label):
                 action, runtime, _ = rail(answers({GATEWAY_ARGS: outcome}))
@@ -356,15 +379,12 @@ class ApplyDeliveryTests(unittest.TestCase):
         self.assertEqual(result.reason, REASON_DELIVERY_FAILED)
 
     def test_a_confirmed_submission_is_delivered_without_echoing_the_record(self) -> None:
-        action, runtime, _ = rail(
+        action, runtime, runner = rail(
             answers(
                 {
-                    GATEWAY_ARGS: {
-                        "status": "sent",
-                        "reason": "ok",
-                        "target": "%1075",
-                        "repo_root": "/srv/checkouts/mozyo_bridge",
-                    }
+                    GATEWAY_ARGS: delivery_record(
+                        target="%1075", repo_root="/srv/checkouts/mozyo_bridge"
+                    )
                 }
             )
         )
@@ -376,6 +396,19 @@ class ApplyDeliveryTests(unittest.TestCase):
         rendered = json.dumps(result.as_payload())
         self.assertNotIn("%1075", rendered)
         self.assertNotIn("/srv/checkouts", rendered)
+
+    def test_the_gateway_is_asked_for_a_deterministic_output_shape(self) -> None:
+        # The gateway's own --json only shapes a fail-closed resolution; without
+        # this the success path returns the markdown-plus-JSON default.
+        action, runtime, runner = rail()
+        unit_id = remote_unit_id(runtime)
+
+        action.apply(action.preview(request(unit_id)))
+
+        command = next(
+            argv[-1] for argv in runner.argvs if "project-gateway" in argv[-1]
+        )
+        self.assertIn("--record-format json", command)
 
     def test_a_unit_whose_identity_the_client_recomputed_as_ambiguous_refuses(self) -> None:
         payload = remote_board_payload()
