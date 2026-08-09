@@ -40,6 +40,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     MOZYO_HERDR_NATIVE_NAME_ENV,
     MOZYO_PROVIDER_ARGV0_ENV,
 )
+from mozyo_bridge.shared.paths import process_home_fence
 
 NAME = "mzb1_ws1_claude_default"
 # MOZYO_HERDR_BINARY is part of the launcher-injected env (see herdr_launch_argv's
@@ -502,10 +503,16 @@ class CmdAgentAttestTest(unittest.TestCase):
             HerdrIdentityAttestationStore,
         )
 
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+        # The production wrapper resolves its store from MOZYO_BRIDGE_HOME, so this
+        # integration-shaped test must place that home inside the process-level test
+        # fence when the canonical runner has one. A bare unittest run has no fence and
+        # keeps tempfile's ordinary platform default.
+        fence = process_home_fence()
+        with tempfile.TemporaryDirectory(dir=fence.root if fence else None) as tmp, patch.dict(
             "os.environ",
             {"MOZYO_BRIDGE_HOME": tmp, "MOZYO_HERDR_BINARY": "/x/herdr",
              "MOZYO_WORKSPACE_ID": "ws1", "MOZYO_AGENT_ROLE": "claude", "MOZYO_LANE_ID": "default"},
+            clear=True,
         ), patch(
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
             "application.herdr_agent_attest.bounded_self_lookup",
