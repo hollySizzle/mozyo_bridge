@@ -45,6 +45,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     SCHEME_PREFIX,
     decode_assigned_name,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (
+    _workspace_prefix,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
     TerminalTransportError,
     valid_target,
@@ -201,11 +204,22 @@ class MetadataSyncReport:
 
 
 @dataclass(frozen=True)
+class UnitColumnActionContext:
+    """Private action-time context for one opaque Unit-board selection."""
+
+    unit_id: str
+    workspace_id: str
+    lane_id: str
+    herdr_workspace_id: str
+
+
+@dataclass(frozen=True)
 class _ObservedBoard:
     snapshot: UnitBoardSnapshot
     unmanaged_panes: tuple[str, ...]
     metadata_authority: tuple[tuple[str, ...], ...]
     action_identities: tuple[tuple[str, str, str], ...] = ()
+    column_action_contexts: tuple[UnitColumnActionContext, ...] = ()
 
 
 class HerdrUnitBoardRuntime:
@@ -352,6 +366,7 @@ class HerdrUnitBoardRuntime:
         observed_panes: set[str] = set()
         metadata_authority: list[tuple[str, ...]] = []
         display_by_unit: dict[tuple[str, str], tuple[str, str, str, str]] = {}
+        host_workspaces_by_unit: dict[tuple[str, str], set[str]] = {}
         for row in rows:
             if not isinstance(row, Mapping):
                 unmanaged += 1
@@ -402,6 +417,11 @@ class HerdrUnitBoardRuntime:
                 )
             managed_panes.add(pane_id)
             unit_key = (identity.workspace_id, identity.lane_id)
+            host_workspace = _workspace_prefix(pane_id)
+            if host_workspace:
+                host_workspaces_by_unit.setdefault(unit_key, set()).add(
+                    host_workspace
+                )
             display = display_by_unit.get(unit_key)
             if display is None:
                 record = self._workspace_loader(identity.workspace_id)
@@ -482,6 +502,24 @@ class HerdrUnitBoardRuntime:
                     for workspace_id, lane_id in display_by_unit
                 )
             ),
+            column_action_contexts=tuple(
+                sorted(
+                    (
+                        UnitColumnActionContext(
+                            _unit_public_id(workspace_id, lane_id),
+                            workspace_id,
+                            lane_id,
+                            next(iter(host_workspaces)),
+                        )
+                        for (
+                            workspace_id,
+                            lane_id,
+                        ), host_workspaces in host_workspaces_by_unit.items()
+                        if len(host_workspaces) == 1
+                    ),
+                    key=lambda item: item.unit_id,
+                )
+            ),
         )
 
     def snapshot(self) -> UnitBoardSnapshot:
@@ -504,6 +542,23 @@ class HerdrUnitBoardRuntime:
             (workspace_id, lane_id)
             for public_id, workspace_id, lane_id in observed.action_identities
             if public_id == unit_id
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def column_action_context(
+        self, unit_id: str
+    ) -> Optional[UnitColumnActionContext]:
+        """Resolve one opaque Unit id to a fresh same-workspace action context."""
+
+        if not isinstance(unit_id, str) or not unit_id:
+            return None
+        observed = self._observe()
+        if not observed.snapshot.ok:
+            return None
+        matches = [
+            context
+            for context in observed.column_action_contexts
+            if context.unit_id == unit_id
         ]
         return matches[0] if len(matches) == 1 else None
 
@@ -734,6 +789,7 @@ __all__ = (
     "MetadataSyncLockError",
     "MetadataSyncFailure",
     "MetadataSyncReport",
+    "UnitColumnActionContext",
     "resolve_unit_board_binary",
     "unit_board_metadata_lock",
 )

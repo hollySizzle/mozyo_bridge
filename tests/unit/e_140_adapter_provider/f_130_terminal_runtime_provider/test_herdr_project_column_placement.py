@@ -10,6 +10,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     group_by_pair,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_placement import (  # noqa: E501
+    COLUMN_MOVE_LEFT,
+    COLUMN_MOVE_RIGHT,
+    COLUMN_WIDTH_DECREASE,
+    COLUMN_WIDTH_INCREASE,
     HerdrProjectColumnPlacement,
     PLACEMENT_APPLIED,
     PLACEMENT_DEFERRED,
@@ -18,6 +22,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     PREVIEW_DEFERRED,
     PREVIEW_MATCHED,
     PREVIEW_READY,
+    PREVIEW_REFUSED,
+    REASON_ADJUSTMENT_INVALID,
+    REASON_EDGE_REACHED,
     REASON_STALE_PREVIEW,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_plan import (  # noqa: E501
@@ -313,6 +320,212 @@ class ProjectColumnPlacementTest(unittest.TestCase):
         )
         preview = service.preview()
 
+        rendered = json.dumps(preview.as_payload(), sort_keys=True)
+
+        for pane_id in self.herdr.agents:
+            self.assertNotIn(pane_id, rendered)
+        self.assertNotIn("generation:", rendered)
+        self.assertNotIn(self.tab.tab_id, rendered)
+
+    def test_live_move_right_preserves_measured_widths_and_pair_ratios(self):
+        root = self.tab.root
+        self.assertIsInstance(root, Split)
+        self.assertIsInstance(root.first, Split)
+        self.assertIsInstance(root.second, Split)
+        root.ratio = 0.3
+        root.first.ratio = 0.4
+        root.second.ratio = 0.6
+        service = self.service(
+            _plan((self.key_a, self.key_b), ((self.key_a, 0.3),))
+        )
+
+        preview = service.preview_adjustment(self.key_a, COLUMN_MOVE_RIGHT)
+        self.assertIsNotNone(preview.evidence)
+        measured_widths = {
+            column.key: preview.evidence.layout.panes[column.top.pane_id].width
+            for column in preview.evidence.columns
+        }
+        result = service.apply_adjustment(preview)
+
+        self.assertEqual(PREVIEW_READY, preview.status)
+        self.assertEqual((self.key_b, self.key_a), preview.desired_order)
+        self.assertEqual(COLUMN_MOVE_RIGHT, preview.operations[0])
+        self.assertEqual(1, preview.selected_current_position)
+        self.assertEqual(2, preview.selected_target_position)
+        self.assertAlmostEqual(
+            preview.selected_current_width_share,
+            preview.selected_target_width_share,
+        )
+        self.assertEqual(PLACEMENT_APPLIED, result.status)
+        self.assertIn("no saved configuration was changed", result.detail)
+        final_root = self.tab.root
+        self.assertIsInstance(final_root, Split)
+        expected = measured_widths[self.key_b] / sum(measured_widths.values())
+        self.assertAlmostEqual(expected, final_root.ratio, places=3)
+        self.assertIsInstance(final_root.first, Split)
+        self.assertIsInstance(final_root.second, Split)
+        self.assertAlmostEqual(0.6, final_root.first.ratio, places=6)
+        self.assertAlmostEqual(0.4, final_root.second.ratio, places=6)
+        self.assertEqual(1, len(self.herdr.swaps))
+
+    def test_live_width_increase_resizes_only_the_selected_unit(self):
+        service = self.service(
+            _plan((self.key_a, self.key_b), ((self.key_a, 0.5),))
+        )
+
+        preview = service.preview_adjustment(self.key_a, COLUMN_WIDTH_INCREASE)
+        result = service.apply_adjustment(preview)
+
+        self.assertEqual(PREVIEW_READY, preview.status)
+        self.assertEqual((self.key_a, self.key_b), preview.desired_order)
+        self.assertEqual(COLUMN_WIDTH_INCREASE, preview.operations[0])
+        self.assertEqual(1, preview.selected_current_position)
+        self.assertEqual(1, preview.selected_target_position)
+        self.assertAlmostEqual(0.5, preview.selected_current_width_share)
+        self.assertAlmostEqual(1.25 / 2.25, preview.selected_target_width_share)
+        self.assertEqual(PLACEMENT_APPLIED, result.status)
+        root = self.tab.root
+        self.assertIsInstance(root, Split)
+        self.assertAlmostEqual(1.25 / 2.25, root.ratio, places=3)
+        self.assertFalse(self.herdr.swaps)
+        self.assertEqual(1, len(self.herdr.resizes))
+
+    def test_live_move_left_uses_the_inverse_adjacent_swap(self):
+        service = self.service(
+            _plan((self.key_a, self.key_b), ((self.key_a, 0.5),))
+        )
+
+        preview = service.preview_adjustment(self.key_b, COLUMN_MOVE_LEFT)
+        result = service.apply_adjustment(preview)
+
+        self.assertEqual(PREVIEW_READY, preview.status)
+        self.assertEqual((self.key_b, self.key_a), preview.desired_order)
+        self.assertEqual(COLUMN_MOVE_LEFT, preview.operations[0])
+        self.assertEqual(PLACEMENT_APPLIED, result.status)
+        self.assertEqual(1, len(self.herdr.swaps))
+
+    def test_live_width_decrease_uses_the_inverse_weight_step(self):
+        service = self.service(
+            _plan((self.key_a, self.key_b), ((self.key_a, 0.5),))
+        )
+
+        preview = service.preview_adjustment(self.key_a, COLUMN_WIDTH_DECREASE)
+        result = service.apply_adjustment(preview)
+
+        self.assertEqual(PREVIEW_READY, preview.status)
+        self.assertEqual(COLUMN_WIDTH_DECREASE, preview.operations[0])
+        self.assertAlmostEqual(0.5, preview.selected_current_width_share)
+        self.assertAlmostEqual(0.8 / 1.8, preview.selected_target_width_share)
+        self.assertEqual(PLACEMENT_APPLIED, result.status)
+        root = self.tab.root
+        self.assertIsInstance(root, Split)
+        self.assertAlmostEqual(0.8 / 1.8, root.ratio, places=3)
+        self.assertFalse(self.herdr.swaps)
+        self.assertEqual(1, len(self.herdr.resizes))
+
+    def test_move_at_edge_is_a_measured_zero_write(self):
+        service = self.service(
+            _plan((self.key_a, self.key_b), ((self.key_a, 0.5),))
+        )
+
+        preview = service.preview_adjustment(self.key_a, COLUMN_MOVE_LEFT)
+        result = service.apply_adjustment(preview)
+
+        self.assertEqual(PREVIEW_MATCHED, preview.status)
+        self.assertEqual(REASON_EDGE_REACHED, preview.reason)
+        self.assertEqual(PLACEMENT_REFUSED, result.status)
+        self.assertEqual(REASON_ADJUSTMENT_INVALID, result.reason)
+        self.assertFalse(self.herdr.swaps)
+        self.assertFalse(self.herdr.resizes)
+
+    def test_live_adjustment_does_not_require_repo_placement_configuration(self):
+        def unavailable_config(*_args, **_kwargs):
+            raise RuntimeError("repo placement configuration is unavailable")
+
+        service = self.service(unavailable_config)
+
+        preview = service.preview_adjustment(self.key_a, COLUMN_MOVE_RIGHT)
+
+        self.assertEqual(PREVIEW_READY, preview.status)
+        self.assertEqual((self.key_b, self.key_a), preview.desired_order)
+        self.assertFalse(self.herdr.swaps)
+        self.assertFalse(self.herdr.resizes)
+
+    def test_preview_refuses_if_live_order_changes_between_observations(self):
+        key_c = UnitColumnKey("project-c", DEFAULT_LANE)
+        self.herdr = PaneTreeHerdr("w1")
+        self.tab = self.herdr.new_tab()
+        self.columns = self.herdr.seed_columns(
+            self.tab,
+            [
+                [_name("project-a", "codex"), _name("project-a", "claude")],
+                [_name("project-b", "codex"), _name("project-b", "claude")],
+                [_name("project-c", "codex"), _name("project-c", "claude")],
+            ],
+        )
+        reads = 0
+
+        def drift_before_second_observation(argv, **kwargs):
+            nonlocal reads
+            if list(argv[1:3]) == ["pane", "layout"]:
+                reads += 1
+                if reads == 2:
+                    self.assertTrue(
+                        self.tab.swap(self.columns[1][0], self.columns[2][0])
+                    )
+                    self.assertTrue(
+                        self.tab.swap(self.columns[1][1], self.columns[2][1])
+                    )
+            return self.herdr(argv, **kwargs)
+
+        service = HerdrProjectColumnPlacement(
+            home=Path("/unused"),
+            target_workspace="w1",
+            top_workspace_id="",
+            binary="herdr",
+            runner=drift_before_second_observation,
+            timeout=1.0,
+            authority=_Authority(),
+            generation_resolver=lambda pane: f"generation:{pane.assigned_name}",
+            plan_resolver=_plan(
+                (self.key_a, self.key_b, key_c),
+                ((self.key_a, 1 / 3), (self.key_b, 0.5)),
+            ),
+        )
+
+        preview = service.preview_adjustment(self.key_a, COLUMN_MOVE_RIGHT)
+
+        self.assertEqual(PREVIEW_REFUSED, preview.status)
+        self.assertEqual(REASON_STALE_PREVIEW, preview.reason)
+        self.assertFalse(self.herdr.swaps)
+        self.assertFalse(self.herdr.resizes)
+
+    def test_unknown_unit_and_stale_adjustment_are_zero_write(self):
+        service = self.service(
+            _plan((self.key_a, self.key_b), ((self.key_a, 0.5),))
+        )
+        unknown = service.preview_adjustment(
+            UnitColumnKey("unknown", DEFAULT_LANE), COLUMN_MOVE_RIGHT
+        )
+        self.assertEqual(REASON_ADJUSTMENT_INVALID, unknown.reason)
+
+        preview = service.preview_adjustment(self.key_a, COLUMN_MOVE_RIGHT)
+        root = self.tab.root
+        self.assertIsInstance(root, Split)
+        root.ratio = 0.45
+        result = service.apply_adjustment(preview)
+
+        self.assertEqual(PLACEMENT_REFUSED, result.status)
+        self.assertEqual(REASON_STALE_PREVIEW, result.reason)
+        self.assertFalse(self.herdr.swaps)
+        self.assertFalse(self.herdr.resizes)
+
+    def test_adjustment_payload_never_contains_runtime_handles_or_generations(self):
+        service = self.service(
+            _plan((self.key_a, self.key_b), ((self.key_a, 0.5),))
+        )
+
+        preview = service.preview_adjustment(self.key_a, COLUMN_MOVE_RIGHT)
         rendered = json.dumps(preview.as_payload(), sort_keys=True)
 
         for pane_id in self.herdr.agents:

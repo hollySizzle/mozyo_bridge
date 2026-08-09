@@ -155,6 +155,32 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
         self.assertEqual(resolved, {(WORKSPACE_ID, lane_a), (WORKSPACE_ID, lane_b)})
         self.assertIsNone(board.action_identity("unit-unknown"))
 
+    def test_column_action_context_uses_one_fresh_herdr_workspace(self) -> None:
+        board = runtime(
+            (row("claude", "wS:p1"), row("codex", "wS:p2"))
+        )
+        unit = board.snapshot().units[0]
+
+        context = board.column_action_context(unit.unit_id)
+
+        self.assertIsNotNone(context)
+        self.assertEqual(context.workspace_id, WORKSPACE_ID)
+        self.assertEqual(context.lane_id, "default")
+        self.assertEqual(context.herdr_workspace_id, "wS")
+        self.assertNotIn("wS:p", repr(board.snapshot().as_payload()))
+        self.assertIsNone(board.column_action_context("unit-unknown"))
+
+    def test_column_action_context_refuses_a_unit_split_across_workspaces(self) -> None:
+        board = runtime(
+            (row("claude", "w1:p1"), row("codex", "w2:p2"))
+        )
+        unit = board.snapshot().units[0]
+
+        self.assertIsNone(board.column_action_context(unit.unit_id))
+        self.assertEqual(
+            board.action_identity(unit.unit_id), (WORKSPACE_ID, "default")
+        )
+
     def test_snapshot_joins_declared_project_role_and_responsibility(self) -> None:
         snapshot = runtime(
             (row("claude", "w1:p1"), row("codex", "w1:p2"))
@@ -1148,6 +1174,7 @@ class HerdrUnitBoardCliTests(unittest.TestCase):
         args = self.parser().parse_args(["herdr", "unit-board", "interact"])
         board = runtime((row("codex", "w1:p2"),))
         placement = object()
+        column_actions = object()
         ui = mock.Mock()
         ui.run.return_value = 0
 
@@ -1158,13 +1185,27 @@ class HerdrUnitBoardCliTests(unittest.TestCase):
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board.production_live_pair_placement",
             return_value=placement,
         ), mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board.load_coordinator_placement_for_launch",
+            return_value=SimpleNamespace(top_workspace_id="top-workspace"),
+        ), mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board.resolve_unit_board_binary",
+            return_value="/bin/herdr",
+        ), mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board._UnitColumnPlacementActions",
+            return_value=column_actions,
+        ) as column_factory, mock.patch(
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_unit_board.HerdrUnitBoardPlacementUI",
             return_value=ui,
         ) as factory:
             result = args.func(args)
 
         self.assertEqual(result, 0)
-        factory.assert_called_once_with(board, placement)
+        column_factory.assert_called_once_with(
+            board,
+            binary="/bin/herdr",
+            top_workspace_id="top-workspace",
+        )
+        factory.assert_called_once_with(board, placement, column_actions)
         ui.run.assert_called_once_with()
 
     def test_interact_runtime_failure_never_resolves_placement(self) -> None:

@@ -39,6 +39,13 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     columnar_verdict,
     read_pane_layout,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_adjustment import (  # noqa: E501
+    COLUMN_MOVE_LEFT,
+    COLUMN_MOVE_RIGHT,
+    COLUMN_WIDTH_DECREASE,
+    COLUMN_WIDTH_INCREASE,
+    ProjectColumnAdjustmentMixin,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_plan import (  # noqa: E501
     ObservedUnitColumn,
     ProjectColumnPlan,
@@ -61,8 +68,11 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     ProjectColumnPlacementPreview,
     ProjectColumnPlacementResult,
     REASON_AUTHORITY_UNVERIFIED,
+    REASON_ADJUSTMENT_INVALID,
+    REASON_ADJUSTMENT_UNREPRESENTABLE,
     REASON_COMMAND_UNPROVEN,
     REASON_CONFIG_UNRESOLVED,
+    REASON_EDGE_REACHED,
     REASON_FULL_PAIR_REQUIRED,
     REASON_GENERATION_UNVERIFIED,
     REASON_GEOMETRY_UNSUPPORTED,
@@ -92,8 +102,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 GenerationResolver = Callable[[CoordinatorPane], str]
 PlanResolver = Callable[..., ProjectColumnPlan]
 
-
-class HerdrProjectColumnPlacement:
+class HerdrProjectColumnPlacement(ProjectColumnAdjustmentMixin):
     """Preview and apply configured shared coordinator column placement."""
 
     def __init__(
@@ -975,8 +984,12 @@ class HerdrProjectColumnPlacement:
 
 
 __all__ = (
-    "HerdrProjectColumnPlacement", "PLACEMENT_APPLIED", "PLACEMENT_DEFERRED",
+    "COLUMN_MOVE_LEFT", "COLUMN_MOVE_RIGHT", "COLUMN_WIDTH_DECREASE",
+    "COLUMN_WIDTH_INCREASE", "HerdrProjectColumnPlacement",
+    "PLACEMENT_APPLIED", "PLACEMENT_DEFERRED",
     "PLACEMENT_MATCHED", "PLACEMENT_PARTIAL", "PLACEMENT_REFUSED",
     "PREVIEW_DEFERRED", "PREVIEW_MATCHED", "PREVIEW_READY", "PREVIEW_REFUSED",
     "ProjectColumnPlacementPreview", "ProjectColumnPlacementResult",
+    "REASON_ADJUSTMENT_INVALID", "REASON_ADJUSTMENT_UNREPRESENTABLE",
+    "REASON_EDGE_REACHED",
 )

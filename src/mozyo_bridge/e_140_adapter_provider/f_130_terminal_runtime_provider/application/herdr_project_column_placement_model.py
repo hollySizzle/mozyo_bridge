@@ -49,6 +49,9 @@ REASON_CONFIG_UNRESOLVED = "config_unresolved"
 REASON_STALE_PREVIEW = "stale_preview"
 REASON_COMMAND_UNPROVEN = "command_unproven"
 REASON_POSTCONDITION_FAILED = "postcondition_failed"
+REASON_ADJUSTMENT_INVALID = "adjustment_invalid"
+REASON_EDGE_REACHED = "edge_reached"
+REASON_ADJUSTMENT_UNREPRESENTABLE = "adjustment_unrepresentable"
 
 
 def row_by_locator(
@@ -268,6 +271,10 @@ class ProjectColumnPlacementPreview:
     evidence: Optional[ProjectColumnPlacementEvidence] = field(
         default=None, repr=False, compare=False
     )
+    selected_current_position: Optional[int] = None
+    selected_target_position: Optional[int] = None
+    selected_current_width_share: Optional[float] = None
+    selected_target_width_share: Optional[float] = None
 
     @property
     def can_apply(self) -> bool:
@@ -288,6 +295,12 @@ class ProjectColumnPlacementPreview:
             "current_order": [public_key(key) for key in self.current_order],
             "desired_order": [public_key(key) for key in self.desired_order],
             "operations": [safe_text(operation) for operation in self.operations],
+            "selected_unit": {
+                "current_position": self.selected_current_position,
+                "target_position": self.selected_target_position,
+                "current_width_share": self.selected_current_width_share,
+                "target_width_share": self.selected_target_width_share,
+            },
         }
 
 
@@ -362,8 +375,11 @@ __all__ = (
     "ProjectColumnPlacementPreview",
     "ProjectColumnPlacementResult",
     "REASON_AUTHORITY_UNVERIFIED",
+    "REASON_ADJUSTMENT_INVALID",
+    "REASON_ADJUSTMENT_UNREPRESENTABLE",
     "REASON_COMMAND_UNPROVEN",
     "REASON_CONFIG_UNRESOLVED",
+    "REASON_EDGE_REACHED",
     "REASON_FULL_PAIR_REQUIRED",
     "REASON_GENERATION_UNVERIFIED",
     "REASON_GEOMETRY_UNSUPPORTED",

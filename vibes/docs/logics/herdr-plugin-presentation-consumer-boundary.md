@@ -170,9 +170,10 @@ UX 実装を先行させない。ただし、engine を UI から利用不能な
 | native atomic prompt transport | proposed in #14618 |
 | Herdr plugin allow / deny preflight | proposed in #14619 |
 | consumer-stable desired-vs-live projectionの完成 | proposed |
-| preview-first plugin action API | proposed |
+| preview-first plugin action API | existing (#15116 dedicated pair / #15122 shared Unit column) |
 | read-only sublane UX plugin spike | proposed |
-| 本格 UI / UX implementation | future separate US |
+| keyboard Unit選択・左右移動・幅変更 | existing first slice (#15122) |
+| drag-and-drop / permanent layout editor | future separate US |
 
 Redmine #15114 で、Herdr 0.8.0 の display metadata と plugin-owned popup を使う
 `mozyo Unit board` を最初の presentation consumer として実装した。Redmine #15116
@@ -180,8 +181,12 @@ Redmine #15114 で、Herdr 0.8.0 の display metadata と plugin-owned popup を
 宣言済みsplit / order / ratioへ収束する。plugin自身はraw pane APIを呼ばず、agent input、
 workflow / Redmine / DBへwriteしない。#14606で既存`position`と`relative_width`から
 desired order / weighted divider ratioを作るnon-mutating planを追加した。shared tab上の
-既存Unit列を実際に移動するoperator actionとUnit board接続は、apply直前のlive再照合を持つ
-後続段階である。一方#15123はfresh full-pair launchの完了処理に限り、そのplanを世代・
+既存Unit列を実際に移動するoperator actionとUnit board接続は#15122で実装し、選択した
+full-pair Unitを左右へ1列移動、または相対幅を1段階変更する。preview後の明示applyと、
+選択Unitの現在 / 目標位置・実測 / 目標幅shareの表示、preview形成中とapply直前の
+identity・generation・tab layout再照合を必須とする。この操作はlive geometry
+だけを変更し、repo configやpresentation state DBへ暗黙保存しない。一方#15123はfresh
+full-pair launchの完了処理に限り、そのplanを世代・
 authority・tab layoutの再照合後に自動適用する。1-pane混在時はzero-writeで延期し、pluginの
 任意操作にはならない。planはpane locatorを公開せずUnit keyとopaque source fingerprintを
 保持し、全ratioを検証できない場合は操作targetを返さない。詳細は
@@ -194,7 +199,7 @@ authority・tab layoutの再照合後に自動適用する。1-pane混在時はz
 - mozyo-bridge に arbitrary external plugin loader を追加すること。
 - UI state を routing、review、approval、completion の正本にすること。
 - #14617 / #14618 / #14619 / #14604 の実装を混ぜること。
-- production publish、system Herdr update、operator HOME mutation。
+- 本書だけを根拠にしたproduction publish、system Herdr update、operator HOME mutation。
 
 ## References
 
