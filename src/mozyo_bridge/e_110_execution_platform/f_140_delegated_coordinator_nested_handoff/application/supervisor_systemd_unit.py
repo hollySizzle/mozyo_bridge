@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
+    DEFAULT_OS_TICK_INTERVAL_SECONDS,
     DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
     DEFAULT_SUPERVISOR_SERVICE_LABEL,
 )
@@ -56,7 +57,12 @@ TIMER_UNIT_NAME = "mozyo-bridge-callback-supervisor.timer"
 #: :data:`DEFAULT_RECONCILIATION_INTERVAL_SECONDS` (300s), so a tick inside that window makes zero
 #: provider reads. Raising this constant would make local work less prompt; it would NOT make
 #: Redmine reads more frequent, and lowering the provider cadence is not this module's decision.
-DEFAULT_TICK_INTERVAL_SECONDS = 60
+#:
+#: Since #15192 the value is the SHARED portable default both OS adapters register at (see
+#: :data:`DEFAULT_OS_TICK_INTERVAL_SECONDS` for the measurement it rests on) rather than a
+#: Linux-private number: one operator-facing cadence knob means the same thing on both hosts. The
+#: alias is kept because it is this adapter's published name for that cadence.
+DEFAULT_TICK_INTERVAL_SECONDS = DEFAULT_OS_TICK_INTERVAL_SECONDS
 
 #: The executable name resolved from PATH at install time (never a shell string).
 SUPERVISOR_EXECUTABLE_NAME = "mozyo-bridge"

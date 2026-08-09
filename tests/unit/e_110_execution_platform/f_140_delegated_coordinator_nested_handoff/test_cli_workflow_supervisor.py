@@ -96,30 +96,28 @@ class _ServiceCliCase(unittest.TestCase):
 
 
 class CliServiceStatusLaunchdTest(_ServiceCliCase):
-    """The darwin dispatch: the owned LaunchAgent pair answers ``--service-status``."""
+    """The darwin dispatch: the ONE owned LaunchAgent answers ``--service-status`` (#15192)."""
 
     def test_service_status_reports_projection_and_definition_exit_zero(self) -> None:
         rc, out = self._service_status("darwin")
         self.assertEqual(rc, 0)
         payload = json.loads(out)
         self.assertEqual(payload["backend"], sb.BACKEND_LAUNCHD)
-        # Redmine #14150: the projection is the owned PAIR (reconcile + drain agents).
+        # Redmine #15192: ONE owned agent, so the roster is one row — the same shape as Linux.
         agents = payload["agents"]
-        self.assertEqual(len(agents), 2)
-        reconcile, drain = agents
-        self.assertFalse(reconcile["installed"])
-        self.assertFalse(reconcile["loaded"])
-        self.assertFalse(drain["installed"])
+        self.assertEqual(len(agents), 1)
+        (supervisor,) = agents
+        self.assertFalse(supervisor["installed"])
+        self.assertFalse(supervisor["loaded"])
         self.assertEqual(payload["phase"], "B1")
-        self.assertFalse(reconcile["keep_alive_present"])
+        self.assertFalse(supervisor["keep_alive_present"])
         self.assertEqual(payload["definition"]["command"][-1], "--run-once")
-        self.assertEqual(payload["drain_definition"]["command"][-1], "--drain-only")
         self.assertFalse(payload["definition"]["keep_alive"])
-        # macOS keeps its own two-row shape; #15183 does not reorganize it.
-        self.assertEqual(len(agents), 2)
-        # The two agents are distinct owned labels.
-        self.assertNotEqual(reconcile["label"], drain["label"])
-        # Secret-free and path-free.
+        self.assertEqual(supervisor["label"], sl.SUPERVISOR_AGENT.label)
+        # The owned roster matches the owned agents 1:1 — no drain service is advertised.
+        self.assertEqual(len(payload["definitions"]), 1)
+        self.assertEqual(payload["definitions"][0]["command"][-1], "--run-once")
+        # Secret-free. Nothing is installed here, so no argv (and no home path) is projected.
         self.assertNotIn("api_key", out.lower())
         self.assertNotIn(self.home, out)
 
@@ -127,18 +125,20 @@ class CliServiceStatusLaunchdTest(_ServiceCliCase):
         # Positive verdict held deterministic by the same OS-home seam: an owned
         # plist under the isolated home is reported installed, proving the
         # projection reflects the controlled home rather than being always-false.
-        target = sl.plist_path(self.os_home)  # default agent = reconcile
+        target = sl.plist_path(self.os_home)  # the single owned agent
         target.parent.mkdir(parents=True, exist_ok=True)
         argv = ["/opt/bin/mozyo-bridge", "workflow", "supervisor", "--run-once", "--home", self.home]
         target.write_bytes(sl.render_plist(argv, interval_seconds=300, os_home=self.os_home))
         rc, out = self._service_status("darwin")
         self.assertEqual(rc, 0)
         payload = json.loads(out)
-        reconcile = payload["agents"][0]
-        self.assertTrue(reconcile["installed"])  # the reconcile agent's owned plist is present
-        self.assertTrue(reconcile["plist_exists"])
-        # The drain agent was NOT installed, so the pair projection distinguishes them.
-        self.assertFalse(payload["agents"][1]["installed"])
+        self.assertEqual(len(payload["agents"]), 1)
+        (supervisor,) = payload["agents"]
+        self.assertTrue(supervisor["installed"])  # the owned plist under the isolated home
+        self.assertTrue(supervisor["plist_exists"])
+        self.assertEqual(supervisor["installed_command"], argv)
+        # No retired drain registration exists on this host, so none is reported as pending.
+        self.assertEqual(supervisor["legacy_drain"], sl.LEGACY_DRAIN_ABSENT)
 
     def test_mutating_verbs_fail_closed_zero_mutation_when_launchd_refuses(self) -> None:
         with patch.object(sl, "_running_on_darwin", return_value=False), patch.object(
@@ -198,7 +198,9 @@ class CliServiceStatusSystemdTest(_ServiceCliCase):
         self.assertEqual(rc, 0)
         payload = json.loads(out)
         self.assertTrue(payload["agents"][0]["installed"])
-        self.assertEqual(payload["agents"][0]["scheduled_interval_seconds"], 60)
+        self.assertEqual(
+            payload["agents"][0]["scheduled_interval_seconds"], unit.default_interval_seconds
+        )
         self.assertEqual(payload["agents"][0]["installed_command"][-1], self.home)
 
     def test_mutating_verbs_fail_closed_zero_mutation_with_no_user_manager(self) -> None:
@@ -301,11 +303,17 @@ class CliServiceDefinitionRosterTest(_ServiceCliCase):
         # not a claim that anything is installed.
         self.assertEqual(payload["definition"]["command"][-1], "--run-once")
 
-    def test_macos_keeps_its_drain_definition_key(self) -> None:
-        payload = self._json_status("darwin")
-        self.assertEqual(payload["backend"], sb.BACKEND_LAUNCHD)
-        self.assertEqual(payload["drain_definition"]["command"][-1], "--drain-only")
-        self.assertEqual(len(payload["definitions"]), 2)
+    def test_no_host_declares_a_drain_service_it_does_not_own(self) -> None:
+        # #15192: neither host registers a `--drain-only` service any more, so neither declares one
+        # — not in the roster and not as a stray scalar. Emitting a definition for a service nobody
+        # owns is the defect review j#102053 Finding 6 removed for Linux; the rule now simply has
+        # no host left to exempt. `--drain-only` remains a MANUAL action, which needs no definition.
+        for platform in ("darwin", "linux"):
+            payload = self._json_status(platform)
+            self.assertEqual(len(payload["definitions"]), 1, platform)
+            self.assertEqual(payload["definitions"][0]["command"][-1], "--run-once", platform)
+            self.assertNotIn("drain_definition", payload, platform)
+            self.assertNotIn("--drain-only", json.dumps(payload), platform)
 
 
 class CliServiceHelpContractTest(unittest.TestCase):
@@ -331,21 +339,24 @@ class CliServiceHelpContractTest(unittest.TestCase):
         self.assertNotIn("service+timer pair", text)
         self.assertNotIn("Atomic-or-nothing;", text)
 
-    def test_help_states_the_linux_single_timer(self) -> None:
+    def test_help_states_one_registration_per_host(self) -> None:
         text = self._supervisor_help()
-        self.assertIn("ONE systemd user service + ONE timer", text)
-        self.assertIn("every 60s", text)
+        self.assertIn("ONE macOS LaunchAgent, or ONE Linux systemd user service + timer", text)
+        self.assertIn("every --tick-interval seconds", text)
+        # The retired two-agent macOS shape must not be advertised anywhere in help.
+        self.assertNotIn("LaunchAgent pair", text)
 
     def test_help_states_that_an_unconfigured_redmine_does_not_block_linux_install(self) -> None:
         text = self._supervisor_help()
-        self.assertIn("unconfigured Redmine does NOT block it", text)
+        self.assertIn("unconfigured Redmine does NOT block the install", text)
         self.assertIn("readiness is reported, not gated", text)
 
-    def test_help_still_states_the_macos_atomic_credential_gate(self) -> None:
-        # The macOS behaviour is unchanged, so help must keep describing it accurately.
+    def test_help_still_states_the_macos_credential_gate(self) -> None:
+        # The one deliberate host difference that survives #15192: macOS gates the install on a
+        # ready credential, Linux projects readiness instead. Help must keep saying so.
         text = self._supervisor_help()
-        self.assertIn("LaunchAgent pair, installed atomic-or-nothing", text)
-        self.assertIn("fail-closed on a non-ready credential", text)
+        self.assertIn("macOS refuses on a non-ready credential", text)
+        self.assertIn("unconfigured Redmine does NOT block the install", text)
 
 
 class CliServiceUnsupportedHostTest(_ServiceCliCase):

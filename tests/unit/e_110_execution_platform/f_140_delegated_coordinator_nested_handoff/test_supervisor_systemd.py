@@ -6,15 +6,15 @@ subprocess call goes through an injected fake runner, and temp roots stand in fo
 kept **distinct**. These pin the Linux adapter's contract as the updated issue body defines it
 (scope correction j#101996, review findings j#102000) —
 
-- **one** owned service + **one** owned timer, ticking ``--run-once`` every 60s. There is no second
-  cadence, no ``--drain-only`` unit, and no atomic pair install: those were removed from the
-  acceptance contract, and a test here fails if they come back;
-- a 60s tick is not a 60s Redmine poll — the provider cadence stays the supervisor body's own ~300s
+- **one** owned service + **one** owned timer, ticking ``--run-once`` on the shared portable OS
+  cadence (#15192). There is no second cadence, no ``--drain-only`` unit, and no atomic pair
+  install: those were removed from the acceptance contract, and a test here fails if they come back;
+- the OS tick is not a Redmine poll — the provider cadence stays the supervisor body's own ~300s
   watermark, which this adapter surfaces but never sets;
 - unit structure: ``Type=oneshot`` with **no** ``Restart=`` / ``RemainAfterExit=`` (the KeepAlive
   equivalent is structurally absent), **no** ``Environment=`` / ``EnvironmentFile=``, no
   ``[Install]`` on the service (only the timer is enabled), and ``OnActiveSec=0s`` +
-  ``OnUnitActiveSec=60s`` as the run-at-load + fixed-interval pair;
+  ``OnUnitActiveSec=<portable default>s`` as the run-at-load + fixed-interval pair;
 - ``ExecStart`` is the exact PATH-resolved absolute executable argv with the resolved mozyo home
   pinned as ``--home``, systemd-quoted per token and round-tripping back to the same argv;
 - **an unconfigured / incomplete / unsafe Redmine credential does NOT block installing the timer**
@@ -47,6 +47,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     supervisor_systemd as ss,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
+    DEFAULT_OS_TICK_INTERVAL_SECONDS,
     DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
 )
 from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_context import (
@@ -232,19 +233,26 @@ class SingleOwnedUnitTest(_LinuxCase):
 
 
 # ---------------------------------------------------------------------------
-# Cadence: a 60s OS tick, with the Redmine cadence left to the supervisor body.
+# Cadence: the shared portable OS tick, with the Redmine cadence left to the supervisor body.
 # ---------------------------------------------------------------------------
 
 
 class TickCadenceTest(_LinuxCase):
-    def test_the_default_os_tick_is_sixty_seconds(self) -> None:
-        self.assertEqual(ss.DEFAULT_TICK_INTERVAL_SECONDS, 60)
-        self.assertIn("OnUnitActiveSec=60s", ss.render_timer_unit())
+    def test_the_default_os_tick_is_the_shared_portable_default(self) -> None:
+        # 180 is the measured portable default (#15192), and it is the SAME value the macOS adapter
+        # registers at — one operator-facing cadence knob, not a per-OS number. The literal is
+        # pinned here so a silent drift back to a private value fails.
+        self.assertEqual(ss.DEFAULT_TICK_INTERVAL_SECONDS, DEFAULT_OS_TICK_INTERVAL_SECONDS)
+        self.assertEqual(DEFAULT_OS_TICK_INTERVAL_SECONDS, 180)
+        self.assertIn("OnUnitActiveSec=180s", ss.render_timer_unit())
 
     def test_the_tick_cadence_is_not_the_redmine_cadence(self) -> None:
-        # The acceptance contract: tick every 60s, but read Redmine on the existing ~300s cadence.
-        # This adapter must not conflate them by scheduling the provider interval on the timer.
+        # The acceptance contract: tick on the OS cadence, but read Redmine on the existing ~300s
+        # cadence. This adapter must not conflate them by scheduling the provider interval on the
+        # timer, and the tick must stay strictly finer so a due watermark is never made to wait a
+        # whole extra period for an aligned tick.
         self.assertNotEqual(ss.DEFAULT_TICK_INTERVAL_SECONDS, DEFAULT_RECONCILIATION_INTERVAL_SECONDS)
+        self.assertLess(ss.DEFAULT_TICK_INTERVAL_SECONDS, DEFAULT_RECONCILIATION_INTERVAL_SECONDS)
         self.assertEqual(DEFAULT_RECONCILIATION_INTERVAL_SECONDS, 300)
 
     def test_the_adapter_does_not_set_or_enforce_the_provider_cadence(self) -> None:
@@ -571,7 +579,7 @@ class InstallSuccessTest(_LinuxCase):
         runner = self._runner()
         result = self._install(runner=runner)
         self.assertTrue(result["performed"], result)
-        self.assertEqual(result["scheduled_interval_seconds"], 60)
+        self.assertEqual(result["scheduled_interval_seconds"], DEFAULT_OS_TICK_INTERVAL_SECONDS)
         self.assertEqual(
             [c for c in runner.calls if c[2] != "show"],
             [
@@ -940,7 +948,7 @@ class ServiceStatusTest(_LinuxCase):
         self.assertTrue(status["loaded"])
         self.assertTrue(status["timer_enabled"])
         self.assertEqual(status["pid"], 4321)
-        self.assertEqual(status["scheduled_interval_seconds"], 60)
+        self.assertEqual(status["scheduled_interval_seconds"], DEFAULT_OS_TICK_INTERVAL_SECONDS)
         self.assertTrue(status["run_at_load"])
         self.assertFalse(status["keep_alive_present"])
         self.assertTrue(status["no_environment_block"])
@@ -974,7 +982,9 @@ class ServiceStatusTest(_LinuxCase):
         self.assertFalse(status["installed"])
         self.assertEqual(status["home_pin"], ss.HOME_PIN_NOT_INSTALLED)
         self.assertEqual(status["credential_readiness"], ss.CREDENTIAL_MISSING)
-        self.assertEqual(status["scheduled_interval_seconds"], 60)  # the hint
+        self.assertEqual(
+            status["scheduled_interval_seconds"], DEFAULT_OS_TICK_INTERVAL_SECONDS
+        )  # the hint
         self.assertEqual(status["installed_command"], [])
 
     def test_a_present_but_unreadable_unit_is_distinct_from_absence(self) -> None:
@@ -1021,7 +1031,9 @@ class ServiceStatusTest(_LinuxCase):
         self._install()
         target = ss.timer_unit_path(self.os_home)
         target.write_text(
-            target.read_text(encoding="utf-8").replace("OnUnitActiveSec=60s", "OnUnitActiveSec=5min"),
+            target.read_text(encoding="utf-8").replace(
+                f"OnUnitActiveSec={DEFAULT_OS_TICK_INTERVAL_SECONDS}s", "OnUnitActiveSec=5min"
+            ),
             encoding="utf-8",
         )
         status = ss.service_status(
@@ -1071,15 +1083,20 @@ class BackendSelectionTest(unittest.TestCase):
         )
         self.assertIsNone(sb.resolve_backend("win32")[1])
 
-    def test_the_macos_adapter_keeps_its_own_dual_agent_shape(self) -> None:
-        # #15183 must not reorganize macOS: its pair verbs stay exactly where they were.
+    def test_both_adapters_expose_the_same_single_service_verbs(self) -> None:
+        # #15192 retired the macOS pair, so there is no per-backend call shape left: the dispatcher
+        # can call one set of verb names on either adapter. A pair verb coming back would silently
+        # reintroduce a second registration on one host only.
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
             supervisor_launchd,
         )
 
-        for verb in ("install_pair", "restart_pair", "uninstall_pair", "service_status_pair"):
+        for verb in ("install", "restart", "uninstall", "service_status"):
             self.assertTrue(hasattr(supervisor_launchd, verb), verb)
-        self.assertEqual(len(supervisor_launchd.SUPERVISOR_AGENTS), 2)
+            self.assertTrue(hasattr(ss, verb), verb)
+        for retired in ("install_pair", "restart_pair", "uninstall_pair", "service_status_pair"):
+            self.assertFalse(hasattr(supervisor_launchd, retired), retired)
+        self.assertEqual(len(supervisor_launchd.SUPERVISOR_AGENTS), 1)
 
     def test_a_linux_result_is_normalized_to_a_single_row_roster(self) -> None:
         def fake_install(**kwargs):
@@ -1091,32 +1108,40 @@ class BackendSelectionTest(unittest.TestCase):
         self.assertEqual(len(result["agents"]), 1)
         self.assertTrue(result["performed"])
 
-    def test_a_macos_result_keeps_its_two_row_roster(self) -> None:
-        def fake_install_pair(**kwargs):
-            return {"action": "install", "performed": True, "reason": "",
-                    "agents": [{"label": "a"}, {"label": "b"}]}
+    def test_a_macos_result_is_normalized_to_a_single_row_roster(self) -> None:
+        def fake_install(**kwargs):
+            return {"action": "install", "performed": True, "reason": "", "label": "L"}
 
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
             supervisor_launchd,
         )
 
         with patch.object(sys, "platform", "darwin"), patch.object(
-            supervisor_launchd, "install_pair", fake_install_pair
+            supervisor_launchd, "install", fake_install
         ):
             result = sb.install()
         self.assertEqual(result["backend"], sb.BACKEND_LAUNCHD)
-        self.assertEqual(len(result["agents"]), 2)
+        self.assertEqual(len(result["agents"]), 1)
 
-    def test_the_tick_interval_reaches_only_the_linux_adapter(self) -> None:
-        seen = {}
+    def test_the_tick_interval_reaches_both_adapters(self) -> None:
+        # One cadence knob, one meaning: `--tick-interval` sets the single owned registration's
+        # interval on either host. It used to be silently dropped on macOS (#15192).
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            supervisor_launchd,
+        )
 
-        def fake_install(**kwargs):
-            seen.update(kwargs)
-            return {"action": "install", "performed": True, "reason": ""}
+        for platform, adapter in (("linux", ss), ("darwin", supervisor_launchd)):
+            seen = {}
 
-        with patch.object(sys, "platform", "linux"), patch.object(ss, "install", fake_install):
-            sb.install(interval_seconds=90)
-        self.assertEqual(seen["interval_seconds"], 90)
+            def fake_install(**kwargs):
+                seen.update(kwargs)
+                return {"action": "install", "performed": True, "reason": ""}
+
+            with patch.object(sys, "platform", platform), patch.object(
+                adapter, "install", fake_install
+            ):
+                sb.install(interval_seconds=90)
+            self.assertEqual(seen["interval_seconds"], 90, platform)
 
     def test_an_unsupported_host_gets_a_typed_zero_mutation_refusal(self) -> None:
         with patch.object(sys, "platform", "win32"):

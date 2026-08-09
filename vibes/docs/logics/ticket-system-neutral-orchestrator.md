@@ -491,34 +491,75 @@ fallback `--run-once` を TTL まで starve させない。token-conditional な
 ### OS scheduler adapter
 
 LaunchAgent / systemd timer / cron は同じ bounded one-shot command を起動する adapter であり、LLM turn 内の
-sleep/poll を要求しない。reconciliation 経路（`--run-once`）と drain 経路（`--drain-only`）は別 cadence の
-別 service definition（`build_service_definition(local_drain=...)`）として表現し、portable default は
+sleep/poll を要求しない。OS scheduler が登録するのは **`--run-once` のみ** であり、`--drain-only` /
+`--watch` は手動・event-driven 入口として残るが OS timer へ登録しない（#15192）。portable default は
 測定に基づく neutral 値（固定の私的運用値を OSS 既定へ焼かない）を持つ。
 
-host realization は operator 契約（`status` / `install` / `restart` / `uninstall`）を共有するが、**内部形状ま
-で同一にはしない**（#15183）。どちらを使うかは `supervisor_service_backend` が platform で解決し（darwin ->
-LaunchAgent、Linux -> systemd user、それ以外 -> typed zero-mutation refusal）、結果 envelope だけを
-`{action, performed, reason, backend, agents: [...]}` に正規化する。`agents` は host adapter が返す owned
-service 行（macOS は 2 行、Linux は 1 行）であり、CLI は platform 分岐なしに両方を描画する。
+host realization は operator 契約（`status` / `install` / `restart` / `uninstall`）を共有する。#15192 以降は
+**operator から見える形**——登録数（各 host 1 個）、実行 command（`workflow supervisor --run-once`）、cadence
+（共通 portable default）、verb の意味、status が答える観測値——も共通である。共通化しないのは **内部実装**で
+あり、launchd と systemd を互いの模倣にせず、cron 等へ無理に統一しない。どちらを使うかは
+`supervisor_service_backend` が platform で解決し（darwin -> LaunchAgent、Linux -> systemd user、それ以外 ->
+typed zero-mutation refusal）、結果 envelope を `{action, performed, reason, backend, agents: [...]}` に正規化
+する。両 adapter が同名・同 signature の 4 verb を公開するため、backend に platform 別の呼び分けは残らない。
 
-**macOS LaunchAgent** の realization は **owned dual-agent lifecycle**（`supervisor_launchd` の `install_pair` /
-`uninstall_pair` / `restart_pair` / `service_status_pair`）: 二つの独立した owned label / plist / log
-（`callback-supervisor` と `callback-supervisor.drain`）を管理する。install は **atomic-or-nothing** で、
-reconcile agent が失敗すれば何もせず、reconcile 成功後に drain agent が失敗すれば両 agent を rollback
-（partial failure で half-installed pair を残さない fail-closed）。各 verb は非 darwin / 実行ファイル欠落 /
-credential 未整備 / not-loaded で zero-mutation 拒否し、既存の RunAtLoad + StartInterval（KeepAlive なし、
-EnvironmentVariables なし）契約を両 agent で維持する。この構成は #15183 で変更しない。
+**macOS LaunchAgent** の realization（`supervisor_launchd`）は **owned agent 1 個**である。#14150 で導入した
+`--drain-only` の第二 agent（`callback-supervisor.drain`）は #15192 で退役した: `--run-once` tick は drain leg
+を含む **superset**（local drain を実行し、watermark が due なら provider leg も実行する）であるため、第二
+agent が買っていたのは capability ではなく latency であり、その対価は Login Items に見える登録がもう 1 つ増え
+ることと、整合を保つべき lifecycle がもう 1 つ増えることだった。各 verb は非 darwin / 実行ファイル欠落 /
+credential 未整備 / not-loaded で zero-mutation 拒否し、RunAtLoad + StartInterval（KeepAlive なし、
+EnvironmentVariables なし）契約を維持する。
+
+**退役 agent の migration**（#15192）。#15192 以前に install した host には第二 LaunchAgent が残る。これを放置
+すると受入条件（macOS は LaunchAgent 1 個）が破れ、既に包含済みの `--drain-only` tick が走り続けるため、
+`install` / `uninstall` が**取り外す**。ただし取り外すのは **自分のもの** と証明できる場合だけである: plist は
+自身の `Label` を持ち launchd はその Label で service を識別するので、退役 path に置かれた別 Label の file は
+他人の agent であり、unlink は他人の service の削除になる。分類は `absent` / `owned` / `foreign` /
+`unreadable` の 4 値で、`owned` だけが削除可能、`foreign` / `unreadable` は typed zero-mutation 拒否とする
+（identity は推測しない）。
+
+**順序は「先に退役、後に install」**であり、これが partial failure 下で不変条件を保つ順序である。逆順（install
+してから migration）にすると途中失敗時に **登録が 2 個** 残る——本変更が終わらせようとしている状態そのものであ
+る。退役を先に行えば残るのは 0 個か 1 個にしかならず、install の再実行は idempotent で、退役した drain leg は
+`--run-once` が既に行うため capability の喪失にならない。refusal 条件（platform / executable / credential /
+退役 plist の identity）はすべて **どちらの mutation よりも前**に評価するので、拒否された install は
+zero-mutation のままである。`uninstall` 側では foreign / unreadable な退役 plist は報告のみで、**自分の** agent
+の削除を妨げない（他人の file を理由に自分の登録を残す方が有害である）。
 
 **Linux systemd user timer** の realization（`supervisor_systemd`）は **owned service 1 個 + timer 1 個**であ
-る。timer は 60 秒ごとに `workflow supervisor --run-once` を 1 回起動し、process は毎 tick 終了する。macOS の
-dual-agent 形状は複製しない: `--drain-only` の別 unit 登録、2 組の atomic install / 一括 rollback、macOS 内部
-構造との同等性は、いずれも受入条件から削除された。
+る。timer は portable default cadence ごとに `workflow supervisor --run-once` を 1 回起動し、process は毎 tick
+終了する。
 
-**60 秒 tick は 60 秒 Redmine poll ではない。** provider 読み取りは supervisor 本体が持つ durable な
+**OS tick は Redmine poll ではない。** provider 読み取りは supervisor 本体が持つ durable な
 per-workspace cadence watermark（`reconcile_cadence` / `should_reconcile_source`、portable default 300 秒 +
 empty pass での指数 backoff と jitter）で gate される。window 内の tick は provider 読み取り **0** の local pass
 へ downgrade されるので、頻繁な tick は SQLite + Herdr で動き、Redmine は低頻度の取りこぼし回収に留まる。この
 gating は supervisor 本体の責務であり、scheduler adapter 側は cadence を供給するだけで再実装しない。
+
+### OS tick interval の portable default（#15192 実測）
+
+interval は **同一の設定 surface**（`--tick-interval`、既定は
+`DEFAULT_OS_TICK_INTERVAL_SECONDS`）から両 host へ与える。launchd の `StartInterval` と systemd の
+`OnUnitActiveSec` は同じ値を受ける。portable default は **180 秒**で、根拠なく 60 秒へ固定しない（60 は退役し
+た drain agent の cadence の名残であり、専用登録が無くなった今その継承に根拠はない）:
+
+| 観点 | 60s | **180s** | 300s |
+| --- | --- | --- | --- |
+| local attest 済み row の回収最大遅延 | 60s | 180s | 300s |
+| provider 要求 row の回収最大遅延（watermark 300s + tick alignment） | 360s | **480s** | 600s |
+| tick 数 / 日 | 1440 | **480** | 288 |
+
+tick 実測コスト（#15192 参照 host、空 registry の 1 tick）は **約 0.48s wall / 0.47s CPU**。180 秒なら約
+480 tick/日、60 秒なら約 1440 tick/日である。#15192 以前の macOS pair は 1728 tick/日（reconcile 288 + drain
+1440）だったので、単一 180 秒 tick は **約 72% 少ない** scheduled work で、fallback 遅延の悪化は最大 120 秒に
+留まる。対話 latency を担うのは event-driven な `--watch`（#13758）であり、OS timer は取りこぼし回収の
+fallback である。tick 落ちは損失にならない（次 tick が outbox を読み直す）ため、これは safety ではなく latency
+の knob である。
+
+300 秒（= provider cadence と同値）を採らない理由は二つある。tick が Redmine poll に見えること、そして tick が
+watermark と整列するため due を僅かに逃した pass が丸ごと 1 周期待つこと（最悪 600 秒）である。OS tick は
+provider cadence より **厳密に細かい**ことを test で固定する。
 
 owned artifact は XDG user unit directory（`$XDG_CONFIG_HOME/systemd/user`、既定 `~/.config/systemd/user`）下の
 service + timer である。対応関係:
@@ -526,7 +567,7 @@ service + timer である。対応関係:
 | LaunchAgent | systemd user | 意味 |
 | --- | --- | --- |
 | `RunAtLoad` | `[Timer] OnActiveSec=0s` | timer が active になった瞬間に 1 tick（`enable --now` と以後の user manager 起動の両方を覆う） |
-| `StartInterval=<N>` | `[Timer] OnUnitActiveSec=60s` | 前回実行から N 秒後に再実行 |
+| `StartInterval=<N>` | `[Timer] OnUnitActiveSec=<N>s` | 前回実行から N 秒後に再実行（N は共通 portable default / `--tick-interval`） |
 | `KeepAlive` 不在 | `Restart=` / `RemainAfterExit=` 不在 + `Type=oneshot` | bounded one-shot を常駐化・tight relaunch loop 化しない（false 設定ではなく **構造的に不在**） |
 | `EnvironmentVariables` 不在 | `Environment=` / `EnvironmentFile=` 不在 | unit に secret を書き込む code path が存在しない |
 | `ProgramArguments` | `ExecStart`（token ごとに systemd quote + `%` escape） | shell string ではない構造化 argv。`/bin/sh -c` を経由しない |
@@ -560,6 +601,23 @@ status は非破壊で、受入条件が求める観測値を秘密非表示で�
 `provider_reconcile_interval_seconds`。restart は owned timer が active な場合だけ作用し、installed command が
 今 install するはずの command と一致しない場合は drift として拒否する（reinstall が正道）。
 
+**この 3 つの観測値の意味は #15192 で両 host 共通にした**（key 名も語彙も同一）。ただし *供給できる範囲* は
+host の manager が公開する情報に従い、**足りない分は key を落とさず explicit unknown で答える**:
+
+- **実行内容**: 両 host が `installed_command` に exact argv を出す。値は executable path + 固定 flag +
+  config directory（mozyo home）であり credential ではない。credential の値・URL・header 名は投影に出ない。
+  macOS 側の status は #15192 以前 path を一切出さない契約だったが、Linux（#15183 で review 済み）に合わせて
+  `installed_command` に限って mozyo home を含める。**それ以外の key は従来どおり path を含めない**（test は
+  carve-out を明示した上でこの不変条件を保持する）。
+- **次回起動**: systemd は monotonic / realtime の next-elapse を公開する。launchd は `StartInterval` agent の
+  次回発火時刻を `launchctl print` に一切公開しないため、macOS は `next_elapse=""` +
+  `next_elapse_basis`=unknown を返す。**key を省略しない**のは、key の不在が「予定なし」と読まれる一方、実際に
+  は schedule されているからである。operator が使える cadence は `scheduled_interval_seconds` と直近実行である。
+- **直近の終了結果**: systemd の `Result` 語彙（`success` / `exit-code` / ...）を共通語彙とし、launchd は
+  `launchctl print` の `last exit code` / `last exit status`（綴りは macOS 版で揺れるため両方受理）を同語彙へ
+  写す。launchd は終了時刻を公開しないため `last_exit_at` は空。値の読み取りは pid と同じ規律（ASCII 十進・
+  `pid_t` 幅、読めなければ `None`）で、projection の "never raises" 契約を守る（#14753 と同じ欠陥類型）。
+
 `next_elapse` は必ず `next_elapse_basis` と対で扱う。systemd は `NextElapseUSecRealtime` を **calendar timer に
 しか設定せず**、本 adapter の monotonic timer では `NextElapseUSecMonotonic` 側に値が入る（片方だけ読むと実 timer
 に対し空を返す。#15183 smoke で実測）。monotonic 値は **boot 起点**であり wall clock ではないため、basis 無しの
@@ -567,9 +625,12 @@ status は非破壊で、受入条件が求める観測値を秘密非表示で�
 （human-readable path だけが解釈手段を失う状態を作らない）。
 
 宣言的 definition は backend が実際に **owned する service** に対応させる。`definitions` を owned service と 1 対 1
-の roster とし、Linux では `--drain-only` の definition を出さない（1 個の `--run-once` timer しか導入しないのに
-drain service の存在を示唆しない）。macOS は既存の `definition` / `drain_definition` key を維持する。CLI help も
-同様に、Linux の非 gate（credential 未整備でも導入可、単一 60 秒 timer）と macOS の atomic pair / credential gate
+の roster とし、`--drain-only` の definition は **どの host でも出さない**（#15192）。これは #15183 review
+Finding 6（「導入しない service の存在を示唆しない」）と同じ規則であり、drain 登録がどの host にも無くなった今、
+例外を適用する host が残っていないだけである。`--drain-only` は manual action として残るが、action に
+definition は要らない。したがって `drain_definition` key と、それだけを設定していた `--drain-interval` flag も
+削除する（何も設定しない flag を「同一設定 surface」として残さない）。CLI help も同様に、host 共通の事実
+（各 1 登録・共通 cadence）と唯一の意図的差異（Linux は credential 未整備でも導入可、macOS は credential gate）
 を書き分け、撤回済み条件を host 共通の事実として書かない。
 
 uninstall は unit file を消すだけでは足りず、最後に `reset-failed` で manager 側の状態も消す: 実行中の sweep を

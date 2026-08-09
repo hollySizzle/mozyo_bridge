@@ -595,10 +595,17 @@ class ServiceStatusTest(_DarwinCase):
         self.assertEqual(sl.CREDENTIAL_READY, status["credential_readiness"])
         blob = str(status)
         self.assertNotIn(str(self.os_home), blob)
-        self.assertNotIn(str(self.mozyo_home), blob)
-        self.assertNotIn(_resolved(self.mozyo_home), blob)
         self.assertNotIn("home-key", blob.lower())
         self.assertNotIn("x-redmine-api-key", blob.lower())
+        # The mozyo home appears in exactly ONE place: the `installed_command` argv added by #15192
+        # so 実行内容 reads the same on both hosts (the Linux adapter has published it since #15183).
+        # That value is a config DIRECTORY, not a credential — the key and URL live in a file under
+        # it and never reach this projection, as the two assertions above pin. Everything else stays
+        # path-free, which is what this test guards: narrowed to the carve-out, not dropped.
+        without_command = {k: v for k, v in status.items() if k != "installed_command"}
+        self.assertNotIn(str(self.mozyo_home), str(without_command))
+        self.assertNotIn(_resolved(self.mozyo_home), str(without_command))
+        self.assertIn(_resolved(self.mozyo_home), status["installed_command"])
 
     def test_status_reports_the_pinned_home_readiness_not_the_current_shell(self) -> None:
         # R3-F1: installed pin (mozyo_home, ready); a DIFFERENT current home B (missing) must not
@@ -702,111 +709,249 @@ class ServiceStatusTest(_DarwinCase):
         self.assertFalse(status["executable_matches"])
 
 
-class _FailNthBootstrap:
-    """A runner that fails the N-th ``bootstrap`` (all else ok) — models a partial dual-agent install."""
+def _legacy_drain_plist(os_home: Path, *, label: str | None = None) -> Path:
+    """Write a pre-#15192 drain LaunchAgent at its owned path (test double for an old install)."""
+    target = sl.plist_path(os_home, agent=sl.LEGACY_DRAIN_AGENT)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": sl.LEGACY_DRAIN_AGENT.label if label is None else label,
+                "ProgramArguments": ["/opt/bin/mozyo-bridge", "workflow", "supervisor",
+                                     "--drain-only", "--home", "/tmp/x"],
+                "RunAtLoad": True,
+                "StartInterval": 60,
+            }
+        )
+    )
+    return target
 
-    def __init__(self, fail_bootstrap: int) -> None:
-        self.calls: list[list[str]] = []
-        self._fail = fail_bootstrap
-        self._bootstraps = 0
 
-    def __call__(self, argv):
-        argv = list(argv)
-        self.calls.append(argv)
-        if len(argv) >= 2 and argv[1] == "bootstrap":
-            self._bootstraps += 1
-            if self._bootstraps == self._fail:
-                return _result(1)
-        return _result(0)
+class SingleOwnedAgentTest(_DarwinCase):
+    """Redmine #15192: macOS registers exactly ONE LaunchAgent, running the bounded ``--run-once``."""
 
+    def test_exactly_one_owned_agent_running_run_once(self) -> None:
+        self.assertEqual(len(sl.SUPERVISOR_AGENTS), 1)
+        self.assertIs(sl.SUPERVISOR_AGENTS[0], sl.SUPERVISOR_AGENT)
+        self.assertEqual(sl.SUPERVISOR_AGENT.argv_tail[-1], "--run-once")
 
-class DualAgentPairTest(_DarwinCase):
-    """Redmine #14150 F1: the split's owned dual-agent (reconcile + drain) lifecycle."""
+    def test_the_retired_drain_agent_is_not_an_owned_agent(self) -> None:
+        # It still has an identity (the migration needs one) but no verb installs or reports it.
+        self.assertNotIn(sl.LEGACY_DRAIN_AGENT, sl.SUPERVISOR_AGENTS)
+        self.assertEqual(sl.LEGACY_DRAIN_AGENT.argv_tail[-1], "--drain-only")
+        self.assertNotEqual(sl.LEGACY_DRAIN_AGENT.label, sl.SUPERVISOR_AGENT.label)
 
-    def test_agents_are_distinct_owned_identities(self) -> None:
-        self.assertNotEqual(sl.RECONCILE_AGENT.label, sl.DRAIN_AGENT.label)
-        self.assertNotEqual(sl.RECONCILE_AGENT.plist_relative, sl.DRAIN_AGENT.plist_relative)
-        self.assertEqual(sl.DRAIN_AGENT.argv_tail[-1], "--drain-only")
-        self.assertEqual(sl.RECONCILE_AGENT.argv_tail[-1], "--run-once")
-
-    def test_install_pair_installs_both_agents(self) -> None:
+    def test_install_registers_one_agent_only(self) -> None:
         _write_home_credential(self.mozyo_home)
         runner = FakeRunner()
-        result = sl.install_pair(
-            os_home=self.os_home, mozyo_home=self.mozyo_home,
-            reconcile_interval_seconds=300, drain_interval_seconds=60,
-            runner=runner, which=_which_found,
-        )
-        self.assertTrue(result["performed"])
-        self.assertEqual([a["label"] for a in result["agents"]],
-                         [sl.RECONCILE_AGENT.label, sl.DRAIN_AGENT.label])
-        # Both owned plists exist, at their own intervals + argv tails.
-        recon = plistlib.loads(sl.plist_path(self.os_home, agent=sl.RECONCILE_AGENT).read_bytes())
-        drain = plistlib.loads(sl.plist_path(self.os_home, agent=sl.DRAIN_AGENT).read_bytes())
-        self.assertEqual(recon["ProgramArguments"][-3], "--run-once")
-        self.assertEqual(drain["ProgramArguments"][-3], "--drain-only")
-        self.assertEqual(recon["StartInterval"], 300)
-        self.assertEqual(drain["StartInterval"], 60)
-        # Both bootstrapped (2 bootstraps).
-        self.assertEqual(runner.verbs.count("bootstrap"), 2)
-
-    def test_install_pair_rolls_back_both_on_drain_failure(self) -> None:
-        _write_home_credential(self.mozyo_home)
-        runner = _FailNthBootstrap(fail_bootstrap=2)  # reconcile bootstrap ok, drain bootstrap fails
-        result = sl.install_pair(
-            os_home=self.os_home, mozyo_home=self.mozyo_home,
-            runner=runner, which=_which_found,
-        )
-        self.assertFalse(result["performed"])
-        self.assertTrue(result["rolled_back"])
-        # Neither owned plist remains — the successful reconcile agent AND the partial drain plist
-        # are both cleaned up, so no half-installed pair is left behind (fail-closed).
-        self.assertFalse(sl.plist_path(self.os_home, agent=sl.RECONCILE_AGENT).exists())
-        self.assertFalse(sl.plist_path(self.os_home, agent=sl.DRAIN_AGENT).exists())
-
-    def test_install_pair_fail_closed_non_darwin_touches_nothing(self) -> None:
-        with patch.object(sl, "_running_on_darwin", return_value=False):
-            result = sl.install_pair(
-                os_home=self.os_home, mozyo_home=self.mozyo_home,
-                runner=FakeRunner(), which=_which_found,
-            )
-        self.assertFalse(result["performed"])
-        self.assertEqual(result["reason"], sl.REASON_UNSUPPORTED_PLATFORM)
-        self.assertFalse(sl.plist_path(self.os_home, agent=sl.RECONCILE_AGENT).exists())
-        self.assertFalse(sl.plist_path(self.os_home, agent=sl.DRAIN_AGENT).exists())
-
-    def test_uninstall_pair_removes_both(self) -> None:
-        _write_home_credential(self.mozyo_home)
-        sl.install_pair(os_home=self.os_home, mozyo_home=self.mozyo_home,
-                        runner=FakeRunner(), which=_which_found)
-        result = sl.uninstall_pair(os_home=self.os_home, runner=FakeRunner())
-        self.assertTrue(result["performed"])
-        self.assertFalse(sl.plist_path(self.os_home, agent=sl.RECONCILE_AGENT).exists())
-        self.assertFalse(sl.plist_path(self.os_home, agent=sl.DRAIN_AGENT).exists())
-
-    def test_restart_pair_re_login_e2e_kickstarts_both_when_loaded(self) -> None:
-        # Installed + loaded pair -> restart (re-login / service kickstart) drives BOTH agents.
-        _write_home_credential(self.mozyo_home)
-        sl.install_pair(os_home=self.os_home, mozyo_home=self.mozyo_home,
-                        runner=FakeRunner(), which=_which_found)
-        runner = FakeRunner(print_result=_result(0))  # `print` returns 0 -> loaded
-        result = sl.restart_pair(
+        result = sl.install(
             os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found,
         )
         self.assertTrue(result["performed"])
-        self.assertEqual(runner.verbs.count("kickstart"), 2)  # both agents kickstarted
+        self.assertEqual(runner.verbs.count("bootstrap"), 1)
+        self.assertTrue(sl.plist_path(self.os_home).exists())
+        self.assertFalse(sl.plist_path(self.os_home, agent=sl.LEGACY_DRAIN_AGENT).exists())
 
-    def test_service_status_pair_reports_both(self) -> None:
-        _write_home_credential(self.mozyo_home)
-        sl.install_pair(os_home=self.os_home, mozyo_home=self.mozyo_home,
-                        runner=FakeRunner(), which=_which_found)
-        status = sl.service_status_pair(
-            os_home=self.os_home, mozyo_home=self.mozyo_home, runner=FakeRunner(), which=_which_found,
+    def test_the_portable_default_interval_is_shared_with_the_linux_adapter(self) -> None:
+        # One operator-facing cadence knob: the same number reaches a launchd StartInterval and a
+        # systemd OnUnitActiveSec, so `--tick-interval` means one thing (#15192).
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            supervisor_systemd as ss,
         )
-        agents = status["agents"]
-        self.assertEqual([a["label"] for a in agents],
-                         [sl.RECONCILE_AGENT.label, sl.DRAIN_AGENT.label])
-        self.assertTrue(all(a["installed"] for a in agents))
+
+        self.assertEqual(
+            sl.SUPERVISOR_AGENT.default_interval_seconds, ss.DEFAULT_TICK_INTERVAL_SECONDS
+        )
+        _write_home_credential(self.mozyo_home)
+        sl.install(os_home=self.os_home, mozyo_home=self.mozyo_home,
+                   runner=FakeRunner(), which=_which_found)
+        installed = plistlib.loads(sl.plist_path(self.os_home).read_bytes())
+        self.assertEqual(installed["StartInterval"], ss.DEFAULT_TICK_INTERVAL_SECONDS)
+
+    def test_the_os_tick_stays_finer_than_the_provider_cadence(self) -> None:
+        # Equal values would make the OS tick read as a Redmine poll and would align the tick with
+        # the watermark, so a just-missed due window waits a whole extra period.
+        self.assertLess(
+            sl.SUPERVISOR_AGENT.default_interval_seconds, sl.DEFAULT_RECONCILIATION_INTERVAL_SECONDS
+        )
+
+
+class LegacyDrainMigrationTest(_DarwinCase):
+    """Redmine #15192: the retired ``--drain-only`` registration is migrated away, under an identity fence."""
+
+    def test_classification_distinguishes_absent_owned_foreign_and_unreadable(self) -> None:
+        self.assertEqual(sl.classify_legacy_drain(self.os_home), sl.LEGACY_DRAIN_ABSENT)
+        _legacy_drain_plist(self.os_home)
+        self.assertEqual(sl.classify_legacy_drain(self.os_home), sl.LEGACY_DRAIN_OWNED)
+        _legacy_drain_plist(self.os_home, label="com.example.someone-else")
+        self.assertEqual(sl.classify_legacy_drain(self.os_home), sl.LEGACY_DRAIN_FOREIGN)
+        sl.plist_path(self.os_home, agent=sl.LEGACY_DRAIN_AGENT).write_bytes(b"not a plist")
+        self.assertEqual(sl.classify_legacy_drain(self.os_home), sl.LEGACY_DRAIN_UNREADABLE)
+
+    def test_install_removes_an_owned_legacy_agent_and_leaves_one_registration(self) -> None:
+        _write_home_credential(self.mozyo_home)
+        legacy = _legacy_drain_plist(self.os_home)
+        runner = FakeRunner()
+        result = sl.install(
+            os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found,
+        )
+        self.assertTrue(result["performed"])
+        self.assertEqual(result["legacy_drain"], sl.LEGACY_DRAIN_OWNED)
+        self.assertTrue(result["legacy_drain_removed"])
+        self.assertFalse(legacy.exists())
+        self.assertTrue(sl.plist_path(self.os_home).exists())
+        # The retired agent was UNLOADED before its file was unlinked; unlinking alone would leave a
+        # bootstrapped service running until logout.
+        booted_out = [c for c in runner.calls if len(c) >= 3 and c[1] == "bootout"]
+        self.assertIn(f"{_GUI_DOMAIN}/{sl.LEGACY_DRAIN_AGENT.label}", [c[2] for c in booted_out])
+
+    def test_install_refuses_zero_mutation_on_a_foreign_plist_at_the_legacy_path(self) -> None:
+        _write_home_credential(self.mozyo_home)
+        foreign = _legacy_drain_plist(self.os_home, label="com.example.someone-else")
+        before = foreign.read_bytes()
+        runner = FakeRunner()
+        result = sl.install(
+            os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found,
+        )
+        self.assertFalse(result["performed"])
+        self.assertEqual(result["reason"], sl.REASON_LEGACY_DRAIN_FOREIGN_LABEL)
+        # Zero mutation: the stranger's plist is intact, our agent was not written, launchctl unused.
+        self.assertEqual(foreign.read_bytes(), before)
+        self.assertFalse(sl.plist_path(self.os_home).exists())
+        self.assertEqual(runner.calls, [])
+
+    def test_install_refuses_zero_mutation_on_an_unreadable_plist_at_the_legacy_path(self) -> None:
+        _write_home_credential(self.mozyo_home)
+        target = _legacy_drain_plist(self.os_home)
+        target.write_bytes(b"not a plist")
+        runner = FakeRunner()
+        result = sl.install(
+            os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found,
+        )
+        self.assertFalse(result["performed"])
+        self.assertEqual(result["reason"], sl.REASON_LEGACY_DRAIN_UNREADABLE)
+        self.assertTrue(target.exists())
+        self.assertFalse(sl.plist_path(self.os_home).exists())
+        self.assertEqual(runner.calls, [])
+
+    def test_a_failed_install_after_migration_never_leaves_two_registrations(self) -> None:
+        # The ordering invariant: migrate first, install second. A bootstrap failure mid-sequence
+        # can leave zero or one registration — never the two-agent state #15192 exists to end.
+        _write_home_credential(self.mozyo_home)
+        legacy = _legacy_drain_plist(self.os_home)
+        result = sl.install(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            runner=FakeRunner(default=_result(1)), which=_which_found,
+        )
+        self.assertFalse(result["performed"])
+        self.assertEqual(result["reason"], sl.REASON_BOOTSTRAP_FAILED)
+        self.assertFalse(legacy.exists())
+
+    def test_uninstall_removes_the_owned_agent_and_the_legacy_one(self) -> None:
+        _write_home_credential(self.mozyo_home)
+        sl.install(os_home=self.os_home, mozyo_home=self.mozyo_home,
+                   runner=FakeRunner(), which=_which_found)
+        legacy = _legacy_drain_plist(self.os_home)  # e.g. re-created by an old build
+        result = sl.uninstall(os_home=self.os_home, runner=FakeRunner())
+        self.assertTrue(result["performed"])
+        self.assertTrue(result["legacy_drain_removed"])
+        self.assertFalse(sl.plist_path(self.os_home).exists())
+        self.assertFalse(legacy.exists())
+
+    def test_uninstall_over_a_foreign_legacy_plist_still_removes_our_own_agent(self) -> None:
+        # Refusing here would strand OUR registration over a file we do not own.
+        _write_home_credential(self.mozyo_home)
+        sl.install(os_home=self.os_home, mozyo_home=self.mozyo_home,
+                   runner=FakeRunner(), which=_which_found)
+        foreign = _legacy_drain_plist(self.os_home, label="com.example.someone-else")
+        result = sl.uninstall(os_home=self.os_home, runner=FakeRunner())
+        self.assertTrue(result["performed"])
+        self.assertFalse(sl.plist_path(self.os_home).exists())
+        self.assertTrue(foreign.exists())
+        self.assertEqual(result["legacy_drain_reason"], sl.REASON_LEGACY_DRAIN_FOREIGN_LABEL)
+
+    def test_migration_is_darwin_only_and_status_reports_a_pending_one(self) -> None:
+        _write_home_credential(self.mozyo_home)
+        _legacy_drain_plist(self.os_home)
+        with patch.object(sl, "_running_on_darwin", return_value=False):
+            result = sl.install(os_home=self.os_home, mozyo_home=self.mozyo_home,
+                                runner=FakeRunner(), which=_which_found)
+        self.assertEqual(result["reason"], sl.REASON_UNSUPPORTED_PLATFORM)
+        self.assertTrue(sl.plist_path(self.os_home, agent=sl.LEGACY_DRAIN_AGENT).exists())
+        status = sl.service_status(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            runner=FakeRunner(), which=_which_found,
+        )
+        self.assertEqual(status["legacy_drain"], sl.LEGACY_DRAIN_OWNED)
+
+
+class CommonStatusContractTest(_DarwinCase):
+    """Redmine #15192: 実行内容 / 次回起動 / 直近の終了結果 mean the same thing on both hosts."""
+
+    def _installed_status(self, *, print_result=None) -> dict:
+        _write_home_credential(self.mozyo_home)
+        sl.install(os_home=self.os_home, mozyo_home=self.mozyo_home,
+                   runner=FakeRunner(), which=_which_found)
+        return sl.service_status(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            runner=FakeRunner(print_result=print_result), which=_which_found,
+        )
+
+    def test_status_publishes_the_shared_contract_keys(self) -> None:
+        status = self._installed_status()
+        for key in (
+            "installed", "loaded", "pid", "scheduled_interval_seconds", "home_pin",
+            "executable_matches", "keep_alive_present", "no_environment_block",
+            "credential_readiness", "installed_command", "next_elapse", "next_elapse_basis",
+            "last_result", "last_exit_status", "last_exit_at",
+            "provider_reconcile_interval_seconds",
+        ):
+            self.assertIn(key, status, key)
+
+    def test_installed_command_is_the_exact_argv_and_carries_no_secret(self) -> None:
+        status = self._installed_status()
+        self.assertEqual(status["installed_command"][-4:-2], ["supervisor", "--run-once"])
+        self.assertNotIn("home-key-sentinel", " ".join(status["installed_command"]))
+
+    def test_next_elapse_is_an_explicit_unknown_not_an_absent_key(self) -> None:
+        # launchd publishes no next-fire time for a StartInterval agent. An ABSENT key would read as
+        # "nothing scheduled" while the agent IS scheduled, so the key is present and says unknown.
+        status = self._installed_status()
+        self.assertEqual(status["next_elapse"], "")
+        self.assertEqual(status["next_elapse_basis"], sl.NEXT_ELAPSE_UNKNOWN)
+
+    def test_the_unknown_basis_token_matches_the_systemd_adapter(self) -> None:
+        # A drift guard instead of a cross-OS import: neither adapter imports the other.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            supervisor_systemd as ss,
+        )
+
+        self.assertEqual(sl.NEXT_ELAPSE_UNKNOWN, ss.NEXT_ELAPSE_UNKNOWN)
+
+    def test_last_result_uses_the_shared_vocabulary(self) -> None:
+        clean = self._installed_status(print_result=_result(0, "\tpid = 4321\n\tlast exit code = 0\n"))
+        self.assertEqual(clean["last_result"], sl.LAST_RESULT_SUCCESS)
+        self.assertEqual(clean["last_exit_status"], 0)
+        failed = self._installed_status(
+            print_result=_result(0, "\tpid = 4321\n\tlast exit status = 2\n")
+        )
+        self.assertEqual(failed["last_result"], sl.LAST_RESULT_EXIT_CODE)
+        self.assertEqual(failed["last_exit_status"], 2)
+
+    def test_an_unreadable_last_exit_is_unknown_not_a_crash(self) -> None:
+        # Same defect class as the #14753 pid read: a non-ASCII digit must not raise out of a
+        # projection whose whole contract is "never raises".
+        status = self._installed_status(
+            print_result=_result(0, "\tpid = 4321\n\tlast exit code = ²\n")
+        )
+        self.assertIsNone(status["last_exit_status"])
+        self.assertEqual(status["last_result"], "")
+
+    def test_status_reports_no_last_result_when_the_service_is_unknown_to_launchd(self) -> None:
+        status = self._installed_status(print_result=_result(113))  # non-zero -> not loaded
+        self.assertFalse(status["loaded"])
+        self.assertIsNone(status["last_exit_status"])
+        self.assertEqual(status["last_result"], "")
 
 
 if __name__ == "__main__":

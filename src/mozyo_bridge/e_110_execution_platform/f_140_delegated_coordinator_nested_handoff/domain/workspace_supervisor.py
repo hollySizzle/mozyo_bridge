@@ -79,14 +79,19 @@ SUPERVISION_MODES = frozenset(
 #: cadence — external Redmine updates are the reconciliation target, not sub-minute latency. The
 #: operator tunes the concrete cadence in their runtime policy; this is only the neutral default.
 DEFAULT_RECONCILIATION_INTERVAL_SECONDS = 300
-#: Portable default LOCAL-drain interval (seconds). The drain reads local state only (no provider
-#: load), so it can run finer than the provider reconciliation cadence to deliver already-safe
-#: pending rows promptly — but it is still a bounded one-shot, never an in-turn poll. Chosen as a
-#: neutral sub-multiple of the reconciliation default (not a private runtime value); the operator
-#: tunes the concrete cadence in their runtime policy. Its correctness never depends on the cadence:
-#: a dropped drain tick loses nothing (the provider reconciliation leg and the next drain re-read the
-#: outbox), so this is a latency knob, not a safety one.
-DEFAULT_LOCAL_DRAIN_INTERVAL_SECONDS = 60
+#: Portable default **OS tick** interval (seconds): how often the host scheduler — launchd on macOS,
+#: a systemd user timer on Linux — starts ONE bounded ``workflow supervisor --run-once`` (Redmine
+#: #15192). The single cadence knob for both OS registrations. The constant above is NOT an OS
+#: cadence: it is the supervisor body's own provider watermark, which no OS timer schedules.
+#:
+#: 180 is MEASURED, not inherited — the prior 60 came from the retired macOS drain agent, which no
+#: longer has a registration. Worst-case recovery is one tick locally and watermark + tick (480s)
+#: for a provider read, against ~72% fewer ticks than 60s; the event-driven ``--watch`` primary
+#: (#13758) carries interactive latency, so this fallback leg trades 120s for load. It must stay
+#: strictly finer than :data:`DEFAULT_RECONCILIATION_INTERVAL_SECONDS` or the tick reads as a Redmine
+#: poll and aligns with the watermark. Full measurement table: the OS scheduler adapter section of
+#: ``vibes/docs/logics/ticket-system-neutral-orchestrator.md``.
+DEFAULT_OS_TICK_INTERVAL_SECONDS = 180
 
 #: A workspace whole-skip reason (fixed vocabulary).
 SKIP_LEASE_REFUSED = "lease_held_by_other"  # a live duplicate supervisor owns this workspace
@@ -881,7 +886,6 @@ def build_service_definition(
     run_at_login: bool = True,
     keep_alive: bool = False,
     label: str = DEFAULT_SUPERVISOR_SERVICE_LABEL,
-    local_drain: bool = False,
 ) -> SupervisorServiceDefinition:
     """Build the supervisor daemon's declarative service definition (pure, no secrets).
 
@@ -892,21 +896,14 @@ def build_service_definition(
     **False**: the sweep exits and is re-run on the interval (launchd ``RunAtLoad`` + ``StartInterval``
     in Phase B1), so KeepAlive would only produce a tight restart loop (j#78995).
 
-    ``local_drain`` (Redmine #14150) builds the LOCAL-drain variant instead: the command is
-    ``<command_prefix> --drain-only`` (read local state only, zero ticket-provider reads) and
-    ``reconciliation_interval_seconds`` carries the FINER drain cadence. The OS scheduler runs this
-    bounded one-shot at the drain interval alongside the coarser reconciliation agent — the SAME
-    bounded command adapter, never an in-turn sleep/poll. The default label switches to the distinct
-    drain label unless the caller overrides ``label``.
+    There is no ``--drain-only`` variant (Redmine #15192): no OS scheduler registers a drain service
+    on any host, and a definition describes a service a backend OWNS. ``--drain-only`` remains a
+    manual action, which needs no declarative definition.
     """
     interval = max(1, int(reconciliation_interval_seconds))
-    action_flag = "--drain-only" if local_drain else "--run-once"
-    command = tuple(str(p) for p in command_prefix) + (action_flag,)
-    resolved_label = str(label)
-    if local_drain and resolved_label == DEFAULT_SUPERVISOR_SERVICE_LABEL:
-        resolved_label = DEFAULT_SUPERVISOR_DRAIN_SERVICE_LABEL
+    command = tuple(str(p) for p in command_prefix) + ("--run-once",)
     return SupervisorServiceDefinition(
-        label=resolved_label,
+        label=str(label),
         command=command,
         reconciliation_interval_seconds=interval,
         run_at_login=bool(run_at_login),
@@ -949,7 +946,7 @@ __all__ = (
     "SUPERVISION_HIBERNATE",
     "SUPERVISION_MODES",
     "DEFAULT_RECONCILIATION_INTERVAL_SECONDS",
-    "DEFAULT_LOCAL_DRAIN_INTERVAL_SECONDS",
+    "DEFAULT_OS_TICK_INTERVAL_SECONDS",
     "SKIP_LEASE_REFUSED",
     "SKIP_ROSTER_UNREADABLE",
     "SKIP_NO_ACTIVE_ISSUES",

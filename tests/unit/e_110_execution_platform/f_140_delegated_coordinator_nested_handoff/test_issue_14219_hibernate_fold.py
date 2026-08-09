@@ -549,8 +549,13 @@ class NoStandaloneActivationSurfaceTest(unittest.TestCase):
         text = self._src(supervisor_launchd)
         self.assertNotIn("--hibernate", text)
         self.assertNotIn("HIBERNATE_AGENT", text)
-        # Owned dual-agent lifecycle preserved (reconcile + drain only).
-        self.assertEqual(len(supervisor_launchd.SUPERVISOR_AGENTS), 2)
+        # The hibernate leg folds into the bounded sweep and never earns its own registration. The
+        # owned roster is ONE agent since #15192 retired the drain agent; what this guard cares
+        # about is that hibernate did not add to it, whatever the roster's size is.
+        self.assertEqual(len(supervisor_launchd.SUPERVISOR_AGENTS), 1)
+        self.assertEqual(
+            supervisor_launchd.SUPERVISOR_AGENTS[0].argv_tail[-1], "--run-once"
+        )
 
 
 class HibernateRollupVocabularyDriftGuardTest(unittest.TestCase):
