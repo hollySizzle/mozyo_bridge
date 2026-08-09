@@ -18,6 +18,7 @@ from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.herdr
 )
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.unit_board_sources import (
     UnitBoardSourcesConfig,
+    source_command_argv,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_multi_source_unit_board import (
     MAX_REMOTE_PATH_LENGTH,
@@ -31,6 +32,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
     REMOTE_BOARD_ARGS,
     REMOTE_WORKSPACE_ARGS,
     MultiSourceUnitBoardRuntime,
+    SourceCommandResult,
 )
 
 
@@ -685,6 +687,60 @@ class SourceWorkspaceTests(unittest.TestCase):
         self.assertIsNone(
             multi.resolve_source_workspace(REMOTE_CONFIG.by_id["devbox"], WORKSPACE_A)
         )
+
+
+class SourceCommandResultReprTests(unittest.TestCase):
+    """A command result is safe to print, not only to render.
+
+    ``completed`` wraps a ``CompletedProcess`` whose repr rebuilds the argv and
+    the captured stdout, and both carry values the board must never disclose:
+    the assembled command holds the ssh target and the ``--target-repo`` path,
+    and the stdout is the remote gateway record.  The result is a live local on
+    the delivery and observation paths, so its repr is a print / log / traceback
+    surface (review j#102201 finding_1, the same class as j#102159 finding_2 —
+    which the preview-side repr test could not have caught, being a different
+    object).
+    """
+
+    REMOTE_PATH = "/srv/REMOTE-PATH-SENTINEL/checkout"
+
+    def _delivery_result(self) -> SourceCommandResult:
+        argv = source_command_argv(
+            REMOTE_CONFIG.by_id["devbox"],
+            (
+                "project-gateway",
+                "handoff",
+                "--to",
+                "codex",
+                "--target-repo",
+                self.REMOTE_PATH,
+                "--summary",
+                "board pointer",
+            ),
+            by_id=REMOTE_CONFIG.by_id,
+        )
+        stdout = json.dumps(
+            {"status": "submitted", "reason": "ok", "repo_root": self.REMOTE_PATH}
+        )
+        completed = subprocess.CompletedProcess(list(argv), 0, stdout, "")
+        return SourceCommandResult(ANSWER_OK, completed)
+
+    def test_no_connection_value_or_remote_path_appears_in_a_repr(self) -> None:
+        # Guard: the argv this result carries really does embed both, so a
+        # missing suppression would show up rather than the sentinels simply
+        # being absent from a result that never held them.
+        self.assertIn("SSH-DESTINATION-SENTINEL", repr(self._delivery_result().completed))
+
+        rendered = repr(self._delivery_result())
+        self.assertNotIn("SSH-DESTINATION-SENTINEL", rendered)
+        self.assertNotIn(self.REMOTE_PATH, rendered)
+
+    def test_the_outcome_and_completed_stay_readable(self) -> None:
+        # Suppressing the repr must not cost the fields callers depend on.
+        result = self._delivery_result()
+        self.assertTrue(result.ok)
+        self.assertIsNotNone(result.completed)
+        self.assertEqual(result.completed.returncode, 0)
 
 
 if __name__ == "__main__":

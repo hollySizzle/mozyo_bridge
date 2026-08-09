@@ -497,7 +497,17 @@ class SourceCommandResult:
     """One source command's mechanical outcome and, when it ran, its result."""
 
     outcome: str
-    completed: Optional[subprocess.CompletedProcess] = None
+    # Kept out of the repr, not only off the payload: ``completed`` is a
+    # ``CompletedProcess`` whose own repr reconstructs ``args`` — the assembled
+    # argv, which carries the ssh target, the container name, and
+    # ``--target-repo <canonical_path>`` — and the captured ``stdout``, which
+    # holds the remote gateway record (repo root, pane id).  A result that is
+    # safe to render but not to print is only half safe, and this one is a live
+    # local on the delivery and observation paths (review j#102201 finding_1,
+    # the same class as j#102159 finding_2).
+    completed: Optional[subprocess.CompletedProcess] = field(
+        default=None, repr=False
+    )
 
     @property
     def ok(self) -> bool:
