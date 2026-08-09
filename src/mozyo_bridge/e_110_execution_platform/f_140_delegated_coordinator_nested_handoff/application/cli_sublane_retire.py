@@ -231,6 +231,55 @@ def register_sublane_retire(
         ),
     )
     sublane_retire.add_argument(
+        "--superseded-audit-failure-terminal",
+        dest="superseded_audit_failure_terminal",
+        action="store_true",
+        help=(
+            "#15166: re-verify at action-time that this lane has NO formal Review Gate at all, "
+            "that its round-1 verdict was recorded by an INDEPENDENT AUDIT journal, and that the "
+            "acceptance it did not reach was obtained by a successor issue that acknowledges the "
+            "supersession — so it can converge to retired without any approval being asserted, "
+            "borrowed or invented. Reproduction #15164: `review_request` was never posted so no "
+            "`## Gate: review` exists (j#101792 says so in as many words), the successor #15165 "
+            "was approved (j#101810) and closed, both issues are task_closed, the lane never "
+            "committed — and the retire still refused permanently with `stale_review_generation` "
+            "(j#101825), because the ordinary fence reads a review generation this lane does not "
+            "have and --superseded-failure-terminal REQUIRES a round that concluded "
+            "`changes_requested`. Deliberately a bare opt-in and NOT a JSON path: its premise is a "
+            "CORRELATION across two issues AND two NEGATIVE claims over the whole record (no "
+            "review round anywhere, no repository change declared anywhere), which a "
+            "caller-supplied file would satisfy by omission alone, so both histories are read LIVE "
+            "over the credential-gated Redmine read. Admits only when ALL of: one canonical "
+            "`superseded_audit_failure` marker whose issue, whose workspace/lane/lane_generation "
+            "envelope (exact-matched against the retire TARGET's own lifecycle row, measured from "
+            "durable state, never from a flag) and whose integration_branch is the repository's "
+            "COMMITTED `sublane_integration.integration_branch` — which --integration-branch must "
+            "also name, because the live measurement is taken against it; the issue records ZERO "
+            "formal review rounds (a round that exists belongs to the ordinary fence or to "
+            "--superseded-failure-terminal, and refusing here is what stops this route becoming a "
+            "second way past a review that did happen); the latest gate is Close and NO recognized "
+            "lifecycle gate stands at-or-after the declaration (so the declaration is written "
+            "after the Close, in its own journal, and a re-opened lane is caught); "
+            "--callbacks-drained; the journal named as the audit record EXISTS in this issue's "
+            "history, is NOT a recognized lifecycle gate, and is OLDER than the declaration; the "
+            "record declares ZERO repository change (required beside the live check because a "
+            "zero ahead-count alone is also what already-merged work looks like); the named "
+            "successor is a DIFFERENT issue whose own record carries a "
+            "`superseded_audit_failure_successor` acknowledgement naming this issue and this audit "
+            "journal, and whose newest round is the approval it names and which is itself closed; "
+            "and the live repository still agrees ABOUT THIS LANE — --branch is the declaration's "
+            "own lane, its head literal-equals the declaration's head, the --worktree checkout is "
+            "clean, and it carries 0 commits over --integration-branch. The zero-change and "
+            "live-zero conjuncts are what BOUND this route: admitting drains a process without "
+            "integrating anything or minting any approval. It does NOT establish that the audit "
+            "concluded a failure (that is prose, not a governed surface) and it does NOT establish "
+            "who wrote the declaration — no record in this workspace can (ruling #14219 j#86718). "
+            "Fail-closed on every gap, including unconfigured credentials and an unmeasurable "
+            "repository. Never pass --latest-generation-admissible for such a lane: there is no "
+            "review generation, so the assert would be false."
+        ),
+    )
+    sublane_retire.add_argument(
         "--review-generation-json",
         dest="review_generation_json",
         default=None,

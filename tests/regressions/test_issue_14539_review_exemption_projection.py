@@ -3958,6 +3958,16 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "parsed through superseded_failure_correlation's single-scan reader (so the "
             "exactly-one-marker rule is that module's); renders the declaration marker itself",
         ),
+        f"{_D}/domain/superseded_audit_failure_terminal.py": (
+            ["*", "*", "*", "*", "*", "*"],
+            "reads (Redmine #15166): the audit-failure terminal declaration gate AND the "
+            "successor's audit-supersession acknowledgement gate, both located and parsed through "
+            "superseded_failure_correlation's single-scan reader (so the exactly-one-marker rule "
+            "is that module's — a second declaration of either gate, or one it names but cannot "
+            "read, poisons the note for that gate rather than yielding the readable sibling); "
+            "renders both markers itself, through the lane envelope's own renderer and the shared "
+            "separator guard",
+        ),
         f"{_D}/domain/hibernate_park_record.py": (["handoff", "handoff"], "reads one marker per record"),
         f"{_D}/application/operator_startup_resume_leg.py": (
             ["*", "operator-startup-gate"],
@@ -4057,6 +4067,13 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
     #: The trade is stated in ``test_no_module_shape_can_hide_a_capability_from_a_wildcard_consumer``:
     #: over-detection costs a declaration line, a missed reader costs a silent gate.
     INHERITED = {
+        f"{_D}/application/retire_superseded_audit_failure.py": (
+            ['*', '*', '*'],
+            "inherits via a used import of superseded_audit_failure_terminal (Redmine #15166); "
+            "names no marker token itself and reads no note directly — it measures the live "
+            "histories, the named audit journal's shape and the lane checkout, and delegates every "
+            "marker question to that module's strict grammar",
+        ),
         f"{_D}/application/coordinator_proxy_send.py": (
             ['workflow-event'],
             "inherits via a used import of coordinator_proxy_decision; names no marker token "
