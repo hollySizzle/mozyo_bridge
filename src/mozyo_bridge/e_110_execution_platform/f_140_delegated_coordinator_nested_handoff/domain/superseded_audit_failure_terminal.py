@@ -22,66 +22,73 @@ assumed:
 - the #14695 ``no_change_review_waiver`` refuses structurally for every input
   (``waiver_writer_authority_unresolvable``).
 
-So this is a FOURTH independent route to the same one boolean, and like the other three it can
-only ever ADMIT — none of them can weaken another, and a lane that fails all four is blocked
-exactly as it was before any of them existed.
+So this is a FIFTH independent route to the same one boolean, and like the other four it can only
+ever ADMIT — none of them can weaken another, and a lane that fails all five is blocked exactly as
+it was before any of them existed.
 
-**What this route rests on, stated in one place rather than implied.** Review j#101880 finding 1
-measured the R1 answer to that question and refuted it: R1 said the safety weight was carried by
-the SOURCE declaration plus the SUCCESSOR acknowledgement corroborating each other. It is not.
-Neither record can be authenticated (ruling #14219 j#86718 — every role posts under one
-source-system account), and the correlation those two markers assert exists NOWHERE ELSE, so one
-writer could place both. That is the exact shape :mod:`.no_change_review_waiver` refuses
-permanently (``WRITER_AUTHORITY_RESOLVABLE``), and #14755's own docstring draws the line at it:
-that route is admissible because "the facts exist independently of the declaration, and the
-declaration only correlates them". R1 quoted the line and then landed on the wrong side of it.
+**This route is a BOUNDED MIGRATION, not a general terminal, and that is the whole shape of it.**
+Two review rounds established why, each refuting the previous answer with a measurement:
 
-So the safety weight is moved onto a fact that exists independently of BOTH markers:
+- R1 rested the admission on the SOURCE declaration and the SUCCESSOR acknowledgement corroborating
+  each other. Review j#101880 finding 1 refuted it: neither record can be authenticated (ruling
+  #14219 j#86718 — every role posts under one source-system account) and the correlation they
+  assert exists NOWHERE ELSE, so one writer can place both. That is the exact shape
+  :mod:`.no_change_review_waiver` refuses permanently (``WRITER_AUTHORITY_RESOLVABLE``).
+- R2 moved the weight onto "the successor's approved Review Gate examined this lane's exact head".
+  Review j#101909 finding 1 refuted that too, and the refutation is the decisive one: **on a
+  zero-change lane, head equality is nearly free.** A lane that never committed sits ON the
+  integration head, so every approved review of every unrelated issue based on that head shares it.
+  The reviewer reproduced it — a successor review whose body names entirely unrelated work still
+  admitted. Head coverage bounds WHICH REPOSITORY STATE is involved; it says nothing about WHOSE
+  work was reviewed.
 
-**the successor's approved Review Gate examined THIS LANE'S EXACT HEAD.** The successor's
-``review_result`` marker carries the head it reviewed, the shared glance grammar has already
-verified under the Marker Contract v2 correlation that it equals the head its ``review_request``
-pinned, and this route requires that head to literal-equal the head the declaration was recorded at
-— which the live probe in turn requires to be the lane's actual head. A real, governed, approved
-Review Gate therefore covers precisely the repository state this lane holds. That is a
-gate-structured fact read from the successor's own record with the same grammar every other
-consumer uses; deleting the correlation markers does not change it, and no marker this route reads
-can manufacture it.
+What remains, after both refutations, is that **no durable record in this workspace can bind "this
+audit failure" to "that successor's acceptance"**. The binding is a coordinator judgement, and the
+authority for a coordinator judgement — a writer/receipt authority verifiably bound to an actual
+coordinator action — does not exist here and is not this issue's to rule on.
 
-The remaining conjuncts bound what admitting can cost:
+So the binding is not read from a record at all. It is ENUMERATED IN CODE
+(:data:`SANCTIONED_MIGRATIONS`): the exact source issue, audit journal, successor issue, successor
+review journal, lane, generation, head and integration branch of each lane this migration covers.
+A tuple that is not enumerated is refused (:data:`REASON_NOT_A_SANCTIONED_MIGRATION`), whatever
+else its records say. This is the "一回限りの移行" review j#101909 sanctions, and it is chosen for
+one property no journal surface has: **a journal author cannot add an entry.** Extending the route
+to another lane is a reviewed code change that appears in the diff an auditor reads.
+
+Everything below is retained as a CONJUNCT on top of that pin — never a substitute for it. The pin
+says which lane may converge; the conjuncts say the record and the repository still agree at action
+time:
 
 1. **no approval exists anywhere on this issue** — the record carries ZERO review rounds
    (:data:`REASON_REVIEW_ROUND_RECORDED`), so there is no approval to be stale, borrowed or
    misread, and this route can never become a second way past the ordinary fence;
 2. **the lane holds nothing of its own** — the durable record declares zero repository change AND
-   the live lane carries zero commits over the integration branch with a clean worktree. Combined
-   with head coverage this is the whole argument: the state is reviewed, and there is no other
-   state;
+   the live lane carries zero commits over the integration branch with a clean worktree;
 3. **both issues are closed IN THE TRACKER, not merely in their own prose** — a ``close`` gate
    journal says the lane BELIEVES it is closed; the tracker says whether it is (review j#101880
    finding 2). Both current statuses are read fresh at action time;
-4. **the correlation records still have to line up** — the declaration names the audit record and
-   the successor, and the successor's own record names this issue and this audit record back. This
-   is retained as an INTEGRITY check on the pointers, NOT as the authority: it establishes that the
-   terminal is about the records it claims to be about, and it establishes nothing about who wrote
-   them.
+4. **the records still have to line up with the pin** — the declaration and the successor's
+   acknowledgement must name each other and must name what the pin names, and the successor's
+   approved round must still be an approval that examined the pinned head. These are INTEGRITY
+   checks: they establish that nothing drifted since the migration was enumerated, and they
+   establish nothing about who wrote anything.
 
 **And what it deliberately does NOT establish.** It does not establish that the named audit record
 CONCLUDED a failure. That conclusion is prose, and prose is not a governed surface — inventing a
 grammar for it here would be the #14755 review j#99065 defect one level over: a claim whose only
-witness is the record that makes it. Review j#101880 measured the consequence directly (an audit
-note replaced by a plain progress memo still admitted), and the answer is not to parse the prose
-but to stop the admission from depending on it: the ``audit_journal`` field is a POINTER for the
-operator, and after this round it carries no admission weight that head coverage does not already
-carry.
+witness is the record that makes it. Review j#101880 measured the consequence (an audit note
+replaced by a plain progress memo still admitted); the answer is not to parse prose but to stop the
+admission depending on it, and under the pin the ``audit_journal`` field is a POINTER whose identity
+the pin fixes.
 
 Nor does it establish WHO wrote anything. That gap is UNCHANGED and unclosable from a durable
 record; :func:`...hibernate_issuer_policy.resolve_journal_issuer` is a POLICY binding that takes no
 author input and says so. This gate is therefore deliberately NOT registered in
 :mod:`.hibernate_evidence_authority` — registering one needs a ruling that NAMES it, and
 manufacturing an anchor from a record that decided no writer contract is the #14661 j#92715 defect.
-What changed in response to finding 1 is not that the gap closed, but that the admission no longer
-rests on it.
+Two rounds of trying to substitute for that authority with more correlation both failed
+measurement; the pin does not close the gap either, it removes the need to cross it by refusing to
+be general.
 
 Boundary: pure. No IO, no Redmine, no git. The live repository half, the gate folds and the
 successor issue's own facts are necessarily measured by the application layer and arrive here as
@@ -333,6 +340,102 @@ def fold_superseded_audit_failure(
 
 
 # ---------------------------------------------------------------------------
+# The enumerated migration. This is the authority; everything else is a conjunct.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SanctionedMigration:
+    """ONE lane this migration is sanctioned to terminalize, by exact identity.
+
+    Every field is a literal that must match what the durable records and the retire target
+    independently resolve to. Nothing here is read from a journal, and nothing here can be added by
+    writing one: extending this route to another lane is a reviewed code change.
+
+    ``workspace`` is deliberately absent. It is a machine-local segment hash, not a repository fact,
+    and the lane identity is already bound to the retire target's own lifecycle row by
+    :data:`REASON_LANE_MISMATCH` — pinning it here would hard-code one checkout's environment into
+    the package.
+    """
+
+    issue: str
+    audit_journal: str
+    successor_issue: str
+    successor_review_journal: str
+    lane: str
+    lane_generation: int
+    head: str
+    integration_branch: str
+
+
+#: The COMPLETE set of lanes this route may terminalize (Redmine #15166, review j#101909 finding 1).
+#:
+#: One entry, and it is the reproduction: #15164 "既知停止からの通常再開をfresh sessionで検証する",
+#: whose round-1 verdict is the non-gate ``## Independent audit — round 1`` j#101792, superseded by
+#: #15165 "通常再開4 stepを閉集合外操作なしでfresh session再検証する", whose ``## Gate: review``
+#: j#101810 concluded ``approved``.
+#:
+#: **Why an enumeration rather than a rule.** The binding between "this audit failure" and "that
+#: successor's acceptance" is a coordinator judgement, and no durable record in this workspace can
+#: carry it: two rounds of trying (mutual acknowledgement, then head coverage) were each refuted by
+#: measurement, because an unauthenticatable writer can produce both halves and — on a zero-change
+#: lane — every unrelated issue shares the same head. Until a writer/receipt authority bound to an
+#: actual coordinator action is ruled on, the honest form of this route is a list.
+#:
+#: Adding an entry is a deliberate act with a reviewed diff. It is NOT a config surface: the
+#: repo-local config's own contract says it carries "policy intent, not authority" and refuses
+#: authority-shaped keys, so an allowlist of terminals does not belong there either.
+SANCTIONED_MIGRATIONS: Tuple[SanctionedMigration, ...] = (
+    SanctionedMigration(
+        issue="15164",
+        audit_journal="101792",
+        successor_issue="15165",
+        successor_review_journal="101810",
+        lane="issue_15164_fresh_session_resume_verification",
+        lane_generation=1,
+        head="83a65e6dc5e9b6037020cd565e26e4af830d9b2a",
+        integration_branch="main",
+    ),
+)
+
+
+def sanctioned_migration(
+    declaration: "SupersededAuditFailureFacts",
+    *,
+    migrations: "Optional[Sequence[SanctionedMigration]]" = None,
+) -> Optional[SanctionedMigration]:
+    """The enumerated migration this declaration is, or ``None`` (pure).
+
+    Every field is compared as a LITERAL against the declaration's own projected values, so a
+    declaration that drifts in any identity — a different audit journal, a different successor, a
+    different review journal, a re-incarnated lane, a moved head, another integration branch — is
+    simply not this migration and gets no admission from it.
+
+    ``migrations`` defaults to ``None`` and is then resolved from :data:`SANCTIONED_MIGRATIONS` AT
+    CALL TIME rather than being bound as a default argument, so the enumeration a run uses is the
+    module's current one. It is a parameter only so a test can state the enumeration it is
+    specifying against; the application route never passes it, because an authority the caller
+    supplies fences nothing (#14539 j#91797 F2) and the package constant IS the authority.
+    """
+    if not declaration.in_force or declaration.envelope is None:
+        return None
+    envelope = declaration.envelope
+    for pin in (SANCTIONED_MIGRATIONS if migrations is None else migrations) or ():
+        if (
+            pin.issue == declaration.issue
+            and pin.audit_journal == declaration.audit_journal
+            and pin.successor_issue == declaration.successor_issue
+            and pin.successor_review_journal == declaration.successor_review_journal
+            and pin.integration_branch == declaration.integration_branch
+            and pin.lane == envelope.lane
+            and pin.lane_generation == envelope.lane_generation
+            and pin.head.strip().lower() == envelope.head.strip().lower()
+        ):
+            return pin
+    return None
+
+
+# ---------------------------------------------------------------------------
 # The audit record the declaration points at, as the caller measured it.
 # ---------------------------------------------------------------------------
 
@@ -412,6 +515,11 @@ REASON_AUDIT_JOURNAL_NOT_EARLIER = "declared_audit_journal_is_not_older_than_the
 REASON_RECORD_DECLARES_CHANGE = "record_declares_repository_change"
 #: The declaration names ITSELF as its successor. An issue cannot supersede its own failed audit.
 REASON_SUCCESSOR_IS_SELF = "superseded_audit_failure_successor_is_the_same_issue"
+#: THE authority refusal (review j#101909 finding 1). The declaration's identities are not one of
+#: the lanes :data:`SANCTIONED_MIGRATIONS` enumerates, so this route has nothing to say about it —
+#: whatever else its records show. This is what keeps the route a bounded migration rather than a
+#: general no-review terminal, and it is the ONE refusal no durable record can talk its way past.
+REASON_NOT_A_SANCTIONED_MIGRATION = "not_an_enumerated_audit_failure_migration"
 #: The named successor's own record does not acknowledge superseding THIS issue and THIS audit
 #: record.
 REASON_SUCCESSOR_NOT_ACKNOWLEDGED = "successor_does_not_acknowledge_the_audit_supersession"
@@ -447,6 +555,7 @@ SUPERSEDED_AUDIT_FAILURE_REFUSAL_REASONS: frozenset[str] = frozenset(
         REASON_AUDIT_JOURNAL_NOT_EARLIER,
         REASON_RECORD_DECLARES_CHANGE,
         REASON_SUCCESSOR_IS_SELF,
+        REASON_NOT_A_SANCTIONED_MIGRATION,
         REASON_SUCCESSOR_NOT_ACKNOWLEDGED,
         REASON_SUCCESSOR_INCOMPLETE,
         REASON_SUCCESSOR_REVIEW_HEAD_MISMATCH,
@@ -485,6 +594,7 @@ def evaluate_superseded_audit_failure_admissible(
     live_commits_ahead: Optional[int] = None,
     worktree_clean: bool = False,
     callbacks_drained: bool = False,
+    migrations: "Optional[Sequence[SanctionedMigration]]" = None,
 ) -> AdmissionResult:
     """Whether a lane whose failure was recorded WITHOUT a Review Gate may terminally retire (pure).
 
@@ -515,33 +625,40 @@ def evaluate_superseded_audit_failure_admissible(
     7. the SUCCESSOR is a different issue, its own record ACKNOWLEDGES superseding this issue and
        this audit record, and it has itself completed: its newest round is the approval the
        acknowledgement names, and it is durably closed;
-    8. **that approved Review Gate examined THIS LANE'S HEAD** — the head its own
-       ``review_result`` marker carries, which the shared grammar has already correlated against
-       the head its ``review_request`` pinned, literal-equals the head the declaration was recorded
-       at;
-    9. the live repository still agrees, and the measurement is about THIS lane: the probed branch
-       is the lane the declaration names, its head is exactly the head the declaration was recorded
-       against, the worktree is proven CLEAN, and it carries no commit the integration branch lacks.
+    8. **the whole tuple is an ENUMERATED migration** — :data:`SANCTIONED_MIGRATIONS` names this
+       source issue, audit journal, successor issue, successor review journal, lane, generation,
+       head and integration branch. This is the authority; the rest are conjuncts;
+    9. that approved Review Gate examined the pinned head — the head its own ``review_result``
+       marker carries, which the shared grammar has already correlated against the head its
+       ``review_request`` pinned;
+    10. the live repository still agrees, and the measurement is about THIS lane: the probed branch
+        is the lane the declaration names, its head is exactly the head the declaration was
+        recorded against, the worktree is proven CLEAN, and it carries no commit the integration
+        branch lacks.
 
-    **Why (8) is what this route rests on, and (6) + (9) what bound it.** Review j#101880 finding 1
-    refuted the R1 answer: the source declaration and the successor acknowledgement corroborating
-    each other is not independent evidence, because neither can be authenticated and the
-    correlation they assert exists nowhere else — one writer could place both, which is the #14695
-    shape. (8) replaces that with a fact neither marker can manufacture: a real, governed, approved
-    Review Gate on another issue examined the exact commit state this lane holds. (6) and (9) then
-    bound the consequence — the record declares no change and the lane carries zero commits over
-    the integration branch with a clean worktree, so there is no OTHER state to be released, and
-    admitting drains a process without integrating anything or minting any approval. (6) is
-    required beside (9) because a zero ahead-count alone does not mean the lane produced nothing:
-    already-merged work is also zero ahead (#14695's own boundary).
+    **Why (8) and not a rule.** Two rounds tried to derive the binding between this audit failure
+    and that successor's acceptance from records, and each was refuted by measurement: R1's mutual
+    acknowledgement (review j#101880 finding 1 — one unauthenticatable writer can place both
+    halves), then R2's head coverage (review j#101909 finding 1 — on a zero-change lane the lane
+    head IS the integration head, so every unrelated approved issue on that base shares it, and a
+    successor review about entirely different work still admitted). The binding is a coordinator
+    judgement and this workspace has no authority that can carry one. So it is enumerated instead,
+    where a journal author cannot reach it.
+
+    (6) and (9) and (10) still bound the consequence: the record declares no change, the reviewed
+    head is the lane head, and the lane carries zero commits over the integration branch with a
+    clean worktree — so admitting drains a process without integrating anything or minting any
+    approval. (6) is required beside (10) because a zero ahead-count alone does not mean the lane
+    produced nothing: already-merged work is also zero ahead (#14695's own boundary).
 
     **What this never does.** It never reads the audit record as an approval — it requires that
-    record to not be a gate at all, and after this round the audit pointer carries no admission
-    weight. It never asserts that THIS issue passed a review: (8) is a statement about which commit
-    state was examined, not about which issue's acceptance was met, and this lane is admitted on the
-    terminal plus zero-change, never on a verdict transferred from the successor. It never widens
-    the ordinary review-generation fence, the #14539 exemption, the #14695 waiver or the #14755
-    terminal: those are independent routes to the same boolean and none of them can weaken another.
+    record to not be a gate at all. It never asserts that THIS issue passed a review: (9) is a
+    statement about which commit state was examined, not about whose acceptance was met, and the
+    admission comes from the enumerated migration plus zero-change, never from a verdict
+    transferred off the successor. It never widens the ordinary review-generation fence, the #14539
+    exemption, the #14695 waiver or the #14755 terminal: those are independent routes to the same
+    boolean and none of them can weaken another. And it never generalizes: a lane the package does
+    not enumerate is refused here exactly as it was before this route existed.
 
     Every refusal is a typed :data:`SUPERSEDED_AUDIT_FAILURE_REFUSAL_REASONS` token. There is no
     input that turns an unreadable, foreign, stale, re-opened, change-bearing or unintegrated
@@ -642,6 +759,15 @@ def evaluate_superseded_audit_failure_admissible(
 
     if declaration.successor_issue == issue:
         return AdmissionResult(False, REASON_SUCCESSOR_IS_SELF)
+
+    # THE authority (review j#101909 finding 1). Asked here, after the conjuncts that diagnose a
+    # malformed or drifted record on their own terms, and before every conjunct that could
+    # otherwise be read as substituting for it. A tuple this package does not enumerate gets no
+    # admission from this route, whatever its records say — that is what makes the route a bounded
+    # migration rather than a general no-review terminal, and it is the refusal an unauthenticatable
+    # writer cannot talk past: adding an entry is a reviewed code change, not a journal.
+    if sanctioned_migration(declaration, migrations=migrations) is None:
+        return AdmissionResult(False, REASON_NOT_A_SANCTIONED_MIGRATION)
 
     # The successor's own acknowledgement — the half the source issue cannot write for itself
     # without also writing into the successor's record. Every identity must line up in both
@@ -822,6 +948,7 @@ __all__ = (
     "REASON_INVALID",
     "REASON_ISSUE_MISMATCH",
     "REASON_LANE_MISMATCH",
+    "REASON_NOT_A_SANCTIONED_MIGRATION",
     "REASON_NOT_RECORDED",
     "REASON_RECORD_DECLARES_CHANGE",
     "REASON_REVIEW_ROUND_RECORDED",
@@ -841,10 +968,13 @@ __all__ = (
     "SUPERSEDED_AUDIT_FAILURE_GATE",
     "SUPERSEDED_AUDIT_FAILURE_REFUSAL_REASONS",
     "SUPERSEDED_AUDIT_FAILURE_STATES",
+    "SANCTIONED_MIGRATIONS",
     "SUPERSEDED_AUDIT_FAILURE_VERSION",
+    "SanctionedMigration",
     "SupersededAuditFailureFacts",
     "TrackerIssueStatus",
     "evaluate_superseded_audit_failure_admissible",
+    "sanctioned_migration",
     "fold_audit_supersession_acknowledgement",
     "fold_superseded_audit_failure",
     "render_audit_supersession_acknowledgement_marker",

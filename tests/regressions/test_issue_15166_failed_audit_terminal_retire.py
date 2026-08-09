@@ -85,6 +85,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
     RedmineJournalEntry,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain import (  # noqa: E501
+    superseded_audit_failure_terminal as terminal_module,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.superseded_audit_failure_terminal import (  # noqa: E501
     ACK_ACKNOWLEDGED,
     ACK_INVALID,
@@ -100,6 +103,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REASON_INVALID,
     REASON_ISSUE_MISMATCH,
     REASON_LANE_MISMATCH,
+    REASON_NOT_A_SANCTIONED_MIGRATION,
     REASON_NOT_RECORDED,
     REASON_RECORD_DECLARES_CHANGE,
     REASON_REVIEW_ROUND_RECORDED,
@@ -113,12 +117,14 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SUCCESSOR_ACK_GATE,
     SUPERSEDED_AUDIT_FAILURE_FIELD_ORDER,
     SUPERSEDED_AUDIT_FAILURE_GATE,
+    SANCTIONED_MIGRATIONS,
     SUPERSEDED_AUDIT_FAILURE_REFUSAL_REASONS,
     TrackerIssueStatus,
     evaluate_superseded_audit_failure_admissible,
     fold_audit_supersession_acknowledgement,
     fold_superseded_audit_failure,
     render_audit_supersession_acknowledgement_marker,
+    sanctioned_migration,
     render_superseded_audit_failure_marker,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.retire_superseded_audit_failure import (  # noqa: E501
@@ -309,6 +315,7 @@ def admit(
     callbacks_drained: bool = True,
     source_closed_in_tracker: "bool | None" = True,
     successor_closed_in_tracker: "bool | None" = True,
+    migrations=None,
 ):
     """Fold both records with the SHARED grammar and evaluate — the whole route, minus IO.
 
@@ -362,6 +369,7 @@ def admit(
         live_commits_ahead=commits_ahead,
         worktree_clean=worktree_clean,
         callbacks_drained=callbacks_drained,
+        migrations=migrations,
     )
 
 
@@ -727,6 +735,100 @@ class TheSuccessorMustAcknowledgeAndHaveSucceeded(unittest.TestCase):
             with self.subTest(**kwargs):
                 with self.assertRaises(ValueError):
                     acknowledgement_marker(**kwargs)
+
+
+class OnlyAnEnumeratedMigrationConverges(unittest.TestCase):
+    """Review j#101909 finding 1: the binding is enumerated in code, not derived from records."""
+
+    def test_the_enumeration_names_exactly_the_reproduction(self):
+        # One entry, and it is #15164 -> #15165. If this ever grows, the diff is where an auditor
+        # sees it — which is the whole reason the authority lives here rather than in a record.
+        self.assertEqual(len(SANCTIONED_MIGRATIONS), 1)
+        pin = SANCTIONED_MIGRATIONS[0]
+        self.assertEqual(
+            (
+                pin.issue,
+                pin.audit_journal,
+                pin.successor_issue,
+                pin.successor_review_journal,
+                pin.lane,
+                pin.lane_generation,
+                pin.head,
+                pin.integration_branch,
+            ),
+            (
+                ISSUE,
+                AUDIT_JOURNAL,
+                SUCCESSOR,
+                SUCCESSOR_REVIEW_JOURNAL,
+                LANE,
+                GENERATION,
+                HEAD,
+                INTEGRATION_BRANCH,
+            ),
+        )
+
+    def test_an_unrelated_approved_and_closed_successor_on_the_same_head_is_refused(self):
+        # THE regression review j#101909 requires. On a zero-change lane the lane head IS the
+        # integration head, so every unrelated approved issue based on it shares that head — head
+        # coverage alone is nearly free. Here #14999 is a genuinely complete successor: an approved
+        # `## Gate: review` with canonical markers on the SAME head, a Close, and an
+        # acknowledgement naming this issue and this audit journal back. Every R1 and R2 conjunct
+        # is satisfied. It is refused because it is not the enumerated pairing.
+        outcome = admit(
+            source=source_journals(marker=declaration_marker(successor_issue="14999")),
+            successor=successor_journals(
+                ack=acknowledgement_marker(issue="14999"), reviewed_head=HEAD
+            ),
+        )
+        self.assertFalse(outcome.admissible)
+        self.assertEqual(outcome.reason, REASON_NOT_A_SANCTIONED_MIGRATION)
+
+    def test_every_pinned_identity_must_match(self):
+        # A DERIVED oracle over the pin's own fields: drift in ANY identity leaves the enumeration.
+        for field, marker_override in (
+            ("successor_issue", {"successor_issue": "14999"}),
+            ("successor_review_journal", {"successor_review_journal": "999998"}),
+            ("head", {"head": "1" * 40}),
+        ):
+            with self.subTest(field=field):
+                outcome = admit(
+                    source=source_journals(marker=declaration_marker(**marker_override))
+                )
+                self.assertFalse(outcome.admissible)
+                self.assertEqual(outcome.reason, REASON_NOT_A_SANCTIONED_MIGRATION)
+
+    def test_an_empty_enumeration_admits_nothing(self):
+        # The negative control for the authority itself: with nothing enumerated, the otherwise
+        # perfect reproduction does not converge. Nothing else in the record can substitute.
+        self.assertEqual(admit(migrations=()).reason, REASON_NOT_A_SANCTIONED_MIGRATION)
+
+    def test_the_pin_predicate_refuses_a_declaration_that_is_not_in_force(self):
+        invalid = fold_superseded_audit_failure(
+            [(DECLARATION_JOURNAL, "## Gate: superseded_audit_failure\n- 記録漏れ\n")]
+        )
+        self.assertIsNone(sanctioned_migration(invalid))
+        self.assertIsNone(sanctioned_migration(fold_superseded_audit_failure([])))
+
+    def test_the_pin_predicate_resolves_the_enumeration_at_call_time(self):
+        # Bound as a default argument it would freeze at import and a test could not specify
+        # against a different enumeration; read at call time it is the module's current one.
+        declaration = fold_superseded_audit_failure(
+            [(DECLARATION_JOURNAL, declaration_marker())]
+        )
+        self.assertIsNotNone(sanctioned_migration(declaration))
+        self.assertIsNone(sanctioned_migration(declaration, migrations=()))
+
+    def test_the_route_does_not_hand_the_enumeration_to_the_fence(self):
+        # The application resolver must never pass ``migrations``: an authority the caller supplies
+        # fences nothing. Read from the real source so a future edit that threads a flag in fails.
+        import inspect
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            retire_superseded_audit_failure as route,
+        )
+
+        self.assertNotIn("migrations", inspect.getsource(route))
 
 
 class TheApprovalMustHaveExaminedThisLaneHead(unittest.TestCase):
@@ -1126,6 +1228,7 @@ def _EVERY_REFUSAL_FIXTURE():
         ),
         admit(source=source_journals(marker=declaration_marker(), implementation_commit="a" * 40)),
         admit(source=source_journals(marker=self_successor)),
+        admit(migrations=()),
         admit(successor=successor_journals(ack=None)),
         admit(successor=successor_journals(ack=acknowledgement_marker(), close=False)),
         admit(
@@ -1308,7 +1411,7 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
                 ISSUE: source_journals(marker=declaration_marker(head=head)),
                 SUCCESSOR: successor_journals(ack=acknowledgement_marker(), reviewed_head=head),
             }
-            outcome = self._resolve_with(records, worktree=tmp)
+            outcome = self._resolve_with(records, worktree=tmp, pin_head=head)
             self.assertTrue(outcome.admissible, outcome.reason)
             self.assertEqual(outcome.reason, REASON_OK)
 
@@ -1320,7 +1423,7 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
                 ISSUE: source_journals(marker=declaration_marker(head=head)),
                 SUCCESSOR: successor_journals(ack=acknowledgement_marker(), reviewed_head=head),
             }
-            outcome = self._resolve_with(records, worktree=tmp)
+            outcome = self._resolve_with(records, worktree=tmp, pin_head=head)
             self.assertFalse(outcome.admissible)
             self.assertEqual(outcome.reason, REASON_WORKTREE_NOT_CLEAN)
 
@@ -1334,7 +1437,7 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
                     ack=acknowledgement_marker(), reviewed_head=head
                 ),
             }
-            outcome = self._resolve_with(records, worktree=tmp)
+            outcome = self._resolve_with(records, worktree=tmp, pin_head=head)
             self.assertFalse(outcome.admissible)
             self.assertEqual(outcome.reason, REASON_LANE_NOT_INTEGRATED)
 
@@ -1346,7 +1449,7 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
                 ISSUE: source_journals(marker=declaration_marker(head=head)),
                 SUCCESSOR: successor_journals(ack=acknowledgement_marker(), reviewed_head=head),
             }
-            outcome = self._resolve_with(records, worktree=tmp)
+            outcome = self._resolve_with(records, worktree=tmp, pin_head=head)
             self.assertFalse(outcome.admissible)
             self.assertEqual(outcome.reason, REASON_LANE_HEAD_UNMEASURED)
 
@@ -1368,7 +1471,7 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
                 ISSUE: source_journals(marker=declaration_marker(head=head)),
                 SUCCESSOR: successor_journals(ack=acknowledgement_marker(), reviewed_head=head),
             }
-            outcome = self._resolve_with(records, worktree=tmp)
+            outcome = self._resolve_with(records, worktree=tmp, pin_head=head)
             self.assertFalse(outcome.admissible)
             self.assertEqual(outcome.reason, REASON_LANE_NOT_INTEGRATED)
 
@@ -1389,7 +1492,7 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
                     ),
                 }
                 outcome = self._resolve_with(
-                    records, worktree=tmp, closed={issue: False}
+                    records, worktree=tmp, closed={issue: False}, pin_head=head
                 )
                 self.assertFalse(outcome.admissible)
                 self.assertEqual(outcome.reason, reason)
@@ -1403,7 +1506,7 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
                     ack=acknowledgement_marker(), reviewed_head=head
                 ),
             }
-            outcome = self._resolve_with(records, worktree=tmp, closed={ISSUE: None})
+            outcome = self._resolve_with(records, worktree=tmp, closed={ISSUE: None}, pin_head=head)
             self.assertFalse(outcome.admissible)
             self.assertEqual(outcome.reason, REASON_TRACKER_STATUS_UNREADABLE)
 
@@ -1446,7 +1549,7 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
                 SUCCESSOR: successor_journals(ack=acknowledgement_marker(), reviewed_head=head),
             }
             outcome = self._resolve_with(
-                records, worktree=tmp, superseded_audit_failure_terminal=False
+                records, worktree=tmp, pin_head=head, superseded_audit_failure_terminal=False
             )
             self.assertFalse(outcome.admissible)
             self.assertEqual(outcome.reason, "")
@@ -1458,7 +1561,7 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
                 ISSUE: source_journals(marker=declaration_marker(head=head)),
                 SUCCESSOR: successor_journals(ack=acknowledgement_marker(), reviewed_head=head),
             }
-            with _stub_live(records):
+            with _stub_live(records, pin_head=head):
                 outcome = _resolve_latest_generation_admissible(
                     self._args(worktree=tmp),
                     target=RetireEvidenceTarget(WORKSPACE, LANE, GENERATION, "pointer", 1),
@@ -1509,8 +1612,8 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
         )
         self.assertTrue(decision.may_retire)
 
-    def _resolve_with(self, records, *, worktree: str, closed=None, **overrides):
-        with _stub_live(records, closed=closed):
+    def _resolve_with(self, records, *, worktree: str, closed=None, pin_head=None, **overrides):
+        with _stub_live(records, closed=closed, pin_head=pin_head):
             return _resolve_superseded_audit_failure_admissible(
                 self._args(worktree=worktree, **overrides),
                 target=RetireEvidenceTarget(WORKSPACE, LANE, GENERATION, "pointer", 1),
@@ -1529,15 +1632,28 @@ class _stub_live:
     end-to-end assertion would degrade into "the tracker was unreadable".
     """
 
-    def __init__(self, records, closed=None):
+    def __init__(self, records, closed=None, pin_head=None):
         self._records = records
         self._closed = closed or {}
+        self._pin_head = pin_head
         self._original_journals = None
         self._original_closed = None
+        self._original_pins = None
 
     def __enter__(self):
         self._original_journals = retire_superseded_audit_failure._read_live_issue_journals
         self._original_closed = retire_superseded_audit_failure._read_live_issue_closed
+        if self._pin_head is not None:
+            # An end-to-end fixture builds a REAL repository, so its head is whatever git made.
+            # The enumeration is specified against that head — the route resolves
+            # ``SANCTIONED_MIGRATIONS`` from the module at call time precisely so a test can state
+            # the enumeration it is specifying against, and never passes ``migrations`` itself.
+            import dataclasses
+
+            self._original_pins = terminal_module.SANCTIONED_MIGRATIONS
+            terminal_module.SANCTIONED_MIGRATIONS = (
+                dataclasses.replace(SANCTIONED_MIGRATIONS[0], head=self._pin_head),
+            )
         retire_superseded_audit_failure._read_live_issue_journals = (
             lambda issue: [
                 (str(jid), notes) for jid, notes in self._records.get(str(issue), [])
@@ -1551,6 +1667,8 @@ class _stub_live:
     def __exit__(self, *exc):
         retire_superseded_audit_failure._read_live_issue_journals = self._original_journals
         retire_superseded_audit_failure._read_live_issue_closed = self._original_closed
+        if self._original_pins is not None:
+            terminal_module.SANCTIONED_MIGRATIONS = self._original_pins
         return False
 
 
