@@ -636,11 +636,11 @@ def evaluate_superseded_audit_failure_admissible(
     **What this never does.** It never reads the audit record as an approval — it requires that
     record to not be a gate at all. It never asserts that THIS issue passed a review: (9) is a
     statement about which commit state was examined, not about whose acceptance was met, and the
-    admission comes from the enumerated migration plus zero-change, never from a verdict
+    admission comes from the coordinator's decision plus zero-change, never from a verdict
     transferred off the successor. It never widens the ordinary review-generation fence, the #14539
     exemption, the #14695 waiver or the #14755 terminal: those are independent routes to the same
-    boolean and none of them can weaken another. And it never generalizes: a lane the package does
-    not enumerate is refused here exactly as it was before this route existed.
+    boolean and none of them can weaken another. And it never admits a lane nobody decided about:
+    with no recorded decision this route refuses exactly as the retire did before it existed.
 
     Every refusal is a typed :data:`SUPERSEDED_AUDIT_FAILURE_REFUSAL_REASONS` token. There is no
     input that turns an unreadable, foreign, stale, re-opened, change-bearing or unintegrated

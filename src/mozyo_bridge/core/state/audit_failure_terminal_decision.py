@@ -28,11 +28,23 @@ this module's existence:
   preflight を照合した結果". That conjunction is exactly the retire's fence: this record supplies
   the first term, the Redmine journals the second, and the live probes the third.
 
+**The writer boundary is INSIDE the writer** (review j#102074 finding 1, then j#102147 finding 1).
+R4 put the decision in this store and argued that being mozyo-owned made it a coordinator decision.
+The reviewer reproduced a write from an ``argparse.Namespace`` carrying no actor identity at all:
+where a record is STORED classifies the record, it does not identify who wrote it. So
+:meth:`record` now runs the same action-time sender attestation #13613 already requires before a
+lane mutation — :func:`...sublane_actuator_herdr_preflight.evaluate_dispatch_sender`, which resolves
+the sender identity from the process environment and cross-checks it against the repository's
+WORKSPACE ANCHOR, the committed coordinator provider binding, and the coordinator default lane. A
+non-coordinator caller is refused zero-write, and because the check lives here rather than in the
+command, calling the store directly does not get past it.
+
 **What a record here does and does not establish, stated rather than implied.** It does NOT
 authenticate a human, and nothing in this workspace can — that gap is unchanged. What it
-establishes is that the decision was taken through the governed command boundary and written to a
-surface a Redmine journal author cannot reach: no sequence of journal writes produces a row here.
-That is the difference from all three refuted attempts, and it is the whole of the claim.
+establishes is (a) that the writer resolved to the configured coordinator provider on the
+coordinator default lane of THIS repository's anchored workspace, under the same gate that already
+fences destructive lane mutation, and (b) that the record lives on a surface a Redmine journal
+author cannot reach: no sequence of journal writes produces a row here.
 
 **Single use is not a state machine here; it is the lifecycle revision.** A decision is bound to
 the lane's exact ``lane_generation`` AND ``revision`` at decision time, and every retire that
@@ -90,7 +102,41 @@ CREATE TABLE IF NOT EXISTS store_meta (
 
 
 class AuditFailureTerminalDecisionError(RuntimeError):
-    """The decision store is absent, replaced, or unreadable; callers must fail closed."""
+    """The decision store is absent, replaced, unreachable, or the writer is not attested."""
+
+
+def _reject_unsafe_path(path: Path, *, label: str) -> None:
+    """Refuse a store artifact that is a symlink or a non-regular file (review j#102147 finding 2).
+
+    An authority-bearing store must write inside the home it declares. R4 opened the DB with
+    ``sqlite3.connect`` and the sidecar with ``write_text`` and checked neither, so a symlink at
+    either path wrote outside the home entirely (reproduced: ``db_written_outside_home=True`` /
+    ``nonce_written_outside_home=True``) — which also defeats the nonce's own purpose, since the
+    identity pair can then be redirected independently of the store it is supposed to identify.
+
+    Checked with ``lstat`` so the LINK is examined rather than its target, and applied to both
+    artifacts before every open and every write. A dangling symlink is refused for the same reason
+    a live one is: what matters is that the path is not the regular file this store owns.
+    """
+    try:
+        stat = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise AuditFailureTerminalDecisionError(
+            f"decision store {label} {path} is unreadable ({type(exc).__name__}); fail closed"
+        ) from exc
+    import stat as stat_module
+
+    if stat_module.S_ISLNK(stat.st_mode):
+        raise AuditFailureTerminalDecisionError(
+            f"decision store {label} {path} is a symlink; refusing to write an authority record "
+            "through a link that can point outside the mozyo-bridge home"
+        )
+    if not stat_module.S_ISREG(stat.st_mode):
+        raise AuditFailureTerminalDecisionError(
+            f"decision store {label} {path} is not a regular file; fail closed"
+        )
 
 
 def audit_failure_terminal_decision_path(home: Optional[Path] = None) -> Path:
@@ -222,6 +268,7 @@ class AuditFailureTerminalDecisionStore:
     # -- store identity (DB-external sidecar) ------------------------------
 
     def _read_sidecar_nonce(self) -> Optional[str]:
+        _reject_unsafe_path(self.sidecar_path, label="sidecar")
         try:
             value = self.sidecar_path.read_text(encoding="utf-8").strip()
         except (OSError, ValueError):
@@ -240,6 +287,8 @@ class AuditFailureTerminalDecisionStore:
 
     def _create_fresh(self, nonce: str) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        _reject_unsafe_path(self.path, label="DB")
+        _reject_unsafe_path(self.sidecar_path, label="sidecar")
         conn = sqlite3.connect(self.path, isolation_level=None)
         try:
             conn.execute("PRAGMA busy_timeout = 2000")
@@ -293,6 +342,10 @@ class AuditFailureTerminalDecisionStore:
                 f"decision store {self.path} DB is missing while its sidecar remains (store loss); "
                 "fail closed rather than auto-create"
             )
+        # Before the open, and on the LINK rather than its target: an authority record must not be
+        # read or written through a path that can point outside the home (review j#102147 f2).
+        _reject_unsafe_path(self.path, label="DB")
+        _reject_unsafe_path(self.sidecar_path, label="sidecar")
         conn = sqlite3.connect(self.path, isolation_level=None)
         try:
             conn.execute("PRAGMA busy_timeout = 2000")
@@ -320,8 +373,49 @@ class AuditFailureTerminalDecisionStore:
 
     # -- the coordinator's action -----------------------------------------
 
-    def record(self, decision: TerminalDecision, *, now: Optional[str] = None) -> TerminalDecision:
+    def _require_attested_coordinator(self, repo_root: Path) -> str:
+        """Verify the WRITER is the attested coordinator, or refuse (review j#102147 finding 1).
+
+        The same action-time gate #13613 already requires before a lane mutation
+        (:func:`...sublane_actuator_herdr_preflight.evaluate_dispatch_sender`): the sender identity
+        is resolved from THIS PROCESS's environment and cross-checked against the repository's
+        workspace anchor, the committed coordinator provider binding, and the coordinator default
+        lane. Env presence alone is not attestation — a wrong-but-nonempty identity fails.
+
+        It lives here, not in the command, because the reviewer's requirement is a writer boundary
+        that a direct store call cannot bypass; a check in the CLI only describes one caller. The
+        import is lazy so this low-level module never pulls the application layer at import time —
+        the same shape ``evaluate_dispatch_sender`` itself uses for its provider-binding read.
+
+        Returns the resolved detail for the caller to surface; raises on any refusal.
+        """
+        import os
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_preflight import (  # noqa: E501
+            evaluate_dispatch_sender,
+        )
+
+        ok, detail = evaluate_dispatch_sender(os.environ, Path(repo_root))
+        if not ok:
+            raise AuditFailureTerminalDecisionError(
+                "refusing to record an audit-failure terminal decision: the writer is not the "
+                f"attested coordinator for this repository ({detail}). A decision is a coordinator "
+                "judgement, so an unattested, foreign-workspace or non-coordinator caller records "
+                "nothing"
+            )
+        return detail
+
+    def record(
+        self,
+        decision: TerminalDecision,
+        *,
+        repo_root: Path,
+        now: Optional[str] = None,
+    ) -> TerminalDecision:
         """Record ONE coordinator decision for a route, minting its id (the writer path).
+
+        ``repo_root`` is the repository whose ANCHOR the writer is attested against — not a claim
+        about who the writer is, but the independent side of that comparison.
 
         Latest-wins per route, deliberately: a lane whose head or generation moved after a decision
         needs the coordinator to decide again about the world that now exists, and the natural way
@@ -333,6 +427,9 @@ class AuditFailureTerminalDecisionStore:
         (empty identity, non-positive generation / revision, self-successor, malformed head), so an
         unusable record is never stored.
         """
+        # The writer boundary first: an unattested caller must not even be told whether its
+        # decision would have validated.
+        self._require_attested_coordinator(repo_root)
         problems = _validation_errors(decision)
         if problems:
             raise AuditFailureTerminalDecisionError(

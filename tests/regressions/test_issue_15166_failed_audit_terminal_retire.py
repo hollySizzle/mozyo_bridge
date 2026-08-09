@@ -38,11 +38,15 @@ identical observation is idempotent.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
@@ -84,6 +88,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
     RedmineJournalEntry,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+    DEFAULT_LANE,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.main_lane_guard_gate import (  # noqa: E501
+    resolve_coordinator_provider,
 )
 from mozyo_bridge.core.state.audit_failure_terminal_decision import (  # noqa: E501
     AuditFailureTerminalDecisionError,
@@ -172,6 +182,10 @@ WORKSPACE = "mozyo_bridge"
 LANE = "issue_15164_fresh_session_resume_verification"
 GENERATION = 1
 INTEGRATION_BRANCH = "main"
+#: The provider the committed config binds to the coordinator role, and the lane it sits on. The
+#: writer attestation compares the process identity against BOTH, so a test that only sets env
+#: presence is refused exactly as a non-coordinator caller is.
+COORDINATOR_PROVIDER = resolve_coordinator_provider(str(ROOT))
 
 
 def declaration_marker(**overrides) -> str:
@@ -862,9 +876,14 @@ class TheDecisionStoreIsTheWriterHalf(unittest.TestCase):
     """The surface no journal write can reach, and its fail-closed edges."""
 
     def _home(self) -> Path:
+        # A home NESTED inside the temp dir, so ``home.parent`` — the repository these tests attest
+        # against — is that temp dir and not the shared system temp root. Writing the anchor into a
+        # shared root would mark it as a workspace for every other suite that walks up from cwd.
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        return Path(tmp.name)
+        home = Path(tmp.name) / "home"
+        home.mkdir(parents=True, exist_ok=True)
+        return home
 
     def test_a_recorded_decision_reads_back_with_a_store_minted_id(self):
         home = self._home()
@@ -946,14 +965,107 @@ class TheDecisionStoreIsTheWriterHalf(unittest.TestCase):
         read = AuditFailureTerminalDecisionStore(home=home).read(DecisionRoute(WORKSPACE, LANE))
         self.assertEqual(read.head, "b" * 40)
 
+    def test_a_caller_with_no_actor_identity_records_nothing(self):
+        # Review j#102147 finding 1, as the reviewer reproduced it: a caller carrying no actor
+        # identity at all. R4 recorded successfully; the writer boundary now refuses zero-write.
+        home = self._home()
+        with mock.patch.dict(
+            os.environ,
+            {"MOZYO_WORKSPACE_ID": "", "MOZYO_AGENT_ROLE": "", "MOZYO_LANE_ID": ""},
+            clear=False,
+        ):
+            with self.assertRaises(AuditFailureTerminalDecisionError):
+                AuditFailureTerminalDecisionStore(home=home).record(
+                    TerminalDecision(**_decision_fields(head=HEAD)),
+                    repo_root=_attested_repo(home.parent),
+                )
+        self.assertFalse(AuditFailureTerminalDecisionStore(home=home).path.exists())
+
+    def test_a_non_coordinator_actor_records_nothing(self):
+        # Env PRESENCE is not attestation. The implementer provider, a foreign workspace, and a
+        # non-default lane each resolve to a real identity that is not the coordinator's.
+        home = self._home()
+        repo_root = _attested_repo(home.parent)
+        for env in (
+            {"MOZYO_AGENT_ROLE": "claude"},
+            {"MOZYO_WORKSPACE_ID": "some_other_workspace"},
+            {"MOZYO_LANE_ID": "issue_15164_fresh_session_resume_verification"},
+        ):
+            with self.subTest(**env):
+                with _attested_coordinator_env(), mock.patch.dict(
+                    os.environ, env, clear=False
+                ):
+                    with self.assertRaises(AuditFailureTerminalDecisionError):
+                        AuditFailureTerminalDecisionStore(home=home).record(
+                            TerminalDecision(**_decision_fields(head=HEAD)),
+                            repo_root=repo_root,
+                        )
+        self.assertFalse(AuditFailureTerminalDecisionStore(home=home).path.exists())
+
+    def test_an_unanchored_repository_records_nothing(self):
+        # The independent side of the comparison. Without the repo's workspace anchor the sender
+        # identity cannot be cross-checked, so the coordinator env alone establishes nothing.
+        home = self._home()
+        with _attested_coordinator_env():
+            with self.assertRaises(AuditFailureTerminalDecisionError):
+                AuditFailureTerminalDecisionStore(home=home).record(
+                    TerminalDecision(**_decision_fields(head=HEAD)),
+                    repo_root=home.parent / "unanchored",
+                )
+
+    def test_the_attested_coordinator_route_records(self):
+        # The positive control for the same gate: the identity the launcher injects, cross-checked
+        # against this repository's anchor and its committed coordinator provider.
+        home = self._home()
+        _record_decision(home, head=HEAD)
+        self.assertIsNotNone(
+            AuditFailureTerminalDecisionStore(home=home).read(DecisionRoute(WORKSPACE, LANE))
+        )
+
+    def test_a_symlinked_db_or_sidecar_writes_nothing_outside_the_home(self):
+        # Review j#102147 finding 2, as reproduced: a symlink at either artifact wrote outside the
+        # home entirely. Both are checked on the LINK, before every open and every write.
+        for artifact in ("db", "sidecar"):
+            with self.subTest(artifact=artifact):
+                home = self._home()
+                outside = home.parent / f"outside-{artifact}"
+                store = AuditFailureTerminalDecisionStore(home=home)
+                target = store.path if artifact == "db" else store.sidecar_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.symlink_to(outside)
+                with _attested_coordinator_env():
+                    with self.assertRaises(AuditFailureTerminalDecisionError):
+                        AuditFailureTerminalDecisionStore(home=home).record(
+                            TerminalDecision(**_decision_fields(head=HEAD)),
+                            repo_root=_attested_repo(home.parent),
+                        )
+                # The dangling symlink is refused too — nothing was created through it.
+                self.assertFalse(outside.exists())
+
+    def test_a_symlinked_store_is_not_read_either(self):
+        home = self._home()
+        _record_decision(home, head=HEAD)
+        store = AuditFailureTerminalDecisionStore(home=home)
+        real = store.path.read_bytes()
+        moved = home / "moved.sqlite"
+        moved.write_bytes(real)
+        store.path.unlink()
+        store.path.symlink_to(moved)
+        with self.assertRaises(AuditFailureTerminalDecisionError):
+            AuditFailureTerminalDecisionStore(home=home).read(DecisionRoute(WORKSPACE, LANE))
+
     def test_no_journal_shaped_input_reaches_the_store(self):
         # The property the three refuted attempts lacked, stated as a test over the writer's own
         # signature: the store's only writer takes a typed decision, never a note or a marker.
         import inspect
 
         parameters = inspect.signature(AuditFailureTerminalDecisionStore.record).parameters
+        # ``repo_root`` is not an authority the caller supplies: it names the repository whose
+        # ANCHOR the writer attestation cross-checks the process identity against — the independent
+        # side of that comparison, and the same input #13613's lane-mutation gate takes.
         self.assertEqual(
-            [name for name in parameters if name not in ("self", "now")], ["decision"]
+            [name for name in parameters if name not in ("self", "now")],
+            ["decision", "repo_root"],
         )
 
 
@@ -1821,16 +1933,55 @@ def _home(tmp: str, head: str, **overrides) -> Path:
     """A temp mozyo home carrying a real recorded decision for the fixture repository's head."""
     home = Path(tmp) / "_home"
     home.mkdir(parents=True, exist_ok=True)
-    _record_decision(home, head=head, **overrides)
+    _record_decision(home, head=head, repo_root=Path(tmp), **overrides)
     return home
 
 
-def _record_decision(home: Path, *, head: str, **overrides) -> None:
-    """Record a REAL coordinator decision into a temp-home store (the writer path).
+def _attested_repo(root: Path) -> Path:
+    """A repository whose ANCHOR and coordinator binding make the writer attestation resolvable.
 
-    Not a stub: the end-to-end tests go through :class:`AuditFailureTerminalDecisionStore` itself,
-    so the authority the route consults is one the shipped store actually produced.
+    The decision store attests its writer through the same #13613 gate a lane mutation uses: the
+    process env is cross-checked against this repo's workspace anchor and the committed coordinator
+    provider. A test therefore has to stand up the real identity surface — env presence alone is
+    exactly what that gate refuses.
     """
+    anchor_dir = root / ".mozyo-bridge"
+    anchor_dir.mkdir(parents=True, exist_ok=True)
+    (anchor_dir / "workspace-anchor.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "workspace_id": WORKSPACE,
+                "canonical_session": "mzb1",
+            }
+        ),
+        encoding="utf-8",
+    )
+    if not (anchor_dir / "config.yaml").exists():
+        (anchor_dir / "config.yaml").write_text(
+            f"version: 2\nsublane_integration:\n  integration_branch: {INTEGRATION_BRANCH}\n",
+            encoding="utf-8",
+        )
+    return root
+
+
+@contextlib.contextmanager
+def _attested_coordinator_env():
+    """Run the block with this process presenting the coordinator's launch identity."""
+    with mock.patch.dict(
+        os.environ,
+        {
+            "MOZYO_WORKSPACE_ID": WORKSPACE,
+            "MOZYO_AGENT_ROLE": COORDINATOR_PROVIDER,
+            "MOZYO_LANE_ID": DEFAULT_LANE,
+        },
+        clear=False,
+    ):
+        yield
+
+
+def _decision_fields(*, head: str, **overrides) -> dict:
+    """The decision the reproduction's coordinator would record, with named field overrides."""
     fields = dict(
         workspace_id=WORKSPACE,
         lane_id=LANE,
@@ -1845,7 +1996,22 @@ def _record_decision(home: Path, *, head: str, **overrides) -> None:
         integration_branch=INTEGRATION_BRANCH,
     )
     fields.update(overrides)
-    AuditFailureTerminalDecisionStore(home=home).record(TerminalDecision(**fields))
+    return fields
+
+
+def _record_decision(home: Path, *, head: str, repo_root: Path = None, **overrides) -> None:
+    """Record a REAL coordinator decision into a temp-home store (the writer path).
+
+    Not a stub: the end-to-end tests go through :class:`AuditFailureTerminalDecisionStore` itself —
+    including its writer attestation — so the authority the route consults is one the shipped store
+    actually produced under the real gate.
+    """
+    fields = _decision_fields(head=head, **overrides)
+    repo_root = Path(repo_root) if repo_root is not None else Path(home).parent
+    with _attested_coordinator_env():
+        AuditFailureTerminalDecisionStore(home=home).record(
+            TerminalDecision(**fields), repo_root=_attested_repo(repo_root)
+        )
 
 
 def _git(path: Path, *argv: str) -> str:
@@ -1883,7 +2049,11 @@ def _make_lane_checkout(path: Path) -> str:
     )
     # The decision store lives in a temp mozyo home beside the checkout; it is not repository
     # content, so it must not make the lane's worktree dirty (which is a conjunct under test).
-    (path / ".gitignore").write_text("_home/\n", encoding="utf-8")
+    # Neither the temp mozyo home nor the test's workspace anchor is repository content, and the
+    # lane worktree being clean is itself a conjunct under test.
+    (path / ".gitignore").write_text(
+        "_home/\n.mozyo-bridge/workspace-anchor.json\n", encoding="utf-8"
+    )
     _git(path, "add", ".gitignore", ".mozyo-bridge/config.yaml")
     _git(path, "commit", "-m", "config")
     _commit(path, "base.txt", "base")

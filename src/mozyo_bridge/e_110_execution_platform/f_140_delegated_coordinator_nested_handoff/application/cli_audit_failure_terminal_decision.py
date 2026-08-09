@@ -133,7 +133,8 @@ def cmd_audit_failure_terminal_record(args: argparse.Namespace) -> int:
 
     try:
         recorded = AuditFailureTerminalDecisionStore(home=home).record(
-            TerminalDecision(
+            repo_root=repo_root,
+            decision=TerminalDecision(
                 workspace_id=target.workspace,
                 lane_id=target.lane,
                 decision_id="",  # minted by the store; a caller never supplies one
@@ -147,7 +148,7 @@ def cmd_audit_failure_terminal_record(args: argparse.Namespace) -> int:
                 ),
                 head=head,
                 integration_branch=branch,
-            )
+            ),
         )
     except AuditFailureTerminalDecisionError as exc:
         emit({"status": DECISION_REFUSED, "detail": str(exc)})
