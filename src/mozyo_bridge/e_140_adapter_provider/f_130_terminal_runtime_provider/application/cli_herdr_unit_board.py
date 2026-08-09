@@ -17,6 +17,26 @@ from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.herdr
     format_board,
     unavailable_snapshot,
 )
+from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.unit_board_aggregate import (
+    format_multi_source_board,
+)
+from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.unit_board_sources import (
+    UnitBoardSourceError,
+    UnitBoardSourcesConfig,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.unit_board_sources_loader import (
+    load_unit_board_sources,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.remote_unit_action import (
+    ACTION_KINDS,
+    DEFAULT_ACTION_KIND,
+    RemoteUnitActionRail,
+    RemoteUnitActionRequest,
+    render_preview,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_multi_source_unit_board import (
+    MultiSourceUnitBoardRuntime,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_unit_board_runtime import (
     HerdrUnitBoardRuntime,
     MetadataSyncFailure,
@@ -50,6 +70,11 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
     COMMAND_TIMEOUT_SECONDS,
 )
 from mozyo_bridge.shared.paths import mozyo_bridge_home
+
+
+#: Floor on the ``watch`` refresh cadence once more than the local server is
+#: observed.  Remote observation is a connection per source per refresh.
+MIN_MULTI_SOURCE_INTERVAL_SECONDS = 5.0
 
 
 def _runtime() -> HerdrUnitBoardRuntime:
@@ -138,11 +163,38 @@ def _load_runtime(
         return None, _runtime_failure_snapshot()
 
 
-def _snapshot(runtime: HerdrUnitBoardRuntime) -> UnitBoardSnapshot:
+def _snapshot(
+    runtime: HerdrUnitBoardRuntime | MultiSourceUnitBoardRuntime,
+) -> UnitBoardSnapshot:
     try:
         return runtime.snapshot()
     except Exception:
         return _runtime_failure_snapshot()
+
+
+def _sources_config() -> tuple[UnitBoardSourcesConfig | None, str]:
+    """Load the operator's observable sources, or explain why it failed.
+
+    A present-but-broken source file is not silently downgraded to local-only:
+    an operator who configured remote hosts and then broke the file would
+    otherwise be shown a local board that looks complete.
+    """
+    try:
+        return load_unit_board_sources(), ""
+    except UnitBoardSourceError as exc:
+        return None, str(exc)
+
+
+def _multi_source_runtime(
+    config: UnitBoardSourcesConfig,
+) -> MultiSourceUnitBoardRuntime:
+    """Build the merged-board runtime without pre-resolving the local server.
+
+    The local Herdr binary is resolved lazily inside the runtime so that a local
+    server the client cannot reach degrades to one visible ``unavailable`` source
+    row instead of hiding every remote source behind a local failure.
+    """
+    return MultiSourceUnitBoardRuntime(config)
 
 
 def _runtime_failure_report() -> MetadataSyncReport:
@@ -161,18 +213,103 @@ def _runtime_failure_report() -> MetadataSyncReport:
 
 
 def cmd_herdr_unit_board_show(args: argparse.Namespace) -> int:
-    runtime, failure = _load_runtime()
-    if failure is not None:
-        snapshot = failure
+    config, config_error = _sources_config()
+    if config is None:
+        print(f"error: {config_error}", file=sys.stderr)
+        return 2
+    if config.is_local_only:
+        runtime, failure = _load_runtime()
+        if failure is not None:
+            snapshot = failure
+        else:
+            assert runtime is not None
+            snapshot = _snapshot(runtime)
     else:
-        assert runtime is not None
-        snapshot = _snapshot(runtime)
+        try:
+            snapshot = _multi_source_runtime(config).snapshot()
+        except Exception:
+            snapshot = _runtime_failure_snapshot()
     if getattr(args, "json", False):
         print(json.dumps(snapshot.as_payload(), ensure_ascii=False, sort_keys=True))
     else:
         width = int(getattr(args, "width", 0) or shutil.get_terminal_size((120, 24)).columns)
-        print(format_board(snapshot, width=width))
+        renderer = format_board if config.is_local_only else format_multi_source_board
+        print(renderer(snapshot, width=width))
     return 0 if snapshot.ok else 1
+
+
+def cmd_herdr_unit_board_sources(args: argparse.Namespace) -> int:
+    """Show each configured source's identity and whether it may be acted on.
+
+    Diagnostics only: it prints host identity, kind, state, and Unit count, and
+    never the ssh destination, container name, or remote binary that reached it.
+    Exits non-zero when any source is not live, because this surface exists to
+    answer "can I act on all of them right now?".
+    """
+    config, config_error = _sources_config()
+    if config is None:
+        print(f"error: {config_error}", file=sys.stderr)
+        return 2
+    try:
+        statuses = tuple(
+            observation.status
+            for observation in _multi_source_runtime(config).observe()
+        )
+    except Exception:
+        print("error: Herdr Unit board sources could not be observed", file=sys.stderr)
+        return 1
+    if getattr(args, "json", False):
+        print(
+            json.dumps(
+                {"sources": [status.as_payload() for status in statuses]},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    else:
+        for status in statuses:
+            marker = "ok " if status.actionable else "!! "
+            line = (
+                f"{marker}{status.host_label} [{status.host_kind}] "
+                f"{status.source_state} units={status.unit_count}"
+            )
+            if status.detail:
+                line = f"{line} — {status.detail}"
+            print(line)
+    return 0 if all(status.actionable for status in statuses) else 1
+
+
+def cmd_herdr_unit_board_action(args: argparse.Namespace) -> int:
+    """Preview — and only with ``--apply`` deliver — one remote Unit action."""
+    config, config_error = _sources_config()
+    if config is None:
+        print(f"error: {config_error}", file=sys.stderr)
+        return 2
+    multi = _multi_source_runtime(config)
+    request = RemoteUnitActionRequest(
+        unit_id=str(getattr(args, "unit", "") or ""),
+        issue=str(getattr(args, "issue", "") or ""),
+        journal=str(getattr(args, "journal", "") or ""),
+        summary=str(getattr(args, "summary", "") or ""),
+        kind=str(getattr(args, "kind", DEFAULT_ACTION_KIND)),
+    )
+    rail = RemoteUnitActionRail(multi)
+    preview = rail.preview(request)
+    as_json = bool(getattr(args, "json", False))
+    if not getattr(args, "apply", False):
+        if as_json:
+            print(json.dumps(preview.as_payload(), ensure_ascii=False, sort_keys=True))
+        else:
+            for line in render_preview(preview):
+                print(line)
+        return 0 if preview.applicable else 1
+    result = rail.apply(preview)
+    if as_json:
+        print(json.dumps(result.as_payload(), ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"remote Unit action: {result.state} ({result.reason})")
+        print(f"  {result.detail}")
+    return 0 if result.delivered else 1
 
 
 def cmd_herdr_unit_board_sync(args: argparse.Namespace) -> int:
@@ -203,19 +340,34 @@ def cmd_herdr_unit_board_watch(args: argparse.Namespace) -> int:
     if not 0.5 <= interval <= 60.0:
         print("error: --interval must be between 0.5 and 60 seconds")
         return 2
-    runtime, failure = _load_runtime()
-    if failure is not None:
-        width = shutil.get_terminal_size((120, 24)).columns
-        print(format_board(failure, width=width), flush=True)
-        return 1
-    assert runtime is not None
+    config, config_error = _sources_config()
+    if config is None:
+        print(f"error: {config_error}", file=sys.stderr)
+        return 2
+    if not config.is_local_only:
+        # Each remote source costs a connection per refresh.  A 2-second local
+        # cadence would turn the board into a connection storm, so the floor
+        # rises with the fan-out instead of silently hammering the hosts.
+        interval = max(interval, MIN_MULTI_SOURCE_INTERVAL_SECONDS)
+    if config.is_local_only:
+        runtime, failure = _load_runtime()
+        if failure is not None:
+            width = shutil.get_terminal_size((120, 24)).columns
+            print(format_board(failure, width=width), flush=True)
+            return 1
+        assert runtime is not None
+        board: HerdrUnitBoardRuntime | MultiSourceUnitBoardRuntime = runtime
+        renderer = format_board
+    else:
+        board = _multi_source_runtime(config)
+        renderer = format_multi_source_board
     try:
         while True:
-            snapshot = _snapshot(runtime)
+            snapshot = _snapshot(board)
             width = shutil.get_terminal_size((120, 24)).columns
             if sys.stdout.isatty():
                 print("\x1b[2J\x1b[H", end="")
-            print(format_board(snapshot, width=width), flush=True)
+            print(renderer(snapshot, width=width), flush=True)
             if not snapshot.ok:
                 return 1
             time.sleep(interval)
@@ -308,9 +460,67 @@ def register_herdr_unit_board_parser(herdr_sub) -> None:
     )
     interact.set_defaults(func=cmd_herdr_unit_board_interact)
 
+    sources = sub.add_parser(
+        "sources",
+        help=(
+            "Show each configured Herdr observation source, its state, and "
+            "whether it is currently action authority."
+        ),
+        description=(
+            "Read-only diagnostics for the operator-scoped source set. Prints "
+            "host identity, kind, state, and Unit count only — never the ssh "
+            "destination, container name, or remote binary used to reach it."
+        ),
+    )
+    sources.add_argument("--json", action="store_true", help="Emit structured JSON.")
+    sources.set_defaults(func=cmd_herdr_unit_board_sources)
+
+    action = sub.add_parser(
+        "action",
+        help=(
+            "Preview (default) or apply one handoff to a remote Unit through "
+            "the target environment's own project gateway."
+        ),
+        description=(
+            "Route one durable-anchor handoff to a Unit observed on another "
+            "Herdr server. Delivery always goes through that environment's own "
+            "project gateway to its Codex unit; the remote worker is never "
+            "direct-sent and no remote pane is addressed from here. The preview "
+            "is not a permit: applying re-observes the source, the Unit, and the "
+            "repository identity, and sends nothing if any of them changed."
+        ),
+    )
+    action.add_argument(
+        "--unit",
+        required=True,
+        help="Opaque unit_id from `unit-board show --json`.",
+    )
+    action.add_argument("--issue", required=True, help="Redmine issue id.")
+    action.add_argument("--journal", required=True, help="Redmine journal id.")
+    action.add_argument(
+        "--kind",
+        choices=ACTION_KINDS,
+        default=DEFAULT_ACTION_KIND,
+        help=f"Durable intent label (default: {DEFAULT_ACTION_KIND}).",
+    )
+    action.add_argument(
+        "--summary",
+        required=True,
+        help="Short pointer text; the durable record stays the source of truth.",
+    )
+    action.add_argument(
+        "--apply",
+        action="store_true",
+        help="Deliver after re-verifying the preview. Omit to preview only.",
+    )
+    action.add_argument("--json", action="store_true", help="Emit structured JSON.")
+    action.set_defaults(func=cmd_herdr_unit_board_action)
+
 
 __all__ = (
+    "cmd_herdr_unit_board_action",
     "cmd_herdr_unit_board_show",
+    "cmd_herdr_unit_board_sources",
     "cmd_herdr_unit_board_sync",
     "cmd_herdr_unit_board_watch",
     "cmd_herdr_unit_board_interact",

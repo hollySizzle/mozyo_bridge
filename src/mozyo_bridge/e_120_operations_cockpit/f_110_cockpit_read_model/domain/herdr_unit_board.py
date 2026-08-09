@@ -22,6 +22,9 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Iterable, Mapping, Sequence
 
+from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.unit_board_sources import (
+    LOCAL_HOST_ID,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.absolute_path_rule import (
     contains_absolute_path,
 )
@@ -30,7 +33,26 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 SOURCE_LIVE = "live"
 SOURCE_UNAVAILABLE = "unavailable"
 SOURCE_RELOAD_REQUIRED = "reload_required"
-SOURCE_STATES = frozenset({SOURCE_LIVE, SOURCE_UNAVAILABLE, SOURCE_RELOAD_REQUIRED})
+#: A source whose observation is real but too old to act on.  Distinct from
+#: ``unavailable``: the rows are still worth *showing*, they are just no longer
+#: fresh enough to be action authority (Redmine #15138).
+SOURCE_STALE = "stale"
+SOURCE_STATES = frozenset(
+    {SOURCE_LIVE, SOURCE_UNAVAILABLE, SOURCE_RELOAD_REQUIRED, SOURCE_STALE}
+)
+
+#: A Unit whose ``(workspace_id, lane_id)`` also exists on another observed
+#: source.  Visible so the operator is never asked to tell two identically
+#: named lanes apart by memory; not a refusal, because the two Units are
+#: genuinely distinct and stay distinguishable by ``host_id``.
+DUPLICATE_SCOPE_NONE = "none"
+DUPLICATE_SCOPE_CROSS_SOURCE = "cross_source"
+
+#: Whether one Unit's grouped fields agree.  Only ``resolved`` unlocks an
+#: action, so this stays a closed vocabulary rather than free display text.
+IDENTITY_RESOLVED = "resolved"
+IDENTITY_AMBIGUOUS = "ambiguous"
+IDENTITY_STATES = frozenset({IDENTITY_RESOLVED, IDENTITY_AMBIGUOUS})
 
 AUTHORITY_RESOLVED = "resolved"
 AUTHORITY_MISSING = "missing"
@@ -440,10 +462,31 @@ def safe_text(value: object, *, fallback: str = "unknown") -> str:
     return normalized[:MAX_PRESENTATION_TEXT]
 
 
-def _unit_public_id(workspace_id: str, lane_id: str) -> str:
-    """Return a bounded opaque key without truncating or disclosing identity input."""
+#: Domain separator for host-qualified Unit keys.  The local shape starts with
+#: an 8-byte big-endian length whose first byte is ``0x00`` for any real
+#: identity, so a stream that starts with these bytes can never be produced by
+#: the local shape.  That is what lets local Units keep their historical opaque
+#: key while remote Units get a distinct one from the same function.
+_HOST_QUALIFIED_TAG = b"host"
+
+
+def _unit_public_id(
+    workspace_id: str, lane_id: str, host_id: str = LOCAL_HOST_ID
+) -> str:
+    """Return a bounded opaque key without truncating or disclosing identity input.
+
+    The key is host-qualified so the same ``(workspace_id, lane_id)`` observed
+    on two servers yields two different Units rather than colliding into one.
+    The local server is the exception on purpose: its key is byte-identical to
+    the pre-multi-source key, so an operator who never configures a remote
+    source sees unchanged ``mozyo_unit`` metadata.
+    """
     digest = hashlib.sha256()
-    for component in (workspace_id, lane_id):
+    components: tuple[str, ...] = (workspace_id, lane_id)
+    if host_id != LOCAL_HOST_ID:
+        digest.update(_HOST_QUALIFIED_TAG)
+        components = (host_id,) + components
+    for component in components:
         encoded = component.encode("utf-8", errors="surrogatepass")
         digest.update(len(encoded).to_bytes(8, "big"))
         digest.update(encoded)
@@ -494,12 +537,16 @@ class AgentObservation:
     responsibility: str
     work_label: str
     authority_state: str
+    host_id: str = LOCAL_HOST_ID
+    host_label: str = LOCAL_HOST_ID
 
     def __post_init__(self) -> None:
         if not self.workspace_id or not self.lane_id or not self.provider:
             raise ValueError("managed Unit observation requires workspace, lane, and provider")
         if self.authority_state not in AUTHORITY_STATES:
             raise ValueError(f"unknown authority state: {self.authority_state!r}")
+        if not self.host_id:
+            raise ValueError("managed Unit observation requires a source host id")
 
 
 @dataclass(frozen=True)
@@ -529,10 +576,15 @@ class UnitBoardRow:
     authority_state: str
     identity_state: str
     agents: tuple[AgentCell, ...]
+    host_id: str = LOCAL_HOST_ID
+    host_label: str = LOCAL_HOST_ID
+    duplicate_scope: str = DUPLICATE_SCOPE_NONE
 
     def as_payload(self) -> dict[str, object]:
         return {
             "unit_id": safe_text(self.unit_id),
+            "host_id": safe_text(self.host_id),
+            "host_label": safe_text(self.host_label),
             "workspace_id": safe_text(self.workspace_id),
             "lane_id": safe_text(self.lane_id),
             "project_label": safe_text(self.project_label),
@@ -541,7 +593,58 @@ class UnitBoardRow:
             "work_label": safe_text(self.work_label),
             "authority_state": safe_text(self.authority_state),
             "identity_state": safe_text(self.identity_state),
+            "duplicate_scope": safe_text(self.duplicate_scope),
             "agents": [agent.as_payload() for agent in self.agents],
+        }
+
+
+@dataclass(frozen=True)
+class UnitBoardSourceStatus:
+    """How one observed Herdr server answered, and whether it may be acted on.
+
+    A source that could not be reached stays in the board as its own visible
+    row.  Dropping it would make an unreachable host indistinguishable from a
+    host with no Units — the exact confusion the close conditions forbid.
+    ``detail`` is a fixed diagnostic phrase, never a connection value or an
+    exception body.
+    """
+
+    host_id: str
+    host_label: str
+    host_kind: str
+    source_state: str
+    observed_at: str
+    unit_count: int = 0
+    unmanaged_agents: int = 0
+    detail: str = ""
+
+    def __post_init__(self) -> None:
+        if self.source_state not in SOURCE_STATES:
+            raise ValueError(f"unknown Unit board source state: {self.source_state!r}")
+        if not self.host_id:
+            raise ValueError("a Unit board source status requires a host id")
+
+    @property
+    def actionable(self) -> bool:
+        """Only a live source is action authority.
+
+        ``unavailable`` / ``reload_required`` / ``stale`` all mean the client
+        cannot currently prove what is running there, so every action against
+        this source fails closed rather than acting on a remembered view.
+        """
+        return self.source_state == SOURCE_LIVE
+
+    def as_payload(self) -> dict[str, object]:
+        return {
+            "host_id": safe_text(self.host_id),
+            "host_label": safe_text(self.host_label),
+            "host_kind": safe_text(self.host_kind),
+            "source_state": self.source_state,
+            "observed_at": safe_text(self.observed_at, fallback=""),
+            "unit_count": self.unit_count,
+            "unmanaged_agents": self.unmanaged_agents,
+            "actionable": self.actionable,
+            "detail": safe_text(self.detail, fallback="") if self.detail else "",
         }
 
 
@@ -552,6 +655,7 @@ class UnitBoardSnapshot:
     units: tuple[UnitBoardRow, ...]
     unmanaged_agents: int = 0
     detail: str = ""
+    sources: tuple[UnitBoardSourceStatus, ...] = ()
 
     def __post_init__(self) -> None:
         if self.source_state not in SOURCE_STATES:
@@ -562,13 +666,18 @@ class UnitBoardSnapshot:
         return self.source_state == SOURCE_LIVE
 
     def as_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "source_state": self.source_state,
             "observed_at": safe_text(self.observed_at, fallback=""),
             "unmanaged_agents": self.unmanaged_agents,
             "detail": safe_text(self.detail, fallback="") if self.detail else "",
             "units": [unit.as_payload() for unit in self.units],
         }
+        # Additive and only when multi-source observation actually ran, so a
+        # single-server payload keeps the shape its existing consumers read.
+        if self.sources:
+            payload["sources"] = [source.as_payload() for source in self.sources]
+        return payload
 
 
 def _choose_unit_field(values: Iterable[str], *, fallback: str) -> tuple[str, bool]:
@@ -592,14 +701,14 @@ def build_unit_board(
     unmanaged_agents: int = 0,
 ) -> UnitBoardSnapshot:
     """Group managed observations into a deterministic, ambiguity-visible board."""
-    grouped: dict[tuple[str, str], list[AgentObservation]] = {}
+    grouped: dict[tuple[str, str, str], list[AgentObservation]] = {}
     for observation in observations:
         grouped.setdefault(
-            (observation.workspace_id, observation.lane_id), []
+            (observation.host_id, observation.workspace_id, observation.lane_id), []
         ).append(observation)
 
     rows: list[UnitBoardRow] = []
-    for (workspace_id, lane_id), members in grouped.items():
+    for (host_id, workspace_id, lane_id), members in grouped.items():
         project, project_ambiguous = _choose_unit_field(
             (member.project_label for member in members), fallback="unknown-project"
         )
@@ -620,7 +729,7 @@ def build_unit_board(
             provider_counts[member.provider] = provider_counts.get(member.provider, 0) + 1
         duplicate_provider = any(count > 1 for count in provider_counts.values())
         identity_state = (
-            "ambiguous"
+            IDENTITY_AMBIGUOUS
             if any(
                 (
                     project_ambiguous,
@@ -631,7 +740,7 @@ def build_unit_board(
                     duplicate_provider,
                 )
             )
-            else "resolved"
+            else IDENTITY_RESOLVED
         )
         cells = tuple(
             AgentCell(
@@ -642,9 +751,12 @@ def build_unit_board(
             )
             for member in sorted(members, key=lambda item: (item.provider, item.pane_id))
         )
+        host_label, _ = _choose_unit_field(
+            (member.host_label for member in members), fallback=host_id
+        )
         rows.append(
             UnitBoardRow(
-                unit_id=_unit_public_id(workspace_id, lane_id),
+                unit_id=_unit_public_id(workspace_id, lane_id, host_id),
                 workspace_id=safe_text(workspace_id),
                 lane_id=safe_text(lane_id),
                 project_label=project,
@@ -654,6 +766,8 @@ def build_unit_board(
                 authority_state=authority,
                 identity_state=identity_state,
                 agents=cells,
+                host_id=host_id,
+                host_label=host_label,
             )
         )
 
@@ -666,14 +780,21 @@ def build_unit_board(
     )
 
 
-def unavailable_snapshot(source_state: str, *, observed_at: str, detail: str) -> UnitBoardSnapshot:
-    if source_state not in {SOURCE_UNAVAILABLE, SOURCE_RELOAD_REQUIRED}:
+def unavailable_snapshot(
+    source_state: str,
+    *,
+    observed_at: str,
+    detail: str,
+    sources: tuple[UnitBoardSourceStatus, ...] = (),
+) -> UnitBoardSnapshot:
+    if source_state not in {SOURCE_UNAVAILABLE, SOURCE_RELOAD_REQUIRED, SOURCE_STALE}:
         raise ValueError("an unavailable snapshot needs an unavailable source state")
     return UnitBoardSnapshot(
         source_state=source_state,
         observed_at=observed_at,
         units=(),
         detail=safe_text(detail),
+        sources=sources,
     )
 
 
@@ -826,14 +947,23 @@ __all__ = (
     "AUTHORITY_INVALID",
     "AUTHORITY_MISSING",
     "AUTHORITY_RESOLVED",
+    "DUPLICATE_SCOPE_CROSS_SOURCE",
+    "DUPLICATE_SCOPE_NONE",
+    "IDENTITY_AMBIGUOUS",
+    "IDENTITY_RESOLVED",
+    "IDENTITY_STATES",
     "MAX_BOARD_WIDTH",
+    "MAX_PRESENTATION_TEXT",
     "REDACTED_TEXT",
+    "AgentCell",
     "AgentObservation",
     "SOURCE_LIVE",
     "SOURCE_RELOAD_REQUIRED",
+    "SOURCE_STALE",
     "SOURCE_UNAVAILABLE",
     "UnitBoardRow",
     "UnitBoardSnapshot",
+    "UnitBoardSourceStatus",
     "build_unit_board",
     "clip_display",
     "format_board",
