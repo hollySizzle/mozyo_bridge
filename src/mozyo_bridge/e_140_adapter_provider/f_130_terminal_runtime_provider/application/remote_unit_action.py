@@ -21,7 +21,7 @@ connection value, a remote path, or an exception body.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Optional, Sequence
 
@@ -66,6 +66,7 @@ REASON_IDENTITY_CHANGED = "identity_changed"
 REASON_INVALID_REQUEST = "invalid_request"
 REASON_DELIVERY_FAILED = "delivery_failed"
 REASON_CONNECTION_VALUE_DISCLOSED = "connection_value_disclosed"
+REASON_PREVIEW_MISMATCH = "preview_mismatch"
 
 #: Durable-anchor intents this rail may carry.  Deliberately the canonical
 #: handoff vocabulary and nothing new: a remote Unit action is an ordinary
@@ -117,6 +118,10 @@ _DETAIL_BY_REASON = {
     REASON_CONNECTION_VALUE_DISCLOSED: (
         "the request text repeats a configured connection value; the preview and "
         "the delivered handoff are public surfaces and must not carry one"
+    ),
+    REASON_PREVIEW_MISMATCH: (
+        "the preview does not match the request it was computed from; apply "
+        "delivers the request that was validated, not a preview handed back to it"
     ),
     REASON_DELIVERY_FAILED: (
         "the target environment's project gateway did not accept the handoff; "
@@ -194,15 +199,27 @@ class RemoteUnitActionRequest:
 
 @dataclass(frozen=True)
 class _ActionEvidence:
-    """The exact identity a preview was computed from, kept out of the payload.
+    """What a preview was computed from, kept out of the payload and the repr.
 
-    ``canonical_path`` is a path on the source host.  It lives here so the apply
-    step can prove the repository identity did not move and can pass it as an
-    argv value on that host; it never reaches a payload or a rendered line.
+    Three things, and the third is the one that makes ``apply`` an act of
+    re-proving rather than of trusting: the identity the preview resolved
+    (``target`` / ``workspace``) **and the validated request it described**.
+
+    A preview is a public object this package exports.  Reading its fields back
+    at apply time would let a caller hand over a preview describing one action
+    and have another delivered — a different anchor, a different intent, or a
+    summary that never passed validation (review j#102159 finding_1).  So the
+    request that was actually checked travels here, and delivery is built from
+    it.
+
+    ``workspace.canonical_path`` is a path on the source host.  It lives here so
+    apply can prove the repository identity did not move and can pass it as an
+    argv value there; it never reaches a payload, a rendered line, or a repr.
     """
 
     target: SourceUnitTarget
     workspace: SourceWorkspace
+    request: RemoteUnitActionRequest
 
 
 @dataclass(frozen=True)
@@ -224,7 +241,11 @@ class RemoteUnitActionPreview:
     journal: str = ""
     summary: str = ""
     observed_at: str = ""
-    evidence: Optional[_ActionEvidence] = None
+    #: Kept out of the repr as well as the payload: it holds the source's
+    #: connection values and the remote repository path, and an object that is
+    #: safe to render but not to print is only half safe (review j#102159
+    #: finding_2).
+    evidence: Optional[_ActionEvidence] = field(default=None, repr=False)
 
     @property
     def applicable(self) -> bool:
@@ -298,6 +319,38 @@ def _refused(
     )
 
 
+def _applicable_preview(evidence: _ActionEvidence) -> RemoteUnitActionPreview:
+    """The one applicable preview a given evidence set describes (pure).
+
+    Built in exactly one place so ``apply`` can rebuild it and compare the whole
+    object.  Comparing a hand-listed set of fields would leave the next field
+    someone adds unchecked; comparing the objects cannot.
+    """
+    target = evidence.target
+    request = evidence.request
+    return RemoteUnitActionPreview(
+        state=ACTION_APPLICABLE,
+        reason=REASON_OK,
+        detail=(
+            "one handoff will be delivered through the target environment's "
+            "own project gateway; the remote worker is never direct-sent"
+        ),
+        host_id=target.source.host_id,
+        host_label=target.source.label,
+        host_kind=target.source.kind,
+        project_label=target.project_label,
+        target_project=request.target_project.strip(),
+        lane_id=target.lane_id,
+        workspace_id=target.workspace_id,
+        kind=request.kind,
+        issue=request.issue,
+        journal=request.journal,
+        summary=request.summary.strip(),
+        observed_at=target.observed_at,
+        evidence=evidence,
+    )
+
+
 class RemoteUnitActionRail:
     """Resolve, explain, and — only on an explicit apply — deliver one action."""
 
@@ -340,33 +393,21 @@ class RemoteUnitActionRail:
         )
         if workspace is None:
             return _refused(REASON_WORKSPACE_UNRESOLVED, request)
-        return RemoteUnitActionPreview(
-            state=ACTION_APPLICABLE,
-            reason=REASON_OK,
-            detail=(
-                "one handoff will be delivered through the target environment's "
-                "own project gateway; the remote worker is never direct-sent"
-            ),
-            host_id=target.source.host_id,
-            host_label=target.source.label,
-            host_kind=target.source.kind,
-            project_label=target.project_label,
-            target_project=request.target_project.strip(),
-            lane_id=target.lane_id,
-            workspace_id=target.workspace_id,
-            kind=request.kind,
-            issue=request.issue,
-            journal=request.journal,
-            summary=request.summary.strip(),
-            observed_at=target.observed_at,
-            evidence=_ActionEvidence(target=target, workspace=workspace),
+        return _applicable_preview(
+            _ActionEvidence(target=target, workspace=workspace, request=request)
         )
 
     def _gateway_args(
         self,
-        preview: RemoteUnitActionPreview,
+        request: RemoteUnitActionRequest,
         workspace: SourceWorkspace,
     ) -> tuple[str, ...]:
+        """The delivered argv, built from the VALIDATED request.
+
+        Reading the preview here would make the comparison above the only thing
+        standing between a substituted field and the wire.  Building from the
+        request means a substitution has to get past both.
+        """
         return (
             "project-gateway",
             "handoff",
@@ -375,19 +416,19 @@ class RemoteUnitActionRail:
             "--source",
             "redmine",
             "--issue",
-            preview.issue,
+            request.issue,
             "--journal",
-            preview.journal,
+            request.journal,
             "--kind",
-            preview.kind,
+            request.kind,
             "--target-repo",
             workspace.canonical_path,
             "--target-project",
-            preview.target_project,
+            request.target_project.strip(),
             "--mode",
             "standard",
             "--summary",
-            preview.summary,
+            request.summary.strip(),
             # The gateway's own ``--json`` only shapes a *fail-closed resolution*
             # payload; a successful handoff still uses the ``both`` record format
             # by default and prints a markdown record before the JSON.  Asking
@@ -412,6 +453,20 @@ class RemoteUnitActionRail:
                 "a fresh applicable preview is required before applying",
                 preview,
             )
+        # Re-prove the request itself, not just the identity it resolved.  The
+        # preview is a public object; every check `preview()` ran is re-run here
+        # against the request that travelled with the evidence, and the preview
+        # is then required to be exactly the one that request describes.
+        evidence = preview.evidence
+        problem = evidence.request.validated()
+        if problem is not None:
+            return self._refuse(preview, REASON_INVALID_REQUEST)
+        for text in (evidence.request.summary, evidence.request.target_project):
+            if self._runtime.config.disclosed_connection_value(text) is not None:
+                return self._refuse(preview, REASON_CONNECTION_VALUE_DISCLOSED)
+        expected = _applicable_preview(evidence)
+        if replace(preview, evidence=None) != replace(expected, evidence=None):
+            return self._refuse(preview, REASON_PREVIEW_MISMATCH)
         if (
             freshness_state(
                 preview.observed_at,
@@ -442,7 +497,7 @@ class RemoteUnitActionRail:
         if workspace.canonical_path != preview.evidence.workspace.canonical_path:
             return self._refuse(preview, REASON_IDENTITY_CHANGED)
 
-        return self._deliver(preview, target.source, workspace)
+        return self._deliver(preview, target.source, workspace, evidence.request)
 
     def _refuse(
         self, preview: RemoteUnitActionPreview, reason: str
@@ -459,9 +514,10 @@ class RemoteUnitActionRail:
         preview: RemoteUnitActionPreview,
         source: UnitBoardSource,
         workspace: SourceWorkspace,
+        request: RemoteUnitActionRequest,
     ) -> RemoteUnitActionResult:
         result = self._runtime.run_source_command(
-            source, self._gateway_args(preview, workspace)
+            source, self._gateway_args(request, workspace)
         )
         completed = result.completed
         if not result.ok or completed is None or completed.returncode != 0:
@@ -597,6 +653,7 @@ __all__ = (
     "REASON_INVALID_REQUEST",
     "REASON_LOCAL_SOURCE",
     "REASON_OK",
+    "REASON_PREVIEW_MISMATCH",
     "REASON_PREVIEW_STALE",
     "REASON_UNIT_UNRESOLVED",
     "REASON_WORKSPACE_UNRESOLVED",

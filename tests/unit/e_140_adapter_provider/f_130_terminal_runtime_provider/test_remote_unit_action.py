@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import subprocess
 import unittest
@@ -12,6 +13,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     ACTION_DELIVERED,
     ACTION_REFUSED,
     REASON_CONNECTION_VALUE_DISCLOSED,
+    REASON_PREVIEW_MISMATCH,
     REASON_DELIVERY_FAILED,
     REASON_IDENTITY_CHANGED,
     REASON_INVALID_REQUEST,
@@ -334,6 +336,111 @@ class ConnectionValueDisclosureTests(unittest.TestCase):
         )
 
         self.assertEqual(preview.reason, REASON_CONNECTION_VALUE_DISCLOSED)
+
+
+class PreviewSubstitutionTests(unittest.TestCase):
+    """apply re-proves the request; it does not read the preview handed to it.
+
+    A preview is a public object this package exports, so ``apply`` receiving
+    one is not evidence that ``preview`` produced it.
+    """
+
+    SUBSTITUTIONS = {
+        "another canonical anchor": {"issue": "999999999", "journal": "888888888"},
+        "another permitted kind": {"kind": "review_request"},
+        "another summary": {"summary": "a completely different instruction"},
+        "another project scope": {"target_project": "some-other-scope"},
+        # Values that would never have passed validation in the first place.
+        "an anchor with a leading zero": {"issue": "0015138"},
+        "a kind outside the vocabulary": {"kind": "close"},
+        "a credential-shaped summary": {"summary": "token=DROP-TOKEN-SENTINEL"},
+        "a configured connection value": {"summary": "ping SSH-DESTINATION-SENTINEL"},
+        # Display-only fields the operator confirmed.
+        "a different displayed host": {"host_label": "somewhere else"},
+        "a different displayed lane": {"lane_id": "issue_99999"},
+    }
+
+    def test_a_substituted_preview_delivers_nothing(self) -> None:
+        for name, changes in self.SUBSTITUTIONS.items():
+            with self.subTest(substitution=name):
+                action, runtime, runner = rail()
+                unit_id = remote_unit_id(runtime)
+                preview = action.preview(request(unit_id))
+
+                result = action.apply(dataclasses.replace(preview, **changes))
+
+                self.assertEqual(result.state, ACTION_REFUSED)
+                self.assertEqual(result.reason, REASON_PREVIEW_MISMATCH)
+                self.assertFalse(
+                    [argv for argv in runner.argvs if "project-gateway" in argv[-1]]
+                )
+
+    def test_substituting_the_evidence_request_is_revalidated(self) -> None:
+        # The second layer: even reaching past the comparison, the request that
+        # travels with the evidence is checked again before anything is built
+        # from it.
+        action, runtime, runner = rail()
+        unit_id = remote_unit_id(runtime)
+        preview = action.preview(request(unit_id))
+        tampered = dataclasses.replace(
+            preview,
+            evidence=dataclasses.replace(
+                preview.evidence,
+                request=dataclasses.replace(
+                    preview.evidence.request,
+                    summary="ping SSH-DESTINATION-SENTINEL",
+                ),
+            ),
+        )
+
+        result = action.apply(tampered)
+
+        self.assertEqual(result.reason, REASON_CONNECTION_VALUE_DISCLOSED)
+        self.assertFalse(
+            [argv for argv in runner.argvs if "project-gateway" in argv[-1]]
+        )
+
+    def test_the_delivered_argv_comes_from_the_validated_request(self) -> None:
+        action, runtime, runner = rail()
+        unit_id = remote_unit_id(runtime)
+        preview = action.preview(request(unit_id, issue="15138", summary="board pointer"))
+
+        result = action.apply(preview)
+
+        self.assertEqual(result.state, ACTION_DELIVERED)
+        command = next(
+            argv[-1] for argv in runner.argvs if "project-gateway" in argv[-1]
+        )
+        self.assertIn("--issue 15138", command)
+        self.assertIn("--summary 'board pointer'", command)
+
+
+class PreviewReprTests(unittest.TestCase):
+    """Safe to render is not the same as safe to print."""
+
+    def test_no_connection_value_or_remote_path_appears_in_a_repr(self) -> None:
+        action, runtime, _ = rail()
+        unit_id = remote_unit_id(runtime)
+        preview = action.preview(request(unit_id))
+        result = action.apply(preview)
+
+        for name, rendered in (
+            ("preview", repr(preview)),
+            ("result", repr(result)),
+            ("evidence", repr(preview.evidence)),
+            ("source", repr(preview.evidence.target.source)),
+            ("workspace", repr(preview.evidence.workspace)),
+        ):
+            with self.subTest(object=name):
+                self.assertNotIn("SSH-DESTINATION-SENTINEL", rendered)
+                self.assertNotIn("/srv/checkouts", rendered)
+
+    def test_the_public_projection_still_carries_the_display_values(self) -> None:
+        action, runtime, _ = rail()
+        unit_id = remote_unit_id(runtime)
+        preview = action.preview(request(unit_id))
+
+        self.assertEqual(preview.as_payload()["host_label"], "dev host")
 
 
 class ApplyDeliveryTests(unittest.TestCase):

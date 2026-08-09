@@ -211,11 +211,15 @@ class UnitBoardSource:
     host_id: str
     label: str
     kind: str
-    ssh_target: str = ""
-    container: str = ""
+    # The connection values are excluded from the repr, not only from
+    # ``as_payload``: an object that is safe to render but not to print leaks
+    # the moment anything logs it or a traceback shows a local (review j#102159
+    # finding_2).
+    ssh_target: str = field(default="", repr=False)
+    container: str = field(default="", repr=False)
     container_runtime: str = "docker"
     via: str = ""
-    mozyo_binary: str = DEFAULT_MOZYO_BINARY
+    mozyo_binary: str = field(default=DEFAULT_MOZYO_BINARY, repr=False)
     connect_timeout: int = DEFAULT_CONNECT_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:

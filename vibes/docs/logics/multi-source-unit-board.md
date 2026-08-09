@@ -217,6 +217,16 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
 - **preview が既定であり、preview は許可証ではない。** `--apply` は preview が依拠した
   source / Unit / repository identity を再観測し、freshness → identity → 配送の順に検査する。
   いずれかが変わっていれば zero-send で refuse する。
+- **apply は identity だけでなく「何を送るか」も再証明する。** preview object は export された
+  public API であり、apply が受け取った preview を `preview()` が作ったという保証はない。
+  検証済み request を private evidence に保持し、apply 時に **(1) request validation を再適用、
+  (2) 接続値照合を再適用、(3) evidence から期待 preview を再構成して object 全体を exact 比較**する
+  （field を数え上げる比較は、次に足す field が検査から漏れる）。不一致は zero-send。
+  配送 argv は **preview 属性ではなく evidence 内の検証済み request から組む** — 比較に穴があっても
+  置換が wire に届かないようにするため。
+- **private 値は payload・描画だけでなく repr からも外す。** preview / result / evidence /
+  source / workspace のいずれを print や log に出しても接続値と remote path が現れないこと。
+  「render しても安全」は「print しても安全」を意味しない（traceback の locals、debug 出力）。
 - `--target-repo` に渡す canonical path は対象 host 上の path である。argv 値としてのみ
   存在し、payload / 描画 / journal には出さない。gateway の delivery record (pane id /
   repo root を含む) も生成 host 側に残し、client へは一切反映しない。

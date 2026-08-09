@@ -23,7 +23,7 @@ import selectors
 import subprocess
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Optional, Sequence
 
@@ -518,7 +518,9 @@ class SourceWorkspace:
     """
 
     workspace_id: str
-    canonical_path: str
+    # A path on another host, kept out of the repr for the same reason it is
+    # kept out of every payload (review j#102159 finding_2).
+    canonical_path: str = field(repr=False)
 
 
 __all__ = (
