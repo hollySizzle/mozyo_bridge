@@ -315,7 +315,6 @@ def admit(
     callbacks_drained: bool = True,
     source_closed_in_tracker: "bool | None" = True,
     successor_closed_in_tracker: "bool | None" = True,
-    migrations=None,
 ):
     """Fold both records with the SHARED grammar and evaluate — the whole route, minus IO.
 
@@ -369,7 +368,6 @@ def admit(
         live_commits_ahead=commits_ahead,
         worktree_clean=worktree_clean,
         callbacks_drained=callbacks_drained,
-        migrations=migrations,
     )
 
 
@@ -801,7 +799,9 @@ class OnlyAnEnumeratedMigrationConverges(unittest.TestCase):
     def test_an_empty_enumeration_admits_nothing(self):
         # The negative control for the authority itself: with nothing enumerated, the otherwise
         # perfect reproduction does not converge. Nothing else in the record can substitute.
-        self.assertEqual(admit(migrations=()).reason, REASON_NOT_A_SANCTIONED_MIGRATION)
+        # The enumeration is rewritten IN THE PACKAGE — there is no argument to hand one in.
+        with _enumeration(()):
+            self.assertEqual(admit().reason, REASON_NOT_A_SANCTIONED_MIGRATION)
 
     def test_the_pin_predicate_refuses_a_declaration_that_is_not_in_force(self):
         invalid = fold_superseded_audit_failure(
@@ -810,25 +810,50 @@ class OnlyAnEnumeratedMigrationConverges(unittest.TestCase):
         self.assertIsNone(sanctioned_migration(invalid))
         self.assertIsNone(sanctioned_migration(fold_superseded_audit_failure([])))
 
-    def test_the_pin_predicate_resolves_the_enumeration_at_call_time(self):
-        # Bound as a default argument it would freeze at import and a test could not specify
-        # against a different enumeration; read at call time it is the module's current one.
-        declaration = fold_superseded_audit_failure(
-            [(DECLARATION_JOURNAL, declaration_marker())]
-        )
-        self.assertIsNotNone(sanctioned_migration(declaration))
-        self.assertIsNone(sanctioned_migration(declaration, migrations=()))
-
-    def test_the_route_does_not_hand_the_enumeration_to_the_fence(self):
-        # The application resolver must never pass ``migrations``: an authority the caller supplies
-        # fences nothing. Read from the real source so a future edit that threads a flag in fails.
+    def test_no_public_decision_surface_accepts_a_replacement_enumeration(self):
+        # Review j#102074 finding 1, as a DERIVED oracle over the module's own public surface
+        # rather than a spot check of one name. R3 exposed the enumeration as a keyword argument
+        # and argued the application never passes it; the reviewer passed one directly to the
+        # decision function and it admitted. An authority-bearing API that accepts a substitute
+        # authority has fenced nothing, so no exported callable may take one — measured by
+        # signature, and by the absence of any parameter defaulting to the enumeration itself.
         import inspect
 
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
-            retire_superseded_audit_failure as route,
-        )
+        for name in terminal_module.__all__:
+            member = getattr(terminal_module, name)
+            if not callable(member) or isinstance(member, type):
+                continue
+            with self.subTest(callable=name):
+                parameters = inspect.signature(member).parameters
+                self.assertNotIn("migrations", parameters)
+                for parameter in parameters.values():
+                    self.assertIsNot(parameter.default, SANCTIONED_MIGRATIONS)
 
-        self.assertNotIn("migrations", inspect.getsource(route))
+    def test_an_off_enumeration_tuple_cannot_admit_through_any_public_path(self):
+        # The behavioural half of the same finding, driven WITHOUT patching anything: a tuple the
+        # package does not enumerate is refused by the pure fence and by the shared resolver alike.
+        off_pin = dict(
+            source=source_journals(marker=declaration_marker(successor_issue="14999")),
+            successor=successor_journals(
+                ack=acknowledgement_marker(issue="14999"), reviewed_head=HEAD
+            ),
+        )
+        self.assertEqual(admit(**off_pin).reason, REASON_NOT_A_SANCTIONED_MIGRATION)
+        self.assertIsNone(
+            sanctioned_migration(
+                fold_superseded_audit_failure(
+                    [(DECLARATION_JOURNAL, declaration_marker(successor_issue="14999"))]
+                )
+            )
+        )
+        records = {ISSUE: off_pin["source"], "14999": off_pin["successor"]}
+        with _stub_live(records):
+            outcome = _resolve_latest_generation_admissible(
+                TheRouteIsWiredIntoTheFence._args(worktree=""),
+                target=RetireEvidenceTarget(WORKSPACE, LANE, GENERATION, "pointer", 1),
+                repo_root=Path("."),
+            )
+        self.assertFalse(outcome.admissible)
 
 
 class TheApprovalMustHaveExaminedThisLaneHead(unittest.TestCase):
@@ -1228,7 +1253,12 @@ def _EVERY_REFUSAL_FIXTURE():
         ),
         admit(source=source_journals(marker=declaration_marker(), implementation_commit="a" * 40)),
         admit(source=source_journals(marker=self_successor)),
-        admit(migrations=()),
+        admit(
+            source=source_journals(marker=declaration_marker(successor_issue="14999")),
+            successor=successor_journals(
+                ack=acknowledgement_marker(issue="14999"), reviewed_head=HEAD
+            ),
+        ),
         admit(successor=successor_journals(ack=None)),
         admit(successor=successor_journals(ack=acknowledgement_marker(), close=False)),
         admit(
@@ -1621,6 +1651,31 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
             )
 
 
+class _enumeration:
+    """Rewrite the PACKAGE's own enumeration for the duration of a test.
+
+    Not an injection seam: :func:`sanctioned_migration` takes no enumeration argument, so nothing a
+    caller can reach through an exported function selects the authority (review j#102074 finding
+    1). What this does is replace the module constant inside the test process — the same thing a
+    reviewed code change does, done temporarily — which is how a test can specify against an
+    enumeration other than the shipped one (an empty list, or the head of a fixture repository that
+    git generated at run time).
+    """
+
+    def __init__(self, migrations):
+        self._migrations = tuple(migrations)
+        self._original = None
+
+    def __enter__(self):
+        self._original = terminal_module.SANCTIONED_MIGRATIONS
+        terminal_module.SANCTIONED_MIGRATIONS = self._migrations
+        return self
+
+    def __exit__(self, *exc):
+        terminal_module.SANCTIONED_MIGRATIONS = self._original
+        return False
+
+
 class _stub_live:
     """Replace BOTH of the route's live Redmine reads with fixtures, restoring them afterwards.
 
@@ -1645,9 +1700,8 @@ class _stub_live:
         self._original_closed = retire_superseded_audit_failure._read_live_issue_closed
         if self._pin_head is not None:
             # An end-to-end fixture builds a REAL repository, so its head is whatever git made.
-            # The enumeration is specified against that head — the route resolves
-            # ``SANCTIONED_MIGRATIONS`` from the module at call time precisely so a test can state
-            # the enumeration it is specifying against, and never passes ``migrations`` itself.
+            # The enumeration is specified against that head by rewriting the package constant
+            # (see :class:`_enumeration`) — there is no argument to hand one in.
             import dataclasses
 
             self._original_pins = terminal_module.SANCTIONED_MIGRATIONS

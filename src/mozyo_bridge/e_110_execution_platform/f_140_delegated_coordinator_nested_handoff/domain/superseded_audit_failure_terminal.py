@@ -55,6 +55,14 @@ else its records say. This is the "一回限りの移行" review j#101909 sancti
 one property no journal surface has: **a journal author cannot add an entry.** Extending the route
 to another lane is a reviewed code change that appears in the diff an auditor reads.
 
+**No decision surface here accepts a replacement enumeration** (review j#102074 finding 1). R3
+exposed one as a test seam, arguing the application never passes it; the reviewer handed a
+caller-supplied pin straight to the decision function and it admitted. An authority-bearing API
+that accepts a substitute authority has fenced nothing, and inspecting one caller does not close
+the contract for the rest — so the parameter is gone and :data:`SANCTIONED_MIGRATIONS` is read from
+module scope. What a test may still do is rewrite the package's own constant in its own process;
+that is not a path any caller can reach through an exported function.
+
 Everything below is retained as a CONJUNCT on top of that pin — never a substitute for it. The pin
 says which lane may converge; the conjuncts say the record and the repository still agree at action
 time:
@@ -401,8 +409,6 @@ SANCTIONED_MIGRATIONS: Tuple[SanctionedMigration, ...] = (
 
 def sanctioned_migration(
     declaration: "SupersededAuditFailureFacts",
-    *,
-    migrations: "Optional[Sequence[SanctionedMigration]]" = None,
 ) -> Optional[SanctionedMigration]:
     """The enumerated migration this declaration is, or ``None`` (pure).
 
@@ -411,16 +417,19 @@ def sanctioned_migration(
     different review journal, a re-incarnated lane, a moved head, another integration branch — is
     simply not this migration and gets no admission from it.
 
-    ``migrations`` defaults to ``None`` and is then resolved from :data:`SANCTIONED_MIGRATIONS` AT
-    CALL TIME rather than being bound as a default argument, so the enumeration a run uses is the
-    module's current one. It is a parameter only so a test can state the enumeration it is
-    specifying against; the application route never passes it, because an authority the caller
-    supplies fences nothing (#14539 j#91797 F2) and the package constant IS the authority.
+    **There is deliberately NO parameter for the enumeration** (review j#102074 finding 1). R3
+    exposed one as a test seam and documented it as "the route never passes it"; the reviewer
+    reproduced an admission by handing a caller-supplied pin to this very function, and the point
+    stands regardless of what the application does: an authority-bearing decision API that ACCEPTS
+    a replacement authority has not fenced anything, and a source-inspection test of one caller
+    does not close the contract for every other caller (#14539 j#91797 F2 — an authority the caller
+    supplies fences nothing). :data:`SANCTIONED_MIGRATIONS` is read from module scope, so the
+    enumeration a decision uses is the package's own and cannot be passed in.
     """
     if not declaration.in_force or declaration.envelope is None:
         return None
     envelope = declaration.envelope
-    for pin in (SANCTIONED_MIGRATIONS if migrations is None else migrations) or ():
+    for pin in SANCTIONED_MIGRATIONS or ():
         if (
             pin.issue == declaration.issue
             and pin.audit_journal == declaration.audit_journal
@@ -594,7 +603,6 @@ def evaluate_superseded_audit_failure_admissible(
     live_commits_ahead: Optional[int] = None,
     worktree_clean: bool = False,
     callbacks_drained: bool = False,
-    migrations: "Optional[Sequence[SanctionedMigration]]" = None,
 ) -> AdmissionResult:
     """Whether a lane whose failure was recorded WITHOUT a Review Gate may terminally retire (pure).
 
@@ -766,7 +774,7 @@ def evaluate_superseded_audit_failure_admissible(
     # admission from this route, whatever its records say — that is what makes the route a bounded
     # migration rather than a general no-review terminal, and it is the refusal an unauthenticatable
     # writer cannot talk past: adding an entry is a reviewed code change, not a journal.
-    if sanctioned_migration(declaration, migrations=migrations) is None:
+    if sanctioned_migration(declaration) is None:
         return AdmissionResult(False, REASON_NOT_A_SANCTIONED_MIGRATION)
 
     # The successor's own acknowledgement — the half the source issue cannot write for itself
