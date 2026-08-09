@@ -49,10 +49,12 @@ selection fresh per process and holds no state.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import functools
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from mozyo_bridge.application.commands_common import repo_root_from_args
 from mozyo_bridge.application.repo_local_config_loader import load_repo_local_config
@@ -63,11 +65,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
     RepoLocalConfigError,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+    is_explicit_pane_target,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
     PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
     RESOLVED_TARGET_CAPABILITY_ARG,
     ResolvedHerdrTargetCapability,
-    explicit_tmux_pane_target,
     validate_resolved_target_capability,
     verify_project_gateway_target_effect,
 )
@@ -101,6 +105,52 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.
     run_tmux as _tmux_run_tmux,
 )
 from mozyo_bridge.shared.errors import die
+
+
+@dataclass(frozen=True)
+class HandoffTransportContext:
+    """The exact inputs the transport-backend selection reads (Redmine #15149).
+
+    The wiring below used to read all six values off an ``argparse.Namespace``,
+    which made the backend switch — the last Namespace-bound step on the send
+    path after #13729 — unreachable for a non-CLI caller. They are all flat
+    scalars already carried by the typed
+    :class:`~...domain.handoff_command_input.HandoffCommandInput` plus the
+    facade's resolved repo root and the stashed project-gateway capability, so
+    this frozen record is the Namespace-free statement of the same inputs.
+
+    :meth:`coerce` keeps every existing Namespace caller (and the
+    ``resolve_handoff_transport_runtime`` monkeypatch seam) working unchanged:
+    the resolvers take either shape and normalize here.
+    """
+
+    repo_root: Path
+    to: str | None = None
+    target: str | None = None
+    target_repo: str | None = None
+    target_lane: str | None = None
+    resolved_target_capability: Any = None
+
+    @classmethod
+    def from_namespace(cls, args: argparse.Namespace) -> "HandoffTransportContext":
+        """Capture the six reads the wiring made off the parsed Namespace."""
+        return cls(
+            repo_root=repo_root_from_args(args),
+            to=getattr(args, "to", None),
+            target=getattr(args, "target", None),
+            target_repo=getattr(args, "target_repo", None),
+            target_lane=getattr(args, "target_lane", None),
+            resolved_target_capability=getattr(
+                args, RESOLVED_TARGET_CAPABILITY_ARG, None
+            ),
+        )
+
+    @classmethod
+    def coerce(cls, source: "Any") -> "HandoffTransportContext":
+        """``source`` as a context: pass one through, convert a Namespace."""
+        if isinstance(source, cls):
+            return source
+        return cls.from_namespace(source)
 
 
 def _herdr_native_assigned_name(
@@ -146,7 +196,7 @@ def _herdr_native_assigned_name(
 
 
 def _resolve_herdr_binding(
-    args: argparse.Namespace, config
+    ctx: HandoffTransportContext, config
 ) -> TransportBinding:
     """Resolve the herdr :class:`TransportBinding` for an already-herdr ``config``.
 
@@ -155,22 +205,22 @@ def _resolve_herdr_binding(
     do not add a second config read). Fail-closed ``die`` when the binary is
     unconfigured / unresolvable (never a silent tmux fallback).
     """
-    repo_root = repo_root_from_args(args)
-    receiver = getattr(args, "to", None) or ""
+    repo_root = ctx.repo_root
+    receiver = ctx.to or ""
     coordinator_provider = resolve_coordinator_provider(repo_root)
     try:
         lister = resolve_agent_lister(config)
         if lister is None:  # defensive: herdr_enabled implies non-None
             die("herdr backend selected but no agent lister could be resolved")
             raise AssertionError("unreachable")
-        resolved_target_capability = getattr(args, RESOLVED_TARGET_CAPABILITY_ARG, None)
+        resolved_target_capability = ctx.resolved_target_capability
         if resolved_target_capability is not None:
             capability = validate_resolved_target_capability(
                 resolved_target_capability,
                 repo_root=repo_root,
-                target=getattr(args, "target", None),
-                target_repo=getattr(args, "target_repo", None),
-                target_lane=getattr(args, "target_lane", None),
+                target=ctx.target,
+                target_repo=ctx.target_repo,
+                target_lane=ctx.target_lane,
                 receiver=receiver,
             )
             # The generic herdr rail normally derives an assigned name from the launch-time sender
@@ -288,11 +338,11 @@ def _guard_project_gateway_standard_rail_effects(
 
 
 def _project_gateway_capability(
-    args: argparse.Namespace,
+    ctx: HandoffTransportContext,
 ) -> Optional[ResolvedHerdrTargetCapability]:
     """Return the exact internal project-gateway capability, if present."""
 
-    capability = getattr(args, RESOLVED_TARGET_CAPABILITY_ARG, None)
+    capability = ctx.resolved_target_capability
     if (
         type(capability) is ResolvedHerdrTargetCapability
         and capability.purpose == PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE
@@ -302,7 +352,7 @@ def _project_gateway_capability(
 
 
 def _require_project_gateway_herdr_transport_frame(
-    args: argparse.Namespace,
+    ctx: HandoffTransportContext,
     source_config,
 ) -> Optional[ResolvedHerdrTargetCapability]:
     """Refuse a project capability before any source-to-target backend fallback.
@@ -314,7 +364,7 @@ def _require_project_gateway_herdr_transport_frame(
     backend join immediately before every later mutation.
     """
 
-    capability = _project_gateway_capability(args)
+    capability = _project_gateway_capability(ctx)
     if capability is None:
         return None
     try:
@@ -341,9 +391,14 @@ def _require_project_gateway_herdr_transport_frame(
 
 
 def resolve_handoff_transport_binding(
-    args: argparse.Namespace,
+    source: "argparse.Namespace | HandoffTransportContext",
 ) -> Optional[TransportBinding]:
     """Resolve the transport binding for this send, or ``None`` for the tmux default.
+
+    Redmine #15149: takes either the parsed Namespace (every existing CLI caller)
+    or the typed :class:`HandoffTransportContext` the shared application API
+    builds, and normalizes to the context. The selection logic is identical for
+    both, so the CLI and a non-CLI caller cannot resolve different backends.
 
     Returns ``None`` when the tmux backend is in effect (the default, an absent
     ``terminal_transport`` block, or a broken / unreadable config) so the caller
@@ -357,9 +412,10 @@ def resolve_handoff_transport_binding(
     unconfigured / unresolvable, the sender identity is un-attested, or the receiver
     does not resolve to a single live agent (never a silent tmux fallback).
     """
-    capability = _project_gateway_capability(args)
+    ctx = HandoffTransportContext.coerce(source)
+    capability = _project_gateway_capability(ctx)
     try:
-        config = load_repo_local_config(repo_root_from_args(args)).terminal_transport
+        config = load_repo_local_config(ctx.repo_root).terminal_transport
     except RepoLocalConfigError:
         if capability is not None:
             die(
@@ -370,7 +426,7 @@ def resolve_handoff_transport_binding(
         # A present-but-broken / unreadable config is "no usable selection", not a
         # herdr opt-in — resolve to the tmux default rather than failing the send.
         return None
-    _require_project_gateway_herdr_transport_frame(args, config)
+    _require_project_gateway_herdr_transport_frame(ctx, config)
     if config.backend != BACKEND_HERDR:
         return None
     # Redmine #13320 (a-narrow, j#73114): an explicit tmux `%pane` target routes on
@@ -379,15 +435,19 @@ def resolve_handoff_transport_binding(
     # `herdr_effective_backend_selected`. `orchestrate_handoff` then runs the tmux
     # path (`require_tmux()` / `pane_info()`), which fails closed on an unresolvable
     # pane exactly as under `backend: tmux` — never a silent herdr fallback.
-    if explicit_tmux_pane_target(args):
+    if is_explicit_pane_target(ctx.target):
         return None
-    return _resolve_herdr_binding(args, config)
+    return _resolve_herdr_binding(ctx, config)
 
 
 def resolve_handoff_transport_runtime(
-    args: argparse.Namespace,
+    source: "argparse.Namespace | HandoffTransportContext",
 ) -> "tuple[Optional[TransportBinding], Optional[HerdrTurnStartRail]]":
     """Resolve the transport binding **and** the herdr turn-start rail in one config read.
+
+    Redmine #15149: like :func:`resolve_handoff_transport_binding`, this takes
+    either the parsed Namespace or the typed :class:`HandoffTransportContext`, so
+    the backend selection on the send path is reachable without a CLI parse.
 
     Redmine #13255 (auditor j#72602 decision 6): under ``terminal_transport.backend:
     herdr`` the standard rail is driven by the event-driven
@@ -405,9 +465,10 @@ def resolve_handoff_transport_runtime(
     herdr+standard branch in ``orchestrate_handoff`` — queue-enter / pending herdr
     sends ignore it and stay on the shim-backed choreography (decision 5).
     """
-    capability = _project_gateway_capability(args)
+    ctx = HandoffTransportContext.coerce(source)
+    capability = _project_gateway_capability(ctx)
     try:
-        config = load_repo_local_config(repo_root_from_args(args)).terminal_transport
+        config = load_repo_local_config(ctx.repo_root).terminal_transport
     except RepoLocalConfigError:
         if capability is not None:
             die(
@@ -416,7 +477,7 @@ def resolve_handoff_transport_runtime(
             )
             raise AssertionError("unreachable")
         return None, None
-    _require_project_gateway_herdr_transport_frame(args, config)
+    _require_project_gateway_herdr_transport_frame(ctx, config)
     if config.backend != BACKEND_HERDR:
         return None, None
     # Redmine #13320 (a-narrow, j#73114): the decorator's branch point. An explicit
@@ -425,9 +486,9 @@ def resolve_handoff_transport_runtime(
     # reads via `herdr_effective_backend_selected`). Narrowing here and in
     # `orchestrate_handoff` together keeps the split whole: a `%pane` send neither
     # gets the herdr shim/rail nor skips `require_tmux()`.
-    if explicit_tmux_pane_target(args):
+    if is_explicit_pane_target(ctx.target):
         return None, None
-    binding = _resolve_herdr_binding(args, config)
+    binding = _resolve_herdr_binding(ctx, config)
     # The binding resolution above already died if the binary is unconfigured /
     # unresolvable, so the rail resolution here rides the same resolved binary and
     # cannot raise for a binary reason; any unexpected TerminalTransportError still
@@ -439,7 +500,7 @@ def resolve_handoff_transport_runtime(
         raise AssertionError("unreachable")
     resolved_target_capability = capability
     if resolved_target_capability is not None:
-        repo_root = Path(repo_root_from_args(args)).expanduser().resolve()
+        repo_root = Path(ctx.repo_root).expanduser().resolve()
         verifier = functools.partial(
             verify_project_gateway_target_effect,
             resolved_target_capability,
@@ -456,44 +517,70 @@ def resolve_handoff_transport_runtime(
     return binding, rail
 
 
-def bind_runtime_transport(fn: Callable[..., int]) -> Callable[..., int]:
-    """Install the config-selected transport binding around a handoff entry (#13253).
+@contextlib.contextmanager
+def runtime_transport_binding(
+    source: "argparse.Namespace | HandoffTransportContext",
+) -> "Iterator[None]":
+    """Install the config-selected transport binding for one send (#13253 / #15149).
 
-    Wraps :func:`orchestrate_handoff` without changing its body. For the herdr
-    backend it swaps the ``commands`` module's ``run_tmux`` / ``capture_pane``
-    globals for the tmux-shaped herdr shim for the duration of the send, and (Redmine
-    #13255) stashes the resolved event-driven turn-start rail on
-    ``commands.active_herdr_turn_start_rail`` so the herdr+standard branch of
-    ``orchestrate_handoff`` can drive it in place of the capture-based observation;
-    all three are restored in a ``finally``. For the tmux default it installs nothing
-    (and leaves the rail slot ``None``).
+    For the herdr backend it swaps the ``commands`` module's ``run_tmux`` /
+    ``capture_pane`` globals for the tmux-shaped herdr shim for the duration of
+    the send, and (Redmine #13255) stashes the resolved event-driven turn-start
+    rail on ``commands.active_herdr_turn_start_rail`` so the herdr+standard
+    branch of the orchestration can drive it in place of the capture-based
+    observation; all three are restored in a ``finally``. For the tmux default it
+    installs nothing (and leaves the rail slot ``None``), so the send is
+    byte-for-byte the current behaviour and any test-patched ``commands.run_tmux``
+    stays in force (the #12932 monkeypatch seam is untouched).
+
+    Redmine #15149 turned the former decorator body into this context manager and
+    moved the installation *inside* the Namespace-free orchestration core, so the
+    backend switch is part of the shared application processing rather than a
+    CLI-entry wrapper. The selection still runs before any send gate, and it still
+    resolves through the module-level :func:`resolve_handoff_transport_runtime`
+    seam.
+    """
+    binding, turn_start_rail = resolve_handoff_transport_runtime(source)
+    if binding is None or binding.backend != BACKEND_HERDR:
+        yield
+        return
+    from mozyo_bridge.application import commands
+
+    saved_run_tmux = commands.run_tmux
+    saved_capture_pane = commands.capture_pane
+    saved_rail = commands.active_herdr_turn_start_rail
+    commands.run_tmux = binding.run_tmux
+    commands.capture_pane = binding.capture_pane
+    commands.active_herdr_turn_start_rail = turn_start_rail
+    try:
+        yield
+    finally:
+        commands.run_tmux = saved_run_tmux
+        commands.capture_pane = saved_capture_pane
+        commands.active_herdr_turn_start_rail = saved_rail
+
+
+def bind_runtime_transport(fn: Callable[..., int]) -> Callable[..., int]:
+    """Decorate a Namespace-taking handoff entry with :func:`runtime_transport_binding`.
+
+    Retained as the Namespace-entry form of the same installation. The
+    orchestration core installs the binding itself (Redmine #15149), so this is
+    no longer applied to ``orchestrate_handoff``; it stays available for any
+    other Namespace-shaped entry that needs the backend swap.
     """
 
     @functools.wraps(fn)
     def wrapper(args: argparse.Namespace, *rest: Any, **kwargs: Any) -> int:
-        binding, turn_start_rail = resolve_handoff_transport_runtime(args)
-        if binding is None or binding.backend != BACKEND_HERDR:
+        with runtime_transport_binding(args):
             return fn(args, *rest, **kwargs)
-        from mozyo_bridge.application import commands
-
-        saved_run_tmux = commands.run_tmux
-        saved_capture_pane = commands.capture_pane
-        saved_rail = commands.active_herdr_turn_start_rail
-        commands.run_tmux = binding.run_tmux
-        commands.capture_pane = binding.capture_pane
-        commands.active_herdr_turn_start_rail = turn_start_rail
-        try:
-            return fn(args, *rest, **kwargs)
-        finally:
-            commands.run_tmux = saved_run_tmux
-            commands.capture_pane = saved_capture_pane
-            commands.active_herdr_turn_start_rail = saved_rail
 
     return wrapper
 
 
 __all__ = (
+    "HandoffTransportContext",
     "bind_runtime_transport",
     "resolve_handoff_transport_binding",
     "resolve_handoff_transport_runtime",
+    "runtime_transport_binding",
 )

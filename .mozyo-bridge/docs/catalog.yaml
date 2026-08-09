@@ -568,6 +568,21 @@ documents:
       - rule-public-private-boundary
       - spec-project-map
 
+  - id: logic-cli-mcp-shared-application-api
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/cli-mcp-shared-application-api.md
+    purpose: "CLIとlocal MCPが同じapplication処理を呼ぶ境界の設計正本 (Redmine #15149 / 親Feature #15148)。判断 (workflow・identity・authority・send safety) をNamespace-freeな共有orchestrationに1本化し、CLIはNamespace adapter、MCPはtyped request/resultのapplication APIとして同一processで呼ぶ。core-owned operation語彙とentry policy表、CommandAbortによるfail-closed carrier、injection-stage authorityによるdelivery判定、typed transport contextを含む。MCPがCLIをsubprocess実行しないこと、APIがCLIの通すgateをskipもaddもしないことを不変条件として固定する。"
+    audit_role: cli_mcp_shared_application_api_logic
+    related_document_refs:
+      - logic-plugin-ready-adapter-boundary
+      - logic-refactor-split-strategy
+      - logic-object-oriented-architecture-policy
+      - logic-tmux-send-safety-contract
+      - logic-ticket-system-neutral-orchestrator
+      - rule-public-private-boundary
+      - spec-project-map
+
   - id: logic-plugin-ready-adapter-boundary
     type: logic
     status: active
@@ -1887,6 +1902,7 @@ file_conventions:
     document_refs:
       - spec-project-map
       - rule-project-agent-workflow
+      - logic-cli-mcp-shared-application-api
       - logic-refactor-split-strategy
       - logic-object-oriented-architecture-policy
       - skill-safety-reference
@@ -2110,10 +2126,17 @@ file_conventions:
       - src/mozyo_bridge/domain/handoff_route_identity.py
       - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/infrastructure/tmux_client.py
       - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/infrastructure/queue_reader.py
+      - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff_operation.py
+      - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/handoff_application_service.py
+      - src/mozyo_bridge/application/handoff_transport_wiring.py
       - tests/unit/e_110_execution_platform/f_130_handoff_routing/test_handoff_same_lane_gateway.py
+      - tests/unit/e_110_execution_platform/f_130_handoff_routing/test_handoff_operation_policy.py
+      - tests/unit/e_110_execution_platform/f_130_handoff_routing/test_handoff_application_service.py
+      - tests/integration/e_110_execution_platform/f_130_handoff_routing/test_handoff_application_api_parity.py
       - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_route_identity_ledger.py
     severity: block
     document_refs:
+      - logic-cli-mcp-shared-application-api
       - logic-tmux-send-safety-contract
       - spec-route-identity-ledger
       - logic-unit-target-model

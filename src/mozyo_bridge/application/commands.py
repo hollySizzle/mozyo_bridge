@@ -6,6 +6,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Any, Callable
 
 # ``run_doctor`` / ``format_doctor_text`` stay importable here as the preserved
 # ``commands.run_doctor`` / ``commands.format_doctor_text`` monkeypatch seams:
@@ -143,6 +144,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_command_input_adapter import (
     HandoffNamespaceAdapter,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_command_input import (
+    HandoffCommandInput,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_envelope_planner import (
     EnvelopePlanError,
     HandoffEnvelopePlanner,
@@ -196,14 +200,14 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.
     source_tmux_conf,
 )
 # Runtime terminal-transport backend switch (Redmine #13253). The wiring lives in
-# its own module so ``commands.py`` does not grow; the decorator resolves the
-# repo-local ``terminal_transport`` selection and, only for the opt-in herdr
-# backend, swaps this module's ``run_tmux`` / ``capture_pane`` for a tmux-shaped
-# herdr shim around the send — the tmux default installs nothing (byte-for-byte).
-from mozyo_bridge.application.handoff_transport_wiring import bind_runtime_transport
+# its own module so ``commands.py`` does not grow; for the opt-in herdr backend it
+# swaps this module's ``run_tmux`` / ``capture_pane`` for a tmux-shaped herdr shim
+# around the send (the tmux default installs nothing, byte-for-byte). Redmine #15149
+# moved that installation from a Namespace decorator into
+# ``runtime_transport_binding``, entered by the shared ``orchestrate_handoff_input``.
 
 # Redmine #13255: the herdr event-driven turn-start rail installed by
-# ``bind_runtime_transport`` for the duration of a herdr send. ``None`` for the
+# ``runtime_transport_binding`` for the duration of a herdr send. ``None`` for the
 # tmux default (and outside a send); the herdr+standard branch of
 # ``orchestrate_handoff`` reads it to drive the rail in place of the capture-based
 # ``_observe_standard_turn_start``. Module-global (like the ``run_tmux`` /
@@ -1611,17 +1615,24 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.del
 )
 
 
-@bind_runtime_transport
-def orchestrate_handoff(
-    args: argparse.Namespace,
+def run_handoff_orchestration(
+    inp: HandoffCommandInput,
     *,
-    default_kind: str | None = None,
-    require_receiver_binding: bool = False,
-    ticketless: bool = False,
-    ticketless_consultation: bool = False,
-    ticketless_work_intake: bool = False,
+    repo_root: Path,
+    publish: Callable[[Any], None],
+    resolved_herdr_target_capability: Any = None,
+    emit_outcome: Callable[..., None] | None = None,
 ) -> int:
     """High-level handoff/reply primitive.
+
+    Redmine #15149: the **shared application processing** the CLI and the typed
+    application API (the boundary a local MCP server calls) both run. It takes the
+    typed ``HandoffCommandInput`` — never a Namespace — plus the resolved repo
+    root, the caller's delivery-outcome ``publish`` hand-back, the stashed
+    project-gateway capability, and the record ``emit_outcome`` sink (the printing
+    CLI one by default), so every gate below is reached identically by both
+    callers. Both enter through ``handoff_application_service`` /
+    ``orchestrate_handoff_input``, which installs the transport binding.
 
     Owns: receiver-pane resolution, agent-target validation, internal pane
     snapshot, marker-prefixed type, landing wait, fail-closed C-u rollback,
@@ -1652,18 +1663,6 @@ def orchestrate_handoff(
     would let an explicit `%pane` for a foreign Claude pane be typed into under
     a ``to=codex`` marker, defeating the gateway boundary.
     """
-    # Redmine #13729 (tranche 1): the Namespace ends here. Scalar inputs + entry
-    # policy convert once into the typed `HandoffCommandInput`; `args` still
-    # carries the mutated `target_repo` and threads to the not-yet-extracted
-    # target/transport helpers (design j#78394 Tasks 3-4).
-    inp = HandoffNamespaceAdapter.from_namespace(
-        args,
-        default_kind=default_kind,
-        require_receiver_binding=require_receiver_binding,
-        ticketless=ticketless,
-        ticketless_consultation=ticketless_consultation,
-        ticketless_work_intake=ticketless_work_intake,
-    )
     # Redmine #13729 tranche 2: the Anchor/Profile Envelope Planner (design j#78394).
     envelope_planner = HandoffEnvelopePlanner()
 
@@ -1671,21 +1670,13 @@ def orchestrate_handoff(
     # step on it. Under herdr a pure session has no tmux server, so `require_tmux()`
     # (and the tmux gates below) must not run; the target is resolved herdr-natively.
     # #13320 (a-narrow): an explicit `%pane` target still rides the tmux rail even under
-    # herdr — the effective predicate (also read by `@bind_runtime_transport`) narrows.
+    # herdr — the effective predicate (also read by `runtime_transport_binding`) narrows.
     # R3-F1: every terminal outcome (incl. the herdr event rail) publishes via this emitter.
-    # Redmine #13729: the emitter takes a facade-owned publish callback (not the
-    # Namespace); the facade writes the delivery outcome onto its own `args` — its
-    # caller wrappers read it back via `delivery_was_positive(args)` after this
-    # returns — so the outcome hand-back stays byte-identical while the emitter and
-    # every deep helper are Namespace-free.
-    _emit = _make_publishing_emitter(
-        lambda outcome: _publish_delivery_outcome(args, outcome), _emit_outcome
-    )
-    # Redmine #13729: the facade's single Namespace->Path boundary conversion. The
-    # herdr backend predicate already resolves this repo root unconditionally, so
-    # computing it once here (and passing it to the herdr helpers + the profile
-    # block) is behaviour-neutral and keeps `repo_root_from_args` off the deep path.
-    repo_root = repo_root_from_args(args)
+    # Redmine #13729 / #15149: the emitter takes caller-owned `publish` + `emit_outcome`
+    # callbacks (not the Namespace). The CLI writes the outcome onto its own `args` and
+    # prints the record; the typed API captures both into its typed result without a
+    # stdout channel. The gate sequence below is identical for either.
+    _emit = _make_publishing_emitter(publish, emit_outcome or _emit_outcome)
     herdr_send = herdr_effective_backend_selected(repo_root=repo_root, target=inp.target)
     if not herdr_send:
         require_tmux()
@@ -1814,7 +1805,7 @@ def orchestrate_handoff(
             record_command=record_command,
             resolved_target_repo=resolved_target_repo,
             herdr_send=herdr_send,
-            resolved_herdr_target_capability=getattr(args, RESOLVED_TARGET_CAPABILITY_ARG, None),
+            resolved_herdr_target_capability=resolved_herdr_target_capability,
         ),
         emit=_emit,
     )
@@ -1963,7 +1954,7 @@ def orchestrate_handoff(
     # refuses to inject at all (no body, no Enter) and fails closed. tmux stays
     # byte-identical, and herdr non-standard sends (pending / queue-enter) keep the
     # common shim-backed choreography (auditor j#72602 decisions 1/2/3/5). The rail is
-    # stashed on `active_herdr_turn_start_rail` by `bind_runtime_transport`.
+    # stashed on `active_herdr_turn_start_rail` by `runtime_transport_binding`.
     if herdr_send and mode == MODE_STANDARD:
         # Redmine #13729 tranche 3: the herdr event-driven turn-start rail slice owns its own
         # control flow (returns / dies without falling through). It is carved into the typed
@@ -2040,6 +2031,45 @@ def orchestrate_handoff(
             restore_previous_active=admission_policy.restore_previous_active,
         ),
         emit=_emit,
+    )
+
+
+def orchestrate_handoff(
+    args: argparse.Namespace,
+    *,
+    default_kind: str | None = None,
+    require_receiver_binding: bool = False,
+    ticketless: bool = False,
+    ticketless_consultation: bool = False,
+    ticketless_work_intake: bool = False,
+) -> int:
+    """CLI Namespace adapter over the shared orchestration (Redmine #15149).
+
+    The Namespace ends here: the parsed scalars + entry policy convert once into
+    the typed ``HandoffCommandInput`` (#13729 tranche 1), the last two Namespace
+    reads (repo root, stashed project-gateway capability) resolve here, and the
+    delivery-outcome hand-back goes down as the ``publish`` callback so the caller
+    wrappers keep reading it off ``args`` via ``delivery_was_positive(args)``.
+    Behaviour, exit codes, printed records, and every gate are unchanged.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_application_service import (  # noqa: E501
+        orchestrate_handoff_input,
+    )
+
+    return orchestrate_handoff_input(
+        HandoffNamespaceAdapter.from_namespace(
+            args,
+            default_kind=default_kind,
+            require_receiver_binding=require_receiver_binding,
+            ticketless=ticketless,
+            ticketless_consultation=ticketless_consultation,
+            ticketless_work_intake=ticketless_work_intake,
+        ),
+        repo_root=repo_root_from_args(args),
+        publish=lambda outcome: _publish_delivery_outcome(args, outcome),
+        resolved_herdr_target_capability=getattr(
+            args, RESOLVED_TARGET_CAPABILITY_ARG, None
+        ),
     )
 
 

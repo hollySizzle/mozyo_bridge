@@ -4477,6 +4477,14 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             ['handoff'],
             "inherits via a used import of handoff; names no marker token itself",
         ),
+        "src/mozyo_bridge/application/handoff_transport_wiring.py": (
+            ['handoff'],
+            "inherits via a used import of handoff for the pure `is_explicit_pane_target` "
+            "target-kind predicate (Redmine #15149 replaced the Namespace-taking "
+            "`explicit_tmux_pane_target` with it so the transport-backend selection reads a "
+            "typed context instead of a parsed Namespace); names no marker token itself, "
+            "renders none, and reads no durable note — it selects a terminal transport backend",
+        ),
         "src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_session_retire_ops.py": (
             ['*', '*', '*', '*', '*:_MARKER_RE', '*:_MARKER_RE', 'handoff'],
             "inherits via a used import of sublane_quarantine, dispatch_authorization, dispatch_disposition, redmine_journal_source; names no marker token itself",

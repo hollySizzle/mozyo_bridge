@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 2266
+    lines: 2296
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -1165,6 +1165,19 @@ allowlist:
       stays deferred to the facade, after every die-able gate AND the startup-admission gate. Net
       -594. Shared baseline change: reconcile at integration if another tranche/lane also edits this
       file.
+      Raised 2266 -> 2296 for the #15149 CLI/MCP shared application API split: the
+      handoff orchestration body became the Namespace-free
+      `run_handoff_orchestration(inp, repo_root=..., publish=..., emit_outcome=...)`
+      that the CLI and the typed application API (the boundary a local MCP server
+      calls) both run, and `orchestrate_handoff` became the thin CLI Namespace
+      adapter over it — so the +30 is a NEW entry adapter, not new logic: the body's
+      own Namespace reads went from three to zero and the `@bind_runtime_transport`
+      decorator moved out to `runtime_transport_binding`. The typed API, the operation
+      entry-policy table, and the transport context live in
+      `f_130_handoff_routing/application/handoff_application_service.py`,
+      `f_130_handoff_routing/domain/handoff_operation.py`, and
+      `application/handoff_transport_wiring.py`, not here. The next reduction for this
+      module stays the #12638 / #12785 residual-orchestration carve, unchanged.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
