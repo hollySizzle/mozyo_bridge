@@ -49,6 +49,23 @@ def _run(argv) -> tuple[int, str]:
     return int(rc or 0), buf.getvalue()
 
 
+def _parse(argv):
+    """Parse OUTSIDE any platform patch, then run inside it.
+
+    Building the parser imports the whole CLI tree, and some of those imports branch on
+    ``sys.platform`` (a win32 patch sends ``multiprocessing`` looking for ``_winapi``). Parsing
+    first keeps a platform-patched test from depending on which other test imported the tree first.
+    """
+    return build_parser().parse_args(argv)
+
+
+def _invoke(args) -> tuple[int, str]:
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = args.func(args)
+    return int(rc or 0), buf.getvalue()
+
+
 class _ServiceCliCase(unittest.TestCase):
     """Base: a hermetic mozyo home + OS user home, with the host scheduler roots isolated."""
 
@@ -246,10 +263,11 @@ class CliServiceDefinitionRosterTest(_ServiceCliCase):
     """Declarative definitions must describe what the backend actually owns (review j#102053 F6)."""
 
     def _json_status(self, platform: str) -> dict:
+        args = _parse(
+            ["workflow", "supervisor", "--service-status", "--home", self.home, "--json"]
+        )
         with self._isolated_host(platform):
-            _rc, out = _run(
-                ["workflow", "supervisor", "--service-status", "--home", self.home, "--json"]
-            )
+            _rc, out = _invoke(args)
         return json.loads(out)
 
     def test_linux_status_declares_no_drain_service_it_does_not_own(self) -> None:
@@ -263,12 +281,25 @@ class CliServiceDefinitionRosterTest(_ServiceCliCase):
         self.assertEqual(payload["definitions"][0]["command"][-1], "--run-once")
 
     def test_the_definition_roster_matches_the_agent_roster(self) -> None:
-        for platform in ("linux", "darwin"):
+        # EVERY backend, including the unsupported host. Covering only the two supported platforms
+        # is what let the unsupported path ship with agents=0 beside definitions=1 — the invariant
+        # this key exists to state (review j#102069 Finding 8).
+        for platform in ("linux", "darwin", "win32"):
             payload = self._json_status(platform)
             self.assertEqual(
                 len(payload["definitions"]), len(payload["agents"]),
                 f"{platform}: definitions must be 1:1 with owned services",
             )
+
+    def test_an_unsupported_host_owns_no_service_and_declares_none(self) -> None:
+        payload = self._json_status("win32")
+        self.assertEqual(payload["backend"], sb.BACKEND_UNSUPPORTED)
+        self.assertEqual(payload["agents"], [])
+        self.assertEqual(payload["definitions"], [])
+        self.assertNotIn("drain_definition", payload)
+        # The would-be primary definition stays available to readers that predate the roster; it is
+        # not a claim that anything is installed.
+        self.assertEqual(payload["definition"]["command"][-1], "--run-once")
 
     def test_macos_keeps_its_drain_definition_key(self) -> None:
         payload = self._json_status("darwin")

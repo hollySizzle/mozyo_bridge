@@ -371,15 +371,23 @@ def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
         # The declarative definitions must describe what this backend actually OWNS. Emitting the
         # drain definition unconditionally told a Linux reader that a `--drain-only` service exists
         # when the host runs one `--run-once` timer (review j#102053 Finding 6). ``definitions`` is
-        # the roster, aligned 1:1 with ``agents``; ``definition`` / ``drain_definition`` stay for the
-        # macOS shape that already had them, and ``drain_definition`` is simply absent where no
-        # drain service is owned.
-        owned_definitions = [definition]
-        if backend == supervisor_service_backend.BACKEND_LAUNCHD:
-            owned_definitions.append(drain_definition)
+        # the roster, aligned 1:1 with ``agents``.
+        #
+        # Deriving it per backend — rather than seeding it with the primary definition and adding to
+        # it — is what makes the unsupported host correct too: a host with no adapter owns NOTHING,
+        # so it must advertise an empty roster next to its empty ``agents``. Seeding produced
+        # ``agents=0`` beside ``definitions=1``, breaking the very invariant this key introduced
+        # (review j#102069 Finding 8).
+        owned_definitions = {
+            supervisor_service_backend.BACKEND_LAUNCHD: [definition, drain_definition],
+            supervisor_service_backend.BACKEND_SYSTEMD: [definition],
+            supervisor_service_backend.BACKEND_UNSUPPORTED: [],
+        }[backend]
+        # ``definition`` stays an always-present scalar for readers that predate the roster; it is
+        # the would-be primary definition, not a claim that a service is installed.
         payload["definition"] = definition.as_payload()
         payload["definitions"] = [d.as_payload() for d in owned_definitions]
-        if len(owned_definitions) > 1:
+        if drain_definition in owned_definitions:
             payload["drain_definition"] = drain_definition.as_payload()
         lines = ["action: service-status", f"backend: {backend}"]
         for index, host in enumerate(status.get("agents", ())):
