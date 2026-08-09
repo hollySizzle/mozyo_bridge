@@ -1,9 +1,16 @@
-"""`workflow supervisor` CLI tests (Redmine #13683 Phase B1).
+"""`workflow supervisor` CLI tests (Redmine #13683 Phase B1; #15183 backend dispatch).
 
 Pins the facade: run-once / status over a hermetic temp home, and the service lifecycle command
 contract — service-status is a redacted projection + secret-free definition (exit 0), while
-install / restart / uninstall drive the owned LaunchAgent and fail-closed (exit non-zero, zero
-mutation) on a non-darwin host. Real launchctl is never invoked here (patched).
+install / restart / uninstall drive the owned scheduler pair and fail-closed (exit non-zero, zero
+mutation) when the host cannot run it.
+
+Redmine #15183: the same four verbs now dispatch by platform — the macOS LaunchAgent pair on darwin,
+the systemd **user** service+timer pair on Linux, a typed refusal anywhere else — so every service
+test below pins the backend it means to exercise instead of inheriting the runner's OS. Real
+``launchctl`` / ``systemctl`` are never invoked here (patched), and both the OS user home and
+``XDG_CONFIG_HOME`` are isolated so a projection never reads or writes the host's real
+``~/Library/LaunchAgents`` or ``~/.config/systemd/user`` (Redmine #14103).
 """
 
 from __future__ import annotations
@@ -11,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -23,6 +31,8 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.application.cli import build_parser
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
     supervisor_launchd as sl,
+    supervisor_service_backend as sb,
+    supervisor_systemd as ss,
 )
 
 
@@ -39,30 +49,44 @@ def _run(argv) -> tuple[int, str]:
     return int(rc or 0), buf.getvalue()
 
 
-class CliWorkflowSupervisorTest(unittest.TestCase):
+class _ServiceCliCase(unittest.TestCase):
+    """Base: a hermetic mozyo home + OS user home, with the host scheduler roots isolated."""
+
     def setUp(self) -> None:
         self.home = str(Path(tempfile.mkdtemp()))
-        # A hermetic OS user home for the owned LaunchAgent plist/log, so the
-        # projection never reads the dogfood host's real ~/Library/LaunchAgents
-        # (Redmine #14103). --home is the mozyo home and by design never
-        # relocates the plist, so the plist root is isolated via Path.home().
+        # A hermetic OS user home for the owned scheduler artifacts. --home is the mozyo home and
+        # by design never relocates them, so their root is isolated via Path.home() — and, for the
+        # systemd adapter, by pointing XDG_CONFIG_HOME at the same temp root (its unit directory
+        # honours that variable exactly as the user manager does).
         self.os_home = Path(tempfile.mkdtemp())
 
-    def _service_status(self) -> tuple[int, str]:
-        """Run ``--service-status`` with both host reads isolated: launchctl is a
-        fake subprocess and ``Path.home()`` resolves to a temp root, so
-        ``installed`` reflects only the plist this test controls under
-        ``self.os_home`` — never the host's installed service."""
-        with patch.object(sl.subprocess, "run", side_effect=_fake_run), patch(
-            "pathlib.Path.home", return_value=self.os_home
+    @contextlib.contextmanager
+    def _isolated_host(self, platform: str, *, run=_fake_run):
+        """Pin the dispatched backend AND isolate every host root it would touch."""
+        module = sl if platform == "darwin" else ss
+        with patch.object(sys, "platform", platform), patch.object(
+            module.subprocess, "run", side_effect=run
+        ), patch("pathlib.Path.home", return_value=self.os_home), patch.dict(
+            os.environ, {"XDG_CONFIG_HOME": str(self.os_home / ".config")}, clear=False
         ):
-            return _run(["workflow", "supervisor", "--service-status", "--home", self.home, "--json"])
+            yield
+
+    def _service_status(self, platform: str, *, run=_fake_run) -> tuple[int, str]:
+        with self._isolated_host(platform, run=run):
+            return _run(
+                ["workflow", "supervisor", "--service-status", "--home", self.home, "--json"]
+            )
+
+
+class CliServiceStatusLaunchdTest(_ServiceCliCase):
+    """The darwin dispatch: the owned LaunchAgent pair answers ``--service-status``."""
 
     def test_service_status_reports_projection_and_definition_exit_zero(self) -> None:
-        rc, out = self._service_status()
+        rc, out = self._service_status("darwin")
         self.assertEqual(rc, 0)
         payload = json.loads(out)
-        # Redmine #14150: the projection is now the owned PAIR (reconcile + drain agents).
+        self.assertEqual(payload["backend"], sb.BACKEND_LAUNCHD)
+        # Redmine #14150: the projection is the owned PAIR (reconcile + drain agents).
         agents = payload["agents"]
         self.assertEqual(len(agents), 2)
         reconcile, drain = agents
@@ -88,7 +112,7 @@ class CliWorkflowSupervisorTest(unittest.TestCase):
         target.parent.mkdir(parents=True, exist_ok=True)
         argv = ["/opt/bin/mozyo-bridge", "workflow", "supervisor", "--run-once", "--home", self.home]
         target.write_bytes(sl.render_plist(argv, interval_seconds=300, os_home=self.os_home))
-        rc, out = self._service_status()
+        rc, out = self._service_status("darwin")
         self.assertEqual(rc, 0)
         payload = json.loads(out)
         reconcile = payload["agents"][0]
@@ -97,16 +121,105 @@ class CliWorkflowSupervisorTest(unittest.TestCase):
         # The drain agent was NOT installed, so the pair projection distinguishes them.
         self.assertFalse(payload["agents"][1]["installed"])
 
-    def test_mutating_verbs_fail_closed_zero_mutation_on_non_darwin(self) -> None:
+    def test_mutating_verbs_fail_closed_zero_mutation_when_launchd_refuses(self) -> None:
         with patch.object(sl, "_running_on_darwin", return_value=False), patch.object(
-            sl.subprocess, "run", side_effect=AssertionError("launchctl must not run")
-        ):
+            sys, "platform", "darwin"
+        ), patch.object(sl.subprocess, "run", side_effect=AssertionError("launchctl must not run")):
             for verb in ("--install", "--restart", "--uninstall"):
                 rc, out = _run(["workflow", "supervisor", verb, "--home", self.home, "--json"])
                 payload = json.loads(out)
                 self.assertEqual(rc, 1, verb)
                 self.assertFalse(payload["performed"], verb)
                 self.assertEqual(payload["reason"], sl.REASON_UNSUPPORTED_PLATFORM, verb)
+
+
+class CliServiceStatusSystemdTest(_ServiceCliCase):
+    """The Linux dispatch (Redmine #15183): the owned systemd user pair answers the same verbs."""
+
+    def test_service_status_reports_the_systemd_projection_exit_zero(self) -> None:
+        rc, out = self._service_status("linux")
+        self.assertEqual(rc, 0)
+        payload = json.loads(out)
+        self.assertEqual(payload["backend"], sb.BACKEND_SYSTEMD)
+        reconcile, drain = payload["agents"]
+        self.assertFalse(reconcile["installed"])
+        self.assertFalse(reconcile["loaded"])
+        self.assertEqual(reconcile["service_unit"], ss.SERVICE_UNIT_NAME)
+        self.assertEqual(drain["timer_unit"], ss.DRAIN_TIMER_UNIT_NAME)
+        self.assertNotEqual(reconcile["label"], drain["label"])
+        # The declarative definitions are the same secret-free pair on both backends.
+        self.assertEqual(payload["definition"]["command"][-1], "--run-once")
+        self.assertEqual(payload["drain_definition"]["command"][-1], "--drain-only")
+        self.assertNotIn("api_key", out.lower())
+        self.assertNotIn(self.home, out)
+
+    def test_service_status_reports_installed_when_owned_units_present(self) -> None:
+        for unit in ss.SUPERVISOR_UNITS:
+            path = ss.service_unit_path(self.os_home, unit=unit)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                ss.render_service_unit(
+                    ["/opt/bin/mozyo-bridge", *unit.argv_tail, "--home", self.home], unit=unit
+                ),
+                encoding="utf-8",
+            )
+            ss.timer_unit_path(self.os_home, unit=unit).write_text(
+                ss.render_timer_unit(interval_seconds=unit.default_interval_seconds, unit=unit),
+                encoding="utf-8",
+            )
+        rc, out = self._service_status("linux")
+        self.assertEqual(rc, 0)
+        payload = json.loads(out)
+        self.assertTrue(payload["agents"][0]["installed"])
+        self.assertTrue(payload["agents"][1]["installed"])
+
+    def test_mutating_verbs_fail_closed_zero_mutation_with_no_user_manager(self) -> None:
+        # A container with no user bus is explicitly unsupported, never a silent degrade to
+        # "installed but never scheduled".
+        def _no_manager(argv, *a, **k):
+            return type("R", (), {"returncode": 1, "stdout": "", "stderr": "no bus"})()
+
+        for verb in ("--install", "--restart", "--uninstall"):
+            with self._isolated_host("linux", run=_no_manager):
+                rc, out = _run(["workflow", "supervisor", verb, "--home", self.home, "--json"])
+            payload = json.loads(out)
+            self.assertEqual(rc, 1, verb)
+            self.assertFalse(payload["performed"], verb)
+            self.assertEqual(payload["reason"], ss.REASON_USER_MANAGER_UNAVAILABLE, verb)
+            self.assertEqual(payload["backend"], sb.BACKEND_SYSTEMD, verb)
+        self.assertFalse(ss.unit_dir(self.os_home).exists())
+
+
+class CliServiceUnsupportedHostTest(_ServiceCliCase):
+    """A host with no owned scheduler adapter is a typed refusal, never a silent no-op."""
+
+    def test_mutating_verbs_refuse_with_a_typed_backend_token(self) -> None:
+        for verb in ("--install", "--restart", "--uninstall"):
+            with patch.object(sys, "platform", "win32"):
+                rc, out = _run(["workflow", "supervisor", verb, "--home", self.home, "--json"])
+            payload = json.loads(out)
+            self.assertEqual(rc, 1, verb)
+            self.assertFalse(payload["performed"], verb)
+            self.assertEqual(payload["reason"], sb.REASON_NO_BACKEND, verb)
+            self.assertEqual(payload["backend"], sb.BACKEND_UNSUPPORTED, verb)
+
+    def test_service_status_still_exits_zero_and_mutates_nothing(self) -> None:
+        with patch.object(sys, "platform", "win32"):
+            rc, out = _run(
+                ["workflow", "supervisor", "--service-status", "--home", self.home, "--json"]
+            )
+        self.assertEqual(rc, 0)
+        payload = json.loads(out)
+        self.assertEqual(payload["backend"], sb.BACKEND_UNSUPPORTED)
+        self.assertEqual(payload["agents"], [])
+        self.assertFalse(payload["platform_supported"])
+        # The secret-free declarative definitions are still projected.
+        self.assertEqual(payload["definition"]["command"][-1], "--run-once")
+
+
+class CliWorkflowSupervisorTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.home = str(Path(tempfile.mkdtemp()))
 
     def test_status_over_empty_home_exits_zero(self) -> None:
         rc, out = _run(["workflow", "supervisor", "--status", "--home", self.home, "--json"])

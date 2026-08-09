@@ -495,14 +495,57 @@ sleep/poll を要求しない。reconciliation 経路（`--run-once`）と drain
 別 service definition（`build_service_definition(local_drain=...)`）として表現し、portable default は
 測定に基づく neutral 値（固定の私的運用値を OSS 既定へ焼かない）を持つ。
 
-macOS LaunchAgent の realization は **owned dual-agent lifecycle**（`supervisor_launchd` の `install_pair` /
+この adapter 契約は **platform-neutral core + host realization** に分かれる（#15183）。platform-neutral core
+（`supervisor_service_common`）は、scheduled tick が実行する argv（PATH 解決済みの絶対 executable + bounded
+argv tail + pin された `--home <mozyo root>`）、**daemon-effective** credential readiness（empty environ +
+pin された mozyo home で判定するため、installer の shell env / `MOZYO_BRIDGE_HOME` が false ready を作れない）、
+installed 側 `--home` pin の健全性語彙、fail-closed refusal token 語彙を持つ。host realization はこの core を
+共有し、host 固有の「installed とは何か」だけを実装する。したがって片方の adapter だけが直る drift が起きない。
+
+**macOS LaunchAgent** の realization は **owned dual-agent lifecycle**（`supervisor_launchd` の `install_pair` /
 `uninstall_pair` / `restart_pair` / `service_status_pair`）: 二つの独立した owned label / plist / log
 （`callback-supervisor` と `callback-supervisor.drain`）を管理する。install は **atomic-or-nothing** で、
 reconcile agent が失敗すれば何もせず、reconcile 成功後に drain agent が失敗すれば両 agent を rollback
 （partial failure で half-installed pair を残さない fail-closed）。各 verb は非 darwin / 実行ファイル欠落 /
 credential 未整備 / not-loaded で zero-mutation 拒否し、既存の RunAtLoad + StartInterval（KeepAlive なし、
-EnvironmentVariables なし）契約を両 agent で維持する。`workflow supervisor --service-status` は両 agent の
-redacted host 投影と両 definition を表示する。
+EnvironmentVariables なし）契約を両 agent で維持する。
+
+**Linux systemd user timer** の realization（`supervisor_systemd`）は同じ dual-pair lifecycle を同じ verb 名で
+提供する。owned artifact は XDG user unit directory（`$XDG_CONFIG_HOME/systemd/user`、既定
+`~/.config/systemd/user`）下の service + timer 2 組である。対応関係は次の 1 対 1 である:
+
+| LaunchAgent | systemd user | 意味 |
+| --- | --- | --- |
+| `RunAtLoad` | `[Timer] OnActiveSec=0s` | timer が active になった瞬間に 1 回実行（`enable --now` と以後の user manager 起動の両方を覆う） |
+| `StartInterval=<N>` | `[Timer] OnUnitActiveSec=<N>s` | 前回実行から N 秒後に再実行 |
+| `KeepAlive` 不在 | `Restart=` / `RemainAfterExit=` 不在 + `Type=oneshot` | bounded one-shot を常駐化・tight relaunch loop 化しない（false 設定ではなく **構造的に不在**） |
+| `EnvironmentVariables` 不在 | `Environment=` / `EnvironmentFile=` 不在 | unit に secret を書き込む code path が存在しない |
+| `ProgramArguments` | `ExecStart`（token ごとに systemd quote） | shell string ではない構造化 argv。`/bin/sh -c` を経由しない |
+
+service unit は `[Install]` を持たない（enable するのは timer のみ。service を直接 enable すると login 時 1 回
+だけ実行され cadence が消える）。timer は `OnCalendar` / `Persistent=` を持たない（取りこぼしの replay は不要で、
+次 tick が前 tick の未処理を reconcile する）。log は systemd journal に出るため owned log path を作らず、unit
+directory 以外へ書かない。systemctl 呼び出しは常に構造化 argv（`daemon-reload` / `enable --now` /
+`disable --now` / `stop` / `restart` / `show`）で、shell を経由しない。zero-mutation 拒否条件は macOS と同じ集合
+に、**systemd user manager 到達不能**（`systemctl` 不在、または user bus に到達できない container / no-session
+環境）を加えたものである。uninstall は unit file を消すだけでは足りず、最後に `reset-failed` で manager 側の
+状態も消す: 実行中の sweep を `stop` すると one-shot は SIGTERM で終了するため systemd が `failed` を記録し、
+file 削除後もその記録が `not-found`/`failed` entry として manager に残る（#15183 の installed-artifact smoke で
+実測。fake runner の hermetic test では manager 側状態を観測できない）。launchd の `bootout` は痕跡を残さない
+ため、「owned artifact だけを正確に消す」は manager 側 residue も残さないことを含む。user manager を持たない環境は「install したが永久に schedule されない」に degrade
+させず、明示的に unsupported として拒否する。restart は owned timer が active な場合だけ作用し、installed
+`ExecStart` が今 install するはずの command と一致しない場合は drift として拒否する（reinstall が正道）。
+
+どちらの realization を使うかは `supervisor_service_backend` が platform で解決する（darwin -> LaunchAgent、
+Linux -> systemd user、それ以外 -> typed zero-mutation refusal）。同 module が dispatch 済みの
+`install_pair` / `restart_pair` / `uninstall_pair` / `service_status_pair` を公開し、consumer は adapter module
+を直接 import しない（直接 import は process の寿命の間 consumer を単一 OS へ縛るため）。すべての結果と status
+投影は解決された `backend` token を持つので、どの adapter が答えたかは常に読める。
+`workflow supervisor --service-status` は解決された backend、両 service の redacted host 投影、両 definition を
+表示する。
+
+いずれの realization も独自常駐 daemon・無限 poll を導入せず、worktree / local branch / remote branch を削除せず、
+#15066 の managed process / lifecycle 退役境界を変更しない。
 
 ## 現行0.12.2と目標状態の差
 

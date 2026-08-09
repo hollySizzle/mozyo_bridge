@@ -16,14 +16,17 @@ Actions (mutually exclusive):
 - ``--status`` — read-only: the registry workspaces, current supervisor leases, and the
   home-scoped runtime-store event count + callback-outbox backlog. Mutates nothing.
 - ``--service-status`` / ``--install`` / ``--restart`` / ``--uninstall`` — the **service lifecycle
-  command contract**, realized in Phase B1 as the owned macOS LaunchAgent lifecycle
-  (:mod:`...application.supervisor_launchd`). ``--service-status`` prints a redacted host-service
-  projection (plist / loaded / pid / scheduled interval / executable-match / credential readiness) +
-  the secret-free declarative definition. ``--install`` / ``--restart`` / ``--uninstall`` drive the
-  owned LaunchAgent: the scheduled ``--run-once`` sweep is wired with ``RunAtLoad`` + ``StartInterval``
-  (never ``KeepAlive``) and a plist carrying **no** ``EnvironmentVariables``. They exit 0 on a
-  performed action and non-zero on a fail-closed refusal (non-darwin, missing executable, non-ready
-  credential, restart-not-loaded), touching nothing but the owned label / plist.
+  command contract**, realized by whichever OS scheduler owns the host
+  (:mod:`...application.supervisor_service_backend`): the owned macOS LaunchAgent pair
+  (:mod:`...application.supervisor_launchd`) or the owned Linux systemd **user** service+timer pair
+  (:mod:`...application.supervisor_systemd`, Redmine #15183). ``--service-status`` prints a redacted
+  host-service projection (installed / loaded / pid / scheduled interval / executable-match /
+  credential readiness) + the secret-free declarative definition. ``--install`` / ``--restart`` /
+  ``--uninstall`` drive the owned services: the scheduled sweep is wired run-at-load +
+  fixed-interval (never a KeepAlive / ``Restart=`` relaunch loop) with **no** environment block in
+  any unit. They exit 0 on a performed action and non-zero on a fail-closed refusal (wrong platform,
+  no host service manager, missing executable, non-ready credential, restart-not-scheduled),
+  touching nothing but the owned labels / unit files.
 
 A source / store error is a ``SystemExit`` with a redacted message (never a credential / URL /
 pane id / absolute path).
@@ -273,46 +276,56 @@ def _drain_service_definition(args: argparse.Namespace):
 
 
 def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
-    """The service lifecycle command contract (Phase B1: macOS LaunchAgent lifecycle, DUAL agent).
+    """The service lifecycle command contract, on whichever OS scheduler owns this host.
 
-    Redmine #14150: the split runs TWO owned bounded one-shot LaunchAgents — the coarse
-    provider-reconciliation agent (``--run-once``) and the finer local-drain agent (``--drain-only``).
-    ``--service-status`` reports the redacted host projection of BOTH agents + both secret-free
+    Redmine #14150: the split runs TWO owned bounded one-shot services — the coarse
+    provider-reconciliation one (``--run-once``) and the finer local-drain one (``--drain-only``).
+    Redmine #15183: which host adapter realizes them is resolved by platform
+    (:mod:`...application.supervisor_service_backend`) — the macOS LaunchAgent pair on darwin, the
+    systemd **user** service+timer pair on Linux — so one operator command means the same thing on
+    both, and a host with neither is a typed zero-mutation refusal rather than a silent no-op. Both
+    adapters expose the identical ``*_pair`` surface, so nothing below branches on platform; the
+    resolved ``backend`` token is carried in every payload so a reader can tell which one answered.
+
+    ``--service-status`` reports the redacted host projection of BOTH services + both secret-free
     definitions (exit 0, mutates nothing). ``--install`` / ``--restart`` / ``--uninstall`` drive the
-    owned PAIR (:mod:`...application.supervisor_launchd` ``*_pair``): install is atomic-or-nothing (a
-    partial failure rolls the first agent back), so an operator never ends up with a half-installed
-    pair. They exit 0 only when BOTH agents performed, and non-zero on any fail-closed refusal
-    (non-darwin / missing executable / non-ready credential / not-loaded), touching nothing but the
-    two owned labels / plists.
+    owned PAIR: install is atomic-or-nothing (a partial failure rolls the first one back), so an
+    operator never ends up with a half-installed pair. They exit 0 only when BOTH performed, and
+    non-zero on any fail-closed refusal (wrong platform / no host service manager / missing
+    executable / non-ready credential / not-scheduled), touching nothing but the owned units.
     """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
-        supervisor_launchd,
+        supervisor_service_backend,
     )
 
     as_json = bool(getattr(args, "as_json", False))
     # The supervisor CLI's ``--home`` is the **mozyo home** override (registry / store / credential
-    # root); the plist / log always live under the OS user home, which the service verbs resolve
-    # from ``Path.home()`` (never relocated by ``--home``) — j#79092 R2-F1.
+    # root); the plist / unit files always live under the OS user home, which the service verbs
+    # resolve from ``Path.home()`` (never relocated by ``--home``) — j#79092 R2-F1.
     mozyo_home = _home_from_args(args)
     definition = _service_definition(args)
     drain_definition = _drain_service_definition(args)
 
     if verb == "service-status":
-        status = supervisor_launchd.service_status_pair(
+        status = supervisor_service_backend.service_status_pair(
             mozyo_home=mozyo_home,
             reconcile_interval_hint=definition.reconciliation_interval_seconds,
             drain_interval_hint=drain_definition.reconciliation_interval_seconds,
         )
-        agents = status["agents"]
-        reconcile_host, drain_host = agents[0], agents[1]
+        backend = status["backend"]
         payload = dict(status)
         payload["phase"] = "B1"
         payload["definition"] = definition.as_payload()
         payload["drain_definition"] = drain_definition.as_payload()
-        lines = ["action: service-status", "phase: B1 (dual owned LaunchAgent pair; #14150)"]
-        for host, defn, kind in (
-            (reconcile_host, definition, "reconciliation"),
-            (drain_host, drain_definition, "drain"),
+        lines = [
+            "action: service-status",
+            f"backend: {backend}",
+            "phase: B1 (dual owned one-shot service pair; #14150 / #15183)",
+        ]
+        for host, defn, kind in zip(
+            status.get("agents", ()),
+            (definition, drain_definition),
+            ("reconciliation", "drain"),
         ):
             lines += [
                 f"[{kind}] service_label: {host['label']}",
@@ -323,24 +336,30 @@ def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
                 f"[{kind}] credential_readiness: {host['credential_readiness']}",
                 f"[{kind}] command: {' '.join(defn.command)}",
             ]
+        if backend == supervisor_service_backend.BACKEND_UNSUPPORTED:
+            lines.append(
+                f"reason: {supervisor_service_backend.REASON_NO_BACKEND} "
+                "(no owned OS scheduler adapter for this host)"
+            )
         _emit(payload, as_json=as_json, text_lines=lambda: lines)
         return 0
 
     if verb == "install":
-        result = supervisor_launchd.install_pair(
+        result = supervisor_service_backend.install_pair(
             mozyo_home=mozyo_home,
             reconcile_interval_seconds=definition.reconciliation_interval_seconds,
             drain_interval_seconds=drain_definition.reconciliation_interval_seconds,
         )
     elif verb == "restart":
-        result = supervisor_launchd.restart_pair(mozyo_home=mozyo_home)
+        result = supervisor_service_backend.restart_pair(mozyo_home=mozyo_home)
     else:  # uninstall
-        result = supervisor_launchd.uninstall_pair()
+        result = supervisor_service_backend.uninstall_pair()
 
     payload = dict(result)
     performed = bool(result.get("performed"))
     lines = [
         f"action: {result.get('action', verb)}",
+        f"backend: {result['backend']}",
         f"performed: {performed}",
     ]
     if result.get("reason"):
@@ -480,11 +499,13 @@ def register_supervisor(workflow_sub) -> None:
             "one bounded supervised sweep (a refused lease skips the workspace: the "
             "duplicate-supervisor fence); `--wake WORKSPACE:ISSUE` switches to local_wake mode. "
             "`--status` is a read-only registry / lease / backlog view. The service lifecycle "
-            "contract (`--service-status` / `--install` / `--restart` / `--uninstall`) is the owned "
-            "macOS LaunchAgent lifecycle (Phase B1): `--service-status` is a redacted projection + "
-            "secret-free definition; the mutating verbs drive the one-shot RunAtLoad + StartInterval "
-            "agent (no KeepAlive, no EnvironmentVariables) and fail-closed on non-darwin / missing "
-            "executable / non-ready credential."
+            "contract (`--service-status` / `--install` / `--restart` / `--uninstall`) runs on the "
+            "OS scheduler that owns this host: the macOS LaunchAgent pair, or the Linux systemd "
+            "user service+timer pair (#15183). `--service-status` is a redacted projection + "
+            "secret-free definition; the mutating verbs drive the one-shot run-at-load + "
+            "fixed-interval services (no KeepAlive / Restart= relaunch loop, no environment block) "
+            "and fail-closed on a wrong platform / no host service manager / missing executable / "
+            "non-ready credential."
         ),
         help=(
             "Workspace callback supervisor: run-once / status / service lifecycle contract. "
@@ -530,16 +551,20 @@ def register_supervisor(workflow_sub) -> None:
     )
     action.add_argument(
         "--install", action="store_true",
-        help="Install the owned LaunchAgent (RunAtLoad + StartInterval one-shot sweep). Fail-closed "
-             "on non-darwin / missing executable / non-ready credential.",
+        help="Install the owned scheduled one-shot services on this host's OS scheduler (macOS "
+             "LaunchAgent pair, or Linux systemd user service+timer pair). Atomic-or-nothing; "
+             "fail-closed on a wrong platform / no host service manager / missing executable / "
+             "non-ready credential.",
     )
     action.add_argument(
         "--restart", action="store_true",
-        help="Kickstart the loaded LaunchAgent. Fail-closed if not loaded / non-darwin / non-ready.",
+        help="Re-run the scheduled bounded sweep now. Fail-closed if the service is not scheduled / "
+             "the installed command drifted / the platform or credential is not usable.",
     )
     action.add_argument(
         "--uninstall", action="store_true",
-        help="Boot out and remove exactly the owned LaunchAgent plist (no credential required).",
+        help="Remove exactly the owned scheduler artifacts (LaunchAgent plists, or systemd user "
+             "units) after stopping them. No credential required.",
     )
     p.add_argument(
         "--local-wake", dest="local_wake", action="store_true",
