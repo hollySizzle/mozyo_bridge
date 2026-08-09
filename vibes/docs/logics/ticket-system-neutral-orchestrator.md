@@ -529,7 +529,13 @@ service + timer である。対応関係:
 | `StartInterval=<N>` | `[Timer] OnUnitActiveSec=60s` | 前回実行から N 秒後に再実行 |
 | `KeepAlive` 不在 | `Restart=` / `RemainAfterExit=` 不在 + `Type=oneshot` | bounded one-shot を常駐化・tight relaunch loop 化しない（false 設定ではなく **構造的に不在**） |
 | `EnvironmentVariables` 不在 | `Environment=` / `EnvironmentFile=` 不在 | unit に secret を書き込む code path が存在しない |
-| `ProgramArguments` | `ExecStart`（token ごとに systemd quote） | shell string ではない構造化 argv。`/bin/sh -c` を経由しない |
+| `ProgramArguments` | `ExecStart`（token ごとに systemd quote + `%` escape） | shell string ではない構造化 argv。`/bin/sh -c` を経由しない |
+
+`ExecStart` の literal pin には **3 種類の escape が同時に要る**。空白 (token を double quote する)、quote / backslash (`\"` / `\\`)、そして **percent (`%` -> `%%`)** である。3 番目は cosmetic ではない: `ExecStart` は systemd **specifier** を解決するため、executable や `--home` path に含まれる `%h` 等を systemd が load 時に展開する。実測 (#15183 review j#102053 Finding 4): `ExecStart="/opt/%h/mozyo-bridge" "--home" "/tmp/%h"` を書いた unit を `systemctl --user show` で読むと `argv[]=/opt//home/holly/mozyo-bridge --home /tmp//home/holly` となり、unit file の literal 文字列とは別の executable / mozyo home が exec される。quote では展開を抑止できず `%%` だけが literal を固定する。escape を欠くと pin が pin でなくなるうえ、`executable_matches` が file の literal text と比較して `True` を返すため **drift を検出できない**。
+
+readback (`parse_exec_argv`) は renderer の正確な逆で `%%` -> `%` を戻すが、**単独 specifier (`%h` 等) が残る場合は readback 全体を信頼しない** (`unreadable_unit` -> `executable_matches=false`、restart は fail-closed)。systemd しか知らない値へ展開されるため、file 上の argv は実行される argv ではないからである。手書き specifier を literal と誤読しない。
+
+さらに、unit file は行指向であるため、改行・復帰・その他 C0 制御文字を含む token は「変な path」ではなく**別の unit** を生む (末尾が別 directive として解釈される)。これらは escape で安全にできないので、破損 unit を書く前に typed refusal (`supervisor_command_not_renderable`) で install を拒否する。
 
 service unit は `[Install]` を持たない（enable するのは timer のみ。service を直接 enable すると login 時 1 回
 だけ実行され cadence が消える）。timer は `OnCalendar` / `Persistent=` を持たない（取りこぼしの replay は不要で、
@@ -548,11 +554,23 @@ zero-mutation 拒否が残るのは install 自体が無意味になる条件だ
 unsupported として拒否する。
 
 status は非破壊で、受入条件が求める観測値を秘密非表示で返す: 導入・有効化状態（`installed` / `timer_enabled` /
-`loaded`）、**次回起動**（`next_elapse`）、**直近の終了結果**（`last_result` / `last_exit_status` /
-`last_exit_at`）、**実行内容**（`installed_command`、`scheduled_interval_seconds`、`home_pin`、
-`executable_matches`）、および参考値としての `provider_reconcile_interval_seconds`。restart は owned timer が
-active な場合だけ作用し、installed command が今 install するはずの command と一致しない場合は drift として拒否
-する（reinstall が正道）。
+`loaded`）、**次回起動**（`next_elapse` + `next_elapse_basis`、および wall-clock の `last_trigger`）、**直近の
+終了結果**（`last_result` / `last_exit_status` / `last_exit_at`）、**実行内容**（`installed_command`、
+`scheduled_interval_seconds`、`home_pin`、`executable_matches`）、および参考値としての
+`provider_reconcile_interval_seconds`。restart は owned timer が active な場合だけ作用し、installed command が
+今 install するはずの command と一致しない場合は drift として拒否する（reinstall が正道）。
+
+`next_elapse` は必ず `next_elapse_basis` と対で扱う。systemd は `NextElapseUSecRealtime` を **calendar timer に
+しか設定せず**、本 adapter の monotonic timer では `NextElapseUSecMonotonic` 側に値が入る（片方だけ読むと実 timer
+に対し空を返す。#15183 smoke で実測）。monotonic 値は **boot 起点**であり wall clock ではないため、basis 無しの
+値は「あと 4 週間」と誤読される。JSON payload だけでなく **text 出力にも basis と `last_trigger` を必ず併記する**
+（human-readable path だけが解釈手段を失う状態を作らない）。
+
+宣言的 definition は backend が実際に **owned する service** に対応させる。`definitions` を owned service と 1 対 1
+の roster とし、Linux では `--drain-only` の definition を出さない（1 個の `--run-once` timer しか導入しないのに
+drain service の存在を示唆しない）。macOS は既存の `definition` / `drain_definition` key を維持する。CLI help も
+同様に、Linux の非 gate（credential 未整備でも導入可、単一 60 秒 timer）と macOS の atomic pair / credential gate
+を書き分け、撤回済み条件を host 共通の事実として書かない。
 
 uninstall は unit file を消すだけでは足りず、最後に `reset-failed` で manager 側の状態も消す: 実行中の sweep を
 `stop` すると one-shot は SIGTERM で終了するため systemd が `failed` を記録し、file 削除後もその記録が

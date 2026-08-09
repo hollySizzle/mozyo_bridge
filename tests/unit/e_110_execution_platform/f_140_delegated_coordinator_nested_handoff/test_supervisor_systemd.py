@@ -366,6 +366,43 @@ class ExecArgvQuotingTest(unittest.TestCase):
         # silently stripped into a matching command.
         self.assertEqual(ss.parse_exec_argv("-/opt/bin/mozyo-bridge"), ["-/opt/bin/mozyo-bridge"])
 
+    def test_a_literal_percent_is_escaped_so_systemd_does_not_expand_it(self) -> None:
+        # Measured on a live user manager (review j#102053 F4): an unescaped `%h` in ExecStart is
+        # expanded by systemd, so the executed argv was `/opt//home/holly/mozyo-bridge` while the
+        # unit's literal text said `/opt/%h/mozyo-bridge`. Only `%%` pins a literal percent.
+        rendered = ss.format_exec_argv(["/opt/%h/mozyo-bridge", "--home", "/tmp/%h"])
+        self.assertIn("%%h", rendered)
+        self.assertNotIn("/opt/%h", rendered)
+
+    def test_a_percent_path_round_trips_through_the_escape(self) -> None:
+        argv = ["/opt/%h/mozyo-bridge", "workflow", "supervisor", "--run-once", "--home", "/tmp/%t"]
+        self.assertEqual(ss.parse_exec_argv(ss.format_exec_argv(argv)), argv)
+
+    def test_a_lone_specifier_makes_the_readback_untrustworthy(self) -> None:
+        # A hand-edited `%h` expands to a value only systemd knows, so the argv in the file is not
+        # the argv that runs. Guessing it is literal would let a drifted command look like a match.
+        self.assertIsNone(ss.parse_exec_argv('"/opt/%h/mozyo-bridge"'))
+        self.assertIsNone(ss.parse_exec_argv('"/opt/bin/x" "--home" "/tmp/%t"'))
+
+    def test_a_trailing_percent_is_also_untrustworthy(self) -> None:
+        self.assertIsNone(ss.parse_exec_argv('"/opt/bin/100%"'))
+
+    def test_an_escaped_percent_reads_back_as_one_literal_percent(self) -> None:
+        self.assertEqual(ss.parse_exec_argv('"/opt/100%%/x"'), ["/opt/100%/x"])
+
+    def test_a_control_character_cannot_be_pinned_and_is_reported(self) -> None:
+        # A newline would not produce a weird path -- it would produce a DIFFERENT unit, because a
+        # unit file is line-based and the tail would parse as another directive.
+        for bad in ("/opt/a\nb", "/opt/a\rb", "/opt/a\x00b", "/opt/a\x1bb", "/opt/a\x7fb"):
+            self.assertEqual(
+                ss.unrenderable_argv_reason([bad]), ss.REASON_COMMAND_NOT_RENDERABLE, bad
+            )
+
+    def test_ordinary_and_awkward_but_renderable_paths_are_accepted(self) -> None:
+        for ok in ("/opt/bin/mozyo-bridge", "/opt/my bin/x", '/opt/we"ird/x', "/opt/back\\slash",
+                   "/opt/100%/x", "/opt/日本語/x"):
+            self.assertEqual(ss.unrenderable_argv_reason([ok]), "", ok)
+
 
 class UnitDirectoryTest(_LinuxCase):
     def test_an_explicit_os_home_uses_the_xdg_default_under_it(self) -> None:
@@ -486,6 +523,47 @@ class InstallRefusalTest(_LinuxCase):
         self.assertFalse(result["performed"])
         self.assertEqual(result["reason"], ss.REASON_EXECUTABLE_NOT_FOUND)
         self._assert_zero_mutation(runner)
+
+    def test_an_unpinnable_executable_refuses_before_writing_a_corrupt_unit(self) -> None:
+        # A newline in the resolved path cannot live on one unit-file line; writing it would emit a
+        # different unit rather than an odd-looking one (review j#102053 F4).
+        runner = self._runner()
+        result = ss.install(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            runner=runner, which=lambda _n: "/opt/bin/mozyo\nbridge",
+        )
+        self.assertFalse(result["performed"])
+        self.assertEqual(result["reason"], ss.REASON_COMMAND_NOT_RENDERABLE)
+        self._assert_zero_mutation(runner)
+
+    def test_an_unpinnable_mozyo_home_refuses_before_writing_a_corrupt_unit(self) -> None:
+        bad_home = Path(self._tmp_mozyo.name) / "a\nb"
+        runner = self._runner()
+        result = ss.install(
+            os_home=self.os_home, mozyo_home=bad_home, runner=runner, which=_which_found
+        )
+        self.assertFalse(result["performed"])
+        self.assertEqual(result["reason"], ss.REASON_COMMAND_NOT_RENDERABLE)
+        self._assert_zero_mutation(runner)
+
+    def test_a_percent_home_installs_and_reads_back_literally(self) -> None:
+        # End-to-end for the specifier boundary: install -> unit text -> status readback must all
+        # agree on the literal path, and the status must still call it a match.
+        percent_home = Path(self._tmp_mozyo.name) / "100%dir"
+        percent_home.mkdir()
+        ss.install(
+            os_home=self.os_home, mozyo_home=percent_home,
+            runner=self._runner(), which=_which_found,
+        )
+        text = ss.service_unit_path(self.os_home).read_text(encoding="utf-8")
+        self.assertIn("%%dir", text)  # escaped in the file...
+        status = ss.service_status(
+            os_home=self.os_home, runner=self._runner(), which=_which_found
+        )
+        # ...and un-escaped back to the literal path on readback, still matching an install.
+        self.assertEqual(status["installed_command"][-1], str(percent_home.resolve()))
+        self.assertTrue(status["executable_matches"])
+        self.assertEqual(status["home_pin"], ss.HOME_PIN_OK)
 
 
 class InstallSuccessTest(_LinuxCase):
@@ -633,6 +711,35 @@ class RestartTest(_LinuxCase):
         )
         self.assertEqual(result["reason"], ss.REASON_HOME_PIN_MISMATCH)
         self.assertNotIn("restart", runner.verbs)
+
+    def test_restart_refuses_a_hand_edited_specifier_instead_of_trusting_it(self) -> None:
+        # A `%h` in the installed unit means systemd runs a path we cannot reproduce, so the
+        # readback is untrustworthy and restart must fail closed rather than compare literals.
+        self._install()
+        ss.service_unit_path(self.os_home).write_text(
+            "[Unit]\nDescription=x\n\n[Service]\nType=oneshot\n"
+            'ExecStart="/opt/%h/mozyo-bridge" "workflow" "supervisor" "--run-once" '
+            '"--home" "/tmp/x"\n',
+            encoding="utf-8",
+        )
+        runner = self._runner()
+        result = ss.restart(os_home=self.os_home, runner=runner, which=_which_found)
+        self.assertEqual(result["reason"], ss.REASON_HOME_PIN_UNHEALTHY)
+        self.assertEqual(result["home_pin"], ss.HOME_PIN_UNREADABLE)
+        self.assertNotIn("restart", runner.verbs)
+
+    def test_status_reports_a_hand_edited_specifier_as_not_matching(self) -> None:
+        self._install()
+        ss.service_unit_path(self.os_home).write_text(
+            "[Unit]\nDescription=x\n\n[Service]\nType=oneshot\n"
+            'ExecStart="/opt/%h/mozyo-bridge" "--home" "/tmp/x"\n',
+            encoding="utf-8",
+        )
+        status = ss.service_status(
+            os_home=self.os_home, runner=self._runner(), which=_which_found
+        )
+        self.assertFalse(status["executable_matches"])
+        self.assertEqual(status["home_pin"], ss.HOME_PIN_UNREADABLE)
 
     def test_restart_refuses_a_drifted_installed_command(self) -> None:
         self._install()

@@ -301,7 +301,15 @@ def _service_status_lines(host: dict, index: int) -> list:
     if "timer_enabled" in host:
         lines.append(f"{tag} timer_enabled: {host['timer_enabled']}")
     if "next_elapse" in host:
-        lines.append(f"{tag} next_elapse: {host['next_elapse']}")
+        # The basis rides WITH the value, never separately. A monotonic figure is measured since
+        # boot, not a wall clock, so `next_elapse: 4w 1d 5h` alone is actively misleading — an
+        # operator reads it as "in 4 weeks". The JSON payload carried the basis from the start; the
+        # text path dropped it, which is the defect review j#102053 Finding 5 recorded.
+        basis = host.get("next_elapse_basis") or "unknown"
+        lines.append(f"{tag} next_elapse: {host['next_elapse'] or '(none)'} (basis: {basis})")
+    if "last_trigger" in host:
+        # The wall-clock companion that makes a monotonic next_elapse actionable.
+        lines.append(f"{tag} last_trigger: {host['last_trigger'] or '(none)'}")
     if "last_result" in host:
         lines.append(
             f"{tag} last_result: {host['last_result']} "
@@ -360,8 +368,19 @@ def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
         # not the adapter shape, so it is preserved verbatim: #15183 adds a host realization and has
         # no reason to drop a key an existing reader may consume.
         payload["phase"] = "B1"
+        # The declarative definitions must describe what this backend actually OWNS. Emitting the
+        # drain definition unconditionally told a Linux reader that a `--drain-only` service exists
+        # when the host runs one `--run-once` timer (review j#102053 Finding 6). ``definitions`` is
+        # the roster, aligned 1:1 with ``agents``; ``definition`` / ``drain_definition`` stay for the
+        # macOS shape that already had them, and ``drain_definition`` is simply absent where no
+        # drain service is owned.
+        owned_definitions = [definition]
+        if backend == supervisor_service_backend.BACKEND_LAUNCHD:
+            owned_definitions.append(drain_definition)
         payload["definition"] = definition.as_payload()
-        payload["drain_definition"] = drain_definition.as_payload()
+        payload["definitions"] = [d.as_payload() for d in owned_definitions]
+        if len(owned_definitions) > 1:
+            payload["drain_definition"] = drain_definition.as_payload()
         lines = ["action: service-status", f"backend: {backend}"]
         for index, host in enumerate(status.get("agents", ())):
             lines += _service_status_lines(host, index)
@@ -586,15 +605,19 @@ def register_supervisor(workflow_sub) -> None:
     )
     action.add_argument(
         "--install", action="store_true",
-        help="Install the owned scheduled one-shot services on this host's OS scheduler (macOS "
-             "LaunchAgent pair, or Linux systemd user service+timer pair). Atomic-or-nothing; "
-             "fail-closed on a wrong platform / no host service manager / missing executable / "
-             "non-ready credential.",
+        help="Install the owned scheduled one-shot service(s) on this host's OS scheduler. The two "
+             "hosts differ and the difference is intentional: on Linux this is ONE systemd user "
+             "service + ONE timer running `--run-once` every 60s, and an unconfigured Redmine does "
+             "NOT block it (readiness is reported, not gated), so local-only work keeps running; "
+             "on macOS it is the existing owned LaunchAgent pair, installed atomic-or-nothing and "
+             "fail-closed on a non-ready credential. Both fail-closed on a wrong platform / no "
+             "host service manager / missing executable.",
     )
     action.add_argument(
         "--restart", action="store_true",
-        help="Re-run the scheduled bounded sweep now. Fail-closed if the service is not scheduled / "
-             "the installed command drifted / the platform or credential is not usable.",
+        help="Re-run the scheduled bounded sweep now. Fail-closed if the service is not scheduled "
+             "or the installed command drifted (reinstall to change it). On macOS a non-ready "
+             "credential also refuses; on Linux it does not.",
     )
     action.add_argument(
         "--uninstall", action="store_true",

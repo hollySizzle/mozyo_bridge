@@ -146,6 +146,10 @@ REASON_UNSUPPORTED_PLATFORM = "systemd_unsupported_platform"
 REASON_USER_MANAGER_UNAVAILABLE = "systemd_user_manager_unavailable"
 #: install/restart refused: the ``mozyo-bridge`` executable is not resolvable on PATH.
 REASON_EXECUTABLE_NOT_FOUND = "supervisor_executable_not_found"
+#: install refused: a resolved argv token cannot be represented literally on a single unit-file line
+#: (a newline / carriage return / other C0 control character). No escaping makes it safe, so writing
+#: the unit would produce a *different* unit rather than an odd-looking one (review j#102053 F4).
+REASON_COMMAND_NOT_RENDERABLE = "supervisor_command_not_renderable"
 #: restart refused: no owned unit is installed (nothing to restart; run install first).
 REASON_NOT_INSTALLED = "service_not_installed"
 #: restart refused: the owned timer is not active, so nothing is scheduling this service. Bringing
@@ -264,18 +268,51 @@ def resolve_supervisor_command(
     ]
 
 
+def unrenderable_argv_reason(command: Sequence[str]) -> str:
+    """``""`` when every token can be pinned literally, else the token-level reason it cannot.
+
+    A unit file is line-based, so a value carrying a newline / carriage return does not produce a
+    "weird path" — it produces a **different unit**: the tail lands on its own line and is parsed as
+    another directive (or silently dropped). Other C0 control characters are equally untrustworthy
+    to round-trip. There is no escape that makes them safe inside an ``ExecStart`` value, so this is
+    a fail-closed condition the caller turns into a zero-mutation refusal rather than writing a
+    corrupt unit and reporting success. Measured boundary re-check requested by review j#102053
+    Finding 4: the earlier "unambiguous for any path" claim only held for spaces and quotes.
+    """
+    for arg in command:
+        text = str(arg)
+        if any(ch == "\n" or ch == "\r" or (ord(ch) < 0x20) or ord(ch) == 0x7F for ch in text):
+            return REASON_COMMAND_NOT_RENDERABLE
+    return ""
+
+
 def format_exec_argv(command: Sequence[str]) -> str:
     """Render argv as a systemd ``ExecStart`` value: one double-quoted, escaped token per argument.
 
-    systemd splits ``ExecStart`` on whitespace with its own quoting rules, so an unquoted path
-    containing a space would silently become two arguments. Every token is emitted double-quoted
-    with ``\\`` and ``"`` escaped, which is unambiguous for any path and round-trips through
-    :func:`parse_exec_argv`. This is a *value*, never a shell string: systemd execs the argv
-    directly, with no ``/bin/sh`` in between.
+    Three separate escaping duties, each load-bearing:
+
+    - **whitespace** — systemd splits ``ExecStart`` on whitespace, so an unquoted path containing a
+      space would silently become two arguments. Every token is double-quoted.
+    - **quotes / backslashes** — escaped as ``\\"`` / ``\\\\`` so the quoting itself round-trips.
+    - **percent** — a literal ``%`` is written ``%%``. This is NOT cosmetic: ``ExecStart`` resolves
+      systemd *specifiers*, so an unescaped ``%h`` in an executable or ``--home`` path is expanded
+      by systemd at load time. Measured on a live user manager (review j#102053 Finding 4): a unit
+      whose ``ExecStart`` read ``"/opt/%h/mozyo-bridge" "--home" "/tmp/%h"`` was reported by
+      ``systemctl show`` as ``argv[]=/opt//home/holly/mozyo-bridge --home /tmp//home/holly`` — a
+      different executable and a different mozyo home than the unit's literal text. Quoting does
+      not suppress specifier expansion; only ``%%`` does. Without this, the pin is not a pin, and
+      ``executable_matches`` compares the file's literal text and reports ``True`` while systemd
+      execs something else.
+
+    This is a *value*, never a shell string: systemd execs the argv directly, with no ``/bin/sh``.
+    Callers must reject :func:`unrenderable_argv_reason` tokens first — this function assumes the
+    command is renderable.
     """
     parts = []
     for arg in command:
-        escaped = str(arg).replace("\\", "\\\\").replace('"', '\\"')
+        escaped = (
+            str(arg).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+        )
         parts.append(f'"{escaped}"')
     return " ".join(parts)
 
@@ -283,11 +320,18 @@ def format_exec_argv(command: Sequence[str]) -> str:
 def parse_exec_argv(value: str) -> Optional[list[str]]:
     """Parse a rendered ``ExecStart`` value back into argv, or ``None`` when it is not parseable.
 
-    The inverse of :func:`format_exec_argv`, tolerant of bare (unquoted) tokens so a hand-edited unit
-    still reads back. It deliberately does **not** interpret systemd's ``-`` / ``@`` / ``:`` / ``!``
-    command prefixes or ``%`` specifiers: this adapter never writes them, so a unit carrying one
-    parses to a token that will not match the expected command and is reported as drift rather than
-    being silently normalized away.
+    The inverse of :func:`format_exec_argv`, tolerant of bare (unquoted) tokens so a hand-edited
+    unit still reads back. Two deliberate refusals to guess:
+
+    - systemd's ``-`` / ``@`` / ``:`` / ``!`` **command prefixes** are not interpreted. This adapter
+      never writes them, so a unit carrying one parses to a token that will not match the expected
+      command and is reported as drift rather than being normalized away.
+    - an **unresolvable specifier** makes the whole readback untrustworthy. ``%%`` is un-escaped back
+      to a literal ``%`` (the exact inverse of the renderer), but a *lone* ``%x`` is something
+      systemd will expand into a value only systemd knows, so the argv in the file is not the argv
+      that runs. Returning ``None`` makes status report ``unreadable_unit`` / ``executable_matches``
+      false and makes restart fail closed — never a confident comparison against text whose runtime
+      meaning we cannot reproduce (review j#102053 Finding 4).
     """
     argv: list[str] = []
     token: list[str] = []
@@ -325,7 +369,33 @@ def parse_exec_argv(value: str) -> Optional[list[str]]:
         return None  # unterminated quote / trailing escape: not trustworthy
     if in_token:
         argv.append("".join(token))
-    return argv or None
+    if not argv:
+        return None
+    resolved: list[str] = []
+    for tok in argv:
+        literal = _resolve_percent(tok)
+        if literal is None:
+            return None  # a specifier we cannot resolve -> the whole readback is untrustworthy
+        resolved.append(literal)
+    return resolved
+
+
+def _resolve_percent(token: str) -> Optional[str]:
+    """``%%`` -> literal ``%``; ``None`` when a lone specifier (``%h`` etc.) remains."""
+    out: list[str] = []
+    index = 0
+    while index < len(token):
+        ch = token[index]
+        if ch != "%":
+            out.append(ch)
+            index += 1
+            continue
+        if index + 1 < len(token) and token[index + 1] == "%":
+            out.append("%")
+            index += 2
+            continue
+        return None  # `%` followed by anything else (or nothing) is a specifier / malformed
+    return "".join(out)
 
 
 def render_service_unit(command: Sequence[str]) -> str:
@@ -607,6 +677,11 @@ def install(
     command = resolve_supervisor_command(mozyo_home=resolved_mozyo, which=which)
     if command is None:
         return _refused("install", REASON_EXECUTABLE_NOT_FOUND)
+    # A token that cannot live literally on one unit-file line would produce a DIFFERENT unit, not a
+    # cosmetically odd one, so refuse before writing anything (review j#102053 F4).
+    unrenderable = unrenderable_argv_reason(command)
+    if unrenderable:
+        return _refused("install", unrenderable)
     # Projected, NOT gated: an unconfigured Redmine must not stop the timer being installed.
     readiness = classify_credential_readiness(mozyo_home=resolved_mozyo)
 
@@ -680,6 +755,10 @@ def restart(
     expected = resolve_supervisor_command(mozyo_home=pinned_home, which=which)
     if expected is None:
         return _refused("restart", REASON_EXECUTABLE_NOT_FOUND)
+    # If an install could not render this command, the installed unit cannot legitimately match it.
+    unrenderable = unrenderable_argv_reason(expected)
+    if unrenderable:
+        return _refused("restart", unrenderable)
     if installed_argv != expected:
         return _refused("restart", REASON_INSTALLED_COMMAND_DRIFT)
     readiness = classify_credential_readiness(mozyo_home=pinned_home)
@@ -928,6 +1007,7 @@ __all__ = (
     "REASON_UNSUPPORTED_PLATFORM",
     "REASON_USER_MANAGER_UNAVAILABLE",
     "REASON_EXECUTABLE_NOT_FOUND",
+    "REASON_COMMAND_NOT_RENDERABLE",
     "REASON_SERVICE_NOT_LOADED",
     "REASON_NOT_INSTALLED",
     "REASON_HOME_PIN_UNHEALTHY",
@@ -957,6 +1037,10 @@ __all__ = (
     "resolve_supervisor_command",
     "format_exec_argv",
     "parse_exec_argv",
+    "unrenderable_argv_reason",
+    "NEXT_ELAPSE_REALTIME",
+    "NEXT_ELAPSE_MONOTONIC",
+    "NEXT_ELAPSE_UNKNOWN",
     "render_service_unit",
     "render_timer_unit",
     "classify_credential_readiness",

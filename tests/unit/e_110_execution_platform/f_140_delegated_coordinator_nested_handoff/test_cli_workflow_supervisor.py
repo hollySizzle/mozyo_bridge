@@ -201,6 +201,122 @@ class CliServiceStatusSystemdTest(_ServiceCliCase):
         self.assertFalse(ss.unit_dir(self.os_home).exists())
 
 
+class CliServiceStatusTextPathTest(_ServiceCliCase):
+    """The human-readable path must not drop what the JSON payload carries (review j#102053 F5)."""
+
+    def _text_status(self, platform: str) -> str:
+        with self._isolated_host(platform):
+            _rc, out = _run(["workflow", "supervisor", "--service-status", "--home", self.home])
+        return out
+
+    def test_text_status_labels_the_next_elapse_basis(self) -> None:
+        # A monotonic figure is measured since boot, so an unlabelled `next_elapse: 4w 1d 5h` reads
+        # as "in four weeks". The basis must ride with the value in text mode too.
+        out = self._text_status("linux")
+        self.assertIn("next_elapse:", out)
+        self.assertIn("basis:", out)
+
+    def test_text_status_shows_the_last_trigger_wall_clock(self) -> None:
+        self.assertIn("last_trigger:", self._text_status("linux"))
+
+    def test_text_status_shows_the_last_exit_result(self) -> None:
+        self.assertIn("last_result:", self._text_status("linux"))
+
+    def test_the_basis_travels_with_a_real_monotonic_value(self) -> None:
+        # Drive the renderer with a real monotonic shape rather than an empty host projection.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_supervisor import (  # noqa: E501
+            _service_status_lines,
+        )
+
+        host = {
+            "label": "L", "installed": True, "loaded": True, "pid": None,
+            "scheduled_interval_seconds": 60, "home_pin": "ok", "executable_matches": True,
+            "keep_alive_present": False, "credential_readiness": "missing", "timer_enabled": True,
+            "next_elapse": "4w 1d 5h 2min 6.063752s", "next_elapse_basis": "monotonic",
+            "last_trigger": "Sun 2026-08-09 22:50:24 JST", "last_result": "success",
+            "last_exit_status": 0, "last_exit_at": "Sun 2026-08-09 22:50:25 JST",
+            "provider_reconcile_interval_seconds": 300, "installed_command": ["/x", "--run-once"],
+        }
+        text = "\n".join(_service_status_lines(host, 0))
+        self.assertIn("next_elapse: 4w 1d 5h 2min 6.063752s (basis: monotonic)", text)
+        self.assertIn("last_trigger: Sun 2026-08-09 22:50:24 JST", text)
+
+
+class CliServiceDefinitionRosterTest(_ServiceCliCase):
+    """Declarative definitions must describe what the backend actually owns (review j#102053 F6)."""
+
+    def _json_status(self, platform: str) -> dict:
+        with self._isolated_host(platform):
+            _rc, out = _run(
+                ["workflow", "supervisor", "--service-status", "--home", self.home, "--json"]
+            )
+        return json.loads(out)
+
+    def test_linux_status_declares_no_drain_service_it_does_not_own(self) -> None:
+        payload = self._json_status("linux")
+        self.assertEqual(payload["backend"], sb.BACKEND_SYSTEMD)
+        self.assertEqual(len(payload["agents"]), 1)
+        # The Linux host installs ONE `--run-once` timer, so advertising a `--drain-only`
+        # definition told the reader a service exists that does not.
+        self.assertNotIn("drain_definition", payload)
+        self.assertEqual(len(payload["definitions"]), 1)
+        self.assertEqual(payload["definitions"][0]["command"][-1], "--run-once")
+
+    def test_the_definition_roster_matches_the_agent_roster(self) -> None:
+        for platform in ("linux", "darwin"):
+            payload = self._json_status(platform)
+            self.assertEqual(
+                len(payload["definitions"]), len(payload["agents"]),
+                f"{platform}: definitions must be 1:1 with owned services",
+            )
+
+    def test_macos_keeps_its_drain_definition_key(self) -> None:
+        payload = self._json_status("darwin")
+        self.assertEqual(payload["backend"], sb.BACKEND_LAUNCHD)
+        self.assertEqual(payload["drain_definition"]["command"][-1], "--drain-only")
+        self.assertEqual(len(payload["definitions"]), 2)
+
+
+class CliServiceHelpContractTest(unittest.TestCase):
+    """CLI help is a distributed contract: it must not advertise retired conditions (F6)."""
+
+    def _supervisor_help(self) -> str:
+        """Help text with argparse's line wrapping collapsed.
+
+        argparse re-wraps every help string to the terminal width, so a phrase can be split across
+        lines at any point. Asserting on the raw output tests the wrap position, not the contract.
+        """
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            try:
+                build_parser().parse_args(["workflow", "supervisor", "--help"])
+            except SystemExit:
+                pass
+        return " ".join(buf.getvalue().split())
+
+    def test_help_does_not_claim_a_linux_atomic_pair(self) -> None:
+        text = self._supervisor_help()
+        # The retired conditions must not be stated as host-common facts.
+        self.assertNotIn("service+timer pair", text)
+        self.assertNotIn("Atomic-or-nothing;", text)
+
+    def test_help_states_the_linux_single_timer(self) -> None:
+        text = self._supervisor_help()
+        self.assertIn("ONE systemd user service + ONE timer", text)
+        self.assertIn("every 60s", text)
+
+    def test_help_states_that_an_unconfigured_redmine_does_not_block_linux_install(self) -> None:
+        text = self._supervisor_help()
+        self.assertIn("unconfigured Redmine does NOT block it", text)
+        self.assertIn("readiness is reported, not gated", text)
+
+    def test_help_still_states_the_macos_atomic_credential_gate(self) -> None:
+        # The macOS behaviour is unchanged, so help must keep describing it accurately.
+        text = self._supervisor_help()
+        self.assertIn("LaunchAgent pair, installed atomic-or-nothing", text)
+        self.assertIn("fail-closed on a non-ready credential", text)
+
+
 class CliServiceUnsupportedHostTest(_ServiceCliCase):
     """A host with no owned scheduler adapter is a typed refusal, never a silent no-op."""
 
