@@ -244,17 +244,17 @@ handoff / notify の運用判断は、しばしば三つの別概念を取り違
 
 ### 通常再開で行わないこと
 
-4 step は上限であって最低限ではない。次は通常再開の経路では **選ばない**。必要になった場合は、下の詳細調査条件のどれに該当するかを durable record に記録してから行う。
+通常経路に属する操作は上の 4 step が **閉じた集合** である。4 step は上限であって最低限ではない。次の列挙は繰り返し観測された逸脱の名指しであって、*許可された残余* の定義ではない — 名指しの有無にかかわらず、4 step 以外の操作は通常経路では **選ばない**。必要になった場合は、下の詳細調査条件のどれに該当するかを durable record に記録して **から** 行う。
 
 - **既読の central preset / skill reference の全文再読。** 特定の gate / 節を確認する必要があるなら、その節だけを読む。
 - **source 全文検索と文書全文 dump。** repo 全体の grep や doc 全文の出力を再開の準備作業にしない。
-- **複数 command の `--help` 収集。** 実行する高レベル command が分かっているなら `--help` を並べない。command 選択自体が不明なら、それは lane / 手順が不明という詳細調査条件であって、help の総当たりではない。
+- **`--help` の収集。** 実行する高レベル command が分かっているなら `--help` を読み直さない。command 選択自体が不明なら、それは lane / 手順が不明という詳細調査条件であって、help の総当たりではない。
 - **raw Herdr / tmux 操作と低レベル `read` / `message` / `type` / `keys`。** これらは adapter test と operator debug のための primitive であり、通常再開の道具ではない (`## Wait / polling 効率標準` / `## Workspace 横断 handoff`)。
 - **同一操作の再送。** 送達済みの dispatch / handoff / callback を「念のため」再実行しない。delivery が uncertain なときは blind retry ではなく fail-closed で停止し、durable record に記録する。
 
 ### 詳細調査へ移れる条件
 
-次の **いずれか** に該当するときに限り、通常再開を離れて詳細調査へ移ってよい。移る判断と、何を確認するために何を読むかを durable record に記録する。
+次の **いずれか** に該当するときに限り、通常再開を離れて詳細調査へ移ってよい。該当条件・移る判断・何を確認するために何を読むかを、**詳細調査の最初の操作より前に** durable record へ記録する。事後の記録は本条件を満たさない — 記録は調査の許可であって、調査の要約ではない。
 
 1. **durable state が競合・欠落・読取不能。** 期待する journal が無い、内容が相互に矛盾する、または取得できない。
 2. **lane が不明または曖昧。** target lane / pane / worktree が一意に解決しない (`## 自然名 target への handoff` の fail-closed 該当)。

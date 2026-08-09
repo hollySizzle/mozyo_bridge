@@ -124,21 +124,27 @@ ESCALATION_ANCHORS: Mapping[str, str] = {
     "destructive_privilege_or_secret": "破壊的操作、権限変更、秘密情報の利用が必要",
 }
 
-# Barred-operation anchors. ``help_lookup`` is intentionally *not* a barred kind: the doc
-# bars collecting ``--help`` for several commands, not a single lookup, so the evaluator
-# caps it instead of rejecting it outright.
+# Barred-operation anchors. These are the doc's *named* deviations. They are not the
+# definition of what the normal path permits — the doc states the four steps are a closed
+# set, so the evaluator default-denies anything else and uses these names only to produce
+# a more specific violation label (#15147 review j#101748 finding 1).
 FORBIDDEN_ANCHORS: Mapping[str, str] = {
     "rule_full_reread": "既読の central preset / skill reference の全文再読",
     "source_full_scan": "source 全文検索と文書全文 dump",
     "doc_full_dump": "source 全文検索と文書全文 dump",
+    "help_lookup": "`--help` の収集",
     "raw_herdr_or_tmux": "raw Herdr / tmux 操作と低レベル",
     "low_level_pane_io": "raw Herdr / tmux 操作と低レベル",
     "duplicate_action_resend": "同一操作の再送",
 }
 
-MULTI_HELP_ANCHOR = "複数 command の `--help` 収集"
+CLOSED_SET_ANCHOR = "通常経路に属する操作は上の 4 step が **閉じた集合** である"
+NAMED_LIST_IS_NOT_RESIDUE_ANCHOR = (
+    "名指しの有無にかかわらず、4 step 以外の操作は通常経路では **選ばない**"
+)
 ESCALATION_RECORD_ANCHOR = (
-    "移る判断と、何を確認するために何を読むかを durable record に記録する。"
+    "**詳細調査の最初の操作より前に** durable record へ記録する。事後の記録は本条件を"
+    "満たさない"
 )
 NO_FULL_REREAD_ANCHOR = (
     "同一 session の通常再開は、既に読んだ central preset / skill reference の全文再読を"
@@ -153,7 +159,13 @@ class ResumePolicy:
     normal_path: tuple[str, ...]
     escalation_conditions: frozenset[str]
     forbidden_kinds: frozenset[str]
-    max_help_lookups: int
+    # True when the doc declares the four steps a closed set. The evaluator then
+    # default-denies every other operation on the normal path instead of consulting
+    # ``forbidden_kinds`` as an allow-open deny-list.
+    normal_path_is_closed: bool
+    # True when the doc requires the escalation decision to be recorded BEFORE the first
+    # detailed-investigation operation, not merely somewhere in the turn.
+    escalation_record_precedes_investigation: bool
 
     @classmethod
     def from_workflow_body(cls, body: str) -> "ResumePolicy":
@@ -179,8 +191,13 @@ class ResumePolicy:
             normal_path=normal_path,
             escalation_conditions=escalation,
             forbidden_kinds=frozenset(forbidden),
-            # The doc bars collecting `--help` for several commands.
-            max_help_lookups=1 if MULTI_HELP_ANCHOR in section else 0,
+            normal_path_is_closed=(
+                CLOSED_SET_ANCHOR in section
+                and NAMED_LIST_IS_NOT_RESIDUE_ANCHOR in section
+            ),
+            escalation_record_precedes_investigation=(
+                ESCALATION_RECORD_ANCHOR in section
+            ),
         )
 
 
@@ -247,20 +264,42 @@ def evaluate_resume_turn(
             violations.append(f"duplicate_action_resend:{op.target}")
         seen_actions.add(op.target)
 
+    # The first operation outside the four steps IS the start of detailed investigation,
+    # whichever mode the turn claimed.
+    first_investigation = next(
+        (i for i, op in enumerate(history) if op.kind not in policy.normal_path),
+        None,
+    )
+
     if escalated:
         # Detailed investigation is unlocked, but the decision to leave the routine path
-        # is itself a durable-record obligation.
-        if not any(op.kind == "journal_add" for op in history):
+        # is a durable-record obligation that PRECEDES the investigation: the record is
+        # the permission to investigate, not a summary of it.
+        recorded_at = next(
+            (i for i, op in enumerate(history) if op.kind == "journal_add"), None
+        )
+        if recorded_at is None:
             violations.append("escalation_not_recorded")
+        elif (
+            policy.escalation_record_precedes_investigation
+            and first_investigation is not None
+            and recorded_at > first_investigation
+        ):
+            violations.append(
+                f"escalation_recorded_after_investigation:"
+                f"{history[first_investigation].kind}"
+            )
         return ResumeVerdict(conforms=not violations, violations=tuple(violations))
 
+    # Normal path: the four steps are a closed set, so anything else is a violation
+    # whether or not the doc names it. Named deviations get the more specific label.
     for op in history:
+        if op.kind in policy.normal_path:
+            continue
         if op.kind in policy.forbidden_kinds:
             violations.append(f"forbidden_in_normal_path:{op.kind}")
-
-    help_lookups = sum(1 for op in history if op.kind == "help_lookup")
-    if help_lookups > policy.max_help_lookups:
-        violations.append(f"help_lookup_over_cap:{help_lookups}")
+        elif policy.normal_path_is_closed:
+            violations.append(f"outside_closed_normal_path:{op.kind}")
 
     observed = tuple(op.kind for op in history if op.kind in policy.normal_path)
     if observed != policy.normal_path:
@@ -284,11 +323,23 @@ ROUTINE_RESUME = (
     ResumeOp("high_level_action", "sublane dispatch-worker --execute"),
 )
 
-# One `--help` to confirm a flag is a lookup, not a survey.
+# Even a single `--help` is outside the closed four-step set (#15147 review j#101748
+# finding 1: the acceptance criterion bars "複数の --help", but the owner intent and the
+# canonical doc say the normal path is the four steps and nothing else).
 ROUTINE_RESUME_WITH_ONE_HELP = (
     ResumeOp("ticket_read", "#15147 j#101693"),
     ResumeOp("high_level_status", "sublane list --repo ."),
     ResumeOp("help_lookup", "sublane dispatch-worker --help"),
+    ResumeOp("journal_add", "#15147 resume decision"),
+    ResumeOp("high_level_action", "sublane dispatch-worker --execute"),
+)
+
+# An operation the doc never names. A deny-list would let it through; a closed set does
+# not (#15147 review j#101748 finding 1).
+ROUTINE_RESUME_WITH_UNNAMED_DETOUR = (
+    ResumeOp("ticket_read", "#15147 j#101693"),
+    ResumeOp("high_level_status", "sublane list --repo ."),
+    ResumeOp("web_search", "how to dispatch a sublane worker"),
     ResumeOp("journal_add", "#15147 resume decision"),
     ResumeOp("high_level_action", "sublane dispatch-worker --execute"),
 )
@@ -347,14 +398,27 @@ UNREAD_RESUME = (
     ResumeOp("high_level_action", "sublane dispatch-worker --execute"),
 )
 
-# Under a recorded escalation condition, the same investigation stops being a violation.
+# Under an escalation condition recorded BEFORE the first detailed operation, the same
+# investigation stops being a violation.
 ESCALATED_INVESTIGATION = (
     ResumeOp("ticket_read", "#15147 j#101693"),
     ResumeOp("high_level_status", "sublane list --repo ."),
+    ResumeOp("journal_add", "#15147 escalation decision"),
     ResumeOp("source_full_scan", "grep -r src/"),
     ResumeOp("doc_full_dump", "vibes/docs/logics/*.md"),
     ResumeOp("help_lookup", "sublane --help"),
     ResumeOp("help_lookup", "handoff --help"),
+    ResumeOp("raw_herdr_or_tmux", "herdr agent read"),
+)
+
+# The same operations, with the decision written up afterwards. The record is then a
+# summary of the investigation rather than the permission for it (#15147 review j#101748
+# finding 2).
+ESCALATION_RECORDED_AFTERWARDS = (
+    ResumeOp("ticket_read", "#15147 j#101693"),
+    ResumeOp("high_level_status", "sublane list --repo ."),
+    ResumeOp("source_full_scan", "grep -r src/"),
+    ResumeOp("doc_full_dump", "vibes/docs/logics/*.md"),
     ResumeOp("raw_herdr_or_tmux", "herdr agent read"),
     ResumeOp("journal_add", "#15147 escalation decision"),
 )
@@ -387,7 +451,8 @@ class RoutineResumeStandardDocTest(unittest.TestCase):
                 for anchor in (
                     NO_FULL_REREAD_ANCHOR,
                     ESCALATION_RECORD_ANCHOR,
-                    MULTI_HELP_ANCHOR,
+                    CLOSED_SET_ANCHOR,
+                    NAMED_LIST_IS_NOT_RESIDUE_ANCHOR,
                 ):
                     self.assertIn(anchor, section, msg=f"{label} lost {anchor!r}")
 
@@ -409,7 +474,18 @@ class RoutineResumeStandardDocTest(unittest.TestCase):
     def test_normal_path_bars_the_observed_15140_operations(self) -> None:
         policy = ResumePolicy.from_workflow_body(_bodies()[0][1])
         self.assertEqual(policy.forbidden_kinds, frozenset(FORBIDDEN_ANCHORS))
-        self.assertEqual(policy.max_help_lookups, 1)
+
+    def test_normal_path_is_a_closed_set_not_a_deny_list(self) -> None:
+        """#15147 review j#101748 finding 1: the named list is not the permitted residue."""
+
+        policy = ResumePolicy.from_workflow_body(_bodies()[0][1])
+        self.assertTrue(policy.normal_path_is_closed)
+
+    def test_escalation_record_must_precede_the_investigation(self) -> None:
+        """#15147 review j#101748 finding 2: the record is permission, not a summary."""
+
+        policy = ResumePolicy.from_workflow_body(_bodies()[0][1])
+        self.assertTrue(policy.escalation_record_precedes_investigation)
 
     def test_standard_is_not_duplicated_into_other_rule_surfaces(self) -> None:
         """One rule, one home (#15147 implementation policy / ``## Workflow docs の正本境界``)."""
@@ -446,9 +522,17 @@ class RoutineResumeOperationHistoryTest(unittest.TestCase):
         verdict = self._verdict(ROUTINE_RESUME)
         self.assertTrue(verdict.conforms, msg=verdict.violations)
 
-    def test_single_help_lookup_stays_inside_the_normal_path(self) -> None:
+    def test_even_a_single_help_lookup_leaves_the_normal_path(self) -> None:
         verdict = self._verdict(ROUTINE_RESUME_WITH_ONE_HELP)
-        self.assertTrue(verdict.conforms, msg=verdict.violations)
+        self.assertFalse(verdict.conforms)
+        self.assertIn("forbidden_in_normal_path:help_lookup", verdict.violations)
+
+    def test_an_operation_the_doc_never_names_is_still_rejected(self) -> None:
+        """A deny-list would admit this; a closed set does not."""
+
+        verdict = self._verdict(ROUTINE_RESUME_WITH_UNNAMED_DETOUR)
+        self.assertFalse(verdict.conforms)
+        self.assertIn("outside_closed_normal_path:web_search", verdict.violations)
 
     def test_observed_15140_resume_is_rejected(self) -> None:
         verdict = self._verdict(OBSERVED_15140_RESUME)
@@ -456,7 +540,11 @@ class RoutineResumeOperationHistoryTest(unittest.TestCase):
         self.assertIn("forbidden_in_normal_path:rule_full_reread", verdict.violations)
         self.assertIn("forbidden_in_normal_path:source_full_scan", verdict.violations)
         self.assertIn("forbidden_in_normal_path:doc_full_dump", verdict.violations)
-        self.assertIn("help_lookup_over_cap:3", verdict.violations)
+        self.assertEqual(
+            3,
+            sum(1 for v in verdict.violations if v == "forbidden_in_normal_path:help_lookup"),
+            msg=verdict.violations,
+        )
 
     def test_raw_transport_operations_are_rejected(self) -> None:
         verdict = self._verdict(RAW_TRANSPORT_RESUME)
@@ -517,6 +605,17 @@ class RoutineResumeOperationHistoryTest(unittest.TestCase):
         )
         self.assertFalse(verdict.conforms)
         self.assertIn("escalation_not_recorded", verdict.violations)
+
+    def test_recording_the_escalation_afterwards_is_rejected(self) -> None:
+        verdict = self._verdict(
+            ESCALATION_RECORDED_AFTERWARDS,
+            escalation="durable_state_conflict_or_unreadable",
+        )
+        self.assertFalse(verdict.conforms)
+        self.assertIn(
+            "escalation_recorded_after_investigation:source_full_scan",
+            verdict.violations,
+        )
 
     def test_escalation_still_does_not_permit_a_blind_resend(self) -> None:
         history = ESCALATED_INVESTIGATION + (
