@@ -111,6 +111,49 @@ def _read_live_issue_closed(issue: str) -> Optional[bool]:
     return status.get("is_closed") is True
 
 
+def _read_coordinator_decision(target, home=None):
+    """The coordinator's recorded decision for the retire target's own route (IO).
+
+    Keyed on ``(workspace_id, lane_id)`` taken from the retire target's lifecycle row, so no argv
+    selects which decision is consulted — the issue and every other identity are BOUND fields the
+    pure fence then compares, not part of the key.
+
+    Any failure — an absent store (nobody has recorded a decision), a replaced or unreadable one,
+    or no row for this route — yields the unrecorded default, and the fence refuses. A decision
+    surface that cannot be trusted is not a decision.
+    """
+    from mozyo_bridge.core.state.audit_failure_terminal_decision import (
+        AuditFailureTerminalDecisionStore,
+        DecisionRoute,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.superseded_audit_failure_terminal import (  # noqa: E501
+        CoordinatorTerminalDecision,
+    )
+
+    try:
+        recorded = AuditFailureTerminalDecisionStore(home=home).read(
+            DecisionRoute(workspace_id=target.workspace, lane_id=target.lane)
+        )
+    except Exception:  # noqa: BLE001 - an untrustworthy decision surface is no decision
+        return CoordinatorTerminalDecision()
+    if recorded is None:
+        return CoordinatorTerminalDecision()
+    return CoordinatorTerminalDecision(
+        recorded=True,
+        decision_id=recorded.decision_id,
+        workspace_id=recorded.workspace_id,
+        lane_id=recorded.lane_id,
+        lane_generation=recorded.lane_generation,
+        lane_revision=recorded.lane_revision,
+        issue=recorded.issue,
+        audit_journal=recorded.audit_journal,
+        successor_issue=recorded.successor_issue,
+        successor_review_journal=recorded.successor_review_journal,
+        head=recorded.head,
+        integration_branch=recorded.integration_branch,
+    )
+
+
 def _measure_audit_record(journals, audit_journal: str):
     """What the issue's OWN history says about the journal the declaration names (pure).
 
@@ -206,6 +249,7 @@ def resolve_superseded_audit_failure_admissible(
             GATE_CLOSE,
         )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.superseded_audit_failure_terminal import (  # noqa: E501
+            CoordinatorTerminalDecision,
             TrackerIssueStatus,
             evaluate_superseded_audit_failure_admissible,
             fold_audit_supersession_acknowledgement,
@@ -262,6 +306,11 @@ def resolve_superseded_audit_failure_admissible(
         outcome = evaluate_superseded_audit_failure_admissible(
             declaration,
             audit=_measure_audit_record(journals, declaration.audit_journal),
+            # THE authority, read from the mozyo-owned decision store keyed on the retire target's
+            # OWN route (workspace + lane, both measured from the lifecycle row). The lookup cannot
+            # be pointed elsewhere by argv, and an unreadable / absent / replaced store yields the
+            # unrecorded default, which refuses.
+            decision=_read_coordinator_decision(target, getattr(args, "home", None)),
             acknowledgement=fold_audit_supersession_acknowledgement(successor_journals),
             successor=successor,
             # The head the successor's approved round actually examined, from the SAME grammar and
@@ -293,6 +342,7 @@ def resolve_superseded_audit_failure_admissible(
             expected_workspace=target.workspace,
             expected_lane=target.lane,
             expected_lane_generation=target.lane_generation,
+            expected_lane_revision=target.revision,
             live_head=measured.head,
             live_commits_ahead=measured.commits_ahead,
             worktree_clean=measured.worktree_clean,

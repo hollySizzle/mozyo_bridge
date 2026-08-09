@@ -26,8 +26,9 @@ So this is a FIFTH independent route to the same one boolean, and like the other
 ever ADMIT — none of them can weaken another, and a lane that fails all five is blocked exactly as
 it was before any of them existed.
 
-**This route is a BOUNDED MIGRATION, not a general terminal, and that is the whole shape of it.**
-Two review rounds established why, each refuting the previous answer with a measurement:
+**What this route rests on: a coordinator DECISION recorded at the mozyo command boundary.** Three
+review rounds established why nothing read from the journals can carry that weight, each refuting
+the previous answer with a measurement:
 
 - R1 rested the admission on the SOURCE declaration and the SUCCESSOR acknowledgement corroborating
   each other. Review j#101880 finding 1 refuted it: neither record can be authenticated (ruling
@@ -42,30 +43,44 @@ Two review rounds established why, each refuting the previous answer with a meas
   admitted. Head coverage bounds WHICH REPOSITORY STATE is involved; it says nothing about WHOSE
   work was reviewed.
 
-What remains, after both refutations, is that **no durable record in this workspace can bind "this
-audit failure" to "that successor's acceptance"**. The binding is a coordinator judgement, and the
-authority for a coordinator judgement — a writer/receipt authority verifiably bound to an actual
-coordinator action — does not exist here and is not this issue's to rule on.
+- R3 enumerated the permitted tuples in code. Review j#102074 finding 1 found the enumeration was
+  ALSO reachable as a keyword argument on the decision API, and scope decision j#102081 then ruled
+  the enumeration itself out on different grounds: fixing issue ids in the package makes every
+  future lane of this shape a product change, which is an individual migration rather than a
+  supported rail.
 
-So the binding is not read from a record at all. It is ENUMERATED IN CODE
-(:data:`SANCTIONED_MIGRATIONS`): the exact source issue, audit journal, successor issue, successor
-review journal, lane, generation, head and integration branch of each lane this migration covers.
-A tuple that is not enumerated is refused (:data:`REASON_NOT_A_SANCTIONED_MIGRATION`), whatever
-else its records say. This is the "一回限りの移行" review j#101909 sanctions, and it is chosen for
-one property no journal surface has: **a journal author cannot add an entry.** Extending the route
-to another lane is a reviewed code change that appears in the diff an auditor reads.
+What remains, after all three, is that **no durable record in this workspace can bind "this audit
+failure" to "that successor's acceptance"**. That binding is a coordinator JUDGEMENT — and
+``managed-state-model.md`` already says where a judgement taken at a mozyo command boundary lives.
+Its ``state_kinds`` table makes ``desired_state`` ("mozyo が command 境界で作成/採用/mark/rename
+しようとした構成・意図") authoritative for mozyo-owned persisted state, and defines
+``side_effect_permission`` as exactly the conjunction this route needs: "persisted desired state +
+durable workflow gate + action-time live preflight を照合した結果".
 
-**No decision surface here accepts a replacement enumeration** (review j#102074 finding 1). R3
-exposed one as a test seam, arguing the application never passes it; the reviewer handed a
-caller-supplied pin straight to the decision function and it admitted. An authority-bearing API
-that accepts a substitute authority has fenced nothing, and inspecting one caller does not close
-the contract for the rest — so the parameter is gone and :data:`SANCTIONED_MIGRATIONS` is read from
-module scope. What a test may still do is rewrite the package's own constant in its own process;
-that is not a path any caller can reach through an exported function.
+So the binding is a :class:`CoordinatorTerminalDecision`, recorded through
+``mozyo-bridge sublane audit-failure-terminal record`` into the mozyo-owned store
+:mod:`mozyo_bridge.core.state.audit_failure_terminal_decision`, and re-measured here against every
+independent source. A lane with no recorded decision is refused
+(:data:`REASON_NO_COORDINATOR_DECISION`); a decision that does not match what the retire measures
+is refused as drift. **No sequence of Redmine journal writes produces such a record** — that is the
+property all three refuted attempts lacked, and it is the whole of the claim. It does NOT
+authenticate a human; nothing here can, and the gap is unchanged.
 
-Everything below is retained as a CONJUNCT on top of that pin — never a substitute for it. The pin
-says which lane may converge; the conjuncts say the record and the repository still agree at action
-time:
+**Single use is the lifecycle revision, not a second ledger.** The decision is bound to the lane's
+exact ``lane_generation`` AND ``revision`` at decision time, and every retire that mutates the lane
+row advances that revision through the existing CAS. One decision therefore authorizes at most one
+mutation, using the lifecycle generation the design direction (j#102092) names as a canonical
+source rather than a consumption ledger that could disagree with it.
+
+**The domain holds no authority a caller can replace** (review j#102074 finding 1). R3 exposed the
+enumeration as a keyword argument, arguing the application never passed it; the reviewer passed one
+and it admitted. The decision now arrives as a MEASUREMENT, exactly like ``live_head`` and
+``expected_workspace`` — the application reads it from the store and from nowhere else — and this
+module keeps no default authority at all.
+
+Everything below is retained as a CONJUNCT on top of that decision — never a substitute for it. The
+decision says which lane may converge; the conjuncts say the record and the repository still agree
+at action time:
 
 1. **no approval exists anywhere on this issue** — the record carries ZERO review rounds
    (:data:`REASON_REVIEW_ROUND_RECORDED`), so there is no approval to be stale, borrowed or
@@ -75,28 +90,29 @@ time:
 3. **both issues are closed IN THE TRACKER, not merely in their own prose** — a ``close`` gate
    journal says the lane BELIEVES it is closed; the tracker says whether it is (review j#101880
    finding 2). Both current statuses are read fresh at action time;
-4. **the records still have to line up with the pin** — the declaration and the successor's
-   acknowledgement must name each other and must name what the pin names, and the successor's
-   approved round must still be an approval that examined the pinned head. These are INTEGRITY
-   checks: they establish that nothing drifted since the migration was enumerated, and they
-   establish nothing about who wrote anything.
+4. **the records still have to line up with the decision** — the declaration and the successor's
+   acknowledgement must name each other and must name what the decision names, and the successor's
+   approved round must still be an approval that examined the decided head. These are INTEGRITY
+   checks: they establish that nothing drifted since the decision was taken, and they establish
+   nothing about who wrote anything.
 
 **And what it deliberately does NOT establish.** It does not establish that the named audit record
 CONCLUDED a failure. That conclusion is prose, and prose is not a governed surface — inventing a
 grammar for it here would be the #14755 review j#99065 defect one level over: a claim whose only
 witness is the record that makes it. Review j#101880 measured the consequence (an audit note
 replaced by a plain progress memo still admitted); the answer is not to parse prose but to stop the
-admission depending on it, and under the pin the ``audit_journal`` field is a POINTER whose identity
-the pin fixes.
+admission depending on it, and under the decision the ``audit_journal`` field is a POINTER whose
+identity the coordinator's decision fixes.
 
 Nor does it establish WHO wrote anything. That gap is UNCHANGED and unclosable from a durable
 record; :func:`...hibernate_issuer_policy.resolve_journal_issuer` is a POLICY binding that takes no
 author input and says so. This gate is therefore deliberately NOT registered in
 :mod:`.hibernate_evidence_authority` — registering one needs a ruling that NAMES it, and
 manufacturing an anchor from a record that decided no writer contract is the #14661 j#92715 defect.
-Two rounds of trying to substitute for that authority with more correlation both failed
-measurement; the pin does not close the gap either, it removes the need to cross it by refusing to
-be general.
+Three rounds of trying to substitute for that authority — more correlation, then more correlation
+again, then an in-package list — each failed on its own terms. The decision record does not close
+the writer gap either; what it does is move the authority off the journal surface entirely, onto
+the ``desired_state`` layer the canonical state model already makes authoritative for intent.
 
 Boundary: pure. No IO, no Redmine, no git. The live repository half, the gate folds and the
 successor issue's own facts are necessarily measured by the application layer and arrive here as
@@ -348,100 +364,45 @@ def fold_superseded_audit_failure(
 
 
 # ---------------------------------------------------------------------------
-# The enumerated migration. This is the authority; everything else is a conjunct.
+# The coordinator's decision. This is the authority; everything else is a conjunct.
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class SanctionedMigration:
-    """ONE lane this migration is sanctioned to terminalize, by exact identity.
+class CoordinatorTerminalDecision:
+    """The coordinator's recorded decision that THIS lane's audit failure may terminalize.
 
-    Every field is a literal that must match what the durable records and the retire target
-    independently resolve to. Nothing here is read from a journal, and nothing here can be added by
-    writing one: extending this route to another lane is a reviewed code change.
+    Measured by the application from the mozyo-owned decision store
+    (:mod:`mozyo_bridge.core.state.audit_failure_terminal_decision`), which that module's docstring
+    grounds in ``managed-state-model.md``: a judgement taken at a mozyo command boundary is
+    ``desired_state``, whose authority IS mozyo-owned persisted state, and the permission to act is
+    the ``side_effect_permission`` conjunction — "persisted desired state + durable workflow gate +
+    action-time live preflight". This value object is the first term; the folds and probes below
+    are the other two.
 
-    ``workspace`` is deliberately absent. It is a machine-local segment hash, not a repository fact,
-    and the lane identity is already bound to the retire target's own lifecycle row by
-    :data:`REASON_LANE_MISMATCH` — pinning it here would hard-code one checkout's environment into
-    the package.
+    Every field is an identity the fence re-compares against an INDEPENDENT source: the declaration
+    marker, the retire target's own lifecycle row, the committed config, and the live checkout. The
+    decision therefore authorizes exactly the world it was taken about — a moved head, a
+    re-incarnated lane or a mutated lifecycle row leaves it behind.
+
+    ``recorded`` is the fail-closed default: an unmeasured decision is no decision. This is a
+    MEASUREMENT the application supplies, exactly as ``live_head`` and ``expected_workspace`` are;
+    what the domain deliberately no longer holds is an authority of its own that a caller could
+    replace (review j#102074 finding 1).
     """
 
-    issue: str
-    audit_journal: str
-    successor_issue: str
-    successor_review_journal: str
-    lane: str
-    lane_generation: int
-    head: str
-    integration_branch: str
-
-
-#: The COMPLETE set of lanes this route may terminalize (Redmine #15166, review j#101909 finding 1).
-#:
-#: One entry, and it is the reproduction: #15164 "既知停止からの通常再開をfresh sessionで検証する",
-#: whose round-1 verdict is the non-gate ``## Independent audit — round 1`` j#101792, superseded by
-#: #15165 "通常再開4 stepを閉集合外操作なしでfresh session再検証する", whose ``## Gate: review``
-#: j#101810 concluded ``approved``.
-#:
-#: **Why an enumeration rather than a rule.** The binding between "this audit failure" and "that
-#: successor's acceptance" is a coordinator judgement, and no durable record in this workspace can
-#: carry it: two rounds of trying (mutual acknowledgement, then head coverage) were each refuted by
-#: measurement, because an unauthenticatable writer can produce both halves and — on a zero-change
-#: lane — every unrelated issue shares the same head. Until a writer/receipt authority bound to an
-#: actual coordinator action is ruled on, the honest form of this route is a list.
-#:
-#: Adding an entry is a deliberate act with a reviewed diff. It is NOT a config surface: the
-#: repo-local config's own contract says it carries "policy intent, not authority" and refuses
-#: authority-shaped keys, so an allowlist of terminals does not belong there either.
-SANCTIONED_MIGRATIONS: Tuple[SanctionedMigration, ...] = (
-    SanctionedMigration(
-        issue="15164",
-        audit_journal="101792",
-        successor_issue="15165",
-        successor_review_journal="101810",
-        lane="issue_15164_fresh_session_resume_verification",
-        lane_generation=1,
-        head="83a65e6dc5e9b6037020cd565e26e4af830d9b2a",
-        integration_branch="main",
-    ),
-)
-
-
-def sanctioned_migration(
-    declaration: "SupersededAuditFailureFacts",
-) -> Optional[SanctionedMigration]:
-    """The enumerated migration this declaration is, or ``None`` (pure).
-
-    Every field is compared as a LITERAL against the declaration's own projected values, so a
-    declaration that drifts in any identity — a different audit journal, a different successor, a
-    different review journal, a re-incarnated lane, a moved head, another integration branch — is
-    simply not this migration and gets no admission from it.
-
-    **There is deliberately NO parameter for the enumeration** (review j#102074 finding 1). R3
-    exposed one as a test seam and documented it as "the route never passes it"; the reviewer
-    reproduced an admission by handing a caller-supplied pin to this very function, and the point
-    stands regardless of what the application does: an authority-bearing decision API that ACCEPTS
-    a replacement authority has not fenced anything, and a source-inspection test of one caller
-    does not close the contract for every other caller (#14539 j#91797 F2 — an authority the caller
-    supplies fences nothing). :data:`SANCTIONED_MIGRATIONS` is read from module scope, so the
-    enumeration a decision uses is the package's own and cannot be passed in.
-    """
-    if not declaration.in_force or declaration.envelope is None:
-        return None
-    envelope = declaration.envelope
-    for pin in SANCTIONED_MIGRATIONS or ():
-        if (
-            pin.issue == declaration.issue
-            and pin.audit_journal == declaration.audit_journal
-            and pin.successor_issue == declaration.successor_issue
-            and pin.successor_review_journal == declaration.successor_review_journal
-            and pin.integration_branch == declaration.integration_branch
-            and pin.lane == envelope.lane
-            and pin.lane_generation == envelope.lane_generation
-            and pin.head.strip().lower() == envelope.head.strip().lower()
-        ):
-            return pin
-    return None
+    recorded: bool = False
+    decision_id: str = ""
+    workspace_id: str = ""
+    lane_id: str = ""
+    lane_generation: int = 0
+    lane_revision: int = 0
+    issue: str = ""
+    audit_journal: str = ""
+    successor_issue: str = ""
+    successor_review_journal: str = ""
+    head: str = ""
+    integration_branch: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -524,11 +485,18 @@ REASON_AUDIT_JOURNAL_NOT_EARLIER = "declared_audit_journal_is_not_older_than_the
 REASON_RECORD_DECLARES_CHANGE = "record_declares_repository_change"
 #: The declaration names ITSELF as its successor. An issue cannot supersede its own failed audit.
 REASON_SUCCESSOR_IS_SELF = "superseded_audit_failure_successor_is_the_same_issue"
-#: THE authority refusal (review j#101909 finding 1). The declaration's identities are not one of
-#: the lanes :data:`SANCTIONED_MIGRATIONS` enumerates, so this route has nothing to say about it —
-#: whatever else its records show. This is what keeps the route a bounded migration rather than a
-#: general no-review terminal, and it is the ONE refusal no durable record can talk its way past.
-REASON_NOT_A_SANCTIONED_MIGRATION = "not_an_enumerated_audit_failure_migration"
+#: THE authority refusal: no coordinator decision is recorded for this lane, or the decision
+#: surface itself could not be trusted. This is the ONE refusal no durable record can talk its way
+#: past, because no sequence of journal writes produces a decision record.
+REASON_NO_COORDINATOR_DECISION = "no_recorded_coordinator_terminal_decision"
+#: A decision IS recorded, but it is not about the world the retire measured — a different issue,
+#: audit journal, successor, review journal, lane, generation, head or integration branch. Drift
+#: since the decision was taken, or a decision about another terminal entirely.
+REASON_DECISION_DRIFTED = "coordinator_decision_names_another_terminal"
+#: The decision was taken against a different lifecycle REVISION than the row now carries. Single
+#: use lives here: the lane row moved since the coordinator decided, so this decision has either
+#: already authorized a mutation or was overtaken by one.
+REASON_DECISION_STALE_REVISION = "coordinator_decision_taken_against_another_lane_revision"
 #: The named successor's own record does not acknowledge superseding THIS issue and THIS audit
 #: record.
 REASON_SUCCESSOR_NOT_ACKNOWLEDGED = "successor_does_not_acknowledge_the_audit_supersession"
@@ -564,7 +532,9 @@ SUPERSEDED_AUDIT_FAILURE_REFUSAL_REASONS: frozenset[str] = frozenset(
         REASON_AUDIT_JOURNAL_NOT_EARLIER,
         REASON_RECORD_DECLARES_CHANGE,
         REASON_SUCCESSOR_IS_SELF,
-        REASON_NOT_A_SANCTIONED_MIGRATION,
+        REASON_NO_COORDINATOR_DECISION,
+        REASON_DECISION_DRIFTED,
+        REASON_DECISION_STALE_REVISION,
         REASON_SUCCESSOR_NOT_ACKNOWLEDGED,
         REASON_SUCCESSOR_INCOMPLETE,
         REASON_SUCCESSOR_REVIEW_HEAD_MISMATCH,
@@ -584,6 +554,7 @@ def evaluate_superseded_audit_failure_admissible(
     declaration: SupersededAuditFailureFacts,
     *,
     audit: AuditRecordEvidence,
+    decision: CoordinatorTerminalDecision = CoordinatorTerminalDecision(),
     acknowledgement: AuditSupersessionAcknowledgementFacts,
     successor: SuccessorEvidence,
     successor_review_head: str = "",
@@ -599,6 +570,7 @@ def evaluate_superseded_audit_failure_admissible(
     expected_workspace: str = "",
     expected_lane: str = "",
     expected_lane_generation: int = 0,
+    expected_lane_revision: int = 0,
     live_head: str = "",
     live_commits_ahead: Optional[int] = None,
     worktree_clean: bool = False,
@@ -633,10 +605,10 @@ def evaluate_superseded_audit_failure_admissible(
     7. the SUCCESSOR is a different issue, its own record ACKNOWLEDGES superseding this issue and
        this audit record, and it has itself completed: its newest round is the approval the
        acknowledgement names, and it is durably closed;
-    8. **the whole tuple is an ENUMERATED migration** — :data:`SANCTIONED_MIGRATIONS` names this
-       source issue, audit journal, successor issue, successor review journal, lane, generation,
-       head and integration branch. This is the authority; the rest are conjuncts;
-    9. that approved Review Gate examined the pinned head — the head its own ``review_result``
+    8. **a coordinator DECISION is recorded for this lane** and names this exact source issue,
+       audit journal, successor issue, successor review journal, lane, generation, revision, head
+       and integration branch. This is the authority; the rest are conjuncts;
+    9. that approved Review Gate examined the decided head — the head its own ``review_result``
        marker carries, which the shared grammar has already correlated against the head its
        ``review_request`` pinned;
     10. the live repository still agrees, and the measurement is about THIS lane: the probed branch
@@ -644,14 +616,16 @@ def evaluate_superseded_audit_failure_admissible(
         recorded against, the worktree is proven CLEAN, and it carries no commit the integration
         branch lacks.
 
-    **Why (8) and not a rule.** Two rounds tried to derive the binding between this audit failure
-    and that successor's acceptance from records, and each was refuted by measurement: R1's mutual
-    acknowledgement (review j#101880 finding 1 — one unauthenticatable writer can place both
-    halves), then R2's head coverage (review j#101909 finding 1 — on a zero-change lane the lane
-    head IS the integration head, so every unrelated approved issue on that base shares it, and a
-    successor review about entirely different work still admitted). The binding is a coordinator
-    judgement and this workspace has no authority that can carry one. So it is enumerated instead,
-    where a journal author cannot reach it.
+    **Why (8) is a decision and not a rule.** Three rounds tried to derive the binding between this
+    audit failure and that successor's acceptance, and each was refuted: R1's mutual acknowledgement
+    (review j#101880 finding 1 — one unauthenticatable writer can place both halves), R2's head
+    coverage (review j#101909 finding 1 — on a zero-change lane the lane head IS the integration
+    head, so every unrelated approved issue on that base shares it), and R3's in-package
+    enumeration (review j#102074 finding 1 reached it as an argument; scope decision j#102081 ruled
+    out enumerating issue ids at all, since that makes every future lane a product change). The
+    binding is a coordinator judgement, and ``managed-state-model.md`` places a judgement taken at
+    a mozyo command boundary in ``desired_state``, whose authority is mozyo-owned persisted state —
+    so it is recorded there, where no journal write can reach it.
 
     (6) and (9) and (10) still bound the consequence: the record declares no change, the reviewed
     head is the lane head, and the lane carries zero commits over the integration branch with a
@@ -768,14 +742,40 @@ def evaluate_superseded_audit_failure_admissible(
     if declaration.successor_issue == issue:
         return AdmissionResult(False, REASON_SUCCESSOR_IS_SELF)
 
-    # THE authority (review j#101909 finding 1). Asked here, after the conjuncts that diagnose a
-    # malformed or drifted record on their own terms, and before every conjunct that could
-    # otherwise be read as substituting for it. A tuple this package does not enumerate gets no
-    # admission from this route, whatever its records say — that is what makes the route a bounded
-    # migration rather than a general no-review terminal, and it is the refusal an unauthenticatable
-    # writer cannot talk past: adding an entry is a reviewed code change, not a journal.
-    if sanctioned_migration(declaration) is None:
-        return AdmissionResult(False, REASON_NOT_A_SANCTIONED_MIGRATION)
+    # THE authority. Asked here, after the conjuncts that diagnose a malformed or drifted record on
+    # their own terms, and before every conjunct that could otherwise be read as substituting for
+    # it. A lane with no recorded coordinator decision gets no admission from this route, whatever
+    # its records say — that is the refusal an unauthenticatable writer cannot talk past, because no
+    # sequence of journal writes produces a decision record.
+    #
+    # Then the decision must be about THE WORLD THIS RETIRE MEASURED. Every field is compared
+    # against an independently sourced value: the declaration's own projection, the retire target's
+    # lifecycle row (workspace / lane / generation / revision), and the committed integration
+    # branch. Two sides of every comparison, never one value compared with itself (#14825 item 5).
+    if not decision.recorded:
+        return AdmissionResult(False, REASON_NO_COORDINATOR_DECISION)
+    if (
+        decision.workspace_id != str(expected_workspace).strip()
+        or decision.lane_id != str(expected_lane).strip()
+        or decision.lane_generation != expected_lane_generation
+        or decision.issue != issue
+        or decision.audit_journal != declaration.audit_journal
+        or decision.successor_issue != declaration.successor_issue
+        or decision.successor_review_journal != declaration.successor_review_journal
+        or decision.integration_branch != branch
+        or decision.head.strip().lower() != envelope.head.strip().lower()
+    ):
+        return AdmissionResult(False, REASON_DECISION_DRIFTED)
+    # Single use. The lane row's revision at decision time must still be the revision the retire
+    # measured: any lifecycle mutation since — including one this very decision already authorized
+    # — advances it, so a decision can never authorize a second write.
+    if (
+        not isinstance(expected_lane_revision, int)
+        or isinstance(expected_lane_revision, bool)
+        or expected_lane_revision <= 0
+        or decision.lane_revision != expected_lane_revision
+    ):
+        return AdmissionResult(False, REASON_DECISION_STALE_REVISION)
 
     # The successor's own acknowledgement — the half the source issue cannot write for itself
     # without also writing into the successor's record. Every identity must line up in both
@@ -956,7 +956,9 @@ __all__ = (
     "REASON_INVALID",
     "REASON_ISSUE_MISMATCH",
     "REASON_LANE_MISMATCH",
-    "REASON_NOT_A_SANCTIONED_MIGRATION",
+    "REASON_DECISION_DRIFTED",
+    "REASON_DECISION_STALE_REVISION",
+    "REASON_NO_COORDINATOR_DECISION",
     "REASON_NOT_RECORDED",
     "REASON_RECORD_DECLARES_CHANGE",
     "REASON_REVIEW_ROUND_RECORDED",
@@ -976,13 +978,11 @@ __all__ = (
     "SUPERSEDED_AUDIT_FAILURE_GATE",
     "SUPERSEDED_AUDIT_FAILURE_REFUSAL_REASONS",
     "SUPERSEDED_AUDIT_FAILURE_STATES",
-    "SANCTIONED_MIGRATIONS",
     "SUPERSEDED_AUDIT_FAILURE_VERSION",
-    "SanctionedMigration",
+    "CoordinatorTerminalDecision",
     "SupersededAuditFailureFacts",
     "TrackerIssueStatus",
     "evaluate_superseded_audit_failure_admissible",
-    "sanctioned_migration",
     "fold_audit_supersession_acknowledgement",
     "fold_superseded_audit_failure",
     "render_audit_supersession_acknowledgement_marker",
