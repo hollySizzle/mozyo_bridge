@@ -442,6 +442,14 @@ def write_declaration(
                     f"({previous.reason}: {previous.detail}), so it could not be "
                     f"restored if this write failed verification",
                 )
+            if previous is None:
+                # It existed at the lstat and was gone by the snapshot read, so
+                # the true previous state is "absent". Recording that (rather
+                # than leaving had_previous set with no backup) is what lets a
+                # rollback restore it by removing the new entry; otherwise a
+                # failed write would leave a declaration the operator never
+                # successfully set active in the workspace.
+                had_previous = False
             previous_bytes = previous
 
         created_at = declaration.created_at

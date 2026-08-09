@@ -626,6 +626,43 @@ class WorkspaceAliasRollbackAndSizeTests(WorkspaceAliasCliTestCase):
         self.assertFalse(alias_path(self.nested).exists())
         self.assertIn("could NOT be restored", payload["detail"])
 
+    def test_failed_write_does_not_leave_a_declaration_the_operator_never_set(
+        self,
+    ) -> None:
+        """The previous entry vanishing mid-write must not strand the new one.
+
+        Found by the implementer's own sweep of this surface, not by review: the
+        entry existed at the lstat and was gone by the snapshot read, so the
+        rollback had a "previous" it could not restore and declined to act —
+        leaving the *new* declaration active even though the write had failed.
+        The true previous state was "absent", so the rollback must remove it.
+        """
+        self.run_cli(
+            "workspace", "alias", "disable",
+            "--repo", str(self.nested), "--reason", "ORIGINAL",
+        )
+        path = alias_path(self.nested)
+        real_read_bytes = store._read_bytes
+
+        def vanishing(dirfd):
+            path.unlink(missing_ok=True)
+            return real_read_bytes(dirfd)
+
+        with mock.patch.object(store, "_read_bytes", vanishing), mock.patch.object(
+            store, "_read_with_dirfd",
+            return_value=store.refused("simulated", "verification failed"),
+        ):
+            code, payload = self.run_cli(
+                "workspace", "alias", "disable",
+                "--repo", str(self.nested), "--reason", "REPLACEMENT",
+            )
+        self.assertEqual(code, 1)
+        self.assertFalse(payload["mutated"])
+        self.assertFalse(
+            path.exists(),
+            "a failed write left a declaration the operator never set",
+        )
+
     # --- F2: a declaration can never force an unbounded allocation ---------
 
     def test_oversized_declaration_is_a_typed_refusal(self) -> None:
