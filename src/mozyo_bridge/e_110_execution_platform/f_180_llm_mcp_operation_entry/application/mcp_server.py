@@ -108,6 +108,11 @@ PHASE_READY = "ready"
 #: identity has not performed the negotiation the phase exists to perform.
 REQUIRED_INITIALIZE_PARAMS = ("protocolVersion", "capabilities", "clientInfo")
 
+#: Members the schema's ``Implementation`` type requires inside ``clientInfo``.
+#: Validated as *values*, not just as a present key: `{}` is a mapping but shares
+#: no implementation information, which is the whole point of the field.
+REQUIRED_CLIENT_INFO_FIELDS = ("name", "version")
+
 
 class CatalogSurfaceError(RuntimeError):
     """The tool catalog would publish a forbidden capability. Startup aborts."""
@@ -269,9 +274,28 @@ class McpServer:
             return error_response(
                 request.id, ERROR_INVALID_PARAMS, '"capabilities" must be an object'
             )
-        if not isinstance(params.get("clientInfo"), Mapping):
+        client_info = params.get("clientInfo")
+        if not isinstance(client_info, Mapping):
             return error_response(
                 request.id, ERROR_INVALID_PARAMS, '"clientInfo" must be an object'
+            )
+        # Validate INTO the object, not just its type (review j#102241 r2f1). The
+        # schema's `Implementation` requires `name` and `version` as strings
+        # (`title` is the only optional member), and checking only that clientInfo
+        # is a mapping accepted `{}` — which shares no implementation information
+        # at all, defeating the purpose of the field.
+        missing_info = [
+            name
+            for name in REQUIRED_CLIENT_INFO_FIELDS
+            if not isinstance(client_info.get(name), str) or not client_info[name].strip()
+        ]
+        if missing_info:
+            return error_response(
+                request.id,
+                ERROR_INVALID_PARAMS,
+                '"clientInfo" requires non-empty string '
+                + " and ".join(f"`{name}`" for name in REQUIRED_CLIENT_INFO_FIELDS),
+                {"invalid": missing_info, "required": list(REQUIRED_CLIENT_INFO_FIELDS)},
             )
 
         # Version negotiation: echo a version we both support, else answer with

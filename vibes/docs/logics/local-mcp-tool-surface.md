@@ -100,10 +100,14 @@ tool surface 全体が開いてしまった。
 | `initializing` | `ping` のみ（spec が許す唯一の先行 request） |
 | `ready` | 全 surface |
 
-- `initialize` は `protocolVersion` / `capabilities` / `clientInfo` の存在と型を検証する。
-  欠落・型不一致は `ERROR_INVALID_PARAMS`。2 度目の `initialize` は拒否する
-  （再 negotiation を許すと、既に応答済みの request がどの version で処理されたか
-  client が決定できない）。
+- `initialize` は `protocolVersion` / `capabilities` / `clientInfo` の存在と型を検証し、
+  **nested object の中まで検証する**。`clientInfo` は schema の `Implementation`
+  （`name: string` / `version: string` 必須、`title` のみ optional）に従い、両 member の
+  存在と非空 string を要求する。`{}` は mapping だが実装情報を何も共有しておらず、
+  この field の目的を満たさない（review j#102241 r2f1: 検証を top-level 3 key で
+  止めると、object であることしか保証しない）。欠落・型不一致は `ERROR_INVALID_PARAMS`。
+  2 度目の `initialize` は拒否する（再 negotiation を許すと、既に応答済みの request が
+  どの version で処理されたか client が決定できない）。
 - version negotiation は未対応 version を error にせず server 側 version を返す
   （MCP lifecycle 仕様どおり。client が使えなければ切断する）。
 - **notification 判定は `id` member の存在で行う。** JSON-RPC 2.0 は
@@ -112,7 +116,15 @@ tool surface 全体が開いてしまった。
   `"id": null` は Request であり null id で応答する。member 不在のみが notification。
   値だけで判定すると、client が待っている call を黙って捨てる。
 - `id` の値域は String / Number / NULL。**Boolean は拒否する**（Python では `bool` が
-  `int` の subclass なので `isinstance(x, int)` を素通りする）。
+  `int` の subclass なので `isinstance(x, int)` を素通りする）。**小数を含む Number は
+  受理する** — 仕様は「Numbers SHOULD NOT contain fractional parts」であり `SHOULD NOT`
+  は推奨であって禁止ではない。response は同値をそのまま返す（「It MUST be the same as
+  the value of the id member in the Request Object」）。
+- **入力側の JSON 妥当性も出力側と同じ強さで検査する。** `json.loads` の既定 decoder は
+  JSON に存在しない `NaN` / `Infinity` / `-Infinity` を受理するため、`parse_constant` で
+  parse error にする。出力側の `json.dumps(allow_nan=False)` と対を成す
+  （review j#102241 r2f2: 出力方向にだけ適用した片側実装だと、有効値を落としながら
+  無効 JSON を通すという逆向きの状態になる）。
 - id を読めなかった frame（parse error / batch / 非 object / 過大）は null id で応答する。
   notification だったと仮定して黙るより、request を hang させない方を採る。
 
@@ -125,15 +137,30 @@ MCP 側がこれを持たず tmux rail を無条件に呼ぶと、herdr backend 
 lane を解決できるのに MCP だけ `lane_unresolved` を返す — **backend を知らない第二の
 状態機械**になる。
 
-したがって選択は `f_140_.../application/workflow_step_plan_resolution.py` に 1 本化し、
-`herdr_backend_active()`（CLI と同じ共有 selector）で rail を選んでから各 rail の
-resolver へ委譲する。この entry は **resolution 専用**で、dispatch / delivery /
-lifecycle mutation / durable write を一切行わない。CLI 側の実行経路（store reconcile、
-startup-resume gate、disposition intake、forward leg）はそのまま CLI が持つ。
+したがって選択は `f_140_.../application/workflow_step_plan_resolution.py` の
+`resolve_step_plan()` に 1 本化し、**CLI と MCP の双方がこの entry を通る**。この entry は
+**resolution 専用**で、dispatch / delivery / lifecycle mutation / durable write を一切
+行わない。CLI 側の実行経路（store reconcile、startup-resume gate、disposition intake、
+forward leg）はその後段にそのまま残る。
 
-`resolve_herdr_step_outcome` が Namespace を取る点は CLI 隣接層で終端させ、MCP feature
-へ Namespace を持ち込まない（`cli-mcp-shared-application-api.md`「Namespace はここで
-終端」）。同 resolver が read するのは `repo` のみで、これは test で pin する。
+backend 判定そのものは 1 段下の `_herdr_step_preflight`（`herdr_backend_active()` と
+herdr resolver を結線している既存の seam）に置き、`resolve_step_plan` がそれを呼ぶ。
+判定を新 module へ複製せず既存 seam を経由するのは、runtime の判定点を 1 つに保ちつつ
+既存の scenario 被覆と test seam を移設しないためである。
+
+**この「1 本化」は test で構造的に固定する**（review j#102241 r2f3）。初版は新 module を
+足しながら MCP だけを配線し、CLI 側の分岐を残したまま docstring に「selection lives here,
+once」と書いていた — 3 箇所目を作って 1 箇所と称した状態だった。現在は
+`cmd_workflow_step` が `_herdr_step_preflight(` も `resolve_workflow_step(` も直接呼ばない
+ことと、両 entry が `resolve_step_plan` に到達することを test が断言する。
+
+CLI の exit 契約は保つ。`LaneUnavailable` は原因となった `SystemExit` を `abort` に保持し、
+CLI はそれを**そのまま再 raise** する（`die` は既に stderr へ書いているので exit code と
+stderr 出力は不変）。MCP 側だけが構造化 refusal へ変換する。
+
+Namespace は CLI 隣接層で終端させ、MCP feature へ持ち込まない
+（`cli-mcp-shared-application-api.md`「Namespace はここで終端」）。preflight が read するのは
+`repo` のみで、これは test で pin する。
 
 ## Path 契約
 
@@ -307,9 +334,11 @@ behavior 差分（意図的、#15151）: workflow-runtime store の構築が fai
 - `tests/integration/.../test_mcp_stdio_session.py`: lifecycle、未初期化拒否、
   unknown method / tool / malformed 引数、stdout 規律、EOF での終了、
   installed package（`python -m mozyo_bridge mcp serve`）の stdio smoke。
-- `tests/regressions/test_issue_15151_mcp_review_findings.py`: review j#102186 の
-  5 finding を finding ごとの class として pin する（lifecycle bypass / backend
-  選択 / path 契約と leak / id member 契約 / blocked claim の解除と envelope）。
+- `tests/regressions/test_issue_15151_mcp_review_findings.py`: 2 round 分の review
+  finding を finding ごとの class として pin する。round 1（j#102186）は lifecycle
+  bypass / backend 選択 / path 契約と leak / id member 契約 / blocked claim の解除と
+  envelope。round 2（j#102241）は `clientInfo` の nested 必須 member / Number 契約の
+  双方向（小数 id 受理・`NaN` 拒否）/ CLI と MCP が同一 entry を通ることの構造断言。
 - `mozyo-bridge health check`、`mozyo-bridge docs validate --repo .`。
 
 ## Next

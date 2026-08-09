@@ -28,6 +28,7 @@ reachable from a unit test without a subprocess or a pipe.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
@@ -137,6 +138,48 @@ class FrameError:
         return self.code == ERROR_PARSE or self.respond
 
 
+#: The non-JSON constants Python's default decoder accepts. JSON has no `NaN` or
+#: `Infinity` literal, so a frame containing one is not JSON at all and must be a
+#: parse error (review j#102241 r2f2). `json.dumps(allow_nan=False)` already
+#: refuses to *emit* them; this is the same rule applied on the way in, which the
+#: earlier version only applied on the way out.
+REJECTED_JSON_CONSTANTS = ("NaN", "Infinity", "-Infinity")
+
+
+def _reject_constant(name: str):
+    """``parse_constant`` hook: every JSON-invalid constant is a parse error."""
+    raise ValueError(f"{name} is not valid JSON")
+
+
+def _loads_strict(line: str):
+    """``json.loads`` with the non-JSON numeric constants refused."""
+    return json.loads(line, parse_constant=_reject_constant)
+
+
+def _is_legal_id(value: object) -> bool:
+    """True when ``value`` is a legal JSON-RPC id.
+
+    The spec allows "a String, Number, or NULL value". Concretely:
+
+    - ``bool`` is refused even though it subclasses ``int`` — it is a JSON
+      Boolean, not a Number;
+    - a **fractional** Number is accepted. The spec says "Numbers SHOULD NOT
+      contain fractional parts", and SHOULD NOT is a recommendation, not a
+      prohibition (review j#102241 r2f2); refusing ``1.5`` rejected a legal id.
+      The response echoes the value unchanged, as the spec requires;
+    - ``NaN`` / ``Infinity`` cannot reach here — they are not JSON and the
+      decoder already refused the frame — but the finite check states the
+      requirement locally rather than relying on that being true elsewhere.
+    """
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    return isinstance(value, str)
+
+
 def parse_frame(line: str) -> "JsonRpcRequest | FrameError":
     """Parse one stdio frame, fail-closed.
 
@@ -156,7 +199,7 @@ def parse_frame(line: str) -> "JsonRpcRequest | FrameError":
             respond=True,
         )
     try:
-        payload = json.loads(line)
+        payload = _loads_strict(line)
     except ValueError as exc:
         return FrameError(ERROR_PARSE, f"invalid JSON: {exc}", respond=True)
     if isinstance(payload, list):
@@ -175,9 +218,7 @@ def parse_frame(line: str) -> "JsonRpcRequest | FrameError":
     # an absent `id` is a notification. Collapsing them loses that distinction.
     has_id = "id" in payload
     raw_id = payload.get("id")
-    id_is_legal = raw_id is None or (
-        isinstance(raw_id, (str, int)) and not isinstance(raw_id, bool)
-    )
+    id_is_legal = raw_id is None or _is_legal_id(raw_id)
     request_id = raw_id if (has_id and id_is_legal) else None
 
     if payload.get("jsonrpc") != JSONRPC_VERSION:
@@ -194,7 +235,7 @@ def parse_frame(line: str) -> "JsonRpcRequest | FrameError":
         # `isinstance(x, int)` check because it subclasses int.
         return FrameError(
             ERROR_INVALID_REQUEST,
-            '"id" must be a string, a number, or null',
+            '"id" must be a string, a finite number, or null',
             None,
             respond=True,
         )
@@ -274,6 +315,7 @@ __all__ = (
     "JSONRPC_VERSION",
     "JsonRpcRequest",
     "MAX_FRAME_CHARS",
+    "REJECTED_JSON_CONSTANTS",
     "encode_message",
     "error_response",
     "parse_frame",

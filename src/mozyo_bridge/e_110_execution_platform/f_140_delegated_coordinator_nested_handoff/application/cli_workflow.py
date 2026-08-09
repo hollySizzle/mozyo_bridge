@@ -621,24 +621,40 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
     # divergent next-action state machine. The tmux path stays byte-identical (herdr_live is
     # None under `backend: tmux`, so `require_tmux()` and the tmux resolution run exactly as
     # before).
-    herdr_live = _herdr_step_preflight(args)
-    if herdr_live is not None:
-        live = herdr_live
-        # The herdr live anchor was verified against source-of-truth Redmine; issue-correlate the
-        # store reconcile against it so a caller-supplied store's cross-issue pending action is not
-        # surfaced onto this lane (Redmine #13489 F3c). The tmux path passes None (byte-invariant).
-        live_anchor_issue = _anchor_issue_of(live.durable_anchor)
-    else:
-        require_tmux()
-        self_pane = current_pane()
-        live = resolve_workflow_step(
-            _discover_candidates(),
-            self_pane=self_pane,
+    # Redmine #15151 review j#102241 r2f3: this branch used to select the backend
+    # itself, duplicating the selection the MCP entry also had to make. Both entries
+    # now go through the SAME `resolve_step_plan`, so "judgement in one place, two
+    # entries" holds for this family too. A `LaneUnavailable` carrying the original
+    # abort is re-raised unchanged, so the CLI's exit code and the stderr `die`
+    # already wrote stay byte-identical. Everything after this — the store reconcile,
+    # the dry-run / executable branch, the output envelope — is unchanged and stays
+    # the CLI's own executing half.
+    from mozyo_bridge.application.commands_common import repo_root_from_args
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_step_plan_resolution import (  # noqa: E501
+        LaneUnavailable,
+        resolve_step_plan,
+    )
+    from mozyo_bridge.shared.errors import die
+
+    try:
+        resolution = resolve_step_plan(
+            repo_root_from_args(args),
             anchor=_anchor_from_args(args),
             pending_callback=_pending_callback_from_args(args),
             session=session,
         )
-        live_anchor_issue = None
+    except LaneUnavailable as exc:
+        if exc.abort is not None:
+            raise exc.abort
+        die(str(exc))
+        raise  # pragma: no cover - `die` always raises
+    live = resolution.outcome
+    # The herdr live anchor was verified against source-of-truth Redmine; issue-correlate the
+    # store reconcile against it so a caller-supplied store's cross-issue pending action is not
+    # surfaced onto this lane (Redmine #13489 F3c). The tmux path passes None (byte-invariant).
+    live_anchor_issue = (
+        _anchor_issue_of(live.durable_anchor) if resolution.is_herdr else None
+    )
 
     # Reconcile the live routing outcome with the persisted runtime store's pending
     # action (Redmine #13291). The store is read fail-open: absent / unreadable degrades

@@ -1,15 +1,29 @@
-"""Regression pins for the #15151 review findings (Redmine j#102186, verdict j#102195).
+"""Regression pins for the #15151 review findings (two rounds).
 
 One class per finding, each reproducing the reported defect as it was reported and
 asserting the fixed behavior. These live in ``tests/regressions`` rather than beside
 the feature tests because their job is to keep *these specific defects* from
 returning, independently of how the feature's own specs are later reorganized.
 
-All five were accepted after independent reproduction; none was disputed.
+- Round 1: review j#102186, verdict j#102195 — ``Finding1``..``Finding5``.
+- Round 2: review j#102241, verdict j#102246 — ``R2F1``..``R2F3``, each covering a
+  place where the round-1 fix was too shallow (validation that stopped at the
+  top-level key, a value range tightened in one direction only, and a "shared"
+  entry only one caller actually used).
+
+All eight were accepted after independent reproduction; none was disputed.
+
+Note ``Finding4RequestIdTests.test_a_fractional_number_id_is_accepted``: round 1
+pinned the *opposite* behavior, and r2f2 corrected it. The test was rewritten
+rather than deleted so the correction stays visible at the place that asserted the
+wrong contract.
 """
 
 from __future__ import annotations
 
+import argparse
+import contextlib
+import inspect
 import io
 import json
 import sys
@@ -24,6 +38,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     cli_workflow,
     herdr_workflow_step,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E402,E501
+    workflow_step_plan_resolution as shared_resolution,
+)
 from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.runtime_observation import (  # noqa: E402,E501
     FRESHNESS_FRESH,
     FRESHNESS_UNKNOWN,
@@ -33,6 +50,7 @@ from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.applica
     PHASE_INITIALIZING,
     PHASE_READY,
     PHASE_UNINITIALIZED,
+    REQUIRED_CLIENT_INFO_FIELDS,
     REQUIRED_INITIALIZE_PARAMS,
     McpServer,
 )
@@ -52,6 +70,8 @@ from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.domain.
     ERROR_INVALID_PARAMS,
     ERROR_INVALID_REQUEST,
     ERROR_NOT_INITIALIZED,
+    ERROR_PARSE,
+    REJECTED_JSON_CONSTANTS,
     FrameError,
     JsonRpcRequest,
     parse_frame,
@@ -358,9 +378,16 @@ class Finding4RequestIdTests(unittest.TestCase):
         self.assertIsInstance(parsed, FrameError)
         self.assertTrue(parsed.respondable)
 
-    def test_a_float_id_is_still_refused(self) -> None:
+    def test_a_fractional_number_id_is_accepted(self) -> None:
+        """Corrected by review j#102241 r2f2 — see :class:`R2F2NumberContractTests`.
+
+        This round-1 fix originally refused ``1.5`` as part of tightening the id
+        check. The spec allows Number and only SHOULD NOT (not MUST NOT) fractional
+        parts, so refusing it rejected a legal id.
+        """
         parsed = parse_frame(json.dumps({"jsonrpc": "2.0", "id": 1.5, "method": "ping"}))
-        self.assertIsInstance(parsed, FrameError)
+        self.assertIsInstance(parsed, JsonRpcRequest)
+        self.assertEqual(parsed.id, 1.5)
 
 
 BLOCKED_NOTE = """## Sublane park
@@ -476,6 +503,214 @@ class Finding5StaleBlockedClaimTests(unittest.TestCase):
             ),
         )
         self.assertEqual(report.workflow.blocked.freshness, FRESHNESS_UNKNOWN)
+
+
+# --------------------------------------------------------------------------- #
+# Round 2 findings (review j#102241, verdict j#102246)
+# --------------------------------------------------------------------------- #
+
+
+class R2F1ClientInfoTests(unittest.TestCase):
+    """`clientInfo` was checked for being a mapping, not for its required members."""
+
+    def _initialize(self, client_info):
+        params = dict(INITIALIZE["params"], clientInfo=client_info)
+        return session([{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params}])
+
+    def test_the_required_member_list_matches_the_schema(self) -> None:
+        """MCP `Implementation extends BaseMetadata`: name + version, title optional."""
+        self.assertEqual(sorted(REQUIRED_CLIENT_INFO_FIELDS), ["name", "version"])
+
+    def test_an_empty_client_info_is_refused(self) -> None:
+        responses, _, server = self._initialize({})
+        self.assertEqual(responses[0]["error"]["code"], ERROR_INVALID_PARAMS)
+        self.assertEqual(server._phase, PHASE_UNINITIALIZED)
+
+    def test_each_required_member_is_individually_required(self) -> None:
+        for present, absent in (("name", "version"), ("version", "name")):
+            responses, _, _ = self._initialize({present: "x"})
+            error = responses[0]["error"]
+            self.assertEqual(error["code"], ERROR_INVALID_PARAMS, absent)
+            self.assertIn(absent, error["data"]["invalid"])
+
+    def test_non_string_members_are_refused(self) -> None:
+        responses, _, _ = self._initialize({"name": 5, "version": []})
+        error = responses[0]["error"]
+        self.assertEqual(error["code"], ERROR_INVALID_PARAMS)
+        self.assertEqual(sorted(error["data"]["invalid"]), ["name", "version"])
+
+    def test_blank_members_are_refused(self) -> None:
+        """`{"name": "  "}` shares no implementation information either."""
+        responses, _, _ = self._initialize({"name": "   ", "version": ""})
+        self.assertEqual(responses[0]["error"]["code"], ERROR_INVALID_PARAMS)
+
+    def test_a_well_formed_client_info_is_accepted(self) -> None:
+        responses, _, server = self._initialize({"name": "client", "version": "1.2.3"})
+        self.assertIn("result", responses[0])
+        self.assertEqual(server._phase, PHASE_INITIALIZING)
+
+    def test_an_optional_title_does_not_break_acceptance(self) -> None:
+        responses, _, _ = self._initialize(
+            {"name": "client", "version": "1", "title": "Client"}
+        )
+        self.assertIn("result", responses[0])
+
+
+class R2F2NumberContractTests(unittest.TestCase):
+    """The Number contract was inverted: legal ids refused, invalid JSON accepted."""
+
+    def test_fractional_number_ids_are_accepted_and_echoed_unchanged(self) -> None:
+        """The spec requires the response id to be the same value as the request's."""
+        for value in (1.5, -2.25, 0.1):
+            responses, _, _ = session(
+                [INITIALIZE, INITIALIZED, {"jsonrpc": "2.0", "id": value, "method": "ping"}]
+            )
+            self.assertEqual(responses[1]["id"], value)
+
+    def test_integer_and_string_ids_still_work(self) -> None:
+        for value in (7, -7, 0, "abc"):
+            parsed = parse_frame(
+                json.dumps({"jsonrpc": "2.0", "id": value, "method": "ping"})
+            )
+            self.assertIsInstance(parsed, JsonRpcRequest, value)
+            self.assertEqual(parsed.id, value)
+
+    def test_boolean_ids_are_still_refused(self) -> None:
+        """Loosening to Numbers must not re-admit Booleans via the int subclass."""
+        for value in (True, False):
+            parsed = parse_frame(
+                json.dumps({"jsonrpc": "2.0", "id": value, "method": "ping"})
+            )
+            self.assertIsInstance(parsed, FrameError, value)
+            self.assertEqual(parsed.code, ERROR_INVALID_REQUEST)
+
+    def test_structured_ids_are_still_refused(self) -> None:
+        for raw in ('{"jsonrpc":"2.0","id":{},"method":"ping"}',
+                    '{"jsonrpc":"2.0","id":[],"method":"ping"}'):
+            self.assertIsInstance(parse_frame(raw), FrameError, raw)
+
+    def test_the_non_json_numeric_constants_are_parse_errors(self) -> None:
+        """`json.loads` accepts NaN/Infinity by default; JSON has no such literal."""
+        for constant in REJECTED_JSON_CONSTANTS:
+            raw = '{"jsonrpc":"2.0","id":1,"method":"ping","params":{"x":%s}}' % constant
+            parsed = parse_frame(raw)
+            self.assertIsInstance(parsed, FrameError, constant)
+            self.assertEqual(parsed.code, ERROR_PARSE, constant)
+
+    def test_a_non_json_constant_as_the_id_is_a_parse_error(self) -> None:
+        parsed = parse_frame('{"jsonrpc":"2.0","id":NaN,"method":"ping"}')
+        self.assertIsInstance(parsed, FrameError)
+        self.assertEqual(parsed.code, ERROR_PARSE)
+
+    def test_an_initialize_carrying_a_non_json_constant_is_refused(self) -> None:
+        raw = (
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":'
+            '{"protocolVersion":"2025-06-18","capabilities":{"x":NaN},'
+            '"clientInfo":{"name":"t","version":"1"}}}'
+        )
+        out, err = io.StringIO(), io.StringIO()
+        server = McpServer(
+            context=ReadPlanContext(repo_root=ROOT, redmine_live=False),
+            stdin=io.StringIO(raw + "\n"),
+            stdout=out,
+            stderr=err,
+        )
+        server.serve()
+        response = json.loads(out.getvalue().strip())
+        self.assertEqual(response["error"]["code"], ERROR_PARSE)
+        self.assertEqual(server._phase, PHASE_UNINITIALIZED)
+
+
+class R2F3SingleSelectionPointTests(unittest.TestCase):
+    """Backend selection was still implemented twice: MCP here, CLI there."""
+
+    def test_the_cli_reaches_the_shared_resolution_entry(self) -> None:
+        """The half of the claim that was previously false."""
+        calls = {"shared": 0}
+        real = shared_resolution.resolve_step_plan
+
+        def spy(*args, **kwargs):
+            calls["shared"] += 1
+            return real(*args, **kwargs)
+
+        args = argparse.Namespace(
+            as_json=True, session=None, dry_run=True, repo=None, issue=None, journal=None
+        )
+        with patch.object(shared_resolution, "resolve_step_plan", spy), patch.object(
+            cli_workflow, "_herdr_step_preflight", lambda _a: None
+        ), patch.object(cli_workflow, "require_tmux", lambda: None), patch.object(
+            cli_workflow, "current_pane", lambda: "%self"
+        ), patch.object(
+            cli_workflow, "_discover_candidates", lambda: []
+        ), contextlib.redirect_stdout(io.StringIO()):
+            cli_workflow.cmd_workflow_step(args)
+        self.assertEqual(calls["shared"], 1)
+
+    def test_the_mcp_entry_reaches_the_same_shared_entry(self) -> None:
+        calls = {"shared": 0}
+        real = shared_resolution.resolve_step_plan
+
+        def spy(*args, **kwargs):
+            calls["shared"] += 1
+            return real(*args, **kwargs)
+
+        with patch.object(shared_resolution, "resolve_step_plan", spy), patch.object(
+            cli_workflow, "_herdr_step_preflight", lambda _a: None
+        ), patch.object(cli_workflow, "require_tmux", lambda: None), patch.object(
+            cli_workflow, "current_pane", lambda: "%self"
+        ), patch.object(cli_workflow, "_discover_candidates", lambda: []):
+            run_workflow_step_plan({}, ReadPlanContext(repo_root=ROOT))
+        self.assertEqual(calls["shared"], 1)
+
+    def test_the_cli_no_longer_selects_the_backend_itself(self) -> None:
+        """Structural: the CLI command body must not re-derive the selection.
+
+        `_herdr_step_preflight` is still the one place the backend check and the
+        herdr resolver are wired together — but it is reached *through* the shared
+        entry now, so `cmd_workflow_step` must not call it directly.
+        """
+        source = inspect.getsource(cli_workflow.cmd_workflow_step)
+        self.assertNotIn("_herdr_step_preflight(", source)
+        self.assertNotIn("resolve_workflow_step(", source)
+        self.assertIn("resolve_step_plan(", source)
+
+    def test_both_entries_agree_on_the_backend_for_the_same_repo(self) -> None:
+        """The property the single selection point exists to guarantee."""
+        sentinel = object()
+
+        class Outcome:
+            ok = True
+            durable_anchor = "none"
+
+            def as_payload(self):
+                return {"next_action": "x", "state": "y"}
+
+        outcome = Outcome()
+        with patch.object(cli_workflow, "_herdr_step_preflight", lambda _a: outcome):
+            mcp = run_workflow_step_plan({}, ReadPlanContext(repo_root=ROOT))
+            direct = shared_resolution.resolve_step_plan(ROOT)
+        self.assertEqual(mcp.payload["backend"], direct.backend)
+        self.assertIs(direct.outcome, outcome)
+        del sentinel
+
+    def test_a_lane_abort_preserves_the_clis_exit_contract(self) -> None:
+        """`die` already wrote to stderr; the CLI must re-raise that exact abort."""
+        from mozyo_bridge.shared.errors import CommandAbort
+
+        abort = CommandAbort("tmux is not installed or not in PATH")
+
+        def boom():
+            raise abort
+
+        args = argparse.Namespace(
+            as_json=True, session=None, dry_run=True, repo=None, issue=None, journal=None
+        )
+        with patch.object(cli_workflow, "_herdr_step_preflight", lambda _a: None), patch.object(
+            cli_workflow, "require_tmux", boom
+        ):
+            with self.assertRaises(CommandAbort) as caught:
+                cli_workflow.cmd_workflow_step(args)
+        self.assertIs(caught.exception, abort)
 
 
 if __name__ == "__main__":  # pragma: no cover
