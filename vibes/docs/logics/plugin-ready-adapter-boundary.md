@@ -1471,8 +1471,10 @@ again was not a safety property — it was a lost turn.
 budget** as the timeout path (`max_enter_resends`, default `1`), so the body is typed
 once and at most one extra Enter is ever pressed — a mixed `timeout`-then-`error`
 sequence cannot spend it twice. Only the error-armed re-wait uses the longer
-`error_resend_wait_timeout_ms` window (default 15s): the first wait *failed* rather
-than timing out, so it measured nothing about how long a start takes here.
+`error_resend_wait_timeout_ms` window (default **and hard maximum** 15s): the first
+wait *failed* rather than timing out, so it measured nothing about how long a start
+takes here. Non-positive values and values above 15s are rejected at construction;
+the safety window cannot be widened by configuration.
 
 The error gate is deliberately **stricter** than the timeout gate, and the asymmetry
 is the point. A timeout is a positive observation (the wait ran and saw no
@@ -1482,10 +1484,17 @@ cannot characterise the rail must positively establish what is on screen:
 | # | gate | skip reason on refusal |
 |---|---|---|
 | 1 | an injected `screen_guard` is bound (in production, the receiver profile's declared `startup_blockers`) | `screen_guard_unbound` |
-| 2 | `read_pane` succeeds and is non-blank (a blank read is never "clear") | `pane_unreadable` |
-| 3 | the guard finds no declared startup screen (trust / login / update-selection) | `startup_screen` |
-| 4 | the injected body is still in the composer (`composer_retains_body`) | `body_absent` |
-| 5 | a re-snapshot is not `blocked` — a runtime permission prompt would eat the Enter | `receiver_blocked` |
+| 2 | an injected `identity_probe` is bound, establishes the target identity before injection, and confirms the exact same non-blank identity immediately before the resend | `identity_probe_unbound` / `identity_unconfirmed` / `identity_drift` |
+| 3 | `read_pane` succeeds and is non-blank (a blank read is never "clear") | `pane_unreadable` |
+| 4 | the guard finds no declared startup screen (trust / login / update-selection) | `startup_screen` |
+| 5 | the injected body is still in the composer (`composer_retains_body`) | `body_absent` |
+| 6 | the runtime re-snapshot read succeeds and positively reports an injectable state (`awaiting_input` or `turn_ended`) | `state_unreadable` / `receiver_blocked` / `state_not_injectable` |
+
+The identity probe runs before the pane read. This prevents the resend gate from
+reading or acting on a locator that was recycled for a different agent during the
+failed-wait window. Likewise, `busy` and `unknown` are not treated as "not blocked":
+the former means a turn is already running and the latter is not a successful state
+observation, so both refuse the resend.
 
 The **timeout gate is untouched** (#15202 requirement 5): the same two checks, the
 same 8s re-wait, the same reader call sequence, and a rail constructed without a
