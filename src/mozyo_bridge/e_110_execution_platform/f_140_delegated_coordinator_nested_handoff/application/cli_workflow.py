@@ -111,13 +111,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     WorkflowAnchor,
     WorkflowStepOutcome,
     callback_rail_fields,
-    resolve_workflow_step,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_reconcile import (
     STORE_ABSENT,
     STORE_PRESENT,
     STORE_UNAVAILABLE,
-    reconcile_step_with_store,
 )
 
 
@@ -613,22 +611,23 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
     session = getattr(args, "session", None)
     dry_run = getattr(args, "dry_run", False)
 
-    # Resolve the LIVE lane outcome. The backend difference is confined here (mid-review
-    # #13489 j#74748 F2): under the herdr backend the lane is resolved herdr-natively from the
-    # launch-time sender identity; otherwise the tmux rail resolves it from `current_pane` +
-    # the tmux inventory. Everything after this — the store reconcile, the dry-run / executable
-    # branch, the output envelope — is backend-agnostic, so herdr no longer runs a second,
-    # divergent next-action state machine. The tmux path stays byte-identical (herdr_live is
-    # None under `backend: tmux`, so `require_tmux()` and the tmux resolution run exactly as
-    # before).
-    # Redmine #15151 review j#102241 r2f3: this branch used to select the backend
-    # itself, duplicating the selection the MCP entry also had to make. Both entries
-    # now go through the SAME `resolve_step_plan`, so "judgement in one place, two
-    # entries" holds for this family too. A `LaneUnavailable` carrying the original
-    # abort is re-raised unchanged, so the CLI's exit code and the stderr `die`
-    # already wrote stay byte-identical. Everything after this — the store reconcile,
-    # the dry-run / executable branch, the output envelope — is unchanged and stays
-    # the CLI's own executing half.
+    # Resolve the SAFE lane outcome through the shared entry both this CLI and the
+    # local MCP server go through (Redmine #15151 review j#102241 r2f3, then
+    # j#102599 r3f1). It performs, in one place:
+    #
+    #   1. the backend selection — herdr-native resolution from the attested
+    #      launch identity, else the tmux `current_pane` + inventory rail;
+    #   2. the store reconcile (#13291) — fail-open on an absent / unreadable
+    #      store, fail-closed when a gating pending action meets a forward leg;
+    #   3. the durable operator startup gate (#13813) — every resumable, legacy or
+    #      INDETERMINATE read routes to the zero-actuating resume leg so no normal
+    #      primitive runs while a gate is outstanding.
+    #
+    # Steps 2 and 3 used to live only here, so the MCP tool reported forward plans
+    # this command would have refused. Everything below — the disposition intake,
+    # the dry-run / executable branch, the output envelope — stays the CLI's own
+    # executing half. A `LaneUnavailable` carrying the original abort is re-raised
+    # unchanged, so the exit code and the stderr `die` already wrote are identical.
     from mozyo_bridge.application.commands_common import repo_root_from_args
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_step_plan_resolution import (  # noqa: E501
         LaneUnavailable,
@@ -642,42 +641,17 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
             anchor=_anchor_from_args(args),
             pending_callback=_pending_callback_from_args(args),
             session=session,
+            issue=(getattr(args, "issue", None) or "").strip(),
+            journal=(getattr(args, "journal", None) or "").strip(),
+            store_path=getattr(args, "store_path", None),
         )
     except LaneUnavailable as exc:
         if exc.abort is not None:
             raise exc.abort
         die(str(exc))
         raise  # pragma: no cover - `die` always raises
-    live = resolution.outcome
-    # The herdr live anchor was verified against source-of-truth Redmine; issue-correlate the
-    # store reconcile against it so a caller-supplied store's cross-issue pending action is not
-    # surfaced onto this lane (Redmine #13489 F3c). The tmux path passes None (byte-invariant).
-    live_anchor_issue = (
-        _anchor_issue_of(live.durable_anchor) if resolution.is_herdr else None
-    )
-
-    # Reconcile the live routing outcome with the persisted runtime store's pending
-    # action (Redmine #13291). The store is read fail-open: absent / unreadable degrades
-    # to the live outcome unchanged (backward compatible), a gating pending action
-    # fail-closed-gates a live forward leg, a pending non-gating action is surfaced.
-    # Fold the store with the SAME repo-local binding resume uses, resolved from the
-    # current self lane's repo root (review j#72693), so the reconcile input matches resume.
-    store_action, store_status = _load_store_action(args, repo_root=live.repo_root)
-    reconciled = reconcile_step_with_store(
-        live, store_action, store_status=store_status, live_anchor_issue=live_anchor_issue
-    )
-    outcome = reconciled.outcome
-
-    # Redmine #13813: a durable operator startup gate takes precedence — route this step to the
-    # exactly-once resume leg. The check reads the latest gate at action time and overrides the
-    # outcome for a resumable gate (``operator_reported_done``), a readable legacy gate (reapproval),
-    # AND every INDETERMINATE read (corrupt / unreadable / source error), which route to the leg's
-    # zero-actuating fail-closed disposition so no normal primitive runs (review j#79504 / j#79524
-    # F1). Only a DEFINITIVE no_gate (or a pre-clear / terminal / in-flight v3 gate) leaves the
-    # normal outcome to execute.
-    resume_outcome = _maybe_operator_startup_resume_outcome(args, outcome)
-    if resume_outcome is not None:
-        outcome = resume_outcome
+    reconciled = resolution.reconciled
+    outcome = resolution.outcome
 
     # Redmine #13892: gateway-owned disposition intake (the writer's ONLY production caller);
     # its result rides the envelope because an unseen refusal is an unrecoverable zero-write.

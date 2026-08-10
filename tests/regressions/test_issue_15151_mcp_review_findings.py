@@ -60,8 +60,10 @@ from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.applica
     run_workflow_step_plan,
 )
 from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.unit_state_tool import (  # noqa: E402,E501
+    VALUE_LANDED,
     UnitFacts,
     compose_unit_state,
+    landing_from_ledger_record,
 )
 from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.domain.blocker_claim import (  # noqa: E402,E501
     latest_blocker_claim,
@@ -84,6 +86,7 @@ from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.domain.
     UnitRecord,
 )
 from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.domain.unit_state import (  # noqa: E402,E501
+    VALUE_UNCONFIRMED,
     BlockedClaim,
 )
 
@@ -98,6 +101,44 @@ INITIALIZE = {
     },
 }
 INITIALIZED = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+
+
+def _forward_outcome():
+    """A real, ready forward outcome the safety composition can consume."""
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (  # noqa: E501
+        EXECUTION_READY,
+        WorkflowStepOutcome,
+    )
+
+    return WorkflowStepOutcome(
+        state="child_dispatch",
+        reason="",
+        execution=EXECUTION_READY,
+        next_action="dispatch the worker",
+        next_owner="child",
+        primitive="handoff send",
+    )
+
+
+@contextlib.contextmanager
+def _inert_safety():
+    """Neutralize the shared safety composition for tests about resolution only.
+
+    The store reconcile and the startup gate are exercised by
+    :class:`R3F1SafetyCompositionTests`; the backend-selection tests are about
+    which rail answers, so they hold both steps inert rather than depending on the
+    host's real store.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_reconcile import (  # noqa: E501
+        STORE_ABSENT,
+    )
+
+    with patch.object(
+        cli_workflow, "_load_store_action", lambda _a, repo_root="": (None, STORE_ABSENT)
+    ), patch.object(
+        cli_workflow, "_maybe_operator_startup_resume_outcome", lambda _a, _o: None
+    ):
+        yield
 
 
 def session(frames, *, repo_root: Path = ROOT):
@@ -207,14 +248,7 @@ class Finding2BackendSelectionTests(unittest.TestCase):
 
         def fake_herdr(_args):
             calls["herdr"] += 1
-
-            class Outcome:
-                ok = True
-
-                def as_payload(self):
-                    return {"next_action": "herdr", "state": "resolved"}
-
-            return Outcome()
+            return _forward_outcome()
 
         with patch(
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
@@ -226,7 +260,7 @@ class Finding2BackendSelectionTests(unittest.TestCase):
             cli_workflow, "_discover_candidates", fake_discover
         ), patch.object(
             herdr_workflow_step, "resolve_herdr_step_outcome", fake_herdr
-        ):
+        ), _inert_safety():
             outcome = run_workflow_step_plan({}, ReadPlanContext(repo_root=ROOT))
         return outcome, calls
 
@@ -253,23 +287,16 @@ class Finding2BackendSelectionTests(unittest.TestCase):
         seen = {}
 
         def capture(args):
-            seen["attrs"] = {
-                k for k in vars(args) if not k.startswith("_")
-            }
-
-            class Outcome:
-                ok = True
-
-                def as_payload(self):
-                    return {}
-
-            return Outcome()
+            seen["attrs"] = {k for k in vars(args) if not k.startswith("_")}
+            return _forward_outcome()
 
         with patch(
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
             "application.herdr_entrypoint_preflight.herdr_backend_active",
             return_value=True,
-        ), patch.object(herdr_workflow_step, "resolve_herdr_step_outcome", capture):
+        ), patch.object(
+            herdr_workflow_step, "resolve_herdr_step_outcome", capture
+        ), _inert_safety():
             run_workflow_step_plan({}, ReadPlanContext(repo_root=ROOT))
         self.assertEqual(seen["attrs"], {"repo"})
 
@@ -367,11 +394,17 @@ class Finding4RequestIdTests(unittest.TestCase):
         )
         self.assertEqual(len(responses), 1)
 
-    def test_a_malformed_notification_is_still_not_answered(self) -> None:
-        """A refused frame with no id member must stay unanswered."""
+    def test_an_invalid_request_without_an_id_is_answered(self) -> None:
+        """Corrected by review j#102599 r3f2 — see :class:`R3F2InvalidRequestTests`.
+
+        Round 1 asserted the opposite: that a refused frame with no id member stays
+        unanswered. But a Notification is a *Request object* without an id, and a
+        payload with a bad ``jsonrpc`` is not a Request object at all — so it is an
+        Invalid Request, which the spec answers with a null id.
+        """
         parsed = parse_frame(json.dumps({"jsonrpc": "1.0", "method": "ping"}))
         self.assertIsInstance(parsed, FrameError)
-        self.assertFalse(parsed.respondable)
+        self.assertTrue(parsed.respondable)
 
     def test_a_malformed_null_id_request_is_answered(self) -> None:
         parsed = parse_frame(json.dumps({"jsonrpc": "1.0", "id": None, "method": "ping"}))
@@ -531,18 +564,26 @@ class R2F1ClientInfoTests(unittest.TestCase):
             responses, _, _ = self._initialize({present: "x"})
             error = responses[0]["error"]
             self.assertEqual(error["code"], ERROR_INVALID_PARAMS, absent)
-            self.assertIn(absent, error["data"]["invalid"])
+            self.assertIn(f"clientInfo.{absent}", error["data"]["invalid"])
 
     def test_non_string_members_are_refused(self) -> None:
         responses, _, _ = self._initialize({"name": 5, "version": []})
         error = responses[0]["error"]
         self.assertEqual(error["code"], ERROR_INVALID_PARAMS)
-        self.assertEqual(sorted(error["data"]["invalid"]), ["name", "version"])
+        self.assertEqual(
+            sorted(error["data"]["invalid"]), ["clientInfo.name", "clientInfo.version"]
+        )
 
-    def test_blank_members_are_refused(self) -> None:
-        """`{"name": "  "}` shares no implementation information either."""
+    def test_blank_members_are_accepted(self) -> None:
+        """Corrected by review j#102599 r3f3 — see :class:`R3F3SchemaExactInitializeTests`.
+
+        Round 2 refused blank members on the argument that they share no
+        implementation information. That was this implementation's own rule: the
+        schema types `name` / `version` as strings with no length constraint, so a
+        blank one conforms. The acceptance boundary is the schema's.
+        """
         responses, _, _ = self._initialize({"name": "   ", "version": ""})
-        self.assertEqual(responses[0]["error"]["code"], ERROR_INVALID_PARAMS)
+        self.assertIn("result", responses[0])
 
     def test_a_well_formed_client_info_is_accepted(self) -> None:
         responses, _, server = self._initialize({"name": "client", "version": "1.2.3"})
@@ -676,22 +717,14 @@ class R2F3SingleSelectionPointTests(unittest.TestCase):
 
     def test_both_entries_agree_on_the_backend_for_the_same_repo(self) -> None:
         """The property the single selection point exists to guarantee."""
-        sentinel = object()
-
-        class Outcome:
-            ok = True
-            durable_anchor = "none"
-
-            def as_payload(self):
-                return {"next_action": "x", "state": "y"}
-
-        outcome = Outcome()
-        with patch.object(cli_workflow, "_herdr_step_preflight", lambda _a: outcome):
+        outcome = _forward_outcome()
+        with patch.object(
+            cli_workflow, "_herdr_step_preflight", lambda _a: outcome
+        ), _inert_safety():
             mcp = run_workflow_step_plan({}, ReadPlanContext(repo_root=ROOT))
             direct = shared_resolution.resolve_step_plan(ROOT)
         self.assertEqual(mcp.payload["backend"], direct.backend)
-        self.assertIs(direct.outcome, outcome)
-        del sentinel
+        self.assertIs(direct.live_outcome, outcome)
 
     def test_a_lane_abort_preserves_the_clis_exit_contract(self) -> None:
         """`die` already wrote to stderr; the CLI must re-raise that exact abort."""
@@ -711,6 +744,327 @@ class R2F3SingleSelectionPointTests(unittest.TestCase):
             with self.assertRaises(CommandAbort) as caught:
                 cli_workflow.cmd_workflow_step(args)
         self.assertIs(caught.exception, abort)
+
+
+# --------------------------------------------------------------------------- #
+# Round 3 findings (review j#102599 full-surface adversarial, verdict j#102632)
+# --------------------------------------------------------------------------- #
+
+
+def _gating_action():
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_next_action import (  # noqa: E501
+        WorkflowNextAction,
+    )
+
+    return WorkflowNextAction(
+        action="integrate",
+        owner_role="coordinator",
+        target_issue="15151",
+        route_identity="",
+        anchor="redmine:15151:1",
+        suggested_command="",
+        risk_level="high",
+        requires_confirmation=True,
+        blocked_reason="",
+        reason="pending integration",
+        provider="",
+    )
+
+
+class R3F1SafetyCompositionTests(unittest.TestCase):
+    """MCP returned the raw rail outcome, skipping the CLI's safety judgement."""
+
+    def _plan(self, *, store_action, store_status, resume=None):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_reconcile import (  # noqa: E501
+            STORE_ABSENT,
+        )
+
+        del STORE_ABSENT
+        with patch.object(
+            cli_workflow, "_herdr_step_preflight", lambda _a: _forward_outcome()
+        ), patch.object(
+            cli_workflow,
+            "_load_store_action",
+            lambda _a, repo_root="": (store_action, store_status),
+        ), patch.object(
+            cli_workflow, "_maybe_operator_startup_resume_outcome", lambda _a, _o: resume
+        ):
+            return run_workflow_step_plan({}, ReadPlanContext(repo_root=ROOT))
+
+    def test_a_gating_store_action_blocks_the_reported_plan(self) -> None:
+        """The reported defect: a forward plan the CLI would refuse to step."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_reconcile import (  # noqa: E501
+            STORE_PRESENT,
+        )
+
+        outcome = self._plan(store_action=_gating_action(), store_status=STORE_PRESENT)
+        self.assertEqual(outcome.payload["plan"]["execution"], "blocked")
+        self.assertFalse(outcome.payload["plan"]["ok"])
+        self.assertTrue(outcome.payload["safety_gated"])
+        self.assertTrue(outcome.is_error)
+
+    def test_an_absent_store_leaves_the_forward_plan_intact(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_reconcile import (  # noqa: E501
+            STORE_ABSENT,
+        )
+
+        outcome = self._plan(store_action=None, store_status=STORE_ABSENT)
+        self.assertEqual(outcome.payload["plan"]["execution"], "ready")
+        self.assertFalse(outcome.payload["safety_gated"])
+
+    def test_an_outstanding_startup_gate_overrides_the_plan(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_reconcile import (  # noqa: E501
+            STORE_ABSENT,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (  # noqa: E501
+            WorkflowStepOutcome,
+        )
+
+        gated = WorkflowStepOutcome(
+            state="startup_resume",
+            reason="operator_reported_done",
+            execution="blocked",
+            next_action="resume the operator startup gate",
+            next_owner="coordinator",
+            primitive="operator_startup_resume",
+        )
+        outcome = self._plan(
+            store_action=None, store_status=STORE_ABSENT, resume=gated
+        )
+        self.assertEqual(outcome.payload["plan"]["primitive"], "operator_startup_resume")
+        self.assertTrue(outcome.payload["safety_gated"])
+
+    def test_the_reconcile_disposition_reaches_the_tool_payload(self) -> None:
+        """A caller must be able to see that the store, not the lane, decided."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_reconcile import (  # noqa: E501
+            STORE_PRESENT,
+        )
+
+        outcome = self._plan(store_action=_gating_action(), store_status=STORE_PRESENT)
+        self.assertIn("reconcile_disposition", outcome.payload["plan"])
+
+    def test_both_entries_apply_the_same_composition(self) -> None:
+        """Structural: the CLI no longer owns the safety steps privately."""
+        cli_source = inspect.getsource(cli_workflow.cmd_workflow_step)
+        shared_source = inspect.getsource(shared_resolution)
+        for step in ("_load_store_action", "_maybe_operator_startup_resume_outcome"):
+            self.assertNotIn(f"{step}(args", cli_source, step)
+            self.assertIn(step, shared_source, step)
+
+
+class R3F2InvalidRequestTests(unittest.TestCase):
+    """An Invalid Request without an id was silently dropped as a notification."""
+
+    def test_a_bad_jsonrpc_version_without_an_id_is_answered(self) -> None:
+        parsed = parse_frame('{"jsonrpc":"1.0","method":"ping"}')
+        self.assertIsInstance(parsed, FrameError)
+        self.assertEqual(parsed.code, ERROR_INVALID_REQUEST)
+        self.assertTrue(parsed.respondable)
+
+    def test_a_non_string_method_without_an_id_is_answered(self) -> None:
+        parsed = parse_frame('{"jsonrpc":"2.0","method":5}')
+        self.assertIsInstance(parsed, FrameError)
+        self.assertTrue(parsed.respondable)
+
+    def test_a_missing_method_without_an_id_is_answered(self) -> None:
+        parsed = parse_frame('{"jsonrpc":"2.0"}')
+        self.assertIsInstance(parsed, FrameError)
+        self.assertTrue(parsed.respondable)
+
+    def test_the_server_answers_such_a_frame_with_a_null_id(self) -> None:
+        responses, _, _ = session(
+            [INITIALIZE, INITIALIZED, {"jsonrpc": "1.0", "method": "ping"}]
+        )
+        self.assertEqual(len(responses), 2)
+        self.assertIsNone(responses[1]["id"])
+        self.assertEqual(responses[1]["error"]["code"], ERROR_INVALID_REQUEST)
+
+    def test_array_params_without_an_id_stay_a_silent_notification(self) -> None:
+        """Deliberately unchanged: array params ARE a valid Request object.
+
+        JSON-RPC allows params "by-position through an Array"; MCP simply defines
+        no positional method. That makes it an application-level invalid-params on
+        a well-formed Request object, and such an object without an id is a
+        notification the server MUST NOT reply to.
+        """
+        parsed = parse_frame('{"jsonrpc":"2.0","method":"ping","params":[1]}')
+        self.assertIsInstance(parsed, FrameError)
+        self.assertFalse(parsed.respondable)
+
+    def test_a_genuine_notification_is_still_silent(self) -> None:
+        responses, _, _ = session(
+            [INITIALIZE, INITIALIZED, {"jsonrpc": "2.0", "method": "notifications/foo"}]
+        )
+        self.assertEqual(len(responses), 1)
+
+
+class R3F3SchemaExactInitializeTests(unittest.TestCase):
+    """The initialize acceptance boundary was both looser and tighter than the schema."""
+
+    def _init(self, **overrides):
+        params = dict(INITIALIZE["params"])
+        params.update(overrides)
+        responses, _, server = session(
+            [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params}]
+        )
+        return responses[0], server
+
+    def test_a_non_string_client_info_title_is_refused(self) -> None:
+        response, _ = self._init(clientInfo={"name": "t", "version": "1", "title": []})
+        self.assertEqual(response["error"]["code"], ERROR_INVALID_PARAMS)
+        self.assertIn("clientInfo.title", response["error"]["data"]["invalid"])
+
+    def test_a_non_object_roots_capability_is_refused(self) -> None:
+        response, _ = self._init(capabilities={"roots": 1})
+        self.assertIn("capabilities.roots", response["error"]["data"]["invalid"])
+
+    def test_a_non_boolean_roots_list_changed_is_refused(self) -> None:
+        response, _ = self._init(capabilities={"roots": {"listChanged": "yes"}})
+        self.assertIn(
+            "capabilities.roots.listChanged", response["error"]["data"]["invalid"]
+        )
+
+    def test_an_empty_name_and_version_are_accepted(self) -> None:
+        """The schema states no length constraint; the non-empty rule was ours."""
+        response, server = self._init(clientInfo={"name": "", "version": ""})
+        self.assertIn("result", response)
+        self.assertEqual(server._phase, PHASE_INITIALIZING)
+
+    def test_required_members_are_still_required_and_typed(self) -> None:
+        for bad in ({"version": "1"}, {"name": "t"}, {"name": 5, "version": "1"}):
+            response, _ = self._init(clientInfo=bad)
+            self.assertEqual(response["error"]["code"], ERROR_INVALID_PARAMS, bad)
+
+    def test_a_fully_conforming_initialize_with_optionals_is_accepted(self) -> None:
+        response, _ = self._init(
+            clientInfo={"name": "c", "version": "1", "title": "C"},
+            capabilities={"roots": {"listChanged": True}, "sampling": {}},
+        )
+        self.assertIn("result", response)
+
+
+class R3F4DeliveryLandingTests(unittest.TestCase):
+    """`no known anomaly` was read as `landed` — an absence turned into a fact."""
+
+    class _Record:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+    def test_an_uninterpretable_ledger_row_is_unconfirmed(self) -> None:
+        self.assertEqual(
+            landing_from_ledger_record(self._Record(status="wat", reason="")),
+            VALUE_UNCONFIRMED,
+        )
+
+    def test_an_empty_ledger_row_is_unconfirmed(self) -> None:
+        self.assertEqual(landing_from_ledger_record(self._Record()), VALUE_UNCONFIRMED)
+
+    def test_no_record_at_all_is_unconfirmed(self) -> None:
+        self.assertEqual(landing_from_ledger_record(None), VALUE_UNCONFIRMED)
+
+    def test_only_a_confirmed_submission_is_landed(self) -> None:
+        record = self._Record(status="sent", reason="ok", mode="standard")
+        self.assertEqual(landing_from_ledger_record(record), VALUE_LANDED)
+
+    def test_the_shared_injection_stage_authority_is_what_decides(self) -> None:
+        """No second delivery verdict: the same authority `delivered` uses."""
+        source = inspect.getsource(landing_from_ledger_record)
+        self.assertIn("injection_stage_for_outcome", source)
+        self.assertIn("STAGE_SUBMITTED_CONFIRMED", source)
+
+    def test_an_unread_delivery_source_stays_unknown_not_unconfirmed(self) -> None:
+        report = compose_unit_state(UNIT, UnitFacts(delivery_readable=False))
+        self.assertEqual(report.delivery.outcome.value, "unknown")
+
+
+class R3F5PerRoleRuntimeTests(unittest.TestCase):
+    """The runtime axis copied one lane value onto every role."""
+
+    def _facts(self, observed_rows):
+        from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.unit_state_tool import (  # noqa: E501
+            LiveUnitStateSource,
+        )
+
+        source = LiveUnitStateSource(ReadPlanContext(repo_root=ROOT))
+        with patch(
+            "mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui."
+            "application.cockpit_payload.herdr_observed_units",
+            return_value=(observed_rows, []),
+        ):
+            return source._runtime_observation(
+                UnitRecord(
+                    workspace_id="ws1",
+                    lane_id="lane1",
+                    project_id="p",
+                    roles=("gateway", "worker"),
+                )
+            )
+
+    class _Row:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+    def test_distinct_per_role_states_are_reported_distinctly(self) -> None:
+        row = self._Row(
+            workspace_id="ws1",
+            lane_id="lane1",
+            backend="herdr",
+            role_runtime_states=(("gateway", "awaiting_input"), ("worker", "busy")),
+        )
+        observation = self._facts([row])
+        self.assertEqual(
+            dict(observation.roles), {"gateway": "awaiting_input", "worker": "busy"}
+        )
+        self.assertTrue(observation.readable)
+
+    def test_the_backend_field_holds_a_backend_not_a_runtime_state(self) -> None:
+        row = self._Row(
+            workspace_id="ws1",
+            lane_id="lane1",
+            backend="herdr",
+            role_runtime_states=(("gateway", "busy"),),
+        )
+        self.assertEqual(self._facts([row]).backend, "herdr")
+
+    def test_a_role_the_fold_does_not_cover_is_unknown_not_copied(self) -> None:
+        """The reported defect: a lane-level value standing in for a role read."""
+        row = self._Row(
+            workspace_id="ws1",
+            lane_id="lane1",
+            backend="herdr",
+            role_runtime_states=(("gateway", "busy"),),
+        )
+        observation = self._facts([row])
+        self.assertEqual(dict(observation.roles)["worker"], "unknown")
+
+    def test_no_matching_unit_reports_every_role_unknown(self) -> None:
+        row = self._Row(
+            workspace_id="other", lane_id="lane1", backend="herdr", role_runtime_states=()
+        )
+        observation = self._facts([row])
+        self.assertEqual(
+            dict(observation.roles), {"gateway": "unknown", "worker": "unknown"}
+        )
+        self.assertFalse(observation.readable)
+
+    def test_an_unavailable_fold_reports_unknown_rather_than_raising(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.unit_state_tool import (  # noqa: E501
+            LiveUnitStateSource,
+        )
+
+        source = LiveUnitStateSource(ReadPlanContext(repo_root=ROOT))
+        with patch(
+            "mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui."
+            "application.cockpit_payload.herdr_observed_units",
+            side_effect=RuntimeError("herdr unavailable"),
+        ):
+            observation = source._runtime_observation(
+                UnitRecord(
+                    workspace_id="ws1", lane_id="lane1", project_id="p", roles=("worker",)
+                )
+            )
+        self.assertEqual(dict(observation.roles), {"worker": "unknown"})
+        self.assertFalse(observation.readable)
 
 
 if __name__ == "__main__":  # pragma: no cover

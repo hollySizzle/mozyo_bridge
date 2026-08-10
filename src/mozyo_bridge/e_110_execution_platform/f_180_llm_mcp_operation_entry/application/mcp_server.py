@@ -108,10 +108,95 @@ PHASE_READY = "ready"
 #: identity has not performed the negotiation the phase exists to perform.
 REQUIRED_INITIALIZE_PARAMS = ("protocolVersion", "capabilities", "clientInfo")
 
-#: Members the schema's ``Implementation`` type requires inside ``clientInfo``.
-#: Validated as *values*, not just as a present key: `{}` is a mapping but shares
-#: no implementation information, which is the whole point of the field.
+#: Members the schema's ``Implementation`` type requires inside ``clientInfo``
+#: (``Implementation extends BaseMetadata``: ``name: string`` + ``version: string``).
 REQUIRED_CLIENT_INFO_FIELDS = ("name", "version")
+
+#: Optional members and their required types, per the schema. Validated so the
+#: acceptance boundary is the schema's — no looser, no tighter (review j#102599
+#: r3f3). ``BaseMetadata.title`` is the only optional member of ``Implementation``.
+OPTIONAL_CLIENT_INFO_TYPES = {"title": str}
+
+#: ``ClientCapabilities``: every member optional. ``roots`` is an object with an
+#: optional boolean ``listChanged``; the rest are plain objects.
+OPTIONAL_CAPABILITY_TYPES = {
+    "experimental": Mapping,
+    "roots": Mapping,
+    "sampling": Mapping,
+    "elicitation": Mapping,
+}
+
+#: ``ClientCapabilities.roots``' own optional members.
+OPTIONAL_ROOTS_TYPES = {"listChanged": bool}
+
+
+def _type_violations(
+    obj: Mapping[str, Any], expected: Mapping[str, Any], prefix: str
+) -> list:
+    """Report every optional member of ``obj`` whose type is not ``expected``.
+
+    Absent members are fine — every entry in ``expected`` is optional. Present
+    ones must match, because a member the schema types is a member a conforming
+    client sends correctly; accepting a wrong type there hides a real defect.
+    ``bool`` is checked before ``int``-ish types would matter, and ``Mapping`` is
+    used rather than ``dict`` so any mapping the decoder produced is accepted.
+    """
+    violations = []
+    for name, want in expected.items():
+        if name not in obj:
+            continue
+        value = obj[name]
+        if want is bool:
+            ok = isinstance(value, bool)
+        elif want is str:
+            ok = isinstance(value, str)
+        else:
+            ok = isinstance(value, want)
+        if not ok:
+            violations.append(f"{prefix}.{name}")
+    return violations
+
+
+def _initialize_param_violations(params: Mapping[str, Any]) -> list:
+    """Every ``initialize`` param that does not match the MCP schema.
+
+    The acceptance boundary IS the schema:
+
+    - ``clientInfo`` (``Implementation``): ``name`` and ``version`` are required
+      strings; ``title`` is an optional string. Neither required member carries a
+      length or format constraint, so ``""`` is a conforming value and is
+      accepted — the previous non-empty rule was this implementation's own.
+    - ``capabilities`` (``ClientCapabilities``): every member optional;
+      ``roots`` is an object whose optional ``listChanged`` is a boolean.
+    """
+    violations: list = []
+
+    client_info = params.get("clientInfo")
+    if not isinstance(client_info, Mapping):
+        violations.append("clientInfo")
+    else:
+        violations.extend(
+            f"clientInfo.{name}"
+            for name in REQUIRED_CLIENT_INFO_FIELDS
+            if not isinstance(client_info.get(name), str)
+        )
+        violations.extend(
+            _type_violations(client_info, OPTIONAL_CLIENT_INFO_TYPES, "clientInfo")
+        )
+
+    capabilities = params.get("capabilities")
+    if not isinstance(capabilities, Mapping):
+        violations.append("capabilities")
+    else:
+        violations.extend(
+            _type_violations(capabilities, OPTIONAL_CAPABILITY_TYPES, "capabilities")
+        )
+        roots = capabilities.get("roots")
+        if isinstance(roots, Mapping):
+            violations.extend(
+                _type_violations(roots, OPTIONAL_ROOTS_TYPES, "capabilities.roots")
+            )
+    return violations
 
 
 class CatalogSurfaceError(RuntimeError):
@@ -270,32 +355,20 @@ class McpServer:
                 '"protocolVersion" must be a non-empty string',
                 {"supported": list(SUPPORTED_PROTOCOL_VERSIONS)},
             )
-        if not isinstance(params.get("capabilities"), Mapping):
-            return error_response(
-                request.id, ERROR_INVALID_PARAMS, '"capabilities" must be an object'
-            )
-        client_info = params.get("clientInfo")
-        if not isinstance(client_info, Mapping):
-            return error_response(
-                request.id, ERROR_INVALID_PARAMS, '"clientInfo" must be an object'
-            )
-        # Validate INTO the object, not just its type (review j#102241 r2f1). The
-        # schema's `Implementation` requires `name` and `version` as strings
-        # (`title` is the only optional member), and checking only that clientInfo
-        # is a mapping accepted `{}` — which shares no implementation information
-        # at all, defeating the purpose of the field.
-        missing_info = [
-            name
-            for name in REQUIRED_CLIENT_INFO_FIELDS
-            if not isinstance(client_info.get(name), str) or not client_info[name].strip()
-        ]
-        if missing_info:
+        # Validate INTO the nested objects, and validate them to *exactly* the
+        # schema (review j#102241 r2f1, then j#102599 r3f3). The first fix reached
+        # one level in and, in the same stroke, invented a non-empty requirement
+        # the schema does not state while still not typing `title` / `roots` /
+        # `roots.listChanged`. Both directions of that mismatch are defects: a
+        # check the schema does not ask for rejects legal clients, and a check it
+        # does ask for is the one that catches real malformation.
+        invalid = _initialize_param_violations(params)
+        if invalid:
             return error_response(
                 request.id,
                 ERROR_INVALID_PARAMS,
-                '"clientInfo" requires non-empty string '
-                + " and ".join(f"`{name}`" for name in REQUIRED_CLIENT_INFO_FIELDS),
-                {"invalid": missing_info, "required": list(REQUIRED_CLIENT_INFO_FIELDS)},
+                "`initialize` params do not match the MCP schema",
+                {"invalid": invalid},
             )
 
         # Version negotiation: echo a version we both support, else answer with

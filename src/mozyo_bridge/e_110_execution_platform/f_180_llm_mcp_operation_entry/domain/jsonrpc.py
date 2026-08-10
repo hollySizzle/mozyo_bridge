@@ -221,12 +221,20 @@ def parse_frame(line: str) -> "JsonRpcRequest | FrameError":
     id_is_legal = raw_id is None or _is_legal_id(raw_id)
     request_id = raw_id if (has_id and id_is_legal) else None
 
+    # An **Invalid Request** is answered even when it carried no id (review j#102599
+    # r3f2). A Notification is "a Request object *without* an id member" — a
+    # *Request object*, i.e. a well-formed one. A payload whose `jsonrpc` or
+    # `method` is wrong is not a Request object at all, so it cannot be a
+    # notification, and the spec's response rule contemplates exactly this case:
+    # "If there was an error in detecting the id in the Request object (e.g. Parse
+    # error/Invalid Request), it MUST be Null". Staying silent left the peer
+    # waiting on a malformed call it could not know we had dropped.
     if payload.get("jsonrpc") != JSONRPC_VERSION:
         return FrameError(
             ERROR_INVALID_REQUEST,
             f'"jsonrpc" must be exactly "{JSONRPC_VERSION}"',
             request_id,
-            respond=has_id and id_is_legal,
+            respond=True,
         )
     if has_id and not id_is_legal:
         # A float / bool / object id is outside the spec's "String, Number, or
@@ -245,16 +253,21 @@ def parse_frame(line: str) -> "JsonRpcRequest | FrameError":
             ERROR_INVALID_REQUEST,
             '"method" must be a non-empty string',
             request_id,
-            respond=has_id,
+            respond=True,
         )
     params = payload.get("params")
     if params is None:
         params = {}
     if not isinstance(params, dict):
-        # Positional (array) params have no meaning for any MCP method.
+        # Deliberately NOT the Invalid-Request treatment above. JSON-RPC allows
+        # params "either by-position through an Array or by-name through an
+        # Object", so an array here is a *well-formed* Request object; MCP simply
+        # defines no positional method. That makes it an application-level
+        # invalid-params, and a well-formed Request object without an id is a
+        # notification the server MUST NOT reply to.
         return FrameError(
             ERROR_INVALID_PARAMS,
-            '"params" must be an object',
+            '"params" must be an object; MCP defines no positional parameters',
             request_id,
             respond=has_id,
         )

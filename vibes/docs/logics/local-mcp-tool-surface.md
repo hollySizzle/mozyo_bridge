@@ -69,8 +69,9 @@ resolve_workflow_step / lane lifecycle store）
 3. **CLI が通す gate を skip せず、CLI が通さない gate を足さない**
    （`cli-mcp-shared-application-api.md` Invariant 2 / 3 を継承）。例:
    `workflow_step_plan` の anchor 規則は CLI の `_anchor_from_args` と同一
-   （`issue` 必須、`journal` 任意）。**backend 選択も判断であり複製しない**
-   （`## Backend 選択の共有`）。
+   （`issue` 必須、`journal` 任意）。**backend 選択も、その後段の安全判定も
+   判断であり複製しない**
+   （`## 安全判定の共有（step の resolution）`）。
 4. **stdout は MCP frame 専用。** 診断は stderr。frame は改行を含まないことを
    producer 側で検査し、書けない response は internal error frame へ degrade する。
 5. **受理した request には必ず 1 応答。notification には 1 応答も返さない。**
@@ -100,14 +101,21 @@ tool surface 全体が開いてしまった。
 | `initializing` | `ping` のみ（spec が許す唯一の先行 request） |
 | `ready` | 全 surface |
 
-- `initialize` は `protocolVersion` / `capabilities` / `clientInfo` の存在と型を検証し、
-  **nested object の中まで検証する**。`clientInfo` は schema の `Implementation`
-  （`name: string` / `version: string` 必須、`title` のみ optional）に従い、両 member の
-  存在と非空 string を要求する。`{}` は mapping だが実装情報を何も共有しておらず、
-  この field の目的を満たさない（review j#102241 r2f1: 検証を top-level 3 key で
-  止めると、object であることしか保証しない）。欠落・型不一致は `ERROR_INVALID_PARAMS`。
-  2 度目の `initialize` は拒否する（再 negotiation を許すと、既に応答済みの request が
-  どの version で処理されたか client が決定できない）。
+- `initialize` は `protocolVersion` / `capabilities` / `clientInfo` を検証し、
+  **nested object の中まで、かつ schema と過不足なく**検証する。
+  - `clientInfo`（`Implementation`）: `name: string` / `version: string` 必須、
+    `title?: string`。**長さ制約は schema に無いので空文字列も受理する**。
+  - `capabilities`（`ClientCapabilities`）: 全 member optional。`roots?: object`、
+    `roots.listChanged?: boolean`、`sampling?` / `elicitation?` / `experimental?` は object。
+  - 欠落・型不一致は `ERROR_INVALID_PARAMS` で、`invalid` に `clientInfo.title` の形の
+    dotted path を返す。
+  - 2 度目の `initialize` は拒否する（再 negotiation を許すと、既に応答済みの request が
+    どの version で処理されたか client が決定できない）。
+
+  この節は 2 度訂正されている。review j#102241 r2f1 は「検証を top-level 3 key で
+  止めていた」ことを、review j#102599 r3f3 は「1 階層だけ入って `title` / `roots` /
+  `listChanged` を素通りさせる一方、schema に無い**非空要件を独自に足していた**」ことを
+  指摘した。**受理境界は schema であり、それより緩くも厳しくもしない。**
 - version negotiation は未対応 version を error にせず server 側 version を返す
   （MCP lifecycle 仕様どおり。client が使えなければ切断する）。
 - **notification 判定は `id` member の存在で行う。** JSON-RPC 2.0 は
@@ -125,23 +133,52 @@ tool surface 全体が開いてしまった。
   parse error にする。出力側の `json.dumps(allow_nan=False)` と対を成す
   （review j#102241 r2f2: 出力方向にだけ適用した片側実装だと、有効値を落としながら
   無効 JSON を通すという逆向きの状態になる）。
+- **Invalid Request は id が無くても応答する**（review j#102599 r3f2）。notification は
+  「a Request object **without an id member**」であり、*Request object* すなわち
+  well-formed なものを指す。`jsonrpc` 不正・`method` 欠落/非 string は Request object
+  ですらないので notification ではなく、仕様の
+  「If there was an error in detecting the id in the Request object (e.g. Parse error/
+  **Invalid Request**), it MUST be Null」に従い null id で応答する。
+- ただし **`params` が Array の場合は notification として無応答**を維持する。JSON-RPC は
+  params を「by-position through an **Array** or by-name through an Object」と定めるため
+  Array は well-formed な Request object であり、MCP に positional method が無いことは
+  application 層の invalid-params にすぎない。well-formed な Request object から id を
+  省いたものは notification であり、応答してはならない。
 - id を読めなかった frame（parse error / batch / 非 object / 過大）は null id で応答する。
   notification だったと仮定して黙るより、request を hang させない方を採る。
 
-## Backend 選択の共有
+## 安全判定の共有（step の resolution）
 
-（review j#102186 finding_2 で確定。）
+（review j#102186 finding_2、j#102241 r2f3、j#102599 r3f1 で段階的に確定。）
 
 `workflow step` は repo の `terminal_transport.backend` で lane 解決 rail を選ぶ。
 MCP 側がこれを持たず tmux rail を無条件に呼ぶと、herdr backend の repo では CLI が
 lane を解決できるのに MCP だけ `lane_unresolved` を返す — **backend を知らない第二の
 状態機械**になる。
 
-したがって選択は `f_140_.../application/workflow_step_plan_resolution.py` の
+したがって `f_140_.../application/workflow_step_plan_resolution.py` の
 `resolve_step_plan()` に 1 本化し、**CLI と MCP の双方がこの entry を通る**。この entry は
 **resolution 専用**で、dispatch / delivery / lifecycle mutation / durable write を一切
-行わない。CLI 側の実行経路（store reconcile、startup-resume gate、disposition intake、
-forward leg）はその後段にそのまま残る。
+行わない。
+
+この entry が持つのは backend 選択だけではない。**step が「安全」と言えるかを決める判定
+一式**が入る（review j#102599 r3f1）。
+
+1. **rail 解決** — herdr / tmux の選択と、選ばれた rail の resolver。
+2. **store reconcile**（#13291）— store 不在・不読は fail-open、gating pending action が
+   forward leg に当たれば fail-closed で `blocked`。
+3. **durable operator startup gate**（#13813）— resumable / legacy / INDETERMINATE の
+   いずれも zero-actuating な resume leg へ回し、gate が outstanding な間は通常の
+   primitive を走らせない。
+
+2 と 3 は当初 CLI にしか無く、MCP は rail の生 outcome を返していた。その結果
+**CLI なら踏み止まる lane を、MCP は「安全な forward plan」として LLM に報告し得た**。
+「判断を 1 箇所」は rail を選ぶ判断だけでなく、**step を安全たらしめる判断**を覆わなければ
+意味がない。MCP payload は composed outcome と `safety_gated`（rail 単独の結果を安全判定が
+変えたか）を返す。
+
+CLI 側の**実行**経路（disposition intake、dry-run / executable 分岐、output envelope）は
+その後段にそのまま残る。
 
 backend 判定そのものは 1 段下の `_herdr_step_preflight`（`herdr_backend_active()` と
 herdr resolver を結線している既存の seam）に置き、`resolve_step_plan` がそれを呼ぶ。
@@ -190,7 +227,22 @@ exception **型名**のみを返す。
 | --- | --- | --- | --- |
 | `workflow` | Redmine durable record | issue status、latest gate / journal、next owner / action | runtime 観測 |
 | `runtime` | herdr / terminal runtime | gateway / worker の観測状態 | workflow truth、review、owner approval、task completion |
+
+**runtime は role 別の実観測を返すか、role ごとに `unknown` を返す**（review j#102599
+r3f5）。per-role state は cockpit read model の herdr `agent list` fold（`ObservedUnit.
+role_runtime_states`）から取る。fold が当該 Unit を覆っていない role は `unknown` とし、
+**lane 単位の値を複写しない**。複写すると payload は role 別の形をしているのに中身は
+同一値になり、caller は role 別観測が存在すると誤認する。`backend` field は backend 名
+（`herdr` / `tmux`）であって runtime state ではない。
 | `delivery` | delivery ledger / durable record | gateway / worker への dispatch outcome | 受信側の処理完了、task completion |
+
+**delivery の到達は積極的な信号からのみ導く**（review j#102599 r3f4）。共有の
+injection-stage authority（`injection_stage_for_outcome` → `STAGE_SUBMITTED_CONFIRMED`）を
+ledger record に適用し、それ以外はすべて `unconfirmed`、ledger 未読は `unknown` とする。
+初版は `anomaly == none` を `landed` と読んでいたが、`anomaly_from_ledger_record` は
+docstring どおり「解釈不能な行も healthy（偽警報を出さない）」ため、`none` は
+**既知の異常が無い**ことしか意味しない。それを到達観測へ昇格させるのは、本 read model が
+是正するために存在する欠陥（不在から状態を導く）そのものである。
 | `health` | 上記3軸の観測品質 | anomaly / degraded / freshness | 他3軸が何を言うか |
 
 `ack-completion-receiver-state.md` の layer 分離（layer 0 delivery ACK / layer 1
@@ -334,11 +386,19 @@ behavior 差分（意図的、#15151）: workflow-runtime store の構築が fai
 - `tests/integration/.../test_mcp_stdio_session.py`: lifecycle、未初期化拒否、
   unknown method / tool / malformed 引数、stdout 規律、EOF での終了、
   installed package（`python -m mozyo_bridge mcp serve`）の stdio smoke。
-- `tests/regressions/test_issue_15151_mcp_review_findings.py`: 2 round 分の review
+- `tests/regressions/test_issue_15151_mcp_review_findings.py`: 3 round 分の review
   finding を finding ごとの class として pin する。round 1（j#102186）は lifecycle
   bypass / backend 選択 / path 契約と leak / id member 契約 / blocked claim の解除と
   envelope。round 2（j#102241）は `clientInfo` の nested 必須 member / Number 契約の
   双方向（小数 id 受理・`NaN` 拒否）/ CLI と MCP が同一 entry を通ることの構造断言。
+  round 3（j#102599 full-surface adversarial）は安全判定の共有（gating store action と
+  startup gate が MCP の plan にも効くこと）/ id 無し Invalid Request への応答と Array
+  params の無応答維持 / initialize の schema 厳密一致 / 到達の積極信号化 / role 別
+  runtime 観測と `unknown` 維持。
+
+  この file は **誤った契約を pin していた test を 3 件、削除せず同じ位置で書き換えて**
+  いる（小数 id、非空 `clientInfo`、id 無し malformed frame の無応答）。訂正の痕跡を
+  誤った断言のあった場所に残すためで、削除すると「なぜこの契約なのか」の履歴が消える。
 - `mozyo-bridge health check`、`mozyo-bridge docs validate --repo .`。
 
 ## Next

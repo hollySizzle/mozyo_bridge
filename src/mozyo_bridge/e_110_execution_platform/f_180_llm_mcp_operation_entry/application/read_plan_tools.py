@@ -289,7 +289,12 @@ def run_workflow_step_plan(
     notes: list[str] = []
     anchor = _anchor_from(arguments, notes)
     try:
-        resolution = resolve_step_plan(context.repo_root, anchor=anchor)
+        resolution = resolve_step_plan(
+            context.repo_root,
+            anchor=anchor,
+            issue=str(arguments.get("issue", "") or "").strip(),
+            journal=str(arguments.get("journal", "") or "").strip(),
+        )
     except LaneUnavailable as exc:
         return ToolOutcome(
             payload={
@@ -304,18 +309,25 @@ def run_workflow_step_plan(
             summary="the current lane could not be resolved from the live runtime",
         )
 
+    # `resolution.outcome` is the SAFE outcome — the rail's result after the store
+    # reconcile and the durable startup gate. Reporting the raw rail result here
+    # was review j#102599 r3f1: it let this tool describe a forward step as safe
+    # on a lane the CLI would have refused to step.
     plan = resolution.outcome.as_payload()
-    # The plan describes what *would* be safe next. Strip nothing, but state the
-    # boundary in the payload so a reader cannot mistake a resolved executable leg
-    # for a performed one.
+    if resolution.reconciled is not None:
+        plan.update(resolution.reconciled.reconcile_payload_fields())
+    payload = {
+        "plan": plan,
+        "backend": resolution.backend,
+        "execution": EXECUTION_PLAN_ONLY,
+        "executed": False,
+        # True when a safety composition changed what the rail alone resolved, so a
+        # caller can see that a gate — not the lane's own state — decided this.
+        "safety_gated": resolution.gated,
+        "source_health": _health(bool(notes), notes),
+    }
     return ToolOutcome(
-        payload={
-            "plan": plan,
-            "backend": resolution.backend,
-            "execution": EXECUTION_PLAN_ONLY,
-            "executed": False,
-            "source_health": _health(bool(notes), notes),
-        },
+        payload=payload,
         is_error=not bool(getattr(resolution.outcome, "ok", True)),
         summary=(
             f"next step resolved on the {resolution.backend} backend: "

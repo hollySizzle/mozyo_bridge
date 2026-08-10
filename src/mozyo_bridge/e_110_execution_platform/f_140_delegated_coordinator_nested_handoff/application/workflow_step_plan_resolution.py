@@ -68,14 +68,32 @@ class LaneUnavailable(RuntimeError):
 
 @dataclass(frozen=True)
 class StepPlanResolution:
-    """One resolved step plan, plus which backend rail resolved it."""
+    """One resolved step plan: the SAFE outcome, plus how it was arrived at.
+
+    ``outcome`` is the outcome after every safety composition the CLI applies —
+    it is what a caller may act on or report, not the raw rail result.
+    ``live_outcome`` is the rail's own result before composition, kept so a caller
+    can show what changed. ``reconciled`` is the store-reconcile record (the CLI
+    renders its payload fields); ``startup_gated`` marks a step the durable
+    operator startup gate re-routed.
+    """
 
     outcome: Any
     backend: str
+    live_outcome: Any = None
+    reconciled: Any = None
+    startup_gated: bool = False
 
     @property
     def is_herdr(self) -> bool:
         return self.backend == BACKEND_HERDR
+
+    @property
+    def gated(self) -> bool:
+        """True when a safety composition changed the rail's own result."""
+        return self.startup_gated or (
+            self.live_outcome is not None and self.outcome is not self.live_outcome
+        )
 
 
 def resolve_step_plan(
@@ -84,30 +102,113 @@ def resolve_step_plan(
     anchor: Optional[Any] = None,
     pending_callback: Optional[Any] = None,
     session: Optional[str] = None,
+    issue: str = "",
+    journal: str = "",
+    store_path: Optional[str] = None,
 ) -> StepPlanResolution:
-    """Resolve the next safe workflow step for ``repo_root``'s current lane.
+    """Resolve the next SAFE workflow step for ``repo_root``'s current lane.
 
-    The single resolution entry both the CLI and MCP go through. The backend
-    selection itself lives one level down, in the herdr preflight seam
-    (:func:`_resolve_herdr`), so there is exactly one place at runtime that
-    decides which rail answers. Raises :class:`LaneUnavailable` when no lane can
-    be resolved.
+    The single resolution entry both the CLI and MCP go through. Two stages, in
+    order, and both are shared:
+
+    1. **rail resolution.** The backend selection lives one level down, in the
+       herdr preflight seam (:func:`_resolve_herdr`), so exactly one place at
+       runtime decides which rail answers.
+    2. **safety composition.** The rail's result is reconciled with the persisted
+       runtime store's pending action, and then checked against the durable
+       operator startup gate. Both can turn a forward leg into ``blocked``.
+
+    Stage 2 used to live only in the CLI (review j#102599 r3f1): the MCP tool
+    returned the raw rail outcome, so a lane the CLI would refuse to step —
+    because the store holds a gating pending action, or a startup gate is
+    outstanding — was reported to an LLM as a safe forward plan. "Judgement in
+    one place" has to cover the judgement that makes a step *safe*, not only the
+    one that picks a rail.
+
+    Raises :class:`LaneUnavailable` when no lane can be resolved.
 
     ``anchor`` / ``pending_callback`` / ``session`` are the already-determined
-    inputs to the tmux rail's pure state machine. The herdr rail takes none of
-    them — it verifies the lane's own anchor against the durable record and
-    classifies from the attested launch identity — so they are accepted and
-    ignored there rather than being forced into a shape it does not have.
+    inputs to the tmux rail's pure state machine; the herdr rail takes none of
+    them (it verifies the lane's own anchor against the durable record). ``issue``
+    / ``journal`` scope the startup-gate read, and ``store_path`` is the CLI's
+    hidden store override.
     """
     root = Path(repo_root)
     herdr_outcome = _resolve_herdr(root)
     if herdr_outcome is not None:
-        return StepPlanResolution(outcome=herdr_outcome, backend=BACKEND_HERDR)
+        live, backend = herdr_outcome, BACKEND_HERDR
+    else:
+        live, backend = (
+            _resolve_tmux(
+                anchor=anchor, pending_callback=pending_callback, session=session
+            ),
+            BACKEND_TMUX,
+        )
+    return _compose_safety(
+        live,
+        backend=backend,
+        repo_root=root,
+        issue=issue,
+        journal=journal,
+        store_path=store_path,
+    )
+
+
+def _compose_safety(
+    live,
+    *,
+    backend: str,
+    repo_root: Path,
+    issue: str,
+    journal: str,
+    store_path: Optional[str],
+) -> StepPlanResolution:
+    """Apply the store reconcile and the startup gate to a rail's raw outcome.
+
+    Both steps are reached through the ``cli_workflow`` seams that already own
+    them, for the same reason :func:`_resolve_herdr` is: one runtime decision
+    point, and the existing tests that patch those seams keep working.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+        cli_workflow,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_reconcile import (  # noqa: E501
+        reconcile_step_with_store,
+    )
+
+    args = argparse.Namespace(
+        repo=str(repo_root),
+        store_path=store_path,
+        issue=issue,
+        journal=journal,
+    )
+    # The herdr anchor was verified against source-of-truth Redmine; issue-correlate
+    # the reconcile against it so a store's cross-issue pending action is not
+    # surfaced onto this lane. The tmux rail passes None (byte-invariant).
+    live_anchor_issue = (
+        cli_workflow._anchor_issue_of(getattr(live, "durable_anchor", ""))
+        if backend == BACKEND_HERDR
+        else None
+    )
+    store_action, store_status = cli_workflow._load_store_action(
+        args, repo_root=getattr(live, "repo_root", "") or ""
+    )
+    reconciled = reconcile_step_with_store(
+        live, store_action, store_status=store_status, live_anchor_issue=live_anchor_issue
+    )
+    outcome = reconciled.outcome
+
+    resume_outcome = cli_workflow._maybe_operator_startup_resume_outcome(args, outcome)
+    startup_gated = resume_outcome is not None
+    if startup_gated:
+        outcome = resume_outcome
+
     return StepPlanResolution(
-        outcome=_resolve_tmux(
-            anchor=anchor, pending_callback=pending_callback, session=session
-        ),
-        backend=BACKEND_TMUX,
+        outcome=outcome,
+        backend=backend,
+        live_outcome=live,
+        reconciled=reconciled,
+        startup_gated=startup_gated,
     )
 
 

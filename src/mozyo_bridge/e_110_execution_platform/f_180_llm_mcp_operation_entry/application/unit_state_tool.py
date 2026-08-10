@@ -86,10 +86,64 @@ _RUNTIME_UNKNOWN = "unknown"
 #: The folded workflow state token that a blocker claim must agree with.
 _STATE_BLOCKED = "blocked"
 
+#: The delivery outcome reported when a landing was positively observed. Only the
+#: shared injection-stage authority may produce it (review j#102599 r3f4).
+VALUE_LANDED = "landed"
+
+
+def landing_from_ledger_record(record: object) -> str:
+    """Classify one delivery-ledger record's landing, from a POSITIVE signal only.
+
+    The defect this replaces (review j#102599 r3f4): the outcome used to be
+    derived as ``anomaly == none -> landed``. But
+    ``anomaly_from_ledger_record`` is documented as deliberately conservative —
+    "an uninterpretable row is healthy, not unknown, so the ledger join never
+    raises a false alarm" — so ``none`` means *no recognized anomaly*, which an
+    unreadable or unknown row also satisfies. Reading that as "the payload
+    landed" turns an absence into a positive observation: precisely the
+    derivation this whole read model exists to prevent, committed inside the
+    module whose docstring forbids it.
+
+    So landing is asked of the **shared injection-stage authority**
+    (``injection_stage_for_outcome``), the same one
+    ``handoff_application_service`` uses to decide ``delivered`` — no second
+    delivery verdict is invented here. Only
+    :data:`~...injection_stage.STAGE_SUBMITTED_CONFIRMED` ("submitted, and the
+    submission was confirmed") is a landing. Every other stage, and every record
+    the authority cannot classify, is :data:`VALUE_UNCONFIRMED`: we looked and did
+    not see it land, which is a different fact from not having looked.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (  # noqa: E501
+        STAGE_SUBMITTED_CONFIRMED,
+        injection_stage_for_outcome,
+    )
+
+    if record is None:
+        return VALUE_UNCONFIRMED
+    try:
+        stage = injection_stage_for_outcome(record)
+    except Exception:  # noqa: BLE001 - an unclassifiable record is unconfirmed
+        return VALUE_UNCONFIRMED
+    return VALUE_LANDED if stage == STAGE_SUBMITTED_CONFIRMED else VALUE_UNCONFIRMED
+
 
 def _utc_now_iso() -> str:
     """The current UTC instant, in the ISO8601 shape the snapshot envelope parses."""
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+@dataclass(frozen=True)
+class _RuntimeObservation:
+    """The per-role runtime read for one Unit.
+
+    ``backend`` is the transport the Unit was observed on (``herdr`` / ``tmux``) —
+    a backend name, not a runtime state. ``roles`` is ``(role, state)`` per role,
+    with ``unknown`` for any role the fold did not cover.
+    """
+
+    backend: str
+    roles: Tuple[Tuple[str, str], ...]
+    readable: bool
 
 
 @dataclass(frozen=True)
@@ -604,7 +658,15 @@ class LiveUnitStateSource:
 
         delivery_source_token = str(row.delivery_source or "")
         delivery_readable = delivery_source_token not in ("", "none")
-        runtime_readable = row.runtime_state != _RUNTIME_UNKNOWN
+        # The landing verdict comes from the ledger record itself through the
+        # shared injection-stage authority, never from "the fold reported no
+        # anomaly" (review j#102599 r3f4).
+        landing = (
+            landing_from_ledger_record(self._latest_ledger_record(sources.ledger, issue_id))
+            if delivery_readable
+            else ""
+        )
+        runtime = self._runtime_observation(unit)
 
         return UnitFacts(
             issue_id=issue_id,
@@ -619,16 +681,14 @@ class LiveUnitStateSource:
             workflow_observed_at=observed_at if workflow_readable else None,
             workflow_freshness=FRESHNESS_FRESH if workflow_readable else FRESHNESS_UNKNOWN,
             workflow_blocked=claim,
-            runtime_backend=row.runtime_state,
-            runtime_roles=tuple((role, row.runtime_state) for role in unit.roles),
+            runtime_backend=runtime.backend,
+            runtime_roles=runtime.roles,
             receive_method=row.receive_method,
-            runtime_readable=runtime_readable,
-            runtime_observed_at=observed_at if runtime_readable else None,
-            runtime_freshness=FRESHNESS_FRESH if runtime_readable else FRESHNESS_UNKNOWN,
+            runtime_readable=runtime.readable,
+            runtime_observed_at=observed_at if runtime.readable else None,
+            runtime_freshness=FRESHNESS_FRESH if runtime.readable else FRESHNESS_UNKNOWN,
             runtime_source=SOURCE_HERDR,
-            delivery_outcome=(
-                "" if row.delivery_anomaly != _ANOMALY_NONE else "landed"
-            ),
+            delivery_outcome=landing,
             delivery_anomaly=row.delivery_anomaly,
             delivery_anomaly_stale=(
                 bool(row.delivery_anomaly_stale) if delivery_readable else None
@@ -639,6 +699,65 @@ class LiveUnitStateSource:
             delivery_source=delivery_source_token or SOURCE_UNOBSERVED,
             notes=tuple(notes),
         )
+
+    @staticmethod
+    def _latest_ledger_record(ledger, issue_id: str):
+        """The issue's most recent delivery-ledger record, or ``None`` (fail-open)."""
+        if ledger is None:
+            return None
+        try:
+            records = ledger.records_for_issue(issue_id)
+        except Exception:  # noqa: BLE001 - a ledger read never breaks a read-only query
+            return None
+        return records[-1] if records else None
+
+    def _runtime_observation(self, unit: UnitRecord) -> "_RuntimeObservation":
+        """Per-role runtime observation for this Unit, or ``unknown`` per role.
+
+        The acceptance asks for the *gateway / worker* observed states. The
+        previous version copied one lane-level value onto every role and put that
+        same value in ``backend`` (review j#102599 r3f5), so the payload had the
+        shape of per-role observation without the substance — a reader could not
+        tell the two roles apart, and would reasonably assume it could.
+
+        The per-role states come from the live herdr ``agent list`` fold the
+        cockpit read model already performs; each Unit row carries
+        ``role_runtime_states`` as ``(role, state)`` pairs. When that fold does not
+        cover this Unit, each role is reported ``unknown`` rather than filled with
+        a lane-level substitute: not knowing per role is the honest answer, and it
+        is the answer this Feature's own rules require.
+        """
+        roles = tuple(unit.roles)
+        observed = ()
+        try:
+            from mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application.cockpit_payload import (  # noqa: E501
+                herdr_observed_units,
+            )
+
+            observed, _diagnostics = herdr_observed_units(
+                repo_root=Path(self.context.repo_root), now=datetime.now(timezone.utc)
+            )
+        except Exception:  # noqa: BLE001 - no live fold available: report unknown
+            observed = ()
+
+        states: dict = {}
+        backend = ""
+        for row in observed or ():
+            if (
+                str(getattr(row, "workspace_id", "") or "") != unit.workspace_id
+                or str(getattr(row, "lane_id", "") or "") != unit.lane_id
+            ):
+                continue
+            backend = str(getattr(row, "backend", "") or "")
+            states = {
+                str(role): str(state)
+                for role, state in (getattr(row, "role_runtime_states", ()) or ())
+            }
+            break
+
+        pairs = tuple((role, states.get(role, VALUE_UNKNOWN)) for role in roles)
+        readable = any(state != VALUE_UNKNOWN for _, state in pairs)
+        return _RuntimeObservation(backend=backend, roles=pairs, readable=readable)
 
     @staticmethod
     def _blocker_claim(
