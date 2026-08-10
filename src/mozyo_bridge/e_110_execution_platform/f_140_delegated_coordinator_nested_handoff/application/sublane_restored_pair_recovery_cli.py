@@ -33,7 +33,7 @@ def format_restored_pair_recovery_text(outcome) -> str:
             f"  {slot.slot_role}: provider={slot.provider or '-'} "
             f"locator={slot.locator or '-'} revision={slot.revision or '-'} "
             f"cwd_matches={slot.cwd_matches} attestation={slot.attestation_state} "
-            f"busy={slot.runtime_busy}"
+            f"runtime_state={slot.runtime_state} settled={slot.runtime_settled}"
         )
     if plan.blocked_reasons:
         lines.append("  blocked: " + ", ".join(plan.blocked_reasons))

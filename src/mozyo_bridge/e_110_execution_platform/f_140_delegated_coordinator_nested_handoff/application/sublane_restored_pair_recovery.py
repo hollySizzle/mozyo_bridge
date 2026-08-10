@@ -11,9 +11,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     render_recovery_owner_approval_marker,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.restored_pair_recovery import (  # noqa: E501
-    BLOCK_PAIR_HEALTHY,
     BLOCK_PAIR_INCOMPLETE,
-    BLOCK_SLOT_BUSY,
     STATUS_COMPLETED,
     STATUS_PREFLIGHT,
     STATUS_REFUSED,
@@ -57,7 +55,9 @@ class RestoredPairRecoveryOps(Protocol):
     def observe(self, request: RestoredPairRecoveryRequest) -> RestoredPairPlan:
         ...
 
-    def transaction_exists(self, action_id: str) -> bool:
+    def transaction_is_progressed_replay(
+        self, request: RestoredPairRecoveryRequest, plan: RestoredPairPlan
+    ) -> bool:
         ...
 
     def approval_verified(
@@ -105,18 +105,22 @@ class SublaneRestoredPairRecoveryUseCase:
                 required_approval_marker=marker,
             )
 
-        existing = bool(request.action_id) and self._ops.transaction_exists(request.action_id)
-        replay_only = {BLOCK_PAIR_INCOMPLETE, BLOCK_PAIR_HEALTHY, BLOCK_SLOT_BUSY}
+        if (
+            request.action_id != plan.action_id
+            or request.action_generation != plan.action_generation
+        ):
+            return self._refused(
+                request, plan, "the supplied action id/generation does not pin this exact pair"
+            )
+        progressed_replay = self._ops.transaction_is_progressed_replay(request, plan)
         hard_blockers = tuple(
             reason
             for reason in plan.blocked_reasons
-            if not (existing and reason in replay_only)
+            if not (progressed_replay and reason == BLOCK_PAIR_INCOMPLETE)
         )
         if hard_blockers:
-            return self._refused(request, plan, "preflight blocked: " + ", ".join(hard_blockers))
-        if request.action_id != plan.action_id or request.action_generation != plan.action_generation:
             return self._refused(
-                request, plan, "the supplied action id/generation does not pin this exact pair"
+                request, plan, "preflight blocked: " + ", ".join(hard_blockers)
             )
         if not request.journal:
             return self._refused(request, plan, "an exact owner-approval journal is required")

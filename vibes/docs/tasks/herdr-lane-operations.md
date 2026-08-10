@@ -428,16 +428,20 @@ forceやpending overrideを加えない。pending generationが本当に破棄�
 `sublane recover-restored-pair` は、active な issue-owned sublane の gateway/worker が
 両方 live だが、再起動復元後の command-shell CWD が lifecycle row の canonical worktree
 と一致しない、または live locator に結び付いた startup self-attestation が non-green な
-場合の公開 recovery rail である。default coordinator と片側だけ存在する pair は本 rail の
-対象外で、前者は self-close executor を持つ別 rail、後者は vanished-slot 用 rail を使う。
+場合の公開 recovery rail である。default lane と片側だけ存在する pair は本 rail の対象外
+である。default coordinator を安全に self-close/relaunch する公開 rail は現時点では未実装
+であり、本コマンドで代用してはならない。legacy の default-lane pair も本railでは扱わない。
+片側だけ存在する pair は vanished-slot 用 rail を使う。
 
 - 既定は read-only preflight。`--allow-pending-composer-loss` は、対象の旧 pane に残る未送信
   composer text が失われ得ることへの明示的な owner 判断であり、worktree の file を捨てる
   許可ではない。
 - preflight は lifecycle の issue/lane/revision/generation、canonical worktree token、branch/HEAD、
-  gateway/worker の assigned name/locator/inventory revision、runtime 非 busy、CWD、startup
-  attestation を結合する。両 slot が healthy なら zero-close。inventory/attestation が読めない、
-  pair が一意でない、busy、worktree/branch が動いた場合も zero-close。
+  gateway/worker の assigned name/locator/inventory revision、runtime state、CWD、startup
+  attestation を結合する。runtime は両 slot とも明示的な `awaiting_input` または
+  `turn_ended` の場合だけ settled とする。status 欠落、`unknown`、未知値、非文字列、
+  `blocked`、`busy` はいずれも zero-close。両 slot が healthy、inventory/attestation が
+  読めない、pair が一意でない、worktree/branch が動いた場合も zero-close。
 - actionable な preflight が返す `required_approval_marker` を、その issue の新しい Redmine
   journal に coordinator が記録する。gate は
   `restored_pair_recovery_owner_approval`、`approval_source=direct_owner`、
@@ -446,9 +450,19 @@ forceやpending overrideを加えない。pending generationが本当に破棄�
   を同じまま再提示する。
 - execute は既存 replacement transaction を使い、各 old locator を action-time に再確認して
   exact close → same-slot launch → action-bound startup attestation を gateway/worker の順で進める。
-  transaction は participant ごとの owed state を先に記録するため、途中停止後も同一 pin で
-  再実行でき、close 済み slot を再 close しない。worktree/lifecycle/branch を作り直さず、send
-  も行わない。fresh pair は idle で起動し、次の durable work anchor は別途 dispatch する。
+  transaction は participant ごとの owed state を各効果の成功後に更新するため、進行が
+  durable に記録された途中停止は同一 pin で再実行でき、記録済みの close を再実行しない。
+  close 成功直後かつ owed-state 更新前に停止し、他participantにもdurableな進行がない場合は
+  進行済みreplayと証明できないため自動再開せず fail-closed とする。すでに同じexact
+  transactionの別participantにdurableな進行がある場合は、actuatorが旧generationの明示的な
+  不在を再確認できたslotだけbounded recoveryで次へ進める。recycled/ambiguousな観測は常に
+  zero-effectで停止する。worktree/lifecycle/branch を作り直さず、send も行わない。fresh pair
+  はidleで起動し、次の durable work anchor は別途 dispatch する。
+  replay で preflight の不完全pair blockerを解除できるのは、同じ action generation、承認
+  journal、continuation、両participantの旧generationが一致し、かつparticipant owed stateが
+  実際に進行済みと証明できる場合だけである。単にtransaction rowが存在するだけでは解除
+  しない。default lane、healthy pair、busyまたは非settled runtimeの blockerはreplayでも
+  解除しない。
 - provider の会話セッション再開は保証しない。保証するのは worktree/branch/file と durable
   transaction の継続性であり、古い pane の画面内容は approval 前に必要なら read-only capture
   して Redmine の状態判断へ反映する。

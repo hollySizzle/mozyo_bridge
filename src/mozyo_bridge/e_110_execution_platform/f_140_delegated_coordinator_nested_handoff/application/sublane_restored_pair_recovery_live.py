@@ -24,6 +24,7 @@ from mozyo_bridge.core.state.replacement_transaction import (
     ReplacementTransactionStore,
 )
 from mozyo_bridge.core.state.replacement_transaction_model import (
+    PARTICIPANT_CLOSE_OWED,
     PHASE_COMPLETED,
     PHASE_DRAINING_CONTINUATION,
     PHASE_REPLACING_NONSELF,
@@ -40,9 +41,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_evidence_planner_composition import (  # noqa: E501
     plan_participants_with_evidence,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
-    repo_scope_workspace_id,
-)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_restored_pair_recovery import (  # noqa: E501
     PairReplacementResult,
     RestoredPairRecoveryRequest,
@@ -56,6 +54,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_stale_worker_recovery_live import (  # noqa: E501
     LiveRecoveryActuatorPort,
     LiveStaleWorkerRecoveryOps,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.worker_recovery_phase_verdict import (  # noqa: E501
+    VERDICT_ALREADY_RECOVERED,
+    VERDICT_DRIVABLE,
+    worker_recovery_phase_verdict,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_owner_approval import (  # noqa: E501
     RESTORED_PAIR_RECOVERY_APPROVAL_EFFECT,
@@ -127,11 +130,77 @@ class LiveRestoredPairRecoveryOps:
             attestation_home=self.attestation_home,
         ).observe(request)
 
-    def transaction_exists(self, action_id: str) -> bool:
+    @staticmethod
+    def _transaction_authority(
+        request: RestoredPairRecoveryRequest, plan: RestoredPairPlan
+    ):
+        key = ReplacementTransactionKey(plan.workspace_id, request.action_id)
+        decision = DecisionPointer("redmine", plan.issue, request.journal)
+        continuation = ContinuationPointer(
+            "redmine",
+            plan.issue,
+            request.journal,
+            RESTORED_PAIR_RECOVERY_APPROVAL_GATE,
+            _CONTINUATION_ACTION,
+        )
+        participants = [
+            ParticipantPin(
+                lane_id=plan.lane,
+                role=slot.provider,
+                provider=slot.provider,
+                assigned_name=slot.assigned_name,
+                old_locator=slot.locator,
+                lane_revision=plan.lane_revision,
+                lane_generation=plan.lane_generation,
+            )
+            for slot in plan.slots
+        ]
+        return key, decision, continuation, participants
+
+    @staticmethod
+    def _existing_participants_match(
+        existing, participants, *, workspace_id: str
+    ) -> bool:
+        if len(existing.participants) != len(participants):
+            return False
+        for pin in participants:
+            stored = existing.find_participant(pin.identity)
+            if stored_evidence_is_foreign(stored, workspace_id=workspace_id):
+                return False
+            planned = participant_with_stored_evidence(pin, stored)
+            if not participant_authority_matches(stored, planned):
+                return False
+        return True
+
+    def transaction_is_progressed_replay(
+        self, request: RestoredPairRecoveryRequest, plan: RestoredPairPlan
+    ) -> bool:
         try:
-            workspace_id = repo_scope_workspace_id(self.repo_root)
-            key = ReplacementTransactionKey(workspace_id, action_id)
-            return self._store().get(key) is not None
+            key, decision, continuation, participants = self._transaction_authority(
+                request, plan
+            )
+            existing = self._store().get(key)
+            if (
+                existing is None
+                or existing.action_generation != request.action_generation
+                or existing.decision != decision
+                or existing.continuation != continuation
+                or not self._existing_participants_match(
+                    existing, participants, workspace_id=plan.workspace_id
+                )
+            ):
+                return False
+            verdict = worker_recovery_phase_verdict(existing)
+            if verdict == VERDICT_ALREADY_RECOVERED:
+                return True
+            return bool(
+                verdict == VERDICT_DRIVABLE
+                and existing.phase == PHASE_REPLACING_NONSELF
+                and any(
+                    pin.phase != PARTICIPANT_CLOSE_OWED
+                    for pin in existing.participants
+                )
+            )
         except Exception:  # noqa: BLE001
             return False
 
@@ -178,27 +247,9 @@ class LiveRestoredPairRecoveryOps:
     ) -> PairReplacementResult:
         store = self._store()
         try:
-            key = ReplacementTransactionKey(plan.workspace_id, request.action_id)
-            decision = DecisionPointer("redmine", plan.issue, request.journal)
-            continuation = ContinuationPointer(
-                "redmine",
-                plan.issue,
-                request.journal,
-                RESTORED_PAIR_RECOVERY_APPROVAL_GATE,
-                _CONTINUATION_ACTION,
+            key, decision, continuation, base = self._transaction_authority(
+                request, plan
             )
-            base = [
-                ParticipantPin(
-                    lane_id=plan.lane,
-                    role=slot.provider,
-                    provider=slot.provider,
-                    assigned_name=slot.assigned_name,
-                    old_locator=slot.locator,
-                    lane_revision=plan.lane_revision,
-                    lane_generation=plan.lane_generation,
-                )
-                for slot in plan.slots
-            ]
         except Exception:  # noqa: BLE001
             return PairReplacementResult(False, detail="approved pair pin is incomplete")
 
@@ -242,12 +293,8 @@ class LiveRestoredPairRecoveryOps:
             current.action_generation != request.action_generation
             or current.decision != decision
             or current.continuation != continuation
-            or len(current.participants) != len(participants)
-            or any(
-                not participant_authority_matches(
-                    current.find_participant(pin.identity), pin
-                )
-                for pin in participants
+            or not self._existing_participants_match(
+                current, participants, workspace_id=plan.workspace_id
             )
         ):
             return PairReplacementResult(

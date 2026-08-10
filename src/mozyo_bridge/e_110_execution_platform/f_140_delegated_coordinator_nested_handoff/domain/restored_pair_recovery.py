@@ -20,16 +20,28 @@ from typing import Any, Mapping, Tuple
 
 from mozyo_bridge.core.state.herdr_identity_attestation import ATTEST_OK
 from mozyo_bridge.core.state.replacement_transaction_model import norm
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (  # noqa: E501
+    RUNTIME_AWAITING_INPUT,
+    RUNTIME_BUSY,
+    RUNTIME_RECEIVER_STATES,
+    RUNTIME_TURN_ENDED,
+    RUNTIME_UNKNOWN,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+    DEFAULT_LANE,
+)
 
 SLOT_GATEWAY = "gateway"
 SLOT_WORKER = "worker"
 RESTORED_PAIR_SLOT_ROLES = (SLOT_GATEWAY, SLOT_WORKER)
 
 BLOCK_IDENTITY_INCOMPLETE = "identity_incomplete"
+BLOCK_DEFAULT_LANE = "default_lane_not_supported"
 BLOCK_LIFECYCLE_NOT_CURRENT = "lifecycle_not_current"
 BLOCK_WORKTREE_AUTHORITY = "worktree_authority_not_current"
 BLOCK_PAIR_INCOMPLETE = "managed_pair_incomplete_or_ambiguous"
 BLOCK_SLOT_BUSY = "managed_slot_busy"
+BLOCK_SLOT_RUNTIME_NOT_SETTLED = "managed_slot_runtime_not_settled"
 BLOCK_ATTESTATION_UNREADABLE = "attestation_store_unreadable"
 BLOCK_PAIR_HEALTHY = "managed_pair_already_healthy"
 BLOCK_COMPOSER_LOSS_NOT_APPROVED = "pending_composer_loss_not_approved"
@@ -51,10 +63,23 @@ class RestoredSlot:
     revision: str
     identity_matches: bool
     inventory_generation_matches: bool
-    runtime_busy: bool
+    runtime_state: str
     cwd_matches: bool
     attestation_state: str
     attestation_readable: bool = True
+
+    def __post_init__(self) -> None:
+        state = self.runtime_state
+        if not isinstance(state, str) or state not in RUNTIME_RECEIVER_STATES:
+            object.__setattr__(self, "runtime_state", RUNTIME_UNKNOWN)
+
+    @property
+    def runtime_busy(self) -> bool:
+        return self.runtime_state == RUNTIME_BUSY
+
+    @property
+    def runtime_settled(self) -> bool:
+        return self.runtime_state in (RUNTIME_AWAITING_INPUT, RUNTIME_TURN_ENDED)
 
     @property
     def complete(self) -> bool:
@@ -72,7 +97,7 @@ class RestoredSlot:
     def healthy(self) -> bool:
         return bool(
             self.complete
-            and not self.runtime_busy
+            and self.runtime_settled
             and self.cwd_matches
             and self.attestation_readable
             and self.attestation_state == ATTEST_OK
@@ -87,7 +112,9 @@ class RestoredSlot:
             "revision": self.revision,
             "identity_matches": self.identity_matches,
             "inventory_generation_matches": self.inventory_generation_matches,
+            "runtime_state": self.runtime_state,
             "runtime_busy": self.runtime_busy,
+            "runtime_settled": self.runtime_settled,
             "cwd_matches": self.cwd_matches,
             "attestation_state": self.attestation_state,
             "attestation_readable": self.attestation_readable,
@@ -140,6 +167,8 @@ class RestoredPairPlan:
             )
         ) or self.action_generation < 1:
             reasons.append(BLOCK_IDENTITY_INCOMPLETE)
+        if norm(self.lane) == DEFAULT_LANE:
+            reasons.append(BLOCK_DEFAULT_LANE)
         if not self.lifecycle_current:
             reasons.append(BLOCK_LIFECYCLE_NOT_CURRENT)
         if not self.worktree_authority_current:
@@ -152,6 +181,11 @@ class RestoredPairPlan:
             reasons.append(BLOCK_PAIR_INCOMPLETE)
         if any(slot.runtime_busy for slot in self.slots):
             reasons.append(BLOCK_SLOT_BUSY)
+        if any(
+            slot.complete and not slot.runtime_busy and not slot.runtime_settled
+            for slot in self.slots
+        ):
+            reasons.append(BLOCK_SLOT_RUNTIME_NOT_SETTLED)
         if not all(slot.attestation_readable for slot in self.slots):
             reasons.append(BLOCK_ATTESTATION_UNREADABLE)
         if all(slot.healthy for slot in self.slots):
@@ -265,11 +299,13 @@ class RestoredPairOutcome:
 __all__ = (
     "BLOCK_ATTESTATION_UNREADABLE",
     "BLOCK_COMPOSER_LOSS_NOT_APPROVED",
+    "BLOCK_DEFAULT_LANE",
     "BLOCK_IDENTITY_INCOMPLETE",
     "BLOCK_LIFECYCLE_NOT_CURRENT",
     "BLOCK_PAIR_HEALTHY",
     "BLOCK_PAIR_INCOMPLETE",
     "BLOCK_SLOT_BUSY",
+    "BLOCK_SLOT_RUNTIME_NOT_SETTLED",
     "BLOCK_WORKTREE_AUTHORITY",
     "RESTORED_PAIR_SLOT_ROLES",
     "RestoredPairOutcome",

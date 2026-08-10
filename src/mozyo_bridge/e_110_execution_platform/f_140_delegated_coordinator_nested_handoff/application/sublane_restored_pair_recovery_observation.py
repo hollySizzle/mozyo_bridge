@@ -36,7 +36,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RestoredSlot,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (  # noqa: E501
-    RUNTIME_BUSY,
+    RUNTIME_UNKNOWN,
     map_agent_status,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
@@ -67,11 +67,13 @@ def _row_revision(row: Mapping[str, object]) -> str:
     return "" if isinstance(value, bool) else _norm(value)
 
 
-def _row_busy(row: Mapping[str, object]) -> bool:
+def _row_runtime_state(row: Optional[Mapping[str, object]]) -> str:
+    if row is None:
+        return RUNTIME_UNKNOWN
     for key in _STATUS_KEYS:
         if key in row:
-            return map_agent_status(row.get(key)) == RUNTIME_BUSY
-    return False
+            return map_agent_status(row.get(key))
+    return RUNTIME_UNKNOWN
 
 
 @dataclass
@@ -170,7 +172,7 @@ class LiveRestoredPairObservation:
             revision=revision,
             identity_matches=identity_matches,
             inventory_generation_matches=inventory_generation_matches,
-            runtime_busy=_row_busy(row) if row is not None else False,
+            runtime_state=_row_runtime_state(row),
             cwd_matches=cwd_matches,
             attestation_state=attestation_state,
             attestation_readable=attestation_readable,

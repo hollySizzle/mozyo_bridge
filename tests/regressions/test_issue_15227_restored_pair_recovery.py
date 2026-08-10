@@ -11,8 +11,16 @@ from unittest import mock
 from mozyo_bridge.core.state.herdr_identity_attestation import ATTEST_OK
 from mozyo_bridge.core.state.replacement_preservation import PreservationObservation
 from mozyo_bridge.core.state.replacement_transaction import (
+    ContinuationPointer,
+    DecisionPointer,
+    ParticipantPin,
     ReplacementTransactionKey,
     ReplacementTransactionStore,
+)
+from mozyo_bridge.core.state.replacement_transaction_model import (
+    PARTICIPANT_LAUNCH_OWED,
+    PHASE_CLAIMED,
+    PHASE_REPLACING_NONSELF,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_evidence_planner_composition import (  # noqa: E501
     EvidencePlanning,
@@ -21,6 +29,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     PairReplacementResult,
     RestoredPairRecoveryRequest,
     SublaneRestoredPairRecoveryUseCase,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_restored_pair_recovery_observation import (  # noqa: E501
+    _row_runtime_state,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
     GATE_RESTORED_PAIR_RECOVERY_OWNER_APPROVAL,
@@ -35,8 +46,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.restored_pair_recovery import (  # noqa: E501
     BLOCK_ATTESTATION_UNREADABLE,
+    BLOCK_DEFAULT_LANE,
     BLOCK_PAIR_HEALTHY,
     BLOCK_PAIR_INCOMPLETE,
+    BLOCK_SLOT_BUSY,
+    BLOCK_SLOT_RUNTIME_NOT_SETTLED,
     SLOT_GATEWAY,
     SLOT_WORKER,
     STATUS_COMPLETED,
@@ -50,9 +64,21 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LAUNCH_DONE,
     OLD_SLOT_PRESENT,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (  # noqa: E501
+    RUNTIME_AWAITING_INPUT,
+    RUNTIME_BUSY,
+    RUNTIME_TURN_ENDED,
+    RUNTIME_UNKNOWN,
+)
 
 
-def _slot(role: str, *, cwd_matches: bool, locator: str) -> RestoredSlot:
+def _slot(
+    role: str,
+    *,
+    cwd_matches: bool,
+    locator: str,
+    runtime_state: str = RUNTIME_AWAITING_INPUT,
+) -> RestoredSlot:
     provider = "codex" if role == SLOT_GATEWAY else "claude"
     return RestoredSlot(
         slot_role=role,
@@ -62,17 +88,22 @@ def _slot(role: str, *, cwd_matches: bool, locator: str) -> RestoredSlot:
         revision="12",
         identity_matches=True,
         inventory_generation_matches=True,
-        runtime_busy=False,
+        runtime_state=runtime_state,
         cwd_matches=cwd_matches,
         attestation_state=ATTEST_OK,
         attestation_readable=True,
     )
 
 
-def _plan(*, gateway_cwd: bool = False, worker_cwd: bool = False) -> RestoredPairPlan:
+def _plan(
+    *,
+    gateway_cwd: bool = False,
+    worker_cwd: bool = False,
+    lane: str = "issue_15227_post_reboot_exact_relaunch",
+) -> RestoredPairPlan:
     return RestoredPairPlan(
         issue="15227",
-        lane="issue_15227_post_reboot_exact_relaunch",
+        lane=lane,
         workspace_id="workspace-a",
         worktree_identity="wt_exact",
         branch="issue_15227_post_reboot_exact_relaunch",
@@ -91,15 +122,15 @@ def _plan(*, gateway_cwd: bool = False, worker_cwd: bool = False) -> RestoredPai
 class _Ops:
     def __init__(self, plan: RestoredPairPlan) -> None:
         self.plan = plan
-        self.existing = False
+        self.progressed_replay = False
         self.approved = False
         self.replace_calls = 0
 
     def observe(self, _request):
         return self.plan
 
-    def transaction_exists(self, _action_id: str) -> bool:
-        return self.existing
+    def transaction_is_progressed_replay(self, _request, _plan) -> bool:
+        return self.progressed_replay
 
     def approval_verified(self, _request, _plan) -> bool:
         return self.approved
@@ -136,6 +167,50 @@ class RestoredPairDecisionTests(unittest.TestCase):
         plan = _plan(gateway_cwd=True, worker_cwd=True)
         self.assertFalse(plan.may_recover)
         self.assertIn(BLOCK_PAIR_HEALTHY, plan.blocked_reasons)
+
+    def test_default_lane_is_never_recovery_eligible(self) -> None:
+        plan = _plan(lane="default")
+        self.assertFalse(plan.may_recover)
+        self.assertIn(BLOCK_DEFAULT_LANE, plan.blocked_reasons)
+
+    def test_only_explicit_settled_runtime_is_recovery_eligible(self) -> None:
+        plan = _plan()
+        for state in (RUNTIME_UNKNOWN, "blocked"):
+            with self.subTest(state=state):
+                observed = replace(
+                    plan,
+                    gateway=replace(plan.gateway, runtime_state=state),
+                )
+                self.assertIn(
+                    BLOCK_SLOT_RUNTIME_NOT_SETTLED, observed.blocked_reasons
+                )
+        busy = replace(
+            plan, gateway=replace(plan.gateway, runtime_state=RUNTIME_BUSY)
+        )
+        self.assertIn(BLOCK_SLOT_BUSY, busy.blocked_reasons)
+        ended = replace(
+            plan, worker=replace(plan.worker, runtime_state=RUNTIME_TURN_ENDED)
+        )
+        self.assertTrue(ended.may_recover)
+
+    def test_runtime_row_mapping_fails_closed(self) -> None:
+        unknown_rows = (
+            None,
+            {},
+            {"agent_status": None},
+            {"agent_status": "unknown"},
+            {"agent_status": "novel"},
+            {"agent_status": 7},
+        )
+        for row in unknown_rows:
+            with self.subTest(row=row):
+                self.assertEqual(_row_runtime_state(row), RUNTIME_UNKNOWN)
+        self.assertEqual(
+            _row_runtime_state({"agent_status": "idle"}), RUNTIME_AWAITING_INPUT
+        )
+        self.assertEqual(
+            _row_runtime_state({"agent_status": "done"}), RUNTIME_TURN_ENDED
+        )
 
     def test_unreadable_attestation_is_not_bad_generation_proof(self) -> None:
         plan = _plan()
@@ -176,6 +251,15 @@ class RestoredPairUseCaseTests(unittest.TestCase):
         self.assertEqual(outcome.status, STATUS_REFUSED)
         self.assertEqual(ops.replace_calls, 0)
 
+    def test_default_lane_preflight_has_no_approval_marker_or_effect(self) -> None:
+        plan = _plan(lane="default")
+        ops = _Ops(plan)
+        outcome = SublaneRestoredPairRecoveryUseCase(ops).run(_request(plan))
+        self.assertFalse(outcome.executed)
+        self.assertEqual(outcome.required_approval_marker, "")
+        self.assertIn(BLOCK_DEFAULT_LANE, outcome.plan.blocked_reasons)
+        self.assertEqual(ops.replace_calls, 0)
+
     def test_execute_replaces_pair_once_after_approval(self) -> None:
         plan = _plan()
         ops = _Ops(plan)
@@ -188,13 +272,50 @@ class RestoredPairUseCaseTests(unittest.TestCase):
         self.assertEqual(ops.replace_calls, 1)
         self.assertFalse(outcome.conversation_resume_guaranteed)
 
+    def test_default_lane_execute_is_zero_effect_even_for_progressed_replay(self) -> None:
+        plan = _plan(lane="default")
+        ops = _Ops(plan)
+        ops.progressed_replay = True
+        ops.approved = True
+        outcome = SublaneRestoredPairRecoveryUseCase(ops).run(
+            _request(plan), execute=True
+        )
+        self.assertEqual(outcome.status, STATUS_REFUSED)
+        self.assertEqual(ops.replace_calls, 0)
+
+    def test_planned_transaction_does_not_bypass_healthy_pair(self) -> None:
+        plan = _plan(gateway_cwd=True, worker_cwd=True)
+        ops = _Ops(plan)
+        ops.approved = True
+        outcome = SublaneRestoredPairRecoveryUseCase(ops).run(
+            _request(plan), execute=True
+        )
+        self.assertEqual(outcome.status, STATUS_REFUSED)
+        self.assertIn(BLOCK_PAIR_HEALTHY, outcome.plan.blocked_reasons)
+        self.assertEqual(ops.replace_calls, 0)
+
+    def test_progressed_replay_does_not_bypass_busy_slot(self) -> None:
+        plan = _plan()
+        plan = replace(
+            plan,
+            gateway=replace(plan.gateway, runtime_state=RUNTIME_BUSY),
+        )
+        ops = _Ops(plan)
+        ops.progressed_replay = True
+        ops.approved = True
+        outcome = SublaneRestoredPairRecoveryUseCase(ops).run(
+            _request(plan), execute=True
+        )
+        self.assertEqual(outcome.status, STATUS_REFUSED)
+        self.assertEqual(ops.replace_calls, 0)
+
     def test_partial_transaction_may_resume_with_old_generation_pins(self) -> None:
         plan = _plan()
         gateway = replace(plan.gateway, inventory_generation_matches=False)
         partial = replace(plan, gateway=gateway)
         self.assertIn(BLOCK_PAIR_INCOMPLETE, partial.blocked_reasons)
         ops = _Ops(partial)
-        ops.existing = True
+        ops.progressed_replay = True
         ops.approved = True
         outcome = SublaneRestoredPairRecoveryUseCase(ops).run(
             _request(partial), execute=True
@@ -213,13 +334,162 @@ class RestoredPairUseCaseTests(unittest.TestCase):
             ),
         )
         ops = _Ops(partial)
-        ops.existing = True
+        ops.progressed_replay = True
         ops.approved = True
         outcome = SublaneRestoredPairRecoveryUseCase(ops).run(
             _request(partial), execute=True
         )
         self.assertEqual(outcome.status, STATUS_REFUSED)
         self.assertEqual(ops.replace_calls, 0)
+
+
+class RestoredPairReplayAdmissionTests(unittest.TestCase):
+    @staticmethod
+    def _declare(store, plan, request):
+        key = ReplacementTransactionKey(plan.workspace_id, plan.action_id)
+        participants = [
+            ParticipantPin(
+                lane_id=plan.lane,
+                role=slot.provider,
+                provider=slot.provider,
+                assigned_name=slot.assigned_name,
+                old_locator=slot.locator,
+                lane_revision=plan.lane_revision,
+                lane_generation=plan.lane_generation,
+            )
+            for slot in plan.slots
+        ]
+        result = store.plan_transaction(
+            key,
+            action_generation=request.action_generation,
+            decision=DecisionPointer("redmine", plan.issue, request.journal),
+            continuation=ContinuationPointer(
+                "redmine",
+                plan.issue,
+                request.journal,
+                RESTORED_PAIR_RECOVERY_APPROVAL_GATE,
+                "pair_relaunch_no_dispatch",
+            ),
+            participants=participants,
+        )
+        if not result.applied:
+            raise AssertionError(result.reason)
+        return key, participants
+
+    def test_exact_planned_row_does_not_bypass_healthy_zero_close(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_restored_pair_recovery_live as site,
+        )
+
+        plan = _plan(gateway_cwd=True, worker_cwd=True)
+        request = _request(plan)
+        with TemporaryDirectory() as temp:
+            store = ReplacementTransactionStore(path=Path(temp) / "replacement.sqlite")
+            self._declare(store, plan, request)
+            ops = site.LiveRestoredPairRecoveryOps(
+                repo_root=Path(temp), transaction_store=store
+            )
+            self.assertFalse(ops.transaction_is_progressed_replay(request, plan))
+            with (
+                mock.patch.object(ops, "observe", return_value=plan),
+                mock.patch.object(ops, "approval_verified", return_value=True),
+                mock.patch.object(ops, "replace_pair") as replace_pair,
+            ):
+                outcome = SublaneRestoredPairRecoveryUseCase(ops).run(
+                    request, execute=True
+                )
+        self.assertEqual(outcome.status, STATUS_REFUSED)
+        replace_pair.assert_not_called()
+
+    def test_only_exact_participant_progress_is_replay_authority(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_restored_pair_recovery_live as site,
+        )
+
+        plan = _plan()
+        request = _request(plan)
+        with TemporaryDirectory() as temp:
+            store = ReplacementTransactionStore(path=Path(temp) / "replacement.sqlite")
+            key, participants = self._declare(store, plan, request)
+            ops = site.LiveRestoredPairRecoveryOps(
+                repo_root=Path(temp), transaction_store=store
+            )
+            record = store.get(key)
+            assert record is not None
+            claim = store.claim(
+                key,
+                expected_revision=record.revision,
+                expected_action_generation=request.action_generation,
+                holder=request.holder,
+                lease_expires_at="2099-01-01T00:00:00+00:00",
+                now="2026-08-10T00:00:00+00:00",
+            )
+            self.assertTrue(claim.applied, claim.reason)
+            for phase in (PHASE_CLAIMED, PHASE_REPLACING_NONSELF):
+                record = store.get(key)
+                assert record is not None
+                moved = store.transition_phase(
+                    key,
+                    expected_revision=record.revision,
+                    expected_action_generation=request.action_generation,
+                    target=phase,
+                    holder=request.holder,
+                    now="2026-08-10T00:00:00+00:00",
+                )
+                self.assertTrue(moved.applied, moved.reason)
+            record = store.get(key)
+            assert record is not None
+            progressed = store.transition_participant(
+                key,
+                expected_revision=record.revision,
+                expected_action_generation=request.action_generation,
+                identity=participants[0].identity,
+                target=PARTICIPANT_LAUNCH_OWED,
+                holder=request.holder,
+                now="2026-08-10T00:00:00+00:00",
+            )
+            self.assertTrue(progressed.applied, progressed.reason)
+            self.assertTrue(ops.transaction_is_progressed_replay(request, plan))
+            partial = replace(
+                plan,
+                gateway=replace(
+                    plan.gateway, inventory_generation_matches=False
+                ),
+            )
+            self.assertIn(BLOCK_PAIR_INCOMPLETE, partial.blocked_reasons)
+            with (
+                mock.patch.object(ops, "observe", return_value=partial),
+                mock.patch.object(ops, "approval_verified", return_value=True),
+                mock.patch.object(
+                    ops,
+                    "replace_pair",
+                    return_value=PairReplacementResult(
+                        True, phase="completed", revision=8, detail="done"
+                    ),
+                ) as replace_pair,
+            ):
+                outcome = SublaneRestoredPairRecoveryUseCase(ops).run(
+                    request, execute=True
+                )
+            self.assertEqual(outcome.status, STATUS_COMPLETED)
+            replace_pair.assert_called_once()
+            self.assertFalse(
+                ops.transaction_is_progressed_replay(
+                    replace(request, journal="102901"), plan
+                )
+            )
+            self.assertFalse(
+                ops.transaction_is_progressed_replay(
+                    replace(request, action_generation=2), plan
+                )
+            )
+            moved_plan = replace(
+                plan,
+                gateway=replace(plan.gateway, locator="different-old-locator"),
+            )
+            self.assertFalse(
+                ops.transaction_is_progressed_replay(request, moved_plan)
+            )
 
 
 class RestoredPairApprovalAuthorityTests(unittest.TestCase):
