@@ -820,6 +820,37 @@ class InstallSuccessTest(_LinuxCase):
         self.assertEqual(result["reason"], ss.REASON_DAEMON_RELOAD_FAILED)
         self.assertNotIn("enable", runner.verbs)
 
+    def test_install_refuses_command_drift_during_reload_before_enable(self) -> None:
+        calls = []
+
+        def runner(argv):
+            argv = list(argv)
+            calls.append(argv)
+            verb = argv[2]
+            if verb == "show":
+                return _result()
+            if verb == "daemon-reload":
+                ss.service_unit_path(self.os_home).write_text(
+                    ss.render_service_unit(
+                        [
+                            "/tmp/unapproved",
+                            "workflow",
+                            "supervisor",
+                            "--run-once",
+                            "--home",
+                            str(self.mozyo_home.resolve()),
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+            return _result()
+
+        result = self._install(runner=runner)
+
+        self.assertFalse(result["performed"])
+        self.assertEqual(result["reason"], ss.REASON_INSTALLED_COMMAND_DRIFT)
+        self.assertNotIn("enable", [call[2] for call in calls])
+
     def test_a_failed_enable_reports_a_redacted_token(self) -> None:
         runner = self._runner(fail_verbs=("enable",))
         result = self._install(runner=runner)
@@ -841,6 +872,44 @@ class RestartTest(_LinuxCase):
         )
         self.assertTrue(result["performed"], result)
         self.assertIn(["systemctl", "--user", "restart", ss.SERVICE_UNIT_NAME], runner.calls)
+
+    def test_restart_refuses_command_drift_during_show_before_restart(self) -> None:
+        self._install()
+        calls = []
+
+        def runner(argv):
+            argv = list(argv)
+            calls.append(argv)
+            verb = argv[2]
+            if verb == "show" and any(a.startswith("--property=Version") for a in argv):
+                return _result()
+            if verb == "show":
+                ss.service_unit_path(self.os_home).write_text(
+                    ss.render_service_unit(
+                        [
+                            "/tmp/unapproved",
+                            "workflow",
+                            "supervisor",
+                            "--run-once",
+                            "--home",
+                            str(self.mozyo_home.resolve()),
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                return _result(0, _timer_show())
+            return _result()
+
+        result = ss.restart(
+            os_home=self.os_home,
+            mozyo_home=self.mozyo_home,
+            runner=runner,
+            which=_which_found,
+        )
+
+        self.assertFalse(result["performed"])
+        self.assertEqual(result["reason"], ss.REASON_INSTALLED_COMMAND_DRIFT)
+        self.assertNotIn("restart", [call[2] for call in calls])
 
     def test_restart_works_without_a_configured_credential(self) -> None:
         # Same reason install does: a non-ready Redmine must not stop local-safe work.

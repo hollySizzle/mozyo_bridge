@@ -427,10 +427,14 @@ def install(
     units = _read_units(os_home)
     if UNIT_UNREADABLE in (units.service_state, units.timer_state):
         return _refused("install", REASON_UNIT_UNREADABLE)
+    expected_service_payload = render_service_unit(command).encode("utf-8")
+    expected_timer_payload = render_timer_unit(
+        interval_seconds=interval_seconds
+    ).encode("utf-8")
     try:
         _write_units(
-            render_service_unit(command).encode("utf-8"),
-            render_timer_unit(interval_seconds=interval_seconds).encode("utf-8"),
+            expected_service_payload,
+            expected_timer_payload,
             os_home,
         )
     except UnsafeUnitArtifactError:
@@ -444,6 +448,23 @@ def install(
             "action": "install", "performed": False, "reason": REASON_DAEMON_RELOAD_FAILED,
             "credential_readiness": readiness, "label": SUPERVISOR_UNIT.label,
         }
+    # ``daemon-reload`` is an effect boundary: another writer can replace either unit while the
+    # manager call runs. Re-read both names through the pinned filesystem seam and require the exact
+    # bytes this invocation wrote before ``enable --now`` can start the timer (j#103073 r16f1).
+    effect_units = _read_units(os_home)
+    if UNIT_UNREADABLE in (effect_units.service_state, effect_units.timer_state):
+        return _refused(
+            "install", REASON_UNIT_UNREADABLE, credential_readiness=readiness
+        )
+    if (
+        effect_units.service_state != UNIT_OWNED
+        or effect_units.timer_state != UNIT_OWNED
+        or effect_units.service_payload != expected_service_payload
+        or effect_units.timer_payload != expected_timer_payload
+    ):
+        return _refused(
+            "install", REASON_INSTALLED_COMMAND_DRIFT, credential_readiness=readiness
+        )
     # ``enable --now`` is idempotent: it rewrites the timers.target want and starts the timer, which
     # (OnActiveSec=0s) runs the first bounded sweep immediately.
     if _systemctl(runner, ["enable", "--now", SUPERVISOR_UNIT.timer_unit]).returncode != 0:
@@ -528,6 +549,34 @@ def restart(
             REASON_SERVICE_NOT_LOADED
             if timer_state == PROBE_CONFIRMED_ABSENT
             else REASON_SERVICE_STATE_UNREADABLE,
+            credential_readiness=readiness,
+            probe_state=timer_state,
+        )
+    # The initial unit bytes are stale after the manager probe. Require a fresh pinned read of the
+    # same service/timer snapshots and independently re-establish exact argv/home before restarting
+    # the one-shot. Filename ownership alone cannot authorize a drifted ExecStart (j#103073 r16f1).
+    action_units = _read_units(os_home)
+    if UNIT_UNREADABLE in (action_units.service_state, action_units.timer_state):
+        return _refused(
+            "restart",
+            REASON_UNIT_UNREADABLE,
+            credential_readiness=readiness,
+            probe_state=timer_state,
+        )
+    action_argv = _installed_command(_parse_unit_keys(action_units.service_payload))
+    action_home, action_pin_status = extract_pinned_home(action_argv)
+    if (
+        action_units.service_state != units.service_state
+        or action_units.timer_state != units.timer_state
+        or action_units.service_payload != units.service_payload
+        or action_units.timer_payload != units.timer_payload
+        or action_argv != expected
+        or action_pin_status != HOME_PIN_OK
+        or action_home != pinned
+    ):
+        return _refused(
+            "restart",
+            REASON_INSTALLED_COMMAND_DRIFT,
             credential_readiness=readiness,
             probe_state=timer_state,
         )

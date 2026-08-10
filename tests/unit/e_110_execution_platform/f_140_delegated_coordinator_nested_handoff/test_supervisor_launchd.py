@@ -448,6 +448,39 @@ class InstallTest(_DarwinCase):
         self.assertEqual(sl.REASON_BOOTSTRAP_FAILED, result["reason"])
         self.assertNotIn("boom", str(result))
 
+    def test_install_refuses_command_drift_during_bootout_before_bootstrap(self) -> None:
+        target = sl.plist_path(self.os_home)
+        calls = []
+
+        def runner(argv):
+            argv = list(argv)
+            calls.append(argv)
+            if argv[1] == "bootout":
+                target.write_bytes(sl.render_plist(
+                    [
+                        "/tmp/unapproved",
+                        "workflow",
+                        "supervisor",
+                        "--run-once",
+                        "--home",
+                        _resolved(self.mozyo_home),
+                    ],
+                    interval_seconds=sl.DEFAULT_OS_TICK_INTERVAL_SECONDS,
+                    os_home=self.os_home,
+                ))
+            return _result()
+
+        result = sl.install(
+            os_home=self.os_home,
+            mozyo_home=self.mozyo_home,
+            runner=runner,
+            which=_which_found,
+        )
+
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_INSTALLED_COMMAND_DRIFT, result["reason"])
+        self.assertNotIn("bootstrap", [call[1] for call in calls])
+
 
 class RestartTest(_DarwinCase):
     def _install_ready(self) -> None:
@@ -464,6 +497,36 @@ class RestartTest(_DarwinCase):
             ["launchctl", "kickstart", "-k", f"{_GUI_DOMAIN}/{sl.SUPERVISOR_LAUNCHD_LABEL}"],
             runner.calls[-1],
         )
+
+    def test_restart_refuses_command_drift_during_print_before_kickstart(self) -> None:
+        self._install_ready()
+        target = sl.plist_path(self.os_home)
+        calls = []
+
+        def runner(argv):
+            argv = list(argv)
+            calls.append(argv)
+            if argv[1] == "print":
+                target.write_bytes(sl.render_plist(
+                    [
+                        "/tmp/unapproved",
+                        "workflow",
+                        "supervisor",
+                        "--run-once",
+                        "--home",
+                        _resolved(self.mozyo_home),
+                    ],
+                    interval_seconds=sl.DEFAULT_OS_TICK_INTERVAL_SECONDS,
+                    os_home=self.os_home,
+                ))
+                return _result(0, stdout="state = running\n\tpid = 4242\n")
+            return _result()
+
+        result = sl.restart(os_home=self.os_home, runner=runner, which=_which_found)
+
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_INSTALLED_COMMAND_DRIFT, result["reason"])
+        self.assertNotIn("kickstart", [call[1] for call in calls])
 
     def test_restart_refuses_zero_mutation_on_a_confirmed_absence(self) -> None:
         # The fixture now carries a real confirmed absence — a recognized clause whose operand IS our

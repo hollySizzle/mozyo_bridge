@@ -582,6 +582,13 @@ plist の**内容**（argv / home pin）のみを読み、`Label` を見てい�
 に対して**発行されるので、**根拠と行為が別の service を指す**。entry で分類し、`print` の後（= subprocess を
 1 回挟んだ後）に再検証する。kickstart も稼働中 system への mutation であり、扱いは削除と同じである。
 
+**manager effect の根拠は effect 直前の exact plist bytes / argv / home pin へ結び付ける**（review
+j#103073 r16f1）。`install` は `bootout` 後・`bootstrap` 前に pinned directory-fd seam から plist を fresh read
+し、この invocation が render / write した exact bytes と一致するときだけ path を launchctl へ渡す。`restart` は
+`print` 後・`kickstart` 前に同じ snapshot と expected argv / absolute home pin を再確認する。途中で owned Label を
+保ったまま command が差し替わっても `installed_command_drift` / `performed: false` で拒否し、後続の
+`bootstrap` / `kickstart` は 0 回である。
+
 **path は「所有の証明」でないだけでなく「その file である証明」でもない**（review j#102550 r13f2）。
 `Path.exists()` は broken symlink を False と答えるため、owned path に置かれた link は `absent` と分類され、
 install が link を辿って **owned path の外に file を作成**した。既存 plist を指す link は、その file が owned
@@ -782,6 +789,13 @@ systemd 側も責務を分ける。`supervisor_systemd_unit` は unit text の r
 directory・device・開けない entry は `systemd_unit_unreadable` で mutation 前に拒否する。read は同じ fd から
 identity と bytes を得て、unidentified entry の bytes を parser / status へ渡さない。write は writer-private な
 `O_EXCL` staging を全量書込後に rename し、既存 file を truncate しない。
+
+**systemd manager effect も effect 直前の exact unit bytes / argv / home pin へ結び付ける**（review
+j#103073 r16f1）。`install` は `daemon-reload` 後・`enable --now` 前に service / timer の両方を fresh read し、
+この invocation が render / write した exact bytes と一致するときだけ enable する。`restart` は timer の `show`
+後・service の `restart` 前に同じ両 unit snapshot と expected argv / absolute home pin を再確認する。途中差替えは
+`systemd_unit_unreadable` または `installed_command_drift` / `performed: false` で拒否し、後続の `enable` /
+`restart` は 0 回である。
 
 **unit の書込先（`XDG_CONFIG_HOME`）は環境変数の値を未加工で読む**（review j#102378 finding r7f3）。これは表示文字列では
 なく **mutation target** である: `install` はここへ unit file を書き、`uninstall` はここの file を削除する。値を strip して

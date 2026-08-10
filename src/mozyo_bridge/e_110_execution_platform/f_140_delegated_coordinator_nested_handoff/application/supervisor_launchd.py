@@ -390,17 +390,16 @@ def install(
             credential_readiness=readiness, label=agent.label, legacy_drain=migration["state"],
             legacy_drain_removed=migration["removed"], plist_state=own_state,
         )
+    expected_plist = render_plist(
+        command, interval_seconds=interval_seconds, os_home=os_home, agent=agent
+    )
     try:
         # Both go through the pinned no-follow chain: `mkdir(parents=True)` and a leaf-only
         # `O_NOFOLLOW` both walk the ancestors normally, which is how a symlinked
         # `Library/LaunchAgents` put the whole install in someone else's directory (j#102590 r14f1).
         # The write itself stages and renames rather than truncating (r14f2).
         ensure_log_dir(os_home, agent=agent)
-        write_owned(
-            render_plist(command, interval_seconds=interval_seconds, os_home=os_home, agent=agent),
-            os_home,
-            agent=agent,
-        )
+        write_owned(expected_plist, os_home, agent=agent)
     except OSError:
         return _refused(
             "install", REASON_PLIST_WRITE_FAILED,
@@ -410,8 +409,35 @@ def install(
     # A previously loaded agent must be booted out before bootstrap or launchd rejects the
     # duplicate label; a not-loaded bootout is fine to ignore (idempotent install).
     _launchctl(runner, ["bootout", _service_target(agent)])
-    # launchctl takes a path here; it resolves it itself, and the file it will find is the one the
-    # pinned write just put there.
+    # ``bootout`` is an effect boundary: a concurrent writer can replace the plist while launchctl
+    # runs. Re-read through the pinned filesystem seam and require the exact bytes this invocation
+    # wrote before handing the path to ``bootstrap``. Label ownership alone is insufficient because
+    # an owned-label plist may carry a different executable/home (review j#103073 r16f1).
+    effect_state, effect_payload = read_owned(os_home, agent=agent)
+    if effect_state != PLIST_OWNED:
+        return _refused(
+            "install",
+            REASON_INSTALLED_COMMAND_DRIFT
+            if effect_state == PLIST_ABSENT
+            else _PLIST_REFUSAL_REASON[effect_state],
+            credential_readiness=readiness,
+            label=agent.label,
+            legacy_drain=migration["state"],
+            legacy_drain_removed=migration["removed"],
+            plist_state=effect_state,
+        )
+    if effect_payload != expected_plist:
+        return _refused(
+            "install",
+            REASON_INSTALLED_COMMAND_DRIFT,
+            credential_readiness=readiness,
+            label=agent.label,
+            legacy_drain=migration["state"],
+            legacy_drain_removed=migration["removed"],
+            plist_state=effect_state,
+        )
+    # launchctl takes a path here. The fresh exact-byte check above binds the authorization as close
+    # as this path-based API permits to the artifact it will resolve.
     result = _launchctl(
         runner, ["bootstrap", _gui_domain(), str(plist_path(os_home, agent=agent))]
     )
@@ -537,10 +563,11 @@ def restart(
             label=agent.label,
             probe_state=probe_state,
         )
-    # Identity at ACTION time: the `print` above shelled out, so the classification is stale by one
-    # subprocess — the same window r12f1 closed for the destructive verbs (j#102550 r13f1). A
-    # kickstart is a mutation of the running system and gets the same treatment.
-    at_kickstart = classify_agent_plist(os_home, agent=agent)
+    # Identity AND command/home at ACTION time: ``print`` above shelled out, so the original bytes
+    # are stale. A Label-only recheck allowed an owned-label plist with a replaced ProgramArguments
+    # to authorize kickstart. Re-read pinned bytes, require the same snapshot, and independently
+    # re-establish the exact expected argv/home before mutating the manager (j#103073 r16f1).
+    at_kickstart, action_payload = read_owned(os_home, agent=agent)
     if at_kickstart != PLIST_OWNED:
         return _refused(
             "restart",
@@ -548,6 +575,22 @@ def restart(
             if at_kickstart == PLIST_ABSENT
             else _PLIST_REFUSAL_REASON[at_kickstart],
             credential_readiness=readiness, label=agent.label, plist_state=at_kickstart,
+        )
+    action_installed = _parse_owned(action_payload)
+    action_argv = action_installed.get("ProgramArguments") if action_installed else None
+    action_home, action_pin_status = _extract_pinned_home(action_argv)
+    if (
+        action_payload != payload
+        or action_argv != expected
+        or action_pin_status != HOME_PIN_OK
+        or action_home != pinned
+    ):
+        return _refused(
+            "restart",
+            REASON_INSTALLED_COMMAND_DRIFT,
+            credential_readiness=readiness,
+            label=agent.label,
+            plist_state=at_kickstart,
         )
     result = _launchctl(runner, ["kickstart", "-k", _service_target(agent)])
     if result.returncode != 0:
