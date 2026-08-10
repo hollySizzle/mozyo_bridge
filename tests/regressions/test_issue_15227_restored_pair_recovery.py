@@ -60,6 +60,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (  # noqa: E501
     ATTEST_BOUND,
+    ATTEST_MISMATCH,
     CLOSE_DONE,
     LAUNCH_DONE,
     OLD_SLOT_PRESENT,
@@ -509,6 +510,157 @@ class RestoredPairApprovalAuthorityTests(unittest.TestCase):
 
 
 class RestoredPairTransactionCompositionTests(unittest.TestCase):
+    @staticmethod
+    def _seed_worker_launch_owed(store, plan, request):
+        key, participants = RestoredPairReplayAdmissionTests._declare(
+            store, plan, request
+        )
+        record = store.get(key)
+        assert record is not None
+        claimed = store.claim(
+            key,
+            expected_revision=record.revision,
+            expected_action_generation=request.action_generation,
+            holder=request.holder,
+            lease_expires_at="2099-01-01T00:00:00+00:00",
+            now="2026-08-10T00:00:00+00:00",
+        )
+        if not claimed.applied:
+            raise AssertionError(claimed.reason)
+        for phase in (PHASE_CLAIMED, PHASE_REPLACING_NONSELF):
+            record = store.get(key)
+            assert record is not None
+            moved = store.transition_phase(
+                key,
+                expected_revision=record.revision,
+                expected_action_generation=request.action_generation,
+                target=phase,
+                holder=request.holder,
+                now="2026-08-10T00:00:00+00:00",
+            )
+            if not moved.applied:
+                raise AssertionError(moved.reason)
+        record = store.get(key)
+        assert record is not None
+        moved = store.transition_participant(
+            key,
+            expected_revision=record.revision,
+            expected_action_generation=request.action_generation,
+            identity=participants[1].identity,
+            target=PARTICIPANT_LAUNCH_OWED,
+            holder=request.holder,
+            now="2026-08-10T00:00:00+00:00",
+        )
+        if not moved.applied:
+            raise AssertionError(moved.reason)
+        return key, participants
+
+    def _exercise_worker_launch_replay(self, worker_attestation: str):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_restored_pair_recovery_live as site,
+        )
+
+        plan = _plan()
+        request = _request(plan)
+
+        class FakePort:
+            def __init__(self) -> None:
+                self.closed: list[str] = []
+                self.launched: list[str] = []
+                self.verified: list[str] = []
+
+            def observe_old_slot(self, _pin):
+                return OLD_SLOT_PRESENT
+
+            def observe_preservation(self, _pin):
+                return PreservationObservation(
+                    identity_matches=True, attestation_fresh=True
+                )
+
+            def close_exact_generation(self, pin):
+                self.closed.append(pin.assigned_name)
+                return CLOSE_DONE
+
+            def launch_action_bound(self, _action_id, pin):
+                self.launched.append(pin.assigned_name)
+                return LAUNCH_DONE
+
+            def verify_attestation(self, _action_id, pin):
+                self.verified.append(pin.assigned_name)
+                if pin.assigned_name == plan.worker.assigned_name:
+                    return worker_attestation
+                return ATTEST_BOUND
+
+        class FakeRoleOps:
+            def __init__(self, *args, request=None, **kwargs):
+                self.request = request
+
+            def resume_lane_authority(self, _request):
+                return True
+
+            def lane_free_of_live_process(self, _request):
+                # The worker's same-name slot is already live after launch succeeded,
+                # while the gateway has not reached its launch effect yet.
+                return self.request.assigned_name != plan.worker.assigned_name
+
+            def replacement_store_admission(self, _key, _pin):
+                return None
+
+        fake_port = FakePort()
+        with TemporaryDirectory() as temp:
+            store = ReplacementTransactionStore(path=Path(temp) / "replacement.sqlite")
+            key, participants = self._seed_worker_launch_owed(
+                store, plan, request
+            )
+            ops = site.LiveRestoredPairRecoveryOps(
+                repo_root=Path(temp), transaction_store=store
+            )
+            with (
+                mock.patch.object(
+                    site, "LiveRecoveryActuatorPort", return_value=fake_port
+                ),
+                mock.patch.object(site, "LiveStaleWorkerRecoveryOps", FakeRoleOps),
+            ):
+                outcome = ops.replace_pair(request, plan)
+            record = store.get(key)
+            assert record is not None
+            participant_phases = {
+                pin.assigned_name: record.find_participant(pin.identity).phase
+                for pin in participants
+            }
+            return outcome, fake_port, record.phase, participant_phases
+
+    def test_launch_effect_crash_replay_adopts_exact_action_bound_live_slot(self) -> None:
+        outcome, port, phase, participant_phases = (
+            self._exercise_worker_launch_replay(ATTEST_BOUND)
+        )
+
+        self.assertTrue(outcome.completed, outcome.detail)
+        self.assertEqual(phase, "completed")
+        # Worker close and launch already happened before the simulated crash.  The
+        # replay adopts it, re-verifies it, and never repeats either live effect.
+        self.assertNotIn("managed-claude", port.closed)
+        self.assertNotIn("managed-claude", port.launched)
+        self.assertGreaterEqual(port.verified.count("managed-claude"), 2)
+        self.assertEqual(participant_phases["managed-claude"], "replaced")
+        # The not-yet-progressed sibling still follows the normal close/launch path.
+        self.assertEqual(port.closed, ["managed-codex"])
+        self.assertEqual(port.launched, ["managed-codex"])
+
+    def test_launch_effect_crash_replay_refuses_foreign_live_slot(self) -> None:
+        outcome, port, phase, participant_phases = (
+            self._exercise_worker_launch_replay(ATTEST_MISMATCH)
+        )
+
+        self.assertFalse(outcome.completed)
+        self.assertIn("launch_authority_moved", outcome.detail)
+        self.assertEqual(phase, PHASE_REPLACING_NONSELF)
+        self.assertEqual(
+            participant_phases["managed-claude"], PARTICIPANT_LAUNCH_OWED
+        )
+        self.assertEqual(port.closed, [])
+        self.assertEqual(port.launched, [])
+
     def test_live_composition_drives_both_exact_participants_to_completed(self) -> None:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
             sublane_restored_pair_recovery_live as site,

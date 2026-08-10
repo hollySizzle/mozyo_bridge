@@ -71,6 +71,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (  # noqa: E501
     ACTUATION_RECOVERED,
+    ATTEST_BOUND,
+    LAUNCH_DONE,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
     COMMAND_TIMEOUT_SECONDS,
@@ -83,6 +85,9 @@ _CONTINUATION_ACTION = "pair_relaunch_no_dispatch"
 @dataclass
 class _PairActuatorPort:
     ports: Mapping[tuple[str, str, str, str], LiveRecoveryActuatorPort]
+    _adopted_launches: set[tuple[str, tuple[str, str, str, str]]] = field(
+        default_factory=set, init=False, repr=False
+    )
 
     def _port(self, pin: ParticipantPin) -> LiveRecoveryActuatorPort:
         port = self.ports.get(pin.identity)
@@ -100,10 +105,31 @@ class _PairActuatorPort:
         return self._port(pin).close_exact_generation(pin)
 
     def launch_action_bound(self, action_id: str, pin: ParticipantPin) -> str:
+        key = (action_id, pin.identity)
+        if key in self._adopted_launches:
+            # The launch effect already completed before the durable launch_owed ->
+            # verify_owed CAS.  The action-bound live attestation was re-joined by
+            # admit_action_bound_live(), so this is an idempotent adopt, not a second
+            # Herdr launch.  verify_attestation() is still called again by the actuator
+            # at verify_owed, closing the race between this read and durable completion.
+            return LAUNCH_DONE
         return self._port(pin).launch_action_bound(action_id, pin)
 
     def verify_attestation(self, action_id: str, pin: ParticipantPin) -> str:
         return self._port(pin).verify_attestation(action_id, pin)
+
+    def admit_action_bound_live(self, action_id: str, pin: ParticipantPin) -> bool:
+        """Adopt only a fresh live slot already bound to this exact replacement.
+
+        This is the launch-effect/CAS crash-window fence.  A normal, foreign, stale,
+        ambiguous, or unreadable slot cannot return ATTEST_BOUND through the canonical
+        live identity join and therefore remains blocked by the lane-free probe.
+        """
+
+        if self._port(pin).verify_attestation(action_id, pin) != ATTEST_BOUND:
+            return False
+        self._adopted_launches.add((action_id, pin.identity))
+        return True
 
 
 @dataclass
@@ -345,7 +371,12 @@ class LiveRestoredPairRecoveryOps:
             preservation_policy=assess_worker_recovery_preservation,
             launch_authority=lambda pin: (
                 role_ops[pin.identity].resume_lane_authority(requests[pin.identity])
-                and role_ops[pin.identity].lane_free_of_live_process(requests[pin.identity])
+                and (
+                    role_ops[pin.identity].lane_free_of_live_process(
+                        requests[pin.identity]
+                    )
+                    or port.admit_action_bound_live(request.action_id, pin)
+                )
             ),
             store_admission=lambda action_key, pin: role_ops[
                 pin.identity

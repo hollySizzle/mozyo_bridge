@@ -452,6 +452,10 @@ forceやpending overrideを加えない。pending generationが本当に破棄�
   exact close → same-slot launch → action-bound startup attestation を gateway/worker の順で進める。
   transaction は participant ごとの owed state を各効果の成功後に更新するため、進行が
   durable に記録された途中停止は同一 pin で再実行でき、記録済みの close を再実行しない。
+  launch effect の成功後かつ `launch_owed -> verify_owed` 更新前に停止した場合は、fresh
+  live slot の identity と action-bound startup attestation が同じaction/pinへ完全一致するとき
+  だけ既存launchを採用し、新しいlaunchを行わずattestation再確認へ進む。異なるaction、通常
+  launch、stale/ambiguous/unreadableなslotは採用せず、同名live process blockerで停止する。
   close 成功直後かつ owed-state 更新前に停止し、他participantにもdurableな進行がない場合は
   進行済みreplayと証明できないため自動再開せず fail-closed とする。すでに同じexact
   transactionの別participantにdurableな進行がある場合は、actuatorが旧generationの明示的な
