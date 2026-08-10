@@ -336,7 +336,7 @@ def prepare_session(
     ``pair_order`` is the lane's STABLE managed pair order, for a caller that shrank
     ``providers`` to a subset (contract: :func:`...validate_pair_order`, #14569).
     """
-    repo_root, _ = apply_workspace_alias(repo_root)  # nested-workspace alias (#15190)
+    repo_root, _alias_id = apply_workspace_alias(repo_root)  # nested alias (#15190)
     # The signature is spelled out rather than `**kwargs` (review j#80305 R8-F2): the
     # explicit keyword-only contract is public (introspection / typing / IDE / wrapping
     # callers), and Python's argument binding at THIS entry is what rejects a malformed
@@ -344,6 +344,7 @@ def prepare_session(
     # lock file first and only then raise from the inner function — a side effect ahead of
     # validation, which is exactly what the rest of this component refuses to do.
     call = dict(
+        alias_expected_workspace_id=_alias_id,
         repo_root=repo_root,
         providers=providers,
         lane_id=lane_id,
@@ -441,6 +442,7 @@ def _prepare_session_locked(
     startup_fence: "Optional[StartupTransactionFence]" = None,
     action_nonce: str = "",
     launch_cause: str = LAUNCH_CAUSE_GENERIC_FRESH,
+    alias_expected_workspace_id: str = "",
     _launch_shims: "Optional[ActionPrivateLaunchShimSet]" = None,
     _capabilities_observed: bool = False,
 ) -> SessionStartResult:
@@ -460,7 +462,8 @@ def _prepare_session_locked(
     is still refused *before* the home lock, binary resolution and the capability
     probe — the zero-side-effect ordering this rail promises.
     """
-    repo_root, _alias_expected_id = apply_workspace_alias(repo_root)
+    repo_root, _own_id = apply_workspace_alias(repo_root)
+    _alias_expected_id = alias_expected_workspace_id or _own_id
     for provider in providers:
         if provider not in AGENT_PROVIDERS:
             raise HerdrSessionStartError(

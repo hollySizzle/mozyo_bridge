@@ -1452,7 +1452,7 @@ allowlist:
     expires: "2027-10-08"
 
   - path: src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_session_start.py
-    lines: 1015
+    lines: 1018
     reason: >-
       Re-added by Redmine #15190 (nested-workspace alias / launch-disable).
       The file was at EXACTLY 1000 — the threshold itself — before this change, so
@@ -1467,7 +1467,9 @@ allowlist:
       Re-applying is idempotent: a canonical root declares nothing, so an
       already-folded root resolves to itself. The addition is two import lines
       and two call lines, plus the action-time identity binding the alias decision
-      owes its launch (#15190 review j#102641 F1), plus the docstring paragraph recording why the
+      owes its launch (#15190 review j#102641 F1) and the public-to-private hand-off
+      of that binding (review j#102710 r6f1 — the canonical root declares nothing,
+      so the private entry cannot re-derive it), plus the docstring paragraph recording why the
       duplication is deliberate — without it a later reader would "clean up" the
       second call and silently restore the bypass. The decision body, its typed
       refusals and its operator guidance all live in the new cohesive sibling

@@ -119,6 +119,32 @@ def _parent_path(repo_root: Path | str) -> Path:
     return Path(repo_root) / _ALIAS_PARENT
 
 
+def _fsync_repo_root(repo_root: Path | str) -> None:
+    """Persist a NEWLY created ``.mozyo-bridge`` entry in its own parent.
+
+    Syncing the declaration and the ``.mozyo-bridge`` dirfd is not enough when
+    that directory itself was just created: the entry naming it lives in the
+    repo root, and an unsynced directory creation can be lost on power loss —
+    taking the declaration with it (review j#102710 r6f4).
+    """
+    root = Path(repo_root)
+    try:
+        fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError as exc:
+        raise WorkspaceAliasStoreError(
+            REASON_DURABILITY_FAILED, f"{root} could not be opened to sync ({exc})"
+        ) from exc
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        raise WorkspaceAliasStoreError(
+            REASON_DURABILITY_FAILED,
+            f"{root} could not be synced after creating {_ALIAS_PARENT} ({exc})",
+        ) from exc
+    finally:
+        os.close(fd)
+
+
 def _open_parent(repo_root: Path | str, *, create: bool) -> Optional[int]:
     """A dirfd for ``<repo_root>/.mozyo-bridge``, opened ``O_NOFOLLOW``.
 
@@ -130,13 +156,17 @@ def _open_parent(repo_root: Path | str, *, create: bool) -> Optional[int]:
     the workspace.
     """
     parent = _parent_path(repo_root)
+    created = False
     if create:
         try:
+            created = not parent.exists()
             os.makedirs(parent, exist_ok=True)
         except OSError as exc:
             raise WorkspaceAliasStoreError(
                 REASON_PARENT_UNSAFE, f"{parent}: {exc}"
             ) from exc
+    if created:
+        _fsync_repo_root(repo_root)
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         return os.open(parent, flags)
@@ -468,6 +498,72 @@ def _fsync_dir(dirfd: int) -> None:
         ) from exc
 
 
+def _take_ownership(dirfd: int, fence) -> Optional[str]:
+    """Atomically claim the current declaration, or refuse.
+
+    ``_require_fence`` followed by ``os.replace`` / ``os.unlink`` is check-then-act:
+    a writer that does not take the lock can land between the two syscalls, and
+    the mutation then destroys an update this operation never read (review
+    j#102710 r6f2). ``rename`` IS atomic, so the entry is moved aside FIRST —
+    after which this operation owns that exact inode and can verify it at
+    leisure. A mismatch is put back, leaving zero mutation.
+
+    Returns the private name now holding the previous declaration, or ``None``
+    when there was nothing to claim.
+    """
+    if fence is None:
+        return None
+    owned = f".{_ALIAS_NAME}.{uuid.uuid4().hex}.owned"
+    try:
+        os.rename(_ALIAS_NAME, owned, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+    except FileNotFoundError:
+        raise WorkspaceAliasStoreError(
+            REASON_CONCURRENT_CHANGE,
+            f"{ALIAS_RELATIVE} disappeared before this operation could claim it",
+        ) from None
+    except OSError as exc:
+        raise WorkspaceAliasStoreError(
+            REASON_WRITE_FAILED, f"{ALIAS_RELATIVE}: {exc}"
+        ) from exc
+    try:
+        body = _read_owned(dirfd, owned)
+    except OSError as exc:
+        _put_back(dirfd, owned)
+        raise WorkspaceAliasStoreError(
+            REASON_CONCURRENT_CHANGE, f"{ALIAS_RELATIVE}: {exc}"
+        ) from exc
+    digest = hashlib.sha256(body).hexdigest() if body is not None else None
+    if digest != fence[1]:
+        _put_back(dirfd, owned)
+        raise WorkspaceAliasStoreError(
+            REASON_CONCURRENT_CHANGE,
+            f"{ALIAS_RELATIVE} was replaced by another writer just before this "
+            f"operation claimed it; the update it never read has been left in "
+            f"place",
+        )
+    return owned
+
+
+def _read_owned(dirfd: int, name: str) -> Optional[bytes]:
+    fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dirfd)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_DECLARATION_BYTES:
+            return None
+        return os.read(fd, MAX_DECLARATION_BYTES + 1)
+    finally:
+        os.close(fd)
+
+
+def _put_back(dirfd: int, owned: str) -> None:
+    """Restore a claimed entry. Best effort: the caller is already refusing."""
+    try:
+        os.rename(owned, _ALIAS_NAME, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+        os.fsync(dirfd)
+    except OSError:
+        pass
+
+
 def _restore(dirfd: int, backup: Optional[str], had_previous: bool) -> bool:
     """Undo a landed replace. True when the effective state was restored.
 
@@ -604,12 +700,29 @@ def write_declaration(
             backup = _write_temp(dirfd, previous_bytes)
         temp_name = _write_temp(dirfd, body)
 
+        owned: Optional[str] = None
         try:
             _require_parent_visible(repo_root, anchor)
-            _require_fence(dirfd, fence)
-            os.replace(temp_name, _ALIAS_NAME, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+            # Claim the current entry atomically, then install. When there is
+            # nothing to claim, `os.link` creates only if absent, so a
+            # declaration that appeared meanwhile is not clobbered.
+            owned = _take_ownership(dirfd, fence)
+            if fence is None:
+                try:
+                    os.link(temp_name, _ALIAS_NAME, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+                except FileExistsError:
+                    raise WorkspaceAliasStoreError(
+                        REASON_CONCURRENT_CHANGE,
+                        f"{ALIAS_RELATIVE} was created by another writer while "
+                        f"this operation was preparing to create it",
+                    ) from None
+                _discard(dirfd, temp_name)
+            else:
+                os.replace(temp_name, _ALIAS_NAME, src_dir_fd=dirfd, dst_dir_fd=dirfd)
         except WorkspaceAliasStoreError:
             _discard(dirfd, temp_name)
+            if owned is not None:
+                _put_back(dirfd, owned)
             raise
         except OSError as exc:
             _discard(dirfd, temp_name)
@@ -726,8 +839,19 @@ def clear_declaration(repo_root: Path | str) -> str:
             )
 
         try:
-            _require_fence(dirfd, fence)
-            os.unlink(_ALIAS_NAME, dir_fd=dirfd)
+            if snapshot is not None:
+                # A regular declaration is claimed atomically first, so an
+                # external replacement between the check and the removal is
+                # detected and left in place rather than deleted (j#102710 r6f2).
+                claimed = _take_ownership(dirfd, fence)
+                if claimed is None:
+                    raise FileNotFoundError
+                os.unlink(claimed, dir_fd=dirfd)
+            else:
+                # Non-regular entries (symlink / directory / FIFO) have no
+                # content to claim: unlinking a symlink drops the link, and a
+                # directory correctly fails below.
+                os.unlink(_ALIAS_NAME, dir_fd=dirfd)
         except FileNotFoundError:
             outcome = CLEAR_ABSENT
         except OSError as exc:
@@ -779,6 +903,7 @@ def clear_declaration(repo_root: Path | str) -> str:
 
 __all__ = (
     "CLEAR_ABSENT",
+    "WorkspaceAliasDeclaration",
     "CLEAR_REMOVED",
     "WorkspaceAliasStoreError",
     "alias_path",

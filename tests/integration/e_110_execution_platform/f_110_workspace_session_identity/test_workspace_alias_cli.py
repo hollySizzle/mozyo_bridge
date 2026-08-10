@@ -1132,3 +1132,141 @@ class WorkspaceAliasProcessConcurrencyTests(WorkspaceAliasCliTestCase):
             {"no_declaration", "aliased", "launch_disabled"},
             f"concurrent mutations left an unreadable state: {payload}",
         )
+
+
+class WorkspaceAliasR6FindingTests(WorkspaceAliasCliTestCase):
+    """Review j#102710 findings r6f1, r6f2 and r6f4."""
+
+    def test_public_launch_entry_keeps_the_alias_identity_binding(self) -> None:
+        """The binding must survive the public -> private entry boundary.
+
+        The canonical root declares nothing, so the private entry's own
+        re-resolution yields no binding; carrying it across the boundary is what
+        makes the action-time check real on the public CLI path.
+        """
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_session_start as session,
+        )
+
+        self.run_cli(
+            "workspace", "alias", "set",
+            "--repo", str(self.nested), "--to", str(self.canonical),
+        )
+        seen: dict = {}
+
+        def spy(expected: str, registered: str) -> None:
+            seen["expected"] = expected
+            seen["registered"] = registered
+
+        with mock.patch.object(session, "require_alias_identity", spy), \
+                mock.patch.object(session, "_resolve_binary_or_die", return_value="herdr"), \
+                mock.patch.object(session, "require_herdr_cli_capabilities", return_value=None), \
+                mock.patch.object(session, "validate_session_request", return_value=None), \
+                mock.patch.object(session, "_resolve_workspace_id_readonly", return_value="e" * 32):
+            try:
+                session.prepare_session(
+                    repo_root=self.nested, providers=["codex"], lane_id="",
+                    env={}, dry_run=True,
+                )
+            except Exception:
+                pass  # the run stops later; only the binding matters here
+        self.assertEqual(
+            seen.get("expected"), CANONICAL_ID,
+            "the public entry dropped the alias identity binding",
+        )
+
+    def _inject_before_claim(self, path: Path):
+        real = store._take_ownership
+        fired: list = []
+
+        def inject(dirfd, fence):
+            if not fired:
+                fired.append(1)
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                payload["reason"] = "CONCURRENT"
+                temp = path.parent / ".unmanaged.tmp"
+                temp.write_text(
+                    json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                os.replace(temp, path)
+            return real(dirfd, fence)
+
+        return inject
+
+    def test_unmanaged_writer_before_the_claim_survives_a_clear(self) -> None:
+        self.run_cli(
+            "workspace", "alias", "disable",
+            "--repo", str(self.nested), "--reason", "OLD",
+        )
+        path = alias_path(self.nested)
+        with mock.patch.object(store, "_take_ownership", self._inject_before_claim(path)):
+            code, payload = self.run_cli(
+                "workspace", "alias", "clear", "--repo", str(self.nested)
+            )
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["reason"], REASON_CONCURRENT_CHANGE)
+        self.assertEqual(
+            json.loads(path.read_text(encoding="utf-8"))["reason"], "CONCURRENT",
+            "clear deleted an update it never read",
+        )
+
+    def test_unmanaged_writer_before_the_claim_survives_a_write(self) -> None:
+        self.run_cli(
+            "workspace", "alias", "disable",
+            "--repo", str(self.nested), "--reason", "OLD",
+        )
+        path = alias_path(self.nested)
+        with mock.patch.object(store, "_take_ownership", self._inject_before_claim(path)):
+            code, payload = self.run_cli(
+                "workspace", "alias", "disable",
+                "--repo", str(self.nested), "--reason", "NEW",
+            )
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["reason"], REASON_CONCURRENT_CHANGE)
+        self.assertEqual(
+            json.loads(path.read_text(encoding="utf-8"))["reason"], "CONCURRENT",
+            "write overwrote an update it never read",
+        )
+
+    def test_a_freshly_created_parent_is_persisted_in_the_repo_root(self) -> None:
+        fresh = self.base / "fresh-workspace"
+        fresh.mkdir()
+        real_fsync = os.fsync
+        synced: list = []
+
+        def track(fd):
+            try:
+                if stat.S_ISDIR(os.fstat(fd).st_mode):
+                    synced.append(os.readlink(f"/proc/self/fd/{fd}"))
+            except OSError:  # pragma: no cover - defensive
+                pass
+            return real_fsync(fd)
+
+        with mock.patch.object(store.os, "fsync", track):
+            store.write_declaration(
+                fresh,
+                store.WorkspaceAliasDeclaration(mode="disabled"),
+            )
+        self.assertIn(
+            str(fresh), synced,
+            "a newly created .mozyo-bridge was not persisted in the repo root",
+        )
+
+    def test_an_existing_parent_is_not_resynced(self) -> None:
+        """The repo-root sync is only owed when the parent was just created."""
+        self.run_cli("workspace", "alias", "disable", "--repo", str(self.nested))
+        real_fsync = os.fsync
+        synced: list = []
+
+        def track(fd):
+            try:
+                if stat.S_ISDIR(os.fstat(fd).st_mode):
+                    synced.append(os.readlink(f"/proc/self/fd/{fd}"))
+            except OSError:  # pragma: no cover - defensive
+                pass
+            return real_fsync(fd)
+
+        with mock.patch.object(store.os, "fsync", track):
+            self.run_cli("workspace", "alias", "disable", "--repo", str(self.nested))
+        self.assertNotIn(str(self.nested), synced)

@@ -227,6 +227,20 @@ descriptor** に固定し、判定は全て `lstat` で行う。
   (dev/ino/mtime_ns/size) を束縛し、snapshot 直後と replace 直前に照合する
   (`declaration_concurrent_change`)。lock を通らない外部 writer への防御であり、
   「読んでいない宣言を上書きしない」ことを保証する。
+- **mutation は check-then-act ではなく atomic take-ownership で行う** (review j#102710 r6f2)。
+  fence 照合と `os.replace` / `os.unlink` は別 syscall であり、その間に lock を通らない
+  writer が着地しうる。そこで既存 entry を先に `rename` で私有名へ退避して**所有権を原子的に
+  獲得**し、獲得した inode の digest を fence と照合してから install / 削除する。不一致なら
+  退避を戻して `declaration_concurrent_change` (zero mutation)。宣言が不在の場合は
+  `os.link` (存在すれば EEXIST) で「不在時のみ作成」を原子化する。非通常 entry
+  (symlink / directory) は content を持たないため従来どおり直接 unlink する。
+- **alias が承認した identity は public entry から private entry へ引き渡す**
+  (review j#102710 r6f1)。canonical root 自身は宣言を持たないため、private entry で
+  再解決すると binding が空になる。public wrapper が承認 id を call へ載せ、private entry は
+  caller 由来の binding を優先する。
+- **`.mozyo-bridge` を新規作成した場合は repo root directory も fsync する**
+  (review j#102710 r6f4)。宣言と `.mozyo-bridge` を sync しても、その directory を指す
+  entry は repo root にあり、未 sync なら crash で宣言ごと失われる。
 - **fence は content-bound で、clear にも適用する** (review j#102641 F2)。metadata
   (dev/ino/mtime_ns/size) だけでは、同一 inode・同 size・mtime 復元の in-place 更新を
   検出できない。snapshot した bytes の digest を fence に含め、replace / unlink の直前に
