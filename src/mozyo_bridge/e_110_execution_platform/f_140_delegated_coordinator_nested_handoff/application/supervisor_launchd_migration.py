@@ -21,22 +21,22 @@ from typing import Optional
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd_agent import (  # noqa: E501
     LEGACY_DRAIN_AGENT,
+    SUPERVISOR_AGENT,
+    Runner,
+    SupervisorAgent,
+    default_runner as _default_runner,
+    launchctl,
+    service_target,
+)
+# Every read and write of an owned plist goes through the filesystem seam, which pins each directory
+# component no-follow rather than re-walking a path string (review j#102590 r14f1).
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd_fs import (  # noqa: E501
     PLIST_ABSENT,
     PLIST_FOREIGN,
     PLIST_OWNED,
     PLIST_UNREADABLE,
-    SUPERVISOR_AGENT,
-    SupervisorAgent,
-    classify_plist,
-    launchctl,
-    plist_path,
-    service_target,
-)
-# The process seam lives with the read-only probe (the only inherently "run something" concern), so
-# both mutating modules take it from one place rather than each defining its own.
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd_probe import (  # noqa: E501
-    Runner,
-    default_runner as _default_runner,
+    classify,
+    unlink_owned,
 )
 
 # ---------------------------------------------------------------------------
@@ -102,7 +102,7 @@ def classify_agent_plist(
     overwrote and ``uninstall`` deleted whatever occupied the *current* agent's path — a stranger's
     LaunchAgent included (r12f2).
     """
-    return classify_plist(plist_path(os_home, agent=agent), label=agent.label)
+    return classify(os_home, agent=agent)
 
 
 def remove_legacy_drain(
@@ -191,7 +191,7 @@ def remove_legacy_drain(
             "state": at_unlink, "removed": False, "reason": _LEGACY_DRAIN_REFUSAL_REASON[at_unlink],
         }
     try:
-        plist_path(os_home, agent=LEGACY_DRAIN_AGENT).unlink()
+        unlink_owned(os_home, agent=LEGACY_DRAIN_AGENT)
     except OSError:
         return {"state": state, "removed": False, "reason": REASON_LEGACY_DRAIN_REMOVAL_FAILED}
     return {"state": state, "removed": True, "reason": ""}

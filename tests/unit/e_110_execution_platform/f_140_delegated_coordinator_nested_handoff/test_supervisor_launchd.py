@@ -23,6 +23,7 @@ without touching the host. Live launchd operation is a separate coordinator gate
 
 from __future__ import annotations
 
+import errno
 import os
 import plistlib
 import sys
@@ -36,6 +37,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
     supervisor_launchd as sl,
+    supervisor_launchd_fs as fs,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workspace_callback_supervisor import (
     SupervisedWorkspace,
@@ -1533,7 +1535,7 @@ class LegacyDrainMigrationTest(_DarwinCase):
         _write_home_credential(self.mozyo_home)
         _legacy_drain_plist(self.os_home)
         runner = _LegacyBootoutSucceeds()
-        with patch.object(sl.Path, "unlink", side_effect=OSError("read-only")):
+        with patch.object(os, "unlink", side_effect=OSError("read-only")):
             result = sl.install(
                 os_home=self.os_home, mozyo_home=self.mozyo_home,
                 runner=runner, which=_which_found,
@@ -2023,7 +2025,7 @@ class UninstallNeverDeletesAfterFailedBootoutTest(_DarwinCase):
     def test_an_unlink_failure_is_a_typed_result_not_an_escaping_oserror(self) -> None:
         # The retired-drain migration has always reported this as a typed result; this verb let the
         # OSError out of the envelope, host path and all (review j#102550 r13f5).
-        with patch.object(sl.Path, "unlink", side_effect=OSError("read-only file system")):
+        with patch.object(os, "unlink", side_effect=OSError("read-only file system")):
             result, _ = self._uninstall_with(_result(0))
         self.assertFalse(result["performed"])
         self.assertEqual(sl.REASON_PLIST_REMOVAL_FAILED, result["reason"])
@@ -2188,13 +2190,16 @@ class ThePathIsNotFollowedTest(_DarwinCase):
         self.assertEqual(before, other.read_bytes())
 
     def test_the_writer_itself_refuses_a_symlink_even_when_asked_directly(self) -> None:
-        # The guarantee must not rest on the classification winning a race, so the write refuses on
-        # its own (O_NOFOLLOW) rather than trusting the check that preceded it.
+        # The guarantee must not rest on the classification winning a race, so the write refuses to
+        # follow a link on its own rather than trusting the check that preceded it. Since j#102590
+        # r14f2 it stages and renames, so the link is replaced as a NAME and the file it pointed at
+        # keeps its contents — which is the property that matters.
         victim = self.outside / "late-swap.plist"
+        victim.write_bytes(b"someone else's bytes")
         self.target.symlink_to(victim)
-        with self.assertRaises(OSError):
-            sl.write_owned_plist(self.target, b"payload")
-        self.assertFalse(victim.exists())
+        fs.write_owned(b"payload", self.os_home)
+        self.assertEqual(b"someone else's bytes", victim.read_bytes())
+        self.assertFalse(self.target.is_symlink())
 
     def test_a_plain_owned_plist_is_still_written_and_readable(self) -> None:
         result = self._install()
@@ -2264,6 +2269,188 @@ class StatusReadsOnlyOurOwnPlistTest(_DarwinCase):
         self.assertEqual(sl.PLIST_ABSENT, status["plist_state"])
         self.assertFalse(status["plist_exists"])
         self.assertEqual([], status["installed_command"])
+
+
+class NoAncestorEscapesTheOwnedPathTest(_DarwinCase):
+    """Every component of the owned path is checked, not just the last (j#102590 r14f1).
+
+    `lstat` and `O_NOFOLLOW` apply to the FINAL component only, so making `Library/LaunchAgents` a
+    symlink left every leaf check intact and still put the write, the read and the unlink in someone
+    else's directory — with `performed: true` and, for a plist planted there, a foreign argv
+    published as `owned`.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.outside = Path(tempfile.mkdtemp())
+        (self.os_home / "Library").mkdir(parents=True, exist_ok=True)
+        (self.os_home / "Library" / "LaunchAgents").symlink_to(self.outside)
+
+    def _install(self):
+        return sl.install(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            runner=FakeRunner(), which=_which_found,
+        )
+
+    def test_a_symlinked_ancestor_is_unreadable_not_absent(self) -> None:
+        self.assertEqual(sl.PLIST_UNREADABLE, sl.classify_agent_plist(self.os_home))
+
+    def test_install_creates_nothing_beyond_a_symlinked_ancestor(self) -> None:
+        result = self._install()
+        self.assertFalse(result["performed"])
+        # Both plists live under the relinked directory, so whichever preflight runs first reports
+        # it. The retired drain's comes first, and either token is an accurate account of the same
+        # fact: nothing under this path can be identified.
+        self.assertIn(
+            result["reason"], (sl.REASON_LEGACY_DRAIN_UNREADABLE, sl.REASON_PLIST_UNREADABLE)
+        )
+        self.assertEqual([], list(self.outside.iterdir()))
+
+    def test_status_publishes_no_argv_from_beyond_a_symlinked_ancestor(self) -> None:
+        _write_plist(self.outside / f"{sl.SUPERVISOR_LAUNCHD_LABEL}.plist", sl.SUPERVISOR_LAUNCHD_LABEL)
+        (self.outside / f"{sl.SUPERVISOR_LAUNCHD_LABEL}.plist").write_bytes(
+            plistlib.dumps(
+                {
+                    "Label": sl.SUPERVISOR_LAUNCHD_LABEL,
+                    "ProgramArguments": ["/x", "--token", "ANCESTOR-SENTINEL"],
+                }
+            )
+        )
+        status = sl.service_status(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            runner=FakeRunner(print_result=_result(113)), which=_which_found,
+        )
+        self.assertEqual(sl.PLIST_UNREADABLE, status["plist_state"])
+        self.assertNotIn("ANCESTOR-SENTINEL", repr(status))
+
+    def test_uninstall_and_restart_refuse_beyond_a_symlinked_ancestor(self) -> None:
+        planted = self.outside / f"{sl.SUPERVISOR_LAUNCHD_LABEL}.plist"
+        _write_plist(planted, sl.SUPERVISOR_LAUNCHD_LABEL)
+        for verb, call in (
+            ("uninstall", lambda: sl.uninstall(os_home=self.os_home, runner=FakeRunner())),
+            ("restart", lambda: sl.restart(
+                os_home=self.os_home, runner=FakeRunner(), which=_which_found)),
+        ):
+            with self.subTest(verb=verb):
+                result = call()
+                self.assertFalse(result["performed"])
+                self.assertEqual(sl.REASON_PLIST_UNREADABLE, result["reason"])
+                self.assertTrue(planted.exists())
+
+    def test_the_retired_migration_refuses_beyond_a_symlinked_ancestor_too(self) -> None:
+        planted = self.outside / f"{sl.SUPERVISOR_DRAIN_LAUNCHD_LABEL}.plist"
+        _write_plist(planted, sl.SUPERVISOR_DRAIN_LAUNCHD_LABEL)
+        result = sl.remove_legacy_drain(os_home=self.os_home, runner=FakeRunner())
+        self.assertFalse(result["removed"])
+        self.assertEqual(sl.LEGACY_DRAIN_UNREADABLE, result["state"])
+        self.assertTrue(planted.exists())
+
+    def test_a_missing_directory_is_absence_not_an_unreadable_state(self) -> None:
+        # A directory that cannot exist cannot hold a plist. Conflating the two would make every
+        # never-installed host look unidentifiable and refuse its first install.
+        clean = Path(tempfile.mkdtemp())
+        self.assertEqual(sl.PLIST_ABSENT, sl.classify_agent_plist(clean))
+
+
+class TheWriteIsStagedNotTruncatedTest(_DarwinCase):
+    """A write assembles under a temporary name and is renamed into place (j#102590 r14f2).
+
+    Opening with `O_TRUNC` destroyed the destination before the descriptor could be examined, so a
+    plist swapped for a hard link to someone else's file had that file overwritten — through a fence
+    that had just refused hard links. And a partial write left a truncated plist reporting success.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.outside = Path(tempfile.mkdtemp())
+        self.target = sl.plist_path(self.os_home)
+        self.target.parent.mkdir(parents=True, exist_ok=True)
+
+    def test_a_hard_link_swapped_in_before_the_write_keeps_its_contents(self) -> None:
+        victim = _write_plist(self.outside / "victim.plist", "com.example.victim")
+        original = victim.read_bytes()
+        os.link(victim, self.target)
+        fs.write_owned(b"ours", self.os_home)
+        # The rename replaced a NAME. The other name still refers to the untouched inode.
+        self.assertEqual(original, victim.read_bytes())
+        self.assertEqual(b"ours", self.target.read_bytes())
+        self.assertEqual(1, os.stat(victim).st_nlink)
+
+    def test_a_failure_mid_write_leaves_the_previous_plist_intact(self) -> None:
+        _write_plist(self.target, sl.SUPERVISOR_LAUNCHD_LABEL)
+        before = self.target.read_bytes()
+        real_write, calls = os.write, {"n": 0}
+
+        def failing(fd, data):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise OSError(errno.ENOSPC, "no space left on device")
+            return real_write(fd, data[:1])
+
+        with patch.object(os, "write", failing):
+            with self.assertRaises(OSError):
+                fs.write_owned(b"0123456789" * 40, self.os_home)
+        self.assertEqual(before, self.target.read_bytes())
+
+    def test_a_failed_write_leaves_no_staging_file_behind(self) -> None:
+        _write_plist(self.target, sl.SUPERVISOR_LAUNCHD_LABEL)
+        with patch.object(os, "write", side_effect=OSError(errno.ENOSPC, "full")):
+            with self.assertRaises(OSError):
+                fs.write_owned(b"payload", self.os_home)
+        self.assertEqual([self.target.name], [p.name for p in self.target.parent.iterdir()])
+
+    def test_a_partial_write_is_completed_rather_than_reported_as_done(self) -> None:
+        # `os.write` may write fewer bytes than it is given; the loop must finish the payload.
+        payload = b"0123456789" * 40
+        real_write = os.write
+        with patch.object(os, "write", lambda fd, data: real_write(fd, data[:7])):
+            fs.write_owned(payload, self.os_home)
+        self.assertEqual(payload, self.target.read_bytes())
+
+
+class StatusJudgesAndPublishesOneInodeTest(_DarwinCase):
+    """The verdict and the bytes come from a single descriptor (review j#102590 r14f3).
+
+    Classifying by path and then re-opening it to read judged one file and published another: a
+    plist replaced between the two calls was reported `owned` while a stranger's argv went out.
+    """
+
+    def test_a_swap_after_classification_cannot_publish_its_argv(self) -> None:
+        target = sl.plist_path(self.os_home)
+        _write_plist(target, sl.SUPERVISOR_LAUNCHD_LABEL)
+        real_read = fs._read_all
+
+        def swap_then_read(fd):
+            # Replace the path — not the descriptor — with an owned-looking file carrying a secret.
+            target.unlink()
+            target.write_bytes(
+                plistlib.dumps(
+                    {
+                        "Label": sl.SUPERVISOR_LAUNCHD_LABEL,
+                        "ProgramArguments": ["/x", "--token", "SWAP-SENTINEL"],
+                    }
+                )
+            )
+            return real_read(fd)
+
+        with patch.object(fs, "_read_all", swap_then_read):
+            status = sl.service_status(
+                os_home=self.os_home, mozyo_home=self.mozyo_home,
+                runner=FakeRunner(print_result=_result(113)), which=_which_found,
+            )
+        self.assertNotIn("SWAP-SENTINEL", repr(status))
+
+    def test_read_owned_returns_no_bytes_for_anything_it_did_not_authenticate(self) -> None:
+        target = sl.plist_path(self.os_home)
+        for label, expected in (
+            ("com.example.foreign", sl.PLIST_FOREIGN),
+            (sl.SUPERVISOR_LAUNCHD_LABEL, sl.PLIST_OWNED),
+        ):
+            with self.subTest(label=label):
+                _write_plist(target, label)
+                state, payload = fs.read_owned(self.os_home)
+                self.assertEqual(expected, state)
+                self.assertEqual(expected == sl.PLIST_OWNED, bool(payload))
 
 
 if __name__ == "__main__":

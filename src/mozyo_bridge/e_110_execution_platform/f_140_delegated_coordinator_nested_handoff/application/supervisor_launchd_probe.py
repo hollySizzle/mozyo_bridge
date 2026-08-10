@@ -4,16 +4,16 @@ Split out of :mod:`...application.supervisor_launchd` to keep every module insid
 line budget, and because the boundary is a real one: nothing here mutates a host. It runs
 ``launchctl print``, classifies the answer three ways, and parses the manager's wording.
 
-**Nothing in this module authorizes a mutation.** That is the whole point of the split (gateway
-disposition j#102458, reviews j#102496 r12f4 / j#102550 r13f6). ``print`` output once decided whether
-a failed ``bootout`` could still delete a plist; it no longer decides anything destructive. Its
-consumers are ``service_status`` — a projection — and ``restart``'s refusal token. If a future change
-makes a destructive verb import from here, that is the defect, not the design.
+**No classification produced here authorizes a mutation** (gateway disposition j#102458, reviews
+j#102496 r12f4 / j#102550 r13f6). ``print`` output once decided whether a failed ``bootout`` could
+still delete a plist; it decides nothing destructive now. Its consumers are ``service_status`` — a
+projection — and ``restart``'s refusal token.
 
-The process seam lives here too: the ``Runner`` protocol every verb injects and the default
-subprocess-backed implementation. Reading the manager is the only thing this adapter does that is
-inherently about *running* something, so the seam belongs with it, and the mutating modules take it
-from here rather than each defining their own.
+That sentence is deliberately narrower than the one it replaces (review j#102590 r14f4), which said
+a destructive verb importing from this module would be a defect — while the mutating modules were
+importing the process seam from it, and that seam is what runs ``bootout``. The claim worth making is
+the one the code keeps: what this module *concludes* never grants permission to change the host. The
+seam moved to the identity module, where being imported by everyone is unremarkable.
 
 Every name is re-exported from ``supervisor_launchd``, so that module remains the single import for
 the whole macOS adapter and no caller or test had to change.
@@ -21,13 +21,13 @@ the whole macOS adapter and no caller or test had to change.
 
 from __future__ import annotations
 
-import subprocess
-from typing import Callable, Optional, Sequence
+from typing import Optional
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd_agent import (  # noqa: E501
     LAUNCHCTL_NOT_FOUND_CODES,
     LAUNCHCTL_UNREADABLE_PHRASES,
     SUPERVISOR_AGENT,
+    Runner,
     SupervisorAgent,
     has_not_found_clause,
     launchctl,
@@ -36,16 +36,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     quoted_names,
     service_target,
 )
-
-#: The runner every verb injects: structured argv in, a completed process out. Injected rather than
-#: called directly so no test ever depends on a real ``launchctl`` being present.
-Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
-
-
-def default_runner(argv: Sequence[str]) -> "subprocess.CompletedProcess[str]":
-    """Run the argv for real. The single place this adapter spawns a process."""
-    return subprocess.run(list(argv), capture_output=True, text=True, check=False)
-
 
 #: ``launchctl print`` probe outcomes (see :func:`_probe`). Three values, not a boolean: "I could
 #: not read it" is a different answer from "it is not there", and only the latter is safe.
@@ -215,8 +205,6 @@ def is_loaded(
 
 
 __all__ = (
-    "Runner",
-    "default_runner",
     "PROBE_LOADED",
     "PROBE_CONFIRMED_ABSENT",
     "PROBE_UNREADABLE",

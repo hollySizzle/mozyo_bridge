@@ -52,6 +52,7 @@ installing / restarting / uninstalling the agent is orthogonal to what the agent
 
 from __future__ import annotations
 
+import plistlib
 import shutil
 import sys
 from pathlib import Path
@@ -85,11 +86,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     HOME_PIN_UNREADABLE,
     LEGACY_DRAIN_AGENT,
     LOG_RELATIVE,
-    PLIST_ABSENT,
-    PLIST_FOREIGN,
-    PLIST_OWNED,
     PLIST_RELATIVE,
-    PLIST_UNREADABLE,
     SUPERVISOR_AGENT,
     SUPERVISOR_AGENTS,
     SUPERVISOR_ARGV_TAIL,
@@ -99,6 +96,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SUPERVISOR_HOME_FLAG,
     SUPERVISOR_LAUNCHD_LABEL,
     SupervisorAgent,
+    Runner,
+    default_runner as _default_runner,
     extract_pinned_home as _extract_pinned_home,
     gui_domain as _gui_domain,
     launchctl as _launchctl,
@@ -107,7 +106,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     read_installed_plist as _read_installed_plist,
     render_plist,
     service_target as _service_target,
-    write_owned_plist,
     # The pure launchctl-message layer. The probe module is its only caller now; re-exported here
     # because this module stays the single import for the whole macOS adapter.
     names_exactly as _names_exactly,
@@ -116,12 +114,23 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 # The read-only probe layer: running `launchctl print` and classifying what came back. Nothing in it
 # authorizes a mutation — see its module docstring.
+# The owned-path filesystem seam: every read and write of a plist this adapter owns, with each
+# directory component pinned no-follow (review j#102590 r14f1 / r14f2 / r14f3).
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd_fs import (  # noqa: E501
+    PLIST_ABSENT,
+    PLIST_FOREIGN,
+    PLIST_OWNED,
+    PLIST_UNREADABLE,
+    OwnedPathError,
+    ensure_log_dir,
+    read_owned,
+    unlink_owned,
+    write_owned,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd_probe import (  # noqa: E501
     PROBE_CONFIRMED_ABSENT,
     PROBE_LOADED,
     PROBE_UNREADABLE,
-    Runner,
-    default_runner as _default_runner,
     is_loaded as _is_loaded,
     probe as _probe,
     says_not_found as _says_not_found,
@@ -378,15 +387,16 @@ def install(
             credential_readiness=readiness, label=agent.label, legacy_drain=migration["state"],
             legacy_drain_removed=migration["removed"], plist_state=own_state,
         )
-    target = plist_path(os_home, agent=agent)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    log_path(os_home, agent=agent).parent.mkdir(parents=True, exist_ok=True)
     try:
-        # O_NOFOLLOW, not `write_bytes`: a symlink planted at the owned path — or swapped in after
-        # the check above — must not redirect this write outside it (review j#102550 r13f2).
-        write_owned_plist(
-            target,
+        # Both go through the pinned no-follow chain: `mkdir(parents=True)` and a leaf-only
+        # `O_NOFOLLOW` both walk the ancestors normally, which is how a symlinked
+        # `Library/LaunchAgents` put the whole install in someone else's directory (j#102590 r14f1).
+        # The write itself stages and renames rather than truncating (r14f2).
+        ensure_log_dir(os_home, agent=agent)
+        write_owned(
             render_plist(command, interval_seconds=interval_seconds, os_home=os_home, agent=agent),
+            os_home,
+            agent=agent,
         )
     except OSError:
         return _refused(
@@ -397,7 +407,11 @@ def install(
     # A previously loaded agent must be booted out before bootstrap or launchd rejects the
     # duplicate label; a not-loaded bootout is fine to ignore (idempotent install).
     _launchctl(runner, ["bootout", _service_target(agent)])
-    result = _launchctl(runner, ["bootstrap", _gui_domain(), str(target)])
+    # launchctl takes a path here; it resolves it itself, and the file it will find is the one the
+    # pinned write just put there.
+    result = _launchctl(
+        runner, ["bootstrap", _gui_domain(), str(plist_path(os_home, agent=agent))]
+    )
     if result.returncode != 0:
         return {
             "action": "install",
@@ -456,13 +470,13 @@ def restart(
     """
     if not _running_on_darwin():
         return _refused("restart", REASON_UNSUPPORTED_PLATFORM, label=agent.label)
-    target = plist_path(os_home, agent=agent)
-    # Identity FIRST, through the same classifier install and uninstall use (review j#102550 r13f1).
+    # Identity FIRST, through the same read install and uninstall use (review j#102550 r13f1), and
+    # in ONE descriptor with the bytes it judged (j#102590 r14f3).
     # restart was the one verb left reading only the plist's contents — argv and home pin — without
     # ever asking whose plist it was. A stranger's file carrying our expected ProgramArguments got a
     # `performed: true` kickstart, and the kickstart went to OUR label: the evidence and the action
     # named different services.
-    own_state = classify_agent_plist(os_home, agent=agent)
+    own_state, payload = read_owned(os_home, agent=agent)
     if own_state == PLIST_ABSENT:
         return _refused("restart", REASON_NOT_INSTALLED, label=agent.label)
     if own_state == PLIST_UNREADABLE:
@@ -477,9 +491,9 @@ def restart(
         return _refused(
             "restart", REASON_PLIST_FOREIGN_LABEL, label=agent.label, plist_state=own_state
         )
-    installed = _read_installed_plist(target)
+    installed = _parse_owned(payload)
     if installed is None:
-        # Raced from readable to unreadable between the classification and here.
+        # The bytes classified as ours no longer parse as a mapping — treat as unidentifiable.
         return _refused(
             "restart", REASON_PLIST_UNREADABLE,
             home_pin=HOME_PIN_UNREADABLE, label=agent.label, plist_state=PLIST_UNREADABLE,
@@ -630,7 +644,7 @@ def uninstall(
             "uninstall", _PLIST_REFUSAL_REASON[at_unlink], label=agent.label, plist_state=at_unlink
         )
     try:
-        plist_path(os_home, agent=agent).unlink()
+        unlink_owned(os_home, agent=agent)
     except OSError:
         # A read-only volume, a permission change, a vanished parent. The retired-drain migration has
         # always reported this as a typed result; this verb let the OSError escape the envelope
@@ -690,8 +704,10 @@ def service_status(
     reporting ``plist_state`` in every case so an operator can tell "nothing installed" from
     "something installed that is not ours" (review j#102550 r13f4).
     """
-    target = plist_path(os_home, agent=agent)
-    plist_state = classify_agent_plist(os_home, agent=agent)
+    # ONE read: the classification and the bytes come from the same descriptor, so what was judged
+    # and what is published cannot be two different files (review j#102590 r14f3). Classifying by
+    # path and then re-opening it to read reported `owned` while a stranger's arguments went out.
+    plist_state, payload = read_owned(os_home, agent=agent)
     plist_exists = plist_state != PLIST_ABSENT
     probe = _probe(runner, agent=agent)
     loaded, pid = bool(probe["loaded"]), probe["pid"]
@@ -702,7 +718,7 @@ def service_status(
     # but it was applied to whatever sat at the path, so a foreign plist's `ProgramArguments` (a
     # `--token sensitive-value` in the reproduction) reached the JSON payload and the CLI text. What
     # someone else's file contains is not this adapter's to promise, so it is never read out.
-    installed = _read_installed_plist(target) if plist_state == PLIST_OWNED else None
+    installed = _parse_owned(payload) if plist_state == PLIST_OWNED else None
     # Three distinct states: absent (not_installed), present-but-unreadable (unreadable_plist), and
     # present + parsed (judged by its --home pin) — j#79136 R4-F3.
     scheduled_interval = installed.get("StartInterval") if installed else None
@@ -801,6 +817,15 @@ def service_status(
         # ``install`` / ``uninstall`` remove it, and status makes it visible in the meantime.
         "legacy_drain": classify_legacy_drain(os_home),
     }
+
+
+def _parse_owned(payload: bytes) -> Optional[dict]:
+    """Parse plist bytes ALREADY read from a verified descriptor. Never re-opens a path."""
+    try:
+        parsed = plistlib.loads(payload)
+    except (ValueError, plistlib.InvalidFileException):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _refused(action: str, reason: str, **extra: object) -> dict:

@@ -3,14 +3,19 @@
 Split out of :mod:`...application.supervisor_launchd` so neither side exceeds the module-health
 line budget, mirroring the split the Linux adapter already carries
 (:mod:`...application.supervisor_systemd_unit`, review j#102069 F7). The division is the same one:
-everything here is **pure** — owned identity, path resolution, argv resolution, plist rendering and
-read-back, the plist-ownership classification every destructive verb shares, the launchctl argv
-builders, and the fixed vocabularies those produce. Nothing in this module runs a process, touches a
-credential, or mutates the host; the lifecycle verbs that do live in the sibling modules.
+everything here is about **naming and text** — owned identity, path resolution, argv resolution,
+plist rendering and read-back, the launchctl argv builders, and the fixed vocabularies those produce.
 
-``launchctl`` appears here only as *argv construction*: :func:`launchctl` hands the command to an
-injected runner and starts nothing itself. Keeping it at this level is what lets the lifecycle verbs
-and the retired-drain migration compose the same command without importing each other.
+The boundary this module keeps, stated as narrowly as it can actually be enforced (review j#102590
+r14f4): **nothing here decides that a host may be mutated, and nothing here changes host state.**
+An earlier version claimed the module was "pure" and mutated nothing while holding the plist writer,
+which is exactly the kind of docstring-versus-code gap this lane has been correcting elsewhere. The
+writer now lives in :mod:`...application.supervisor_launchd_fs`, which is named for what it does.
+
+Two seams sit here because every layer above needs them and none of them should own them:
+:func:`launchctl` builds the manager's argv and hands it to an injected runner, and :data:`Runner` /
+:func:`default_runner` are that injection point. Running an argv someone else chose is not a decision
+about mutating the host; choosing it is, and that happens in the lifecycle verbs.
 
 Every name is re-exported from ``supervisor_launchd``, so that module remains the single import for
 the whole macOS adapter and no caller or test had to change.
@@ -22,7 +27,7 @@ import dataclasses
 import os
 import plistlib
 import shutil
-import stat
+import subprocess
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
@@ -238,92 +243,19 @@ def service_target(agent: SupervisorAgent = SUPERVISOR_AGENT) -> str:
     return f"{gui_domain()}/{agent.label}"
 
 
-def launchctl(runner, args: Sequence[str]):
+#: The runner every verb injects: structured argv in, a completed process out. Injected rather than
+#: called directly so no test ever depends on a real ``launchctl`` being present.
+Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
+
+
+def default_runner(argv: Sequence[str]) -> "subprocess.CompletedProcess[str]":
+    """Run the argv for real. The single place this adapter spawns a process."""
+    return subprocess.run(list(argv), capture_output=True, text=True, check=False)
+
+
+def launchctl(runner: Runner, args: Sequence[str]):
     """Build the launchctl argv and hand it to the injected ``runner``. Runs no process itself."""
     return runner([LAUNCHCTL, *args])
-
-
-#: Identity of whatever currently occupies an agent's plist path. Every destructive verb classifies
-#: before it writes or unlinks, and only :data:`PLIST_OWNED` may be mutated.
-PLIST_ABSENT = "absent"  # nothing there: a clean host, or one already torn down
-PLIST_OWNED = "owned"  # parses, and ``Label`` is exactly this agent's label
-PLIST_FOREIGN = "foreign"  # parses, but the ``Label`` belongs to someone else
-PLIST_UNREADABLE = "unreadable"  # present but unparseable / non-mapping / no ``Label`` string
-
-
-def classify_plist(target: Path, *, label: str) -> str:
-    """Classify who owns the file at ``target`` — the single identity test every verb shares.
-
-    Returns one of :data:`PLIST_ABSENT` / :data:`PLIST_OWNED` / :data:`PLIST_FOREIGN` /
-    :data:`PLIST_UNREADABLE`. Identity is read from the plist's own ``Label``, never inferred from
-    the filename: a path is a *location*, and a location says nothing about who wrote what is there.
-
-    This was previously implemented only for the retired drain agent, so the adapter could refuse to
-    delete a stranger's retired plist while its *current* agent's install overwrote and its uninstall
-    deleted whatever happened to occupy the path (review j#102496 r12f2). One classifier, applied by
-    every verb, is what makes "we mutate exactly our own artifacts" a property of the code rather
-    than a claim in a docstring.
-
-    ``UNREADABLE`` is deliberately distinct from ``FOREIGN``: "this is someone else's" and "I cannot
-    tell whose this is" are different facts, and neither one authorizes a mutation.
-
-    **The path is not followed anywhere else** (review j#102550 r13f2). r12f2 established that a path
-    does not prove ownership of the file at it; this closes the mirror image — that the path may not
-    even *be* the file. ``Path.exists()`` answers False for a broken symlink, so a link at the owned
-    path classified as ``ABSENT`` and the install then created a file wherever it pointed; a link to
-    an existing plist carrying our label classified as ``OWNED`` and the install overwrote a file
-    outside the owned path. Both reported ``performed: true``.
-
-    So identity is established with ``lstat`` on the path itself, and only a **regular file with a
-    single link** can be owned:
-
-    - a symlink is ``UNREADABLE`` — following it would mutate somewhere else, and where it points is
-      not this adapter's to decide;
-    - anything that is not a regular file (directory, socket, device) is ``UNREADABLE``;
-    - ``st_nlink > 1`` is ``UNREADABLE`` too. A hard link is the same defect wearing different
-      clothes: the inode is reachable under another name, so writing "our" path writes a file we
-      never accounted for. This is a deliberate refusal, stated rather than left implicit, and it
-      does over-refuse a host that hard-links its LaunchAgents on purpose — which is recoverable and
-      visible, unlike writing through one.
-
-    Classification alone would not be enough even so: the path could become a symlink between this
-    call and the write. The writer therefore refuses to follow links itself (``O_NOFOLLOW``), so the
-    guarantee does not rest on the check winning a race.
-    """
-    try:
-        info = os.lstat(target)
-    except FileNotFoundError:
-        return PLIST_ABSENT
-    except OSError:
-        # Present enough to raise something other than "not there" — we cannot establish what it is.
-        return PLIST_UNREADABLE
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-        return PLIST_UNREADABLE
-    parsed = read_installed_plist(target)
-    if parsed is None:
-        return PLIST_UNREADABLE
-    found = parsed.get("Label")
-    if not isinstance(found, str) or not found:
-        return PLIST_UNREADABLE
-    return PLIST_OWNED if found == label else PLIST_FOREIGN
-
-
-def write_owned_plist(target: Path, payload: bytes) -> None:
-    """Write ``payload`` to ``target`` **without following a symlink** (review j#102550 r13f2).
-
-    ``Path.write_bytes`` follows a link at the destination, so a link planted at the owned path — or
-    swapped in after the classification — redirects the write to a file this adapter does not own.
-    ``O_NOFOLLOW`` makes the kernel refuse that at open time, which is a property of the call rather
-    than of a check that has to win a race.
-
-    Raises ``OSError`` (``ELOOP``) when the path is a symlink, so callers surface it as a refusal
-    instead of writing through it.
-    """
-    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
-    try:
-        os.write(fd, payload)
-    finally:
-        os.close(fd)
 
 
 def extract_pinned_home(installed_argv: object) -> tuple[Optional[str], str]:
@@ -632,13 +564,9 @@ __all__ = (
     "render_plist",
     "extract_pinned_home",
     "read_installed_plist",
-    "PLIST_ABSENT",
-    "PLIST_OWNED",
-    "PLIST_FOREIGN",
-    "PLIST_UNREADABLE",
-    "classify_plist",
-    "write_owned_plist",
     "LAUNCHCTL",
+    "Runner",
+    "default_runner",
     "gui_domain",
     "service_target",
     "launchctl",

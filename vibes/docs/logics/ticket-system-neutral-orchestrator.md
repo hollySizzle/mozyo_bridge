@@ -583,8 +583,27 @@ install が link を辿って **owned path の外に file を作成**した。�
 label を持てば `owned` と分類され、**外部 plist を上書き**した。したがって identity は `lstat` で path 自身に
 対して確立し、**単一 link の regular file だけ**が `owned` になりうる: symlink・非 regular file・
 `st_nlink > 1`（hard link）はすべて `unreadable` とする。hard link を含めるのは同じ class（自 path への write が
-外部の名前にも及ぶ）だからであり、**意図的な過剰拒否として明示**する。さらに **write 側も `O_NOFOLLOW`** で
-link を辿らない。分類だけでは「分類後に link へ差し替える」窓が残るため、**保証を検査の勝敗に依存させない**。
+外部の名前にも及ぶ）だからであり、**意図的な過剰拒否として明示**する。
+
+**検査対象は path の全 component である**（review j#102590 r14f1）。`lstat` も `O_NOFOLLOW` も
+**最終 component にしか効かない**。したがって `Library/LaunchAgents` を symlink に差し替えると、leaf の検査は
+すべて成立したまま write / read / unlink が他人の directory で行われた。**leaf の判定を強化しても解決しない**——
+leaf へは祖先を経由して到達するからである。よって trusted root（`os_home`）から順に **各 component を
+`O_NOFOLLOW | O_DIRECTORY` で開いて pin し**、以降の `mkdir` / `open` / `stat` / `unlink` / `rename` を
+**その directory fd 相対**で行う。fd は開いた directory を指すので、後から名前を差し替えても向き先は変わらない。
+`mkdir(parents=True)` は文字列を辿るため使わない。root 自体は信頼の起点として受け入れる（それ以上遡る足場がない）。
+
+**write は truncate せず、staging + rename で行う**（review j#102590 r14f2）。`O_TRUNC` は **fd を検査する前に
+inode を破壊する**ため、分類直後に owned leaf を外部 file の hard link へ差し替えると、hard link を拒否したはずの
+fence を通り抜けてその file が上書きされた。また `os.write` の返却 byte 数を見ない実装は partial write で
+truncate 済みの plist を残したまま成功を返した。同一 directory 内に `O_EXCL` で staging file を作り、全 byte を
+書き切ってから `os.replace` する。これにより (a) 完了まで既存 plist は無傷、(b) 宛先が hard link でも rename は
+**名前を差し替えるだけ**なので相手の inode は元の内容を保つ、(c) 途中失敗は rename 前に検出される。
+
+**所有判定と公開する bytes は同一 fd から取る**（review j#102590 r14f3）。path で分類してから path を開き直すと
+**判定した inode と公開する inode が別になりうる**。実際、分類後に置換すると `owned` と報告しつつ他人の argv を
+projection へ出せた。`read_owned` が (state, bytes) を返し、caller は同じ読みを使う。所有と確認できない場合は
+bytes を返さない。
 
 **status は自分が書いた plist しか読み出さない**（review j#102550 r13f4）。secret-free の約束は「この plist は
 自分が render した」——environment block も credential も入らない——という事実に立脚しており、**path に居る
