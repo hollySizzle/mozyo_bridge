@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.recovery_owner_approval_live import (  # noqa: E501
     verify_live_recovery_owner_approval,
+    verify_live_generation_mismatch_disposition_approval,
 )
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
+    GATE_GENERATION_MISMATCH_DISPOSITION_OWNER_APPROVAL,
     GATE_GATEWAY_RECOVERY_OWNER_APPROVAL,
     GATE_STALE_WORKER_RECOVERY_OWNER_APPROVAL,
+    GENERATION_MISMATCH_DISPOSITION_APPROVAL_RULING,
     ISSUER_COORDINATOR,
     ISSUER_LANE_WORKER,
     RECOVERY_OWNER_APPROVAL_RULING,
@@ -22,11 +26,18 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_owner_approval import (  # noqa: E501
     GATEWAY_RECOVERY_APPROVAL_EFFECT,
     GATEWAY_RECOVERY_APPROVAL_GATE,
+    GENERATION_MISMATCH_DISPOSITION_APPROVAL_EFFECT,
+    GENERATION_MISMATCH_DISPOSITION_APPROVAL_GATE,
     STALE_WORKER_RECOVERY_APPROVAL_EFFECT,
     STALE_WORKER_RECOVERY_APPROVAL_GATE,
     RecoveryOwnerApprovalError,
     render_recovery_owner_approval_marker,
     verify_recovery_owner_approval,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.generation_mismatch_disposition import (  # noqa: E501
+    PENDING_EFFECT_DISCARDED_ON_REPLACE,
+    DispositionFacts,
+    disposition_approval_operation,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
     RedmineJournalEntry,
@@ -88,6 +99,20 @@ class RecoveryApprovalContractTests(unittest.TestCase):
         ):
             self.assertEqual(contract_writer_role(gate), ISSUER_COORDINATOR)
             self.assertEqual(contract_ruling_pointer(gate), RECOVERY_OWNER_APPROVAL_RULING)
+
+    def test_generation_mismatch_gate_has_its_own_coordinator_writer_ruling(self):
+        self.assertEqual(
+            GATE_GENERATION_MISMATCH_DISPOSITION_OWNER_APPROVAL,
+            GENERATION_MISMATCH_DISPOSITION_APPROVAL_GATE,
+        )
+        self.assertEqual(
+            contract_writer_role(GATE_GENERATION_MISMATCH_DISPOSITION_OWNER_APPROVAL),
+            ISSUER_COORDINATOR,
+        )
+        self.assertEqual(
+            contract_ruling_pointer(GATE_GENERATION_MISMATCH_DISPOSITION_OWNER_APPROVAL),
+            GENERATION_MISMATCH_DISPOSITION_APPROVAL_RULING,
+        )
 
     def test_one_canonical_marker_verifies(self):
         marker = render_recovery_owner_approval_marker(**_approval())
@@ -206,6 +231,105 @@ class RecoveryApprovalContractTests(unittest.TestCase):
             **_approval(),
         )
         self.assertFalse(verified)
+
+
+class GenerationMismatchDispositionApprovalTests(unittest.TestCase):
+    def _facts(self, **overrides):
+        values = dict(
+            issue="15193",
+            lane="issue_15193_generation_mismatch_disposition",
+            role="claude",
+            workspace_id="wProj",
+            assigned_name="managed-worker",
+            locator="wProj:p18",
+            agent_revision=4,
+            lane_generation=1,
+            lifecycle_revision=7,
+            attested_at="2026-08-10T07:00:00+00:00",
+            action_generation=(
+                "quarantine:issue_15193_generation_mismatch_disposition:claude:wProj:p18"
+            ),
+            generation_axes=("pair",),
+            pending_identity="pending:provider:" + "a" * 64,
+            pending_effect=PENDING_EFFECT_DISCARDED_ON_REPLACE,
+        )
+        values.update(overrides)
+        return DispositionFacts(**values)
+
+    def _verification(
+        self,
+        notes: str,
+        *,
+        issuer_role=ISSUER_COORDINATOR,
+        production_resolver: bool = False,
+        **request_overrides,
+    ) -> bool:
+        facts = self._facts()
+        entry = RedmineJournalEntry(facts.issue, "103088", notes)
+        request = SimpleNamespace(
+            issue=facts.issue,
+            lane=facts.lane,
+            journal="103088",
+            role=facts.role,
+            assigned_name=facts.assigned_name,
+            locator=facts.locator,
+            approved_revision=facts.agent_revision,
+            approved_lane_generation=facts.lane_generation,
+            approved_lifecycle_revision=facts.lifecycle_revision,
+            approval_observed_at=facts.attested_at,
+            action_generation=facts.action_generation,
+            approved_generation_axes=facts.generation_axes,
+            approved_pending_identity=facts.pending_identity,
+            approved_pending_effect=facts.pending_effect,
+        )
+        for name, value in request_overrides.items():
+            setattr(request, name, value)
+        ops_values = dict(
+            repo_root=Path(__file__).resolve().parents[4],
+            journal_reader=lambda _issue: [entry],
+            journal_reader_fresh=True,
+        )
+        if not production_resolver:
+            ops_values["issuer_resolver"] = lambda _entry: _issuer(issuer_role)
+        ops = SimpleNamespace(**ops_values)
+        return verify_live_generation_mismatch_disposition_approval(
+            ops, request, SimpleNamespace(workspace_id=facts.workspace_id)
+        )
+
+    def test_exact_structured_disposition_marker_verifies(self):
+        facts = self._facts()
+        marker = render_recovery_owner_approval_marker(
+            gate=GENERATION_MISMATCH_DISPOSITION_APPROVAL_GATE,
+            effect=GENERATION_MISMATCH_DISPOSITION_APPROVAL_EFFECT,
+            issue=facts.issue,
+            lane=facts.lane,
+            operation=disposition_approval_operation(facts),
+        )
+        self.assertTrue(self._verification(marker))
+
+    def test_exact_marker_verifies_through_the_production_issuer_resolver(self):
+        facts = self._facts()
+        marker = render_recovery_owner_approval_marker(
+            gate=GENERATION_MISMATCH_DISPOSITION_APPROVAL_GATE,
+            effect=GENERATION_MISMATCH_DISPOSITION_APPROVAL_EFFECT,
+            issue=facts.issue,
+            lane=facts.lane,
+            operation=disposition_approval_operation(facts),
+        )
+        self.assertTrue(self._verification(marker, production_resolver=True))
+
+    def test_pointer_or_wrong_digest_never_authorizes(self):
+        self.assertFalse(self._verification("approved in prose"))
+        facts = self._facts()
+        marker = render_recovery_owner_approval_marker(
+            gate=GENERATION_MISMATCH_DISPOSITION_APPROVAL_GATE,
+            effect=GENERATION_MISMATCH_DISPOSITION_APPROVAL_EFFECT,
+            issue=facts.issue,
+            lane=facts.lane,
+            operation=disposition_approval_operation(facts),
+        )
+        self.assertFalse(self._verification(marker, approved_revision=5))
+        self.assertFalse(self._verification(marker, issuer_role=ISSUER_LANE_WORKER))
 
 
 if __name__ == "__main__":  # pragma: no cover

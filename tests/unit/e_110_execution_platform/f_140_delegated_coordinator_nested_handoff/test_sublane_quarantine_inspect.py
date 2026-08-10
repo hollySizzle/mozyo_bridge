@@ -53,6 +53,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     AGENT_WORKING,
     PendingComposerSignal,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.generation_mismatch_disposition import (  # noqa: E501
+    DISPOSITION_COMPOSER_GENERATION_UNAVAILABLE,
+    DISPOSITION_LIFECYCLE_ABSENT,
+    DISPOSITION_LIFECYCLE_PINS_INVALID,
+    DISPOSITION_LIFECYCLE_UNREADABLE,
+    DISPOSITION_READY,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
     HerdrSessionStartError,
 )
@@ -87,7 +94,7 @@ def _signal(**kw) -> PendingComposerSignal:
     base = dict(
         inventory_readable=True,
         has_pending=True,
-        agent_state="idle",
+        agent_state="awaiting_input",
         identity_attested=True,
         generation_matches=True,
         correlated_marker_ids=(),
@@ -116,6 +123,7 @@ def _inspection(**kw) -> QuarantineInspection:
         row_revision=REVISION,
         attested_at=ATTESTED_AT,
         receiver_present=True,
+        composer_generation="opaque-provider-draft-generation-1",
         detail="classified_without_persisting_composer_body",
     )
     base.update(kw)
@@ -123,7 +131,15 @@ def _inspection(**kw) -> QuarantineInspection:
 
 
 class _Case(unittest.TestCase):
-    def _run(self, *, rows=None, inspection=None, workspace=WS, rows_raise=False):
+    def _run(
+        self,
+        *,
+        rows=None,
+        inspection=None,
+        workspace=WS,
+        rows_raise=False,
+        lifecycle=(1, 7),
+    ):
         if rows is None:
             rows = [_row()]
 
@@ -138,6 +154,11 @@ class _Case(unittest.TestCase):
             repo_root=Path("/tmp/repo"),
             rows_reader=_reader,
             ops_factory=lambda _rows: ops,
+            lifecycle_reader=(
+                lifecycle
+                if callable(lifecycle)
+                else lambda _workspace, _lane: lifecycle
+            ),
         )
         original = inspect_module.repo_scope_workspace_id
         inspect_module.repo_scope_workspace_id = lambda _root: workspace
@@ -343,6 +364,58 @@ class GenerationDriftTest(_Case):
         # The previously rendered approval carried the OLD revision; the execute-time fence
         # compares them, so the drift is detectable rather than silently applied.
         self.assertNotEqual(fresh.facts.agent_revision, REVISION)
+
+
+class DispositionLifecyclePinsTest(_Case):
+    def _mismatch(
+        self, composer_generation="opaque-provider-draft-generation-1", **kw
+    ):
+        return _inspection(
+            signal=_signal(
+                generation_matches=False,
+                generation_axes=("pair",),
+                **kw,
+            ),
+            composer_generation=composer_generation,
+        )
+
+    def test_positive_pins_reach_the_ready_command(self):
+        out = self._run(inspection=self._mismatch(), lifecycle=(3, 11))
+        self.assertEqual(out.disposition_reason, DISPOSITION_READY)
+        argv = out.as_payload()["disposition"]["disposition_command"]
+        self.assertEqual(argv[argv.index("--approved-lane-generation") + 1], "3")
+        self.assertEqual(argv[argv.index("--approved-lifecycle-revision") + 1], "11")
+
+    def test_missing_provider_composer_generation_mints_no_template(self):
+        out = self._run(
+            inspection=self._mismatch(composer_generation=""), lifecycle=(3, 11)
+        )
+        self.assertEqual(
+            out.disposition_reason, DISPOSITION_COMPOSER_GENERATION_UNAVAILABLE
+        )
+        self.assertEqual(out.disposition_template, "")
+
+    def test_absent_lifecycle_mints_no_template(self):
+        out = self._run(inspection=self._mismatch(), lifecycle=None)
+        self.assertEqual(out.disposition_reason, DISPOSITION_LIFECYCLE_ABSENT)
+        self.assertEqual(out.disposition_template, "")
+
+    def test_unreadable_lifecycle_mints_no_template(self):
+        def unreadable(_workspace, _lane):
+            raise OSError("unreadable")
+
+        out = self._run(inspection=self._mismatch(), lifecycle=unreadable)
+        self.assertEqual(out.disposition_reason, DISPOSITION_LIFECYCLE_UNREADABLE)
+        self.assertEqual(out.disposition_template, "")
+
+    def test_invalid_or_partial_lifecycle_pins_mint_no_template(self):
+        for lifecycle in ((0, 7), (1, 0), ("1", 7), (True, 7), (1,)):
+            with self.subTest(lifecycle=lifecycle):
+                out = self._run(inspection=self._mismatch(), lifecycle=lifecycle)
+                self.assertEqual(
+                    out.disposition_reason, DISPOSITION_LIFECYCLE_PINS_INVALID
+                )
+                self.assertEqual(out.disposition_template, "")
 
 
 class TextRenderingTest(_Case):
