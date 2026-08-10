@@ -51,6 +51,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     encode_assigned_name,
     encode_field,
     occupant_of_locator,
+    process_generation_of_locator,
     rebind_by_name,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (  # noqa: E501
@@ -308,6 +309,62 @@ class OccupantOfLocatorTest(unittest.TestCase):
     def test_malformed_rows_are_skipped_not_raised(self) -> None:
         agents = ["not-a-row", 42, None, {"name": self.name, "pane_id": "w1:p1"}]
         self.assertEqual(occupant_of_locator("w1:p1", agents), self.name)
+
+
+class ProcessGenerationOfLocatorTest(unittest.TestCase):
+    """The resend identity uses Herdr row revision as process-generation evidence.
+
+    This matches the existing gateway/worker recovery contract: revision is pinned
+    independently of runtime state, and a same-name / same-locator revision bump is a
+    recycled process generation rather than ordinary ``working`` / ``done`` churn.
+    """
+
+    def setUp(self) -> None:
+        self.name = encode_assigned_name("ws", "claude", "lane15202")
+
+    def _row(self, *, revision=41, status="idle"):
+        return {
+            "name": self.name,
+            "pane_id": "w1:p1",
+            "revision": revision,
+            "status": status,
+        }
+
+    def test_runtime_state_churn_preserves_the_generation_token(self) -> None:
+        before = process_generation_of_locator(
+            "w1:p1", [self._row(status="working")]
+        )
+        after = process_generation_of_locator(
+            "w1:p1", [self._row(status="done")]
+        )
+        self.assertIsNotNone(before)
+        self.assertEqual(before, after)
+
+    def test_same_name_and_locator_revision_bump_is_a_new_generation(self) -> None:
+        before = process_generation_of_locator("w1:p1", [self._row(revision=41)])
+        recycled = process_generation_of_locator("w1:p1", [self._row(revision=42)])
+        self.assertIsNotNone(before)
+        self.assertIsNotNone(recycled)
+        self.assertNotEqual(before, recycled)
+
+    def test_missing_or_malformed_revision_fails_closed(self) -> None:
+        malformed = (None, "", "41", True, False, -1, 41.0, object())
+        self.assertIsNone(
+            process_generation_of_locator(
+                "w1:p1", [{"name": self.name, "pane_id": "w1:p1"}]
+            )
+        )
+        for revision in malformed:
+            with self.subTest(revision=revision):
+                self.assertIsNone(
+                    process_generation_of_locator(
+                        "w1:p1", [self._row(revision=revision)]
+                    )
+                )
+
+    def test_ambiguous_locator_fails_closed_even_when_revision_matches(self) -> None:
+        rows = [self._row(), {**self._row(), "name": "other"}]
+        self.assertIsNone(process_generation_of_locator("w1:p1", rows))
 
 
 class RebindTest(unittest.TestCase):

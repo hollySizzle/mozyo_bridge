@@ -386,6 +386,7 @@ AGENT_KEY_NAME: str = "name"
 AGENT_KEY_LOCATOR: str = "pane_id"  # real herdr `agent list` row key (PoC #13175 E10 実測)
 AGENT_KEY_LOCATOR_ALIAS: str = "pane"
 AGENT_KEY_LOCATOR_ALIAS_2: str = "location"
+AGENT_KEY_REVISION: str = "revision"
 
 
 class HerdrIdentityError(ValueError):
@@ -816,6 +817,58 @@ def occupant_of_locator(
     return names[0]
 
 
+def process_generation_of_locator(
+    locator: object, agents: Sequence[Mapping[str, object]]
+) -> Optional[str]:
+    """An opaque token for the exact Herdr process at ``locator``, or ``None``.
+
+    The WAIT_ERROR Enter-only resend must distinguish more than the durable assigned
+    name.  Existing recovery contracts already treat the live ``agent list`` row
+    ``revision`` as a required process-generation component: notably
+    ``gateway_turn_recovery.gateway_refresh_action_id`` and
+    ``worker_turn_recovery.worker_refresh_action_id`` pin it so a same-name,
+    same-locator row whose revision advances is a different process generation.  The
+    runtime ``status`` is deliberately *not* part of those generation pins; ordinary
+    ``working`` / ``done`` state churn must not look like a process replacement.
+
+    This fold applies the same contract to the resend gate.  A successful token is an
+    injective length-prefixed encoding of ``(assigned_name, locator, row_revision)``.
+    It is opaque and local to equality comparison; it is never persisted or rendered.
+    Missing or malformed revision evidence fails closed.  Herdr inventory exposes the
+    revision as a non-negative JSON integer, so strings, booleans, floats, and negative
+    integers are rejected rather than normalised into fabricated evidence.
+
+    Exactly one row must claim the locator and it must carry a non-blank name, matching
+    :func:`occupant_of_locator`'s ambiguity rules.  Consequently, a stable name +
+    locator + revision compares equal across runtime-state changes, while a revision
+    bump compares different even when the name and locator were recycled unchanged.
+    """
+    wanted = _norm(locator)
+    if not wanted:
+        return None
+    matches = [
+        agent
+        for agent in agents
+        if isinstance(agent, Mapping) and _agent_locator(agent) == wanted
+    ]
+    if len(matches) != 1:
+        return None
+    row = matches[0]
+    assigned_name = _norm(row.get(AGENT_KEY_NAME))
+    revision = row.get(AGENT_KEY_REVISION)
+    if (
+        not assigned_name
+        or not isinstance(revision, int)
+        or isinstance(revision, bool)
+        or revision < 0
+    ):
+        return None
+    return (
+        f"{len(assigned_name)}:{assigned_name}:"
+        f"{len(wanted)}:{wanted}:r{revision}"
+    )
+
+
 def _agent_locator(agent: Mapping[str, object]) -> str:
     """Read the transient pane locator from an ``agent list`` row (fail-soft)."""
     locator = _norm(agent.get(AGENT_KEY_LOCATOR))
@@ -831,6 +884,7 @@ __all__ = (
     "AGENT_KEY_LOCATOR_ALIAS",
     "AGENT_KEY_LOCATOR_ALIAS_2",
     "AGENT_KEY_NAME",
+    "AGENT_KEY_REVISION",
     "DECODE_FAILURE_REASONS",
     "DEFAULT_LANE",
     "LANE_WORKSPACE_TOKEN_PREFIX",
@@ -862,5 +916,6 @@ __all__ = (
     "encode_assigned_name",
     "encode_field",
     "occupant_of_locator",
+    "process_generation_of_locator",
     "rebind_by_name",
 )

@@ -5,7 +5,8 @@ herdr / tmux / Redmine — pinning the slice truth table:
 
 - the rail's six closed outcomes project onto the handoff ``(status, reason)`` wire, and only a
   confirmed ``sent`` turn start persists the opt-in durable record and returns ``0``; every other
-  outcome emits + ledgers then ``die``\\ s with **no C-u rollback and no re-send**;
+  outcome emits + ledgers then ``die``\\ s with no C-u rollback, no body re-injection, and the
+  actual bounded Enter-only resend count in its narrative;
 - a missing rail (defensive) ``die``\\ s before driving anything;
 - the side-effect ordering is emit -> ledger -> (persist | die);
 - the resolved anchor (Redmine / Asana) + the ticketless / envelope context thread verbatim onto
@@ -200,11 +201,11 @@ def _request(
 
 
 class HerdrStandardRailTruthTableTest(unittest.TestCase):
-    def _run(
-        self, outcome: str, request: HerdrStandardRailRequest
+    def _run_result(
+        self, result: TurnStartResult, request: HerdrStandardRailRequest
     ) -> tuple[_FakeOps, _FakeRail, Optional[int], Optional[_FakeDie]]:
         ops = _FakeOps()
-        rail = _FakeRail(TurnStartResult(outcome=outcome))
+        rail = _FakeRail(result)
         code: Optional[int] = None
         died: Optional[_FakeDie] = None
         try:
@@ -212,6 +213,11 @@ class HerdrStandardRailTruthTableTest(unittest.TestCase):
         except _FakeDie as exc:
             died = exc
         return ops, rail, code, died
+
+    def _run(
+        self, outcome: str, request: HerdrStandardRailRequest
+    ) -> tuple[_FakeOps, _FakeRail, Optional[int], Optional[_FakeDie]]:
+        return self._run_result(TurnStartResult(outcome=outcome), request)
 
     # --- sent -------------------------------------------------------------------------------- #
 
@@ -264,13 +270,33 @@ class HerdrStandardRailTruthTableTest(unittest.TestCase):
         self.assertEqual(ops.persisted, [])
         self.assertEqual(ops.emitted[0].outcome.status, "blocked")
         self.assertEqual(ops.emitted[0].outcome.reason, "turn_start_unconfirmed")
-        # The rollback boundary is the whole point: the marker+body was typed once and only
-        # Enter was sent — no C-u rollback and no blind re-send.
-        self.assertIn("no C-u rollback, no", died.message)
+        # Body re-injection and Enter-only resend are different facts. This zero-resend
+        # outcome reports both without the old ambiguous "no re-send" wording.
+        self.assertIn("no C-u rollback", died.message)
+        self.assertIn("Enter-only resends=0", died.message)
+        self.assertIn("never re-injected", died.message)
         self.assertIn("typed at most once", died.message)
+        self.assertNotIn("no re-send", died.message)
         self.assertIn("rail outcome delivered_not_started", died.message)
         self.assertIn("target=%pT", died.message)
         self.assertIn("marker=[[mk-1]]", died.message)
+
+    def test_failure_after_enter_only_resend_reports_one_not_no_resend(self) -> None:
+        ops, _rail, code, died = self._run_result(
+            TurnStartResult(
+                outcome=OUTCOME_DELIVERED_NOT_STARTED,
+                enter_resends=1,
+            ),
+            _request(),
+        )
+        self.assertIsNone(code)
+        self.assertIsNotNone(died)
+        assert died is not None
+        self.assertEqual(ops.events, ["emit", "ledger", "die"])
+        self.assertIn("marker+body was typed at most once", died.message)
+        self.assertIn("never re-injected", died.message)
+        self.assertIn("Enter-only resends=1", died.message)
+        self.assertNotIn("no re-send", died.message)
 
     def test_blocked_outcome_projects_receiver_blocked_and_dies(self) -> None:
         ops, _rail, code, died = self._run(OUTCOME_BLOCKED, _request())

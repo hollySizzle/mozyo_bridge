@@ -80,7 +80,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     WaitResult,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
-    occupant_of_locator,
+    process_generation_of_locator,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_discovery import (  # noqa: E501
     HerdrCliAgentLister,
@@ -277,20 +277,23 @@ def make_locator_identity_probe(
     *,
     runner: Optional[Runner] = None,
 ) -> Callable[[str], Optional[str]]:
-    """A live "who holds this locator now" probe for the rail (Redmine #15202).
+    """A live "which process holds this locator now" probe (Redmine #15202).
 
     The rail's WAIT_ERROR Enter-resend may only fire once it has re-established that
     the target locator still addresses the agent the send was authorised against
     (audit j#102755 finding 3). This binds the pure
-    :func:`~...domain.herdr_identity.occupant_of_locator` fold over a **fresh**
-    ``agent list`` snapshot — a new listing on every call, deliberately un-memoised,
-    because a cached snapshot would make the before/after comparison vacuous and turn
-    the guard into decoration.
+    :func:`~...domain.herdr_identity.process_generation_of_locator` fold over a
+    **fresh** ``agent list`` snapshot — a new listing on every call, deliberately
+    un-memoised, because a cached snapshot would make the before/after comparison
+    vacuous and turn the guard into decoration.  The token pins assigned name,
+    locator, and Herdr row revision; a same-name / same-locator revision bump is a
+    different process generation, while runtime status churn is not.
 
-    Fail-closed and total: an unreadable listing, an unknown locator, a blank name, or
-    an ambiguous locator (two rows claiming it) all answer ``None``, and the rail reads
-    ``None`` as "identity unconfirmed" and withholds the extra Enter. Never raises, so
-    a listing fault degrades the resend rather than the send.
+    Fail-closed and total: an unreadable listing, an unknown locator, a blank name,
+    missing / malformed row revision, or an ambiguous locator (two rows claiming it)
+    all answer ``None``, and the rail reads ``None`` as "identity unconfirmed" and
+    withholds the extra Enter. Never raises, so a listing fault degrades the resend
+    rather than the send.
     """
     lister = HerdrCliAgentLister(binary, runner=runner)
 
@@ -299,7 +302,7 @@ def make_locator_identity_probe(
             rows = lister.list_agent_rows()
         except (Exception, SystemExit):
             return None
-        return occupant_of_locator(target, rows)
+        return process_generation_of_locator(target, rows)
 
     return _probe
 

@@ -82,6 +82,8 @@ TARGET = "w1:p1"
 BODY = "Refs: Redmine #13248 please start the turn"
 #: The durable assigned name a live identity probe reports for :data:`TARGET`.
 IDENTITY = "mzb1_ws_claude_lane"
+GENERATION_41 = f"{len(IDENTITY)}:{IDENTITY}:{len(TARGET)}:{TARGET}:r41"
+GENERATION_42 = f"{len(IDENTITY)}:{IDENTITY}:{len(TARGET)}:{TARGET}:r42"
 
 #: The five machine keys `to_telemetry_dict` carried before Redmine #15202 added two.
 TELEMETRY_KEYS_BEFORE_15202 = (
@@ -904,6 +906,45 @@ class WaitErrorEnterResendTests(unittest.TestCase):
         self.assertEqual(result.enter_resends, 1)
 
     # --- target identity revalidation (audit j#102755 finding 3) ------------------
+    def test_same_name_locator_and_revision_admits_one_bounded_enter(self) -> None:
+        # The production probe's opaque token joins assigned name + locator + row
+        # revision. A stable token across ordinary runtime-state churn proves the same
+        # process generation and permits the one bounded Enter-only resend.
+        probe = FakeIdentityProbe(GENERATION_41, GENERATION_41)
+        reader = FakeReader(
+            AgentStateResult.observed(RUNTIME_AWAITING_INPUT),
+            AgentStateResult.observed(RUNTIME_TURN_ENDED),
+        )
+        transport = FakeTransport(read_pane=[PaneReadResult.success(BODY)])
+        wait = FakeWait(WaitResult.error(), WaitResult.changed())
+        result = _rail(
+            reader, transport, wait, max_enter_resends=1, identity_probe=probe
+        ).drive_turn_start(TARGET, BODY, screen_guard=_clear_screen)
+        self.assertEqual(result.outcome, OUTCOME_STARTED)
+        self.assertEqual(result.enter_resends, 1)
+        self.assertEqual(len(transport.send_text_calls), 1)
+        self.assertEqual(len(transport.send_keys_calls), 2)
+        self.assertEqual(probe.calls, [TARGET, TARGET])
+
+    def test_same_name_and_locator_revision_drift_withholds_the_enter(self) -> None:
+        # Herdr row revision is existing process-generation evidence, not runtime
+        # status. Recycling a process under the same assigned name and locator changes
+        # only this token axis; the old generation's body must never authorise an Enter
+        # into the new generation.
+        probe = FakeIdentityProbe(GENERATION_41, GENERATION_42)
+        reader = FakeReader(AgentStateResult.observed(RUNTIME_AWAITING_INPUT))
+        transport = FakeTransport(read_pane=[PaneReadResult.success(BODY)])
+        wait = FakeWait(WaitResult.error())
+        result = _rail(
+            reader, transport, wait, max_enter_resends=1, identity_probe=probe
+        ).drive_turn_start(TARGET, BODY, screen_guard=_clear_screen)
+        self.assertEqual(result.outcome, OUTCOME_DELIVERED_NOT_STARTED)
+        self.assertEqual(result.enter_resends, 0)
+        self.assertEqual(result.resend_skipped_reason, RESEND_SKIP_IDENTITY_DRIFT)
+        self.assertEqual(len(transport.send_text_calls), 1)
+        self.assertEqual(len(transport.send_keys_calls), 1)
+        self.assertEqual(transport.read_pane_calls, [])
+
     def test_no_error_resend_when_the_target_identity_drifted(self) -> None:
         # 除外条件「対象の識別情報変更」. A locator is transient: the pane can be killed
         # and its id reused, or the lane relaunched, inside the 8–15s wait window. The
