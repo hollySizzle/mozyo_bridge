@@ -12,8 +12,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
+    GATE_GENERATION_MISMATCH_DISPOSITION_OWNER_APPROVAL,
     GATE_GATEWAY_RECOVERY_OWNER_APPROVAL,
     GATE_STALE_WORKER_RECOVERY_OWNER_APPROVAL,
+    GENERATION_MISMATCH_DISPOSITION_APPROVAL_RULING,
     ISSUER_COORDINATOR,
     ISSUER_LANE_WORKER,
     RECOVERY_OWNER_APPROVAL_RULING,
@@ -97,6 +99,20 @@ class RecoveryApprovalContractTests(unittest.TestCase):
         ):
             self.assertEqual(contract_writer_role(gate), ISSUER_COORDINATOR)
             self.assertEqual(contract_ruling_pointer(gate), RECOVERY_OWNER_APPROVAL_RULING)
+
+    def test_generation_mismatch_gate_has_its_own_coordinator_writer_ruling(self):
+        self.assertEqual(
+            GATE_GENERATION_MISMATCH_DISPOSITION_OWNER_APPROVAL,
+            GENERATION_MISMATCH_DISPOSITION_APPROVAL_GATE,
+        )
+        self.assertEqual(
+            contract_writer_role(GATE_GENERATION_MISMATCH_DISPOSITION_OWNER_APPROVAL),
+            ISSUER_COORDINATOR,
+        )
+        self.assertEqual(
+            contract_ruling_pointer(GATE_GENERATION_MISMATCH_DISPOSITION_OWNER_APPROVAL),
+            GENERATION_MISMATCH_DISPOSITION_APPROVAL_RULING,
+        )
 
     def test_one_canonical_marker_verifies(self):
         marker = render_recovery_owner_approval_marker(**_approval())
@@ -241,7 +257,12 @@ class GenerationMismatchDispositionApprovalTests(unittest.TestCase):
         return DispositionFacts(**values)
 
     def _verification(
-        self, notes: str, *, issuer_role=ISSUER_COORDINATOR, **request_overrides
+        self,
+        notes: str,
+        *,
+        issuer_role=ISSUER_COORDINATOR,
+        production_resolver: bool = False,
+        **request_overrides,
     ) -> bool:
         facts = self._facts()
         entry = RedmineJournalEntry(facts.issue, "103088", notes)
@@ -263,12 +284,14 @@ class GenerationMismatchDispositionApprovalTests(unittest.TestCase):
         )
         for name, value in request_overrides.items():
             setattr(request, name, value)
-        ops = SimpleNamespace(
+        ops_values = dict(
             repo_root=Path(__file__).resolve().parents[4],
             journal_reader=lambda _issue: [entry],
             journal_reader_fresh=True,
-            issuer_resolver=lambda _entry: _issuer(issuer_role),
         )
+        if not production_resolver:
+            ops_values["issuer_resolver"] = lambda _entry: _issuer(issuer_role)
+        ops = SimpleNamespace(**ops_values)
         return verify_live_generation_mismatch_disposition_approval(
             ops, request, SimpleNamespace(workspace_id=facts.workspace_id)
         )
@@ -283,6 +306,17 @@ class GenerationMismatchDispositionApprovalTests(unittest.TestCase):
             operation=disposition_approval_operation(facts),
         )
         self.assertTrue(self._verification(marker))
+
+    def test_exact_marker_verifies_through_the_production_issuer_resolver(self):
+        facts = self._facts()
+        marker = render_recovery_owner_approval_marker(
+            gate=GENERATION_MISMATCH_DISPOSITION_APPROVAL_GATE,
+            effect=GENERATION_MISMATCH_DISPOSITION_APPROVAL_EFFECT,
+            issue=facts.issue,
+            lane=facts.lane,
+            operation=disposition_approval_operation(facts),
+        )
+        self.assertTrue(self._verification(marker, production_resolver=True))
 
     def test_pointer_or_wrong_digest_never_authorizes(self):
         self.assertFalse(self._verification("approved in prose"))

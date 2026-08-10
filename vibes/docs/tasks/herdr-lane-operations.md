@@ -151,6 +151,7 @@ same-lane implementation_gateway が **callback delivery 確認済みの provide
       - **no-change Review waiver gate `no_change_review_waiver` の ruling は `redmine:#14695:j#93412`** (Design Consultation Answer)。writer role は `coordinator`、provenance 軸は marker の `approval_source=direct_owner` で、両者は連言であり代替関係ではない (#14695 j#93412)。**同一 consultation の先行 Answer j#93406 を pointer にしない** — 両者とも writer を `coordinator` と裁定しており binding 自体は同じだが、hard carve-out と live 測定境界を持つのは j#93412 だけなので、j#93406 を指すと `is_anchored` は通るのに**現行契約を述べていない record** へ読者を送ることになり、(a) が防ぐ誤帰属と同型になる。この gate も (b)(c) の合成規則と fail-closed 条件は既存 gate と同一で、既存 5 gate の anchor 文字列は 1 文字も変わらない。
       - **global offline rollout gate `herdr_offline_rollout_owner_approval` の ruling は `redmine:#14838:j#97993`**。writer role は `coordinator`、全workspace停止・3-store migration・runtime cutoverを承認した判断のprovenanceはmarkerの `approval_source=direct_owner` で、両者を連言する。full approval manifest + issueのdigestをmarkerへ束縛し、source-system author ID一致はauthorityに使わない。(b)(c) の合成とunanchored refusalは他gateと同じで、既存gateのruling pointerを変更しない。
       - **post-reboot pair recovery gate `restored_pair_recovery_owner_approval` の ruling は `redmine:#15227:j#102879`**。writer role は `coordinator`、owner 判断は marker の `approval_source=direct_owner` と連言する。pair 全体の lifecycle / participant / worktree pin と composer loss の許可を action digest に束縛し、既存 gate の ruling pointer を変更しない。ただしこのgateはconditional-close導入後のために予約されたdormant contractであり、現行read-only診断はmarkerを生成せず、gateを破壊操作へ使わない。
+      - **generation-mismatch disposition gate `generation_mismatch_disposition_owner_approval` の ruling は `redmine:#15193:j#103101`**。writer role は `coordinator`、owner 判断は marker の `approval_source=direct_owner` と連言する。pending composer・receiver・lifecycleのexact operation digestを束縛し、別gateのrulingやjournal pointerだけをauthorityとして流用しない。
       - **ruling を持たない gate は unanchored** となり、本 surface は zero-close で refuse する (fail-closed)。
       - 本節の (a) と既存 gate の維持は **test が code から導出して照合する**ため、runbook と実装のどちらか一方だけを変えると赤化する (前 3 round 連続で docs drift を出したため綴り検査ではなく導出照合にした)。
     - ★**旧実装の「approval journal の author == issue の author」は撤去した** (#14661 review j#92601 F1)。実測で worker / gateway / coordinator の全 role が同一 source-system user id で書いており、この述語は **issue 上の全 journal が満たす**。何も証明していなかった。
@@ -290,6 +291,10 @@ mozyo-bridge sublane quarantine-inspect --issue <id> --lane <lane> --role <role>
   `attestation_unreadable` / `known_marker_requires_q_enter` / `not_quarantine_candidate` /
   `workspace_unresolved`。**refusal時はtemplateを出さない** (execute側fenceが拒否するapprovalを貼らせないため)。
 - `known_marker_requires_q_enter` はreceiver replacementではなく、既存delivery railのq-enterで処理する。
+  classifierのprecedenceで`generation_mismatch`が先に確定しても、同時観測したknown marker factを捨てない。
+  同じ観測でpending composerをpositiveに確認したexact 1 markerはq-enterへ残し、複数・ambiguous、または
+  pending不在／不読と矛盾するmarker相関はblockedとする。どれもdisposition templateを生成せず、pending inputの
+  discard authorityにはならない。
 - receiverのrevision / attested generation / locatorが変化したらapprovalは無効である。`--execute` は実状態と
   再照合してfail-closedするので、driftしたapprovalは適用されずに拒否される。inspectを取り直してapprovalを出し直す。
 - generation mismatch と real pending input が同時にある場合だけ、同じ inspection は disposition template を返す。

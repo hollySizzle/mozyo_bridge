@@ -94,6 +94,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DISPOSITION_AGENT_WORKING,
     DISPOSITION_APPROVAL_INCOMPLETE,
     DISPOSITION_COMPOSER_UNREADABLE,
+    DISPOSITION_KNOWN_MARKER_REQUIRES_Q_ENTER,
     DISPOSITION_LIFECYCLE_ABSENT,
     DISPOSITION_LIFECYCLE_PINS_INVALID,
     DISPOSITION_LIFECYCLE_UNREADABLE,
@@ -321,6 +322,27 @@ class DeadlockReproductionTest(_Case):
         self.assertTrue(out.classification.pending_observed)
         self.assertEqual(out.classification.generation_axes, AXES)
         self.assertTrue(out.classification.generation_mismatch_with_pending)
+
+    def test_known_marker_survives_mismatch_and_routes_away_from_discard(self) -> None:
+        out = self._inspect(signal=_signal(correlated_marker_ids=("known-delivery",)))
+        self.assertEqual(out.classification.label, GENERATION_MISMATCH)
+        self.assertEqual(out.classification.correlated_marker_id, "known-delivery")
+        self.assertTrue(out.classification.q_enter_recommended)
+        self.assertEqual(
+            out.disposition_reason, DISPOSITION_KNOWN_MARKER_REQUIRES_Q_ENTER
+        )
+        self.assertFalse(out.disposition_ready)
+        self.assertEqual(out.disposition_template, "")
+
+    def test_ambiguous_markers_under_mismatch_never_mint_discard_authority(self) -> None:
+        out = self._inspect(
+            signal=_signal(correlated_marker_ids=("known-a", "known-b"))
+        )
+        self.assertEqual(out.classification.label, GENERATION_MISMATCH)
+        self.assertFalse(out.classification.q_enter_recommended)
+        self.assertFalse(out.classification.generation_mismatch_with_pending)
+        self.assertFalse(out.disposition_ready)
+        self.assertEqual(out.disposition_template, "")
 
     def test_the_approval_names_the_exact_mismatch_and_the_discard(self) -> None:
         out = self._inspect()

@@ -158,15 +158,21 @@ class PendingComposerSignal:
 class PendingComposerClassification:
     """The winning verdict PLUS the facts the losing precedence branches observed.
 
-    ``label`` and the three derived predicates are unchanged (#13763). Redmine #15193 adds the
-    co-observed facts so a caller can distinguish states the single label folds together —
-    specifically ``generation_mismatch`` with an empty composer (nothing at stake) from
-    ``generation_mismatch`` with a real unsent input (an operator decision is owed). Neither
-    added field widens candidacy: :attr:`quarantine_candidate` still reads ``label`` alone.
+    ``label`` remains unchanged (#13763). Redmine #15193 adds co-observed facts so a caller can
+    distinguish states the single label folds together — specifically ``generation_mismatch``
+    with an empty composer (nothing at stake) from one with a real unsent input.  Review r18f2
+    also preserves marker correlation when that higher-precedence label wins: a known delivery
+    remains q-enter work, and an ambiguous correlation remains blocked, rather than either being
+    admitted to the destructive disposition rail. Neither fact widens quarantine candidacy:
+    :attr:`quarantine_candidate` still reads ``label`` alone.
     """
 
     label: str
     correlated_marker_id: str = ""
+    #: The adapter saw an ambiguous marker set even if a higher-precedence label won.  This is a
+    #: content-free safety fact, not composer material.  It remains internal to the decision: no
+    #: arbitrary marker is selected or published as authoritative from an ambiguous set.
+    pending_correlation_ambiguous: bool = False
     #: The raw pending fact as observed, carried through REGARDLESS of which precedence
     #: branch won. ``None`` means the composer could not be read (never "empty"), matching
     #: :attr:`PendingComposerSignal.has_pending`. This is the fact the collapsed label
@@ -177,7 +183,12 @@ class PendingComposerClassification:
 
     @property
     def q_enter_recommended(self) -> bool:
-        return self.label == CORRELATED_KNOWN_MARKER
+        return self.label == CORRELATED_KNOWN_MARKER or (
+            self.label == GENERATION_MISMATCH
+            and self.pending_observed is True
+            and bool(self.correlated_marker_id)
+            and not self.pending_correlation_ambiguous
+        )
 
     @property
     def quarantine_candidate(self) -> bool:
@@ -195,9 +206,15 @@ class PendingComposerClassification:
         the state where the canonical rails deadlock, so a caller may route to the disposition
         preflight instead of repeating ``not_quarantine_candidate`` at the operator. An
         unreadable composer (``pending_observed is None``) is deliberately excluded: an
-        unprovable pending fact must never open a disposition path.
+        unprovable pending fact must never open a disposition path. A known delivery marker is
+        likewise excluded because q-enter owns it; ambiguous marker evidence stays blocked.
         """
-        return self.label == GENERATION_MISMATCH and self.pending_observed is True
+        return (
+            self.label == GENERATION_MISMATCH
+            and self.pending_observed is True
+            and not self.correlated_marker_id
+            and not self.pending_correlation_ambiguous
+        )
 
     def as_payload(self) -> dict[str, object]:
         return {
@@ -227,6 +244,15 @@ def classify_pending_composer(
     and the ``inventory_unreadable`` label is reachable from both.
     """
     axes = ordered_generation_axes(signal.generation_axes)
+    markers = tuple(dict.fromkeys(m for m in signal.correlated_marker_ids if m))
+    # A correlation is actionable only when the same observation positively proved a pending
+    # composer.  A marker alongside ``False`` / ``None`` is an internally inconsistent read,
+    # never evidence for q-enter and never disposition authority.
+    marker_ambiguous = (
+        signal.correlation_ambiguous
+        or len(markers) > 1
+        or (bool(markers) and signal.has_pending is not True)
+    )
 
     def verdict(label: str, **changes: object) -> PendingComposerClassification:
         # One construction point, so no branch can forget to carry the co-observed facts.
@@ -243,7 +269,13 @@ def classify_pending_composer(
     if not signal.inventory_readable:
         return verdict(INVENTORY_UNREADABLE)
     if not signal.generation_matches:
-        return verdict(GENERATION_MISMATCH)
+        return verdict(
+            GENERATION_MISMATCH,
+            correlated_marker_id=(
+                markers[0] if len(markers) == 1 and not marker_ambiguous else ""
+            ),
+            pending_correlation_ambiguous=marker_ambiguous,
+        )
     if not signal.identity_attested:
         return verdict(IDENTITY_UNATTESTED)
     if agent_state_is_working(signal.agent_state):
@@ -252,9 +284,8 @@ def classify_pending_composer(
         return verdict(INVENTORY_UNREADABLE)
     if not signal.has_pending:
         return verdict(NO_PENDING_COMPOSER)
-    markers = tuple(dict.fromkeys(m for m in signal.correlated_marker_ids if m))
-    if signal.correlation_ambiguous or len(markers) > 1:
-        return verdict(AMBIGUOUS)
+    if marker_ambiguous:
+        return verdict(AMBIGUOUS, pending_correlation_ambiguous=True)
     if len(markers) == 1:
         return verdict(CORRELATED_KNOWN_MARKER, correlated_marker_id=markers[0])
     return verdict(UNCORRELATED)

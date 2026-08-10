@@ -209,6 +209,62 @@ class CoObservedFactsTest(unittest.TestCase):
         self.assertEqual(result.generation_axes, ("pair",))
         self.assertTrue(result.generation_mismatch_with_pending)
 
+    def test_generation_mismatch_preserves_one_known_marker_for_q_enter(self) -> None:
+        result = classify_pending_composer(
+            _signal(
+                generation_matches=False,
+                correlated_marker_ids=(MARKER,),
+                generation_axes=("pair",),
+            )
+        )
+        # The historical precedence label remains stable, but the losing marker branch is an
+        # authority fact: this input belongs to q-enter and can never become a discard candidate.
+        self.assertEqual(result.label, GENERATION_MISMATCH)
+        self.assertEqual(result.correlated_marker_id, MARKER)
+        self.assertTrue(result.q_enter_recommended)
+        self.assertFalse(result.generation_mismatch_with_pending)
+        self.assertFalse(result.blocked)
+
+    def test_generation_mismatch_with_ambiguous_markers_stays_blocked(self) -> None:
+        signals = (
+            _signal(
+                generation_matches=False,
+                correlated_marker_ids=(MARKER, OTHER_MARKER),
+                generation_axes=("pair",),
+            ),
+            _signal(
+                generation_matches=False,
+                correlated_marker_ids=(MARKER,),
+                correlation_ambiguous=True,
+                generation_axes=("pair",),
+            ),
+        )
+        for signal in signals:
+            with self.subTest(signal=signal):
+                result = classify_pending_composer(signal)
+                self.assertEqual(result.label, GENERATION_MISMATCH)
+                self.assertEqual(result.correlated_marker_id, "")
+                self.assertFalse(result.q_enter_recommended)
+                self.assertFalse(result.generation_mismatch_with_pending)
+                self.assertTrue(result.blocked)
+
+    def test_generation_mismatch_never_q_enters_a_marker_without_positive_pending(self) -> None:
+        for has_pending in (False, None):
+            with self.subTest(has_pending=has_pending):
+                result = classify_pending_composer(
+                    _signal(
+                        generation_matches=False,
+                        has_pending=has_pending,
+                        correlated_marker_ids=(MARKER,),
+                        generation_axes=("pair",),
+                    )
+                )
+                self.assertEqual(result.label, GENERATION_MISMATCH)
+                self.assertEqual(result.correlated_marker_id, "")
+                self.assertFalse(result.q_enter_recommended)
+                self.assertFalse(result.generation_mismatch_with_pending)
+                self.assertTrue(result.blocked)
+
     def test_generation_mismatch_without_pending_is_not_the_disposition_shape(self) -> None:
         result = classify_pending_composer(
             _signal(generation_matches=False, has_pending=False, generation_axes=("identity",))

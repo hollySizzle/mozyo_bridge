@@ -59,6 +59,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     NO_PENDING_COMPOSER,
     UNCORRELATED,
     PendingComposerClassification,
+    PendingComposerSignal,
+    classify_pending_composer,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine_disposition import (  # noqa: E501
     disposition_agent_state_settled,
@@ -247,6 +249,40 @@ class NeverDestroyKnownInputTest(unittest.TestCase):
             _decide(classification=classification),
             DISPOSITION_KNOWN_MARKER_REQUIRES_Q_ENTER,
         )
+
+    def test_real_classifier_preserves_known_marker_through_mismatch_precedence(self) -> None:
+        classification = classify_pending_composer(
+            PendingComposerSignal(
+                inventory_readable=True,
+                has_pending=True,
+                agent_state="awaiting_input",
+                identity_attested=True,
+                generation_matches=False,
+                correlated_marker_ids=(MARKER,),
+                generation_axes=("pair",),
+            )
+        )
+        self.assertEqual(classification.label, GENERATION_MISMATCH)
+        self.assertTrue(classification.q_enter_recommended)
+        self.assertEqual(
+            _decide(classification=classification),
+            DISPOSITION_KNOWN_MARKER_REQUIRES_Q_ENTER,
+        )
+
+    def test_real_classifier_never_admits_ambiguous_markers_to_disposition(self) -> None:
+        classification = classify_pending_composer(
+            PendingComposerSignal(
+                inventory_readable=True,
+                has_pending=True,
+                agent_state="awaiting_input",
+                identity_attested=True,
+                generation_matches=False,
+                correlated_marker_ids=(MARKER, "second-marker"),
+                generation_axes=("pair",),
+            )
+        )
+        self.assertFalse(classification.generation_mismatch_with_pending)
+        self.assertNotEqual(_decide(classification=classification), DISPOSITION_READY)
 
 
 class ScopeTest(unittest.TestCase):
