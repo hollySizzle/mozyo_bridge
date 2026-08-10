@@ -30,6 +30,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.han
     TmuxTransportRailRequest,
     TmuxTransportRailUseCase,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_herdr_queue_enter_rail import (
+    QueueEnterResendGate,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     DeliveryOutcome,
     QueueEnterRetryOutcome,
@@ -50,6 +53,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     TerminalTransportConfig,
     TerminalTransportError,
     TransportResult,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_resend_gate import (
+    RESEND_SKIP_BODY_ABSENT,
 )
 
 #: A herdr-valid live locator, so the shim's translator passes the target through unchanged and
@@ -168,6 +174,37 @@ class _ShimBackedOps:
 
     def observe_queue_enter_turn_start(self, target: str):
         return None
+
+    def observe_queue_enter_runtime_state(self, target: str) -> str:
+        return "turn_ended"
+
+    def observe_queue_enter_gateway_binding(self, target: str) -> dict:
+        return {
+            "provider": "codex",
+            "assigned_name": "mzb1_ws_codex_lane",
+            "locator": target,
+            "row_revision": "1",
+            "attestation_observed_at": "2026-08-10T00:00:00+00:00",
+            "startup_action_id": "startup-test",
+        }
+
+    def arm_queue_enter_turn_wait(self, target: str, *, timeout_ms: int):
+        return object()
+
+    def collect_queue_enter_turn_wait(self, armed) -> str:
+        return "timeout"
+
+    def evaluate_queue_enter_resend(
+        self,
+        target: str,
+        text: str,
+        receiver: str,
+        baseline_binding: Optional[dict],
+    ) -> QueueEnterResendGate:
+        # Exercise the real Herdr shim's pane read from the current #15242
+        # strict gate, not the retired marker-only retry probe.
+        self.capture(target, 200)
+        return QueueEnterResendGate(RESEND_SKIP_BODY_ABSENT)
 
     def emit(self, outcome: DeliveryOutcome, **kwargs) -> None:
         self.emitted.append(outcome)
@@ -304,7 +341,7 @@ class FakeHerdrTransportFailureClosesToTypedOutcomeTest(unittest.TestCase):
                 self._assert_typed_and_redacted(ops)
 
     def test_enter_only_retry_probe_read_timeout(self):
-        """The queue-enter Enter-only retry's marker probe fails after Enter was pressed."""
+        """The queue-enter strict resend gate's pane read fails after the first Enter."""
 
         @dataclass
         class _LateReadFailure(_FakeHerdrPort):
@@ -313,7 +350,7 @@ class FakeHerdrTransportFailureClosesToTypedOutcomeTest(unittest.TestCase):
             def read_pane(self, target, *, source="visible", lines=None):
                 self.reads += 1
                 # The landing wait's read succeeds (marker unobserved -> queue-enter proceeds
-                # and presses Enter); the retry probe's read then times out.
+                # and presses Enter); the strict resend gate's pane read then times out.
                 if self.reads == 1:
                     return PaneReadResult.success("no marker here")
                 return PaneReadResult.failure(

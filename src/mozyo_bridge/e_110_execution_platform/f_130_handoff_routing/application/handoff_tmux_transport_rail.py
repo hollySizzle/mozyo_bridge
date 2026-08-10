@@ -119,6 +119,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.han
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (
     REASON_TRANSPORT_ERROR,
+    turn_start_positively_observed,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (
     RoleProfileResolution,
@@ -654,15 +655,26 @@ class TmuxTransportRailUseCase:
                 # this renderer remains the redaction-safe post-choreography snapshot wording.
                 turn_start_lines = queue_enter_turn_start_record_lines(snapshot)
 
-        # Wording-layer differentiation under the relaxed `queue-enter` rail: marker observed
-        # (possibly via the Enter-only retry above) -> strict `sent`/`ok`; marker still unobserved
-        # -> `sent`/`queue_enter` (sender did not pre-confirm landing). The receiver-side contract
-        # and `next_action_owner` stay identical to strict `sent` per the contract.
+        # tmux keeps the legacy marker-based queue result. Herdr now has a causal
+        # authority: only an armed working transition on the same launch generation
+        # is a successful submit. Missing evidence is an uncertain partial delivery,
+        # never rc=0 / sent merely because Enter was issued (#15242 acceptance).
         relaxed_unobserved = request.mode == MODE_QUEUE_ENTER and not marker_observed
+        herdr_queue_unconfirmed = queue_session is not None and not (
+            turn_start_positively_observed(queue_enter_observation)
+        )
         outcome = self._outcome(
             request,
-            status="sent",
-            reason="queue_enter" if relaxed_unobserved else "ok",
+            status="blocked" if herdr_queue_unconfirmed else "sent",
+            reason=(
+                "turn_start_unconfirmed"
+                if herdr_queue_unconfirmed
+                else "ok"
+                if queue_session is not None
+                else "queue_enter"
+                if relaxed_unobserved
+                else "ok"
+            ),
             queue_enter_turn_start_observation=queue_enter_observation,
         )
         # Durable retry telemetry (policy + attempted count + interval) is recorded only when the
@@ -710,6 +722,17 @@ class TmuxTransportRailUseCase:
         # 経路不変); the Enter-only retry telemetry enriches the same entry.
         if request.herdr_send:
             ops.record_ledger(outcome, retry_outcome=retry_record)
+        if herdr_queue_unconfirmed:
+            ops.die(
+                "Herdr queue-enter typed the marker+body once and pressed Enter "
+                f"{enter_attempts} time(s), but no causally attributable turn start "
+                "was confirmed on the same launch generation. The uncertain partial "
+                "delivery was recorded as blocked / turn_start_unconfirmed; no body "
+                "resend or rollback was issued, and blind retry is prohibited. Read "
+                "the receiver and durable anchor before any explicit recovery. "
+                f"target={request.target} marker={request.marker}"
+            )
+            raise AssertionError("unreachable")
         return 0
 
 

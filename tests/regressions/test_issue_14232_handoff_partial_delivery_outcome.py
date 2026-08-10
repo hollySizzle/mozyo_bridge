@@ -90,6 +90,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.han
     TmuxTransportRailRequest,
     TmuxTransportRailUseCase,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_herdr_queue_enter_rail import (
+    QueueEnterResendGate,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     DeliveryOutcome,
     QueueEnterRetryOutcome,
@@ -111,6 +114,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.q_enter 
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.transport_binding import (
     TransportBindingError,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_resend_gate import (
+    RESEND_SKIP_BODY_ABSENT,
 )
 
 _MODE_QUEUE_ENTER = "queue-enter"
@@ -207,6 +213,38 @@ class _RaisingOps:
 
     def observe_queue_enter_turn_start(self, target: str):
         return None
+
+    def observe_queue_enter_runtime_state(self, target: str) -> str:
+        return "turn_ended"
+
+    def observe_queue_enter_gateway_binding(self, target: str) -> dict:
+        return {
+            "provider": "codex",
+            "assigned_name": "mzb1_ws_codex_lane",
+            "locator": target,
+            "row_revision": "1",
+            "attestation_observed_at": "2026-08-10T00:00:00+00:00",
+            "startup_action_id": "startup-test",
+        }
+
+    def arm_queue_enter_turn_wait(self, target: str, *, timeout_ms: int):
+        return object()
+
+    def collect_queue_enter_turn_wait(self, armed) -> str:
+        return "timeout"
+
+    def evaluate_queue_enter_resend(
+        self,
+        target: str,
+        text: str,
+        receiver: str,
+        baseline_binding: Optional[dict],
+    ) -> QueueEnterResendGate:
+        # #15242 replaced the Herdr marker-only retry probe with this strict
+        # gate. Route the old #14232 transport-failure pin through the current
+        # pane-read seam so the containment contract remains exercised.
+        self.capture(target, 200)
+        return QueueEnterResendGate(RESEND_SKIP_BODY_ABSENT)
 
     def emit(
         self,
@@ -348,7 +386,7 @@ class HerdrTransportExceptionClosesToTypedOutcomeTest(unittest.TestCase):
         self.assertEqual(ops.enter_presses, 0)
 
     def test_enter_only_retry_probe_read_timeout_closes_to_typed_outcome(self):
-        """The queue-enter Enter-only retry's marker probe (``capture``) timed out."""
+        """The queue-enter strict resend gate's pane read timed out."""
         ops = _RaisingOps(raise_on="capture", marker_observed=False)
         with self.assertRaises(_FakeDie):
             TmuxTransportRailUseCase(ops).execute(
