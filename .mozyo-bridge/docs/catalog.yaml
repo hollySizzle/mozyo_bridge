@@ -627,6 +627,21 @@ documents:
       - rule-public-private-boundary
       - spec-project-map
 
+  - id: logic-multi-source-unit-board
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/multi-source-unit-board.md
+    purpose: local／remote host／Dev Containerの複数Herdrサーバーからpublic-safeなUnit情報をclient側で集約表示し、host-aware identity・source unavailable/stale/duplicateのfail-closed投影・remote Unit操作の対象環境coordinator gateway routeを固定する実装正本。
+    audit_role: multi_source_unit_board_logic
+    related_document_refs:
+      - logic-herdr-unit-board
+      - logic-local-remote-cockpit-host-boundary
+      - logic-unit-target-model
+      - logic-herdr-plugin-presentation-consumer-boundary
+      - rule-public-private-boundary
+      - spec-herdr-native-identity
+      - spec-project-map
+
   - id: logic-herdr-unit-board
     type: logic
     status: active
@@ -634,6 +649,7 @@ documents:
     purpose: managed Herdr agent pairをproject・workflow role・責務・lane work label・runtime stateで識別するpublic-safe Unit board、display metadata再同期、preview-first pair配置操作、shared Unit列移動との分離を固定する実装正本。
     audit_role: herdr_unit_board_logic
     related_document_refs:
+      - logic-multi-source-unit-board
       - logic-herdr-plugin-presentation-consumer-boundary
       - logic-plugin-ready-adapter-boundary
       - logic-delegated-coordinator-cockpit-display
@@ -1640,11 +1656,39 @@ file_conventions:
       - logic-object-oriented-architecture-policy
       - skill-workflow-reference
 
+  - id: fc-multi-source-unit-board
+    name: Multi-source Herdr Unit board sources, aggregation, and remote action rail
+    patterns:
+      - src/mozyo_bridge/e_120_operations_cockpit/f_110_cockpit_read_model/domain/unit_board_sources.py
+      - src/mozyo_bridge/e_120_operations_cockpit/f_110_cockpit_read_model/domain/unit_board_aggregate.py
+      - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/unit_board_sources_loader.py
+      - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/remote_unit_action.py
+      - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/infrastructure/herdr_multi_source_unit_board.py
+      - tests/unit/e_120_operations_cockpit/f_110_cockpit_read_model/test_unit_board_sources.py
+      - tests/unit/e_120_operations_cockpit/f_110_cockpit_read_model/test_unit_board_aggregate.py
+      - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_unit_board_sources_loader.py
+      - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_herdr_multi_source_unit_board.py
+      - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_remote_unit_action.py
+      - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_cli_herdr_unit_board_sources.py
+      - tests/regressions/test_issue_15138_local_only_unit_board_preserved.py
+      - vibes/docs/logics/multi-source-unit-board.md
+    severity: block
+    document_refs:
+      - logic-multi-source-unit-board
+      - logic-herdr-unit-board
+      - logic-local-remote-cockpit-host-boundary
+      - logic-unit-target-model
+      - rule-public-private-boundary
+      - rule-project-agent-workflow
+      - spec-herdr-native-identity
+      - spec-project-map
+
   - id: fc-herdr-unit-board
     name: Herdr Unit board projection, runtime adapter, plugin, and tests
     patterns:
       - herdr-plugins/mozyo-unit-board/**
       - src/mozyo_bridge/e_120_operations_cockpit/f_110_cockpit_read_model/domain/herdr_unit_board.py
+      - src/mozyo_bridge/e_120_operations_cockpit/f_110_cockpit_read_model/domain/public_safe_text.py
       - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/cli_herdr_unit_board.py
       - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_unit_board_placement_ui.py
       - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/infrastructure/herdr_unit_board_runtime.py
@@ -1656,6 +1700,7 @@ file_conventions:
     severity: block
     document_refs:
       - logic-herdr-unit-board
+      - logic-multi-source-unit-board
       - logic-herdr-plugin-presentation-consumer-boundary
       - logic-plugin-ready-adapter-boundary
       - logic-delegated-coordinator-cockpit-display

@@ -53,10 +53,34 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
+- name: Multi-source Herdr Unit board sources, aggregation, and remote action rail
+  patterns:
+  - src/mozyo_bridge/e_120_operations_cockpit/f_110_cockpit_read_model/domain/unit_board_sources.py
+  - src/mozyo_bridge/e_120_operations_cockpit/f_110_cockpit_read_model/domain/unit_board_aggregate.py
+  - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/unit_board_sources_loader.py
+  - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/remote_unit_action.py
+  - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/infrastructure/herdr_multi_source_unit_board.py
+  - tests/unit/e_120_operations_cockpit/f_110_cockpit_read_model/test_unit_board_sources.py
+  - tests/unit/e_120_operations_cockpit/f_110_cockpit_read_model/test_unit_board_aggregate.py
+  - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_unit_board_sources_loader.py
+  - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_herdr_multi_source_unit_board.py
+  - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_remote_unit_action.py
+  - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_cli_herdr_unit_board_sources.py
+  - tests/regressions/test_issue_15138_local_only_unit_board_preserved.py
+  - vibes/docs/logics/multi-source-unit-board.md
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/multi-source-unit-board.md と @vibes/docs/logics/herdr-unit-board.md と @vibes/docs/logics/local-remote-cockpit-host-boundary.md
+    と @vibes/docs/logics/unit-target-model.md と @vibes/docs/rules/public-private-boundary.md と @vibes/docs/rules/agent-workflow.md
+    と @vibes/docs/specs/herdr-native-identity.md と @vibes/docs/specs/project-map.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
 - name: Herdr Unit board projection, runtime adapter, plugin, and tests
   patterns:
   - herdr-plugins/mozyo-unit-board/**
   - src/mozyo_bridge/e_120_operations_cockpit/f_110_cockpit_read_model/domain/herdr_unit_board.py
+  - src/mozyo_bridge/e_120_operations_cockpit/f_110_cockpit_read_model/domain/public_safe_text.py
   - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/cli_herdr_unit_board.py
   - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_unit_board_placement_ui.py
   - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/infrastructure/herdr_unit_board_runtime.py
@@ -66,7 +90,7 @@ rules:
   - tests/integration/e_140_adapter_provider/f_130_terminal_runtime_provider/test_herdr_unit_board_plugin.py
   - vibes/docs/logics/herdr-unit-board.md
   severity: block
-  message: 'このファイルを変更する場合は､ @vibes/docs/logics/herdr-unit-board.md と @vibes/docs/logics/herdr-plugin-presentation-consumer-boundary.md
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/herdr-unit-board.md と @vibes/docs/logics/multi-source-unit-board.md と @vibes/docs/logics/herdr-plugin-presentation-consumer-boundary.md
     と @vibes/docs/logics/plugin-ready-adapter-boundary.md と @vibes/docs/logics/delegated-coordinator-cockpit-display.md と
     @vibes/docs/rules/public-private-boundary.md と @vibes/docs/rules/agent-workflow.md と @vibes/docs/specs/herdr-native-identity.md
     と @vibes/docs/specs/project-map.md をよく確認し従うこと

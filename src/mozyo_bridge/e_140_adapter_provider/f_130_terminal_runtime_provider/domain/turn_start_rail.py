@@ -79,6 +79,37 @@ it just happens to be what E14 needed. If the pane read fails or the body is no
 longer in the composer, the rail does **not** resend (fail-closed: never blindly
 re-Enter when it cannot confirm the stuck-composer precondition).
 
+Wait-ERROR Enter-resend (Redmine #15202 — enforced in code)
+-----------------------------------------------------------
+E14's rail was armed by :data:`WAIT_TIMEOUT` alone, so a first wait that resolved
+:data:`WAIT_ERROR` — a spawn / OS / unclassifiable wait failure — fell straight
+through to ``delivered_not_started`` with ``enter_resends=0``. #15199 hit that
+shape nine times in one lane: the body was typed, the first Enter was sent, the
+*observation* failed, and the composer kept the request forever. A failed wait is
+evidence about the **observer**, not the receiver, so refusing to press Enter
+again is not a safety property — it is a lost turn.
+
+``error`` is therefore a resend candidate too. Timeout-only sequences keep the
+configured :attr:`HerdrTurnStartRail.max_enter_resends` budget. After ``error``,
+the effective total budget is hard-capped at one, including a later timeout. The
+error resend re-waits on :attr:`HerdrTurnStartRail.error_resend_wait_timeout_ms`
+(default and hard maximum 15s): the failed first wait measured no start latency.
+
+The error path's resend gate is deliberately **stricter** than the timeout path's,
+and the asymmetry is the point. A timeout is a positive observation (the wait ran
+and saw no transition); an error is the absence of one, so before it presses Enter
+into a pane it cannot characterise the rail must positively establish *who* holds
+the target and *what* is on it. The six gate conditions, and why each one is
+fail-closed, are documented on ``domain/turn_start_resend_gate`` — the leaf that
+owns the gate's vocabulary — and enforced in :meth:`HerdrTurnStartRail._error_resend_gate`.
+
+Every refusal is recorded as a closed :data:`RESEND_SKIP_REASONS` token, and the
+FIRST wait kind is preserved in :attr:`TurnStartResult.first_wait_kind` so a
+recovered turn never erases that the first observation failed. The
+:data:`WAIT_TIMEOUT` gate is untouched (#15202 requirement 5): same two checks,
+same 8s re-wait, same reader call sequence — a rail constructed without a
+``screen_guard`` / ``identity_probe`` behaves on timeouts byte-for-byte as before.
+
 Subscribe-time event caveat (PoC E14 — fail-safe)
 -------------------------------------------------
 E14 observed that a wait armed just after the awaited transition had already
@@ -93,10 +124,11 @@ Scope (staged seam — kept explicit so it does not drift)
 - **In scope:** the closed :data:`TURN_START_OUTCOMES` vocabulary, the structured
   :class:`TurnStartResult`, the injected-dependency wait-primitive *port*
   (:class:`TurnStartWaitPort` / :class:`ArmedWait`) and its :class:`WaitResult`
-  vocabulary, the pure :func:`composer_retains_body` helper, the pure
-  :class:`HerdrTurnStartRail` orchestrator, and the redaction-safe
-  :func:`turn_start_rail_record_lines` telemetry renderer. All exercised by the
-  fake-driven 4-case + 2-precondition + Enter-resend harness (no live binary).
+  vocabulary, the pure :class:`HerdrTurnStartRail` orchestrator, and the
+  redaction-safe :func:`turn_start_rail_record_lines` telemetry renderer. The
+  resend gate's closed skip vocabulary and pure predicates live in the leaf
+  ``domain/turn_start_resend_gate``, re-exported here so importers are unchanged.
+  All exercised by the fake-driven 4-case + 2-precondition + Enter-resend harness.
 - **Out of scope (later US's):** the concrete herdr ``wait agent-status``
   subprocess wait primitive lives in the sibling ``infrastructure/herdr_turn_start``
   (still a staged seam, no live binary in its tests); wiring this rail into the
@@ -128,6 +160,31 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
     TerminalTransportError,
 )
+# The resend gate's closed vocabulary and pure predicates live in their own leaf module
+# (module-health gate). Re-exported below via ``__all__`` so every existing importer of
+# ``composer_retains_body`` from this module is unchanged.
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_resend_gate import (  # noqa: E501
+    RESEND_SKIP_BODY_ABSENT,
+    RESEND_SKIP_BUDGET_EXHAUSTED,
+    RESEND_SKIP_DISABLED,
+    RESEND_SKIP_ENTER_SEND_FAILED,
+    RESEND_SKIP_IDENTITY_DRIFT,
+    RESEND_SKIP_IDENTITY_PROBE_UNBOUND,
+    RESEND_SKIP_IDENTITY_UNCONFIRMED,
+    RESEND_SKIP_NONE,
+    RESEND_SKIP_PANE_UNREADABLE,
+    RESEND_SKIP_REASONS,
+    RESEND_SKIP_RECEIVER_BLOCKED,
+    RESEND_SKIP_SCREEN_GUARD_UNBOUND,
+    RESEND_SKIP_STARTUP_SCREEN,
+    RESEND_SKIP_STATE_NOT_INJECTABLE,
+    RESEND_SKIP_STATE_UNREADABLE,
+    ResendIdentityProbe,
+    ResendScreenGuard,
+    composer_retains_body,
+    probe_identity,
+    screen_guard_detects,
+)
 
 
 class TurnStartRailError(TerminalTransportError):
@@ -152,6 +209,13 @@ WAIT_ERROR = "error"  # spawn / OS / unclassifiable wait failure — fail-closed
 WAIT_RESULT_KINDS: frozenset[str] = frozenset(
     {WAIT_CHANGED, WAIT_TIMEOUT, WAIT_ABSENT, WAIT_ERROR}
 )
+
+#: The wait kinds that make an Enter-only resend a *candidate* (Redmine #15202).
+#: ``timeout`` is the E14 stuck-composer shape; ``error`` is the #15199 shape where
+#: the observation itself failed. Both mean "the body is delivered and no start was
+#: confirmed"; neither is by itself permission to press Enter — each has its own gate
+#: below. ``changed`` (started) and ``absent`` (no pane) are terminal and never resend.
+RESENDABLE_WAIT_KINDS: frozenset[str] = frozenset({WAIT_TIMEOUT, WAIT_ERROR})
 
 
 @dataclass(frozen=True)
@@ -291,8 +355,14 @@ class TurnStartResult:
     - ``wait_kind`` — the final wait result kind (a member of
       :data:`WAIT_RESULT_KINDS`), or ``None`` when no wait was ever armed (a
       pre-injection fail-closed outcome);
+    - ``first_wait_kind`` — the kind the FIRST armed wait resolved to, preserved
+      even when a resend later changed the verdict (Redmine #15202): a start that
+      needed a resend is not the same fact as one that did not. Equal to
+      ``wait_kind`` when no resend ran, ``None`` alongside a ``None`` ``wait_kind``;
     - ``enter_resends`` — how many *extra* Enter keypresses the resend rail issued
       (0 when the first wait resolved or the resend rail was disabled / skipped);
+    - ``resend_skipped_reason`` — a member of :data:`RESEND_SKIP_REASONS`: why a
+      candidate resend did not happen, or ``""`` when one ran or none was warranted;
     - ``reclassified_blocked`` — ``True`` iff a wait timeout was re-snapshotted and
       found a runtime block (the outcome is then ``blocked``).
     """
@@ -303,6 +373,8 @@ class TurnStartResult:
     wait_kind: Optional[str] = None
     enter_resends: int = 0
     reclassified_blocked: bool = False
+    first_wait_kind: Optional[str] = None
+    resend_skipped_reason: str = RESEND_SKIP_NONE
 
     def __post_init__(self) -> None:
         if self.outcome not in TURN_START_OUTCOMES:
@@ -327,6 +399,19 @@ class TurnStartResult:
         if self.enter_resends < 0:
             raise TurnStartRailError(
                 f"enter_resends must be non-negative, got {self.enter_resends}"
+            )
+        if (
+            self.first_wait_kind is not None
+            and self.first_wait_kind not in WAIT_RESULT_KINDS
+        ):
+            raise TurnStartRailError(
+                f"first_wait_kind {self.first_wait_kind!r} is not a recognised wait "
+                f"result kind; allowed: {sorted(WAIT_RESULT_KINDS)}"
+            )
+        if self.resend_skipped_reason not in RESEND_SKIP_REASONS:
+            raise TurnStartRailError(
+                f"resend_skipped_reason {self.resend_skipped_reason!r} is not "
+                f"recognised; allowed: {sorted(RESEND_SKIP_REASONS)}"
             )
 
     @property
@@ -356,9 +441,16 @@ class TurnStartResult:
         two rail outcomes (``delivered_not_started`` / ``blocked``) onto reused
         ``(status, reason)`` wire tokens, so an auditor (and the future #12656
         ledger) reads THIS field — not the reason alone — to replay the rail. The
-        keys are exactly the five fields j#72602 decision 4 named:
+        first five keys are exactly the fields j#72602 decision 4 named:
         ``outcome`` / ``snapshot_state`` / ``wait_kind`` / ``enter_resends`` /
         ``reclassified_blocked``.
+
+        Redmine #15202 adds two **additive** keys the five could not answer for:
+        ``first_wait_kind`` (``wait_kind`` became the kind AFTER a resend, so a
+        recovered turn reported ``changed`` and the original failure vanished) and
+        ``resend_skipped_reason`` (``enter_resends=0`` alone cannot say whether a
+        resend was unwanted or refused). Existing keys keep their meaning and
+        position, so an older reader is unaffected.
         """
         return {
             "outcome": self.outcome,
@@ -366,50 +458,9 @@ class TurnStartResult:
             "wait_kind": self.wait_kind,
             "enter_resends": self.enter_resends,
             "reclassified_blocked": self.reclassified_blocked,
+            "first_wait_kind": self.first_wait_kind,
+            "resend_skipped_reason": self.resend_skipped_reason,
         }
-
-
-def _strip_all_ws(text: str) -> str:
-    """Remove every whitespace character (a wrapping-insensitive match key).
-
-    ``str.split()`` with no argument splits on any whitespace run, so ``"".join``
-    of the pieces drops all whitespace — spaces, tabs, and the newlines a rendered
-    composer inserts at line wraps, whether at a word boundary or *mid-token*.
-    """
-    return "".join(text.split())
-
-
-def composer_retains_body(content: object, text: object) -> bool:
-    """True when the injected ``text`` still appears in the pane ``content`` (pure).
-
-    The Enter-resend gate (PoC E14): the rail re-sends Enter only when the injected
-    body is still sitting in the composer — the stuck-Enter signature. The match is
-    whitespace-INSENSITIVE: all whitespace is removed from both sides before the
-    substring test.
-
-    Why remove all whitespace rather than collapse runs to a single space: a
-    rendered composer hard-wraps a long line to the pane width, and it wraps even
-    *mid-token* for an unbroken token. The real handoff marker
-    ``[mozyo:handoff:...:journal=73136:kind=...]`` renders as ``journal=7313`` +
-    newline + ``  6:kind`` (Redmine #13322, confirmed against the live codex TUI); a
-    whitespace-*collapse* would fold that wrap to a spurious space
-    (``journal=7313 6:kind``) and miss the injected ``journal=73136:kind`` — the rail
-    would then refuse to resend and report ``delivered_not_started`` with
-    ``enter_resends=0`` even though the body is plainly retained. Dropping all
-    whitespace makes the wrap — mid-token or at a word boundary — vanish, so a
-    retained body matches regardless of how the TUI folded it.
-
-    A non-empty body is still required; anything non-string, or an empty body, is
-    ``False`` — a read that could not confirm retention must not authorise a resend
-    (an empty / cleared composer therefore never matches, keeping the resend gate
-    fail-closed). Never raises.
-    """
-    if not isinstance(content, str) or not isinstance(text, str):
-        return False
-    body = _strip_all_ws(text)
-    if not body:
-        return False
-    return body in _strip_all_ws(content)
 
 
 #: The default raw key token submitted after the text (herdr ``pane send-keys``).
@@ -420,9 +471,31 @@ DEFAULT_ENTER_KEYS = "enter"
 #: waits about as long as the tmux guard it is equivalent to.
 DEFAULT_WAIT_TIMEOUT_MS = 8000
 
-#: The default bound on Enter re-sends after the first wait times out (PoC E14).
-#: ``1`` allows a single resend (what E14 needed); ``0`` disables the resend rail.
+#: The default bound on Enter re-sends after a first wait that did not confirm a
+#: start (PoC E14 ``timeout``; Redmine #15202 ``error``). ``1`` allows a single
+#: resend (what E14 needed); ``0`` disables the resend rail. This is ONE budget
+#: shared by both arming kinds, so the body is typed once and at most this many
+#: extra Enter keypresses are ever pressed per drive — a mixed timeout-then-error
+#: sequence cannot spend it twice.
 DEFAULT_MAX_ENTER_RESENDS = 1
+
+#: The default ``wait agent-status --timeout`` window for the re-wait after a
+#: WAIT_ERROR-armed Enter resend, in milliseconds (Redmine #15202). Longer than
+#: :data:`DEFAULT_WAIT_TIMEOUT_MS` on purpose: the first wait *failed* rather than
+#: timing out, so it produced no evidence about how long a start takes on this
+#: receiver, and re-waiting only the 8s landing window would turn a slow-but-real
+#: start into a second unconfirmed record. The timeout-armed resend keeps the 8s
+#: window, where the first wait did measure the receiver.
+DEFAULT_ERROR_RESEND_WAIT_TIMEOUT_MS = 15000
+
+#: The HARD upper bound on the error-resend re-wait window, in milliseconds. The
+#: requirement is "再待機は最大15秒" (#15202 j#102578 item 2) — a *maximum*, not a
+#: default. Making the field merely positive-checked let a caller configure 21s and
+#: still call it compliant (audit j#102755 finding 2), so the bound is enforced at
+#: construction and a larger value is refused rather than silently clamped: a caller
+#: asking for 30s has a different intent than this contract permits, and clamping
+#: would honour the letter while hiding the disagreement.
+MAX_ERROR_RESEND_WAIT_TIMEOUT_MS = 15000
 
 #: The default settle delay (seconds) between ``send_text`` and ``send_keys enter``.
 #: Zero by default (the seam is staged; the live cutover tunes it), but the clock is
@@ -461,6 +534,8 @@ class HerdrTurnStartRail:
         wait_timeout_ms: int = DEFAULT_WAIT_TIMEOUT_MS,
         max_enter_resends: int = DEFAULT_MAX_ENTER_RESENDS,
         inject_settle_seconds: float = DEFAULT_INJECT_SETTLE_SECONDS,
+        error_resend_wait_timeout_ms: int = DEFAULT_ERROR_RESEND_WAIT_TIMEOUT_MS,
+        identity_probe: Optional[ResendIdentityProbe] = None,
     ):
         if not isinstance(wait_timeout_ms, int) or isinstance(wait_timeout_ms, bool):
             raise TurnStartRailError(
@@ -469,6 +544,24 @@ class HerdrTurnStartRail:
         if wait_timeout_ms <= 0:
             raise TurnStartRailError(
                 f"wait_timeout_ms must be positive, got {wait_timeout_ms}"
+            )
+        if not isinstance(error_resend_wait_timeout_ms, int) or isinstance(
+            error_resend_wait_timeout_ms, bool
+        ):
+            raise TurnStartRailError(
+                "error_resend_wait_timeout_ms must be an int, got "
+                f"{error_resend_wait_timeout_ms!r}"
+            )
+        if error_resend_wait_timeout_ms <= 0:
+            raise TurnStartRailError(
+                "error_resend_wait_timeout_ms must be positive, got "
+                f"{error_resend_wait_timeout_ms}"
+            )
+        if error_resend_wait_timeout_ms > MAX_ERROR_RESEND_WAIT_TIMEOUT_MS:
+            raise TurnStartRailError(
+                "error_resend_wait_timeout_ms must not exceed "
+                f"{MAX_ERROR_RESEND_WAIT_TIMEOUT_MS} ms (the contract's '再待機は最大"
+                f"15秒' maximum), got {error_resend_wait_timeout_ms}"
             )
         if not isinstance(max_enter_resends, int) or isinstance(max_enter_resends, bool):
             raise TurnStartRailError(
@@ -486,10 +579,17 @@ class HerdrTurnStartRail:
         self._wait_timeout_ms = wait_timeout_ms
         self._max_enter_resends = max_enter_resends
         self._inject_settle_seconds = max(0.0, float(inject_settle_seconds))
+        self._error_resend_wait_timeout_ms = error_resend_wait_timeout_ms
+        self._identity_probe = identity_probe
 
     @property
     def max_enter_resends(self) -> int:
         return self._max_enter_resends
+
+    @property
+    def error_resend_wait_timeout_ms(self) -> int:
+        """The re-wait window (ms) after a WAIT_ERROR-armed Enter resend (#15202)."""
+        return self._error_resend_wait_timeout_ms
 
     @property
     def reader(self):
@@ -527,13 +627,25 @@ class HerdrTurnStartRail:
         return read.content
 
     def drive_turn_start(
-        self, target: str, text: str, *, enter_keys: str = DEFAULT_ENTER_KEYS
+        self,
+        target: str,
+        text: str,
+        *,
+        enter_keys: str = DEFAULT_ENTER_KEYS,
+        screen_guard: Optional[ResendScreenGuard] = None,
     ) -> TurnStartResult:
         """Inject ``text`` into ``target`` and confirm a turn started (check-then-wait).
 
         Follows the fixed order from the module docstring: snapshot → arm wait →
         inject → collect (→ bounded Enter-resend → re-snapshot). Returns a
         structured :class:`TurnStartResult`; never raises.
+
+        ``screen_guard`` is the optional pure pane classifier (:data:`ResendScreenGuard`)
+        the WAIT_ERROR resend gate requires (Redmine #15202). Leaving it unbound — like
+        leaving the constructor's ``identity_probe`` unbound — does not change any
+        behaviour this rail had before #15202. It only withholds the new error-armed
+        resend, which refuses rather than press Enter into a pane whose occupant or
+        startup screens it cannot rule out.
         """
         # --- 1. Pre-injection snapshot (check). A non-injectable (or unreadable)
         # state fails closed: a turn on a busy/blocked/unknown pane cannot be
@@ -552,6 +664,20 @@ class HerdrTurnStartRail:
                 ),
                 snapshot_state=snapshot_state,
             )
+
+        # --- 1b. Capture WHO holds the target, before a single byte is typed (#15202,
+        # audit j#102755 finding 3). This is the baseline the error-resend gate compares
+        # against: the outer identity gates (target resolution, `--target-repo`, startup
+        # admission) all run BEFORE this call and never re-run mid-drive, so nothing
+        # otherwise guarantees the locator still addresses the same agent 8–15s later.
+        # A pane can be killed and its id reused, or a lane relaunched, inside the wait
+        # window. `None` here (no probe, or an unresolvable one) is not a send failure —
+        # the send proceeds exactly as before — it only makes the extra Enter unavailable.
+        baseline_identity = (
+            None
+            if self._identity_probe is None
+            else probe_identity(self._identity_probe, target)
+        )
 
         # --- 2. Arm the wait BEFORE injecting (avoid the E9 change-semantics race).
         armed = self._wait.arm(target, timeout_ms=self._wait_timeout_ms)
@@ -576,21 +702,48 @@ class HerdrTurnStartRail:
                 snapshot_state=snapshot_state,
             )
 
-        # --- 4. Collect the wait, then run the bounded Enter-resend rail on timeout.
+        # --- 4. Collect, then run the bounded resend rail (E14 / #15202).
+        # Timeout-only sequences retain the configured budget. Once an error is
+        # observed, the effective total budget is capped at one across both kinds.
         wait_result = armed.collect()
+        first_wait_kind = wait_result.kind
         resends = 0
-        while (
-            wait_result.kind == WAIT_TIMEOUT and resends < self._max_enter_resends
-        ):
-            # E14 Codex Enter-resend: only re-Enter when the injected body is still
-            # in the composer (a read failure or a cleared composer stops the rail).
-            read = self._transport.read_pane(target)
-            if not read.ok or not composer_retains_body(read.content, text):
+        skipped_reason = RESEND_SKIP_NONE
+        error_seen = False
+        while wait_result.kind in RESENDABLE_WAIT_KINDS:
+            if wait_result.kind == WAIT_ERROR:
+                error_seen = True
+            effective_resend_budget = (
+                min(self._max_enter_resends, 1)
+                if error_seen
+                else self._max_enter_resends
+            )
+            if resends >= effective_resend_budget:
+                skipped_reason = (
+                    RESEND_SKIP_DISABLED
+                    if effective_resend_budget == 0
+                    else RESEND_SKIP_BUDGET_EXHAUSTED
+                )
                 break
-            rearmed = self._wait.arm(target, timeout_ms=self._wait_timeout_ms)
+            if wait_result.kind == WAIT_TIMEOUT:
+                # E14, unchanged (#15202 requirement 5): only re-Enter when the
+                # injected body is still in the composer. A read failure or a cleared
+                # composer stops the rail — same two checks, same reader call sequence.
+                gate = self._timeout_resend_gate(target, text)
+                rearm_timeout_ms = self._wait_timeout_ms
+            else:
+                gate = self._error_resend_gate(
+                    target, text, screen_guard, baseline_identity
+                )
+                rearm_timeout_ms = self._error_resend_wait_timeout_ms
+            if gate != RESEND_SKIP_NONE:
+                skipped_reason = gate
+                break
+            rearmed = self._wait.arm(target, timeout_ms=rearm_timeout_ms)
             resend_result = self._transport.send_keys(target, enter_keys)
             if not resend_result.ok:
                 rearmed.cancel()
+                skipped_reason = RESEND_SKIP_ENTER_SEND_FAILED
                 break
             resends += 1
             wait_result = rearmed.collect()
@@ -600,10 +753,98 @@ class HerdrTurnStartRail:
             target=target,
             snapshot_state=snapshot_state,
             resends=resends,
+            first_wait_kind=first_wait_kind,
+            skipped_reason=skipped_reason,
         )
 
+    def _timeout_resend_gate(self, target: str, text: str) -> str:
+        """The E14 stuck-composer gate: a skip reason, or :data:`RESEND_SKIP_NONE`.
+
+        Byte-for-byte the pre-#15202 condition (``read_pane`` must succeed and the
+        composer must still hold the body); it only *names* which half refused, which
+        is telemetry rather than control flow.
+        """
+        read = self._transport.read_pane(target)
+        if not read.ok:
+            return RESEND_SKIP_PANE_UNREADABLE
+        if not composer_retains_body(read.content, text):
+            return RESEND_SKIP_BODY_ABSENT
+        return RESEND_SKIP_NONE
+
+    def _error_resend_gate(
+        self,
+        target: str,
+        text: str,
+        screen_guard: Optional[ResendScreenGuard],
+        baseline_identity: Optional[str],
+    ) -> str:
+        """The #15202 wait-error gate: a skip reason, or :data:`RESEND_SKIP_NONE`.
+
+        Stricter than :meth:`_timeout_resend_gate` because a failed wait is the absence
+        of an observation rather than a negative one — see the module docstring. The
+        order is deliberate: the free checks first (an unbound guard / probe costs no
+        read), then identity — *who* holds the pane is prior to *what* is rendered on
+        it, and re-reading a pane that a different agent now owns is already reading the
+        wrong thing — then the pane read, then the screen classification BEFORE the body
+        check (so a modal rendering over a still-visible body is reported as the screen
+        it is rather than as a retained composer), and the runtime state last, since it
+        costs another read.
+        """
+        if screen_guard is None:
+            return RESEND_SKIP_SCREEN_GUARD_UNBOUND
+        if self._identity_probe is None:
+            return RESEND_SKIP_IDENTITY_PROBE_UNBOUND
+        if baseline_identity is None:
+            # The pre-injection probe could not name the holder, so there is nothing to
+            # compare against and drift is undetectable. Refuse rather than assume.
+            return RESEND_SKIP_IDENTITY_UNCONFIRMED
+        current_identity = probe_identity(self._identity_probe, target)
+        if current_identity is None:
+            return RESEND_SKIP_IDENTITY_UNCONFIRMED
+        if current_identity != baseline_identity:
+            # A DIFFERENT agent holds this locator now. The extra Enter would land on a
+            # receiver that never got the body — the exact wrong-target send the outer
+            # identity gates exist to prevent, arriving through the resend instead.
+            return RESEND_SKIP_IDENTITY_DRIFT
+        read = self._transport.read_pane(target)
+        if not read.ok:
+            return RESEND_SKIP_PANE_UNREADABLE
+        content = read.content
+        if not isinstance(content, str) or not content.strip():
+            # A blank read is not evidence of a clear composer (#13760's live lane saw
+            # an empty pane *after* a dialog ate the body). Never "clear".
+            return RESEND_SKIP_PANE_UNREADABLE
+        if screen_guard_detects(screen_guard, content):
+            return RESEND_SKIP_STARTUP_SCREEN
+        if not composer_retains_body(content, text):
+            return RESEND_SKIP_BODY_ABSENT
+        # The runtime re-snapshot must POSITIVELY confirm an injectable receiver, not
+        # merely fail to say "blocked". `AgentStateResult` forces `state=unknown` on a
+        # mechanical read failure, so an `== RUNTIME_BLOCKED` test alone admits a resend
+        # on a read that never happened — fail-OPEN, and exactly the "read失敗では再送し
+        # ない" requirement it was meant to satisfy (audit j#102755 finding 1). A
+        # successful read can also carry an *observed* unknown, and `busy` means a turn
+        # is already running, so both are refused too. Same injectable set the
+        # pre-injection precondition gate uses, so "may we inject here" has one answer.
+        resnap = self._reader.read_agent_state(target)
+        if not resnap.ok:
+            return RESEND_SKIP_STATE_UNREADABLE
+        if resnap.state == RUNTIME_BLOCKED:
+            # A runtime permission prompt is up: Enter would answer it, not submit.
+            return RESEND_SKIP_RECEIVER_BLOCKED
+        if resnap.state not in INJECTABLE_PRECONDITION_STATES:
+            return RESEND_SKIP_STATE_NOT_INJECTABLE
+        return RESEND_SKIP_NONE
+
     def _classify(
-        self, wait_result: WaitResult, *, target: str, snapshot_state: str, resends: int
+        self,
+        wait_result: WaitResult,
+        *,
+        target: str,
+        snapshot_state: str,
+        resends: int,
+        first_wait_kind: Optional[str] = None,
+        skipped_reason: str = RESEND_SKIP_NONE,
     ) -> TurnStartResult:
         """Map the final wait result (+ a re-snapshot on timeout) onto an outcome."""
         if wait_result.kind == WAIT_CHANGED:
@@ -613,6 +854,8 @@ class HerdrTurnStartRail:
                 snapshot_state=snapshot_state,
                 wait_kind=wait_result.kind,
                 enter_resends=resends,
+                first_wait_kind=first_wait_kind,
+                resend_skipped_reason=skipped_reason,
             )
         if wait_result.kind == WAIT_ABSENT:
             return TurnStartResult(
@@ -621,6 +864,8 @@ class HerdrTurnStartRail:
                 snapshot_state=snapshot_state,
                 wait_kind=wait_result.kind,
                 enter_resends=resends,
+                first_wait_kind=first_wait_kind,
+                resend_skipped_reason=skipped_reason,
             )
         if wait_result.kind == WAIT_ERROR:
             # We delivered but could not observe the wait — fail closed to
@@ -632,6 +877,8 @@ class HerdrTurnStartRail:
                 snapshot_state=snapshot_state,
                 wait_kind=wait_result.kind,
                 enter_resends=resends,
+                first_wait_kind=first_wait_kind,
+                resend_skipped_reason=skipped_reason,
             )
         # WAIT_TIMEOUT: re-snapshot to tell a runtime block from a plain
         # delivered-not-started (E13/E14: blocked mid-turn times out ``working``).
@@ -645,6 +892,8 @@ class HerdrTurnStartRail:
                 wait_kind=wait_result.kind,
                 enter_resends=resends,
                 reclassified_blocked=True,
+                first_wait_kind=first_wait_kind,
+                resend_skipped_reason=skipped_reason,
             )
         return TurnStartResult(
             outcome=OUTCOME_DELIVERED_NOT_STARTED,
@@ -652,6 +901,8 @@ class HerdrTurnStartRail:
             snapshot_state=snapshot_state,
             wait_kind=wait_result.kind,
             enter_resends=resends,
+            first_wait_kind=first_wait_kind,
+            resend_skipped_reason=skipped_reason,
         )
 
 
@@ -668,13 +919,31 @@ def turn_start_rail_record_lines(result: TurnStartResult) -> list[str]:
     delivery record / persisted note. It documents what the rail observed and never
     overrides ``next_action``; the structured outcome owns the wire.
     """
+    wait_token = result.wait_kind if result.wait_kind is not None else "not-armed"
+    # Redmine #15202: name the FIRST wait whenever a resend changed the verdict, so a
+    # recovered turn still records that the first observation failed, and name a
+    # refused resend's reason so `0 Enter re-send(s)` is never ambiguous between
+    # "none was needed" and "one was wanted and withheld".
+    first_token = (
+        f", first wait {result.first_wait_kind}"
+        if result.first_wait_kind is not None
+        and result.first_wait_kind != result.wait_kind
+        else ""
+    )
+    skip_token = (
+        f", resend withheld: {result.resend_skipped_reason}"
+        if result.resend_skipped_reason
+        else ""
+    )
     return [
         (
             "- Turn start (herdr rail): outcome "
             f"{result.outcome} (snapshot {result.snapshot_state}, "
-            f"wait {result.wait_kind if result.wait_kind is not None else 'not-armed'}, "
+            f"wait {wait_token}"
+            f"{first_token}, "
             f"{result.enter_resends} Enter re-send(s)"
-            f"{', re-snapshot found block' if result.reclassified_blocked else ''}). "
+            f"{', re-snapshot found block' if result.reclassified_blocked else ''}"
+            f"{skip_token}). "
             "Check-then-wait: snapshot before injection, wait armed before Enter; "
             "the body was typed once and only Enter was ever re-sent."
         )
@@ -683,16 +952,34 @@ def turn_start_rail_record_lines(result: TurnStartResult) -> list[str]:
 
 __all__ = (
     "DEFAULT_ENTER_KEYS",
+    "DEFAULT_ERROR_RESEND_WAIT_TIMEOUT_MS",
     "DEFAULT_INJECT_SETTLE_SECONDS",
     "DEFAULT_MAX_ENTER_RESENDS",
     "DEFAULT_WAIT_TIMEOUT_MS",
     "INJECTABLE_PRECONDITION_STATES",
+    "MAX_ERROR_RESEND_WAIT_TIMEOUT_MS",
     "OUTCOME_ABSENT",
     "OUTCOME_BLOCKED",
     "OUTCOME_DELIVERED_NOT_STARTED",
     "OUTCOME_INJECT_FAILED",
     "OUTCOME_PRECONDITION_NOT_IDLE",
     "OUTCOME_STARTED",
+    "RESENDABLE_WAIT_KINDS",
+    "RESEND_SKIP_BODY_ABSENT",
+    "RESEND_SKIP_BUDGET_EXHAUSTED",
+    "RESEND_SKIP_DISABLED",
+    "RESEND_SKIP_ENTER_SEND_FAILED",
+    "RESEND_SKIP_IDENTITY_DRIFT",
+    "RESEND_SKIP_IDENTITY_PROBE_UNBOUND",
+    "RESEND_SKIP_IDENTITY_UNCONFIRMED",
+    "RESEND_SKIP_NONE",
+    "RESEND_SKIP_PANE_UNREADABLE",
+    "RESEND_SKIP_REASONS",
+    "RESEND_SKIP_RECEIVER_BLOCKED",
+    "RESEND_SKIP_SCREEN_GUARD_UNBOUND",
+    "RESEND_SKIP_STARTUP_SCREEN",
+    "RESEND_SKIP_STATE_NOT_INJECTABLE",
+    "RESEND_SKIP_STATE_UNREADABLE",
     "TURN_START_OUTCOMES",
     "WAIT_ABSENT",
     "WAIT_CHANGED",
@@ -701,6 +988,8 @@ __all__ = (
     "WAIT_TIMEOUT",
     "ArmedWait",
     "HerdrTurnStartRail",
+    "ResendIdentityProbe",
+    "ResendScreenGuard",
     "TurnStartRailError",
     "TurnStartResult",
     "TurnStartWaitPort",

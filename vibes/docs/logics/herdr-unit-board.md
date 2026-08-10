@@ -26,6 +26,8 @@ mozyo-bridge herdr unit-board show --json
 mozyo-bridge herdr unit-board sync
 mozyo-bridge herdr unit-board watch
 mozyo-bridge herdr unit-board interact
+mozyo-bridge herdr unit-board sources
+mozyo-bridge herdr unit-board action
 ```
 
 - `show` は一度だけ public-safe projection を表示する。
@@ -44,6 +46,14 @@ mozyo-bridge herdr unit-board interact
 - apply呼出しが例外になった場合は、書込み前か書込み後かをUIから判定できないため
   `partial_failure / postcondition_failed`として表示し、refresh・状態確認まで再実行を
   禁止する。apply結果取得後のboard refresh失敗でも結果を失わず、同じくblind retryを促さない。
+- `sources` は operator が登録した観測 source の identity / kind / state / Unit 数だけを
+  出す診断面で、接続値は出さない。`action` は remote Unit への handoff を対象環境自身の
+  coordinator gateway へ route する preview-first rail である。両者と複数 Herdr サーバーの
+  集約表示の正本は `vibes/docs/logics/multi-source-unit-board.md` (#15138) にあり、
+  本 doc には複製しない。
+- 複数 source を設定しても local-only の挙動は変わらない。`sync` は local server 限定の
+  writer のままで、`interact` の pane geometry 操作も local Herdr server の live pane に
+  対するものである。
 - inventory を読めない場合や managed identity が壊れている場合は非0で終了する。
 
 JSON payload は transient `pane_id`、absolute path、ticket本文、agent本文を含めない。
@@ -154,6 +164,7 @@ workspaceへの移動、任意座標指定、配置の暗黙保存は実装済�
 
 ## 関連文書
 
+- `vibes/docs/logics/multi-source-unit-board.md`
 - `vibes/docs/logics/herdr-plugin-presentation-consumer-boundary.md`
 - `vibes/docs/logics/plugin-ready-adapter-boundary.md`
 - `vibes/docs/logics/delegated-coordinator-cockpit-display.md`

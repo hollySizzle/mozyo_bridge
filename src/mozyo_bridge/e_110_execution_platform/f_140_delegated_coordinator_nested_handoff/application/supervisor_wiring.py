@@ -334,6 +334,7 @@ def default_background_transport(ws: SupervisedWorkspace):
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_admission import (
         ADMISSION_BLOCKED,
         evaluate_startup_admission,
+        make_resend_screen_guard,
     )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_turn_start import (
         resolve_turn_start_rail,
@@ -396,7 +397,15 @@ def default_background_transport(ws: SupervisedWorkspace):
                 )
                 return HandoffDeliveryResult("blocked", reason)
             try:
-                result = rail.drive_turn_start(locator, f"{marker} {body}")
+                # Redmine #15202: the same provider profile that just admitted this send
+                # also gates the rail's WAIT_ERROR Enter resend. Without it the rail
+                # withholds that resend rather than press Enter into a pane whose startup
+                # screens it cannot rule out.
+                result = rail.drive_turn_start(
+                    locator,
+                    f"{marker} {body}",
+                    screen_guard=make_resend_screen_guard(receiver),
+                )
             except Exception:  # noqa: BLE001 - a rail blow-up mid-drive is fail-safe uncertain
                 return HandoffDeliveryResult("blocked", "inject_failed")
             status, reason = project_herdr_turn_start(result)
