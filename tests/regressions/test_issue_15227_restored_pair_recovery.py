@@ -1,0 +1,329 @@
+"""Regression coverage for post-reboot active-pair recovery (Redmine #15227)."""
+
+from __future__ import annotations
+
+import unittest
+from dataclasses import replace
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest import mock
+
+from mozyo_bridge.core.state.herdr_identity_attestation import ATTEST_OK
+from mozyo_bridge.core.state.replacement_preservation import PreservationObservation
+from mozyo_bridge.core.state.replacement_transaction import (
+    ReplacementTransactionKey,
+    ReplacementTransactionStore,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_evidence_planner_composition import (  # noqa: E501
+    EvidencePlanning,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_restored_pair_recovery import (  # noqa: E501
+    PairReplacementResult,
+    RestoredPairRecoveryRequest,
+    SublaneRestoredPairRecoveryUseCase,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
+    GATE_RESTORED_PAIR_RECOVERY_OWNER_APPROVAL,
+    ISSUER_COORDINATOR,
+    RESTORED_PAIR_RECOVERY_APPROVAL_RULING,
+    contract_ruling_pointer,
+    contract_writer_role,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_owner_approval import (  # noqa: E501
+    RESTORED_PAIR_RECOVERY_APPROVAL_EFFECT,
+    RESTORED_PAIR_RECOVERY_APPROVAL_GATE,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.restored_pair_recovery import (  # noqa: E501
+    BLOCK_ATTESTATION_UNREADABLE,
+    BLOCK_PAIR_HEALTHY,
+    BLOCK_PAIR_INCOMPLETE,
+    SLOT_GATEWAY,
+    SLOT_WORKER,
+    STATUS_COMPLETED,
+    STATUS_REFUSED,
+    RestoredPairPlan,
+    RestoredSlot,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (  # noqa: E501
+    ATTEST_BOUND,
+    CLOSE_DONE,
+    LAUNCH_DONE,
+    OLD_SLOT_PRESENT,
+)
+
+
+def _slot(role: str, *, cwd_matches: bool, locator: str) -> RestoredSlot:
+    provider = "codex" if role == SLOT_GATEWAY else "claude"
+    return RestoredSlot(
+        slot_role=role,
+        provider=provider,
+        assigned_name=f"managed-{provider}",
+        locator=locator,
+        revision="12",
+        identity_matches=True,
+        inventory_generation_matches=True,
+        runtime_busy=False,
+        cwd_matches=cwd_matches,
+        attestation_state=ATTEST_OK,
+        attestation_readable=True,
+    )
+
+
+def _plan(*, gateway_cwd: bool = False, worker_cwd: bool = False) -> RestoredPairPlan:
+    return RestoredPairPlan(
+        issue="15227",
+        lane="issue_15227_post_reboot_exact_relaunch",
+        workspace_id="workspace-a",
+        worktree_identity="wt_exact",
+        branch="issue_15227_post_reboot_exact_relaunch",
+        head="a" * 40,
+        lane_revision="7",
+        lane_generation="3",
+        lifecycle_current=True,
+        worktree_authority_current=True,
+        worktree_authority_reason="ok",
+        allow_pending_composer_loss=True,
+        gateway=_slot(SLOT_GATEWAY, cwd_matches=gateway_cwd, locator="pane-g"),
+        worker=_slot(SLOT_WORKER, cwd_matches=worker_cwd, locator="pane-w"),
+    )
+
+
+class _Ops:
+    def __init__(self, plan: RestoredPairPlan) -> None:
+        self.plan = plan
+        self.existing = False
+        self.approved = False
+        self.replace_calls = 0
+
+    def observe(self, _request):
+        return self.plan
+
+    def transaction_exists(self, _action_id: str) -> bool:
+        return self.existing
+
+    def approval_verified(self, _request, _plan) -> bool:
+        return self.approved
+
+    def replace_pair(self, _request, _plan) -> PairReplacementResult:
+        self.replace_calls += 1
+        return PairReplacementResult(True, phase="completed", revision=19, detail="done")
+
+
+def _request(plan: RestoredPairPlan) -> RestoredPairRecoveryRequest:
+    return RestoredPairRecoveryRequest(
+        issue=plan.issue,
+        lane=plan.lane,
+        journal="102900",
+        action_id=plan.action_id,
+        action_generation=plan.action_generation,
+        allow_pending_composer_loss=True,
+        gateway_assigned_name=plan.gateway.assigned_name,
+        gateway_locator=plan.gateway.locator,
+        gateway_revision=plan.gateway.revision,
+        worker_assigned_name=plan.worker.assigned_name,
+        worker_locator=plan.worker.locator,
+        worker_revision=plan.worker.revision,
+    )
+
+
+class RestoredPairDecisionTests(unittest.TestCase):
+    def test_reboot_restored_pair_with_wrong_cwd_is_approval_ready(self) -> None:
+        plan = _plan(gateway_cwd=False, worker_cwd=False)
+        self.assertTrue(plan.may_recover)
+        self.assertEqual(plan.blocked_reasons, ())
+
+    def test_green_pair_is_not_replaced(self) -> None:
+        plan = _plan(gateway_cwd=True, worker_cwd=True)
+        self.assertFalse(plan.may_recover)
+        self.assertIn(BLOCK_PAIR_HEALTHY, plan.blocked_reasons)
+
+    def test_unreadable_attestation_is_not_bad_generation_proof(self) -> None:
+        plan = _plan()
+        gateway = replace(plan.gateway, attestation_readable=False)
+        plan = replace(plan, gateway=gateway)
+        self.assertIn(BLOCK_ATTESTATION_UNREADABLE, plan.blocked_reasons)
+
+    def test_action_id_changes_when_exact_old_generation_changes(self) -> None:
+        plan = _plan()
+        recycled = replace(
+            plan, worker=replace(plan.worker, locator="pane-w-new", revision="13")
+        )
+        self.assertNotEqual(plan.action_id, recycled.action_id)
+
+
+class RestoredPairUseCaseTests(unittest.TestCase):
+    def test_preflight_renders_exact_owner_approval_and_has_zero_effect(self) -> None:
+        plan = _plan()
+        ops = _Ops(plan)
+        outcome = SublaneRestoredPairRecoveryUseCase(ops).run(_request(plan))
+        self.assertFalse(outcome.executed)
+        self.assertIn(
+            f"gate={RESTORED_PAIR_RECOVERY_APPROVAL_GATE}",
+            outcome.required_approval_marker,
+        )
+        self.assertIn(
+            f"effect={RESTORED_PAIR_RECOVERY_APPROVAL_EFFECT}",
+            outcome.required_approval_marker,
+        )
+        self.assertEqual(ops.replace_calls, 0)
+
+    def test_execute_requires_verified_exact_approval(self) -> None:
+        plan = _plan()
+        ops = _Ops(plan)
+        outcome = SublaneRestoredPairRecoveryUseCase(ops).run(
+            _request(plan), execute=True
+        )
+        self.assertEqual(outcome.status, STATUS_REFUSED)
+        self.assertEqual(ops.replace_calls, 0)
+
+    def test_execute_replaces_pair_once_after_approval(self) -> None:
+        plan = _plan()
+        ops = _Ops(plan)
+        ops.approved = True
+        outcome = SublaneRestoredPairRecoveryUseCase(ops).run(
+            _request(plan), execute=True
+        )
+        self.assertEqual(outcome.status, STATUS_COMPLETED)
+        self.assertEqual(outcome.phase, "completed")
+        self.assertEqual(ops.replace_calls, 1)
+        self.assertFalse(outcome.conversation_resume_guaranteed)
+
+    def test_partial_transaction_may_resume_with_old_generation_pins(self) -> None:
+        plan = _plan()
+        gateway = replace(plan.gateway, inventory_generation_matches=False)
+        partial = replace(plan, gateway=gateway)
+        self.assertIn(BLOCK_PAIR_INCOMPLETE, partial.blocked_reasons)
+        ops = _Ops(partial)
+        ops.existing = True
+        ops.approved = True
+        outcome = SublaneRestoredPairRecoveryUseCase(ops).run(
+            _request(partial), execute=True
+        )
+        self.assertEqual(outcome.status, STATUS_COMPLETED)
+        self.assertEqual(ops.replace_calls, 1)
+
+    def test_partial_transaction_still_refuses_unreadable_attestation_store(self) -> None:
+        plan = _plan()
+        partial = replace(
+            plan,
+            gateway=replace(
+                plan.gateway,
+                inventory_generation_matches=False,
+                attestation_readable=False,
+            ),
+        )
+        ops = _Ops(partial)
+        ops.existing = True
+        ops.approved = True
+        outcome = SublaneRestoredPairRecoveryUseCase(ops).run(
+            _request(partial), execute=True
+        )
+        self.assertEqual(outcome.status, STATUS_REFUSED)
+        self.assertEqual(ops.replace_calls, 0)
+
+
+class RestoredPairApprovalAuthorityTests(unittest.TestCase):
+    def test_gate_has_coordinator_writer_and_exact_design_ruling(self) -> None:
+        self.assertEqual(
+            GATE_RESTORED_PAIR_RECOVERY_OWNER_APPROVAL,
+            RESTORED_PAIR_RECOVERY_APPROVAL_GATE,
+        )
+        self.assertEqual(
+            contract_writer_role(RESTORED_PAIR_RECOVERY_APPROVAL_GATE),
+            ISSUER_COORDINATOR,
+        )
+        self.assertEqual(
+            contract_ruling_pointer(RESTORED_PAIR_RECOVERY_APPROVAL_GATE),
+            RESTORED_PAIR_RECOVERY_APPROVAL_RULING,
+        )
+
+
+class RestoredPairTransactionCompositionTests(unittest.TestCase):
+    def test_live_composition_drives_both_exact_participants_to_completed(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_restored_pair_recovery_live as site,
+        )
+
+        class FakePort:
+            def __init__(self) -> None:
+                self.closed: list[str] = []
+                self.launched: list[str] = []
+                self.verified: list[str] = []
+
+            def observe_old_slot(self, _pin):
+                return OLD_SLOT_PRESENT
+
+            def observe_preservation(self, _pin):
+                return PreservationObservation(
+                    identity_matches=True, attestation_fresh=True
+                )
+
+            def close_exact_generation(self, pin):
+                self.closed.append(pin.assigned_name)
+                return CLOSE_DONE
+
+            def launch_action_bound(self, _action_id, pin):
+                self.launched.append(pin.assigned_name)
+                return LAUNCH_DONE
+
+            def verify_attestation(self, _action_id, pin):
+                self.verified.append(pin.assigned_name)
+                return ATTEST_BOUND
+
+        class FakeRoleOps:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def resume_lane_authority(self, _request):
+                return True
+
+            def lane_free_of_live_process(self, _request):
+                return True
+
+            def replacement_store_admission(self, _key, _pin):
+                return None
+
+        plan = _plan()
+        request = _request(plan)
+        fake_port = FakePort()
+        with TemporaryDirectory() as temp:
+            store = ReplacementTransactionStore(path=Path(temp) / "replacement.sqlite")
+            ops = site.LiveRestoredPairRecoveryOps(
+                repo_root=Path(temp), transaction_store=store
+            )
+            with (
+                mock.patch.object(
+                    site,
+                    "plan_participants_with_evidence",
+                    side_effect=lambda pins, **_kwargs: EvidencePlanning(
+                        participants=tuple(pins)
+                    ),
+                ),
+                mock.patch.object(
+                    site, "LiveRecoveryActuatorPort", return_value=fake_port
+                ),
+                mock.patch.object(
+                    site, "LiveStaleWorkerRecoveryOps", FakeRoleOps
+                ),
+            ):
+                outcome = ops.replace_pair(request, plan)
+
+            self.assertTrue(outcome.completed, outcome.detail)
+            self.assertEqual(outcome.phase, "completed")
+            self.assertCountEqual(
+                fake_port.closed,
+                [plan.gateway.assigned_name, plan.worker.assigned_name],
+            )
+            self.assertCountEqual(fake_port.launched, fake_port.closed)
+            self.assertCountEqual(fake_port.verified, fake_port.closed)
+            record = store.get(
+                ReplacementTransactionKey(plan.workspace_id, plan.action_id)
+            )
+            self.assertIsNotNone(record)
+            assert record is not None
+            self.assertEqual(record.phase, "completed")
+            self.assertEqual(record.lease_holder, "")
+
+
+if __name__ == "__main__":
+    unittest.main()

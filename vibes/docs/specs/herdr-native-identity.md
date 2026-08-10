@@ -115,7 +115,12 @@ resolver はこれを fail-closed に読む。
   subprocess への伝播を証明しないため、send 直前の `resolve_sender_identity(os.environ, ...)` は hard
   gate のまま残る (env-less shell は依然 `missing_sender_env` で fail-closed)。record 不在/世代不一致
   (stale)/`missing`/`conflict` の adopt は fail-closed し、**owner 承認の close + same-slot relaunch** を
-  next action として返す (自動 destructive repair を行わない)。真の暗号学的 attestation
+  next action として返す (自動 destructive repair を行わない)。active issue-owned sublane の
+  gateway/worker pair については `sublane recover-restored-pair` がその公開 rail であり、startup
+  attestation が green でも live inventory の CWD が canonical worktree と違えば同じ repair
+  対象になる。これは startup record が tool-exec subprocess の CWD/env 伝播を証明しないためで
+  ある。正確な preflight/approval/replay 契約は `vibes/docs/tasks/herdr-lane-operations.md`
+  「再起動復元後の active sublane pair を作り直す」を正本とする。真の暗号学的 attestation
   (nonce / challenge-response) の導入は別 US 判断であり本節の範囲外。
 
 - **startup attestation は lane epoch へ bind する (Redmine #14756)。** #13637 の record は

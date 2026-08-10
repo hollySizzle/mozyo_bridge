@@ -4057,6 +4057,16 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
     #: The trade is stated in ``test_no_module_shape_can_hide_a_capability_from_a_wildcard_consumer``:
     #: over-detection costs a declaration line, a missed reader costs a silent gate.
     INHERITED = {
+        f"{_D}/application/sublane_restored_pair_recovery.py": (
+            ['*'],
+            "inherits the recovery owner-approval marker capability through the exact marker "
+            "renderer; it renders the preflight marker but does not parse durable notes",
+        ),
+        f"{_D}/application/sublane_restored_pair_recovery_live.py": (
+            ['*'],
+            "inherits the recovery owner-approval marker capability through the live verifier; "
+            "the shared verifier requires exactly one canonical marker and refuses ambiguity",
+        ),
         f"{_D}/application/coordinator_proxy_send.py": (
             ['workflow-event'],
             "inherits via a used import of coordinator_proxy_decision; names no marker token "

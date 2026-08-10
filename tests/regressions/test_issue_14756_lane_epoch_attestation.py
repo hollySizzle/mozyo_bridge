@@ -1391,6 +1391,7 @@ class ThePreCloseFenceIsActuallyArmedOnEveryReplacementPath(unittest.TestCase):
         "sublane_stale_worker_recovery.py": "store_admission=self._ops.replacement_store_admission",
         "sublane_worker_refresh.py": "store_admission=self._ops.replacement_store_admission",
         "sublane_gateway_recovery.py": "store_admission=self._ops.replacement_store_admission",
+        "sublane_restored_pair_recovery_live.py": "store_admission=lambda action_key, pin",
         "sublane_vanished_gateway_recovery_live.py": "store_admission=store_admission",
         "self_close_executor.py": "store_admission=self._store_admission",
     }
