@@ -397,6 +397,15 @@ class CleanupAuthoritySplitTests(unittest.TestCase):
                 popen_factory=lambda argv, **kwargs: server,
                 sleeper=lambda _seconds: None,
                 ambient_env={},
+                # The stand-in server is a `sleep(30)` child and `server stop` is a
+                # recording stub, so the graceful phase of `shutdown()` waits for an
+                # exit that CANNOT happen and then escalates -- at the 10.0s default
+                # this one test spent 10s of wall clock inside cleanup (#15229).
+                # Shortened through the production seam, not by weakening the
+                # contract: the child is still required to be live while the worker
+                # probes it (asserted below), and shutdown still runs graceful ->
+                # terminate -> kill. Only the wait for the impossible exit is small.
+                shutdown_timeout=0.5,
             )
             instance.start()
             self.addCleanup(instance.shutdown)
