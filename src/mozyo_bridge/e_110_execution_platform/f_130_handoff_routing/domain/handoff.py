@@ -110,7 +110,8 @@ class QueueEnterRetryPolicy:
     """Resolved Enter-only retry policy for the `queue-enter` rail.
 
     ``max_retries`` counts additional Enter presses; the body is never retyped.
-    Non-finite or sub-millisecond values disable additional Enter presses.
+    Non-finite/non-positive values disable retries. Tmux accepts any positive float;
+    the Herdr rail enforces its integer-millisecond bound.
     """
 
     window_seconds: float
@@ -119,11 +120,7 @@ class QueueEnterRetryPolicy:
     @property
     def max_retries(self) -> int:
         values = (self.window_seconds, self.interval_seconds)
-        if (
-            not all(math.isfinite(value) for value in values)
-            or self.window_seconds < 0.001
-            or self.interval_seconds < 0.001
-        ):
+        if not all(math.isfinite(value) for value in values) or min(values) <= 0:
             return 0
         return int(self.window_seconds // self.interval_seconds)
 

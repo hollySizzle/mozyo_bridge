@@ -68,14 +68,25 @@ def armed_wait_observation() -> dict:
     canonical v2 generation binding is present, which is what proves the receiver
     process did not change across the observation window.
     """
+    assigned_name = "mzb1_ws_codex_lane"
+    terminal_id = "terminal-w1B-p1D"
+    locator = "w1B:p1D"
+    revision = "7"
     return {
         "observation_version": 2,
         "event_wait_kind": "changed",
+        "baseline_runtime_state": "turn_ended",
         "gateway_binding": {
             "provider": "codex",
-            "assigned_name": "codex-gateway",
-            "locator": "w1B:p1D",
-            "row_revision": "7",
+            "assigned_name": assigned_name,
+            "locator": locator,
+            "terminal_id": terminal_id,
+            "row_revision": revision,
+            "process_generation": (
+                f"{len(assigned_name)}:{assigned_name}:"
+                f"{len(terminal_id)}:{terminal_id}:"
+                f"{len(locator)}:{locator}:r{revision}"
+            ),
             "attestation_observed_at": "2026-08-10T05:00:00Z",
             "startup_action_id": "startup-abc123",
         },
@@ -894,6 +905,69 @@ class ApplyDeliveryTests(unittest.TestCase):
         self.assertNotIn("%1075", rendered)
         self.assertNotIn("/srv/checkouts", rendered)
 
+    def test_response_mode_must_match_the_requested_mode(self) -> None:
+        # A stale/other-mode host answer cannot grant success to this request.
+        # The command ran, so the fail-closed answer is uncertain rather than a
+        # zero-send refusal.
+        for label, outcome in (
+            ("missing", '{"status":"sent","reason":"ok"}'),
+            ("standard", delivery_record(mode="standard")),
+            ("pending", delivery_record(mode="pending")),
+        ):
+            with self.subTest(mode=label):
+                action, runtime, _ = rail(answers({GATEWAY_ARGS: outcome}))
+                unit_id = remote_unit_id(runtime)
+
+                result = action.apply(action.preview(request(unit_id)))
+
+                self.assertEqual(result.state, ACTION_UNCERTAIN)
+                self.assertEqual(result.injection_stage, STAGE_UNCERTAIN_PARTIAL)
+
+    def test_carried_queue_success_without_current_causal_proof_is_uncertain(self) -> None:
+        raw = delivery_record(observation=None).splitlines()[-1]
+        payload = json.loads(raw)
+        payload["injection_stage"] = {"stage": STAGE_SUBMITTED_CONFIRMED}
+        action, runtime, _ = rail(
+            answers({GATEWAY_ARGS: json.dumps(payload)})
+        )
+        unit_id = remote_unit_id(runtime)
+
+        result = action.apply(action.preview(request(unit_id)))
+
+        self.assertEqual(result.state, ACTION_UNCERTAIN)
+        self.assertEqual(result.injection_stage, STAGE_UNCERTAIN_PARTIAL)
+
+    def test_explicit_malformed_carried_stage_never_falls_back_to_success(self) -> None:
+        raw = delivery_record().splitlines()[-1]
+        for malformed in ({"stage": "bogus"}, {}, "submitted_confirmed"):
+            with self.subTest(carried=malformed):
+                payload = json.loads(raw)
+                payload["injection_stage"] = malformed
+                action, runtime, _ = rail(
+                    answers({GATEWAY_ARGS: json.dumps(payload)})
+                )
+                unit_id = remote_unit_id(runtime)
+
+                result = action.apply(action.preview(request(unit_id)))
+
+                self.assertEqual(result.state, ACTION_UNCERTAIN)
+                self.assertEqual(
+                    result.injection_stage, STAGE_UNCERTAIN_PARTIAL
+                )
+
+    def test_pending_mode_cannot_claim_a_confirmed_submission(self) -> None:
+        action, runtime, _ = rail(
+            answers({GATEWAY_ARGS: delivery_record(mode="pending")})
+        )
+        unit_id = remote_unit_id(runtime)
+
+        result = action.apply(
+            action.preview(request(unit_id, delivery_mode="pending"))
+        )
+
+        self.assertEqual(result.state, ACTION_UNCERTAIN)
+        self.assertEqual(result.injection_stage, STAGE_UNCERTAIN_PARTIAL)
+
     def test_output_after_the_outcome_line_is_not_ignored(self) -> None:
         # The contract picks the LAST line; scanning past it for something
         # parseable would let a stale success survive whatever followed it.
@@ -902,10 +976,16 @@ class ApplyDeliveryTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            _gateway_injection_stage(delivery_record()), STAGE_SUBMITTED_CONFIRMED
+            _gateway_injection_stage(
+                delivery_record(), expected_mode=MODE_QUEUE_ENTER
+            ),
+            STAGE_SUBMITTED_CONFIRMED,
         )
-        good = '{"status": "sent", "reason": "ok"}'
-        self.assertEqual(_gateway_injection_stage(good), STAGE_SUBMITTED_CONFIRMED)
+        good = delivery_record().splitlines()[-1]
+        self.assertEqual(
+            _gateway_injection_stage(good, expected_mode=MODE_QUEUE_ENTER),
+            STAGE_SUBMITTED_CONFIRMED,
+        )
         for name, tail in (
             ("another object", '{"receipt": "later"}'),
             ("malformed", "{bad}"),
@@ -915,7 +995,9 @@ class ApplyDeliveryTests(unittest.TestCase):
         ):
             with self.subTest(trailing=name):
                 self.assertEqual(
-                    _gateway_injection_stage(good + "\n" + tail),
+                    _gateway_injection_stage(
+                        good + "\n" + tail, expected_mode=MODE_QUEUE_ENTER
+                    ),
                     STAGE_UNCERTAIN_PARTIAL,
                 )
 

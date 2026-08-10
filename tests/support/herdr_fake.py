@@ -273,6 +273,7 @@ class FakeHerdr:
         name: str,
         *,
         workspace_id: str,
+        logical_name: "str | None" = None,
         provider: str = "",
         status: str = DEFAULT_START_STATUS,
         cwd: str = "",
@@ -284,6 +285,8 @@ class FakeHerdr:
 
         Seeds the live inventory the way a prior ``agent start`` would have, so a
         scenario can stand up an existing lane slot without replaying its launch.
+        ``logical_name`` lets a modern fixture seed Herdr's short native name while
+        preserving the durable mzb1 identity restored by the production lister.
         ``revision`` / ``detected_agent`` pin the richer ``agent list`` row fields a
         recover-stale generation gate / shell-residue classification reads; both default to
         the legacy minimal shape (field absent). ``tab_id`` lets a scenario seed the Herdr 0.8
@@ -300,7 +303,7 @@ class FakeHerdr:
             ws.pane_tab[pane_id] = tab_id
         self._agents[pane_id] = _Agent(
             name=name,
-            logical_name=name,
+            logical_name=name if logical_name is None else logical_name,
             pane_id=pane_id,
             workspace_id=workspace_id,
             terminal_id=f"terminal-{pane_id}",
@@ -573,6 +576,7 @@ class FakeHerdr:
             workspace_id=ws.workspace_id,
             terminal_id=f"terminal-{pane_id}",
             provider=parsed.provider,
+            detected_agent=parsed.provider,
             cwd=parsed.cwd,
             tab_id=parsed.tab_id,
             launch_argv=parsed.launch_argv,

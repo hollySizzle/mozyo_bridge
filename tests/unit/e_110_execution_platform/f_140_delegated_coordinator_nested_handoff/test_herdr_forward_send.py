@@ -611,8 +611,8 @@ class CallbackTransportOutcomeBoundaryTest(unittest.TestCase):
         The queue-enter rail resolves a landed marker to ``ok`` WITHOUT running any turn-start
         gate, so completing a forward generation on it would forward again while the previous
         consultation is still unanswered — precisely what this boundary exists to prevent. Only
-        positive evidence (the post-choreography snapshot seeing the receiver actually
-        producing a turn) confirms it.
+        positive evidence (an armed transition under one terminal-bound generation)
+        confirms it.
         """
         import argparse as _ap
         from mozyo_bridge.application.commands import delivery_was_positive
@@ -626,9 +626,28 @@ class CallbackTransportOutcomeBoundaryTest(unittest.TestCase):
             if causal:
                 # Review j#95601: the armed working-transition wait, published by the rail
                 # only under a coherent generation — the one causally attributable signal.
+                assigned_name = "mzb1_ws_codex_lane"
+                terminal_id = "terminal-2"
+                locator = "%2"
+                revision = "1"
                 observation.update(
-                    event_wait_kind="changed", observation_version=2,
-                    gateway_binding={"provider": "codex", "assigned_name": "mzb1_ws_codex_lane", "locator": "%2", "row_revision": "1", "attestation_observed_at": "2026-07-29T20:10:01+00:00", "startup_action_id": "startup-abc"},
+                    event_wait_kind="changed",
+                    observation_version=2,
+                    baseline_runtime_state="turn_ended",
+                    gateway_binding={
+                        "provider": "codex",
+                        "assigned_name": assigned_name,
+                        "locator": locator,
+                        "terminal_id": terminal_id,
+                        "row_revision": revision,
+                        "process_generation": (
+                            f"{len(assigned_name)}:{assigned_name}:"
+                            f"{len(terminal_id)}:{terminal_id}:"
+                            f"{len(locator)}:{locator}:r{revision}"
+                        ),
+                        "attestation_observed_at": "2026-07-29T20:10:01+00:00",
+                        "startup_action_id": "startup-abc",
+                    },
                 )
             args = _ap.Namespace()
             args.delivery_outcome = self._mk_outcome(

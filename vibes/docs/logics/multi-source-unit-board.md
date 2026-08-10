@@ -301,13 +301,16 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   exit status は confirmation を **撤回することはできるが付与はできない**: 構造化 outcome が
   `submitted_confirmed` でも non-zero exit なら矛盾として `uncertain_partial` へ落とす。
   `not_sent` は対象 gateway が **pre-injection で拒否した**と構造化 outcome が述べている場合に限る。
-- **gateway record は producer が導出した `injection_stage` を運ぶ。** 単一行 JSON は
-  `asdict(DeliveryOutcome)` であり、`mode` と producer が **full context** で導出した
-  `injection_stage` を含む。共有 authority はこの carried 値を優先するため、queue-enter carve-out
-  （turn-start 未確認の `blocked` outcome、または busy-only evidence は confirmed ではない）が host 境界を
-  越えても正しく解決する。host は queue 専用 `queue_enter_turn_start_observation` / delivery-ledger rail を
-  保ち、standard `turn_start_outcome` へ射影しない。
-  test fixture もこの形状を **実 producer** から生成し、wire と食い違わせない。
+- **gateway record は producer が導出した `injection_stage` を運ぶが、client は無条件には信頼しない。**
+  単一行 JSON は `asdict(DeliveryOutcome)` であり、`mode` と producer が **full context** で導出した
+  `injection_stage` を含む。host 境界では request の mode と response の `mode` が byte-exact に一致することを
+  必須とし、欠落・別modeは command 実行済みの `uncertain_partial` とする。さらに carried stage を現在の
+  wire fieldから共有 `injection_stage` authorityで再導出した stageと照合し、矛盾も `uncertain_partial` に落とす。
+  queue-enter の confirmation は canonical causal-v2 `queue_enter_turn_start_observation` だけを使い、standard
+  `turn_start_outcome` を借りない。これにより旧host・途中version・壊れたrecordが carried
+  `submitted_confirmed` だけで成功へ昇格しない。host は queue 専用 observation / delivery-ledger rail を保ち、
+  standard `turn_start_outcome` へ射影しない。test fixture もこの形状を **実 producer** から生成し、wire と
+  食い違わせない。
 - **結果は 3 分岐であり、2 分岐へ畳まない（#15198）。** 共有 authority の
   `not_sent` / `uncertain_partial` / `submitted_confirmed` をそのまま result state へ対応させる。
   未確認を成功にも非送達にも読み替えない — 前者は誰も読んでいない request を closed にし、

@@ -294,7 +294,8 @@ def cmd_herdr_unit_board_action(args: argparse.Namespace) -> int:
     """Preview — and only with ``--apply`` deliver — one remote Unit action.
 
     Three exits, because the delivery has three answers (Redmine #15198): ``0``
-    confirmed, ``1`` refused with nothing sent, ``3`` sent but unconfirmed.
+    confirmed, ``1`` refused with nothing sent, ``3`` submission unconfirmed after
+    sending began (body and/or Enter may have reached the receiver).
     Folding ``3`` into ``1`` would tell an automated caller that a retry is free
     at exactly the moment it is not.
     """
@@ -522,7 +523,8 @@ def register_herdr_unit_board_parser(herdr_sub) -> None:
             "repository identity, and sends nothing if any of them changed. "
             "Delivery takes the same rail as an ordinary agent handoff and is "
             "judged by the shared injection-stage authority: exit 0 confirmed, "
-            "1 refused with nothing sent, 3 sent but unconfirmed (do not "
+            "1 refused with nothing sent, 3 submission unconfirmed after sending "
+            "began (body and/or Enter may have reached; do not "
             "blind-retry a 3 — read the target environment's durable record)."
         ),
     )

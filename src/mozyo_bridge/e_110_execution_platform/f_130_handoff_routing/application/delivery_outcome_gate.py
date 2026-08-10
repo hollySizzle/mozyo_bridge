@@ -54,10 +54,9 @@ def publish_delivery_outcome(args: argparse.Namespace, outcome) -> None:
 def delivery_was_positive(args: argparse.Namespace) -> bool:
     """True only when the last ``orchestrate_handoff`` on ``args`` **positively delivered**.
 
-    Positive delivery is the structured ``status="sent"`` **and** ``reason="ok"`` (landing marker
-    observed). ``pending_input`` (body typed, Enter never pressed — it carries ``reason="ok"``, so
-    the status is what disqualifies it), a marker-unobserved ``queue_enter``, a blocked outcome, and
-    an **absent** outcome (an early return, or a caller that never sent) are all ``False``.
+    Positive delivery requires a structured outcome classified as submitted and confirmed.
+    ``pending_input`` (body typed, Enter never pressed), a marker-unobserved ``queue_enter``, a
+    blocked outcome, and an **absent** outcome are all ``False``.
     """
     outcome = getattr(args, DELIVERY_OUTCOME_ATTR, None)
     if outcome is None:
@@ -66,11 +65,10 @@ def delivery_was_positive(args: argparse.Namespace) -> bool:
     # two tokens locally, so this gate and the callback / outbox retry authority can no longer
     # answer "was it delivered?" differently.
     #
-    # Review j#95333 F1: read the WHOLE outcome, not the two tokens. A marker-observed
-    # ``queue-enter`` send also reports ``sent`` / ``ok``, but that rail runs no turn-start
-    # gate — so the tokens alone would let this predicate confirm a delivery whose own
-    # telemetry says the receiver never started a turn. That is a stricter reading of the same
-    # predicate, in the same fail-closed direction #13583 chose for ``queue_enter``.
+    # Review j#95333 F1: read the WHOLE outcome, not the two tokens. A tmux, legacy, or
+    # synthetic ``queue-enter`` outcome can report ``sent`` / ``ok`` without causal
+    # turn-start evidence. The Herdr rail now supplies that evidence and fails closed when
+    # it cannot. The shared classifier keeps both cases safe.
     return injection_stage_for_outcome(outcome) == STAGE_SUBMITTED_CONFIRMED
 
 

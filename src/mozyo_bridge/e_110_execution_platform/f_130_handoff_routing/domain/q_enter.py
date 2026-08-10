@@ -489,10 +489,11 @@ class SubmitOutcome:
 
         Redmine #14232 review j#95333 F1: this takes the whole
         :class:`...handoff.DeliveryOutcome`, not its two wire tokens. ``sent`` / ``ok`` is
-        ambiguous across rails — the marker-observed ``queue-enter`` cell reports it without
-        running any turn-start gate — so a two-token derivation confirmed deliveries the
-        outcome's own telemetry contradicted. ``outcome`` is ``None`` when the rail returned no
-        structured outcome at all (an early return, or a caller that never sent), which the
+        ambiguous across rails — tmux, legacy, or synthetic ``queue-enter`` outcomes can report
+        it without causal turn-start evidence — so a two-token derivation confirmed deliveries
+        the outcome's own telemetry contradicted. Herdr now requires the evidence. ``outcome`` is
+        ``None`` when the rail returned no structured outcome at all (an early return, or a
+        caller that never sent), which the
         authority fails closed to ``uncertain_partial``: the front door must not claim a
         delivery it cannot see.
 

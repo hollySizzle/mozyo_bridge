@@ -174,6 +174,10 @@ class _HealthySlot:
         self.provider = provider
         self.outcome = "launched"
         self.detail = ""
+        # The real SlotResult now carries the terminal identity captured from
+        # this launch's own agent_started receipt.  Startup-health preserves it
+        # while composing evidence; this fixture must model the same shape.
+        self.launch_terminal_id = f"terminal-{locator}"
 
 
 class EvidenceGateCompositionTest(unittest.TestCase):

@@ -379,7 +379,11 @@ class ActionTests(unittest.TestCase):
         self.assertNotIn("--mode standard", command)
 
     def test_an_explicit_strict_rail_is_still_selectable(self) -> None:
-        wiring = _Wiring()
+        wiring = _Wiring(
+            answer_map=answers(
+                {GATEWAY_ARGS: delivery_record(mode="standard")}
+            )
+        )
         with wiring:
             code, _, _ = self._apply(wiring, "--delivery-mode", "standard")
 

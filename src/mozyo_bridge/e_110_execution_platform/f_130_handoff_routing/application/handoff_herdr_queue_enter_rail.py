@@ -398,12 +398,31 @@ class HerdrQueueEnterSession:
             "queue-enter safety evidence expired before the Enter send effect"
         )
 
+    def _require_retry_effect_boundary_ready(
+        self, armed: Optional[object]
+    ) -> None:
+        """Repeat the complete resend proof at the final retry effect boundary."""
+        gate = self._evaluate_resend_gate()
+        if not gate.allowed:
+            self._cancel(armed)
+            self.resend_skipped_reason = gate.skip_reason
+            raise QueueEnterEffectFenceRefused(
+                "queue-enter resend proof changed before the Enter send effect"
+            )
+        # Only the post-verifier state may be paired with this retry's event.
+        self.causal_state = gate.runtime_state
+        self._require_effect_boundary_ready(armed)
+
     @contextmanager
-    def enter_effect_boundary(self, armed: Optional[object]) -> Iterator[None]:
+    def enter_effect_boundary(
+        self, armed: Optional[object], *, retry: bool = False
+    ) -> Iterator[None]:
         """Bind this Enter's final live fence around its transport call."""
-        with queue_enter_effect_fence(
-            lambda: self._require_effect_boundary_ready(armed)
-        ):
+        if retry:
+            check = lambda: self._require_retry_effect_boundary_ready(armed)
+        else:
+            check = lambda: self._require_effect_boundary_ready(armed)
+        with queue_enter_effect_fence(check):
             yield
 
     def arm_before_first_enter(self) -> bool:
@@ -611,7 +630,7 @@ class HerdrQueueEnterSession:
                 return
 
             try:
-                with self.enter_effect_boundary(rearmed):
+                with self.enter_effect_boundary(rearmed, retry=True):
                     press_extra_enter()
             except QueueEnterEffectFenceRefused:
                 self._cancel(rearmed)
@@ -623,7 +642,6 @@ class HerdrQueueEnterSession:
             resends += 1
             self.retry_engaged = True
             self.last_enter_at = self.monotonic()
-            self.causal_state = gate.runtime_state
             armed = rearmed
 
     @property

@@ -788,6 +788,55 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         enters = [op for op in herdr.sends if op[0] == "send_keys"]
         self.assertEqual(len(enters), 1, msg=herdr.sends)
 
+    def test_project_gateway_queue_rechecks_full_gate_after_retry_verifier(self) -> None:
+        target = "wT:pT"
+
+        def drift_after_retry_gate(fake, list_calls):
+            # The fourth list reads the already-snapshotted identity for the
+            # retry's project-gateway verifier. Change only the later pane/state
+            # proof so the final effect fence must catch the drift.
+            if list_calls == 4:
+                fake._read_returns_body = False
+                fake._pane_content = TRUST_SCREEN
+                fake._get_states = ["blocked"]
+                fake._get_calls = 0
+
+        herdr = _FakeHerdr(
+            [],
+            get_states=["idle", "idle"],
+            wait_results=[(1, "timed out"), (0, "")],
+            read_returns_body=True,
+            after_agent_list=drift_after_retry_gate,
+        )
+        result, herdr, _ws, out, err = self._run(
+            agent_rows_fn=_project_gateway_rows(target),
+            herdr=herdr,
+            set_sender_env=False,
+            mode="queue-enter",
+            receiver="codex",
+            proxy_target_locator=target,
+            extra_argv=[
+                "--queue-enter-retry-window", "1",
+                "--queue-enter-retry-interval", "0.001",
+            ],
+            queue_binding=lambda ws: _project_queue_binding(ws, target),
+            project_gateway_capability=True,
+        )
+
+        self.assertNotEqual(result, 0, msg=f"out={out}\nerr={err}")
+        outcome = _outcome_from(out)
+        self.assertEqual(outcome.get("reason"), "turn_start_unconfirmed", msg=out)
+        self.assertEqual(
+            outcome["queue_enter_turn_start_observation"]["enter_attempts"], 1
+        )
+        self.assertIn("pressed Enter 1 time(s)", err)
+        self.assertEqual(
+            len([op for op in herdr.sends if op[0] == "send_text"]), 1
+        )
+        self.assertEqual(
+            len([op for op in herdr.sends if op[0] == "send_keys"]), 1
+        )
+
     def test_project_gateway_standard_refuses_revision_drift_before_body(self) -> None:
         target_locator = "wT:pT"
 
@@ -1291,7 +1340,8 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         outcome = _outcome_from(out)
         self.assertEqual(outcome.get("status"), "sent", msg=out)
         self.assertEqual(outcome.get("reason"), "ok", msg=out)
-        self.assertEqual(gate_spy.call_count, 1)
+        # Once after re-arming and once again at the raw Enter effect boundary.
+        self.assertEqual(gate_spy.call_count, 2)
 
         send_texts = [op for op in herdr.sends if op[0] == "send_text"]
         waits = [op for op in herdr.sends if op[0] == "wait"]

@@ -533,6 +533,24 @@ class TmuxTransportRailQueueEnterTest(unittest.TestCase):
         self.assertEqual(retry.enter_attempts, 4)
         self.assertFalse(retry.marker_observed)
 
+    def test_tmux_keeps_small_positive_retry_values(self) -> None:
+        # Redmine #15242: Herdr rounds wait budgets to integer milliseconds,
+        # but tmux's established marker rail accepts positive float values.
+        # The Herdr-only minimum must not erase tmux's additional Enter.
+        ops = _FakeOps(marker_observed=False, captures=["", "[[mk-1]]"])
+        code, died = _run(
+            ops,
+            _request(
+                mode=_MODE_QUEUE_ENTER,
+                queue_enter_retry_window=0.002,
+                queue_enter_retry_interval=0.0005,
+            ),
+        )
+        self.assertIsNone(died)
+        self.assertEqual(code, 0)
+        self.assertEqual(ops.enter_presses, 2)
+        self.assertEqual(ops.emitted[0].outcome.reason, "ok")
+
     def test_retry_disabled_when_marker_observed(self) -> None:
         # Even with a policy window, an observed marker never engages the retry loop.
         ops = _FakeOps(marker_observed=True)

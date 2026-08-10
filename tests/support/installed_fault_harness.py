@@ -608,6 +608,12 @@ class InstalledFaultHarness:
             StartupTransactionFence,
             StartupUnit,
         )
+        from mozyo_bridge.core.state.herdr_native_identity_binding import (
+            HerdrNativeIdentityBindingStore,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
+            pane_bound_receipt,
+        )
 
         fence = StartupTransactionFence(home=self.home)
         unit = StartupUnit(workspace_id=self.workspace_id, lane_id=lane_id, providers=providers)
@@ -618,12 +624,28 @@ class InstalledFaultHarness:
         locators: dict[str, str] = {}
         for role in providers:
             name = encode_assigned_name(self.workspace_id, role, lane_id)
+            binding = HerdrNativeIdentityBindingStore(home=self.home).bind(name)
             locator = self.fake.seed_agent(
-                name, workspace_id=self._ws, provider=role, status=status
+                binding.native_name,
+                workspace_id=self._ws,
+                logical_name=name,
+                provider=role,
+                status=status,
+                detected_agent=role,
             )
             fence.record_participant(
                 action.action_id,
-                Participant(role=role, assigned_name=name, locator=locator, receipt=locator),
+                Participant(
+                    role=role,
+                    assigned_name=name,
+                    locator=locator,
+                    receipt=pane_bound_receipt(
+                        target_workspace=self._ws,
+                        target_tab=f"{self._ws}:t1",
+                        native_name=binding.native_name,
+                        terminal_id=self.fake.terminal_id_of(locator),
+                    ),
+                ),
             )
             locators[role] = locator
             self._locators[name] = locator

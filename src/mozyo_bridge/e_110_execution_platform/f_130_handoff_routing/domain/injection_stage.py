@@ -445,10 +445,10 @@ def injection_stage_for(
     - on ``--mode standard`` the rail *verified a turn start* before resolving to ``ok`` (the
       capture-based observation, or the herdr event rail's ``started``), so it is a genuine
       confirmed submission;
-    - on the daily-default ``queue-enter`` rail ``ok`` only means **the landing marker was
-      observed and Enter was pressed** — that rail deliberately runs no turn-start gate
-      (its snapshot is additive telemetry). A receiver whose composer took the text but whose
-      Enter was absorbed reports exactly this outcome.
+    - on the tmux ``queue-enter`` rail ``ok`` only means **the landing marker was observed and
+      Enter was pressed**; tmux has no causal turn-start gate. The Herdr ``queue-enter`` rail
+      now requires causal turn-start evidence and otherwise fails closed. Older or synthetic
+      outcomes without that evidence remain unconfirmed.
 
     Reading ``ok`` as confirmed on queue-enter was therefore the same optimistic
     delivered-ization the issue's Non-goals prohibit, in a second place: it claimed a

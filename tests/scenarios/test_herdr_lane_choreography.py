@@ -87,6 +87,9 @@ from mozyo_bridge.core.state.startup_transaction_fence import (
     StartupUnit,
 )
 from mozyo_bridge.core.state.herdr_native_identity_binding import native_name_for
+from mozyo_bridge.core.state.herdr_native_identity_binding import (
+    HerdrNativeIdentityBindingStore,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_dispatch_herdr_ops import (  # noqa: E501
     HerdrWorkerDispatchOps,
 )
@@ -257,10 +260,16 @@ class _Finding1World:
             workspace_id=ws,
             provider="codex",
         )
+        worker_name = encode_assigned_name(self.workspace_id, "claude", LANE)
+        worker_binding = HerdrNativeIdentityBindingStore(home=self.home).bind(
+            worker_name
+        )
         self.worker_locator = self.fake.seed_agent(
-            encode_assigned_name(self.workspace_id, "claude", LANE),
+            worker_binding.native_name,
             workspace_id=ws,
+            logical_name=worker_name,
             provider="claude",
+            detected_agent="claude",
         )
         self._seed_worker_launch_authority()
         self.runner = _ScenarioRunner(self.fake, self.herdr_bin)

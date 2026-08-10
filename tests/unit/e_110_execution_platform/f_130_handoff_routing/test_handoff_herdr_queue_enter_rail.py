@@ -296,6 +296,7 @@ def _drive(session: HerdrQueueEnterSession, ops: _FakeOps) -> _DriveResult:
     extra_enter_times: list[float] = []
 
     def _press_extra_enter() -> None:
+        enforce_active_queue_enter_effect_fence()
         ops.events.append("enter:retry")
         extra_enter_times.append(ops.clock())
 
@@ -540,6 +541,53 @@ class QueueEnterGenerationFenceTest(unittest.TestCase):
 
 
 class QueueEnterCausalLoopTest(unittest.TestCase):
+    def test_retry_rechecks_full_gate_at_final_effect_boundary(self) -> None:
+        clock = _ManualClock()
+        ops = _FakeOps(
+            clock,
+            wait_kinds=[WAIT_TIMEOUT, WAIT_CHANGED],
+            collect_advances=[2.0, 0.0],
+            gates=[
+                QueueEnterResendGate(RESEND_SKIP_NONE, "turn_ended"),
+                QueueEnterResendGate(RESEND_SKIP_BODY_ABSENT),
+            ],
+        )
+        session = _session(ops, clock)
+        self.assertTrue(session.capture_before_body())
+        self.assertTrue(session.arm_before_first_enter())
+        session.note_first_enter_sent()
+        sent: list[float] = []
+
+        def guarded_send() -> None:
+            enforce_active_queue_enter_effect_fence()
+            sent.append(clock())
+
+        session.complete_after_first_enter(press_extra_enter=guarded_send)
+
+        self.assertEqual(sent, [])
+        self.assertEqual(session.enter_attempts, 1)
+        self.assertEqual(session.resend_skipped_reason, RESEND_SKIP_BODY_ABSENT)
+        self.assertEqual(len(ops.gate_calls), 2)
+
+    def test_retry_uses_final_gate_state_as_causal_baseline(self) -> None:
+        clock = _ManualClock()
+        ops = _FakeOps(
+            clock,
+            wait_kinds=[WAIT_TIMEOUT, WAIT_CHANGED],
+            collect_advances=[2.0, 0.0],
+            gates=[
+                QueueEnterResendGate(RESEND_SKIP_NONE, "turn_ended"),
+                QueueEnterResendGate(RESEND_SKIP_NONE, "busy"),
+            ],
+        )
+        session = _session(ops, clock)
+
+        result = _drive(session, ops)
+
+        self.assertEqual(result.extra_enter_times, (2.0,))
+        self.assertFalse(session.causal_start_confirmed)
+        self.assertEqual(session.causal_state, "busy")
+
     def test_wait_settled_inside_retry_adapter_io_is_zero_extra_enter(self) -> None:
         clock = _ManualClock()
         ops = _FakeOps(
@@ -618,7 +666,7 @@ class QueueEnterCausalLoopTest(unittest.TestCase):
                 self.assertTrue(result.first_enter_sent)
                 self.assertEqual(result.extra_enter_times, (2.0, 4.0))
                 self.assertEqual(session.enter_attempts, 3)
-                self.assertEqual(len(ops.gate_calls), 2)
+                self.assertEqual(len(ops.gate_calls), 4)
                 self.assertEqual(len(ops.arm_calls), 3)
                 self.assertEqual(
                     [timeout for _target, timeout in ops.arm_calls],
@@ -626,7 +674,7 @@ class QueueEnterCausalLoopTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     [call[1:] for call in ops.gate_calls],
-                    [(TEXT, RECEIVER, _GENERATION_A)] * 2,
+                    [(TEXT, RECEIVER, _GENERATION_A)] * 4,
                 )
                 self.assertFalse(hasattr(ops, "inject_body"))
                 self.assertFalse(hasattr(ops, "send_text"))
@@ -709,7 +757,10 @@ class QueueEnterCausalLoopTest(unittest.TestCase):
             states=["turn_ended"],
             wait_kinds=[WAIT_TIMEOUT, WAIT_CHANGED],
             collect_advances=[2.0, 0.0],
-            gates=[QueueEnterResendGate(RESEND_SKIP_NONE, "busy")],
+            gates=[
+                QueueEnterResendGate(RESEND_SKIP_NONE, "busy"),
+                QueueEnterResendGate(RESEND_SKIP_NONE, "busy"),
+            ],
         )
         session = _session(ops, clock)
 
@@ -864,7 +915,9 @@ class QueueEnterCausalLoopTest(unittest.TestCase):
                 self.assertEqual(
                     session.enter_attempts, 1 + prior_timeout_retries
                 )
-                self.assertEqual(len(ops.gate_calls), prior_timeout_retries)
+                self.assertEqual(
+                    len(ops.gate_calls), prior_timeout_retries * 2
+                )
                 self.assertEqual(session.final_wait_kind, WAIT_ERROR)
                 self.assertEqual(
                     session.resend_skipped_reason, RESEND_SKIP_STATE_UNREADABLE
