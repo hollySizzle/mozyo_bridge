@@ -379,7 +379,11 @@ class ActionTests(unittest.TestCase):
         self.assertNotIn("--mode standard", command)
 
     def test_an_explicit_strict_rail_is_still_selectable(self) -> None:
-        wiring = _Wiring()
+        wiring = _Wiring(
+            answer_map=answers(
+                {GATEWAY_ARGS: delivery_record(mode="standard")}
+            )
+        )
         with wiring:
             code, _, _ = self._apply(wiring, "--delivery-mode", "standard")
 
@@ -388,6 +392,27 @@ class ActionTests(unittest.TestCase):
             argv[-1] for argv in wiring.runner.argvs if "project-gateway" in argv[-1]
         )
         self.assertIn("--mode standard", command)
+
+    def test_an_explicit_pending_rail_exits_as_uncertain(self) -> None:
+        wiring = _Wiring(
+            answer_map=answers(
+                {
+                    GATEWAY_ARGS: delivery_record(
+                        mode="pending", status="pending_input", reason="ok"
+                    )
+                }
+            )
+        )
+        with wiring:
+            code, out, _ = self._apply(wiring, "--delivery-mode", "pending")
+
+        self.assertEqual(code, 3)
+        self.assertIn("uncertain", out)
+        self.assertIn("uncertain_partial", out)
+        command = next(
+            argv[-1] for argv in wiring.runner.argvs if "project-gateway" in argv[-1]
+        )
+        self.assertIn("--mode pending", command)
 
     def test_an_unconfirmed_submission_exits_distinctly_from_a_refusal(self) -> None:
         # The exit code is the only thing an automated caller sees. Reusing 1

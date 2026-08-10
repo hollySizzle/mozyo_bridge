@@ -149,8 +149,8 @@ Unit identity は `host_id + workspace_id + lane_id` である。
 - **source からの出力は byte 上限で bound する**（共有 subprocess seam）。unit 件数・agent 数は
   decode 後の bound であり、それだけでは到達可能な source が decode 前に client の memory を
   枯渇させられる。上限は**読み取り時点**で効かせ（超過分を読まない）、超過時は board / registry を
-  `reload_required`、配送を `delivery_failed` の固定結果にする。**「到達不能」とは区別する** —
-  上限超過は source が応答した結果であり、connection failure ではない。
+  `reload_required`、配送を `uncertain / delivery_uncertain / uncertain_partial` の固定結果にする。
+  **「到達不能」とは区別する** — 上限超過は source が応答した結果であり、connection failure ではない。
 - **byte 上限と timeout は同時に成り立たせる。** 上限までの単一 blocking read は、上限未満のまま
   stdout を開き続ける source に対して**永久に待つ**（timeout はその後ろにあり到達しない）。
   読み取りは **deadline-aware な incremental read** とし、期限超過時は kill / wait / stream close
@@ -259,7 +259,7 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   側の既存 Enter-only retry が完了する前に client が command を timeout にしないための待機 budget
   である。`standard` / `pending` を明示した action は基礎 deadline のままとする。
 - **配送成否は exit code で判定しない。** 対象 gateway の **構造化 outcome** を読み、共有 authority
-  (`injection_stage_for_outcome`) の判定に従う。
+  (`injection_stage_for`) の判定に従う。
   **構造化 outcome は判定にのみ使い、client の表示は固定の public-safe 文言とする**（remote の値を
   一切反映しない。これが本項の唯一の契約である）。
   出力形状は決定的にする: gateway 呼び出しで `--record-format json` を明示し、読み取りは
@@ -281,9 +281,12 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   `submitted_confirmed` でも non-zero exit なら矛盾として `uncertain_partial` へ落とす。
   `not_sent` は対象 gateway が **pre-injection で拒否した**と構造化 outcome が述べている場合に限る。
 - **gateway record は producer が導出した `injection_stage` を運ぶ。** 単一行 JSON は
-  `asdict(DeliveryOutcome)` であり、`mode` と producer が **full context** で導出した
-  `injection_stage` を含む。共有 authority はこの carried 値を優先するため、queue-enter carve-out
-  （turn-start 未観測の `sent` + `ok` は confirmed ではない）が host 境界を越えても正しく解決する。
+  `asdict(DeliveryOutcome)` であり、`mode`、turn-start telemetry、producer が **full context** で導出した
+  `injection_stage` を含む。client は record の mode が request の解決済み mode と完全一致することを
+  先に要求し、同じ full context を共有 authority (`injection_stage_for`) で再計算する。carried stage は
+  authority ではなく照合値であり、存在する場合は再計算値と完全一致しなければならない。mode の欠落・
+  不一致、carried stage の不正形・矛盾は `uncertain_partial` とする。これにより queue-enter carve-out
+  （turn-start 未観測の `sent` + `ok` は confirmed ではない）を host 境界越しでも caller が独立に確認する。
   test fixture もこの形状を **実 producer** から生成し、wire と食い違わせない。
 - **結果は 3 分岐であり、2 分岐へ畳まない（#15198）。** 共有 authority の
   `not_sent` / `uncertain_partial` / `submitted_confirmed` をそのまま result state へ対応させる。

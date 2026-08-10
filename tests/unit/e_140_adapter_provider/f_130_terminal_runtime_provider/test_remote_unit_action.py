@@ -826,6 +826,28 @@ class ApplyDeliveryTests(unittest.TestCase):
                 self.assertEqual(result.injection_stage, STAGE_UNCERTAIN_PARTIAL)
                 self.assertTrue(result.as_payload()["blind_retry_prohibited"])
 
+    def test_an_explicit_pending_rail_publishes_an_uncertain_result(self) -> None:
+        action, runtime, _ = rail(
+            answers(
+                {
+                    GATEWAY_ARGS: delivery_record(
+                        mode="pending", status="pending_input", reason="ok"
+                    )
+                }
+            )
+        )
+        unit_id = remote_unit_id(runtime)
+
+        result = action.apply(
+            action.preview(request(unit_id, delivery_mode="pending"))
+        )
+
+        self.assertFalse(result.delivered)
+        self.assertEqual(result.state, ACTION_UNCERTAIN)
+        self.assertEqual(result.reason, REASON_DELIVERY_UNCERTAIN)
+        self.assertEqual(result.injection_stage, STAGE_UNCERTAIN_PARTIAL)
+        self.assertTrue(result.as_payload()["blind_retry_prohibited"])
+
     def test_a_pre_injection_gateway_refusal_is_a_zero_send(self) -> None:
         # The other half of the distinction: the target gateway refused BEFORE
         # typing anything, so this is a real non-delivery and re-issuing the same
@@ -902,10 +924,16 @@ class ApplyDeliveryTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            _gateway_injection_stage(delivery_record()), STAGE_SUBMITTED_CONFIRMED
+            _gateway_injection_stage(
+                delivery_record(), expected_mode=MODE_QUEUE_ENTER
+            ),
+            STAGE_SUBMITTED_CONFIRMED,
         )
-        good = '{"status": "sent", "reason": "ok"}'
-        self.assertEqual(_gateway_injection_stage(good), STAGE_SUBMITTED_CONFIRMED)
+        good = delivery_record().splitlines()[-1]
+        self.assertEqual(
+            _gateway_injection_stage(good, expected_mode=MODE_QUEUE_ENTER),
+            STAGE_SUBMITTED_CONFIRMED,
+        )
         for name, tail in (
             ("another object", '{"receipt": "later"}'),
             ("malformed", "{bad}"),
@@ -915,9 +943,79 @@ class ApplyDeliveryTests(unittest.TestCase):
         ):
             with self.subTest(trailing=name):
                 self.assertEqual(
-                    _gateway_injection_stage(good + "\n" + tail),
+                    _gateway_injection_stage(
+                        good + "\n" + tail,
+                        expected_mode=MODE_QUEUE_ENTER,
+                    ),
                     STAGE_UNCERTAIN_PARTIAL,
                 )
+
+    def test_gateway_mode_and_carried_stage_must_agree_with_full_context(self) -> None:
+        # The remote record is untrusted.  Neither a carried stage nor a familiar
+        # status/reason pair may override the mode this caller actually selected
+        # or the shared authority's full-context classification.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.remote_unit_action import (
+            _gateway_injection_stage,
+        )
+
+        def record_payload(record: str) -> dict:
+            return json.loads(record.splitlines()[-1])
+
+        missing_mode = record_payload(delivery_record())
+        missing_mode.pop("mode")
+
+        mode_mismatch = record_payload(delivery_record())
+        mode_mismatch["mode"] = "standard"
+
+        missing_turn_evidence = record_payload(delivery_record(observation=None))
+        missing_turn_evidence["injection_stage"] = {
+            "stage": STAGE_SUBMITTED_CONFIRMED
+        }
+
+        status_stage_contradiction = record_payload(
+            delivery_record(status="blocked", reason="invalid_args")
+        )
+        status_stage_contradiction["injection_stage"] = {
+            "stage": STAGE_SUBMITTED_CONFIRMED
+        }
+
+        for label, payload in (
+            ("missing mode", missing_mode),
+            ("mode mismatch", mode_mismatch),
+            ("sent ok without turn evidence", missing_turn_evidence),
+            ("status reason versus carried stage", status_stage_contradiction),
+        ):
+            with self.subTest(case=label):
+                self.assertEqual(
+                    _gateway_injection_stage(
+                        json.dumps(payload),
+                        expected_mode=MODE_QUEUE_ENTER,
+                    ),
+                    STAGE_UNCERTAIN_PARTIAL,
+                )
+
+    def test_missing_or_mismatched_gateway_mode_is_publicly_uncertain(self) -> None:
+        confirmed = json.loads(delivery_record().splitlines()[-1])
+        missing_mode = dict(confirmed)
+        missing_mode.pop("mode")
+        mismatched_mode = dict(confirmed, mode="standard")
+
+        for label, payload in (
+            ("missing", missing_mode),
+            ("mismatched", mismatched_mode),
+        ):
+            with self.subTest(mode=label):
+                action, runtime, _ = rail(
+                    answers({GATEWAY_ARGS: json.dumps(payload)})
+                )
+                unit_id = remote_unit_id(runtime)
+
+                result = action.apply(action.preview(request(unit_id)))
+
+                self.assertEqual(result.state, ACTION_UNCERTAIN)
+                self.assertEqual(result.reason, REASON_DELIVERY_UNCERTAIN)
+                self.assertEqual(result.injection_stage, STAGE_UNCERTAIN_PARTIAL)
+                self.assertTrue(result.as_payload()["blind_retry_prohibited"])
 
     def test_the_gateway_is_asked_for_a_deterministic_output_shape(self) -> None:
         # The gateway's own --json only shapes a fail-closed resolution; without

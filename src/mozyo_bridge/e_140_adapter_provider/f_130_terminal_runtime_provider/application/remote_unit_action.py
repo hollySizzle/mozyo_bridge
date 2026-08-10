@@ -50,7 +50,8 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injectio
     STAGE_SUBMITTED_CONFIRMED,
     STAGE_UNCERTAIN_PARTIAL,
     blind_retry_prohibited,
-    injection_stage_for_outcome,
+    injection_stage_for,
+    stage_from_telemetry,
 )
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.herdr_unit_board import (
     MAX_PRESENTATION_TEXT,
@@ -640,7 +641,10 @@ class RemoteUnitActionRail:
                 else 0.0
             ),
         )
-        stage = _delivery_stage(result)
+        stage = _delivery_stage(
+            result,
+            expected_mode=request.effective_delivery_mode,
+        )
         if stage == STAGE_SUBMITTED_CONFIRMED:
             return RemoteUnitActionResult(
                 ACTION_DELIVERED,
@@ -661,23 +665,6 @@ class RemoteUnitActionRail:
             preview,
             injection_stage=STAGE_UNCERTAIN_PARTIAL,
         )
-
-
-class _OutcomeView:
-    """Attribute view over a decoded delivery outcome.
-
-    The shared injection-stage authority reads an outcome by attribute, and the
-    outcome arrives here as JSON across a process and a host boundary.  This
-    adapts the shape without restating any of the authority's rules.
-    """
-
-    __slots__ = ("_record",)
-
-    def __init__(self, record: dict) -> None:
-        self._record = record
-
-    def __getattr__(self, name: str) -> object:
-        return self._record.get(name)
 
 
 def _delivery_outcome_record(stdout: object) -> Optional[dict]:
@@ -719,24 +706,25 @@ def _delivery_outcome_record(stdout: object) -> Optional[dict]:
     return payload
 
 
-def _gateway_injection_stage(stdout: object) -> str:
+def _gateway_injection_stage(stdout: object, *, expected_mode: str) -> str:
     """The shared stage token for the target gateway's own outcome.
 
     A zero exit code is **not** proof of delivery — ``delivery_outcome_gate``
     documents the two rc-0 shapes that never reached a receiver (a ``pending``
     send that parks the body in the composer, and a marker-unobserved
     ``queue-enter``).  So the structured outcome is read, and it is read through
-    the *shared* :func:`injection_stage_for_outcome` authority rather than by
-    re-testing status/reason tokens locally: #14232 records what happened when
-    three places answered "was it delivered?" with their own private tables.
+    the *shared* :func:`injection_stage_for` authority rather than by re-testing
+    status/reason tokens locally: #14232 records what happened when three places
+    answered "was it delivered?" with their own private tables.
 
-    The gateway serialises its whole ``DeliveryOutcome``, so the record carries
-    the ``injection_stage`` the producer already derived **with full context** —
-    the mode and both turn-start telemetries — and the authority prefers it over
-    re-deriving.  That is what makes the queue-enter carve-out resolve correctly
-    across the host boundary: a ``sent`` + ``ok`` that observed no turn start
-    arrives already classified as uncertain, instead of being read here as a
-    confirmed submission (Redmine #15198).
+    The gateway serialises its whole ``DeliveryOutcome``, including the effective
+    mode, both turn-start telemetries, and the ``injection_stage`` the producer
+    derived from that full context.  This boundary must not trust any one of
+    those claims in isolation.  The gateway mode has to equal the mode this
+    caller requested, and the carried stage (when present) has to equal a fresh
+    full-context classification by the shared authority.  A missing/mismatched
+    mode or a contradictory carried stage is therefore uncertain rather than a
+    confirmation or a zero-send (review j#103034, UBRA-RESULT-001).
 
     Everything unreadable — absent output, no JSON line, a non-object — resolves
     to :data:`STAGE_UNCERTAIN_PARTIAL`, the same direction the authority itself
@@ -746,10 +734,28 @@ def _gateway_injection_stage(stdout: object) -> str:
     payload = _delivery_outcome_record(stdout)
     if payload is None:
         return STAGE_UNCERTAIN_PARTIAL
-    return injection_stage_for_outcome(_OutcomeView(payload))
+    record_mode = payload.get("mode")
+    if not isinstance(record_mode, str) or record_mode != expected_mode:
+        return STAGE_UNCERTAIN_PARTIAL
+
+    recomputed = injection_stage_for(
+        payload.get("status"),
+        payload.get("reason"),
+        mode=record_mode,
+        queue_enter_turn_start_observation=payload.get(
+            "queue_enter_turn_start_observation"
+        ),
+        turn_start_outcome=payload.get("turn_start_outcome"),
+    )
+    carried = stage_from_telemetry(payload.get("injection_stage"))
+    if "injection_stage" in payload and carried is None:
+        return STAGE_UNCERTAIN_PARTIAL
+    if carried is not None and carried != recomputed:
+        return STAGE_UNCERTAIN_PARTIAL
+    return recomputed
 
 
-def _delivery_stage(result) -> str:
+def _delivery_stage(result, *, expected_mode: str) -> str:
     """The stage for one whole gateway invocation, exit status included (pure).
 
     The structured outcome is the verdict; the exit status is only allowed to
@@ -764,7 +770,10 @@ def _delivery_stage(result) -> str:
         # The command could not be run to completion.  Whether the remote reached
         # its receiver before the transport gave up is exactly what nobody knows.
         return STAGE_UNCERTAIN_PARTIAL
-    stage = _gateway_injection_stage(completed.stdout)
+    stage = _gateway_injection_stage(
+        completed.stdout,
+        expected_mode=expected_mode,
+    )
     if stage == STAGE_SUBMITTED_CONFIRMED and completed.returncode != 0:
         return STAGE_UNCERTAIN_PARTIAL
     return stage
