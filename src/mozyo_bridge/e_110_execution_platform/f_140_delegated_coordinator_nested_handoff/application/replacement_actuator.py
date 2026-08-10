@@ -222,6 +222,7 @@ class ReplacementActuatorUseCase:
         preservation_policy: Callable[
             [PreservationObservation], PreservationVerdict
         ] = assess_preservation,
+        close_authority: Optional[Callable[[ParticipantPin], bool]] = None,
         launch_authority: Optional[Callable[[ParticipantPin], bool]] = None,
         store_admission: Optional[
             Callable[[ReplacementTransactionKey, ParticipantPin], Optional[str]]
@@ -238,6 +239,12 @@ class ReplacementActuatorUseCase:
         # a dirty / unrecorded worktree while still refusing to close a live-working or
         # wrong-identity slot (Redmine #13806 tranche D, j#79485 §4).
         self._preservation_policy = preservation_policy
+        # An OPTIONAL restored-pair action-time qualification run after preservation but
+        # BEFORE the final lease re-authentication and live close.  Keeping the callback on
+        # this side of _reauth_before_effect is deliberate: a potentially slow inventory /
+        # worktree join must not widen the lease-check-to-close gap.  False means zero close
+        # and leaves the participant close_owed.
+        self._close_authority = close_authority
         # An OPTIONAL action-time authority probe re-joined by the launch step IMMEDIATELY before
         # the (bounded-recovery) ``launch_action_bound`` effect (Redmine #13806 R3-F1, Review
         # j#82731). ``None`` (the self-replacement default) leaves the launch unchanged. A
@@ -726,6 +733,14 @@ class ReplacementActuatorUseCase:
                     status=ACTUATION_PRESERVATION_BLOCKED, phase=rec.phase,
                     revision=rec.revision, stopped_on=pin.identity,
                     preservation_reasons=verdict.reasons, detail=verdict.detail,
+                )
+            if self._close_authority is not None and not self._close_authority(pin):
+                return ActuationResult(
+                    status=ACTUATION_PRESERVATION_BLOCKED,
+                    phase=rec.phase,
+                    revision=rec.revision,
+                    stopped_on=pin.identity,
+                    detail="close_authority_moved",
                 )
             # Re-authenticate immediately before the destructive close (R1-F1): the external
             # observations above may have taken time during which the lease could expire or

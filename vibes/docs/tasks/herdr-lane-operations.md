@@ -150,6 +150,7 @@ same-lane implementation_gateway が **callback delivery 確認済みの provide
       - **既存 hibernate-evidence gate (`park_declared` / `review_result` / `required_ci_green` / `integration_disposition` / `dogfood_delegated`) は `redmine:#14219:j#85530:Q3` を維持する**。本 command の追加で既存 evidence の anchor 文字列は 1 文字も変わらない (**re-attribution しない**)。
       - **no-change Review waiver gate `no_change_review_waiver` の ruling は `redmine:#14695:j#93412`** (Design Consultation Answer)。writer role は `coordinator`、provenance 軸は marker の `approval_source=direct_owner` で、両者は連言であり代替関係ではない (#14695 j#93412)。**同一 consultation の先行 Answer j#93406 を pointer にしない** — 両者とも writer を `coordinator` と裁定しており binding 自体は同じだが、hard carve-out と live 測定境界を持つのは j#93412 だけなので、j#93406 を指すと `is_anchored` は通るのに**現行契約を述べていない record** へ読者を送ることになり、(a) が防ぐ誤帰属と同型になる。この gate も (b)(c) の合成規則と fail-closed 条件は既存 gate と同一で、既存 5 gate の anchor 文字列は 1 文字も変わらない。
       - **global offline rollout gate `herdr_offline_rollout_owner_approval` の ruling は `redmine:#14838:j#97993`**。writer role は `coordinator`、全workspace停止・3-store migration・runtime cutoverを承認した判断のprovenanceはmarkerの `approval_source=direct_owner` で、両者を連言する。full approval manifest + issueのdigestをmarkerへ束縛し、source-system author ID一致はauthorityに使わない。(b)(c) の合成とunanchored refusalは他gateと同じで、既存gateのruling pointerを変更しない。
+      - **post-reboot pair recovery gate `restored_pair_recovery_owner_approval` の ruling は `redmine:#15227:j#102879`**。writer role は `coordinator`、owner 判断は marker の `approval_source=direct_owner` と連言する。pair 全体の lifecycle / participant / worktree pin と composer loss の許可を action digest に束縛し、既存 gate の ruling pointer を変更しない。
       - **ruling を持たない gate は unanchored** となり、本 surface は zero-close で refuse する (fail-closed)。
       - 本節の (a) と既存 gate の維持は **test が code から導出して照合する**ため、runbook と実装のどちらか一方だけを変えると赤化する (前 3 round 連続で docs drift を出したため綴り検査ではなく導出照合にした)。
     - ★**旧実装の「approval journal の author == issue の author」は撤去した** (#14661 review j#92601 F1)。実測で worker / gateway / coordinator の全 role が同一 source-system user id で書いており、この述語は **issue 上の全 journal が満たす**。何も証明していなかった。
@@ -421,6 +422,77 @@ forceやpending overrideを加えない。pending generationが本当に破棄�
 | logout / `authentication required` / process終了 | `agent_auth_unavailable` | credentialを記録せずre-authまたはfresh agent relaunch | routing bug扱い、blind resend |
 | agentはliveだが実command shellに`MOZYO_WORKSPACE_ID` / `MOZYO_AGENT_ROLE` / `MOZYO_LANE_ID`が無い/不整合 | `sender_identity_missing_or_conflict` | dispatchを止め、runtime propagation/proxy gapをdurable化 | 手動env注入、raw Herdr send |
 | assigned-name/lane slotが無い、または複数 | `route_runtime_unavailable` | lane metadata + live inventoryを再取得し、standard relaunch/preflightへ | tmux-era candidate空振りだけで断定 |
+
+### 再起動復元後の active sublane pair を作り直す (#15227)
+
+`sublane recover-restored-pair` は、active な issue-owned sublane の gateway/worker が
+両方 live だが、再起動復元後の command-shell CWD が lifecycle row の canonical worktree
+と一致しない、または live locator に結び付いた startup self-attestation が non-green な
+場合の公開 recovery rail である。default lane と片側だけ存在する pair は本 rail の対象外
+である。default coordinator を安全に self-close/relaunch する公開 rail は現時点では未実装
+であり、本コマンドで代用してはならない。legacy の default-lane pair も本railでは扱わない。
+片側だけ存在する pair は vanished-slot 用 rail を使う。
+
+- 既定は read-only preflight。`--allow-pending-composer-loss` は、対象の旧 pane に残る未送信
+  composer text が失われ得ることへの明示的な owner 判断であり、worktree の file を捨てる
+  許可ではない。
+- preflight は lifecycle の issue/lane/revision/generation、canonical worktree token、branch/HEAD、
+  gateway/worker の assigned name/locator/inventory revision、runtime state、CWD、startup
+  attestation を結合する。runtime は両 slot とも明示的な `awaiting_input` または
+  `turn_ended` の場合だけ settled とする。status 欠落、`unknown`、未知値、非文字列、
+  `blocked`、`busy` はいずれも zero-close。両 slot が healthy、inventory/attestation が
+  読めない、pair が一意でない、worktree/branch が動いた場合も zero-close。
+- actionable な preflight が返す `required_approval_marker` を、その issue の新しい Redmine
+  journal に coordinator が記録する。gate は
+  `restored_pair_recovery_owner_approval`、`approval_source=direct_owner`、
+  `decision=approved`、effect は `restored_pair_close_relaunch`。`--execute` はその journal、
+  preflight の action id/generation、部分実行を再開する場合は両 slot の旧 name/locator/revision
+  を同じまま再提示する。
+- execute は既存 replacement transaction を使い、各 old locator を action-time に再確認して
+  exact close → same-slot launch → action-bound startup attestation を participant identity に基づく
+  決定的 transaction 順で進める（gateway→workerの固定順ではない）。
+  preflight が各 slot に表示した `approval_health` (`healthy` / `degraded`) は承認 digest に含まれる。
+  execute と部分再開では、その同じ値を `--gateway-approval-health` / `--worker-approval-health`
+  へ必ず再提示する。承認後かつ最初の effect 前に健康状態が変わった場合は実行を拒否する。
+  transactionが`planned`または`claimed`に留まり、close/launch/sendが一度も発生し得ない間に
+  健康状態が変わった場合は、古い承認で進めず `--supersede` preflightを行う。
+  `replacing_nonself`は全participantがdurable上`close_owed`でも対象外とする。close effectは
+  participant state CASより先に発生するため、その間の停止後は外部closeが既に成功したかをrowだけで
+  証明できない。このzero-effect判定は既存の`recover-stale --supersede`にも共通であり、曖昧な
+  `replacing_nonself` residueをraw DB操作で戻さない。安全に救済するにはdurableなclose-attempt/effect
+  receiptを持つ別railが必要である。preflightが表示するexact
+  `supersedes_generation` / `supersedes_journal` / `supersedes_revision`、次のaction generation、
+  両slotのhealth pinを新しいowner approvalと同じRedmine journalへ値非省略で記録する。executeは
+  それらを同名flagで再提示する。専用CASはold generation/revision/journal、同一action、完全に同じ
+  participant manifest、phaseが`planned`/`claimed`、zero-effect、live leaseなし、
+  new generation=`old + 1`を一つのlock内で再確認し、
+  participant manifestを変更せずnew journal/generationへheaderを更新する。row不在、effect済み、
+  live lease、authority driftではzero-write。CAS直後に停止しても同じnew journal/generation/pinsを
+  再提示すれば新headerを冪等に採用し、old generationのexecutorはgeneration mismatchで停止する。
+  各close effect直前には lifecycle/worktree/branch/HEADと、まだ`close_owed`の全participantの
+  name/locator/revision、settled runtime、attestation可読性をfresh observationで再結合する。
+  最初のclose前にpairがhealthy化した場合やauthorityが動いた場合はzero-close。既に進行済みの
+  participantは旧generationとの再比較から除外し、partial replayを妨げない。
+  transaction は participant ごとの owed state を各効果の成功後に更新するため、進行が
+  durable に記録された途中停止は同一 pin で再実行でき、記録済みの close を再実行しない。
+  launch effect の成功後かつ `launch_owed -> verify_owed` 更新前に停止した場合は、fresh
+  live slot の identity と action-bound startup attestation が同じaction/pinへ完全一致するとき
+  だけ既存launchを採用し、新しいlaunchを行わずattestation再確認へ進む。異なるaction、通常
+  launch、stale/ambiguous/unreadableなslotは採用せず、同名live process blockerで停止する。
+  close 成功直後かつ owed-state 更新前に停止し、他participantにもdurableな進行がない場合は
+  進行済みreplayと証明できないため自動再開せず fail-closed とする。すでに同じexact
+  transactionの別participantにdurableな進行がある場合は、actuatorが旧generationの明示的な
+  不在を再確認できたslotだけbounded recoveryで次へ進める。recycled/ambiguousな観測は常に
+  zero-effectで停止する。worktree/lifecycle/branch を作り直さず、send も行わない。fresh pair
+  はidleで起動し、次の durable work anchor は別途 dispatch する。
+  replay で preflight の不完全pair blockerを解除できるのは、同じ action generation、承認
+  journal、continuation、両participantの旧generationが一致し、かつparticipant owed stateが
+  実際に進行済みと証明できる場合だけである。単にtransaction rowが存在するだけでは解除
+  しない。default lane、healthy pair、busyまたは非settled runtimeの blockerはreplayでも
+  解除しない。
+- provider の会話セッション再開は保証しない。保証するのは worktree/branch/file と durable
+  transaction の継続性であり、古い pane の画面内容は approval 前に必要なら read-only capture
+  して Redmine の状態判断へ反映する。
 
 `sublane create --execute`がlaunch後にdispatchだけfailした場合は、起動済みslot、未配送anchor、失敗理由をjournalに残す。partial laneを成功扱いせず、同じcommandをblind replayしない (Redmine #13613)。
 
