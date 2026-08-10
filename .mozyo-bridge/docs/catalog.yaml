@@ -168,6 +168,21 @@ documents:
       - spec-herdr-native-identity
       - task-herdr-lane-operations
 
+  - id: spec-durable-lane-assignment-session-replacement
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/durable-lane-assignment-and-session-replacement.md
+    purpose: Redmine issueとlane generationをprovider-neutralなLLM担当単位として結び、会話sessionを任意のresume hintに限定し、身元不明のmanaged sessionをworktreeとdurable stateを保持したfresh sessionへ安全に交換するADR。
+    audit_role: durable_lane_assignment_session_replacement_spec
+    related_document_refs:
+      - spec-session-continuity-user-harness
+      - spec-herdr-native-identity
+      - logic-session-boundary
+      - logic-managed-state-model
+      - logic-worktree-lifecycle-boundary
+      - spec-delegated-coordinator-decision-records
+      - task-herdr-lane-operations
+
   - id: spec-bounded-context-map
     type: spec
     status: active
