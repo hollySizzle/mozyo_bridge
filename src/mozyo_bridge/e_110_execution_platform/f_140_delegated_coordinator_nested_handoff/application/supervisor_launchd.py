@@ -107,15 +107,25 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     read_installed_plist as _read_installed_plist,
     render_plist,
     service_target as _service_target,
-    # The pure launchctl-message layer: what the manager's wording says, parsed without running it.
-    LAUNCHCTL_NOT_FOUND_CODES as _LAUNCHCTL_NOT_FOUND_CODES,
-    LAUNCHCTL_UNREADABLE_PHRASES as _LAUNCHCTL_UNREADABLE_PHRASES,
+    write_owned_plist,
+    # The pure launchctl-message layer. The probe module is its only caller now; re-exported here
+    # because this module stays the single import for the whole macOS adapter.
     names_exactly as _names_exactly,
-    has_not_found_clause as _has_not_found_clause,
-    not_found_operand as _not_found_operand,
-    quoted_names as _quoted_names,
     resolve_mozyo_home,
     resolve_supervisor_command,
+)
+# The read-only probe layer: running `launchctl print` and classifying what came back. Nothing in it
+# authorizes a mutation — see its module docstring.
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd_probe import (  # noqa: E501
+    PROBE_CONFIRMED_ABSENT,
+    PROBE_LOADED,
+    PROBE_UNREADABLE,
+    Runner,
+    default_runner as _default_runner,
+    is_loaded as _is_loaded,
+    probe as _probe,
+    says_not_found as _says_not_found,
+    small_int_or_none as _small_int_or_none,
 )
 # The retired `--drain-only` migration: a one-way, time-limited concern with its own vocabulary,
 # separated for the same line-budget reason and re-exported here unchanged.
@@ -128,9 +138,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REASON_LEGACY_DRAIN_REMOVAL_FAILED,
     REASON_LEGACY_DRAIN_STATE_UNREADABLE,
     REASON_LEGACY_DRAIN_UNREADABLE,
-    Runner,
     _LEGACY_DRAIN_REFUSAL_REASON,
-    _default_runner,
     classify_agent_plist,
     classify_legacy_drain,
     remove_legacy_drain,
@@ -178,17 +186,19 @@ REASON_PLIST_FOREIGN_LABEL = "plist_foreign_label"
 #: install/uninstall refused: a file sits at the current agent's own path but cannot be parsed, so
 #: whose it is cannot be established. Distinct from absence, and never guessed (j#102496 r12f2).
 REASON_PLIST_UNREADABLE = "plist_unreadable"
+#: install refused: the owned plist could not be written. Most often the path is a symlink and the
+#: writer refuses to follow it (``O_NOFOLLOW``), which is the point — the alternative is creating or
+#: overwriting a file outside the owned path (review j#102550 r13f2).
+REASON_PLIST_WRITE_FAILED = "plist_write_failed"
+#: uninstall partial failure: the bootout succeeded and the plist is ours, but the unlink failed. A
+#: structured result rather than an escaping ``OSError``, matching what the retired-drain migration
+#: has always reported — and it carries no exception text or host path (review j#102550 r13f5).
+REASON_PLIST_REMOVAL_FAILED = "plist_removal_failed"
 #: uninstall refused: the owned plist is ours, but ``launchctl bootout`` did not succeed, so nothing
 #: establishes that the job stopped. Unlinking here would hide a possibly-live registration — launchd
 #: keys a bootstrapped job off its *label*, so a job whose file is gone keeps running until logout.
 #: The plist is kept on purpose: it is the operator's only durable trace of it (j#102496 r12f3).
 REASON_BOOTOUT_FAILED = "launchctl_bootout_failed"
-
-#: ``launchctl print`` probe outcomes (see :func:`_probe`). Three values, not a boolean: "I could
-#: not read it" is a different answer from "it is not there", and only the latter is safe.
-PROBE_LOADED = "loaded"
-PROBE_CONFIRMED_ABSENT = "confirmed_absent"
-PROBE_UNREADABLE = "unreadable"
 
 
 #: The same mapping for the CURRENT agent's own plist path. The tokens are distinct from the retired
@@ -267,164 +277,6 @@ def classify_credential_readiness(*, mozyo_home: Optional[Path] = None) -> str:
 
 def _running_on_darwin() -> bool:
     return sys.platform == "darwin"
-
-
-#: The widest process id ``launchctl`` can print. DERIVED, not chosen: POSIX ``pid_t`` is a signed
-#: 32-bit integer on Darwin, so ten digits covers every value the kernel can assign. Deliberately
-#: NOT unified with the Redmine-id / lifecycle-revision widths this lane also bounds — a pid is
-#: the OS's counter and answers to a different authority (Redmine #14753).
-_MAX_PID_DIGITS = len(str(2**31 - 1))
-
-
-#: The ``launchctl print`` line prefixes carrying the last bounded sweep's exit status. Both
-#: spellings are accepted because the wording is not stable across macOS releases and an unmatched
-#: prefix silently costs the whole 直近の終了結果 projection (#15192).
-_LAST_EXIT_PREFIXES = ("last exit code = ", "last exit status = ")
-
-def _probe(runner: Runner, agent: SupervisorAgent = SUPERVISOR_AGENT) -> dict:
-    """Read-only ``launchctl print`` → ``{state, loaded, pid, last_exit_status}``. Never raises.
-
-    ``state`` is THREE-valued (review j#102180 finding 1): :data:`PROBE_LOADED`,
-    :data:`PROBE_CONFIRMED_ABSENT`, or :data:`PROBE_UNREADABLE`. Collapsing every non-zero exit into
-    "not loaded" reported a permission-denied / manager-error read as an established fact — "I could
-    not see it" is not "it is not there".
-
-    **This is a status projection; it authorizes nothing.** ``confirmed_absent`` once let a failed
-    bootout still delete a plist; that authority is retired (j#102458, review j#102496 r12f4). The
-    three values now feed only ``service_status`` and ``restart``'s refusal token, where being wrong
-    costs an inaccurate read-out rather than a deleted registration.
-
-    A non-zero exit is classified as *confirmed absent* ONLY when launchctl positively says the
-    service is unknown (:data:`_LAUNCHCTL_NOT_FOUND_CODES` / :data:`_LAUNCHCTL_NOT_FOUND_PHRASES`).
-    Anything else — an unrecognized code, an unreadable message, a missing launchctl binary, an OS
-    error — is :data:`PROBE_UNREADABLE`, so the caller fails closed rather than guessing.
-
-    ``loaded`` is kept as the boolean the status projection and ``restart`` already consume; it is
-    true only for :data:`PROBE_LOADED`, so an unreadable probe never reads as "running".
-
-    Every integer here is read as an ASCII decimal inside POSIX ``pid_t`` width, NOT via
-    ``str.isdigit()``, which does not mean "a number ``int()`` can read": measured (Redmine #14753),
-    a ``pid = ²`` line raised a raw ``ValueError`` out of :func:`service_status`, breaking both this
-    function's "never raises" promise and the typed status dict its callers consume. An unreadable
-    value reads as ``None`` — the same value returned when launchctl reports none at all.
-    """
-    def _result(state: str) -> dict:
-        return {"state": state, "loaded": False, "pid": None, "last_exit_status": None}
-
-    try:
-        result = _launchctl(runner, ["print", _service_target(agent)])
-    except (FileNotFoundError, OSError):  # launchctl absent / not executable — unknowable, not absent
-        return _result(PROBE_UNREADABLE)
-    if result.returncode != 0:
-        return _result(
-            PROBE_CONFIRMED_ABSENT
-            if _says_not_found(result, _service_target(agent))
-            else PROBE_UNREADABLE
-        )
-    pid: Optional[int] = None
-    last_exit: Optional[int] = None
-    seen_pid = False
-    for line in (result.stdout or "").splitlines():
-        stripped = line.strip()
-        if not seen_pid and stripped.startswith("pid = "):
-            pid = _small_int_or_none(stripped.split("=", 1)[1])
-            seen_pid = True
-            continue
-        for prefix in _LAST_EXIT_PREFIXES:
-            if stripped.startswith(prefix):
-                last_exit = _small_int_or_none(stripped[len(prefix):])
-                break
-    return {
-        "state": PROBE_LOADED, "loaded": True, "pid": pid, "last_exit_status": last_exit,
-    }
-
-
-def _says_not_found(result, service_target: str) -> bool:
-    """Whether a non-zero ``launchctl print`` positively reports THIS service as unknown.
-
-    **No deletion depends on this** (j#102458, review j#102496 r12f4). It once decided whether a
-    failed bootout could still delete a plist; it now only sharpens a read-only projection. The
-    conjunction below is kept because a wrong *status* is still worth avoiding, and because relaxing
-    it would invite the same reasoning back into a destructive path.
-
-    The evidence is a **conjunction**, not a choice (review j#102200 finding r3f1). All of:
-
-    1. the exit code is one launchctl uses for an unknown label, **and**
-    2. the output carries a recognized "no such service" phrase, **and**
-    3. the output names the exact service target we asked about, **and**
-    4. the output carries no signal that the read failed for some *other* reason.
-
-    The earlier version accepted the code **or** the phrase, which is how ``113`` +
-    ``Operation not permitted`` — a permission failure — read as absence and deleted an owned plist.
-    Either signal alone is too weak to carry that consequence: launchctl's man page documents only
-    "0 on success, non-zero on failure", so 113 is not a not-found contract, and it states that
-    ``print`` output is not an API, so the wording may change. Requiring both, bound to our own
-    domain/label, is what makes the reading specific enough to act on; requiring the *absence* of a
-    permission signal is what stops "the reason we could not look" from passing as "nothing to see".
-
-    A miss on any conjunct yields :data:`PROBE_UNREADABLE`: the install refuses with a typed reason
-    and keeps the plist. That is the deliberate failure direction — **over-refusal is recoverable
-    and visible, a second live registration is the defect this migration exists to prevent** — and
-    until the contract can be confirmed against a real launchd, refusing is the honest answer.
-    """
-    if result.returncode not in _LAUNCHCTL_NOT_FOUND_CODES:
-        return False
-    # The two streams are read SEPARATELY, as the distinct texts launchctl actually wrote (review
-    # j#102417 finding r10f1). Concatenating them into one string handed the position-aware parser a
-    # sentence that never existed: `stderr="Could not find service"` with `stdout='"<owned>"'` put a
-    # phrase and an operand on either side of the joining newline, which satisfied "separated by
-    # whitespace only" and authorized unlinking the owned plist. Hardening the parser is worth
-    # nothing if its caller can manufacture the very adjacency the parser checks.
-    streams = [
-        getattr(result, "stderr", "") or "",
-        getattr(result, "stdout", "") or "",
-    ]
-    # Wording is prose whose capitalization is not a contract, so phrases are matched case-folded.
-    # Identity is the label launchd keys the job off, matched exactly as launchctl wrote it (review
-    # j#102327 finding r6f1). A denial signal anywhere disqualifies the whole read: it names why we
-    # could not look, which is the opposite of evidence that there is nothing to look at.
-    if any(
-        phrase in stream.lower()
-        for stream in streams
-        for phrase in _LAUNCHCTL_UNREADABLE_PHRASES
-    ):
-        return False
-    target = service_target or ""
-    label = target.rsplit("/", 1)[-1]
-    if not label:
-        return False
-    bound = False
-    for stream in streams:
-        operand = _not_found_operand(stream)
-        if operand is None:
-            # A stream that says nothing about absence is normal (an empty stdout, say). A stream
-            # that DOES carry recognized wording but yields no operand is ambiguity, and ambiguity is
-            # not resolved by whatever the other stream happens to say.
-            if _has_not_found_clause(stream):
-                return False
-            continue
-        if operand not in (target, label):
-            return False  # this stream reports a DIFFERENT service missing: contradictory
-        bound = True
-    return bound
-
-
-def _small_int_or_none(token: str) -> Optional[int]:
-    """A small signed decimal, or ``None``. Never raises (see :data:`_MAX_PID_DIGITS`)."""
-    raw = (token or "").strip()
-    negative = raw.startswith("-")
-    digits = raw[1:] if negative else raw
-    if not (digits.isascii() and digits.isdigit() and len(digits) <= _MAX_PID_DIGITS):
-        return None
-    return -int(digits) if negative else int(digits)
-
-
-def _is_loaded(
-    runner: Runner, agent: SupervisorAgent = SUPERVISOR_AGENT
-) -> tuple[bool, Optional[int]]:
-    """``(loaded, pid)`` — the narrow view :func:`restart` needs. See :func:`_probe`."""
-    probe = _probe(runner, agent)
-    return bool(probe["loaded"]), probe["pid"]
 
 
 # ---------------------------------------------------------------------------
@@ -529,9 +381,19 @@ def install(
     target = plist_path(os_home, agent=agent)
     target.parent.mkdir(parents=True, exist_ok=True)
     log_path(os_home, agent=agent).parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(
-        render_plist(command, interval_seconds=interval_seconds, os_home=os_home, agent=agent)
-    )
+    try:
+        # O_NOFOLLOW, not `write_bytes`: a symlink planted at the owned path — or swapped in after
+        # the check above — must not redirect this write outside it (review j#102550 r13f2).
+        write_owned_plist(
+            target,
+            render_plist(command, interval_seconds=interval_seconds, os_home=os_home, agent=agent),
+        )
+    except OSError:
+        return _refused(
+            "install", REASON_PLIST_WRITE_FAILED,
+            credential_readiness=readiness, label=agent.label, legacy_drain=migration["state"],
+            legacy_drain_removed=migration["removed"], plist_state=own_state,
+        )
     # A previously loaded agent must be booted out before bootstrap or launchd rejects the
     # duplicate label; a not-loaded bootout is fine to ignore (idempotent install).
     _launchctl(runner, ["bootout", _service_target(agent)])
@@ -574,8 +436,16 @@ def restart(
     credential readiness, so it never reports a false-ready restart when the current shell resolves a
     different (ready) home than the one the loaded service actually runs with (j#79125 R3-F1).
 
+    **Whose plist it is comes before what is in it** (review j#102550 r13f1). restart used to read the
+    installed argv and ``--home`` pin without ever checking the ``Label``, so a stranger's plist that
+    happened to carry the expected ProgramArguments produced a ``performed: true`` kickstart — of
+    *our* label, on the strength of *their* file. Identity is classified at entry through the same
+    test install and uninstall use, and re-established after the probe, because a kickstart is a
+    mutation of the running system and the probe shells out.
+
     Refuses — before any launchctl mutation — on a non-darwin host, no installed plist (file
-    absent), an owned plist that exists but is unreadable / non-mapping, an unhealthy ``--home`` pin
+    absent), a plist that is not ours, one that exists but is unreadable / non-mapping, an unhealthy
+    ``--home`` pin
     (missing / malformed / duplicated / not an absolute canonical path), a requested ``mozyo_home``
     that differs from the pin, installed ``ProgramArguments`` that no longer match the command an
     install would write now (executable / argv drift — reinstall to change), a missing executable, or
@@ -587,13 +457,32 @@ def restart(
     if not _running_on_darwin():
         return _refused("restart", REASON_UNSUPPORTED_PLATFORM, label=agent.label)
     target = plist_path(os_home, agent=agent)
-    if not target.exists():
+    # Identity FIRST, through the same classifier install and uninstall use (review j#102550 r13f1).
+    # restart was the one verb left reading only the plist's contents — argv and home pin — without
+    # ever asking whose plist it was. A stranger's file carrying our expected ProgramArguments got a
+    # `performed: true` kickstart, and the kickstart went to OUR label: the evidence and the action
+    # named different services.
+    own_state = classify_agent_plist(os_home, agent=agent)
+    if own_state == PLIST_ABSENT:
         return _refused("restart", REASON_NOT_INSTALLED, label=agent.label)
+    if own_state == PLIST_UNREADABLE:
+        # `home_pin` is still reported so consumers reading that field see what they always did; the
+        # reason is now the accurate one — a file we cannot parse is unidentifiable before it is
+        # un-pinnable (j#79136 R4-F3 kept the same refusal, under a token about the pin).
+        return _refused(
+            "restart", REASON_PLIST_UNREADABLE,
+            home_pin=HOME_PIN_UNREADABLE, label=agent.label, plist_state=own_state,
+        )
+    if own_state != PLIST_OWNED:
+        return _refused(
+            "restart", REASON_PLIST_FOREIGN_LABEL, label=agent.label, plist_state=own_state
+        )
     installed = _read_installed_plist(target)
     if installed is None:
-        # File present but unreadable / non-mapping — unhealthy, NOT absence (j#79136 R4-F3).
+        # Raced from readable to unreadable between the classification and here.
         return _refused(
-            "restart", REASON_HOME_PIN_UNHEALTHY, home_pin=HOME_PIN_UNREADABLE, label=agent.label
+            "restart", REASON_PLIST_UNREADABLE,
+            home_pin=HOME_PIN_UNREADABLE, label=agent.label, plist_state=PLIST_UNREADABLE,
         )
     installed_argv = installed.get("ProgramArguments")
     pinned, pin_status = _extract_pinned_home(installed_argv)
@@ -630,6 +519,18 @@ def restart(
             credential_readiness=readiness,
             label=agent.label,
             probe_state=probe_state,
+        )
+    # Identity at ACTION time: the `print` above shelled out, so the classification is stale by one
+    # subprocess — the same window r12f1 closed for the destructive verbs (j#102550 r13f1). A
+    # kickstart is a mutation of the running system and gets the same treatment.
+    at_kickstart = classify_agent_plist(os_home, agent=agent)
+    if at_kickstart != PLIST_OWNED:
+        return _refused(
+            "restart",
+            REASON_NOT_INSTALLED
+            if at_kickstart == PLIST_ABSENT
+            else _PLIST_REFUSAL_REASON[at_kickstart],
+            credential_readiness=readiness, label=agent.label, plist_state=at_kickstart,
         )
     result = _launchctl(runner, ["kickstart", "-k", _service_target(agent)])
     if result.returncode != 0:
@@ -672,17 +573,24 @@ def uninstall(
     admits it does not understand. ``absent`` still boots out — nothing needs identifying, and a
     loaded job whose file is already gone is precisely the state a teardown should clear.
 
-    **A verified stop.** The owned plist is unlinked only after ``launchctl bootout`` **succeeds**,
-    the same single authority the retired-drain migration uses (gateway disposition j#102458).
-    Unlinking does not unregister anything — launchd keys a bootstrapped job off its *label* — so
-    deleting after a failed bootout hides a possibly-live job instead of stopping it, and it used to
-    do so while reporting ``performed: true`` / ``removed: true`` with an empty reason.
+    **A verified stop, in every branch.** The verb succeeds only when ``launchctl bootout``
+    **succeeds**, the same single authority the retired-drain migration uses (gateway disposition
+    j#102458). Unlinking does not unregister anything — launchd keys a bootstrapped job off its
+    *label* — so deleting after a failed bootout hides a possibly-live job instead of stopping it.
 
-    The over-refusal is real and is the deliberate choice: a plist that was never loaded may also
-    fail to boot out, so its uninstall now refuses with :data:`REASON_BOOTOUT_FAILED` and keeps the
-    file. That costs the operator a visible, retryable leftover. The other direction costs an
-    invisible service that no file can stop before logout — the exact state #15192 exists to end. The
-    result carries the retained plist's state so the leftover is never silent.
+    That rule now covers the ``absent`` branch too (review j#102550 r13f3). It did not, on a
+    justification that contradicted itself: the comment there said a loaded job whose file is gone is
+    exactly what a teardown should clear, and then that the bootout's exit code decided nothing. If
+    that is the state being cleared, whether the bootout worked is precisely what matters — and when
+    it failed, this returned ``performed: true`` with an empty reason and the CLI exited 0 while the
+    job kept running.
+
+    The over-refusal is real, wider than before, and still the deliberate choice. A never-loaded
+    label can also fail to boot out, so an uninstall on an already-clean host — nothing installed,
+    nothing loaded — can now refuse with :data:`REASON_BOOTOUT_FAILED` instead of quietly succeeding.
+    That costs a visible, retryable refusal. The other direction costs an operator who believes a
+    service is gone while it runs until logout, which is the state #15192 exists to end. The result
+    carries the plist's state so nothing about what was left behind is silent.
 
     A retired ``--drain-only`` registration from before #15192 is torn down under its own identical
     fence, and its refusal never blocks this one: they are separate artifacts with separate reasons.
@@ -696,17 +604,19 @@ def uninstall(
             "uninstall", _PLIST_REFUSAL_REASON[own_state], label=agent.label, plist_state=own_state
         )
     booted_out = _launchctl(runner, ["bootout", _service_target(agent)])
-    if own_state == PLIST_ABSENT:
-        # Nothing to identify or unlink. The bootout above is the whole teardown; whether it exits
-        # non-zero says nothing here, since a never-loaded label also does.
-        migration = remove_legacy_drain(os_home=os_home, runner=runner)
-        return _uninstall_result(False, "", agent=agent, migration=migration, plist_state=own_state)
     if booted_out.returncode != 0:
-        # Keep the plist: it is the operator's only durable trace of a registration that may still be
-        # live. The retired drain is left alone too — this host is not in a state we understand.
+        # The stop is not established, so the verb does not succeed — in EITHER branch (j#102550
+        # r13f3). With a plist, it is kept: the operator's only durable trace of a registration that
+        # may still be live. Without one, there is nothing to keep and nothing to report as removed,
+        # but the job may still be running, so this is a refusal rather than a quiet success. The
+        # retired drain is left alone too — this host is not in a state we understand.
         return _refused(
             "uninstall", REASON_BOOTOUT_FAILED, label=agent.label, plist_state=own_state
         )
+    if own_state == PLIST_ABSENT:
+        # Nothing to unlink; the succeeding bootout was the whole teardown.
+        migration = remove_legacy_drain(os_home=os_home, runner=runner)
+        return _uninstall_result(False, "", agent=agent, migration=migration, plist_state=own_state)
     # Identity at ACTION time, one subprocess after the classification above (r12f1's fix, applied to
     # this verb as well). Narrows the window; `unlink` still targets a path, not the validated inode.
     at_unlink = classify_agent_plist(os_home, agent=agent)
@@ -719,7 +629,17 @@ def uninstall(
         return _refused(
             "uninstall", _PLIST_REFUSAL_REASON[at_unlink], label=agent.label, plist_state=at_unlink
         )
-    plist_path(os_home, agent=agent).unlink()
+    try:
+        plist_path(os_home, agent=agent).unlink()
+    except OSError:
+        # A read-only volume, a permission change, a vanished parent. The retired-drain migration has
+        # always reported this as a typed result; this verb let the OSError escape the envelope
+        # entirely, taking a host path in the exception text with it (review j#102550 r13f5). The
+        # bootout DID succeed, so the job is stopped — only the file is still there.
+        return _refused(
+            "uninstall", REASON_PLIST_REMOVAL_FAILED,
+            label=agent.label, removed=False, plist_state=at_unlink,
+        )
     migration = remove_legacy_drain(os_home=os_home, runner=runner)
     return _uninstall_result(True, "", agent=agent, migration=migration, plist_state=at_unlink)
 
@@ -761,16 +681,28 @@ def service_status(
     An unhealthy pin — or an owned plist that exists but is unreadable / non-mapping (``home_pin`` =
     ``unreadable_plist``; distinct from absence, which is ``not_installed`` — j#79136 R4-F3) —
     surfaces as ``home_pin`` != ``ok`` with an empty readiness (unknowable). Only when nothing is
-    installed is ``credential_readiness`` the would-be root's (``mozyo_home`` / default). Never emits
-    a credential value, a request header, a repo-local path, or pane text.
+    installed is ``credential_readiness`` the would-be root's (``mozyo_home`` / default).
+
+    **Never emits a credential value, a request header, a repo-local path, or pane text** — and that
+    promise is now scoped to what makes it true. It rests on this adapter having *written* the plist
+    it reads; a stranger's file at the same path carries whatever its author put in it. The
+    projection therefore classifies first and reads plist contents only when the file is ``owned``,
+    reporting ``plist_state`` in every case so an operator can tell "nothing installed" from
+    "something installed that is not ours" (review j#102550 r13f4).
     """
     target = plist_path(os_home, agent=agent)
-    plist_exists = target.exists()
+    plist_state = classify_agent_plist(os_home, agent=agent)
+    plist_exists = plist_state != PLIST_ABSENT
     probe = _probe(runner, agent=agent)
     loaded, pid = bool(probe["loaded"]), probe["pid"]
     probe_state = probe["state"]
 
-    installed = _read_installed_plist(target) if plist_exists else None
+    # Only OUR plist is read into the projection (review j#102550 r13f4). The secret-free promise
+    # below held for a file this adapter wrote — it renders no environment block and no credential —
+    # but it was applied to whatever sat at the path, so a foreign plist's `ProgramArguments` (a
+    # `--token sensitive-value` in the reproduction) reached the JSON payload and the CLI text. What
+    # someone else's file contains is not this adapter's to promise, so it is never read out.
+    installed = _read_installed_plist(target) if plist_state == PLIST_OWNED else None
     # Three distinct states: absent (not_installed), present-but-unreadable (unreadable_plist), and
     # present + parsed (judged by its --home pin) — j#79136 R4-F3.
     scheduled_interval = installed.get("StartInterval") if installed else None
@@ -854,8 +786,13 @@ def service_status(
         # nor the common CLI could distinguish a verified state from an unreadable one. A fixed
         # token only: no raw launchctl text and no secret ever reaches this projection.
         "probe_state": probe_state,
-        # 実行内容: the exact argv the scheduled agent runs. Non-secret by construction — a
-        # PATH-resolved executable, fixed flags, and a config directory; never an environment block.
+        # Whose file occupies the owned path, in the same fixed vocabulary the mutating verbs refuse
+        # with. Emitted always, so "installed" is never read as "installed by us" (j#102550 r13f4).
+        "plist_state": plist_state,
+        # 実行内容: the exact argv the scheduled agent runs. Non-secret **because this adapter wrote
+        # it** — a PATH-resolved executable, fixed flags, and a config directory, never an
+        # environment block. That is a fact about our own render, not about any file at the path, so
+        # it is emitted only when `plist_state` is `owned` and is empty otherwise.
         "installed_command": list(installed_argv) if isinstance(installed_argv, list) else [],
         # The provider cadence the supervisor body enforces internally, surfaced so an operator can
         # see that the OS tick is not a Redmine poll. This adapter does not set or enforce it.
@@ -893,6 +830,8 @@ __all__ = (
     "REASON_PLIST_FOREIGN_LABEL",
     "REASON_PLIST_UNREADABLE",
     "REASON_BOOTOUT_FAILED",
+    "REASON_PLIST_WRITE_FAILED",
+    "REASON_PLIST_REMOVAL_FAILED",
     "PROBE_LOADED",
     "PROBE_CONFIRMED_ABSENT",
     "PROBE_UNREADABLE",

@@ -554,15 +554,20 @@ class RestartTest(_DarwinCase):
         self.assertNotIn("kickstart", runner.verbs)
 
     def test_restart_refuses_on_unreadable_plist_distinct_from_absent(self) -> None:
-        # R4-F3: a present-but-unparseable plist is unhealthy, not "not installed".
+        # R4-F3: a present-but-unparseable plist is unhealthy, not "not installed". That distinction
+        # is what this test exists for and it still holds; since j#102550 r13f1 routed restart
+        # through the shared classifier, the REASON is the accurate `plist_unreadable` — a file we
+        # cannot parse is unidentifiable before it is un-pinnable — while `home_pin` keeps the value
+        # it always reported, so consumers of that field see no change.
         target = sl.plist_path(self.os_home)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(b"\x00\x01 not a plist")
         runner = FakeRunner(print_result=_result(0, stdout="pid = 9\n"))
         result = sl.restart(os_home=self.os_home, runner=runner, which=_which_found)
         self.assertFalse(result["performed"])
-        self.assertEqual(sl.REASON_HOME_PIN_UNHEALTHY, result["reason"])
+        self.assertEqual(sl.REASON_PLIST_UNREADABLE, result["reason"])
         self.assertEqual(sl.HOME_PIN_UNREADABLE, result["home_pin"])
+        self.assertNotEqual(sl.REASON_NOT_INSTALLED, result["reason"])  # still not "absent"
         self.assertEqual([], runner.calls)
 
     def test_restart_refuses_on_non_darwin(self) -> None:
@@ -1993,15 +1998,40 @@ class UninstallNeverDeletesAfterFailedBootoutTest(_DarwinCase):
         self.assertFalse(legacy.exists())
         self.assertEqual(["bootout", "bootout"], [c[1] for c in calls])  # owned, then retired drain
 
-    def test_an_absent_plist_still_boots_out_and_succeeds(self) -> None:
-        # Nothing to identify or unlink, and a loaded job whose file is already gone is exactly the
-        # state a teardown should clear — so the bootout still runs and its exit code decides nothing.
+    def test_an_absent_plist_boots_out_and_succeeds_only_when_the_bootout_does(self) -> None:
+        # A loaded job whose file is already gone is exactly the state a teardown should clear — so
+        # whether the bootout SUCCEEDED is precisely what decides the answer. This test previously
+        # asserted the opposite (rc=1 -> performed True), pinning a success the host had not
+        # delivered; the comment even said the exit code "decides nothing" while the branch above it
+        # explained why it decides everything (review j#102550 r13f3).
         self.owned.unlink()
-        result, calls = self._uninstall_with(_result(1))
+        result, calls = self._uninstall_with(_result(0))
         self.assertTrue(result["performed"])
         self.assertFalse(result["removed"])
         self.assertEqual(sl.PLIST_ABSENT, result["plist_state"])
         self.assertIn("bootout", [c[1] for c in calls])
+
+    def test_an_absent_plist_with_a_failed_bootout_refuses(self) -> None:
+        # Nothing to keep and nothing removable, but the job may still be running, so this is a
+        # refusal — not a quiet success with CLI exit 0.
+        self.owned.unlink()
+        result, _ = self._uninstall_with(_result(1, stderr="Boot-out failed: 5: I/O error"))
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_BOOTOUT_FAILED, result["reason"])
+        self.assertEqual(sl.PLIST_ABSENT, result["plist_state"])
+
+    def test_an_unlink_failure_is_a_typed_result_not_an_escaping_oserror(self) -> None:
+        # The retired-drain migration has always reported this as a typed result; this verb let the
+        # OSError out of the envelope, host path and all (review j#102550 r13f5).
+        with patch.object(sl.Path, "unlink", side_effect=OSError("read-only file system")):
+            result, _ = self._uninstall_with(_result(0))
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_PLIST_REMOVAL_FAILED, result["reason"])
+        self.assertFalse(result["removed"])
+        self.assertEqual(sl.PLIST_OWNED, result["plist_state"])
+        rendered = repr(result)
+        self.assertNotIn("read-only", rendered)
+        self.assertNotIn(str(self.os_home), rendered)
 
     def test_the_refusal_carries_no_manager_text_or_host_path(self) -> None:
         result, _ = self._uninstall_with(
@@ -2011,6 +2041,229 @@ class UninstallNeverDeletesAfterFailedBootoutTest(_DarwinCase):
         self.assertNotIn(str(self.os_home), rendered)
         self.assertNotIn("Boot-out", rendered)
         self.assertNotIn("Input/output", rendered)
+
+
+class RestartEnforcesOwnedIdentityTest(_DarwinCase):
+    """restart acts only on a plist that is ours (review j#102550 r13f1).
+
+    It was the one verb reading the plist's *contents* — argv, `--home` pin — without ever asking
+    whose plist it was. A stranger's file carrying our expected ProgramArguments produced a
+    `performed: true` kickstart, and the kickstart named OUR label: the evidence and the action were
+    about different services.
+    """
+
+    def _expected_argv(self) -> list:
+        return sl.resolve_supervisor_command(mozyo_home=self.mozyo_home, which=_which_found)
+
+    def _plist_with(self, label: str) -> Path:
+        target = sl.plist_path(self.os_home)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(
+            plistlib.dumps({"Label": label, "ProgramArguments": self._expected_argv()})
+        )
+        return target
+
+    def test_a_foreign_plist_with_our_exact_argv_is_refused_before_any_launchctl(self) -> None:
+        self._plist_with("com.example.foreign")
+        runner = FakeRunner(print_result=_result(0, "\tstate = running\n\tpid = 42\n"))
+        result = sl.restart(os_home=self.os_home, runner=runner, which=_which_found)
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_PLIST_FOREIGN_LABEL, result["reason"])
+        self.assertEqual(sl.PLIST_FOREIGN, result["plist_state"])
+        self.assertEqual([], runner.calls)  # no print, and above all no kickstart
+
+    def test_an_unreadable_plist_refuses_and_still_reports_the_pin_field(self) -> None:
+        target = sl.plist_path(self.os_home)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"not a plist")
+        runner = FakeRunner()
+        result = sl.restart(os_home=self.os_home, runner=runner, which=_which_found)
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_PLIST_UNREADABLE, result["reason"])
+        # `home_pin` keeps the value it always had, so consumers of that field are unaffected; only
+        # the reason changed, to the accurate one.
+        self.assertEqual(sl.HOME_PIN_UNREADABLE, result["home_pin"])
+        self.assertEqual([], runner.calls)
+
+    def test_a_plist_swapped_between_the_probe_and_the_kickstart_is_not_kickstarted(self) -> None:
+        # Same window r12f1 closed for the destructive verbs: a kickstart is a mutation too.
+        target = self._plist_with(sl.SUPERVISOR_LAUNCHD_LABEL)
+        calls: list[str] = []
+
+        def runner(argv):
+            calls.append(argv[1])
+            if argv[1] == "print":
+                target.write_bytes(
+                    plistlib.dumps(
+                        {"Label": "com.example.foreign", "ProgramArguments": self._expected_argv()}
+                    )
+                )
+                return _result(0, "\tstate = running\n\tpid = 42\n")
+            return _result(0)
+
+        result = sl.restart(
+            os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found
+        )
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_PLIST_FOREIGN_LABEL, result["reason"])
+        self.assertEqual(["print"], calls)  # the kickstart never went out
+
+    def test_an_owned_plist_still_restarts(self) -> None:
+        self._plist_with(sl.SUPERVISOR_LAUNCHD_LABEL)
+        runner = FakeRunner(print_result=_result(0, "\tstate = running\n\tpid = 42\n"))
+        result = sl.restart(
+            os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found
+        )
+        self.assertTrue(result["performed"], result.get("reason"))
+        self.assertEqual(["print", "kickstart"], runner.verbs)
+
+
+class ThePathIsNotFollowedTest(_DarwinCase):
+    """A symlink at the owned path never redirects a mutation out of it (j#102550 r13f2).
+
+    r12f2 established that a path does not prove ownership of the file at it. This is the mirror
+    image: the path may not even *be* the file. `Path.exists()` calls a broken symlink absent, so a
+    link classified as `absent` and the install created a file wherever it pointed; a link to an
+    existing plist carrying our label classified as `owned` and the install overwrote it. Both
+    reported `performed: true`.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.outside = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: None)
+        self.target = sl.plist_path(self.os_home)
+        self.target.parent.mkdir(parents=True, exist_ok=True)
+
+    def _install(self):
+        return sl.install(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            runner=FakeRunner(), which=_which_found,
+        )
+
+    def test_a_broken_symlink_is_unreadable_not_absent(self) -> None:
+        self.target.symlink_to(self.outside / "nowhere.plist")
+        self.assertEqual(sl.PLIST_UNREADABLE, sl.classify_agent_plist(self.os_home))
+
+    def test_install_through_a_broken_symlink_creates_nothing_outside(self) -> None:
+        victim = self.outside / "victim.plist"
+        self.target.symlink_to(victim)
+        result = self._install()
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_PLIST_UNREADABLE, result["reason"])
+        self.assertFalse(victim.exists())
+
+    def test_install_through_a_symlink_to_our_label_does_not_overwrite_it(self) -> None:
+        victim = _write_plist(self.outside / "someone-elses.plist", sl.SUPERVISOR_LAUNCHD_LABEL)
+        before = victim.read_bytes()
+        self.target.symlink_to(victim)
+        result = self._install()
+        self.assertFalse(result["performed"])
+        self.assertEqual(before, victim.read_bytes())
+
+    def test_uninstall_and_restart_refuse_a_symlink_too(self) -> None:
+        victim = _write_plist(self.outside / "elsewhere.plist", sl.SUPERVISOR_LAUNCHD_LABEL)
+        self.target.symlink_to(victim)
+        for verb, call in (
+            ("uninstall", lambda: sl.uninstall(os_home=self.os_home, runner=FakeRunner())),
+            ("restart", lambda: sl.restart(
+                os_home=self.os_home, runner=FakeRunner(), which=_which_found)),
+        ):
+            with self.subTest(verb=verb):
+                result = call()
+                self.assertFalse(result["performed"])
+                self.assertEqual(sl.REASON_PLIST_UNREADABLE, result["reason"])
+                self.assertTrue(victim.exists())
+
+    def test_a_hard_linked_plist_is_refused_and_the_other_name_is_untouched(self) -> None:
+        # Same class: the inode is reachable under a name we never accounted for, so writing "our"
+        # path writes a file outside it. A deliberate, stated refusal.
+        other = self.outside / "second-name.plist"
+        _write_plist(self.target, sl.SUPERVISOR_LAUNCHD_LABEL)
+        os.link(self.target, other)
+        before = other.read_bytes()
+        self.assertEqual(sl.PLIST_UNREADABLE, sl.classify_agent_plist(self.os_home))
+        result = self._install()
+        self.assertFalse(result["performed"])
+        self.assertEqual(before, other.read_bytes())
+
+    def test_the_writer_itself_refuses_a_symlink_even_when_asked_directly(self) -> None:
+        # The guarantee must not rest on the classification winning a race, so the write refuses on
+        # its own (O_NOFOLLOW) rather than trusting the check that preceded it.
+        victim = self.outside / "late-swap.plist"
+        self.target.symlink_to(victim)
+        with self.assertRaises(OSError):
+            sl.write_owned_plist(self.target, b"payload")
+        self.assertFalse(victim.exists())
+
+    def test_a_plain_owned_plist_is_still_written_and_readable(self) -> None:
+        result = self._install()
+        self.assertTrue(result["performed"], result.get("reason"))
+        self.assertEqual(
+            sl.SUPERVISOR_LAUNCHD_LABEL, plistlib.loads(self.target.read_bytes())["Label"]
+        )
+
+
+class StatusReadsOnlyOurOwnPlistTest(_DarwinCase):
+    """service_status never reads out a file it did not write (review j#102550 r13f4).
+
+    The secret-free promise held for a plist this adapter rendered — no environment block, no
+    credential. It was being applied to whatever occupied the path, so a foreign plist's
+    `ProgramArguments` reached the payload verbatim.
+    """
+
+    SENTINEL = "sensitive-sentinel-value"
+
+    def _status(self):
+        return sl.service_status(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            runner=FakeRunner(print_result=_result(113)), which=_which_found,
+        )
+
+    def _foreign_with_sentinel(self) -> Path:
+        target = sl.plist_path(self.os_home)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(
+            plistlib.dumps(
+                {
+                    "Label": "com.example.foreign",
+                    "ProgramArguments": ["/tmp/foreign", "--token", self.SENTINEL],
+                }
+            )
+        )
+        return target
+
+    def test_a_foreign_plists_arguments_never_reach_the_projection(self) -> None:
+        self._foreign_with_sentinel()
+        status = self._status()
+        self.assertNotIn(self.SENTINEL, repr(status))
+        self.assertEqual([], status["installed_command"])
+        self.assertEqual(sl.PLIST_FOREIGN, status["plist_state"])
+
+    def test_status_still_reports_that_something_is_installed(self) -> None:
+        # Suppressing the contents must not suppress the fact: an operator has to see that a file is
+        # there and that it is not ours.
+        self._foreign_with_sentinel()
+        status = self._status()
+        self.assertTrue(status["plist_exists"])
+        self.assertEqual(sl.PLIST_FOREIGN, status["plist_state"])
+        self.assertEqual(sl.HOME_PIN_UNREADABLE, status["home_pin"])
+        self.assertFalse(status["executable_matches"])
+
+    def test_an_owned_plist_still_publishes_its_argv(self) -> None:
+        sl.install(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            runner=FakeRunner(), which=_which_found,
+        )
+        status = self._status()
+        self.assertEqual(sl.PLIST_OWNED, status["plist_state"])
+        self.assertIn("--run-once", status["installed_command"])
+
+    def test_a_clean_host_reports_absent(self) -> None:
+        status = self._status()
+        self.assertEqual(sl.PLIST_ABSENT, status["plist_state"])
+        self.assertFalse(status["plist_exists"])
+        self.assertEqual([], status["installed_command"])
 
 
 if __name__ == "__main__":

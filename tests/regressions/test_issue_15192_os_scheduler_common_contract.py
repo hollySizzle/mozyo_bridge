@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import subprocess
 import sys
 import plistlib
 import tempfile
@@ -500,8 +501,11 @@ class DestructiveVerbIdentityFenceTest(unittest.TestCase):
         return os_home, mozyo_home
 
     def _write(self, target: Path, label: str) -> Path:
+        return self._write_argv(target, label, ["/x"])
+
+    def _write_argv(self, target: Path, label: str, argv: list) -> Path:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(plistlib.dumps({"Label": label, "ProgramArguments": ["/x"]}))
+        target.write_bytes(plistlib.dumps({"Label": label, "ProgramArguments": argv}))
         return target
 
     def test_a_stranger_s_plist_at_our_path_survives_install_and_uninstall(self) -> None:
@@ -532,6 +536,61 @@ class DestructiveVerbIdentityFenceTest(unittest.TestCase):
         self.assertFalse(result["performed"])
         self.assertEqual(sl.REASON_BOOTOUT_FAILED, result["reason"])
         self.assertTrue(owned.exists())
+
+    def test_no_verb_mutates_through_a_symlink_at_the_owned_path(self) -> None:
+        # Review j#102550 r13f2: a path is not proof of ownership (r12f2) AND is not proof of being
+        # the file at all. Asserted for every verb, since each one used to follow the link.
+        for verb in ("install", "restart", "uninstall"):
+            with self.subTest(verb=verb):
+                os_home, mozyo_home = self._home()
+                victim = Path(tempfile.mkdtemp()) / "outside.plist"
+                self._write(victim, sl.SUPERVISOR_LAUNCHD_LABEL)
+                before = victim.read_bytes()
+                link = sl.plist_path(os_home)
+                link.parent.mkdir(parents=True, exist_ok=True)
+                link.symlink_to(victim)
+                with patch.object(sl, "_running_on_darwin", return_value=True):
+                    call = {
+                        "install": lambda: sl.install(
+                            os_home=os_home, mozyo_home=mozyo_home,
+                            runner=lambda _c: _fake_result(0),
+                            which=lambda _n: "/opt/bin/mozyo-bridge",
+                        ),
+                        "restart": lambda: sl.restart(
+                            os_home=os_home, runner=lambda _c: _fake_result(0),
+                            which=lambda _n: "/opt/bin/mozyo-bridge",
+                        ),
+                        "uninstall": lambda: sl.uninstall(
+                            os_home=os_home, runner=lambda _c: _fake_result(0)
+                        ),
+                    }[verb]
+                    result = call()
+                self.assertFalse(result["performed"])
+                self.assertEqual(sl.REASON_PLIST_UNREADABLE, result["reason"])
+                self.assertTrue(victim.exists())
+                self.assertEqual(before, victim.read_bytes())
+
+    def test_a_foreign_plists_arguments_never_reach_the_cli_text_or_json(self) -> None:
+        # Review j#102550 r13f4: the secret-free acceptance is asserted where an operator reads it,
+        # through the real CLI, in BOTH renderings — not only at the adapter's return value.
+        sentinel = "sensitive-sentinel-value"
+        os_home = Path(tempfile.mkdtemp())
+        home = Path(tempfile.mkdtemp())
+        self._write_argv(
+            sl.plist_path(os_home), "com.example.foreign",
+            ["/tmp/foreign", "--token", sentinel],
+        )
+        for as_json in (True, False):
+            with self.subTest(json=as_json):
+                argv = ["workflow", "supervisor", "--service-status", "--home", str(home)]
+                if as_json:
+                    argv.append("--json")
+                with patch.object(sys, "platform", "darwin"), patch.object(
+                    subprocess, "run", side_effect=lambda *a, **k: _fake_result(113)
+                ), patch("pathlib.Path.home", return_value=os_home):
+                    _rc, out = _run(argv)
+                self.assertNotIn(sentinel, out)
+                self.assertNotIn("/tmp/foreign", out)
 
     def test_the_classification_is_the_same_one_for_both_agents(self) -> None:
         # Not two parallel implementations that can drift apart — one function, two callers.

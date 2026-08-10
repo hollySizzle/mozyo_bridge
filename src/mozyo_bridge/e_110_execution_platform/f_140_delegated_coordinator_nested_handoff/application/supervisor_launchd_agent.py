@@ -22,6 +22,7 @@ import dataclasses
 import os
 import plistlib
 import shutil
+import stat
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
@@ -265,9 +266,39 @@ def classify_plist(target: Path, *, label: str) -> str:
 
     ``UNREADABLE`` is deliberately distinct from ``FOREIGN``: "this is someone else's" and "I cannot
     tell whose this is" are different facts, and neither one authorizes a mutation.
+
+    **The path is not followed anywhere else** (review j#102550 r13f2). r12f2 established that a path
+    does not prove ownership of the file at it; this closes the mirror image — that the path may not
+    even *be* the file. ``Path.exists()`` answers False for a broken symlink, so a link at the owned
+    path classified as ``ABSENT`` and the install then created a file wherever it pointed; a link to
+    an existing plist carrying our label classified as ``OWNED`` and the install overwrote a file
+    outside the owned path. Both reported ``performed: true``.
+
+    So identity is established with ``lstat`` on the path itself, and only a **regular file with a
+    single link** can be owned:
+
+    - a symlink is ``UNREADABLE`` — following it would mutate somewhere else, and where it points is
+      not this adapter's to decide;
+    - anything that is not a regular file (directory, socket, device) is ``UNREADABLE``;
+    - ``st_nlink > 1`` is ``UNREADABLE`` too. A hard link is the same defect wearing different
+      clothes: the inode is reachable under another name, so writing "our" path writes a file we
+      never accounted for. This is a deliberate refusal, stated rather than left implicit, and it
+      does over-refuse a host that hard-links its LaunchAgents on purpose — which is recoverable and
+      visible, unlike writing through one.
+
+    Classification alone would not be enough even so: the path could become a symlink between this
+    call and the write. The writer therefore refuses to follow links itself (``O_NOFOLLOW``), so the
+    guarantee does not rest on the check winning a race.
     """
-    if not target.exists():
+    try:
+        info = os.lstat(target)
+    except FileNotFoundError:
         return PLIST_ABSENT
+    except OSError:
+        # Present enough to raise something other than "not there" — we cannot establish what it is.
+        return PLIST_UNREADABLE
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        return PLIST_UNREADABLE
     parsed = read_installed_plist(target)
     if parsed is None:
         return PLIST_UNREADABLE
@@ -275,6 +306,24 @@ def classify_plist(target: Path, *, label: str) -> str:
     if not isinstance(found, str) or not found:
         return PLIST_UNREADABLE
     return PLIST_OWNED if found == label else PLIST_FOREIGN
+
+
+def write_owned_plist(target: Path, payload: bytes) -> None:
+    """Write ``payload`` to ``target`` **without following a symlink** (review j#102550 r13f2).
+
+    ``Path.write_bytes`` follows a link at the destination, so a link planted at the owned path — or
+    swapped in after the classification — redirects the write to a file this adapter does not own.
+    ``O_NOFOLLOW`` makes the kernel refuse that at open time, which is a property of the call rather
+    than of a check that has to win a race.
+
+    Raises ``OSError`` (``ELOOP``) when the path is a symlink, so callers surface it as a refusal
+    instead of writing through it.
+    """
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    try:
+        os.write(fd, payload)
+    finally:
+        os.close(fd)
 
 
 def extract_pinned_home(installed_argv: object) -> tuple[Optional[str], str]:
@@ -588,6 +637,7 @@ __all__ = (
     "PLIST_FOREIGN",
     "PLIST_UNREADABLE",
     "classify_plist",
+    "write_owned_plist",
     "LAUNCHCTL",
     "gui_domain",
     "service_target",

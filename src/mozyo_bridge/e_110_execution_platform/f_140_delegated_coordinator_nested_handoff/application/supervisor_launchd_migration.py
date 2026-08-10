@@ -16,9 +16,8 @@ the whole macOS adapter and no caller or test had to change.
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
-from typing import Callable, Optional, Sequence
+from typing import Optional
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd_agent import (  # noqa: E501
     LEGACY_DRAIN_AGENT,
@@ -33,13 +32,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     plist_path,
     service_target,
 )
-
-Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
-
-
-def _default_runner(argv: Sequence[str]) -> "subprocess.CompletedProcess[str]":
-    return subprocess.run(list(argv), capture_output=True, text=True, check=False)
-
+# The process seam lives with the read-only probe (the only inherently "run something" concern), so
+# both mutating modules take it from one place rather than each defining its own.
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd_probe import (  # noqa: E501
+    Runner,
+    default_runner as _default_runner,
+)
 
 # ---------------------------------------------------------------------------
 # Fixed-vocabulary reason tokens for this migration (secret-safe; UI-language-independent).

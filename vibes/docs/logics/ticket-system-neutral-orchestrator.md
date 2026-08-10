@@ -561,11 +561,41 @@ path にしか identity 検査がなく、`install` は自 path 上の **他人�
 分類は両 agent で **同一関数**を用い、`absent` / `owned` のみ mutation 可能、`foreign` / `unreadable` は
 **launchctl 呼出すら行わない** typed zero-mutation 拒否とする（`plist_foreign_label` / `plist_unreadable`）。
 
-**`uninstall` も bootout 成功なしに owned plist を unlink しない**（review j#102496 r12f3）。従来は bootout の
+**`uninstall` も bootout 成功なしに成功しない**（review j#102496 r12f3 / j#102550 r13f3）。従来は bootout の
 結果を破棄して削除し、`performed: true` / `removed: true` / reason 空という **成功と区別できない envelope** で
-報告していた。**過剰拒否は承知の上での選択**である: 未 load の plist も bootout が非 0 を返しうるため、その
-uninstall は `launchctl_bootout_failed` で拒否され file が残る。残留は operator から可視で再試行可能だが、
-誤削除は **logout まで停止できず file からは見えない job** を生む。損害が非対称なので安全側へ倒す。
+報告していた。この規則は **plist 不在の branch にも適用する**。当初 absent 分岐だけは「その状態を clear する
+ために bootout を撃つのだから exit code は判定に使わない」としていたが、**前段と後段が矛盾していた**: clear
+するために撃つのなら、成功したかどうかこそが決定的である。失敗時は停止できていないのに CLI が exit 0 を返す。
+
+**過剰拒否は承知の上での選択**であり、範囲は r12f3 より広い: 未 load の label にも bootout は非 0 を返しうる
+ため、**何も入っていない正常 host の uninstall も拒否されうる**。それでも採るのは損害が非対称だからである。
+拒否は可視で再試行可能、誤った成功報告は **operator が「消えた」と信じたまま logout まで走る job** を残す。
+
+**mutation する verb は `restart` も含めて identity を検査する**（review j#102550 r13f1）。`restart` だけは
+plist の**内容**（argv / home pin）のみを読み、`Label` を見ていなかったため、他人の plist が期待どおりの
+`ProgramArguments` を持つだけで `performed: true` の kickstart が成立した。しかも kickstart は **owned label
+に対して**発行されるので、**根拠と行為が別の service を指す**。entry で分類し、`print` の後（= subprocess を
+1 回挟んだ後）に再検証する。kickstart も稼働中 system への mutation であり、扱いは削除と同じである。
+
+**path は「所有の証明」でないだけでなく「その file である証明」でもない**（review j#102550 r13f2）。
+`Path.exists()` は broken symlink を False と答えるため、owned path に置かれた link は `absent` と分類され、
+install が link を辿って **owned path の外に file を作成**した。既存 plist を指す link は、その file が owned
+label を持てば `owned` と分類され、**外部 plist を上書き**した。したがって identity は `lstat` で path 自身に
+対して確立し、**単一 link の regular file だけ**が `owned` になりうる: symlink・非 regular file・
+`st_nlink > 1`（hard link）はすべて `unreadable` とする。hard link を含めるのは同じ class（自 path への write が
+外部の名前にも及ぶ）だからであり、**意図的な過剰拒否として明示**する。さらに **write 側も `O_NOFOLLOW`** で
+link を辿らない。分類だけでは「分類後に link へ差し替える」窓が残るため、**保証を検査の勝敗に依存させない**。
+
+**status は自分が書いた plist しか読み出さない**（review j#102550 r13f4）。secret-free の約束は「この plist は
+自分が render した」——environment block も credential も入らない——という事実に立脚しており、**path に居る
+任意の file には及ばない**。identity 検査なしに raw `ProgramArguments` を projection へ通していたため、他人の
+plist の引数（再現では `--token <値>`）が JSON payload と CLI text の双方へ露出した。`plist_state` を常に投影し、
+`owned` のときだけ argv を出す。**「installed」を「installed by us」と読ませない**ためである。
+
+**失敗も同一 result shape で返す**（review j#102550 r13f5）。`uninstall` の unlink 失敗は構造化 envelope を
+抜けて `OSError` として送出され、例外文に host path を伴っていた。退役 migration が同じ失敗を typed result に
+していたのと非対称である。`plist_removal_failed` として `performed=false` / `removed=false` / `plist_state` と
+共に返し、例外文と path を CLI へ出さない。
 
 **「読めなかった」を「無かった」に畳まない**（review j#102180 finding 1）。probe は `loaded` /
 `confirmed_absent` / `unreadable` の 3 値である。権限不足・service manager 異常・認識できない失敗・
