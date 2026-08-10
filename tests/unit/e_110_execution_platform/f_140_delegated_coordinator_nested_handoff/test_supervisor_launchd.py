@@ -436,12 +436,33 @@ class RestartTest(_DarwinCase):
             runner.calls[-1],
         )
 
-    def test_restart_refuses_zero_mutation_when_not_loaded(self) -> None:
+    def test_restart_refuses_zero_mutation_on_a_confirmed_absence(self) -> None:
+        # The fixture now carries a real confirmed absence — a recognized clause whose operand IS our
+        # label. The old one said only `"not found"`, which binds to nothing and is therefore an
+        # UNREADABLE read, not an absent one; the sibling test below covers that case explicitly.
         self._install_ready()
-        runner = FakeRunner(print_result=_result(113, stderr="not found"))
+        owned = sl.SUPERVISOR_AGENT.label
+        runner = FakeRunner(
+            print_result=_result(113, stderr=f'Could not find service "{owned}" in domain for gui')
+        )
         result = sl.restart(os_home=self.os_home, runner=runner, which=_which_found)
         self.assertFalse(result["performed"])
         self.assertEqual(sl.REASON_SERVICE_NOT_LOADED, result["reason"])
+        self.assertEqual(sl.PROBE_CONFIRMED_ABSENT, result["probe_state"])
+        self.assertNotIn("kickstart", runner.verbs)
+
+    def test_restart_separates_an_unreadable_state_from_a_confirmed_absence(self) -> None:
+        # Review j#102398 finding r9f2. `_is_loaded` collapsed the three-valued probe to a bool, so a
+        # permission-denied read and a confirmed not-found came back as the same
+        # `service_not_loaded` with no `probe_state` — reporting "I cannot tell" as an established
+        # fact, and diverging from the Linux adapter under a backend that declares the verbs
+        # identical. Both still refuse with zero mutation; they no longer claim the same thing.
+        self._install_ready()
+        runner = FakeRunner(print_result=_result(1, stderr="Operation not permitted"))
+        result = sl.restart(os_home=self.os_home, runner=runner, which=_which_found)
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_SERVICE_STATE_UNREADABLE, result["reason"])
+        self.assertEqual(sl.PROBE_UNREADABLE, result["probe_state"])
         self.assertNotIn("kickstart", runner.verbs)
 
     def test_restart_refuses_when_not_installed(self) -> None:
@@ -1148,6 +1169,76 @@ class LegacyDrainMigrationTest(_DarwinCase):
                 agent=sl.LEGACY_DRAIN_AGENT,
             )["state"]
             self.assertEqual(state, sl.PROBE_UNREADABLE, why)
+
+    def test_the_clause_must_be_positionally_bound_to_its_operand(self) -> None:
+        # Review j#102398 finding r9f1. The parser searched for the phrase and for a quote
+        # independently and called the pair a clause. Three messages satisfied that while saying
+        # something else, and each authorized unlinking the owned registration.
+        owned = sl.LEGACY_DRAIN_AGENT.label
+        for rendered, why in (
+            (f'Could not find service com.example.other; suggestion "{owned}"',
+             "the clause's real operand is UNQUOTED; ours is a later span"),
+            (f'diagnostic "could not find service"{owned}"x" "{owned}"',
+             "the phrase is INSIDE a span, so the next quote is a closing delimiter"),
+            (f'no such processnot find service "{owned}"',
+             "two abutting phrases are two clauses, not one"),
+            (f'Could not find service oops "{owned}"',
+             "prose between the clause and the span"),
+        ):
+            state = sl._probe(
+                FakeRunner(print_result=_result(113, stderr=rendered)),
+                agent=sl.LEGACY_DRAIN_AGENT,
+            )["state"]
+            self.assertEqual(state, sl.PROBE_UNREADABLE, why)
+
+    def test_the_canonical_form_still_binds_after_positional_tightening(self) -> None:
+        # The complement: tightening must not refuse the shape this is supposed to recognize.
+        owned = sl.LEGACY_DRAIN_AGENT.label
+        for rendered, why in (
+            (f'Could not find service "{owned}" in domain for gui', "canonical"),
+            (f'COULD NOT FIND SERVICE "{owned}"', "wording is prose: case-insensitive"),
+            (f'Could not find service    "{owned}"', "whitespace only between clause and operand"),
+        ):
+            state = sl._probe(
+                FakeRunner(print_result=_result(113, stderr=rendered)),
+                agent=sl.LEGACY_DRAIN_AGENT,
+            )["state"]
+            self.assertEqual(state, sl.PROBE_CONFIRMED_ABSENT, why)
+
+    def test_case_folding_never_shifts_the_offsets_it_reports(self) -> None:
+        # Offsets are computed on the ORIGINAL message. Folding the whole string first and indexing
+        # the result misaligns wherever folding changes length — `len("İ".lower()) == 2` — so a
+        # message carrying such a character would slice the original at the wrong place.
+        self.assertNotEqual(len("\u0130"), len("\u0130".lower()))
+        owned = sl.LEGACY_DRAIN_AGENT.label
+        rendered = f'\u0130 Could not find service "{owned}" in domain'
+        state = sl._probe(
+            FakeRunner(print_result=_result(113, stderr=rendered)),
+            agent=sl.LEGACY_DRAIN_AGENT,
+        )["state"]
+        self.assertEqual(state, sl.PROBE_CONFIRMED_ABSENT)
+
+    def test_the_r9f1_vectors_keep_the_plist_end_to_end(self) -> None:
+        owned = sl.LEGACY_DRAIN_AGENT.label
+        for rendered in (
+            f'Could not find service com.example.other; suggestion "{owned}"',
+            f'diagnostic "could not find service"{owned}"x" "{owned}"',
+            f'no such processnot find service "{owned}"',
+        ):
+            legacy = _legacy_drain_plist(self.os_home)
+
+            class _Vector:
+                def __call__(self, argv):
+                    argv = list(argv)
+                    target = argv[2] if len(argv) > 2 else ""
+                    if owned in target:
+                        return _result(113 if argv[1] == "print" else 1, stderr=rendered)
+                    return _result(0)
+
+            result = sl.remove_legacy_drain(os_home=self.os_home, runner=_Vector())
+            self.assertFalse(result["removed"], rendered)
+            self.assertEqual(result["reason"], sl.REASON_LEGACY_DRAIN_STATE_UNREADABLE, rendered)
+            self.assertTrue(legacy.exists(), rendered)
 
     def test_a_not_found_about_another_service_keeps_the_plist_end_to_end(self) -> None:
         # The consequence the finding turned on: this reading reached `remove_legacy_drain` and

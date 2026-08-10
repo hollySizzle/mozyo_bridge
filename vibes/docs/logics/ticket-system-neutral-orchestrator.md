@@ -558,6 +558,16 @@ span のどこかにある」という **2 つの独立した存在確認**を�
 別 service の not-found と owned label の併記、phrase の前後に owned label があるだけの入力、clause が
 複数ある入力（どれが支配するかの規則がない）は、すべて `unreadable` へ倒す。
 
+clause と operand の結合は **位置つきの単一 scanner** で行う（review j#102398 finding r9f1）。phrase 探索と
+引用符探索を別々に行うと、次のいずれも「clause」を満たしてしまい所有 plist の削除を authorize した:
+operand が**非引用**で ours が後続の別 span（`... service com.example.other; suggestion "<owned>"`）、
+phrase が**引用 span の内側**にあり「直後の引用符」が span の閉じである入力、**隣接する 2 phrase** を 1 clause へ
+併合した入力。したがって (a) phrase は **span の外側**にあること、(b) clause は **真に重なる** hit のみ併合し
+隣接は別 clause（= 複数 clause は unreadable）、(c) operand span は clause の**直後に開始**し間は空白のみ、
+(d) operand は scanner 自身が確定した完全 span であること、をすべて要求する。
+位置計算は **元文字列上**で行う（`lower()` は長さを変え得る code point があるため、畳んだ写しの offset を
+元文字列へ添字すると位置がずれる）。
+
 (3) の照合は **quoted 完全一致のみ**である（review j#102309 finding r5f1）。以前は label 継続文字を
 「英数 + `.` `-` `_`」と *こちらで定義* し、その集合外を境界とみなしていたが、Apple 正本は `Label` を
 「unique な識別文字列」と述べるのみで **この文字集合を規定していない**。結果として `<owned>@helper` /
@@ -611,9 +621,16 @@ launchctl の error wording は API ではなく、**quote を含む label を�
 順序 authority は存在しないため、解決せず捨てる（= `unreadable`）。**同値の重複は矛盾ではない**ため保持する
 （規則は重複ではなく相反についてである）。
 
-`restart` は refusal 理由を事実に対応させる: timer が確認済みで停止していれば `service_not_loaded`、
-状態を読めなければ `timer_state_unreadable`。どちらも zero-mutation だが、**「動いていない」と「判別できない」を
-同じ token で報告しない**（本 issue が繰り返し是正してきた区別を refusal 側でも保つ）。
+`restart` は refusal 理由を事実に対応させる: 確認済みで停止していれば `service_not_loaded`、状態を読めなければ
+`service_state_unreadable`。どちらも zero-mutation だが、**「動いていない」と「判別できない」を同じ token で
+報告しない**（本 issue が繰り返し是正してきた区別を refusal 側でも保つ）。
+
+**この refusal 語彙は両 OS 共通の契約である**（review j#102398 finding r9f2）。backend は verb の
+operator-visible な意味を両 host 同一と宣言しているため、token は OS 固有の manager 名詞（timer / LaunchAgent
+等）を含めず、両 adapter が同一 token を publish する。R8 で Linux 側にのみ区別を入れ macOS 側を bool へ縮退した
+ままにしたことで、**共通化を目的とする本 issue で共通性を壊していた**。macOS `restart` も 3 値 probe を保持し、
+`probe_state` を refusal に載せる。両 backend の unreadable / absent / loaded matrix は **backend envelope まで**
+回帰で固定する。
 
 Linux の `ActiveState` 分類は **closed vocabulary** である（review j#102309 finding r5f2）。
 `active` / `reloading` -> `loaded`（systemd は `reloading` を「active かつ設定 reload 中」と定義する）、

@@ -750,7 +750,7 @@ class RestartTest(_LinuxCase):
                 expected = (
                     ss.REASON_SERVICE_NOT_LOADED
                     if status["probe_state"] == ss.PROBE_CONFIRMED_ABSENT
-                    else ss.REASON_TIMER_STATE_UNREADABLE
+                    else ss.REASON_SERVICE_STATE_UNREADABLE
                 )
                 self.assertEqual(result["reason"], expected, active)
 
@@ -973,7 +973,7 @@ class ShowDuplicatePropertyTest(_LinuxCase):
         self.assertFalse(result["performed"])
         self.assertNotIn("restart", runner.verbs)
         # And it says WHICH fact refused: unreadable is not "the timer is stopped".
-        self.assertEqual(result["reason"], ss.REASON_TIMER_STATE_UNREADABLE)
+        self.assertEqual(result["reason"], ss.REASON_SERVICE_STATE_UNREADABLE)
         self.assertEqual(result["probe_state"], ss.PROBE_UNREADABLE)
 
     def test_restart_still_refuses_a_genuinely_stopped_timer_with_its_own_reason(self) -> None:

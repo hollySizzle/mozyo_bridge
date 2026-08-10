@@ -281,74 +281,121 @@ LAUNCHCTL_UNREADABLE_PHRASES = (
 
 
 
+def quoted_spans(message: str) -> Optional[list[tuple[int, int]]]:
+    """Every complete quoted span as ``(open_index, close_index)``, or ``None`` if undecidable.
+
+    Positions, not just contents (review j#102398 finding r9f1). The earlier parser recovered the
+    span *strings* and then searched for a quote character separately, which meant it could not tell
+    an opening quote from a closing one — ``diagnostic "could not find service"<owned>"x"`` bound our
+    label off a quote that was *closing* someone else's span.
+
+    Same refusal rules as :func:`quoted_names`: any backslash, an unclosed span, or two adjacent
+    spans mean the quoting grammar is not the one this scanner reads, and it declines to answer.
+    """
+    if "\\" in message:
+        return None
+    opens = [i for i, ch in enumerate(message) if ch == '"']
+    if len(opens) % 2:
+        return None
+    spans = list(zip(opens[0::2], opens[1::2]))
+    for previous, following in zip(spans, spans[1:]):
+        if previous[1] + 1 == following[0]:  # `""` — the signature of a doubling escape
+            return None
+    return spans
+
+
 def not_found_operand(message: str) -> Optional[str]:
     """The service a recognized "no such service" clause is ABOUT, or ``None`` when undecidable.
 
-    The point of this function is the difference between *containing* and *being about*. The earlier
-    check asked whether a not-found phrase appeared anywhere and, separately, whether our label
-    appeared in any quoted span — then treated both being true as one conjunction. It is not one:
-    ``Could not find service "com.example.other"; suggestion "<owned>"`` satisfies both while
-    explicitly reporting a DIFFERENT service as missing, and that reading authorized unlinking our
-    own registration (review j#102383 finding r8f1).
+    One position-aware pass, because the binding *is* a position claim (review j#102398 r9f1). The
+    previous version searched for the phrase and for a quote independently and called the pair a
+    clause; three different messages satisfied it while saying something else entirely:
 
-    So the clause is parsed as a unit: a recognized phrase, and the quoted span that immediately
-    follows it, which is that phrase's operand. Only that operand can bind. Everything ambiguous
-    resolves to ``None`` — meaning unreadable, never a confirmed absence:
+    - ``Could not find service com.example.other; suggestion "<owned>"`` — the clause's real operand
+      is unquoted, and ours is a later, unrelated span;
+    - ``diagnostic "could not find service"<owned>"x" "<owned>"`` — the phrase sits *inside* a quoted
+      span, so the "next quote" was a closing delimiter;
+    - ``no such processnot find service "<owned>"`` — two abutting phrases merged into one clause.
 
-    - no recognized phrase, or no quoted span after it;
-    - **more than one** recognized phrase (two clauses, no rule for which one governs);
-    - a message whose quoting cannot be read unambiguously (:func:`quoted_names` returns ``None``);
-    - an operand that is not exactly one complete quoted span.
+    Each authorized unlinking the owned registration. So the rules are now positional and all four
+    must hold:
 
-    Note what is deliberately *not* accepted: our label appearing before the phrase, beside it, or in
-    any later span. Position is not incidental here — it is the only thing distinguishing "the
-    service that is missing" from "some other service mentioned in the same sentence".
+    1. the phrase occurs **outside** every quoted span (a phrase inside a span is data, not wording);
+    2. exactly **one** clause survives merging, and merging joins only genuinely *overlapping* hits —
+       abutting hits are separate clauses, which is ambiguity, not one clause;
+    3. the operand span **starts immediately after** the clause, separated by nothing but whitespace;
+    4. the operand is a complete span this scanner itself delimited.
+
+    Offsets are computed on the original ``message``. Case-folding for the phrase comparison is done
+    per-slice, never by lowercasing the whole string and indexing the result: ``len("İ") == 1`` while
+    ``len("İ".lower()) == 2``, so a folded copy is not positionally aligned with the original.
     """
-    names = quoted_names(message)
-    if names is None:
+    spans = quoted_spans(message)
+    if spans is None:
         return None
-    clauses = not_found_clauses(message.lower())
+    clauses = _not_found_clauses(message, spans)
     if len(clauses) != 1:
         return None
     _, clause_end = clauses[0]
-    # The operand is the first complete quoted span that OPENS after the clause wording ends.
-    opening = message.find('"', clause_end)
-    if opening < 0:
-        return None
-    closing = message.find('"', opening + 1)
-    if closing < 0:
-        return None
-    operand = message[opening + 1:closing]
-    # It must be one of the spans the scanner already validated, so a boundary inferred here can
-    # never disagree with the one :func:`quoted_names` accepted.
-    return operand if operand in names else None
+    # Only whitespace may separate the clause from its operand: any other prose means the sentence
+    # said something between them, and what it said is not this parser's to guess.
+    cursor = clause_end
+    while cursor < len(message) and message[cursor].isspace():
+        cursor += 1
+    for open_index, close_index in spans:
+        if open_index == cursor:
+            return message[open_index + 1:close_index]
+    return None
 
 
-def not_found_clauses(wording: str) -> list[tuple[int, int]]:
-    """The merged ``(start, end)`` ranges of recognized not-found wording in ``wording`` (pure).
+def _not_found_clauses(
+    message: str, spans: list[tuple[int, int]]
+) -> list[tuple[int, int]]:
+    """Merged ``(start, end)`` ranges of recognized not-found wording OUTSIDE any quoted span.
 
-    The recognized phrases deliberately overlap — ``"could not find service"`` contains
-    ``"not find service"`` — so one clause matches several of them. Counting raw hits would make
-    every ordinary message look like several clauses and refuse everything, so overlapping hits are
-    merged into the single clause they describe. What survives the merge is the count that the
-    ambiguity rule is about: two *separate* clauses mean no rule says which one governs the sentence.
+    Merging joins hits that genuinely overlap — the phrases are deliberately nested, so
+    ``"could not find service"`` and ``"not find service"`` describe one clause. Hits that merely
+    touch are NOT merged: ``no such process`` immediately followed by ``not find service`` is two
+    clauses, and treating them as one let an ambiguous message read as a single confident statement.
     """
+    inside = [range(open_index, close_index + 1) for open_index, close_index in spans]
+
+    def in_span(index: int) -> bool:
+        return any(index in window for window in inside)
+
     hits: list[tuple[int, int]] = []
     for phrase in LAUNCHCTL_NOT_FOUND_PHRASES:
+        needle = phrase.lower()
         start = 0
         while True:
-            index = wording.find(phrase, start)
+            index = _find_folded(message, needle, start)
             if index < 0:
                 break
-            hits.append((index, index + len(phrase)))
+            if not in_span(index):
+                hits.append((index, index + len(phrase)))
             start = index + 1
     merged: list[tuple[int, int]] = []
     for begin, finish in sorted(hits):
-        if merged and begin <= merged[-1][1]:  # overlaps or abuts the clause already collected
+        if merged and begin < merged[-1][1]:  # strictly overlapping, not merely abutting
             merged[-1] = (merged[-1][0], max(merged[-1][1], finish))
         else:
             merged.append((begin, finish))
     return merged
+
+
+def _find_folded(message: str, needle_lower: str, start: int) -> int:
+    """Index of ``needle_lower`` in ``message`` compared case-insensitively, in ORIGINAL offsets.
+
+    Each candidate slice is folded on its own so the returned index always refers to ``message``.
+    Lowercasing the whole string first and searching that would return offsets into a *different*
+    string whenever folding changes length (``"İ".lower()`` is two code points), and those offsets
+    were then used to slice the original.
+    """
+    width = len(needle_lower)
+    for index in range(start, len(message) - width + 1):
+        if message[index:index + width].lower() == needle_lower:
+            return index
+    return -1
 
 
 def quoted_names(message: str) -> Optional[list[str]]:
@@ -451,6 +498,7 @@ __all__ = (
     "read_installed_plist",
     "LAUNCHCTL_NOT_FOUND_CODES",
     "not_found_operand",
+    "quoted_spans",
     "quoted_names",
     "names_exactly",
 )

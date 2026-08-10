@@ -442,6 +442,104 @@ def _systemd_status(*, manager_available: bool, timer_output: str = "ActiveState
         )
 
 
+class RestartRefusalParityTest(unittest.TestCase):
+    """Review j#102398 finding r9f2: one verb, one meaning, through the common envelope.
+
+    The backend declares `install` / `restart` / `uninstall` / `service_status` identical across
+    hosts, so a refusal must mean the same thing on both. macOS collapsed its three-valued probe to a
+    bool and answered `service_not_loaded` for BOTH a permission-denied read and a confirmed absence,
+    dropping `probe_state` — while Linux had already separated them. Asserted at the **backend
+    envelope**, not the adapter, because that is the surface the operator and the CLI actually see.
+    """
+
+    #: The refusal vocabulary is a shared contract and names no OS-specific manager noun.
+    def test_both_adapters_publish_the_same_refusal_tokens(self) -> None:
+        self.assertEqual(sl.REASON_SERVICE_NOT_LOADED, ss.REASON_SERVICE_NOT_LOADED)
+        self.assertEqual(sl.REASON_SERVICE_STATE_UNREADABLE, ss.REASON_SERVICE_STATE_UNREADABLE)
+        for token in (sl.REASON_SERVICE_STATE_UNREADABLE, sl.REASON_SERVICE_NOT_LOADED):
+            for os_noun in ("timer", "launchagent", "plist", "unit", "launchd", "systemd"):
+                self.assertNotIn(os_noun, token.lower(), token)
+
+    def test_the_restart_envelope_separates_absent_from_unreadable_on_both_hosts(self) -> None:
+        matrix = {
+            "darwin": {
+                "absent": _fake_result(
+                    113,
+                    stderr=f'Could not find service "{sl.SUPERVISOR_AGENT.label}" in domain',
+                ),
+                "unreadable": _fake_result(1, stderr="Operation not permitted"),
+            },
+            "linux": {
+                "absent": "ActiveState=inactive\n",
+                "unreadable": "ActiveState=inactive\nActiveState=active\n",
+            },
+        }
+        for platform, cases in matrix.items():
+            absent = _restart_envelope(platform, cases["absent"])
+            unreadable = _restart_envelope(platform, cases["unreadable"])
+            # Both refuse with zero mutation...
+            self.assertFalse(absent["performed"], platform)
+            self.assertFalse(unreadable["performed"], platform)
+            # ...and say WHICH fact refused, in the shared vocabulary.
+            self.assertEqual(absent["agents"][0]["reason"], sl.REASON_SERVICE_NOT_LOADED, platform)
+            self.assertEqual(
+                unreadable["agents"][0]["reason"], sl.REASON_SERVICE_STATE_UNREADABLE, platform
+            )
+            self.assertEqual(
+                absent["agents"][0]["probe_state"], sl.PROBE_CONFIRMED_ABSENT, platform
+            )
+            self.assertEqual(
+                unreadable["agents"][0]["probe_state"], sl.PROBE_UNREADABLE, platform
+            )
+
+
+def _restart_envelope(platform: str, scripted) -> dict:
+    """A backend-normalized `restart` envelope for ``platform`` with the probe read scripted."""
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+        supervisor_service_backend,
+    )
+
+    os_home = Path(tempfile.mkdtemp())
+    mozyo_home = Path(tempfile.mkdtemp())
+    if platform == "darwin":
+        target = sl.plist_path(os_home)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        argv = [
+            "/opt/bin/mozyo-bridge", "workflow", "supervisor", "--run-once",
+            "--home", str(sl.resolve_mozyo_home(mozyo_home)),
+        ]
+        target.write_bytes(sl.render_plist(argv, interval_seconds=180, os_home=os_home))
+
+        def runner(command):
+            return scripted if list(command)[1] == "print" else _fake_result(0)
+
+        with patch.object(sys, "platform", "darwin"), patch.object(
+            sl, "_running_on_darwin", return_value=True
+        ):
+            return supervisor_service_backend.restart(
+                mozyo_home=mozyo_home, os_home=os_home, runner=runner,
+                which=lambda _n: "/opt/bin/mozyo-bridge",
+            )
+
+    def runner(command):
+        argv = list(command)
+        if argv[2] == "show" and any(a.startswith("--property=Version") for a in argv):
+            return _fake_result(0)
+        if argv[2] == "show":
+            return _fake_result(0, scripted)
+        return _fake_result(0)
+
+    with patch.object(sys, "platform", "linux"):
+        ss.install(
+            os_home=os_home, mozyo_home=mozyo_home, runner=runner,
+            which=lambda _n: "/opt/bin/mozyo-bridge",
+        )
+        return supervisor_service_backend.restart(
+            mozyo_home=mozyo_home, os_home=os_home, runner=runner,
+            which=lambda _n: "/opt/bin/mozyo-bridge",
+        )
+
+
 class OfflineRolloutSeamTest(_HostCase):
     """Review j#102151 Finding 2: the capture side and the plan side must agree on the roster size.
 

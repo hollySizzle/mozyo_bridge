@@ -161,6 +161,12 @@ REASON_LEGACY_DRAIN_STILL_LOADED = "legacy_drain_still_loaded"
 #: facts differ — one says "it is running", this one says "I cannot tell" — and identical only in
 #: consequence: neither may authorize deleting a registration or adding a second (j#102180 F1).
 REASON_LEGACY_DRAIN_STATE_UNREADABLE = "legacy_drain_state_unreadable"
+#: restart refused: the owned service's run state could not be READ. Distinct from
+#: ``service_not_loaded`` because the facts differ — one says the service is not running, this one
+#: says we cannot tell — and **shared verbatim with the Linux adapter**: the backend declares one
+#: operator-visible meaning per verb, so the refusal vocabulary is a common contract and carries no
+#: OS-specific manager noun (review j#102398 finding r9f2).
+REASON_SERVICE_STATE_UNREADABLE = "service_state_unreadable"
 
 #: ``launchctl print`` probe outcomes (see :func:`_probe`). Three values, not a boolean: "I could
 #: not read it" is a different answer from "it is not there", and only the latter is safe.
@@ -659,10 +665,22 @@ def restart(
         return _refused("restart", REASON_INSTALLED_COMMAND_DRIFT, label=agent.label)
     # Projected, NOT gated (j#102151 Finding 4).
     readiness = classify_credential_readiness(mozyo_home=pinned_home)
-    loaded, _pid = _is_loaded(runner, agent=agent)
-    if not loaded:
+    # The THREE-valued probe is carried through, not collapsed to a bool (review j#102398 r9f2).
+    # `_is_loaded` reduced "I could not read the manager" and "the manager says it is not there" to
+    # one `service_not_loaded`, dropping `probe_state` — so a permission-denied read was reported as
+    # an established fact, and the same envelope meant different things on the two hosts even though
+    # the backend declares the verbs identical. Both still refuse; they no longer claim to be the
+    # same refusal.
+    probe_state = _probe(runner, agent=agent)["state"]
+    if probe_state != PROBE_LOADED:
         return _refused(
-            "restart", REASON_SERVICE_NOT_LOADED, credential_readiness=readiness, label=agent.label
+            "restart",
+            REASON_SERVICE_NOT_LOADED
+            if probe_state == PROBE_CONFIRMED_ABSENT
+            else REASON_SERVICE_STATE_UNREADABLE,
+            credential_readiness=readiness,
+            label=agent.label,
+            probe_state=probe_state,
         )
     result = _launchctl(runner, ["kickstart", "-k", _service_target(agent)])
     if result.returncode != 0:
@@ -870,6 +888,7 @@ __all__ = (
     "REASON_LEGACY_DRAIN_REMOVAL_FAILED",
     "REASON_LEGACY_DRAIN_STILL_LOADED",
     "REASON_LEGACY_DRAIN_STATE_UNREADABLE",
+    "REASON_SERVICE_STATE_UNREADABLE",
     "PROBE_LOADED",
     "PROBE_CONFIRMED_ABSENT",
     "PROBE_UNREADABLE",

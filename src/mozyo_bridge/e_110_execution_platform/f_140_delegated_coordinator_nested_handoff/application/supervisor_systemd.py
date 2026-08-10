@@ -129,11 +129,13 @@ REASON_NOT_INSTALLED = "service_not_installed"
 #: restart refused: the owned timer is not active, so nothing is scheduling this service. Bringing
 #: it up is ``install``'s job, not ``restart``'s.
 REASON_SERVICE_NOT_LOADED = "service_not_loaded"
-#: restart refused: the owned timer's run state could not be READ (an unreachable manager, or a
+#: restart refused: the owned service's run state could not be READ (an unreachable manager, or a
 #: reply this parser cannot resolve — e.g. one that answers `ActiveState` twice with different
-#: values). Distinct from ``service_not_loaded`` because the facts differ: one says the timer is not
-#: running, this one says we cannot tell (review j#102383 finding r8f2).
-REASON_TIMER_STATE_UNREADABLE = "timer_state_unreadable"
+#: values). Distinct from ``service_not_loaded`` because the facts differ: one says it is not
+#: running, this one says we cannot tell (review j#102383 finding r8f2). The token is **shared with
+#: the macOS adapter** and names no OS-specific manager noun, because the backend declares one
+#: operator-visible meaning per verb (review j#102398 finding r9f2).
+REASON_SERVICE_STATE_UNREADABLE = "service_state_unreadable"
 #: restart/status: the installed ``--home`` pin is missing / malformed / duplicated / not an absolute
 #: canonical path, so the root the scheduled process actually uses cannot be trusted.
 REASON_HOME_PIN_UNHEALTHY = "home_pin_unhealthy"
@@ -494,7 +496,7 @@ def restart(
             "restart",
             REASON_SERVICE_NOT_LOADED
             if timer_state == PROBE_CONFIRMED_ABSENT
-            else REASON_TIMER_STATE_UNREADABLE,
+            else REASON_SERVICE_STATE_UNREADABLE,
             credential_readiness=readiness,
             probe_state=timer_state,
         )
@@ -736,7 +738,7 @@ __all__ = (
     "REASON_EXECUTABLE_NOT_FOUND",
     "REASON_COMMAND_NOT_RENDERABLE",
     "REASON_SERVICE_NOT_LOADED",
-    "REASON_TIMER_STATE_UNREADABLE",
+    "REASON_SERVICE_STATE_UNREADABLE",
     "REASON_NOT_INSTALLED",
     "REASON_HOME_PIN_UNHEALTHY",
     "REASON_HOME_PIN_MISMATCH",
