@@ -24,7 +24,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 )
 
 
-def apply_workspace_alias(repo_root: Path) -> Path:
+def apply_workspace_alias(repo_root: Path) -> tuple[Path, str]:
     """Fold an explicitly-supplied nested root into its canonical root.
 
     Called from **both** launch entries, which is deliberate (review j#102107
@@ -47,10 +47,14 @@ def apply_workspace_alias(repo_root: Path) -> Path:
     removing either call re-opens a bypass. So the rail holds identically at plan
     time (``--dry-run``) and at live action time.
 
-    Returns the root a launch should use:
+    Returns ``(launch_root, expected_workspace_id)``:
 
-    - no declaration → the requested root, unchanged (the common path);
-    - verified alias → the canonical root;
+    - no declaration → the requested root, unchanged, and ``""``;
+    - verified alias → the canonical root, and the workspace id the declaration
+      was verified against. That id is the alias decision's *binding*: the
+      caller must confirm the identity it actually registers matches it, since
+      the canonical path's anchor can be replaced between this decision and the
+      launch (review j#102641 Finding 1).
 
     and raises :class:`HerdrSessionStartError` otherwise. Every refusal carries a
     fixed typed reason token, and none of them falls back to the nested root:
@@ -66,7 +70,7 @@ def apply_workspace_alias(repo_root: Path) -> Path:
     )
 
     resolution = resolve_launch_root(repo_root)
-    if resolution.state == STATE_NO_DECLARATION:
+    if resolution.state == STATE_NO_DECLARATION:  # noqa: E501
         # Return the caller's OWN path object, not the resolver's normalized one.
         # `resolve_launch_root` resolves symlinks and `..` to compare roots, but an
         # undeclared workspace must come back byte-identical: the launch cwd is
@@ -74,9 +78,15 @@ def apply_workspace_alias(repo_root: Path) -> Path:
         # canonicalizing it would change that argv for every workspace in the
         # world that declares nothing — the exact opposite of this rail's promise
         # to leave the common path untouched.
-        return repo_root
+        return repo_root, ""
     if resolution.ok:
-        return Path(resolution.launch_root) if resolution.launch_root else repo_root
+        expected = (
+            resolution.declaration.canonical_workspace_id
+            if resolution.declaration is not None
+            else ""
+        )
+        root = Path(resolution.launch_root) if resolution.launch_root else repo_root
+        return root, expected
     if resolution.state == STATE_LAUNCH_DISABLED:
         raise HerdrSessionStartError(
             f"workspace {repo_root} declares launch-disabled "
@@ -97,4 +107,27 @@ def apply_workspace_alias(repo_root: Path) -> Path:
     )
 
 
-__all__ = ("apply_workspace_alias",)
+def require_alias_identity(expected_workspace_id: str, registered: str) -> None:
+    """Bind the alias decision to the identity the launch actually registered.
+
+    The alias is approved against a specific ``workspace_id`` at the canonical
+    path. Nothing stops that path's anchor being replaced between the decision
+    and the registration, and the launch would then mint names for a workspace
+    the operator never aliased to. Checked at action time, after registration,
+    so the drift is a typed zero-launch instead of a silently different pair
+    (review j#102641 Finding 1).
+    """
+    if not expected_workspace_id:
+        return
+    if registered != expected_workspace_id:
+        raise HerdrSessionStartError(
+            f"the alias was verified against workspace {expected_workspace_id} "
+            f"but this launch registered {registered!r}; the canonical "
+            f"workspace's identity changed between the alias decision and the "
+            f"launch. No agent was launched. Re-declare the alias with "
+            f"`mozyo-bridge workspace alias set` once the canonical identity is "
+            f"settled."
+        )
+
+
+__all__ = ("apply_workspace_alias", "require_alias_identity")

@@ -868,7 +868,9 @@ class WorkspaceAliasConcurrencyAndDurabilityTests(WorkspaceAliasCliTestCase):
                 "workspace", "alias", "clear", "--repo", str(self.nested)
             )
         self.assertEqual(code, 1)
-        self.assertEqual(payload["reason"], REASON_REMOVE_FAILED)
+        # A durability failure keeps the durability reason on every mutation
+        # path, so write and clear report the same contract (j#102641 F3).
+        self.assertEqual(payload["reason"], REASON_DURABILITY_FAILED)
         self.assertTrue(payload["mutated"])
 
     def test_rollback_is_also_synced(self) -> None:
@@ -895,6 +897,133 @@ class WorkspaceAliasConcurrencyAndDurabilityTests(WorkspaceAliasCliTestCase):
         self.assertEqual(code, 1)
         self.assertGreaterEqual(
             seen["dir"], 2, "the rollback replace was never made durable"
+        )
+
+
+class WorkspaceAliasIdentityBindingTests(WorkspaceAliasCliTestCase):
+    """Review j#102641 Findings 1–2."""
+
+    def test_canonical_identity_swap_between_decision_and_launch_is_refused(
+        self,
+    ) -> None:
+        """The alias is approved for one workspace id; the launch must use it.
+
+        Nothing stops the canonical path's anchor being replaced after the alias
+        decision, so the binding is re-checked against the identity actually
+        registered at action time.
+        """
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_alias import (  # noqa: E501
+            apply_workspace_alias,
+            require_alias_identity,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
+            HerdrSessionStartError,
+        )
+
+        self.run_cli(
+            "workspace", "alias", "set",
+            "--repo", str(self.nested), "--to", str(self.canonical),
+        )
+        root, expected = apply_workspace_alias(self.nested)
+        self.assertEqual(Path(root), self.canonical)
+        self.assertEqual(expected, CANONICAL_ID)
+
+        # The canonical workspace's identity is replaced before actuation.
+        _write_anchor(self.canonical, "e" * 32, "mozyo-repo-cccccccc")
+        with self.assertRaises(HerdrSessionStartError) as caught:
+            require_alias_identity(expected, "e" * 32)
+        self.assertIn(CANONICAL_ID, str(caught.exception))
+        # The matching case still passes.
+        require_alias_identity(expected, CANONICAL_ID)
+
+    def test_undeclared_workspace_carries_no_identity_binding(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_alias import (  # noqa: E501
+            apply_workspace_alias,
+            require_alias_identity,
+        )
+
+        root, expected = apply_workspace_alias(self.nested)
+        self.assertEqual(Path(root), self.nested)
+        self.assertEqual(expected, "")
+        require_alias_identity(expected, "anything")  # no binding to enforce
+
+    def test_clear_refuses_a_declaration_that_changed_after_the_snapshot(
+        self,
+    ) -> None:
+        """A concurrent update must not be deleted as if it were the read one."""
+        self.run_cli(
+            "workspace", "alias", "disable",
+            "--repo", str(self.nested), "--reason", "OLD",
+        )
+        path = alias_path(self.nested)
+        real_read_bytes = store._read_bytes
+        fired: list = []
+
+        def once(dirfd):
+            data = real_read_bytes(dirfd)
+            if not fired:
+                fired.append(1)
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                payload["reason"] = "CONCURRENT"
+                temp = path.parent / ".concurrent.tmp"
+                temp.write_text(
+                    json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                os.replace(temp, path)
+            return data
+
+        with mock.patch.object(store, "_read_bytes", once):
+            code, payload = self.run_cli(
+                "workspace", "alias", "clear", "--repo", str(self.nested)
+            )
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["reason"], REASON_CONCURRENT_CHANGE)
+        self.assertTrue(path.exists(), "clear destroyed a concurrent update")
+        self.assertEqual(
+            json.loads(path.read_text(encoding="utf-8"))["reason"], "CONCURRENT"
+        )
+
+    def test_same_inode_same_size_update_is_detected(self) -> None:
+        """Metadata alone cannot identify a declaration; content must.
+
+        An in-place rewrite of equal length with the mtime restored is invisible
+        to a (dev, ino, mtime, size) fence.
+        """
+        self.run_cli(
+            "workspace", "alias", "disable",
+            "--repo", str(self.nested), "--reason", "AAAA",
+        )
+        path = alias_path(self.nested)
+        before = os.stat(path)
+        real_read_bytes = store._read_bytes
+        fired: list = []
+
+        def once(dirfd):
+            data = real_read_bytes(dirfd)
+            if not fired:
+                fired.append(1)
+                raw = path.read_bytes().replace(b'"AAAA"', b'"BBBB"')
+                fd = os.open(path, os.O_WRONLY)
+                os.write(fd, raw)
+                os.close(fd)
+                os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+            return data
+
+        with mock.patch.object(store, "_read_bytes", once), mock.patch.object(
+            store, "_read_with_dirfd",
+            return_value=store.refused("simulated", "verification failed"),
+        ):
+            code, payload = self.run_cli(
+                "workspace", "alias", "disable",
+                "--repo", str(self.nested), "--reason", "NEW",
+            )
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["reason"], REASON_CONCURRENT_CHANGE)
+        self.assertEqual(
+            json.loads(path.read_text(encoding="utf-8"))["reason"],
+            "BBBB",
+            "a same-inode update was overwritten by a failed rollback",
         )
 
 

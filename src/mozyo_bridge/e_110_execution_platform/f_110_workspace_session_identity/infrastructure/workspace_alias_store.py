@@ -47,6 +47,7 @@ review findings shaped the current contract; each is load-bearing.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import stat
@@ -409,19 +410,34 @@ def _mutation_lock(dirfd: int):
         os.close(fd)
 
 
-def _generation(entry: Optional[os.stat_result]) -> Optional[Tuple[int, int, int, int]]:
-    """Identity of the declaration this operation read, or ``None`` when absent."""
+def _fence(dirfd: int):
+    """A **content-bound** identity of the current declaration.
+
+    Metadata alone is not an identity (review j#102641 Finding 2): an in-place
+    update that keeps the inode, writes the same number of bytes and restores
+    the mtime is invisible to a ``(dev, ino, mtime_ns, size)`` comparison, so a
+    failed rollback would overwrite content this operation never read. The
+    digest of the bytes closes that: two different declarations cannot share it.
+
+    ``None`` when the declaration is absent. Raises ``OSError`` only from the
+    ``lstat``; an unreadable-but-present entry yields ``(metadata, None)``, which
+    can never compare equal to a readable one.
+    """
+    entry = _lstat_entry(dirfd)
     if entry is None:
         return None
-    return (entry.st_dev, entry.st_ino, entry.st_mtime_ns, entry.st_size)
+    meta = (entry.st_dev, entry.st_ino, entry.st_mtime_ns, entry.st_size)
+    body = _read_bytes(dirfd)
+    digest = (
+        hashlib.sha256(body).hexdigest() if isinstance(body, bytes) else None
+    )
+    return (meta, digest)
 
 
-def _require_generation(
-    dirfd: int, expected: Optional[Tuple[int, int, int, int]]
-) -> None:
-    """Assert the declaration is still the one this operation snapshotted."""
+def _require_fence(dirfd: int, expected) -> None:
+    """Assert the declaration is byte-for-byte the one this operation read."""
     try:
-        current = _generation(_lstat_entry(dirfd))
+        current = _fence(dirfd)
     except OSError as exc:
         raise WorkspaceAliasStoreError(
             REASON_CONCURRENT_CHANGE, f"{ALIAS_RELATIVE}: {exc}"
@@ -527,7 +543,6 @@ def write_declaration(
         # rollback would unlink the new entry and the previous declaration would
         # be gone, reported as an unchanged no-op.
         had_previous = entry is not None
-        generation = _generation(entry)
         previous_bytes: Optional[bytes] = None
         if had_previous:
             previous = _read_bytes(dirfd)
@@ -547,11 +562,26 @@ def write_declaration(
                 # successfully set active in the workspace.
                 had_previous = False
             previous_bytes = previous
-            # The snapshot and the generation must describe the SAME version:
-            # binding the generation afterwards would let a declaration that
-            # landed *during* the read be treated as the one just snapshotted,
-            # and a later rollback would then overwrite it with the older bytes.
-            _require_generation(dirfd, generation)
+
+        # The content-bound fence of what this operation actually read. Captured
+        # AFTER the snapshot and re-checked before the replace, so a declaration
+        # that landed during the read is not mistaken for the one snapshotted.
+        try:
+            fence = _fence(dirfd)
+        except OSError as exc:
+            raise WorkspaceAliasStoreError(
+                REASON_CONCURRENT_CHANGE, f"{ALIAS_RELATIVE}: {exc}"
+            ) from exc
+        if had_previous and fence is None:
+            had_previous = False
+            previous_bytes = None
+        if had_previous and previous_bytes is not None:
+            if fence is None or fence[1] != hashlib.sha256(previous_bytes).hexdigest():
+                raise WorkspaceAliasStoreError(
+                    REASON_CONCURRENT_CHANGE,
+                    f"{ALIAS_RELATIVE} changed while it was being snapshotted; "
+                    f"refusing to proceed with bytes that are no longer current",
+                )
 
         created_at = declaration.created_at
         if not created_at:
@@ -576,7 +606,7 @@ def write_declaration(
 
         try:
             _require_parent_visible(repo_root, anchor)
-            _require_generation(dirfd, generation)
+            _require_fence(dirfd, fence)
             os.replace(temp_name, _ALIAS_NAME, src_dir_fd=dirfd, dst_dir_fd=dirfd)
         except WorkspaceAliasStoreError:
             _discard(dirfd, temp_name)
@@ -676,7 +706,27 @@ def clear_declaration(repo_root: Path | str) -> str:
             if isinstance(captured, bytes):
                 snapshot = captured
 
+        # The removal must be fenced exactly like a write (review j#102641
+        # Finding 2): without this, a declaration that landed between the
+        # snapshot and the unlink was deleted and reported as a clean removal,
+        # destroying an update this operation never read.
         try:
+            fence = _fence(dirfd)
+        except OSError as exc:
+            raise WorkspaceAliasStoreError(
+                REASON_REMOVE_FAILED, f"{ALIAS_RELATIVE}: {exc}"
+            ) from exc
+        if snapshot is not None and (
+            fence is None or fence[1] != hashlib.sha256(snapshot).hexdigest()
+        ):
+            raise WorkspaceAliasStoreError(
+                REASON_CONCURRENT_CHANGE,
+                f"{ALIAS_RELATIVE} changed while it was being read; refusing to "
+                f"remove a declaration this operation never read",
+            )
+
+        try:
+            _require_fence(dirfd, fence)
             os.unlink(_ALIAS_NAME, dir_fd=dirfd)
         except FileNotFoundError:
             outcome = CLEAR_ABSENT
@@ -719,7 +769,7 @@ def clear_declaration(repo_root: Path | str) -> str:
             f"({getattr(effective, 'reason', 'a declaration is still effective')})"
         )
         raise WorkspaceAliasStoreError(
-            REASON_REMOVE_FAILED,
+            REASON_DURABILITY_FAILED if durability else REASON_REMOVE_FAILED,
             detail,
             mutated=outcome == CLEAR_REMOVED and not restored,
         )

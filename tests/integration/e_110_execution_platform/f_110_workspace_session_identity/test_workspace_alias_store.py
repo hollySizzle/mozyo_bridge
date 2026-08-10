@@ -317,7 +317,7 @@ class LaunchChokepointTests(AliasFixtureTestCase):
             apply_workspace_alias,
         )
 
-        return apply_workspace_alias(root)
+        return apply_workspace_alias(root)[0]
 
     def _error(self):
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
@@ -390,7 +390,7 @@ class OrdinaryResolutionRegressionTests(AliasFixtureTestCase):
         try:
             requested = resolve_repo_root()
             self.assertEqual(requested, self.nested)
-            self.assertEqual(Path(apply_workspace_alias(requested)), self.canonical)
+            self.assertEqual(Path(apply_workspace_alias(requested)[0]), self.canonical)
         finally:
             if previous is None:
                 os.environ.pop("MOZYO_REPO", None)

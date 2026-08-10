@@ -227,6 +227,17 @@ descriptor** に固定し、判定は全て `lstat` で行う。
   (dev/ino/mtime_ns/size) を束縛し、snapshot 直後と replace 直前に照合する
   (`declaration_concurrent_change`)。lock を通らない外部 writer への防御であり、
   「読んでいない宣言を上書きしない」ことを保証する。
+- **fence は content-bound で、clear にも適用する** (review j#102641 F2)。metadata
+  (dev/ino/mtime_ns/size) だけでは、同一 inode・同 size・mtime 復元の in-place 更新を
+  検出できない。snapshot した bytes の digest を fence に含め、replace / unlink の直前に
+  照合する。`clear` も write と同じ fence を通し、snapshot と unlink の間に着地した宣言を
+  「読んだもの」として削除しない (`declaration_concurrent_change`)。
+- **alias が承認した identity を launch actuation まで束縛する** (review j#102641 F1)。
+  alias 決定は canonical の特定 `workspace_id` に対して下される。決定と登録の間に canonical
+  path の anchor が差し替わると、承認されていない workspace 向けに名前が mint されうる。
+  そのため登録後の identity を承認 id と exact 照合し、drift は typed zero-launch にする。
+- **durability failure の typed reason は全 mutation で統一する** (review j#102641 F3)。
+  write / clear / rollback / restore のいずれでも `declaration_durability_failed` を返す。
 - **directory durability を成功条件に含める** (review j#102259 F2)。final replace /
   clear の unlink / すべての rollback・restore の後に parent directory を `fsync` し、
   失敗を握り潰さない (`declaration_durability_failed`)。unsynced な rename/unlink は
