@@ -1,0 +1,747 @@
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import time
+import unittest
+from datetime import datetime, timedelta, timezone
+
+from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.herdr_unit_board import (
+    AUTHORITY_RESOLVED,
+    SOURCE_LIVE,
+    SOURCE_RELOAD_REQUIRED,
+    SOURCE_STALE,
+    SOURCE_UNAVAILABLE,
+    AgentObservation,
+    build_unit_board,
+)
+from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.unit_board_sources import (
+    UnitBoardSourcesConfig,
+    source_command_argv,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_multi_source_unit_board import (
+    MAX_REMOTE_PATH_LENGTH,
+    ANSWER_OK,
+    ANSWER_UNREACHABLE,
+    ANSWER_UNREADABLE,
+    MAX_SOURCE_OUTPUT_BYTES,
+    UntrustedJsonError,
+    bounded_capture_run,
+    loads_untrusted_json,
+    REMOTE_BOARD_ARGS,
+    REMOTE_WORKSPACE_ARGS,
+    MultiSourceUnitBoardRuntime,
+    SourceCommandResult,
+)
+
+
+WORKSPACE_A = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+NOW = datetime(2026, 8, 9, 12, 0, 0, tzinfo=timezone.utc)
+STAMP = NOW.isoformat(timespec="seconds")
+
+REMOTE_CONFIG = UnitBoardSourcesConfig.from_record(
+    {
+        "version": 1,
+        "sources": [
+            {
+                "host_id": "devbox",
+                "kind": "ssh",
+                "ssh_target": "SSH-DESTINATION-SENTINEL",
+                "label": "dev host",
+            }
+        ],
+    }
+)
+
+
+def local_snapshot(lane_id: str = "default", observed_at: str = STAMP):
+    return build_unit_board(
+        (
+            AgentObservation(
+                workspace_id=WORKSPACE_A,
+                lane_id=lane_id,
+                provider="codex",
+                pane_id="w1:p1",
+                runtime_state="idle",
+                interactive_ready=True,
+                project_label="mozyo_bridge",
+                workflow_role="coordinator",
+                responsibility="mozyo_bridge",
+                work_label="default lane",
+                authority_state=AUTHORITY_RESOLVED,
+            ),
+        ),
+        observed_at=observed_at,
+    )
+
+
+class FakeLocalRuntime:
+    def __init__(self, snapshot=None, error: BaseException | None = None) -> None:
+        self._snapshot = snapshot if snapshot is not None else local_snapshot()
+        self._error = error
+        self.calls = 0
+
+    def snapshot(self):
+        self.calls += 1
+        if self._error is not None:
+            raise self._error
+        return self._snapshot
+
+
+def remote_board_payload(unit_id: str = "unit-deadbeef", lane_id: str = "default"):
+    return {
+        "source_state": SOURCE_LIVE,
+        "observed_at": STAMP,
+        "unmanaged_agents": 0,
+        "detail": "",
+        "units": [
+            {
+                "unit_id": unit_id,
+                "workspace_id": WORKSPACE_A,
+                "lane_id": lane_id,
+                "project_label": "mozyo_bridge",
+                "workflow_role": "coordinator",
+                "responsibility": "mozyo_bridge",
+                "work_label": "default lane",
+                "authority_state": AUTHORITY_RESOLVED,
+                "identity_state": "resolved",
+                "agents": [
+                    {
+                        "provider": "codex",
+                        "runtime_state": "idle",
+                        "interactive_ready": True,
+                    }
+                ],
+            }
+        ],
+    }
+
+
+WORKSPACE_PAYLOAD = {
+    "workspaces": [
+        {
+            "workspace_id": WORKSPACE_A,
+            "canonical_path": "/srv/checkouts/mozyo_bridge",
+            "project_name": "mozyo_bridge",
+        }
+    ]
+}
+
+
+class RecordingRunner:
+    """Answer remote invocations by the mozyo-bridge arguments they carry."""
+
+    def __init__(self, answers: dict[tuple[str, ...], object]) -> None:
+        self._answers = answers
+        self.argvs: list[list[str]] = []
+
+    def __call__(self, argv, **kwargs):
+        self.argvs.append(list(argv))
+        remote_command = argv[-1]
+        for args, answer in self._answers.items():
+            if all(f" {token}" in f" {remote_command}" for token in args):
+                if isinstance(answer, BaseException):
+                    raise answer
+                if answer is None:
+                    return subprocess.CompletedProcess(argv, 1, "", "")
+                # A ``str`` answer is already-rendered stdout, so a test can
+                # hand over the shape a CLI really prints (a human-readable
+                # record, a blank line, then the JSON outcome last).  A mapping
+                # is the JSON-only shape.
+                stdout = answer if isinstance(answer, str) else json.dumps(answer)
+                return subprocess.CompletedProcess(argv, 0, stdout, "")
+        return subprocess.CompletedProcess(argv, 127, "", "")
+
+
+def runtime(
+    answers: dict[tuple[str, ...], object] | None = None,
+    *,
+    config: UnitBoardSourcesConfig = REMOTE_CONFIG,
+    local=None,
+    clock=lambda: NOW,
+):
+    runner = RecordingRunner(
+        answers
+        if answers is not None
+        else {
+            REMOTE_BOARD_ARGS: remote_board_payload(),
+            REMOTE_WORKSPACE_ARGS: WORKSPACE_PAYLOAD,
+        }
+    )
+    return (
+        MultiSourceUnitBoardRuntime(
+            config,
+            local_runtime=local if local is not None else FakeLocalRuntime(),
+            runner=runner,
+            clock=clock,
+        ),
+        runner,
+    )
+
+
+class LocalOnlyTests(unittest.TestCase):
+    def test_local_only_snapshot_is_the_unchanged_local_board(self) -> None:
+        local = FakeLocalRuntime()
+        multi = MultiSourceUnitBoardRuntime(
+            UnitBoardSourcesConfig.default(), local_runtime=local
+        )
+
+        snapshot = multi.snapshot()
+
+        self.assertEqual(snapshot.as_payload(), local_snapshot().as_payload())
+        self.assertNotIn("sources", snapshot.as_payload())
+
+
+class ObservationTests(unittest.TestCase):
+    def test_remote_source_is_asked_for_its_own_single_server_board(self) -> None:
+        multi, runner = runtime()
+
+        snapshot = multi.snapshot()
+
+        self.assertEqual(runner.argvs[0][0], "ssh")
+        self.assertIn("herdr unit-board show --json", runner.argvs[0][-1])
+        # Without this the far host answers with ITS merged board.
+        self.assertIn("--local-only", runner.argvs[0][-1])
+        self.assertEqual(len(snapshot.units), 2)
+        self.assertEqual(
+            {unit.host_id for unit in snapshot.units}, {"local", "devbox"}
+        )
+
+    def test_unreachable_remote_stays_visible_and_unactionable(self) -> None:
+        multi, _ = runtime({REMOTE_BOARD_ARGS: OSError("no route")})
+
+        snapshot = multi.snapshot()
+
+        self.assertTrue(snapshot.ok)
+        states = {status.host_id: status for status in snapshot.sources}
+        self.assertEqual(states["devbox"].source_state, SOURCE_UNAVAILABLE)
+        self.assertFalse(states["devbox"].actionable)
+
+    def test_remote_timeout_degrades_only_that_source(self) -> None:
+        multi, _ = runtime(
+            {REMOTE_BOARD_ARGS: subprocess.TimeoutExpired(["ssh"], 30)}
+        )
+
+        snapshot = multi.snapshot()
+
+        states = {status.host_id: status for status in snapshot.sources}
+        self.assertTrue(states["local"].actionable)
+        self.assertFalse(states["devbox"].actionable)
+
+    def test_unreadable_answer_is_reload_required_not_unreachable(self) -> None:
+        # "did not answer" and "answered something unreadable" are different
+        # source states; collapsing them mislabels a schema break as a
+        # connection failure.
+        def unreadable(argv, **kw):
+            if "unit-board show" in argv[-1]:
+                return subprocess.CompletedProcess(argv, 0, "{not json", "")
+            return subprocess.CompletedProcess(argv, 0, json.dumps(WORKSPACE_PAYLOAD), "")
+
+        multi = MultiSourceUnitBoardRuntime(
+            REMOTE_CONFIG,
+            local_runtime=FakeLocalRuntime(),
+            runner=unreadable,
+            clock=lambda: NOW,
+        )
+
+        states = {s.host_id: s for s in multi.snapshot().sources}
+        self.assertEqual(states["devbox"].source_state, SOURCE_RELOAD_REQUIRED)
+        self.assertFalse(states["devbox"].actionable)
+
+    def test_non_zero_exit_stays_unreachable(self) -> None:
+        def refused(argv, **kw):
+            if "unit-board show" in argv[-1]:
+                return subprocess.CompletedProcess(argv, 255, "", "")
+            return subprocess.CompletedProcess(argv, 0, json.dumps(WORKSPACE_PAYLOAD), "")
+
+        multi = MultiSourceUnitBoardRuntime(
+            REMOTE_CONFIG,
+            local_runtime=FakeLocalRuntime(),
+            runner=refused,
+            clock=lambda: NOW,
+        )
+
+        states = {s.host_id: s for s in multi.snapshot().sources}
+        self.assertEqual(states["devbox"].source_state, SOURCE_UNAVAILABLE)
+
+    def test_failing_local_runtime_becomes_a_visible_source_row(self) -> None:
+        multi, _ = runtime(local=FakeLocalRuntime(error=RuntimeError("boom")))
+
+        snapshot = multi.snapshot()
+
+        states = {status.host_id: status for status in snapshot.sources}
+        self.assertFalse(states["local"].actionable)
+        self.assertTrue(states["devbox"].actionable)
+
+    def test_slow_fanout_marks_the_first_observation_stale(self) -> None:
+        moments = iter(
+            [
+                NOW,  # remote observation stamp
+                NOW + timedelta(seconds=600),  # freshness evaluation
+                NOW + timedelta(seconds=600),  # aggregate stamp
+            ]
+        )
+        multi, _ = runtime(clock=lambda: next(moments))
+
+        snapshot = multi.snapshot()
+
+        states = {status.host_id: status for status in snapshot.sources}
+        self.assertEqual(states["devbox"].source_state, SOURCE_STALE)
+        self.assertFalse(states["devbox"].actionable)
+
+
+class UntrustedJsonTests(unittest.TestCase):
+    def test_a_duplicate_key_is_refused_rather_than_last_wins(self) -> None:
+        # json.loads keeps the last value, so a source could put a rejected
+        # value first and a canonical one second and have every later check see
+        # only the second.
+        with self.assertRaises(UntrustedJsonError):
+            loads_untrusted_json('{"workspace_id": "bad", "workspace_id": "good"}')
+
+    def test_a_duplicate_key_nested_in_an_object_is_refused(self) -> None:
+        with self.assertRaises(UntrustedJsonError):
+            loads_untrusted_json('{"a": {"b": 1, "b": 2}}')
+
+    def test_a_duplicate_key_inside_an_array_element_is_refused(self) -> None:
+        with self.assertRaises(UntrustedJsonError):
+            loads_untrusted_json('{"units": [{"x": 1, "x": 2}]}')
+
+    def test_a_decoder_resource_failure_becomes_a_typed_error(self) -> None:
+        # Deeply nested input raises RecursionError on Python 3.10 / 3.11 and
+        # decodes on 3.12+, so the mapping is asserted directly rather than
+        # through input that only misbehaves on some supported interpreters.
+        from unittest import mock
+
+        with mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "infrastructure.herdr_multi_source_unit_board.json.loads",
+            side_effect=RecursionError("too deep"),
+        ):
+            with self.assertRaises(UntrustedJsonError):
+                loads_untrusted_json('{"a": 1}')
+
+    def test_ordinary_documents_still_decode(self) -> None:
+        self.assertEqual(
+            loads_untrusted_json('{"a": 1, "b": {"c": [1, 2]}}'),
+            {"a": 1, "b": {"c": [1, 2]}},
+        )
+
+    def test_a_board_with_a_duplicated_identity_key_is_unreadable(self) -> None:
+        duplicated = (
+            '{"source_state":"live","observed_at":"' + STAMP + '",'
+            '"unmanaged_agents":0,"detail":"","units":[{"unit_id":"unit-x",'
+            '"workspace_id":"NOT-CANONICAL","workspace_id":"' + WORKSPACE_A + '",'
+            '"lane_id":"default","project_label":"p","workflow_role":"c",'
+            '"responsibility":"p","work_label":"w","authority_state":"resolved",'
+            '"identity_state":"resolved","agents":[{"provider":"codex",'
+            '"runtime_state":"idle","interactive_ready":true}]}]}'
+        )
+
+        def answering(argv, **kwargs):
+            if "unit-board show" in argv[-1]:
+                return subprocess.CompletedProcess(argv, 0, duplicated, "")
+            return subprocess.CompletedProcess(argv, 0, json.dumps(WORKSPACE_PAYLOAD), "")
+
+        multi = MultiSourceUnitBoardRuntime(
+            REMOTE_CONFIG, local_runtime=FakeLocalRuntime(), runner=answering,
+            clock=lambda: NOW,
+        )
+
+        states = {s.host_id: s for s in multi.snapshot().sources}
+        self.assertEqual(states["devbox"].source_state, SOURCE_RELOAD_REQUIRED)
+
+
+class OutputBoundTests(unittest.TestCase):
+    def test_output_over_the_ceiling_is_unreadable_not_unreachable(self) -> None:
+        # The source did answer; calling that a connection failure mislabels it.
+        def oversized(argv, **kwargs):
+            return subprocess.CompletedProcess(
+                argv, 0, "y" * (MAX_SOURCE_OUTPUT_BYTES + 1), ""
+            )
+
+        multi = MultiSourceUnitBoardRuntime(REMOTE_CONFIG, runner=oversized)
+        result = multi.run_source_command(
+            REMOTE_CONFIG.by_id["devbox"], ("workspace", "list")
+        )
+
+        self.assertEqual(result.outcome, ANSWER_UNREADABLE)
+        self.assertIsNone(result.completed)
+
+    def test_an_over_bound_board_degrades_the_source_to_reload_required(self) -> None:
+        def oversized(argv, **kwargs):
+            return subprocess.CompletedProcess(
+                argv, 0, "y" * (MAX_SOURCE_OUTPUT_BYTES + 1), ""
+            )
+
+        multi = MultiSourceUnitBoardRuntime(
+            REMOTE_CONFIG, local_runtime=FakeLocalRuntime(), runner=oversized,
+            clock=lambda: NOW,
+        )
+
+        states = {s.host_id: s.source_state for s in multi.snapshot().sources}
+        self.assertEqual(states["devbox"], SOURCE_RELOAD_REQUIRED)
+
+    def test_a_mechanical_failure_stays_unreachable(self) -> None:
+        def refusing(argv, **kwargs):
+            raise OSError("no route")
+
+        multi = MultiSourceUnitBoardRuntime(REMOTE_CONFIG, runner=refusing)
+        result = multi.run_source_command(
+            REMOTE_CONFIG.by_id["devbox"], ("workspace", "list")
+        )
+
+        self.assertEqual(result.outcome, ANSWER_UNREACHABLE)
+
+    def test_output_exactly_at_the_ceiling_is_accepted(self) -> None:
+        def at_limit(argv, **kwargs):
+            return subprocess.CompletedProcess(
+                argv, 0, "y" * MAX_SOURCE_OUTPUT_BYTES, ""
+            )
+
+        multi = MultiSourceUnitBoardRuntime(REMOTE_CONFIG, runner=at_limit)
+        result = multi.run_source_command(
+            REMOTE_CONFIG.by_id["devbox"], ("workspace", "list")
+        )
+
+        self.assertEqual(result.outcome, ANSWER_OK)
+        assert result.completed is not None
+        self.assertEqual(len(result.completed.stdout), MAX_SOURCE_OUTPUT_BYTES)
+
+
+class ProductionRunnerTests(unittest.TestCase):
+    """The real runner, exercised against real child processes.
+
+    Both bounds have to hold at once, and the natural composition of them does
+    not: a single blocking read for the ceiling leaves the deadline unreachable.
+    """
+
+    def test_ordinary_output_passes_through(self) -> None:
+        completed = bounded_capture_run(
+            [sys.executable, "-c", "print('hello')"], timeout=60
+        )
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout.strip(), "hello")
+
+    def test_reading_stops_at_the_ceiling_without_waiting_for_the_child(self) -> None:
+        # Once we stop consuming, a child with more to write blocks on a full
+        # pipe; waiting for it would turn the ceiling into a hang.
+        started = time.monotonic()
+
+        completed = bounded_capture_run(
+            [sys.executable, "-c",
+             f"import sys; sys.stdout.write('z' * {MAX_SOURCE_OUTPUT_BYTES * 4})"],
+            timeout=30,
+        )
+
+        self.assertLessEqual(len(completed.stdout), MAX_SOURCE_OUTPUT_BYTES + 1)
+        self.assertGreater(len(completed.stdout), MAX_SOURCE_OUTPUT_BYTES)
+        self.assertLess(time.monotonic() - started, 20)
+
+    def test_a_silent_child_hits_the_deadline(self) -> None:
+        started = time.monotonic()
+
+        with self.assertRaises(subprocess.TimeoutExpired):
+            bounded_capture_run(
+                [sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.2
+            )
+
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_a_child_that_writes_a_little_then_stalls_hits_the_deadline(self) -> None:
+        # Under the ceiling forever: the case a blocking read never escapes.
+        started = time.monotonic()
+
+        with self.assertRaises(subprocess.TimeoutExpired):
+            bounded_capture_run(
+                [sys.executable, "-c",
+                 "import sys, time; sys.stdout.write('x'); sys.stdout.flush(); time.sleep(30)"],
+                timeout=0.2,
+            )
+
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_a_deadline_hit_through_the_shared_seam_is_unreachable(self) -> None:
+        multi = MultiSourceUnitBoardRuntime(REMOTE_CONFIG)
+        source = REMOTE_CONFIG.by_id["devbox"]
+
+        def stalling(argv, **kwargs):
+            return bounded_capture_run(
+                [sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.2
+            )
+
+        multi = MultiSourceUnitBoardRuntime(REMOTE_CONFIG, runner=stalling)
+        self.assertEqual(
+            multi.run_source_command(source, ("workspace", "list")).outcome,
+            ANSWER_UNREACHABLE,
+        )
+
+
+class UnitResolutionTests(unittest.TestCase):
+    def _remote_unit_id(self, multi) -> str:
+        return next(
+            unit.unit_id for unit in multi.snapshot().units if unit.host_id == "devbox"
+        )
+
+    def test_remote_unit_resolves_to_its_own_source_and_remote_key(self) -> None:
+        multi, _ = runtime()
+        unit_id = self._remote_unit_id(multi)
+
+        target = multi.resolve_unit_target(unit_id)
+
+        self.assertIsNotNone(target)
+        assert target is not None
+        self.assertEqual(target.source.host_id, "devbox")
+        self.assertEqual(target.remote_unit_id, "unit-deadbeef")
+        self.assertEqual(target.workspace_id, WORKSPACE_A)
+
+    def test_unknown_unit_key_resolves_to_nothing(self) -> None:
+        multi, _ = runtime()
+
+        self.assertIsNone(multi.resolve_unit_target("unit-absent"))
+        self.assertIsNone(multi.resolve_unit_target(""))
+
+    def test_unit_on_a_degraded_source_is_not_addressable(self) -> None:
+        multi, _ = runtime()
+        unit_id = self._remote_unit_id(multi)
+        degraded, _ = runtime({REMOTE_BOARD_ARGS: OSError("no route")})
+
+        self.assertIsNone(degraded.resolve_unit_target(unit_id))
+
+    def test_ambiguous_unit_is_not_addressable(self) -> None:
+        payload = remote_board_payload()
+        payload["units"][0]["identity_state"] = "ambiguous"
+        multi, _ = runtime(
+            {REMOTE_BOARD_ARGS: payload, REMOTE_WORKSPACE_ARGS: WORKSPACE_PAYLOAD}
+        )
+        unit_id = next(
+            unit.unit_id for unit in multi.snapshot().units if unit.host_id == "devbox"
+        )
+
+        self.assertIsNone(multi.resolve_unit_target(unit_id))
+
+    def test_unit_whose_display_authority_did_not_resolve_is_not_addressable(self) -> None:
+        for authority in ("missing", "invalid"):
+            with self.subTest(authority=authority):
+                payload = remote_board_payload()
+                payload["units"][0]["authority_state"] = authority
+                multi, _ = runtime(
+                    {
+                        REMOTE_BOARD_ARGS: payload,
+                        REMOTE_WORKSPACE_ARGS: WORKSPACE_PAYLOAD,
+                    }
+                )
+                unit_id = next(
+                    unit.unit_id
+                    for unit in multi.snapshot().units
+                    if unit.host_id == "devbox"
+                )
+
+                self.assertIsNone(multi.resolve_unit_target(unit_id))
+
+    def test_display_shaped_workspace_id_is_never_an_action_input(self) -> None:
+        payload = remote_board_payload()
+        payload["units"][0]["workspace_id"] = "workspace-a"
+        multi, _ = runtime(
+            {REMOTE_BOARD_ARGS: payload, REMOTE_WORKSPACE_ARGS: WORKSPACE_PAYLOAD}
+        )
+        unit_id = next(
+            unit.unit_id for unit in multi.snapshot().units if unit.host_id == "devbox"
+        )
+
+        self.assertIsNone(multi.resolve_unit_target(unit_id))
+
+
+class SourceWorkspaceTests(unittest.TestCase):
+    def test_workspace_resolves_the_git_root_only(self) -> None:
+        multi, _ = runtime()
+
+        workspace = multi.resolve_source_workspace(
+            REMOTE_CONFIG.by_id["devbox"], WORKSPACE_A
+        )
+
+        self.assertIsNotNone(workspace)
+        assert workspace is not None
+        self.assertEqual(workspace.canonical_path, "/srv/checkouts/mozyo_bridge")
+        # The registry project name is display metadata and a directory-name
+        # default; it must not be reachable as a scope authority from here.
+        self.assertFalse(hasattr(workspace, "project_name"))
+
+    def test_a_registry_row_without_a_project_name_still_resolves(self) -> None:
+        multi, _ = runtime(
+            {
+                REMOTE_BOARD_ARGS: remote_board_payload(),
+                REMOTE_WORKSPACE_ARGS: {
+                    "workspaces": [
+                        {
+                            "workspace_id": WORKSPACE_A,
+                            "canonical_path": "/srv/checkouts/mozyo_bridge",
+                        }
+                    ]
+                },
+            }
+        )
+
+        self.assertIsNotNone(
+            multi.resolve_source_workspace(REMOTE_CONFIG.by_id["devbox"], WORKSPACE_A)
+        )
+
+    def test_ambiguous_or_missing_registry_row_fails_closed(self) -> None:
+        duplicated = {
+            "workspaces": [
+                WORKSPACE_PAYLOAD["workspaces"][0],
+                WORKSPACE_PAYLOAD["workspaces"][0],
+            ]
+        }
+        for payload in ({"workspaces": []}, duplicated, {"workspaces": "x"}, None):
+            with self.subTest(payload=payload):
+                multi, _ = runtime(
+                    {
+                        REMOTE_BOARD_ARGS: remote_board_payload(),
+                        REMOTE_WORKSPACE_ARGS: payload,
+                    }
+                )
+
+                self.assertIsNone(
+                    multi.resolve_source_workspace(
+                        REMOTE_CONFIG.by_id["devbox"], WORKSPACE_A
+                    )
+                )
+
+    def test_a_registry_path_with_a_control_character_is_rejected(self) -> None:
+        # The path is untrusted input that becomes an argv element; checked here
+        # rather than at the subprocess boundary, where the failure mode is an
+        # exception instead of a refusal.
+        for path in ("/srv/ok\x00evil", "/srv/tab\tx", "/" + "a" * (MAX_REMOTE_PATH_LENGTH + 1)):
+            with self.subTest(path=path[:16]):
+                multi, _ = runtime(
+                    {
+                        REMOTE_BOARD_ARGS: remote_board_payload(),
+                        REMOTE_WORKSPACE_ARGS: {
+                            "workspaces": [
+                                {
+                                    "workspace_id": WORKSPACE_A,
+                                    "canonical_path": path,
+                                    "project_name": "mozyo_bridge",
+                                }
+                            ]
+                        },
+                    }
+                )
+
+                self.assertIsNone(
+                    multi.resolve_source_workspace(
+                        REMOTE_CONFIG.by_id["devbox"], WORKSPACE_A
+                    )
+                )
+
+    def test_control_characters_are_rejected_across_the_whole_category(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_multi_source_unit_board import (
+            _usable_remote_path,
+        )
+
+        self.assertTrue(_usable_remote_path("/srv/checkouts/mozyo_bridge"))
+        for name, char in (
+            ("NUL", "\x00"), ("C0", "\x1f"), ("DEL", "\x7f"),
+            # The C1 block is what an ASCII-range check silently passes.
+            ("C1 lower", "\x80"), ("NEL", "\x85"), ("C1 upper", "\x9f"),
+        ):
+            with self.subTest(control=name):
+                self.assertFalse(_usable_remote_path("/srv/" + char + "x"))
+
+    def test_an_argv_the_subprocess_layer_refuses_is_a_typed_failure(self) -> None:
+        def refusing(argv, **kw):
+            raise ValueError("embedded null byte")
+
+        multi = MultiSourceUnitBoardRuntime(
+            REMOTE_CONFIG,
+            local_runtime=FakeLocalRuntime(),
+            runner=refusing,
+            clock=lambda: NOW,
+        )
+
+        self.assertEqual(
+            multi.run_source_command(
+                REMOTE_CONFIG.by_id["devbox"], ("workspace", "list")
+            ).outcome,
+            ANSWER_UNREACHABLE,
+        )
+
+    def test_relative_canonical_path_is_rejected(self) -> None:
+        multi, _ = runtime(
+            {
+                REMOTE_BOARD_ARGS: remote_board_payload(),
+                REMOTE_WORKSPACE_ARGS: {
+                    "workspaces": [
+                        {
+                            "workspace_id": WORKSPACE_A,
+                            "canonical_path": "relative/path",
+                            "project_name": "mozyo_bridge",
+                        }
+                    ]
+                },
+            }
+        )
+
+        self.assertIsNone(
+            multi.resolve_source_workspace(REMOTE_CONFIG.by_id["devbox"], WORKSPACE_A)
+        )
+
+
+class SourceCommandResultReprTests(unittest.TestCase):
+    """A command result is safe to print, not only to render.
+
+    ``completed`` wraps a ``CompletedProcess`` whose repr rebuilds the argv and
+    the captured stdout, and both carry values the board must never disclose:
+    the assembled command holds the ssh target and the ``--target-repo`` path,
+    and the stdout is the remote gateway record.  The result is a live local on
+    the delivery and observation paths, so its repr is a print / log / traceback
+    surface (review j#102201 finding_1, the same class as j#102159 finding_2 —
+    which the preview-side repr test could not have caught, being a different
+    object).
+    """
+
+    REMOTE_PATH = "/srv/REMOTE-PATH-SENTINEL/checkout"
+
+    def _delivery_result(self) -> SourceCommandResult:
+        argv = source_command_argv(
+            REMOTE_CONFIG.by_id["devbox"],
+            (
+                "project-gateway",
+                "handoff",
+                "--to",
+                "codex",
+                "--target-repo",
+                self.REMOTE_PATH,
+                "--summary",
+                "board pointer",
+            ),
+            by_id=REMOTE_CONFIG.by_id,
+        )
+        stdout = json.dumps(
+            {"status": "submitted", "reason": "ok", "repo_root": self.REMOTE_PATH}
+        )
+        completed = subprocess.CompletedProcess(list(argv), 0, stdout, "")
+        return SourceCommandResult(ANSWER_OK, completed)
+
+    def test_no_connection_value_or_remote_path_appears_in_a_repr(self) -> None:
+        # Guard: the argv this result carries really does embed both, so a
+        # missing suppression would show up rather than the sentinels simply
+        # being absent from a result that never held them.
+        self.assertIn("SSH-DESTINATION-SENTINEL", repr(self._delivery_result().completed))
+
+        rendered = repr(self._delivery_result())
+        self.assertNotIn("SSH-DESTINATION-SENTINEL", rendered)
+        self.assertNotIn(self.REMOTE_PATH, rendered)
+
+    def test_the_outcome_and_completed_stay_readable(self) -> None:
+        # Suppressing the repr must not cost the fields callers depend on.
+        result = self._delivery_result()
+        self.assertTrue(result.ok)
+        self.assertIsNotNone(result.completed)
+        self.assertEqual(result.completed.returncode, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

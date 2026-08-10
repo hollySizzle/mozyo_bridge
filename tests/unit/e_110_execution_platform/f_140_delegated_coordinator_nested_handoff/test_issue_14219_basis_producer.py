@@ -2108,9 +2108,12 @@ class SendSemanticsSharedAuthorityTests(unittest.TestCase):
         # the canonical side. Both now come from the authority.
         import inspect
 
-        from mozyo_bridge.application.commands import orchestrate_handoff
+        # Redmine #15149 split the CLI Namespace adapter (`orchestrate_handoff`) from
+        # the shared orchestration body both the CLI and the typed application API run.
+        # The authority wiring lives in the body, so that is what this reads.
+        from mozyo_bridge.application.commands import run_handoff_orchestration
 
-        source = inspect.getsource(orchestrate_handoff)
+        source = inspect.getsource(run_handoff_orchestration)
         self.assertIn("send_semantic_gap", source)
         self.assertIn("effective_send_mode", source)
 
@@ -2208,9 +2211,12 @@ class SendSemanticsSharedAuthorityTests(unittest.TestCase):
         # its die text off the authority's own message table.
         import inspect
 
-        from mozyo_bridge.application.commands import orchestrate_handoff
+        # Redmine #15149 split the CLI Namespace adapter (`orchestrate_handoff`) from
+        # the shared orchestration body both the CLI and the typed application API run.
+        # The authority wiring lives in the body, so that is what this reads.
+        from mozyo_bridge.application.commands import run_handoff_orchestration
 
-        source = inspect.getsource(orchestrate_handoff)
+        source = inspect.getsource(run_handoff_orchestration)
         # The full authority-call fragment: a bare "submit_delay=inp.submit_delay" also appears
         # where the rail request is built, so asserting it alone cannot tell whether the
         # AUTHORITY receives the value (probe M7 slipped through exactly that way).
