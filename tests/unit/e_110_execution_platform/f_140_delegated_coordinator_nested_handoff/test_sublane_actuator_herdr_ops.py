@@ -249,6 +249,8 @@ class _StatefulHerdr:
                                 "pane_id": pane_id,
                                 "workspace_id": wid,
                                 "tab_id": tab_id or f"{wid}:t1",
+                                "terminal_id": f"terminal-{pane_id}",
+                                "revision": 0,
                             },
                         }
                     }
@@ -372,6 +374,8 @@ class _StatefulHerdr:
                                 # #13411: echo the requested tab so the landing guard
                                 # (returned tab_id == --tab) passes on the happy path.
                                 "tab_id": tab_id,
+                                "terminal_id": f"terminal-{pane_id}",
+                                "revision": 0,
                             },
                             "type": "agent_started",
                         }

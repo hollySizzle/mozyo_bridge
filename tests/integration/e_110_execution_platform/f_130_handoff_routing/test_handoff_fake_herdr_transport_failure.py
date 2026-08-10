@@ -141,6 +141,8 @@ class _ShimBackedOps:
     enter_presses: int = 0
     rollbacks: int = 0
     injections: int = 0
+    queue_wait_kinds: List[str] = field(default_factory=lambda: ["changed"])
+    live_waits: set[object] = field(default_factory=set)
 
     def inject_body(self, target: str, text: str) -> None:
         self.injections += 1
@@ -179,20 +181,38 @@ class _ShimBackedOps:
         return "turn_ended"
 
     def observe_queue_enter_gateway_binding(self, target: str) -> dict:
+        assigned_name = "mzb1_ws_codex_lane"
+        terminal_id = "terminal-test"
+        revision = "1"
         return {
             "provider": "codex",
-            "assigned_name": "mzb1_ws_codex_lane",
+            "assigned_name": assigned_name,
             "locator": target,
-            "row_revision": "1",
+            "terminal_id": terminal_id,
+            "row_revision": revision,
+            "process_generation": (
+                f"{len(assigned_name)}:{assigned_name}:"
+                f"{len(terminal_id)}:{terminal_id}:"
+                f"{len(target)}:{target}:r{revision}"
+            ),
             "attestation_observed_at": "2026-08-10T00:00:00+00:00",
             "startup_action_id": "startup-test",
         }
 
     def arm_queue_enter_turn_wait(self, target: str, *, timeout_ms: int):
-        return object()
+        armed = object()
+        self.live_waits.add(armed)
+        return armed
 
     def collect_queue_enter_turn_wait(self, armed) -> str:
-        return "timeout"
+        self.live_waits.discard(armed)
+        return self.queue_wait_kinds.pop(0) if self.queue_wait_kinds else "changed"
+
+    def cancel_queue_enter_turn_wait(self, armed) -> None:
+        self.live_waits.discard(armed)
+
+    def queue_enter_turn_wait_pending(self, armed) -> bool:
+        return armed in self.live_waits
 
     def evaluate_queue_enter_resend(
         self,
@@ -257,6 +277,12 @@ def _request(**overrides) -> TmuxTransportRailRequest:
         submit_delivery_id="qe-0123456789abcdef",
         persist_delivery=False,
         herdr_send=True,
+        herdr_assigned_name="mzb1_ws_codex_lane",
+        herdr_process_generation=(
+            f"{len('mzb1_ws_codex_lane')}:mzb1_ws_codex_lane:"
+            f"{len('terminal-test')}:terminal-test:"
+            f"{len(_TARGET)}:{_TARGET}:r1"
+        ),
         read_lines=50,
         landing_timeout=8.0,
         submit_delay=None,
@@ -294,8 +320,16 @@ def _ops_over_fake_herdr(port: _FakeHerdrPort) -> _ShimBackedOps:
 class FakeHerdrTransportFailureClosesToTypedOutcomeTest(unittest.TestCase):
     """Each acceptance-5 failure mode closes to one typed, secret-safe outcome."""
 
-    def _drive(self, port: _FakeHerdrPort, **request_overrides) -> _ShimBackedOps:
+    def _drive(
+        self,
+        port: _FakeHerdrPort,
+        *,
+        queue_wait_kinds: Optional[List[str]] = None,
+        **request_overrides,
+    ) -> _ShimBackedOps:
         ops = _ops_over_fake_herdr(port)
+        if queue_wait_kinds is not None:
+            ops.queue_wait_kinds = list(queue_wait_kinds)
         with self.assertRaises(_FakeDie):
             TmuxTransportRailUseCase(ops).execute(_request(**request_overrides))
         return ops
@@ -359,6 +393,7 @@ class FakeHerdrTransportFailureClosesToTypedOutcomeTest(unittest.TestCase):
 
         ops = self._drive(
             _LateReadFailure(fail_on="never"),
+            queue_wait_kinds=["timeout"],
             queue_enter_retry_window=4.0,
             queue_enter_retry_interval=2.0,
         )
@@ -376,14 +411,14 @@ class FakeHerdrTransportFailureClosesToTypedOutcomeTest(unittest.TestCase):
         """
         port = _FakeHerdrPort(fail_on="never")
         ops = _ops_over_fake_herdr(port)
-        # The landing wait reads an empty pane, so the marker is unobserved and the relaxed
-        # queue-enter rail resolves to `sent` / `queue_enter` (its documented contract).
+        # The marker is unobserved, but the pre-armed event fires on the same
+        # generation, which is stronger causal evidence than rendered landing.
         rc = TmuxTransportRailUseCase(ops).execute(_request())
         self.assertEqual(rc, 0)
         self.assertEqual(ops.died, [])
         self.assertEqual(len(ops.emitted), 1)
         self.assertEqual(ops.emitted[0].status, "sent")
-        self.assertEqual(ops.emitted[0].reason, "queue_enter")
+        self.assertEqual(ops.emitted[0].reason, "ok")
         self.assertEqual(ops.enter_presses, 1)
 
 

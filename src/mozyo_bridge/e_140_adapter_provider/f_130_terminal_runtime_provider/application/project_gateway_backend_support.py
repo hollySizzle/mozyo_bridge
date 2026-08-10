@@ -9,11 +9,9 @@ scope.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from mozyo_bridge.core.state.herdr_launch_generation import (
-    verified_generation_token,
-)
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.project_gateway_backend_inventory import (
     HerdrTargetObservation,
     register_project_gateway_backend_support,
@@ -21,14 +19,19 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (
     herdr_workspace_segment,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_generation_binding import (
+    verified_terminal_generation_token,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_LOCATOR,
     AGENT_KEY_LOCATOR_ALIAS,
     AGENT_KEY_LOCATOR_ALIAS_2,
     AGENT_KEY_NAME,
+    AGENT_KEY_TERMINAL_ID,
     _norm,
     _norm_lane,
     decode_assigned_name,
+    process_generation_of_locator,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (
     SLOT_LIVE,
@@ -48,6 +51,7 @@ class HerdrProjectGatewayBackendSupport:
     """Concrete Herdr operations behind the core-owned inventory port."""
 
     agent_name_key = AGENT_KEY_NAME
+    terminal_id_key = AGENT_KEY_TERMINAL_ID
     locator_keys = (
         AGENT_KEY_LOCATOR,
         AGENT_KEY_LOCATOR_ALIAS,
@@ -95,17 +99,25 @@ class HerdrProjectGatewayBackendSupport:
         provider: str,
         lane_id: str,
         locator: str,
+        terminal_id: str,
     ) -> str:
-        return verified_generation_token(
+        return verified_terminal_generation_token(
             None,
             assigned_name=assigned_name,
             workspace_id=workspace_id,
             role=provider,
             lane_id=lane_id,
             locator=locator,
+            terminal_id=terminal_id,
             norm=_norm,
             norm_lane=_norm_lane,
         )
+
+    @staticmethod
+    def process_generation(
+        locator: str, rows: Sequence[Mapping[str, object]]
+    ) -> str:
+        return process_generation_of_locator(locator, rows) or ""
 
     @staticmethod
     def build_project_gateway_capability(observation: HerdrTargetObservation):
@@ -123,6 +135,8 @@ class HerdrProjectGatewayBackendSupport:
             assigned_name=observation.assigned_name,
             locator=observation.locator,
             purpose=PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
+            terminal_id=observation.terminal_id,
+            process_generation=observation.process_generation,
             generation_token=observation.generation_token,
             project_scope=observation.project_scope,
             target_repo_root=observation.target_repo_root,

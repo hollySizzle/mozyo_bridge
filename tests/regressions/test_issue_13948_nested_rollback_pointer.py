@@ -49,6 +49,7 @@ import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_
 from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
     HerdrIdentityReplacementBindingStore,
 )
+from mozyo_bridge.core.state.herdr_native_identity_binding import native_name_for
 from tests.support.current_launch_authority import (  # noqa: E402
     seed_current_generation,
 )
@@ -103,6 +104,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     REASON_OK,
     REASON_PREFLIGHT,
     run_session_rollback,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
+    pane_bound_receipt,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_v1_replacement_binding import (  # noqa: E501
     V1_BINDING_LAUNCH_UNHEALTHY,
@@ -255,6 +259,19 @@ class _CloseResult:
         self.failed = tuple(failed)
 
 
+def _terminal_id(locator: str) -> str:
+    return "terminal-" + locator.replace(":", "-")
+
+
+def _terminal_receipt(assigned_name: str, locator: str) -> str:
+    return pane_bound_receipt(
+        target_workspace="w2G",
+        target_tab="w2G:t1",
+        native_name=native_name_for(assigned_name),
+        terminal_id=_terminal_id(locator),
+    )
+
+
 class _RollbackOps:
     """The five reads + one close the public rollback rail is allowed; close is stateful."""
 
@@ -283,6 +300,21 @@ class _RollbackOps:
         for _role, locator in targets:
             self.rows = [r for r in self.rows if r.get("pane_id") != locator]
         return _CloseResult(closed=list(targets))
+
+    def close_agent_participant(self, *, workspace_id, lane_id, target):
+        matches = [
+            row
+            for row in self.rows
+            if row.get("name") == target.assigned_name
+            and row.get("pane_id") == target.locator
+            and row.get("native_name") == target.native_name
+            and row.get("terminal_id") == target.terminal_id
+            and row.get("agent") == target.role
+        ]
+        if len(matches) != 1:
+            return False, "terminal-bound startup target changed before close"
+        self.close(workspace_id, lane_id, ((target.role, target.locator),))
+        return True, ""
 
 
 class RealDriveWiringTest(unittest.TestCase):
@@ -319,7 +351,8 @@ class RealDriveWiringTest(unittest.TestCase):
             action.action_id,
             Participant(
                 role="claude", assigned_name=self.assigned,
-                locator=self.fresh_locator, receipt="workspace=w2G",
+                locator=self.fresh_locator,
+                receipt=_terminal_receipt(self.assigned, self.fresh_locator),
             ),
         )
         self.fence.set_phase(action.action_id, PHASE_ROLLBACK_OWED)
@@ -430,6 +463,8 @@ class RealDriveWiringTest(unittest.TestCase):
         action_id = outcome.rollback_pointer.split("--action-id ", 1)[1]
         rows = [{
             "name": self.assigned, "pane_id": self.fresh_locator,
+            "terminal_id": _terminal_id(self.fresh_locator),
+            "native_name": native_name_for(self.assigned),
             "agent": "claude", "agent_status": "idle",
         }]
         preflight = run_session_rollback(
@@ -481,7 +516,8 @@ class V1ReplacementBindingRollbackRailTest(unittest.TestCase):
             action.action_id,
             Participant(
                 role="claude", assigned_name=self.assigned,
-                locator=self.FRESH_LOCATOR, receipt="workspace=w2G",
+                locator=self.FRESH_LOCATOR,
+                receipt=_terminal_receipt(self.assigned, self.FRESH_LOCATOR),
             ),
         )
         startup_fence.set_phase(action.action_id, PHASE_ROLLBACK_OWED)
@@ -505,6 +541,8 @@ class V1ReplacementBindingRollbackRailTest(unittest.TestCase):
     def _rollback_rows(self):
         return [{
             "name": self.assigned, "pane_id": self.FRESH_LOCATOR,
+            "terminal_id": _terminal_id(self.FRESH_LOCATOR),
+            "native_name": native_name_for(self.assigned),
             "agent": "claude", "agent_status": "idle",
         }]
 

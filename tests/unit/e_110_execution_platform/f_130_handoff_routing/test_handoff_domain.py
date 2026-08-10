@@ -430,6 +430,10 @@ class QueueEnterRetryPolicyTest(unittest.TestCase):
         self.assertFalse(resolve_queue_enter_retry_policy(-5, 2).enabled)
         self.assertEqual(0, resolve_queue_enter_retry_policy(-5, 2).max_retries)
 
+    def test_generic_policy_keeps_legacy_tmux_values_above_herdr_bound(self) -> None:
+        policy = resolve_queue_enter_retry_policy(3601, 2)
+        self.assertEqual(1800, policy.max_retries)
+
     def test_zero_window_or_interval_disables_retry(self) -> None:
         self.assertEqual(0, resolve_queue_enter_retry_policy(0, 2).max_retries)
         self.assertEqual(0, resolve_queue_enter_retry_policy(30, 0).max_retries)

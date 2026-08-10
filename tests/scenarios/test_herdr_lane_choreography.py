@@ -72,6 +72,21 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.workspace_registry import read_anchor, register_workspace
+from mozyo_bridge.core.state.herdr_identity_attestation import (
+    HerdrIdentityAttestationStore,
+    IdentityAttestationRecord,
+    VERDICT_PRESENT,
+)
+from mozyo_bridge.core.state.herdr_launch_generation import (
+    HerdrLaunchGenerationStore,
+)
+from mozyo_bridge.core.state.startup_transaction_fence import (
+    PHASE_COMPLETED_SUCCESS,
+    Participant,
+    StartupTransactionFence,
+    StartupUnit,
+)
+from mozyo_bridge.core.state.herdr_native_identity_binding import native_name_for
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_dispatch_herdr_ops import (  # noqa: E501
     HerdrWorkerDispatchOps,
 )
@@ -82,11 +97,15 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (  # noqa: E501
     herdr_effective_backend_selected,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
+    pane_bound_receipt,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     encode_assigned_name,
 )
 
 from tests.support.herdr_fake import FakeHerdr
+from tests.support.herdr_fake import STATUS_WORKING
 from tests.support.redmine_anchor_authority import matching_redmine_anchor_source_patch
 
 
@@ -243,7 +262,68 @@ class _Finding1World:
             workspace_id=ws,
             provider="claude",
         )
+        self._seed_worker_launch_authority()
         self.runner = _ScenarioRunner(self.fake, self.herdr_bin)
+
+    def _seed_worker_launch_authority(self) -> None:
+        """Represent the worker as one completed, attested managed generation."""
+        name = encode_assigned_name(self.workspace_id, "claude", LANE)
+        observed_at = "2026-08-10T00:00:00+00:00"
+        HerdrIdentityAttestationStore(home=self.home).upsert(
+            IdentityAttestationRecord(
+                assigned_name=name,
+                workspace_id=self.workspace_id,
+                role="claude",
+                lane_id=LANE,
+                locator=self.worker_locator,
+                verdict=VERDICT_PRESENT,
+                observed_at=observed_at,
+            )
+        )
+        fence = StartupTransactionFence(home=self.home)
+        action = fence.reserve(
+            StartupUnit(
+                workspace_id=self.workspace_id,
+                lane_id=LANE,
+                providers=("claude",),
+            ),
+            "scenario-managed-worker-generation",
+        )
+        terminal_id = f"terminal-{self.worker_locator}"
+        target_workspace = self.worker_locator.split(":", 1)[0]
+        fence.record_participant(
+            action.action_id,
+            Participant(
+                role="claude",
+                assigned_name=name,
+                locator=self.worker_locator,
+                receipt=pane_bound_receipt(
+                    target_workspace=target_workspace,
+                    target_tab=f"{target_workspace}:t1",
+                    native_name=native_name_for(name),
+                    terminal_id=terminal_id,
+                ),
+            ),
+        )
+        fence.set_phase(action.action_id, PHASE_COMPLETED_SUCCESS)
+        generations = HerdrLaunchGenerationStore(home=self.home)
+        generations.reserve_pending(
+            assigned_name=name,
+            startup_action_id=action.action_id,
+            workspace_id=self.workspace_id,
+            role="claude",
+            lane_id=LANE,
+        )
+        generations.finalize(
+            assigned_name=name,
+            startup_action_id=action.action_id,
+            workspace_id=self.workspace_id,
+            role="claude",
+            lane_id=LANE,
+            locator=self.worker_locator,
+            verdict=VERDICT_PRESENT,
+            observed_at=observed_at,
+        )
 
     # -- environment / argv -----------------------------------------------
 
@@ -324,6 +404,8 @@ class _Finding1World:
     def drive_inner_send(self, *, pin: bool):
         """Drive the real ``_drive_worker_send_argv`` composition; return (rc, out, err)."""
         env = self.sender_env()
+        if pin:
+            self.fake.arm_transition(self.worker_locator, STATUS_WORKING)
         with self._driving_context(env):
             out = io.StringIO()
             err = io.StringIO()
@@ -346,6 +428,7 @@ class _Finding1World:
             runner=self.runner.run,
         )
         env = self.sender_env()
+        self.fake.arm_transition(self.worker_locator, STATUS_WORKING)
         with self._driving_context(env):
             out = io.StringIO()
             err = io.StringIO()

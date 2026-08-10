@@ -176,24 +176,35 @@ class _FakeOps:
         self.events.append("state_qe")
         return None
 
-    def observe_queue_enter_gateway_binding(self, target: str) -> Optional[dict]:
+    def observe_queue_enter_gateway_binding(
+        self, target: str
+    ) -> Optional[dict[str, str]]:
         self.events.append("bind_qe")
         return None
 
-    def arm_queue_enter_turn_wait(self, target: str, *, timeout_ms: int):
+    def arm_queue_enter_turn_wait(
+        self, target: str, *, timeout_ms: int
+    ) -> Optional[object]:
         self.events.append(f"arm_qe_wait:{timeout_ms}")
         return None
 
-    def collect_queue_enter_turn_wait(self, armed) -> Optional[str]:
+    def collect_queue_enter_turn_wait(self, armed: object) -> Optional[str]:
         self.events.append("collect_qe_wait")
         return None
+
+    def cancel_queue_enter_turn_wait(self, armed: object) -> None:
+        self.events.append("cancel_qe_wait")
+
+    def queue_enter_turn_wait_pending(self, armed: object) -> bool:
+        self.events.append("pending_qe_wait")
+        return False
 
     def evaluate_queue_enter_resend(
         self,
         target: str,
         text: str,
         receiver: str,
-        baseline_binding: Optional[dict],
+        baseline_binding: Optional[dict[str, str]],
     ) -> QueueEnterResendGate:
         self.events.append("gate_qe")
         return QueueEnterResendGate(RESEND_SKIP_STATE_UNREADABLE)
@@ -297,6 +308,7 @@ def _request(
     target_activation: Optional[TargetActivationOutcome] = None,
     restore_previous_active: bool = False,
     submit_delay: Optional[float] = None,
+    herdr_process_generation: Optional[str] = None,
 ) -> TmuxTransportRailRequest:
     """Build a request; the envelope value objects are ``None`` (the slice only threads them)."""
     return TmuxTransportRailRequest(
@@ -322,6 +334,13 @@ def _request(
         submit_delivery_id=submit_delivery_id,
         persist_delivery=persist_delivery,
         herdr_send=herdr_send,
+        herdr_assigned_name=("mzb1_ws_claude_lane" if herdr_send else None),
+        herdr_process_generation=(
+            herdr_process_generation
+            or QueueEnterObservationOnlyWaitTests._binding()["process_generation"]
+            if herdr_send
+            else None
+        ),
         read_lines=50,
         landing_timeout=None,
         submit_delay=submit_delay,
@@ -533,7 +552,13 @@ class TmuxTransportRailQueueEnterTest(unittest.TestCase):
         snapshot = QueueEnterTurnStartObservation(
             runtime_state="busy", read_ok=True, read_reason=None, poll_attempts=1
         )
-        ops = _FakeOps(marker_observed=True, queue_enter_snapshot=snapshot)
+        ops = _V2FakeOps(
+            marker_observed=True,
+            queue_enter_snapshot=snapshot,
+            wait_kind="changed",
+            binding=QueueEnterObservationOnlyWaitTests._binding(),
+            runtime_state="turn_ended",
+        )
         code, died = _run(ops, _request(mode=_MODE_QUEUE_ENTER, herdr_send=True))
         self.assertIsNone(died)
         self.assertEqual(code, 0)
@@ -636,19 +661,35 @@ class _V2FakeOps(_FakeOps):
         self.armed_targets: List[str] = []
         self.armed_timeouts: List[int] = []
         self.collected: List[object] = []
+        self.live_waits: set[object] = set()
 
-    def arm_queue_enter_turn_wait(self, target: str, *, timeout_ms: int):
+    def arm_queue_enter_turn_wait(
+        self, target: str, *, timeout_ms: int
+    ) -> Optional[object]:
         self.events.append("arm_qe_wait")
         self.armed_targets.append(target)
         self.armed_timeouts.append(timeout_ms)
-        return object()
+        armed = object()
+        self.live_waits.add(armed)
+        return armed
 
-    def collect_queue_enter_turn_wait(self, armed) -> Optional[str]:
+    def collect_queue_enter_turn_wait(self, armed: object) -> Optional[str]:
         self.events.append("collect_qe_wait")
         self.collected.append(armed)
+        self.live_waits.discard(armed)
         return self.wait_kinds.pop(0) if self.wait_kinds else self.wait_kind
 
-    def observe_queue_enter_gateway_binding(self, target: str) -> Optional[dict]:
+    def cancel_queue_enter_turn_wait(self, armed: object) -> None:
+        self.events.append("cancel_qe_wait")
+        self.live_waits.discard(armed)
+
+    def queue_enter_turn_wait_pending(self, armed: object) -> bool:
+        self.events.append("pending_qe_wait")
+        return armed in self.live_waits
+
+    def observe_queue_enter_gateway_binding(
+        self, target: str
+    ) -> Optional[dict[str, str]]:
         self.events.append("bind_qe")
         return self.binding
 
@@ -661,7 +702,7 @@ class _V2FakeOps(_FakeOps):
         target: str,
         text: str,
         receiver: str,
-        baseline_binding: Optional[dict],
+        baseline_binding: Optional[dict[str, str]],
     ) -> QueueEnterResendGate:
         self.events.append("gate_qe")
         return self.resend_gate
@@ -677,17 +718,31 @@ class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
 
     @staticmethod
     def _binding():
+        assigned_name = "mzb1_ws_claude_lane"
+        terminal_id = "terminal-test"
+        locator = "%pT"
+        revision = "4"
         return {
-            "provider": "codex",
-            "assigned_name": "gw",
-            "locator": "w:3",
-            "row_revision": "4",
+            "provider": "claude",
+            "assigned_name": assigned_name,
+            "locator": locator,
+            "terminal_id": terminal_id,
+            "row_revision": revision,
+            "process_generation": (
+                f"{len(assigned_name)}:{assigned_name}:"
+                f"{len(terminal_id)}:{terminal_id}:"
+                f"{len(locator)}:{locator}:r{revision}"
+            ),
             "attestation_observed_at": "2026-07-24T17:00:00+00:00",
             "startup_action_id": "startup-GEN-A",
         }
 
     def test_the_wait_is_armed_before_the_first_enter(self) -> None:
-        ops = _V2FakeOps(marker_observed=True, queue_enter_snapshot=self._snapshot())
+        ops = _V2FakeOps(
+            marker_observed=True,
+            queue_enter_snapshot=self._snapshot(),
+            binding=self._binding(),
+        )
         code, died = _run(ops, _request(mode=_MODE_QUEUE_ENTER, herdr_send=True))
         self.assertIsNone(died)
         self.assertEqual(code, 0)
@@ -699,11 +754,7 @@ class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
         # The immediate start->turn_ended shape: the armed wait collected ``changed`` while
         # the post-choreography snapshot only ever saw the settled state. The persisted
         # observation carries BOTH + the action-time process binding, versioned additively.
-        binding = {
-            "provider": "codex", "assigned_name": "gw", "locator": "w:3",
-            "row_revision": "4", "attestation_observed_at": "2026-07-24T17:00:00+00:00",
-            "startup_action_id": "startup-GEN-A",
-        }
+        binding = self._binding()
         ops = _V2FakeOps(
             marker_observed=True, queue_enter_snapshot=self._snapshot("turn_ended"),
             wait_kind="changed", binding=binding,
@@ -716,19 +767,19 @@ class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
         self.assertEqual(obs.get("gateway_binding"), binding)
         self.assertEqual(obs.get("observation_version"), 2)
 
-    def test_a_wait_timeout_is_persisted_without_changing_the_delivery(self) -> None:
-        binding = {
-            "provider": "codex", "assigned_name": "gw", "locator": "w:3",
-            "row_revision": "4", "attestation_observed_at": "2026-07-24T17:00:00+00:00",
-            "startup_action_id": "startup-GEN-A",
-        }
+    def test_a_wait_timeout_is_persisted_as_uncertain_non_success(self) -> None:
+        binding = self._binding()
         ops = _V2FakeOps(
             marker_observed=True, queue_enter_snapshot=self._snapshot(),
             wait_kind="timeout", binding=binding,
         )
         code, died = _run(ops, _request(mode=_MODE_QUEUE_ENTER, herdr_send=True))
-        self.assertIsNone(died)
-        self.assertEqual(code, 0)  # the observation NEVER fails a normal delivery
+        self.assertIsNotNone(died)
+        self.assertIsNone(code)
+        self.assertEqual(
+            (ops.emitted[0].outcome.status, ops.emitted[0].outcome.reason),
+            ("blocked", "turn_start_unconfirmed"),
+        )
         obs = ops.emitted[0].outcome.queue_enter_turn_start_observation
         # Only a causal ``changed`` is published under the authoritative field.
         # Timeout remains explicit diagnostic telemetry and the body-absent gate
@@ -740,7 +791,7 @@ class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
         self.assertEqual(obs.get("enter_attempts"), 1)
         self.assertEqual(obs.get("gateway_binding"), binding)
 
-    def test_timeout_rechecks_then_rearms_and_sends_exactly_one_extra_enter(self) -> None:
+    def test_timeout_rechecks_then_stops_after_the_confirming_retry(self) -> None:
         binding = self._binding()
         ops = _V2FakeOps(
             marker_observed=True,
@@ -767,27 +818,44 @@ class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
             STAGE_SUBMITTED_CONFIRMED,
         )
 
-    def test_busy_baseline_can_receive_one_nudge_but_is_never_confirmed_by_state_change(self) -> None:
+    def test_busy_baseline_can_be_nudged_but_never_reports_success(self) -> None:
         binding = self._binding()
         ops = _V2FakeOps(
             marker_observed=True,
             queue_enter_snapshot=self._snapshot("busy"),
-            wait_kinds=["changed", "changed"],
+            # A timeout can authorise one freshly gated nudge while busy. The
+            # following changed event is not attributable to this send because
+            # the pre-Enter state was busy, so it must stop rather than authorise
+            # another Enter.
+            wait_kinds=["timeout", "changed"],
             binding=binding,
             runtime_state="busy",
             resend_gate=QueueEnterResendGate(RESEND_SKIP_NONE, "busy"),
         )
-        code, died = _run(ops, _request(mode=_MODE_QUEUE_ENTER, herdr_send=True))
-        self.assertIsNone(died)
-        self.assertEqual(code, 0)
+        code, died = _run(
+            ops,
+            _request(
+                mode=_MODE_QUEUE_ENTER,
+                herdr_send=True,
+                queue_enter_retry_window=4.0,
+                queue_enter_retry_interval=2.0,
+            ),
+        )
+        self.assertIsNotNone(died)
+        self.assertIsNone(code)
         self.assertEqual(ops.enter_presses, 2)
+        self.assertEqual(ops.events.count("gate_qe"), 1)
         obs = ops.emitted[0].outcome.queue_enter_turn_start_observation
         self.assertNotIn("event_wait_kind", obs)
         self.assertEqual(obs.get("baseline_runtime_state"), "busy")
+        self.assertEqual(obs.get("first_event_wait_kind"), "timeout")
+        self.assertEqual(obs.get("final_event_wait_kind"), "changed")
+        self.assertEqual(obs.get("enter_attempts"), 2)
         self.assertEqual(
             ops.emitted[0].outcome.injection_stage["stage"],
             STAGE_UNCERTAIN_PARTIAL,
         )
+        self.assertEqual(ops.emitted[0].outcome.status, "blocked")
 
     def test_generation_drift_refuses_the_extra_enter(self) -> None:
         ops = _V2FakeOps(
@@ -809,7 +877,7 @@ class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
                 target: str,
                 text: str,
                 receiver: str,
-                baseline_binding: Optional[dict],
+                baseline_binding: Optional[dict[str, str]],
             ) -> QueueEnterResendGate:
                 self.events.append("gate_qe")
                 raise TerminalTransportError("adapter-private failure detail")
@@ -853,8 +921,8 @@ class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
         obs = ops.emitted[0].outcome.queue_enter_turn_start_observation
         self.assertEqual(obs.get("resend_skipped_reason"), "resend_disabled")
 
-    def test_non_finite_retry_policy_refuses_before_body_or_enter(self) -> None:
-        for value in (float("nan"), float("inf"), float("-inf")):
+    def test_unsupported_retry_policy_refuses_before_body_or_enter(self) -> None:
+        for value in (float("nan"), float("inf"), float("-inf"), 1e306, 1e308):
             with self.subTest(value=value):
                 ops = _V2FakeOps(marker_observed=True)
                 code, died = _run(
@@ -871,6 +939,29 @@ class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
                 self.assertEqual(ops.enter_presses, 0)
                 self.assertEqual(ops.emitted[0].outcome.reason, "invalid_args")
 
+    def test_sub_millisecond_policy_never_overflows_and_disables_extra_enter(self) -> None:
+        ops = _V2FakeOps(
+            marker_observed=True,
+            queue_enter_snapshot=self._snapshot(),
+            binding=self._binding(),
+            wait_kind="changed",
+        )
+
+        code, died = _run(
+            ops,
+            _request(
+                mode=_MODE_QUEUE_ENTER,
+                herdr_send=True,
+                queue_enter_retry_window=0.0001,
+                queue_enter_retry_interval=5e-324,
+            ),
+        )
+
+        self.assertIsNone(died)
+        self.assertEqual(code, 0)
+        self.assertEqual(ops.enter_presses, 1)
+        self.assertEqual(ops.armed_timeouts, [8000])
+
     def test_a_generation_change_across_the_window_drops_the_v2_authority(self) -> None:
         # j#87418 F1: the pre-arm and post-collect generations differ (a same-name/-locator
         # recycle mid-window) -> the observed start + binding are NOT persisted as one
@@ -883,9 +974,19 @@ class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
             def observe_queue_enter_gateway_binding(self, target):
                 self.events.append("bind_qe")
                 self._bind_calls += 1
+                assigned_name = "mzb1_ws_claude_lane"
+                terminal_id = "terminal-test"
+                revision = str(self._bind_calls)
                 return {
-                    "provider": "codex", "assigned_name": "gw", "locator": "w:3",
-                    "row_revision": str(self._bind_calls),  # DIFFERENT each read
+                    "provider": "claude",
+                    "assigned_name": assigned_name,
+                    "locator": "%pT",
+                    "terminal_id": terminal_id,
+                    "row_revision": revision,
+                    "process_generation": (
+                        f"{len(assigned_name)}:{assigned_name}:"
+                        f"{len(terminal_id)}:{terminal_id}:3:%pT:r{revision}"
+                    ),
                     "attestation_observed_at": f"2026-07-24T17:0{self._bind_calls}:00+00:00",
                     "startup_action_id": f"startup-GEN-{self._bind_calls}",  # DIFFERENT token
                 }
@@ -893,20 +994,40 @@ class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
         ops = _RecycleOps(
             marker_observed=True, queue_enter_snapshot=self._snapshot(), wait_kind="changed",
         )
-        code, _died = _run(ops, _request(mode=_MODE_QUEUE_ENTER, herdr_send=True))
-        self.assertEqual(code, 0)
+        initial_name = "mzb1_ws_claude_lane"
+        initial_terminal = "terminal-test"
+        initial_locator = "%pT"
+        initial_generation = (
+            f"{len(initial_name)}:{initial_name}:"
+            f"{len(initial_terminal)}:{initial_terminal}:"
+            f"{len(initial_locator)}:{initial_locator}:r1"
+        )
+        code, died = _run(
+            ops,
+            _request(
+                mode=_MODE_QUEUE_ENTER,
+                herdr_send=True,
+                herdr_process_generation=initial_generation,
+            ),
+        )
+        self.assertIsNone(code)
+        self.assertIsNotNone(died)
+        self.assertEqual(ops.enter_presses, 0)
         obs = ops.emitted[0].outcome.queue_enter_turn_start_observation
         self.assertNotIn("event_wait_kind", obs)
         self.assertNotIn("gateway_binding", obs)
 
-    def test_a_legacy_ops_without_the_seam_stays_green_and_unversioned(self) -> None:
+    def test_an_ops_without_an_armed_wait_fails_closed_and_unversioned(self) -> None:
         ops = _FakeOps(marker_observed=True, queue_enter_snapshot=self._snapshot())
         code, died = _run(ops, _request(mode=_MODE_QUEUE_ENTER, herdr_send=True))
-        self.assertIsNone(died)
-        self.assertEqual(code, 0)
-        obs = ops.emitted[0].outcome.queue_enter_turn_start_observation
-        self.assertNotIn("event_wait_kind", obs)
-        self.assertNotIn("observation_version", obs)
+        self.assertIsNotNone(died)
+        self.assertIsNone(code)
+        self.assertEqual(ops.enter_presses, 0)
+        self.assertEqual(ops.injected, [])
+        self.assertEqual(ops.emitted[0].outcome.reason, "target_unavailable")
+        self.assertIsNone(
+            ops.emitted[0].outcome.queue_enter_turn_start_observation
+        )
 
     def test_the_tmux_and_standard_paths_never_arm(self) -> None:
         ops = _V2FakeOps(marker_observed=True)
@@ -939,11 +1060,13 @@ class _DeadlineFakeOps(_V2FakeOps):
         self.collect_advances = list(collect_advances)
         self.arm_records: List[tuple[float, int]] = []
 
-    def arm_queue_enter_turn_wait(self, target: str, *, timeout_ms: int):
+    def arm_queue_enter_turn_wait(
+        self, target: str, *, timeout_ms: int
+    ) -> Optional[object]:
         self.arm_records.append((self.clock(), timeout_ms))
         return super().arm_queue_enter_turn_wait(target, timeout_ms=timeout_ms)
 
-    def collect_queue_enter_turn_wait(self, armed) -> Optional[str]:
+    def collect_queue_enter_turn_wait(self, armed: object) -> Optional[str]:
         kind = super().collect_queue_enter_turn_wait(armed)
         if self.collect_advances:
             self.clock.advance(self.collect_advances.pop(0))
@@ -955,7 +1078,7 @@ class _DeadlineFakeOps(_V2FakeOps):
 
 
 class QueueEnterAbsoluteRetryDeadlineTests(unittest.TestCase):
-    """Pin the Herdr retry to one absolute window and at most one extra Enter."""
+    """Pin every Herdr wait and retry to one absolute public window."""
 
     @staticmethod
     def _binding():
@@ -970,15 +1093,19 @@ class QueueEnterAbsoluteRetryDeadlineTests(unittest.TestCase):
             poll_attempts=1,
         )
 
-    def _execute(self, ops, clock, *, window: float, interval: float) -> int:
-        return TmuxTransportRailUseCase(ops, monotonic=clock).execute(
-            _request(
-                mode=_MODE_QUEUE_ENTER,
-                herdr_send=True,
-                queue_enter_retry_window=window,
-                queue_enter_retry_interval=interval,
+    def _execute(self, ops, clock, *, window: float, interval: float):
+        try:
+            code = TmuxTransportRailUseCase(ops, monotonic=clock).execute(
+                _request(
+                    mode=_MODE_QUEUE_ENTER,
+                    herdr_send=True,
+                    queue_enter_retry_window=window,
+                    queue_enter_retry_interval=interval,
+                )
             )
-        )
+        except _FakeDie as exc:
+            return None, exc
+        return code, None
 
     def test_initial_wait_consuming_the_window_refuses_an_extra_enter(self) -> None:
         clock = _ManualMonotonicClock()
@@ -993,9 +1120,11 @@ class QueueEnterAbsoluteRetryDeadlineTests(unittest.TestCase):
             resend_gate=QueueEnterResendGate(RESEND_SKIP_NONE, "turn_ended"),
         )
 
-        self.assertEqual(self._execute(ops, clock, window=2.0, interval=0.25), 0)
+        code, died = self._execute(ops, clock, window=2.0, interval=0.25)
+        self.assertIsNone(code)
+        self.assertIsNotNone(died)
         self.assertEqual(ops.enter_presses, 1)
-        self.assertEqual(ops.arm_records, [(0.0, 2000)])
+        self.assertEqual(ops.arm_records, [(0.0, 250)])
         self.assertNotIn("gate_qe", ops.events)
         observation = ops.emitted[0].outcome.queue_enter_turn_start_observation
         self.assertEqual(
@@ -1016,7 +1145,9 @@ class QueueEnterAbsoluteRetryDeadlineTests(unittest.TestCase):
             resend_gate=QueueEnterResendGate(RESEND_SKIP_NONE, "turn_ended"),
         )
 
-        self.assertEqual(self._execute(ops, clock, window=1.0, interval=2.0), 0)
+        code, died = self._execute(ops, clock, window=1.0, interval=2.0)
+        self.assertIsNone(code)
+        self.assertIsNotNone(died)
         self.assertEqual(ops.enter_presses, 1)
         self.assertEqual(ops.arm_records, [(0.0, 1000)])
         self.assertNotIn("sleep", ops.events)
@@ -1036,7 +1167,9 @@ class QueueEnterAbsoluteRetryDeadlineTests(unittest.TestCase):
             resend_gate=QueueEnterResendGate(RESEND_SKIP_NONE, "turn_ended"),
         )
 
-        self.assertEqual(self._execute(ops, clock, window=window, interval=0.4), 0)
+        code, died = self._execute(ops, clock, window=window, interval=0.4)
+        self.assertIsNone(code)
+        self.assertIsNotNone(died)
         self.assertEqual(ops.enter_presses, 2)
         self.assertEqual(len(ops.arm_records), 2)
         self.assertEqual(ops.wait_kinds, ["changed"])

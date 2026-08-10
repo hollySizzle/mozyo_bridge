@@ -60,7 +60,7 @@ _HERDR_TAB_ID = re.compile(r"^(w[A-Za-z0-9]+):t[A-Za-z0-9]+$")
 
 
 class PaneBoundReceiptError(ValueError):
-    """A prepared-pane receipt is not the exact v1 authority shape."""
+    """A prepared-pane receipt is not an exact supported authority shape."""
 
 
 @dataclass(frozen=True)
@@ -70,6 +70,7 @@ class PaneBoundReceipt:
     workspace_id: str
     tab_id: str
     native_name: str
+    terminal_id: str = ""
 
 
 def new_action_nonce() -> str:
@@ -272,15 +273,25 @@ def launch_receipt(*, target_workspace: str, target_tab: str) -> str:
 
 
 def pane_bound_receipt(
-    *, target_workspace: str, target_tab: str, native_name: str
+    *,
+    target_workspace: str,
+    target_tab: str,
+    native_name: str,
+    terminal_id: str = "",
 ) -> str:
     """Strict receipt identifying a Herdr 0.8 pane prepared before agent start."""
     receipt = PaneBoundReceipt(
         workspace_id=target_workspace,
         tab_id=target_tab,
         native_name=native_name,
+        terminal_id=terminal_id,
     )
     _validate_pane_bound_receipt(receipt)
+    if receipt.terminal_id:
+        return (
+            f"pane_bound_v2 workspace={receipt.workspace_id} tab={receipt.tab_id} "
+            f"native={receipt.native_name} terminal={receipt.terminal_id}"
+        )
     return (
         f"pane_bound_v1 workspace={receipt.workspace_id} tab={receipt.tab_id} "
         f"native={receipt.native_name}"
@@ -288,7 +299,7 @@ def pane_bound_receipt(
 
 
 def parse_pane_bound_receipt(value: object) -> Optional[PaneBoundReceipt]:
-    """Decode only the byte-exact ``pane_bound_v1`` receipt grammar.
+    """Decode the byte-exact ``pane_bound_v1`` / ``pane_bound_v2`` grammar.
 
     A legacy launch receipt is outside this codec and returns ``None``.  Anything that
     claims to be a pane-bound receipt — including an unknown future version — but is not
@@ -304,22 +315,29 @@ def parse_pane_bound_receipt(value: object) -> Optional[PaneBoundReceipt]:
             "prepared-pane receipt marker is not in its canonical byte position"
         )
     parts = value.split(" ")
-    if (
-        len(parts) != 4
-        or parts[0] != "pane_bound_v1"
-        or not parts[1].startswith("workspace=")
-        or not parts[2].startswith("tab=")
-        or not parts[3].startswith("native=")
+    v1 = len(parts) == 4 and parts[0] == "pane_bound_v1"
+    v2 = len(parts) == 5 and parts[0] == "pane_bound_v2"
+    if not (
+        (v1 or v2)
+        and parts[1].startswith("workspace=")
+        and parts[2].startswith("tab=")
+        and parts[3].startswith("native=")
+        and (not v2 or parts[4].startswith("terminal="))
     ):
         raise PaneBoundReceiptError(
-            "prepared-pane receipt is not the exact pane_bound_v1 field shape"
+            "prepared-pane receipt is not an exact supported field shape"
         )
     receipt = PaneBoundReceipt(
         workspace_id=parts[1][len("workspace=") :],
         tab_id=parts[2][len("tab=") :],
         native_name=parts[3][len("native=") :],
+        terminal_id=parts[4][len("terminal=") :] if v2 else "",
     )
     _validate_pane_bound_receipt(receipt)
+    if v2 and not receipt.terminal_id:
+        raise PaneBoundReceiptError(
+            "pane_bound_v2 receipt has no terminal identity"
+        )
     return receipt
 
 
@@ -336,6 +354,13 @@ def _validate_pane_bound_receipt(receipt: PaneBoundReceipt) -> None:
     if not is_native_name(receipt.native_name):
         raise PaneBoundReceiptError(
             "prepared-pane receipt has an invalid canonical Herdr native name"
+        )
+    if receipt.terminal_id and (
+        receipt.terminal_id != receipt.terminal_id.strip()
+        or any(char.isspace() for char in receipt.terminal_id)
+    ):
+        raise PaneBoundReceiptError(
+            "prepared-pane receipt has an invalid terminal identity"
         )
 
 

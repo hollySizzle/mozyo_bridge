@@ -32,6 +32,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -42,6 +43,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.workspace_registry import read_anchor, register_workspace
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
+    PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
     RESOLVED_TARGET_CAPABILITY_ARG,
     ResolvedHerdrTargetCapability,
 )
@@ -84,15 +86,20 @@ class _FakeWaitProc:
     """A fake ``wait agent-status`` subprocess (herdr event wait), classified on exit."""
 
     def __init__(self, *, returncode: int = 0, stdout: str = "", stderr: str = ""):
-        self.returncode = returncode
+        self.returncode = None
+        self._result_returncode = returncode
         self._stdout = stdout
         self._stderr = stderr
 
     def communicate(self, timeout=None):
+        self.returncode = self._result_returncode
         return self._stdout, self._stderr
 
+    def poll(self):
+        return self.returncode
+
     def kill(self):
-        pass
+        self.returncode = -9
 
 
 class _FakeHerdr:
@@ -124,6 +131,8 @@ class _FakeHerdr:
         fail_send_keys=False,
         pane_content=None,
         fail_read=False,
+        after_agent_list=None,
+        after_send_text=None,
     ):
         self.agent_rows = agent_rows
         self.sends: list = []
@@ -132,6 +141,7 @@ class _FakeHerdr:
         self._get_calls = 0
         self._wait_results = list(wait_results) if wait_results is not None else [(0, "")]
         self._wait_calls = 0
+        self.wait_processes: list[_FakeWaitProc] = []
         self._read_returns_body = read_returns_body
         self._fail_send_text = fail_send_text
         self._fail_send_keys = fail_send_keys
@@ -141,6 +151,9 @@ class _FakeHerdr:
         # screen, or `fail_read=True` to make the visible read fail outright.
         self._pane_content = IDLE_COMPOSER if pane_content is None else pane_content
         self._fail_read = fail_read
+        self._after_agent_list = after_agent_list
+        self._after_send_text = after_send_text
+        self._agent_list_calls = 0
 
     def run(self, argv, capture_output=None, text=None, timeout=None, **kw):
         rest = list(argv[1:])
@@ -150,9 +163,11 @@ class _FakeHerdr:
         if list(argv[:1]) == ["git"]:
             return subprocess.CompletedProcess(argv, 128, stdout="", stderr="not a git repo")
         if rest == ["agent", "list"]:
-            return subprocess.CompletedProcess(
-                argv, 0, stdout=json.dumps({"agents": self.agent_rows}), stderr=""
-            )
+            payload = json.dumps({"agents": self.agent_rows})
+            self._agent_list_calls += 1
+            if self._after_agent_list is not None:
+                self._after_agent_list(self, self._agent_list_calls)
+            return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr="")
         if rest[:2] == ["agent", "get"]:
             target = rest[2]
             state = (
@@ -169,6 +184,8 @@ class _FakeHerdr:
             target, body = rest[2], rest[3] if len(rest) > 3 else ""
             self.sends.append(("send_text", target, body))
             self._last_body_by_target[target] = body
+            if self._after_send_text is not None:
+                self._after_send_text(self, target, body)
             rc = 1 if self._fail_send_text else 0
             return subprocess.CompletedProcess(
                 argv, rc, stdout="", stderr="send-text failed" if rc else ""
@@ -212,7 +229,9 @@ class _FakeHerdr:
                 else self._wait_results[-1]
             )
             self._wait_calls += 1
-            return _FakeWaitProc(returncode=rc, stderr=err)
+            process = _FakeWaitProc(returncode=rc, stderr=err)
+            self.wait_processes.append(process)
+            return process
         raise AssertionError(f"unexpected popen call: {argv!r}")
 
 
@@ -232,11 +251,99 @@ def _same_lane_rows(target_locator: str = "wT:pT"):
 
     def rows(ws):
         return [
-            {"name": encode_assigned_name(ws, "codex", "lane-1"), "pane_id": "wS:pS"},
-            {"name": encode_assigned_name(ws, "claude", "lane-1"), "pane_id": target_locator},
+            {
+                "name": encode_assigned_name(ws, "codex", "lane-1"),
+                "pane_id": "wS:pS",
+                "terminal_id": "terminal-wS:pS",
+                "revision": 7,
+            },
+            {
+                "name": encode_assigned_name(ws, "claude", "lane-1"),
+                "pane_id": target_locator,
+                "terminal_id": f"terminal-{target_locator}",
+                "revision": 7,
+            },
         ]
 
     return rows
+
+
+def _project_gateway_rows(target_locator: str = "wT:pT"):
+    def rows(ws):
+        return [
+            {
+                "name": encode_assigned_name(ws, "codex", "default"),
+                "pane_id": target_locator,
+                "terminal_id": "terminal-A",
+                "revision": 7,
+                "agent": "codex",
+                "agent_status": "idle",
+            }
+        ]
+
+    return rows
+
+
+def _queue_binding(
+    workspace_id: str,
+    target_locator: str = "wT:pT",
+    *,
+    receiver: str = "claude",
+    lane_id: str = "lane-1",
+) -> dict:
+    assigned_name = encode_assigned_name(workspace_id, receiver, lane_id)
+    terminal_id = f"terminal-{target_locator}"
+    revision = "7"
+    return {
+        "provider": receiver,
+        "assigned_name": assigned_name,
+        "locator": target_locator,
+        "terminal_id": terminal_id,
+        "row_revision": revision,
+        "process_generation": (
+            f"{len(assigned_name)}:{assigned_name}:"
+            f"{len(terminal_id)}:{terminal_id}:"
+            f"{len(target_locator)}:{target_locator}:r{revision}"
+        ),
+        "attestation_observed_at": "2026-08-10T00:00:00+00:00",
+        "startup_action_id": "startup-test-generation",
+    }
+
+
+def _project_queue_binding(workspace_id: str, target_locator: str) -> dict:
+    """Queue proof matching the project-gateway capability fixture's v2 target."""
+    binding = _queue_binding(
+        workspace_id,
+        target_locator,
+        receiver="codex",
+        lane_id="default",
+    )
+    assigned_name = binding["assigned_name"]
+    binding.update(
+        terminal_id="terminal-A",
+        process_generation=_process_generation(
+            assigned_name,
+            locator=target_locator,
+            terminal_id="terminal-A",
+            revision=7,
+        ),
+        startup_action_id="generation-1",
+    )
+    return binding
+
+
+def _process_generation(
+    assigned_name: str,
+    *,
+    locator: str,
+    terminal_id: str,
+    revision: int,
+) -> str:
+    return (
+        f"{len(assigned_name)}:{assigned_name}:"
+        f"{len(terminal_id)}:{terminal_id}:"
+        f"{len(locator)}:{locator}:r{revision}"
+    )
 
 
 class PureHerdrEndToEndTest(unittest.TestCase):
@@ -254,6 +361,8 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         receiver="claude",
         proxy_target_locator=None,
         caller_identity=None,
+        queue_binding=None,
+        project_gateway_capability=False,
     ):
         from mozyo_bridge.application import commands  # noqa: F401 (import side effects)
         from mozyo_bridge.application.cli import build_parser
@@ -269,10 +378,19 @@ class PureHerdrEndToEndTest(unittest.TestCase):
             )
             register_workspace(repo, home=home)
             workspace_id = read_anchor(repo)["workspace_id"]
+            agent_rows = agent_rows_fn(workspace_id)
+            if project_gateway_capability:
+                target_name = encode_assigned_name(workspace_id, receiver, "default")
+                for row in agent_rows:
+                    if row.get("name") == target_name:
+                        row["cwd"] = str(repo.resolve())
             if herdr is None:
-                herdr = _FakeHerdr(agent_rows_fn(workspace_id))
+                herdr = _FakeHerdr(agent_rows)
             else:
-                herdr.agent_rows = agent_rows_fn(workspace_id)
+                herdr.agent_rows = agent_rows
+
+            if callable(queue_binding):
+                queue_binding = queue_binding(workspace_id)
 
             herdr_bin = repo / "fake-herdr"
             herdr_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -294,6 +412,28 @@ class PureHerdrEndToEndTest(unittest.TestCase):
                 args.target = proxy_target_locator
                 args.target_lane = "default"
                 args.target_repo = str(repo)
+                assigned_name = encode_assigned_name(
+                    workspace_id, receiver, "default"
+                )
+                project_fields = (
+                    {
+                        "purpose": PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
+                        "generation_token": "generation-1",
+                        "terminal_id": "terminal-A",
+                        "process_generation": _process_generation(
+                            assigned_name,
+                            locator=proxy_target_locator,
+                            terminal_id="terminal-A",
+                            revision=7,
+                        ),
+                        "project_scope": "project-1",
+                        "target_repo_root": str(repo.resolve()),
+                        "target_cwd": str(repo.resolve()),
+                        "project_path": ".",
+                    }
+                    if project_gateway_capability
+                    else {}
+                )
                 setattr(
                     args,
                     RESOLVED_TARGET_CAPABILITY_ARG,
@@ -301,10 +441,9 @@ class PureHerdrEndToEndTest(unittest.TestCase):
                         workspace_id=workspace_id,
                         lane_id="default",
                         provider=receiver,
-                        assigned_name=encode_assigned_name(
-                            workspace_id, receiver, "default"
-                        ),
+                        assigned_name=assigned_name,
                         locator=proxy_target_locator,
+                        **project_fields,
                     ),
                 )
 
@@ -340,6 +479,28 @@ class PureHerdrEndToEndTest(unittest.TestCase):
                     patch(
                         "mozyo_bridge.application.commands._observe_standard_turn_start",
                         observe_mock,
+                    )
+                )
+            if queue_binding is not None:
+                ctx.append(
+                    patch(
+                        "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing."
+                        "application.handoff_tmux_transport_rail."
+                        "LiveTmuxTransportRailOps.observe_queue_enter_gateway_binding",
+                        return_value=queue_binding,
+                    )
+                )
+            if project_gateway_capability:
+                ctx.append(
+                    patch(
+                        "mozyo_bridge.e_140_adapter_provider."
+                        "f_130_terminal_runtime_provider.application.herdr_send_entry."
+                        "verified_terminal_generation_token",
+                        side_effect=lambda _home, **kwargs: (
+                            "generation-1"
+                            if kwargs.get("terminal_id") == "terminal-A"
+                            else ""
+                        ),
                     )
                 )
             with contextlib.ExitStack() as stack:
@@ -390,6 +551,8 @@ class PureHerdrEndToEndTest(unittest.TestCase):
                 {
                     "name": encode_assigned_name(ws, "codex", "default"),
                     "pane_id": target_locator,
+                    "terminal_id": f"terminal-{target_locator}",
+                    "revision": 7,
                 }
             ]
 
@@ -404,16 +567,358 @@ class PureHerdrEndToEndTest(unittest.TestCase):
                 "MOZYO_AGENT_ROLE": "claude",
                 "MOZYO_LANE_ID": "foreign-lane",
             },
+            queue_binding=lambda ws: _queue_binding(
+                ws,
+                target_locator,
+                receiver="codex",
+                lane_id="default",
+            ),
         )
 
         self.assertEqual(result, 0, msg=f"out={out}\nerr={err}")
         outcome = _outcome_from(out)
         self.assertEqual(outcome.get("status"), "sent", msg=out)
-        self.assertEqual(outcome.get("reason"), "queue_enter", msg=out)
+        self.assertEqual(outcome.get("reason"), "ok", msg=out)
         sends = [op for op in herdr.sends if op[0] == "send_text"]
         self.assertEqual(len(sends), 1, msg=herdr.sends)
         self.assertEqual(sends[0][1], target_locator)
         self.assertNotEqual(ws, "ffffffffffffffffffffffffffffffff")
+
+    def test_project_gateway_standard_refuses_terminal_replacement_before_body(self) -> None:
+        target_locator = "wT:pT"
+
+        def rows(ws):
+            return [
+                {
+                    "name": encode_assigned_name(ws, "codex", "default"),
+                    "pane_id": target_locator,
+                    "terminal_id": "terminal-A",
+                    "revision": 7,
+                    "agent": "codex",
+                    "agent_status": "idle",
+                }
+            ]
+
+        def replace_after_resolution(fake, list_calls):
+            if list_calls == 1:
+                fake.agent_rows[0]["terminal_id"] = "terminal-B"
+
+        herdr = _FakeHerdr(
+            [],
+            get_states=["idle"],
+            wait_results=[(0, "")],
+            after_agent_list=replace_after_resolution,
+        )
+        result, herdr, _ws, out, err = self._run(
+            agent_rows_fn=rows,
+            herdr=herdr,
+            set_sender_env=False,
+            mode="standard",
+            receiver="codex",
+            proxy_target_locator=target_locator,
+            project_gateway_capability=True,
+        )
+
+        self.assertNotEqual(result, 0, msg=f"out={out}\nerr={err}")
+        outcome = _outcome_from(out)
+        self.assertEqual(outcome.get("status"), "blocked", msg=out)
+        self.assertEqual(outcome.get("reason"), "inject_failed", msg=out)
+        self.assertEqual(
+            [op for op in herdr.sends if op[0] in ("send_text", "send_keys")],
+            [],
+            msg=herdr.sends,
+        )
+
+    def test_project_gateway_queue_refuses_first_enter_if_wait_settles_in_verifier(self) -> None:
+        target = "wT:pT"
+
+        def settle_armed_wait(fake, _list_calls):
+            if fake.wait_processes:
+                fake.wait_processes[-1].returncode = 0
+
+        herdr = _FakeHerdr(
+            [],
+            get_states=["idle"],
+            wait_results=[(0, "")],
+            after_agent_list=settle_armed_wait,
+        )
+        result, herdr, _ws, out, err = self._run(
+            agent_rows_fn=_project_gateway_rows(target),
+            herdr=herdr,
+            set_sender_env=False,
+            mode="queue-enter",
+            receiver="codex",
+            proxy_target_locator=target,
+            queue_binding=lambda ws: _project_queue_binding(ws, target),
+            project_gateway_capability=True,
+        )
+
+        self.assertNotEqual(result, 0, msg=f"out={out}\nerr={err}")
+        outcome = _outcome_from(out)
+        self.assertEqual(outcome.get("reason"), "turn_start_unconfirmed", msg=out)
+        self.assertEqual(
+            outcome["queue_enter_turn_start_observation"]["enter_attempts"], 0
+        )
+        self.assertIn("pressed Enter 0 time(s)", err)
+        self.assertEqual(
+            len([op for op in herdr.sends if op[0] == "send_text"]), 1
+        )
+        self.assertEqual(
+            [op for op in herdr.sends if op[0] == "send_keys"], [], msg=herdr.sends
+        )
+
+    def test_project_gateway_queue_refuses_first_enter_if_verifier_exhausts_deadline(self) -> None:
+        target = "wT:pT"
+
+        def exhaust_budget_after_arm(fake, _list_calls):
+            if fake.wait_processes:
+                until = time.monotonic() + 0.06
+                while time.monotonic() < until:
+                    pass
+
+        herdr = _FakeHerdr(
+            [],
+            get_states=["idle"],
+            wait_results=[(0, "")],
+            after_agent_list=exhaust_budget_after_arm,
+        )
+        result, herdr, _ws, out, err = self._run(
+            agent_rows_fn=_project_gateway_rows(target),
+            herdr=herdr,
+            set_sender_env=False,
+            mode="queue-enter",
+            receiver="codex",
+            proxy_target_locator=target,
+            extra_argv=[
+                "--queue-enter-retry-window", "0.05",
+                "--queue-enter-retry-interval", "0.001",
+            ],
+            queue_binding=lambda ws: _project_queue_binding(ws, target),
+            project_gateway_capability=True,
+        )
+
+        self.assertNotEqual(result, 0, msg=f"out={out}\nerr={err}")
+        outcome = _outcome_from(out)
+        self.assertEqual(outcome.get("reason"), "turn_start_unconfirmed", msg=out)
+        self.assertEqual(
+            outcome["queue_enter_turn_start_observation"]["enter_attempts"], 0
+        )
+        self.assertIn("pressed Enter 0 time(s)", err)
+        self.assertEqual(
+            [op for op in herdr.sends if op[0] == "send_keys"], [], msg=herdr.sends
+        )
+
+    def test_project_gateway_queue_refuses_retry_if_wait_settles_in_verifier(self) -> None:
+        target = "wT:pT"
+
+        def settle_retry_wait(fake, _list_calls):
+            if len(fake.wait_processes) >= 2:
+                fake.wait_processes[-1].returncode = 0
+
+        herdr = _FakeHerdr(
+            [],
+            get_states=["idle", "idle"],
+            wait_results=[(1, "timed out"), (0, "")],
+            read_returns_body=True,
+            after_agent_list=settle_retry_wait,
+        )
+        result, herdr, _ws, out, err = self._run(
+            agent_rows_fn=_project_gateway_rows(target),
+            herdr=herdr,
+            set_sender_env=False,
+            mode="queue-enter",
+            receiver="codex",
+            proxy_target_locator=target,
+            extra_argv=[
+                "--queue-enter-retry-window", "1",
+                "--queue-enter-retry-interval", "0.001",
+            ],
+            queue_binding=lambda ws: _project_queue_binding(ws, target),
+            project_gateway_capability=True,
+        )
+
+        self.assertNotEqual(result, 0, msg=f"out={out}\nerr={err}")
+        outcome = _outcome_from(out)
+        self.assertEqual(outcome.get("reason"), "turn_start_unconfirmed", msg=out)
+        self.assertEqual(
+            outcome["queue_enter_turn_start_observation"]["enter_attempts"], 1
+        )
+        self.assertIn("pressed Enter 1 time(s)", err)
+        enters = [op for op in herdr.sends if op[0] == "send_keys"]
+        self.assertEqual(len(enters), 1, msg=herdr.sends)
+
+    def test_project_gateway_queue_refuses_retry_if_verifier_exhausts_deadline(self) -> None:
+        target = "wT:pT"
+
+        def exhaust_retry_budget(fake, _list_calls):
+            if len(fake.wait_processes) >= 2:
+                until = time.monotonic() + 0.06
+                while time.monotonic() < until:
+                    pass
+
+        herdr = _FakeHerdr(
+            [],
+            get_states=["idle", "idle"],
+            wait_results=[(1, "timed out"), (0, "")],
+            read_returns_body=True,
+            after_agent_list=exhaust_retry_budget,
+        )
+        result, herdr, _ws, out, err = self._run(
+            agent_rows_fn=_project_gateway_rows(target),
+            herdr=herdr,
+            set_sender_env=False,
+            mode="queue-enter",
+            receiver="codex",
+            proxy_target_locator=target,
+            extra_argv=[
+                "--queue-enter-retry-window", "0.05",
+                "--queue-enter-retry-interval", "0.001",
+            ],
+            queue_binding=lambda ws: _project_queue_binding(ws, target),
+            project_gateway_capability=True,
+        )
+
+        self.assertNotEqual(result, 0, msg=f"out={out}\nerr={err}")
+        outcome = _outcome_from(out)
+        self.assertEqual(outcome.get("reason"), "turn_start_unconfirmed", msg=out)
+        self.assertEqual(
+            outcome["queue_enter_turn_start_observation"]["enter_attempts"], 1
+        )
+        self.assertIn("pressed Enter 1 time(s)", err)
+        enters = [op for op in herdr.sends if op[0] == "send_keys"]
+        self.assertEqual(len(enters), 1, msg=herdr.sends)
+
+    def test_project_gateway_standard_refuses_revision_drift_before_body(self) -> None:
+        target_locator = "wT:pT"
+
+        def rows(ws):
+            return [
+                {
+                    "name": encode_assigned_name(ws, "codex", "default"),
+                    "pane_id": target_locator,
+                    "terminal_id": "terminal-A",
+                    "revision": 7,
+                    "agent": "codex",
+                    "agent_status": "idle",
+                }
+            ]
+
+        def advance_after_resolution(fake, list_calls):
+            if list_calls == 1:
+                fake.agent_rows[0]["revision"] = 8
+
+        herdr = _FakeHerdr(
+            [],
+            get_states=["idle"],
+            wait_results=[(0, "")],
+            after_agent_list=advance_after_resolution,
+        )
+        result, herdr, _ws, out, err = self._run(
+            agent_rows_fn=rows,
+            herdr=herdr,
+            set_sender_env=False,
+            mode="standard",
+            receiver="codex",
+            proxy_target_locator=target_locator,
+            project_gateway_capability=True,
+        )
+
+        self.assertNotEqual(result, 0, msg=f"out={out}\nerr={err}")
+        outcome = _outcome_from(out)
+        self.assertEqual(outcome.get("status"), "blocked", msg=out)
+        self.assertEqual(outcome.get("reason"), "inject_failed", msg=out)
+        self.assertEqual(
+            [op for op in herdr.sends if op[0] in ("send_text", "send_keys")],
+            [],
+            msg=herdr.sends,
+        )
+
+    def test_project_gateway_standard_allows_revision_drift_after_body(self) -> None:
+        target_locator = "wT:pT"
+
+        def rows(ws):
+            return [
+                {
+                    "name": encode_assigned_name(ws, "codex", "default"),
+                    "pane_id": target_locator,
+                    "terminal_id": "terminal-A",
+                    "revision": 7,
+                    "agent": "codex",
+                    "agent_status": "idle",
+                }
+            ]
+
+        def advance_revision(fake, _target, _body):
+            fake.agent_rows[0]["revision"] = 8
+
+        herdr = _FakeHerdr(
+            [],
+            get_states=["idle"],
+            wait_results=[(0, "")],
+            after_send_text=advance_revision,
+        )
+        result, herdr, _ws, out, err = self._run(
+            agent_rows_fn=rows,
+            herdr=herdr,
+            set_sender_env=False,
+            mode="standard",
+            receiver="codex",
+            proxy_target_locator=target_locator,
+            project_gateway_capability=True,
+        )
+
+        self.assertEqual(result, 0, msg=f"out={out}\nerr={err}")
+        self.assertEqual(_outcome_from(out).get("status"), "sent", msg=out)
+        self.assertEqual(
+            len([op for op in herdr.sends if op[0] == "send_text"]), 1
+        )
+        self.assertEqual(
+            len([op for op in herdr.sends if op[0] == "send_keys"]), 1
+        )
+
+    def test_project_gateway_standard_refuses_terminal_replacement_before_enter(self) -> None:
+        target_locator = "wT:pT"
+
+        def rows(ws):
+            return [
+                {
+                    "name": encode_assigned_name(ws, "codex", "default"),
+                    "pane_id": target_locator,
+                    "terminal_id": "terminal-A",
+                    "revision": 7,
+                    "agent": "codex",
+                    "agent_status": "idle",
+                }
+            ]
+
+        def replace_terminal(fake, _target, _body):
+            fake.agent_rows[0]["terminal_id"] = "terminal-B"
+
+        herdr = _FakeHerdr(
+            [],
+            get_states=["idle"],
+            wait_results=[(0, "")],
+            after_send_text=replace_terminal,
+        )
+        result, herdr, _ws, out, err = self._run(
+            agent_rows_fn=rows,
+            herdr=herdr,
+            set_sender_env=False,
+            mode="standard",
+            receiver="codex",
+            proxy_target_locator=target_locator,
+            project_gateway_capability=True,
+        )
+
+        self.assertNotEqual(result, 0, msg=f"out={out}\nerr={err}")
+        outcome = _outcome_from(out)
+        self.assertEqual(outcome.get("reason"), "inject_failed", msg=out)
+        self.assertEqual(
+            len([op for op in herdr.sends if op[0] == "send_text"]), 1
+        )
+        self.assertEqual(
+            [op for op in herdr.sends if op[0] == "send_keys"], [], msg=herdr.sends
+        )
 
     def test_cross_lane_worker_fails_closed_at_resolution_no_tmux(self) -> None:
         # Redmine #13305: the route-authority convergence makes the herdr send path
@@ -692,9 +1197,9 @@ class PureHerdrEndToEndTest(unittest.TestCase):
 
     def test_enter_resend_does_not_reinject_body(self) -> None:
         # First wait times out, the composer still holds the body (read echoes it),
-        # so the rail re-sends Enter ONCE and re-arms; the second wait sees the
-        # transition → started. The body must be injected exactly once (only Enter
-        # is re-sent), and the telemetry records the single re-send.
+        # so the rail re-sends Enter and re-arms; the second wait sees the
+        # transition and ends this sequence. The body must be injected exactly once
+        # (only Enter is re-sent), and telemetry records this sequence's single re-send.
         herdr = _FakeHerdr(
             [],
             get_states=["idle", "idle"],
@@ -717,11 +1222,14 @@ class PureHerdrEndToEndTest(unittest.TestCase):
     def test_queue_enter_rail_arms_its_causal_wait_before_enter_under_herdr(self) -> None:
         # #14203 introduced the pre-Enter working wait as observation-only; #15242
         # promotes a generation-coherent result to queue-specific causal evidence and
-        # uses a miss to consider one strictly-gated extra Enter. Injection remains once,
+        # uses a miss to consider strictly-gated extra Enters. Injection remains once,
         # and the STANDARD rail's `turn_start_outcome` field stays absent.
-        herdr = _FakeHerdr([], get_states=["working"], wait_results=[(0, "")])
+        herdr = _FakeHerdr([], get_states=["idle"], wait_results=[(0, "")])
         result, herdr, ws, out, err = self._run(
-            agent_rows_fn=_same_lane_rows(), herdr=herdr, mode="queue-enter"
+            agent_rows_fn=_same_lane_rows(),
+            herdr=herdr,
+            mode="queue-enter",
+            queue_binding=_queue_binding,
         )
         self.assertEqual(result, 0, msg=f"out={out}\nerr={err}")
         outcome = _outcome_from(out)
@@ -742,25 +1250,17 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         # The STANDARD event rail's `turn_start_outcome` wire field stays absent on queue-enter.
         self.assertIsNone(outcome.get("turn_start_outcome"), msg=out)
 
-    def test_queue_enter_timeout_runs_strict_gate_then_rearms_for_one_extra_enter(self) -> None:
+    def test_queue_enter_timeout_rechecks_once_then_stops_on_confirmation(self) -> None:
         # #15242: the landing marker is already visible in the current composer, but
         # the first Enter is absorbed (first event wait times out).  A stable launch
         # generation plus the exact current-composer body and an idle runtime allow
-        # ONE Enter-only fallback.  The second wait is armed before that Enter and
-        # observes the turn start.  A third canned wait result proves there is no
-        # retry loop beyond the single fallback.
+        # an Enter-only fallback. The second wait is armed before that Enter and
+        # observes the turn start. A third canned result proves causal confirmation
+        # ends this sequence; timeout-only sequences may continue within policy.
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_tmux_transport_rail import (  # noqa: E501
             LiveTmuxTransportRailOps,
         )
 
-        binding = {
-            "provider": "claude",
-            "assigned_name": "mzb1_ws_claude_lane-1",
-            "locator": "wT:pT",
-            "row_revision": "7",
-            "attestation_observed_at": "2026-08-10T00:00:00+00:00",
-            "startup_action_id": "startup-test-generation",
-        }
         herdr = _FakeHerdr(
             [],
             get_states=["idle", "idle", "idle"],
@@ -769,10 +1269,6 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         )
         original_gate = LiveTmuxTransportRailOps.evaluate_queue_enter_resend
         with patch.object(
-            LiveTmuxTransportRailOps,
-            "observe_queue_enter_gateway_binding",
-            return_value=binding,
-        ), patch.object(
             LiveTmuxTransportRailOps,
             "evaluate_queue_enter_resend",
             autospec=True,
@@ -786,7 +1282,10 @@ class PureHerdrEndToEndTest(unittest.TestCase):
                     "--queue-enter-retry-window", "1",
                     "--queue-enter-retry-interval", "0.001",
                 ],
+                queue_binding=_queue_binding,
             )
+
+        binding = _queue_binding(ws)
 
         self.assertEqual(result, 0, msg=f"out={out}\nerr={err}")
         outcome = _outcome_from(out)
@@ -827,19 +1326,23 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         self.assertEqual(obs.get("gateway_binding"), binding, msg=out)
         self.assertIsNone(outcome.get("turn_start_outcome"), msg=out)
 
-    def test_queue_enter_snapshot_records_telemetry_only(self) -> None:
+    def test_busy_snapshot_without_causal_authority_is_non_success(self) -> None:
         # Redmine #13292 (design j#72759): a herdr queue-enter send takes a read-only
         # post-choreography `agent get` snapshot and records it as the additive,
         # telemetry-only `queue_enter_turn_start_observation` field. A `working`
-        # snapshot is a settled state (single read), but it NEVER changes the
-        # `sent` wire and never blocks.
+        # snapshot is a settled state (single read), but it is not attributable
+        # to this send and therefore cannot produce a successful result.
         herdr = _FakeHerdr([], get_states=["working"])
         result, herdr, ws, out, err = self._run(
-            agent_rows_fn=_same_lane_rows(), herdr=herdr, mode="queue-enter"
+            agent_rows_fn=_same_lane_rows(),
+            herdr=herdr,
+            mode="queue-enter",
+            queue_binding=_queue_binding,
         )
-        self.assertEqual(result, 0, msg=f"out={out}\nerr={err}")
+        self.assertNotEqual(result, 0, msg=f"out={out}\nerr={err}")
         outcome = _outcome_from(out)
-        self.assertEqual(outcome.get("status"), "sent", msg=out)
+        self.assertEqual(outcome.get("status"), "blocked", msg=out)
+        self.assertEqual(outcome.get("reason"), "turn_start_unconfirmed", msg=out)
         # The snapshot read hit `agent get` at least once.
         self.assertTrue([op for op in herdr.sends if op[0] == "get"], msg=herdr.sends)
         obs = outcome.get("queue_enter_turn_start_observation")
@@ -850,25 +1353,23 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         self.assertTrue(obs.get("read_ok"), msg=out)
         self.assertIsNone(obs.get("read_reason"), msg=out)
         self.assertEqual(obs.get("poll_attempts"), 1, msg=out)
-        # The record line labels itself telemetry-only and does NOT reuse the event
-        # rail's wording.
+        # The snapshot remains a distinct signal and does NOT reuse the standard
+        # event rail's telemetry field.
         self.assertIn("Queue-enter turn-start observation (herdr agent get)", out)
-        self.assertIn("Telemetry-only", out)
         self.assertNotIn("Turn start (herdr rail)", out)
 
-    def test_queue_enter_snapshot_awaiting_input_is_advisory_not_block(self) -> None:
-        # Redmine #13292: an idle (awaiting_input) receiver after the choreography is
-        # "delivered but no turn observed starting" — recorded as telemetry ONLY. It
-        # MUST NOT hard-block: the `sent` contract (hard-block forbidden, #13262
-        # j#72523) is preserved.
-        herdr = _FakeHerdr([], get_states=["idle"])
+    def test_idle_post_snapshot_does_not_retract_a_causal_event(self) -> None:
+        herdr = _FakeHerdr([], get_states=["idle"], wait_results=[(0, "")])
         result, herdr, ws, out, err = self._run(
-            agent_rows_fn=_same_lane_rows(), herdr=herdr, mode="queue-enter"
+            agent_rows_fn=_same_lane_rows(),
+            herdr=herdr,
+            mode="queue-enter",
+            queue_binding=_queue_binding,
         )
         self.assertEqual(result, 0, msg=f"out={out}\nerr={err}")
         outcome = _outcome_from(out)
         self.assertEqual(outcome.get("status"), "sent", msg=out)
-        self.assertIn(outcome.get("reason"), ("ok", "queue_enter"), msg=out)
+        self.assertEqual(outcome.get("reason"), "ok", msg=out)
         self.assertEqual(outcome.get("next_action_owner"), "receiver", msg=out)
         obs = outcome.get("queue_enter_turn_start_observation")
         self.assertIsInstance(obs, dict, msg=out)
@@ -943,6 +1444,16 @@ class HerdrLedgerSendSiteWiringTest(unittest.TestCase):
                 stack.enter_context(patch("subprocess.Popen", herdr.popen))
                 stack.enter_context(patch("mozyo_bridge.application.commands.time.sleep"))
                 stack.enter_context(patch.dict(os.environ, env, clear=True))
+                if mode == "queue-enter":
+                    stack.enter_context(
+                        patch(
+                            "mozyo_bridge.e_110_execution_platform."
+                            "f_130_handoff_routing.application."
+                            "handoff_tmux_transport_rail.LiveTmuxTransportRailOps."
+                            "observe_queue_enter_gateway_binding",
+                            return_value=_queue_binding(workspace_id),
+                        )
+                    )
                 out = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
                 err = stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
                 try:
@@ -994,19 +1505,21 @@ class HerdrLedgerSendSiteWiringTest(unittest.TestCase):
             (rec.turn_start_outcome or {}).get("outcome"), "delivered_not_started"
         )
 
-    def test_queue_enter_rail_appends_with_observation(self) -> None:
+    def test_queue_enter_unconfirmed_appends_non_success_with_observation(self) -> None:
         herdr = _FakeHerdr([], get_states=["working"])
         result, outcome, records, out = self._run_and_ledger(
             herdr=herdr, mode="queue-enter"
         )
-        self.assertEqual(result, 0, msg=out)
-        self.assertEqual(outcome.get("status"), "sent", msg=out)
+        self.assertNotEqual(result, 0, msg=out)
+        self.assertEqual(outcome.get("status"), "blocked", msg=out)
+        self.assertEqual(outcome.get("reason"), "turn_start_unconfirmed", msg=out)
         self.assertEqual(len(records), 1, msg=records)
         rec = records[0]
         self.assertEqual(rec.entry_kind, "delivery_outcome")
         self.assertEqual(rec.rail, "queue_enter_rail")
         self.assertEqual(rec.backend, "herdr")
-        self.assertEqual(rec.status, "sent")
+        self.assertEqual(rec.status, "blocked")
+        self.assertEqual(rec.reason, "turn_start_unconfirmed")
         # The queue-enter rail carries the additive post-choreography observation;
         # the event rail's `turn_start_outcome` stays absent.
         self.assertIsInstance(rec.queue_enter_observation, dict)
@@ -1283,7 +1796,10 @@ class StartupAdmissionZeroSendTest(unittest.TestCase):
         # screen. Before #13760 this returned `sent / queue_enter` after typing the body.
         herdr = _FakeHerdr([], get_states=["idle"], pane_content=TRUST_SCREEN)
         result, herdr, _ws, out, err = self._run(
-            agent_rows_fn=_same_lane_rows(), herdr=herdr, mode="queue-enter"
+            agent_rows_fn=_same_lane_rows(),
+            herdr=herdr,
+            mode="queue-enter",
+            queue_binding=_queue_binding,
         )
         self.assertNotEqual(result, 0, msg=f"out={out}\nerr={err}")
         outcome = _outcome_from(out)
@@ -1384,12 +1900,15 @@ class StartupAdmissionZeroSendTest(unittest.TestCase):
         # (j#77947 Q3 — the admitted queue-enter contract is byte-invariant).
         herdr = _FakeHerdr([], get_states=["idle"], wait_results=[(0, "")])
         result, herdr, _ws, out, err = self._run(
-            agent_rows_fn=_same_lane_rows(), herdr=herdr, mode="queue-enter"
+            agent_rows_fn=_same_lane_rows(),
+            herdr=herdr,
+            mode="queue-enter",
+            queue_binding=_queue_binding,
         )
         self.assertEqual(result, 0, msg=f"out={out}\nerr={err}")
         outcome = _outcome_from(out)
         self.assertEqual(outcome.get("status"), "sent", msg=out)
-        self.assertEqual(outcome.get("reason"), "queue_enter", msg=out)
+        self.assertEqual(outcome.get("reason"), "ok", msg=out)
         self.assertIsNone(outcome.get("startup_admission"), msg=out)
         send_texts = [op for op in herdr.sends if op[0] == "send_text"]
         self.assertEqual(len(send_texts), 1, msg=herdr.sends)
@@ -1425,7 +1944,10 @@ class StartupAdmissionZeroSendTest(unittest.TestCase):
 
         cleared = _FakeHerdr([], get_states=["idle"], wait_results=[(0, "")])
         result, cleared, _ws, out2, err2 = self._run(
-            agent_rows_fn=_same_lane_rows(), herdr=cleared, mode="queue-enter"
+            agent_rows_fn=_same_lane_rows(),
+            herdr=cleared,
+            mode="queue-enter",
+            queue_binding=_queue_binding,
         )
         self.assertEqual(result, 0, msg=f"out={out2}\nerr={err2}")
         retry_outcome = _outcome_from(out2)

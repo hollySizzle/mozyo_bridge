@@ -1394,6 +1394,9 @@ Table naming:
         再実行した run」が前の run の record を継承し、rollback が **自分が起動していない pane** を閉じうる。
       - **participants** = provider / assigned-name / launch locator / launch receipt。各 fresh launch の**直後**に記録する
         (最後にまとめて記録すると、2 つの start の間で死んだ run — まさに partial pair — の第 1 agent が誰の物か分からなくなる)。
+        現行のpane-bound receiptはsplit応答のterminal idを含む`pane_bound_v2`であり、`agent_started`のterminal idと
+        exact一致して初めてlaunch-generation finalizeへ進む。旧`pane_bound_v1`は解析互換のみで、terminal generation
+        authorityには昇格しない。正本は`vibes/docs/specs/herdr-native-identity.md`のHerdr 0.8 launch contractを参照。
       - **phases** = `planned` → `launching` → `health_check` → `rollback_owed` | `success_owed` → `completed_rolled_back` |
         `completed_success`。terminal は write-once で、replay は record から答える (再 close しない)。
       - **reserve は bootstrap 可 / rollback は不可** (意図的な非対称): reserve は *新しい* identity を作るので何も忘れない。

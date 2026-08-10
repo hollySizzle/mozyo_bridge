@@ -52,6 +52,21 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mozyo_bridge.core.state.herdr_identity_attestation import (
+    HerdrIdentityAttestationStore,
+    IdentityAttestationRecord,
+    VERDICT_PRESENT,
+)
+from mozyo_bridge.core.state.herdr_launch_generation import (
+    HerdrLaunchGenerationStore,
+)
+from mozyo_bridge.core.state.startup_transaction_fence import (
+    PHASE_COMPLETED_SUCCESS,
+    Participant,
+    StartupTransactionFence,
+    StartupUnit,
+)
+from mozyo_bridge.core.state.herdr_native_identity_binding import native_name_for
 from mozyo_bridge.core.state.workspace_registry import read_anchor, register_workspace
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_dispatch_herdr_ops import (  # noqa: E501
     HerdrWorkerDispatchOps,
@@ -63,8 +78,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     encode_assigned_name,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
+    pane_bound_receipt,
+)
 
-from tests.support.herdr_fake import FakeHerdr
+from tests.support.herdr_fake import FakeHerdr, STATUS_WORKING
 from tests.support.redmine_anchor_authority import matching_redmine_anchor_source_patch
 from tests.scenarios.test_herdr_lane_choreography import _ScenarioRunner
 
@@ -139,7 +157,69 @@ class _DivergentSenderWorld:
             workspace_id=ws,
             provider="codex",
         )
+        if self.worker_locator:
+            self._seed_worker_launch_authority()
         self.runner = _ScenarioRunner(self.fake, self.herdr_bin)
+
+    def _seed_worker_launch_authority(self) -> None:
+        """Represent the worker as one completed, attested managed generation."""
+        name = encode_assigned_name(self.workspace_id, "claude", LANE)
+        observed_at = "2026-08-10T00:00:00+00:00"
+        HerdrIdentityAttestationStore(home=self.home).upsert(
+            IdentityAttestationRecord(
+                assigned_name=name,
+                workspace_id=self.workspace_id,
+                role="claude",
+                lane_id=LANE,
+                locator=self.worker_locator,
+                verdict=VERDICT_PRESENT,
+                observed_at=observed_at,
+            )
+        )
+        fence = StartupTransactionFence(home=self.home)
+        action = fence.reserve(
+            StartupUnit(
+                workspace_id=self.workspace_id,
+                lane_id=LANE,
+                providers=("claude",),
+            ),
+            "scenario-managed-stable-worker-generation",
+        )
+        terminal_id = f"terminal-{self.worker_locator}"
+        target_workspace = self.worker_locator.split(":", 1)[0]
+        fence.record_participant(
+            action.action_id,
+            Participant(
+                role="claude",
+                assigned_name=name,
+                locator=self.worker_locator,
+                receipt=pane_bound_receipt(
+                    target_workspace=target_workspace,
+                    target_tab=f"{target_workspace}:t1",
+                    native_name=native_name_for(name),
+                    terminal_id=terminal_id,
+                ),
+            ),
+        )
+        fence.set_phase(action.action_id, PHASE_COMPLETED_SUCCESS)
+        generations = HerdrLaunchGenerationStore(home=self.home)
+        generations.reserve_pending(
+            assigned_name=name,
+            startup_action_id=action.action_id,
+            workspace_id=self.workspace_id,
+            role="claude",
+            lane_id=LANE,
+        )
+        generations.finalize(
+            assigned_name=name,
+            startup_action_id=action.action_id,
+            workspace_id=self.workspace_id,
+            role="claude",
+            lane_id=LANE,
+            locator=self.worker_locator,
+            verdict=VERDICT_PRESENT,
+            observed_at=observed_at,
+        )
 
     def sender_env(self) -> dict:
         """The attested cross-lane (coordinator) sender identity env.
@@ -213,6 +293,7 @@ class _DivergentSenderWorld:
             target_lane=LANE,
             allow_direct_worker=True,
         )
+        self.fake.arm_transition(self.worker_locator, STATUS_WORKING)
         with self._driving_context():
             out, err = io.StringIO(), io.StringIO()
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -235,6 +316,8 @@ class _DivergentSenderWorld:
             env=self.sender_env(),
             runner=self.runner.run,
         )
+        if self.worker_locator:
+            self.fake.arm_transition(self.worker_locator, STATUS_WORKING)
         with self._driving_context():
             out, err = io.StringIO(), io.StringIO()
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):

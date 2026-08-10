@@ -46,6 +46,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Mapping, NamedTuple, Optional
 from unittest import mock
 
@@ -1022,17 +1023,63 @@ class InstalledFaultHarness:
     def _seed_fresh_attestation(
         self, ctx: _RecoverStaleContext, locator: str, *, observed_at: str
     ) -> None:
-        """Seed the fresh receiver's startup identity attestation (the relaunch came online)."""
+        """Seed the fresh receiver's complete managed-launch authority."""
         from mozyo_bridge.core.state.herdr_identity_attestation import (
             HerdrIdentityAttestationStore, IdentityAttestationRecord, VERDICT_PRESENT,
         )
+        from mozyo_bridge.core.state.herdr_launch_generation import (
+            GENERATION_PENDING,
+            HerdrLaunchGenerationStore,
+        )
+        from mozyo_bridge.core.state.startup_execution_events import (
+            STAGE_ATTESTATION_WRITE_SUCCEEDED,
+            append_execution_event,
+        )
+        from mozyo_bridge.core.state.startup_transaction_fence import (
+            PHASE_COMPLETED_SUCCESS,
+            StartupTransactionFence,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_generation_binding import (  # noqa: E501
+            finalize_launch_generations,
+        )
 
-        HerdrIdentityAttestationStore(home=self.home).upsert(
+        attestations = HerdrIdentityAttestationStore(home=self.home)
+        attestations.upsert(
             IdentityAttestationRecord(
                 assigned_name=ctx.worker_name, workspace_id=ctx.workspace_id, role="claude",
                 lane_id=ctx.lane_id, locator=locator, verdict=VERDICT_PRESENT,
                 observed_at=observed_at, replacement_action_id=ctx.action_id,
             )
+        )
+        generations = HerdrLaunchGenerationStore(home=self.home)
+        generation = generations.read(ctx.worker_name)
+        if generation is None or generation.phase != GENERATION_PENDING:
+            return
+        fence = StartupTransactionFence(home=self.home)
+        action = fence.read(generation.startup_action_id)
+        if action is None:
+            return
+        append_execution_event(
+            fence,
+            generation.startup_action_id,
+            STAGE_ATTESTATION_WRITE_SUCCEEDED,
+            participant=ctx.worker_name,
+        )
+        if not action.terminal:
+            fence.set_phase(generation.startup_action_id, PHASE_COMPLETED_SUCCESS)
+        slot = SimpleNamespace(
+            assigned_name=ctx.worker_name,
+            provider="claude",
+            locator=locator,
+            launch_terminal_id=self.fake.terminal_id_of(locator),
+        )
+        finalize_launch_generations(
+            store_home=self.home,
+            startup_action_id=generation.startup_action_id,
+            slots=[slot],
+            workspace_id=ctx.workspace_id,
+            lane_id=ctx.lane_id,
+            attestation_read=attestations.read,
         )
 
     def _agent_identity_set(self) -> frozenset:

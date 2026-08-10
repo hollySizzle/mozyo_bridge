@@ -675,6 +675,7 @@ def probe_session_health(
             blocker_id=settled.blocker_id,
             compensation=settled.compensation,
             health_detail=settled.detail,
+            launch_terminal_id=slot.launch_terminal_id,
         )
     return probed
 

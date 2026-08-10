@@ -53,6 +53,7 @@ class PreparedPane:
     locator: str
     workspace_id: str
     tab_id: str
+    terminal_id: str
 
 
 @dataclass(frozen=True)
@@ -192,6 +193,7 @@ def prepared_pane_recorder(
                 target_workspace=prepared["target_workspace"],
                 target_tab=prepared["target_tab"],
                 native_name=prepared["native_name"],
+                terminal_id=prepared["terminal_id"],
             ),
         )
 
@@ -218,6 +220,7 @@ def _parse_pane(stdout: object) -> PreparedPane | None:
     locator = _norm(pane.get("pane_id"))
     workspace_id = _norm(pane.get("workspace_id"))
     tab_id = _norm(pane.get("tab_id"))
+    terminal_id = pane.get("terminal_id")
     if (
         not valid_target(locator)
         or not valid_target(workspace_id)
@@ -225,9 +228,12 @@ def _parse_pane(stdout: object) -> PreparedPane | None:
         or _workspace_prefix(locator) != workspace_id
         or not tab_id.startswith(f"{workspace_id}:t")
         or tab_id == f"{workspace_id}:t"
+        or type(terminal_id) is not str
+        or not terminal_id
+        or terminal_id.strip() != terminal_id
     ):
         return None
-    return PreparedPane(locator, workspace_id, tab_id)
+    return PreparedPane(locator, workspace_id, tab_id, terminal_id)
 
 
 def build_pane_split_argv(

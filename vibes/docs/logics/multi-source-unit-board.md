@@ -250,21 +250,26 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   （gateway version 間で選択を決定的にするため。値の出所は共有既定であり、既定の第二の見解を作らない）。
 - **queue-enter の本文は 1 回だけ渡す。** client は結果に関わらず gateway command を **ちょうど 1 回**
   実行し、再実行しない（再実行は Enter の再送ではなく本文の再入力になる）。対象 host が Herdr の場合、
-  host 側 rail は body exactly once / first Enter exactly once を維持し、causal turn start 未確認時だけ、同一
+  host 側 rail は body exactly once / first Enter zero-or-one を維持する。post-body generation 再確認、first
+  wait arm、deadline check が成功した場合だけ first Enter を発行し、失敗時は `enter_attempts=0` の
+  `blocked` / `turn_start_unconfirmed` に閉じる。causal turn start 未確認時だけ、同一
   target identity、collision-free launch generation、現在の composer tail にある full marker+body
   （hard-wrap whitespace のみ正規化）、startup / modal / trust / login / selection screen の非該当、runtime
-  read 成功を再確認した後に追加 Enter を
-  **高々1回**発行できる。`busy` は queue semantics 上この厳格 gate の候補になれるが、busy baseline / snapshot /
-  event だけでは delivery confirmation にならない。tmux host の既存 marker-based queue retry は変更しない。
+  read 成功を **各回 fresh に**再確認し、各 Enter より先に working-transition wait を arm する。timeout-only
+  系列は policy の回数上限と absolute deadline まで Enter-only retry を反復できる。wait error は次の Enter を
+  許可せず即時停止し、それ以前の timeout-authorised retries は telemetry に残す。`busy` は queue semantics 上この厳格 gate の候補になれるが、
+  busy baseline / snapshot / event だけでは delivery confirmation にならない。tmux host の既存 marker-based
+  queue retry は変更しない。
   client 側 retry、無制限 Enter retry、raw pane input、direct remote Claude 送信は追加しない。
 - **remote command の deadline は観測と queue-enter 配送で分ける。** board / workspace の read-only
   観測は従来どおり `connect_timeout + COMMAND_GRACE_SECONDS` で速やかに degrade する。queue-enter の
   gateway command に限り、その基礎 deadline へ共有 policy の
-  `QUEUE_ENTER_RETRY_WINDOW_SECONDS` を **一度だけ**加える。host 側ではこの window が初回 event wait、
-  first/extra Enter 間の最小 interval、追加 Enter 後の再 wait を含む単一 absolute budget であり、再 arm で
-  延長しない。`QUEUE_ENTER_RETRY_INTERVAL_SECONDS` は first Enter から extra Enter までの最小間隔で、初回
-  wait が既に interval を消費した場合は追加 sleep しない。window / interval のどちらか `0`、または正値でも
-  `0.001` 秒未満なら host 側の extra Enter は無効である（first Enter と初回 observation は維持する）。
+  `QUEUE_ENTER_RETRY_WINDOW_SECONDS` を **一度だけ**加える。host 側では既定30秒の window が初回 event wait、
+  全 Enter 間の minimum interval、全追加 Enter 後の再 wait を含む単一 absolute budget であり、再 arm で
+  延長しない。`QUEUE_ENTER_RETRY_INTERVAL_SECONDS`（既定2秒）は隣接 Enter 間の最小間隔で、直前の wait が
+  既に interval を消費した場合は追加 sleep しない。window / interval のどちらか `0`、または正値でも
+  `0.001` 秒未満なら host 側の extra Enter は無効である。initial admission は試みるが、first Enter と
+  observation は generation 再確認・wait arm・deadline check が成功した場合に限る。
   これは client 側で retry を増やす処理ではなく、対象 host の bounded rail が完了する前に client が command
   を timeout にしないための待機 budget である。`standard` / `pending` を
   明示した action は基礎 deadline のままとする。
@@ -279,11 +284,14 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   候補は **末尾の非空行ちょうど 1 件**であり、それが parse 不能 / 非 object / required field 欠落なら
   即座に未確認とする。**parse できる行を求めて遡らない** — 遡ると outcome の後に続いた出力が無視され、
   古い成功が生き残る（fail-closed 契約の fail-open な読み方になる）。
-  exit 0 でも composer に置いただけの `pending_input` や causal turn start が未確認の `queue_enter` は
-  **confirmed ではない**が **zero-send でもない**。landing marker 観測や post-hoc `busy` snapshot だけでも
-  confirmed にしない。Herdr queue-enter で confirmation に使えるのは、`awaiting_input` / `turn_ended` の
-  readable baseline より先に arm した working-transition event と coherent な target / collision-free launch
-  generation が揃う場合だけである。正本は `delivery_outcome_gate` / `injection_stage`
+  composer に置いただけの `pending_input` や Herdr causal turn start 未確認の delivery は **confirmed ではない**が
+  **zero-send でもない**。Herdr gateway は未確認を legacy `sent` / exit 0 に倒さず、precise `blocked` reason /
+  non-zero で返す。landing marker 観測や post-hoc `busy` snapshot だけでも confirmed にしない。Herdr
+  queue-enter で confirmation に使えるのは、`awaiting_input` / `turn_ended` の readable baseline より先に arm
+  した working-transition event と coherent な target / collision-free launch generation が揃う場合だけである。
+  wait absent は `turn_start_absent`、fresh gate の runtime blocked は `receiver_blocked`、timeout/error/unarmed/
+  drift/body-screen-state proof failure は `turn_start_unconfirmed`、raised transport failure は `transport_error`。
+  正本は `delivery_outcome_gate` / `injection_stage`
   （同一の問いに複数箇所が別答を出した #14232 の経緯を持つ）。status / reason token を局所で
   再検査せず、**共有 authority を評価する**。
   欠落・非 JSON・非 object・authority が位置づけられない outcome、および command を完了実行
@@ -296,7 +304,7 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
 - **gateway record は producer が導出した `injection_stage` を運ぶ。** 単一行 JSON は
   `asdict(DeliveryOutcome)` であり、`mode` と producer が **full context** で導出した
   `injection_stage` を含む。共有 authority はこの carried 値を優先するため、queue-enter carve-out
-  （turn-start 未観測の `sent` + `ok`、または busy-only evidence は confirmed ではない）が host 境界を
+  （turn-start 未確認の `blocked` outcome、または busy-only evidence は confirmed ではない）が host 境界を
   越えても正しく解決する。host は queue 専用 `queue_enter_turn_start_observation` / delivery-ledger rail を
   保ち、standard `turn_start_outcome` へ射影しない。
   test fixture もこの形状を **実 producer** から生成し、wire と食い違わせない。
@@ -353,13 +361,15 @@ read-only observation + 1 本の routed な preview-first action に限る。
   exit code 0 / 1 / 3 の区別と `blind_retry_prohibited` の公開を CLI level で固定する
 - gateway command が結果に関わらず **ちょうど 1 回**しか実行されないことの unit test（本文の
   重複送信を client 側から起こさない）
-- Herdr queue-enter が body / gateway command を再入力せず、first Enter 1回 + strict recheck 後の extra Enter
-  高々1回であること。identity / collision-free launch generation drift、historical transcript だけの body、
-  startup/modal、blocked / unknown / state read failure、wait unarmed が extra Enter を zero-actuation にすること
+- Herdr queue-enter が body / gateway command を再入力せず、first Enter zero-or-one、各実発行 Enter 前の arm、
+  各 extra Enter 前の fresh strict recheck を行うこと。timeout-only 系列は policy/deadline まで反復でき、
+  wait error は次の Enter を許可せず即時停止すること。identity / collision-free launch generation drift、historical transcript
+  だけの body、startup/modal、blocked / unknown / state read failure、wait unarmed がその回の extra Enter を
+  zero-actuation にすること
 - busy receiver は queue 配送候補として維持されるが busy-only evidence で `submitted_confirmed` にならず、
   `awaiting_input` / `turn_ended` の armed event + coherent generation だけが confirmation になること
-- public retry window が initial wait + interval + re-wait の absolute budget で、再 arm しても延長されないこと。
-  interval は first/extra Enter の最小間隔で、window / interval `0` または正の sub-millisecond 値が extra
+- public retry window が initial wait + 全 interval + 全 re-wait の absolute budget で、再 arm しても延長されないこと。
+  interval は隣接 Enter の最小間隔で、window / interval `0` または正の sub-millisecond 値が extra
   Enter を無効にすること
 - uncertain result が `blind_retry_prohibited` のまま client retry を起こさず、queue-specific telemetry /
   delivery-ledger rail を維持すること。tmux queue-enter、Herdr standard、pending の回帰がないこと

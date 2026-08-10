@@ -143,13 +143,19 @@ class FakeArmedWait:
         self._result = result
         self._events = events
         self._index = index
+        self._resolved = False
 
     def collect(self) -> WaitResult:
+        self._resolved = True
         self._events.append(("collect", self._index))
         return self._result
 
     def cancel(self) -> None:
+        self._resolved = True
         self._events.append(("cancel", self._index))
+
+    def pending(self) -> bool:
+        return not self._resolved
 
 
 class FakeWait:

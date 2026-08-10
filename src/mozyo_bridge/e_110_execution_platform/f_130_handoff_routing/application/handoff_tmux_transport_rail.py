@@ -14,9 +14,9 @@ remaining tmux choreography injects the body once and drives it to a terminal di
   recovery guidance, and ``die``\\ s WITHOUT pressing Enter — the one place a C-u rollback is
   allowed;
 - press Enter once. tmux ``--mode queue-enter`` retains its marker-miss retry; Herdr instead
-  arms a working-transition wait and may issue **at most one** additional Enter after re-proving
-  launch generation, current composer, clear screen, readable state, and a re-armed wait.
-  Neither path re-types marker+body;
+  arms a working-transition wait and may issue deadline-bounded additional Enters after freshly
+  re-proving launch generation, current composer, clear screen, readable state, and a re-armed
+  wait before each one. Neither path re-types marker+body;
 - under ``--mode standard`` observe the receiver pane for post-Enter turn-start activity; an
   unconfirmed turn start emits a ``blocked`` / ``turn_start_unconfirmed`` outcome and ``die``\\ s
   with **no C-u rollback and no re-send** (the uncertain-delivery no-blind-retry boundary);
@@ -45,8 +45,8 @@ record / ledger / persistence seams, or the retry-policy config boundary:
   tmux / herdr / Redmine.
 - :class:`TmuxTransportRailUseCase` holds the slice body: the three retry / rollback policy
   conditions (uncertain-delivery no-blind-retry, C-u rollback allowed only on a strict marker
-  miss, the unchanged tmux marker retry, and the Herdr causal at-most-once Enter fallback) live
-  here as typed control flow over the injected effects.
+  miss, the unchanged tmux marker retry, and the Herdr causal deadline-bounded Enter-only
+  fallback) live here as typed control flow over the injected effects.
 - :class:`LiveTmuxTransportRailOps` routes every effect through the :mod:`commands` module *at
   call time* (``run_tmux`` / ``capture_pane`` / ``wait_for_text`` — which ``bind_runtime_transport``
   swaps for herdr shims and the tests monkeypatch — plus ``_observe_standard_turn_start`` /
@@ -76,7 +76,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Protocol
+from typing import Any, Callable, List, Optional, Protocol
 
 from mozyo_bridge.application.handoff_delivery_command import submit_lines_for
 from mozyo_bridge.application.session_bootstrap_command import marker_visible_in
@@ -114,8 +114,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.han
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_herdr_queue_enter_rail import (
     HerdrQueueEnterSession,
     LiveHerdrQueueEnterOpsMixin,
+    QueueEnterEffectFenceRefused,
     QueueEnterResendGate,
-    retry_values_are_finite,
+    retry_values_are_supported,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (
     REASON_TRANSPORT_ERROR,
@@ -188,6 +189,8 @@ class TmuxTransportRailRequest:
     submit_delivery_id: Optional[str]
     persist_delivery: bool
     herdr_send: bool
+    herdr_assigned_name: Optional[str]
+    herdr_process_generation: Optional[str]
     read_lines: int
     landing_timeout: Optional[float]
     submit_delay: Optional[float]
@@ -250,16 +253,28 @@ class TmuxTransportRailOps(Protocol):
         """A mechanically-successful pre-Enter Herdr state, otherwise ``None``."""
         ...
 
-    def observe_queue_enter_gateway_binding(self, target: str) -> Optional[dict]:
+    def observe_queue_enter_gateway_binding(
+        self, target: str
+    ) -> Optional[dict[str, str]]:
         """The collision-free launch-generation binding for the current target."""
         ...
 
-    def arm_queue_enter_turn_wait(self, target: str, *, timeout_ms: int):
+    def arm_queue_enter_turn_wait(
+        self, target: str, *, timeout_ms: int
+    ) -> Optional[object]:
         """Arm the bound Herdr working-transition wait before an Enter."""
         ...
 
-    def collect_queue_enter_turn_wait(self, armed) -> Optional[str]:
+    def collect_queue_enter_turn_wait(self, armed: object) -> Optional[str]:
         """Collect a queue-enter wait and return its closed kind, or ``None``."""
+        ...
+
+    def cancel_queue_enter_turn_wait(self, armed: object) -> None:
+        """Cancel a queue-enter wait when no following Enter is authorised."""
+        ...
+
+    def queue_enter_turn_wait_pending(self, armed: object) -> bool:
+        """Whether the wait is still live immediately before Enter."""
         ...
 
     def evaluate_queue_enter_resend(
@@ -267,7 +282,7 @@ class TmuxTransportRailOps(Protocol):
         target: str,
         text: str,
         receiver: str,
-        baseline_binding: Optional[dict],
+        baseline_binding: Optional[dict[str, str]],
     ) -> QueueEnterResendGate:
         """Re-prove identity, generation, composer, screen, and state before retry."""
         ...
@@ -356,7 +371,7 @@ class TmuxTransportRailUseCase:
         *,
         status: str,
         reason: str,
-        queue_enter_turn_start_observation: Optional[dict] = None,
+        queue_enter_turn_start_observation: Optional[dict[str, Any]] = None,
     ) -> DeliveryOutcome:
         """Assemble a terminal :class:`DeliveryOutcome` from the request context.
 
@@ -431,7 +446,7 @@ class TmuxTransportRailUseCase:
             request.queue_enter_retry_window,
             request.queue_enter_retry_interval,
         )
-        retry_values_finite = retry_values_are_finite(*raw_retry_values)
+        retry_values_valid = retry_values_are_supported(*raw_retry_values)
         retry_policy = resolve_queue_enter_retry_policy(
             request.queue_enter_retry_window,
             request.queue_enter_retry_interval,
@@ -439,7 +454,7 @@ class TmuxTransportRailUseCase:
         if (
             request.herdr_send
             and request.mode == MODE_QUEUE_ENTER
-            and not retry_values_finite
+            and not retry_values_valid
         ):
             # argparse accepts ``nan`` / ``inf`` as floats.  Neither can define a
             # finite send deadline, so reject before the one body injection.
@@ -453,14 +468,57 @@ class TmuxTransportRailUseCase:
                 submit_lines=self._submit_lines(request, outcome),
             )
             ops.die(
-                "queue-enter retry window and interval must be finite numbers; "
+                "queue-enter retry window and interval must be finite numbers no "
+                "greater than 3600 seconds; "
                 "nothing was typed and Enter was not pressed"
             )
             raise AssertionError("unreachable")
+        herdr_queue_enter = request.herdr_send and request.mode == MODE_QUEUE_ENTER
+        injected_text = f"{request.marker} {request.body}"
+        queue_session: Optional[HerdrQueueEnterSession] = None
+        if herdr_queue_enter:
+            queue_session = HerdrQueueEnterSession(
+                ops=ops,
+                target=request.target,
+                text=injected_text,
+                receiver=request.receiver,
+                expected_assigned_name=request.herdr_assigned_name,
+                expected_process_generation=request.herdr_process_generation,
+                retry_policy=retry_policy,
+                monotonic=self._monotonic,
+            )
+            # Pin the collision-free process generation BEFORE the body reaches
+            # the composer. A locator recycled between body injection and Enter
+            # is then detected and never receives the Enter.
+            if not queue_session.capture_before_body():
+                outcome = self._outcome(
+                    request, status="blocked", reason="target_unavailable"
+                )
+                ops.emit(
+                    outcome,
+                    record_format=request.record_format,
+                    command=request.record_command,
+                    duplicate_lane_panes=request.duplicate_lane_panes or None,
+                    role_profile_contract=request.role_profile_contract,
+                    submit_lines=self._submit_lines(request, outcome),
+                )
+                ops.die(
+                    "Herdr queue-enter could not prove that the current target is "
+                    "the exact authorised receiver terminal generation; nothing was "
+                    "typed and Enter was not pressed. Resolve the target again before "
+                    "retrying. Re-running session-start only adopts a live legacy pair "
+                    "and cannot create missing launch proof. A record-less non-default "
+                    "scratch pair can use session-retire preflight/execute followed by a "
+                    "fresh session-start. Lifecycle-managed and default pairs have no "
+                    "general receipt-refresh rail in this build; keep them fail-closed "
+                    "and follow the terminal-bound receipt upgrade runbook. A database "
+                    f"retry or migration cannot repair this. target={request.target}"
+                )
+                raise AssertionError("unreachable")
+
         # The common body injection: the marker+body is typed ONCE here. No later path re-types
         # it — the whole no-blind-retry / rollback contract rests on this single injection.
         self._current_step = STEP_SEND_TEXT_BODY
-        injected_text = f"{request.marker} {request.body}"
         ops.inject_body(request.target, injected_text)
 
         if request.mode == MODE_PENDING:
@@ -536,23 +594,31 @@ class TmuxTransportRailUseCase:
         # only when the state was idle/turn-ended and the generation remains coherent; a busy
         # baseline may still accept an Enter but can never turn an unrelated working transition
         # into a confirmed submission.
-        herdr_queue_enter = request.herdr_send and request.mode == MODE_QUEUE_ENTER
-        queue_session: Optional[HerdrQueueEnterSession] = None
-        if herdr_queue_enter:
-            queue_session = HerdrQueueEnterSession(
-                ops=ops,
-                target=request.target,
-                text=injected_text,
-                receiver=request.receiver,
-                retry_policy=retry_policy,
-                monotonic=self._monotonic,
-            )
+        first_enter_armed = (
             queue_session.arm_before_first_enter()
-
-        self._current_step = STEP_SEND_KEYS_ENTER
-        ops.press_enter(request.target)
-        enter_attempts = 1
-        if queue_session is not None:
+            if queue_session is not None
+            else True
+        )
+        enter_attempts = 0
+        if first_enter_armed:
+            self._current_step = STEP_SEND_KEYS_ENTER
+            try:
+                if queue_session is None:
+                    ops.press_enter(request.target)
+                else:
+                    with queue_session.enter_effect_boundary(queue_session.armed_wait):
+                        ops.press_enter(request.target)
+            except QueueEnterEffectFenceRefused:
+                if queue_session is not None:
+                    queue_session.cancel_before_failed_enter()
+                first_enter_armed = False
+            except TerminalTransportError:
+                if queue_session is not None:
+                    queue_session.cancel_before_failed_enter()
+                raise
+            if first_enter_armed:
+                enter_attempts = 1
+        if queue_session is not None and first_enter_armed:
             queue_session.note_first_enter_sent()
 
         # Enter-only retry (Redmine #12580 / #12581). Only the `queue-enter` rail, and only when
@@ -583,9 +649,9 @@ class TmuxTransportRailUseCase:
                 enter_attempts += 1
 
         # Herdr queue-enter never runs the tmux marker loop. The extracted session
-        # owns its causal wait, strict live rechecks, absolute deadline, and one
-        # possible Enter; it has no body-injection primitive in reach.
-        if queue_session is not None:
+        # owns its causal waits, strict live rechecks, and one absolute deadline;
+        # it has no body-injection primitive in reach.
+        if queue_session is not None and first_enter_armed:
             def _press_extra_enter() -> None:
                 self._current_step = STEP_SEND_KEYS_ENTER_RETRY
                 ops.press_enter(request.target)
@@ -643,9 +709,9 @@ class TmuxTransportRailUseCase:
         # Queue-enter keeps its own telemetry/ledger rail.  The authoritative
         # ``event_wait_kind=changed`` field is now published only for an idle/turn-ended
         # arm whose collision-free launch generation remained coherent. Raw first/final
-        # wait kinds and the one-Enter fallback decision remain additive diagnostics;
+        # wait kinds and the bounded fallback decisions remain additive diagnostics;
         # a busy baseline can therefore be nudged without being over-claimed as confirmed.
-        queue_enter_observation: Optional[dict] = None
+        queue_enter_observation: Optional[dict[str, Any]] = None
         if queue_session is not None:
             snapshot = ops.observe_queue_enter_turn_start(request.target)
             queue_enter_observation = queue_session.observation(snapshot)
@@ -667,7 +733,7 @@ class TmuxTransportRailUseCase:
             request,
             status="blocked" if herdr_queue_unconfirmed else "sent",
             reason=(
-                "turn_start_unconfirmed"
+                queue_session.failure_reason
                 if herdr_queue_unconfirmed
                 else "ok"
                 if queue_session is not None
@@ -727,7 +793,7 @@ class TmuxTransportRailUseCase:
                 "Herdr queue-enter typed the marker+body once and pressed Enter "
                 f"{enter_attempts} time(s), but no causally attributable turn start "
                 "was confirmed on the same launch generation. The uncertain partial "
-                "delivery was recorded as blocked / turn_start_unconfirmed; no body "
+                f"delivery was recorded as blocked / {outcome.reason}; no body "
                 "resend or rollback was issued, and blind retry is prohibited. Read "
                 "the receiver and durable anchor before any explicit recovery. "
                 f"target={request.target} marker={request.marker}"

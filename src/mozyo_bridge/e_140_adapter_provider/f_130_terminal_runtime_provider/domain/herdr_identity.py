@@ -833,12 +833,13 @@ def process_generation_of_locator(
     as a conservative mutation fence, not as identity proof.
 
     A successful token is an injective length-prefixed encoding of
-    ``(assigned_name, terminal_id, locator, row_revision)``. It is opaque and local to
-    equality comparison; it is never persisted or rendered. Missing or malformed
-    terminal-id or revision evidence fails closed. A terminal id must be an exact,
-    non-blank JSON string with no surrounding whitespace. Herdr exposes revision as a
-    non-negative JSON integer, so strings, booleans, floats, and negative integers are
-    rejected rather than normalised into fabricated evidence.
+    ``(assigned_name, terminal_id, locator, row_revision)``. It is opaque: telemetry
+    may persist or render the complete token for exact comparison, but consumers must
+    not parse it or treat it as durable process identity. Missing or malformed terminal-
+    id or revision evidence fails closed. A terminal id must be an exact, non-blank JSON
+    string with no surrounding whitespace. Herdr exposes revision as a non-negative
+    JSON integer, so strings, booleans, floats, and negative integers are rejected
+    rather than normalised into fabricated evidence.
 
     Exactly one row must claim the locator and it must carry a non-blank name, matching
     :func:`occupant_of_locator`'s ambiguity rules. Consequently, stable name + terminal

@@ -33,6 +33,19 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     PREPARED_PANE_PRESENT,
     PREPARED_PANE_UNREADABLE,
     PreparedPaneObservation,
+    StartupRollbackAgentTarget,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+    AGENT_KEY_NAME,
+    AGENT_KEY_TERMINAL_ID,
+    _agent_locator,
+    _norm,
+    _norm_lane,
+    decode_assigned_name,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E501
+    SLOT_LIVE,
+    classify_named_slot,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (  # noqa: E501
     valid_target,
@@ -64,6 +77,65 @@ class LiveStartupRollbackOps:
 
     def close(self, workspace_id: str, lane_id: str, targets):
         return self._retire_ops.close(workspace_id, lane_id, targets)
+
+    def close_agent_participant(
+        self,
+        *,
+        workspace_id: str,
+        lane_id: str,
+        target: StartupRollbackAgentTarget,
+    ) -> tuple[bool, str]:
+        """Re-read the exact v2 generation immediately before a single close.
+
+        Herdr 0.8 has no compare-and-close primitive, so a process can theoretically
+        change after this final inventory read.  Keeping the read inside the actuation
+        port removes the much wider preflight-to-close window and refuses every observed
+        replacement; the remaining read-to-close interval cannot be eliminated client-side.
+        """
+        if not target.terminal_id or not target.native_name:
+            return False, "startup close authority has no terminal-bound v2 generation"
+        try:
+            rows = list(self.agent_rows())
+        except Exception:  # noqa: BLE001 - unreadable inventory is never close authority
+            return False, "the Herdr agent inventory could not be re-read before close"
+        matches = [
+            row
+            for row in rows
+            if isinstance(row, Mapping)
+            and _norm(row.get(AGENT_KEY_NAME)) == _norm(target.assigned_name)
+        ]
+        if len(matches) != 1:
+            return False, "the assigned name is absent or ambiguous at close time"
+        row = matches[0]
+        decoded = decode_assigned_name(target.assigned_name)
+        identity = decoded.identity if decoded.ok else None
+        if (
+            identity is None
+            or identity.workspace_id != _norm(workspace_id)
+            or identity.lane_id != _norm_lane(lane_id)
+            or identity.role != _norm(target.role)
+        ):
+            return False, "the recorded assigned name does not match the startup unit"
+        if classify_named_slot(row) != SLOT_LIVE or _norm(row.get("agent")) != identity.role:
+            return False, "the assigned slot is not backed by the expected live provider"
+        if _norm(_agent_locator(row)) != _norm(target.locator):
+            return False, "the live pane locator changed before close"
+        if _norm(row.get("native_name")) != _norm(target.native_name):
+            return False, "the live native identity changed before close"
+        if (
+            type(row.get(AGENT_KEY_TERMINAL_ID)) is not str
+            or row.get(AGENT_KEY_TERMINAL_ID) != target.terminal_id
+        ):
+            return False, "the live terminal identity changed before close"
+        result = self._retire_ops.close(
+            workspace_id, lane_id, ((target.role, target.locator),)
+        )
+        for role, locator, detail in getattr(result, "failed", ()):
+            if role == target.role and locator == target.locator:
+                return False, detail or "pane close failed"
+        if (target.role, target.locator) not in getattr(result, "closed", ()):
+            return False, "pane close did not confirm the exact target"
+        return True, ""
 
     def _environ(self) -> Mapping[str, str]:
         return self._env if self._env is not None else os.environ
@@ -115,12 +187,18 @@ class LiveStartupRollbackOps:
         row = matches[0]
         row_workspace = row["workspace_id"]
         row_tab = row["tab_id"]
+        terminal_id = (
+            row.get("terminal_id")
+            if type(row.get("terminal_id")) is str
+            else ""
+        )
         if row_workspace != workspace_id or row_tab != tab_id:
             return PreparedPaneObservation(
                 state=PREPARED_PANE_PRESENT,
                 locator=locator,
                 workspace_id=row_workspace,
                 tab_id=row_tab,
+                terminal_id=terminal_id,
                 detail="the recorded container does not match the live pane inventory",
             )
         agent_absent = "agent" not in row
@@ -130,6 +208,7 @@ class LiveStartupRollbackOps:
                 locator=locator,
                 workspace_id=row_workspace,
                 tab_id=row_tab,
+                terminal_id=terminal_id,
                 detail="the prepared pane now contains an agent",
             )
         shell_only = _read_shell_only(
@@ -143,6 +222,7 @@ class LiveStartupRollbackOps:
                 locator=locator,
                 workspace_id=row_workspace,
                 tab_id=row_tab,
+                terminal_id=terminal_id,
                 agent_absent=True,
                 shell_only=False,
                 detail="the prepared pane could not be proven to contain only its shell",
@@ -155,6 +235,7 @@ class LiveStartupRollbackOps:
             locator=locator,
             workspace_id=row_workspace,
             tab_id=row_tab,
+            terminal_id=terminal_id,
             agent_absent=True,
             shell_only=True,
             input_empty=None,
@@ -165,7 +246,12 @@ class LiveStartupRollbackOps:
         )
 
     def close_prepared_pane(
-        self, *, locator: str, workspace_id: str, tab_id: str
+        self,
+        *,
+        locator: str,
+        workspace_id: str,
+        tab_id: str,
+        expected_terminal_id: str = "",
     ) -> tuple[bool, str]:
         """Recheck every positive fact immediately before an exact pane close."""
         observation = self.prepared_pane(
@@ -176,6 +262,8 @@ class LiveStartupRollbackOps:
             and observation.locator == locator
             and observation.workspace_id == workspace_id
             and observation.tab_id == tab_id
+            and bool(expected_terminal_id)
+            and observation.terminal_id == expected_terminal_id
             and observation.agent_absent is True
             and observation.shell_only is True
             and observation.input_empty is True

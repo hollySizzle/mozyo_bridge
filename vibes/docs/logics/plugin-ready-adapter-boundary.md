@@ -1540,31 +1540,47 @@ second binary, server, or environment whose events could belong to another runti
 
 The queue seam owns this sequence:
 
-1. Capture a conservative target identity, the action-time gateway binding carrying
-   the collision-free launch-generation token, and the readable runtime baseline;
-   arm a `working`-transition wait before the first Enter.
-2. Keep the common transport choreography: body exactly once, first Enter exactly
-   once. Never move body injection into the retry helper.
+1. Before body injection, require the exact conservative `process_generation`
+   snapshot resolved for the target. It includes mutable `terminal.revision` and is
+   intentionally strict at this pre-body boundary. The binding also carries stable
+   provider / assigned-name / locator / terminal-id fields and a verified
+   `pane_bound_v2` launch token. Arm a `working`-transition wait before the first
+   Enter and then read the runtime baseline.
+2. Keep the common transport choreography: body exactly once, first Enter zero-or-one.
+   The first Enter requires the post-body **stable terminal/v2 launch-token** recheck,
+   armed wait, and an unexpired absolute deadline; revision-only drift on that same
+   verified terminal is allowed because body rendering may advance the revision.
+   The pending wait and absolute deadline are checked again at the final transport
+   effect boundary, after project-gateway capability verification and immediately
+   before the delegate send. Otherwise `enter_attempts` remains unchanged and the
+   send fails closed. Never move body injection into the retry helper. Every Enter
+   actually pressed has a successfully armed wait.
 3. Treat an armed `changed` event as submission evidence only when the baseline was
-   `awaiting_input` / `turn_ended` and the target + launch generation stay coherent.
+   `awaiting_input` / `turn_ended` and the stable terminal/v2 launch generation stay
+   coherent.
    A `busy` baseline, post-hoc `busy` snapshot, or event that cannot be separated from
    the already-running turn is not confirmation.
-4. If causal start is not confirmed, allow at most one extra Enter only after a fresh,
-   fail-closed recheck: exact target identity and collision-free launch generation;
-   readable, non-blank pane whose **last composer prompt and wrapped tail** contain the
-   complete injected marker+body (whitespace is ignored only to survive terminal hard
-   wraps); no declared startup / modal / trust / login / selection screen;
-   successful runtime read in `busy` / `awaiting_input` / `turn_ended`; and a new wait
-   armed before the extra Enter. `blocked`, `unknown`, read failure, generation drift,
-   historical-transcript-only body matches, and unarmed wait all stop the Enter.
-5. Collect inside the one public queue-enter absolute window. The initial wait,
-   minimum interval between first and extra Enter, and post-resend wait share that
-   budget; every wait timeout is capped by the remaining time and re-arming never
-   resets it. If the first wait already consumed the interval, no extra sleep occurs.
-   A zero or positive sub-millisecond window/interval disables the extra Enter while
-   preserving the first Enter and initial observation; invalid non-finite input is
-   rejected before injection. A sub-millisecond value is never rounded upward into a
-   wider actuation budget.
+4. If causal start is not confirmed, an extra Enter requires a fresh, fail-closed
+   recheck **on every iteration**: exact target identity and stable terminal/v2
+   launch generation; readable, non-blank pane whose **last composer prompt and wrapped
+   tail** contain the complete injected marker+body (whitespace is ignored only to
+   survive terminal hard wraps); no declared startup / modal / trust / login /
+   selection screen; successful runtime read in `busy` / `awaiting_input` /
+   `turn_ended`; and a new wait armed before that Enter. `blocked`, `unknown`, read
+   failure, generation drift, historical-transcript-only body matches, and unarmed
+   wait all stop actuation. A timeout-only sequence may repeat this strict iteration
+   within the public policy/deadline. A wait `error` authorises no next Enter and stops
+   immediately; timeout-authorised retries already issued before a late error cannot be
+   undone and remain explicit in telemetry.
+5. The public default is a 30-second window and a 2-second minimum interval. The
+   initial wait, every interval delay, and every post-Enter wait share that one
+   absolute budget; every wait timeout is capped by the remaining time and re-arming
+   never resets it. If the preceding wait already consumed the interval, no extra
+   sleep occurs. A zero or positive sub-millisecond window/interval disables extra
+   Enter but does not itself suppress initial admission. First Enter and observation
+   still require the generation recheck, armed wait, and deadline check; invalid non-finite
+   input is rejected before injection. A sub-millisecond value is never rounded
+   upward into a wider actuation budget.
 
 The busy rule is deliberately asymmetric. `busy` may pass the **resend admission**
 only when the exact current composer still holds this request and every identity /
@@ -1572,10 +1588,16 @@ screen gate passes; `busy` alone can never pass the **delivery confirmation** ga
 
 Telemetry remains in the queue-specific `queue_enter_turn_start_observation`; the
 seam does not emit standard `turn_start_outcome`. This preserves the queue delivery-
-ledger classification and its generation fence. Missing causal evidence remains an
-`uncertain` injection stage with `blind_retry_prohibited`, even if the legacy wording
-surface says `sent`. tmux queue-enter, Herdr standard, and pending rails do not enter
-this seam.
+ledger classification and its generation fence. A same-generation causal start maps
+to `sent` / `ok` / exit 0. Otherwise the command fails closed and exits non-zero:
+wait `absent` maps to `blocked` / `turn_start_absent`; a fresh gate that observes
+runtime `blocked` maps to `blocked` / `receiver_blocked`; timeout, error, unarmed wait,
+identity/generation drift, or body/screen/state proof failure maps to `blocked` /
+`turn_start_unconfirmed`; a raised `TerminalTransportError` maps to `blocked` /
+`transport_error`. These post-injection failures retain an `uncertain` injection
+stage with `blind_retry_prohibited`; the former legacy telemetry-only `sent` fallback
+is not a success path. tmux queue-enter, Herdr standard, and pending rails do not
+enter this seam.
 
 ### Equivalence to the #13166 codex-standard turn-start guard (documented proof)
 

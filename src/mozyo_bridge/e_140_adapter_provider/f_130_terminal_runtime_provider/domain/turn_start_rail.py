@@ -262,8 +262,7 @@ class ArmedWait(Protocol):
     Returned by :meth:`TurnStartWaitPort.arm`. The rail arms a wait *before*
     injecting (check-then-wait), then either :meth:`collect`\\ s it (blocking until
     the awaited transition, a timeout, or an error) or :meth:`cancel`\\ s it (when
-    an inject step failed and there is nothing to wait for). Exactly one of the two
-    is called per armed wait.
+    an inject step failed and there is nothing to wait for); exactly one is called.
     """
 
     def collect(self) -> WaitResult:
@@ -273,6 +272,8 @@ class ArmedWait(Protocol):
     def cancel(self) -> None:
         """Abandon the armed wait without waiting for it (best-effort cleanup)."""
         ...
+
+    def pending(self) -> bool: ...
 
 
 @runtime_checkable

@@ -41,7 +41,9 @@ python smoke/real_tmux_notify_smoke.py
 MOZYO_BRIDGE_COMMAND=mozyo-bridge-testpypi python smoke/real_tmux_notify_smoke.py
 ```
 
-`smoke/real_tmux_notify_smoke.py` は **explicit な strict `--mode standard` rail** のみを自動検証する (v0.4 contract pivot 後は `mozyo-bridge handoff send --mode standard --force` を非 agent な `sh` receiver に対して打つ形)。v0.4 で normative default になった `--mode queue-enter` rail (Asana `1214825156046950` 配下、`vibes/docs/logics/tmux-send-safety-contract.md` の `## Default Delivery Promise (v0.4)` / `## Queue-Enter Default Rail` を正本とする) は (a) real Claude / Codex TUI 上の prompt queue 挙動と pane metadata に依存し、(b) Layer B deterministic preflight (`--force` 不可、window-name / same-session / active-split / per-receiver foreground process allowlist) が non-agent `sh` receiver を typing 前に reject するため、同 smoke では auto-cover できない。v0.4 default を触る変更は同 smoke header の docstring に記載した手順 (`mozyo-bridge handoff send` を `--mode` 指定なしで queue-enter default として marker 観測あり / 観測なしの 2 ケース、`--mode standard` 明示で strict regression 1 ケース、v0.3 preflight spot-check 3 ケース (foreign-session / inactive-split / non-agent reject)、v0.4 force-rejection regression 1 ケースの計 7 ケース) を Asana task に記録する。default promise は `confirmed landing` ではなく `strong preflight 付き practical queued submission` のため、queue-enter rail の auto smoke が無い状態でも product 約束自体は破綻しない (durable record が引き続き source of truth)。
+`smoke/real_tmux_notify_smoke.py` は **explicit な strict `--mode standard` rail** のみを自動検証する (v0.4 contract pivot 後は `mozyo-bridge handoff send --mode standard --force` を非 agent な `sh` receiver に対して打つ形)。real Claude / Codex TUI、Herdr event wait、terminal-bound generationを必要とする既定`queue-enter`はこのscriptだけでは検証できない。
+
+既定queue-enter、Herdr transport、remote Unit Boardのいずれかを変えた候補は、exact candidateをlocal／SSH remote host／Dev Containerの3 runtimeへ固定導入し、Redmine #15140「local／remote／Dev Container Unit統合表示・操作の実機確認」の5 checksを必須release gateとして実行する。少なくとも、(1) `herdr unit-board sources/show`で3 sourceとidentity・role・project・runtime stateを同一画面からreadback、(2) remote coordinatorへのdefault-mode preview後に新しいdurable anchorからapply exactly once、(3) causal confirmation時だけexit 0 + `delivered / ok / submitted_confirmed`、(4) stale／duplicate／接続不能と旧v1 generationでzero-send、(5) test process／lane／worktreeのmanaged cleanupを記録する。exit 3／`uncertain`は成功にせずblind retryしない。container unavailableや候補未導入を「他2 sourceがgreen」で代替しない。旧7-case tmux手動spot-checkは互換回帰として有用だが、この3-runtime Herdr acceptanceの代替ではない。
 
 ### Handoff primitive regression coverage (Asana `1214760806178471`)
 
@@ -57,9 +59,9 @@ Published-package 専用 smoke は追加しない。理由:
 
 - TestPyPI / PyPI fresh install acceptance (`Beta Tester Install` 節) が installed binary に対して `mozyo-bridge doctor` を実行する。primitive subcommand (`handoff send` / `handoff reply` / `reply` alias / `notify-*` standard variants) が installed binary に欠落していれば parser 構築段階で fail し、`scaffold apply` / `scaffold status` フローまで到達できない。
 - 同じ acceptance flow が installed binary に対して `scaffold apply <preset>` を実行するため、scaffold preset の中身 (上記 `ScaffoldPresetHandoffPrimitiveDocsTest` で固定された primitive guidance を含む) が installed package に乗っていることが確認される。
-- queue-enter rail の **末端 tmux 挙動** は real Claude / Codex TUI に依存し、`sh` receiver に対しては典型的な smoke にできない (上記 7 ケース手順を Asana task に残す運用で代替する)。`--mode standard` 鉄道は本 smoke で end-to-end 検証済み。
+- queue-enter rail の末端挙動はreal Claude / Codex TUIに依存し、`sh` receiverだけのpackage smokeでは代替できない。既定queue-enter／Herdr／remote actionを変更したreleaseは、上記Redmine #15140のexact-candidate 3-runtime smokeを別途完了させる。`--mode standard`のtmux互換だけは本scriptでend-to-end検証する。
 
-新規 smoke を増やす条件: real TUI receiver を伴う queue-enter 自動化が確立した時、または `notify-*` wrapper が primitive 経路を離れた時 (上記 doc-regression テストが落ちて初めて気づくのでは遅いケース)。両条件は現状 false であるため smoke の追加は deferred とする。
+real TUI receiverを伴うqueue-enterの自動化が確立した場合は、その自動smokeを#15140の手動実機項目へ追加する。自動化が無いことは実機gateをdeferする理由にならない。
 
 ## Release Flow
 
@@ -338,7 +340,10 @@ entry は「何が変わったか」「adopter は何もしないとどうなる
 
 ### 未反映 entry
 
-- なし。
+- Redmine #15242「既定queue-enterのEnter吸収を安全に補完」
+  - 何が変わるか: Herdrの既定`queue-enter`は本文をexactly once入力し、各Enterの前にworking-transition waitをarmする。causal turn-startを確認できない間だけ、既定30秒の単一budget／2秒間隔で、identity・`pane_bound_v2` launch token・現在のcomposer本文・startup/modal画面・runtime stateを毎回再確認してEnterだけをbounded retryする。causal eventと同じstable terminal generationが揃った場合だけ`sent / ok`になり、それ以外は非0の`blocked`へ閉じる。tmux、Herdr `standard`、`pending`の契約は変えない。
+  - 何もしない場合: 新しいmanaged launchは`pane_bound_v2`を記録してそのまま利用できる。候補版より前から動く`pane_bound_v1`／legacy pairはterminal provenanceを持たないため、Herdr queue-enterとrollback closeがfail-closedし、以前のような楽観的successやpresent targetの互換closeは行わない。`session-start`再実行はlive pairをadoptするだけでv2へ更新しない。record-less non-default scratch pairだけは`herdr session-retire` preflight→明示承認付きexecute→positive absence→fresh `session-start`で更新できる。lifecycle-managed active pairとdefault coordinatorには汎用receipt-refresh railが無く、一般移行runbook未成立はrelease blockerである。
+  - 元へ戻す方法: v2 pairをまだ作っていない環境は`terminal_transport.backend: tmux`へ戻してprocessを再起動できる。v2 receiptをshared homeへ書いた後は0.20.1へのin-place downgradeを行わない。0.20.1はv2 receiptを未知としてcloseを拒否するため安全側だが、v2 stateを収束できず、0.20.1で再launchすると再びv1を作る。候補版readerでstartup／rollback debtを収束し、別途承認したdowngrade計画なしには旧runtimeへ切り替えない。
 
 ## Tag and Release
 

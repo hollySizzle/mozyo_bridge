@@ -339,9 +339,17 @@ def configure_handoff_parser(
         default=MODE_QUEUE_ENTER,
         help=(
             "`queue-enter` (default since v0.4; Claude/Codex agent "
-            "panes only, --force not allowed) types and presses "
-            "Enter regardless of marker observation, emitting "
-            "reason=queue_enter on marker miss without rollback; "
+            "panes only, --force not allowed) types the body once. Under "
+            "Herdr it arms a causal wait before every Enter, applies fresh "
+            "identity/composer/screen/state checks before each extra Enter, "
+            "and fails closed unless the same launch generation confirms the "
+            "turn start (`turn_start_absent` for an absent target, "
+            "`receiver_blocked` for a confirmed blocked runtime, otherwise "
+            "`turn_start_unconfirmed`; transport failures use "
+            "`transport_error`). If the post-body generation recheck, first "
+            "wait arm, or absolute deadline check fails, Herdr presses no Enter; "
+            "the staged body makes blind retry unsafe. Under tmux it keeps the legacy marker-based "
+            "Enter-only retry and reason=queue_enter on marker miss; "
             "`standard` (strict explicit fallback) types and presses "
             "Enter after the landing marker, with C-u rollback on "
             "marker timeout; "
@@ -385,12 +393,17 @@ def configure_handoff_parser(
         type=float,
         default=QUEUE_ENTER_RETRY_WINDOW_SECONDS,
         help=(
-            "queue-enter Enter-only retry window in seconds (default "
-            f"{QUEUE_ENTER_RETRY_WINDOW_SECONDS:g}). When the landing marker is "
-            "not observed, Enter — and only Enter; the marker+body is never "
-            "re-typed — is re-issued every --queue-enter-retry-interval seconds "
-            "until the marker is observed or this window elapses. `0` disables "
-            "the retry (single Enter). Ignored under --mode standard/pending."
+            "Absolute queue-enter retry budget in seconds (default "
+            f"{QUEUE_ENTER_RETRY_WINDOW_SECONDS:g}); the body is always typed "
+            "once. Herdr includes the first pre-armed causal wait, all minimum-"
+            "interval delays, and every re-armed wait in this one budget. A "
+            "timeout may repeat an Enter-only retry after a fresh strict gate "
+            "until the deadline; a wait error stops the sequence immediately "
+            "without authorising another Enter. Earlier timeout-authorised "
+            "retries remain recorded. tmux keeps its legacy marker-unobserved "
+            "Enter-only loop. Herdr queue-enter accepts only finite values up "
+            "to 3600 seconds; tmux limits are unchanged. `0` disables extra "
+            "Enter. Ignored under --mode standard/pending."
         ),
     )
     parser_.add_argument(
@@ -399,9 +412,11 @@ def configure_handoff_parser(
         type=float,
         default=QUEUE_ENTER_RETRY_INTERVAL_SECONDS,
         help=(
-            "Seconds between Enter-only retries on the queue-enter rail "
-            f"(default {QUEUE_ENTER_RETRY_INTERVAL_SECONDS:g}). `0` disables the "
-            "retry."
+            "Minimum seconds between queue-enter Enter presses (default "
+            f"{QUEUE_ENTER_RETRY_INTERVAL_SECONDS:g}). Herdr re-arms the causal "
+            "wait and re-runs the strict live gate before every extra Enter; "
+            "Herdr accepts only finite values up to 3600 seconds. tmux keeps "
+            "the legacy marker probe loop. `0` disables extra Enter."
         ),
     )
     parser_.add_argument(

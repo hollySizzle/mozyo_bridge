@@ -108,8 +108,14 @@ def _add_ticketless_delivery_options(
         default=MODE_QUEUE_ENTER,
         help=(
             "Pane delivery rail (identical semantics to `handoff send`): "
-            "`queue-enter` (default), `standard` (strict, C-u rollback on marker "
-            "timeout), or `pending` (operator/debug)."
+            "`queue-enter` (default; body once, Herdr causal wait before each "
+            "Enter and fail-closed `turn_start_absent` / `receiver_blocked` / "
+            "`turn_start_unconfirmed` / `transport_error` result, tmux legacy "
+            "marker retry). A failed post-body generation recheck, first wait "
+            "arm, or deadline check means zero Enter and nonzero blocked; the "
+            "staged body makes blind retry unsafe; "
+            "`standard` (strict, C-u rollback on marker timeout), or `pending` "
+            "(operator/debug)."
         ),
     )
     parser_.add_argument(
@@ -136,17 +142,26 @@ def _add_ticketless_delivery_options(
         "--queue-enter-retry-window", dest="queue_enter_retry_window",
         type=float, default=QUEUE_ENTER_RETRY_WINDOW_SECONDS,
         help=(
-            "queue-enter Enter-only retry window in seconds (default "
-            f"{QUEUE_ENTER_RETRY_WINDOW_SECONDS:g}). `0` disables. Ignored under "
-            "--mode standard/pending."
+            "Absolute queue-enter retry budget in seconds (default "
+            f"{QUEUE_ENTER_RETRY_WINDOW_SECONDS:g}); body is typed once. Herdr "
+            "includes the first pre-armed wait, interval delays, and every "
+            "re-armed wait; timeout retries require a fresh strict gate, while "
+            "a wait error stops immediately without authorising another Enter "
+            "(earlier timeout retries remain recorded). tmux keeps the "
+            "legacy marker retry. Herdr queue-enter accepts only finite values "
+            "up to 3600 seconds; tmux limits are unchanged. `0` disables extra "
+            "Enter. Ignored under --mode standard/pending."
         ),
     )
     parser_.add_argument(
         "--queue-enter-retry-interval", dest="queue_enter_retry_interval",
         type=float, default=QUEUE_ENTER_RETRY_INTERVAL_SECONDS,
         help=(
-            "Seconds between Enter-only retries on the queue-enter rail (default "
-            f"{QUEUE_ENTER_RETRY_INTERVAL_SECONDS:g}). `0` disables."
+            "Minimum seconds between queue-enter Enter presses (default "
+            f"{QUEUE_ENTER_RETRY_INTERVAL_SECONDS:g}). Herdr re-arms the causal "
+            "wait and re-runs the live gate before every extra Enter; Herdr "
+            "accepts only finite values up to 3600 seconds. tmux keeps the "
+            "legacy marker probe loop. `0` disables extra Enter."
         ),
     )
     parser_.add_argument(

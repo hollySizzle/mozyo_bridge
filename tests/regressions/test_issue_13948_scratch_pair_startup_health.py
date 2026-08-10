@@ -61,6 +61,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     REASON_PREFLIGHT,
     run_session_rollback,
 )
+from mozyo_bridge.core.state.herdr_native_identity_binding import native_name_for
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
+    pane_bound_receipt,
+)
 from mozyo_bridge.core.state.startup_transaction_fence import (  # noqa: E501
     PHASE_COMPLETED_ROLLED_BACK,
     PHASE_COMPLETED_SUCCESS,
@@ -1165,6 +1169,23 @@ class _RollbackOps:
                 self.rows = [r for r in self.rows if r.get("pane_id") != locator]
         return _CloseResult(closed=closed, failed=failed)
 
+    def close_agent_participant(self, *, workspace_id, lane_id, target):
+        matches = [
+            row
+            for row in self.rows
+            if row.get("name") == target.assigned_name
+            and row.get("pane_id") == target.locator
+            and row.get("native_name") == target.native_name
+            and row.get("terminal_id") == target.terminal_id
+            and row.get("agent") == target.role
+        ]
+        if len(matches) != 1:
+            return False, "terminal-bound startup target changed before close"
+        result = self.close(
+            workspace_id, lane_id, ((target.role, target.locator),)
+        )
+        return (not result.failed, result.failed[0][2] if result.failed else "")
+
 
 class _Obligation:
     def __init__(self, target):
@@ -1194,7 +1215,7 @@ class SessionRollbackRailTest(unittest.TestCase):
                     role=role,
                     assigned_name=f"mzb1_ws1_{role}_lane-1",
                     locator=f"w2G:p{3 + index}",
-                    receipt="workspace=w2G",
+                    receipt=self._receipt(role),
                 ),
             )
         self.fence.set_phase(action.action_id, PHASE_ROLLBACK_OWED)
@@ -1205,11 +1226,22 @@ class SessionRollbackRailTest(unittest.TestCase):
             {
                 "name": f"mzb1_ws1_{role}_lane-1",
                 "pane_id": f"w2G:p{3 + ('claude', 'codex').index(role)}",
+                "terminal_id": f"terminal-{role}",
+                "native_name": native_name_for(f"mzb1_ws1_{role}_lane-1"),
                 "agent": role,
                 "agent_status": "idle",
             }
             for role in roles
         ]
+
+    @staticmethod
+    def _receipt(role):
+        return pane_bound_receipt(
+            target_workspace="w2G",
+            target_tab="w2G:t1",
+            native_name=native_name_for(f"mzb1_ws1_{role}_lane-1"),
+            terminal_id=f"terminal-{role}",
+        )
 
     def _run(self, ops, action, **kw):
         return run_session_rollback(
@@ -1236,7 +1268,10 @@ class SessionRollbackRailTest(unittest.TestCase):
         verdict = self._run(ops, action, execute=True)
         self.assertTrue(verdict.ok)
         self.assertEqual(verdict.reason, REASON_OK)
-        self.assertEqual({r for r, _ in ops.close_calls[0]}, {"claude", "codex"})
+        self.assertEqual(
+            {role for call in ops.close_calls for role, _ in call},
+            {"claude", "codex"},
+        )
         self.assertEqual(
             self.fence.read(action.action_id).phase, PHASE_COMPLETED_ROLLED_BACK
         )
@@ -1455,7 +1490,10 @@ class SessionRollbackRailTest(unittest.TestCase):
         self.fence.record_participant(
             action.action_id,
             Participant(
-                role="codex", assigned_name="mzb1_ws1_codex_lane-1", locator="w2G:p4"
+                role="codex",
+                assigned_name="mzb1_ws1_codex_lane-1",
+                locator="w2G:p4",
+                receipt=self._receipt("codex"),
             ),
         )
         ops = _RollbackOps(self._rows("codex"))
@@ -1484,25 +1522,22 @@ class SessionRollbackRailTest(unittest.TestCase):
         self.assertFalse(
             ops.close_calls, f"closed a foreign agent: {ops.close_calls}"
         )
-        # Both participants are positively absent -> the action is settled, not a failure.
-        self.assertTrue(verdict.ok)
-        self.assertEqual(
-            {p.verdict for p in verdict.participants}, {ROLLBACK_ABSENT}
-        )
+        # A v2 receipt cannot reinterpret a replacement occupying its recorded pane as
+        # the original generation. It preserves the debt but never closes the foreign row.
+        self.assertEqual(verdict.reason, REASON_BLOCKED)
 
-    def test_a_mix_of_absent_and_live_closes_only_the_live_one(self):
+    def test_a_mix_of_replacement_and_live_blocks_without_partial_close(self):
         action = self._owed_action()
         # codex present at its recorded pane; claude's name absent, its pane taken over.
         rows = [
-            {"name": "mzb1_ws1_codex_lane-1", "pane_id": "w2G:p4", "agent": "codex",
-             "agent_status": "idle"},
+            self._rows("codex")[0],
             {"name": "a_stranger", "pane_id": "w2G:p3", "agent": "claude",
              "agent_status": "idle"},
         ]
         ops = _RollbackOps(rows)
         verdict = self._run(ops, action, execute=True)
-        self.assertEqual([c for c in ops.close_calls[0]], [("codex", "w2G:p4")])
-        self.assertTrue(verdict.ok)
+        self.assertEqual(ops.close_calls, [])
+        self.assertEqual(verdict.reason, REASON_BLOCKED)
 
     def test_a_startup_screen_over_an_unreadable_composer_is_preserved(self):
         # Review j#81070 R1-F3: a recognised trust screen used to license a close even
@@ -1661,8 +1696,12 @@ class SessionRollbackRailTest(unittest.TestCase):
         action = self.fence.reserve(self.unit, "n1")
         self.fence.record_participant(
             action.action_id,
-            Participant(role="codex", assigned_name="mzb1_ws1_codex_lane-1",
-                        locator="w2G:p4", receipt="w"),
+            Participant(
+                role="codex",
+                assigned_name="mzb1_ws1_codex_lane-1",
+                locator="w2G:p4",
+                receipt=self._receipt("codex"),
+            ),
         )
         self.fence.set_phase(action.action_id, PHASE_HEALTH_CHECK)  # crashed here
         ops = _RollbackOps(self._rows("codex"))

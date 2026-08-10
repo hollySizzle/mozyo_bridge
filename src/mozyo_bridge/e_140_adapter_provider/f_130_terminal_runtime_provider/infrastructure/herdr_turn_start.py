@@ -155,7 +155,8 @@ class _HerdrArmedWait:
             return WaitResult.timeout(
                 "herdr wait exceeded the outer subprocess bound"
             )
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
+            self._reap()
             return WaitResult.error(
                 f"herdr wait failed to reap ({exc.__class__.__name__})"
             )
@@ -165,6 +166,14 @@ class _HerdrArmedWait:
         if self._prefailed is not None or self._proc is None:
             return
         self._reap()
+
+    def pending(self) -> bool:
+        if self._prefailed is not None or self._proc is None:
+            return False
+        try:
+            return self._proc.poll() is None
+        except (OSError, ValueError):
+            return False
 
     def _reap(self) -> None:
         proc = self._proc

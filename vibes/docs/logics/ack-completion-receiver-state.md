@@ -160,11 +160,16 @@ Redmine #15242 (既定 queue-enter の turn-start 補完) は、同じ偽陽性�
 layer 0 hardening である。ただし queue-enter は `busy` な receiver にも request を queue する rail なので、
 idle だけを許す standard `drive_turn_start` を流用しない。
 
-- marker + body は exactly once、first Enter も exactly once。最初の Enter より先に working-transition wait を
-  arm する。causal start が未確認なら、同一 target identity、collision-free launch generation、現在の
-  composer tail にある full marker+body（hard-wrap whitespace のみ正規化）、startup / modal / trust / login /
-  selection screen の非該当、runtime state の read 成功を送信直前に再確認し、追加 Enter を高々一度だけ
-  許す。historical transcript に同じ本文があるだけでは composer retention にならない。
+- marker + body は exactly once。first Enter は zero-or-one であり、body 注入後の pinned generation 再確認と
+  working-transition wait の arm が成功し、absolute deadline 内にある場合だけ発行する。失敗時は
+  `enter_attempts=0` のまま `blocked` / `turn_start_unconfirmed` に閉じる。実際に発行する first / extra Enter は
+  すべて事前に wait を arm する。causal start が未確認なら、同一 target identity、collision-free launch
+  generation、現在の composer tail にある full marker+body（hard-wrap whitespace のみ正規化）、startup /
+  modal / trust / login / selection screen の非該当、runtime state の read 成功を **各回の送信直前に fresh に**
+  再確認する。timeout-only 系列は policy 回数上限と absolute deadline まで Enter-only retry を反復できる。
+  wait error は次の Enter を許可せず、その場で系列を停止する。それ以前に timeout の fresh gate で許可・発行済みの
+  retry は取り消せないため、その回数を telemetry に残す。historical transcript に
+  同じ本文があるだけでは composer retention にならない。
 - `busy` は queue semantics 上、上記の全再確認を通過した追加 Enter を拒む理由ではない。しかし busy snapshot、
   busy baseline、既存 turn と区別できない event は **submission proof ではない**。pre-Enter state が
   `awaiting_input` / `turn_ended`、wait がその Enter より先に arm 済み、working transition が観測済み、
@@ -172,16 +177,21 @@ idle だけを許す standard `drive_turn_start` を流用しない。
 - `blocked` / `unknown` / state read failure、identity または generation の欠落・drift、current composer からの
   body 消失、startup/modal 検出、wait の arm 不能は追加 Enter を拒否する。「不明」は安全な retry の根拠では
   ない。
-- public retry window は初回観測から追加 Enter 後の再観測までの単一 absolute budget で、wait を arm し直しても
-  延長しない。interval は first Enter と extra Enter の最小間隔で、観測待ちにより既に満たしていれば追加 sleep
-  しない。window / interval の `0` または正の sub-millisecond 値は追加 Enter 無効である（first Enter と初回
-  observation は維持し、`0.001` 秒へ切り上げない）。非有限値は本文注入前に拒否する。
+- public default は window 30 秒 / interval 2 秒。window は初回観測、全 interval 待ち、全追加 Enter 後の
+  再観測を含む単一 absolute budget で、wait を arm し直しても延長しない。interval は隣接する Enter 間の
+  最小間隔で、観測待ちにより既に満たしていれば追加 sleep しない。window / interval の `0` または正の
+  sub-millisecond 値は追加 Enter 無効である。これは initial admission 自体を抑止しないが、first Enter と
+  observation は post-body generation 再確認・wait arm・deadline check が成功した場合に限る。`0.001` 秒へ
+  切り上げず、非有限値は本文注入前に拒否する。
 
 確認結果は queue 専用 `queue_enter_turn_start_observation` と queue delivery-ledger rail に残し、standard
 `turn_start_outcome` へ射影しない。後者へ射影すると queue delivery が別 rail として分類され、recovery 判断が
-変わるためである。causal event と coherent generation が無い結果は `uncertain` であり、表層の `sent` / `ok`
-や post-hoc `busy` から `submitted_confirmed` に昇格させない。`uncertain` は本文が届いた可能性を含むので blind
-retry を禁止する。ここまで確認できても task completion ではない。
+変わるためである。causal event と coherent generation が揃った場合だけ `sent` / `ok` / exit 0。wait absent は
+`blocked` / `turn_start_absent`、fresh gate が runtime blocked を確認した場合は `blocked` /
+`receiver_blocked`、timeout / error / wait unarmed / drift / body-screen-state 再確認不成立は `blocked` /
+`turn_start_unconfirmed`、送信 primitive の `TerminalTransportError` は `blocked` / `transport_error` へ写し、
+いずれも非0である。未確認を legacy の `sent` / telemetry-only success に倒さない。ただし本文が届いた可能性を
+含むので injection stage は `uncertain`、blind retry 禁止となる。ここまで確認できても task completion ではない。
 
 ### Minimal future runtime event vocabulary
 
@@ -353,10 +363,11 @@ doctrine としての position:
 6. **handoff の durable wording は ACK 層の正本**として書く。completion / processing の含意を持たせない。受領契約は引き続き「receiver は durable anchor を読む」であり、pane の rendered text に依存させない。
 7. **owner approval / review / close を runtime signal で自動化しない**。`runtime.input.ack`、`runtime.output.eof`、`assistant_turn_finished`、ticket webhook のいずれも、Review Gate / owner close approval / Close Gate の代替ではない。
 8. **ticket-system signal は provider 境界に閉じる**。Redmine / Asana の status、journal、approval record を読む場合は ticket provider adapter / governed workflow の layer 3 record として扱い、terminal runtime adapter や sidecar の ACK state に混ぜない。
-9. **Herdr queue-enter の確認不能を自動再送へ読み替えない**。本文が既に composer にある可能性があるため、
-   causal event + coherent generation が欠ける結果は `uncertain` とし、同じ gateway command や本文を再実行
-   しない。rail 内で許される補完は、current composer と同一 target / generation を再証明した高々1回の
-   Enter-only resend だけである。
+9. **Herdr queue-enter の確認不能を外側の自動再送へ読み替えない**。本文が既に composer にある可能性が
+   あるため、causal event + coherent generation が欠ける結果は precise `blocked` reason / non-zero かつ
+   injection stage `uncertain` とし、同じ gateway command や本文を再実行しない。rail 内だけは body を再入力せず、
+   各 Enter より先の wait と fresh strict gate、public absolute budget の下で Enter-only retry できる。
+   timeout-only 系列は policy 上限まで反復できるが、wait error は次の Enter を許可せず即時停止する。
 
 ## Receiver-side recovery admission と、その保証境界 (Redmine #13910)
 

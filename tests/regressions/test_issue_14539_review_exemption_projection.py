@@ -4124,6 +4124,11 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             ['handoff'],
             "inherits via a used import of handoff; names no marker token itself",
         ),
+        f"{_H}/application/handoff_herdr_queue_enter_rail.py": (
+            ['handoff'],
+            "inherits via a used import of handoff for the queue-enter retry policy; "
+            "names no marker token itself, renders none, and reads no durable note",
+        ),
         f"{_H}/application/handoff_target_resolution.py": (
             ['handoff'],
             "inherits via a used import of handoff; names no marker token itself",

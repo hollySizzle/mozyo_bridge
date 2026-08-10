@@ -791,6 +791,7 @@ def verified_generation_token(
     locator: str,
     norm,
     norm_lane,
+    participant_receipt_matches=None,
 ) -> str:
     """The attested generation token for this exact gateway, or ``""`` (read-only, j#87472).
 
@@ -849,6 +850,14 @@ def verified_generation_token(
         and norm(getattr(participant, "locator", "")) == norm(locator)
     ):
         return ""
+    if participant_receipt_matches is not None:
+        try:
+            if not participant_receipt_matches(
+                getattr(participant, "receipt", "")
+            ):
+                return ""
+        except Exception:  # noqa: BLE001 - malformed receipt cannot grant authority
+            return ""
     return token
 
 

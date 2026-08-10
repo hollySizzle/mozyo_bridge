@@ -816,6 +816,8 @@ class _Herdr:
                                 "pane_id": pane_id,
                                 "workspace_id": wid,
                                 "tab_id": tab_id,
+                                "terminal_id": f"terminal-{pane_id}",
+                                "revision": 0,
                                 "cwd": cwd,
                             },
                         }
@@ -948,6 +950,8 @@ class _Herdr:
                                 "workspace_id": wid,
                                 "tab_id": landed_tab,
                                 "agent_status": "unknown",
+                                "terminal_id": f"terminal-{pane_id}",
+                                "revision": 0,
                             },
                             "argv": rest,
                             "type": "agent_started",
@@ -1174,6 +1178,8 @@ class _Herdr:
             "workspace_id": wid,
             "tab_id": tab_id,
             "agent_status": "idle",
+            "terminal_id": f"terminal-{pane_id}",
+            "revision": 0,
         }
         if role in self.residue_after_start:
             # Positive shell residue: the name is there, the agent field is present and
@@ -5650,6 +5656,63 @@ class LaneTabSubdivisionTest(unittest.TestCase):
                         runner=fake.run,
                     )
         self.assertIn("--tab", str(ctx.exception))
+
+    def test_shared_fake_terminal_replacement_stimulus_fails_closed(self) -> None:
+        fake = FakeHerdr()
+        fake.misreport_next_terminal_id("terminal-replacement")
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            from mozyo_bridge.core.state.startup_transaction_fence import (
+                StartupTransactionFence,
+                StartupUnit,
+                startup_action_id,
+            )
+            from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
+                parse_pane_bound_receipt,
+            )
+
+            fence = StartupTransactionFence(home=home)
+            nonce = "terminal-mismatch"
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+            ):
+                with self.assertRaises(HerdrSessionStartError) as ctx:
+                    prepare_session(
+                        repo_root=repo,
+                        providers=["codex"],
+                        lane_id="lane-a",
+                        env=_launch_env(binpath),
+                        runner=fake.run,
+                        startup_fence=fence,
+                        action_nonce=nonce,
+                    )
+                workspace_id = read_anchor(repo)["workspace_id"]
+                action = fence.read(
+                    startup_action_id(
+                        StartupUnit(
+                            workspace_id=workspace_id,
+                            lane_id="lane-a",
+                            providers=("codex",),
+                        ),
+                        nonce,
+                    )
+                )
+                self.assertIsNotNone(action)
+                participant = action.participant_for("codex")
+                self.assertIsNotNone(participant)
+                receipt = parse_pane_bound_receipt(participant.receipt)
+                self.assertIsNotNone(receipt)
+                self.assertTrue(receipt.terminal_id)
+                self.assertNotEqual(receipt.terminal_id, "terminal-replacement")
+                self.assertFalse(action.terminal)
+
+        self.assertIn("different terminal identity", str(ctx.exception))
 
     def test_tab_target_for_lane_placement_rules(self) -> None:
         # Pure decision function (Redmine #13411): own tab pins first, multi-tab

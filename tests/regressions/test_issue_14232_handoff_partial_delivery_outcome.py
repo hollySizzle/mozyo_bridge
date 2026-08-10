@@ -129,9 +129,22 @@ _MISSING = object()
 
 #: A generation-coherent gateway binding, in the shape the rail persists when the pre-arm and
 #: post-collect generations match.
+_GATEWAY_NAME = "mzb1_ws_codex_lane"
+_GATEWAY_TERMINAL = "terminal-test"
+_GATEWAY_LOCATOR = "%7"
+_GATEWAY_REVISION = "1"
 _GATEWAY_BINDING = {
-    "provider": "codex", "assigned_name": "mzb1_ws_codex_lane", "locator": "w4B:p4T",
-    "row_revision": "1", "attestation_observed_at": "2026-07-29T20:10:01+00:00",
+    "provider": "codex",
+    "assigned_name": _GATEWAY_NAME,
+    "locator": _GATEWAY_LOCATOR,
+    "terminal_id": _GATEWAY_TERMINAL,
+    "row_revision": _GATEWAY_REVISION,
+    "process_generation": (
+        f"{len(_GATEWAY_NAME)}:{_GATEWAY_NAME}:"
+        f"{len(_GATEWAY_TERMINAL)}:{_GATEWAY_TERMINAL}:"
+        f"{len(_GATEWAY_LOCATOR)}:{_GATEWAY_LOCATOR}:r{_GATEWAY_REVISION}"
+    ),
+    "attestation_observed_at": "2026-07-29T20:10:01+00:00",
     "startup_action_id": "startup-abc",
 }
 
@@ -167,6 +180,7 @@ class _RaisingOps:
     rollbacks: int = 0
     guidance: List[str] = field(default_factory=list)
     died: List[str] = field(default_factory=list)
+    live_waits: set[object] = field(default_factory=set)
 
     def _boom(self, primitive: str) -> None:
         raise TransportBindingError(
@@ -218,20 +232,38 @@ class _RaisingOps:
         return "turn_ended"
 
     def observe_queue_enter_gateway_binding(self, target: str) -> dict:
+        assigned_name = "mzb1_ws_codex_lane"
+        terminal_id = "terminal-test"
+        revision = "1"
         return {
             "provider": "codex",
-            "assigned_name": "mzb1_ws_codex_lane",
+            "assigned_name": assigned_name,
             "locator": target,
-            "row_revision": "1",
+            "terminal_id": terminal_id,
+            "row_revision": revision,
+            "process_generation": (
+                f"{len(assigned_name)}:{assigned_name}:"
+                f"{len(terminal_id)}:{terminal_id}:"
+                f"{len(target)}:{target}:r{revision}"
+            ),
             "attestation_observed_at": "2026-08-10T00:00:00+00:00",
             "startup_action_id": "startup-test",
         }
 
     def arm_queue_enter_turn_wait(self, target: str, *, timeout_ms: int):
-        return object()
+        armed = object()
+        self.live_waits.add(armed)
+        return armed
 
     def collect_queue_enter_turn_wait(self, armed) -> str:
+        self.live_waits.discard(armed)
         return "timeout"
+
+    def cancel_queue_enter_turn_wait(self, armed) -> None:
+        self.live_waits.discard(armed)
+
+    def queue_enter_turn_wait_pending(self, armed) -> bool:
+        return armed in self.live_waits
 
     def evaluate_queue_enter_resend(
         self,
@@ -324,6 +356,8 @@ def _request(mode: str = _MODE_QUEUE_ENTER, **overrides) -> TmuxTransportRailReq
         submit_delivery_id=None,
         persist_delivery=False,
         herdr_send=True,
+        herdr_assigned_name="mzb1_ws_codex_lane",
+        herdr_process_generation=_GATEWAY_BINDING["process_generation"],
         read_lines=50,
         landing_timeout=8.0,
         submit_delay=None,
@@ -627,6 +661,7 @@ class MarkerObservedQueueEnterIsNotAConfirmedSubmissionTest(unittest.TestCase):
             extra = {}
             if event_wait_kind is not None:
                 extra["event_wait_kind"] = event_wait_kind
+                extra["baseline_runtime_state"] = "turn_ended"
             if binding is not _MISSING:
                 extra["gateway_binding"] = binding
             if extra:
@@ -791,6 +826,7 @@ class MalformedGenerationBindingIsNotCausalEvidenceTest(unittest.TestCase):
             "observation_kind": "post_choreography_snapshot",
             "source": "herdr_agent_get", "runtime_state": "busy", "read_ok": True,
             "read_reason": None, "poll_attempts": 3, "event_wait_kind": "changed",
+            "baseline_runtime_state": "turn_ended",
         }
         if binding is not _MISSING:
             observation["gateway_binding"] = binding

@@ -103,6 +103,10 @@ class SlotResult:
     compensation: str = COMPENSATION_NOT_NEEDED
     #: A fixed operator sentence for ``health`` (never observed pane content).
     health_detail: str = ""
+    #: Per-process terminal identity from this slot's own ``agent_started`` receipt.
+    #: Internal launch-generation evidence only: it is intentionally omitted from
+    #: :meth:`as_payload` and never becomes durable route identity.
+    launch_terminal_id: str = field(default="", repr=False)
 
     @property
     def disposition(self) -> str:

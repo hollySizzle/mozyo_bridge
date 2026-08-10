@@ -134,6 +134,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     decode_assigned_name,
     encode_assigned_name,
 )
+from mozyo_bridge.core.state.herdr_native_identity_binding import native_name_for
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
+    pane_bound_receipt,
+)
 
 from tests.support.agent_provider_binaries import with_provider_path
 from tests.support.herdr_fake import FakeHerdr, _Agent as _FakeAgent
@@ -877,11 +881,15 @@ def _agent_list_rows(fake: FakeHerdr):
     logical_by_native = {
         agent.name: agent.logical_name for agent in fake._agents.values()
     }
+    provider_by_native = {
+        agent.name: agent.provider for agent in fake._agents.values()
+    }
     restored = []
     for row in rows:
         logical_name = logical_by_native.get(row.get("name"), "")
         if logical_name and logical_name != row.get("name"):
             row = dict(row)
+            row["agent"] = provider_by_native.get(row["name"], "")
             row["native_name"] = row["name"]
             row["name"] = logical_name
         restored.append(row)
@@ -936,6 +944,23 @@ class _FakeBackedRollbackOps:
                 if agent.logical_name == name:
                     del self.fake._agents[pane]
         return _CloseResult(closed=closed, failed=())
+
+    def close_agent_participant(self, *, workspace_id, lane_id, target):
+        matches = [
+            row
+            for row in _agent_list_rows(self.fake)
+            if row.get("name") == target.assigned_name
+            and row.get("pane_id") == target.locator
+            and row.get("native_name") == target.native_name
+            and row.get("terminal_id") == target.terminal_id
+            and row.get("agent") == target.role
+        ]
+        if len(matches) != 1:
+            return False, "terminal-bound startup target changed before close"
+        result = self.close(
+            workspace_id, lane_id, ((target.role, target.locator),)
+        )
+        return (not result.failed, result.failed[0][2] if result.failed else "")
 
 
 def _append_v1_lane(tmp: str, *, lane: str, issue: str):
@@ -998,7 +1023,8 @@ class _AttestingHerdr(FakeHerdr):
             return __import__("subprocess").CompletedProcess(
                 argv, 0,
                 stdout=json.dumps({"result": {"type": "agent_started", "agent": {
-                    "name": native_name, "pane_id": pane, "workspace_id": wid, "tab_id": tab}}}),
+                    "name": native_name, "pane_id": pane, "workspace_id": wid, "tab_id": tab,
+                    "terminal_id": f"terminal-{pane}", "revision": 0}}}),
                 stderr="",
             )
         result = super()._cmd_agent_start(argv, rest)
@@ -1948,7 +1974,7 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
     ISSUE = "13846"
 
     def _seed_partial(
-        self, home, ws, gw_name, gw_live, *, action, receipt="workspace=w1",
+        self, home, ws, gw_name, gw_live, *, action, receipt=None,
         phase=PHASE_ROLLBACK_OWED, old_locator="w1:pPREV", attest_locator=None,
     ):
         nonce = f"preflight-nonce-{action}"
@@ -1962,6 +1988,14 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
         )
         fence = StartupTransactionFence(home=home)
         fence.reserve(unit, nonce)
+        if receipt is None:
+            pane_workspace = gw_live.split(":", 1)[0]
+            receipt = pane_bound_receipt(
+                target_workspace=pane_workspace,
+                target_tab=f"{pane_workspace}:t1",
+                native_name=native_name_for(gw_name),
+                terminal_id=f"terminal-{gw_live}",
+            )
         fence.record_participant(
             sa_id, Participant(role="codex", assigned_name=gw_name,
                                locator=gw_live, receipt=receipt)
@@ -2559,6 +2593,7 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
             fake._agents[legacy_locator] = _FakeAgent(
                 name=pane_receipt.native_name, logical_name=wk_name,
                 pane_id=legacy_locator, workspace_id=reference.workspace_id,
+                terminal_id=pane_receipt.terminal_id,
                 provider="claude", tab_id=reference.tab_id,
             )
             HerdrIdentityAttestationStore(home=home).upsert(
@@ -2587,7 +2622,7 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
             rb_done = run_session_rollback(
                 action_id=legacy_startup_id, ops=rb_ops, home=home, execute=True
             )
-            self.assertTrue(rb_done.ok)
+            self.assertTrue(rb_done.ok, rb_done.as_payload())
             self.assertEqual(rb_done.reason, REASON_OK)
             self.assertEqual(rb_ops.close_calls, [[("claude", legacy_locator)]])
             self.assertIsNone(fake.agent_named(wk_name))

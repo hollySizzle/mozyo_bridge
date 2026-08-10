@@ -1245,8 +1245,10 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
-    lines: 2217
+    lines: 2211
     reason: >-
+      Lowered 2217 -> 2211 for #15242 while adding the causal queue-enter outcome:
+      stale and repetitive rail comments were condensed without widening the module.
       Baseline 2216 -> 2217 for #14741 (Codex update prompt / managed binary authority
       split): one additive `receiver_update_authority_split` token on the closed `Reason`
       vocabulary. Exactly the additive-Reason pattern this entry already records twice
