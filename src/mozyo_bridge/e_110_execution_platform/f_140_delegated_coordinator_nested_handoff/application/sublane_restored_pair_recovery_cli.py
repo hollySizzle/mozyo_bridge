@@ -1,4 +1,4 @@
-"""CLI for owner-approved post-reboot active-pair replacement (Redmine #15227)."""
+"""Read-only inspection of a post-reboot active pair (Redmine #15227)."""
 
 from __future__ import annotations
 
@@ -30,6 +30,8 @@ def format_restored_pair_recovery_text(outcome) -> str:
         f"  action_id: {plan.action_id}",
         f"  action_generation: {plan.action_generation}",
         f"  worktree_authority: {plan.worktree_authority_reason}",
+        "  generation_conditional_close_available: "
+        + str(plan.generation_conditional_close_available).lower(),
     ]
     if plan.supersede_requested:
         lines += [
@@ -83,19 +85,20 @@ def cmd_sublane_recover_restored_pair(args: argparse.Namespace) -> int:
         worker_approval_health=(
             getattr(args, "worker_approval_health", "") or ""
         ),
-        supersede=bool(getattr(args, "supersede", False)),
-        supersedes_generation=int(
-            getattr(args, "supersedes_generation", 0) or 0
-        ),
-        supersedes_journal=getattr(args, "supersedes_journal", "") or "",
-        supersedes_revision=int(
-            getattr(args, "supersedes_revision", 0) or 0
-        ),
+        # Supersede is an execution/reapproval concern.  It is not exposed by
+        # the diagnostic-only public parser while conditional close is absent.
+        supersede=False,
+        supersedes_generation=0,
+        supersedes_journal="",
+        supersedes_revision=0,
     )
     use_case = SublaneRestoredPairRecoveryUseCase(
         build_live_restored_pair_recovery_ops(repo_root)
     )
-    outcome = use_case.run(request, execute=bool(getattr(args, "execute", False)))
+    # Herdr 0.8 / protocol 19 cannot atomically compare the observed terminal
+    # generation at close.  Keep this public command read-only even if a
+    # programmatic caller forges an ``execute`` attribute on the Namespace.
+    outcome = use_case.run(request, execute=False)
     if bool(getattr(args, "json", False)):
         print(json.dumps(outcome.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
     else:
@@ -107,9 +110,10 @@ def register_sublane_recover_restored_pair_parser(sublane_sub: Any) -> None:
     parser = sublane_sub.add_parser(
         "recover-restored-pair",
         help=(
-            "Redmine #15227: replace the exact idle gateway+worker generations of an "
+            "Redmine #15227: inspect the exact idle gateway+worker generations of an "
             "active lane when reboot restoration left their command-shell CWD or startup "
-            "identity proof inconsistent. Preserves the worktree/branch; default is read-only."
+            "identity proof inconsistent. Read-only until Herdr exposes an atomic "
+            "generation-conditional close primitive."
         ),
     )
     parser.add_argument("--issue", required=True, help="Redmine issue owned by the active lane")
@@ -117,51 +121,25 @@ def register_sublane_recover_restored_pair_parser(sublane_sub: Any) -> None:
     parser.add_argument(
         "--journal",
         default="",
-        help="Exact structured direct-owner approval journal (required by --execute)",
+        help="Reserved exact approval journal for read-only replay diagnosis",
     )
     parser.add_argument(
         "--action-id",
         default="",
-        help="Exact action_id printed by preflight (required by --execute)",
+        help="Optional exact action_id pin for read-only diagnosis",
     )
     parser.add_argument(
         "--action-generation",
         type=int,
         default=0,
-        help="Exact positive generation printed by preflight (required by --execute)",
-    )
-    parser.add_argument(
-        "--supersede",
-        action="store_true",
-        help=(
-            "Re-anchor an exact zero-effect stuck transaction to the next generation and a "
-            "fresh owner approval. Default preflight derives the exact old pins; never applies "
-            "after a close, launch, verify, or continuation effect."
-        ),
-    )
-    parser.add_argument(
-        "--supersedes-generation",
-        type=int,
-        default=0,
-        help="Exact old action generation printed by a --supersede preflight",
-    )
-    parser.add_argument(
-        "--supersedes-journal",
-        default="",
-        help="Exact old decision journal printed by a --supersede preflight",
-    )
-    parser.add_argument(
-        "--supersedes-revision",
-        type=int,
-        default=0,
-        help="Exact old transaction revision printed by a --supersede preflight",
+        help="Optional exact action generation for read-only diagnosis",
     )
     parser.add_argument(
         "--allow-pending-composer-loss",
         action="store_true",
         help=(
-            "Owner accepts that unsent composer text in these exact old panes may be lost. "
-            "Required even for an approval-ready preflight; files/worktree are not discarded."
+            "Record during read-only diagnosis whether eventual replacement may lose unsent "
+            "composer text. This flag does not authorize or perform a close."
         ),
     )
     for flag, dest, label in (
@@ -177,8 +155,7 @@ def register_sublane_recover_restored_pair_parser(sublane_sub: Any) -> None:
             dest=dest,
             default="",
             help=(
-                f"Exact {label} printed by preflight. Optional on the first run; supply it "
-                "when replaying a partially completed action."
+                f"Optional exact {label} pin for read-only replay diagnosis."
             ),
         )
     for flag, dest, label in (
@@ -199,15 +176,9 @@ def register_sublane_recover_restored_pair_parser(sublane_sub: Any) -> None:
             choices=sorted(APPROVAL_HEALTH_STATES),
             default="",
             help=(
-                f"Exact {label} approval_health printed by the owner-approved preflight. "
-                "Required by --execute and every partial replay."
+                f"Reserved exact {label} approval_health for future conditional-close replay."
             ),
         )
-    parser.add_argument(
-        "--execute",
-        action="store_true",
-        help="Perform the exact approved close/relaunch/attestation transaction",
-    )
     add_repo_option(parser)
     parser.add_argument("--json", action="store_true", help="Emit structured JSON")
     parser.set_defaults(func=cmd_sublane_recover_restored_pair)
