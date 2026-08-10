@@ -252,6 +252,12 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   属する。client は結果に関わらず gateway command を **ちょうど 1 回**実行し、再実行しない
   （再実行は Enter の再送ではなく本文の再入力になる）。無制限 Enter retry・raw pane input・
   direct remote Claude 送信は追加しない。
+- **remote command の deadline は観測と queue-enter 配送で分ける。** board / workspace の read-only
+  観測は従来どおり `connect_timeout + COMMAND_GRACE_SECONDS` で速やかに degrade する。queue-enter の
+  gateway command に限り、その基礎 deadline へ共有 policy の
+  `QUEUE_ENTER_RETRY_WINDOW_SECONDS` を加える。これは client 側で retry を増やす処理ではなく、対象 host
+  側の既存 Enter-only retry が完了する前に client が command を timeout にしないための待機 budget
+  である。`standard` / `pending` を明示した action は基礎 deadline のままとする。
 - **配送成否は exit code で判定しない。** 対象 gateway の **構造化 outcome** を読み、共有 authority
   (`injection_stage_for_outcome`) の判定に従う。
   **構造化 outcome は判定にのみ使い、client の表示は固定の public-safe 文言とする**（remote の値を

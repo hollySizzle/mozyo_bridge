@@ -9,6 +9,9 @@ from datetime import datetime, timedelta, timezone
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.unit_board_sources import (
     UnitBoardSourcesConfig,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+    QUEUE_ENTER_RETRY_WINDOW_SECONDS,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (
     MODE_QUEUE_ENTER,
 )
@@ -37,6 +40,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     render_preview,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_multi_source_unit_board import (
+    COMMAND_GRACE_SECONDS,
     REMOTE_BOARD_ARGS,
     REMOTE_WORKSPACE_ARGS,
     MultiSourceUnitBoardRuntime,
@@ -572,6 +576,51 @@ class DeliveryModeTests(unittest.TestCase):
                     argv for argv in runner.argvs if "project-gateway" in argv[-1]
                 ]
                 self.assertEqual(len(gateway), 1)
+
+    def test_queue_enter_gets_its_retry_window_without_slowing_observation(
+        self,
+    ) -> None:
+        class TimeoutRecordingRunner(RecordingRunner):
+            def __init__(self, answer_map):
+                super().__init__(answer_map)
+                self.calls = []
+
+            def __call__(self, argv, **kwargs):
+                self.calls.append((list(argv), kwargs["timeout"]))
+                return super().__call__(argv, **kwargs)
+
+        clock = MovableClock()
+        runner = TimeoutRecordingRunner(answers())
+        runtime = MultiSourceUnitBoardRuntime(
+            REMOTE_CONFIG,
+            local_runtime=FakeLocalRuntime(),
+            runner=runner,
+            clock=clock,
+        )
+        action = RemoteUnitActionRail(runtime, clock=clock)
+        unit_id = remote_unit_id(runtime)
+        summary = "deadline-boundary-body"
+
+        action.apply(action.preview(request(unit_id, summary=summary)))
+
+        base_timeout = (
+            REMOTE_CONFIG.by_id["devbox"].connect_timeout + COMMAND_GRACE_SECONDS
+        )
+        self.assertEqual(base_timeout, 30)
+        gateway_calls = [
+            call for call in runner.calls if "project-gateway" in call[0][-1]
+        ]
+        observation_calls = [
+            call for call in runner.calls if "project-gateway" not in call[0][-1]
+        ]
+        self.assertEqual(len(gateway_calls), 1)
+        self.assertEqual(
+            gateway_calls[0][1],
+            base_timeout + QUEUE_ENTER_RETRY_WINDOW_SECONDS,
+        )
+        self.assertTrue(observation_calls)
+        self.assertEqual({timeout for _, timeout in observation_calls}, {base_timeout})
+        self.assertEqual(gateway_calls[0][0][-1].count(summary), 1)
 
     def test_no_raw_input_or_direct_worker_route_is_introduced(self) -> None:
         action, runtime, runner = rail()

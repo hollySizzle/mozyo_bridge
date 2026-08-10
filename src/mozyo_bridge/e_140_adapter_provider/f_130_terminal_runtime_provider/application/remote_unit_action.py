@@ -39,8 +39,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     MODES,
+    QUEUE_ENTER_RETRY_WINDOW_SECONDS,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (
+    MODE_QUEUE_ENTER,
     effective_send_mode,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (
@@ -630,7 +632,13 @@ class RemoteUnitActionRail:
         the body rather than re-press Enter (Redmine #15198).
         """
         result = self._runtime.run_source_command(
-            source, self._gateway_args(request, workspace)
+            source,
+            self._gateway_args(request, workspace),
+            completion_window_seconds=(
+                QUEUE_ENTER_RETRY_WINDOW_SECONDS
+                if request.effective_delivery_mode == MODE_QUEUE_ENTER
+                else 0.0
+            ),
         )
         stage = _delivery_stage(result)
         if stage == STAGE_SUBMITTED_CONFIRMED:

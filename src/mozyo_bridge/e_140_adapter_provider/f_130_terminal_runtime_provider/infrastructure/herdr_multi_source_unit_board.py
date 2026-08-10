@@ -271,7 +271,11 @@ class MultiSourceUnitBoardRuntime:
         return self._local_runtime
 
     def run_source_command(
-        self, source: UnitBoardSource, args: Sequence[str]
+        self,
+        source: UnitBoardSource,
+        args: Sequence[str],
+        *,
+        completion_window_seconds: float = 0.0,
     ) -> "SourceCommandResult":
         """Run one mozyo-bridge command on ``source`` through its fixed argv.
 
@@ -279,6 +283,10 @@ class MultiSourceUnitBoardRuntime:
         observation and action alike.  One seam means one place builds argv, one
         place applies the timeout, and a test that injects a runner cannot leave
         a second real-subprocess path behind.
+
+        The default deadline stays the short observation deadline.  A caller
+        waiting for a bounded server-side completion policy may add that policy's
+        window explicitly; this seam does not infer an action from command text.
 
         The outcome distinguishes "could not run" from "answered too much": a
         source that overflowed the ceiling did respond, and reporting that as a
@@ -293,7 +301,11 @@ class MultiSourceUnitBoardRuntime:
                 list(argv),
                 capture_output=True,
                 text=True,
-                timeout=source.connect_timeout + COMMAND_GRACE_SECONDS,
+                timeout=(
+                    source.connect_timeout
+                    + COMMAND_GRACE_SECONDS
+                    + completion_window_seconds
+                ),
             )
         except (OSError, subprocess.SubprocessError, ValueError):
             # ``ValueError`` is the subprocess layer refusing the argv itself —
