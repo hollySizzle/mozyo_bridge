@@ -759,6 +759,92 @@ class WaitErrorEnterResendTests(unittest.TestCase):
         self.assertEqual(len(transport.send_text_calls), 1)
         self.assertEqual(len(transport.send_keys_calls), 2)
 
+    def test_error_hard_cap_overrides_a_larger_configured_budget(self) -> None:
+        # Audit j#102980: max_enter_resends is public and may exceed its default.
+        # WAIT_ERROR still permits at most one extra Enter in the whole sequence.
+        reader = FakeReader(
+            AgentStateResult.observed(RUNTIME_AWAITING_INPUT),
+            AgentStateResult.observed(RUNTIME_AWAITING_INPUT),
+        )
+        transport = FakeTransport(read_pane=[PaneReadResult.success(BODY)])
+        wait = FakeWait(WaitResult.error(), WaitResult.error(), WaitResult.error())
+        result = _rail(reader, transport, wait, max_enter_resends=2).drive_turn_start(
+            TARGET, BODY, screen_guard=_clear_screen
+        )
+        self.assertEqual(result.enter_resends, 1)
+        self.assertEqual(result.first_wait_kind, WAIT_ERROR)
+        self.assertEqual(result.wait_kind, WAIT_ERROR)
+        self.assertEqual(result.resend_skipped_reason, RESEND_SKIP_BUDGET_EXHAUSTED)
+        self.assertEqual(len(transport.send_text_calls), 1)
+        self.assertEqual(len(transport.send_keys_calls), 2)
+        self.assertEqual(
+            wait.timeouts,
+            [DEFAULT_WAIT_TIMEOUT_MS, DEFAULT_ERROR_RESEND_WAIT_TIMEOUT_MS],
+        )
+
+    def test_timeout_then_error_cannot_spend_a_larger_budget_twice(self) -> None:
+        reader = FakeReader(
+            AgentStateResult.observed(RUNTIME_AWAITING_INPUT),
+            AgentStateResult.observed(RUNTIME_AWAITING_INPUT),
+        )
+        transport = FakeTransport(read_pane=[PaneReadResult.success(BODY)])
+        wait = FakeWait(WaitResult.timeout(), WaitResult.error(), WaitResult.error())
+        result = _rail(reader, transport, wait, max_enter_resends=2).drive_turn_start(
+            TARGET, BODY, screen_guard=_clear_screen
+        )
+        self.assertEqual(result.enter_resends, 1)
+        self.assertEqual(result.first_wait_kind, WAIT_TIMEOUT)
+        self.assertEqual(result.wait_kind, WAIT_ERROR)
+        self.assertEqual(result.resend_skipped_reason, RESEND_SKIP_BUDGET_EXHAUSTED)
+        self.assertEqual(len(transport.send_text_calls), 1)
+        self.assertEqual(len(transport.send_keys_calls), 2)
+
+    def test_error_then_timeout_stays_at_the_error_hard_cap(self) -> None:
+        reader = FakeReader(
+            AgentStateResult.observed(RUNTIME_AWAITING_INPUT),
+            AgentStateResult.observed(RUNTIME_AWAITING_INPUT),
+        )
+        transport = FakeTransport(read_pane=[PaneReadResult.success(BODY)])
+        wait = FakeWait(WaitResult.error(), WaitResult.timeout(), WaitResult.timeout())
+        result = _rail(reader, transport, wait, max_enter_resends=2).drive_turn_start(
+            TARGET, BODY, screen_guard=_clear_screen
+        )
+        self.assertEqual(result.enter_resends, 1)
+        self.assertEqual(result.first_wait_kind, WAIT_ERROR)
+        self.assertEqual(result.wait_kind, WAIT_TIMEOUT)
+        self.assertEqual(result.resend_skipped_reason, RESEND_SKIP_BUDGET_EXHAUSTED)
+        self.assertEqual(len(transport.send_text_calls), 1)
+        self.assertEqual(len(transport.send_keys_calls), 2)
+
+    def test_timeout_only_sequence_keeps_the_configured_larger_budget(self) -> None:
+        reader = FakeReader(
+            AgentStateResult.observed(RUNTIME_AWAITING_INPUT),
+            AgentStateResult.observed(RUNTIME_AWAITING_INPUT),
+            AgentStateResult.observed(RUNTIME_AWAITING_INPUT),
+        )
+        transport = FakeTransport(
+            read_pane=[PaneReadResult.success(BODY), PaneReadResult.success(BODY)]
+        )
+        wait = FakeWait(WaitResult.timeout(), WaitResult.timeout(), WaitResult.changed())
+        result = _rail(reader, transport, wait, max_enter_resends=2).drive_turn_start(
+            TARGET, BODY, screen_guard=_clear_screen
+        )
+        self.assertEqual(result.outcome, OUTCOME_STARTED)
+        self.assertEqual(result.enter_resends, 2)
+        self.assertEqual(result.first_wait_kind, WAIT_TIMEOUT)
+        self.assertEqual(result.wait_kind, WAIT_CHANGED)
+        self.assertEqual(result.resend_skipped_reason, RESEND_SKIP_NONE)
+        self.assertEqual(len(transport.send_text_calls), 1)
+        self.assertEqual(len(transport.send_keys_calls), 3)
+        self.assertEqual(
+            wait.timeouts,
+            [
+                DEFAULT_WAIT_TIMEOUT_MS,
+                DEFAULT_WAIT_TIMEOUT_MS,
+                DEFAULT_WAIT_TIMEOUT_MS,
+            ],
+        )
+
     def test_no_error_resend_when_a_startup_screen_is_on_the_pane(self) -> None:
         # 実装要件 3 / 除外条件: workspace trust・権限確認・選択画面を検出したら再送しない。
         # #13760: a blind Enter into one accepts its default and destroys the request.
