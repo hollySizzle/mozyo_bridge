@@ -376,16 +376,21 @@ def _says_not_found(result, service_target: str) -> bool:
     """
     if result.returncode not in _LAUNCHCTL_NOT_FOUND_CODES:
         return False
-    message = f"{getattr(result, 'stderr', '') or ''}\n{getattr(result, 'stdout', '') or ''}".lower()
-    if any(phrase in message for phrase in _LAUNCHCTL_UNREADABLE_PHRASES):
+    message = f"{getattr(result, 'stderr', '') or ''}\n{getattr(result, 'stdout', '') or ''}"
+    # Two readings of one string, kept apart on purpose (review j#102327 finding r6f1). *Wording* is
+    # prose whose capitalization is not a contract, so phrases are matched case-folded. *Identity* is
+    # the label launchd keys the job off, and folding its case would make a DIFFERENT label's absence
+    # read as ours — so identity is matched against the raw bytes launchctl printed.
+    wording = message.lower()
+    if any(phrase in wording for phrase in _LAUNCHCTL_UNREADABLE_PHRASES):
         return False
-    if not any(phrase in message for phrase in _LAUNCHCTL_NOT_FOUND_PHRASES):
+    if not any(phrase in wording for phrase in _LAUNCHCTL_NOT_FOUND_PHRASES):
         return False
     # Bind the reading to what we actually asked about: a not-found message naming some OTHER label
     # says nothing about ours. The full target (gui/<uid>/<label>) or the bare label both count,
     # since the exact wording is not a contract — but the match must be an EXACT token, not a
     # substring (review j#102235 finding r4f1).
-    target = (service_target or "").lower()
+    target = service_target or ""
     label = target.rsplit("/", 1)[-1]
     if not label:
         return False
@@ -395,9 +400,18 @@ def _says_not_found(result, service_target: str) -> bool:
 def _names_exactly(message: str, token: str) -> bool:
     """Whether ``message`` names ``token`` as launchd's own **quoted** service name.
 
-    Only one form is accepted: the token inside double quotes, exactly. That is how launchctl
+    Only one form is accepted: the token inside double quotes, byte for byte. That is how launchctl
     renders the name it could not find, and the quotes are what make the boundary *observed* rather
     than *assumed*.
+
+    ``message`` must be the RAW launchctl output, never a case-folded copy. Comparing folded strings
+    made ``"ORG.MOZYO-BRIDGE.CALLBACK-SUPERVISOR.DRAIN"`` — a different byte sequence, and therefore
+    a label this adapter never installed — satisfy the check for our own label and authorize
+    unlinking our plist (review j#102327 finding r6f1). Apple documents ``Label`` only as a string
+    that uniquely identifies a job; that it may be compared case-insensitively is nowhere stated, so
+    it is an assumption, and an assumption is not something to hang a destructive migration on. Two
+    labels differing only in case are treated as different labels until a real host says otherwise
+    (#15194) — the direction that costs a retry rather than someone else's registration.
 
     The previous version inferred boundaries from a character allowlist — alphanumerics plus
     ``.-_`` — treating anything else as a delimiter. Apple documents ``Label`` only as a unique

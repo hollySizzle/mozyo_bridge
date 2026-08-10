@@ -1068,6 +1068,68 @@ class LegacyDrainMigrationTest(_DarwinCase):
             sl._names_exactly(f"Could not find service {owned} in domain for gui", owned)
         )
 
+    def test_a_label_differing_only_in_case_is_a_different_label(self) -> None:
+        # Review j#102327 finding r6f1. The message and the queried target were both lower-cased
+        # before the quoted comparison, so a not-found naming `ORG.MOZYO-BRIDGE...DRAIN` — a
+        # different byte sequence, and therefore a job this adapter never installed — read as a
+        # confirmed absence of OURS and could authorize unlinking our plist. Apple documents `Label`
+        # as a string that uniquely identifies a job and says nothing about case-insensitive
+        # matching, so folding case here was an assumption, not a contract.
+        owned = sl.LEGACY_DRAIN_AGENT.label
+        target = sl._service_target(sl.LEGACY_DRAIN_AGENT)
+        variants = (
+            (owned.upper(), "the bare label upper-cased"),
+            (owned.title(), "the bare label title-cased"),
+            (owned[:-1] + owned[-1].upper(), "a single character of the bare label"),
+            (target.upper(), "the full target upper-cased"),
+        )
+        for other, why in variants:
+            rendered = f'Could not find service "{other}" in domain for gui'
+            self.assertFalse(sl._names_exactly(rendered, owned), why)
+            self.assertFalse(sl._names_exactly(rendered, target), why)
+            state = sl._probe(
+                FakeRunner(print_result=_result(113, stderr=rendered)),
+                agent=sl.LEGACY_DRAIN_AGENT,
+            )["state"]
+            self.assertEqual(state, sl.PROBE_UNREADABLE, why)
+
+    def test_the_wording_stays_case_insensitive_while_the_identity_does_not(self) -> None:
+        # The two readings of one string are deliberately different. launchctl's prose is not an
+        # API, so its capitalization cannot be a contract — but the label it names is an identity,
+        # and identities are compared as bytes. A shouted phrase around OUR exact label still reads
+        # as a confirmed absence.
+        owned = sl.LEGACY_DRAIN_AGENT.label
+        state = sl._probe(
+            FakeRunner(
+                print_result=_result(113, stderr=f'COULD NOT FIND SERVICE "{owned}" IN DOMAIN')
+            ),
+            agent=sl.LEGACY_DRAIN_AGENT,
+        )["state"]
+        self.assertEqual(state, sl.PROBE_CONFIRMED_ABSENT)
+
+    def test_a_case_folded_label_not_found_keeps_the_plist_end_to_end(self) -> None:
+        # The consequence the two layers above exist to prevent, exercised through the destructive
+        # path: an unreadable state must leave the retired registration on disk.
+        _write_home_credential(self.mozyo_home)
+        legacy = _legacy_drain_plist(self.os_home)
+        other = sl.LEGACY_DRAIN_AGENT.label.upper()
+
+        class _CaseFoldedLabelNotFound:
+            def __call__(self, argv):
+                argv = list(argv)
+                target = argv[2] if len(argv) > 2 else ""
+                if sl.LEGACY_DRAIN_AGENT.label in target:
+                    code = 113 if argv[1] == "print" else 1
+                    return _result(
+                        code, stderr=f'Could not find service "{other}" in domain for gui'
+                    )
+                return _result(0)
+
+        result = sl.remove_legacy_drain(os_home=self.os_home, runner=_CaseFoldedLabelNotFound())
+        self.assertFalse(result["removed"])
+        self.assertEqual(result["reason"], sl.REASON_LEGACY_DRAIN_STATE_UNREADABLE)
+        self.assertTrue(legacy.exists())
+
     def test_a_not_found_about_a_LONGER_label_is_not_about_ours(self) -> None:
         # Review j#102235 finding r4f1. `label in message` is a substring test, and our label is a
         # PREFIX of any longer one, so a not-found about `<label>.helper` satisfied the check for

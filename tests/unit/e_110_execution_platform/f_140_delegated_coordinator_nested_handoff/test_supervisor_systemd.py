@@ -671,6 +671,29 @@ class RestartTest(_LinuxCase):
         self.assertEqual(result["reason"], ss.REASON_SERVICE_NOT_LOADED)
         self.assertNotIn("restart", runner.verbs)
 
+    def test_restart_and_status_classify_one_manager_answer_the_same_way(self) -> None:
+        # Review j#102327 finding r6f2. `restart` compared the raw value to `active` while `status`
+        # ran the same reply through the closed vocabulary, so one `ActiveState=reloading` timer was
+        # `loaded` to status and `service_not_loaded` to restart — two answers about one state
+        # machine. Both verbs now read the same classification.
+        self._install()
+        for active in ("active", "reloading", "inactive", "failed", "activating",
+                       "deactivating", "maintenance", "ACTIVE", "RELOADING", "INACTIVE", ""):
+            show_map = {ss.SUPERVISOR_UNIT.timer_unit: _timer_show(active=active)}
+            status = ss.service_status(
+                os_home=self.os_home, mozyo_home=self.mozyo_home,
+                runner=self._runner(show_map=show_map), which=_which_found,
+            )
+            runner = self._runner(show_map=show_map)
+            result = ss.restart(
+                os_home=self.os_home, mozyo_home=self.mozyo_home,
+                runner=runner, which=_which_found,
+            )
+            self.assertEqual(result["performed"], status["loaded"], active)
+            self.assertEqual("restart" in runner.verbs, status["loaded"], active)
+            if not status["loaded"]:
+                self.assertEqual(result["reason"], ss.REASON_SERVICE_NOT_LOADED, active)
+
     def test_restart_refuses_an_unreadable_service_unit(self) -> None:
         self._install()
         ss.service_unit_path(self.os_home).write_text("not a unit at all\n", encoding="utf-8")

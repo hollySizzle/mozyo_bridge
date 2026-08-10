@@ -555,6 +555,15 @@ signal を含まない。
 plist 削除の authorization に到達し得た。quote は境界を *観測* にする（推測ではない）。quote されない文面では
 束縛を証明できないため `unreadable` へ倒す —— **実機文面を確定できるまで over-refusal を選ぶ**（#15194）。
 
+(3) の完全一致は **raw byte の比較**であり、照合前に case を畳まない（review j#102327 finding r6f1）。文面
+（not-found 語・権限 signal）は散文であり大小文字は契約でないため case-insensitive に照合してよいが、**label は
+identity** である。両者を同じ正規化文字列で扱っていたため、`ORG.MOZYO-BRIDGE...DRAIN` という **別の byte 列**
+—— したがって本 adapter が install していない別 job —— の not-found が owned の確認済み不在として通り、plist 削除の
+authorization に到達し得た。Apple 正本は `Label` を「job を一意に識別する文字列」と述べるのみで
+**case-insensitive 照合を規定していない**ため、case-fold は契約ではなく *こちらの仮定*であった。大小文字だけが
+異なる 2 つの label は、実機が別を示すまで **別 label** として扱う（#15194）。文面用の正規化文字列と identity 用の
+raw 文字列は実装上も分離する。
+
 以前は (1) **または** (2) で足りるとしていたため、`113` + `Operation not permitted`（権限失敗）が不存在と判定され
 所有 plist を削除した。単独の signal はこの帰結を負うには弱すぎる: launchctl の man page は成功=0 / 失敗=非0 しか
 定めておらず **113 を不存在の契約としていない**し、`print` 出力は **API ではなく変更され得ると明記**されている。
@@ -578,6 +587,18 @@ Linux の `ActiveState` 分類は **closed vocabulary** である（review j#102
 将来 systemd が追加する値までを「確認済み不在」と *断定* していた。macOS 側の「unknown を *absent* へ畳まない」
 規則と同じ規則の裏返しであり、**未知値をいかなる確認済み状態へも畳まない**。`loaded` 投影は
 `probe_state == loaded` から導出し、同一 state machine について 2 つの答えが出ないようにする。
+
+この照合も **case-sensitive** である（review j#102327 finding r6f2）。値を lower() してから集合照合していたため
+`INACTIVE` が確認済み不在、`ACTIVE` が確認済み稼働として通っていたが、systemd upstream の D-Bus 契約が列挙する
+`ActiveState` は **lowercase literal** であり、大小文字違いは本実装が「認識済み」と宣言した語彙ではない。
+すなわち unknown であり `unreadable` へ倒す（macOS 側 r6f1 と同型の「未確認の同一性を確認済み事実へ昇格しない」
+規則）。strip するのは `key=value` 行の解析に由来する空白のみである。
+
+**分類の consumer は 1 つの state machine に 2 つの答えを出さない**（同 finding）。`restart` は raw 値を
+`active` と直接比較していたため、`reloading` の timer が status では `loaded`、restart では
+`service_not_loaded` になっていた。`restart` は status と **同一の分類**を読み、`loaded` の positive な確認が
+取れたときだけ実行する。確認済み不在と読み取り失敗はどちらも拒否側であり、これは macOS adapter の `restart` が
+既に持つ契約と同じである。
 
 **順序は「先に退役、後に install」**であり、これが partial failure 下で不変条件を保つ順序である。逆順（install
 してから migration）にすると途中失敗時に **登録が 2 個** 残る——本変更が終わらせようとしている状態そのものであ

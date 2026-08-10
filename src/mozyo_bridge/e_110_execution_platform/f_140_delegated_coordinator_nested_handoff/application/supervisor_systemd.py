@@ -289,10 +289,18 @@ def _probe_state(shown: dict[str, str], *, manager_available: bool) -> str:
     Note the symmetry with the macOS side: there the rule is "do not fold unknown into *absent*",
     and here it is the same rule pointing the other way — do not fold unknown into any *confirmed*
     state. A value systemd adds in a future release must read as "I do not know", never as a fact.
+
+    That is why the comparison is **case-sensitive**. Case-folding the value first reopened the very
+    vocabulary this function closes: ``INACTIVE`` read as a confirmed absence and ``ACTIVE`` as a
+    confirmed run, though neither is a token systemd's D-Bus interface enumerates — upstream lists
+    ``ActiveState`` as lowercase literals (review j#102327 finding r6f2). A value whose case we have
+    not seen documented is a value this code has not been told the meaning of, which is exactly the
+    unknown case. Only ``strip()`` is applied, because surrounding whitespace comes from parsing the
+    ``key=value`` line, not from the manager's answer.
     """
     if not manager_available:
         return PROBE_UNREADABLE
-    active_state = (shown.get("ActiveState") or "").strip().lower()
+    active_state = (shown.get("ActiveState") or "").strip()
     if not active_state:
         return PROBE_UNREADABLE
     if active_state in _ACTIVE_STATES:
@@ -408,8 +416,9 @@ def restart(
     installed service unit, an owned unit with no single parseable ``ExecStart``, an unhealthy
     ``--home`` pin, a requested ``mozyo_home`` that differs from the pin, an installed command that
     no longer matches what an install would write now (drift — reinstall to change), a missing
-    executable, or an owned timer that is not active. A non-ready credential does not block a
-    restart, for the same reason it does not block an install.
+    executable, or an owned timer the shared probe does not classify as ``loaded`` (a confirmed stop
+    and an unreadable state alike). A non-ready credential does not block a restart, for the same
+    reason it does not block an install.
     """
     blocked = _preflight("restart", runner)
     if blocked is not None:
@@ -439,10 +448,13 @@ def restart(
     if installed_argv != expected:
         return _refused("restart", REASON_INSTALLED_COMMAND_DRIFT)
     readiness = classify_credential_readiness(mozyo_home=pinned_home)
-    timer_active = _show(runner, SUPERVISOR_UNIT.timer_unit, ("ActiveState",)).get(
-        "ActiveState"
-    ) == "active"
-    if not timer_active:
+    # The SAME classification `service_status` publishes, not a second reading of one state machine
+    # (review j#102327 finding r6f2). Comparing the raw value to `active` here made `reloading` — a
+    # state status reports as loaded — refuse as `service_not_loaded`, so the two verbs answered
+    # differently about one manager reply. Proceeding needs a positive `loaded`: a confirmed absence
+    # and an unreadable read both refuse, which is the launchd adapter's contract for restart too.
+    timer_shown = _show(runner, SUPERVISOR_UNIT.timer_unit, ("ActiveState",))
+    if _probe_state(timer_shown, manager_available=True) != PROBE_LOADED:
         return _refused(
             "restart", REASON_SERVICE_NOT_LOADED, credential_readiness=readiness
         )

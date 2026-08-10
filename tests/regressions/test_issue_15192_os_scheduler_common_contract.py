@@ -326,6 +326,35 @@ class ProbeStateProjectionTest(unittest.TestCase):
             )
             self.assertEqual(status["probe_state"], want, state)
 
+    def test_the_closed_vocabulary_is_matched_case_sensitively(self) -> None:
+        # Review j#102327 finding r6f2. The value was lower-cased before the lookup, which reopened
+        # the vocabulary the table above closes: `INACTIVE` reported a confirmed absence and
+        # `ACTIVE` a confirmed run, though systemd's D-Bus interface enumerates `ActiveState` as
+        # lowercase literals and neither spelling is a token this code was told the meaning of.
+        for state in ("ACTIVE", "Active", "RELOADING", "INACTIVE", "Inactive", "FAILED"):
+            status = _systemd_status(
+                manager_available=True, timer_output=f"ActiveState={state}\n"
+            )
+            self.assertEqual(status["probe_state"], ss.PROBE_UNREADABLE, state)
+        # Only the whitespace that comes from parsing the `key=value` line is stripped: that is the
+        # reader's own framing, not part of the manager's answer.
+        padded = _systemd_status(
+            manager_available=True, timer_output="ActiveState=  active  \n"
+        )
+        self.assertEqual(padded["probe_state"], ss.PROBE_LOADED)
+
+    def test_neither_adapter_folds_case_to_reach_a_confirmed_state(self) -> None:
+        # The cross-adapter shape of r6f1 / r6f2: one is an identity (a launchd label), the other a
+        # state token, and folding either one turned an unrecognized input into a confirmed fact —
+        # on macOS into an absence that authorizes deleting a registration.
+        owned = sl.LEGACY_DRAIN_AGENT.label
+        macos = _launchd_status(
+            _fake_result(113, stderr=f'Could not find service "{owned.upper()}" in domain')
+        )
+        self.assertEqual(macos["probe_state"], sl.PROBE_UNREADABLE)
+        linux = _systemd_status(manager_available=True, timer_output="ActiveState=INACTIVE\n")
+        self.assertEqual(linux["probe_state"], ss.PROBE_UNREADABLE)
+
     def test_loaded_and_probe_state_never_disagree(self) -> None:
         # One state machine, one answer: `loaded` is derived from the same classification, so the
         # projection cannot say "not running" while the state token says otherwise (and vice versa).
