@@ -61,12 +61,19 @@ write is not zero-write, and no amount of extra prechecking fixes it — the gap
 re-resolving a path a second time.
 
 ``sqlite3`` cannot be handed a descriptor (its only input is a path), so this store does not use
-it. It does not need to: one record per lane route, replaced whole. The home is opened ONCE with
-``O_DIRECTORY | O_NOFOLLOW`` into a descriptor, and every subsequent operation is relative to that
-descriptor with ``O_NOFOLLOW`` — create, read, write, atomic rename. A path swapped after the
-directory is opened cannot redirect anything, because nothing re-resolves the path: there is no
+it. It does not need to: one record per lane route, replaced whole. The filesystem root is opened
+with ``O_DIRECTORY | O_NOFOLLOW`` and every home component is walked/created relative to the
+descriptor for its parent with the same no-follow flags. JSON, nonce and lock operations are then
+relative to the resulting home descriptor — create, read, write, atomic rename. A component swap
+cannot redirect a later operation through a newly resolved path because there is no path-wide
 second resolution to lose. That is the "stable directory/file descriptor" the required direction
 asks for, met rather than weakened.
+
+Atomic rename protects one publication, not the read-modify-write that precedes it. A regular,
+single-linked home-relative lock therefore serializes the entire initialization/load/update/
+publication sequence with ``LOCK_EX``. Reads and initialization probes hold ``LOCK_SH`` through
+their complete snapshot, and never create a missing home or lock. Missing, replaced or unsafe lock
+identity is a typed fail-closed refusal.
 
 Store identity mirrors the sibling fences: a nonce sidecar makes a deleted / replaced / foreign
 store fail CLOSED. Unlike them there is no ``bootstrap`` / ``recover`` ceremony, because the
@@ -80,18 +87,26 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import stat
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - the managed terminal runtime is POSIX
+    fcntl = None  # type: ignore[assignment]
 
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
 AUDIT_FAILURE_TERMINAL_DECISION_SCHEMA_VERSION = 1
 AUDIT_FAILURE_TERMINAL_DECISION_SIDECAR_SUFFIX = ".nonce"
+AUDIT_FAILURE_TERMINAL_DECISION_LOCK_SUFFIX = ".lock"
 #: The records file's basename under the home. A plain JSON document, replaced whole: one record
-#: per lane route, no concurrent-writer CAS to model (single use is the lifecycle revision), and —
-#: decisively — a format this module can write through a descriptor.
+#: per lane route, serialized by a home-relative advisory lock, and — decisively — a format this
+#: module can write through a descriptor.
 AUDIT_FAILURE_TERMINAL_DECISION_FILENAME = "audit-failure-terminal-decision.json"
 _TEMP_SUFFIX = ".tmp"
 
@@ -209,48 +224,6 @@ def _validation_errors(decision: TerminalDecision) -> "tuple[str, ...]":
     return tuple(problems)
 
 
-def _reject_unsafe_ancestors(home: Path) -> None:
-    """Refuse a home reachable only through a link, at ANY ancestor (review j#102582 finding 1).
-
-    The home ITSELF is not checked here — :meth:`AuditFailureTerminalDecisionStore._open_home_fd`
-    opens it with ``O_NOFOLLOW``, which refuses a symlinked home atomically rather than by a
-    precheck that can go stale. What this adds is the chain ABOVE it: an ancestor link would be
-    traversed while resolving the home, so it must be refused before that open is attempted.
-
-    Prechecking is deliberately confined to this. Everything below the home is opened relative to
-    the resulting descriptor, so there is no second path resolution for a swap to win — which is
-    why R6's leaf prechecks are gone rather than added to.
-    """
-    import stat as stat_module
-
-    components: list[Path] = []
-    cursor = Path(home).parent
-    while True:
-        components.append(cursor)
-        if cursor.parent == cursor:
-            break
-        cursor = cursor.parent
-    for component in reversed(components):
-        try:
-            component_stat = component.lstat()
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            raise AuditFailureTerminalDecisionError(
-                f"decision store path component {component} is unreadable "
-                f"({type(exc).__name__}); fail closed"
-            ) from exc
-        if stat_module.S_ISLNK(component_stat.st_mode):
-            raise AuditFailureTerminalDecisionError(
-                f"decision store path component {component} is a symlink; refusing to write an "
-                "authority record through a link that can point outside the mozyo-bridge home"
-            )
-        if not stat_module.S_ISDIR(component_stat.st_mode):
-            raise AuditFailureTerminalDecisionError(
-                f"decision store path component {component} is not a directory; fail closed"
-            )
-
-
 class AuditFailureTerminalDecisionStore:
     """Read / write the coordinator's decisions, entirely through a stable directory descriptor.
 
@@ -261,44 +234,195 @@ class AuditFailureTerminalDecisionStore:
     """
 
     def __init__(self, path: Optional[Path] = None, *, home: Optional[Path] = None) -> None:
-        self.path = (
+        declared = (
             Path(path) if path is not None else audit_failure_terminal_decision_path(home)
         )
+        # Bind a relative declaration to this cwd once, without following any symlink.  The
+        # component walk below then starts from the filesystem root and never resolves this string
+        # as a whole.
+        self.path = Path(os.path.abspath(os.fspath(declared)))
         #: The DECLARED home. Opened once per operation into a descriptor; every artifact is
         #: created and opened relative to THAT, never by re-resolving a path.
         self.home = self.path.parent
         self.sidecar_path = self.path.with_name(
             self.path.name + AUDIT_FAILURE_TERMINAL_DECISION_SIDECAR_SUFFIX
         )
+        self.lock_path = self.path.with_name(
+            self.path.name + AUDIT_FAILURE_TERMINAL_DECISION_LOCK_SUFFIX
+        )
 
     # -- the stable directory descriptor -----------------------------------
 
     def _open_home_fd(self, *, create: bool) -> int:
-        """Open the declared home as a descriptor, or refuse (review j#102582 finding 1).
+        """Open/create the declared home by an anchored no-follow component walk.
 
-        ``O_DIRECTORY | O_NOFOLLOW`` on the home itself, so a symlinked home never opens at all,
-        and the ancestors are validated first so a link higher in the chain cannot have been
-        traversed to reach it. Everything afterwards uses ``dir_fd=`` against this descriptor: the
-        path is resolved ONCE, and a swap after that has nothing left to redirect.
+        A path-wide ``lstat`` precheck followed by ``mkdir`` / ``open(path)`` has a swap window:
+        the second operation resolves every ancestor again.  Instead this method opens the trusted
+        filesystem root once, then opens (or creates) each component relative to the descriptor
+        obtained for its parent.  A component swapped before its open is rejected by
+        ``O_NOFOLLOW``; one swapped after its open cannot redirect later operations.
         """
-        _reject_unsafe_ancestors(self.home)
-        if create:
-            try:
-                self.home.mkdir(parents=True, exist_ok=True)
-            except OSError as exc:
-                raise AuditFailureTerminalDecisionError(
-                    f"decision store home {self.home} could not be created "
-                    f"({type(exc).__name__}); fail closed"
-                ) from exc
+        if self.home.anchor != os.sep:
+            raise AuditFailureTerminalDecisionError(
+                f"decision store home {self.home} is not rooted at the filesystem root; "
+                "fail closed"
+            )
+        if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+            raise AuditFailureTerminalDecisionError(
+                "decision store component walk requires O_DIRECTORY and O_NOFOLLOW; "
+                "this platform cannot enforce the no-follow contract, so fail closed"
+            )
+        flags = (
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+        )
         try:
-            return os.open(
-                self.home, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+            current_fd = os.open(os.sep, flags)
+        except OSError as exc:
+            raise AuditFailureTerminalDecisionError(
+                f"decision store filesystem root could not be opened "
+                f"({type(exc).__name__}); fail closed"
+            ) from exc
+        try:
+            for component in self.home.parts[1:]:
+                if not component or component in (".", ".."):
+                    raise AuditFailureTerminalDecisionError(
+                        f"decision store home {self.home} has an unsafe path component; "
+                        "fail closed"
+                    )
+                try:
+                    next_fd = os.open(component, flags, dir_fd=current_fd)
+                except FileNotFoundError:
+                    if not create:
+                        raise AuditFailureTerminalDecisionError(
+                            f"decision store home {self.home} does not exist; fail closed"
+                        ) from None
+                    try:
+                        os.mkdir(component, 0o700, dir_fd=current_fd)
+                    except FileExistsError:
+                        # A concurrent creator won.  The no-follow open below decides whether the
+                        # winner is the directory component this walk is allowed to adopt.
+                        pass
+                    except OSError as exc:
+                        raise AuditFailureTerminalDecisionError(
+                            f"decision store home component {component} could not be created "
+                            f"({type(exc).__name__}); fail closed"
+                        ) from exc
+                    try:
+                        next_fd = os.open(component, flags, dir_fd=current_fd)
+                    except OSError as exc:
+                        raise AuditFailureTerminalDecisionError(
+                            f"decision store home component {component} could not be opened "
+                            f"after creation ({type(exc).__name__}); fail closed"
+                        ) from exc
+                except OSError as exc:
+                    raise AuditFailureTerminalDecisionError(
+                        f"decision store home component {component} could not be opened as a "
+                        f"directory without following a link ({type(exc).__name__}); fail closed"
+                    ) from exc
+                os.close(current_fd)
+                current_fd = next_fd
+            result = current_fd
+            current_fd = -1
+            return result
+        finally:
+            if current_fd >= 0:
+                os.close(current_fd)
+
+    def _require_safe_lock(self, dir_fd: int, lock_fd: int) -> None:
+        """Require one regular, single-linked lock still visible at the opened name."""
+        try:
+            opened = os.fstat(lock_fd)
+            visible = os.stat(
+                self.lock_path.name, dir_fd=dir_fd, follow_symlinks=False
             )
         except OSError as exc:
             raise AuditFailureTerminalDecisionError(
-                f"decision store home {self.home} could not be opened as a directory without "
+                f"decision store lock {self.lock_path.name} could not be verified "
+                f"({type(exc).__name__}); fail closed"
+            ) from exc
+        for label, info in (("opened", opened), ("visible", visible)):
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise AuditFailureTerminalDecisionError(
+                    f"decision store lock {self.lock_path.name} is not a single-linked regular "
+                    f"file at its {label} identity; fail closed"
+                )
+        if (opened.st_dev, opened.st_ino) != (visible.st_dev, visible.st_ino):
+            raise AuditFailureTerminalDecisionError(
+                f"decision store lock {self.lock_path.name} changed identity while opening; "
+                "fail closed"
+            )
+
+    def _open_lock_fd(self, dir_fd: int, *, create: bool) -> Optional[int]:
+        """Open the home-relative lock without following or blocking on an unsafe file type."""
+        flags = (
+            (os.O_RDWR if create else os.O_RDONLY)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        if create:
+            flags |= os.O_CREAT
+        try:
+            lock_fd = os.open(self.lock_path.name, flags, 0o600, dir_fd=dir_fd)
+        except FileNotFoundError:
+            if not create:
+                return None
+            raise AuditFailureTerminalDecisionError(
+                f"decision store lock {self.lock_path.name} disappeared while opening; "
+                "fail closed"
+            ) from None
+        except OSError as exc:
+            raise AuditFailureTerminalDecisionError(
+                f"decision store lock {self.lock_path.name} could not be opened without "
                 f"following a link ({type(exc).__name__}); fail closed"
             ) from exc
+        try:
+            self._require_safe_lock(dir_fd, lock_fd)
+        except AuditFailureTerminalDecisionError:
+            os.close(lock_fd)
+            raise
+        return lock_fd
+
+    @contextmanager
+    def _locked_home(self, *, create: bool, exclusive: bool) -> Iterator[int]:
+        """Hold the home descriptor and one consistent store lock for an entire operation."""
+        if fcntl is None:
+            raise AuditFailureTerminalDecisionError(
+                "decision store advisory locking is unavailable; refusing to access shared "
+                "state without the required lock"
+            )
+        dir_fd = self._open_home_fd(create=create)
+        lock_fd: Optional[int] = None
+        locked = False
+        try:
+            lock_fd = self._open_lock_fd(dir_fd, create=create)
+            if lock_fd is None:
+                raise AuditFailureTerminalDecisionError(
+                    f"decision store {self.path} has no coordination lock; fail closed"
+                )
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+                locked = True
+            except OSError as exc:
+                raise AuditFailureTerminalDecisionError(
+                    f"decision store lock {self.lock_path.name} could not be acquired "
+                    f"({type(exc).__name__}); fail closed"
+                ) from exc
+            # Refuse a replacement lock generation installed while this opener was waiting.
+            self._require_safe_lock(dir_fd, lock_fd)
+            yield dir_fd
+        finally:
+            if lock_fd is not None:
+                if locked:
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                os.close(lock_fd)
+            os.close(dir_fd)
 
     def _read_file(self, dir_fd: int, name: str) -> Optional[str]:
         """Read one artifact relative to the home descriptor, never following a link."""
@@ -352,27 +476,19 @@ class AuditFailureTerminalDecisionStore:
 
     def _read_sidecar_nonce(self) -> Optional[str]:
         try:
-            dir_fd = self._open_home_fd(create=False)
+            with self._locked_home(create=False, exclusive=False) as dir_fd:
+                value = self._read_file(dir_fd, self.sidecar_path.name)
         except AuditFailureTerminalDecisionError:
             return None
-        try:
-            value = self._read_file(dir_fd, self.sidecar_path.name)
-        finally:
-            os.close(dir_fd)
         return (value or "").strip() or None
 
     def is_initialized(self) -> bool:
         try:
-            dir_fd = self._open_home_fd(create=False)
+            with self._locked_home(create=False, exclusive=False) as dir_fd:
+                nonce = (self._read_file(dir_fd, self.sidecar_path.name) or "").strip()
+                document = self._read_file(dir_fd, self.path.name)
         except AuditFailureTerminalDecisionError:
             return False
-        try:
-            nonce = (self._read_file(dir_fd, self.sidecar_path.name) or "").strip()
-            document = self._read_file(dir_fd, self.path.name)
-        except AuditFailureTerminalDecisionError:
-            return False
-        finally:
-            os.close(dir_fd)
         if not nonce or document is None:
             return False
         try:
@@ -507,8 +623,7 @@ class AuditFailureTerminalDecisionStore:
             integration_branch=decision.integration_branch.strip(),
             recorded_at=stamp,
         )
-        dir_fd = self._open_home_fd(create=True)
-        try:
+        with self._locked_home(create=True, exclusive=True) as dir_fd:
             existing = self._read_file(dir_fd, self.sidecar_path.name)
             nonce = (existing or "").strip()
             if not nonce:
@@ -532,8 +647,6 @@ class AuditFailureTerminalDecisionStore:
                 self.path.name,
                 json.dumps(document, ensure_ascii=False, sort_keys=True, indent=2),
             )
-        finally:
-            os.close(dir_fd)
         return recorded
 
     # -- the retire's read -------------------------------------------------
@@ -545,39 +658,37 @@ class AuditFailureTerminalDecisionStore:
         has no decision" and "the decision surface is gone" are different operational problems, and
         both refuse.
         """
-        dir_fd = self._open_home_fd(create=False)
-        try:
+        with self._locked_home(create=False, exclusive=False) as dir_fd:
             document = self._load(dir_fd)
-        finally:
-            os.close(dir_fd)
-        payload = document["decisions"].get(self._key(route))
-        if not isinstance(payload, dict):
-            return None
-        workspace_id, lane_id = route.as_row()
-        try:
-            return TerminalDecision(
-                workspace_id=workspace_id,
-                lane_id=lane_id,
-                decision_id=str(payload["decision_id"]),
-                lane_generation=int(payload["lane_generation"]),
-                lane_revision=int(payload["lane_revision"]),
-                issue=str(payload["issue"]),
-                audit_journal=str(payload["audit_journal"]),
-                successor_issue=str(payload["successor_issue"]),
-                successor_review_journal=str(payload["successor_review_journal"]),
-                head=str(payload["head"]),
-                integration_branch=str(payload["integration_branch"]),
-                recorded_at=str(payload.get("recorded_at", "")),
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise AuditFailureTerminalDecisionError(
-                f"decision store {self.path} carries an unreadable record for this route "
-                f"({type(exc).__name__}); fail closed"
-            ) from exc
+            payload = document["decisions"].get(self._key(route))
+            if not isinstance(payload, dict):
+                return None
+            workspace_id, lane_id = route.as_row()
+            try:
+                return TerminalDecision(
+                    workspace_id=workspace_id,
+                    lane_id=lane_id,
+                    decision_id=str(payload["decision_id"]),
+                    lane_generation=int(payload["lane_generation"]),
+                    lane_revision=int(payload["lane_revision"]),
+                    issue=str(payload["issue"]),
+                    audit_journal=str(payload["audit_journal"]),
+                    successor_issue=str(payload["successor_issue"]),
+                    successor_review_journal=str(payload["successor_review_journal"]),
+                    head=str(payload["head"]),
+                    integration_branch=str(payload["integration_branch"]),
+                    recorded_at=str(payload.get("recorded_at", "")),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise AuditFailureTerminalDecisionError(
+                    f"decision store {self.path} carries an unreadable record for this route "
+                    f"({type(exc).__name__}); fail closed"
+                ) from exc
 
 
 __all__ = (
     "AUDIT_FAILURE_TERMINAL_DECISION_FILENAME",
+    "AUDIT_FAILURE_TERMINAL_DECISION_LOCK_SUFFIX",
     "AUDIT_FAILURE_TERMINAL_DECISION_SCHEMA_VERSION",
     "AUDIT_FAILURE_TERMINAL_DECISION_SIDECAR_SUFFIX",
     "AuditFailureTerminalDecisionError",

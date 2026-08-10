@@ -44,6 +44,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1159,6 +1160,155 @@ class TheDecisionStoreIsTheWriterHalf(unittest.TestCase):
                 )
         self.assertEqual(list(outside.iterdir()), [])
 
+    def test_an_ancestor_swap_during_the_component_walk_is_refused_without_writing(self):
+        # Review j#102840 finding r7f1, deterministic reproduction: swap the next component after
+        # its parent descriptor is open but before the component itself is opened.  There is no
+        # sleep or scheduler guess; the intercepted open is the exact race boundary.
+        from mozyo_bridge.core.state import audit_failure_terminal_decision as store_module
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        outside = root / "outside"
+        outside.mkdir()
+        parent = root / "parent"
+        parent.mkdir()
+        moved = root / "parent-before-swap"
+        home = parent / "home"
+        store = AuditFailureTerminalDecisionStore(home=home)
+        repo_root = _attested_repo(root / "repo")
+        real_open = os.open
+        swapped = []
+
+        def swap_then_open(path, flags, mode=0o777, *, dir_fd=None):
+            if path == "parent" and dir_fd is not None and not swapped:
+                parent.rename(moved)
+                parent.symlink_to(outside, target_is_directory=True)
+                swapped.append(True)
+            if dir_fd is None:
+                return real_open(path, flags, mode)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with _attested_coordinator_env(), mock.patch.object(
+            store_module.os, "open", side_effect=swap_then_open
+        ):
+            with self.assertRaises(AuditFailureTerminalDecisionError):
+                store.record(
+                    TerminalDecision(**_decision_fields(head=HEAD)),
+                    repo_root=repo_root,
+                )
+        self.assertEqual(swapped, [True])
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertEqual(list(moved.iterdir()), [])
+
+    def test_two_barrier_released_writers_retain_both_routes(self):
+        # Review j#102840 finding r7f2: atomic rename is not RMW serialization.  Both writers are
+        # released from the same barrier; the home-relative exclusive lock must preserve both
+        # updates instead of allowing the later rename to discard the other route.
+        home = self._home()
+        store = AuditFailureTerminalDecisionStore(home=home)
+        repo_root = _attested_repo(home.parent)
+        start = threading.Barrier(3)
+        errors = []
+
+        def write(lane_id, issue):
+            try:
+                start.wait()
+                store.record(
+                    TerminalDecision(
+                        **_decision_fields(head=HEAD, lane_id=lane_id, issue=issue)
+                    ),
+                    repo_root=repo_root,
+                )
+            except BaseException as exc:  # surfaced in the parent test thread below
+                errors.append(exc)
+
+        routes = ((f"{LANE}_one", "151641"), (f"{LANE}_two", "151642"))
+        threads = [threading.Thread(target=write, args=route) for route in routes]
+        with _attested_coordinator_env():
+            for thread in threads:
+                thread.start()
+            start.wait()
+            for thread in threads:
+                thread.join(timeout=5)
+        self.assertFalse(any(thread.is_alive() for thread in threads), "writer deadlocked")
+        self.assertEqual(errors, [])
+        for lane_id, issue in routes:
+            with self.subTest(lane_id=lane_id):
+                decision = store.read(DecisionRoute(WORKSPACE, lane_id))
+                self.assertIsNotNone(decision)
+                self.assertEqual(decision.issue, issue)
+
+    def test_unsafe_lock_entries_are_typed_refusals_and_write_no_store(self):
+        # The lock is authority-bearing too: following a symlink/hardlink or blocking on a special
+        # file would either escape the home or split the serialization generation.
+        for shape in ("symlink", "hardlink", "directory"):
+            with self.subTest(shape=shape):
+                home = self._home()
+                store = AuditFailureTerminalDecisionStore(home=home)
+                outside = home.parent / f"outside-lock-{shape}"
+                if shape == "directory":
+                    store.lock_path.mkdir()
+                else:
+                    outside.write_text("sentinel", encoding="utf-8")
+                    if shape == "symlink":
+                        store.lock_path.symlink_to(outside)
+                    else:
+                        os.link(outside, store.lock_path)
+                with _attested_coordinator_env():
+                    with self.assertRaises(AuditFailureTerminalDecisionError):
+                        store.record(
+                            TerminalDecision(**_decision_fields(head=HEAD)),
+                            repo_root=_attested_repo(home.parent),
+                        )
+                self.assertFalse(store.path.exists())
+                self.assertFalse(store.sidecar_path.exists())
+                if shape != "directory":
+                    self.assertEqual(outside.read_text(encoding="utf-8"), "sentinel")
+
+    def test_read_and_initialization_checks_create_no_directories_or_lock(self):
+        # A shared read lock is used only when the store already has a lock generation.  Probing an
+        # absent/legacy-unlocked surface must remain side-effect free.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        home = Path(tmp.name) / "missing-parent" / "home"
+        store = AuditFailureTerminalDecisionStore(home=home)
+        self.assertFalse(store.is_initialized())
+        self.assertIsNone(store._read_sidecar_nonce())
+        with self.assertRaises(AuditFailureTerminalDecisionError):
+            store.read(DecisionRoute(WORKSPACE, LANE))
+        self.assertFalse(home.exists())
+
+        home.mkdir(parents=True)
+        self.assertFalse(store.is_initialized())
+        self.assertFalse(store.lock_path.exists())
+
+    def test_read_and_initialization_checks_take_shared_locks(self):
+        from mozyo_bridge.core.state import audit_failure_terminal_decision as store_module
+
+        home = self._home()
+        _record_decision(home, head=HEAD)
+        store = AuditFailureTerminalDecisionStore(home=home)
+        real_flock = store_module.fcntl.flock
+        operations = []
+
+        def observe(fd, operation):
+            operations.append(operation)
+            return real_flock(fd, operation)
+
+        with mock.patch.object(store_module.fcntl, "flock", side_effect=observe):
+            self.assertIsNotNone(store.read(DecisionRoute(WORKSPACE, LANE)))
+            self.assertTrue(store.is_initialized())
+        self.assertEqual(
+            operations,
+            [
+                store_module.fcntl.LOCK_SH,
+                store_module.fcntl.LOCK_UN,
+                store_module.fcntl.LOCK_SH,
+                store_module.fcntl.LOCK_UN,
+            ],
+        )
+
     def test_a_symlinked_home_is_not_read_either(self):
         # The read path refuses on the same chain, so a redirected home cannot supply a decision.
         tmp = tempfile.TemporaryDirectory()
@@ -1224,12 +1374,20 @@ class TheDecisionStoreIsTheWriterHalf(unittest.TestCase):
         # (it cannot be handed a descriptor), so the docstring is stripped before asserting.
         body = source.split('"""', 2)[-1]
         self.assertNotIn("sqlite3", body)
-        # The ONE bare open is the home directory itself, and it carries O_DIRECTORY|O_NOFOLLOW.
-        # Every other artifact operation names a directory descriptor.
+        # The ONE bare open is the trusted filesystem root and carries O_DIRECTORY|O_NOFOLLOW.
+        # Every home component and artifact operation names a directory descriptor.
+        open_home = inspect.getsource(
+            store_module.AuditFailureTerminalDecisionStore._open_home_fd
+        )
+        self.assertIn("os.open(os.sep, flags)", open_home)
+        self.assertIn("os.O_DIRECTORY", open_home)
+        self.assertIn("| os.O_NOFOLLOW", open_home)
         lines = source.splitlines()
         for index, line in enumerate(lines):
             for opener in ("os.open(", "os.rename(", "os.unlink("):
                 if opener not in line:
+                    continue
+                if "os.open(os.sep, flags)" in line:
                     continue
                 window = " ".join(lines[index : index + 4])
                 if "dir_fd" in window or "O_DIRECTORY" in window:
