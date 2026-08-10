@@ -2,10 +2,18 @@
 
 The writer half of the route :mod:`.retire_superseded_audit_failure` reads. Scope decision j#102081
 ruled out enumerating permitted lanes in the package, and design direction j#102092 ruled that the
-binding must instead be an actual coordinator judgement recorded verifiably. This command IS that
-judgement: it resolves the lane's identity from durable state, re-measures the world it is deciding
-about, and writes one :class:`...audit_failure_terminal_decision.TerminalDecision` — a mozyo-owned
-``desired_state`` record no Redmine journal write can produce.
+binding must instead be an actual coordinator judgement recorded verifiably. This command records
+that judgement: it resolves the lane's identity from durable state, re-measures the world it is
+deciding about, and writes one :class:`...audit_failure_terminal_decision.TerminalDecision`.
+
+**CURRENT STATE: a decision recorded here authorizes NO retire** (review j#102582 finding 2). The
+route that reads it is inert — see
+:data:`...superseded_audit_failure_terminal.RECEIPT_AUTHORITY_RESOLVABLE` — because nothing here
+can establish that the writer really was the coordinator runtime, and the coordinator's ruling on
+consultation j#102184 holds it that way until #15195 supplies a Herdr-runtime-issued receipt.
+Until then a record written by this command is a PRE-AUTHORITY DIAGNOSTIC record: it is useful for
+staging and inspecting a terminal disposition, and it unlocks nothing. Everything below describes
+the contract that becomes an authority once #15195 lands, not one operating today.
 
 **Why it re-measures instead of taking the operator's word.** A decision that recorded whatever argv
 said would be a caller-supplied authority wearing a store's clothes (#14539 j#91797 F2). So every
@@ -167,10 +175,12 @@ def register_audit_failure_terminal_decision(
     parser = sublane_sub.add_parser(
         "audit-failure-terminal",
         help=(
-            "Redmine #15166: record the coordinator's decision that ONE lane's independent-audit "
+            "Redmine #15166: stage the coordinator's decision that ONE lane's independent-audit "
             "failure may terminally retire, superseded by a named successor's approved review. "
-            "The decision is the authority `sublane retire --superseded-audit-failure-terminal` "
-            "requires; recording one retires nothing."
+            "**A record written here currently authorizes NO retire**: the route that reads it is "
+            "held as a typed refusal until #15195 supplies a Herdr-runtime-issued receipt "
+            "(#15195 blocks #15166), so this is a PRE-AUTHORITY DIAGNOSTIC record. Recording one "
+            "retires nothing and unlocks nothing."
         ),
     )
     actions = parser.add_subparsers(dest="audit_failure_terminal_command", required=True)
@@ -180,8 +190,10 @@ def register_audit_failure_terminal_decision(
             "Record the decision for --lane-label. The lane's workspace, generation, revision and "
             "head, and the committed integration branch, are MEASURED here — only the four Redmine "
             "identities are the operator's judgement. The retire re-measures every one of them at "
-            "action time and refuses on any drift, so a decision authorizes exactly the world it "
-            "was taken about, once (the lifecycle revision moves when it is used)."
+            "action time and refuses on any drift. **It then refuses anyway** with "
+            "`coordinator_receipt_authority_unresolvable` until #15195 lands: the once-only "
+            "binding to the lifecycle revision is part of the contract that becomes an authority "
+            "then, not a permission this record grants now."
         ),
     )
     record.add_argument("--issue", required=True, help="The source Redmine issue id")

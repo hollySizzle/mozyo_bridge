@@ -53,17 +53,33 @@ authorizes at most one mutation and cannot be replayed against the world it left
 the lifecycle generation the design direction (j#102092) names as one of its canonical sources,
 rather than inventing a second consumption ledger that could disagree with it.
 
-Store identity mirrors the sibling fences: a DB-external nonce sidecar makes a deleted / replaced
-/ foreign store fail CLOSED. Unlike them there is no ``bootstrap`` / ``recover`` ceremony, because
-the asymmetry here is simpler and safer: :meth:`record` — the coordinator's own action — creates
-the store, and every read path refuses when it is absent. A lost store therefore cannot silently
-admit anything; it can only require the coordinator to decide again.
+**Every artifact is created and opened through a STABLE DIRECTORY DESCRIPTOR** (review j#102582
+finding 1). R6 validated the path and then handed the path STRING to ``sqlite3.connect``; the
+reviewer replaced the leaf with a symlink between the check and the open and an external database
+was created (20480 bytes) before the post-hoc identity check fired. Detecting a redirect after the
+write is not zero-write, and no amount of extra prechecking fixes it — the gap is intrinsic to
+re-resolving a path a second time.
+
+``sqlite3`` cannot be handed a descriptor (its only input is a path), so this store does not use
+it. It does not need to: one record per lane route, replaced whole. The home is opened ONCE with
+``O_DIRECTORY | O_NOFOLLOW`` into a descriptor, and every subsequent operation is relative to that
+descriptor with ``O_NOFOLLOW`` — create, read, write, atomic rename. A path swapped after the
+directory is opened cannot redirect anything, because nothing re-resolves the path: there is no
+second resolution to lose. That is the "stable directory/file descriptor" the required direction
+asks for, met rather than weakened.
+
+Store identity mirrors the sibling fences: a nonce sidecar makes a deleted / replaced / foreign
+store fail CLOSED. Unlike them there is no ``bootstrap`` / ``recover`` ceremony, because the
+asymmetry here is simpler and safer: :meth:`record` — the coordinator's own action — creates the
+store, and every read path refuses when it is absent. A lost store therefore cannot silently admit
+anything; it can only require the coordinator to decide again.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import secrets
-import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -73,120 +89,22 @@ from mozyo_bridge.shared.paths import mozyo_bridge_home
 
 AUDIT_FAILURE_TERMINAL_DECISION_SCHEMA_VERSION = 1
 AUDIT_FAILURE_TERMINAL_DECISION_SIDECAR_SUFFIX = ".nonce"
-_STORE_NONCE_KEY = "store_nonce"
-
-_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS audit_failure_terminal_decision (
-    workspace_id TEXT NOT NULL,
-    lane_id TEXT NOT NULL,
-    decision_id TEXT NOT NULL,
-    lane_generation INTEGER NOT NULL,
-    lane_revision INTEGER NOT NULL,
-    issue TEXT NOT NULL,
-    audit_journal TEXT NOT NULL,
-    successor_issue TEXT NOT NULL,
-    successor_review_journal TEXT NOT NULL,
-    head TEXT NOT NULL,
-    integration_branch TEXT NOT NULL,
-    recorded_at TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, lane_id)
-)
-"""
-
-_META_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS store_meta (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-)
-"""
+#: The records file's basename under the home. A plain JSON document, replaced whole: one record
+#: per lane route, no concurrent-writer CAS to model (single use is the lifecycle revision), and —
+#: decisively — a format this module can write through a descriptor.
+AUDIT_FAILURE_TERMINAL_DECISION_FILENAME = "audit-failure-terminal-decision.json"
+_TEMP_SUFFIX = ".tmp"
 
 
 class AuditFailureTerminalDecisionError(RuntimeError):
     """The decision store is absent, replaced, unreachable, or the writer is not attested."""
 
 
-def _reject_unsafe_path(path: Path, *, label: str, home: Path) -> None:
-    """Refuse a store artifact reachable only through a link, at ANY component (j#102181 f2).
-
-    R5 checked ``lstat`` on the FINAL artifact paths alone. The reviewer made ``home`` itself a
-    symlink to an external directory and both the DB and the nonce were written outside the
-    declared home (``symlinked_home_db_written_outside=True`` /
-    ``symlinked_home_nonce_written_outside=True``). Checking the leaf cannot establish "inside the
-    mozyo home" when an ancestor is the link.
-
-    So every component from the filesystem root down to the artifact is examined with ``lstat`` —
-    the LINK, never its target — and any symlink or non-regular / non-directory entry refuses. The
-    artifact must additionally live directly under the canonical ``home``.
-
-    **What this does and does not close, stated rather than overclaimed.** It closes a symlinked
-    home, a symlinked ancestor, a symlinked or non-regular artifact, and a dangling link at any of
-    them. It does NOT by itself close a check-to-open race — an attacker with write access inside
-    the home could swap a component between the check and the open. :meth:`_open_sidecar_fd` uses
-    ``O_NOFOLLOW`` so the sidecar can never be opened through a link at all, and the DB open
-    re-verifies the artifact's ``(st_dev, st_ino)`` after connecting, which detects a swap rather
-    than preventing it. A fully race-free guarantee needs ``openat2(RESOLVE_BENEATH)``, which the
-    Python standard library does not expose; that residual is named here rather than papered over.
-    """
-    import stat as stat_module
-
-    home = Path(home)
-    resolved_parent = path.parent
-    if resolved_parent != home:
-        raise AuditFailureTerminalDecisionError(
-            f"decision store {label} {path} is not directly under the declared home {home}; "
-            "fail closed"
-        )
-    # Root-down, so a link high in the chain is caught before anything below it is trusted.
-    components: list[Path] = []
-    cursor = home
-    while True:
-        components.append(cursor)
-        if cursor.parent == cursor:
-            break
-        cursor = cursor.parent
-    for component in reversed(components):
-        try:
-            component_stat = component.lstat()
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            raise AuditFailureTerminalDecisionError(
-                f"decision store path component {component} is unreadable "
-                f"({type(exc).__name__}); fail closed"
-            ) from exc
-        if stat_module.S_ISLNK(component_stat.st_mode):
-            raise AuditFailureTerminalDecisionError(
-                f"decision store path component {component} is a symlink; refusing to write an "
-                "authority record through a link that can point outside the mozyo-bridge home"
-            )
-        if not stat_module.S_ISDIR(component_stat.st_mode):
-            raise AuditFailureTerminalDecisionError(
-                f"decision store path component {component} is not a directory; fail closed"
-            )
-    try:
-        artifact_stat = path.lstat()
-    except FileNotFoundError:
-        return
-    except OSError as exc:
-        raise AuditFailureTerminalDecisionError(
-            f"decision store {label} {path} is unreadable ({type(exc).__name__}); fail closed"
-        ) from exc
-    if stat_module.S_ISLNK(artifact_stat.st_mode):
-        raise AuditFailureTerminalDecisionError(
-            f"decision store {label} {path} is a symlink; refusing to write an authority record "
-            "through a link that can point outside the mozyo-bridge home"
-        )
-    if not stat_module.S_ISREG(artifact_stat.st_mode):
-        raise AuditFailureTerminalDecisionError(
-            f"decision store {label} {path} is not a regular file; fail closed"
-        )
-
-
 def audit_failure_terminal_decision_path(home: Optional[Path] = None) -> Path:
-    """Resolve the decision store's path under the mozyo-bridge home (same shape as the fences)."""
-    return (Path(home) if home is not None else mozyo_bridge_home()) / (
-        "audit-failure-terminal-decision.sqlite"
-    )
+    """Resolve the decision records path under the mozyo-bridge home."""
+    return (
+        Path(home) if home is not None else mozyo_bridge_home()
+    ) / AUDIT_FAILURE_TERMINAL_DECISION_FILENAME
 
 
 def _utc_now() -> str:
@@ -291,11 +209,53 @@ def _validation_errors(decision: TerminalDecision) -> "tuple[str, ...]":
     return tuple(problems)
 
 
-class AuditFailureTerminalDecisionStore:
-    """Read / write the coordinator's audit-failure terminal decisions (home-scoped).
+def _reject_unsafe_ancestors(home: Path) -> None:
+    """Refuse a home reachable only through a link, at ANY ancestor (review j#102582 finding 1).
 
-    :meth:`record` is the coordinator's action and is the ONLY writer; it creates the store on
-    first use. :meth:`read` never creates anything and raises when the store is absent, replaced or
+    The home ITSELF is not checked here — :meth:`AuditFailureTerminalDecisionStore._open_home_fd`
+    opens it with ``O_NOFOLLOW``, which refuses a symlinked home atomically rather than by a
+    precheck that can go stale. What this adds is the chain ABOVE it: an ancestor link would be
+    traversed while resolving the home, so it must be refused before that open is attempted.
+
+    Prechecking is deliberately confined to this. Everything below the home is opened relative to
+    the resulting descriptor, so there is no second path resolution for a swap to win — which is
+    why R6's leaf prechecks are gone rather than added to.
+    """
+    import stat as stat_module
+
+    components: list[Path] = []
+    cursor = Path(home).parent
+    while True:
+        components.append(cursor)
+        if cursor.parent == cursor:
+            break
+        cursor = cursor.parent
+    for component in reversed(components):
+        try:
+            component_stat = component.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise AuditFailureTerminalDecisionError(
+                f"decision store path component {component} is unreadable "
+                f"({type(exc).__name__}); fail closed"
+            ) from exc
+        if stat_module.S_ISLNK(component_stat.st_mode):
+            raise AuditFailureTerminalDecisionError(
+                f"decision store path component {component} is a symlink; refusing to write an "
+                "authority record through a link that can point outside the mozyo-bridge home"
+            )
+        if not stat_module.S_ISDIR(component_stat.st_mode):
+            raise AuditFailureTerminalDecisionError(
+                f"decision store path component {component} is not a directory; fail closed"
+            )
+
+
+class AuditFailureTerminalDecisionStore:
+    """Read / write the coordinator's decisions, entirely through a stable directory descriptor.
+
+    :meth:`record` is the coordinator's action and the ONLY writer; it creates the store on first
+    use. :meth:`read` never creates anything and raises when the store is absent, replaced or
     unreadable, so a retire whose decision surface is gone refuses rather than proceeding on the
     records alone.
     """
@@ -304,188 +264,194 @@ class AuditFailureTerminalDecisionStore:
         self.path = (
             Path(path) if path is not None else audit_failure_terminal_decision_path(home)
         )
-        #: The DECLARED home every artifact must live directly under. Kept so the path guard can
-        #: check the whole chain rather than the leaf (review j#102181 finding 2).
+        #: The DECLARED home. Opened once per operation into a descriptor; every artifact is
+        #: created and opened relative to THAT, never by re-resolving a path.
         self.home = self.path.parent
         self.sidecar_path = self.path.with_name(
             self.path.name + AUDIT_FAILURE_TERMINAL_DECISION_SIDECAR_SUFFIX
         )
 
-    # -- no-follow artifact IO ---------------------------------------------
+    # -- the stable directory descriptor -----------------------------------
 
-    def _read_sidecar_text(self) -> Optional[str]:
-        """Read the sidecar through ``O_NOFOLLOW``, so a link is never followed at all."""
-        import os
+    def _open_home_fd(self, *, create: bool) -> int:
+        """Open the declared home as a descriptor, or refuse (review j#102582 finding 1).
 
+        ``O_DIRECTORY | O_NOFOLLOW`` on the home itself, so a symlinked home never opens at all,
+        and the ancestors are validated first so a link higher in the chain cannot have been
+        traversed to reach it. Everything afterwards uses ``dir_fd=`` against this descriptor: the
+        path is resolved ONCE, and a swap after that has nothing left to redirect.
+        """
+        _reject_unsafe_ancestors(self.home)
+        if create:
+            try:
+                self.home.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise AuditFailureTerminalDecisionError(
+                    f"decision store home {self.home} could not be created "
+                    f"({type(exc).__name__}); fail closed"
+                ) from exc
         try:
-            fd = os.open(self.sidecar_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            return os.open(
+                self.home, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+            )
+        except OSError as exc:
+            raise AuditFailureTerminalDecisionError(
+                f"decision store home {self.home} could not be opened as a directory without "
+                f"following a link ({type(exc).__name__}); fail closed"
+            ) from exc
+
+    def _read_file(self, dir_fd: int, name: str) -> Optional[str]:
+        """Read one artifact relative to the home descriptor, never following a link."""
+        try:
+            fd = os.open(
+                name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dir_fd
+            )
         except FileNotFoundError:
             return None
         except OSError as exc:
             raise AuditFailureTerminalDecisionError(
-                f"decision store sidecar {self.sidecar_path} could not be opened without "
-                f"following a link ({type(exc).__name__}); fail closed"
+                f"decision store artifact {name} could not be opened without following a link "
+                f"({type(exc).__name__}); fail closed"
+            ) from exc
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def _replace_file(self, dir_fd: int, name: str, text: str) -> None:
+        """Write one artifact atomically: exclusive temp, fsync, rename — all via the descriptor.
+
+        ``O_EXCL | O_NOFOLLOW`` means the temp is a file this call created, never an existing link,
+        and the rename happens inside the SAME directory descriptor, so the published name is
+        replaced without the path ever being resolved again.
+        """
+        temp = f"{name}{_TEMP_SUFFIX}.{secrets.token_hex(8)}"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(temp, flags, 0o600, dir_fd=dir_fd)
+        except OSError as exc:
+            raise AuditFailureTerminalDecisionError(
+                f"decision store artifact {name} could not be staged "
+                f"({type(exc).__name__}); fail closed"
             ) from exc
         try:
-            with os.fdopen(fd, "r", encoding="utf-8") as handle:
-                return handle.read()
-        except (OSError, ValueError) as exc:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.rename(temp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except OSError as exc:
+            try:
+                os.unlink(temp, dir_fd=dir_fd)
+            except OSError:
+                pass
             raise AuditFailureTerminalDecisionError(
-                f"decision store sidecar {self.sidecar_path} is unreadable "
+                f"decision store artifact {name} could not be published "
                 f"({type(exc).__name__}); fail closed"
             ) from exc
 
-    def _write_sidecar_text(self, value: str) -> None:
-        """Create the sidecar with ``O_NOFOLLOW``; an existing link is never written through."""
-        import os
-
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            fd = os.open(self.sidecar_path, flags, 0o600)
-        except OSError as exc:
-            raise AuditFailureTerminalDecisionError(
-                f"decision store sidecar {self.sidecar_path} could not be created without "
-                f"following a link ({type(exc).__name__}); fail closed"
-            ) from exc
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(value)
-
-    # -- store identity (DB-external sidecar) ------------------------------
+    # -- store identity ----------------------------------------------------
 
     def _read_sidecar_nonce(self) -> Optional[str]:
-        _reject_unsafe_path(self.sidecar_path, label="sidecar", home=self.home)
-        value = self._read_sidecar_text()
+        try:
+            dir_fd = self._open_home_fd(create=False)
+        except AuditFailureTerminalDecisionError:
+            return None
+        try:
+            value = self._read_file(dir_fd, self.sidecar_path.name)
+        finally:
+            os.close(dir_fd)
         return (value or "").strip() or None
 
-    @staticmethod
-    def _db_nonce(conn: sqlite3.Connection) -> Optional[str]:
-        try:
-            row = conn.execute(
-                "SELECT value FROM store_meta WHERE key = ?", (_STORE_NONCE_KEY,)
-            ).fetchone()
-        except sqlite3.DatabaseError:
-            return None
-        return str(row[0]) if row is not None else None
-
-    def _create_fresh(self, nonce: str) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        _reject_unsafe_path(self.path, label="DB", home=self.home)
-        _reject_unsafe_path(self.sidecar_path, label="sidecar", home=self.home)
-        conn = sqlite3.connect(self.path, isolation_level=None)
-        try:
-            conn.execute("PRAGMA busy_timeout = 2000")
-            conn.execute(_TABLE_SQL)
-            conn.execute(_META_TABLE_SQL)
-            conn.execute(
-                "INSERT OR REPLACE INTO store_meta (key, value) VALUES (?, ?)",
-                (_STORE_NONCE_KEY, nonce),
-            )
-            conn.execute(
-                f"PRAGMA user_version = {AUDIT_FAILURE_TERMINAL_DECISION_SCHEMA_VERSION}"
-            )
-        finally:
-            conn.close()
-        self._write_sidecar_text(nonce)
-
     def is_initialized(self) -> bool:
-        sidecar_nonce = self._read_sidecar_nonce()
-        if sidecar_nonce is None or not self.path.exists():
+        try:
+            dir_fd = self._open_home_fd(create=False)
+        except AuditFailureTerminalDecisionError:
             return False
         try:
-            conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
-        except sqlite3.DatabaseError:
-            return False
-        try:
-            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            if version != AUDIT_FAILURE_TERMINAL_DECISION_SCHEMA_VERSION:
-                return False
-            return self._db_nonce(conn) == sidecar_nonce
-        except (sqlite3.DatabaseError, TypeError, ValueError):
+            nonce = (self._read_file(dir_fd, self.sidecar_path.name) or "").strip()
+            document = self._read_file(dir_fd, self.path.name)
+        except AuditFailureTerminalDecisionError:
             return False
         finally:
-            conn.close()
+            os.close(dir_fd)
+        if not nonce or document is None:
+            return False
+        try:
+            parsed = json.loads(document)
+        except ValueError:
+            return False
+        return (
+            isinstance(parsed, dict)
+            and parsed.get("store_nonce") == nonce
+            and parsed.get("schema_version")
+            == AUDIT_FAILURE_TERMINAL_DECISION_SCHEMA_VERSION
+        )
 
-    def _connect(self) -> sqlite3.Connection:
-        """Open an existing, identity-matched connection, or fail closed.
-
-        Never creates. A missing sidecar, a missing DB beside a surviving sidecar, a foreign schema
-        version and a nonce mismatch are each a store loss or replacement, and each refuses: an
-        admission resting on a decision surface that is not demonstrably the one the coordinator
-        wrote to is not an admission.
-        """
-        sidecar_nonce = self._read_sidecar_nonce()
-        if sidecar_nonce is None:
+    def _load(self, dir_fd: int) -> dict:
+        """The records document, verified against the sidecar identity, or fail closed."""
+        nonce = (self._read_file(dir_fd, self.sidecar_path.name) or "").strip()
+        if not nonce:
             raise AuditFailureTerminalDecisionError(
                 f"decision store {self.path} has no identity sidecar (never recorded / lost); "
                 "fail closed rather than admit a terminal with no recorded decision"
             )
-        if not self.path.exists():
+        document = self._read_file(dir_fd, self.path.name)
+        if document is None:
             raise AuditFailureTerminalDecisionError(
-                f"decision store {self.path} DB is missing while its sidecar remains (store loss); "
+                f"decision store {self.path} is missing while its sidecar remains (store loss); "
                 "fail closed rather than auto-create"
             )
-        # Before the open, and on the LINK rather than its target: an authority record must not be
-        # read or written through a path that can point outside the home (review j#102147 f2).
-        _reject_unsafe_path(self.path, label="DB", home=self.home)
-        _reject_unsafe_path(self.sidecar_path, label="sidecar", home=self.home)
-        import os
-
-        before = os.lstat(self.path)
-        conn = sqlite3.connect(self.path, isolation_level=None)
         try:
-            # sqlite3 cannot be handed an fd, so the artifact identity is re-verified after the
-            # open: a component swapped between the check and the connect yields a different
-            # (device, inode) and refuses. This DETECTS a race rather than preventing one — see
-            # ``_reject_unsafe_path`` for the residual this deliberately does not overclaim.
-            after = os.lstat(self.path)
-            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
-                raise AuditFailureTerminalDecisionError(
-                    f"decision store {self.path} changed identity between the safety check and "
-                    "the open (replaced store); fail closed"
-                )
-            conn.execute("PRAGMA busy_timeout = 2000")
-            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            if version != AUDIT_FAILURE_TERMINAL_DECISION_SCHEMA_VERSION:
-                raise AuditFailureTerminalDecisionError(
-                    f"decision store {self.path} is not at schema version "
-                    f"{AUDIT_FAILURE_TERMINAL_DECISION_SCHEMA_VERSION} (found {version}: empty / "
-                    "replaced / foreign store); fail closed"
-                )
-            if self._db_nonce(conn) != sidecar_nonce:
-                raise AuditFailureTerminalDecisionError(
-                    f"decision store {self.path} nonce does not match its sidecar (replaced / "
-                    "foreign store); fail closed"
-                )
-        except sqlite3.DatabaseError as exc:
-            conn.close()
+            parsed = json.loads(document)
+        except ValueError as exc:
             raise AuditFailureTerminalDecisionError(
                 f"decision store {self.path} is unreadable ({type(exc).__name__}); fail closed"
             ) from exc
-        except AuditFailureTerminalDecisionError:
-            conn.close()
-            raise
-        return conn
+        if not isinstance(parsed, dict):
+            raise AuditFailureTerminalDecisionError(
+                f"decision store {self.path} is not a decision document; fail closed"
+            )
+        if parsed.get("schema_version") != AUDIT_FAILURE_TERMINAL_DECISION_SCHEMA_VERSION:
+            raise AuditFailureTerminalDecisionError(
+                f"decision store {self.path} is not at schema version "
+                f"{AUDIT_FAILURE_TERMINAL_DECISION_SCHEMA_VERSION} (empty / replaced / foreign "
+                "store); fail closed"
+            )
+        if parsed.get("store_nonce") != nonce:
+            raise AuditFailureTerminalDecisionError(
+                f"decision store {self.path} nonce does not match its sidecar (replaced / "
+                "foreign store); fail closed"
+            )
+        records = parsed.get("decisions")
+        if not isinstance(records, dict):
+            raise AuditFailureTerminalDecisionError(
+                f"decision store {self.path} carries no decision map; fail closed"
+            )
+        return parsed
 
-    # -- the coordinator's action -----------------------------------------
+    @staticmethod
+    def _key(route: DecisionRoute) -> str:
+        workspace, lane = route.as_row()
+        return f"{workspace}\u0000{lane}"
+
+    # -- the writer boundary -----------------------------------------------
 
     def _require_attested_coordinator(self, repo_root: Path) -> str:
         """Verify the WRITER is the attested coordinator, or refuse (review j#102147 finding 1).
 
-        The same action-time gate #13613 already requires before a lane mutation
+        The same action-time gate #13613 requires before a lane mutation
         (:func:`...sublane_actuator_herdr_preflight.evaluate_dispatch_sender`): the sender identity
         is resolved from THIS PROCESS's environment and cross-checked against the repository's
         workspace anchor, the committed coordinator provider binding, and the coordinator default
-        lane. Env presence alone is not attestation — a wrong-but-nonempty identity fails.
+        lane. Env presence alone is not attestation.
 
-        It lives here, not in the command, because the reviewer's requirement is a writer boundary
-        that a direct store call cannot bypass; a check in the CLI only describes one caller. The
-        import is lazy so this low-level module never pulls the application layer at import time —
-        the same shape ``evaluate_dispatch_sender`` itself uses for its provider-binding read.
+        It lives here, not in the command, because a writer boundary a direct store call can bypass
+        is not a boundary. The import is lazy so this low-level module never pulls the application
+        layer at import time.
 
-        Returns the resolved detail for the caller to surface; raises on any refusal.
+        **This does not close the writer question** — review j#102181 showed the material it reads
+        can itself be created by the caller — which is why the route it feeds is inert. See
+        :data:`...superseded_audit_failure_terminal.RECEIPT_AUTHORITY_RESOLVABLE`.
         """
-        import os
-
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_preflight import (  # noqa: E501
             evaluate_dispatch_sender,
         )
@@ -512,18 +478,13 @@ class AuditFailureTerminalDecisionStore:
         ``repo_root`` is the repository whose ANCHOR the writer is attested against — not a claim
         about who the writer is, but the independent side of that comparison.
 
-        Latest-wins per route, deliberately: a lane whose head or generation moved after a decision
-        needs the coordinator to decide again about the world that now exists, and the natural way
-        to express that is to record the new decision. What latest-wins does NOT do is widen
-        anything — the replacement is still bound to its own exact identities, and the retire still
-        re-measures every one of them.
+        Latest-wins per route: a lane whose head or generation moved needs the coordinator to decide
+        again about the world that now exists. The replacement is still bound to its own exact
+        identities, and the retire re-measures every one of them.
 
-        Raises :class:`AuditFailureTerminalDecisionError` on a decision that could never match
-        (empty identity, non-positive generation / revision, self-successor, malformed head), so an
-        unusable record is never stored.
+        Raises on an unattested writer, on a decision that could never match, and on any artifact
+        that cannot be created or opened through the home descriptor without following a link.
         """
-        # The writer boundary first: an unattested caller must not even be told whether its
-        # decision would have validated.
         self._require_attested_coordinator(repo_root)
         problems = _validation_errors(decision)
         if problems:
@@ -531,13 +492,6 @@ class AuditFailureTerminalDecisionStore:
                 "refusing to record an audit-failure terminal decision that can never match: "
                 + "; ".join(problems)
             )
-        if not self.is_initialized():
-            if self.path.exists() or self._read_sidecar_nonce() is not None:
-                raise AuditFailureTerminalDecisionError(
-                    f"decision store {self.path} exists but its identity does not verify "
-                    "(replaced / foreign / half-written store); refusing to write into it"
-                )
-            self._create_fresh(secrets.token_hex(16))
         stamp = now or _utc_now()
         recorded = TerminalDecision(
             workspace_id=decision.workspace_id.strip(),
@@ -553,32 +507,33 @@ class AuditFailureTerminalDecisionStore:
             integration_branch=decision.integration_branch.strip(),
             recorded_at=stamp,
         )
-        conn = self._connect()
+        dir_fd = self._open_home_fd(create=True)
         try:
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                "INSERT OR REPLACE INTO audit_failure_terminal_decision (workspace_id, lane_id, "
-                "decision_id, lane_generation, lane_revision, issue, audit_journal, "
-                "successor_issue, successor_review_journal, head, integration_branch, recorded_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    recorded.workspace_id,
-                    recorded.lane_id,
-                    recorded.decision_id,
-                    recorded.lane_generation,
-                    recorded.lane_revision,
-                    recorded.issue,
-                    recorded.audit_journal,
-                    recorded.successor_issue,
-                    recorded.successor_review_journal,
-                    recorded.head,
-                    recorded.integration_branch,
-                    recorded.recorded_at,
-                ),
+            existing = self._read_file(dir_fd, self.sidecar_path.name)
+            nonce = (existing or "").strip()
+            if not nonce:
+                if self._read_file(dir_fd, self.path.name) is not None:
+                    raise AuditFailureTerminalDecisionError(
+                        f"decision store {self.path} exists without its identity sidecar "
+                        "(replaced / half-written store); refusing to write into it"
+                    )
+                nonce = secrets.token_hex(16)
+                document = {
+                    "schema_version": AUDIT_FAILURE_TERMINAL_DECISION_SCHEMA_VERSION,
+                    "store_nonce": nonce,
+                    "decisions": {},
+                }
+                self._replace_file(dir_fd, self.sidecar_path.name, nonce)
+            else:
+                document = self._load(dir_fd)
+            document["decisions"][self._key(recorded.route)] = recorded.as_payload()
+            self._replace_file(
+                dir_fd,
+                self.path.name,
+                json.dumps(document, ensure_ascii=False, sort_keys=True, indent=2),
             )
-            conn.execute("COMMIT")
         finally:
-            conn.close()
+            os.close(dir_fd)
         return recorded
 
     # -- the retire's read -------------------------------------------------
@@ -586,44 +541,43 @@ class AuditFailureTerminalDecisionStore:
     def read(self, route: DecisionRoute) -> Optional[TerminalDecision]:
         """The decision recorded for ``route``, or ``None`` when the route has none.
 
-        Raises rather than returning ``None`` when the STORE itself cannot be trusted (see
-        :meth:`_connect`): "this lane has no decision" and "the decision surface is gone" are
-        different operational problems and the caller reports them differently, but both refuse.
+        Raises rather than returning ``None`` when the STORE itself cannot be trusted: "this lane
+        has no decision" and "the decision surface is gone" are different operational problems, and
+        both refuse.
         """
-        conn = self._connect()
+        dir_fd = self._open_home_fd(create=False)
         try:
-            row = conn.execute(
-                "SELECT decision_id, lane_generation, lane_revision, issue, audit_journal, "
-                "successor_issue, successor_review_journal, head, integration_branch, recorded_at "
-                "FROM audit_failure_terminal_decision WHERE workspace_id=? AND lane_id=?",
-                route.as_row(),
-            ).fetchone()
-        except sqlite3.DatabaseError as exc:
-            raise AuditFailureTerminalDecisionError(
-                f"decision store {self.path} read failed ({type(exc).__name__}); fail closed"
-            ) from exc
+            document = self._load(dir_fd)
         finally:
-            conn.close()
-        if row is None:
+            os.close(dir_fd)
+        payload = document["decisions"].get(self._key(route))
+        if not isinstance(payload, dict):
             return None
         workspace_id, lane_id = route.as_row()
-        return TerminalDecision(
-            workspace_id=workspace_id,
-            lane_id=lane_id,
-            decision_id=str(row[0]),
-            lane_generation=int(row[1]),
-            lane_revision=int(row[2]),
-            issue=str(row[3]),
-            audit_journal=str(row[4]),
-            successor_issue=str(row[5]),
-            successor_review_journal=str(row[6]),
-            head=str(row[7]),
-            integration_branch=str(row[8]),
-            recorded_at=str(row[9]),
-        )
+        try:
+            return TerminalDecision(
+                workspace_id=workspace_id,
+                lane_id=lane_id,
+                decision_id=str(payload["decision_id"]),
+                lane_generation=int(payload["lane_generation"]),
+                lane_revision=int(payload["lane_revision"]),
+                issue=str(payload["issue"]),
+                audit_journal=str(payload["audit_journal"]),
+                successor_issue=str(payload["successor_issue"]),
+                successor_review_journal=str(payload["successor_review_journal"]),
+                head=str(payload["head"]),
+                integration_branch=str(payload["integration_branch"]),
+                recorded_at=str(payload.get("recorded_at", "")),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AuditFailureTerminalDecisionError(
+                f"decision store {self.path} carries an unreadable record for this route "
+                f"({type(exc).__name__}); fail closed"
+            ) from exc
 
 
 __all__ = (
+    "AUDIT_FAILURE_TERMINAL_DECISION_FILENAME",
     "AUDIT_FAILURE_TERMINAL_DECISION_SCHEMA_VERSION",
     "AUDIT_FAILURE_TERMINAL_DECISION_SIDECAR_SUFFIX",
     "AuditFailureTerminalDecisionError",

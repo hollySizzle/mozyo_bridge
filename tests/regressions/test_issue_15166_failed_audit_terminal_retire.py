@@ -882,6 +882,36 @@ class OnlyARecordedCoordinatorDecisionConverges(unittest.TestCase):
 class TheRouteAdmitsNothingUntilTheReceiptAuthorityExists(unittest.TestCase):
     """Coordinator ruling on consultation j#102184: hold as a typed refusal, do not guess again."""
 
+    def test_the_record_command_does_not_claim_an_authority_it_does_not_grant(self):
+        # Review j#102582 finding 2: the operator-facing record surface said the decision "IS that
+        # judgement" and "authorizes ... once" while the route it feeds admits nothing. A help text
+        # that contradicts the ruling is an over-claim on the surface an operator actually reads.
+        import argparse
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_audit_failure_terminal_decision import (  # noqa: E501
+            register_audit_failure_terminal_decision,
+        )
+
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="sublane_command")
+        register_audit_failure_terminal_decision(sub, add_repo_option=lambda p: None)
+
+        # What `sublane --help` shows for the group, and what the group's own help shows for
+        # `record`: both must name the ruling rather than an authority the record does not grant.
+        group_summary = " ".join(
+            (action.help or "")
+            for action in sub._choices_actions
+            if action.dest == "audit-failure-terminal"
+        )
+        group_summary = " ".join(group_summary.split())
+        record_help = " ".join(
+            sub.choices["audit-failure-terminal"].format_help().split()
+        )
+        self.assertIn("authorizes NO retire", group_summary)
+        self.assertIn("#15195", group_summary)
+        self.assertIn("#15195", record_help)
+        self.assertIn("coordinator_receipt_authority_unresolvable", record_help)
+
     def test_the_receipt_authority_is_declared_unresolvable(self):
         self.assertFalse(RECEIPT_AUTHORITY_RESOLVABLE)
 
@@ -1155,19 +1185,56 @@ class TheDecisionStoreIsTheWriterHalf(unittest.TestCase):
         with self.assertRaises(AuditFailureTerminalDecisionError):
             AuditFailureTerminalDecisionStore(home=home).read(DecisionRoute(WORKSPACE, LANE))
 
-    def test_a_store_swapped_between_the_check_and_the_open_is_detected(self):
-        # The DB cannot be handed an fd, so the artifact identity is re-verified after connecting.
-        # Pinned as DETECTION, which is what it is — the docstring does not claim prevention.
-        home = self._home()
-        _record_decision(home, head=HEAD)
-        store = AuditFailureTerminalDecisionStore(home=home)
-        original = store.path.lstat()
-        replacement = home / "replacement.sqlite"
-        replacement.write_bytes(store.path.read_bytes())
-        self.assertNotEqual(
-            (original.st_dev, original.st_ino),
-            (replacement.lstat().st_dev, replacement.lstat().st_ino),
-        )
+    def test_a_swapped_artifact_writes_nothing_outside_the_home(self):
+        # Review j#102582 finding 1, as the reviewer reproduced it and as the required direction
+        # asks it be fixed: a link planted where an artifact will be created must produce NO file,
+        # no nonce and no directory outside the home. R6 detected the redirect only after sqlite
+        # had already created a 20480-byte database at the link target; there is no sqlite here,
+        # and every create goes through O_EXCL|O_NOFOLLOW relative to the home descriptor.
+        for artifact in ("records", "sidecar"):
+            with self.subTest(artifact=artifact):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                root = Path(tmp.name)
+                outside = root / "outside"
+                outside.mkdir()
+                home = root / "home"
+                home.mkdir()
+                store = AuditFailureTerminalDecisionStore(home=home)
+                target = store.path if artifact == "records" else store.sidecar_path
+                target.symlink_to(outside / "stolen")
+                with _attested_coordinator_env():
+                    with self.assertRaises(AuditFailureTerminalDecisionError):
+                        store.record(
+                            TerminalDecision(**_decision_fields(head=HEAD)),
+                            repo_root=_attested_repo(root / "repo"),
+                        )
+                self.assertEqual(sorted(p.name for p in outside.iterdir()), [])
+
+    def test_nothing_below_the_home_is_reached_by_re_resolving_a_path(self):
+        # The structural claim behind the fix, measured on the source: every artifact operation is
+        # relative to the home descriptor (``dir_fd=``), so there is no second path resolution for
+        # a swap to win. A future edit that reaches for a bare open / connect fails here.
+        import inspect
+
+        from mozyo_bridge.core.state import audit_failure_terminal_decision as store_module
+
+        source = inspect.getsource(store_module)
+        # No sqlite in the CODE. The module docstring names it only to explain why it is not used
+        # (it cannot be handed a descriptor), so the docstring is stripped before asserting.
+        body = source.split('"""', 2)[-1]
+        self.assertNotIn("sqlite3", body)
+        # The ONE bare open is the home directory itself, and it carries O_DIRECTORY|O_NOFOLLOW.
+        # Every other artifact operation names a directory descriptor.
+        lines = source.splitlines()
+        for index, line in enumerate(lines):
+            for opener in ("os.open(", "os.rename(", "os.unlink("):
+                if opener not in line:
+                    continue
+                window = " ".join(lines[index : index + 4])
+                if "dir_fd" in window or "O_DIRECTORY" in window:
+                    continue
+                self.fail(f"artifact IO without a directory descriptor: {line.strip()}")
 
     def test_a_symlinked_store_is_not_read_either(self):
         home = self._home()
