@@ -24,10 +24,13 @@ without touching the host. Live launchd operation is a separate coordinator gate
 from __future__ import annotations
 
 import errno
+import inspect
+import json
 import os
 import plistlib
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -37,7 +40,9 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
     supervisor_launchd as sl,
+    supervisor_launchd_agent as agent,
     supervisor_launchd_fs as fs,
+    supervisor_launchd_process as process,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workspace_callback_supervisor import (
     SupervisedWorkspace,
@@ -185,6 +190,21 @@ class RenderPlistTest(unittest.TestCase):
         with patch.dict("os.environ", {API_KEY_ENV: "SECRET-KEY-SENTINEL"}, clear=False):
             raw = sl.render_plist(["/opt/bin/mozyo-bridge"], interval_seconds=300)
         self.assertNotIn(b"SECRET-KEY-SENTINEL", raw)
+
+
+class LaunchdModuleBoundaryTest(unittest.TestCase):
+    """The text module cannot directly read an owned plist or start a process (r15f4)."""
+
+    def test_process_and_filesystem_effects_live_in_their_named_modules(self) -> None:
+        agent_source = inspect.getsource(agent)
+        self.assertNotIn("import subprocess", agent_source)
+        self.assertNotIn("def default_runner", agent_source)
+        self.assertNotIn("def launchctl", agent_source)
+        self.assertNotIn(".read_bytes(", agent_source)
+        self.assertIs(sl._default_runner, process.default_runner)
+        self.assertIs(sl._launchctl, process.launchctl)
+        self.assertEqual(process.default_runner.__module__, process.__name__)
+        self.assertEqual(fs.read_owned.__module__, fs.__name__)
 
 
 class ResolveHomeAndCommandTest(unittest.TestCase):
@@ -749,6 +769,31 @@ class ServiceStatusTest(_DarwinCase):
             runner=FakeRunner(print_result=_result(113)), which=which_moved,
         )
         self.assertFalse(status["executable_matches"])
+
+    def test_drifted_owned_argv_is_absent_from_repr_and_json(self) -> None:
+        sentinel = "LAUNCHD-DRIFT-SECRET-SENTINEL"
+        _write_home_credential(self.mozyo_home)
+        argv = [
+            "/opt/bin/mozyo-bridge", "workflow", "supervisor", "--run-once",
+            "--home", _resolved(self.mozyo_home), "--token", sentinel,
+        ]
+        target = sl.plist_path(self.os_home)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(
+            sl.render_plist(
+                argv, interval_seconds=sl.DEFAULT_OS_TICK_INTERVAL_SECONDS,
+                os_home=self.os_home,
+            )
+        )
+
+        status = sl.service_status(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            runner=FakeRunner(print_result=_result(113)), which=_which_found,
+        )
+        self.assertFalse(status["executable_matches"])
+        self.assertEqual([], status["installed_command"])
+        self.assertNotIn(sentinel, repr(status))
+        self.assertNotIn(sentinel, json.dumps(status))
 
 
 def _legacy_drain_plist(os_home: Path, *, label: str | None = None) -> Path:
@@ -2406,6 +2451,46 @@ class TheWriteIsStagedNotTruncatedTest(_DarwinCase):
         with patch.object(os, "write", lambda fd, data: real_write(fd, data[:7])):
             fs.write_owned(payload, self.os_home)
         self.assertEqual(payload, self.target.read_bytes())
+
+    def test_two_concurrent_writers_never_rename_each_others_payload(self) -> None:
+        payloads = (b"writer-a:" + b"A" * 4096, b"writer-b:" + b"B" * 4096)
+        both_staged = threading.Barrier(2)
+        real_write_all = fs._write_all
+        errors: list[BaseException] = []
+
+        def staged_write(fd, payload):
+            real_write_all(fd, payload)
+            both_staged.wait(timeout=5)
+
+        def writer(payload):
+            try:
+                fs.write_owned(payload, self.os_home)
+            except BaseException as exc:  # captured in the test thread and asserted below
+                errors.append(exc)
+
+        with patch.object(fs, "_write_all", staged_write):
+            threads = [threading.Thread(target=writer, args=(payload,)) for payload in payloads]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual([], errors)
+        self.assertIn(self.target.read_bytes(), payloads)
+        self.assertEqual([self.target.name], sorted(p.name for p in self.target.parent.iterdir()))
+
+    def test_unknown_historical_and_foreign_staging_entries_are_never_deleted(self) -> None:
+        historical = self.target.with_name(f"{self.target.name}.mozyo-staging")
+        foreign = self.target.with_name(f".{self.target.name}.mozyo-staging-foreign")
+        historical.write_bytes(b"historical-writer")
+        foreign.write_bytes(b"concurrent-writer")
+
+        fs.write_owned(b"ours", self.os_home)
+
+        self.assertEqual(b"ours", self.target.read_bytes())
+        self.assertEqual(b"historical-writer", historical.read_bytes())
+        self.assertEqual(b"concurrent-writer", foreign.read_bytes())
 
 
 class StatusJudgesAndPublishesOneInodeTest(_DarwinCase):

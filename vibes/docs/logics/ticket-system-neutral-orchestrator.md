@@ -512,6 +512,12 @@ agent が買っていたのは capability ではなく latency であり、そ�
 StartInterval（KeepAlive なし、EnvironmentVariables なし）契約を維持する。**credential 未整備は拒否理由ではない**（両 OS 共通、後述の
 「Redmine 未設定は導入の拒否理由にしない」を正本とする）。
 
+責務境界は module 名と一致させる（review j#102843 r15f4）。`supervisor_launchd_agent` は identity・path 名・
+plist text の組立と parse だけを持ち、owned path の read/write は `supervisor_launchd_fs`、process 実行は
+`supervisor_launchd_process` だけが持つ。`supervisor_launchd_probe` は process seam を使って非破壊な
+`launchctl print` を読むが、その分類は mutation authority にならない。lifecycle の許可判断は
+`supervisor_launchd`、退役 agent の移行判断は `supervisor_launchd_migration` に残す。
+
 **退役 agent の migration**（#15192）。#15192 以前に install した host には第二 LaunchAgent が残る。これを放置
 すると受入条件（macOS は LaunchAgent 1 個）が破れ、既に包含済みの `--drain-only` tick が走り続けるため、
 `install` / `uninstall` が**取り外す**。ただし取り外すのは **自分のもの** と証明できる場合だけである: plist は
@@ -550,10 +556,9 @@ logout まで走り続ける。したがって plist の削除は **「job が�
 **identity は mutation の瞬間に再確立する**（review j#102496 r12f1）。分類と unlink / write の間には
 subprocess 呼び出しが挟まるため、両者は**別の時点についての別の事実**である。分類済みの file と実際に
 削除される file が同一である保証はなく、この窓で差し替えられた plist は `state: owned` / `removed: true` を
-返しながら削除された。ただし**限界も併記する**: 再確認は窓を狭めるが閉じない。`unlink` / `write_bytes` は
-検証した inode ではなく **path** を対象とするため、再確認と実行の間に差し替えられれば同じ結果になりうる。
-主張するのは「race を解消した」ではなく「**action time で再検証し、観測できた不一致は追加 mutation なしで
-拒否する**」である。
+返しながら削除された。この段階の再確認だけでは窓を狭めるに留まったが、後述の pinned directory-fd seam では
+分類・read・write・unlink を同じ directory fd 相対に行う。現在の主張は「path を再度信用した」ではなく、
+「**action time で再検証し、その action は pin 済み directory から外へ向きを変えない**」である。
 
 **この identity fence は現行 agent の plist にも等しく適用する**（review j#102496 r12f2）。以前は退役 drain
 path にしか identity 検査がなく、`install` は自 path 上の **他人の Label を持つ plist を上書き**し、
@@ -597,7 +602,10 @@ leaf へは祖先を経由して到達するからである。よって trusted 
 inode を破壊する**ため、分類直後に owned leaf を外部 file の hard link へ差し替えると、hard link を拒否したはずの
 fence を通り抜けてその file が上書きされた。また `os.write` の返却 byte 数を見ない実装は partial write で
 truncate 済みの plist を残したまま成功を返した。同一 directory 内に `O_EXCL` で staging file を作り、全 byte を
-書き切ってから `os.replace` する。これにより (a) 完了まで既存 plist は無傷、(b) 宛先が hard link でも rename は
+書き切ってから `os.replace` する。さらに staging 名は writer ごとの unguessable token を持ち、`O_EXCL` の
+成功を ownership 証拠とする（review j#102843 r15f2）。固定 `<plist>.mozyo-staging` は複数 writer が互いの
+payload を rename / cleanup できるため使わず、歴史的な固定 staging や他 writer の staging は削除しない。
+これにより (a) 完了まで既存 plist は無傷、(b) 宛先が hard link でも rename は
 **名前を差し替えるだけ**なので相手の inode は元の内容を保つ、(c) 途中失敗は rename 前に検出される。
 
 **所有判定と公開する bytes は同一 fd から取る**（review j#102590 r14f3）。path で分類してから path を開き直すと
@@ -609,7 +617,10 @@ bytes を返さない。
 自分が render した」——environment block も credential も入らない——という事実に立脚しており、**path に居る
 任意の file には及ばない**。identity 検査なしに raw `ProgramArguments` を projection へ通していたため、他人の
 plist の引数（再現では `--token <値>`）が JSON payload と CLI text の双方へ露出した。`plist_state` を常に投影し、
-`owned` のときだけ argv を出す。**「installed」を「installed by us」と読ませない**ためである。
+`owned` で、かつ argv が現在 install する exact expected command と一致するときだけ、trusted expected argv を
+出す（review j#102843 r15f3）。owned Label は filename の identity であって任意の `ProgramArguments` の
+安全性証明ではない。drift 時は `executable_matches=false` / `installed_command=[]` とし、raw mismatch bytes を
+repr / JSON / CLI text のどこにも渡さない。**「installed」を「installed by us」と読ませない**ためである。
 
 **失敗も同一 result shape で返す**（review j#102550 r13f5）。`uninstall` の unlink 失敗は構造化 envelope を
 抜けて `OSError` として送出され、例外文に host path を伴っていた。退役 migration が同じ失敗を typed result に
@@ -764,6 +775,14 @@ zero-mutation のままである（credential readiness は gate ではないた
 る。timer は portable default cadence ごとに `workflow supervisor --run-once` を 1 回起動し、process は毎 tick
 終了する。
 
+systemd 側も責務を分ける。`supervisor_systemd_unit` は unit text の render / parse だけを行い、host file を
+直接開かない。`supervisor_systemd_fs` が trusted root から unit directory の全 component を
+`O_NOFOLLOW | O_DIRECTORY` で pin し、service / timer の read・staged write・unlink を同じ directory fd 相対で
+行う（review j#102843 r15f1）。leaf は regular かつ single-link のときだけ identified とし、symlink・hardlink・
+directory・device・開けない entry は `systemd_unit_unreadable` で mutation 前に拒否する。read は同じ fd から
+identity と bytes を得て、unidentified entry の bytes を parser / status へ渡さない。write は writer-private な
+`O_EXCL` staging を全量書込後に rename し、既存 file を truncate しない。
+
 **unit の書込先（`XDG_CONFIG_HOME`）は環境変数の値を未加工で読む**（review j#102378 finding r7f3）。これは表示文字列では
 なく **mutation target** である: `install` はここへ unit file を書き、`uninstall` はここの file を削除する。値を strip して
 から絶対 path 判定していたため、XDG Base Directory Specification 0.8 の規則を同時に 2 方向へ破っていた ——
@@ -840,10 +859,10 @@ zero-mutation refusal の gate ではなく **projection** として `missing` /
 token で報告する。ローカル情報だけで安全に行える処理を止めないためである。安全境界は破れない —
 値を読むのは `resolve_redmine_credentials` であり、unsafe な file には警告を返して値を渡さないので、timer を
 導入しても不正な credential が使用されることはない。install は unsafe file の修復も迂回もしない。
-zero-mutation 拒否が残るのは install 自体が無意味になる条件だけ、すなわち非 Linux host、**systemd user manager
-到達不能**（`systemctl` 不在、または user bus に到達できない container / no-session 環境）、実行ファイル欠落で
-ある。user manager を持たない環境は「install したが永久に schedule されない」に degrade させず、明示的に
-unsupported として拒否する。
+zero-mutation 拒否が残るのは install 自体が無意味または安全に行えない条件、すなわち非 Linux host、
+**systemd user manager 到達不能**（`systemctl` 不在、または user bus に到達できない container / no-session
+環境）、実行ファイル欠落、および unit path / artifact の identity 不明である。user manager を持たない環境は
+「install したが永久に schedule されない」に degrade させず、明示的に unsupported として拒否する。
 
 status は非破壊で、受入条件が求める観測値を秘密非表示で返す: 導入・有効化状態（`installed` / `timer_enabled` /
 `loaded`）、**次回起動**（`next_elapse` + `next_elapse_basis`、および wall-clock の `last_trigger`）、**直近の
@@ -855,8 +874,10 @@ status は非破壊で、受入条件が求める観測値を秘密非表示で�
 **この 3 つの観測値の意味は #15192 で両 host 共通にした**（key 名も語彙も同一）。ただし *供給できる範囲* は
 host の manager が公開する情報に従い、**足りない分は key を落とさず explicit unknown で答える**:
 
-- **実行内容**: 両 host が `installed_command` に exact argv を出す。値は executable path + 固定 flag +
-  config directory（mozyo home）であり credential ではない。credential の値・URL・header 名は投影に出ない。
+- **実行内容**: 両 host が、installed argv と現在の expected argv が exact match した場合に限り、
+  `installed_command` に **expected argv** を出す。値は executable path + 固定 flag + config directory
+  （mozyo home）であり credential ではない。drift / unidentified command は raw 値を出さず `[]` とする。
+  credential の値・URL・header 名は投影に出ない。
   macOS 側の status は #15192 以前 path を一切出さない契約だったが、Linux（#15183 で review 済み）に合わせて
   `installed_command` に限って mozyo home を含める。**それ以外の key は従来どおり path を含めない**（test は
   carve-out を明示した上でこの不変条件を保持する）。

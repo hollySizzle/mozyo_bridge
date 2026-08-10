@@ -5,8 +5,8 @@ contract — service-status is a redacted projection + secret-free definition (e
 install / restart / uninstall drive the owned scheduler pair and fail-closed (exit non-zero, zero
 mutation) when the host cannot run it.
 
-Redmine #15183: the same four verbs now dispatch by platform — the macOS LaunchAgent pair on darwin,
-the systemd **user** service+timer pair on Linux, a typed refusal anywhere else — so every service
+Redmine #15192: the same four verbs now dispatch by platform — one macOS LaunchAgent on darwin,
+one systemd **user** service+timer pair on Linux, a typed refusal anywhere else — so every service
 test below pins the backend it means to exercise instead of inheriting the runner's OS. Real
 ``launchctl`` / ``systemctl`` are never invoked here (patched), and both the OS user home and
 ``XDG_CONFIG_HOME`` are isolated so a projection never reads or writes the host's real
@@ -130,7 +130,8 @@ class CliServiceStatusLaunchdTest(_ServiceCliCase):
         # projection reflects the controlled home rather than being always-false.
         target = sl.plist_path(self.os_home)  # the single owned agent
         target.parent.mkdir(parents=True, exist_ok=True)
-        argv = ["/opt/bin/mozyo-bridge", "workflow", "supervisor", "--run-once", "--home", self.home]
+        argv = sl.resolve_supervisor_command(mozyo_home=Path(self.home))
+        self.assertIsNotNone(argv)
         target.write_bytes(sl.render_plist(argv, interval_seconds=300, os_home=self.os_home))
         rc, out = self._service_status("darwin")
         self.assertEqual(rc, 0)
@@ -190,10 +191,10 @@ class CliServiceStatusSystemdTest(_ServiceCliCase):
         unit = ss.SUPERVISOR_UNIT
         path = ss.service_unit_path(self.os_home)
         path.parent.mkdir(parents=True, exist_ok=True)
+        argv = ss.resolve_supervisor_command(mozyo_home=Path(self.home))
+        self.assertIsNotNone(argv)
         path.write_text(
-            ss.render_service_unit(
-                ["/opt/bin/mozyo-bridge", *unit.argv_tail, "--home", self.home]
-            ),
+            ss.render_service_unit(argv),
             encoding="utf-8",
         )
         ss.timer_unit_path(self.os_home).write_text(

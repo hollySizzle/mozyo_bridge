@@ -8,7 +8,8 @@ But only when it is provably OURS.
 Split out of :mod:`...application.supervisor_launchd` to keep both modules inside the module-health
 line budget, and because this is a genuinely separable concern: a one-way, time-limited migration off
 a registration shape that no longer exists, sitting beside the lifecycle of the one that does. It
-depends only on the pure layer, so the lifecycle verbs can call it without a cycle.
+uses the dedicated process and pinned-filesystem seams; policy remains here, so the lifecycle verbs
+can call it without a cycle.
 
 Every name is re-exported from ``supervisor_launchd``, so that module remains the single import for
 the whole macOS adapter and no caller or test had to change.
@@ -22,8 +23,10 @@ from typing import Optional
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd_agent import (  # noqa: E501
     LEGACY_DRAIN_AGENT,
     SUPERVISOR_AGENT,
-    Runner,
     SupervisorAgent,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd_process import (  # noqa: E501
+    Runner,
     default_runner as _default_runner,
     launchctl,
     service_target,

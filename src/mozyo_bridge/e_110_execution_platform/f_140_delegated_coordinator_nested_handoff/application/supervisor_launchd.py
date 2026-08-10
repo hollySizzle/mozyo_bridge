@@ -68,8 +68,8 @@ from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.re
 from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_credentials import (
     resolve_redmine_credentials,
 )
-# The pure layer (owned identity, path / argv resolution, plist rendering and read-back, and the
-# vocabularies those produce) lives in the sibling module so neither side exceeds the module-health
+# The text layer (owned identity, path / argv resolution, plist rendering, and the vocabularies
+# those produce) lives in the sibling module so neither side exceeds the module-health
 # line budget — the same split the Linux adapter carries (review j#102069 F7). Everything is
 # re-exported here, so this module remains the single import for the whole macOS adapter and no
 # caller or test had to change.
@@ -96,24 +96,25 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SUPERVISOR_HOME_FLAG,
     SUPERVISOR_LAUNCHD_LABEL,
     SupervisorAgent,
-    Runner,
-    default_runner as _default_runner,
     extract_pinned_home as _extract_pinned_home,
-    gui_domain as _gui_domain,
-    launchctl as _launchctl,
     log_path,
     plist_path,
-    read_installed_plist as _read_installed_plist,
     render_plist,
-    service_target as _service_target,
     # The pure launchctl-message layer. The probe module is its only caller now; re-exported here
     # because this module stays the single import for the whole macOS adapter.
     names_exactly as _names_exactly,
     resolve_mozyo_home,
     resolve_supervisor_command,
 )
-# The read-only probe layer: running `launchctl print` and classifying what came back. Nothing in it
-# authorizes a mutation — see its module docstring.
+# Process execution is a separate leaf: this lifecycle module chooses an authorized action and the
+# seam below only runs the resulting structured launchctl argv (review j#102843 r15f4).
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd_process import (  # noqa: E501
+    Runner,
+    default_runner as _default_runner,
+    gui_domain as _gui_domain,
+    launchctl as _launchctl,
+    service_target as _service_target,
+)
 # The owned-path filesystem seam: every read and write of a plist this adapter owns, with each
 # directory component pinned no-follow (review j#102590 r14f1 / r14f2 / r14f3).
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd_fs import (  # noqa: E501
@@ -127,6 +128,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     unlink_owned,
     write_owned,
 )
+# The read-only probe layer: running `launchctl print` and classifying what came back. Nothing in it
+# authorizes a mutation — see its module docstring.
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd_probe import (  # noqa: E501
     PROBE_CONFIRMED_ABSENT,
     PROBE_LOADED,
@@ -805,11 +808,11 @@ def service_status(
         # Whose file occupies the owned path, in the same fixed vocabulary the mutating verbs refuse
         # with. Emitted always, so "installed" is never read as "installed by us" (j#102550 r13f4).
         "plist_state": plist_state,
-        # 実行内容: the exact argv the scheduled agent runs. Non-secret **because this adapter wrote
-        # it** — a PATH-resolved executable, fixed flags, and a config directory, never an
-        # environment block. That is a fact about our own render, not about any file at the path, so
-        # it is emitted only when `plist_state` is `owned` and is empty otherwise.
-        "installed_command": list(installed_argv) if isinstance(installed_argv, list) else [],
+        # 実行内容: publish the trusted EXPECTED argv only after the installed argv matches that
+        # exact schema. Label ownership authenticates the file name, not arbitrary ProgramArguments;
+        # a drifted owned plist may contain secret-shaped flags, so raw mismatch bytes never enter
+        # repr / JSON (review j#102843 finding r15f3).
+        "installed_command": list(expected) if executable_matches else [],
         # The provider cadence the supervisor body enforces internally, surfaced so an operator can
         # see that the OS tick is not a Redmine poll. This adapter does not set or enforce it.
         "provider_reconcile_interval_seconds": DEFAULT_RECONCILIATION_INTERVAL_SECONDS,

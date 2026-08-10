@@ -2,8 +2,8 @@
 
 Everything here answers "what exactly goes in the unit files, and what does an installed unit say"
 — path resolution, argv resolution, systemd quoting / specifier escaping, unit rendering, and
-unit-file readback. All of it is **pure or read-only**: no ``systemctl``, no host mutation, no
-credential resolution. The lifecycle verbs that drive the host manager live in the sibling
+parsing bytes supplied by the pinned filesystem seam. All of it is **pure**: no filesystem access,
+no ``systemctl``, no host mutation, no credential resolution. The lifecycle verbs live in the sibling
 :mod:`...application.supervisor_systemd`, which re-exports every public name below so the adapter's
 surface is a single import for callers.
 
@@ -410,16 +410,22 @@ def render_timer_unit(*, interval_seconds: int = DEFAULT_TICK_INTERVAL_SECONDS) 
 # ---------------------------------------------------------------------------
 
 
-def read_unit_keys(target: Path) -> Optional[dict[str, list[str]]]:
-    """Parse an installed unit file into ``{key: [values]}``; ``None`` if unreadable.
+def parse_unit_keys(payload: bytes | str) -> Optional[dict[str, list[str]]]:
+    """Parse pinned unit bytes into ``{key: [values]}``; ``None`` if undecodable.
 
     Section-flat on purpose: this adapter only asks "does key X exist / what is its value", and the
     owned units never reuse a key name across sections. Comments, section headers, and blank lines
-    are dropped; a line without ``=`` is ignored rather than raising.
+    are dropped; a line without ``=`` is ignored rather than raising. The caller obtains ``payload``
+    from :mod:`supervisor_systemd_fs`; this text layer never re-opens a path.
     """
-    try:
-        raw = target.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+    if isinstance(payload, bytes):
+        try:
+            raw = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    elif isinstance(payload, str):
+        raw = payload
+    else:
         return None
     keys: dict[str, list[str]] = {}
     for line in raw.splitlines():
@@ -542,7 +548,7 @@ __all__ = (
     "parse_exec_argv",
     "render_service_unit",
     "render_timer_unit",
-    "read_unit_keys",
+    "parse_unit_keys",
     "installed_command",
     "installed_interval_seconds",
     "extract_pinned_home",

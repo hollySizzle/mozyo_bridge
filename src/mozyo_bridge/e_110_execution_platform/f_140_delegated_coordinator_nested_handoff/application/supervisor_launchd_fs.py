@@ -30,6 +30,12 @@ and moved into place with ``os.replace``. Renaming swaps the *name*: if the dest
 link to a stranger's file, that file keeps its contents and only loses one of its names. A failure
 anywhere before the rename leaves the existing plist exactly as it was.
 
+Each writer uses its own unguessable ``O_EXCL`` staging name (review j#102843 r15f2). A fixed
+``<plist>.mozyo-staging`` let concurrent writers unlink one another's entry and rename a payload
+they did not write. Cleanup and rename now target only the entry whose exclusive create proved this
+writer owns it; historical or concurrent staging names are never removed merely because they match
+a predictable suffix.
+
 **Ownership and content come from one descriptor** (review j#102590 r14f3). :func:`read_owned` opens
 once, verifies the descriptor, and reads through it, returning the classification together with the
 bytes it classified. Callers that publish plist contents use that pair, so what was judged and what
@@ -41,6 +47,7 @@ from __future__ import annotations
 import errno
 import os
 import plistlib
+import secrets
 import stat
 from pathlib import Path
 from typing import Optional
@@ -59,9 +66,12 @@ PLIST_FOREIGN = "foreign"  # parses, but the ``Label`` belongs to someone else
 #: covers all of them, and none of them authorizes a mutation.
 PLIST_UNREADABLE = "unreadable"
 
-#: Suffix for the staging file a write is assembled in before it is renamed into place. It lives in
-#: the same pinned directory so the rename is within one filesystem and therefore atomic.
+#: Prefix component for writer-owned staging entries. The historical fixed entry
+#: ``<plist>.mozyo-staging`` is never used or removed: it may belong to a concurrent/older writer,
+#: and its mere name proves no ownership (review j#102843 finding r15f2).
 _STAGING_SUFFIX = ".mozyo-staging"
+_STAGING_RANDOM_BYTES = 16
+_STAGING_CREATE_ATTEMPTS = 8
 
 
 class OwnedPathError(OSError):
@@ -206,17 +216,12 @@ def write_owned(
     turn into a typed refusal.
     """
     name = agent.plist_relative.name
-    staging = f"{name}{_STAGING_SUFFIX}"
     dir_fd = open_owned_dir(os_home, agent.plist_relative, create=True)
     try:
-        # O_EXCL: never write into a staging file someone else left or planted.
-        try:
-            os.unlink(staging, dir_fd=dir_fd)
-        except FileNotFoundError:
-            pass
-        fd = os.open(
-            staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dir_fd
-        )
+        # Each writer owns an unguessable O_EXCL-created name. A fixed staging name let writer A
+        # unlink writer B's entry and later rename B's payload as if it were A's. Neither a stale
+        # historical staging entry nor another writer's live entry is ever removed here.
+        staging, fd = _create_staging(name, dir_fd)
         try:
             try:
                 _write_all(fd, payload)
@@ -225,8 +230,8 @@ def write_owned(
                 os.close(fd)
             os.replace(staging, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
         except OSError:
-            # Anything short of a completed rename leaves the previous plist untouched; clear the
-            # half-written staging file so a later run does not have to reason about it.
+            # Anything short of a completed rename leaves the previous plist untouched. Clean up
+            # only the random entry this writer successfully created; never a shared/fixed name.
             _discard(staging, dir_fd)
             raise
     finally:
@@ -264,6 +269,34 @@ def _write_all(fd: int, payload: bytes) -> None:
         if count <= 0:
             raise OSError(errno.EIO, "short write to the owned plist")
         written += count
+
+
+def _create_staging(target_name: str, dir_fd: int) -> tuple[str, int]:
+    """Create and return this writer's private staging ``(name, fd)``.
+
+    The 128-bit random component is intentionally not derived from pid/thread/time. ``O_EXCL`` is
+    the ownership proof: cleanup and rename may target only a name for which this call obtained the
+    exclusive create. A collision is retried without deleting what occupied the candidate name.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    for _attempt in range(_STAGING_CREATE_ATTEMPTS):
+        token = secrets.token_hex(_STAGING_RANDOM_BYTES)
+        staging = f".{target_name}{_STAGING_SUFFIX}-{token}"
+        try:
+            fd = os.open(staging, flags, 0o644, dir_fd=dir_fd)
+        except FileExistsError:
+            continue
+        info = os.fstat(fd)
+        if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+            return staging, fd
+        os.close(fd)
+        # This should be unreachable after O_CREAT|O_EXCL, but fail closed and remove only the entry
+        # whose exclusive creation this writer just proved.
+        _discard(staging, dir_fd)
+        raise OwnedPathError(errno.EPERM, "staging entry is not a private regular file")
+    raise OwnedPathError(errno.EEXIST, "unable to allocate a private staging entry")
 
 
 def _discard(name: str, dir_fd: int) -> None:

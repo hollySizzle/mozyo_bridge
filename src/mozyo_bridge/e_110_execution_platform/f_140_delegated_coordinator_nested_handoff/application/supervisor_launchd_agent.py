@@ -4,7 +4,7 @@ Split out of :mod:`...application.supervisor_launchd` so neither side exceeds th
 line budget, mirroring the split the Linux adapter already carries
 (:mod:`...application.supervisor_systemd_unit`, review j#102069 F7). The division is the same one:
 everything here is about **naming and text** — owned identity, path resolution, argv resolution,
-plist rendering and read-back, the launchctl argv builders, and the fixed vocabularies those produce.
+plist rendering, and the fixed vocabularies those produce.
 
 The boundary this module keeps, stated as narrowly as it can actually be enforced (review j#102590
 r14f4): **nothing here decides that a host may be mutated, and nothing here changes host state.**
@@ -12,10 +12,10 @@ An earlier version claimed the module was "pure" and mutated nothing while holdi
 which is exactly the kind of docstring-versus-code gap this lane has been correcting elsewhere. The
 writer now lives in :mod:`...application.supervisor_launchd_fs`, which is named for what it does.
 
-Two seams sit here because every layer above needs them and none of them should own them:
-:func:`launchctl` builds the manager's argv and hands it to an injected runner, and :data:`Runner` /
-:func:`default_runner` are that injection point. Running an argv someone else chose is not a decision
-about mutating the host; choosing it is, and that happens in the lifecycle verbs.
+Process execution is deliberately absent. The injected runner and structured ``launchctl`` argv
+builder live in :mod:`...application.supervisor_launchd_process`; all owned-path reads and writes
+live in :mod:`...application.supervisor_launchd_fs`. Consequently importing this module cannot
+start a process or touch an owned plist (review j#102843 finding r15f4).
 
 Every name is re-exported from ``supervisor_launchd``, so that module remains the single import for
 the whole macOS adapter and no caller or test had to change.
@@ -27,7 +27,6 @@ import dataclasses
 import os
 import plistlib
 import shutil
-import subprocess
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
@@ -216,46 +215,6 @@ def render_plist(
     return plistlib.dumps(payload)
 
 
-
-
-def read_installed_plist(target: Path) -> Optional[dict]:
-    """Best-effort parse of the installed plist; ``None`` if unreadable/malformed (never raises)."""
-    try:
-        raw = target.read_bytes()
-        parsed = plistlib.loads(raw)
-    except (OSError, ValueError, plistlib.InvalidFileException):
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-#: The manager binary. Named here, with the argv builders, so the retired-drain migration and the
-#: lifecycle verbs compose the same command without importing each other.
-LAUNCHCTL = "launchctl"
-
-
-def gui_domain() -> str:
-    """The per-user launchd domain a LaunchAgent lives in."""
-    return f"gui/{os.getuid()}"
-
-
-def service_target(agent: SupervisorAgent = SUPERVISOR_AGENT) -> str:
-    """``<domain>/<label>`` — how launchctl names one service. The label is the identity."""
-    return f"{gui_domain()}/{agent.label}"
-
-
-#: The runner every verb injects: structured argv in, a completed process out. Injected rather than
-#: called directly so no test ever depends on a real ``launchctl`` being present.
-Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
-
-
-def default_runner(argv: Sequence[str]) -> "subprocess.CompletedProcess[str]":
-    """Run the argv for real. The single place this adapter spawns a process."""
-    return subprocess.run(list(argv), capture_output=True, text=True, check=False)
-
-
-def launchctl(runner: Runner, args: Sequence[str]):
-    """Build the launchctl argv and hand it to the injected ``runner``. Runs no process itself."""
-    return runner([LAUNCHCTL, *args])
 
 
 def extract_pinned_home(installed_argv: object) -> tuple[Optional[str], str]:
@@ -563,13 +522,6 @@ __all__ = (
     "resolve_supervisor_command",
     "render_plist",
     "extract_pinned_home",
-    "read_installed_plist",
-    "LAUNCHCTL",
-    "Runner",
-    "default_runner",
-    "gui_domain",
-    "service_target",
-    "launchctl",
     "LAUNCHCTL_NOT_FOUND_CODES",
     "not_found_operand",
     "has_not_found_clause",

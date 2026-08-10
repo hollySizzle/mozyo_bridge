@@ -32,6 +32,7 @@ Live systemd operation is recorded as a separate installed-artifact smoke on the
 from __future__ import annotations
 
 import inspect
+import json
 import os
 import sys
 import tempfile
@@ -45,6 +46,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
     supervisor_service_backend as sb,
     supervisor_systemd as ss,
+    supervisor_systemd_fs as systemd_fs,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
     DEFAULT_OS_TICK_INTERVAL_SECONDS,
@@ -459,6 +461,10 @@ class UnitDirectoryTest(_LinuxCase):
         # redirected to a temp root so the ignored-value fallback stays inside the fixture.
         ignored = self.os_home / "cfg"
         fallback_home = self.os_home / "home"
+        # The filesystem boundary deliberately takes the user home itself as its trusted root.
+        # A real Path.home() exists; make the synthetic root equally truthful before pinning the
+        # components below it no-follow.
+        fallback_home.mkdir()
         with patch.dict(os.environ, {"XDG_CONFIG_HOME": f" {ignored}"}, clear=False), \
                 patch.object(Path, "home", return_value=fallback_home):
             result = ss.install(
@@ -474,6 +480,146 @@ class UnitDirectoryTest(_LinuxCase):
             self.assertFalse(
                 (fallback_home / ".config/systemd/user" / ss.SERVICE_UNIT_NAME).exists()
             )
+
+
+class PinnedUnitFilesystemTest(_LinuxCase):
+    """Systemd unit operations never escape or mutate an unidentified artifact (r15f1)."""
+
+    _MUTATING_VERBS = {
+        "daemon-reload", "enable", "disable", "stop", "restart", "reset-failed",
+    }
+
+    def _assert_no_manager_mutation(self, runner: FakeRunner) -> None:
+        self.assertEqual([], [verb for verb in runner.verbs if verb in self._MUTATING_VERBS])
+
+    def test_install_refuses_a_symlinked_ancestor_without_writing_beyond_it(self) -> None:
+        with tempfile.TemporaryDirectory() as outside_raw:
+            outside = Path(outside_raw)
+            (self.os_home / ".config").mkdir()
+            (self.os_home / ".config" / "systemd").symlink_to(
+                outside, target_is_directory=True
+            )
+            runner = self._runner()
+
+            result = ss.install(
+                os_home=self.os_home, mozyo_home=self.mozyo_home,
+                runner=runner, which=_which_found,
+            )
+
+            self.assertFalse(result["performed"])
+            self.assertEqual(ss.REASON_UNIT_UNREADABLE, result["reason"])
+            self._assert_no_manager_mutation(runner)
+            self.assertEqual([], list(outside.iterdir()))
+
+    def test_install_refuses_a_service_symlink_and_preserves_its_victim(self) -> None:
+        with tempfile.TemporaryDirectory() as outside_raw:
+            outside = Path(outside_raw)
+            victim = outside / "victim.service"
+            sentinel = b"UNIT-SYMLINK-VICTIM-SENTINEL"
+            victim.write_bytes(sentinel)
+            unit_dir = ss.unit_dir(self.os_home)
+            unit_dir.mkdir(parents=True)
+            ss.service_unit_path(self.os_home).symlink_to(victim)
+            runner = self._runner()
+
+            result = ss.install(
+                os_home=self.os_home, mozyo_home=self.mozyo_home,
+                runner=runner, which=_which_found,
+            )
+
+            self.assertFalse(result["performed"])
+            self.assertEqual(ss.REASON_UNIT_UNREADABLE, result["reason"])
+            self._assert_no_manager_mutation(runner)
+            self.assertEqual(sentinel, victim.read_bytes())
+            self.assertFalse(ss.timer_unit_path(self.os_home).exists())
+
+    def test_install_refuses_a_hard_linked_timer_and_preserves_the_other_name(self) -> None:
+        with tempfile.TemporaryDirectory() as outside_raw:
+            outside = Path(outside_raw)
+            victim = outside / "victim.timer"
+            sentinel = b"UNIT-HARDLINK-VICTIM-SENTINEL"
+            victim.write_bytes(sentinel)
+            unit_dir = ss.unit_dir(self.os_home)
+            unit_dir.mkdir(parents=True)
+            os.link(victim, ss.timer_unit_path(self.os_home))
+            runner = self._runner()
+
+            result = ss.install(
+                os_home=self.os_home, mozyo_home=self.mozyo_home,
+                runner=runner, which=_which_found,
+            )
+
+            self.assertFalse(result["performed"])
+            self.assertEqual(ss.REASON_UNIT_UNREADABLE, result["reason"])
+            self._assert_no_manager_mutation(runner)
+            self.assertEqual(sentinel, victim.read_bytes())
+            self.assertFalse(ss.service_unit_path(self.os_home).exists())
+
+    def test_writer_revalidates_a_leaf_changed_after_lifecycle_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as outside_raw:
+            victim = Path(outside_raw) / "late-victim.service"
+            sentinel = b"ACTION-TIME-SYMLINK-VICTIM-SENTINEL"
+            victim.write_bytes(sentinel)
+            real_write_units = ss._write_units
+
+            def swap_then_write(service_payload, timer_payload, os_home):
+                ss.unit_dir(self.os_home).mkdir(parents=True)
+                ss.service_unit_path(self.os_home).symlink_to(victim)
+                return real_write_units(service_payload, timer_payload, os_home)
+
+            runner = self._runner()
+            with patch.object(ss, "_write_units", swap_then_write):
+                result = ss.install(
+                    os_home=self.os_home, mozyo_home=self.mozyo_home,
+                    runner=runner, which=_which_found,
+                )
+
+            self.assertFalse(result["performed"])
+            self.assertEqual(ss.REASON_UNIT_UNREADABLE, result["reason"])
+            self._assert_no_manager_mutation(runner)
+            self.assertEqual(sentinel, victim.read_bytes())
+            self.assertTrue(ss.service_unit_path(self.os_home).is_symlink())
+            self.assertFalse(ss.timer_unit_path(self.os_home).exists())
+
+    def test_uninstall_refuses_an_unsafe_leaf_before_manager_mutation(self) -> None:
+        self._install()
+        with tempfile.TemporaryDirectory() as outside_raw:
+            victim = Path(outside_raw) / "victim.service"
+            sentinel = b"UNINSTALL-SYMLINK-VICTIM-SENTINEL"
+            victim.write_bytes(sentinel)
+            target = ss.service_unit_path(self.os_home)
+            target.unlink()
+            target.symlink_to(victim)
+            runner = self._runner()
+
+            result = ss.uninstall(os_home=self.os_home, runner=runner)
+
+            self.assertFalse(result["performed"])
+            self.assertEqual(ss.REASON_UNIT_UNREADABLE, result["reason"])
+            self.assertFalse(result["removed"])
+            self._assert_no_manager_mutation(runner)
+            self.assertEqual(sentinel, victim.read_bytes())
+            self.assertTrue(target.is_symlink())
+
+    def test_status_never_reads_bytes_through_an_unsafe_leaf(self) -> None:
+        with tempfile.TemporaryDirectory() as outside_raw:
+            sentinel = "STATUS-SYMLINK-SECRET-SENTINEL"
+            victim = Path(outside_raw) / "victim.service"
+            victim.write_text(sentinel, encoding="utf-8")
+            ss.unit_dir(self.os_home).mkdir(parents=True)
+            ss.service_unit_path(self.os_home).symlink_to(victim)
+            runner = self._runner()
+
+            status = ss.service_status(
+                os_home=self.os_home, mozyo_home=self.mozyo_home,
+                runner=runner, which=_which_found,
+            )
+
+            self.assertEqual(systemd_fs.UNIT_UNREADABLE, status["service_unit_state"])
+            self.assertEqual([], status["installed_command"])
+            self.assertNotIn(sentinel, repr(status))
+            self.assertNotIn(sentinel, json.dumps(status))
+            self._assert_no_manager_mutation(runner)
 
 
 # ---------------------------------------------------------------------------
@@ -1097,6 +1243,26 @@ class ServiceStatusTest(_LinuxCase):
                 "--home", str(self.mozyo_home.resolve()),
             ],
         )
+
+    def test_drifted_installed_argv_is_absent_from_repr_and_json(self) -> None:
+        self._install()
+        sentinel = "SYSTEMD-DRIFT-SECRET-SENTINEL"
+        drifted = [
+            "/opt/bin/mozyo-bridge", "workflow", "supervisor", "--run-once",
+            "--home", str(self.mozyo_home.resolve()), "--token", sentinel,
+        ]
+        ss.service_unit_path(self.os_home).write_text(
+            ss.render_service_unit(drifted), encoding="utf-8"
+        )
+
+        status = ss.service_status(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            runner=self._runner(), which=_which_found,
+        )
+        self.assertFalse(status["executable_matches"])
+        self.assertEqual([], status["installed_command"])
+        self.assertNotIn(sentinel, repr(status))
+        self.assertNotIn(sentinel, json.dumps(status))
 
     def test_status_projects_the_installed_and_scheduled_service(self) -> None:
         self._install()

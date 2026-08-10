@@ -12,8 +12,9 @@ projection — and ``restart``'s refusal token.
 That sentence is deliberately narrower than the one it replaces (review j#102590 r14f4), which said
 a destructive verb importing from this module would be a defect — while the mutating modules were
 importing the process seam from it, and that seam is what runs ``bootout``. The claim worth making is
-the one the code keeps: what this module *concludes* never grants permission to change the host. The
-seam moved to the identity module, where being imported by everyone is unremarkable.
+the one the code keeps: what this module *concludes* never grants permission to change the host.
+Process execution now lives in ``supervisor_launchd_process``; this module imports that narrow seam
+only to perform the read-only ``launchctl print`` request (review j#102843 r15f4).
 
 Every name is re-exported from ``supervisor_launchd``, so that module remains the single import for
 the whole macOS adapter and no caller or test had to change.
@@ -27,13 +28,15 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LAUNCHCTL_NOT_FOUND_CODES,
     LAUNCHCTL_UNREADABLE_PHRASES,
     SUPERVISOR_AGENT,
-    Runner,
     SupervisorAgent,
     has_not_found_clause,
-    launchctl,
     names_exactly,
     not_found_operand,
     quoted_names,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd_process import (  # noqa: E501
+    Runner,
+    launchctl,
     service_target,
 )
 
