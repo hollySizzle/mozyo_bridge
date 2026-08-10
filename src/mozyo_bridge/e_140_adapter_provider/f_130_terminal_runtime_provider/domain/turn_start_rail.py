@@ -179,11 +179,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     RESEND_SKIP_STARTUP_SCREEN,
     RESEND_SKIP_STATE_NOT_INJECTABLE,
     RESEND_SKIP_STATE_UNREADABLE,
-    RESEND_SKIP_WAIT_UNARMED,
     ResendIdentityProbe,
     ResendScreenGuard,
     composer_retains_body,
-    current_composer_retains_body,
     probe_identity,
     screen_guard_detects,
 )
@@ -597,13 +595,10 @@ class HerdrTurnStartRail:
     def reader(self):
         """The injected #13246 state reader (``read_agent_state``).
 
-        Exposed read-only so a caller that already holds the resolved herdr rail
-        (stashed on ``commands.active_herdr_turn_start_rail`` for a herdr send) can
-        take runtime-state snapshots without resolving a second reader from config.
-        The queue-enter path borrows it for its pre-Enter causal baseline, strict
-        at-most-once resend gate, and post-choreography snapshot (#13292 / #15242).
-        That path still does NOT call ``drive_turn_start`` or transfer injection
-        ownership, because queue-enter deliberately permits a busy receiver.
+        A caller holding the active rail may take snapshots without resolving a
+        second reader. queue-enter borrows it for its causal baseline, strict resend
+        gate, and final snapshot (#13292 / #15242), but never calls
+        ``drive_turn_start`` because that would reject a busy receiver.
         """
         return self._reader
 
@@ -628,22 +623,7 @@ class HerdrTurnStartRail:
         return read.content
 
     def arm_turn_start_wait(self, target: str, *, timeout_ms: int) -> ArmedWait:
-        """Arm this rail's bound working-transition observer without injecting.
-
-        The Herdr queue-enter path owns body injection because it permits a busy
-        receiver, unlike :meth:`drive_turn_start`.  It still must use the exact
-        same bound wait primitive (binary, server and environment) as the standard
-        rail.  This narrow two-stage seam lets that path arm before its Enter
-        without resolving a second provider or reaching into ``_wait``.
-        """
-        if not isinstance(timeout_ms, int) or isinstance(timeout_ms, bool):
-            raise TurnStartRailError(
-                f"timeout_ms must be an int, got {timeout_ms!r}"
-            )
-        if timeout_ms <= 0:
-            raise TurnStartRailError(
-                f"timeout_ms must be positive, got {timeout_ms}"
-            )
+        """Arm the already-bound observer without transferring injection ownership."""
         return self._wait.arm(target, timeout_ms=timeout_ms)
 
     def drive_turn_start(
@@ -1000,7 +980,6 @@ __all__ = (
     "RESEND_SKIP_STARTUP_SCREEN",
     "RESEND_SKIP_STATE_NOT_INJECTABLE",
     "RESEND_SKIP_STATE_UNREADABLE",
-    "RESEND_SKIP_WAIT_UNARMED",
     "TURN_START_OUTCOMES",
     "WAIT_ABSENT",
     "WAIT_CHANGED",
@@ -1016,6 +995,5 @@ __all__ = (
     "TurnStartWaitPort",
     "WaitResult",
     "composer_retains_body",
-    "current_composer_retains_body",
     "turn_start_rail_record_lines",
 )

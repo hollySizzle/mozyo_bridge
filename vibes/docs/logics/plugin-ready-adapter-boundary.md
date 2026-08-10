@@ -1521,13 +1521,15 @@ the fact that the first observation failed; `resend_skipped_reason` (the closed
 `enter_resends=0` is no longer ambiguous between "none was needed" and "one was wanted
 and withheld". The original five j#72602 keys keep their meaning and values.
 
-The gate's closed skip vocabulary and its pure predicates live in the leaf
-`domain/turn_start_resend_gate.py` and are re-exported from `turn_start_rail.py`
-(the module-health split, mirroring the provider registry's startup-blocker schema).
+The gate's closed skip vocabulary and pure predicates live in the leaf
+`domain/turn_start_resend_gate.py`. Existing standard-rail names remain re-exported
+from `turn_start_rail.py`; the queue-specific current-composer predicate is imported
+directly by its application seam so the 999-line standard rail does not grow.
 
 ### Herdr queue-enter causal resend seam (Redmine #15242)
 
-Redmine #15242 (既定 queue-enter の turn-start 補完) connects the default Herdr
+`application/handoff_herdr_queue_enter_rail.py` owns this bounded seam. Redmine #15242
+(既定 queue-enter の turn-start 補完) connects the default Herdr
 `queue-enter` choreography to causal turn-start evidence without routing it through
 `drive_turn_start`. That separation is required: `drive_turn_start` rejects a `busy`
 precondition so that a standard send can attribute the next turn to itself, while

@@ -52,6 +52,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (
     AgentStateResult,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
+    TerminalTransportError,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     AsanaAnchor,
     DeliveryOutcome,
@@ -798,6 +801,36 @@ class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
         self.assertEqual(ops.enter_presses, 1)
         obs = ops.emitted[0].outcome.queue_enter_turn_start_observation
         self.assertEqual(obs.get("resend_skipped_reason"), RESEND_SKIP_IDENTITY_DRIFT)
+
+    def test_transport_failure_during_resend_gate_closes_to_typed_block(self) -> None:
+        class _TransportFailingGateOps(_V2FakeOps):
+            def evaluate_queue_enter_resend(
+                self,
+                target: str,
+                text: str,
+                receiver: str,
+                baseline_binding: Optional[dict],
+            ) -> QueueEnterResendGate:
+                self.events.append("gate_qe")
+                raise TerminalTransportError("adapter-private failure detail")
+
+        ops = _TransportFailingGateOps(
+            marker_observed=True,
+            queue_enter_snapshot=self._snapshot(),
+            wait_kind="timeout",
+            binding=self._binding(),
+            runtime_state="turn_ended",
+        )
+        code, died = _run(ops, _request(mode=_MODE_QUEUE_ENTER, herdr_send=True))
+
+        self.assertIsNone(code)
+        self.assertIsNotNone(died)
+        self.assertEqual(ops.enter_presses, 1)
+        self.assertEqual(ops.injected, [("%pT", "[[mk-1]] hello body")])
+        outcome = ops.emitted[0].outcome
+        self.assertEqual((outcome.status, outcome.reason), ("blocked", "transport_error"))
+        self.assertEqual(outcome.injection_stage["stage"], STAGE_UNCERTAIN_PARTIAL)
+        self.assertNotIn("adapter-private", died.message)
 
     def test_zero_window_disables_the_extra_enter_but_keeps_the_initial_observation(self) -> None:
         ops = _V2FakeOps(

@@ -75,8 +75,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     TurnStartResult,
     WaitResult,
     composer_retains_body,
-    current_composer_retains_body,
     turn_start_rail_record_lines,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_resend_gate import (
+    current_composer_retains_body,
 )
 
 TARGET = "w1:p1"
