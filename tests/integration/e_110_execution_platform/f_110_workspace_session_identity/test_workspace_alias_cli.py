@@ -28,6 +28,8 @@ from mozyo_bridge.core.state.workspace_registry import ANCHOR_SCHEMA_VERSION
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.workspace_alias import (  # noqa: E501
     MAX_DECLARATION_BYTES,
     REASON_ALIAS_CYCLE,
+    REASON_CONCURRENT_CHANGE,
+    REASON_DURABILITY_FAILED,
     REASON_CROSS_REPOSITORY,
     REASON_DECLARATION_INVALID,
     REASON_DECLARATION_UNREADABLE,
@@ -720,6 +722,180 @@ class WorkspaceAliasRollbackAndSizeTests(WorkspaceAliasCliTestCase):
         )
         self.assertEqual(code, 0)
         self.assertEqual(payload["state"], "aliased")
+
+
+class WorkspaceAliasConcurrencyAndDurabilityTests(WorkspaceAliasCliTestCase):
+    """Review j#102259 Findings 1–2, driven through the public CLI."""
+
+    @staticmethod
+    def _is_dir_fd(fd: int) -> bool:
+        try:
+            return stat.S_ISDIR(os.fstat(fd).st_mode)
+        except OSError:  # pragma: no cover - defensive
+            return False
+
+    # --- F1: a concurrent declaration must survive a failed rollback -------
+
+    def test_concurrent_declaration_is_not_overwritten_by_a_failed_rollback(
+        self,
+    ) -> None:
+        """Another successful mutation must not be undone by our failure.
+
+        The writer snapshots, a different supported mutation lands a *new*
+        inode at the same path, and this writer then fails verification. Its
+        rollback must not restore the older bytes over the concurrent winner.
+        """
+        self.run_cli(
+            "workspace", "alias", "disable",
+            "--repo", str(self.nested), "--reason", "OLD",
+        )
+        path = alias_path(self.nested)
+        real_read_bytes = store._read_bytes
+
+        def snapshot_then_concurrent(dirfd):
+            data = real_read_bytes(dirfd)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["reason"] = "CONCURRENT"
+            temp = path.parent / ".concurrent.tmp"
+            temp.write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temp, path)
+            return data
+
+        with mock.patch.object(store, "_read_bytes", snapshot_then_concurrent), \
+                mock.patch.object(
+                    store, "_read_with_dirfd",
+                    return_value=store.refused("simulated", "verification failed"),
+                ):
+            code, payload = self.run_cli(
+                "workspace", "alias", "disable",
+                "--repo", str(self.nested), "--reason", "NEW",
+            )
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["reason"], REASON_CONCURRENT_CHANGE)
+        self.assertFalse(payload["mutated"])
+        self.assertEqual(
+            json.loads(path.read_text(encoding="utf-8"))["reason"],
+            "CONCURRENT",
+            "a failed write overwrote a concurrently-succeeded declaration",
+        )
+
+    def test_supported_mutations_serialize_on_one_lock(self) -> None:
+        """A second mutation cannot enter while one holds the lock."""
+        entered: list = []
+        parent = self.nested / ".mozyo-bridge"
+        parent.mkdir(parents=True, exist_ok=True)
+        dirfd = store._open_parent(self.nested, create=True)
+        try:
+            with store._mutation_lock(dirfd):
+                def _try_write() -> None:
+                    other = store._open_parent(self.nested, create=True)
+                    try:
+                        # Non-blocking probe of the same lock.
+                        fd = os.open(
+                            store._LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o644,
+                            dir_fd=other,
+                        )
+                        try:
+                            import fcntl as _fcntl
+
+                            _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                            entered.append("acquired")
+                        except OSError:
+                            entered.append("blocked")
+                        finally:
+                            os.close(fd)
+                    finally:
+                        os.close(other)
+
+                worker = threading.Thread(target=_try_write)
+                worker.start()
+                worker.join(5.0)
+        finally:
+            os.close(dirfd)
+        self.assertEqual(entered, ["blocked"])
+
+    # --- F2: directory durability is required, not best-effort -------------
+
+    def test_write_refuses_when_the_directory_cannot_be_synced(self) -> None:
+        real_fsync = os.fsync
+
+        def failing(fd):
+            if self._is_dir_fd(fd):
+                raise OSError(5, "EIO")
+            return real_fsync(fd)
+
+        with mock.patch.object(store.os, "fsync", failing):
+            code, payload = self.run_cli(
+                "workspace", "alias", "disable", "--repo", str(self.nested)
+            )
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["reason"], REASON_DURABILITY_FAILED)
+        # The rollback could not be made durable either, so this is reported as
+        # a real mutation needing manual inspection rather than as a no-op.
+        self.assertTrue(payload["mutated"])
+
+    def test_clear_syncs_the_parent_directory(self) -> None:
+        self.run_cli("workspace", "alias", "disable", "--repo", str(self.nested))
+        real_fsync = os.fsync
+        seen = {"dir": 0}
+
+        def counting(fd):
+            if self._is_dir_fd(fd):
+                seen["dir"] += 1
+            return real_fsync(fd)
+
+        with mock.patch.object(store.os, "fsync", counting):
+            code, _ = self.run_cli(
+                "workspace", "alias", "clear", "--repo", str(self.nested)
+            )
+        self.assertEqual(code, 0)
+        self.assertGreaterEqual(seen["dir"], 1, "clear did not sync its directory")
+
+    def test_clear_refuses_when_the_directory_cannot_be_synced(self) -> None:
+        self.run_cli("workspace", "alias", "disable", "--repo", str(self.nested))
+        real_fsync = os.fsync
+
+        def failing(fd):
+            if self._is_dir_fd(fd):
+                raise OSError(5, "EIO")
+            return real_fsync(fd)
+
+        with mock.patch.object(store.os, "fsync", failing):
+            code, payload = self.run_cli(
+                "workspace", "alias", "clear", "--repo", str(self.nested)
+            )
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["reason"], REASON_REMOVE_FAILED)
+        self.assertTrue(payload["mutated"])
+
+    def test_rollback_is_also_synced(self) -> None:
+        self.run_cli(
+            "workspace", "alias", "disable",
+            "--repo", str(self.nested), "--reason", "OLD",
+        )
+        real_fsync = os.fsync
+        seen = {"dir": 0}
+
+        def counting(fd):
+            if self._is_dir_fd(fd):
+                seen["dir"] += 1
+            return real_fsync(fd)
+
+        with mock.patch.object(store.os, "fsync", counting), mock.patch.object(
+            store, "_read_with_dirfd",
+            return_value=store.refused("simulated", "verification failed"),
+        ):
+            code, _ = self.run_cli(
+                "workspace", "alias", "disable",
+                "--repo", str(self.nested), "--reason", "NEW",
+            )
+        self.assertEqual(code, 1)
+        self.assertGreaterEqual(
+            seen["dir"], 2, "the rollback replace was never made durable"
+        )
 
 
 class WorkspaceAliasLaunchRefusalTests(WorkspaceAliasCliTestCase):

@@ -97,6 +97,17 @@ REASON_WRITE_FAILED = "declaration_write_failed"
 # a later verification failure would have nothing to restore (review j#102230
 # Finding 1). Refused ahead of the replace rather than discovered after it.
 REASON_SNAPSHOT_FAILED = "declaration_snapshot_failed"
+# The declaration changed identity between this operation's snapshot and its
+# replace (review j#102259 Finding 1). Supported mutations serialize on a lock,
+# so this means an unmanaged writer intervened; either way a rollback would
+# overwrite a declaration this operation never read.
+REASON_CONCURRENT_CHANGE = "declaration_concurrent_change"
+# The mutation could not be made durable — the parent directory entry was not
+# synced (review j#102259 Finding 2). An unsynced rename can vanish on power
+# loss, so it cannot be reported as a completed, read-back-able declaration.
+REASON_DURABILITY_FAILED = "declaration_durability_failed"
+# The single-writer mutation lock could not be taken.
+REASON_LOCK_FAILED = "declaration_lock_failed"
 # The declaration exceeds :data:`MAX_DECLARATION_BYTES`. A declaration is a
 # handful of short fields; anything larger is a repository-controlled file being
 # used to force an unbounded allocation in a process that only wanted to decide
@@ -484,6 +495,9 @@ __all__ = (
     "ALIAS_RELATIVE",
     "ALIAS_SCHEMA_VERSION",
     "MAX_DECLARATION_BYTES",
+    "REASON_CONCURRENT_CHANGE",
+    "REASON_DURABILITY_FAILED",
+    "REASON_LOCK_FAILED",
     "REASON_PARENT_DRIFT",
     "REASON_SNAPSHOT_FAILED",
     "REASON_TOO_LARGE",

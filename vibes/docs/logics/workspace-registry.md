@@ -218,6 +218,21 @@ descriptor** に固定し、判定は全て `lstat` で行う。
   持たずに巨大 size を宣言でき、read 中に成長もしうる) ため、両方を課す。旧実装の
   `os.read(fd, st_size + 1)` は 512 MiB の sparse 宣言だけで reader を raw `MemoryError` に
   追い込めた。`MemoryError` も typed refusal へ変換する。
+- **全 supported mutation は single-writer で直列化する** (review j#102259 F1)。
+  `.mozyo-bridge/.workspace-alias.json.lock` の排他 lock を snapshot → replace →
+  verify → rollback の全区間で保持する。replace 直前の precheck だけでは
+  check→replace race が残り、その間に成功した別 mutation を失敗側の rollback が
+  無言で上書きしうる (実測: 失敗した write が concurrent 宣言を旧内容へ戻し、しかも
+  `mutated=false` と報告した)。加えて snapshot した entry の generation
+  (dev/ino/mtime_ns/size) を束縛し、snapshot 直後と replace 直前に照合する
+  (`declaration_concurrent_change`)。lock を通らない外部 writer への防御であり、
+  「読んでいない宣言を上書きしない」ことを保証する。
+- **directory durability を成功条件に含める** (review j#102259 F2)。final replace /
+  clear の unlink / すべての rollback・restore の後に parent directory を `fsync` し、
+  失敗を握り潰さない (`declaration_durability_failed`)。unsynced な rename/unlink は
+  power loss で失われるため、process 内 readback が一致しても durable な宣言とは
+  言えない。rollback も durable に完了できない場合は `mutated=true` 相当として
+  manual inspection を要求する。
 - **schema の型検査は exact** (review j#102140 F4)。Python では `True == 1` / `1.0 == 1` が
   成立し、`bool` は `int` の subclass なので、値比較だけでは bool / float が整数 1 として
   通ってしまう。`schema_version` は `type(v) is int` を要求し、optional な文字列 field は
