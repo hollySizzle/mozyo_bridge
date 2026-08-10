@@ -66,6 +66,12 @@ GATE_STALE_WORKER_RECOVERY_OWNER_APPROVAL = "stale_worker_recovery_owner_approva
 #: Redmine #15227: owner-approved replacement of a post-reboot active sublane pair whose
 #: restored command shell no longer matches its canonical worktree / startup identity proof.
 GATE_RESTORED_PAIR_RECOVERY_OWNER_APPROVAL = "restored_pair_recovery_owner_approval"
+#: Redmine #15193: owner-approved discard of one exactly-bound pending composer followed by
+#: replacement of a generation-mismatched stopped receiver.  The marker's direct-owner provenance
+#: remains a separate axis; this token only names the coordinator writer contract (j#103101).
+GATE_GENERATION_MISMATCH_DISPOSITION_OWNER_APPROVAL = (
+    "generation_mismatch_disposition_owner_approval"
+)
 
 #: Redmine #14838: the shared-home global offline-rollout approval gate (ruling j#97993).
 GATE_HERDR_OFFLINE_ROLLOUT_OWNER_APPROVAL = "herdr_offline_rollout_owner_approval"
@@ -85,6 +91,9 @@ WORKER_REFRESH_APPROVAL_RULING = "redmine:#14661:j#92641"
 RECOVERY_OWNER_APPROVAL_RULING = "redmine:#14663:j#99195"
 #: The ruling that fixes the #15227 pair-recovery gate's canonical writer and scope.
 RESTORED_PAIR_RECOVERY_APPROVAL_RULING = "redmine:#15227:j#102879"
+#: The gate-specific ruling that names the #15193 disposition approval's coordinator writer.
+#: It cannot inherit the older recovery ruling: that record predates and does not name this gate.
+GENERATION_MISMATCH_DISPOSITION_APPROVAL_RULING = "redmine:#15193:j#103101"
 #: The ruling that binds the global offline-rollout approval record to the coordinator writer.
 HERDR_OFFLINE_ROLLOUT_APPROVAL_RULING = "redmine:#14838:j#97993"
 #: The ruling that decided the no-change review waiver gate's writer contract. It names THIS gate
@@ -137,6 +146,7 @@ _KIND_ISSUER = {
     GATE_GATEWAY_RECOVERY_OWNER_APPROVAL: ISSUER_COORDINATOR,
     GATE_STALE_WORKER_RECOVERY_OWNER_APPROVAL: ISSUER_COORDINATOR,
     GATE_RESTORED_PAIR_RECOVERY_OWNER_APPROVAL: ISSUER_COORDINATOR,
+    GATE_GENERATION_MISMATCH_DISPOSITION_OWNER_APPROVAL: ISSUER_COORDINATOR,
     # Redmine #14838 ruling j#97993: the coordinator records the owner's exact global-cutover
     # decision.  The marker's approval_source=direct_owner is the independent provenance axis;
     # this mapping only establishes the canonical writer role.
@@ -168,6 +178,9 @@ _KIND_RULING = {
     GATE_GATEWAY_RECOVERY_OWNER_APPROVAL: RECOVERY_OWNER_APPROVAL_RULING,
     GATE_STALE_WORKER_RECOVERY_OWNER_APPROVAL: RECOVERY_OWNER_APPROVAL_RULING,
     GATE_RESTORED_PAIR_RECOVERY_OWNER_APPROVAL: RESTORED_PAIR_RECOVERY_APPROVAL_RULING,
+    GATE_GENERATION_MISMATCH_DISPOSITION_OWNER_APPROVAL: (
+        GENERATION_MISMATCH_DISPOSITION_APPROVAL_RULING
+    ),
     GATE_HERDR_OFFLINE_ROLLOUT_OWNER_APPROVAL: HERDR_OFFLINE_ROLLOUT_APPROVAL_RULING,
     GATE_NO_CHANGE_REVIEW_WAIVER: NO_CHANGE_REVIEW_WAIVER_RULING,
 }
@@ -347,12 +360,14 @@ def check_issuer(kind: str, issuer: ResolvedIssuer, *, envelope) -> "str | None"
 
 __all__ = [
     "GATE_GATEWAY_RECOVERY_OWNER_APPROVAL",
+    "GATE_GENERATION_MISMATCH_DISPOSITION_OWNER_APPROVAL",
     "GATE_HERDR_OFFLINE_ROLLOUT_OWNER_APPROVAL",
     "GATE_NO_CHANGE_REVIEW_WAIVER",
     "GATE_WORKER_REFRESH_OWNER_APPROVAL",
     "GATE_STALE_WORKER_RECOVERY_OWNER_APPROVAL",
     "GATE_RESTORED_PAIR_RECOVERY_OWNER_APPROVAL",
     "HIBERNATE_EVIDENCE_RULING",
+    "GENERATION_MISMATCH_DISPOSITION_APPROVAL_RULING",
     "HERDR_OFFLINE_ROLLOUT_APPROVAL_RULING",
     "NO_CHANGE_REVIEW_WAIVER_RULING",
     "RECOVERY_OWNER_APPROVAL_RULING",

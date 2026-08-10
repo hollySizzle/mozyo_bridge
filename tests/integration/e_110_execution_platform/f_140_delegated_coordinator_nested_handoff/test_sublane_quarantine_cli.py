@@ -91,9 +91,10 @@ class _FakeOps:
     """Stands in for the live herdr adapter: a candidate composer, zero actuation."""
 
     calls: list[str] = []
+    init_kwargs: dict = {}
 
-    def __init__(self, **_kw) -> None:
-        pass
+    def __init__(self, **kw) -> None:
+        _FakeOps.init_kwargs = kw
 
     def inspect(self, request) -> QuarantineInspection:
         return QuarantineInspection(
@@ -120,6 +121,9 @@ class _FakeOps:
     def verify_fresh_receiver(self, request, *, fresh_after):  # pragma: no cover
         raise AssertionError("preflight must not verify a fresh receiver")
 
+    def approval_verified(self, request, inspection):
+        return False
+
 
 class RegistrationTest(unittest.TestCase):
     def test_quarantine_is_registered_under_sublane(self) -> None:
@@ -133,6 +137,20 @@ class RegistrationTest(unittest.TestCase):
     def test_execute_is_opt_in(self) -> None:
         self.assertFalse(build_parser().parse_args(ARGV).execute)
         self.assertTrue(build_parser().parse_args([*ARGV, "--execute"]).execute)
+
+    def test_disposition_lifecycle_pins_parse_as_positive_integers(self) -> None:
+        ns = build_parser().parse_args(
+            [
+                *ARGV,
+                "--approved-generation-axes", "pair",
+                "--approved-pending-identity", "pending:uncorrelated",
+                "--approved-pending-effect", "discarded_on_replace",
+                "--approved-lane-generation", "3",
+                "--approved-lifecycle-revision", "11",
+            ]
+        )
+        self.assertEqual(ns.approved_lane_generation, 3)
+        self.assertEqual(ns.approved_lifecycle_revision, 11)
 
     def test_every_exact_target_field_is_required(self) -> None:
         # Dropping any one of them would leave the receiver only partially identified,
@@ -162,6 +180,7 @@ class CommandTest(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.home = Path(self._tmp.name)
         _FakeOps.calls = []
+        _FakeOps.init_kwargs = {}
 
         self.lifecycle = LaneLifecycleStore(home=self.home)
         self.key = LaneLifecycleKey(WS, LANE)
@@ -199,6 +218,28 @@ class CommandTest(unittest.TestCase):
         row = self.lifecycle.get(self.key)
         self.assertEqual(row.replacement_state, REPLACEMENT_NOT_REQUESTED)
         self.assertEqual(row.revision, 1)
+
+    def test_disposition_execute_wires_only_a_fresh_durable_reader(self) -> None:
+        reader = lambda _issue: []
+        disposition = [
+            *ARGV,
+            "--approved-generation-axes", "pair",
+            "--approved-pending-identity", "pending:provider:" + "a" * 64,
+            "--approved-pending-effect", "discarded_on_replace",
+            "--approved-lane-generation", "1",
+            "--approved-lifecycle-revision", "1",
+            "--execute",
+        ]
+        with mock.patch.object(
+            quarantine_module,
+            "fresh_live_redmine_journal_reader",
+            return_value=(reader, True),
+        ):
+            rc, _out = self._run(disposition)
+        self.assertEqual(rc, 1)
+        self.assertIs(_FakeOps.init_kwargs["journal_reader"], reader)
+        self.assertTrue(_FakeOps.init_kwargs["journal_reader_fresh"])
+        self.assertEqual(_FakeOps.calls, [])
 
     def test_json_payload_reports_classification_not_composer_body(self) -> None:
         rc, out = self._run([*ARGV, "--json"])

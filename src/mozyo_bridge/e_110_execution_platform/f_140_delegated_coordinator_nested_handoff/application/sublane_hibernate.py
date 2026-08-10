@@ -50,7 +50,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, Protocol, Sequence, runtime_checkable
+from typing import Any, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
 from mozyo_bridge.core.state.herdr_identity_attestation import (
     IdentityAttestationRecord,
@@ -105,6 +105,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LaneActivityObservation,
     fresh_release_disposition,
     post_release_residue,
+    read_activity,
     read_fingerprint,
     read_live_lane_activity,
     read_live_worktree_fingerprint,
@@ -520,9 +521,10 @@ class SublaneHibernateUseCase:
         # fingerprint at the release boundary and blocks on any divergence (see
         # :func:`sublane_hibernate_boundary.revalidate_boundary`).
         rows, inventory_readable = self.ops.read_inventory()
-        # Redmine #13843 preflight (T0) worktree fingerprint — the baseline the release-boundary
-        # re-validation compares the fresh (T1) capture against.
+        # Preflight (T0) captures, both re-read fresh at the boundary per the note above:
+        # the #13843 worktree fingerprint and the #15193 dry-run-parity activity probe.
         fingerprint_preflight = read_fingerprint(self.ops)
+        activity_preflight = read_activity(self.ops, workspace_id, lane, rows)
 
         # Project-gateway action-time exact-generation fences (Redmine #13811; design #13780
         # j#78386 §1-2). The release closes the lane's CURRENT live slots, so before any
@@ -744,6 +746,9 @@ class SublaneHibernateUseCase:
             project_attestation_ok=project_attestation_ok,
             action_generation_current=action_generation_current,
             action_revision_current=action_revision_current,
+            live_composer_pending=activity_preflight.composer_pending,
+            live_worker_busy=activity_preflight.worker_busy,
+            live_activity_readable=activity_preflight.readable,
             assertions=request.assertions,
         )
         if not preflight.may_hibernate or not execute:

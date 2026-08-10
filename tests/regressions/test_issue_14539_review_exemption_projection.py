@@ -3889,6 +3889,12 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "A malformed marker, non-canonical field order, duplicate field, or anything other "
             "than exactly one operation-bound marker for the requested gate authorizes nothing",
         ),
+        f"{_D}/domain/generation_mismatch_disposition.py": (
+            ["*"],
+            "renders the generation-mismatch disposition approval through the shared "
+            "recovery_owner_approval renderer; it does not read durable notes. The shared live "
+            "verifier requires exactly one canonical operation-bound marker for this gate",
+        ),
         "src/mozyo_bridge/e_110_execution_platform/f_160_state_store_managed_events/domain/offline_rollout_action.py": (
             ["*", "*", "*", "*:MARKER_RE"],
             "owns the offline-rollout owner-approval grammar: renders the exact workflow-event "

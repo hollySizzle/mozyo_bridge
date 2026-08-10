@@ -352,7 +352,7 @@ class WorkspaceAliasCliFilesystemSafetyTests(WorkspaceAliasCliTestCase):
         )
         self.assertEqual(code, 0)
         self.assertEqual(payload["state"], "cleared")
-        self.assertFalse(alias_path(self.nested).exists(follow_symlinks=False))
+        self.assertFalse(os.path.lexists(alias_path(self.nested)))
         self.assertEqual(victim.read_text(encoding="utf-8"), "SECRET-ORIGINAL")
 
     def test_show_refuses_a_declaration_carrying_unknown_fields(self) -> None:

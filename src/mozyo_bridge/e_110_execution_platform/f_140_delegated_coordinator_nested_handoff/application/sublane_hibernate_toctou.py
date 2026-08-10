@@ -180,7 +180,12 @@ _NEXT_ACTION_DETAIL: dict[str, str] = {
     NEXT_ACTION_OWNER_APPROVED_QUARANTINE: (
         "a real (non-ghost) pending composer input was observed; it requires an "
         "owner-approved disposition (consume the input, or quarantine the lane) before "
-        "hibernate can proceed — never auto-discard it"
+        "hibernate can proceed — never auto-discard it. Run `sublane quarantine-inspect` "
+        "to obtain the applicable owner-approval template: it renders the ordinary "
+        "quarantine approval when the receiver's generation matches, and the "
+        "generation-mismatch disposition approval when it does not (Redmine #15193). "
+        "Pointing at quarantine alone was the dead end that stalled #15110 / #15140 / "
+        "#15195, because a generation-mismatched receiver is never a quarantine candidate"
     ),
     NEXT_ACTION_NO_BLIND_RETRY: (
         "the worktree content changed between preflight and this boundary re-read; "
