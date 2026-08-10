@@ -8,8 +8,9 @@ gateway/worker generations.
 
 No live observation is accepted as authority by itself.  A recoverable plan binds the durable
 issue/lane lifecycle, canonical worktree token, branch/HEAD, and both inventory generations.
-The owner approval digest is made from those immutable fields; health observations only decide
-whether a replacement is needed and are intentionally not replay authority.
+The stable action id is made from those immutable fields.  The owner approval additionally pins
+each slot's approval-time healthy/degraded classification; that baseline survives a partial replay
+without making transient post-launch health part of the transaction identity.
 """
 
 from __future__ import annotations
@@ -45,11 +46,16 @@ BLOCK_SLOT_RUNTIME_NOT_SETTLED = "managed_slot_runtime_not_settled"
 BLOCK_ATTESTATION_UNREADABLE = "attestation_store_unreadable"
 BLOCK_PAIR_HEALTHY = "managed_pair_already_healthy"
 BLOCK_COMPOSER_LOSS_NOT_APPROVED = "pending_composer_loss_not_approved"
+BLOCK_SUPERSEDE_NOT_READY = "zero_effect_supersede_not_ready"
 
 STATUS_PREFLIGHT = "preflight"
 STATUS_REFUSED = "refused"
 STATUS_STOPPED = "stopped"
 STATUS_COMPLETED = "completed"
+
+APPROVAL_HEALTHY = "healthy"
+APPROVAL_DEGRADED = "degraded"
+APPROVAL_HEALTH_STATES = frozenset({APPROVAL_HEALTHY, APPROVAL_DEGRADED})
 
 
 @dataclass(frozen=True)
@@ -103,6 +109,10 @@ class RestoredSlot:
             and self.attestation_state == ATTEST_OK
         )
 
+    @property
+    def approval_health(self) -> str:
+        return APPROVAL_HEALTHY if self.healthy else APPROVAL_DEGRADED
+
     def as_payload(self) -> dict[str, Any]:
         return {
             "slot_role": self.slot_role,
@@ -119,6 +129,7 @@ class RestoredSlot:
             "attestation_state": self.attestation_state,
             "attestation_readable": self.attestation_readable,
             "healthy": self.healthy,
+            "approval_health": self.approval_health,
         }
 
 
@@ -141,6 +152,10 @@ class RestoredPairPlan:
     gateway: RestoredSlot
     worker: RestoredSlot
     action_generation: int = 1
+    supersede_requested: bool = False
+    supersedes_generation: int = 0
+    supersedes_journal: str = ""
+    supersedes_revision: int = 0
 
     @property
     def slots(self) -> Tuple[RestoredSlot, RestoredSlot]:
@@ -192,6 +207,15 @@ class RestoredPairPlan:
             reasons.append(BLOCK_PAIR_HEALTHY)
         if not self.allow_pending_composer_loss:
             reasons.append(BLOCK_COMPOSER_LOSS_NOT_APPROVED)
+        if self.supersede_requested and not (
+            self.supersedes_generation >= 1
+            and self.action_generation == self.supersedes_generation + 1
+            and norm(self.supersedes_journal)
+            and self.supersedes_revision >= 1
+        ):
+            reasons.append(BLOCK_SUPERSEDE_NOT_READY)
+        if not self.supersede_requested and self.action_generation != 1:
+            reasons.append(BLOCK_SUPERSEDE_NOT_READY)
         return tuple(dict.fromkeys(reasons))
 
     @property
@@ -214,6 +238,10 @@ class RestoredPairPlan:
             "allow_pending_composer_loss": self.allow_pending_composer_loss,
             "action_id": self.action_id,
             "action_generation": self.action_generation,
+            "supersede_requested": self.supersede_requested,
+            "supersedes_generation": self.supersedes_generation,
+            "supersedes_journal": self.supersedes_journal,
+            "supersedes_revision": self.supersedes_revision,
             "may_recover": self.may_recover,
             "blocked_reasons": list(self.blocked_reasons),
             "slots": [slot.as_payload() for slot in self.slots],
@@ -254,12 +282,32 @@ def restored_pair_action_id(plan: RestoredPairPlan) -> str:
     return f"restored-pair:{digest}"
 
 
-def restored_pair_approval_operation(plan: RestoredPairPlan) -> Mapping[str, object]:
-    """Operation payload consumed by the shared strict owner-approval digest."""
+def restored_pair_approval_operation(
+    plan: RestoredPairPlan,
+    *,
+    gateway_approval_health: str = "",
+    worker_approval_health: str = "",
+) -> Mapping[str, object]:
+    """Operation payload consumed by the shared strict owner-approval digest.
+
+    Preflight uses the observed classifications.  Execute/replay supplies the exact values
+    printed by that preflight so the approval digest remains stable after one participant has
+    already been replaced, while an approval-to-execute healing drift is still refused.
+    """
 
     return {
         "action_id": plan.action_id,
         "action_generation": plan.action_generation,
+        "supersede": plan.supersede_requested,
+        "supersedes_generation": plan.supersedes_generation,
+        "supersedes_journal": plan.supersedes_journal or "none",
+        "supersedes_revision": plan.supersedes_revision,
+        "gateway_approval_health": (
+            gateway_approval_health or plan.gateway.approval_health
+        ),
+        "worker_approval_health": (
+            worker_approval_health or plan.worker.approval_health
+        ),
         **restored_pair_authority_fields(plan),
     }
 
@@ -297,6 +345,9 @@ class RestoredPairOutcome:
 
 
 __all__ = (
+    "APPROVAL_DEGRADED",
+    "APPROVAL_HEALTH_STATES",
+    "APPROVAL_HEALTHY",
     "BLOCK_ATTESTATION_UNREADABLE",
     "BLOCK_COMPOSER_LOSS_NOT_APPROVED",
     "BLOCK_DEFAULT_LANE",
@@ -306,6 +357,7 @@ __all__ = (
     "BLOCK_PAIR_INCOMPLETE",
     "BLOCK_SLOT_BUSY",
     "BLOCK_SLOT_RUNTIME_NOT_SETTLED",
+    "BLOCK_SUPERSEDE_NOT_READY",
     "BLOCK_WORKTREE_AUTHORITY",
     "RESTORED_PAIR_SLOT_ROLES",
     "RestoredPairOutcome",

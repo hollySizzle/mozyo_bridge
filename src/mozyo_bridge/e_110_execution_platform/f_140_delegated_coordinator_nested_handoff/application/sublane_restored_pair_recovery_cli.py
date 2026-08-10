@@ -16,6 +16,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_restored_pair_recovery_live import (  # noqa: E501
     build_live_restored_pair_recovery_ops,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.restored_pair_recovery import (  # noqa: E501
+    APPROVAL_HEALTH_STATES,
+)
 
 
 def format_restored_pair_recovery_text(outcome) -> str:
@@ -28,12 +31,20 @@ def format_restored_pair_recovery_text(outcome) -> str:
         f"  action_generation: {plan.action_generation}",
         f"  worktree_authority: {plan.worktree_authority_reason}",
     ]
+    if plan.supersede_requested:
+        lines += [
+            "  supersede: true",
+            f"  supersedes_generation: {plan.supersedes_generation}",
+            f"  supersedes_journal: {plan.supersedes_journal or '-'}",
+            f"  supersedes_revision: {plan.supersedes_revision}",
+        ]
     for slot in plan.slots:
         lines.append(
             f"  {slot.slot_role}: provider={slot.provider or '-'} "
             f"locator={slot.locator or '-'} revision={slot.revision or '-'} "
             f"cwd_matches={slot.cwd_matches} attestation={slot.attestation_state} "
-            f"runtime_state={slot.runtime_state} settled={slot.runtime_settled}"
+            f"runtime_state={slot.runtime_state} settled={slot.runtime_settled} "
+            f"approval_health={slot.approval_health}"
         )
     if plan.blocked_reasons:
         lines.append("  blocked: " + ", ".join(plan.blocked_reasons))
@@ -66,6 +77,20 @@ def cmd_sublane_recover_restored_pair(args: argparse.Namespace) -> int:
         worker_assigned_name=getattr(args, "worker_assigned_name", "") or "",
         worker_locator=getattr(args, "worker_locator", "") or "",
         worker_revision=getattr(args, "worker_revision", "") or "",
+        gateway_approval_health=(
+            getattr(args, "gateway_approval_health", "") or ""
+        ),
+        worker_approval_health=(
+            getattr(args, "worker_approval_health", "") or ""
+        ),
+        supersede=bool(getattr(args, "supersede", False)),
+        supersedes_generation=int(
+            getattr(args, "supersedes_generation", 0) or 0
+        ),
+        supersedes_journal=getattr(args, "supersedes_journal", "") or "",
+        supersedes_revision=int(
+            getattr(args, "supersedes_revision", 0) or 0
+        ),
     )
     use_case = SublaneRestoredPairRecoveryUseCase(
         build_live_restored_pair_recovery_ops(repo_root)
@@ -106,6 +131,32 @@ def register_sublane_recover_restored_pair_parser(sublane_sub: Any) -> None:
         help="Exact positive generation printed by preflight (required by --execute)",
     )
     parser.add_argument(
+        "--supersede",
+        action="store_true",
+        help=(
+            "Re-anchor an exact zero-effect stuck transaction to the next generation and a "
+            "fresh owner approval. Default preflight derives the exact old pins; never applies "
+            "after a close, launch, verify, or continuation effect."
+        ),
+    )
+    parser.add_argument(
+        "--supersedes-generation",
+        type=int,
+        default=0,
+        help="Exact old action generation printed by a --supersede preflight",
+    )
+    parser.add_argument(
+        "--supersedes-journal",
+        default="",
+        help="Exact old decision journal printed by a --supersede preflight",
+    )
+    parser.add_argument(
+        "--supersedes-revision",
+        type=int,
+        default=0,
+        help="Exact old transaction revision printed by a --supersede preflight",
+    )
+    parser.add_argument(
         "--allow-pending-composer-loss",
         action="store_true",
         help=(
@@ -128,6 +179,28 @@ def register_sublane_recover_restored_pair_parser(sublane_sub: Any) -> None:
             help=(
                 f"Exact {label} printed by preflight. Optional on the first run; supply it "
                 "when replaying a partially completed action."
+            ),
+        )
+    for flag, dest, label in (
+        (
+            "--gateway-approval-health",
+            "gateway_approval_health",
+            "gateway",
+        ),
+        (
+            "--worker-approval-health",
+            "worker_approval_health",
+            "worker",
+        ),
+    ):
+        parser.add_argument(
+            flag,
+            dest=dest,
+            choices=sorted(APPROVAL_HEALTH_STATES),
+            default="",
+            help=(
+                f"Exact {label} approval_health printed by the owner-approved preflight. "
+                "Required by --execute and every partial replay."
             ),
         )
     parser.add_argument(

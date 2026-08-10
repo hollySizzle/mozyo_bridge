@@ -449,7 +449,30 @@ forceやpending overrideを加えない。pending generationが本当に破棄�
   preflight の action id/generation、部分実行を再開する場合は両 slot の旧 name/locator/revision
   を同じまま再提示する。
 - execute は既存 replacement transaction を使い、各 old locator を action-time に再確認して
-  exact close → same-slot launch → action-bound startup attestation を gateway/worker の順で進める。
+  exact close → same-slot launch → action-bound startup attestation を participant identity に基づく
+  決定的 transaction 順で進める（gateway→workerの固定順ではない）。
+  preflight が各 slot に表示した `approval_health` (`healthy` / `degraded`) は承認 digest に含まれる。
+  execute と部分再開では、その同じ値を `--gateway-approval-health` / `--worker-approval-health`
+  へ必ず再提示する。承認後かつ最初の effect 前に健康状態が変わった場合は実行を拒否する。
+  transactionが`planned`または`claimed`に留まり、close/launch/sendが一度も発生し得ない間に
+  健康状態が変わった場合は、古い承認で進めず `--supersede` preflightを行う。
+  `replacing_nonself`は全participantがdurable上`close_owed`でも対象外とする。close effectは
+  participant state CASより先に発生するため、その間の停止後は外部closeが既に成功したかをrowだけで
+  証明できない。このzero-effect判定は既存の`recover-stale --supersede`にも共通であり、曖昧な
+  `replacing_nonself` residueをraw DB操作で戻さない。安全に救済するにはdurableなclose-attempt/effect
+  receiptを持つ別railが必要である。preflightが表示するexact
+  `supersedes_generation` / `supersedes_journal` / `supersedes_revision`、次のaction generation、
+  両slotのhealth pinを新しいowner approvalと同じRedmine journalへ値非省略で記録する。executeは
+  それらを同名flagで再提示する。専用CASはold generation/revision/journal、同一action、完全に同じ
+  participant manifest、phaseが`planned`/`claimed`、zero-effect、live leaseなし、
+  new generation=`old + 1`を一つのlock内で再確認し、
+  participant manifestを変更せずnew journal/generationへheaderを更新する。row不在、effect済み、
+  live lease、authority driftではzero-write。CAS直後に停止しても同じnew journal/generation/pinsを
+  再提示すれば新headerを冪等に採用し、old generationのexecutorはgeneration mismatchで停止する。
+  各close effect直前には lifecycle/worktree/branch/HEADと、まだ`close_owed`の全participantの
+  name/locator/revision、settled runtime、attestation可読性をfresh observationで再結合する。
+  最初のclose前にpairがhealthy化した場合やauthorityが動いた場合はzero-close。既に進行済みの
+  participantは旧generationとの再比較から除外し、partial replayを妨げない。
   transaction は participant ごとの owed state を各効果の成功後に更新するため、進行が
   durable に記録された途中停止は同一 pin で再実行でき、記録済みの close を再実行しない。
   launch effect の成功後かつ `launch_owed -> verify_owed` 更新前に停止した場合は、fresh

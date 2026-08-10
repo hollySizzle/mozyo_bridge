@@ -11,6 +11,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     render_recovery_owner_approval_marker,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.restored_pair_recovery import (  # noqa: E501
+    APPROVAL_HEALTH_STATES,
     BLOCK_PAIR_INCOMPLETE,
     STATUS_COMPLETED,
     STATUS_PREFLIGHT,
@@ -36,6 +37,15 @@ class RestoredPairRecoveryRequest:
     worker_assigned_name: str = ""
     worker_locator: str = ""
     worker_revision: str = ""
+    gateway_approval_health: str = ""
+    worker_approval_health: str = ""
+    # Explicit owner-approved re-anchor of an exact ZERO-EFFECT transaction.  The target
+    # generation is exactly the stored generation + 1; the old journal/revision are approval
+    # pins and the dedicated CAS rewrites the durable header before any live effect.
+    supersede: bool = False
+    supersedes_generation: int = 0
+    supersedes_journal: str = ""
+    supersedes_revision: int = 0
 
     @property
     def holder(self) -> str:
@@ -112,7 +122,49 @@ class SublaneRestoredPairRecoveryUseCase:
             return self._refused(
                 request, plan, "the supplied action id/generation does not pin this exact pair"
             )
+        if (
+            request.supersede != plan.supersede_requested
+            or (
+                request.supersede
+                and (
+                    request.supersedes_generation != plan.supersedes_generation
+                    or request.supersedes_journal != plan.supersedes_journal
+                    or request.supersedes_revision != plan.supersedes_revision
+                )
+            )
+            or (
+                not request.supersede
+                and (
+                    request.supersedes_generation
+                    or request.supersedes_journal
+                    or request.supersedes_revision
+                )
+            )
+        ):
+            return self._refused(
+                request,
+                plan,
+                "the supplied zero-effect supersede pins do not match this transaction",
+            )
         progressed_replay = self._ops.transaction_is_progressed_replay(request, plan)
+        if (
+            request.gateway_approval_health not in APPROVAL_HEALTH_STATES
+            or request.worker_approval_health not in APPROVAL_HEALTH_STATES
+        ):
+            return self._refused(
+                request,
+                plan,
+                "the approval-time health classification for both slots is required",
+            )
+        if not progressed_replay and (
+            request.gateway_approval_health != plan.gateway.approval_health
+            or request.worker_approval_health != plan.worker.approval_health
+        ):
+            return self._refused(
+                request,
+                plan,
+                "a slot's health changed after the owner approval preflight",
+            )
         hard_blockers = tuple(
             reason
             for reason in plan.blocked_reasons
