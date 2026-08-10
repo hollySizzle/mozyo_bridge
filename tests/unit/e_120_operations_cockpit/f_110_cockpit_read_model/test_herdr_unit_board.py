@@ -5,6 +5,9 @@ import json
 import unicodedata
 import unittest
 
+from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.public_safe_text import (
+    REDACTED_TEXT as _PROJECTION_REDACTED,
+)
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.herdr_unit_board import (
     AUTHORITY_MISSING,
     AUTHORITY_RESOLVED,
@@ -46,6 +49,73 @@ def terminal_width(value: str) -> int:
         else 1
         for char in value
     )
+
+
+def _jwt_segment(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+class CredentialParserDuplicateKeyTests(unittest.TestCase):
+    """A repeated key must not talk the classifier out of a redaction."""
+
+    #: A claims segment that is NOT a JSON object, so the only route to
+    #: detection is the header's own marker.
+    CLAIMS = _jwt_segment(b"not-json-at-all")
+
+    def token(self, header: bytes) -> str:
+        return f"{_jwt_segment(header)}.{self.CLAIMS}.signature"
+
+    def test_an_honest_header_still_redacts(self) -> None:
+        self.assertEqual(safe_text(self.token(b'{"cty":"JWT"}')), REDACTED_TEXT)
+
+    def test_a_repeated_marker_key_redacts_rather_than_passing_through(self) -> None:
+        # json.loads keeps the last value, so the second `cty` would otherwise
+        # read as innocuous and the credential would print verbatim.
+        for header in (
+            b'{"cty":"JWT","cty":"text"}',
+            b'{"typ":"JWT","typ":"text"}',
+            b'{"cty":"text","cty":"JWT"}',
+        ):
+            with self.subTest(header=header):
+                self.assertEqual(safe_text(self.token(header)), REDACTED_TEXT)
+
+    def test_a_repeated_key_in_an_encrypted_header_redacts(self) -> None:
+        parts = [_jwt_segment(b'{"enc":"A256GCM","enc":"x"}')] + [
+            _jwt_segment(b"a"), _jwt_segment(b"b"), _jwt_segment(b"c"), _jwt_segment(b"d")
+        ]
+
+        self.assertEqual(safe_text(".".join(parts)), REDACTED_TEXT)
+
+    def test_a_repeated_key_in_embedded_json_redacts(self) -> None:
+        self.assertEqual(
+            safe_text('{"note":"ok","note":"ok"}'), REDACTED_TEXT
+        )
+
+    def test_ordinary_text_is_untouched(self) -> None:
+        self.assertEqual(safe_text("a plain work label"), "a plain work label")
+
+
+class ModuleSplitIntegrityTests(unittest.TestCase):
+    def test_every_public_callable_resolves_its_type_hints(self) -> None:
+        # Splitting a module can drop an import while leaving the annotation
+        # that needs it: `from __future__ import annotations` keeps the import
+        # working and only tooling that evaluates the hints notices.
+        from typing import get_type_hints
+
+        from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain import (
+            herdr_unit_board,
+            public_safe_text,
+        )
+
+        for module in (herdr_unit_board, public_safe_text):
+            for name in dir(module):
+                member = getattr(module, name)
+                if not callable(member):
+                    continue
+                if getattr(member, "__module__", None) != module.__name__:
+                    continue
+                with self.subTest(module=module.__name__, member=name):
+                    get_type_hints(member)
 
 
 class UnitBoardReadModelTests(unittest.TestCase):
