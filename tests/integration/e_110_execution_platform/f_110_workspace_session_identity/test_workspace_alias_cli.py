@@ -16,6 +16,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -1082,3 +1083,52 @@ class WorkspaceAliasLaunchRefusalTests(WorkspaceAliasCliTestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class WorkspaceAliasProcessConcurrencyTests(WorkspaceAliasCliTestCase):
+    """Real concurrent processes racing set / disable / clear (j#102641 条件 5).
+
+    The earlier serialization test only probed the lock helper; this drives the
+    public CLI from separate OS processes so the lock, the fence and the
+    durability contract are exercised by genuine contention.
+    """
+
+    def _run(self, argv: list[str]) -> subprocess.CompletedProcess:
+        env = dict(os.environ, MOZYO_BRIDGE_HOME=str(self.base / "home"),
+                   PYTHONPATH=str(Path(__file__).resolve().parents[4] / "src"))
+        return subprocess.run(
+            [sys.executable, "-m", "mozyo_bridge", *argv, "--json"],
+            capture_output=True, text=True, env=env, timeout=120,
+        )
+
+    def test_concurrent_mutations_never_corrupt_the_declaration(self) -> None:
+        import concurrent.futures
+
+        commands = []
+        for _ in range(4):
+            commands.append(["workspace", "alias", "disable",
+                             "--repo", str(self.nested), "--reason", "D"])
+            commands.append(["workspace", "alias", "set", "--repo", str(self.nested),
+                             "--to", str(self.canonical), "--reason", "S"])
+            commands.append(["workspace", "alias", "clear", "--repo", str(self.nested)])
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(commands)) as pool:
+            results = list(pool.map(self._run, commands))
+
+        for result, argv in zip(results, commands):
+            self.assertIn(
+                result.returncode, (0, 1),
+                f"{argv} crashed: rc={result.returncode} stderr={result.stderr[:400]}",
+            )
+            self.assertNotIn("Traceback", result.stderr, f"{argv} raised: {result.stderr[:400]}")
+
+        # Whatever the interleaving, the surviving state is readable and valid —
+        # never a half-written or corrupt declaration.
+        final = self._run(["workspace", "alias", "show", "--repo", str(self.nested)])
+        self.assertIn(final.returncode, (0, 1))
+        payload = json.loads(final.stdout)
+        self.assertIn(
+            payload["state"],
+            {"no_declaration", "aliased", "launch_disabled"},
+            f"concurrent mutations left an unreadable state: {payload}",
+        )
