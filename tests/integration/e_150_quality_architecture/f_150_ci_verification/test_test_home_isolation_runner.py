@@ -41,6 +41,7 @@ from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.t
     install_audit_fence,
 )
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.test_home_fence import (  # noqa: E402,E501
+    ambient_homes,
     read_deny_ledger,
 )
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.test_home_os_fence import (  # noqa: E402,E501
@@ -75,11 +76,39 @@ _REAL_USER_BASE = site.getuserbase()
 
 
 
+def _outer_authority() -> tuple[bool, tuple[str, ...]]:
+    """Whether a nested run would inherit, and the homes it must never resolve onto.
+
+    Both answers come from ONE reading of this process's boundary, so they cannot
+    disagree, and both are derived here rather than reported by the child: the child
+    cannot observe `inherited` without adding a field to the published context, and
+    j#100500 forbids production changes. An outer context in THIS process is exactly
+    the condition under which the nested run inherits.
+
+    The protected roots are read from that context instead of being respelled as
+    ``Path("~/.mozyo_bridge").expanduser()`` (#15229). Under
+    ``mozyo-bridge tests parallel`` each shard is handed a fresh task-local ``HOME``
+    (#13733 acceptance 3), so expanding ``~`` here names the *shard's* home, while
+    the authority the fenced child actually inherited was captured from the
+    operator's home before that shard existed. The expectation and the authority then
+    came from different places and this module failed in parallel while passing
+    serially -- a false failure about where the expectation was computed, not about
+    isolation.
+    """
+    context = load_outer_context()
+    if context is not None:
+        # Byte-exact, and the same tuple the inherited fence denies.
+        return True, tuple(str(root) for root in context.outer_protected_roots)
+    # No outer boundary: this process was launched directly, so its own ambient
+    # homes ARE the operator's -- taken from the production resolver rather than
+    # respelled, so a test's expectation cannot drift from what the rail guards.
+    return False, tuple(str(home) for home in ambient_homes())
+
+
 def _assert_branch_contract(
     case: unittest.TestCase,
     *,
     observed: dict,
-    inherited: bool,
     synthetic_default: str,
     resolved_key: str,
 ) -> None:
@@ -93,23 +122,32 @@ def _assert_branch_contract(
     rule for both would have forced a production change to satisfy a test.
     """
     resolved = observed[resolved_key]
-    real_default = str(Path("~/.mozyo_bridge").expanduser().resolve())
+    inherited, protected_roots = _outer_authority()
     if inherited:
         # The outer authority, unchanged -- the nested synthetic default is NOT
-        # added to it (that is the F2 single-authority rule).
+        # added to it (that is the F2 single-authority rule). Compared as the whole
+        # set, not as "the default spelling appears somewhere in it": byte-exact
+        # preservation is the claim, and the set is what carries it.
         case.assertNotIn(synthetic_default, observed["denied"])
-        case.assertIn(real_default, observed["denied"], "outer authority was lost")
+        case.assertTrue(
+            protected_roots, "premise lost: the outer boundary protects nothing"
+        )
+        case.assertEqual(
+            sorted(observed["denied"]),
+            sorted(protected_roots),
+            "outer authority was lost",
+        )
         case.assertEqual(resolved, synthetic_default)
     else:
         case.assertIn(synthetic_default, observed["denied"])
         case.assertEqual(resolved, observed["fence_root"])
         case.assertNotEqual(resolved, synthetic_default)
-    # Both branches: never the real operator home, nor anything under it.
-    case.assertNotEqual(resolved, real_default)
-    case.assertFalse(
-        resolved == real_default or resolved.startswith(real_default + os.sep),
-        f"resolution reached the real operator home: {resolved}",
-    )
+    # Both branches: never a protected home, nor anything under one.
+    for root in protected_roots:
+        case.assertFalse(
+            resolved == root or resolved.startswith(root + os.sep),
+            f"resolution reached a protected home {root}: {resolved}",
+        )
 
 
 def _require_backend(case: unittest.TestCase, exc: Exception) -> None:
@@ -335,7 +373,6 @@ class FenceReachesTheProcessThatRunsTheTestsTest(unittest.TestCase):
             fixture = _Fixture(
                 self, _PROBE_MODULE.format(src=SRC, report=str(report))
             )
-            inherited = load_outer_context() is not None
             code, _out, _err = _run_cli(
                 [
                     "tests", "run", "--repo", str(fixture.repo),
@@ -370,7 +407,6 @@ class FenceReachesTheProcessThatRunsTheTestsTest(unittest.TestCase):
         _assert_branch_contract(
             self,
             observed=observed,
-            inherited=inherited,
             synthetic_default=str(
                 (synthetic_account_home(fixture.guarded_home) / ".mozyo_bridge").resolve()
             ),
@@ -390,11 +426,6 @@ class FenceReachesTheProcessThatRunsTheTestsTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            # `inherited` is derived here, not reported by the child: the child
-            # cannot observe it without adding a field to the published context,
-            # and j#100500 forbids production changes. An outer context in THIS
-            # process is exactly the condition under which the nested run inherits.
-            inherited = load_outer_context() is not None
             code, _out, _err = _run_cli(
                 ["tests", "run", "--repo", str(fixture.repo)],
                 guarded_home=fixture.guarded_home,
@@ -416,7 +447,6 @@ class FenceReachesTheProcessThatRunsTheTestsTest(unittest.TestCase):
         _assert_branch_contract(
             self,
             observed=observed,
-            inherited=inherited,
             synthetic_default=synthetic_default,
             resolved_key="resolved",
         )

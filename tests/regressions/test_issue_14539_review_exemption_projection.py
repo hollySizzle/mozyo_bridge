@@ -4487,6 +4487,15 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             ['handoff'],
             "inherits via a used import of handoff; names no marker token itself",
         ),
+        "src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/remote_unit_action.py": (
+            ['handoff'],
+            "inherits via a used import of handoff for the canonical `MODES` send-rail "
+            "vocabulary (Redmine #15198 replaced the caller-side `--mode standard` pin with the "
+            "shared default, so the rail offers exactly the modes the gateway has); names no "
+            "marker token itself, renders none, and reads no durable note — it reads only the "
+            "target gateway's own structured delivery outcome, and through the shared "
+            "injection-stage authority rather than by inspecting tokens",
+        ),
         "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/handoff_application_service.py": (
             ['handoff'],
             "inherits via a used import of handoff for the `DeliveryOutcome` / "

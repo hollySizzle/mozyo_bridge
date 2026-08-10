@@ -28,8 +28,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     load_unit_board_sources,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.remote_unit_action import (
+    ACTION_DELIVERY_MODES,
     ACTION_KINDS,
     DEFAULT_ACTION_KIND,
+    DEFAULT_DELIVERY_MODE,
     RemoteUnitActionRail,
     RemoteUnitActionRequest,
     render_preview,
@@ -289,7 +291,13 @@ def cmd_herdr_unit_board_sources(args: argparse.Namespace) -> int:
 
 
 def cmd_herdr_unit_board_action(args: argparse.Namespace) -> int:
-    """Preview — and only with ``--apply`` deliver — one remote Unit action."""
+    """Preview — and only with ``--apply`` deliver — one remote Unit action.
+
+    Three exits, because the delivery has three answers (Redmine #15198): ``0``
+    confirmed, ``1`` refused with nothing sent, ``3`` sent but unconfirmed.
+    Folding ``3`` into ``1`` would tell an automated caller that a retry is free
+    at exactly the moment it is not.
+    """
     config, config_error = _sources_config()
     if config is None:
         print(f"error: {config_error}", file=sys.stderr)
@@ -302,6 +310,7 @@ def cmd_herdr_unit_board_action(args: argparse.Namespace) -> int:
         summary=str(getattr(args, "summary", "") or ""),
         target_project=str(getattr(args, "target_project", "") or ""),
         kind=str(getattr(args, "kind", DEFAULT_ACTION_KIND)),
+        delivery_mode=str(getattr(args, "delivery_mode", "") or DEFAULT_DELIVERY_MODE),
     )
     rail = RemoteUnitActionRail(multi)
     preview = rail.preview(request)
@@ -319,7 +328,10 @@ def cmd_herdr_unit_board_action(args: argparse.Namespace) -> int:
     else:
         print(f"remote Unit action: {result.state} ({result.reason})")
         print(f"  {result.detail}")
-    return 0 if result.delivered else 1
+        print(f"  injection stage: {result.injection_stage}")
+    if result.delivered:
+        return 0
+    return 3 if result.uncertain else 1
 
 
 def cmd_herdr_unit_board_sync(args: argparse.Namespace) -> int:
@@ -507,7 +519,11 @@ def register_herdr_unit_board_parser(herdr_sub) -> None:
             "project gateway to its Codex unit; the remote worker is never "
             "direct-sent and no remote pane is addressed from here. The preview "
             "is not a permit: applying re-observes the source, the Unit, and the "
-            "repository identity, and sends nothing if any of them changed."
+            "repository identity, and sends nothing if any of them changed. "
+            "Delivery takes the same rail as an ordinary agent handoff and is "
+            "judged by the shared injection-stage authority: exit 0 confirmed, "
+            "1 refused with nothing sent, 3 sent but unconfirmed (do not "
+            "blind-retry a 3 — read the target environment's durable record)."
         ),
     )
     action.add_argument(
@@ -537,6 +553,17 @@ def register_herdr_unit_board_parser(herdr_sub) -> None:
         "--summary",
         required=True,
         help="Short pointer text; the durable record stays the source of truth.",
+    )
+    action.add_argument(
+        "--delivery-mode",
+        dest="delivery_mode",
+        choices=ACTION_DELIVERY_MODES,
+        default=DEFAULT_DELIVERY_MODE,
+        help=(
+            "Send rail for the delivered handoff. Omit to take the same default "
+            "an ordinary agent handoff takes. Name `standard` or `pending` only "
+            "for strict landing observation or operator debugging."
+        ),
     )
     action.add_argument(
         "--apply",
