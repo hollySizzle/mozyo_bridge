@@ -77,6 +77,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transiti
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.workflow_contract import (
     WorkflowContractBundle,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_admission import (  # noqa: E501
+    make_resend_screen_guard,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_rail import (
     TurnStartResult,
     turn_start_rail_record_lines,
@@ -94,8 +97,19 @@ class TurnStartRailPort(Protocol):
     concrete rail keeps the slice exercisable with a synthetic fake rail.
     """
 
-    def drive_turn_start(self, target: str, text: str) -> TurnStartResult:
-        """Inject ``text`` into ``target`` and confirm a turn started; never raises."""
+    def drive_turn_start(
+        self,
+        target: str,
+        text: str,
+        *,
+        screen_guard: Optional[Callable[[str], Optional[str]]] = None,
+    ) -> TurnStartResult:
+        """Inject ``text`` into ``target`` and confirm a turn started; never raises.
+
+        ``screen_guard`` is the Redmine #15202 resend-time pane classifier. The slice
+        binds it from the resolved receiver's provider profile, because the rail is a
+        pure domain orchestrator that must not resolve providers itself.
+        """
         ...
 
 
@@ -211,7 +225,16 @@ class HerdrStandardRailUseCase:
                 f"target={request.target}"
             )
             raise AssertionError("unreachable")
-        turn_start = rail.drive_turn_start(request.target, f"{request.marker} {request.body}")
+        # Redmine #15202: bind the receiver provider's declared startup screens into the
+        # rail's WAIT_ERROR resend gate. The pre-send admission gate already proved the
+        # pane was startup-clear a moment ago; this is the same classification re-asked
+        # at resend time, because the only thing that changed between them is that our
+        # observation failed — not that the screen cannot have appeared since.
+        turn_start = rail.drive_turn_start(
+            request.target,
+            f"{request.marker} {request.body}",
+            screen_guard=make_resend_screen_guard(request.receiver),
+        )
         status, reason = project_herdr_turn_start(turn_start)
         # Machine-readable turn-start telemetry (turn_start_outcome / snapshot_state /
         # wait_kind / enter_resends / reclassified_blocked) for EVERY rail outcome,

@@ -1423,8 +1423,8 @@ selection and trusted-env binary resolution as the transport (#13245).
    ~0.36s).
 3. **Inject** — `send_text` then `send_keys enter`. Any transport failure fails
    closed to `inject_failed` and cancels the armed wait.
-4. **Collect the wait**, classify (see the outcome table), and on a timeout run the
-   bounded Enter-resend rail.
+4. **Collect the wait**, classify (see the outcome table), and on a `timeout` (E14) or
+   an `error` (#15202) run the bounded Enter-resend rail.
 
 ### The six outcomes (`TURN_START_OUTCOMES`, closed set)
 
@@ -1457,6 +1457,54 @@ as `started`, so an immediate event never becomes a false timeout. The exact
 subscribe-time delivery and the wait's non-zero stderr tokens (pane-get vs
 timeout) are confirmed against a live binary at the cutover smoke (#13254); the
 classifier's indicator set is defensive and the default is `error` (fail-closed).
+
+### Wait-error Enter-resend (Redmine #15202 — enforced in code)
+
+E14's rail was armed by `timeout` alone, so a first wait resolving `error` fell
+straight through to `delivered_not_started` with `enter_resends=0`. #15199 hit that
+shape nine times in one lane: the body was typed, the first Enter was sent, the
+*observation* failed, and the request sat in the composer forever. A failed wait is
+evidence about the **observer**, not about the receiver, so refusing to press Enter
+again was not a safety property — it was a lost turn.
+
+`error` is therefore an Enter-resend candidate too, drawing on the **same single
+budget** as the timeout path (`max_enter_resends`, default `1`), so the body is typed
+once and at most one extra Enter is ever pressed — a mixed `timeout`-then-`error`
+sequence cannot spend it twice. Only the error-armed re-wait uses the longer
+`error_resend_wait_timeout_ms` window (default 15s): the first wait *failed* rather
+than timing out, so it measured nothing about how long a start takes here.
+
+The error gate is deliberately **stricter** than the timeout gate, and the asymmetry
+is the point. A timeout is a positive observation (the wait ran and saw no
+transition); an error is the absence of one, so before pressing Enter into a pane it
+cannot characterise the rail must positively establish what is on screen:
+
+| # | gate | skip reason on refusal |
+|---|---|---|
+| 1 | an injected `screen_guard` is bound (in production, the receiver profile's declared `startup_blockers`) | `screen_guard_unbound` |
+| 2 | `read_pane` succeeds and is non-blank (a blank read is never "clear") | `pane_unreadable` |
+| 3 | the guard finds no declared startup screen (trust / login / update-selection) | `startup_screen` |
+| 4 | the injected body is still in the composer (`composer_retains_body`) | `body_absent` |
+| 5 | a re-snapshot is not `blocked` — a runtime permission prompt would eat the Enter | `receiver_blocked` |
+
+The **timeout gate is untouched** (#15202 requirement 5): the same two checks, the
+same 8s re-wait, the same reader call sequence, and a rail constructed without a
+`screen_guard` behaves on timeouts byte-for-byte as it did before. The guard is
+supplied by `herdr_startup_admission.make_resend_screen_guard`, so no provider string
+ever enters the pure domain rail — the same #13760 data boundary the pre-send
+admission gate keeps. Detecting a screen still never authorises answering it; the
+guard's only possible effect is to **stop** an Enter.
+
+Telemetry gains two additive keys. `first_wait_kind` preserves the first wait's
+result even when a resend later changed the verdict, so a recovered turn never erases
+the fact that the first observation failed; `resend_skipped_reason` (the closed
+`RESEND_SKIP_REASONS` set, tokens only) says why a candidate resend did not happen, so
+`enter_resends=0` is no longer ambiguous between "none was needed" and "one was wanted
+and withheld". The original five j#72602 keys keep their meaning and values.
+
+The gate's closed skip vocabulary and its pure predicates live in the leaf
+`domain/turn_start_resend_gate.py` and are re-exported from `turn_start_rail.py`
+(the module-health split, mirroring the provider registry's startup-blocker schema).
 
 ### Equivalence to the #13166 codex-standard turn-start guard (documented proof)
 
@@ -1501,7 +1549,11 @@ fail-closed outcomes (`precondition_not_idle` / `inject_failed`), the check-then
 wait *ordering* (arm before inject, asserted on an event log), and the Enter-resend
 rail (initial-timeout → resend → `started`; resend-cap → `delivered_not_started`;
 resend skipped when the composer is cleared / the read fails / the cap is 0; the
-subscribe-time immediate-`changed` fail-safe). The wait primitive itself is pinned
+subscribe-time immediate-`changed` fail-safe) and, since #15202, the wait-error
+resend rail (initial-`error` → resend → `started` with `first_wait_kind` preserved;
+still unconfirmed after the resend; each of the five error-gate refusals; the shared
+one-Enter cap across a mixed `timeout`/`error` sequence; the timeout gate proven
+indifferent to a matching `screen_guard`). The wait primitive itself is pinned
 in `test_herdr_turn_start.py` through an injected `Popen` factory (argv, the two-
 phase arm/collect, the double timeout, and the exit classification). **Live**
 verification of the wait surface is deferred to the #13254 cutover smoke, per the

@@ -63,6 +63,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     SLOT_LIVE,
     classify_named_slot,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_admission import (  # noqa: E501
+    make_resend_screen_guard,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_rail import (  # noqa: E501
     OUTCOME_PRECONDITION_NOT_IDLE,
     OUTCOME_STARTED,
@@ -184,8 +187,12 @@ class LiveRecoveryAnchorDeliveryService:
                 self._record(outcome, request, turn_start_telemetry=None)
                 return outcome
         try:
+            # Redmine #15202: bind the receiver provider's declared startup screens into
+            # the rail's WAIT_ERROR Enter-resend gate (unbound, that resend is withheld).
             result = rail.drive_turn_start(
-                request.target_locator, f"{marker} {body}"
+                request.target_locator,
+                f"{marker} {body}",
+                screen_guard=make_resend_screen_guard(request.provider),
             )
         except (Exception, SystemExit):  # injection may have happened
             outcome = self._uncertain(marker)

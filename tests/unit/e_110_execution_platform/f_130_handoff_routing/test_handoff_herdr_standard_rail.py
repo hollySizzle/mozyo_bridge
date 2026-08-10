@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_herdr_standard_rail import (
     HerdrStandardRailOps,
@@ -143,9 +143,19 @@ class _FakeRail:
     def __init__(self, result: TurnStartResult) -> None:
         self._result = result
         self.driven: List[tuple[str, str]] = []
+        self.screen_guards: List[Optional[Callable[[str], Optional[str]]]] = []
 
-    def drive_turn_start(self, target: str, text: str) -> TurnStartResult:
+    def drive_turn_start(
+        self,
+        target: str,
+        text: str,
+        *,
+        screen_guard: Optional[Callable[[str], Optional[str]]] = None,
+    ) -> TurnStartResult:
         self.driven.append((target, text))
+        # Redmine #15202: record the bound resend-time pane classifier so the slice's
+        # obligation to supply one is assertable, not merely tolerated.
+        self.screen_guards.append(screen_guard)
         return self._result
 
 
@@ -218,6 +228,22 @@ class HerdrStandardRailTruthTableTest(unittest.TestCase):
         self.assertEqual(ops.persisted[0].record_format, "both")
         # The rail was driven with exactly marker+body, once, against the target.
         self.assertEqual(rail.driven, [("%pT", "[[mk-1]] hello body")])
+        # Redmine #15202: the slice binds the receiver provider's declared startup
+        # screens into the rail's WAIT_ERROR resend gate. Unbound, the rail withholds
+        # that resend entirely, so a missing guard here would silently disable the fix.
+        self.assertEqual(len(rail.screen_guards), 1)
+        guard = rail.screen_guards[0]
+        self.assertIsNotNone(guard)
+        # It is really the `claude` profile's classifier, not an always-None stub: a
+        # ready composer passes and the declared trust screen is caught.
+        self.assertIsNone(guard('╭────────╮\n│ > Try  │\n╰────────╯'))
+        self.assertEqual(
+            guard(
+                "Quick safety check: Is this a project you created or one you trust? "
+                "Claude Code'll be able to read, edit, and execute files here."
+            ),
+            "workspace_trust_confirmation",
+        )
         # Structured turn-start telemetry rides the outcome (auditor replay, #13255 j#72695).
         self.assertIsInstance(ops.emitted[0].outcome.turn_start_outcome, dict)
         self.assertEqual(

@@ -178,6 +178,54 @@ def evaluate_startup_admission(
     return StartupAdmission(outcome=ADMISSION_ADMITTED, provider_id=resolved)
 
 
+#: The token :func:`make_resend_screen_guard` returns when the receiver's provider has
+#: no registered profile. Not a screen id — it is the honest statement that this pane's
+#: startup screens cannot be classified at all. The turn-start rail reads any non-``None``
+#: token as "do not press Enter", so an unprofiled provider fails closed exactly like the
+#: pre-send admission gate's :data:`ADMISSION_UNKNOWN_PROVIDER`.
+RESEND_GUARD_UNCLASSIFIABLE_PROVIDER = "unclassifiable_provider"
+
+
+def make_resend_screen_guard(
+    provider_id: str,
+    *,
+    registry: Optional[AgentProviderProfileRegistry] = None,
+) -> Callable[[str], Optional[str]]:
+    """Bind ``provider_id``'s declared startup screens into a pure pane classifier.
+
+    The WAIT_ERROR Enter-resend gate (Redmine #15202) may only press Enter once it has
+    positively established that the receiver is not showing a trust / login / update
+    -selection screen. The *rail* is a pure domain orchestrator and must not know a
+    single provider string (#13760 j#77947 correction 1), so it takes an injected
+    :data:`...turn_start_rail.ResendScreenGuard` and this is the factory that supplies
+    one — the same packaged profile data the pre-send admission gate classifies against,
+    re-used at resend time rather than re-implemented.
+
+    Returns a callable that takes the pane's rendered text and returns the matched
+    blocker id, or ``None`` when the pane carries no declared startup screen. Only the
+    fixed id crosses back; the pane's own text never leaves the closure, so the rail
+    cannot carry it onto a pasteable durable record.
+
+    Fail-closed on an unprofiled provider: the guard then always answers
+    :data:`RESEND_GUARD_UNCLASSIFIABLE_PROVIDER`, so the rail withholds the resend
+    rather than guess that a provider it cannot describe has no startup screen.
+
+    This grants no new authority. Detecting a screen never authorises answering it —
+    the guard's only effect is to STOP an Enter, never to send one.
+    """
+    profiles = AGENT_PROVIDER_PROFILES if registry is None else registry
+    resolved = str(provider_id or "").strip()
+    profile = profiles.get(resolved) if resolved else None
+    if profile is None:
+        return lambda _content: RESEND_GUARD_UNCLASSIFIABLE_PROVIDER
+
+    def _guard(content: str) -> Optional[str]:
+        blocker = profile.match_startup_blocker(content)
+        return None if blocker is None else blocker.blocker_id
+
+    return _guard
+
+
 def startup_admission_record_lines(admission: StartupAdmission) -> list[str]:
     """Render the additive durable-record telemetry (pure, redaction-safe).
 
@@ -222,8 +270,10 @@ __all__ = (
     "ADMISSION_OUTCOMES",
     "ADMISSION_UNKNOWN_PROVIDER",
     "ADMISSION_UNREADABLE",
+    "RESEND_GUARD_UNCLASSIFIABLE_PROVIDER",
     "StartupAdmission",
     "StartupAdmissionError",
     "evaluate_startup_admission",
+    "make_resend_screen_guard",
     "startup_admission_record_lines",
 )
