@@ -33,6 +33,9 @@ from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.doma
     REASON_NOT_REGULAR_FILE,
     WorkspaceAliasDeclaration,
 )
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.infrastructure import (  # noqa: E501
+    workspace_alias_store as store,
+)
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.infrastructure.workspace_alias_store import (  # noqa: E501
     alias_path,
     write_declaration,
@@ -76,6 +79,9 @@ def _write_anchor(root: Path, workspace_id: str, session: str) -> None:
         ),
         encoding="utf-8",
     )
+    # Raw malformed/non-regular declaration fixtures below target launch
+    # refusal after coordinated observation, not the missing-lock refusal.
+    (path.parent / store._LOCK_NAME).touch(exist_ok=True)
 
 
 class V1ReplacementAliasBoundaryTest(unittest.TestCase):

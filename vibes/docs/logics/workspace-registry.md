@@ -203,10 +203,24 @@ descriptor** に固定し、判定は全て `lstat` で行う。
   失敗する時点で既に着地しているため、直前の内容を同一 directory 内へ stage しておき、
   失敗時に戻す (元が無ければ新 entry を削除する)。`WorkspaceAliasStoreError` は `mutated`
   を持ち、CLI は「何も書かれていない」と決め打ちせず実際の effective state を報告する。
-- **read は raise せず、block もしない** (review j#102140 F3)。`stat` / `open` / `read` の
-  失敗はすべて固定 typed refusal へ変換する。さらに `O_NONBLOCK` で開いた上で `fstat` により
-  同一 object が regular file であることを再確認するので、`lstat` と `open` の間に
-  regular file が FIFO へ差し替えられても reader が無限に停止しない。
+- **read は raise せず、block もしない** (review j#102140 F3 / j#102710 r6f3)。reader は
+  writer と同じ `.workspace-alias.json.lock` を create せず安全に開き、`fstat` で
+  single-linked regular file と確認し、visible inode を再照合してから
+  `LOCK_SH | LOCK_NB` を取得する。shared lock は宣言の parse 完了まで保持する。writer の
+  `LOCK_EX` と競合した場合は待機も `None` 返却もせず
+  `declaration_mutation_in_progress` の typed refusal とする。lock の open / stat / flock が
+  安全に成立しない場合は `declaration_lock_failed` で fail closed。lock entry がまだ無い
+  workspace では、宣言 entry の不在を確認した後に lock の不在を再確認し、2 回目の lock
+  `ENOENT` を linearization point とする。真に不在なら read-only side effect なしで `None`、
+  途中で writer の lock が現れたら通常の shared-lock 判定へ入り、宣言が存在するのに lock が
+  無ければ未協調 read を拒否する。`declaration_exists()` も同じ reader を使い、mutation中の
+  refusal を「存在」として cycle 判定を fail closed にする。さらに宣言本体も
+  `O_NONBLOCK` で開いた上で `fstat` により同一 object が regular file であることを再確認する
+  ので、`lstat` と `open` の間に regular file が FIFO へ差し替えられても reader が無限に
+  停止しない。writer が `LOCK_EX` を保持中に行う effective readback は、public reader の
+  shared lock を再取得せず、caller-held lock fd と fresh path から見える lock inode を
+  read 前後に照合する private read を使う。fresh parent の消失・置換は absent ではなく
+  parent/lock drift の typed refusal となり、write/clear の成功にはならない。
 - **restore できない mutation を「変更なし」と報告しない** (review j#102230 F1)。
   既存 entry を snapshot できない場合は replace の**前**に `declaration_snapshot_failed` で
   拒否する (snapshot 無しで進むと、後段の検証失敗時に rollback が新 entry を消すだけとなり、

@@ -12,8 +12,10 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from mozyo_bridge.core.state.workspace_registry import (
     ANCHOR_SCHEMA_VERSION,
@@ -31,7 +33,12 @@ from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.doma
     MODE_DISABLED,
     REASON_ALIAS_CYCLE,
     REASON_CROSS_REPOSITORY,
+    REASON_DECLARATION_MUTATION_IN_PROGRESS,
     REASON_DECLARATION_UNREADABLE,
+    REASON_DURABILITY_FAILED,
+    REASON_LOCK_FAILED,
+    REASON_PARENT_DRIFT,
+    REASON_REMOVE_FAILED,
     REASON_TARGET_IDENTITY_MISMATCH,
     REASON_TARGET_MISSING,
     STATE_ALIASED,
@@ -39,6 +46,10 @@ from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.doma
     STATE_NO_DECLARATION,
     STATE_REFUSED,
     WorkspaceAliasDeclaration,
+    AliasResolution,
+)
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.infrastructure import (  # noqa: E501
+    workspace_alias_store as store,
 )
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.infrastructure.workspace_alias_store import (  # noqa: E501
     CLEAR_ABSENT,
@@ -46,6 +57,7 @@ from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.infr
     alias_path,
     clear_declaration,
     read_declaration,
+    WorkspaceAliasStoreError,
     write_declaration,
 )
 
@@ -221,6 +233,7 @@ class FailClosedTests(AliasFixtureTestCase):
     def test_corrupt_declaration_does_not_degrade_to_launching(self) -> None:
         path = alias_path(self.nested)
         path.parent.mkdir(parents=True, exist_ok=True)
+        (path.parent / store._LOCK_NAME).touch()
         path.write_text("{ this is not json", encoding="utf-8")
         self._assert_refused(REASON_DECLARATION_UNREADABLE)
 
@@ -306,7 +319,142 @@ class StoreTests(AliasFixtureTestCase):
         self.assertEqual(clear_declaration(self.nested), CLEAR_ABSENT)
 
     def test_absent_declaration_reads_as_none(self) -> None:
+        lock_path = alias_path(self.nested).parent / store._LOCK_NAME
+        self.assertFalse(lock_path.exists())
         self.assertIsNone(read_declaration(self.nested))
+        self.assertFalse(
+            lock_path.exists(), "a read-only absence check created a lock entry"
+        )
+
+    def test_present_declaration_without_lock_is_refused(self) -> None:
+        self._declare_alias()
+        lock_path = alias_path(self.nested).parent / store._LOCK_NAME
+        lock_path.unlink()
+
+        result = read_declaration(self.nested)
+
+        self.assertIsInstance(result, AliasResolution)
+        self.assertEqual(result.reason, REASON_LOCK_FAILED)
+        self.assertFalse(lock_path.exists())
+
+    def test_unsafe_lock_entry_is_a_typed_refusal(self) -> None:
+        self._declare_alias()
+        lock_path = alias_path(self.nested).parent / store._LOCK_NAME
+        lock_path.unlink()
+        victim = self.base / "external-lock"
+        victim.write_text("do not lock", encoding="utf-8")
+        lock_path.symlink_to(victim)
+
+        result = read_declaration(self.nested)
+
+        self.assertIsInstance(result, AliasResolution)
+        self.assertEqual(result.reason, REASON_LOCK_FAILED)
+        self.assertEqual(victim.read_text(encoding="utf-8"), "do not lock")
+
+    def test_hardlinked_lock_entry_is_a_typed_refusal(self) -> None:
+        self._declare_alias()
+        lock_path = alias_path(self.nested).parent / store._LOCK_NAME
+        lock_path.unlink()
+        victim = self.base / "shared-lock-inode"
+        victim.write_text("do not lock", encoding="utf-8")
+        os.link(victim, lock_path)
+
+        result = read_declaration(self.nested)
+
+        self.assertIsInstance(result, AliasResolution)
+        self.assertEqual(result.reason, REASON_LOCK_FAILED)
+        self.assertEqual(victim.read_text(encoding="utf-8"), "do not lock")
+
+    def test_mutations_do_not_reacquire_the_public_reader_lock(self) -> None:
+        declaration = WorkspaceAliasDeclaration(mode=MODE_DISABLED, reason="roundtrip")
+        with mock.patch.object(
+            store,
+            "read_declaration",
+            side_effect=AssertionError("writer attempted public shared-lock read"),
+        ):
+            write_declaration(self.nested, declaration)
+            self.assertEqual(clear_declaration(self.nested), CLEAR_REMOVED)
+
+    def test_reader_refuses_during_failed_clear_then_reads_restored_value(self) -> None:
+        declaration = WorkspaceAliasDeclaration(mode=MODE_DISABLED, reason="original")
+        write_declaration(self.nested, declaration)
+        entry_taken = threading.Event()
+        reader_finished = threading.Event()
+        clear_errors: list[BaseException] = []
+
+        def fail_post_unlink_durability(dirfd: int) -> None:
+            self.assertGreaterEqual(dirfd, 0)
+            self.assertFalse(
+                alias_path(self.nested).exists(),
+                "clear had not yet taken the declaration entry",
+            )
+            entry_taken.set()
+            if not reader_finished.wait(5.0):
+                raise AssertionError("reader did not finish while clear held LOCK_EX")
+            raise WorkspaceAliasStoreError(
+                REASON_DURABILITY_FAILED, "forced post-unlink directory sync failure"
+            )
+
+        def run_clear() -> None:
+            try:
+                clear_declaration(self.nested)
+            except BaseException as exc:  # surfaced in the main test thread below
+                clear_errors.append(exc)
+
+        with mock.patch.object(
+            store, "_fsync_dir", side_effect=fail_post_unlink_durability
+        ):
+            worker = threading.Thread(target=run_clear, daemon=True)
+            worker.start()
+            self.assertTrue(entry_taken.wait(5.0), "clear never reached taken-entry state")
+            try:
+                during_clear = read_declaration(self.nested)
+                self.assertIsInstance(during_clear, AliasResolution)
+                self.assertEqual(
+                    during_clear.reason, REASON_DECLARATION_MUTATION_IN_PROGRESS
+                )
+                self.assertTrue(
+                    store.declaration_exists(self.nested),
+                    "cycle observation treated the writer's temporary absence as absent",
+                )
+            finally:
+                reader_finished.set()
+            worker.join(5.0)
+            self.assertFalse(worker.is_alive(), "clear did not finish its rollback")
+
+        self.assertEqual(len(clear_errors), 1)
+        self.assertIsInstance(clear_errors[0], WorkspaceAliasStoreError)
+        self.assertEqual(clear_errors[0].reason, REASON_DURABILITY_FAILED)
+        self.assertFalse(clear_errors[0].mutated)
+        restored = read_declaration(self.nested)
+        self.assertIsInstance(restored, WorkspaceAliasDeclaration)
+        self.assertEqual(restored.reason, "original")
+
+    def test_clear_refuses_when_fresh_parent_disappears_before_readback(self) -> None:
+        self._declare_alias()
+        parent = alias_path(self.nested).parent
+        detached = parent.with_name(".mozyo-bridge.detached")
+        real_fsync_dir = store._fsync_dir
+
+        def detach_after_unlink(dirfd: int) -> None:
+            real_fsync_dir(dirfd)
+            os.rename(parent, detached)
+
+        try:
+            with mock.patch.object(
+                store, "_fsync_dir", side_effect=detach_after_unlink
+            ):
+                with self.assertRaises(WorkspaceAliasStoreError) as caught:
+                    clear_declaration(self.nested)
+            self.assertEqual(caught.exception.reason, REASON_REMOVE_FAILED)
+            self.assertIn(REASON_PARENT_DRIFT, caught.exception.detail)
+            self.assertFalse(caught.exception.mutated)
+        finally:
+            if detached.exists():
+                os.rename(detached, parent)
+
+        restored = read_declaration(self.nested)
+        self.assertIsInstance(restored, WorkspaceAliasDeclaration)
 
 
 class LaunchChokepointTests(AliasFixtureTestCase):

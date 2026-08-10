@@ -34,6 +34,7 @@ from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.doma
     REASON_CROSS_REPOSITORY,
     REASON_DECLARATION_INVALID,
     REASON_DECLARATION_UNREADABLE,
+    REASON_LOCK_FAILED,
     REASON_NOT_REGULAR_FILE,
     REASON_PARENT_DRIFT,
     REASON_READBACK_FAILED,
@@ -87,6 +88,10 @@ def _write_anchor(root: Path, workspace_id: str, session: str) -> None:
         ),
         encoding="utf-8",
     )
+    # Hand-written declaration fixtures below exercise declaration parsing, not
+    # the new missing-lock refusal. Give every anchored fixture the same safe
+    # coordination entry a supported writer leaves behind.
+    (path.parent / store._LOCK_NAME).touch(exist_ok=True)
 
 
 class WorkspaceAliasCliTestCase(unittest.TestCase):
@@ -469,7 +474,12 @@ class WorkspaceAliasRaceAndTypeTests(WorkspaceAliasCliTestCase):
             )
         self.assertEqual(code, 1)
         self.assertIn(
-            payload["reason"], {REASON_DECLARATION_UNREADABLE, REASON_PARENT_DRIFT}
+            payload["reason"],
+            {
+                REASON_DECLARATION_UNREADABLE,
+                REASON_LOCK_FAILED,
+                REASON_PARENT_DRIFT,
+            },
         )
 
     def test_regular_to_fifo_swap_does_not_block_the_reader(self) -> None:
@@ -595,7 +605,7 @@ class WorkspaceAliasRollbackAndSizeTests(WorkspaceAliasCliTestCase):
         before = alias_path(self.nested).read_text(encoding="utf-8")
 
         with mock.patch.object(
-            store, "read_declaration",
+            store, "_read_effective_with_mutation_lock",
             return_value=store.refused("simulated", "verification failed"),
         ):
             code, payload = self.run_cli(
@@ -615,7 +625,7 @@ class WorkspaceAliasRollbackAndSizeTests(WorkspaceAliasCliTestCase):
             "workspace", "alias", "disable", "--repo", str(self.nested)
         )
         with mock.patch.object(
-            store, "read_declaration",
+            store, "_read_effective_with_mutation_lock",
             return_value=store.refused("simulated", "verification failed"),
         ), mock.patch.object(
             store, "_write_temp", side_effect=OSError("no space")

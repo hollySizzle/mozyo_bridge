@@ -1,51 +1,16 @@
-"""Workspace-local read/write for the nested-workspace alias declaration (#15190).
+"""Workspace-local nested-workspace alias declaration store (#15190).
 
-The declaration lives at ``<workspace>/.mozyo-bridge/workspace-alias.json``,
-next to the identity anchor but deliberately separate from it (see
-:data:`...domain.workspace_alias.ALIAS_RELATIVE`).
-
-Workspace-local storage — not the home registry — is the point. The acceptance
-boundary for #15190 requires the declaration to survive **registry loss and
-recovery**: after the home registry is moved aside and rebuilt from anchors, a
-nested workspace must still fold into its parent instead of quietly becoming
-launchable again. A row in ``registry.sqlite`` would be destroyed by exactly the
-recovery procedure it has to outlive, and would also require a schema bump on
-the identity store this rail is forbidden to hand-edit.
-
-Filesystem safety
------------------
-This file gates whether a launch happens, and it sits at a path the repository
-controls, so every operation treats the path itself as hostile. Four separate
-review findings shaped the current contract; each is load-bearing.
-
-- **Never follow a symlink** (j#102104 F1). ``Path.write_text`` follows them, so
-  a ``workspace-alias.json`` symlinked out of the workspace made
-  ``workspace alias disable`` overwrite an arbitrary external file. Operations
-  are anchored to a directory fd opened ``O_NOFOLLOW`` and decisions are made
-  from ``lstat``.
-- **"Absent" is not "unreadable"** (j#102104 F2). ``is_file()`` is false for a
-  directory, FIFO or dangling symlink, so a substituted declaration read back as
-  "nothing declared" and the nested launch proceeded. Only a genuinely missing
-  entry is ``no declaration``; anything else is a typed refusal.
-- **A pinned dirfd is not the visible directory** (j#102140 F1). A dirfd survives
-  a rename of its directory, so a write could land in a *detached* directory and
-  report success while the workspace-visible path had nothing. Every mutation
-  re-verifies that the root-visible ``.mozyo-bridge`` is still the same inode it
-  pinned, and confirms the result by reading back through a **fresh** path-based
-  open — the effective state, not the pinned one.
-- **A failed verification must not leave damage** (j#102140 F2). ``os.replace``
-  has already landed by the time a readback can fail, so the previous content is
-  restored (or the new entry removed when there was none) before the typed error
-  is raised. :class:`WorkspaceAliasStoreError` carries ``mutated`` so the CLI
-  reports what actually happened instead of always claiming nothing was written.
-- **Reads never raise, and never block** (j#102140 F3). Any ``stat``/``open``/
-  ``read`` failure becomes a typed refusal, and the file is opened
-  ``O_NONBLOCK`` and re-checked with ``fstat`` so a regular-file-to-FIFO swap
-  between the ``lstat`` and the ``open`` cannot hang the reader forever.
+The declaration survives home-registry recovery and stays separate from the
+identity anchor. Repository-controlled paths are hostile: operations pin a
+nofollow directory fd, distinguish absence from unreadability, verify visible
+inode identity, and roll back failed mutations. Reads are bounded/nonblocking
+and hold ``LOCK_SH | LOCK_NB`` through parsing so a writer's temporary absence
+is a typed refusal. Full rationale: ``vibes/docs/logics/workspace-registry.md``.
 """
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import json
@@ -57,11 +22,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple
 
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.infrastructure import (  # noqa: E501
+    workspace_alias_lock,
+)
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.workspace_alias import (  # noqa: E501
     ALIAS_RELATIVE,
     ALIAS_SCHEMA_VERSION,
     MAX_DECLARATION_BYTES,
     REASON_CONCURRENT_CHANGE,
+    REASON_DECLARATION_MUTATION_IN_PROGRESS,
     REASON_DECLARATION_UNREADABLE,
     REASON_DURABILITY_FAILED,
     REASON_LOCK_FAILED,
@@ -83,8 +52,11 @@ from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.doma
 _ALIAS_PARENT = Path(ALIAS_RELATIVE).parent.as_posix()
 _ALIAS_NAME = Path(ALIAS_RELATIVE).name
 
-#: The single-writer lock every supported mutation serializes on.
-_LOCK_NAME = f".{Path(ALIAS_RELATIVE).name}.lock"
+# Compatibility seams used by existing focused tests and callers in this module.
+_LOCK_NAME = workspace_alias_lock.LOCK_NAME
+_open_lock_fd = workspace_alias_lock.open_lock_fd
+_require_lock_visible = workspace_alias_lock.require_lock_visible
+WorkspaceAliasLockError = workspace_alias_lock.WorkspaceAliasLockError
 
 #: Read granularity for the bounded declaration read.
 _READ_CHUNK = 8192
@@ -242,18 +214,11 @@ def declaration_exists(repo_root: Path | str) -> bool:
     rather than only a readable declaration, and an unreadable parent counts as
     "present" so the caller refuses instead of aliasing into it.
     """
-    try:
-        dirfd = _open_parent(repo_root, create=False)
-    except WorkspaceAliasStoreError:
-        return True
-    if dirfd is None:
-        return False
-    try:
-        return _lstat_entry(dirfd) is not None
-    except OSError:
-        return True
-    finally:
-        os.close(dirfd)
+    # Reuse the coordinated public reader. A refusal is deliberately "present":
+    # alias-cycle detection must fail closed on an active mutation, unsafe lock,
+    # unreadable declaration, or malformed declaration rather than treating any
+    # of those as proof that the target declares nothing.
+    return read_declaration(repo_root) is not None
 
 
 def _read_bytes(dirfd: int) -> Optional[bytes] | AliasResolution:
@@ -362,8 +327,112 @@ def read_declaration(
         return refused(REASON_DECLARATION_UNREADABLE, f"{_parent_path(repo_root)}: {exc}")
     if dirfd is None:
         return None
+    lockfd: Optional[int] = None
+    locked = False
     try:
-        return _read_with_dirfd(dirfd)
+        try:
+            lockfd = _open_lock_fd(dirfd, create=False, writable=False)
+        except WorkspaceAliasLockError as exc:
+            return refused(exc.reason, exc.detail)
+        if lockfd is None:
+            # Do not create a lock file from a read-only operation. A present
+            # entry without its coordination lock cannot be proved stable, so
+            # it fails closed instead.
+            try:
+                entry = _lstat_entry(dirfd)
+            except OSError as exc:
+                return refused(
+                    REASON_DECLARATION_UNREADABLE, f"{ALIAS_RELATIVE}: {exc}"
+                )
+            if entry is None:
+                # Recheck the lock after observing absence. If a supported
+                # writer created it in between, join the normal shared-lock
+                # path instead of exposing its pre-install interval as None.
+                # A second ENOENT is the linearization point: no supported
+                # mutation had begun, and this read remains side-effect free.
+                try:
+                    lockfd = _open_lock_fd(dirfd, create=False, writable=False)
+                except WorkspaceAliasLockError as exc:
+                    return refused(exc.reason, exc.detail)
+                if lockfd is None:
+                    return None
+            else:
+                return refused(
+                    REASON_LOCK_FAILED,
+                    f"{ALIAS_RELATIVE} exists but {_LOCK_NAME} is absent; refusing "
+                    "an uncoordinated read",
+                )
+        try:
+            fcntl.flock(lockfd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            locked = True
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                return refused(
+                    REASON_DECLARATION_MUTATION_IN_PROGRESS,
+                    f"{_LOCK_NAME} is exclusively locked by a declaration mutation",
+                )
+            return refused(
+                REASON_LOCK_FAILED, f"could not share-lock {_LOCK_NAME}: {exc}"
+            )
+        try:
+            _require_lock_visible(dirfd, lockfd)
+        except WorkspaceAliasLockError as exc:
+            return refused(exc.reason, exc.detail)
+        result = _read_with_dirfd(dirfd)
+        try:
+            _require_lock_visible(dirfd, lockfd)
+        except WorkspaceAliasLockError as exc:
+            return refused(exc.reason, exc.detail)
+        return result
+    finally:
+        if lockfd is not None:
+            if locked:
+                try:
+                    fcntl.flock(lockfd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            os.close(lockfd)
+        os.close(dirfd)
+
+
+def _read_effective_with_mutation_lock(
+    repo_root: Path | str,
+    expected_lock_fd: int,
+) -> Optional[WorkspaceAliasDeclaration] | AliasResolution:
+    """Fresh path-based readback for a caller already holding ``LOCK_EX``.
+
+    ``read_declaration`` deliberately opens another fd and attempts ``LOCK_SH``.
+    Calling it while this process holds the writer lock would self-conflict and
+    make every mutation fail. Writers use this helper only for their effective
+    post-mutation check; the exclusive lock remains held for the entire call,
+    while the parent directory is reopened from ``repo_root`` so parent drift is
+    still observed rather than hidden by the writer's pinned dirfd.
+    """
+    try:
+        dirfd = _open_parent(repo_root, create=False)
+    except WorkspaceAliasStoreError as exc:
+        return refused(exc.reason, exc.detail)
+    except OSError as exc:  # pragma: no cover - defensive
+        return refused(
+            REASON_DECLARATION_UNREADABLE, f"{_parent_path(repo_root)}: {exc}"
+        )
+    if dirfd is None:
+        return refused(
+            REASON_PARENT_DRIFT,
+            f"{_parent_path(repo_root)} disappeared while its mutation lock "
+            "remained held; refusing to treat parent drift as an absent declaration",
+        )
+    try:
+        try:
+            _require_lock_visible(dirfd, expected_lock_fd)
+        except WorkspaceAliasLockError as exc:
+            return refused(exc.reason, exc.detail)
+        result = _read_with_dirfd(dirfd)
+        try:
+            _require_lock_visible(dirfd, expected_lock_fd)
+        except WorkspaceAliasLockError as exc:
+            return refused(exc.reason, exc.detail)
+        return result
     finally:
         os.close(dirfd)
 
@@ -403,41 +472,12 @@ def _discard(dirfd: int, name: str) -> None:
 
 @contextmanager
 def _mutation_lock(dirfd: int):
-    """Serialize every supported mutation on one exclusive lock.
-
-    Review j#102259 Finding 1: a pre-replace recheck is not enough on its own —
-    between the check and the ``os.replace`` another supported mutation can land
-    a *different* valid declaration, which this operation's rollback then
-    overwrites while reporting itself a no-op. Holding an exclusive lock across
-    snapshot → replace → verify → rollback makes that window unreachable for any
-    writer that goes through this module; the generation check below is the
-    defence against writers that do not.
-    """
+    """Compatibility wrapper preserving ``WorkspaceAliasStoreError``."""
     try:
-        fd = os.open(
-            _LOCK_NAME,
-            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
-            0o644,
-            dir_fd=dirfd,
-        )
-    except OSError as exc:
-        raise WorkspaceAliasStoreError(
-            REASON_LOCK_FAILED, f"could not open {_LOCK_NAME}: {exc}"
-        ) from exc
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        except OSError as exc:
-            raise WorkspaceAliasStoreError(
-                REASON_LOCK_FAILED, f"could not lock {_LOCK_NAME}: {exc}"
-            ) from exc
-        yield
-    finally:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        os.close(fd)
+        with workspace_alias_lock.mutation_lock(dirfd) as fd:
+            yield fd
+    except WorkspaceAliasLockError as exc:
+        raise WorkspaceAliasStoreError(REASON_LOCK_FAILED, exc.detail) from exc
 
 
 def _fence(dirfd: int):
@@ -608,7 +648,7 @@ def write_declaration(
     assert dirfd is not None  # create=True either opens or raises
     backup: Optional[str] = None
     try:
-      with _mutation_lock(dirfd):
+      with _mutation_lock(dirfd) as mutation_lock_fd:
         anchor = _fd_identity(dirfd)
         _require_parent_visible(repo_root, anchor)
 
@@ -754,7 +794,9 @@ def write_declaration(
             # The effective state, read through a fresh path-based open. This is
             # what catches a parent that drifted: the pinned dirfd would happily
             # read back the write it just made into a detached directory.
-            effective = read_declaration(repo_root)
+            effective = _read_effective_with_mutation_lock(
+                repo_root, mutation_lock_fd
+            )
             if isinstance(effective, AliasResolution) or effective is None or (
                 effective.as_payload() != payload
             ):
@@ -797,7 +839,7 @@ def clear_declaration(repo_root: Path | str) -> str:
     if dirfd is None:
         return CLEAR_ABSENT
     try:
-      with _mutation_lock(dirfd):
+      with _mutation_lock(dirfd) as mutation_lock_fd:
         anchor = _fd_identity(dirfd)
         try:
             _require_parent_visible(repo_root, anchor)
@@ -871,7 +913,7 @@ def clear_declaration(repo_root: Path | str) -> str:
                 _fsync_dir(dirfd)
             except WorkspaceAliasStoreError as exc:
                 durability = exc.detail
-        effective = read_declaration(repo_root)
+        effective = _read_effective_with_mutation_lock(repo_root, mutation_lock_fd)
         if effective is None and durability is None:
             return outcome
 

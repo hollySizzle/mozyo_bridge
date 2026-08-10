@@ -108,6 +108,10 @@ REASON_CONCURRENT_CHANGE = "declaration_concurrent_change"
 REASON_DURABILITY_FAILED = "declaration_durability_failed"
 # The single-writer mutation lock could not be taken.
 REASON_LOCK_FAILED = "declaration_lock_failed"
+# A public reader found the declaration writer holding its exclusive lock.
+# Readers never wait: a transiently hidden entry must fail closed rather than
+# being mistaken for a genuinely absent declaration (review j#102710 r6f3).
+REASON_DECLARATION_MUTATION_IN_PROGRESS = "declaration_mutation_in_progress"
 # The declaration exceeds :data:`MAX_DECLARATION_BYTES`. A declaration is a
 # handful of short fields; anything larger is a repository-controlled file being
 # used to force an unbounded allocation in a process that only wanted to decide
@@ -496,6 +500,7 @@ __all__ = (
     "ALIAS_SCHEMA_VERSION",
     "MAX_DECLARATION_BYTES",
     "REASON_CONCURRENT_CHANGE",
+    "REASON_DECLARATION_MUTATION_IN_PROGRESS",
     "REASON_DURABILITY_FAILED",
     "REASON_LOCK_FAILED",
     "REASON_PARENT_DRIFT",
