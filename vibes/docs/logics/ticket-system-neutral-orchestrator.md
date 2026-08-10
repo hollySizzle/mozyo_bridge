@@ -555,14 +555,28 @@ signal を含まない。
 plist 削除の authorization に到達し得た。quote は境界を *観測* にする（推測ではない）。quote されない文面では
 束縛を証明できないため `unreadable` へ倒す —— **実機文面を確定できるまで over-refusal を選ぶ**（#15194）。
 
-(3) の完全一致は **raw byte の比較**であり、照合前に case を畳まない（review j#102327 finding r6f1）。文面
-（not-found 語・権限 signal）は散文であり大小文字は契約でないため case-insensitive に照合してよいが、**label は
-identity** である。両者を同じ正規化文字列で扱っていたため、`ORG.MOZYO-BRIDGE...DRAIN` という **別の byte 列**
-—— したがって本 adapter が install していない別 job —— の not-found が owned の確認済み不在として通り、plist 削除の
-authorization に到達し得た。Apple 正本は `Label` を「job を一意に識別する文字列」と述べるのみで
-**case-insensitive 照合を規定していない**ため、case-fold は契約ではなく *こちらの仮定*であった。大小文字だけが
-異なる 2 つの label は、実機が別を示すまで **別 label** として扱う（#15194）。文面用の正規化文字列と identity 用の
-raw 文字列は実装上も分離する。
+(3) の完全一致は **decoded string（code point 列）の完全一致**であり、照合前に case を畳まない
+（review j#102327 finding r6f1）。文面（not-found 語・権限 signal）は散文であり大小文字は契約でないため
+case-insensitive に照合してよいが、**label は identity** である。両者を同じ正規化文字列で扱っていたため、
+`ORG.MOZYO-BRIDGE...DRAIN` という **別の文字列** —— したがって本 adapter が install していない別 job —— の
+not-found が owned の確認済み不在として通り、plist 削除の authorization に到達し得た。Apple 正本は `Label` を
+「job を一意に識別する文字列」と述べるのみで **case-insensitive 照合を規定していない**ため、case-fold は契約ではなく
+*こちらの仮定*であった。大小文字だけが異なる 2 つの label は、実機が別を示すまで **別 label** として扱う（#15194）。
+文面用の正規化文字列と identity 用の未加工文字列は実装上も分離する。
+
+（本節は当初「raw byte の比較」と記していたが、runner は `subprocess.run(..., text=True)` で decode 済み `str` を
+返すため、この経路に byte は存在しない。実装が使っていない語で契約を書くこと自体が欠陥であり、
+review j#102378 finding r7f1 の副次指摘として訂正した。）
+
+(3) の照合は **substring 検索ではなく quoted-name の走査**である（review j#102378 finding r7f1）。
+`f'"{token}"' in message` は「その 2 文字が存在する」ことしか確かめておらず、2 つの quote が **同一 span の両端**である
+保証がなかった。別 label を backslash escape で `"prefix\"<owned>"` と表示した場合、hit の開始 quote は *その別 label の
+データである escaped quote*、終了 quote は外側 delimiter であり、hit は plist 削除の authorization に到達し得た。
+launchctl の error wording は API ではなく、**quote を含む label をどう表示するかは未確認**である。したがって
+走査が認識する grammar は「escape を一切含まない plain な `"` で区切られた span」1 つに限定し、別の grammar が
+使われている兆候 —— backslash の存在、quote 数の不均衡（閉じない span）、隣接する span（`""` 形式の escape の兆候）
+—— が 1 つでもあれば **文面を解析不能として `unreadable` へ倒す**。解析できた場合のみ、完全な span 群と exact 比較する。
+「解析不能」は「一致しない」ではなく、確認済み不在には決してならない。
 
 以前は (1) **または** (2) で足りるとしていたため、`113` + `Operation not permitted`（権限失敗）が不存在と判定され
 所有 plist を削除した。単独の signal はこの帰結を負うには弱すぎる: launchctl の man page は成功=0 / 失敗=非0 しか
@@ -588,11 +602,17 @@ Linux の `ActiveState` 分類は **closed vocabulary** である（review j#102
 規則と同じ規則の裏返しであり、**未知値をいかなる確認済み状態へも畳まない**。`loaded` 投影は
 `probe_state == loaded` から導出し、同一 state machine について 2 つの答えが出ないようにする。
 
-この照合も **case-sensitive** である（review j#102327 finding r6f2）。値を lower() してから集合照合していたため
-`INACTIVE` が確認済み不在、`ACTIVE` が確認済み稼働として通っていたが、systemd upstream の D-Bus 契約が列挙する
-`ActiveState` は **lowercase literal** であり、大小文字違いは本実装が「認識済み」と宣言した語彙ではない。
-すなわち unknown であり `unreadable` へ倒す（macOS 側 r6f1 と同型の「未確認の同一性を確認済み事実へ昇格しない」
-規則）。strip するのは `key=value` 行の解析に由来する空白のみである。
+この照合は **case-sensitive かつ trim なし**、すなわち値の **exact 比較**である（review j#102327 finding r6f2 /
+j#102378 finding r7f2）。正規化を 1 つ挟むたびに closed vocabulary が開いた: lower() は `INACTIVE` を確認済み不在・
+`ACTIVE` を確認済み稼働として通し、strip は `ActiveState= inactive ` に同じことをした。systemd upstream の D-Bus 契約が
+列挙する `ActiveState` は **padding を持たない lowercase literal** であり、大小文字違いも空白付きも本実装が
+「認識済み」と宣言した語彙ではない。すなわち unknown であり `unreadable` へ倒す（macOS 側 r6f1 / r7f1 と同型の
+「未確認の同一性・状態を確認済み事実へ昇格しない」規則）。
+
+strip を「`key=value` 行の解析に由来する framing」とした当初の根拠は成立しない: `splitlines()` が既に line terminator を
+除いており、最初の `=` より後ろは manager の回答そのものである。したがって authority を担う読取
+（`ActiveState` / `UnitFileState`）では key・value とも manager が書いたまま扱い、**表示専用の値の整形は投影側で行う**。
+両者を同じ reader で正規化すると、表示の都合が migration fence の語彙を広げることになる。
 
 **分類の consumer は 1 つの state machine に 2 つの答えを出さない**（同 finding）。`restart` は raw 値を
 `active` と直接比較していたため、`reloading` の timer が status では `loaded`、restart では
@@ -611,6 +631,17 @@ zero-mutation のままである（credential readiness は gate ではないた
 **Linux systemd user timer** の realization（`supervisor_systemd`）は **owned service 1 個 + timer 1 個**であ
 る。timer は portable default cadence ごとに `workflow supervisor --run-once` を 1 回起動し、process は毎 tick
 終了する。
+
+**unit の書込先（`XDG_CONFIG_HOME`）は環境変数の値を未加工で読む**（review j#102378 finding r7f3）。これは表示文字列では
+なく **mutation target** である: `install` はここへ unit file を書き、`uninstall` はここの file を削除する。値を strip して
+から絶対 path 判定していたため、XDG Base Directory Specification 0.8 の規則を同時に 2 方向へ破っていた ——
+`" /tmp/x"` は **absolute ではなく**、spec は invalid として無視することを要求するのに、trim が有効な root へ昇格させて
+そこへ install した。`"/tmp/x "` は末尾空白を名前に含む directory を指す **absolute path** なのに、trim が別 directory へ
+書込先を変えた。したがって規則は: **unset または empty のときのみ** default（`~/.config`）、raw が absolute ならその
+**exact path**、それ以外（relative・空白のみ等）は invalid として無視し default を使う。未加工で読むことは user manager と
+一致する唯一の読み方でもある —— manager 自身の unit 探索 path も同じ未加工の変数から決まるため、trim した先へ書けば
+`systemctl --user` から見えない場所へ install することになり、この adapter が無くそうとしている
+silently unscheduled supervisor をこちらから作ることになる。
 
 **OS tick は Redmine poll ではない。** provider 読み取りは supervisor 本体が持つ durable な
 per-workspace cadence watermark（`reconcile_cadence` / `should_reconcile_source`、portable default 300 秒 +

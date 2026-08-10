@@ -425,6 +425,56 @@ class UnitDirectoryTest(_LinuxCase):
         with patch.dict(os.environ, {"XDG_CONFIG_HOME": "relative/cfg"}, clear=False):
             self.assertEqual(ss.unit_dir(), Path.home() / ".config/systemd/user")
 
+    def test_the_xdg_value_is_read_exactly_as_set(self) -> None:
+        # Review j#102378 finding r7f3. The value was trimmed before the absolute test, which broke
+        # the XDG Base Directory Specification in both directions at once: a value that is NOT
+        # absolute (and which the spec says to treat as invalid and ignore) was promoted to a valid
+        # root, and an absolute path naming a directory whose name ends in a space was redirected to
+        # a different directory. This is not cosmetic — `install` writes the unit files into what
+        # this returns and `uninstall` unlinks from it.
+        cases = (
+            (" /tmp/mozyo-xdg", Path.home() / ".config/systemd/user", "leading space: not absolute"),
+            ("\t/tmp/mozyo-xdg", Path.home() / ".config/systemd/user", "leading tab: not absolute"),
+            ("   ", Path.home() / ".config/systemd/user", "whitespace only: not absolute"),
+            ("/tmp/mozyo-xdg ", Path("/tmp/mozyo-xdg /systemd/user"), "trailing space is part of it"),
+            ("/tmp/mozyo-xdg", Path("/tmp/mozyo-xdg/systemd/user"), "the ordinary absolute case"),
+        )
+        for raw, expected, why in cases:
+            with patch.dict(os.environ, {"XDG_CONFIG_HOME": raw}, clear=False):
+                self.assertEqual(ss.unit_dir(), expected, why)
+
+    def test_an_empty_or_unset_xdg_config_home_selects_the_default(self) -> None:
+        # The spec's only two triggers for the default. Empty must not be confused with invalid:
+        # both land on the default here, but for different documented reasons.
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": ""}, clear=False):
+            self.assertEqual(ss.unit_dir(), Path.home() / ".config/systemd/user")
+        env = dict(os.environ)
+        env.pop("XDG_CONFIG_HOME", None)
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(ss.unit_dir(), Path.home() / ".config/systemd/user")
+
+    def test_install_and_uninstall_touch_only_the_raw_authority_path(self) -> None:
+        # The end-to-end consequence: a padded XDG value must not make install create units in — or
+        # uninstall delete units from — a directory the raw value never named. `Path.home` is
+        # redirected to a temp root so the ignored-value fallback stays inside the fixture.
+        ignored = self.os_home / "cfg"
+        fallback_home = self.os_home / "home"
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": f" {ignored}"}, clear=False), \
+                patch.object(Path, "home", return_value=fallback_home):
+            result = ss.install(
+                mozyo_home=self.mozyo_home, runner=self._runner(), which=_which_found
+            )
+            self.assertTrue(result["performed"], result)
+            self.assertFalse(
+                (ignored / "systemd/user").exists(),
+                "a non-absolute XDG value must be ignored, not trimmed into a write target",
+            )
+            self.assertTrue((fallback_home / ".config/systemd/user" / ss.SERVICE_UNIT_NAME).exists())
+            ss.uninstall(runner=self._runner())
+            self.assertFalse(
+                (fallback_home / ".config/systemd/user" / ss.SERVICE_UNIT_NAME).exists()
+            )
+
 
 # ---------------------------------------------------------------------------
 # Finding 2: an unconfigured Redmine must NOT block installing the timer.
@@ -678,7 +728,8 @@ class RestartTest(_LinuxCase):
         # machine. Both verbs now read the same classification.
         self._install()
         for active in ("active", "reloading", "inactive", "failed", "activating",
-                       "deactivating", "maintenance", "ACTIVE", "RELOADING", "INACTIVE", ""):
+                       "deactivating", "maintenance", "ACTIVE", "RELOADING", "INACTIVE", "",
+                       " active ", "active ", "\tinactive", "  failed  "):
             show_map = {ss.SUPERVISOR_UNIT.timer_unit: _timer_show(active=active)}
             status = ss.service_status(
                 os_home=self.os_home, mozyo_home=self.mozyo_home,

@@ -380,7 +380,7 @@ def _says_not_found(result, service_target: str) -> bool:
     # Two readings of one string, kept apart on purpose (review j#102327 finding r6f1). *Wording* is
     # prose whose capitalization is not a contract, so phrases are matched case-folded. *Identity* is
     # the label launchd keys the job off, and folding its case would make a DIFFERENT label's absence
-    # read as ours — so identity is matched against the raw bytes launchctl printed.
+    # read as ours — so identity is matched against the message exactly as launchctl wrote it.
     wording = message.lower()
     if any(phrase in wording for phrase in _LAUNCHCTL_UNREADABLE_PHRASES):
         return False
@@ -397,37 +397,72 @@ def _says_not_found(result, service_target: str) -> bool:
     return _names_exactly(message, target) or _names_exactly(message, label)
 
 
+def _quoted_names(message: str) -> Optional[list[str]]:
+    """Every complete double-quoted span in ``message``, or ``None`` when the quoting is undecidable.
+
+    launchctl's error wording is explicitly not an API, so the quoting *grammar* it uses is unknown:
+    we have never seen how it renders a label that itself contains a quote. This scanner therefore
+    recognizes exactly one grammar — spans delimited by plain ``"`` with nothing escaped — and
+    refuses to answer whenever the text shows a sign that some OTHER grammar is in play:
+
+    - **any backslash**, which would mean an escape convention this scanner cannot read;
+    - an **odd number of quotes**, i.e. a span that never closes;
+    - **two adjacent spans** (an empty run between them), the signature of ``""``-style escaping.
+
+    ``None`` is not "no match": it means the message cannot be parsed, which :func:`_says_not_found`
+    turns into :data:`PROBE_UNREADABLE`, never into a confirmed absence.
+    """
+    if "\\" in message:
+        return None
+    parts = message.split('"')
+    if len(parts) % 2 == 0:  # one quote per span boundary, so a balanced message splits into odd
+        return None
+    if any(parts[i] == "" for i in range(2, len(parts) - 1, 2)):
+        return None
+    return parts[1::2]
+
+
 def _names_exactly(message: str, token: str) -> bool:
     """Whether ``message`` names ``token`` as launchd's own **quoted** service name.
 
-    Only one form is accepted: the token inside double quotes, byte for byte. That is how launchctl
-    renders the name it could not find, and the quotes are what make the boundary *observed* rather
-    than *assumed*.
+    Only one form is accepted: the token as a complete quoted span, compared in full. That is how
+    launchctl renders the name it could not find, and a delimited span is what makes the boundary
+    *observed* rather than *assumed*.
 
-    ``message`` must be the RAW launchctl output, never a case-folded copy. Comparing folded strings
-    made ``"ORG.MOZYO-BRIDGE.CALLBACK-SUPERVISOR.DRAIN"`` — a different byte sequence, and therefore
-    a label this adapter never installed — satisfy the check for our own label and authorize
-    unlinking our plist (review j#102327 finding r6f1). Apple documents ``Label`` only as a string
-    that uniquely identifies a job; that it may be compared case-insensitively is nowhere stated, so
-    it is an assumption, and an assumption is not something to hang a destructive migration on. Two
-    labels differing only in case are treated as different labels until a real host says otherwise
-    (#15194) — the direction that costs a retry rather than someone else's registration.
+    The comparison is over the **exact decoded string** — the ``str`` the runner hands back from
+    ``subprocess.run(..., text=True)``, character for character. (Earlier revisions of this docstring
+    said "bytes"; nothing in this path ever sees bytes, and describing a check in terms it does not
+    use is its own defect — review j#102378 finding r7f1.) In particular the message is never
+    case-folded before it gets here. Comparing folded strings made
+    ``"ORG.MOZYO-BRIDGE.CALLBACK-SUPERVISOR.DRAIN"`` — a different string, and therefore a label this
+    adapter never installed — satisfy the check for our own label and authorize unlinking our plist
+    (review j#102327 finding r6f1). Apple documents ``Label`` only as a string that uniquely
+    identifies a job; that it may be compared case-insensitively is nowhere stated, so it is an
+    assumption, and an assumption is not something to hang a destructive migration on.
 
-    The previous version inferred boundaries from a character allowlist — alphanumerics plus
-    ``.-_`` — treating anything else as a delimiter. Apple documents ``Label`` only as a unique
-    identifying string and places no such restriction on it, so that allowlist was invented here,
-    and it was wrong: ``<owned>@helper``, ``<owned>:helper``, ``<owned>+helper`` and
-    ``<owned>/helper`` are all *different* labels that satisfied a boundary test built from it, and
-    each could authorize unlinking the owned registration (review j#102309 finding r5f1).
+    The check must also *parse*, not merely find (review j#102378 finding r7f1). ``f'"{token}"' in
+    message`` was a substring test wearing a parser's clothes: for a different label rendered as
+    ``"prefix\\"<owned>"``, the opening quote of the "match" is the escaped quote that belongs to
+    THAT label's data and the closing one is the outer delimiter, so the two quotes bounding the hit
+    were never the two ends of one span — and the hit authorized unlinking our registration. Spans
+    now come from :func:`_quoted_names`, which refuses to answer at all when the quoting cannot be
+    read unambiguously.
 
-    A quoted match cannot be satisfied by a longer or different label whatever characters it
-    contains, because the closing quote terminates the comparison. Everything else — including a
-    message that names the service without quoting it — yields no binding and therefore
-    :data:`PROBE_UNREADABLE`. That is deliberately an over-refusal: until the real launchctl wording
-    is captured on a live host (#15194), refusing is the only honest answer, and refusing costs a
-    retry while a wrong match costs someone else's running service.
+    Two earlier boundary rules failed the same way from further out. A character allowlist —
+    alphanumerics plus ``.-_``, anything else a delimiter — was invented here, and Apple constrains
+    ``Label``'s characters nowhere, so ``<owned>@helper`` / ``<owned>:helper`` / ``<owned>+helper`` /
+    ``<owned>/helper`` all satisfied it (review j#102309 finding r5f1). Before that, a bare substring
+    test made our label a prefix of every longer one (review j#102235 finding r4f1).
+
+    Everything unrecognized — an unquoted mention, an unreadable quoting, a different label — yields
+    no binding and therefore :data:`PROBE_UNREADABLE`. That is deliberately an over-refusal: until
+    the real launchctl wording is captured on a live host (#15194), refusing is the only honest
+    answer, and refusing costs a retry while a wrong match costs someone else's running service.
     """
-    return bool(token) and f'"{token}"' in message
+    if not token or '"' in token or "\\" in token:
+        return False
+    names = _quoted_names(message)
+    return names is not None and token in names
 
 
 def _small_int_or_none(token: str) -> Optional[int]:

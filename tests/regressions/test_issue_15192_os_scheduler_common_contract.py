@@ -336,12 +336,31 @@ class ProbeStateProjectionTest(unittest.TestCase):
                 manager_available=True, timer_output=f"ActiveState={state}\n"
             )
             self.assertEqual(status["probe_state"], ss.PROBE_UNREADABLE, state)
-        # Only the whitespace that comes from parsing the `key=value` line is stripped: that is the
-        # reader's own framing, not part of the manager's answer.
-        padded = _systemd_status(
-            manager_available=True, timer_output="ActiveState=  active  \n"
+    def test_the_closed_vocabulary_is_matched_without_trimming(self) -> None:
+        # Review j#102378 finding r7f2 — and a correction to this file. The sibling test above was
+        # added in R6 asserting that `ActiveState=  active  ` reads as LOADED, on the reasoning that
+        # the padding was framing the `key=value` parse had introduced. That reasoning was wrong:
+        # `splitlines` has already removed the terminator, so everything after the first `=` is the
+        # manager's answer, and systemd enumerates its states as bare lowercase literals. A padded
+        # value is therefore a value this code has not been told the meaning of — the unknown case.
+        # A green regression test is not evidence its expectation was right.
+        for state, why in (
+            ("  active  ", "spaces around a known running state"),
+            (" inactive ", "spaces around a known absent state"),
+            ("\tfailed", "a tab before a known absent state"),
+            ("active ", "one trailing space"),
+        ):
+            status = _systemd_status(
+                manager_available=True, timer_output=f"ActiveState={state}\n"
+            )
+            self.assertEqual(status["probe_state"], ss.PROBE_UNREADABLE, why)
+        # The complement: the exact tokens still classify.
+        self.assertEqual(
+            _systemd_status(
+                manager_available=True, timer_output="ActiveState=active\n"
+            )["probe_state"],
+            ss.PROBE_LOADED,
         )
-        self.assertEqual(padded["probe_state"], ss.PROBE_LOADED)
 
     def test_neither_adapter_folds_case_to_reach_a_confirmed_state(self) -> None:
         # The cross-adapter shape of r6f1 / r6f2: one is an identity (a launchd label), the other a

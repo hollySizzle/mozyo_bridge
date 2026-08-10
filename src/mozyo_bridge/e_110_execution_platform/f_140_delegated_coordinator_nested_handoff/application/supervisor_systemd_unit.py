@@ -150,11 +150,22 @@ def unit_dir(os_home: Optional[Path] = None) -> Path:
     holds an absolute path, else ``~/.config/systemd/user``. Writing anywhere else would produce an
     install that ``systemctl --user`` cannot see — a silently unscheduled supervisor, which is the
     exact failure this adapter exists to remove.
+
+    The environment value is read **exactly as set**, with no trimming (review j#102378 finding
+    r7f3). This is not a display string: :func:`install` writes the two unit files into the
+    directory this returns and :func:`uninstall` unlinks files from it, so a normalization here
+    changes what gets created and deleted. Trimming broke both halves of the XDG Base Directory
+    Specification's rule at once — a value like ``" /tmp/x"`` is *not* absolute and the spec says an
+    implementation must treat it as invalid and ignore it, yet the trim promoted it to a valid root
+    and installed there; and ``"/tmp/x "`` *is* absolute, naming a directory whose name ends in a
+    space, yet the trim redirected the write to a different directory. Only unset and empty select
+    the default. Reading it raw is also the only reading that can agree with the user manager, whose
+    own unit search path comes from the same unmodified variable.
     """
     if os_home is not None:
         return Path(os_home) / CONFIG_DIR_RELATIVE / UNIT_DIR_RELATIVE
-    xdg = (os.environ.get("XDG_CONFIG_HOME") or "").strip()
-    config_root = Path(xdg) if xdg and os.path.isabs(xdg) else Path.home() / CONFIG_DIR_RELATIVE
+    xdg = os.environ.get("XDG_CONFIG_HOME") or ""
+    config_root = Path(xdg) if os.path.isabs(xdg) else Path.home() / CONFIG_DIR_RELATIVE
     return config_root / UNIT_DIR_RELATIVE
 
 

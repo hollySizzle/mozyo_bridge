@@ -243,6 +243,16 @@ def _show(runner: Runner, unit_name: str, properties: Sequence[str]) -> dict[str
 
     An empty result means the read FAILED, which :func:`_probe_state` keeps distinct from a
     successful read of an inactive unit — those are different facts.
+
+    Keys and values are carried **exactly as the manager wrote them**, split on the first ``=`` and
+    otherwise untouched. This reader feeds :func:`_probe_state`, whose whole contract is a closed
+    vocabulary of exact tokens, and trimming here silently widened it: ``ActiveState= inactive ``
+    was reported as a confirmed stop though systemd enumerates its states as bare lowercase literals
+    and pads nothing (review j#102378 finding r7f2). ``splitlines`` has already removed the line
+    terminator, so any remaining whitespace came from the manager's answer, not from framing this
+    parser added — treating it as framing was an assumption, and the closed vocabulary exists
+    precisely so unrecognized input reads as unknown. Where a value is merely *displayed*, the
+    projection tidies it at the point of display, which is a formatting decision and not this one.
     """
     args = ["show", unit_name, *[f"--property={p}" for p in properties]]
     try:
@@ -253,9 +263,9 @@ def _show(runner: Runner, unit_name: str, properties: Sequence[str]) -> dict[str
         return {}
     values: dict[str, str] = {}
     for line in (result.stdout or "").splitlines():
-        key, sep, value = line.strip().partition("=")
+        key, sep, value = line.partition("=")
         if sep:
-            values[key.strip()] = value.strip()
+            values[key] = value
     return values
 
 
@@ -290,17 +300,19 @@ def _probe_state(shown: dict[str, str], *, manager_available: bool) -> str:
     and here it is the same rule pointing the other way — do not fold unknown into any *confirmed*
     state. A value systemd adds in a future release must read as "I do not know", never as a fact.
 
-    That is why the comparison is **case-sensitive**. Case-folding the value first reopened the very
-    vocabulary this function closes: ``INACTIVE`` read as a confirmed absence and ``ACTIVE`` as a
-    confirmed run, though neither is a token systemd's D-Bus interface enumerates — upstream lists
-    ``ActiveState`` as lowercase literals (review j#102327 finding r6f2). A value whose case we have
-    not seen documented is a value this code has not been told the meaning of, which is exactly the
-    unknown case. Only ``strip()`` is applied, because surrounding whitespace comes from parsing the
-    ``key=value`` line, not from the manager's answer.
+    That is why the value is compared **exactly**: no case folding, no trimming. Each normalization
+    reopened the vocabulary this function closes. Folding case let ``INACTIVE`` read as a confirmed
+    absence and ``ACTIVE`` as a confirmed run (review j#102327 finding r6f2); trimming let
+    ``ActiveState= inactive `` do the same (review j#102378 finding r7f2). Neither spelling is a
+    token systemd's D-Bus interface enumerates — upstream lists ``ActiveState`` as bare lowercase
+    literals — so both are values this code has not been told the meaning of, which is exactly the
+    unknown case. The justification offered for the trim (that the whitespace was framing this
+    parser had introduced) did not hold: ``splitlines`` removes the terminator, and everything after
+    the first ``=`` is the manager's answer.
     """
     if not manager_available:
         return PROBE_UNREADABLE
-    active_state = (shown.get("ActiveState") or "").strip()
+    active_state = shown.get("ActiveState") or ""
     if not active_state:
         return PROBE_UNREADABLE
     if active_state in _ACTIVE_STATES:
@@ -614,6 +626,8 @@ def service_status(
         "timer_unit": SUPERVISOR_UNIT.timer_unit,
         "service_unit_exists": service_exists,
         "timer_unit_exists": timer_exists,
+        # Exact, like `probe_state`: `UnitFileState` is another enumerated systemd token, so an
+        # unrecognized spelling means "not the state we can name", never "enabled".
         "timer_enabled": timer_shown.get("UnitFileState") == "enabled",
         # ``loaded`` is the cross-adapter word for "the host manager is scheduling this service",
         # derived from the SAME classification as ``probe_state`` so the two cannot disagree about
@@ -625,13 +639,16 @@ def service_status(
         "next_elapse": next_elapse_value,
         "next_elapse_basis": next_elapse_basis,
         # Wall-clock time of the last trigger — the operator-friendly companion to a monotonic
-        # next-elapse, and the value that makes the observed cadence checkable.
-        "last_trigger": timer_shown.get("LastTriggerUSec", ""),
+        # next-elapse, and the value that makes the observed cadence checkable. These three are
+        # DISPLAY values, so tidying them is a formatting choice made here, at the point of display
+        # — deliberately not in `_show`, where the same trim would widen the state vocabulary the
+        # migration fence depends on (review j#102378 finding r7f2).
+        "last_trigger": timer_shown.get("LastTriggerUSec", "").strip(),
         # How the last tick ended (acceptance: 直近の終了結果). ``Result`` is systemd's fixed
         # vocabulary (``success`` / ``exit-code`` / ``signal`` / ``timeout`` / ...).
-        "last_result": service_shown.get("Result", ""),
+        "last_result": service_shown.get("Result", "").strip(),
         "last_exit_status": _int_or_none(service_shown.get("ExecMainStatus", "")),
-        "last_exit_at": service_shown.get("ExecMainExitTimestamp", ""),
+        "last_exit_at": service_shown.get("ExecMainExitTimestamp", "").strip(),
         "pid": _pid_or_none(service_shown.get("MainPID", "")),
         "scheduled_interval_seconds": (
             scheduled_interval

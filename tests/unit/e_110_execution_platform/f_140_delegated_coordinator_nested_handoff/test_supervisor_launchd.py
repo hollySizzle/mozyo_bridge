@@ -1093,6 +1093,62 @@ class LegacyDrainMigrationTest(_DarwinCase):
             )["state"]
             self.assertEqual(state, sl.PROBE_UNREADABLE, why)
 
+    def test_quoting_it_cannot_parse_is_unreadable_not_a_match(self) -> None:
+        # Review j#102378 finding r7f1. `f'"{token}"' in message` was a substring test, not a parse:
+        # for a different label rendered with a backslash escape, the opening quote of the "match"
+        # is that label's own escaped quote and the closing one is the outer delimiter, so the two
+        # quotes bounding the hit are not the two ends of one span. launchctl's quoting grammar is
+        # unverified, so every sign of a grammar this scanner cannot read must refuse.
+        owned = sl.LEGACY_DRAIN_AGENT.label
+        for rendered, why in (
+            (f'Could not find service "prefix\\"{owned}" in domain', "backslash-escaped quote"),
+            (f'Could not find service "prefix""{owned}" in domain', 'doubled-quote escaping'),
+            (f'Could not find service "prefix"{owned}" in domain', "an unbalanced quote run"),
+            (f'Could not find service "{owned}\\" in domain', "a trailing escape in our own span"),
+        ):
+            self.assertFalse(sl._names_exactly(rendered, owned), why)
+            state = sl._probe(
+                FakeRunner(print_result=_result(113, stderr=rendered)),
+                agent=sl.LEGACY_DRAIN_AGENT,
+            )["state"]
+            self.assertEqual(state, sl.PROBE_UNREADABLE, why)
+
+    def test_a_readable_message_with_two_quoted_names_still_binds(self) -> None:
+        # The complement: refusing ambiguity must not refuse a message that simply quotes more than
+        # one thing. Both spans are complete and unambiguous, and one of them is ours.
+        owned = sl.LEGACY_DRAIN_AGENT.label
+        state = sl._probe(
+            FakeRunner(
+                print_result=_result(
+                    113, stderr=f'Could not find service "{owned}" in domain "gui/501"'
+                )
+            ),
+            agent=sl.LEGACY_DRAIN_AGENT,
+        )["state"]
+        self.assertEqual(state, sl.PROBE_CONFIRMED_ABSENT)
+
+    def test_an_escaped_quote_label_keeps_the_plist_end_to_end(self) -> None:
+        # The consequence, through the destructive path: an unparseable message must leave the
+        # retired registration on disk rather than authorize unlinking it.
+        _write_home_credential(self.mozyo_home)
+        legacy = _legacy_drain_plist(self.os_home)
+        rendered = (
+            f'Could not find service "prefix\\"{sl.LEGACY_DRAIN_AGENT.label}" in domain for gui'
+        )
+
+        class _EscapedQuoteLabelNotFound:
+            def __call__(self, argv):
+                argv = list(argv)
+                target = argv[2] if len(argv) > 2 else ""
+                if sl.LEGACY_DRAIN_AGENT.label in target:
+                    return _result(113 if argv[1] == "print" else 1, stderr=rendered)
+                return _result(0)
+
+        result = sl.remove_legacy_drain(os_home=self.os_home, runner=_EscapedQuoteLabelNotFound())
+        self.assertFalse(result["removed"])
+        self.assertEqual(result["reason"], sl.REASON_LEGACY_DRAIN_STATE_UNREADABLE)
+        self.assertTrue(legacy.exists())
+
     def test_the_wording_stays_case_insensitive_while_the_identity_does_not(self) -> None:
         # The two readings of one string are deliberately different. launchctl's prose is not an
         # API, so its capitalization cannot be a contract — but the label it names is an identity,
