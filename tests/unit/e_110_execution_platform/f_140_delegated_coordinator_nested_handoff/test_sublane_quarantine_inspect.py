@@ -54,6 +54,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     PendingComposerSignal,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.generation_mismatch_disposition import (  # noqa: E501
+    DISPOSITION_COMPOSER_GENERATION_UNAVAILABLE,
     DISPOSITION_LIFECYCLE_ABSENT,
     DISPOSITION_LIFECYCLE_PINS_INVALID,
     DISPOSITION_LIFECYCLE_UNREADABLE,
@@ -93,7 +94,7 @@ def _signal(**kw) -> PendingComposerSignal:
     base = dict(
         inventory_readable=True,
         has_pending=True,
-        agent_state="idle",
+        agent_state="awaiting_input",
         identity_attested=True,
         generation_matches=True,
         correlated_marker_ids=(),
@@ -122,6 +123,7 @@ def _inspection(**kw) -> QuarantineInspection:
         row_revision=REVISION,
         attested_at=ATTESTED_AT,
         receiver_present=True,
+        composer_generation="opaque-provider-draft-generation-1",
         detail="classified_without_persisting_composer_body",
     )
     base.update(kw)
@@ -365,13 +367,16 @@ class GenerationDriftTest(_Case):
 
 
 class DispositionLifecyclePinsTest(_Case):
-    def _mismatch(self, **kw):
+    def _mismatch(
+        self, composer_generation="opaque-provider-draft-generation-1", **kw
+    ):
         return _inspection(
             signal=_signal(
                 generation_matches=False,
                 generation_axes=("pair",),
                 **kw,
-            )
+            ),
+            composer_generation=composer_generation,
         )
 
     def test_positive_pins_reach_the_ready_command(self):
@@ -380,6 +385,15 @@ class DispositionLifecyclePinsTest(_Case):
         argv = out.as_payload()["disposition"]["disposition_command"]
         self.assertEqual(argv[argv.index("--approved-lane-generation") + 1], "3")
         self.assertEqual(argv[argv.index("--approved-lifecycle-revision") + 1], "11")
+
+    def test_missing_provider_composer_generation_mints_no_template(self):
+        out = self._run(
+            inspection=self._mismatch(composer_generation=""), lifecycle=(3, 11)
+        )
+        self.assertEqual(
+            out.disposition_reason, DISPOSITION_COMPOSER_GENERATION_UNAVAILABLE
+        )
+        self.assertEqual(out.disposition_template, "")
 
     def test_absent_lifecycle_mints_no_template(self):
         out = self._run(inspection=self._mismatch(), lifecycle=None)

@@ -1465,7 +1465,7 @@ allowlist:
     expires: "2027-10-08"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_quarantine.py
-    lines: 1224
+    lines: 1222
     reason: >-
       Already at 986 lines before #15193 — 14 under the threshold, so any material
       addition crosses it. #15193 adds the generation-mismatch disposition rail that
@@ -1487,7 +1487,8 @@ allowlist:
       `sublane_quarantine_disposition.py` split; only the orchestration-site returns remain
       here because moving them would duplicate or bypass the existing replacement state
       machine.
-      The concrete remaining decomposition is extracting `LiveSublaneQuarantineOps`
+      Follow-up #15244 owns the concrete remaining decomposition: extracting
+      `LiveSublaneQuarantineOps`
       (~300 lines) into its own adapter module, per the adapter-boundary policy. That was
       attempted during this issue and REVERTED: the class owns the provider globals that
       `mock.patch` targets across several suites, and retargeting them reached
@@ -1496,7 +1497,7 @@ allowlist:
       recorded design consultation. Deferring the split is the scope-boundary-respecting
       choice, not an unbounded one: it is a mechanical move plus patch-target updates once
       #15166 has integrated.
-    owner_issue: "#15193"
+    owner_issue: "#15244"
     resolution_version: "v0.12.0 (Version #276 OOP-first architecture and static typing)"
     expires: "2027-11-15"
 

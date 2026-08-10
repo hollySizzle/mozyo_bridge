@@ -296,11 +296,23 @@ mozyo-bridge sublane quarantine-inspect --issue <id> --lane <lane> --role <role>
   command は mismatch/pending の3 tokenに加え、正の `--approved-lane-generation` と
   `--approved-lifecycle-revision` を必ず含む。この5 tokenは一組であり、欠落・非正数は
   `disposition_approval_incomplete` / `lane_lifecycle_pins_invalid` の typed zero-actuation になる。
+- disposition template は一意な `generation_mismatch_disposition_owner_approval` workflow-event markerを含む。
+  executeはexact issue/journalをfresh readし、`approval_source=direct_owner`、anchored coordinator writer、workspace / role /
+  assigned-name / locator / agent revision / attested generation / action id / mismatch axes / pending identity+effect /
+  lane generation / lifecycle revisionのoperation digest完全一致を検証する。journal pointer、散文、引用、重複marker、
+  reader不能、wrong writer/digestはいずれもzero CAS / zero close / zero launchである。
+- 未相関composerのidentityはprovider-owned opaque composer generationだけに束縛する。現行providerのread契約はこの
+  generationを返さないため、取得不能時は`composer_generation_unavailable`でtemplateを生成せずexecuteも拒否する。
+  Herdr row revision、composer本文・hash・lengthを代用authorityにしてはならない。
 - lifecycle authority の不読・row不在は `lane_lifecycle_unreadable` / `lane_lifecycle_absent` でtemplateを出さない。
   executeは承認時revisionをreplacement generationの起点として、request CAS、owed close、partial launch replay、
   completion CASの各effect直前にnon-migrating fresh readでlane incarnationと期待revisionを再照合する。
   `lane_generation_drift` / `lifecycle_revision_drift` では以後のCAS・close・launchを行わない。したがって同じlane名が
   次incarnationへ再作成されても旧approvalは流用できず、partial replayも承認された同一generationだけを再開する。
+- owed closeはrun冒頭のsnapshotを再利用せず、close port直前にidentity/state/composerをfresh取得し、続けてlifecycleを
+  fresh readする。runtime stateは`awaiting_input`または`turn_ended`だけをsettledとし、busy / blocked / unknown / 空値 /
+  unreadable / novel state、composer generation・identity・revision・attestation・lifecycle driftはclose 0かつ後続CAS/launch 0。
+  exact receiverがpositive absentのpost-close replayだけは再closeせず、既存transactionのcontinuationを処理する。
 
 ### pending composer がpairをpreserveしている場合
 

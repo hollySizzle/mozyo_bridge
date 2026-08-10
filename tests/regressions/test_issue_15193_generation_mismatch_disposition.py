@@ -41,6 +41,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -102,6 +103,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DRIFT_LIFECYCLE_REVISION,
     PENDING_EFFECT_DISCARDED_ON_REPLACE,
     PENDING_EFFECT_PRESERVED,
+    pending_identity,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.quarantine_approval import (  # noqa: E501
     APPROVAL_NOT_QUARANTINE_CANDIDATE,
@@ -136,9 +138,12 @@ ACTION = quarantine_action_id(lane_id=LANE, role=ROLE, locator=OLD_LOCATOR)
 #: The measured axis in j#102624: the worker was live but the gateway/worker pair did not
 #: resolve to one shared placement, so `generation_matches` folded to False.
 AXES = (GEN_AXIS_PAIR,)
-#: An uncorrelated pending input — nothing in the delivery ledger matches it, which is why
-#: the q-enter rail cannot drive it either.
-PENDING_ID = "pending:uncorrelated"
+PROVIDER_GENERATION = "opaque-provider-draft-generation-1"
+PENDING_ID = pending_identity(
+    pending_observed=True,
+    correlated_marker_ids=(),
+    provider_generation=PROVIDER_GENERATION,
+)
 
 #: Never allowed to reach any output on any path (the value-non-exposure contract).
 SECRET_BODY = "未送信の下書き — private composer body"
@@ -149,7 +154,7 @@ def _signal(**kw) -> PendingComposerSignal:
     base = dict(
         inventory_readable=True,
         has_pending=True,
-        agent_state="idle",
+        agent_state="awaiting_input",
         identity_attested=True,
         generation_matches=False,
         correlated_marker_ids=(),
@@ -163,10 +168,20 @@ def _signal(**kw) -> PendingComposerSignal:
 class _FakeOps:
     """Fake quarantine IO port: canned classification + recorded actuation."""
 
-    def __init__(self, *, signal=None, receiver_present=True, row_revision=AGENT_REVISION):
+    def __init__(
+        self,
+        *,
+        signal=None,
+        receiver_present=True,
+        row_revision=AGENT_REVISION,
+        composer_generation=PROVIDER_GENERATION,
+        approval_verified=True,
+    ):
         self._signal = signal if signal is not None else _signal()
         self._receiver_present = receiver_present
         self._row_revision = row_revision
+        self._composer_generation = composer_generation
+        self._approval_verified = approval_verified
         self.closed_pins: list[ReleasePin] = []
         self.heals = 0
 
@@ -177,7 +192,11 @@ class _FakeOps:
             row_revision=self._row_revision,
             attested_at=ATTESTED_AT,
             receiver_present=self._receiver_present,
+            composer_generation=self._composer_generation,
         )
+
+    def approval_verified(self, request, inspection) -> bool:
+        return self._approval_verified
 
     def close_receiver(self, request, pin) -> CloseReceiverResult:
         self.closed_pins.append(pin)
@@ -188,6 +207,20 @@ class _FakeOps:
 
     def verify_fresh_receiver(self, request, *, fresh_after) -> FreshReceiverVerification:
         return FreshReceiverVerification(True, locator=FRESH_LOCATOR)
+
+
+class _CloseBoundaryOps(_FakeOps):
+    """Opening inspection is stable; every later read carries the close-edge state."""
+
+    def __init__(self, *, close_updates=None, **kwargs):
+        super().__init__(**kwargs)
+        self._close_updates = close_updates or {}
+        self.inspection_reads = 0
+
+    def inspect(self, request: QuarantineRequest) -> QuarantineInspection:
+        observed = super().inspect(request)
+        self.inspection_reads += 1
+        return replace(observed, **self._close_updates) if self.inspection_reads > 1 else observed
 
 
 def _request(**kw) -> QuarantineRequest:
@@ -399,6 +432,79 @@ class DispositionExecuteTest(_Case):
         self.assertEqual(outcome.replacement_state, REPLACEMENT_NOT_REQUESTED)
 
 
+class FreshCloseBoundaryTest(_Case):
+    """The destructive port consumes a fresh full observation, never run-opening state."""
+
+    @staticmethod
+    def _isolated_run(ops):
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw)
+            key = LaneLifecycleKey(WS, LANE)
+            lifecycle = LaneLifecycleStore(home=home)
+            lifecycle.declare_active(
+                key,
+                decision=DecisionPointer(
+                    source="redmine", issue_id=ISSUE, journal_id=JOURNAL
+                ),
+                issue_id=ISSUE,
+            )
+            outcome = SublaneQuarantineUseCase(
+                ops=ops, store=LaneReplacementStore(home=home)
+            ).run(_request(), execute=True)
+            return outcome, lifecycle.get(key).replacement_state
+
+    def test_unsettled_close_edge_states_withhold_close_and_every_later_effect(self) -> None:
+        for state in ("busy", "blocked", "unknown", ""):
+            with self.subTest(state=state):
+                ops = _CloseBoundaryOps(close_updates={"signal": _signal(agent_state=state)})
+                outcome, persisted = self._isolated_run(ops)
+                self.assertEqual(ops.closed_pins, [])
+                self.assertEqual(ops.heals, 0)
+                self.assertEqual(outcome.replacement_state, REPLACEMENT_REQUESTED)
+                self.assertEqual(persisted, REPLACEMENT_REQUESTED)
+
+    def test_provider_composer_generation_drift_withholds_close(self) -> None:
+        ops = _CloseBoundaryOps(
+            close_updates={"composer_generation": "opaque-provider-draft-generation-2"}
+        )
+        outcome, _persisted = self._isolated_run(ops)
+        self.assertEqual(ops.closed_pins, [])
+        self.assertEqual(ops.heals, 0)
+        self.assertIn("pending_identity_drift", outcome.detail)
+
+    def test_identity_revision_and_attestation_drift_each_withhold_close(self) -> None:
+        for updates in (
+            {"row_revision": AGENT_REVISION + 1},
+            {"attested_at": "2026-08-10T08:00:00+00:00"},
+            {"workspace_id": "another-workspace"},
+        ):
+            with self.subTest(updates=updates):
+                ops = _CloseBoundaryOps(close_updates=updates)
+                outcome, _persisted = self._isolated_run(ops)
+                self.assertEqual(ops.closed_pins, [])
+                self.assertEqual(ops.heals, 0)
+                self.assertEqual(outcome.replacement_state, REPLACEMENT_REQUESTED)
+
+    def test_lifecycle_revision_drift_at_close_boundary_withholds_close(self) -> None:
+        original = quarantine_module.LaneLifecycleReader.get
+        reads = 0
+
+        def drifting(reader, key):
+            nonlocal reads
+            reads += 1
+            record = original(reader, key)
+            return replace(record, revision=record.revision + 1) if reads == 2 else record
+
+        ops = _CloseBoundaryOps()
+        with mock.patch.object(
+            quarantine_module.LaneLifecycleReader, "get", new=drifting
+        ):
+            outcome, _persisted = self._isolated_run(ops)
+        self.assertEqual(ops.closed_pins, [])
+        self.assertEqual(ops.heals, 0)
+        self.assertIn(DRIFT_LIFECYCLE_REVISION, outcome.detail)
+
+
 class ZeroMutationTest(_Case):
     """Ambiguous / foreign / active work / unreadable authority -> zero mutation."""
 
@@ -425,6 +531,20 @@ class ZeroMutationTest(_Case):
                 outcome = self._run(ops, request=_request(**missing))
                 self.assertIn(DISPOSITION_APPROVAL_INCOMPLETE, outcome.detail)
                 self._assert_no_mutation(ops, outcome)
+
+    def test_pointer_shape_without_structured_owner_approval_is_zero_effect(self) -> None:
+        self._active_lane()
+        ops = _FakeOps(approval_verified=False)
+        outcome = self._run(ops)
+        self.assertIn("structured direct-owner approval", outcome.detail)
+        self._assert_no_mutation(ops, outcome)
+
+    def test_unavailable_provider_composer_generation_is_zero_effect(self) -> None:
+        self._active_lane()
+        ops = _FakeOps(composer_generation="")
+        outcome = self._run(ops)
+        self.assertIn("composer_generation_unavailable", outcome.detail)
+        self._assert_no_mutation(ops, outcome)
 
     def test_non_positive_lifecycle_pin_is_typed_zero_mutation(self) -> None:
         self._active_lane()

@@ -98,6 +98,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     PendingComposerClassification,
     agent_state_is_working,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine_disposition import (  # noqa: E501
+    disposition_agent_state_settled,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
     HerdrSessionStartError,
 )
@@ -112,7 +115,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     TRANSPORT_FAILURE_REASONS,
     TerminalTransportError,
 )
-
 #: The synthetic request fields the inspection uses to drive the #13763 inspector. The inspector
 #: needs a request shaped for the *approval* path; an inspection has no approval yet. These are
 #: inert placeholders, never emitted and never compared: the action generation is recomputed from
@@ -553,6 +555,7 @@ class SublaneQuarantineInspectUseCase:
             pending_identity=pending_identity(
                 pending_observed=classification.pending_observed,
                 correlated_marker_ids=signal.correlated_marker_ids,
+                provider_generation=inspection.composer_generation,
             ),
             pending_effect=PENDING_EFFECT_DISCARDED_ON_REPLACE,
             observed_at=facts.observed_at,
@@ -568,6 +571,7 @@ class SublaneQuarantineInspectUseCase:
             # mismatched receiver never carries the `agent_working` label and would
             # otherwise be handed a disposition template while it is still running.
             agent_working=agent_state_is_working(signal.agent_state),
+            agent_settled=disposition_agent_state_settled(signal.agent_state),
             duplicate_receiver=False,
             lifecycle_reason=lifecycle_reason,
         )

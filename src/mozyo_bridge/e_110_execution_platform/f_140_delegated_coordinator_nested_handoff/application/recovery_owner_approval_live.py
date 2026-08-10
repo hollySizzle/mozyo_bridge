@@ -15,6 +15,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     resolve_journal_issuer,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_owner_approval import (  # noqa: E501
+    GENERATION_MISMATCH_DISPOSITION_APPROVAL_EFFECT,
+    GENERATION_MISMATCH_DISPOSITION_APPROVAL_GATE,
     GATEWAY_RECOVERY_APPROVAL_EFFECT,
     GATEWAY_RECOVERY_APPROVAL_GATE,
     RecoveryOwnerApprovalError,
@@ -23,6 +25,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     gateway_recovery_approval_operation,
     stale_worker_recovery_approval_operation,
     verify_recovery_owner_approval,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.generation_mismatch_disposition import (  # noqa: E501
+    DispositionFacts,
+    disposition_approval_operation,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_pending_composer import (  # noqa: E501
+    ordered_generation_axes,
 )
 
 
@@ -157,10 +166,67 @@ def verify_live_stale_worker_recovery_approval(
     )
 
 
+def verify_live_generation_mismatch_disposition_approval(
+    ops: object, request: object, inspection: object
+) -> bool:
+    """Bound fresh verifier for one exact #15193 disposition operation."""
+
+    facts = DispositionFacts(
+        issue=str(getattr(request, "issue", "") or "").strip(),
+        lane=str(getattr(request, "lane", "") or "").strip(),
+        role=str(getattr(request, "role", "") or "").strip(),
+        workspace_id=str(getattr(inspection, "workspace_id", "") or "").strip(),
+        assigned_name=str(getattr(request, "assigned_name", "") or "").strip(),
+        locator=str(getattr(request, "locator", "") or "").strip(),
+        agent_revision=getattr(request, "approved_revision", -1),
+        lane_generation=getattr(request, "approved_lane_generation", -1),
+        lifecycle_revision=getattr(request, "approved_lifecycle_revision", -1),
+        attested_at=str(getattr(request, "approval_observed_at", "") or "").strip(),
+        action_generation=str(getattr(request, "action_generation", "") or "").strip(),
+        generation_axes=ordered_generation_axes(
+            tuple(getattr(request, "approved_generation_axes", ()) or ())
+        ),
+        pending_identity=str(
+            getattr(request, "approved_pending_identity", "") or ""
+        ).strip(),
+        pending_effect=str(
+            getattr(request, "approved_pending_effect", "") or ""
+        ).strip(),
+    )
+    return verify_live_recovery_owner_approval(
+        repo_root=getattr(ops, "repo_root"),
+        journal_reader=getattr(ops, "journal_reader", None),
+        journal_reader_fresh=bool(getattr(ops, "journal_reader_fresh", False)),
+        journal=str(getattr(request, "journal", "") or "").strip(),
+        anchor_issue=facts.issue,
+        gate=GENERATION_MISMATCH_DISPOSITION_APPROVAL_GATE,
+        effect=GENERATION_MISMATCH_DISPOSITION_APPROVAL_EFFECT,
+        issue=facts.issue,
+        lane=facts.lane,
+        operation=disposition_approval_operation(facts),
+        issuer_resolver=getattr(ops, "issuer_resolver", None),
+    )
+
+
+def fresh_live_redmine_journal_reader() -> tuple[object | None, bool]:
+    """Resolve the credential-gated live journal reader, or a fail-closed absence."""
+
+    try:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E501
+            LiveRedmineJournalSource,
+        )
+
+        return LiveRedmineJournalSource.from_environment().read_entries, True
+    except Exception:  # noqa: BLE001 - unavailable durable authority never permits close
+        return None, False
+
+
 __all__ = (
     "committed_issuer_policy_pointer",
     "resolved_recovery_approval_issuer",
     "verify_live_recovery_owner_approval",
     "verify_live_gateway_recovery_approval",
     "verify_live_stale_worker_recovery_approval",
+    "verify_live_generation_mismatch_disposition_approval",
+    "fresh_live_redmine_journal_reader",
 )

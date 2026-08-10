@@ -75,7 +75,7 @@ def _inspection(**kw) -> QuarantineInspection:
     signal = PendingComposerSignal(
         inventory_readable=True,
         has_pending=True,
-        agent_state="idle",
+        agent_state="awaiting_input",
         identity_attested=True,
         generation_matches=True,
     )
@@ -85,6 +85,7 @@ def _inspection(**kw) -> QuarantineInspection:
         row_revision=REVISION,
         attested_at=ATTESTED_AT,
         receiver_present=True,
+        composer_generation="opaque-provider-draft-generation-1",
         detail="classified_without_persisting_composer_body",
     )
     base.update(kw)
@@ -199,7 +200,7 @@ class ApprovalRoundTripTest(unittest.TestCase):
         mismatch = PendingComposerSignal(
             inventory_readable=True,
             has_pending=True,
-            agent_state="idle",
+            agent_state="awaiting_input",
             identity_attested=True,
             generation_matches=False,
             generation_axes=("pair",),

@@ -61,6 +61,11 @@ import hashlib
 from dataclasses import dataclass
 from typing import Optional
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_owner_approval import (  # noqa: E501
+    GENERATION_MISMATCH_DISPOSITION_APPROVAL_EFFECT,
+    GENERATION_MISMATCH_DISPOSITION_APPROVAL_GATE,
+    render_recovery_owner_approval_marker,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_pending_composer import (  # noqa: E501
     GENERATION_MISMATCH,
     PendingComposerClassification,
@@ -89,6 +94,10 @@ DISPOSITION_REVISION_UNREADABLE = "revision_unreadable"
 DISPOSITION_ATTESTATION_UNREADABLE = "attestation_unreadable"
 #: A live worker is mid-turn. Active work is never disposed of; wait for quiescence.
 DISPOSITION_AGENT_WORKING = "agent_working"
+#: The state is blocked, unknown, absent, novel or otherwise not positively settled.
+DISPOSITION_AGENT_NOT_SETTLED = "agent_not_settled"
+#: The provider cannot identify the exact uncorrelated draft generation without its body.
+DISPOSITION_COMPOSER_GENERATION_UNAVAILABLE = "composer_generation_unavailable"
 #: The composer holds a KNOWN delivered marker: the remedy is q-enter, not replacement.
 DISPOSITION_KNOWN_MARKER_REQUIRES_Q_ENTER = "known_marker_requires_q_enter"
 #: The receiver is NOT in the #15193 shape — its generation matches, or its composer is
@@ -115,6 +124,8 @@ DISPOSITION_REASONS = frozenset(
         DISPOSITION_REVISION_UNREADABLE,
         DISPOSITION_ATTESTATION_UNREADABLE,
         DISPOSITION_AGENT_WORKING,
+        DISPOSITION_AGENT_NOT_SETTLED,
+        DISPOSITION_COMPOSER_GENERATION_UNAVAILABLE,
         DISPOSITION_KNOWN_MARKER_REQUIRES_Q_ENTER,
         DISPOSITION_NOT_MISMATCH_WITH_PENDING,
         DISPOSITION_AXES_UNATTRIBUTED,
@@ -194,8 +205,14 @@ DISPOSITION_DRIFT_REASONS = frozenset(
 )
 
 
+PENDING_IDENTITY_UNBOUND = "pending:uncorrelated:unbound"
+
+
 def pending_identity(
-    *, pending_observed: Optional[bool], correlated_marker_ids: tuple[str, ...]
+    *,
+    pending_observed: Optional[bool],
+    correlated_marker_ids: tuple[str, ...],
+    provider_generation: str = "",
 ) -> str:
     """A stable, content-free identity for the pending input being disposed of (pure).
 
@@ -203,13 +220,10 @@ def pending_identity(
     approved discard must be refused once the input has *changed*, otherwise an approval the
     owner granted over one input would silently destroy a different one that arrived later.
 
-    The identity is derived ONLY from facts that already cross this boundary — whether an
-    input was observed at all, and the delivery-marker identities correlated to it. The body
-    is never read, so this is deliberately NOT a content digest: it cannot distinguish two
-    different uncorrelated inputs. That weakness is covered by the other bound tokens (a new
-    input on a live receiver advances the revision / attestation the approval also pins), and
-    it is the correct trade: hashing the body would put a body-derived value on a surface
-    whose contract is that no such value exists.
+    A correlated input is identified by its durable marker set. An uncorrelated input requires
+    a provider-owned opaque generation. The public token hashes that opaque generation only;
+    it never hashes or exposes body text, length or an excerpt. If the provider cannot supply
+    such a generation the input remains deliberately unbound and no approval may be minted.
 
     ``""`` when nothing pending was observed; ``"unreadable"`` when the fact was unknown, so
     an unreadable observation can never compare equal to a readable one.
@@ -220,7 +234,13 @@ def pending_identity(
         return ""
     markers = tuple(dict.fromkeys(m for m in correlated_marker_ids if m))
     if not markers:
-        return "pending:uncorrelated"
+        generation = provider_generation if isinstance(provider_generation, str) else ""
+        if not generation:
+            return PENDING_IDENTITY_UNBOUND
+        digest = hashlib.sha256(
+            ("mozyo:provider-composer-generation:v1\0" + generation).encode("utf-8")
+        ).hexdigest()
+        return f"pending:provider:{digest}"
     digest = hashlib.sha256("\n".join(sorted(markers)).encode("utf-8")).hexdigest()[:16]
     return f"pending:markers:{digest}"
 
@@ -294,6 +314,7 @@ def decide_disposition_readiness(
     inventory_readable: bool,
     composer_readable: bool,
     agent_working: bool = False,
+    agent_settled: bool = False,
     duplicate_receiver: bool = False,
     lifecycle_reason: str = "",
 ) -> str:
@@ -339,12 +360,16 @@ def decide_disposition_readiness(
     if agent_working:
         # Active work is never disposed of, regardless of what else is true.
         return DISPOSITION_AGENT_WORKING
+    if not agent_settled:
+        return DISPOSITION_AGENT_NOT_SETTLED
     if classification.correlated_marker_id:
         # A known delivered marker is recoverable by re-submitting it; replacing the receiver
         # would destroy a real queued handoff. The remedy is q-enter, not this disposition.
         return DISPOSITION_KNOWN_MARKER_REQUIRES_Q_ENTER
     if not classification.generation_mismatch_with_pending:
         return DISPOSITION_NOT_MISMATCH_WITH_PENDING
+    if facts.pending_identity == PENDING_IDENTITY_UNBOUND:
+        return DISPOSITION_COMPOSER_GENERATION_UNAVAILABLE
     if not facts.generation_axes:
         return DISPOSITION_AXES_UNATTRIBUTED
     if not facts.action_generation:
@@ -423,21 +448,45 @@ def disposition_command(facts: DispositionFacts, *, journal: str = "") -> tuple[
     )
 
 
+def disposition_approval_operation(facts: DispositionFacts) -> dict[str, object]:
+    """Every authority-bearing field covered by the structured owner digest."""
+
+    return {
+        "action_generation": facts.lane_generation,
+        "quarantine_action_id": facts.action_generation,
+        "workspace_id": facts.workspace_id,
+        "role": facts.role,
+        "assigned_name": facts.assigned_name,
+        "locator": facts.locator,
+        "agent_revision": facts.agent_revision,
+        "lifecycle_revision": facts.lifecycle_revision,
+        "attested_at": facts.attested_at,
+        "generation_axes": ",".join(ordered_generation_axes(facts.generation_axes)),
+        "pending_identity": facts.pending_identity,
+        "pending_effect": facts.pending_effect,
+    }
+
+
 def render_disposition_template(facts: DispositionFacts, *, journal: str = "") -> str:
     """The pasteable owner-approval record for a READY disposition (pure).
-
-    Deliberately NOT a ``[mozyo:workflow-event:gate=...]`` marker: the governed gate
-    vocabulary is closed, and this is an action authorization rather than a workflow gate —
-    the same choice :func:`...domain.quarantine_approval.render_approval_template` makes.
 
     The pending-input effect is rendered as a literal sentence AND as a bound token, so the
     approval cannot be read as authorizing a replacement without also authorizing what
     happens to the unsent input. Callers must only render this for :data:`DISPOSITION_READY`.
     """
     argv = " ".join(disposition_command(facts, journal=journal))
+    marker = render_recovery_owner_approval_marker(
+        gate=GENERATION_MISMATCH_DISPOSITION_APPROVAL_GATE,
+        effect=GENERATION_MISMATCH_DISPOSITION_APPROVAL_EFFECT,
+        issue=facts.issue,
+        lane=facts.lane,
+        operation=disposition_approval_operation(facts),
+    )
     return "\n".join(
         (
             "## Owner Approval — sublane generation-mismatch disposition (generation-bound)",
+            "",
+            marker,
             "",
             f"- issue: {facts.issue}",
             f"- lane: `{facts.lane}`",
@@ -473,10 +522,12 @@ def render_disposition_template(facts: DispositionFacts, *, journal: str = "") -
 
 __all__ = (
     "DISPOSITION_AGENT_WORKING",
+    "DISPOSITION_AGENT_NOT_SETTLED",
     "DISPOSITION_APPROVAL_INCOMPLETE",
     "DISPOSITION_ATTESTATION_UNREADABLE",
     "DISPOSITION_AXES_UNATTRIBUTED",
     "DISPOSITION_COMPOSER_UNREADABLE",
+    "DISPOSITION_COMPOSER_GENERATION_UNAVAILABLE",
     "DISPOSITION_DRIFT_REASONS",
     "DISPOSITION_DUPLICATE_RECEIVER",
     "DISPOSITION_INVENTORY_UNREADABLE",
@@ -504,11 +555,13 @@ __all__ = (
     "DRIFT_ROLE",
     "DRIFT_WORKSPACE",
     "PENDING_EFFECTS",
+    "PENDING_IDENTITY_UNBOUND",
     "PENDING_EFFECT_DISCARDED_ON_REPLACE",
     "PENDING_EFFECT_PRESERVED",
     "PENDING_EFFECT_SENTENCE",
     "DispositionFacts",
     "decide_disposition_readiness",
+    "disposition_approval_operation",
     "disposition_command",
     "observed_facts_match",
     "pending_identity",

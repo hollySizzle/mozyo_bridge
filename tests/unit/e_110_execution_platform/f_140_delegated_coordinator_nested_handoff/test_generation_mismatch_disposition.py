@@ -17,9 +17,11 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.generation_mismatch_disposition import (  # noqa: E501
+    DISPOSITION_AGENT_NOT_SETTLED,
     DISPOSITION_AGENT_WORKING,
     DISPOSITION_ATTESTATION_UNREADABLE,
     DISPOSITION_AXES_UNATTRIBUTED,
+    DISPOSITION_COMPOSER_GENERATION_UNAVAILABLE,
     DISPOSITION_COMPOSER_UNREADABLE,
     DISPOSITION_DUPLICATE_RECEIVER,
     DISPOSITION_INVENTORY_UNREADABLE,
@@ -42,6 +44,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DRIFT_PENDING_IDENTITY,
     PENDING_EFFECT_DISCARDED_ON_REPLACE,
     PENDING_EFFECT_PRESERVED,
+    PENDING_IDENTITY_UNBOUND,
     DispositionFacts,
     decide_disposition_readiness,
     disposition_command,
@@ -57,8 +60,17 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     UNCORRELATED,
     PendingComposerClassification,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine_disposition import (  # noqa: E501
+    disposition_agent_state_settled,
+)
 
 MARKER = "[mozyo:handoff:source=redmine:issue=15193:journal=102219:kind=implementation_request:to=claude]"
+PROVIDER_GENERATION = "opaque-provider-draft-generation-1"
+PENDING_ID = pending_identity(
+    pending_observed=True,
+    correlated_marker_ids=(),
+    provider_generation=PROVIDER_GENERATION,
+)
 
 
 def _facts(**kw) -> DispositionFacts:
@@ -76,7 +88,7 @@ def _facts(**kw) -> DispositionFacts:
         attested_at="2026-08-10T07:00:00+00:00",
         action_generation="quarantine-abc123",
         generation_axes=("pair",),
-        pending_identity="pending:uncorrelated",
+        pending_identity=PENDING_ID,
         pending_effect=PENDING_EFFECT_DISCARDED_ON_REPLACE,
         observed_at="2026-08-10T07:30:00+00:00",
     )
@@ -100,6 +112,7 @@ def _decide(**kw) -> str:
         inventory_readable=True,
         composer_readable=True,
         agent_working=False,
+        agent_settled=True,
         duplicate_receiver=False,
     )
     base.update(kw)
@@ -107,6 +120,14 @@ def _decide(**kw) -> str:
 
 
 class ReadinessTest(unittest.TestCase):
+    def test_shared_settled_state_predicate_is_closed(self) -> None:
+        for state in ("awaiting_input", "turn_ended", " AWAITING_INPUT "):
+            with self.subTest(state=state):
+                self.assertTrue(disposition_agent_state_settled(state))
+        for state in ("blocked", "unknown", "", "novel"):
+            with self.subTest(state=state):
+                self.assertFalse(disposition_agent_state_settled(state))
+
     def test_the_exact_15193_shape_is_ready(self) -> None:
         # #15110 j#102068 / #15140 j#102064 / #15195 j#102193 all reduce to this state, and
         # it is the ONLY state this rail admits.
@@ -168,6 +189,15 @@ class ZeroMutationRefusalTest(unittest.TestCase):
 
     def test_unreadable_attestation_refuses(self) -> None:
         self.assertEqual(_decide(facts=_facts(attested_at="")), DISPOSITION_ATTESTATION_UNREADABLE)
+
+    def test_non_settled_state_refuses(self) -> None:
+        self.assertEqual(_decide(agent_settled=False), DISPOSITION_AGENT_NOT_SETTLED)
+
+    def test_unbound_uncorrelated_generation_refuses(self) -> None:
+        self.assertEqual(
+            _decide(facts=_facts(pending_identity=PENDING_IDENTITY_UNBOUND)),
+            DISPOSITION_COMPOSER_GENERATION_UNAVAILABLE,
+        )
 
     def test_unreadable_lifecycle_refuses(self) -> None:
         self.assertEqual(
@@ -258,6 +288,14 @@ class PendingEffectTest(unittest.TestCase):
         rendered = render_disposition_template(_facts())
         self.assertIn("未送信 composer input を破棄する", rendered)
         self.assertIn(f"pending_effect: `{PENDING_EFFECT_DISCARDED_ON_REPLACE}`", rendered)
+        self.assertEqual(
+            rendered.count(
+                "[mozyo:workflow-event:gate="
+                "generation_mismatch_disposition_owner_approval"
+            ),
+            1,
+        )
+        self.assertIn("approval_source=direct_owner", rendered)
 
     def test_template_states_preservation_when_nothing_is_discarded(self) -> None:
         rendered = render_disposition_template(_facts(pending_effect=PENDING_EFFECT_PRESERVED))
@@ -317,7 +355,21 @@ class PendingIdentityTest(unittest.TestCase):
     def test_identity_carries_no_composer_body(self) -> None:
         # Derived only from the pending flag and ledger marker identities.
         token = pending_identity(pending_observed=True, correlated_marker_ids=())
-        self.assertEqual(token, "pending:uncorrelated")
+        self.assertEqual(token, PENDING_IDENTITY_UNBOUND)
+
+    def test_provider_generation_distinguishes_uncorrelated_drafts(self) -> None:
+        first = pending_identity(
+            pending_observed=True,
+            correlated_marker_ids=(),
+            provider_generation="opaque-1",
+        )
+        second = pending_identity(
+            pending_observed=True,
+            correlated_marker_ids=(),
+            provider_generation="opaque-2",
+        )
+        self.assertTrue(first.startswith("pending:provider:"))
+        self.assertNotEqual(first, second)
 
 
 class ActionTimeRevalidationTest(unittest.TestCase):

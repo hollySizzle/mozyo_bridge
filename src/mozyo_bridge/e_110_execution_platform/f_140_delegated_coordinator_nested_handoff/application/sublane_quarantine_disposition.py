@@ -24,6 +24,8 @@ import argparse
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.generation_mismatch_disposition import (  # noqa: E501
     DISPOSITION_APPROVAL_INCOMPLETE,
+    DISPOSITION_AGENT_NOT_SETTLED,
+    DISPOSITION_COMPOSER_GENERATION_UNAVAILABLE,
     DISPOSITION_LIFECYCLE_ABSENT,
     DISPOSITION_LIFECYCLE_PINS_INVALID,
     DRIFT_GENERATION_AXES,
@@ -32,6 +34,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DRIFT_PENDING_IDENTITY,
     PENDING_EFFECT_DISCARDED_ON_REPLACE,
     PENDING_EFFECT_PRESERVED,
+    PENDING_IDENTITY_UNBOUND,
     pending_identity,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_pending_composer import (  # noqa: E501
@@ -42,6 +45,16 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     _norm,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (  # noqa: E501
+    RUNTIME_AWAITING_INPUT,
+    RUNTIME_TURN_ENDED,
+)
+
+
+def disposition_agent_state_settled(state: object) -> bool:
+    """Whether one fresh agent-state observation is safe at both disposition gates."""
+
+    return _norm(state).lower() in (RUNTIME_AWAITING_INPUT, RUNTIME_TURN_ENDED)
 
 
 def disposition_drift(
@@ -65,7 +78,8 @@ def disposition_drift(
     the pending input being discarded.
     """
     reasons: list[str] = []
-    if agent_state_is_working(inspection.signal.agent_state):
+    state = _norm(inspection.signal.agent_state).lower()
+    if agent_state_is_working(state):
         # Read from the RAW agent state, never from the classification label: the classifier
         # puts `generation_mismatch` ABOVE `agent_working`, so a mismatched receiver whose
         # worker is mid-turn still labels `generation_mismatch` and would otherwise satisfy
@@ -73,6 +87,8 @@ def disposition_drift(
         # this rail close a pane on a running turn — the one thing every sibling fence
         # refuses absolutely.
         return "a live worker turn is in flight; active work is never disposed of"
+    if not disposition_agent_state_settled(state):
+        return f"{DISPOSITION_AGENT_NOT_SETTLED}:{state or 'empty'}"
     if not classification.generation_mismatch_with_pending:
         # The approval was minted for "mismatch + real pending input". If either half is no
         # longer true, the state the owner approved over does not exist: an empty composer
@@ -91,7 +107,10 @@ def disposition_drift(
     observed_pending = pending_identity(
         pending_observed=classification.pending_observed,
         correlated_marker_ids=inspection.signal.correlated_marker_ids,
+        provider_generation=inspection.composer_generation,
     )
+    if observed_pending == PENDING_IDENTITY_UNBOUND:
+        return DISPOSITION_COMPOSER_GENERATION_UNAVAILABLE
     if _norm(request.approved_pending_identity) != observed_pending:
         reasons.append(DRIFT_PENDING_IDENTITY)
     return ",".join(reasons)
@@ -114,6 +133,8 @@ def disposition_request_reason(request: "QuarantineRequest") -> str:
         return ""
     if not all(supplied):
         return DISPOSITION_APPROVAL_INCOMPLETE
+    if _norm(request.approved_pending_identity) == PENDING_IDENTITY_UNBOUND:
+        return DISPOSITION_COMPOSER_GENERATION_UNAVAILABLE
     if not all(
         _positive_int(value)
         for value in (
@@ -201,6 +222,7 @@ def register_disposition_flags(parser: argparse.ArgumentParser) -> None:
 
 
 __all__ = (
+    "disposition_agent_state_settled",
     "disposition_drift",
     "disposition_lifecycle_reason",
     "disposition_request_reason",
