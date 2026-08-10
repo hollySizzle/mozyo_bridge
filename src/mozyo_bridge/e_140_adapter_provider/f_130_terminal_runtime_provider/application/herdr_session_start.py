@@ -141,6 +141,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_generation_binding import (  # noqa: E501
     open_startup_transaction_and_reserve_generations,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_alias import apply_workspace_alias, require_alias_identity  # noqa: E501
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_completion import (  # noqa: E501
     complete_session_start,
 )
@@ -335,6 +336,7 @@ def prepare_session(
     ``pair_order`` is the lane's STABLE managed pair order, for a caller that shrank
     ``providers`` to a subset (contract: :func:`...validate_pair_order`, #14569).
     """
+    repo_root, _alias_id = apply_workspace_alias(repo_root)  # nested alias (#15190)
     # The signature is spelled out rather than `**kwargs` (review j#80305 R8-F2): the
     # explicit keyword-only contract is public (introspection / typing / IDE / wrapping
     # callers), and Python's argument binding at THIS entry is what rejects a malformed
@@ -342,6 +344,7 @@ def prepare_session(
     # lock file first and only then raise from the inner function — a side effect ahead of
     # validation, which is exactly what the rest of this component refuses to do.
     call = dict(
+        alias_expected_workspace_id=_alias_id,
         repo_root=repo_root,
         providers=providers,
         lane_id=lane_id,
@@ -439,6 +442,7 @@ def _prepare_session_locked(
     startup_fence: "Optional[StartupTransactionFence]" = None,
     action_nonce: str = "",
     launch_cause: str = LAUNCH_CAUSE_GENERIC_FRESH,
+    alias_expected_workspace_id: str = "",
     _launch_shims: "Optional[ActionPrivateLaunchShimSet]" = None,
     _capabilities_observed: bool = False,
 ) -> SessionStartResult:
@@ -446,7 +450,20 @@ def _prepare_session_locked(
 
     The cataloged native-identity spec owns the full contract. This private entry
     point validates the plan before writes; the public caller owns lock and rollback.
+
+    Nested-workspace alias / launch-disable is re-evaluated HERE as well as in
+    :func:`prepare_session` (review j#102107 Finding 4). This entry — not the
+    public wrapper — is the boundary every launch actually reaches: the v1
+    replacement driver calls it directly with ``admission_lock_held=True`` to
+    avoid re-entering the lock wrapper, so a rail placed only on the public entry
+    is bypassed by exactly the live replacement path. Re-applying is idempotent:
+    a canonical root declares nothing, so an already-folded root resolves to
+    itself unchanged. The public entry keeps its own call so a declined workspace
+    is still refused *before* the home lock, binary resolution and the capability
+    probe — the zero-side-effect ordering this rail promises.
     """
+    repo_root, _own_id = apply_workspace_alias(repo_root)
+    _alias_expected_id = alias_expected_workspace_id or _own_id
     for provider in providers:
         if provider not in AGENT_PROVIDERS:
             raise HerdrSessionStartError(
@@ -531,6 +548,7 @@ def _prepare_session_locked(
             raise HerdrSessionStartError(
                 "workspace has no resolvable workspace_id after registration"
             )
+    require_alias_identity(_alias_expected_id, workspace_id)
 
     result = SessionStartResult(
         workspace_id=workspace_id, lane_id=lane or "default", dry_run=dry_run
