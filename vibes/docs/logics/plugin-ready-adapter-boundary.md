@@ -1484,21 +1484,24 @@ cannot characterise the rail must positively establish what is on screen:
 | # | gate | skip reason on refusal |
 |---|---|---|
 | 1 | an injected `screen_guard` is bound (in production, the receiver profile's declared `startup_blockers`) | `screen_guard_unbound` |
-| 2 | an injected `identity_probe` is bound, establishes the exact target process generation before injection, and confirms the same non-blank generation immediately before the resend. The built-in Herdr token is `(assigned name, locator, row revision)`; a missing/malformed revision is unconfirmed, and a revision bump is drift even when name+locator are unchanged. Runtime status is not part of the token. | `identity_probe_unbound` / `identity_unconfirmed` / `identity_drift` |
+| 2 | an injected `identity_probe` is bound, establishes a conservative live-target fingerprint before injection, and confirms the same non-blank fingerprint immediately before the resend. The built-in Herdr token is `(assigned name, terminal id, locator, row revision)`. `terminal_id` is the stable identity of the server-owned terminal; missing/malformed terminal id or revision is unconfirmed. Revision drift is refused, but revision is only a mutation fence, not a process-generation id. Runtime status is not directly part of the token. | `identity_probe_unbound` / `identity_unconfirmed` / `identity_drift` |
 | 3 | `read_pane` succeeds and is non-blank (a blank read is never "clear") | `pane_unreadable` |
 | 4 | the guard finds no declared startup screen (trust / login / update-selection) | `startup_screen` |
 | 5 | the injected body is still in the composer (`composer_retains_body`) | `body_absent` |
 | 6 | the runtime re-snapshot read succeeds and positively reports an injectable state (`awaiting_input` or `turn_ended`) | `state_unreadable` / `receiver_blocked` / `state_not_injectable` |
 
 The identity probe runs before the pane read. This prevents the resend gate from
-reading or acting on a locator that was recycled for a different process during the
-failed-wait window. The row revision is existing process-generation evidence in the
-gateway/worker recovery contracts; it is not an ordinary runtime-state counter. Thus
-`working` → `done` with the same name+locator+revision remains the same generation,
-while `revision=41` → `revision=42` is refused even if name and locator were recycled
-unchanged. Likewise, `busy` and `unknown` are not treated as "not blocked": the former
-means a turn is already running and the latter is not a successful state observation,
-so both refuse the resend.
+reading or acting on a locator that was recycled for a different terminal during the
+failed-wait window. Herdr 0.8 `AgentInfo.terminal_id` identifies the server-owned
+terminal and distinguishes two terminals even if they report the same pane id and
+revision. `AgentInfo.revision` mirrors mutable `terminal.revision`; title or metadata
+presentation changes can advance it, so it must not be described as process-generation
+evidence. The resend gate nevertheless pins it as a conservative change fence: a
+revision-only change may withhold an otherwise safe resend, but cannot cause an Enter
+to be sent on stale evidence. `working` → `done` with every token field unchanged
+remains stable. Likewise, `busy` and `unknown` are not treated as "not blocked": the
+former means a turn is already running and the latter is not a successful state
+observation, so both refuse the resend.
 
 The **timeout gate is untouched** (#15202 requirement 5): the same two checks, the
 same 8s re-wait, the same reader call sequence, and a rail constructed without a

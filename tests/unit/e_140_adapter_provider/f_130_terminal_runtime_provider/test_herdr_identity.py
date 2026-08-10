@@ -312,46 +312,75 @@ class OccupantOfLocatorTest(unittest.TestCase):
 
 
 class ProcessGenerationOfLocatorTest(unittest.TestCase):
-    """The resend identity uses Herdr row revision as process-generation evidence.
+    """The resend token combines terminal identity with a conservative revision fence.
 
-    This matches the existing gateway/worker recovery contract: revision is pinned
-    independently of runtime state, and a same-name / same-locator revision bump is a
-    recycled process generation rather than ordinary ``working`` / ``done`` churn.
+    Herdr ``AgentInfo.terminal_id`` identifies the server-owned terminal. Its row
+    ``revision`` mirrors mutable ``terminal.revision`` and is therefore pinned only to
+    fail closed on intervening changes, never described as process-generation proof.
     """
 
     def setUp(self) -> None:
         self.name = encode_assigned_name("ws", "claude", "lane15202")
 
-    def _row(self, *, revision=41, status="idle"):
+    def _row(self, *, terminal_id="term_a", revision=41, agent_status="idle"):
         return {
             "name": self.name,
             "pane_id": "w1:p1",
+            "terminal_id": terminal_id,
             "revision": revision,
-            "status": status,
+            "agent_status": agent_status,
         }
 
-    def test_runtime_state_churn_preserves_the_generation_token(self) -> None:
+    def test_runtime_state_churn_preserves_the_live_target_token(self) -> None:
         before = process_generation_of_locator(
-            "w1:p1", [self._row(status="working")]
+            "w1:p1", [self._row(agent_status="working")]
         )
         after = process_generation_of_locator(
-            "w1:p1", [self._row(status="done")]
+            "w1:p1", [self._row(agent_status="done")]
         )
         self.assertIsNotNone(before)
         self.assertEqual(before, after)
 
-    def test_same_name_and_locator_revision_bump_is_a_new_generation(self) -> None:
+    def test_revision_bump_changes_the_conservative_snapshot_token(self) -> None:
         before = process_generation_of_locator("w1:p1", [self._row(revision=41)])
-        recycled = process_generation_of_locator("w1:p1", [self._row(revision=42)])
+        changed = process_generation_of_locator("w1:p1", [self._row(revision=42)])
         self.assertIsNotNone(before)
-        self.assertIsNotNone(recycled)
-        self.assertNotEqual(before, recycled)
+        self.assertIsNotNone(changed)
+        self.assertNotEqual(before, changed)
+
+    def test_different_terminal_same_name_locator_and_revision_is_different(self) -> None:
+        before = process_generation_of_locator(
+            "w1:p1", [self._row(terminal_id="term_a", revision=41)]
+        )
+        replacement = process_generation_of_locator(
+            "w1:p1", [self._row(terminal_id="term_b", revision=41)]
+        )
+        self.assertIsNotNone(before)
+        self.assertIsNotNone(replacement)
+        self.assertNotEqual(before, replacement)
+
+    def test_missing_or_malformed_terminal_id_fails_closed(self) -> None:
+        malformed = (None, "", " ", " term_a", "term_a ", 41, True, 41.0, object())
+        self.assertIsNone(
+            process_generation_of_locator(
+                "w1:p1",
+                [{"name": self.name, "pane_id": "w1:p1", "revision": 41}],
+            )
+        )
+        for terminal_id in malformed:
+            with self.subTest(terminal_id=terminal_id):
+                self.assertIsNone(
+                    process_generation_of_locator(
+                        "w1:p1", [self._row(terminal_id=terminal_id)]
+                    )
+                )
 
     def test_missing_or_malformed_revision_fails_closed(self) -> None:
         malformed = (None, "", "41", True, False, -1, 41.0, object())
         self.assertIsNone(
             process_generation_of_locator(
-                "w1:p1", [{"name": self.name, "pane_id": "w1:p1"}]
+                "w1:p1",
+                [{"name": self.name, "pane_id": "w1:p1", "terminal_id": "term_a"}],
             )
         )
         for revision in malformed:

@@ -43,17 +43,17 @@ determine" is always a refusal, never a pass:
 1. ``screen_guard`` is bound. Without a classifier the rail cannot rule out a trust /
    login / update-selection screen, and #13760 is exactly what a blind Enter into one
    costs (the request body is destroyed while the transport reports ``sent``).
-2. ``identity_probe`` is bound, and the target's process generation was established
+2. ``identity_probe`` is bound, and a conservative live-target token was established
    before injection **and** is byte-identical now. Every outer identity gate (target
    resolution, ``--target-repo``, startup admission) runs *before* the drive and none
    re-runs mid-drive, so nothing else guarantees the locator still addresses the same
    process 8–15s later — a pane can be killed and its id reused, or a lane relaunched,
-   inside the wait window. The built-in Herdr token joins assigned name + locator + row
-   revision, matching the repo's existing process-generation contract; missing /
-   malformed revision evidence refuses the resend. Runtime status is not part of the
-   token, so ordinary state churn is not mistaken for replacement. Identity is checked
-   *before* the pane read because re-reading a pane a different process now owns is
-   already reading the wrong thing.
+   inside the wait window. The built-in Herdr token joins assigned name + terminal id +
+   locator + row revision. Terminal id is the server-owned terminal identity; revision
+   is only a conservative mutation fence and is not a process-generation id. Missing /
+   malformed terminal-id or revision evidence refuses the resend. Runtime status is
+   not directly part of the token. Identity is checked *before* the pane read because
+   re-reading a pane a different process now owns is already reading the wrong thing.
 3. The pane reads, and is not blank. An unreadable or blank pane is never "clear" —
    #13760's live lane saw an empty pane *after* a dialog ate the body.
 4. The guard finds no declared startup screen. Checked before the body check, so a
@@ -110,12 +110,14 @@ RESEND_SKIP_REASONS: frozenset[str] = frozenset(
 
 #: The injected read-only target-identity probe the WAIT_ERROR resend gate requires
 #: (Redmine #15202, audit j#102755 finding 3). Given the target locator it returns an
-#: opaque token naming *which process currently holds it* — under Herdr, an injective
-#: encoding of assigned name + locator + row revision from a FRESH ``agent list``
-#: snapshot — or ``None`` when that cannot be established. The rail captures one token
-#: before injecting and requires an exact match before it re-sends Enter, so a pane that
-#: was recycled, relaunched, or reassigned in the wait window can never receive the
-#: extra Enter. A runtime status change alone leaves the token stable.
+#: opaque conservative fingerprint of the live target — under Herdr, an injective
+#: encoding of assigned name + stable terminal id + locator + row revision from a FRESH
+#: ``agent list`` snapshot — or ``None`` when that cannot be established. Terminal id
+#: separates terminal instances; revision is a mutation fence, not a process-generation
+#: id. The rail captures one token before injecting and requires an exact match before
+#: it re-sends Enter, so a pane that was recycled, relaunched, or reassigned in the wait
+#: window cannot receive the extra Enter. A runtime status change alone leaves the
+#: token stable unless it coincides with some separately revisioned presentation change.
 #: A memoised probe would make the comparison vacuous: it MUST re-read.
 ResendIdentityProbe = Callable[[str], Optional[str]]
 

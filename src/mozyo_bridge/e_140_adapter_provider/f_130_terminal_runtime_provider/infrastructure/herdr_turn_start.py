@@ -285,15 +285,16 @@ def make_locator_identity_probe(
     :func:`~...domain.herdr_identity.process_generation_of_locator` fold over a
     **fresh** ``agent list`` snapshot — a new listing on every call, deliberately
     un-memoised, because a cached snapshot would make the before/after comparison
-    vacuous and turn the guard into decoration.  The token pins assigned name,
-    locator, and Herdr row revision; a same-name / same-locator revision bump is a
-    different process generation, while runtime status churn is not.
+    vacuous and turn the guard into decoration. The token pins assigned name,
+    Herdr's stable terminal id, locator, and row revision. Terminal id distinguishes
+    terminal instances. Revision is retained as a conservative mutation fence; Herdr
+    0.8 derives it from ``terminal.revision``, so it is not a process-generation id.
 
     Fail-closed and total: an unreadable listing, an unknown locator, a blank name,
-    missing / malformed row revision, or an ambiguous locator (two rows claiming it)
-    all answer ``None``, and the rail reads ``None`` as "identity unconfirmed" and
-    withholds the extra Enter. Never raises, so a listing fault degrades the resend
-    rather than the send.
+    missing / malformed terminal id or row revision, or an ambiguous locator (two rows
+    claiming it) all answer ``None``, and the rail reads ``None`` as "identity
+    unconfirmed" and withholds the extra Enter. Never raises, so a listing fault
+    degrades the resend rather than the send.
     """
     lister = HerdrCliAgentLister(binary, runner=runner)
 

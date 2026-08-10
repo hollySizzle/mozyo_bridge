@@ -386,6 +386,7 @@ AGENT_KEY_NAME: str = "name"
 AGENT_KEY_LOCATOR: str = "pane_id"  # real herdr `agent list` row key (PoC #13175 E10 実測)
 AGENT_KEY_LOCATOR_ALIAS: str = "pane"
 AGENT_KEY_LOCATOR_ALIAS_2: str = "location"
+AGENT_KEY_TERMINAL_ID: str = "terminal_id"
 AGENT_KEY_REVISION: str = "revision"
 
 
@@ -820,28 +821,31 @@ def occupant_of_locator(
 def process_generation_of_locator(
     locator: object, agents: Sequence[Mapping[str, object]]
 ) -> Optional[str]:
-    """An opaque token for the exact Herdr process at ``locator``, or ``None``.
+    """An opaque, conservative token for the live Herdr target, or ``None``.
 
     The WAIT_ERROR Enter-only resend must distinguish more than the durable assigned
-    name.  Existing recovery contracts already treat the live ``agent list`` row
-    ``revision`` as a required process-generation component: notably
-    ``gateway_turn_recovery.gateway_refresh_action_id`` and
-    ``worker_turn_recovery.worker_refresh_action_id`` pin it so a same-name,
-    same-locator row whose revision advances is a different process generation.  The
-    runtime ``status`` is deliberately *not* part of those generation pins; ordinary
-    ``working`` / ``done`` state churn must not look like a process replacement.
+    name and transient pane locator. Herdr 0.8 ``AgentInfo.terminal_id`` is the opaque
+    identity of the server-owned terminal and is regenerated for a replacement
+    terminal; it therefore separates different terminals even when a pane id and row
+    revision happen to be reused. ``AgentInfo.revision`` is *not* a process-generation
+    id: it mirrors ``terminal.revision`` and can advance for presentation changes such
+    as title or metadata updates. The revision remains in this short-window token only
+    as a conservative mutation fence, not as identity proof.
 
-    This fold applies the same contract to the resend gate.  A successful token is an
-    injective length-prefixed encoding of ``(assigned_name, locator, row_revision)``.
-    It is opaque and local to equality comparison; it is never persisted or rendered.
-    Missing or malformed revision evidence fails closed.  Herdr inventory exposes the
-    revision as a non-negative JSON integer, so strings, booleans, floats, and negative
-    integers are rejected rather than normalised into fabricated evidence.
+    A successful token is an injective length-prefixed encoding of
+    ``(assigned_name, terminal_id, locator, row_revision)``. It is opaque and local to
+    equality comparison; it is never persisted or rendered. Missing or malformed
+    terminal-id or revision evidence fails closed. A terminal id must be an exact,
+    non-blank JSON string with no surrounding whitespace. Herdr exposes revision as a
+    non-negative JSON integer, so strings, booleans, floats, and negative integers are
+    rejected rather than normalised into fabricated evidence.
 
     Exactly one row must claim the locator and it must carry a non-blank name, matching
-    :func:`occupant_of_locator`'s ambiguity rules.  Consequently, a stable name +
-    locator + revision compares equal across runtime-state changes, while a revision
-    bump compares different even when the name and locator were recycled unchanged.
+    :func:`occupant_of_locator`'s ambiguity rules. Consequently, stable name + terminal
+    id + locator + revision compares equal when only the separately reported runtime
+    status changes. A different terminal id or revision compares different, even if
+    name and locator are unchanged; revision-only drift may conservatively withhold an
+    otherwise safe resend, which is preferable to sending on incomplete evidence.
     """
     wanted = _norm(locator)
     if not wanted:
@@ -855,9 +859,13 @@ def process_generation_of_locator(
         return None
     row = matches[0]
     assigned_name = _norm(row.get(AGENT_KEY_NAME))
+    terminal_id = row.get(AGENT_KEY_TERMINAL_ID)
     revision = row.get(AGENT_KEY_REVISION)
     if (
         not assigned_name
+        or type(terminal_id) is not str
+        or not terminal_id
+        or terminal_id.strip() != terminal_id
         or not isinstance(revision, int)
         or isinstance(revision, bool)
         or revision < 0
@@ -865,6 +873,7 @@ def process_generation_of_locator(
         return None
     return (
         f"{len(assigned_name)}:{assigned_name}:"
+        f"{len(terminal_id)}:{terminal_id}:"
         f"{len(wanted)}:{wanted}:r{revision}"
     )
 
@@ -885,6 +894,7 @@ __all__ = (
     "AGENT_KEY_LOCATOR_ALIAS_2",
     "AGENT_KEY_NAME",
     "AGENT_KEY_REVISION",
+    "AGENT_KEY_TERMINAL_ID",
     "DECODE_FAILURE_REASONS",
     "DEFAULT_LANE",
     "LANE_WORKSPACE_TOKEN_PREFIX",
