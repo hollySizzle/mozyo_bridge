@@ -85,6 +85,13 @@ def _result(returncode: int = 0, stdout: str = "", stderr: str = ""):
     return type("R", (), {"returncode": returncode, "stdout": stdout, "stderr": stderr})()
 
 
+def _write_plist(target: Path, label: str) -> Path:
+    """Write a parseable plist carrying exactly ``label`` — the identity every verb classifies on."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(plistlib.dumps({"Label": label, "ProgramArguments": ["/opt/bin/x"]}))
+    return target
+
+
 def _pinned_plist(os_home: Path, home: str, *, executable="/opt/bin/mozyo-bridge",
                   extra=()) -> Path:
     """Write an owned plist whose ProgramArguments pin ``home`` (test double for an install)."""
@@ -139,7 +146,7 @@ class _DarwinCase(unittest.TestCase):
         self.os_home = Path(self._tmp_os.name)
         self.mozyo_home = Path(self._tmp_mozyo.name)
         p_darwin = patch.object(sl, "_running_on_darwin", return_value=True)
-        p_uid = patch.object(sl.os, "getuid", return_value=_TEST_UID, create=True)
+        p_uid = patch.object(os, "getuid", return_value=_TEST_UID, create=True)
         p_darwin.start()
         p_uid.start()
         self.addCleanup(p_darwin.stop)
@@ -570,9 +577,10 @@ class RestartTest(_DarwinCase):
 
 class UninstallTest(_DarwinCase):
     def test_uninstall_boots_out_and_removes_exactly_owned_plist(self) -> None:
-        plist_file = sl.plist_path(self.os_home)
-        plist_file.parent.mkdir(parents=True)
-        plist_file.write_bytes(b"placeholder")
+        # The plist must carry OUR Label to be removable. This test used to write `b"placeholder"` —
+        # a file that parses as nothing — and assert its deletion, so a test named "exactly owned"
+        # pinned the deletion of a file whose owner was unknowable (review j#102496 r12f2).
+        plist_file = _write_plist(sl.plist_path(self.os_home), sl.SUPERVISOR_LAUNCHD_LABEL)
         bystander = plist_file.parent / "some.other.agent.plist"
         bystander.write_bytes(b"untouched")
         runner = FakeRunner()
@@ -1736,6 +1744,273 @@ class CommonStatusContractTest(_DarwinCase):
         self.assertFalse(status["loaded"])
         self.assertIsNone(status["last_exit_status"])
         self.assertEqual(status["last_result"], "")
+
+
+class OwnedIdentityIsRevalidatedAtActionTimeTest(_DarwinCase):
+    """Every destructive verb re-establishes ownership at the moment it mutates (j#102496 r12f1).
+
+    The entry classification and the mutation are separated by a subprocess call, so they are two
+    different facts about two different moments. These pin the second one. They do not claim the
+    race is closed — ``unlink`` / ``write_bytes`` target a path, not the validated inode — only that
+    a replacement this adapter *can* observe is never mutated.
+    """
+
+    def _swap_on(self, verb: str, target: Path, label: str, *, remove: bool = False):
+        """A runner that replaces ``target`` while ``verb`` runs, i.e. inside the stale window."""
+        def runner(argv):
+            if len(argv) >= 2 and argv[1] == verb:
+                if remove:
+                    target.unlink()
+                else:
+                    _write_plist(target, label)
+            return _result(0)
+        return runner
+
+    def test_legacy_plist_replaced_during_bootout_is_not_unlinked(self) -> None:
+        legacy = _legacy_drain_plist(self.os_home)
+        result = sl.remove_legacy_drain(
+            os_home=self.os_home,
+            runner=self._swap_on("bootout", legacy, "com.example.foreign"),
+        )
+        self.assertFalse(result["removed"])
+        self.assertEqual(sl.REASON_LEGACY_DRAIN_FOREIGN_LABEL, result["reason"])
+        self.assertEqual(sl.LEGACY_DRAIN_FOREIGN, result["state"])
+        self.assertTrue(legacy.exists())  # the stranger's file survived
+        self.assertEqual("com.example.foreign", plistlib.loads(legacy.read_bytes())["Label"])
+
+    def test_legacy_plist_made_unreadable_during_bootout_is_not_unlinked(self) -> None:
+        legacy = _legacy_drain_plist(self.os_home)
+
+        def runner(argv):
+            if len(argv) >= 2 and argv[1] == "bootout":
+                legacy.write_bytes(b"\x00 truncated mid-write")
+            return _result(0)
+
+        result = sl.remove_legacy_drain(os_home=self.os_home, runner=runner)
+        self.assertFalse(result["removed"])
+        self.assertEqual(sl.REASON_LEGACY_DRAIN_UNREADABLE, result["reason"])
+        self.assertTrue(legacy.exists())
+
+    def test_legacy_plist_removed_by_someone_else_is_not_claimed_as_our_removal(self) -> None:
+        # The goal state holds, but this call did not bring it about. Reporting `removed: True`
+        # would credit us with a mutation we never performed.
+        legacy = _legacy_drain_plist(self.os_home)
+        result = sl.remove_legacy_drain(
+            os_home=self.os_home, runner=self._swap_on("bootout", legacy, "", remove=True)
+        )
+        self.assertFalse(result["removed"])
+        self.assertEqual("", result["reason"])
+        self.assertEqual(sl.LEGACY_DRAIN_ABSENT, result["state"])
+
+    def test_owned_plist_replaced_during_uninstall_bootout_is_not_unlinked(self) -> None:
+        owned = _write_plist(sl.plist_path(self.os_home), sl.SUPERVISOR_LAUNCHD_LABEL)
+        result = sl.uninstall(
+            os_home=self.os_home,
+            runner=self._swap_on("bootout", owned, "com.example.foreign"),
+        )
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_PLIST_FOREIGN_LABEL, result["reason"])
+        self.assertEqual(sl.PLIST_FOREIGN, result["plist_state"])
+        self.assertTrue(owned.exists())
+
+    def test_current_plist_replaced_during_migration_is_not_overwritten_by_install(self) -> None:
+        # install's own-path preflight runs before the migration; the migration then shells out, so
+        # the write is re-checked against what is on disk *now*.
+        _legacy_drain_plist(self.os_home)
+        current = sl.plist_path(self.os_home)
+        result = sl.install(
+            os_home=self.os_home,
+            mozyo_home=self.mozyo_home,
+            runner=self._swap_on("bootout", current, "com.example.foreign"),
+            which=_which_found,
+        )
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_PLIST_FOREIGN_LABEL, result["reason"])
+        self.assertEqual("com.example.foreign", plistlib.loads(current.read_bytes())["Label"])
+
+
+class CurrentAgentIdentityFenceTest(_DarwinCase):
+    """install / uninstall mutate our own path only when the file there is ours (j#102496 r12f2).
+
+    The retired-drain path had this fence from the start; the current agent's did not, so a plist
+    carrying a stranger's ``Label`` was overwritten by install and deleted by uninstall. A path is a
+    location — the ``Label`` inside the file is the identity.
+    """
+
+    def _foreign(self) -> Path:
+        return _write_plist(sl.plist_path(self.os_home), "com.example.foreign")
+
+    def _unreadable(self) -> Path:
+        target = sl.plist_path(self.os_home)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"this is not a plist")
+        return target
+
+    def test_install_refuses_over_a_foreign_plist_with_zero_mutation(self) -> None:
+        foreign = self._foreign()
+        before = foreign.read_bytes()
+        runner = FakeRunner()
+        result = sl.install(
+            os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found
+        )
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_PLIST_FOREIGN_LABEL, result["reason"])
+        self.assertEqual(sl.PLIST_FOREIGN, result["plist_state"])
+        self.assertEqual(before, foreign.read_bytes())
+        self.assertEqual([], runner.calls)  # not even a bootout
+
+    def test_install_refuses_over_an_unreadable_plist_with_zero_mutation(self) -> None:
+        unreadable = self._unreadable()
+        runner = FakeRunner()
+        result = sl.install(
+            os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found
+        )
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_PLIST_UNREADABLE, result["reason"])
+        self.assertEqual(b"this is not a plist", unreadable.read_bytes())
+        self.assertEqual([], runner.calls)
+
+    def test_install_refusal_does_not_remove_the_retired_drain_first(self) -> None:
+        # The own-path preflight is evaluated BEFORE the migration, so a refused install really is
+        # zero-mutation rather than "zero mutation apart from the one it already did".
+        legacy = _legacy_drain_plist(self.os_home)
+        self._foreign()
+        result = sl.install(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            runner=FakeRunner(), which=_which_found,
+        )
+        self.assertFalse(result["performed"])
+        self.assertTrue(legacy.exists())
+
+    def test_uninstall_refuses_to_delete_a_foreign_plist(self) -> None:
+        foreign = self._foreign()
+        runner = FakeRunner()
+        result = sl.uninstall(os_home=self.os_home, runner=runner)
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_PLIST_FOREIGN_LABEL, result["reason"])
+        self.assertEqual(sl.PLIST_FOREIGN, result["plist_state"])
+        self.assertTrue(foreign.exists())
+        self.assertEqual([], runner.calls)
+
+    def test_uninstall_refuses_to_delete_an_unreadable_plist(self) -> None:
+        unreadable = self._unreadable()
+        runner = FakeRunner()
+        result = sl.uninstall(os_home=self.os_home, runner=runner)
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_PLIST_UNREADABLE, result["reason"])
+        self.assertTrue(unreadable.exists())
+        self.assertEqual([], runner.calls)
+
+    def test_uninstall_over_a_foreign_plist_leaves_the_retired_drain_alone_too(self) -> None:
+        # An unidentifiable host state stops the whole verb, not just the part that touches it.
+        legacy = _legacy_drain_plist(self.os_home)
+        self._foreign()
+        sl.uninstall(os_home=self.os_home, runner=FakeRunner())
+        self.assertTrue(legacy.exists())
+
+    def test_refusals_name_no_path_no_label_and_no_manager_text(self) -> None:
+        self._foreign()
+        rendered = repr(sl.uninstall(os_home=self.os_home, runner=FakeRunner())) + repr(
+            sl.install(
+                os_home=self.os_home, mozyo_home=self.mozyo_home,
+                runner=FakeRunner(), which=_which_found,
+            )
+        )
+        self.assertNotIn(str(self.os_home), rendered)
+        self.assertNotIn("com.example.foreign", rendered)
+        self.assertNotIn("Boot-out", rendered)
+
+
+class UninstallNeverDeletesAfterFailedBootoutTest(_DarwinCase):
+    """A succeeding bootout is the only authority to unlink the owned plist (j#102496 r12f3).
+
+    The same rule the retired-drain migration already carries (j#102458), applied to the verb that
+    deletes the *current* agent. Unlinking does not unregister anything — launchd keys a bootstrapped
+    job off its label — so deleting after a failed bootout hides a possibly-live job. It used to do
+    exactly that while reporting ``performed: true`` / ``removed: true`` and an empty reason.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.owned = _write_plist(sl.plist_path(self.os_home), sl.SUPERVISOR_LAUNCHD_LABEL)
+
+    def _uninstall_with(self, result_or_exc):
+        calls: list[list[str]] = []
+
+        def runner(argv):
+            calls.append(list(argv))
+            if isinstance(result_or_exc, Exception):
+                raise result_or_exc
+            return result_or_exc
+
+        return sl.uninstall(os_home=self.os_home, runner=runner), calls
+
+    def test_nonzero_bootout_keeps_the_plist_and_refuses(self) -> None:
+        for stderr in (
+            "Boot-out failed: 5: Input/output error",
+            'Could not find service "org.mozyo-bridge.callback-supervisor" in domain',
+            "",
+        ):
+            with self.subTest(stderr=stderr):
+                _write_plist(sl.plist_path(self.os_home), sl.SUPERVISOR_LAUNCHD_LABEL)
+                result, _ = self._uninstall_with(_result(1, stderr=stderr))
+                self.assertFalse(result["performed"])
+                self.assertEqual(sl.REASON_BOOTOUT_FAILED, result["reason"])
+                self.assertTrue(self.owned.exists())
+
+    def test_wording_that_claims_absence_still_does_not_authorize_the_unlink(self) -> None:
+        # The retired second authority: "bootout failed but the manager says it is unknown, so it
+        # was never loaded". No deletion reads manager wording any more (j#102458 / r12f4).
+        result, calls = self._uninstall_with(
+            _result(113, stderr='Could not find service "org.mozyo-bridge.callback-supervisor"')
+        )
+        self.assertFalse(result["performed"])
+        self.assertTrue(self.owned.exists())
+        self.assertEqual(["bootout"], [c[1] for c in calls])  # no `print` follow-up at all
+
+    def test_a_bootout_that_cannot_run_keeps_the_plist(self) -> None:
+        for exc in (FileNotFoundError("launchctl"), OSError("denied")):
+            with self.subTest(exc=type(exc).__name__):
+                with self.assertRaises(type(exc)):
+                    self._uninstall_with(exc)
+                self.assertTrue(self.owned.exists())
+
+    def test_a_succeeding_bootout_still_removes_the_owned_plist(self) -> None:
+        result, calls = self._uninstall_with(_result(0))
+        self.assertTrue(result["performed"])
+        self.assertTrue(result["removed"])
+        self.assertEqual(sl.PLIST_OWNED, result["plist_state"])
+        self.assertFalse(self.owned.exists())
+        # One bootout for the owned label; the retired drain is absent here, and its migration
+        # short-circuits on `absent` without shelling out at all.
+        self.assertEqual(["bootout"], [c[1] for c in calls])
+
+    def test_a_succeeding_bootout_removes_the_retired_drain_in_the_same_run(self) -> None:
+        legacy = _legacy_drain_plist(self.os_home)
+        result, calls = self._uninstall_with(_result(0))
+        self.assertTrue(result["removed"])
+        self.assertTrue(result["legacy_drain_removed"])
+        self.assertFalse(legacy.exists())
+        self.assertEqual(["bootout", "bootout"], [c[1] for c in calls])  # owned, then retired drain
+
+    def test_an_absent_plist_still_boots_out_and_succeeds(self) -> None:
+        # Nothing to identify or unlink, and a loaded job whose file is already gone is exactly the
+        # state a teardown should clear — so the bootout still runs and its exit code decides nothing.
+        self.owned.unlink()
+        result, calls = self._uninstall_with(_result(1))
+        self.assertTrue(result["performed"])
+        self.assertFalse(result["removed"])
+        self.assertEqual(sl.PLIST_ABSENT, result["plist_state"])
+        self.assertIn("bootout", [c[1] for c in calls])
+
+    def test_the_refusal_carries_no_manager_text_or_host_path(self) -> None:
+        result, _ = self._uninstall_with(
+            _result(1, stderr=f"Boot-out failed at {self.os_home}: 5: Input/output error")
+        )
+        rendered = repr(result)
+        self.assertNotIn(str(self.os_home), rendered)
+        self.assertNotIn("Boot-out", rendered)
+        self.assertNotIn("Input/output", rendered)
 
 
 if __name__ == "__main__":

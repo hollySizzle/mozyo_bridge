@@ -4,8 +4,13 @@ Split out of :mod:`...application.supervisor_launchd` so neither side exceeds th
 line budget, mirroring the split the Linux adapter already carries
 (:mod:`...application.supervisor_systemd_unit`, review j#102069 F7). The division is the same one:
 everything here is **pure** — owned identity, path resolution, argv resolution, plist rendering and
-read-back, and the fixed vocabularies those produce. Nothing in this module runs ``launchctl``,
-touches a credential, or mutates the host; the lifecycle verbs that do live in the sibling module.
+read-back, the plist-ownership classification every destructive verb shares, the launchctl argv
+builders, and the fixed vocabularies those produce. Nothing in this module runs a process, touches a
+credential, or mutates the host; the lifecycle verbs that do live in the sibling modules.
+
+``launchctl`` appears here only as *argv construction*: :func:`launchctl` hands the command to an
+injected runner and starts nothing itself. Keeping it at this level is what lets the lifecycle verbs
+and the retired-drain migration compose the same command without importing each other.
 
 Every name is re-exported from ``supervisor_launchd``, so that module remains the single import for
 the whole macOS adapter and no caller or test had to change.
@@ -215,6 +220,61 @@ def read_installed_plist(target: Path) -> Optional[dict]:
     except (OSError, ValueError, plistlib.InvalidFileException):
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+#: The manager binary. Named here, with the argv builders, so the retired-drain migration and the
+#: lifecycle verbs compose the same command without importing each other.
+LAUNCHCTL = "launchctl"
+
+
+def gui_domain() -> str:
+    """The per-user launchd domain a LaunchAgent lives in."""
+    return f"gui/{os.getuid()}"
+
+
+def service_target(agent: SupervisorAgent = SUPERVISOR_AGENT) -> str:
+    """``<domain>/<label>`` — how launchctl names one service. The label is the identity."""
+    return f"{gui_domain()}/{agent.label}"
+
+
+def launchctl(runner, args: Sequence[str]):
+    """Build the launchctl argv and hand it to the injected ``runner``. Runs no process itself."""
+    return runner([LAUNCHCTL, *args])
+
+
+#: Identity of whatever currently occupies an agent's plist path. Every destructive verb classifies
+#: before it writes or unlinks, and only :data:`PLIST_OWNED` may be mutated.
+PLIST_ABSENT = "absent"  # nothing there: a clean host, or one already torn down
+PLIST_OWNED = "owned"  # parses, and ``Label`` is exactly this agent's label
+PLIST_FOREIGN = "foreign"  # parses, but the ``Label`` belongs to someone else
+PLIST_UNREADABLE = "unreadable"  # present but unparseable / non-mapping / no ``Label`` string
+
+
+def classify_plist(target: Path, *, label: str) -> str:
+    """Classify who owns the file at ``target`` — the single identity test every verb shares.
+
+    Returns one of :data:`PLIST_ABSENT` / :data:`PLIST_OWNED` / :data:`PLIST_FOREIGN` /
+    :data:`PLIST_UNREADABLE`. Identity is read from the plist's own ``Label``, never inferred from
+    the filename: a path is a *location*, and a location says nothing about who wrote what is there.
+
+    This was previously implemented only for the retired drain agent, so the adapter could refuse to
+    delete a stranger's retired plist while its *current* agent's install overwrote and its uninstall
+    deleted whatever happened to occupy the path (review j#102496 r12f2). One classifier, applied by
+    every verb, is what makes "we mutate exactly our own artifacts" a property of the code rather
+    than a claim in a docstring.
+
+    ``UNREADABLE`` is deliberately distinct from ``FOREIGN``: "this is someone else's" and "I cannot
+    tell whose this is" are different facts, and neither one authorizes a mutation.
+    """
+    if not target.exists():
+        return PLIST_ABSENT
+    parsed = read_installed_plist(target)
+    if parsed is None:
+        return PLIST_UNREADABLE
+    found = parsed.get("Label")
+    if not isinstance(found, str) or not found:
+        return PLIST_UNREADABLE
+    return PLIST_OWNED if found == label else PLIST_FOREIGN
 
 
 def extract_pinned_home(installed_argv: object) -> tuple[Optional[str], str]:
@@ -523,6 +583,15 @@ __all__ = (
     "render_plist",
     "extract_pinned_home",
     "read_installed_plist",
+    "PLIST_ABSENT",
+    "PLIST_OWNED",
+    "PLIST_FOREIGN",
+    "PLIST_UNREADABLE",
+    "classify_plist",
+    "LAUNCHCTL",
+    "gui_domain",
+    "service_target",
+    "launchctl",
     "LAUNCHCTL_NOT_FOUND_CODES",
     "not_found_operand",
     "has_not_found_clause",

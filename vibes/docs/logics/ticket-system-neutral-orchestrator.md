@@ -508,8 +508,8 @@ typed zero-mutation refusal）、結果 envelope を `{action, performed, reason
 を含む **superset**（local drain を実行し、watermark が due なら provider leg も実行する）であるため、第二
 agent が買っていたのは capability ではなく latency であり、その対価は Login Items に見える登録がもう 1 つ増え
 ることと、整合を保つべき lifecycle がもう 1 つ増えることだった。各 verb は非 darwin / 実行ファイル欠落 /
-退役 plist の identity 不明 / not-loaded で zero-mutation 拒否し、RunAtLoad + StartInterval（KeepAlive なし、
-EnvironmentVariables なし）契約を維持する。**credential 未整備は拒否理由ではない**（両 OS 共通、後述の
+**退役 plist または現行 plist の identity 不明** / not-loaded で zero-mutation 拒否し、RunAtLoad +
+StartInterval（KeepAlive なし、EnvironmentVariables なし）契約を維持する。**credential 未整備は拒否理由ではない**（両 OS 共通、後述の
 「Redmine 未設定は導入の拒否理由にしない」を正本とする）。
 
 **退役 agent の migration**（#15192）。#15192 以前に install した host には第二 LaunchAgent が残る。これを放置
@@ -544,26 +544,40 @@ capability の損失はなく、status の `legacy_drain` で operator に可視
 
 **停止は「試みた」ではなく「確認した」でなければならない**（review j#102151 Finding 1）。plist の unlink は
 registration の削除ではない: launchd は bootstrap 済み job を **label** で保持するため、file を消しても job は
-logout まで走り続ける。したがって退役 plist の削除は **「退役 job が消えている」という positive な証拠**が
-得られた場合に限る。証拠の取り方は次の 2 つだけである:
+logout まで走り続ける。したがって plist の削除は **「job が消えている」という positive な証拠**が得られた
+場合に限る。その証拠は **`bootout` の rc 0 ただ 1 つ**であり、上記の唯一 authority と同一である。
 
-1. `launchctl bootout` が **rc 0 で成功した** —— 自分でいま unload したのだから確実であり、error taxonomy の
-   解釈に一切依存しない。
-2. bootout が失敗し、続く `launchctl print` が **「そのような service は無い」と明示的に報告した** —— 元から
-   load されていなかった場合であり、既に停止済みの退役 agent の通常状態である。
+**identity は mutation の瞬間に再確立する**（review j#102496 r12f1）。分類と unlink / write の間には
+subprocess 呼び出しが挟まるため、両者は**別の時点についての別の事実**である。分類済みの file と実際に
+削除される file が同一である保証はなく、この窓で差し替えられた plist は `state: owned` / `removed: true` を
+返しながら削除された。ただし**限界も併記する**: 再確認は窓を狭めるが閉じない。`unlink` / `write_bytes` は
+検証した inode ではなく **path** を対象とするため、再確認と実行の間に差し替えられれば同じ結果になりうる。
+主張するのは「race を解消した」ではなく「**action time で再検証し、観測できた不一致は追加 mutation なしで
+拒否する**」である。
 
-bootout の return code **単体**は判定に使わない（未 load の label にも非ゼロを返すため、失敗と読むと正常な
-migration をすべて拒否する）。ただしその **成功は事実として使う**。これにより通常経路は error 解釈を経由せず
-確定し、推測に依存するのは「元から load されていなかった」case だけになる。
+**この identity fence は現行 agent の plist にも等しく適用する**（review j#102496 r12f2）。以前は退役 drain
+path にしか identity 検査がなく、`install` は自 path 上の **他人の Label を持つ plist を上書き**し、
+`uninstall` は **path に居る file を Label 無検査で削除**していた。path は所在であって所有の証明ではない。
+分類は両 agent で **同一関数**を用い、`absent` / `owned` のみ mutation 可能、`foreign` / `unreadable` は
+**launchctl 呼出すら行わない** typed zero-mutation 拒否とする（`plist_foreign_label` / `plist_unreadable`）。
+
+**`uninstall` も bootout 成功なしに owned plist を unlink しない**（review j#102496 r12f3）。従来は bootout の
+結果を破棄して削除し、`performed: true` / `removed: true` / reason 空という **成功と区別できない envelope** で
+報告していた。**過剰拒否は承知の上での選択**である: 未 load の plist も bootout が非 0 を返しうるため、その
+uninstall は `launchctl_bootout_failed` で拒否され file が残る。残留は operator から可視で再試行可能だが、
+誤削除は **logout まで停止できず file からは見えない job** を生む。損害が非対称なので安全側へ倒す。
 
 **「読めなかった」を「無かった」に畳まない**（review j#102180 finding 1）。probe は `loaded` /
-`confirmed_absent` / `unreadable` の 3 値であり、**`confirmed_absent` だけが削除を許可する**。権限不足・
-service manager 異常・認識できない失敗・launchctl 不在はすべて `unreadable` であり、
-`legacy_drain_state_unreadable` で拒否する。以前の版は `launchctl print` の非ゼロをすべて「not loaded」へ畳んで
-いたため、**実際には読めていない状態を検証済みの停止として** plist を削除できてしまった。`still_loaded` と
-`state_unreadable` は事実が異なる（「動いている」と「判別できない」）ため token を分ける。どちらの拒否でも退役
+`confirmed_absent` / `unreadable` の 3 値である。権限不足・service manager 異常・認識できない失敗・
+launchctl 不在はすべて `unreadable` とする。`still_loaded` token を廃止した理由は前述のとおり。どの拒否でも
 plist は**あえて残す**: それが operator にとって「まだ生きている登録があるかもしれない」ことを示す唯一の
 durable な手掛かりであり、消せば live job を隠すことになる。
+
+**以下の parser 規則は `probe_state` という非破壊 projection の精度についてのものであり、削除 authority では
+ない**（gateway disposition j#102458 / review j#102496 r12f4）。かつて「bootout 失敗 + `print` の
+`confirmed_absent`」を **第二の削除 authority** としていた記述は **retired** である。`confirmed_absent` は
+現在いかなる削除も許可しない。規則自体を残すのは、status を誤って表示する価値もないからであり、また緩めれば
+同じ推論が破壊的 path へ再び入り込むためである。**この節を根拠に mutation を追加してはならない。**
 
 not-found の認識は **連言**である（review j#102200 finding r3f1）。`confirmed_absent` は次の**すべて**を要求する:
 (1) `launchctl` の exit code が unknown label のもの、(2) 認識可能な not-found 語を含む、(3) その出力が

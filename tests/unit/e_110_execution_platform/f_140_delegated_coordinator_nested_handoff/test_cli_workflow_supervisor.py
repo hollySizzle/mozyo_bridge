@@ -19,6 +19,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -80,9 +81,11 @@ class _ServiceCliCase(unittest.TestCase):
     @contextlib.contextmanager
     def _isolated_host(self, platform: str, *, run=_fake_run):
         """Pin the dispatched backend AND isolate every host root it would touch."""
-        module = sl if platform == "darwin" else ss
+        # Patch `subprocess.run` itself rather than one adapter module's binding: both adapters use
+        # the same module object, and the macOS side now spawns from a sibling leaf module, so a
+        # per-module patch would silently stop covering it.
         with patch.object(sys, "platform", platform), patch.object(
-            module.subprocess, "run", side_effect=run
+            subprocess, "run", side_effect=run
         ), patch("pathlib.Path.home", return_value=self.os_home), patch.dict(
             os.environ, {"XDG_CONFIG_HOME": str(self.os_home / ".config")}, clear=False
         ):
@@ -143,7 +146,9 @@ class CliServiceStatusLaunchdTest(_ServiceCliCase):
     def test_mutating_verbs_fail_closed_zero_mutation_when_launchd_refuses(self) -> None:
         with patch.object(sl, "_running_on_darwin", return_value=False), patch.object(
             sys, "platform", "darwin"
-        ), patch.object(sl.subprocess, "run", side_effect=AssertionError("launchctl must not run")):
+        ), patch.object(
+            subprocess, "run", side_effect=AssertionError("launchctl must not run")
+        ):
             for verb in ("--install", "--restart", "--uninstall"):
                 rc, out = _run(["workflow", "supervisor", verb, "--home", self.home, "--json"])
                 payload = json.loads(out)

@@ -472,6 +472,83 @@ class LegacyMigrationAuthorityTest(unittest.TestCase):
         for noun in ("/users/", "key", "token", "password"):
             self.assertNotIn(noun, sl.REASON_LEGACY_DRAIN_STATE_UNREADABLE.lower())
 
+    def test_every_destructive_refusal_token_is_typed_and_secret_free(self) -> None:
+        # Review j#102496 added three tokens to the destructive surface. Same contract as the rest:
+        # a fixed lowercase identifier, no host path, no credential noun, no manager wording.
+        for token in (
+            sl.REASON_PLIST_FOREIGN_LABEL,
+            sl.REASON_PLIST_UNREADABLE,
+            sl.REASON_BOOTOUT_FAILED,
+        ):
+            with self.subTest(token=token):
+                self.assertRegex(token, r"^[a-z0-9_]+$")
+                for noun in ("/users/", "key", "token", "password", "boot-out", "denied"):
+                    self.assertNotIn(noun, token.lower())
+
+
+class DestructiveVerbIdentityFenceTest(unittest.TestCase):
+    """Review j#102496 r12f1-r12f3, asserted at the surface an operator observes.
+
+    One rule now covers both LaunchAgents this adapter can touch: a file is mutated only when its own
+    ``Label`` says it is ours, checked again at the moment of the mutation, and the owned plist is
+    unlinked only after a bootout that actually succeeded.
+    """
+
+    def _home(self):
+        os_home = Path(tempfile.mkdtemp())
+        mozyo_home = Path(tempfile.mkdtemp())
+        return os_home, mozyo_home
+
+    def _write(self, target: Path, label: str) -> Path:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(plistlib.dumps({"Label": label, "ProgramArguments": ["/x"]}))
+        return target
+
+    def test_a_stranger_s_plist_at_our_path_survives_install_and_uninstall(self) -> None:
+        for verb in ("install", "uninstall"):
+            with self.subTest(verb=verb):
+                os_home, mozyo_home = self._home()
+                foreign = self._write(sl.plist_path(os_home), "com.example.foreign")
+                before = foreign.read_bytes()
+                with patch.object(sl, "_running_on_darwin", return_value=True):
+                    result = (
+                        sl.install(
+                            os_home=os_home, mozyo_home=mozyo_home,
+                            runner=lambda _c: _fake_result(0),
+                            which=lambda _n: "/opt/bin/mozyo-bridge",
+                        )
+                        if verb == "install"
+                        else sl.uninstall(os_home=os_home, runner=lambda _c: _fake_result(0))
+                    )
+                self.assertFalse(result["performed"])
+                self.assertEqual(sl.REASON_PLIST_FOREIGN_LABEL, result["reason"])
+                self.assertEqual(before, foreign.read_bytes())
+
+    def test_uninstall_keeps_the_owned_plist_when_the_bootout_did_not_succeed(self) -> None:
+        os_home, _ = self._home()
+        owned = self._write(sl.plist_path(os_home), sl.SUPERVISOR_LAUNCHD_LABEL)
+        with patch.object(sl, "_running_on_darwin", return_value=True):
+            result = sl.uninstall(os_home=os_home, runner=lambda _c: _fake_result(1))
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_BOOTOUT_FAILED, result["reason"])
+        self.assertTrue(owned.exists())
+
+    def test_the_classification_is_the_same_one_for_both_agents(self) -> None:
+        # Not two parallel implementations that can drift apart — one function, two callers.
+        os_home, _ = self._home()
+        for agent in (sl.SUPERVISOR_AGENT, sl.LEGACY_DRAIN_AGENT):
+            with self.subTest(agent=agent.label):
+                target = sl.plist_path(os_home, agent=agent)
+                self.assertEqual(
+                    sl.PLIST_ABSENT, sl.classify_agent_plist(os_home, agent=agent)
+                )
+                self._write(target, agent.label)
+                self.assertEqual(sl.PLIST_OWNED, sl.classify_agent_plist(os_home, agent=agent))
+                self._write(target, "com.example.other")
+                self.assertEqual(sl.PLIST_FOREIGN, sl.classify_agent_plist(os_home, agent=agent))
+                target.write_bytes(b"not a plist")
+                self.assertEqual(sl.PLIST_UNREADABLE, sl.classify_agent_plist(os_home, agent=agent))
+
 
 class RestartRefusalParityTest(unittest.TestCase):
     """Review j#102398 finding r9f2: one verb, one meaning, through the common envelope.

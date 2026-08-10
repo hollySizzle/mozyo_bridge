@@ -52,12 +52,10 @@ installing / restarting / uninstalling the agent is orthogonal to what the agent
 
 from __future__ import annotations
 
-import os
 import shutil
-import subprocess
 import sys
 from pathlib import Path
-from typing import Callable, Optional, Sequence
+from typing import Callable, Optional
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
     DEFAULT_OS_TICK_INTERVAL_SECONDS,
@@ -87,7 +85,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     HOME_PIN_UNREADABLE,
     LEGACY_DRAIN_AGENT,
     LOG_RELATIVE,
+    PLIST_ABSENT,
+    PLIST_FOREIGN,
+    PLIST_OWNED,
     PLIST_RELATIVE,
+    PLIST_UNREADABLE,
     SUPERVISOR_AGENT,
     SUPERVISOR_AGENTS,
     SUPERVISOR_ARGV_TAIL,
@@ -98,10 +100,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SUPERVISOR_LAUNCHD_LABEL,
     SupervisorAgent,
     extract_pinned_home as _extract_pinned_home,
+    gui_domain as _gui_domain,
+    launchctl as _launchctl,
     log_path,
     plist_path,
     read_installed_plist as _read_installed_plist,
     render_plist,
+    service_target as _service_target,
     # The pure launchctl-message layer: what the manager's wording says, parsed without running it.
     LAUNCHCTL_NOT_FOUND_CODES as _LAUNCHCTL_NOT_FOUND_CODES,
     LAUNCHCTL_UNREADABLE_PHRASES as _LAUNCHCTL_UNREADABLE_PHRASES,
@@ -111,6 +116,24 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     quoted_names as _quoted_names,
     resolve_mozyo_home,
     resolve_supervisor_command,
+)
+# The retired `--drain-only` migration: a one-way, time-limited concern with its own vocabulary,
+# separated for the same line-budget reason and re-exported here unchanged.
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd_migration import (  # noqa: E501
+    LEGACY_DRAIN_ABSENT,
+    LEGACY_DRAIN_FOREIGN,
+    LEGACY_DRAIN_OWNED,
+    LEGACY_DRAIN_UNREADABLE,
+    REASON_LEGACY_DRAIN_FOREIGN_LABEL,
+    REASON_LEGACY_DRAIN_REMOVAL_FAILED,
+    REASON_LEGACY_DRAIN_STATE_UNREADABLE,
+    REASON_LEGACY_DRAIN_UNREADABLE,
+    Runner,
+    _LEGACY_DRAIN_REFUSAL_REASON,
+    _default_runner,
+    classify_agent_plist,
+    classify_legacy_drain,
+    remove_legacy_drain,
 )
 
 # ---------------------------------------------------------------------------
@@ -140,23 +163,7 @@ REASON_INSTALLED_COMMAND_DRIFT = "installed_command_drift"
 REASON_BOOTSTRAP_FAILED = "launchctl_bootstrap_failed"
 #: A launchctl kickstart failed (message redacted to a fixed token).
 REASON_KICKSTART_FAILED = "launchctl_kickstart_failed"
-#: install/uninstall refused: a plist sits at the retired drain agent's owned path but does NOT carry
-#: our retired drain label, so it belongs to someone else. Removing it would be deleting a stranger's
-#: LaunchAgent; refuse with zero mutation and let the operator resolve the collision (#15192).
-REASON_LEGACY_DRAIN_FOREIGN_LABEL = "legacy_drain_foreign_label"
-#: install/uninstall refused: a file sits at the retired drain agent's owned path but cannot be
-#: parsed, so its identity is unknowable — distinct from absence, and never guessed (#15192).
-REASON_LEGACY_DRAIN_UNREADABLE = "legacy_drain_unreadable"
-#: install refused: the retired drain plist is ours and removable in principle, but unlinking it
-#: failed. Reported instead of proceeding, because proceeding would leave TWO registrations — the
-#: exact state #15192 exists to end.
-REASON_LEGACY_DRAIN_REMOVAL_FAILED = "legacy_drain_removal_failed"
 
-#: install refused: the retired agent's run state could not be READ (permission denied, a broken
-#: service manager, an unrecognized launchctl failure). Distinct from ``still_loaded`` because the
-#: facts differ — one says "it is running", this one says "I cannot tell" — and identical only in
-#: consequence: neither may authorize deleting a registration or adding a second (j#102180 F1).
-REASON_LEGACY_DRAIN_STATE_UNREADABLE = "legacy_drain_state_unreadable"
 #: restart refused: the owned service's run state could not be READ. Distinct from
 #: ``service_not_loaded`` because the facts differ — one says the service is not running, this one
 #: says we cannot tell — and **shared verbatim with the Linux adapter**: the backend declares one
@@ -164,22 +171,32 @@ REASON_LEGACY_DRAIN_STATE_UNREADABLE = "legacy_drain_state_unreadable"
 #: OS-specific manager noun (review j#102398 finding r9f2).
 REASON_SERVICE_STATE_UNREADABLE = "service_state_unreadable"
 
+#: install/uninstall refused: a plist sits at the CURRENT agent's own path but carries someone else's
+#: ``Label``. The retired-drain path has refused this since #15192; the current agent's did not, so an
+#: install overwrote a stranger's LaunchAgent and an uninstall deleted it (review j#102496 r12f2).
+REASON_PLIST_FOREIGN_LABEL = "plist_foreign_label"
+#: install/uninstall refused: a file sits at the current agent's own path but cannot be parsed, so
+#: whose it is cannot be established. Distinct from absence, and never guessed (j#102496 r12f2).
+REASON_PLIST_UNREADABLE = "plist_unreadable"
+#: uninstall refused: the owned plist is ours, but ``launchctl bootout`` did not succeed, so nothing
+#: establishes that the job stopped. Unlinking here would hide a possibly-live registration — launchd
+#: keys a bootstrapped job off its *label*, so a job whose file is gone keeps running until logout.
+#: The plist is kept on purpose: it is the operator's only durable trace of it (j#102496 r12f3).
+REASON_BOOTOUT_FAILED = "launchctl_bootout_failed"
+
 #: ``launchctl print`` probe outcomes (see :func:`_probe`). Three values, not a boolean: "I could
 #: not read it" is a different answer from "it is not there", and only the latter is safe.
 PROBE_LOADED = "loaded"
 PROBE_CONFIRMED_ABSENT = "confirmed_absent"
 PROBE_UNREADABLE = "unreadable"
 
-#: Retired-drain classification vocabulary (see :func:`classify_legacy_drain`).
-LEGACY_DRAIN_ABSENT = "absent"  # nothing at the retired path: a clean or already-migrated host
-LEGACY_DRAIN_OWNED = "owned"  # our retired registration, safe to remove
-LEGACY_DRAIN_FOREIGN = "foreign"  # a plist at that path carrying someone else's Label
-LEGACY_DRAIN_UNREADABLE = "unreadable"  # present but unparseable / non-mapping / no Label
 
-#: The install/uninstall refusal reason for each non-removable retired-drain state.
-_LEGACY_DRAIN_REFUSAL_REASON = {
-    LEGACY_DRAIN_FOREIGN: REASON_LEGACY_DRAIN_FOREIGN_LABEL,
-    LEGACY_DRAIN_UNREADABLE: REASON_LEGACY_DRAIN_UNREADABLE,
+#: The same mapping for the CURRENT agent's own plist path. The tokens are distinct from the retired
+#: drain's so an operator reading a refusal knows *which* artifact is unidentifiable — the retired
+#: registration being migrated away, or the one this adapter is installing right now.
+_PLIST_REFUSAL_REASON = {
+    PLIST_FOREIGN: REASON_PLIST_FOREIGN_LABEL,
+    PLIST_UNREADABLE: REASON_PLIST_UNREADABLE,
 }
 
 #: ``next_elapse_basis`` when the host manager publishes no next-fire time. launchd schedules a
@@ -202,11 +219,9 @@ CREDENTIAL_MISSING = "missing"  # neither present, and nothing unsafe (the plain
 CREDENTIAL_UNSAFE = "unsafe"  # a present credential file is unsafe/malformed (permission / YAML)
 
 # A launchctl "print" for an unknown label exits non-zero — but a non-zero exit alone says only
-# that the read failed, NOT that the service is gone. `_probe` classifies it three ways; see
-# `_says_not_found` for the evidence a removal requires (reviews j#102180 / j#102200 / j#102309).
-_LAUNCHCTL = "launchctl"
-
-Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
+# that the read failed, NOT that the service is gone. `_probe` classifies it three ways, and that
+# classification is a **read-only status projection only**: no deletion anywhere in this module is
+# authorized by it or by the wording it parses (gateway disposition j#102458, review j#102496 r12f4).
 
 
 # ---------------------------------------------------------------------------
@@ -250,20 +265,8 @@ def classify_credential_readiness(*, mozyo_home: Optional[Path] = None) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _default_runner(argv: Sequence[str]) -> "subprocess.CompletedProcess[str]":
-    return subprocess.run(list(argv), capture_output=True, text=True, check=False)
-
-
 def _running_on_darwin() -> bool:
     return sys.platform == "darwin"
-
-
-def _gui_domain() -> str:
-    return f"gui/{os.getuid()}"
-
-
-def _service_target(agent: SupervisorAgent = SUPERVISOR_AGENT) -> str:
-    return f"{_gui_domain()}/{agent.label}"
 
 
 #: The widest process id ``launchctl`` can print. DERIVED, not chosen: POSIX ``pid_t`` is a signed
@@ -271,10 +274,6 @@ def _service_target(agent: SupervisorAgent = SUPERVISOR_AGENT) -> str:
 #: NOT unified with the Redmine-id / lifecycle-revision widths this lane also bounds — a pid is
 #: the OS's counter and answers to a different authority (Redmine #14753).
 _MAX_PID_DIGITS = len(str(2**31 - 1))
-
-
-def _launchctl(runner: Runner, args: Sequence[str]) -> "subprocess.CompletedProcess[str]":
-    return runner([_LAUNCHCTL, *args])
 
 
 #: The ``launchctl print`` line prefixes carrying the last bounded sweep's exit status. Both
@@ -285,11 +284,15 @@ _LAST_EXIT_PREFIXES = ("last exit code = ", "last exit status = ")
 def _probe(runner: Runner, agent: SupervisorAgent = SUPERVISOR_AGENT) -> dict:
     """Read-only ``launchctl print`` → ``{state, loaded, pid, last_exit_status}``. Never raises.
 
-    ``state`` is the THREE-valued answer the migration fence needs (review j#102180 finding 1):
-    :data:`PROBE_LOADED`, :data:`PROBE_CONFIRMED_ABSENT`, or :data:`PROBE_UNREADABLE`. Collapsing
-    every non-zero exit into "not loaded" is what let a permission-denied / manager-error read pass
-    as a verified stop — "I could not see it" is not "it is not there", and only the second one may
-    authorize deleting a registration.
+    ``state`` is THREE-valued (review j#102180 finding 1): :data:`PROBE_LOADED`,
+    :data:`PROBE_CONFIRMED_ABSENT`, or :data:`PROBE_UNREADABLE`. Collapsing every non-zero exit into
+    "not loaded" reported a permission-denied / manager-error read as an established fact — "I could
+    not see it" is not "it is not there".
+
+    **This is a status projection; it authorizes nothing.** ``confirmed_absent`` once let a failed
+    bootout still delete a plist; that authority is retired (j#102458, review j#102496 r12f4). The
+    three values now feed only ``service_status`` and ``restart``'s refusal token, where being wrong
+    costs an inaccurate read-out rather than a deleted registration.
 
     A non-zero exit is classified as *confirmed absent* ONLY when launchctl positively says the
     service is unknown (:data:`_LAUNCHCTL_NOT_FOUND_CODES` / :data:`_LAUNCHCTL_NOT_FOUND_PHRASES`).
@@ -339,8 +342,12 @@ def _probe(runner: Runner, agent: SupervisorAgent = SUPERVISOR_AGENT) -> dict:
 def _says_not_found(result, service_target: str) -> bool:
     """Whether a non-zero ``launchctl print`` positively reports THIS service as unknown.
 
-    This is the only path that can authorize deleting a registration on the strength of an *error*,
-    so the evidence is a **conjunction**, not a choice (review j#102200 finding r3f1). All of:
+    **No deletion depends on this** (j#102458, review j#102496 r12f4). It once decided whether a
+    failed bootout could still delete a plist; it now only sharpens a read-only projection. The
+    conjunction below is kept because a wrong *status* is still worth avoiding, and because relaxing
+    it would invite the same reasoning back into a destructive path.
+
+    The evidence is a **conjunction**, not a choice (review j#102200 finding r3f1). All of:
 
     1. the exit code is one launchctl uses for an unknown label, **and**
     2. the output carries a recognized "no such service" phrase, **and**
@@ -421,118 +428,6 @@ def _is_loaded(
 
 
 # ---------------------------------------------------------------------------
-# Retired-drain migration (Redmine #15192).
-#
-# A host installed before #15192 carries a SECOND LaunchAgent. Leaving it would break the very
-# acceptance this change exists for ("macOS manages exactly one LaunchAgent") and would keep running
-# a `--drain-only` tick the single agent already subsumes. So install removes it — but only when it
-# is provably OURS.
-# ---------------------------------------------------------------------------
-
-
-def classify_legacy_drain(os_home: Optional[Path] = None) -> str:
-    """Classify what sits at the retired drain agent's owned plist path (read-only; never raises).
-
-    Path ownership alone is not identity. A LaunchAgent plist carries its own ``Label``, and launchd
-    keys the running service off *that*, not off the filename — so a file at our retired path whose
-    ``Label`` is someone else's is someone else's agent, and unlinking it would remove a service this
-    module never installed. The four outcomes are therefore kept apart and only
-    :data:`LEGACY_DRAIN_OWNED` is removable:
-
-    - :data:`LEGACY_DRAIN_ABSENT` — nothing there (a clean host, or one already migrated);
-    - :data:`LEGACY_DRAIN_OWNED` — parses, and ``Label`` is exactly our retired drain label;
-    - :data:`LEGACY_DRAIN_FOREIGN` — parses, but the ``Label`` is not ours;
-    - :data:`LEGACY_DRAIN_UNREADABLE` — present but unparseable / non-mapping / no ``Label`` string,
-      so identity is unknowable and is never guessed.
-    """
-    target = plist_path(os_home, agent=LEGACY_DRAIN_AGENT)
-    if not target.exists():
-        return LEGACY_DRAIN_ABSENT
-    parsed = _read_installed_plist(target)
-    if parsed is None:
-        return LEGACY_DRAIN_UNREADABLE
-    label = parsed.get("Label")
-    if not isinstance(label, str) or not label:
-        return LEGACY_DRAIN_UNREADABLE
-    return LEGACY_DRAIN_OWNED if label == LEGACY_DRAIN_AGENT.label else LEGACY_DRAIN_FOREIGN
-
-
-def remove_legacy_drain(
-    *, os_home: Optional[Path] = None, runner: Runner = _default_runner
-) -> dict:
-    """Boot out and unlink the retired drain agent when — and only when — it is ours.
-
-    ``{"state": <classification>, "removed": bool, "reason": <token>}``. An absent legacy agent is a
-    no-op success (the normal steady state). A foreign / unreadable one mutates **nothing** and
-    reports the refusal token, so the caller can fail closed rather than delete something it cannot
-    identify. Its owned log is deliberately left alone: a log is evidence of what the retired agent
-    did, and this migration retires a *registration*, not an audit trail.
-
-    **The stop is verified, not assumed** (review j#102151 Finding 1). Unlinking the plist does not
-    unregister anything: launchd keys a bootstrapped job off its *label*, so a job whose file is gone
-    keeps running until logout. The removal therefore proceeds only on **positive evidence that the
-    retired job is gone**, and there are exactly two ways to obtain it:
-
-    1. ``launchctl bootout`` **succeeds** — we just unloaded it ourselves. This is the strongest
-       evidence available and it depends on nothing but the exit status of the action we took.
-    2. bootout fails, and a follow-up ``launchctl print`` **positively reports an unknown service**
-       — it was never loaded, which is the ordinary state of an already stopped retired agent.
-
-    The bootout return code alone is deliberately not the test, because it also exits non-zero for a
-    never-loaded label; treating that as failure would refuse every clean migration. But its
-    *success* is a fact worth using, and reading it first means the common path never depends on
-    interpreting an error at all.
-
-    Anything else refuses with :data:`REASON_LEGACY_DRAIN_STATE_UNREADABLE`. There is deliberately
-    no separate "still loaded" answer any more: distinguishing a running job from an unreadable one
-    required interpreting launchctl's wording, and that interpretation is no longer permitted to
-    influence a deletion, so a token claiming the distinction would assert more than this code can
-    establish. The retired plist is kept on purpose: it is the operator's only durable trace of a
-    registration that may still be live, and removing it would hide the very thing they need to act
-    on. ``service_status`` still reports it via ``legacy_drain``.
-    """
-    state = classify_legacy_drain(os_home)
-    if state == LEGACY_DRAIN_ABSENT:
-        return {"state": state, "removed": False, "reason": ""}
-    if state != LEGACY_DRAIN_OWNED:
-        return {"state": state, "removed": False, "reason": _LEGACY_DRAIN_REFUSAL_REASON[state]}
-    # Unload before unlinking: removing the file leaves a bootstrapped service running until logout.
-    #
-    # THE ONLY AUTHORITY TO UNLINK IS A SUCCEEDING BOOTOUT. A non-zero result ends the decision here
-    # — the wording launchctl printed is never read, so it cannot authorize anything (owner
-    # delegation j#102452, gateway disposition j#102458).
-    #
-    # This is structural, not another rule about strings. Six review rounds tried to make the
-    # message safe to interpret: an exit code treated as a contract, a substring match, an invented
-    # character class, an open negation, a phrase never bound to its operand, a position rule the
-    # caller could forge across two streams, and finally an unparseable stream read as silence and a
-    # newline read as a space. Each fix was locally right and rested on an unverified premise about
-    # output nobody here has observed. The defect is not any one of those premises — it is that a
-    # destructive action depends on parsing text whose grammar is undocumented and unavailable to
-    # check. Removing the dependency removes the class.
-    #
-    # `launchctl bootout` returning 0 means *this process just unloaded that job*. That is a fact
-    # about an action we took, not an inference from prose, and it is the whole authority now.
-    try:
-        booted_out = _launchctl(runner, ["bootout", _service_target(LEGACY_DRAIN_AGENT)])
-        unloaded_by_us = booted_out.returncode == 0
-    except (FileNotFoundError, OSError):
-        unloaded_by_us = False
-    if not unloaded_by_us:
-        # Keep the plist. It is the operator's only durable trace of a registration that may still
-        # be live, and `--run-once` already performs the drain leg, so leaving it costs no
-        # capability. `service_status` reports it as a pending migration via `legacy_drain`.
-        return {
-            "state": state, "removed": False, "reason": REASON_LEGACY_DRAIN_STATE_UNREADABLE,
-        }
-    try:
-        plist_path(os_home, agent=LEGACY_DRAIN_AGENT).unlink()
-    except OSError:
-        return {"state": state, "removed": False, "reason": REASON_LEGACY_DRAIN_REMOVAL_FAILED}
-    return {"state": state, "removed": True, "reason": ""}
-
-
-# ---------------------------------------------------------------------------
 # Lifecycle verbs (structured results; fail-closed, zero-mutation refusals).
 # ---------------------------------------------------------------------------
 
@@ -573,13 +468,18 @@ def install(
     idempotent), and the removed drain leg is not a capability loss, since a ``--run-once`` tick
     already does the drain leg's work.
 
-    Every *preflight* refusal — platform, executable, and an unidentifiable retired plist — is
-    evaluated before **either** mutation, so a refused install is zero-mutation. Three refusals are
-    not, and all three stop **before the owned agent is written or bootstrapped**:
-    ``legacy_drain_state_unreadable`` (the bootout did not succeed, so nothing authorizes a
-    removal) and
-    ``legacy_drain_removal_failed`` (the unlink failed after the job was confirmed gone). These are
-    reported honestly rather than described as zero-mutation.
+    **The identity fence covers this agent's own plist too** (review j#102496 r12f2). It used to
+    apply only to the retired drain path, so an install would happily overwrite a plist at its *own*
+    path carrying a stranger's ``Label`` — replacing someone else's LaunchAgent with ours. A path is a
+    location, not a proof of ownership; the ``Label`` inside the file is the identity, and only
+    ``absent`` or ``owned`` may be written over.
+
+    Every *preflight* refusal — platform, executable, an unidentifiable retired plist, and an
+    unidentifiable current plist — is evaluated before **either** mutation, so a refused install is
+    zero-mutation. Two refusals are not, and both stop **before the owned agent is written or
+    bootstrapped**: ``legacy_drain_state_unreadable`` (the bootout did not succeed, so nothing
+    authorizes a removal) and ``legacy_drain_removal_failed`` (the unlink failed after the job was
+    confirmed gone). These are reported honestly rather than described as zero-mutation.
     """
     if not _running_on_darwin():
         return _refused("install", REASON_UNSUPPORTED_PLATFORM, label=agent.label)
@@ -598,6 +498,15 @@ def install(
             "install", _LEGACY_DRAIN_REFUSAL_REASON[legacy_state],
             credential_readiness=readiness, label=agent.label, legacy_drain=legacy_state,
         )
+    # Same identity test on OUR OWN path (j#102496 r12f2). Evaluated here, with the other preflights,
+    # so a refusal happens before the retired-drain removal — a refused install mutates nothing.
+    own_state = classify_agent_plist(os_home, agent=agent)
+    if own_state not in (PLIST_ABSENT, PLIST_OWNED):
+        return _refused(
+            "install", _PLIST_REFUSAL_REASON[own_state],
+            credential_readiness=readiness, label=agent.label, legacy_drain=legacy_state,
+            plist_state=own_state,
+        )
     migration = remove_legacy_drain(os_home=os_home, runner=runner)
     if migration["reason"]:
         # The removal itself failed (an unlink error). Proceeding would install a second live
@@ -607,6 +516,16 @@ def install(
             credential_readiness=readiness, label=agent.label, legacy_drain=migration["state"],
         )
 
+    # Re-establish identity at ACTION time: the preflight above is stale by one migration, which ran
+    # a subprocess (j#102496 r12f1 / r12f2). As on the retired path, this narrows the window without
+    # closing it — `write_bytes` targets a path, not the inode just validated.
+    own_state = classify_agent_plist(os_home, agent=agent)
+    if own_state not in (PLIST_ABSENT, PLIST_OWNED):
+        return _refused(
+            "install", _PLIST_REFUSAL_REASON[own_state],
+            credential_readiness=readiness, label=agent.label, legacy_drain=migration["state"],
+            legacy_drain_removed=migration["removed"], plist_state=own_state,
+        )
     target = plist_path(os_home, agent=agent)
     target.parent.mkdir(parents=True, exist_ok=True)
     log_path(os_home, agent=agent).parent.mkdir(parents=True, exist_ok=True)
@@ -738,31 +657,84 @@ def uninstall(
 ) -> dict:
     """Boot the agent out and remove exactly the owned plist. No credential required.
 
-    Refuses only on a non-darwin host (there is no launchd to bootout). On darwin, tears down the
-    agent even when credentials are absent — you must be able to remove a service without them. The
-    plist lives under the OS user home (``os_home``); no mozyo home is needed to remove it.
+    Credentials are never required: you must be able to remove a service without them. The plist
+    lives under the OS user home (``os_home``); no mozyo home is needed to remove it.
 
-    A retired ``--drain-only`` registration from before #15192 is torn down too, under the same
-    identity fence :func:`install` uses: "remove exactly the owned artifacts" has to include the
-    artifacts this adapter used to own, or uninstalling would leave a live agent behind on exactly
-    the hosts that most need cleaning. A foreign / unreadable plist at that path is reported and left
-    untouched — it never blocks removing the agent this adapter *does* own, because refusing to
-    uninstall over a stranger's file would strand our own registration.
+    Two fences make "exactly the owned plist" true of the code rather than only of this sentence
+    (review j#102496 r12f2 / r12f3). Until then the verb deleted whatever file occupied the path,
+    whether or not the bootout had worked:
+
+    **Identity.** The file is classified by its own ``Label`` before anything is touched. ``foreign``
+    and ``unreadable`` refuse with **zero mutation** — not even a bootout — because an unidentifiable
+    state is exactly where the ticket's fence says to stop (#15192 j#102088). The refusal is
+    deliberately total: it would be tempting to bootout anyway, since a bootout is label-scoped and
+    cannot affect a stranger's job, but that is still a mutation performed in a state this adapter
+    admits it does not understand. ``absent`` still boots out — nothing needs identifying, and a
+    loaded job whose file is already gone is precisely the state a teardown should clear.
+
+    **A verified stop.** The owned plist is unlinked only after ``launchctl bootout`` **succeeds**,
+    the same single authority the retired-drain migration uses (gateway disposition j#102458).
+    Unlinking does not unregister anything — launchd keys a bootstrapped job off its *label* — so
+    deleting after a failed bootout hides a possibly-live job instead of stopping it, and it used to
+    do so while reporting ``performed: true`` / ``removed: true`` with an empty reason.
+
+    The over-refusal is real and is the deliberate choice: a plist that was never loaded may also
+    fail to boot out, so its uninstall now refuses with :data:`REASON_BOOTOUT_FAILED` and keeps the
+    file. That costs the operator a visible, retryable leftover. The other direction costs an
+    invisible service that no file can stop before logout — the exact state #15192 exists to end. The
+    result carries the retained plist's state so the leftover is never silent.
+
+    A retired ``--drain-only`` registration from before #15192 is torn down under its own identical
+    fence, and its refusal never blocks this one: they are separate artifacts with separate reasons.
     """
     if not _running_on_darwin():
         return _refused("uninstall", REASON_UNSUPPORTED_PLATFORM, label=agent.label)
-    _launchctl(runner, ["bootout", _service_target(agent)])
-    target = plist_path(os_home, agent=agent)
-    existed = target.exists()
-    if existed:
-        target.unlink()
+    own_state = classify_agent_plist(os_home, agent=agent)
+    if own_state not in (PLIST_ABSENT, PLIST_OWNED):
+        # Zero mutation: no bootout, no unlink, no legacy migration. We cannot say whose file this is.
+        return _refused(
+            "uninstall", _PLIST_REFUSAL_REASON[own_state], label=agent.label, plist_state=own_state
+        )
+    booted_out = _launchctl(runner, ["bootout", _service_target(agent)])
+    if own_state == PLIST_ABSENT:
+        # Nothing to identify or unlink. The bootout above is the whole teardown; whether it exits
+        # non-zero says nothing here, since a never-loaded label also does.
+        migration = remove_legacy_drain(os_home=os_home, runner=runner)
+        return _uninstall_result(False, "", agent=agent, migration=migration, plist_state=own_state)
+    if booted_out.returncode != 0:
+        # Keep the plist: it is the operator's only durable trace of a registration that may still be
+        # live. The retired drain is left alone too — this host is not in a state we understand.
+        return _refused(
+            "uninstall", REASON_BOOTOUT_FAILED, label=agent.label, plist_state=own_state
+        )
+    # Identity at ACTION time, one subprocess after the classification above (r12f1's fix, applied to
+    # this verb as well). Narrows the window; `unlink` still targets a path, not the validated inode.
+    at_unlink = classify_agent_plist(os_home, agent=agent)
+    if at_unlink != PLIST_OWNED:
+        if at_unlink == PLIST_ABSENT:
+            migration = remove_legacy_drain(os_home=os_home, runner=runner)
+            return _uninstall_result(
+                False, "", agent=agent, migration=migration, plist_state=at_unlink
+            )
+        return _refused(
+            "uninstall", _PLIST_REFUSAL_REASON[at_unlink], label=agent.label, plist_state=at_unlink
+        )
+    plist_path(os_home, agent=agent).unlink()
     migration = remove_legacy_drain(os_home=os_home, runner=runner)
+    return _uninstall_result(True, "", agent=agent, migration=migration, plist_state=at_unlink)
+
+
+def _uninstall_result(
+    removed: bool, reason: str, *, agent: SupervisorAgent, migration: dict, plist_state: str
+) -> dict:
+    """The uninstall success envelope. ``plist_state`` reports what was found at the owned path."""
     return {
         "action": "uninstall",
         "performed": True,
-        "reason": "",
-        "removed": existed,
+        "reason": reason,
+        "removed": removed,
         "label": agent.label,
+        "plist_state": plist_state,
         "legacy_drain": migration["state"],
         "legacy_drain_removed": migration["removed"],
         "legacy_drain_reason": migration["reason"],
@@ -918,6 +890,9 @@ __all__ = (
     "REASON_LEGACY_DRAIN_REMOVAL_FAILED",
     "REASON_LEGACY_DRAIN_STATE_UNREADABLE",
     "REASON_SERVICE_STATE_UNREADABLE",
+    "REASON_PLIST_FOREIGN_LABEL",
+    "REASON_PLIST_UNREADABLE",
+    "REASON_BOOTOUT_FAILED",
     "PROBE_LOADED",
     "PROBE_CONFIRMED_ABSENT",
     "PROBE_UNREADABLE",
@@ -925,6 +900,10 @@ __all__ = (
     "LEGACY_DRAIN_OWNED",
     "LEGACY_DRAIN_FOREIGN",
     "LEGACY_DRAIN_UNREADABLE",
+    "PLIST_ABSENT",
+    "PLIST_OWNED",
+    "PLIST_FOREIGN",
+    "PLIST_UNREADABLE",
     "NEXT_ELAPSE_UNKNOWN",
     "LAST_RESULT_SUCCESS",
     "LAST_RESULT_EXIT_CODE",
@@ -956,5 +935,6 @@ __all__ = (
     "LEGACY_DRAIN_AGENT",
     "SUPERVISOR_DRAIN_LAUNCHD_LABEL",
     "classify_legacy_drain",
+    "classify_agent_plist",
     "remove_legacy_drain",
 )

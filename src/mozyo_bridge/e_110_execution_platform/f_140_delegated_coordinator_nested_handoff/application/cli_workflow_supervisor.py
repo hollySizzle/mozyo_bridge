@@ -493,6 +493,12 @@ def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
             detail += f" reason={a['reason']}"
         if "removed" in a:
             detail += f" removed={a['removed']}"
+        if a.get("plist_state") and a["plist_state"] not in ("absent", "owned"):
+            # The service definition at our own path is not identifiable as ours, so a mutating verb
+            # refused and left it alone. The operator has to see *which* state, because "someone
+            # else's file is here" and "I cannot parse what is here" need different fixes
+            # (review j#102496 r12f2). Quiet in the ordinary absent / owned cases.
+            detail += f" plist_state={a['plist_state']}"
         if "credential_readiness" in a:
             # Reported, not gated on Linux: an unconfigured Redmine does not block installing the
             # timer, so an operator sees the state without the install being refused (#15183).
