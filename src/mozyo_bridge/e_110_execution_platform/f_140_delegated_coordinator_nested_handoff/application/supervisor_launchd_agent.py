@@ -215,6 +215,28 @@ def render_plist(
     return plistlib.dumps(payload)
 
 
+def matches_rendered_plist(
+    payload: bytes,
+    command: Sequence[str],
+    *,
+    os_home: Optional[Path] = None,
+    agent: SupervisorAgent = SUPERVISOR_AGENT,
+) -> bool:
+    """Whether ``payload`` is exactly the closed plist schema this adapter renders."""
+    try:
+        installed = plistlib.loads(payload)
+    except (plistlib.InvalidFileException, ValueError, TypeError):
+        return False
+    if not isinstance(installed, dict):
+        return False
+    interval = installed.get("StartInterval")
+    return (
+        type(interval) is int
+        and interval >= 1
+        and payload
+        == render_plist(command, interval_seconds=interval, os_home=os_home, agent=agent)
+    )
+
 
 
 def extract_pinned_home(installed_argv: object) -> tuple[Optional[str], str]:
@@ -521,6 +543,7 @@ __all__ = (
     "resolve_mozyo_home",
     "resolve_supervisor_command",
     "render_plist",
+    "matches_rendered_plist",
     "extract_pinned_home",
     "LAUNCHCTL_NOT_FOUND_CODES",
     "not_found_operand",

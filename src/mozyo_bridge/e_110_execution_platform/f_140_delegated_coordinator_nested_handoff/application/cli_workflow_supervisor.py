@@ -479,6 +479,7 @@ def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
         f"action: {result.get('action', verb)}",
         f"backend: {result['backend']}",
         f"performed: {performed}",
+        f"effect_state: {result['effect_state']}",
     ]
     lines += [f"deprecation: {n}" for n in deprecations]
     if result.get("reason"):
@@ -491,6 +492,8 @@ def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
         detail = f"  service {a.get('label', '')}: performed={a.get('performed')}"
         if a.get("reason"):
             detail += f" reason={a['reason']}"
+        if "effect_state" in a:
+            detail += f" effect_state={a['effect_state']}"
         if "removed" in a:
             detail += f" removed={a['removed']}"
         if a.get("plist_state") and a["plist_state"] not in ("absent", "owned"):

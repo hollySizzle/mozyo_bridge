@@ -7,8 +7,8 @@ that are kept **distinct** (review j#79092 R2-F1). These pin the Phase B1 safety
 
 - plist structure: no ``EnvironmentVariables`` key, ``RunAtLoad`` + ``StartInterval``, **no**
   ``KeepAlive``, exact PATH-resolved executable argv with the resolved mozyo home pinned as ``--home``;
-- structured launchctl argv (bootout-then-bootstrap install, kickstart -k restart, exact-file
-  uninstall), idempotent install;
+- structured launchctl argv (verified bootout-then-bootstrap install/restart, exact-file uninstall),
+  idempotent install;
 - fail-closed **zero-mutation** refusals: non-darwin host, missing executable, and the Redmine
   credential matrix — daemon-effective readiness (neither shell key/URL (j#79059 F1) nor a shell
   ``MOZYO_BRIDGE_HOME`` (j#79092 R2-F1) can make it ``ready``);
@@ -348,6 +348,7 @@ class InstallTest(_DarwinCase):
         self.assertNotIn("EnvironmentVariables", payload)
         self.assertEqual(
             [
+                ["launchctl", "print", f"{_GUI_DOMAIN}/{sl.SUPERVISOR_LAUNCHD_LABEL}"],
                 ["launchctl", "bootout", f"{_GUI_DOMAIN}/{sl.SUPERVISOR_LAUNCHD_LABEL}"],
                 ["launchctl", "bootstrap", _GUI_DOMAIN, str(plist_file)],
             ],
@@ -441,12 +442,74 @@ class InstallTest(_DarwinCase):
 
     def test_install_bootstrap_failure_is_reported_without_host_detail(self) -> None:
         _write_home_credential(self.mozyo_home)
-        runner = FakeRunner(default=_result(1, stderr="boom"))
+        def runner(argv):
+            if argv[1] == "print":
+                return _result(
+                    113,
+                    stderr=(
+                        f'Could not find service "{sl.SUPERVISOR_LAUNCHD_LABEL}" '
+                        "in domain for gui"
+                    ),
+                )
+            return _result(1, stderr="boom") if argv[1] == "bootstrap" else _result()
         result = sl.install(os_home=self.os_home, mozyo_home=self.mozyo_home,
                             runner=runner, which=_which_found)
         self.assertFalse(result["performed"])
         self.assertEqual(sl.REASON_BOOTSTRAP_FAILED, result["reason"])
         self.assertNotIn("boom", str(result))
+
+    def test_unreadable_manager_state_refuses_before_writing_the_plist(self) -> None:
+        runner = FakeRunner(print_result=_result(1, stderr="Operation not permitted"))
+        result = sl.install(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            runner=runner, which=_which_found,
+        )
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_SERVICE_STATE_UNREADABLE, result["reason"])
+        self.assertEqual(sl.EFFECT_NONE, result["effect_state"])
+        self.assertFalse(sl.plist_path(self.os_home).exists())
+        self.assertEqual(["print"], runner.verbs)
+
+    def test_bootout_failure_preserves_the_existing_plist(self) -> None:
+        target = _pinned_plist(self.os_home, _resolved(self.mozyo_home))
+        before = target.read_bytes()
+
+        def runner(argv):
+            if argv[1] == "print":
+                return _result(0, stdout="state = running\n\tpid = 42\n")
+            return _result(1) if argv[1] == "bootout" else _result()
+
+        result = sl.install(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            interval_seconds=91, runner=runner, which=_which_found,
+        )
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_BOOTOUT_FAILED, result["reason"])
+        self.assertEqual(sl.EFFECT_UNCERTAIN, result["effect_state"])
+        self.assertEqual(before, target.read_bytes())
+
+    def test_loaded_job_is_booted_out_before_the_first_plist_write(self) -> None:
+        stopped = {"value": False}
+
+        def runner(argv):
+            if argv[1] == "print":
+                return _result(0, stdout="state = running\n\tpid = 42\n")
+            if argv[1] == "bootout":
+                stopped["value"] = True
+            return _result()
+
+        real_write = sl.write_owned
+
+        def guarded_write(*args, **kwargs):
+            self.assertTrue(stopped["value"], "loaded job survived until plist replacement")
+            return real_write(*args, **kwargs)
+
+        with patch.object(sl, "write_owned", guarded_write):
+            result = sl.install(
+                os_home=self.os_home, mozyo_home=self.mozyo_home,
+                runner=runner, which=_which_found,
+            )
+        self.assertTrue(result["performed"], result)
 
     def test_install_refuses_command_drift_during_bootout_before_bootstrap(self) -> None:
         target = sl.plist_path(self.os_home)
@@ -488,15 +551,40 @@ class RestartTest(_DarwinCase):
         sl.install(os_home=self.os_home, mozyo_home=self.mozyo_home, runner=FakeRunner(),
                    which=_which_found)
 
-    def test_restart_kickstarts_loaded_service_using_the_installed_pin(self) -> None:
+    def test_restart_verified_reloads_using_the_installed_pin(self) -> None:
         self._install_ready()
         runner = FakeRunner(print_result=_result(0, stdout="state = running\n\tpid = 4242\n"))
         result = sl.restart(os_home=self.os_home, runner=runner, which=_which_found)
         self.assertTrue(result["performed"])
         self.assertEqual(
-            ["launchctl", "kickstart", "-k", f"{_GUI_DOMAIN}/{sl.SUPERVISOR_LAUNCHD_LABEL}"],
+            ["launchctl", "bootstrap", _GUI_DOMAIN, str(sl.plist_path(self.os_home))],
             runner.calls[-1],
         )
+        self.assertEqual(["print", "bootout", "bootstrap"], runner.verbs)
+
+    def test_restart_refuses_noncanonical_keepalive_or_environment_plist(self) -> None:
+        for key, value in (
+            ("KeepAlive", True),
+            ("EnvironmentVariables", {"UNAPPROVED": "value"}),
+        ):
+            with self.subTest(key=key):
+                self._install_ready()
+                target = sl.plist_path(self.os_home)
+                payload = plistlib.loads(target.read_bytes())
+                payload[key] = value
+                target.write_bytes(plistlib.dumps(payload))
+                runner = FakeRunner(
+                    print_result=_result(0, stdout="state = running\n\tpid = 4242\n")
+                )
+
+                result = sl.restart(
+                    os_home=self.os_home, runner=runner, which=_which_found
+                )
+
+                self.assertFalse(result["performed"])
+                self.assertEqual(sl.REASON_INSTALLED_COMMAND_DRIFT, result["reason"])
+                self.assertEqual(sl.EFFECT_NONE, result["effect_state"])
+                self.assertEqual([], runner.calls)
 
     def test_restart_refuses_command_drift_during_print_before_kickstart(self) -> None:
         self._install_ready()
@@ -578,7 +666,7 @@ class RestartTest(_DarwinCase):
             result = sl.restart(os_home=self.os_home, runner=runner, which=_which_found)
         self.assertTrue(result["performed"], result)
         self.assertEqual(sl.CREDENTIAL_MISSING, result["credential_readiness"])
-        self.assertIn("kickstart", runner.verbs)
+        self.assertEqual(["print", "bootout", "bootstrap"], runner.verbs)
 
     def test_restart_refuses_on_requested_home_that_differs_from_pin(self) -> None:
         # R3-F1: a --home that disagrees with the installed pin is a re-point attempt -> fail-closed.
@@ -1078,6 +1166,25 @@ class LegacyDrainMigrationTest(_DarwinCase):
         self.assertFalse(result["performed"])
         self.assertEqual(result["reason"], sl.REASON_BOOTSTRAP_FAILED)
         self.assertFalse(legacy.exists())
+
+    def test_manager_unreadable_after_legacy_retirement_is_partial_without_current_write(self) -> None:
+        legacy = _legacy_drain_plist(self.os_home)
+
+        def runner(argv):
+            target = argv[2] if len(argv) > 2 else ""
+            if argv[1] == "bootout" and sl.LEGACY_DRAIN_AGENT.label in target:
+                return _result()
+            return _result(1, stderr="Operation not permitted")
+
+        result = sl.install(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            runner=runner, which=_which_found,
+        )
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_SERVICE_STATE_UNREADABLE, result["reason"])
+        self.assertEqual(sl.EFFECT_PARTIAL, result["effect_state"])
+        self.assertFalse(legacy.exists())
+        self.assertFalse(sl.plist_path(self.os_home).exists())
 
     def test_uninstall_removes_the_owned_agent_and_the_legacy_one(self) -> None:
         _write_home_credential(self.mozyo_home)
@@ -2168,9 +2275,15 @@ class RestartEnforcesOwnedIdentityTest(_DarwinCase):
     def _plist_with(self, label: str) -> Path:
         target = sl.plist_path(self.os_home)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(
-            plistlib.dumps({"Label": label, "ProgramArguments": self._expected_argv()})
+        payload = plistlib.loads(
+            sl.render_plist(
+                self._expected_argv(),
+                interval_seconds=sl.DEFAULT_OS_TICK_INTERVAL_SECONDS,
+                os_home=self.os_home,
+            )
         )
+        payload["Label"] = label
+        target.write_bytes(plistlib.dumps(payload))
         return target
 
     def test_a_foreign_plist_with_our_exact_argv_is_refused_before_any_launchctl(self) -> None:
@@ -2225,7 +2338,7 @@ class RestartEnforcesOwnedIdentityTest(_DarwinCase):
             os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found
         )
         self.assertTrue(result["performed"], result.get("reason"))
-        self.assertEqual(["print", "kickstart"], runner.verbs)
+        self.assertEqual(["print", "bootout", "bootstrap"], runner.verbs)
 
 
 class ThePathIsNotFollowedTest(_DarwinCase):
@@ -2410,7 +2523,11 @@ class NoAncestorEscapesTheOwnedPathTest(_DarwinCase):
         # it. The retired drain's comes first, and either token is an accurate account of the same
         # fact: nothing under this path can be identified.
         self.assertIn(
-            result["reason"], (sl.REASON_LEGACY_DRAIN_UNREADABLE, sl.REASON_PLIST_UNREADABLE)
+            result["reason"], (
+                sl.REASON_LEGACY_DRAIN_UNREADABLE,
+                sl.REASON_PLIST_UNREADABLE,
+                sl.REASON_LIFECYCLE_LOCK_UNREADABLE,
+            )
         )
         self.assertEqual([], list(self.outside.iterdir()))
 
@@ -2442,7 +2559,7 @@ class NoAncestorEscapesTheOwnedPathTest(_DarwinCase):
             with self.subTest(verb=verb):
                 result = call()
                 self.assertFalse(result["performed"])
-                self.assertEqual(sl.REASON_PLIST_UNREADABLE, result["reason"])
+                self.assertEqual(sl.REASON_LIFECYCLE_LOCK_UNREADABLE, result["reason"])
                 self.assertTrue(planted.exists())
 
     def test_the_retired_migration_refuses_beyond_a_symlinked_ancestor_too(self) -> None:

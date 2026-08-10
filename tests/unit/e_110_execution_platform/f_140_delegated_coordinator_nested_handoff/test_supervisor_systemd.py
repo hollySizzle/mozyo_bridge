@@ -47,6 +47,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     supervisor_service_backend as sb,
     supervisor_systemd as ss,
     supervisor_systemd_fs as systemd_fs,
+    supervisor_systemd_manager as systemd_manager,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
     DEFAULT_OS_TICK_INTERVAL_SECONDS,
@@ -91,15 +92,22 @@ class FakeRunner:
     non-zero result for a given systemctl verb. Everything else succeeds.
     """
 
-    def __init__(self, *, show_map=None, fail_verbs=(), manager_available=True) -> None:
+    def __init__(
+        self, *, os_home=None, show_map=None, fail_verbs=(), manager_available=True,
+        manager_overrides=None,
+    ) -> None:
         self.calls: list[list[str]] = []
+        self._os_home = os_home
         self._show_map = show_map or {}
         self._fail_verbs = set(fail_verbs)
         self._manager_available = manager_available
+        self._manager_overrides = manager_overrides or {}
 
     def __call__(self, argv):
         argv = list(argv)
         self.calls.append(argv)
+        if argv and argv[0] == "busctl":
+            return self._busctl(argv)
         verb = argv[2] if len(argv) > 2 else ""  # argv is ["systemctl", "--user", <verb>, ...]
         if verb == "show":
             if any(a.startswith("--property=Version") for a in argv):
@@ -109,9 +117,70 @@ class FakeRunner:
             return _result(1, stderr="redacted")
         return _result(0)
 
+    @staticmethod
+    def _json(signature, data):
+        return _result(0, json.dumps({"type": signature, "data": data}))
+
+    def _busctl(self, argv):
+        if not self._manager_available:
+            return _result(1)
+        operation = argv[3] if len(argv) > 3 else ""
+        if operation == "call":
+            unit = argv[-1]
+            escaped = unit.replace("-", "_2d").replace(".", "_2e")
+            return self._json("o", [f"/org/freedesktop/systemd1/unit/{escaped}"])
+        prop = argv[-1]
+        if prop in self._manager_overrides:
+            signature, data = self._manager_overrides[prop]
+            return self._json(signature, data)
+        if prop == "Version":
+            return self._json("s", "test-systemd")
+        units = ss._read_units(self._os_home)
+        service_argv = ss._installed_command(ss._parse_unit_keys(units.service_payload)) or []
+        interval = ss._installed_interval_seconds(ss._parse_unit_keys(units.timer_payload)) or 0
+        service_path = os.path.abspath(os.fspath(ss.service_unit_path(self._os_home)))
+        timer_path = os.path.abspath(os.fspath(ss.timer_unit_path(self._os_home)))
+        empty_exec = (systemd_manager._EXEC_SIGNATURE, [])
+        properties = {
+            "FragmentPath": (
+                "s", service_path if "service" in argv[5] else timer_path
+            ),
+            "DropInPaths": ("as", []),
+            "NeedDaemonReload": ("b", False),
+            "Type": ("s", "oneshot"),
+            "RemainAfterExit": ("b", False),
+            "Restart": ("s", "no"),
+            "Environment": ("as", []),
+            "EnvironmentFiles": ("a(sb)", []),
+            "PassEnvironment": ("as", []),
+            "UnsetEnvironment": ("as", []),
+            "ExecStart": (
+                systemd_manager._EXEC_SIGNATURE,
+                [[service_argv[0], service_argv, False, *([0] * 7)]] if service_argv else [],
+            ),
+            "ExecCondition": empty_exec,
+            "ExecStartPre": empty_exec,
+            "ExecStartPost": empty_exec,
+            "ExecReload": empty_exec,
+            "ExecReloadPost": empty_exec,
+            "ExecStop": empty_exec,
+            "ExecStopPost": empty_exec,
+            "Unit": ("s", ss.SERVICE_UNIT_NAME),
+            "TimersMonotonic": (
+                "a(stt)",
+                [["OnActiveUSec", 0, 0], ["OnUnitActiveUSec", interval * 1_000_000, 0]],
+            ),
+            "TimersCalendar": ("a(sst)", []),
+            "Persistent": ("b", False),
+            "RandomizedDelayUSec": ("t", 0),
+            "OnClockChange": ("b", False),
+            "OnTimezoneChange": ("b", False),
+        }
+        return self._json(*properties[prop]) if prop in properties else _result(1)
+
     @property
     def verbs(self) -> list[str]:
-        return [c[2] for c in self.calls if len(c) > 2]
+        return [c[2] for c in self.calls if len(c) > 2 and c[0] == "systemctl"]
 
 
 def _timer_show(
@@ -175,11 +244,12 @@ class _LinuxCase(unittest.TestCase):
 
     def _runner(self, **kwargs) -> FakeRunner:
         """A runner whose owned timer reports active+enabled (the installed-and-scheduled case)."""
+        os_home = kwargs.pop("os_home", self.os_home)
         show_map = kwargs.pop("show_map", None) or {
             ss.SUPERVISOR_UNIT.timer_unit: _timer_show(),
             ss.SUPERVISOR_UNIT.service_unit: _service_show(),
         }
-        return FakeRunner(show_map=show_map, **kwargs)
+        return FakeRunner(os_home=os_home, show_map=show_map, **kwargs)
 
     def _install(self, *, runner=None, interval=None, credential=True) -> dict:
         if credential:
@@ -227,7 +297,10 @@ class SingleOwnedUnitTest(_LinuxCase):
 
     def test_installing_writes_exactly_two_files(self) -> None:
         self._install()
-        written = sorted(p.name for p in ss.unit_dir(self.os_home).iterdir())
+        written = sorted(
+            p.name for p in ss.unit_dir(self.os_home).iterdir()
+            if p.name.endswith((".service", ".timer"))
+        )
         self.assertEqual(written, sorted([ss.SERVICE_UNIT_NAME, ss.TIMER_UNIT_NAME]))
 
     def test_the_scheduled_command_is_run_once(self) -> None:
@@ -468,7 +541,8 @@ class UnitDirectoryTest(_LinuxCase):
         with patch.dict(os.environ, {"XDG_CONFIG_HOME": f" {ignored}"}, clear=False), \
                 patch.object(Path, "home", return_value=fallback_home):
             result = ss.install(
-                mozyo_home=self.mozyo_home, runner=self._runner(), which=_which_found
+                mozyo_home=self.mozyo_home, runner=self._runner(os_home=fallback_home),
+                which=_which_found
             )
             self.assertTrue(result["performed"], result)
             self.assertFalse(
@@ -507,7 +581,7 @@ class PinnedUnitFilesystemTest(_LinuxCase):
             )
 
             self.assertFalse(result["performed"])
-            self.assertEqual(ss.REASON_UNIT_UNREADABLE, result["reason"])
+            self.assertEqual(ss.REASON_LIFECYCLE_LOCK_UNREADABLE, result["reason"])
             self._assert_no_manager_mutation(runner)
             self.assertEqual([], list(outside.iterdir()))
 
@@ -563,11 +637,16 @@ class PinnedUnitFilesystemTest(_LinuxCase):
             real_write_units = ss._write_units
 
             def swap_then_write(service_payload, timer_payload, os_home):
-                ss.unit_dir(self.os_home).mkdir(parents=True)
+                ss.unit_dir(self.os_home).mkdir(parents=True, exist_ok=True)
                 ss.service_unit_path(self.os_home).symlink_to(victim)
                 return real_write_units(service_payload, timer_payload, os_home)
 
-            runner = self._runner()
+            runner = self._runner(
+                show_map={
+                    ss.TIMER_UNIT_NAME: _timer_show(active="inactive"),
+                    ss.SERVICE_UNIT_NAME: _service_show(),
+                }
+            )
             with patch.object(ss, "_write_units", swap_then_write):
                 result = ss.install(
                     os_home=self.os_home, mozyo_home=self.mozyo_home,
@@ -779,10 +858,12 @@ class InstallSuccessTest(_LinuxCase):
         self.assertTrue(result["performed"], result)
         self.assertEqual(result["scheduled_interval_seconds"], DEFAULT_OS_TICK_INTERVAL_SECONDS)
         self.assertEqual(
-            [c for c in runner.calls if c[2] != "show"],
+            [c for c in runner.calls if c[0] == "systemctl" and c[2] != "show"],
             [
+                ["systemctl", "--user", "stop", ss.TIMER_UNIT_NAME],
+                ["systemctl", "--user", "enable", "--no-reload", ss.TIMER_UNIT_NAME],
                 ["systemctl", "--user", "daemon-reload"],
-                ["systemctl", "--user", "enable", "--now", ss.TIMER_UNIT_NAME],
+                ["systemctl", "--user", "start", ss.TIMER_UNIT_NAME],
             ],
         )
 
@@ -791,6 +872,65 @@ class InstallSuccessTest(_LinuxCase):
         first = ss.service_unit_path(self.os_home).read_text(encoding="utf-8")
         self._install()
         self.assertEqual(ss.service_unit_path(self.os_home).read_text(encoding="utf-8"), first)
+
+    def test_confirmed_inactive_timer_is_not_stopped_before_install(self) -> None:
+        runner = self._runner(
+            show_map={
+                ss.TIMER_UNIT_NAME: _timer_show(active="inactive"),
+                ss.SERVICE_UNIT_NAME: _service_show(),
+            }
+        )
+        result = self._install(runner=runner)
+        self.assertTrue(result["performed"], result)
+        self.assertNotIn("stop", runner.verbs)
+
+    def test_unreadable_timer_state_refuses_before_unit_write_or_manager_effect(self) -> None:
+        runner = self._runner(
+            show_map={ss.TIMER_UNIT_NAME: "", ss.SERVICE_UNIT_NAME: _service_show()}
+        )
+        result = self._install(runner=runner)
+        self.assertFalse(result["performed"])
+        self.assertEqual(ss.REASON_SERVICE_STATE_UNREADABLE, result["reason"])
+        self.assertEqual(ss.EFFECT_NONE, result["effect_state"])
+        self.assertFalse(ss.service_unit_path(self.os_home).exists())
+        self.assertEqual([], [v for v in runner.verbs if v != "show"])
+
+    def test_active_timer_is_stopped_before_the_first_unit_write(self) -> None:
+        runner = self._runner()
+        active = {"value": True}
+        original_runner = runner.__call__
+
+        def ordered_runner(argv):
+            result = original_runner(argv)
+            if list(argv)[0] == "systemctl" and list(argv)[2] == "stop":
+                active["value"] = False
+            return result
+
+        real_write = ss._write_units
+
+        def guarded_write(*args):
+            self.assertFalse(active["value"], "active timer survived until unit replacement")
+            return real_write(*args)
+
+        with patch.object(ss, "_write_units", guarded_write):
+            result = self._install(runner=ordered_runner)
+        self.assertTrue(result["performed"], result)
+
+    def test_stop_failure_preserves_old_units_and_reports_uncertain_effect(self) -> None:
+        self._install()
+        service_before = ss.service_unit_path(self.os_home).read_bytes()
+        timer_before = ss.timer_unit_path(self.os_home).read_bytes()
+        runner = self._runner(fail_verbs=("stop",))
+        result = ss.install(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            interval_seconds=91, runner=runner, which=_which_found,
+        )
+        self.assertFalse(result["performed"])
+        self.assertEqual(ss.REASON_STOP_FAILED, result["reason"])
+        self.assertEqual(ss.EFFECT_UNCERTAIN, result["effect_state"])
+        self.assertEqual(service_before, ss.service_unit_path(self.os_home).read_bytes())
+        self.assertEqual(timer_before, ss.timer_unit_path(self.os_home).read_bytes())
+        self.assertNotIn("enable", runner.verbs)
 
     def test_the_installed_unit_pins_the_absolute_canonical_mozyo_home(self) -> None:
         self._install()
@@ -818,17 +958,20 @@ class InstallSuccessTest(_LinuxCase):
         result = self._install(runner=runner)
         self.assertFalse(result["performed"])
         self.assertEqual(result["reason"], ss.REASON_DAEMON_RELOAD_FAILED)
-        self.assertNotIn("enable", runner.verbs)
+        self.assertNotIn("start", runner.verbs)
 
     def test_install_refuses_command_drift_during_reload_before_enable(self) -> None:
         calls = []
+        manager = self._runner()
 
         def runner(argv):
             argv = list(argv)
             calls.append(argv)
+            if argv[0] == "busctl":
+                return manager(argv)
             verb = argv[2]
             if verb == "show":
-                return _result()
+                return _result(0, "ActiveState=inactive\n")
             if verb == "daemon-reload":
                 ss.service_unit_path(self.os_home).write_text(
                     ss.render_service_unit(
@@ -849,13 +992,41 @@ class InstallSuccessTest(_LinuxCase):
 
         self.assertFalse(result["performed"])
         self.assertEqual(result["reason"], ss.REASON_INSTALLED_COMMAND_DRIFT)
-        self.assertNotIn("enable", [call[2] for call in calls])
+        self.assertNotIn("start", [call[2] for call in calls if call[0] == "systemctl"])
 
     def test_a_failed_enable_reports_a_redacted_token(self) -> None:
         runner = self._runner(fail_verbs=("enable",))
         result = self._install(runner=runner)
         self.assertFalse(result["performed"])
         self.assertEqual(result["reason"], ss.REASON_ENABLE_FAILED)
+        self.assertEqual(ss.EFFECT_PARTIAL, result["effect_state"])
+
+    def test_manager_effective_hook_drift_blocks_start_after_reload(self) -> None:
+        hook = [["/tmp/hook", ["/tmp/hook"], False, *([0] * 7)]]
+        runner = self._runner(
+            manager_overrides={"ExecStop": (systemd_manager._EXEC_SIGNATURE, hook)}
+        )
+        result = self._install(runner=runner)
+        self.assertFalse(result["performed"])
+        self.assertEqual(ss.REASON_MANAGER_DEFINITION_DRIFT, result["reason"])
+        self.assertEqual(ss.EFFECT_PARTIAL, result["effect_state"])
+        self.assertNotIn("start", runner.verbs)
+
+    def test_untyped_manager_capability_refuses_before_files_or_effects(self) -> None:
+        runner = self._runner(manager_overrides={"Version": ("as", ["test-systemd"])})
+        result = self._install(runner=runner)
+        self.assertFalse(result["performed"])
+        self.assertEqual(ss.REASON_MANAGER_DEFINITION_UNREADABLE, result["reason"])
+        self.assertEqual(ss.EFFECT_NONE, result["effect_state"])
+        self.assertFalse(ss.unit_dir(self.os_home).exists())
+        self.assertEqual([], [v for v in runner.verbs if v != "show"])
+
+    def test_start_failure_is_uncertain_not_zero_effect(self) -> None:
+        runner = self._runner(fail_verbs=("start",))
+        result = self._install(runner=runner)
+        self.assertFalse(result["performed"])
+        self.assertEqual(ss.REASON_START_FAILED, result["reason"])
+        self.assertEqual(ss.EFFECT_UNCERTAIN, result["effect_state"])
 
 
 # ---------------------------------------------------------------------------
@@ -873,13 +1044,68 @@ class RestartTest(_LinuxCase):
         self.assertTrue(result["performed"], result)
         self.assertIn(["systemctl", "--user", "restart", ss.SERVICE_UNIT_NAME], runner.calls)
 
+    def test_manager_effective_argv_drift_blocks_restart(self) -> None:
+        self._install()
+        drifted = [
+            "/tmp/unapproved", "workflow", "supervisor", "--run-once", "--home",
+            str(self.mozyo_home.resolve()),
+        ]
+        loaded = [[drifted[0], drifted, False, *([0] * 7)]]
+        runner = self._runner(
+            manager_overrides={"ExecStart": (systemd_manager._EXEC_SIGNATURE, loaded)}
+        )
+        result = ss.restart(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            runner=runner, which=_which_found,
+        )
+        self.assertFalse(result["performed"])
+        self.assertEqual(ss.REASON_MANAGER_DEFINITION_DRIFT, result["reason"])
+        self.assertEqual(ss.EFFECT_NONE, result["effect_state"])
+        self.assertNotIn("restart", runner.verbs)
+
+    def test_disk_environment_drift_blocks_restart_before_manager_effect(self) -> None:
+        self._install()
+        target = ss.service_unit_path(self.os_home)
+        target.write_text(
+            target.read_text(encoding="utf-8") + "Environment=FOO=bar\n",
+            encoding="utf-8",
+        )
+        runner = self._runner()
+
+        result = ss.restart(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            runner=runner, which=_which_found,
+        )
+
+        self.assertFalse(result["performed"])
+        self.assertEqual(ss.REASON_INSTALLED_COMMAND_DRIFT, result["reason"])
+        self.assertEqual(ss.EFFECT_NONE, result["effect_state"])
+        self.assertNotIn("restart", runner.verbs)
+
+    def test_manager_effective_environment_drift_blocks_restart(self) -> None:
+        self._install()
+        runner = self._runner(manager_overrides={"Environment": ("as", ["FOO=bar"])})
+
+        result = ss.restart(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            runner=runner, which=_which_found,
+        )
+
+        self.assertFalse(result["performed"])
+        self.assertEqual(ss.REASON_MANAGER_DEFINITION_DRIFT, result["reason"])
+        self.assertEqual(ss.EFFECT_NONE, result["effect_state"])
+        self.assertNotIn("restart", runner.verbs)
+
     def test_restart_refuses_command_drift_during_show_before_restart(self) -> None:
         self._install()
         calls = []
+        manager = self._runner()
 
         def runner(argv):
             argv = list(argv)
             calls.append(argv)
+            if argv[0] == "busctl":
+                return manager(argv)
             verb = argv[2]
             if verb == "show" and any(a.startswith("--property=Version") for a in argv):
                 return _result()
@@ -909,7 +1135,7 @@ class RestartTest(_LinuxCase):
 
         self.assertFalse(result["performed"])
         self.assertEqual(result["reason"], ss.REASON_INSTALLED_COMMAND_DRIFT)
-        self.assertNotIn("restart", [call[2] for call in calls])
+        self.assertNotIn("restart", [call[2] for call in calls if call[0] == "systemctl"])
 
     def test_restart_works_without_a_configured_credential(self) -> None:
         # Same reason install does: a non-ready Redmine must not stop local-safe work.
@@ -1114,6 +1340,70 @@ class UninstallTest(_LinuxCase):
         verbs = [c[2] for c in runner.calls if c[2] != "show"]
         self.assertLess(verbs.index("daemon-reload"), verbs.index("reset-failed"))
 
+    def test_disable_failure_keeps_units_and_stops_the_sequence(self) -> None:
+        self._install()
+        runner = self._runner(fail_verbs=("disable",))
+
+        result = ss.uninstall(os_home=self.os_home, runner=runner)
+
+        self.assertFalse(result["performed"])
+        self.assertEqual(ss.REASON_DISABLE_FAILED, result["reason"])
+        self.assertEqual(ss.EFFECT_UNCERTAIN, result["effect_state"])
+        self.assertFalse(result["removed"])
+        self.assertTrue(ss.service_unit_path(self.os_home).exists())
+        self.assertTrue(ss.timer_unit_path(self.os_home).exists())
+        self.assertEqual(["disable"], [verb for verb in runner.verbs if verb != "show"])
+
+    def test_service_stop_failure_keeps_units_and_stops_the_sequence(self) -> None:
+        self._install()
+        runner = self._runner(fail_verbs=("stop",))
+
+        result = ss.uninstall(os_home=self.os_home, runner=runner)
+
+        self.assertFalse(result["performed"])
+        self.assertEqual(ss.REASON_STOP_FAILED, result["reason"])
+        self.assertEqual(ss.EFFECT_UNCERTAIN, result["effect_state"])
+        self.assertFalse(result["removed"])
+        self.assertTrue(ss.service_unit_path(self.os_home).exists())
+        self.assertTrue(ss.timer_unit_path(self.os_home).exists())
+        self.assertEqual(
+            ["disable", "stop"], [verb for verb in runner.verbs if verb != "show"]
+        )
+
+    def test_daemon_reload_failure_reports_removed_units_as_partial(self) -> None:
+        self._install()
+        runner = self._runner(fail_verbs=("daemon-reload",))
+
+        result = ss.uninstall(os_home=self.os_home, runner=runner)
+
+        self.assertFalse(result["performed"])
+        self.assertEqual(ss.REASON_DAEMON_RELOAD_FAILED, result["reason"])
+        self.assertEqual(ss.EFFECT_PARTIAL, result["effect_state"])
+        self.assertTrue(result["removed"])
+        self.assertFalse(ss.service_unit_path(self.os_home).exists())
+        self.assertFalse(ss.timer_unit_path(self.os_home).exists())
+        self.assertEqual(
+            ["disable", "stop", "daemon-reload"],
+            [verb for verb in runner.verbs if verb != "show"],
+        )
+
+    def test_reset_failure_reports_removed_units_as_partial(self) -> None:
+        self._install()
+        runner = self._runner(fail_verbs=("reset-failed",))
+
+        result = ss.uninstall(os_home=self.os_home, runner=runner)
+
+        self.assertFalse(result["performed"])
+        self.assertEqual(ss.REASON_RESET_FAILED, result["reason"])
+        self.assertEqual(ss.EFFECT_PARTIAL, result["effect_state"])
+        self.assertTrue(result["removed"])
+        self.assertFalse(ss.service_unit_path(self.os_home).exists())
+        self.assertFalse(ss.timer_unit_path(self.os_home).exists())
+        self.assertEqual(
+            ["disable", "stop", "daemon-reload", "reset-failed"],
+            [verb for verb in runner.verbs if verb != "show"],
+        )
+
     def test_uninstall_works_with_no_credential_at_all(self) -> None:
         result = ss.uninstall(os_home=self.os_home, runner=self._runner())
         self.assertTrue(result["performed"])
@@ -1182,7 +1472,7 @@ class ShowDuplicatePropertyTest(_LinuxCase):
                 ss.SERVICE_UNIT_NAME: _service_show(),
             }
         )
-        self._install(runner=runner)
+        self._install()
         runner.calls.clear()
         result = ss.restart(
             os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found

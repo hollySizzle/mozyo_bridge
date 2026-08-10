@@ -27,6 +27,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     UNIT_DIR_RELATIVE,
     SUPERVISOR_UNIT,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_scheduler_lifecycle_lock import (  # noqa: E501
+    SchedulerLifecycleLock,
+)
 
 UNIT_ABSENT = "absent"
 UNIT_OWNED = "owned"
@@ -232,6 +235,15 @@ def unlink_units(os_home: Optional[Path] = None) -> bool:
         os.close(dir_fd)
 
 
+def acquire_lifecycle_lock(os_home: Optional[Path] = None) -> SchedulerLifecycleLock:
+    """Serialize cooperating mutating verbs in the pinned user-unit directory."""
+    dir_fd = open_unit_dir(os_home, create=True)
+    try:
+        return SchedulerLifecycleLock.acquire(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 def _create_staging(dir_fd: int, target_name: str) -> tuple[str, int]:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
@@ -290,4 +302,5 @@ __all__ = (
     "read_units",
     "write_units",
     "unlink_units",
+    "acquire_lifecycle_lock",
 )

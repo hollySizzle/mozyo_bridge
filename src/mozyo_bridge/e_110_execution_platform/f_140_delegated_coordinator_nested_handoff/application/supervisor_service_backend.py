@@ -16,9 +16,9 @@ forced onto a common scheduler (no cron). Retiring the second macOS agent is wha
 branching below disappear: both adapters now expose the same four verbs with the same signatures, so
 this module resolves *which* adapter and normalizes the envelope, and nothing else.
 
-The envelope every verb returns is ``{action, performed, reason, backend, agents: [...]}`` where
-``agents`` is the per-owned-service rows the host adapter produced — one row on each supported host.
-The CLI renders it without branching on platform.
+The envelope every verb returns is ``{action, performed, reason, backend, effect_state,
+agents: [...]}`` where ``agents`` is the per-owned-service rows the host adapter produced — one row
+on each supported host. The CLI renders it without branching on platform.
 
 A host with neither adapter is a typed zero-mutation refusal, never a silent no-op.
 """
@@ -37,6 +37,14 @@ BACKEND_UNSUPPORTED = "unsupported"
 
 #: A verb was refused because this host has no supervisor scheduler adapter at all.
 REASON_NO_BACKEND = "service_backend_unsupported_platform"
+
+#: Closed, cross-backend mutation-effect vocabulary. ``performed`` means the requested operation
+#: completed; it cannot by itself distinguish a pre-effect refusal from an interrupted mutation.
+EFFECT_NONE = "none"
+EFFECT_PARTIAL = "partial"
+EFFECT_UNCERTAIN = "uncertain"
+EFFECT_COMPLETE = "complete"
+_MUTATING_ACTIONS = frozenset(("install", "restart", "uninstall"))
 
 
 def resolve_backend_name(platform: Optional[str] = None) -> str:
@@ -83,6 +91,7 @@ def unsupported_result(action: str) -> dict:
         "action": action,
         "performed": False,
         "reason": REASON_NO_BACKEND,
+        "effect_state": EFFECT_NONE,
         "backend": BACKEND_UNSUPPORTED,
         "agents": [],
     }
@@ -101,6 +110,10 @@ def _envelope(action: str, backend: str, result: dict) -> dict:
     """Normalize an adapter result into the common ``agents``-list envelope."""
     payload = dict(result)
     payload.setdefault("action", action)
+    if action in _MUTATING_ACTIONS:
+        payload.setdefault(
+            "effect_state", EFFECT_COMPLETE if payload.get("performed") else EFFECT_NONE
+        )
     payload["backend"] = backend
     if "agents" not in payload:
         # Each adapter owns one service and returns one flat row; present it as a one-element roster
@@ -164,6 +177,10 @@ __all__ = (
     "BACKEND_SYSTEMD",
     "BACKEND_UNSUPPORTED",
     "REASON_NO_BACKEND",
+    "EFFECT_NONE",
+    "EFFECT_PARTIAL",
+    "EFFECT_UNCERTAIN",
+    "EFFECT_COMPLETE",
     "resolve_backend_name",
     "resolve_backend",
     "unsupported_result",

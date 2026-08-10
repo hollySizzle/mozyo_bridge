@@ -500,8 +500,10 @@ host realization は operator 契約（`status` / `install` / `restart` / `unins
 （共通 portable default）、verb の意味、status が答える観測値——も共通である。共通化しないのは **内部実装**で
 あり、launchd と systemd を互いの模倣にせず、cron 等へ無理に統一しない。どちらを使うかは
 `supervisor_service_backend` が platform で解決し（darwin -> LaunchAgent、Linux -> systemd user、それ以外 ->
-typed zero-mutation refusal）、結果 envelope を `{action, performed, reason, backend, agents: [...]}` に正規化
-する。両 adapter が同名・同 signature の 4 verb を公開するため、backend に platform 別の呼び分けは残らない。
+typed zero-mutation refusal）、結果 envelope を
+`{action, performed, reason, backend, effect_state, agents: [...]}` に正規化する。`effect_state` は後述の共通
+4 値であり、`performed=false` だけでは区別できない「manager effect 前の拒否」と「作用途中の失敗」を区別する。
+両 adapter が同名・同 signature の 4 verb を公開するため、backend に platform 別の呼び分けは残らない。
 
 **macOS LaunchAgent** の realization（`supervisor_launchd`）は **owned agent 1 個**である。#14150 で導入した
 `--drain-only` の第二 agent（`callback-supervisor.drain`）は #15192 で退役した: `--run-once` tick は drain leg
@@ -517,6 +519,26 @@ plist text の組立と parse だけを持ち、owned path の read/write は `s
 `supervisor_launchd_process` だけが持つ。`supervisor_launchd_probe` は process seam を使って非破壊な
 `launchctl print` を読むが、その分類は mutation authority にならない。lifecycle の許可判断は
 `supervisor_launchd`、退役 agent の移行判断は `supervisor_launchd_migration` に残す。
+
+**mutating lifecycle は cooperating bridge writer 間で 1 本に直列化する**（#15192 j#103093）。launchd は pinned
+`LaunchAgents` directory、systemd は pinned user-unit directory に、current uid 所有・mode `0600`・regular・
+single-link の lifecycle lock file を置き、`install` / `restart` / `uninstall` の filesystem 変更から manager
+unload/reload/attestation/start までを同じ nonblocking exclusive `flock` の内側で行う。既存 entry が symlink / hard
+link / 異なる owner / 異なる mode、または別の cooperating writer が保持中なら、それぞれ typed zero-effect refusal
+（`scheduler_lifecycle_lock_unreadable` / `scheduler_lifecycle_busy`）とする。lock file は通常 artifact として残し、
+unlink / replace しない。
+
+これは **security boundary ではなく cooperative protocol** である。同一 uid の別 process は lock を無視して plist /
+unit を直接変更し、lock 名を unlink し、manager を直接操作できる。そのような **noncooperative same-user writer は保証
+外**であり、stable な drift は fresh read / manager attestation で検出できても、swap-consume-restore を完全には防げ
+ない。これを防ぐには privilege または uid の分離が必要であり、本 user-owned adapter の契約には含めない。
+
+**mutating result は作用段階を closed 4 値で返す。** `none` は scheduler artifact / manager への既知の作用前の
+拒否（private lock metadata の作成は数えない）、`partial` は definition write / enable / reload / unlink 等の先行
+作用はあるが要求した最終作用まで完了していない状態、`uncertain` は bootout / start / restart 等を試みたため実 host
+への最終作用有無を安全に断定できない状態、`complete` は adapter が要求 sequence を最後まで完了した状態である。
+CLI は JSON の field を保つだけでなく text にも `effect_state:` を必ず表示する。`performed=false` と
+`effect_state=none` を同義にせず、再試行・operator 調査の判断から途中作用を隠さない。
 
 **退役 agent の migration**（#15192）。#15192 以前に install した host には第二 LaunchAgent が残る。これを放置
 すると受入条件（macOS は LaunchAgent 1 個）が破れ、既に包含済みの `--drain-only` tick が走り続けるため、
@@ -576,18 +598,28 @@ path にしか identity 検査がなく、`install` は自 path 上の **他人�
 ため、**何も入っていない正常 host の uninstall も拒否されうる**。それでも採るのは損害が非対称だからである。
 拒否は可視で再試行可能、誤った成功報告は **operator が「消えた」と信じたまま logout まで走る job** を残す。
 
-**mutation する verb は `restart` も含めて identity を検査する**（review j#102550 r13f1）。`restart` だけは
+**mutation する verb は `restart` も含めて identity を検査する**（review j#102550 r13f1）。旧 `restart` だけは
 plist の**内容**（argv / home pin）のみを読み、`Label` を見ていなかったため、他人の plist が期待どおりの
-`ProgramArguments` を持つだけで `performed: true` の kickstart が成立した。しかも kickstart は **owned label
-に対して**発行されるので、**根拠と行為が別の service を指す**。entry で分類し、`print` の後（= subprocess を
-1 回挟んだ後）に再検証する。kickstart も稼働中 system への mutation であり、扱いは削除と同じである。
+`ProgramArguments` を持つだけで `performed: true` の manager effect が成立していた。しかも作用先は **owned
+label** なので、**根拠と行為が別の service を指す**。entry で分類し、各 manager effect の直前に再検証する。
 
-**manager effect の根拠は effect 直前の exact plist bytes / argv / home pin へ結び付ける**（review
-j#103073 r16f1）。`install` は `bootout` 後・`bootstrap` 前に pinned directory-fd seam から plist を fresh read
-し、この invocation が render / write した exact bytes と一致するときだけ path を launchctl へ渡す。`restart` は
-`print` 後・`kickstart` 前に同じ snapshot と expected argv / absolute home pin を再確認する。途中で owned Label を
-保ったまま command が差し替わっても `installed_command_drift` / `performed: false` で拒否し、後続の
-`bootstrap` / `kickstart` は 0 回である。
+**launchd の manager consumption は verified unload/reload に限定する**（review j#103073 r16f1、#15192
+j#103093）。launchd は loaded job の effective argv を機械可読な安定 API で exact に返さず、`bootstrap` も fd
+ではなく plist path を受け取る。この制約下で `kickstart` による旧定義の再実行は検証不能なので使わない。
+`install` は migration 後の current plist identity/bytes → `print` → fresh current snapshot の順で読み、loaded
+なら **write前に** `bootout` rc 0を必須とする。post-bootout snapshot が同じことを再確認してから expected plist を
+staged writeし、fresh exact expected bytes → `bootstrap` と進む（confirmed absent なら bootout は不要だが、
+`print` 後の fresh snapshot は同じく必須）。bootout 失敗時に disk だけ新定義へ変えず、旧loaded jobが定義更新中に
+interval発火する窓を残さない。`restart` は exact bytes / argv / absolute home pin → `print` → fresh exact snapshot
+→ `bootout` rc 0 → fresh exact snapshot → `bootstrap` の順である。
+ここで exact bytes は Label / argv / home だけの部分一致ではなく、renderer が生成する閉じた plist schema 全体を
+指す。`KeepAlive` / `EnvironmentVariables` / 未知 key / log path driftを含む非canonical plistは、Labelが自分の
+ものでもbootout前に拒否し、bootstrap直前も同じauthenticated bytesを要求する。
+drift / unreadable / bootout failure の後は bootstrap 0 回で、success を返すのは bootstrap rc 0まで完了した時だけ
+である。current manager state unreadable は current plist write 前に止まり `effect_state=none`、ただし legacy
+migration を既に完了した同じ install はその既知作用を隠さず `partial` になる。bootout 非0は current diskを
+変更せず `uncertain`、bootout成功後のwrite/fresh-read/bootstrap失敗は `partial` である。cooperative writer は
+前述の lock で全 sequence から排除される。
 
 **path は「所有の証明」でないだけでなく「その file である証明」でもない**（review j#102550 r13f2）。
 `Path.exists()` は broken symlink を False と答えるため、owned path に置かれた link は `absent` と分類され、
@@ -790,12 +822,29 @@ directory・device・開けない entry は `systemd_unit_unreadable` で mutati
 identity と bytes を得て、unidentified entry の bytes を parser / status へ渡さない。write は writer-private な
 `O_EXCL` staging を全量書込後に rename し、既存 file を truncate しない。
 
-**systemd manager effect も effect 直前の exact unit bytes / argv / home pin へ結び付ける**（review
-j#103073 r16f1）。`install` は `daemon-reload` 後・`enable --now` 前に service / timer の両方を fresh read し、
-この invocation が render / write した exact bytes と一致するときだけ enable する。`restart` は timer の `show`
-後・service の `restart` 前に同じ両 unit snapshot と expected argv / absolute home pin を再確認する。途中差替えは
-`systemd_unit_unreadable` または `installed_command_drift` / `performed: false` で拒否し、後続の `enable` /
-`restart` は 0 回である。
+**systemd は manager-effective definition を typed D-Bus property で exact attestation する**（review
+j#103073 r16f1、#15192 j#103093）。file bytes は `systemctl restart` が使う定義ではなく、user manager が
+`daemon-reload` で読んだ定義が authority である。shell向け表示文字列は parse せず、`busctl --user
+--json=short` で `FragmentPath` / `DropInPaths` / `NeedDaemonReload`、service の `Type` /
+`RemainAfterExit` / `Restart` / `ExecStart` と全 start/stop/reload hook、timer の target / monotonic cadence /
+calendar / persistent / randomized-delay / clock-timezone hook に加え、service の `Environment` /
+`EnvironmentFiles` / `PassEnvironment` / `UnsetEnvironment` を型付きで読む。owned file path、drop-in なし、exact
+argv + absolute home pin、oneshot、余分な hook・unit固有environmentなし、exact timer cadence のすべてが一致するとき
+だけ manager effectを許可する。restartのdisk側もargv/cadenceの部分parseだけでなくrendererのservice/timer bytes全体
+へexact一致させる。欠落・不正型・読取不能は `manager_effective_definition_unreadable`、型は読めるが値が異なる場合は
+`manager_effective_definition_drift` で拒否し、raw manager output / path / argv は result に出さない。
+
+`install` の exact sequence は両 unit snapshot → timer `ActiveState` の closed分類 → loadedならeffect直前snapshot
+再照合と timer `stop` rc 0（confirmed absentならstop不要、unreadableならwrite前拒否）→ post-stop snapshot → unit
+staged write → `enable --no-reload`（暗黙 reload を禁止）→ explicit `daemon-reload` → 両 unit の fresh exact bytes →
+manager-effective attestation → timer `start` である。これにより旧timerが定義更新・reload・attestation中に発火し
+ない。timer state unreadable は unit write前の `effect_state=none`、stop非0は旧unit bytesを保持して
+`uncertain`、stop成功後のdisk drift / write / enable / reload / attestation失敗は `partial`、startを試みた後の
+失敗は `uncertain` とする。`restart` は
+両 unit / exact argv / home pin → timer active の positive な確認 → fresh unit snapshot → manager-effective
+attestation → final unit snapshot → service `restart` の順である。いずれも lifecycle lock 内で行い、attestation
+不成立後の `start` / `restart` は 0 回である。systemd manager には caller supplied digest を条件に start する
+compare-and-swap API がないため、noncooperative same-user writer に対する保証は前述の threat boundary を越えない。
 
 **unit の書込先（`XDG_CONFIG_HOME`）は環境変数の値を未加工で読む**（review j#102378 finding r7f3）。これは表示文字列では
 なく **mutation target** である: `install` はここへ unit file を書き、`uninstall` はここの file を削除する。値を strip して
@@ -843,7 +892,7 @@ service + timer である。対応関係:
 
 | LaunchAgent | systemd user | 意味 |
 | --- | --- | --- |
-| `RunAtLoad` | `[Timer] OnActiveSec=0s` | timer が active になった瞬間に 1 tick（`enable --now` と以後の user manager 起動の両方を覆う） |
+| `RunAtLoad` | `[Timer] OnActiveSec=0s` | timer が active になった瞬間に 1 tick（install は attestation 後に明示 `start`、以後の user manager 起動は enabled timer が担う） |
 | `StartInterval=<N>` | `[Timer] OnUnitActiveSec=<N>s` | 前回実行から N 秒後に再実行（N は共通 portable default / `--tick-interval`） |
 | `KeepAlive` 不在 | `Restart=` / `RemainAfterExit=` 不在 + `Type=oneshot` | bounded one-shot を常駐化・tight relaunch loop 化しない（false 設定ではなく **構造的に不在**） |
 | `EnvironmentVariables` 不在 | `Environment=` / `EnvironmentFile=` 不在 | unit に secret を書き込む code path が存在しない |
@@ -858,8 +907,8 @@ readback (`parse_exec_argv`) は renderer の正確な逆で `%%` -> `%` を戻�
 service unit は `[Install]` を持たない（enable するのは timer のみ。service を直接 enable すると login 時 1 回
 だけ実行され cadence が消える）。timer は `OnCalendar` / `Persistent=` を持たない（取りこぼしの replay は不要で、
 次 tick が前 tick の未処理を reconcile する）。log は systemd journal に出るため owned log path を作らない。
-systemctl 呼び出しは常に構造化 argv（`daemon-reload` / `enable --now` / `disable --now` / `stop` / `restart` /
-`show` / `reset-failed`）で、shell を経由しない。
+systemctl 呼び出しは常に構造化 argv（`enable --no-reload` / `daemon-reload` / `start` / `disable --now` /
+`stop` / `restart` / `show` / `reset-failed`）で、shell を経由しない。
 
 **Redmine 未設定は導入の拒否理由にしない（両 OS 共通）。** #15192 以前は macOS のみ credential 未整備で
 `install` / `restart` を拒否していたが、これは **install できるか否かという operator から見える答え**が host に
@@ -940,6 +989,11 @@ uninstall は unit file を消すだけでは足りず、最後に `reset-failed
 `not-found`/`failed` entry として manager に残る（#15183 の installed-artifact smoke で実測。fake runner の
 hermetic test では manager 側状態を観測できない）。launchd の `bootout` は痕跡を残さないため、「owned artifact
 だけを正確に消す」は manager 側 residue も残さないことを含む。
+systemd uninstallの順序は timer `disable --now` → service `stop` → owned unit unlink → `daemon-reload` →
+`reset-failed` で、各manager commandはrc 0を次段の必要条件とする。disable/stop非0はunitを保持し、manager側でどこまで
+作用したか断定できないため`uncertain`。unlink後のreload/reset非0は実際の`removed`値を返して`partial`とし、後続
+commandを呼ばない。stderrを「既に無い」と解釈して成功へ昇格することはせず、その扱いには別のtyped confirmed-absent
+観測を要する。
 
 `workflow supervisor --service-status` は解決された backend、owned service の redacted host 投影、secret-free な
 definition を表示する。いずれの realization も独自常駐 daemon・無限 poll を導入せず、worktree / local branch /

@@ -156,6 +156,7 @@ class CliServiceStatusLaunchdTest(_ServiceCliCase):
                 self.assertEqual(rc, 1, verb)
                 self.assertFalse(payload["performed"], verb)
                 self.assertEqual(payload["reason"], sl.REASON_UNSUPPORTED_PLATFORM, verb)
+                self.assertEqual(payload["effect_state"], sb.EFFECT_NONE, verb)
 
 
 class CliServiceStatusSystemdTest(_ServiceCliCase):
@@ -223,6 +224,7 @@ class CliServiceStatusSystemdTest(_ServiceCliCase):
             self.assertFalse(payload["performed"], verb)
             self.assertEqual(payload["reason"], ss.REASON_USER_MANAGER_UNAVAILABLE, verb)
             self.assertEqual(payload["backend"], sb.BACKEND_SYSTEMD, verb)
+            self.assertEqual(payload["effect_state"], sb.EFFECT_NONE, verb)
         self.assertFalse(ss.unit_dir(self.os_home).exists())
 
 
@@ -265,6 +267,17 @@ class CliServiceStatusTextPathTest(_ServiceCliCase):
         text = "\n".join(_service_status_lines(host, 0))
         self.assertIn("next_elapse: 4w 1d 5h 2min 6.063752s (basis: monotonic)", text)
         self.assertIn("last_trigger: Sun 2026-08-09 22:50:24 JST", text)
+
+    def test_mutation_text_does_not_hide_an_uncertain_effect(self) -> None:
+        result = {
+            "action": "restart", "performed": False, "reason": "restart_failed",
+            "backend": sb.BACKEND_LAUNCHD, "effect_state": sb.EFFECT_UNCERTAIN,
+            "agents": [],
+        }
+        with patch.object(sb, "restart", return_value=result):
+            rc, out = _run(["workflow", "supervisor", "--restart", "--home", self.home])
+        self.assertEqual(rc, 1)
+        self.assertIn("effect_state: uncertain", out)
 
 
 class CliServiceDefinitionRosterTest(_ServiceCliCase):
@@ -430,6 +443,7 @@ class CliServiceUnsupportedHostTest(_ServiceCliCase):
             self.assertEqual(rc, 1, verb)
             self.assertFalse(payload["performed"], verb)
             self.assertEqual(payload["reason"], sb.REASON_NO_BACKEND, verb)
+            self.assertEqual(payload["effect_state"], sb.EFFECT_NONE, verb)
             self.assertEqual(payload["backend"], sb.BACKEND_UNSUPPORTED, verb)
 
     def test_service_status_still_exits_zero_and_mutates_nothing(self) -> None:

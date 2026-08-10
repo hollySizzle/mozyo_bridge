@@ -1,50 +1,9 @@
-"""Linux systemd **user** service + timer for the callback supervisor (Redmine #15183).
-
-On Linux the bounded ``workflow supervisor --run-once`` body already worked, but nothing scheduled
-it: retiring finished sublanes, delivering callbacks, and supplying durable state all fell back to a
-human running the command. This module is the Linux realization of the service lifecycle contract
-(``status`` / ``install`` / ``restart`` / ``uninstall``), and **nothing more**.
-
-Design boundary (Redmine #15183 scope correction j#101996 — the issue body is the authority):
-
-- **ONE owned service + ONE owned timer.** The timer starts ``workflow supervisor --run-once`` at
-  the shared portable cadence (currently 180 seconds) and the process exits each tick. This is
-  deliberately *not* the retired macOS dual-agent shape:
-  registering a separate ``--drain-only`` unit, installing two units atomically, and mirroring the
-  LaunchAgent internals were all removed from the acceptance contract. The macOS adapter
-  (:mod:`...application.supervisor_launchd`) is untouched by this module.
-- **An OS tick is not a Redmine poll.** The supervisor body already gates provider reads behind a
-  durable per-workspace cadence watermark (``reconcile_cadence`` / ``should_reconcile_source``)
-  whose portable default is :data:`DEFAULT_RECONCILIATION_INTERVAL_SECONDS` (300s, with exponential
-  backoff + jitter when passes come up empty). A tick inside that window is downgraded to a local
-  pass with **zero** provider reads, so the frequent tick works from SQLite + Herdr and Redmine stays
-  the low-frequency loss-recovery leg. That gating lives in the supervisor body, not here; this
-  module only supplies the cadence and must not re-implement it.
-- **No resident daemon.** ``Type=oneshot`` with **no** ``Restart=`` and **no** ``RemainAfterExit=``:
-  a restart directive on a one-shot is a tight relaunch loop, so it is structurally absent, not set
-  to a falsy value. ``OnActiveSec=0s`` runs one tick the moment the timer activates;
-  ``OnUnitActiveSec=<portable default>s`` repeats it. No infinite wait, no in-process poll.
-- **No secret in a unit.** The rendered units have **no** ``Environment=`` and no
-  ``EnvironmentFile=`` key at all, so no code path can serialize a credential into one. A
-  systemd-started supervisor inherits no interactive shell environment; the Redmine key/URL reach it
-  through the daemon-trusted home-scoped credential file, never a unit. ``ExecStart`` is the exact
-  PATH-resolved ``mozyo-bridge`` executable + structured argv, systemd-quoted per token — never a
-  shell string, and never ``/bin/sh -c``.
-- **An unconfigured Redmine does not block installing the timer** (acceptance: 「Redmine設定が未整備でも
-  timerの導入自体は拒否しない」). This was the sharpest divergence from the macOS adapter until Redmine
-  #15192 aligned that host to the same contract, so it is now shared rather than a divergence: the
-  operator-visible answer to "can I install this?" no longer depends on the host (j#102151 Finding
-  4). Credential readiness is *projected* as a fixed token, never used as an install gate:
-  the local work a tick can safely do from SQLite + Herdr must keep running, and an unreachable
-  Redmine surfaces as an explicit result rather than as a refusal to schedule anything at all.
-- **Fail-closed, zero-mutation refusals** remain for the conditions that make the install itself
-  meaningless: a non-Linux host, an unreachable systemd **user** manager (a container with no user
-  bus is explicitly unsupported, not silently degraded), and a missing executable.
-- **Structured systemctl only.** Every ``systemctl --user`` invocation is structured argv — no shell.
-
-This module performs **no** Redmine fetch, gate progression, route resolution, or callback delivery:
-installing / restarting / uninstalling the unit is orthogonal to what it does when it runs. It never
-touches worktrees, branches, or the #15066 managed-process retirement boundary.
+"""Linux systemd user service+timer lifecycle for the callback supervisor (#15183/#15192).
+One timer starts the bounded ``workflow supervisor --run-once`` oneshot at the shared OS cadence.
+No drain-only unit, daemon, shell, credential, environment file, ``Restart=``, or ``RemainAfterExit=``
+exists. Credential readiness is projected; provider cadence belongs to the supervisor body.
+Mutating verbs use pinned files, a cooperative lock, and typed manager attestation; they do no
+Redmine work, route progression, callback delivery, worktree change, or process retirement.
 """
 
 from __future__ import annotations
@@ -116,12 +75,29 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     UNIT_UNREADABLE,
     OwnedUnitPathError,
     UnsafeUnitArtifactError,
+    acquire_lifecycle_lock,
     read_units as _read_units,
     unlink_units as _unlink_units,
     write_units as _write_units,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_scheduler_lifecycle_lock import (  # noqa: E501
+    SchedulerLifecycleLockBusy,
+    SchedulerLifecycleLockError,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_systemd_manager import (  # noqa: E501
+    MANAGER_DEFINITION_DRIFT,
+    SystemdManagerInspector,
+    UNINSTALL_DISABLE_FAILED,
+    UNINSTALL_RELOAD_FAILED,
+    UNINSTALL_RESET_FAILED,
+    UNINSTALL_STOP_FAILED,
+    disk_definition_matches,
+    run_systemctl as _systemctl,
+    run_uninstall_manager_sequence,
+    show_properties as _show,
+    user_manager_available as _user_manager_available,
+)
 
-_SYSTEMCTL = "systemctl"
 # ---------------------------------------------------------------------------
 # Fixed-vocabulary reason tokens (machine-readable; secret-safe; UI-language-independent).
 # ---------------------------------------------------------------------------
@@ -159,6 +135,9 @@ REASON_INSTALLED_COMMAND_DRIFT = "installed_command_drift"
 REASON_DAEMON_RELOAD_FAILED = "systemctl_daemon_reload_failed"
 #: ``systemctl --user enable --now <timer>`` failed (message redacted to a fixed token).
 REASON_ENABLE_FAILED = "systemctl_enable_failed"
+#: ``systemctl --user disable --now <timer>`` failed.  The timer may have been changed before the
+#: command reported failure, so uninstall reports an uncertain effect and keeps the unit files.
+REASON_DISABLE_FAILED = "systemctl_disable_failed"
 #: ``systemctl --user restart <service>`` failed (message redacted to a fixed token).
 REASON_RESTART_FAILED = "systemctl_restart_failed"
 #: A unit path or artifact could not be identified as a regular, singly-linked owned entry. This is
@@ -168,6 +147,21 @@ REASON_UNIT_UNREADABLE = "systemd_unit_unreadable"
 #: A pinned, identified write/removal failed. Host paths and exception strings are not projected.
 REASON_UNIT_WRITE_FAILED = "systemd_unit_write_failed"
 REASON_UNIT_REMOVAL_FAILED = "systemd_unit_removal_failed"
+#: Another cooperating scheduler lifecycle operation owns the shared fence.
+REASON_LIFECYCLE_BUSY = "scheduler_lifecycle_busy"
+REASON_LIFECYCLE_LOCK_UNREADABLE = "scheduler_lifecycle_lock_unreadable"
+#: Typed manager state could not be read without trusting raw text.
+REASON_MANAGER_DEFINITION_UNREADABLE = "manager_effective_definition_unreadable"
+#: The loaded definition differs from the exact owned command/home/path/timer contract.
+REASON_MANAGER_DEFINITION_DRIFT = "manager_effective_definition_drift"
+REASON_START_FAILED = "systemctl_start_failed"
+REASON_STOP_FAILED = "systemctl_stop_failed"
+REASON_RESET_FAILED = "systemctl_reset_failed"
+
+EFFECT_NONE = "none"
+EFFECT_PARTIAL = "partial"
+EFFECT_UNCERTAIN = "uncertain"
+EFFECT_COMPLETE = "complete"
 
 
 #: Redmine credential-readiness tokens. On this adapter these are a **projection only** — never an
@@ -225,24 +219,9 @@ def _running_on_linux() -> bool:
     return sys.platform.startswith("linux")
 
 
-def _systemctl(runner: Runner, args: Sequence[str]) -> "subprocess.CompletedProcess[str]":
-    return runner([_SYSTEMCTL, "--user", *args])
-
-
 def user_manager_available(runner: Runner = _default_runner) -> bool:
-    """Whether a systemd **user** manager is reachable. Read-only; never raises.
-
-    Probed with ``systemctl --user show --property=Version``, which succeeds only when systemctl
-    exists *and* it can talk to a user bus. A container without a user session fails here, and every
-    mutating verb refuses with :data:`REASON_USER_MANAGER_UNAVAILABLE` rather than writing unit files
-    nothing will ever read. Deliberately not ``is-system-running``: that reports non-zero for a
-    perfectly usable ``degraded`` manager.
-    """
-    try:
-        result = _systemctl(runner, ["show", "--property=Version"])
-    except (FileNotFoundError, OSError):  # systemctl absent / not executable
-        return False
-    return result.returncode == 0
+    """Whether the systemd user manager answers a read-only version probe."""
+    return _user_manager_available(runner)
 
 
 #: The widest process id ``systemctl show`` can print. DERIVED, not chosen: Linux ``pid_t`` is a
@@ -260,51 +239,6 @@ _MAX_PID_DIGITS = len(str(2**31 - 1))
 PROBE_LOADED = "loaded"
 PROBE_CONFIRMED_ABSENT = "confirmed_absent"
 PROBE_UNREADABLE = "unreadable"
-
-
-def _show(runner: Runner, unit_name: str, properties: Sequence[str]) -> dict[str, str]:
-    """Read-only ``systemctl --user show`` → ``{property: value}``. Never raises.
-
-    An empty result means the read FAILED, which :func:`_probe_state` keeps distinct from a
-    successful read of an inactive unit — those are different facts. A reply that answers the same
-    property twice with **different** values is such a failure: there is no order authority that
-    makes one of them the answer, so the read is discarded rather than resolved (review j#102383
-    finding r8f2). A property repeated with the *same* value is not a contradiction and is kept —
-    the rule is about conflicting answers, not about repetition.
-
-    Keys and values are carried **exactly as the manager wrote them**, split on the first ``=`` and
-    otherwise untouched. This reader feeds :func:`_probe_state`, whose whole contract is a closed
-    vocabulary of exact tokens, and trimming here silently widened it: ``ActiveState= inactive ``
-    was reported as a confirmed stop though systemd enumerates its states as bare lowercase literals
-    and pads nothing (review j#102378 finding r7f2). ``splitlines`` has already removed the line
-    terminator, so any remaining whitespace came from the manager's answer, not from framing this
-    parser added — treating it as framing was an assumption, and the closed vocabulary exists
-    precisely so unrecognized input reads as unknown. Where a value is merely *displayed*, the
-    projection tidies it at the point of display, which is a formatting decision and not this one.
-    """
-    args = ["show", unit_name, *[f"--property={p}" for p in properties]]
-    try:
-        result = _systemctl(runner, args)
-    except (FileNotFoundError, OSError):
-        return {}
-    if result.returncode != 0:
-        return {}
-    values: dict[str, str] = {}
-    for line in (result.stdout or "").splitlines():
-        key, sep, value = line.partition("=")
-        if not sep:
-            continue
-        if key in values and values[key] != value:
-            # Two different answers for one property, and nothing says which is authoritative.
-            # Assigning into the dict silently kept the last, so `ActiveState=inactive` followed by
-            # `ActiveState=active` became a CONFIRMED `loaded` — and the reverse order became a
-            # confirmed absence, the same contradictory reply reversing a settled fact on line order
-            # alone. That value went on to authorize a real `systemctl restart` (review j#102383
-            # finding r8f2). The whole read is discarded: a reply this parser cannot resolve is
-            # unreadable, and unreadable is exactly what the callers already fail closed on.
-            return {}
-        values[key] = value
-    return values
 
 
 #: ``ActiveState`` values that mean the manager IS running this unit. ``reloading`` belongs here:
@@ -362,9 +296,11 @@ def _probe_state(shown: dict[str, str], *, manager_available: bool) -> str:
 
 
 def _refused(action: str, reason: str, **extra: object) -> dict:
-    """A fail-closed, zero-mutation refusal result (fixed vocabulary; no host detail)."""
-    return {"action": action, "performed": False, "reason": reason, "label": SUPERVISOR_UNIT.label,
-            **extra}
+    """A fixed-vocabulary refusal; callers override ``effect_state`` after prior effects."""
+    return {
+        "action": action, "performed": False, "reason": reason,
+        "label": SUPERVISOR_UNIT.label, "effect_state": EFFECT_NONE, **extra,
+    }
 
 
 def _preflight(action: str, runner: Runner) -> Optional[dict]:
@@ -389,25 +325,46 @@ def install(
     runner: Runner = _default_runner,
     which: Callable[[str], Optional[str]] = shutil.which,
 ) -> dict:
-    """Write the owned service + timer and enable the timer. Idempotent; fail-closed.
-
-    Refuses — before any filesystem write or systemctl call — only on the conditions that make the
-    install itself meaningless: a non-Linux host, an unreachable systemd user manager, or a missing
-    executable.
-
-    A non-ready Redmine credential is **not** one of them (issue #15183). Readiness is resolved
-    against the pinned mozyo home and reported as ``credential_readiness``, but the timer installs
-    regardless, so the local work a tick can safely do from SQLite + Herdr keeps running and an
-    unconfigured Redmine surfaces as an explicit state instead of a refusal to schedule anything.
-    Since Redmine #15192 the macOS adapter carries the SAME contract, so this is no longer a
-    divergence: neither host gates the install on credential readiness (review j#102151 Finding 4).
-
-    A failure *after* the units are written leaves them on disk and reports ``performed: False``; the
-    operator can fix the cause and re-run install, which rewrites both units idempotently.
-    """
+    """Install under the shared lifecycle lock with typed manager attestation."""
     blocked = _preflight("install", runner)
     if blocked is not None:
         return blocked
+    command = resolve_supervisor_command(mozyo_home=mozyo_home, which=which)
+    if command is None:
+        return _refused("install", REASON_EXECUTABLE_NOT_FOUND)
+    unrenderable = unrenderable_argv_reason(command)
+    if unrenderable:
+        return _refused("install", unrenderable)
+    inspector = SystemdManagerInspector(runner)
+    if not inspector.capability_available():
+        return _refused("install", REASON_MANAGER_DEFINITION_UNREADABLE)
+    try:
+        lifecycle = acquire_lifecycle_lock(os_home)
+    except SchedulerLifecycleLockBusy:
+        return _refused("install", REASON_LIFECYCLE_BUSY)
+    except (SchedulerLifecycleLockError, OwnedUnitPathError, OSError):
+        return _refused("install", REASON_LIFECYCLE_LOCK_UNREADABLE)
+    with lifecycle:
+        return _install_locked(
+            os_home=os_home, mozyo_home=mozyo_home, interval_seconds=interval_seconds,
+            runner=runner, which=which, inspector=inspector,
+        )
+
+
+def _install_locked(
+    *,
+    os_home: Optional[Path] = None,
+    mozyo_home: Optional[Path] = None,
+    interval_seconds: int = DEFAULT_TICK_INTERVAL_SECONDS,
+    runner: Runner = _default_runner,
+    which: Callable[[str], Optional[str]] = shutil.which,
+    inspector: Optional[SystemdManagerInspector] = None,
+) -> dict:
+    """Write, enable-without-reload, reload, attest, then start under the held lock."""
+    blocked = _preflight("install", runner)
+    if blocked is not None:
+        return blocked
+    inspector = inspector or SystemdManagerInspector(runner)
     resolved_mozyo = resolve_mozyo_home(mozyo_home)
     command = resolve_supervisor_command(mozyo_home=resolved_mozyo, which=which)
     if command is None:
@@ -427,6 +384,32 @@ def install(
     units = _read_units(os_home)
     if UNIT_UNREADABLE in (units.service_state, units.timer_state):
         return _refused("install", REASON_UNIT_UNREADABLE)
+    timer_shown = _show(runner, SUPERVISOR_UNIT.timer_unit, ("ActiveState",))
+    timer_state = _probe_state(timer_shown, manager_available=True)
+    if timer_state == PROBE_UNREADABLE:
+        return _refused(
+            "install", REASON_SERVICE_STATE_UNREADABLE,
+            credential_readiness=readiness, probe_state=timer_state,
+        )
+    if timer_state == PROBE_LOADED:
+        if _read_units(os_home) != units:
+            return _refused(
+                "install", REASON_INSTALLED_COMMAND_DRIFT,
+                credential_readiness=readiness, probe_state=timer_state,
+            )
+        stopped = _systemctl(runner, ["stop", SUPERVISOR_UNIT.timer_unit])
+        if stopped.returncode != 0:
+            return {
+                "action": "install", "performed": False, "reason": REASON_STOP_FAILED,
+                "credential_readiness": readiness, "label": SUPERVISOR_UNIT.label,
+                "probe_state": timer_state, "effect_state": EFFECT_UNCERTAIN,
+            }
+    if _read_units(os_home) != units:
+        return _refused(
+            "install", REASON_INSTALLED_COMMAND_DRIFT,
+            credential_readiness=readiness, probe_state=timer_state,
+            effect_state=EFFECT_PARTIAL if timer_state == PROBE_LOADED else EFFECT_NONE,
+        )
     expected_service_payload = render_service_unit(command).encode("utf-8")
     expected_timer_payload = render_timer_unit(
         interval_seconds=interval_seconds
@@ -437,24 +420,32 @@ def install(
             expected_timer_payload,
             os_home,
         )
-    except UnsafeUnitArtifactError:
-        return _refused("install", REASON_UNIT_UNREADABLE)
-    except (OwnedUnitPathError, OSError):
-        return _refused("install", REASON_UNIT_WRITE_FAILED)
+    except (UnsafeUnitArtifactError, OwnedUnitPathError):
+        return _refused("install", REASON_UNIT_UNREADABLE, effect_state=EFFECT_PARTIAL)
+    except OSError:
+        return _refused("install", REASON_UNIT_WRITE_FAILED, effect_state=EFFECT_PARTIAL)
 
-    # The manager must re-read the unit directory before the timer can be enabled from it.
+    # `enable` normally reloads implicitly.  Suppress that unobservable second consumption and make
+    # the one explicit reload below the definition load this invocation attests.
+    if _systemctl(
+        runner, ["enable", "--no-reload", SUPERVISOR_UNIT.timer_unit]
+    ).returncode != 0:
+        return {
+            "action": "install", "performed": False, "reason": REASON_ENABLE_FAILED,
+            "credential_readiness": readiness, "label": SUPERVISOR_UNIT.label,
+            "effect_state": EFFECT_PARTIAL,
+        }
     if _systemctl(runner, ["daemon-reload"]).returncode != 0:
         return {
             "action": "install", "performed": False, "reason": REASON_DAEMON_RELOAD_FAILED,
             "credential_readiness": readiness, "label": SUPERVISOR_UNIT.label,
+            "effect_state": EFFECT_PARTIAL,
         }
-    # ``daemon-reload`` is an effect boundary: another writer can replace either unit while the
-    # manager call runs. Re-read both names through the pinned filesystem seam and require the exact
-    # bytes this invocation wrote before ``enable --now`` can start the timer (j#103073 r16f1).
     effect_units = _read_units(os_home)
     if UNIT_UNREADABLE in (effect_units.service_state, effect_units.timer_state):
         return _refused(
-            "install", REASON_UNIT_UNREADABLE, credential_readiness=readiness
+            "install", REASON_UNIT_UNREADABLE, credential_readiness=readiness,
+            effect_state=EFFECT_PARTIAL,
         )
     if (
         effect_units.service_state != UNIT_OWNED
@@ -463,14 +454,30 @@ def install(
         or effect_units.timer_payload != expected_timer_payload
     ):
         return _refused(
-            "install", REASON_INSTALLED_COMMAND_DRIFT, credential_readiness=readiness
+            "install", REASON_INSTALLED_COMMAND_DRIFT, credential_readiness=readiness,
+            effect_state=EFFECT_PARTIAL,
         )
-    # ``enable --now`` is idempotent: it rewrites the timers.target want and starts the timer, which
-    # (OnActiveSec=0s) runs the first bounded sweep immediately.
-    if _systemctl(runner, ["enable", "--now", SUPERVISOR_UNIT.timer_unit]).returncode != 0:
+    attestation = inspector.attest(
+        service_unit=SUPERVISOR_UNIT.service_unit,
+        timer_unit=SUPERVISOR_UNIT.timer_unit,
+        service_path=service_unit_path(os_home),
+        timer_path=timer_unit_path(os_home),
+        expected_argv=command,
+        interval_seconds=interval_seconds,
+    )
+    if not attestation.matched:
+        return _refused(
+            "install",
+            REASON_MANAGER_DEFINITION_DRIFT
+            if attestation.state == MANAGER_DEFINITION_DRIFT
+            else REASON_MANAGER_DEFINITION_UNREADABLE,
+            credential_readiness=readiness, effect_state=EFFECT_PARTIAL,
+        )
+    if _systemctl(runner, ["start", SUPERVISOR_UNIT.timer_unit]).returncode != 0:
         return {
-            "action": "install", "performed": False, "reason": REASON_ENABLE_FAILED,
+            "action": "install", "performed": False, "reason": REASON_START_FAILED,
             "credential_readiness": readiness, "label": SUPERVISOR_UNIT.label,
+            "effect_state": EFFECT_UNCERTAIN,
         }
     return {
         "action": "install",
@@ -479,6 +486,7 @@ def install(
         "credential_readiness": readiness,
         "scheduled_interval_seconds": max(1, int(interval_seconds)),
         "label": SUPERVISOR_UNIT.label,
+        "effect_state": EFFECT_COMPLETE,
     }
 
 
@@ -489,20 +497,7 @@ def restart(
     runner: Runner = _default_runner,
     which: Callable[[str], Optional[str]] = shutil.which,
 ) -> dict:
-    """Re-run the bounded sweep now on the *scheduled* service. Fail-closed zero-mutation.
-
-    The **installed unit** — not the caller's current shell — is the authority on the root the
-    scheduled process uses: restart reads the ``--home`` pin from the owned ``.service`` and reports
-    *that* root's readiness, so it never claims a state belonging to a different home.
-
-    Refuses — before any systemctl mutation — on a non-Linux host, an unreachable user manager, no
-    installed service unit, an owned unit with no single parseable ``ExecStart``, an unhealthy
-    ``--home`` pin, a requested ``mozyo_home`` that differs from the pin, an installed command that
-    no longer matches what an install would write now (drift — reinstall to change), a missing
-    executable, or an owned timer the shared probe does not classify as ``loaded`` (a confirmed stop
-    and an unreadable state alike). A non-ready credential does not block a restart, for the same
-    reason it does not block an install.
-    """
+    """Restart only after disk and manager-effective definitions agree under one lock."""
     blocked = _preflight("restart", runner)
     if blocked is not None:
         return blocked
@@ -510,7 +505,41 @@ def restart(
     if UNIT_UNREADABLE in (units.service_state, units.timer_state):
         return _refused("restart", REASON_UNIT_UNREADABLE)
     if units.service_state == UNIT_ABSENT:
-        return _refused("restart", REASON_NOT_INSTALLED)
+        return _refuse_missing_restart(runner)
+    inspector = SystemdManagerInspector(runner)
+    if not inspector.capability_available():
+        return _refused("restart", REASON_MANAGER_DEFINITION_UNREADABLE)
+    try:
+        lifecycle = acquire_lifecycle_lock(os_home)
+    except SchedulerLifecycleLockBusy:
+        return _refused("restart", REASON_LIFECYCLE_BUSY)
+    except (SchedulerLifecycleLockError, OwnedUnitPathError, OSError):
+        return _refused("restart", REASON_LIFECYCLE_LOCK_UNREADABLE)
+    with lifecycle:
+        return _restart_locked(
+            os_home=os_home, mozyo_home=mozyo_home, runner=runner, which=which,
+            inspector=inspector,
+        )
+
+
+def _restart_locked(
+    *,
+    os_home: Optional[Path] = None,
+    mozyo_home: Optional[Path] = None,
+    runner: Runner = _default_runner,
+    which: Callable[[str], Optional[str]] = shutil.which,
+    inspector: Optional[SystemdManagerInspector] = None,
+) -> dict:
+    """Re-run only when pinned disk and typed manager-effective definitions both match."""
+    blocked = _preflight("restart", runner)
+    if blocked is not None:
+        return blocked
+    inspector = inspector or SystemdManagerInspector(runner)
+    units = _read_units(os_home)
+    if UNIT_UNREADABLE in (units.service_state, units.timer_state):
+        return _refused("restart", REASON_UNIT_UNREADABLE)
+    if units.service_state == UNIT_ABSENT:
+        return _refuse_missing_restart(runner)
     installed_argv = _installed_command(_parse_unit_keys(units.service_payload))
     if installed_argv is None:
         # Present but unreadable / no single parseable ExecStart — unhealthy, NOT absence.
@@ -518,32 +547,41 @@ def restart(
     pinned, pin_status = extract_pinned_home(installed_argv)
     if pin_status != HOME_PIN_OK:
         return _refused("restart", REASON_HOME_PIN_UNHEALTHY, home_pin=pin_status)
-    # A requested home that disagrees with the installed pin is a re-point attempt — refuse; a home
-    # change must rewrite the unit via install, not silently re-run the old pin.
     if mozyo_home is not None and str(resolve_mozyo_home(mozyo_home)) != pinned:
         return _refused("restart", REASON_HOME_PIN_MISMATCH, home_pin=pin_status)
     pinned_home = Path(pinned)
     expected = resolve_supervisor_command(mozyo_home=pinned_home, which=which)
     if expected is None:
         return _refused("restart", REASON_EXECUTABLE_NOT_FOUND)
-    # If an install could not render this command, the installed unit cannot legitimately match it.
     unrenderable = unrenderable_argv_reason(expected)
     if unrenderable:
         return _refused("restart", unrenderable)
     if installed_argv != expected:
         return _refused("restart", REASON_INSTALLED_COMMAND_DRIFT)
+    installed_interval = _installed_interval_seconds(
+        _parse_unit_keys(units.timer_payload)
+    )
+    if installed_interval is None:
+        return _refused("restart", REASON_INSTALLED_COMMAND_DRIFT)
+    # Parsed argv/cadence are necessary but not sufficient authority.  A stable extra directive
+    # (for example Environment=, an Exec* hook, or a second timer trigger) must not be restarted
+    # merely because the two fields above still match.  Exact renderer bytes are the closed disk
+    # schema this adapter owns; manager-effective fields are checked separately below.
+    if (
+        units.service_state != UNIT_OWNED
+        or units.timer_state != UNIT_OWNED
+        or not disk_definition_matches(
+            units.service_payload,
+            units.timer_payload,
+            expected_argv=expected,
+            interval_seconds=installed_interval,
+        )
+    ):
+        return _refused("restart", REASON_INSTALLED_COMMAND_DRIFT)
     readiness = classify_credential_readiness(mozyo_home=pinned_home)
-    # The SAME classification `service_status` publishes, not a second reading of one state machine
-    # (review j#102327 finding r6f2). Comparing the raw value to `active` here made `reloading` — a
-    # state status reports as loaded — refuse as `service_not_loaded`, so the two verbs answered
-    # differently about one manager reply. Proceeding needs a positive `loaded`: a confirmed absence
-    # and an unreadable read both refuse, which is the launchd adapter's contract for restart too.
     timer_shown = _show(runner, SUPERVISOR_UNIT.timer_unit, ("ActiveState",))
     timer_state = _probe_state(timer_shown, manager_available=True)
     if timer_state != PROBE_LOADED:
-        # Refuse either way, but say WHICH fact refused: "the timer is not running" and "I could not
-        # read whether it is" are different answers, and reporting the second as the first is the
-        # same confusion this adapter fails closed on everywhere else. Both are zero-mutation.
         return _refused(
             "restart",
             REASON_SERVICE_NOT_LOADED
@@ -552,9 +590,6 @@ def restart(
             credential_readiness=readiness,
             probe_state=timer_state,
         )
-    # The initial unit bytes are stale after the manager probe. Require a fresh pinned read of the
-    # same service/timer snapshots and independently re-establish exact argv/home before restarting
-    # the one-shot. Filename ownership alone cannot authorize a drifted ExecStart (j#103073 r16f1).
     action_units = _read_units(os_home)
     if UNIT_UNREADABLE in (action_units.service_state, action_units.timer_state):
         return _refused(
@@ -580,73 +615,121 @@ def restart(
             credential_readiness=readiness,
             probe_state=timer_state,
         )
-    # ``restart`` on a one-shot stops any in-flight sweep and runs a fresh one. The timer's own
-    # cadence is untouched.
+    action_interval = _installed_interval_seconds(
+        _parse_unit_keys(action_units.timer_payload)
+    )
+    if action_interval is None:
+        return _refused(
+            "restart", REASON_INSTALLED_COMMAND_DRIFT,
+            credential_readiness=readiness, probe_state=timer_state,
+        )
+    attestation = inspector.attest(
+        service_unit=SUPERVISOR_UNIT.service_unit,
+        timer_unit=SUPERVISOR_UNIT.timer_unit,
+        service_path=service_unit_path(os_home),
+        timer_path=timer_unit_path(os_home),
+        expected_argv=expected,
+        interval_seconds=action_interval,
+    )
+    if not attestation.matched:
+        return _refused(
+            "restart",
+            REASON_MANAGER_DEFINITION_DRIFT
+            if attestation.state == MANAGER_DEFINITION_DRIFT
+            else REASON_MANAGER_DEFINITION_UNREADABLE,
+            credential_readiness=readiness, probe_state=timer_state,
+        )
+    final_units = _read_units(os_home)
+    if final_units != action_units:
+        return _refused(
+            "restart", REASON_INSTALLED_COMMAND_DRIFT,
+            credential_readiness=readiness, probe_state=timer_state,
+        )
     if _systemctl(runner, ["restart", SUPERVISOR_UNIT.service_unit]).returncode != 0:
         return {
             "action": "restart", "performed": False, "reason": REASON_RESTART_FAILED,
             "credential_readiness": readiness, "label": SUPERVISOR_UNIT.label,
+            "effect_state": EFFECT_UNCERTAIN,
         }
     return {
         "action": "restart", "performed": True, "reason": "",
         "credential_readiness": readiness, "label": SUPERVISOR_UNIT.label,
+        "effect_state": EFFECT_COMPLETE,
     }
 
 
+def _refuse_missing_restart(runner: Runner) -> dict:
+    """Preserve the shared manager-state reason when no disk unit can authorize an effect."""
+    shown = _show(runner, SUPERVISOR_UNIT.timer_unit, ("ActiveState",))
+    state = _probe_state(shown, manager_available=True)
+    if state == PROBE_LOADED:
+        return _refused("restart", REASON_NOT_INSTALLED, probe_state=state)
+    reason = (
+        REASON_SERVICE_NOT_LOADED
+        if state == PROBE_CONFIRMED_ABSENT
+        else REASON_SERVICE_STATE_UNREADABLE
+    )
+    return _refused("restart", reason, probe_state=state)
+
+
 def uninstall(*, os_home: Optional[Path] = None, runner: Runner = _default_runner) -> dict:
-    """Disable + stop the owned timer/service and remove exactly the owned unit files.
+    """Uninstall under the same cooperating-writer lifecycle fence."""
+    blocked = _preflight("uninstall", runner)
+    if blocked is not None:
+        return blocked
+    try:
+        lifecycle = acquire_lifecycle_lock(os_home)
+    except SchedulerLifecycleLockBusy:
+        return _refused("uninstall", REASON_LIFECYCLE_BUSY, removed=False)
+    except (SchedulerLifecycleLockError, OwnedUnitPathError, OSError):
+        return _refused("uninstall", REASON_LIFECYCLE_LOCK_UNREADABLE, removed=False)
+    with lifecycle:
+        return _uninstall_locked(os_home=os_home, runner=runner)
 
-    Refuses only on a non-Linux host or an unreachable user manager (there is nothing to disable).
-    Otherwise it tears the unit down even when credentials are absent — you must be able to remove a
-    service without them. Each systemctl step is best-effort (a not-enabled timer / not-running
-    service is a normal idempotent case), then exactly the two owned files are removed and the
-    manager is reloaded so the removal takes effect. No mozyo home is needed.
 
-    The final ``reset-failed`` is not cosmetic. ``stop`` on a sweep that is mid-flight SIGTERMs it,
-    so the one-shot exits on a signal and systemd records the unit as ``failed``; once the unit files
-    are gone that record lingers in the manager as a ``not-found``/``failed`` entry that
-    ``list-units`` still shows. Measured on a live user manager during the Redmine #15183
-    installed-artifact smoke — a fake runner cannot observe manager-side state. launchd's ``bootout``
-    leaves no such trace, so "removes exactly the owned artifacts" has to mean the manager holds no
-    residue either, not just that the files are unlinked.
-    """
+def _uninstall_locked(*, os_home: Optional[Path] = None, runner: Runner = _default_runner) -> dict:
+    """Disable, remove the two owned unit files, and clear manager residue."""
     blocked = _preflight("uninstall", runner)
     if blocked is not None:
         return blocked
     units = _read_units(os_home)
     if UNIT_UNREADABLE in (units.service_state, units.timer_state):
         return _refused("uninstall", REASON_UNIT_UNREADABLE, removed=False)
-    _systemctl(runner, ["disable", "--now", SUPERVISOR_UNIT.timer_unit])
-    _systemctl(runner, ["stop", SUPERVISOR_UNIT.service_unit])
     try:
-        removed = _unlink_units(os_home)
+        outcome = run_uninstall_manager_sequence(
+            runner,
+            timer_unit=SUPERVISOR_UNIT.timer_unit,
+            service_unit=SUPERVISOR_UNIT.service_unit,
+            remove_units=lambda: _unlink_units(os_home),
+        )
     except UnsafeUnitArtifactError:
-        # The manager calls above may already have acted; do not call this zero mutation. ``None``
-        # is the honest removal projection because an action-time drift can be observed after one
-        # safe entry was removed but before the second (no raw path or exception is exposed).
-        return _refused("uninstall", REASON_UNIT_UNREADABLE, removed=None)
+        return _refused(
+            "uninstall", REASON_UNIT_UNREADABLE, removed=None, effect_state=EFFECT_PARTIAL
+        )
     except (OwnedUnitPathError, OSError):
-        return _refused("uninstall", REASON_UNIT_REMOVAL_FAILED, removed=None)
-    _systemctl(runner, ["daemon-reload"])
-    _systemctl(
-        runner, ["reset-failed", SUPERVISOR_UNIT.service_unit, SUPERVISOR_UNIT.timer_unit]
-    )
+        return _refused(
+            "uninstall", REASON_UNIT_REMOVAL_FAILED, removed=None,
+            effect_state=EFFECT_PARTIAL,
+        )
+    if not outcome.completed:
+        reason = {
+            UNINSTALL_DISABLE_FAILED: REASON_DISABLE_FAILED,
+            UNINSTALL_STOP_FAILED: REASON_STOP_FAILED,
+            UNINSTALL_RELOAD_FAILED: REASON_DAEMON_RELOAD_FAILED,
+            UNINSTALL_RESET_FAILED: REASON_RESET_FAILED,
+        }[outcome.phase]
+        return _refused(
+            "uninstall", reason, removed=outcome.removed,
+            effect_state=(
+                EFFECT_UNCERTAIN if outcome.removed is False else EFFECT_PARTIAL
+            ),
+        )
     return {
         "action": "uninstall", "performed": True, "reason": "",
-        "removed": removed, "label": SUPERVISOR_UNIT.label,
+        "removed": outcome.removed, "label": SUPERVISOR_UNIT.label,
+        "effect_state": EFFECT_COMPLETE,
     }
 
-
-#: The ``systemctl show`` properties the status projection reads. All are non-secret scalars.
-#:
-#: BOTH next-elapse properties are read, and that is not redundancy. systemd populates
-#: ``NextElapseUSecRealtime`` only for calendar (``OnCalendar``) timers; a monotonic timer — which
-#: this adapter's ``OnActiveSec`` / ``OnUnitActiveSec`` pair is — publishes
-#: ``NextElapseUSecMonotonic`` and leaves the realtime one **empty**. Reading only the realtime
-#: property reported a blank "next run" against a live, correctly-scheduled timer (measured during
-#: the Redmine #15183 installed-artifact smoke). Reading both keeps the projection correct if the
-#: cadence ever becomes calendar-based, and :data:`_NEXT_ELAPSE_PROPERTIES` fixes the preference
-#: order so the answer is never silently empty.
 
 #: The ``systemctl show`` properties the status projection reads. All are non-secret scalars. The
 #: next-elapse pair is owned by the unit-text layer (see ``NEXT_ELAPSE_PROPERTIES``).
@@ -847,8 +930,15 @@ __all__ = (
     "REASON_HOME_PIN_MISMATCH",
     "REASON_INSTALLED_COMMAND_DRIFT",
     "REASON_DAEMON_RELOAD_FAILED",
+    "REASON_DISABLE_FAILED",
     "REASON_ENABLE_FAILED",
+    "REASON_START_FAILED",
+    "REASON_STOP_FAILED",
+    "REASON_LIFECYCLE_BUSY", "REASON_LIFECYCLE_LOCK_UNREADABLE",
+    "REASON_MANAGER_DEFINITION_UNREADABLE", "REASON_MANAGER_DEFINITION_DRIFT",
+    "EFFECT_NONE", "EFFECT_PARTIAL", "EFFECT_UNCERTAIN", "EFFECT_COMPLETE",
     "REASON_RESTART_FAILED",
+    "REASON_RESET_FAILED",
     "REASON_UNIT_UNREADABLE",
     "REASON_UNIT_WRITE_FAILED",
     "REASON_UNIT_REMOVAL_FAILED",

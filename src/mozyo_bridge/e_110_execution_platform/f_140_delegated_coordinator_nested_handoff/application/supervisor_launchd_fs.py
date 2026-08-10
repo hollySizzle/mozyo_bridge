@@ -56,6 +56,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SUPERVISOR_AGENT,
     SupervisorAgent,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_scheduler_lifecycle_lock import (  # noqa: E501
+    SchedulerLifecycleLock,
+)
 
 #: Identity of whatever occupies an agent's plist path. Only :data:`PLIST_OWNED` may be mutated.
 PLIST_ABSENT = "absent"  # nothing there: a clean host, or one already torn down
@@ -252,6 +255,17 @@ def ensure_log_dir(os_home: Optional[Path] = None, *, agent: SupervisorAgent = S
     os.close(open_owned_dir(os_home, agent.log_relative, create=True))
 
 
+def acquire_lifecycle_lock(
+    os_home: Optional[Path] = None, *, agent: SupervisorAgent = SUPERVISOR_AGENT
+) -> SchedulerLifecycleLock:
+    """Serialize cooperating mutating verbs in this agent's pinned plist directory."""
+    dir_fd = open_owned_dir(os_home, agent.plist_relative, create=True)
+    try:
+        return SchedulerLifecycleLock.acquire(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 def _read_all(fd: int) -> bytes:
     chunks = []
     while True:
@@ -319,4 +333,5 @@ __all__ = (
     "write_owned",
     "unlink_owned",
     "ensure_log_dir",
+    "acquire_lifecycle_lock",
 )

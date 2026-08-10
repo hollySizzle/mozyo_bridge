@@ -32,10 +32,8 @@ Design boundary (design preflight j#78995 / Implementation Request j#79005):
   shell environment; the Redmine key/URL reach it through the daemon-trusted home-scoped credential
   file (``resolve_redmine_credentials``), never the plist. ``ProgramArguments`` is the exact
   PATH-resolved ``mozyo-bridge`` executable + structured argv — never a shell string.
-- **Structured launchctl only.** Every ``launchctl`` invocation is structured argv
-  (``bootstrap`` / ``bootout`` / ``kickstart -k`` / ``print``) — no shell. Install is idempotent
-  (bootout-then-bootstrap), restart acts only on a *loaded* service, uninstall removes exactly the
-  owned label / plist and touches nothing else.
+- **Structured launchctl only.** Every invocation uses argv, never a shell. Install and restart use
+  verified ``bootout`` then fresh exact bytes then ``bootstrap``; uninstall removes only our label.
 - **Fail-closed, zero-mutation refusals.** ``install`` / ``restart`` refuse — *before* writing any
   file or invoking launchctl — on a non-darwin host, a missing executable, or a retired drain plist
   that cannot be identified as ours. A non-ready Redmine credential is **not** among them since
@@ -68,11 +66,7 @@ from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.re
 from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_credentials import (
     resolve_redmine_credentials,
 )
-# The text layer (owned identity, path / argv resolution, plist rendering, and the vocabularies
-# those produce) lives in the sibling module so neither side exceeds the module-health
-# line budget — the same split the Linux adapter carries (review j#102069 F7). Everything is
-# re-exported here, so this module remains the single import for the whole macOS adapter and no
-# caller or test had to change.
+# The text layer lives in a sibling so both adapters remain within the module-health budget.
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd_agent import (  # noqa: E501
     DRAIN_LOG_RELATIVE,
     DRAIN_PLIST_RELATIVE,
@@ -98,10 +92,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SupervisorAgent,
     extract_pinned_home as _extract_pinned_home,
     log_path,
+    matches_rendered_plist,
     plist_path,
     render_plist,
-    # The pure launchctl-message layer. The probe module is its only caller now; re-exported here
-    # because this module stays the single import for the whole macOS adapter.
+    # Re-export the pure launchctl-message predicates for compatibility.
     names_exactly as _names_exactly,
     resolve_mozyo_home,
     resolve_supervisor_command,
@@ -123,10 +117,15 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     PLIST_OWNED,
     PLIST_UNREADABLE,
     OwnedPathError,
+    acquire_lifecycle_lock,
     ensure_log_dir,
     read_owned,
     unlink_owned,
     write_owned,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_scheduler_lifecycle_lock import (  # noqa: E501
+    SchedulerLifecycleLockBusy,
+    SchedulerLifecycleLockError,
 )
 # The read-only probe layer: running `launchctl print` and classifying what came back. Nothing in it
 # authorizes a mutation — see its module docstring.
@@ -211,6 +210,15 @@ REASON_PLIST_REMOVAL_FAILED = "plist_removal_failed"
 #: keys a bootstrapped job off its *label*, so a job whose file is gone keeps running until logout.
 #: The plist is kept on purpose: it is the operator's only durable trace of it (j#102496 r12f3).
 REASON_BOOTOUT_FAILED = "launchctl_bootout_failed"
+#: Another cooperating bridge lifecycle operation owns the scheduler fence.
+REASON_LIFECYCLE_BUSY = "scheduler_lifecycle_busy"
+#: The owned/private lifecycle lock identity could not be established.
+REASON_LIFECYCLE_LOCK_UNREADABLE = "scheduler_lifecycle_lock_unreadable"
+
+EFFECT_NONE = "none"
+EFFECT_PARTIAL = "partial"
+EFFECT_UNCERTAIN = "uncertain"
+EFFECT_COMPLETE = "complete"
 
 
 #: The same mapping for the CURRENT agent's own plist path. The tokens are distinct from the retired
@@ -305,45 +313,42 @@ def install(
     which: Callable[[str], Optional[str]] = shutil.which,
     agent: SupervisorAgent = SUPERVISOR_AGENT,
 ) -> dict:
-    """Write the owned plist and (re)bootstrap the single agent. Idempotent; fail-closed.
+    """Install under the shared cooperating-writer lifecycle fence."""
+    if not _running_on_darwin():
+        return _refused("install", REASON_UNSUPPORTED_PLATFORM, label=agent.label)
+    if resolve_supervisor_command(mozyo_home=mozyo_home, which=which, agent=agent) is None:
+        return _refused("install", REASON_EXECUTABLE_NOT_FOUND, label=agent.label)
+    try:
+        lifecycle = acquire_lifecycle_lock(os_home, agent=agent)
+    except SchedulerLifecycleLockBusy:
+        return _refused("install", REASON_LIFECYCLE_BUSY, label=agent.label)
+    except (SchedulerLifecycleLockError, OwnedPathError, OSError):
+        return _refused("install", REASON_LIFECYCLE_LOCK_UNREADABLE, label=agent.label)
+    with lifecycle:
+        return _install_locked(
+            os_home=os_home,
+            mozyo_home=mozyo_home,
+            interval_seconds=interval_seconds,
+            runner=runner,
+            which=which,
+            agent=agent,
+        )
 
-    Refuses — before any filesystem write or launchctl call — on a non-darwin host, a missing
-    executable, or a retired drain plist that cannot be identified as ours. The mozyo home is
-    resolved **once** and used for both the readiness projection and the pinned ``--home`` argv, so
-    the daemon reads the exact root the preflight validated. The plist / log live under the OS user
-    home (``os_home``).
 
-    **An unconfigured Redmine does not block the install** (review j#102151 Finding 4). Readiness is
-    resolved against the pinned home and *reported* as ``credential_readiness``, never used as a
-    gate — the same contract the Linux adapter has carried since #15183. It used to refuse here, a
-    rule inherited from #13683 when a supervisor tick meant nothing but a Redmine reconciliation.
-    Since #14150 gave the sweep a local drain leg, a tick does useful work from SQLite + Herdr with
-    no provider at all, so refusing to schedule anything left the local work unrun and made the
-    *operator-visible* meaning of ``install`` differ per host — which is what #15192 exists to end.
-    Nothing about credential handling loosens: values are still read only by
-    ``resolve_redmine_credentials``, an unsafe file still yields a redacted warning and no value, and
-    no credential reaches the plist, the status projection, or a log.
+def _install_locked(
+    *,
+    os_home: Optional[Path] = None,
+    mozyo_home: Optional[Path] = None,
+    interval_seconds: int = DEFAULT_OS_TICK_INTERVAL_SECONDS,
+    runner: Runner = _default_runner,
+    which: Callable[[str], Optional[str]] = shutil.which,
+    agent: SupervisorAgent = SUPERVISOR_AGENT,
+) -> dict:
+    """Retire the old drain job, verified-stop this label, write, and bootstrap one agent.
 
-    **Ordering: the retired drain agent is removed BEFORE the owned agent is written** (#15192).
-    That is the ordering that makes the acceptance invariant hold under partial failure. Installing
-    first and migrating second would, on a mid-sequence failure, leave the host with *two* running
-    registrations — precisely the state this change exists to end. Removing first can only ever leave
-    zero or one: a failure after the removal leaves the owned agent's install to be retried (it is
-    idempotent), and the removed drain leg is not a capability loss, since a ``--run-once`` tick
-    already does the drain leg's work.
-
-    **The identity fence covers this agent's own plist too** (review j#102496 r12f2). It used to
-    apply only to the retired drain path, so an install would happily overwrite a plist at its *own*
-    path carrying a stranger's ``Label`` — replacing someone else's LaunchAgent with ours. A path is a
-    location, not a proof of ownership; the ``Label`` inside the file is the identity, and only
-    ``absent`` or ``owned`` may be written over.
-
-    Every *preflight* refusal — platform, executable, an unidentifiable retired plist, and an
-    unidentifiable current plist — is evaluated before **either** mutation, so a refused install is
-    zero-mutation. Two refusals are not, and both stop **before the owned agent is written or
-    bootstrapped**: ``legacy_drain_state_unreadable`` (the bootout did not succeed, so nothing
-    authorizes a removal) and ``legacy_drain_removal_failed`` (the unlink failed after the job was
-    confirmed gone). These are reported honestly rather than described as zero-mutation.
+    The caller holds the lifecycle lock.  Identity/home/argv are re-read inside it; credential
+    readiness remains a projection, not an install gate.  Partial migration/bootout/write/load
+    failures carry an explicit ``effect_state`` instead of claiming zero mutation.
     """
     if not _running_on_darwin():
         return _refused("install", REASON_UNSUPPORTED_PLATFORM, label=agent.label)
@@ -378,26 +383,62 @@ def install(
         return _refused(
             "install", migration["reason"],
             credential_readiness=readiness, label=agent.label, legacy_drain=migration["state"],
+            effect_state=(
+                EFFECT_PARTIAL
+                if migration["reason"] == REASON_LEGACY_DRAIN_REMOVAL_FAILED
+                else EFFECT_UNCERTAIN
+            ),
         )
 
-    # Re-establish identity at ACTION time: the preflight above is stale by one migration, which ran
-    # a subprocess (j#102496 r12f1 / r12f2). As on the retired path, this narrows the window without
-    # closing it — `write_bytes` targets a path, not the inode just validated.
-    own_state = classify_agent_plist(os_home, agent=agent)
+    own_state, own_payload = read_owned(os_home, agent=agent)
     if own_state not in (PLIST_ABSENT, PLIST_OWNED):
         return _refused(
             "install", _PLIST_REFUSAL_REASON[own_state],
             credential_readiness=readiness, label=agent.label, legacy_drain=migration["state"],
             legacy_drain_removed=migration["removed"], plist_state=own_state,
+            effect_state=EFFECT_PARTIAL if migration["removed"] else EFFECT_NONE,
+        )
+    manager_state = _probe(runner, agent=agent)["state"]
+    if manager_state == PROBE_UNREADABLE:
+        return _refused(
+            "install", REASON_SERVICE_STATE_UNREADABLE,
+            credential_readiness=readiness, label=agent.label,
+            legacy_drain=migration["state"], legacy_drain_removed=migration["removed"],
+            probe_state=manager_state,
+            effect_state=EFFECT_PARTIAL if migration["removed"] else EFFECT_NONE,
+        )
+    effect_state, effect_payload = read_owned(os_home, agent=agent)
+    if (effect_state, effect_payload) != (own_state, own_payload):
+        return _refused(
+            "install", REASON_INSTALLED_COMMAND_DRIFT,
+            credential_readiness=readiness, label=agent.label,
+            legacy_drain=migration["state"], legacy_drain_removed=migration["removed"],
+            plist_state=effect_state,
+            effect_state=EFFECT_PARTIAL if migration["removed"] else EFFECT_NONE,
+        )
+    if manager_state == PROBE_LOADED:
+        booted_out = _launchctl(runner, ["bootout", _service_target(agent)])
+        if booted_out.returncode != 0:
+            return _refused(
+                "install", REASON_BOOTOUT_FAILED,
+                credential_readiness=readiness, label=agent.label,
+                legacy_drain=migration["state"], legacy_drain_removed=migration["removed"],
+                plist_state=effect_state, effect_state=EFFECT_UNCERTAIN,
+            )
+    write_state, write_payload = read_owned(os_home, agent=agent)
+    if (write_state, write_payload) != (own_state, own_payload):
+        return _refused(
+            "install", REASON_INSTALLED_COMMAND_DRIFT,
+            credential_readiness=readiness, label=agent.label,
+            legacy_drain=migration["state"], legacy_drain_removed=migration["removed"],
+            plist_state=write_state,
+            effect_state=(EFFECT_PARTIAL if manager_state == PROBE_LOADED
+                          or migration["removed"] else EFFECT_NONE),
         )
     expected_plist = render_plist(
         command, interval_seconds=interval_seconds, os_home=os_home, agent=agent
     )
     try:
-        # Both go through the pinned no-follow chain: `mkdir(parents=True)` and a leaf-only
-        # `O_NOFOLLOW` both walk the ancestors normally, which is how a symlinked
-        # `Library/LaunchAgents` put the whole install in someone else's directory (j#102590 r14f1).
-        # The write itself stages and renames rather than truncating (r14f2).
         ensure_log_dir(os_home, agent=agent)
         write_owned(expected_plist, os_home, agent=agent)
     except OSError:
@@ -405,14 +446,8 @@ def install(
             "install", REASON_PLIST_WRITE_FAILED,
             credential_readiness=readiness, label=agent.label, legacy_drain=migration["state"],
             legacy_drain_removed=migration["removed"], plist_state=own_state,
+            effect_state=EFFECT_PARTIAL,
         )
-    # A previously loaded agent must be booted out before bootstrap or launchd rejects the
-    # duplicate label; a not-loaded bootout is fine to ignore (idempotent install).
-    _launchctl(runner, ["bootout", _service_target(agent)])
-    # ``bootout`` is an effect boundary: a concurrent writer can replace the plist while launchctl
-    # runs. Re-read through the pinned filesystem seam and require the exact bytes this invocation
-    # wrote before handing the path to ``bootstrap``. Label ownership alone is insufficient because
-    # an owned-label plist may carry a different executable/home (review j#103073 r16f1).
     effect_state, effect_payload = read_owned(os_home, agent=agent)
     if effect_state != PLIST_OWNED:
         return _refused(
@@ -425,6 +460,7 @@ def install(
             legacy_drain=migration["state"],
             legacy_drain_removed=migration["removed"],
             plist_state=effect_state,
+            effect_state=EFFECT_PARTIAL,
         )
     if effect_payload != expected_plist:
         return _refused(
@@ -435,9 +471,8 @@ def install(
             legacy_drain=migration["state"],
             legacy_drain_removed=migration["removed"],
             plist_state=effect_state,
+            effect_state=EFFECT_PARTIAL,
         )
-    # launchctl takes a path here. The fresh exact-byte check above binds the authorization as close
-    # as this path-based API permits to the artifact it will resolve.
     result = _launchctl(
         runner, ["bootstrap", _gui_domain(), str(plist_path(os_home, agent=agent))]
     )
@@ -450,6 +485,7 @@ def install(
             "label": agent.label,
             "legacy_drain": migration["state"],
             "legacy_drain_removed": migration["removed"],
+            "effect_state": EFFECT_PARTIAL,
         }
     return {
         "action": "install",
@@ -461,6 +497,7 @@ def install(
         # What the migration did, so an upgrade is observable rather than silent.
         "legacy_drain": migration["state"],
         "legacy_drain_removed": migration["removed"],
+        "effect_state": EFFECT_COMPLETE,
     }
 
 
@@ -472,46 +509,44 @@ def restart(
     which: Callable[[str], Optional[str]] = shutil.which,
     agent: SupervisorAgent = SUPERVISOR_AGENT,
 ) -> dict:
-    """Kickstart (kill + relaunch) the *loaded* agent. Fail-closed zero-mutation.
+    """Verified unload/reload under the shared cooperating-writer lifecycle fence."""
+    if not _running_on_darwin():
+        return _refused("restart", REASON_UNSUPPORTED_PLATFORM, label=agent.label)
+    initial_state, _payload = read_owned(os_home, agent=agent)
+    if initial_state == PLIST_ABSENT:
+        return _refused("restart", REASON_NOT_INSTALLED, label=agent.label)
+    try:
+        lifecycle = acquire_lifecycle_lock(os_home, agent=agent)
+    except SchedulerLifecycleLockBusy:
+        return _refused("restart", REASON_LIFECYCLE_BUSY, label=agent.label)
+    except (SchedulerLifecycleLockError, OwnedPathError, OSError):
+        return _refused("restart", REASON_LIFECYCLE_LOCK_UNREADABLE, label=agent.label)
+    with lifecycle:
+        return _restart_locked(
+            os_home=os_home, mozyo_home=mozyo_home, runner=runner, which=which, agent=agent
+        )
 
-    The **installed plist** — not the caller's current shell — is the authority on the daemon's
-    mozyo home: restart reads the ``--home`` pin from the owned plist and checks *that* exact root's
-    credential readiness, so it never reports a false-ready restart when the current shell resolves a
-    different (ready) home than the one the loaded service actually runs with (j#79125 R3-F1).
 
-    **Whose plist it is comes before what is in it** (review j#102550 r13f1). restart used to read the
-    installed argv and ``--home`` pin without ever checking the ``Label``, so a stranger's plist that
-    happened to carry the expected ProgramArguments produced a ``performed: true`` kickstart — of
-    *our* label, on the strength of *their* file. Identity is classified at entry through the same
-    test install and uninstall use, and re-established after the probe, because a kickstart is a
-    mutation of the running system and the probe shells out.
+def _restart_locked(
+    *,
+    os_home: Optional[Path] = None,
+    mozyo_home: Optional[Path] = None,
+    runner: Runner = _default_runner,
+    which: Callable[[str], Optional[str]] = shutil.which,
+    agent: SupervisorAgent = SUPERVISOR_AGENT,
+) -> dict:
+    """Restart by verified unload/reload; the caller holds the lifecycle lock.
 
-    Refuses — before any launchctl mutation — on a non-darwin host, no installed plist (file
-    absent), a plist that is not ours, one that exists but is unreadable / non-mapping, an unhealthy
-    ``--home`` pin
-    (missing / malformed / duplicated / not an absolute canonical path), a requested ``mozyo_home``
-    that differs from the pin, installed ``ProgramArguments`` that no longer match the command an
-    install would write now (executable / argv drift — reinstall to change), a missing executable, or
-    a service that is not loaded.
-
-    A non-ready credential does **not** block a restart, for the same reason it no longer blocks an
-    install (j#102151 Finding 4): readiness is reported, not gated, and matches the Linux adapter.
+    The installed plist owns home/argv authority.  launchd exposes no stable loaded-argv API, so a
+    successful bootout plus fresh exact plist read and bootstrap replaces the former kickstart.
     """
     if not _running_on_darwin():
         return _refused("restart", REASON_UNSUPPORTED_PLATFORM, label=agent.label)
-    # Identity FIRST, through the same read install and uninstall use (review j#102550 r13f1), and
-    # in ONE descriptor with the bytes it judged (j#102590 r14f3).
-    # restart was the one verb left reading only the plist's contents — argv and home pin — without
-    # ever asking whose plist it was. A stranger's file carrying our expected ProgramArguments got a
-    # `performed: true` kickstart, and the kickstart went to OUR label: the evidence and the action
-    # named different services.
+    # Identity and bytes come from one pinned descriptor (j#102550 r13f1 / j#102590 r14f3).
     own_state, payload = read_owned(os_home, agent=agent)
     if own_state == PLIST_ABSENT:
         return _refused("restart", REASON_NOT_INSTALLED, label=agent.label)
     if own_state == PLIST_UNREADABLE:
-        # `home_pin` is still reported so consumers reading that field see what they always did; the
-        # reason is now the accurate one — a file we cannot parse is unidentifiable before it is
-        # un-pinnable (j#79136 R4-F3 kept the same refusal, under a token about the pin).
         return _refused(
             "restart", REASON_PLIST_UNREADABLE,
             home_pin=HOME_PIN_UNREADABLE, label=agent.label, plist_state=own_state,
@@ -531,27 +566,19 @@ def restart(
     pinned, pin_status = _extract_pinned_home(installed_argv)
     if pin_status != HOME_PIN_OK:
         return _refused("restart", REASON_HOME_PIN_UNHEALTHY, home_pin=pin_status, label=agent.label)
-    # A requested home that disagrees with the installed pin is a re-point attempt — refuse; a home
-    # change must rewrite the plist via install, not silently kickstart the old pin.
     if mozyo_home is not None and str(resolve_mozyo_home(mozyo_home)) != pinned:
         return _refused("restart", REASON_HOME_PIN_MISMATCH, home_pin=pin_status, label=agent.label)
     pinned_home = Path(pinned)
     expected = resolve_supervisor_command(mozyo_home=pinned_home, which=which, agent=agent)
     if expected is None:
         return _refused("restart", REASON_EXECUTABLE_NOT_FOUND, label=agent.label)
-    # The installed command must still be exactly what an install would write (same authority as
-    # `service_status`'s executable_matches): a moved executable or any argv drift means the loaded
-    # service runs a stale command — reinstall to change it, never kickstart the drift (j#79136 R4-F2).
     if installed_argv != expected:
+        return _refused("restart", REASON_INSTALLED_COMMAND_DRIFT, label=agent.label)
+    if not matches_rendered_plist(payload, expected, os_home=os_home, agent=agent):
         return _refused("restart", REASON_INSTALLED_COMMAND_DRIFT, label=agent.label)
     # Projected, NOT gated (j#102151 Finding 4).
     readiness = classify_credential_readiness(mozyo_home=pinned_home)
-    # The THREE-valued probe is carried through, not collapsed to a bool (review j#102398 r9f2).
-    # `_is_loaded` reduced "I could not read the manager" and "the manager says it is not there" to
-    # one `service_not_loaded`, dropping `probe_state` — so a permission-denied read was reported as
-    # an established fact, and the same envelope meant different things on the two hosts even though
-    # the backend declares the verbs identical. Both still refuse; they no longer claim to be the
-    # same refusal.
+    # Preserve the probe's three values; unreadable is not confirmed absence (j#102398 r9f2).
     probe_state = _probe(runner, agent=agent)["state"]
     if probe_state != PROBE_LOADED:
         return _refused(
@@ -563,10 +590,7 @@ def restart(
             label=agent.label,
             probe_state=probe_state,
         )
-    # Identity AND command/home at ACTION time: ``print`` above shelled out, so the original bytes
-    # are stale. A Label-only recheck allowed an owned-label plist with a replaced ProgramArguments
-    # to authorize kickstart. Re-read pinned bytes, require the same snapshot, and independently
-    # re-establish the exact expected argv/home before mutating the manager (j#103073 r16f1).
+    # The probe shelled out, so re-establish exact bytes/argv/home before the first manager effect.
     at_kickstart, action_payload = read_owned(os_home, agent=agent)
     if at_kickstart != PLIST_OWNED:
         return _refused(
@@ -592,14 +616,42 @@ def restart(
             label=agent.label,
             plist_state=at_kickstart,
         )
-    result = _launchctl(runner, ["kickstart", "-k", _service_target(agent)])
+    booted_out = _launchctl(runner, ["bootout", _service_target(agent)])
+    if booted_out.returncode != 0:
+        return {
+            "action": "restart",
+            "performed": False,
+            "reason": REASON_BOOTOUT_FAILED,
+            "credential_readiness": readiness,
+            "label": agent.label,
+            "effect_state": EFFECT_UNCERTAIN,
+        }
+    # launchd publishes no stable machine API for the loaded ProgramArguments.  A successful
+    # bootout followed by a fresh exact pinned read and bootstrap is therefore the verified reload
+    # that binds restart to the plist we can authenticate (j#103091/j#103093).
+    at_bootstrap, bootstrap_payload = read_owned(os_home, agent=agent)
+    if at_bootstrap != PLIST_OWNED or bootstrap_payload != action_payload:
+        return _refused(
+            "restart",
+            REASON_INSTALLED_COMMAND_DRIFT
+            if at_bootstrap == PLIST_ABSENT
+            else _PLIST_REFUSAL_REASON.get(at_bootstrap, REASON_INSTALLED_COMMAND_DRIFT),
+            credential_readiness=readiness,
+            label=agent.label,
+            plist_state=at_bootstrap,
+            effect_state=EFFECT_PARTIAL,
+        )
+    result = _launchctl(
+        runner, ["bootstrap", _gui_domain(), str(plist_path(os_home, agent=agent))]
+    )
     if result.returncode != 0:
         return {
             "action": "restart",
             "performed": False,
-            "reason": REASON_KICKSTART_FAILED,
+            "reason": REASON_BOOTSTRAP_FAILED,
             "credential_readiness": readiness,
             "label": agent.label,
+            "effect_state": EFFECT_PARTIAL,
         }
     return {
         "action": "restart",
@@ -607,6 +659,7 @@ def restart(
         "reason": "",
         "credential_readiness": readiness,
         "label": agent.label,
+        "effect_state": EFFECT_COMPLETE,
     }
 
 
@@ -616,44 +669,29 @@ def uninstall(
     runner: Runner = _default_runner,
     agent: SupervisorAgent = SUPERVISOR_AGENT,
 ) -> dict:
-    """Boot the agent out and remove exactly the owned plist. No credential required.
+    """Uninstall under the same fence used by install and restart."""
+    if not _running_on_darwin():
+        return _refused("uninstall", REASON_UNSUPPORTED_PLATFORM, label=agent.label)
+    try:
+        lifecycle = acquire_lifecycle_lock(os_home, agent=agent)
+    except SchedulerLifecycleLockBusy:
+        return _refused("uninstall", REASON_LIFECYCLE_BUSY, label=agent.label)
+    except (SchedulerLifecycleLockError, OwnedPathError, OSError):
+        return _refused("uninstall", REASON_LIFECYCLE_LOCK_UNREADABLE, label=agent.label)
+    with lifecycle:
+        return _uninstall_locked(os_home=os_home, runner=runner, agent=agent)
 
-    Credentials are never required: you must be able to remove a service without them. The plist
-    lives under the OS user home (``os_home``); no mozyo home is needed to remove it.
 
-    Two fences make "exactly the owned plist" true of the code rather than only of this sentence
-    (review j#102496 r12f2 / r12f3). Until then the verb deleted whatever file occupied the path,
-    whether or not the bootout had worked:
+def _uninstall_locked(
+    *,
+    os_home: Optional[Path] = None,
+    runner: Runner = _default_runner,
+    agent: SupervisorAgent = SUPERVISOR_AGENT,
+) -> dict:
+    """Verified-bootout and remove only an owned plist; credentials are never required.
 
-    **Identity.** The file is classified by its own ``Label`` before anything is touched. ``foreign``
-    and ``unreadable`` refuse with **zero mutation** — not even a bootout — because an unidentifiable
-    state is exactly where the ticket's fence says to stop (#15192 j#102088). The refusal is
-    deliberately total: it would be tempting to bootout anyway, since a bootout is label-scoped and
-    cannot affect a stranger's job, but that is still a mutation performed in a state this adapter
-    admits it does not understand. ``absent`` still boots out — nothing needs identifying, and a
-    loaded job whose file is already gone is precisely the state a teardown should clear.
-
-    **A verified stop, in every branch.** The verb succeeds only when ``launchctl bootout``
-    **succeeds**, the same single authority the retired-drain migration uses (gateway disposition
-    j#102458). Unlinking does not unregister anything — launchd keys a bootstrapped job off its
-    *label* — so deleting after a failed bootout hides a possibly-live job instead of stopping it.
-
-    That rule now covers the ``absent`` branch too (review j#102550 r13f3). It did not, on a
-    justification that contradicted itself: the comment there said a loaded job whose file is gone is
-    exactly what a teardown should clear, and then that the bootout's exit code decided nothing. If
-    that is the state being cleared, whether the bootout worked is precisely what matters — and when
-    it failed, this returned ``performed: true`` with an empty reason and the CLI exited 0 while the
-    job kept running.
-
-    The over-refusal is real, wider than before, and still the deliberate choice. A never-loaded
-    label can also fail to boot out, so an uninstall on an already-clean host — nothing installed,
-    nothing loaded — can now refuse with :data:`REASON_BOOTOUT_FAILED` instead of quietly succeeding.
-    That costs a visible, retryable refusal. The other direction costs an operator who believes a
-    service is gone while it runs until logout, which is the state #15192 exists to end. The result
-    carries the plist's state so nothing about what was left behind is silent.
-
-    A retired ``--drain-only`` registration from before #15192 is torn down under its own identical
-    fence, and its refusal never blocks this one: they are separate artifacts with separate reasons.
+    The caller holds the same lifecycle lock as install/restart.  A failed bootout never authorizes
+    unlink, and foreign/unreadable identity refuses before manager mutation.
     """
     if not _running_on_darwin():
         return _refused("uninstall", REASON_UNSUPPORTED_PLATFORM, label=agent.label)
@@ -671,7 +709,8 @@ def uninstall(
         # but the job may still be running, so this is a refusal rather than a quiet success. The
         # retired drain is left alone too — this host is not in a state we understand.
         return _refused(
-            "uninstall", REASON_BOOTOUT_FAILED, label=agent.label, plist_state=own_state
+            "uninstall", REASON_BOOTOUT_FAILED, label=agent.label, plist_state=own_state,
+            effect_state=EFFECT_UNCERTAIN,
         )
     if own_state == PLIST_ABSENT:
         # Nothing to unlink; the succeeding bootout was the whole teardown.
@@ -699,6 +738,7 @@ def uninstall(
         return _refused(
             "uninstall", REASON_PLIST_REMOVAL_FAILED,
             label=agent.label, removed=False, plist_state=at_unlink,
+            effect_state=EFFECT_PARTIAL,
         )
     migration = remove_legacy_drain(os_home=os_home, runner=runner)
     return _uninstall_result(True, "", agent=agent, migration=migration, plist_state=at_unlink)
@@ -718,6 +758,7 @@ def _uninstall_result(
         "legacy_drain": migration["state"],
         "legacy_drain_removed": migration["removed"],
         "legacy_drain_reason": migration["reason"],
+        "effect_state": EFFECT_COMPLETE if not migration["reason"] else EFFECT_PARTIAL,
     }
 
 
@@ -875,8 +916,11 @@ def _parse_owned(payload: bytes) -> Optional[dict]:
 
 
 def _refused(action: str, reason: str, **extra: object) -> dict:
-    """A fail-closed, zero-mutation refusal result (fixed vocabulary; no host detail)."""
-    return {"action": action, "performed": False, "reason": reason, **extra}
+    """A fixed-vocabulary refusal; callers override ``effect_state`` after prior effects."""
+    return {
+        "action": action, "performed": False, "reason": reason,
+        "effect_state": EFFECT_NONE, **extra,
+    }
 
 
 __all__ = (
@@ -901,6 +945,12 @@ __all__ = (
     "REASON_PLIST_FOREIGN_LABEL",
     "REASON_PLIST_UNREADABLE",
     "REASON_BOOTOUT_FAILED",
+    "REASON_LIFECYCLE_BUSY",
+    "REASON_LIFECYCLE_LOCK_UNREADABLE",
+    "EFFECT_NONE",
+    "EFFECT_PARTIAL",
+    "EFFECT_UNCERTAIN",
+    "EFFECT_COMPLETE",
     "REASON_PLIST_WRITE_FAILED",
     "REASON_PLIST_REMOVAL_FAILED",
     "PROBE_LOADED",

@@ -4,10 +4,10 @@ Split out of :mod:`...application.supervisor_launchd` to keep every module insid
 line budget, and because the boundary is a real one: nothing here mutates a host. It runs
 ``launchctl print``, classifies the answer three ways, and parses the manager's wording.
 
-**No classification produced here authorizes a mutation** (gateway disposition j#102458, reviews
-j#102496 r12f4 / j#102550 r13f6). ``print`` output once decided whether a failed ``bootout`` could
-still delete a plist; it decides nothing destructive now. Its consumers are ``service_status`` — a
-projection — and ``restart``'s refusal token.
+The classification is a conservative load-state prerequisite for install/restart, but never proves
+loaded argv, file identity, or permission to unlink.  Those authorities stay in the lifecycle
+adapter: restart uses verified bootout/fresh-plist/bootstrap, and a failed bootout never permits
+deletion (j#102458; j#103093).
 
 That sentence is deliberately narrower than the one it replaces (review j#102590 r14f4), which said
 a destructive verb importing from this module would be a defect — while the mutating modules were
@@ -67,10 +67,8 @@ def probe(runner: Runner, agent: SupervisorAgent = SUPERVISOR_AGENT) -> dict:
     "not loaded" reported a permission-denied / manager-error read as an established fact — "I could
     not see it" is not "it is not there".
 
-    **This is a status projection; it authorizes nothing.** ``confirmed_absent`` once let a failed
-    bootout still delete a plist; that authority is retired (j#102458, review j#102496 r12f4). The
-    three values now feed only ``service_status`` and ``restart``'s refusal token, where being wrong
-    costs an inaccurate read-out rather than a deleted registration.
+    This proves only the load-state token. It cannot prove manager-loaded argv and never authorizes
+    unlink; lifecycle code combines it with owned exact bytes and verified manager actions.
 
     A non-zero exit is classified as *confirmed absent* ONLY when launchctl positively says the
     service is unknown (:data:`LAUNCHCTL_NOT_FOUND_CODES` / :data:`_LAUNCHCTL_NOT_FOUND_PHRASES`).
@@ -140,12 +138,9 @@ def says_not_found(result, service_target: str) -> bool:
     domain/label, is what makes the reading specific enough to act on; requiring the *absence* of a
     permission signal is what stops "the reason we could not look" from passing as "nothing to see".
 
-    A miss on any conjunct yields :data:`PROBE_UNREADABLE`. Its consequences are entirely within the
-    read-only surface: ``service_status`` reports ``probe_state: unreadable``, and ``restart``
-    refuses with ``service_state_unreadable`` instead of kickstarting a service it cannot confirm is
-    loaded. **No install, uninstall, or unlink consults this** (review j#102550 r13f6 — the sentence
-    here used to claim it gated the install and prevented a second live registration, contradicting
-    the opening paragraph of this same docstring after j#102458 retired that authority).
+    A miss yields :data:`PROBE_UNREADABLE`: status projects unknown and install/restart refuse before
+    manager mutation.  The wording still never authorizes unlink or substitutes for exact plist
+    identity; only a bootout rc 0 carries verified-stop authority.
     """
     if result.returncode not in LAUNCHCTL_NOT_FOUND_CODES:
         return False
