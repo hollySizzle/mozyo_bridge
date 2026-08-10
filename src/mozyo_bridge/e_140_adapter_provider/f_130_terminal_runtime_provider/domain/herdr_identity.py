@@ -6,8 +6,9 @@ addresses a herdr target by a **handle**, and the #13175 herdr PoC
 (``vibes/docs/logics/herdr-poc-13175-experiment-log.md``) proved *which* handle is
 durable: experiment **E10** showed that a herdr **assigned name** (given by
 ``agent rename``, e.g. ``poc_claude``) survives a full ``server stop`` / restart,
-while ``pane_id`` and ``terminal_id`` are regenerated per process and are
-therefore disposable. The PoC learning was explicit: "mozyo-bridge の lane/Redmine
+while ``terminal_id`` is regenerated per process and ``pane_id`` is only a
+transient logical location that may be restored with the same text. Neither is
+a durable process-generation identity. The PoC learning was explicit: "mozyo-bridge の lane/Redmine
 紐付けに使う handle は herdr 付与名一択".
 
 This module is the **staged seam** that turns that learning into a contract: a
@@ -606,8 +607,9 @@ class HerdrAgentIdentity:
     The stable components are ``(workspace_id, lane_id, role)`` — the same slot the
     route-identity ledger uses — and the durable handle is :attr:`assigned_name`,
     the restart-surviving herdr name (PoC E10). This type deliberately carries
-    **no** ``pane_id`` / ``terminal_id`` field: those are per-process, disposable
-    locators, so a caller structurally cannot persist one as identity. The live
+    **no** ``pane_id`` / ``terminal_id`` field: ``terminal_id`` is per-process,
+    while ``pane_id`` is a transient logical locator whose text may be restored or
+    reused for a new terminal generation. Neither is durable identity. The live
     locator is recovered on demand by :func:`rebind_by_name` and is transient.
 
     Construction normalises the components (trim; empty lane -> :data:`DEFAULT_LANE`)
@@ -712,9 +714,10 @@ def rebind_by_name(
     Signature: ``rebind_by_name(name, agents) -> HerdrRebindResult``.
 
     This is the restart-recovery procedure the PoC prescribes: after a herdr
-    ``server`` restart the ``pane_id`` / ``terminal_id`` are regenerated, but the
-    assigned name persists, so the live target is re-discovered by **matching the
-    name** in the ``agent list`` snapshot — never by trusting a cached locator.
+    ``server`` restart regenerates ``terminal_id`` while the same ``pane_id`` text
+    may be restored for a new terminal generation. The assigned name persists, so
+    the live target is re-discovered by **matching the name** in the ``agent list``
+    snapshot — never by treating a cached locator as process-generation identity.
     ``agents`` is the read-only row shape herdr's ``agent list`` emits; each row's
     name rides on :data:`AGENT_KEY_NAME` and its transient locator on
     :data:`AGENT_KEY_LOCATOR` (alias :data:`AGENT_KEY_LOCATOR_ALIAS`).

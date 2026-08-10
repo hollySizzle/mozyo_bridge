@@ -47,6 +47,9 @@ BLOCK_ATTESTATION_UNREADABLE = "attestation_store_unreadable"
 BLOCK_PAIR_HEALTHY = "managed_pair_already_healthy"
 BLOCK_COMPOSER_LOSS_NOT_APPROVED = "pending_composer_loss_not_approved"
 BLOCK_SUPERSEDE_NOT_READY = "zero_effect_supersede_not_ready"
+BLOCK_GENERATION_CONDITIONAL_CLOSE_UNAVAILABLE = (
+    "generation_conditional_close_unavailable"
+)
 
 STATUS_PREFLIGHT = "preflight"
 STATUS_REFUSED = "refused"
@@ -158,6 +161,17 @@ class RestoredPairPlan:
     supersedes_revision: int = 0
 
     @property
+    def generation_conditional_close_available(self) -> bool:
+        """Whether close atomically consumes the observed terminal generation.
+
+        This is deliberately not a request or configuration field.  Herdr 0.8 /
+        protocol 19 accepts only ``pane_id`` at the close mutation, so a caller
+        cannot assert the missing safety capability into existence.
+        """
+
+        return False
+
+    @property
     def slots(self) -> Tuple[RestoredSlot, RestoredSlot]:
         return (self.gateway, self.worker)
 
@@ -216,6 +230,8 @@ class RestoredPairPlan:
             reasons.append(BLOCK_SUPERSEDE_NOT_READY)
         if not self.supersede_requested and self.action_generation != 1:
             reasons.append(BLOCK_SUPERSEDE_NOT_READY)
+        if self.generation_conditional_close_available is not True:
+            reasons.append(BLOCK_GENERATION_CONDITIONAL_CLOSE_UNAVAILABLE)
         return tuple(dict.fromkeys(reasons))
 
     @property
@@ -242,6 +258,9 @@ class RestoredPairPlan:
             "supersedes_generation": self.supersedes_generation,
             "supersedes_journal": self.supersedes_journal,
             "supersedes_revision": self.supersedes_revision,
+            "generation_conditional_close_available": (
+                self.generation_conditional_close_available
+            ),
             "may_recover": self.may_recover,
             "blocked_reasons": list(self.blocked_reasons),
             "slots": [slot.as_payload() for slot in self.slots],
@@ -351,6 +370,7 @@ __all__ = (
     "BLOCK_ATTESTATION_UNREADABLE",
     "BLOCK_COMPOSER_LOSS_NOT_APPROVED",
     "BLOCK_DEFAULT_LANE",
+    "BLOCK_GENERATION_CONDITIONAL_CLOSE_UNAVAILABLE",
     "BLOCK_IDENTITY_INCOMPLETE",
     "BLOCK_LIFECYCLE_NOT_CURRENT",
     "BLOCK_PAIR_HEALTHY",

@@ -12,6 +12,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.restored_pair_recovery import (  # noqa: E501
     APPROVAL_HEALTH_STATES,
+    BLOCK_GENERATION_CONDITIONAL_CLOSE_UNAVAILABLE,
     BLOCK_PAIR_INCOMPLETE,
     STATUS_COMPLETED,
     STATUS_PREFLIGHT,
@@ -82,7 +83,7 @@ class RestoredPairRecoveryOps(Protocol):
 
 
 class SublaneRestoredPairRecoveryUseCase:
-    """Read-only by default; execute only an exact direct-owner-approved pair action."""
+    """Diagnose a restored pair; refuse effects until close is generation-conditional."""
 
     def __init__(self, ops: RestoredPairRecoveryOps) -> None:
         self._ops = ops
@@ -113,6 +114,17 @@ class SublaneRestoredPairRecoveryUseCase:
                     else "preflight blocked: " + ", ".join(plan.blocked_reasons)
                 ),
                 required_approval_marker=marker,
+            )
+
+        # This precedes transaction inspection, approval reads, and replacement.
+        # The missing Herdr primitive is a compiled technical fact, not a
+        # caller-overridable policy flag.
+        if BLOCK_GENERATION_CONDITIONAL_CLOSE_UNAVAILABLE in plan.blocked_reasons:
+            return self._refused(
+                request,
+                plan,
+                "preflight blocked: "
+                + BLOCK_GENERATION_CONDITIONAL_CLOSE_UNAVAILABLE,
             )
 
         if (
