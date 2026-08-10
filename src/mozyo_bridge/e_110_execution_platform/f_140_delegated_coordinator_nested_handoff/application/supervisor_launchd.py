@@ -106,6 +106,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LAUNCHCTL_NOT_FOUND_CODES as _LAUNCHCTL_NOT_FOUND_CODES,
     LAUNCHCTL_UNREADABLE_PHRASES as _LAUNCHCTL_UNREADABLE_PHRASES,
     names_exactly as _names_exactly,
+    has_not_found_clause as _has_not_found_clause,
     not_found_operand as _not_found_operand,
     quoted_names as _quoted_names,
     resolve_mozyo_home,
@@ -366,23 +367,44 @@ def _says_not_found(result, service_target: str) -> bool:
     """
     if result.returncode not in _LAUNCHCTL_NOT_FOUND_CODES:
         return False
-    message = f"{getattr(result, 'stderr', '') or ''}\n{getattr(result, 'stdout', '') or ''}"
-    # Two readings of one string, kept apart on purpose (review j#102327 finding r6f1). *Wording* is
-    # prose whose capitalization is not a contract, so phrases are matched case-folded. *Identity* is
-    # the label launchd keys the job off, and folding its case would make a DIFFERENT label's absence
-    # read as ours — so identity is matched against the message exactly as launchctl wrote it.
-    wording = message.lower()
-    if any(phrase in wording for phrase in _LAUNCHCTL_UNREADABLE_PHRASES):
+    # The two streams are read SEPARATELY, as the distinct texts launchctl actually wrote (review
+    # j#102417 finding r10f1). Concatenating them into one string handed the position-aware parser a
+    # sentence that never existed: `stderr="Could not find service"` with `stdout='"<owned>"'` put a
+    # phrase and an operand on either side of the joining newline, which satisfied "separated by
+    # whitespace only" and authorized unlinking the owned plist. Hardening the parser is worth
+    # nothing if its caller can manufacture the very adjacency the parser checks.
+    streams = [
+        getattr(result, "stderr", "") or "",
+        getattr(result, "stdout", "") or "",
+    ]
+    # Wording is prose whose capitalization is not a contract, so phrases are matched case-folded.
+    # Identity is the label launchd keys the job off, matched exactly as launchctl wrote it (review
+    # j#102327 finding r6f1). A denial signal anywhere disqualifies the whole read: it names why we
+    # could not look, which is the opposite of evidence that there is nothing to look at.
+    if any(
+        phrase in stream.lower()
+        for stream in streams
+        for phrase in _LAUNCHCTL_UNREADABLE_PHRASES
+    ):
         return False
-    # Bind the reading to what we asked about — and bind it to the *right part* of the sentence.
-    # Finding the phrase somewhere and our label somewhere are two separate existence checks; a
-    # message can satisfy both while saying the opposite of what we need (review j#102383 r8f1).
     target = service_target or ""
     label = target.rsplit("/", 1)[-1]
     if not label:
         return False
-    operand = _not_found_operand(message)
-    return operand is not None and operand in (target, label)
+    bound = False
+    for stream in streams:
+        operand = _not_found_operand(stream)
+        if operand is None:
+            # A stream that says nothing about absence is normal (an empty stdout, say). A stream
+            # that DOES carry recognized wording but yields no operand is ambiguity, and ambiguity is
+            # not resolved by whatever the other stream happens to say.
+            if _has_not_found_clause(stream):
+                return False
+            continue
+        if operand not in (target, label):
+            return False  # this stream reports a DIFFERENT service missing: contradictory
+        bound = True
+    return bound
 
 
 def _small_int_or_none(token: str) -> Optional[int]:

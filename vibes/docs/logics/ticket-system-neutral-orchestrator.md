@@ -558,6 +558,15 @@ span のどこかにある」という **2 つの独立した存在確認**を�
 別 service の not-found と owned label の併記、phrase の前後に owned label があるだけの入力、clause が
 複数ある入力（どれが支配するかの規則がない）は、すべて `unreadable` へ倒す。
 
+**stderr と stdout は独立した原文として parse する**（review j#102417 finding r10f1）。両者を 1 文字列へ
+連結してから parse すると、挿入した改行が「clause と operand の間は空白のみ」を満たし、
+`stderr="Could not find service"` と `stdout='"<owned>"'` のように **どちらの stream 単独にも存在しない文**を
+合成して削除を authorize できた。parser をいくら厳格化しても、**その入力を作る側が検査対象の隣接関係を捏造
+できる**なら意味がない。したがって: (a) stream をまたぐ補完を行わない、(b) recognized clause を含みながら
+operand を解決できない stream があれば `unreadable`（曖昧さを他方の肯定で埋めない）、(c) ours 以外を operand と
+する stream があれば `unreadable`（相反）、(d) いずれかの stream が **同一 stream 内で** ours を operand として
+解決した場合のみ `confirmed_absent`。denial signal はどちらの stream にあっても read 全体を失格させる。
+
 clause と operand の結合は **位置つきの単一 scanner** で行う（review j#102398 finding r9f1）。phrase 探索と
 引用符探索を別々に行うと、次のいずれも「clause」を満たしてしまい所有 plist の削除を authorize した:
 operand が**非引用**で ours が後続の別 span（`... service com.example.other; suggestion "<owned>"`）、

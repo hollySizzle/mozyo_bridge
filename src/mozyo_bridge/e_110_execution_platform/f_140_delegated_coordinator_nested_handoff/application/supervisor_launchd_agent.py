@@ -348,6 +348,18 @@ def not_found_operand(message: str) -> Optional[str]:
     return None
 
 
+def has_not_found_clause(message: str) -> bool:
+    """Whether ``message`` carries recognized not-found wording outside every quoted span (pure).
+
+    Used to tell "this stream said nothing about absence" (normal) from "this stream tried to say
+    something and could not be resolved" (ambiguity). Only the first may be passed over silently.
+    """
+    spans = quoted_spans(message)
+    if spans is None:
+        return False
+    return bool(_not_found_clauses(message, spans))
+
+
 def _not_found_clauses(
     message: str, spans: list[tuple[int, int]]
 ) -> list[tuple[int, int]]:
@@ -498,6 +510,7 @@ __all__ = (
     "read_installed_plist",
     "LAUNCHCTL_NOT_FOUND_CODES",
     "not_found_operand",
+    "has_not_found_clause",
     "quoted_spans",
     "quoted_names",
     "names_exactly",

@@ -1170,6 +1170,84 @@ class LegacyDrainMigrationTest(_DarwinCase):
             )["state"]
             self.assertEqual(state, sl.PROBE_UNREADABLE, why)
 
+    def test_a_clause_and_an_operand_in_DIFFERENT_streams_do_not_bind(self) -> None:
+        # Review j#102417 finding r10f1. `stderr` and `stdout` were concatenated into one string
+        # before parsing, so the joining newline satisfied "clause and operand separated by
+        # whitespace only" — a sentence launchctl never wrote. Hardening the parser is worth nothing
+        # if its caller can manufacture the adjacency the parser checks. Both directions are pinned:
+        # the reverse only failed before by accident of concatenation order, which a later change to
+        # that order would silently undo.
+        owned = sl.LEGACY_DRAIN_AGENT.label
+        for stderr, stdout, why in (
+            ("Could not find service", f'"{owned}"', "phrase in stderr, operand in stdout"),
+            (f'"{owned}"', "Could not find service", "phrase in stdout, operand in stderr"),
+        ):
+            self.assertFalse(
+                sl._says_not_found(
+                    _result(113, stdout=stdout, stderr=stderr),
+                    f"{_GUI_DOMAIN}/{owned}",
+                ),
+                why,
+            )
+
+    def test_a_canonical_clause_binds_from_either_stream_alone(self) -> None:
+        # The complement: a whole clause living in one stream is exactly what this recognizes, and
+        # launchctl may write it to either.
+        owned = sl.LEGACY_DRAIN_AGENT.label
+        clause = f'Could not find service "{owned}" in domain for gui'
+        for stderr, stdout, why in (
+            (clause, "", "stderr alone"),
+            ("", clause, "stdout alone"),
+            (clause, clause, "both streams agree"),
+        ):
+            self.assertTrue(
+                sl._says_not_found(
+                    _result(113, stdout=stdout, stderr=stderr),
+                    f"{_GUI_DOMAIN}/{owned}",
+                ),
+                why,
+            )
+
+    def test_streams_that_disagree_or_dangle_are_unreadable(self) -> None:
+        # One stream's positive reading may not paper over the other's contradiction or ambiguity.
+        owned = sl.LEGACY_DRAIN_AGENT.label
+        clause = f'Could not find service "{owned}" in domain for gui'
+        for stderr, stdout, why in (
+            (clause, 'Could not find service "com.example.other"', "streams name different services"),
+            (clause, "Could not find service", "the other stream has wording but no operand"),
+            (clause, "Operation not permitted", "a denial signal anywhere disqualifies the read"),
+        ):
+            self.assertFalse(
+                sl._says_not_found(
+                    _result(113, stdout=stdout, stderr=stderr),
+                    f"{_GUI_DOMAIN}/{owned}",
+                ),
+                why,
+            )
+
+    def test_cross_stream_vectors_keep_the_plist_end_to_end(self) -> None:
+        owned = sl.LEGACY_DRAIN_AGENT.label
+        for stderr, stdout, why in (
+            ("Could not find service", f'"{owned}"', "phrase in stderr, operand in stdout"),
+            (f'"{owned}"', "Could not find service", "phrase in stdout, operand in stderr"),
+        ):
+            legacy = _legacy_drain_plist(self.os_home)
+
+            class _CrossStream:
+                def __call__(self, argv):
+                    argv = list(argv)
+                    target = argv[2] if len(argv) > 2 else ""
+                    if owned in target:
+                        if argv[1] == "print":
+                            return _result(113, stdout=stdout, stderr=stderr)
+                        return _result(1, stderr="bootout failed")
+                    return _result(0)
+
+            result = sl.remove_legacy_drain(os_home=self.os_home, runner=_CrossStream())
+            self.assertFalse(result["removed"], why)
+            self.assertEqual(result["reason"], sl.REASON_LEGACY_DRAIN_STATE_UNREADABLE, why)
+            self.assertTrue(legacy.exists(), why)
+
     def test_the_clause_must_be_positionally_bound_to_its_operand(self) -> None:
         # Review j#102398 finding r9f1. The parser searched for the phrase and for a quote
         # independently and called the pair a clause. Three messages satisfied that while saying
