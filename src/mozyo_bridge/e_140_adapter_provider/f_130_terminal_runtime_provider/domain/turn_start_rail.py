@@ -89,12 +89,11 @@ shape nine times in one lane: the body was typed, the first Enter was sent, the
 evidence about the **observer**, not the receiver, so refusing to press Enter
 again is not a safety property — it is a lost turn.
 
-``error`` is therefore an Enter-resend candidate too, on the SAME single-Enter
-budget (:attr:`HerdrTurnStartRail.max_enter_resends` — the body is typed once and
-at most ONE extra Enter is ever pressed across both arming kinds), re-waiting on
-:attr:`HerdrTurnStartRail.error_resend_wait_timeout_ms` (default and hard maximum
-15s, :data:`MAX_ERROR_RESEND_WAIT_TIMEOUT_MS`): the first wait measured nothing
-about how long a start takes here, so the retry gets more room than the 8s window.
+``error`` is therefore a resend candidate too. Timeout-only sequences keep the
+configured :attr:`HerdrTurnStartRail.max_enter_resends` budget. After ``error``,
+the effective total budget is hard-capped at one, including a later timeout. The
+error resend re-waits on :attr:`HerdrTurnStartRail.error_resend_wait_timeout_ms`
+(default and hard maximum 15s): the failed first wait measured no start latency.
 
 The error path's resend gate is deliberately **stricter** than the timeout path's,
 and the asymmetry is the point. A timeout is a positive observation (the wait ran
@@ -703,20 +702,26 @@ class HerdrTurnStartRail:
                 snapshot_state=snapshot_state,
             )
 
-        # --- 4. Collect the wait, then run the bounded Enter-resend rail. A first
-        # wait that neither confirmed a start nor proved the pane gone (timeout —
-        # E14; error — #15202) is a resend CANDIDATE; the per-kind gate below decides
-        # whether Enter may actually be pressed. Both kinds draw on one budget, so the
-        # body is typed once and at most `max_enter_resends` extra Enters are sent.
+        # --- 4. Collect, then run the bounded resend rail (E14 / #15202).
+        # Timeout-only sequences retain the configured budget. Once an error is
+        # observed, the effective total budget is capped at one across both kinds.
         wait_result = armed.collect()
         first_wait_kind = wait_result.kind
         resends = 0
         skipped_reason = RESEND_SKIP_NONE
+        error_seen = False
         while wait_result.kind in RESENDABLE_WAIT_KINDS:
-            if resends >= self._max_enter_resends:
+            if wait_result.kind == WAIT_ERROR:
+                error_seen = True
+            effective_resend_budget = (
+                min(self._max_enter_resends, 1)
+                if error_seen
+                else self._max_enter_resends
+            )
+            if resends >= effective_resend_budget:
                 skipped_reason = (
                     RESEND_SKIP_DISABLED
-                    if self._max_enter_resends == 0
+                    if effective_resend_budget == 0
                     else RESEND_SKIP_BUDGET_EXHAUSTED
                 )
                 break

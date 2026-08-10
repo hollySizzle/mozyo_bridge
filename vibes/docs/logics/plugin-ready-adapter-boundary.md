@@ -1467,10 +1467,12 @@ shape nine times in one lane: the body was typed, the first Enter was sent, the
 evidence about the **observer**, not about the receiver, so refusing to press Enter
 again was not a safety property — it was a lost turn.
 
-`error` is therefore an Enter-resend candidate too, drawing on the **same single
-budget** as the timeout path (`max_enter_resends`, default `1`), so the body is typed
-once and at most one extra Enter is ever pressed — a mixed `timeout`-then-`error`
-sequence cannot spend it twice. Only the error-armed re-wait uses the longer
+`error` is therefore an Enter-resend candidate too. A timeout-only sequence keeps
+the configured `max_enter_resends` budget (default `1`), including values above
+one. Once a sequence encounters `error`, however, its effective **total** resend
+budget is hard-capped at one: an `error` cannot spend a second Enter after a
+timeout resend, and a timeout after an error resend cannot spend one either. The
+body is still typed exactly once. Only the error-armed re-wait uses the longer
 `error_resend_wait_timeout_ms` window (default **and hard maximum** 15s): the first
 wait *failed* rather than timing out, so it measured nothing about how long a start
 takes here. Non-positive values and values above 15s are rejected at construction;
