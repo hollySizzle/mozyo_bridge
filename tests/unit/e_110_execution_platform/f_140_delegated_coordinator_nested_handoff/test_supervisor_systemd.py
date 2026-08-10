@@ -376,7 +376,7 @@ class ExecArgvQuotingTest(unittest.TestCase):
 
     def test_a_literal_percent_is_escaped_so_systemd_does_not_expand_it(self) -> None:
         # Measured on a live user manager (review j#102053 F4): an unescaped `%h` in ExecStart is
-        # expanded by systemd, so the executed argv was `/opt//home/holly/mozyo-bridge` while the
+        # expanded by systemd, so the executed argv contained the expanded user home while the
         # unit's literal text said `/opt/%h/mozyo-bridge`. Only `%%` pins a literal percent.
         rendered = ss.format_exec_argv(["/opt/%h/mozyo-bridge", "--home", "/tmp/%h"])
         self.assertIn("%%h", rendered)
@@ -506,10 +506,12 @@ class CredentialIsProjectedNotGatedTest(_LinuxCase):
     def test_an_unsafe_credential_is_never_read_into_the_unit(self) -> None:
         # The safety boundary is preserved by NOT using the value, not by refusing the install:
         # the resolver withholds an unsafe file's contents, so nothing can reach the unit.
-        _write_home_credential(self.mozyo_home, api_key="super-secret-key", mode=0o644)
+        _write_home_credential(
+            self.mozyo_home, api_key="DROP-CREDENTIAL-SENTINEL", mode=0o644
+        )
         self._install(credential=False)
         text = ss.service_unit_path(self.os_home).read_text(encoding="utf-8")
-        self.assertNotIn("super-secret-key", text)
+        self.assertNotIn("DROP-CREDENTIAL-SENTINEL", text)
         self.assertNotIn("redmine.example.test", text)
 
     def test_no_credential_refusal_token_exists_on_this_adapter(self) -> None:
@@ -1126,7 +1128,7 @@ class ServiceStatusTest(_LinuxCase):
         self.assertFalse(ss.unit_dir(self.os_home).exists())
 
     def test_status_emits_no_secret(self) -> None:
-        _write_home_credential(self.mozyo_home, api_key="super-secret-key")
+        _write_home_credential(self.mozyo_home, api_key="DROP-CREDENTIAL-SENTINEL")
         self._install(credential=False)
         blob = repr(
             ss.service_status(
@@ -1134,7 +1136,7 @@ class ServiceStatusTest(_LinuxCase):
                 runner=self._runner(), which=_which_found,
             )
         )
-        self.assertNotIn("super-secret-key", blob)
+        self.assertNotIn("DROP-CREDENTIAL-SENTINEL", blob)
         self.assertNotIn("redmine.example.test", blob)
 
     def test_an_uninstalled_host_reports_the_would_be_root_readiness(self) -> None:

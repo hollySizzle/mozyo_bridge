@@ -150,6 +150,7 @@ same-lane implementation_gateway が **callback delivery 確認済みの provide
       - **既存 hibernate-evidence gate (`park_declared` / `review_result` / `required_ci_green` / `integration_disposition` / `dogfood_delegated`) は `redmine:#14219:j#85530:Q3` を維持する**。本 command の追加で既存 evidence の anchor 文字列は 1 文字も変わらない (**re-attribution しない**)。
       - **no-change Review waiver gate `no_change_review_waiver` の ruling は `redmine:#14695:j#93412`** (Design Consultation Answer)。writer role は `coordinator`、provenance 軸は marker の `approval_source=direct_owner` で、両者は連言であり代替関係ではない (#14695 j#93412)。**同一 consultation の先行 Answer j#93406 を pointer にしない** — 両者とも writer を `coordinator` と裁定しており binding 自体は同じだが、hard carve-out と live 測定境界を持つのは j#93412 だけなので、j#93406 を指すと `is_anchored` は通るのに**現行契約を述べていない record** へ読者を送ることになり、(a) が防ぐ誤帰属と同型になる。この gate も (b)(c) の合成規則と fail-closed 条件は既存 gate と同一で、既存 5 gate の anchor 文字列は 1 文字も変わらない。
       - **global offline rollout gate `herdr_offline_rollout_owner_approval` の ruling は `redmine:#14838:j#97993`**。writer role は `coordinator`、全workspace停止・3-store migration・runtime cutoverを承認した判断のprovenanceはmarkerの `approval_source=direct_owner` で、両者を連言する。full approval manifest + issueのdigestをmarkerへ束縛し、source-system author ID一致はauthorityに使わない。(b)(c) の合成とunanchored refusalは他gateと同じで、既存gateのruling pointerを変更しない。
+      - **post-reboot pair recovery gate `restored_pair_recovery_owner_approval` の ruling は `redmine:#15227:j#102879`**。writer role は `coordinator`、owner 判断は marker の `approval_source=direct_owner` と連言する。pair 全体の lifecycle / participant / worktree pin と composer loss の許可を action digest に束縛し、既存 gate の ruling pointer を変更しない。ただしこのgateはconditional-close導入後のために予約されたdormant contractであり、現行read-only診断はmarkerを生成せず、gateを破壊操作へ使わない。
       - **ruling を持たない gate は unanchored** となり、本 surface は zero-close で refuse する (fail-closed)。
       - 本節の (a) と既存 gate の維持は **test が code から導出して照合する**ため、runbook と実装のどちらか一方だけを変えると赤化する (前 3 round 連続で docs drift を出したため綴り検査ではなく導出照合にした)。
     - ★**旧実装の「approval journal の author == issue の author」は撤去した** (#14661 review j#92601 F1)。実測で worker / gateway / coordinator の全 role が同一 source-system user id で書いており、この述語は **issue 上の全 journal が満たす**。何も証明していなかった。
@@ -212,7 +213,7 @@ host (Mac 等) が再起動されると lane pane の Claude/Codex TUI は exit 
 - **state を混同しない (authority matrix, #13520 j#75276)**: Redmine issue/journal = workflow gate と durable anchor / Git worktree・ref・diff = code と dirty state / `registry.sqlite` + repo-local anchor = workspace identity / `state.sqlite` = lane metadata・callback outbox の復元材料 (workflow truth ではない) / herdr assigned-name + live inventory = runtime liveness / launch-time sender env = 再 attest する process-local input (永続 authority にしない)。
 - **composite liveness で false-positive adopt を防ぐ (#13518 j#75329)**: `herdr session-start` の adopt 判定は assigned `name` 一致だけでは不十分。`agent list` row を `classify_named_slot` (`domain/herdr_slot_liveness.py`) で複合判定し、detected agent 不在 + `agent_status=unknown` の **shell residue** は `stale_named_slot` として outcome `stale` で surface する (blind adopt しない / 名前が残っているため launch も上書きしない)。detected agent が名指しされた live slot は従来どおり adopt、liveness signal を一切持たない minimal row も従来どおり adopt (self-heal 不変)。
 - **dirty worktree を never-clobber**: recovery 中に lane worktree を reset / stash / delete / recreate しない。未 commit 成果は保全して同一 durable anchor から resume する (12-file dirty diff を SHA-256 で preflight/post-check して不変を確認した実例: #13518 j#75331/j#75334)。
-- **stale pane の close + same-slot relaunch は destructive** ゆえ **owner-approved recovery gate** を要求する (replayable に journal 記録: #13518 j#75331)。承認後は old pane を `herdr pane close` → 同一 lane/worktree へ `herdr session-start` で relaunch (adopt でなく launched になる)。
+- **stale shell-residue pane の close + same-slot relaunch は destructive** ゆえ **owner-approved recovery gate** を要求する (replayable に journal 記録: #13518 j#75331)。この履歴例は、agent processが無いlogical pane自体のcloseをownerが承認したscopeである。exact terminal generationだけを閉じる #15227 active-sublane recoveryには適用せず、raw `herdr pane close`で代用しない。
 - **projection cache を authority にしない**: `sublane status` の `panes=[]` は stale projection でありうる。live assigned-name inventory と矛盾する場合は同じ reconciler で fail-closed に扱い、runtime 不在と即断しない。
 - **env 欠落に注意**: reboot 後に adopt された既存 process は launch-time `MOZYO_WORKSPACE_ID` / `MOZYO_AGENT_ROLE` / `MOZYO_LANE_ID` を欠くことがある (session-start adopt は retroactive 注入しない)。正規 dispatch が `missing_sender_env` で fail-closed した場合、registry/anchor/live assigned-name から検証した値を **その 1 回の** high-level dispatch child process にだけ再注入する (env spoof / 別 role 偽装はしない)。Herdr backend では tmux 専用の `mozyo-bridge init` hint は無効 (`TMUX_PANE is not set`)。
 - **fail-closed 条件**: workspace mismatch / missing・unreadable journal / ambiguous live slot / DB と Redmine・Git の矛盾は停止。implementation/close/integration/publish を自動承認しない。
@@ -421,6 +422,50 @@ forceやpending overrideを加えない。pending generationが本当に破棄�
 | logout / `authentication required` / process終了 | `agent_auth_unavailable` | credentialを記録せずre-authまたはfresh agent relaunch | routing bug扱い、blind resend |
 | agentはliveだが実command shellに`MOZYO_WORKSPACE_ID` / `MOZYO_AGENT_ROLE` / `MOZYO_LANE_ID`が無い/不整合 | `sender_identity_missing_or_conflict` | dispatchを止め、runtime propagation/proxy gapをdurable化 | 手動env注入、raw Herdr send |
 | assigned-name/lane slotが無い、または複数 | `route_runtime_unavailable` | lane metadata + live inventoryを再取得し、standard relaunch/preflightへ | tmux-era candidate空振りだけで断定 |
+
+### 再起動復元後の active sublane pair を診断する (#15227)
+
+`sublane recover-restored-pair` は、active な issue-owned sublane の gateway/worker が
+両方 live だが、再起動復元後の command-shell CWD が lifecycle row の canonical worktree
+と一致しない、または live locator に結び付いた startup self-attestation が non-green な
+場合の公開read-only診断である。default lane と片側だけ存在する pair は本診断の対象外
+である。default coordinator を安全に self-close/relaunch する公開 rail は現時点では未実装
+であり、本コマンドで代用してはならない。片側だけ存在する pair は vanished-slot 用 rail
+を使う。
+
+- 現行で提供する動作は read-only preflight だけである。`--allow-pending-composer-loss` は、
+  eventual replacementで旧 pane の未送信composer textが失われ得るかを診断結果へ含めるための
+  入力であり、close、file破棄、またはowner approvalを実行するflagではない。
+- preflight は lifecycle の issue/lane/revision/generation、canonical worktree token、branch/HEAD、
+  gateway/worker の assigned name/locator/inventory revision、runtime state、CWD、startup
+  attestation を結合する。runtime は両 slot とも明示的な `awaiting_input` または
+  `turn_ended` の場合だけ settled とする。status 欠落、`unknown`、未知値、非文字列、
+  `blocked`、`busy` はいずれも非actionableである。両 slot が healthy、inventory/
+  attestation が読めない、pair が一意でない、worktree/branchが動いた場合も同様である。
+- **現行は診断専用で、破壊操作を持たない**。Herdr 0.8 / protocol 19 の `pane.close` は
+  `pane_id` だけを受け取り、preflightで観測したterminal generationやinventory revisionを
+  close mutationと同じ原子的操作で照合できない。server restartでは同じlogical pane idを
+  復元しつつterminal generationが変わり得るため、inventoryのfresh read直後に
+  `pane close <pane_id>`を呼ぶ二段階処理もexact-generation closeにはならない。
+  `generation_conditional_close_unavailable` は全planに付く技術的blockerであり、
+  `required_approval_marker` は生成しない。public CLIに `--execute` はなく、programmatic CLI
+  呼出しも常にread-onlyである。live replacement portを直接呼んでもreplacement transaction、
+  close、launch、sendを一切行わずtyped refusalを返す。raw Herdr closeや二重readで迂回しては
+  ならない。
+- **先行要件**: Herdr server内の同じclose操作で、少なくとも `pane_id` と期待するterminal
+  generation（必要に応じてassigned name / inventory revisionも）を照合し、
+  `closed | absent | precondition_failed` を区別して返すconditional-close primitiveが必要である。
+  このprimitiveとadapterが実装・検証されるまで、本railはapproval-readyにもdogfood-readyにも
+  ならない。
+- **conditional close導入後に再審査する契約**: 既存のowner approval digest、approval-time
+  health pin、replacement transaction、zero-effect transactionのgeneration再承認CASは将来の
+  候補として残る。ただしread-sideのfresh再確認だけで現行locator-only closeを有効化しては
+  ならない。Herdrのclose mutation自体が承認されたterminal generationを消費し、その返却値を
+  transaction effect receiptへ結合できて初めて、marker生成とclose → same-slot launch →
+  action-bound attestationを有効化する。その時点でpartial replay、healthy化、generation ABA、
+  close成功後CAS前停止を改めて独立reviewする。
+- provider の会話セッション再開は保証しない。保証対象は worktree/branch/file と durable record
+  であり、古い pane の画面内容は必要なら read-only capture して Redmine の状態判断へ反映する。
 
 `sublane create --execute`がlaunch後にdispatchだけfailした場合は、起動済みslot、未配送anchor、失敗理由をjournalに残す。partial laneを成功扱いせず、同じcommandをblind replayしない (Redmine #13613)。
 

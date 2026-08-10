@@ -151,6 +151,11 @@ class HerdrSectionAttestationTest(unittest.TestCase):
             any("self-attestation" in note for note in section["notes"])
         )
         self.assertTrue(section["next_action"])
+        next_action = " ".join(section["next_action"])
+        self.assertIn("recover-restored-pair", next_action)
+        self.assertIn("no supported close/relaunch action exists", next_action)
+        self.assertIn("Do not substitute raw", next_action)
+        self.assertNotIn("owner-approved close", next_action)
 
     def test_present_generation_matched_is_ok(self) -> None:
         ours, view = self._view_with_agent(locator="%5")

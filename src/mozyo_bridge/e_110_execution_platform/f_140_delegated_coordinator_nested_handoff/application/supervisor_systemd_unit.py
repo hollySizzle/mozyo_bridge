@@ -247,11 +247,12 @@ def format_exec_argv(command: Sequence[str]) -> str:
       systemd *specifiers*, so an unescaped ``%h`` in an executable or ``--home`` path is expanded
       by systemd at load time. Measured on a live user manager (review j#102053 Finding 4): a unit
       whose ``ExecStart`` read ``"/opt/%h/mozyo-bridge" "--home" "/tmp/%h"`` was reported by
-      ``systemctl show`` as ``argv[]=/opt//home/holly/mozyo-bridge --home /tmp//home/holly`` — a
-      different executable and a different mozyo home than the unit's literal text. Quoting does
-      not suppress specifier expansion; only ``%%`` does. Without this, the pin is not a pin, and
-      ``executable_matches`` compares the file's literal text and reports ``True`` while systemd
-      execs something else.
+      ``systemctl show`` (with the expanded home neutralized) as
+      ``argv[]=/opt/EXPANDED-USER-HOME-SENTINEL/mozyo-bridge --home
+      /tmp/EXPANDED-USER-HOME-SENTINEL`` — a different executable and a different mozyo home than
+      the unit's literal text. Quoting does not suppress specifier expansion; only ``%%`` does.
+      Without this, the pin is not a pin, and ``executable_matches`` compares the file's literal
+      text and reports ``True`` while systemd execs something else.
 
     This is a *value*, never a shell string: systemd execs the argv directly, with no ``/bin/sh``.
     Callers must reject :func:`unrenderable_argv_reason` tokens first — this function assumes the

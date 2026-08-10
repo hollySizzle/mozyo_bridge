@@ -28,6 +28,7 @@ import errno
 import io
 import json
 import os
+import pwd
 import sqlite3
 import subprocess
 import sys
@@ -103,18 +104,48 @@ class ClearedEnvNeverReachesTheOperatorHomeTest(unittest.TestCase):
         """The exact #14477 reach: env cleared, so the fallback must not be shared.
 
         With the environment gone, `expanduser()` falls through to the passwd
-        database and reaches the *real* operator default -- so that spelling has to
-        be in the deny set for the redirect to fire. That is not a contrivance:
-        `ambient_homes()` always includes it, which is why the runner's deny set is
-        built from both the default spelling and any explicit one.
+        database, so the deny set has to hold *that* spelling for the redirect to
+        fire. It is modelled here rather than borrowed from `ambient_homes()`
+        (#15229). `ambient_homes()` expands `~` from the **current** `HOME`, and
+        under `mozyo-bridge tests parallel` every shard is handed a fresh
+        task-local `HOME` (#13733 acceptance 3) -- so it named the shard's home
+        while the cleared-env fallback still reached the operator's real account.
+        The premise silently failed and the resolver was then measured returning
+        the operator home: serial green, parallel red, for a reason about where
+        the fixture got its expectation rather than about the fence.
+
+        Patching only `pwd.getpwuid` keeps the environment genuinely empty and the
+        production fallback genuinely exercised, with a deterministic answer no
+        launch mode can move -- the shape j#100498 adopted for the end-to-end twin
+        of this test. `ambient_homes()` stays in the deny set: this makes the set
+        broader, never narrower.
         """
+        account = Path(self._task.name).resolve() / "fake-account"
+        account.mkdir()
+        real = pwd.getpwuid(os.getuid())
+        synthetic = type(real)(
+            (real.pw_name, real.pw_passwd, real.pw_uid, real.pw_gid,
+             real.pw_gecos, str(account), real.pw_shell)
+        )
         bind_process_home_fence(
             HomeFence(
                 root=self.fence_home,
-                denied=(self.operator_home, *ambient_homes()),
+                denied=(
+                    self.operator_home,
+                    (account / ".mozyo_bridge").resolve(),
+                    *ambient_homes(),
+                ),
             )
         )
-        with patch.dict(os.environ, {}, clear=True):
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            pwd, "getpwuid", return_value=synthetic
+        ):
+            # The premise: the fallback really did reach the modelled account, so
+            # a redirect to the fence root is evidence and not a coincidence.
+            self.assertEqual(
+                str(Path("~/.mozyo_bridge").expanduser()),
+                str(account / ".mozyo_bridge"),
+            )
             self.assertEqual(mozyo_bridge_home(), self.fence_home)
 
     def test_resolving_onto_the_operator_home_is_refused_not_returned(self) -> None:
