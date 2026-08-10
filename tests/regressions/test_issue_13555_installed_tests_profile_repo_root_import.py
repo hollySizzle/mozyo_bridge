@@ -92,15 +92,33 @@ class InstalledTestsProfileRepoRootImportTest(unittest.TestCase):
     def _cleanup_repo(self, tmp: Path) -> None:
         import shutil
 
-        # Drop any fake-package modules discovery imported, and any path entries
-        # unittest/our bootstrap may have left, so suites stay isolated. Both the
-        # top-level package and the discovered sub-package namespace are purged.
+        # Drop every module loaded from the fake repo, not only modules whose name
+        # starts with our two explicit package names.  ``unittest.discover`` also
+        # imports sibling packages below its implicit top-level directory by their
+        # short name; in this fixture that includes ``support``.  Leaving that
+        # module cached points later tests at a directory this cleanup removes.
+        fake_root = tmp.resolve()
+
+        def loaded_from_fake_repo(module: object) -> bool:
+            locations: list[object] = [getattr(module, "__file__", None)]
+            locations.extend(getattr(module, "__path__", ()))
+            for location in locations:
+                if location is None:
+                    continue
+                try:
+                    Path(location).resolve().relative_to(fake_root)
+                except (OSError, TypeError, ValueError):
+                    continue
+                return True
+            return False
+
         stale = [
             n
-            for n in sys.modules
+            for n, module in tuple(sys.modules.items())
             if n in (_PKG, _SUBPKG)
             or n.startswith(_PKG + ".")
             or n.startswith(_SUBPKG + ".")
+            or loaded_from_fake_repo(module)
         ]
         for name in stale:
             del sys.modules[name]
@@ -130,6 +148,31 @@ class InstalledTestsProfileRepoRootImportTest(unittest.TestCase):
         # The installed console-script condition: neither the repo root nor the
         # start-dir package's parent are already importable.
         self.assertNotIn(str(repo), sys.path)
+
+    def test_cleanup_purges_short_name_modules_loaded_from_the_fake_repo(self) -> None:
+        # The negative-control discovery imports ``<fake repo>/support`` as the
+        # top-level name ``support``.  Preserve a real module if an enclosing suite
+        # already imported one, then prove our cleanup removes only the fake one.
+        missing = object()
+        previous_support = sys.modules.pop("support", missing)
+        try:
+            repo = self._write_fake_repo()
+            loader = unittest.TestLoader()
+            loader.discover(start_dir=str(repo / _PKG), pattern="test*.py")
+
+            leaked = sys.modules.get("support")
+            self.assertIsNotNone(leaked)
+            self.assertTrue(
+                Path(getattr(leaked, "__file__", ""))
+                .resolve()
+                .is_relative_to(repo.resolve())
+            )
+
+            self._cleanup_repo(repo)
+            self.assertNotIn("support", sys.modules)
+        finally:
+            if previous_support is not missing:
+                sys.modules["support"] = previous_support
 
     def test_installed_path_without_bootstrap_reproduces_collection_error(self) -> None:
         # Negative control: the pre-fix discovery (no repo-root bootstrap,
