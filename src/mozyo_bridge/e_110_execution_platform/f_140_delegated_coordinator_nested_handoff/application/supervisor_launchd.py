@@ -151,11 +151,6 @@ REASON_LEGACY_DRAIN_UNREADABLE = "legacy_drain_unreadable"
 #: failed. Reported instead of proceeding, because proceeding would leave TWO registrations — the
 #: exact state #15192 exists to end.
 REASON_LEGACY_DRAIN_REMOVAL_FAILED = "legacy_drain_removal_failed"
-#: install refused: the retired drain agent is STILL LOADED after the bootout attempt (review
-#: j#102151 Finding 1). Unlinking a plist does not unregister a bootstrapped job — launchd keys the
-#: running job off its label, not off the file — so proceeding here would bootstrap the new agent
-#: alongside a live retired one: two registrations, the exact state this change exists to end.
-REASON_LEGACY_DRAIN_STILL_LOADED = "legacy_drain_still_loaded"
 
 #: install refused: the retired agent's run state could not be READ (permission denied, a broken
 #: service manager, an unrecognized launchctl failure). Distinct from ``still_loaded`` because the
@@ -488,13 +483,13 @@ def remove_legacy_drain(
     *success* is a fact worth using, and reading it first means the common path never depends on
     interpreting an error at all.
 
-    Anything else refuses. A still-loaded job gives :data:`REASON_LEGACY_DRAIN_STILL_LOADED`; a state
-    that could not be read — permission denied, a broken service manager, an unrecognized failure —
-    gives :data:`REASON_LEGACY_DRAIN_STATE_UNREADABLE` (review j#102180 finding 1). The earlier
-    version collapsed that second case into "not loaded" and deleted the plist on the strength of a
-    read that never happened; **"I could not see it" is not "it is not there"**. In both refusals the
-    retired plist is kept on purpose: it is the operator's only durable trace of a registration that
-    may still be live, and removing it would hide the very thing they need to act on.
+    Anything else refuses with :data:`REASON_LEGACY_DRAIN_STATE_UNREADABLE`. There is deliberately
+    no separate "still loaded" answer any more: distinguishing a running job from an unreadable one
+    required interpreting launchctl's wording, and that interpretation is no longer permitted to
+    influence a deletion, so a token claiming the distinction would assert more than this code can
+    establish. The retired plist is kept on purpose: it is the operator's only durable trace of a
+    registration that may still be live, and removing it would hide the very thing they need to act
+    on. ``service_status`` still reports it via ``legacy_drain``.
     """
     state = classify_legacy_drain(os_home)
     if state == LEGACY_DRAIN_ABSENT:
@@ -502,21 +497,34 @@ def remove_legacy_drain(
     if state != LEGACY_DRAIN_OWNED:
         return {"state": state, "removed": False, "reason": _LEGACY_DRAIN_REFUSAL_REASON[state]}
     # Unload before unlinking: removing the file leaves a bootstrapped service running until logout.
+    #
+    # THE ONLY AUTHORITY TO UNLINK IS A SUCCEEDING BOOTOUT. A non-zero result ends the decision here
+    # — the wording launchctl printed is never read, so it cannot authorize anything (owner
+    # delegation j#102452, gateway disposition j#102458).
+    #
+    # This is structural, not another rule about strings. Six review rounds tried to make the
+    # message safe to interpret: an exit code treated as a contract, a substring match, an invented
+    # character class, an open negation, a phrase never bound to its operand, a position rule the
+    # caller could forge across two streams, and finally an unparseable stream read as silence and a
+    # newline read as a space. Each fix was locally right and rested on an unverified premise about
+    # output nobody here has observed. The defect is not any one of those premises — it is that a
+    # destructive action depends on parsing text whose grammar is undocumented and unavailable to
+    # check. Removing the dependency removes the class.
+    #
+    # `launchctl bootout` returning 0 means *this process just unloaded that job*. That is a fact
+    # about an action we took, not an inference from prose, and it is the whole authority now.
     try:
         booted_out = _launchctl(runner, ["bootout", _service_target(LEGACY_DRAIN_AGENT)])
         unloaded_by_us = booted_out.returncode == 0
     except (FileNotFoundError, OSError):
         unloaded_by_us = False
     if not unloaded_by_us:
-        # We did not stop it ourselves, so the run state has to be READ — and read strictly.
-        probe_state = _probe(runner, agent=LEGACY_DRAIN_AGENT)["state"]
-        if probe_state == PROBE_LOADED:
-            return {"state": state, "removed": False, "reason": REASON_LEGACY_DRAIN_STILL_LOADED}
-        if probe_state != PROBE_CONFIRMED_ABSENT:
-            return {
-                "state": state, "removed": False,
-                "reason": REASON_LEGACY_DRAIN_STATE_UNREADABLE,
-            }
+        # Keep the plist. It is the operator's only durable trace of a registration that may still
+        # be live, and `--run-once` already performs the drain leg, so leaving it costs no
+        # capability. `service_status` reports it as a pending migration via `legacy_drain`.
+        return {
+            "state": state, "removed": False, "reason": REASON_LEGACY_DRAIN_STATE_UNREADABLE,
+        }
     try:
         plist_path(os_home, agent=LEGACY_DRAIN_AGENT).unlink()
     except OSError:
@@ -568,8 +576,8 @@ def install(
     Every *preflight* refusal — platform, executable, and an unidentifiable retired plist — is
     evaluated before **either** mutation, so a refused install is zero-mutation. Three refusals are
     not, and all three stop **before the owned agent is written or bootstrapped**:
-    ``legacy_drain_still_loaded`` (the retired job survived its bootout),
-    ``legacy_drain_state_unreadable`` (its run state could not be read at all), and
+    ``legacy_drain_state_unreadable`` (the bootout did not succeed, so nothing authorizes a
+    removal) and
     ``legacy_drain_removal_failed`` (the unlink failed after the job was confirmed gone). These are
     reported honestly rather than described as zero-mutation.
     """
@@ -908,7 +916,6 @@ __all__ = (
     "REASON_LEGACY_DRAIN_FOREIGN_LABEL",
     "REASON_LEGACY_DRAIN_UNREADABLE",
     "REASON_LEGACY_DRAIN_REMOVAL_FAILED",
-    "REASON_LEGACY_DRAIN_STILL_LOADED",
     "REASON_LEGACY_DRAIN_STATE_UNREADABLE",
     "REASON_SERVICE_STATE_UNREADABLE",
     "PROBE_LOADED",

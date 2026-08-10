@@ -304,6 +304,11 @@ def quoted_spans(message: str) -> Optional[list[tuple[int, int]]]:
     return spans
 
 
+#: Whitespace that can separate words *within* one line. Deliberately excludes every line break:
+#: `\n`, `\r`, and the vertical/form feeds `str.isspace()` also accepts.
+_INTRA_LINE_SPACE = frozenset(" \t")
+
+
 def not_found_operand(message: str) -> Optional[str]:
     """The service a recognized "no such service" clause is ABOUT, or ``None`` when undecidable.
 
@@ -323,7 +328,8 @@ def not_found_operand(message: str) -> Optional[str]:
     1. the phrase occurs **outside** every quoted span (a phrase inside a span is data, not wording);
     2. exactly **one** clause survives merging, and merging joins only genuinely *overlapping* hits —
        abutting hits are separate clauses, which is ambiguity, not one clause;
-    3. the operand span **starts immediately after** the clause, separated by nothing but whitespace;
+    3. the operand span **starts immediately after** the clause, separated by nothing but spaces or
+       tabs — never a line break;
     4. the operand is a complete span this scanner itself delimited.
 
     Offsets are computed on the original ``message``. Case-folding for the phrase comparison is done
@@ -337,10 +343,13 @@ def not_found_operand(message: str) -> Optional[str]:
     if len(clauses) != 1:
         return None
     _, clause_end = clauses[0]
-    # Only whitespace may separate the clause from its operand: any other prose means the sentence
-    # said something between them, and what it said is not this parser's to guess.
+    # Only INTRA-LINE whitespace may separate the clause from its operand. A newline is not a wide
+    # space: it ends a line, and one stream is not one record. Treating `\n` as ordinary spacing
+    # bound a phrase on one line to a label on another (review j#102438 finding r11f2) — the same
+    # false adjacency that cross-stream concatenation produced, one level in. Any other prose
+    # between them means the sentence said something this parser is not entitled to guess at.
     cursor = clause_end
-    while cursor < len(message) and message[cursor].isspace():
+    while cursor < len(message) and message[cursor] in _INTRA_LINE_SPACE:
         cursor += 1
     for open_index, close_index in spans:
         if open_index == cursor:
@@ -356,7 +365,13 @@ def has_not_found_clause(message: str) -> bool:
     """
     spans = quoted_spans(message)
     if spans is None:
-        return False
+        # The quoting could not be read, so whether a clause is *well-formed* is unknowable — but
+        # the question this answers is whether the stream TRIED to say something about absence, and
+        # recognized wording is that attempt. Returning False here made an unparseable stream
+        # indistinguishable from one that said nothing, which let the other stream's positive
+        # reading carry a deletion (review j#102438 finding r11f1).
+        wording = message.lower()
+        return any(phrase in wording for phrase in LAUNCHCTL_NOT_FOUND_PHRASES)
     return bool(_not_found_clauses(message, spans))
 
 

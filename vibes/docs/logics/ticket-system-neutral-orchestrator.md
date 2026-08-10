@@ -520,6 +520,28 @@ EnvironmentVariables なし）契約を維持する。**credential 未整備は�
 `unreadable` の 4 値で、`owned` だけが削除可能、`foreign` / `unreadable` は typed zero-mutation 拒否とする
 （identity は推測しない）。
 
+**退役 plist を削除できる唯一の authority は `bootout` の成功である**（owner delegation j#102452 /
+gateway disposition j#102458）。`bootout` が **非 0 を返した時点で判定は終了**し、stdout / stderr / exit の
+**文面は一切解釈しない**。plist を保持し `legacy_drain_state_unreadable` を返す。追加の unlink mutation は行わない。
+
+これは文字列規則の追加ではなく **依存関係の除去**である。R3〜R11 の 6 round は launchctl の error 文面を安全に
+解釈しようと試み続けた —— exit code を契約と見なす / substring / 独自の文字集合 / open negation /
+phrase と operand の未結合 / 2 stream を跨いだ位置の捏造 / 解釈不能 stream を沈黙と同一視 / 改行を語間空白と
+同一視。**個々の修正はいずれも局所的には正しく、いずれも「誰も観測していない出力」についての未検証前提に
+依拠していた**。欠陥は特定の前提ではなく、**破壊的操作が文書化されていない grammar の parse に依存していたこと**
+そのものである。依存を外せば class ごと消える。
+
+`launchctl bootout` の rc 0 は「**このプロセスが今その job を unload した**」という、自分が行った action に
+ついての事実であり、散文からの推論ではない。現在の authority はこれだけである。
+
+失敗方向は over-refusal に限定される: 退役 drain が残っても `--run-once` が drain leg を包含するため
+capability の損失はなく、status の `legacy_drain` で operator に可視である。実 macOS の文面・stream・行構造の
+採取（#15194）後に、観測した完全な出力単位に基づいて判定規則を再設計できる。
+
+なお「still loaded」という個別 refusal token は廃止した。稼働中と読取不能の区別は **文面の解釈によってのみ**
+導出可能であり、その解釈を破壊的判断から外した以上、その区別を主張する token は **code が確立できる以上のことを
+述べる**ことになるためである（status の 3 値 `probe_state` は非破壊 projection として維持する）。
+
 **停止は「試みた」ではなく「確認した」でなければならない**（review j#102151 Finding 1）。plist の unlink は
 registration の削除ではない: launchd は bootstrap 済み job を **label** で保持するため、file を消しても job は
 logout まで走り続ける。したがって退役 plist の削除は **「退役 job が消えている」という positive な証拠**が

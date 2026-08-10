@@ -27,6 +27,7 @@ import contextlib
 import io
 import json
 import sys
+import plistlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -440,6 +441,36 @@ def _systemd_status(*, manager_available: bool, timer_output: str = "ActiveState
             os_home=os_home, mozyo_home=mozyo_home, runner=runner,
             which=lambda _n: "/opt/bin/mozyo-bridge",
         )
+
+
+class LegacyMigrationAuthorityTest(unittest.TestCase):
+    """The retired-agent migration's authority, seen through the operator-facing surfaces.
+
+    Owner delegation j#102452 / gateway disposition j#102458: only a succeeding `bootout` may
+    authorize the unlink, and a non-zero one is a typed refusal that keeps the plist. Asserted here
+    at the status/envelope level, where an operator would actually observe it.
+    """
+
+    def test_status_still_reports_a_retained_legacy_registration(self) -> None:
+        # The migration refusing must not make the leftover invisible: it is the operator's cue.
+        os_home = Path(tempfile.mkdtemp())
+        mozyo_home = Path(tempfile.mkdtemp())
+        target = sl.plist_path(os_home, agent=sl.LEGACY_DRAIN_AGENT)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(
+            plistlib.dumps({"Label": sl.LEGACY_DRAIN_AGENT.label, "ProgramArguments": ["/x"]})
+        )
+        with patch.object(sl, "_running_on_darwin", return_value=True):
+            status = sl.service_status(
+                os_home=os_home, mozyo_home=mozyo_home,
+                runner=lambda _c: _fake_result(1), which=lambda _n: "/opt/bin/mozyo-bridge",
+            )
+        self.assertEqual(status["legacy_drain"], sl.LEGACY_DRAIN_OWNED)
+
+    def test_the_refusal_token_is_typed_and_secret_free(self) -> None:
+        self.assertEqual(sl.REASON_LEGACY_DRAIN_STATE_UNREADABLE, "legacy_drain_state_unreadable")
+        for noun in ("/users/", "key", "token", "password"):
+            self.assertNotIn(noun, sl.REASON_LEGACY_DRAIN_STATE_UNREADABLE.lower())
 
 
 class RestartRefusalParityTest(unittest.TestCase):

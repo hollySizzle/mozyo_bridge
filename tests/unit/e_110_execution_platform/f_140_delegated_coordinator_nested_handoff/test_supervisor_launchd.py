@@ -783,8 +783,13 @@ class _LegacyStaysLoaded:
 _NOT_FOUND = (113, 'Could not find service "org.mozyo-bridge.callback-supervisor.drain" in domain')
 
 
-class _LegacyNeverLoaded:
-    """launchctl where the RETIRED label was never loaded: bootout fails, print says NOT FOUND."""
+class _LegacyBootoutSucceeds:
+    """launchctl where booting the RETIRED label out SUCCEEDS — the only authority to unlink.
+
+    Modelled explicitly on the action rather than on wording: since the safe interim invariant
+    (owner delegation j#102452 / gateway disposition j#102458), a non-zero bootout ends the decision
+    and no message is read, so a fake that returns not-found prose no longer describes a migration.
+    """
 
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
@@ -792,10 +797,6 @@ class _LegacyNeverLoaded:
     def __call__(self, argv):
         argv = list(argv)
         self.calls.append(argv)
-        target = argv[2] if len(argv) > 2 else ""
-        if sl.LEGACY_DRAIN_AGENT.label in target:
-            code, message = _NOT_FOUND
-            return _result(code, stderr=message)
         return _result(0)
 
     @property
@@ -890,7 +891,7 @@ class LegacyDrainMigrationTest(_DarwinCase):
     def test_install_removes_an_owned_legacy_agent_and_leaves_one_registration(self) -> None:
         _write_home_credential(self.mozyo_home)
         legacy = _legacy_drain_plist(self.os_home)
-        runner = _LegacyNeverLoaded()
+        runner = _LegacyBootoutSucceeds()
         result = sl.install(
             os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found,
         )
@@ -939,7 +940,7 @@ class LegacyDrainMigrationTest(_DarwinCase):
         _write_home_credential(self.mozyo_home)
         legacy = _legacy_drain_plist(self.os_home)
 
-        class _MigrationOkBootstrapFails(_LegacyNeverLoaded):
+        class _MigrationOkBootstrapFails(_LegacyBootoutSucceeds):
             def __call__(self, argv):
                 result = super().__call__(argv)
                 argv = list(argv)
@@ -960,7 +961,7 @@ class LegacyDrainMigrationTest(_DarwinCase):
         sl.install(os_home=self.os_home, mozyo_home=self.mozyo_home,
                    runner=FakeRunner(), which=_which_found)
         legacy = _legacy_drain_plist(self.os_home)  # e.g. re-created by an old build
-        result = sl.uninstall(os_home=self.os_home, runner=_LegacyNeverLoaded())
+        result = sl.uninstall(os_home=self.os_home, runner=_LegacyBootoutSucceeds())
         self.assertTrue(result["performed"])
         self.assertTrue(result["legacy_drain_removed"])
         self.assertFalse(sl.plist_path(self.os_home).exists())
@@ -978,7 +979,7 @@ class LegacyDrainMigrationTest(_DarwinCase):
         self.assertTrue(foreign.exists())
         self.assertEqual(result["legacy_drain_reason"], sl.REASON_LEGACY_DRAIN_FOREIGN_LABEL)
 
-    def test_a_legacy_agent_that_survives_bootout_blocks_the_install(self) -> None:
+    def test_any_nonzero_bootout_blocks_the_install_without_reading_the_message(self) -> None:
         # Review j#102151 Finding 1. Unlinking a plist does NOT unregister a bootstrapped job —
         # launchd keys it off the label — so if the retired job is still loaded after the bootout,
         # installing the new agent would produce TWO live registrations. The stop must be verified.
@@ -989,7 +990,7 @@ class LegacyDrainMigrationTest(_DarwinCase):
             os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found,
         )
         self.assertFalse(result["performed"])
-        self.assertEqual(result["reason"], sl.REASON_LEGACY_DRAIN_STILL_LOADED)
+        self.assertEqual(result["reason"], sl.REASON_LEGACY_DRAIN_STATE_UNREADABLE)
         # The owned agent was never written or bootstrapped...
         self.assertFalse(sl.plist_path(self.os_home).exists())
         self.assertNotIn("bootstrap", runner.verbs)
@@ -1014,16 +1015,16 @@ class LegacyDrainMigrationTest(_DarwinCase):
         self.assertFalse(sl.plist_path(self.os_home).exists())
         self.assertNotIn("bootstrap", runner.verbs)
 
-    def test_unreadable_is_a_distinct_answer_from_still_loaded(self) -> None:
-        # Two different facts — "it is running" and "I cannot tell" — must not share a token, or the
-        # operator cannot tell which one they are looking at.
-        self.assertNotEqual(
-            sl.REASON_LEGACY_DRAIN_STATE_UNREADABLE, sl.REASON_LEGACY_DRAIN_STILL_LOADED
-        )
+    def test_the_probe_vocabulary_is_still_three_valued(self) -> None:
+        # The status projection keeps all three answers; only the DESTRUCTIVE path stopped consuming
+        # them. A retired-agent refusal can no longer claim "it is running" — that fact was only ever
+        # derivable by reading the message, which no longer authorizes anything — so the migration
+        # reports the honest `state_unreadable` instead of a distinction it cannot establish.
         self.assertEqual(
             {sl.PROBE_LOADED, sl.PROBE_CONFIRMED_ABSENT, sl.PROBE_UNREADABLE},
             {"loaded", "confirmed_absent", "unreadable"},
         )
+        self.assertFalse(hasattr(sl, "REASON_LEGACY_DRAIN_STILL_LOADED"))
 
     def test_absence_needs_the_whole_conjunction_not_any_one_signal(self) -> None:
         # Review j#102200 finding r3f1. Deleting a registration on the strength of an ERROR needs
@@ -1506,7 +1507,7 @@ class LegacyDrainMigrationTest(_DarwinCase):
         # stopped retired agent. Gating on the return code would refuse every clean migration.
         _write_home_credential(self.mozyo_home)
         legacy = _legacy_drain_plist(self.os_home)
-        runner = _LegacyNeverLoaded()
+        runner = _LegacyBootoutSucceeds()
         result = sl.install(
             os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found,
         )
@@ -1518,7 +1519,7 @@ class LegacyDrainMigrationTest(_DarwinCase):
     def test_an_unlinkable_legacy_plist_blocks_the_install_after_a_verified_stop(self) -> None:
         _write_home_credential(self.mozyo_home)
         _legacy_drain_plist(self.os_home)
-        runner = _LegacyNeverLoaded()
+        runner = _LegacyBootoutSucceeds()
         with patch.object(sl.Path, "unlink", side_effect=OSError("read-only")):
             result = sl.install(
                 os_home=self.os_home, mozyo_home=self.mozyo_home,
@@ -1542,6 +1543,130 @@ class LegacyDrainMigrationTest(_DarwinCase):
             runner=FakeRunner(), which=_which_found,
         )
         self.assertEqual(status["legacy_drain"], sl.LEGACY_DRAIN_OWNED)
+
+
+class NonzeroBootoutNeverAuthorizesUnlinkTest(_DarwinCase):
+    """The safe interim invariant (owner delegation j#102452 / gateway disposition j#102458).
+
+    Six rounds tried to make launchctl's error text safe to interpret — an exit code taken as a
+    contract, a substring match, an invented character class, an open negation, a phrase never bound
+    to its operand, a position rule forgeable across two streams, an unparseable stream read as
+    silence, a newline read as a space. Every fix was locally right and rested on an unverified
+    premise about output nobody here has observed. The defect was never one premise: it was that a
+    destructive action depended on parsing an undocumented grammar at all.
+
+    So the authority is now an ACTION, not a reading: `launchctl bootout` returning 0 means this
+    process just unloaded that job. Anything else keeps the plist. These pin that the message is not
+    merely *insufficient* but *unread* — `print` is never even invoked.
+    """
+
+    #: Every wording vector any prior round turned into a deletion, plus the shapes r11 found last.
+    def _vectors(self) -> list:
+        owned = sl.LEGACY_DRAIN_AGENT.label
+        canonical = f'Could not find service "{owned}" in domain for gui'
+        return [
+            (_result(113, stderr=canonical), "canonical owned not-found"),
+            (_result(113, stderr=f'Could not find service "x\\'), "malformed / backslash"),
+            (_result(113, stderr=f'Could not find service "{owned}'), "unbalanced quote"),
+            (_result(113, stdout=f'"{owned}"', stderr="Could not find service"), "cross-stream"),
+            (_result(113, stderr=f'Could not find service\n"{owned}"'), "LF between phrase and label"),
+            (_result(113, stderr=f'Could not find service\r\n"{owned}"'), "CRLF"),
+            (_result(113, stderr=f'Could not find service\n\n"{owned}"'), "multiple lines"),
+            (
+                _result(113, stderr='Could not find service "com.example.other"'),
+                "a different label",
+            ),
+            (_result(113, stderr="Operation not permitted"), "denial"),
+            (_result(0, stdout="\tstate = running\n"), "print says LOADED"),
+        ]
+
+    def test_no_wording_survives_a_nonzero_bootout(self) -> None:
+        for print_result, why in self._vectors():
+            legacy = _legacy_drain_plist(self.os_home)
+            runner = _BootoutFails(print_result)
+            result = sl.remove_legacy_drain(os_home=self.os_home, runner=runner)
+            self.assertFalse(result["removed"], why)
+            self.assertEqual(result["reason"], sl.REASON_LEGACY_DRAIN_STATE_UNREADABLE, why)
+            self.assertTrue(legacy.exists(), why)
+
+    def test_the_message_is_not_read_at_all_after_a_nonzero_bootout(self) -> None:
+        # Stronger than "the wording did not convince it": the wording is never consulted, so no
+        # future parser change can reopen this path.
+        _legacy_drain_plist(self.os_home)
+        runner = _BootoutFails(_result(113, stderr="Could not find service"))
+        sl.remove_legacy_drain(os_home=self.os_home, runner=runner)
+        self.assertNotIn("print", runner.verbs)
+
+    def test_install_refuses_and_never_bootstraps_after_a_nonzero_bootout(self) -> None:
+        _write_home_credential(self.mozyo_home)
+        legacy = _legacy_drain_plist(self.os_home)
+        runner = _BootoutFails(_result(113, stderr="Could not find service"))
+        result = sl.install(
+            os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found,
+        )
+        self.assertFalse(result["performed"])
+        self.assertEqual(result["reason"], sl.REASON_LEGACY_DRAIN_STATE_UNREADABLE)
+        self.assertTrue(legacy.exists())
+        self.assertFalse(sl.plist_path(self.os_home).exists())
+        self.assertNotIn("bootstrap", runner.verbs)
+
+    def test_a_succeeding_bootout_still_completes_the_owned_cleanup(self) -> None:
+        # The invariant closes a path; it must not close the migration itself.
+        legacy = _legacy_drain_plist(self.os_home)
+        result = sl.remove_legacy_drain(os_home=self.os_home, runner=_LegacyBootoutSucceeds())
+        self.assertTrue(result["removed"])
+        self.assertEqual(result["reason"], "")
+        self.assertFalse(legacy.exists())
+
+    def test_the_foreign_and_unreadable_preflights_are_unchanged(self) -> None:
+        # These refuse BEFORE any bootout, on identity, and the invariant must not disturb them.
+        foreign = _legacy_drain_plist(self.os_home, label="com.example.someone-else")
+        runner = _LegacyBootoutSucceeds()
+        result = sl.remove_legacy_drain(os_home=self.os_home, runner=runner)
+        self.assertEqual(result["reason"], sl.REASON_LEGACY_DRAIN_FOREIGN_LABEL)
+        self.assertTrue(foreign.exists())
+        self.assertEqual(runner.verbs, [])
+
+        sl.plist_path(self.os_home, agent=sl.LEGACY_DRAIN_AGENT).write_bytes(b"not a plist")
+        unreadable = sl.remove_legacy_drain(os_home=self.os_home, runner=_LegacyBootoutSucceeds())
+        self.assertEqual(unreadable["reason"], sl.REASON_LEGACY_DRAIN_UNREADABLE)
+
+    def test_the_refusal_carries_no_manager_text_or_secret(self) -> None:
+        _write_home_credential(self.mozyo_home)
+        _legacy_drain_plist(self.os_home)
+        runner = _BootoutFails(
+            _result(113, stderr='Could not find service "x" — home-key-sentinel /Users/someone')
+        )
+        result = sl.install(
+            os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found,
+        )
+        blob = str(result)
+        self.assertNotIn("home-key", blob.lower())
+        self.assertNotIn("/Users/someone", blob)
+        self.assertNotIn("Could not find service", blob)
+
+
+class _BootoutFails:
+    """launchctl where the RETIRED label's bootout fails; `print` is scripted but must go unused."""
+
+    def __init__(self, print_result) -> None:
+        self.calls: list[list[str]] = []
+        self._print_result = print_result
+
+    def __call__(self, argv):
+        argv = list(argv)
+        self.calls.append(argv)
+        target = argv[2] if len(argv) > 2 else ""
+        if sl.LEGACY_DRAIN_AGENT.label in target:
+            if argv[1] == "bootout":
+                return _result(1, stderr="bootout failed")
+            if argv[1] == "print":
+                return self._print_result
+        return _result(0)
+
+    @property
+    def verbs(self) -> list[str]:
+        return [c[1] for c in self.calls if len(c) >= 2]
 
 
 class CommonStatusContractTest(_DarwinCase):
