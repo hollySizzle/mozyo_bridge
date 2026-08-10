@@ -495,14 +495,92 @@ sleep/poll を要求しない。reconciliation 経路（`--run-once`）と drain
 別 service definition（`build_service_definition(local_drain=...)`）として表現し、portable default は
 測定に基づく neutral 値（固定の私的運用値を OSS 既定へ焼かない）を持つ。
 
-macOS LaunchAgent の realization は **owned dual-agent lifecycle**（`supervisor_launchd` の `install_pair` /
+host realization は operator 契約（`status` / `install` / `restart` / `uninstall`）を共有するが、**内部形状ま
+で同一にはしない**（#15183）。どちらを使うかは `supervisor_service_backend` が platform で解決し（darwin ->
+LaunchAgent、Linux -> systemd user、それ以外 -> typed zero-mutation refusal）、結果 envelope だけを
+`{action, performed, reason, backend, agents: [...]}` に正規化する。`agents` は host adapter が返す owned
+service 行（macOS は 2 行、Linux は 1 行）であり、CLI は platform 分岐なしに両方を描画する。
+
+**macOS LaunchAgent** の realization は **owned dual-agent lifecycle**（`supervisor_launchd` の `install_pair` /
 `uninstall_pair` / `restart_pair` / `service_status_pair`）: 二つの独立した owned label / plist / log
 （`callback-supervisor` と `callback-supervisor.drain`）を管理する。install は **atomic-or-nothing** で、
 reconcile agent が失敗すれば何もせず、reconcile 成功後に drain agent が失敗すれば両 agent を rollback
 （partial failure で half-installed pair を残さない fail-closed）。各 verb は非 darwin / 実行ファイル欠落 /
 credential 未整備 / not-loaded で zero-mutation 拒否し、既存の RunAtLoad + StartInterval（KeepAlive なし、
-EnvironmentVariables なし）契約を両 agent で維持する。`workflow supervisor --service-status` は両 agent の
-redacted host 投影と両 definition を表示する。
+EnvironmentVariables なし）契約を両 agent で維持する。この構成は #15183 で変更しない。
+
+**Linux systemd user timer** の realization（`supervisor_systemd`）は **owned service 1 個 + timer 1 個**であ
+る。timer は 60 秒ごとに `workflow supervisor --run-once` を 1 回起動し、process は毎 tick 終了する。macOS の
+dual-agent 形状は複製しない: `--drain-only` の別 unit 登録、2 組の atomic install / 一括 rollback、macOS 内部
+構造との同等性は、いずれも受入条件から削除された。
+
+**60 秒 tick は 60 秒 Redmine poll ではない。** provider 読み取りは supervisor 本体が持つ durable な
+per-workspace cadence watermark（`reconcile_cadence` / `should_reconcile_source`、portable default 300 秒 +
+empty pass での指数 backoff と jitter）で gate される。window 内の tick は provider 読み取り **0** の local pass
+へ downgrade されるので、頻繁な tick は SQLite + Herdr で動き、Redmine は低頻度の取りこぼし回収に留まる。この
+gating は supervisor 本体の責務であり、scheduler adapter 側は cadence を供給するだけで再実装しない。
+
+owned artifact は XDG user unit directory（`$XDG_CONFIG_HOME/systemd/user`、既定 `~/.config/systemd/user`）下の
+service + timer である。対応関係:
+
+| LaunchAgent | systemd user | 意味 |
+| --- | --- | --- |
+| `RunAtLoad` | `[Timer] OnActiveSec=0s` | timer が active になった瞬間に 1 tick（`enable --now` と以後の user manager 起動の両方を覆う） |
+| `StartInterval=<N>` | `[Timer] OnUnitActiveSec=60s` | 前回実行から N 秒後に再実行 |
+| `KeepAlive` 不在 | `Restart=` / `RemainAfterExit=` 不在 + `Type=oneshot` | bounded one-shot を常駐化・tight relaunch loop 化しない（false 設定ではなく **構造的に不在**） |
+| `EnvironmentVariables` 不在 | `Environment=` / `EnvironmentFile=` 不在 | unit に secret を書き込む code path が存在しない |
+| `ProgramArguments` | `ExecStart`（token ごとに systemd quote + `%` escape） | shell string ではない構造化 argv。`/bin/sh -c` を経由しない |
+
+`ExecStart` の literal pin には **3 種類の escape が同時に要る**。空白 (token を double quote する)、quote / backslash (`\"` / `\\`)、そして **percent (`%` -> `%%`)** である。3 番目は cosmetic ではない: `ExecStart` は systemd **specifier** を解決するため、executable や `--home` path に含まれる `%h` 等を systemd が load 時に展開する。実測 (#15183 review j#102053 Finding 4): `ExecStart="/opt/%h/mozyo-bridge" "--home" "/tmp/%h"` を書いた unit を `systemctl --user show` で読むと、展開後の home を中立 sentinel へ置き換えた表記では `argv[]=/opt/EXPANDED-USER-HOME-SENTINEL/mozyo-bridge --home /tmp/EXPANDED-USER-HOME-SENTINEL` となり、unit file の literal 文字列とは別の executable / mozyo home が exec される。quote では展開を抑止できず `%%` だけが literal を固定する。escape を欠くと pin が pin でなくなるうえ、`executable_matches` が file の literal text と比較して `True` を返すため **drift を検出できない**。
+
+readback (`parse_exec_argv`) は renderer の正確な逆で `%%` -> `%` を戻すが、**単独 specifier (`%h` 等) が残る場合は readback 全体を信頼しない** (`unreadable_unit` -> `executable_matches=false`、restart は fail-closed)。systemd しか知らない値へ展開されるため、file 上の argv は実行される argv ではないからである。手書き specifier を literal と誤読しない。
+
+さらに、unit file は行指向であるため、改行・復帰・その他 C0 制御文字を含む token は「変な path」ではなく**別の unit** を生む (末尾が別 directive として解釈される)。これらは escape で安全にできないので、破損 unit を書く前に typed refusal (`supervisor_command_not_renderable`) で install を拒否する。
+
+service unit は `[Install]` を持たない（enable するのは timer のみ。service を直接 enable すると login 時 1 回
+だけ実行され cadence が消える）。timer は `OnCalendar` / `Persistent=` を持たない（取りこぼしの replay は不要で、
+次 tick が前 tick の未処理を reconcile する）。log は systemd journal に出るため owned log path を作らない。
+systemctl 呼び出しは常に構造化 argv（`daemon-reload` / `enable --now` / `disable --now` / `stop` / `restart` /
+`show` / `reset-failed`）で、shell を経由しない。
+
+**Redmine 未設定は timer 導入の拒否理由にしない**（macOS adapter との意図的な差異）。credential readiness は
+zero-mutation refusal の gate ではなく **projection** として `missing` / `incomplete` / `unsafe` / `ready` の
+token で報告する。ローカル情報だけで安全に行える処理を止めないためである。安全境界は破れない —
+値を読むのは `resolve_redmine_credentials` であり、unsafe な file には警告を返して値を渡さないので、timer を
+導入しても不正な credential が使用されることはない。install は unsafe file の修復も迂回もしない。
+zero-mutation 拒否が残るのは install 自体が無意味になる条件だけ、すなわち非 Linux host、**systemd user manager
+到達不能**（`systemctl` 不在、または user bus に到達できない container / no-session 環境）、実行ファイル欠落で
+ある。user manager を持たない環境は「install したが永久に schedule されない」に degrade させず、明示的に
+unsupported として拒否する。
+
+status は非破壊で、受入条件が求める観測値を秘密非表示で返す: 導入・有効化状態（`installed` / `timer_enabled` /
+`loaded`）、**次回起動**（`next_elapse` + `next_elapse_basis`、および wall-clock の `last_trigger`）、**直近の
+終了結果**（`last_result` / `last_exit_status` / `last_exit_at`）、**実行内容**（`installed_command`、
+`scheduled_interval_seconds`、`home_pin`、`executable_matches`）、および参考値としての
+`provider_reconcile_interval_seconds`。restart は owned timer が active な場合だけ作用し、installed command が
+今 install するはずの command と一致しない場合は drift として拒否する（reinstall が正道）。
+
+`next_elapse` は必ず `next_elapse_basis` と対で扱う。systemd は `NextElapseUSecRealtime` を **calendar timer に
+しか設定せず**、本 adapter の monotonic timer では `NextElapseUSecMonotonic` 側に値が入る（片方だけ読むと実 timer
+に対し空を返す。#15183 smoke で実測）。monotonic 値は **boot 起点**であり wall clock ではないため、basis 無しの
+値は「あと 4 週間」と誤読される。JSON payload だけでなく **text 出力にも basis と `last_trigger` を必ず併記する**
+（human-readable path だけが解釈手段を失う状態を作らない）。
+
+宣言的 definition は backend が実際に **owned する service** に対応させる。`definitions` を owned service と 1 対 1
+の roster とし、Linux では `--drain-only` の definition を出さない（1 個の `--run-once` timer しか導入しないのに
+drain service の存在を示唆しない）。macOS は既存の `definition` / `drain_definition` key を維持する。CLI help も
+同様に、Linux の非 gate（credential 未整備でも導入可、単一 60 秒 timer）と macOS の atomic pair / credential gate
+を書き分け、撤回済み条件を host 共通の事実として書かない。
+
+uninstall は unit file を消すだけでは足りず、最後に `reset-failed` で manager 側の状態も消す: 実行中の sweep を
+`stop` すると one-shot は SIGTERM で終了するため systemd が `failed` を記録し、file 削除後もその記録が
+`not-found`/`failed` entry として manager に残る（#15183 の installed-artifact smoke で実測。fake runner の
+hermetic test では manager 側状態を観測できない）。launchd の `bootout` は痕跡を残さないため、「owned artifact
+だけを正確に消す」は manager 側 residue も残さないことを含む。
+
+`workflow supervisor --service-status` は解決された backend、owned service の redacted host 投影、secret-free な
+definition を表示する。いずれの realization も独自常駐 daemon・無限 poll を導入せず、worktree / local branch /
+remote branch を削除せず、#15066 の managed process / lifecycle 退役境界を変更しない。
 
 ## 現行0.12.2と目標状態の差
 

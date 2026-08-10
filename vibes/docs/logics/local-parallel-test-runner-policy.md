@@ -143,6 +143,76 @@ shard を占有して他が idle する事態を避ける)、(b) `--failfast` �
 にする (in-flight の subprocess は kill せず完了させる)。full dogfood では 324 module を
 jobs=10 で 40 shard に分割し、wall clock が serial 比で更に改善した。
 
+## local full-suite の実行 (Redmine #15229)
+
+#15229 の起点は「ローカル全件テストが 45 分超で未完走」という owner 観測である。測定した
+結果、支配的な要因は個々の test の実時間待機ではなく **どの entrypoint をどの runtime で
+起動したか** であった。本節は local full の推奨経路と、時間値の扱いを固定する。時間値は
+`## reliability invariant` のとおり **informational** であり pass/fail 閾値ではない。
+
+### 推奨経路
+
+| 目的 | command |
+| --- | --- |
+| local full の既定 | `PYTHONPATH=src python3 -m mozyo_bridge tests parallel --jobs 10` |
+| focused / 集合と verdict の正本 | `mozyo-bridge tests run [-- <targets>]` |
+| CI full lane | GitHub Actions `Integration batch` |
+
+serial 直列 discovery は **test 集合と green/red verdict の正本**であり続ける
+(`## reliability invariant`)。ただし *日常の全件確認* に直列 `python -m unittest discover` を
+選ぶ理由はない: 本 runner は同一 discover call を使い aggregate が parity を強制するため、
+集合も verdict も serial と一致する。
+
+### 実測 (2026-08-10 / macOS 14 core / `jobs=10` / #15229 head)
+
+| 測定 | 値 |
+| --- | ---: |
+| `tests parallel --jobs 10` (既定 40 shard) | 16,894 tests / wall **151s** / PASS |
+| 同 `--shards 659` (1 module = 1 shard) | wall **243s** / PASS |
+| module 単位 wall の総和 (659 shard 実測) | 2,252s (うち 659 回の shard 起動が約 1s/shard) |
+| 最遅の単一 module | 111s (`integration...f_160_release_version_governance.test_release_helpers`) |
+| CI `Integration batch` (full + build + smoke) | 12m24s (#15138 j#102341) |
+
+読み方は 3 点である。
+
+- **直列全件が 25〜45 分かかるのは単一の病理ではない。** module 単位 wall は long tail で、
+  30s 超が 11 module / 546s、10〜30s が 20 module / 364s を占める。上位は real subprocess・
+  wheel build・synthetic Git repo・installed launcher を回す integration / regression であり、
+  「1 個の異常な待機を消せば直列が速くなる」形ではない。**直列を速くするのではなく、
+  local full の既定 entrypoint を parallel runner にする**のが本 issue の結論である。
+- **wall clock の下限は最遅 module である。** 既定 40 shard の 151s は最遅 module 111s に
+  対してほぼ最適に近い。`--shards` を module 数まで上げると shard 起動が支配して **遅くなる**
+  (243s)。更に詰めるなら shard 数ではなく `tests profile --format json` の duration manifest を
+  `--durations` に渡して weight を実測へ寄せる (`## deterministic plan と weight`)。
+- **途中の `F` を final traceback まで保持する経路は runner 側にある。** 直列 discovery を
+  途中で中断すると traceback を失うが、本 runner は失敗 test id・shard の stdout/stderr tail・
+  shard 単位の replay command を aggregate 出力に載せ、`--format json` で機械可読に残す
+  (`## CLI` / `### aggregate は fail-closed`)。早期に閉じたいときは `--failfast` を使う。
+  ただし `--failfast` は queue 中 shard を止めるので、**残りの同型欠陥を見落とす**: #15229 の
+  初期観測では 1 件目で閉じたため、同一 helper に由来する 2 件目と別 module の 3 件目が
+  見えていなかった。欠陥類型を数えるときは failfast なしで 1 回通す。
+
+### runtime provenance — CLI 自身の runtime が検証対象になる
+
+`tests parallel` / `tests profile` は parent 自身を fenced child へ re-exec し、その bootstrap は
+**呼び出した CLI 自身の** package dir を `sys.path` へ挿入する (機構の正本:
+`test-process-home-isolation.md` の `## 3 つの入口`)。したがって **どの CLI で起動したかが、
+どの runtime を検証したかを決める**。worktree の `src/` を検証したい場合は worktree の runtime で
+起動する — それが上表の `PYTHONPATH=src python3 -m mozyo_bridge` 形の理由である。
+
+installed binary (`mozyo-bridge`) から起動すると installed package が検証対象になる。#15229 で
+実測した形は次である: installed `0.20.1` は worktree の `src/` より古く、`mozyo_bridge` は
+discovery より前に installed 側から import 済みになるため、test module 自身の
+`sys.path.insert(0, ROOT / "src")` は **既に import 済み package の `__path__` を変えられず inert**
+である。結果、worktree 固有 symbol を参照する 13 module が collection import error になり、full run
+は 2.9s で fail-closed した。fail-closed 自体は正しい挙動だが、教訓は **version 文字列の一致は
+module 集合の一致を意味しない**ことである (installed も source も `0.20.1` を名乗っていた)。
+
+`tests run` はこの影響を受けない: fenced child が literal `python -m unittest` を **新しい
+interpreter** で起動するため `mozyo_bridge` は事前 import されておらず、corpus 規約 (各 test /
+support module 自身が repo-local `src/` を `sys.path` へ挿入する。正本: `tests/__init__.py` の
+module docstring) どおりに解決する。
+
 ## serial bucket 方針 (明示 bucket と、既定が空である根拠)
 
 受け入れ条件は「Herdr/tmux/real process/shared state を触る parallel-unsafe test を

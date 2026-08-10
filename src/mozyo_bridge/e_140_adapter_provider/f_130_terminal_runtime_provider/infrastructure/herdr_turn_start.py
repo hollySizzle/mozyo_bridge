@@ -79,6 +79,12 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     HerdrTurnStartRail,
     WaitResult,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+    process_generation_of_locator,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_discovery import (  # noqa: E501
+    HerdrCliAgentLister,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_state import (
     HerdrCliAgentStateReader,
 )
@@ -266,6 +272,42 @@ class HerdrCliWaitPrimitive:
         return _HerdrArmedWait(proc, subprocess_timeout=outer_timeout)
 
 
+def make_locator_identity_probe(
+    binary: str,
+    *,
+    runner: Optional[Runner] = None,
+) -> Callable[[str], Optional[str]]:
+    """A live "which process holds this locator now" probe (Redmine #15202).
+
+    The rail's WAIT_ERROR Enter-resend may only fire once it has re-established that
+    the target locator still addresses the agent the send was authorised against
+    (audit j#102755 finding 3). This binds the pure
+    :func:`~...domain.herdr_identity.process_generation_of_locator` fold over a
+    **fresh** ``agent list`` snapshot — a new listing on every call, deliberately
+    un-memoised, because a cached snapshot would make the before/after comparison
+    vacuous and turn the guard into decoration. The token pins assigned name,
+    Herdr's stable terminal id, locator, and row revision. Terminal id distinguishes
+    terminal instances. Revision is retained as a conservative mutation fence; Herdr
+    0.8 derives it from ``terminal.revision``, so it is not a process-generation id.
+
+    Fail-closed and total: an unreadable listing, an unknown locator, a blank name,
+    missing / malformed terminal id or row revision, or an ambiguous locator (two rows
+    claiming it) all answer ``None``, and the rail reads ``None`` as "identity
+    unconfirmed" and withholds the extra Enter. Never raises, so a listing fault
+    degrades the resend rather than the send.
+    """
+    lister = HerdrCliAgentLister(binary, runner=runner)
+
+    def _probe(target: str) -> Optional[str]:
+        try:
+            rows = lister.list_agent_rows()
+        except (Exception, SystemExit):
+            return None
+        return process_generation_of_locator(target, rows)
+
+    return _probe
+
+
 def _resolve_herdr_binary(
     config: Optional[TerminalTransportConfig],
     env: Optional[Mapping[str, str]],
@@ -324,11 +366,13 @@ def resolve_turn_start_rail(
         wait_timeout_ms=wait_timeout_ms,
         max_enter_resends=max_enter_resends,
         inject_settle_seconds=inject_settle_seconds,
+        identity_probe=make_locator_identity_probe(binary, runner=runner),
     )
 
 
 __all__ = (
     "SUBPROCESS_TIMEOUT_MARGIN_SECONDS",
     "HerdrCliWaitPrimitive",
+    "make_locator_identity_probe",
     "resolve_turn_start_rail",
 )

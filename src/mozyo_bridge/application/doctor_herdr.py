@@ -88,12 +88,14 @@ _WORKSPACE_SEGMENT_NEXT_ACTION = (
 _ATTESTATION_NEXT_ACTION = (
     "one or more managed agents have no valid startup self-attestation (their "
     "injected identity env is unverified, so their handoff sends fail closed): "
-    "herdr cannot read or repair a running process's env, so recover with an "
-    "owner-approved close of the affected pane(s) + a same-slot relaunch via "
-    "`mozyo-bridge herdr session-start` (the relaunch re-runs the self-check). "
     "First check `mozyo-bridge herdr attestation-store status` (Redmine #13882): "
     "when the whole home reads unattested at once, the cause is usually the store's "
-    "schema, not the panes — and relaunching cannot fix that"
+    "schema, not the panes — and relaunching cannot fix that. Herdr cannot read or "
+    "repair a running process's env. For an active issue-owned sublane, run the "
+    "read-only `mozyo-bridge sublane recover-restored-pair` diagnosis; Herdr 0.8 "
+    "cannot atomically close an expected terminal generation, so no supported "
+    "close/relaunch action exists yet. Do not substitute raw `herdr pane close` "
+    "or `herdr session-start`"
 )
 
 

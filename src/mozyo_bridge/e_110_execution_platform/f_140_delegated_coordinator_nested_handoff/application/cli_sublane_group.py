@@ -74,6 +74,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_pair_composer_discard import register_sublane_prepare_bound_pair_parser  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_reboot_audit import register_sublane_reboot_audit_parser  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_residue_close import register_sublane_close_residue_parser  # noqa: E501
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_restored_pair_recovery_cli import register_sublane_recover_restored_pair_parser  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_callback import (
     CALLBACK_ABSENT,
     CALLBACK_CHOICES,
@@ -685,3 +686,4 @@ def register_sublane_group(
     # and the lane-scoped shell-residue close it recommends.
     register_sublane_reboot_audit_parser(sublane_sub)
     register_sublane_close_residue_parser(sublane_sub)
+    register_sublane_recover_restored_pair_parser(sublane_sub)

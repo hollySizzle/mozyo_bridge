@@ -110,7 +110,8 @@ class FakeRail:
         self.result = result
         self.calls: list[tuple[str, str]] = []
 
-    def drive_turn_start(self, target: str, body: str):
+    def drive_turn_start(self, target: str, body: str, **kwargs):
+        # ``**kwargs`` absorbs the Redmine #15202 ``screen_guard`` the live seam binds.
         self.calls.append((target, body))
         if isinstance(self.result, BaseException):
             raise self.result

@@ -5,7 +5,8 @@ herdr / tmux / Redmine — pinning the slice truth table:
 
 - the rail's six closed outcomes project onto the handoff ``(status, reason)`` wire, and only a
   confirmed ``sent`` turn start persists the opt-in durable record and returns ``0``; every other
-  outcome emits + ledgers then ``die``\\ s with **no C-u rollback and no re-send**;
+  outcome emits + ledgers then ``die``\\ s with no C-u rollback, no body re-injection, and the
+  actual bounded Enter-only resend count in its narrative;
 - a missing rail (defensive) ``die``\\ s before driving anything;
 - the side-effect ordering is emit -> ledger -> (persist | die);
 - the resolved anchor (Redmine / Asana) + the ticketless / envelope context thread verbatim onto
@@ -20,7 +21,7 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_herdr_standard_rail import (
     HerdrStandardRailOps,
@@ -143,9 +144,19 @@ class _FakeRail:
     def __init__(self, result: TurnStartResult) -> None:
         self._result = result
         self.driven: List[tuple[str, str]] = []
+        self.screen_guards: List[Optional[Callable[[str], Optional[str]]]] = []
 
-    def drive_turn_start(self, target: str, text: str) -> TurnStartResult:
+    def drive_turn_start(
+        self,
+        target: str,
+        text: str,
+        *,
+        screen_guard: Optional[Callable[[str], Optional[str]]] = None,
+    ) -> TurnStartResult:
         self.driven.append((target, text))
+        # Redmine #15202: record the bound resend-time pane classifier so the slice's
+        # obligation to supply one is assertable, not merely tolerated.
+        self.screen_guards.append(screen_guard)
         return self._result
 
 
@@ -190,11 +201,11 @@ def _request(
 
 
 class HerdrStandardRailTruthTableTest(unittest.TestCase):
-    def _run(
-        self, outcome: str, request: HerdrStandardRailRequest
+    def _run_result(
+        self, result: TurnStartResult, request: HerdrStandardRailRequest
     ) -> tuple[_FakeOps, _FakeRail, Optional[int], Optional[_FakeDie]]:
         ops = _FakeOps()
-        rail = _FakeRail(TurnStartResult(outcome=outcome))
+        rail = _FakeRail(result)
         code: Optional[int] = None
         died: Optional[_FakeDie] = None
         try:
@@ -202,6 +213,11 @@ class HerdrStandardRailTruthTableTest(unittest.TestCase):
         except _FakeDie as exc:
             died = exc
         return ops, rail, code, died
+
+    def _run(
+        self, outcome: str, request: HerdrStandardRailRequest
+    ) -> tuple[_FakeOps, _FakeRail, Optional[int], Optional[_FakeDie]]:
+        return self._run_result(TurnStartResult(outcome=outcome), request)
 
     # --- sent -------------------------------------------------------------------------------- #
 
@@ -218,6 +234,22 @@ class HerdrStandardRailTruthTableTest(unittest.TestCase):
         self.assertEqual(ops.persisted[0].record_format, "both")
         # The rail was driven with exactly marker+body, once, against the target.
         self.assertEqual(rail.driven, [("%pT", "[[mk-1]] hello body")])
+        # Redmine #15202: the slice binds the receiver provider's declared startup
+        # screens into the rail's WAIT_ERROR resend gate. Unbound, the rail withholds
+        # that resend entirely, so a missing guard here would silently disable the fix.
+        self.assertEqual(len(rail.screen_guards), 1)
+        guard = rail.screen_guards[0]
+        self.assertIsNotNone(guard)
+        # It is really the `claude` profile's classifier, not an always-None stub: a
+        # ready composer passes and the declared trust screen is caught.
+        self.assertIsNone(guard('╭────────╮\n│ > Try  │\n╰────────╯'))
+        self.assertEqual(
+            guard(
+                "Quick safety check: Is this a project you created or one you trust? "
+                "Claude Code'll be able to read, edit, and execute files here."
+            ),
+            "workspace_trust_confirmation",
+        )
         # Structured turn-start telemetry rides the outcome (auditor replay, #13255 j#72695).
         self.assertIsInstance(ops.emitted[0].outcome.turn_start_outcome, dict)
         self.assertEqual(
@@ -238,13 +270,33 @@ class HerdrStandardRailTruthTableTest(unittest.TestCase):
         self.assertEqual(ops.persisted, [])
         self.assertEqual(ops.emitted[0].outcome.status, "blocked")
         self.assertEqual(ops.emitted[0].outcome.reason, "turn_start_unconfirmed")
-        # The rollback boundary is the whole point: the marker+body was typed once and only
-        # Enter was sent — no C-u rollback and no blind re-send.
-        self.assertIn("no C-u rollback, no", died.message)
+        # Body re-injection and Enter-only resend are different facts. This zero-resend
+        # outcome reports both without the old ambiguous "no re-send" wording.
+        self.assertIn("no C-u rollback", died.message)
+        self.assertIn("Enter-only resends=0", died.message)
+        self.assertIn("never re-injected", died.message)
         self.assertIn("typed at most once", died.message)
+        self.assertNotIn("no re-send", died.message)
         self.assertIn("rail outcome delivered_not_started", died.message)
         self.assertIn("target=%pT", died.message)
         self.assertIn("marker=[[mk-1]]", died.message)
+
+    def test_failure_after_enter_only_resend_reports_one_not_no_resend(self) -> None:
+        ops, _rail, code, died = self._run_result(
+            TurnStartResult(
+                outcome=OUTCOME_DELIVERED_NOT_STARTED,
+                enter_resends=1,
+            ),
+            _request(),
+        )
+        self.assertIsNone(code)
+        self.assertIsNotNone(died)
+        assert died is not None
+        self.assertEqual(ops.events, ["emit", "ledger", "die"])
+        self.assertIn("marker+body was typed at most once", died.message)
+        self.assertIn("never re-injected", died.message)
+        self.assertIn("Enter-only resends=1", died.message)
+        self.assertNotIn("no re-send", died.message)
 
     def test_blocked_outcome_projects_receiver_blocked_and_dies(self) -> None:
         ops, _rail, code, died = self._run(OUTCOME_BLOCKED, _request())

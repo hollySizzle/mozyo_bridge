@@ -25,7 +25,8 @@ common rail, or the queue-enter rail (all out of this slice's scope):
   synthetic fake port + a fake rail and no live herdr / tmux / Redmine.
 - :class:`HerdrStandardRailUseCase` holds the slice body: drive the rail, project the wire
   outcome, assemble + emit + ledger the terminal outcome, and either persist + succeed (``sent``)
-  or ``die`` with no C-u rollback and no re-send (every other rail outcome).
+  or ``die`` with no C-u rollback, no body re-injection, and the actual bounded Enter-only
+  resend count (every other rail outcome).
 - :class:`LiveHerdrStandardRailOps` routes the ledger / persistence / ``die`` seams through the
   :mod:`commands` module *at call time* (the ``_record_herdr_send_ledger`` /
   ``_maybe_persist_delivery_record`` / ``die`` re-exports), so the existing herdr transport
@@ -77,6 +78,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transiti
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.workflow_contract import (
     WorkflowContractBundle,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_admission import (  # noqa: E501
+    make_resend_screen_guard,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_rail import (
     TurnStartResult,
     turn_start_rail_record_lines,
@@ -94,8 +98,19 @@ class TurnStartRailPort(Protocol):
     concrete rail keeps the slice exercisable with a synthetic fake rail.
     """
 
-    def drive_turn_start(self, target: str, text: str) -> TurnStartResult:
-        """Inject ``text`` into ``target`` and confirm a turn started; never raises."""
+    def drive_turn_start(
+        self,
+        target: str,
+        text: str,
+        *,
+        screen_guard: Optional[Callable[[str], Optional[str]]] = None,
+    ) -> TurnStartResult:
+        """Inject ``text`` into ``target`` and confirm a turn started; never raises.
+
+        ``screen_guard`` is the Redmine #15202 resend-time pane classifier. The slice
+        binds it from the resolved receiver's provider profile, because the rail is a
+        pure domain orchestrator that must not resolve providers itself.
+        """
         ...
 
 
@@ -193,9 +208,11 @@ class HerdrStandardRailUseCase:
 
     Drives the injected :class:`HerdrTurnStartRail`, projects the ``(status, reason)`` wire,
     assembles + emits + ledgers the terminal outcome, and either persists + returns ``0`` (a
-    confirmed ``sent`` turn start) or dies with the marker+body typed at most once and only
-    Enter sent — **no C-u rollback and no re-send** — on every other rail outcome. The control
-    flow returns / dies without ever falling through (the caller returns this method's result).
+    confirmed ``sent`` turn start) or dies with the marker+body typed at most once and never
+    re-injected. The failure narrative reports the actual bounded Enter-only resend count
+    separately; it never calls a run with ``enter_resends > 0`` "no re-send". There is no C-u
+    rollback on these event-rail outcomes. The control flow returns / dies without ever falling
+    through (the caller returns this method's result).
     """
 
     def __init__(self, ops: HerdrStandardRailOps) -> None:
@@ -211,7 +228,16 @@ class HerdrStandardRailUseCase:
                 f"target={request.target}"
             )
             raise AssertionError("unreachable")
-        turn_start = rail.drive_turn_start(request.target, f"{request.marker} {request.body}")
+        # Redmine #15202: bind the receiver provider's declared startup screens into the
+        # rail's WAIT_ERROR resend gate. The pre-send admission gate already proved the
+        # pane was startup-clear a moment ago; this is the same classification re-asked
+        # at resend time, because the only thing that changed between them is that our
+        # observation failed — not that the screen cannot have appeared since.
+        turn_start = rail.drive_turn_start(
+            request.target,
+            f"{request.marker} {request.body}",
+            screen_guard=make_resend_screen_guard(request.receiver),
+        )
         status, reason = project_herdr_turn_start(turn_start)
         # Machine-readable turn-start telemetry (turn_start_outcome / snapshot_state /
         # wait_kind / enter_resends / reclassified_blocked) for EVERY rail outcome,
@@ -276,8 +302,9 @@ class HerdrStandardRailUseCase:
             "handoff was routed through the herdr event-driven turn-start rail but "
             f"no turn start was confirmed (rail outcome {turn_start.outcome}); the "
             f"{request.receiver} receiver was not observed starting a turn. The marker+body "
-            "was typed at most once and only Enter was sent (no C-u rollback, no "
-            f"re-send). Read the receiver before re-issuing. target={request.target} "
+            "was typed at most once and was never re-injected; "
+            f"Enter-only resends={turn_start.enter_resends}; no C-u rollback. "
+            f"Read the receiver before re-issuing. target={request.target} "
             f"marker={request.marker}"
         )
         raise AssertionError("unreachable")

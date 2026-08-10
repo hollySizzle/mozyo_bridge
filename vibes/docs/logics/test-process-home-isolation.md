@@ -251,6 +251,18 @@ child は `python -c <bootstrap>` で起動し、bootstrap が絶対 path の pa
 j#78390 F1 (`src/` が nested `pip install` へ漏れて install を skip させ、serial/parallel
 verdict が割れた) と同じ穴を開けないため。
 
+bootstrap が挿入するのは **呼び出した CLI 自身の** package dir (`runtime_root()` =
+`mozyo_bridge.__file__` の親の親) である。したがって re-exec する 2 入口 (`tests profile` /
+`tests parallel`) では **どの CLI で起動したかが、どの runtime を検証したかを決める**。
+installed binary から起動すると installed package が検証対象になり、`mozyo_bridge` は discovery
+より前に import 済みになるので、test module 側の `sys.path.insert(0, ROOT / "src")` は既に
+import 済み package の `__path__` を変えられず **inert** になる (#15229 実測: worktree より古い
+installed から `tests parallel` を起動し、worktree 固有 symbol を参照する 13 module が collection
+import error で fail-closed した)。`tests run` は fenced child が literal `python -m unittest` を
+新しい interpreter で起動するため事前 import がなく、corpus 規約どおりに解決する。worktree の
+`src/` を検証する invocation の正本は `local-parallel-test-runner-policy.md` の
+`### runtime provenance` に置く (本 doc に複製しない)。
+
 ### `tests parallel` shard との差 (`HOME` の扱い)
 
 shard は #13733 の acceptance どおり **per-shard `HOME` を pin し続ける**
