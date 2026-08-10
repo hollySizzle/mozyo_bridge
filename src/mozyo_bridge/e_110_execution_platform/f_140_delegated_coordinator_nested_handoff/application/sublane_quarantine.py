@@ -69,12 +69,22 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     GhostComposerRenderPolicy,
     RenderGhostFacts,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine_disposition import (  # noqa: E501
+    disposition_drift,
+    register_disposition_flags,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_pending_composer import (  # noqa: E501
     AMBIGUOUS,
+    GEN_AXIS_IDENTITY,
+    GEN_AXIS_PAIR,
+    GEN_AXIS_REVISION,
+    GEN_AXIS_ROW_AMBIGUOUS,
+    GEN_AXIS_WORKSPACE_CWD,
     UNCORRELATED,
     PendingComposerClassification,
     PendingComposerSignal,
     classify_pending_composer,
+    ordered_generation_axes,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
     _tab_id_of_row,
@@ -150,6 +160,34 @@ class QuarantineRequest:
     action_generation: str
     approval_observed_at: str
     approved_revision: int
+    # --- Generation-mismatch disposition tokens (Redmine #15193) -----------------------
+    # Absent on an ordinary quarantine, so that path is byte-identical. Present together
+    # they turn this request into a disposition: an approval granted over an explicitly
+    # named generation mismatch, which additionally authorizes discarding the pending input.
+    #: The exact mismatch axes the owner approved over.
+    approved_generation_axes: tuple[str, ...] = ()
+    #: The identity of the pending input the owner saw and approved discarding.
+    approved_pending_identity: str = ""
+    #: What the approval says becomes of that input. Only
+    #: :data:`...domain.generation_mismatch_disposition.PENDING_EFFECT_DISCARDED_ON_REPLACE`
+    #: is actionable here — a replacement cannot preserve the composer it replaces.
+    approved_pending_effect: str = ""
+
+    @property
+    def is_disposition(self) -> bool:
+        """Does this request carry a COMPLETE disposition approval?
+
+        All three tokens are required together. A partial set is deliberately NOT a
+        disposition: it would let a caller unlock the generation-mismatch path while leaving
+        the pending input's fate unstated, which is exactly the silent discard #15193
+        forbids. A partial set therefore falls through to the ordinary quarantine gate and is
+        refused there as ``not quarantine-eligible``.
+        """
+        return bool(
+            self.approved_generation_axes
+            and self.approved_pending_identity
+            and self.approved_pending_effect
+        )
 
 
 @dataclass(frozen=True)
@@ -298,7 +336,22 @@ class SublaneQuarantineUseCase:
         since have taken new input or started working; killing it then would destroy
         an input the owner never approved discarding).
         """
-        if not classification.quarantine_candidate:
+        if request.is_disposition:
+            # Redmine #15193: a generation-mismatched receiver holding a REAL pending input
+            # is not a quarantine candidate and never becomes one — but it is exactly the
+            # state hibernate's boundary sends here, so refusing unconditionally is what
+            # closed the loop on #15110 / #15140 / #15195. A complete disposition approval
+            # opens a separate, narrower door.
+            #
+            # The re-verification runs whenever the tokens are present, NOT only when the
+            # ordinary rail refused. A disposition approval is granted over an explicitly
+            # named condition; if that condition has since healed the receiver into an
+            # ordinary quarantine candidate, honouring the approval anyway would act outside
+            # the scope the owner actually authorized. Fail closed and make them re-observe.
+            drift = disposition_drift(request, inspection, classification)
+            if drift:
+                return f"disposition approval does not match live state ({drift})"
+        elif not classification.quarantine_candidate:
             return "classification is not quarantine-eligible; zero actuation"
         if inspection.row_revision != request.approved_revision:
             return "approval is stale for the current agent/composer revision"
@@ -679,9 +732,19 @@ class LiveSublaneQuarantineOps:
         present = bool(exact)
         row = exact[0] if len(exact) == 1 and len(matches) == 1 else None
         if row is None:
+            # Zero or several rows for the exact pinned (name, locator). Redmine #15193: the
+            # axis is reported so the operator sees WHY the generation did not match, but the
+            # pending fact stays ``None`` — an ambiguous inventory can never be disposed of.
             return QuarantineInspection(
                 workspace_id=workspace_id,
-                signal=PendingComposerSignal(True, None, "unknown", False, False),
+                signal=PendingComposerSignal(
+                    True,
+                    None,
+                    "unknown",
+                    False,
+                    False,
+                    generation_axes=(GEN_AXIS_ROW_AMBIGUOUS,),
+                ),
                 receiver_present=present,
                 detail="generation_mismatch",
             )
@@ -699,12 +762,20 @@ class LiveSublaneQuarantineOps:
             if isinstance(revision_raw, int) and not isinstance(revision_raw, bool)
             else -1
         )
-        generation_ok = (
-            identity_ok
-            and revision == request.approved_revision
-            and self._cwd_matches(row, self.repo_root)
-            and self._pair_ok(rows, workspace_id=workspace_id, lane=request.lane)
+        # Redmine #15193: the same four checks as before, but each is evaluated and NAMED
+        # separately instead of being folded into one opaque boolean. `generation_ok` is
+        # still their conjunction, so the classification is byte-identical; the axis tuple is
+        # purely additive and is what lets an owner approval say which condition it is
+        # granted over (#15110 j#102068 / #15140 j#102064 / #15195 j#102193 each hit a
+        # DIFFERENT axis, and the collapsed boolean made them indistinguishable).
+        axis_checks = (
+            (GEN_AXIS_IDENTITY, identity_ok),
+            (GEN_AXIS_REVISION, revision == request.approved_revision),
+            (GEN_AXIS_WORKSPACE_CWD, self._cwd_matches(row, self.repo_root)),
+            (GEN_AXIS_PAIR, self._pair_ok(rows, workspace_id=workspace_id, lane=request.lane)),
         )
+        generation_axes = tuple(axis for axis, ok in axis_checks if not ok)
+        generation_ok = not generation_axes
         attestation_record = None
         try:
             attestation_record = HerdrIdentityAttestationStore().read(
@@ -768,6 +839,7 @@ class LiveSublaneQuarantineOps:
             generation_matches=generation_ok,
             correlated_marker_ids=tuple(correlated),
             correlation_ambiguous=len(observation.marker_ids) > 1,
+            generation_axes=generation_axes,
         )
         return QuarantineInspection(
             workspace_id=workspace_id,
@@ -908,6 +980,17 @@ def cmd_sublane_quarantine(args: argparse.Namespace) -> int:
         action_generation=getattr(args, "action_generation", "") or "",
         approval_observed_at=getattr(args, "approval_observed_at", "") or "",
         approved_revision=int(getattr(args, "approved_revision", -1)),
+        # Redmine #15193: normalised here so the use case compares canonical axis tuples
+        # regardless of the order or spacing the operator pasted.
+        approved_generation_axes=ordered_generation_axes(
+            tuple(
+                token.strip()
+                for token in (getattr(args, "approved_generation_axes", "") or "").split(",")
+                if token.strip()
+            )
+        ),
+        approved_pending_identity=getattr(args, "approved_pending_identity", "") or "",
+        approved_pending_effect=getattr(args, "approved_pending_effect", "") or "",
     )
     use_case = SublaneQuarantineUseCase(
         ops=LiveSublaneQuarantineOps(repo_root=repo_root),
@@ -928,9 +1011,12 @@ def register_sublane_quarantine_parser(sublane_sub: Any) -> None:
     parser = sublane_sub.add_parser(
         "quarantine",
         help=(
-            "Redmine #13763: classify one exact pending composer and, only with a "
+            "Redmine #13763 / #15193: classify one exact pending composer and, only with a "
             "positive generation-bound owner approval, replace that managed receiver "
-            "without generic Enter/C-u/body typing. Default is read-only preflight."
+            "without generic Enter/C-u/body typing. A receiver whose generation mismatches "
+            "AND holds a real pending input additionally requires the three --approved-* "
+            "disposition tokens, which bind the approval to the exact mismatch and state "
+            "what becomes of that input. Default is read-only preflight."
         ),
     )
     for flag, dest, help_text in (
@@ -959,6 +1045,7 @@ def register_sublane_quarantine_parser(sublane_sub: Any) -> None:
         type=int,
         help="Herdr agent/composer revision observed by the approval",
     )
+    register_disposition_flags(parser)
     parser.add_argument(
         "--execute",
         action="store_true",

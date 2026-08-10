@@ -16,6 +16,11 @@ from typing import Any
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_assertions import (  # noqa: E501
     HibernateAssertions,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_toctou import (  # noqa: E501
+    BLOCK_COMPOSER_PENDING_REAL,
+    BLOCK_RUNTIME_STATE_UNREADABLE_OR_UNKNOWN,
+    BLOCK_WORKER_BUSY,
+)
 
 # Blocked-reason vocabulary (fail-closed preflight).
 BLOCK_ORIGINAL_IDENTITY = "original_identity_unknown"
@@ -95,6 +100,27 @@ class HibernatePreflight:
     #: ``release_action_id`` fails closed. ``True`` on the fresh path (no stored release yet)
     #: and for an issue lane.
     action_identity_current: bool = True
+    # --- Dry-run / action-time parity (Redmine #15193) ---------------------------------
+    # The gates above are all ASSERTED from the durable record; the release boundary
+    # (T1) additionally LIVE-PROBES the composer and worker. That asymmetry is the
+    # divergence #15193 names: an operator asserting `--not-working` / no pending prompt
+    # got `may_hibernate=true` from a dry-run, then `--execute` blocked on
+    # `composer_pending_real` — a blocker the dry-run had every means to report and did
+    # not, because it never looked (#15110 j#102068, #15140 j#102064).
+    #
+    # These three carry a T0 live observation so the dry-run returns the SAME typed token
+    # the boundary would. They default to the quiescent/readable values, so a caller that
+    # supplies no probe keeps the previous behaviour exactly.
+    #: A REAL (ghost-refined) pending composer input was positively observed at preflight.
+    live_composer_pending: bool = False
+    #: A live managed slot was positively observed mid-turn at preflight.
+    live_worker_busy: bool = False
+    #: The live activity probe itself was readable. An UNREADABLE probe deliberately does
+    #: NOT block the dry-run: a dry-run is a diagnostic, an unreadable probe proves nothing,
+    #: and failing it closed would deny the operator the very report they ran it for. The
+    #: action-time boundary still fails closed on the same condition — the difference is
+    #: reported explicitly by :attr:`unverified_axes` rather than left silent.
+    live_activity_readable: bool = True
     assertions: HibernateAssertions = field(default_factory=HibernateAssertions)
 
     @property
@@ -111,7 +137,22 @@ class HibernatePreflight:
             and self.action_generation_current
             and self.action_revision_current
             and self.action_identity_current
+            and not self.live_composer_pending
+            and not self.live_worker_busy
         )
+
+    @property
+    def unverified_axes(self) -> tuple[str, ...]:
+        """Axes this preflight could NOT verify but the action-time boundary will (#15193).
+
+        A green preflight carrying a non-empty ``unverified_axes`` means exactly: "no blocker
+        was found, AND this axis was not provable here, so ``--execute`` may still block on
+        it". That is the typed explanation of the dry-run / action-time difference the issue
+        asks for — previously the same situation was reported as an unqualified green.
+        """
+        if not self.live_activity_readable:
+            return (BLOCK_RUNTIME_STATE_UNREADABLE_OR_UNKNOWN,)
+        return ()
 
     @property
     def park_basis(self) -> str:
@@ -161,6 +202,13 @@ class HibernatePreflight:
             reasons.append(BLOCK_PROJECT_GENERATION_MISMATCH)
         if not self.project_attestation_ok:
             reasons.append(BLOCK_PROJECT_UNATTESTED)
+        # Redmine #15193 dry-run parity: the SAME tokens the release boundary uses, so an
+        # operator sees one vocabulary across preflight and action time rather than a green
+        # dry-run followed by an unfamiliar `composer_pending_real`.
+        if self.live_worker_busy:
+            reasons.append(BLOCK_WORKER_BUSY)
+        if self.live_composer_pending:
+            reasons.append(BLOCK_COMPOSER_PENDING_REAL)
         return tuple(reasons)
 
     def as_payload(self) -> dict[str, Any]:
@@ -178,6 +226,10 @@ class HibernatePreflight:
             "action_generation_current": self.action_generation_current,
             "action_revision_current": self.action_revision_current,
             "action_identity_current": self.action_identity_current,
+            "live_composer_pending": self.live_composer_pending,
+            "live_worker_busy": self.live_worker_busy,
+            "live_activity_readable": self.live_activity_readable,
+            "unverified_axes": list(self.unverified_axes),
             "blocked_reasons": list(self.blocked_reasons),
         }
 

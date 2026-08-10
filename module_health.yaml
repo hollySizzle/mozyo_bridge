@@ -1464,6 +1464,36 @@ allowlist:
     resolution_version: "v0.12.0 (Version #301 ワークフロー単一ステップ実行入口整備枠)"
     expires: "2027-10-08"
 
+  - path: src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_quarantine.py
+    lines: 1073
+    reason: >-
+      Already at 986 lines before #15193 — 14 under the threshold, so any material
+      addition crosses it. #15193 adds the generation-mismatch disposition rail that
+      breaks the #15110 / #15140 / #15195 deadlock (a stopped receiver carrying BOTH a
+      generation mismatch and a real pending composer could be converged by no supported
+      rail: hibernate blocked on `composer_pending_real` and pointed at quarantine, which
+      answered `not_quarantine_candidate`). Everything separable was separated rather
+      than parked here: the pure decision vocabulary lives in
+      `domain/generation_mismatch_disposition.py`, and the action-time drift
+      re-verification plus the CLI token registration live in the new sibling
+      `sublane_quarantine_disposition.py`. What remains in this module is only what
+      cannot leave it — the three `QuarantineRequest` approval fields, the four-axis
+      decomposition of `generation_ok` inside the live inspector (it needs `_cwd_matches`
+      / `_pair_ok`), and the single `_approval_stale_reason` branch that routes to the
+      disposition gate.
+      The concrete remaining decomposition is extracting `LiveSublaneQuarantineOps`
+      (~300 lines) into its own adapter module, per the adapter-boundary policy. That was
+      attempted during this issue and REVERTED: the class owns the provider globals that
+      `mock.patch` targets across several suites, and retargeting them reached
+      `tests/regressions/test_issue_14539_review_exemption_projection.py`, which is on
+      #15166's active changed-path list — an overlap j#102219 forbids editing without a
+      recorded design consultation. Deferring the split is the scope-boundary-respecting
+      choice, not an unbounded one: it is a mechanical move plus patch-target updates once
+      #15166 has integrated.
+    owner_issue: "#15193"
+    resolution_version: "v0.12.0 (Version #276 OOP-first architecture and static typing)"
+    expires: "2027-11-15"
+
 
 # sublane_actuator_herdr_ops.py was allowlisted at a 1029-line baseline (owner_issue
 # #13847). Redmine #14258 removed the entry by carrying out a reduction rather than
