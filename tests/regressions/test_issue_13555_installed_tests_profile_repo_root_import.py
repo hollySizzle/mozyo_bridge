@@ -32,6 +32,7 @@ import argparse
 import io
 import sys
 import tempfile
+import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -115,10 +116,7 @@ class InstalledTestsProfileRepoRootImportTest(unittest.TestCase):
         stale = [
             n
             for n, module in tuple(sys.modules.items())
-            if n in (_PKG, _SUBPKG)
-            or n.startswith(_PKG + ".")
-            or n.startswith(_SUBPKG + ".")
-            or loaded_from_fake_repo(module)
+            if loaded_from_fake_repo(module)
         ]
         for name in stale:
             del sys.modules[name]
@@ -173,6 +171,36 @@ class InstalledTestsProfileRepoRootImportTest(unittest.TestCase):
         finally:
             if previous_support is not missing:
                 sys.modules["support"] = previous_support
+
+    def test_cleanup_preserves_same_named_modules_outside_the_fake_repo(self) -> None:
+        repo = self._write_fake_repo()
+        names = (
+            "support",
+            _PKG,
+            f"{_PKG}.child",
+            _SUBPKG,
+            f"{_SUBPKG}.child",
+        )
+        missing = object()
+        previous = {name: sys.modules.get(name, missing) for name in names}
+        sentinels: dict[str, types.ModuleType] = {}
+        try:
+            for name in names:
+                module = types.ModuleType(name)
+                module.__file__ = str(Path(__file__).resolve())
+                sentinels[name] = module
+                sys.modules[name] = module
+
+            self._cleanup_repo(repo)
+
+            for name, module in sentinels.items():
+                self.assertIs(sys.modules.get(name), module)
+        finally:
+            for name, module in previous.items():
+                if module is missing:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = module
 
     def test_installed_path_without_bootstrap_reproduces_collection_error(self) -> None:
         # Negative control: the pre-fix discovery (no repo-root bootstrap,
