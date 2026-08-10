@@ -342,6 +342,118 @@ class ActionTests(unittest.TestCase):
             [argv for argv in wiring.runner.argvs if "project-gateway" in argv[-1]]
         )
 
+    def _apply(self, wiring, *extra):
+        unit_id = self._remote_unit(wiring)
+        return run(
+            cli.cmd_herdr_unit_board_action,
+            parse(
+                [
+                    "unit-board",
+                    "action",
+                    "--unit",
+                    unit_id,
+                    "--issue",
+                    "15138",
+                    "--journal",
+                    "101633",
+                    "--summary",
+                    "board pointer",
+                    "--target-project",
+                    "scope-alpha",
+                    "--apply",
+                    *extra,
+                ]
+            ),
+        )
+
+    def test_apply_takes_the_shared_default_rail(self) -> None:
+        # Redmine #15198: the caller-side `--mode standard` pin is gone.
+        wiring = _Wiring()
+        with wiring:
+            self._apply(wiring)
+
+        command = next(
+            argv[-1] for argv in wiring.runner.argvs if "project-gateway" in argv[-1]
+        )
+        self.assertIn("--mode queue-enter", command)
+        self.assertNotIn("--mode standard", command)
+
+    def test_an_explicit_strict_rail_is_still_selectable(self) -> None:
+        wiring = _Wiring()
+        with wiring:
+            code, _, _ = self._apply(wiring, "--delivery-mode", "standard")
+
+        self.assertEqual(code, 0)
+        command = next(
+            argv[-1] for argv in wiring.runner.argvs if "project-gateway" in argv[-1]
+        )
+        self.assertIn("--mode standard", command)
+
+    def test_an_unconfirmed_submission_exits_distinctly_from_a_refusal(self) -> None:
+        # The exit code is the only thing an automated caller sees. Reusing 1
+        # here would tell it a retry is free while the body may already be at
+        # the receiver (Redmine #15198).
+        wiring = _Wiring(answer_map=answers({GATEWAY_ARGS: delivery_record(observation=None)}))
+        with wiring:
+            code, out, _ = self._apply(wiring)
+
+        self.assertEqual(code, 3)
+        self.assertIn("uncertain", out)
+        self.assertIn("uncertain_partial", out)
+        self.assertEqual(
+            len([argv for argv in wiring.runner.argvs if "project-gateway" in argv[-1]]),
+            1,
+        )
+
+    def test_a_pre_injection_gateway_refusal_exits_as_a_refusal(self) -> None:
+        wiring = _Wiring(
+            answer_map=answers(
+                {
+                    GATEWAY_ARGS: delivery_record(
+                        status="blocked", reason="precondition_not_idle"
+                    )
+                }
+            )
+        )
+        with wiring:
+            code, out, _ = self._apply(wiring)
+
+        self.assertEqual(code, 1)
+        self.assertIn("refused", out)
+        self.assertIn("not_sent", out)
+
+    def test_the_json_surface_publishes_the_shared_stage(self) -> None:
+        wiring = _Wiring(answer_map=answers({GATEWAY_ARGS: delivery_record(observation=None)}))
+        with wiring:
+            code, out, _ = self._apply(wiring, "--json")
+
+        payload = json.loads(out)
+        self.assertEqual(code, 3)
+        self.assertEqual(payload["injection_stage"], "uncertain_partial")
+        self.assertTrue(payload["blind_retry_prohibited"])
+        self.assertNotIn("SSH-DESTINATION-SENTINEL", out)
+
+    def test_an_unsupported_rail_is_rejected_by_the_parser(self) -> None:
+        with self.assertRaises(SystemExit), redirect_stderr(StringIO()):
+            parse(
+                [
+                    "unit-board",
+                    "action",
+                    "--unit",
+                    "unit-x",
+                    "--issue",
+                    "1",
+                    "--journal",
+                    "2",
+                    "--summary",
+                    "s",
+                    "--target-project",
+                    "scope-alpha",
+                    "--delivery-mode",
+                    "raw-keys",
+                ]
+            )
+
     def test_claude_is_not_an_addressable_receiver_on_this_surface(self) -> None:
         with self.assertRaises(SystemExit), redirect_stderr(StringIO()):
             parse(

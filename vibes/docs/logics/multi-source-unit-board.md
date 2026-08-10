@@ -201,7 +201,8 @@ remote Unit は「入力してよい pane」ではない。host 境界越えは 
 ```text
 mozyo-bridge herdr unit-board action --unit <unit_id> \
   --target-project <adopted project scope> \
-  --issue <id> --journal <id> --kind <kind> --summary <text> [--apply]
+  --issue <id> --journal <id> --kind <kind> --summary <text> \
+  [--delivery-mode <mode>] [--apply]
 ```
 
 - 配送は対象 source 上で `project-gateway handoff --to codex --target-repo <root>
@@ -240,8 +241,25 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   検出は **token 境界**（前後が英数字でない位置）で行い、**値の長さで例外を作らない**。契約は
   「接続値を公開面へ出さない」であり、短い値だけ契約外にする根拠は無い（`restart db now` は
   container `db` の開示、`dbus` は非開示）。3 文字以上の値は語中への埋め込みも検出する。
+- **送信 rail は caller 側で固定しない（#15198）。** route が特別なのであって、送信方法は特別ではない。
+  安全確認を通過した後の `--mode` は、通常の agent handoff と同じ既定を共有 authority
+  (`effective_send_mode`) から解決する。以前の実装は caller 側で `--mode standard` を固定しており、
+  同じ receiver への他の全 handoff と異なる rail を通っていた。`standard` / `pending` は
+  **strict landing observation または operator/debug 目的で明示選択する場合のみ**残す
+  (`--delivery-mode`)。既定へ落とし込まない。mode は省略ではなく解決値を明示送信する
+  （gateway version 間で選択を決定的にするため。値の出所は共有既定であり、既定の第二の見解を作らない）。
+- **queue-enter の本文は 1 回だけ渡す。** Enter のみの bounded retry は対象 host 側 rail の既存 policy に
+  属する。client は結果に関わらず gateway command を **ちょうど 1 回**実行し、再実行しない
+  （再実行は Enter の再送ではなく本文の再入力になる）。無制限 Enter retry・raw pane input・
+  direct remote Claude 送信は追加しない。
+- **remote command の deadline は観測と queue-enter 配送で分ける。** board / workspace の read-only
+  観測は従来どおり `connect_timeout + COMMAND_GRACE_SECONDS` で速やかに degrade する。queue-enter の
+  gateway command に限り、その基礎 deadline へ共有 policy の
+  `QUEUE_ENTER_RETRY_WINDOW_SECONDS` を加える。これは client 側で retry を増やす処理ではなく、対象 host
+  側の既存 Enter-only retry が完了する前に client が command を timeout にしないための待機 budget
+  である。`standard` / `pending` を明示した action は基礎 deadline のままとする。
 - **配送成否は exit code で判定しない。** 対象 gateway の **構造化 outcome** を読み、共有 authority
-  (`injection_stage_for_outcome`) が `submitted_confirmed` を返した場合のみ `delivered` とする。
+  (`injection_stage_for_outcome`) の判定に従う。
   **構造化 outcome は判定にのみ使い、client の表示は固定の public-safe 文言とする**（remote の値を
   一切反映しない。これが本項の唯一の契約である）。
   出力形状は決定的にする: gateway 呼び出しで `--record-format json` を明示し、読み取りは
@@ -251,11 +269,36 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   候補は **末尾の非空行ちょうど 1 件**であり、それが parse 不能 / 非 object / required field 欠落なら
   即座に未確認とする。**parse できる行を求めて遡らない** — 遡ると outcome の後に続いた出力が無視され、
   古い成功が生き残る（fail-closed 契約の fail-open な読み方になる）。
-  exit 0 でも composer に置いただけの `pending_input` や marker 未観測の `queue_enter` は未配送で
-  あり、正本は `delivery_outcome_gate` / `injection_stage`（同一の問いに複数箇所が別答を出した
-  #14232 の経緯を持つ）。status / reason token を局所で再検査せず、**共有 authority を評価する**。
-  欠落・非 JSON・非 object・authority が位置づけられない outcome はすべて typed `delivery_failed`
-  とし、remote stdout の値を detail へ反射しない。
+  exit 0 でも composer に置いただけの `pending_input` や marker 未観測の `queue_enter` は
+  **confirmed ではない**が **zero-send でもない**。正本は `delivery_outcome_gate` / `injection_stage`
+  （同一の問いに複数箇所が別答を出した #14232 の経緯を持つ）。status / reason token を局所で
+  再検査せず、**共有 authority を評価する**。
+  欠落・非 JSON・非 object・authority が位置づけられない outcome、および command を完了実行
+  できなかった場合（spawn 失敗 / timeout）はすべて `uncertain_partial` とする。**「読めない」は
+  「送っていない」ではない** — command は対象 host 上で実際に走っている。remote stdout の値を
+  detail へ反射しない。
+  exit status は confirmation を **撤回することはできるが付与はできない**: 構造化 outcome が
+  `submitted_confirmed` でも non-zero exit なら矛盾として `uncertain_partial` へ落とす。
+  `not_sent` は対象 gateway が **pre-injection で拒否した**と構造化 outcome が述べている場合に限る。
+- **gateway record は producer が導出した `injection_stage` を運ぶ。** 単一行 JSON は
+  `asdict(DeliveryOutcome)` であり、`mode` と producer が **full context** で導出した
+  `injection_stage` を含む。共有 authority はこの carried 値を優先するため、queue-enter carve-out
+  （turn-start 未観測の `sent` + `ok` は confirmed ではない）が host 境界を越えても正しく解決する。
+  test fixture もこの形状を **実 producer** から生成し、wire と食い違わせない。
+- **結果は 3 分岐であり、2 分岐へ畳まない（#15198）。** 共有 authority の
+  `not_sent` / `uncertain_partial` / `submitted_confirmed` をそのまま result state へ対応させる。
+  未確認を成功にも非送達にも読み替えない — 前者は誰も読んでいない request を closed にし、
+  後者は同じ request の二重配送を招く。
+
+  | injection_stage | state | reason | exit |
+  | --- | --- | --- | --- |
+  | `submitted_confirmed` | `delivered` | `ok` | 0 |
+  | `not_sent` | `refused` | `delivery_failed` | 1 |
+  | `uncertain_partial` | `uncertain` | `delivery_uncertain` | 3 |
+
+  result payload は `injection_stage` と `blind_retry_prohibited` を共有 authority から公開する。
+  exit 3 を 1 へ畳むと、本文が既に receiver に届いている可能性がある時点で automated caller に
+  「retry は無償」と伝えることになる。
 - `--summary` は **public-safe projection を素通りする文字列だけを受け付ける**。preview は
   projection を通した文字列を表示するため、projection が書き換える文字列 (control 文字 /
   absolute path / credential 形状 / 正規化される形) を許すと「preview で確認した文字列」と
@@ -287,6 +330,14 @@ read-only observation + 1 本の routed な preview-first action に限る。
   degraded source（到達不能 / 読めない応答の分離）、remote registry path の厳格検証の unit tests
 - 配送判定が共有 injection-stage authority を評価していること（exit 0 の非配送 outcome を
   `delivered` にしない）の unit tests
+- 送信 rail が共有既定であること（caller 側 `standard` 固定の非退行）、`standard` / `pending` の
+  明示選択が維持されていること、preview が rail を表示し substituted rail が zero-send になることの
+  unit tests
+- 3 分岐 result の unit tests: `submitted_confirmed` → `delivered`、pre-injection 拒否 →
+  `refused` / `not_sent`、marker 未観測 / pending / 読めない outcome / spawn 失敗 → `uncertain`。
+  exit code 0 / 1 / 3 の区別と `blind_retry_prohibited` の公開を CLI level で固定する
+- gateway command が結果に関わらず **ちょうど 1 回**しか実行されないことの unit test（本文の
+  重複送信を client 側から起こさない）
 - 多 source runtime と action rail の injected-runner tests (live host を使わない)
 - local-only 不変の regression pin (`tests/regressions/test_issue_15138_local_only_unit_board_preserved.py`)
 - local / remote host / remote Dev Container を使った軽量実機確認は #15140 が所有する
