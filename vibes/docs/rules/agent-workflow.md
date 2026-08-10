@@ -93,6 +93,18 @@ escalation trigger 一覧 (実装者 Claude がユーザー窓口 Codex へ esca
 - `owner_close_approval` journal の記録は coordinator role が行う (standing delegation を含む)。lane gateway が発動条件充足を確認した場合は、close 条件充足の callback を coordinator へ返し、記録自体は coordinator が行う。lane gateway が standing_delegation を直接起票した既往は、条件充足時に限り coordinator の ratification journal で追認できるが、標準経路にしない (owner_intent anchor: #13358 j#73485 運用注記)。
 - herdr backend での lane 実運用手順 (作成 / dispatch / relaunch / retire / 統合 / live smoke) の正本は `vibes/docs/tasks/herdr-lane-operations.md`。本 doc は手順を複製しない。
 
+### Same-lane reviewer 判断委譲 trial
+
+この節は `mozyo_bridge` repository 内だけで行う、revert 可能な運用試行である。新しい role、gate、handoff kind を定義せず、distributed skill や central preset の既定も変更しない。適用対象は、durable journal で本 trial の対象として明示した既存の sublane とする。
+
+- 同じ lane の `implementation_gateway` は、その work unit の目的と既存 acceptance を変えない範囲で、実装方式の選択、方式の却下、worker の停止・再開、追加調査の要求、Task-level review の結論を決めてよい。類似原因の重大 finding が繰り返された場合は、個別修正の継続を止め、方式を再検討させてよい。
+- `implementation_gateway` は引き続き no-diff reviewer であり、code / docs の実装は worker が行う。判断を worker へ渡す前に、根拠となる確認事実、採用または却下した方式、変更してはならない境界、必要な test、未解決事項を同じ issue の journal に記録する。
+- main coordinator は、sublane 内で完結した Task-level review を同じ観点でやり直さない。gateway が acceptance を満たすと判断した結果を受け取り、lane 間の整合、integration、親 issue / US の disposition を担当する。
+- issue の目的・acceptance の変更、lane をまたぐ契約や公開 interface の変更、実 host に対する破壊操作、credential・permission・課金、release・publish、owner approval、親 issue / US の close は main coordinator または owner に残す。gateway は危険を避けるために作業を止めたり条件を厳しくしたりできるが、これらを自ら許可したり既存 guardrail を弱めたりしてはならない。
+- 判断が上記境界を越える場合、gateway は worker を止め、確認済み事実と選択肢を main coordinator へ返す。境界内であれば、main coordinator の逐次承認を待たずに worker へ次の指示を出す。
+
+試行結果は Redmine #15199（sublane reviewer 判断委譲 trial、着手中）を記録先とする。不要な main coordinator 往復が減り、判断根拠と review 結論が追跡でき、同型 finding の後戻りと境界違反が増えないことを採用判断の基準とする。判断主体が曖昧になる、安全境界を越える、lane 間の衝突や再作業が増える場合は本変更を revert する。単一 lane の成功だけでは distributed policy へ昇格せず、#15192 OS ネイティブ定期確認統合（着手中）と性質の異なる別 lane の観測後に判断する。
+
 ## Architecture Boundary For Modularization
 
 - `src/**` / `tests/**` の分割・整理・新規設計を伴う通常開発では、単なる free function のファイル移動だけを architecture 改善として扱わない。対象 path の catalog resolve で `vibes/docs/logics/object-oriented-architecture-policy.md` を読み、command handler / use case / domain policy / value object / port-adapter のどこを改善する作業かを Redmine に記録する。
