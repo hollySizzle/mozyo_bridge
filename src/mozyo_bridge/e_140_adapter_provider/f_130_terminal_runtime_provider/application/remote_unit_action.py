@@ -16,6 +16,15 @@ Unit moved, the source stopped answering, the observation aged out, or the
 registry now resolves the workspace differently, the apply refuses and sends
 nothing.  Every refusal is a typed reason with a fixed message — never a
 connection value, a remote path, or an exception body.
+
+What crossing the boundary does **not** change is how the handoff is sent or how
+its outcome is read (Redmine #15198).  The route is special; the delivery is not.
+So the mode comes from the same shared default an ordinary agent handoff uses
+instead of being pinned here, and the answer to "did it arrive?" comes from the
+same shared injection-stage authority — including its third answer.  A submission
+that was never confirmed is reported as uncertain, not rewritten into a success
+or into a non-delivery, because those two readings license the two failures that
+matter: closing an unread request, and delivering it twice.
 """
 
 from __future__ import annotations
@@ -28,8 +37,17 @@ from typing import Optional, Sequence
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (
     is_canonical_positive_decimal,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+    MODES,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (
+    effective_send_mode,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (
+    STAGE_NOT_SENT,
     STAGE_SUBMITTED_CONFIRMED,
+    STAGE_UNCERTAIN_PARTIAL,
+    blind_retry_prohibited,
     injection_stage_for_outcome,
 )
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.herdr_unit_board import (
@@ -56,6 +74,13 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
 ACTION_APPLICABLE = "applicable"
 ACTION_REFUSED = "refused"
 ACTION_DELIVERED = "delivered"
+#: Redmine #15198.  The third answer this rail previously could not give.  A
+#: delivery that reached the receiver's composer without a confirmed submission
+#: is neither ``delivered`` nor ``refused``: calling it delivered claims a
+#: submission nobody observed, and calling it refused claims a zero-send that
+#: would license a duplicate retry.  The shared authority already names the
+#: distinction (``uncertain_partial``); this state is where it surfaces.
+ACTION_UNCERTAIN = "uncertain"
 
 REASON_OK = "ok"
 REASON_UNIT_UNRESOLVED = "unit_unresolved"
@@ -65,6 +90,7 @@ REASON_PREVIEW_STALE = "preview_stale"
 REASON_IDENTITY_CHANGED = "identity_changed"
 REASON_INVALID_REQUEST = "invalid_request"
 REASON_DELIVERY_FAILED = "delivery_failed"
+REASON_DELIVERY_UNCERTAIN = "delivery_uncertain"
 REASON_CONNECTION_VALUE_DISCLOSED = "connection_value_disclosed"
 REASON_PREVIEW_MISMATCH = "preview_mismatch"
 
@@ -79,6 +105,21 @@ ACTION_KINDS = (
     "custom",
 )
 DEFAULT_ACTION_KIND = "design_consultation"
+
+#: The send rails an operator may name explicitly, and nothing invented here:
+#: the canonical ``handoff send`` vocabulary, imported so this rail cannot drift
+#: into offering a mode the gateway does not have (Redmine #15198).
+ACTION_DELIVERY_MODES: tuple[str, ...] = tuple(sorted(MODES))
+
+#: An unset delivery mode means "whatever an ordinary agent handoff would do",
+#: resolved through the shared authority rather than restated as a literal.  This
+#: rail used to pin ``--mode standard`` at the caller, which is why a Unit Board
+#: action took a different rail from every other handoff to the same receiver
+#: (Redmine #15198): the pin was a caller-side policy decision that no longer
+#: tracked the default it was forked from.  ``standard`` and ``pending`` stay
+#: reachable — as an explicit operator choice for strict landing observation or
+#: debugging — but they are chosen, never defaulted into.
+DEFAULT_DELIVERY_MODE = ""
 
 #: The summary is bounded by the public-safe projection itself, not by a
 #: separate limit.  A longer summary would be shown truncated in the preview and
@@ -124,8 +165,15 @@ _DETAIL_BY_REASON = {
         "delivers the request that was validated, not a preview handed back to it"
     ),
     REASON_DELIVERY_FAILED: (
-        "the target environment's project gateway did not accept the handoff; "
-        "read its durable record before retrying"
+        "the target environment's project gateway refused the handoff before "
+        "anything was typed at its receiver; read that environment's durable "
+        "record, clear the named refusal, then re-issue the same anchor"
+    ),
+    REASON_DELIVERY_UNCERTAIN: (
+        "the handoff may already have reached the target environment's receiver "
+        "and the submission was not confirmed; read that environment's durable "
+        "record to establish what arrived before re-issuing — a blind retry can "
+        "deliver the same request twice"
     ),
 }
 
@@ -150,6 +198,20 @@ class RemoteUnitActionRequest:
     #: client from synthesizing an authority it does not hold.
     target_project: str = ""
     kind: str = DEFAULT_ACTION_KIND
+    #: Empty means the canonical default rail; a named mode is an explicit
+    #: operator choice for strict observation or debugging.  Deliberately not a
+    #: default of ``standard``: see :data:`DEFAULT_DELIVERY_MODE`.
+    delivery_mode: str = DEFAULT_DELIVERY_MODE
+
+    @property
+    def effective_delivery_mode(self) -> str:
+        """The rail this request will actually be delivered on (pure).
+
+        Resolved through the shared ``handoff send`` default so the preview names
+        the same rail the argv selects, and so a change to that default reaches
+        this route without an edit here.
+        """
+        return effective_send_mode(self.delivery_mode or None)
 
     def validated(self) -> Optional[str]:
         """Return the first structural problem, or ``None`` when well formed."""
@@ -166,6 +228,14 @@ class RemoteUnitActionRequest:
             )
         if self.kind not in ACTION_KINDS:
             return "the requested handoff kind is not supported by this route"
+        if not isinstance(self.delivery_mode, str) or (
+            self.delivery_mode and self.delivery_mode not in ACTION_DELIVERY_MODES
+        ):
+            return (
+                "the delivery mode must be omitted — taking the same default rail "
+                "as an ordinary agent handoff — or name one of: "
+                + ", ".join(ACTION_DELIVERY_MODES)
+            )
         if not isinstance(self.target_project, str) or not self.target_project.strip():
             return (
                 "the target repository's adopted project scope is required; the "
@@ -241,6 +311,11 @@ class RemoteUnitActionPreview:
     journal: str = ""
     summary: str = ""
     observed_at: str = ""
+    #: The rail the apply will select, already resolved through the shared
+    #: default — so the operator confirms the rail rather than inferring it from
+    #: the absence of a flag.  Part of the compared object, so a substituted
+    #: preview cannot swap the rail either.
+    delivery_mode: str = ""
     #: Kept out of the repr as well as the payload: it holds the source's
     #: connection values and the remote repository path, and an object that is
     #: safe to render but not to print is only half safe (review j#102159
@@ -268,6 +343,7 @@ class RemoteUnitActionPreview:
             "journal": safe_text(self.journal, fallback=""),
             "summary": safe_text(self.summary, fallback=""),
             "observed_at": safe_text(self.observed_at, fallback=""),
+            "delivery_mode": safe_text(self.delivery_mode, fallback=""),
             # Named, not spelled out: the route is fixed and the receiver is
             # fixed, so the operator confirms a boundary rather than a string.
             "route": "target-source project gateway",
@@ -282,16 +358,36 @@ class RemoteUnitActionResult:
     reason: str
     detail: str
     preview: RemoteUnitActionPreview
+    #: The shared three-token verdict (Redmine #15198).  Every path that returns
+    #: without running the gateway command is a genuine zero-send, so
+    #: :data:`STAGE_NOT_SENT` is the honest default rather than a convenient one.
+    injection_stage: str = STAGE_NOT_SENT
 
     @property
     def delivered(self) -> bool:
         return self.state == ACTION_DELIVERED
+
+    @property
+    def uncertain(self) -> bool:
+        """True when the request may have reached the receiver unconfirmed.
+
+        Separate from :attr:`delivered` on purpose: the two questions "did it
+        arrive?" and "may I send it again?" have different answers here, and
+        collapsing them is what turned an unconfirmed submission into a reported
+        non-delivery.
+        """
+        return self.state == ACTION_UNCERTAIN
 
     def as_payload(self) -> dict[str, object]:
         return {
             "state": self.state,
             "reason": self.reason,
             "detail": safe_text(self.detail, fallback=""),
+            # The token and the retry verdict both come from the shared
+            # authority; this rail publishes them rather than re-deriving a
+            # local opinion about what the target gateway's outcome meant.
+            "injection_stage": self.injection_stage,
+            "blind_retry_prohibited": blind_retry_prohibited(self.injection_stage),
             "preview": self.preview.as_payload(),
         }
 
@@ -347,6 +443,7 @@ def _applicable_preview(evidence: _ActionEvidence) -> RemoteUnitActionPreview:
         journal=request.journal,
         summary=request.summary.strip(),
         observed_at=target.observed_at,
+        delivery_mode=request.effective_delivery_mode,
         evidence=evidence,
     )
 
@@ -407,6 +504,15 @@ class RemoteUnitActionRail:
         Reading the preview here would make the comparison above the only thing
         standing between a substituted field and the wire.  Building from the
         request means a substitution has to get past both.
+
+        The mode is resolved, not pinned (Redmine #15198).  A Unit Board action
+        is an ordinary handoff that happens to cross a host boundary, so it takes
+        the same rail an ordinary handoff to that receiver would take; the
+        operator can still name ``standard`` or ``pending`` when strict landing
+        observation or debugging calls for one.  Sending the mode explicitly
+        rather than omitting the flag keeps the selection deterministic across
+        gateway versions — the value comes from the shared default, so it cannot
+        become a second opinion about what that default is.
         """
         return (
             "project-gateway",
@@ -426,7 +532,7 @@ class RemoteUnitActionRail:
             "--target-project",
             request.target_project.strip(),
             "--mode",
-            "standard",
+            request.effective_delivery_mode,
             "--summary",
             request.summary.strip(),
             # The gateway's own ``--json`` only shapes a *fail-closed resolution*
@@ -516,19 +622,36 @@ class RemoteUnitActionRail:
         workspace: SourceWorkspace,
         request: RemoteUnitActionRequest,
     ) -> RemoteUnitActionResult:
+        """Run the one gateway command and report what the shared authority saw.
+
+        Exactly one invocation, whatever comes back.  The body is handed to the
+        gateway once; any Enter-only retry belongs to the rail on the far side,
+        under its own bounded policy, and re-running this command would re-type
+        the body rather than re-press Enter (Redmine #15198).
+        """
         result = self._runtime.run_source_command(
             source, self._gateway_args(request, workspace)
         )
-        completed = result.completed
-        if not result.ok or completed is None or completed.returncode != 0:
+        stage = _delivery_stage(result)
+        if stage == STAGE_SUBMITTED_CONFIRMED:
+            return RemoteUnitActionResult(
+                ACTION_DELIVERED,
+                REASON_OK,
+                "the target environment's project gateway confirmed the submission",
+                preview,
+                injection_stage=stage,
+            )
+        if stage == STAGE_NOT_SENT:
             return self._refuse(preview, REASON_DELIVERY_FAILED)
-        if not _gateway_confirmed_submission(completed.stdout):
-            return self._refuse(preview, REASON_DELIVERY_FAILED)
+        # Everything the authority cannot place as confirmed or as a zero-send.
+        # Reporting it as a refusal would be the #15198 defect: the operator reads
+        # "nothing was sent", re-issues, and the receiver gets the request twice.
         return RemoteUnitActionResult(
-            ACTION_DELIVERED,
-            REASON_OK,
-            "the target environment's project gateway confirmed the submission",
+            ACTION_UNCERTAIN,
+            REASON_DELIVERY_UNCERTAIN,
+            _DETAIL_BY_REASON[REASON_DELIVERY_UNCERTAIN],
             preview,
+            injection_stage=STAGE_UNCERTAIN_PARTIAL,
         )
 
 
@@ -588,8 +711,8 @@ def _delivery_outcome_record(stdout: object) -> Optional[dict]:
     return payload
 
 
-def _gateway_confirmed_submission(stdout: object) -> bool:
-    """True only when the target gateway's own outcome says it was submitted.
+def _gateway_injection_stage(stdout: object) -> str:
+    """The shared stage token for the target gateway's own outcome.
 
     A zero exit code is **not** proof of delivery — ``delivery_outcome_gate``
     documents the two rc-0 shapes that never reached a receiver (a ``pending``
@@ -599,15 +722,44 @@ def _gateway_confirmed_submission(stdout: object) -> bool:
     re-testing status/reason tokens locally: #14232 records what happened when
     three places answered "was it delivered?" with their own private tables.
 
-    Everything unreadable — absent output, no JSON line, a non-object, an
-    outcome the authority cannot place — resolves to not-confirmed, which is the
-    same direction the authority itself takes for an outcome it cannot see
-    (review j#101846 finding_1).
+    The gateway serialises its whole ``DeliveryOutcome``, so the record carries
+    the ``injection_stage`` the producer already derived **with full context** —
+    the mode and both turn-start telemetries — and the authority prefers it over
+    re-deriving.  That is what makes the queue-enter carve-out resolve correctly
+    across the host boundary: a ``sent`` + ``ok`` that observed no turn start
+    arrives already classified as uncertain, instead of being read here as a
+    confirmed submission (Redmine #15198).
+
+    Everything unreadable — absent output, no JSON line, a non-object — resolves
+    to :data:`STAGE_UNCERTAIN_PARTIAL`, the same direction the authority itself
+    takes for an outcome it cannot see (review j#101846 finding_1).  Unreadable
+    is *not* the same as not-sent: the command did run.
     """
     payload = _delivery_outcome_record(stdout)
     if payload is None:
-        return False
-    return injection_stage_for_outcome(_OutcomeView(payload)) == STAGE_SUBMITTED_CONFIRMED
+        return STAGE_UNCERTAIN_PARTIAL
+    return injection_stage_for_outcome(_OutcomeView(payload))
+
+
+def _delivery_stage(result) -> str:
+    """The stage for one whole gateway invocation, exit status included (pure).
+
+    The structured outcome is the verdict; the exit status is only allowed to
+    *withhold* a confirmation, never to grant one.  A gateway that printed a
+    confirmed submission and then exited non-zero is emitting a shape its own CLI
+    does not produce, and the fail-closed reading of a contradiction is that the
+    submission is unconfirmed — not that it succeeded, and not that it never
+    happened.
+    """
+    completed = result.completed
+    if not result.ok or completed is None:
+        # The command could not be run to completion.  Whether the remote reached
+        # its receiver before the transport gave up is exactly what nobody knows.
+        return STAGE_UNCERTAIN_PARTIAL
+    stage = _gateway_injection_stage(completed.stdout)
+    if stage == STAGE_SUBMITTED_CONFIRMED and completed.returncode != 0:
+        return STAGE_UNCERTAIN_PARTIAL
+    return stage
 
 
 def render_preview(preview: RemoteUnitActionPreview) -> Sequence[str]:
@@ -634,6 +786,7 @@ def render_preview(preview: RemoteUnitActionPreview) -> Sequence[str]:
         "  route:   target-source project gateway -> codex",
         f"  anchor:  Redmine #{payload['issue']} j#{payload['journal']} "
         f"({payload['kind']})",
+        f"  rail:    --mode {payload['delivery_mode']}",
         f"  summary: {payload['summary']}",
         "  the remote worker is never direct-sent; apply re-verifies source, "
         "Unit, and repository identity",
@@ -643,12 +796,16 @@ def render_preview(preview: RemoteUnitActionPreview) -> Sequence[str]:
 __all__ = (
     "ACTION_APPLICABLE",
     "ACTION_DELIVERED",
+    "ACTION_DELIVERY_MODES",
     "ACTION_KINDS",
     "ACTION_REFUSED",
+    "ACTION_UNCERTAIN",
     "DEFAULT_ACTION_KIND",
+    "DEFAULT_DELIVERY_MODE",
     "MAX_SUMMARY_LENGTH",
     "REASON_CONNECTION_VALUE_DISCLOSED",
     "REASON_DELIVERY_FAILED",
+    "REASON_DELIVERY_UNCERTAIN",
     "REASON_IDENTITY_CHANGED",
     "REASON_INVALID_REQUEST",
     "REASON_LOCAL_SOURCE",

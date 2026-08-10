@@ -9,12 +9,23 @@ from datetime import datetime, timedelta, timezone
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.unit_board_sources import (
     UnitBoardSourcesConfig,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (
+    MODE_QUEUE_ENTER,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (
+    STAGE_NOT_SENT,
+    STAGE_SUBMITTED_CONFIRMED,
+    STAGE_UNCERTAIN_PARTIAL,
+    injection_stage_telemetry,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.remote_unit_action import (
     ACTION_DELIVERED,
     ACTION_REFUSED,
+    ACTION_UNCERTAIN,
     REASON_CONNECTION_VALUE_DISCLOSED,
     REASON_PREVIEW_MISMATCH,
     REASON_DELIVERY_FAILED,
+    REASON_DELIVERY_UNCERTAIN,
     REASON_IDENTITY_CHANGED,
     REASON_INVALID_REQUEST,
     REASON_LOCAL_SOURCE,
@@ -45,7 +56,29 @@ from tests.unit.e_140_adapter_provider.f_130_terminal_runtime_provider.test_herd
 GATEWAY_ARGS = ("project-gateway", "handoff")
 
 
-def delivery_record(**outcome) -> str:
+def armed_wait_observation() -> dict:
+    """A queue-enter observation carrying causally attributable turn-start evidence.
+
+    The exact shape ``turn_start_positively_observed`` requires: the armed
+    working-transition wait fired (``event_wait_kind == "changed"``) AND the
+    canonical v2 generation binding is present, which is what proves the receiver
+    process did not change across the observation window.
+    """
+    return {
+        "observation_version": 2,
+        "event_wait_kind": "changed",
+        "gateway_binding": {
+            "provider": "codex",
+            "assigned_name": "codex-gateway",
+            "locator": "w1B:p1D",
+            "row_revision": "7",
+            "attestation_observed_at": "2026-08-10T05:00:00Z",
+            "startup_action_id": "startup-abc123",
+        },
+    }
+
+
+def delivery_record(*, mode=MODE_QUEUE_ENTER, observation=..., **outcome) -> str:
     """The shape a handoff CLI actually prints.
 
     ``record_format`` defaults to ``both``: a human-readable record, a blank
@@ -53,9 +86,34 @@ def delivery_record(**outcome) -> str:
     the bare JSON, which is why a reader that parsed the whole stdout as one
     document passed its tests and failed against the real CLI (review j#101891
     finding_1).
+
+    Redmine #15198 carries that lesson one step further.  The JSON line is
+    ``asdict(DeliveryOutcome)``, so it carries ``mode`` and the ``injection_stage``
+    the producer already derived with full context — and on the queue-enter rail
+    those two fields are the entire difference between a confirmed submission and
+    an unconfirmed one.  A fixture that omitted them would leave every delivery
+    reading as ``sent`` + ``ok`` with no mode, which the authority is documented to
+    treat as a confirmed standard send: the tests would agree with each other and
+    disagree with the wire.  So the stage is computed here by the **real**
+    producer, from the same fields, and cannot drift from it.
+
+    The default is a *confirmed* queue-enter delivery (the armed wait fired).
+    Pass ``observation=None`` for the marker-landed-but-turn-start-unobserved
+    shape, which is a genuine rc-0 non-confirmation.
     """
-    payload = {"status": "sent", "reason": "ok"}
+    payload = {"status": "sent", "reason": "ok", "mode": mode}
     payload.update(outcome)
+    payload["queue_enter_turn_start_observation"] = (
+        armed_wait_observation() if observation is ... else observation
+    )
+    payload.setdefault("turn_start_outcome", None)
+    payload["injection_stage"] = injection_stage_telemetry(
+        payload["status"],
+        payload["reason"],
+        mode=payload["mode"],
+        queue_enter_turn_start_observation=payload["queue_enter_turn_start_observation"],
+        turn_start_outcome=payload["turn_start_outcome"],
+    )
     return (
         "Delivery result — sent\n"
         "\n"
@@ -415,6 +473,165 @@ class PreviewSubstitutionTests(unittest.TestCase):
         self.assertIn("--summary 'board pointer'", command)
 
 
+class DeliveryModeTests(unittest.TestCase):
+    """Redmine #15198: the route is special, the send rail is not."""
+
+    def test_the_default_rail_is_the_shared_agent_handoff_default(self) -> None:
+        # The pin this issue removed: the rail used to send `--mode standard`
+        # regardless, so a Unit Board action took a different rail from every
+        # other handoff to the same receiver.
+        action, runtime, runner = rail()
+        unit_id = remote_unit_id(runtime)
+
+        action.apply(action.preview(request(unit_id)))
+
+        command = next(
+            argv[-1] for argv in runner.argvs if "project-gateway" in argv[-1]
+        )
+        self.assertIn(f"--mode {MODE_QUEUE_ENTER}", command)
+        self.assertNotIn("--mode standard", command)
+
+    def test_the_default_is_not_restated_but_resolved(self) -> None:
+        # If the shared default moves, this route moves with it — the point of
+        # routing the choice through `effective_send_mode` instead of a literal.
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (
+            effective_send_mode,
+        )
+
+        self.assertEqual(
+            request("unit-x").effective_delivery_mode, effective_send_mode(None)
+        )
+
+    def test_strict_and_debug_rails_remain_explicitly_selectable(self) -> None:
+        for mode in ("standard", "pending"):
+            with self.subTest(mode=mode):
+                action, runtime, runner = rail()
+                unit_id = remote_unit_id(runtime)
+
+                preview = action.preview(request(unit_id, delivery_mode=mode))
+                action.apply(preview)
+
+                self.assertEqual(preview.as_payload()["delivery_mode"], mode)
+                command = next(
+                    argv[-1] for argv in runner.argvs if "project-gateway" in argv[-1]
+                )
+                self.assertIn(f"--mode {mode}", command)
+
+    def test_an_unsupported_rail_refuses_before_any_observation(self) -> None:
+        action, runtime, runner = rail()
+        unit_id = remote_unit_id(runtime)
+        before = len(runner.argvs)
+
+        preview = action.preview(request(unit_id, delivery_mode="raw-keys"))
+
+        self.assertEqual(preview.reason, REASON_INVALID_REQUEST)
+        self.assertEqual(len(runner.argvs), before)
+
+    def test_the_preview_names_the_rail_the_apply_will_take(self) -> None:
+        action, runtime, _ = rail()
+        unit_id = remote_unit_id(runtime)
+
+        preview = action.preview(request(unit_id))
+
+        self.assertEqual(preview.as_payload()["delivery_mode"], MODE_QUEUE_ENTER)
+        self.assertIn(
+            f"--mode {MODE_QUEUE_ENTER}", "\n".join(render_preview(preview))
+        )
+
+    def test_a_substituted_rail_delivers_nothing(self) -> None:
+        # The rail is part of what the operator confirmed, so swapping it on the
+        # preview has to fail the whole-object comparison like any other field.
+        action, runtime, runner = rail()
+        unit_id = remote_unit_id(runtime)
+        preview = action.preview(request(unit_id))
+
+        result = action.apply(dataclasses.replace(preview, delivery_mode="pending"))
+
+        self.assertEqual(result.reason, REASON_PREVIEW_MISMATCH)
+        self.assertFalse(
+            [argv for argv in runner.argvs if "project-gateway" in argv[-1]]
+        )
+
+    def test_the_body_is_handed_to_the_gateway_exactly_once(self) -> None:
+        # queue-enter retries Enter, never the body — and that retry belongs to
+        # the rail on the far side. This client runs the command once whatever
+        # comes back, so it can never be the source of a duplicate body.
+        for label, outcome in (
+            ("confirmed", delivery_record()),
+            ("unconfirmed", delivery_record(observation=None)),
+            ("pre-injection refusal", delivery_record(status="blocked", reason="invalid_args")),
+            ("unreadable", None),
+        ):
+            with self.subTest(outcome=label):
+                action, runtime, runner = rail(answers({GATEWAY_ARGS: outcome}))
+                unit_id = remote_unit_id(runtime)
+
+                action.apply(action.preview(request(unit_id)))
+
+                gateway = [
+                    argv for argv in runner.argvs if "project-gateway" in argv[-1]
+                ]
+                self.assertEqual(len(gateway), 1)
+
+    def test_no_raw_input_or_direct_worker_route_is_introduced(self) -> None:
+        action, runtime, runner = rail()
+        unit_id = remote_unit_id(runtime)
+
+        action.apply(action.preview(request(unit_id)))
+
+        command = next(
+            argv[-1] for argv in runner.argvs if "project-gateway" in argv[-1]
+        )
+        self.assertIn("--to codex", command)
+        for forbidden in ("--to claude", "--target %", " keys ", " type ", "--force"):
+            self.assertNotIn(forbidden, command)
+
+
+class ZeroSendNonRegressionTests(unittest.TestCase):
+    """Every pre-send refusal still sends nothing and still says `not_sent`."""
+
+    def test_the_safety_refusals_are_unchanged_zero_sends(self) -> None:
+        answer_map = answers()
+        moved = answers()
+        moved[REMOTE_BOARD_ARGS] = remote_board_payload(lane_id="issue_15138")
+
+        cases = (
+            ("secret in the summary", {"summary": "ping SSH-DESTINATION-SENTINEL"}, None),
+            ("unresolved unit", {}, "absent"),
+            ("unresolved workspace", {}, "workspace"),
+            ("stale preview", {}, "stale"),
+            ("identity changed", {}, "identity"),
+        )
+        for label, overrides, mutation in cases:
+            with self.subTest(case=label):
+                clock = MovableClock()
+                answer_map = answers(
+                    {REMOTE_WORKSPACE_ARGS: {"workspaces": []}}
+                    if mutation == "workspace"
+                    else None
+                )
+                action, runtime, runner = rail(answer_map, clock=clock)
+                unit_id = (
+                    "unit-absent" if mutation == "absent" else remote_unit_id(runtime)
+                )
+                preview = action.preview(request(unit_id, **overrides))
+                if mutation == "stale":
+                    clock.moment = NOW + timedelta(seconds=600)
+                if mutation == "identity":
+                    answer_map[REMOTE_BOARD_ARGS] = remote_board_payload(
+                        lane_id="issue_15138"
+                    )
+
+                result = action.apply(preview)
+
+                self.assertEqual(result.state, ACTION_REFUSED)
+                self.assertEqual(result.injection_stage, STAGE_NOT_SENT)
+                self.assertNotEqual(result.reason, REASON_DELIVERY_UNCERTAIN)
+                self.assertFalse(
+                    [argv for argv in runner.argvs if "project-gateway" in argv[-1]]
+                )
+
+
 class PreviewReprTests(unittest.TestCase):
     """Safe to render is not the same as safe to print."""
 
@@ -538,10 +755,13 @@ class ApplyDeliveryTests(unittest.TestCase):
     def test_a_zero_exit_with_a_non_delivered_outcome_is_not_delivered(self) -> None:
         # rc 0 is not proof of delivery: a parked composer and a
         # marker-unobserved queue-enter both exit 0 without reaching a receiver.
+        # None of them is a zero-send either — the body was typed — so each is
+        # `uncertain`, and the operator is told not to blind-retry.
         for label, outcome in (
             ("blocked", delivery_record(status="blocked", reason="turn_start_unconfirmed")),
             ("pending_input", delivery_record(status="pending_input", reason="ok")),
             ("queue_enter", delivery_record(status="sent", reason="queue_enter")),
+            ("marker-unobserved turn start", delivery_record(observation=None)),
             ("empty object", {}),
             ("record with no JSON line", "Delivery result — sent\n\n- Status: `sent`"),
         ):
@@ -551,8 +771,37 @@ class ApplyDeliveryTests(unittest.TestCase):
 
                 result = action.apply(action.preview(request(unit_id)))
 
+                self.assertFalse(result.delivered)
+                self.assertEqual(result.state, ACTION_UNCERTAIN)
+                self.assertEqual(result.reason, REASON_DELIVERY_UNCERTAIN)
+                self.assertEqual(result.injection_stage, STAGE_UNCERTAIN_PARTIAL)
+                self.assertTrue(result.as_payload()["blind_retry_prohibited"])
+
+    def test_a_pre_injection_gateway_refusal_is_a_zero_send(self) -> None:
+        # The other half of the distinction: the target gateway refused BEFORE
+        # typing anything, so this is a real non-delivery and re-issuing the same
+        # anchor cannot duplicate. Reporting it as `uncertain` would strand a
+        # request nobody ever received.
+        for reason in (
+            "precondition_not_idle",
+            "receiver_startup_interaction_required",
+            "target_unavailable",
+            "invalid_args",
+        ):
+            with self.subTest(reason=reason):
+                action, runtime, _ = rail(
+                    answers(
+                        {GATEWAY_ARGS: delivery_record(status="blocked", reason=reason)}
+                    )
+                )
+                unit_id = remote_unit_id(runtime)
+
+                result = action.apply(action.preview(request(unit_id)))
+
                 self.assertEqual(result.state, ACTION_REFUSED)
                 self.assertEqual(result.reason, REASON_DELIVERY_FAILED)
+                self.assertEqual(result.injection_stage, STAGE_NOT_SENT)
+                self.assertFalse(result.as_payload()["blind_retry_prohibited"])
 
     def test_an_unreadable_gateway_answer_is_not_delivered(self) -> None:
         class Unreadable(RecordingRunner):
@@ -573,7 +822,8 @@ class ApplyDeliveryTests(unittest.TestCase):
 
         result = action.apply(action.preview(request(unit_id)))
 
-        self.assertEqual(result.reason, REASON_DELIVERY_FAILED)
+        self.assertEqual(result.state, ACTION_UNCERTAIN)
+        self.assertEqual(result.injection_stage, STAGE_UNCERTAIN_PARTIAL)
 
     def test_a_confirmed_submission_is_delivered_without_echoing_the_record(self) -> None:
         action, runtime, runner = rail(
@@ -590,6 +840,7 @@ class ApplyDeliveryTests(unittest.TestCase):
         result = action.apply(action.preview(request(unit_id)))
 
         self.assertEqual(result.state, ACTION_DELIVERED)
+        self.assertEqual(result.injection_stage, STAGE_SUBMITTED_CONFIRMED)
         rendered = json.dumps(result.as_payload())
         self.assertNotIn("%1075", rendered)
         self.assertNotIn("/srv/checkouts", rendered)
@@ -598,12 +849,14 @@ class ApplyDeliveryTests(unittest.TestCase):
         # The contract picks the LAST line; scanning past it for something
         # parseable would let a stale success survive whatever followed it.
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.remote_unit_action import (
-            _gateway_confirmed_submission,
+            _gateway_injection_stage,
         )
 
+        self.assertEqual(
+            _gateway_injection_stage(delivery_record()), STAGE_SUBMITTED_CONFIRMED
+        )
         good = '{"status": "sent", "reason": "ok"}'
-        self.assertTrue(_gateway_confirmed_submission(good))
-        self.assertTrue(_gateway_confirmed_submission(delivery_record()))
+        self.assertEqual(_gateway_injection_stage(good), STAGE_SUBMITTED_CONFIRMED)
         for name, tail in (
             ("another object", '{"receipt": "later"}'),
             ("malformed", "{bad}"),
@@ -612,7 +865,10 @@ class ApplyDeliveryTests(unittest.TestCase):
             ("prose", "done."),
         ):
             with self.subTest(trailing=name):
-                self.assertFalse(_gateway_confirmed_submission(good + "\n" + tail))
+                self.assertEqual(
+                    _gateway_injection_stage(good + "\n" + tail),
+                    STAGE_UNCERTAIN_PARTIAL,
+                )
 
     def test_the_gateway_is_asked_for_a_deterministic_output_shape(self) -> None:
         # The gateway's own --json only shapes a fail-closed resolution; without
@@ -645,17 +901,23 @@ class ApplyDeliveryTests(unittest.TestCase):
             [argv for argv in runner.argvs if "project-gateway" in argv[-1]]
         )
 
-    def test_gateway_refusal_is_reported_without_echoing_its_record(self) -> None:
+    def test_a_silent_nonzero_gateway_exit_is_unconfirmed_not_zero_send(self) -> None:
+        # Non-zero with no structured outcome: the command DID run on the target
+        # host, and whether it reached the receiver before failing is exactly
+        # what is unknown. Calling that a refusal would invite a duplicate.
         action, runtime, _ = rail(answers({GATEWAY_ARGS: None}))
         unit_id = remote_unit_id(runtime)
         preview = action.preview(request(unit_id))
 
         result = action.apply(preview)
 
-        self.assertEqual(result.state, ACTION_REFUSED)
-        self.assertEqual(result.reason, REASON_DELIVERY_FAILED)
+        self.assertEqual(result.state, ACTION_UNCERTAIN)
+        self.assertEqual(result.reason, REASON_DELIVERY_UNCERTAIN)
+        rendered = json.dumps(result.as_payload())
+        self.assertNotIn("SSH-DESTINATION-SENTINEL", rendered)
+        self.assertNotIn("/srv/checkouts", rendered)
 
-    def test_gateway_spawn_failure_is_a_typed_refusal(self) -> None:
+    def test_gateway_spawn_failure_is_a_typed_uncertain_outcome(self) -> None:
         action, runtime, _ = rail(
             answers({GATEWAY_ARGS: subprocess.TimeoutExpired(["ssh"], 30)})
         )
@@ -664,7 +926,37 @@ class ApplyDeliveryTests(unittest.TestCase):
 
         result = action.apply(preview)
 
-        self.assertEqual(result.reason, REASON_DELIVERY_FAILED)
+        self.assertEqual(result.reason, REASON_DELIVERY_UNCERTAIN)
+        self.assertEqual(result.injection_stage, STAGE_UNCERTAIN_PARTIAL)
+
+    def test_a_confirmed_outcome_contradicted_by_a_nonzero_exit_is_unconfirmed(
+        self,
+    ) -> None:
+        # The structured outcome is the verdict, but the exit status may still
+        # withhold a confirmation the CLI's own shapes would never pair with it.
+        class Contradictory(RecordingRunner):
+            def __call__(self, argv, **kwargs):
+                if "project-gateway" in argv[-1]:
+                    self.argvs.append(list(argv))
+                    return subprocess.CompletedProcess(argv, 1, delivery_record(), "")
+                return super().__call__(argv, **kwargs)
+
+        runner = Contradictory(answers())
+        runtime = MultiSourceUnitBoardRuntime(
+            REMOTE_CONFIG,
+            local_runtime=FakeLocalRuntime(),
+            runner=runner,
+            clock=MovableClock(),
+        )
+        action = RemoteUnitActionRail(runtime, clock=MovableClock())
+        unit_id = next(
+            unit.unit_id for unit in runtime.snapshot().units if unit.host_id == "devbox"
+        )
+
+        result = action.apply(action.preview(request(unit_id)))
+
+        self.assertEqual(result.state, ACTION_UNCERTAIN)
+        self.assertEqual(result.injection_stage, STAGE_UNCERTAIN_PARTIAL)
 
 
 
