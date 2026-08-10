@@ -129,6 +129,11 @@ REASON_NOT_INSTALLED = "service_not_installed"
 #: restart refused: the owned timer is not active, so nothing is scheduling this service. Bringing
 #: it up is ``install``'s job, not ``restart``'s.
 REASON_SERVICE_NOT_LOADED = "service_not_loaded"
+#: restart refused: the owned timer's run state could not be READ (an unreachable manager, or a
+#: reply this parser cannot resolve — e.g. one that answers `ActiveState` twice with different
+#: values). Distinct from ``service_not_loaded`` because the facts differ: one says the timer is not
+#: running, this one says we cannot tell (review j#102383 finding r8f2).
+REASON_TIMER_STATE_UNREADABLE = "timer_state_unreadable"
 #: restart/status: the installed ``--home`` pin is missing / malformed / duplicated / not an absolute
 #: canonical path, so the root the scheduled process actually uses cannot be trusted.
 REASON_HOME_PIN_UNHEALTHY = "home_pin_unhealthy"
@@ -242,7 +247,11 @@ def _show(runner: Runner, unit_name: str, properties: Sequence[str]) -> dict[str
     """Read-only ``systemctl --user show`` → ``{property: value}``. Never raises.
 
     An empty result means the read FAILED, which :func:`_probe_state` keeps distinct from a
-    successful read of an inactive unit — those are different facts.
+    successful read of an inactive unit — those are different facts. A reply that answers the same
+    property twice with **different** values is such a failure: there is no order authority that
+    makes one of them the answer, so the read is discarded rather than resolved (review j#102383
+    finding r8f2). A property repeated with the *same* value is not a contradiction and is kept —
+    the rule is about conflicting answers, not about repetition.
 
     Keys and values are carried **exactly as the manager wrote them**, split on the first ``=`` and
     otherwise untouched. This reader feeds :func:`_probe_state`, whose whole contract is a closed
@@ -264,8 +273,18 @@ def _show(runner: Runner, unit_name: str, properties: Sequence[str]) -> dict[str
     values: dict[str, str] = {}
     for line in (result.stdout or "").splitlines():
         key, sep, value = line.partition("=")
-        if sep:
-            values[key] = value
+        if not sep:
+            continue
+        if key in values and values[key] != value:
+            # Two different answers for one property, and nothing says which is authoritative.
+            # Assigning into the dict silently kept the last, so `ActiveState=inactive` followed by
+            # `ActiveState=active` became a CONFIRMED `loaded` — and the reverse order became a
+            # confirmed absence, the same contradictory reply reversing a settled fact on line order
+            # alone. That value went on to authorize a real `systemctl restart` (review j#102383
+            # finding r8f2). The whole read is discarded: a reply this parser cannot resolve is
+            # unreadable, and unreadable is exactly what the callers already fail closed on.
+            return {}
+        values[key] = value
     return values
 
 
@@ -466,9 +485,18 @@ def restart(
     # differently about one manager reply. Proceeding needs a positive `loaded`: a confirmed absence
     # and an unreadable read both refuse, which is the launchd adapter's contract for restart too.
     timer_shown = _show(runner, SUPERVISOR_UNIT.timer_unit, ("ActiveState",))
-    if _probe_state(timer_shown, manager_available=True) != PROBE_LOADED:
+    timer_state = _probe_state(timer_shown, manager_available=True)
+    if timer_state != PROBE_LOADED:
+        # Refuse either way, but say WHICH fact refused: "the timer is not running" and "I could not
+        # read whether it is" are different answers, and reporting the second as the first is the
+        # same confusion this adapter fails closed on everywhere else. Both are zero-mutation.
         return _refused(
-            "restart", REASON_SERVICE_NOT_LOADED, credential_readiness=readiness
+            "restart",
+            REASON_SERVICE_NOT_LOADED
+            if timer_state == PROBE_CONFIRMED_ABSENT
+            else REASON_TIMER_STATE_UNREADABLE,
+            credential_readiness=readiness,
+            probe_state=timer_state,
         )
     # ``restart`` on a one-shot stops any in-flight sweep and runs a fresh one. The timer's own
     # cadence is untouched.
@@ -708,6 +736,7 @@ __all__ = (
     "REASON_EXECUTABLE_NOT_FOUND",
     "REASON_COMMAND_NOT_RENDERABLE",
     "REASON_SERVICE_NOT_LOADED",
+    "REASON_TIMER_STATE_UNREADABLE",
     "REASON_NOT_INSTALLED",
     "REASON_HOME_PIN_UNHEALTHY",
     "REASON_HOME_PIN_MISMATCH",

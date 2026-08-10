@@ -1113,9 +1113,11 @@ class LegacyDrainMigrationTest(_DarwinCase):
             )["state"]
             self.assertEqual(state, sl.PROBE_UNREADABLE, why)
 
-    def test_a_readable_message_with_two_quoted_names_still_binds(self) -> None:
-        # The complement: refusing ambiguity must not refuse a message that simply quotes more than
-        # one thing. Both spans are complete and unambiguous, and one of them is ours.
+    def test_two_quoted_names_bind_when_OURS_is_the_clause_operand(self) -> None:
+        # The complement, restated correctly (review j#102383 finding r8f1). The old comment here
+        # said "one of them is ours", generalising a rule that is false: what matters is not that our
+        # label appears among the spans, but that it is the span the not-found clause is ABOUT. This
+        # message qualifies because ours directly follows the wording; the domain is the second span.
         owned = sl.LEGACY_DRAIN_AGENT.label
         state = sl._probe(
             FakeRunner(
@@ -1126,6 +1128,49 @@ class LegacyDrainMigrationTest(_DarwinCase):
             agent=sl.LEGACY_DRAIN_AGENT,
         )["state"]
         self.assertEqual(state, sl.PROBE_CONFIRMED_ABSENT)
+
+    def test_a_not_found_about_ANOTHER_service_does_not_bind_via_a_second_span(self) -> None:
+        # The negative half the old test's comment wrongly excluded. The clause explicitly reports a
+        # DIFFERENT service as missing; our label is an unrelated second span. Containing our name
+        # and being about our service are different claims, and only the second may authorize a
+        # deletion.
+        owned = sl.LEGACY_DRAIN_AGENT.label
+        for rendered, why in (
+            (f'Could not find service "com.example.other"; suggestion "{owned}"',
+             "ours is a trailing suggestion"),
+            (f'"{owned}" Could not find service "com.example.other"',
+             "ours precedes the clause"),
+            (f'Could not find service "com.example.other". Could not find service "{owned}"',
+             "two clauses: no rule says which governs"),
+        ):
+            state = sl._probe(
+                FakeRunner(print_result=_result(113, stderr=rendered)),
+                agent=sl.LEGACY_DRAIN_AGENT,
+            )["state"]
+            self.assertEqual(state, sl.PROBE_UNREADABLE, why)
+
+    def test_a_not_found_about_another_service_keeps_the_plist_end_to_end(self) -> None:
+        # The consequence the finding turned on: this reading reached `remove_legacy_drain` and
+        # unlinked the owned plist.
+        _write_home_credential(self.mozyo_home)
+        legacy = _legacy_drain_plist(self.os_home)
+        owned = sl.LEGACY_DRAIN_AGENT.label
+        rendered = f'Could not find service "com.example.other"; suggestion "{owned}"'
+
+        class _NotFoundAboutAnotherService:
+            def __call__(self, argv):
+                argv = list(argv)
+                target = argv[2] if len(argv) > 2 else ""
+                if owned in target:
+                    return _result(113 if argv[1] == "print" else 1, stderr=rendered)
+                return _result(0)
+
+        result = sl.remove_legacy_drain(
+            os_home=self.os_home, runner=_NotFoundAboutAnotherService()
+        )
+        self.assertFalse(result["removed"])
+        self.assertEqual(result["reason"], sl.REASON_LEGACY_DRAIN_STATE_UNREADABLE)
+        self.assertTrue(legacy.exists())
 
     def test_an_escaped_quote_label_keeps_the_plist_end_to_end(self) -> None:
         # The consequence, through the destructive path: an unparseable message must leave the

@@ -548,6 +548,16 @@ not-found の認識は **連言**である（review j#102200 finding r3f1）。`
 **自分の label を quote 付きで完全一致に名指ししている**、(4) 権限エラー等「不存在以外の理由で読めなかった」
 signal を含まない。
 
+(3) は「owned label が文面のどこかにある」ではなく **not-found clause の service operand が owned である**
+ことを要求する（review j#102383 finding r8f1）。以前は「not-found 語がどこかにある」と「owned label が引用
+span のどこかにある」という **2 つの独立した存在確認**を連言と称していた。しかし
+`Could not find service "com.example.other"; suggestion "<owned>"` は両方を満たしながら **別 service の不在**を
+報告しており、この読みが所有 plist の unlink を authorize した。**「名前を含む」と「その service について
+述べている」は別の主張**である。したがって recognized wording とその直後の引用 span を **1 つの clause**
+として parse し、その operand が exact owned target / bare label の場合のみ `confirmed_absent` とする。
+別 service の not-found と owned label の併記、phrase の前後に owned label があるだけの入力、clause が
+複数ある入力（どれが支配するかの規則がない）は、すべて `unreadable` へ倒す。
+
 (3) の照合は **quoted 完全一致のみ**である（review j#102309 finding r5f1）。以前は label 継続文字を
 「英数 + `.` `-` `_`」と *こちらで定義* し、その集合外を境界とみなしていたが、Apple 正本は `Label` を
 「unique な識別文字列」と述べるのみで **この文字集合を規定していない**。結果として `<owned>@helper` /
@@ -593,6 +603,17 @@ launchctl の error wording は API ではなく、**quote を含む label を�
 だけに出すと、共通契約を統一するために足した key が逆に契約を host 別に割る）。Linux 側は `systemctl show` が
 読めたか否かから同じ語彙へ写す（`show` は未知 unit にも応答するため、空の結果は「unit 不在」ではなく
 **読み取り失敗**である）。生の launchctl / systemctl 文面と秘密値は投影に出さない。
+
+`systemctl show` の応答が **同一 property を相反する値で複数回**返した場合、`_show` は **read 全体を破棄**する
+（review j#102383 finding r8f2）。dict 代入による last-wins は先行値を黙って失い、`ActiveState=inactive` の後に
+`ActiveState=active` が来れば `loaded`、逆順なら `confirmed_absent` と、**同じ相反集合が行順だけで確定事実を
+反転**させ、その値が実際の `systemctl --user restart` を authorize していた。どちらが authoritative かを決める
+順序 authority は存在しないため、解決せず捨てる（= `unreadable`）。**同値の重複は矛盾ではない**ため保持する
+（規則は重複ではなく相反についてである）。
+
+`restart` は refusal 理由を事実に対応させる: timer が確認済みで停止していれば `service_not_loaded`、
+状態を読めなければ `timer_state_unreadable`。どちらも zero-mutation だが、**「動いていない」と「判別できない」を
+同じ token で報告しない**（本 issue が繰り返し是正してきた区別を refusal 側でも保つ）。
 
 Linux の `ActiveState` 分類は **closed vocabulary** である（review j#102309 finding r5f2）。
 `active` / `reloading` -> `loaded`（systemd は `reloading` を「active かつ設定 reload 中」と定義する）、

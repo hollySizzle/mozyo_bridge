@@ -102,6 +102,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     plist_path,
     read_installed_plist as _read_installed_plist,
     render_plist,
+    # The pure launchctl-message layer: what the manager's wording says, parsed without running it.
+    LAUNCHCTL_NOT_FOUND_CODES as _LAUNCHCTL_NOT_FOUND_CODES,
+    LAUNCHCTL_UNREADABLE_PHRASES as _LAUNCHCTL_UNREADABLE_PHRASES,
+    names_exactly as _names_exactly,
+    not_found_operand as _not_found_operand,
+    quoted_names as _quoted_names,
     resolve_mozyo_home,
     resolve_supervisor_command,
 )
@@ -274,28 +280,6 @@ def _launchctl(runner: Runner, args: Sequence[str]) -> "subprocess.CompletedProc
 #: prefix silently costs the whole 直近の終了結果 projection (#15192).
 _LAST_EXIT_PREFIXES = ("last exit code = ", "last exit status = ")
 
-#: ``launchctl print`` exit codes seen for an unknown label. **Necessary, never sufficient** (review
-#: j#102200 finding r3f1): launchctl's man page documents only "0 on success, non-zero on failure"
-#: and does not make 113 a stable not-found contract, so this corroborates label-bound evidence and
-#: cannot authorize a removal by itself.
-_LAUNCHCTL_NOT_FOUND_CODES = (113,)
-#: Lowercased fragments of launchctl's "unknown service" message. Also necessary-but-not-sufficient:
-#: the man page states ``print`` output is not an API and may change.
-_LAUNCHCTL_NOT_FOUND_PHRASES = ("could not find service", "no such process", "not find service")
-#: Lowercased fragments meaning "this read failed for a reason OTHER than absence". Their presence
-#: disqualifies a not-found reading outright — a permission error names why we could not look, which
-#: is the opposite of evidence that there is nothing to look at.
-_LAUNCHCTL_UNREADABLE_PHRASES = (
-    "not permitted",
-    "permission denied",
-    "not privileged",
-    "denied",
-    "unauthori",  # unauthorised / unauthorized
-    "could not connect",
-    "connection invalid",
-)
-
-
 def _probe(runner: Runner, agent: SupervisorAgent = SUPERVISOR_AGENT) -> dict:
     """Read-only ``launchctl print`` → ``{state, loaded, pid, last_exit_status}``. Never raises.
 
@@ -384,85 +368,15 @@ def _says_not_found(result, service_target: str) -> bool:
     wording = message.lower()
     if any(phrase in wording for phrase in _LAUNCHCTL_UNREADABLE_PHRASES):
         return False
-    if not any(phrase in wording for phrase in _LAUNCHCTL_NOT_FOUND_PHRASES):
-        return False
-    # Bind the reading to what we actually asked about: a not-found message naming some OTHER label
-    # says nothing about ours. The full target (gui/<uid>/<label>) or the bare label both count,
-    # since the exact wording is not a contract — but the match must be an EXACT token, not a
-    # substring (review j#102235 finding r4f1).
+    # Bind the reading to what we asked about — and bind it to the *right part* of the sentence.
+    # Finding the phrase somewhere and our label somewhere are two separate existence checks; a
+    # message can satisfy both while saying the opposite of what we need (review j#102383 r8f1).
     target = service_target or ""
     label = target.rsplit("/", 1)[-1]
     if not label:
         return False
-    return _names_exactly(message, target) or _names_exactly(message, label)
-
-
-def _quoted_names(message: str) -> Optional[list[str]]:
-    """Every complete double-quoted span in ``message``, or ``None`` when the quoting is undecidable.
-
-    launchctl's error wording is explicitly not an API, so the quoting *grammar* it uses is unknown:
-    we have never seen how it renders a label that itself contains a quote. This scanner therefore
-    recognizes exactly one grammar — spans delimited by plain ``"`` with nothing escaped — and
-    refuses to answer whenever the text shows a sign that some OTHER grammar is in play:
-
-    - **any backslash**, which would mean an escape convention this scanner cannot read;
-    - an **odd number of quotes**, i.e. a span that never closes;
-    - **two adjacent spans** (an empty run between them), the signature of ``""``-style escaping.
-
-    ``None`` is not "no match": it means the message cannot be parsed, which :func:`_says_not_found`
-    turns into :data:`PROBE_UNREADABLE`, never into a confirmed absence.
-    """
-    if "\\" in message:
-        return None
-    parts = message.split('"')
-    if len(parts) % 2 == 0:  # one quote per span boundary, so a balanced message splits into odd
-        return None
-    if any(parts[i] == "" for i in range(2, len(parts) - 1, 2)):
-        return None
-    return parts[1::2]
-
-
-def _names_exactly(message: str, token: str) -> bool:
-    """Whether ``message`` names ``token`` as launchd's own **quoted** service name.
-
-    Only one form is accepted: the token as a complete quoted span, compared in full. That is how
-    launchctl renders the name it could not find, and a delimited span is what makes the boundary
-    *observed* rather than *assumed*.
-
-    The comparison is over the **exact decoded string** — the ``str`` the runner hands back from
-    ``subprocess.run(..., text=True)``, character for character. (Earlier revisions of this docstring
-    said "bytes"; nothing in this path ever sees bytes, and describing a check in terms it does not
-    use is its own defect — review j#102378 finding r7f1.) In particular the message is never
-    case-folded before it gets here. Comparing folded strings made
-    ``"ORG.MOZYO-BRIDGE.CALLBACK-SUPERVISOR.DRAIN"`` — a different string, and therefore a label this
-    adapter never installed — satisfy the check for our own label and authorize unlinking our plist
-    (review j#102327 finding r6f1). Apple documents ``Label`` only as a string that uniquely
-    identifies a job; that it may be compared case-insensitively is nowhere stated, so it is an
-    assumption, and an assumption is not something to hang a destructive migration on.
-
-    The check must also *parse*, not merely find (review j#102378 finding r7f1). ``f'"{token}"' in
-    message`` was a substring test wearing a parser's clothes: for a different label rendered as
-    ``"prefix\\"<owned>"``, the opening quote of the "match" is the escaped quote that belongs to
-    THAT label's data and the closing one is the outer delimiter, so the two quotes bounding the hit
-    were never the two ends of one span — and the hit authorized unlinking our registration. Spans
-    now come from :func:`_quoted_names`, which refuses to answer at all when the quoting cannot be
-    read unambiguously.
-
-    Two earlier boundary rules failed the same way from further out. A character allowlist —
-    alphanumerics plus ``.-_``, anything else a delimiter — was invented here, and Apple constrains
-    ``Label``'s characters nowhere, so ``<owned>@helper`` / ``<owned>:helper`` / ``<owned>+helper`` /
-    ``<owned>/helper`` all satisfied it (review j#102309 finding r5f1). Before that, a bare substring
-    test made our label a prefix of every longer one (review j#102235 finding r4f1).
-
-    Everything unrecognized — an unquoted mention, an unreadable quoting, a different label — yields
-    no binding and therefore :data:`PROBE_UNREADABLE`. That is deliberately an over-refusal: until
-    the real launchctl wording is captured on a live host (#15194), refusing is the only honest
-    answer, and refusing costs a retry while a wrong match costs someone else's running service.
-    """
-    if not token or '"' in token or "\\" in token:
-        return False
-    names = _quoted_names(message)
-    return names is not None and token in names
+    operand = _not_found_operand(message)
+    return operand is not None and operand in (target, label)
 
 
 def _small_int_or_none(token: str) -> Optional[int]:

@@ -248,6 +248,177 @@ def extract_pinned_home(installed_argv: object) -> tuple[Optional[str], str]:
     return value, HOME_PIN_OK
 
 
+
+
+# ---------------------------------------------------------------------------
+# launchctl message text (pure): what the manager's wording SAYS, kept apart from running it.
+#
+# These parse an error string and nothing else — no subprocess, no host, no credential. They live
+# here because the question "does this sentence report OUR service as missing?" is a text question,
+# and because the lifecycle module has a line budget (review j#102069 F7 established the split).
+# ---------------------------------------------------------------------------
+
+#: ``launchctl print`` exit codes seen for an unknown label. **Necessary, never sufficient** (review
+#: j#102200 finding r3f1): launchctl's man page documents only "0 on success, non-zero on failure"
+#: and does not make 113 a stable not-found contract, so this corroborates label-bound evidence and
+#: cannot authorize a removal by itself.
+LAUNCHCTL_NOT_FOUND_CODES = (113,)
+#: Lowercased fragments of launchctl's "unknown service" message. Also necessary-but-not-sufficient:
+#: the man page states ``print`` output is not an API and may change.
+LAUNCHCTL_NOT_FOUND_PHRASES = ("could not find service", "no such process", "not find service")
+#: Lowercased fragments meaning "this read failed for a reason OTHER than absence". Their presence
+#: disqualifies a not-found reading outright — a permission error names why we could not look, which
+#: is the opposite of evidence that there is nothing to look at.
+LAUNCHCTL_UNREADABLE_PHRASES = (
+    "not permitted",
+    "permission denied",
+    "not privileged",
+    "denied",
+    "unauthori",  # unauthorised / unauthorized
+    "could not connect",
+    "connection invalid",
+)
+
+
+
+def not_found_operand(message: str) -> Optional[str]:
+    """The service a recognized "no such service" clause is ABOUT, or ``None`` when undecidable.
+
+    The point of this function is the difference between *containing* and *being about*. The earlier
+    check asked whether a not-found phrase appeared anywhere and, separately, whether our label
+    appeared in any quoted span — then treated both being true as one conjunction. It is not one:
+    ``Could not find service "com.example.other"; suggestion "<owned>"`` satisfies both while
+    explicitly reporting a DIFFERENT service as missing, and that reading authorized unlinking our
+    own registration (review j#102383 finding r8f1).
+
+    So the clause is parsed as a unit: a recognized phrase, and the quoted span that immediately
+    follows it, which is that phrase's operand. Only that operand can bind. Everything ambiguous
+    resolves to ``None`` — meaning unreadable, never a confirmed absence:
+
+    - no recognized phrase, or no quoted span after it;
+    - **more than one** recognized phrase (two clauses, no rule for which one governs);
+    - a message whose quoting cannot be read unambiguously (:func:`quoted_names` returns ``None``);
+    - an operand that is not exactly one complete quoted span.
+
+    Note what is deliberately *not* accepted: our label appearing before the phrase, beside it, or in
+    any later span. Position is not incidental here — it is the only thing distinguishing "the
+    service that is missing" from "some other service mentioned in the same sentence".
+    """
+    names = quoted_names(message)
+    if names is None:
+        return None
+    clauses = not_found_clauses(message.lower())
+    if len(clauses) != 1:
+        return None
+    _, clause_end = clauses[0]
+    # The operand is the first complete quoted span that OPENS after the clause wording ends.
+    opening = message.find('"', clause_end)
+    if opening < 0:
+        return None
+    closing = message.find('"', opening + 1)
+    if closing < 0:
+        return None
+    operand = message[opening + 1:closing]
+    # It must be one of the spans the scanner already validated, so a boundary inferred here can
+    # never disagree with the one :func:`quoted_names` accepted.
+    return operand if operand in names else None
+
+
+def not_found_clauses(wording: str) -> list[tuple[int, int]]:
+    """The merged ``(start, end)`` ranges of recognized not-found wording in ``wording`` (pure).
+
+    The recognized phrases deliberately overlap — ``"could not find service"`` contains
+    ``"not find service"`` — so one clause matches several of them. Counting raw hits would make
+    every ordinary message look like several clauses and refuse everything, so overlapping hits are
+    merged into the single clause they describe. What survives the merge is the count that the
+    ambiguity rule is about: two *separate* clauses mean no rule says which one governs the sentence.
+    """
+    hits: list[tuple[int, int]] = []
+    for phrase in LAUNCHCTL_NOT_FOUND_PHRASES:
+        start = 0
+        while True:
+            index = wording.find(phrase, start)
+            if index < 0:
+                break
+            hits.append((index, index + len(phrase)))
+            start = index + 1
+    merged: list[tuple[int, int]] = []
+    for begin, finish in sorted(hits):
+        if merged and begin <= merged[-1][1]:  # overlaps or abuts the clause already collected
+            merged[-1] = (merged[-1][0], max(merged[-1][1], finish))
+        else:
+            merged.append((begin, finish))
+    return merged
+
+
+def quoted_names(message: str) -> Optional[list[str]]:
+    """Every complete double-quoted span in ``message``, or ``None`` when the quoting is undecidable.
+
+    launchctl's error wording is explicitly not an API, so the quoting *grammar* it uses is unknown:
+    we have never seen how it renders a label that itself contains a quote. This scanner therefore
+    recognizes exactly one grammar — spans delimited by plain ``"`` with nothing escaped — and
+    refuses to answer whenever the text shows a sign that some OTHER grammar is in play:
+
+    - **any backslash**, which would mean an escape convention this scanner cannot read;
+    - an **odd number of quotes**, i.e. a span that never closes;
+    - **two adjacent spans** (an empty run between them), the signature of ``""``-style escaping.
+
+    ``None`` is not "no match": it means the message cannot be parsed, which :func:`_says_not_found`
+    turns into :data:`PROBE_UNREADABLE`, never into a confirmed absence.
+    """
+    if "\\" in message:
+        return None
+    parts = message.split('"')
+    if len(parts) % 2 == 0:  # one quote per span boundary, so a balanced message splits into odd
+        return None
+    if any(parts[i] == "" for i in range(2, len(parts) - 1, 2)):
+        return None
+    return parts[1::2]
+
+
+def names_exactly(message: str, token: str) -> bool:
+    """Whether ``message`` names ``token`` as launchd's own **quoted** service name.
+
+    Only one form is accepted: the token as a complete quoted span, compared in full. That is how
+    launchctl renders the name it could not find, and a delimited span is what makes the boundary
+    *observed* rather than *assumed*.
+
+    The comparison is over the **exact decoded string** — the ``str`` the runner hands back from
+    ``subprocess.run(..., text=True)``, character for character. (Earlier revisions of this docstring
+    said "bytes"; nothing in this path ever sees bytes, and describing a check in terms it does not
+    use is its own defect — review j#102378 finding r7f1.) In particular the message is never
+    case-folded before it gets here. Comparing folded strings made
+    ``"ORG.MOZYO-BRIDGE.CALLBACK-SUPERVISOR.DRAIN"`` — a different string, and therefore a label this
+    adapter never installed — satisfy the check for our own label and authorize unlinking our plist
+    (review j#102327 finding r6f1). Apple documents ``Label`` only as a string that uniquely
+    identifies a job; that it may be compared case-insensitively is nowhere stated, so it is an
+    assumption, and an assumption is not something to hang a destructive migration on.
+
+    The check must also *parse*, not merely find (review j#102378 finding r7f1). ``f'"{token}"' in
+    message`` was a substring test wearing a parser's clothes: for a different label rendered as
+    ``"prefix\\"<owned>"``, the opening quote of the "match" is the escaped quote that belongs to
+    THAT label's data and the closing one is the outer delimiter, so the two quotes bounding the hit
+    were never the two ends of one span — and the hit authorized unlinking our registration. Spans
+    now come from :func:`quoted_names`, which refuses to answer at all when the quoting cannot be
+    read unambiguously.
+
+    Two earlier boundary rules failed the same way from further out. A character allowlist —
+    alphanumerics plus ``.-_``, anything else a delimiter — was invented here, and Apple constrains
+    ``Label``'s characters nowhere, so ``<owned>@helper`` / ``<owned>:helper`` / ``<owned>+helper`` /
+    ``<owned>/helper`` all satisfied it (review j#102309 finding r5f1). Before that, a bare substring
+    test made our label a prefix of every longer one (review j#102235 finding r4f1).
+
+    Everything unrecognized — an unquoted mention, an unreadable quoting, a different label — yields
+    no binding and therefore :data:`PROBE_UNREADABLE`. That is deliberately an over-refusal: until
+    the real launchctl wording is captured on a live host (#15194), refusing is the only honest
+    answer, and refusing costs a retry while a wrong match costs someone else's running service.
+    """
+    if not token or '"' in token or "\\" in token:
+        return False
+    names = quoted_names(message)
+    return names is not None and token in names
+
+
 __all__ = (
     "SUPERVISOR_LAUNCHD_LABEL",
     "PLIST_RELATIVE",
@@ -278,4 +449,8 @@ __all__ = (
     "render_plist",
     "extract_pinned_home",
     "read_installed_plist",
+    "LAUNCHCTL_NOT_FOUND_CODES",
+    "not_found_operand",
+    "quoted_names",
+    "names_exactly",
 )

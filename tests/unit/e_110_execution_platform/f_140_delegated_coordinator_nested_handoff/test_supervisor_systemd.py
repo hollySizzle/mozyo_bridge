@@ -743,7 +743,16 @@ class RestartTest(_LinuxCase):
             self.assertEqual(result["performed"], status["loaded"], active)
             self.assertEqual("restart" in runner.verbs, status["loaded"], active)
             if not status["loaded"]:
-                self.assertEqual(result["reason"], ss.REASON_SERVICE_NOT_LOADED, active)
+                # The r6f2 invariant is that both verbs read ONE classification — which now also
+                # means the refusal names which fact refused: a confirmed stop and an unreadable
+                # state are different answers (review j#102383 finding r8f2), and status already
+                # distinguishes them via `probe_state`.
+                expected = (
+                    ss.REASON_SERVICE_NOT_LOADED
+                    if status["probe_state"] == ss.PROBE_CONFIRMED_ABSENT
+                    else ss.REASON_TIMER_STATE_UNREADABLE
+                )
+                self.assertEqual(result["reason"], expected, active)
 
     def test_restart_refuses_an_unreadable_service_unit(self) -> None:
         self._install()
@@ -902,6 +911,86 @@ class UninstallTest(_LinuxCase):
 # ---------------------------------------------------------------------------
 # Finding 3: status must show next run, last exit result, and the installed command.
 # ---------------------------------------------------------------------------
+
+
+class ShowDuplicatePropertyTest(_LinuxCase):
+    """Review j#102383 finding r8f2: a reply that answers one property twice, differently.
+
+    ``_show`` assigned into a dict, so the last line silently won. The same contradictory reply then
+    produced OPPOSITE confirmed facts depending on line order — and the winning value went on to
+    authorize a real ``systemctl restart``. Nothing makes either line authoritative, so the read is
+    discarded rather than resolved.
+    """
+
+    def _shown(self, stdout: str) -> dict:
+        return ss._show(lambda _cmd: _result(0, stdout), "x.timer", ("ActiveState",))
+
+    def test_conflicting_duplicates_discard_the_read_in_either_order(self) -> None:
+        for stdout, why in (
+            ("ActiveState=inactive\nActiveState=active\n", "absent then loaded"),
+            ("ActiveState=active\nActiveState=inactive\n", "loaded then absent"),
+        ):
+            self.assertEqual(self._shown(stdout), {}, why)
+            self.assertEqual(
+                ss._probe_state(self._shown(stdout), manager_available=True),
+                ss.PROBE_UNREADABLE,
+                why,
+            )
+
+    def test_a_conflict_on_any_requested_property_discards_the_read(self) -> None:
+        # Not just the one the classifier happens to read: an unresolvable reply is unresolvable.
+        stdout = "UnitFileState=enabled\nActiveState=active\nUnitFileState=disabled\n"
+        self.assertEqual(self._shown(stdout), {})
+
+    def test_a_repeated_property_with_the_SAME_value_is_not_a_conflict(self) -> None:
+        # Stated and pinned deliberately: the rule is about contradiction, not repetition. Refusing
+        # identical repeats would be an over-refusal with nothing behind it.
+        self.assertEqual(
+            self._shown("ActiveState=active\nActiveState=active\n"), {"ActiveState": "active"}
+        )
+
+    def test_a_single_answer_and_a_missing_key_are_unchanged(self) -> None:
+        self.assertEqual(self._shown("ActiveState=active\n"), {"ActiveState": "active"})
+        self.assertEqual(self._shown("SomethingElse=x\n"), {"SomethingElse": "x"})
+        self.assertEqual(
+            ss._probe_state(self._shown("SomethingElse=x\n"), manager_available=True),
+            ss.PROBE_UNREADABLE,
+        )
+
+    def test_restart_makes_zero_mutation_on_a_conflicting_reply(self) -> None:
+        # The consumer the finding turned on: the last-wins value reached `systemctl restart`.
+        runner = self._runner(
+            show_map={
+                ss.TIMER_UNIT_NAME: "ActiveState=inactive\nActiveState=active\n",
+                ss.SERVICE_UNIT_NAME: _service_show(),
+            }
+        )
+        self._install(runner=runner)
+        runner.calls.clear()
+        result = ss.restart(
+            os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found
+        )
+        self.assertFalse(result["performed"])
+        self.assertNotIn("restart", runner.verbs)
+        # And it says WHICH fact refused: unreadable is not "the timer is stopped".
+        self.assertEqual(result["reason"], ss.REASON_TIMER_STATE_UNREADABLE)
+        self.assertEqual(result["probe_state"], ss.PROBE_UNREADABLE)
+
+    def test_restart_still_refuses_a_genuinely_stopped_timer_with_its_own_reason(self) -> None:
+        runner = self._runner(
+            show_map={
+                ss.TIMER_UNIT_NAME: "ActiveState=inactive\n",
+                ss.SERVICE_UNIT_NAME: _service_show(),
+            }
+        )
+        self._install(runner=runner)
+        runner.calls.clear()
+        result = ss.restart(
+            os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found
+        )
+        self.assertFalse(result["performed"])
+        self.assertEqual(result["reason"], ss.REASON_SERVICE_NOT_LOADED)
+        self.assertNotIn("restart", runner.verbs)
 
 
 class ServiceStatusTest(_LinuxCase):
