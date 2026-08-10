@@ -1038,6 +1038,36 @@ class LegacyDrainMigrationTest(_DarwinCase):
             state = sl._probe(FakeRunner(print_result=scripted))["state"]
             self.assertEqual(state, expected, why)
 
+    def test_no_character_class_assumption_admits_a_different_label(self) -> None:
+        # Review j#102309 finding r5f1. The boundary used to be inferred from a character allowlist
+        # invented here (alphanumerics plus `.-_`), but Apple documents `Label` only as a unique
+        # identifying string and constrains its characters nowhere. Every separator outside that
+        # invented set therefore read as a boundary, so these DIFFERENT labels all matched ours —
+        # and the match could authorize unlinking our registration.
+        owned = sl.LEGACY_DRAIN_AGENT.label
+        for suffix in ("@helper", ":helper", "+helper", "/helper", " helper",
+                       ".helper", "-secondary", "\u00e9helper", "\u3042"):
+            other = f"{owned}{suffix}"
+            rendered = f'Could not find service "{other}" in domain for gui'
+            self.assertFalse(
+                sl._names_exactly(rendered, owned),
+                f"a not-found about {other!r} is not about {owned!r}",
+            )
+            state = sl._probe(FakeRunner(print_result=_result(113, stderr=rendered)))["state"]
+            self.assertEqual(state, sl.PROBE_UNREADABLE, suffix)
+
+    def test_only_the_quoted_form_binds_the_reading_to_our_label(self) -> None:
+        # Quotes make the boundary OBSERVED rather than assumed. An unquoted mention cannot prove
+        # where the name ends, so it yields no binding — deliberately an over-refusal until the real
+        # launchctl wording is captured on a live host (#15194).
+        owned = sl.LEGACY_DRAIN_AGENT.label
+        self.assertTrue(
+            sl._names_exactly(f'Could not find service "{owned}" in domain for gui', owned)
+        )
+        self.assertFalse(
+            sl._names_exactly(f"Could not find service {owned} in domain for gui", owned)
+        )
+
     def test_a_not_found_about_a_LONGER_label_is_not_about_ours(self) -> None:
         # Review j#102235 finding r4f1. `label in message` is a substring test, and our label is a
         # PREFIX of any longer one, so a not-found about `<label>.helper` satisfied the check for
@@ -1055,19 +1085,21 @@ class LegacyDrainMigrationTest(_DarwinCase):
                 state = sl._probe(FakeRunner(print_result=_result(113, stderr=rendered)))["state"]
                 self.assertEqual(state, sl.PROBE_UNREADABLE, f"{why} ({form})")
 
-    def test_a_not_found_about_our_own_label_still_counts(self) -> None:
-        # The complement: the fence must not have become so tight that a genuine absence is refused.
+    def test_a_quoted_not_found_about_our_own_label_still_counts(self) -> None:
+        # The complement: the fence must not have become so tight that a genuine, quoted absence is
+        # refused. Only the quoted form qualifies since j#102309 r5f1 — the unquoted variants that
+        # used to pass here are now `unreadable`, because an unquoted mention cannot prove where the
+        # name ends. That is a deliberate over-refusal, pinned by the sibling test above.
         owned = sl.LEGACY_DRAIN_AGENT.label
-        for rendered, form in (
-            (f'Could not find service "{owned}" in domain for gui', "quoted"),
-            (f"Could not find service {owned} in domain for gui", "bare, delimited"),
-            (f"Could not find service gui/501/{owned} in domain", "full service target"),
-        ):
-            state = sl._probe(
-                FakeRunner(print_result=_result(113, stderr=rendered)),
-                agent=sl.LEGACY_DRAIN_AGENT,
-            )["state"]
-            self.assertEqual(state, sl.PROBE_CONFIRMED_ABSENT, form)
+        state = sl._probe(
+            FakeRunner(
+                print_result=_result(
+                    113, stderr=f'Could not find service "{owned}" in domain for gui'
+                )
+            ),
+            agent=sl.LEGACY_DRAIN_AGENT,
+        )["state"]
+        self.assertEqual(state, sl.PROBE_CONFIRMED_ABSENT)
 
     def test_a_longer_label_not_found_keeps_the_plist_end_to_end(self) -> None:
         _write_home_credential(self.mozyo_home)

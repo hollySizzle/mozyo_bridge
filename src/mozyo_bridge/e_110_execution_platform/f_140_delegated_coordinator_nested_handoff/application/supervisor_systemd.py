@@ -259,27 +259,48 @@ def _show(runner: Runner, unit_name: str, properties: Sequence[str]) -> dict[str
     return values
 
 
+#: ``ActiveState`` values that mean the manager IS running this unit. ``reloading`` belongs here:
+#: systemd defines it as active while reloading its configuration, not as stopped.
+_ACTIVE_STATES = frozenset({"active", "reloading"})
+#: ``ActiveState`` values that positively mean the unit is NOT running. Only these two are a
+#: confirmed absence; everything else is either mid-transition or a value this code does not know.
+_ABSENT_STATES = frozenset({"inactive", "failed"})
+#: Mid-transition values. Documented by systemd, but neither running nor confirmed stopped — the
+#: answer is "ask again", which is exactly what unreadable means to the callers of this projection.
+_TRANSITIONAL_STATES = frozenset({"activating", "deactivating"})
+
+
 def _probe_state(shown: dict[str, str], *, manager_available: bool) -> str:
     """Classify the host manager read into the shared three-token vocabulary.
 
     ``systemctl show`` answers for a unit it does not know (with empty / inactive values), so an
     EMPTY mapping here does not mean "no such unit" — it means the read itself failed, which is the
-    unreadable case. An unreachable user manager is unreadable for the same reason: nothing was
-    read, so nothing about the unit is known (review j#102200 finding r3f2).
+    unreadable case. An unreachable user manager is unreadable for the same reason (j#102200 r3f2),
+    and so is an absent or empty ``ActiveState``: reading *some* property is not reading the
+    *schedule state* (j#102235 r4f2).
 
-    The classification hangs on **``ActiveState`` specifically**, not on the mapping being non-empty
-    (review j#102235 finding r4f2). Reading *some* property is not the same as reading the *schedule
-    state*: a partial answer carrying only ``UnitFileState`` used to be reported as
-    ``confirmed_absent``, which asserts a fact nothing in that response established. Absent or empty
-    ``ActiveState`` is therefore unreadable — the same rule the macOS side applies when it cannot
-    read the run state.
+    The classification is a **closed vocabulary**, not "active versus everything else" (review
+    j#102309 finding r5f2). That open negation reported ``reloading`` — which systemd defines as
+    active — plus both transition states and any value this code has never heard of, as
+    ``confirmed_absent``: an assertion that the unit is definitely not running, made about states
+    where it may well be. Absence is now claimed only for the two values that actually mean it, and
+    anything unrecognized falls to :data:`PROBE_UNREADABLE`.
+
+    Note the symmetry with the macOS side: there the rule is "do not fold unknown into *absent*",
+    and here it is the same rule pointing the other way — do not fold unknown into any *confirmed*
+    state. A value systemd adds in a future release must read as "I do not know", never as a fact.
     """
     if not manager_available:
         return PROBE_UNREADABLE
-    active_state = (shown.get("ActiveState") or "").strip()
+    active_state = (shown.get("ActiveState") or "").strip().lower()
     if not active_state:
         return PROBE_UNREADABLE
-    return PROBE_LOADED if active_state == "active" else PROBE_CONFIRMED_ABSENT
+    if active_state in _ACTIVE_STATES:
+        return PROBE_LOADED
+    if active_state in _ABSENT_STATES:
+        return PROBE_CONFIRMED_ABSENT
+    # Transitional and unknown alike: not a state this projection may assert as fact.
+    return PROBE_UNREADABLE
 
 
 def _refused(action: str, reason: str, **extra: object) -> dict:
@@ -320,7 +341,8 @@ def install(
     against the pinned mozyo home and reported as ``credential_readiness``, but the timer installs
     regardless, so the local work a tick can safely do from SQLite + Herdr keeps running and an
     unconfigured Redmine surfaces as an explicit state instead of a refusal to schedule anything.
-    (This is the deliberate divergence from the macOS LaunchAgent adapter, which gates on it.)
+    Since Redmine #15192 the macOS adapter carries the SAME contract, so this is no longer a
+    divergence: neither host gates the install on credential readiness (review j#102151 Finding 4).
 
     A failure *after* the units are written leaves them on disk and reports ``performed: False``; the
     operator can fix the cause and re-run install, which rewrites both units idempotently.
@@ -521,6 +543,7 @@ def service_status(
 
     manager_available = user_manager_available(runner)
     timer_shown = _show(runner, SUPERVISOR_UNIT.timer_unit, _TIMER_PROPERTIES)
+    probe_state = _probe_state(timer_shown, manager_available=manager_available)
     service_shown = _show(runner, SUPERVISOR_UNIT.service_unit, _SERVICE_PROPERTIES)
 
     service_keys = _read_unit_keys(service_target) if service_exists else None
@@ -571,7 +594,7 @@ def service_status(
         # Whether the host manager's answer could be READ, in the same fixed vocabulary the macOS
         # adapter publishes (review j#102200 finding r3f2): a failed read must not be reported as a
         # confirmed state. The timer is the unit that answers "is anything scheduling this".
-        "probe_state": _probe_state(timer_shown, manager_available=manager_available),
+        "probe_state": probe_state,
         # Installed only when BOTH owned units are present: a lone service has no cadence and a lone
         # timer has nothing to start.
         "installed": service_exists and timer_exists,
@@ -580,8 +603,11 @@ def service_status(
         "service_unit_exists": service_exists,
         "timer_unit_exists": timer_exists,
         "timer_enabled": timer_shown.get("UnitFileState") == "enabled",
-        # ``loaded`` is the cross-adapter word for "the host manager is scheduling this service".
-        "loaded": timer_shown.get("ActiveState") == "active",
+        # ``loaded`` is the cross-adapter word for "the host manager is scheduling this service",
+        # derived from the SAME classification as ``probe_state`` so the two cannot disagree about
+        # one state machine (review j#102309 finding r5f2): reading `active` here while the state
+        # token said otherwise is exactly the drift that finding recorded.
+        "loaded": probe_state == PROBE_LOADED,
         # When the next tick runs (acceptance: 次回起動), with the basis needed to read it: a
         # monotonic value is measured since boot, not a wall clock.
         "next_elapse": next_elapse_value,

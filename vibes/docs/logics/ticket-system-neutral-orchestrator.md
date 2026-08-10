@@ -508,8 +508,9 @@ typed zero-mutation refusal）、結果 envelope を `{action, performed, reason
 を含む **superset**（local drain を実行し、watermark が due なら provider leg も実行する）であるため、第二
 agent が買っていたのは capability ではなく latency であり、その対価は Login Items に見える登録がもう 1 つ増え
 ることと、整合を保つべき lifecycle がもう 1 つ増えることだった。各 verb は非 darwin / 実行ファイル欠落 /
-credential 未整備 / not-loaded で zero-mutation 拒否し、RunAtLoad + StartInterval（KeepAlive なし、
-EnvironmentVariables なし）契約を維持する。
+退役 plist の identity 不明 / not-loaded で zero-mutation 拒否し、RunAtLoad + StartInterval（KeepAlive なし、
+EnvironmentVariables なし）契約を維持する。**credential 未整備は拒否理由ではない**（両 OS 共通、後述の
+「Redmine 未設定は導入の拒否理由にしない」を正本とする）。
 
 **退役 agent の migration**（#15192）。#15192 以前に install した host には第二 LaunchAgent が残る。これを放置
 すると受入条件（macOS は LaunchAgent 1 個）が破れ、既に包含済みの `--drain-only` tick が走り続けるため、
@@ -544,7 +545,15 @@ durable な手掛かりであり、消せば live job を隠すことになる�
 
 not-found の認識は **連言**である（review j#102200 finding r3f1）。`confirmed_absent` は次の**すべて**を要求する:
 (1) `launchctl` の exit code が unknown label のもの、(2) 認識可能な not-found 語を含む、(3) その出力が
-**自分の domain/label を名指ししている**、(4) 権限エラー等「不存在以外の理由で読めなかった」signal を含まない。
+**自分の label を quote 付きで完全一致に名指ししている**、(4) 権限エラー等「不存在以外の理由で読めなかった」
+signal を含まない。
+
+(3) の照合は **quoted 完全一致のみ**である（review j#102309 finding r5f1）。以前は label 継続文字を
+「英数 + `.` `-` `_`」と *こちらで定義* し、その集合外を境界とみなしていたが、Apple 正本は `Label` を
+「unique な識別文字列」と述べるのみで **この文字集合を規定していない**。結果として `<owned>@helper` /
+`<owned>:helper` / `<owned>+helper` / `<owned>/helper` という **別ラベル**がすべて owned と一致し、その一致が
+plist 削除の authorization に到達し得た。quote は境界を *観測* にする（推測ではない）。quote されない文面では
+束縛を証明できないため `unreadable` へ倒す —— **実機文面を確定できるまで over-refusal を選ぶ**（#15194）。
 
 以前は (1) **または** (2) で足りるとしていたため、`113` + `Operation not permitted`（権限失敗）が不存在と判定され
 所有 plist を削除した。単独の signal はこの帰結を負うには弱すぎる: launchctl の man page は成功=0 / 失敗=非0 しか
@@ -562,12 +571,20 @@ not-found の認識は **連言**である（review j#102200 finding r3f1）。`
 読めたか否かから同じ語彙へ写す（`show` は未知 unit にも応答するため、空の結果は「unit 不在」ではなく
 **読み取り失敗**である）。生の launchctl / systemctl 文面と秘密値は投影に出さない。
 
+Linux の `ActiveState` 分類は **closed vocabulary** である（review j#102309 finding r5f2）。
+`active` / `reloading` -> `loaded`（systemd は `reloading` を「active かつ設定 reload 中」と定義する）、
+`inactive` / `failed` -> `confirmed_absent`、`activating` / `deactivating`（遷移中）**および未知値** ->
+`unreadable`。以前は「`active` 以外はすべて不在」という **open な否定**で分類しており、reload 中・遷移中・
+将来 systemd が追加する値までを「確認済み不在」と *断定* していた。macOS 側の「unknown を *absent* へ畳まない」
+規則と同じ規則の裏返しであり、**未知値をいかなる確認済み状態へも畳まない**。`loaded` 投影は
+`probe_state == loaded` から導出し、同一 state machine について 2 つの答えが出ないようにする。
+
 **順序は「先に退役、後に install」**であり、これが partial failure 下で不変条件を保つ順序である。逆順（install
 してから migration）にすると途中失敗時に **登録が 2 個** 残る——本変更が終わらせようとしている状態そのものであ
 る。退役を先に行えば残るのは 0 個か 1 個にしかならず、install の再実行は idempotent で、退役した drain leg は
-`--run-once` が既に行うため capability の喪失にならない。refusal 条件（platform / executable / credential /
+`--run-once` が既に行うため capability の喪失にならない。refusal 条件（platform / executable /
 退役 plist の identity）はすべて **どちらの mutation よりも前**に評価するので、拒否された install は
-zero-mutation のままである。`uninstall` 側では foreign / unreadable な退役 plist は報告のみで、**自分の** agent
+zero-mutation のままである（credential readiness は gate ではないため、この列挙に含まれない）。`uninstall` 側では foreign / unreadable な退役 plist は報告のみで、**自分の** agent
 の削除を妨げない（他人の file を理由に自分の登録を残す方が有害である）。
 
 **Linux systemd user timer** の realization（`supervisor_systemd`）は **owned service 1 個 + timer 1 個**であ

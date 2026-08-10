@@ -305,12 +305,38 @@ class ProbeStateProjectionTest(unittest.TestCase):
             status = _systemd_status(manager_available=True, timer_output=timer_output)
             self.assertEqual(status["probe_state"], ss.PROBE_UNREADABLE, why)
 
-    def test_a_complete_linux_read_still_classifies(self) -> None:
-        # The complement: the stricter rule must not make every real read unreadable.
-        active = _systemd_status(manager_available=True, timer_output="ActiveState=active\n")
-        inactive = _systemd_status(manager_available=True, timer_output="ActiveState=inactive\n")
-        self.assertEqual(active["probe_state"], ss.PROBE_LOADED)
-        self.assertEqual(inactive["probe_state"], ss.PROBE_CONFIRMED_ABSENT)
+    def test_every_active_state_is_classified_by_a_closed_vocabulary(self) -> None:
+        # Review j#102309 finding r5f2. "active versus everything else" is an OPEN negation: it
+        # asserted confirmed absence for `reloading` (which systemd defines as active), for both
+        # transition states, and for any value this code has never heard of. Absence is claimed only
+        # for the two values that mean it; everything unrecognized is unreadable.
+        expected = {
+            "active": ss.PROBE_LOADED,
+            "reloading": ss.PROBE_LOADED,          # active, reloading its configuration
+            "inactive": ss.PROBE_CONFIRMED_ABSENT,
+            "failed": ss.PROBE_CONFIRMED_ABSENT,
+            "activating": ss.PROBE_UNREADABLE,     # mid-transition: not a confirmed state
+            "deactivating": ss.PROBE_UNREADABLE,
+            "maintenance": ss.PROBE_UNREADABLE,    # documented elsewhere, unknown to this code
+            "some-future-state": ss.PROBE_UNREADABLE,
+        }
+        for state, want in expected.items():
+            status = _systemd_status(
+                manager_available=True, timer_output=f"ActiveState={state}\n"
+            )
+            self.assertEqual(status["probe_state"], want, state)
+
+    def test_loaded_and_probe_state_never_disagree(self) -> None:
+        # One state machine, one answer: `loaded` is derived from the same classification, so the
+        # projection cannot say "not running" while the state token says otherwise (and vice versa).
+        for state in ("active", "reloading", "activating", "deactivating", "inactive",
+                      "failed", "some-future-state", ""):
+            status = _systemd_status(
+                manager_available=True, timer_output=f"ActiveState={state}\n"
+            )
+            self.assertEqual(
+                status["loaded"], status["probe_state"] == ss.PROBE_LOADED, state
+            )
 
     def test_the_projection_leaks_no_raw_manager_text(self) -> None:
         # `probe_state` is a fixed token, never the launchctl / systemctl message it came from.

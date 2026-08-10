@@ -193,7 +193,9 @@ CREDENTIAL_INCOMPLETE = "incomplete"  # exactly one of key / usable url present
 CREDENTIAL_MISSING = "missing"  # neither present, and nothing unsafe (the plain unconfigured case)
 CREDENTIAL_UNSAFE = "unsafe"  # a present credential file is unsafe/malformed (permission / YAML)
 
-# A launchctl "print" for an unknown label exits non-zero; treat any non-zero as "not loaded".
+# A launchctl "print" for an unknown label exits non-zero — but a non-zero exit alone says only
+# that the read failed, NOT that the service is gone. `_probe` classifies it three ways; see
+# `_says_not_found` for the evidence a removal requires (reviews j#102180 / j#102200 / j#102309).
 _LAUNCHCTL = "launchctl"
 
 Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
@@ -390,44 +392,28 @@ def _says_not_found(result, service_target: str) -> bool:
     return _names_exactly(message, target) or _names_exactly(message, label)
 
 
-#: Characters that continue a launchd label. A reverse-DNS label is alphanumerics plus these, so a
-#: match bounded by anything else is a whole label rather than a piece of a longer one.
-_LABEL_CONTINUATION = set(".-_")
-
-
 def _names_exactly(message: str, token: str) -> bool:
-    """Whether ``message`` names ``token`` as a WHOLE label, not as part of a longer one.
+    """Whether ``message`` names ``token`` as launchd's own **quoted** service name.
 
-    ``label in message`` was the bug: ``org.…callback-supervisor.drain`` is a prefix of
-    ``org.…callback-supervisor.drain.helper``, so a not-found about the *helper* satisfied the check
-    for the *drain* agent and its plist was deleted while it may still have been running (review
-    j#102235 finding r4f1). A not-found about someone else's label is not evidence about ours, so
-    the containment has to respect label boundaries.
+    Only one form is accepted: the token inside double quotes, exactly. That is how launchctl
+    renders the name it could not find, and the quotes are what make the boundary *observed* rather
+    than *assumed*.
 
-    Two accepted forms, both exact:
+    The previous version inferred boundaries from a character allowlist — alphanumerics plus
+    ``.-_`` — treating anything else as a delimiter. Apple documents ``Label`` only as a unique
+    identifying string and places no such restriction on it, so that allowlist was invented here,
+    and it was wrong: ``<owned>@helper``, ``<owned>:helper``, ``<owned>+helper`` and
+    ``<owned>/helper`` are all *different* labels that satisfied a boundary test built from it, and
+    each could authorize unlinking the owned registration (review j#102309 finding r5f1).
 
-    - **quoted** — ``"<token>"``, which is how launchctl actually renders the name it could not find;
-    - **delimited** — the token bounded on both sides by something that cannot continue a label
-      (start/end of text, whitespace, a quote, a slash, …), so neither a longer suffix nor a longer
-      prefix can satisfy it.
+    A quoted match cannot be satisfied by a longer or different label whatever characters it
+    contains, because the closing quote terminates the comparison. Everything else — including a
+    message that names the service without quoting it — yields no binding and therefore
+    :data:`PROBE_UNREADABLE`. That is deliberately an over-refusal: until the real launchctl wording
+    is captured on a live host (#15194), refusing is the only honest answer, and refusing costs a
+    retry while a wrong match costs someone else's running service.
     """
-    if not token:
-        return False
-    if f'"{token}"' in message:
-        return True
-    start = 0
-    while True:
-        index = message.find(token, start)
-        if index < 0:
-            return False
-        before = message[index - 1] if index > 0 else ""
-        after_index = index + len(token)
-        after = message[after_index] if after_index < len(message) else ""
-        bounded_left = not (before.isalnum() or before in _LABEL_CONTINUATION)
-        bounded_right = not (after.isalnum() or after in _LABEL_CONTINUATION)
-        if bounded_left and bounded_right:
-            return True
-        start = index + 1
+    return bool(token) and f'"{token}"' in message
 
 
 def _small_int_or_none(token: str) -> Optional[int]:
