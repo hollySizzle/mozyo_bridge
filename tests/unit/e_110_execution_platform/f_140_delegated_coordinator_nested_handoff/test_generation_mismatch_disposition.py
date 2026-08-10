@@ -24,6 +24,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DISPOSITION_DUPLICATE_RECEIVER,
     DISPOSITION_INVENTORY_UNREADABLE,
     DISPOSITION_KNOWN_MARKER_REQUIRES_Q_ENTER,
+    DISPOSITION_LIFECYCLE_ABSENT,
+    DISPOSITION_LIFECYCLE_PINS_INVALID,
+    DISPOSITION_LIFECYCLE_UNREADABLE,
     DISPOSITION_NOT_MISMATCH_WITH_PENDING,
     DISPOSITION_READY,
     DISPOSITION_REASONS,
@@ -166,6 +169,26 @@ class ZeroMutationRefusalTest(unittest.TestCase):
     def test_unreadable_attestation_refuses(self) -> None:
         self.assertEqual(_decide(facts=_facts(attested_at="")), DISPOSITION_ATTESTATION_UNREADABLE)
 
+    def test_unreadable_lifecycle_refuses(self) -> None:
+        self.assertEqual(
+            _decide(lifecycle_reason=DISPOSITION_LIFECYCLE_UNREADABLE),
+            DISPOSITION_LIFECYCLE_UNREADABLE,
+        )
+
+    def test_absent_lifecycle_refuses(self) -> None:
+        self.assertEqual(
+            _decide(lifecycle_reason=DISPOSITION_LIFECYCLE_ABSENT),
+            DISPOSITION_LIFECYCLE_ABSENT,
+        )
+
+    def test_non_positive_lifecycle_pins_refuse(self) -> None:
+        for changes in ({"lane_generation": 0}, {"lifecycle_revision": -1}):
+            with self.subTest(changes=changes):
+                self.assertEqual(
+                    _decide(facts=_facts(**changes)),
+                    DISPOSITION_LIFECYCLE_PINS_INVALID,
+                )
+
     def test_working_agent_refuses_regardless_of_everything_else(self) -> None:
         self.assertEqual(_decide(agent_working=True), DISPOSITION_AGENT_WORKING)
 
@@ -261,6 +284,10 @@ class PendingEffectTest(unittest.TestCase):
         self.assertIn("--approved-generation-axes", argv)
         self.assertIn("--approved-pending-identity", argv)
         self.assertIn("--approved-pending-effect", argv)
+        self.assertIn("--approved-lane-generation", argv)
+        self.assertIn("--approved-lifecycle-revision", argv)
+        self.assertEqual(argv[argv.index("--approved-lane-generation") + 1], "1")
+        self.assertEqual(argv[argv.index("--approved-lifecycle-revision") + 1], "7")
         self.assertIn("--execute", argv)
         self.assertEqual(argv[argv.index("--journal") + 1], "102900")
 
@@ -361,11 +388,12 @@ class ActionTimeRevalidationTest(unittest.TestCase):
         )
         self.assertEqual(set(drift), {DRIFT_AGENT_REVISION, DRIFT_LOCATOR, DRIFT_GENERATION_AXES})
 
-    def test_unpinned_lane_generation_is_not_compared(self) -> None:
-        # A caller whose store cannot supply the lane generation is not silently blocked;
-        # the remaining tokens still bind the identity.
+    def test_unpinned_lane_generation_is_drift(self) -> None:
         approved = _facts(lane_generation=-1)
-        self.assertEqual(observed_facts_match(approved, _facts(lane_generation=3)), ())
+        self.assertEqual(
+            observed_facts_match(approved, _facts(lane_generation=3)),
+            (DRIFT_LANE_GENERATION,),
+        )
 
 
 class BodyFenceTest(unittest.TestCase):

@@ -11,7 +11,7 @@ seams that bind it to the quarantine command:
 
 - :func:`disposition_drift` — the action-time re-comparison of an approval against a FRESH
   observation, run at every edge that could close a receiver.
-- :func:`register_disposition_flags` — the three CLI tokens that turn an ordinary quarantine
+- :func:`register_disposition_flags` — the five CLI tokens that turn an ordinary quarantine
   request into a disposition.
 
 See :mod:`...domain.generation_mismatch_disposition` for why the rail exists and what the
@@ -23,7 +23,12 @@ from __future__ import annotations
 import argparse
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.generation_mismatch_disposition import (  # noqa: E501
+    DISPOSITION_APPROVAL_INCOMPLETE,
+    DISPOSITION_LIFECYCLE_ABSENT,
+    DISPOSITION_LIFECYCLE_PINS_INVALID,
     DRIFT_GENERATION_AXES,
+    DRIFT_LANE_GENERATION,
+    DRIFT_LIFECYCLE_REVISION,
     DRIFT_PENDING_IDENTITY,
     PENDING_EFFECT_DISCARDED_ON_REPLACE,
     PENDING_EFFECT_PRESERVED,
@@ -92,10 +97,58 @@ def disposition_drift(
     return ",".join(reasons)
 
 
+def _positive_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def disposition_request_reason(request: "QuarantineRequest") -> str:
+    """Typed refusal for a partial or invalid five-token disposition approval."""
+    supplied = (
+        bool(request.approved_generation_axes),
+        bool(_norm(request.approved_pending_identity)),
+        bool(_norm(request.approved_pending_effect)),
+        request.approved_lane_generation != -1,
+        request.approved_lifecycle_revision != -1,
+    )
+    if not any(supplied):
+        return ""
+    if not all(supplied):
+        return DISPOSITION_APPROVAL_INCOMPLETE
+    if not all(
+        _positive_int(value)
+        for value in (
+            request.approved_lane_generation,
+            request.approved_lifecycle_revision,
+        )
+    ):
+        return DISPOSITION_LIFECYCLE_PINS_INVALID
+    return ""
+
+
+def disposition_lifecycle_reason(
+    request: "QuarantineRequest", record: object, *, expected_revision: int
+) -> str:
+    """Recompare the approval's incarnation pins with one fresh lifecycle row."""
+    request_reason = disposition_request_reason(request)
+    if request_reason or not request.is_disposition:
+        return request_reason
+    if record is None:
+        return DISPOSITION_LIFECYCLE_ABSENT
+    generation = getattr(record, "lane_generation", None)
+    revision = getattr(record, "revision", None)
+    if not _positive_int(generation) or not _positive_int(revision):
+        return DISPOSITION_LIFECYCLE_PINS_INVALID
+    if generation != request.approved_lane_generation:
+        return DRIFT_LANE_GENERATION
+    if revision != expected_revision:
+        return DRIFT_LIFECYCLE_REVISION
+    return ""
+
+
 def register_disposition_flags(parser: argparse.ArgumentParser) -> None:
-    """Add the three #15193 disposition tokens to the `sublane quarantine` parser."""
+    """Add the five #15193 disposition tokens to the `sublane quarantine` parser."""
     # Generation-mismatch disposition tokens (Redmine #15193). Optional and only meaningful
-    # TOGETHER: supplying all three turns the request into a disposition, which is the only
+    # TOGETHER: supplying all five turns the request into a disposition, which is the only
     # way a `generation_mismatch` receiver holding a real pending input can be acted on. A
     # partial set stays an ordinary quarantine and is refused as not-eligible, so no caller
     # can unlock the mismatch path without also stating the pending input's fate.
@@ -131,9 +184,25 @@ def register_disposition_flags(parser: argparse.ArgumentParser) -> None:
             "replacement cannot preserve the composer it replaces."
         ),
     )
+    parser.add_argument(
+        "--approved-lane-generation",
+        dest="approved_lane_generation",
+        default=-1,
+        type=int,
+        help="Redmine #15193: positive lifecycle incarnation observed by quarantine-inspect.",
+    )
+    parser.add_argument(
+        "--approved-lifecycle-revision",
+        dest="approved_lifecycle_revision",
+        default=-1,
+        type=int,
+        help="Redmine #15193: positive shared lifecycle revision observed by quarantine-inspect.",
+    )
 
 
 __all__ = (
     "disposition_drift",
+    "disposition_lifecycle_reason",
+    "disposition_request_reason",
     "register_disposition_flags",
 )

@@ -80,6 +80,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.generation_mismatch_disposition import (  # noqa: E501
     DISPOSITION_DUPLICATE_RECEIVER,
     DISPOSITION_INVENTORY_UNREADABLE,
+    DISPOSITION_LIFECYCLE_ABSENT,
+    DISPOSITION_LIFECYCLE_PINS_INVALID,
+    DISPOSITION_LIFECYCLE_UNREADABLE,
     DISPOSITION_READY,
     DISPOSITION_RECEIVER_ABSENT,
     DISPOSITION_WORKSPACE_UNRESOLVED,
@@ -320,32 +323,41 @@ class SublaneQuarantineInspectUseCase:
     env: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
     #: Injected ``(workspace_id, lane) -> (lane_generation, lifecycle_revision)`` reader for
     #: the disposition's lane-scoped binding (Redmine #15193 requirement 3). Defaults to the
-    #: live lifecycle store. A store that cannot be read yields ``(-1, -1)`` — "unpinned" —
-    #: which :func:`...domain.generation_mismatch_disposition.observed_facts_match` then skips
-    #: rather than compares, so an unreadable store weakens the binding to the identity tokens
-    #: instead of fabricating a generation the approval would falsely claim to have verified.
+    #: live lifecycle store. Unreadable, absent, and invalid authority remain distinct typed
+    #: refusals; none may mint an approval with an unpinned incarnation.
     lifecycle_reader: Any = None
 
-    def _lane_pins(self, workspace_id: str, lane: str) -> tuple[int, int]:
+    def _lane_pins(self, workspace_id: str, lane: str) -> tuple[int, int, str]:
         if self.lifecycle_reader is not None:
             try:
-                generation, revision = self.lifecycle_reader(workspace_id, lane)
-                return int(generation), int(revision)
-            except Exception:  # noqa: BLE001 - an unreadable pin is "unpinned", never a guess
-                return -1, -1
-        try:
-            # The NON-migrating, NON-creating reader (Redmine #13844), not the writable
-            # store: this command is a read-only projection and must not create or migrate
-            # the shared home store just to render an approval template.
-            from mozyo_bridge.core.state.lane_lifecycle_model import LaneLifecycleKey
-            from mozyo_bridge.core.state.lane_lifecycle_readonly import LaneLifecycleReader
+                record = self.lifecycle_reader(workspace_id, lane)
+            except Exception:  # noqa: BLE001 - fixed typed refusal, never a guessed pin
+                return -1, -1, DISPOSITION_LIFECYCLE_UNREADABLE
+            if record is None:
+                return -1, -1, DISPOSITION_LIFECYCLE_ABSENT
+            try:
+                generation, revision = record
+            except (TypeError, ValueError):
+                return -1, -1, DISPOSITION_LIFECYCLE_PINS_INVALID
+        else:
+            try:
+                # NON-migrating and NON-creating: inspection cannot mutate shared authority.
+                from mozyo_bridge.core.state.lane_lifecycle_model import LaneLifecycleKey
+                from mozyo_bridge.core.state.lane_lifecycle_readonly import LaneLifecycleReader
 
-            record = LaneLifecycleReader().get(LaneLifecycleKey(workspace_id, lane))
-        except Exception:  # noqa: BLE001 - unreadable/absent store reads as "unpinned"
-            return -1, -1
-        if record is None:
-            return -1, -1
-        return int(getattr(record, "lane_generation", -1)), int(getattr(record, "revision", -1))
+                record = LaneLifecycleReader().get(LaneLifecycleKey(workspace_id, lane))
+            except Exception:  # noqa: BLE001 - fixed typed refusal, never a guessed pin
+                return -1, -1, DISPOSITION_LIFECYCLE_UNREADABLE
+            if record is None:
+                return -1, -1, DISPOSITION_LIFECYCLE_ABSENT
+            generation = getattr(record, "lane_generation", None)
+            revision = getattr(record, "revision", None)
+        if not all(
+            isinstance(value, int) and not isinstance(value, bool) and value > 0
+            for value in (generation, revision)
+        ):
+            return -1, -1, DISPOSITION_LIFECYCLE_PINS_INVALID
+        return generation, revision, ""
 
     def _rows(self) -> Sequence[Mapping[str, object]]:
         if self.rows_reader is not None:
@@ -521,7 +533,9 @@ class SublaneQuarantineInspectUseCase:
         lost. Naming that effect on the approval is the acceptance criterion — the operator
         approves a discard explicitly or not at all.
         """
-        lane_generation, lifecycle_revision = self._lane_pins(facts.workspace_id, facts.lane)
+        lane_generation, lifecycle_revision, lifecycle_reason = self._lane_pins(
+            facts.workspace_id, facts.lane
+        )
         signal = inspection.signal
         disposition_facts = DispositionFacts(
             issue=facts.issue,
@@ -555,6 +569,7 @@ class SublaneQuarantineInspectUseCase:
             # otherwise be handed a disposition template while it is still running.
             agent_working=agent_state_is_working(signal.agent_state),
             duplicate_receiver=False,
+            lifecycle_reason=lifecycle_reason,
         )
         return disposition_facts, reason
 

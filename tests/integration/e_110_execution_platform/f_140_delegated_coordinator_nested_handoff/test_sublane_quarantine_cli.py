@@ -134,6 +134,20 @@ class RegistrationTest(unittest.TestCase):
         self.assertFalse(build_parser().parse_args(ARGV).execute)
         self.assertTrue(build_parser().parse_args([*ARGV, "--execute"]).execute)
 
+    def test_disposition_lifecycle_pins_parse_as_positive_integers(self) -> None:
+        ns = build_parser().parse_args(
+            [
+                *ARGV,
+                "--approved-generation-axes", "pair",
+                "--approved-pending-identity", "pending:uncorrelated",
+                "--approved-pending-effect", "discarded_on_replace",
+                "--approved-lane-generation", "3",
+                "--approved-lifecycle-revision", "11",
+            ]
+        )
+        self.assertEqual(ns.approved_lane_generation, 3)
+        self.assertEqual(ns.approved_lifecycle_revision, 11)
+
     def test_every_exact_target_field_is_required(self) -> None:
         # Dropping any one of them would leave the receiver only partially identified,
         # which is precisely what the contract forbids naming.

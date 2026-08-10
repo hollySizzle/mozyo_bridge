@@ -42,23 +42,30 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.lane_lifecycle import (
+    DISPOSITION_ACTIVE,
+    DISPOSITION_RETIRED,
     DecisionPointer,
     LaneLifecycleKey,
     LaneLifecycleStore,
+    LaneLifecycleError,
     ReleasePin,
 )
+from mozyo_bridge.core.state.lane_declaration import LaneDeclarationStore
 from mozyo_bridge.core.state.lane_lifecycle_model import (
     REPLACEMENT_NOT_REQUESTED,
     REPLACEMENT_REPLACED,
+    REPLACEMENT_REQUESTED,
 )
 from mozyo_bridge.core.state.lane_replacement import LaneReplacementStore
 from mozyo_bridge.core.state.lane_replacement_model import quarantine_action_id
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+    sublane_quarantine as quarantine_module,
     sublane_quarantine_inspect as inspect_module,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_preflight import (  # noqa: E501
@@ -84,9 +91,15 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.generation_mismatch_disposition import (  # noqa: E501
     DISPOSITION_AGENT_WORKING,
+    DISPOSITION_APPROVAL_INCOMPLETE,
     DISPOSITION_COMPOSER_UNREADABLE,
+    DISPOSITION_LIFECYCLE_ABSENT,
+    DISPOSITION_LIFECYCLE_PINS_INVALID,
+    DISPOSITION_LIFECYCLE_UNREADABLE,
     DISPOSITION_READY,
     DISPOSITION_RECEIVER_ABSENT,
+    DRIFT_LANE_GENERATION,
+    DRIFT_LIFECYCLE_REVISION,
     PENDING_EFFECT_DISCARDED_ON_REPLACE,
     PENDING_EFFECT_PRESERVED,
 )
@@ -116,6 +129,8 @@ FRESH_LOCATOR = f"{WS}:p24"
 ATTESTED_AT = "2026-08-10T07:00:00+00:00"
 APPROVED_AT = "2026-08-10T07:30:00+00:00"
 AGENT_REVISION = 4
+LANE_GENERATION = 1
+LIFECYCLE_REVISION = 1
 ACTION = quarantine_action_id(lane_id=LANE, role=ROLE, locator=OLD_LOCATOR)
 
 #: The measured axis in j#102624: the worker was live but the gateway/worker pair did not
@@ -190,6 +205,8 @@ def _request(**kw) -> QuarantineRequest:
         approved_generation_axes=AXES,
         approved_pending_identity=PENDING_ID,
         approved_pending_effect=PENDING_EFFECT_DISCARDED_ON_REPLACE,
+        approved_lane_generation=LANE_GENERATION,
+        approved_lifecycle_revision=LIFECYCLE_REVISION,
     )
     base.update(kw)
     return QuarantineRequest(**base)
@@ -231,7 +248,10 @@ class _Case(unittest.TestCase):
             repo_root=Path("/tmp/repo"),
             rows_reader=lambda: rows,
             ops_factory=lambda _rows: _Ops(),
-            lifecycle_reader=lambda _ws, _lane: (1, 7),
+            lifecycle_reader=lambda _ws, _lane: (
+                LANE_GENERATION,
+                LIFECYCLE_REVISION,
+            ),
         )
         original = inspect_module.repo_scope_workspace_id
         inspect_module.repo_scope_workspace_id = lambda _root: WS
@@ -275,8 +295,8 @@ class DeadlockReproductionTest(_Case):
         self.assertEqual(facts.generation_axes, AXES)
         self.assertEqual(facts.pending_identity, PENDING_ID)
         self.assertEqual(facts.pending_effect, PENDING_EFFECT_DISCARDED_ON_REPLACE)
-        self.assertEqual(facts.lane_generation, 1)
-        self.assertEqual(facts.lifecycle_revision, 7)
+        self.assertEqual(facts.lane_generation, LANE_GENERATION)
+        self.assertEqual(facts.lifecycle_revision, LIFECYCLE_REVISION)
         # Stated in words, not only as a token — the operator approves a discard knowingly.
         self.assertIn("破棄する", out.disposition_template)
 
@@ -397,12 +417,42 @@ class ZeroMutationTest(_Case):
             dict(approved_generation_axes=()),
             dict(approved_pending_identity=""),
             dict(approved_pending_effect=""),
+            dict(approved_lane_generation=-1),
+            dict(approved_lifecycle_revision=-1),
         ):
             with self.subTest(missing=missing):
                 ops = _FakeOps()
                 outcome = self._run(ops, request=_request(**missing))
-                self.assertIn("not quarantine-eligible", outcome.detail)
+                self.assertIn(DISPOSITION_APPROVAL_INCOMPLETE, outcome.detail)
                 self._assert_no_mutation(ops, outcome)
+
+    def test_non_positive_lifecycle_pin_is_typed_zero_mutation(self) -> None:
+        self._active_lane()
+        ops = _FakeOps()
+        outcome = self._run(
+            ops, request=_request(approved_lifecycle_revision=0)
+        )
+        self.assertIn(DISPOSITION_LIFECYCLE_PINS_INVALID, outcome.detail)
+        self._assert_no_mutation(ops, outcome)
+
+    def test_absent_lifecycle_row_is_typed_zero_mutation(self) -> None:
+        ops = _FakeOps()
+        outcome = self._run(ops)
+        self.assertIn(DISPOSITION_LIFECYCLE_ABSENT, outcome.detail)
+        self.assertEqual(ops.closed_pins, [])
+        self.assertEqual(ops.heals, 0)
+
+    def test_unreadable_lifecycle_is_typed_zero_mutation(self) -> None:
+        self._active_lane()
+        ops = _FakeOps()
+        with mock.patch.object(
+            quarantine_module.LaneLifecycleReader,
+            "get",
+            side_effect=LaneLifecycleError("unreadable"),
+        ):
+            outcome = self._run(ops)
+        self.assertIn(DISPOSITION_LIFECYCLE_UNREADABLE, outcome.detail)
+        self._assert_no_mutation(ops, outcome)
 
     def test_a_working_agent_is_never_disposed_of(self) -> None:
         # PRECEDENCE TRAP: `generation_mismatch` outranks `agent_working` in the classifier,
@@ -519,6 +569,69 @@ class StaleApprovalTest(_Case):
         outcome = self._run(ops)
         self.assertIn("stale", outcome.detail)
         self.assertEqual(ops.closed_pins, [])
+
+    def test_an_advanced_lifecycle_revision_is_refused_before_the_open_cas(self) -> None:
+        self._active_lane()
+        ops = _FakeOps()
+        outcome = self._run(
+            ops,
+            request=_request(approved_lifecycle_revision=LIFECYCLE_REVISION + 1),
+        )
+        self.assertIn(DRIFT_LIFECYCLE_REVISION, outcome.detail)
+        self.assertEqual(ops.closed_pins, [])
+        self.assertEqual(self.lifecycle.get(self.key).revision, LIFECYCLE_REVISION)
+
+    def test_old_approval_cannot_cross_a_reopened_lane_incarnation(self) -> None:
+        self._active_lane()
+        row = self.lifecycle.get(self.key)
+        retired = self.lifecycle.transition_disposition(
+            self.key,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=row.revision,
+            target=DISPOSITION_RETIRED,
+            decision=DecisionPointer(
+                source="redmine", issue_id=ISSUE, journal_id=JOURNAL
+            ),
+        )
+        self.assertTrue(retired.applied)
+        row = self.lifecycle.get(self.key)
+        reopened = LaneDeclarationStore(home=self.home).open_next_generation(
+            self.key,
+            expected_revision=row.revision,
+            expected_generation=row.lane_generation,
+            decision=DecisionPointer(
+                source="redmine", issue_id=ISSUE, journal_id=JOURNAL
+            ),
+        )
+        self.assertTrue(reopened.applied)
+        ops = _FakeOps()
+        outcome = self._run(ops)
+        self.assertIn(DRIFT_LANE_GENERATION, outcome.detail)
+        self.assertEqual(ops.closed_pins, [])
+
+    def test_partial_replay_rechecks_lifecycle_revision_at_the_owed_close(self) -> None:
+        self._active_lane()
+        opened = self.store.request_replacement(
+            self.key,
+            expected_revision=LIFECYCLE_REVISION,
+            action_id=ACTION,
+            pins=(ReleasePin(role=ROLE, assigned_name=NAME, locator=OLD_LOCATOR),),
+            decision=DecisionPointer(
+                source="redmine", issue_id=ISSUE, journal_id=APPROVAL_JOURNAL
+            ),
+        )
+        self.assertTrue(opened.applied)
+        ops = _FakeOps()
+        outcome = self._run(
+            ops,
+            request=_request(approved_lifecycle_revision=LIFECYCLE_REVISION + 1),
+        )
+        self.assertIn(DRIFT_LIFECYCLE_REVISION, outcome.detail)
+        self.assertEqual(ops.closed_pins, [])
+        self.assertEqual(
+            self.lifecycle.get(self.key).replacement_state,
+            REPLACEMENT_REQUESTED,
+        )
 
     def test_a_cross_lane_action_generation_is_refused(self) -> None:
         self._active_lane()

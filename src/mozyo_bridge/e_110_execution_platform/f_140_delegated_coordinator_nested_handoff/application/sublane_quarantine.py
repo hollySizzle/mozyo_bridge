@@ -33,6 +33,7 @@ from mozyo_bridge.core.state.lane_lifecycle import (
     ReleasePinError,
 )
 from mozyo_bridge.core.state.lane_lifecycle_readonly import (
+    LaneLifecycleReader,
     lifecycle_migration_payload,
 )
 from mozyo_bridge.core.state.lane_lifecycle_model import (
@@ -71,7 +72,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine_disposition import (  # noqa: E501
     disposition_drift,
+    disposition_lifecycle_reason,
+    disposition_request_reason,
     register_disposition_flags,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.generation_mismatch_disposition import (  # noqa: E501
+    DISPOSITION_LIFECYCLE_UNREADABLE,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_pending_composer import (  # noqa: E501
     AMBIGUOUS,
@@ -172,12 +178,24 @@ class QuarantineRequest:
     #: :data:`...domain.generation_mismatch_disposition.PENDING_EFFECT_DISCARDED_ON_REPLACE`
     #: is actionable here — a replacement cannot preserve the composer it replaces.
     approved_pending_effect: str = ""
+    approved_lane_generation: int = -1
+    approved_lifecycle_revision: int = -1
+
+    @property
+    def has_disposition_tokens(self) -> bool:
+        return bool(
+            self.approved_generation_axes
+            or self.approved_pending_identity
+            or self.approved_pending_effect
+            or self.approved_lane_generation != -1
+            or self.approved_lifecycle_revision != -1
+        )
 
     @property
     def is_disposition(self) -> bool:
         """Does this request carry a COMPLETE disposition approval?
 
-        All three tokens are required together. A partial set is deliberately NOT a
+        All five tokens are required together. A partial set is deliberately NOT a
         disposition: it would let a caller unlock the generation-mismatch path while leaving
         the pending input's fate unstated, which is exactly the silent discard #15193
         forbids. A partial set therefore falls through to the ordinary quarantine gate and is
@@ -187,6 +205,12 @@ class QuarantineRequest:
             self.approved_generation_axes
             and self.approved_pending_identity
             and self.approved_pending_effect
+            and isinstance(self.approved_lane_generation, int)
+            and not isinstance(self.approved_lane_generation, bool)
+            and self.approved_lane_generation > 0
+            and isinstance(self.approved_lifecycle_revision, int)
+            and not isinstance(self.approved_lifecycle_revision, bool)
+            and self.approved_lifecycle_revision > 0
         )
 
 
@@ -336,6 +360,9 @@ class SublaneQuarantineUseCase:
         since have taken new input or started working; killing it then would destroy
         an input the owner never approved discarding).
         """
+        request_reason = disposition_request_reason(request)
+        if request_reason:
+            return request_reason
         if request.is_disposition:
             # Redmine #15193: a generation-mismatched receiver holding a REAL pending input
             # is not a quarantine candidate and never becomes one — but it is exactly the
@@ -360,6 +387,24 @@ class SublaneQuarantineUseCase:
         ):
             return "approval predates the current attested agent generation"
         return ""
+
+    def _disposition_lifecycle_reason(
+        self,
+        request: QuarantineRequest,
+        key: LaneLifecycleKey,
+        *,
+        expected_revision: int,
+    ) -> str:
+        """Re-read the shared authority immediately before a disposition effect."""
+        if not request.has_disposition_tokens:
+            return ""
+        try:
+            record = LaneLifecycleReader(path=self.store.path).get(key)
+        except (LaneLifecycleError, OSError):
+            return DISPOSITION_LIFECYCLE_UNREADABLE
+        return disposition_lifecycle_reason(
+            request, record, expected_revision=expected_revision
+        )
 
     def _capture_migration(self) -> None:
         """Fold THIS run's schema migration into the operation-scoped accumulator (Redmine #13844
@@ -391,6 +436,15 @@ class SublaneQuarantineUseCase:
                     if classification.q_enter_recommended
                     else "preflight only"
                 ),
+            )
+
+        request_reason = disposition_request_reason(request)
+        if request_reason:
+            return self._base_outcome(
+                request,
+                classification,
+                executed=True,
+                detail=f"disposition approval refused ({request_reason}); zero actuation",
             )
 
         # Positive durable approval and exact generation are mandatory before any
@@ -450,7 +504,21 @@ class SublaneQuarantineUseCase:
             current = self.store.get_replacement(key)
         except (LaneLifecycleError, ReleasePinError, OSError):
             current = None
-        if current is None or not current.lane_active or current.issue_id != decision.issue_id:
+        if current is None:
+            lifecycle_reason = self._disposition_lifecycle_reason(
+                request, key, expected_revision=request.approved_lifecycle_revision
+            )
+            return self._base_outcome(
+                request,
+                classification,
+                executed=True,
+                detail=(
+                    f"disposition lifecycle refused ({lifecycle_reason}); zero actuation"
+                    if lifecycle_reason
+                    else "lane lifecycle owner is absent / foreign / inactive"
+                ),
+            )
+        if not current.lane_active or current.issue_id != decision.issue_id:
             return self._base_outcome(
                 request,
                 classification,
@@ -477,6 +545,19 @@ class SublaneQuarantineUseCase:
             current.action_id == expected_action and current.pins == (pin,)
         )
         if current.state == REPLACEMENT_REPLACED and exact_generation:
+            lifecycle_reason = self._disposition_lifecycle_reason(
+                request,
+                key,
+                expected_revision=request.approved_lifecycle_revision + 3,
+            )
+            if lifecycle_reason:
+                return self._base_outcome(
+                    request,
+                    classification,
+                    executed=True,
+                    replacement_state=current.state,
+                    detail=f"disposition lifecycle refused ({lifecycle_reason}); zero actuation",
+                )
             return self._base_outcome(
                 request,
                 classification,
@@ -496,6 +577,20 @@ class SublaneQuarantineUseCase:
                         "in flight"
                     ),
                 )
+            offset = 1 if current.state == REPLACEMENT_REQUESTED else 2
+            lifecycle_reason = self._disposition_lifecycle_reason(
+                request,
+                key,
+                expected_revision=request.approved_lifecycle_revision + offset,
+            )
+            if lifecycle_reason:
+                return self._base_outcome(
+                    request,
+                    classification,
+                    executed=True,
+                    replacement_state=current.state,
+                    detail=f"disposition lifecycle refused ({lifecycle_reason}); zero actuation",
+                )
         else:
             # Opening a NEW generation depends on the current transient composer
             # observation. A stored generation is resumed instead of re-opened — but
@@ -509,6 +604,17 @@ class SublaneQuarantineUseCase:
                     executed=True,
                     replacement_state=current.state,
                     detail=stale,
+                )
+            lifecycle_reason = self._disposition_lifecycle_reason(
+                request, key, expected_revision=request.approved_lifecycle_revision
+            )
+            if lifecycle_reason:
+                return self._base_outcome(
+                    request,
+                    classification,
+                    executed=True,
+                    replacement_state=current.state,
+                    detail=f"disposition lifecycle refused ({lifecycle_reason}); zero actuation",
                 )
             opened = self.store.request_replacement(
                 key,
@@ -555,6 +661,19 @@ class SublaneQuarantineUseCase:
                         replacement_state=REPLACEMENT_REQUESTED,
                         detail=f"{stale}; owed close withheld",
                     )
+            lifecycle_reason = self._disposition_lifecycle_reason(
+                request,
+                key,
+                expected_revision=request.approved_lifecycle_revision + 1,
+            )
+            if lifecycle_reason:
+                return self._base_outcome(
+                    request,
+                    classification,
+                    executed=True,
+                    replacement_state=REPLACEMENT_REQUESTED,
+                    detail=f"disposition lifecycle refused ({lifecycle_reason}); owed close withheld",
+                )
             close = self.ops.close_receiver(request, pin)
             if not (close.closed or close.old_absent):
                 return self._base_outcome(
@@ -594,6 +713,20 @@ class SublaneQuarantineUseCase:
 
         # ``pending`` is deliberately the durable partial-launch state. A redrive
         # starts here and never closes the old locator a second time.
+        lifecycle_reason = self._disposition_lifecycle_reason(
+            request,
+            key,
+            expected_revision=request.approved_lifecycle_revision + 2,
+        )
+        if lifecycle_reason:
+            return self._base_outcome(
+                request,
+                classification,
+                executed=True,
+                replacement_state=REPLACEMENT_PENDING,
+                closed_old_receiver=closed,
+                detail=f"disposition lifecycle refused ({lifecycle_reason}); launch withheld",
+            )
         try:
             self.ops.heal_receiver(request)
         except Exception as exc:  # noqa: BLE001 - fixed type only, no body/detail persisted
@@ -616,6 +749,20 @@ class SublaneQuarantineUseCase:
                 replacement_state=REPLACEMENT_PENDING,
                 closed_old_receiver=closed,
                 detail="fresh receiver verification failed; redrive launch only",
+            )
+        lifecycle_reason = self._disposition_lifecycle_reason(
+            request,
+            key,
+            expected_revision=request.approved_lifecycle_revision + 2,
+        )
+        if lifecycle_reason:
+            return self._base_outcome(
+                request,
+                classification,
+                executed=True,
+                replacement_state=REPLACEMENT_PENDING,
+                closed_old_receiver=closed,
+                detail=f"disposition lifecycle refused ({lifecycle_reason}); completion withheld",
             )
         replaced = self.store.record_replacement_outcome(
             key,
@@ -991,6 +1138,10 @@ def cmd_sublane_quarantine(args: argparse.Namespace) -> int:
         ),
         approved_pending_identity=getattr(args, "approved_pending_identity", "") or "",
         approved_pending_effect=getattr(args, "approved_pending_effect", "") or "",
+        approved_lane_generation=int(getattr(args, "approved_lane_generation", -1)),
+        approved_lifecycle_revision=int(
+            getattr(args, "approved_lifecycle_revision", -1)
+        ),
     )
     use_case = SublaneQuarantineUseCase(
         ops=LiveSublaneQuarantineOps(repo_root=repo_root),
@@ -1014,7 +1165,7 @@ def register_sublane_quarantine_parser(sublane_sub: Any) -> None:
             "Redmine #13763 / #15193: classify one exact pending composer and, only with a "
             "positive generation-bound owner approval, replace that managed receiver "
             "without generic Enter/C-u/body typing. A receiver whose generation mismatches "
-            "AND holds a real pending input additionally requires the three --approved-* "
+            "AND holds a real pending input additionally requires the five --approved-* "
             "disposition tokens, which bind the approval to the exact mismatch and state "
             "what becomes of that input. Default is read-only preflight."
         ),

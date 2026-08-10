@@ -99,6 +99,10 @@ DISPOSITION_NOT_MISMATCH_WITH_PENDING = "not_generation_mismatch_with_pending"
 #: The mismatch could not be attributed to any known axis, so an approval could not name the
 #: condition it authorizes. Fail closed rather than bind an unnamed mismatch.
 DISPOSITION_AXES_UNATTRIBUTED = "generation_axes_unattributed"
+DISPOSITION_LIFECYCLE_UNREADABLE = "lane_lifecycle_unreadable"
+DISPOSITION_LIFECYCLE_ABSENT = "lane_lifecycle_absent"
+DISPOSITION_LIFECYCLE_PINS_INVALID = "lane_lifecycle_pins_invalid"
+DISPOSITION_APPROVAL_INCOMPLETE = "disposition_approval_incomplete"
 
 DISPOSITION_REASONS = frozenset(
     {
@@ -114,6 +118,9 @@ DISPOSITION_REASONS = frozenset(
         DISPOSITION_KNOWN_MARKER_REQUIRES_Q_ENTER,
         DISPOSITION_NOT_MISMATCH_WITH_PENDING,
         DISPOSITION_AXES_UNATTRIBUTED,
+        DISPOSITION_LIFECYCLE_UNREADABLE,
+        DISPOSITION_LIFECYCLE_ABSENT,
+        DISPOSITION_LIFECYCLE_PINS_INVALID,
     }
 )
 
@@ -252,6 +259,13 @@ class DispositionFacts:
     def revision_readable(self) -> bool:
         return isinstance(self.agent_revision, int) and self.agent_revision >= 0
 
+    @property
+    def lifecycle_pins_positive(self) -> bool:
+        return all(
+            isinstance(value, int) and not isinstance(value, bool) and value > 0
+            for value in (self.lane_generation, self.lifecycle_revision)
+        )
+
     def as_payload(self) -> dict[str, object]:
         return {
             "issue": self.issue,
@@ -281,6 +295,7 @@ def decide_disposition_readiness(
     composer_readable: bool,
     agent_working: bool = False,
     duplicate_receiver: bool = False,
+    lifecycle_reason: str = "",
 ) -> str:
     """The typed readiness reason for minting a disposition approval (pure).
 
@@ -313,6 +328,14 @@ def decide_disposition_readiness(
         return DISPOSITION_REVISION_UNREADABLE
     if not facts.attested_at:
         return DISPOSITION_ATTESTATION_UNREADABLE
+    if lifecycle_reason in {
+        DISPOSITION_LIFECYCLE_UNREADABLE,
+        DISPOSITION_LIFECYCLE_ABSENT,
+        DISPOSITION_LIFECYCLE_PINS_INVALID,
+    }:
+        return lifecycle_reason
+    if not facts.lifecycle_pins_positive:
+        return DISPOSITION_LIFECYCLE_PINS_INVALID
     if agent_working:
         # Active work is never disposed of, regardless of what else is true.
         return DISPOSITION_AGENT_WORKING
@@ -337,9 +360,8 @@ def observed_facts_match(approved: DispositionFacts, observed: DispositionFacts)
 
     Each token is compared for EQUALITY, never for "close enough": an approval is authority
     over one exact generation, so a token that moved means the owner approved a state that no
-    longer exists. ``lane_generation`` / ``lifecycle_revision`` are compared only when the
-    approval actually pinned them (``>= 0``), so a caller whose store cannot supply them is
-    not silently blocked — the remaining tokens still bind the identity.
+    longer exists. ``lane_generation`` / ``lifecycle_revision`` are mandatory positive
+    approval pins, so they are always compared; an invalid approval cannot weaken this bind.
     """
     reasons: list[str] = []
     if approved.workspace_id != observed.workspace_id:
@@ -354,12 +376,9 @@ def observed_facts_match(approved: DispositionFacts, observed: DispositionFacts)
         reasons.append(DRIFT_LOCATOR)
     if approved.agent_revision != observed.agent_revision:
         reasons.append(DRIFT_AGENT_REVISION)
-    if approved.lane_generation >= 0 and approved.lane_generation != observed.lane_generation:
+    if approved.lane_generation != observed.lane_generation:
         reasons.append(DRIFT_LANE_GENERATION)
-    if (
-        approved.lifecycle_revision >= 0
-        and approved.lifecycle_revision != observed.lifecycle_revision
-    ):
+    if approved.lifecycle_revision != observed.lifecycle_revision:
         reasons.append(DRIFT_LIFECYCLE_REVISION)
     if approved.attested_at != observed.attested_at:
         reasons.append(DRIFT_ATTESTED_AT)
@@ -397,6 +416,8 @@ def disposition_command(facts: DispositionFacts, *, journal: str = "") -> tuple[
         "--approved-generation-axes", ",".join(facts.generation_axes),
         "--approved-pending-identity", facts.pending_identity,
         "--approved-pending-effect", facts.pending_effect,
+        "--approved-lane-generation", str(facts.lane_generation),
+        "--approved-lifecycle-revision", str(facts.lifecycle_revision),
         "--journal", journal or DISPOSITION_JOURNAL_PLACEHOLDER,
         "--execute",
     )
@@ -452,6 +473,7 @@ def render_disposition_template(facts: DispositionFacts, *, journal: str = "") -
 
 __all__ = (
     "DISPOSITION_AGENT_WORKING",
+    "DISPOSITION_APPROVAL_INCOMPLETE",
     "DISPOSITION_ATTESTATION_UNREADABLE",
     "DISPOSITION_AXES_UNATTRIBUTED",
     "DISPOSITION_COMPOSER_UNREADABLE",
@@ -460,6 +482,9 @@ __all__ = (
     "DISPOSITION_INVENTORY_UNREADABLE",
     "DISPOSITION_JOURNAL_PLACEHOLDER",
     "DISPOSITION_KNOWN_MARKER_REQUIRES_Q_ENTER",
+    "DISPOSITION_LIFECYCLE_ABSENT",
+    "DISPOSITION_LIFECYCLE_PINS_INVALID",
+    "DISPOSITION_LIFECYCLE_UNREADABLE",
     "DISPOSITION_NOT_MISMATCH_WITH_PENDING",
     "DISPOSITION_READY",
     "DISPOSITION_REASONS",

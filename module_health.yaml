@@ -1465,7 +1465,7 @@ allowlist:
     expires: "2027-10-08"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_quarantine.py
-    lines: 1073
+    lines: 1224
     reason: >-
       Already at 986 lines before #15193 — 14 under the threshold, so any material
       addition crosses it. #15193 adds the generation-mismatch disposition rail that
@@ -1477,10 +1477,16 @@ allowlist:
       `domain/generation_mismatch_disposition.py`, and the action-time drift
       re-verification plus the CLI token registration live in the new sibling
       `sublane_quarantine_disposition.py`. What remains in this module is only what
-      cannot leave it — the three `QuarantineRequest` approval fields, the four-axis
+      cannot leave it — the five `QuarantineRequest` approval fields, the four-axis
       decomposition of `generation_ok` inside the live inspector (it needs `_cwd_matches`
       / `_pair_ok`), and the single `_approval_stale_reason` branch that routes to the
-      disposition gate.
+      disposition gate. The accepted High correction in #15193 j#103051-j#103053 also
+      requires the shared lifecycle incarnation to be re-read at every effect boundary:
+      before opening the replacement CAS, an owed close, a partial replay launch, and its
+      completion CAS. The typed pin policy and CLI registration remain in the existing
+      `sublane_quarantine_disposition.py` split; only the orchestration-site returns remain
+      here because moving them would duplicate or bypass the existing replacement state
+      machine.
       The concrete remaining decomposition is extracting `LiveSublaneQuarantineOps`
       (~300 lines) into its own adapter module, per the adapter-boundary policy. That was
       attempted during this issue and REVERTED: the class owns the provider globals that

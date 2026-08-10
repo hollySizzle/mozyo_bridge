@@ -292,6 +292,15 @@ mozyo-bridge sublane quarantine-inspect --issue <id> --lane <lane> --role <role>
 - `known_marker_requires_q_enter` はreceiver replacementではなく、既存delivery railのq-enterで処理する。
 - receiverのrevision / attested generation / locatorが変化したらapprovalは無効である。`--execute` は実状態と
   再照合してfail-closedするので、driftしたapprovalは適用されずに拒否される。inspectを取り直してapprovalを出し直す。
+- generation mismatch と real pending input が同時にある場合だけ、同じ inspection は disposition template を返す。
+  command は mismatch/pending の3 tokenに加え、正の `--approved-lane-generation` と
+  `--approved-lifecycle-revision` を必ず含む。この5 tokenは一組であり、欠落・非正数は
+  `disposition_approval_incomplete` / `lane_lifecycle_pins_invalid` の typed zero-actuation になる。
+- lifecycle authority の不読・row不在は `lane_lifecycle_unreadable` / `lane_lifecycle_absent` でtemplateを出さない。
+  executeは承認時revisionをreplacement generationの起点として、request CAS、owed close、partial launch replay、
+  completion CASの各effect直前にnon-migrating fresh readでlane incarnationと期待revisionを再照合する。
+  `lane_generation_drift` / `lifecycle_revision_drift` では以後のCAS・close・launchを行わない。したがって同じlane名が
+  次incarnationへ再作成されても旧approvalは流用できず、partial replayも承認された同一generationだけを再開する。
 
 ### pending composer がpairをpreserveしている場合
 
