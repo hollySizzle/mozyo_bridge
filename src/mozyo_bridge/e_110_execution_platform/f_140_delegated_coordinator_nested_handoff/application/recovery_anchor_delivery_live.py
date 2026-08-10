@@ -409,6 +409,7 @@ class LiveRecoveryAnchorDeliveryService:
         )
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_turn_start import (  # noqa: E501
             HerdrCliWaitPrimitive,
+            make_locator_identity_probe,
         )
 
         try:
@@ -420,7 +421,17 @@ class LiveRecoveryAnchorDeliveryService:
                 resolution.path, runner=self.runner, timeout=self.timeout
             )
             wait = HerdrCliWaitPrimitive(resolution.path)
-            return HerdrTurnStartRail(transport=transport, reader=reader, wait=wait)
+            return HerdrTurnStartRail(
+                transport=transport,
+                reader=reader,
+                wait=wait,
+                # Redmine #15202: without a live identity probe the rail withholds the
+                # WAIT_ERROR Enter resend entirely, so this seam would silently keep the
+                # #15199 shape it is meant to recover from.
+                identity_probe=make_locator_identity_probe(
+                    resolution.path, runner=self.runner
+                ),
+            )
         except Exception:  # noqa: BLE001 - unavailable capability is a zero-send
             return None
 

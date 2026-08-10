@@ -51,16 +51,22 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     OUTCOME_DELIVERED_NOT_STARTED,
     OUTCOME_INJECT_FAILED,
     OUTCOME_PRECONDITION_NOT_IDLE,
+    MAX_ERROR_RESEND_WAIT_TIMEOUT_MS,
     OUTCOME_STARTED,
     RESEND_SKIP_BODY_ABSENT,
     RESEND_SKIP_BUDGET_EXHAUSTED,
     RESEND_SKIP_DISABLED,
     RESEND_SKIP_ENTER_SEND_FAILED,
+    RESEND_SKIP_IDENTITY_DRIFT,
+    RESEND_SKIP_IDENTITY_PROBE_UNBOUND,
+    RESEND_SKIP_IDENTITY_UNCONFIRMED,
     RESEND_SKIP_NONE,
     RESEND_SKIP_PANE_UNREADABLE,
     RESEND_SKIP_RECEIVER_BLOCKED,
     RESEND_SKIP_SCREEN_GUARD_UNBOUND,
     RESEND_SKIP_STARTUP_SCREEN,
+    RESEND_SKIP_STATE_NOT_INJECTABLE,
+    RESEND_SKIP_STATE_UNREADABLE,
     WAIT_CHANGED,
     WAIT_ERROR,
     WAIT_TIMEOUT,
@@ -74,6 +80,8 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 
 TARGET = "w1:p1"
 BODY = "Refs: Redmine #13248 please start the turn"
+#: The durable assigned name a live identity probe reports for :data:`TARGET`.
+IDENTITY = "mzb1_ws_claude_lane"
 
 #: The five machine keys `to_telemetry_dict` carried before Redmine #15202 added two.
 TELEMETRY_KEYS_BEFORE_15202 = (
@@ -190,7 +198,29 @@ class FakeTransport:
         return self._read_pane[idx]
 
 
+class FakeIdentityProbe:
+    """A scripted target-identity probe. Pops tokens in order; repeats the last.
+
+    ``None`` in the script means "could not establish an identity" — the shape a live
+    probe reports for an unreadable listing or an ambiguous locator.
+    """
+
+    def __init__(self, *tokens):
+        self._tokens = list(tokens) if tokens else [IDENTITY]
+        self.calls: list[str] = []
+
+    def __call__(self, target: str):
+        self.calls.append(target)
+        if len(self._tokens) > 1:
+            return self._tokens.pop(0)
+        return self._tokens[0]
+
+
 def _rail(reader, transport, wait, events=None, **kwargs) -> HerdrTurnStartRail:
+    # A stable identity probe is the DEFAULT here so each error-path test states only
+    # the condition it is about; the identity gate itself is pinned by the dedicated
+    # unbound / unconfirmed / drift tests below, which pass `identity_probe=` explicitly.
+    kwargs.setdefault("identity_probe", FakeIdentityProbe())
     return HerdrTurnStartRail(
         transport=transport, reader=reader, wait=wait, **kwargs
     )
@@ -640,7 +670,7 @@ class WaitErrorEnterResendTests(unittest.TestCase):
         )
         self.assertEqual(DEFAULT_ERROR_RESEND_WAIT_TIMEOUT_MS, 15000)
 
-    def test_error_resend_window_is_configurable(self) -> None:
+    def test_error_resend_window_is_configurable_below_the_maximum(self) -> None:
         reader = FakeReader(AgentStateResult.observed(RUNTIME_AWAITING_INPUT))
         transport = FakeTransport(read_pane=[PaneReadResult.success(BODY)])
         wait = FakeWait(WaitResult.error(), WaitResult.changed())
@@ -649,9 +679,36 @@ class WaitErrorEnterResendTests(unittest.TestCase):
             transport,
             wait,
             max_enter_resends=1,
-            error_resend_wait_timeout_ms=21000,
+            error_resend_wait_timeout_ms=11000,
         ).drive_turn_start(TARGET, BODY, screen_guard=_clear_screen)
-        self.assertEqual(wait.timeouts, [DEFAULT_WAIT_TIMEOUT_MS, 21000])
+        self.assertEqual(wait.timeouts, [DEFAULT_WAIT_TIMEOUT_MS, 11000])
+
+    def test_error_resend_window_above_fifteen_seconds_is_rejected(self) -> None:
+        # 実装要件 2 の「再待機は最大15秒」は *maximum* であって default ではない。
+        # positive チェックだけでは 21 秒を構成できてしまい要件に反する
+        # (audit j#102755 finding 2)。clamp ではなく construction で拒否する。
+        reader = FakeReader()
+        transport = FakeTransport()
+        wait = FakeWait(WaitResult.changed())
+        self.assertEqual(MAX_ERROR_RESEND_WAIT_TIMEOUT_MS, 15000)
+        self.assertEqual(
+            DEFAULT_ERROR_RESEND_WAIT_TIMEOUT_MS, MAX_ERROR_RESEND_WAIT_TIMEOUT_MS
+        )
+        for over_limit in (15001, 21000, 60000):
+            with self.assertRaises(TurnStartRailError):
+                HerdrTurnStartRail(
+                    transport=transport,
+                    reader=reader,
+                    wait=wait,
+                    error_resend_wait_timeout_ms=over_limit,
+                )
+        # The maximum itself is admissible (a boundary, not an exclusive bound).
+        HerdrTurnStartRail(
+            transport=transport,
+            reader=reader,
+            wait=wait,
+            error_resend_wait_timeout_ms=MAX_ERROR_RESEND_WAIT_TIMEOUT_MS,
+        )
 
     def test_still_unconfirmed_after_resend_is_delivered_not_started(self) -> None:
         # 受け入れ条件: 再送後に確認できなければ開始未確認として記録する。
@@ -789,6 +846,165 @@ class WaitErrorEnterResendTests(unittest.TestCase):
         self.assertEqual(result.enter_resends, 0)
         self.assertEqual(result.resend_skipped_reason, RESEND_SKIP_RECEIVER_BLOCKED)
         self.assertEqual(len(transport.send_keys_calls), 1)
+
+    def test_no_error_resend_when_the_re_snapshot_read_fails(self) -> None:
+        # 除外条件「read失敗」 (audit j#102755 finding 1). `AgentStateResult` forces
+        # `state=unknown` on a mechanical failure, so a bare `!= blocked` test would
+        # press Enter on the strength of a read that never happened — fail-OPEN.
+        reader = FakeReader(
+            AgentStateResult.observed(RUNTIME_AWAITING_INPUT),
+            AgentStateResult.failure(REASON_TRANSPORT_ERROR),
+        )
+        transport = FakeTransport(read_pane=[PaneReadResult.success(BODY)])
+        wait = FakeWait(WaitResult.error())
+        result = _rail(reader, transport, wait, max_enter_resends=1).drive_turn_start(
+            TARGET, BODY, screen_guard=_clear_screen
+        )
+        self.assertEqual(result.outcome, OUTCOME_DELIVERED_NOT_STARTED)
+        self.assertEqual(result.enter_resends, 0)
+        self.assertEqual(result.resend_skipped_reason, RESEND_SKIP_STATE_UNREADABLE)
+        self.assertEqual(len(transport.send_keys_calls), 1)
+
+    def test_no_error_resend_on_an_observed_unknown_or_busy_receiver(self) -> None:
+        # A read can SUCCEED and still carry `unknown` (an unrecognised status), and
+        # `busy` means a turn is already running. Neither is a confirmed idle receiver,
+        # so the gate demands positive membership of the injectable set rather than the
+        # absence of `blocked`.
+        for state in (RUNTIME_UNKNOWN, RUNTIME_BUSY):
+            with self.subTest(state=state):
+                reader = FakeReader(
+                    AgentStateResult.observed(RUNTIME_AWAITING_INPUT),
+                    AgentStateResult.observed(state),
+                )
+                transport = FakeTransport(read_pane=[PaneReadResult.success(BODY)])
+                wait = FakeWait(WaitResult.error())
+                result = _rail(
+                    reader, transport, wait, max_enter_resends=1
+                ).drive_turn_start(TARGET, BODY, screen_guard=_clear_screen)
+                self.assertEqual(result.enter_resends, 0)
+                self.assertEqual(
+                    result.resend_skipped_reason, RESEND_SKIP_STATE_NOT_INJECTABLE
+                )
+                self.assertEqual(len(transport.send_keys_calls), 1)
+
+    def test_turn_ended_re_snapshot_admits_the_resend(self) -> None:
+        # The injectable set is the SAME one the pre-injection precondition uses, so
+        # `turn_ended` (herdr `done`, a static state) admits the resend just as it
+        # admits the original injection — the gate is strict, not arbitrary.
+        reader = FakeReader(
+            AgentStateResult.observed(RUNTIME_AWAITING_INPUT),
+            AgentStateResult.observed(RUNTIME_TURN_ENDED),
+        )
+        transport = FakeTransport(read_pane=[PaneReadResult.success(BODY)])
+        wait = FakeWait(WaitResult.error(), WaitResult.changed())
+        result = _rail(reader, transport, wait, max_enter_resends=1).drive_turn_start(
+            TARGET, BODY, screen_guard=_clear_screen
+        )
+        self.assertEqual(result.outcome, OUTCOME_STARTED)
+        self.assertEqual(result.enter_resends, 1)
+
+    # --- target identity revalidation (audit j#102755 finding 3) ------------------
+    def test_no_error_resend_when_the_target_identity_drifted(self) -> None:
+        # 除外条件「対象の識別情報変更」. A locator is transient: the pane can be killed
+        # and its id reused, or the lane relaunched, inside the 8–15s wait window. The
+        # outer identity gates all ran BEFORE the drive and none re-runs mid-drive, so
+        # without this check the extra Enter can land on an agent that never got a body.
+        probe = FakeIdentityProbe(IDENTITY, "mzb1_ws_claude_otherlane")
+        reader = FakeReader(AgentStateResult.observed(RUNTIME_AWAITING_INPUT))
+        transport = FakeTransport(read_pane=[PaneReadResult.success(BODY)])
+        wait = FakeWait(WaitResult.error())
+        result = _rail(
+            reader, transport, wait, max_enter_resends=1, identity_probe=probe
+        ).drive_turn_start(TARGET, BODY, screen_guard=_clear_screen)
+        self.assertEqual(result.outcome, OUTCOME_DELIVERED_NOT_STARTED)
+        self.assertEqual(result.enter_resends, 0)
+        self.assertEqual(result.resend_skipped_reason, RESEND_SKIP_IDENTITY_DRIFT)
+        self.assertEqual(len(transport.send_keys_calls), 1)
+        # Probed once before injection and once before the resend — never memoised.
+        self.assertEqual(probe.calls, [TARGET, TARGET])
+
+    def test_no_error_resend_without_a_bound_identity_probe(self) -> None:
+        reader = FakeReader(AgentStateResult.observed(RUNTIME_AWAITING_INPUT))
+        transport = FakeTransport(read_pane=[PaneReadResult.success(BODY)])
+        wait = FakeWait(WaitResult.error())
+        result = _rail(
+            reader, transport, wait, max_enter_resends=1, identity_probe=None
+        ).drive_turn_start(TARGET, BODY, screen_guard=_clear_screen)
+        self.assertEqual(result.enter_resends, 0)
+        self.assertEqual(
+            result.resend_skipped_reason, RESEND_SKIP_IDENTITY_PROBE_UNBOUND
+        )
+        # Refused before any pane read — an unbound probe costs nothing.
+        self.assertEqual(transport.read_pane_calls, [])
+        self.assertEqual(len(transport.send_keys_calls), 1)
+
+    def test_no_error_resend_when_the_identity_cannot_be_established(self) -> None:
+        # Either end unresolvable is a refusal: an unreadable listing before injection
+        # leaves nothing to compare against, and one at resend time cannot rule drift out.
+        for tokens in ((None, IDENTITY), (IDENTITY, None), (None, None)):
+            with self.subTest(tokens=tokens):
+                reader = FakeReader(AgentStateResult.observed(RUNTIME_AWAITING_INPUT))
+                transport = FakeTransport(read_pane=[PaneReadResult.success(BODY)])
+                wait = FakeWait(WaitResult.error())
+                result = _rail(
+                    reader,
+                    transport,
+                    wait,
+                    max_enter_resends=1,
+                    identity_probe=FakeIdentityProbe(*tokens),
+                ).drive_turn_start(TARGET, BODY, screen_guard=_clear_screen)
+                self.assertEqual(result.enter_resends, 0)
+                self.assertEqual(
+                    result.resend_skipped_reason, RESEND_SKIP_IDENTITY_UNCONFIRMED
+                )
+                self.assertEqual(len(transport.send_keys_calls), 1)
+
+    def test_a_raising_identity_probe_refuses_the_resend(self) -> None:
+        def _explodes(_target):
+            raise RuntimeError("agent list failed")
+
+        reader = FakeReader(AgentStateResult.observed(RUNTIME_AWAITING_INPUT))
+        transport = FakeTransport(read_pane=[PaneReadResult.success(BODY)])
+        wait = FakeWait(WaitResult.error())
+        result = _rail(
+            reader, transport, wait, max_enter_resends=1, identity_probe=_explodes
+        ).drive_turn_start(TARGET, BODY, screen_guard=_clear_screen)
+        self.assertEqual(result.enter_resends, 0)
+        self.assertEqual(
+            result.resend_skipped_reason, RESEND_SKIP_IDENTITY_UNCONFIRMED
+        )
+
+    def test_blank_identity_tokens_never_compare_equal(self) -> None:
+        # Two unresolvable answers must not satisfy the drift check by both being "".
+        reader = FakeReader(AgentStateResult.observed(RUNTIME_AWAITING_INPUT))
+        transport = FakeTransport(read_pane=[PaneReadResult.success(BODY)])
+        wait = FakeWait(WaitResult.error())
+        result = _rail(
+            reader,
+            transport,
+            wait,
+            max_enter_resends=1,
+            identity_probe=FakeIdentityProbe("   ", "   "),
+        ).drive_turn_start(TARGET, BODY, screen_guard=_clear_screen)
+        self.assertEqual(result.enter_resends, 0)
+        self.assertEqual(
+            result.resend_skipped_reason, RESEND_SKIP_IDENTITY_UNCONFIRMED
+        )
+
+    def test_timeout_path_does_not_consult_the_identity_probe(self) -> None:
+        # 実装要件 5: the timeout gate keeps its original two checks. The probe is still
+        # sampled once before injection (the baseline), but the timeout gate never asks
+        # it, so a drifted identity does not change that path's behaviour.
+        probe = FakeIdentityProbe(IDENTITY, "mzb1_ws_claude_otherlane")
+        reader = FakeReader(AgentStateResult.observed(RUNTIME_AWAITING_INPUT))
+        transport = FakeTransport(read_pane=[PaneReadResult.success(BODY)])
+        wait = FakeWait(WaitResult.timeout(), WaitResult.changed())
+        result = _rail(
+            reader, transport, wait, max_enter_resends=1, identity_probe=probe
+        ).drive_turn_start(TARGET, BODY, screen_guard=_trust_screen)
+        self.assertEqual(result.outcome, OUTCOME_STARTED)
+        self.assertEqual(result.enter_resends, 1)
+        self.assertEqual(probe.calls, [TARGET])
 
     def test_error_resend_enter_send_failure_stops_the_rail(self) -> None:
         events: list = []

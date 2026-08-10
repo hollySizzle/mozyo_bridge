@@ -783,6 +783,39 @@ def rebind_by_name(
     )
 
 
+def occupant_of_locator(
+    locator: object, agents: Sequence[Mapping[str, object]]
+) -> Optional[str]:
+    """The durable assigned name currently holding ``locator``, or ``None`` (pure).
+
+    The inverse direction of :func:`rebind_by_name`: that one answers "where is this
+    agent now", this one answers "who is at this pane now". It is the identity
+    revalidation the turn-start rail's WAIT_ERROR Enter-resend needs (Redmine #15202,
+    audit j#102755 finding 3) — a locator is *transient*, so a pane that was killed and
+    had its id reused, or a lane relaunched inside the 8–15s wait window, addresses a
+    different agent than the one the send was authorised against. Comparing this token
+    before injection and again before the extra Enter is what makes that detectable.
+
+    Pure and fail-closed: it reads a caller-supplied ``agent list`` snapshot and never
+    lists on its own (the caller owns freshness — a memoised snapshot would make the
+    comparison vacuous). ``None`` whenever the answer is not unambiguous: a blank
+    locator, no matching row, a row with a blank name, or **more than one** row claiming
+    the same locator (a herdr uniqueness violation — refuse to guess, exactly as
+    :data:`REBIND_AMBIGUOUS` does).
+    """
+    wanted = _norm(locator)
+    if not wanted:
+        return None
+    names = [
+        _norm(agent.get(AGENT_KEY_NAME))
+        for agent in agents
+        if isinstance(agent, Mapping) and _agent_locator(agent) == wanted
+    ]
+    if len(names) != 1 or not names[0]:
+        return None
+    return names[0]
+
+
 def _agent_locator(agent: Mapping[str, object]) -> str:
     """Read the transient pane locator from an ``agent list`` row (fail-soft)."""
     locator = _norm(agent.get(AGENT_KEY_LOCATOR))
@@ -828,5 +861,6 @@ __all__ = (
     "decode_assigned_name",
     "encode_assigned_name",
     "encode_field",
+    "occupant_of_locator",
     "rebind_by_name",
 )

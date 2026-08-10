@@ -30,6 +30,39 @@ What is here, and why each piece is shaped the way it is:
 Nothing here can *send* anything: there is no transport in reach. A guard's only
 possible effect is to STOP an Enter, never to press one — declaring a screen never
 authorises answering it (#13760 境界).
+
+The WAIT_ERROR gate conditions (Redmine #15202, audit j#102755)
+---------------------------------------------------------------
+The rail's timeout-armed resend asks two questions; the error-armed resend asks six,
+and the asymmetry is the point. A timeout is a *positive* observation (the wait ran
+and saw no transition); an error is the **absence** of an observation, so before
+pressing Enter into a pane it cannot characterise, the rail must positively establish
+who holds the target and what is on it. Each condition is fail-closed — "could not
+determine" is always a refusal, never a pass:
+
+1. ``screen_guard`` is bound. Without a classifier the rail cannot rule out a trust /
+   login / update-selection screen, and #13760 is exactly what a blind Enter into one
+   costs (the request body is destroyed while the transport reports ``sent``).
+2. ``identity_probe`` is bound, and the target's identity was established before
+   injection **and** is byte-identical now. Every outer identity gate (target
+   resolution, ``--target-repo``, startup admission) runs *before* the drive and none
+   re-runs mid-drive, so nothing else guarantees the locator still addresses the same
+   agent 8–15s later — a pane can be killed and its id reused, or a lane relaunched,
+   inside the wait window. Identity is checked *before* the pane read because re-reading
+   a pane a different agent now owns is already reading the wrong thing.
+3. The pane reads, and is not blank. An unreadable or blank pane is never "clear" —
+   #13760's live lane saw an empty pane *after* a dialog ate the body.
+4. The guard finds no declared startup screen. Checked before the body check, so a
+   modal rendering over a still-visible body is reported as the screen it is.
+5. The injected body is still in the composer (:func:`composer_retains_body`) — the
+   stuck-Enter signature. A cleared composer means the turn already consumed it.
+6. A runtime re-snapshot **positively** confirms an injectable receiver — not merely
+   "did not say blocked". ``AgentStateResult`` forces ``state=unknown`` on a mechanical
+   read failure, so a bare ``!= blocked`` test admits a resend on a read that never
+   happened (the fail-OPEN this gate's first version shipped with). The read must
+   succeed *and* the state must be injectable: ``blocked`` is a permission prompt Enter
+   would answer, ``busy`` means a turn is already running, ``unknown`` is not an
+   observation.
 """
 
 from __future__ import annotations
@@ -46,6 +79,11 @@ RESEND_SKIP_STARTUP_SCREEN = "startup_screen"  # the guard matched a declared st
 RESEND_SKIP_SCREEN_GUARD_UNBOUND = "screen_guard_unbound"  # no classifier — cannot rule #13760 out
 RESEND_SKIP_RECEIVER_BLOCKED = "receiver_blocked"  # a runtime permission prompt is on screen
 RESEND_SKIP_ENTER_SEND_FAILED = "enter_send_failed"  # the resend's send_keys transport step failed
+RESEND_SKIP_STATE_UNREADABLE = "state_unreadable"  # the runtime re-snapshot read failed
+RESEND_SKIP_STATE_NOT_INJECTABLE = "state_not_injectable"  # observed busy / unknown — not a confirmed idle receiver
+RESEND_SKIP_IDENTITY_PROBE_UNBOUND = "identity_probe_unbound"  # no way to re-verify who holds the target
+RESEND_SKIP_IDENTITY_UNCONFIRMED = "identity_unconfirmed"  # the probe could not establish an identity
+RESEND_SKIP_IDENTITY_DRIFT = "identity_drift"  # a DIFFERENT agent now holds the target locator
 
 RESEND_SKIP_REASONS: frozenset[str] = frozenset(
     {
@@ -58,8 +96,23 @@ RESEND_SKIP_REASONS: frozenset[str] = frozenset(
         RESEND_SKIP_SCREEN_GUARD_UNBOUND,
         RESEND_SKIP_RECEIVER_BLOCKED,
         RESEND_SKIP_ENTER_SEND_FAILED,
+        RESEND_SKIP_STATE_UNREADABLE,
+        RESEND_SKIP_STATE_NOT_INJECTABLE,
+        RESEND_SKIP_IDENTITY_PROBE_UNBOUND,
+        RESEND_SKIP_IDENTITY_UNCONFIRMED,
+        RESEND_SKIP_IDENTITY_DRIFT,
     }
 )
+
+#: The injected read-only target-identity probe the WAIT_ERROR resend gate requires
+#: (Redmine #15202, audit j#102755 finding 3). Given the target locator it returns an
+#: opaque token naming *who currently holds it* — under herdr, the durable assigned
+#: name the locator rebinds to against a FRESH ``agent list`` snapshot — or ``None``
+#: when that cannot be established. The rail captures one token before injecting and
+#: requires an exact match before it re-sends Enter, so a pane that was recycled,
+#: relaunched, or reassigned in the wait window can never receive the extra Enter.
+#: A memoised probe would make the comparison vacuous: it MUST re-read.
+ResendIdentityProbe = Callable[[str], Optional[str]]
 
 #: The injected pane classifier the WAIT_ERROR resend gate requires (Redmine #15202).
 #: Takes the pane's rendered text; returns a fixed blocker token when a declared startup
@@ -113,6 +166,25 @@ def composer_retains_body(content: object, text: object) -> bool:
     return body in _strip_all_ws(content)
 
 
+def probe_identity(probe: ResendIdentityProbe, target: str) -> Optional[str]:
+    """The probe's token for ``target``, or ``None`` when it cannot be established.
+
+    Fail-closed and total: a probe that raises (a listing failure, an unresolvable
+    workspace, a herdr fault) is indistinguishable from "I cannot tell you who holds
+    this pane", which is exactly the case the resend must refuse. A blank or
+    non-string token is normalised to ``None`` for the same reason — an empty identity
+    would otherwise compare equal to another empty identity and pass the drift check.
+    """
+    try:
+        token = probe(target)
+    except (Exception, SystemExit):
+        return None
+    if not isinstance(token, str):
+        return None
+    token = token.strip()
+    return token or None
+
+
 def screen_guard_detects(screen_guard: ResendScreenGuard, content: str) -> bool:
     """True when the guard reports a startup / permission / selection screen (pure).
 
@@ -133,13 +205,20 @@ __all__ = (
     "RESEND_SKIP_BUDGET_EXHAUSTED",
     "RESEND_SKIP_DISABLED",
     "RESEND_SKIP_ENTER_SEND_FAILED",
+    "RESEND_SKIP_IDENTITY_DRIFT",
+    "RESEND_SKIP_IDENTITY_PROBE_UNBOUND",
+    "RESEND_SKIP_IDENTITY_UNCONFIRMED",
     "RESEND_SKIP_NONE",
     "RESEND_SKIP_PANE_UNREADABLE",
     "RESEND_SKIP_REASONS",
     "RESEND_SKIP_RECEIVER_BLOCKED",
     "RESEND_SKIP_SCREEN_GUARD_UNBOUND",
     "RESEND_SKIP_STARTUP_SCREEN",
+    "RESEND_SKIP_STATE_NOT_INJECTABLE",
+    "RESEND_SKIP_STATE_UNREADABLE",
+    "ResendIdentityProbe",
     "ResendScreenGuard",
     "composer_retains_body",
+    "probe_identity",
     "screen_guard_detects",
 )

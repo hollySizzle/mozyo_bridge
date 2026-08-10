@@ -50,6 +50,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     derive_lane_workspace_token,
     encode_assigned_name,
     encode_field,
+    occupant_of_locator,
     rebind_by_name,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (  # noqa: E501
@@ -250,6 +251,63 @@ class IdentityTypeTest(unittest.TestCase):
     def test_construction_fails_closed_on_empty_required(self) -> None:
         with self.assertRaises(HerdrIdentityError):
             HerdrAgentIdentity(workspace_id="", role="claude")
+
+
+
+class OccupantOfLocatorTest(unittest.TestCase):
+    """occupant_of_locator answers "who holds this pane now", fail-closed (#15202).
+
+    The inverse of :func:`rebind_by_name`, and the identity revalidation the turn-start
+    rail's WAIT_ERROR Enter-resend compares before and after the wait (audit j#102755
+    finding 3). A locator is transient, so anything short of exactly one unambiguous
+    answer must be ``None`` — the rail reads ``None`` as "unconfirmed" and withholds
+    the extra Enter rather than press it into a pane whose occupant it cannot name.
+    """
+
+    def setUp(self) -> None:
+        self.name = encode_assigned_name("ws", "claude", "lane15202")
+
+    def test_resolves_the_holder_of_a_locator(self) -> None:
+        agents = [
+            {"name": "someone_else", "pane_id": "w0:p0"},
+            {"name": self.name, "pane_id": "w1:p1"},
+        ]
+        self.assertEqual(occupant_of_locator("w1:p1", agents), self.name)
+
+    def test_locator_aliases_resolve(self) -> None:
+        # Same alias precedence rebind_by_name uses: pane_id, then pane, then location.
+        for key in ("pane_id", "pane", "location"):
+            with self.subTest(key=key):
+                self.assertEqual(
+                    occupant_of_locator("w1:p1", [{"name": self.name, key: "w1:p1"}]),
+                    self.name,
+                )
+
+    def test_unknown_locator_is_none(self) -> None:
+        agents = [{"name": self.name, "pane_id": "w1:p1"}]
+        self.assertIsNone(occupant_of_locator("w9:p9", agents))
+        self.assertIsNone(occupant_of_locator("w1:p1", []))
+
+    def test_ambiguous_locator_is_none(self) -> None:
+        # Two rows claiming one pane is a herdr uniqueness violation. Refuse to guess,
+        # exactly as REBIND_AMBIGUOUS does — picking either would fabricate an identity.
+        agents = [
+            {"name": self.name, "pane_id": "w1:p1"},
+            {"name": "other_agent", "pane_id": "w1:p1"},
+        ]
+        self.assertIsNone(occupant_of_locator("w1:p1", agents))
+
+    def test_blank_locator_or_blank_name_is_none(self) -> None:
+        # A blank identity would compare equal to another blank one and pass a drift
+        # check that never actually confirmed anything.
+        self.assertIsNone(occupant_of_locator("", [{"name": self.name, "pane_id": ""}]))
+        self.assertIsNone(occupant_of_locator("   ", []))
+        self.assertIsNone(occupant_of_locator("w1:p1", [{"name": "  ", "pane_id": "w1:p1"}]))
+        self.assertIsNone(occupant_of_locator(None, [{"name": self.name, "pane_id": "w1:p1"}]))
+
+    def test_malformed_rows_are_skipped_not_raised(self) -> None:
+        agents = ["not-a-row", 42, None, {"name": self.name, "pane_id": "w1:p1"}]
+        self.assertEqual(occupant_of_locator("w1:p1", agents), self.name)
 
 
 class RebindTest(unittest.TestCase):
