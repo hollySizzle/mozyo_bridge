@@ -25,9 +25,11 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     ADMISSION_BLOCKED,
     ADMISSION_UNKNOWN_PROVIDER,
     ADMISSION_UNREADABLE,
+    RESEND_GUARD_UNCLASSIFIABLE_PROVIDER,
     StartupAdmission,
     StartupAdmissionError,
     evaluate_startup_admission,
+    make_resend_screen_guard,
     startup_admission_record_lines,
 )
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile import (
@@ -539,6 +541,52 @@ class StartupAdmissionRecordTest(unittest.TestCase):
     def test_unknown_outcome_token_is_rejected(self) -> None:
         with self.assertRaises(StartupAdmissionError):
             StartupAdmission(outcome="probably_fine", provider_id="claude")
+
+
+class ResendScreenGuardTest(unittest.TestCase):
+    """The Redmine #15202 resend-time classifier bound from the same profile data.
+
+    The turn-start rail's WAIT_ERROR Enter-resend may only fire once a startup screen is
+    positively ruled OUT. This factory is how the pure domain rail gets that answer
+    without ever holding a provider string of its own.
+    """
+
+    def test_a_declared_screen_returns_its_blocker_id(self) -> None:
+        guard = make_resend_screen_guard("claude", registry=AGENT_PROVIDER_PROFILES)
+        self.assertEqual(guard(TRUST_SCREEN), "workspace_trust_confirmation")
+
+    def test_a_ready_composer_returns_none(self) -> None:
+        # The whole value of the guard: it must not refuse the resend on a real
+        # composer, or the #15199 shape it exists to fix stays unfixed.
+        guard = make_resend_screen_guard("claude", registry=AGENT_PROVIDER_PROFILES)
+        self.assertIsNone(guard(IDLE_COMPOSER))
+
+    def test_an_unprofiled_provider_fails_closed(self) -> None:
+        # Never guess that a provider we cannot describe has no startup screen — the
+        # rail reads any non-None token as "do not press Enter".
+        guard = make_resend_screen_guard("nosuchprovider")
+        self.assertEqual(guard(IDLE_COMPOSER), RESEND_GUARD_UNCLASSIFIABLE_PROVIDER)
+        self.assertIsNotNone(guard(TRUST_SCREEN))
+
+    def test_a_blank_provider_id_fails_closed(self) -> None:
+        for provider_id in ("", "   "):
+            guard = make_resend_screen_guard(provider_id)
+            self.assertEqual(guard(IDLE_COMPOSER), RESEND_GUARD_UNCLASSIFIABLE_PROVIDER)
+
+    def test_the_guard_returns_a_token_never_the_pane_text(self) -> None:
+        # A startup screen renders a workspace path and the rail's verdict lands in a
+        # pasteable durable record; only the fixed id may cross back.
+        guard = make_resend_screen_guard("claude", registry=AGENT_PROVIDER_PROFILES)
+        verdict = guard(TRUST_SCREEN)
+        self.assertNotIn(_WORKSPACE_PATH, verdict)
+        self.assertNotIn("\n", verdict)
+
+    def test_the_guard_only_stops_an_enter_it_never_sends_one(self) -> None:
+        # A structural statement of the #13760 境界: the classifier is a pure function of
+        # (profile data, pane text) with no transport in reach — detecting a screen can
+        # never become answering it.
+        guard = make_resend_screen_guard("claude", registry=AGENT_PROVIDER_PROFILES)
+        self.assertEqual(guard.__code__.co_freevars, ("profile",))
 
 
 if __name__ == "__main__":  # pragma: no cover

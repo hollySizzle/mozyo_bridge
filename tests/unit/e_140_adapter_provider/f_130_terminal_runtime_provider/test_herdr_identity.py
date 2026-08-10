@@ -50,6 +50,8 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     derive_lane_workspace_token,
     encode_assigned_name,
     encode_field,
+    occupant_of_locator,
+    process_generation_of_locator,
     rebind_by_name,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (  # noqa: E501
@@ -250,6 +252,148 @@ class IdentityTypeTest(unittest.TestCase):
     def test_construction_fails_closed_on_empty_required(self) -> None:
         with self.assertRaises(HerdrIdentityError):
             HerdrAgentIdentity(workspace_id="", role="claude")
+
+
+
+class OccupantOfLocatorTest(unittest.TestCase):
+    """occupant_of_locator answers "who holds this pane now", fail-closed (#15202).
+
+    The inverse of :func:`rebind_by_name`, and the identity revalidation the turn-start
+    rail's WAIT_ERROR Enter-resend compares before and after the wait (audit j#102755
+    finding 3). A locator is transient, so anything short of exactly one unambiguous
+    answer must be ``None`` — the rail reads ``None`` as "unconfirmed" and withholds
+    the extra Enter rather than press it into a pane whose occupant it cannot name.
+    """
+
+    def setUp(self) -> None:
+        self.name = encode_assigned_name("ws", "claude", "lane15202")
+
+    def test_resolves_the_holder_of_a_locator(self) -> None:
+        agents = [
+            {"name": "someone_else", "pane_id": "w0:p0"},
+            {"name": self.name, "pane_id": "w1:p1"},
+        ]
+        self.assertEqual(occupant_of_locator("w1:p1", agents), self.name)
+
+    def test_locator_aliases_resolve(self) -> None:
+        # Same alias precedence rebind_by_name uses: pane_id, then pane, then location.
+        for key in ("pane_id", "pane", "location"):
+            with self.subTest(key=key):
+                self.assertEqual(
+                    occupant_of_locator("w1:p1", [{"name": self.name, key: "w1:p1"}]),
+                    self.name,
+                )
+
+    def test_unknown_locator_is_none(self) -> None:
+        agents = [{"name": self.name, "pane_id": "w1:p1"}]
+        self.assertIsNone(occupant_of_locator("w9:p9", agents))
+        self.assertIsNone(occupant_of_locator("w1:p1", []))
+
+    def test_ambiguous_locator_is_none(self) -> None:
+        # Two rows claiming one pane is a herdr uniqueness violation. Refuse to guess,
+        # exactly as REBIND_AMBIGUOUS does — picking either would fabricate an identity.
+        agents = [
+            {"name": self.name, "pane_id": "w1:p1"},
+            {"name": "other_agent", "pane_id": "w1:p1"},
+        ]
+        self.assertIsNone(occupant_of_locator("w1:p1", agents))
+
+    def test_blank_locator_or_blank_name_is_none(self) -> None:
+        # A blank identity would compare equal to another blank one and pass a drift
+        # check that never actually confirmed anything.
+        self.assertIsNone(occupant_of_locator("", [{"name": self.name, "pane_id": ""}]))
+        self.assertIsNone(occupant_of_locator("   ", []))
+        self.assertIsNone(occupant_of_locator("w1:p1", [{"name": "  ", "pane_id": "w1:p1"}]))
+        self.assertIsNone(occupant_of_locator(None, [{"name": self.name, "pane_id": "w1:p1"}]))
+
+    def test_malformed_rows_are_skipped_not_raised(self) -> None:
+        agents = ["not-a-row", 42, None, {"name": self.name, "pane_id": "w1:p1"}]
+        self.assertEqual(occupant_of_locator("w1:p1", agents), self.name)
+
+
+class ProcessGenerationOfLocatorTest(unittest.TestCase):
+    """The resend token combines terminal identity with a conservative revision fence.
+
+    Herdr ``AgentInfo.terminal_id`` identifies the server-owned terminal. Its row
+    ``revision`` mirrors mutable ``terminal.revision`` and is therefore pinned only to
+    fail closed on intervening changes, never described as process-generation proof.
+    """
+
+    def setUp(self) -> None:
+        self.name = encode_assigned_name("ws", "claude", "lane15202")
+
+    def _row(self, *, terminal_id="term_a", revision=41, agent_status="idle"):
+        return {
+            "name": self.name,
+            "pane_id": "w1:p1",
+            "terminal_id": terminal_id,
+            "revision": revision,
+            "agent_status": agent_status,
+        }
+
+    def test_runtime_state_churn_preserves_the_live_target_token(self) -> None:
+        before = process_generation_of_locator(
+            "w1:p1", [self._row(agent_status="working")]
+        )
+        after = process_generation_of_locator(
+            "w1:p1", [self._row(agent_status="done")]
+        )
+        self.assertIsNotNone(before)
+        self.assertEqual(before, after)
+
+    def test_revision_bump_changes_the_conservative_snapshot_token(self) -> None:
+        before = process_generation_of_locator("w1:p1", [self._row(revision=41)])
+        changed = process_generation_of_locator("w1:p1", [self._row(revision=42)])
+        self.assertIsNotNone(before)
+        self.assertIsNotNone(changed)
+        self.assertNotEqual(before, changed)
+
+    def test_different_terminal_same_name_locator_and_revision_is_different(self) -> None:
+        before = process_generation_of_locator(
+            "w1:p1", [self._row(terminal_id="term_a", revision=41)]
+        )
+        replacement = process_generation_of_locator(
+            "w1:p1", [self._row(terminal_id="term_b", revision=41)]
+        )
+        self.assertIsNotNone(before)
+        self.assertIsNotNone(replacement)
+        self.assertNotEqual(before, replacement)
+
+    def test_missing_or_malformed_terminal_id_fails_closed(self) -> None:
+        malformed = (None, "", " ", " term_a", "term_a ", 41, True, 41.0, object())
+        self.assertIsNone(
+            process_generation_of_locator(
+                "w1:p1",
+                [{"name": self.name, "pane_id": "w1:p1", "revision": 41}],
+            )
+        )
+        for terminal_id in malformed:
+            with self.subTest(terminal_id=terminal_id):
+                self.assertIsNone(
+                    process_generation_of_locator(
+                        "w1:p1", [self._row(terminal_id=terminal_id)]
+                    )
+                )
+
+    def test_missing_or_malformed_revision_fails_closed(self) -> None:
+        malformed = (None, "", "41", True, False, -1, 41.0, object())
+        self.assertIsNone(
+            process_generation_of_locator(
+                "w1:p1",
+                [{"name": self.name, "pane_id": "w1:p1", "terminal_id": "term_a"}],
+            )
+        )
+        for revision in malformed:
+            with self.subTest(revision=revision):
+                self.assertIsNone(
+                    process_generation_of_locator(
+                        "w1:p1", [self._row(revision=revision)]
+                    )
+                )
+
+    def test_ambiguous_locator_fails_closed_even_when_revision_matches(self) -> None:
+        rows = [self._row(), {**self._row(), "name": "other"}]
+        self.assertIsNone(process_generation_of_locator("w1:p1", rows))
 
 
 class RebindTest(unittest.TestCase):
