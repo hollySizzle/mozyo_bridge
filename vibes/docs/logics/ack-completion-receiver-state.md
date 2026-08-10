@@ -145,13 +145,43 @@ turn 開始) を保証していなかったこと。busy / redraw 状態の comp
   本 doc の doctrine と C-u rollback の capture-absence 注意に整合させるため。submit 成功時、codex TUI では
   送信済み marker が transcript に user message として残るので、marker-absence は成功の証拠にならない
   (成功時にも present であり得る)。
-- claude rail と queue-enter rail の挙動は不変。behavioral 正本は
-  `vibes/docs/logics/tmux-send-safety-contract.md` の v0.6 節。本節はその **実測と ACK-layer 位置づけ** を
+- #13166 の変更時点では claude rail と queue-enter rail の挙動は不変だった。後続の Redmine #15242
+  (既定 queue-enter の turn-start 補完) は herdr queue-enter だけを更新する。behavioral 正本は
+  `vibes/docs/logics/tmux-send-safety-contract.md` の v0.6 / v0.21 節。本節は **実測と ACK-layer 位置づけ** を
   記録するだけであり、rail の挙動仕様を再定義しない。
 - これは tmux capture 依存の compat hardening であり、long-term direction ではない。`tmux capture-pane` を
   観測しなくても submit / turn 開始が分かる本命は、依然として sidecar / control-event ベースの
   receiver-state observability (段階 1 以降) と durable-ledger 側にある。#13166 の候補 2 (pending delivery
   ledger) は本 fix の non-goal として明示的に後回しにされた。
+
+### Herdr queue-enter の causal turn-start と確認不能境界 (Redmine #15242)
+
+Redmine #15242 (既定 queue-enter の turn-start 補完) は、同じ偽陽性を既定 Herdr rail で残さないための
+layer 0 hardening である。ただし queue-enter は `busy` な receiver にも request を queue する rail なので、
+idle だけを許す standard `drive_turn_start` を流用しない。
+
+- marker + body は exactly once、first Enter も exactly once。最初の Enter より先に working-transition wait を
+  arm する。causal start が未確認なら、同一 target identity、collision-free launch generation、現在の
+  composer tail にある full marker+body（hard-wrap whitespace のみ正規化）、startup / modal / trust / login /
+  selection screen の非該当、runtime state の read 成功を送信直前に再確認し、追加 Enter を高々一度だけ
+  許す。historical transcript に同じ本文があるだけでは composer retention にならない。
+- `busy` は queue semantics 上、上記の全再確認を通過した追加 Enter を拒む理由ではない。しかし busy snapshot、
+  busy baseline、既存 turn と区別できない event は **submission proof ではない**。pre-Enter state が
+  `awaiting_input` / `turn_ended`、wait がその Enter より先に arm 済み、working transition が観測済み、
+  launch generation が前後で coherent、という因果関係が揃った場合だけ confirmation に使う。
+- `blocked` / `unknown` / state read failure、identity または generation の欠落・drift、current composer からの
+  body 消失、startup/modal 検出、wait の arm 不能は追加 Enter を拒否する。「不明」は安全な retry の根拠では
+  ない。
+- public retry window は初回観測から追加 Enter 後の再観測までの単一 absolute budget で、wait を arm し直しても
+  延長しない。interval は first Enter と extra Enter の最小間隔で、観測待ちにより既に満たしていれば追加 sleep
+  しない。window / interval の `0` または正の sub-millisecond 値は追加 Enter 無効である（first Enter と初回
+  observation は維持し、`0.001` 秒へ切り上げない）。非有限値は本文注入前に拒否する。
+
+確認結果は queue 専用 `queue_enter_turn_start_observation` と queue delivery-ledger rail に残し、standard
+`turn_start_outcome` へ射影しない。後者へ射影すると queue delivery が別 rail として分類され、recovery 判断が
+変わるためである。causal event と coherent generation が無い結果は `uncertain` であり、表層の `sent` / `ok`
+や post-hoc `busy` から `submitted_confirmed` に昇格させない。`uncertain` は本文が届いた可能性を含むので blind
+retry を禁止する。ここまで確認できても task completion ではない。
 
 ### Minimal future runtime event vocabulary
 
@@ -250,7 +280,7 @@ ticket-system signal が増えても、それは layer 3 workflow truth の fres
 
 現行 `mozyo-bridge` の handoff / notify 経路は `tmux capture-pane` を通じた marker observation に依存している。これは現実的な compat layer として正しい選択だが、長期 contract として固定する対象ではない。
 
-- 短期的責務 (現行 tmux runtime に残す): `vibes/docs/logics/tmux-send-safety-contract.md` の `Fail-Closed Conditions` / `Queue-Enter Default Rail` / `### Deterministic Preflight Admission Control` が定める範囲で `wait_for_text` を **observability のため** に呼ぶ。Enter 発行の根拠は strict rail では marker 観測、queue-enter rail では Layer B preflight 通過と durable anchor 整合。いずれの rail でも rendered text は ACK / completion の正本にしない。
+- 短期的責務 (現行 tmux runtime に残す): `vibes/docs/logics/tmux-send-safety-contract.md` の `Fail-Closed Conditions` / `Queue-Enter Default Rail` / `### Deterministic Preflight Admission Control` が定める範囲で `wait_for_text` を **observability のため** に呼ぶ。Enter 発行の根拠は strict rail では marker 観測、tmux queue-enter では Layer B preflight 通過と durable anchor 整合。Herdr queue-enter の追加 Enter では、同文書 v0.21 の causal event / identity / generation gate に加えて、last prompt 以降の **current composer tail** に exact marker+body があることだけを retention evidence とする。scrollback 全体の substring は使わない。この current-composer check も retry を止めるための必要条件であって、ACK / completion の正本ではない。
 - 長期方向: rendered text 観測は **fallback** であり、本命は sidecar / control-event ベースの machine-readable signal (`runtime.input.ack` / `runtime.process.exited` / `runtime.output.eof` 等) を、provider normalizer / event classifier 経由で agentd 内 durable event store に正規化する経路。詳細は `mozyo_bridge_pty/vibes/docs/specs/agentd-sidecar-ipc.md`、`mozyo_bridge_pty/vibes/docs/specs/pty-event-normalization.md`、`mozyo_bridge_pty/vibes/docs/specs/event-classifier-module-structure.md`。
 
 「capture-pane を強化する」「marker wrap 補修を入れる」方向の改善は、短期 wrap shape 起因の `marker_timeout` を救うための **compat fix** であって long-term contract の昇格ではない。doctrine 上の long-term direction は「rendered text を観測しなくても良くなる側」であり、それは PTY-first runtime の sidecar / control-event 経路でしか整わない。
@@ -323,6 +353,10 @@ doctrine としての position:
 6. **handoff の durable wording は ACK 層の正本**として書く。completion / processing の含意を持たせない。受領契約は引き続き「receiver は durable anchor を読む」であり、pane の rendered text に依存させない。
 7. **owner approval / review / close を runtime signal で自動化しない**。`runtime.input.ack`、`runtime.output.eof`、`assistant_turn_finished`、ticket webhook のいずれも、Review Gate / owner close approval / Close Gate の代替ではない。
 8. **ticket-system signal は provider 境界に閉じる**。Redmine / Asana の status、journal、approval record を読む場合は ticket provider adapter / governed workflow の layer 3 record として扱い、terminal runtime adapter や sidecar の ACK state に混ぜない。
+9. **Herdr queue-enter の確認不能を自動再送へ読み替えない**。本文が既に composer にある可能性があるため、
+   causal event + coherent generation が欠ける結果は `uncertain` とし、同じ gateway command や本文を再実行
+   しない。rail 内で許される補完は、current composer と同一 target / generation を再証明した高々1回の
+   Enter-only resend だけである。
 
 ## Receiver-side recovery admission と、その保証境界 (Redmine #13910)
 

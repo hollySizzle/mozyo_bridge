@@ -179,9 +179,11 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     RESEND_SKIP_STARTUP_SCREEN,
     RESEND_SKIP_STATE_NOT_INJECTABLE,
     RESEND_SKIP_STATE_UNREADABLE,
+    RESEND_SKIP_WAIT_UNARMED,
     ResendIdentityProbe,
     ResendScreenGuard,
     composer_retains_body,
+    current_composer_retains_body,
     probe_identity,
     screen_guard_detects,
 )
@@ -597,12 +599,11 @@ class HerdrTurnStartRail:
 
         Exposed read-only so a caller that already holds the resolved herdr rail
         (stashed on ``commands.active_herdr_turn_start_rail`` for a herdr send) can
-        take a read-only runtime-state snapshot without resolving a second reader
-        from config. Used by the queue-enter post-choreography turn-start
-        observation (Redmine #13292): that path does NOT drive the rail (no
-        ``drive_turn_start``, no injection ownership, no ``precondition_not_idle``
-        fail-close) — it only borrows the reader for an additive, telemetry-only
-        ``agent get`` snapshot.
+        take runtime-state snapshots without resolving a second reader from config.
+        The queue-enter path borrows it for its pre-Enter causal baseline, strict
+        at-most-once resend gate, and post-choreography snapshot (#13292 / #15242).
+        That path still does NOT call ``drive_turn_start`` or transfer injection
+        ownership, because queue-enter deliberately permits a busy receiver.
         """
         return self._reader
 
@@ -625,6 +626,25 @@ class HerdrTurnStartRail:
                 f"visible-pane read failed for {target!r}: {read.reason or 'unreadable'}"
             )
         return read.content
+
+    def arm_turn_start_wait(self, target: str, *, timeout_ms: int) -> ArmedWait:
+        """Arm this rail's bound working-transition observer without injecting.
+
+        The Herdr queue-enter path owns body injection because it permits a busy
+        receiver, unlike :meth:`drive_turn_start`.  It still must use the exact
+        same bound wait primitive (binary, server and environment) as the standard
+        rail.  This narrow two-stage seam lets that path arm before its Enter
+        without resolving a second provider or reaching into ``_wait``.
+        """
+        if not isinstance(timeout_ms, int) or isinstance(timeout_ms, bool):
+            raise TurnStartRailError(
+                f"timeout_ms must be an int, got {timeout_ms!r}"
+            )
+        if timeout_ms <= 0:
+            raise TurnStartRailError(
+                f"timeout_ms must be positive, got {timeout_ms}"
+            )
+        return self._wait.arm(target, timeout_ms=timeout_ms)
 
     def drive_turn_start(
         self,
@@ -980,6 +1000,7 @@ __all__ = (
     "RESEND_SKIP_STARTUP_SCREEN",
     "RESEND_SKIP_STATE_NOT_INJECTABLE",
     "RESEND_SKIP_STATE_UNREADABLE",
+    "RESEND_SKIP_WAIT_UNARMED",
     "TURN_START_OUTCOMES",
     "WAIT_ABSENT",
     "WAIT_CHANGED",
@@ -995,5 +1016,6 @@ __all__ = (
     "TurnStartWaitPort",
     "WaitResult",
     "composer_retains_body",
+    "current_composer_retains_body",
     "turn_start_rail_record_lines",
 )

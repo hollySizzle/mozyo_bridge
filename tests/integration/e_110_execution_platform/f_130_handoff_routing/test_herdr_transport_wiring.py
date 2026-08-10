@@ -15,7 +15,8 @@ working --timeout <ms>`` event (spawned via ``subprocess.Popen``) and the
 once; an Enter resend never re-injects the body; each of the 6 rail outcomes lands
 on the correct ``(status, reason)`` with the additive ``turn_start_outcome`` +
 telemetry; a not-idle pre-snapshot refuses to inject; and the queue-enter rail is
-unchanged (no rail, byte-compatible ``sent``).
+kept separate from the standard rail while adding its own generation-bound,
+at-most-once Enter fallback. The pending rail remains body-only.
 
 Also covers the fail-closed branches (un-attested sender env, no live target agent)
 and confirms the tmux backend resolves to no binding (byte-identical tmux path).
@@ -193,7 +194,10 @@ class _FakeHerdr:
                 if self._read_returns_body
                 else ""
             )
-            content = f"{self._pane_content}\n{body}" if body else self._pane_content
+            # A retained payload is rendered in the CURRENT composer, not as a
+            # transcript line.  The queue-enter fallback deliberately refuses a
+            # matching historical payload, so the fake must preserve that boundary.
+            content = f"{self._pane_content}\n› {body}" if body else self._pane_content
             return subprocess.CompletedProcess(argv, 0, stdout=content, stderr="")
         raise AssertionError(f"unexpected subprocess call: {argv!r}")
 
@@ -510,6 +514,40 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         outcome = _outcome_from(out)
         self.assertEqual(outcome.get("status"), "sent", msg=out)
         self.assertEqual(outcome.get("reason"), "ok", msg=out)
+        self.assertEqual(
+            len([op for op in herdr.sends if op[0] == "send_text"]), 1,
+            msg=herdr.sends,
+        )
+        self.assertEqual(
+            len([
+                op for op in herdr.sends
+                if op[0] == "send_keys" and str(op[2]).lower() == "enter"
+            ]),
+            1,
+            msg=herdr.sends,
+        )
+        self.assertIsNone(outcome.get("queue_enter_turn_start_observation"), msg=out)
+
+    def test_pending_remains_body_only_without_queue_wait_or_enter(self) -> None:
+        herdr = _FakeHerdr([], get_states=["idle"], wait_results=[(0, "")])
+        result, herdr, ws, out, err = self._run(
+            agent_rows_fn=_same_lane_rows(), herdr=herdr, mode="pending",
+            extra_argv=[
+                "--queue-enter-retry-window", "1",
+                "--queue-enter-retry-interval", "0.001",
+            ],
+        )
+        self.assertEqual(result, 0, msg=f"out={out}\nerr={err}")
+        outcome = _outcome_from(out)
+        self.assertEqual(outcome.get("status"), "pending_input", msg=out)
+        self.assertEqual(
+            len([op for op in herdr.sends if op[0] == "send_text"]), 1,
+            msg=herdr.sends,
+        )
+        self.assertFalse(
+            [op for op in herdr.sends if op[0] in ("send_keys", "wait", "get")],
+            msg=herdr.sends,
+        )
 
     def test_done_turn_ended_injects_and_projects_to_sent_ok(self) -> None:
         # Redmine #13319: herdr holds `done` until the next input, so a follow-up
@@ -676,14 +714,11 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         self.assertEqual(len(enters), 2, msg=f"expected one Enter re-send: {herdr.sends}")
         self.assertIn("1 Enter re-send(s)", out)
 
-    def test_queue_enter_rail_choreography_adds_observation_only_wait_under_herdr(self) -> None:
-        # Redmine #14203 design j#87409 (B, constrained): the queue-enter rail now arms an
-        # OBSERVATION-ONLY `working` wait BEFORE the first Enter (so an immediate
-        # start->turn_ended is captured even when the post-hoc snapshot only sees the settled
-        # state). The wait is telemetry only: the injection (once, no double input), the Enter
-        # choreography, and the `sent`/`ok` wire are UNCHANGED, and the STANDARD event rail's
-        # `turn_start_outcome` field stays absent — the observation lives in the additive v2
-        # `queue_enter_turn_start_observation` fields, never on the wire.
+    def test_queue_enter_rail_arms_its_causal_wait_before_enter_under_herdr(self) -> None:
+        # #14203 introduced the pre-Enter working wait as observation-only; #15242
+        # promotes a generation-coherent result to queue-specific causal evidence and
+        # uses a miss to consider one strictly-gated extra Enter. Injection remains once,
+        # and the STANDARD rail's `turn_start_outcome` field stays absent.
         herdr = _FakeHerdr([], get_states=["working"], wait_results=[(0, "")])
         result, herdr, ws, out, err = self._run(
             agent_rows_fn=_same_lane_rows(), herdr=herdr, mode="queue-enter"
@@ -691,7 +726,7 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         self.assertEqual(result, 0, msg=f"out={out}\nerr={err}")
         outcome = _outcome_from(out)
         self.assertEqual(outcome.get("status"), "sent", msg=out)
-        # The observation-only wait IS now armed (design j#87409) — and BEFORE the first Enter.
+        # The queue-specific wait is armed BEFORE the first Enter.
         wait_ops = [op for op in herdr.sends if op[0] == "wait"]
         self.assertTrue(wait_ops, msg=herdr.sends)
         wait_idx = herdr.sends.index(wait_ops[0])
@@ -705,6 +740,91 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         send_texts = [op for op in herdr.sends if op[0] == "send_text"]
         self.assertEqual(len(send_texts), 1, msg=herdr.sends)
         # The STANDARD event rail's `turn_start_outcome` wire field stays absent on queue-enter.
+        self.assertIsNone(outcome.get("turn_start_outcome"), msg=out)
+
+    def test_queue_enter_timeout_runs_strict_gate_then_rearms_for_one_extra_enter(self) -> None:
+        # #15242: the landing marker is already visible in the current composer, but
+        # the first Enter is absorbed (first event wait times out).  A stable launch
+        # generation plus the exact current-composer body and an idle runtime allow
+        # ONE Enter-only fallback.  The second wait is armed before that Enter and
+        # observes the turn start.  A third canned wait result proves there is no
+        # retry loop beyond the single fallback.
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_tmux_transport_rail import (  # noqa: E501
+            LiveTmuxTransportRailOps,
+        )
+
+        binding = {
+            "provider": "claude",
+            "assigned_name": "mzb1_ws_claude_lane-1",
+            "locator": "wT:pT",
+            "row_revision": "7",
+            "attestation_observed_at": "2026-08-10T00:00:00+00:00",
+            "startup_action_id": "startup-test-generation",
+        }
+        herdr = _FakeHerdr(
+            [],
+            get_states=["idle", "idle", "idle"],
+            wait_results=[(1, "timed out"), (0, ""), (0, "")],
+            read_returns_body=True,
+        )
+        original_gate = LiveTmuxTransportRailOps.evaluate_queue_enter_resend
+        with patch.object(
+            LiveTmuxTransportRailOps,
+            "observe_queue_enter_gateway_binding",
+            return_value=binding,
+        ), patch.object(
+            LiveTmuxTransportRailOps,
+            "evaluate_queue_enter_resend",
+            autospec=True,
+            side_effect=original_gate,
+        ) as gate_spy:
+            result, herdr, ws, out, err = self._run(
+                agent_rows_fn=_same_lane_rows(),
+                herdr=herdr,
+                mode="queue-enter",
+                extra_argv=[
+                    "--queue-enter-retry-window", "1",
+                    "--queue-enter-retry-interval", "0.001",
+                ],
+            )
+
+        self.assertEqual(result, 0, msg=f"out={out}\nerr={err}")
+        outcome = _outcome_from(out)
+        self.assertEqual(outcome.get("status"), "sent", msg=out)
+        self.assertEqual(outcome.get("reason"), "ok", msg=out)
+        self.assertEqual(gate_spy.call_count, 1)
+
+        send_texts = [op for op in herdr.sends if op[0] == "send_text"]
+        waits = [op for op in herdr.sends if op[0] == "wait"]
+        enters = [
+            op for op in herdr.sends
+            if op[0] == "send_keys" and str(op[2]).lower() == "enter"
+        ]
+        self.assertEqual(len(send_texts), 1, msg=herdr.sends)
+        self.assertEqual(len(waits), 2, msg=herdr.sends)
+        self.assertEqual(herdr._wait_calls, 2, msg=herdr.sends)
+        self.assertEqual(len(enters), 2, msg=herdr.sends)
+
+        wait_indexes = [
+            i for i, op in enumerate(herdr.sends) if op[0] == "wait"
+        ]
+        enter_indexes = [
+            i for i, op in enumerate(herdr.sends)
+            if op[0] == "send_keys" and str(op[2]).lower() == "enter"
+        ]
+        first_wait, second_wait = wait_indexes
+        first_enter, second_enter = enter_indexes
+        self.assertLess(first_wait, first_enter, msg=herdr.sends)
+        self.assertLess(first_enter, second_wait, msg=herdr.sends)
+        self.assertLess(second_wait, second_enter, msg=herdr.sends)
+
+        obs = outcome.get("queue_enter_turn_start_observation")
+        self.assertIsInstance(obs, dict, msg=out)
+        self.assertEqual(obs.get("enter_attempts"), 2, msg=out)
+        self.assertEqual(obs.get("first_event_wait_kind"), "timeout", msg=out)
+        self.assertEqual(obs.get("final_event_wait_kind"), "changed", msg=out)
+        self.assertEqual(obs.get("event_wait_kind"), "changed", msg=out)
+        self.assertEqual(obs.get("gateway_binding"), binding, msg=out)
         self.assertIsNone(outcome.get("turn_start_outcome"), msg=out)
 
     def test_queue_enter_snapshot_records_telemetry_only(self) -> None:

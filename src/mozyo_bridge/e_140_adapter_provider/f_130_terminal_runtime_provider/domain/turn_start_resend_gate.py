@@ -3,7 +3,7 @@
 The turn-start rail (``domain/turn_start_rail``) may, after a first wait that neither
 confirmed a start nor proved the pane gone, re-send **Enter and only Enter** — never the
 body. Deciding whether it may is a self-contained question with its own closed
-vocabulary and two pure predicates, so it lives here rather than in the orchestrator,
+vocabulary and small pure predicates, so it lives here rather than in the orchestrator,
 exactly as the provider registry split its startup-blocker schema out of the oversized
 profile config (the module-health gate).
 
@@ -23,7 +23,10 @@ What is here, and why each piece is shaped the way it is:
   Keeping it an injected *callable* rather than a registry lookup is what keeps the rail
   provider-neutral: not one provider string exists in the domain, matching the #13760
   boundary that every provider-specific literal stays in packaged profile data.
-- :func:`composer_retains_body` — the stuck-composer signature both gates share.
+- :func:`composer_retains_body` — the standard-rail-compatible whole-pane
+  stuck-composer signature.
+- :func:`current_composer_retains_body` — the stricter queue-enter signature that
+  accepts only the structurally current composer tail, never matching scrollback alone.
 - :func:`screen_guard_detects` — the fail-closed reduction of a guard's token to a
   verdict.
 
@@ -71,6 +74,7 @@ determine" is always a refusal, never a pass:
 
 from __future__ import annotations
 
+import re
 from typing import Callable, Optional
 
 # --- resend-skip vocabulary (core-owned, closed set) -------------------------
@@ -88,6 +92,7 @@ RESEND_SKIP_STATE_NOT_INJECTABLE = "state_not_injectable"  # observed busy / unk
 RESEND_SKIP_IDENTITY_PROBE_UNBOUND = "identity_probe_unbound"  # no way to re-verify who holds the target
 RESEND_SKIP_IDENTITY_UNCONFIRMED = "identity_unconfirmed"  # the probe could not establish an identity
 RESEND_SKIP_IDENTITY_DRIFT = "identity_drift"  # a DIFFERENT agent now holds the target locator
+RESEND_SKIP_WAIT_UNARMED = "wait_unarmed"  # no causal wait could be armed before the extra Enter
 
 RESEND_SKIP_REASONS: frozenset[str] = frozenset(
     {
@@ -105,6 +110,7 @@ RESEND_SKIP_REASONS: frozenset[str] = frozenset(
         RESEND_SKIP_IDENTITY_PROBE_UNBOUND,
         RESEND_SKIP_IDENTITY_UNCONFIRMED,
         RESEND_SKIP_IDENTITY_DRIFT,
+        RESEND_SKIP_WAIT_UNARMED,
     }
 )
 
@@ -173,6 +179,48 @@ def composer_retains_body(content: object, text: object) -> bool:
     return body in _strip_all_ws(content)
 
 
+_COMPOSER_PROMPT_RE = re.compile(r"^\s*[›❯>]\s*(?P<body>.*)$")
+
+
+def current_composer_retains_body(content: object, text: object) -> bool:
+    """True only when ``text`` is retained in the *current* composer tail.
+
+    ``composer_retains_body`` intentionally preserves the older standard-rail
+    whole-pane match.  That is not strong enough for the Herdr queue-enter retry:
+    a prior copy of the same handoff in scrollback must never authorise a fresh
+    Enter.  This predicate finds the last rendered composer prompt and searches
+    only that prompt plus its wrapped continuation lines.  Whitespace is removed
+    inside that tail so a hard wrap in the marker or body remains matchable.
+
+    Missing/blank prompt evidence, non-string input, and an empty body all fail
+    closed.  The composer text is never returned or persisted.
+    """
+    if not isinstance(content, str) or not isinstance(text, str):
+        return False
+    body = _strip_all_ws(text)
+    if not body:
+        return False
+    lines = content.splitlines()
+    prompt_index = -1
+    prompt_body = ""
+    for index, line in enumerate(lines):
+        match = _COMPOSER_PROMPT_RE.match(line)
+        if match:
+            prompt_index = index
+            prompt_body = match.group("body").strip()
+    if prompt_index < 0 or not prompt_body:
+        return False
+    # A submitted prompt remains in scrollback while unindented receiver output is
+    # rendered below it.  Such a historical prompt is not a current composer even
+    # when no newer prompt is visible (notably while a receiver is busy).  Wrapped
+    # composer continuations and TUI footer/status rows are indented; fail closed on
+    # any non-empty, non-indented row after the candidate prompt.
+    if any(line.strip() and not line[:1].isspace() for line in lines[prompt_index + 1 :]):
+        return False
+    composer_tail = _strip_all_ws("".join(lines[prompt_index:]))
+    return body in composer_tail
+
+
 def probe_identity(probe: ResendIdentityProbe, target: str) -> Optional[str]:
     """The probe's token for ``target``, or ``None`` when it cannot be established.
 
@@ -223,9 +271,11 @@ __all__ = (
     "RESEND_SKIP_STARTUP_SCREEN",
     "RESEND_SKIP_STATE_NOT_INJECTABLE",
     "RESEND_SKIP_STATE_UNREADABLE",
+    "RESEND_SKIP_WAIT_UNARMED",
     "ResendIdentityProbe",
     "ResendScreenGuard",
     "composer_retains_body",
+    "current_composer_retains_body",
     "probe_identity",
     "screen_guard_detects",
 )

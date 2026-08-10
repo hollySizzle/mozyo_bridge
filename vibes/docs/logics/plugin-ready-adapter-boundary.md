@@ -1394,7 +1394,8 @@ existing tmux path is untouched.
   — **core**, pure. The closed `TURN_START_OUTCOMES` vocabulary, the structured
   `TurnStartResult`, the injected wait-primitive *port* (`TurnStartWaitPort` /
   `ArmedWait`) and its `WaitResult` vocabulary (`changed` / `timeout` / `absent` /
-  `error`), the pure `composer_retains_body` helper, the pure `HerdrTurnStartRail`
+  `error`), the standard-rail-compatible `composer_retains_body` helper, the stricter
+  queue-enter `current_composer_retains_body` helper, the pure `HerdrTurnStartRail`
   orchestrator, and the redaction-safe `turn_start_rail_record_lines` renderer.
   `TurnStartRailError` subclasses `TerminalTransportError`, so the whole seam
   shares one fail-closed error base. It imports no provider.
@@ -1523,6 +1524,56 @@ and withheld". The original five j#72602 keys keep their meaning and values.
 The gate's closed skip vocabulary and its pure predicates live in the leaf
 `domain/turn_start_resend_gate.py` and are re-exported from `turn_start_rail.py`
 (the module-health split, mirroring the provider registry's startup-blocker schema).
+
+### Herdr queue-enter causal resend seam (Redmine #15242)
+
+Redmine #15242 (既定 queue-enter の turn-start 補完) connects the default Herdr
+`queue-enter` choreography to causal turn-start evidence without routing it through
+`drive_turn_start`. That separation is required: `drive_turn_start` rejects a `busy`
+precondition so that a standard send can attribute the next turn to itself, while
+queue-enter deliberately accepts a busy receiver and queues work behind the active
+turn. The queue seam nevertheless borrows the **already-active** rail's bound reader,
+visible-pane reader, and narrow `arm_turn_start_wait` method; it does not resolve a
+second binary, server, or environment whose events could belong to another runtime.
+
+The queue seam owns this sequence:
+
+1. Capture a conservative target identity, the action-time gateway binding carrying
+   the collision-free launch-generation token, and the readable runtime baseline;
+   arm a `working`-transition wait before the first Enter.
+2. Keep the common transport choreography: body exactly once, first Enter exactly
+   once. Never move body injection into the retry helper.
+3. Treat an armed `changed` event as submission evidence only when the baseline was
+   `awaiting_input` / `turn_ended` and the target + launch generation stay coherent.
+   A `busy` baseline, post-hoc `busy` snapshot, or event that cannot be separated from
+   the already-running turn is not confirmation.
+4. If causal start is not confirmed, allow at most one extra Enter only after a fresh,
+   fail-closed recheck: exact target identity and collision-free launch generation;
+   readable, non-blank pane whose **last composer prompt and wrapped tail** contain the
+   complete injected marker+body (whitespace is ignored only to survive terminal hard
+   wraps); no declared startup / modal / trust / login / selection screen;
+   successful runtime read in `busy` / `awaiting_input` / `turn_ended`; and a new wait
+   armed before the extra Enter. `blocked`, `unknown`, read failure, generation drift,
+   historical-transcript-only body matches, and unarmed wait all stop the Enter.
+5. Collect inside the one public queue-enter absolute window. The initial wait,
+   minimum interval between first and extra Enter, and post-resend wait share that
+   budget; every wait timeout is capped by the remaining time and re-arming never
+   resets it. If the first wait already consumed the interval, no extra sleep occurs.
+   A zero or positive sub-millisecond window/interval disables the extra Enter while
+   preserving the first Enter and initial observation; invalid non-finite input is
+   rejected before injection. A sub-millisecond value is never rounded upward into a
+   wider actuation budget.
+
+The busy rule is deliberately asymmetric. `busy` may pass the **resend admission**
+only when the exact current composer still holds this request and every identity /
+screen gate passes; `busy` alone can never pass the **delivery confirmation** gate.
+
+Telemetry remains in the queue-specific `queue_enter_turn_start_observation`; the
+seam does not emit standard `turn_start_outcome`. This preserves the queue delivery-
+ledger classification and its generation fence. Missing causal evidence remains an
+`uncertain` injection stage with `blind_retry_prohibited`, even if the legacy wording
+surface says `sent`. tmux queue-enter, Herdr standard, and pending rails do not enter
+this seam.
 
 ### Equivalence to the #13166 codex-standard turn-start guard (documented proof)
 

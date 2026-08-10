@@ -27,6 +27,7 @@
 - v0.20 で更新 (Redmine #15202): **herdr turn-start rail の Enter 再送を `wait error` にも armする**。v0.8 が固定した bounded Enter-resend は `wait_kind=timeout` だけを候補にしており、最初の wait が `error` (spawn / OS / 分類不能な wait 失敗) で解決した場合は再送せず `delivered_not_started` / `enter_resends=0` で停止していた。#15199 の lane で本形が 9 件観測され、本文と最初の Enter は送れているのに composer に request が残り続けた。wait の失敗は **観測側** についての証拠であって受信側についての証拠ではないため、v0.20 は `error` も Enter-only 再送の候補にする。**本文は再入力しない**。timeout だけの系列は設定された `max_enter_resends` (既定 `1`) を維持し、`2` 以上も有効。一方、系列が一度でも `error` に遭遇した後の effective total budget は **追加 Enter 1 回**に hard-cap する。したがって timeout 再送後の `error` は2回目を送らず、`error` 再送後の timeout も2回目を送らない。`error` 由来の再待機のみ 15 秒 window (`error_resend_wait_timeout_ms`) を使い、この値は **既定かつ hard maximum 15 秒** (0 以下または 15 秒超は構築時拒否) とする。最初の wait は受信側の所要時間を測れていないため、通常の 8 秒より長く待つが、設定で無制限には延長できない。
   `error` 側の gate は `timeout` 側より **厳しい6条件**: (1) pane 分類器 (`screen_guard`) が bind されていること、(2) target identity probe が bind され、本文注入前に確立した非空 live-target fingerprint と再送直前の fingerprint が完全一致すること。built-in Herdr token は assigned name + `terminal_id` + locator + row revision である。`terminal_id` は server-owned terminal のstable identityであり、別terminalが同じpane IDとrevisionを持っても区別する。row revisionは `terminal.revision` 由来の保守的なchange fenceでありprocess generation IDではなく、title / metadata presentation changeでも増え得る。terminal IDまたはrevisionの欠落/不正は未確認として拒否し、runtime statusはtokenへ直接含めない、(3) pane が読めること (空白読みは clear と見なさない)、(4) 宣言済み startup screen (workspace trust / login / update 選択等、#13760 の profile data) が検出されないこと、(5) 本文が composer に残っていること、(6) 再snapshot の read が成功し、`awaiting_input` または `turn_ended` を積極確認すること。`blocked` は権限確認 prompt を Enter が処理するため拒否し、`busy` と `unknown` も「not blocked」として通さず拒否する。identity probe は pane read より先に行い、wait 中に fingerprint が変わった場合は pane を読まず再送しない。いずれかを満たさなければ、closed token (`screen_guard_unbound` / `identity_probe_unbound` / `identity_unconfirmed` / `identity_drift` / `pane_unreadable` / `startup_screen` / `body_absent` / `state_unreadable` / `receiver_blocked` / `state_not_injectable`) を記録して再送しない。
   **`timeout` 側の gate・再待機 window・reader 呼び出し列は不変**。telemetry は additive に 2 key 追加 (`first_wait_kind` / `resend_skipped_reason`): 再送で回復しても最初の wait 失敗を最終結果で上書きせず、`enter_resends=0` が「不要」か「拒否」かを区別する。standard-rail の失敗文言は本文再入力の有無と Enter-only resend 回数を分離し、`enter_resends>0` を `no re-send` と表現しない。wire `Status` / `Reason` 集合・pane selection・tmux backend・`--mode pending` / queue-enter rail は不変。screen を検出しても mozyo がそれに **応答することはない** (#13760 境界は不変)。
+- v0.21 で更新 (Redmine #15242 既定 queue-enter の turn-start 補完): **herdr backend の既定 `queue-enter` を causal な turn-start 観測と、厳格な Enter-only fallback に接続する**。本文は一度だけ type し、最初の Enter も一度だけ発行する。最初の Enter でこの送信に帰属できる turn start を確認できなかった場合に限り、target identity、衝突しない launch generation、現在の composer tail にある exact marker+body、startup / modal / trust / login / selection screen の非該当、runtime state の read 成功を送信直前にすべて再確認し、追加 Enter を **高々一度**発行できる。`busy` は queue semantics を維持するため追加 Enter の候補から除外しないが、busy snapshot や busy baseline に重なった event だけで submission を confirmed にしない。`awaiting_input` / `turn_ended` から先に arm した working-transition event と、前後で一致する collision-free generation を揃えた場合だけ causal confirmation とする。確認不能は `uncertain` のまま blind retry を禁止する。queue 専用 telemetry と delivery-ledger 分類を維持し、standard rail の `turn_start_outcome` と混ぜない。public `queue-enter` window は初回待機・必要な間隔待ち・追加 Enter 後の再待機を含む **単一の absolute budget** で、各 wait は remaining budget を超えない。interval は最初の Enter から追加 Enter までの最小間隔であり、初回待機が interval 以上なら追加 sleep しない。window / interval のどちらか `0`、または正値でも `0.001` 秒未満なら追加 Enter 無効（first Enter と初回観測は維持）、非有限値は pre-injection `invalid_args` とする。tmux queue-enter、herdr `standard`、`pending` は変更しない。
 - v0.5.1 で追加 (Redmine #12612): delivery rail dogfood / smoke / pre-smoke gate では **runtime fingerprint** を必須 evidence とする。`mozyo-bridge --version` だけでは、同じ version 文字列を名乗る installed package と `origin/main` source CLI の挙動差を検出できない。実行した executable path、imported package path、source / installed の区別、feature probe (例: `standard_target_admission` present) を durable record に残し、fingerprint が期待 behavior と一致しない場合は dogfood を green にしない。
 - v0.4 で pivot (Asana `1214824751741628` / parent `1214825156046950`): default delivery rail を strict `standard` から `queue-enter` に再配置し、product promise を `confirmed landing` 中心から `strong preflight 付き practical queued submission` 中心に切り替える (`## Default Delivery Promise (v0.4)` 参照)。strict `standard` rail は contract から削除せず、明示的 fallback として残す。strict rail の挙動・wire enums (`Status` / `Reason` / `AckStatus` / `next_action_owner`)・queue-enter rail の Layer B admission gate (Step 1–14) はいずれも変更しない (新規 `Reason` 値も追加しない)。本 task の射程は contract wording の pivot のみであり、CLI / handoff 実装 (Asana `1214825307842391`)、distributed docs / rules / skill refs / preset surfaces (Asana `1214825156844993`)、tests / smoke / workflow verification (Asana `1214825156769677`) は別 child task が所有する。
 - Upstream contract (前提): `mozyo_bridge_pty/vibes/docs/specs/transport-agnostic-ack-state-contract.md`
@@ -447,33 +448,82 @@ queue-enter rail でも `wait_for_text(marker)` は引き続き呼ぶ。これ�
 
 durable record の文面初期化は v0.2 lineage の実装 task `1214782240686275` が実施済み (queue-enter rail 自体の wording 層の追加)。v0.4 default flip を実施する task `1214825307842391` は、この文面要件を default 化 (default rail に乗る送信が増えることに伴う durable record 量の増加) に対しても維持することを前提とする。いずれの task が手を入れるにしても、上記 5 点を欠いた文面は本 contract に違反する。
 
-### Enter-Only Retry (Redmine #12580 / #12581)
+### Enter-Only Retry (Redmine #12580 / #12581 / #15242)
 
-queue-enter rail の Enter 発行は、busy / redraw 中の Claude / Codex TUI が **最初の Enter を取りこぼす** ケースを high-level primitive 内で吸収するため、**Enter-only retry** を持つ。本 retry は strict / pending rail には存在せず、queue-enter rail かつ landing marker 未観測のときだけ作動する。strict / pending の意味論は一切変更しない。
+queue-enter rail の Enter 発行は、busy / redraw 中の Claude / Codex TUI が **最初の Enter を取りこぼす**
+ケースを high-level primitive 内で吸収するため、**Enter-only retry** を持つ。marker + body は backend に
+かかわらず最初に一度だけ type し、retry では再入力しない。strict / pending rail の意味論は変更しない。
+
+#### tmux queue-enter (既存 marker retry、変更なし)
 
 ```yaml
-enter_only_retry:
-  対象rail: queue-enter のみ
+tmux_enter_only_retry:
+  対象rail: tmux backend の queue-enter のみ
   発動条件: landing marker が landing_timeout 内に未観測
   既定policy: window 30 秒 / interval 2 秒
   挙動:
-    - marker + body は最初に一度だけ type する (`send-keys -l`)。retry では再 type しない (payload 再投入なし)。
-    - retry は Enter のみを再発行する。idle な agent composer への空 Enter は no-op であり、payload を重複投入しない。
-    - interval ごとに marker を 1 度だけ観測 (one-shot capture) し、観測できたら即停止する。観測できなければ Enter を再発行する。
+    - marker + body は最初に一度だけ type する (`send-keys -l`)。
+    - interval ごとに marker を 1 度だけ観測し、未観測なら Enter のみ再発行する。
     - window 経過 (= floor(window / interval) 回の追加 Enter) または marker 観測で停止する。
-  config境界:
-    - 既定値は domain 定数 `QUEUE_ENTER_RETRY_WINDOW_SECONDS` / `QUEUE_ENTER_RETRY_INTERVAL_SECONDS` に分離し、`resolve_queue_enter_retry_policy` を単一の解決 seam とする (将来の設定ファイル駆動に備える)。
-    - CLI override: `--queue-enter-retry-window` / `--queue-enter-retry-interval`。どちらかを `0` にすると retry を無効化し、historical な single-Enter 挙動へ戻す。
   outcome:
-    - retry の結果 marker を観測できた場合: strict と同じ `sent` / `ok` (`mode=queue-enter`、header `sent (queue-enter, marker observed)`)。
-    - window を使い切っても未観測の場合: 既存どおり `sent` / `queue_enter`。
-    - `Status` / `Reason` / `AckStatus` / `next_action_owner` enum も `project_last_input` projection も変更しない。retry は wording-layer のみ。
-  durable記録:
-    - retry が作動したとき、delivery record / outcome narrative に retry policy (window / interval)・attempted count (総 Enter 数)・interval を `- Retry:` 行として残す (数値と bool のみ; paste-safe)。
-    - 本 telemetry は wire outcome (json) には載せない。Defer Rationale の「新規 wire field を増やさない」境界を維持し、durable record text にのみ持たせる。
+    - marker 観測: `sent` / `ok` (`mode=queue-enter`)
+    - window 内に未観測: `sent` / `queue_enter`
 ```
 
-本 retry は `## Open Questions` 6 の pickup observability を解決しない。receiver が prompt を実際に pickup したかは依然 sender から確認できず、durable record が完了の正本である点は不変。retry は「最初の Enter 取りこぼし」を best-effort で吸収するだけであり、queue 受理の確証を約束しない。
+この marker retry は tmux compatibility layer の既存 contract である。Redmine #15242
+(既定 queue-enter の turn-start 補完) はこれを causal event retry に読み替えず、byte-compatible に残す。
+
+#### herdr queue-enter (causal turn-start + 高々1回の追加 Enter)
+
+Herdr は working-transition event と runtime state を読めるため、landing marker の有無ではなく、**この送信に
+帰属できる turn start が確認されたか**を追加 Enter の判断に使う。ただし standard rail の
+`drive_turn_start` をそのまま流用しない。queue-enter は receiver が `busy` でも request を queue に置くための
+rail であり、standard rail の pre-injection idle gate を適用すると既定 queue semantics を失うためである。
+
+```yaml
+herdr_queue_enter_retry:
+  injection:
+    body: exactly once
+    first_enter: exactly once
+    extra_enter: at_most_once
+  causal_observation:
+    - first Enter より先に working-transition wait を arm する
+    - target identity と collision-free launch generation を前後で exact 照合する
+    - pre-Enter runtime state が awaiting_input / turn_ended で、armed event が changed、
+      generation が coherent な場合だけ submission confirmation に使える
+    - busy baseline / busy snapshot / busy に重なった event だけでは confirmation にしない
+  extra_enter_gate:
+    - causal start が未確認である
+    - target identity が注入前と送信直前で exact 一致する
+    - collision-free launch generation が注入前と送信直前で exact 一致する
+    - pane read が成功し、現在の composer tail に full marker + body が残る
+      (terminal hard-wrap の whitespace だけを正規化する)
+    - historical transcript に同じ本文があるだけでは通さない
+    - startup / modal / trust / login / selection screen が検出されない
+    - runtime read が成功し、state が busy / awaiting_input / turn_ended のいずれかである
+    - blocked / unknown / read failure は拒否する
+    - 追加 Enter より先に次の working-transition wait を arm できる
+  result:
+    - confirmation が揃えば queue 専用 turn-start observation に記録する
+    - 揃わなければ uncertain のまま。自動・手動を問わず blind retry を許可しない
+```
+
+`busy` を追加 Enter gate で許容することと、`busy` を delivery confirmation に使うことは別である。前者は
+現在の composer に exact request が残り、同一 target / generation であることを確認した上で queue 受理を
+補完するための限定的な許可である。後者は既存 turn が動いているだけでも成立するため禁止する。
+
+public policy の `--queue-enter-retry-window` は、初回 event wait、必要な interval 待ち、追加 Enter 後の
+再待機を合わせた **単一の absolute wall-clock budget** である。各 wait timeout はその時点の remaining
+budget で cap し、再 arm しても window をリセット・延長しない。`--queue-enter-retry-interval` は最初の
+Enter から追加 Enter までの最小間隔であり、初回 wait が既に interval 以上かかった場合は追加 sleep しない。
+window / interval のどちらかが `0`、または正値でも `0.001` 秒未満なら追加 Enter は無効で、最初の Enter と
+初回 observation は従来どおり一度だけ実行する。sub-millisecond 値を `0.001` 秒へ切り上げて actuation budget
+を広げない。非有限値は本文注入前に `invalid_args` とする。
+
+Herdr の結果は既存 `queue_enter_turn_start_observation` と queue delivery-ledger rail に残す。standard rail の
+`turn_start_outcome` を付けると、同じ queue delivery が event rail として再分類されるため禁止する。
+confirmation が無い outcome は `sent` という表層語だけで `submitted_confirmed` に昇格させず、共有
+`injection_stage` authority で `uncertain` に保つ。durable record が task completion の正本である点も不変。
 
 ### Failure Modes
 
@@ -766,15 +816,27 @@ queue-enter rail を使用した事実は、本 contract が要求する以下�
 
 これらの兆候のいずれかが顕在化したときに、本 task を `Reopen` するか、新規 task を切る。それまでは現状の wording-layer 観測で十分とする。
 
-### herdr backend による Open Question 6 の部分クローズ (Redmine #13292)
+### herdr backend による Open Question 6 の部分クローズ (Redmine #13292 / #15242)
 
-上記「再オープンのシグナル」3 点目 (`queue-enter pickup の post-hoc 検証手段が確立し … 追加 field を持たせる意義が出た = Open Question 6 の closure`) は、herdr backend の導入で **herdr 経路に限って** 顕在化した。herdr は receiver runtime state (`agent get` → `read_agent_state`、runtime receiver-state vocabulary; `vibes/docs/logics/ack-completion-receiver-state.md`) を提供するため、tmux pane signal では決定論的に取れなかった post-hoc pickup 観測が読める。Redmine #13292 (design answer #13292 j#72759、#13255 j#72602 decision 5 の follow-up) はこれを次の範囲で実装した:
+上記「再オープンのシグナル」3 点目 (`queue-enter pickup の post-hoc 検証手段が確立し … 追加 field を持たせる意義が出た = Open Question 6 の closure`) は、herdr backend の導入で **herdr 経路に限って** 顕在化した。herdr は receiver runtime state (`agent get` → `read_agent_state`、runtime receiver-state vocabulary; `vibes/docs/logics/ack-completion-receiver-state.md`) を提供するため、tmux pane signal では決定論的に取れなかった post-hoc pickup 観測が読める。Redmine #13292 (queue-enter pickup 観測、design answer j#72759、#13255 j#72602 decision 5 の follow-up) の初期実装は次の範囲だった:
 
 - **backend 限定**: `terminal_transport.backend: herdr` かつ `--mode queue-enter` のときだけ。tmux 経路は本節上部の defer のまま (post-hoc pickup は tmux では引き続き不可)。
 - **注入不変**: 既存 queue-enter の inject → Enter → Enter-only retry choreography は byte 不変。観測はその **後** の read-only snapshot 1 回 (bounded advisory poll) であり、event-driven `HerdrTurnStartRail` の armed `wait agent-status` は使わない (change-into semantics が注入順序 coupling と `precondition_not_idle` fail-close を持ち込むため; #13292 j#72759 で B=snapshot を採用)。
 - **additive telemetry-only**: 新 field `DeliveryOutcome.queue_enter_turn_start_observation` (`observation_kind` / `source` / `runtime_state` / `read_ok` / `read_reason` / `poll_attempts`)。`status` / `reason` / `next_action_owner` / `ack_status` projection は不変で、marker 未観測 queue-enter を **blocked に格上げしない** (`sent` / `queue_enter` 契約維持、#13262 j#72523)。read 失敗・`unknown`・`awaiting_input` はすべて telemetry に畳み、send を block しない。
 - **`意図的に first-class にしない項目` との整合**: 上の list が退けた `queue_enter_used: bool` は tmux 経路の `mode`+`reason` で冗長になる field だった。本 field はそれとは別物 — herdr の runtime-state を根拠にした **pickup 観測そのもの** (event rail の armed-wait `turn_start_outcome` とも causality の性質が異なるため別 field に分離)。
 - **wire enum / contract semantics は不変**: Status / Reason / AckStatus / next_action_owner enum を一切変えないため、本 contract の Status version bump はしない (defer rationale と同じ posture)。tmux path 向けの本 defer は維持され、herdr 経路のみ Open Question 6 を部分クローズする。
+
+Redmine #15242 (既定 queue-enter の turn-start 補完) は、上記の「post-choreography snapshot だけ」という
+初期境界を **herdr queue-enter に限って**更新する。first Enter より先に armed working-transition wait を
+置き、collision-free launch generation と target identity を同一 window 内で照合する。causal start が
+確認できなければ、`### Enter-Only Retry` の厳格 gate をすべて満たした場合だけ Enter を高々一度追加する。
+本文は一度しか注入せず、tmux queue-enter の marker retry は変更しない。
+
+この更新でも telemetry の所有先は `queue_enter_turn_start_observation` のままである。busy baseline / post-hoc
+busy snapshot は submission proof ではなく、standard rail 用 `turn_start_outcome` も生成しない。従って
+delivery-ledger は queue rail のまま保たれ、causal event + coherent generation が欠ける結果は
+`submitted_confirmed` ではなく `uncertain` である。ここで確認するのは turn start までであり、task completion
+や ticket gate を確認するものではない。
 
 ## Follow-up Tasks (推奨)
 
@@ -796,6 +858,7 @@ queue-enter rail を使用した事実は、本 contract が要求する以下�
 - 現行 tmux compatibility layer は 6 state (`staging` transient + `submitted` / `pending_submit` / `rolled_back` / `delivery_failed` / `stage_failed`) を実装し、`acknowledged` を取らない。これは tmux が原理的に receiver runtime 内部を覗けないことの正直な表現。
 - `mozyo-bridge handoff send` / `handoff reply`、`notify-*` standard variants は同じ safety contract に乗る。`notify-*-legacy-task` と `mozyo-bridge message` は legacy compatibility として残し、新規 caller は handoff 経路に寄せる。
 - **Normative default rail (v0.4 contract 以降)** は `--mode queue-enter`: Claude / Codex agent pane に対する queue-oriented delivery 経路。Layer B deterministic admission gate (window-name / same-session / active-split / per-receiver foreground process allowlist など) が admit したときに限り Enter を発行し、marker 未観測でも `C-u` rollback を行わない。観測あり → `sent` / `ok`、観測なし → `sent` / `queue_enter` (新規 reason)。default delivery promise は `confirmed landing` ではなく `strong preflight 付き practical queued submission`。durable record (Asana task comment / Redmine journal) は引き続き source of truth であり、queue 受理を task 完了の signal にしない。CLI binary 上も commit `93dc953` (Asana `1214825307842391`) で `default=MODE_QUEUE_ENTER` に flip 済み (旧 transient gap は `### Contract Default vs CLI Default (Transient Gap)` で resolved として記録)。詳細は `## Default Delivery Promise (v0.4)` および `## Queue-Enter Default Rail` を参照。
+- Herdr の既定 queue-enter は、本文1回・first Enter 1回を保ち、causal start 未確認時だけ厳格な同一 target / launch-generation / current-composer / screen / runtime-state gate の後に追加 Enter を高々1回許す。`busy` は queue 配送を拒否する理由ではないが delivery confirmation でもない。causal event と coherent generation が欠ける結果は `uncertain` であり blind retry しない。tmux queue-enter、herdr standard、pending はこの更新の対象外。
 - **Strict explicit fallback (v0.4 contract)** は `--mode standard`: blind Enter は許容しない。typing 前の `capture-pane` 観測 + landing marker `wait_for_text` 成功を Enter の必要条件にし、marker 未観測時は `C-u` rollback を発行し (Enter は押さない) `rolled_back` に倒す。`C-u` 発行は sender 側の事実であり、receiver composer が実際に clear されたことの検証ではない (v0.2 / v0.3 / v0.3.1 / v0.4 で挙動は一切変更しない)。strict landing observation を要求する send (regression check / brand-new pane / observability test / strict landing evidence が監査要件) で明示的に選ぶ。v0.4 contract で normative default ではなくなったが contract からは削除しない。
 - `Status` enum / `AckStatus` enum / `next_action_owner` enum は変更せず、queue-enter rail は `Reason` enum 1 値と `mode` 文字列 1 値の追加だけで wording-layer を表現する。`next_action_for("sent", "queue_enter", receiver)` は strict `sent` と同じ `receiver` owned。`project_last_input` は strict `("sent", "ok")` と完全に同一の `submitted_at = outcome timestamp / ack_status = "submitted"` を採る (上流 inspector contract が `ack_status` を `submitted_at` / `acknowledged_at` から derive する規定に従う; `submitted_at` を null に倒すと `pending_input/ok` と区別できなくなり、また同 spec の Capability Matrix が tmux compat でも `submitted_at` populate を明示しているため)。queue-enter rail の wording-layer 差は `DeliveryOutcome.reason` と durable record narrative にだけ存在し、inspector projection には流出させない。
 - pane への notification が届かないことを失敗とは扱わず、durable record (Asana task comment / Redmine journal) を正本とする。`message --no-submit` は codex TUI gate fallback として retries 3 / Asana 試行記録の手順を memory に従って運用する。長期は `--mode queue-enter` default への統一が候補 (Open Question 5)。
