@@ -620,7 +620,7 @@ class SchemaV5MigrationTest(unittest.TestCase):
             # Drop the v5 binding/generation columns, the v6 reconcile_phase AND the v7
             # lane_kind so the rewound shape is a genuine pre-#13810 v4 signature.
             for col in ("binding_kind", "project_scope", "lane_generation", "declared_slots",
-                        "reconcile_phase", "lane_kind", "hibernated_at",
+                        "reconcile_phase", "reconcile_close_pin", "lane_kind", "hibernated_at",
                         "release_observation",
                         "lane_epoch"):  # v10 (#14756)
                 conn.execute(f"ALTER TABLE lane_lifecycle_records DROP COLUMN {col}")
@@ -671,6 +671,7 @@ class SchemaV5MigrationTest(unittest.TestCase):
             # keep the v5 columns and BOTH owner indexes so the rewound shape is a genuine v5
             # signature, not a v4 one.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_phase")
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_close_pin")
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_kind")
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN hibernated_at")
             # v9 (#14477 j#94582) added release_observation; a faithful pre-v9 rewind drops it.
@@ -838,7 +839,12 @@ class ReviewCorrectionJ78868Test(unittest.TestCase):
         # A release generation opens on the (non-active) lane and is left in flight.
         self.store.request_release(
             key, expected_revision=rec.revision, action_id="rel1",
-            observation=build_release_observation([ReleasePin(role="codex", assigned_name="n", locator="%1")]),
+            observation=build_release_observation([
+                ReleasePin(
+                    role="codex", assigned_name="n", locator="%1",
+                    startup_action_id="startup-action-current",
+                )
+            ]),
         )
         rec = self.store.get(key)
         self.assertEqual(rec.process_release, "requested")
@@ -866,7 +872,12 @@ class ReviewCorrectionJ78868Test(unittest.TestCase):
         rec = self.store.get(key)
         self.store.request_release(
             key, expected_revision=rec.revision, action_id="rel1",
-            observation=build_release_observation([ReleasePin(role="codex", assigned_name="n", locator="%1")]),
+            observation=build_release_observation([
+                ReleasePin(
+                    role="codex", assigned_name="n", locator="%1",
+                    startup_action_id="startup-action-current",
+                )
+            ]),
         )
         rec = self.store.get(key)
         self.store.record_release_outcome(

@@ -26,6 +26,7 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (  # noqa: E402
     HerdrIdentityAttestationStore,
     IdentityAttestationRecord,
 )
+from mozyo_bridge.core.state.lane_release_pin import ReleasePin  # noqa: E402
 from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
     ContinuationPointer,
     DecisionPointer,
@@ -67,6 +68,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E402,E501
     encode_assigned_name,
 )
+from tests.support.current_launch_authority import (  # noqa: E402
+    seed_completed_current_launch_authority,
+)
 
 WS = "wsX"
 LANE = "issue_13806_x"
@@ -85,7 +89,17 @@ def _row(**overrides):
         "foreground_cwd": str(ROOT),  # a real git checkout => worktree readable
     }
     row.update(overrides)
+    row.setdefault("terminal_id", f"terminal:{row['pane_id']}")
     return row
+
+
+def _current_close_pin(request):
+    return ReleasePin(
+        role=request.role,
+        assigned_name=request.assigned_name,
+        locator=request.locator,
+        startup_action_id="startup-action-current",
+    )
 
 
 def _request(**overrides):
@@ -314,6 +328,7 @@ class ActuatorDelegationTests(_LiveCase):
         )
 
         class FakeQ:
+            def current_close_pin(self, req): return _current_close_pin(req)
             def close_receiver(self, req, pin): return CloseReceiverResult(closed=True)
             def heal_receiver(self, req): return None
             def verify_fresh_receiver(self, req, *, fresh_after):
@@ -329,6 +344,7 @@ class ActuatorDelegationTests(_LiveCase):
         addressed = []
 
         class FakeQ:
+            def current_close_pin(self, req): return _current_close_pin(req)
             def close_receiver(self, req, pin):
                 addressed.append(pin.role)
                 return CloseReceiverResult(closed=True)
@@ -346,6 +362,7 @@ class ActuatorDelegationTests(_LiveCase):
         )
 
         class FakeQ:
+            def current_close_pin(self, req): return _current_close_pin(req)
             def close_receiver(self, req, pin):
                 return CloseReceiverResult(closed=False, old_absent=False, detail="close_failed")
 
@@ -404,9 +421,25 @@ class ActuatorDelegationTests(_LiveCase):
         self.assertEqual(seen["heal"], (str(ROOT), ROLE))
 
     def _seed_attestation(self, home, *, action_id):
+        locator = "w28:p88"
+        terminal_id = f"terminal:{locator}"
+        live.list_herdr_agent_rows = lambda env: [
+            _row(pane_id=locator, terminal_id=terminal_id)
+        ]
+        seed_completed_current_launch_authority(
+            Path(home),
+            workspace_id=WS,
+            lane_id=LANE,
+            role=ROLE,
+            assigned_name=NAME,
+            locator=locator,
+            terminal_id=terminal_id,
+            target_workspace="w28",
+            target_tab="w28:t1",
+        )
         HerdrIdentityAttestationStore(home=home).upsert(IdentityAttestationRecord(
-            assigned_name=NAME, workspace_id=WS, role=ROLE, lane_id=LANE, locator="w28:p88",
-            verdict="present", replacement_action_id=action_id,
+            assigned_name=NAME, workspace_id=WS, role=ROLE, lane_id=LANE, locator=locator,
+            terminal_id=terminal_id, verdict="present", replacement_action_id=action_id,
         ))
 
     def test_verify_bound_on_exact_action_match(self):
@@ -492,10 +525,41 @@ class RedispatchLedgerTests(_LiveCase):
         )
 
     def _seed_launch(self, att_home, observed_at=LAUNCH_AT):
+        terminal_id = f"terminal:{self.FRESH}"
+        self._startup_action_id = seed_completed_current_launch_authority(
+            Path(att_home),
+            workspace_id=WS,
+            lane_id=LANE,
+            role=ROLE,
+            assigned_name=NAME,
+            locator=self.FRESH,
+            terminal_id=terminal_id,
+            target_workspace="w28",
+            target_tab="w28:t1",
+        )
+        self._launch_observed_at = observed_at
         HerdrIdentityAttestationStore(home=att_home).upsert(IdentityAttestationRecord(
             assigned_name=NAME, workspace_id=WS, role=ROLE, lane_id=LANE, locator=self.FRESH,
-            verdict="present", observed_at=observed_at, replacement_action_id="a",
+            terminal_id=terminal_id, verdict="present", observed_at=observed_at,
+            replacement_action_id="a",
         ))
+
+    def _queue_observation(self):
+        return {
+            "observation_version": 2,
+            "gateway_binding": {
+                "provider": ROLE,
+                "assigned_name": NAME,
+                "locator": self.FRESH,
+                "row_revision": "3",
+                "attestation_observed_at": getattr(
+                    self, "_launch_observed_at", self.LAUNCH_AT
+                ),
+                "startup_action_id": getattr(
+                    self, "_startup_action_id", "startup-unverified"
+                ),
+            },
+        }
 
     def _delivered(self, **over):
         # a full, correct herdr worker-dispatch delivery record (as the real writer projects it)
@@ -503,6 +567,7 @@ class RedispatchLedgerTests(_LiveCase):
             notification_marker=self.MARKER, source="redmine", issue_id=self.ISSUE,
             journal_id=self.JOURNAL, receiver=ROLE, backend="herdr", rail="queue_enter_rail",
             target=self.FRESH, status="sent", reason="ok", recorded_at=self.AFTER,
+            queue_enter_observation=self._queue_observation(),
         )
         base.update(over)
         return HerdrDeliveryLedgerRecord(**base)
@@ -540,8 +605,7 @@ class RedispatchLedgerTests(_LiveCase):
             anchor=RedmineAnchor(issue=self.ISSUE, journal=self.JOURNAL),
             mode="queue-enter", kind="implementation_request", notification_marker=self.MARKER,
             source="redmine",
-            queue_enter_turn_start_observation={"observation_kind": "post_choreography_snapshot",
-                                                "runtime_state": "turn_ended", "read_ok": True},
+            queue_enter_turn_start_observation=self._queue_observation(),
         )
         record_herdr_delivery(outcome, home=led_home)
         ops = self._ops(HerdrDeliveryLedger(home=led_home), att)

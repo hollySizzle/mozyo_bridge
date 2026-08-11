@@ -81,7 +81,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     execute_herdr_retire_close,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_process_release import (  # noqa: E501
-    ReleaseOutcome,
+    ReadableInventoryReleaseOps, ReleaseOutcome,
     declared_generation_attested,
     declared_generation_exactly_live,
     drive_process_release,
@@ -199,10 +199,9 @@ class HibernateOutcome:
     #: means either no ghost was observed, or activity was never probed (unreadable boundary /
     #: no live slots) — never asserted as proof no ghost existed.
     composer_ghost_observed: bool = False
-    #: Redmine #14219 T2a R1-F2: the supervisor lease was lost at the commit boundary (the
-    #: injected ``lease_guard`` refused immediately before the CAS / redrive close), so this
-    #: attempt committed NOTHING — a taken-over runner must not double-actuate. Zero transition,
-    #: zero close. ``False`` for the default CLI path (no lease guard).
+    #: The supervisor lease was lost immediately before the CAS or a release effect. A fresh
+    #: disposition CAS may already have landed, but the taken-over runner closes nothing;
+    #: a redrive mutates nothing. ``False`` for the default CLI path (no lease guard).
     lease_lost: bool = False
 
     @property
@@ -430,12 +429,9 @@ class HibernateRequest:
 class SublaneHibernateUseCase:
     """Preflight + disposition CAS (active -> hibernated) + tombstone-free release.
 
-    ``lease_guard`` (Redmine #14219 T2a R1-F2) is an optional ownership re-check invoked at the
-    irreversible commit boundary — immediately before the fresh-path CAS and before the redrive
-    close. A background auto-hibernate runner injects its supervisor-lease renew here so a lease
-    lost during the T0/T1 boundary reads aborts with zero transition / zero close, instead of a
-    taken-over runner completing the mutation. ``None`` (the default, e.g. the interactive CLI) is
-    a behavior-preserving no-op.
+    ``lease_guard`` is an optional ownership re-check immediately before the fresh-path CAS and
+    every release effect. A background runner injects its supervisor-lease renew so a takeover
+    during any fresh read closes nothing. ``None`` (the interactive CLI default) is a no-op.
     """
 
     ops: SublaneHibernateOps
@@ -638,7 +634,9 @@ class SublaneHibernateUseCase:
                             key, lane, workspace_id, rows1, action_id,
                             expected_revision=rec.revision,
                         )
-                        if release.admission_blocked:
+                        if release.effect_admission_blocked:
+                            redrive_lease_lost, release = True, None
+                        elif release.admission_blocked:
                             boundary_reasons = (BLOCK_RELEASE_BOUNDARY_REVISION_DRIFT,)
                             release = None
                         else:
@@ -681,7 +679,7 @@ class SublaneHibernateUseCase:
                 recovery_detail=recovery_detail,
                 lease_lost=redrive_lease_lost,
                 detail=redrive_detail(
-                    redrive_ok=redrive_ok,
+                    redrive_ok=redrive_ok and not redrive_lease_lost,
                     boundary_reasons=boundary_reasons,
                     post_residue=post_residue,
                 ),
@@ -844,18 +842,19 @@ class SublaneHibernateUseCase:
                 detail=f"hibernate commit refused ({transition.reason})",
             )
 
-        # Release on the FRESH boundary snapshot (rows1), bound to the exact revision the CAS
-        # just committed (Redmine #13843 review F3): an authority advance between the CAS and the
-        # driver read closes nothing (admission_blocked). Then the post-release (T2) check +
-        # disposition resolution withhold the success on residue / admission block.
+        # Release on the FRESH boundary snapshot, bound to the CAS revision; authority drift or
+        # lease loss during the driver's own fresh read closes nothing. The post-release check
+        # withholds success on residue or an admission block.
         release = self._drive_release(
             key, lane, workspace_id, rows1, action_id,
             expected_revision=transition.revision,
         )
-        post = post_release_residue(
-            ops=self.ops, fingerprint_boundary=fingerprint_boundary
-        )
-        withheld, recovery, detail = fresh_release_disposition(release, post)
+        effect_blocked = release.effect_admission_blocked
+        if effect_blocked:
+            withheld, recovery, detail = True, "", "supervisor lease lost before process release"
+        else:
+            post = post_release_residue(ops=self.ops, fingerprint_boundary=fingerprint_boundary)
+            withheld, recovery, detail = fresh_release_disposition(release, post)
         return HibernateOutcome(
             executed=True,
             preflight=preflight,
@@ -866,6 +865,7 @@ class SublaneHibernateUseCase:
             release=release,
             success_withheld=withheld,
             recovery_detail=recovery,
+            lease_lost=effect_blocked,
             composer_ghost_observed=composer_ghost_observed,
             detail=detail,
         )
@@ -950,13 +950,12 @@ class SublaneHibernateUseCase:
         """
         return drive_process_release(
             store=self.store,
-            ops=self.ops,
+            ops=ReadableInventoryReleaseOps(self.ops.read_inventory, self.ops.execute_close),
             key=key,
             lane_id=lane,
             workspace_id=workspace_id,
             action_id=action_id,
-            rows=rows,
-            expected_revision=expected_revision,
+            rows=rows, expected_revision=expected_revision, effect_guard=self._lease_held,
         )
 
 

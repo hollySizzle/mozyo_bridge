@@ -1053,7 +1053,20 @@ class _AttestingHerdr(FakeHerdr):
                     "name": native_name, "pane_id": pane, "workspace_id": wid, "tab_id": tab}}}),
                 stderr="",
             )
-        result = super()._cmd_agent_start(argv, rest)
+        # The canonical FakeHerdr now models the wrapped launch's v4 attestation itself.
+        # This subclass needs one deliberate non-green launch, so suppress only that
+        # automatic write while leaving the wrapper/provider execution events below intact.
+        pane = rest[rest.index("--pane") + 1] if "--pane" in rest else ""
+        workspace = self._workspace_of_pane(pane)
+        pane_env = workspace.pane_env.get(pane, {}) if workspace is not None else {}
+        skipped_action = None
+        if provider in getattr(self, "skip_attestation_for", set()):
+            skipped_action = pane_env.pop("MOZYO_STARTUP_ACTION_ID", None)
+        try:
+            result = super()._cmd_agent_start(argv, rest)
+        finally:
+            if skipped_action is not None:
+                pane_env["MOZYO_STARTUP_ACTION_ID"] = skipped_action
         live = self.agent_named(native_name)
         logical_name = live["name"] if live else ""
         decoded = decode_assigned_name(logical_name)
@@ -1079,8 +1092,6 @@ class _AttestingHerdr(FakeHerdr):
         # Redmine #14222 j#85125 F2: a real wrapped launch appends its attributed
         # execution-stage rows before exec'ing, and the health probe now demands them
         # before a green. Model that per launch, keyed by the injected startup action.
-        pane = rest[rest.index("--pane") + 1] if "--pane" in rest else ""
-        workspace = self._workspace_of_pane(pane)
         launch_action = (
             workspace.pane_env.get(pane, {}).get("MOZYO_STARTUP_ACTION_ID", "")
             if workspace is not None

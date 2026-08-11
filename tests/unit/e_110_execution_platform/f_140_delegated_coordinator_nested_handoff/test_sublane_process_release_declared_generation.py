@@ -48,6 +48,8 @@ GW_NAME = encode_assigned_name(WS, "codex", LANE)
 WK_NAME = encode_assigned_name(WS, "claude", LANE)
 GW_LOC = "wProj:p2"
 WK_LOC = "wProj:p3"
+GW_TERM = "terminal:wProj:p2"
+WK_TERM = "terminal:wProj:p3"
 
 
 def _pin(role: str, provider: str, name: str, locator: str, rev: str = "") -> ProcessGenerationPin:
@@ -83,7 +85,10 @@ def _row(name: str, locator: str, **extra) -> dict:
 
 
 def _live(**extra_gw) -> list[dict]:
-    return [_row(GW_NAME, GW_LOC, **extra_gw), _row(WK_NAME, WK_LOC)]
+    return [
+        _row(GW_NAME, GW_LOC, terminal_id=GW_TERM, **extra_gw),
+        _row(WK_NAME, WK_LOC, terminal_id=WK_TERM),
+    ]
 
 
 def _match(declared, rows) -> bool:
@@ -256,12 +261,14 @@ class _FakeAttestReader:
 
 
 def _att(name: str, role: str, locator: str, *, verdict=VERDICT_PRESENT, lane=LANE, ws=WS):
+    terminal_id = GW_TERM if name == GW_NAME else WK_TERM
     return IdentityAttestationRecord(
         assigned_name=name,
         workspace_id=ws,
         role=role,
         lane_id=lane,
         locator=locator,
+        terminal_id=terminal_id,
         verdict=verdict,
         observed_at="2026-07-20T00:00:00Z",
     )

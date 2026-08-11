@@ -51,6 +51,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     SmokeEndpointEscapeError,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.shared_space_smoke_observation import (  # noqa: E402,E501
+    RecordingHerdrRunner,
     SharedSpaceSmokeError,
 )
 from tests.support.private_path_fixtures import macos_home_path  # noqa: E402
@@ -423,6 +424,166 @@ class CleanupAuthoritySplitTests(unittest.TestCase):
             self.assertEqual(dispatched_in_child, 1)
 
 
+class OwnedWorkspaceCleanupTests(unittest.TestCase):
+    """Workspace teardown is one-shot, receipt-bound, and minter-only."""
+
+    def _instance(self, tmp: str, dispatched: list, process) -> DisposableHerdrInstance:
+        instance = DisposableHerdrInstance(
+            binary="/bin/true",
+            root=Path(tmp) / "instance",
+            base_env={"HOME": str(Path(tmp) / "operator")},
+            runner=lambda argv, **kwargs: dispatched.append(list(argv))
+            or subprocess.CompletedProcess(argv, 0, "[]", ""),
+            popen_factory=lambda argv, **kwargs: process,
+            sleeper=lambda _seconds: None,
+            ambient_env={},
+        )
+        instance.start()
+        dispatched.clear()
+        return instance
+
+    def _contain(self, instance: DisposableHerdrInstance) -> None:
+        instance.withhold_root_release(live_module.WITHHOLD_WORKERS_UNVERIFIED)
+        instance.permit_root_release()
+
+    def _receipts(self, *workspace_ids: str):
+        recorder = RecordingHerdrRunner(
+            lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, "", "")
+        )
+        recorder.merge_receipts(
+            launched_locators=(),
+            created_workspaces={workspace_id: "coordinators" for workspace_id in workspace_ids},
+            agent_start_names=(),
+            coordinators_create_count=len(workspace_ids),
+        )
+        return recorder.workspace_cleanup_receipts()
+
+    def test_only_receipted_workspace_is_closed_once_after_containment(self) -> None:
+        process = _Process()
+        dispatched: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self._instance(tmp, dispatched, process)
+            self.addCleanup(instance.shutdown)
+            self._contain(instance)
+
+            cleanup = instance.mint_workspace_cleanup(
+                self._receipts("workspace-private-id")
+            )
+            self.assertIsNotNone(cleanup)
+            self.assertNotIn("workspace-private-id", repr(cleanup))
+            self.assertTrue(cleanup.close_all())
+            self.assertEqual(
+                dispatched,
+                [["/bin/true", "workspace", "close", "workspace-private-id"]],
+            )
+            self.assertFalse(cleanup.close_all(), "a consumed id set must not replay")
+            self.assertEqual(len(dispatched), 1)
+            evidence = instance.as_evidence()
+            self.assertTrue(evidence["workspace_cleanup_completed"])
+            self.assertEqual(evidence["workspace_close_dispatched"], 1)
+            self.assertNotIn("workspace-private-id", repr(evidence))
+
+    def test_generic_workspace_close_is_not_exposed(self) -> None:
+        process = _Process()
+        dispatched: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self._instance(tmp, dispatched, process)
+            self.addCleanup(instance.shutdown)
+            with self.assertRaises(SmokeEndpointEscapeError) as caught:
+                instance.runner(
+                    ["/bin/true", "workspace", "close", "workspace-private-id"],
+                    capture_output=True,
+                )
+            self.assertEqual(
+                caught.exception.reason, live_module.REFUSAL_COMMAND_NOT_ALLOWLISTED
+            )
+            self.assertEqual(dispatched, [])
+
+    def test_raw_caller_selected_id_is_not_a_create_receipt(self) -> None:
+        process = _Process()
+        dispatched: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self._instance(tmp, dispatched, process)
+            self.addCleanup(instance.shutdown)
+            self._contain(instance)
+            self.assertIsNone(
+                instance.mint_workspace_cleanup(("workspace-private-id",))  # type: ignore[arg-type]
+            )
+            self.assertEqual(
+                instance.as_evidence()["workspace_cleanup_refusal"],
+                live_module.REFUSAL_WORKSPACE_RECEIPT_INVALID,
+            )
+            self.assertEqual(dispatched, [])
+
+    def test_no_containment_or_no_receipt_mints_no_cleanup(self) -> None:
+        process = _Process()
+        dispatched: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self._instance(tmp, dispatched, process)
+            self.addCleanup(instance.shutdown)
+            instance.withhold_root_release(live_module.WITHHOLD_WORKERS_UNVERIFIED)
+            self.assertIsNone(
+                instance.mint_workspace_cleanup(
+                    self._receipts("workspace-private-id")
+                )
+            )
+            self.assertEqual(
+                instance.as_evidence()["workspace_cleanup_refusal"],
+                live_module.REFUSAL_WORKERS_NOT_CONTAINED,
+            )
+            instance.permit_root_release()
+            self.assertIsNone(instance.mint_workspace_cleanup(self._receipts()))
+            self.assertEqual(
+                instance.as_evidence()["workspace_cleanup_refusal"],
+                live_module.REFUSAL_WORKSPACE_RECEIPT_ABSENT,
+            )
+            self.assertEqual(dispatched, [])
+
+    def test_dead_child_or_endpoint_drift_dispatches_zero_workspace_closes(self) -> None:
+        for failure in ("dead", "drift"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
+                process = _Process()
+                dispatched: list = []
+                instance = self._instance(tmp, dispatched, process)
+                self._contain(instance)
+                cleanup = instance.mint_workspace_cleanup(
+                    self._receipts("workspace-private-id")
+                )
+                self.assertIsNotNone(cleanup)
+                if failure == "dead":
+                    process.returncode = 17
+                    expected = live_module.REFUSAL_OWNED_CHILD_NOT_ALIVE
+                else:
+                    instance.runner._binding_env = {}
+                    expected = live_module.REFUSAL_ENDPOINT_UNBOUND
+                self.assertFalse(cleanup.close_all())
+                self.assertEqual(dispatched, [])
+                self.assertEqual(
+                    instance.as_evidence()["workspace_cleanup_refusal"], expected
+                )
+                instance.shutdown()
+
+    def test_non_minter_cannot_mint_cleanup(self) -> None:
+        process = _Process()
+        dispatched: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self._instance(tmp, dispatched, process)
+            self.addCleanup(instance.shutdown)
+            self._contain(instance)
+            with mock.patch.object(
+                live_module.os, "getpid", return_value=os.getpid() + 1
+            ):
+                cleanup = instance.mint_workspace_cleanup(
+                    self._receipts("workspace-private-id")
+                )
+            self.assertIsNone(cleanup)
+            self.assertEqual(
+                instance.as_evidence()["workspace_cleanup_refusal"],
+                live_module.REFUSAL_CLEANUP_AUTHORITY_NOT_OWNER,
+            )
+            self.assertEqual(dispatched, [])
+
+
 def _worker_probe(queue, instance) -> None:
     """Run one client call in a forked worker; report what it observed."""
     seen = []
@@ -445,6 +606,8 @@ def _worker_probe(queue, instance) -> None:
 #: Herdr grows another control, the allowlist still refuses it by construction, and this
 #: list only has to grow for the *assertion* to keep naming real commands.
 HERDR_LIFECYCLE_CONTROLS = (
+    ("workspace", "close"),
+    ("pane", "close"),
     ("session", "stop"),
     ("session", "delete"),
     ("session", "attach"),
@@ -529,6 +692,25 @@ class ControlSurfaceAllowlistTests(unittest.TestCase):
             self.assertEqual(
                 dispatched, [], "a refused control must make zero external requests"
             )
+
+    def test_generic_pane_close_is_refused_before_dispatch(self) -> None:
+        process = _Process()
+        dispatched: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self._instance(tmp, dispatched, process)
+            self.addCleanup(instance.shutdown)
+            dispatched.clear()
+
+            with self.assertRaises(SmokeEndpointEscapeError) as caught:
+                instance.runner(
+                    ["/bin/true", "pane", "close", "workspace:reused-slot"],
+                    capture_output=True,
+                )
+
+            self.assertEqual(
+                caught.exception.reason, live_module.REFUSAL_COMMAND_NOT_ALLOWLISTED
+            )
+            self.assertEqual(dispatched, [])
 
     def test_the_minters_own_graceful_stop_is_still_allowed(self) -> None:
         """Baseline: the allowlist must not break the one control cleanup needs."""

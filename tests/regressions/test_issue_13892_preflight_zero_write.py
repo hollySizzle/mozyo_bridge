@@ -27,6 +27,7 @@ from unittest import mock
 from mozyo_bridge.core.state.callback_outbox import CallbackOutbox, CallbackOutboxKey
 from mozyo_bridge.core.state.dispatch_outbox_fence import DispatchOutboxFence, FenceKey
 from mozyo_bridge.core.state.forward_outbox_fence import ForwardOutboxFence
+from mozyo_bridge.core.state.scratch_retirement_pin import ScratchRetirementPin
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
     herdr_workspace_segment,
 )
@@ -147,6 +148,19 @@ class PreflightZeroWriteTest(unittest.TestCase):
                 )
 
                 return ScratchRetirementFence(home=test.home).peek(unit)
+
+            def current_generation_pins(self, workspace_id, lane_id, targets):
+                return tuple(
+                    ScratchRetirementPin(
+                        role=role,
+                        assigned_name=encode_assigned_name(
+                            workspace_id, role, lane_id
+                        ),
+                        locator=locator,
+                        startup_action_id=f"startup:{role}:{locator}",
+                    )
+                    for role, locator in targets
+                )
 
             def close(self, ws, lane, targets):
                 self.close_calls.append(tuple(targets))

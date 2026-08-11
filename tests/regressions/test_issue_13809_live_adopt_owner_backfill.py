@@ -89,7 +89,11 @@ ATTESTED_AT = "2026-07-15T00:00:00+00:00"
 
 
 def _row(provider: str, locator: str, *, stale: bool = False) -> dict:
-    row = {"name": encode_assigned_name(WS, provider, LANE), "pane_id": locator}
+    row = {
+        "name": encode_assigned_name(WS, provider, LANE),
+        "pane_id": locator,
+        "terminal_id": f"terminal:{locator}",
+    }
     if stale:
         row["agent"] = ""  # detected-agent field present but blank -> SLOT_STALE residue
     return row
@@ -119,6 +123,7 @@ class DeclareAdoptedOwnerRowTest(unittest.TestCase):
                 role=provider,
                 lane_id=LANE,
                 locator=locator,
+                terminal_id=f"terminal:{locator}",
                 verdict=VERDICT_PRESENT,
                 observed_at=ATTESTED_AT,
             )
@@ -777,6 +782,7 @@ class HerdrAdoptOwnerRowWiringTest(unittest.TestCase):
                 IdentityAttestationRecord(
                     assigned_name=encode_assigned_name(WS, provider, LANE),
                     workspace_id=WS, role=provider, lane_id=LANE, locator=loc,
+                    terminal_id=f"terminal:{loc}",
                     verdict=VERDICT_PRESENT, observed_at=ATTESTED_AT,
                 )
             )

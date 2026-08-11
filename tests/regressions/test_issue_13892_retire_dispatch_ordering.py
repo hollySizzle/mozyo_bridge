@@ -27,6 +27,7 @@ from mozyo_bridge.core.state.scratch_retirement_fence import (
     ScratchRetirementFence,
     slot_digest,
 )
+from mozyo_bridge.core.state.scratch_retirement_pin import ScratchRetirementPin
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution import (  # noqa: E501
     DISPATCH_SKIPPED,
     SendOutcome,
@@ -93,6 +94,18 @@ class RetireDispatchOrderingTest(unittest.TestCase):
         self.sends.append(1)
         return SendOutcome(turn_start=TURN_START_STARTED)
 
+    def _pins(self, pairs):
+        names = {GW: self.gw, WK: self.wk}
+        return tuple(
+            ScratchRetirementPin(
+                role,
+                names[role],
+                locator,
+                f"startup:{role}:{locator}",
+            )
+            for role, locator in pairs
+        )
+
     def _auth(self, target):
         return DispatchAuthorization(
             action_id="act1", source_gate="gate", issue="13999", workspace_id=self.ws,
@@ -156,6 +169,9 @@ class RetireDispatchOrderingTest(unittest.TestCase):
             def peek_retirement(self, unit):
                 return test.fence.peek(unit)
 
+            def current_generation_pins(self, workspace_id, lane_id, targets):
+                return test._pins(targets)
+
             def close(self, ws, lane, targets):
                 self.close_calls.append(tuple(targets))
                 locs = {loc for _r, loc in targets}
@@ -177,7 +193,7 @@ class RetireDispatchOrderingTest(unittest.TestCase):
     def test_retire_first_then_dispatch_sends_nothing(self):
         """The retire's pending is published before its obligation read -> dispatch aborts."""
         with self.fence.transaction(self.unit, live_pair_present=True) as txn:
-            txn.reserve(pinned=(("codex", "%1"), ("claude", "%2")))
+            txn.reserve(pinned=self._pins((("codex", "%1"), ("claude", "%2"))))
             result = execute_dispatch(
                 authorization=self._auth(self.wk), fence=self.outbox, send=self._send
             )
@@ -209,7 +225,7 @@ class RetireDispatchOrderingTest(unittest.TestCase):
     def test_unreadable_retirement_authority_blocks_the_send(self):
         """An authority we cannot read is not an authority that says 'no retirement'."""
         with self.fence.transaction(self.unit, live_pair_present=True) as txn:
-            txn.reserve(pinned=(("claude", "%2"),))
+            txn.reserve(pinned=self._pins((("claude", "%2"),)))
         self.fence.seal_path.write_text("deadbeef")  # identity mismatch
         result = execute_dispatch(
             authorization=self._auth(self.wk), fence=self.outbox, send=self._send
@@ -234,16 +250,19 @@ class RelaunchAfterCompletedTest(RetireDispatchOrderingTest):
 
     def _complete_at(self, pins):
         with self.fence.transaction(self.unit, live_pair_present=True) as txn:
-            a = txn.reserve(pinned=pins)
+            a = txn.reserve(pinned=self._pins(pins))
             txn.mark_completed(attempt_id=a.attempt_id, closed=pins)
 
     def test_relaunched_pair_at_a_new_locator_is_dispatchable(self):
         import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution as de
 
         self._complete_at((("codex", "%old1"), ("claude", "%old2")))
-        original = de._live_locator_for
-        de._live_locator_for = lambda n: "%new9"
-        self.addCleanup(setattr, de, "_live_locator_for", original)
+        original = de._live_generation_for
+        de._live_generation_for = lambda n, identity: (
+            "%new9",
+            "startup:claude:%new9",
+        )
+        self.addCleanup(setattr, de, "_live_generation_for", original)
         result = execute_dispatch(
             authorization=self._auth(self.wk), fence=self.outbox, send=self._send
         )
@@ -254,9 +273,12 @@ class RelaunchAfterCompletedTest(RetireDispatchOrderingTest):
         import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution as de
 
         self._complete_at((("codex", "%old1"), ("claude", "%old2")))
-        original = de._live_locator_for
-        de._live_locator_for = lambda n: "%old2"  # the very pane the attempt closed
-        self.addCleanup(setattr, de, "_live_locator_for", original)
+        original = de._live_generation_for
+        de._live_generation_for = lambda n, identity: (
+            "%old2",
+            "startup:claude:%old2",
+        )  # the very generation the attempt closed
+        self.addCleanup(setattr, de, "_live_generation_for", original)
         result = execute_dispatch(
             authorization=self._auth(self.wk), fence=self.outbox, send=self._send
         )
@@ -267,9 +289,9 @@ class RelaunchAfterCompletedTest(RetireDispatchOrderingTest):
         import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution as de
 
         self._complete_at((("codex", "%old1"), ("claude", "%old2")))
-        original = de._live_locator_for
-        de._live_locator_for = lambda n: ""
-        self.addCleanup(setattr, de, "_live_locator_for", original)
+        original = de._live_generation_for
+        de._live_generation_for = lambda n, identity: ("", None)
+        self.addCleanup(setattr, de, "_live_generation_for", original)
         result = execute_dispatch(
             authorization=self._auth(self.wk), fence=self.outbox, send=self._send
         )
@@ -279,10 +301,13 @@ class RelaunchAfterCompletedTest(RetireDispatchOrderingTest):
         import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution as de
 
         with self.fence.transaction(self.unit, live_pair_present=True) as txn:
-            txn.reserve(pinned=(("claude", "%2"),))
-        original = de._live_locator_for
-        de._live_locator_for = lambda n: "%totally_other"
-        self.addCleanup(setattr, de, "_live_locator_for", original)
+            txn.reserve(pinned=self._pins((("claude", "%2"),)))
+        original = de._live_generation_for
+        de._live_generation_for = lambda n, identity: (
+            "%totally_other",
+            "startup:claude:%totally_other",
+        )
+        self.addCleanup(setattr, de, "_live_generation_for", original)
         result = execute_dispatch(
             authorization=self._auth(self.wk), fence=self.outbox, send=self._send
         )

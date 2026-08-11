@@ -129,8 +129,8 @@ def _seed_active_bound(
         expected_revision=rec.revision,
         action_id="rel-1",
         observation=build_release_observation([
-            ReleasePin("gateway", "codex-mzb1", "w2X:p3Q"),
-            ReleasePin("worker", "claude-mzb1", "w2X:p3R"),
+            ReleasePin("gateway", "codex-mzb1", "w2X:p3Q", "startup-action-current"),
+            ReleasePin("worker", "claude-mzb1", "w2X:p3R", "startup-action-current"),
         ]),
     )
     if release_target == RELEASE_REQUESTED:
@@ -293,7 +293,11 @@ class ActiveRetireCasMatrix(unittest.TestCase):
             _key(),
             expected_revision=rec.revision,
             action_id="rel-1",
-            observation=build_release_observation([ReleasePin("gateway", "codex-mzb1", "w2X:p3Q")]),
+            observation=build_release_observation([
+                ReleasePin(
+                    "gateway", "codex-mzb1", "w2X:p3Q", "startup-action-current"
+                )
+            ]),
         )
         self.assertFalse(out.applied)
         self.assertEqual(
@@ -357,7 +361,11 @@ class ActiveRetireCasMatrix(unittest.TestCase):
         rec = lifecycle.get(_key())
         req = lifecycle.request_release(
             _key(), expected_revision=rec.revision, action_id="rel-1",
-            observation=build_release_observation([ReleasePin("gateway", "codex-mzb1", "w2X:p3Q")]),
+            observation=build_release_observation([
+                ReleasePin(
+                    "gateway", "codex-mzb1", "w2X:p3Q", "startup-action-current"
+                )
+            ]),
         )
         self.assertFalse(req.applied)
         rec = lifecycle.get(_key())
@@ -786,7 +794,11 @@ class ActiveRetireDoesNotErodeSiblings(unittest.TestCase):
             key=_key() if False else _key(),
             expected_revision=rec.revision,
             action_id="rel-1",
-            observation=build_release_observation([ReleasePin("gateway", "codex-mzb1", "w2X:p3Q")]),
+            observation=build_release_observation([
+                ReleasePin(
+                    "gateway", "codex-mzb1", "w2X:p3Q", "startup-action-current"
+                )
+            ]),
         )
         rec = lifecycle.get(_key())
         lifecycle.record_release_outcome(

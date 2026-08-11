@@ -46,8 +46,16 @@ def _name(role: str) -> str:
 class _Ops:
     def __init__(self, *, gateway_epoch: str = "1", worker_epoch: str = "1") -> None:
         self._rows = [
-            {"name": _name("codex"), "pane_id": f"{WS}:p20"},
-            {"name": _name("claude"), "pane_id": f"{WS}:p21"},
+            {
+                "name": _name("codex"),
+                "pane_id": f"{WS}:p20",
+                "terminal_id": f"terminal:{WS}:p20",
+            },
+            {
+                "name": _name("claude"),
+                "pane_id": f"{WS}:p21",
+                "terminal_id": f"terminal:{WS}:p21",
+            },
         ]
         self._attestations = {
             _name("codex"): self._record("codex", "p20", gateway_epoch),
@@ -62,6 +70,7 @@ class _Ops:
             role=role,
             lane_id=LANE,
             locator=f"{WS}:{pane}",
+            terminal_id=f"terminal:{WS}:{pane}",
             verdict=VERDICT_PRESENT,
             # Deliberately older than the hibernate transition. A minted exact epoch, not
             # this caller-controlled clock, proves which generation the process belongs to.

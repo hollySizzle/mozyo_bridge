@@ -80,6 +80,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_runtime_fence import (  # noqa: E501
     SublaneHealError,
 )
+from tests.support.current_launch_authority import (  # noqa: E402
+    seed_completed_current_launch_authority,
+)
 
 _WS = "wsA"
 _LANE = "issue_13847_x"
@@ -112,6 +115,22 @@ def _ops(tmp, **kw):
 
 def _rec(revision=3, disposition=DISPOSITION_HIBERNATED):
     return SimpleNamespace(revision=revision, lane_disposition=disposition, lane_generation=2)
+
+
+def _seed_close_authority(tmp, *, assigned_name, locator, provider):
+    terminal_id = f"terminal:{locator}"
+    seed_completed_current_launch_authority(
+        Path(tmp),
+        workspace_id=_WS,
+        lane_id=_LANE,
+        role=provider,
+        assigned_name=assigned_name,
+        locator=locator,
+        terminal_id=terminal_id,
+        target_workspace="wZ",
+        target_tab="wZ:t1",
+    )
+    return [_row(assigned_name, locator)]
 
 
 class ObserveJoin(unittest.TestCase):
@@ -574,16 +593,25 @@ class CloseAndRelaunchDelegate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ops = _ops(tmp)
             calls = []
+            assigned_name = encode_assigned_name(_WS, "claude", _LANE)
+            rows = _seed_close_authority(
+                tmp,
+                assigned_name=assigned_name,
+                locator="wZ:p3H",
+                provider="claude",
+            )
 
             class _FakeQ:
                 def close_receiver(self, request, pin):
                     calls.append((request.assigned_name, pin.locator))
                     return SimpleNamespace(closed=True, old_absent=False)
 
-            with patch.object(type(ops), "_quarantine", return_value=_FakeQ()):
+            with patch.object(type(ops), "_quarantine", return_value=_FakeQ()), \
+                    patch.object(type(ops), "workspace_id", return_value=_WS), \
+                    patch.object(live, "list_herdr_agent_rows", return_value=rows):
                 ok = ops.close_bad_slot(
                     role="worker", provider="claude",
-                    assigned_name=encode_assigned_name(_WS, "claude", _LANE),
+                    assigned_name=assigned_name,
                     locator="wZ:p3H", action_id="a",
                 )
             self.assertTrue(ok)
@@ -592,15 +620,24 @@ class CloseAndRelaunchDelegate(unittest.TestCase):
     def test_close_old_absent_is_byte_preserving_success(self):
         with tempfile.TemporaryDirectory() as tmp:
             ops = _ops(tmp)
+            assigned_name = encode_assigned_name(_WS, "claude", _LANE)
+            rows = _seed_close_authority(
+                tmp,
+                assigned_name=assigned_name,
+                locator="wZ:p3H",
+                provider="claude",
+            )
 
             class _FakeQ:
                 def close_receiver(self, request, pin):
                     return SimpleNamespace(closed=False, old_absent=True)
 
-            with patch.object(type(ops), "_quarantine", return_value=_FakeQ()):
+            with patch.object(type(ops), "_quarantine", return_value=_FakeQ()), \
+                    patch.object(type(ops), "workspace_id", return_value=_WS), \
+                    patch.object(live, "list_herdr_agent_rows", return_value=rows):
                 ok = ops.close_bad_slot(
                     role="worker", provider="claude",
-                    assigned_name=encode_assigned_name(_WS, "claude", _LANE),
+                    assigned_name=assigned_name,
                     locator="wZ:p3H", action_id="a",
                 )
             self.assertTrue(ok, "a positively-absent exact slot is byte-preserving, not a failure")

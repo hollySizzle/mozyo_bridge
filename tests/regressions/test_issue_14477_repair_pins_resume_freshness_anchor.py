@@ -173,6 +173,12 @@ T_LATER = "2026-07-26T20:40:00+00:00"
 
 _GW_LOC = f"{_WS}:p4A"
 _WK_LOC = f"{_WS}:p4B"
+_STARTUP_ACTION = "startup-14477-current"
+
+
+def _terminal_id(locator: str) -> str:
+    """Stable synthetic server-owned terminal identity for one fake live locator."""
+    return f"terminal:{locator}"
 
 
 def _decision(journal: str = _JOURNAL) -> DecisionPointer:
@@ -235,6 +241,7 @@ def _attest(
         verdict=VERDICT_PRESENT,
         observed_at=observed_at,
         lane_epoch=lane_epoch,
+        terminal_id=_terminal_id(locator),
     )
 
 
@@ -251,8 +258,16 @@ class _FakeOps:
         lane_epoch: str = _CURRENT_EPOCH,
     ):
         self._rows = [
-            {"name": _gw_name(), "pane_id": gw_locator},
-            {"name": _wk_name(), "pane_id": wk_locator},
+            {
+                "name": _gw_name(),
+                "pane_id": gw_locator,
+                "terminal_id": _terminal_id(gw_locator),
+            },
+            {
+                "name": _wk_name(),
+                "pane_id": wk_locator,
+                "terminal_id": _terminal_id(wk_locator),
+            },
         ]
         self._attest = {
             _gw_name(): _attest(_GW_PROVIDER, gw_locator, observed_at, lane_epoch),
@@ -520,6 +535,9 @@ class PreV8CompatibilityTest(_Fixture):
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN release_observation")
             # v10 (#14756) added lane_epoch; a faithful pre-v10 rewind drops it too.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
+            # v11 (#15227) added reconcile_close_pin; retaining it would be a partial/newer
+            # shape merely stamped v7, not a genuine historical v7 store.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_close_pin")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 7 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -671,8 +689,8 @@ class ReleasedLocatorFenceTest(_Fixture):
                 expected_revision=self._rec().revision,
                 action_id="rel-again",
                 observation=build_release_observation([
-                    ReleasePin("gateway", _gw_name(), released[0]),
-                    ReleasePin("worker", _wk_name(), released[1]),
+                    ReleasePin("gateway", _gw_name(), released[0], _STARTUP_ACTION),
+                    ReleasePin("worker", _wk_name(), released[1], _STARTUP_ACTION),
                 ]),
                 now=now,
             ).applied
@@ -886,8 +904,12 @@ class ReleaseObservationBindingTest(_Fixture):
         self.assertTrue(out.applied, out.reason)
         fabricated = build_release_observation(
             (
-                ReleasePin("gateway", _gw_name(), f"{_WS}:pOTHER_G"),
-                ReleasePin("worker", _wk_name(), f"{_WS}:pOTHER_W"),
+                ReleasePin(
+                    "gateway", _gw_name(), f"{_WS}:pOTHER_G", _STARTUP_ACTION
+                ),
+                ReleasePin(
+                    "worker", _wk_name(), f"{_WS}:pOTHER_W", _STARTUP_ACTION
+                ),
             )
         )
         self.assertTrue(
@@ -1012,7 +1034,9 @@ class ReleaseAxisResetClearsObservationTest(_Fixture):
                 expected_revision=self.store.get(recovery).revision,
                 action_id="rel-recovery",
                 observation=build_release_observation([
-                    ReleasePin("gateway", _gw_name(), f"{_WS}:pREC_G"),
+                    ReleasePin(
+                        "gateway", _gw_name(), f"{_WS}:pREC_G", _STARTUP_ACTION
+                    ),
                 ]),
                 now=T_RELEASE,
             ).applied
@@ -1106,8 +1130,8 @@ class ReleaseAxisResetClearsObservationTest(_Fixture):
             )
             self.assertTrue(out.applied, out.reason)
         observation = build_release_observation([
-            ReleasePin("gateway", _gw_name(), _GW_LOC),
-            ReleasePin("worker", _wk_name(), _WK_LOC),
+            ReleasePin("gateway", _gw_name(), _GW_LOC, _STARTUP_ACTION),
+            ReleasePin("worker", _wk_name(), _WK_LOC, _STARTUP_ACTION),
         ])
         self.assertTrue(
             self.store.request_release(
@@ -1172,7 +1196,7 @@ class ReleaseAxisResetClearsObservationTest(_Fixture):
         build's row is read, this is the reason an operator sees — distinct from the in-flight
         case so the two are never confused.
         """
-        pins = (ReleasePin("gateway", _gw_name(), _GW_LOC),)
+        pins = (ReleasePin("gateway", _gw_name(), _GW_LOC, _STARTUP_ACTION),)
         violated = LaneLifecycleRecord(
             repo_workspace_id=_WS,
             lane_id=_LANE,
@@ -1188,7 +1212,7 @@ class ReleaseAxisResetClearsObservationTest(_Fixture):
         self.assertNotEqual(reason, OBSERVATION_GENERATION_NOT_COMPLETED)
 
     def _row_with_release_state(self, token: str) -> LaneLifecycleRecord:
-        pins = (ReleasePin("gateway", _gw_name(), _GW_LOC),)
+        pins = (ReleasePin("gateway", _gw_name(), _GW_LOC, _STARTUP_ACTION),)
         return LaneLifecycleRecord(
             repo_workspace_id=_WS,
             lane_id=_LANE,
@@ -1278,7 +1302,7 @@ class ReleaseAxisResetClearsObservationTest(_Fixture):
         ``absent`` when the observation was empty and ``unreadable`` when it was malformed — the
         state-specific reason only appeared when the observation happened to be valid.
         """
-        pins = (ReleasePin("gateway", _gw_name(), _GW_LOC),)
+        pins = (ReleasePin("gateway", _gw_name(), _GW_LOC, _STARTUP_ACTION),)
         for label, raw in (
             ("valid", encode_release_observation(build_release_observation(pins))),
             ("absent", ""),
@@ -1396,8 +1420,15 @@ class ReleasedLocatorVerdictUnitTest(unittest.TestCase):
     """
 
     def _rec(self, *, release=RELEASE_RELEASED, observation_raw=None, pins=None, locators=(_GW_LOC,)):
+        identities = (
+            ("gateway", _gw_name()),
+            ("worker", _wk_name()),
+        )
         obs = build_release_observation(
-            tuple(ReleasePin("gateway", _gw_name(), loc) for loc in locators)
+            tuple(
+                ReleasePin(role, name, locator, _STARTUP_ACTION)
+                for (role, name), locator in zip(identities, locators)
+            )
         )
         raw = encode_release_observation(obs) if observation_raw is None else observation_raw
         stored = obs.slots if pins is None else pins
@@ -1405,7 +1436,9 @@ class ReleasedLocatorVerdictUnitTest(unittest.TestCase):
             repo_workspace_id=_WS,
             lane_id=_LANE,
             process_release=release,
-            release_pins=encode_release_pins(stored) if stored else "",
+            # v2 complete-empty is a PRESENT envelope. Collapsing it to the legacy/absent
+            # empty string would turn positive zero-slot evidence into a pin mismatch.
+            release_pins=encode_release_pins(stored),
             release_observation=raw,
         )
 
@@ -1437,8 +1470,8 @@ class ReleasedLocatorVerdictUnitTest(unittest.TestCase):
 
     def test_pins_claiming_an_extra_slot_is_a_mismatch(self) -> None:
         extra = (
-            ReleasePin("gateway", _gw_name(), _GW_LOC),
-            ReleasePin("worker", _wk_name(), _WK_LOC),
+            ReleasePin("gateway", _gw_name(), _GW_LOC, _STARTUP_ACTION),
+            ReleasePin("worker", _wk_name(), _WK_LOC, _STARTUP_ACTION),
         )
         rec = self._rec(locators=(_GW_LOC,), pins=extra)
         self.assertEqual(released_locator_verdict(rec, [f"{_WS}:pN"]), (False, OBSERVATION_PIN_MISMATCH))
@@ -1466,14 +1499,16 @@ class ReleasedLocatorVerdictUnitTest(unittest.TestCase):
         with self.assertRaises(ReleaseObservationError):
             build_release_observation(
                 (
-                    ReleasePin("gateway", _gw_name(), _GW_LOC),
-                    ReleasePin("worker", _wk_name(), _GW_LOC),
+                    ReleasePin("gateway", _gw_name(), _GW_LOC, _STARTUP_ACTION),
+                    ReleasePin("worker", _wk_name(), _GW_LOC, _STARTUP_ACTION),
                 )
             )
 
     def test_a_slot_without_a_locator_is_refused_at_construction(self) -> None:
         with self.assertRaises(Exception):
-            build_release_observation((ReleasePin("gateway", _gw_name(), ""),))
+            build_release_observation(
+                (ReleasePin("gateway", _gw_name(), "", _STARTUP_ACTION),)
+            )
 
 
 
@@ -1506,6 +1541,13 @@ class DriverDerivedObservationE2ETest(_Fixture):
             from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
                 HerdrRetireCloseResult,
             )
+            closed_locators = {locator for _role, locator in plan.close_targets}
+            # The production rail performs a fresh full-inventory read after close. Model
+            # the successful close in that authoritative observation instead of returning
+            # the same pre-close rows forever.
+            self._rows = [
+                row for row in self._rows if row.get("pane_id") not in closed_locators
+            ]
             return HerdrRetireCloseResult(
                 workspace_id=plan.workspace_id,
                 lane_id=plan.lane_id,
@@ -1519,10 +1561,39 @@ class DriverDerivedObservationE2ETest(_Fixture):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_process_release import (  # noqa: E501
             drive_process_release,
         )
+        from tests.support.current_launch_authority import (
+            seed_completed_current_launch_authority,
+        )
+
         rows = [
-            {"name": _gw_name(), "pane_id": live[0]},
-            {"name": _wk_name(), "pane_id": live[1]},
+            {
+                "name": _gw_name(),
+                "pane_id": live[0],
+                "terminal_id": _terminal_id(live[0]),
+            },
+            {
+                "name": _wk_name(),
+                "pane_id": live[1],
+                "terminal_id": _terminal_id(live[1]),
+            },
         ]
+        for role, assigned_name, locator in (
+            (_GW_PROVIDER, _gw_name(), live[0]),
+            (_WK_PROVIDER, _wk_name(), live[1]),
+        ):
+            seed_completed_current_launch_authority(
+                self.path.parent,
+                workspace_id=_WS,
+                lane_id=_LANE,
+                role=role,
+                assigned_name=assigned_name,
+                locator=locator,
+                terminal_id=_terminal_id(locator),
+                # Receipt topology is an explicit Herdr container identity. It is separate
+                # from the logical repo-workspace segment used in the managed name.
+                target_workspace="w28",
+                target_tab="w28:t1",
+            )
         return drive_process_release(
             store=self.store,
             ops=self._ReleaseOps(rows),
@@ -1977,7 +2048,11 @@ class StoredAuthorityIsNeverNormalisedTest(_Fixture):
                     self.key,
                     expected_revision=self._rec().revision,
                     action_id="probe-open",
-                    pins=[ReleasePin("worker", _wk_name(), f"{_WS}:pOLD")],
+                    pins=[
+                        ReleasePin(
+                            "worker", _wk_name(), f"{_WS}:pOLD", _STARTUP_ACTION
+                        )
+                    ],
                     decision=_decision(),
                 )
                 self.assertFalse(out.applied)
@@ -1996,7 +2071,9 @@ class StoredAuthorityIsNeverNormalisedTest(_Fixture):
             self.key,
             expected_revision=self._rec().revision,
             action_id="probe-advance",
-            pins=[ReleasePin("worker", _wk_name(), f"{_WS}:pOLD")],
+            pins=[
+                ReleasePin("worker", _wk_name(), f"{_WS}:pOLD", _STARTUP_ACTION)
+            ],
             decision=_decision(),
         )
         self.assertTrue(opened.applied, opened.reason)
@@ -2117,7 +2194,9 @@ class StoredAuthorityIsNeverNormalisedTest(_Fixture):
             self.key,
             expected_revision=self._rec().revision,
             action_id="probe-canonical",
-            pins=[ReleasePin("worker", _wk_name(), f"{_WS}:pOLD")],
+            pins=[
+                ReleasePin("worker", _wk_name(), f"{_WS}:pOLD", _STARTUP_ACTION)
+            ],
             decision=_decision(),
         )
         self.assertTrue(out.applied, out.reason)
@@ -2520,6 +2599,7 @@ class StoredBindingKindIsNeverNormalisedTest(_Fixture):
             # A genuine v4 shape lacks every column added after it, not only the v5 tranche —
             # the schema gate matches the FULL signature and refuses a partial rewind.
             for column in (
+                "reconcile_close_pin",  # v11
                 "lane_epoch",  # v10
                 "release_observation",  # v9
                 "hibernated_at",  # v8

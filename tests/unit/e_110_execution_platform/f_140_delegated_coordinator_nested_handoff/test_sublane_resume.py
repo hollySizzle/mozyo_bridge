@@ -75,7 +75,11 @@ STALE_AT = "2026-07-13T13:20:00+00:00"
 
 
 def _row(role: str, lane: str, locator: str) -> dict:
-    return {"name": encode_assigned_name(WS, role, lane), "pane_id": locator}
+    return {
+        "name": encode_assigned_name(WS, role, lane),
+        "pane_id": locator,
+        "terminal_id": f"terminal:{locator}",
+    }
 
 
 def _attest(
@@ -102,6 +106,7 @@ def _attest(
         role=role,
         lane_id=lane,
         locator=locator,
+        terminal_id=f"terminal:{locator}",
         verdict=verdict,
         observed_at=observed_at,
         lane_epoch=lane_epoch,
@@ -222,11 +227,13 @@ class SublaneResumeTest(unittest.TestCase):
                         role="codex",
                         assigned_name=encode_assigned_name(WS, "codex", LANE),
                         locator=f"{WS}:pOLD_GW",
+                        startup_action_id="startup-action-current",
                     ),
                     ReleasePin(
                         role="claude",
                         assigned_name=encode_assigned_name(WS, "claude", LANE),
                         locator=f"{WS}:pOLD_WK",
+                        startup_action_id="startup-action-current",
                     ),
                 ]),
                 now=HIBERNATE_AT,
@@ -527,6 +534,7 @@ class SublaneResumeTest(unittest.TestCase):
                         role="codex",
                         assigned_name=encode_assigned_name(WS, "codex", LANE),
                         locator=f"{WS}:p20",
+                        startup_action_id="startup-action-current",
                     )
                 ]),
                 now=HIBERNATE_AT,

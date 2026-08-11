@@ -1,4 +1,4 @@
-"""herdr command invocation + workspace/tab creation & root-pane reclaim.
+"""Herdr invocation plus workspace/tab creation and root observation.
 
 The third cohesive sibling of :mod:`herdr_session_start`, alongside
 :mod:`herdr_lane_topology` (the pure placement / parse decision core) and
@@ -9,17 +9,15 @@ fail-closed command runner every step shares (:func:`_invoke`), the ``agent list
 (:func:`_create_workspace`, :func:`_create_tab`, :func:`_close_base_pane`).
 
 Homing them here — the extraction the ``module_health.yaml`` allowlist entry for
-``herdr_session_start`` pre-declared ("a further reduction could extract the empty-base-pane
-/ tab reclaim helpers if this grows"), carried out when Redmine #13646 added the
+``herdr_session_start`` pre-declared, carried out when Redmine #13646 added the
 config-driven ``lane_placement`` axis — keeps the session-start composition root focused on
-classification / placement / reclaim *orchestration* and drops it back under the
+classification / placement / root-preservation orchestration and drops it back under the
 module-health threshold.
 
-The reclaim contract is unchanged (Redmine #13330 / #13411): a workspace / tab this run
-**creates** is the only reclaim target, so its empty root pane is a *known* handle rather
-than one scanned for (a user's own shell can never be mis-closed); a create that returns an
-unparseable payload fails closed rather than guessing a pane; and a ``pane close`` failure
-is recorded non-fatally (the agents are already live, an empty root pane is only cosmetic).
+The #15227 contract treats a created root locator as exact observation but not destructive
+authority. Unparseable create output fails closed; generation-unbound roots are preserved.
+The low-level close helper remains for callers that independently prove fresh v4 and
+completed generation-v2 authority and must never be used as a root-locator fallback.
 """
 
 from __future__ import annotations
@@ -806,7 +804,13 @@ def preflight_generation_protocol_capability(
         )
 
 
-def _list_rows(binary: str, runner: Runner, timeout: float) -> Sequence[Mapping[str, object]]:
+def _list_rows(
+    binary: str,
+    runner: Runner,
+    timeout: float,
+    *,
+    binding_store=None,
+) -> Sequence[Mapping[str, object]]:
     """Return logicalized inventory rows; preserve the raw name as ``native_name``."""
     completed = _invoke(binary, ["agent", "list"], runner, timeout, env=None)
     rows = _extract_list_rows(completed.stdout)
@@ -820,7 +824,7 @@ def _list_rows(binary: str, runner: Runner, timeout: float) -> Sequence[Mapping[
     )
 
     try:
-        return logicalize_agent_rows(rows)
+        return logicalize_agent_rows(rows, store=binding_store)
     except HerdrNativeIdentityBindingError as exc:
         raise HerdrSessionStartError(
             "herdr agent inventory contains a managed native name whose logical "
@@ -855,9 +859,8 @@ def _create_workspace(
 ) -> tuple[str, str]:
     """Explicitly create a herdr workspace; return ``(workspace_id, root_pane_id)``.
 
-    Making the workspace ourselves (rather than letting the first ``agent start``
-    auto-create it) is what turns the empty base pane into a *known* handle we can
-    reclaim by id — never one we scan for. ``--no-focus`` avoids stealing the
+    Making the workspace ourselves turns the empty base pane into an exact observation,
+    never generation-bound close authority and never one we scan for. ``--no-focus`` avoids stealing the
     operator's focus. ``label`` names a minted workspace for the operator: for a
     **sublane host** (Redmine #13380) it is cosmetic and never a join key; for the
     **shared coordinators space** (Redmine #14139) the SAME label
@@ -882,7 +885,7 @@ def _create_workspace(
         raise HerdrSessionStartError(
             "herdr workspace create returned no parseable workspace id / root pane "
             "(expected result.workspace.workspace_id + result.root_pane.pane_id in a "
-            "workspace_created payload); refuse to guess a pane to reclaim"
+            "workspace_created payload); refuse to guess a root observation"
         )
     return parsed
 
@@ -899,9 +902,9 @@ def _create_tab(
 
     Lane=tab subdivision (Redmine #13411): a non-default lane gets its OWN tab in
     the sublane host workspace, its gateway + worker placed as a split pair inside
-    it. Minting the tab ourselves turns its empty root pane into a *known* handle
-    to reclaim by id (the tab analogue of the #13330 workspace base pane), never
-    one we scan for. ``--label`` (the lane label) is cosmetic and operator-readable
+    it. Minting the tab ourselves makes its empty root pane an exact observation
+    (the tab analogue of the #13330 workspace base pane), never generation-bound
+    close authority and never one we scan for. ``--label`` is cosmetic and operator-readable
     only — every join decision keys on the live ``tab_id``, never the label.
     ``--no-focus`` avoids stealing the operator's focus. Fails closed if the
     response is unparseable.
@@ -916,7 +919,7 @@ def _create_tab(
         raise HerdrSessionStartError(
             "herdr tab create returned no parseable tab id / root pane "
             "(expected result.tab.tab_id + result.root_pane.pane_id in a "
-            "tab_created payload); refuse to guess a pane to reclaim"
+            "tab_created payload); refuse to guess a root observation"
         )
     return parsed
 
@@ -928,13 +931,12 @@ def _close_base_pane(
     timeout: float,
     env: Mapping[str, str],
 ) -> tuple[bool, str]:
-    """Reclaim a created root pane; **never hard-fail** (cosmetic residue only).
+    """Low-level locator close; callers must first prove destructive authority.
 
-    Used for both the #13330 workspace base pane and the #13411 lane tab root
-    pane. Returns ``(True, "")`` on a clean close, else ``(False, <detail>)``. A
-    failed reclaim only leaves the harmless empty root pane behind — the agent
-    slots are already live — so it is recorded, not raised (Redmine #13330 ruling
-    j#73225).
+    The provider cannot condition this mutation on terminal generation. Current
+    #15227 code therefore never calls it for generation-unbound workspace/tab roots;
+    guarded retire/recovery callers must supply their own fresh v4 + generation-v2
+    admission. Returns a bounded fixed-shape result rather than raising.
     """
     try:
         _invoke(binary, ["pane", "close", pane_id], runner, timeout, env=dict(env))

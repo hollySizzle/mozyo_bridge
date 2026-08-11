@@ -39,8 +39,14 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 
 
 def _ok_view(segment: str = "ws-a", agents=()) -> HerdrInventoryView:
+    agents = tuple(agents)
     return HerdrInventoryView(
-        backend_selected=True, ok=True, workspace_segment=segment, agents=agents
+        backend_selected=True,
+        ok=True,
+        workspace_segment=segment,
+        agents=agents,
+        raw_row_count=len(agents),
+        invalid_row_count=0,
     )
 
 
@@ -98,8 +104,18 @@ class EvaluateHerdrSectionTest(unittest.TestCase):
         ours = encode_assigned_name("ws-a", "claude", "")
         agents = project_observed_agents(
             [
-                {"name": ours, "agent_status": "working", "pane_id": "%5"},
-                {"name": "foreign", "agent_status": "idle"},
+                {
+                    "name": ours,
+                    "agent_status": "working",
+                    "pane_id": "%5",
+                    "terminal_id": "terminal:%5",
+                },
+                {
+                    "name": "foreign",
+                    "agent_status": "idle",
+                    "pane_id": "%6",
+                    "terminal_id": "terminal:%6",
+                },
             ]
         )
         section = evaluate_herdr_section(_ok_view(agents=agents))
@@ -128,7 +144,14 @@ class HerdrSectionAttestationTest(unittest.TestCase):
     def _view_with_agent(self, locator="%5"):
         ours = encode_assigned_name("ws-a", "claude", "")
         agents = project_observed_agents(
-            [{"name": ours, "agent_status": "working", "pane_id": locator}]
+            [
+                {
+                    "name": ours,
+                    "agent_status": "working",
+                    "pane_id": locator,
+                    "terminal_id": f"terminal:{locator}",
+                }
+            ]
         )
         return ours, _ok_view(agents=agents)
 
@@ -140,6 +163,7 @@ class HerdrSectionAttestationTest(unittest.TestCase):
             lane_id="default",
             locator=locator,
             verdict=verdict,
+            terminal_id=f"terminal:{locator}",
         )
 
     def test_absent_record_is_warning_and_notes_self_attestation(self) -> None:

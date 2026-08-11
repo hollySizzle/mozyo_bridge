@@ -14,16 +14,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Mapping, Optional, Protocol, Sequence
 
-from mozyo_bridge.core.state.herdr_identity_attestation import (
-    HerdrIdentityAttestationStore,
-    VERDICT_PRESENT,
-    evaluate_attestation,
-)
-from mozyo_bridge.core.state.herdr_launch_generation import (
-    GENERATION_ATTESTED,
-    GENERATION_PENDING,
-    HerdrLaunchGenerationStore,
-)
 from mozyo_bridge.core.state.herdr_native_identity_binding import native_name_for
 
 from mozyo_bridge.core.state.startup_transaction_fence import (
@@ -41,9 +31,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _agent_locator,
     _norm,
     _norm_lane,
-    terminal_identity_of_live_slot,
     terminal_identity_of_row,
-    terminal_identity_snapshot_complete,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E501
     SLOT_STALE,
@@ -79,6 +67,20 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     SessionRollbackVerdict as ContractSessionRollbackVerdict,
     StartupRollbackAgentTarget,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_rollback_identity import (  # noqa: E501
+    PREPARED_PANE_ABSENT,
+    PREPARED_PANE_PRESENT,
+    PREPARED_PANE_UNREADABLE,
+    ROLLBACK_PREPARED_NATIVE_MISMATCH,
+    ROLLBACK_PREPARED_PANE_UNVERIFIABLE,
+    ROLLBACK_PREPARED_RECEIPT_INVALID,
+    historical_agent_generation_state as _historical_agent_generation_state,
+    inventory_identity_complete as _inventory_identity_complete,
+    name_matches as _name_matches,
+    prepared_pane_verdict as _prepared_pane_verdict,
+    terminal_bound_action_target as _terminal_bound_action_target,
+    terminal_bound_action_target_absent as _terminal_bound_action_target_absent,
+)
 
 #: Refusals that are about the ACTION, not about any one participant.
 REASON_OK = "ok"
@@ -90,14 +92,6 @@ REASON_BUSY = "rollback_busy"
 REASON_BLOCKED = "rollback_blocked"
 REASON_INCOMPLETE = "rollback_incomplete"
 REASON_PREFLIGHT = "preflight_only"
-
-#: Prepared panes have no terminal pin and are observation-only.
-PREPARED_PANE_PRESENT = "present"
-PREPARED_PANE_ABSENT = "absent"
-PREPARED_PANE_UNREADABLE = "unreadable"
-ROLLBACK_PREPARED_PANE_UNVERIFIABLE = "prepared_pane_unverifiable"
-ROLLBACK_PREPARED_RECEIPT_INVALID = "prepared_pane_receipt_invalid"
-ROLLBACK_PREPARED_NATIVE_MISMATCH = "prepared_pane_native_identity_mismatch"
 
 #: Non-terminal phases that may already carry participants and therefore rollback debt.
 ACTIONABLE_PHASES: frozenset[str] = frozenset(
@@ -258,267 +252,6 @@ def _facts_for(
     return ParticipantFacts(**base), blocker
 
 
-def _terminal_bound_action_target(store_home, action, participant, rows, locator) -> bool:
-    """Join one live slot to this exact startup action without exposing its terminal id."""
-    live_terminal_id = terminal_identity_of_live_slot(
-        participant.assigned_name, locator, rows
-    )
-    try:
-        attestation = HerdrIdentityAttestationStore(home=store_home).read(
-            participant.assigned_name
-        )
-        generation = HerdrLaunchGenerationStore(home=store_home).read(
-            participant.assigned_name
-        )
-    except Exception:  # noqa: BLE001 - unreadable current authority never licenses close
-        return False
-    attested = evaluate_attestation(
-        attestation,
-        live_locator=locator,
-        live_terminal_id=live_terminal_id,
-        expected_workspace_id=action.unit.workspace_id,
-        expected_role=participant.role,
-        expected_lane=action.unit.lane_id,
-    )
-    return bool(
-        attested.ok
-        and generation is not None
-        and _norm(getattr(generation, "phase", "")) == GENERATION_ATTESTED
-        and _norm(getattr(generation, "verdict", "")) == VERDICT_PRESENT
-        and _norm(getattr(generation, "startup_action_id", ""))
-        == _norm(action.action_id)
-        and _norm(getattr(generation, "assigned_name", ""))
-        == _norm(participant.assigned_name)
-        and _norm(getattr(generation, "workspace_id", ""))
-        == _norm(action.unit.workspace_id)
-        and _norm(getattr(generation, "role", "")) == _norm(participant.role)
-        and _norm_lane(getattr(generation, "lane_id", ""))
-        == _norm_lane(action.unit.lane_id)
-        and _norm(getattr(generation, "locator", "")) == locator
-        and getattr(generation, "terminal_id", "") == live_terminal_id
-    )
-
-
-def _terminal_bound_action_target_absent(
-    store_home, action, participant, rows, *, generation_override=None
-) -> bool:
-    """Prove one recorded normal participant's private generation terminal absent."""
-    try:
-        snapshot = tuple(rows)
-        if not terminal_identity_snapshot_complete(snapshot):
-            return False
-        receipt = parse_pane_bound_receipt(participant.receipt)
-        if receipt is None:
-            return False
-        generation = generation_override
-        if generation is None:
-            generation = HerdrLaunchGenerationStore(home=store_home).read(
-                participant.assigned_name
-            )
-        attestation = HerdrIdentityAttestationStore(home=store_home).read(
-            participant.assigned_name
-        )
-    except Exception:  # noqa: BLE001 - historical absence is a positive proof
-        return False
-    terminal_id = getattr(generation, "terminal_id", "")
-    return bool(
-        generation is not None
-        and _norm(getattr(generation, "phase", "")) == GENERATION_ATTESTED
-        and _norm(getattr(generation, "verdict", "")) == VERDICT_PRESENT
-        and _norm(getattr(generation, "startup_action_id", "")) == _norm(action.action_id)
-        and _norm(getattr(generation, "assigned_name", ""))
-        == _norm(participant.assigned_name)
-        and _norm(getattr(generation, "workspace_id", ""))
-        == _norm(action.unit.workspace_id)
-        and _norm(getattr(generation, "role", "")) == _norm(participant.role)
-        and _norm_lane(getattr(generation, "lane_id", ""))
-        == _norm_lane(action.unit.lane_id)
-        and _norm(getattr(generation, "locator", "")) == _norm(participant.locator)
-        and type(terminal_id) is str and terminal_id and terminal_id.strip() == terminal_id
-        and receipt.native_name == native_name_for(participant.assigned_name)
-        and receipt.terminal_id == terminal_id
-        and evaluate_attestation(
-            attestation,
-            live_locator=participant.locator,
-            live_terminal_id=terminal_id,
-            expected_workspace_id=action.unit.workspace_id,
-            expected_role=participant.role,
-            expected_lane=action.unit.lane_id,
-        ).ok
-        and not any(
-            row.get(AGENT_KEY_NAME) == participant.assigned_name
-            or _agent_locator(row) == participant.locator
-            or terminal_identity_of_row(row) == terminal_id
-            for row in snapshot
-        )
-    )
-
-
-def _historical_agent_generation_state(store_home, action, participant, rows) -> str:
-    """Return ``absent``, ``blocked``, or ``none`` for a no-live-name participant."""
-    try:
-        generation = HerdrLaunchGenerationStore(home=store_home).read(
-            participant.assigned_name
-        )
-    except Exception:  # noqa: BLE001 - unreadable history cannot become prepared authority
-        return "blocked"
-    if generation is None:
-        return "none"
-    if (
-        _norm(getattr(generation, "phase", "")) == GENERATION_PENDING
-        and _norm(getattr(generation, "startup_action_id", "")) == _norm(action.action_id)
-        and _norm(getattr(generation, "assigned_name", ""))
-        == _norm(participant.assigned_name)
-        and _norm(getattr(generation, "workspace_id", ""))
-        == _norm(action.unit.workspace_id)
-        and _norm(getattr(generation, "role", "")) == _norm(participant.role)
-        and _norm_lane(getattr(generation, "lane_id", ""))
-        == _norm_lane(action.unit.lane_id)
-    ):
-        return "none"
-    if _terminal_bound_action_target_absent(
-        store_home, action, participant, rows, generation_override=generation
-    ):
-        return "absent"
-    return "blocked"
-
-
-def _name_matches(participant, rows) -> list[Mapping[str, object]]:
-    return [
-        row
-        for row in rows
-        if isinstance(row, Mapping)
-        and _norm(row.get(AGENT_KEY_NAME)) == _norm(participant.assigned_name)
-    ]
-
-
-def _inventory_identity_complete(rows) -> bool:
-    """Require one complete globally unique terminal-identity snapshot."""
-    return terminal_identity_snapshot_complete(rows)
-
-
-def _prepared_pane_verdict(
-    ops: StartupRollbackOps,
-    participant,
-    receipt,
-    *,
-    inventory_readable: bool,
-    obligation_names: set,
-    obligation_unreadable: bool,
-    conditional_close_supported: bool,
-    inventory_rows: Sequence[Mapping[str, object]],
-) -> ParticipantVerdict:
-    """Classify a receipt-bound pane whose logical agent row is absent.
-
-    The old agent-only rule treated an absent agent row as a settled participant.  That
-    is false during Herdr 0.8's split-before-start interval: the shell pane is already a
-    side effect.  It is closeable only from every positive fact below; an unavailable
-    input-state fact therefore preserves the pane.
-    """
-    if not inventory_readable:
-        verdict = ROLLBACK_INVENTORY_UNREADABLE
-        detail = ROLLBACK_DETAIL[verdict]
-    elif obligation_unreadable:
-        verdict = ROLLBACK_OBLIGATION_UNREADABLE
-        detail = ROLLBACK_DETAIL[verdict]
-    elif participant.assigned_name in obligation_names:
-        verdict = ROLLBACK_WORK_OBLIGATION
-        detail = ROLLBACK_DETAIL[verdict]
-    else:
-        if receipt.native_name != native_name_for(participant.assigned_name):
-            return ParticipantVerdict(
-                role=participant.role,
-                assigned_name=participant.assigned_name,
-                locator=participant.locator,
-                verdict=ROLLBACK_PREPARED_NATIVE_MISMATCH,
-                detail="the prepared pane receipt has a foreign native identity",
-                closed=participant.closed,
-                prepared_pane=True,
-            )
-        try:
-            observation = ops.prepared_pane(
-                locator=participant.locator,
-                workspace_id=receipt.workspace_id,
-                tab_id=receipt.tab_id,
-                expected_terminal_id=receipt.terminal_id,
-            )
-        except Exception:  # noqa: BLE001 - absence of a positive pane read blocks close
-            observation = PreparedPaneObservation(
-                state=PREPARED_PANE_UNREADABLE,
-                detail="prepared pane inventory could not be read",
-            )
-        terminal_reclaimed = bool(
-            receipt.terminal_id
-            and any(
-                terminal_identity_of_row(row) == receipt.terminal_id
-                for row in inventory_rows
-            )
-        )
-        pane_terminal_clear = (
-            not receipt.terminal_id or observation.terminal_reclaimed is False
-        )
-        if (
-            observation.state == PREPARED_PANE_ABSENT
-            and not terminal_reclaimed
-            and pane_terminal_clear
-        ):
-            verdict = ROLLBACK_ABSENT
-            detail = (
-                "the pane-bound locator is positively absent from the complete Herdr "
-                "pane inventory; there is nothing to close"
-            )
-        elif (
-            not receipt.terminal_id
-            or terminal_reclaimed
-            or observation.terminal_reclaimed is True
-        ):
-            verdict = ROLLBACK_PREPARED_TERMINAL_MISMATCH
-            detail = "the pane-bound receipt has no terminal generation identity"
-        elif (
-            observation.state == PREPARED_PANE_PRESENT
-            and observation.terminal_id != receipt.terminal_id
-        ):
-            verdict = ROLLBACK_PREPARED_TERMINAL_MISMATCH
-            detail = "the live prepared pane terminal generation changed"
-        elif (
-            observation.state == PREPARED_PANE_PRESENT
-            and observation.locator == participant.locator
-            and observation.workspace_id == receipt.workspace_id
-            and observation.tab_id == receipt.tab_id
-            and observation.agent_absent is True
-            and observation.shell_only is True
-            and observation.input_empty is True
-        ):
-            verdict = (
-                ROLLBACK_ELIGIBLE
-                if conditional_close_supported
-                else ROLLBACK_CONDITIONAL_CLOSE_UNAVAILABLE
-            )
-            detail = ROLLBACK_DETAIL.get(
-                verdict, "the exact prepared pane generation is conditionally closeable"
-            )
-        elif observation.state == PREPARED_PANE_PRESENT:
-            verdict = ROLLBACK_PREPARED_PANE_UNVERIFIABLE
-            detail = (
-                "the prepared pane lacks an exact terminal-bound conditional-close proof"
-            )
-        else:
-            verdict = ROLLBACK_PREPARED_PANE_UNVERIFIABLE
-            detail = observation.detail or (
-                "the action-recorded prepared pane could not be proven to have the same "
-                "container, no agent, only its shell, and no input; refusing to close it"
-            )
-    return ParticipantVerdict(
-        role=participant.role,
-        assigned_name=participant.assigned_name,
-        locator=participant.locator,
-        verdict=verdict,
-        detail=detail,
-        closed=participant.closed,
-        prepared_pane=True,
-    )
-
-
 def run_session_rollback(
     *,
     action_id: str,
@@ -531,12 +264,12 @@ def run_session_rollback(
     fence = fence or StartupTransactionFence(home=home)
     try:
         action = fence.read(action_id)
-    except StartupTransactionError as exc:
+    except StartupTransactionError:
         return SessionRollbackVerdict(
             action_id=action_id,
             state="blocked",
             reason=REASON_AUTHORITY_UNAVAILABLE,
-            detail=str(exc),
+            detail="startup rollback authority is unreadable",
         )
     if action is None:
         return SessionRollbackVerdict(
@@ -580,18 +313,21 @@ def run_session_rollback(
             return _rollback_locked(
                 action_id, pre_lock, ops, fence, execute=execute
             )
-    except StartupTransactionBusy as exc:
+    except StartupTransactionBusy:
         return SessionRollbackVerdict(
-            action_id=action_id, state="blocked", reason=REASON_BUSY, detail=str(exc)
+            action_id=action_id,
+            state="blocked",
+            reason=REASON_BUSY,
+            detail="startup rollback authority is busy",
         )
-    except StartupTransactionError as exc:
+    except StartupTransactionError:
         return SessionRollbackVerdict(
             action_id=action_id,
             state="blocked",
             reason=REASON_AUTHORITY_UNAVAILABLE,
-            detail=str(exc),
+            detail="startup rollback authority became unavailable",
         )
-    except Exception as exc:  # noqa: BLE001 - the public rail's "never raises" is a hard
+    except Exception:  # noqa: BLE001 - the public rail's "never raises" is a hard
         # contract (review j#81224 R7-F4). The port-specific handlers above turn a live
         # port failure into a structured verdict; this backstop guarantees that even an
         # unforeseen exception surfaces as a fail-closed refusal, never a stack trace out
@@ -600,7 +336,7 @@ def run_session_rollback(
             action_id=action_id,
             state="blocked",
             reason=REASON_BLOCKED,
-            detail=f"the rollback could not complete ({type(exc).__name__}: {exc})",
+            detail="startup rollback execution failed",
         )
 
 
@@ -630,7 +366,7 @@ def _observe(action, ops: StartupRollbackOps, *, store_home: Path) -> tuple[list
     for participant in action.participants:
         try:
             pane_receipt = parse_pane_bound_receipt(participant.receipt)
-        except PaneBoundReceiptError as exc:
+        except PaneBoundReceiptError:
             verdicts.append(
                 ParticipantVerdict(
                     role=participant.role,
@@ -639,7 +375,7 @@ def _observe(action, ops: StartupRollbackOps, *, store_home: Path) -> tuple[list
                     verdict=ROLLBACK_PREPARED_RECEIPT_INVALID,
                     detail=(
                         "the participant claims pane-bound authority but its receipt is "
-                        f"invalid ({exc}); refusing to reinterpret it as a legacy launch"
+                        "invalid; refusing to reinterpret it as a legacy launch"
                     ),
                     closed=participant.closed,
                     # A durable closed flag is replay authority even when an old or
@@ -1102,14 +838,14 @@ def _execute_rollback(action_id, action, ops, fence, verdicts, *, store_home):
         )
     try:
         fence.set_phase(action_id, PHASE_COMPLETED_ROLLED_BACK)
-    except StartupTransactionError as exc:
+    except StartupTransactionError:
         # The panes ARE gone; we simply cannot prove it durably. Withhold the success
         # rather than fabricate it — there is no capacity leak either way (#13892 j#80526).
         return SessionRollbackVerdict(
             action_id=action_id,
             state="incomplete",
             reason=REASON_INCOMPLETE,
-            detail=f"the rollback completed but its record could not be written ({exc})",
+            detail="the rollback completed but its record could not be written",
             executed=True,
             participants=tuple(settled),
         )

@@ -257,6 +257,7 @@ class HerdrLivePairPlacementTests(unittest.TestCase):
         order: tuple[str, str] = PROVIDERS,
         ratio: float = 0.5,
         third_pane: bool = False,
+        cosmetic_root: bool = False,
     ):
         herdr = PairPlacementHerdr("w1")
         root = Path(self.record.canonical_path)
@@ -264,10 +265,20 @@ class HerdrLivePairPlacementTests(unittest.TestCase):
         tab = herdr.new_tab()
         first_name = encode_assigned_name(WORKSPACE_ID, order[0], LANE_ID)
         second_name = encode_assigned_name(WORKSPACE_ID, order[1], LANE_ID)
-        first_pane = herdr.seed_pane(tab, first_name)
+        if cosmetic_root:
+            root_pane = herdr.seed_pane(tab)
+            first_pane = herdr.split_pane(
+                tab,
+                root_pane,
+                "right",
+                first_name,
+            )
+        else:
+            first_pane = herdr.seed_pane(tab, first_name)
         second_pane = herdr.split_pane(tab, first_pane, split, second_name)
-        if isinstance(tab.root, Split):
-            tab.root.ratio = ratio
+        pair_split = tab.root.second if cosmetic_root else tab.root
+        if isinstance(pair_split, Split):
+            pair_split.ratio = ratio
         if third_pane:
             herdr.split_pane(tab, second_pane, "right")
 
@@ -350,6 +361,27 @@ class HerdrLivePairPlacementTests(unittest.TestCase):
         generations.replace_after_reads = 2
 
         result = service.apply(WORKSPACE_ID)
+
+        self.assertEqual(result.status, APPLY_REFUSED)
+        self.assertEqual(result.reason, REASON_STALE)
+        self.assertEqual(self._mutations(herdr), [])
+
+    def test_apply_refuses_external_root_split_drift_before_first_effect(self) -> None:
+        service, herdr, _, _ = self._build(
+            split="down",
+            ratio=0.7,
+            cosmetic_root=True,
+        )
+        opening = service.preview(WORKSPACE_ID)
+        self.assertEqual(opening.status, PLAN_READY)
+        herdr.calls.clear()
+        # Change only the external split evidence in the next fresh layout.  Pane
+        # rectangles and the managed pair itself stay byte-identical, so this
+        # specifically pins the scope fingerprint rather than the old bbox check.
+        herdr.layout_split_ratio_overrides_once["split_0_root"] = 0.3
+
+        with patch.object(service, "preview", return_value=opening):
+            result = service.apply(WORKSPACE_ID)
 
         self.assertEqual(result.status, APPLY_REFUSED)
         self.assertEqual(result.reason, REASON_STALE)
@@ -563,7 +595,7 @@ class HerdrLivePairPlacementTests(unittest.TestCase):
 
         plan = service.preview(WORKSPACE_ID)
 
-        self.assertEqual(plan.reason, "geometry_unsupported")
+        self.assertEqual(plan.reason, REASON_NOT_DEDICATED_PAIR)
         self.assertEqual(self._mutations(herdr), [])
 
     def test_invalid_tab_locator_refuses_before_mutation(self) -> None:

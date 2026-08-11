@@ -26,13 +26,14 @@ Flow (per requested provider agent, ``claude`` / ``codex``):
 Duplicate requested ``(provider, lane)`` slots fail closed **before any side effect**
 (spec §5 slot-uniqueness) so the same durable name is never minted twice.
 
-Pane-bound launch and root reclaim (Redmine #13330, #15101)
------------------------------------------------------------
+Pane-bound launch and root preservation (Redmine #13330, #15101, #15227)
+-------------------------------------------------------------------------
 Herdr 0.8 no longer places a process while starting it. A cold run explicitly creates
 the workspace or tab, splits its run-owned root pane (or an exact live managed pane),
-and starts each provider in that prepared pane. After every launch succeeds, geometry
-finalization closes only the root captured by this run. A failure retains typed startup
-debt for the public rollback path; it never scans for or closes an unowned shell pane.
+and starts each provider in that prepared pane. The captured root lacks a terminal-bound
+generation pin, so geometry finalization records typed preservation and never closes it
+by locator. A failure retains typed startup debt for the public rollback path; it never
+scans for or closes an unowned shell pane.
 
 Placement: dedicated sublane host workspace (Redmine #13380)
 ------------------------------------------------------------
@@ -44,8 +45,8 @@ the project workspace while every lane slot lands in a single dedicated sublane
 host workspace — a constant "project 1 + host 1", never scaling with lanes. The
 join rule lives in :func:`_launch_target_for_lane`; the host is minted on demand
 with an operator-readable label (:func:`_host_workspace_label`, cosmetic only)
-and needs no retire-side disposal: herdr auto-closes a workspace with its last
-pane (live-measured), so a lane-zero host vanishes by itself.
+and is not retire authority. A lane-zero host may retain a cosmetic unbound root;
+managed-slot retirement neither closes that root nor requires workspace disappearance.
 
 The command is explicit opt-in and is **not** coupled to the ``terminal_transport``
 backend flag: you may prepare herdr identities without selecting the herdr transport,
@@ -146,6 +147,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_alias import apply_workspace_alias, require_alias_identity  # noqa: E501
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_completion import (  # noqa: E501
     complete_session_start,
+    complete_session_start_container,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_result import (
     SLOT_ADOPTED,
@@ -957,20 +959,15 @@ def _prepare_session_locked(
             # so an unmanaged run (no transaction) composes the exact prior pipeline.
             action_id=transaction.action_id if transaction is not None else "",
         )
-    # Finish the container — reclaim, column, ratio; the callee owns that order and why it
-    # must follow pass 3 (#14996 R3, live finding j#100135). Records rather than raises.
-    finalize_container_geometry(
-        result, config_split=config_split, config_order=config_order,
-        pair_order=pair_order, requested=providers, config_ratio=config_ratio,
-        launched=len(launch_plans), initial_occupancy=plan_of_container.occupancy,
-        dry_run=dry_run, binary=binary, runner=runner, timeout=timeout, env=env,
-        project_coordinator=project_column_coordinator, store_home=store_home,
-        top_workspace_id=coordinator_top_workspace_id,
-    )
-    complete_session_start(
-        result, store_home=store_home, transaction=transaction,
-        workspace_id=workspace_id, attestation_read=attestation_read,
-        attest_launcher=attest_launcher, launch_plans=launch_plans, dry_run=dry_run,
+    # The completion leaf owns authority -> geometry -> configured placement order.
+    complete_session_start_container(
+        result, geometry_finalizer=finalize_container_geometry,
+        configured_placement=complete_session_start, store_home=store_home,
+        transaction=transaction, workspace_id=workspace_id,
+        attestation_read=attestation_read, attest_launcher=attest_launcher,
+        launch_plans=launch_plans, dry_run=dry_run, config_split=config_split,
+        config_order=config_order, pair_order=pair_order, requested=providers,
+        config_ratio=config_ratio, initial_occupancy=plan_of_container.occupancy,
         project_column_coordinator=project_column_coordinator,
         coordinator_top_workspace_id=coordinator_top_workspace_id, binary=binary,
         runner=runner, timeout=timeout, env=env,

@@ -92,6 +92,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     derive_lane_workspace_token,
     encode_assigned_name,
 )
+from tests.support.current_launch_authority import (  # noqa: E402
+    seed_completed_current_launch_authority,
+)
 
 _WORKSPACE_ID = "e1487dcb1f2d4412"
 _LANE = "issue_13754_retire_zero_close_fence"
@@ -100,7 +103,11 @@ _JOURNAL = "77985"
 
 
 def _row(ws: str, role: str, lane: str, locator: str) -> dict:
-    return {"name": encode_assigned_name(ws, role, lane), "pane_id": locator}
+    return {
+        "name": encode_assigned_name(ws, role, lane),
+        "pane_id": locator,
+        "terminal_id": f"terminal:{locator}",
+    }
 
 
 def _git(*args: str, cwd: Path) -> None:
@@ -319,6 +326,19 @@ class RetireCommandFenceTests(unittest.TestCase):
             _row(_WORKSPACE_ID, "codex", "", "w28:p1"),
             _row(_WORKSPACE_ID, "claude", "", "w28:p2"),
         ]
+        for row in self.rows[:2]:
+            role = "codex" if row["pane_id"] == "w28:p3" else "claude"
+            seed_completed_current_launch_authority(
+                self.home,
+                workspace_id=_WORKSPACE_ID,
+                lane_id=_LANE,
+                role=role,
+                assigned_name=row["name"],
+                locator=row["pane_id"],
+                terminal_id=row["terminal_id"],
+                target_workspace="w28",
+                target_tab="w28:t1",
+            )
         self.rows_error: Exception | None = None
         self.close_failures: set[str] = set()
         self.closed_calls: list[tuple[str, str]] = []
@@ -807,6 +827,18 @@ class SiblingWorktreeForeignCloseFence(unittest.TestCase):
             _row(_WORKSPACE_ID, "codex", self._LANE_B, "wB:pG"),
             _row(_WORKSPACE_ID, "claude", self._LANE_B, "wB:pW"),
         ]
+        for role, row in zip(("codex", "claude"), self.rows):
+            seed_completed_current_launch_authority(
+                self.home,
+                workspace_id=_WORKSPACE_ID,
+                lane_id=self._LANE_B,
+                role=role,
+                assigned_name=row["name"],
+                locator=row["pane_id"],
+                terminal_id=row["terminal_id"],
+                target_workspace="wB",
+                target_tab="wB:t1",
+            )
         self.closed_calls: list[tuple[str, str]] = []
         real_projection = sublane_herdr_projection.list_herdr_agent_rows
         real_execute = sublane_herdr_retire.execute_herdr_retire_close

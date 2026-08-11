@@ -612,6 +612,9 @@ class OldLifecycleRowsAreBlockedNotGuessed(unittest.TestCase):
             # Rewind to the v9 signature the way a real older build would have left it.
             conn = sqlite3.connect(path)
             try:
+                conn.execute(
+                    "ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_close_pin"
+                )
                 conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
                 conn.execute(
                     "UPDATE state_schema_components SET schema_version = 9 "
@@ -634,6 +637,9 @@ class OldLifecycleRowsAreBlockedNotGuessed(unittest.TestCase):
             store, key = _hibernated_lane(tmp)
             conn = sqlite3.connect(store.path)
             try:
+                conn.execute(
+                    "ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_close_pin"
+                )
                 conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
                 conn.execute("UPDATE lane_lifecycle_records SET lane_generation = 5")
                 conn.execute(
@@ -1878,8 +1884,14 @@ class TheLegacyRecoveryPlanRefusesBeforeItCloses(unittest.TestCase):
             observation = encode_release_observation(
                 build_release_observation(
                     (
-                        ReleasePin(role="claude", assigned_name="pair-worker", locator="%10"),
-                        ReleasePin(role="codex", assigned_name="pair-gateway", locator="%11"),
+                        ReleasePin(
+                            role="claude", assigned_name="pair-worker", locator="%10",
+                            startup_action_id="startup-action-current",
+                        ),
+                        ReleasePin(
+                            role="codex", assigned_name="pair-gateway", locator="%11",
+                            startup_action_id="startup-action-current",
+                        ),
                     )
                 )
             )

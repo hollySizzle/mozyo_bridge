@@ -2,11 +2,12 @@
 
 The current-generation join used by configured project-column placement becomes
 authoritative only after both the launch-generation row and the startup transaction
-have completed.  Keeping these final steps in one function makes their order explicit:
+have completed.  Keeping these final steps in one leaf makes their order explicit:
 
 1. finalize every launch generation;
 2. settle the startup transaction;
-3. and only then preview/apply configured shared-column placement.
+3. complete container geometry;
+4. and only then preview/apply configured shared-column placement.
 """
 
 from __future__ import annotations
@@ -63,7 +64,7 @@ class _SessionAttestationPort:
         return join.ok, join.state
 
 
-def complete_session_start(
+def finalize_session_launch_authority(
     result,
     *,
     store_home,
@@ -73,14 +74,11 @@ def complete_session_start(
     attest_launcher: str,
     launch_plans,
     dry_run: bool,
-    project_column_coordinator: bool,
-    coordinator_top_workspace_id: str,
     binary: str,
     runner,
     timeout: float,
-    env,
 ) -> None:
-    """Complete generation/transaction authority, then configured placement."""
+    """Finalize v4/generation-v2 authority before any shared-pane geometry effect."""
 
     try:
         generation_inventory = tuple(_list_rows(binary, runner, timeout))
@@ -103,6 +101,41 @@ def complete_session_start(
         transaction.settle(
             owed=result.owes_rollback,
             launched=bool(launch_plans),
+        )
+
+
+def complete_session_start(
+    result,
+    *,
+    store_home,
+    transaction,
+    workspace_id: str,
+    attestation_read,
+    attest_launcher: str,
+    launch_plans,
+    dry_run: bool,
+    project_column_coordinator: bool,
+    coordinator_top_workspace_id: str,
+    binary: str,
+    runner,
+    timeout: float,
+    env,
+    authority_already_completed: bool = False,
+) -> None:
+    """Complete authority when needed, then configured placement."""
+    if not authority_already_completed:
+        finalize_session_launch_authority(
+            result,
+            store_home=store_home,
+            transaction=transaction,
+            workspace_id=workspace_id,
+            attestation_read=attestation_read,
+            attest_launcher=attest_launcher,
+            launch_plans=launch_plans,
+            dry_run=dry_run,
+            binary=binary,
+            runner=runner,
+            timeout=timeout,
         )
 
     # Configured reordering is intentionally a fresh-full-pair completion step.
@@ -183,6 +216,84 @@ def complete_session_start(
     result.column_outcome = COLUMN_FAILED
     result.column_detail = " ".join(
         part for part in (placement.detail, placement.recovery) if part
+    )
+
+
+def complete_session_start_container(
+    result,
+    *,
+    geometry_finalizer,
+    configured_placement,
+    store_home,
+    transaction,
+    workspace_id: str,
+    attestation_read,
+    attest_launcher: str,
+    launch_plans,
+    dry_run: bool,
+    config_split,
+    config_order,
+    pair_order,
+    requested,
+    config_ratio,
+    initial_occupancy: int,
+    project_column_coordinator: bool,
+    coordinator_top_workspace_id: str,
+    binary: str,
+    runner,
+    timeout: float,
+    env,
+) -> None:
+    """Finalize launch authority, geometry, and configured placement in order."""
+
+    finalize_session_launch_authority(
+        result,
+        store_home=store_home,
+        transaction=transaction,
+        workspace_id=workspace_id,
+        attestation_read=attestation_read,
+        attest_launcher=attest_launcher,
+        launch_plans=launch_plans,
+        dry_run=dry_run,
+        binary=binary,
+        runner=runner,
+        timeout=timeout,
+    )
+    geometry_finalizer(
+        result,
+        config_split=config_split,
+        config_order=config_order,
+        pair_order=pair_order,
+        requested=requested,
+        config_ratio=config_ratio,
+        launched=len(launch_plans),
+        initial_occupancy=initial_occupancy,
+        dry_run=dry_run,
+        binary=binary,
+        runner=runner,
+        timeout=timeout,
+        env=env,
+        project_coordinator=project_column_coordinator,
+        store_home=store_home,
+        top_workspace_id=coordinator_top_workspace_id,
+        attestation_read=attestation_read,
+    )
+    configured_placement(
+        result,
+        store_home=store_home,
+        transaction=transaction,
+        workspace_id=workspace_id,
+        attestation_read=attestation_read,
+        attest_launcher=attest_launcher,
+        launch_plans=launch_plans,
+        dry_run=dry_run,
+        project_column_coordinator=project_column_coordinator,
+        coordinator_top_workspace_id=coordinator_top_workspace_id,
+        binary=binary,
+        runner=runner,
+        timeout=timeout,
+        env=env,
+        authority_already_completed=True,
     )
 
 

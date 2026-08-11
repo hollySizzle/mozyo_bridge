@@ -137,6 +137,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     derive_lane_workspace_token,
     encode_assigned_name,
 )
+from tests.support.current_launch_authority import (  # noqa: E402
+    seed_completed_current_launch_authority,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E402,E501
     SLOT_STALE,
     classify_named_slot,
@@ -175,7 +178,11 @@ def _pins() -> tuple[ProcessGenerationPin, ...]:
 
 
 def _row(ws: str, role: str, lane: str, locator: str) -> dict:
-    return {"name": encode_assigned_name(ws, role, lane), "pane_id": locator}
+    return {
+        "name": encode_assigned_name(ws, role, lane),
+        "pane_id": locator,
+        "terminal_id": f"terminal:{locator}",
+    }
 
 
 def _git(*args: str, cwd: Path) -> None:
@@ -230,8 +237,8 @@ def _seed_hibernated_released_bound(
         expected_revision=rec.revision,
         action_id="rel-1",
         observation=build_release_observation([
-            ReleasePin("gateway", "codex-mzb1", "w28:p3S"),
-            ReleasePin("worker", "claude-mzb1", "w28:p3T"),
+            ReleasePin("codex", "codex-mzb1", "w28:p3S", "startup-gateway"),
+            ReleasePin("claude", "claude-mzb1", "w28:p3T", "startup-worker"),
         ]),
     )
     if release_target == RELEASE_REQUESTED:
@@ -500,7 +507,7 @@ class BoundRetireCasMatrix(unittest.TestCase):
             self.key,
             expected_revision=rec.revision,
             action_id="repl-1",
-            pins=[ReleasePin("worker", "claude-mzb1", "w28:p3T")],
+            pins=[ReleasePin("claude", "claude-mzb1", "w28:p3T", "startup-worker")],
             decision=dec,
         )
         self.assertTrue(opened.applied)
@@ -802,6 +809,18 @@ class BoundRetireCommandTests(unittest.TestCase):
                 _row(_WORKSPACE_ID, "claude", _LANE, "w28:p3T"),
             ]
         )
+        for role, row in zip(("codex", "claude"), self.rows[-2:]):
+            seed_completed_current_launch_authority(
+                self.home,
+                workspace_id=_WORKSPACE_ID,
+                lane_id=_LANE,
+                role=role,
+                assigned_name=row["name"],
+                locator=row["pane_id"],
+                terminal_id=row["terminal_id"],
+                target_workspace="w28",
+                target_tab="w28:t1",
+            )
 
     def _lane_ahead_of_main(self) -> None:
         """Advance the lane branch past main so its head is NOT integrated."""

@@ -754,7 +754,9 @@ class DeclaredIntegrationBranchTest(unittest.TestCase):
             self.assertEqual(store.get(key).lane_disposition, DISPOSITION_HIBERNATED)
             self.assertEqual(store.get(key).process_release, RELEASE_RELEASED)
             self.assertEqual(store.get(key).decision.journal_id, "96790")
-            self.assertEqual(len(inventory.closed), 1)
+            # The authoritative action-time inventory is complete-empty: the release
+            # transition completes without manufacturing a stale close target.
+            self.assertEqual(len(inventory.closed), 0)
             self.assertIsNone(use_case.authority.callback_debt_fn())
             self.assertEqual(use_case.authority.cleanup_callback_debt_fn(), 0)
             self.assertGreaterEqual(fresh_read.call_count, 3)
@@ -796,7 +798,8 @@ class DeclaredIntegrationBranchTest(unittest.TestCase):
                 report.final_decision.state, STATE_RETIRED, report.final_decision
             )
             self.assertEqual(store.get(key).process_release, RELEASE_RELEASED)
-            self.assertEqual(len(inventory.closed), 1)
+            # Reconciliation preserves the same complete-empty, zero-actuation boundary.
+            self.assertEqual(len(inventory.closed), 0)
 
     def test_supersede_after_composition_is_zero_register_and_zero_event(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

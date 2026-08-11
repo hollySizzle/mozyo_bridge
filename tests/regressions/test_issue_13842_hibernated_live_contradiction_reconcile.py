@@ -89,8 +89,14 @@ from mozyo_bridge.core.state.lane_lifecycle_schema import (  # noqa: E402
 from mozyo_bridge.core.state.lane_reconcile_binding import (  # noqa: E402
     LaneReconcileBindingStore,
 )
+from mozyo_bridge.core.state.lane_reconcile_close_pin import (  # noqa: E402
+    build_reconcile_close_pin,
+)
 from mozyo_bridge.core.state.lane_lifecycle_model import (  # noqa: E402
     RECONCILE_PHASE_RECONCILED,
+)
+from tests.support.current_launch_authority import (  # noqa: E402
+    seed_completed_current_launch_authority,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E402,E501
     sublane_herdr_projection,
@@ -156,7 +162,11 @@ def _decision(issue: str = _ISSUE, journal: str = _JOURNAL) -> DecisionPointer:
 
 
 def _row(ws: str, role: str, lane: str, locator: str, *, agent: str = None) -> dict:
-    row = {"name": encode_assigned_name(ws, role, lane), "pane_id": locator}
+    row = {
+        "name": encode_assigned_name(ws, role, lane),
+        "pane_id": locator,
+        "terminal_id": f"terminal:{locator}",
+    }
     # A live managed pane reports its detected provider agent; default to the role
     # (provider) so classify_named_slot reads it live. Pass agent="" for a shell residue.
     row["agent"] = role if agent is None else agent
@@ -199,8 +209,8 @@ def _seed_hibernated_released(
         expected_revision=rec.revision,
         action_id="rel-1",
         observation=build_release_observation([
-            ReleasePin("gateway", "codex-mzb1", "w1:p1"),
-            ReleasePin("worker", "claude-mzb1", "w1:p2"),
+            ReleasePin("codex", "codex-mzb1", "w1:p1", "startup-gateway"),
+            ReleasePin("claude", "claude-mzb1", "w1:p2", "startup-worker"),
         ]),
     )
     if release_target == RELEASE_REQUESTED:
@@ -231,6 +241,21 @@ def _pins() -> list[ProcessGenerationPin]:
     ]
 
 
+def _close_pin(pins=None):
+    declared = tuple(pins if pins is not None else _pins())
+    return build_reconcile_close_pin(
+        tuple(
+            ReleasePin(
+                pin.provider,
+                pin.assigned_name,
+                pin.locator,
+                f"startup-{pin.provider}",
+            )
+            for pin in declared
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # 1. The bounded rebind CAS guard matrix.
 # ---------------------------------------------------------------------------
@@ -256,12 +281,14 @@ class ReconcileRebindCasMatrix(unittest.TestCase):
         rev = expected_revision if expected_revision is not None else (
             rec.revision if rec is not None else 1
         )
+        declared = pins if pins is not None else _pins()
         return self.rebind.retire_reconciled_hibernated_legacy(
             self.key,
             expected_revision=rev,
             issue_id=issue,
             worktree_identity=token if token is not None else self.token,
-            declared_slots=pins if pins is not None else _pins(),
+            declared_slots=declared,
+            close_pin=_close_pin(declared),
             decision=decision if decision is not None else _decision(issue),
         )
 
@@ -291,6 +318,7 @@ class ReconcileRebindCasMatrix(unittest.TestCase):
             issue_id=_ISSUE,
             worktree_identity=self.token,
             declared_slots=_pins(),
+            close_pin=_close_pin(),
             decision=_decision(),
         )
         self.assertFalse(second.applied)
@@ -305,6 +333,7 @@ class ReconcileRebindCasMatrix(unittest.TestCase):
             issue_id=_ISSUE,
             worktree_identity=self.token,
             declared_slots=_pins(),
+            close_pin=_close_pin(),
             decision=DecisionPointer(source="redmine", issue_id=_ISSUE, journal_id="70001"),
         )
         self.assertTrue(out.applied)
@@ -326,6 +355,7 @@ class ReconcileRebindCasMatrix(unittest.TestCase):
                 out = self.rebind.retire_reconciled_hibernated_legacy(
                     self.key, expected_revision=self.store.get(self.key).revision,
                     issue_id=_ISSUE, worktree_identity=self.token, declared_slots=_pins(),
+                    close_pin=_close_pin(),
                     decision=_decision(),
                 )
                 self.assertFalse(out.applied)
@@ -427,6 +457,7 @@ class ReconcileRebindCasMatrix(unittest.TestCase):
             issue_id=_ISSUE,
             worktree_identity=self.token,
             declared_slots=_pins(),
+            close_pin=_close_pin(),
             decision=_decision(),
         )
         self.assertFalse(out.applied)
@@ -438,23 +469,27 @@ class ReconcileRebindCasMatrix(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.rebind.retire_reconciled_hibernated_legacy(
                 self.key, expected_revision=rev, issue_id="",
-                worktree_identity=self.token, declared_slots=_pins(), decision=_decision(),
+                worktree_identity=self.token, declared_slots=_pins(),
+                close_pin=_close_pin(), decision=_decision(),
             )
         with self.assertRaises(ValueError):
             self.rebind.retire_reconciled_hibernated_legacy(
                 self.key, expected_revision=rev, issue_id=_ISSUE,
-                worktree_identity="", declared_slots=_pins(), decision=_decision(),
+                worktree_identity="", declared_slots=_pins(),
+                close_pin=_close_pin(), decision=_decision(),
             )
         with self.assertRaises(ValueError):
             self.rebind.retire_reconciled_hibernated_legacy(
                 self.key, expected_revision=rev, issue_id=_ISSUE,
-                worktree_identity=self.token, declared_slots=[], decision=_decision(),
+                worktree_identity=self.token, declared_slots=[],
+                close_pin=_close_pin(), decision=_decision(),
             )
         with self.assertRaises(Exception):
             # A decision anchored to a different issue cannot authorize this binding.
             self.rebind.retire_reconciled_hibernated_legacy(
                 self.key, expected_revision=rev, issue_id=_ISSUE,
                 worktree_identity=self.token, declared_slots=_pins(),
+                close_pin=_close_pin(),
                 decision=_decision(_OTHER_ISSUE),
             )
 
@@ -481,7 +516,8 @@ class ReconcilePhaseProvenanceTests(unittest.TestCase):
         _seed_hibernated_released(self.store, key=self.key)
         LaneReconcileBindingStore(path=self.path).retire_reconciled_hibernated_legacy(
             self.key, expected_revision=self.store.get(self.key).revision, issue_id=_ISSUE,
-            worktree_identity="wt_x", declared_slots=_pins(), decision=_decision(),
+            worktree_identity="wt_x", declared_slots=_pins(), close_pin=_close_pin(),
+            decision=_decision(),
         )
         self.assertEqual(self.store.get(self.key).reconcile_phase, RECONCILE_PHASE_RECONCILED)
 
@@ -501,7 +537,8 @@ class ReconcilePhaseProvenanceTests(unittest.TestCase):
         _seed_hibernated_released(self.store, key=self.key)
         LaneReconcileBindingStore(path=self.path).retire_reconciled_hibernated_legacy(
             self.key, expected_revision=self.store.get(self.key).revision, issue_id=_ISSUE,
-            worktree_identity="wt_x", declared_slots=_pins(), decision=_decision(),
+            worktree_identity="wt_x", declared_slots=_pins(), close_pin=_close_pin(),
+            decision=_decision(),
         )
         rec = self.store.get(self.key)
         self.assertEqual(rec.reconcile_phase, RECONCILE_PHASE_RECONCILED)
@@ -737,6 +774,7 @@ class _FakeReconcileOps:
                     locator=row.get("pane_id", ""),
                     verdict=VERDICT_PRESENT,
                     observed_at="2026-07-15T00:00:00+00:00",
+                    terminal_id=row.get("terminal_id", ""),
                 )
         return None
 
@@ -764,6 +802,21 @@ class ReconcileOrchestrationTests(unittest.TestCase):
             _row(_WORKSPACE_ID, "codex", _LANE, "w28:p3"),
             _row(_WORKSPACE_ID, "claude", _LANE, "w28:p4"),
         ]
+        self.current_actions = {}
+        for row in self.rows[-2:]:
+            identity = decode_assigned_name(row["name"]).identity
+            assert identity is not None
+            self.current_actions[identity.role] = seed_completed_current_launch_authority(
+                self.home,
+                workspace_id=_WORKSPACE_ID,
+                lane_id=_LANE,
+                role=identity.role,
+                assigned_name=row["name"],
+                locator=row["pane_id"],
+                terminal_id=row["terminal_id"],
+                target_workspace="w28",
+                target_tab="w28:t1",
+            )
         self.rows_error: Exception | None = None
         self._real_rows = sublane_herdr_projection.list_herdr_agent_rows
         self._real_execute = sublane_herdr_retire.execute_herdr_retire_close
@@ -814,6 +867,19 @@ class ReconcileOrchestrationTests(unittest.TestCase):
     def _token(self) -> str:
         return derive_lane_workspace_token(str(self.lane_worktree.resolve()))
 
+    def _current_close_pin(self):
+        return build_reconcile_close_pin(
+            tuple(
+                ReleasePin(
+                    pin.provider,
+                    pin.assigned_name,
+                    pin.locator,
+                    self.current_actions[pin.provider],
+                )
+                for pin in _pins()
+            )
+        )
+
     def _args(self, *, branch: str = _LANE, issue: str = _ISSUE) -> argparse.Namespace:
         return argparse.Namespace(
             repo=str(self.primary),
@@ -854,6 +920,10 @@ class ReconcileOrchestrationTests(unittest.TestCase):
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN release_observation")
             # v10 (#14756) added lane_epoch; a faithful pre-v10 rewind drops it too.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
+            # v11 (#15227) added the terminal-bound reconcile close pin.
+            conn.execute(
+                "ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_close_pin"
+            )
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -981,6 +1051,7 @@ class ReconcileOrchestrationTests(unittest.TestCase):
             issue_id=_ISSUE,
             worktree_identity=self._token(),
             declared_slots=_pins(),
+            close_pin=self._current_close_pin(),
             decision=decision if decision is not None else _decision(),
         )
 
@@ -1104,8 +1175,8 @@ class ReconcileOrchestrationTests(unittest.TestCase):
         rec = store.get(key)
         store.request_release(
             key, expected_revision=rec.revision, action_id="rel-1",
-            observation=build_release_observation([ReleasePin("gateway", "codex-mzb1", "w1:p1"),
-                  ReleasePin("worker", "claude-mzb1", "w1:p2")]),
+            observation=build_release_observation([ReleasePin("codex", "codex-mzb1", "w1:p1", "startup-gateway"),
+                  ReleasePin("claude", "claude-mzb1", "w1:p2", "startup-worker")]),
         )
         rec = store.get(key)
         store.record_release_outcome(
@@ -1213,8 +1284,8 @@ class ReconcileOrchestrationTests(unittest.TestCase):
                 rec = store.get(key)
                 store.request_release(
                     key, expected_revision=rec.revision, action_id="rel-1",
-                    observation=build_release_observation([ReleasePin("gateway", "codex-mzb1", "w1:p1"),
-                          ReleasePin("worker", "claude-mzb1", "w1:p2")]),
+                    observation=build_release_observation([ReleasePin("codex", "codex-mzb1", "w1:p1", "startup-gateway"),
+                          ReleasePin("claude", "claude-mzb1", "w1:p2", "startup-worker")]),
                 )
                 rec = store.get(key)
                 store.record_release_outcome(

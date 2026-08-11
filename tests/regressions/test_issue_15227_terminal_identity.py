@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 import os
 import shutil
 import sqlite3
@@ -63,6 +64,12 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_rollback import (  # noqa: E501
     REASON_BLOCKED,
     run_session_rollback,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_rollback_identity import (  # noqa: E501
+    terminal_bound_action_target,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_rollback_cli import (  # noqa: E501
+    _render_text as render_session_rollback_text,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_rollback_ops import (  # noqa: E501
     LiveStartupRollbackOps,
@@ -135,6 +142,109 @@ def _legacy_generation(home: Path) -> dict:
 
 
 class TerminalIdentityRegressionTests(unittest.TestCase):
+    def test_corrupt_private_receipt_never_reaches_public_rollback_output(self):
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw)
+            fence = StartupTransactionFence(home=home)
+            action = fence.reserve(
+                StartupUnit("ws", "lane", ("codex",)), "corrupt-private-receipt"
+            )
+            corrupt = [{
+                "role": "codex",
+                "assigned_name": "agent",
+                "locator": "w1:p1",
+                "receipt": {"terminal_id": _TOKEN},
+                "closed": False,
+            }]
+            with sqlite3.connect(fence.path) as conn:
+                conn.execute(
+                    "UPDATE startup_actions SET participants=? WHERE action_id=?",
+                    (json.dumps(corrupt), action.action_id),
+                )
+
+            verdict = run_session_rollback(
+                action_id=action.action_id,
+                ops=SimpleNamespace(),
+                fence=fence,
+                execute=True,
+            )
+            self.assertEqual(verdict.reason, "rollback_authority_unavailable")
+            for rendered in (
+                repr(verdict),
+                str(verdict.as_payload()),
+                render_session_rollback_text(verdict),
+            ):
+                self.assertNotIn(_TOKEN, rendered)
+
+    def test_live_rollback_requires_receipt_terminal_to_match_current_generation(self):
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw)
+            workspace, lane, role = "ws", "lane", "codex"
+            assigned_name = encode_assigned_name(workspace, role, lane)
+            locator, live_terminal = "w1:p1", "terminal-B"
+            fence = StartupTransactionFence(home=home)
+            reserved = fence.reserve(
+                StartupUnit(workspace, lane, (role,)), "receipt-terminal-join"
+            )
+            participant = Participant(
+                role=role,
+                assigned_name=assigned_name,
+                locator=locator,
+                receipt=pane_bound_receipt(
+                    target_workspace="w1",
+                    target_tab="w1:t1",
+                    native_name=native_name_for(assigned_name),
+                    terminal_id="terminal-A",
+                ),
+            )
+            fence.record_participant(reserved.action_id, participant)
+            fence.set_phase(reserved.action_id, PHASE_HEALTH_CHECK)
+            fence.set_phase(reserved.action_id, PHASE_ROLLBACK_OWED)
+            action = fence.read(reserved.action_id)
+            seed_current_generation(
+                home,
+                workspace_id=workspace,
+                lane_id=lane,
+                role=role,
+                assigned_name=assigned_name,
+                locator=locator,
+                action_id=action.action_id,
+                terminal_id=live_terminal,
+            )
+            HerdrIdentityAttestationStore(home=home).upsert(
+                IdentityAttestationRecord(
+                    assigned_name,
+                    workspace,
+                    role,
+                    lane,
+                    locator,
+                    VERDICT_PRESENT,
+                    observed_at="2026-08-11T00:00:00+00:00",
+                    terminal_id=live_terminal,
+                )
+            )
+            rows = ({
+                "name": assigned_name,
+                "pane_id": locator,
+                "terminal_id": live_terminal,
+            },)
+
+            self.assertFalse(terminal_bound_action_target(
+                home, action, participant, rows, locator
+            ))
+            matching = replace(
+                participant,
+                receipt=pane_bound_receipt(
+                    target_workspace="w1",
+                    target_tab="w1:t1",
+                    native_name=native_name_for(assigned_name),
+                    terminal_id=live_terminal,
+                ),
+            )
+            self.assertTrue(terminal_bound_action_target(
+                home, action, matching, rows, locator
+            ))
+
     def test_public_rollback_redacts_terminal_text_from_close_failure(self):
         class _Ops:
             def __init__(self, row): self.row = row

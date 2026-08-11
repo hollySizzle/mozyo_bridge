@@ -144,6 +144,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     derive_lane_workspace_token,
     encode_assigned_name,
 )
+from tests.support.current_launch_authority import (  # noqa: E402
+    seed_completed_current_launch_authority,
+)
 
 _WORKSPACE_ID = "b3d17ac95e6f4802"
 _INTEGRATION_BRANCH = "int_13472_session_continuity"
@@ -750,11 +753,26 @@ def _seed_hibernated_released_bound(
     dec = DecisionPointer(source="redmine", issue_id=issue, journal_id="82000")
     lifecycle = LaneLifecycleStore()
     declaration = LaneDeclarationStore()
+    declared_slots = _pins(key.lane_id)
+    startup_action_ids = {
+        pin.role: seed_completed_current_launch_authority(
+            Path(os.environ["MOZYO_BRIDGE_HOME"]),
+            workspace_id=key.repo_workspace_id,
+            lane_id=key.lane_id,
+            role=pin.provider,
+            assigned_name=pin.assigned_name,
+            locator=pin.locator,
+            terminal_id=f"terminal:{pin.locator}",
+            target_workspace="w28",
+            target_tab="w28:t1",
+        )
+        for pin in declared_slots
+    }
     out = declaration.declare_lane(
         key,
         decision=dec,
         issue_id=issue,
-        declared_slots=_pins(key.lane_id),
+        declared_slots=declared_slots,
         worktree_identity=worktree_identity,
     )
     assert out.applied, f"seed declare refused: {out.reason}"
@@ -771,10 +789,17 @@ def _seed_hibernated_released_bound(
         key,
         expected_revision=rec.revision,
         action_id="rel-1",
-        observation=build_release_observation([
-            ReleasePin("gateway", "codex-mzb1", "w28:p3S"),
-            ReleasePin("worker", "claude-mzb1", "w28:p3T"),
-        ]),
+        observation=build_release_observation(
+            [
+                ReleasePin(
+                    pin.role,
+                    pin.assigned_name,
+                    pin.locator,
+                    startup_action_ids[pin.role],
+                )
+                for pin in declared_slots
+            ]
+        ),
     )
     rec = lifecycle.get(key)
     lifecycle.record_release_outcome(
@@ -1097,8 +1122,16 @@ class PatchEquivalentCommandBoundary(unittest.TestCase):
         os.environ["MOZYO_BRIDGE_HOME"] = str(self.home)
 
         self.rows: list[dict] = [
-            {"name": encode_assigned_name(_WORKSPACE_ID, "codex", ""), "pane_id": "w28:p1"},
-            {"name": encode_assigned_name(_WORKSPACE_ID, "claude", ""), "pane_id": "w28:p2"},
+            {
+                "name": encode_assigned_name(_WORKSPACE_ID, "codex", ""),
+                "pane_id": "w28:p1",
+                "terminal_id": "terminal:w28:p1",
+            },
+            {
+                "name": encode_assigned_name(_WORKSPACE_ID, "claude", ""),
+                "pane_id": "w28:p2",
+                "terminal_id": "terminal:w28:p2",
+            },
         ]
         self._real_rows = sublane_herdr_projection.list_herdr_agent_rows
         self._real_execute = sublane_herdr_retire.execute_herdr_retire_close
@@ -1213,8 +1246,16 @@ class PatchEquivalentCommandBoundary(unittest.TestCase):
         self.assertEqual(self._run(self._args(s))[0], 0)
         self.rows.extend(
             [
-                {"name": encode_assigned_name(_WORKSPACE_ID, "codex", lane), "pane_id": "w9:pA"},
-                {"name": encode_assigned_name(_WORKSPACE_ID, "claude", lane), "pane_id": "w9:pB"},
+                {
+                    "name": encode_assigned_name(_WORKSPACE_ID, "codex", lane),
+                    "pane_id": "w9:pA",
+                    "terminal_id": "terminal:w9:pA",
+                },
+                {
+                    "name": encode_assigned_name(_WORKSPACE_ID, "claude", lane),
+                    "pane_id": "w9:pB",
+                    "terminal_id": "terminal:w9:pB",
+                },
             ]
         )
         code, payload = self._run(self._args(s))

@@ -57,6 +57,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 
 
+def _terminal_id(locator: str) -> str:
+    """Deterministic fake server identity for one live test terminal."""
+    return f"terminal-{locator}"
+
+
 def _target(**overrides) -> GateTarget:
     kwargs = dict(
         workspace_id="ws-alpha",
@@ -248,7 +253,11 @@ class ResumeTargetResolverTests(unittest.TestCase):
     _UNSET = object()
 
     def _resolver(self, *, record=None, rows=None, workspace=_UNSET, binding="claude"):
-        rows = rows if rows is not None else [{AGENT_KEY_NAME: "worker-a", "pane_id": "w1:p1"}]
+        rows = rows if rows is not None else [{
+            AGENT_KEY_NAME: "worker-a",
+            "pane_id": "w1:p1",
+            "terminal_id": _terminal_id("w1:p1"),
+        }]
         rec = record if record is not None else self._record()
         identity = self._identity() if workspace is self._UNSET else workspace
         return ResumeTargetResolver(
@@ -296,13 +305,23 @@ class ResumeTargetResolverTests(unittest.TestCase):
         )
 
     def test_locator_mismatch_none(self) -> None:
-        rows = [{AGENT_KEY_NAME: "worker-a", "pane_id": "w9:p9"}]
+        rows = [{
+            AGENT_KEY_NAME: "worker-a",
+            "pane_id": "w9:p9",
+            "terminal_id": _terminal_id("w9:p9"),
+        }]
         self.assertIsNone(self._resolver(rows=rows).resolve(_done_gate(), {}))
 
     def test_duplicate_inventory_rows_none(self) -> None:
         rows = [
-            {AGENT_KEY_NAME: "worker-a", "pane_id": "w1:p1"},
-            {AGENT_KEY_NAME: "worker-a", "pane_id": "w1:p1"},
+            {
+                AGENT_KEY_NAME: "worker-a", "pane_id": "w1:p1",
+                "terminal_id": _terminal_id("w1:p1"),
+            },
+            {
+                AGENT_KEY_NAME: "worker-a", "pane_id": "w1:p1",
+                "terminal_id": _terminal_id("w1:p1"),
+            },
         ]
         self.assertIsNone(self._resolver(rows=rows).resolve(_done_gate(), {}))
 
@@ -335,7 +354,12 @@ class ResumeTargetResolverTests(unittest.TestCase):
         )
 
     def test_foreign_provider_live_row_none(self) -> None:
-        rows = [{AGENT_KEY_NAME: "worker-a", "pane_id": "w1:p1", "provider": "foreign-provider"}]
+        rows = [{
+            AGENT_KEY_NAME: "worker-a",
+            "pane_id": "w1:p1",
+            "terminal_id": _terminal_id("w1:p1"),
+            "provider": "foreign-provider",
+        }]
         self.assertIsNone(self._resolver(rows=rows).resolve(_done_gate(), {}))
 
     def test_runtime_revision_drift_none(self) -> None:
@@ -348,7 +372,12 @@ class ResumeTargetResolverTests(unittest.TestCase):
             locator="w1:p1",
             runtime_revision="declared-r1",
         )
-        rows = [{AGENT_KEY_NAME: "worker-a", "pane_id": "w1:p1", "runtime_revision": "live-r2"}]
+        rows = [{
+            AGENT_KEY_NAME: "worker-a",
+            "pane_id": "w1:p1",
+            "terminal_id": _terminal_id("w1:p1"),
+            "runtime_revision": "live-r2",
+        }]
         self.assertIsNone(
             self._resolver(record=self._record(pin=pin), rows=rows).resolve(_done_gate(), {})
         )
@@ -403,13 +432,18 @@ class ResumeTargetResolverTests(unittest.TestCase):
             role="claude",
             lane_id="lane-alpha",
             locator="w1:p1",
+            terminal_id=_terminal_id("w1:p1"),
             verdict=VERDICT_PRESENT,
         )
         resolver = ResumeTargetResolver(
             env={},
             repo_root="/repo/root",
             lifecycle_get=lambda ws, lane: self._record(),
-            inventory=lambda env: [{AGENT_KEY_NAME: "worker-a", "pane_id": "w1:p1"}],
+            inventory=lambda env: [{
+                AGENT_KEY_NAME: "worker-a",
+                "pane_id": "w1:p1",
+                "terminal_id": _terminal_id("w1:p1"),
+            }],
             attestation_read=lambda name: record,
             capture=lambda loc, lines: self._READY,
             workspace_resolve=lambda repo_root, execution_root, env: self._identity(),
@@ -427,13 +461,18 @@ class ResumeTargetResolverTests(unittest.TestCase):
             role="implementation_worker",  # workflow role, not the runtime "claude" -> conflict
             lane_id="lane-alpha",
             locator="w1:p1",
+            terminal_id=_terminal_id("w1:p1"),
             verdict=VERDICT_PRESENT,
         )
         resolver = ResumeTargetResolver(
             env={},
             repo_root="/repo/root",
             lifecycle_get=lambda ws, lane: self._record(),
-            inventory=lambda env: [{AGENT_KEY_NAME: "worker-a", "pane_id": "w1:p1"}],
+            inventory=lambda env: [{
+                AGENT_KEY_NAME: "worker-a",
+                "pane_id": "w1:p1",
+                "terminal_id": _terminal_id("w1:p1"),
+            }],
             attestation_read=lambda name: record,
             capture=lambda loc, lines: self._READY,
             workspace_resolve=lambda repo_root, execution_root, env: self._identity(),

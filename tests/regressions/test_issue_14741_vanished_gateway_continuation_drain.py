@@ -79,6 +79,7 @@ OBSERVED = "2026-08-02T00:00:01+00:00"
 AFTER = "2026-08-02T00:00:02+00:00"
 LATER = "2026-08-02T00:10:00+00:00"
 UPSTREAM = "coordinator_codex"
+STARTUP_ACTION = "startup-14741"
 
 
 class _Ops:
@@ -140,6 +141,7 @@ class VanishedGatewayContinuationDrainTest(_PrepareCase):
             fresh_locator=FRESH,
             old_locator=LOCATOR,
             observed_at=OBSERVED,
+            startup_action_id=STARTUP_ACTION,
             revision=2,
         )
         self.ops = _Ops(self.authority)
@@ -177,6 +179,17 @@ class VanishedGatewayContinuationDrainTest(_PrepareCase):
             journal_id=pointer.journal_id,
             status="sent",
             reason="ok",
+            queue_enter_observation={
+                "observation_version": 2,
+                "gateway_binding": {
+                    "provider": PROVIDER,
+                    "assigned_name": ASSIGNED,
+                    "locator": FRESH,
+                    "row_revision": "2",
+                    "attestation_observed_at": OBSERVED,
+                    "startup_action_id": STARTUP_ACTION,
+                },
+            },
             recorded_at=AFTER,
         )
         values.update(changes)

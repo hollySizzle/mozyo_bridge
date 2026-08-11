@@ -57,6 +57,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _norm,
     _norm_lane,
 )
+from tests.support.current_launch_authority import (
+    seed_completed_current_launch_authority,
+)
 
 WS = "wsA"
 ROLE = "codex"
@@ -128,6 +131,33 @@ def _token_for(home: Path, *, name=NAME, role=ROLE, lane=LANE, locator=LOCATOR,
 
 class TerminalGenerationReceiptRegression(unittest.TestCase):
     """The current terminal may use only the receipt minted by its own launch."""
+
+    def test_completed_launch_authority_fixture_verifies_its_exact_action(self):
+        home = _tmp()
+        action_id = seed_completed_current_launch_authority(
+            home,
+            workspace_id=WS,
+            lane_id=LANE,
+            role=ROLE,
+            assigned_name=NAME,
+            locator=LOCATOR,
+            terminal_id=TERMINAL_ID,
+            target_workspace="w1",
+            target_tab="w1:t1",
+        )
+
+        self.assertEqual(
+            verified_terminal_generation_token(
+                home,
+                assigned_name=NAME,
+                workspace_id=WS,
+                role=ROLE,
+                lane_id=LANE,
+                locator=LOCATOR,
+                terminal_id=TERMINAL_ID,
+            ),
+            action_id,
+        )
 
     def test_terminal_a_receipt_cannot_authorise_replacement_terminal_b(self):
         home = _tmp()

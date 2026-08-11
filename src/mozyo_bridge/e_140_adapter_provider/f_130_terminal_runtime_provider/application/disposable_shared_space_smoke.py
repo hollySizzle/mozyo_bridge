@@ -114,8 +114,12 @@ class _ForkedRun:
     failure_kind: str = ""
     #: Closed tokens for receipts that were refused rather than accepted.
     receipt_anomalies: tuple = ()
-    #: Exact pane locators recovered from refused receipts, kept for cleanup only.
+    #: Exact pane locators recovered from refused receipts, observation-only. They are
+    #: generation-unbound and never replayed as destructive cleanup targets.
     salvaged_locators: tuple = ()
+    #: Successful workspace-create receipts recovered from refused outer receipts.
+    #: They remain cleanup-only and never rehabilitate the receipt as success evidence.
+    salvaged_created_workspaces: tuple = ()
 
     @property
     def workers_contained(self) -> bool:
@@ -144,6 +148,14 @@ class _ProcessReceipt:
     agent_start_names: tuple[str, ...] = ()
     coordinators_create_count: int = 0
     endpoint_gate: "EndpointGateCounters | None" = None
+
+
+class _CleanupReceiptTape(list):
+    """Backward-compatible locator tape plus private create-receipt salvage."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.created_workspaces: list = []
 
 
 def _forked_project_worker(
@@ -233,14 +245,14 @@ def _run_forked_projects(
     ]
     started: list = []
     # Owned by THIS function so a later failure cannot take the receipts that already
-    # arrived with it.  Losing them meant losing the exact pane locators cleanup needs
-    # and the gate counters a worker had already proven (review j#91687 F3).
+    # arrived with it. Losing them meant losing successful workspace-create cleanup
+    # receipts and the gate counters a worker had already proven (review j#91687 F3).
     collected: dict = {}
     #: Closed tokens naming what was wrong with a rejected receipt.
     anomalies: list = []
     #: Exact pane locators from receipts we could not accept.  Cleanup still needs them
     #: even though they must not count towards the success evidence.
-    locator_tape: list = []
+    locator_tape = _CleanupReceiptTape()
     orphaned = 0
     round_failed = False
     failure_kind = ""
@@ -278,6 +290,7 @@ def _run_forked_projects(
         failure_kind=failure_kind,
         receipt_anomalies=tuple(anomalies),
         salvaged_locators=tuple(locator_tape),
+        salvaged_created_workspaces=tuple(locator_tape.created_workspaces),
     )
 
 
@@ -317,9 +330,9 @@ def _receipt_anomaly(receipt, specs: Sequence[_ProjectSpec], collected: dict) ->
 def _fill_unreported(specs: Sequence[_ProjectSpec], collected: "dict") -> list:
     """Everything that arrived, plus a typed ``failed`` placeholder for what did not.
 
-    Only the indexes that never reported are replaced.  Wiping the whole set on a late
-    failure threw away exact pane locators cleanup still needs, and gate counters a
-    worker had already proven — a placeholder is fail-closed, but it is not free
+    Only the indexes that never reported are replaced. Wiping the whole set on a late
+    failure threw away successful workspace-create receipts and gate counters a worker
+    had already proven — a placeholder is fail-closed, but it is not free
     (review j#91687 F3).  A placeholder carries no endpoint-gate snapshot, so the
     aggregate counts it as *missing* rather than as a proven zero.
     """
@@ -390,6 +403,9 @@ def _collect_forked_receipts(
             # keeps it for cleanup; the anomaly keeps it out of the success evidence.
             anomalies.append(anomaly)
             locator_tape.extend(receipt.launched_locators)
+            workspace_tape = getattr(locator_tape, "created_workspaces", None)
+            if workspace_tape is not None:
+                workspace_tape.extend(receipt.created_workspaces)
             continue
         collected[receipt.index] = receipt
     output.close()
@@ -512,11 +528,22 @@ def run_disposable_shared_space_smoke(
                 observations = [receipt.observation for receipt in receipts]
                 worker_gate_receipts = [receipt.endpoint_gate for receipt in receipts]
                 if forked.salvaged_locators:
-                    # Refused receipts still name real panes; cleanup must close them
-                    # even though they do not count as evidence (review j#91741 F3).
+                    # Pane locators are observation-only. Keep them on the private tape
+                    # for residue accounting, but never replay them as close targets.
                     cleanup_harness.recorder.merge_receipts(
                         launched_locators=forked.salvaged_locators,
-                        created_workspaces={},
+                        created_workspaces=dict(
+                            forked.salvaged_created_workspaces
+                        ),
+                        agent_start_names=(),
+                        coordinators_create_count=0,
+                    )
+                elif forked.salvaged_created_workspaces:
+                    cleanup_harness.recorder.merge_receipts(
+                        launched_locators=(),
+                        created_workspaces=dict(
+                            forked.salvaged_created_workspaces
+                        ),
                         agent_start_names=(),
                         coordinators_create_count=0,
                     )
@@ -529,7 +556,15 @@ def run_disposable_shared_space_smoke(
                     )
                 duplicate_agents = _count_duplicate_agents(observations)
                 create_count = sum(r.coordinators_create_count for r in receipts)
-                cleanup_harness.cleanup(observations)
+                workspace_cleanup = None
+                if workers_contained:
+                    workspace_cleanup = instance.mint_workspace_cleanup(
+                        cleanup_harness.recorder.workspace_cleanup_receipts()
+                    )
+                cleanup_attempted = workspace_cleanup is not None
+                cleanup_completed = cleanup_harness.cleanup(
+                    observations, workspace_cleanup=workspace_cleanup
+                )
                 residue_verified = True
                 residue_workspaces, residue_agents = -1, -1
                 try:
@@ -549,7 +584,8 @@ def run_disposable_shared_space_smoke(
                     residue_workspaces=residue_workspaces,
                     residue_agents=residue_agents,
                     residue_verified=residue_verified,
-                    cleanup_attempted=True,
+                    cleanup_attempted=cleanup_attempted,
+                    cleanup_completed=cleanup_completed,
                 )
     finally:
         # ``with instance`` already shut down, obeying the same lifecycle policy this

@@ -1983,6 +1983,9 @@ class ReviewJ91896TargetBindingTests(unittest.TestCase):
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
             derive_directory_lane_token,
         )
+        from tests.support.current_launch_authority import (
+            seed_completed_current_launch_authority,
+        )
 
         def _row(ws, role, lane, locator):
             return {
@@ -1990,7 +1993,9 @@ class ReviewJ91896TargetBindingTests(unittest.TestCase):
                 "agent_role": role,
                 "lane_id": lane,
                 "locator": locator,
+                "pane_id": locator,
                 "name": f"mzb1_{ws}_{role}_{lane or 'default'}",
+                "terminal_id": f"terminal:{ws}:{lane}:{role}:{locator}",
                 "health": "healthy",
             }
 
@@ -2052,15 +2057,32 @@ class ReviewJ91896TargetBindingTests(unittest.TestCase):
                     _row(ws_id, "codex", self.LANE, "w2:p8"),
                     _row(ws_id, "claude", self.LANE, "w2:p9"),
                 ]
+                for row in rows:
+                    seed_completed_current_launch_authority(
+                        home,
+                        workspace_id=ws_id,
+                        lane_id=self.LANE,
+                        role=row["agent_role"],
+                        assigned_name=row["name"],
+                        locator=row["locator"],
+                        terminal_id=row["terminal_id"],
+                        target_workspace="w1",
+                        target_tab="w1:t1",
+                    )
 
                 def _fake_close(plan, **kw):
                     calls.append(plan)
-                    return retire_mod.HerdrRetireCloseResult(
+                    result = retire_mod.HerdrRetireCloseResult(
                         workspace_id=plan.workspace_id,
                         lane_id=plan.lane_id,
                         closed=plan.close_targets,
                         foreign_names=plan.foreign_names,
                     )
+                    closed_locators = {locator for _role, locator in result.closed}
+                    rows[:] = [
+                        row for row in rows if row["locator"] not in closed_locators
+                    ]
+                    return result
 
                 def _rows_then_advance(*_a, **_kw):
                     """The race: the row moves on between the first attest and the close."""
@@ -4454,6 +4476,12 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "inherits via a used import of worker_refresh_approval; names no marker token "
             "itself, and reads no note — it plans the refresh and delegates approval "
             "verification to that module's strict parser",
+        ),
+        f"{_D}/application/sublane_worker_dispatch_herdr_ops.py": (
+            ['handoff'],
+            "inherits via a used import of handoff to build the exact implementation-request "
+            "delivery marker matched against the durable queue-enter record; it reads no "
+            "journal text and marker multiplicity is resolved by the delivery ledger owner",
         ),
         f"{_D}/application/recovery_owner_approval_live.py": (
             ['*'],

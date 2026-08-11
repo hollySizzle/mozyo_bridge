@@ -55,7 +55,7 @@ fake が忠実に再現すべき面:
 | B | `agent list [--json]` | live inventory の行集合。各行 `name`/`pane_id`(alias `pane`/`location`)。mzb1 名は `mzb1_<ws>_<role>_<lane>` scheme。**recognised-empty ≠ unrecognisable** の区別、malformed 行は skip (非 fatal) | in-memory state から行を render、mzb1 decode 契約に一致、malformed 注入面 |
 | C | `agent get <target> [--json]` / `agent rename` | 付与名は `server stop`/restart を越えて永続 (E10); `terminal_id` は per-process 使い捨て | 名前永続、locator は再生成可能な transient として扱う |
 | D | `workspace create --cwd --no-focus` | 応答 `type:workspace_created`、`workspace_id` + `root_pane.pane_id`、`pane_count:1` (空 base pane を必ず 1 個生成) | workspace 採番 + root pane 採番、cold-start 経路の base pane 残骸を再現 |
-| E | `pane close <pane_id>` → **最終 pane close で workspace 自動消滅** | 実測 #13380: lane ゼロの host workspace は最終 pane close で herdr が自動 close (husk 構造的に生じない) | pane close→(workspace 内 pane 0 なら)workspace 消滅を状態機械で再現 |
+| E | `pane close <pane_id>` のprovider側付随挙動 | 最終paneを閉じればworkspaceも消滅し得るが、locator-only closeはterminal generationを条件化できない。#15227以後、productはgeneration-unbound rootへこの挙動を発火させない | fakeはprovider挙動を再現する一方、product acceptanceはv4+completed generation-v2で証明したmanaged slotだけをcloseし、root保存を検証 |
 | F | `wait agent-status <pane> --status <s> --timeout` | **change-semantics** (E9): 既にその状態でも返らず「その状態への*変化*」を待つ。check-then-wait 必須。started は event 返り ~0.36s (E12)、absent は pane get error (E9 c3)、blocked 中 `wait working` は timeout (E13/E14) | 状態遷移イベントの発火/timeout を決定論的に注入 (時間を実 sleep せず論理 tick で) |
 | G | backend routing (config → rail) | `terminal_transport.backend: herdr` が唯一の selector; herdr は `BUILTIN_PROVIDER_REGISTRY` 非登録; explicit `%pane` target は herdr config 下でも tmux rail (#13320) | fake は herdr rail 側の IO のみ供給。routing 判定自体は実 code (seam) を通す |
 
@@ -75,7 +75,7 @@ fake ではない)。
   (`test_sublane_worker_dispatch_herdr_ops.py`, `_HerdrLaneFixture:61` が `:65` で wrap)
   ただ 1 つに import されるのみ。他の 50+ ファイルは各自 `RecordingRunner` / `FakePort` /
   `_FakeHerdr` / `_CloseHerdr` を再定義し、workspace↔pane lifecycle (§1.1 E の
-  pane-close→workspace 自動消滅) を誰も共有的にモデルしない。
+  provider付随挙動とproduct側root保存境界) を誰も共有的にモデルしない。
 - **canned-response drift = false confidence**。各 fake の JSON 形が実 0.7.1 から乖離しても
   誰も気づかない。実バイナリに対する **contract テストが存在しない** (§2 で新設)。
 - **routing seam を素通りする層で fake する (最重要、finding 1 の住処)**。
@@ -108,7 +108,7 @@ fake ではない)。
 | B `agent list` decode | 部分 (canned rows) | malformed-row skip / recognised-empty 区別を注入する面がない |
 | C rename/get 永続 | ほぼ無 | restart 永続 (E10) を再現する scenario がない |
 | D `workspace create` + base pane | 部分 (#13330 test) | 共有 state machine でない |
-| E **pane close→workspace 自動消滅** | **無** | retire choreography の核心 (#13380) を誰も再現しない |
+| E provider付随挙動 + productのroot保存境界 | **無** | managed-slot closeとgeneration-unbound root zero-closeのchoreography (#15227) を誰も再現しない |
 | F `wait` change-semantics | 部分 (#13255 turn-start) | check-then-wait race を scenario で駆動する harness がない |
 | G **backend routing (config→rail)** | **無 (routing 上で fake)** | **finding 1 の住処。最重要 gap** |
 
@@ -218,11 +218,11 @@ backend routing を assert** する。各 leg で「実 code が backend をど�
 
 | hop | 駆動する実 seam | assert する routing decision |
 |---|---|---|
-| create | `herdr session-start` / `sublane create --execute` の launch/adopt + `_launch_target_for_lane` (#13380 host join) | mzb1 名 mint、workspace join (project pin vs sublane host)、cold-start base pane reclaim (#13330) |
+| create | `herdr session-start` / `sublane create --execute` の launch/adopt + `_launch_target_for_lane` (#13380 host join) | mzb1 名 mint、workspace join (project pin vs sublane host)、generation-unbound cold-start base paneのtyped保存 (#13330 / #15227) |
 | dispatch | `dispatch-worker` → `_resolve_worker_dispatch_ops` → `HerdrWorkerDispatchOps.dispatch_to_worker` → `herdr_effective_backend_selected` | **worker_pane が herdr locator → herdr rail** (finding 1 の観測点)。config→rail の予測が cwd 由来 root と一致すること |
 | ACK | route authority `resolve_herdr_route_target` (lane-in-match `derive_target_lane`) + queue-enter 送信 | 単一 live slot に解決 (`target_unavailable`/`ambiguous` に落ちない)、delivery ACK (exit 0) のみ promote (#12988) |
 | callback | `--target coordinator` の workspace-scoped 解決 | coordinator lane の Codex slot に解決、cross-lane hop が lane-in-match を通ること |
-| retire | `sublane retire` + `pane close`→workspace 自動消滅 (E) | lane slot 消滅、host workspace が最終 pane で自動 close、legacy token 経路と分離 |
+| retire | `sublane retire` + terminal-bound managed-slot close (E) | lane slot消滅、generation-unbound host/tab rootは保存、workspace消滅を完了条件にせずlegacy token経路と分離 |
 
 ### 3.3 parametrization (tmux/herdr × git/非git/外部)
 

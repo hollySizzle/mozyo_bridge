@@ -25,6 +25,7 @@ from mozyo_bridge.core.state.scratch_retirement_fence import (
     ScratchRetirementFence,
     slot_digest,
 )
+from mozyo_bridge.core.state.scratch_retirement_pin import ScratchRetirementPin
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_outbox_processor import (  # noqa: E501
     CallbackOutboxProcessor,
 )
@@ -34,6 +35,12 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 
 WS, LANE, ROLE = "wsabc", "dogfood13892", "claude"
 NAME = encode_assigned_name(WS, ROLE, LANE)
+
+
+def _worker_pin() -> ScratchRetirementPin:
+    return ScratchRetirementPin(
+        ROLE, NAME, "%2", "startup:claude:%2"
+    )
 
 
 class _NullSource:
@@ -77,7 +84,7 @@ class CallbackDeliverEdgeTest(unittest.TestCase):
 
     def test_a_pending_retirement_makes_the_callback_edge_zero_send(self):
         with self.fence.transaction(self.unit, live_pair_present=True) as txn:
-            txn.reserve(pinned=(("claude", "%2"),))
+            txn.reserve(pinned=(_worker_pin(),))
             report = self.proc.deliver(self._sender)
         self.assertEqual(self.sends, [], "sent=0: never deliver into a retiring pair")
         self.assertTrue(report.skipped_retiring, "the skip is surfaced, not silent")
@@ -98,13 +105,13 @@ class CallbackDeliverEdgeTest(unittest.TestCase):
         outbox.enqueue(key)  # no target_lane / target_receiver
         proc = CallbackOutboxProcessor(outbox, _NullSource(), workspace_id=WS)
         with self.fence.transaction(self.unit, live_pair_present=True) as txn:
-            txn.reserve(pinned=(("claude", "%2"),))
+            txn.reserve(pinned=(_worker_pin(),))
             proc.deliver(self._sender)
         self.assertEqual(len(self.sends), 1)
 
     def test_an_unreadable_authority_blocks_the_callback_edge(self):
         with self.fence.transaction(self.unit, live_pair_present=True) as txn:
-            txn.reserve(pinned=(("claude", "%2"),))
+            txn.reserve(pinned=(_worker_pin(),))
         self.fence.seal_path.write_text("deadbeef")  # identity mismatch
         self.proc.deliver(self._sender)
         self.assertEqual(self.sends, [], "an unreadable authority must not permit a send")
@@ -136,7 +143,7 @@ class SharedGuardSeamTest(unittest.TestCase):
         fence = ScratchRetirementFence(home=home)
         unit = RetirementUnit(WS, LANE, slot_digest([NAME]))
         with fence.transaction(unit, live_pair_present=True) as txn:
-            txn.reserve(pinned=(("claude", "%2"),))
+            txn.reserve(pinned=(_worker_pin(),))
             retiring, detail = target_is_retiring(NAME)
         self.assertTrue(retiring, "the shared guard the forward edge calls must refuse")
         self.assertTrue(detail)

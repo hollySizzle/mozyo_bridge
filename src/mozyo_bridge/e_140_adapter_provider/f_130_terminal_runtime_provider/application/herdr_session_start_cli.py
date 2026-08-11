@@ -78,14 +78,22 @@ def _render_text(result: SessionStartResult) -> str:
         state = (
             "reclaimed"
             if result.base_pane_reclaimed
-            else f"reclaim-failed ({result.base_pane_detail})"
+            else (
+                "preserved (generation_unproven_root_preserved)"
+                if result.base_pane_detail == "generation_unproven_root_preserved"
+                else f"reclaim-failed ({result.base_pane_detail})"
+            )
         )
         lines.append(f"base pane {result.base_pane_id}: {state}")
     if result.tab_pane_id:
         state = (
             "reclaimed"
             if result.tab_pane_reclaimed
-            else f"reclaim-failed ({result.tab_pane_detail})"
+            else (
+                "preserved (generation_unproven_root_preserved)"
+                if result.tab_pane_detail == "generation_unproven_root_preserved"
+                else f"reclaim-failed ({result.tab_pane_detail})"
+            )
         )
         lines.append(f"tab root pane {result.tab_pane_id}: {state}")
     if result.ratio_outcome != RATIO_NOT_APPLICABLE:

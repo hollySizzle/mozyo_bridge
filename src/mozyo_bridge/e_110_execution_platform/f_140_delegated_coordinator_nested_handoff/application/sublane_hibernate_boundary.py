@@ -32,6 +32,8 @@ _MAX_UNTRACKED_FILE_BYTES = 64 * 1024 * 1024  # 64 MiB per untracked file
 _MAX_UNTRACKED_FILES = 20_000  # total untracked paths hashed
 
 from mozyo_bridge.core.state.lane_lifecycle import (
+    RELEASE_NOT_REQUESTED,
+    RELEASE_RELEASED,
     LaneLifecycleError,
     LaneLifecycleKey,
     LaneLifecycleStore,
@@ -617,6 +619,16 @@ def fresh_release_disposition(
             post_check.recovery_detail or RECOVERY_ACTION_DETAIL,
             "lane hibernated; release admission blocked by revision drift — success withheld, "
             "re-drive with current authority via `sublane resume`",
+        )
+    if getattr(release, "process_release", "") not in (
+        RELEASE_RELEASED,
+        RELEASE_NOT_REQUESTED,
+    ):
+        return (
+            True,
+            RECOVERY_ACTION_DETAIL,
+            "lane hibernated; process release incomplete — success withheld, re-drive with "
+            "current authority via `sublane resume`",
         )
     if post_check.residue_detected:
         return (

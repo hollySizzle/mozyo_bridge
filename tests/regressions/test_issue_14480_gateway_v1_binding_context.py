@@ -1,4 +1,4 @@
-"""Regression: the action-bound relaunch carries its exact v1 binding context (#14480).
+"""Regression: an action-bound relaunch carries exact context and a typed stop (#14480).
 
 The measured defect (#14479 j#88695, installed 0.14.0a3 dogfood): with the selected
 identity-attestation store at v1, ``sublane recover-gateway --execute`` closed the exact old
@@ -7,7 +7,8 @@ committed-close replay whose lane authority read ``ok`` and whose sibling worker
 done. The lane was left with the gateway closed, no fresh gateway, no resume, and no public
 statement of why.
 
-Two distinct defects sit behind that one opaque token, and this module pins both:
+Two distinct defects sat behind that one opaque token, and this module pins both while
+retaining #15227's current authority contract:
 
 1. **The launch had no binding context.** :meth:`LiveRecoveryActuatorPort.launch_action_bound`
    passed only ``replacement_action_id`` and called ``heal_lane_column`` unscoped. Under v1
@@ -19,12 +20,11 @@ Two distinct defects sit behind that one opaque token, and this module pins both
    ``LAUNCH_ERROR``, and the generic actuator records a hardcoded ``detail="launch"``, so the
    operator could not tell a binding fence from a transient pane failure.
 
-The first class drives the REAL chain — port -> ``heal_lane_column`` -> ``V1ReplacementDriver``
--> ``launch_or_resume_v1_replacement`` -> reserve / startup receipt / side bind — against an
-isolated home with v1 selected. Only the process-launching seam is faked, and it is faked by
-*doing what a real launch does* (write the startup-transaction receipt and the normal-v1
-attestation row), so the v1 binding state machine is exercised rather than mocked away. On the
-pre-fix source these tests fail at ``replacement_binding_context_missing``.
+The first class drives the real port -> ``heal_lane_column`` chain against an isolated home.
+Only the process-launching seam is faked, and it records the pane-bound-v2 receipt, terminal-
+bound generation-v2 and v4 attestation a current launch produces.  Legacy v1-v3 side rows are
+diagnostic-only and remain absent; the legacy fence token is covered only as a public closed-
+token projection.  On the pre-#14480 source the context-threading tests still fail.
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (  # noqa: E402
     IdentityAttestationRecord,
 )
 from tests.support.current_launch_authority import (  # noqa: E402
-    seed_current_generation,
+    seed_completed_current_launch_authority,
 )
 from mozyo_bridge.core.state.replacement_preservation import (  # noqa: E402
     PreservationObservation,
@@ -58,17 +58,18 @@ from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
 from mozyo_bridge.core.state.startup_transaction_fence import (  # noqa: E402
     PHASE_COMPLETED_SUCCESS,
     Participant,
+    StartupTransactionFence,
     StartupUnit,
     startup_action_id,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E402,E501
     sublane_actuator_herdr_ops as herdr_ops,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E402,E501
-    sublane_actuator_v1_replacement as v1_drive,
-)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.recovery_owner_approval_live import (  # noqa: E402,E501
     verify_live_recovery_owner_approval,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_evidence_planner_composition import (  # noqa: E402,E501
+    EvidencePlanning,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_gateway_recovery import (  # noqa: E402,E501
     GatewayRefreshRequest,
@@ -128,6 +129,13 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_v1_replacement_binding import (  # noqa: E402,E501
     V1_BINDING_CONTEXT_MISSING,
+    V1_BINDING_LAUNCH_UNHEALTHY,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E402,E501
+    pane_bound_receipt,
+)
+from mozyo_bridge.core.state.herdr_native_identity_binding import (  # noqa: E402
+    native_name_for,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E402,E501
     encode_assigned_name,
@@ -145,6 +153,8 @@ TAB = "w3N:tW"
 OLD_GATEWAY_LOCATOR = "w3N:p2J"
 FRESH_GATEWAY_LOCATOR = "w3N:p3A"
 WORKER_LOCATOR = "w3N:p2K"
+GATEWAY_TERMINAL = "terminal:14480:gateway"
+WORKER_TERMINAL = "terminal:14480:worker"
 ACTION_ID = "refresh-gateway:{lane}:codex:codex:gw:{loc}:r1".format(
     lane=LANE, loc=OLD_GATEWAY_LOCATOR
 )
@@ -153,13 +163,8 @@ GATEWAY_NAME = encode_assigned_name(WS, GATEWAY_PROVIDER, LANE)
 WORKER_NAME = encode_assigned_name(WS, WORKER_PROVIDER, LANE)
 
 
-@contextlib.contextmanager
-def _nolock(*_args, **_kwargs):
-    yield
-
-
-class _V1LaunchCase(unittest.TestCase):
-    """Drive the REAL v1 action-bound launch chain over an isolated home.
+class _CurrentLaunchCase(unittest.TestCase):
+    """Drive the current terminal-bound action launch over an isolated home.
 
     The lane state under test is the exact measured one: the old gateway is already closed
     (absent from the live inventory), the sibling worker is live at its own locator, and the
@@ -207,7 +212,8 @@ class _V1LaunchCase(unittest.TestCase):
         """The measured live inventory: the old gateway is gone, the worker survives."""
         return [
             {
-                "assigned_name": WORKER_NAME, "pane_id": WORKER_LOCATOR,
+                "name": WORKER_NAME, "assigned_name": WORKER_NAME,
+                "pane_id": WORKER_LOCATOR, "terminal_id": WORKER_TERMINAL,
                 "revision": "1", "agent_status": "turn_ended",
             }
         ]
@@ -217,13 +223,12 @@ class _V1LaunchCase(unittest.TestCase):
 
         A real ``prepare_session`` reserves the startup transaction under the nonce it was
         handed, records the participant receipt for the slot it actually started, marks the
-        transaction durably successful, and leaves a normal-v1 startup self-attestation row at
-        the fresh locator. All four are what the v1 side-bind then joins on, so faking the
-        *subprocess* while performing the *durable effects* keeps the binding state machine
-        under test instead of stubbed out.
+        transaction durably successful, finalizes generation-v2, and leaves a v4 startup
+        attestation at the fresh locator. Faking the subprocess while performing those durable
+        effects keeps the current authority join under test instead of stubbed out.
         """
-        nonce = kwargs.get("action_nonce", "")
-        fence = kwargs.get("startup_fence")
+        nonce = kwargs.get("action_nonce") or "current-14480-launch"
+        fence = kwargs.get("startup_fence") or StartupTransactionFence(home=self.home)
         providers = kwargs.get("providers")
         self.launch_calls.append(
             {
@@ -243,14 +248,46 @@ class _V1LaunchCase(unittest.TestCase):
             action_id,
             Participant(
                 role=GATEWAY_PROVIDER, assigned_name=GATEWAY_NAME,
-                locator=FRESH_GATEWAY_LOCATOR, receipt=TAB,
+                locator=FRESH_GATEWAY_LOCATOR,
+                receipt=pane_bound_receipt(
+                    target_workspace="w3N",
+                    target_tab=TAB,
+                    native_name=native_name_for(GATEWAY_NAME),
+                    terminal_id=GATEWAY_TERMINAL,
+                ),
             ),
         )
         fence.set_phase(action_id, PHASE_COMPLETED_SUCCESS)
+        from mozyo_bridge.core.state.herdr_launch_generation import (
+            HerdrLaunchGenerationStore,
+        )
+
+        generation = HerdrLaunchGenerationStore(home=self.home)
+        generation.reserve_pending(
+            assigned_name=GATEWAY_NAME,
+            startup_action_id=action_id,
+            workspace_id=WS,
+            role=GATEWAY_PROVIDER,
+            lane_id=LANE,
+        )
+        generation.finalize(
+            assigned_name=GATEWAY_NAME,
+            startup_action_id=action_id,
+            workspace_id=WS,
+            role=GATEWAY_PROVIDER,
+            lane_id=LANE,
+            locator=FRESH_GATEWAY_LOCATOR,
+            terminal_id=GATEWAY_TERMINAL,
+            verdict=VERDICT_PRESENT,
+            observed_at="2026-08-12T00:00:00+00:00",
+        )
         HerdrIdentityAttestationStore(home=self.home).upsert(
             IdentityAttestationRecord(
                 assigned_name=GATEWAY_NAME, workspace_id=WS, role=GATEWAY_PROVIDER,
-                lane_id=LANE, locator=FRESH_GATEWAY_LOCATOR, verdict=VERDICT_PRESENT,
+                lane_id=LANE, locator=FRESH_GATEWAY_LOCATOR,
+                terminal_id=GATEWAY_TERMINAL,
+                replacement_action_id=ACTION_ID,
+                verdict=VERDICT_PRESENT,
             )
         )
         return SessionStartResult(
@@ -282,8 +319,8 @@ class _V1LaunchCase(unittest.TestCase):
         return WS, LANE, healed
 
     @contextlib.contextmanager
-    def _real_v1_chain(self):
-        """Patch only the external boundaries; the v1 binding logic stays real."""
+    def _current_launch_chain(self):
+        """Patch only external process boundaries; current authority stores stay real."""
         test = self
         with contextlib.ExitStack() as stack:
             for target, name, value in [
@@ -292,8 +329,6 @@ class _V1LaunchCase(unittest.TestCase):
                     herdr_ops, "evaluate_heal_runtime_fence",
                     lambda *a, **k: SimpleNamespace(ok=True, reason="", detail=""),
                 ),
-                (v1_drive, "selected_attestation_store_is_v1", lambda home: True),
-                (v1_drive, "attestation_store_lock", _nolock),
             ]:
                 stack.enter_context(mock.patch.object(target, name, value))
             for cls, name, value in [
@@ -312,27 +347,26 @@ class _V1LaunchCase(unittest.TestCase):
             yield
 
 
-class ExactBindingContextTests(_V1LaunchCase):
-    """#14480 acceptance 1 + 3: the v1 launch receives the exact pin context and completes."""
+class ExactBindingContextTests(_CurrentLaunchCase):
+    """#14480 acceptance 1 + 3: the current launch receives exact pin context."""
 
-    def test_committed_close_replay_launches_and_binds_under_selected_v1(self):
-        """The negative control. Pre-fix this stops at ``replacement_binding_context_missing``.
+    def test_committed_close_replay_launches_under_current_v4_authority(self):
+        """The negative control. Pre-fix this stopped at the missing binding context.
 
         Nothing here is asserted through a mock of the thing under test: the launch drives the
-        real ``heal_lane_column`` -> real ``V1ReplacementDriver`` -> real
-        ``launch_or_resume_v1_replacement``, and the side bind must find the exact reserve,
-        the exact startup receipt, and a clean normal-v1 attestation row.
+        real ``heal_lane_column`` and must produce an exact pane-bound receipt, generation-v2,
+        and v4 attestation without creating a legacy side binding.
         """
         port = self._port()
-        with self._real_v1_chain():
+        with self._current_launch_chain():
             result = port.launch_action_bound(ACTION_ID, self._pin())
         self.assertEqual(result, LAUNCH_DONE)
         # A completed launch fenced on nothing — the typed field says "no fence", which is a
         # different statement from "we do not know why" (LAUNCH_FAILURE_UNTYPED).
         self.assertEqual(port.launch_failure_reason, LAUNCH_FAILURE_NONE)
         self.assertIsNone(port.launch_startup_health)
-        # The v1 side binding for the EXACT action + participant is durable, which is what
-        # ``verify_attestation`` re-checks. A launch that never bound would leave this absent.
+        # The v1-v3 side binding is diagnostic-only under #15227.  Current authority is the
+        # direct replacement action on the terminal-bound v4 attestation plus generation-v2.
         from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
             HerdrIdentityReplacementBindingStore,
         )
@@ -340,16 +374,16 @@ class ExactBindingContextTests(_V1LaunchCase):
         intent = HerdrIdentityReplacementBindingStore(home=self.home).read(
             ACTION_ID, GATEWAY_NAME
         )
-        self.assertIsNotNone(intent)
-        self.assertEqual(intent.assigned_name, GATEWAY_NAME)
-        self.assertEqual(intent.role, GATEWAY_PROVIDER)
-        self.assertEqual(intent.lane_id, LANE)
-        self.assertEqual(intent.old_locator, OLD_GATEWAY_LOCATOR)
+        self.assertIsNone(intent)
+        attestation = HerdrIdentityAttestationStore(home=self.home).read(GATEWAY_NAME)
+        self.assertIsNotNone(attestation)
+        self.assertEqual(attestation.replacement_action_id, ACTION_ID)
+        self.assertEqual(attestation.terminal_id, GATEWAY_TERMINAL)
 
     def test_the_launch_is_driven_for_the_gateway_only_and_adopts_the_live_worker(self):
         """#14480 acceptance 2: the surviving worker is adopted, never relaunched or closed."""
         port = self._port()
-        with self._real_v1_chain():
+        with self._current_launch_chain():
             self.assertEqual(port.launch_action_bound(ACTION_ID, self._pin()), LAUNCH_DONE)
         self.assertEqual(len(self.launch_calls), 1)
         call = self.launch_calls[0]
@@ -358,14 +392,14 @@ class ExactBindingContextTests(_V1LaunchCase):
         # recover-pair's explicit both-absent mode and must NOT be switched on here — doing so
         # would start the gateway beside an unreserved sibling.
         self.assertIsNone(call["providers"])
-        # The bind is reserved for the gateway participant alone; the worker's name never
-        # enters the replacement binding store, so the worker holds no replacement authority.
+        # Legacy side bindings stay absent for both participants; they are never current
+        # replacement authority even when a current v4 launch succeeds.
         from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
             HerdrIdentityReplacementBindingStore,
         )
 
         store = HerdrIdentityReplacementBindingStore(home=self.home)
-        self.assertIsNotNone(store.read(ACTION_ID, GATEWAY_NAME))
+        self.assertIsNone(store.read(ACTION_ID, GATEWAY_NAME))
         self.assertIsNone(store.read(ACTION_ID, WORKER_NAME))
         # The worker's live attestation row is untouched by the gateway's relaunch: the
         # recovery never writes, rebinds, or closes the sibling it is preserving.
@@ -374,23 +408,22 @@ class ExactBindingContextTests(_V1LaunchCase):
         )
 
     def test_an_incomplete_pin_context_is_reported_as_its_typed_reason(self):
-        """#14480 acceptance 4: the v1 context fence reaches the public field, not a bare token.
+        """#14480 acceptance 4: an incomplete target reaches a typed public field.
 
         Drives the SAME real chain with a pin whose assigned name does not encode
-        ``(workspace, provider, lane)`` — the exact shape v1 refuses. Pre-fix EVERY launch took
-        this path and reported nothing; the point of the assertion is the reason, not the
-        failure.
+        ``(workspace, provider, lane)``. The point of the assertion is the closed reason, not
+        the generic fact that the launch failed.
         """
         port = self._port()
-        with self._real_v1_chain():
+        with self._current_launch_chain():
             result = port.launch_action_bound(
                 ACTION_ID, self._pin(assigned_name="not-an-encoded-name")
             )
         self.assertEqual(result, LAUNCH_ERROR)
-        self.assertEqual(port.launch_failure_reason, V1_BINDING_CONTEXT_MISSING)
+        self.assertEqual(port.launch_failure_reason, V1_BINDING_LAUNCH_UNHEALTHY)
         # And the port exposes it through the shared typed-capability reader the public
         # surfaces use, not only as a private attribute.
-        self.assertEqual(port_launch_failure_reason(port), V1_BINDING_CONTEXT_MISSING)
+        self.assertEqual(port_launch_failure_reason(port), V1_BINDING_LAUNCH_UNHEALTHY)
 
     def test_a_live_pair_split_after_the_relaunch_still_fails_closed(self):
         """#14480 acceptance 5: target scoping did not weaken the same-tab pair invariant.
@@ -401,7 +434,7 @@ class ExactBindingContextTests(_V1LaunchCase):
         """
         self.post_worker = (WORKER_LOCATOR, "w3N:tOTHER")
         port = self._port()
-        with self._real_v1_chain():
+        with self._current_launch_chain():
             result = port.launch_action_bound(ACTION_ID, self._pin())
         self.assertEqual(result, LAUNCH_ERROR)
         self.assertEqual(port.launch_failure_reason, HEAL_REASON_PAIR_SPLIT)
@@ -410,13 +443,13 @@ class ExactBindingContextTests(_V1LaunchCase):
         """The other half of the scoping contract: an absent sibling converges later."""
         self.post_worker = None
         port = self._port()
-        with self._real_v1_chain():
+        with self._current_launch_chain():
             result = port.launch_action_bound(ACTION_ID, self._pin())
         self.assertEqual(result, LAUNCH_DONE)
         self.assertEqual(port.launch_failure_reason, LAUNCH_FAILURE_NONE)
 
 
-class ArgumentThreadingTests(_V1LaunchCase):
+class ArgumentThreadingTests(_CurrentLaunchCase):
     """#14480 acceptance 1, pinned at the exact call boundary the defect lived on."""
 
     def test_the_pin_context_reaches_the_lane_actuator_and_the_scoped_heal(self):
@@ -711,9 +744,16 @@ class PublicOutcomeTests(unittest.TestCase):
         self.store = ReplacementTransactionStore(home=self.home)
         # Ruling j#97105: seed this gateway's CURRENT (pre-#14741, untagged) row, so the
         # launch fence under test is reached instead of the missing-authority refusal.
-        seed_current_generation(
-            self.home, workspace_id=WS, lane_id=LANE, role=GATEWAY_PROVIDER,
-            assigned_name="gw", locator=OLD_GATEWAY_LOCATOR,
+        seed_completed_current_launch_authority(
+            self.home,
+            workspace_id=WS,
+            lane_id=LANE,
+            role=GATEWAY_PROVIDER,
+            assigned_name="gw",
+            locator=OLD_GATEWAY_LOCATOR,
+            terminal_id=f"terminal:{OLD_GATEWAY_LOCATOR}",
+            target_workspace="w3N",
+            target_tab=TAB,
         )
 
     def _request(self) -> GatewayRefreshRequest:
@@ -730,6 +770,20 @@ class PublicOutcomeTests(unittest.TestCase):
             self.store, port, _Ops(), workspace_id=WS,
             clock=lambda: "2026-07-27T00:00:00+00:00",
         )
+
+    def _run(self, port, request, *, execute):
+        """Isolate launch-reason projection from the separately-tested evidence planner."""
+        target = (
+            "mozyo_bridge.e_110_execution_platform."
+            "f_140_delegated_coordinator_nested_handoff.application."
+            "sublane_gateway_recovery.plan_participants_with_evidence"
+        )
+
+        def admit(participants, **_kwargs):
+            return EvidencePlanning(participants=tuple(participants))
+
+        with mock.patch(target, side_effect=admit):
+            return self._use_case(port).run(request, execute=execute)
 
     def _actionable_request(self) -> GatewayRefreshRequest:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.gateway_turn_recovery import (  # noqa: E501
@@ -748,7 +802,7 @@ class PublicOutcomeTests(unittest.TestCase):
 
     def test_a_fenced_launch_names_its_reason_in_a_typed_field_and_in_the_detail(self):
         port = _FencedLaunchPort()
-        outcome = self._use_case(port).run(self._actionable_request(), execute=True)
+        outcome = self._run(port, self._actionable_request(), execute=True)
         self.assertEqual(outcome.status, REFRESH_STATUS_STOPPED)
         self.assertEqual(outcome.launch_failure_reason, V1_BINDING_CONTEXT_MISSING)
         # The compatibility rendering: readers that predate the typed field still see the
@@ -768,24 +822,20 @@ class PublicOutcomeTests(unittest.TestCase):
             format_recover_gateway_text,
         )
 
-        stopped = self._use_case(_FencedLaunchPort()).run(
-            self._actionable_request(), execute=True
+        stopped = self._run(
+            _FencedLaunchPort(), self._actionable_request(), execute=True
         )
         self.assertIn(
             f"launch_failure: {V1_BINDING_CONTEXT_MISSING}",
             format_recover_gateway_text(stopped),
         )
-        preflight = self._use_case(_FencedLaunchPort()).run(
-            self._request(), execute=False
-        )
+        preflight = self._run(_FencedLaunchPort(), self._request(), execute=False)
         self.assertEqual(preflight.status, REFRESH_STATUS_PREFLIGHT)
         self.assertEqual(preflight.launch_failure_reason, LAUNCH_FAILURE_NONE)
         self.assertNotIn("launch_failure:", format_recover_gateway_text(preflight))
 
     def test_every_outcome_carries_the_key_so_absence_is_never_inferred(self):
-        preflight = self._use_case(_FencedLaunchPort()).run(
-            self._request(), execute=False
-        )
+        preflight = self._run(_FencedLaunchPort(), self._request(), execute=False)
         payload = preflight.as_payload()
         self.assertIn("launch_failure_reason", payload)
         self.assertIsNone(payload["launch_failure_reason"])

@@ -1,14 +1,12 @@
-"""Post-launch container geometry: reclaim the roots, then divide the pair (#14569).
+"""Post-launch container geometry: preserve unbound roots and divide the pair (#14569).
 
 The cohesive sibling of :mod:`herdr_session_start` that owns everything a run does to the
 *container* **after every launch has succeeded**, so the composition root holds one call
 and no geometry logic of its own:
 
-1. **root-pane reclaim** — close the empty herdr root panes this run created (the #13330
-   workspace base pane and the #13411 lane tab root pane). Relocated here unchanged from
-   the session-start composition root: it is the first half of "finish shaping the
-   container", and it must run BEFORE step 2 because closing the root collapses the split
-   tree the ratio is measured against.
+1. **root-pane classification** — workspace and tab roots have no terminal-bound launch
+   generation, so this rail preserves them with a typed zero-close verdict. Geometry is
+   subsequently measured only inside the managed, generation-proven pane envelope.
 2. **declared pair split ratio** — herdr 0.7.4 ``agent start`` has no ``--ratio`` flag
    (live ``--help`` characterization, j#91140), so the pair's relative division cannot ride
    on the launch argv the way ``--split`` does. It is actuated once, afterwards, with
@@ -21,8 +19,8 @@ The only divider this module ever moves is **one this run just created**. Concre
 container; an all-adopt run, a dry run, and a first-launch-only run all create no divider
 and actuate nothing. Loading a config actuates nothing at all — there is no path from
 ``config.yaml`` to a live pane except through a launch that completes a pair. No pane is
-ever closed, moved, swapped, focused or killed here beyond the root reclaim this run's own
-``workspace create`` / ``tab create`` incurred.
+ever closed, moved, swapped, focused or killed here as root cleanup; unbound roots stay
+outside the managed geometry authority.
 
 That predicate — and nothing narrower — also decides what gets MEASURED. Everything the
 rail needs is found from the one slot this run launched as a split
@@ -44,6 +42,9 @@ not the one herdr would move for that pane, a ``pane resize`` that herdr rejecte
 last — a final measurement that disagrees with the declared ratio. herdr silently clamps
 both the per-call ``--amount`` (to 0.5) and the resulting ratio (to ``0.1..0.9``), so
 *issuing* a resize proves nothing; only the closing :func:`pane layout` read does.
+Every effect is fenced by fresh terminal/v4/generation and full-layout checks. Herdr 0.8
+still exposes only locator-addressed resize, so check-to-dispatch ABA remains a documented
+provider residual rather than a claim of atomic conditional mutation.
 """
 
 from __future__ import annotations
@@ -689,69 +690,17 @@ def _apply_ratio(
     runner: Runner,
     timeout: float,
     env,
+    authority_check=None,
 ) -> "tuple[str, str]":
-    """Drive the pair's divider to ``target`` and MEASURE the result — ``(outcome, detail)``.
+    """Drive the pair under a fresh terminal-generation and layout fence."""
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pair_split_ratio_actuation import (  # noqa: E501
+        apply_pair_ratio,
+    )
 
-    ``split`` / ``first`` are the caller's opening measurement (it already had to read the
-    layout to decide which pane holds the first side), so the read is not repeated here.
-
-    The loop is the answer to herdr's two silent clamps (measured j#91140): ``--amount`` is
-    capped at 0.5 per call and the resulting ratio at ``0.1..0.9``. Each pass therefore
-    recomputes its step from a fresh measurement instead of from what it asked for, and the
-    outcome is decided by the closing read, not by the resize exiting 0.
-
-    Termination is bounded three ways, so an unreachable target cannot spin: the pass count
-    (:data:`MAX_RESIZE_PASSES`), a match, and a pass that failed to move the ratio strictly
-    closer to the target. The last one is what catches a clamped-out target — the divider
-    stops moving and the run reports the residual rather than issuing the same request
-    forever.
-    """
-    matched, detail = ratio_verdict(split, first, target)
-    if matched:
-        return RATIO_MATCHED, detail
-    for _ in range(MAX_RESIZE_PASSES):
-        distance = abs(split.ratio - target)
-        token, amount = resize_step(split.ratio, target, direction)
-        actuator_pane = (
-            pair.first_pane
-            if token == _GROW_DIRECTION[direction]
-            else pair.second_pane
-        )
-        resize_effect = _resize(
-            actuator_pane, token, amount,
-            binary=binary, runner=runner, timeout=timeout, env=env,
-        )
-        if resize_effect == RESIZE_UNCHANGED:
-            return RATIO_FAILED, (
-                f"herdr reported no change for 'pane resize --direction {token}'; "
-                f"{detail}"
-            )
-        if resize_effect == RESIZE_REFUSED:
-            return RATIO_FAILED, (
-                f"herdr refused 'pane resize --direction {token}'; {detail}"
-            )
-        if resize_effect != RESIZE_CHANGED:
-            return RATIO_FAILED, (
-                f"herdr did not prove the effect of 'pane resize --direction {token}'; "
-                f"{detail}"
-            )
-        split, first, reason = _measure_pair(
-            _read_layout(
-                pair.first_pane, binary=binary, runner=runner, timeout=timeout, env=env
-            ),
-            pair,
-            direction,
-        )
-        if split is None or first is None:
-            return RATIO_FAILED, reason
-        matched, detail = ratio_verdict(split, first, target)
-        if matched:
-            return RATIO_APPLIED, detail
-        if abs(split.ratio - target) >= distance:
-            # The divider did not move closer: herdr clamped the request. Report the
-            # residual instead of repeating a call that has already stopped working.
-            return RATIO_FAILED, f"herdr stopped moving the divider short of the target; {detail}"
-    return RATIO_FAILED, f"the divider did not reach the declared ratio; {detail}"
+    return apply_pair_ratio(
+        pair, split, first, direction=direction, target=target, binary=binary,
+        runner=runner, timeout=timeout, env=env, authority_check=authority_check,
+    )
 
 
 def _pair_geometry(
@@ -769,6 +718,7 @@ def _pair_geometry(
     runner: Runner,
     timeout: float,
     env,
+    store_home: Path,
 ) -> "tuple[str, str]":
     """Decide and (when owed) actuate this run's pair split ratio — ``(outcome, detail)``.
 
@@ -828,6 +778,43 @@ def _pair_geometry(
     split, first, reason = _measure_pair(layout, pair, config_split)
     if split is None or first is None:
         return RATIO_FAILED, reason
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pair_generation_authority import (  # noqa: E501
+        pair_generation_fingerprint,
+    )
+
+    opening_generation = pair_generation_fingerprint(
+        (pair.first_pane, pair.second_pane),
+        expected_workspace_id=result.workspace_id,
+        expected_lane_id=result.lane_id,
+        expected_anchor_assigned_name=anchor.assigned_name,
+        expected_anchor_provider=anchor.provider,
+        expected_anchor_locator=anchor.locator,
+        expected_anchor_terminal_id=anchor.launch_terminal_id,
+        expected_anchor_action_id=result.action_id,
+        home=store_home,
+        binary=binary,
+        runner=runner,
+        timeout=timeout,
+    )
+    if opening_generation is None:
+        return RATIO_FAILED, "the pair lacks exact completed current-generation authority"
+
+    def same_generation_authority() -> bool:
+        return pair_generation_fingerprint(
+            (pair.first_pane, pair.second_pane),
+            expected_workspace_id=result.workspace_id,
+            expected_lane_id=result.lane_id,
+            expected_anchor_assigned_name=anchor.assigned_name,
+            expected_anchor_provider=anchor.provider,
+            expected_anchor_locator=anchor.locator,
+            expected_anchor_terminal_id=anchor.launch_terminal_id,
+            expected_anchor_action_id=result.action_id,
+            home=store_home,
+            binary=binary,
+            runner=runner,
+            timeout=timeout,
+        ) == opening_generation
+
     return _apply_ratio(
         pair,
         split,
@@ -838,6 +825,7 @@ def _pair_geometry(
         runner=runner,
         timeout=timeout,
         env=env,
+        authority_check=same_generation_authority,
     )
 
 
@@ -859,8 +847,9 @@ def finalize_container_geometry(
     project_coordinator: bool = False,
     store_home: object = None,
     top_workspace_id: str = "",
+    attestation_read=None,
 ) -> None:
-    """Finish the container this run launched into: reclaim, column, divide the pair.
+    """Finish the container: preserve roots, shape the column, divide the pair.
 
     Runs as the LAST pass of a launch, after the bounded startup-health probe (#13948)
     has settled — not before it, which is where it used to sit. herdr reports a pane it
@@ -874,8 +863,8 @@ def finalize_container_geometry(
 
     Within this call, the three steps compose in one order:
 
-    1. **reclaim** the root panes this run created — closing one collapses the split tree,
-       so anything measured before it would read a geometry about to change;
+    1. **classify** root panes and preserve them because they have no terminal-bound
+       generation authority; managed geometry excludes their rectangles;
     2. **project column** (Redmine #14996 R2) — a pair freshly appended to either shared
        coordinator placement workspace is bounced into its own full-height column. It runs
        BEFORE the ratio because it rebuilds the very divider the ratio is measured against;
@@ -886,8 +875,8 @@ def finalize_container_geometry(
     3. **pair split ratio** (#14569) — divide the pair this run created at the declared
        ratio, measured against the geometry the two steps above settled on.
 
-    All three record onto ``result`` rather than raising: a reclaim failure has always been
-    cosmetic residue, and a column / ratio failure leaves a fully live pair whose only
+    All three record onto ``result`` rather than raising: a preserved root is cosmetic
+    residue, and a column / ratio failure leaves a fully live pair whose only
     defect is its placement — killing agents over that would be a far worse outcome than
     reporting it (Design Answer j#91127, "既存agentをkill/closeせず"). The report is not
     cosmetic either: ``SessionStartResult.ok`` reads both axes, so a failure is not
@@ -925,6 +914,7 @@ def finalize_container_geometry(
         runner=runner,
         timeout=timeout,
         env=env,
+        store_home=Path(store_home) if store_home else mozyo_bridge_home(),
     )
 
 

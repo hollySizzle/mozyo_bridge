@@ -95,6 +95,7 @@ def seed_current_generations(home: Path, participants: Iterable, *, workspace_id
 def seed_completed_current_generation(
     home: Path, *, workspace_id: str, lane_id: str, role: str,
     assigned_name: str, locator: str, terminal_id: str = "",
+    receipt: str = "workspace=current",
 ) -> str:
     """Seed a terminal-bound generation with its exact completed startup transaction."""
     from mozyo_bridge.core.state.startup_transaction_fence import (
@@ -106,7 +107,7 @@ def seed_completed_current_generation(
     action = fence.reserve(StartupUnit(workspace_id, lane_id, (role,)),
                            f"current-generation-{role}-{assigned_name}")
     fence.record_participant(action.action_id, Participant(
-        role=role, assigned_name=assigned_name, locator=locator, receipt="workspace=current",
+        role=role, assigned_name=assigned_name, locator=locator, receipt=receipt,
     ))
     fence.set_phase(action.action_id, PHASE_HEALTH_CHECK)
     fence.set_phase(action.action_id, PHASE_COMPLETED_SUCCESS)
@@ -118,10 +119,63 @@ def seed_completed_current_generation(
     return action.action_id
 
 
+def seed_completed_current_launch_authority(
+    home: Path, *, workspace_id: str, lane_id: str, role: str,
+    assigned_name: str, locator: str, terminal_id: str,
+    target_workspace: str, target_tab: str,
+) -> str:
+    """Seed the complete v4-attestation + completed generation-v2 test authority.
+
+    Destructive current-state fixtures must not accidentally prove only one half
+    of the production join.  Keeping the terminal and container arguments required
+    also prevents a caller from manufacturing authority for an implicit topology.
+    """
+    from mozyo_bridge.core.state.herdr_identity_attestation import (
+        HerdrIdentityAttestationStore,
+        IdentityAttestationRecord,
+    )
+    from mozyo_bridge.core.state.herdr_native_identity_binding import native_name_for
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
+        pane_bound_receipt,
+    )
+
+    receipt = pane_bound_receipt(
+        target_workspace=target_workspace,
+        target_tab=target_tab,
+        native_name=native_name_for(assigned_name),
+        terminal_id=terminal_id,
+    )
+
+    action_id = seed_completed_current_generation(
+        home,
+        workspace_id=workspace_id,
+        lane_id=lane_id,
+        role=role,
+        assigned_name=assigned_name,
+        locator=locator,
+        terminal_id=terminal_id,
+        receipt=receipt,
+    )
+    HerdrIdentityAttestationStore(home=home).upsert(
+        IdentityAttestationRecord(
+            assigned_name=assigned_name,
+            workspace_id=workspace_id,
+            role=role,
+            lane_id=lane_id,
+            locator=locator,
+            terminal_id=terminal_id,
+            verdict="present",
+            observed_at=_OBSERVED_AT,
+        )
+    )
+    return action_id
+
+
 __all__ = (
     "LEGACY_ACTION_ID",
     "RECEIPT_CAPABLE_ACTION_ID",
     "seed_current_generation",
     "seed_current_generations",
     "seed_completed_current_generation",
+    "seed_completed_current_launch_authority",
 )

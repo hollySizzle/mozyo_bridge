@@ -37,7 +37,8 @@ Contract faithfulness (design §1.1, modelled faces A–F)
 - **D ``workspace create``** — mints a fresh ``w<n>`` workspace born with exactly
   one empty base ``root_pane`` (``pane_count: 1``), reproducing the cold-start base
   pane #13330 reclaims.
-- **E ``pane close``** — removes the pane and, when its workspace has **zero**
+- **E ``pane close`` / ``workspace close``** — pane close removes one pane and,
+  when its workspace has **zero**
   panes left, auto-closes the workspace (live-measured #13380: a lane-zero host
   workspace has no husk). Symmetrically, when a **tab** has zero panes left the
   tab auto-vanishes (live-measured #13411 j#73668), the tab analogue of E.
@@ -421,6 +422,8 @@ class FakeHerdr:
             return self._cmd_workspace_create(argv, rest)
         if head == ["workspace", "list"]:
             return self._cmd_workspace_list(argv)
+        if head == ["workspace", "close"]:
+            return self._cmd_workspace_close(argv, rest)
         if head == ["tab", "create"]:
             return self._cmd_tab_create(argv, rest)
         if head == ["pane", "split"]:
@@ -513,6 +516,30 @@ class FakeHerdr:
             },
         )
 
+    def _cmd_workspace_close(self, argv, rest):
+        workspace_id = rest[2] if len(rest) == 3 else ""
+        workspace = self._workspaces.pop(workspace_id, None)
+        if workspace is None:
+            return _err(argv, f"unknown workspace: {workspace_id}")
+        pane_ids = set(workspace.panes)
+        for pane_id in pane_ids:
+            self._agents.pop(pane_id, None)
+            self._prepared_provider_functions.pop(pane_id, None)
+            self._composer.pop(pane_id, None)
+        for key in tuple(self._split_ratio):
+            if key[0] == workspace_id:
+                self._split_ratio.pop(key, None)
+                self._split_direction.pop(key, None)
+        return _ok(
+            argv,
+            {
+                "result": {
+                    "type": "workspace_closed",
+                    "workspace": {"workspace_id": workspace_id},
+                }
+            },
+        )
+
     def _cmd_tab_create(self, argv, rest):
         # G (Redmine #13411): mint a fresh tab in an existing workspace, born with
         # one empty root pane (the tab analogue of `workspace create`). Fails closed
@@ -597,6 +624,54 @@ class FakeHerdr:
             launch_argv=parsed.launch_argv,
             env=parsed.env,
         )
+        # A wrapped managed launch executes these writes before provider exec.
+        # Model them at the same boundary so integration-style users of the
+        # canonical fake exercise current v4 + generation-v2 authority rather
+        # than silently degrading to an unwrapped legacy launch.
+        action_id = parsed.env.get("MOZYO_STARTUP_ACTION_ID", "")
+        store_home = parsed.env.get("MOZYO_BRIDGE_HOME", "")
+        logical_name = _logical_name_from_env(parsed.env) or parsed.name
+        if action_id and store_home:
+            from mozyo_bridge.core.state.herdr_identity_attestation import (
+                IdentityAttestationRecord,
+                VERDICT_PRESENT,
+                record_identity_attestation,
+            )
+            from mozyo_bridge.core.state.startup_execution_events import (
+                STAGE_ATTESTATION_WRITE_SUCCEEDED,
+                STAGE_PROVIDER_EXEC_CALL_REACHED,
+                STAGE_WRAPPER_ENTERED,
+                append_execution_event,
+            )
+            from mozyo_bridge.core.state.startup_transaction_fence import (
+                StartupTransactionFence,
+            )
+
+            record_identity_attestation(
+                IdentityAttestationRecord(
+                    assigned_name=logical_name,
+                    workspace_id=parsed.env.get("MOZYO_WORKSPACE_ID", ""),
+                    role=parsed.provider,
+                    lane_id=parsed.env.get("MOZYO_LANE_ID", ""),
+                    locator=pane_id,
+                    terminal_id=self._agents[pane_id].terminal_id,
+                    verdict=VERDICT_PRESENT,
+                    observed_at="2026-08-11T00:00:00+00:00",
+                ),
+                home=Path(store_home),
+            )
+            fence = StartupTransactionFence(home=Path(store_home))
+            for stage in (
+                STAGE_WRAPPER_ENTERED,
+                STAGE_ATTESTATION_WRITE_SUCCEEDED,
+                STAGE_PROVIDER_EXEC_CALL_REACHED,
+            ):
+                append_execution_event(
+                    fence,
+                    action_id,
+                    stage,
+                    participant=logical_name,
+                )
         # Fail-closed injection faces (the fake supplies the stimulus shape; the
         # real code renders the verdict).
         rendered_locator = pane_id
@@ -723,14 +798,22 @@ class FakeHerdr:
         if self.layout_bad_payload:
             return _ok(argv, {"result": {"type": "not_a_layout"}})
         key = (ws.workspace_id, tab)
+        managed = [pane for pane in panes if pane in self._agents]
+        cosmetic = [pane for pane in panes if pane not in self._agents]
+        cosmetic_root = (
+            cosmetic[0]
+            if len(managed) == 2 and len(cosmetic) == 1
+            else ""
+        )
         return _ok(
             argv,
             render_pane_layout(
-                pane_ids=panes,
+                pane_ids=managed if cosmetic_root else panes,
                 direction=self._split_direction.get(key, "down"),
                 ratio=self._split_ratio.get(key, 0.5),
                 tab_id=tab or f"{ws.workspace_id}:t1",
                 workspace_id=ws.workspace_id,
+                cosmetic_root_pane=cosmetic_root,
             ),
         )
 
@@ -777,11 +860,13 @@ class FakeHerdr:
         if ws is None:
             return _err(argv, f"no such pane: {pane_id}")
         _ws, tab, panes = self._container_of(pane_id)
+        managed_before = [candidate for candidate in panes if candidate in self._agents]
         ws.panes.remove(pane_id)
-        if len(panes) <= 2:
+        if pane_id in self._agents and len(managed_before) <= 2:
             # G (#14569): a divider exists only while two panes share it. Closing one
-            # collapses the split, so the stored ratio must go with it — a later
-            # A later `pane split` builds a FRESH divider at herdr's even default rather
+            # managed pane collapses the managed split even when an unrelated,
+            # generation-unbound root is preserved outside it.  A later `pane split`
+            # builds a FRESH divider at herdr's even default rather
             # than inheriting the dead one's share. Keeping it would let a heal report
             # `matched` without ever having divided anything.
             self._split_ratio.pop((ws.workspace_id, tab), None)
@@ -1300,6 +1385,7 @@ def render_pane_layout(
     workspace_id: str = "w1",
     extent: int = HERDR_SPLIT_EXTENT,
     cross: int = HERDR_SPLIT_CROSS,
+    cosmetic_root_pane: str = "",
 ) -> dict:
     """A ``herdr pane layout`` payload for a container — the one shape both fakes share.
 
@@ -1331,28 +1417,68 @@ def render_pane_layout(
         layout["panes"] = [{"pane_id": p, "rect": dict(area)} for p in panes]
         layout["splits"] = []
         return {"result": {"type": "pane_layout", "layout": layout}}
-    first = round(extent * ratio)
-    second = extent - first
+    # A generation-unbound tab root is deliberately preserved (#15227).  Model
+    # it as an outer, disjoint half while the two managed panes exactly tile their
+    # own inner split.  This keeps geometry tests honest: the root remains visible
+    # to full-layout readers, but it can never be mistaken for either managed
+    # side or for the divider a pair-ratio effect is allowed to resize.
+    managed_area = dict(area)
+    outer_split = None
+    if cosmetic_root_pane:
+        outer_extent = max(1, area["width"] // 2)
+        root_rect = {
+            "x": area["x"],
+            "y": area["y"],
+            "width": outer_extent,
+            "height": area["height"],
+        }
+        managed_area["x"] += outer_extent
+        managed_area["width"] -= outer_extent
+        outer_split = {
+            "id": "split_0_root",
+            "direction": "right",
+            "ratio": outer_extent / area["width"],
+            "rect": dict(area),
+        }
+    managed_extent = (
+        managed_area["height"] if direction == "down" else managed_area["width"]
+    )
+    first = round(managed_extent * ratio)
+    second = managed_extent - first
     if direction == "down":
         rects = [
-            {"x": 0, "y": 0, "width": cross, "height": first},
-            {"x": 0, "y": first, "width": cross, "height": second},
+            {
+                "x": managed_area["x"], "y": managed_area["y"],
+                "width": managed_area["width"], "height": first,
+            },
+            {
+                "x": managed_area["x"], "y": managed_area["y"] + first,
+                "width": managed_area["width"], "height": second,
+            },
         ]
     else:
         rects = [
-            {"x": 0, "y": 0, "width": first, "height": cross},
-            {"x": first, "y": 0, "width": second, "height": cross},
+            {
+                "x": managed_area["x"], "y": managed_area["y"],
+                "width": first, "height": managed_area["height"],
+            },
+            {
+                "x": managed_area["x"] + first, "y": managed_area["y"],
+                "width": second, "height": managed_area["height"],
+            },
         ]
-    layout["panes"] = [
+    layout["panes"] = ([
+        {"pane_id": cosmetic_root_pane, "rect": root_rect, "focused": False},
+    ] if cosmetic_root_pane else []) + [
         {"pane_id": panes[0], "rect": rects[0], "focused": True},
         {"pane_id": panes[1], "rect": rects[1], "focused": False},
     ]
-    layout["splits"] = [
+    layout["splits"] = ([outer_split] if outer_split is not None else []) + [
         {
-            "id": "split_0_root",
+            "id": "split_1_managed" if outer_split is not None else "split_0_root",
             "direction": direction,
             "ratio": ratio,
-            "rect": dict(area),
+            "rect": dict(managed_area),
         }
     ]
     return {"result": {"type": "pane_layout", "layout": layout}}

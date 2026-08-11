@@ -15,6 +15,7 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     HerdrIdentityAttestationStore,
     IdentityAttestationRecord,
 )
+from mozyo_bridge.core.state.herdr_native_identity_binding import native_name_for
 from mozyo_bridge.core.state.lane_lifecycle_model import ReleasePin
 from mozyo_bridge.core.state.lane_release_observation import (
     ReleaseObservation,
@@ -47,6 +48,9 @@ from mozyo_bridge.core.state.scratch_retirement_pin import (
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_destructive_close_identity import (  # noqa: E501
     pinned_generation_partition,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
+    pane_bound_receipt,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import encode_assigned_name  # noqa: E501
 from tests.support.current_launch_authority import seed_completed_current_generation
@@ -497,9 +501,16 @@ class HistoricalRollbackAbsenceTest(unittest.TestCase):
         self.ws, self.lane, self.role = "ws", "lane", "codex"
         self.name = encode_assigned_name(self.ws, self.role, self.lane)
         self.locator, self.terminal = "w:p1", "terminal-rollback"
+        self.receipt = pane_bound_receipt(
+            target_workspace="w2G",
+            target_tab="w2G:t1",
+            native_name=native_name_for(self.name),
+            terminal_id=self.terminal,
+        )
         self.action_id = seed_completed_current_generation(
             self.home, workspace_id=self.ws, lane_id=self.lane, role=self.role,
             assigned_name=self.name, locator=self.locator, terminal_id=self.terminal,
+            receipt=self.receipt,
         )
         HerdrIdentityAttestationStore(home=self.home).upsert(
             IdentityAttestationRecord(
@@ -509,7 +520,10 @@ class HistoricalRollbackAbsenceTest(unittest.TestCase):
             )
         )
         self.participant = SimpleNamespace(
-            role=self.role, assigned_name=self.name, locator=self.locator, receipt=""
+            role=self.role,
+            assigned_name=self.name,
+            locator=self.locator,
+            receipt=self.receipt,
         )
         self.action = SimpleNamespace(
             action_id=self.action_id,
@@ -526,7 +540,8 @@ class HistoricalRollbackAbsenceTest(unittest.TestCase):
         return SimpleNamespace(
             agent_rows=lambda: tuple(rows),
             prepared_pane=lambda **_kwargs: PreparedPaneObservation(
-                state=prepared_state
+                state=prepared_state,
+                terminal_reclaimed=(False if prepared_state == "absent" else None),
             ),
         )
 
@@ -558,20 +573,26 @@ class HistoricalRollbackAbsenceTest(unittest.TestCase):
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_rollback import (  # noqa: E501
             _completed_rollback_absent,
         )
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
-            pane_bound_receipt,
+        prepared_role = "claude"
+        prepared_name = encode_assigned_name(self.ws, prepared_role, self.lane)
+        prepared_locator = "w:p2"
+        prepared_terminal = "terminal-prepared"
+        prepared_receipt = pane_bound_receipt(
+            target_workspace="w2G",
+            target_tab="w2G:t1",
+            native_name=native_name_for(prepared_name),
+            terminal_id=prepared_terminal,
         )
-        from mozyo_bridge.core.state.herdr_native_identity_binding import native_name_for
-
         prepared = SimpleNamespace(
-            role=self.role, assigned_name=self.name, locator=self.locator,
-            receipt=pane_bound_receipt(
-                target_workspace="w2G", target_tab="w2G:t1",
-                native_name=native_name_for(self.name),
-            ),
+            role=prepared_role,
+            assigned_name=prepared_name,
+            locator=prepared_locator,
+            receipt=prepared_receipt,
         )
         action = SimpleNamespace(
-            action_id=self.action_id, unit=self.action.unit, participants=(prepared,)
+            action_id="startup-prepared",
+            unit=self.action.unit,
+            participants=(prepared,),
         )
         self.assertTrue(_completed_rollback_absent(
             action, self._ops((), prepared_state="absent"), self.home
@@ -582,7 +603,9 @@ class HistoricalRollbackAbsenceTest(unittest.TestCase):
         malformed = SimpleNamespace(
             action_id=self.action_id, unit=self.action.unit,
             participants=(SimpleNamespace(
-                role=self.role, assigned_name=self.name, locator=self.locator,
+                role=prepared_role,
+                assigned_name=prepared_name,
+                locator=prepared_locator,
                 receipt="pane_bound_v1 malformed",
             ),),
         )

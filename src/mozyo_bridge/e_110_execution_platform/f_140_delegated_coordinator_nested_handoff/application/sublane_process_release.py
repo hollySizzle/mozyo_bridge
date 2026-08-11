@@ -135,6 +135,29 @@ class SublaneReleaseOps(Protocol):
     def execute_close(self, plan: HerdrRetireClosePlan) -> HerdrRetireCloseResult: ...
 
 
+@dataclass(frozen=True)
+class ReadableInventoryReleaseOps:
+    """Adapt a readability-bearing inventory port to fresh release-edge reads.
+
+    Each ``live_rows`` call performs a new read.  An unreadable snapshot raises so the
+    release driver withholds close/completion instead of folding it into positive absence.
+    """
+
+    read_inventory: Callable[
+        [], tuple[Sequence[Mapping[str, object]], bool]
+    ]
+    close: Callable[[HerdrRetireClosePlan], HerdrRetireCloseResult]
+
+    def live_rows(self) -> Sequence[Mapping[str, object]]:
+        rows, readable = self.read_inventory()
+        if not readable:
+            raise RuntimeError("release inventory unreadable")
+        return tuple(rows)
+
+    def execute_close(self, plan: HerdrRetireClosePlan) -> HerdrRetireCloseResult:
+        return self.close(plan)
+
+
 # ---------------------------------------------------------------------------
 # Lane-unit live inventory.
 # ---------------------------------------------------------------------------
@@ -297,6 +320,9 @@ class ReleaseOutcome:
     #: caller treats this as a re-validation block, never a success. ``False`` for a caller
     #: that passes no ``expected_revision`` (the supersede path, unchanged).
     admission_blocked: bool = False
+    #: A caller-owned effect fence refused immediately before close/completion. The driver
+    #: leaves the release open and performs zero close / outcome write.
+    effect_admission_blocked: bool = False
 
     def as_payload(self) -> dict[str, Any]:
         return {
@@ -308,6 +334,7 @@ class ReleaseOutcome:
             ],
             "foreign_names": list(self.foreign_names),
             "admission_blocked": self.admission_blocked,
+            "effect_admission_blocked": self.effect_admission_blocked,
             "detail": self.detail,
         }
 
@@ -624,6 +651,7 @@ def drive_process_release(
     action_id: str,
     rows: Optional[Sequence[Mapping[str, object]]] = None,
     expected_revision: Optional[int] = None,
+    effect_guard: Optional[Callable[[], bool]] = None,
 ) -> ReleaseOutcome:
     """Open (or idempotently resume) a release generation and close the lane's slots.
 
@@ -646,6 +674,10 @@ def drive_process_release(
     and this read (a check-then-act race), so the driver closes NOTHING and returns
     ``admission_blocked`` (a zero-close, not "nothing to release"). ``None`` (the supersede
     path) skips the check — unchanged.
+
+    ``effect_guard`` is a caller-owned, value-free admission re-check immediately before the
+    close/completion edge. False, an exception, or an unreadable authority leaves the release
+    open with zero close and zero outcome write.
 
     Only a lane that has already left ``active`` is released here — a lane still holding
     its work is never a release target (the caller's disposition CAS must land first).
@@ -837,6 +869,17 @@ def drive_process_release(
             process_release=rec.process_release,
             detail="release pins inconsistent with lane unit; fail closed (no slots closed)",
         )
+    try:
+        effect_admitted = effect_guard is None or bool(effect_guard())
+    except Exception:  # noqa: BLE001 - caller authority unreadable -> zero effect
+        effect_admitted = False
+    if not effect_admitted:
+        return ReleaseOutcome(
+            action_id=action_id,
+            process_release=rec.process_release,
+            effect_admission_blocked=True,
+            detail="release effect admission refused; zero-close",
+        )
     close = (
         ops.execute_close(plan)
         if plan.close_targets
@@ -900,6 +943,7 @@ def drive_process_release(
 
 
 __all__ = (
+    "ReadableInventoryReleaseOps",
     "ReleaseOutcome",
     "SublaneReleaseOps",
     "declared_generation_attested",

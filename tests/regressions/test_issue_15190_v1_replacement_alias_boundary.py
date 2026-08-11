@@ -154,6 +154,16 @@ class V1ReplacementAliasBoundaryTest(unittest.TestCase):
         ), mock.patch(
             session + "require_herdr_cli_capabilities", return_value=None
         ), mock.patch(
+            session + "_list_rows", return_value=[]
+        ), mock.patch(
+            session + "preflight_launch_providers",
+            return_value={
+                provider: mock.MagicMock(provider_id=provider)
+                for provider in ("codex", "claude")
+            },
+        ), mock.patch(
+            session + "preflight_managed_launch", return_value=None
+        ), mock.patch(
             session + "register_workspace", side_effect=_capture_root
         ):
             try:

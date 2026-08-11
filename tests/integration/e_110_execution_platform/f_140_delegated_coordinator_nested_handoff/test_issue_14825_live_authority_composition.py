@@ -658,7 +658,9 @@ class LiveManagedProcessReleaseTest(unittest.TestCase):
         self.assertEqual(record.lane_disposition, DISPOSITION_HIBERNATED)
         self.assertEqual(record.process_release, RELEASE_RELEASED)
         self.assertEqual(record.decision.journal_id, "96790")
-        self.assertEqual(len(inventory.closed), 1)
+        # A complete-empty inventory is positive absence, so release completes
+        # without dispatching an empty close plan to the provider.
+        self.assertEqual(inventory.closed, [])
 
     def test_a_generation_that_is_not_the_rows_resolves_to_no_row_at_all(self) -> None:
         # The staleness mechanism, stated as the test that proves it: a lifecycle row carries the

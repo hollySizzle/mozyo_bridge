@@ -330,6 +330,7 @@ class _StatefulHerdr:
                 "name": logical_name,
                 "native_name": native_name,
                 "pane_id": pane_id,
+                "terminal_id": f"terminal-{pane_id}",
             }
             if tab_id:
                 row["tab_id"] = tab_id
@@ -342,6 +343,7 @@ class _StatefulHerdr:
                         role=launch_env.get("MOZYO_AGENT_ROLE", ""),
                         lane_id=launch_env.get("MOZYO_LANE_ID", ""),
                         locator=pane_id,
+                        terminal_id=f"terminal-{pane_id}",
                         verdict=VERDICT_PRESENT,
                         observed_at="2026-07-18T00:00:00+00:00",
                     ),
@@ -353,6 +355,7 @@ class _StatefulHerdr:
                 action_id = launch_env.get("MOZYO_STARTUP_ACTION_ID", "")
                 if action_id:
                     from mozyo_bridge.core.state.startup_execution_events import (
+                        STAGE_ATTESTATION_WRITE_SUCCEEDED,
                         STAGE_PROVIDER_EXEC_CALL_REACHED,
                         STAGE_WRAPPER_ENTERED,
                         append_execution_event,
@@ -364,6 +367,7 @@ class _StatefulHerdr:
                     events_fence = StartupTransactionFence(home=Path(self.attest_home))
                     for stage in (
                         STAGE_WRAPPER_ENTERED,
+                        STAGE_ATTESTATION_WRITE_SUCCEEDED,
                         STAGE_PROVIDER_EXEC_CALL_REACHED,
                     ):
                         append_execution_event(

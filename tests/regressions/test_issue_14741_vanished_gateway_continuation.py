@@ -523,6 +523,7 @@ JOIN_LANE = "issue_14741"
 JOIN_PROVIDER = "codex"
 JOIN_OLD = "w4B:p61"
 JOIN_FRESH = "w4B:p81"
+JOIN_TERMINAL = "terminal:w4B:p81"
 
 
 def _join_pointer(**changes) -> ContinuationPointer:
@@ -593,6 +594,7 @@ def _live_row(**changes) -> dict:
         "agent": JOIN_PROVIDER,
         "status": "idle",
         "revision": 0,
+        "terminal_id": JOIN_TERMINAL,
     }
     row.update(changes)
     return row
@@ -610,6 +612,7 @@ def _inventory_join(preparation=None, **changes) -> VanishedGatewayInventoryJoin
         assigned_name=pin.assigned_name,
         fresh_locator=JOIN_FRESH,
         old_locator=pin.old_locator,
+        terminal_id=JOIN_TERMINAL,
     )
     values.update(changes)
     return VanishedGatewayInventoryJoin(**values)
@@ -681,6 +684,7 @@ class FreshInventoryJoinTest(unittest.TestCase):
             {
                 "outcome", "stopped", "detail", "action_id", "workspace_id",
                 "lane_id", "provider", "assigned_name", "fresh_locator", "old_locator",
+                "terminal_id",
             },
         )
         for claim in ("attest", "sent", "confirm", "complete", "ledger"):
@@ -899,6 +903,7 @@ class AttestationBindingTest(unittest.TestCase):
             role=JOIN_PROVIDER,
             lane_id=JOIN_LANE,
             locator=JOIN_FRESH,
+            terminal_id=JOIN_TERMINAL,
             verdict=VERDICT_PRESENT,
             observed_at="2026-08-03T00:00:00+00:00",
             replacement_action_id=self.inventory.action_id,
@@ -1038,6 +1043,7 @@ class AttestationBindingTest(unittest.TestCase):
             {
                 "action_id": self.inventory.action_id,
                 "live_locator": JOIN_FRESH,
+                "live_terminal_id": JOIN_TERMINAL,
                 "workspace_id": JOIN_WORKSPACE,
                 "role": JOIN_PROVIDER,
                 "lane": JOIN_LANE,
