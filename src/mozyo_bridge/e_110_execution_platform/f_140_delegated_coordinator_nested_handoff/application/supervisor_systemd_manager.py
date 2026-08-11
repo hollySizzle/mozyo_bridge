@@ -172,7 +172,7 @@ class SystemdManagerInspector:
         expected_argv: Sequence[str],
         interval_seconds: int,
     ) -> ManagerDefinitionAttestation:
-        """Compare the manager-loaded command/home/path/timer contract to exact expectations."""
+        """Compare the manager-loaded command, home, path, and timer contract."""
         try:
             service_object = self._unit_object(service_unit)
             timer_object = self._unit_object(timer_unit)
