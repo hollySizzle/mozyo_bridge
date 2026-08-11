@@ -41,6 +41,7 @@ import argparse
 import contextlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1206,6 +1207,10 @@ class TheDecisionStoreIsTheWriterHalf(unittest.TestCase):
         # released from the same barrier; the home-relative exclusive lock must preserve both
         # updates instead of allowing the later rename to discard the other route.
         home = self._home()
+        # Bootstrap is deliberately a single-writer claim: the nonce becomes visible before the
+        # lock so an in-flight first writer cannot be mistaken for initialized lock loss. Exercise
+        # concurrent RMW after that one-time generation exists.
+        _record_decision(home, head=HEAD)
         store = AuditFailureTerminalDecisionStore(home=home)
         repo_root = _attested_repo(home.parent)
         start = threading.Barrier(3)
@@ -1239,6 +1244,1269 @@ class TheDecisionStoreIsTheWriterHalf(unittest.TestCase):
                 self.assertIsNotNone(decision)
                 self.assertEqual(decision.issue, issue)
 
+    def test_the_document_is_durably_bound_to_the_lock_token_and_inode(self):
+        home = self._home()
+        _record_decision(home, head=HEAD)
+        store = AuditFailureTerminalDecisionStore(home=home)
+        document = json.loads(store.path.read_text(encoding="utf-8"))
+        lock = store.lock_path.stat()
+        self.assertEqual(
+            document["lock_generation"],
+            {
+                "device": lock.st_dev,
+                "inode": lock.st_ino,
+                "ctime_ns": lock.st_ctime_ns,
+                "token": store.lock_path.read_text(encoding="ascii").strip(),
+            },
+        )
+
+    def test_an_initialized_store_never_recreates_a_missing_lock(self):
+        # Review j#103084 finding r8f1: O_CREAT on every writer silently minted a second flock
+        # generation. Once either durable artifact exists, lock loss is store loss and is zero-write.
+        home = self._home()
+        _record_decision(home, head=HEAD)
+        store = AuditFailureTerminalDecisionStore(home=home)
+        before = (store.path.read_bytes(), store.sidecar_path.read_bytes())
+        store.lock_path.unlink()
+
+        with self.assertRaises(AuditFailureTerminalDecisionError):
+            _record_decision(home, head="b" * 40, lane_id=f"{LANE}_missing_lock")
+
+        self.assertFalse(os.path.lexists(store.lock_path))
+        self.assertEqual(
+            (store.path.read_bytes(), store.sidecar_path.read_bytes()), before
+        )
+
+    def test_ex_snapshot_rejects_old_and_new_lock_writers_without_losing_a_decision(self):
+        # The exact r8f1 interleaving. Writer A has loaded under the old EX-locked inode. The visible
+        # lock is then unlinked/recreated with the SAME token, and writer B acquires the new inode.
+        # Neither writer may report success and the pre-existing decision must remain byte-exact.
+        home = self._home()
+        _record_decision(home, head=HEAD)
+        store = AuditFailureTerminalDecisionStore(home=home)
+        repo_root = _attested_repo(home.parent)
+        before = (store.path.read_bytes(), store.sidecar_path.read_bytes())
+        old_loaded = threading.Event()
+        release_old = threading.Event()
+        new_done = threading.Event()
+        paused = []
+        successes = []
+        errors = []
+        real_load = AuditFailureTerminalDecisionStore._load
+
+        def pause_old_after_snapshot(instance, scope):
+            snapshot = real_load(instance, scope)
+            if threading.current_thread().name == "old-lock-writer" and not paused:
+                paused.append(True)
+                old_loaded.set()
+                if not release_old.wait(timeout=5):
+                    raise AssertionError("old writer was not released")
+            return snapshot
+
+        def write(label, lane_id, issue, done=None):
+            try:
+                decision = store.record(
+                    TerminalDecision(
+                        **_decision_fields(head=HEAD, lane_id=lane_id, issue=issue)
+                    ),
+                    repo_root=repo_root,
+                )
+            except BaseException as exc:
+                errors.append((label, exc))
+            else:
+                successes.append((label, decision))
+            finally:
+                if done is not None:
+                    done.set()
+
+        with _attested_coordinator_env(), mock.patch.object(
+            AuditFailureTerminalDecisionStore,
+            "_load",
+            new=pause_old_after_snapshot,
+        ):
+            old = threading.Thread(
+                name="old-lock-writer",
+                target=write,
+                args=("old", f"{LANE}_old", "151661"),
+            )
+            old.start()
+            self.assertTrue(old_loaded.wait(timeout=5), "old writer did not reach snapshot")
+            copied_token = store.lock_path.read_bytes()
+            store.lock_path.unlink()
+            store.lock_path.write_bytes(copied_token)
+            store.lock_path.chmod(0o600)
+            new = threading.Thread(
+                name="new-lock-writer",
+                target=write,
+                args=("new", f"{LANE}_new", "151662", new_done),
+            )
+            new.start()
+            try:
+                self.assertTrue(
+                    new_done.wait(timeout=5),
+                    "new inode writer blocked on the detached old inode",
+                )
+            finally:
+                release_old.set()
+            old.join(timeout=5)
+            new.join(timeout=5)
+
+        self.assertFalse(old.is_alive() or new.is_alive(), "writer deadlocked")
+        self.assertEqual(successes, [])
+        self.assertEqual({label for label, _exc in errors}, {"old", "new"})
+        self.assertTrue(
+            all(isinstance(exc, AuditFailureTerminalDecisionError) for _label, exc in errors)
+        )
+        self.assertEqual(
+            (store.path.read_bytes(), store.sidecar_path.read_bytes()), before
+        )
+
+    def test_shared_reader_refuses_if_the_visible_lock_generation_drifts(self):
+        # A SH lock on an unlinked inode is not a snapshot fence. The context-exit recheck cancels
+        # the already-constructed return when its visible generation changed during the read.
+        home = self._home()
+        _record_decision(home, head=HEAD)
+        store = AuditFailureTerminalDecisionStore(home=home)
+        before = (store.path.read_bytes(), store.sidecar_path.read_bytes())
+        snapshot_read = threading.Event()
+        release_reader = threading.Event()
+        paused = []
+        results = []
+        errors = []
+        real_load = AuditFailureTerminalDecisionStore._load
+
+        def pause_after_snapshot(instance, scope):
+            snapshot = real_load(instance, scope)
+            if threading.current_thread().name == "drifting-reader" and not paused:
+                paused.append(True)
+                snapshot_read.set()
+                if not release_reader.wait(timeout=5):
+                    raise AssertionError("reader was not released")
+            return snapshot
+
+        def read():
+            try:
+                results.append(store.read(DecisionRoute(WORKSPACE, LANE)))
+            except BaseException as exc:
+                errors.append(exc)
+
+        with mock.patch.object(
+            AuditFailureTerminalDecisionStore,
+            "_load",
+            new=pause_after_snapshot,
+        ):
+            reader = threading.Thread(name="drifting-reader", target=read)
+            reader.start()
+            self.assertTrue(snapshot_read.wait(timeout=5), "reader did not take its snapshot")
+            copied_token = store.lock_path.read_bytes()
+            store.lock_path.unlink()
+            store.lock_path.write_bytes(copied_token)
+            store.lock_path.chmod(0o600)
+            release_reader.set()
+            reader.join(timeout=5)
+
+        self.assertFalse(reader.is_alive(), "reader deadlocked")
+        self.assertEqual(results, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], AuditFailureTerminalDecisionError)
+        self.assertEqual(
+            (store.path.read_bytes(), store.sidecar_path.read_bytes()), before
+        )
+
+    def test_post_publication_lock_drift_rolls_json_back_before_refusing(self):
+        # Detecting drift after rename is not enough: a false-success writer can otherwise erase a
+        # decision even though it raises. Arm rollback at rename and restore exact prior bytes.
+        from mozyo_bridge.core.state import audit_failure_terminal_decision as store_module
+
+        home = self._home()
+        _record_decision(home, head=HEAD)
+        store = AuditFailureTerminalDecisionStore(home=home)
+        before = (store.path.read_bytes(), store.sidecar_path.read_bytes())
+        real_rename = store_module.os.rename
+        swapped = []
+
+        def rename_then_replace_lock(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+            result = real_rename(
+                src,
+                dst,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+            )
+            if dst == store.path.name and not swapped:
+                copied_token = store.lock_path.read_bytes()
+                store.lock_path.unlink()
+                store.lock_path.write_bytes(copied_token)
+                store.lock_path.chmod(0o600)
+                swapped.append(True)
+            return result
+
+        with mock.patch.object(
+            store_module.os, "rename", side_effect=rename_then_replace_lock
+        ):
+            with self.assertRaises(AuditFailureTerminalDecisionError):
+                _record_decision(home, head="b" * 40)
+
+        self.assertEqual(swapped, [True])
+        self.assertEqual(
+            (store.path.read_bytes(), store.sidecar_path.read_bytes()), before
+        )
+
+    def test_real_rename_then_exception_is_rolled_back_for_existing_and_fresh_store(self):
+        # os.rename returning is not the publication boundary: a wrapper/signal can raise after the
+        # kernel already moved the inode.  The rollback intent must therefore exist before rename.
+        from mozyo_bridge.core.state import audit_failure_terminal_decision_lock as lock_module
+
+        for initialized in (True, False):
+            with self.subTest(initialized=initialized):
+                home = self._home()
+                store = AuditFailureTerminalDecisionStore(home=home)
+                if initialized:
+                    _record_decision(home, head=HEAD)
+                    before = (
+                        store.path.read_bytes(),
+                        store.sidecar_path.read_bytes(),
+                        store.lock_path.read_bytes(),
+                    )
+                real_rename = lock_module.os.rename
+                injected = []
+
+                def real_rename_then_raise(
+                    src, dst, *, src_dir_fd=None, dst_dir_fd=None
+                ):
+                    result = real_rename(
+                        src,
+                        dst,
+                        src_dir_fd=src_dir_fd,
+                        dst_dir_fd=dst_dir_fd,
+                    )
+                    if dst == store.path.name and not injected:
+                        injected.append(True)
+                        raise RuntimeError("injected after real rename")
+                    return result
+
+                with mock.patch.object(
+                    lock_module.os, "rename", side_effect=real_rename_then_raise
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "after real rename"):
+                        _record_decision(home, head="b" * 40)
+
+                self.assertEqual(injected, [True])
+                if initialized:
+                    self.assertEqual(
+                        (
+                            store.path.read_bytes(),
+                            store.sidecar_path.read_bytes(),
+                            store.lock_path.read_bytes(),
+                        ),
+                        before,
+                    )
+                else:
+                    self.assertFalse(os.path.lexists(store.path))
+                    self.assertFalse(os.path.lexists(store.sidecar_path))
+                    self.assertFalse(os.path.lexists(store.lock_path))
+
+    def test_same_content_bootstrap_nonce_inode_aba_refuses_and_cleans_own_artifacts(self):
+        # The nonce bytes alone are not an identity. Replace the just-created nonce after JSON
+        # publication with the same bytes on another inode: JSON and this writer's lock are rolled
+        # back, while the foreign replacement is neither accepted nor deleted.
+        from mozyo_bridge.core.state import audit_failure_terminal_decision_lock as lock_module
+
+        home = self._home()
+        store = AuditFailureTerminalDecisionStore(home=home)
+        real_rename = lock_module.os.rename
+        replacement = []
+
+        def publish_then_replace_nonce(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+            result = real_rename(
+                src,
+                dst,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+            )
+            if dst == store.path.name and not replacement:
+                original = store.sidecar_path.stat()
+                content = store.sidecar_path.read_bytes()
+                replacement_path = store.sidecar_path.with_name("replacement-nonce")
+                replacement_path.write_bytes(content)
+                replacement_path.chmod(0o600)
+                os.replace(replacement_path, store.sidecar_path)
+                replacement_info = store.sidecar_path.stat()
+                self.assertNotEqual(
+                    (original.st_dev, original.st_ino),
+                    (replacement_info.st_dev, replacement_info.st_ino),
+                )
+                replacement.append((content, replacement_info.st_dev, replacement_info.st_ino))
+            return result
+
+        with mock.patch.object(
+            lock_module.os, "rename", side_effect=publish_then_replace_nonce
+        ):
+            with self.assertRaises(AuditFailureTerminalDecisionError):
+                _record_decision(home, head=HEAD)
+
+        self.assertEqual(len(replacement), 1)
+        replacement_info = store.sidecar_path.stat()
+        self.assertEqual(store.sidecar_path.read_bytes(), replacement[0][0])
+        self.assertEqual(
+            (replacement_info.st_dev, replacement_info.st_ino), replacement[0][1:]
+        )
+        self.assertFalse(os.path.lexists(store.path))
+        self.assertFalse(os.path.lexists(store.lock_path))
+
+    def test_same_content_initialized_nonce_replacement_is_not_a_store_identity(self):
+        home = self._home()
+        _record_decision(home, head=HEAD)
+        store = AuditFailureTerminalDecisionStore(home=home)
+        document_before = store.path.read_bytes()
+        original = store.sidecar_path.stat()
+        content = store.sidecar_path.read_bytes()
+        replacement_path = store.sidecar_path.with_name("replacement-nonce")
+        replacement_path.write_bytes(content)
+        replacement_path.chmod(0o600)
+        os.replace(replacement_path, store.sidecar_path)
+        replacement = store.sidecar_path.stat()
+        self.assertNotEqual(
+            (original.st_dev, original.st_ino),
+            (replacement.st_dev, replacement.st_ino),
+        )
+
+        with self.assertRaisesRegex(
+            AuditFailureTerminalDecisionError, "nonce inode generation"
+        ):
+            store.read(DecisionRoute(WORKSPACE, LANE))
+        with self.assertRaisesRegex(
+            AuditFailureTerminalDecisionError, "nonce inode generation"
+        ):
+            _record_decision(home, head="b" * 40)
+
+        self.assertEqual(store.path.read_bytes(), document_before)
+        self.assertEqual(store.sidecar_path.read_bytes(), content)
+
+    def test_prepublish_foreign_json_replacement_is_not_overwritten(self):
+        from mozyo_bridge.core.state import audit_failure_terminal_decision_lock as lock_module
+
+        cases = (
+            ("after_snapshot", False),
+            ("after_snapshot", True),
+            ("after_retention", False),
+        )
+        for swap_at, poison_fails in cases:
+            with self.subTest(swap_at=swap_at, poison_fails=poison_fails):
+                home = self._home()
+                _record_decision(home, head=HEAD)
+                store = AuditFailureTerminalDecisionStore(home=home)
+                before = store.path.read_bytes()
+                sidecar_before = store.sidecar_path.read_bytes()
+                lock_before = store.lock_path.read_bytes()
+                foreign_document = json.loads(before.decode("utf-8"))
+                foreign_document["decisions"][f"{WORKSPACE}\u0000{LANE}"]["head"] = "d" * 40
+                foreign = json.dumps(
+                    foreign_document, ensure_ascii=False, sort_keys=True, indent=2
+                ).encode("utf-8")
+                swapped = []
+
+                def replace():
+                    replacement = store.path.with_name("foreign-json")
+                    replacement.write_bytes(foreign)
+                    os.replace(replacement, store.path)
+                    swapped.append(True)
+
+                if swap_at == "after_snapshot":
+                    real_publish = lock_module.DecisionStoreFileCoordinator.publish_file
+
+                    def replace_then_publish(instance, scope, name, text, **kwargs):
+                        replace()
+                        return real_publish(instance, scope, name, text, **kwargs)
+
+                    patcher = mock.patch.object(
+                        lock_module.DecisionStoreFileCoordinator,
+                        "publish_file",
+                        new=replace_then_publish,
+                    )
+                else:
+                    real_arm = lock_module.DecisionStoreFileCoordinator._arm_rollback_backup
+
+                    def arm_then_replace(instance, scope, publication):
+                        result = real_arm(instance, scope, publication)
+                        replace()
+                        return result
+
+                    patcher = mock.patch.object(
+                        lock_module.DecisionStoreFileCoordinator,
+                        "_arm_rollback_backup",
+                        new=arm_then_replace,
+                    )
+                poison_patcher = (
+                    mock.patch.object(
+                        lock_module.DecisionStoreFileCoordinator,
+                        "_poison_visible_lock_generation",
+                        side_effect=RuntimeError("injected total poison failure"),
+                    )
+                    if poison_fails
+                    else contextlib.nullcontext()
+                )
+                with patcher, poison_patcher:
+                    with self.assertRaises(AuditFailureTerminalDecisionError):
+                        _record_decision(home, head="b" * 40)
+
+                self.assertEqual(swapped, [True])
+                self.assertEqual(store.path.read_bytes(), foreign)
+                self.assertEqual(store.sidecar_path.read_bytes(), sidecar_before)
+                retained = list(home.glob(f"{store.path.name}.rollback.*"))
+                if swap_at == "after_retention":
+                    self.assertEqual(len(retained), 1)
+                    self.assertEqual(retained[0].read_bytes(), before)
+                else:
+                    self.assertEqual(retained, [])
+                operation_markers = list(home.glob(f"{store.path.name}.intent.tmp.*"))
+                self.assertEqual(len(operation_markers), 1)
+                if poison_fails:
+                    self.assertEqual(store.lock_path.read_bytes(), lock_before)
+                with self.assertRaises(AuditFailureTerminalDecisionError):
+                    store.read(DecisionRoute(WORKSPACE, LANE))
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork crash boundary")
+    def test_process_stop_immediately_after_snapshot_leaves_a_durable_intent(self):
+        home = self._home()
+        _record_decision(home, head=HEAD)
+        store = AuditFailureTerminalDecisionStore(home=home)
+        repo_root = _attested_repo(home.parent)
+        lock_before = store.lock_path.read_bytes()
+        pid = os.fork()
+        if pid == 0:
+            try:
+                real_load = store._load
+
+                def snapshot_then_replace_and_stop(scope):
+                    snapshot = real_load(scope)
+                    payload = json.loads(snapshot.document_text)
+                    payload["decisions"][f"{WORKSPACE}\u0000{LANE}"]["head"] = "d" * 40
+                    replacement = home / "post-snapshot-foreign"
+                    with replacement.open("w", encoding="utf-8") as handle:
+                        json.dump(payload, handle, ensure_ascii=False, sort_keys=True, indent=2)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(replacement, store.path)
+                    os.fsync(scope.dir_fd)
+                    os._exit(77)
+
+                store._load = snapshot_then_replace_and_stop
+                with _attested_coordinator_env():
+                    store.record(
+                        TerminalDecision(**_decision_fields(head="b" * 40)),
+                        repo_root=repo_root,
+                    )
+            except BaseException:
+                os._exit(78)
+            os._exit(79)
+
+        _, status = os.waitpid(pid, 0)
+        self.assertTrue(os.WIFEXITED(status))
+        self.assertEqual(os.WEXITSTATUS(status), 77)
+        self.assertEqual(store.lock_path.read_bytes(), lock_before)
+        self.assertEqual(
+            json.loads(store.path.read_text(encoding="utf-8"))["decisions"]
+            [f"{WORKSPACE}\u0000{LANE}"]["head"],
+            "d" * 40,
+        )
+        self.assertEqual(len(list(home.glob(f"{store.path.name}.intent.tmp.*"))), 1)
+        self.assertEqual(list(home.glob(f"{store.path.name}.rollback.*")), [])
+        with self.assertRaises(AuditFailureTerminalDecisionError):
+            store.read(DecisionRoute(WORKSPACE, LANE))
+
+    def test_same_inode_json_mutation_after_snapshot_is_not_adopted(self):
+        from mozyo_bridge.core.state import audit_failure_terminal_decision_lock as lock_module
+
+        home = self._home()
+        _record_decision(home, head=HEAD)
+        _record_decision(home, head="c" * 40, lane_id="other-lane")
+        store = AuditFailureTerminalDecisionStore(home=home)
+        original_identity = store.path.stat()
+        real_publish = lock_module.DecisionStoreFileCoordinator.publish_file
+        foreign = []
+
+        def mutate_then_publish(instance, scope, name, text, **kwargs):
+            payload = json.loads(store.path.read_text(encoding="utf-8"))
+            del payload["decisions"][f"{WORKSPACE}\u0000other-lane"]
+            store.path.write_text(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2),
+                encoding="utf-8",
+            )
+            foreign.append(store.path.read_bytes())
+            return real_publish(instance, scope, name, text, **kwargs)
+
+        with mock.patch.object(
+            lock_module.DecisionStoreFileCoordinator,
+            "publish_file",
+            new=mutate_then_publish,
+        ):
+            with self.assertRaises(AuditFailureTerminalDecisionError):
+                _record_decision(home, head="b" * 40)
+
+        current_identity = store.path.stat()
+        self.assertEqual(
+            (current_identity.st_dev, current_identity.st_ino),
+            (original_identity.st_dev, original_identity.st_ino),
+        )
+        self.assertEqual(store.path.read_bytes(), foreign[0])
+        self.assertEqual(len(list(home.glob(f"{store.path.name}.intent.tmp.*"))), 1)
+        with self.assertRaises(AuditFailureTerminalDecisionError):
+            store.read(DecisionRoute(WORKSPACE, "other-lane"))
+
+    def test_staged_path_inode_aba_cannot_erase_an_existing_route(self):
+        from mozyo_bridge.core.state import audit_failure_terminal_decision_lock as lock_module
+
+        for raise_after_rename in (False, True):
+            with self.subTest(raise_after_rename=raise_after_rename):
+                home = self._home()
+                _record_decision(home, head=HEAD)
+                _record_decision(home, head="c" * 40, lane_id="other-lane")
+                store = AuditFailureTerminalDecisionStore(home=home)
+                before = store.path.read_bytes()
+                other_route = DecisionRoute(WORKSPACE, "other-lane")
+                other_before = store.read(other_route)
+                real_rename = lock_module.os.rename
+                replaced = []
+
+                def replace_stage_then_rename(
+                    src, dst, *, src_dir_fd=None, dst_dir_fd=None
+                ):
+                    if dst == store.path.name and not replaced:
+                        stage_path = home / src
+                        payload = json.loads(stage_path.read_text(encoding="utf-8"))
+                        del payload["decisions"][f"{WORKSPACE}\u0000other-lane"]
+                        replacement = home / "replacement-stage"
+                        replacement.write_text(
+                            json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2),
+                            encoding="utf-8",
+                        )
+                        os.replace(replacement, stage_path)
+                        replaced.append(True)
+                    result = real_rename(
+                        src,
+                        dst,
+                        src_dir_fd=src_dir_fd,
+                        dst_dir_fd=dst_dir_fd,
+                    )
+                    if raise_after_rename and replaced == [True]:
+                        replaced.append("raised")
+                        raise RuntimeError("injected after substituted stage rename")
+                    return result
+
+                with mock.patch.object(
+                    lock_module.os, "rename", side_effect=replace_stage_then_rename
+                ):
+                    with self.assertRaises((AuditFailureTerminalDecisionError, RuntimeError)):
+                        _record_decision(home, head="b" * 40)
+
+                self.assertTrue(replaced)
+                self.assertNotEqual(store.path.read_bytes(), before)
+                retained = list(home.glob(f"{store.path.name}.rollback.*"))
+                self.assertEqual(len(retained), 1)
+                self.assertEqual(retained[0].read_bytes(), before)
+                with self.assertRaises(AuditFailureTerminalDecisionError):
+                    store.read(other_route)
+                self.assertIsNotNone(other_before)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork crash boundary")
+    def test_fresh_stage_aba_crash_before_identity_check_leaves_a_durable_refusal(self):
+        from mozyo_bridge.core.state import audit_failure_terminal_decision_lock as lock_module
+
+        home = self._home()
+        store = AuditFailureTerminalDecisionStore(home=home)
+        pid = os.fork()
+        if pid == 0:
+            try:
+                real_rename = lock_module.os.rename
+
+                def replace_stage_publish_then_stop(
+                    src, dst, *, src_dir_fd=None, dst_dir_fd=None
+                ):
+                    if dst == store.path.name:
+                        stage = home / src
+                        payload = json.loads(stage.read_text(encoding="utf-8"))
+                        payload["decisions"][f"{WORKSPACE}\u0000{LANE}"]["head"] = "d" * 40
+                        replacement = home / "fresh-foreign-stage"
+                        replacement.write_text(
+                            json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2),
+                            encoding="utf-8",
+                        )
+                        os.replace(replacement, stage)
+                    result = real_rename(
+                        src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd
+                    )
+                    if dst == store.path.name:
+                        os._exit(77)
+                    return result
+
+                lock_module.os.rename = replace_stage_publish_then_stop
+                _record_decision(home, head=HEAD)
+            except BaseException:
+                os._exit(78)
+            os._exit(79)
+
+        _, status = os.waitpid(pid, 0)
+        self.assertTrue(os.WIFEXITED(status))
+        self.assertEqual(os.WEXITSTATUS(status), 77)
+        self.assertTrue(store.path.exists())
+        self.assertEqual(
+            json.loads(store.path.read_text(encoding="utf-8"))["decisions"]
+            [f"{WORKSPACE}\u0000{LANE}"]["head"],
+            "d" * 40,
+        )
+        self.assertEqual(len(list(home.glob(f"{store.path.name}.intent.tmp.*"))), 1)
+        with self.assertRaises(AuditFailureTerminalDecisionError):
+            store.read(DecisionRoute(WORKSPACE, LANE))
+
+    def test_unencodable_document_cleans_its_private_stage_without_losing_the_store(self):
+        home = self._home()
+        _record_decision(home, head=HEAD)
+        store = AuditFailureTerminalDecisionStore(home=home)
+        before = store.path.read_bytes()
+        repo_root = _attested_repo(home.parent)
+        with _attested_coordinator_env():
+            with self.assertRaises(AuditFailureTerminalDecisionError):
+                store.record(
+                    TerminalDecision(**_decision_fields(head="b" * 40)),
+                    repo_root=repo_root,
+                    now="\ud800",
+                )
+
+        self.assertEqual(store.path.read_bytes(), before)
+        self.assertEqual(list(home.glob(f"{store.path.name}.tmp.*")), [])
+        self.assertEqual(list(home.glob(f"{store.path.name}.intent.*")), [])
+        self.assertEqual(store.read(DecisionRoute(WORKSPACE, LANE)).head, HEAD)
+
+    def test_staged_inode_content_mutation_cannot_erase_an_existing_route(self):
+        from mozyo_bridge.core.state import audit_failure_terminal_decision_lock as lock_module
+
+        for mutate_at in ("before_rename", "after_rename"):
+            with self.subTest(mutate_at=mutate_at):
+                home = self._home()
+                _record_decision(home, head=HEAD)
+                _record_decision(home, head="c" * 40, lane_id="other-lane")
+                store = AuditFailureTerminalDecisionStore(home=home)
+                before = store.path.read_bytes()
+                other_route = DecisionRoute(WORKSPACE, "other-lane")
+                other_before = store.read(other_route)
+                real_rename = lock_module.os.rename
+                mutated = []
+
+                def mutate_same_inode(path):
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    del payload["decisions"][f"{WORKSPACE}\u0000other-lane"]
+                    path.write_text(
+                        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2),
+                        encoding="utf-8",
+                    )
+                    mutated.append(mutate_at)
+
+                def mutate_around_rename(
+                    src, dst, *, src_dir_fd=None, dst_dir_fd=None
+                ):
+                    is_publication = (
+                        dst == store.path.name
+                        and str(src).startswith(f"{store.path.name}.tmp.")
+                        and not mutated
+                    )
+                    if is_publication and mutate_at == "before_rename":
+                        mutate_same_inode(home / src)
+                    result = real_rename(
+                        src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd
+                    )
+                    if is_publication and mutate_at == "after_rename":
+                        mutate_same_inode(store.path)
+                    return result
+
+                with mock.patch.object(
+                    lock_module.os, "rename", side_effect=mutate_around_rename
+                ):
+                    with self.assertRaises(AuditFailureTerminalDecisionError):
+                        _record_decision(home, head="b" * 40)
+
+                self.assertEqual(mutated, [mutate_at])
+                self.assertEqual(store.path.read_bytes(), before)
+                self.assertEqual(store.read(other_route), other_before)
+
+    def test_preeffect_or_postpublication_failure_restores_exact_old_json(self):
+        from mozyo_bridge.core.state import audit_failure_terminal_decision_lock as lock_module
+
+        failures = (
+            "stage_write",
+            "retention_fsync",
+            "retention_lock_drift",
+            "rename_preeffect",
+            "postpublication_fsync",
+        )
+        for failure in failures:
+            with self.subTest(failure=failure):
+                home = self._home()
+                _record_decision(home, head=HEAD)
+                _record_decision(home, head="c" * 40, lane_id="other-lane")
+                store = AuditFailureTerminalDecisionStore(home=home)
+                before = store.path.read_bytes()
+                real_write = lock_module.os.write
+                real_fsync = lock_module.os.fsync
+                real_rename = lock_module.os.rename
+                real_require = lock_module.DecisionStoreFileCoordinator.require_lock_generation
+                failed = []
+                directory_fsyncs = []
+
+                def fail_stage_write(fd, data):
+                    if failure == "stage_write" and not failed:
+                        failed.append(True)
+                        raise OSError("injected publication stage write failure")
+                    return real_write(fd, data)
+
+                def fail_postpublication_fsync(fd):
+                    info = os.fstat(fd)
+                    if stat.S_ISDIR(info.st_mode):
+                        directory_fsyncs.append(True)
+                        if (
+                            failure in ("retention_fsync", "postpublication_fsync")
+                            and len(directory_fsyncs)
+                            == (2 if failure == "retention_fsync" else 3)
+                            and not failed
+                        ):
+                            failed.append(True)
+                            raise OSError(f"injected {failure}")
+                    return real_fsync(fd)
+
+                def fail_rename_preeffect(
+                    src, dst, *, src_dir_fd=None, dst_dir_fd=None
+                ):
+                    if (
+                        failure == "rename_preeffect"
+                        and dst == store.path.name
+                        and str(src).startswith(f"{store.path.name}.tmp.")
+                        and not failed
+                    ):
+                        failed.append(True)
+                        raise OSError("injected publication rename pre-effect failure")
+                    return real_rename(
+                        src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd
+                    )
+
+                def fail_lock_after_retention(instance, scope):
+                    if (
+                        failure == "retention_lock_drift"
+                        and list(home.glob(f"{store.path.name}.rollback.*"))
+                        and not failed
+                    ):
+                        failed.append(True)
+                        raise AuditFailureTerminalDecisionError(
+                            "injected lock drift after retention"
+                        )
+                    return real_require(instance, scope)
+
+                with mock.patch.object(
+                    lock_module.os, "write", side_effect=fail_stage_write
+                ), mock.patch.object(
+                    lock_module.os, "fsync", side_effect=fail_postpublication_fsync
+                ), mock.patch.object(
+                    lock_module.os, "rename", side_effect=fail_rename_preeffect
+                ), mock.patch.object(
+                    lock_module.DecisionStoreFileCoordinator,
+                    "require_lock_generation",
+                    new=fail_lock_after_retention,
+                ):
+                    with self.assertRaises(AuditFailureTerminalDecisionError):
+                        _record_decision(home, head="b" * 40)
+
+                self.assertEqual(failed, [True])
+                self.assertEqual(store.path.read_bytes(), before)
+                self.assertEqual(list(home.glob(f"{store.path.name}.tmp.*")), [])
+                self.assertEqual(list(home.glob(f"{store.path.name}.rollback.*")), [])
+                self.assertIsNotNone(store.read(DecisionRoute(WORKSPACE, LANE)))
+
+    def test_rollback_failure_poison_refuses_the_failed_publication(self):
+        from mozyo_bridge.core.state import audit_failure_terminal_decision_lock as lock_module
+
+        for failure in ("rollback_rename_preeffect", "rollback_fsync"):
+            with self.subTest(failure=failure):
+                home = self._home()
+                _record_decision(home, head=HEAD)
+                _record_decision(home, head="c" * 40, lane_id="other-lane")
+                store = AuditFailureTerminalDecisionStore(home=home)
+                before = store.path.read_bytes()
+                real_fsync = lock_module.os.fsync
+                real_rename = lock_module.os.rename
+                directory_fsyncs = []
+                injected = []
+
+                def fail_publication_then_rollback_fsync(fd):
+                    if stat.S_ISDIR(os.fstat(fd).st_mode):
+                        directory_fsyncs.append(True)
+                        if len(directory_fsyncs) == 3:
+                            injected.append("publication_fsync")
+                            raise OSError("injected publication fsync failure")
+                        if failure == "rollback_fsync" and len(directory_fsyncs) == 4:
+                            injected.append("rollback_fsync")
+                            raise OSError("injected rollback fsync failure")
+                    return real_fsync(fd)
+
+                def fail_rollback_rename(
+                    src, dst, *, src_dir_fd=None, dst_dir_fd=None
+                ):
+                    if (
+                        failure == "rollback_rename_preeffect"
+                        and ".rollback." in str(src)
+                        and dst == store.path.name
+                    ):
+                        injected.append("rollback_rename")
+                        raise RuntimeError("injected rollback rename pre-effect failure")
+                    return real_rename(
+                        src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd
+                    )
+
+                with mock.patch.object(
+                    lock_module.os,
+                    "fsync",
+                    side_effect=fail_publication_then_rollback_fsync,
+                ), mock.patch.object(
+                    lock_module.os, "rename", side_effect=fail_rollback_rename
+                ):
+                    with self.assertRaises(AuditFailureTerminalDecisionError):
+                        _record_decision(home, head="b" * 40)
+
+                self.assertIn("publication_fsync", injected)
+                self.assertIn(
+                    "rollback_fsync"
+                    if failure == "rollback_fsync"
+                    else "rollback_rename",
+                    injected,
+                )
+                retained = list(home.glob(f"{store.path.name}.rollback.*"))
+                if retained:
+                    self.assertEqual(retained[0].read_bytes(), before)
+                else:
+                    self.assertEqual(store.path.read_bytes(), before)
+                with self.assertRaises(AuditFailureTerminalDecisionError):
+                    store.read(DecisionRoute(WORKSPACE, LANE))
+
+    def test_mutated_retained_inode_is_not_restored_as_the_old_decision(self):
+        from mozyo_bridge.core.state import audit_failure_terminal_decision_lock as lock_module
+
+        home = self._home()
+        _record_decision(home, head=HEAD)
+        _record_decision(home, head="c" * 40, lane_id="other-lane")
+        store = AuditFailureTerminalDecisionStore(home=home)
+        real_restore = lock_module.DecisionStoreFileCoordinator._restore_published_text
+        real_fsync = lock_module.os.fsync
+        mutated = []
+        directory_fsyncs = []
+
+        def mutate_then_restore(instance, dir_fd, publication):
+            retained = home / publication.rollback_name
+            payload = json.loads(retained.read_text(encoding="utf-8"))
+            del payload["decisions"][f"{WORKSPACE}\u0000other-lane"]
+            retained.write_text(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2),
+                encoding="utf-8",
+            )
+            mutated.append(True)
+            return real_restore(instance, dir_fd, publication)
+
+        def fail_publication_fsync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                directory_fsyncs.append(True)
+                if len(directory_fsyncs) == 3:
+                    raise OSError("injected post-publication failure")
+            return real_fsync(fd)
+
+        with mock.patch.object(
+            lock_module.DecisionStoreFileCoordinator,
+            "_restore_published_text",
+            new=mutate_then_restore,
+        ), mock.patch.object(
+            lock_module.os, "fsync", side_effect=fail_publication_fsync
+        ):
+            with self.assertRaises(AuditFailureTerminalDecisionError):
+                _record_decision(home, head="b" * 40)
+
+        self.assertEqual(mutated, [True])
+        self.assertEqual(len(list(home.glob(f"{store.path.name}.intent.tmp.*"))), 1)
+        with self.assertRaises(AuditFailureTerminalDecisionError):
+            store.read(DecisionRoute(WORKSPACE, LANE))
+
+    def test_foreign_replacement_after_publication_is_preserved_and_poisoned(self):
+        from mozyo_bridge.core.state import audit_failure_terminal_decision_lock as lock_module
+
+        home = self._home()
+        _record_decision(home, head=HEAD)
+        _record_decision(home, head="c" * 40, lane_id="other-lane")
+        store = AuditFailureTerminalDecisionStore(home=home)
+        before = store.path.read_bytes()
+        foreign = b'{"foreign": "after-publication"}'
+        real_rename = lock_module.os.rename
+        replaced = []
+
+        def publish_then_replace(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+            result = real_rename(
+                src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd
+            )
+            if dst == store.path.name and ".tmp." in str(src) and not replaced:
+                replacement = home / "foreign-after-publication"
+                replacement.write_bytes(foreign)
+                os.replace(replacement, store.path)
+                replaced.append(True)
+            return result
+
+        with mock.patch.object(lock_module.os, "rename", side_effect=publish_then_replace):
+            with self.assertRaises(AuditFailureTerminalDecisionError):
+                _record_decision(home, head="b" * 40)
+
+        self.assertEqual(replaced, [True])
+        self.assertEqual(store.path.read_bytes(), foreign)
+        retained = list(home.glob(f"{store.path.name}.rollback.*"))
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].read_bytes(), before)
+        with self.assertRaises(AuditFailureTerminalDecisionError):
+            store.read(DecisionRoute(WORKSPACE, LANE))
+
+    def test_poison_failure_falls_back_to_a_durable_missing_lock_refusal(self):
+        from mozyo_bridge.core.state import audit_failure_terminal_decision_lock as lock_module
+
+        for poison_failure in ("stage", "rename", "fsync", "total"):
+            with self.subTest(poison_failure=poison_failure):
+                home = self._home()
+                _record_decision(home, head=HEAD)
+                store = AuditFailureTerminalDecisionStore(home=home)
+                before = store.path.read_bytes()
+                real_stage = lock_module.DecisionStoreFileCoordinator._stage_file
+                real_poison = (
+                    lock_module.DecisionStoreFileCoordinator._poison_visible_lock_generation
+                )
+                real_rename = lock_module.os.rename
+                real_fsync = lock_module.os.fsync
+                directory_fsyncs = []
+                injected = []
+
+                def fail_poison_stage(instance, dir_fd, name, text):
+                    if poison_failure == "stage" and name.endswith(".lock.poison"):
+                        injected.append("poison_stage")
+                        raise OSError("injected poison stage failure")
+                    return real_stage(instance, dir_fd, name, text)
+
+                def fail_total_poison(instance, dir_fd, lock_fd):
+                    if poison_failure == "total":
+                        injected.append("poison_total")
+                        raise RuntimeError("injected total poison failure")
+                    return real_poison(instance, dir_fd, lock_fd)
+
+                def fail_rollback_or_poison_rename(
+                    src, dst, *, src_dir_fd=None, dst_dir_fd=None
+                ):
+                    if ".rollback." in str(src) and dst == store.path.name:
+                        injected.append("rollback_rename")
+                        raise RuntimeError("injected rollback rename failure")
+                    if (
+                        poison_failure == "rename"
+                        and dst == store.lock_path.name
+                        and ".poison.tmp." in str(src)
+                    ):
+                        injected.append("poison_rename")
+                        raise RuntimeError("injected poison rename failure")
+                    return real_rename(
+                        src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd
+                    )
+
+                def fail_publication_or_poison_fsync(fd):
+                    if stat.S_ISDIR(os.fstat(fd).st_mode):
+                        directory_fsyncs.append(True)
+                        if len(directory_fsyncs) == 3:
+                            injected.append("publication_fsync")
+                            raise OSError("injected publication fsync failure")
+                        if poison_failure == "fsync" and len(directory_fsyncs) == 4:
+                            injected.append("poison_fsync")
+                            raise OSError("injected poison fsync failure")
+                    return real_fsync(fd)
+
+                with mock.patch.object(
+                    lock_module.DecisionStoreFileCoordinator,
+                    "_stage_file",
+                    new=fail_poison_stage,
+                ), mock.patch.object(
+                    lock_module.DecisionStoreFileCoordinator,
+                    "_poison_visible_lock_generation",
+                    new=fail_total_poison,
+                ), mock.patch.object(
+                    lock_module.os,
+                    "rename",
+                    side_effect=fail_rollback_or_poison_rename,
+                ), mock.patch.object(
+                    lock_module.os,
+                    "fsync",
+                    side_effect=fail_publication_or_poison_fsync,
+                ):
+                    with self.assertRaises(AuditFailureTerminalDecisionError):
+                        _record_decision(home, head="b" * 40)
+
+                self.assertIn("publication_fsync", injected)
+                self.assertIn("rollback_rename", injected)
+                self.assertIn(f"poison_{poison_failure}", injected)
+                self.assertEqual(
+                    os.path.lexists(store.lock_path), poison_failure == "total"
+                )
+                retained = list(home.glob(f"{store.path.name}.rollback.*"))
+                self.assertEqual(len(retained), 1)
+                self.assertEqual(retained[0].read_bytes(), before)
+                with self.assertRaises(AuditFailureTerminalDecisionError):
+                    store.read(DecisionRoute(WORKSPACE, LANE))
+
+    def test_rollback_marker_unlink_is_the_irreversible_commit_point(self):
+        from mozyo_bridge.core.state import audit_failure_terminal_decision_lock as lock_module
+
+        for failure in ("unlink_preeffect", "unlink_after_effect", "cleanup_fsync"):
+            with self.subTest(failure=failure):
+                home = self._home()
+                _record_decision(home, head=HEAD)
+                _record_decision(home, head="c" * 40, lane_id="other-lane")
+                store = AuditFailureTerminalDecisionStore(home=home)
+                before = store.path.read_bytes()
+                real_unlink = lock_module.os.unlink
+                real_fsync = lock_module.os.fsync
+                directory_fsyncs = []
+                injected = []
+
+                def fail_cleanup_unlink(path, *, dir_fd=None):
+                    is_marker = ".rollback." in str(path) and not injected
+                    if is_marker and failure == "unlink_preeffect":
+                        injected.append(failure)
+                        raise OSError("injected marker unlink pre-effect failure")
+                    result = real_unlink(path, dir_fd=dir_fd)
+                    if is_marker and failure == "unlink_after_effect":
+                        injected.append(failure)
+                        raise RuntimeError("injected marker unlink after-effect failure")
+                    return result
+
+                def fail_cleanup_fsync(fd):
+                    if stat.S_ISDIR(os.fstat(fd).st_mode):
+                        directory_fsyncs.append(True)
+                        if failure == "cleanup_fsync" and len(directory_fsyncs) == 5:
+                            injected.append(failure)
+                            raise OSError("injected marker cleanup fsync failure")
+                    return real_fsync(fd)
+
+                patches = (
+                    mock.patch.object(lock_module.os, "unlink", side_effect=fail_cleanup_unlink),
+                    mock.patch.object(lock_module.os, "fsync", side_effect=fail_cleanup_fsync),
+                )
+                with patches[0], patches[1]:
+                    if failure == "unlink_preeffect":
+                        with self.assertRaises(AuditFailureTerminalDecisionError):
+                            _record_decision(home, head="b" * 40)
+                    else:
+                        _record_decision(home, head="b" * 40)
+
+                self.assertEqual(injected, [failure])
+                self.assertEqual(list(home.glob(f"{store.path.name}.rollback.*")), [])
+                if failure == "unlink_preeffect":
+                    self.assertEqual(store.path.read_bytes(), before)
+                    self.assertEqual(store.read(DecisionRoute(WORKSPACE, LANE)).head, HEAD)
+                else:
+                    self.assertEqual(store.read(DecisionRoute(WORKSPACE, LANE)).head, "b" * 40)
+                    self.assertIsNotNone(store.read(DecisionRoute(WORKSPACE, "other-lane")))
+
+    def test_descriptor_close_failure_after_commit_does_not_report_a_failed_write(self):
+        from mozyo_bridge.core.state import audit_failure_terminal_decision_lock as lock_module
+
+        for close_index in (1, 2):
+            with self.subTest(close_index=close_index):
+                home = self._home()
+                _record_decision(home, head=HEAD)
+                store = AuditFailureTerminalDecisionStore(home=home)
+                real_commit = lock_module.DecisionStoreFileCoordinator._commit_publications
+                real_close = lock_module.os.close
+                committed = []
+                closes = []
+
+                def commit_then_arm(instance, dir_fd, publications):
+                    result = real_commit(instance, dir_fd, publications)
+                    committed.append(True)
+                    return result
+
+                def close_then_raise(fd):
+                    result = real_close(fd)
+                    if committed:
+                        closes.append(fd)
+                        if len(closes) == close_index:
+                            raise OSError("injected descriptor close after commit")
+                    return result
+
+                with mock.patch.object(
+                    lock_module.DecisionStoreFileCoordinator,
+                    "_commit_publications",
+                    new=commit_then_arm,
+                ), mock.patch.object(lock_module.os, "close", side_effect=close_then_raise):
+                    _record_decision(home, head="b" * 40)
+
+                self.assertGreaterEqual(len(closes), 2)
+                self.assertEqual(store.read(DecisionRoute(WORKSPACE, LANE)).head, "b" * 40)
+
+    def test_marker_method_exception_after_commit_does_not_roll_back_the_decision(self):
+        from mozyo_bridge.core.state import audit_failure_terminal_decision_lock as lock_module
+
+        for initialized in (False, True):
+            for exception_at in ("method_return", "unlink_return"):
+                with self.subTest(initialized=initialized, exception_at=exception_at):
+                    self._assert_marker_exception_after_commit(
+                        lock_module, initialized=initialized, exception_at=exception_at
+                    )
+
+    def _assert_marker_exception_after_commit(
+        self, lock_module, *, initialized, exception_at
+    ):
+        home = self._home()
+        store = AuditFailureTerminalDecisionStore(home=home)
+        if initialized:
+            _record_decision(home, head=HEAD)
+        method_name = "_remove_rollback_backup" if initialized else "_remove_intent_marker"
+        real_remove = getattr(lock_module.DecisionStoreFileCoordinator, method_name)
+        real_unlink = lock_module.os.unlink
+        injected = []
+
+        def remove_then_raise(instance, dir_fd, publication, **kwargs):
+            if exception_at == "method_return":
+                real_remove(instance, dir_fd, publication, **kwargs)
+            else:
+                self.assertTrue(kwargs.get("commit"))
+                marker = publication.rollback_name if initialized else publication.intent_name
+                publication.commit_marker = marker
+                real_unlink(marker, dir_fd=dir_fd)
+            injected.append(True)
+            raise RuntimeError("injected after final marker removal")
+
+        with mock.patch.object(
+            lock_module.DecisionStoreFileCoordinator,
+            method_name,
+            new=remove_then_raise,
+        ):
+            _record_decision(home, head="b" * 40)
+
+        self.assertEqual(injected, [True])
+        self.assertEqual(store.read(DecisionRoute(WORKSPACE, LANE)).head, "b" * 40)
+        self.assertEqual(list(home.glob(f"{store.path.name}.intent.*")), [])
+        self.assertEqual(list(home.glob(f"{store.path.name}.rollback.*")), [])
+
+    def test_partial_fresh_rollback_preserves_foreign_json_but_cleans_own_nonce_and_lock(self):
+        from mozyo_bridge.core.state import audit_failure_terminal_decision_lock as lock_module
+
+        home = self._home()
+        store = AuditFailureTerminalDecisionStore(home=home)
+        real_rename = lock_module.os.rename
+        foreign = b'{"foreign": true}'
+        injected = []
+
+        def publish_then_replace_json_and_raise(
+            src, dst, *, src_dir_fd=None, dst_dir_fd=None
+        ):
+            result = real_rename(
+                src,
+                dst,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+            )
+            if dst == store.path.name and not injected:
+                replacement = store.path.with_name("foreign-json")
+                replacement.write_bytes(foreign)
+                os.replace(replacement, store.path)
+                injected.append(True)
+                raise RuntimeError("injected after foreign replacement")
+            return result
+
+        with mock.patch.object(
+            lock_module.os, "rename", side_effect=publish_then_replace_json_and_raise
+        ):
+            with self.assertRaises(AuditFailureTerminalDecisionError):
+                _record_decision(home, head=HEAD)
+
+        self.assertEqual(injected, [True])
+        self.assertEqual(store.path.read_bytes(), foreign)
+        self.assertFalse(os.path.lexists(store.sidecar_path))
+        self.assertFalse(os.path.lexists(store.lock_path))
+
+    def test_first_publication_lock_drift_leaves_no_json_or_nonce(self):
+        # The same rollback boundary covers both halves of first initialization. Drift after either
+        # rename leaves no authority-bearing artifact behind, even when the replacement copies the
+        # old token.
+        from mozyo_bridge.core.state import audit_failure_terminal_decision as store_module
+        from mozyo_bridge.core.state import audit_failure_terminal_decision_lock as lock_module
+
+        for drift_after in ("nonce", "json"):
+            with self.subTest(drift_after=drift_after):
+                home = self._home()
+                store = AuditFailureTerminalDecisionStore(home=home)
+                real_rename = store_module.os.rename
+                swapped = []
+
+                def rename_then_replace_lock(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+                    result = real_rename(
+                        src,
+                        dst,
+                        src_dir_fd=src_dir_fd,
+                        dst_dir_fd=dst_dir_fd,
+                    )
+                    if dst == store.path.name and not swapped:
+                        copied_token = store.lock_path.read_bytes()
+                        store.lock_path.unlink()
+                        store.lock_path.write_bytes(copied_token)
+                        store.lock_path.chmod(0o600)
+                        swapped.append(True)
+                    return result
+
+                real_write_token = lock_module.DecisionStoreFileCoordinator._write_lock_token
+
+                def write_token_then_replace_lock(instance, lock_fd, token):
+                    result = real_write_token(instance, lock_fd, token)
+                    if not swapped:
+                        copied_token = store.lock_path.read_bytes()
+                        store.lock_path.unlink()
+                        store.lock_path.write_bytes(copied_token)
+                        store.lock_path.chmod(0o600)
+                        swapped.append(True)
+                    return result
+
+                patcher = (
+                    mock.patch.object(
+                        lock_module.DecisionStoreFileCoordinator,
+                        "_write_lock_token",
+                        new=write_token_then_replace_lock,
+                    )
+                    if drift_after == "nonce"
+                    else mock.patch.object(
+                        store_module.os, "rename", side_effect=rename_then_replace_lock
+                    )
+                )
+                with patcher:
+                    with self.assertRaises(AuditFailureTerminalDecisionError):
+                        _record_decision(home, head=HEAD)
+
+                self.assertEqual(swapped, [True])
+                self.assertFalse(os.path.lexists(store.path))
+                self.assertFalse(os.path.lexists(store.sidecar_path))
+                recreated_lock = store.lock_path.read_bytes()
+                with self.assertRaises(AuditFailureTerminalDecisionError):
+                    _record_decision(home, head=HEAD)
+                self.assertEqual(store.lock_path.read_bytes(), recreated_lock)
+                self.assertFalse(os.path.lexists(store.path))
+                self.assertFalse(os.path.lexists(store.sidecar_path))
+
+    def test_an_artifact_free_preexisting_lock_is_never_adopted(self):
+        # Fresh-store ABA has no JSON generation to compare. A lock that this record operation did
+        # not create together with its exclusive nonce claim is therefore untrusted, empty or not.
+        for content in (b"", b"1" * 32 + b"\n"):
+            with self.subTest(content=content):
+                home = self._home()
+                store = AuditFailureTerminalDecisionStore(home=home)
+                store.lock_path.write_bytes(content)
+                store.lock_path.chmod(0o600)
+                with self.assertRaises(AuditFailureTerminalDecisionError):
+                    _record_decision(home, head=HEAD)
+                self.assertEqual(store.lock_path.read_bytes(), content)
+                self.assertFalse(os.path.lexists(store.path))
+                self.assertFalse(os.path.lexists(store.sidecar_path))
+
     def test_unsafe_lock_entries_are_typed_refusals_and_write_no_store(self):
         # The lock is authority-bearing too: following a symlink/hardlink or blocking on a special
         # file would either escape the home or split the serialization generation.
@@ -1266,6 +2534,57 @@ class TheDecisionStoreIsTheWriterHalf(unittest.TestCase):
                 if shape != "directory":
                     self.assertEqual(outside.read_text(encoding="utf-8"), "sentinel")
 
+    def test_an_initialized_lock_with_unsafe_mode_is_a_zero_write_refusal(self):
+        home = self._home()
+        _record_decision(home, head=HEAD)
+        store = AuditFailureTerminalDecisionStore(home=home)
+        before = (store.path.read_bytes(), store.sidecar_path.read_bytes())
+        store.lock_path.chmod(0o640)
+
+        with self.assertRaisesRegex(AuditFailureTerminalDecisionError, "owner/mode"):
+            _record_decision(home, head="b" * 40)
+
+        self.assertEqual(stat.S_IMODE(store.lock_path.stat().st_mode), 0o640)
+        self.assertEqual(
+            (store.path.read_bytes(), store.sidecar_path.read_bytes()), before
+        )
+
+    def test_an_initialized_lock_with_foreign_owner_is_a_zero_write_refusal(self):
+        from mozyo_bridge.core.state import audit_failure_terminal_decision_lock as lock_module
+
+        home = self._home()
+        _record_decision(home, head=HEAD)
+        store = AuditFailureTerminalDecisionStore(home=home)
+        before = (store.path.read_bytes(), store.sidecar_path.read_bytes())
+        lock_identity = store.lock_path.stat()
+        real_fstat = lock_module.os.fstat
+
+        class ForeignOwnerStat:
+            def __init__(self, actual):
+                self.actual = actual
+
+            def __getattr__(self, name):
+                if name == "st_uid":
+                    return self.actual.st_uid + 1
+                return getattr(self.actual, name)
+
+        def foreign_lock_owner(fd):
+            info = real_fstat(fd)
+            if (info.st_dev, info.st_ino) == (
+                lock_identity.st_dev,
+                lock_identity.st_ino,
+            ):
+                return ForeignOwnerStat(info)
+            return info
+
+        with mock.patch.object(lock_module.os, "fstat", side_effect=foreign_lock_owner):
+            with self.assertRaisesRegex(AuditFailureTerminalDecisionError, "owner/mode"):
+                _record_decision(home, head="b" * 40)
+
+        self.assertEqual(
+            (store.path.read_bytes(), store.sidecar_path.read_bytes()), before
+        )
+
     def test_read_and_initialization_checks_create_no_directories_or_lock(self):
         # A shared read lock is used only when the store already has a lock generation.  Probing an
         # absent/legacy-unlocked surface must remain side-effect free.
@@ -1285,27 +2604,28 @@ class TheDecisionStoreIsTheWriterHalf(unittest.TestCase):
 
     def test_read_and_initialization_checks_take_shared_locks(self):
         from mozyo_bridge.core.state import audit_failure_terminal_decision as store_module
+        from mozyo_bridge.core.state import audit_failure_terminal_decision_lock as lock_module
 
         home = self._home()
         _record_decision(home, head=HEAD)
         store = AuditFailureTerminalDecisionStore(home=home)
-        real_flock = store_module.fcntl.flock
+        real_flock = lock_module.fcntl.flock
         operations = []
 
         def observe(fd, operation):
             operations.append(operation)
             return real_flock(fd, operation)
 
-        with mock.patch.object(store_module.fcntl, "flock", side_effect=observe):
+        with mock.patch.object(lock_module.fcntl, "flock", side_effect=observe):
             self.assertIsNotNone(store.read(DecisionRoute(WORKSPACE, LANE)))
             self.assertTrue(store.is_initialized())
         self.assertEqual(
             operations,
             [
-                store_module.fcntl.LOCK_SH,
-                store_module.fcntl.LOCK_UN,
-                store_module.fcntl.LOCK_SH,
-                store_module.fcntl.LOCK_UN,
+                lock_module.fcntl.LOCK_SH,
+                lock_module.fcntl.LOCK_UN,
+                lock_module.fcntl.LOCK_SH,
+                lock_module.fcntl.LOCK_UN,
             ],
         )
 
@@ -1334,6 +2654,41 @@ class TheDecisionStoreIsTheWriterHalf(unittest.TestCase):
         store.sidecar_path.symlink_to(real)
         with self.assertRaises(AuditFailureTerminalDecisionError):
             AuditFailureTerminalDecisionStore(home=home).read(DecisionRoute(WORKSPACE, LANE))
+
+    def test_fifo_artifacts_are_nonblocking_typed_refusals(self):
+        from mozyo_bridge.core.state import audit_failure_terminal_decision_lock as lock_module
+
+        for artifact in ("records", "sidecar"):
+            with self.subTest(artifact=artifact):
+                home = self._home()
+                _record_decision(home, head=HEAD)
+                store = AuditFailureTerminalDecisionStore(home=home)
+                target = store.path if artifact == "records" else store.sidecar_path
+                lock_before = store.lock_path.read_bytes()
+                target.unlink()
+                os.mkfifo(target, 0o600)
+                real_open = lock_module.os.open
+                observed_flags = []
+
+                def require_nonblocking_artifact_open(path, flags, *args, **kwargs):
+                    if path == target.name:
+                        observed_flags.append(flags)
+                        if not flags & os.O_NONBLOCK:
+                            raise AssertionError("FIFO artifact open omitted O_NONBLOCK")
+                    return real_open(path, flags, *args, **kwargs)
+
+                with mock.patch.object(
+                    lock_module.os, "open", side_effect=require_nonblocking_artifact_open
+                ):
+                    with self.assertRaisesRegex(
+                        AuditFailureTerminalDecisionError, "single-linked regular file"
+                    ):
+                        store.read(DecisionRoute(WORKSPACE, LANE))
+
+                self.assertTrue(observed_flags)
+                self.assertTrue(all(flags & os.O_NONBLOCK for flags in observed_flags))
+                self.assertTrue(stat.S_ISFIFO(target.lstat().st_mode))
+                self.assertEqual(store.lock_path.read_bytes(), lock_before)
 
     def test_a_swapped_artifact_writes_nothing_outside_the_home(self):
         # Review j#102582 finding 1, as the reviewer reproduced it and as the required direction
@@ -1368,8 +2723,10 @@ class TheDecisionStoreIsTheWriterHalf(unittest.TestCase):
         import inspect
 
         from mozyo_bridge.core.state import audit_failure_terminal_decision as store_module
+        from mozyo_bridge.core.state import audit_failure_terminal_decision_lock as lock_module
 
-        source = inspect.getsource(store_module)
+        sources = (inspect.getsource(store_module), inspect.getsource(lock_module))
+        source = "\n".join(sources)
         # No sqlite in the CODE. The module docstring names it only to explain why it is not used
         # (it cannot be handed a descriptor), so the docstring is stripped before asserting.
         body = source.split('"""', 2)[-1]
@@ -1377,14 +2734,14 @@ class TheDecisionStoreIsTheWriterHalf(unittest.TestCase):
         # The ONE bare open is the trusted filesystem root and carries O_DIRECTORY|O_NOFOLLOW.
         # Every home component and artifact operation names a directory descriptor.
         open_home = inspect.getsource(
-            store_module.AuditFailureTerminalDecisionStore._open_home_fd
+            lock_module.DecisionStoreFileCoordinator.open_home_fd
         )
         self.assertIn("os.open(os.sep, flags)", open_home)
         self.assertIn("os.O_DIRECTORY", open_home)
         self.assertIn("| os.O_NOFOLLOW", open_home)
         lines = source.splitlines()
         for index, line in enumerate(lines):
-            for opener in ("os.open(", "os.rename(", "os.unlink("):
+            for opener in ("os.open(", "os.mkdir(", "os.stat(", "os.rename(", "os.unlink("):
                 if opener not in line:
                     continue
                 if "os.open(os.sep, flags)" in line:

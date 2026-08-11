@@ -71,12 +71,33 @@ asks for, met rather than weakened.
 
 Atomic rename protects one publication, not the read-modify-write that precedes it. A regular,
 single-linked home-relative lock therefore serializes the entire initialization/load/update/
-publication sequence with ``LOCK_EX``. Reads and initialization probes hold ``LOCK_SH`` through
-their complete snapshot, and never create a missing home or lock. Missing, replaced or unsafe lock
-identity is a typed fail-closed refusal.
+publication sequence with ``LOCK_EX``. Its random token AND opened inode generation are bound into
+the JSON document: copying the old token into a replacement inode does not create a second valid
+serialization generation. Every operation revalidates that same visible generation before and
+after its snapshot; writers additionally revalidate immediately before and after publication.
+Rollback intent is armed before rename; the renamed canonical inode is checked against the staged
+inode, and an existing JSON's exact old inode is retained as a durable home-relative hard link
+before publication. Rollback atomically renames that retained inode back without truncating or
+rewriting it. A rollback, write or fsync failure therefore cannot turn an earlier complete decision
+document into a partial/empty JSON. If the canonical target is already foreign or exact rollback
+cannot complete, the foreign target is preserved and the visible lock is atomically replaced by a
+poison generation. The durable rollback link is also an operation-scoped marker: any later
+operation that did not create that exact marker refuses it. An independent publication-intent name
+is armed and made durable before the writer starts its original snapshot, then remains until exact
+readback, so snapshot drift, pre-retention foreign replacement, fresh stage ABA or total poison
+failure remains a refusal even across process stop. Compound failure cannot become authority later.
+Removing the last rollback marker after the durable canonical readback is the irreversible commit
+point; cleanup fsync, descriptor-close or wrapper/signal exceptions after that point do not roll the
+committed decision back or misreport it as a failed write. A marker resurrected after reboot makes
+the store refuse.
+Reads and initialization probes hold ``LOCK_SH`` through their complete snapshot, and never create
+a missing home or lock. Once either store artifact exists, a missing lock is store loss, never an
+invitation to create a new generation. Missing, replaced or unsafe lock identity is a typed
+fail-closed refusal.
 
-Store identity mirrors the sibling fences: a nonce sidecar makes a deleted / replaced / foreign
-store fail CLOSED. Unlike them there is no ``bootstrap`` / ``recover`` ceremony, because the
+Store identity mirrors the sibling fences: nonce bytes AND the sidecar inode generation are bound
+into JSON, so a copied nonce on a replacement inode makes a deleted / replaced / foreign store
+fail CLOSED. Unlike them there is no ``bootstrap`` / ``recover`` ceremony, because the
 asymmetry here is simpler and safer: :meth:`record` — the coordinator's own action — creates the
 store, and every read path refuses when it is absent. A lost store therefore cannot silently admit
 anything; it can only require the coordinator to decide again.
@@ -87,32 +108,25 @@ from __future__ import annotations
 import json
 import os
 import secrets
-import stat
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Optional
 
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - the managed terminal runtime is POSIX
-    fcntl = None  # type: ignore[assignment]
-
+from mozyo_bridge.core.state.audit_failure_terminal_decision_lock import (
+    AuditFailureTerminalDecisionError,
+    DecisionStoreFileCoordinator,
+    LockedHome,
+)
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
-AUDIT_FAILURE_TERMINAL_DECISION_SCHEMA_VERSION = 1
+AUDIT_FAILURE_TERMINAL_DECISION_SCHEMA_VERSION = 2
 AUDIT_FAILURE_TERMINAL_DECISION_SIDECAR_SUFFIX = ".nonce"
 AUDIT_FAILURE_TERMINAL_DECISION_LOCK_SUFFIX = ".lock"
 #: The records file's basename under the home. A plain JSON document, replaced whole: one record
 #: per lane route, serialized by a home-relative advisory lock, and — decisively — a format this
 #: module can write through a descriptor.
 AUDIT_FAILURE_TERMINAL_DECISION_FILENAME = "audit-failure-terminal-decision.json"
-_TEMP_SUFFIX = ".tmp"
-
-
-class AuditFailureTerminalDecisionError(RuntimeError):
-    """The decision store is absent, replaced, unreachable, or the writer is not attested."""
 
 
 def audit_failure_terminal_decision_path(home: Optional[Path] = None) -> Path:
@@ -129,6 +143,10 @@ def _utc_now() -> str:
 def mint_decision_id() -> str:
     """A fresh opaque decision id. Minted by the STORE, never supplied by a caller."""
     return f"aft_{secrets.token_hex(16)}"
+
+
+def _artifact_generation_payload(identity: tuple[int, int, int]) -> dict:
+    return {"device": identity[0], "inode": identity[1], "ctime_ns": identity[2]}
 
 
 @dataclass(frozen=True)
@@ -193,6 +211,14 @@ class TerminalDecision:
         }
 
 
+@dataclass(frozen=True)
+class _StoreSnapshot:
+    document: dict
+    document_text: str
+    document_identity: tuple[int, int, int]
+    nonce_text: str
+
+
 def _validation_errors(decision: TerminalDecision) -> "tuple[str, ...]":
     """Why this decision cannot identify a terminal (empty iff usable; pure).
 
@@ -250,274 +276,76 @@ class AuditFailureTerminalDecisionStore:
         self.lock_path = self.path.with_name(
             self.path.name + AUDIT_FAILURE_TERMINAL_DECISION_LOCK_SUFFIX
         )
-
-    # -- the stable directory descriptor -----------------------------------
-
-    def _open_home_fd(self, *, create: bool) -> int:
-        """Open/create the declared home by an anchored no-follow component walk.
-
-        A path-wide ``lstat`` precheck followed by ``mkdir`` / ``open(path)`` has a swap window:
-        the second operation resolves every ancestor again.  Instead this method opens the trusted
-        filesystem root once, then opens (or creates) each component relative to the descriptor
-        obtained for its parent.  A component swapped before its open is rejected by
-        ``O_NOFOLLOW``; one swapped after its open cannot redirect later operations.
-        """
-        if self.home.anchor != os.sep:
-            raise AuditFailureTerminalDecisionError(
-                f"decision store home {self.home} is not rooted at the filesystem root; "
-                "fail closed"
-            )
-        if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
-            raise AuditFailureTerminalDecisionError(
-                "decision store component walk requires O_DIRECTORY and O_NOFOLLOW; "
-                "this platform cannot enforce the no-follow contract, so fail closed"
-            )
-        flags = (
-            os.O_RDONLY
-            | os.O_DIRECTORY
-            | os.O_NOFOLLOW
-            | getattr(os, "O_CLOEXEC", 0)
+        self._files = DecisionStoreFileCoordinator(
+            home=self.home,
+            document_name=self.path.name,
+            sidecar_name=self.sidecar_path.name,
+            lock_name=self.lock_path.name,
+            display_path=self.path,
         )
-        try:
-            current_fd = os.open(os.sep, flags)
-        except OSError as exc:
-            raise AuditFailureTerminalDecisionError(
-                f"decision store filesystem root could not be opened "
-                f"({type(exc).__name__}); fail closed"
-            ) from exc
-        try:
-            for component in self.home.parts[1:]:
-                if not component or component in (".", ".."):
-                    raise AuditFailureTerminalDecisionError(
-                        f"decision store home {self.home} has an unsafe path component; "
-                        "fail closed"
-                    )
-                try:
-                    next_fd = os.open(component, flags, dir_fd=current_fd)
-                except FileNotFoundError:
-                    if not create:
-                        raise AuditFailureTerminalDecisionError(
-                            f"decision store home {self.home} does not exist; fail closed"
-                        ) from None
-                    try:
-                        os.mkdir(component, 0o700, dir_fd=current_fd)
-                    except FileExistsError:
-                        # A concurrent creator won.  The no-follow open below decides whether the
-                        # winner is the directory component this walk is allowed to adopt.
-                        pass
-                    except OSError as exc:
-                        raise AuditFailureTerminalDecisionError(
-                            f"decision store home component {component} could not be created "
-                            f"({type(exc).__name__}); fail closed"
-                        ) from exc
-                    try:
-                        next_fd = os.open(component, flags, dir_fd=current_fd)
-                    except OSError as exc:
-                        raise AuditFailureTerminalDecisionError(
-                            f"decision store home component {component} could not be opened "
-                            f"after creation ({type(exc).__name__}); fail closed"
-                        ) from exc
-                except OSError as exc:
-                    raise AuditFailureTerminalDecisionError(
-                        f"decision store home component {component} could not be opened as a "
-                        f"directory without following a link ({type(exc).__name__}); fail closed"
-                    ) from exc
-                os.close(current_fd)
-                current_fd = next_fd
-            result = current_fd
-            current_fd = -1
-            return result
-        finally:
-            if current_fd >= 0:
-                os.close(current_fd)
-
-    def _require_safe_lock(self, dir_fd: int, lock_fd: int) -> None:
-        """Require one regular, single-linked lock still visible at the opened name."""
-        try:
-            opened = os.fstat(lock_fd)
-            visible = os.stat(
-                self.lock_path.name, dir_fd=dir_fd, follow_symlinks=False
-            )
-        except OSError as exc:
-            raise AuditFailureTerminalDecisionError(
-                f"decision store lock {self.lock_path.name} could not be verified "
-                f"({type(exc).__name__}); fail closed"
-            ) from exc
-        for label, info in (("opened", opened), ("visible", visible)):
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                raise AuditFailureTerminalDecisionError(
-                    f"decision store lock {self.lock_path.name} is not a single-linked regular "
-                    f"file at its {label} identity; fail closed"
-                )
-        if (opened.st_dev, opened.st_ino) != (visible.st_dev, visible.st_ino):
-            raise AuditFailureTerminalDecisionError(
-                f"decision store lock {self.lock_path.name} changed identity while opening; "
-                "fail closed"
-            )
-
-    def _open_lock_fd(self, dir_fd: int, *, create: bool) -> Optional[int]:
-        """Open the home-relative lock without following or blocking on an unsafe file type."""
-        flags = (
-            (os.O_RDWR if create else os.O_RDONLY)
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_NONBLOCK", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-        )
-        if create:
-            flags |= os.O_CREAT
-        try:
-            lock_fd = os.open(self.lock_path.name, flags, 0o600, dir_fd=dir_fd)
-        except FileNotFoundError:
-            if not create:
-                return None
-            raise AuditFailureTerminalDecisionError(
-                f"decision store lock {self.lock_path.name} disappeared while opening; "
-                "fail closed"
-            ) from None
-        except OSError as exc:
-            raise AuditFailureTerminalDecisionError(
-                f"decision store lock {self.lock_path.name} could not be opened without "
-                f"following a link ({type(exc).__name__}); fail closed"
-            ) from exc
-        try:
-            self._require_safe_lock(dir_fd, lock_fd)
-        except AuditFailureTerminalDecisionError:
-            os.close(lock_fd)
-            raise
-        return lock_fd
-
-    @contextmanager
-    def _locked_home(self, *, create: bool, exclusive: bool) -> Iterator[int]:
-        """Hold the home descriptor and one consistent store lock for an entire operation."""
-        if fcntl is None:
-            raise AuditFailureTerminalDecisionError(
-                "decision store advisory locking is unavailable; refusing to access shared "
-                "state without the required lock"
-            )
-        dir_fd = self._open_home_fd(create=create)
-        lock_fd: Optional[int] = None
-        locked = False
-        try:
-            lock_fd = self._open_lock_fd(dir_fd, create=create)
-            if lock_fd is None:
-                raise AuditFailureTerminalDecisionError(
-                    f"decision store {self.path} has no coordination lock; fail closed"
-                )
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
-                locked = True
-            except OSError as exc:
-                raise AuditFailureTerminalDecisionError(
-                    f"decision store lock {self.lock_path.name} could not be acquired "
-                    f"({type(exc).__name__}); fail closed"
-                ) from exc
-            # Refuse a replacement lock generation installed while this opener was waiting.
-            self._require_safe_lock(dir_fd, lock_fd)
-            yield dir_fd
-        finally:
-            if lock_fd is not None:
-                if locked:
-                    try:
-                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                    except OSError:
-                        pass
-                os.close(lock_fd)
-            os.close(dir_fd)
-
-    def _read_file(self, dir_fd: int, name: str) -> Optional[str]:
-        """Read one artifact relative to the home descriptor, never following a link."""
-        try:
-            fd = os.open(
-                name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dir_fd
-            )
-        except FileNotFoundError:
-            return None
-        except OSError as exc:
-            raise AuditFailureTerminalDecisionError(
-                f"decision store artifact {name} could not be opened without following a link "
-                f"({type(exc).__name__}); fail closed"
-            ) from exc
-        with os.fdopen(fd, "r", encoding="utf-8") as handle:
-            return handle.read()
-
-    def _replace_file(self, dir_fd: int, name: str, text: str) -> None:
-        """Write one artifact atomically: exclusive temp, fsync, rename — all via the descriptor.
-
-        ``O_EXCL | O_NOFOLLOW`` means the temp is a file this call created, never an existing link,
-        and the rename happens inside the SAME directory descriptor, so the published name is
-        replaced without the path ever being resolved again.
-        """
-        temp = f"{name}{_TEMP_SUFFIX}.{secrets.token_hex(8)}"
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            fd = os.open(temp, flags, 0o600, dir_fd=dir_fd)
-        except OSError as exc:
-            raise AuditFailureTerminalDecisionError(
-                f"decision store artifact {name} could not be staged "
-                f"({type(exc).__name__}); fail closed"
-            ) from exc
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(text)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.rename(temp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-        except OSError as exc:
-            try:
-                os.unlink(temp, dir_fd=dir_fd)
-            except OSError:
-                pass
-            raise AuditFailureTerminalDecisionError(
-                f"decision store artifact {name} could not be published "
-                f"({type(exc).__name__}); fail closed"
-            ) from exc
 
     # -- store identity ----------------------------------------------------
 
     def _read_sidecar_nonce(self) -> Optional[str]:
         try:
-            with self._locked_home(create=False, exclusive=False) as dir_fd:
-                value = self._read_file(dir_fd, self.sidecar_path.name)
+            with self._files.locked_home(create=False, exclusive=False) as scope:
+                value = self._load(scope).nonce_text
         except AuditFailureTerminalDecisionError:
             return None
         return (value or "").strip() or None
 
     def is_initialized(self) -> bool:
         try:
-            with self._locked_home(create=False, exclusive=False) as dir_fd:
-                nonce = (self._read_file(dir_fd, self.sidecar_path.name) or "").strip()
-                document = self._read_file(dir_fd, self.path.name)
+            with self._files.locked_home(create=False, exclusive=False) as scope:
+                self._load(scope)
         except AuditFailureTerminalDecisionError:
             return False
-        if not nonce or document is None:
-            return False
-        try:
-            parsed = json.loads(document)
-        except ValueError:
-            return False
-        return (
-            isinstance(parsed, dict)
-            and parsed.get("store_nonce") == nonce
-            and parsed.get("schema_version")
-            == AUDIT_FAILURE_TERMINAL_DECISION_SCHEMA_VERSION
-        )
+        return True
 
-    def _load(self, dir_fd: int) -> dict:
+    def _require_known_rollback_markers(self, scope: LockedHome) -> None:
+        prefixes = (self.path.name + ".rollback.", self.path.name + ".intent.")
+        try:
+            observed = sorted(
+                name for name in os.listdir(scope.dir_fd) if name.startswith(prefixes)
+            )
+        except OSError as exc:
+            raise AuditFailureTerminalDecisionError(
+                f"decision store {self.path} rollback markers could not be inspected; fail closed"
+            ) from exc
+        expected = sorted(
+            name
+            for publication in scope.publications
+            for name in (publication.rollback_name, publication.intent_name)
+            if name is not None
+        )
+        if observed != expected:
+            raise AuditFailureTerminalDecisionError(
+                f"decision store {self.path} has an unresolved publication marker; fail closed"
+            )
+
+    def _load(self, scope: LockedHome) -> _StoreSnapshot:
         """The records document, verified against the sidecar identity, or fail closed."""
-        nonce = (self._read_file(dir_fd, self.sidecar_path.name) or "").strip()
-        if not nonce:
+        self._files.require_lock_generation(scope)
+        self._require_known_rollback_markers(scope)
+        nonce_text, nonce_identity = self._files.read_file_snapshot(
+            scope.dir_fd, self.sidecar_path.name
+        )
+        nonce = (nonce_text or "").strip()
+        if not nonce or nonce_identity is None:
             raise AuditFailureTerminalDecisionError(
                 f"decision store {self.path} has no identity sidecar (never recorded / lost); "
                 "fail closed rather than admit a terminal with no recorded decision"
             )
-        document = self._read_file(dir_fd, self.path.name)
-        if document is None:
+        document_text, document_identity = self._files.read_file_snapshot(
+            scope.dir_fd, self.path.name
+        )
+        if document_text is None or document_identity is None:
             raise AuditFailureTerminalDecisionError(
                 f"decision store {self.path} is missing while its sidecar remains (store loss); "
                 "fail closed rather than auto-create"
             )
         try:
-            parsed = json.loads(document)
+            parsed = json.loads(document_text)
         except ValueError as exc:
             raise AuditFailureTerminalDecisionError(
                 f"decision store {self.path} is unreadable ({type(exc).__name__}); fail closed"
@@ -537,12 +365,45 @@ class AuditFailureTerminalDecisionStore:
                 f"decision store {self.path} nonce does not match its sidecar (replaced / "
                 "foreign store); fail closed"
             )
+        if parsed.get("store_nonce_generation") != _artifact_generation_payload(
+            nonce_identity
+        ):
+            raise AuditFailureTerminalDecisionError(
+                f"decision store {self.path} is bound to a different nonce inode generation; "
+                "refusing a replaced or copied identity sidecar"
+            )
+        if parsed.get("lock_generation") != scope.generation.as_payload():
+            raise AuditFailureTerminalDecisionError(
+                f"decision store {self.path} is bound to a different lock generation; refusing "
+                "a replaced, recreated or copied coordination lock"
+            )
         records = parsed.get("decisions")
         if not isinstance(records, dict):
             raise AuditFailureTerminalDecisionError(
                 f"decision store {self.path} carries no decision map; fail closed"
             )
-        return parsed
+        if self._files.artifact_identity(
+            scope.dir_fd, self.sidecar_path.name
+        ) != nonce_identity:
+            raise AuditFailureTerminalDecisionError(
+                f"decision store {self.path} nonce identity drifted during its snapshot; "
+                "fail closed"
+            )
+        if self._files.artifact_identity(
+            scope.dir_fd, self.path.name
+        ) != document_identity:
+            raise AuditFailureTerminalDecisionError(
+                f"decision store {self.path} JSON identity drifted during its snapshot; "
+                "fail closed"
+            )
+        self._require_known_rollback_markers(scope)
+        self._files.require_lock_generation(scope)
+        return _StoreSnapshot(
+            document=parsed,
+            document_text=document_text,
+            document_identity=document_identity,
+            nonce_text=nonce_text or "",
+        )
 
     @staticmethod
     def _key(route: DecisionRoute) -> str:
@@ -623,30 +484,62 @@ class AuditFailureTerminalDecisionStore:
             integration_branch=decision.integration_branch.strip(),
             recorded_at=stamp,
         )
-        with self._locked_home(create=True, exclusive=True) as dir_fd:
-            existing = self._read_file(dir_fd, self.sidecar_path.name)
-            nonce = (existing or "").strip()
-            if not nonce:
-                if self._read_file(dir_fd, self.path.name) is not None:
+        with self._files.locked_home(create=True, exclusive=True) as scope:
+            publication = self._files.arm_publication(scope, self.path.name)
+            existing_nonce = self._files.read_file(scope.dir_fd, self.sidecar_path.name)
+            existing_document = self._files.read_file(scope.dir_fd, self.path.name)
+            if scope.bootstrap_nonce is not None:
+                if (
+                    scope.bootstrap_identity is None
+                    or existing_nonce != scope.bootstrap_nonce
+                    or existing_document is not None
+                ):
                     raise AuditFailureTerminalDecisionError(
-                        f"decision store {self.path} exists without its identity sidecar "
-                        "(replaced / half-written store); refusing to write into it"
+                        f"decision store {self.path} changed during first-use bootstrap; fail closed"
                     )
-                nonce = secrets.token_hex(16)
+                nonce = scope.bootstrap_nonce
                 document = {
                     "schema_version": AUDIT_FAILURE_TERMINAL_DECISION_SCHEMA_VERSION,
                     "store_nonce": nonce,
+                    "store_nonce_generation": _artifact_generation_payload(
+                        scope.bootstrap_identity
+                    ),
+                    "lock_generation": scope.generation.as_payload(),
                     "decisions": {},
                 }
-                self._replace_file(dir_fd, self.sidecar_path.name, nonce)
+                original_document = None
+                original_document_identity = None
+                self._files.bind_publication_snapshot(publication, None, None)
             else:
-                document = self._load(dir_fd)
+                if existing_nonce is None or existing_document is None:
+                    raise AuditFailureTerminalDecisionError(
+                        f"decision store {self.path} has only one of its JSON/nonce artifacts "
+                        "(replaced / half-written store); refusing to write into it"
+                    )
+                snapshot = self._load(scope)
+                document = snapshot.document
+                original_document = snapshot.document_text
+                original_document_identity = snapshot.document_identity
+                self._files.bind_publication_snapshot(
+                    publication, original_document, original_document_identity
+                )
             document["decisions"][self._key(recorded.route)] = recorded.as_payload()
-            self._replace_file(
-                dir_fd,
-                self.path.name,
-                json.dumps(document, ensure_ascii=False, sort_keys=True, indent=2),
+            intended_document = json.dumps(
+                document, ensure_ascii=False, sort_keys=True, indent=2
             )
+            self._files.publish_file(
+                scope,
+                self.path.name,
+                intended_document,
+                publication=publication,
+            )
+            # Verify the whole effective document, not only this route: a mutated staged inode must
+            # not erase an earlier successful route while retaining the just-written route.
+            if self._load(scope).document_text != intended_document:
+                raise AuditFailureTerminalDecisionError(
+                    f"decision store {self.path} did not retain the exact published document; "
+                    "rolling back rather than reporting false success"
+                )
         return recorded
 
     # -- the retire's read -------------------------------------------------
@@ -658,8 +551,8 @@ class AuditFailureTerminalDecisionStore:
         has no decision" and "the decision surface is gone" are different operational problems, and
         both refuse.
         """
-        with self._locked_home(create=False, exclusive=False) as dir_fd:
-            document = self._load(dir_fd)
+        with self._files.locked_home(create=False, exclusive=False) as scope:
+            document = self._load(scope).document
             payload = document["decisions"].get(self._key(route))
             if not isinstance(payload, dict):
                 return None
