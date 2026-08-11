@@ -395,7 +395,7 @@ class LiveHibernatedPairRecoveryOps:
             release = current_generation_release_pin(
                 tuple(self._rows()),
                 home=self.attestation_home,
-                workspace_id=repo_scope_workspace_id(self.repo_root),
+                workspace_id=self.workspace_id(),
                 lane_id=self.request_lane,
                 role=provider,
                 assigned_name=assigned_name,

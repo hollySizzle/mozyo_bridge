@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mozyo-bridge"
-version = "0.20.1"
+version = "1.0.0rc1"
 description = "Redmine-gated tmux pane notification bridge for Claude Code and Codex terminals"
 readme = "README.md"
 license = "MIT"
@@ -144,6 +144,10 @@ files = [
     # `HerdrStandardRailOps` / `TurnStartRailPort` structural-conformance assignments
     # are real gates against fake signature drift (review j#79040 F1').
     "tests/unit/e_110_execution_platform/f_130_handoff_routing/test_handoff_herdr_standard_rail.py",
+    # Redmine #15242: Herdr queue-enter's causal wait / generation fence / bounded
+    # Enter-only retry application seam and its structurally-conforming fake port.
+    "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/handoff_herdr_queue_enter_rail.py",
+    "tests/unit/e_110_execution_platform/f_130_handoff_routing/test_handoff_herdr_queue_enter_rail.py",
     # Redmine #13729 tranche 4: the common tmux transport rail slice (typed request +
     # Protocol port for the inject / marker gate / rollback / retry / turn-start / emit
     # side effects + a fully-annotated live adapter).
@@ -206,6 +210,15 @@ warn_return_any = true
 # fully-annotated bar (typed request / Protocol ports / live adapter all typed).
 [[tool.mypy.overrides]]
 module = "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_herdr_standard_rail"
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+warn_return_any = true
+
+# Redmine #15242: the extracted Herdr queue-enter session / Protocol port / live
+# adapter is a strict typed island, matching the surrounding handoff rail seams.
+[[tool.mypy.overrides]]
+module = "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_herdr_queue_enter_rail"
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
 check_untyped_defs = true

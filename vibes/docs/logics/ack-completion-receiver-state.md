@@ -145,13 +145,62 @@ turn 開始) を保証していなかったこと。busy / redraw 状態の comp
   本 doc の doctrine と C-u rollback の capture-absence 注意に整合させるため。submit 成功時、codex TUI では
   送信済み marker が transcript に user message として残るので、marker-absence は成功の証拠にならない
   (成功時にも present であり得る)。
-- claude rail と queue-enter rail の挙動は不変。behavioral 正本は
-  `vibes/docs/logics/tmux-send-safety-contract.md` の v0.6 節。本節はその **実測と ACK-layer 位置づけ** を
+- #13166 の変更時点では claude rail と queue-enter rail の挙動は不変だった。後続の Redmine #15242
+  (既定 queue-enter の turn-start 補完) は herdr queue-enter だけを更新する。behavioral 正本は
+  `vibes/docs/logics/tmux-send-safety-contract.md` の v0.6 / v0.21 節。本節は **実測と ACK-layer 位置づけ** を
   記録するだけであり、rail の挙動仕様を再定義しない。
 - これは tmux capture 依存の compat hardening であり、long-term direction ではない。`tmux capture-pane` を
   観測しなくても submit / turn 開始が分かる本命は、依然として sidecar / control-event ベースの
   receiver-state observability (段階 1 以降) と durable-ledger 側にある。#13166 の候補 2 (pending delivery
   ledger) は本 fix の non-goal として明示的に後回しにされた。
+
+### Herdr queue-enter の causal turn-start と確認不能境界 (Redmine #15242)
+
+Redmine #15242 (既定 queue-enter の turn-start 補完) は、同じ偽陽性を既定 Herdr rail で残さないための
+layer 0 hardening である。ただし queue-enter は `busy` な receiver にも request を queue する rail なので、
+idle だけを許す standard `drive_turn_start` を流用しない。
+
+- marker + body は exactly once。Herdr queue-enter は body 注入後に tmux compatibility 由来の
+  landing-marker wait を行わない。pinned generation を再確認し、Herdr 0.8 の
+  `agent wait TARGET --until working --timeout MS` を arm でき、absolute deadline 内にある場合だけ
+  first Enter を発行する。失敗時は
+  `enter_attempts=0` のまま `blocked` / `turn_start_unconfirmed` に閉じる。実際に発行する first / extra Enter は
+  すべて事前に wait を arm する。causal start が未確認なら、同一 target identity、collision-free launch
+  generation、現在の composer tail にある full marker+body（hard-wrap whitespace のみ正規化）、startup /
+  modal / trust / login / selection screen の非該当、runtime state の read 成功を **各回の送信直前に fresh に**
+  再確認する。timeout-only 系列は policy 回数上限と absolute deadline まで Enter-only retry を反復できる。
+  wait error は次の Enter を許可せず、その場で系列を停止する。それ以前に timeout の fresh gate で許可・発行済みの
+  retry は取り消せないため、その回数を telemetry に残す。historical transcript に
+  同じ本文があるだけでは composer retention にならない。
+- `busy` は queue semantics 上、上記の全再確認を通過した追加 Enter を拒む理由ではない。しかし busy snapshot、
+  busy baseline、既存 turn と区別できない event は **submission proof ではない**。pre-Enter state が
+  `awaiting_input` / `turn_ended`、wait がその Enter より先に arm 済み、working transition が観測済み、
+  launch generation が前後で coherent、という因果関係が揃った場合だけ confirmation に使う。
+- `blocked` / `unknown` / state read failure、identity または generation の欠落・drift、current composer からの
+  body 消失、startup/modal 検出、wait の arm 不能は追加 Enter を拒否する。「不明」は安全な retry の根拠では
+  ない。
+- public default は window 30 秒 / interval 2 秒。window は初回観測、全 interval 待ち、全追加 Enter 後の
+  再観測を含む単一 absolute budget で、wait を arm し直しても延長しない。interval は隣接する Enter 間の
+  最小間隔で、観測待ちにより既に満たしていれば追加 sleep しない。window / interval の `0` または正の
+  sub-millisecond 値は追加 Enter 無効である。これは initial admission 自体を抑止しないが、first Enter と
+  observation は post-body generation 再確認・wait arm・deadline check が成功した場合に限る。`0.001` 秒へ
+  切り上げず、非有限値は本文注入前に拒否する。
+
+確認結果は queue 専用 `queue_enter_turn_start_observation` と queue delivery-ledger rail に残し、standard
+`turn_start_outcome` へ射影しない。後者へ射影すると queue delivery が別 rail として分類され、recovery 判断が
+変わるためである。causal event と coherent generation が揃った場合だけ `sent` / `ok` / exit 0。wait absent は
+`blocked` / `turn_start_absent`、fresh gate が runtime blocked を確認した場合は `blocked` /
+`receiver_blocked`、timeout / error / wait unarmed / drift / body-screen-state 再確認不成立は `blocked` /
+`turn_start_unconfirmed`、送信 primitive の `TerminalTransportError` は `blocked` / `transport_error` へ写し、
+いずれも非0である。未確認を legacy の `sent` / telemetry-only success に倒さない。ただし本文が届いた可能性を
+含むので injection stage は `uncertain_partial`、blind retry 禁止となる。ここまで確認できても task completion ではない。
+
+post-injection transport failure は、通常の queue terminal と同じ delivery-ledger rail に **exactly one** row を
+残す。row は `backend=herdr` / `rail=queue_enter_rail` / `disposition=<TRANSPORT_STEPS の固定 token>`、
+structured outcome は `transport_failure.primitive=<同 token>` だけを持つ。adapter exception、raw stderr、
+binary / repository path、任意 detail は ACK evidence ではなく、durable record や Unit Board に出さない。
+Unit Board の診断は `gateway_status=blocked` / `gateway_reason=transport_error` /
+`transport_primitive=<同 token>` の閉じた public-safe 射影に限る。この診断を completion evidence に昇格しない。
 
 ### Minimal future runtime event vocabulary
 
@@ -250,7 +299,7 @@ ticket-system signal が増えても、それは layer 3 workflow truth の fres
 
 現行 `mozyo-bridge` の handoff / notify 経路は `tmux capture-pane` を通じた marker observation に依存している。これは現実的な compat layer として正しい選択だが、長期 contract として固定する対象ではない。
 
-- 短期的責務 (現行 tmux runtime に残す): `vibes/docs/logics/tmux-send-safety-contract.md` の `Fail-Closed Conditions` / `Queue-Enter Default Rail` / `### Deterministic Preflight Admission Control` が定める範囲で `wait_for_text` を **observability のため** に呼ぶ。Enter 発行の根拠は strict rail では marker 観測、queue-enter rail では Layer B preflight 通過と durable anchor 整合。いずれの rail でも rendered text は ACK / completion の正本にしない。
+- 短期的責務 (現行 tmux runtime に残す): `vibes/docs/logics/tmux-send-safety-contract.md` の `Fail-Closed Conditions` / `Queue-Enter Default Rail` / `### Deterministic Preflight Admission Control` が定める範囲で `wait_for_text` を **observability のため** に呼ぶ。Enter 発行の根拠は strict rail では marker 観測、tmux queue-enter では Layer B preflight 通過と durable anchor 整合。Herdr queue-enter の追加 Enter では、同文書 v0.21 の causal event / identity / generation gate に加えて、last prompt 以降の **current composer tail** に exact marker+body があることだけを retention evidence とする。scrollback 全体の substring は使わない。この current-composer check も retry を止めるための必要条件であって、ACK / completion の正本ではない。
 - 長期方向: rendered text 観測は **fallback** であり、本命は sidecar / control-event ベースの machine-readable signal (`runtime.input.ack` / `runtime.process.exited` / `runtime.output.eof` 等) を、provider normalizer / event classifier 経由で agentd 内 durable event store に正規化する経路。詳細は `mozyo_bridge_pty/vibes/docs/specs/agentd-sidecar-ipc.md`、`mozyo_bridge_pty/vibes/docs/specs/pty-event-normalization.md`、`mozyo_bridge_pty/vibes/docs/specs/event-classifier-module-structure.md`。
 
 「capture-pane を強化する」「marker wrap 補修を入れる」方向の改善は、短期 wrap shape 起因の `marker_timeout` を救うための **compat fix** であって long-term contract の昇格ではない。doctrine 上の long-term direction は「rendered text を観測しなくても良くなる側」であり、それは PTY-first runtime の sidecar / control-event 経路でしか整わない。
@@ -323,6 +372,14 @@ doctrine としての position:
 6. **handoff の durable wording は ACK 層の正本**として書く。completion / processing の含意を持たせない。受領契約は引き続き「receiver は durable anchor を読む」であり、pane の rendered text に依存させない。
 7. **owner approval / review / close を runtime signal で自動化しない**。`runtime.input.ack`、`runtime.output.eof`、`assistant_turn_finished`、ticket webhook のいずれも、Review Gate / owner close approval / Close Gate の代替ではない。
 8. **ticket-system signal は provider 境界に閉じる**。Redmine / Asana の status、journal、approval record を読む場合は ticket provider adapter / governed workflow の layer 3 record として扱い、terminal runtime adapter や sidecar の ACK state に混ぜない。
+9. **Herdr queue-enter の確認不能を外側の自動再送へ読み替えない**。本文が既に composer にある可能性が
+   あるため、causal event + coherent generation が欠ける結果は precise `blocked` reason / non-zero かつ
+   injection stage `uncertain_partial` とし、同じ gateway command や本文を再実行しない。rail 内だけは body を再入力せず、
+   各 Enter より先の wait と fresh strict gate、public absolute budget の下で Enter-only retry できる。
+   timeout-only 系列は policy 上限まで反復できるが、wait error は次の Enter を許可せず即時停止する。
+10. **Herdr の wait command と tmux の marker wait を混同しない**。現行 Herdr 0.8 の event wait は
+    `agent wait TARGET --until STATUS --timeout MS` である。Herdr queue-enter は body 後に landing-marker
+    wait を挟まず、generation 再確認 → event wait arm → Enter の順で進む。
 
 ## Receiver-side recovery admission と、その保証境界 (Redmine #13910)
 

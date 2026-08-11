@@ -27,6 +27,7 @@ sources:
   - host_id: devcontainer
     kind: container
     container: workspace-dev
+    container_user: "1000:1000"
     via: devbox
 """
 
@@ -63,6 +64,7 @@ class LoaderTests(unittest.TestCase):
             [LOCAL_HOST_ID, "devbox", "devcontainer"],
         )
         self.assertEqual(config.by_id["devcontainer"].via, "devbox")
+        self.assertEqual(config.by_id["devcontainer"].container_user, "1000:1000")
 
     def test_duplicate_key_fails_closed_rather_than_taking_the_last_value(self) -> None:
         self.write(

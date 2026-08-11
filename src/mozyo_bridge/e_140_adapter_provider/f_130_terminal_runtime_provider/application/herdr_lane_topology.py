@@ -865,8 +865,16 @@ def _parse_workspace_created(stdout: object) -> Optional[tuple[str, str]]:
     return workspace_id, root_pane_id
 
 
-def _parse_started_agent_identity(stdout: object) -> Optional[tuple[str, str, str]]:
-    """``(pane_id, tab_id, native_name)`` from Herdr 0.8 ``agent start``."""
+def _parse_started_agent_identity(
+    stdout: object,
+) -> Optional[tuple[str, str, str, str]]:
+    """``(pane_id, tab_id, native_name, terminal_id)`` from Herdr 0.8 start.
+
+    ``terminal_id`` is required and exact.  It is the only per-process fingerprint in
+    the same response as the launch receipt; accepting a missing/normalised value would
+    make a later inventory read capable of joining an older launch token to a replacement
+    terminal (Redmine #15242).
+    """
     if not isinstance(stdout, str):
         return None
     try:
@@ -883,9 +891,16 @@ def _parse_started_agent_identity(stdout: object) -> Optional[tuple[str, str, st
         return None
     pane_id = _norm(agent.get("pane_id"))
     native_name = _norm(agent.get("name"))
-    if not pane_id or not native_name:
+    terminal_id = agent.get("terminal_id")
+    if (
+        not pane_id
+        or not native_name
+        or type(terminal_id) is not str
+        or not terminal_id
+        or terminal_id.strip() != terminal_id
+    ):
         return None
-    return pane_id, _norm(agent.get("tab_id")), native_name
+    return pane_id, _norm(agent.get("tab_id")), native_name, terminal_id
 
 
 def _parse_started_agent(stdout: object) -> Optional[tuple[str, str]]:

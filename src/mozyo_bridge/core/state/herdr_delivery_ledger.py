@@ -522,6 +522,7 @@ def build_herdr_delivery_ledger_record(
     *,
     provider: Optional[str] = None,
     backend: Optional[str] = None,
+    rail: Optional[str] = None,
     retry: Optional[dict] = None,
     disposition: Optional[str] = None,
     entry_kind: str = ENTRY_DELIVERY_OUTCOME,
@@ -541,7 +542,10 @@ def build_herdr_delivery_ledger_record(
     the #13255 / #13292 layers', not the ledger's. ``provider`` and ``backend`` are
     not on the transport outcome, so the caller supplies them (the caller knows the
     provider binding and the terminal backend); ``backend`` defaults to ``herdr``
-    when either herdr telemetry field is present and the caller passed none.
+    when either herdr telemetry field is present and the caller passed none.  A
+    transport exception may occur before queue telemetry exists, so its Herdr
+    caller explicitly supplies the closed ``rail`` value; that override is
+    accepted only with an absent or ``herdr`` backend.
     """
     turn_start_outcome = getattr(outcome, "turn_start_outcome", None)
     if not isinstance(turn_start_outcome, dict):
@@ -552,9 +556,16 @@ def build_herdr_delivery_ledger_record(
     if not isinstance(queue_enter_observation, dict):
         queue_enter_observation = None
 
-    rail = _rail_for(turn_start_outcome, queue_enter_observation)
+    derived_rail = _rail_for(turn_start_outcome, queue_enter_observation)
+    if rail is not None and rail not in (RAIL_EVENT, RAIL_QUEUE_ENTER, RAIL_OTHER):
+        raise ValueError("unknown herdr delivery ledger rail")
+    resolved_rail = rail or derived_rail
+    # A caller-supplied rail is reserved for the Herdr terminal path.  Keep the
+    # legacy no-override builder compatible with explicit non-Herdr backends.
+    if rail is not None and backend not in (None, BACKEND_HERDR):
+        raise ValueError("unknown herdr delivery ledger backend")
     resolved_backend = backend
-    if resolved_backend is None and rail in (RAIL_EVENT, RAIL_QUEUE_ENTER):
+    if resolved_backend is None and resolved_rail in (RAIL_EVENT, RAIL_QUEUE_ENTER):
         resolved_backend = BACKEND_HERDR
 
     anchor = getattr(outcome, "anchor", None)
@@ -568,7 +579,7 @@ def build_herdr_delivery_ledger_record(
         receiver=getattr(outcome, "receiver", None),
         provider=provider,
         backend=resolved_backend,
-        rail=rail,
+        rail=resolved_rail,
         target=getattr(outcome, "target", None),
         source=getattr(outcome, "source", None) or anchor.get("source"),
         issue_id=issue_id,
@@ -589,6 +600,7 @@ def record_herdr_delivery(
     *,
     provider: Optional[str] = None,
     backend: Optional[str] = None,
+    rail: Optional[str] = None,
     retry: Optional[dict] = None,
     disposition: Optional[str] = None,
     entry_kind: str = ENTRY_DELIVERY_OUTCOME,
@@ -607,6 +619,7 @@ def record_herdr_delivery(
             outcome,
             provider=provider,
             backend=backend,
+            rail=rail,
             retry=retry,
             disposition=disposition,
             entry_kind=entry_kind,

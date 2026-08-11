@@ -334,9 +334,10 @@ flag には結合しない (別々に選べる) が、純 herdr 運用では両�
      --env KEY=VALUE ... --no-focus
    ```
 
-   `result.type=pane_info`と`result.pane.{pane_id,workspace_id,tab_id}`をexactに検証する。成功直後、
-   `pane_bound_v1` receipt（workspace/tab/native identity）をstartup transactionへ記録し、それ以前に
-   `agent start`を実行しない。
+   `result.type=pane_info`と`result.pane.{pane_id,workspace_id,tab_id,terminal_id}`をexactに検証する。成功直後、
+   `pane_bound_v2` receipt（workspace/tab/native/terminal identity）をstartup transactionへ記録し、それ以前に
+   `agent start`を実行しない。`pane_bound_v1`は既存recordの解析互換だけに残し、新しいlaunch authorityや
+   queue-enterのterminal-generation proofには使わない。
 5. 作成したexact paneへ`pane run`でcanonical provider名のshell functionを定義する。関数は
    action-private shimをabsolute pathで`exec`し、当該paneのshellだけに存在する。これによりlogin-shell
    startup後にもshimを解決でき、global PATH・他pane・provider子processへaliasを漏らさない。その後、
@@ -348,7 +349,9 @@ flag には結合しない (別々に選べる) が、純 herdr 運用では両�
 
    `pane run`の非zeroまたは`agent start`の非zeroはfail-closed。split直後のshell準備中にHerdrがtyped
    `agent_pane_busy`を返した場合だけ、同一pane・同一argvを最大30回、0.1秒間隔で再試行する。他の理由は
-   再試行しない。`result.type=agent_started`、返却pane、tab、native nameを準備済み値と照合する。長い`mzb1`はwrapper
+   再試行しない。`result.type=agent_started`、返却pane、tab、native name、terminal idを準備済み値と照合する。
+   split応答と`agent_started`応答のterminal idが異なる場合は、locatorが同じでもfail-closedとし、v2 receiptは
+   split応答で得たterminal idを保持する。長い`mzb1`はwrapper
    の`--assigned-name`とself-attestation recordへ保持し、Herdrへ直接渡さない。split直後のlogin shell
    準備中だけHerdr 0.8が返すtyped `agent_pane_busy`は、同じexact pane・同じargvに限り0.1秒間隔、
    最大30回で再試行する。他のerror、typed codeを読めない応答、上限到達は即時fail-closedとする。
@@ -359,6 +362,33 @@ flag には結合しない (別々に選べる) が、純 herdr 運用では両�
 
 この移行はHerdr downgradeや旧CLI fallbackを持たない。0.8 surfaceが確認できないruntimeは修復対象で
 あり、別形式へ自動分岐しない。
+
+#### terminal-bound receiptへの更新
+
+候補版へ更新する前から動いているpairの`pane_bound_v1`は解析可能だが、現在のterminalがそのlaunch transactionの
+side effectだという証拠を持たない。そのため、そのpairへのHerdr `queue-enter`は本文入力前に
+`target_unavailable`でfail-closedする。`session-start`をlive pairへ再実行してもexact-name slotをadoptするだけで、
+receiptやlaunch generationは更新されない。DB retryやschema migrationも過去のterminal provenanceを生成できず、
+既存live pairを自動的に強いauthorityへ昇格させない。
+
+lifecycle rowを持たない**非default scratch pair**だけは、exact candidate runtimeを使い、次の公開railでv2へ
+置き換えられる。1行目はread-only preflightであり、green判定とこのpairを閉じる明示承認の後にだけ2行目を実行する。
+positive absence / retired proofを確認してからfresh startへ進む。
+
+```bash
+mozyo-bridge herdr session-retire --lane <lane> --repo <root> --json
+mozyo-bridge herdr session-retire --lane <lane> --repo <root> --execute --json
+mozyo-bridge herdr session-start --agent codex --agent claude --lane <lane> --repo <root> --json
+```
+
+このretireはpairを閉じるがworktree / branch / commitは削除しない。lifecycle row present、default lane、inventory
+unreadable、duplicate / foreign / unlocatable slot、busy agent、未承認pending composer、durable obligationは
+fail-closedする。
+
+**lifecycle-managed active pairとdefault coordinatorには、receiptだけをv1→v2へ安全に更新する汎用public railが
+現時点でない。** `sublane retire`は業務完了後のterminal retirement、hibernate / recoveryはそれぞれの正当な
+前提を持つ別railであり、receipt refreshのために条件を偽装しない。この2 classの一般移行runbookは未成立で、
+専用の外部実行型refresh railまたは明示したcompatibility判断がrelease前に必要である。
 
 flow:
 

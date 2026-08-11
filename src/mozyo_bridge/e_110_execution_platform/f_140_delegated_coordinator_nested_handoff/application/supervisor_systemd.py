@@ -153,7 +153,7 @@ REASON_LIFECYCLE_BUSY = "scheduler_lifecycle_busy"
 REASON_LIFECYCLE_LOCK_UNREADABLE = "scheduler_lifecycle_lock_unreadable"
 #: Typed manager state could not be read without trusting raw text.
 REASON_MANAGER_DEFINITION_UNREADABLE = "manager_effective_definition_unreadable"
-#: The loaded definition differs from the exact owned command/home/path/timer contract.
+#: The loaded definition differs from the exact owned command, home, path, and timer contract.
 REASON_MANAGER_DEFINITION_DRIFT = "manager_effective_definition_drift"
 REASON_START_FAILED = "systemctl_start_failed"
 REASON_STOP_FAILED = "systemctl_stop_failed"

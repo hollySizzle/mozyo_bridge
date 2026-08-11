@@ -25,10 +25,19 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SublaneActuatorOps,
     format_actuate_text,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_ops import (  # noqa: E501
+    SublaneDispatchAttempt,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (  # noqa: E501
+    STAGE_NOT_SENT,
+    STAGE_SUBMITTED_CONFIRMED,
+    STAGE_UNCERTAIN_PARTIAL,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
     ACTUATE_BLOCKED,
     ACTUATE_EXECUTED,
     ACTUATE_READY,
+    DISPATCH_DELIVERY_UNCERTAIN,
     DISPATCH_GATEWAY_NOTIFIED,
     DISPATCH_SKIPPED,
     REASON_ANCHOR_REQUIRED,
@@ -719,10 +728,15 @@ class HealCapableFakeOps(FakeActuatorOps):
     value sticky) so a first-fails / retry-succeeds sequence is expressible.
     """
 
-    def __init__(self, *, heal_error=None, dispatch_rcs=(0,), **kw):
+    def __init__(
+        self, *, heal_error=None, dispatch_rcs=(0,), dispatch_stages=None, **kw
+    ):
         super().__init__(**kw)
         self._heal_error = heal_error
         self._dispatch_rcs = list(dispatch_rcs)
+        self._dispatch_stages = (
+            list(dispatch_stages) if dispatch_stages is not None else None
+        )
 
     def heal_lane_column(self, worktree_path):
         self.calls.append(("heal_lane_column", worktree_path))
@@ -736,6 +750,16 @@ class HealCapableFakeOps(FakeActuatorOps):
         if len(self._dispatch_rcs) > 1:
             return self._dispatch_rcs.pop(0)
         return self._dispatch_rcs[0] if self._dispatch_rcs else 0
+
+    def dispatch_implementation_request_result(self, **kwargs):
+        rc = self.dispatch_implementation_request(**kwargs)
+        if self._dispatch_stages is None:
+            stage = STAGE_SUBMITTED_CONFIRMED if rc == 0 else STAGE_NOT_SENT
+        elif len(self._dispatch_stages) > 1:
+            stage = self._dispatch_stages.pop(0)
+        else:
+            stage = self._dispatch_stages[0]
+        return SublaneDispatchAttempt.typed(rc, stage)
 
 
 class DispatchSelfHealTests(unittest.TestCase):
@@ -765,6 +789,10 @@ class DispatchSelfHealTests(unittest.TestCase):
         outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
         self.assertEqual(outcome.status, ACTUATE_EXECUTED)
         self.assertEqual(outcome.dispatch_result, DISPATCH_GATEWAY_NOTIFIED)
+        self.assertEqual(
+            outcome.dispatch_injection_stage, STAGE_SUBMITTED_CONFIRMED
+        )
+        self.assertTrue(outcome.dispatch_blind_retry_prohibited)
         # The outcome carries the RELAUNCHED gateway locator, not the vanished one.
         self.assertEqual(outcome.gateway_pane, "%130")
         self.assertEqual(outcome.dispatch_target, "%130")
@@ -778,6 +806,74 @@ class DispatchSelfHealTests(unittest.TestCase):
         self.assertIn("dispatch implementation_request (retry)", titles)
         dispatches = [c for c in ops.calls if isinstance(c, tuple) and c[0] == "dispatch"]
         self.assertEqual(dispatches[-1][1]["gateway_pane"], "%130")
+
+    def test_typed_success_stage_reaches_public_payload_and_journal(self):
+        ops = HealCapableFakeOps(
+            git=True,
+            lanes=[None, _lane()],
+            dispatch_rcs=(0,),
+            dispatch_stages=(STAGE_SUBMITTED_CONFIRMED,),
+        )
+
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        payload = outcome.as_payload()
+        journal = render_actuation_journal(outcome)
+
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        self.assertEqual(outcome.dispatch_result, DISPATCH_GATEWAY_NOTIFIED)
+        self.assertEqual(
+            payload["dispatch_injection_stage"], STAGE_SUBMITTED_CONFIRMED
+        )
+        self.assertTrue(payload["dispatch_blind_retry_prohibited"])
+        self.assertIn(
+            "- dispatch_injection_stage: submitted_confirmed", journal
+        )
+        self.assertIn(
+            "- dispatch_blind_retry_prohibited: true", journal
+        )
+
+    def test_uncertain_vanished_gateway_never_replays_full_body(self):
+        ops = self._healable(
+            lanes=[None, _lane(), _lane(gateway=None)],
+            dispatch_rcs=(2,),
+            dispatch_stages=(STAGE_UNCERTAIN_PARTIAL,),
+            gateway_ready=False,
+        )
+
+        outcome = SublaneActuateUseCase(
+            ops,
+            gateway_ready_probes=1,
+            gateway_ready_interval_seconds=0,
+        ).run(_req(), execute=True)
+
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertEqual(outcome.dispatch_result, DISPATCH_DELIVERY_UNCERTAIN)
+        self.assertEqual(
+            outcome.dispatch_injection_stage, STAGE_UNCERTAIN_PARTIAL
+        )
+        self.assertTrue(outcome.dispatch_blind_retry_prohibited)
+        self.assertEqual(ops._names().count("dispatch"), 1)
+        self.assertNotIn("heal_lane_column", ops._names())
+        self.assertIn("body and/or Enter may have reached", outcome.reason)
+        rendered = format_actuate_text(outcome)
+        self.assertIn("blind retry prohibited", rendered)
+        self.assertNotIn("subsequently confirmed", rendered)
+
+    def test_untyped_nonzero_never_authorises_heal_replay(self):
+        class UntypedHealOps(HealCapableFakeOps):
+            dispatch_implementation_request_result = None
+
+        ops = UntypedHealOps(
+            git=True,
+            lanes=[None, _lane(), _lane(gateway=None)],
+            dispatch_rcs=(1, 0),
+        )
+
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+
+        self.assertEqual(outcome.dispatch_result, DISPATCH_DELIVERY_UNCERTAIN)
+        self.assertEqual(ops._names().count("dispatch"), 1)
+        self.assertNotIn("heal_lane_column", ops._names())
 
     def test_gateway_still_resolvable_blocks_without_heal(self):
         # The dispatch failed but the gateway is still live on read-back: not the
@@ -1218,17 +1314,19 @@ class GatewayReadinessContractTests(unittest.TestCase):
         self.assertTrue(outcome.gateway_ready)
         self.assertEqual(slept, [0.5, 0.5])
 
-    def test_never_ready_degrades_but_still_dispatches(self):
-        # The rail is never hard-blocked: an unconfirmed readiness dispatches anyway.
+    def test_never_ready_degrades_but_still_runs_governed_dispatch(self):
+        # Gateway readiness is an observation, not delivery authority: a miss is
+        # recorded, then the governed handoff rail independently admits or blocks the
+        # actual send. This fake models the admitted/successful transport case.
         ops = FakeActuatorOps(git=True, lanes=[None, _lane()], gateway_ready=False)
         slept = []
         outcome = SublaneActuateUseCase(
             ops, gateway_ready_probes=3, sleep=slept.append
         ).run(_req(), execute=True)
-        self.assertEqual(outcome.status, ACTUATE_EXECUTED)  # NOT blocked
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
         self.assertFalse(outcome.gateway_ready)
         self.assertEqual(outcome.dispatch_result, DISPATCH_GATEWAY_NOTIFIED)
-        self.assertIn("dispatch", ops._names())  # dispatch still happened
+        self.assertIn("dispatch", ops._names())
         # probed the full window (3 probes, 2 back-offs) then degraded
         self.assertEqual(slept, [0.5, 0.5])
         readiness = _step(outcome, "confirm gateway readiness")

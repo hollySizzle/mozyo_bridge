@@ -47,7 +47,12 @@ from mozyo_bridge.core.state.startup_transaction_fence import (
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_generation_binding import (  # noqa: E501
     finalize_launch_generations,
     reserve_launch_generations,
+    verified_terminal_generation_token,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
+    pane_bound_receipt,
+)
+from mozyo_bridge.core.state.herdr_native_identity_binding import native_name_for
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     _norm,
     _norm_lane,
@@ -58,7 +63,14 @@ ROLE = "codex"
 LANE = "issue_x_lane"
 LOCATOR = "w:3"
 NAME = "gw"
-TERMINAL = "terminal:w:3"
+TERMINAL_ID = "terminal-A"
+TERMINAL = TERMINAL_ID
+PANE_BOUND_V2_RECEIPT = pane_bound_receipt(
+    target_workspace="w1",
+    target_tab="w1:t1",
+    native_name=native_name_for(NAME),
+    terminal_id=TERMINAL_ID,
+)
 
 
 def _tmp() -> Path:
@@ -67,7 +79,8 @@ def _tmp() -> Path:
 
 def _seed_fence_success(
     home: Path, *, nonce: str, name=NAME, role=ROLE, lane=LANE, locator=LOCATOR,
-    workspace=WS, closed=False, terminal_success=True, receipt="rcpt",
+    workspace=WS, closed=False, terminal_success=True,
+    receipt=PANE_BOUND_V2_RECEIPT,
 ) -> str:
     """Reserve a startup transaction, record this gateway as its participant, drive it to
     ``completed_success`` (or a non-terminal phase). Returns the fence action id (token)."""
@@ -111,6 +124,66 @@ def _token_for(home: Path, *, name=NAME, role=ROLE, lane=LANE, locator=LOCATOR,
         home, assigned_name=name, workspace_id=workspace, role=role, lane_id=lane,
         locator=locator, live_terminal_id=TERMINAL, norm=_norm, norm_lane=_norm_lane,
     )
+
+
+class TerminalGenerationReceiptRegression(unittest.TestCase):
+    """The current terminal may use only the receipt minted by its own launch."""
+
+    def test_terminal_a_receipt_cannot_authorise_replacement_terminal_b(self):
+        home = _tmp()
+        token = _seed_fence_success(home, nonce="terminal-A")
+        _seed_generation(home, token)
+
+        common = dict(
+            assigned_name=NAME,
+            workspace_id=WS,
+            role=ROLE,
+            lane_id=LANE,
+            locator=LOCATOR,
+            norm=_norm,
+            norm_lane=_norm_lane,
+        )
+        self.assertEqual(
+            verified_terminal_generation_token(
+                home, terminal_id=TERMINAL_ID, **common
+            ),
+            token,
+        )
+        self.assertEqual(
+            verified_terminal_generation_token(
+                home, terminal_id="terminal-B", **common
+            ),
+            "",
+        )
+
+    def test_readable_v1_receipt_is_not_strong_terminal_authority(self):
+        home = _tmp()
+        v1_receipt = pane_bound_receipt(
+            target_workspace="w1",
+            target_tab="w1:t1",
+            native_name=native_name_for(NAME),
+        )
+        token = _seed_fence_success(
+            home,
+            nonce="legacy-v1",
+            receipt=v1_receipt,
+        )
+        _seed_generation(home, token)
+
+        self.assertEqual(
+            verified_terminal_generation_token(
+                home,
+                assigned_name=NAME,
+                workspace_id=WS,
+                role=ROLE,
+                lane_id=LANE,
+                locator=LOCATOR,
+                terminal_id=TERMINAL_ID,
+                norm=_norm,
+                norm_lane=_norm_lane,
+            ),
+            "",
+        )
 
 
 def _seed_v1_attestation_store(home: Path) -> Path:
@@ -387,7 +460,12 @@ class R7DiagnosticOnlyEvents(unittest.TestCase):
     """7. A startup execution event is diagnostic-only — never a close authority alone."""
 
     def _slot(self, **over):
-        base = dict(assigned_name=NAME, provider=ROLE, locator=LOCATOR)
+        base = dict(
+            assigned_name=NAME,
+            provider=ROLE,
+            locator=LOCATOR,
+            launch_terminal_id=TERMINAL_ID,
+        )
         base.update(over)
         return SimpleNamespace(**base)
 
@@ -426,6 +504,140 @@ class R7DiagnosticOnlyEvents(unittest.TestCase):
         )
         self.assertEqual(HerdrLaunchGenerationStore(home=home).read(NAME).phase,
                          GENERATION_ATTESTED)
+
+    def test_receipt_terminal_mismatch_leaves_generation_pending(self):
+        home = _tmp()
+        token = _seed_fence_success(home, nonce="terminal-mismatch")
+        reserve_launch_generations(
+            store_home=home, startup_action_id=token,
+            launch_plans=[self._slot()], workspace_id=WS, lane_id=LANE,
+        )
+        append_execution_event(
+            StartupTransactionFence(home=home), token,
+            STAGE_ATTESTATION_WRITE_SUCCEEDED, participant=NAME,
+        )
+
+        finalize_launch_generations(
+            store_home=home,
+            startup_action_id=token,
+            slots=[self._slot(launch_terminal_id="terminal-B")],
+            workspace_id=WS,
+            lane_id=LANE,
+            attestation_read=lambda _name: self._attestation(),
+            inventory_rows=[
+                {"name": NAME, "pane_id": LOCATOR, "terminal_id": "terminal-B"}
+            ],
+        )
+
+        self.assertEqual(
+            HerdrLaunchGenerationStore(home=home).read(NAME).phase,
+            GENERATION_PENDING,
+        )
+
+    def test_inventory_terminal_only_mismatch_leaves_generation_pending(self):
+        home = _tmp()
+        token = _seed_fence_success(home, nonce="inventory-terminal-mismatch")
+        self._reserve(home, token)
+        append_execution_event(
+            StartupTransactionFence(home=home), token,
+            STAGE_ATTESTATION_WRITE_SUCCEEDED, participant=NAME,
+        )
+        finalize_launch_generations(
+            store_home=home, startup_action_id=token, slots=[self._slot()],
+            workspace_id=WS, lane_id=LANE,
+            attestation_read=lambda _name: self._attestation(),
+            inventory_rows=iter((
+                {"name": NAME, "pane_id": LOCATOR, "terminal_id": "terminal-B"},
+            )),
+        )
+        self.assertEqual(
+            HerdrLaunchGenerationStore(home=home).read(NAME).phase,
+            GENERATION_PENDING,
+        )
+
+    def test_attestation_terminal_only_mismatch_leaves_generation_pending(self):
+        home = _tmp()
+        token = _seed_fence_success(home, nonce="attestation-terminal-mismatch")
+        self._reserve(home, token)
+        append_execution_event(
+            StartupTransactionFence(home=home), token,
+            STAGE_ATTESTATION_WRITE_SUCCEEDED, participant=NAME,
+        )
+        finalize_launch_generations(
+            store_home=home, startup_action_id=token, slots=[self._slot()],
+            workspace_id=WS, lane_id=LANE,
+            attestation_read=lambda _name: self._attestation(terminal_id="terminal-B"),
+            inventory_rows=[
+                {"name": NAME, "pane_id": LOCATOR, "terminal_id": TERMINAL}
+            ],
+        )
+        self.assertEqual(
+            HerdrLaunchGenerationStore(home=home).read(NAME).phase,
+            GENERATION_PENDING,
+        )
+
+    def test_receipt_native_only_mismatch_leaves_generation_pending(self):
+        home = _tmp()
+        receipt = pane_bound_receipt(
+            target_workspace="w1", target_tab="w1:t1",
+            native_name=native_name_for("foreign-name"), terminal_id=TERMINAL,
+        )
+        token = _seed_fence_success(
+            home, nonce="receipt-native-mismatch", receipt=receipt
+        )
+        self._reserve(home, token)
+        append_execution_event(
+            StartupTransactionFence(home=home), token,
+            STAGE_ATTESTATION_WRITE_SUCCEEDED, participant=NAME,
+        )
+        finalize_launch_generations(
+            store_home=home, startup_action_id=token, slots=[self._slot()],
+            workspace_id=WS, lane_id=LANE,
+            attestation_read=lambda _name: self._attestation(),
+            inventory_rows=[
+                {"name": NAME, "pane_id": LOCATOR, "terminal_id": TERMINAL}
+            ],
+        )
+        self.assertEqual(
+            HerdrLaunchGenerationStore(home=home).read(NAME).phase,
+            GENERATION_PENDING,
+        )
+
+    def test_legacy_v1_receipt_cannot_finalize_terminal_generation(self):
+        home = _tmp()
+        v1_receipt = pane_bound_receipt(
+            target_workspace="w1",
+            target_tab="w1:t1",
+            native_name=native_name_for(NAME),
+        )
+        token = _seed_fence_success(
+            home, nonce="legacy-v1-finalize", receipt=v1_receipt
+        )
+        reserve_launch_generations(
+            store_home=home, startup_action_id=token,
+            launch_plans=[self._slot()], workspace_id=WS, lane_id=LANE,
+        )
+        append_execution_event(
+            StartupTransactionFence(home=home), token,
+            STAGE_ATTESTATION_WRITE_SUCCEEDED, participant=NAME,
+        )
+
+        finalize_launch_generations(
+            store_home=home,
+            startup_action_id=token,
+            slots=[self._slot()],
+            workspace_id=WS,
+            lane_id=LANE,
+            attestation_read=lambda _name: self._attestation(),
+            inventory_rows=[
+                {"name": NAME, "pane_id": LOCATOR, "terminal_id": TERMINAL}
+            ],
+        )
+
+        self.assertEqual(
+            HerdrLaunchGenerationStore(home=home).read(NAME).phase,
+            GENERATION_PENDING,
+        )
 
     def test_the_write_succeeded_event_alone_never_finalizes(self):
         # A wrapper execution event WITHOUT the main attestation is diagnostic-only — it must

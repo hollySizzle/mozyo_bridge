@@ -261,17 +261,21 @@ class Participant:
     role: str
     assigned_name: str
     locator: str
-    receipt: str = ""
+    receipt: str = field(default="", repr=False)
     closed: bool = False
 
     def as_payload(self) -> dict:
+        """Return the public projection; private pane receipts are deliberately omitted."""
         return {
             "role": self.role,
             "assigned_name": self.assigned_name,
             "locator": self.locator,
-            "receipt": self.receipt,
             "closed": self.closed,
         }
+
+    def as_authority_payload(self) -> dict:
+        """Return the exact private on-disk authority shape."""
+        return {**self.as_payload(), "receipt": self.receipt}
 
     @staticmethod
     def from_payload(raw: dict) -> "Participant":
@@ -378,6 +382,13 @@ class StartupAction:
             "participants": [p.as_payload() for p in self.participants],
             "reserved_at": self.reserved_at,
             "updated_at": self.updated_at,
+        }
+
+    def as_authority_payload(self) -> dict:
+        """Return the private fingerprint/storage projection including receipts."""
+        return {
+            **self.as_payload(),
+            "participants": [p.as_authority_payload() for p in self.participants],
         }
 
 
@@ -879,7 +890,7 @@ class StartupTransactionFence:
                     " ?, revision = revision + 1 WHERE action_id = ?",
                     (
                         phase,
-                        json.dumps([p.as_payload() for p in participants]),
+                        json.dumps([p.as_authority_payload() for p in participants]),
                         _utc_now(),
                         _norm(action_id),
                     ),

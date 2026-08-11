@@ -44,7 +44,17 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     project_sublanes,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (
+    DISPATCH_DELIVERY_NOT_SENT,
+    DISPATCH_DELIVERY_UNCERTAIN,
+    DISPATCH_GATEWAY_NOTIFIED,
     SublaneStartupObservation,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (
+    INJECTION_STAGES,
+    STAGE_NOT_SENT,
+    STAGE_SUBMITTED_CONFIRMED,
+    STAGE_UNCERTAIN_PARTIAL,
+    blind_retry_prohibited,
 )
 
 
@@ -54,14 +64,95 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 # ``DEFAULT_GATEWAY_READY_INTERVAL_SECONDS`` apart (≈ a 10s window by default) so a
 # freshly-launched Codex TUI has time to boot before the queue-enter dispatch — the
 # j#72677 / 5-example dispatch-loss failure mode was 100% "dispatch typed into a still-
-# booting composer". The wait NEVER hard-blocks the queue-enter rail: an unconfirmed
-# readiness degrades to a recorded ``gateway_ready=false`` and dispatches anyway.
+# booting composer". The probe itself is advisory: an unconfirmed result is recorded as
+# ``gateway_ready=false``; the governed send still independently confirms or fails closed.
 # ---------------------------------------------------------------------------
 
 DEFAULT_GATEWAY_READY_PROBES = 20
 DEFAULT_GATEWAY_READY_INTERVAL_SECONDS = 0.5
 #: How many rendered lines the live readiness probe captures from the gateway pane.
 GATEWAY_READY_CAPTURE_LINES = 40
+
+
+# ---------------------------------------------------------------------------
+# Gateway dispatch result boundary (#15242).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SublaneDispatchAttempt:
+    """One gateway send result without collapsing delivery stage into an rc.
+
+    ``injection_stage is None`` is the legacy tmux/int adapter shape.  Its zero rc
+    remains compatible success, while a non-zero untyped result is uncertain and
+    never authorises self-heal replay.  Herdr supplies a shared injection-stage token;
+    a non-zero/confirmed contradiction is normalised to uncertain.
+    """
+
+    exit_code: int
+    injection_stage: Optional[str] = None
+
+    @classmethod
+    def typed(cls, exit_code: object, injection_stage: object) -> "SublaneDispatchAttempt":
+        code = exit_code if type(exit_code) is int else 1
+        stage = (
+            injection_stage
+            if type(injection_stage) is str and injection_stage in INJECTION_STAGES
+            else STAGE_UNCERTAIN_PARTIAL
+        )
+        if code != 0 and stage == STAGE_SUBMITTED_CONFIRMED:
+            stage = STAGE_UNCERTAIN_PARTIAL
+        return cls(code, stage)
+
+    @classmethod
+    def untyped(cls, exit_code: object) -> "SublaneDispatchAttempt":
+        return cls(exit_code if type(exit_code) is int else 1)
+
+    @property
+    def confirmed(self) -> bool:
+        return self.exit_code == 0 and self.injection_stage in (
+            None,
+            STAGE_SUBMITTED_CONFIRMED,
+        )
+
+    @property
+    def retry_safe(self) -> bool:
+        """Only explicit shared ``not_sent`` proof may replay the full body."""
+        return self.injection_stage == STAGE_NOT_SENT
+
+    @property
+    def public_result(self) -> str:
+        if self.confirmed:
+            return DISPATCH_GATEWAY_NOTIFIED
+        if self.retry_safe:
+            return DISPATCH_DELIVERY_NOT_SENT
+        return DISPATCH_DELIVERY_UNCERTAIN
+
+    @property
+    def public_injection_stage(self) -> Optional[str]:
+        if self.injection_stage is not None:
+            return self.injection_stage
+        return None if self.confirmed else STAGE_UNCERTAIN_PARTIAL
+
+    @property
+    def blind_retry_prohibited(self) -> bool:
+        if self.injection_stage is None:
+            return not self.confirmed
+        return blind_retry_prohibited(self.injection_stage)
+
+
+def drive_dispatch_implementation_request(
+    ops: object, **kwargs: object
+) -> SublaneDispatchAttempt:
+    """Use an optional typed port when present; keep legacy int adapters compatible."""
+    typed_drive = getattr(ops, "dispatch_implementation_request_result", None)
+    if callable(typed_drive):
+        result = typed_drive(**kwargs)
+        if type(result) is SublaneDispatchAttempt:
+            return result
+        return SublaneDispatchAttempt.typed(1, STAGE_UNCERTAIN_PARTIAL)
+    legacy_drive = getattr(ops, "dispatch_implementation_request")
+    return SublaneDispatchAttempt.untyped(legacy_drive(**kwargs))
 
 
 # ---------------------------------------------------------------------------
@@ -465,8 +556,10 @@ __all__ = (
     "DEFAULT_GATEWAY_READY_PROBES",
     "DEFAULT_GATEWAY_READY_INTERVAL_SECONDS",
     "GATEWAY_READY_CAPTURE_LINES",
+    "SublaneDispatchAttempt",
     "SublaneActuatorOps",
     "LiveSublaneActuatorOps",
+    "drive_dispatch_implementation_request",
     "resolve_lane_runtime_root",
     "decide_create_launch",
     "default_nongit_worktree_request",

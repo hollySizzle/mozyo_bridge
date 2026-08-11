@@ -328,10 +328,10 @@ def classify_composer_residue(
 
     Redmine #14232 (j#84877 required correction 2): this branch used to special-case
     ``marker_timeout`` alone and fold **every other** ``blocked`` onto ``not_typed``. That
-    misread the whole post-injection family as "nothing reached the receiver" — most
-    visibly the herdr ``delivered_not_started`` projection (``blocked`` /
-    ``turn_start_unconfirmed``), where body **and** Enter were injected before the event
-    wait timed out, and the new ``transport_error``, where a primitive raised mid-send.
+    misread the whole post-admission family as "nothing reached the receiver" — most
+    visibly the Herdr ``delivered_not_started`` projection (``blocked`` /
+    ``turn_start_unconfirmed``), where the body or an Enter may already have been injected,
+    and ``transport_error``, where a primitive raised at an unknown point in the send.
     Deriving the split from the shared authority instead of a local literal is what keeps
     the residue read and the retry decision from disagreeing again: a residue of
     ``not_typed`` invites exactly the blind retry the injection stage prohibits.
@@ -489,10 +489,11 @@ class SubmitOutcome:
 
         Redmine #14232 review j#95333 F1: this takes the whole
         :class:`...handoff.DeliveryOutcome`, not its two wire tokens. ``sent`` / ``ok`` is
-        ambiguous across rails — the marker-observed ``queue-enter`` cell reports it without
-        running any turn-start gate — so a two-token derivation confirmed deliveries the
-        outcome's own telemetry contradicted. ``outcome`` is ``None`` when the rail returned no
-        structured outcome at all (an early return, or a caller that never sent), which the
+        ambiguous across rails — tmux, legacy, or synthetic ``queue-enter`` outcomes can report
+        it without causal turn-start evidence — so a two-token derivation confirmed deliveries
+        the outcome's own telemetry contradicted. Herdr now requires the evidence. ``outcome`` is
+        ``None`` when the rail returned no structured outcome at all (an early return, or a
+        caller that never sent), which the
         authority fails closed to ``uncertain_partial``: the front door must not claim a
         delivery it cannot see.
 

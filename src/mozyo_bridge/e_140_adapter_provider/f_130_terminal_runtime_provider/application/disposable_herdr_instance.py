@@ -168,7 +168,7 @@ CLIENT_CALL_SUBCOMMANDS: frozenset = frozenset(
         ("pane", "location"),
         ("pane", "swap"),
         ("tab", "create"),
-        ("wait", "agent-status"),
+        ("agent", "wait"),
         ("config", "check-parse"),
     }
 )

@@ -157,9 +157,10 @@ def submit_lines_for(
         reason=outcome.reason,
         intent=intent,
         delivery_id=delivery_id,
-        # Review j#95333 F1: the residue classification needs the rail and its turn-start
-        # telemetry, not just the two wire tokens — `sent`/`ok` means "submitted" on the
-        # standard rail and only "typed + Enter pressed" on queue-enter.
+        # Review j#95333 F1: the residue classification needs the rail and its causal
+        # telemetry, not just the two wire tokens.  Herdr queue-enter confirms a turn
+        # before success, while tmux queue-enter remains a compatibility-level queued
+        # submission; the mode-specific evidence distinguishes those meanings.
         mode=outcome.mode,
         queue_enter_turn_start_observation=outcome.queue_enter_turn_start_observation,
         turn_start_outcome=outcome.turn_start_outcome,
@@ -565,7 +566,12 @@ def maybe_persist_delivery_record(
 
 
 def record_herdr_send_ledger(
-    outcome, *, retry_outcome: "QueueEnterRetryOutcome | None" = None
+    outcome,
+    *,
+    retry_outcome: "QueueEnterRetryOutcome | None" = None,
+    backend: str | None = None,
+    rail: str | None = None,
+    disposition: str | None = None,
 ) -> None:
     """Emit the #13296 herdr delivery-ledger record at a live herdr send-site (#13300).
 
@@ -587,4 +593,10 @@ def record_herdr_send_ledger(
     path never reaches it (close condition: tmux 経路不変).
     """
     retry = retry_outcome.to_dict() if retry_outcome is not None else None
-    record_herdr_delivery(outcome, retry=retry)
+    record_herdr_delivery(
+        outcome,
+        retry=retry,
+        backend=backend,
+        rail=rail,
+        disposition=disposition,
+    )

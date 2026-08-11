@@ -846,7 +846,9 @@ class HerdrLaunchGenerationStore:
             conn.close()
 
 
-def completed_generation_startup_token(home, generation, *, norm, norm_lane) -> str:
+def completed_generation_startup_token(
+    home, generation, *, norm, norm_lane, participant_receipt_matches=None
+) -> str:
     """Return the generation token only after exact startup success."""
     from mozyo_bridge.core.state.startup_transaction_fence import (
         PHASE_COMPLETED_SUCCESS, StartupTransactionError, StartupTransactionFence,
@@ -875,12 +877,20 @@ def completed_generation_startup_token(home, generation, *, norm, norm_lane) -> 
     participant = action.participant_for(role)
     if participant is None or getattr(participant, "closed", True):
         return ""
-    return token if (
+    if not (
         norm(getattr(participant, "assigned_name", ""))
         == norm(getattr(generation, "assigned_name", ""))
         and norm(getattr(participant, "locator", ""))
         == norm(getattr(generation, "locator", ""))
-    ) else ""
+    ):
+        return ""
+    if participant_receipt_matches is not None:
+        try:
+            if not participant_receipt_matches(getattr(participant, "receipt", "")):
+                return ""
+        except Exception:  # noqa: BLE001 - malformed receipt grants no authority
+            return ""
+    return token
 
 
 def verified_generation_token(
@@ -894,6 +904,7 @@ def verified_generation_token(
     live_terminal_id: object,
     norm,
     norm_lane,
+    participant_receipt_matches=None,
 ) -> str:
     """The attested generation token for this exact gateway, or ``""`` (read-only, j#87472).
 
@@ -938,7 +949,11 @@ def verified_generation_token(
     ):
         return ""
     return completed_generation_startup_token(
-        home, generation, norm=norm, norm_lane=norm_lane
+        home,
+        generation,
+        norm=norm,
+        norm_lane=norm_lane,
+        participant_receipt_matches=participant_receipt_matches,
     )
 
 

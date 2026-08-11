@@ -31,6 +31,7 @@ from mozyo_bridge.core.state.herdr_launch_generation import (
     LaunchGeneration,
     herdr_launch_generation_path,
 )
+from mozyo_bridge.core.state.herdr_native_identity_binding import native_name_for
 from tests.support.current_launch_authority import (
     seed_completed_current_generation,
     seed_current_generation,
@@ -40,6 +41,7 @@ from mozyo_bridge.core.state.startup_transaction_fence import (
     PHASE_HEALTH_CHECK,
     PHASE_ROLLBACK_OWED,
     Participant,
+    StartupAction,
     StartupTransactionFence,
     StartupUnit,
 )
@@ -64,6 +66,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_rollback_ops import (  # noqa: E501
     LiveStartupRollbackOps,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
+    pane_bound_receipt,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
     build_attest_capability_epilog,
@@ -138,11 +143,10 @@ class TerminalIdentityRegressionTests(unittest.TestCase):
             def observe_composer(self, _locator): return True, False
             def startup_blocker(self, _provider, _locator): return ""
             def open_obligations(self, _workspace, _names): return ()
-            def close_current_generation(self, action, targets, *, store_home):
-                return SimpleNamespace(
-                    closed=(),
-                    failed=tuple((role, locator, _TOKEN) for role, locator in targets),
-                )
+            def supports_conditional_close(self): return True
+            def close_agent_participant(self, **_kwargs): return False, _TOKEN
+            def close_prepared_pane(self, **_kwargs): return False, _TOKEN
+            def current_generation_targets_absent(self, *_args, **_kwargs): return False
             def prepared_pane(self, **_kwargs): raise AssertionError("not prepared")
 
         with tempfile.TemporaryDirectory() as raw:
@@ -153,7 +157,10 @@ class TerminalIdentityRegressionTests(unittest.TestCase):
             name, locator, terminal = "agent", "w1:p1", "terminal-current"
             fence.record_participant(action.action_id, Participant(
                 role="codex", assigned_name=name, locator=locator,
-                receipt="workspace=w1",
+                receipt=pane_bound_receipt(
+                    target_workspace="w1", target_tab="w1:t1",
+                    native_name=native_name_for(name), terminal_id=terminal,
+                ),
             ))
             fence.set_phase(action.action_id, PHASE_HEALTH_CHECK)
             seed_current_generation(
@@ -174,7 +181,7 @@ class TerminalIdentityRegressionTests(unittest.TestCase):
             self.assertNotIn(_TOKEN, repr(verdict))
             self.assertNotIn(_TOKEN, str(verdict.as_payload()))
 
-    def test_rollback_destructive_edge_rejoins_terminal_before_low_level_close(self):
+    def test_live_rollback_never_falls_back_to_locator_only_close(self):
         class _Retire:
             def __init__(self, rows):
                 self.rows = rows
@@ -210,17 +217,25 @@ class TerminalIdentityRegressionTests(unittest.TestCase):
             }])
             ops = LiveStartupRollbackOps.__new__(LiveStartupRollbackOps)
             ops._retire_ops = retire
-            refused = ops.close_current_generation(
-                action, [("codex", locator)], store_home=home
+            refused, _detail = ops.close_agent_participant(
+                workspace_id="ws", lane_id="lane",
+                target=SimpleNamespace(
+                    role="codex", assigned_name=name, locator=locator,
+                    native_name=native_name_for(name), terminal_id=terminal,
+                ),
             )
-            self.assertTrue(refused.failed)
+            self.assertFalse(refused)
             self.assertEqual(retire.close_calls, [])
             retire.rows[0]["terminal_id"] = terminal
-            closed = ops.close_current_generation(
-                action, [("codex", locator)], store_home=home
+            refused, _detail = ops.close_agent_participant(
+                workspace_id="ws", lane_id="lane",
+                target=SimpleNamespace(
+                    role="codex", assigned_name=name, locator=locator,
+                    native_name=native_name_for(name), terminal_id=terminal,
+                ),
             )
-            self.assertEqual(closed.closed, (("codex", locator),))
-            self.assertEqual(len(retire.close_calls), 1)
+            self.assertFalse(refused)
+            self.assertEqual(retire.close_calls, [])
 
     def test_public_rollback_never_closes_a_reused_locator_from_another_generation(self):
         class _Ops:
@@ -233,11 +248,11 @@ class TerminalIdentityRegressionTests(unittest.TestCase):
             def observe_composer(self, _locator): return True, False
             def startup_blocker(self, _provider, _locator): return ""
             def open_obligations(self, _workspace, _names): return ()
-            def close(self, _workspace, _lane, targets):
-                self.close_calls.append(tuple(targets))
-                return SimpleNamespace(closed=tuple(targets), failed=())
-            def close_current_generation(self, action, targets, *, store_home):
-                return self.close(action.unit.workspace_id, action.unit.lane_id, targets)
+            def supports_conditional_close(self): return True
+            def close_agent_participant(self, **_kwargs):
+                self.close_calls.append(_kwargs)
+                return True, ""
+            def current_generation_targets_absent(self, *_args, **_kwargs): return False
             def prepared_pane(self, **_kwargs): raise AssertionError("not prepared")
             def close_prepared_pane(self, **_kwargs): raise AssertionError("not prepared")
 
@@ -285,7 +300,10 @@ class TerminalIdentityRegressionTests(unittest.TestCase):
             action = fence.reserve(StartupUnit(workspace, lane, (role,)), "rollback-nonce")
             fence.record_participant(action.action_id, Participant(
                 role=role, assigned_name=assigned_name, locator=locator,
-                receipt="workspace=current",
+                receipt=pane_bound_receipt(
+                    target_workspace="w1", target_tab="w1:t1",
+                    native_name=native_name_for(assigned_name), terminal_id=terminal,
+                ),
             ))
             fence.set_phase(action.action_id, PHASE_HEALTH_CHECK)
             fence.set_phase(action.action_id, PHASE_ROLLBACK_OWED)
@@ -446,12 +464,43 @@ class TerminalIdentityRegressionTests(unittest.TestCase):
         )
         observed = _agent()
         private = PhaseExecutionResult(True, receipt={"terminal_id": _TOKEN})
+        participant = Participant(
+            role="codex", assigned_name="agent", locator="p1",
+            receipt=pane_bound_receipt(
+                target_workspace="w1", target_tab="w1:t1",
+                native_name=native_name_for("agent"), terminal_id=_TOKEN,
+            ),
+        )
+        action = StartupAction(
+            action_id="action", unit=StartupUnit("ws", "default", ("codex",)),
+            phase=PHASE_ROLLBACK_OWED, participants=(participant,),
+        )
         for rendered in (
             repr(record), str(record.as_payload()), repr(generation),
             str(generation.as_payload()), repr(observed), str(observed.to_record()),
-            repr(private),
+            repr(private), repr(participant), str(participant.as_payload()),
+            repr(action), str(action.as_payload()),
         ):
             self.assertNotIn(_TOKEN, rendered)
+        self.assertIn(_TOKEN, str(participant.as_authority_payload()))
+        self.assertIn(_TOKEN, str(action.as_authority_payload()))
+
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_herdr_queue_enter_rail import (  # noqa: E501
+            _canonical_private_generation_binding,
+            _public_generation_binding,
+        )
+        private_binding = {
+            "provider": "codex", "assigned_name": "agent", "locator": "p1",
+            "terminal_id": _TOKEN, "row_revision": "1",
+            "process_generation": f"5:agent:{len(_TOKEN)}:{_TOKEN}:2:p1:r1",
+            "attestation_observed_at": "2026-08-11T00:00:00+00:00",
+            "startup_action_id": "action",
+        }
+        self.assertTrue(_canonical_private_generation_binding(private_binding))
+        public_binding = _public_generation_binding(private_binding)
+        self.assertNotIn(_TOKEN, repr(public_binding))
+        self.assertNotIn("terminal_id", public_binding)
+        self.assertNotIn("process_generation", public_binding)
 
     def test_delivery_requires_canonical_v2_and_every_generation_axis(self):
         boundary = FreshGenerationBoundary(

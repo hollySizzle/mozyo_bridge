@@ -50,6 +50,7 @@ sources:
   - host_id: devcontainer
     kind: container
     container: <container 名>
+    container_user: <Herdr serverを所有するname|uid[:group|gid]>  # optional
     via: devbox               # 1 hop のみ。container 経由の container は拒否
 ```
 
@@ -63,16 +64,24 @@ sources:
   Unicode 正規化・空白圧縮で同一表示になりうる）。
 - `kind` ごとに許可 key を固定し、未知 key・misplaced key・重複 key・version 不一致は
   fail-closed。`yaml.safe_load` の duplicate key は宣言順で解決せず拒否する。
-- 接続値 (`ssh_target` / `container` / `mozyo_binary`) は argv 構築の入力にすぎない。
+- 接続値 (`ssh_target` / `container` / `container_user` / `mozyo_binary`) は argv 構築の入力にすぎない。
   payload、描画行、refusal detail のいずれにも出さない。private かどうかは **field で決める**。
   `mozyo_binary` は既定値を保持しているときだけ「この tool の名前」として除外し、
-  `ssh_target` / `container` は**内容に関わらず常に private**（既定 binary と同じ綴りの宛先も宛先である）。
+  `ssh_target` / `container` / `container_user` は**内容に関わらず常に private**
+  （既定 binary と同じ綴りの宛先も宛先である）。
 - **公開 field (`host_id` / `label`) が接続値を繰り返す設定は拒否する。** 両 field は board が
   publish するため、そこに接続値が入れば operator-scoped file へ隔離した意味が失われる。
   same-source（自分の接続値）と cross-source（他 source の接続値）の双方を検査し、label 未指定時に
   host_id を既定にする経路も同じ検査を通す。
 - source 数と接続 timeout は bound する (`MAX_SOURCES` / `MAX_CONNECT_TIMEOUT_SECONDS`)。
   1 refresh あたり source ごとに 1 接続が発生するため。
+- `container_user` は container source だけに指定できる。container の既定 user と Herdr server の
+  所有 user が異なる Dev Container では、指定しない問い合わせは別 user の runtime を見るため、
+  明示値を使う。値は bounded な `name|uid[:group|gid]` の 1 token に限定し、指定時だけ
+  `exec --user <value>` を使う。失敗時に既定 user や root へ fallback しない。
+- `container_user` は実行 user だけを選ぶ。`HOME` / `MOZYO_BRIDGE_HOME` などの environment を
+  推測・上書きする契約ではない。対象 container は、指定 user の通常環境から正しい Herdr runtime
+  を解決できるよう構成する。追加の environment override が必要な場合は別の明示的契約として扱う。
 
 ### argv 形状 (arbitrary remote shell を作らない)
 
@@ -84,7 +93,7 @@ remote command 1 箇所だけで、そこは token ごとに `shlex.quote` す�
 | --- | --- |
 | `local` | in-process 観測 (subprocess を作らない) |
 | `ssh` | `ssh -o BatchMode=yes -o ConnectTimeout=<n> -T -- <target> '<quoted command>'` |
-| `container` | `<docker\|podman> exec <container> mozyo-bridge ...` |
+| `container` | `<docker\|podman> exec [--user <name\|uid[:group\|gid]>] <container> mozyo-bridge ...` |
 | `container` + `via: <ssh>` | 上記 exec argv を ssh remote command として 1 hop nest |
 
 `BatchMode=yes` は必須である。到達不能・未認証の host が password prompt で block すると
@@ -248,20 +257,41 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   **strict landing observation または operator/debug 目的で明示選択する場合のみ**残す
   (`--delivery-mode`)。既定へ落とし込まない。mode は省略ではなく解決値を明示送信する
   （gateway version 間で選択を決定的にするため。値の出所は共有既定であり、既定の第二の見解を作らない）。
-- **queue-enter の本文は 1 回だけ渡す。** Enter のみの bounded retry は対象 host 側 rail の既存 policy に
-  属する。client は結果に関わらず gateway command を **ちょうど 1 回**実行し、再実行しない
-  （再実行は Enter の再送ではなく本文の再入力になる）。無制限 Enter retry・raw pane input・
-  direct remote Claude 送信は追加しない。
+- **queue-enter の本文は 1 回だけ渡す。** client は結果に関わらず gateway command を **ちょうど 1 回**
+  実行し、再実行しない（再実行は Enter の再送ではなく本文の再入力になる）。対象 host が Herdr の場合、
+  host 側 rail は body exactly once / first Enter zero-or-one を維持し、tmux compatibility 用の
+  landing-marker wait は実行しない。post-body generation 再確認、Herdr 0.8 の
+  `agent wait TARGET --until working --timeout MS` の arm、deadline check が成功した場合だけ
+  first Enter を発行し、失敗時は `enter_attempts=0` の
+  `blocked` / `turn_start_unconfirmed` に閉じる。causal turn start 未確認時だけ、同一
+  target identity、collision-free launch generation、現在の composer tail にある full marker+body
+  （hard-wrap whitespace のみ正規化）、startup / modal / trust / login / selection screen の非該当、runtime
+  read 成功を **各回 fresh に**再確認し、各 Enter より先に working-transition wait を arm する。timeout-only
+  系列は policy の回数上限と absolute deadline まで Enter-only retry を反復できる。wait error は次の Enter を
+  許可せず即時停止し、それ以前の timeout-authorised retries は telemetry に残す。`busy` は queue semantics 上この厳格 gate の候補になれるが、
+  busy baseline / snapshot / event だけでは delivery confirmation にならない。tmux host の既存 marker-based
+  queue retry は変更しない。
+  client 側 retry、無制限 Enter retry、raw pane input、direct remote Claude 送信は追加しない。
 - **remote command の deadline は観測と queue-enter 配送で分ける。** board / workspace の read-only
   観測は従来どおり `connect_timeout + COMMAND_GRACE_SECONDS` で速やかに degrade する。queue-enter の
   gateway command に限り、その基礎 deadline へ共有 policy の
-  `QUEUE_ENTER_RETRY_WINDOW_SECONDS` を加える。これは client 側で retry を増やす処理ではなく、対象 host
-  側の既存 Enter-only retry が完了する前に client が command を timeout にしないための待機 budget
-  である。`standard` / `pending` を明示した action は基礎 deadline のままとする。
+  `QUEUE_ENTER_RETRY_WINDOW_SECONDS` を **一度だけ**加える。host 側では既定30秒の window が初回 event wait、
+  全 Enter 間の minimum interval、全追加 Enter 後の再 wait を含む単一 absolute budget であり、再 arm で
+  延長しない。`QUEUE_ENTER_RETRY_INTERVAL_SECONDS`（既定2秒）は隣接 Enter 間の最小間隔で、直前の wait が
+  既に interval を消費した場合は追加 sleep しない。window / interval のどちらか `0`、または正値でも
+  `0.001` 秒未満なら host 側の extra Enter は無効である。initial admission は試みるが、first Enter と
+  observation は generation 再確認・wait arm・deadline check が成功した場合に限る。
+  これは client 側で retry を増やす処理ではなく、対象 host の bounded rail が完了する前に client が command
+  を timeout にしないための待機 budget である。`standard` / `pending` を
+  明示した action は基礎 deadline のままとする。
 - **配送成否は exit code で判定しない。** 対象 gateway の **構造化 outcome** を読み、共有 authority
   (`injection_stage_for`) の判定に従う。
-  **構造化 outcome は判定にのみ使い、client の表示は固定の public-safe 文言とする**（remote の値を
-  一切反映しない。これが本項の唯一の契約である）。
+  **構造化 outcome は判定と、閉じた transport-failure 診断にのみ使う。** client の通常表示は固定の
+  public-safe 文言とし、remote の任意値を反映しない。唯一の追加透過は、outcome が
+  `blocked` / `transport_error` で `transport_failure.primitive` が `TRANSPORT_STEPS` の固定 token に
+  exact 一致するときの `gateway_status=blocked` / `gateway_reason=transport_error` /
+  `transport_primitive=<同 token>` である。raw stderr、exception、absolute / remote path、任意 detail は
+  outcome からも subprocess 結果からも転記しない。欠落・未知 token は空の診断に倒し、配送 stage を変えない。
   出力形状は決定的にする: gateway 呼び出しで `--record-format json` を明示し、読み取りは
   documented scrape target である **末尾の JSON-looking line** を読む。`record_format` の既定は
   `both`（人間可読 record → 空行 → 単一行 JSON）であり、stdout 全体を 1 つの JSON として
@@ -269,8 +299,14 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   候補は **末尾の非空行ちょうど 1 件**であり、それが parse 不能 / 非 object / required field 欠落なら
   即座に未確認とする。**parse できる行を求めて遡らない** — 遡ると outcome の後に続いた出力が無視され、
   古い成功が生き残る（fail-closed 契約の fail-open な読み方になる）。
-  exit 0 でも composer に置いただけの `pending_input` や marker 未観測の `queue_enter` は
-  **confirmed ではない**が **zero-send でもない**。正本は `delivery_outcome_gate` / `injection_stage`
+  composer に置いただけの `pending_input` や Herdr causal turn start 未確認の delivery は **confirmed ではない**が
+  **zero-send でもない**。Herdr gateway は未確認を legacy `sent` / exit 0 に倒さず、precise `blocked` reason /
+  non-zero で返す。landing marker 観測や post-hoc `busy` snapshot だけでも confirmed にしない。Herdr
+  queue-enter で confirmation に使えるのは、`awaiting_input` / `turn_ended` の readable baseline より先に arm
+  した working-transition event と coherent な target / collision-free launch generation が揃う場合だけである。
+  wait absent は `turn_start_absent`、fresh gate の runtime blocked は `receiver_blocked`、timeout/error/unarmed/
+  drift/body-screen-state proof failure は `turn_start_unconfirmed`、raised transport failure は `transport_error`。
+  正本は `delivery_outcome_gate` / `injection_stage`
   （同一の問いに複数箇所が別答を出した #14232 の経緯を持つ）。status / reason token を局所で
   再検査せず、**共有 authority を評価する**。
   欠落・非 JSON・非 object・authority が位置づけられない outcome、および command を完了実行
@@ -280,14 +316,17 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   exit status は confirmation を **撤回することはできるが付与はできない**: 構造化 outcome が
   `submitted_confirmed` でも non-zero exit なら矛盾として `uncertain_partial` へ落とす。
   `not_sent` は対象 gateway が **pre-injection で拒否した**と構造化 outcome が述べている場合に限る。
-- **gateway record は producer が導出した `injection_stage` を運ぶ。** 単一行 JSON は
-  `asdict(DeliveryOutcome)` であり、`mode`、turn-start telemetry、producer が **full context** で導出した
-  `injection_stage` を含む。client は record の mode が request の解決済み mode と完全一致することを
-  先に要求し、同じ full context を共有 authority (`injection_stage_for`) で再計算する。carried stage は
-  authority ではなく照合値であり、存在する場合は再計算値と完全一致しなければならない。mode の欠落・
-  不一致、carried stage の不正形・矛盾は `uncertain_partial` とする。これにより queue-enter carve-out
-  （turn-start 未観測の `sent` + `ok` は confirmed ではない）を host 境界越しでも caller が独立に確認する。
-  test fixture もこの形状を **実 producer** から生成し、wire と食い違わせない。
+- **gateway record は producer が導出した `injection_stage` を運ぶが、client は無条件には信頼しない。**
+  単一行 JSON は `asdict(DeliveryOutcome)` であり、`mode` と producer が **full context** で導出した
+  `injection_stage` を含む。host 境界では request の mode と response の `mode` が byte-exact に一致することを
+  必須とし、欠落・別modeは command 実行済みの `uncertain_partial` とする。さらに carried stage は authority
+  そのものではなく照合値として扱い、現在の wire fieldから共有 `injection_stage_for` authorityで再導出した
+  stageと完全一致しなければ `uncertain_partial` に落とす。
+  queue-enter の confirmation は canonical causal-v2 `queue_enter_turn_start_observation` だけを使い、standard
+  `turn_start_outcome` を借りない。これにより旧host・途中version・壊れたrecordが carried
+  `submitted_confirmed` だけで成功へ昇格しない。host は queue 専用 observation / delivery-ledger rail を保ち、
+  standard `turn_start_outcome` へ射影しない。test fixture もこの形状を **実 producer** から生成し、wire と
+  食い違わせない。
 - **結果は 3 分岐であり、2 分岐へ畳まない（#15198）。** 共有 authority の
   `not_sent` / `uncertain_partial` / `submitted_confirmed` をそのまま result state へ対応させる。
   未確認を成功にも非送達にも読み替えない — 前者は誰も読んでいない request を closed にし、
@@ -300,6 +339,8 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   | `uncertain_partial` | `uncertain` | `delivery_uncertain` | 3 |
 
   result payload は `injection_stage` と `blind_retry_prohibited` を共有 authority から公開する。
+  post-injection transport failure に限り、上記の fixed-field projection
+  (`gateway_status` / `gateway_reason` / `transport_primitive`) を additive に公開する。
   exit 3 を 1 へ畳むと、本文が既に receiver に届いている可能性がある時点で automated caller に
   「retry は無償」と伝えることになる。
 - `--summary` は **public-safe projection を素通りする文字列だけを受け付ける**。preview は
@@ -341,6 +382,25 @@ read-only observation + 1 本の routed な preview-first action に限る。
   exit code 0 / 1 / 3 の区別と `blind_retry_prohibited` の公開を CLI level で固定する
 - gateway command が結果に関わらず **ちょうど 1 回**しか実行されないことの unit test（本文の
   重複送信を client 側から起こさない）
+- Herdr 0.8 の wait argv が `agent wait TARGET --until STATUS --timeout MS` であり、旧
+  `wait agent-status ... --status ...` を production fake が受理しないこと。body 後に tmux 由来の
+  landing-marker wait を行わず generation recheck → wait arm → Enter の順であること
+- Herdr queue-enter が body / gateway command を再入力せず、first Enter zero-or-one、各実発行 Enter 前の arm、
+  各 extra Enter 前の fresh strict recheck を行うこと。timeout-only 系列は policy/deadline まで反復でき、
+  wait error は次の Enter を許可せず即時停止すること。identity / collision-free launch generation drift、historical transcript
+  だけの body、startup/modal、blocked / unknown / state read failure、wait unarmed がその回の extra Enter を
+  zero-actuation にすること
+- busy receiver は queue 配送候補として維持されるが busy-only evidence で `submitted_confirmed` にならず、
+  `awaiting_input` / `turn_ended` の armed event + coherent generation だけが confirmation になること
+- public retry window が initial wait + 全 interval + 全 re-wait の absolute budget で、再 arm しても延長されないこと。
+  interval は隣接 Enter の最小間隔で、window / interval `0` または正の sub-millisecond 値が extra
+  Enter を無効にすること
+- uncertain result が `blind_retry_prohibited` のまま client retry を起こさず、queue-specific telemetry /
+  delivery-ledger rail を維持すること。tmux queue-enter、Herdr standard、pending の回帰がないこと
+- post-injection transport failure が `backend=herdr` / `rail=queue_enter_rail` /
+  `disposition=<TRANSPORT_STEPS token>` の ledger row を exactly one 残すこと。Unit Board result は
+  `gateway_status=blocked` / `gateway_reason=transport_error` / `transport_primitive=<同 token>` だけを
+  透過し、raw stderr / exception / path / detail を含まないこと
 - 多 source runtime と action rail の injected-runner tests (live host を使わない)
 - local-only 不変の regression pin (`tests/regressions/test_issue_15138_local_only_unit_board_preserved.py`)
 - local / remote host / remote Dev Container を使った軽量実機確認は #15140 が所有する

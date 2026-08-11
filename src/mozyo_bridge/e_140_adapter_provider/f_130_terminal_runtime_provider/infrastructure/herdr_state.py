@@ -25,7 +25,8 @@ Snapshot, not wait (staged seam)
 :meth:`HerdrCliAgentStateReader.read_agent_state` is a **snapshot** read: it
 reports the pane's current runtime state at the moment it is called. It is the
 ``current-state snapshot`` half of the ``check-then-wait`` rail the PoC
-established (E9 / E12–E14): ``wait agent-status`` waits for a *change* into a
+established (E9 / E12–E14):
+``agent wait TARGET --until STATUS --timeout MS`` waits for a *change* into a
 state and (E9 c2) does not return when already in it, so a caller must read a
 snapshot before arming a wait. The wait rail itself — arming a wait, the Codex
 Enter-resend, and the subscribe-time event behaviour observed in E14 — is
@@ -39,7 +40,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from typing import Mapping, Optional
+from typing import Mapping, Optional, Sequence
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (
     AgentStateListResult,
@@ -213,6 +214,29 @@ class HerdrCliAgentStateReader:
         pairs, skipped = _rows_to_state_pairs(rows)
         detail = f"skipped {skipped} row(s) with an invalid handle" if skipped else ""
         return AgentStateListResult.observed(pairs, detail=detail)
+
+    def read_agent_rows(self) -> Optional[Sequence[Mapping[str, object]]]:
+        """Read the bound Herdr inventory without resolving another binary.
+
+        Queue-enter borrows this narrow raw-row view to pin the exact terminal
+        generation before an Enter. Mechanical, schema, or managed-name failures
+        return ``None`` so the caller withholds actuation.
+        """
+        completed = self._invoke(["agent", "list"])
+        if isinstance(completed, AgentStateResult) or completed.returncode != 0:
+            return None
+        rows = _extract_list_rows(completed.stdout)
+        if rows is None:
+            return None
+        from mozyo_bridge.core.state.herdr_native_identity_binding import (
+            HerdrNativeIdentityBindingError,
+            logicalize_agent_rows,
+        )
+
+        try:
+            return tuple(logicalize_agent_rows(rows))
+        except HerdrNativeIdentityBindingError:
+            return None
 
     # -- internals ------------------------------------------------------------
 

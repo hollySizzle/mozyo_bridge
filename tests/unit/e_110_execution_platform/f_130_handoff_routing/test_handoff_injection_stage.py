@@ -162,12 +162,18 @@ class InjectionStageTruthTableTest(unittest.TestCase):
         self.assertEqual(injection_stage_for(" sent ", " ok "), STAGE_SUBMITTED_CONFIRMED)
 
 
-#: A generation-coherent gateway binding, in the shape `observe_queue_enter_gateway_binding`
-#: returns. The rail writes it together with `event_wait_kind` ONLY when the pre-arm and
-#: post-collect generations match, so its presence is what makes the wait attributable.
+#: The redaction-safe public projection emitted after the private terminal-aware
+#: pre-arm/post-collect comparison succeeds.
+_BINDING_NAME = "mzb1_ws_codex_lane"
+_BINDING_TERMINAL = "terminal-test"
+_BINDING_LOCATOR = "w4B:p4T"
+_BINDING_REVISION = "1"
 _BINDING = {
-    "provider": "codex", "assigned_name": "mzb1_ws_codex_lane", "locator": "w4B:p4T",
-    "row_revision": "1", "attestation_observed_at": "2026-07-29T20:10:01+00:00",
+    "provider": "codex",
+    "assigned_name": _BINDING_NAME,
+    "locator": _BINDING_LOCATOR,
+    "row_revision": _BINDING_REVISION,
+    "attestation_observed_at": "2026-07-29T20:10:01+00:00",
     "startup_action_id": "startup-abc",
 }
 
@@ -202,7 +208,11 @@ def _snapshot(
 
 def _causal(runtime_state: str = "busy") -> dict:
     """The v2 observation whose armed wait fired under a coherent generation."""
-    return _snapshot(runtime_state, event_wait_kind="changed", binding=_BINDING)
+    observation = _snapshot(
+        runtime_state, event_wait_kind="changed", binding=_BINDING
+    )
+    observation["baseline_runtime_state"] = "turn_ended"
+    return observation
 
 
 def _run_front_door(status, reason, *, mode="queue-enter", rail_rc=0):
@@ -293,6 +303,17 @@ class TurnStartEvidenceTest(unittest.TestCase):
             turn_start_positively_observed(_snapshot("busy", binding=_BINDING))
         )
 
+    def test_missing_or_non_idle_baseline_is_not_causal_authority(self):
+        missing = _snapshot(
+            "busy", event_wait_kind="changed", binding=_BINDING
+        )
+        busy = dict(missing, baseline_runtime_state="busy")
+        malformed = dict(missing, baseline_runtime_state=" turn_ended ")
+
+        self.assertFalse(turn_start_positively_observed(missing))
+        self.assertFalse(turn_start_positively_observed(busy))
+        self.assertFalse(turn_start_positively_observed(malformed))
+
     def test_every_other_signal_fails_closed(self):
         for observation, event in (
             (_snapshot("blocked"), None),
@@ -367,17 +388,12 @@ class CanonicalV2BindingShapeTest(unittest.TestCase):
     def test_a_canonical_v2_binding_is_accepted(self):
         self.assertTrue(canonical_v2_generation_binding(_causal()))
 
-    def test_an_empty_row_revision_is_accepted(self):
-        """The producer's ONE optional-empty field.
-
-        ``row_revision`` is ``_norm(str(revision))`` and collapses to ``""`` for a bool row
-        value, so rejecting an empty one would refuse a genuinely canonical binding.
-        """
+    def test_an_empty_row_revision_is_rejected(self):
         observation = _snapshot(
             "busy", event_wait_kind="changed",
             binding={**_BINDING, "row_revision": ""},
         )
-        self.assertTrue(canonical_v2_generation_binding(observation))
+        self.assertFalse(canonical_v2_generation_binding(observation))
 
     def test_unknown_extra_keys_are_accepted(self):
         """Additive schema growth must not silently demote every delivery.
@@ -395,17 +411,11 @@ class CanonicalV2BindingShapeTest(unittest.TestCase):
         """Review j#95881: exact type, so numeric equality cannot widen the schema gate."""
         self.assertTrue(canonical_v2_generation_binding(_causal()))
 
-    def test_a_literal_empty_row_revision_survives_the_normalization_check(self):
-        """The optional-empty exemption must not be swallowed by the stripped-form rule.
-
-        `""` is already its own stripped form, so it passes the normalization check and is then
-        exempted from non-emptiness — while `" "` is rejected by the normalization check before
-        the exemption is ever consulted.
-        """
+    def test_empty_or_whitespace_revision_is_rejected(self):
         observation = _snapshot(
             "busy", event_wait_kind="changed", binding={**_BINDING, "row_revision": ""},
         )
-        self.assertTrue(canonical_v2_generation_binding(observation))
+        self.assertFalse(canonical_v2_generation_binding(observation))
         blank = _snapshot(
             "busy", event_wait_kind="changed", binding={**_BINDING, "row_revision": " "},
         )

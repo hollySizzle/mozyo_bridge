@@ -1,6 +1,6 @@
 """Built-in herdr CLI wait-primitive + rail resolver tests (Redmine #13248).
 
-Pins the herdr ``wait agent-status`` wait primitive and the fully wired rail
+Pins the Herdr ``agent wait --until`` wait primitive and the fully wired rail
 resolver *without a live herdr binary*: argv construction and the two-phase
 arm/collect are verified through an injected ``Popen`` factory that simulates
 exit-0 / non-zero / hang without spawning herdr, the non-zero exit classification
@@ -53,12 +53,19 @@ class FakeProc:
     """A ``subprocess.Popen``-shaped fake: scripted communicate / returncode."""
 
     def __init__(
-        self, *, returncode=0, stdout="", stderr="", hang=False
+        self,
+        *,
+        returncode=0,
+        stdout="",
+        stderr="",
+        hang=False,
+        communicate_raises=None,
     ):
         self.returncode = returncode
         self._stdout = stdout
         self._stderr = stderr
         self._hang = hang
+        self._communicate_raises = communicate_raises
         self.killed = False
         self.communicate_calls = 0
         self.communicate_timeouts: list = []
@@ -68,10 +75,15 @@ class FakeProc:
         self.communicate_timeouts.append(timeout)
         if self._hang and not self.killed:
             raise subprocess.TimeoutExpired(cmd="herdr wait", timeout=timeout)
+        if self._communicate_raises is not None and not self.killed:
+            raise self._communicate_raises
         return self._stdout, self._stderr
 
     def kill(self):
         self.killed = True
+
+    def poll(self):
+        return self.returncode if self.killed else None
 
 
 class RecordingPopen:
@@ -97,7 +109,7 @@ class ArmArgvTests(unittest.TestCase):
         argv, kwargs = popen.calls[0]
         self.assertEqual(
             argv,
-            [BIN, "wait", "agent-status", TARGET, "--status", HERDR_STATUS_WORKING, "--timeout", "8000"],
+            [BIN, "agent", "wait", TARGET, "--until", HERDR_STATUS_WORKING, "--timeout", "8000"],
         )
         self.assertEqual(kwargs.get("stdout"), subprocess.PIPE)
         self.assertEqual(kwargs.get("stderr"), subprocess.PIPE)
@@ -176,6 +188,20 @@ class CollectClassificationTests(unittest.TestCase):
         result = prim.arm(TARGET, timeout_ms=8000).collect()
         self.assertEqual(result.kind, WAIT_TIMEOUT)
         self.assertTrue(proc.killed)
+
+    def test_communicate_failures_are_reaped_and_reported_error(self) -> None:
+        for failure in (OSError("socket"), ValueError("closed stream")):
+            with self.subTest(failure=type(failure).__name__):
+                proc = FakeProc(communicate_raises=failure)
+                popen = RecordingPopen(proc=proc)
+                prim = HerdrCliWaitPrimitive(BIN, popen=popen)
+                armed = prim.arm(TARGET, timeout_ms=8000)
+
+                result = armed.collect()
+
+                self.assertEqual(result.kind, WAIT_ERROR)
+                self.assertTrue(proc.killed)
+                self.assertFalse(armed.pending())
 
     def test_cancel_reaps_process(self) -> None:
         proc = FakeProc(returncode=0)

@@ -1,7 +1,7 @@
 {
   "files": {
     ".claude-nagger/.gitignore": {
-      "sha256": "19d56605cf7f92cfd442b5475944b93f7071f171675405e9a1a4f5003068a33e"
+      "sha256": "9a52ca312bd2754adb1e9861bca3ff58954e53d56e718bfdec4248decce0d720"
     },
     ".claude-nagger/command_conventions.yaml.example": {
       "sha256": "1f49b51cf8979bfbca2f1e80b88abfdc4ee1d08aa3f42c04d274146a558ce49d"
@@ -28,17 +28,17 @@
       "sha256": "718e6707047608a7f830c5a06b9c2796ff1114f0d926011dfde59d4afcd949c2"
     },
     "AGENTS.md": {
-      "sha256": "8c26f4ff337313b9c6c85c0638c22ae1165066b193b6410640f7d85fc6a11fe0"
+      "sha256": "6fb4c5e8035cb1eddd47f752de3cabbd8d8ebe31cfd74b9c42d2062137998a54"
     },
     "CLAUDE.md": {
       "sha256": "a36239476a308bbf35e566be568ce7720bec9f6018775072b3d33191849fe53a"
     }
   },
-  "generated_by": "mozyo-bridge 0.14.0",
+  "generated_by": "mozyo-bridge 0.20.1",
   "mode": "repo-local",
   "preset": "redmine-governed",
-  "preset_hash": "c5cce855a780b148f0fc4ae55f6b8f63e22b035321806456072e6de74bdc4a0f",
-  "preset_version": "2026.08.02.9",
+  "preset_hash": "a19e3b9d18fa0e190829d93918a877b2723f2cf46bd5224f4e3e83b845fe4b86",
+  "preset_version": "2026.08.04.1",
   "rule_path": ".mozyo-bridge/rules/presets/redmine-governed/agent-workflow.md",
   "schema_version": 2
 }

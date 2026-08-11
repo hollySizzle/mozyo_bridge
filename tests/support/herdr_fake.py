@@ -55,7 +55,7 @@ Contract faithfulness (design §1.1, modelled faces A–F)
   ``agent list`` row
   carries its ``tab_id`` (live rows expose it alongside ``workspace_id``),
   so a heal reads the live slot's tab to rejoin it.
-- **F ``wait agent-status``** — **change-semantics** (PoC E9): a wait returns only
+- **F ``agent wait --until``** — **change-semantics** (PoC E9): a wait returns only
   on a *change into* the requested status; already being in it does **not** return
   (it times out). Modelled deterministically with **no real time** — a pre-armed
   logical transition (:meth:`FakeHerdr.arm_transition`) is what a wait returns on;
@@ -89,7 +89,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 # Self-bootstrap the repo-local ``src`` so single-file / isolated discovery works
 # regardless of install state (the #12490 idiom shared with the sibling support
@@ -109,6 +109,9 @@ STATUS_IDLE = "idle"
 STATUS_WORKING = "working"
 STATUS_BLOCKED = "blocked"
 STATUS_DONE = "done"
+_AGENT_WAIT_STATUSES = frozenset(
+    {STATUS_IDLE, STATUS_WORKING, STATUS_BLOCKED, STATUS_DONE, "unknown"}
+)
 
 #: Default status a freshly launched agent snapshots at (booted but not yet
 #: driven): idle. A ``wait`` for a *change into* another status is what advances
@@ -178,7 +181,7 @@ class _Agent:
     logical_name: str
     pane_id: str
     workspace_id: str
-    terminal_id: str
+    terminal_id: str = ""
     provider: str = ""
     cwd: str = ""
     status: str = DEFAULT_START_STATUS
@@ -188,7 +191,7 @@ class _Agent:
     #: The live worker inventory row revision, when a scenario pins the #13806 recover-stale
     #: worker-revision generation gate. Empty (default) renders no ``revision`` field, the legacy
     #: minimal shape most scenarios use.
-    revision: str = ""
+    revision: object = 0
     #: The detected managed provider agent behind the pane, when a scenario distinguishes a live
     #: pane (a named provider) from a shell residue (``""``, present-but-blank). ``None`` (default)
     #: renders no ``agent`` field, the shape whose liveness is decided by ``status`` alone.
@@ -224,6 +227,7 @@ class FakeHerdr:
         # --- one-shot fail-closed injection state (design §2.1 stimuli) ---------
         self._misplace_next: Optional[str] = None
         self._drop_next_locator = False
+        self._misreport_next_terminal_id: Optional[str] = None
         #: Tab-axis stimuli (Redmine #13411): make the next ``agent start`` report a
         #: DIFFERENT tab than requested (misplacement), or NO tab (missing), so the
         #: real code's tab-landing guard fails closed. One-shot, cleared after use.
@@ -272,11 +276,12 @@ class FakeHerdr:
         name: str,
         *,
         workspace_id: str,
+        logical_name: "str | None" = None,
         provider: str = "",
         status: str = DEFAULT_START_STATUS,
         cwd: str = "",
-        revision: str = "",
         terminal_id: str = "",
+        revision: object = 0,
         detected_agent: "str | None" = None,
         tab_id: str = "",
     ) -> str:
@@ -284,6 +289,8 @@ class FakeHerdr:
 
         Seeds the live inventory the way a prior ``agent start`` would have, so a
         scenario can stand up an existing lane slot without replaying its launch.
+        ``logical_name`` lets a modern fixture seed Herdr's short native name while
+        preserving the durable mzb1 identity restored by the production lister.
         ``revision`` / ``detected_agent`` pin the richer ``agent list`` row fields a
         recover-stale generation gate / shell-residue classification reads; both default to
         the legacy minimal shape (field absent). ``tab_id`` lets a scenario seed the Herdr 0.8
@@ -300,9 +307,12 @@ class FakeHerdr:
             ws.pane_tab[pane_id] = tab_id
         self._agents[pane_id] = _Agent(
             name=name,
-            logical_name=name,
+            logical_name=name if logical_name is None else logical_name,
             pane_id=pane_id,
             workspace_id=workspace_id,
+            # ``agent_named`` is the legacy fixture constructor used by the v4/v2
+            # migration regressions. Keep its canonical fixture token stable; the
+            # real ``agent start`` fake path below uses the runtime-shaped token.
             terminal_id=terminal_id or f"terminal:{pane_id}",
             provider=provider,
             status=status,
@@ -331,6 +341,10 @@ class FakeHerdr:
         deciding the outcome.
         """
         self._drop_next_locator = True
+
+    def misreport_next_terminal_id(self, terminal_id: str) -> None:
+        """Make the next ``agent start`` disagree with its prepared pane terminal."""
+        self._misreport_next_terminal_id = terminal_id
 
     def misplace_next_tab(self, tab_id: str) -> None:
         """Make the next ``agent start`` report landing in ``tab_id`` (Redmine #13411).
@@ -434,9 +448,9 @@ class FakeHerdr:
     # -- PopenFactory (subprocess.Popen shape) for the wait rail --------------
 
     def popen(self, argv, stdout=None, stderr=None, text=None, **_):
-        """The injected wait ``popen``: model ``wait agent-status`` (change-semantics).
+        """The injected wait ``popen``: model ``agent wait`` (change-semantics).
 
-        Only ``wait agent-status <target> --status <s> --timeout <ms>`` is
+        Only ``agent wait <target> --until <s> --timeout <ms>`` is
         modelled (the sole command the turn-start rail arms). The outcome is
         resolved **immediately and deterministically** (no real time): a pre-armed
         transition into ``<s>`` for ``<target>`` fires the transition and returns
@@ -446,10 +460,18 @@ class FakeHerdr:
         """
         rest = list(argv[1:])
         self.calls.append(rest)
-        if rest[:2] != ["wait", "agent-status"]:
+        if (
+            len(rest) != 7
+            or rest[:2] != ["agent", "wait"]
+            or not rest[2]
+            or rest[3] != "--until"
+            or rest[4] not in _AGENT_WAIT_STATUSES
+            or rest[5] != "--timeout"
+            or not rest[6].isdigit()
+        ):
             raise UnknownHerdrCommandError(f"unmodelled herdr popen: {list(argv)!r}")
-        target = rest[2] if len(rest) > 2 else ""
-        want = _flag_value(rest, "--status")
+        target = rest[2]
+        want = rest[4]
         return self._resolve_wait(target, want)
 
     # -- command handlers -----------------------------------------------------
@@ -536,6 +558,8 @@ class FakeHerdr:
                         "pane_id": pane_id,
                         "workspace_id": ws.workspace_id,
                         "tab_id": tab_id or f"{ws.workspace_id}:t1",
+                        "terminal_id": f"terminal-{pane_id}",
+                        "revision": 0,
                         "cwd": ws.pane_cwd[pane_id],
                     },
                 }
@@ -565,8 +589,9 @@ class FakeHerdr:
             logical_name=_logical_name_from_env(parsed.env) or parsed.name,
             pane_id=pane_id,
             workspace_id=ws.workspace_id,
-            terminal_id=f"terminal:{pane_id}",
+            terminal_id=f"terminal-{pane_id}",
             provider=parsed.provider,
+            detected_agent=parsed.provider,
             cwd=parsed.cwd,
             tab_id=parsed.tab_id,
             launch_argv=parsed.launch_argv,
@@ -591,6 +616,10 @@ class FakeHerdr:
         elif self._misplace_next_tab is not None:
             rendered_tab = self._misplace_next_tab
             self._misplace_next_tab = None
+        rendered_terminal_id = self._agents[pane_id].terminal_id
+        if self._misreport_next_terminal_id is not None:
+            rendered_terminal_id = self._misreport_next_terminal_id
+            self._misreport_next_terminal_id = None
         return _ok(
             argv,
             {
@@ -601,6 +630,8 @@ class FakeHerdr:
                         "pane_id": rendered_locator,
                         "workspace_id": ws.workspace_id,
                         "tab_id": rendered_tab,
+                        "terminal_id": rendered_terminal_id,
+                        "revision": self._agents[pane_id].revision,
                         "argv": parsed.launch_argv,
                     },
                     "type": "agent_started",
@@ -611,11 +642,10 @@ class FakeHerdr:
     def _cmd_agent_list(self, argv):
         rows = []
         for agent in self._agents.values():
-            row = {
-                "name": agent.name, "agent_status": agent.status,
-                "terminal_id": agent.terminal_id,
-            }
+            row = {"name": agent.name, "agent_status": agent.status}
             row[self.locator_render_key] = agent.pane_id
+            row["terminal_id"] = agent.terminal_id
+            row["revision"] = agent.revision
             # Live rows carry the slot's tab (#13411); render it when the
             # agent lives in one so a heal can rejoin the same tab.
             if agent.tab_id:
@@ -624,8 +654,6 @@ class FakeHerdr:
             # them (legacy minimal shape otherwise): the worker inventory revision, the detected
             # managed provider agent (present-but-blank == shell residue), and the foreground cwd
             # the worktree-readable probe reads.
-            if agent.revision:
-                row["revision"] = agent.revision
             if agent.detected_agent is not None:
                 row["agent"] = agent.detected_agent
             if agent.cwd:
@@ -817,11 +845,22 @@ class FakeHerdr:
         for index, (armed_target, to_status) in enumerate(self._armed_transitions):
             if armed_target == target and to_status == want_status:
                 del self._armed_transitions[index]
-                agent = self._resolve_agent(target)
-                if agent is not None:
-                    agent.status = to_status  # the transition actually happens
                 event = {"event": "pane.agent_status_changed", "status": to_status}
-                return _FakeWaitProcess(returncode=0, stdout=json.dumps(event))
+
+                def _apply_transition() -> None:
+                    agent = self._resolve_agent(target)
+                    if agent is not None:
+                        agent.status = to_status
+
+                # Arming registers the future transition; collection occurs
+                # after the injected Enter and is when the deterministic fake
+                # materialises it. Mutating status during Popen construction
+                # would invert arm -> inject -> collect causality.
+                return _FakeWaitProcess(
+                    returncode=0,
+                    stdout=json.dumps(event),
+                    on_communicate=_apply_transition,
+                )
         # No armed change into ``want_status`` -> change-semantics timeout, even if
         # the agent is *already* in ``want_status`` (PoC E9 c2).
         return _FakeWaitProcess(returncode=1, stderr=WAIT_TIMEOUT_MESSAGE)
@@ -904,6 +943,11 @@ class FakeHerdr:
                 return ws.pane_tab[pane_id]
         return ""
 
+    def terminal_id_of(self, pane_id: str) -> str:
+        """The exact live terminal identity for ``pane_id``, or ``""`` if absent."""
+        agent = self._agents.get(pane_id)
+        return agent.terminal_id if agent is not None else ""
+
     @property
     def agents(self) -> list:
         """The live agents as ``{"name", "pane_id", "status"}`` dicts (list order)."""
@@ -946,9 +990,9 @@ class FakeHerdr:
                 {
                     "name": a.name, "logical_name": a.logical_name,
                     "pane_id": a.pane_id, "workspace_id": a.workspace_id,
-                    "terminal_id": a.terminal_id,
                     "provider": a.provider, "cwd": a.cwd, "status": a.status, "tab_id": a.tab_id,
-                    "revision": a.revision, "detected_agent": a.detected_agent,
+                    "terminal_id": a.terminal_id, "revision": a.revision,
+                    "detected_agent": a.detected_agent,
                 }
                 for a in self._agents.values()
             ],
@@ -990,10 +1034,10 @@ class FakeHerdr:
             fake._agents[ad["pane_id"]] = _Agent(
                 name=ad["name"], logical_name=ad.get("logical_name", ad["name"]),
                 pane_id=ad["pane_id"], workspace_id=ad["workspace_id"],
-                terminal_id=ad.get("terminal_id", f"terminal:{ad['pane_id']}"),
+                terminal_id=ad.get("terminal_id", f"terminal-{ad['pane_id']}"),
                 provider=ad.get("provider", ""), cwd=ad.get("cwd", ""),
                 status=ad.get("status", DEFAULT_START_STATUS), tab_id=ad.get("tab_id", ""),
-                revision=ad.get("revision", ""), detected_agent=ad.get("detected_agent"),
+                revision=ad.get("revision", 0), detected_agent=ad.get("detected_agent"),
             )
         return fake
 
@@ -1048,7 +1092,7 @@ class FakeHerdr:
 
 
 class _FakeWaitProcess:
-    """A deterministic stand-in for a ``wait agent-status`` ``Popen`` (no real time).
+    """A deterministic stand-in for an ``agent wait`` ``Popen`` (no real time).
 
     Exposes the slice of the ``Popen`` surface the turn-start rail collects
     against: :meth:`communicate` (returns ``(stdout, stderr)`` immediately),
@@ -1056,18 +1100,36 @@ class _FakeWaitProcess:
     construction, so ``communicate`` never blocks and no ``timeout`` ever elapses.
     """
 
-    def __init__(self, *, returncode: int, stdout: str = "", stderr: str = "") -> None:
+    def __init__(
+        self,
+        *,
+        returncode: int,
+        stdout: str = "",
+        stderr: str = "",
+        on_communicate: Optional[Callable[[], None]] = None,
+    ) -> None:
         self.returncode = returncode
         self._stdout = stdout
         self._stderr = stderr
+        self._on_communicate = on_communicate
+        self._communicated = False
+        self._killed = False
 
     def communicate(self, timeout=None):
+        self._communicated = True
+        if self._on_communicate is not None:
+            callback, self._on_communicate = self._on_communicate, None
+            callback()
         return self._stdout, self._stderr
 
     def kill(self) -> None:  # pragma: no cover - the rail only calls this on reap
+        self._killed = True
+        self._on_communicate = None
         return None
 
     def poll(self):
+        if not self._communicated and not self._killed:
+            return None
         return self.returncode
 
 

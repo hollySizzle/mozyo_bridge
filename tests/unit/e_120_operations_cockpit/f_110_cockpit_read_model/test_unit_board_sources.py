@@ -125,6 +125,10 @@ class SourceSchemaTests(unittest.TestCase):
             )
         with self.assertRaises(UnitBoardSourceError):
             UnitBoardSource.from_record(container_record(ssh_target="SSH-DESTINATION-SENTINEL"))
+        with self.assertRaises(UnitBoardSourceError):
+            UnitBoardSource.from_record(
+                ssh_record(container_user="1000:1000")
+            )
 
     def test_connection_values_reject_option_and_metacharacter_shapes(self) -> None:
         for target in ("-oProxyCommand=x", "host;rm -rf /", "host name", "a$b"):
@@ -137,6 +141,50 @@ class SourceSchemaTests(unittest.TestCase):
         UnitBoardSource.from_record(ssh_record(mozyo_binary="/opt/bin/mozyo-bridge"))
         with self.assertRaises(UnitBoardSourceError):
             UnitBoardSource.from_record(ssh_record(mozyo_binary="../evil"))
+
+    def test_container_user_accepts_name_or_uid_with_optional_group(self) -> None:
+        for value in (
+            "vscode",
+            "root",
+            "0",
+            "1000",
+            "vscode:developers",
+            "0:0",
+            "1000:1000",
+        ):
+            with self.subTest(value=value):
+                source = UnitBoardSource.from_record(
+                    container_record(container_user=value)
+                )
+
+                self.assertEqual(source.container_user, value)
+
+    def test_container_user_rejects_unsafe_or_ambiguous_shapes(self) -> None:
+        for value in (
+            "",
+            "-root",
+            "user name",
+            "user;id",
+            "user:group:extra",
+            "user:",
+            ":group",
+            "u" * 65,
+            "u:" + "g" * 65,
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(UnitBoardSourceError):
+                    UnitBoardSource.from_record(
+                        container_record(container_user=value)
+                    )
+
+        with self.assertRaises(UnitBoardSourceError):
+            UnitBoardSource(
+                host_id="devcontainer",
+                label="dev container",
+                kind="container",
+                container="workspace-dev",
+                container_user=1000,  # type: ignore[arg-type]
+            )
 
     def test_connect_timeout_is_bounded_and_not_a_boolean(self) -> None:
         with self.assertRaises(UnitBoardSourceError):
@@ -231,6 +279,24 @@ class ConnectionValueDisclosureTests(unittest.TestCase):
         self.assertEqual(
             set(self.config().private_connection_values),
             {"SSH-DESTINATION-SENTINEL", "CONTAINER-SENTINEL"},
+        )
+
+    def test_container_user_is_a_private_connection_value(self) -> None:
+        source = UnitBoardSource.from_record(
+            container_record(container_user="EXEC-USER-SENTINEL", label="dev box")
+        )
+        config = UnitBoardSourcesConfig.from_record(
+            {"version": 1, "sources": [container_record(
+                container_user="EXEC-USER-SENTINEL", label="dev box"
+            )]}
+        )
+
+        self.assertNotIn("EXEC-USER-SENTINEL", repr(source))
+        self.assertNotIn("EXEC-USER-SENTINEL", str(source.as_payload()))
+        self.assertIn("EXEC-USER-SENTINEL", config.private_connection_values)
+        self.assertEqual(
+            config.disclosed_connection_value("run as EXEC-USER-SENTINEL"),
+            "EXEC-USER-SENTINEL",
         )
 
     def test_the_published_default_binary_is_not_treated_as_private(self) -> None:
@@ -354,6 +420,28 @@ class SourceArgvTests(unittest.TestCase):
             argv, ("docker", "exec", "workspace-dev", "mozyo-bridge", "herdr")
         )
 
+    def test_container_argv_places_user_before_the_container(self) -> None:
+        config = UnitBoardSourcesConfig.from_record(
+            {"version": 1, "sources": [container_record(container_user="1000:1000")]}
+        )
+
+        argv = source_command_argv(
+            config.by_id["devcontainer"], ("herdr",), by_id=config.by_id
+        )
+
+        self.assertEqual(
+            argv,
+            (
+                "docker",
+                "exec",
+                "--user",
+                "1000:1000",
+                "workspace-dev",
+                "mozyo-bridge",
+                "herdr",
+            ),
+        )
+
     def test_container_via_ssh_nests_exactly_one_hop(self) -> None:
         config = UnitBoardSourcesConfig.from_record(
             {
@@ -368,6 +456,26 @@ class SourceArgvTests(unittest.TestCase):
         self.assertEqual(argv[0], "ssh")
         self.assertEqual(
             argv[-1], "docker exec workspace-dev mozyo-bridge herdr"
+        )
+
+    def test_container_user_is_preserved_through_the_ssh_hop(self) -> None:
+        config = UnitBoardSourcesConfig.from_record(
+            {
+                "version": 1,
+                "sources": [
+                    ssh_record(),
+                    container_record(via="devbox", container_user="vscode:users"),
+                ],
+            }
+        )
+
+        argv = source_command_argv(
+            config.by_id["devcontainer"], ("herdr",), by_id=config.by_id
+        )
+
+        self.assertEqual(
+            argv[-1],
+            "docker exec --user vscode:users workspace-dev mozyo-bridge herdr",
         )
 
 

@@ -1369,6 +1369,11 @@ caller composes a snapshot read with a wait. Established live in the PoC
   fail-safe in #13248; it does not affect this snapshot read model, which never
   subscribes. Recorded here so the wait US does not re-derive it.
 
+The command spellings in the bullets above are retained as **Herdr 0.7.1 PoC evidence**;
+they are not the current adapter grammar. Herdr 0.8 exposes the same change-semantics through
+`agent wait TARGET --until STATUS --timeout MS`. Production code and the current fake must use
+that exact argv shape and fail closed on the former `wait agent-status ... --status ...` shape.
+
 Live verification is not required for this US (staged seam): the mapping and the
 reader are pinned through a pure fake / injected-runner, with no live herdr.
 
@@ -1399,14 +1404,16 @@ existing tmux path is untouched.
   — **core**, pure. The closed `TURN_START_OUTCOMES` vocabulary, the structured
   `TurnStartResult`, the injected wait-primitive *port* (`TurnStartWaitPort` /
   `ArmedWait`) and its `WaitResult` vocabulary (`changed` / `timeout` / `absent` /
-  `error`), the pure `composer_retains_body` helper, the pure `HerdrTurnStartRail`
+  `error`), the standard-rail-compatible `composer_retains_body` helper, the stricter
+  queue-enter `current_composer_retains_body` helper, the pure `HerdrTurnStartRail`
   orchestrator, and the redaction-safe `turn_start_rail_record_lines` renderer.
   `TurnStartRailError` subclasses `TerminalTransportError`, so the whole seam
   shares one fail-closed error base. It imports no provider.
 - `src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/infrastructure/herdr_turn_start.py`
-  — the built-in **herdr CLI wait primitive** (`HerdrCliWaitPrimitive`, a
-  two-phase `arm` / `collect` over `wait agent-status <target> --status working
-  --timeout <ms>` via an injectable `Popen` factory) plus the fail-closed
+  — the built-in **herdr CLI wait primitive**. `HerdrCliWaitPrimitive` is a
+  two-phase `arm` / `collect` over `agent wait <target> --until working
+  --timeout <ms>` (Herdr 0.8; `TARGET` is positional immediately after `wait`) via an injectable
+  `Popen` factory. The same module owns the fail-closed
   `resolve_turn_start_rail` resolver that wires all three providers (transport
   #13245, reader #13246, this wait primitive) from the one trusted-env binary.
   Dependency points provider -> core.
@@ -1525,9 +1532,94 @@ the fact that the first observation failed; `resend_skipped_reason` (the closed
 `enter_resends=0` is no longer ambiguous between "none was needed" and "one was wanted
 and withheld". The original five j#72602 keys keep their meaning and values.
 
-The gate's closed skip vocabulary and its pure predicates live in the leaf
-`domain/turn_start_resend_gate.py` and are re-exported from `turn_start_rail.py`
-(the module-health split, mirroring the provider registry's startup-blocker schema).
+The gate's closed skip vocabulary and pure predicates live in the leaf
+`domain/turn_start_resend_gate.py`. Existing standard-rail names remain re-exported
+from `turn_start_rail.py`; the queue-specific current-composer predicate is imported
+directly by its application seam so the 999-line standard rail does not grow.
+
+### Herdr queue-enter causal resend seam (Redmine #15242)
+
+`application/handoff_herdr_queue_enter_rail.py` owns this bounded seam. Redmine #15242
+(既定 queue-enter の turn-start 補完) connects the default Herdr
+`queue-enter` choreography to causal turn-start evidence without routing it through
+`drive_turn_start`. That separation is required: `drive_turn_start` rejects a `busy`
+precondition so that a standard send can attribute the next turn to itself, while
+queue-enter deliberately accepts a busy receiver and queues work behind the active
+turn. The queue seam nevertheless borrows the **already-active** rail's bound reader,
+visible-pane reader, and narrow `arm_turn_start_wait` method; it does not resolve a
+second binary, server, or environment whose events could belong to another runtime.
+
+The queue seam owns this sequence:
+
+1. Before body injection, require the exact conservative `process_generation`
+   snapshot resolved for the target. It includes mutable `terminal.revision` and is
+   intentionally strict at this pre-body boundary. The binding also carries stable
+   provider / assigned-name / locator / terminal-id fields and a verified
+   `pane_bound_v2` launch token. Arm a `working`-transition wait before the first
+   Enter and then read the runtime baseline.
+2. Keep the common transport choreography: body exactly once, first Enter zero-or-one.
+   Unlike the tmux compatibility rail, Herdr queue-enter performs **no landing-marker wait**
+   between body injection and causal admission. The first Enter requires, in order, the
+   post-body **stable terminal/v2 launch-token** recheck, an armed Herdr 0.8
+   `agent wait TARGET --until working --timeout MS`, and an unexpired absolute deadline;
+   revision-only drift on that same
+   verified terminal is allowed because body rendering may advance the revision.
+   The pending wait and absolute deadline are checked again at the final transport
+   effect boundary, after project-gateway capability verification and immediately
+   before the delegate send. Otherwise `enter_attempts` remains unchanged and the
+   send fails closed. Never move body injection into the retry helper. Every Enter
+   actually pressed has a successfully armed wait.
+3. Treat an armed `changed` event as submission evidence only when the baseline was
+   `awaiting_input` / `turn_ended` and the stable terminal/v2 launch generation stay
+   coherent.
+   A `busy` baseline, post-hoc `busy` snapshot, or event that cannot be separated from
+   the already-running turn is not confirmation.
+4. If causal start is not confirmed, an extra Enter requires a fresh, fail-closed
+   recheck **on every iteration**: exact target identity and stable terminal/v2
+   launch generation; readable, non-blank pane whose **last composer prompt and wrapped
+   tail** contain the complete injected marker+body (whitespace is ignored only to
+   survive terminal hard wraps); no declared startup / modal / trust / login /
+   selection screen; successful runtime read in `busy` / `awaiting_input` /
+   `turn_ended`; and a new wait armed before that Enter. `blocked`, `unknown`, read
+   failure, generation drift, historical-transcript-only body matches, and unarmed
+   wait all stop actuation. A timeout-only sequence may repeat this strict iteration
+   within the public policy/deadline. A wait `error` authorises no next Enter and stops
+   immediately; timeout-authorised retries already issued before a late error cannot be
+   undone and remain explicit in telemetry.
+5. The public default is a 30-second window and a 2-second minimum interval. The
+   initial wait, every interval delay, and every post-Enter wait share that one
+   absolute budget; every wait timeout is capped by the remaining time and re-arming
+   never resets it. If the preceding wait already consumed the interval, no extra
+   sleep occurs. A zero or positive sub-millisecond window/interval disables extra
+   Enter but does not itself suppress initial admission. First Enter and observation
+   still require the generation recheck, armed wait, and deadline check; invalid non-finite
+   input is rejected before injection. A sub-millisecond value is never rounded
+   upward into a wider actuation budget.
+
+The busy rule is deliberately asymmetric. `busy` may pass the **resend admission**
+only when the exact current composer still holds this request and every identity /
+screen gate passes; `busy` alone can never pass the **delivery confirmation** gate.
+
+Telemetry remains in the queue-specific `queue_enter_turn_start_observation`; the
+seam does not emit standard `turn_start_outcome`. This preserves the queue delivery-
+ledger classification and its generation fence. A same-generation causal start maps
+to `sent` / `ok` / exit 0. Otherwise the command fails closed and exits non-zero:
+wait `absent` maps to `blocked` / `turn_start_absent`; a fresh gate that observes
+runtime `blocked` maps to `blocked` / `receiver_blocked`; timeout, error, unarmed wait,
+identity/generation drift, or body/screen/state proof failure maps to `blocked` /
+`turn_start_unconfirmed`; a raised `TerminalTransportError` maps to `blocked` /
+`transport_error`. These post-injection failures retain an `uncertain_partial` injection
+stage with `blind_retry_prohibited`; the former legacy telemetry-only `sent` fallback
+is not a success path. tmux queue-enter, Herdr standard, and pending rails do not
+enter this seam.
+
+A raised post-injection transport failure is also a terminal ledger event, not an exception-only
+exit. The rail appends exactly one row with `backend=herdr`, `rail=queue_enter_rail`, and
+`disposition` equal to the rail-owned `TRANSPORT_STEPS` primitive token. The gateway outcome carries
+only `transport_failure.primitive=<same token>`; the Unit Board projection may expose only
+`gateway_status=blocked`, `gateway_reason=transport_error`, and
+`transport_primitive=<same token>`. Adapter exception text, raw stderr, binary / repository paths,
+and arbitrary detail never cross either structured boundary.
 
 ### Equivalence to the #13166 codex-standard turn-start guard (documented proof)
 

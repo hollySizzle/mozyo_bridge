@@ -1406,6 +1406,9 @@ Table naming:
         再実行した run」が前の run の record を継承し、rollback が **自分が起動していない pane** を閉じうる。
       - **participants** = provider / assigned-name / launch locator / launch receipt。各 fresh launch の**直後**に記録する
         (最後にまとめて記録すると、2 つの start の間で死んだ run — まさに partial pair — の第 1 agent が誰の物か分からなくなる)。
+        現行のpane-bound receiptはsplit応答のterminal idを含む`pane_bound_v2`であり、`agent_started`のterminal idと
+        exact一致して初めてlaunch-generation finalizeへ進む。旧`pane_bound_v1`は解析互換のみで、terminal generation
+        authorityには昇格しない。正本は`vibes/docs/specs/herdr-native-identity.md`のHerdr 0.8 launch contractを参照。
       - **phases** = `planned` → `launching` → `health_check` → `rollback_owed` | `success_owed` → `completed_rolled_back` |
         `completed_success`。terminal は write-once で、replay は record から答える (再 close しない)。
       - **reserve は bootstrap 可 / rollback は不可** (意図的な非対称): reserve は *新しい* identity を作るので何も忘れない。
@@ -1431,9 +1434,13 @@ Table naming:
         normal participant の destructive close は、close 直前に 1 回取得した full inventory の全 row が
         canonical name / locator / terminal identity を持ち各軸 global unique であり、同一 snapshot の exact
         name+locator+terminal が v4 attestation と finalized generation-v2 の **同じ rollback startup action**
-        に一致する場合だけ許可する。legacy/unbound/mismatch と prepared shell（terminal/generation pin 無し）は
-        常に zero-close。Herdr 0.8 の mutation 自体は locator-only で atomic compare-and-close を持たないため、
-        この直前照合と実 close の間の provider race は残差であり、race-free とは主張しない。
+        に一致し、provider がその native/terminal generation を server-side で条件付き close できる場合だけ許可する。
+        `pane_bound_v2` prepared shell も receipt の exact native/terminal、full pane inventory の terminal global
+        uniqueness、empty-input positive fact、同じ conditional-close capability の連言が必要。structured
+        `pane_bound_v1` は recorded locator の positive absenceだけを zero-close settle できる。legacy unstructured /
+        unbound / mismatch は常に zero-close。現 Herdr は conditional-close capability を公開しないため present
+        normal/prepared participant は保存される。将来 capability が提供されても post-close で agent/pane 双方の
+        full inventory と private terminal global absenceを再確認してからだけ durable completionへ進む。
         composer は 3 値を保つ: 捨てられるのは **transaction 自身が生んだ startup UI** (認識済み provider startup blocker で、
         誰も打鍵していないもの) だけで、LLM / operator が投入した composer body は **owner approval の有無に関わらず preserve**
         する。generic pending-composer discard authority (#13918 / #13933 の `direct_owner`) は**拡張しない**。

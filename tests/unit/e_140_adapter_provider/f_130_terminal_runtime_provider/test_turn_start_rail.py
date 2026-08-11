@@ -77,6 +77,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     composer_retains_body,
     turn_start_rail_record_lines,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_resend_gate import (
+    current_composer_retains_body,
+)
 
 TARGET = "w1:p1"
 BODY = "Refs: Redmine #13248 please start the turn"
@@ -140,13 +143,19 @@ class FakeArmedWait:
         self._result = result
         self._events = events
         self._index = index
+        self._resolved = False
 
     def collect(self) -> WaitResult:
+        self._resolved = True
         self._events.append(("collect", self._index))
         return self._result
 
     def cancel(self) -> None:
+        self._resolved = True
         self._events.append(("cancel", self._index))
+
+    def pending(self) -> bool:
+        return not self._resolved
 
 
 class FakeWait:
@@ -1454,6 +1463,37 @@ class ComposerRetainsBodyTests(unittest.TestCase):
     def test_non_string_is_false(self) -> None:
         self.assertFalse(composer_retains_body(None, BODY))
         self.assertFalse(composer_retains_body("x", None))
+
+    def test_current_composer_match_ignores_same_body_in_transcript(self) -> None:
+        content = f"› {BODY}\nassistant: completed\n› "
+        self.assertFalse(current_composer_retains_body(content, BODY))
+
+    def test_current_composer_match_rejects_old_prompt_when_busy_output_follows(self) -> None:
+        # While a receiver is busy it may render no fresh composer at all. The last
+        # prompt is then the already-submitted request in transcript; unindented
+        # receiver output below it proves that prompt is historical, not retained.
+        content = f"› {BODY}\n• Working on the request\nmore output"
+        self.assertFalse(current_composer_retains_body(content, BODY))
+
+    def test_current_composer_match_accepts_wrapped_last_prompt_only(self) -> None:
+        content = "assistant: old output\n› Refs: Redmine #15242 please\n  start the turn"
+        self.assertTrue(
+            current_composer_retains_body(
+                content, "Refs: Redmine #15242 please start the turn"
+            )
+        )
+
+    def test_current_composer_match_tolerates_indented_tui_footer(self) -> None:
+        content = "› Refs: Redmine #15242 please\n  start the turn\n\n  ? for shortcuts"
+        self.assertTrue(
+            current_composer_retains_body(
+                content, "Refs: Redmine #15242 please start the turn"
+            )
+        )
+
+    def test_current_composer_requires_a_non_blank_last_prompt(self) -> None:
+        self.assertFalse(current_composer_retains_body("transcript only " + BODY, BODY))
+        self.assertFalse(current_composer_retains_body("›   ", BODY))
 
 
 if __name__ == "__main__":

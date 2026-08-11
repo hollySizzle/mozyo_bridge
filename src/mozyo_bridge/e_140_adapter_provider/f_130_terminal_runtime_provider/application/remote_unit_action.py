@@ -34,14 +34,15 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Optional, Sequence
 
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (
-    is_canonical_positive_decimal,
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_transport_failure_gate import (
+    TRANSPORT_STEPS,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     MODES,
     QUEUE_ENTER_RETRY_WINDOW_SECONDS,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (
+    MODE_PENDING,
     MODE_QUEUE_ENTER,
     effective_send_mode,
 )
@@ -52,6 +53,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injectio
     blind_retry_prohibited,
     injection_stage_for,
     stage_from_telemetry,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (
+    is_canonical_positive_decimal,
 )
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.herdr_unit_board import (
     MAX_PRESENTATION_TEXT,
@@ -365,6 +369,9 @@ class RemoteUnitActionResult:
     #: without running the gateway command is a genuine zero-send, so
     #: :data:`STAGE_NOT_SENT` is the honest default rather than a convenient one.
     injection_stage: str = STAGE_NOT_SENT
+    gateway_status: str = ""
+    gateway_reason: str = ""
+    transport_primitive: str = ""
 
     @property
     def delivered(self) -> bool:
@@ -391,6 +398,9 @@ class RemoteUnitActionResult:
             # local opinion about what the target gateway's outcome meant.
             "injection_stage": self.injection_stage,
             "blind_retry_prohibited": blind_retry_prohibited(self.injection_stage),
+            "gateway_status": self.gateway_status,
+            "gateway_reason": self.gateway_reason,
+            "transport_primitive": self.transport_primitive,
             "preview": self.preview.as_payload(),
         }
 
@@ -645,6 +655,12 @@ class RemoteUnitActionRail:
             result,
             expected_mode=request.effective_delivery_mode,
         )
+        gateway_status, gateway_reason, transport_primitive = (
+            _gateway_transport_failure_diagnostics(
+                result,
+                expected_mode=request.effective_delivery_mode,
+            )
+        )
         if stage == STAGE_SUBMITTED_CONFIRMED:
             return RemoteUnitActionResult(
                 ACTION_DELIVERED,
@@ -664,6 +680,9 @@ class RemoteUnitActionRail:
             _DETAIL_BY_REASON[REASON_DELIVERY_UNCERTAIN],
             preview,
             injection_stage=STAGE_UNCERTAIN_PARTIAL,
+            gateway_status=gateway_status,
+            gateway_reason=gateway_reason,
+            transport_primitive=transport_primitive,
         )
 
 
@@ -706,25 +725,30 @@ def _delivery_outcome_record(stdout: object) -> Optional[dict]:
     return payload
 
 
-def _gateway_injection_stage(stdout: object, *, expected_mode: str) -> str:
+def _gateway_injection_stage(
+    stdout: object, *, expected_mode: str
+) -> str:
     """The shared stage token for the target gateway's own outcome.
 
-    A zero exit code is **not** proof of delivery — ``delivery_outcome_gate``
-    documents the two rc-0 shapes that never reached a receiver (a ``pending``
-    send that parks the body in the composer, and a marker-unobserved
-    ``queue-enter``).  So the structured outcome is read, and it is read through
-    the *shared* :func:`injection_stage_for` authority rather than by re-testing
-    status/reason tokens locally: #14232 records what happened when three places
-    answered "was it delivered?" with their own private tables.
+    A zero exit code is **not** proof of causally confirmed delivery — a
+    ``pending`` send intentionally parks the body in the receiver composer, and
+    the tmux-compatibility ``queue-enter`` rail can report a practical queued
+    submission without causal turn-start evidence.  So the structured outcome
+    is read through the shared :func:`injection_stage_for` and
+    :func:`stage_from_telemetry` authorities rather than through a private
+    status/reason table: #14232 records what happened when three places answered
+    "was it delivered?" independently.
 
-    The gateway serialises its whole ``DeliveryOutcome``, including the effective
-    mode, both turn-start telemetries, and the ``injection_stage`` the producer
-    derived from that full context.  This boundary must not trust any one of
-    those claims in isolation.  The gateway mode has to equal the mode this
-    caller requested, and the carried stage (when present) has to equal a fresh
-    full-context classification by the shared authority.  A missing/mismatched
-    mode or a contradictory carried stage is therefore uncertain rather than a
-    confirmation or a zero-send (review j#103034, UBRA-RESULT-001).
+    The host boundary is not allowed to turn a stale producer's partial record
+    into current delivery proof.  The response therefore must carry the exact
+    mode requested by this client, and its producer-carried stage must agree
+    with a current re-derivation from the wire fields.  For queue-enter that
+    re-derivation deliberately ignores the standard rail's
+    ``turn_start_outcome``: only the canonical causal-v2 queue observation can
+    confirm this mode.  A missing/mismatched mode, legacy queue evidence, or a
+    contradictory carried stage is uncertain, never success or zero-send.  The
+    carried stage is only a cross-check, not authority in isolation (review
+    j#103034, UBRA-RESULT-001).
 
     Everything unreadable — absent output, no JSON line, a non-object — resolves
     to :data:`STAGE_UNCERTAIN_PARTIAL`, the same direction the authority itself
@@ -734,25 +758,43 @@ def _gateway_injection_stage(stdout: object, *, expected_mode: str) -> str:
     payload = _delivery_outcome_record(stdout)
     if payload is None:
         return STAGE_UNCERTAIN_PARTIAL
-    record_mode = payload.get("mode")
-    if not isinstance(record_mode, str) or record_mode != expected_mode:
+    payload_mode = payload.get("mode")
+    if (
+        type(payload_mode) is not str
+        or payload_mode != payload_mode.strip()
+        or payload_mode != expected_mode
+        or expected_mode not in MODES
+    ):
         return STAGE_UNCERTAIN_PARTIAL
 
-    recomputed = injection_stage_for(
+    derived = injection_stage_for(
         payload.get("status"),
         payload.get("reason"),
-        mode=record_mode,
+        mode=payload_mode,
         queue_enter_turn_start_observation=payload.get(
             "queue_enter_turn_start_observation"
         ),
-        turn_start_outcome=payload.get("turn_start_outcome"),
+        # A queue-enter response cannot borrow the standard rail's proof axis.
+        turn_start_outcome=(
+            None
+            if expected_mode == MODE_QUEUE_ENTER
+            else payload.get("turn_start_outcome")
+        ),
     )
-    carried = stage_from_telemetry(payload.get("injection_stage"))
-    if "injection_stage" in payload and carried is None:
+    if expected_mode == MODE_PENDING and derived == STAGE_SUBMITTED_CONFIRMED:
         return STAGE_UNCERTAIN_PARTIAL
-    if carried is not None and carried != recomputed:
+    if "injection_stage" in payload:
+        carried = stage_from_telemetry(payload.get("injection_stage"))
+        if carried is None:
+            return STAGE_UNCERTAIN_PARTIAL
+    else:
+        # A legacy producer may omit the additive projection.  Its complete
+        # current fields can still be classified, but an explicitly malformed
+        # projection is a contradiction rather than an invitation to fallback.
+        carried = derived
+    if carried != derived:
         return STAGE_UNCERTAIN_PARTIAL
-    return recomputed
+    return derived
 
 
 def _delivery_stage(result, *, expected_mode: str) -> str:
@@ -777,6 +819,35 @@ def _delivery_stage(result, *, expected_mode: str) -> str:
     if stage == STAGE_SUBMITTED_CONFIRMED and completed.returncode != 0:
         return STAGE_UNCERTAIN_PARTIAL
     return stage
+
+
+def _gateway_transport_failure_diagnostics(
+    result, *, expected_mode: str
+) -> tuple[str, str, str]:
+    """Return only the fixed transport-failure tokens from a gateway outcome.
+
+    Raw stderr and adapter detail are intentionally out of reach.  A malformed
+    mode, status, reason, telemetry object, or primitive returns empty strings;
+    diagnostics must never weaken the shared delivery-stage verdict.
+    """
+    completed = result.completed
+    if not result.ok or completed is None:
+        return "", "", ""
+    payload = _delivery_outcome_record(completed.stdout)
+    if payload is None or payload.get("mode") != expected_mode:
+        return "", "", ""
+    if (
+        payload.get("status") != "blocked"
+        or payload.get("reason") != "transport_error"
+    ):
+        return "", "", ""
+    telemetry = payload.get("transport_failure")
+    if not isinstance(telemetry, dict):
+        return "", "", ""
+    primitive = telemetry.get("primitive")
+    if type(primitive) is not str or primitive not in TRANSPORT_STEPS:
+        return "", "", ""
+    return "blocked", "transport_error", primitive
 
 
 def render_preview(preview: RemoteUnitActionPreview) -> Sequence[str]:

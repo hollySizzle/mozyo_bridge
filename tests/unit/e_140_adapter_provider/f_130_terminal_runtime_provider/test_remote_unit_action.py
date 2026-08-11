@@ -12,6 +12,9 @@ from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.unit_
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     QUEUE_ENTER_RETRY_WINDOW_SECONDS,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_transport_failure_gate import (
+    STEP_SEND_KEYS_ENTER,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (
     MODE_QUEUE_ENTER,
 )
@@ -68,14 +71,19 @@ def armed_wait_observation() -> dict:
     canonical v2 generation binding is present, which is what proves the receiver
     process did not change across the observation window.
     """
+    assigned_name = "mzb1_ws_codex_lane"
+    terminal_id = "terminal-w1B-p1D"
+    locator = "w1B:p1D"
+    revision = "7"
     return {
         "observation_version": 2,
         "event_wait_kind": "changed",
+        "baseline_runtime_state": "turn_ended",
         "gateway_binding": {
             "provider": "codex",
-            "assigned_name": "codex-gateway",
-            "locator": "w1B:p1D",
-            "row_revision": "7",
+            "assigned_name": assigned_name,
+            "locator": locator,
+            "row_revision": revision,
             "attestation_observed_at": "2026-08-10T05:00:00Z",
             "startup_action_id": "startup-abc123",
         },
@@ -477,6 +485,67 @@ class PreviewSubstitutionTests(unittest.TestCase):
         self.assertIn("--summary 'board pointer'", command)
 
 
+class ContainerUserRoutingTests(unittest.TestCase):
+    def test_observation_workspace_lookup_and_delivery_use_the_same_user(self) -> None:
+        config = UnitBoardSourcesConfig.from_record(
+            {
+                "version": 1,
+                "sources": [
+                    {
+                        "host_id": "devcontainer",
+                        "kind": "container",
+                        "container": "CONTAINER-SENTINEL",
+                        "container_user": "1000:1000",
+                        "label": "dev container",
+                    }
+                ],
+            }
+        )
+        answer_map = answers()
+
+        class ContainerRunner:
+            def __init__(self) -> None:
+                self.argvs: list[list[str]] = []
+
+            def __call__(self, argv, **kwargs):
+                self.argvs.append(list(argv))
+                for expected_args, answer in answer_map.items():
+                    if all(token in argv for token in expected_args):
+                        stdout = answer if isinstance(answer, str) else json.dumps(answer)
+                        return subprocess.CompletedProcess(argv, 0, stdout, "")
+                return subprocess.CompletedProcess(argv, 127, "", "")
+
+        runner = ContainerRunner()
+        runtime = MultiSourceUnitBoardRuntime(
+            config,
+            local_runtime=FakeLocalRuntime(),
+            runner=runner,
+            clock=MovableClock(),
+        )
+        action = RemoteUnitActionRail(runtime, clock=MovableClock())
+        unit_id = next(
+            unit.unit_id
+            for unit in runtime.snapshot().units
+            if unit.host_id == "devcontainer"
+        )
+
+        result = action.apply(action.preview(request(unit_id)))
+
+        self.assertEqual(result.state, ACTION_DELIVERED)
+        self.assertGreaterEqual(len(runner.argvs), 3)
+        for argv in runner.argvs:
+            self.assertEqual(
+                argv[:5],
+                [
+                    "docker",
+                    "exec",
+                    "--user",
+                    "1000:1000",
+                    "CONTAINER-SENTINEL",
+                ],
+            )
+
+
 class DeliveryModeTests(unittest.TestCase):
     """Redmine #15198: the route is special, the send rail is not."""
 
@@ -802,10 +871,9 @@ class ApplyDeliveryTests(unittest.TestCase):
         self.assertEqual(result.reason, REASON_UNIT_UNRESOLVED)
 
     def test_a_zero_exit_with_a_non_delivered_outcome_is_not_delivered(self) -> None:
-        # rc 0 is not proof of delivery: a parked composer and a
-        # marker-unobserved queue-enter both exit 0 without reaching a receiver.
-        # None of them is a zero-send either — the body was typed — so each is
-        # `uncertain`, and the operator is told not to blind-retry.
+        # rc 0 is not causal delivery proof. A pending body is parked in the receiver
+        # composer and a tmux-compatible queue-enter may be only practically queued.
+        # Neither is zero-send, so each is `uncertain` and must not be blind-retried.
         for label, outcome in (
             ("blocked", delivery_record(status="blocked", reason="turn_start_unconfirmed")),
             ("pending_input", delivery_record(status="pending_input", reason="ok")),
@@ -847,6 +915,84 @@ class ApplyDeliveryTests(unittest.TestCase):
         self.assertEqual(result.reason, REASON_DELIVERY_UNCERTAIN)
         self.assertEqual(result.injection_stage, STAGE_UNCERTAIN_PARTIAL)
         self.assertTrue(result.as_payload()["blind_retry_prohibited"])
+
+    def test_transport_failure_exposes_only_the_closed_gateway_diagnostics(self) -> None:
+        private_stderr = "ssh failed: /srv/private/repository"
+
+        class FailedPrimitiveRunner(RecordingRunner):
+            def __call__(self, argv, **kwargs):
+                if "project-gateway" in argv[-1]:
+                    self.argvs.append(list(argv))
+                    stdout = delivery_record(
+                        status="blocked",
+                        reason="transport_error",
+                        transport_failure={
+                            "primitive": STEP_SEND_KEYS_ENTER,
+                            "detail": "adapter exception must stay private",
+                        },
+                    )
+                    return subprocess.CompletedProcess(argv, 3, stdout, private_stderr)
+                return super().__call__(argv, **kwargs)
+
+        runner = FailedPrimitiveRunner(answers())
+        runtime = MultiSourceUnitBoardRuntime(
+            REMOTE_CONFIG,
+            local_runtime=FakeLocalRuntime(),
+            runner=runner,
+            clock=MovableClock(),
+        )
+        action = RemoteUnitActionRail(runtime, clock=MovableClock())
+        unit_id = remote_unit_id(runtime)
+
+        result = action.apply(action.preview(request(unit_id)))
+
+        self.assertEqual(result.state, ACTION_UNCERTAIN)
+        self.assertEqual(result.injection_stage, STAGE_UNCERTAIN_PARTIAL)
+        self.assertEqual(result.gateway_status, "blocked")
+        self.assertEqual(result.gateway_reason, "transport_error")
+        self.assertEqual(result.transport_primitive, STEP_SEND_KEYS_ENTER)
+        rendered = json.dumps(result.as_payload())
+        self.assertNotIn(private_stderr, rendered)
+        self.assertNotIn("adapter exception", rendered)
+        self.assertNotIn("/srv/private", rendered)
+
+    def test_free_form_transport_failure_diagnostics_are_dropped(self) -> None:
+        private_stderr = "ssh failed: /srv/private/repository"
+
+        class FreeFormFailureRunner(RecordingRunner):
+            def __call__(self, argv, **kwargs):
+                if "project-gateway" in argv[-1]:
+                    self.argvs.append(list(argv))
+                    stdout = delivery_record(
+                        status="blocked",
+                        reason="transport_error",
+                        transport_failure={
+                            "primitive": "send failed: /srv/private/repository",
+                            "stderr": private_stderr,
+                        },
+                    )
+                    return subprocess.CompletedProcess(argv, 3, stdout, private_stderr)
+                return super().__call__(argv, **kwargs)
+
+        runner = FreeFormFailureRunner(answers())
+        runtime = MultiSourceUnitBoardRuntime(
+            REMOTE_CONFIG,
+            local_runtime=FakeLocalRuntime(),
+            runner=runner,
+            clock=MovableClock(),
+        )
+        action = RemoteUnitActionRail(runtime, clock=MovableClock())
+        unit_id = remote_unit_id(runtime)
+
+        result = action.apply(action.preview(request(unit_id)))
+
+        self.assertEqual(result.state, ACTION_UNCERTAIN)
+        self.assertEqual(result.gateway_status, "")
+        self.assertEqual(result.gateway_reason, "")
+        self.assertEqual(result.transport_primitive, "")
+        rendered = json.dumps(result.as_payload())
+        self.assertNotIn(private_stderr, rendered)
+        self.assertNotIn("/srv/private", rendered)
 
     def test_a_pre_injection_gateway_refusal_is_a_zero_send(self) -> None:
         # The other half of the distinction: the target gateway refused BEFORE
@@ -915,6 +1061,69 @@ class ApplyDeliveryTests(unittest.TestCase):
         rendered = json.dumps(result.as_payload())
         self.assertNotIn("%1075", rendered)
         self.assertNotIn("/srv/checkouts", rendered)
+
+    def test_response_mode_must_match_the_requested_mode(self) -> None:
+        # A stale/other-mode host answer cannot grant success to this request.
+        # The command ran, so the fail-closed answer is uncertain rather than a
+        # zero-send refusal.
+        for label, outcome in (
+            ("missing", '{"status":"sent","reason":"ok"}'),
+            ("standard", delivery_record(mode="standard")),
+            ("pending", delivery_record(mode="pending")),
+        ):
+            with self.subTest(mode=label):
+                action, runtime, _ = rail(answers({GATEWAY_ARGS: outcome}))
+                unit_id = remote_unit_id(runtime)
+
+                result = action.apply(action.preview(request(unit_id)))
+
+                self.assertEqual(result.state, ACTION_UNCERTAIN)
+                self.assertEqual(result.injection_stage, STAGE_UNCERTAIN_PARTIAL)
+
+    def test_carried_queue_success_without_current_causal_proof_is_uncertain(self) -> None:
+        raw = delivery_record(observation=None).splitlines()[-1]
+        payload = json.loads(raw)
+        payload["injection_stage"] = {"stage": STAGE_SUBMITTED_CONFIRMED}
+        action, runtime, _ = rail(
+            answers({GATEWAY_ARGS: json.dumps(payload)})
+        )
+        unit_id = remote_unit_id(runtime)
+
+        result = action.apply(action.preview(request(unit_id)))
+
+        self.assertEqual(result.state, ACTION_UNCERTAIN)
+        self.assertEqual(result.injection_stage, STAGE_UNCERTAIN_PARTIAL)
+
+    def test_explicit_malformed_carried_stage_never_falls_back_to_success(self) -> None:
+        raw = delivery_record().splitlines()[-1]
+        for malformed in ({"stage": "bogus"}, {}, "submitted_confirmed"):
+            with self.subTest(carried=malformed):
+                payload = json.loads(raw)
+                payload["injection_stage"] = malformed
+                action, runtime, _ = rail(
+                    answers({GATEWAY_ARGS: json.dumps(payload)})
+                )
+                unit_id = remote_unit_id(runtime)
+
+                result = action.apply(action.preview(request(unit_id)))
+
+                self.assertEqual(result.state, ACTION_UNCERTAIN)
+                self.assertEqual(
+                    result.injection_stage, STAGE_UNCERTAIN_PARTIAL
+                )
+
+    def test_pending_mode_cannot_claim_a_confirmed_submission(self) -> None:
+        action, runtime, _ = rail(
+            answers({GATEWAY_ARGS: delivery_record(mode="pending")})
+        )
+        unit_id = remote_unit_id(runtime)
+
+        result = action.apply(
+            action.preview(request(unit_id, delivery_mode="pending"))
+        )
+
+        self.assertEqual(result.state, ACTION_UNCERTAIN)
+        self.assertEqual(result.injection_stage, STAGE_UNCERTAIN_PARTIAL)
 
     def test_output_after_the_outcome_line_is_not_ignored(self) -> None:
         # The contract picks the LAST line; scanning past it for something

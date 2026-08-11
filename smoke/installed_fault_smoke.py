@@ -199,6 +199,99 @@ def recover_stale_accepts(outcome: "dict | None") -> bool:
     )
 
 
+def session_rollback_accepts(outcome: "dict | None") -> bool:
+    """Accept only the installed zero-close terminal current Herdr can safely provide.
+
+    Herdr protocol 19 has no server-side conditional close for one observed terminal generation.
+    The representative is therefore green only when preflight, execute, and replay all preserve
+    the exact participant and debt; the execute must return nonzero with the typed
+    ``conditional_close_unavailable`` reason. This is deliberately stricter than treating any
+    blocked rollback as a successful smoke.
+    """
+    if not isinstance(outcome, dict):
+        return False
+    preflight = outcome.get("preflight")
+    execute = outcome.get("execute")
+    replay = outcome.get("replay")
+    if not all(isinstance(item, dict) for item in (preflight, execute, replay)):
+        return False
+
+    def participant(payload: dict) -> "dict | None":
+        rows = payload.get("participants")
+        if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+            return None
+        return rows[0]
+
+    preflight_participant = participant(preflight)
+    execute_participant = participant(execute)
+    replay_participant = participant(replay)
+    if not all(
+        isinstance(item, dict)
+        for item in (
+            preflight_participant,
+            execute_participant,
+            replay_participant,
+        )
+    ):
+        return False
+    participants = (
+        preflight_participant,
+        execute_participant,
+        replay_participant,
+    )
+    assert all(item is not None for item in participants)
+    def nonblank_text(value: object) -> bool:
+        return type(value) is str and bool(value.strip())
+
+    action_id = preflight.get("action_id")
+    identity = (
+        preflight_participant.get("role"),
+        preflight_participant.get("assigned_name"),
+        preflight_participant.get("locator"),
+    )
+    return bool(
+        type(outcome.get("preflight_exit")) is int
+        and outcome.get("preflight_exit") == 0
+        and type(outcome.get("execute_exit")) is int
+        and outcome.get("execute_exit") == 1
+        and type(outcome.get("replay_exit")) is int
+        and outcome.get("replay_exit") == 0
+        and nonblank_text(action_id)
+        and nonblank_text(execute.get("action_id"))
+        and nonblank_text(replay.get("action_id"))
+        and execute.get("action_id") == action_id
+        and replay.get("action_id") == action_id
+        and preflight.get("state") == "blocked"
+        and preflight.get("reason") == "preflight_only"
+        and preflight.get("executed") is False
+        and execute.get("state") == "blocked"
+        and execute.get("reason") == "conditional_close_unavailable"
+        and execute.get("executed") is False
+        and replay.get("state") == "blocked"
+        and replay.get("reason") == "preflight_only"
+        and replay.get("executed") is False
+        and identity[0] == "claude"
+        and all(nonblank_text(value) for value in identity[1:])
+        and all(
+            (
+                row.get("role"),
+                row.get("assigned_name"),
+                row.get("locator"),
+            )
+            == identity
+            for row in participants
+        )
+        and all(
+            row.get("verdict") == "conditional_close_unavailable"
+            and row.get("closed") is False
+            for row in participants
+        )
+        and outcome.get("agents_unchanged") is True
+        and type(outcome.get("live_agent_count")) is int
+        and outcome.get("live_agent_count") == 1
+    )
+
+
 def build_summary(
     *, provenance_problems: list[str], wheel_name: str, wheel_sha256: str,
     entrypoints: dict[str, int], representative: dict[str, bool],

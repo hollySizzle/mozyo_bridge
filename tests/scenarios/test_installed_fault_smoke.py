@@ -8,6 +8,7 @@ verdict, the summary verdict, and the artifact digest — with no subprocess, ex
 
 from __future__ import annotations
 
+import copy
 import importlib.util
 import tempfile
 import unittest
@@ -261,6 +262,136 @@ class RecoverStaleAcceptsTests(unittest.TestCase):
             self.assertEqual(mod.main([]), 0)
 
 
+class SessionRollbackAcceptsTests(unittest.TestCase):
+    """The installed rollback is green only for typed zero-close debt preservation."""
+
+    @staticmethod
+    def _participant():
+        return {
+            "role": "claude",
+            "assigned_name": "mzb1_fixture_claude_lane",
+            "locator": "w1:p2",
+            "verdict": "conditional_close_unavailable",
+            "closed": False,
+        }
+
+    def _make_outcome(self):
+        action_id = "startup-fixture"
+        preflight = {
+            "action_id": action_id,
+            "state": "blocked",
+            "reason": "preflight_only",
+            "executed": False,
+            "participants": [self._participant()],
+        }
+        execute = copy.deepcopy(preflight)
+        execute["reason"] = "conditional_close_unavailable"
+        replay = copy.deepcopy(preflight)
+        return {
+            "preflight": preflight,
+            "execute": execute,
+            "replay": replay,
+            "preflight_exit": 0,
+            "execute_exit": 1,
+            "replay_exit": 0,
+            "agents_unchanged": True,
+            "live_agent_count": 1,
+        }
+
+    def test_accepts_typed_zero_close_and_retained_debt(self):
+        self.assertTrue(mod.session_rollback_accepts(self._make_outcome()))
+
+    def test_missing_or_malformed_outcome_is_rejected(self):
+        self.assertFalse(mod.session_rollback_accepts(None))
+        self.assertFalse(mod.session_rollback_accepts({}))
+        self.assertFalse(mod.session_rollback_accepts("blocked"))
+
+    def test_each_safety_dimension_is_load_bearing(self):
+        mutations = (
+            ("preflight nonzero", lambda value: value.update(preflight_exit=1)),
+            ("execute falsely zero", lambda value: value.update(execute_exit=0)),
+            ("replay nonzero", lambda value: value.update(replay_exit=1)),
+            (
+                "action changed",
+                lambda value: value["replay"].update(action_id="startup-other"),
+            ),
+            (
+                "preflight actionable",
+                lambda value: value["preflight"].update(state="actionable"),
+            ),
+            (
+                "execute completed",
+                lambda value: value["execute"].update(state="completed"),
+            ),
+            (
+                "execute reason weakened",
+                lambda value: value["execute"].update(reason="rollback_blocked"),
+            ),
+            (
+                "execute claimed",
+                lambda value: value["execute"].update(executed=True),
+            ),
+            (
+                "replay discharged",
+                lambda value: value["replay"].update(reason="already_rolled_back"),
+            ),
+            (
+                "participant eligible",
+                lambda value: value["execute"]["participants"][0].update(
+                    verdict="eligible"
+                ),
+            ),
+            (
+                "participant closed",
+                lambda value: value["execute"]["participants"][0].update(
+                    closed=True
+                ),
+            ),
+            (
+                "participant changed",
+                lambda value: value["replay"]["participants"][0].update(
+                    locator="w1:p3"
+                ),
+            ),
+            (
+                "action id is not text",
+                lambda value: [
+                    payload.update(action_id=7)
+                    for payload in (
+                        value["preflight"], value["execute"], value["replay"]
+                    )
+                ],
+            ),
+            ("exit bool aliases zero", lambda value: value.update(preflight_exit=False)),
+            (
+                "assigned name is not text",
+                lambda value: [
+                    payload["participants"][0].update(assigned_name=["fixture"])
+                    for payload in (
+                        value["preflight"], value["execute"], value["replay"]
+                    )
+                ],
+            ),
+            (
+                "locator is not text",
+                lambda value: [
+                    payload["participants"][0].update(locator={"pane": "p2"})
+                    for payload in (
+                        value["preflight"], value["execute"], value["replay"]
+                    )
+                ],
+            ),
+            ("inventory changed", lambda value: value.update(agents_unchanged=False)),
+            ("inventory empty", lambda value: value.update(live_agent_count=0)),
+            ("inventory count bool", lambda value: value.update(live_agent_count=True)),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label):
+                outcome = self._make_outcome()
+                mutate(outcome)
+                self.assertFalse(mod.session_rollback_accepts(outcome), label)
+
+
 class Sha256Tests(unittest.TestCase):
     def test_matches_hashlib(self):
         import hashlib
@@ -469,6 +600,290 @@ class Post14741InstalledFixtureTests(unittest.TestCase):
             ),
             [fresh_locator],
         )
+
+    def test_rollback_fixture_records_exact_terminal_bound_v2_identity(self):
+        """The installed representative reaches the capability blocker, not a legacy receipt."""
+        from mozyo_bridge.core.state.herdr_native_identity_binding import (
+            HerdrNativeIdentityBindingStore,
+        )
+        from mozyo_bridge.core.state.startup_transaction_fence import (
+            StartupTransactionFence,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
+            parse_pane_bound_receipt,
+        )
+
+        driver = self._driver()
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            fake = driver.FakeHerdr()
+            native_workspace = fake.seed_workspace(cwd=directory)
+            fence = StartupTransactionFence(home=home)
+            action_id, locator = driver._seed_owed_rollback(
+                fence,
+                fake,
+                home,
+                "fixture-workspace",
+                "issue_15242_rollback",
+                "nonce",
+            )
+            action = fence.read(action_id)
+            self.assertIsNotNone(action)
+            receipt = parse_pane_bound_receipt(action.participants[0].receipt)
+            self.assertIsNotNone(receipt)
+            logical_name = action.participants[0].assigned_name
+            live = next(row for row in fake.to_state()["agents"] if row["pane_id"] == locator)
+            resolved_logical = HerdrNativeIdentityBindingStore(home=home).resolve_native(
+                receipt.native_name
+            )
+
+        self.assertEqual(receipt.workspace_id, native_workspace)
+        self.assertEqual(receipt.tab_id, f"{native_workspace}:t1")
+        self.assertEqual(receipt.native_name, live["name"])
+        self.assertEqual(receipt.terminal_id, live["terminal_id"])
+        self.assertEqual(live["logical_name"], logical_name)
+        self.assertEqual(resolved_logical, logical_name)
+
+    def test_recovery_fixture_finalizes_generation_only_through_composite_proof(self):
+        from mozyo_bridge.core.state.herdr_launch_generation import (
+            GENERATION_ATTESTED,
+            HerdrLaunchGenerationStore,
+        )
+        from mozyo_bridge.core.state.startup_transaction_fence import (
+            StartupTransactionFence,
+        )
+
+        driver = self._driver()
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            fake = driver.FakeHerdr()
+            fake.seed_workspace(cwd=directory)
+            fence = StartupTransactionFence(home=home)
+            action_id, locator = driver._seed_owed_rollback(
+                fence,
+                fake,
+                home,
+                "fixture-workspace",
+                "issue_15242_generation",
+                "nonce",
+            )
+            action = fence.read(action_id)
+            assigned_name = action.participants[0].assigned_name
+            generations = HerdrLaunchGenerationStore(home=home)
+            generations.reserve_pending(
+                assigned_name=assigned_name,
+                startup_action_id=action_id,
+                workspace_id="fixture-workspace",
+                role="claude",
+                lane_id="issue_15242_generation",
+            )
+            finalized = driver._attest_fresh_recovery_generation(
+                home=home,
+                fake=fake,
+                assigned_name=assigned_name,
+                workspace_id="fixture-workspace",
+                lane_id="issue_15242_generation",
+                locator=locator,
+                observed_at="2026-08-11T00:00:00+00:00",
+                replacement_action_id="replacement-fixture",
+            )
+            record = generations.read(assigned_name)
+
+        self.assertTrue(finalized)
+        self.assertEqual(record.phase, GENERATION_ATTESTED)
+        self.assertEqual(record.startup_action_id, action_id)
+        self.assertEqual(record.locator, locator)
+
+    def test_standalone_fake_wait_stays_pending_until_enter(self):
+        import json
+        import os
+        import subprocess
+        import time
+
+        driver = self._driver()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state.json"
+            fake = driver.FakeHerdr()
+            workspace = fake.seed_workspace(cwd=directory)
+            target = fake.seed_agent(
+                "claude-fixture", workspace_id=workspace, provider="claude"
+            )
+            fake.arm_transition(target, "working")
+            state.write_text(json.dumps(fake.to_state()), encoding="utf-8")
+            env = {**os.environ, "MOZYO_FAKE_HERDR_STATE": str(state)}
+            wait = subprocess.Popen(
+                [
+                    str(driver._FAKE_HERDR_CLI),
+                    "agent", "wait", target,
+                    "--until", "working", "--timeout", "2000",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+            try:
+                deadline = time.monotonic() + 1
+                registrations = list(root.glob(".state.json.wait-*"))
+                while not registrations and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                    registrations = list(root.glob(".state.json.wait-*"))
+                self.assertEqual(len(registrations), 1)
+                registration = registrations[0]
+                self.assertIsNone(wait.poll())
+                sent = subprocess.run(
+                    [
+                        str(driver._FAKE_HERDR_CLI),
+                        "pane", "send-keys", target, "enter",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    check=False,
+                )
+                out, err = wait.communicate(timeout=3)
+            finally:
+                if wait.poll() is None:
+                    wait.kill()
+                    wait.communicate()
+            restored = driver.FakeHerdr.from_state(
+                json.loads(state.read_text(encoding="utf-8"))
+            )
+
+        self.assertEqual(sent.returncode, 0)
+        self.assertEqual(wait.returncode, 0)
+        self.assertIn("pane.agent_status_changed", out)
+        self.assertEqual(err, "")
+        self.assertEqual(restored.agent_named("claude-fixture")["status"], "working")
+        self.assertFalse(registration.exists())
+
+    def test_standalone_fake_body_send_does_not_fire_the_wait(self):
+        import json
+        import os
+        import subprocess
+        import time
+
+        driver = self._driver()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state.json"
+            fake = driver.FakeHerdr()
+            workspace = fake.seed_workspace(cwd=directory)
+            target = fake.seed_agent(
+                "claude-fixture", workspace_id=workspace, provider="claude"
+            )
+            fake.arm_transition(target, "working")
+            state.write_text(json.dumps(fake.to_state()), encoding="utf-8")
+            env = {**os.environ, "MOZYO_FAKE_HERDR_STATE": str(state)}
+            wait = subprocess.Popen(
+                [
+                    str(driver._FAKE_HERDR_CLI),
+                    "agent", "wait", target,
+                    "--until", "working", "--timeout", "500",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+            try:
+                deadline = time.monotonic() + 1
+                registrations = list(root.glob(".state.json.wait-*"))
+                while not registrations and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                    registrations = list(root.glob(".state.json.wait-*"))
+                self.assertEqual(len(registrations), 1)
+                registration = registrations[0]
+                self.assertIsNone(wait.poll())
+                sent = subprocess.run(
+                    [
+                        str(driver._FAKE_HERDR_CLI),
+                        "pane", "send-text", target, "body",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    check=False,
+                )
+                out, err = wait.communicate(timeout=3)
+            finally:
+                if wait.poll() is None:
+                    wait.kill()
+                    wait.communicate()
+            restored = driver.FakeHerdr.from_state(
+                json.loads(state.read_text(encoding="utf-8"))
+            )
+
+        self.assertEqual(sent.returncode, 0)
+        self.assertEqual(wait.returncode, 1)
+        self.assertEqual(out, "")
+        self.assertIn("timed out", err)
+        self.assertNotEqual(
+            restored.agent_named("claude-fixture")["status"], "working"
+        )
+        self.assertFalse(registration.exists())
+
+    def test_standalone_fake_enter_without_an_armed_wait_does_not_fire(self):
+        import json
+        import os
+        import subprocess
+
+        driver = self._driver()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state.json"
+            fake = driver.FakeHerdr()
+            workspace = fake.seed_workspace(cwd=directory)
+            target = fake.seed_agent(
+                "claude-fixture", workspace_id=workspace, provider="claude"
+            )
+            fake.arm_transition(target, "working")
+            state.write_text(json.dumps(fake.to_state()), encoding="utf-8")
+            env = {**os.environ, "MOZYO_FAKE_HERDR_STATE": str(state)}
+            sent = subprocess.run(
+                [
+                    str(driver._FAKE_HERDR_CLI),
+                    "pane", "send-keys", target, "enter",
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+            restored_state = json.loads(state.read_text(encoding="utf-8"))
+            restored = driver.FakeHerdr.from_state(restored_state)
+
+        self.assertEqual(sent.returncode, 0)
+        self.assertEqual(sent.stderr, "")
+        self.assertNotEqual(
+            restored.agent_named("claude-fixture")["status"], "working"
+        )
+        self.assertEqual(restored_state["armed_transitions"], [[target, "working"]])
+
+    def test_fake_transition_diagnostic_reads_the_canonical_top_level_queue(self):
+        import json
+
+        driver = self._driver()
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            fake = driver.FakeHerdr()
+            workspace = fake.seed_workspace(cwd=directory)
+            target = fake.seed_agent(
+                "claude-fixture", workspace_id=workspace, provider="claude"
+            )
+            fake.arm_transition(target, "working")
+            pending = fake.to_state()
+            state.write_text(json.dumps(pending), encoding="utf-8")
+            self.assertFalse(driver._fake_transition_observed(state))
+
+            pending["armed_transitions"] = []
+            state.write_text(json.dumps(pending), encoding="utf-8")
+            self.assertTrue(driver._fake_transition_observed(state))
+
+            pending.pop("armed_transitions")
+            state.write_text(json.dumps(pending), encoding="utf-8")
+            self.assertIsNone(driver._fake_transition_observed(state))
 
     def test_callback_fixture_proves_issue_journal_ownership_to_the_live_adapter(self):
         """The positive callback smoke must satisfy #14246, not bypass its ownership gate."""

@@ -119,6 +119,8 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     IdentityAttestationRecord,
     VERDICT_PRESENT,
 )
+from mozyo_bridge.core.state.herdr_native_identity_binding import native_name_for
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import pane_bound_receipt
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_health import (  # noqa: E501
     COMPENSATION_NOT_NEEDED,
     COMPENSATION_ROLLBACK_OWED,
@@ -290,12 +292,38 @@ class _RollbackOps:
             self.rows = [r for r in self.rows if r.get("pane_id") != locator]
         return _CloseResult(closed=list(targets))
 
-    def close_current_generation(self, action, targets, *, store_home):
-        return self.close(action.unit.workspace_id, action.unit.lane_id, targets)
+    def supports_conditional_close(self):
+        return True
+
+    def close_agent_participant(self, *, workspace_id, lane_id, target):
+        matches = [
+            row for row in self.rows
+            if row.get("name") == target.assigned_name
+            and row.get("pane_id") == target.locator
+            and row.get("native_name") == target.native_name
+            and row.get("terminal_id") == target.terminal_id
+            and row.get("agent") == target.role
+        ]
+        if len(matches) != 1:
+            return False, "terminal generation changed before close"
+        self.close(workspace_id, lane_id, ((target.role, target.locator),))
+        return True, ""
+
+    def close_prepared_pane(self, **_kwargs):
+        return False, "prepared close disabled"
 
     def current_generation_targets_absent(self, action, targets, *, store_home):
         live = {row.get("pane_id") for row in self.rows}
         return all(locator not in live for _role, locator in targets)
+
+
+def _rollback_receipt(assigned_name, terminal_id):
+    return pane_bound_receipt(
+        target_workspace="w2G",
+        target_tab="w2G:t1",
+        native_name=native_name_for(assigned_name),
+        terminal_id=terminal_id,
+    )
 
 
 class RealDriveWiringTest(unittest.TestCase):
@@ -332,7 +360,8 @@ class RealDriveWiringTest(unittest.TestCase):
             action.action_id,
             Participant(
                 role="claude", assigned_name=self.assigned,
-                locator=self.fresh_locator, receipt="workspace=w2G",
+                locator=self.fresh_locator,
+                receipt=_rollback_receipt(self.assigned, "terminal:claude"),
             ),
         )
         self.fence.set_phase(action.action_id, PHASE_ROLLBACK_OWED)
@@ -465,6 +494,7 @@ class RealDriveWiringTest(unittest.TestCase):
             "name": self.assigned, "pane_id": self.fresh_locator,
             "agent": "claude", "agent_status": "idle",
             "terminal_id": "terminal:claude",
+            "native_name": native_name_for(self.assigned),
         }]
         preflight = run_session_rollback(
             action_id=action_id, ops=_RollbackOps(rows),
@@ -515,7 +545,8 @@ class V1ReplacementBindingRollbackRailTest(unittest.TestCase):
             action.action_id,
             Participant(
                 role="claude", assigned_name=self.assigned,
-                locator=self.FRESH_LOCATOR, receipt="workspace=w2G",
+                locator=self.FRESH_LOCATOR,
+                receipt=_rollback_receipt(self.assigned, "terminal:claude"),
             ),
         )
         startup_fence.set_phase(action.action_id, PHASE_ROLLBACK_OWED)
@@ -553,6 +584,7 @@ class V1ReplacementBindingRollbackRailTest(unittest.TestCase):
             "name": self.assigned, "pane_id": self.FRESH_LOCATOR,
             "agent": "claude", "agent_status": "idle",
             "terminal_id": "terminal:claude",
+            "native_name": native_name_for(self.assigned),
         }]
 
     def test_public_rollback_then_replay_converges_to_a_new_action_id(self):

@@ -180,6 +180,8 @@ class BackendInventoryTest(unittest.TestCase):
         return {
             "name": encode_assigned_name(workspace, role, lane),
             "pane_id": locator,
+            "terminal_id": f"terminal-{locator}",
+            "revision": 7,
             "agent": role,
             "agent_status": "idle",
             "cwd": f"{REPO}/projects/{PROJECT}",
@@ -204,7 +206,10 @@ class BackendInventoryTest(unittest.TestCase):
         self.assertEqual(payload["runtime"]["provider"], "herdr")
         self.assertEqual(payload["runtime"]["pane_id"], "w1:p1")
         self.assertEqual(payload["runtime"]["assigned_name"], candidate.pane_id)
-        self.assertEqual(inventory.observations[0].generation_token, "generation-1")
+        observation = inventory.observations[0]
+        self.assertEqual(observation.generation_token, "generation-1")
+        self.assertEqual(observation.terminal_id, "terminal-w1:p1")
+        self.assertIn("terminal-w1:p1", observation.process_generation)
 
     def test_herdr_session_selector_fails_before_inventory_read(self):
         ops = _InventoryOps()
@@ -268,6 +273,30 @@ class BackendInventoryTest(unittest.TestCase):
         with self.assertRaises(ProjectGatewayInventoryError) as caught:
             ProjectGatewayBackendInventoryUseCase(ops).discover(self._request())
         self.assertEqual(caught.exception.reason, "herdr_generation_unverified")
+
+    def test_missing_terminal_identity_is_typed_failure_before_generation_read(self):
+        ops = _InventoryOps()
+        row = self._row(ops.workspace)
+        row.pop("terminal_id")
+        ops.rows = [row]
+        ops.generation_token = Mock(return_value="generation-1")
+        with self.assertRaises(ProjectGatewayInventoryError) as caught:
+            ProjectGatewayBackendInventoryUseCase(ops).discover(self._request())
+        self.assertEqual(
+            caught.exception.reason, "herdr_terminal_identity_unavailable"
+        )
+        ops.generation_token.assert_not_called()
+
+    def test_missing_process_generation_is_typed_failure(self):
+        ops = _InventoryOps()
+        row = self._row(ops.workspace)
+        row.pop("revision")
+        ops.rows = [row]
+        with self.assertRaises(ProjectGatewayInventoryError) as caught:
+            ProjectGatewayBackendInventoryUseCase(ops).discover(self._request())
+        self.assertEqual(
+            caught.exception.reason, "herdr_process_generation_unavailable"
+        )
 
     def test_unreadable_generation_authority_is_typed_failure(self):
         ops = _InventoryOps()
@@ -445,6 +474,11 @@ class BackendInventoryTest(unittest.TestCase):
         self.assertEqual(prepared.target, inventory[0].pane_id)
         self.assertEqual(prepared.target_lane, "default")
         self.assertEqual(prepared.capability.generation_token, "generation-1")
+        self.assertEqual(prepared.capability.terminal_id, "terminal-w1:p1")
+        self.assertEqual(
+            prepared.capability.process_generation,
+            inventory.observations[0].process_generation,
+        )
         self.assertEqual(prepared.capability.purpose, "project_gateway")
 
     def test_delivery_revalidation_refuses_generation_drift(self):

@@ -67,6 +67,18 @@ TRANSPORT_STEPS: tuple[str, ...] = (
 )
 
 
+def transport_failure_telemetry(primitive: str) -> dict[str, str]:
+    """Return the redaction-safe structured diagnostic for one failed primitive.
+
+    Only a rail-owned token may cross this boundary.  In particular, the
+    adapter exception is never inspected here, so binary paths and backend
+    error text cannot leak into the outcome or a remote Unit result.
+    """
+    if primitive not in TRANSPORT_STEPS:
+        raise ValueError("unknown handoff transport primitive")
+    return {"primitive": primitive}
+
+
 def transport_failure_die_message(*, primitive: str, target: str, marker: str) -> str:
     """The ``die`` text for a contained transport failure (pure; fixed prose only)."""
     return (
@@ -130,5 +142,6 @@ __all__ = (
     "STEP_SEND_TEXT_BODY",
     "TRANSPORT_STEPS",
     "close_transport_failure",
+    "transport_failure_telemetry",
     "transport_failure_die_message",
 )

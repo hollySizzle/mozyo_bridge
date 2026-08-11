@@ -269,6 +269,17 @@ class RegistrationTest(unittest.TestCase):
         self.assertTrue(ns.sweep)
         self.assertIs(ns.func, cli.cmd_workflow_callbacks)
 
+    def test_callbacks_help_names_the_current_herdr_wait_grammar(self):
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="command")
+        cli.register_callbacks(sub)
+        help_text = " ".join(sub.choices["callbacks"].format_help().split())
+        self.assertIn(
+            "agent wait TARGET --until STATUS --timeout MS",
+            help_text,
+        )
+        self.assertNotIn("wait agent-status", help_text)
+
 
 class IngestCliTest(_CliTestCase):
     def test_ingest_classifies_and_enqueues(self):

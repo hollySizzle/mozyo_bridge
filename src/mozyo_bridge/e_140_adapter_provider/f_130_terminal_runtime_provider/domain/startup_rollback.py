@@ -20,8 +20,9 @@ transaction created*, never a body an LLM or an operator put in a composer. So:
   are different facts with the same answer here (preserve), but collapsing them would make
   the *reason* unreportable — the #13892 R8 defect this issue's consultation re-found;
 - a recognised **startup blocker** is action-owned UI: this action put that screen there by
-  starting the provider, and no one has typed into it. It is closeable — and it is never
-  *answered* (accepting a trust prompt is an action in the provider's own UI, #13760).
+  starting the provider, and no one has typed into it. It passes this content fence, but
+  still requires a server-side conditional-close capability — and it is never *answered*
+  (accepting a trust prompt is an action in the provider's own UI, #13760).
 
 Every predicate is a positive fact. Nothing here progresses on the absence of evidence.
 """
@@ -30,8 +31,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-#: Close it: this action started it, the world still agrees, and nothing is owed to it.
-#: This verdict — and ONLY this one — names a live pane to close.
+#: Capability-independent candidate: this action started it, the world still agrees, and
+#: nothing is owed to it. This verdict — and ONLY this one — names a live pane that may be
+#: closed after the caller separately proves server-side conditional-close support.
 ROLLBACK_ELIGIBLE = "eligible"
 #: Positively absent: the durable name is not in the live inventory at all. Settled, so a
 #: partial rollback resumes past it — but NOT a close target (review j#81070 R1-F2).
@@ -58,10 +60,16 @@ ROLLBACK_INVENTORY_UNREADABLE = "inventory_unreadable"
 #: A live-state port (runtime state / composer) raised while reading this pane, so its
 #: idle/settle facts are unknown. Fail closed — an unreadable live state is not a settled one.
 ROLLBACK_LIVE_STATE_UNREADABLE = "live_state_unreadable"
+#: The runtime cannot atomically close only the generation that was observed.  A
+#: read-then-close sequence is not authority because the pane may be replaced between
+#: those operations; preserve every present participant until the server supplies the
+#: compare-and-close primitive tracked by Redmine #15243.
+ROLLBACK_CONDITIONAL_CLOSE_UNAVAILABLE = "conditional_close_unavailable"
 #: Already proven closed by this same action. Replay is answered from the record.
 ROLLBACK_ALREADY_CLOSED = "already_closed"
 
-#: Verdicts that name a live pane this rollback may close. Exactly one, on purpose: a
+#: Verdicts that name a live pane this rollback may close after a separate runtime
+#: capability proof. Exactly one, on purpose: a
 #: caller asking "is this a target?" must not be able to answer it from "is this settled?".
 ROLLBACK_CLOSE_TARGETS: frozenset[str] = frozenset({ROLLBACK_ELIGIBLE})
 
@@ -85,6 +93,7 @@ ROLLBACK_VERDICTS: frozenset[str] = frozenset(
         ROLLBACK_AGENT_BUSY,
         ROLLBACK_INVENTORY_UNREADABLE,
         ROLLBACK_LIVE_STATE_UNREADABLE,
+        ROLLBACK_CONDITIONAL_CLOSE_UNAVAILABLE,
         ROLLBACK_ALREADY_CLOSED,
     }
 )
@@ -101,7 +110,7 @@ COMPOSER_STARTUP_BLOCKER = "startup_blocker"
 ROLLBACK_DETAIL: dict[str, str] = {
     ROLLBACK_ELIGIBLE: (
         "this action started this exact pane, the live inventory still agrees, and "
-        "nothing is owed to it"
+        "nothing is owed to it; close still requires server-side conditional authority"
     ),
     ROLLBACK_ABSENT: (
         "this participant's durable name is not in the live inventory: it is already "
@@ -142,6 +151,11 @@ ROLLBACK_DETAIL: dict[str, str] = {
     ROLLBACK_LIVE_STATE_UNREADABLE: (
         "a live-state read (runtime state / composer) failed for this pane, so it cannot "
         "be shown idle with no pending input; fail closed and close nothing"
+    ),
+    ROLLBACK_CONDITIONAL_CLOSE_UNAVAILABLE: (
+        "the selected Herdr runtime has no server-side conditional close for the "
+        "observed pane generation; a client-side read followed by pane close is not "
+        "atomic, so this present participant is preserved and the rollback debt remains"
     ),
     ROLLBACK_ALREADY_CLOSED: (
         "this action already proved this participant closed; replay is answered from the "
@@ -253,6 +267,7 @@ __all__ = (
     "ROLLBACK_ALREADY_CLOSED",
     "ROLLBACK_AMBIGUOUS",
     "ROLLBACK_COMPOSER_UNREADABLE",
+    "ROLLBACK_CONDITIONAL_CLOSE_UNAVAILABLE",
     "ROLLBACK_DETAIL",
     "ROLLBACK_ELIGIBLE",
     "ROLLBACK_IDENTITY_DRIFT",

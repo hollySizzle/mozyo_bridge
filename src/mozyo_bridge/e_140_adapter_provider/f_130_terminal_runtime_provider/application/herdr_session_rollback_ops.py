@@ -34,6 +34,13 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     PREPARED_PANE_UNREADABLE,
     PreparedPaneObservation,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_rollback_contract import (  # noqa: E501
+    StartupRollbackAgentTarget,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_rollback import (  # noqa: E501
+    ROLLBACK_CONDITIONAL_CLOSE_UNAVAILABLE,
+    ROLLBACK_DETAIL,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (  # noqa: E501
     valid_target,
 )
@@ -62,99 +69,61 @@ class LiveStartupRollbackOps:
     def open_obligations(self, workspace_id: str, assigned_names: Sequence[str]):
         return self._retire_ops.open_obligations(workspace_id, assigned_names)
 
-    def close(self, workspace_id: str, lane_id: str, targets):
-        return self._retire_ops.close(workspace_id, lane_id, targets)
+    def supports_conditional_close(self) -> bool:
+        """Herdr's locator close has no server-side generation predicate."""
+        return False
 
-    def close_current_generation(self, action, targets, *, store_home):
-        """Freshly rejoin the whole batch to ``action`` immediately before close."""
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
-            HerdrRetireCloseResult,
-        )
+    def close_agent_participant(
+        self,
+        *,
+        workspace_id: str,
+        lane_id: str,
+        target: StartupRollbackAgentTarget,
+    ) -> tuple[bool, str]:
+        return False, ROLLBACK_DETAIL[ROLLBACK_CONDITIONAL_CLOSE_UNAVAILABLE]
+
+    def close_prepared_pane(
+        self,
+        *,
+        locator: str,
+        workspace_id: str,
+        tab_id: str,
+        expected_terminal_id: str = "",
+    ) -> tuple[bool, str]:
+        return False, ROLLBACK_DETAIL[ROLLBACK_CONDITIONAL_CLOSE_UNAVAILABLE]
+
+    def current_generation_targets_absent(self, action, targets, *, store_home) -> bool:
+        """Use one fresh full snapshot to prove every durable target terminal absent."""
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_rollback import (  # noqa: E501
-            _terminal_bound_action_target,
+            _terminal_bound_action_target_absent,
         )
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
             terminal_identity_snapshot_complete,
         )
-        try:
-            rows = tuple(self.agent_rows())
-            participants = {participant.role: participant for participant in action.participants}
-            complete = terminal_identity_snapshot_complete(rows)
-            exact = complete and all(
-                role in participants
-                and participants[role].locator == locator
-                and _terminal_bound_action_target(
-                    store_home, action, participants[role], rows, locator
-                )
-                for role, locator in targets
-            )
-        except Exception:  # noqa: BLE001 - an unreadable destructive-edge join closes none
-            exact = False
-        if not exact:
-            return HerdrRetireCloseResult(
-                workspace_id=action.unit.workspace_id,
-                lane_id=action.unit.lane_id,
-                failed=tuple(
-                    (role, locator, "current startup generation could not be rejoined")
-                    for role, locator in targets
-                ),
-            )
-        try:
-            result = self.close(action.unit.workspace_id, action.unit.lane_id, targets)
-        except Exception:  # noqa: BLE001 - provider detail may contain private identity
-            return HerdrRetireCloseResult(
-                workspace_id=action.unit.workspace_id,
-                lane_id=action.unit.lane_id,
-                failed=tuple(
-                    (role, locator, "terminal-bound pane close failed")
-                    for role, locator in targets
-                ),
-            )
-        return HerdrRetireCloseResult(
-            workspace_id=action.unit.workspace_id,
-            lane_id=action.unit.lane_id,
-            closed=tuple(getattr(result, "closed", ())),
-            failed=tuple(
-                (role, locator, "terminal-bound pane close failed")
-                for role, locator, _detail in getattr(result, "failed", ())
-            ),
-        )
-
-    def current_generation_targets_absent(self, action, targets, *, store_home) -> bool:
-        """Use one fresh full snapshot to prove every durable target terminal absent."""
-        from mozyo_bridge.core.state.lane_release_pin import ReleasePin
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_destructive_close_identity import (  # noqa: E501
-            pinned_generation_partition,
-        )
 
         participants = {participant.role: participant for participant in action.participants}
         try:
-            pins = tuple(
-                ReleasePin(
-                    role=role,
-                    assigned_name=participants[role].assigned_name,
-                    locator=locator,
-                    startup_action_id=action.action_id,
-                )
-                for role, locator in targets
-            )
             rows = tuple(self.agent_rows())
-            partition = pinned_generation_partition(
-                pins,
-                rows,
-                home=Path(store_home),
-                workspace_id=action.unit.workspace_id,
-                lane_id=action.unit.lane_id,
+            return bool(
+                terminal_identity_snapshot_complete(rows)
+                and all(
+                    role in participants
+                    and participants[role].locator == locator
+                    and _terminal_bound_action_target_absent(
+                        Path(store_home), action, participants[role], rows
+                    )
+                    for role, locator in targets
+                )
             )
         except Exception:  # noqa: BLE001 - absence is a positive proof
             return False
-        return partition is not None and not partition[0] and partition[1] == pins
 
     def _environ(self) -> Mapping[str, str]:
         return self._env if self._env is not None else os.environ
 
     def prepared_pane(
-        self, *, locator: str, workspace_id: str, tab_id: str
+        self, *, locator: str, workspace_id: str, tab_id: str,
+        expected_terminal_id: str = "",
     ) -> PreparedPaneObservation:
         """Read the exact Herdr 0.8 pane facts; never infer an empty input buffer."""
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
@@ -190,8 +159,20 @@ class LiveStartupRollbackOps:
                 detail="the complete Herdr pane inventory could not be read",
             )
         matches = [row for row in rows if row["pane_id"] == locator]
+        terminal_reclaimed = (
+            any(
+                row["pane_id"] != locator
+                and row.get("terminal_id") == expected_terminal_id
+                for row in rows
+            )
+            if expected_terminal_id
+            else None
+        )
         if not matches:
-            return PreparedPaneObservation(state=PREPARED_PANE_ABSENT)
+            return PreparedPaneObservation(
+                state=PREPARED_PANE_ABSENT,
+                terminal_reclaimed=terminal_reclaimed,
+            )
         if len(matches) != 1:
             return PreparedPaneObservation(
                 state=PREPARED_PANE_UNREADABLE,
@@ -200,12 +181,19 @@ class LiveStartupRollbackOps:
         row = matches[0]
         row_workspace = row["workspace_id"]
         row_tab = row["tab_id"]
+        terminal_id = (
+            row.get("terminal_id")
+            if type(row.get("terminal_id")) is str
+            else ""
+        )
         if row_workspace != workspace_id or row_tab != tab_id:
             return PreparedPaneObservation(
                 state=PREPARED_PANE_PRESENT,
                 locator=locator,
                 workspace_id=row_workspace,
                 tab_id=row_tab,
+                terminal_id=terminal_id,
+                terminal_reclaimed=terminal_reclaimed,
                 detail="the recorded container does not match the live pane inventory",
             )
         agent_absent = "agent" not in row
@@ -215,6 +203,8 @@ class LiveStartupRollbackOps:
                 locator=locator,
                 workspace_id=row_workspace,
                 tab_id=row_tab,
+                terminal_id=terminal_id,
+                terminal_reclaimed=terminal_reclaimed,
                 detail="the prepared pane now contains an agent",
             )
         shell_only = _read_shell_only(
@@ -228,6 +218,8 @@ class LiveStartupRollbackOps:
                 locator=locator,
                 workspace_id=row_workspace,
                 tab_id=row_tab,
+                terminal_id=terminal_id,
+                terminal_reclaimed=terminal_reclaimed,
                 agent_absent=True,
                 shell_only=False,
                 detail="the prepared pane could not be proven to contain only its shell",
@@ -240,6 +232,8 @@ class LiveStartupRollbackOps:
             locator=locator,
             workspace_id=row_workspace,
             tab_id=row_tab,
+            terminal_id=terminal_id,
+            terminal_reclaimed=terminal_reclaimed,
             agent_absent=True,
             shell_only=True,
             input_empty=None,
@@ -296,10 +290,12 @@ def _strict_pane_rows(stdout: object) -> tuple[Mapping[str, object], ...]:
     if not isinstance(rows, list) or any(not isinstance(row, Mapping) for row in rows):
         raise ValueError("pane list does not contain a complete pane array")
     pane_ids: set[str] = set()
+    terminal_ids: set[str] = set()
     for row in rows:
         pane_id = row.get("pane_id")
         workspace_id = row.get("workspace_id")
         tab_id = row.get("tab_id")
+        terminal_id = row.get("terminal_id")
         if (
             not valid_target(pane_id)
             or not valid_target(workspace_id)
@@ -308,9 +304,14 @@ def _strict_pane_rows(stdout: object) -> tuple[Mapping[str, object], ...]:
             or not tab_id.startswith(f"{workspace_id}:t")
             or tab_id == f"{workspace_id}:t"
             or pane_id in pane_ids
+            or type(terminal_id) is not str
+            or not terminal_id
+            or terminal_id.strip() != terminal_id
+            or terminal_id in terminal_ids
         ):
             raise ValueError("pane list contains a malformed or duplicate identity")
         pane_ids.add(pane_id)
+        terminal_ids.add(terminal_id)
     return tuple(rows)
 
 

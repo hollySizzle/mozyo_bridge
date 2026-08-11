@@ -23,10 +23,10 @@ before; when it is not observed within the window the send fails closed to
 ``blocked`` / ``turn_start_unconfirmed`` (a new reason in the existing
 ``marker_timeout``-style vocabulary) and rides the existing blocked-path
 fallback. No new transport or raw ``send-keys`` recovery path is added, and no
-prompt is auto-resent — the marker+body is typed exactly once. The queue-enter
-rail is deliberately NOT covered: its marker-unobserved path stays
-``sent`` / ``queue_enter`` (Redmine #13262 auditor boundary; a queue-enter
-contract change would need its own design record).
+prompt is auto-resent — the marker+body is typed exactly once. The capture-based
+observer remains standard-only. Herdr queue-enter now has a separate causal
+armed-wait envelope (Redmine #15242); its post-hoc runtime snapshot remains
+advisory and cannot confirm submission by itself.
 
 Signal choice (new output activity, not composer-clear-via-marker-absence): the
 receiver-state doctrine (``vibes/docs/logics/ack-completion-receiver-state.md``)
@@ -252,24 +252,25 @@ def project_herdr_turn_start(result: TurnStartResult) -> Tuple[str, str]:
 
 
 # --- queue-enter post-choreography turn-start observation (Redmine #13292) ----
-# The daily-default ``queue-enter`` rail's additive, telemetry-only turn-start
+# The daily-default ``queue-enter`` rail's additive post-choreography turn-start
 # observation under the herdr backend (j#72602 decision 5's deferred follow-up,
-# design confirmed in #13292 j#72759). Deliberately NOT the event-driven
-# ``HerdrTurnStartRail``: that rail OWNS injection and fails closed on
-# ``precondition_not_idle``, which #13262 / the #13292 constraints forbid on
-# queue-enter (its ``sent`` / ``queue_enter`` contract must not hard-block). This
-# observation instead leaves the existing queue-enter inject → Enter → Enter-only
-# retry choreography byte-identical and, AFTER it, takes a read-only
+# design confirmed in #13292 j#72759). The snapshot remains deliberately distinct
+# from the event-driven ``HerdrTurnStartRail``: that rail OWNS injection and fails
+# closed on ``precondition_not_idle``, which would remove queue-enter's busy-receiver
+# semantics. The original #13292 implementation left the inject → Enter choreography
+# unchanged and, AFTER it, took a read-only
 # ``agent get`` snapshot of the receiver's runtime state (#13246
-# ``read_agent_state``). The result is recorded as additive telemetry ONLY — it
-# never influences ``status`` / ``reason`` / ``next_action_owner`` and never blocks
-# the send; a read failure, an ``unknown`` state, or an ``awaiting_input`` (not yet
-# started) all fold to telemetry.
+# ``read_agent_state``). The snapshot fields remain advisory: a read failure, an
+# ``unknown`` state, or an ``awaiting_input`` state cannot confirm or reject this
+# send. Redmine #15242 merges separate armed-wait + coherent-generation evidence
+# into the queue observation envelope; only that causal evidence controls whether
+# the handoff is confirmed or ``blocked / turn_start_unconfirmed``.
 #
 # It is kept structurally distinct from the event rail's ``turn_start_outcome``
 # telemetry on purpose (j#72759 answer 3): a post-hoc snapshot does not prove
 # causality (it cannot attribute an observed ``busy`` to *this* send the way an
-# armed ``wait agent-status`` transition does), so mapping ``busy`` onto the rail's
+# armed ``agent wait TARGET --until STATUS --timeout MS`` transition does), so
+# mapping ``busy`` onto the rail's
 # ``started`` token would let the #12656 ledger / an auditor misread it as an
 # event-observed turn start. The telemetry therefore carries its own
 # ``observation_kind`` / ``source`` provenance and its own field name
@@ -300,10 +301,12 @@ _QUEUE_ENTER_SETTLED_STATES = frozenset(
 class QueueEnterTurnStartObservation:
     """The post-choreography herdr snapshot observation for the queue-enter rail.
 
-    Telemetry-only (Redmine #13292 j#72759): recorded additively on the delivery
-    record / JSON outcome and NEVER consulted for ``status`` / ``reason`` /
-    ``next_action_owner``. Tokens + a bool + numbers only, so it is safe verbatim in
-    the pasteable durable record and the opt-in persisted note.
+    Snapshot-only (Redmine #13292 j#72759): recorded additively on the delivery
+    record / JSON outcome. These fields do not prove causality and therefore cannot
+    confirm submission by themselves; Redmine #15242's separate armed-wait and
+    launch-generation fields control the queue outcome. Tokens + a bool + numbers
+    only, so it is safe verbatim in the pasteable durable record and the opt-in
+    persisted note.
 
     - ``runtime_state`` — the observed runtime receiver-state (a member of
       :data:`RUNTIME_RECEIVER_STATES`; ``unknown`` when the read failed or the
@@ -319,7 +322,7 @@ class QueueEnterTurnStartObservation:
     read_reason: Optional[str]
     poll_attempts: int
 
-    def to_telemetry_dict(self) -> dict:
+    def to_telemetry_dict(self) -> dict[str, object]:
         """The machine-readable queue-enter observation telemetry (Redmine #13292).
 
         Carries its own ``observation_kind`` / ``source`` provenance so a replaying
@@ -356,7 +359,9 @@ def observe_queue_enter_turn_start(
     is observed or ``window_seconds`` elapses — a non-positive window collapses to a
     single snapshot. This is read-only (``agent get``): it performs NO injection,
     NO Enter, and NO C-u rollback, and it never raises out — the reader itself fails
-    closed to an ``unknown`` state, which is recorded as telemetry, never a block.
+    closed to an ``unknown`` state. The snapshot is recorded as telemetry and cannot
+    independently prove success or choose a blocked reason; the separate causal
+    wait/generation evidence controls the overall queue-enter outcome.
     """
     if interval_seconds <= 0:
         interval_seconds = QUEUE_ENTER_OBSERVE_INTERVAL_SECONDS
@@ -393,11 +398,11 @@ _QUEUE_ENTER_STATE_DETAIL: dict = {
     RUNTIME_BUSY: "receiver is producing a turn (working)",
     RUNTIME_BLOCKED: (
         "receiver shows a runtime-observed block (a permission prompt is on "
-        "screen); telemetry only, this is not a workflow / handoff block"
+        "screen); this snapshot alone does not choose the handoff result"
     ),
     RUNTIME_AWAITING_INPUT: (
         "receiver is idle — no turn was observed starting within the window "
-        "(delivered, but a turn start was not observed)"
+        "and this snapshot alone cannot establish submission"
     ),
     RUNTIME_TURN_ENDED: "receiver's assistant turn had already finished",
     RUNTIME_UNKNOWN: "receiver runtime state was unreadable / unrecognised",
@@ -412,10 +417,11 @@ def queue_enter_turn_start_record_lines(
     Follows the #13166 / #13255 telemetry-line precedent: tokens + numbers + a
     fixed verdict phrase, no free text and no absolute paths, so it is safe in the
     pasteable delivery record and the opt-in persisted note. It explicitly labels
-    itself **telemetry-only** and does NOT reuse the event rail's
+    itself **snapshot-only** and does NOT reuse the event rail's
     ``Turn start (herdr rail)`` wording — a post-hoc snapshot is a different signal
-    from an armed-wait transition. It documents the observation only and never
-    overrides ``next_action``; the ``(status, reason)`` wire is unchanged.
+    from an armed-wait transition. The line therefore does not claim that it can
+    confirm submission or prevent a block; the merged causal envelope owns the
+    ``(status, reason)`` outcome.
     """
     if observation.read_ok:
         detail = _QUEUE_ENTER_STATE_DETAIL.get(
@@ -430,11 +436,12 @@ def queue_enter_turn_start_record_lines(
         (
             "- Queue-enter turn-start observation (herdr agent get): runtime_state "
             f"{observation.runtime_state} ({observation.poll_attempts} snapshot "
-            f"read(s)) — {detail}. Telemetry-only: an additive post-choreography "
-            "snapshot; the queue-enter status / reason / next_action are unchanged "
-            "and this never blocks the send. The observation performed no injection, "
-            "no Enter, and no C-u rollback (the marker+body and Enter were the "
-            "existing queue-enter rail's, typed as before)."
+            f"read(s)) — {detail}. Snapshot-only: this post-choreography state "
+            "does not by itself confirm submission or choose status / reason. The "
+            "Herdr queue-enter causal envelope — an armed working-transition wait "
+            "plus a coherent launch generation — controls the delivery outcome. "
+            "This snapshot reader is read-only; injection, Enter retry, and rollback "
+            "facts belong to the causal queue rail."
         )
     ]
 

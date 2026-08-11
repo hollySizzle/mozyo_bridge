@@ -262,14 +262,14 @@ class _ProjectGatewayEffectGuardTransport:
     ``inject_failed`` zero-send path.
     """
 
-    def __init__(self, delegate: object, verifier: Callable[[], None]) -> None:
+    def __init__(self, delegate: object, verifier: Callable[[bool], None]) -> None:
         self._delegate = delegate
         self._verifier = verifier
         self.backend = getattr(delegate, "backend", BACKEND_HERDR)
 
-    def _guard(self) -> Optional[TransportResult]:
+    def _guard(self, require_process_generation: bool) -> Optional[TransportResult]:
         try:
-            self._verifier()
+            self._verifier(require_process_generation)
         except Exception:  # noqa: BLE001 - any attestation failure blocks the effect
             return TransportResult.failure(
                 REASON_TRANSPORT_ERROR,
@@ -278,13 +278,15 @@ class _ProjectGatewayEffectGuardTransport:
         return None
 
     def send_text(self, target: str, text: str) -> TransportResult:
-        refused = self._guard()
+        refused = self._guard(True)
         if refused is not None:
             return refused
         return self._delegate.send_text(target, text)
 
     def send_keys(self, target: str, keys: str) -> TransportResult:
-        refused = self._guard()
+        # ``terminal.revision`` may advance after body injection.  Enter is still
+        # bound by terminal id + pane_bound_v2 generation, not that mutable snapshot.
+        refused = self._guard(False)
         if refused is not None:
             return refused
         return self._delegate.send_keys(target, keys)
@@ -297,7 +299,7 @@ class _ProjectGatewayEffectGuardTransport:
 
 def _guard_project_gateway_binding_effects(
     binding: TransportBinding,
-    verifier: Callable[[], None],
+    verifier: Callable[[bool], None],
 ) -> TransportBinding:
     """Guard each non-standard shim send effect before it reaches the binding."""
 
@@ -309,7 +311,7 @@ def _guard_project_gateway_binding_effects(
         # cannot inherit a later key effect after an earlier body check.
         if len(args) >= 3 and args[0] == "send-keys" and args[1] == "-t":
             try:
-                verifier()
+                verifier("-l" in args[3:])
             except Exception as exc:  # noqa: BLE001 - effect guard is fail-closed
                 raise TransportBindingError(
                     "project-gateway target capability changed before the send effect"
@@ -323,9 +325,34 @@ def _guard_project_gateway_binding_effects(
     )
 
 
+def _guard_queue_enter_effect_fence(binding: TransportBinding) -> TransportBinding:
+    """Run the active queue wait/deadline fence at the final binding boundary."""
+    delegate = binding.run_tmux
+
+    def fenced_run_tmux(*args: str, check: bool = True):
+        if (
+            len(args) == 4
+            and args[0] == "send-keys"
+            and args[1] == "-t"
+            and args[3].lower() == "enter"
+        ):
+            from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_herdr_queue_enter_rail import (  # noqa: E501
+                enforce_active_queue_enter_effect_fence,
+            )
+
+            enforce_active_queue_enter_effect_fence()
+        return delegate(*args, check=check)
+
+    return TransportBinding(
+        backend=binding.backend,
+        run_tmux=fenced_run_tmux,
+        capture_pane=binding.capture_pane,
+    )
+
+
 def _guard_project_gateway_standard_rail_effects(
     rail: HerdrTurnStartRail,
-    verifier: Callable[[], None],
+    verifier: Callable[[bool], None],
 ) -> HerdrTurnStartRail:
     """Install the effect guard on the standard rail's injected transport port."""
 
@@ -438,7 +465,7 @@ def resolve_handoff_transport_binding(
     # pane exactly as under `backend: tmux` — never a silent herdr fallback.
     if is_explicit_pane_target(ctx.target):
         return None
-    return _resolve_herdr_binding(ctx, config)
+    return _guard_queue_enter_effect_fence(_resolve_herdr_binding(ctx, config))
 
 
 def resolve_handoff_transport_runtime(
@@ -489,7 +516,7 @@ def resolve_handoff_transport_runtime(
     # gets the herdr shim/rail nor skips `require_tmux()`.
     if is_explicit_pane_target(ctx.target):
         return None, None
-    binding = _resolve_herdr_binding(ctx, config)
+    binding = _guard_queue_enter_effect_fence(_resolve_herdr_binding(ctx, config))
     # The binding resolution above already died if the binary is unconfigured /
     # unresolvable, so the rail resolution here rides the same resolved binary and
     # cannot raise for a binary reason; any unexpected TerminalTransportError still
@@ -502,11 +529,14 @@ def resolve_handoff_transport_runtime(
     resolved_target_capability = capability
     if resolved_target_capability is not None:
         repo_root = Path(ctx.repo_root).expanduser().resolve()
-        verifier = functools.partial(
-            verify_project_gateway_target_effect,
-            resolved_target_capability,
-            repo_root=repo_root,
-        )
+        effect_verifier = verify_project_gateway_target_effect
+
+        def verifier(require_process_generation: bool) -> None:
+            effect_verifier(
+                resolved_target_capability,
+                repo_root=repo_root,
+                require_process_generation=require_process_generation,
+            )
         binding = _guard_project_gateway_binding_effects(binding, verifier)
         if rail is None:
             die(

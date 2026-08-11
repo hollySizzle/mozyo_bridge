@@ -3476,7 +3476,7 @@ class TheRouteIsWiredIntoTheFence(unittest.TestCase):
         def _reader(payload):
             source = LiveRedmineJournalSource(
                 base_url="https://example.invalid",
-                api_key="k",
+                api_key="test-key-sentinel",
                 transport=lambda **_: payload,
             )
             original = LiveRedmineJournalSource.from_environment

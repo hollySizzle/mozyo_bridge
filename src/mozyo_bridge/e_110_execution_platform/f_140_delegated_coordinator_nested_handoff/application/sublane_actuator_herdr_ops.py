@@ -1,46 +1,11 @@
-"""herdr-backend creation-side actuation IO for ``sublane start --execute`` (Redmine #13377).
+"""Herdr creation-side IO for ``sublane start --execute`` (#13377).
 
-The tmux :class:`~...application.sublane_actuator_ops.LiveSublaneActuatorOps` stands a lane
-up as a *cockpit column* (two tmux panes) in the shared tmux server, so a lane is a
-``(workspace_id, lane_id)`` slice of one workspace. Redmine #13377 (design consultation
-answer j#73613, **Opt3 — shared project workspace**) gives herdr the same identity shape:
-the lane worktree stays a linked git worktree and its two managed agents are launched as
-``mzb1_<project-ws>_codex_<lane>`` / ``mzb1_<project-ws>_claude_<lane>`` by the #13330
-:func:`~...terminal_runtime_provider.application.herdr_session_start.prepare_session`
-(join-or-create workspace + pane-bound ``agent start`` + root-pane reclaim). Placement
-refined by Redmine #13380 (dedicated sublane host workspace): lane
-slots land in a single sublane host workspace separate from the coordinator pair's project
-workspace, so the herdr workspace count is a constant "project 1 + host 1" — never scaling
-with the lane count. This supersedes the #13331 j#73314 per-lane ``wt_<hash>`` workspace
-(option A), which survives read-side as legacy compatibility only.
-
-:class:`HerdrSublaneActuatorOps` implements the SAME
-:class:`~...application.sublane_actuator_ops.SublaneActuatorOps` port the tmux adapter
-does, so the pure fail-closed :class:`~...application.sublane_actuator_use_case.SublaneActuateUseCase`
-choreography is unchanged — only the side effects differ:
-
-* ``create_worktree`` — the identical additive #12604 git op (backend-agnostic worktree add);
-* ``append_lane_column`` — instead of a cockpit append, :func:`prepare_session` on the lane
-  worktree with ``lane_id=lane_label``, launching the codex gateway + claude worker as lane
-  slots of the project identity, placed in the dedicated sublane host workspace (#13380);
-* ``read_lane`` — resolves the lane from the **live herdr inventory** (``agent list`` mzb1
-  decode, #13247) filtered to ``(project workspace, lane_label)``, not a tmux snapshot; a
-  pre-#13377 lane resolves through its legacy ``wt_<hash>`` slots (compatibility read, so a
-  live legacy lane is never double-created);
-* ``probe_gateway_ready`` — a non-fatal boot-readiness check of the gateway agent: live in
-  the inventory AND rendered (``agent read`` returns non-blank text, #13378); the send
-  rail's turn-start observation + Enter-resend (#13322) stays the landing net;
-* ``dispatch_implementation_request`` — the governed ``handoff send`` to the gateway. The
-  gateway is a lane slot of the SAME *mozyo* workspace identity (its #13380 host placement
-  is irrelevant to routing, which matches on the mzb1 decode), so the coordinator→gateway
-  leg is an **explicit-lane** send: ``--target-lane <lane_label>`` (the j#73613 explicit
-  lane field — never an all-lane scan) plus ``--target-repo <lane-worktree>`` as the
-  repo/cwd gate and a non-``%pane`` herdr target so the send rides the herdr rail (#13320).
-
-Boundary (identical to the tmux adapter): creation-side / additive only — there is no
-remove / kill / delete / merge method here; the destructive retire half stays gated
-(``worktree-lifecycle-boundary.md``). The herdr binary is resolved ONLY from the trusted
-environment (never a repo-local binary), exactly like every other herdr path.
+The adapter implements the same injected port as tmux while projecting each lane as
+two managed agents in the shared project identity and dedicated lane-host placement.
+Inventory reads, readiness probes and explicit-lane handoff dispatches are Herdr-native;
+worktree creation is shared.  The boundary is additive only, and the binary resolves
+only from the trusted environment.  Gateway dispatch also exposes a typed injection
+stage so #15242 uncertainty cannot become a blind self-heal replay.
 """
 
 from __future__ import annotations
@@ -57,6 +22,10 @@ if TYPE_CHECKING:
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_ops import (
     GATEWAY_READY_CAPTURE_LINES,
+    SublaneDispatchAttempt,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (
+    injection_stage_for_outcome,
 )
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_launch_composition import (  # noqa: E501
     LAUNCH_CAUSE_GENERIC_FRESH,
@@ -913,15 +882,8 @@ class HerdrSublaneActuatorOps:
     ) -> list[str]:
         """The governed ``handoff send`` argv for the coordinator→lane-gateway leg.
 
-        The gateway is a lane slot of the SAME project workspace (Redmine #13377), so the
-        dispatch is an explicit-lane, same-workspace herdr send: ``--target-lane
-        <lane_label>`` names the slot (j#73613 — an explicit lane field, never an all-lane
-        scan) and ``--target-repo <lane-worktree>`` stays the repo/cwd gate (a gate, not a
-        workspace selector). The ``--target`` is the gateway's live herdr locator — a
-        non-``%pane`` value, so the send rides the herdr rail (#13320 effective-backend
-        predicate) rather than the tmux rail. Same governed shape as the tmux dispatch
-        (queue-enter, implementation_gateway role profile, lane / upstream_coordinator
-        profile fields).
+        ``--target-lane`` names the stable slot, ``--target-repo`` remains the cwd
+        gate, and the non-``%pane`` target selects Herdr rather than tmux.
         """
         argv = [
             "handoff",
@@ -956,22 +918,38 @@ class HerdrSublaneActuatorOps:
             argv += ["--profile-field", f"upstream_coordinator={upstream_coordinator}"]
         return argv
 
-    def _drive_cli(self, argv: list[str]) -> int:
-        """Parse ``argv`` with the composed CLI parser and run its handler (live).
-
-        Mirrors the tmux adapter's ``_drive_cli`` so a herdr dispatch is byte-for-byte the
-        Namespace an operator's ``mozyo-bridge handoff send ...`` would build (same
-        defaults, same herdr send rail, same outcome emission). Imported lazily so the pure
-        use case / tests never require the CLI infrastructure.
-        """
+    def _drive_cli_result(self, argv: list[str]) -> SublaneDispatchAttempt:
+        """Run the composed CLI and retain its published injection stage."""
         from mozyo_bridge.application.cli import build_parser, normalize_paths
 
-        args = build_parser().parse_args(argv)
-        args = normalize_paths(args)
-        if self.quiet_stdout:
-            with contextlib.redirect_stdout(sys.stderr):
-                return int(args.func(args))
-        return int(args.func(args))
+        args = None
+        try:
+            args = normalize_paths(build_parser().parse_args(argv))
+            if self.quiet_stdout:
+                with contextlib.redirect_stdout(sys.stderr):
+                    rc = args.func(args)
+            else:
+                rc = args.func(args)
+        except SystemExit as exc:
+            code = exc.code
+            rc = code if type(code) is int and code != 0 else 1
+        return SublaneDispatchAttempt.typed(
+            rc,
+            injection_stage_for_outcome(
+                getattr(args, "delivery_outcome", None)
+            ),
+        )
+
+    def _drive_cli(self, argv: list[str]) -> int:
+        """Legacy int result retained for existing direct callers."""
+        return self._drive_cli_result(argv).exit_code
+
+    def dispatch_implementation_request_result(
+        self,
+        **kwargs,
+    ) -> SublaneDispatchAttempt:
+        """Typed gateway dispatch used by the sublane actuator."""
+        return self._drive_cli_result(self.dispatch_argv(**kwargs))
 
     def dispatch_implementation_request(
         self,
@@ -983,16 +961,14 @@ class HerdrSublaneActuatorOps:
         upstream_coordinator: Optional[str],
         target_repo: str,
     ) -> int:
-        return self._drive_cli(
-            self.dispatch_argv(
-                issue=issue,
-                journal=journal,
-                gateway_pane=gateway_pane,
-                lane_label=lane_label,
-                upstream_coordinator=upstream_coordinator,
-                target_repo=target_repo,
-            )
-        )
+        return self.dispatch_implementation_request_result(
+            issue=issue,
+            journal=journal,
+            gateway_pane=gateway_pane,
+            lane_label=lane_label,
+            upstream_coordinator=upstream_coordinator,
+            target_repo=target_repo,
+        ).exit_code
 
 __all__ = (
     "HERDR_LANE_PROVIDERS",

@@ -34,6 +34,7 @@ from mozyo_bridge.core.state.startup_transaction_fence import (
     startup_action_id,
     startup_action_id_matching,
 )
+from mozyo_bridge.core.state.herdr_native_identity_binding import native_name_for
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (
     list_herdr_agent_rows,
@@ -62,6 +63,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     decode_assigned_name,
     encode_assigned_name,
     terminal_identity_of_live_slot,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
+    PaneBoundReceiptError,
+    parse_pane_bound_receipt,
 )
 
 
@@ -237,6 +242,21 @@ def resolve_rollback_owed_startup_action(
                 or owed.assigned_name != assigned_name
                 or owed.locator != live_locator
                 or not owed.receipt
+            ):
+                continue
+            try:
+                receipt = parse_pane_bound_receipt(owed.receipt)
+            except PaneBoundReceiptError:
+                continue
+            if intent is not None:
+                # Legacy side bindings remain diagnostic-only and cannot lend current
+                # rollback authority to a destructive rail.
+                continue
+            if (
+                receipt is None
+                or not receipt.terminal_id
+                or receipt.native_name != native_name_for(assigned_name)
+                or receipt.terminal_id != terminal_id
             ):
                 continue
             if intent is not None and not _exact_normal_v1_row(

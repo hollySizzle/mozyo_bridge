@@ -38,7 +38,9 @@ from mozyo_bridge.core.state.herdr_identity_attestation import VERDICT_PRESENT
 from mozyo_bridge.core.state.herdr_launch_generation import (
     HerdrLaunchGenerationError,
     HerdrLaunchGenerationStore,
+    verified_generation_token,
 )
+from mozyo_bridge.core.state.herdr_native_identity_binding import native_name_for
 from mozyo_bridge.core.state.startup_execution_events import (
     STAGE_ATTESTATION_WRITE_SUCCEEDED,
     read_execution_events,
@@ -46,6 +48,10 @@ from mozyo_bridge.core.state.startup_execution_events import (
 from mozyo_bridge.core.state.startup_transaction_fence import StartupTransactionFence
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_identity_binding import (  # noqa: E501
     reserve_session_launch_identities,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
+    PaneBoundReceiptError,
+    parse_pane_bound_receipt,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     AGENT_KEY_NAME,
@@ -127,6 +133,10 @@ def finalize_launch_generations(
     }
     ws = _norm(workspace_id)
     lane = _norm_lane(lane_id)
+    try:
+        snapshot = tuple(inventory_rows)
+    except Exception:  # noqa: BLE001 - unreadable inventory leaves every row pending
+        return
     for slot in slots:
         # Only a slot THIS transaction actually launched recorded a participant (adopt /
         # dry-run / unattested slots never call `record_launch`), so the participant check
@@ -134,16 +144,17 @@ def finalize_launch_generations(
         name = _norm(getattr(slot, "assigned_name", ""))
         role = _norm(getattr(slot, "provider", ""))
         locator = _norm(getattr(slot, "locator", ""))
-        if not (name and role and locator):
+        launch_terminal_id = _norm(getattr(slot, "launch_terminal_id", ""))
+        if not (name and role and locator and launch_terminal_id):
             continue
         matches = [
             row
-            for row in inventory_rows
+            for row in snapshot
             if isinstance(row, Mapping) and _norm(row.get(AGENT_KEY_NAME)) == name
         ]
         if len(matches) != 1 or _norm(_agent_locator(matches[0])) != locator:
             continue
-        live_terminal_id = terminal_identity_of_live_slot(name, locator, inventory_rows)
+        live_terminal_id = terminal_identity_of_live_slot(name, locator, snapshot)
         if live_terminal_id is None:
             continue
         # 1. launch receipt + startup-transaction participant (not closed), for this slot.
@@ -154,6 +165,16 @@ def finalize_launch_generations(
             _norm(getattr(participant, "assigned_name", "")) == name
             and _norm(getattr(participant, "locator", "")) == locator
             and _norm(getattr(participant, "receipt", ""))
+        ):
+            continue
+        try:
+            pane_receipt = parse_pane_bound_receipt(participant.receipt)
+        except PaneBoundReceiptError:
+            continue
+        if (
+            pane_receipt is None
+            or pane_receipt.native_name != native_name_for(name)
+            or _norm(pane_receipt.terminal_id) != launch_terminal_id
         ):
             continue
         # 2. the wrapper's OWN attestation_write_succeeded execution event.
@@ -167,7 +188,7 @@ def finalize_launch_generations(
         if record is None:
             continue
         observed_at = _norm(str(getattr(record, "observed_at", "") or ""))
-        terminal_id = getattr(record, "terminal_id", None)
+        attested_terminal_id = getattr(record, "terminal_id", None)
         if not (
             _norm(getattr(record, "verdict", "")) == VERDICT_PRESENT
             and observed_at
@@ -176,10 +197,11 @@ def finalize_launch_generations(
             and _norm(getattr(record, "workspace_id", "")) == ws
             and _norm_lane(getattr(record, "lane_id", "")) == lane
             and _norm(getattr(record, "locator", "")) == locator
-            and type(terminal_id) is str
-            and bool(terminal_id)
-            and terminal_id.strip() == terminal_id
-            and terminal_id == live_terminal_id
+            and type(attested_terminal_id) is str
+            and bool(attested_terminal_id)
+            and attested_terminal_id.strip() == attested_terminal_id
+            and attested_terminal_id == launch_terminal_id
+            and attested_terminal_id == live_terminal_id
         ):
             continue
         # 4. CAS to attested. A refusal (a newer pending reservation superseded this one)
@@ -192,12 +214,61 @@ def finalize_launch_generations(
                 role=role,
                 lane_id=lane,
                 locator=locator,
-                terminal_id=terminal_id,
+                terminal_id=attested_terminal_id,
                 verdict=VERDICT_PRESENT,
                 observed_at=observed_at,
             )
         except HerdrLaunchGenerationError:
             continue
+
+
+def verified_terminal_generation_token(
+    home: Path | None,
+    *,
+    assigned_name: str,
+    workspace_id: str,
+    role: str,
+    lane_id: str,
+    locator: str,
+    terminal_id: str,
+    norm=_norm,
+    norm_lane=_norm_lane,
+) -> str:
+    """Return the launch token only when its atomic participant receipt owns terminal.
+
+    The durable generation row binds the action token to the logical slot and locator.
+    The completed startup transaction binds that same token to the ``pane_bound_v2``
+    receipt written from the prepared pane's own response.  Requiring the current
+    terminal id to match that receipt prevents a restored terminal from borrowing the
+    stale token of the process that previously occupied the same name and locator.
+    """
+    expected_terminal = norm(terminal_id)
+    if not expected_terminal:
+        return ""
+
+    def _receipt_matches(raw: object) -> bool:
+        try:
+            receipt = parse_pane_bound_receipt(raw)
+        except PaneBoundReceiptError:
+            return False
+        return (
+            receipt is not None
+            and receipt.native_name == native_name_for(assigned_name)
+            and norm(receipt.terminal_id) == expected_terminal
+        )
+
+    return verified_generation_token(
+        home,
+        assigned_name=assigned_name,
+        workspace_id=workspace_id,
+        role=role,
+        lane_id=lane_id,
+        locator=locator,
+        live_terminal_id=expected_terminal,
+        norm=norm,
+        norm_lane=norm_lane,
+        participant_receipt_matches=_receipt_matches,
+    )
 
 
 def reserve_session_launch_generations(
@@ -281,4 +352,5 @@ __all__ = (
     "open_startup_transaction_and_reserve_generations",
     "reserve_launch_generations",
     "reserve_session_launch_generations",
+    "verified_terminal_generation_token",
 )

@@ -47,7 +47,7 @@ class ResolveWakeTest(unittest.TestCase):
 
 
 class BuildHerdrEventWaitTest(unittest.TestCase):
-    """#13520 review F1b: the production wait binds the stable `herdr wait agent-status` event."""
+    """#13520 review F1b: production binds the Herdr 0.8 ``agent wait`` event."""
 
     def test_builds_the_stable_wait_argv(self):
         calls = []
@@ -58,8 +58,8 @@ class BuildHerdrEventWaitTest(unittest.TestCase):
         self.assertTrue(wait())  # rc 0 -> observed the change (woke)
         self.assertEqual(
             calls[0],
-            ["/opt/herdr", "wait", "agent-status", "mzb1_ws_codex_default",
-             "--status", "working", "--timeout", "50000"],
+            ["/opt/herdr", "agent", "wait", "mzb1_ws_codex_default",
+             "--until", "working", "--timeout", "50000"],
         )
 
     def test_herdr_bounded_timeout_is_falsy_timed_out(self):

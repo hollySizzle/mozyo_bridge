@@ -95,11 +95,15 @@ class TypedManagerRunner:
 
 class ManagerDefinitionAttestationTest(unittest.TestCase):
     def setUp(self):
-        self.service_path = Path("/home/test/.config/systemd/user/supervisor.service")
-        self.timer_path = Path("/home/test/.config/systemd/user/supervisor.timer")
+        self.service_path = Path(
+            "/workspace/operator-fixture/.config/systemd/user/supervisor.service"
+        )
+        self.timer_path = Path(
+            "/workspace/operator-fixture/.config/systemd/user/supervisor.timer"
+        )
         self.argv = [
             "/opt/bin/mozyo-bridge", "workflow", "supervisor", "--run-once",
-            "--home", "/home/test/.mozyo-bridge",
+            "--home", "/workspace/operator-fixture/.mozyo-bridge",
         ]
 
     def _attest(self, overrides=None):

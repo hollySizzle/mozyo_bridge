@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Protocol
 
@@ -77,6 +77,7 @@ class ProjectGatewayBackendSupport(Protocol):
     """Adapter operations required by the core inventory use case."""
 
     agent_name_key: str
+    terminal_id_key: str
     locator_keys: tuple[str, ...]
 
     def normalize(self, value: object) -> str: ...
@@ -105,7 +106,11 @@ class ProjectGatewayBackendSupport(Protocol):
         provider: str,
         lane_id: str,
         locator: str,
-        live_terminal_id: object,
+        terminal_id: str,
+    ) -> str: ...
+
+    def process_generation(
+        self, locator: str, rows: Sequence[Mapping[str, object]]
     ) -> str: ...
 
     def build_project_gateway_capability(self, observation: object) -> object: ...
@@ -241,6 +246,8 @@ class HerdrTargetObservation:
     project_scope: str
     assigned_name: str
     locator: str
+    terminal_id: str = field(repr=False)
+    process_generation: str = field(repr=False)
     generation_token: str
     target_cwd: str
     target_repo_root: str
@@ -327,7 +334,7 @@ class LiveProjectGatewayInventoryOps:
         provider: str,
         lane_id: str,
         locator: str,
-        live_terminal_id: object,
+        terminal_id: str,
     ) -> str:
         return _require_backend_support().generation_token(
             assigned_name=assigned_name,
@@ -335,7 +342,7 @@ class LiveProjectGatewayInventoryOps:
             provider=provider,
             lane_id=lane_id,
             locator=locator,
-            live_terminal_id=live_terminal_id,
+            terminal_id=terminal_id,
         )
 
     def project_path(
@@ -670,6 +677,28 @@ class ProjectGatewayBackendInventoryUseCase:
                     "herdr_locator_ambiguous",
                     "the matching Herdr locator is aliased by multiple live inventory rows",
                 )
+            row_terminal_id = row.get(_require_backend_support().terminal_id_key)
+            terminal_id = _require_backend_support().terminal_identity(
+                assigned_name, locator, rows
+            )
+            if (
+                type(terminal_id) is not str
+                or not terminal_id
+                or terminal_id.strip() != terminal_id
+                or terminal_id != row_terminal_id
+            ):
+                self._error(
+                    "herdr_terminal_identity_unavailable",
+                    "a matching live Herdr row has no exact terminal identity",
+                )
+            process_generation = _require_backend_support().process_generation(
+                locator, rows
+            )
+            if not process_generation:
+                self._error(
+                    "herdr_process_generation_unavailable",
+                    "a matching live Herdr row has no unambiguous process generation",
+                )
             try:
                 generation = self._ops.generation_token(
                     assigned_name=assigned_name,
@@ -677,9 +706,7 @@ class ProjectGatewayBackendInventoryUseCase:
                     provider=identity.role,
                     lane_id=lane,
                     locator=locator,
-                    live_terminal_id=_require_backend_support().terminal_identity(
-                        assigned_name, locator, rows
-                    ),
+                    terminal_id=terminal_id,
                 )
             except Exception as exc:  # noqa: BLE001 - attestation source is an IO boundary
                 raise ProjectGatewayInventoryError(
@@ -748,6 +775,8 @@ class ProjectGatewayBackendInventoryUseCase:
                 project_scope=scope,
                 assigned_name=assigned_name,
                 locator=locator,
+                terminal_id=terminal_id,
+                process_generation=process_generation,
                 generation_token=generation,
                 target_cwd=target_cwd,
                 target_repo_root=target_root,

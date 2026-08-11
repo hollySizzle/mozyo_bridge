@@ -26,9 +26,11 @@ addendum j#83362 + the callback-lease addendum j#83426 + the #13897 addendum j#8
    preflight + zero-close negative rail (the release's actual installed-negative-safety posture,
    never a fabricated installed positive).
 2. **Nested unhealthy launch -> rollback pointer** (#13948) — ``herdr session-rollback``. A fresh
-   idle launch that owes a rollback is surfaced as an ``eligible`` pointer by the read-only
-   preflight; ``--execute`` closes exactly that fresh pane; a replay is idempotent
-   (``already_rolled_back``, nothing re-closed). A busy / foreign slot is never closed.
+   idle launch that owes a rollback is surfaced by the read-only preflight. When the selected
+   Herdr runtime lacks server-side conditional close for the observed pane generation, the
+   participant verdict is ``conditional_close_unavailable`` and ``--execute`` reports the same
+   reason; no pane is closed and the rollback debt remains retryable. A busy / foreign / ambiguous
+   slot is likewise never closed.
 3. **Stale-locator ``sublane list`` projection** (#14063 / j#83362) — ``sublane list --json``. A
    locator-present shell-residue slot never populates a live pane: a live+stale pair reads
    one-sided (``gateway_only`` / ``worker_only``) with the role-specific stale hint, a both-stale
@@ -48,7 +50,8 @@ Every fault is prepared through the safe isolated fixture rails the harness owns
 public stores + the fake's one-shot stimuli), so an operator/agent driving it never issues a raw
 SQLite / tmux / Herdr mutation. Cleanup is structural: the isolated home is removed, so a scratch
 lane / lease / callback row can never amplify managed state — the harness additionally asserts the
-scratch inventory drains to zero.
+scratch inventory never grows as a side effect. When the runtime cannot close conditionally, the
+measured live residue is preserved until the isolated fixture is structurally removed.
 """
 
 from __future__ import annotations
@@ -356,35 +359,46 @@ class CallbackLeaseRecoveryThroughPublicCli(unittest.TestCase):
 # Shape 2 — nested unhealthy launch -> public rollback pointer (#13948)
 # ---------------------------------------------------------------------------
 class NestedRollbackPointerThroughPublicCli(unittest.TestCase):
-    """``herdr session-rollback``: preflight pointer -> execute closes -> idempotent replay."""
+    """``herdr session-rollback`` preserves panes when atomic close is unavailable."""
 
-    def test_preflight_points_execute_closes_replay_is_idempotent(self):
+    def test_preflight_execute_and_replay_preserve_debt_without_conditional_close(self):
         h = InstalledFaultHarness(self)
-        action_id, locators = h.seed_owed_rollback("issue_14097_nested", providers=("claude",))
+        action_id, _ = h.seed_owed_rollback("issue_14097_nested", providers=("claude",))
         self.assertEqual(h.live_locator_count(), 1)
 
         preflight = h.session_rollback_cli(action_id)
         self.assertEqual(preflight.rc, 0)
         payload = preflight.json()
         self.assertEqual(payload["reason"], "preflight_only")
-        self.assertEqual(payload["state"], "actionable")
+        self.assertEqual(payload["state"], "blocked")
         self.assertFalse(payload["executed"])  # a preflight closes nothing
-        self.assertEqual(payload["participants"][0]["verdict"], "eligible")
+        self.assertEqual(
+            payload["participants"][0]["verdict"], "conditional_close_unavailable"
+        )
         self.assertFalse(payload["participants"][0]["closed"])
         self.assertEqual(h.live_locator_count(), 1)  # preflight is zero-close
 
         execute = h.session_rollback_cli(action_id, execute=True)
-        self.assertEqual(execute.rc, 0)
-        done = execute.json()
-        self.assertTrue(done["executed"])
-        self.assertEqual(done["state"], "completed")
-        self.assertTrue(done["participants"][0]["closed"])
-        self.assertEqual(h.live_locator_count(), 0)  # the fresh unhealthy launch was closed
+        self.assertEqual(execute.rc, 1)
+        blocked = execute.json()
+        self.assertFalse(blocked["executed"])
+        self.assertEqual(blocked["state"], "blocked")
+        self.assertEqual(blocked["reason"], "conditional_close_unavailable")
+        self.assertEqual(
+            blocked["participants"][0]["verdict"], "conditional_close_unavailable"
+        )
+        self.assertFalse(blocked["participants"][0]["closed"])
+        self.assertEqual(h.live_locator_count(), 1)  # no non-atomic read-then-close fallback
 
         replay = h.session_rollback_cli(action_id)
         self.assertEqual(replay.rc, 0)
-        self.assertEqual(replay.json()["reason"], "already_rolled_back")
-        self.assertEqual(replay.json()["participants"], [])  # nothing left to close
+        replayed = replay.json()
+        self.assertEqual(replayed["reason"], "preflight_only")
+        self.assertEqual(replayed["state"], "blocked")
+        self.assertEqual(
+            replayed["participants"][0]["verdict"], "conditional_close_unavailable"
+        )
+        self.assertEqual(h.live_locator_count(), 1)  # debt and participant remain retryable
 
     def test_a_busy_participant_is_never_closed(self):
         # A rollback never interrupts work in flight: a busy slot refuses the close, zero-close.
@@ -406,27 +420,34 @@ class NestedRollbackPointerThroughPublicCli(unittest.TestCase):
         self.assertEqual(out.json()["participants"], [])
         self.assertEqual(h.live_locator_count(), 1)  # the other action's slot is untouched
 
-    def test_same_binding_new_action_replay_after_rollback_discharge(self):
-        # The nested-rollback acceptance tail (issue Required work 2): after the PUBLIC rollback
-        # rail discharges the debt, the SAME unit replays toward a FRESH launch under a NEW action
-        # id — the discharged action is never resurrected.
+    def test_same_binding_new_action_keeps_old_debt_and_refuses_ambiguity(self):
+        # Without conditional close, action A cannot be discharged. A later fixture reservation
+        # for the SAME durable name still mints a distinct action id, but neither action guesses
+        # which duplicate live row it owns or closes either row.
         h = InstalledFaultHarness(self)
         action_a, _ = h.seed_owed_rollback(
             "issue_14097_replay", providers=("claude",), nonce="n1"
         )
-        self.assertEqual(h.session_rollback_cli(action_a, execute=True).json()["state"], "completed")
-        self.assertEqual(h.live_locator_count(), 0)  # action A's fresh launch was closed
+        first = h.session_rollback_cli(action_a, execute=True)
+        self.assertEqual(first.rc, 1)
+        self.assertEqual(first.json()["reason"], "conditional_close_unavailable")
+        self.assertEqual(h.live_locator_count(), 1)  # action A's participant is preserved
 
-        # The same binding (same startup unit) replays: a fresh reservation mints a NEW action id.
+        # The same binding (same startup unit) gets a fresh reservation under a NEW action id.
         action_b, _ = h.seed_owed_rollback(
             "issue_14097_replay", providers=("claude",), nonce="n2"
         )
         self.assertNotEqual(action_b, action_a)  # a distinct new action id
         replay = h.session_rollback_cli(action_b).json()
-        self.assertEqual(replay["participants"][0]["verdict"], "eligible")  # B is a live fresh launch
+        self.assertEqual(replay["state"], "blocked")
+        self.assertEqual(replay["participants"][0]["verdict"], "ambiguous")
+        self.assertEqual(h.live_locator_count(), 2)
 
-        # Action A stays terminally discharged — the replay never resurrects the rolled-back one.
-        self.assertEqual(h.session_rollback_cli(action_a).json()["reason"], "already_rolled_back")
+        # Action A's debt is not silently discharged or rewritten by action B.
+        original = h.session_rollback_cli(action_a).json()
+        self.assertEqual(original["state"], "blocked")
+        self.assertEqual(original["participants"][0]["verdict"], "ambiguous")
+        self.assertEqual(h.live_locator_count(), 2)
 
 
 # ---------------------------------------------------------------------------
@@ -696,15 +717,28 @@ class LegacyMigrationForeignInventoryThroughPublicCli(unittest.TestCase):
 # Cleanup — the scratch inventory / stores never amplify managed state
 # ---------------------------------------------------------------------------
 class ScratchCleanupNeverAmplifies(unittest.TestCase):
-    """After the faults are driven + retired, the scratch inventory drains to zero (no residue)."""
+    """Fault drives never add hidden effects; isolated teardown removes their scratch state."""
 
-    def test_rollback_and_retire_leave_no_live_residue(self):
+    def test_rollback_without_conditional_close_preserves_exact_live_residue(self):
         h = InstalledFaultHarness(self)
-        # A nested rollback discharge is the harness's own retire rail for a scratch launch.
+        # Herdr 0.8 cannot atomically close an observed pane generation. The public rail must
+        # report the residue and preserve both rows; the harness's structural temp teardown owns
+        # final cleanup, so production never falls back to an unsafe read-then-close sequence.
         action_id, _ = h.seed_owed_rollback("issue_14097_cleanup", providers=("claude", "codex"))
         self.assertEqual(h.live_locator_count(), 2)
-        h.session_rollback_cli(action_id, execute=True)
-        self.assertEqual(h.live_locator_count(), 0)  # both scratch slots retired, zero residue
+        result = h.session_rollback_cli(action_id, execute=True)
+        self.assertEqual(result.rc, 1)
+        payload = result.json()
+        self.assertEqual(payload["state"], "blocked")
+        self.assertEqual(payload["reason"], "conditional_close_unavailable")
+        self.assertEqual(
+            {participant["verdict"] for participant in payload["participants"]},
+            {"conditional_close_unavailable"},
+        )
+        self.assertTrue(
+            all(not participant["closed"] for participant in payload["participants"])
+        )
+        self.assertEqual(h.live_locator_count(), 2)  # zero close and zero amplification
 
     def test_a_callback_lease_scenario_leaves_a_healthy_bounded_store(self):
         # A recovered lease store is healthy and bounded (one DB + one sidecar) — the recovery

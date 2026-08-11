@@ -31,6 +31,10 @@ from __future__ import annotations
 
 from typing import Optional
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_ops import (
+    SublaneDispatchAttempt,
+    drive_dispatch_implementation_request,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (
     DISPATCH_GATEWAY_NOTIFIED,
     REASON_HANDOFF_FAILED,
@@ -55,6 +59,8 @@ def heal_and_retry_dispatch(
     *,
     steps: list,
     failed_dispatch_detail: str,
+    failed_dispatch_attempt: SublaneDispatchAttempt,
+    failed_gateway_pane: Optional[str],
     dispatch: bool,
     target_repo: str,
     lane_runtime_root: str,
@@ -73,6 +79,16 @@ def heal_and_retry_dispatch(
     ``lane_runtime_root`` (#13392) is the root the read-back / relaunch drive against —
     the Git worktree, or a non-git lane's workspace root (never the phantom path).
     """
+    if not failed_dispatch_attempt.retry_safe:
+        return None
+    initial_dispatch_fields = {
+        "dispatch_target": failed_gateway_pane,
+        "dispatch_result": failed_dispatch_attempt.public_result,
+        "dispatch_injection_stage": failed_dispatch_attempt.public_injection_stage,
+        "dispatch_blind_retry_prohibited": (
+            failed_dispatch_attempt.blind_retry_prohibited
+        ),
+    }
     heal = getattr(use_case.ops, "heal_lane_column", None)
     if not callable(heal):
         return None
@@ -117,6 +133,7 @@ def heal_and_retry_dispatch(
             fill_decision=fill_decision,
             fill_override_reason=fill_override_reason,
             gateway_ready=gateway_ready,
+            **initial_dispatch_fields,
         )
     healed_lane = use_case.ops.read_lane(lane_runtime_root)
     if not (healed_lane and healed_lane.gateway_pane and healed_lane.worker_pane):
@@ -144,6 +161,7 @@ def heal_and_retry_dispatch(
             fill_decision=fill_decision,
             fill_override_reason=fill_override_reason,
             gateway_ready=gateway_ready,
+            **initial_dispatch_fields,
         )
     # Redmine #13705 R1-F2: a healed lane whose pair is split across tabs / workspaces
     # is not operable. The herdr `heal_lane_column` same-tab postcondition already fails
@@ -175,6 +193,7 @@ def heal_and_retry_dispatch(
             fill_decision=fill_decision,
             fill_override_reason=fill_override_reason,
             gateway_ready=gateway_ready,
+            **initial_dispatch_fields,
         )
     if not use_case._identity_matches(healed_lane, request):
         steps.append(
@@ -203,6 +222,7 @@ def heal_and_retry_dispatch(
             fill_decision=fill_decision,
             fill_override_reason=fill_override_reason,
             gateway_ready=gateway_ready,
+            **initial_dispatch_fields,
         )
     gateway_pane = healed_lane.gateway_pane
     worker_pane = healed_lane.worker_pane
@@ -233,9 +253,8 @@ def heal_and_retry_dispatch(
     else:
         readiness_detail = (
             f"healed gateway {gateway_pane} readiness unconfirmed after "
-            f"{ready_probes} probe(s); retrying the dispatch anyway (queue-enter "
-            "rail never hard-blocks — the handoff Enter-only retry is the "
-            "landing safety net)"
+            f"{ready_probes} probe(s); attempting the governed retry, which must "
+            "independently confirm submission or fail closed"
         )
         readiness_status = STEP_SKIPPED
     steps.append(
@@ -248,7 +267,8 @@ def heal_and_retry_dispatch(
         )
     )
     try:
-        retry_rc = use_case.ops.dispatch_implementation_request(
+        retry_attempt = drive_dispatch_implementation_request(
+            use_case.ops,
             issue=request.issue,
             journal=(request.journal or ""),
             gateway_pane=gateway_pane or "",
@@ -256,18 +276,31 @@ def heal_and_retry_dispatch(
             upstream_coordinator=request.resolved_upstream_coordinator(),
             target_repo=target_repo,
         )
+    except SystemExit as exc:
+        code = exc.code
+        retry_attempt = SublaneDispatchAttempt.untyped(
+            code if type(code) is int and code != 0 else 1
+        )
+        retry_detail = "handoff dispatch exited without a typed delivery result"
     except Exception as exc:  # noqa: BLE001 — fail-closed on any dispatch failure.
-        retry_rc = 1
+        retry_attempt = SublaneDispatchAttempt.untyped(1)
         retry_detail = f"handoff dispatch raised: {exc}"
     else:
-        retry_detail = f"handoff send to gateway {gateway_pane} exit={retry_rc}"
-    if retry_rc != 0:
+        retry_detail = (
+            f"handoff send to gateway {gateway_pane} exit={retry_attempt.exit_code}"
+        )
+    if not retry_attempt.confirmed:
+        fate = (
+            "nothing reached the gateway; retry is safe after fixing the refusal"
+            if retry_attempt.retry_safe
+            else "body and/or Enter may have reached the gateway; blind retry prohibited"
+        )
         steps.append(
             ActuationStep(
                 order=8,
                 title="dispatch implementation_request (retry)",
                 status=STEP_BLOCKED,
-                detail=retry_detail,
+                detail=f"{retry_detail}; {fate}",
                 command=use_case._dispatch_command(request),
             )
         )
@@ -275,7 +308,7 @@ def heal_and_retry_dispatch(
             request,
             launch_action=launch.action,
             reason="gateway implementation_request dispatch failed again after "
-            "the lane self-heal; fail-closed (no second heal)",
+            f"the lane self-heal; {fate} (no second heal)",
             reasons=(REASON_HANDOFF_FAILED,),
             dispatch=dispatch,
             steps=tuple(steps),
@@ -285,6 +318,12 @@ def heal_and_retry_dispatch(
             fill_decision=fill_decision,
             fill_override_reason=fill_override_reason,
             gateway_ready=healed_ready,
+            dispatch_target=gateway_pane,
+            dispatch_result=retry_attempt.public_result,
+            dispatch_injection_stage=retry_attempt.public_injection_stage,
+            dispatch_blind_retry_prohibited=(
+                retry_attempt.blind_retry_prohibited
+            ),
         )
     steps.append(
         ActuationStep(
@@ -306,6 +345,10 @@ def heal_and_retry_dispatch(
         dispatch_result=DISPATCH_GATEWAY_NOTIFIED,
         adopted=adopted,
         steps=tuple(steps),
+        dispatch_injection_stage=retry_attempt.public_injection_stage,
+        dispatch_blind_retry_prohibited=(
+            retry_attempt.blind_retry_prohibited
+        ),
         fill_decision=fill_decision,
         fill_override_reason=fill_override_reason,
         gateway_ready=healed_ready,

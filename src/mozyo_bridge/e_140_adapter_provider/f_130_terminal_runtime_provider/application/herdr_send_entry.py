@@ -1,30 +1,11 @@
-"""herdr-native send-target entry resolution (Redmine #13261, increment 2).
+"""Herdr-native send-target entry resolution (Redmine #13261).
 
-The orchestrate-entry seam that lets ``orchestrate_handoff`` resolve its send target
-**without tmux** when ``terminal_transport.backend: herdr``. In increment 1 the herdr
-shim only translated a rail-supplied tmux ``%N`` into a herdr locator; the rail still
-resolved that ``%N`` through the tmux pane resolver (``pane_info``), which dies in a
-pure herdr session (no tmux server). This module closes that gap: under the herdr
-backend the rail resolves the target from the **launch-time sender identity** (env +
-anchor) + the **live herdr inventory** (WU1 :func:`resolve_herdr_target`) and hands
-``orchestrate_handoff`` a synthesized, ``project_preflight_target``-compatible pane
-record whose ``id`` is the live herdr locator — so every downstream guard / projection
-that reads pane-dict fields keeps working, and the shim passes the locator straight
-through (it is already ``valid_target``).
-
-Kept out of the oversized ``application/commands.py`` (module-health gate): the command
-module keeps only a small, strictly config-guarded branch that calls
-:func:`herdr_backend_selected` and :func:`resolve_herdr_send_target`. The ``backend:
-tmux`` path never touches this module, so it stays byte-identical.
-
-Fail-closed: an un-attested sender identity, an unavailable herdr binary / inventory,
-or a receiver that does not resolve to a single live agent raises
-:class:`HerdrSendEntryError`; the caller emits a structured ``blocked`` /
-``target_unavailable`` outcome and ``die``s — never a silent tmux fallback, never a send
-to a guessed target. One case projects differently (Redmine #13884): an explicit
-``--target`` that names a different agent than the resolved route raises
-:class:`HerdrExplicitTargetMismatchError` and projects onto ``blocked`` / ``invalid_args``
-(an inconsistent argument, not an unavailable window) — still a zero-send.
+The Herdr backend resolves a live locator from launch-time sender identity plus live
+inventory, then synthesizes the pane-shaped record consumed by shared preflight.  It
+never consults tmux or silently falls back to it.  Unattested identity, unreadable
+inventory, or a non-exact receiver raises :class:`HerdrSendEntryError` and produces a
+zero-send ``target_unavailable`` outcome.  An inconsistent explicit ``--target`` is the
+distinct zero-send ``invalid_args`` case (Redmine #13884).
 """
 
 from __future__ import annotations
@@ -32,7 +13,7 @@ from __future__ import annotations
 import argparse
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -58,6 +39,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     resolve_herdr_cross_workspace_target,
     resolve_herdr_route_target,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_generation_binding import (
+    verified_terminal_generation_token,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (
     herdr_workspace_segment,
 )
@@ -66,10 +50,12 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     AGENT_KEY_LOCATOR_ALIAS,
     AGENT_KEY_LOCATOR_ALIAS_2,
     AGENT_KEY_NAME,
+    AGENT_KEY_TERMINAL_ID,
     _agent_locator,
     _norm,
     _norm_lane,
     decode_assigned_name,
+    process_generation_of_locator,
     terminal_identity_of_live_slot,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
@@ -102,26 +88,16 @@ class HerdrSendEntryError(ValueError):
         self.reason = reason
 
 
-#: The existing delivery-outcome reason a herdr explicit-target mismatch projects onto
-#: (Redmine #13884 review j#83307 F1/F2). NOT a new fail-closed token: the herdr resolution
-#: vocabulary stays the #13302 ledger set (``vibes/docs/specs/herdr-native-identity.md``
-#: §3.1). ``invalid_args`` (an inconsistent ``--target`` argument, not an unavailable window)
-#: is the pre-existing ``DeliveryOutcome`` reason whose ``next_action`` ("supply the required
-#: arguments") is consistent with the cause; the full ``--target-lane`` retry guidance rides
-#: the die message. ``orchestrate_handoff`` reads this off ``exc.reason`` and surfaces it
-#: instead of the generic ``target_unavailable`` (which would tell the operator to start a
-#: window — contradicting the cause).
+#: Existing #13884 outcome: inconsistent arguments, not an unavailable receiver.
+#: The detailed ``--target-lane`` repair remains in the exception message.
 EXPLICIT_TARGET_MISMATCH_OUTCOME_REASON: str = "invalid_args"
 
 
 class HerdrExplicitTargetMismatchError(HerdrSendEntryError):
     """An explicit ``--target`` named a different agent than the resolved route (#13884).
 
-    A discriminable :class:`HerdrSendEntryError` subclass carrying the pre-existing
-    :data:`EXPLICIT_TARGET_MISMATCH_OUTCOME_REASON` (``invalid_args``) as its ``reason`` — no
-    new fail-closed token is minted (herdr-native-identity.md §3.1). The locator is never
-    promoted to a routing authority (#13305); this only refuses when the named target and
-    the resolved target disagree, and it stays a zero-send (``target=None``, no injection).
+    Carries the pre-existing ``invalid_args`` reason; the locator remains evidence rather
+    than routing authority and a mismatch stays zero-send.
     """
 
     def __init__(self, message: str):
@@ -177,10 +153,10 @@ class ResolvedHerdrTargetCapability:
     assigned_name: str
     locator: str
     purpose: str = RESOLVED_TARGET_CAPABILITY_PURPOSE
-    # Project-gateway capabilities are generation-bound.  The external proxy's
-    # older capability remains byte-compatible (empty additive fields) because its
-    # generation fence is owned by the proxy flow upstream.
+    # Project gateways bind these fields; the older external proxy leaves them empty.
     generation_token: str = ""
+    terminal_id: str = field(default="", repr=False)
+    process_generation: str = field(default="", repr=False)
     project_scope: str = ""
     target_repo_root: str = ""
     target_cwd: str = ""
@@ -201,11 +177,7 @@ def validate_resolved_target_capability(
     target_lane: str | None,
     receiver: str,
 ) -> ResolvedHerdrTargetCapability:
-    """Rejoin an internal pre-resolved target to the current handoff request.
-
-    Every comparison is exact after the public request's normal path resolution.  A mismatch is a
-    zero-send invariant failure; it never falls back to ``os.environ`` or the ordinary route scan.
-    """
+    """Rejoin a capability exactly; mismatch is zero-send with no route fallback."""
 
     if type(capability) is not ResolvedHerdrTargetCapability:
         raise _resolved_target_capability_error(
@@ -264,6 +236,8 @@ def validate_resolved_target_capability(
     if cap.purpose == PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE:
         project_fields = {
             "generation_token": cap.generation_token,
+            "terminal_id": cap.terminal_id,
+            "process_generation": cap.process_generation,
             "project_scope": cap.project_scope,
             "target_repo_root": cap.target_repo_root,
             "target_cwd": cap.target_cwd,
@@ -365,8 +339,10 @@ def _project_gateway_inventory_config(
 def _resolve_current_capability_row(
     cap: ResolvedHerdrTargetCapability,
     inventory_config: TerminalTransportConfig,
+    *,
+    require_process_generation: bool,
 ) -> Mapping[str, object]:
-    """Resolve one exact current row and, for project gateway, its generation."""
+    """Resolve one exact row and its stable generation; optionally pin the snapshot."""
 
     try:
         lister = resolve_agent_lister(inventory_config)
@@ -453,18 +429,33 @@ def _resolve_current_capability_row(
         raise _resolved_target_capability_error(
             "the project-gateway resolved target cwd changed before handoff"
         )
-    from mozyo_bridge.core.state.herdr_launch_generation import (
-        verified_generation_token,
+    live_terminal_id = terminal_identity_of_live_slot(
+        cap.assigned_name, cap.locator, rows
     )
+    if (
+        type(live_terminal_id) is not str
+        or not live_terminal_id
+        or live_terminal_id.strip() != live_terminal_id
+        or live_terminal_id != cap.terminal_id
+    ):
+        raise _resolved_target_capability_error(
+            "the project-gateway resolved target terminal changed before handoff"
+        )
+    if require_process_generation:
+        live_process_generation = process_generation_of_locator(cap.locator, rows) or ""
+        if not live_process_generation or live_process_generation != cap.process_generation:
+            raise _resolved_target_capability_error(
+                "the project-gateway resolved target process snapshot changed before handoff"
+            )
     try:
-        live_generation = verified_generation_token(
+        live_generation = verified_terminal_generation_token(
             None,
             assigned_name=cap.assigned_name,
             workspace_id=cap.workspace_id,
             role=cap.provider,
             lane_id=cap.lane_id,
             locator=cap.locator,
-            live_terminal_id=terminal_identity_of_live_slot(cap.assigned_name, cap.locator, rows),
+            terminal_id=live_terminal_id,
             norm=_norm,
             norm_lane=_norm_lane,
         )
@@ -483,6 +474,7 @@ def verify_project_gateway_target_effect(
     capability: object,
     *,
     repo_root: Path,
+    require_process_generation: bool = True,
 ) -> None:
     """Re-attest the exact project-gateway generation immediately before an effect.
 
@@ -518,7 +510,11 @@ def verify_project_gateway_target_effect(
             "the project-gateway source transport config is unreadable"
         ) from exc
     inventory_config = _project_gateway_inventory_config(cap, source_config)
-    _resolve_current_capability_row(cap, inventory_config)
+    _resolve_current_capability_row(
+        cap,
+        inventory_config,
+        require_process_generation=require_process_generation,
+    )
 
 
 def _resolve_capability_target(
@@ -546,7 +542,9 @@ def _resolve_capability_target(
         if cap.purpose == PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE
         else config
     )
-    _resolve_current_capability_row(cap, inventory_config)
+    row = _resolve_current_capability_row(
+        cap, inventory_config, require_process_generation=True
+    )
 
     return {
         "id": cap.locator,
@@ -573,9 +571,12 @@ def _resolve_capability_target(
             else ""
         ),
         "herdr_assigned_name": cap.assigned_name,
-        # An external proxy is intentionally NOT represented as a lane sender.  The proxy's
-        # durable decision/fence authority is upstream; these fields stay empty so no downstream
-        # gate can accidentally promote the target unit into a fabricated sender identity.
+        "herdr_process_generation": (
+            cap.process_generation
+            if cap.purpose == PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE
+            else process_generation_of_locator(cap.locator, (row,)) or ""
+        ),
+        # A proxy's decision/fence authority is upstream; never fabricate lane-sender fields.
         "herdr_sender_workspace_id": "",
         "herdr_sender_lane_id": "",
     }
@@ -953,6 +954,7 @@ def resolve_herdr_send_target(
         target_cwd = ""
     else:
         target_cwd = str(repo_root)
+    process_generation = process_generation_of_locator(resolution.locator, rows) or ""
     return {
         "id": resolution.locator,
         # No tmux location: the pure-herdr target is addressed by its live locator and
@@ -969,14 +971,11 @@ def resolve_herdr_send_target(
         "workspace_id": identity.workspace_id,
         "lane_id": identity.lane_id,
         "cwd": target_cwd,
-        # Diagnostic breadcrumb (not consumed by the pane projection): the durable
-        # herdr name this locator was resolved from.
+        # Durable Herdr identity pins; not consumed by the pane projection.
         "herdr_assigned_name": resolution.assigned_name,
-        # The env-derived SENDER Unit (Redmine #13261 increment 4). Carried on the
-        # target record so the gateway-route gate can enforce on the sender's lane
-        # without a tmux `current_pane_lane_unit()` call — the sender identity was
-        # already resolved here (single resolution, no duplication). Not part of the
-        # pane projection (project_preflight_target ignores unknown keys).
+        "herdr_process_generation": process_generation,
+        # Env-derived SENDER Unit for the gateway-route gate; no second tmux lookup.
+        # Not part of the pane projection (unknown keys are ignored there).
         "herdr_sender_workspace_id": sender.workspace_id,
         "herdr_sender_lane_id": sender.lane_id,
     }

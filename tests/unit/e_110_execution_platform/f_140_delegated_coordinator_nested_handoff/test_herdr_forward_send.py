@@ -560,11 +560,12 @@ class ReceiverVisibleRoundtripTest(unittest.TestCase):
 
 
 class CallbackTransportOutcomeBoundaryTest(unittest.TestCase):
-    """R2-F2: completion is gated on the transport's structured POSITIVE delivery, not the CLI rc.
+    """R2-F2: completion requires a causally confirmed structured outcome, not CLI rc.
 
     `orchestrate_handoff` returns rc 0 for a `pending_input` (body typed, Enter never pressed) and
-    for a marker-unobserved `queue_enter` (landing unconfirmed). Neither handed the message to the
-    receiver, so neither may complete a forward generation.
+    the tmux-compatibility marker-unobserved `queue_enter` (landing unconfirmed). The former is
+    parked in the receiver composer and the latter is only a practical queued submission; neither
+    may complete a forward generation without the mode-specific confirmation.
     """
 
     def _mk_outcome(self, status, reason, *, mode="standard", **extra):
@@ -608,11 +609,10 @@ class CallbackTransportOutcomeBoundaryTest(unittest.TestCase):
     def test_marker_observed_queue_enter_is_not_positive_without_a_started_turn(self):
         """Redmine #14232 review j#95333 F1: `sent`/`ok` on queue-enter is not a confirmation.
 
-        The queue-enter rail resolves a landed marker to ``ok`` WITHOUT running any turn-start
-        gate, so completing a forward generation on it would forward again while the previous
-        consultation is still unanswered — precisely what this boundary exists to prevent. Only
-        positive evidence (the post-choreography snapshot seeing the receiver actually
-        producing a turn) confirms it.
+        Historical or synthetic queue-enter outcomes can carry those wire tokens without the
+        Herdr causal observation. Completing a forward generation on that partial record would
+        forward again while the previous consultation may still be unanswered. Only an armed
+        transition under one terminal-bound generation confirms it.
         """
         import argparse as _ap
         from mozyo_bridge.application.commands import delivery_was_positive
@@ -626,9 +626,22 @@ class CallbackTransportOutcomeBoundaryTest(unittest.TestCase):
             if causal:
                 # Review j#95601: the armed working-transition wait, published by the rail
                 # only under a coherent generation — the one causally attributable signal.
+                assigned_name = "mzb1_ws_codex_lane"
+                terminal_id = "terminal-2"
+                locator = "%2"
+                revision = "1"
                 observation.update(
-                    event_wait_kind="changed", observation_version=2,
-                    gateway_binding={"provider": "codex", "assigned_name": "mzb1_ws_codex_lane", "locator": "%2", "row_revision": "1", "attestation_observed_at": "2026-07-29T20:10:01+00:00", "startup_action_id": "startup-abc"},
+                    event_wait_kind="changed",
+                    observation_version=2,
+                    baseline_runtime_state="turn_ended",
+                    gateway_binding={
+                        "provider": "codex",
+                        "assigned_name": assigned_name,
+                        "locator": locator,
+                        "row_revision": revision,
+                        "attestation_observed_at": "2026-07-29T20:10:01+00:00",
+                        "startup_action_id": "startup-abc",
+                    },
                 )
             args = _ap.Namespace()
             args.delivery_outcome = self._mk_outcome(

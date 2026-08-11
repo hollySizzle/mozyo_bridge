@@ -37,6 +37,7 @@ from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
 )
 from mozyo_bridge.core.state.herdr_launch_generation import HerdrLaunchGenerationStore
 from mozyo_bridge.core.state.herdr_launch_generation import herdr_launch_generation_path
+from mozyo_bridge.core.state.herdr_native_identity_binding import native_name_for
 from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_ACTIVE,
     DISPOSITION_HIBERNATED,
@@ -51,6 +52,7 @@ from mozyo_bridge.core.state.startup_transaction_fence import (
     PHASE_COMPLETED_ROLLED_BACK,
     PHASE_COMPLETED_SUCCESS,
     PHASE_HEALTH_CHECK,
+    PHASE_LAUNCHING,
     PHASE_ROLLBACK_OWED,
     Participant,
     StartupTransactionFence,
@@ -69,6 +71,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     REASON_OK,
     run_session_rollback,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import pane_bound_receipt
 from mozyo_bridge.core.state.replacement_preservation import (
     PreservationObservation,
     assess_preservation,
@@ -953,12 +956,39 @@ class _FakeBackedRollbackOps:
                     del self.fake._agents[pane]
         return _CloseResult(closed=closed, failed=())
 
-    def close_current_generation(self, action, targets, *, store_home):
-        return self.close(action.unit.workspace_id, action.unit.lane_id, targets)
+    def supports_conditional_close(self):
+        return True
+
+    def close_agent_participant(self, *, workspace_id, lane_id, target):
+        matches = [
+            row for row in self.agent_rows()
+            if row.get("name") == target.assigned_name
+            and row.get("pane_id") == target.locator
+            and row.get("native_name") == target.native_name
+            and row.get("terminal_id") == target.terminal_id
+        ]
+        if len(matches) != 1:
+            return False, "terminal generation changed before close"
+        result = self.close(workspace_id, lane_id, ((target.role, target.locator),))
+        return (not result.failed, "" if not result.failed else "close failed")
+
+    def close_prepared_pane(self, **_kwargs):
+        return False, "prepared close disabled"
 
     def current_generation_targets_absent(self, action, targets, *, store_home):
-        live = {row.get("pane_id") for row in self.agent_rows()}
-        return all(locator not in live for _role, locator in targets)
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_rollback import (  # noqa: E501
+            _terminal_bound_action_target_absent,
+        )
+        participants = {participant.role: participant for participant in action.participants}
+        rows = tuple(self.agent_rows())
+        return all(
+            role in participants
+            and participants[role].locator == locator
+            and _terminal_bound_action_target_absent(
+                store_home, action, participants[role], rows
+            )
+            for role, locator in targets
+        )
 
 
 def _append_v1_lane(tmp: str, *, lane: str, issue: str):
@@ -1027,7 +1057,12 @@ class _AttestingHerdr(FakeHerdr):
         live = self.agent_named(native_name)
         logical_name = live["name"] if live else ""
         decoded = decode_assigned_name(logical_name)
-        if live and self.action_id and decoded.ok and decoded.identity is not None:
+        if (
+            live
+            and provider not in getattr(self, "skip_attestation_for", set())
+            and decoded.ok
+            and decoded.identity is not None
+        ):
             HerdrIdentityAttestationStore(home=self._attestation_home).upsert(
                 IdentityAttestationRecord(
                     assigned_name=logical_name,
@@ -1325,6 +1360,15 @@ class RealLauncherCompositionTests(unittest.TestCase):
                 wk_name = encode_assigned_name(ws, "claude", self.LANE)
                 gw_old = fake.agent_named(gw_name)["pane_id"]
                 wk_old = fake.agent_named(wk_name)["pane_id"]
+                seed_completed_current_generation(
+                    home,
+                    workspace_id=ws,
+                    lane_id=self.LANE,
+                    role="claude",
+                    assigned_name=wk_name,
+                    locator=wk_old,
+                    terminal_id=fake.agent_named(wk_name)["terminal_id"],
+                )
 
                 # Partial shape: gateway absent, worker stale-live.
                 for pane, agent in list(fake._agents.items()):
@@ -1400,7 +1444,7 @@ class RealLauncherCompositionTests(unittest.TestCase):
                     self.assertEqual(run1.status, ACTUATION_EFFECT_FAILED)
                     # The real same-tab postcondition raised a typed reason the real port captured.
                     self.assertEqual(
-                        port.launch_failure_reason, "replacement_binding_launch_unhealthy"
+                        port.launch_failure_reason, "launch_error"
                     )
                     self.assertEqual(
                         store.get(key).find_participant(wk_pin.identity).phase,
@@ -1861,7 +1905,7 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
     ISSUE = "13846"
 
     def _seed_partial(
-        self, home, ws, gw_name, gw_live, *, action, receipt="workspace=w1",
+        self, home, ws, gw_name, gw_live, *, action, receipt="",
         phase=PHASE_ROLLBACK_OWED, old_locator="w1:pPREV", attest_locator=None,
     ):
         nonce = f"preflight-nonce-{action}"
@@ -1875,13 +1919,20 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
         )
         fence = StartupTransactionFence(home=home)
         fence.reserve(unit, nonce)
+        terminal = f"terminal-{gw_live}"
+        if not receipt:
+            receipt = pane_bound_receipt(
+                target_workspace="w1",
+                target_tab="w1:t1",
+                native_name=native_name_for(gw_name),
+                terminal_id=terminal,
+            )
         fence.record_participant(
             sa_id, Participant(role="codex", assigned_name=gw_name,
                                locator=gw_live, receipt=receipt)
         )
         fence.set_phase(sa_id, PHASE_HEALTH_CHECK)
         fence.set_phase(sa_id, phase)
-        terminal = f"terminal:{gw_live}"
         generation = HerdrLaunchGenerationStore(home=home)
         generation.reserve_pending(
             assigned_name=gw_name, startup_action_id=sa_id, workspace_id=ws,
@@ -1910,6 +1961,15 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
             home, coord, worktree, env, fake, ws, gw_name, wk_name, gw_old, wk_old = (
                 _append_v1_lane(tmp, lane=self.LANE, issue=self.ISSUE)
             )
+            seed_completed_current_generation(
+                home,
+                workspace_id=ws,
+                lane_id=self.LANE,
+                role="claude",
+                assigned_name=wk_name,
+                locator=wk_old,
+                terminal_id=fake.agent_named(wk_name)["terminal_id"],
+            )
             request = PrepareBoundPairRequest(
                 issue=self.ISSUE, journal="80925", lane=self.LANE,
                 worktree=str(worktree), branch="main",
@@ -1927,7 +1987,10 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
             self.assertEqual(_detect("act-happy"), sa_id)
 
             # Mismatch matrix -> "" (never this owned partial; left to the generic block).
-            self._seed_partial(home, ws, gw_name, gw_old, action="act-no-receipt", receipt="")
+            self._seed_partial(
+                home, ws, gw_name, gw_old,
+                action="act-no-receipt", receipt="workspace=w1",
+            )
             self.assertEqual(_detect("act-no-receipt"), "")
             self._seed_partial(home, ws, gw_name, gw_old, action="act-not-owed",
                                phase=PHASE_COMPLETED_SUCCESS)
@@ -2368,7 +2431,7 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
                 seed_completed_current_generation(
                     home, workspace_id=workspace, lane_id=self.LANE, role=provider,
                     assigned_name=name, locator=locator,
-                    terminal_id=f"terminal:{locator}",
+                    terminal_id=f"terminal-{locator}",
                 )
 
             # Real inventory: the FakeHerdr rows enriched with the ``revision`` / ``foreground_cwd``
@@ -2484,7 +2547,7 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
             self.assertIsNotNone(worker_generation)
             legacy_startup_id = worker_generation.startup_action_id
             legacy_startup = StartupTransactionFence(home=home).read(legacy_startup_id)
-            self.assertEqual(legacy_startup.phase, PHASE_ROLLBACK_OWED)
+            self.assertEqual(legacy_startup.phase, PHASE_LAUNCHING)
             legacy_locator = legacy_startup.participant_for("claude").locator
             self.assertNotIn(legacy_locator, {wk_old, gw_old})
             reference = fake._agents[gw_old]
@@ -2495,16 +2558,20 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
             pane_receipt = parse_pane_bound_receipt(
                 legacy_startup.participant_for("claude").receipt
             )
+            self.assertIsNotNone(pane_receipt)
+            self.assertEqual(pane_receipt.native_name, native_name_for(wk_name))
+            self.assertTrue(pane_receipt.terminal_id)
+            legacy_terminal = pane_receipt.terminal_id
             fake._agents[legacy_locator] = _FakeAgent(
                 name=pane_receipt.native_name, logical_name=wk_name,
                 pane_id=legacy_locator, workspace_id=reference.workspace_id,
-                terminal_id=f"terminal:{legacy_locator}",
+                terminal_id=legacy_terminal,
                 provider="claude", tab_id=reference.tab_id,
             )
             HerdrIdentityAttestationStore(home=home).upsert(
                 IdentityAttestationRecord(
                     assigned_name=wk_name, workspace_id=ws, role="claude", lane_id=self.LANE,
-                    locator=legacy_locator, terminal_id=f"terminal:{legacy_locator}",
+                    locator=legacy_locator, terminal_id=legacy_terminal,
                     verdict=VERDICT_PRESENT, observed_at="2099-07-18T00:00:00+00:00",
                     replacement_action_id=outer_action,
                 )
@@ -2512,9 +2579,12 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
             HerdrLaunchGenerationStore(home=home).finalize(
                 assigned_name=wk_name, startup_action_id=legacy_startup_id,
                 workspace_id=ws, role="claude", lane_id=self.LANE,
-                locator=legacy_locator, terminal_id=f"terminal:{legacy_locator}",
+                locator=legacy_locator, terminal_id=legacy_terminal,
                 verdict=VERDICT_PRESENT, observed_at="2099-07-18T00:00:00+00:00",
             )
+            startup_fence = StartupTransactionFence(home=home)
+            startup_fence.set_phase(legacy_startup_id, PHASE_HEALTH_CHECK)
+            startup_fence.set_phase(legacy_startup_id, PHASE_ROLLBACK_OWED)
 
             # 4. Public prepare preflight again -> surfaces the exact rollback --action-id.
             with seams():
@@ -2534,7 +2604,7 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
             rb_done = run_session_rollback(
                 action_id=legacy_startup_id, ops=rb_ops, home=home, execute=True
             )
-            self.assertTrue(rb_done.ok)
+            self.assertTrue(rb_done.ok, repr(rb_done))
             self.assertEqual(rb_done.reason, REASON_OK)
             self.assertEqual(rb_ops.close_calls, [[("claude", legacy_locator)]])
             self.assertIsNone(fake.agent_named(wk_name))
