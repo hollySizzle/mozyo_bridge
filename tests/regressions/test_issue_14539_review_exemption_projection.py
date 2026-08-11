@@ -3964,6 +3964,33 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "parsed through superseded_failure_correlation's single-scan reader (so the "
             "exactly-one-marker rule is that module's); renders the declaration marker itself",
         ),
+        f"{_D}/domain/superseded_audit_failure_producer.py": (
+            ["*", "*", "*", "*"],
+            "renders (Redmine #15166): the audit-failure terminal declaration marker, split out of "
+            "the terminal module when the j#102184 typed-refusal wiring pushed it past the "
+            "oversized-module gate. Reads no note; the emitted body is byte-identical to what the "
+            "terminal module's strict reader accepts, by construction",
+        ),
+        f"{_D}/domain/superseded_audit_failure_terminal.py": (
+            ["*", "*", "*"],
+            "reads (Redmine #15166): the audit-failure terminal declaration gate, located and "
+            "parsed through superseded_failure_correlation's single-scan reader (so the "
+            "exactly-one-marker rule is that module's — a second declaration of the gate, or one "
+            "it names but cannot read, poisons the note for the gate rather than yielding the "
+            "readable sibling). The declaration RENDERER now lives in the producer module above "
+            "and is re-exported here. It also RE-EXPORTS the successor "
+            "acknowledgement names from the sibling correlation module below, which is where that "
+            "second gate's grammar now lives",
+        ),
+        f"{_D}/domain/superseded_audit_failure_correlation.py": (
+            ["*", "*", "*", "*"],
+            "reads (Redmine #15166): the successor's audit-supersession acknowledgement gate, "
+            "located and parsed through superseded_failure_correlation's single-scan reader; "
+            "renders that marker through the shared separator guard. Split out of the terminal "
+            "module by review j#101880's hardening, mirroring the #14755 terminal / correlation "
+            "pair. It establishes POINTER INTEGRITY only — one actor can write both this record "
+            "and the declaration that names it, so it is never the authority a terminal rests on",
+        ),
         f"{_D}/domain/hibernate_park_record.py": (["handoff", "handoff"], "reads one marker per record"),
         f"{_D}/application/operator_startup_resume_leg.py": (
             ["*", "operator-startup-gate"],
@@ -4063,6 +4090,14 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
     #: The trade is stated in ``test_no_module_shape_can_hide_a_capability_from_a_wildcard_consumer``:
     #: over-detection costs a declaration line, a missed reader costs a silent gate.
     INHERITED = {
+        f"{_D}/application/retire_superseded_audit_failure.py": (
+            ['*'],
+            "inherits via a used import of superseded_audit_failure_terminal (Redmine #15166); "
+            "names no marker token itself and reads no note directly — it measures the live "
+            "histories, both issues' current tracker status, the named audit journal's shape and "
+            "the lane checkout, and delegates every marker question to that module's strict "
+            "grammar",
+        ),
         f"{_D}/application/sublane_restored_pair_recovery.py": (
             ['*'],
             "inherits the recovery owner-approval marker capability through the exact marker "
