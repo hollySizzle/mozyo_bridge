@@ -1364,6 +1364,11 @@ caller composes a snapshot read with a wait. Established live in the PoC
   fail-safe in #13248; it does not affect this snapshot read model, which never
   subscribes. Recorded here so the wait US does not re-derive it.
 
+The command spellings in the bullets above are retained as **Herdr 0.7.1 PoC evidence**;
+they are not the current adapter grammar. Herdr 0.8 exposes the same change-semantics through
+`agent wait TARGET --until STATUS --timeout MS`. Production code and the current fake must use
+that exact argv shape and fail closed on the former `wait agent-status ... --status ...` shape.
+
 Live verification is not required for this US (staged seam): the mapping and the
 reader are pinned through a pure fake / injected-runner, with no live herdr.
 
@@ -1400,9 +1405,10 @@ existing tmux path is untouched.
   `TurnStartRailError` subclasses `TerminalTransportError`, so the whole seam
   shares one fail-closed error base. It imports no provider.
 - `src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/infrastructure/herdr_turn_start.py`
-  — the built-in **herdr CLI wait primitive** (`HerdrCliWaitPrimitive`, a
-  two-phase `arm` / `collect` over `wait agent-status <target> --status working
-  --timeout <ms>` via an injectable `Popen` factory) plus the fail-closed
+  — the built-in **herdr CLI wait primitive**. `HerdrCliWaitPrimitive` is a
+  two-phase `arm` / `collect` over `agent wait <target> --until working
+  --timeout <ms>` (Herdr 0.8; `TARGET` is positional immediately after `wait`) via an injectable
+  `Popen` factory. The same module owns the fail-closed
   `resolve_turn_start_rail` resolver that wires all three providers (transport
   #13245, reader #13246, this wait primitive) from the one trusted-env binary.
   Dependency points provider -> core.
@@ -1547,8 +1553,11 @@ The queue seam owns this sequence:
    `pane_bound_v2` launch token. Arm a `working`-transition wait before the first
    Enter and then read the runtime baseline.
 2. Keep the common transport choreography: body exactly once, first Enter zero-or-one.
-   The first Enter requires the post-body **stable terminal/v2 launch-token** recheck,
-   armed wait, and an unexpired absolute deadline; revision-only drift on that same
+   Unlike the tmux compatibility rail, Herdr queue-enter performs **no landing-marker wait**
+   between body injection and causal admission. The first Enter requires, in order, the
+   post-body **stable terminal/v2 launch-token** recheck, an armed Herdr 0.8
+   `agent wait TARGET --until working --timeout MS`, and an unexpired absolute deadline;
+   revision-only drift on that same
    verified terminal is allowed because body rendering may advance the revision.
    The pending wait and absolute deadline are checked again at the final transport
    effect boundary, after project-gateway capability verification and immediately
@@ -1594,10 +1603,18 @@ wait `absent` maps to `blocked` / `turn_start_absent`; a fresh gate that observe
 runtime `blocked` maps to `blocked` / `receiver_blocked`; timeout, error, unarmed wait,
 identity/generation drift, or body/screen/state proof failure maps to `blocked` /
 `turn_start_unconfirmed`; a raised `TerminalTransportError` maps to `blocked` /
-`transport_error`. These post-injection failures retain an `uncertain` injection
+`transport_error`. These post-injection failures retain an `uncertain_partial` injection
 stage with `blind_retry_prohibited`; the former legacy telemetry-only `sent` fallback
 is not a success path. tmux queue-enter, Herdr standard, and pending rails do not
 enter this seam.
+
+A raised post-injection transport failure is also a terminal ledger event, not an exception-only
+exit. The rail appends exactly one row with `backend=herdr`, `rail=queue_enter_rail`, and
+`disposition` equal to the rail-owned `TRANSPORT_STEPS` primitive token. The gateway outcome carries
+only `transport_failure.primitive=<same token>`; the Unit Board projection may expose only
+`gateway_status=blocked`, `gateway_reason=transport_error`, and
+`transport_primitive=<same token>`. Adapter exception text, raw stderr, binary / repository paths,
+and arbitrary detail never cross either structured boundary.
 
 ### Equivalence to the #13166 codex-standard turn-start guard (documented proof)
 

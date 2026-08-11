@@ -828,6 +828,7 @@ class DeliveryOutcome:
     # `None` for the tmux backend, the event-driven standard rail, and every
     # non-queue-enter path (the explicit fallback).
     queue_enter_turn_start_observation: Optional[dict[str, Any]] = None
+    transport_failure: Optional[dict[str, Any]] = None
     # Redmine #13760: the pre-send startup-admission verdict (`outcome` /
     # `provider_id` / `blocker_id`), built by
     # `herdr_startup_admission.StartupAdmission.to_telemetry_dict`. Set ONLY on a
@@ -1541,8 +1542,8 @@ def _outcome_narrative(
         # #13255: event-wait evidence, not landing-marker/tmux-capture evidence.
         return (
             "herdr turn-start rail (--mode standard): the notification was injected "
-            "and the event wait for a working transition (herdr `wait agent-status "
-            "--status working`) timed out — no turn start was observed within the "
+            "and the event wait for a working transition (herdr `agent wait "
+            "<target> --until working`) timed out — no turn start was observed within the "
             "wait window. The marker+body was injected once; the rail may have "
             "re-issued Enter within its bounded resend budget (see the turn-start "
             "telemetry line for the exact re-send count). There is no landing-marker "
@@ -2091,6 +2092,7 @@ def make_outcome(
     ticketless_work_intake: Optional["TicketlessWorkIntake"] = None,
     turn_start_outcome: Optional[dict[str, Any]] = None,
     queue_enter_turn_start_observation: Optional[dict[str, Any]] = None,
+    transport_failure: Optional[dict[str, Any]] = None,
     startup_admission: Optional[dict[str, Any]] = None,
     auto_target_repo: Optional[dict[str, Any]] = None,
 ) -> DeliveryOutcome:
@@ -2144,6 +2146,7 @@ def make_outcome(
         ),
         turn_start_outcome=turn_start_outcome,
         queue_enter_turn_start_observation=queue_enter_turn_start_observation,
+        transport_failure=transport_failure,
         startup_admission=startup_admission,
         auto_target_repo=auto_target_repo,
         injection_stage=injection_stage_telemetry(status, reason, mode=mode, queue_enter_turn_start_observation=queue_enter_turn_start_observation, turn_start_outcome=turn_start_outcome),  # noqa: E501 - Redmine #14232 + review j#95333 F1: the ONE full-context classification (the mode and both turn-start telemetries resolve the queue-enter `ok` cell)

@@ -22,7 +22,8 @@ Actions (mutually exclusive):
 - ``--run-once`` — one **production pass**: discover fresh handoff-worthy gate candidates from
   ``--source-issue`` (structured markers), ingest/classify, deliver once, sweep. Actuates.
 - ``--watch`` — the bounded background-watcher loop: run a production pass per Herdr-event wake
-  (``--max-passes`` / ``--wake-target`` stable ``wait agent-status`` event, else ``--wake-interval``),
+  (``--max-passes`` / ``--wake-target`` stable ``agent wait --until`` event, else
+  ``--wake-interval``),
   re-reading Redmine every wake outcome. Actuates.
 - ``--emit-gate`` — the canonical **governed** gate-record writer: record a callback-required gate
   journal on Redmine (``--issue`` + ``--gate`` [+ ``--body``]) with the discoverable
@@ -375,7 +376,7 @@ def _herdr_wake_wait(interval_seconds: float) -> object:
 def _wake_wait_fn(args: argparse.Namespace) -> Callable[[], object]:
     """Build the ``--watch`` wake primitive (#13520 review F1b).
 
-    Production binds this to the **stable Herdr CLI event** ``wait agent-status`` when a
+    Production binds this to the **stable Herdr CLI event** ``agent wait --until`` when a
     ``--wake-target`` is given and the trusted herdr binary resolves: each wake blocks on a real
     herdr runtime state change (bounded by ``--wake-timeout-ms``), the sanctioned event surface of
     design j#75098 Q1 (never the raw socket, never on the LLM surface). When no wake target is
@@ -955,7 +956,7 @@ def register_callbacks(sub) -> None:
     )
     p.add_argument(
         "--wake-target", dest="wake_target",
-        help="Herdr agent/target to wait on via the stable `wait agent-status` event for --watch "
+        help="Herdr agent/target to wait on via `agent wait TARGET --until STATUS` for --watch "
              "(when set + herdr resolves, the real Herdr CLI event drives wakes; else --wake-interval).",
     )
     p.add_argument(
@@ -964,7 +965,8 @@ def register_callbacks(sub) -> None:
     )
     p.add_argument(
         "--wake-timeout-ms", dest="wake_timeout_ms", type=int, default=0,
-        help="Bounded `wait agent-status --timeout` window in ms for --watch (0 = default 50000).",
+        help="Bounded `agent wait TARGET --until STATUS --timeout MS` window for --watch "
+             "(0 = default 50000 ms).",
     )
     p.add_argument(
         "--candidate", action="append", type=_parse_candidate, metavar="ISSUE:JOURNAL:ROUTE[:KIND]",

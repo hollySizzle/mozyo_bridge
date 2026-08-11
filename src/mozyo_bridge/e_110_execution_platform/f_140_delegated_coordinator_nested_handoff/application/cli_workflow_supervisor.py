@@ -523,7 +523,8 @@ def _resolve_watch_wait_binary() -> str:
 
     Uses the single shared :func:`resolve_herdr_binary` (``MOZYO_HERDR_BINARY`` -> trusted-PATH
     ``herdr``), the same resolver ``workflow callbacks --watch`` binds its wake to, so the pump
-    spawns ``herdr wait agent-status`` and never ``mozyo-bridge`` (which has no ``wait``
+    spawns ``herdr agent wait TARGET --until STATUS --timeout MS`` and never
+    ``mozyo-bridge`` (which has no ``agent wait``
     subcommand). Fail-safe: an unconfigured / unresolvable binary returns ``""`` so the pump
     degrades to a bounded timeout-only wait (still runs the whole-roster reconciliation) instead of
     launching a bogus executable.
@@ -542,8 +543,8 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     """Run the bounded supervisor event pump: Herdr turn events drive the reconcile passes.
 
     The event-driven PRIMARY activation (Redmine #13758 Q1 / j#79507): the shared supervisor is
-    the sole reconcile owner, driven by a bounded multiplex Herdr ``wait agent-status --status
-    done`` per active-lane target. ``--max-iterations`` bounds the pump (never an unbounded poll);
+    the sole reconcile owner, driven by a bounded multiplex Herdr ``agent wait TARGET --until
+    done --timeout MS`` per active-lane target. ``--max-iterations`` bounds the pump (never an unbounded poll);
     the StartInterval one-shot ``--run-once`` remains the loss-recovery fallback.
     """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.reconcile_event_pump import (
@@ -565,8 +566,8 @@ def _cmd_watch(args: argparse.Namespace) -> int:
         holder=holder, home=home,
         store_path=_store_path_from_args(args), release_after=False,
     )
-    # Review R6-F1: the event wait spawns herdr's ``wait agent-status`` surface, so the seam must
-    # get the sanctioned trusted-environment herdr binary — never ``mozyo-bridge`` (no ``wait``
+    # Review R6-F1: the event wait spawns herdr's ``agent wait --until`` surface, so the seam must
+    # get the sanctioned trusted-environment herdr binary — never ``mozyo-bridge`` (no ``agent wait``
     # subcommand). If it is not configured, pass an empty binary so the pump degrades to a
     # timeout-only wait (still runs the bounded whole-roster reconciliation) rather than spawning a
     # bogus executable (mirrors the ``workflow callbacks --watch`` fail-safe).

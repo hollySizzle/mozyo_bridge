@@ -905,7 +905,7 @@ class HerdrTurnStartRecordWordingTest(unittest.TestCase):
         self.assertNotIn("typed exactly once", record)
         # It DOES describe the event-wait timeout signal accurately.
         self.assertIn("event wait", record)
-        self.assertIn("wait agent-status", record)
+        self.assertIn("agent wait", record)
         # The next-action is the herdr event-driven phrasing, not the capture rail's.
         self.assertIn("event-driven", outcome.next_action)
         self.assertNotIn("marker+body was typed once and Enter was pressed", outcome.next_action)

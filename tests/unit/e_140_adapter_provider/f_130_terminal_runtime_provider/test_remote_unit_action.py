@@ -12,6 +12,9 @@ from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.unit_
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     QUEUE_ENTER_RETRY_WINDOW_SECONDS,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_transport_failure_gate import (
+    STEP_SEND_KEYS_ENTER,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (
     MODE_QUEUE_ENTER,
 )
@@ -918,6 +921,84 @@ class ApplyDeliveryTests(unittest.TestCase):
         self.assertEqual(result.reason, REASON_DELIVERY_UNCERTAIN)
         self.assertEqual(result.injection_stage, STAGE_UNCERTAIN_PARTIAL)
         self.assertTrue(result.as_payload()["blind_retry_prohibited"])
+
+    def test_transport_failure_exposes_only_the_closed_gateway_diagnostics(self) -> None:
+        private_stderr = "ssh failed: /srv/private/repository"
+
+        class FailedPrimitiveRunner(RecordingRunner):
+            def __call__(self, argv, **kwargs):
+                if "project-gateway" in argv[-1]:
+                    self.argvs.append(list(argv))
+                    stdout = delivery_record(
+                        status="blocked",
+                        reason="transport_error",
+                        transport_failure={
+                            "primitive": STEP_SEND_KEYS_ENTER,
+                            "detail": "adapter exception must stay private",
+                        },
+                    )
+                    return subprocess.CompletedProcess(argv, 3, stdout, private_stderr)
+                return super().__call__(argv, **kwargs)
+
+        runner = FailedPrimitiveRunner(answers())
+        runtime = MultiSourceUnitBoardRuntime(
+            REMOTE_CONFIG,
+            local_runtime=FakeLocalRuntime(),
+            runner=runner,
+            clock=MovableClock(),
+        )
+        action = RemoteUnitActionRail(runtime, clock=MovableClock())
+        unit_id = remote_unit_id(runtime)
+
+        result = action.apply(action.preview(request(unit_id)))
+
+        self.assertEqual(result.state, ACTION_UNCERTAIN)
+        self.assertEqual(result.injection_stage, STAGE_UNCERTAIN_PARTIAL)
+        self.assertEqual(result.gateway_status, "blocked")
+        self.assertEqual(result.gateway_reason, "transport_error")
+        self.assertEqual(result.transport_primitive, STEP_SEND_KEYS_ENTER)
+        rendered = json.dumps(result.as_payload())
+        self.assertNotIn(private_stderr, rendered)
+        self.assertNotIn("adapter exception", rendered)
+        self.assertNotIn("/srv/private", rendered)
+
+    def test_free_form_transport_failure_diagnostics_are_dropped(self) -> None:
+        private_stderr = "ssh failed: /srv/private/repository"
+
+        class FreeFormFailureRunner(RecordingRunner):
+            def __call__(self, argv, **kwargs):
+                if "project-gateway" in argv[-1]:
+                    self.argvs.append(list(argv))
+                    stdout = delivery_record(
+                        status="blocked",
+                        reason="transport_error",
+                        transport_failure={
+                            "primitive": "send failed: /srv/private/repository",
+                            "stderr": private_stderr,
+                        },
+                    )
+                    return subprocess.CompletedProcess(argv, 3, stdout, private_stderr)
+                return super().__call__(argv, **kwargs)
+
+        runner = FreeFormFailureRunner(answers())
+        runtime = MultiSourceUnitBoardRuntime(
+            REMOTE_CONFIG,
+            local_runtime=FakeLocalRuntime(),
+            runner=runner,
+            clock=MovableClock(),
+        )
+        action = RemoteUnitActionRail(runtime, clock=MovableClock())
+        unit_id = remote_unit_id(runtime)
+
+        result = action.apply(action.preview(request(unit_id)))
+
+        self.assertEqual(result.state, ACTION_UNCERTAIN)
+        self.assertEqual(result.gateway_status, "")
+        self.assertEqual(result.gateway_reason, "")
+        self.assertEqual(result.transport_primitive, "")
+        rendered = json.dumps(result.as_payload())
+        self.assertNotIn(private_stderr, rendered)
+        self.assertNotIn("/srv/private", rendered)
 
     def test_a_pre_injection_gateway_refusal_is_a_zero_send(self) -> None:
         # The other half of the distinction: the target gateway refused BEFORE

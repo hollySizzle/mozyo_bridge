@@ -125,7 +125,7 @@ def _run_wait(argv: list[str], state_path: Path) -> int:
     transition from the shared state. No body send, absent wait, or timeout can fire it.
     """
     target = argv[2] if len(argv) > 2 else ""
-    wanted = _flag_value(argv, "--status")
+    wanted = _flag_value(argv, "--until")
     try:
         timeout_ms = max(1, int(_flag_value(argv, "--timeout") or "1000"))
     except ValueError:
@@ -199,10 +199,10 @@ def _fire_enter_transition(fake: FakeHerdr, target: str) -> None:
     proc = fake.popen(
         [
             sys.argv[0],
+            "agent",
             "wait",
-            "agent-status",
             target,
-            "--status",
+            "--until",
             wanted,
             "--timeout",
             "1",
@@ -215,7 +215,7 @@ def _fire_enter_transition(fake: FakeHerdr, target: str) -> None:
 def _state_lock(state_path: Path):
     """Serialize the read->mutate->write cycle across concurrent adapter invocations.
 
-    The standard-rail turn-start choreography ARMS its ``wait agent-status`` (a non-blocking
+    The standard-rail turn-start choreography ARMS its ``agent wait`` (a non-blocking
     background invocation of this adapter) and THEN injects (``pane send-text`` / ``send-keys``,
     further invocations) — so two adapter processes hold the SAME state file at once. Without a
     lock their read-modify-write cycles interleave and one clobbers the other (a stale snapshot
@@ -240,7 +240,7 @@ def _state_lock(state_path: Path):
 
 def main(argv: list[str]) -> int:
     state_path = _state_path()
-    if argv[:2] == ["wait", "agent-status"]:
+    if argv[:2] == ["agent", "wait"]:
         return _run_wait(argv, state_path)
 
     enter_send = _is_enter_send(argv)

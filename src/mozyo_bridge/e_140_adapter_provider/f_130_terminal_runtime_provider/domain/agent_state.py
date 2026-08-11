@@ -58,7 +58,7 @@ Scope (staged seam — kept explicit so it does not drift):
 - **In scope:** the observed-status vocabulary, the runtime receiver-state
   vocabulary, the pure fail-closed mapping, and the fail-closed read result
   record (filled by the sibling herdr ``agent get`` / ``agent list`` reader).
-- **Out of scope (later US's):** ``wait agent-status`` turn-start / change
+- **Out of scope (later US's):** ``agent wait --until`` turn-start / change
   semantics (#13248 — this module is a *snapshot* read model; the check-then-wait
   rail from PoC E9 / E12–E14 is built there, see the design doc), durable
   identity naming (#13247), any test that runs a live herdr binary, wiring this

@@ -357,7 +357,8 @@ def turn_start_positively_observed(
     was set up **before** this send's Enter and then fired, so the start it saw belongs to
     THIS send. Exactly two such signals exist:
 
-    - the herdr **event** rail's armed ``wait agent-status --status working`` transition
+    - the herdr **event** rail's armed
+      ``agent wait TARGET --until working --timeout MS`` transition
       (``turn_start_outcome.outcome == "started"``), used by ``--mode standard``;
     - the queue-enter rail's own armed working-transition wait (Redmine #14203), surfaced on
       the v2 observation as ``event_wait_kind == "changed"`` **together with** a
@@ -373,7 +374,7 @@ def turn_start_positively_observed(
     direction of this predicate. Review j#95601 established that reading ``busy`` as a
     confirmation violates the source contract of the field itself
     (``DeliveryOutcome.queue_enter_turn_start_observation``: *"a post-hoc snapshot does not
-    prove causality the way an armed ``wait agent-status`` transition does, so it must not be
+    prove causality the way an armed ``agent wait --until`` transition does, so it must not be
     read as an event-observed turn start"*). A post-hoc poll cannot attribute what it sees to
     this send: the queue-enter rail runs no idle precondition gate, so a receiver that was
     already busy before the send — or a recycled process running someone else's turn — reads

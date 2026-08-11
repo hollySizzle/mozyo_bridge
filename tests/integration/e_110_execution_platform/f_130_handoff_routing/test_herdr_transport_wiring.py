@@ -8,8 +8,8 @@ available**: the target is resolved herdr-natively at the orchestrate entry
 Redmine #13255 promotes the ``--mode standard`` rail under the herdr backend from
 the capture-based ``_observe_standard_turn_start`` to the event-driven
 ``HerdrTurnStartRail``. The fake herdr no longer models turn-start via an
-``agent read`` capture-diff; it fakes the ``wait agent-status <target> --status
-working --timeout <ms>`` event (spawned via ``subprocess.Popen``) and the
+``agent read`` capture-diff; it fakes the ``agent wait <target> --until working
+--timeout <ms>`` event (spawned via ``subprocess.Popen``) and the
 ``agent get`` state snapshot. These tests prove, for herdr+standard:
 ``_observe_standard_turn_start`` is NOT called; the body is ``send_text`` exactly
 once; an Enter resend never re-injects the body; each of the 6 rail outcomes lands
@@ -83,7 +83,7 @@ TRUST_SCREEN = (
 
 
 class _FakeWaitProc:
-    """A fake ``wait agent-status`` subprocess (herdr event wait), classified on exit."""
+    """A fake ``agent wait`` subprocess (Herdr event wait), classified on exit."""
 
     def __init__(self, *, returncode: int = 0, stdout: str = "", stderr: str = ""):
         self.returncode = None
@@ -108,7 +108,7 @@ class _FakeHerdr:
     Models the surfaces the herdr+standard rail drives: ``agent get`` (the
     pre-injection state snapshot + the timeout re-snapshot), ``pane send-text`` /
     ``pane send-keys`` (inject), ``agent read`` (the Enter-resend composer check),
-    ``agent list`` (inventory), and ``wait agent-status`` (the event wait, spawned
+    ``agent list`` (inventory), and ``agent wait`` (the event wait, spawned
     via ``subprocess.Popen``). Turn-start is the ``wait`` result, NOT an ``agent
     read`` capture-diff.
 
@@ -220,7 +220,7 @@ class _FakeHerdr:
 
     def popen(self, argv, stdout=None, stderr=None, text=None, **kw):
         rest = list(argv[1:])
-        if rest[:2] == ["wait", "agent-status"]:
+        if rest[:2] == ["agent", "wait"]:
             target = rest[2]
             self.sends.append(("wait", target))
             rc, err = (
@@ -1189,7 +1189,7 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         # Redmine #13255 j#72695: the record wording must describe a herdr event-wait
         # timeout, NOT the tmux/capture standard rail's landing-marker observation.
         self.assertIn("event wait", out)
-        self.assertIn("wait agent-status", out)
+        self.assertIn("agent wait", out)
         self.assertNotIn("Landing marker was observed and Enter was pressed", out)
         self.assertNotIn("tmux capture", out)
 

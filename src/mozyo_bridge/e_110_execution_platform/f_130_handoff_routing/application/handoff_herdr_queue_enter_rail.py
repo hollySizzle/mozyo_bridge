@@ -84,6 +84,10 @@ class QueueEnterEffectFenceRefused(TerminalTransportError):
     """The queue's live wait/deadline proof expired before the Enter effect."""
 
 
+class QueueEnterRetryProbeFailed(TerminalTransportError):
+    """A transport read failed while authorising an additional Enter."""
+
+
 @contextmanager
 def queue_enter_effect_fence(check: Callable[[], None]) -> Iterator[None]:
     """Expose one queue Enter's last safety check to the actual send primitive."""
@@ -522,10 +526,10 @@ class HerdrQueueEnterSession:
                 self.receiver,
                 self.pre_binding,
             )
-        except TerminalTransportError:
+        except TerminalTransportError as exc:
             # A bound transport primitive failed after injection. Preserve the
             # common rail's typed ``blocked / transport_error`` terminal.
-            raise
+            raise QueueEnterRetryProbeFailed("queue-enter retry probe failed") from exc
         except Exception:  # noqa: BLE001 - a failed proof refuses Enter
             return QueueEnterResendGate(RESEND_SKIP_STATE_UNREADABLE)
         if not isinstance(gate, QueueEnterResendGate):
@@ -919,6 +923,7 @@ __all__ = (
     "HerdrQueueEnterSession",
     "LiveHerdrQueueEnterOpsMixin",
     "QueueEnterEffectFenceRefused",
+    "QueueEnterRetryProbeFailed",
     "QueueEnterSnapshot",
     "QueueEnterResendGate",
     "enforce_active_queue_enter_effect_fence",

@@ -610,7 +610,7 @@ class PaneSendTest(unittest.TestCase):
 
 class WaitChangeSemanticsTest(unittest.TestCase):
     def _wait_argv(self, target, status):
-        return [BINARY, "wait", "agent-status", target, "--status", status, "--timeout", "45000"]
+        return [BINARY, "agent", "wait", target, "--until", status, "--timeout", "45000"]
 
     def test_armed_transition_returns_changed_and_advances_status(self) -> None:
         fake = FakeHerdr()
@@ -650,6 +650,21 @@ class WaitChangeSemanticsTest(unittest.TestCase):
         self.assertEqual(fake.popen(self._wait_argv(loc, STATUS_WORKING)).returncode, 0)
         # The armed event is spent; a second identical wait times out.
         self.assertEqual(fake.popen(self._wait_argv(loc, STATUS_WORKING)).returncode, 1)
+
+    def test_wait_argv_fails_closed_outside_the_exact_herdr_08_grammar(self) -> None:
+        fake = FakeHerdr()
+        exact = self._wait_argv("w1:p1", STATUS_WORKING)
+        invalid = (
+            exact[:-2],
+            [*exact[:4], "--status", *exact[5:]],
+            [*exact, "--json"],
+            [*exact[:-1], "not-a-number"],
+            [*exact[:5], "definitely_not_a_status", *exact[6:]],
+        )
+        for argv in invalid:
+            with self.subTest(argv=argv):
+                with self.assertRaises(UnknownHerdrCommandError):
+                    fake.popen(argv)
 
 
 # -- fail-closed on unmodelled argv (design §2.3) ------------------------------

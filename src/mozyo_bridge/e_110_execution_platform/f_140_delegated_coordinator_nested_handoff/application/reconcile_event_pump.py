@@ -4,8 +4,8 @@ The event-driven PRIMARY activation the reconciler needs: instead of only the bo
 StartInterval sweep (which cannot observe the ``busy -> turn_ended`` transient), the
 ``WorkspaceCallbackSupervisor`` — the SOLE reconcile owner — is driven by Herdr turn events.
 After a startup bootstrap reconcile, each bounded iteration is **wait -> pass**: it enumerates
-the active-lane expected-owner targets, arms a bounded CONCURRENT/MULTIPLEX Herdr ``wait
-agent-status --status done`` (the raw status mozyo maps to ``turn_ended``; NOT the ``working``
+the active-lane expected-owner targets, arms a bounded CONCURRENT/MULTIPLEX Herdr ``agent
+wait --until done`` (the raw status mozyo maps to ``turn_ended``; NOT the ``working``
 default used for turn-START), then runs one supervisor pass that CONSUMES that outcome (observes
 the live runtime + reconciles + re-reads Redmine). So an observed edge is reconciled within the
 same bounded invocation — even the CLI default ``--max-iterations 1`` (review R6-F3). On any
@@ -34,6 +34,9 @@ import threading
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional, Sequence
 
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_agent_wait import (  # noqa: E501
+    build_herdr_agent_wait_argv,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_wake import (
     WAKE_ERROR,
     WAKE_OUTER_TIMEOUT_MARGIN_SECONDS,
@@ -60,7 +63,7 @@ class EventPumpTarget:
     workspace_id: str
     issue: str
     lane_id: str
-    target: str  # the stable assigned Herdr agent name/id for ``wait agent-status``
+    target: str  # the stable assigned Herdr agent name/id for ``agent wait``
 
 
 #: The grace a SIGTERM'd wait gets to exit before the reap escalates to SIGKILL (review R8-F2).
@@ -105,7 +108,7 @@ class _TimeoutOnlyWait(CancellableWait):
 
 
 class HerdrCancellableWait(CancellableWait):
-    """A cancellable ``herdr wait agent-status`` over a killable :class:`subprocess.Popen` (R7-F1/R8-F2).
+    """A cancellable ``herdr agent wait`` over a killable :class:`subprocess.Popen` (R7-F1/R8-F2).
 
     ``run()`` spawns the child and blocks on it (bounded by the outer timeout); ``cancel()`` sends
     SIGTERM and ``kill()`` sends SIGKILL, so a losing wait is reaped in ~ms after the winning target
@@ -319,12 +322,12 @@ def build_event_pump_seams(
     - ``supervisor_pass(mode, hints)`` drives the shared :class:`WorkspaceCallbackSupervisor`
       (the sole reconcile owner) — no second supervisor;
     - ``targets_fn`` enumerates the active-lane expected-owner Herdr targets (injected);
-    - the multiplex wait arms a bounded :mod:`...callback_wake` ``wait agent-status --status done``
+    - the multiplex wait arms a bounded :mod:`...callback_wake` ``agent wait --until done``
       per target (the turn_ended raw status), reusing the stable Herdr wait primitive.
 
     ``wait_binary`` MUST be the sanctioned trusted-environment herdr executable — resolved by the
     composition root via :func:`resolve_herdr_binary` (review R6-F1). It is ``herdr`` (whose
-    ``wait agent-status`` surface this uses), never ``mozyo-bridge`` (which has no ``wait``
+    ``agent wait`` surface this uses), never ``mozyo-bridge`` (which has no ``agent wait``
     subcommand). When the herdr binary is not configured in the trusted environment the composition
     root passes an empty ``wait_binary``: the pump then degrades to a TIMEOUT-ONLY wait (no live
     event source) so it still runs the bounded whole-roster reconciliation each iteration rather
@@ -341,10 +344,12 @@ def build_event_pump_seams(
         if not binary:
             # No trusted herdr binary -> no event source: a benign bounded timeout (still re-reads).
             return _TimeoutOnlyWait()
-        argv = [
-            str(binary), "wait", "agent-status", str(t.target),
-            "--status", HERDR_STATUS_TURN_ENDED, "--timeout", str(int(timeout_ms)),
-        ]
+        argv = build_herdr_agent_wait_argv(
+            binary,
+            t.target,
+            until=HERDR_STATUS_TURN_ENDED,
+            timeout_ms=int(timeout_ms),
+        )
         return HerdrCancellableWait(argv, outer_timeout=outer_timeout, runner=wait_runner)
 
     def _wait_multiplex(targets):

@@ -498,6 +498,10 @@ class ControlSurfaceAllowlistTests(unittest.TestCase):
             "the minter's extra authority must stay exactly its own graceful stop",
         )
 
+    def test_only_the_herdr_08_agent_wait_shape_is_allowlisted(self) -> None:
+        self.assertIn(("agent", "wait"), live_module.CLIENT_CALL_SUBCOMMANDS)
+        self.assertNotIn(("wait", "agent-status"), live_module.CLIENT_CALL_SUBCOMMANDS)
+
     def test_every_lifecycle_control_is_refused_with_zero_dispatch(self) -> None:
         process = _Process()
         dispatched: list = []

@@ -715,8 +715,8 @@ class Post14741InstalledFixtureTests(unittest.TestCase):
             wait = subprocess.Popen(
                 [
                     str(driver._FAKE_HERDR_CLI),
-                    "wait", "agent-status", target,
-                    "--status", "working", "--timeout", "2000",
+                    "agent", "wait", target,
+                    "--until", "working", "--timeout", "2000",
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -779,8 +779,8 @@ class Post14741InstalledFixtureTests(unittest.TestCase):
             wait = subprocess.Popen(
                 [
                     str(driver._FAKE_HERDR_CLI),
-                    "wait", "agent-status", target,
-                    "--status", "working", "--timeout", "500",
+                    "agent", "wait", target,
+                    "--until", "working", "--timeout", "500",
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

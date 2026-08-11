@@ -39,6 +39,13 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.han
     TmuxTransportRailRequest,
     TmuxTransportRailUseCase,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_herdr_queue_enter_rail import (
+    enforce_active_queue_enter_effect_fence,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_transport_failure_gate import (
+    STEP_READ_PANE_RETRY_PROBE,
+    STEP_SEND_KEYS_ENTER_RETRY,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_resend_gate import (
     RESEND_SKIP_BODY_ABSENT,
     RESEND_SKIP_BUDGET_EXHAUSTED,
@@ -266,9 +273,14 @@ class _FakeOps:
         outcome: DeliveryOutcome,
         *,
         retry_outcome: Optional[QueueEnterRetryOutcome],
+        backend: Optional[str] = None,
+        rail: Optional[str] = None,
+        disposition: Optional[str] = None,
     ) -> None:
         self.events.append("ledger")
-        self.ledgered.append((outcome, retry_outcome))
+        self.ledgered.append(
+            (outcome, retry_outcome, backend, rail, disposition)
+        )
 
     def restore_previous_active(
         self,
@@ -580,6 +592,9 @@ class TmuxTransportRailQueueEnterTest(unittest.TestCase):
         code, died = _run(ops, _request(mode=_MODE_QUEUE_ENTER, herdr_send=True))
         self.assertIsNone(died)
         self.assertEqual(code, 0)
+        self.assertNotIn(
+            "wait", ops.events, "Herdr must not run the tmux landing-marker poll"
+        )
         # herdr queue-enter: the #13292 snapshot is observed and the #13300 ledger is recorded.
         self.assertIn("observe_qe", ops.events)
         self.assertIn("ledger", ops.events)
@@ -597,6 +612,7 @@ class TmuxTransportRailQueueEnterTest(unittest.TestCase):
         ops = _FakeOps(marker_observed=True)
         code, _died = _run(ops, _request(mode=_MODE_QUEUE_ENTER, herdr_send=False))
         self.assertEqual(code, 0)
+        self.assertIn("wait", ops.events, "the tmux compatibility rail is unchanged")
         self.assertNotIn("ledger", ops.events)
         self.assertNotIn("observe_qe", ops.events)
         self.assertIsNone(ops.emitted[0].outcome.queue_enter_turn_start_observation)
@@ -724,6 +740,14 @@ class _V2FakeOps(_FakeOps):
     ) -> QueueEnterResendGate:
         self.events.append("gate_qe")
         return self.resend_gate
+
+
+class _EffectFencedV2FakeOps(_V2FakeOps):
+    """Model the live Herdr adapter's final read fence before each Enter."""
+
+    def press_enter(self, target: str) -> None:
+        enforce_active_queue_enter_effect_fence()
+        super().press_enter(target)
 
 
 class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
@@ -916,7 +940,120 @@ class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
         outcome = ops.emitted[0].outcome
         self.assertEqual((outcome.status, outcome.reason), ("blocked", "transport_error"))
         self.assertEqual(outcome.injection_stage["stage"], STAGE_UNCERTAIN_PARTIAL)
+        self.assertEqual(
+            outcome.transport_failure,
+            {"primitive": STEP_READ_PANE_RETRY_PROBE},
+        )
+        self.assertEqual(len(ops.ledgered), 1)
+        self.assertEqual(ops.ledgered[0][0], outcome)
+        self.assertIsNone(ops.ledgered[0][1])
+        self.assertEqual(ops.ledgered[0][2], "herdr")
+        self.assertEqual(ops.ledgered[0][3], "queue_enter_rail")
+        self.assertEqual(ops.ledgered[0][4], STEP_READ_PANE_RETRY_PROBE)
+        self.assertLess(ops.events.index("ledger"), ops.events.index("emit"))
         self.assertNotIn("adapter-private", died.message)
+
+    def test_transport_failure_at_retry_effect_boundary_is_a_read_probe(self) -> None:
+        class _SecondGateFails(_EffectFencedV2FakeOps):
+            gate_calls = 0
+
+            def evaluate_queue_enter_resend(
+                self,
+                target: str,
+                text: str,
+                receiver: str,
+                baseline_binding: Optional[dict[str, str]],
+            ) -> QueueEnterResendGate:
+                self.events.append("gate_qe")
+                self.gate_calls += 1
+                if self.gate_calls == 2:
+                    raise TerminalTransportError("effect-boundary read failed")
+                return QueueEnterResendGate(RESEND_SKIP_NONE, "turn_ended")
+
+        ops = _SecondGateFails(
+            marker_observed=True,
+            queue_enter_snapshot=self._snapshot(),
+            wait_kind="timeout",
+            binding=self._binding(),
+        )
+        code, died = _run(ops, _request(mode=_MODE_QUEUE_ENTER, herdr_send=True))
+
+        self.assertIsNone(code)
+        self.assertIsNotNone(died)
+        self.assertEqual(ops.enter_presses, 1)
+        self.assertEqual(ops.ledgered[0][4], STEP_READ_PANE_RETRY_PROBE)
+        self.assertEqual(
+            ops.emitted[0].outcome.transport_failure,
+            {"primitive": STEP_READ_PANE_RETRY_PROBE},
+        )
+
+    def test_transport_failure_after_one_retry_enter_returns_to_read_probe(self) -> None:
+        class _ThirdGateFails(_EffectFencedV2FakeOps):
+            gate_calls = 0
+
+            def evaluate_queue_enter_resend(
+                self,
+                target: str,
+                text: str,
+                receiver: str,
+                baseline_binding: Optional[dict[str, str]],
+            ) -> QueueEnterResendGate:
+                self.events.append("gate_qe")
+                self.gate_calls += 1
+                if self.gate_calls == 3:
+                    raise TerminalTransportError("next retry read failed")
+                return QueueEnterResendGate(RESEND_SKIP_NONE, "turn_ended")
+
+        ops = _ThirdGateFails(
+            marker_observed=True,
+            queue_enter_snapshot=self._snapshot(),
+            wait_kinds=["timeout", "timeout"],
+            binding=self._binding(),
+        )
+        code, died = _run(
+            ops,
+            _request(
+                mode=_MODE_QUEUE_ENTER,
+                herdr_send=True,
+                queue_enter_retry_window=6.0,
+                queue_enter_retry_interval=2.0,
+            ),
+        )
+
+        self.assertIsNone(code)
+        self.assertIsNotNone(died)
+        self.assertEqual(ops.enter_presses, 2)
+        self.assertEqual(ops.ledgered[0][4], STEP_READ_PANE_RETRY_PROBE)
+        self.assertEqual(
+            ops.emitted[0].outcome.transport_failure,
+            {"primitive": STEP_READ_PANE_RETRY_PROBE},
+        )
+
+    def test_transport_failure_in_retry_enter_stays_an_enter_failure(self) -> None:
+        class _RetryEnterFails(_EffectFencedV2FakeOps):
+            def press_enter(self, target: str) -> None:
+                enforce_active_queue_enter_effect_fence()
+                if self.enter_presses == 1:
+                    raise TerminalTransportError("retry Enter failed")
+                _FakeOps.press_enter(self, target)
+
+        ops = _RetryEnterFails(
+            marker_observed=True,
+            queue_enter_snapshot=self._snapshot(),
+            wait_kind="timeout",
+            binding=self._binding(),
+            resend_gate=QueueEnterResendGate(RESEND_SKIP_NONE, "turn_ended"),
+        )
+        code, died = _run(ops, _request(mode=_MODE_QUEUE_ENTER, herdr_send=True))
+
+        self.assertIsNone(code)
+        self.assertIsNotNone(died)
+        self.assertEqual(ops.enter_presses, 1)
+        self.assertEqual(ops.ledgered[0][4], STEP_SEND_KEYS_ENTER_RETRY)
+        self.assertEqual(
+            ops.emitted[0].outcome.transport_failure,
+            {"primitive": STEP_SEND_KEYS_ENTER_RETRY},
+        )
 
     def test_zero_window_disables_the_extra_enter_but_keeps_the_initial_observation(self) -> None:
         ops = _V2FakeOps(

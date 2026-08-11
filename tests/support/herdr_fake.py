@@ -55,7 +55,7 @@ Contract faithfulness (design §1.1, modelled faces A–F)
   ``agent list`` row
   carries its ``tab_id`` (live rows expose it alongside ``workspace_id``),
   so a heal reads the live slot's tab to rejoin it.
-- **F ``wait agent-status``** — **change-semantics** (PoC E9): a wait returns only
+- **F ``agent wait --until``** — **change-semantics** (PoC E9): a wait returns only
   on a *change into* the requested status; already being in it does **not** return
   (it times out). Modelled deterministically with **no real time** — a pre-armed
   logical transition (:meth:`FakeHerdr.arm_transition`) is what a wait returns on;
@@ -109,6 +109,9 @@ STATUS_IDLE = "idle"
 STATUS_WORKING = "working"
 STATUS_BLOCKED = "blocked"
 STATUS_DONE = "done"
+_AGENT_WAIT_STATUSES = frozenset(
+    {STATUS_IDLE, STATUS_WORKING, STATUS_BLOCKED, STATUS_DONE, "unknown"}
+)
 
 #: Default status a freshly launched agent snapshots at (booted but not yet
 #: driven): idle. A ``wait`` for a *change into* another status is what advances
@@ -441,9 +444,9 @@ class FakeHerdr:
     # -- PopenFactory (subprocess.Popen shape) for the wait rail --------------
 
     def popen(self, argv, stdout=None, stderr=None, text=None, **_):
-        """The injected wait ``popen``: model ``wait agent-status`` (change-semantics).
+        """The injected wait ``popen``: model ``agent wait`` (change-semantics).
 
-        Only ``wait agent-status <target> --status <s> --timeout <ms>`` is
+        Only ``agent wait <target> --until <s> --timeout <ms>`` is
         modelled (the sole command the turn-start rail arms). The outcome is
         resolved **immediately and deterministically** (no real time): a pre-armed
         transition into ``<s>`` for ``<target>`` fires the transition and returns
@@ -453,10 +456,18 @@ class FakeHerdr:
         """
         rest = list(argv[1:])
         self.calls.append(rest)
-        if rest[:2] != ["wait", "agent-status"]:
+        if (
+            len(rest) != 7
+            or rest[:2] != ["agent", "wait"]
+            or not rest[2]
+            or rest[3] != "--until"
+            or rest[4] not in _AGENT_WAIT_STATUSES
+            or rest[5] != "--timeout"
+            or not rest[6].isdigit()
+        ):
             raise UnknownHerdrCommandError(f"unmodelled herdr popen: {list(argv)!r}")
-        target = rest[2] if len(rest) > 2 else ""
-        want = _flag_value(rest, "--status")
+        target = rest[2]
+        want = rest[4]
         return self._resolve_wait(target, want)
 
     # -- command handlers -----------------------------------------------------
@@ -1076,7 +1087,7 @@ class FakeHerdr:
 
 
 class _FakeWaitProcess:
-    """A deterministic stand-in for a ``wait agent-status`` ``Popen`` (no real time).
+    """A deterministic stand-in for an ``agent wait`` ``Popen`` (no real time).
 
     Exposes the slice of the ``Popen`` surface the turn-start rail collects
     against: :meth:`communicate` (returns ``(stdout, stderr)`` immediately),

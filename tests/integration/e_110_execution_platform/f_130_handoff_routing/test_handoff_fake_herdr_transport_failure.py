@@ -135,7 +135,7 @@ class _ShimBackedOps:
 
     emitted: List[DeliveryOutcome] = field(default_factory=list)
     persisted: List[DeliveryOutcome] = field(default_factory=list)
-    ledgered: List[DeliveryOutcome] = field(default_factory=list)
+    ledgered: List[tuple] = field(default_factory=list)
     died: List[str] = field(default_factory=list)
     guidance: List[str] = field(default_factory=list)
     enter_presses: int = 0
@@ -233,9 +233,17 @@ class _ShimBackedOps:
         self.persisted.append(outcome)
 
     def record_ledger(
-        self, outcome: DeliveryOutcome, *, retry_outcome: Optional[QueueEnterRetryOutcome]
+        self,
+        outcome: DeliveryOutcome,
+        *,
+        retry_outcome: Optional[QueueEnterRetryOutcome],
+        backend: Optional[str] = None,
+        rail: Optional[str] = None,
+        disposition: Optional[str] = None,
     ) -> None:
-        self.ledgered.append(outcome)
+        self.ledgered.append(
+            (outcome, retry_outcome, backend, rail, disposition)
+        )
 
     def restore_previous_active(
         self,
@@ -346,6 +354,12 @@ class FakeHerdrTransportFailureClosesToTypedOutcomeTest(unittest.TestCase):
         self.assertNotIn(_TIMEOUT_DETAIL, outcome.next_action)
         self.assertNotIn(_TIMEOUT_DETAIL, ops.died[0])
         self.assertNotIn("/opt/private/bin/herdr", outcome.to_json())
+        self.assertEqual(len(ops.ledgered), 1)
+        self.assertEqual(ops.ledgered[0][0], outcome)
+        self.assertEqual(ops.ledgered[0][2:4], ("herdr", "queue_enter_rail"))
+        self.assertEqual(
+            ops.ledgered[0][4], outcome.transport_failure["primitive"]
+        )
         return outcome
 
     def test_send_text_timeout(self):
@@ -360,14 +374,17 @@ class FakeHerdrTransportFailureClosesToTypedOutcomeTest(unittest.TestCase):
         self.assertEqual(ops.injections, 1, "the marker+body is typed exactly once")
         self.assertEqual(ops.rollbacks, 0, "no C-u rollback on an uncertain delivery")
 
-    def test_landing_wait_read_timeout(self):
-        ops = self._drive(_FakeHerdrPort(fail_on="read_pane"))
-        self._assert_typed_and_redacted(ops)
-        self.assertEqual(ops.enter_presses, 0)
+    def test_herdr_queue_enter_skips_the_tmux_landing_read(self):
+        port = _FakeHerdrPort(fail_on="read_pane")
+        ops = _ops_over_fake_herdr(port)
+        rc = TmuxTransportRailUseCase(ops).execute(_request())
+        self.assertEqual(rc, 0)
+        self.assertNotIn(("read_pane", _TARGET), port.calls)
+        self.assertEqual(ops.enter_presses, 1)
 
     def test_adapter_exception_rather_than_a_reported_failure(self):
         """A primitive that *raises* (not one that reports ``ok=False``) is also contained."""
-        for primitive in ("send_text", "send_keys_enter", "read_pane"):
+        for primitive in ("send_text", "send_keys_enter"):
             with self.subTest(primitive=primitive):
                 ops = self._drive(
                     _FakeHerdrPort(fail_on=primitive, raise_instead=True)
@@ -383,10 +400,8 @@ class FakeHerdrTransportFailureClosesToTypedOutcomeTest(unittest.TestCase):
 
             def read_pane(self, target, *, source="visible", lines=None):
                 self.reads += 1
-                # The landing wait's read succeeds (marker unobserved -> queue-enter proceeds
-                # and presses Enter); the strict resend gate's pane read then times out.
-                if self.reads == 1:
-                    return PaneReadResult.success("no marker here")
+                # Herdr does not perform a landing read.  Its first pane read is
+                # the strict resend gate after the initial Enter.
                 return PaneReadResult.failure(
                     TRANSPORT_REASON_TRANSPORT_ERROR, _TIMEOUT_DETAIL
                 )

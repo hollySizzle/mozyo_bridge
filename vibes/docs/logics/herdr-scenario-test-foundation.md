@@ -167,6 +167,27 @@ fake ドリフト = false confidence を防ぐ **contract テスト** (小さな
   - contract テストが赤 = fake が実仕様から乖離した signal。scenario の green は
     contract green を前提としてのみ意味を持つ (green の依存順序を doc で固定)。
 
+### 2.2.1 Herdr 0.8 current contract override (Redmine #15198)
+
+§1.1 / §2.2 と `herdr-poc-13175-experiment-log.md` は Herdr 0.7.1 の実測履歴として保持し、
+その command spelling を遡及変更しない。一方、現行 production adapter と production seam を駆動する
+stateful fake の wait grammar は `agent wait TARGET --until STATUS --timeout MS` (Herdr 0.8) である。
+旧 `wait agent-status TARGET --status STATUS --timeout MS` を current fake が成功扱いしてはならず、未知 argv と
+同じく fail-closed にする。change-semantics 自体は E9 のままなので、変更するのは argv grammar であって
+snapshot → arm → transition collect の因果契約ではない。
+
+queue-enter scenario の event log は、body injection exactly once の後に tmux 由来の landing-marker wait が
+**0 回**であり、stable generation recheck → 上記 wait の arm → deadline check → Enter の順になることを
+assert する。post-injection transport primitive を故障注入した scenario は、次を同時に固定する:
+
+- gateway outcome は `blocked` / `transport_error` / `uncertain_partial` で、
+  `transport_failure.primitive` は `TRANSPORT_STEPS` の固定 token 1 個だけ。
+- delivery ledger は exactly one row で、`backend=herdr` / `rail=queue_enter_rail` /
+  `disposition=<同 token>`。
+- Unit Board result は `gateway_status=blocked` / `gateway_reason=transport_error` /
+  `transport_primitive=<同 token>` だけを透過し、raw exception / stderr / absolute path / arbitrary detail を
+  どの payload にも含めない。
+
 ### 2.3 ドリフトの二方向を明示
 
 - **fake → 実バイナリ drift** (fake が古い): §2.2 contract テストが捕える。

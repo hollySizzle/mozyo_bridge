@@ -566,7 +566,12 @@ def maybe_persist_delivery_record(
 
 
 def record_herdr_send_ledger(
-    outcome, *, retry_outcome: "QueueEnterRetryOutcome | None" = None
+    outcome,
+    *,
+    retry_outcome: "QueueEnterRetryOutcome | None" = None,
+    backend: str | None = None,
+    rail: str | None = None,
+    disposition: str | None = None,
 ) -> None:
     """Emit the #13296 herdr delivery-ledger record at a live herdr send-site (#13300).
 
@@ -588,4 +593,10 @@ def record_herdr_send_ledger(
     path never reaches it (close condition: tmux 経路不変).
     """
     retry = retry_outcome.to_dict() if retry_outcome is not None else None
-    record_herdr_delivery(outcome, retry=retry)
+    record_herdr_delivery(
+        outcome,
+        retry=retry,
+        backend=backend,
+        rail=rail,
+        disposition=disposition,
+    )
