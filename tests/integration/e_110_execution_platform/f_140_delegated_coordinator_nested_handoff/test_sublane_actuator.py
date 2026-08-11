@@ -789,6 +789,10 @@ class DispatchSelfHealTests(unittest.TestCase):
         outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
         self.assertEqual(outcome.status, ACTUATE_EXECUTED)
         self.assertEqual(outcome.dispatch_result, DISPATCH_GATEWAY_NOTIFIED)
+        self.assertEqual(
+            outcome.dispatch_injection_stage, STAGE_SUBMITTED_CONFIRMED
+        )
+        self.assertTrue(outcome.dispatch_blind_retry_prohibited)
         # The outcome carries the RELAUNCHED gateway locator, not the vanished one.
         self.assertEqual(outcome.gateway_pane, "%130")
         self.assertEqual(outcome.dispatch_target, "%130")
@@ -802,6 +806,31 @@ class DispatchSelfHealTests(unittest.TestCase):
         self.assertIn("dispatch implementation_request (retry)", titles)
         dispatches = [c for c in ops.calls if isinstance(c, tuple) and c[0] == "dispatch"]
         self.assertEqual(dispatches[-1][1]["gateway_pane"], "%130")
+
+    def test_typed_success_stage_reaches_public_payload_and_journal(self):
+        ops = HealCapableFakeOps(
+            git=True,
+            lanes=[None, _lane()],
+            dispatch_rcs=(0,),
+            dispatch_stages=(STAGE_SUBMITTED_CONFIRMED,),
+        )
+
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        payload = outcome.as_payload()
+        journal = render_actuation_journal(outcome)
+
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        self.assertEqual(outcome.dispatch_result, DISPATCH_GATEWAY_NOTIFIED)
+        self.assertEqual(
+            payload["dispatch_injection_stage"], STAGE_SUBMITTED_CONFIRMED
+        )
+        self.assertTrue(payload["dispatch_blind_retry_prohibited"])
+        self.assertIn(
+            "- dispatch_injection_stage: submitted_confirmed", journal
+        )
+        self.assertIn(
+            "- dispatch_blind_retry_prohibited: true", journal
+        )
 
     def test_uncertain_vanished_gateway_never_replays_full_body(self):
         ops = self._healable(

@@ -345,6 +345,10 @@ def heal_and_retry_dispatch(
         dispatch_result=DISPATCH_GATEWAY_NOTIFIED,
         adopted=adopted,
         steps=tuple(steps),
+        dispatch_injection_stage=retry_attempt.public_injection_stage,
+        dispatch_blind_retry_prohibited=(
+            retry_attempt.blind_retry_prohibited
+        ),
         fill_decision=fill_decision,
         fill_override_reason=fill_override_reason,
         gateway_ready=healed_ready,

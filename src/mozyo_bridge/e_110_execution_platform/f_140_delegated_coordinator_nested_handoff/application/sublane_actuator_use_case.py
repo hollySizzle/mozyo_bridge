@@ -926,6 +926,10 @@ class SublaneActuateUseCase:
             dispatch_result=DISPATCH_GATEWAY_NOTIFIED,
             adopted=adopted,
             steps=tuple(steps),
+            dispatch_injection_stage=dispatch_attempt.public_injection_stage,
+            dispatch_blind_retry_prohibited=(
+                dispatch_attempt.blind_retry_prohibited
+            ),
             fill_decision=fill_decision,
             fill_override_reason=fill_override_reason,
             gateway_ready=gateway_ready,
@@ -981,6 +985,8 @@ class SublaneActuateUseCase:
         dispatch_result: str,
         adopted: bool,
         steps: tuple[ActuationStep, ...],
+        dispatch_injection_stage: Optional[str] = None,
+        dispatch_blind_retry_prohibited: bool = False,
         fill_decision: Optional[str] = None,
         fill_override_reason: Optional[str] = None,
         gateway_ready: Optional[bool] = None,
@@ -1005,6 +1011,8 @@ class SublaneActuateUseCase:
             worker_pane=worker_pane,
             dispatch_target=dispatch_target,
             dispatch_result=dispatch_result,
+            dispatch_injection_stage=dispatch_injection_stage,
+            dispatch_blind_retry_prohibited=dispatch_blind_retry_prohibited,
             durable_anchor=(request.journal or None),
             adopted=adopted,
             steps=steps,
