@@ -29,6 +29,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_rollback import (  # noqa: E501
     PREPARED_PANE_ABSENT,
     PREPARED_PANE_PRESENT,
+    REASON_CONDITIONAL_CLOSE_UNAVAILABLE,
     REASON_INCOMPLETE,
     ROLLBACK_PREPARED_NATIVE_MISMATCH,
     ROLLBACK_PREPARED_TERMINAL_MISMATCH,
@@ -40,6 +41,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_rollback_ops import (  # noqa: E501
     LiveStartupRollbackOps,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_rollback import (  # noqa: E501
+    ROLLBACK_CONDITIONAL_CLOSE_UNAVAILABLE,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
     RECORD_LAUNCH_BUSY_RETRY_SLEEP_SECONDS,
@@ -185,7 +189,14 @@ class StartupTransactionRecordLaunchTest(unittest.TestCase):
 
 
 class _PreparedRollbackOps:
-    def __init__(self, observation, *, remove_after_close=True, agent_rows=()) -> None:
+    def __init__(
+        self,
+        observation,
+        *,
+        remove_after_close=True,
+        agent_rows=(),
+        conditional_close_supported=True,
+    ) -> None:
         self.observation = observation
         self.remove_after_close = remove_after_close
         self.rows = list(agent_rows)
@@ -194,6 +205,10 @@ class _PreparedRollbackOps:
         self.agent_close_calls = []
         self.agent_close_checks = []
         self.swap_terminal_before_agent_close = ""
+        self._conditional_close_supported = conditional_close_supported
+
+    def supports_conditional_close(self):
+        return self._conditional_close_supported
 
     def agent_rows(self):
         return list(self.rows)
@@ -463,7 +478,7 @@ class LiveAgentGenerationCloseTest(unittest.TestCase):
 
         return _Retire()
 
-    def test_replacement_terminal_is_refused_before_live_close(self):
+    def test_live_agent_close_is_refused_without_server_conditional_close(self):
         ops = LiveStartupRollbackOps(repo_root=ROOT, env={})
         retire = self._retire_ops("terminal-B")
         ops._retire_ops = retire
@@ -475,10 +490,10 @@ class LiveAgentGenerationCloseTest(unittest.TestCase):
         )
 
         self.assertFalse(ok)
-        self.assertIn("terminal identity changed", detail)
+        self.assertIn("server-side conditional close", detail)
         self.assertEqual(retire.close_calls, [])
 
-    def test_exact_terminal_generation_reaches_single_target_close(self):
+    def test_exact_terminal_generation_does_not_reach_ordinary_pane_close(self):
         ops = LiveStartupRollbackOps(repo_root=ROOT, env={})
         retire = self._retire_ops("terminal-A")
         ops._retire_ops = retire
@@ -489,11 +504,25 @@ class LiveAgentGenerationCloseTest(unittest.TestCase):
             target=self._target(),
         )
 
-        self.assertTrue(ok, detail)
-        self.assertEqual(
-            retire.close_calls,
-            [("logical-workspace", "default", (("codex", "w1:p2"),))],
+        self.assertFalse(ok)
+        self.assertIn("server-side conditional close", detail)
+        self.assertEqual(retire.close_calls, [])
+
+    def test_prepared_shell_close_is_refused_without_server_conditional_close(self):
+        ops = LiveStartupRollbackOps(repo_root=ROOT, env={})
+        retire = self._retire_ops("terminal-A")
+        ops._retire_ops = retire
+
+        ok, detail = ops.close_prepared_pane(
+            locator="w1:p2",
+            workspace_id="w1",
+            tab_id="w1:t1",
+            expected_terminal_id="terminal-A",
         )
+
+        self.assertFalse(ok)
+        self.assertIn("server-side conditional close", detail)
+        self.assertEqual(retire.close_calls, [])
 
 
 class PreparedPaneRollbackTest(unittest.TestCase):
@@ -568,6 +597,66 @@ class PreparedPaneRollbackTest(unittest.TestCase):
             self.assertEqual(
                 fence.read(action_id).phase, PHASE_COMPLETED_ROLLED_BACK
             )
+
+    def test_present_prepared_shell_is_preserved_without_conditional_close(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fence, action_id = _rollback_action(
+                Path(directory), self._receipt(terminal_id="terminal-A")
+            )
+            ops = _PreparedRollbackOps(
+                self._present(input_empty=True, terminal_id="terminal-A"),
+                conditional_close_supported=False,
+            )
+
+            result = run_session_rollback(
+                action_id=action_id, ops=ops, fence=fence, execute=True
+            )
+
+            self.assertEqual(result.state, "blocked")
+            self.assertEqual(result.reason, REASON_CONDITIONAL_CLOSE_UNAVAILABLE)
+            self.assertEqual(
+                result.participants[0].verdict,
+                ROLLBACK_CONDITIONAL_CLOSE_UNAVAILABLE,
+            )
+            self.assertEqual(ops.prepared_close_calls, [])
+            self.assertEqual(ops.agent_close_calls, [])
+            self.assertEqual(fence.read(action_id).phase, PHASE_ROLLBACK_OWED)
+
+    def test_present_agent_is_preserved_without_conditional_close(self):
+        logical_name = LOGICAL_NAME
+        with tempfile.TemporaryDirectory() as directory:
+            fence, action_id = _rollback_action(
+                Path(directory), self._receipt(terminal_id="terminal-A")
+            )
+            ops = _PreparedRollbackOps(
+                self._present(input_empty=True, terminal_id="terminal-A"),
+                conditional_close_supported=False,
+                agent_rows=[
+                    {
+                        "name": logical_name,
+                        "pane_id": "w1:p2",
+                        "terminal_id": "terminal-A",
+                        "native_name": native_name_for(logical_name),
+                        "agent": "codex",
+                        "agent_status": "idle",
+                    }
+                ],
+            )
+
+            result = run_session_rollback(
+                action_id=action_id, ops=ops, fence=fence, execute=True
+            )
+
+            self.assertEqual(result.state, "blocked")
+            self.assertEqual(result.reason, REASON_CONDITIONAL_CLOSE_UNAVAILABLE)
+            self.assertEqual(
+                result.participants[0].verdict,
+                ROLLBACK_CONDITIONAL_CLOSE_UNAVAILABLE,
+            )
+            self.assertEqual(ops.agent_close_checks, [])
+            self.assertEqual(ops.agent_close_calls, [])
+            self.assertEqual(ops.prepared_close_calls, [])
+            self.assertEqual(fence.read(action_id).phase, PHASE_ROLLBACK_OWED)
 
     def test_close_success_is_not_enough_when_exact_pane_remains(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -693,7 +782,8 @@ class PreparedPaneRollbackTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             fence, action_id = _rollback_action(Path(directory), self._receipt())
             ops = _PreparedRollbackOps(
-                PreparedPaneObservation(state=PREPARED_PANE_ABSENT)
+                PreparedPaneObservation(state=PREPARED_PANE_ABSENT),
+                conditional_close_supported=False,
             )
 
             result = run_session_rollback(

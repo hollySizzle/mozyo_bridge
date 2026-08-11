@@ -38,6 +38,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     ROLLBACK_AMBIGUOUS,
     ROLLBACK_CLOSE_TARGETS,
     ROLLBACK_COMPOSER_UNREADABLE,
+    ROLLBACK_CONDITIONAL_CLOSE_UNAVAILABLE,
     ROLLBACK_SETTLED,
     ROLLBACK_DETAIL,
     ROLLBACK_ELIGIBLE,
@@ -55,6 +56,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     REASON_ALREADY_ROLLED_BACK,
     REASON_AUTHORITY_UNAVAILABLE,
     REASON_BLOCKED,
+    REASON_CONDITIONAL_CLOSE_UNAVAILABLE,
     REASON_INCOMPLETE,
     REASON_NOTHING_OWED,
     REASON_OK,
@@ -1126,7 +1128,14 @@ class _RollbackOps:
     j#80506 F3) pass by construction — which is the guard being pinned.
     """
 
-    def __init__(self, rows, *, obligations=(), obligations_unreadable=False):
+    def __init__(
+        self,
+        rows,
+        *,
+        obligations=(),
+        obligations_unreadable=False,
+        conditional_close_supported=True,
+    ):
         self.rows = list(rows)
         self._obligations = tuple(obligations)
         self._obligations_unreadable = obligations_unreadable
@@ -1137,6 +1146,10 @@ class _RollbackOps:
         self.close_calls = []
         self.close_fails = set()
         self.close_is_a_lie = False
+        self._conditional_close_supported = conditional_close_supported
+
+    def supports_conditional_close(self):
+        return self._conditional_close_supported
 
     def agent_rows(self):
         if not self.inventory_readable:
@@ -1274,6 +1287,25 @@ class SessionRollbackRailTest(unittest.TestCase):
         )
         self.assertEqual(
             self.fence.read(action.action_id).phase, PHASE_COMPLETED_ROLLED_BACK
+        )
+
+    def test_missing_conditional_close_preserves_present_agents_and_debt(self):
+        action = self._owed_action()
+        ops = _RollbackOps(
+            self._rows("claude", "codex"), conditional_close_supported=False
+        )
+
+        verdict = self._run(ops, action, execute=True)
+
+        self.assertEqual(verdict.state, "blocked")
+        self.assertEqual(verdict.reason, REASON_CONDITIONAL_CLOSE_UNAVAILABLE)
+        self.assertEqual(
+            {participant.verdict for participant in verdict.participants},
+            {ROLLBACK_CONDITIONAL_CLOSE_UNAVAILABLE},
+        )
+        self.assertFalse(ops.close_calls)
+        self.assertEqual(
+            self.fence.read(action.action_id).phase, PHASE_ROLLBACK_OWED
         )
 
     def test_a_close_that_lies_is_caught_by_the_remeasure(self):

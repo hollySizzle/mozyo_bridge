@@ -283,6 +283,11 @@ class _RollbackOps:
     def agent_rows(self):
         return list(self.rows)
 
+    def supports_conditional_close(self):
+        # This fake models the future server-side primitive so the older convergence
+        # wiring tests remain about their original responsibility.
+        return True
+
     def runtime_state(self, locator):
         return "turn_ended"
 

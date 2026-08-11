@@ -1,10 +1,9 @@
 """The live composition root for the startup rollback rail (Redmine #13948).
 
-Deliberately thin: four of the six ports it needs are already implemented, reviewed and
+Deliberately thin: the shared observation ports are already implemented, reviewed and
 live-exercised by :class:`LiveSessionRetireOps` (#13892), so this delegates rather than
-re-deriving an inventory read, a runtime read, a composer read, an obligation read or a
-pin-matched close. Re-implementing those would fork exactly the observations whose
-fail-closed semantics were the expensive part.
+re-deriving inventory, runtime, composer or obligation reads. Ordinary pane close is not
+upgraded into a conditional close; current Herdr therefore leaves present rollback debt.
 
 What it does NOT inherit is the retirement *policy*: no lifecycle read, no worktree gate,
 no ``composer_discard_approval``. Those belong to `session-retire`'s authority, and this
@@ -28,24 +27,16 @@ from typing import Mapping, Optional, Sequence
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
     _workspace_prefix,
 )
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_rollback import (  # noqa: E501
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_rollback_contract import (  # noqa: E501
     PREPARED_PANE_ABSENT,
     PREPARED_PANE_PRESENT,
     PREPARED_PANE_UNREADABLE,
     PreparedPaneObservation,
     StartupRollbackAgentTarget,
 )
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
-    AGENT_KEY_NAME,
-    AGENT_KEY_TERMINAL_ID,
-    _agent_locator,
-    _norm,
-    _norm_lane,
-    decode_assigned_name,
-)
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E501
-    SLOT_LIVE,
-    classify_named_slot,
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_rollback import (  # noqa: E501
+    ROLLBACK_CONDITIONAL_CLOSE_UNAVAILABLE,
+    ROLLBACK_DETAIL,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (  # noqa: E501
     valid_target,
@@ -75,6 +66,10 @@ class LiveStartupRollbackOps:
     def open_obligations(self, workspace_id: str, assigned_names: Sequence[str]):
         return self._retire_ops.open_obligations(workspace_id, assigned_names)
 
+    def supports_conditional_close(self) -> bool:
+        """Current Herdr 0.8 / protocol 19 has no generation-conditional pane close."""
+        return False
+
     def close(self, workspace_id: str, lane_id: str, targets):
         return self._retire_ops.close(workspace_id, lane_id, targets)
 
@@ -85,57 +80,11 @@ class LiveStartupRollbackOps:
         lane_id: str,
         target: StartupRollbackAgentTarget,
     ) -> tuple[bool, str]:
-        """Re-read the exact v2 generation immediately before a single close.
-
-        Herdr 0.8 has no compare-and-close primitive, so a process can theoretically
-        change after this final inventory read.  Keeping the read inside the actuation
-        port removes the much wider preflight-to-close window and refuses every observed
-        replacement; the remaining read-to-close interval cannot be eliminated client-side.
-        """
-        if not target.terminal_id or not target.native_name:
-            return False, "startup close authority has no terminal-bound v2 generation"
-        try:
-            rows = list(self.agent_rows())
-        except Exception:  # noqa: BLE001 - unreadable inventory is never close authority
-            return False, "the Herdr agent inventory could not be re-read before close"
-        matches = [
-            row
-            for row in rows
-            if isinstance(row, Mapping)
-            and _norm(row.get(AGENT_KEY_NAME)) == _norm(target.assigned_name)
-        ]
-        if len(matches) != 1:
-            return False, "the assigned name is absent or ambiguous at close time"
-        row = matches[0]
-        decoded = decode_assigned_name(target.assigned_name)
-        identity = decoded.identity if decoded.ok else None
-        if (
-            identity is None
-            or identity.workspace_id != _norm(workspace_id)
-            or identity.lane_id != _norm_lane(lane_id)
-            or identity.role != _norm(target.role)
-        ):
-            return False, "the recorded assigned name does not match the startup unit"
-        if classify_named_slot(row) != SLOT_LIVE or _norm(row.get("agent")) != identity.role:
-            return False, "the assigned slot is not backed by the expected live provider"
-        if _norm(_agent_locator(row)) != _norm(target.locator):
-            return False, "the live pane locator changed before close"
-        if _norm(row.get("native_name")) != _norm(target.native_name):
-            return False, "the live native identity changed before close"
-        if (
-            type(row.get(AGENT_KEY_TERMINAL_ID)) is not str
-            or row.get(AGENT_KEY_TERMINAL_ID) != target.terminal_id
-        ):
-            return False, "the live terminal identity changed before close"
-        result = self._retire_ops.close(
-            workspace_id, lane_id, ((target.role, target.locator),)
+        """Refuse a non-atomic read→close; current Herdr cannot bind close to identity."""
+        return (
+            False,
+            ROLLBACK_DETAIL[ROLLBACK_CONDITIONAL_CLOSE_UNAVAILABLE],
         )
-        for role, locator, detail in getattr(result, "failed", ()):
-            if role == target.role and locator == target.locator:
-                return False, detail or "pane close failed"
-        if (target.role, target.locator) not in getattr(result, "closed", ()):
-            return False, "pane close did not confirm the exact target"
-        return True, ""
 
     def _environ(self) -> Mapping[str, str]:
         return self._env if self._env is not None else os.environ
@@ -253,35 +202,10 @@ class LiveStartupRollbackOps:
         tab_id: str,
         expected_terminal_id: str = "",
     ) -> tuple[bool, str]:
-        """Recheck every positive fact immediately before an exact pane close."""
-        observation = self.prepared_pane(
-            locator=locator, workspace_id=workspace_id, tab_id=tab_id
-        )
-        if not (
-            observation.state == PREPARED_PANE_PRESENT
-            and observation.locator == locator
-            and observation.workspace_id == workspace_id
-            and observation.tab_id == tab_id
-            and bool(expected_terminal_id)
-            and observation.terminal_id == expected_terminal_id
-            and observation.agent_absent is True
-            and observation.shell_only is True
-            and observation.input_empty is True
-        ):
-            return False, observation.detail or "prepared pane close proof changed"
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
-            _close_base_pane,
-        )
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
-            COMMAND_TIMEOUT_SECONDS,
-        )
-
-        return _close_base_pane(
-            self._retire_ops._binary(),
-            locator,
-            subprocess.run,
-            COMMAND_TIMEOUT_SECONDS,
-            self._environ(),
+        """Refuse a non-atomic read→close for a prepared shell generation."""
+        return (
+            False,
+            ROLLBACK_DETAIL[ROLLBACK_CONDITIONAL_CLOSE_UNAVAILABLE],
         )
 
     def startup_blocker(self, provider: str, locator: str) -> str:

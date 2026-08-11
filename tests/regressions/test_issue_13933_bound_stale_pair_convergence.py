@@ -921,6 +921,10 @@ class _FakeBackedRollbackOps:
     def agent_rows(self):
         return _agent_list_rows(self.fake)
 
+    def supports_conditional_close(self):
+        # Hypothetical capable adapter: these tests exercise outer convergence wiring.
+        return True
+
     def runtime_state(self, locator):
         return self.runtime.get(locator, "turn_ended")
 
