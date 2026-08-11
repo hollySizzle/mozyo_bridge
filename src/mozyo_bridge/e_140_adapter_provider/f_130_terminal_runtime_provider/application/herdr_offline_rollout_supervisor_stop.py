@@ -21,9 +21,10 @@ def supervisor_stop_refusal(
 ) -> str:
     """Return ``""`` only for positive current-and-legacy stop evidence.
 
-    Missing fields never mean ``False``/absent.  In particular, launchd's retired
-    ``--drain-only`` registration must be absent in both the uninstall outcome and the fresh
-    status row; a partial migration cannot authorize the following offline rollout phase.
+    Missing fields never mean ``False``/absent.  In particular, launchd's uninstall outcome
+    must prove that the retired ``--drain-only`` registration was owned and removed, while the
+    fresh status row must observe it absent.  A missing plist alone, or a partial migration,
+    cannot authorize the following offline rollout phase.
     """
     if not isinstance(result, Mapping) or not isinstance(status, Mapping):
         return "supervisor_stop_evidence_invalid"
@@ -56,9 +57,12 @@ def supervisor_stop_refusal(
     if backend == BACKEND_LAUNCHD:
         legacy_before = result.get("legacy_drain")
         legacy_removed = result.get("legacy_drain_removed")
+        # Plist absence is not manager-stop evidence: a bootstrapped launchd job can outlive its
+        # registration file.  The only admitted path starts with our owned plist and reports that
+        # this uninstall removed it after a successful bootout.
         migration_complete = (
-            legacy_before == LEGACY_DRAIN_ABSENT and legacy_removed is False
-        ) or (legacy_before == LEGACY_DRAIN_OWNED and legacy_removed is True)
+            legacy_before == LEGACY_DRAIN_OWNED and legacy_removed is True
+        )
         if (
             not migration_complete
             or result.get("legacy_drain_reason") != ""

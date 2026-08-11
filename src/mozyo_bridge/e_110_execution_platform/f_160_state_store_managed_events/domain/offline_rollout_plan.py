@@ -19,7 +19,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 
 
-OFFLINE_ROLLOUT_PLAN_SCHEMA_VERSION = 2
+OFFLINE_ROLLOUT_PLAN_SCHEMA_VERSION = 3
 
 PLAN_READY = "planned"
 PLAN_REFUSED = "refused"
@@ -76,7 +76,10 @@ _SUPERVISOR_BACKENDS = frozenset(
 _LAUNCHD_LEGACY_DRAIN_STATES = frozenset(
     {"absent", "owned", "foreign", "unreadable"}
 )
-_LAUNCHD_PLANNABLE_LEGACY_DRAIN_STATES = frozenset({"absent", "owned"})
+# A missing plist proves only that the registration file is absent.  A launchd job that was
+# already bootstrapped may remain alive after that file is removed, so only an owned plist can
+# mint a plan: its later successful bootout is the positive manager-stop evidence.
+_LAUNCHD_PLANNABLE_LEGACY_DRAIN_STATES = frozenset({"owned"})
 
 
 def _exact_nonempty(value: object) -> bool:

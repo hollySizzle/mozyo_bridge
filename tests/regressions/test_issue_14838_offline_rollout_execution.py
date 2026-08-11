@@ -91,8 +91,8 @@ class OfflineRolloutExecutionRegressionTests(unittest.TestCase):
             "label": self.SUPERVISOR_LABEL,
             "performed": True,
             "effect_state": "complete",
-            "legacy_drain": "absent",
-            "legacy_drain_removed": False,
+            "legacy_drain": "owned",
+            "legacy_drain_removed": True,
             "legacy_drain_reason": "",
         }
         self.assertEqual(
@@ -101,15 +101,16 @@ class OfflineRolloutExecutionRegressionTests(unittest.TestCase):
             ),
             "",
         )
-        self.assertEqual(
-            supervisor_stop_refusal(
-                {**complete, "legacy_drain": "owned", "legacy_drain_removed": True},
-                stopped_status,
-                expected_label=self.SUPERVISOR_LABEL,
-            ),
-            "",
-        )
         cases = (
+            (
+                {
+                    **complete,
+                    "legacy_drain": "absent",
+                    "legacy_drain_removed": False,
+                },
+                stopped_status,
+                "supervisor_legacy_stop_unverified",
+            ),
             (
                 {
                     **complete,
@@ -216,6 +217,46 @@ class OfflineRolloutExecutionRegressionTests(unittest.TestCase):
             self.assertFalse(outcome.ok)
             self.assertEqual(outcome.reason, "supervisor_stop_unverified")
             self.assertEqual(outcome.detail, "supervisor_uninstall_incomplete")
+
+        absent_without_manager_stop = {
+            "backend": "launchd",
+            "label": self.SUPERVISOR_LABEL,
+            "performed": True,
+            "effect_state": "complete",
+            "reason": "",
+            "legacy_drain": "absent",
+            "legacy_drain_removed": False,
+            "legacy_drain_reason": "",
+        }
+        stopped_status = {
+            "backend": "launchd",
+            "agents": [
+                {
+                    "label": self.SUPERVISOR_LABEL,
+                    "installed": False,
+                    "loaded": False,
+                    "legacy_drain": "absent",
+                }
+            ],
+        }
+        with (
+            patch.object(
+                supervisor_service_backend,
+                "uninstall",
+                return_value=absent_without_manager_stop,
+            ),
+            patch.object(
+                supervisor_service_backend,
+                "service_status",
+                return_value=stopped_status,
+            ),
+        ):
+            outcome = port._supervisor_stop(  # noqa: SLF001
+                {"supervisor_labels": [self.SUPERVISOR_LABEL]}, {}, self.home
+            )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.reason, "supervisor_stop_unverified")
+        self.assertEqual(outcome.detail, "supervisor_legacy_stop_unverified")
 
     def test_run_requires_execute_before_any_action_store_read(self) -> None:
         args = argparse.Namespace(

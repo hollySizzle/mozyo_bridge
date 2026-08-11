@@ -814,11 +814,13 @@ zero-mutation のままである（credential readiness は gate ではないた
 launchd の uninstall が `performed=true` でも、退役 drain の bootout / unlink が失敗すれば
 `effect_state=partial` であり、旧 scheduler が動作中または不明である。この状態で shared store / runtime
 migrationへ進むと、旧processがoffline区間へcallbackを書き得る。したがって停止 readback は top-level
-`effect_state=complete`、current rowの `installed=false` と `loaded=false`、uninstall結果とfresh statusの
-`legacy_drain=absent`をすべてpositive evidenceとして要求し、uninstall結果とfresh rowのlabelもplanが束縛した
-current supervisor labelへexact一致させる。plan schema v2もcapture時のbackendとlegacy drain
-stateを保持し、旧schemaやfield欠落を「不在」と補完しない。`foreign` / `unreadable` な退役stateは
-planを発行せず、`owned`だけを承認対象となるpending removalとして保持する。
+`effect_state=complete`、current rowの `installed=false` と `loaded=false`、uninstall結果の
+`legacy_drain=owned` / `legacy_drain_removed=true`、fresh statusの `legacy_drain=absent`をすべて要求し、
+uninstall結果とfresh rowのlabelもplanが束縛したcurrent supervisor labelへexact一致させる。plistの不在は
+manager jobの停止を証明しないため、それ単独をpositive evidenceにしない。plan schema v3はcapture時のbackendと
+legacy drain stateを保持し、旧v2 plan/action・field欠落を新しい意味へ読み替えない。launchdでは`owned`だけを
+承認対象となるpending removalとして保持し、`absent` / `foreign` / `unreadable` はplanを発行しない。このため、
+退役plistが既に無いmacOSでは、文書化されたmanager側の確認方法が得られるまでoffline rolloutを意図的に拒否する。
 
 **Linux systemd user timer** の realization（`supervisor_systemd`）は **owned service 1 個 + timer 1 個**であ
 る。timer は portable default cadence ごとに `workflow supervisor --run-once` を 1 回起動し、process は毎 tick

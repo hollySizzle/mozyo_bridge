@@ -158,7 +158,7 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
         result = build_offline_rollout_plan(captured)
 
         self.assertTrue(result.ok)
-        self.assertEqual(result.plan["schema_version"], 2)
+        self.assertEqual(result.plan["schema_version"], 3)
         self.assertEqual(result.plan["supervisors"][0]["backend"], "launchd")
         self.assertEqual(result.plan["supervisors"][0]["legacy_drain"], "owned")
         self.assertEqual(len(result.plan["workspaces"]), 2)

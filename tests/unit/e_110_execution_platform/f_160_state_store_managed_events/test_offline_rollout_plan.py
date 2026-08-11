@@ -394,9 +394,9 @@ class OfflineRolloutPlanTests(unittest.TestCase):
                 )
                 self.assertEqual(result.reason, "supervisor_set_invalid")
 
-    def test_launchd_foreign_or_unreadable_legacy_drain_cannot_mint_a_plan(self) -> None:
+    def test_launchd_unverified_legacy_drain_cannot_mint_a_plan(self) -> None:
         source = _capture()
-        for state in ("foreign", "unreadable"):
+        for state in ("absent", "foreign", "unreadable"):
             with self.subTest(state=state):
                 result = build_offline_rollout_plan(
                     replace(

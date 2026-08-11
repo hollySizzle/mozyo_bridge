@@ -119,7 +119,7 @@ def verify_plan(plan: object, expected_digest: object) -> Mapping[str, object]:
         raise OfflineRolloutActionError("plan_invalid")
     if canonical_digest(plan) != digest:
         raise OfflineRolloutActionError("plan_digest_mismatch")
-    if plan.get("schema_version") != 2:
+    if plan.get("schema_version") != 3:
         raise OfflineRolloutActionError("plan_schema_unsupported")
     phases = plan.get("phase_order")
     if not isinstance(phases, list) or not phases:
@@ -151,7 +151,7 @@ def verify_plan(plan: object, expected_digest: object) -> Mapping[str, object]:
     legacy = supervisor.get("legacy_drain")
     if (
         supervisor.get("backend") == "launchd"
-        and legacy not in {"absent", "owned"}
+        and legacy != "owned"
     ) or (
         supervisor.get("backend") == "systemd_user" and legacy != "not_applicable"
     ):

@@ -33,7 +33,7 @@ def _plan() -> dict:
     top = "mzb1_ws__codex__default"
     supervisor_label = "org.mozyo-bridge.callback-supervisor"
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "candidate_artifact": {
             "distribution": "testpypi",
             "version": "0.15.0a4",
@@ -215,9 +215,10 @@ class OfflineRolloutActionTests(unittest.TestCase):
         self.plan = _plan()
         self.digest = canonical_digest(self.plan)
 
-    def test_v1_or_missing_supervisor_stop_evidence_is_not_executable(self) -> None:
+    def test_old_schema_or_missing_supervisor_stop_evidence_is_not_executable(self) -> None:
         cases = (
             ("v1", lambda plan: plan.__setitem__("schema_version", 1), "plan_schema_unsupported"),
+            ("v2", lambda plan: plan.__setitem__("schema_version", 2), "plan_schema_unsupported"),
             (
                 "missing_legacy",
                 lambda plan: plan["supervisors"][0].pop("legacy_drain"),
@@ -248,6 +249,13 @@ class OfflineRolloutActionTests(unittest.TestCase):
                 "unreadable_legacy",
                 lambda plan: plan["supervisors"][0].update(
                     backend="launchd", legacy_drain="unreadable"
+                ),
+                "plan_supervisor_evidence_invalid",
+            ),
+            (
+                "absent_legacy",
+                lambda plan: plan["supervisors"][0].update(
+                    backend="launchd", legacy_drain="absent"
                 ),
                 "plan_supervisor_evidence_invalid",
             ),
