@@ -79,6 +79,29 @@ runbook の原則:
 - 削除前に dirty / in-scope 変更を確認する safety step は runbook 側の必須手順とし、core の自動削除にしない。
 - 具体 path / branch 命名は operator が決める。issue 番号からの強制生成を runbook の前提にしない。
 
+### worktree ownership は配賦・隔離・退役責務である
+
+Redmine #15365「限定統合refとUS worktreeの責務境界を文書化する」の役割境界では、project coordinator
+(`delegated_coordinator`) が限定scope内の
+worktree allocation、single-writer lease、branch / checkout identity、cleanliness、上位へのhandoffを
+所有する。最上位の `coordinator` は、限定統合headのcanonical targetへの到達性、scope横断の
+integration disposition、release handoff、最終retirement admissionを所有する。物理cleanupの実行を
+下位へ委譲しても、上位による到達性・対象identityの確認を省略しない。責務全体の正本は
+[[logic-coordinator-sublane-development-flow]] の `### 限定統合と全体統合の責務境界` を読む。
+
+この所有はdirectory pathへauthorityを与えない。Redmine Versionは候補範囲であり、
+`1 Redmine Version = 1共有worktree`を標準にしない。同じmutable checkoutを複数のUS / workerが
+共有すると、HEAD、index、dirty state、失敗・rollback・auditの境界が混ざるためである。並行する
+実装はUS / lane branch単位で隔離する。明示pilotでscope用integration worktreeを置く場合も、manual
+single-writer projectionであってauthorityでも現auto-integration actuatorのcheckout / targetでもなく、
+未commitの子US差分を入れない。固定N本のcleanなlane worktreeを再利用するか、毎回作成するかは
+operator policyであり、portable core defaultではない。
+
+worktreeの配置自体がcoordinator checkoutへuntracked entryを生み、clean-worktree gateを恒常的に
+壊す形は避ける。repo外のsibling pathまたは検証済みlocal-only ignoreをoperator recipeで選び、
+tracked `.gitignore` へprivate pathを焼き込まない。配置方式にかかわらず、再割当て前にcleanliness、
+branch identity、origin reachability、前leaseのretirement dispositionを再確認する。
+
 ## sublane retirement authority
 
 Redmine #11959。sublane の退役は、原則として main coordinator Codex の運用責務である。owner は成果物・release・権限・破壊的な project state の判断者であり、routine な lane 清掃のたびに owner 承認を求めると、sublane 運用が owner の手作業に依存してしまう。

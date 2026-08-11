@@ -406,6 +406,66 @@ mozyo-bridge init claude   # / codex
 mozyo-bridge agents targets --session <cockpit-session>
 ```
 
+### 限定統合と全体統合の責務境界
+
+Redmine #15365「限定統合refとUS worktreeの責務境界を文書化する」では、二層 pilot が検証する
+境界を次のように固定する。owner の会話上の
+`root coordinator` は固定 role 語彙の `coordinator`、`project coordinator` は子 project
+を委譲された `delegated_coordinator` に対応する。これらは新しい runtime role token ではない。
+
+- **限定統合 (scoped integration)** は、明示的な durable decision が定めた project scope 内で、
+  review済みの実装結果を相互に整合させ、集約検証し、origin到達可能なnon-canonical exact candidate headと
+  残存リスクを上位へ渡せる形へする責務である。candidate commitは既に許可されたissue / lane refから
+  origin到達可能にしてよく、専用のper-scope refを必須にしない。candidateを保持できる許可済みrefがない場合、
+  ordered exact-head manifestは準備handoffには使えるが、限定統合完了とは記録しない。
+  `delegated_coordinator` が所有する。Redmine Version / Epic / Feature は scope 候補を説明するmetadataには
+  使えるが、所属だけで限定統合の対象・順序・許可を決めない。
+- **全体統合 (global integration)** は、複数の限定統合headを採用projectのcanonical integration
+  targetへ統合し、scope横断の競合、release readiness、最終drain dispositionを収束させる責務である。
+  最上位の `coordinator` が所有する。release tag、package version、publish、owner close approvalは
+  既存のrelease / close gateのままで、限定統合へ委譲しない。ここでいう最終drainはdisposition / admissionで
+  あり、physical worktree / local branch cleanupは既存operator runbookに残す。
+
+Gitの隔離・統合・公開は同じ単位へ畳まない。
+
+| 面 | owner | authority / output |
+| --- | --- | --- |
+| US実装隔離 | `delegated_coordinator` (allocation / lease / lifecycle)、`implementation_worker` (exclusive consumer / bounded implementation) | 1つのactive US / lane branchへ排他的にleaseされたworktree。成果はUS境界が分かるcommitとorigin到達可能なexact head |
+| 限定統合 | `delegated_coordinator` | durable decisionが名指すscopeとreview済みexact input heads。成果はorigin到達可能なnon-canonical exact candidate head、集約検証、未解決事項を記録したhandoff package |
+| 全体統合 | 最上位`coordinator` | review済みexact head、configured canonical integration target、scope横断のintegration disposition、release handoff、最終drain |
+
+worktree は mutable checkout であって authority ではない。並行するUS / workerは同じdirty worktreeを
+共有せず、それぞれ隔離されたbranch/worktreeを使う。明示pilotでproject coordinatorがscope用integration
+worktreeを持つ場合も、それはmanual pilot用single-writer projectionであってauthorityでも現行
+auto-integration actuatorのcheckout / targetでもない。子USの未commit差分を同居させない。権限とhandoffは
+pathでなく、durable gate、exact commit、明示されたcandidate outputへ束縛する。object-level integrationを
+使える場合、integration authorityをworktreeへ載せ直さない。
+
+provider identityとrole authorityは別である。同じCodex providerを二層pilotの実装と限定統合に割り当てても、
+それぞれ別にmintされた固定role actorであり、同時兼任やrole transitionではない。現runtimeには
+`delegated_coordinator`↔`implementation_worker`のrole transition railがないため、実装用の
+`implementation_worker` slot/session/laneと限定統合用の`delegated_coordinator` slot/session/laneを分け、
+durable handoffでauthorityを切る。workerがbounded実装、implementation done / review request、
+origin到達可能なexact headを記録し、別actorのReview Gateがapprovedになった後だけ、delegated coordinatorが
+そのreview済みheadを入力に限定統合する。同じprovider labelであってもactorとauthorityを同一視せず、
+別に記録されたaudit結果を最上位
+`coordinator`へ返す。同一session / lane内のrole transitionは、別issueでruntime、gate、acceptanceを
+実装するまで未対応である。
+
+このpilotが証明できるのは **限定統合と全体統合のhandoff** である。
+`implementation_gateway` / `implementation_worker`への孫dispatch、並行US隔離、三層callbackが成立した証拠には
+しない。それらは三層acceptanceで別に検証する。
+
+本repoは引き続きsingle-canonical-branch (`origin/main`) topologyを採用する。この節は新しいstaging
+branchやRedmine Version単位の共有worktreeを自動作成せず、`.mozyo-bridge/config.yaml`の
+`work_unit.granularity` / `sublane_integration.integration_branch`も変更しない。現topologyで限定統合用の
+常設refを作成しない。candidate commitは既存の許可済みissue / lane refからorigin到達可能にできるが、専用の
+non-canonical per-scope candidate refを試す場合は、durable pilot decisionでscope、base、single writer、
+lifetime、handoff、retirementを固定する。Redmine Versionから自動生成せず、canonical / promotion targetや
+現行actuator対象として扱わない。
+限定統合refを常設するtopologyへ移る場合は、別issueでconfig、gate、migration、real-machine acceptanceを
+設計する。
+
 ## 帯域 / admission / pipeline fill
 
 sublane bandwidth は CPU capacity ではなく、管制塔の注意力である。実用上の default は pipeline-first であり、管制塔が drain すべき coordinator-owned queue を持たない間は、独立した実装 work を止めずに進める。
