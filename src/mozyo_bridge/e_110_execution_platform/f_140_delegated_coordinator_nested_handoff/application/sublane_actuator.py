@@ -73,6 +73,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     resolve_work_unit_request_fields,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (
+    DISPATCH_DELIVERY_NOT_SENT,
+    DISPATCH_DELIVERY_UNCERTAIN,
     DISPATCH_GATEWAY_NOTIFIED,
     SublaneActuationOutcome,
     render_actuation_journal,
@@ -108,9 +110,8 @@ def format_actuate_text(outcome: SublaneActuationOutcome) -> str:
         lines.append(f"  gateway_ready: {str(outcome.gateway_ready).lower()}")
         if outcome.gateway_ready is False:
             lines.append(
-                "  ! gateway readiness NOT confirmed before dispatch; the input may "
-                "have landed on a still-booting composer — watch for a no_progress "
-                "lane (the handoff Enter-only retry is the landing safety net)"
+                "  ! gateway readiness probe was NOT confirmed before the governed "
+                "send; the dispatch result below is independently authoritative"
             )
     if outcome.dispatch_target:
         lines.append(
@@ -123,6 +124,17 @@ def format_actuate_text(outcome: SublaneActuationOutcome) -> str:
                 "`sublane dispatch-worker --execute` (#12988); if no worker "
                 "progress lands, classify with `sublane callback-recovery "
                 "--dispatch-delivered`"
+            )
+        elif outcome.dispatch_result == DISPATCH_DELIVERY_UNCERTAIN:
+            lines.append(
+                "  ! delivery uncertain: body and/or Enter may have reached the "
+                "gateway; blind retry is prohibited. Read the receiver and durable "
+                "anchor before any explicit recovery"
+            )
+        elif outcome.dispatch_result == DISPATCH_DELIVERY_NOT_SENT:
+            lines.append(
+                "  ! delivery did not reach the gateway; the structured "
+                "pre-injection refusal permits retry after its cause is fixed"
             )
     if outcome.is_blocked:
         lines.append("  -> blocked: " + ", ".join(outcome.blocked_reasons))

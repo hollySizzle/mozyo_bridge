@@ -63,8 +63,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_ops import (  # noqa: E501
     DEFAULT_GATEWAY_READY_INTERVAL_SECONDS,
     DEFAULT_GATEWAY_READY_PROBES,
+    SublaneDispatchAttempt,
     SublaneActuatorOps,
     decide_create_launch,
+    drive_dispatch_implementation_request,
     resolve_create_identity,
     resolve_lane_runtime_root,
 )
@@ -83,13 +85,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 
 @dataclass
 class SublaneActuateUseCase:
-    """Drive the fail-closed creation-side actuation over :class:`SublaneActuatorOps`.
+    """Drive additive actuation over the injected port, stopping fail-closed.
 
-    The runtime preflight is the final authority (#12604 acceptance style): probe git
-    through the port, ask the pure :func:`decide_worktree_launch`, and — in a live
-    ``--execute`` run — perform only the additive side effects the plan authorizes,
-    **stopping at the first failure and reporting the partial state**. A dry-run
-    resolves the plan and performs nothing.
+    A dry-run resolves the plan and performs nothing.
     """
 
     ops: SublaneActuatorOps
@@ -105,12 +103,8 @@ class SublaneActuateUseCase:
     ) -> tuple[Optional[bool], int]:
         """Bounded, non-fatal pre-dispatch readiness wait (#13293).
 
-        Polls :meth:`SublaneActuatorOps.probe_gateway_ready` up to
-        ``gateway_ready_probes`` times, ``gateway_ready_interval_seconds`` apart. Returns
-        ``(ready, probes_run)``: ``ready`` is ``None`` when disabled (``probes<=0``) or no
-        gateway pane resolved, ``True`` on the first ready observation, else ``False`` when
-        the window elapses. NEVER raises / blocks — an unconfirmed ``False`` degrades to a
-        recorded observation and the caller dispatches anyway (Enter-only retry is the net).
+        The probe itself does not veto dispatch; the governed send still returns its
+        own confirmed, not-sent, or uncertain terminal.
         """
         probes = self.gateway_ready_probes
         if probes <= 0 or not gateway_pane:
@@ -126,13 +120,7 @@ class SublaneActuateUseCase:
     def _identity_matches(
         lane: SublaneLaneView, request: SublaneCreateRequest
     ) -> bool:
-        """True iff the resolved ``lane`` is the requested target (pure).
-
-        The lane's ``lane_label`` must equal the requested label and its issue the
-        requested issue (falling back to ``parse_issue_from_lane_label`` when the ``issue``
-        field was not pre-populated). A blank / mismatched label or issue fails closed —
-        the guard that stops a repo-root / basename collision misdelivering (j#70250).
-        """
+        """True iff label and issue resolve to the requested lane (j#70250)."""
         want_label = (request.lane_label or "").strip()
         got_label = (lane.lane_label or "").strip()
         if not want_label or got_label != want_label:
@@ -277,6 +265,10 @@ class SublaneActuateUseCase:
         steps: tuple[ActuationStep, ...] = (),
         gateway_pane: Optional[str] = None,
         worker_pane: Optional[str] = None,
+        dispatch_target: Optional[str] = None,
+        dispatch_result: str = DISPATCH_NOT_ATTEMPTED,
+        dispatch_injection_stage: Optional[str] = None,
+        dispatch_blind_retry_prohibited: bool = False,
         adopted: bool = False,
         fill_decision: Optional[str] = None,
         fill_override_reason: Optional[str] = None,
@@ -294,8 +286,10 @@ class SublaneActuateUseCase:
             launch_action=launch_action,
             gateway_pane=gateway_pane,
             worker_pane=worker_pane,
-            dispatch_target=None,
-            dispatch_result=DISPATCH_NOT_ATTEMPTED,
+            dispatch_target=dispatch_target,
+            dispatch_result=dispatch_result,
+            dispatch_injection_stage=dispatch_injection_stage,
+            dispatch_blind_retry_prohibited=dispatch_blind_retry_prohibited,
             durable_anchor=(request.journal or None),
             adopted=adopted,
             steps=steps,
@@ -363,16 +357,14 @@ class SublaneActuateUseCase:
                 "both panes and its identity stamps",
                 command=None,
             ),
-            # #13293: the pre-dispatch gateway readiness wait (bounded, non-fatal) that
-            # --execute would run before the queue-enter dispatch.
             ActuationStep(
                 order=4,
                 title="confirm gateway readiness",
                 status=STEP_READY if dispatch else STEP_SKIPPED,
                 detail="wait (bounded, non-fatal) for the gateway TUI to boot + render "
                 "before the queue-enter dispatch so the input lands on a live composer; "
-                "an unconfirmed readiness degrades to gateway_ready=false and dispatches "
-                "anyway (never hard-blocks the queue-enter rail)"
+                "an unconfirmed probe records gateway_ready=false; the governed send "
+                "then returns its own confirmed or fail-closed result"
                 if dispatch
                 else "dispatch skipped (--no-dispatch); gateway readiness not probed",
                 command=None,
@@ -795,10 +787,7 @@ class SublaneActuateUseCase:
                 fill_override_reason=fill_override_reason,
             )
 
-        # Step 4 — pre-dispatch gateway readiness wait (#13293): let a freshly-launched
-        # gateway TUI boot so queue-enter lands on a live composer (j#72677). NEVER
-        # hard-blocks — unconfirmed degrades to ``gateway_ready=false`` and dispatches
-        # anyway (Enter-only retry #12580 is the net).
+        # Step 4: the readiness probe is advisory; the governed send remains authoritative.
         gateway_ready, ready_probes = self._wait_gateway_ready(gateway_pane)
         if gateway_ready is None:
             readiness_detail = (
@@ -815,9 +804,8 @@ class SublaneActuateUseCase:
         else:
             readiness_detail = (
                 f"gateway {gateway_pane} readiness unconfirmed after {ready_probes} "
-                "probe(s); dispatching anyway (queue-enter rail never hard-blocks — the "
-                "handoff Enter-only retry is the landing safety net). Recorded "
-                "gateway_ready=false so a no-progress lane is watched for"
+                "probe(s); attempting the governed send, which must independently "
+                "confirm submission or fail closed. Recorded gateway_ready=false"
             )
             readiness_status = STEP_SKIPPED
         steps.append(
@@ -831,7 +819,8 @@ class SublaneActuateUseCase:
         )
 
         try:
-            rc = self.ops.dispatch_implementation_request(
+            dispatch_attempt = drive_dispatch_implementation_request(
+                self.ops,
                 issue=request.issue,
                 journal=(request.journal or ""),
                 gateway_pane=gateway_pane or "",
@@ -839,49 +828,75 @@ class SublaneActuateUseCase:
                 upstream_coordinator=request.resolved_upstream_coordinator(),
                 target_repo=target_repo,
             )
+        except SystemExit as exc:
+            code = exc.code
+            dispatch_attempt = SublaneDispatchAttempt.untyped(
+                code if type(code) is int and code != 0 else 1
+            )
+            dispatch_detail = "handoff dispatch exited without a typed delivery result"
         except Exception as exc:  # noqa: BLE001 — fail-closed on any dispatch failure.
-            rc = 1
+            dispatch_attempt = SublaneDispatchAttempt.untyped(1)
             dispatch_detail = f"handoff dispatch raised: {exc}"
         else:
-            dispatch_detail = f"handoff send to gateway {gateway_pane} exit={rc}"
-        if rc != 0:
+            dispatch_detail = (
+                f"handoff send to gateway {gateway_pane} "
+                f"exit={dispatch_attempt.exit_code}"
+            )
+        if not dispatch_attempt.confirmed:
             # Redmine #13378: a failed dispatch whose gateway slot is GONE on read-back
-            # is the measured vanish mode — self-heal once and retry when the ops adapter
-            # offers the capability; any other failure keeps the plain block below.
-            healed_outcome = self._heal_and_retry_dispatch(
-                request,
-                launch,
-                steps=steps,
-                failed_dispatch_detail=dispatch_detail,
-                dispatch=dispatch,
-                target_repo=target_repo,
-                lane_runtime_root=lane_runtime_root,
-                adopted=adopted,
-                fill_decision=fill_decision,
-                fill_override_reason=fill_override_reason,
-                gateway_ready=gateway_ready,
+            # may self-heal and replay only with explicit pre-injection ``not_sent``
+            # proof. Untyped/nonzero and post-injection uncertainty never retype body.
+            healed_outcome = (
+                self._heal_and_retry_dispatch(
+                    request,
+                    launch,
+                    steps=steps,
+                    failed_dispatch_detail=dispatch_detail,
+                    failed_dispatch_attempt=dispatch_attempt,
+                    failed_gateway_pane=gateway_pane,
+                    dispatch=dispatch,
+                    target_repo=target_repo,
+                    lane_runtime_root=lane_runtime_root,
+                    adopted=adopted,
+                    fill_decision=fill_decision,
+                    fill_override_reason=fill_override_reason,
+                    gateway_ready=gateway_ready,
+                )
+                if dispatch_attempt.retry_safe
+                else None
             )
             if healed_outcome is not None:
                 return healed_outcome
+            fate = (
+                "nothing reached the gateway; retry is safe after fixing the refusal"
+                if dispatch_attempt.retry_safe
+                else "body and/or Enter may have reached the gateway; blind retry prohibited"
+            )
             steps.append(
                 ActuationStep(
                     order=5,
                     title="dispatch implementation_request",
                     status=STEP_BLOCKED,
-                    detail=dispatch_detail,
+                    detail=f"{dispatch_detail}; {fate}",
                     command=self._dispatch_command(request),
                 )
             )
             return self._blocked(
                 request,
                 launch_action=launch.action,
-                reason="gateway implementation_request dispatch failed; panes created "
-                "but not dispatched (fail-closed)",
+                reason=f"gateway implementation_request dispatch failed; {fate} "
+                "(fail-closed)",
                 reasons=(REASON_HANDOFF_FAILED,),
                 dispatch=dispatch,
                 steps=tuple(steps),
                 gateway_pane=gateway_pane,
                 worker_pane=worker_pane,
+                dispatch_target=gateway_pane,
+                dispatch_result=dispatch_attempt.public_result,
+                dispatch_injection_stage=dispatch_attempt.public_injection_stage,
+                dispatch_blind_retry_prohibited=(
+                    dispatch_attempt.blind_retry_prohibited
+                ),
                 adopted=adopted,
                 fill_decision=fill_decision,
                 fill_override_reason=fill_override_reason,
@@ -923,6 +938,8 @@ class SublaneActuateUseCase:
         *,
         steps: list,
         failed_dispatch_detail: str,
+        failed_dispatch_attempt: SublaneDispatchAttempt,
+        failed_gateway_pane: Optional[str],
         dispatch: bool,
         target_repo: str,
         lane_runtime_root: str,
@@ -931,15 +948,7 @@ class SublaneActuateUseCase:
         fill_override_reason: Optional[str],
         gateway_ready: Optional[bool],
     ) -> Optional[SublaneActuationOutcome]:
-        """One bounded self-heal + dispatch retry for a vanished gateway (#13378).
-
-        Thin delegator to :func:`~.sublane_actuator_heal.heal_and_retry_dispatch`
-        (carved into its own module for the module-health ceiling — the recovery
-        contract lives there). Returns ``None`` when the heal is not applicable
-        (no ops capability, or the gateway is still resolvable), leaving ``steps``
-        untouched so the caller's plain fail-closed block is byte-for-byte the
-        pre-#13378 behaviour; otherwise a terminal executed / blocked outcome.
-        """
+        """Delegate the explicit-not-sent vanished-gateway recovery (#13378)."""
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_heal import (  # noqa: E501
             heal_and_retry_dispatch,
         )
@@ -950,6 +959,8 @@ class SublaneActuateUseCase:
             launch,
             steps=steps,
             failed_dispatch_detail=failed_dispatch_detail,
+            failed_dispatch_attempt=failed_dispatch_attempt,
+            failed_gateway_pane=failed_gateway_pane,
             dispatch=dispatch,
             target_repo=target_repo,
             lane_runtime_root=lane_runtime_root,
@@ -1004,11 +1015,7 @@ class SublaneActuateUseCase:
 
     @staticmethod
     def _dispatch_reason_suffix(dispatch_result: str) -> str:
-        """Honest dispatch clause appended to an executed outcome's reason (pure).
-
-        Redmine #12986: keep the reason from reading as full success when only the
-        gateway was notified — spell out that worker dispatch is unconfirmed.
-        """
+        """Keep gateway notification distinct from worker dispatch (#12986)."""
         if dispatch_result == DISPATCH_GATEWAY_NOTIFIED:
             return (
                 " — gateway notified only; worker dispatch NOT yet confirmed "
@@ -1020,13 +1027,7 @@ class SublaneActuateUseCase:
 
     @staticmethod
     def _heal_reason_suffix(healed: bool) -> str:
-        """Spell out that the lane was self-healed before this dispatch (pure, #13378).
-
-        A healed outcome means the originally-launched gateway vanished before the
-        first delivery (a host-level event killed the idle agent) and the lane column
-        was relaunched in-flow; the coordinator record must say so — the gateway
-        locator in this outcome is the *relaunched* pane, not the created one.
-        """
+        """Record that explicit-not-sent recovery relaunched the lane (#13378)."""
         if not healed:
             return ""
         return (
@@ -1038,19 +1039,11 @@ class SublaneActuateUseCase:
     def _gateway_ready_reason_suffix(
         dispatch_result: str, gateway_ready: Optional[bool]
     ) -> str:
-        """Spell out an unconfirmed pre-dispatch gateway readiness (pure, #13293).
-
-        Only a gateway-notified dispatch whose pre-dispatch readiness wait elapsed
-        unconfirmed (``gateway_ready is False``) gets a clause: the input was dispatched
-        into a gateway TUI that never confirmed ready, so the coordinator is told to
-        watch for a no-progress lane. A confirmed-ready or not-probed dispatch adds
-        nothing (keeps the reason quiet in the healthy / back-compat case).
-        """
+        """Record an advisory readiness miss only after confirmed notification."""
         if dispatch_result == DISPATCH_GATEWAY_NOTIFIED and gateway_ready is False:
             return (
-                " — WARN gateway readiness NOT confirmed before dispatch; the input may "
-                "have landed on a still-booting composer (watch for no_progress; the "
-                "handoff Enter-only retry is the landing safety net)"
+                " — WARN gateway readiness NOT confirmed before dispatch, but the "
+                "governed send subsequently confirmed gateway notification"
             )
         return ""
 

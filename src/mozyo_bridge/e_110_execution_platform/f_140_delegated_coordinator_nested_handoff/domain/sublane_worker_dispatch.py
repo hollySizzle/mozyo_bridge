@@ -373,8 +373,7 @@ class WorkerDispatchOutcome:
     # #13301 pre-dispatch worker readiness wait (bounded, non-fatal, mirroring the
     # #13293 gateway readiness wait). ``None`` when the wait was not run (dry-run,
     # disabled, or blocked before the send); ``True`` on a confirmed booted worker
-    # pane; ``False`` when the window elapsed unconfirmed and the drive forwarded
-    # anyway (the queue-enter rail never hard-blocks).
+    # pane; ``False`` when the window elapsed and the drive failed closed before send.
     worker_ready: Optional[bool] = None
     # #13301 route-gate integration: whether the explicit ``--allow-direct-worker``
     # durable exception (#12918) was threaded into the same-lane worker send so a
