@@ -220,6 +220,93 @@ class ScratchMigrationTest(unittest.TestCase):
         with self.fence.transaction(unit, live_pair_present=True) as txn:
             self.assertIsNone(txn.current())
 
+    def test_mount_portable_path_fallback_replays_after_partial_publish(self):
+        import errno
+
+        self._v1()
+        from mozyo_bridge.core.state import scratch_retirement_migration as migration
+
+        real_link = migration.os.link
+        private_publish_calls = 0
+        pseudo_fd_calls = 0
+        fail_second_private_publish = True
+
+        class UnprivilegedLinkAt:
+            def __call__(self, *_args):
+                migration.ctypes.set_errno(errno.EPERM)
+                return -1
+
+        def mount_portable_link(source, target, *args, **kwargs):
+            nonlocal private_publish_calls, pseudo_fd_calls
+            source_path = Path(source)
+            if source_path.parent == Path("/proc/self/fd"):
+                pseudo_fd_calls += 1
+                raise OSError(errno.EXDEV, os.strerror(errno.EXDEV), source_path)
+            if source_path.name in {"store.sqlite3", "store.seal"}:
+                private_publish_calls += 1
+                if fail_second_private_publish and private_publish_calls == 2:
+                    raise OSError("crash after first private-path publish")
+            return real_link(source, target, *args, **kwargs)
+
+        fake_libc = SimpleNamespace(linkat=UnprivilegedLinkAt())
+        real_is_dir = migration.Path.is_dir
+
+        def fd_root_is_dir(path):
+            if path == Path("/proc/self/fd"):
+                return True
+            if path == Path("/dev/fd"):
+                return False
+            return real_is_dir(path)
+
+        patches = (
+            patch.object(migration.ctypes, "CDLL", return_value=fake_libc),
+            patch.object(migration.sys, "platform", "linux"),
+            patch.object(migration.Path, "is_dir", fd_root_is_dir),
+            patch.object(migration.os, "link", side_effect=mount_portable_link),
+        )
+        prior_errno = migration.ctypes.get_errno()
+        try:
+            with patches[0], patches[1], patches[2], patches[3]:
+                with self.assertRaises(ScratchRetirementFenceError):
+                    self.fence.migrate_v1_backup_first()
+
+                backup = self.fence.path.with_name(
+                    self.fence.path.name + ".v1.backup"
+                )
+                backup_seal = backup.with_name(backup.name + ".seal")
+                control = backup.with_name(backup.name + ".migration")
+                self.assertTrue(backup.exists())
+                self.assertFalse(backup_seal.exists())
+                self.assertTrue(control.exists())
+
+                fail_second_private_publish = False
+                self.assertEqual(self.fence.migrate_v1_backup_first(), 2)
+        finally:
+            migration.ctypes.set_errno(prior_errno)
+
+        authority = json.loads(control.read_text(encoding="utf-8"))
+        staging_root = control.parent / authority["staging_name"]
+        marker = staging_root / "authority.json"
+        self.assertEqual(
+            (marker.stat().st_dev, marker.stat().st_ino),
+            (control.stat().st_dev, control.stat().st_ino),
+        )
+        for name, final in (
+            ("store.sqlite3", backup),
+            ("store.seal", backup_seal),
+        ):
+            expected_pin = tuple(authority["artifact_pins"][name])
+            staging = staging_root / name
+            self.assertEqual(
+                (staging.stat().st_dev, staging.stat().st_ino), expected_pin
+            )
+            self.assertEqual((final.stat().st_dev, final.stat().st_ino), expected_pin)
+        self.assertEqual(private_publish_calls, 3)
+        self.assertEqual(pseudo_fd_calls, 3)
+        self.assertEqual(self.fence.store_shape().state, "present")
+        with sqlite3.connect(self.fence.path) as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+
     def test_partial_private_staging_seal_is_rebuilt(self):
         self._v1()
         module = "mozyo_bridge.core.state.scratch_retirement_migration._write_seal"
