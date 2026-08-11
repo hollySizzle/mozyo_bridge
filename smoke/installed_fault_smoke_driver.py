@@ -20,6 +20,7 @@ import urllib.parse
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -322,6 +323,104 @@ def _record_recover_diag(
     diagnostics[name] = record
 
 
+def _attest_fresh_recovery_generation(
+    *,
+    home: Path,
+    fake: FakeHerdr,
+    assigned_name: str,
+    workspace_id: str,
+    lane_id: str,
+    locator: str,
+    observed_at: str,
+    replacement_action_id: str,
+) -> bool:
+    """Complete the fresh worker's real managed-launch authority through public stores.
+
+    A main attestation alone is not a terminal-generation proof. The managed launcher reserved a
+    pending generation before actuation; this fixture supplies the wrapper event that the real
+    worker would emit after writing its attestation, completes the same startup transaction, and
+    calls the production finalizer. The finalizer still requires the action's pane-bound-v2
+    receipt, exact terminal id, event, and attestation to agree, so the smoke never fabricates an
+    ``attested`` generation with a direct store write.
+    """
+    from mozyo_bridge.core.state.herdr_identity_attestation import (
+        HerdrIdentityAttestationStore,
+        IdentityAttestationRecord,
+        VERDICT_PRESENT,
+    )
+    from mozyo_bridge.core.state.herdr_launch_generation import (
+        GENERATION_ATTESTED,
+        GENERATION_PENDING,
+        HerdrLaunchGenerationStore,
+    )
+    from mozyo_bridge.core.state.startup_execution_events import (
+        STAGE_ATTESTATION_WRITE_SUCCEEDED,
+        append_execution_event,
+    )
+    from mozyo_bridge.core.state.startup_transaction_fence import (
+        PHASE_COMPLETED_SUCCESS,
+        StartupTransactionFence,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_generation_binding import (  # noqa: E501
+        finalize_launch_generations,
+    )
+
+    attestations = HerdrIdentityAttestationStore(home=home)
+    attestations.upsert(
+        IdentityAttestationRecord(
+            assigned_name=assigned_name,
+            workspace_id=workspace_id,
+            role="claude",
+            lane_id=lane_id,
+            locator=locator,
+            verdict=VERDICT_PRESENT,
+            observed_at=observed_at,
+            replacement_action_id=replacement_action_id,
+        )
+    )
+    generations = HerdrLaunchGenerationStore(home=home)
+    generation = generations.read(assigned_name)
+    if generation is None or generation.phase != GENERATION_PENDING:
+        return False
+    fence = StartupTransactionFence(home=home)
+    action = fence.read(generation.startup_action_id)
+    if action is None:
+        return False
+    append_execution_event(
+        fence,
+        generation.startup_action_id,
+        STAGE_ATTESTATION_WRITE_SUCCEEDED,
+        participant=assigned_name,
+    )
+    if not action.terminal:
+        fence.set_phase(generation.startup_action_id, PHASE_COMPLETED_SUCCESS)
+    finalize_launch_generations(
+        store_home=home,
+        startup_action_id=generation.startup_action_id,
+        slots=[
+            SimpleNamespace(
+                assigned_name=assigned_name,
+                provider="claude",
+                locator=locator,
+                launch_terminal_id=fake.terminal_id_of(locator),
+            )
+        ],
+        workspace_id=workspace_id,
+        lane_id=lane_id,
+        attestation_read=attestations.read,
+    )
+    finalized = generations.read(assigned_name)
+    return bool(
+        finalized is not None
+        and finalized.phase == GENERATION_ATTESTED
+        and finalized.startup_action_id == generation.startup_action_id
+        and finalized.workspace_id == workspace_id
+        and finalized.role == "claude"
+        and finalized.lane_id == lane_id
+        and finalized.locator == locator
+    )
+
+
 def _recover_stale_outcome(
     cli: Path, tmp: Path, tag: str, *, inject_uncertain: bool = False
 ) -> "tuple | None":
@@ -336,9 +435,6 @@ def _recover_stale_outcome(
     import datetime as _dt
 
     from mozyo_bridge.core.state.herdr_delivery_ledger import HerdrDeliveryLedger
-    from mozyo_bridge.core.state.herdr_identity_attestation import (
-        HerdrIdentityAttestationStore, IdentityAttestationRecord, VERDICT_PRESENT,
-    )
     from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleKey, LaneLifecycleStore
     from mozyo_bridge.core.state.replacement_transaction import DecisionPointer
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.stale_worker_recovery import (  # noqa: E501
@@ -511,14 +607,32 @@ def _recover_stale_outcome(
         "2999-01-01T00:00:00+00:00" if inject_uncertain
         else _dt.datetime.now(_dt.timezone.utc).isoformat()
     )
-    HerdrIdentityAttestationStore(home=home).upsert(IdentityAttestationRecord(
-        assigned_name=name, workspace_id=ws_id, role="claude", lane_id=lane, locator=fresh,
-        verdict=VERDICT_PRESENT, observed_at=observed_at, replacement_action_id=action_id))
-    # Re-serialize the fake (EXEC1 mutated it) with the composer echo + the fresh worker's
-    # turn-start armed, so the second pass observes a live, attested receiver.
+    # Rehydrate the fake EXEC1 mutated, then complete the fresh worker's managed-launch
+    # authority through the same production finalizer the parent launcher uses. A main
+    # attestation without the launch event + pane-bound-v2 terminal receipt would leave the
+    # generation pending and correctly make queue-enter refuse before typing anything.
     fake2 = FakeHerdr.from_state(json.loads(state.read_text(encoding="utf-8")))
     fake2.echo_composer = True
     fake2.arm_transition(fresh, STATUS_WORKING)
+    try:
+        generation_finalized = _attest_fresh_recovery_generation(
+            home=home,
+            fake=fake2,
+            assigned_name=name,
+            workspace_id=ws_id,
+            lane_id=lane,
+            locator=fresh,
+            observed_at=observed_at,
+            replacement_action_id=action_id,
+        )
+    except Exception:  # noqa: BLE001 - setup failure is reported content-free below
+        generation_finalized = False
+    if not generation_finalized:
+        return {
+            "setup_error": "fresh_generation_unfinalized",
+            "pass1": p1,
+            "pass1_exit": first.returncode,
+        }
     agents_before = sorted((a["name"], a["pane_id"]) for a in fake2.agents)
     state.write_text(json.dumps(fake2.to_state()), encoding="utf-8")
 
@@ -641,25 +755,54 @@ def _norm(value: "str | None") -> str:
     return (value or "").strip()
 
 
-def _seed_owed_rollback(fence, fake, ws_id: str, lane: str, nonce: str):
-    """Reserve a startup action + record a fresh idle launch that owes a rollback; return action id."""
+def _seed_owed_rollback(
+    fence, fake, home: Path, ws_id: str, lane: str, nonce: str
+):
+    """Record one terminal-bound fresh launch whose safe rollback remains owed."""
+    from mozyo_bridge.core.state.herdr_native_identity_binding import (
+        HerdrNativeIdentityBindingStore,
+    )
     from mozyo_bridge.core.state.startup_transaction_fence import Participant, StartupUnit
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
+        pane_bound_receipt,
+    )
 
     action = fence.reserve(StartupUnit(workspace_id=ws_id, lane_id=lane, providers=("claude",)), nonce)
     name = encode_assigned_name(ws_id, "claude", lane)
-    locator = fake.seed_agent(name, workspace_id=list(fake._workspaces)[0], provider="claude")
-    fence.record_participant(action.action_id,
-                             Participant(role="claude", assigned_name=name, locator=locator,
-                                         receipt=locator))
+    binding = HerdrNativeIdentityBindingStore(home=home).bind(name)
+    native_workspace = list(fake._workspaces)[0]
+    locator = fake.seed_agent(
+        binding.native_name,
+        logical_name=name,
+        workspace_id=native_workspace,
+        provider="claude",
+        detected_agent="claude",
+    )
+    fence.record_participant(
+        action.action_id,
+        Participant(
+            role="claude",
+            assigned_name=name,
+            locator=locator,
+            receipt=pane_bound_receipt(
+                target_workspace=native_workspace,
+                target_tab=f"{native_workspace}:t1",
+                native_name=binding.native_name,
+                terminal_id=fake.terminal_id_of(locator),
+            ),
+        ),
+    )
     return action.action_id, locator
 
 
 def _drive_session_rollback(cli: Path, tmp: Path) -> bool:
-    """F3 critical path installed: after discharge, the SAME binding replays under a NEW action id.
+    """F3 installed: current Herdr preserves a present terminal and its rollback debt.
 
-    Action A is rolled back; then a fresh reservation of the SAME startup unit mints a NEW action
-    id (A != B), B is a live fresh launch (``eligible``), and A stays terminally rolled back.
+    The exact terminal-bound participant crosses the identity/content fences, but protocol 19 has
+    no server-side conditional close. Preflight, execute, and replay must therefore report the
+    typed blocker while the execute closes zero panes and leaves the same action retryable.
     """
+    from installed_fault_smoke import session_rollback_accepts
     from mozyo_bridge.core.state.startup_transaction_fence import StartupTransactionFence
 
     lane, ws_id = "issue_14097_smoke_nested", "fixture-14097-smoke-nested"
@@ -668,31 +811,60 @@ def _drive_session_rollback(cli: Path, tmp: Path) -> bool:
     fence = StartupTransactionFence(home=home)
     fake = FakeHerdr(read_text="idle\n> ")
     fake.seed_workspace(cwd=str(tmp))
-    action_a, _ = _seed_owed_rollback(fence, fake, ws_id, lane, "n1")
+    action_id, _ = _seed_owed_rollback(fence, fake, home, ws_id, lane, "n1")
     state = tmp / "sr_state.json"
     state.write_text(json.dumps(fake.to_state()), encoding="utf-8")
     env = _base_env(home, herdr_state=state)
 
-    discharge = _run(cli, ["herdr", "session-rollback", "--action-id", action_a,
-                           "--execute", "--json", "--repo", str(tmp)], env)
-    # The same binding replays: a fresh reservation of the same unit mints a NEW action id. Reload
-    # the state the discharge just mutated (A's fresh launch closed) before seeding B's launch.
-    fake = FakeHerdr.from_state(json.loads(state.read_text(encoding="utf-8")))
-    action_b, _ = _seed_owed_rollback(fence, fake, ws_id, lane, "n2")
-    state.write_text(json.dumps(fake.to_state()), encoding="utf-8")
-    replay_b = _run(cli, ["herdr", "session-rollback", "--action-id", action_b,
-                          "--json", "--repo", str(tmp)], env)
-    replay_a = _run(cli, ["herdr", "session-rollback", "--action-id", action_a,
-                          "--json", "--repo", str(tmp)], env)
+    agents_before = sorted(
+        (row["name"], row["pane_id"])
+        for row in FakeHerdr.from_state(
+            json.loads(state.read_text(encoding="utf-8"))
+        ).agents
+    )
+    preflight = _run(
+        cli,
+        [
+            "herdr", "session-rollback", "--action-id", action_id,
+            "--json", "--repo", str(tmp),
+        ],
+        env,
+    )
+    execute = _run(
+        cli,
+        [
+            "herdr", "session-rollback", "--action-id", action_id,
+            "--execute", "--json", "--repo", str(tmp),
+        ],
+        env,
+    )
+    replay = _run(
+        cli,
+        [
+            "herdr", "session-rollback", "--action-id", action_id,
+            "--json", "--repo", str(tmp),
+        ],
+        env,
+    )
     try:
-        dis = json.loads(discharge.stdout)
-        rb = json.loads(replay_b.stdout)
-        ra = json.loads(replay_a.stdout)
-        return (dis["state"] == "completed" and dis["participants"][0]["closed"]
-                and action_b != action_a
-                and rb["participants"][0]["verdict"] == "eligible"
-                and ra["reason"] == "already_rolled_back")
-    except (ValueError, KeyError, IndexError):
+        payload = {
+            "preflight": json.loads(preflight.stdout),
+            "execute": json.loads(execute.stdout),
+            "replay": json.loads(replay.stdout),
+            "preflight_exit": preflight.returncode,
+            "execute_exit": execute.returncode,
+            "replay_exit": replay.returncode,
+        }
+        agents_after = sorted(
+            (row["name"], row["pane_id"])
+            for row in FakeHerdr.from_state(
+                json.loads(state.read_text(encoding="utf-8"))
+            ).agents
+        )
+        payload["agents_unchanged"] = agents_before == agents_after
+        payload["live_agent_count"] = len(agents_after)
+        return session_rollback_accepts(payload)
+    except (OSError, ValueError, KeyError, IndexError):
         return False
 
 
@@ -869,17 +1041,13 @@ def _fake_transition_observed(state_path: Path) -> "bool | None":
         raw = json.loads(Path(state_path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    agents = raw.get("agents")
-    if isinstance(agents, dict):
-        agents = list(agents.values())
-    if not isinstance(agents, list):
+    armed_transitions = raw.get("armed_transitions")
+    if not isinstance(armed_transitions, list):
         return None
-    for agent in agents:
-        if isinstance(agent, dict) and "armed_transitions" in agent:
-            # Armed transitions are consumed as they fire, so an empty/absent list means the
-            # armed turn-start was observed.
-            return not agent.get("armed_transitions")
-    return None
+    # FakeHerdr serializes its transition queue at the state root. The callback fixture arms one
+    # transition before delivery, so an empty canonical queue afterwards means that exact
+    # transition was consumed. An absent/malformed queue remains unknown rather than guessed.
+    return not armed_transitions
 
 
 def _record_cb_diag(diagnostics: "dict | None", record: dict, *, failed: list) -> None:
