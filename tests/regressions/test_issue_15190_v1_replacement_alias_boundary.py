@@ -30,11 +30,13 @@ from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.doma
     MODE_ALIAS,
     MODE_DISABLED,
     REASON_DECLARATION_INVALID,
+    REASON_GIT_BINDING_UNAVAILABLE,
     REASON_NOT_REGULAR_FILE,
     WorkspaceAliasDeclaration,
 )
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.infrastructure import (  # noqa: E501
     workspace_alias_store as store,
+    workspace_git_probe as git_probe,
 )
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.infrastructure.workspace_alias_store import (  # noqa: E501
     alias_path,
@@ -112,7 +114,7 @@ class V1ReplacementAliasBoundaryTest(unittest.TestCase):
             ),
         )
 
-    def _run_lock_held(self) -> dict:
+    def _run_lock_held(self, seen: dict | None = None) -> dict:
         """Drive the ``admission_lock_held=True`` branch to the first repo_root use.
 
         ``_prepare_session_locked`` is deliberately NOT stubbed — it is the entry
@@ -122,7 +124,8 @@ class V1ReplacementAliasBoundaryTest(unittest.TestCase):
         receive the (possibly folded) root. What that call sees is the root the
         launch would actually use.
         """
-        seen: dict = {}
+        if seen is None:
+            seen = {}
 
         class _Stop(Exception):
             pass
@@ -189,9 +192,10 @@ class V1ReplacementAliasBoundaryTest(unittest.TestCase):
         is the first thing after the rail that would touch durable state, so an
         empty capture proves the refusal landed before any of it.
         """
+        seen: dict = {}
         with self.assertRaises(HerdrSessionStartError) as caught:
-            seen = self._run_lock_held()
-            self.assertEqual(seen, {})
+            self._run_lock_held(seen)
+        self.assertEqual(seen, {})
         self.assertIn(expected, str(caught.exception))
 
     def test_launch_disabled_never_reaches_the_lock_held_entry(self) -> None:
@@ -220,6 +224,13 @@ class V1ReplacementAliasBoundaryTest(unittest.TestCase):
     def test_non_regular_declaration_never_reaches_the_lock_held_entry(self) -> None:
         alias_path(self.nested).mkdir(parents=True)
         self._assert_refused_without_side_effect(REASON_NOT_REGULAR_FILE)
+
+    def test_unavailable_git_probe_never_reaches_the_lock_held_entry(self) -> None:
+        self._declare_alias()
+        with mock.patch.object(git_probe.shutil, "which", return_value=None):
+            self._assert_refused_without_side_effect(
+                REASON_GIT_BINDING_UNAVAILABLE
+            )
 
 
 if __name__ == "__main__":  # pragma: no cover

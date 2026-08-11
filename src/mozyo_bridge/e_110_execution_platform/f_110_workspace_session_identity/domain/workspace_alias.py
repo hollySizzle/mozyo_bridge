@@ -72,7 +72,15 @@ GIT_BINDING_DIFFERENT = "different"
 #: Neither side is a git checkout. Containment then carries the whole binding —
 #: the legitimate non-git nested workspace case (#11301 scaffolded roots).
 GIT_BINDING_NOT_MEASURABLE = "not_measurable"
-GIT_BINDINGS = (GIT_BINDING_SAME, GIT_BINDING_DIFFERENT, GIT_BINDING_NOT_MEASURABLE)
+#: Git topology could not be measured safely.  Unlike genuine two-non-Git
+#: roots, this is always a typed zero-launch.
+GIT_BINDING_UNAVAILABLE = "unavailable"
+GIT_BINDINGS = (
+    GIT_BINDING_SAME,
+    GIT_BINDING_DIFFERENT,
+    GIT_BINDING_NOT_MEASURABLE,
+    GIT_BINDING_UNAVAILABLE,
+)
 
 #: Typed refusal reasons. Each is a fixed token so an operator, a test, and a
 #: durable record can all name the same branch without parsing prose.
@@ -132,6 +140,7 @@ REASON_TARGET_NOT_ANCESTOR = "alias_target_not_ancestor"
 REASON_TARGET_IDENTITY_UNRESOLVED = "alias_target_identity_unresolved"
 REASON_TARGET_IDENTITY_MISMATCH = "alias_target_identity_mismatch"
 REASON_CROSS_REPOSITORY = "alias_target_cross_repository"
+REASON_GIT_BINDING_UNAVAILABLE = "alias_target_git_binding_unavailable"
 REASON_ALIAS_CYCLE = "alias_target_declares_alias"
 
 
@@ -441,6 +450,12 @@ def build_alias_resolution(
             ),
             declaration,
         )
+    if target.git_binding == GIT_BINDING_UNAVAILABLE:
+        return refused(
+            REASON_GIT_BINDING_UNAVAILABLE,
+            "git repository binding could not be measured safely",
+            declaration,
+        )
     if target.git_binding not in GIT_BINDINGS:
         return refused(
             REASON_CROSS_REPOSITORY,
@@ -512,10 +527,12 @@ __all__ = (
     "GIT_BINDING_DIFFERENT",
     "GIT_BINDING_NOT_MEASURABLE",
     "GIT_BINDING_SAME",
+    "GIT_BINDING_UNAVAILABLE",
     "MODE_ALIAS",
     "MODE_DISABLED",
     "REASON_ALIAS_CYCLE",
     "REASON_CROSS_REPOSITORY",
+    "REASON_GIT_BINDING_UNAVAILABLE",
     "REASON_DECLARATION_INVALID",
     "REASON_DECLARATION_UNREADABLE",
     "REASON_MULTIPLE_LINKS",

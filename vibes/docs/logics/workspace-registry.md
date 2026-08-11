@@ -162,6 +162,7 @@ declaration:
   `alias_target_missing` / `alias_target_not_directory` / `alias_target_is_self` /
   `alias_target_not_ancestor` / `alias_target_identity_unresolved` /
   `alias_target_identity_mismatch` / `alias_target_cross_repository` /
+  `alias_target_git_binding_unavailable` /
   `alias_target_declares_alias` / `declaration_unreadable` / `declaration_invalid` /
   `declaration_unsupported_schema` / `declaration_not_regular_file`。
 - **未知 field は拒否する** (`declaration_invalid`)。schema v1 が mode ごとに定義する key
@@ -281,7 +282,13 @@ descriptor** に固定し、判定は全て `lstat` で行う。
   共通なので同一 repository (sublane worktree は従来どおり launch 可能)、**submodule** は
   親の tree 内に物理的に存在しても別 repository として拒否する。観測事例の
   `projects/nihonidenshi` が submodule であるため、path 包含だけでは不十分。
-  両者とも非 git の場合のみ包含関係が binding を担う (#11301 の非 git scaffolded workspace)。
+  両者とも**positively non-git**の場合のみ包含関係が binding を担う (#11301 の非 git
+  scaffolded workspace)。この判定は workspace-alias 専用のlossless probeを使い、Gitが実際に
+  起動してlocale固定のnon-repository結果を返し、discovery path上に `.git` entryが無い場合だけ
+  `not_measurable` とする。missing executable / timeout / unexpected non-zero / malformed output /
+  marker stat failureは `alias_target_git_binding_unavailable` のtyped zero-launchであり、
+  `workspace alias set`も宣言を一切書かない。shared workspace-registryのbest-effort helperが
+  failureを `None` に畳む後方互換contractを、authority-bearing alias判定へ流用しない。
 - **identity binding**: 宣言は canonical の `workspace_id` を記録する。同一 path で identity が
   再発行・復元された場合は `alias_target_identity_mismatch` で fail closed し、alias が別
   workspace へ黙って向き直ることを防ぐ。
