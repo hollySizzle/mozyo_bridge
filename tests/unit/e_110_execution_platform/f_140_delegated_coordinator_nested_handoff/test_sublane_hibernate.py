@@ -88,11 +88,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_boundary import (  # noqa: E501
     LaneActivityObservation,
+    fresh_release_disposition,
     read_live_lane_activity,
     read_live_worktree_fingerprint,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_cli import (  # noqa: E501
     cmd_sublane_hibernate,
+    format_hibernate_text,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     encode_assigned_name,
@@ -597,6 +599,8 @@ class SublaneHibernateTest(unittest.TestCase):
             self.assertEqual(retry.release.process_release, "weird_unknown_token")
             self.assertIn("release_state_unknown", retry.release.detail)
             self.assertEqual(ops.close_calls, [], "an unclassified state closes nothing")
+            self.assertFalse(retry.success_withheld)
+            self.assertIn("release state unclassified", retry.detail)
             self.assertFalse(
                 retry.is_success,
                 "a synthetic released with zero actuation must never read as a clean success",
@@ -2607,6 +2611,25 @@ class PartialReleaseSuccessTest(unittest.TestCase):
     def _rows(self):
         return [_row("codex", LANE, f"{WS}:p2"), _row("claude", LANE, f"{WS}:p3")]
 
+    def test_admission_block_uses_revision_recovery_not_residue_recovery(self) -> None:
+        withheld, recovery, detail = fresh_release_disposition(
+            mock.Mock(admission_blocked=True),
+            mock.Mock(recovery_detail="", residue_detected=False),
+        )
+        self.assertTrue(withheld)
+        self.assertIn("revision drift", recovery)
+        self.assertIn("revision drift", detail)
+        self.assertNotIn("worktree residue", recovery)
+
+    def test_unknown_fresh_release_state_is_not_laundered_as_incomplete(self) -> None:
+        withheld, recovery, detail = fresh_release_disposition(
+            mock.Mock(admission_blocked=False, process_release="future_state"),
+            mock.Mock(recovery_detail="", residue_detected=False),
+        )
+        self.assertFalse(withheld)
+        self.assertEqual(recovery, "")
+        self.assertIn("release state unclassified", detail)
+
     def test_partial_release_is_not_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = LaneLifecycleStore(home=Path(tmp))
@@ -2625,6 +2648,113 @@ class PartialReleaseSuccessTest(unittest.TestCase):
             self.assertFalse(outcome.is_blocked)
             self.assertTrue(outcome.success_withheld)
             self.assertFalse(outcome.is_success)
+            self.assertIn("process release incomplete", outcome.recovery_detail)
+            text = format_hibernate_text(outcome)
+            self.assertIn("process release incomplete", text)
+            self.assertNotIn("post-release worktree residue", text)
+
+    def test_partial_redrive_remains_withheld_until_close_debt_converges(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LaneLifecycleStore(home=Path(tmp))
+            _declare_issue_lane(store)
+            partial = HerdrRetireCloseResult(
+                workspace_id=WS, lane_id=LANE,
+                closed=(("claude", f"{WS}:p3"),),
+                failed=(("codex", f"{WS}:p2", "close_failed"),),
+            )
+            SublaneHibernateUseCase(
+                ops=_FakeOps(rows=self._rows(), close_result=partial), store=store
+            ).run(_request(), execute=True)
+            still_partial = HerdrRetireCloseResult(
+                workspace_id=WS, lane_id=LANE, closed=(),
+                failed=(("codex", f"{WS}:p2", "close_failed"),),
+            )
+            retry = SublaneHibernateUseCase(
+                ops=_FakeOps(
+                    rows=[_row("codex", LANE, f"{WS}:p2")],
+                    close_result=still_partial,
+                ),
+                store=store,
+            ).run(_request(), execute=True)
+            self.assertTrue(retry.already_hibernated)
+            self.assertEqual(retry.release.process_release, RELEASE_PARTIAL)
+            self.assertTrue(retry.success_withheld)
+            self.assertFalse(retry.is_success)
+            self.assertIn("process release incomplete", retry.recovery_detail)
+            self.assertNotIn("worktree residue", format_hibernate_text(retry))
+
+    def test_partial_redrive_preflight_does_not_claim_a_withheld_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LaneLifecycleStore(home=Path(tmp))
+            _declare_issue_lane(store)
+            partial = HerdrRetireCloseResult(
+                workspace_id=WS, lane_id=LANE,
+                closed=(("claude", f"{WS}:p3"),),
+                failed=(("codex", f"{WS}:p2", "close_failed"),),
+            )
+            SublaneHibernateUseCase(
+                ops=_FakeOps(rows=self._rows(), close_result=partial), store=store
+            ).run(_request(), execute=True)
+            preflight = SublaneHibernateUseCase(
+                ops=_FakeOps(rows=[_row("codex", LANE, f"{WS}:p2")]),
+                store=store,
+            ).run(_request(), execute=False)
+            self.assertTrue(preflight.already_hibernated)
+            self.assertFalse(preflight.executed)
+            self.assertIsNone(preflight.release)
+            self.assertFalse(preflight.success_withheld)
+            self.assertIn("preflight only", preflight.detail)
+            self.assertNotIn("resumed release", preflight.detail)
+
+    def test_partial_release_with_post_residue_prioritizes_boundary_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LaneLifecycleStore(home=Path(tmp))
+            _declare_issue_lane(store)
+            partial = HerdrRetireCloseResult(
+                workspace_id=WS, lane_id=LANE,
+                closed=(("claude", f"{WS}:p3"),),
+                failed=(("codex", f"{WS}:p2", "close_failed"),),
+            )
+            outcome = SublaneHibernateUseCase(
+                ops=_FakeOps(
+                    rows=self._rows(), close_result=partial,
+                    fingerprints=[_CLEAN_FP, _CLEAN_FP, _dirty_fp("post-residue")],
+                ),
+                store=store,
+            ).run(_request(), execute=True)
+            self.assertEqual(outcome.release.process_release, RELEASE_PARTIAL)
+            self.assertTrue(outcome.success_withheld)
+            self.assertIn("post-release worktree residue", outcome.recovery_detail)
+            self.assertIn("boundary-record", outcome.detail)
+
+    def test_partial_redrive_with_post_residue_prioritizes_boundary_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LaneLifecycleStore(home=Path(tmp))
+            _declare_issue_lane(store)
+            partial = HerdrRetireCloseResult(
+                workspace_id=WS, lane_id=LANE,
+                closed=(("claude", f"{WS}:p3"),),
+                failed=(("codex", f"{WS}:p2", "close_failed"),),
+            )
+            SublaneHibernateUseCase(
+                ops=_FakeOps(rows=self._rows(), close_result=partial), store=store
+            ).run(_request(), execute=True)
+            still_partial = HerdrRetireCloseResult(
+                workspace_id=WS, lane_id=LANE, closed=(),
+                failed=(("codex", f"{WS}:p2", "close_failed"),),
+            )
+            retry = SublaneHibernateUseCase(
+                ops=_FakeOps(
+                    rows=[_row("codex", LANE, f"{WS}:p2")],
+                    close_result=still_partial,
+                    fingerprints=[_CLEAN_FP, _CLEAN_FP, _dirty_fp("post-residue")],
+                ),
+                store=store,
+            ).run(_request(), execute=True)
+            self.assertEqual(retry.release.process_release, RELEASE_PARTIAL)
+            self.assertTrue(retry.success_withheld)
+            self.assertIn("post-release worktree residue", retry.recovery_detail)
+            self.assertIn("boundary-record", retry.detail)
 
     def test_released_is_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

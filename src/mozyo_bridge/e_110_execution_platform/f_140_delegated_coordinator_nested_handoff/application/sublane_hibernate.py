@@ -109,7 +109,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     read_fingerprint,
     read_live_lane_activity,
     read_live_worktree_fingerprint,
-    redrive_detail,
+    redrive_disposition,
     revalidate_boundary,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
@@ -187,9 +187,8 @@ class HibernateOutcome:
     boundary_blocked: bool = False
     #: The typed reasons the boundary re-validation blocked (rendered with the preflight ones).
     boundary_reasons: tuple[str, ...] = ()
-    #: Redmine #13843: the post-release (T2) check / release admission block withheld a success
-    #: — the lane stays hibernated (work preserved) and :attr:`recovery_detail` names the next
-    #: action.
+    #: Redmine #13843: an incomplete release, its admission block, or the post-release (T2)
+    #: check withheld success. The lane stays hibernated and recovery_detail names the next action.
     success_withheld: bool = False
     recovery_detail: str = ""
     #: Redmine #14230: a live managed slot's composer was observed carrying a ghost-empty
@@ -651,6 +650,11 @@ class SublaneHibernateUseCase:
             redrive_blocked = execute and (
                 not redrive_ok or bool(boundary_reasons) or redrive_lease_lost
             )
+            withheld, recovery_detail, outcome_detail = redrive_disposition(
+                release=release, redrive_ok=redrive_ok and not redrive_lease_lost,
+                boundary_reasons=boundary_reasons, post_residue=post_residue,
+                recovery_detail=recovery_detail,
+            )
             preflight = HibernatePreflight(
                 original_identity_known=True,  # the hibernated lane is known
                 park_satisfied=request.assertions.park_satisfied,
@@ -675,14 +679,10 @@ class SublaneHibernateUseCase:
                 boundary_reasons=boundary_reasons,
                 composer_ghost_observed=composer_ghost_observed,
                 release=release,
-                success_withheld=post_residue,
+                success_withheld=withheld,
                 recovery_detail=recovery_detail,
                 lease_lost=redrive_lease_lost,
-                detail=redrive_detail(
-                    redrive_ok=redrive_ok and not redrive_lease_lost,
-                    boundary_reasons=boundary_reasons,
-                    post_residue=post_residue,
-                ),
+                detail=outcome_detail,
             )
 
         # Fresh-path stale-approval REVISION fence (Redmine #13811 R2 F2). For a

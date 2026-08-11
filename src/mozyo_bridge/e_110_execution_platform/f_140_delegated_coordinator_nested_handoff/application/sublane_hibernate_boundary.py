@@ -33,7 +33,9 @@ _MAX_UNTRACKED_FILES = 20_000  # total untracked paths hashed
 
 from mozyo_bridge.core.state.lane_lifecycle import (
     RELEASE_NOT_REQUESTED,
+    RELEASE_PARTIAL,
     RELEASE_RELEASED,
+    RELEASE_REQUESTED,
     LaneLifecycleError,
     LaneLifecycleKey,
     LaneLifecycleStore,
@@ -49,7 +51,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCK_RELEASE_BOUNDARY_GENERATION_DRIFT,
     BLOCK_RELEASE_BOUNDARY_REVISION_DRIFT,
     CLEAN_WORKTREE_FINGERPRINT,
-    RECOVERY_ACTION_DETAIL,
     PostReleaseCheck,
     WorktreeMutationFingerprint,
     post_release_check,
@@ -60,6 +61,16 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 # boundary re-read that becomes unreadable fails closed on the same vocabulary the preflight
 # uses, so the operator sees one consistent reason.
 BLOCK_INVENTORY_UNREADABLE = "inventory_unreadable"
+
+INCOMPLETE_RELEASE_RECOVERY_DETAIL = (
+    "process release incomplete: re-drive the hibernated lane with current authority via "
+    "`sublane resume` (issue / worktree / branch / commits are preserved, and no unproven "
+    "slot is closed)"
+)
+ADMISSION_BLOCKED_RECOVERY_DETAIL = (
+    "process release admission blocked by lifecycle revision drift: re-drive the hibernated "
+    "lane with current authority via `sublane resume` (work is preserved)"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -609,60 +620,77 @@ def fresh_release_disposition(
 ) -> tuple[bool, str, str]:
     """Resolve a fresh hibernate's ``(success_withheld, recovery_detail, detail)`` (#13843).
 
-    A revision-drift admission block (review F3) OR a post-release residue withholds the
-    success (the lane stays hibernated; the release is resumed later with current authority).
-    A clean release is a plain success.
+    A revision-drift admission block, incomplete release, or post-release residue withholds
+    success. The lane stays hibernated and resumes later with current authority.
     """
     if getattr(release, "admission_blocked", False):
         return (
             True,
-            post_check.recovery_detail or RECOVERY_ACTION_DETAIL,
+            ADMISSION_BLOCKED_RECOVERY_DETAIL,
             "lane hibernated; release admission blocked by revision drift — success withheld, "
             "re-drive with current authority via `sublane resume`",
-        )
-    if getattr(release, "process_release", "") not in (
-        RELEASE_RELEASED,
-        RELEASE_NOT_REQUESTED,
-    ):
-        return (
-            True,
-            RECOVERY_ACTION_DETAIL,
-            "lane hibernated; process release incomplete — success withheld, re-drive with "
-            "current authority via `sublane resume`",
         )
     if post_check.residue_detected:
         return (
             True,
             post_check.recovery_detail,
-            "lane hibernated; managed processes released but post-release worktree residue "
-            "detected — success withheld, converge to recovery/boundary-record",
+            "lane hibernated; post-release worktree residue detected — success withheld, "
+            "converge to recovery/boundary-record before any release re-drive",
+        )
+    state = getattr(release, "process_release", "")
+    if release is not None and state in (RELEASE_PARTIAL, RELEASE_REQUESTED):
+        return (
+            True,
+            INCOMPLETE_RELEASE_RECOVERY_DETAIL,
+            "lane hibernated; process release incomplete — success withheld, re-drive with "
+            "current authority via `sublane resume`",
+        )
+    if release is None or state not in (RELEASE_RELEASED, RELEASE_NOT_REQUESTED):
+        return False, "", (
+            "lane hibernated; release state unclassified — zero close, zero write; repair the "
+            "stored release authority before re-drive"
         )
     return False, "", "lane hibernated; managed processes released"
 
 
-def redrive_detail(
+def redrive_disposition(
     *,
+    release: object,
     redrive_ok: bool,
     boundary_reasons: tuple[str, ...],
     post_residue: bool,
-) -> str:
-    """The human detail string for an already-hibernated redrive outcome (#13843)."""
+    recovery_detail: str,
+) -> tuple[bool, str, str]:
+    """Resolve withheld state, recovery and detail for an already-hibernated redrive."""
     if not redrive_ok:
-        return (
+        return False, "", (
             "lane already hibernated; release re-drive blocked (preservation gate "
             "unmet or inventory unreadable)"
         )
     if boundary_reasons:
-        return (
+        return False, "", (
             "lane already hibernated; release re-drive blocked by release-boundary "
             "re-validation (" + ", ".join(boundary_reasons) + ")"
         )
     if post_residue:
-        return (
-            "lane already hibernated; resumed release but post-release worktree residue "
-            "detected — success withheld, converge to recovery/boundary-record"
+        return True, recovery_detail, (
+            "lane already hibernated; post-release worktree residue detected — success "
+            "withheld, converge to recovery/boundary-record before any release re-drive"
         )
-    return "lane already hibernated; resumed release"
+    if release is None:
+        return False, "", "lane already hibernated; release re-drive preflight only"
+    state = getattr(release, "process_release", "")
+    if state in (RELEASE_PARTIAL, RELEASE_REQUESTED):
+        return True, INCOMPLETE_RELEASE_RECOVERY_DETAIL, (
+            "lane already hibernated; resumed process release remains incomplete — "
+            "success withheld, re-drive with current authority via `sublane resume`"
+        )
+    if state not in (RELEASE_RELEASED, RELEASE_NOT_REQUESTED):
+        return False, "", (
+            "lane already hibernated; release state unclassified — zero close, zero write; "
+            "repair the stored release authority before re-drive"
+        )
+    return False, "", "lane already hibernated; resumed release"
 
 
 __all__ = (
@@ -674,6 +702,6 @@ __all__ = (
     "read_fingerprint",
     "read_live_lane_activity",
     "read_live_worktree_fingerprint",
-    "redrive_detail",
+    "redrive_disposition",
     "revalidate_boundary",
 )
