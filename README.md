@@ -15,6 +15,25 @@ need the full stage order.
 
 > 人間向けのリリースノートは [`RELEASE_NOTES.md`](RELEASE_NOTES.md) にあります。
 
+### Herdr support and breaking upgrades
+
+The 1.0 release-candidate line is verified against **Herdr 0.8.0 only**.
+Older Herdr versions and newer versions that have not completed this project's
+tests and acceptance checks are unsupported; “latest” does not mean automatic
+forward compatibility.
+
+When upgrading an existing Herdr-backed installation, checkpoint the work in
+progress, stop the old session, and start a fresh named session from the new
+environment. Pre-1.0 sessions, launch receipts, and terminal identities are not
+migrated in place, and in-place downgrade is not supported. Compatibility code
+for old Herdr command grammars or persisted sessions is intentionally not kept.
+
+This is a deliberate policy for the initial, centrally managed small user
+cohort: the implementation, test, and incident-analysis cost of parallel legacy
+paths exceeds their operational benefit. If a broader or independently managed
+user base needs rolling upgrades later, that migration contract must be designed
+and tested as a separate feature before support is claimed.
+
 1. **Install the CLI** and confirm `tmux` is on `PATH`:
 
    ```bash
