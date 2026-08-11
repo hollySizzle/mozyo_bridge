@@ -563,6 +563,7 @@ class LaneDeclarationStore:
                     "release_observation = ?, "
                     "replacement_state = ?, replacement_action_id = ?, "
                     "replacement_pins = ?, declared_slots = ?, reconcile_phase = ?, "
+                    "reconcile_close_pin = ?, "
                     "lane_kind = ?, hibernated_at = ?, revision = ?, "
                     "decision_source = ?, decision_issue_id = ?, decision_journal = ?, "
                     "updated_at = ? "
@@ -586,6 +587,9 @@ class LaneDeclarationStore:
                         # v6 (Redmine #13842): a re-incarnated generation is a fresh active lane,
                         # NOT a reconcile-retired one — clear any stale reconcile owed-close phase
                         # so an old generation's provenance never authorizes a new one.
+                        "",
+                        # v11 (#15227): never carry an owed-close generation pin across a
+                        # lane-generation reopen. Legacy rows are not back-filled.
                         "",
                         # v7 (Redmine #13647): carry the geometry kind forward unless the
                         # caller explicitly re-binds it at this generation boundary.

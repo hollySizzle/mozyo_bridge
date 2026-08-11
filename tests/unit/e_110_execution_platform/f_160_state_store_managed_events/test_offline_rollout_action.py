@@ -19,9 +19,11 @@ from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.doma
     approval_matches,
     canonical_digest,
     deterministic_action_id,
+    new_action,
     parse_approval_note,
     render_approval_note,
     validate_action,
+    verify_plan,
 )
 from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.infrastructure.offline_rollout_action_store import (  # noqa: E501
     OfflineRolloutActionStore,
@@ -33,7 +35,7 @@ def _plan() -> dict:
     top = "mzb1_ws__codex__default"
     supervisor_label = "org.mozyo-bridge.callback-supervisor"
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "candidate_artifact": {
             "distribution": "testpypi",
             "version": "0.15.0a4",
@@ -92,7 +94,7 @@ def _plan() -> dict:
             "attestation": {
                 "state": "recognized",
                 "version": 1,
-                "target_version": 3,
+                "target_version": 4,
                 "upgrade_required": False,
                 "content_digest": "1" * 64,
                 "migration_plan_digest": "",
@@ -100,9 +102,17 @@ def _plan() -> dict:
             "lane_lifecycle": {
                 "state": "recognized",
                 "version": 10,
-                "target_version": 10,
-                "upgrade_required": False,
+                "target_version": 11,
+                "upgrade_required": True,
                 "content_digest": "2" * 64,
+                "migration_plan_digest": "",
+            },
+            "launch_generation": {
+                "state": "recognized",
+                "version": 1,
+                "target_version": 2,
+                "upgrade_required": True,
+                "content_digest": "5" * 64,
                 "migration_plan_digest": "",
             },
             "startup_transaction": {
@@ -130,8 +140,9 @@ def _plan() -> dict:
         "stop_order": [top],
         "restore_order": [top],
         "schema_transitions": [
-            {"store": "attestation", "from_version": 1, "to_version": 3},
-            {"store": "lane_lifecycle", "from_version": 10, "to_version": 10},
+            {"store": "attestation", "from_version": 1, "to_version": 4},
+            {"store": "lane_lifecycle", "from_version": 10, "to_version": 11},
+            {"store": "launch_generation", "from_version": 1, "to_version": 2},
             {"store": "startup_transaction", "from_version": 1, "to_version": 2},
         ],
         "phase_order": [
@@ -144,9 +155,10 @@ def _plan() -> dict:
             {"phase": "top_workspace_stop", "assigned_names": [top]},
             {"phase": "consumer_zero", "required_readback": "zero"},
             {"phase": "verified_backup", "stores": ["attestation"]},
-            {"phase": "migrate_attestation", "target_version": 3},
-            {"phase": "migrate_lane_lifecycle", "target_version": 10},
+            {"phase": "migrate_attestation", "target_version": 4},
+            {"phase": "migrate_lane_lifecycle", "target_version": 11},
             {"phase": "migrate_startup_transaction", "target_version": 2},
+            {"phase": "rebuild_launch_generation", "target_version": 2},
             {"phase": "exact_runtime_install"},
             {"phase": "legacy_lane_epoch_adoption", "targets": []},
             {"phase": "top_restore_action_bootstrap", "assigned_names": [top]},
@@ -315,6 +327,53 @@ class OfflineRolloutActionTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.reason, "owner_approval_invalid")
 
+    def test_plan_numeric_versions_require_exact_int_not_bool_or_float(self) -> None:
+        mutations = (
+            lambda plan: plan.__setitem__("schema_version", True),
+            lambda plan: plan.__setitem__("schema_version", 4.0),
+            lambda plan: plan["stores"]["lane_lifecycle"].__setitem__(
+                "target_version", 11.0
+            ),
+            lambda plan: plan["stores"]["launch_generation"].__setitem__(
+                "version", True
+            ),
+            lambda plan: plan["schema_transitions"][0].__setitem__(
+                "from_version", 1.0
+            ),
+            lambda plan: next(
+                phase for phase in plan["phase_order"]
+                if phase["phase"] == "migrate_lane_lifecycle"
+            ).__setitem__("target_version", 11.0),
+        )
+        for mutate in mutations:
+            plan = json.loads(json.dumps(self.plan))
+            mutate(plan)
+            with self.assertRaises(OfflineRolloutActionError):
+                verify_plan(plan, canonical_digest(plan))
+
+    def test_action_envelope_is_closed_and_schema_version_is_exact_int(self) -> None:
+        action = new_action(
+            action_id="offline_" + "a" * 32,
+            plan=self.plan,
+            plan_digest=self.digest,
+            approval_pointer="14838:97999",
+            private_bindings={},
+            now="2026-08-11T00:00:00+00:00",
+        )
+        mutations = (
+            lambda row: row.__setitem__("schema_version", True),
+            lambda row: row.__setitem__("schema_version", 1.0),
+            lambda row: row.__setitem__("extra", "unsupported"),
+            lambda row: row.pop("updated_at"),
+        )
+        for mutate in mutations:
+            candidate = json.loads(json.dumps(action))
+            mutate(candidate)
+            with self.subTest(candidate=candidate), self.assertRaises(
+                OfflineRolloutActionError
+            ):
+                validate_action(candidate)
+
     def _delegate(self, ops: FakeOps):
         result = delegate_offline_rollout(
             plan=self.plan,
@@ -351,6 +410,39 @@ class OfflineRolloutActionTests(unittest.TestCase):
         encoded = json.dumps(status.as_payload())
         self.assertNotIn("/private/", encoded)
         self.assertEqual(status.payload["completed_phases"], expected)
+
+    def test_terminal_pin_is_private_0600_and_never_renders_publicly(self) -> None:
+        sentinel = "terminal-id-must-never-render"
+
+        class TerminalOps(FakeOps):
+            def capture_private_bindings(self, **kwargs):
+                return PhaseExecutionResult(True, receipt={
+                    "workspace_paths": {"ws": "/private/ws", "other": "/private/other"},
+                    "agents": [{
+                        "assigned_name": "mzb1_ws_codex_default",
+                        "workspace_id": "ws", "lane_id": "default",
+                        "provider": "codex", "locator": "w:p1",
+                        "terminal_id": sentinel,
+                    }],
+                    "target_cli": "/private/bin/mozyo-bridge",
+                    "pipx": "/private/bin/pipx",
+                })
+
+        ops = TerminalOps()
+        action_id = self._delegate(ops)
+        store = OfflineRolloutActionStore(self.home)
+        directory = store.action_directory(action_id)
+        record = directory / "action.json"
+        self.assertEqual(store.root.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(record.stat().st_mode & 0o777, 0o600)
+        self.assertIn(sentinel, json.dumps(store.load(action_id)))
+        self.assertNotIn(sentinel, repr(PhaseExecutionResult(
+            True, receipt={"terminal_id": sentinel}
+        )))
+        public = status_offline_rollout_action(action_id=action_id, home=self.home)
+        self.assertNotIn(sentinel, repr(public))
+        self.assertNotIn(sentinel, json.dumps(public.as_payload(), sort_keys=True))
 
     def test_duplicate_delegate_of_one_plan_cannot_launch_a_second_runner(self) -> None:
         ops = FakeOps()

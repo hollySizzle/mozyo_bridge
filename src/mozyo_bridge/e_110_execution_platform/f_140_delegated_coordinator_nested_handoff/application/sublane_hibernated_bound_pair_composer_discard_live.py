@@ -104,6 +104,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_NAME,
     _agent_locator,
+    terminal_identity_of_live_slot,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_prepare_readonly_projection import (
     SnapshotQuarantineOps as _SnapshotQuarantineOps,
@@ -152,6 +153,7 @@ class _ComposerDiscardActuatorPort(_BoundPairActuatorPort):
                 observation,
                 self.expectation,
                 transaction.participants,
+                rows=rows,
                 require_attested_roles=require_attested_roles,
             )
         except Exception:  # noqa: BLE001 - every unreadable edge is zero effect
@@ -387,6 +389,7 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
         expectation: PreparationExpectation,
         participant: ParticipantPin,
         *,
+        rows: Sequence[Mapping[str, object]],
         require_attestation: bool = False,
     ) -> bool:
         slot = next(
@@ -425,6 +428,9 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
         join = evaluate_attestation(
             record,
             live_locator=slot.locator,
+            live_terminal_id=terminal_identity_of_live_slot(
+                slot.assigned_name, slot.locator, rows
+            ),
             expected_workspace_id=observation.workspace_id,
             expected_role=slot.provider,
             expected_lane=request.lane,
@@ -437,6 +443,9 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
                 record,
                 action_id=norm(expectation.action_id),
                 live_locator=slot.locator,
+                live_terminal_id=terminal_identity_of_live_slot(
+                    slot.assigned_name, slot.locator, rows
+                ),
                 expected_workspace_id=observation.workspace_id,
                 expected_role=slot.provider, expected_lane=request.lane,
                 expected_assigned_name=slot.assigned_name,
@@ -451,6 +460,7 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
         expectation: PreparationExpectation,
         participants: Sequence[ParticipantPin],
         *,
+        rows: Sequence[Mapping[str, object]],
         require_attested_roles: Sequence[str] = (),
     ) -> tuple[str, ...]:
         exact_attestation = set(require_attested_roles)
@@ -463,6 +473,7 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
                 observation,
                 expectation,
                 pin,
+                rows=rows,
                 require_attestation=pin.role in exact_attestation,
             )
         )
@@ -601,11 +612,18 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
             lane=request.lane,
             action_id=action_id,
         )
-
     def observe(
-        self, request: PrepareBoundPairRequest, *, action_id: str = ""
+        self, request: PrepareBoundPairRequest, *, action_id: str = "",
+        _snapshot_rows: Sequence[Mapping[str, object]] | None = None,
     ) -> PreparationObservation:
-        base = super().observe(_convergence_request(request), action_id=action_id)
+        try:
+            rows = tuple(_snapshot_rows) if _snapshot_rows is not None else tuple(list_herdr_agent_rows(self.env))
+        except Exception:  # noqa: BLE001
+            rows = ()
+            base = super().observe(_convergence_request(request), action_id=action_id)
+        else:
+            base = super().observe(_convergence_request(request), action_id=action_id,
+                                   _snapshot_rows=rows)
         # With an action id the base projects the slots this action already closed; that proof
         # is what lets the role still owed keep its discard authority on a replay (j#80934).
         action_closed = _action_closed_providers(base.slots)
@@ -620,6 +638,7 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
                 provider=slot.provider,
                 assigned_name=slot.assigned_name,
                 locator=slot.locator,
+                rows=rows,
                 action_closed_roles=action_closed,
             ):
                 discard.append(slot.role)
@@ -756,12 +775,19 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
         except Exception as exc:  # noqa: BLE001
             return PreparationDrive(False, "transaction_conflict", type(exc).__name__)
 
-        current = self.observe(request, action_id=expectation.action_id if existing else "")
+        try:
+            rows = tuple(list_herdr_agent_rows(self.env))
+        except Exception as exc:  # noqa: BLE001
+            return PreparationDrive(False, "inventory_unreadable", type(exc).__name__)
+        current = self.observe(
+            request, action_id=expectation.action_id if existing else "",
+            _snapshot_rows=rows,
+        )
         if not self._observation_matches(request, current, expectation):
             return PreparationDrive(False, "transaction_conflict", "approval-bound observation changed")
         if existing is not None:
             progress = self._progress_proven_roles(
-                request, current, expectation, existing.participants
+                request, current, expectation, existing.participants, rows=rows
             )
             if not self._progress_snapshot_matches(
                 request,
@@ -846,6 +872,7 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
                 # the same authority.
                 workspace_id=initial.workspace_id,
                 lane_id=request.lane,
+                live_rows=rows,
             )
             if planning.refused:
                 # Before plan_transaction: no row, no supersede, no actuation.
@@ -947,7 +974,9 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
             # Inherited from LiveBoundPairConvergenceOps — the discard rail closes and
             # relaunches through the same actuator, so it needs the same pre-close fence
             # (Redmine #14756 j#96848).
-            store_admission=self.store_admission,
+            store_admission=lambda key, pin: self.store_admission(
+                key, pin, repo_root=Path(request.worktree)
+            ),
             evidence_completion=build_update_evidence_completion(
                 self.transaction_store.path.parent
             ),

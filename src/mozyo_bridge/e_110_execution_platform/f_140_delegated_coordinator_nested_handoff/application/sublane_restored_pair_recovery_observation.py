@@ -47,6 +47,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     decode_assigned_name,
     derive_lane_workspace_token,
     encode_assigned_name,
+    terminal_identity_of_live_slot,
 )
 
 _STATUS_KEYS = ("agent_status", "status", "state")
@@ -157,6 +158,9 @@ class LiveRestoredPairObservation:
             attestation_state = evaluate_attestation(
                 attestation,
                 live_locator=observed_locator,
+                live_terminal_id=terminal_identity_of_live_slot(
+                    assigned_name, observed_locator, rows
+                ),
                 expected_workspace_id=workspace_id,
                 expected_role=provider,
                 expected_lane=lane,

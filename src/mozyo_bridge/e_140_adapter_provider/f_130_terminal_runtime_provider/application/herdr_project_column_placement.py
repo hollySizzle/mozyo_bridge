@@ -144,6 +144,7 @@ class HerdrProjectColumnPlacement(ProjectColumnAdjustmentMixin):
             role=pane.role,
             lane_id=pane.lane_id,
             locator=pane.locator,
+            live_terminal_id=pane.terminal_id,
             norm=_norm,
             norm_lane=_norm_lane,
         )

@@ -272,9 +272,11 @@ class ResumeTargetResolver:
         from mozyo_bridge.core.state.lane_lifecycle_model import ProcessGenerationPin
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
             _agent_locator,
+            terminal_identity_of_live_slot,
         )
 
-        row = _live_row_for(self.inventory(env), target.target_assigned_name)
+        rows = self.inventory(env)
+        row = _live_row_for(rows, target.target_assigned_name)
         if row is None:
             return None
         live_locator = str(_agent_locator(row)).strip()
@@ -314,6 +316,9 @@ class ResumeTargetResolver:
             join = evaluate_attestation(
                 self.attestation_read(target.target_assigned_name),
                 live_locator=live_locator,
+                live_terminal_id=terminal_identity_of_live_slot(
+                    target.target_assigned_name, live_locator, rows
+                ),
                 expected_workspace_id=target.workspace_id,
                 expected_role=target.provider_id,
                 expected_lane=target.lane_id,

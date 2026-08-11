@@ -114,12 +114,42 @@ def build_attestation_joins(
     durable *self*-attestation the agent wrote at boot, never a live-env read.
     """
     joins: dict[str, AttestationJoin] = {}
-    if not view.ok or not view.workspace_segment:
+    if (
+        not view.ok
+        or not view.workspace_segment
+        or view.raw_row_count is None
+        or view.invalid_row_count != 0
+        or view.raw_row_count != len(view.agents)
+        or any(
+            type(agent.terminal_id) is not str
+            or not agent.terminal_id
+            or agent.terminal_id.strip() != agent.terminal_id
+            for agent in view.agents
+        )
+    ):
         return joins
-    for agent in view.workspace_agents():
+    agents = view.workspace_agents()
+    all_agents = tuple(view.agents)
+    multiplicity: dict[str, int] = {}
+    locator_multiplicity: dict[str, int] = {}
+    terminal_multiplicity: dict[str, int] = {}
+    for agent in all_agents:
+        multiplicity[agent.name] = multiplicity.get(agent.name, 0) + 1
+        locator_multiplicity[agent.locator] = locator_multiplicity.get(agent.locator, 0) + 1
+        terminal_multiplicity[agent.terminal_id] = (
+            terminal_multiplicity.get(agent.terminal_id, 0) + 1
+        )
+    for agent in agents:
         joins[agent.name] = evaluate_attestation(
             reader(agent.name),
             live_locator=agent.locator,
+            live_terminal_id=(
+                agent.terminal_id
+                if multiplicity.get(agent.name) == 1
+                and locator_multiplicity.get(agent.locator) == 1
+                and terminal_multiplicity.get(agent.terminal_id) == 1
+                else None
+            ),
             expected_workspace_id=agent.workspace_id,
             expected_role=agent.role,
             expected_lane=agent.lane_id,
@@ -229,6 +259,26 @@ def evaluate_herdr_section(
         section["status"] = "warning"
         section["notes"].append(_WORKSPACE_SEGMENT_WARNING)
         section["next_action"].append(_WORKSPACE_SEGMENT_NEXT_ACTION)
+        return section
+
+    inventory_identity_incomplete = (
+        view.raw_row_count is None
+        or view.invalid_row_count != 0
+        or view.raw_row_count != len(view.agents)
+        or any(
+            type(agent.terminal_id) is not str
+            or not agent.terminal_id
+            or agent.terminal_id.strip() != agent.terminal_id
+            for agent in view.agents
+        )
+    )
+    if inventory_identity_incomplete:
+        section["status"] = "warning"
+        section["notes"].append(
+            "live terminal identity inventory is incomplete or malformed; startup "
+            "self-attestation cannot be joined unambiguously"
+        )
+        section["next_action"].append(_ATTESTATION_NEXT_ACTION)
         return section
 
     if not view.workspace_agents():

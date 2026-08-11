@@ -93,8 +93,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     WorkerRefreshObservation,
     WorkerTurnObservation,
 )
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_epoch import (  # noqa: E501
-    replacement_store_admission as _replacement_store_admission,
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_replacement_launch_admission import (  # noqa: E501
+    replacement_managed_launch_admission as _replacement_store_admission,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (  # noqa: E501
     RUNTIME_AWAITING_INPUT,
@@ -250,6 +250,10 @@ class LiveWorkerRefreshOps:
         return _replacement_store_admission(
             key.workspace_id,
             pin.lane_id,
+            repo_root=self.repo_root,
+            env=self.env,
+            runner=self.runner,
+            timeout=self.timeout,
             lifecycle_home=str(self.lifecycle_home) if self.lifecycle_home else "",
             attestation_home=str(self.attestation_home) if self.attestation_home else "",
         )
@@ -491,7 +495,28 @@ class LiveWorkerRefreshOps:
             rec, request=self.request, repo_root=self.repo_root,
             attestation_home=self.attestation_home,
             pin_revision=self.request.worker_revision,
+            live_terminal_id=self._live_terminal_identity(),
         )
+
+    def _record_generation_bound(self, rec) -> bool:
+        return _gen_authority.record_generation_bound(
+            rec, request=self.request, repo_root=self.repo_root,
+            attestation_home=self.attestation_home,
+            pin_revision=self.request.worker_revision,
+            live_terminal_id=self._live_terminal_identity(),
+        )
+
+    def _live_terminal_identity(self):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            terminal_identity_of_live_slot,
+        )
+
+        try:
+            return terminal_identity_of_live_slot(
+                self.request.assigned_name, self.request.locator, self._rows()
+            )
+        except Exception:  # noqa: BLE001 - unreadable/ambiguous inventory fails closed
+            return None
 
     def _anchor_bound(self, request: WorkerRefreshRequest) -> bool:
         """Is this observation bound to a resolvable EXACT durable anchor? (#14661)
@@ -535,7 +560,7 @@ class LiveWorkerRefreshOps:
             return WorkerTurnObservation()  # unresolvable binding => unobservable
         anchor_bound = self._anchor_bound(request)
         record = self._anchor_delivery_record(worker_provider) if anchor_bound else None
-        delivery_confirmed = record is not None
+        delivery_confirmed = record is not None and self._record_generation_bound(record)
         turn_started = record is not None and self._record_observed_turn_start(record)
         row = self._pinned_row(request)
         settled = row is not None and _row_runtime_state(row) in (
@@ -788,11 +813,11 @@ class LiveWorkerRefreshOps:
         read as this refresh's fresh worker on both the send and the confirm edge.
 
         The one-shot rail never had that gap because it passes ``target_action_id`` and
-        :class:`LiveRecoveryAnchorDeliveryService` verifies the action binding (native-v2
-        ``replacement_action_id`` equality, or the v1 side-binding store). This routes the
+        :class:`LiveRecoveryAnchorDeliveryService` verifies the terminal-bound v4 direct
+        ``replacement_action_id`` equality. This routes the
         governed rail through that SAME public authority — ``preflight`` re-runs every
         read-only action gate without injecting or writing — instead of re-implementing the
-        v1/v2 branch here and letting the two drift.
+        current-authority rule here and letting the two drift.
         """
         request = self._delivery_request(continuation, locator, worker_provider)
         if request is None:
@@ -870,17 +895,14 @@ class LiveWorkerRefreshOps:
         worker_provider, _gateway = self._providers()
         if not worker_provider:
             return False
-        fresh_observed_at = self._fresh_attestation_observed_at()
-        if not fresh_observed_at:
-            return False
-        fresh_locator = self._fresh_worker_locator()
-        if not fresh_locator or fresh_locator == _norm(self.request.locator):
+        boundary = self._fresh_attestation_identity()
+        if boundary is None or boundary.locator == _norm(self.request.locator):
             return False
         # The timestamp boundary below is necessary but NOT sufficient as a generation
         # identity (#14203 j#87445: two same-second launches share ``observed_at``). Require
         # the fresh slot to be attested for THIS replacement action as well, so a recycled
         # slot's delivery is never confirmed as this refresh's resume (j#92487 F3).
-        if not self._fresh_slot_action_bound(continuation, fresh_locator, worker_provider):
+        if not self._fresh_slot_action_bound(continuation, boundary.locator, worker_provider):
             return False
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
             RedmineAnchor,
@@ -914,28 +936,27 @@ class LiveWorkerRefreshOps:
                 and _norm(rec.receiver) == worker_provider
                 and _norm(rec.provider) in ("", worker_provider)
                 and _norm(rec.backend) == "herdr"
-                and _norm(rec.target) == fresh_locator
+                and _norm(rec.target) == boundary.locator
                 and _norm(rec.status) == "sent"
                 and _norm(rec.reason) == "ok"
-                and _recorded_after(rec.recorded_at, fresh_observed_at)
+                and _recorded_after(rec.recorded_at, boundary.observed_at)
+                and boundary.matches_delivery(rec)
             ):
                 return True
         return False
 
-    def _fresh_attestation_observed_at(self) -> str:
-        from mozyo_bridge.core.state.herdr_identity_attestation import (
-            HerdrIdentityAttestationStore,
-        )
-
+    def _fresh_attestation_identity(self):
         try:
-            record = HerdrIdentityAttestationStore(home=self.attestation_home).read(
-                _norm(self.request.assigned_name)
+            from .herdr_live_attestation_time import fresh_attestation_identity
+            rows = self._rows()
+            return fresh_attestation_identity(
+                home=self.attestation_home, rows=rows,
+                assigned_name=self.request.assigned_name,
+                workspace_id=repo_scope_workspace_id(self.repo_root),
+                role=self.request.provider, lane=self.request.lane,
             )
-        except Exception:  # noqa: BLE001 - unreadable attestation => no boundary
-            return ""
-        if record is None:
-            return ""
-        return _norm(getattr(record, "observed_at", ""))
+        except Exception:  # noqa: BLE001 - unreadable authority fails closed
+            return None
 
 
 __all__ = (

@@ -62,7 +62,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     parse_changed_effect,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
-    _close_base_pane,
     _invoke,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_result import (  # noqa: E501
@@ -577,28 +576,13 @@ def order_is_deferred(anchor_provider: str, effective_order: "Sequence[str]") ->
 def _reclaim_root_panes(
     result, *, binary: str, runner: Runner, timeout: float, env: Optional[Mapping[str, str]]
 ) -> None:
-    """Close the empty root panes this run created (Redmine #13330 / #13411).
-
-    Relocated verbatim from the session-start composition root. Reclaim runs only after
-    EVERY launch succeeded (a launch failure raised before the caller reached here, so
-    reaching this point means all agents are live and the workspace / tab is safe to keep
-    with just its agent panes). Close only the exact root pane ids this run captured; a
-    close failure is non-fatal cosmetic residue. The workspace base pane (#13330) and the
-    lane tab root pane (#13411) are distinct handles — reclaim each independently, never
-    one guessed for the other.
-    """
+    """Preserve generation-unbound cosmetic roots (#15227 j#103467)."""
     if result.base_pane_id:
-        reclaimed, detail = _close_base_pane(
-            binary, result.base_pane_id, runner, timeout, env
-        )
-        result.base_pane_reclaimed = reclaimed
-        result.base_pane_detail = detail
+        result.base_pane_reclaimed = False
+        result.base_pane_detail = "generation_unproven_root_preserved"
     if result.tab_pane_id:
-        reclaimed, detail = _close_base_pane(
-            binary, result.tab_pane_id, runner, timeout, env
-        )
-        result.tab_pane_reclaimed = reclaimed
-        result.tab_pane_detail = detail
+        result.tab_pane_reclaimed = False
+        result.tab_pane_detail = "generation_unproven_root_preserved"
 
 
 def _read_layout(

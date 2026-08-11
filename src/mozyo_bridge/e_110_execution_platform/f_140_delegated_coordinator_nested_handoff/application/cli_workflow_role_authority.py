@@ -39,7 +39,7 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (
     BINDINGS_FILENAME,
@@ -192,6 +192,7 @@ def _live_attestation_layer(workspace_id: str, provider: str) -> dict:
             _agent_locator,
             _norm_lane,
             decode_assigned_name,
+            terminal_identity_of_live_slot,
         )
 
         rows = list_herdr_agent_rows(os.environ)
@@ -203,7 +204,7 @@ def _live_attestation_layer(workspace_id: str, provider: str) -> dict:
     assigned_name = ""
     locator = ""
     for row in rows or ():
-        if not isinstance(row, dict):
+        if not isinstance(row, Mapping):
             continue
         decode = decode_assigned_name(row.get(AGENT_KEY_NAME))
         if not getattr(decode, "ok", False) or decode.identity is None:
@@ -238,7 +239,11 @@ def _live_attestation_layer(workspace_id: str, provider: str) -> dict:
     )
 
     ok, state, reason = live_attestation_join(
-        assigned_name, locator=locator, workspace_id=workspace_id, provider=provider
+        assigned_name,
+        locator=locator,
+        terminal_id=terminal_identity_of_live_slot(assigned_name, locator, rows),
+        workspace_id=workspace_id,
+        provider=provider,
     )
     return {
         "status": "attested" if ok else "unattested",

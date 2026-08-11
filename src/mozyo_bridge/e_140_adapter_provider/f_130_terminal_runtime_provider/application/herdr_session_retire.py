@@ -1,33 +1,10 @@
-"""Public guarded retirement of a session-start scratch pair (Redmine #13892).
+"""Public guarded retirement of a session-start scratch pair (#13892).
 
-The inverse of ``herdr session-start``. ``session-start`` mints an exact Claude/Codex pair
-whose only durable identity is its herdr assigned name; it writes no lane lifecycle record,
-so every recorded-lane retirement surface refuses it structurally and the pair leaks
-capacity forever (live evidence: #13882 j#80060 / j#80066 — a preserved ``dogfood13882``
-pair no public rail could retire, which blocked that ticket's F4 retry).
-
-This module is the impure half of that surface: it resolves the exact pair from durable
-identity, observes the unit at action time, asks the pure
-:func:`...domain.scratch_pair_retire.decide_scratch_pair_retire` for a verdict, and — only
-on a green verdict — closes the resolved locators and records the durable outcome.
-
-It **composes reviewed parts** rather than re-deriving them (the #13847 pattern):
-
-- ``plan_herdr_retire_close`` purely as a **unit scoper** (never for its own close targets):
-  it is what fixes the targeted unit to this lane and structurally excludes the project
-  workspace's default-lane coordinator pair and every other lane (#13377);
-- ``expected_slot_rows`` — the RAW scan, read alongside the plan. The aggregated
-  ``expected_live_slots`` role-set is deliberately NOT the authority here: it drops
-  unexpected occupants, duplicate multiplicity and locator-less rows, so an empty aggregate
-  means "no expected role is live", never "the unit is empty" (#13845 review j#80148);
-- ``execute_herdr_retire_close`` — the reviewed, per-target non-fatal ``herdr pane close``,
-  driven with the **verdict's** pin-matched targets (the #13842 ``pin_matched_close_plan``
-  shape), so nothing outside the decided set can ever be closed.
-
-Boundaries this surface keeps: no lifecycle row is ever created (acceptance 4 — a row minted
-to pass a retire is fabrication, refused by #13882 j#80066); no store is mutated; no
-worktree / branch is removed; no process is launched or resumed; no raw herdr / tmux is
-driven by the caller. The only mutation is the pin-matched close of this pair's own slots.
+The pair has no lane lifecycle record. The rail scopes its exact unit, closes only
+current-generation pins, and records completion only after terminal-bound positive
+absence. It never creates lifecycle authority, mutates a worktree/branch, launches a
+process, or lets the caller drive raw Herdr; its only process mutation is the guarded
+close of this pair's own slots.
 """
 
 from __future__ import annotations
@@ -42,6 +19,7 @@ from typing import Mapping, Optional, Protocol, Sequence
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_retire_ops import (  # noqa: E501
     LiveSessionRetireOps,
     SessionRetireOps,
+    completed_retirement_replay_proven,
     observe_scratch_pair,
 )
 from mozyo_bridge.core.state.scratch_retirement_fence import (  # noqa: E501
@@ -94,62 +72,27 @@ REASON_LANE_IS_DEFAULT = "lane_is_default"
 REASON_PROVIDER_UNRESOLVED = "provider_unresolved"
 REASON_IDENTITY_UNENCODABLE = "identity_unencodable"
 REASON_CLOSE_FAILED = "close_failed"
-#: A durable obligation is owed to one of this pair's slots (Redmine #13892 review j#80506 F4).
-#: A reserved / uncertain dispatch-outbox row means a send took the write lock against that
-#: assigned name and its fate is unresolved. A runtime ``idle`` / ``turn_ended`` reading cannot
-#: rule this out: receiver state and durable obligation are different axes, and the workflow
-#: contract forbids promoting a runtime signal into a gate verdict.
+#: A durable obligation is owed to one of this pair's slots.
 REASON_WORK_OBLIGATION_PRESENT = "work_obligation_present"
-#: The durable obligation store could not be read. Not observing an obligation is not the same
-#: as there being none, so this fails closed rather than closing over unknown owed work.
+#: The durable obligation store could not be read.
 REASON_OBLIGATION_UNREADABLE = "obligation_unreadable"
-#: The post-close re-measure found the targeted unit still occupied (Redmine #13892 review
-#: j#80506 F3). A close command's return code is not proof the unit is empty; capacity is
-#: recovered only when the panes are actually gone.
 REASON_POST_CLOSE_RESIDUE = "post_close_residue"
-#: The post-close re-measure could not read a fresh inventory, so the unit's emptiness — the
-#: whole point of the retire — is unproven. The closes that committed are still reported.
 REASON_POST_CLOSE_UNREADABLE = "post_close_unreadable"
-#: Zero expected slots are live, but nothing proves THIS command retired them (Redmine #13892
-#: review j#80506 F1). A mistyped ``--lane`` and a never-launched pair are indistinguishable
-#: from a completed retire by absence alone, so absence is refused rather than celebrated.
 REASON_RETIRE_EVIDENCE_ABSENT = "retire_evidence_absent"
-#: Another retirement transaction holds this unit. Zero-close; never wait, never steal.
 REASON_RETIREMENT_BUSY = "retirement_busy"
-#: The retirement authority is unavailable / unprovable (damaged artifacts, unknown schema,
-#: seal mismatch, or a zero-slot run over an absent store). Fail closed (j#80526).
 REASON_RETIREMENT_AUTHORITY_UNAVAILABLE = "retirement_authority_unavailable"
-#: The close committed but the fence completion write failed. NOT a success — but the closes
-#: that committed are reported truthfully, and the next run repairs from the pending attempt.
 REASON_COMPLETION_UNPROVEN = "completion_unproven"
-#: The surface's own signature (the unit has no lifecycle record) was lost mid-flight
-#: (Redmine #13892 review j#80523 R2-F3). Re-verified before the completion, never assumed.
 REASON_SIGNATURE_LOST = "signature_lost"
-#: A pending attempt's pinned slot is live at a DIFFERENT locator: the assigned name matches
-#: but the process does not, so it is a relaunched pair the old attempt cannot close
-#: (Redmine #13892 review j#80523 R3-F2).
 REASON_PIN_DRIFT = "pin_drift"
-#: The only opt-in that may discard unsent composer input is a strict Redmine
-#: ``ISSUE:JOURNAL`` pointer. Missing / malformed authority stays zero-close (#13918).
 REASON_COMPOSER_DISCARD_APPROVAL_INVALID = "composer_discard_approval_invalid"
-#: A pending destructive attempt may only resume under byte-identical verified evidence.
 REASON_COMPOSER_DISCARD_APPROVAL_MISMATCH = "composer_discard_approval_mismatch"
-#: A historical ``issue_<id>_...`` lane may only use an approval from that same issue.
 REASON_COMPOSER_DISCARD_ISSUE_MISMATCH = "composer_discard_issue_mismatch"
-#: Historical worktree evidence is action-time authority, never a caller assertion.
 REASON_HISTORICAL_WORKTREE_UNREADABLE = "historical_worktree_unreadable"
 REASON_HISTORICAL_WORKTREE_DIRTY = "historical_worktree_dirty"
 REASON_HISTORICAL_BRANCH_MISMATCH = "historical_branch_mismatch"
 
-#: The idempotent replay: this exact unit was proven retired by a prior run and no expected
-#: slot is live now. Exit 0 (design j#80526 rejects an effect-only exit 1).
 STATE_ALREADY_RETIRED = "already_retired"
 
-#: The managed-event kinds this surface appends as its durable retirement outcome. It is
-#: an audit record, NOT lifecycle authority — capacity is recovered by the panes ceasing to
-#: exist (``enumerate_active_lanes`` folds live panes; a record-less unit has disposition
-#: ``None`` and stays in the roster until its panes are gone), so this record explains a
-#: retirement rather than causing one.
 EVENT_COMMAND = "herdr session-retire"
 EVENT_KIND_RETIRED = "scratch_pair_retired"
 
@@ -338,7 +281,9 @@ def run_session_retire(
             expected_names=expected_names,
         )
 
-    live_ops = ops or LiveSessionRetireOps(repo_root=resolved_root)
+    live_ops = ops or LiveSessionRetireOps(
+        repo_root=resolved_root, home=getattr(args, "home", None)
+    )
     historical = _ISSUE_LANE_RE.match(lane_id)
     if approval is not None and historical is not None:
         lane_issue = historical.group(1)
@@ -408,12 +353,38 @@ def run_session_retire(
     # The ISSUE:JOURNAL CLI value is only a locator.  Read the attempt first without writing,
     # choose the exact current/pending pins, then require a fresh credentialed Redmine read of
     # one structured owner approval for THIS unit.  No reserve or close occurs before this.
-    prior_hint = None
-    if approval is not None or not execute:
-        try:
-            prior_hint = live_ops.peek_retirement(unit)
-        except ScratchRetirementFenceError as exc:
-            return _blocked(REASON_RETIREMENT_AUTHORITY_UNAVAILABLE, str(exc), **base)
+    try:
+        prior_hint = live_ops.peek_retirement(unit)
+    except ScratchRetirementFenceError as exc:
+        return _blocked(REASON_RETIREMENT_AUTHORITY_UNAVAILABLE, str(exc), **base)
+
+    generation_pins = None
+    if pair_is_live:
+        if prior_hint is not None and prior_hint.pending:
+            if (
+                prior_hint.pin_version != 2
+                or not prior_hint.generation_pins
+                or not live_ops.current_generation_pins_replayable(
+                    workspace_id, lane_id, prior_hint.generation_pins
+                )
+            ):
+                return _blocked(
+                    REASON_PIN_DRIFT,
+                    "the pending retirement lacks replayable terminal-bound generation "
+                    "authority; nothing was written or closed",
+                    **base,
+                )
+        else:
+            generation_pins = live_ops.current_generation_pins(
+                workspace_id, lane_id, live_targets
+            )
+            if generation_pins is None:
+                return _blocked(
+                    REASON_PIN_DRIFT,
+                    "the live pair lacks exact v4/completed-v2 generation authority; "
+                    "nothing was written or closed",
+                    **base,
+                )
 
     approval_evidence: Optional[ComposerDiscardApprovalEvidence] = None
     if approval is not None:
@@ -484,6 +455,14 @@ def run_session_retire(
 
             if not pair_is_live:
                 if prior is not None and prior.completed:
+                    if not completed_retirement_replay_proven(
+                        live_ops, prior, workspace_id, lane_id
+                    ):
+                        return _blocked(
+                            REASON_POST_CLOSE_RESIDUE,
+                            "completed retirement lacks fresh generation-bound absence proof",
+                            **base,
+                        )
                     try:
                         prior_token = _attempt_approval_token(prior)
                     except ComposerDiscardApprovalError as exc:
@@ -509,6 +488,19 @@ def run_session_retire(
                 if prior is not None and prior.pending:
                     # A crash after the close but before the completion. Repair it: re-measure
                     # the whole unit and, if provably empty, finish the attempt (F2 repair).
+                    if (
+                        prior.pin_version != 2
+                        or not prior.generation_pins
+                        or not live_ops.current_generation_pins_absent(
+                            workspace_id, lane_id, prior.generation_pins
+                        )
+                    ):
+                        return _blocked(
+                            REASON_PIN_DRIFT,
+                            "the pending attempt is legacy or its terminal-bound generation "
+                            "is not positively absent; zero-close",
+                            **base,
+                        )
                     return _finish_retirement(
                         live_ops,
                         txn,
@@ -536,13 +528,32 @@ def run_session_retire(
             # dispatch could reserve in the gap and nothing told it to stop.
             if prior is not None and prior.pending:
                 attempt = prior
+                if (
+                    prior.pin_version != 2
+                    or not prior.generation_pins
+                    or not live_ops.current_generation_pins_replayable(
+                        workspace_id, lane_id, prior.generation_pins
+                    )
+                ):
+                    return _blocked(
+                        REASON_PIN_DRIFT,
+                        "the pending retirement carries legacy tokenless pins; zero-close",
+                        **base,
+                    )
                 plan = _resume_plan(prior, live_by_role, base)
                 if isinstance(plan, SessionRetireVerdict):
                     return plan
                 remaining = plan
             else:
+                if generation_pins is None:
+                    return _blocked(
+                        REASON_PIN_DRIFT,
+                        "the retirement authority changed after its read-only generation "
+                        "preflight; nothing was reserved or closed",
+                        **base,
+                    )
                 attempt = txn.reserve(
-                    pinned=live_targets,
+                    pinned=generation_pins,
                     approval_evidence=(
                         approval_evidence.canonical_json()
                         if approval_evidence is not None
@@ -558,24 +569,22 @@ def run_session_retire(
             if blocked is not None:
                 return blocked
 
-            if not remaining:
-                # Every pinned slot is already positively gone: nothing left to close.
-                return _finish_retirement(
-                    live_ops,
-                    txn,
-                    attempt=attempt,
+            result = live_ops.close_current_generations(
+                workspace_id, lane_id, attempt.generation_pins
+            )
+            if result is None:
+                return _blocked(
+                    REASON_PIN_DRIFT,
+                    "the terminal-bound retirement pins no longer match one complete fresh "
+                    "generation snapshot; zero-close",
                     closed=attempt.closed,
-                    workspace_id=workspace_id,
-                    lane_id=lane_id,
-                    expected_roles=expected_roles,
-                    expected_names=expected_names,
-                    base=base,
-                    repaired=True,
+                    **base,
                 )
-
-            result = live_ops.close(workspace_id, lane_id, remaining)
             closed = tuple(attempt.closed) + tuple(getattr(result, "closed", ()) or ())
-            failed = tuple(getattr(result, "failed", ()) or ())
+            failed = tuple(
+                (role, locator, "provider close failed")
+                for role, locator, *_detail in (getattr(result, "failed", ()) or ())
+            )
             if closed:
                 txn.record_progress(attempt_id=attempt.attempt_id, closed=closed)
             if failed:
@@ -643,23 +652,7 @@ def _approval_retry_refusal(prior, *, approval_evidence, base):
 
 
 def _resume_plan(attempt, live_by_role, base):
-    """The exact slots a RESUMED attempt may close, or a blocked verdict. (R3-F2)
-
-    A resumed attempt's authority is its own ``pinned`` locators — never the pair that happens
-    to be live now. herdr assigned names are deterministic in ``(workspace, role, lane)``, so a
-    relaunched pair occupies the SAME names at NEW locators; closing "whatever is live at those
-    names" would destroy a running pair on the strength of an old attempt (review j#80523 R3-F2,
-    reproduced: pins %1/%2, live %11/%22 -> the old attempt closed the new pair).
-
-    Each still-open pin is therefore one of exactly three things:
-
-    - **live at its pinned locator** — this attempt's own slot: closable;
-    - **positively absent** (its name resolves to no live slot) — a prior run already closed
-      it, or it died: nothing to do, and NOT a block (that is what makes a partial close
-      replayable);
-    - **live at a DIFFERENT locator** — a relaunch at the same name. The attempt has no
-      authority over it, and silently re-pinning would be exactly the destruction above.
-    """
+    """Resume exact pinned locators; absence skips and locator reuse blocks."""
     already = set(attempt.closed)
     remaining: list[tuple[str, str]] = []
     drifted: list[str] = []
@@ -699,6 +692,14 @@ def _preflight_verdict(
     """The read-only verdict: report what an execute WOULD do, writing nothing."""
     if not pair_is_live:
         if prior is not None and prior.completed:
+            if not completed_retirement_replay_proven(
+                live_ops, prior, workspace_id, base["lane_id"]
+            ):
+                return _blocked(
+                    REASON_POST_CLOSE_RESIDUE,
+                    "completed retirement lacks fresh generation-bound absence proof",
+                    **base,
+                )
             return SessionRetireVerdict(
                 state=STATE_ALREADY_RETIRED,
                 detail="this exact pair is proven retired and no slot is live",
@@ -737,7 +738,6 @@ def _preflight_verdict(
         executed=False,
         **base,
     )
-
 
 
 def _obligation_refusal(live_ops, workspace_id, expected_names, base):
@@ -843,6 +843,21 @@ def _finish_retirement(
     blocked = _obligation_refusal(live_ops, workspace_id, expected_names, base)
     if blocked is not None:
         return replace(blocked, closed=closed, executed=True)
+    if (
+        attempt.pin_version != 2
+        or not attempt.generation_pins
+        or not live_ops.current_generation_pins_absent(
+            workspace_id, lane_id, attempt.generation_pins
+        )
+    ):
+        return SessionRetireVerdict(
+            state=STATE_BLOCKED,
+            reason=REASON_POST_CLOSE_RESIDUE,
+            detail="the terminal-bound generation is not positively absent; completion withheld",
+            closed=closed,
+            executed=True,
+            **base,
+        )
 
     try:
         completed = txn.mark_completed(

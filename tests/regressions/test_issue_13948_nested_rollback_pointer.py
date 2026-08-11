@@ -50,6 +50,7 @@ from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding impo
     HerdrIdentityReplacementBindingStore,
 )
 from tests.support.current_launch_authority import (  # noqa: E402
+    seed_completed_current_generation,
     seed_current_generation,
 )
 from mozyo_bridge.core.state.replacement_preservation import PreservationObservation
@@ -112,6 +113,11 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     encode_assigned_name,
+)
+from mozyo_bridge.core.state.herdr_identity_attestation import (
+    HerdrIdentityAttestationStore,
+    IdentityAttestationRecord,
+    VERDICT_PRESENT,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_health import (  # noqa: E501
     COMPENSATION_NOT_NEEDED,
@@ -284,6 +290,13 @@ class _RollbackOps:
             self.rows = [r for r in self.rows if r.get("pane_id") != locator]
         return _CloseResult(closed=list(targets))
 
+    def close_current_generation(self, action, targets, *, store_home):
+        return self.close(action.unit.workspace_id, action.unit.lane_id, targets)
+
+    def current_generation_targets_absent(self, action, targets, *, store_home):
+        live = {row.get("pane_id") for row in self.rows}
+        return all(locator not in live for _role, locator in targets)
+
 
 class RealDriveWiringTest(unittest.TestCase):
     """Item 1/2/4 end-to-end through the REAL drive, then the REAL public rollback rail.
@@ -302,7 +315,7 @@ class RealDriveWiringTest(unittest.TestCase):
         # launch-generation row, and this lane is a pre-#14741 one -- stated for the exact
         # slots the observation carries rather than left absent (which now refuses).
         for slot in self.obs.slots:
-            seed_current_generation(
+            seed_completed_current_generation(
                 self.home, workspace_id=WS, lane_id=LANE, role=slot.provider,
                 assigned_name=slot.assigned_name, locator=slot.locator,
             )
@@ -323,13 +336,25 @@ class RealDriveWiringTest(unittest.TestCase):
             ),
         )
         self.fence.set_phase(action.action_id, PHASE_ROLLBACK_OWED)
+        seed_current_generation(
+            self.home, workspace_id=WS, lane_id=LANE, role="claude",
+            assigned_name=self.assigned, locator=self.fresh_locator,
+            action_id=action.action_id, terminal_id="terminal:claude",
+        )
+        HerdrIdentityAttestationStore(home=self.home).upsert(
+            IdentityAttestationRecord(
+                self.assigned, WS, "claude", LANE, self.fresh_locator,
+                VERDICT_PRESENT, observed_at="2026-08-11T00:00:00+00:00",
+                terminal_id="terminal:claude",
+            )
+        )
 
     def _real_ops(self):
         outer = self
 
         class _Ops(compdisclive.LiveBoundPairPreparationOps):
             # Only the three pure external reads are overridden; drive/actuator/heal are real.
-            def observe(self, request, *, action_id=""):
+            def observe(self, request, *, action_id="", _snapshot_rows=None):
                 return outer.obs
 
             def approval_fields(self, issue, journal):
@@ -357,33 +382,39 @@ class RealDriveWiringTest(unittest.TestCase):
         def _nolock(*a, **k):
             yield
 
-        def _fenced_nested_launch(**_kwargs):
+        def _fenced_nested_launch(*_args, **_kwargs):
             # The nested pane launch came up dead: fail closed carrying the raw result, exactly
             # as the real `session-start` -> v1 adapter would (this is the ONLY seam a live
             # herdr backend would own). heal_lane_column's REAL catch projects it downstream.
-            raise V1ReplacementBindingFailure(
-                "fenced", "nested unhealthy",
-                startup_result=_unhealthy_result(
-                    action_id=self.action_id, assigned=self.assigned,
-                    locator=self.fresh_locator,
-                ),
+            return _unhealthy_result(
+                action_id=self.action_id, assigned=self.assigned,
+                locator=self.fresh_locator,
             )
 
         not_preserved = PreservationObservation(
             dirty_diff=False, running_process=False, pending_approval=False,
             identity_matches=True, attestation_fresh=True,
         )
+        inventory = [
+            {
+                "name": slot.assigned_name,
+                "pane_id": slot.locator,
+                "agent": slot.provider,
+                "terminal_id": f"terminal:{slot.locator}",
+            }
+            for slot in self.obs.slots
+        ]
         port = compdisclive._ComposerDiscardActuatorPort
         with contextlib.ExitStack() as stack:
             for target, name, value in [
-                (compdisclive, "list_herdr_agent_rows", lambda env: []),
-                (convlive, "list_herdr_agent_rows", lambda env: []),
+                (compdisclive, "list_herdr_agent_rows", lambda env: list(inventory)),
+                (convlive, "list_herdr_agent_rows", lambda env: list(inventory)),
                 (herdr_ops, "evaluate_heal_runtime_fence",
                  lambda *a, **k: SimpleNamespace(ok=True, reason="", detail="")),
                 (v1_drive, "selected_attestation_store_is_v1", lambda home: True),
                 (v1_drive, "attestation_store_lock", _nolock),
                 (herdr_ops, "mozyo_bridge_home", lambda: self.home),
-                (v1_drive, "launch_or_resume_v1_replacement", _fenced_nested_launch),
+                (convlive, "replacement_managed_launch_admission", lambda *a, **k: None),
             ]:
                 stack.enter_context(mock.patch.object(target, name, value))
             for cls, name, value in [
@@ -393,6 +424,8 @@ class RealDriveWiringTest(unittest.TestCase):
                 (herdr_ops.HerdrSublaneActuatorOps, "_resolve_lane_slots",
                  lambda self, wt, rows, managed=None: (
                      WS, LANE, {"codex": ("", ""), "claude": ("", "")})),
+                (herdr_ops.HerdrSublaneActuatorOps, "_prepare_lane_session",
+                 _fenced_nested_launch),
                 (port, "observe_old_slot", lambda self, pin: OLD_SLOT_PRESENT),
                 (port, "observe_preservation", lambda self, pin: not_preserved),
                 (port, "close_exact_generation", lambda self, pin: CLOSE_DONE),
@@ -431,6 +464,7 @@ class RealDriveWiringTest(unittest.TestCase):
         rows = [{
             "name": self.assigned, "pane_id": self.fresh_locator,
             "agent": "claude", "agent_status": "idle",
+            "terminal_id": "terminal:claude",
         }]
         preflight = run_session_rollback(
             action_id=action_id, ops=_RollbackOps(rows),
@@ -485,6 +519,18 @@ class V1ReplacementBindingRollbackRailTest(unittest.TestCase):
             ),
         )
         startup_fence.set_phase(action.action_id, PHASE_ROLLBACK_OWED)
+        seed_current_generation(
+            self.home, workspace_id=WS, lane_id=LANE, role="claude",
+            assigned_name=self.assigned, locator=self.FRESH_LOCATOR,
+            action_id=action.action_id, terminal_id="terminal:claude",
+        )
+        HerdrIdentityAttestationStore(home=self.home).upsert(
+            IdentityAttestationRecord(
+                self.assigned, WS, "claude", LANE, self.FRESH_LOCATOR,
+                VERDICT_PRESENT, observed_at="2026-08-11T00:00:00+00:00",
+                terminal_id="terminal:claude",
+            )
+        )
         return _unhealthy_result(
             action_id=action.action_id, assigned=self.assigned, locator=self.FRESH_LOCATOR,
         )
@@ -506,6 +552,7 @@ class V1ReplacementBindingRollbackRailTest(unittest.TestCase):
         return [{
             "name": self.assigned, "pane_id": self.FRESH_LOCATOR,
             "agent": "claude", "agent_status": "idle",
+            "terminal_id": "terminal:claude",
         }]
 
     def test_public_rollback_then_replay_converges_to_a_new_action_id(self):

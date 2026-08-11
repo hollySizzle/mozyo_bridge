@@ -194,7 +194,7 @@ def _row(workspace_id: str, provider: str, locator: str = "w3:p1") -> dict:
     }
 
 
-def _attested(_name, *, locator, workspace_id, provider):
+def _attested(_name, *, locator, terminal_id, workspace_id, provider):
     return True, "ok", "startup self-attestation present and generation-matched"
 
 

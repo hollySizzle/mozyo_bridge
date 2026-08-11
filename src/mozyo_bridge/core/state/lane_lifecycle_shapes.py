@@ -48,6 +48,7 @@ _V7_ADDS = frozenset({"lane_kind"})  # #13647 generation-bound lane-role heal au
 _V8_ADDS = frozenset({"hibernated_at"})  # #14477 immutable resume-freshness boundary
 _V9_ADDS = frozenset({"release_observation"})  # #14477 j#94582 release-observation authority
 _V10_ADDS = frozenset({"lane_epoch"})  # #14756 monotonic hibernate-generation epoch
+_V11_ADDS = frozenset({"reconcile_close_pin"})  # #15227 generation-bound owed close
 
 #: The EXACT allowed column-name signatures per recorded version (Redmine #13754 R6-F1,
 #: j#78803). A recognized store must match one of its version's signatures EXACTLY (set
@@ -67,6 +68,7 @@ _SHAPE_V7 = _SHAPE_V6 | _V7_ADDS
 _SHAPE_V8 = _SHAPE_V7 | _V8_ADDS
 _SHAPE_V9 = _SHAPE_V8 | _V9_ADDS
 _SHAPE_V10 = _SHAPE_V9 | _V10_ADDS
+_SHAPE_V11 = _SHAPE_V10 | _V11_ADDS
 _ALLOWED_SHAPES_BY_VERSION: dict[int, tuple[frozenset, ...]] = {
     1: (_SHAPE_V1,),
     2: (_SHAPE_V2,),
@@ -78,6 +80,7 @@ _ALLOWED_SHAPES_BY_VERSION: dict[int, tuple[frozenset, ...]] = {
     8: (_SHAPE_V8,),
     9: (_SHAPE_V9,),
     10: (_SHAPE_V10,),
+    11: (_SHAPE_V11,),
 }
 
 #: The authority-affecting definition each column MUST carry: ``(type, notnull, default,
@@ -108,6 +111,7 @@ _COLUMN_DEFS: dict[str, tuple[str, int, Optional[str], int]] = {
     "lane_generation": ("INTEGER", 1, "1", 0),
     "declared_slots": ("TEXT", 1, "''", 0),
     "reconcile_phase": ("TEXT", 1, "''", 0),
+    "reconcile_close_pin": ("TEXT", 1, "''", 0),
     "lane_kind": ("TEXT", 1, "''", 0),
     "hibernated_at": ("TEXT", 1, "''", 0),
     "release_observation": ("TEXT", 1, "''", 0),

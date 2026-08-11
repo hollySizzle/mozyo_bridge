@@ -42,7 +42,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 _RUN_TIMEOUT = 120.0
 _INSTALL_TIMEOUT = 600.0
 
-
 def _ok(**receipt) -> PhaseExecutionResult:
     return PhaseExecutionResult(ok=True, receipt=receipt)
 
@@ -131,31 +130,17 @@ class LiveOfflineRolloutExecutionPort:
             inventory = read_herdr_inventory(self.repo_root, env=self.env)
         except Exception as exc:  # noqa: BLE001
             return _fail("private_binding_capture_failed", type(exc).__name__)
-        if not inventory.ok or inventory.invalid_row_count != 0:
-            return _fail("inventory_unreadable", inventory.reason or "")
+        from .herdr_offline_inventory_identity import private_agent_bindings
         wanted_workspaces = {
             row["workspace_id"] for row in plan.get("workspaces", ())
         }
         by_workspace = {record.workspace_id: record for record in records}
         if set(by_workspace) != wanted_workspaces:
             return _fail("workspace_set_drift")
-        wanted_agents = {row["assigned_name"] for row in plan.get("agents", ())}
-        current_agents = {agent.name for agent in inventory.managed_agents}
-        if current_agents != wanted_agents or inventory.unmanaged_agents:
-            return _fail("agent_set_drift")
-        agents = []
-        for agent in inventory.managed_agents:
-            if not agent.locator:
-                return _fail("agent_locator_unreadable", agent.name)
-            agents.append(
-                {
-                    "assigned_name": agent.name,
-                    "workspace_id": agent.workspace_id,
-                    "lane_id": agent.lane_id,
-                    "provider": agent.role,
-                    "locator": agent.locator,
-                }
-            )
+        captured_agents = private_agent_bindings(inventory, plan)
+        if not captured_agents.ok:
+            return captured_agents
+        agents = list(captured_agents.receipt["agents"])
         merged = merge_legacy_recovery_agent_bindings(plan=plan, agents=agents)
         if not merged.ok:
             return merged
@@ -425,6 +410,7 @@ class LiveOfflineRolloutExecutionPort:
             "migrate_attestation": self._migrate_attestation,
             "migrate_lane_lifecycle": self._migrate_lane_lifecycle,
             "migrate_startup_transaction": self._migrate_startup_transaction,
+            "rebuild_launch_generation": self._rebuild_launch_generation,
             "exact_runtime_install": self._exact_runtime_install,
             "legacy_lane_epoch_adoption": lambda _p, action, _d, *, replaying=False: adopt_legacy_lanes(home=self.home, targets=action["plan"].get("legacy_recoveries", ()), replaying=bool(replaying)),  # noqa: E501
             "top_restore_action_bootstrap": self._restore_agents,
@@ -441,6 +427,7 @@ class LiveOfflineRolloutExecutionPort:
                 "migrate_attestation",
                 "migrate_lane_lifecycle",
                 "migrate_startup_transaction",
+                "rebuild_launch_generation",
                 "legacy_lane_epoch_adoption",
             }:
                 return handler(
@@ -556,12 +543,17 @@ class LiveOfflineRolloutExecutionPort:
                 return recovered_wip
         for name in names:
             view = self._inventory(action)
-            if not view.ok or view.invalid_row_count != 0 or view.unmanaged_agents:
+            from .herdr_offline_inventory_identity import private_inventory_current
+            if not private_inventory_current(view, bindings):
                 return _fail("inventory_unreadable")
             matches = [agent for agent in view.managed_agents if agent.name == name]
             if not matches:
                 continue
-            if len(matches) != 1 or matches[0].locator != bindings[name]["locator"]:
+            if (
+                len(matches) != 1
+                or matches[0].locator != bindings[name]["locator"]
+                or matches[0].terminal_id != bindings[name]["terminal_id"]
+            ):
                 return _fail("agent_generation_drift", name)
             result = execute_herdr_retire_close(
                 HerdrRetireClosePlan(
@@ -575,7 +567,10 @@ class LiveOfflineRolloutExecutionPort:
             if result.failed:
                 return _fail("agent_close_failed", name)
         view = self._inventory(action)
-        live = {agent.name for agent in view.managed_agents} if view.ok else set(names)
+        from .herdr_offline_inventory_identity import private_inventory_current
+        if not private_inventory_current(view, bindings):
+            return _fail("inventory_unreadable")
+        live = {agent.name for agent in view.managed_agents}
         if any(name in live for name in names):
             return _fail("agent_stop_unverified")
         return _ok(stopped_assigned_names=sorted(names), wip_preserved=True)
@@ -596,7 +591,8 @@ class LiveOfflineRolloutExecutionPort:
         paths = self._bindings(action)["workspace_paths"]
         while True:
             view = self._inventory(action)
-            if not view.ok or view.invalid_row_count != 0 or view.unmanaged_agents:
+            from .herdr_offline_inventory_identity import private_inventory_current
+            if not private_inventory_current(view, bindings):
                 return _fail("inventory_unreadable")
             current = {agent.name: agent for agent in view.managed_agents}
             pending = []
@@ -605,7 +601,11 @@ class LiveOfflineRolloutExecutionPort:
                 if agent is None:
                     continue
                 binding = bindings.get(name)
-                if binding is None or agent.locator != binding["locator"]:
+                if (
+                    binding is None
+                    or agent.locator != binding["locator"]
+                    or agent.terminal_id != binding["terminal_id"]
+                ):
                     return _fail("agent_generation_drift", name)
                 if agent.runtime_state not in (
                     RUNTIME_AWAITING_INPUT,
@@ -690,6 +690,11 @@ class LiveOfflineRolloutExecutionPort:
         startup_digest = artifact_digest_of(startup)
         if not startup_digest:
             return _fail("startup_backup_readback_failed")
+        from .herdr_offline_rollout_generation_rebuild import backup_launch_generation
+        launch = backup_launch_generation(
+            home=self.home, backup_root=backup_root, planned=expected["launch_generation"], observe=lambda: self._fresh_store_records()["launch_generation"])
+        if not launch.ok:
+            return launch
         proofs = prepare_store_migration_proofs(
             action_directory=action_directory,
             store_paths={
@@ -704,6 +709,7 @@ class LiveOfflineRolloutExecutionPort:
             state_backup=bool(state),
             startup_backup=True,
             startup_backup_digest=startup_digest,
+            **launch.receipt,
             migration_post_digests=proofs.receipt["migration_post_digests"],
         )
 
@@ -800,14 +806,23 @@ class LiveOfflineRolloutExecutionPort:
             expected_plan_digest=expected,
             completion_receipt=completion,
         )
-        if result.schema_version != 2:
+        if type(result.schema_version) is not int or result.schema_version != 2:
             return _fail("startup_migration_unverified")
         return _ok(
             outcome=result.outcome,
             to_version=result.schema_version,
             artifact_digest=result.artifact_digest or completion.artifact_digest,
         )
-
+    def _rebuild_launch_generation(self, _phase, action, _directory, *, replaying=False):
+        """Backup-first v1 cache reset; restore repopulates terminal-bound v2 rows."""
+        from .herdr_offline_rollout_generation_rebuild import rebuild_launch_generation
+        planned = action["plan"]["stores"]["launch_generation"]
+        return rebuild_launch_generation(
+            home=self.home, backup_root=_directory / "backups", planned=planned,
+            observe=lambda: self._fresh_store_records()["launch_generation"],
+            backup_receipt=action.get("phase_receipts", {}).get("verified_backup", {}),
+            replaying=replaying,
+        )
     def _exact_runtime_install(self, _phase, action, _directory):
         bindings = self._bindings(action)
         runner = bindings["runner"]
@@ -885,28 +900,16 @@ class LiveOfflineRolloutExecutionPort:
             return verified
         return _ok(restored_assigned_names=sorted(names), startup_action_ids=action_ids)
 
-    def _verify_live_names(self, action, names):
-        from mozyo_bridge.core.state.herdr_identity_attestation import (
-            HerdrIdentityAttestationStore,
-            VERDICT_PRESENT,
-        )
-
+    def _verify_live_names(self, action, names, *, exact_roster=False):
+        from .herdr_offline_restore_verification import verify_restored_names
         view = self._inventory(action)
-        if not view.ok or view.invalid_row_count != 0 or view.unmanaged_agents:
-            return _fail("restore_inventory_unreadable")
-        live = {agent.name: agent for agent in view.managed_agents}
-        store = HerdrIdentityAttestationStore(home=self.home)
-        for name in names:
-            agent = live.get(name)
-            record = store.read(name)
-            if (
-                agent is None
-                or not agent.locator
-                or record is None
-                or record.verdict != VERDICT_PRESENT
-                or record.locator != agent.locator
-            ):
-                return _fail("restore_attestation_unverified", name)
+        ok, name = verify_restored_names(
+            view=view, names=names, home=self.home, exact_roster=exact_roster)
+        if not ok:
+            return (
+                _fail("restore_attestation_unverified", name)
+                if name else _fail("restore_inventory_unreadable")
+            )
         return _ok(live_names_verified=True)
 
     def _supervisor_install(self, _phase, action, _directory):
@@ -961,12 +964,17 @@ class LiveOfflineRolloutExecutionPort:
             for recovery in action["plan"].get("legacy_recoveries", ())
             for agent in recovery.get("agents", ())
         )
-        live = self._verify_live_names(action, expected)
+        live = self._verify_live_names(action, expected, exact_roster=True)
         if not live.ok:
             return live
         stores = self._fresh_store_records()
-        targets = {"attestation": 3, "lane_lifecycle": 10, "startup_transaction": 2}
-        if any(stores[name]["version"] != version for name, version in targets.items()):
+        targets = {
+            "attestation": 4, "lane_lifecycle": 11,
+            "launch_generation": 2, "startup_transaction": 2,
+        }
+        if any(stores[n]["state"] != "recognized" or type(stores[n]["version"]) is not int
+               or stores[n]["version"] != v
+               for n, v in targets.items()):
             return _fail("final_store_version_mismatch")
         supervisors = self._supervisor_readback({}, action, _directory)
         if not supervisors.ok:

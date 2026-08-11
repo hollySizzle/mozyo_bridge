@@ -14,11 +14,16 @@ from typing import Mapping, Sequence
 
 from mozyo_bridge.core.state.herdr_identity_attestation import (
     HerdrIdentityAttestationStore,
+    VERDICT_PRESENT,
     evaluate_attestation,
 )
 from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
     BINDING_RESERVED,
     HerdrIdentityReplacementBindingStore,
+)
+from mozyo_bridge.core.state.herdr_launch_generation import (
+    GENERATION_ATTESTED,
+    HerdrLaunchGenerationStore,
 )
 from mozyo_bridge.core.state.lane_lifecycle import norm
 from mozyo_bridge.core.state.startup_transaction_fence import (
@@ -56,6 +61,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _norm_lane as norm_lane,
     decode_assigned_name,
     encode_assigned_name,
+    terminal_identity_of_live_slot,
 )
 
 
@@ -78,7 +84,7 @@ def action_closed_providers(slots: Sequence[BoundSlot]) -> tuple[str, ...]:
     return tuple(slot.provider for slot in slots if slot.close_proven)
 
 
-def _exact_normal_v1_row(home, intent, live_locator: str) -> bool:
+def _exact_normal_v1_row(home, intent, live_locator: str, rows) -> bool:
     """True iff the live locator carries an exact, unbound normal-v1 attestation row."""
     try:
         record = HerdrIdentityAttestationStore(home=home).read(intent.assigned_name)
@@ -87,6 +93,9 @@ def _exact_normal_v1_row(home, intent, live_locator: str) -> bool:
     join = evaluate_attestation(
         record,
         live_locator=live_locator,
+        live_terminal_id=terminal_identity_of_live_slot(
+            intent.assigned_name, live_locator, rows
+        ),
         expected_workspace_id=intent.workspace_id,
         expected_role=intent.role,
         expected_lane=intent.lane_id,
@@ -108,10 +117,10 @@ def resolve_rollback_owed_startup_action(
     transaction ``rollback_owed``. The read-only preflight must both name that state and hand
     the operator the exact ``--action-id`` the public startup rollback rail needs; without it
     the rollback -> replay recovery chain has no entry point. Returns "" unless every conjunct
-    matches (the same ones the v1 bind requires: an un-closed participant receipt at the exact
-    live locator, a clean normal-v1 attestation row, the exact startup unit). The side binding
-    keyed by ``(action_id, assigned_name)`` is the proof this action owns the slot. Purely
-    read-only and fail-soft: any unreadable store yields "".
+    matches: an unclosed participant receipt at the exact live locator, terminal-bound v4
+    attestation, an attested generation-v2 row, and the exact rollback-owed startup unit.
+    Legacy side bindings remain readable diagnostic history and never grant current
+    authority. Purely read-only and fail-soft: any unreadable store yields "".
     """
     action_id = norm(action_id)
     workspace = norm(workspace)
@@ -129,16 +138,56 @@ def resolve_rollback_owed_startup_action(
         fence = StartupTransactionFence(home=home)
         for provider in providers:
             assigned_name = encode_assigned_name(workspace, provider, lane)
-            intent = binding_store.read(action_id, assigned_name)
-            if intent is None:
-                continue
+            current_record = HerdrIdentityAttestationStore(home=home).read(assigned_name)
+            direct = current_record is not None and norm(
+                current_record.replacement_action_id
+            ) == action_id
+            if direct:
+                intent = None
+                generation = HerdrLaunchGenerationStore(home=home).read(assigned_name)
+                record = current_record
+                if generation is None or record is None:
+                    continue
+                named = [row for row in rows if isinstance(row, Mapping)
+                         and norm(row.get(AGENT_KEY_NAME)) == norm(assigned_name)]
+                if len(named) != 1:
+                    continue
+                live_locator = _agent_locator(named[0])
+                terminal_id = terminal_identity_of_live_slot(
+                    assigned_name, live_locator, rows
+                )
+                joined = evaluate_attestation(
+                    record, live_locator=live_locator, live_terminal_id=terminal_id,
+                    expected_workspace_id=workspace, expected_role=provider,
+                    expected_lane=lane,
+                )
+                if not (
+                    joined.ok and norm(record.replacement_action_id) == action_id
+                    and generation.phase == GENERATION_ATTESTED
+                    and generation.verdict == VERDICT_PRESENT
+                    and generation.assigned_name == assigned_name
+                    and generation.workspace_id == workspace
+                    and norm(generation.role) == norm(provider)
+                    and norm(generation.lane_id) == norm(lane)
+                    and generation.locator == live_locator
+                    and generation.terminal_id == terminal_id
+                ):
+                    continue
+                expected_startup = generation.startup_action_id
+                old_locator = ""
+            else:
+                intent = binding_store.read(action_id, assigned_name)
+                if intent is None:
+                    continue
+                expected_startup = ""
+                old_locator = norm(intent.old_locator)
             # Mirror the authoritative bind path's exact identity + unit join
             # (herdr_session_start_v1_replacement_binding._binding_identity_matches, review
             # j#82084 F1): the stored binding is trusted only when its immutable identity is
             # this exact unit AND its startup id re-derives from that unit + the reserved
             # nonce. A binding whose stored workspace/role/lane, or whose startup unit, belongs
             # to another generation must never lend its startup id to a rollback aimed here.
-            if (
+            if intent is not None and (
                 intent.phase != BINDING_RESERVED
                 or norm(intent.workspace_id) != workspace
                 or norm(intent.role) != norm(provider)
@@ -148,7 +197,7 @@ def resolve_rollback_owed_startup_action(
                 continue
             try:
                 # Redmine #14741 j#96917: capability-aware re-derivation (see the helper).
-                expected_startup = startup_action_id_matching(
+                expected_startup = expected_startup or startup_action_id_matching(
                     StartupUnit(workspace, lane, managed_pair),
                     intent.startup_nonce,
                     intent.startup_action_id,
@@ -157,7 +206,7 @@ def resolve_rollback_owed_startup_action(
                 continue
             if not expected_startup:
                 continue
-            if norm(intent.startup_action_id) != expected_startup:
+            if intent is not None and norm(intent.startup_action_id) != expected_startup:
                 continue
             named = [
                 row
@@ -167,7 +216,7 @@ def resolve_rollback_owed_startup_action(
             if len(named) != 1:
                 continue
             live_locator = _agent_locator(named[0])
-            if not live_locator or live_locator == norm(intent.old_locator):
+            if not live_locator or (old_locator and live_locator == old_locator):
                 continue
             startup = fence.read(expected_startup)
             if (
@@ -176,21 +225,25 @@ def resolve_rollback_owed_startup_action(
                 or startup.action_id != expected_startup
                 or norm(startup.unit.workspace_id) != workspace
                 or norm(startup.unit.lane_id) != norm(lane)
-                or tuple(startup.unit.providers) != tuple(sorted(set(managed_pair)))
+                or not startup.unit.providers
+                or provider not in startup.unit.providers
+                or not set(startup.unit.providers).issubset(set(managed_pair))
             ):
                 continue
-            owed = startup.participant_for(intent.role)
+            owed = startup.participant_for(provider)
             if (
                 owed is None
                 or owed.closed
-                or owed.assigned_name != intent.assigned_name
+                or owed.assigned_name != assigned_name
                 or owed.locator != live_locator
                 or not owed.receipt
             ):
                 continue
-            if not _exact_normal_v1_row(home, intent, live_locator):
+            if intent is not None and not _exact_normal_v1_row(
+                home, intent, live_locator, rows
+            ):
                 continue
-            return intent.startup_action_id
+            return expected_startup
     except Exception:  # noqa: BLE001 - a read-only projection is fail-soft
         return ""
     return ""

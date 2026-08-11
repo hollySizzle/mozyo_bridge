@@ -58,6 +58,7 @@ ROLE = "codex"
 LANE = "issue_x_lane"
 LOCATOR = "w:3"
 NAME = "gw"
+TERMINAL = "terminal:w:3"
 
 
 def _tmp() -> Path:
@@ -99,7 +100,7 @@ def _seed_generation(
     if finalize:
         store.finalize(
             assigned_name=name, startup_action_id=token, workspace_id=workspace,
-            role=role, lane_id=lane, locator=locator, verdict=verdict,
+            role=role, lane_id=lane, locator=locator, terminal_id=TERMINAL, verdict=verdict,
             observed_at="2026-07-24T17:00:00+00:00",
         )
 
@@ -108,7 +109,7 @@ def _token_for(home: Path, *, name=NAME, role=ROLE, lane=LANE, locator=LOCATOR,
                workspace=WS) -> str:
     return verified_generation_token(
         home, assigned_name=name, workspace_id=workspace, role=role, lane_id=lane,
-        locator=locator, norm=_norm, norm_lane=_norm_lane,
+        locator=locator, live_terminal_id=TERMINAL, norm=_norm, norm_lane=_norm_lane,
     )
 
 
@@ -311,6 +312,7 @@ class R4LateFinalizeCasRejected(unittest.TestCase):
         with self.assertRaises(HerdrLaunchGenerationError):
             store.finalize(assigned_name=NAME, startup_action_id="startup-A",
                            workspace_id=WS, role=ROLE, lane_id=LANE, locator=LOCATOR,
+                           terminal_id=TERMINAL,
                            verdict=VERDICT_PRESENT, observed_at="t")
         row = store.read(NAME)
         self.assertEqual((row.phase, row.startup_action_id), (GENERATION_PENDING, "startup-B"))
@@ -323,7 +325,8 @@ class R4LateFinalizeCasRejected(unittest.TestCase):
         with self.assertRaises(HerdrLaunchGenerationError):
             store.finalize(assigned_name=NAME, startup_action_id="startup-A",
                            workspace_id="OTHER-WS", role=ROLE, lane_id=LANE,
-                           locator=LOCATOR, verdict=VERDICT_PRESENT, observed_at="t")
+                           locator=LOCATOR, terminal_id=TERMINAL,
+                           verdict=VERDICT_PRESENT, observed_at="t")
 
 
 class R5SameSecondAba(unittest.TestCase):
@@ -372,6 +375,7 @@ class R6ReturnEqualsDb(unittest.TestCase):
         attested = store.finalize(
             assigned_name=NAME, startup_action_id="startup-A", workspace_id=WS,
             role=ROLE, lane_id=LANE, locator=LOCATOR, verdict=VERDICT_PRESENT,
+            terminal_id=TERMINAL,
             observed_at="2026-07-24T17:00:00+00:00",
         )
         self.assertEqual(attested.phase, GENERATION_ATTESTED)
@@ -390,7 +394,8 @@ class R7DiagnosticOnlyEvents(unittest.TestCase):
     def _attestation(self, **over):
         base = dict(
             assigned_name=NAME, role=ROLE, workspace_id=WS, lane_id=LANE,
-            locator=LOCATOR, verdict=VERDICT_PRESENT, observed_at="obs-1",
+            locator=LOCATOR, terminal_id=TERMINAL,
+            verdict=VERDICT_PRESENT, observed_at="obs-1",
         )
         base.update(over)
         return SimpleNamespace(**base)
@@ -417,6 +422,7 @@ class R7DiagnosticOnlyEvents(unittest.TestCase):
         finalize_launch_generations(
             store_home=home, startup_action_id=token, slots=[self._slot()],
             workspace_id=WS, lane_id=LANE, attestation_read=lambda n: self._attestation(),
+            inventory_rows=[{"name": NAME, "pane_id": LOCATOR, "terminal_id": TERMINAL}],
         )
         self.assertEqual(HerdrLaunchGenerationStore(home=home).read(NAME).phase,
                          GENERATION_ATTESTED)
@@ -434,6 +440,7 @@ class R7DiagnosticOnlyEvents(unittest.TestCase):
         finalize_launch_generations(
             store_home=home, startup_action_id=token, slots=[self._slot()],
             workspace_id=WS, lane_id=LANE, attestation_read=lambda n: None,  # NO attestation
+            inventory_rows=[{"name": NAME, "pane_id": LOCATOR, "terminal_id": TERMINAL}],
         )
         self.assertEqual(HerdrLaunchGenerationStore(home=home).read(NAME).phase,
                          GENERATION_PENDING)
@@ -451,6 +458,7 @@ class R7DiagnosticOnlyEvents(unittest.TestCase):
         finalize_launch_generations(
             store_home=home, startup_action_id=token, slots=[self._slot()],
             workspace_id=WS, lane_id=LANE, attestation_read=lambda n: self._attestation(),
+            inventory_rows=[{"name": NAME, "pane_id": LOCATOR, "terminal_id": TERMINAL}],
         )
         self.assertEqual(HerdrLaunchGenerationStore(home=home).read(NAME).phase,
                          GENERATION_PENDING)
@@ -472,6 +480,7 @@ class R7DiagnosticOnlyEvents(unittest.TestCase):
         finalize_launch_generations(
             store_home=home, startup_action_id=token, slots=[self._slot()],
             workspace_id=WS, lane_id=LANE, attestation_read=lambda n: self._attestation(),
+            inventory_rows=[{"name": NAME, "pane_id": LOCATOR, "terminal_id": TERMINAL}],
         )
         self.assertEqual(HerdrLaunchGenerationStore(home=home).read(NAME).phase,
                          GENERATION_PENDING)
@@ -591,9 +600,10 @@ class R9RebuildableCacheRecovery(unittest.TestCase):
     rebuild — it never bricks future launches, and never repairs implicitly."""
 
     def _view(self, *, live=(), ok=True, backend=True):
-        agents = tuple(SimpleNamespace(name=n) for n in live)
+        agents = tuple(SimpleNamespace(name=n, terminal_id=f"terminal:{n}") for n in live)
         return SimpleNamespace(
             backend_selected=backend, ok=ok, managed_agents=agents,
+            agents=agents, raw_row_count=len(agents), invalid_row_count=0,
             reason="unreadable", detail="probe failed",
         )
 
@@ -717,9 +727,10 @@ class R10RebuildAtomicityAndLock(unittest.TestCase):
     backup-first, and reports side-effect truth — a mature rail, not a raw quarantine."""
 
     def _view(self, *, live=(), ok=True, backend=True):
-        agents = tuple(SimpleNamespace(name=n) for n in live)
+        agents = tuple(SimpleNamespace(name=n, terminal_id=f"terminal:{n}") for n in live)
         return SimpleNamespace(
             backend_selected=backend, ok=ok, managed_agents=agents,
+            agents=agents, raw_row_count=len(agents), invalid_row_count=0,
             reason="unreadable", detail="probe failed",
         )
 
@@ -830,9 +841,10 @@ class R11RealMultiProcessAndSidecar(unittest.TestCase):
     before the injected failure — not an in-process lock-primitive stub."""
 
     def _view(self, *, live=(), ok=True, backend=True):
-        agents = tuple(SimpleNamespace(name=n) for n in live)
+        agents = tuple(SimpleNamespace(name=n, terminal_id=f"terminal:{n}") for n in live)
         return SimpleNamespace(
             backend_selected=backend, ok=ok, managed_agents=agents,
+            agents=agents, raw_row_count=len(agents), invalid_row_count=0,
             reason="unreadable", detail="probe failed",
         )
 

@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.vanished_gateway_recovery import (  # noqa: E501
     OUTCOME_LEGACY_DIRECT,
@@ -99,11 +99,22 @@ def _pointers(anchor: RequestAnchor):
     return decision, continuation
 
 
-def _current_generation(home: Optional[Path], authority: ParticipantAuthority):
+def _current_generation(home: Optional[Path], authority: ParticipantAuthority, live_rows):
     """The participant's own current launch-generation row, or a typed refusal."""
     from mozyo_bridge.core.state.herdr_launch_generation import (
+        completed_generation_startup_token,
         GENERATION_ATTESTED,
         HerdrLaunchGenerationStore,
+    )
+    from mozyo_bridge.core.state.herdr_identity_attestation import VERDICT_PRESENT
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+        AGENT_KEY_NAME,
+        AGENT_KEY_TERMINAL_ID,
+        _agent_locator,
+        _norm,
+        _norm_lane,
+        terminal_identity_of_row,
+        terminal_identity_snapshot_complete,
     )
 
     try:
@@ -127,6 +138,35 @@ def _current_generation(home: Optional[Path], authority: ParticipantAuthority):
     if getattr(row, "phase", None) != GENERATION_ATTESTED:
         return refuse(
             REFUSE_GENERATION_MISMATCH, "the current launch generation is not attested"
+        )
+    if (
+        getattr(row, "verdict", None) != VERDICT_PRESENT
+        or completed_generation_startup_token(
+            home, row, norm=_norm, norm_lane=_norm_lane
+        ) != row.startup_action_id
+    ):
+        return refuse(
+            REFUSE_GENERATION_MISMATCH,
+            "the vanished generation lacks exact completed startup authority",
+        )
+    if not terminal_identity_snapshot_complete(live_rows):
+        return refuse(
+            REFUSE_GENERATION_MISMATCH,
+            "the live inventory contains malformed terminal identity evidence",
+        )
+    claims = [
+        candidate for candidate in live_rows
+        if isinstance(candidate, Mapping)
+        and (
+            candidate.get(AGENT_KEY_NAME) == authority.assigned_name
+            or _agent_locator(candidate) == authority.old_locator
+            or candidate.get(AGENT_KEY_TERMINAL_ID) == row.terminal_id
+        )
+    ]
+    if not row.terminal_id or claims:
+        return refuse(
+            REFUSE_GENERATION_MISMATCH,
+            "the vanished generation still has a live name, locator, or terminal claimant",
         )
     return row
 
@@ -355,7 +395,8 @@ def replay_explicit_recovery(
 
 
 def plan_fresh_recovery(
-    *, store_factory, home, anchor: RequestAnchor, authority: ParticipantAuthority
+    *, store_factory, home, anchor: RequestAnchor, authority: ParticipantAuthority,
+    live_rows,
 ) -> RecoveryPlan:
     """Classify a recovery from today's authority and, if it owes a receipt, plan it.
 
@@ -373,7 +414,7 @@ def plan_fresh_recovery(
     ):
         return RecoveryPlan(decision=refuse(REFUSE_REQUEST_INVALID, "not an exact request"))
 
-    generation = _current_generation(resolved_home, authority)
+    generation = _current_generation(resolved_home, authority, live_rows)
     if isinstance(generation, RecoveryDecision):
         return RecoveryPlan(decision=generation)
 
@@ -428,6 +469,8 @@ def plan_fresh_recovery(
         home=resolved_home,
         workspace_id=authority.workspace_id,
         lane_id=authority.lane_id,
+        allow_historical_absent=True,
+        live_rows=live_rows,
     )
     if planning.refused:
         return RecoveryPlan(

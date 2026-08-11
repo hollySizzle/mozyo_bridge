@@ -95,7 +95,16 @@ def _resolve_workspace_id_readonly(resolved_root: Path) -> str:
     )
 
 
+def resolve_workspace_id_if_registered(resolved_root: Path) -> str:
+    """Return an existing durable workspace id, or ``""`` without writing."""
+    try:
+        return _resolve_workspace_id_readonly(resolved_root)
+    except HerdrSessionStartError:
+        return ""
+
+
 __all__ = (
     "_lane_id_from_metadata",
     "_resolve_workspace_id_readonly",
+    "resolve_workspace_id_if_registered",
 )

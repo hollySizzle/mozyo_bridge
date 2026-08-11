@@ -67,6 +67,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_v1_replacement import (  # noqa: E501
     V1ReplacementDriver,
     V1ReplacementRequest,
+    require_replacement_target_healthy,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (
     LiveSublaneGitOperations,
@@ -92,7 +93,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SublaneLauncherIncompatibleError,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_identity_binding import (  # noqa: E501
-    finalize_lane_identity_receipts,
+    finalize_lane_receipts_from_inventory,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_relaunch_authority_fence import (  # noqa: E501
     fence_update_relaunch_or_die,
@@ -185,16 +186,16 @@ class HerdrSublaneActuatorOps:
     #: The #13806 tranche D replacement ``action_id`` a worker-recovery relaunch carries into
     #: the fresh process's startup self-attestation (empty on a normal heal = byte-invariant).
     replacement_action_id: str = ""
-    #: Exact immutable participant identity for the narrow v1 action-binding fallback
-    #: (Redmine #13933 R12). Empty on every normal create/heal.
+    #: Legacy diagnostic participant fields retained for reading old replacement debt.
+    #: They never authorize a current launch; v4 direct action + generation-v2 does.
     replacement_assigned_name: str = ""
     replacement_old_locator: str = ""
     #: The typed launch cause this actuator's relaunch carries (Redmine #14741 j#97171).
     #: Defaults to the UNARMED cause, so every existing create / heal / recover caller that
     #: omits it is byte-invariant and queries no updater.
     replacement_launch_cause: str = LAUNCH_CAUSE_GENERIC_FRESH
-    #: Recover-pair's explicit both-absent v1 mode: launch and receipt-bind only the exact
-    #: target provider. Default False preserves the pair-managed #13933 replacement path.
+    #: Historical target-only vocabulary retained for decoding old recovery intent.
+    #: Current launch admission still requires v4/v2 terminal-bound authority.
     replacement_target_only: bool = False
 
     # -- git probes / additive worktree add (backend-agnostic, reused verbatim) -----
@@ -414,7 +415,7 @@ class HerdrSublaneActuatorOps:
         # Redmine #14741 bracket 3 (j#96899 / C13): only HERE does the lane's lifecycle
         # row exist, so only here is there an actual generation/revision to bind to —
         # `prepare_session`'s own finalize runs strictly earlier (measured, j#97001).
-        finalize_lane_identity_receipts(store_home=mozyo_bridge_home(), result=result)
+        finalize_lane_receipts_from_inventory(store_home=mozyo_bridge_home(), result=result, env=self.env)
         return result
 
     def _launch_context(self):
@@ -670,8 +671,7 @@ class HerdrSublaneActuatorOps:
         if not verdict.ok:
             raise RuntimeError(f"lane heal fenced ({verdict.reason}): {verdict.detail}")
 
-        # Update-authority fence (Redmine #14741, j#96374 / j#96847). Still inside the
-        # pre-side-effect window, so a refusal is a ZERO-relaunch refusal.
+        # Update-authority fence: still inside the zero-relaunch pre-effect window.
         fence_update_relaunch_or_die(
             managed_pair,
             self.env,
@@ -711,7 +711,8 @@ class HerdrSublaneActuatorOps:
             )
         )
         if not used_v1_binding:
-            self.append_lane_column(worktree_path)
+            result = self._prepare_lane_session(worktree_path, providers=((target_provider,) if self.replacement_target_only and target_provider else None), pair_order=managed_pair)
+            require_replacement_target_healthy(result, self.replacement_action_id, target_provider, self.replacement_assigned_name)
 
         # Same-tab postcondition (Redmine #13705 R1-F3): the compatible heal must have
         # restored the gateway/worker pair in ONE `(herdr_workspace, tab_id)` container.
@@ -992,7 +993,6 @@ class HerdrSublaneActuatorOps:
                 target_repo=target_repo,
             )
         )
-
 
 __all__ = (
     "HERDR_LANE_PROVIDERS",

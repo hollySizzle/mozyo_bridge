@@ -28,9 +28,9 @@ policy ``rebuildable_cache``. It is **not** authority for workspace identity
 loss degrades *safely to fail-closed* (an absent record makes adopt refuse and
 doctor go non-green); it never promotes to a permission / liveness / identity
 verdict, and a stale record is never re-used as a live process's attestation — the
-generation is pinned by the **live locator** captured at write time (the only
-externally observable discriminant), and a read whose live locator no longer matches
-the recorded one is ``stale`` (Design Answer j#76462 refinement 2).
+generation is pinned by both the **live locator** and Herdr's server-owned terminal
+identity captured at write time. Either mismatch is ``stale``; a locator is reusable
+and therefore never sufficient by itself (Design Answer j#76462 refinement 2).
 
 **Privacy (refinement 3):** the record stores only the verdict token, the expected
 identity (workspace / role / lane / assigned name), the live locator, a
@@ -69,26 +69,23 @@ schema authority, so the dependency never points core -> provider.
 written by launchers of different vintages at once, so schema policy lives in
 :mod:`.herdr_identity_attestation_schema` and this module never compares versions
 itself. Reads are **read-compatible**: an older recognized shape is projected up to
-:data:`COLUMNS_V2` inside one pinned read transaction, so a v1 store's rows decode
-natively instead of reading as ``absent`` (the #13882 live evidence: 94 real rows that
-every downstream verify treated as unattested). Writes are **conservative**: a v1 store
-is written v1-shaped rather than migrated, because auto-migrating the shared home would
-break every older installed launcher the same way. The one refusal is a **replacement**
-launch onto a v1 store — that field cannot be dropped, so the write raises instead of
-landing a row a replacement recovery could never match. Forward migration is an
-explicit operator command only.
+:data:`COLUMNS_V4` inside one pinned read transaction, so v1-v3 rows remain diagnosable
+instead of decoding as ``absent``. Writes are **conservative** in the opposite direction:
+only v4 can preserve the required terminal binding, so every older shape is read-only and
+managed launch refuses it before side effects. Forward migration is an explicit,
+backup-first offline rollout operation; mixed old/new runtimes never silently drop v4 data.
 """
 
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Optional
 
 from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
-    COLUMNS_V3,
+    COLUMNS_V4,
     AttestationStoreLockUnavailable,
     attestation_store_lock,
     HERDR_IDENTITY_ATTESTATION_RECOVERY_POLICY,
@@ -103,6 +100,7 @@ from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
     writable_projection,
     write_drops_lane_epoch,
     write_drops_replacement_action_id,
+    write_drops_terminal_id,
 )
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
@@ -192,6 +190,11 @@ class IdentityAttestationRecord:
     #: token must survive to that classifier as itself rather than being laundered into a
     #: canonical number the launcher never minted. A token only — never a secret.
     lane_epoch: str = ""
+    #: Herdr's server-owned terminal identity observed in the wrapper's unique live
+    #: inventory row.  Unlike ``locator``, this changes when a cold restore reuses the
+    #: same pane id for a different terminal.  Empty is read-compatible legacy evidence
+    #: only and can never produce an attested join.
+    terminal_id: str = field(default="", repr=False)
     schema_version: int = HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION
 
     def as_payload(self) -> dict:
@@ -270,6 +273,7 @@ def evaluate_attestation(
     expected_workspace_id: str,
     expected_role: str,
     expected_lane: str,
+    live_terminal_id: object,
 ) -> AttestationJoin:
     """Join a stored self-attestation with the live slot (pure; adopt + doctor share).
 
@@ -282,8 +286,10 @@ def evaluate_attestation(
     3. recorded ``locator`` empty or != ``live_locator`` -> :data:`ATTEST_STALE`
        (a different process generation; the whole point of the generation pin —
        a stale ``present`` record is never re-used as this process's attestation);
-    4. recorded verdict ``missing`` / ``conflict`` -> the matching non-green state;
-    5. otherwise :data:`ATTEST_OK`.
+    4. stored/live terminal identity missing, malformed, or unequal ->
+       :data:`ATTEST_STALE` (same pane text is not a process generation);
+    5. recorded verdict ``missing`` / ``conflict`` -> the matching non-green state;
+    6. otherwise :data:`ATTEST_OK`.
 
     ``reason`` is value-free and phrased as startup self-attestation, never as a
     live-env read (herdr has no such surface).
@@ -314,6 +320,30 @@ def evaluate_attestation(
             "the startup self-attestation was written by a different process generation "
             "(its recorded locator no longer matches the live slot); a stale record is "
             "never re-used as this process's attestation",
+        )
+    recorded_terminal_id = record.terminal_id
+    if (
+        type(recorded_terminal_id) is not str
+        or not recorded_terminal_id
+        or recorded_terminal_id.strip() != recorded_terminal_id
+        or type(live_terminal_id) is not str
+        or not live_terminal_id
+        or live_terminal_id.strip() != live_terminal_id
+    ):
+        return AttestationJoin(
+            False,
+            ATTEST_STALE,
+            "the startup self-attestation or live inventory lacks a canonical "
+            "server-owned terminal identity; pane identity alone never proves the live "
+            "process generation",
+        )
+    if recorded_terminal_id != live_terminal_id:
+        return AttestationJoin(
+            False,
+            ATTEST_STALE,
+            "the startup self-attestation was written by a different server-owned "
+            "terminal, even though the live pane locator may be unchanged; a cold-restore "
+            "record is never re-used",
         )
     if record.verdict == VERDICT_MISSING:
         return AttestationJoin(
@@ -391,11 +421,10 @@ class HerdrIdentityAttestationStore:
         best-effort :func:`record_identity_attestation` wraps this so a store failure
         never blocks an agent boot.
 
-        Writes the store's **own** shape (Redmine #13882) rather than migrating it: a v1
-        store takes a v1-shaped row, which loses nothing on a normal launch because
-        ``replacement_action_id`` is empty. A **replacement** launch onto a v1 store
-        raises instead — dropping that field would silently unbind the fresh process from
-        the replacement transaction that a recovery matches on exactly.
+        Writes the store's own shape without implicit migration (Redmine #13882). A managed
+        v4 record always carries ``terminal_id``; therefore every v1-v3 store raises before
+        writing instead of landing a locator-only row. The backup-first offline rollout is
+        the sole supported forward-migration boundary.
         """
         observed_at = record.observed_at or _utc_now()
         # Shared lock over the WHOLE write (Redmine #13882 j#80190 boundary 2), taken
@@ -413,6 +442,15 @@ class HerdrIdentityAttestationStore:
     ) -> IdentityAttestationRecord:
         conn, version = _connect_rw(self.path)
         try:
+            if write_drops_terminal_id(version, record.terminal_id):
+                raise HerdrIdentityAttestationError(
+                    f"herdr identity attestation store {self.path} is schema v{version}, "
+                    "which cannot preserve this launch's server-owned `terminal_id`. "
+                    "Refusing to write a locator-only row that could falsely attest a "
+                    "different terminal after restore (the store is left untouched). "
+                    "Migrate the store first: `mozyo-bridge herdr attestation-store "
+                    "migrate --write`."
+                )
             if write_drops_replacement_action_id(version, record.replacement_action_id):
                 raise HerdrIdentityAttestationError(
                     f"herdr identity attestation store {self.path} is schema v{version}, "
@@ -451,6 +489,7 @@ class HerdrIdentityAttestationStore:
                 "observed_at": observed_at,
                 "replacement_action_id": record.replacement_action_id,
                 "lane_epoch": record.lane_epoch,
+                "terminal_id": record.terminal_id,
             }
             updatable = [c for c in columns if c != "assigned_name"]
             with conn:
@@ -474,6 +513,7 @@ class HerdrIdentityAttestationStore:
             observed_at=observed_at,
             replacement_action_id=record.replacement_action_id,
             lane_epoch=record.lane_epoch,
+            terminal_id=record.terminal_id,
         )
 
     def assigned_names(self) -> Optional[frozenset]:
@@ -559,6 +599,7 @@ class HerdrIdentityAttestationStore:
             observed_at=row[7],
             replacement_action_id=row[8],
             lane_epoch=row[9],
+            terminal_id=row[10],
         )
 
 
@@ -586,7 +627,7 @@ def record_identity_attestation(
 
 
 __all__ = (
-    "COLUMNS_V3",
+    "COLUMNS_V4",
     "HERDR_IDENTITY_ATTESTATION_FILENAME",
     "HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION",
     "HERDR_IDENTITY_ATTESTATION_RECOVERY_POLICY",

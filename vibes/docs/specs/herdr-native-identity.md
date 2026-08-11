@@ -57,6 +57,11 @@ sender env** に置き換える。
 - **transient locator** = herdr の `pane_id` (`agent list` row の `pane_id`、alias `pane` /
   `location`)。per-process 再生成される使い捨て値であり、**identity として persist しない**。
   target への「今」の到達には `rebind_by_name` で live snapshot から都度復元する。
+- **server-owned terminal identity** = `agent list` row の `terminal_id`。値は公開JSON・doctor・log・
+  error・dataclass reprへ描画しない内部generation pinであり、durableなlogical identityではない。
+  authority joinは同じfresh full inventory snapshotで assigned name / locator / terminal_id が各exact 1件、
+  かつ全rowがcanonicalであることを要求する。same locator / different terminal、重複、欠落、空白、
+  malformed row混在はいずれもnon-greenである。
 - **workspace_registry は無変更 (#11425)。** herdr anchor に新 schema は足さない。純 herdr
   session の identity anchor は既存の `workspace_id` (registry / `.mozyo-bridge/workspace-anchor.json`)
   + assigned-name scheme で完結する。registry には runtime/pane state を持ち込まない不変条件を維持する。
@@ -105,7 +110,8 @@ resolver はこれを fail-closed に読む。
   read も repair もできない** (修復は relaunch のみ)。したがって triplet が実際に spawn 先へ届いたかを
   観測できるのは **agent 自身の process だけ**である。managed launch は provider を
   `mozyo-bridge herdr agent-attest` で wrap し、agent boot 時に自 `os.environ` を launcher が期待する
-  identity と照合して `present | missing | conflict` を判定し、**live locator に generation-bind した
+  identity と照合して `present | missing | conflict` を判定し、**live locator + server-owned
+  terminal identity に generation-bind した
   durable record** (home-scoped `herdr-identity-attestation.sqlite`、runtime observation projection、
   env 値・secret は保存しない) を書いてから provider を `exec` する。この record は
   (a) adopt が live name-match を採用してよいかの gate (§5) と、(b) doctor が env-less/mismatch managed
@@ -124,6 +130,9 @@ resolver はこれを fail-closed に読む。
   `vibes/docs/tasks/herdr-lane-operations.md`
   「再起動復元後の active sublane pair を診断する」を正本とする。真の暗号学的 attestation
   (nonce / challenge-response) の導入は別 US 判断であり本節の範囲外。
+  reboot診断は各slotについてcanonical CWDと、`MOZYO_WORKSPACE_ID` / `MOZYO_AGENT_ROLE` /
+  `MOZYO_LANE_ID`の**key存在だけ**（値は非表示）を一体観測する。どれか不明・欠落・不一致、または
+  same-pane/different-terminalならsend 0 / close 0で、value-freeなfixed diagnosisを返す。
 
 - **startup attestation は lane epoch へ bind する (Redmine #14756)。** #13637 の record は
   「boot 時に triplet が届いたか」を証明するが、**その boot がどの世代か**は locator (tmux pane-id)
@@ -162,8 +171,11 @@ resolver はこれを fail-closed に読む。
     超過は typed malformed (同 F2)。
   - **既存 fence を弱めない**。epoch は **追加 conjunct** であり、attestation / locator / provider /
     multiplicity / declared-pin / `release_observation` の各 fence は verdict を 1 つも変えない。
-  - **rebuildable cache を流用しない**。`herdr_launch_generation` は `rebuildable_cache` の
-    projection なので load-bearing authority にしない (`### recovery policy vocabulary`)。
+  - **terminal-bound generation v2をcurrent-process conjunctにする**。`herdr_launch_generation` は
+    再launchで再生成可能な `rebuildable_cache` だが、存在するprocessを「current」と主張するread、
+    queue-enter receipt、offline restore/final verifyではterminal-bound attested v2 rowが必須である。
+    v1はlocator-onlyなのでnon-greenであり、4-store offline rolloutがbackup後に削除し、restore launchが
+    v2を再reserve/finalizeする。rebuildableであることはcurrent authorityから省略できる意味ではない。
   - **store 互換性の拒否は effect より前**。`attestation_store_epoch_unsupported` は
     launch preflight (`decide_store_compatibility`) と replacement の pre-effect fence
     (`replacement_store_admission`) の**両方**で、同一の 2 predicate から答える。後者は
@@ -893,7 +905,8 @@ kind 層が参照されるのは **durable な lane_kind が解決でき、か�
   lane の lifecycle row を **launch が返った後**に declare するため、初回 launch 時点に stored kind は
   存在しない。context を渡さないと「pane を実際に作る launch」だけが `lane_class` 幾何になり、以後の
   heal だけ設定どおりになるという逆転が起きる。よって actuator は `prepare_actuator_lane_session`
-  (create / heal / v1 replacement が通る唯一の funnel) へ pre-launch に context を渡す。
+  (create / heal / current v4 replacement が通る唯一の funnel) へ pre-launch に context を渡す。
+  v1-v3 side-binding は診断専用で、この funnel の current launch authorityにはならない。
 - **heal** = lane lifecycle authority row の generation-bound `lane_kind` (schema v7、
   `managed-state-model.md`)。launch chokepoint が **network 無し / display cache 無し**で offline 読解する。
 - **矛盾は fail-closed**: 両方あって不一致なら片方が stale。launch admission (#14242 の

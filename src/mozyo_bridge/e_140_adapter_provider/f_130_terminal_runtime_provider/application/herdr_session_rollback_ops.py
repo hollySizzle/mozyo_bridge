@@ -65,6 +65,91 @@ class LiveStartupRollbackOps:
     def close(self, workspace_id: str, lane_id: str, targets):
         return self._retire_ops.close(workspace_id, lane_id, targets)
 
+    def close_current_generation(self, action, targets, *, store_home):
+        """Freshly rejoin the whole batch to ``action`` immediately before close."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
+            HerdrRetireCloseResult,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_rollback import (  # noqa: E501
+            _terminal_bound_action_target,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            terminal_identity_snapshot_complete,
+        )
+        try:
+            rows = tuple(self.agent_rows())
+            participants = {participant.role: participant for participant in action.participants}
+            complete = terminal_identity_snapshot_complete(rows)
+            exact = complete and all(
+                role in participants
+                and participants[role].locator == locator
+                and _terminal_bound_action_target(
+                    store_home, action, participants[role], rows, locator
+                )
+                for role, locator in targets
+            )
+        except Exception:  # noqa: BLE001 - an unreadable destructive-edge join closes none
+            exact = False
+        if not exact:
+            return HerdrRetireCloseResult(
+                workspace_id=action.unit.workspace_id,
+                lane_id=action.unit.lane_id,
+                failed=tuple(
+                    (role, locator, "current startup generation could not be rejoined")
+                    for role, locator in targets
+                ),
+            )
+        try:
+            result = self.close(action.unit.workspace_id, action.unit.lane_id, targets)
+        except Exception:  # noqa: BLE001 - provider detail may contain private identity
+            return HerdrRetireCloseResult(
+                workspace_id=action.unit.workspace_id,
+                lane_id=action.unit.lane_id,
+                failed=tuple(
+                    (role, locator, "terminal-bound pane close failed")
+                    for role, locator in targets
+                ),
+            )
+        return HerdrRetireCloseResult(
+            workspace_id=action.unit.workspace_id,
+            lane_id=action.unit.lane_id,
+            closed=tuple(getattr(result, "closed", ())),
+            failed=tuple(
+                (role, locator, "terminal-bound pane close failed")
+                for role, locator, _detail in getattr(result, "failed", ())
+            ),
+        )
+
+    def current_generation_targets_absent(self, action, targets, *, store_home) -> bool:
+        """Use one fresh full snapshot to prove every durable target terminal absent."""
+        from mozyo_bridge.core.state.lane_release_pin import ReleasePin
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_destructive_close_identity import (  # noqa: E501
+            pinned_generation_partition,
+        )
+
+        participants = {participant.role: participant for participant in action.participants}
+        try:
+            pins = tuple(
+                ReleasePin(
+                    role=role,
+                    assigned_name=participants[role].assigned_name,
+                    locator=locator,
+                    startup_action_id=action.action_id,
+                )
+                for role, locator in targets
+            )
+            rows = tuple(self.agent_rows())
+            partition = pinned_generation_partition(
+                pins,
+                rows,
+                home=Path(store_home),
+                workspace_id=action.unit.workspace_id,
+                lane_id=action.unit.lane_id,
+            )
+        except Exception:  # noqa: BLE001 - absence is a positive proof
+            return False
+        return partition is not None and not partition[0] and partition[1] == pins
+
     def _environ(self) -> Mapping[str, str]:
         return self._env if self._env is not None else os.environ
 
@@ -162,38 +247,6 @@ class LiveStartupRollbackOps:
                 "Herdr 0.8 does not expose an authoritative empty-input fact for a "
                 "shell pane; refusing to infer one from rendered prompt text"
             ),
-        )
-
-    def close_prepared_pane(
-        self, *, locator: str, workspace_id: str, tab_id: str
-    ) -> tuple[bool, str]:
-        """Recheck every positive fact immediately before an exact pane close."""
-        observation = self.prepared_pane(
-            locator=locator, workspace_id=workspace_id, tab_id=tab_id
-        )
-        if not (
-            observation.state == PREPARED_PANE_PRESENT
-            and observation.locator == locator
-            and observation.workspace_id == workspace_id
-            and observation.tab_id == tab_id
-            and observation.agent_absent is True
-            and observation.shell_only is True
-            and observation.input_empty is True
-        ):
-            return False, observation.detail or "prepared pane close proof changed"
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
-            _close_base_pane,
-        )
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
-            COMMAND_TIMEOUT_SECONDS,
-        )
-
-        return _close_base_pane(
-            self._retire_ops._binary(),
-            locator,
-            subprocess.run,
-            COMMAND_TIMEOUT_SECONDS,
-            self._environ(),
         )
 
     def startup_blocker(self, provider: str, locator: str) -> str:

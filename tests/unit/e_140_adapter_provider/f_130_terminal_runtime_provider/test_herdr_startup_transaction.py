@@ -207,6 +207,9 @@ class _PreparedRollbackOps:
             self.rows = []
         return SimpleNamespace(failed=())
 
+    def close_current_generation(self, action, targets, *, store_home):
+        return self.close(action.unit.workspace_id, action.unit.lane_id, targets)
+
     def prepared_pane(self, *, locator, workspace_id, tab_id):
         self.prepared_calls.append((locator, workspace_id, tab_id))
         return self.observation
@@ -391,7 +394,7 @@ class PreparedPaneRollbackTest(unittest.TestCase):
             self.assertEqual(ops.agent_close_calls, [])
             self.assertEqual(fence.read(action_id).phase, PHASE_ROLLBACK_OWED)
 
-    def test_positive_future_input_fact_allows_exact_close_and_absence_recheck(self):
+    def test_future_input_fact_still_cannot_replace_terminal_generation_authority(self):
         with tempfile.TemporaryDirectory() as directory:
             fence, action_id = _rollback_action(Path(directory), self._receipt())
             ops = _PreparedRollbackOps(self._present(input_empty=True))
@@ -400,15 +403,15 @@ class PreparedPaneRollbackTest(unittest.TestCase):
                 action_id=action_id, ops=ops, fence=fence, execute=True
             )
 
-            self.assertTrue(result.ok)
-            self.assertEqual(result.state, "completed")
+            self.assertEqual(result.state, "blocked")
             self.assertEqual(
-                ops.prepared_close_calls, [("w1:p2", "w1", "w1:t1")]
+                result.participants[0].verdict,
+                ROLLBACK_PREPARED_PANE_UNVERIFIABLE,
             )
+            self.assertEqual(ops.prepared_close_calls, [])
             self.assertEqual(ops.agent_close_calls, [])
-            self.assertGreaterEqual(len(ops.prepared_calls), 2)
             self.assertEqual(
-                fence.read(action_id).phase, PHASE_COMPLETED_ROLLED_BACK
+                fence.read(action_id).phase, PHASE_ROLLBACK_OWED
             )
 
     def test_close_success_is_not_enough_when_exact_pane_remains(self):
@@ -422,9 +425,9 @@ class PreparedPaneRollbackTest(unittest.TestCase):
                 action_id=action_id, ops=ops, fence=fence, execute=True
             )
 
-            self.assertEqual(result.state, "incomplete")
-            self.assertEqual(result.reason, REASON_INCOMPLETE)
+            self.assertEqual(result.state, "blocked")
             self.assertFalse(result.participants[0].closed)
+            self.assertEqual(ops.prepared_close_calls, [])
             self.assertEqual(fence.read(action_id).phase, PHASE_ROLLBACK_OWED)
 
     def test_malformed_pane_receipt_blocks_without_any_close(self):
@@ -459,6 +462,7 @@ class PreparedPaneRollbackTest(unittest.TestCase):
                         "pane_id": "w1:p2",
                         "agent": "codex",
                         "agent_status": "idle",
+                        "terminal_id": "terminal:w1:p2",
                         # Deliberately no native_name: this is a legacy logical row,
                         # not proof of the pane-bound action's native identity.
                     }

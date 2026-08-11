@@ -54,6 +54,25 @@ def cmd_herdr_retirement_store_status(args: argparse.Namespace) -> int:
     return 0 if readable is not False else 1
 
 
+def cmd_herdr_retirement_store_migrate(args: argparse.Namespace) -> int:
+    """Explicit backup-first v1→v2 migration; normal retire never performs it."""
+    from mozyo_bridge.core.state.scratch_retirement_fence import (
+        ScratchRetirementFence,
+        ScratchRetirementFenceError,
+    )
+
+    if not getattr(args, "write", False):
+        print("retirement-store migrate requires --write")
+        return 2
+    try:
+        version = ScratchRetirementFence().migrate_v1_backup_first()
+    except ScratchRetirementFenceError:
+        print("retirement authority migration refused")
+        return 1
+    print(f"retirement authority schema: {version}")
+    return 0
+
+
 def register_herdr_retirement_store_parser(herdr_sub, *, add_repo_option=None) -> None:
     """Register ``herdr retirement-store status`` (Redmine #13892)."""
     parser = herdr_sub.add_parser(
@@ -82,10 +101,19 @@ def register_herdr_retirement_store_parser(herdr_sub, *, add_repo_option=None) -
     if add_repo_option is not None:
         add_repo_option(status)
     status.set_defaults(func=cmd_herdr_retirement_store_status)
+    migrate = sub.add_parser(
+        "migrate",
+        help="Explicitly publish a verified v1 backup, then migrate the authority to v2.",
+    )
+    migrate.add_argument("--write", action="store_true", help="Authorize the migration write")
+    if add_repo_option is not None:
+        add_repo_option(migrate)
+    migrate.set_defaults(func=cmd_herdr_retirement_store_migrate)
 
 
 __all__ = (
     "cmd_herdr_retirement_store_status",
+    "cmd_herdr_retirement_store_migrate",
     "register_herdr_retirement_store_parser",
     "register_herdr_retirement_surfaces",
 )

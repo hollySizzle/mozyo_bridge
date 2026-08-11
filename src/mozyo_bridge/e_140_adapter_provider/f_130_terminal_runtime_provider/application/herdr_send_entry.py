@@ -70,6 +70,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _norm,
     _norm_lane,
     decode_assigned_name,
+    terminal_identity_of_live_slot,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
     AGENT_PROVIDERS,
@@ -455,7 +456,6 @@ def _resolve_current_capability_row(
     from mozyo_bridge.core.state.herdr_launch_generation import (
         verified_generation_token,
     )
-
     try:
         live_generation = verified_generation_token(
             None,
@@ -464,6 +464,7 @@ def _resolve_current_capability_row(
             role=cap.provider,
             lane_id=cap.lane_id,
             locator=cap.locator,
+            live_terminal_id=terminal_identity_of_live_slot(cap.assigned_name, cap.locator, rows),
             norm=_norm,
             norm_lane=_norm_lane,
         )

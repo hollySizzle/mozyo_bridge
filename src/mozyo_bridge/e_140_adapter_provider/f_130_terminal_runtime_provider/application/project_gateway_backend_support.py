@@ -9,6 +9,7 @@ scope.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 
 from mozyo_bridge.core.state.herdr_launch_generation import (
@@ -29,6 +30,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _norm,
     _norm_lane,
     decode_assigned_name,
+    terminal_identity_of_live_slot,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (
     SLOT_LIVE,
@@ -75,6 +77,15 @@ class HerdrProjectGatewayBackendSupport:
         return valid_target(value)
 
     @staticmethod
+    def terminal_identity(assigned_name: object, locator: object, rows: object) -> object:
+        return (
+            terminal_identity_of_live_slot(assigned_name, locator, rows)
+            if isinstance(rows, (list, tuple))
+            and all(isinstance(row, Mapping) for row in rows)
+            else None
+        )
+
+    @staticmethod
     def workspace_segment(repo_root: Path) -> str:
         return herdr_workspace_segment(repo_root)
 
@@ -95,6 +106,7 @@ class HerdrProjectGatewayBackendSupport:
         provider: str,
         lane_id: str,
         locator: str,
+        live_terminal_id: object,
     ) -> str:
         return verified_generation_token(
             None,
@@ -103,6 +115,7 @@ class HerdrProjectGatewayBackendSupport:
             role=provider,
             lane_id=lane_id,
             locator=locator,
+            live_terminal_id=live_terminal_id,
             norm=_norm,
             norm_lane=_norm_lane,
         )

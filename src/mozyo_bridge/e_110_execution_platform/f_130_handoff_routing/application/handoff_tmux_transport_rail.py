@@ -821,6 +821,7 @@ class LiveTmuxTransportRailOps:
             _norm,
             _norm_lane,
             decode_assigned_name,
+            terminal_identity_of_live_slot,
         )
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_discovery import (  # noqa: E501
             HerdrCliAgentLister,
@@ -846,7 +847,7 @@ class LiveTmuxTransportRailOps:
         if not decoded.ok or decoded.identity is None:
             return None
         identity = decoded.identity
-        revision_raw = row.get("revision")
+        terminal_id = terminal_identity_of_live_slot(name, target, rows); revision_raw = row.get("revision")
         row_revision = _norm(str(revision_raw)) if not isinstance(revision_raw, bool) else ""
         # A generation-bound, verdict=present attestation whose EVERY identity axis matches the
         # decoded live-inventory identity AND this target locator — otherwise no binding.
@@ -863,14 +864,16 @@ class LiveTmuxTransportRailOps:
             and _norm(getattr(record, "role", "")) == _norm(identity.role)
             and _norm(getattr(record, "assigned_name", "")) == name
             and _norm(getattr(record, "locator", "")) == _norm(target)
+            and terminal_id is not None and getattr(record, "terminal_id", "") == terminal_id
         ):
             return None
         observed_at = _norm(str(getattr(record, "observed_at", "") or ""))
         # #14203 design j#87472: the COLLISION-FREE per-launch generation token is sourced
         # from the home-scoped launch-generation store, NOT the main attestation (whose
         # seconds-precision observed_at cannot separate two same-second launches, and which
-        # must not carry a required token onto shared v1/v2 homes). The attestation above is
-        # an INDEPENDENT health prerequisite; the token is the launch-generation authority's,
+        # is not itself the generation token). Managed homes are v4 attestation + v2
+        # generation stores after the four-store rollout; attestation is independent, while
+        # the token is the launch-generation authority's,
         # verified as an attested row for this exact identity whose startup transaction is a
         # terminally-successful participant of this gateway. A pending / superseded / tokenless
         # generation yields NO binding — recovery then fails closed rather than trusting a
@@ -880,22 +883,20 @@ class LiveTmuxTransportRailOps:
             assigned_name=name,
             workspace_id=identity.workspace_id,
             role=identity.role,
-            lane_id=identity.lane_id,
-            locator=target,
+            lane_id=identity.lane_id, locator=target,
+            live_terminal_id=terminal_id,
             norm=_norm,
             norm_lane=_norm_lane,
         )
         if not observed_at or not startup_action_id:
             return None
         return {
-            "provider": identity.role,
-            "assigned_name": name,
+            "provider": identity.role, "assigned_name": name,
             "locator": _norm(target),
             "row_revision": row_revision,
             "attestation_observed_at": observed_at,
             "startup_action_id": startup_action_id,
         }
-
     def emit(
         self,
         outcome: DeliveryOutcome,

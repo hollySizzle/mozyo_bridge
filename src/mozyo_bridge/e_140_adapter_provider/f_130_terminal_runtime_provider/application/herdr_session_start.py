@@ -112,6 +112,7 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_identity import (  # noqa: E501
     _lane_id_from_metadata,
     _resolve_workspace_id_readonly,
+    resolve_workspace_id_if_registered,
 )
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
@@ -126,6 +127,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _norm,
     derive_lane_workspace_token,
     encode_assigned_name,
+    terminal_identity_of_live_slot,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (
     SLOT_STALE as LIVENESS_STALE,
@@ -512,6 +514,7 @@ def _prepare_session_locked(
     # remains the slot discriminant. The shared resolver keeps every consumer aligned.
     resolved_root = Path(repo_root).expanduser().resolve()
     lane = _norm(lane_id)
+    refresh_registration = False
     if _is_linked_worktree(resolved_root):
         workspace_id = herdr_workspace_segment(resolved_root)
         if not workspace_id:
@@ -541,23 +544,24 @@ def _prepare_session_locked(
         # registered one. Resolve read-only; fail closed when no identity resolves.
         workspace_id = _resolve_workspace_id_readonly(resolved_root)
     else:
-        register_workspace(repo_root)
-        anchor = read_anchor(repo_root)
-        workspace_id = _norm(anchor.get("workspace_id")) if isinstance(anchor, dict) else ""
-        if not workspace_id:
-            raise HerdrSessionStartError(
-                "workspace has no resolvable workspace_id after registration"
-            )
+        existing_workspace = resolve_workspace_id_if_registered(resolved_root)
+        if existing_workspace:
+            workspace_id = existing_workspace
+            refresh_registration = True
+        else:
+            preflight_managed_launch(attest_launcher, launcher_runner, timeout, env, repo_root=repo_root, store_home=Path(store_home), workspace_id="unregistered", lane_id=lane or "default", replacement_action_id=replacement_action_id, launch_planned=bool(providers))
+            register_workspace(repo_root)
+            anchor = read_anchor(repo_root)
+            workspace_id = _norm(anchor.get("workspace_id")) if isinstance(anchor, dict) else ""
+            if not workspace_id:
+                raise HerdrSessionStartError("workspace has no resolvable workspace_id after registration")
     require_alias_identity(_alias_expected_id, workspace_id)
 
     result = SessionStartResult(
         workspace_id=workspace_id, lane_id=lane or "default", dry_run=dry_run
     )
 
-    # Redmine #14242 F3 — the ORDER half of the launch / terminalize exclusion. Placement is
-    # load-bearing (see the leaf's docstring): here it runs under the caller-held shared lock on
-    # BOTH entry paths. A dry run actuates nothing and consults no durable state. That same
-    # boundary read resolves this launch's lane-kind (Redmine #13647 T1b): caller context
+    # This shared-lock boundary resolves the launch's lane-kind (Redmine #13647 T1b): caller context
     # (fresh launch) reconciled with the stored generation-bound kind (heal), fail-closed.
     lane_kind = admit_launch_against_lifecycle(
         workspace_id=workspace_id,
@@ -630,9 +634,7 @@ def _prepare_session_locked(
             if classify_named_slot(existing[0]) == LIVENESS_STALE:
                 # Composite liveness (Redmine #13518 j#75329): a host-restart shell residue
                 # (name matches, no detected agent) is stale and surfaced, never blind-adopted.
-                plans.append(
-                    _SlotPlan(provider, assigned_name, "stale", live_locator)
-                )
+                plans.append(_SlotPlan(provider, assigned_name, "stale", live_locator))
             else:
                 # Startup self-attestation gate (Redmine #13637, Design Answer j#76462):
                 # adopt a live name-match ONLY when a `present` self-attestation is
@@ -642,6 +644,7 @@ def _prepare_session_locked(
                 join = evaluate_attestation(
                     attestation_read(assigned_name),
                     live_locator=live_locator,
+                    live_terminal_id=terminal_identity_of_live_slot(assigned_name, live_locator, rows),
                     expected_workspace_id=workspace_id,
                     expected_role=provider,
                     expected_lane=lane,
@@ -703,17 +706,7 @@ def _prepare_session_locked(
                 f"(resolved={resolved!r}); refusing to start a lane with an "
                 f"unresolved or mismatched provider"
             )
-
-    native_admission = bind_native_launch_set(
-        tuple(plan.assigned_name for plan in launch_plans),
-        store_home=Path(store_home),
-        source_path=env.get("PATH"),
-    )
-
-    # Managed-launch compatibility boundary — the LAST fail-closed point before any herdr
-    # write. The whole conjunction, its gating and its derived flags live beside it in
-    # `herdr_launch_preflight.preflight_managed_launch`, shared with the `sublane create`
-    # pre-worktree gate so a conjunct can never be present at only one of the two boundaries.
+    # Managed-launch compatibility boundary, shared with the pre-worktree gate.
     preflight_managed_launch(
         attest_launcher, launcher_runner, timeout, env,
         repo_root=repo_root,
@@ -722,6 +715,13 @@ def _prepare_session_locked(
         lane_id=result.lane_id,
         replacement_action_id=replacement_action_id,
         launch_planned=bool(launch_plans),
+    )
+    if refresh_registration:
+        register_workspace(repo_root)
+    native_admission = bind_native_launch_set(
+        tuple(plan.assigned_name for plan in launch_plans),
+        store_home=Path(store_home),
+        source_path=env.get("PATH"),
     )
     if role_grouped_project_coordinator:
         preflight_project_coordinator_label_authority(

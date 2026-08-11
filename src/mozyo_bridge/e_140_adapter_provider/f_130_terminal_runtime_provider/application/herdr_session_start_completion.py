@@ -17,6 +17,9 @@ from mozyo_bridge.core.state.herdr_identity_attestation import evaluate_attestat
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_generation_binding import (  # noqa: E501
     finalize_session_launch_generations,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
+    _list_rows,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_placement import (  # noqa: E501
     HerdrProjectColumnPlacement,
     PLACEMENT_APPLIED,
@@ -52,6 +55,7 @@ class _SessionAttestationPort:
         join = evaluate_attestation(
             self._reader(pane.assigned_name),
             live_locator=pane.locator,
+            live_terminal_id=pane.terminal_id,
             expected_workspace_id=pane.workspace_id,
             expected_role=pane.role,
             expected_lane=pane.lane_id,
@@ -78,6 +82,11 @@ def complete_session_start(
 ) -> None:
     """Complete generation/transaction authority, then configured placement."""
 
+    try:
+        generation_inventory = tuple(_list_rows(binary, runner, timeout))
+    except Exception:  # noqa: BLE001 - unreadable post-launch inventory leaves pending
+        generation_inventory = ()
+
     finalize_session_launch_generations(
         store_home=Path(store_home),
         transaction=transaction,
@@ -85,6 +94,7 @@ def complete_session_start(
         workspace_id=workspace_id,
         lane_id=result.lane_id,
         attestation_read=attestation_read,
+        inventory_rows=generation_inventory,
         attest_launcher=attest_launcher,
         launch_plans=launch_plans,
         dry_run=dry_run,

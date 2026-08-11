@@ -285,11 +285,10 @@ def preflight_attest_store_schema(
     launcher probe, i.e. before the caller's first ``workspace`` / ``tab`` / ``agent``
     write, so an incompatible store aborts with zero herdr side effect (acceptance 1).
 
-    A v1 store with a **normal** launch is admitted: the launcher writes it v1-shaped and
-    ``replacement_action_id`` is empty, so nothing is dropped and no generation is
-    fabricated. A **replacement** launch is refused there, because that field cannot
-    survive the v1 shape. The error is raised, never persisted, so no personal path is
-    written to a durable store.
+    Recognized v1-v3 stores are read-compatible diagnostics only. Every managed launch,
+    normal or replacement, requires an absent store or exact writable v4 because the
+    server-owned terminal identity cannot survive any older shape. Migration is the
+    approved four-store offline rollout, never an implicit launch-side write.
 
     ``epoch_launch`` (Redmine #14756) is the second instance of that same "field that cannot
     be dropped" rule, and it MUST be decided here rather than in the child: the child's
@@ -717,7 +716,10 @@ def preflight_launcher_compatibility(
        the shared lane lifecycle join. Every config outcome is typed HERE;
     4. **the lane cwd probe** (#14231) — re-run in ``repo_root`` once the config is proven
        parseable by this launcher, so a failure there is now unambiguously about something
-       other than the config.
+       other than the config;
+    5. **generation protocol and store** — the advertised protocol first, then the shared
+       store's absent-or-v2 shape.  Keeping both last preserves the established refusal
+       precedence while still refusing before either caller's first mutation.
     """
     with tempfile.TemporaryDirectory(prefix="mozyo-capability-probe-") as neutral:
         observation = preflight_attest_launcher_capability(
@@ -755,6 +757,21 @@ def preflight_launcher_compatibility(
     #    `prepare_session` boundary refuses — leaving exactly the worktree residue #14258's
     #    close condition 1 exists to prevent.
     preflight_generation_protocol_capability(observation)
+    from mozyo_bridge.core.state.herdr_launch_generation import (
+        GENERATION_STORE_ABSENT,
+        GENERATION_STORE_HEALTHY,
+        herdr_launch_generation_path,
+        probe_launch_generation_store,
+    )
+    generation_state, _detail = probe_launch_generation_store(
+        herdr_launch_generation_path(Path(store_home))
+    )
+    if generation_state not in (GENERATION_STORE_ABSENT, GENERATION_STORE_HEALTHY):
+        raise HerdrLauncherIncompatibleError(
+            "managed-launch preflight refused the selected launcher: launch-generation "
+            "store requires the offline v2 rebuild. No workspace / tab / agent was created.",
+            reason="launch_generation_store_unsupported",
+        )
     return observation
 
 

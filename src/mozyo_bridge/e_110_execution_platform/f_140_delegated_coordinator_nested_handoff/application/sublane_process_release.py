@@ -49,8 +49,13 @@ from mozyo_bridge.core.state.lane_pin_role import (
 from mozyo_bridge.core.state.lane_release_observation import (
     ReleaseObservationError,
     build_release_observation,
+    decode_release_observation,
+    observation_matches_pins,
 )
-from mozyo_bridge.core.state.lane_lifecycle_model import is_canonical_release_state
+from mozyo_bridge.core.state.lane_lifecycle_model import (
+    decode_release_pin_projection,
+    is_canonical_release_state,
+)
 from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_ACTIVE,
     RELEASE_NOT_REQUESTED,
@@ -64,6 +69,10 @@ from mozyo_bridge.core.state.lane_lifecycle import (
     ProcessPinError,
     ReleasePin,
     ReleasePinError,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_destructive_close_identity import (  # noqa: E501
+    current_generation_release_pins,
+    pinned_generation_partition, pinned_generations_absent,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
     HerdrRetireClosePlan,
@@ -79,6 +88,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _norm,
     _norm_lane,
     decode_assigned_name,
+    terminal_identity_of_live_slot,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_terminal_identity import (  # noqa: E501
+    terminal_identity_snapshot_complete,
 )
 
 #: The two managed slots a lane unit carries (gateway + worker), under the resolved
@@ -154,6 +167,25 @@ def unit_slots(
     return slots
 
 
+def _lane_unit_inventory_exact(rows, workspace_id: str, lane_id: str) -> bool:
+    """One complete view may omit closed expected slots, but never carry a foreign slot."""
+    if not terminal_identity_snapshot_complete(rows):
+        return False
+    want_lane = _norm_lane(lane_id)
+    for row in rows:
+        decode = decode_assigned_name(row.get(AGENT_KEY_NAME))
+        if not decode.ok or decode.identity is None:
+            continue
+        identity = decode.identity
+        if (
+            identity.workspace_id == workspace_id
+            and _norm_lane(identity.lane_id) == want_lane
+            and identity.role not in _LANE_ROLES
+        ):
+            return False
+    return True
+
+
 def evaluate_pair_attestation(
     rows: Sequence[Mapping[str, object]],
     workspace_id: str,
@@ -208,6 +240,9 @@ def evaluate_pair_attestation(
         join = evaluate_attestation(
             record,
             live_locator=locator,
+            live_terminal_id=terminal_identity_of_live_slot(
+                assigned_name, locator, rows
+            ),
             expected_workspace_id=workspace_id,
             expected_role=role,
             expected_lane=lane,
@@ -530,6 +565,9 @@ def declared_generation_attested(
         join = evaluate_attestation(
             record,
             live_locator=locator,
+            live_terminal_id=terminal_identity_of_live_slot(
+                assigned_name, locator, rows
+            ),
             expected_workspace_id=workspace_id,
             expected_role=role,
             expected_lane=lane,
@@ -540,18 +578,21 @@ def declared_generation_attested(
 
 
 def release_pins(
-    rows: Sequence[Mapping[str, object]], workspace_id: str, lane: str
-) -> list[ReleasePin]:
-    """Pin the lane's live managed slots as the release generation's targets."""
-    pins: list[ReleasePin] = []
-    for role, (assigned_name, locator) in unit_slots(rows, workspace_id, lane).items():
-        try:
-            pins.append(
-                ReleasePin(role=role, assigned_name=assigned_name, locator=locator)
-            )
-        except ReleasePinError:
-            continue
-    return pins
+    rows: Sequence[Mapping[str, object]], workspace_id: str, lane: str, *, home
+) -> Optional[list[ReleasePin]]:
+    """Pin only exact v4/completed-v2 generations from one complete live snapshot."""
+    slots = unit_slots(rows, workspace_id, lane)
+    pins = current_generation_release_pins(
+        rows,
+        home=home,
+        workspace_id=workspace_id,
+        lane_id=lane,
+        targets=tuple(
+            (role, assigned_name, locator)
+            for role, (assigned_name, locator) in slots.items()
+        ),
+    )
+    return list(pins) if pins is not None else None
 
 
 def _release_recorded_detail(plan, close) -> str:
@@ -596,10 +637,8 @@ def drive_process_release(
     resumed instead, never a second one opened.
 
     ``rows`` lets a caller pass a live inventory snapshot it has already read (and whose
-    readability it has already vetted, Redmine #13682 R1-F1): an empty ``rows`` then means
-    a *confirmed*-empty inventory ("the processes are already gone"), never an *unreadable*
-    one folded to empty. When ``rows`` is ``None`` the driver reads it via ``ops.live_rows``
-    (the supersede path, whose fail-open to ``()`` is its documented boundary).
+    readability it has already vetted): empty then means confirmed-empty, never an
+    unreadable inventory folded to absence.
 
     ``expected_revision`` (Redmine #13843 review F3) binds the release to the caller's exact
     T1-verified lifecycle authority: when supplied and the driver's FRESH row read does not
@@ -641,6 +680,12 @@ def drive_process_release(
         )
 
     rows = ops.live_rows() if rows is None else rows
+    if not _lane_unit_inventory_exact(rows, workspace_id, lane_id):
+        return ReleaseOutcome(
+            action_id=action_id,
+            process_release=rec.process_release,
+            detail="release inventory is incomplete or carries a foreign lane slot; zero-close",
+        )
     if rec.process_release == RELEASE_NOT_REQUESTED:
         # Redmine #14477 j#94582 item 1: the driver's enumeration IS the authority. It is
         # wrapped once here and handed to the store, which derives the generation's pins from
@@ -652,9 +697,12 @@ def drive_process_release(
         # (j#94582 item 2 / item 4). Recording a COMPLETE-EMPTY observation makes that a
         # positive, checkable fact instead of an absence.
         try:
-            observation = build_release_observation(
-                release_pins(rows, workspace_id, lane_id)
+            observed_pins = release_pins(
+                rows, workspace_id, lane_id, home=store.path.parent
             )
+            if observed_pins is None:
+                raise ReleaseObservationError("release inventory generation proof is incomplete")
+            observation = build_release_observation(observed_pins)
         except ReleaseObservationError as exc:
             return ReleaseOutcome(
                 action_id=action_id,
@@ -715,15 +763,71 @@ def drive_process_release(
     # partial close and its resume. Corrupt pins fail closed (never degrade to fewer
     # targets, leaving slots alive).
     try:
-        stored_pins = rec.pins
+        pin_projection = decode_release_pin_projection(rec.release_pins)
+        stored_pins = pin_projection.pins
+        stored_observation = decode_release_observation(rec.release_observation)
     except ReleasePinError:
         return ReleaseOutcome(
             action_id=action_id,
             process_release=rec.process_release,
             detail="release pins unreadable; fail closed (no slots closed)",
         )
+    except ReleaseObservationError:
+        return ReleaseOutcome(
+            action_id=action_id,
+            process_release=rec.process_release,
+            detail="release observation unreadable; fail closed (no slots closed)",
+        )
+    if (
+        stored_observation is None
+        or stored_observation.version != 2
+        or not pin_projection.current_authority
+        or not observation_matches_pins(stored_observation, stored_pins)
+    ):
+        return ReleaseOutcome(
+            action_id=action_id,
+            process_release=rec.process_release,
+            detail="release observation/pin generation is legacy or mismatched; zero-close",
+        )
+    try:
+        close_rows = tuple(ops.live_rows())
+        close_rows_readable = _lane_unit_inventory_exact(
+            close_rows, workspace_id, lane_id
+        )
+    except Exception:  # noqa: BLE001 - destructive-edge inventory unreadable
+        close_rows = ()
+        close_rows_readable = False
+    if stored_pins:
+        partition = (
+            pinned_generation_partition(
+                stored_pins,
+                close_rows,
+                home=store.path.parent,
+                workspace_id=workspace_id,
+                lane_id=lane_id,
+            )
+            if pin_projection.current_authority and close_rows_readable
+            else None
+        )
+        generation_current = partition is not None
+        live_pins = partition[0] if partition is not None else ()
+    else:
+        generation_current = (
+            close_rows_readable
+            and
+            pin_projection.current_authority
+            and _lane_unit_inventory_exact(close_rows, workspace_id, lane_id)
+            and not unit_slots(close_rows, workspace_id, lane_id)
+        )
+        live_pins = ()
+    if not generation_current:
+        return ReleaseOutcome(
+            action_id=action_id,
+            process_release=rec.process_release,
+            detail="release generation is legacy or no longer current; zero-close",
+        )
     plan = pin_matched_close_plan(
-        stored_pins, rows, workspace_id=workspace_id, lane_id=lane_id
+        live_pins, close_rows, workspace_id=workspace_id, lane_id=lane_id
     )
     if plan is None:
         # R2-F1: the pin set is semantically inconsistent with the lane unit — fail closed
@@ -733,8 +837,34 @@ def drive_process_release(
             process_release=rec.process_release,
             detail="release pins inconsistent with lane unit; fail closed (no slots closed)",
         )
-    close = ops.execute_close(plan)
-    target = RELEASE_RELEASED if not close.failed else RELEASE_PARTIAL
+    close = (
+        ops.execute_close(plan)
+        if plan.close_targets
+        else HerdrRetireCloseResult(workspace_id=workspace_id, lane_id=lane_id)
+    )
+    safe_failed = tuple((role, locator, "close_failed") for role, locator, _ in close.failed)
+    target = RELEASE_RELEASED if not safe_failed else RELEASE_PARTIAL
+    if target == RELEASE_RELEASED:
+        try:
+            post_rows = tuple(ops.live_rows())
+            post_complete = _lane_unit_inventory_exact(
+                post_rows, workspace_id, lane_id
+            )
+        except Exception:  # noqa: BLE001 - absence is not proven
+            post_rows, post_complete = (), False
+        post_absent = (
+            post_complete and not unit_slots(post_rows, workspace_id, lane_id)
+            if not stored_pins
+            else post_complete and pinned_generations_absent(
+                stored_pins, post_rows, home=store.path.parent,
+                workspace_id=workspace_id, lane_id=lane_id,
+            )
+        )
+        if not post_absent:
+            target = RELEASE_PARTIAL
+            safe_failed = tuple(
+                (pin.role, pin.locator, "close_absence_unproven") for pin in stored_pins
+            )
     try:
         recorded = store.record_release_outcome(
             key,
@@ -747,7 +877,7 @@ def drive_process_release(
             action_id=action_id,
             process_release=rec.process_release,
             closed=close.closed,
-            failed=close.failed,
+            failed=safe_failed,
             foreign_names=close.foreign_names,
             detail=f"release outcome record failed ({type(exc).__name__})",
         )
@@ -755,10 +885,14 @@ def drive_process_release(
         action_id=action_id,
         process_release=target if recorded.applied else rec.process_release,
         closed=close.closed,
-        failed=close.failed,
+        failed=safe_failed,
         foreign_names=close.foreign_names,
         detail=(
-            _release_recorded_detail(plan, close)
+            (
+                "release close finished but fresh full-snapshot absence was unproven"
+                if safe_failed and not close.failed
+                else _release_recorded_detail(plan, close)
+            )
             if recorded.applied
             else f"release outcome refused ({recorded.reason})"
         ),

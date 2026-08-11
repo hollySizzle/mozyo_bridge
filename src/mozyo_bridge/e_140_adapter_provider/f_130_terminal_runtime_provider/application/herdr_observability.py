@@ -37,7 +37,7 @@ byte-invariant.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
@@ -49,6 +49,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _agent_locator,
     _norm,
     decode_assigned_name,
+    terminal_identity_of_row,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.pane_render_observation import (  # noqa: E501
     RENDER_REASON_INVALID_TARGET,
@@ -93,6 +94,9 @@ class HerdrObservedAgent:
     runtime_state: str = "unknown"
     raw_status: str = ""
     locator: str = ""
+    #: Internal-only server-owned terminal identity for attestation joins. It is not
+    #: rendered by :meth:`to_record`; malformed/missing evidence remains ``""``.
+    terminal_id: str = field(default="", repr=False)
     decode_reason: Optional[str] = None
 
     def to_record(self) -> dict:
@@ -183,6 +187,7 @@ def project_observed_agents(rows: Sequence) -> tuple:
         raw_status = _row_status_token(row)
         runtime_state = map_agent_status(raw_status or None)
         locator = _agent_locator(row)
+        terminal_id = terminal_identity_of_row(row) or ""
         decode = decode_assigned_name(name)
         if decode.ok and decode.identity is not None:
             identity = decode.identity
@@ -196,6 +201,7 @@ def project_observed_agents(rows: Sequence) -> tuple:
                     runtime_state=runtime_state,
                     raw_status=raw_status,
                     locator=locator,
+                    terminal_id=terminal_id,
                 )
             )
         else:
@@ -206,6 +212,7 @@ def project_observed_agents(rows: Sequence) -> tuple:
                     runtime_state=runtime_state,
                     raw_status=raw_status,
                     locator=locator,
+                    terminal_id=terminal_id,
                     decode_reason=decode.reason,
                 )
             )

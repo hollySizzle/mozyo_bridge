@@ -78,6 +78,7 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
                     role="codex",
                     runtime_state="working",
                     raw_status="working",
+                    terminal_id="terminal:top",
                 ),
                 HerdrObservedAgent(
                     name=self.peer_name,
@@ -87,6 +88,7 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
                     role="claude",
                     runtime_state="idle",
                     raw_status="idle",
+                    terminal_id="terminal:peer",
                 ),
             ),
             raw_row_count=2,
@@ -125,6 +127,9 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
                     "lane_lifecycle", "recognized", 9, content_digest="2" * 64
                 ),
                 StoreSnapshot(
+                    "launch_generation", "recognized", 1, content_digest="5" * 64
+                ),
+                StoreSnapshot(
                     "startup_transaction",
                     "recognized",
                     1,
@@ -158,7 +163,7 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
         result = build_offline_rollout_plan(captured)
 
         self.assertTrue(result.ok)
-        self.assertEqual(result.plan["schema_version"], 3)
+        self.assertEqual(result.plan["schema_version"], 4)
         self.assertEqual(result.plan["supervisors"][0]["backend"], "launchd")
         self.assertEqual(result.plan["supervisors"][0]["legacy_drain"], "owned")
         self.assertEqual(len(result.plan["workspaces"]), 2)
@@ -231,6 +236,9 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
                 ),
                 StoreSnapshot(
                     "lane_lifecycle", "recognized", 9, content_digest="2" * 64
+                ),
+                StoreSnapshot(
+                    "launch_generation", "recognized", 1, content_digest="5" * 64
                 ),
                 StoreSnapshot(
                     "startup_transaction",

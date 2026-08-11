@@ -37,6 +37,7 @@ def seed_current_generation(
     locator: str,
     action_id: str = LEGACY_ACTION_ID,
     attested: bool = True,
+    terminal_id: str = "",
 ) -> None:
     """Record ``assigned_name``'s current launch generation under ``home``.
 
@@ -64,7 +65,8 @@ def seed_current_generation(
         role=role,
         lane_id=lane_id,
         locator=locator,
-        verdict="ready",
+        terminal_id=terminal_id or f"terminal:{locator}",
+        verdict="present",
         observed_at=_OBSERVED_AT,
     )
 
@@ -90,9 +92,36 @@ def seed_current_generations(home: Path, participants: Iterable, *, workspace_id
         )
 
 
+def seed_completed_current_generation(
+    home: Path, *, workspace_id: str, lane_id: str, role: str,
+    assigned_name: str, locator: str, terminal_id: str = "",
+) -> str:
+    """Seed a terminal-bound generation with its exact completed startup transaction."""
+    from mozyo_bridge.core.state.startup_transaction_fence import (
+        PHASE_COMPLETED_SUCCESS, PHASE_HEALTH_CHECK, Participant,
+        StartupTransactionFence, StartupUnit,
+    )
+
+    fence = StartupTransactionFence(home=home)
+    action = fence.reserve(StartupUnit(workspace_id, lane_id, (role,)),
+                           f"current-generation-{role}-{assigned_name}")
+    fence.record_participant(action.action_id, Participant(
+        role=role, assigned_name=assigned_name, locator=locator, receipt="workspace=current",
+    ))
+    fence.set_phase(action.action_id, PHASE_HEALTH_CHECK)
+    fence.set_phase(action.action_id, PHASE_COMPLETED_SUCCESS)
+    seed_current_generation(
+        home, workspace_id=workspace_id, lane_id=lane_id, role=role,
+        assigned_name=assigned_name, locator=locator, action_id=action.action_id,
+        terminal_id=terminal_id,
+    )
+    return action.action_id
+
+
 __all__ = (
     "LEGACY_ACTION_ID",
     "RECEIPT_CAPABLE_ACTION_ID",
     "seed_current_generation",
     "seed_current_generations",
+    "seed_completed_current_generation",
 )

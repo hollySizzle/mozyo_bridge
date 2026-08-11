@@ -23,12 +23,14 @@ Both are gated by the caller on ``attest_launcher and launch_plans`` — the sam
 the #13748/#13882 launcher-capability preflight. An unwrapped / adopt-only / dry-run run
 establishes no generation and stays byte-invariant; it simply has no generation to recover,
 which fails closed exactly as an un-attested launch already does. The generation protocol is
-thus a capability of the *managed wrapper*, independent of the main attestation store's
-on-disk schema version — it requires no migration of a shared v1/v2 home (j#87472).
+a capability of the *managed wrapper* and requires the terminal-bound v2 cache. A legacy v1
+cache is backup/rebuilt only inside the four-store offline rollout; managed launch refuses it
+before reserving a startup transaction so mixed runtimes cannot silently drop the binding.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
@@ -46,8 +48,11 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     reserve_session_launch_identities,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+    AGENT_KEY_NAME,
+    _agent_locator,
     _norm,
     _norm_lane,
+    terminal_identity_of_live_slot,
 )
 
 
@@ -90,6 +95,7 @@ def finalize_launch_generations(
     workspace_id: str,
     lane_id: str,
     attestation_read: Optional[Callable[[str], object]],
+    inventory_rows: Iterable,
 ) -> None:
     """CAS each launched slot's reservation to ``attested`` when the evidence agrees.
 
@@ -130,6 +136,16 @@ def finalize_launch_generations(
         locator = _norm(getattr(slot, "locator", ""))
         if not (name and role and locator):
             continue
+        matches = [
+            row
+            for row in inventory_rows
+            if isinstance(row, Mapping) and _norm(row.get(AGENT_KEY_NAME)) == name
+        ]
+        if len(matches) != 1 or _norm(_agent_locator(matches[0])) != locator:
+            continue
+        live_terminal_id = terminal_identity_of_live_slot(name, locator, inventory_rows)
+        if live_terminal_id is None:
+            continue
         # 1. launch receipt + startup-transaction participant (not closed), for this slot.
         participant = action.participant_for(role)
         if participant is None or getattr(participant, "closed", True):
@@ -151,6 +167,7 @@ def finalize_launch_generations(
         if record is None:
             continue
         observed_at = _norm(str(getattr(record, "observed_at", "") or ""))
+        terminal_id = getattr(record, "terminal_id", None)
         if not (
             _norm(getattr(record, "verdict", "")) == VERDICT_PRESENT
             and observed_at
@@ -159,6 +176,10 @@ def finalize_launch_generations(
             and _norm(getattr(record, "workspace_id", "")) == ws
             and _norm_lane(getattr(record, "lane_id", "")) == lane
             and _norm(getattr(record, "locator", "")) == locator
+            and type(terminal_id) is str
+            and bool(terminal_id)
+            and terminal_id.strip() == terminal_id
+            and terminal_id == live_terminal_id
         ):
             continue
         # 4. CAS to attested. A refusal (a newer pending reservation superseded this one)
@@ -171,6 +192,7 @@ def finalize_launch_generations(
                 role=role,
                 lane_id=lane,
                 locator=locator,
+                terminal_id=terminal_id,
                 verdict=VERDICT_PRESENT,
                 observed_at=observed_at,
             )
@@ -240,7 +262,7 @@ def open_startup_transaction_and_reserve_generations(
 
 def finalize_session_launch_generations(
     *, store_home, transaction, slots, workspace_id, lane_id, attestation_read,
-    attest_launcher, launch_plans, dry_run,
+    inventory_rows, attest_launcher, launch_plans, dry_run,
 ) -> None:
     """Session-boundary finalize: gate (same as the reserve, plus not-dry-run) then
     best-effort finalize each launched slot's generation (never raises)."""
@@ -249,6 +271,7 @@ def finalize_session_launch_generations(
     finalize_launch_generations(
         store_home=store_home, startup_action_id=transaction.action_id, slots=slots,
         workspace_id=workspace_id, lane_id=lane_id, attestation_read=attestation_read,
+        inventory_rows=inventory_rows,
     )
 
 

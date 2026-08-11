@@ -177,6 +177,7 @@ def _present_attestation_reader(ws, role, lane, locator):
         locator=locator,
         verdict=VERDICT_PRESENT,
         observed_at="2026-07-12T00:00:00+00:00",
+        terminal_id=f"terminal:{locator}",
     )
     return lambda queried: record if queried == name else None
 
@@ -425,7 +426,10 @@ class _Herdr:
         # attest-capable launcher predating the launch-generation event protocol.
         self.generation_capable = generation_capable
         self.attest_probes: list = []
-        self.existing_rows = existing_rows or []
+        self.existing_rows = [dict(row) for row in (existing_rows or [])]
+        for row in self.existing_rows:
+            if "terminal_id" not in row and row.get("pane_id"):
+                row["terminal_id"] = f"terminal:{row['pane_id']}"
         # By default the launched agent lands in the exact pane supplied via `--pane`.
         # An explicit `start_locator` overrides that — used to force a mislocated launch
         # (#13330 review j#73231).
@@ -1171,6 +1175,7 @@ class _Herdr:
             "name": name,
             "_native_name": native_name,
             "pane_id": pane_id,
+            "terminal_id": f"terminal:{pane_id}",
             "workspace_id": wid,
             "tab_id": tab_id,
             "agent_status": "idle",
@@ -1209,6 +1214,7 @@ class _Herdr:
             locator=pane_id,
             verdict=VERDICT_PRESENT,
             observed_at="2026-07-17T00:00:00+00:00",
+            terminal_id=f"terminal:{pane_id}",
         )
         record_identity_attestation(record, home=Path(self.attest_home))
         self.attest_writes.append(name)
@@ -1469,7 +1475,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         starts = _agent_start_calls(herdr)
         self.assertEqual(len(starts), 2)
         self.assertEqual(starts[0], starts[1])
-        sleep.assert_called_once_with(0.1)
+        self.assertEqual([call.args for call in sleep.call_args_list if call.args == (0.1,)], [(0.1,)])
 
     def test_busy_error_with_a_success_payload_is_not_retried(self) -> None:
         calls = []
@@ -1619,7 +1625,8 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                 herdr = _Herdr(
                     attest_capable=False,
                     existing_rows=[
-                        {"name": encode_assigned_name(ws, "codex", "lane-1"), "pane_id": "w1:pOLD"}
+                        {"name": encode_assigned_name(ws, "codex", "lane-1"),
+                         "pane_id": "w1:pOLD", "terminal_id": "terminal:w1:pOLD"}
                     ],
                 )
                 binpath = Path(tmp) / "fake-herdr"
@@ -1686,6 +1693,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                         lane_id="lane-1",
                         locator="w9:pX",
                         verdict=VERDICT_PRESENT,
+                        terminal_id="terminal:w9:pX",
                     )
                 )
                 herdr = _Herdr(
@@ -6935,8 +6943,9 @@ class SessionStartStartupHealthTest(_SessionStartHarness, unittest.TestCase):
             lists_two,
             f"inventory reads scaled with role count: 1 role={lists_one}, 2 roles={lists_two}",
         )
-        # pass 1 classify + exactly one healthy probe round.
-        self.assertEqual(lists_two, 2)
+        # Pass 1 classify + one healthy probe round + one terminal-bound generation
+        # finalization snapshot.  None of those reads scale with role count.
+        self.assertEqual(lists_two, 3)
 
     def test_a_healthy_pair_costs_exactly_one_probe_round(self) -> None:
         # The deadline is spent only on genuinely transient states. A pair that is up must
@@ -6952,7 +6961,7 @@ class SessionStartStartupHealthTest(_SessionStartHarness, unittest.TestCase):
                 extra_env=launcher_env,
             )
         self.assertFalse(naps)
-        self.assertEqual(len([c for c in herdr.calls if c == ["agent", "list"]]), 2)
+        self.assertEqual(len([c for c in herdr.calls if c == ["agent", "list"]]), 3)
 
     def test_every_role_of_a_round_is_judged_against_one_snapshot(self) -> None:
         # Reading per slot lets a pair be classified from two different views of the
@@ -6971,9 +6980,10 @@ class SessionStartStartupHealthTest(_SessionStartHarness, unittest.TestCase):
         herdr.run = _recording
         with tempfile.TemporaryDirectory() as tmp:
             self._wrapped(tmp, herdr)
-        # pass 1 (empty) + one probe round that saw BOTH launched roles at once.
-        self.assertEqual(len(snapshots), 2)
-        self.assertEqual(len(snapshots[-1]), 2)
+        # Pass 1 (empty) + one probe round + one generation-finalization view.  Each
+        # post-launch snapshot sees BOTH roles together.
+        self.assertEqual(len(snapshots), 3)
+        self.assertEqual([len(rows) for rows in snapshots[1:]], [2, 2])
 
     def test_the_live_shape_reproduces_across_every_repo_and_home_the_issue_names(
         self,

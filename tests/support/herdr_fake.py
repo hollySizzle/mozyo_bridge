@@ -178,6 +178,7 @@ class _Agent:
     logical_name: str
     pane_id: str
     workspace_id: str
+    terminal_id: str
     provider: str = ""
     cwd: str = ""
     status: str = DEFAULT_START_STATUS
@@ -275,6 +276,7 @@ class FakeHerdr:
         status: str = DEFAULT_START_STATUS,
         cwd: str = "",
         revision: str = "",
+        terminal_id: str = "",
         detected_agent: "str | None" = None,
         tab_id: str = "",
     ) -> str:
@@ -301,6 +303,7 @@ class FakeHerdr:
             logical_name=name,
             pane_id=pane_id,
             workspace_id=workspace_id,
+            terminal_id=terminal_id or f"terminal:{pane_id}",
             provider=provider,
             status=status,
             cwd=cwd,
@@ -562,6 +565,7 @@ class FakeHerdr:
             logical_name=_logical_name_from_env(parsed.env) or parsed.name,
             pane_id=pane_id,
             workspace_id=ws.workspace_id,
+            terminal_id=f"terminal:{pane_id}",
             provider=parsed.provider,
             cwd=parsed.cwd,
             tab_id=parsed.tab_id,
@@ -607,7 +611,10 @@ class FakeHerdr:
     def _cmd_agent_list(self, argv):
         rows = []
         for agent in self._agents.values():
-            row = {"name": agent.name, "agent_status": agent.status}
+            row = {
+                "name": agent.name, "agent_status": agent.status,
+                "terminal_id": agent.terminal_id,
+            }
             row[self.locator_render_key] = agent.pane_id
             # Live rows carry the slot's tab (#13411); render it when the
             # agent lives in one so a heal can rejoin the same tab.
@@ -939,6 +946,7 @@ class FakeHerdr:
                 {
                     "name": a.name, "logical_name": a.logical_name,
                     "pane_id": a.pane_id, "workspace_id": a.workspace_id,
+                    "terminal_id": a.terminal_id,
                     "provider": a.provider, "cwd": a.cwd, "status": a.status, "tab_id": a.tab_id,
                     "revision": a.revision, "detected_agent": a.detected_agent,
                 }
@@ -982,6 +990,7 @@ class FakeHerdr:
             fake._agents[ad["pane_id"]] = _Agent(
                 name=ad["name"], logical_name=ad.get("logical_name", ad["name"]),
                 pane_id=ad["pane_id"], workspace_id=ad["workspace_id"],
+                terminal_id=ad.get("terminal_id", f"terminal:{ad['pane_id']}"),
                 provider=ad.get("provider", ""), cwd=ad.get("cwd", ""),
                 status=ad.get("status", DEFAULT_START_STATUS), tab_id=ad.get("tab_id", ""),
                 revision=ad.get("revision", ""), detected_agent=ad.get("detected_agent"),
@@ -1006,6 +1015,7 @@ class FakeHerdr:
             "name": a.logical_name or a.name,
             "native_name": a.name if a.logical_name and a.logical_name != a.name else "",
             "pane_id": a.pane_id,
+            "terminal_id": a.terminal_id,
             "status": a.status,
         }
 

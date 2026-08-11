@@ -23,6 +23,26 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 
 ACTION_SCHEMA_VERSION = 1
 
+_ACTION_FIELDS = frozenset(
+    {
+        "schema_version",
+        "action_id",
+        "plan_digest",
+        "plan",
+        "approval",
+        "private_bindings",
+        "state",
+        "active_phase",
+        "completed_phases",
+        "phase_receipts",
+        "attempts",
+        "last_reason",
+        "last_detail",
+        "created_at",
+        "updated_at",
+    }
+)
+
 ACTION_PREPARED = "prepared"
 ACTION_DELEGATED = "delegated"
 ACTION_RUNNING = "running"
@@ -58,6 +78,7 @@ EXECUTION_PHASES = (
     "migrate_attestation",
     "migrate_lane_lifecycle",
     "migrate_startup_transaction",
+    "rebuild_launch_generation",
     "exact_runtime_install",
     "legacy_lane_epoch_adoption",
     "top_restore_action_bootstrap",
@@ -119,7 +140,7 @@ def verify_plan(plan: object, expected_digest: object) -> Mapping[str, object]:
         raise OfflineRolloutActionError("plan_invalid")
     if canonical_digest(plan) != digest:
         raise OfflineRolloutActionError("plan_digest_mismatch")
-    if plan.get("schema_version") != 3:
+    if type(plan.get("schema_version")) is not int or plan.get("schema_version") != 4:
         raise OfflineRolloutActionError("plan_schema_unsupported")
     phases = plan.get("phase_order")
     if not isinstance(phases, list) or not phases:
@@ -170,19 +191,57 @@ def verify_plan(plan: object, expected_digest: object) -> Mapping[str, object]:
     if artifact.get("distribution") != "testpypi":
         raise OfflineRolloutActionError("artifact_distribution_unsupported")
     stores = plan.get("stores")
-    targets = {"attestation": 3, "lane_lifecycle": 10, "startup_transaction": 2}
+    targets = {
+        "attestation": 4, "lane_lifecycle": 11,
+        "launch_generation": 2, "startup_transaction": 2,
+    }
     if not isinstance(stores, Mapping) or set(stores) != set(targets):
         raise OfflineRolloutActionError("plan_store_set_invalid")
     for name, target in targets.items():
         record = stores[name]
+        if not isinstance(record, Mapping):
+            raise OfflineRolloutActionError(f"plan_{name}_not_execution_ready")
+        launch_absent = name == "launch_generation" and record.get("state") == "absent"
         if (
             not isinstance(record, Mapping)
-            or record.get("state") != "recognized"
+            or (record.get("state") != "recognized" and not launch_absent)
+            or type(record.get("target_version")) is not int
             or record.get("target_version") != target
-            or not isinstance(record.get("content_digest"), str)
-            or not _SHA256.fullmatch(record["content_digest"])
+            or (
+                not launch_absent
+                and type(record.get("version")) is not int
+            )
+            or (
+                not launch_absent
+                and (
+                    not isinstance(record.get("content_digest"), str)
+                    or not _SHA256.fullmatch(record["content_digest"])
+                )
+            )
         ):
             raise OfflineRolloutActionError(f"plan_{name}_not_execution_ready")
+        if name == "launch_generation":
+            version = record.get("version")
+            if launch_absent:
+                exact_absent = (
+                    version is None
+                    and record.get("content_digest") == ""
+                    and record.get("migration_plan_digest") == ""
+                    and record.get("upgrade_required") is False
+                )
+                if not exact_absent:
+                    raise OfflineRolloutActionError(
+                        "plan_launch_generation_not_execution_ready"
+                    )
+            elif (
+                type(version) is not int
+                or version not in (1, 2)
+                or record.get("upgrade_required") is not (version == 1)
+                or record.get("migration_plan_digest") != ""
+            ):
+                raise OfflineRolloutActionError(
+                    "plan_launch_generation_not_execution_ready"
+                )
     startup_digest = stores["startup_transaction"].get("migration_plan_digest", "")
     if not isinstance(startup_digest, str) or not _SHA256.fullmatch(startup_digest):
         raise OfflineRolloutActionError("plan_startup_migration_digest_invalid")
@@ -194,8 +253,34 @@ def verify_plan(plan: object, expected_digest: object) -> Mapping[str, object]:
         }
         for name in sorted(targets)
     ]
-    if plan.get("schema_transitions") != expected_transitions:
+    transitions = plan.get("schema_transitions")
+    if (
+        not isinstance(transitions, list)
+        or any(
+            not isinstance(item, Mapping)
+            or (
+                type(item.get("from_version")) is not int
+                and not (
+                    item.get("store") == "launch_generation"
+                    and stores["launch_generation"].get("state") == "absent"
+                    and item.get("from_version") is None
+                )
+            )
+            or type(item.get("to_version")) is not int
+            for item in transitions
+        )
+        or transitions != expected_transitions
+    ):
         raise OfflineRolloutActionError("plan_schema_transitions_invalid")
+    for phase_name, target in (
+        ("migrate_attestation", 4),
+        ("migrate_lane_lifecycle", 11),
+        ("migrate_startup_transaction", 2),
+        ("rebuild_launch_generation", 2),
+    ):
+        value = phases_by_name[phase_name].get("target_version")
+        if type(value) is not int or value != target:
+            raise OfflineRolloutActionError("plan_phase_target_version_invalid")
     recoveries = plan.get("legacy_recoveries")
     if not isinstance(recoveries, list):
         raise OfflineRolloutActionError("plan_legacy_recoveries_invalid")
@@ -490,7 +575,12 @@ def new_action(
 def validate_action(action: object) -> Mapping[str, object]:
     if not isinstance(action, Mapping):
         raise OfflineRolloutActionError("action_invalid")
-    if action.get("schema_version") != ACTION_SCHEMA_VERSION:
+    if set(action) != _ACTION_FIELDS:
+        raise OfflineRolloutActionError("action_shape_invalid")
+    if (
+        type(action.get("schema_version")) is not int
+        or action.get("schema_version") != ACTION_SCHEMA_VERSION
+    ):
         raise OfflineRolloutActionError("action_schema_unsupported")
     if not _ACTION_ID.fullmatch(_token(action.get("action_id"), "action_id")):
         raise OfflineRolloutActionError("action_id_invalid")

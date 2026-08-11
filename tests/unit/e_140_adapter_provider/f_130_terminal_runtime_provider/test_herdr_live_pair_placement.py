@@ -192,6 +192,7 @@ class FakeGenerationStore:
         self.rows = rows
         self.reads = 0
         self.replace_after_reads = 0
+        self.startup_completed = True
 
     def read(self, assigned_name: str):
         self.reads += 1
@@ -213,6 +214,20 @@ class FakeGenerationStore:
                 attested_at=row.attested_at,
             )
         return row
+
+    def verified(self, _home, **expected):
+        row = self.read(expected["assigned_name"])
+        if not self.startup_completed or row is None or any((
+            row.phase != GENERATION_ATTESTED,
+            row.verdict != VERDICT_PRESENT,
+            row.workspace_id != expected["workspace_id"],
+            row.role != expected["role"],
+            row.lane_id != expected["lane_id"],
+            row.locator != expected["locator"],
+            row.terminal_id != expected["live_terminal_id"],
+        )):
+            return ""
+        return row.startup_action_id
 
 
 class HerdrLivePairPlacementTests(unittest.TestCase):
@@ -266,6 +281,7 @@ class HerdrLivePairPlacementTests(unittest.TestCase):
                 role=provider,
                 lane_id=LANE_ID,
                 locator=pane_by_provider[provider],
+                terminal_id=f"terminal:{pane_by_provider[provider]}",
                 verdict=VERDICT_PRESENT,
                 observed_at="now",
                 reserved_at="now",
@@ -279,6 +295,7 @@ class HerdrLivePairPlacementTests(unittest.TestCase):
             runner=herdr,
             lister=HerdrCliAgentLister("herdr", runner=herdr),
             generation_store=generations,
+            generation_verifier=generations.verified,
             workspace_loader=lambda workspace_id: (
                 self.record if workspace_id == WORKSPACE_ID else None
             ),
@@ -493,6 +510,13 @@ class HerdrLivePairPlacementTests(unittest.TestCase):
         self.assertEqual(plan.reason, REASON_GENERATION_UNVERIFIED)
         self.assertEqual(self._mutations(herdr), [])
         self.assertFalse(any(call[:2] == ["pane", "layout"] for call in herdr.calls))
+
+    def test_unsettled_startup_transaction_refuses_before_mutation(self) -> None:
+        service, herdr, generations, _ = self._build(split="right")
+        generations.startup_completed = False
+        plan = service.preview(WORKSPACE_ID)
+        self.assertEqual(plan.reason, REASON_GENERATION_UNVERIFIED)
+        self.assertEqual(self._mutations(herdr), [])
 
     def test_provider_mismatch_and_shell_residue_refuse_before_mutation(self) -> None:
         for mode in ("provider", "stale"):

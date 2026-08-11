@@ -5,12 +5,12 @@ The #13748 launcher preflight (:func:`...herdr_pane_lifecycle
 ``herdr agent-attest`` subcommand by matching :data:`...herdr_launch_argv
 .ATTEST_CAPABILITY_MARKER` (``--assigned-name``) in its ``--help`` output. That is a
 **subcommand-marker** check only. It cannot see the failure #13847 closes: the source
-runtime's startup self-attestation store is schema v2
+runtime's startup self-attestation store is schema v4
 (:data:`...herdr_identity_attestation.HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION`), but a
 managed launch may be wrapped through an *older installed* launcher whose attestation
 store is v1. Both launchers carry ``agent-attest`` and ``--assigned-name`` — so the
 subcommand-marker probe passes — yet the v1 launcher, injected with the source runtime's
-shared ``MOZYO_BRIDGE_HOME``, opens the v2 store, hits the exact-version write guard
+shared ``MOZYO_BRIDGE_HOME``, opens the v4 store, hits the exact-version write guard
 (``_connect_rw``), silently drops the attestation, and ``exec``s the provider anyway. The
 pair boots **live but unattested / stale**, and every downstream verify (adopt, resume,
 recover) fails closed with no public recovery — the live evidence in the issue.
@@ -311,7 +311,9 @@ def build_attest_capability_epilog() -> str:
     """
     from mozyo_bridge.core.state.herdr_identity_attestation import (
         HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
-        RECOGNIZED_SCHEMA_VERSIONS,
+    )
+    from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
+        WRITABLE_SCHEMA_VERSIONS,
     )
     from mozyo_bridge.core.state.herdr_launch_generation import (
         HERDR_LAUNCH_GENERATION_PROTOCOL_VERSION,
@@ -326,7 +328,7 @@ def build_attest_capability_epilog() -> str:
             HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION
         )
         + "\nwritable attestation store shapes (Redmine #13882):\n"
-        + build_attest_capability_stores_line(RECOGNIZED_SCHEMA_VERSIONS)
+        + build_attest_capability_stores_line(WRITABLE_SCHEMA_VERSIONS)
         + "\nrepo-local config parse contract (Redmine #14258):\n"
         + build_attest_capability_config_parse_line(CONFIG_PARSE_CONTRACT_VERSION)
         + "\nreadable shared lane lifecycle schema (Redmine #14258):\n"
@@ -579,8 +581,9 @@ def decide_store_compatibility(
        dropped" shape, on the axis the resume generation proof depends on);
     5. the probed launcher cannot prove it writes this shape ->
        :data:`STORE_LAUNCHER_CANNOT_WRITE`;
-    6. otherwise :data:`STORE_JOIN_OK` — including the v1-store / normal-launch case,
-       which acceptance 2 admits via the proven backward-compatible write path.
+    6. otherwise :data:`STORE_JOIN_OK` — only an absent store or an exact writable-v4
+       store. Recognized v1-v3 stores remain readable diagnostics but are never writable
+       managed-launch authority.
     """
     if store.state == _STORE_UNREADABLE_STATE:
         return LauncherCapabilityVerdict(
@@ -628,6 +631,14 @@ def decide_store_compatibility(
     )
     if epoch_refusal is not None:
         return LauncherCapabilityVerdict(False, *epoch_refusal)
+    if version != int(required_schema_version):
+        return LauncherCapabilityVerdict(
+            False,
+            STORE_LAUNCHER_CANNOT_WRITE,
+            f"the selected attestation store is v{version}, but a managed launch now "
+            f"requires the v{int(required_schema_version)} terminal-identity shape. "
+            f"Older shapes remain readable only; migrate before launch: {_MIGRATE_HINT}",
+        )
     if version not in observation.writable_store_versions:
         provable = (
             "advertises no writable-store set, so it is credited only with its native "

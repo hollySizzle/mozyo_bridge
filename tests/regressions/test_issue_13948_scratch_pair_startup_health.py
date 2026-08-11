@@ -984,7 +984,9 @@ class ClassifyRollbackTest(unittest.TestCase):
 
     def test_a_replay_is_answered_from_the_record_not_by_closing_again(self):
         self.assertEqual(
-            classify_rollback(self._facts(recorded_closed=True)), ROLLBACK_ALREADY_CLOSED
+            classify_rollback(self._facts(
+                recorded_closed=True, absence_generation_bound=True
+            )), ROLLBACK_ALREADY_CLOSED
         )
 
     def test_unreadable_inventory_closes_nothing(self):
@@ -1005,7 +1007,9 @@ class ClassifyRollbackTest(unittest.TestCase):
         # (#13847 R1-F1 / #13892). Absence is NOT a licence to close the address it used
         # to live at: `eligible` covered both, so the rail handed the recorded locator to
         # close and shut down a foreign agent that had since taken that pane id.
-        verdict = classify_rollback(self._facts(name_matches=0))
+        verdict = classify_rollback(self._facts(
+            name_matches=0, absence_generation_bound=True
+        ))
         self.assertEqual(verdict, ROLLBACK_ABSENT)
         self.assertIn(verdict, ROLLBACK_SETTLED)
         self.assertNotIn(verdict, ROLLBACK_CLOSE_TARGETS)
@@ -1123,7 +1127,11 @@ class _RollbackOps:
     """
 
     def __init__(self, rows, *, obligations=(), obligations_unreadable=False):
-        self.rows = list(rows)
+        self.rows = []
+        for source in rows:
+            row = dict(source)
+            row.setdefault("terminal_id", f"terminal:{row.get('agent', 'unknown')}")
+            self.rows.append(row)
         self._obligations = tuple(obligations)
         self._obligations_unreadable = obligations_unreadable
         self.inventory_readable = True
@@ -1165,6 +1173,13 @@ class _RollbackOps:
                 self.rows = [r for r in self.rows if r.get("pane_id") != locator]
         return _CloseResult(closed=closed, failed=failed)
 
+    def close_current_generation(self, action, targets, *, store_home):
+        return self.close(action.unit.workspace_id, action.unit.lane_id, targets)
+
+    def current_generation_targets_absent(self, action, targets, *, store_home):
+        live = {row.get("pane_id") for row in self.agent_rows()}
+        return all(locator not in live for _role, locator in targets)
+
 
 class _Obligation:
     def __init__(self, target):
@@ -1198,7 +1213,52 @@ class SessionRollbackRailTest(unittest.TestCase):
                 ),
             )
         self.fence.set_phase(action.action_id, PHASE_ROLLBACK_OWED)
-        return self.fence.read(action.action_id)
+        current = self.fence.read(action.action_id)
+        self._seed_authority(current)
+        return current
+
+    def _seed_authority(self, current):
+        from mozyo_bridge.core.state.herdr_identity_attestation import (
+            HerdrIdentityAttestationStore,
+            IdentityAttestationRecord,
+            VERDICT_PRESENT,
+        )
+        from mozyo_bridge.core.state.herdr_launch_generation import (
+            HerdrLaunchGenerationStore,
+        )
+
+        generation = HerdrLaunchGenerationStore(home=self.home)
+        attestations = HerdrIdentityAttestationStore(home=self.home)
+        for participant in current.participants:
+            terminal = f"terminal:{participant.role}"
+            generation.reserve_pending(
+                assigned_name=participant.assigned_name,
+                startup_action_id=current.action_id,
+                workspace_id=current.unit.workspace_id,
+                role=participant.role,
+                lane_id=current.unit.lane_id,
+            )
+            generation.finalize(
+                assigned_name=participant.assigned_name,
+                startup_action_id=current.action_id,
+                workspace_id=current.unit.workspace_id,
+                role=participant.role,
+                lane_id=current.unit.lane_id,
+                locator=participant.locator,
+                terminal_id=terminal,
+                verdict=VERDICT_PRESENT,
+                observed_at="2026-08-11T00:00:00+00:00",
+            )
+            attestations.upsert(IdentityAttestationRecord(
+                participant.assigned_name,
+                current.unit.workspace_id,
+                participant.role,
+                current.unit.lane_id,
+                participant.locator,
+                VERDICT_PRESENT,
+                observed_at="2026-08-11T00:00:00+00:00",
+                terminal_id=terminal,
+            ))
 
     def _rows(self, *roles):
         return [
@@ -1207,6 +1267,7 @@ class SessionRollbackRailTest(unittest.TestCase):
                 "pane_id": f"w2G:p{3 + ('claude', 'codex').index(role)}",
                 "agent": role,
                 "agent_status": "idle",
+                "terminal_id": f"terminal:{role}",
             }
             for role in roles
         ]
@@ -1402,6 +1463,21 @@ class SessionRollbackRailTest(unittest.TestCase):
         self.assertEqual(verdict.reason, REASON_AUTHORITY_UNAVAILABLE)
         self.assertFalse(ops.close_calls)
 
+    def test_terminal_replay_rejects_private_terminal_reclaimed_under_another_name(self):
+        action = self._owed_action()
+        first = _RollbackOps(self._rows("claude", "codex"))
+        self.assertTrue(self._run(first, action, execute=True).ok)
+        moved = _RollbackOps([{
+            "name": "mzb1_other_claude_elsewhere",
+            "pane_id": "w9:p9",
+            "agent": "claude",
+            "agent_status": "idle",
+            "terminal_id": "terminal:claude",
+        }])
+        replay = self._run(moved, action, execute=True)
+        self.assertEqual(replay.reason, REASON_INCOMPLETE)
+        self.assertFalse(moved.close_calls)
+
     def test_a_corrupt_authority_is_a_structured_refusal_not_a_raw_error(self):
         # Review j#81092 R2-F2: a store whose bytes are not a database raised a raw
         # sqlite3.DatabaseError straight out of the public rail — the "never raises"
@@ -1458,6 +1534,7 @@ class SessionRollbackRailTest(unittest.TestCase):
                 role="codex", assigned_name="mzb1_ws1_codex_lane-1", locator="w2G:p4"
             ),
         )
+        self._seed_authority(self.fence.read(action.action_id))
         ops = _RollbackOps(self._rows("codex"))
         verdict = run_session_rollback(
             action_id=action.action_id, ops=ops, fence=self.fence, execute=True
@@ -1484,11 +1561,8 @@ class SessionRollbackRailTest(unittest.TestCase):
         self.assertFalse(
             ops.close_calls, f"closed a foreign agent: {ops.close_calls}"
         )
-        # Both participants are positively absent -> the action is settled, not a failure.
-        self.assertTrue(verdict.ok)
-        self.assertEqual(
-            {p.verdict for p in verdict.participants}, {ROLLBACK_ABSENT}
-        )
+        self.assertFalse(verdict.ok)
+        self.assertEqual(verdict.reason, REASON_BLOCKED)
 
     def test_a_mix_of_absent_and_live_closes_only_the_live_one(self):
         action = self._owed_action()
@@ -1501,8 +1575,8 @@ class SessionRollbackRailTest(unittest.TestCase):
         ]
         ops = _RollbackOps(rows)
         verdict = self._run(ops, action, execute=True)
-        self.assertEqual([c for c in ops.close_calls[0]], [("codex", "w2G:p4")])
-        self.assertTrue(verdict.ok)
+        self.assertFalse(ops.close_calls)
+        self.assertEqual(verdict.reason, REASON_BLOCKED)
 
     def test_a_startup_screen_over_an_unreadable_composer_is_preserved(self):
         # Review j#81070 R1-F3: a recognised trust screen used to license a close even
@@ -1665,6 +1739,7 @@ class SessionRollbackRailTest(unittest.TestCase):
                         locator="w2G:p4", receipt="w"),
         )
         self.fence.set_phase(action.action_id, PHASE_HEALTH_CHECK)  # crashed here
+        self._seed_authority(self.fence.read(action.action_id))
         ops = _RollbackOps(self._rows("codex"))
         verdict = run_session_rollback(
             action_id=action.action_id, ops=ops, fence=self.fence, execute=True
@@ -1700,7 +1775,7 @@ class SessionRollbackRailTest(unittest.TestCase):
         with _patch.object(StartupTransactionFence, "read", _racey_read):
             verdict = self._run(ops, action, execute=True)
         self.assertFalse(ops.close_calls, "re-closed a pane after a concurrent completion")
-        self.assertEqual(verdict.reason, REASON_ALREADY_ROLLED_BACK)
+        self.assertEqual(verdict.reason, REASON_INCOMPLETE)
 
     def test_a_participant_added_between_read_and_lock_is_not_closed(self):
         # Review j#81244 R8-F1: R7 closed the terminal-change race but not the participant-

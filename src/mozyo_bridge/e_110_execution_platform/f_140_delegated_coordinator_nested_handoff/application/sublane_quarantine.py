@@ -103,6 +103,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _norm,
     _norm_lane,
     decode_assigned_name,
+    terminal_identity_of_live_slot,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_state import (  # noqa: E501
     HerdrCliAgentStateReader,
@@ -147,8 +148,6 @@ def observe_composer_text(content: object) -> ComposerObservation:
         return ComposerObservation(False, None)
     if not prompt_body:
         return ComposerObservation(True, False)
-    # A marker may be hard-wrapped mid-token. Collapse whitespace only inside the
-    # current composer tail, never the whole pane/scrollback.
     composer_tail = "".join("".join(lines[prompt_index:]).split())
     markers = tuple(dict.fromkeys(_HANDOFF_MARKER_RE.findall(composer_tail)))
     return ComposerObservation(True, True, markers)
@@ -204,7 +203,6 @@ class QuarantineInspection:
     row_revision: int = -1
     attested_at: str = ""
     receiver_present: Optional[bool] = None
-    # Empty means no provider-owned generation; body-derived substitutes are forbidden.
     composer_generation: str = ""
     detail: str = ""
 
@@ -239,9 +237,6 @@ class QuarantineOutcome:
     closed_old_receiver: bool = False
     fresh_locator: str = ""
     detail: str = ""
-    #: The shared-store schema migration this quarantine's replacement write gate performed, if
-    #: any (Redmine #13844 R3-F2): the typed audit record so the migration is legible in JSON/text,
-    #: not only the pre-migration stderr advisory.
     lifecycle_migration: Optional[dict[str, Any]] = None
 
     @property
@@ -270,6 +265,8 @@ class QuarantineOutcome:
 @runtime_checkable
 class SublaneQuarantineOps(Protocol):
     def inspect(self, request: QuarantineRequest) -> QuarantineInspection: ...
+
+    def current_close_pin(self, request: QuarantineRequest) -> Optional[ReleasePin]: ...
 
     def close_receiver(
         self, request: QuarantineRequest, pin: ReleasePin
@@ -331,7 +328,6 @@ class SublaneQuarantineUseCase:
         inspection: QuarantineInspection,
         classification: PendingComposerClassification,
     ) -> str:
-        """Why this approval cannot act on the receiver observed right now."""
         request_reason = disposition_request_reason(request)
         if request_reason:
             return request_reason
@@ -356,7 +352,6 @@ class SublaneQuarantineUseCase:
         *,
         expected_revision: int,
     ) -> str:
-        """Re-read the shared authority immediately before a disposition effect."""
         if not request.has_disposition_tokens:
             return ""
         try:
@@ -368,17 +363,11 @@ class SublaneQuarantineUseCase:
         )
 
     def _capture_migration(self) -> None:
-        """Accumulate the schema migration performed by this run (#13844)."""
         self._operation_migration = self._operation_migration or lifecycle_migration_payload(
             getattr(self.store, "last_write_preparation", None)
         )
 
     def run(self, request: QuarantineRequest, *, execute: bool) -> QuarantineOutcome:
-        # Redmine #13844 R5-F1: the schema migration this ONE command performs is captured
-        # operation-scoped — reset at the start of every run(), so a REUSED use case / store never
-        # carries a PAST run's migration into this action's audit. It is folded in after EACH of
-        # this run's schema-needing writes (see :meth:`_capture_migration`); a read-only / preflight
-        # run never sets it.
         self._operation_migration: Optional[dict[str, Any]] = None
         inspection = self.ops.inspect(request)
         classification = inspection.classification
@@ -491,23 +480,34 @@ class SublaneQuarantineUseCase:
                 detail="lane lifecycle owner is absent / foreign / inactive",
             )
 
-        try:
-            pin = ReleasePin(
-                role=request.role,
-                assigned_name=request.assigned_name,
-                locator=request.locator,
+        stored_generation = current.state in (
+            REPLACEMENT_REQUESTED, REPLACEMENT_PENDING, REPLACEMENT_REPLACED,
+        )
+        if stored_generation:
+            if current.pin_version != 2 or len(current.pins) != 1:
+                return self._base_outcome(
+                    request, classification, executed=True,
+                    replacement_state=current.state,
+                    detail="stored replacement pin is legacy or malformed; zero-close",
+                )
+            pin = current.pins[0]
+        else:
+            pin = self.ops.current_close_pin(request)
+            if pin is None:
+                return self._base_outcome(
+                    request, classification, executed=True,
+                    replacement_state=current.state,
+                    detail=(
+                        "approved receiver lacks exact completed current-generation authority"
+                    ),
+                )
+        exact_generation = current.action_id == expected_action and (
+            not stored_generation
+            or (
+                pin.role == _norm(request.role)
+                and pin.assigned_name == _norm(request.assigned_name)
+                and pin.locator == _norm(request.locator)
             )
-        except ReleasePinError:
-            return self._base_outcome(
-                request,
-                classification,
-                executed=True,
-                replacement_state=current.state,
-                detail="approved receiver pin is incomplete",
-            )
-
-        exact_generation = (
-            current.action_id == expected_action and current.pins == (pin,)
         )
         if current.state == REPLACEMENT_REPLACED and exact_generation:
             lifecycle_reason = self._disposition_lifecycle_reason(
@@ -557,10 +557,6 @@ class SublaneQuarantineUseCase:
                     detail=f"disposition lifecycle refused ({lifecycle_reason}); zero actuation",
                 )
         else:
-            # Opening a NEW generation depends on the current transient composer
-            # observation. A stored generation is resumed instead of re-opened — but
-            # resuming never means acting blind: an owed close re-runs these same
-            # fences below (R1-F1 j#78347).
             stale = self._approval_stale_reason(request, inspection, classification)
             if stale:
                 return self._base_outcome(
@@ -680,8 +676,6 @@ class SublaneQuarantineUseCase:
                     detail="replacement row vanished after pending record",
                 )
 
-        # ``pending`` is deliberately the durable partial-launch state. A redrive
-        # starts here and never closes the old locator a second time.
         lifecycle_reason = self._disposition_lifecycle_reason(
             request,
             key,
@@ -760,15 +754,12 @@ class SublaneQuarantineUseCase:
 @dataclass
 class LiveSublaneQuarantineOps:
     repo_root: Path
+    home: Optional[Path] = None
     env: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
     runner: Optional[Runner] = None
     timeout: float = COMMAND_TIMEOUT_SECONDS
-    #: Redmine #14065 Phase 2: injected ghost render policy (``None`` = gate OFF /
-    #: byte-unchanged); ``render_facts_reader`` lets a hermetic test supply facts.
     ghost_policy: Optional[GhostComposerRenderPolicy] = None
     render_facts_reader: Optional[Callable[[str], RenderGhostFacts]] = None
-    #: Optional provider capability. The CLI leaves it unwired until Herdr exposes an opaque
-    #: composer generation; absence deliberately disables uncorrelated draft discard.
     composer_generation_reader: Optional[Callable[[str], str]] = None
     journal_reader: Optional[object] = None
     journal_reader_fresh: bool = False
@@ -847,16 +838,9 @@ class LiveSublaneQuarantineOps:
             and _norm(row.get(AGENT_KEY_NAME)) == _norm(request.assigned_name)
         ]
         exact = [row for row in matches if _agent_locator(row) == _norm(request.locator)]
-        # Presence is the exact pinned pair being live AT ALL — deliberately not the
-        # unique-row test below. An ambiguous inventory still means something is live at
-        # that locator, so an owed close must re-validate rather than treat it as the
-        # crash-after-close case (R1-F1 j#78347).
         present = bool(exact)
         row = exact[0] if len(exact) == 1 and len(matches) == 1 else None
         if row is None:
-            # Zero or several rows for the exact pinned (name, locator). Redmine #15193: the
-            # axis is reported so the operator sees WHY the generation did not match, but the
-            # pending fact stays ``None`` — an ambiguous inventory can never be disposed of.
             return QuarantineInspection(
                 workspace_id=workspace_id,
                 signal=PendingComposerSignal(
@@ -884,12 +868,6 @@ class LiveSublaneQuarantineOps:
             if isinstance(revision_raw, int) and not isinstance(revision_raw, bool)
             else -1
         )
-        # Redmine #15193: the same four checks as before, but each is evaluated and NAMED
-        # separately instead of being folded into one opaque boolean. `generation_ok` is
-        # still their conjunction, so the classification is byte-identical; the axis tuple is
-        # purely additive and is what lets an owner approval say which condition it is
-        # granted over (#15110 j#102068 / #15140 j#102064 / #15195 j#102193 each hit a
-        # DIFFERENT axis, and the collapsed boolean made them indistinguishable).
         axis_checks = (
             (GEN_AXIS_IDENTITY, identity_ok),
             (GEN_AXIS_REVISION, revision == request.approved_revision),
@@ -908,6 +886,8 @@ class LiveSublaneQuarantineOps:
         attestation = evaluate_attestation(
             attestation_record,
             live_locator=_norm(request.locator),
+            live_terminal_id=terminal_identity_of_live_slot(
+                request.assigned_name, request.locator, rows),
             expected_workspace_id=workspace_id,
             expected_role=_norm(request.role),
             expected_lane=_norm_lane(request.lane),
@@ -929,22 +909,12 @@ class LiveSublaneQuarantineOps:
         except Exception:  # noqa: BLE001 - transport failure is inventory_unreadable
             runtime_state = "unknown"
             observation = ComposerObservation(False, None)
-        correlated: list[str] = []
+        from .herdr_live_attestation_time import correlated_delivery_markers, fresh_attestation_identity
+        boundary = fresh_attestation_identity(
+            home=None, rows=rows, assigned_name=request.assigned_name,
+            workspace_id=workspace_id, role=request.role, lane=request.lane)
         ledger = HerdrDeliveryLedger()
-        for marker in observation.marker_ids:
-            records = ledger.records_for_marker(marker)
-            if any(
-                _norm(record.target) in (
-                    _norm(request.locator),
-                    _norm(request.assigned_name),
-                )
-                for record in records
-            ):
-                correlated.append(marker)
-        # Redmine #14065 Phase 2: a dim ghost the provider declares empties the text
-        # pending candidate at action time; everything else (normal/mixed/unknown,
-        # unreadable, unresolved provider, missing observation, no injected policy)
-        # preserves. The render read runs only when the text observation reported pending.
+        correlated = correlated_delivery_markers(observation.marker_ids, ledger, boundary)
         effective_has_pending = apply_ghost_empty(
             observation.has_pending,
             policy=self.ghost_policy,
@@ -993,33 +963,49 @@ class LiveSublaneQuarantineOps:
             self, request, inspection
         )
 
+    def current_close_pin(self, request: QuarantineRequest) -> Optional[ReleasePin]:
+        from .herdr_destructive_close_identity import current_generation_release_pin
+
+        try:
+            rows = tuple(self._rows())
+            workspace_id = repo_scope_workspace_id(self.repo_root)
+        except Exception:  # noqa: BLE001 - destructive authority is unreadable
+            return None
+        return current_generation_release_pin(
+            rows,
+            home=self.home,
+            workspace_id=workspace_id,
+            lane_id=request.lane,
+            role=request.role,
+            assigned_name=request.assigned_name,
+            locator=request.locator,
+        )
+
     def close_receiver(
         self, request: QuarantineRequest, pin: ReleasePin
     ) -> CloseReceiverResult:
         workspace_id = repo_scope_workspace_id(self.repo_root)
         try:
-            rows = self._rows()
+            rows = tuple(self._rows())
+            from .herdr_destructive_close_identity import pinned_generation_partition
+            partition = pinned_generation_partition(
+                (pin,), rows, home=self.home, workspace_id=workspace_id,
+                lane_id=request.lane,
+            )
+            if partition is None:
+                return CloseReceiverResult(False, detail="close_generation_not_current")
+            live_pins, absent_pins = partition
+            if absent_pins:
+                return CloseReceiverResult(
+                    closed=False, old_absent=True, detail="old_receiver_absent"
+                )
             plan = pin_matched_close_plan(
-                (pin,), rows, workspace_id=workspace_id, lane_id=request.lane
+                live_pins, rows, workspace_id=workspace_id, lane_id=request.lane
             )
         except Exception:  # noqa: BLE001 - close preflight failure is zero close
             return CloseReceiverResult(False, detail="close_preflight_unreadable")
         if plan is None:
             return CloseReceiverResult(False, detail="close_pin_inconsistent")
-        if not plan.close_targets:
-            # Old exact locator already vanished. A recycled assigned name at a
-            # different locator is NOT absence; it is a newer generation and stale approval.
-            recycled = any(
-                isinstance(row, Mapping)
-                and _norm(row.get(AGENT_KEY_NAME)) == pin.assigned_name
-                and _agent_locator(row) != pin.locator
-                for row in rows
-            )
-            return CloseReceiverResult(
-                closed=False,
-                old_absent=not recycled,
-                detail="old_receiver_absent" if not recycled else "assigned_name_recycled",
-            )
         result = execute_herdr_retire_close(
             HerdrRetireClosePlan(
                 workspace_id=plan.workspace_id,
@@ -1030,6 +1016,16 @@ class LiveSublaneQuarantineOps:
             runner=self.runner,
             timeout=self.timeout,
         )
+        if result.closed and not result.failed:
+            try:
+                from .herdr_destructive_close_identity import pinned_generations_absent
+                absent = pinned_generations_absent(
+                    (pin,), tuple(self._rows()), home=self.home,
+                    workspace_id=workspace_id, lane_id=request.lane)
+            except Exception:  # noqa: BLE001 - absence must be positively proven
+                absent = False
+            if not absent:
+                return CloseReceiverResult(False, detail="close_absence_unproven")
         return CloseReceiverResult(
             closed=bool(result.closed) and not result.failed,
             detail="closed" if result.closed and not result.failed else "close_failed",
@@ -1077,6 +1073,8 @@ class LiveSublaneQuarantineOps:
         joined = evaluate_attestation(
             record,
             live_locator=locator,
+            live_terminal_id=terminal_identity_of_live_slot(
+                request.assigned_name, locator, rows),
             expected_workspace_id=workspace_id,
             expected_role=request.role,
             expected_lane=request.lane,

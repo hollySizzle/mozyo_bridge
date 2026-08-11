@@ -136,8 +136,9 @@ def register_herdr_attestation_store_parser(herdr_sub, *, add_repo_option=None) 
         help=(
             "Redmine #13882: inspect / migrate / rebuild the home-scoped startup "
             "self-attestation store. A shared home is written by launchers of several "
-            "vintages, so an older store is left as-is and read compatibly rather than "
-            "migrated by a launch; this is the public rail for changing it on purpose. "
+            "vintages: v1-v3 remain readable for diagnosis, but managed launch writes "
+            "require terminal-bound v4 and refuse older stores before effects. This is "
+            "the public backup-first rail for changing the schema on purpose. "
             "Backup-first and idempotent; requires no raw SQLite; closes, sends to, and "
             "launches NO process; refuses while managed agents are live."
         ),
@@ -158,8 +159,8 @@ def register_herdr_attestation_store_parser(herdr_sub, *, add_repo_option=None) 
         "migrate",
         help=(
             "Additive forward migration of a recognized older store (backup-first, "
-            "idempotent). Needed only to admit REPLACEMENT launches, which the older "
-            "shape cannot carry; normal launches already work read-compatibly. After "
+            "idempotent). Needed before any managed launch because older shapes cannot "
+            "carry the server-owned terminal identity. After "
             "migrating, launchers that write only the older shape are refused visibly "
             "at the managed-launch preflight rather than silently dropped."
         ),

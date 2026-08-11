@@ -115,7 +115,7 @@ same-lane implementation_gateway が **callback delivery 確認済みの provide
   - ★**`launch_authority_reason` とは独立の軸である**。前者は「lane の ambient authority が今どうか」の**観測**、後者は「launch leg が何に fence されたか」。#14480 の live 事故 (#14479 j#88695) は `launch_authority=ok` のまま launch が 2 回失敗した形であり、authority 軸だけでは原因を名指しできない。
   - ★**空 (`null`) と `launch_error` は別の主張である**。空は「launch fence は起きていない」(成功した / launch leg に到達していない)、`launch_error` は「失敗したが typed reason が無い」。空を「正常」と読み替えて良いのは前者だけ。
   - token は **axis / fence 名のみ**で、path・locator・credential・例外散文を含めない。port が返した値が closed-token の形 (`^[a-z][a-z0-9_]{0,63}$`) を満たさない場合は publish せず `launch_error` に落とす (fail-closed)。
-- ★**v1 attestation store 下では launch は exact participant context を要求する** (#14480)。selected store が v1 の間、action binding は participant を key とする side record なので、`launch_or_resume_v1_replacement` は target の `provider` / `assigned_name` / `old_locator` / workspace / lane を必須とし、欠けると `replacement_binding_context_missing` で **launch 自体が不可能**になる (「generic に launch される」ではない)。recovery port はこの context を **pin から** 取る — pin は close / verify が既に通している単一 authority であり、より狭い派生を別途組み立てない。`target_provider` は同時に same-tab postcondition を **その 1 participant に scope** する: actuator は 1 launch あたり 1 participant しか駆動しないため、この edge では pair は構造上 partial である (recover-gateway = gateway closed / worker live、recover-stale = worker closed / gateway live)。**scope しても live split は fail-closed のまま**で、緩むのは *absent* sibling の場合だけ (後続 leg が収束させる)。生存 sibling は `prepare_session` の adopt-or-launch 冪等性で **adopt** され、relaunch も close もされない。
+- ★**replacement launch は v4 attestation + generation-v2 の exact participant authorityを要求する** (#14480/#15227)。`provider` / `assigned_name` / `old_locator` / workspace / lane / server-owned terminal / startup action の全軸を同じ fresh snapshotへ結合し、不足・不一致・duplicate・malformedは **launch前 zero-effect**。v1-v3 side recordは診断専用で、exactであってもcurrent authorityにはならない。対象providerへのscope後もlive splitはfail-closedで、生存siblingはadoptされrelaunch/closeされない。旧homeは4-store offline rolloutでv4/v2へ移行する。
 - 実装正本: `domain/gateway_turn_recovery.py` / `domain/lane_launch_authority.py` (#14475) / `domain/replacement_launch_failure.py` (#14480) / `application/sublane_gateway_recovery*.py` (#14203)。launch context threading は `application/sublane_stale_worker_recovery_live.py` の `LiveRecoveryActuatorPort.launch_action_bound` (recover-gateway / recover-stale 共有 port)。
 
 ## live turn-ended worker の guarded refresh (`sublane refresh-worker`, #14661)
@@ -149,7 +149,7 @@ same-lane implementation_gateway が **callback delivery 確認済みの provide
       - ★**(a) を repo 横断の 1 本にすると、その gate について沈黙している ruling へ全 gate が帰属する** (R6 の実欠陥。#14661 review j#92715)。anchor 文字列は非空なので `is_anchored` は通り、**空 anchor の拒否だけではこの誤帰属を検出できない**。**辿った先がその gate について沈黙している ruling なら、辿れたことにならない**。したがって ruling は role と同じ場所で **gate ごと**に持つ (`contract_ruling_pointer`)。
       - **既存 hibernate-evidence gate (`park_declared` / `review_result` / `required_ci_green` / `integration_disposition` / `dogfood_delegated`) は `redmine:#14219:j#85530:Q3` を維持する**。本 command の追加で既存 evidence の anchor 文字列は 1 文字も変わらない (**re-attribution しない**)。
       - **no-change Review waiver gate `no_change_review_waiver` の ruling は `redmine:#14695:j#93412`** (Design Consultation Answer)。writer role は `coordinator`、provenance 軸は marker の `approval_source=direct_owner` で、両者は連言であり代替関係ではない (#14695 j#93412)。**同一 consultation の先行 Answer j#93406 を pointer にしない** — 両者とも writer を `coordinator` と裁定しており binding 自体は同じだが、hard carve-out と live 測定境界を持つのは j#93412 だけなので、j#93406 を指すと `is_anchored` は通るのに**現行契約を述べていない record** へ読者を送ることになり、(a) が防ぐ誤帰属と同型になる。この gate も (b)(c) の合成規則と fail-closed 条件は既存 gate と同一で、既存 5 gate の anchor 文字列は 1 文字も変わらない。
-      - **global offline rollout gate `herdr_offline_rollout_owner_approval` の ruling は `redmine:#14838:j#97993`**。writer role は `coordinator`、全workspace停止・3-store migration・runtime cutoverを承認した判断のprovenanceはmarkerの `approval_source=direct_owner` で、両者を連言する。full approval manifest + issueのdigestをmarkerへ束縛し、source-system author ID一致はauthorityに使わない。(b)(c) の合成とunanchored refusalは他gateと同じで、既存gateのruling pointerを変更しない。
+      - **global offline rollout gate `herdr_offline_rollout_owner_approval` の ruling は `redmine:#14838:j#97993`**。writer role は `coordinator`、全workspace停止・4-store migration/rebuild・runtime cutoverを承認した判断のprovenanceはmarkerの `approval_source=direct_owner` で、両者を連言する。full approval manifest + issueのdigestをmarkerへ束縛し、source-system author ID一致はauthorityに使わない。(b)(c) の合成とunanchored refusalは他gateと同じで、既存gateのruling pointerを変更しない。
       - **post-reboot pair recovery gate `restored_pair_recovery_owner_approval` の ruling は `redmine:#15227:j#102879`**。writer role は `coordinator`、owner 判断は marker の `approval_source=direct_owner` と連言する。pair 全体の lifecycle / participant / worktree pin と composer loss の許可を action digest に束縛し、既存 gate の ruling pointer を変更しない。ただしこのgateはconditional-close導入後のために予約されたdormant contractであり、現行read-only診断はmarkerを生成せず、gateを破壊操作へ使わない。
       - **generation-mismatch disposition gate `generation_mismatch_disposition_owner_approval` の ruling は `redmine:#15193:j#103101`**。writer role は `coordinator`、owner 判断は marker の `approval_source=direct_owner` と連言する。pending composer・receiver・lifecycleのexact operation digestを束縛し、別gateのrulingやjournal pointerだけをauthorityとして流用しない。
       - **ruling を持たない gate は unanchored** となり、本 surface は zero-close で refuse する (fail-closed)。
@@ -424,9 +424,24 @@ forceやpending overrideを加えない。pending generationが本当に破棄�
 - **workflow gate ではない**: channel は watcher の recognized channels と `GATE_BEARING_KINDS` に **入れない**。correlation を説明する record であって workflow event ではない。
 - **判定の正本は `tests/regressions/test_issue_13892_obligation_source_matrix.py`**。covered は「実際に scratch slot が現れ reader が返す」probe で、inapplicable は「**不可能にしている precondition**」を assert する (store の形が変われば落ちる)。prose は腐るので判定を prose に置かない。
 
-- **partial close は replay 可能**: pending attempt に **pinned locators** と closed progress が durable に残るため、re-run の close authority は **`attempt.pinned` − (positively absent | 既 closed)** の **exact locator のみ**。★**assigned name が一致しても locator が違えば `pin_drift` で non-success** — 同名で relaunch された別 pair を旧 attempt の権限で閉じないため (review j#80523 R3-F2)。crash 位置別の replay: `live + pending` → full preflight 再実行後に close resume / `absent + pending` → whole-unit re-measure 後に **completed へ repair** / `absent + completed` → **idempotent success (exit 0)** / `absent + proof 無し` → `retire_evidence_absent`。fence completion write 失敗は non-success (`completion_unproven`) だが **truthful な closed は保持**し、次回 run が pending から repair する。
+- **partial close は v2 generation pin で replay 可能**: pending attempt は role / assigned
+  name / locator / `startup_action_id` と closed progress を durable に保持する。re-run は fresh
+  full inventory の canonical name / locator / private terminal identityを、v4 attestation と
+  completed-success のgeneration-v2 startup participantへexact joinする。閉済pinは同じgenerationの
+  private terminalが全inventoryからpositive absenceのときだけ除外し、残るexact-live subsetだけを閉じる。
+  v1 tokenless pending/partial、legacy/malformed/mismatch、terminalの別name・lane・locatorでの再claimは
+  **zero-close**。crash位置別の replay は `live + pending-v2` → remaining exact generationだけclose、
+  `absent + pending-v2` → terminal-bound positive absence後にcompleted repair、`absent + completed-v2`
+  → 同じproofを毎回再検証したidempotent success。fence completion write失敗はnon-success
+  (`completion_unproven`) だがtruthfulなclosed progressは保持する。
 - **relaunch 誤認の防止**: herdr assigned name は `(workspace, role, lane)` で決まるため同名 pair が再 launch され得る。`completed` の後に新しい live slots が現れたら **新しい attempt (revision+1) を開く**ので、古い completion が稼働中の pair の proof に流用されない。
-- attestation は要求 **しない** (#13892 j#80483): scratch pair は generation / lifecycle row を持たず attestation は構造的に取得不能で、要求すると本 rail が対象とする唯一の shape (live-but-unattested) を恒久 retire 不能にする。identity は assigned-name 一致 + foreign 不在 + duplicate 不在 + locator 一意で証明する。
+- current runtime の destructive close は **v4 attestation + completed generation-v2** を要求する。
+  旧v1 retirement storeは通常runtimeではread-only/non-authoritativeで、通常executeから暗黙migration
+  しない。consumerを止めた明示rail `mozyo-bridge herdr retirement-store migrate --write`だけが、
+  exact-v1 schemaをprivate backup-firstでv2へstampする。verified v1 backupと0700 staging provenanceは
+  crash replay/recovery evidenceとして保持され、primary欠落、backup/pin/security drift、unproven
+  stagingは`recovery_required`相当のdamaged状態となりnormal write/closeを0にする。旧pinのterminalを
+  live inventoryからbackfillしてauthorityへ昇格させない。
 - worktree / branch 除去、process launch / resume、raw herdr / tmux、store 直接 mutation は伴わない。
 
 ## 統合 (integration disposition)

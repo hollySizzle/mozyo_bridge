@@ -169,13 +169,13 @@ def _notes(mapping=None):
     return _read
 
 
-def _attested(_name, *, locator, workspace_id, provider):
+def _attested(_name, *, locator, terminal_id, workspace_id, provider):
     """A passing attestation join (the store is exercised separately)."""
     return True, "ok", "startup self-attestation present and generation-matched"
 
 
 def _unattested(state="stale"):
-    def _join(_name, *, locator, workspace_id, provider):
+    def _join(_name, *, locator, terminal_id, workspace_id, provider):
         return False, state, f"attestation {state}"
 
     return _join

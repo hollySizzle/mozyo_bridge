@@ -445,6 +445,7 @@ class PaneTreeHerdr:
             row = {
                 "name": name,
                 "pane_id": pane_id,
+                "terminal_id": f"terminal:{pane_id}",
                 # Production rows state the workspace explicitly as well as inside
                 # the locator (measured on the operator's running herdr), and the
                 # authority's scope test reads both (#14996 R2 review j#99938).

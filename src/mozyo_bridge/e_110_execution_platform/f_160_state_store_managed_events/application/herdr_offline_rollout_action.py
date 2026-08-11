@@ -31,7 +31,7 @@ class PhaseExecutionResult:
     ok: bool
     reason: str = ""
     detail: str = ""
-    receipt: Mapping[str, object] = field(default_factory=dict)
+    receipt: Mapping[str, object] = field(default_factory=dict, repr=False)
 
 
 @dataclass(frozen=True)
@@ -265,6 +265,8 @@ def store_phase_authority(
     replay_candidate = (
         isinstance(observed, Mapping)
         and observed.get("state") == "recognized"
+        and type(observed.get("version")) is int
+        and type(planned.get("target_version")) is int
         and observed.get("version") == planned.get("target_version")
         and replaying is True
         and action.get("active_phase") == phase_name
@@ -292,6 +294,8 @@ def verify_migrated_store(action, store_name: str, observed) -> PhaseExecutionRe
     if (
         isinstance(observed, Mapping)
         and observed.get("state") == "recognized"
+        and type(observed.get("version")) is int
+        and type(planned.get("target_version")) is int
         and observed.get("version") == planned.get("target_version")
         and expected
         and observed.get("content_digest") == expected

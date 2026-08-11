@@ -89,6 +89,10 @@ class ProjectGatewayBackendSupport(Protocol):
 
     def valid_target(self, value: object) -> bool: ...
 
+    def terminal_identity(
+        self, assigned_name: object, locator: object, rows: object
+    ) -> object: ...
+
     def workspace_segment(self, repo_root: Path) -> str: ...
 
     def list_agent_rows(self, config: object) -> Any: ...
@@ -101,6 +105,7 @@ class ProjectGatewayBackendSupport(Protocol):
         provider: str,
         lane_id: str,
         locator: str,
+        live_terminal_id: object,
     ) -> str: ...
 
     def build_project_gateway_capability(self, observation: object) -> object: ...
@@ -322,6 +327,7 @@ class LiveProjectGatewayInventoryOps:
         provider: str,
         lane_id: str,
         locator: str,
+        live_terminal_id: object,
     ) -> str:
         return _require_backend_support().generation_token(
             assigned_name=assigned_name,
@@ -329,6 +335,7 @@ class LiveProjectGatewayInventoryOps:
             provider=provider,
             lane_id=lane_id,
             locator=locator,
+            live_terminal_id=live_terminal_id,
         )
 
     def project_path(
@@ -670,6 +677,9 @@ class ProjectGatewayBackendInventoryUseCase:
                     provider=identity.role,
                     lane_id=lane,
                     locator=locator,
+                    live_terminal_id=_require_backend_support().terminal_identity(
+                        assigned_name, locator, rows
+                    ),
                 )
             except Exception as exc:  # noqa: BLE001 - attestation source is an IO boundary
                 raise ProjectGatewayInventoryError(

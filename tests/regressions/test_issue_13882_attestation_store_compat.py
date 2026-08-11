@@ -53,6 +53,7 @@ from mozyo_bridge.core.state.state_store import StateStoreError  # noqa: E402
 from mozyo_bridge.core.state.herdr_identity_attestation_schema import (  # noqa: E402
     HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
     RECOGNIZED_SCHEMA_VERSIONS,
+    WRITABLE_SCHEMA_VERSIONS,
     STORE_ABSENT,
     STORE_RECOGNIZED,
     STORE_UNREADABLE,
@@ -97,7 +98,7 @@ _ACTION_ID = "recover:l:worker:claude:wk:w2"
 
 # A #13882 build: advertises the writable SET. A pre-#13882 build advertises the native
 # schema only — the distinction the store join rests on.
-_NEW_LAUNCHER = LauncherCapabilityObservation(True, _V2, frozenset(RECOGNIZED_SCHEMA_VERSIONS))
+_NEW_LAUNCHER = LauncherCapabilityObservation(True, _V2, frozenset(WRITABLE_SCHEMA_VERSIONS))
 _OLD_LAUNCHER = LauncherCapabilityObservation(True, _V2, None)
 
 _V1_DDL = (
@@ -132,6 +133,7 @@ def _rec(**over) -> IdentityAttestationRecord:
     base = dict(
         assigned_name=_NAME, workspace_id="ws1", role="claude", lane_id="default",
         locator="wY:p2", verdict="present",
+        terminal_id="terminal:ws1:claude:default",
     )
     base.update(over)
     return IdentityAttestationRecord(**base)
@@ -186,11 +188,15 @@ class _View:
         self.reason = reason
         self.detail = detail
         self.managed_agents = tuple(agents)
+        self.agents = self.managed_agents
+        self.raw_row_count = len(self.managed_agents)
+        self.invalid_row_count = 0
 
 
 class _Agent:
     def __init__(self, name):
         self.name = name
+        self.terminal_id = f"terminal:{name}"
 
 
 _NO_CONSUMERS = _View(agents=())
@@ -212,16 +218,16 @@ class StoreSchemaJoinTest(unittest.TestCase):
         self.assertFalse(verdict.ok)
         self.assertEqual(verdict.reason, STORE_LAUNCHER_CANNOT_WRITE)
 
-    def test_v1_store_with_compatible_launcher_normal_launch_is_admitted(self) -> None:
-        # Acceptance 2: a normal launch may use the proven backward-compatible path.
+    def test_v1_store_with_compatible_launcher_normal_launch_is_refused(self) -> None:
+        # v1 remains readable, but cannot preserve the terminal-generation binding.
         verdict = decide_store_compatibility(
             _NEW_LAUNCHER,
             StoreSchemaObservation(STORE_RECOGNIZED, 1),
             required_schema_version=_V2,
             replacement_launch=False,
         )
-        self.assertTrue(verdict.ok)
-        self.assertEqual(verdict.reason, STORE_JOIN_OK)
+        self.assertFalse(verdict.ok)
+        self.assertEqual(verdict.reason, STORE_LAUNCHER_CANNOT_WRITE)
 
     def test_v1_store_replacement_launch_is_refused_even_when_compatible(self) -> None:
         # `action_id` must never be dropped — the v1 shape cannot carry it.
@@ -276,11 +282,11 @@ class StoreSchemaJoinTest(unittest.TestCase):
         # are indistinguishable (both advertise `2`), and the join above silently
         # re-admits the incident. The token must also survive argparse's help wrapping —
         # the #13847 lesson that a split token reads as "incapable".
-        line = build_attest_capability_stores_line(RECOGNIZED_SCHEMA_VERSIONS)
+        line = build_attest_capability_stores_line(WRITABLE_SCHEMA_VERSIONS)
         self.assertNotIn(" ", line)
         self.assertNotIn("-", line.split("=")[1])
         parsed = parse_launcher_capability_output(f"usage: x --assigned-name N\n{line}\n")
-        self.assertEqual(parsed.advertised_store_versions, frozenset(RECOGNIZED_SCHEMA_VERSIONS))
+        self.assertEqual(parsed.advertised_store_versions, frozenset(WRITABLE_SCHEMA_VERSIONS))
 
     def test_pre_13882_launcher_is_credited_only_with_its_native_schema(self) -> None:
         self.assertEqual(_OLD_LAUNCHER.writable_store_versions, frozenset({_V2}))
@@ -298,7 +304,7 @@ class StoreSchemaJoinTest(unittest.TestCase):
             build_parser().parse_args(["herdr", "agent-attest", "--help"])
         parsed = parse_launcher_capability_output(buf.getvalue())
         self.assertEqual(
-            parsed.advertised_store_versions, frozenset(RECOGNIZED_SCHEMA_VERSIONS)
+            parsed.advertised_store_versions, frozenset(WRITABLE_SCHEMA_VERSIONS)
         )
 
 
@@ -347,13 +353,15 @@ class ReadCompatibleTest(unittest.TestCase):
 
 
 class WriteConservativeTest(unittest.TestCase):
-    """Acceptance 2: normal launch writes v1-shaped; replacement launch refuses."""
+    """Terminal-bound launches never silently drop their identity into old shapes."""
 
-    def test_normal_launch_writes_v1_shaped_without_migrating(self) -> None:
+    def test_normal_launch_onto_v1_refuses_without_migrating(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             path = _seed_v1(home)
-            HerdrIdentityAttestationStore(home=home).upsert(_rec(locator="wZ:p9"))
+            before = _digest(path)
+            with self.assertRaises(HerdrIdentityAttestationError):
+                HerdrIdentityAttestationStore(home=home).upsert(_rec(locator="wZ:p9"))
             conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
             try:
                 # GUARD BITE: auto-migrating the shared home here would break every older
@@ -363,7 +371,7 @@ class WriteConservativeTest(unittest.TestCase):
                 self.assertNotIn("replacement_action_id", cols)
             finally:
                 conn.close()
-            self.assertEqual(HerdrIdentityAttestationStore(home=home).read(_NAME).locator, "wZ:p9")
+            self.assertEqual(_digest(path), before)
 
     def test_replacement_launch_onto_v1_refuses_and_writes_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -374,7 +382,7 @@ class WriteConservativeTest(unittest.TestCase):
                 HerdrIdentityAttestationStore(home=home).upsert(
                     _rec(locator="wZ:p9", replacement_action_id=_ACTION_ID)
                 )
-            self.assertIn("replacement", str(ctx.exception))
+            self.assertIn("terminal_id", str(ctx.exception))
             self.assertEqual(_digest(path), before)  # untouched, not partially written
 
     def test_fresh_store_is_created_at_current_version(self) -> None:
@@ -419,20 +427,22 @@ class OldReaderTest(unittest.TestCase):
             with mock.patch.object(sch, "RECOGNIZED_SCHEMA_VERSIONS", frozenset({1})):
                 self.assertIsNone(HerdrIdentityAttestationStore(home=home).read(_NAME))
 
-    def test_old_reader_sees_a_v1_store_unchanged_after_a_normal_launch(self) -> None:
-        # Acceptance 4: old CLI behavior stays compatible on an unmigrated home.
+    def test_old_reader_sees_a_v1_store_unchanged_after_refused_launch(self) -> None:
+        # A new runtime must leave the old store byte-identical when refusing launch.
         import mozyo_bridge.core.state.herdr_identity_attestation_schema as sch
 
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             _seed_v1(home)
-            HerdrIdentityAttestationStore(home=home).upsert(_rec(locator="wZ:p9"))
+            before = _digest(herdr_identity_attestation_path(home))
+            with self.assertRaises(HerdrIdentityAttestationError):
+                HerdrIdentityAttestationStore(home=home).upsert(_rec(locator="wZ:p9"))
             with mock.patch.object(sch, "RECOGNIZED_SCHEMA_VERSIONS", frozenset({1})):
-                got = HerdrIdentityAttestationStore(home=home).read(_NAME)
-            self.assertIsNotNone(got)
-            self.assertEqual(got.locator, "wZ:p9")
-
-
+                self.assertEqual(
+                    HerdrIdentityAttestationStore(home=home).read(_NAME).locator,
+                    "wY:p2",
+                )
+            self.assertEqual(_digest(herdr_identity_attestation_path(home)), before)
 class MaintenanceCommandTest(unittest.TestCase):
     """Acceptance 3: backup-first, idempotent, consumer-gated, no raw SQLite."""
 
@@ -1441,7 +1451,8 @@ os.environ["MOZYO_BRIDGE_HOME"] = {home!r}
 from pathlib import Path
 import mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application.herdr_attestation_store_maintenance as m
 class V:
-    backend_selected = True; ok = True; reason = None; detail = ""; managed_agents = ()
+    backend_selected = True; ok = True; reason = None; detail = ""
+    managed_agents = (); agents = (); raw_row_count = 0; invalid_row_count = 0
 r = m.run_attestation_store_rebuild(home=Path({home!r}), view=V(), write=True)
 print(r.state + "|" + str(r.executed) + "|" + str(r.backup_dir is not None), flush=True)
 """
@@ -1453,7 +1464,8 @@ from pathlib import Path
 from mozyo_bridge.core.state.herdr_identity_attestation import (
     HerdrIdentityAttestationStore, IdentityAttestationRecord)
 rec = IdentityAttestationRecord(assigned_name="fresh", workspace_id="ws", role="claude",
-                                lane_id="default", locator="w:9", verdict="present")
+                                lane_id="default", locator="w:9", verdict="present",
+                                terminal_id="terminal:fresh")
 t0 = time.time()
 out = HerdrIdentityAttestationStore(home=Path({home!r})).upsert(rec)
 print("WROTE|%.2f|%s" % (time.time() - t0, out is not None), flush=True)
@@ -1755,15 +1767,15 @@ class ZeroSideEffectTest(unittest.TestCase):
             self.assertEqual(ctx.exception.reason, STORE_LAUNCHER_CANNOT_WRITE)
             self.assertIn("No workspace / tab / agent was created", str(ctx.exception))
 
-    def test_preflight_admits_a_normal_launch_onto_v1(self) -> None:
+    def test_preflight_refuses_a_normal_launch_onto_v1(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             _seed_v1(home)
-            self.assertIsNone(
+            with self.assertRaises(HerdrLauncherIncompatibleError) as ctx:
                 preflight_attest_store_schema(
                     _NEW_LAUNCHER, store_home=home, replacement_launch=False
                 )
-            )
+            self.assertEqual(ctx.exception.reason, STORE_LAUNCHER_CANNOT_WRITE)
 
     def test_preflight_refuses_a_replacement_launch_onto_v1(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -53,6 +53,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     occupant_of_locator,
     process_generation_of_locator,
     rebind_by_name,
+    terminal_identity_of_live_slot,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (  # noqa: E501
     valid_target,
@@ -394,6 +395,46 @@ class ProcessGenerationOfLocatorTest(unittest.TestCase):
     def test_ambiguous_locator_fails_closed_even_when_revision_matches(self) -> None:
         rows = [self._row(), {**self._row(), "name": "other"}]
         self.assertIsNone(process_generation_of_locator("w1:p1", rows))
+
+    def test_unrelated_malformed_row_withholds_resend_authority(self) -> None:
+        for unrelated in (
+            "not-a-row",
+            {"name": "other", "pane_id": "w2:p1"},
+            {"name": "other", "pane_id": "w2:p1", "terminal_id": " bad"},
+            {"name": " other ", "pane_id": "w2:p1", "terminal_id": "term_b"},
+        ):
+            with self.subTest(unrelated=unrelated):
+                self.assertIsNone(
+                    process_generation_of_locator("w1:p1", [self._row(), unrelated])
+                )
+        for pair in (
+            ({"name": "other", "pane_id": "w2:p1", "terminal_id": "term_b"},
+             {"name": "other", "pane_id": "w3:p1", "terminal_id": "term_c"}),
+            ({"name": "other-a", "pane_id": "w2:p1", "terminal_id": "term_b"},
+             {"name": "other-b", "pane_id": "w2:p1", "terminal_id": "term_c"}),
+            ({"name": "other-a", "pane_id": "w2:p1", "terminal_id": "term_b"},
+             {"name": "other-b", "pane_id": "w3:p1", "terminal_id": "term_b"}),
+        ):
+            self.assertIsNone(process_generation_of_locator("w1:p1", [self._row(), *pair]))
+
+    def test_live_slot_requires_global_name_locator_terminal_uniqueness(self) -> None:
+        row = self._row()
+        self.assertEqual(
+            terminal_identity_of_live_slot(self.name, "w1:p1", [row]), "term_a"
+        )
+        adversaries = (
+            {**row, "name": "other"},
+            {**row, "pane_id": "w2:p1", "name": "other"},
+            {"name": "other", "pane_id": "w2:p1"},
+            "not-a-row",
+        )
+        for adversary in adversaries:
+            with self.subTest(adversary=adversary):
+                self.assertIsNone(
+                    terminal_identity_of_live_slot(
+                        self.name, "w1:p1", [row, adversary]
+                    )
+                )
 
 
 class RebindTest(unittest.TestCase):

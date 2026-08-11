@@ -1,16 +1,16 @@
 """Public attestation-store maintenance use case (Redmine #13882 acceptance 3).
 
-The #13882 write policy deliberately leaves a v1 shared home **at v1** so older installed
-launchers keep working (``herdr_identity_attestation_schema``). That makes forward
-migration an explicit operator act rather than a launch side effect — and this module is
-that act's only public rail. It exists because the alternative the incident actually left
+The store is read-compatible across recognized predecessors but managed launches write only
+the current terminal-bound schema. Forward migration is therefore an explicit operator act
+rather than a launch side effect — and this module is that act's only public rail. It exists
+because the alternative the incident actually left
 operators with was hand-editing ``herdr-identity-attestation.sqlite`` with raw SQLite,
 which the issue rules out as a non-goal.
 
 Three intents, each a read-only plan by default:
 
 - ``status`` — what shape the selected store is, and what that admits;
-- ``migrate`` — additive v1 -> v2, backup-first, idempotent;
+- ``migrate`` — additive recognized predecessor -> current schema, backup-first, idempotent;
 - ``rebuild`` — rotate an unmigratable (corrupt / foreign / newer) store aside into
   ``backups/`` and start a fresh one. Legitimate *only* because this projection is a
   ``rebuildable_cache``: the next launch's self-attestation re-derives it, and until then
@@ -159,10 +159,20 @@ def measure_store_consumers(view, home: Path) -> tuple:
     ``rebuild`` against an unreadable store while agents were live — fail-open on the one
     path whose entire target set is unreadable stores.
     """
-    if not view.backend_selected:
-        # No herdr backend: no managed consumers of this store by construction.
-        return CONSUMERS_NONE, ()
-    if not view.ok:
+    if not view.backend_selected or not view.ok:
+        return CONSUMERS_UNMEASURABLE, ()
+    if (
+        view.raw_row_count is None
+        or view.invalid_row_count is None
+        or view.invalid_row_count != 0
+        or view.raw_row_count != len(view.agents)
+        or any(
+            type(agent.terminal_id) is not str
+            or not agent.terminal_id
+            or agent.terminal_id.strip() != agent.terminal_id
+            for agent in view.agents
+        )
+    ):
         return CONSUMERS_UNMEASURABLE, ()
     live = {agent.name for agent in view.managed_agents}
     if not live:
@@ -191,7 +201,7 @@ def _consumer_gate(view, intent: str, home: Path) -> Optional[AttestationStoreMa
             ),
             live_consumers=names,
         )
-    if not view.ok:
+    if not view.backend_selected or not view.ok:
         return AttestationStoreMaintenanceResult(
             intent=intent,
             state=BLOCKED_INVENTORY_UNREADABLE,
@@ -230,12 +240,13 @@ def run_attestation_store_status(*, home: Path) -> AttestationStoreMaintenanceRe
         else:
             notes.append(
                 f"v{store.version} is read-compatible: reads project up to "
-                f"v{HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION} and normal launches write "
-                f"it v{store.version}-shaped, so older installed launchers keep working"
+                f"v{HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION}, but managed launches are "
+                "REFUSED until the store is migrated because terminal identity cannot be "
+                "silently dropped"
             )
             notes.append(
-                "replacement launches are REFUSED at this shape (no "
-                "`replacement_action_id` column); run `migrate --write` to admit them"
+                "run `migrate --write` during an offline, consumer-zero window to admit "
+                "terminal-bound startup attestation writes"
             )
     elif store.upgrade_required:
         notes.append("the store is newer than this runtime; use a newer runtime")
@@ -257,7 +268,7 @@ def run_attestation_store_status(*, home: Path) -> AttestationStoreMaintenanceRe
 def _run_migrate_locked(
     *, home: Path, view, write: bool = False
 ) -> AttestationStoreMaintenanceResult:
-    """Additive v1 -> v2 migration: backup-first, idempotent, consumer-gated."""
+    """Additive migration to current schema: backup-first and consumer-gated."""
     path = herdr_identity_attestation_path(home)
     store = probe_store_schema(path)
     if store.state not in (STORE_ABSENT, STORE_RECOGNIZED):
@@ -534,7 +545,7 @@ def _with_exclusive_lock(intent: str, home: Path, run):
 def run_attestation_store_migrate(
     *, home: Path, view, write: bool = False
 ) -> AttestationStoreMaintenanceResult:
-    """Additive v1 -> v2 migration: backup-first, idempotent, consumer-gated."""
+    """Additive migration to current schema: backup-first and consumer-gated."""
     if not write:  # a read-only plan mutates nothing and takes no lock
         return _run_migrate_locked(home=home, view=view, write=False)
     return _with_exclusive_lock(

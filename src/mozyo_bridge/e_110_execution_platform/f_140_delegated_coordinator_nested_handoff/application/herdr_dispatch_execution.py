@@ -104,13 +104,8 @@ def fence_key_for(authorization: DispatchAuthorization) -> FenceKey:
     )
 
 
-def _live_locator_for(assigned_name: str) -> str:
-    """The live locator of a named slot, or ``""`` when it cannot be observed. (fail-soft)
-
-    Fail-soft on purpose: an unreadable inventory yields ``""``, which
-    :meth:`ScratchRetirementFence.blocking_attempt_for_target` treats as ambiguous and blocks.
-    The safety decision stays in the authority; this only supplies the fact.
-    """
+def _live_generation_for(assigned_name: str, identity) -> tuple[str, Optional[str]]:
+    """The exact completed current generation, or an ambiguous ``("", None)``."""
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
         list_herdr_agent_rows,
     )
@@ -123,14 +118,26 @@ def _live_locator_for(assigned_name: str) -> str:
     try:
         rows = list_herdr_agent_rows(os.environ)
     except Exception:  # noqa: BLE001 - unreadable -> "" -> the authority fails closed
-        return ""
+        return "", None
     matches = [
         r for r in rows
         if isinstance(r, Mapping) and _norm(r.get(AGENT_KEY_NAME)) == want
     ]
     if len(matches) != 1:
-        return ""  # absent or ambiguous -> let the authority decide conservatively
-    return _norm(_agent_locator(matches[0]))
+        return "", None
+    locator = _norm(_agent_locator(matches[0]))
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_destructive_close_identity import current_generation_release_pin  # noqa: E501
+
+    pin = current_generation_release_pin(
+        tuple(rows),
+        home=None,
+        workspace_id=identity.workspace_id,
+        lane_id=identity.lane_id,
+        role=identity.role,
+        assigned_name=assigned_name,
+        locator=locator,
+    )
+    return locator, (pin.startup_action_id if pin is not None else None)
 
 
 def target_is_retiring(target_assigned_name: str) -> tuple[bool, str]:
@@ -167,7 +174,7 @@ def target_is_retiring(target_assigned_name: str) -> tuple[bool, str]:
     # The live locator distinguishes "the pane a completed attempt closed" from "a pair
     # relaunched at the same deterministic name" (review j#80594 R4-F2). Reading it is
     # fail-soft: an unknown locator makes a completed attempt ambiguous, which blocks.
-    live_locator = _live_locator_for(target)
+    live_locator, live_generation_token = _live_generation_for(target, identity)
     try:
         fence = ScratchRetirementFence()
         # A scratch unit's digest is over the pair's full assigned-name set, so a single
@@ -177,6 +184,7 @@ def target_is_retiring(target_assigned_name: str) -> tuple[bool, str]:
             lane_id=identity.lane_id,
             target_assigned_name=target,
             live_locator=live_locator,
+            live_generation_token=live_generation_token,
         )
     except ScratchRetirementFenceError as exc:
         return (

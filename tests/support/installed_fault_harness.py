@@ -920,6 +920,7 @@ class InstalledFaultHarness:
             role="claude",
             lane_id=lane_id,
             locator=locator,
+            terminal_id=f"terminal:{locator}",
             verdict="present",
             observed_at="2026-01-01T00:00:00.000000+00:00",
         )

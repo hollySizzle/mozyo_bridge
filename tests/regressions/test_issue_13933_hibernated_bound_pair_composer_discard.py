@@ -444,7 +444,8 @@ class FullPairRetryAuthorityTests(unittest.TestCase):
             "application.sublane_hibernated_bound_pair_composer_discard_live."
             "ReplacementActuatorUseCase"
         )
-        with mock.patch(module) as actuator:
+        inventory = module.rsplit(".", 1)[0] + ".list_herdr_agent_rows"
+        with mock.patch(inventory, return_value=()), mock.patch(module) as actuator:
             result = ops.drive(REQ, expectation, approved)
         self.assertFalse(result.ok)
         self.assertEqual(result.status, "transaction_conflict")
@@ -529,8 +530,12 @@ class FullPairRetryAuthorityTests(unittest.TestCase):
             discard_roles=(),
         )
         ops = LiveBoundPairPreparationOps(repo_root=Path("/coordinator"), env={})
+        rows = ({
+            "name": verifying.assigned_name, "pane_id": "w1:p9",
+            "terminal_id": "terminal:gateway",
+        },)
         proven = ops._progress_proven_roles(
-            REQ, launched, expectation, (verifying,)
+            REQ, launched, expectation, (verifying,), rows=rows
         )
         self.assertEqual(proven, ("gateway",))
         self.assertTrue(
@@ -563,6 +568,7 @@ class FullPairRetryAuthorityTests(unittest.TestCase):
                     launched,
                     expectation,
                     verifying,
+                    rows=rows,
                     require_attestation=True,
                 )
             )
@@ -572,6 +578,7 @@ class FullPairRetryAuthorityTests(unittest.TestCase):
                     launched,
                     expectation,
                     verifying,
+                    rows=rows,
                     require_attestation=True,
                 )
             )

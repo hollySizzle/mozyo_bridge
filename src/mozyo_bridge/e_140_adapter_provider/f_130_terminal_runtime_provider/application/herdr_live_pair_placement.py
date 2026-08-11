@@ -16,11 +16,9 @@ from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
 from mozyo_bridge.application.repo_local_config_loader import load_repo_local_config
-from mozyo_bridge.core.state.herdr_identity_attestation import VERDICT_PRESENT
 from mozyo_bridge.core.state.herdr_launch_generation import (
-    GENERATION_ATTESTED,
-    HerdrLaunchGenerationError,
     HerdrLaunchGenerationStore,
+    verified_generation_token,
 )
 from mozyo_bridge.core.state.lane_kind import LANE_KIND_COORDINATOR
 from mozyo_bridge.core.state.lane_lifecycle import (
@@ -70,9 +68,12 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     AGENT_KEY_LOCATOR,
     AGENT_KEY_LOCATOR_ALIAS,
     AGENT_KEY_LOCATOR_ALIAS_2,
+    _norm,
+    _norm_lane,
     decode_assigned_name,
     encode_assigned_name,
     rebind_by_name,
+    terminal_identity_of_live_slot,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (
     SLOT_LIVE,
@@ -402,6 +403,7 @@ class HerdrLivePairPlacement:
         timeout: float = COMMAND_TIMEOUT_SECONDS,
         lister: Optional[HerdrCliAgentLister] = None,
         generation_store: Optional[HerdrLaunchGenerationStore] = None,
+        generation_verifier: Optional[Callable[..., str]] = None,
         workspace_loader: Callable[[str], Optional[WorkspaceRecord]] = (
             load_workspace_by_id
         ),
@@ -412,6 +414,7 @@ class HerdrLivePairPlacement:
         self.timeout = timeout
         self.lister = lister or HerdrCliAgentLister(binary, runner=self.runner, timeout=timeout)
         self.generations = generation_store or HerdrLaunchGenerationStore()
+        self.generation_verifier = generation_verifier or verified_generation_token
         self.workspace_loader = workspace_loader
         self.workspace_of = workspace_resolver or IdentityWorkspaceResolver(
             mozyo_bridge_home()
@@ -517,7 +520,6 @@ class HerdrLivePairPlacement:
                         REASON_PAIR_INVALID,
                         "a managed provider does not match its declared generation",
                     )
-
             if row.get("agent") != provider or classify_named_slot(row) != SLOT_LIVE:
                 return (
                     None,
@@ -560,20 +562,13 @@ class HerdrLivePairPlacement:
                         "a managed provider foreground process resolves to another workspace",
                     )
 
-            try:
-                generation = self.generations.read(name)
-            except (HerdrLaunchGenerationError, OSError, ValueError):
-                generation = None
-            if (
-                generation is None
-                or generation.phase != GENERATION_ATTESTED
-                or generation.verdict != VERDICT_PRESENT
-                or generation.workspace_id != workspace_id
-                or generation.lane_id != lane_id
-                or generation.role != provider
-                or generation.locator != rebound.locator
-                or not generation.startup_action_id
-            ):
+            terminal_id = terminal_identity_of_live_slot(name, rebound.locator, rows)
+            generation_token = self.generation_verifier(
+                None, assigned_name=name, workspace_id=workspace_id, role=provider,
+                lane_id=lane_id, locator=rebound.locator,
+                live_terminal_id=terminal_id, norm=_norm, norm_lane=_norm_lane,
+            )
+            if not generation_token:
                 return (
                     None,
                     REASON_GENERATION_UNVERIFIED,
@@ -581,10 +576,9 @@ class HerdrLivePairPlacement:
                 )
             slots.append(
                 LiveSlot(
-                    provider,
-                    name,
+                    provider, name,
                     rebound.locator,
-                    generation.startup_action_id,
+                    generation_token,
                     runtime_revision,
                 )
             )

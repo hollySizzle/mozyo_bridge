@@ -38,6 +38,33 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
 )
 
 
+def _delivery_is_current(
+    record, *, issue: str, journal: str, provider: str, boundary
+) -> bool:
+    """Join one successful queue-enter record to one verified live generation."""
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+        RedmineAnchor,
+        build_marker,
+    )
+    marker = build_marker(RedmineAnchor(issue=issue, journal=journal),
+                          "implementation_request", provider)
+    return bool(
+        boundary is not None
+        and record.notification_marker == marker
+        and record.source == "redmine"
+        and record.issue_id == issue
+        and record.journal_id == journal
+        and record.receiver == provider
+        and record.provider in (None, "", provider)
+        and record.backend == "herdr"
+        and record.rail == "queue_enter_rail"
+        and record.target in (boundary.assigned_name, boundary.locator)
+        and record.status == "sent"
+        and record.reason == "ok"
+        and boundary.matches_delivery(record)
+    )
+
+
 def _generation_binding_detail(
     *,
     current: bool,
@@ -170,6 +197,7 @@ class HerdrWorkerDispatchOps:
             AGENT_KEY_NAME,
             _agent_locator,
             encode_assigned_name,
+            terminal_identity_of_live_slot,
         )
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (
             SLOT_STALE,
@@ -223,6 +251,9 @@ class HerdrWorkerDispatchOps:
         joined = evaluate_attestation(
             attestation,
             live_locator=locator,
+            live_terminal_id=terminal_identity_of_live_slot(
+                assigned_name, locator, rows
+            ),
             expected_workspace_id=lane.workspace_id,
             expected_role=provider,
             expected_lane=lane.lane_id,
@@ -250,6 +281,9 @@ class HerdrWorkerDispatchOps:
                 and evaluate_attestation(
                     attestation,
                     live_locator=worker_pin.locator,
+                    live_terminal_id=terminal_identity_of_live_slot(
+                        assigned_name, worker_pin.locator, rows
+                    ),
                     expected_workspace_id=lane.workspace_id,
                     expected_role=provider,
                     expected_lane=lane.lane_id,
@@ -311,6 +345,11 @@ class HerdrWorkerDispatchOps:
             and norm(getattr(attestation, "assigned_name", "")) == norm(assigned_name)
             and fresh_live_provider_consistent
         )
+        from .herdr_live_attestation_time import fresh_attestation_identity
+        delivery_boundary = fresh_attestation_identity(
+            home=None, rows=rows, assigned_name=assigned_name,
+            workspace_id=lane.workspace_id, role=provider, lane=lane.lane_id,
+        )
 
         # The action-time process-generation binding, from whichever authority the
         # declaration surface actually provided. A live receiver must match the declared pin's
@@ -356,10 +395,10 @@ class HerdrWorkerDispatchOps:
             # pin is generation-bound authority; empty strings alone are not authority.
             action_binding_current = generation_binding_current
         duplicate = any(
-            record.journal_id == (request.journal or "").strip()
-            and (record.receiver == provider or record.provider == provider)
-            and record.target in {assigned_name, locator}
-            for record in delivery_records
+            _delivery_is_current(
+                record, issue=request.issue, journal=(request.journal or "").strip(),
+                provider=provider, boundary=delivery_boundary,
+            ) for record in delivery_records
         )
         terminal_absence = bool(
             (len(matches) == 0 and lifecycle_current and declared_identity_current)
@@ -816,18 +855,29 @@ class HerdrWorkerDispatchOps:
         from mozyo_bridge.core.state.herdr_delivery_ledger import HerdrDeliveryLedger
 
         try:
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+                list_herdr_agent_rows,
+                repo_scope_workspace_id,
+            )
+            from .herdr_live_attestation_time import fresh_attestation_identity
+            provider = self.worker_provider()
+            rows = list_herdr_agent_rows(self.env)
+            boundary = fresh_attestation_identity(
+                home=None, rows=rows, assigned_name=worker_assigned_name,
+                workspace_id=repo_scope_workspace_id(self.repo_root),
+                role=provider, lane=self.lane_label,
+            )
             records = HerdrDeliveryLedger().records_for_issue(issue)
         except Exception:  # noqa: BLE001 - unobservable telemetry is unknown
             return "unknown"
         exact = [
             record
             for record in records
-            if record.journal_id == journal
-            and (
-                record.receiver == self.worker_provider()
-                or record.provider == self.worker_provider()
+            if boundary is not None and boundary.locator == worker_locator
+            and _delivery_is_current(
+                record, issue=issue, journal=journal,
+                provider=provider, boundary=boundary,
             )
-            and record.target in {worker_assigned_name, worker_locator}
         ]
         for record in reversed(exact):
             event = record.turn_start_outcome or {}

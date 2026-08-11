@@ -29,6 +29,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _reports_exact_version,
     _sanitized_runtime_env,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_offline_rollout_generation_rebuild import (  # noqa: E501
+    backup_launch_generation,
+    rebuild_launch_generation,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_offline_rollout_supervisor_stop import (  # noqa: E501
     supervisor_stop_refusal,
 )
@@ -811,6 +815,30 @@ class OfflineRolloutExecutionRegressionTests(unittest.TestCase):
         self.assertFalse(refused.ok)
         self.assertEqual(refused.reason, "attestation_plan_drift")
 
+    def test_generation_rebuild_refuses_bool_and_float_planned_versions(self) -> None:
+        backup_root = Path(self.temp.name) / "backup-numeric"
+        backup_root.mkdir()
+        for version in (True, 1.0, 2.0):
+            planned = {
+                "state": "recognized", "version": version,
+                "target_version": 2, "upgrade_required": True,
+                "content_digest": "a" * 64, "migration_plan_digest": "",
+            }
+            observed = dict(planned, version=int(version))
+            with self.subTest(version=version):
+                backed = backup_launch_generation(
+                    home=self.home, backup_root=backup_root, planned=planned,
+                    observe=lambda: observed,
+                )
+                self.assertFalse(backed.ok)
+                self.assertEqual(backed.reason, "launch_generation_plan_drift")
+                rebuilt = rebuild_launch_generation(
+                    home=self.home, backup_root=backup_root, planned=planned,
+                    observe=lambda: observed, backup_receipt={}, replaying=True,
+                )
+                self.assertFalse(rebuilt.ok)
+                self.assertEqual(rebuilt.reason, "launch_generation_plan_drift")
+
     def test_startup_replay_authority_names_deferred_completion_check(self) -> None:
         planned = {
             "state": "recognized",
@@ -844,7 +872,7 @@ class OfflineRolloutExecutionRegressionTests(unittest.TestCase):
             "startup_completion_check_deferred_to_primitive",
         )
 
-    def test_real_private_home_migrates_v1_v10_v1_to_v3_v10_v2_and_replays(self) -> None:
+    def test_real_private_home_migrates_four_stores_and_replays(self) -> None:
         from mozyo_bridge.core.state.herdr_identity_attestation import (
             herdr_identity_attestation_path,
         )
@@ -855,6 +883,10 @@ class OfflineRolloutExecutionRegressionTests(unittest.TestCase):
         from mozyo_bridge.core.state.startup_transaction_fence import (
             StartupTransactionFence,
             StartupUnit,
+        )
+        from mozyo_bridge.core.state.herdr_launch_generation import (
+            HerdrLaunchGenerationStore,
+            herdr_launch_generation_path,
         )
 
         attestation = herdr_identity_attestation_path(self.home)
@@ -873,6 +905,18 @@ class OfflineRolloutExecutionRegressionTests(unittest.TestCase):
                 ("mzb1_ws_codex_default", "ws", "codex", "default", "w1:p1", "present", "", "t0"),
             )
         ensure_lane_lifecycle_schema(lane_lifecycle_path(self.home))
+        generation_path = herdr_launch_generation_path(self.home)
+        with sqlite3.connect(generation_path) as conn:
+            conn.execute("PRAGMA user_version = 1")
+            conn.execute(
+                "CREATE TABLE herdr_launch_generations ("
+                "assigned_name TEXT NOT NULL PRIMARY KEY, startup_action_id TEXT NOT NULL, "
+                "phase TEXT NOT NULL, workspace_id TEXT NOT NULL, role TEXT NOT NULL, "
+                "lane_id TEXT NOT NULL, locator TEXT NOT NULL DEFAULT '', "
+                "verdict TEXT NOT NULL DEFAULT '', observed_at TEXT NOT NULL DEFAULT '', "
+                "reserved_at TEXT NOT NULL, attested_at TEXT NOT NULL DEFAULT '')"
+            )
+        generation_path.chmod(0o600)
         startup = StartupTransactionFence(home=self.home)
         startup.reserve(StartupUnit("ws", "default", ("codex",)), "nonce")
 
@@ -882,7 +926,8 @@ class OfflineRolloutExecutionRegressionTests(unittest.TestCase):
         original = port._fresh_store_records()  # noqa: SLF001
         self.assertEqual(
             {name: row["version"] for name, row in original.items()},
-            {"attestation": 1, "lane_lifecycle": 10, "startup_transaction": 1},
+            {"attestation": 1, "lane_lifecycle": 11,
+             "launch_generation": 1, "startup_transaction": 1},
         )
         action = {
             "action_id": "offline_" + "e" * 32,
@@ -893,6 +938,7 @@ class OfflineRolloutExecutionRegressionTests(unittest.TestCase):
         backup = port._verified_backup({}, action, action_directory)  # noqa: SLF001
         self.assertTrue(backup.ok, backup)
         self.assertTrue(backup.receipt["startup_backup_digest"])
+        self.assertTrue(backup.receipt["launch_generation_backup"])
         self.assertEqual(
             set(backup.receipt["migration_post_digests"]),
             {"attestation", "lane_lifecycle"},
@@ -911,11 +957,22 @@ class OfflineRolloutExecutionRegressionTests(unittest.TestCase):
             {}, action, action_directory
         )
         self.assertTrue(startup_result.ok, startup_result)
+        action["active_phase"] = "rebuild_launch_generation"
+        generation_result = port._rebuild_launch_generation(  # noqa: SLF001
+            {}, action, action_directory
+        )
+        self.assertTrue(generation_result.ok, generation_result)
         migrated = port._fresh_store_records()  # noqa: SLF001
         self.assertEqual(
             {name: row["version"] for name, row in migrated.items()},
-            {"attestation": 3, "lane_lifecycle": 10, "startup_transaction": 2},
+            {"attestation": 4, "lane_lifecycle": 11,
+             "launch_generation": None, "startup_transaction": 2},
         )
+        HerdrLaunchGenerationStore(home=self.home).reserve_pending(
+            assigned_name="mzb1_ws_codex_default", startup_action_id="startup_action",
+            workspace_id="ws", role="codex", lane_id="default",
+        )
+        self.assertEqual(port._fresh_store_records()["launch_generation"]["version"], 2)
 
         # Crash-window replay: active intent remains while the effect is already durable.
         action["active_phase"] = "migrate_attestation"

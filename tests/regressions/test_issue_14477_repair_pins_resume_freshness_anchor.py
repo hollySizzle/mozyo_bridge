@@ -314,8 +314,8 @@ class _Fixture(unittest.TestCase):
             expected_revision=self._rec().revision,
             action_id="rel-14477",
             observation=build_release_observation([
-                ReleasePin("gateway", _gw_name(), f"{_WS}:pOLD_G"),
-                ReleasePin("worker", _wk_name(), f"{_WS}:pOLD_W"),
+                ReleasePin("gateway", _gw_name(), f"{_WS}:pOLD_G", "startup-old"),
+                ReleasePin("worker", _wk_name(), f"{_WS}:pOLD_W", "startup-old"),
             ]),
             now=T_RELEASE,
         )
