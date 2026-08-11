@@ -392,6 +392,7 @@ def _supervisor_snapshots(home: Path, reader) -> tuple[SupervisorAgentSnapshot, 
     # The platform-resolving backend, not a host adapter: it normalizes whichever OS scheduler owns
     # this host into the same `agents` roster (#15192 retired the launchd-only `*_pair` verbs).
     projection = reader(mozyo_home=home)
+    backend = str(projection.get("backend") or "")
     snapshots = []
     for row in projection.get("agents", ()):  # public projection is already secret-safe
         pid = row.get("pid")
@@ -404,6 +405,12 @@ def _supervisor_snapshots(home: Path, reader) -> tuple[SupervisorAgentSnapshot, 
                 home_pin=str(row.get("home_pin") or ""),
                 executable_matches=bool(row.get("executable_matches")),
                 credential_readiness=str(row.get("credential_readiness") or ""),
+                backend=backend,
+                legacy_drain=(
+                    str(row.get("legacy_drain") or "")
+                    if backend == "launchd"
+                    else "not_applicable"
+                ),
             )
         )
     return tuple(snapshots)

@@ -725,9 +725,8 @@ def _uninstall_locked(
             return _uninstall_result(
                 False, "", agent=agent, migration=migration, plist_state=at_unlink
             )
-        return _refused(
-            "uninstall", _PLIST_REFUSAL_REASON[at_unlink], label=agent.label, plist_state=at_unlink
-        )
+        return _refused("uninstall", _PLIST_REFUSAL_REASON[at_unlink], label=agent.label,
+                        plist_state=at_unlink, effect_state=EFFECT_PARTIAL)
     try:
         unlink_owned(os_home, agent=agent)
     except OSError:

@@ -31,8 +31,9 @@ from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.infr
 
 def _plan() -> dict:
     top = "mzb1_ws__codex__default"
+    supervisor_label = "org.mozyo-bridge.callback-supervisor"
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "candidate_artifact": {
             "distribution": "testpypi",
             "version": "0.15.0a4",
@@ -113,7 +114,19 @@ def _plan() -> dict:
                 "migration_plan_digest": "4" * 64,
             },
         },
-        "supervisors": [],
+        "supervisors": [
+            {
+                "label": supervisor_label,
+                "installed": True,
+                "loaded": True,
+                "pid": 123,
+                "home_pin": "ok",
+                "executable_matches": True,
+                "credential_readiness": "ready",
+                "backend": "systemd_user",
+                "legacy_drain": "not_applicable",
+            }
+        ],
         "stop_order": [top],
         "restore_order": [top],
         "schema_transitions": [
@@ -122,7 +135,11 @@ def _plan() -> dict:
             {"store": "startup_transaction", "from_version": 1, "to_version": 2},
         ],
         "phase_order": [
-            {"phase": "supervisor_stop", "supervisor_labels": []},
+            {
+                "phase": "supervisor_stop",
+                "supervisor_labels": [supervisor_label],
+                "required_readback": "current_stopped_and_legacy_absent",
+            },
             {"phase": "non_top_workspace_stop", "assigned_names": []},
             {"phase": "top_workspace_stop", "assigned_names": [top]},
             {"phase": "consumer_zero", "required_readback": "zero"},
@@ -134,8 +151,8 @@ def _plan() -> dict:
             {"phase": "legacy_lane_epoch_adoption", "targets": []},
             {"phase": "top_restore_action_bootstrap", "assigned_names": [top]},
             {"phase": "remaining_workspace_restore", "assigned_names": []},
-            {"phase": "supervisor_pair_install", "supervisor_labels": []},
-            {"phase": "supervisor_pair_readback", "supervisor_labels": []},
+            {"phase": "supervisor_pair_install", "supervisor_labels": [supervisor_label]},
+            {"phase": "supervisor_pair_readback", "supervisor_labels": [supervisor_label]},
             {"phase": "final_verify"},
         ],
     }
@@ -197,6 +214,50 @@ class OfflineRolloutActionTests(unittest.TestCase):
         self.repo.mkdir()
         self.plan = _plan()
         self.digest = canonical_digest(self.plan)
+
+    def test_v1_or_missing_supervisor_stop_evidence_is_not_executable(self) -> None:
+        cases = (
+            ("v1", lambda plan: plan.__setitem__("schema_version", 1), "plan_schema_unsupported"),
+            (
+                "missing_legacy",
+                lambda plan: plan["supervisors"][0].pop("legacy_drain"),
+                "plan_supervisor_evidence_invalid",
+            ),
+            (
+                "wrong_phase_label",
+                lambda plan: plan["phase_order"][0].__setitem__(
+                    "supervisor_labels", ["foreign"]
+                ),
+                "plan_supervisor_evidence_invalid",
+            ),
+            (
+                "old_readback",
+                lambda plan: plan["phase_order"][0].__setitem__(
+                    "required_readback", "all_not_installed_and_not_loaded"
+                ),
+                "supervisor_readback_contract_invalid",
+            ),
+            (
+                "foreign_legacy",
+                lambda plan: plan["supervisors"][0].update(
+                    backend="launchd", legacy_drain="foreign"
+                ),
+                "plan_supervisor_evidence_invalid",
+            ),
+            (
+                "unreadable_legacy",
+                lambda plan: plan["supervisors"][0].update(
+                    backend="launchd", legacy_drain="unreadable"
+                ),
+                "plan_supervisor_evidence_invalid",
+            ),
+        )
+        for name, mutate, expected in cases:
+            with self.subTest(name=name):
+                plan = json.loads(json.dumps(self.plan))
+                mutate(plan)
+                with self.assertRaisesRegex(OfflineRolloutActionError, expected):
+                    approval_manifest(plan, canonical_digest(plan))
 
     def test_approval_note_is_exact_and_enumerates_high_blast_facts(self) -> None:
         manifest = approval_manifest(self.plan, self.digest)
@@ -321,6 +382,17 @@ class OfflineRolloutActionTests(unittest.TestCase):
         self.assertEqual(attempts, [False, True])
         status = status_offline_rollout_action(action_id=action_id, home=self.home)
         self.assertEqual(status.payload["active_phase"], "")
+
+    def test_unverified_supervisor_stop_never_runs_the_next_offline_phase(self) -> None:
+        ops = FakeOps(fail_once="supervisor_stop")
+        action_id = self._delegate(ops)
+
+        result = run_offline_rollout_action(action_id=action_id, home=self.home, ops=ops)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, "injected_failure")
+        self.assertEqual(ops.phases, ["supervisor_stop"])
+        self.assertEqual(result.payload["completed_phases"], [])
 
     def test_active_phase_is_persisted_before_effect_and_tamper_is_refused(self) -> None:
         ops = FakeOps(fail_once="migrate_attestation")

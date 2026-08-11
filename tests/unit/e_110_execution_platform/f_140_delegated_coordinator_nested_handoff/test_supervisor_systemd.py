@@ -31,7 +31,9 @@ Live systemd operation is recorded as a separate installed-artifact smoke on the
 
 from __future__ import annotations
 
+import contextlib
 import inspect
+import io
 import json
 import os
 import sys
@@ -43,6 +45,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mozyo_bridge.application.cli import build_parser
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
     supervisor_service_backend as sb,
     supervisor_systemd as ss,
@@ -153,7 +156,7 @@ class FakeRunner:
             "Environment": ("as", []),
             "EnvironmentFiles": ("a(sb)", []),
             "PassEnvironment": ("as", []),
-            "UnsetEnvironment": ("as", []),
+            "UnsetEnvironment": ("as", list(ss.MASKED_MANAGER_ENVIRONMENT)),
             "ExecStart": (
                 systemd_manager._EXEC_SIGNATURE,
                 [[service_argv[0], service_argv, False, *([0] * 7)]] if service_argv else [],
@@ -382,8 +385,78 @@ class UnitRenderingTest(_LinuxCase):
 
     def test_the_service_unit_carries_no_environment_block(self) -> None:
         text = self._service_text()
-        self.assertNotIn("Environment=", text)
-        self.assertNotIn("EnvironmentFile=", text)
+        lines = text.splitlines()
+        self.assertFalse(any(line.startswith("Environment=") for line in lines))
+        self.assertFalse(any(line.startswith("EnvironmentFile=") for line in lines))
+        self.assertIn(
+            f"UnsetEnvironment={' '.join(ss.MASKED_MANAGER_ENVIRONMENT)}", text
+        )
+
+    def test_manager_global_redmine_environment_is_masked_without_value_exposure(self) -> None:
+        self.assertEqual(
+            ss.MASKED_MANAGER_ENVIRONMENT,
+            ("MOZYO_REDMINE_API_KEY", "MOZYO_REDMINE_URL"),
+        )
+        self.assertNotIn("MOZYO_REDMINE_DELIVERY_WRITE", ss.MASKED_MANAGER_ENVIRONMENT)
+        secret = "manager-global-secret-sentinel"
+        manager_environment = {
+            name: f"{secret}-{index}"
+            for index, name in enumerate(ss.MASKED_MANAGER_ENVIRONMENT)
+        }
+        with patch.dict(os.environ, manager_environment, clear=False):
+            text = self._service_text()
+            readiness = ss.classify_credential_readiness(mozyo_home=self.mozyo_home)
+        self.assertEqual(readiness, ss.CREDENTIAL_MISSING)
+        self.assertIn(
+            f"UnsetEnvironment={' '.join(ss.MASKED_MANAGER_ENVIRONMENT)}", text
+        )
+        self.assertNotIn(secret, repr({"unit": text, "readiness": readiness}))
+
+    def test_manager_global_secret_never_reaches_status_or_cli_text_and_json(self) -> None:
+        secret = "manager-global-secret-sentinel"
+        manager_environment = {
+            API_KEY_ENV: f"{secret}-key",
+            BASE_URL_ENV: f"https://{secret}.invalid",
+        }
+        runner = self._runner()
+        installed = self._install(runner=runner, credential=False)
+        self.assertTrue(installed["performed"], installed)
+
+        def backend_status(*, mozyo_home=None, **_kwargs):
+            row = ss.service_status(
+                os_home=self.os_home,
+                mozyo_home=mozyo_home,
+                runner=runner,
+                which=_which_found,
+            )
+            return sb._envelope("service_status", sb.BACKEND_SYSTEMD, row)  # noqa: SLF001
+
+        with patch.dict(os.environ, manager_environment, clear=False):
+            status = backend_status(mozyo_home=self.mozyo_home)
+            outputs = []
+            for as_json in (False, True):
+                argv = [
+                    "workflow",
+                    "supervisor",
+                    "--service-status",
+                    "--home",
+                    str(self.mozyo_home),
+                ]
+                if as_json:
+                    argv.append("--json")
+                args = build_parser().parse_args(argv)
+                buffer = io.StringIO()
+                with patch.object(
+                    sb, "service_status", side_effect=backend_status
+                ), contextlib.redirect_stdout(buffer):
+                    self.assertEqual(int(args.func(args) or 0), 0)
+                outputs.append(buffer.getvalue())
+
+        self.assertEqual(status["agents"][0]["credential_readiness"], ss.CREDENTIAL_MISSING)
+        self.assertNotIn(secret, repr(status))
+        self.assertNotIn(secret, json.dumps(status))
+        for output in outputs:
+            self.assertNotIn(secret, output)
 
     def test_the_service_unit_has_no_install_section(self) -> None:
         # Only the TIMER is enabled. A directly enabled service would run once at login and never

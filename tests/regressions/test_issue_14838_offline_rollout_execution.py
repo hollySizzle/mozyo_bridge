@@ -29,6 +29,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _reports_exact_version,
     _sanitized_runtime_env,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_offline_rollout_supervisor_stop import (  # noqa: E501
+    supervisor_stop_refusal,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_offline_rollout_runner import (  # noqa: E501
     OfflineRolloutRunnerBindingError,
     capture_provider_launch_bindings,
@@ -56,6 +59,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 
 
 class OfflineRolloutExecutionRegressionTests(unittest.TestCase):
+    SUPERVISOR_LABEL = "org.mozyo-bridge.callback-supervisor"
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -68,6 +73,149 @@ class OfflineRolloutExecutionRegressionTests(unittest.TestCase):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", ResourceWarning)
             gc.collect()
+
+    def test_supervisor_stop_requires_complete_current_and_legacy_evidence(self) -> None:
+        stopped_status = {
+            "backend": "launchd",
+            "agents": [
+                {
+                    "label": self.SUPERVISOR_LABEL,
+                    "installed": False,
+                    "loaded": False,
+                    "legacy_drain": "absent",
+                }
+            ],
+        }
+        complete = {
+            "backend": "launchd",
+            "label": self.SUPERVISOR_LABEL,
+            "performed": True,
+            "effect_state": "complete",
+            "legacy_drain": "absent",
+            "legacy_drain_removed": False,
+            "legacy_drain_reason": "",
+        }
+        self.assertEqual(
+            supervisor_stop_refusal(
+                complete, stopped_status, expected_label=self.SUPERVISOR_LABEL
+            ),
+            "",
+        )
+        self.assertEqual(
+            supervisor_stop_refusal(
+                {**complete, "legacy_drain": "owned", "legacy_drain_removed": True},
+                stopped_status,
+                expected_label=self.SUPERVISOR_LABEL,
+            ),
+            "",
+        )
+        cases = (
+            (
+                {
+                    **complete,
+                    "effect_state": "partial",
+                    "legacy_drain": "owned",
+                    "legacy_drain_reason": "legacy_drain_state_unreadable",
+                },
+                stopped_status,
+                "supervisor_uninstall_incomplete",
+            ),
+            (
+                {
+                    **complete,
+                    "effect_state": "partial",
+                    "legacy_drain": "owned",
+                    "legacy_drain_reason": "legacy_drain_removal_failed",
+                },
+                stopped_status,
+                "supervisor_uninstall_incomplete",
+            ),
+            (
+                complete,
+                {
+                    "backend": "launchd",
+                    "agents": [
+                        {"label": self.SUPERVISOR_LABEL, "legacy_drain": "absent"}
+                    ],
+                },
+                "supervisor_current_stop_unverified",
+            ),
+            (
+                complete,
+                {
+                    "backend": "launchd",
+                    "agents": [
+                        {
+                            "label": self.SUPERVISOR_LABEL,
+                            "installed": False,
+                            "loaded": False,
+                            "legacy_drain": "owned",
+                        }
+                    ],
+                },
+                "supervisor_legacy_stop_unverified",
+            ),
+        )
+        for result, status, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(
+                    supervisor_stop_refusal(
+                        result, status, expected_label=self.SUPERVISOR_LABEL
+                    ),
+                    expected,
+                )
+
+        wrong_row = {
+            **stopped_status,
+            "agents": [{**stopped_status["agents"][0], "label": "foreign"}],
+        }
+        self.assertEqual(
+            supervisor_stop_refusal(
+                complete, wrong_row, expected_label=self.SUPERVISOR_LABEL
+            ),
+            "supervisor_stop_label_drift",
+        )
+
+    def test_live_stop_phase_refuses_before_following_offline_phase_on_legacy_failure(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            supervisor_service_backend,
+        )
+
+        port = LiveOfflineRolloutExecutionPort(home=self.home, env={})
+        status = {
+            "backend": "launchd",
+            "agents": [
+                {
+                    "label": self.SUPERVISOR_LABEL,
+                    "installed": False,
+                    "loaded": False,
+                    "legacy_drain": "owned",
+                }
+            ],
+        }
+        for reason in (
+            "legacy_drain_state_unreadable",
+            "legacy_drain_removal_failed",
+        ):
+            result = {
+                "backend": "launchd",
+                "label": self.SUPERVISOR_LABEL,
+                "performed": True,
+                "effect_state": "partial",
+                "reason": "",
+                "legacy_drain": "owned",
+                "legacy_drain_reason": reason,
+            }
+            with (
+                patch.object(supervisor_service_backend, "uninstall", return_value=result),
+                patch.object(supervisor_service_backend, "service_status", return_value=status),
+            ):
+                outcome = port._supervisor_stop(  # noqa: SLF001
+                    {"supervisor_labels": [self.SUPERVISOR_LABEL]}, {}, self.home
+                )
+            self.assertFalse(outcome.ok)
+            self.assertEqual(outcome.reason, "supervisor_stop_unverified")
+            self.assertEqual(outcome.detail, "supervisor_uninstall_incomplete")
 
     def test_run_requires_execute_before_any_action_store_read(self) -> None:
         args = argparse.Namespace(

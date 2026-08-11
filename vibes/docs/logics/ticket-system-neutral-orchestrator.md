@@ -810,6 +810,16 @@ strip を「`key=value` 行の解析に由来する framing」とした当初の
 zero-mutation のままである（credential readiness は gate ではないため、この列挙に含まれない）。`uninstall` 側では foreign / unreadable な退役 plist は報告のみで、**自分の** agent
 の削除を妨げない（他人の file を理由に自分の登録を残す方が有害である）。
 
+ただし **global offline rollout の停止 gate は、自分の current agent を消せた事実だけでは通らない**。
+launchd の uninstall が `performed=true` でも、退役 drain の bootout / unlink が失敗すれば
+`effect_state=partial` であり、旧 scheduler が動作中または不明である。この状態で shared store / runtime
+migrationへ進むと、旧processがoffline区間へcallbackを書き得る。したがって停止 readback は top-level
+`effect_state=complete`、current rowの `installed=false` と `loaded=false`、uninstall結果とfresh statusの
+`legacy_drain=absent`をすべてpositive evidenceとして要求し、uninstall結果とfresh rowのlabelもplanが束縛した
+current supervisor labelへexact一致させる。plan schema v2もcapture時のbackendとlegacy drain
+stateを保持し、旧schemaやfield欠落を「不在」と補完しない。`foreign` / `unreadable` な退役stateは
+planを発行せず、`owned`だけを承認対象となるpending removalとして保持する。
+
 **Linux systemd user timer** の realization（`supervisor_systemd`）は **owned service 1 個 + timer 1 個**であ
 る。timer は portable default cadence ごとに `workflow supervisor --run-once` を 1 回起動し、process は毎 tick
 終了する。
@@ -833,6 +843,14 @@ argv + absolute home pin、oneshot、余分な hook・unit固有environmentな�
 だけ manager effectを許可する。restartのdisk側もargv/cadenceの部分parseだけでなくrendererのservice/timer bytes全体
 へexact一致させる。欠落・不正型・読取不能は `manager_effective_definition_unreadable`、型は読めるが値が異なる場合は
 `manager_effective_definition_drift` で拒否し、raw manager output / path / argv は result に出さない。
+
+user manager のglobal environmentはuser serviceへ通常継承されるため、「unitに `Environment=` がない」だけでは
+daemon-effective environmentを空と証明しない。owned serviceは値を一切書かず、固定名
+`MOZYO_REDMINE_API_KEY` / `MOZYO_REDMINE_URL` を
+`UnsetEnvironment=` で最終merge後に除去する。typed attestationも `UnsetEnvironment` がこのexact name集合であることを
+要求する。credential値は従来どおりpermission-gated mozyo home fileから解決し、unit / D-Bus result / status / logへ
+値を出さない。`MOZYO_REDMINE_DELIVERY_WRITE` はcredentialではなくlive writeの明示opt-inなのでmaskせず、
+manager environmentからの能力指定を維持する。
 
 `install` の exact sequence は両 unit snapshot → timer `ActiveState` の closed分類 → loadedならeffect直前snapshot
 再照合と timer `stop` rc 0（confirmed absentならstop不要、unreadableならwrite前拒否）→ post-stop snapshot → unit
@@ -895,7 +913,7 @@ service + timer である。対応関係:
 | `RunAtLoad` | `[Timer] OnActiveSec=0s` | timer が active になった瞬間に 1 tick（install は attestation 後に明示 `start`、以後の user manager 起動は enabled timer が担う） |
 | `StartInterval=<N>` | `[Timer] OnUnitActiveSec=<N>s` | 前回実行から N 秒後に再実行（N は共通 portable default / `--tick-interval`） |
 | `KeepAlive` 不在 | `Restart=` / `RemainAfterExit=` 不在 + `Type=oneshot` | bounded one-shot を常駐化・tight relaunch loop 化しない（false 設定ではなく **構造的に不在**） |
-| `EnvironmentVariables` 不在 | `Environment=` / `EnvironmentFile=` 不在 | unit に secret を書き込む code path が存在しない |
+| `EnvironmentVariables` 不在 | `Environment=` / `EnvironmentFile=` 不在 + fixed-name `UnsetEnvironment=` | unit に secret を書かず、user-manager global Redmine envも最終merge後に除去する |
 | `ProgramArguments` | `ExecStart`（token ごとに systemd quote + `%` escape） | shell string ではない構造化 argv。`/bin/sh -c` を経由しない |
 
 `ExecStart` の literal pin には **3 種類の escape が同時に要る**。空白 (token を double quote する)、quote / backslash (`\"` / `\\`)、そして **percent (`%` -> `%%`)** である。3 番目は cosmetic ではない: `ExecStart` は systemd **specifier** を解決するため、executable や `--home` path に含まれる `%h` 等を systemd が load 時に展開する。実測 (#15183 review j#102053 Finding 4): `ExecStart="/opt/%h/mozyo-bridge" "--home" "/tmp/%h"` を書いた unit を `systemctl --user show` で読むと、展開後の home を中立 sentinel へ置き換えた表記では `argv[]=/opt/EXPANDED-USER-HOME-SENTINEL/mozyo-bridge --home /tmp/EXPANDED-USER-HOME-SENTINEL` となり、unit file の literal 文字列とは別の executable / mozyo home が exec される。quote では展開を抑止できず `%%` だけが literal を固定する。escape を欠くと pin が pin でなくなるうえ、`executable_matches` が file の literal text と比較して `True` を返すため **drift を検出できない**。

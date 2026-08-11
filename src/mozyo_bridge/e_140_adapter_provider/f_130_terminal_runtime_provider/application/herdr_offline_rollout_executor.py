@@ -465,24 +465,26 @@ class LiveOfflineRolloutExecutionPort:
         repo = Path(paths[action["plan"]["current_workspace_id"]])
         return read_herdr_inventory(repo, env=self.env)
 
-    def _supervisor_stop(self, _phase, _action, _directory):
+    def _supervisor_stop(self, phase, _action, _directory):
         # Routed through the platform-resolving backend rather than the launchd module directly
         # (#15192 retired the `*_pair` verbs): the backend normalizes either host adapter into the
         # same one-row `agents` roster this check reads, so the step stops being macOS-only.
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
             supervisor_service_backend,
         )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_offline_rollout_supervisor_stop import (  # noqa: E501
+            supervisor_stop_refusal,
+        )
 
         result = supervisor_service_backend.uninstall()
         status = supervisor_service_backend.service_status(mozyo_home=self.home)
-        rows = status.get("agents", ())
-        # An EMPTY roster is not proof of a stopped supervisor — it is an unsupported host or an
-        # unreadable projection, and `all()` over nothing would call that verified.
-        stopped = bool(rows) and all(
-            not row.get("installed") and not row.get("loaded") for row in rows
+        labels = phase.get("supervisor_labels") if isinstance(phase, Mapping) else None
+        expected_label = labels[0] if isinstance(labels, list) and len(labels) == 1 else None
+        refusal = supervisor_stop_refusal(
+            result, status, expected_label=expected_label
         )
-        if not result.get("performed") or not stopped:
-            return _fail("supervisor_stop_unverified", str(result.get("reason") or ""))
+        if refusal:
+            return _fail("supervisor_stop_unverified", refusal)
         return _ok(supervisors_stopped=True)
 
     def _ensure_wip_snapshots(

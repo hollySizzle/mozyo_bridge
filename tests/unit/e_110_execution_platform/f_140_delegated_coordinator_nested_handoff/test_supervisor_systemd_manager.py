@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
     supervisor_systemd_manager as manager,
+    supervisor_systemd_unit as systemd_unit,
 )
 
 
@@ -65,7 +66,7 @@ class TypedManagerRunner:
             "Environment": ("as", []),
             "EnvironmentFiles": ("a(sb)", []),
             "PassEnvironment": ("as", []),
-            "UnsetEnvironment": ("as", []),
+            "UnsetEnvironment": ("as", list(systemd_unit.MASKED_MANAGER_ENVIRONMENT)),
             "ExecStart": (
                 manager._EXEC_SIGNATURE,
                 [[self.argv[0], self.argv, False, *([0] * 7)]],

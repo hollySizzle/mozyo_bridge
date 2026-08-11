@@ -119,7 +119,7 @@ def verify_plan(plan: object, expected_digest: object) -> Mapping[str, object]:
         raise OfflineRolloutActionError("plan_invalid")
     if canonical_digest(plan) != digest:
         raise OfflineRolloutActionError("plan_digest_mismatch")
-    if plan.get("schema_version") != 1:
+    if plan.get("schema_version") != 2:
         raise OfflineRolloutActionError("plan_schema_unsupported")
     phases = plan.get("phase_order")
     if not isinstance(phases, list) or not phases:
@@ -132,6 +132,38 @@ def verify_plan(plan: object, expected_digest: object) -> Mapping[str, object]:
         names.append(name)
     if tuple(names) != EXECUTION_PHASES:
         raise OfflineRolloutActionError("plan_phase_order_unsupported")
+    supervisor_phase = next(
+        phase for phase in phases if phase.get("phase") == "supervisor_stop"
+    )
+    if supervisor_phase.get("required_readback") != "current_stopped_and_legacy_absent":
+        raise OfflineRolloutActionError("supervisor_readback_contract_invalid")
+    supervisors = plan.get("supervisors")
+    if not isinstance(supervisors, list) or len(supervisors) != 1:
+        raise OfflineRolloutActionError("plan_supervisor_set_invalid")
+    supervisor = supervisors[0]
+    if not isinstance(supervisor, Mapping) or supervisor.get("backend") not in {
+        "launchd", "systemd_user"
+    }:
+        raise OfflineRolloutActionError("plan_supervisor_evidence_invalid")
+    supervisor_label = supervisor.get("label")
+    if type(supervisor_label) is not str or not supervisor_label:
+        raise OfflineRolloutActionError("plan_supervisor_evidence_invalid")
+    legacy = supervisor.get("legacy_drain")
+    if (
+        supervisor.get("backend") == "launchd"
+        and legacy not in {"absent", "owned"}
+    ) or (
+        supervisor.get("backend") == "systemd_user" and legacy != "not_applicable"
+    ):
+        raise OfflineRolloutActionError("plan_supervisor_evidence_invalid")
+    phases_by_name = {phase["phase"]: phase for phase in phases}
+    for phase_name in (
+        "supervisor_stop",
+        "supervisor_pair_install",
+        "supervisor_pair_readback",
+    ):
+        if phases_by_name[phase_name].get("supervisor_labels") != [supervisor_label]:
+            raise OfflineRolloutActionError("plan_supervisor_evidence_invalid")
     artifact = plan.get("candidate_artifact")
     if not isinstance(artifact, Mapping) or artifact.get("exact_pin_ready") is not True:
         raise OfflineRolloutActionError("artifact_pin_incomplete")

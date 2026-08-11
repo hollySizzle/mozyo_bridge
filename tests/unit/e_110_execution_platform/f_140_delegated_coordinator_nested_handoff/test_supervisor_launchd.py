@@ -2026,13 +2026,42 @@ class OwnedIdentityIsRevalidatedAtActionTimeTest(_DarwinCase):
 
     def test_owned_plist_replaced_during_uninstall_bootout_is_not_unlinked(self) -> None:
         owned = _write_plist(sl.plist_path(self.os_home), sl.SUPERVISOR_LAUNCHD_LABEL)
-        result = sl.uninstall(
-            os_home=self.os_home,
-            runner=self._swap_on("bootout", owned, "com.example.foreign"),
-        )
+        calls = []
+
+        def runner(argv):
+            calls.append(list(argv))
+            if len(argv) >= 2 and argv[1] == "bootout":
+                _write_plist(owned, "com.example.foreign")
+            return _result(0)
+
+        with patch.object(sl, "unlink_owned") as unlink:
+            result = sl.uninstall(os_home=self.os_home, runner=runner)
         self.assertFalse(result["performed"])
         self.assertEqual(sl.REASON_PLIST_FOREIGN_LABEL, result["reason"])
         self.assertEqual(sl.PLIST_FOREIGN, result["plist_state"])
+        self.assertEqual(sl.EFFECT_PARTIAL, result["effect_state"])
+        self.assertEqual([argv[1] for argv in calls], ["bootout"])
+        unlink.assert_not_called()
+        self.assertTrue(owned.exists())
+
+    def test_owned_plist_made_unreadable_after_uninstall_bootout_is_partial(self) -> None:
+        owned = _write_plist(sl.plist_path(self.os_home), sl.SUPERVISOR_LAUNCHD_LABEL)
+        calls = []
+
+        def runner(argv):
+            calls.append(list(argv))
+            if len(argv) >= 2 and argv[1] == "bootout":
+                owned.write_bytes(b"not a plist")
+            return _result(0)
+
+        with patch.object(sl, "unlink_owned") as unlink:
+            result = sl.uninstall(os_home=self.os_home, runner=runner)
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_PLIST_UNREADABLE, result["reason"])
+        self.assertEqual(sl.PLIST_UNREADABLE, result["plist_state"])
+        self.assertEqual(sl.EFFECT_PARTIAL, result["effect_state"])
+        self.assertEqual([argv[1] for argv in calls], ["bootout"])
+        unlink.assert_not_called()
         self.assertTrue(owned.exists())
 
     def test_current_plist_replaced_during_migration_is_not_overwritten_by_install(self) -> None:

@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_systemd_unit import (  # noqa: E501
+    MASKED_MANAGER_ENVIRONMENT,
     render_service_unit,
     render_timer_unit,
 )
@@ -275,10 +276,13 @@ class SystemdManagerInspector:
             ("service_environment", "as"),
             ("service_environment_files", "a(sb)"),
             ("service_pass_environment", "as"),
-            ("service_unset_environment", "as"),
         ):
             if cls._array(values[key], signature) != []:
                 return False
+        if cls._array(values["service_unset_environment"], "as") != list(
+            MASKED_MANAGER_ENVIRONMENT
+        ):
+            return False
         if not cls._exec_start_matches(values["exec_start"], expected_argv):
             return False
         for key in (

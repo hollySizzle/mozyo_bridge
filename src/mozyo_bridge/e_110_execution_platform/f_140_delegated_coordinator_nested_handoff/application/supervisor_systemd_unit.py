@@ -78,6 +78,15 @@ _SYSTEMCTL = "systemctl"
 #: and on every later user-manager start).
 RUN_AT_LOAD_DELAY = "0s"
 
+#: Names removed from the final service environment after all manager-global, unit-local, and PAM
+#: environment sources have been merged.  Values are never serialized; credentials come from the
+#: permission-gated mozyo home file so daemon-effective readiness stays independent of an
+#: operator's prior ``systemctl --user import-environment`` calls.
+MASKED_MANAGER_ENVIRONMENT = (
+    "MOZYO_REDMINE_API_KEY",
+    "MOZYO_REDMINE_URL",
+)
+
 
 @dataclasses.dataclass(frozen=True)
 class SupervisorUnit:
@@ -354,7 +363,8 @@ def render_service_unit(command: Sequence[str]) -> str:
     Structurally minimal and secret-free:
 
     - **No** ``Environment=`` / ``EnvironmentFile=`` key exists in the output, so no secret can be
-      serialized in.
+      serialized in. ``UnsetEnvironment=`` names the Redmine inputs without their values and masks
+      any same-named user-manager global environment after systemd merges all sources.
     - **No** ``Restart=`` and **no** ``RemainAfterExit=`` key: the command is a bounded sweep that
       exits and the ``.timer`` re-runs it. A restart directive on a one-shot would be a tight
       relaunch loop, so it is absent by design.
@@ -371,6 +381,7 @@ def render_service_unit(command: Sequence[str]) -> str:
             "[Service]",
             "Type=oneshot",
             f"ExecStart={format_exec_argv(command)}",
+            f"UnsetEnvironment={' '.join(MASKED_MANAGER_ENVIRONMENT)}",
             f"SyslogIdentifier={Path(SUPERVISOR_UNIT.service_unit).stem}",
             "",
         )
@@ -518,6 +529,7 @@ __all__ = (
     "TIMER_UNIT_NAME",
     "TIMERS_TARGET",
     "RUN_AT_LOAD_DELAY",
+    "MASKED_MANAGER_ENVIRONMENT",
     "DEFAULT_TICK_INTERVAL_SECONDS",
     "SUPERVISOR_EXECUTABLE_NAME",
     "SUPERVISOR_ARGV_TAIL",

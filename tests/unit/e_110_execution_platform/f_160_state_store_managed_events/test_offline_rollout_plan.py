@@ -78,6 +78,8 @@ def _capture() -> OfflineRolloutCapture:
                 "ok",
                 True,
                 "ready",
+                "systemd_user",
+                "not_applicable",
             ),
         ),
     )
@@ -356,6 +358,60 @@ class OfflineRolloutPlanTests(unittest.TestCase):
                 ["org.mozyo-bridge.callback-supervisor"],
                 phase,
             )
+        self.assertEqual(
+            by_phase["supervisor_stop"]["required_readback"],
+            "current_stopped_and_legacy_absent",
+        )
+        self.assertEqual(result.plan["supervisors"][0]["backend"], "systemd_user")
+        self.assertEqual(result.plan["supervisors"][0]["legacy_drain"], "not_applicable")
+
+    def test_launchd_legacy_drain_state_is_bound_into_the_plan(self) -> None:
+        source = _capture()
+        result = build_offline_rollout_plan(
+            replace(
+                source,
+                supervisors=(
+                    replace(
+                        source.supervisors[0], backend="launchd", legacy_drain="owned"
+                    ),
+                ),
+            )
+        )
+        self.assertTrue(result.ok, result)
+        self.assertEqual(result.plan["supervisors"][0]["legacy_drain"], "owned")
+
+    def test_supervisor_backend_and_legacy_state_are_closed(self) -> None:
+        source = _capture()
+        invalid = (
+            replace(source.supervisors[0], backend="", legacy_drain="not_applicable"),
+            replace(source.supervisors[0], backend="systemd_user", legacy_drain="absent"),
+            replace(source.supervisors[0], backend="launchd", legacy_drain="mystery"),
+        )
+        for supervisor in invalid:
+            with self.subTest(supervisor=supervisor):
+                result = build_offline_rollout_plan(
+                    replace(source, supervisors=(supervisor,))
+                )
+                self.assertEqual(result.reason, "supervisor_set_invalid")
+
+    def test_launchd_foreign_or_unreadable_legacy_drain_cannot_mint_a_plan(self) -> None:
+        source = _capture()
+        for state in ("foreign", "unreadable"):
+            with self.subTest(state=state):
+                result = build_offline_rollout_plan(
+                    replace(
+                        source,
+                        supervisors=(
+                            replace(
+                                source.supervisors[0],
+                                backend="launchd",
+                                legacy_drain=state,
+                            ),
+                        ),
+                    )
+                )
+                self.assertEqual(result.reason, "supervisor_set_invalid")
+                self.assertEqual(result.detail, "legacy_drain_not_plannable")
 
     def test_public_plan_copy_cannot_mutate_digest_authority(self) -> None:
         result = build_offline_rollout_plan(_capture())
