@@ -488,6 +488,67 @@ class PreviewSubstitutionTests(unittest.TestCase):
         self.assertIn("--summary 'board pointer'", command)
 
 
+class ContainerUserRoutingTests(unittest.TestCase):
+    def test_observation_workspace_lookup_and_delivery_use_the_same_user(self) -> None:
+        config = UnitBoardSourcesConfig.from_record(
+            {
+                "version": 1,
+                "sources": [
+                    {
+                        "host_id": "devcontainer",
+                        "kind": "container",
+                        "container": "CONTAINER-SENTINEL",
+                        "container_user": "1000:1000",
+                        "label": "dev container",
+                    }
+                ],
+            }
+        )
+        answer_map = answers()
+
+        class ContainerRunner:
+            def __init__(self) -> None:
+                self.argvs: list[list[str]] = []
+
+            def __call__(self, argv, **kwargs):
+                self.argvs.append(list(argv))
+                for expected_args, answer in answer_map.items():
+                    if all(token in argv for token in expected_args):
+                        stdout = answer if isinstance(answer, str) else json.dumps(answer)
+                        return subprocess.CompletedProcess(argv, 0, stdout, "")
+                return subprocess.CompletedProcess(argv, 127, "", "")
+
+        runner = ContainerRunner()
+        runtime = MultiSourceUnitBoardRuntime(
+            config,
+            local_runtime=FakeLocalRuntime(),
+            runner=runner,
+            clock=MovableClock(),
+        )
+        action = RemoteUnitActionRail(runtime, clock=MovableClock())
+        unit_id = next(
+            unit.unit_id
+            for unit in runtime.snapshot().units
+            if unit.host_id == "devcontainer"
+        )
+
+        result = action.apply(action.preview(request(unit_id)))
+
+        self.assertEqual(result.state, ACTION_DELIVERED)
+        self.assertGreaterEqual(len(runner.argvs), 3)
+        for argv in runner.argvs:
+            self.assertEqual(
+                argv[:5],
+                [
+                    "docker",
+                    "exec",
+                    "--user",
+                    "1000:1000",
+                    "CONTAINER-SENTINEL",
+                ],
+            )
+
+
 class DeliveryModeTests(unittest.TestCase):
     """Redmine #15198: the route is special, the send rail is not."""
 

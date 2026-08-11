@@ -12,9 +12,9 @@ The schema is pure and fail-closed.  It owns two things and nothing else:
   ``lane_id`` into a cross-host Unit identity, plus the operator-chosen public
   label the board is allowed to display;
 - **command shape** — the exact argv used to reach one source.  Connection
-  values (ssh target, container name) are private to the operator home file:
-  they are inputs to argv construction and are never part of any payload,
-  rendered row, or refusal detail.
+  values (ssh target, container name, container execution user) are private to
+  the operator home file: they are inputs to argv construction and are never
+  part of any payload, rendered row, or refusal detail.
 
 There is no arbitrary remote shell here.  A source resolves to one of three
 fixed argv shapes (local / ssh / container-exec, optionally container-over-ssh),
@@ -83,6 +83,13 @@ _LABEL_RE = re.compile(
 #: destination can never be read as an ssh option.
 _SSH_TARGET_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.@%:-]{0,127}$")
 _CONTAINER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
+#: Docker and Podman accept ``name|uid[:group|gid]`` for ``exec --user``.  Keep
+#: the operator value a single bounded argv token: no leading option marker,
+#: whitespace, control character, shell metacharacter, or second colon.
+_CONTAINER_USER_RE = re.compile(
+    r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}"
+    r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,63})?$"
+)
 #: A command name on the trusted PATH of the target host, or an absolute POSIX
 #: path to it.  Both are operator-home values; neither is ever displayed.
 _BINARY_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
@@ -167,9 +174,10 @@ def _connection_values(source: "UnitBoardSource") -> tuple[str, ...]:
     ``container`` are private whatever they contain — a destination that happens
     to be spelled ``mozyo-bridge`` is still a destination, and excluding it by
     value let exactly that string reach a public payload (review j#102129
-    finding_3).
+    finding_3).  The container execution user is topology too: it can be an
+    operator name, not merely a numeric uid, so it follows the same boundary.
     """
-    values = [source.ssh_target, source.container]
+    values = [source.ssh_target, source.container, source.container_user]
     if source.mozyo_binary and source.mozyo_binary != DEFAULT_MOZYO_BINARY:
         values.append(source.mozyo_binary)
     return tuple(dict.fromkeys(value for value in values if value))
@@ -217,6 +225,7 @@ class UnitBoardSource:
     # finding_2).
     ssh_target: str = field(default="", repr=False)
     container: str = field(default="", repr=False)
+    container_user: str = field(default="", repr=False)
     container_runtime: str = "docker"
     via: str = ""
     mozyo_binary: str = field(default=DEFAULT_MOZYO_BINARY, repr=False)
@@ -242,6 +251,19 @@ class UnitBoardSource:
         if not self.is_local and self.host_id == LOCAL_HOST_ID:
             raise UnitBoardSourceError(
                 f"host_id {LOCAL_HOST_ID!r} is reserved for the local source"
+            )
+        if not isinstance(self.container_user, str):
+            raise UnitBoardSourceError("'container_user' must be a string")
+        if self.container_user:
+            if self.kind != HOST_KIND_CONTAINER:
+                raise UnitBoardSourceError(
+                    "'container_user' is supported only for a container source"
+                )
+            _validated(
+                self.container_user,
+                _CONTAINER_USER_RE,
+                key="container_user",
+                where=f"Unit board source {self.host_id!r}",
             )
         # The stored label IS the public value.  Enforced on every construction
         # path, not just the record loader, so no caller can install a raw label
@@ -269,9 +291,10 @@ class UnitBoardSource:
     def as_payload(self) -> dict[str, str]:
         """Public-safe projection: identity and display label only.
 
-        Deliberately omits ``ssh_target`` / ``container`` / ``mozyo_binary``.
-        Those are the private connection values the close conditions forbid on
-        every public surface, and a payload is the easiest place to leak them.
+        Deliberately omits ``ssh_target`` / ``container`` / ``container_user`` /
+        ``mozyo_binary``.  Those are the private connection values the close
+        conditions forbid on every public surface, and a payload is the easiest
+        place to leak them.
         """
         return {
             "host_id": self.host_id,
@@ -306,7 +329,8 @@ class UnitBoardSource:
         allowed = {
             HOST_KIND_LOCAL: common,
             HOST_KIND_SSH: common + ("ssh_target",),
-            HOST_KIND_CONTAINER: common + ("container", "container_runtime", "via"),
+            HOST_KIND_CONTAINER: common
+            + ("container", "container_user", "container_runtime", "via"),
         }[kind]
         _reject_unknown_keys(record, allowed, where=where)
 
@@ -340,6 +364,7 @@ class UnitBoardSource:
 
         ssh_target = ""
         container = ""
+        container_user = ""
         container_runtime = "docker"
         via = ""
         if kind == HOST_KIND_SSH:
@@ -356,6 +381,13 @@ class UnitBoardSource:
                 key="container",
                 where=where,
             )
+            if "container_user" in record:
+                container_user = _validated(
+                    _require_str(record, "container_user", where=where),
+                    _CONTAINER_USER_RE,
+                    key="container_user",
+                    where=where,
+                )
             if "container_runtime" in record:
                 container_runtime = _require_str(
                     record, "container_runtime", where=where
@@ -381,6 +413,7 @@ class UnitBoardSource:
             kind=kind,
             ssh_target=ssh_target,
             container=container,
+            container_user=container_user,
             container_runtime=container_runtime,
             via=via,
             mozyo_binary=mozyo_binary,
@@ -619,7 +652,10 @@ def source_command_argv(
     command = [source.mozyo_binary, *args]
     if source.kind == HOST_KIND_SSH:
         return ssh_argv(source, command)
-    exec_argv = [source.container_runtime, "exec", source.container, *command]
+    exec_argv = [source.container_runtime, "exec"]
+    if source.container_user:
+        exec_argv.extend(("--user", source.container_user))
+    exec_argv.extend((source.container, *command))
     if not source.via:
         return tuple(exec_argv)
     parent = (by_id or {}).get(source.via)

@@ -50,6 +50,7 @@ sources:
   - host_id: devcontainer
     kind: container
     container: <container 名>
+    container_user: <Herdr serverを所有するname|uid[:group|gid]>  # optional
     via: devbox               # 1 hop のみ。container 経由の container は拒否
 ```
 
@@ -63,16 +64,24 @@ sources:
   Unicode 正規化・空白圧縮で同一表示になりうる）。
 - `kind` ごとに許可 key を固定し、未知 key・misplaced key・重複 key・version 不一致は
   fail-closed。`yaml.safe_load` の duplicate key は宣言順で解決せず拒否する。
-- 接続値 (`ssh_target` / `container` / `mozyo_binary`) は argv 構築の入力にすぎない。
+- 接続値 (`ssh_target` / `container` / `container_user` / `mozyo_binary`) は argv 構築の入力にすぎない。
   payload、描画行、refusal detail のいずれにも出さない。private かどうかは **field で決める**。
   `mozyo_binary` は既定値を保持しているときだけ「この tool の名前」として除外し、
-  `ssh_target` / `container` は**内容に関わらず常に private**（既定 binary と同じ綴りの宛先も宛先である）。
+  `ssh_target` / `container` / `container_user` は**内容に関わらず常に private**
+  （既定 binary と同じ綴りの宛先も宛先である）。
 - **公開 field (`host_id` / `label`) が接続値を繰り返す設定は拒否する。** 両 field は board が
   publish するため、そこに接続値が入れば operator-scoped file へ隔離した意味が失われる。
   same-source（自分の接続値）と cross-source（他 source の接続値）の双方を検査し、label 未指定時に
   host_id を既定にする経路も同じ検査を通す。
 - source 数と接続 timeout は bound する (`MAX_SOURCES` / `MAX_CONNECT_TIMEOUT_SECONDS`)。
   1 refresh あたり source ごとに 1 接続が発生するため。
+- `container_user` は container source だけに指定できる。container の既定 user と Herdr server の
+  所有 user が異なる Dev Container では、指定しない問い合わせは別 user の runtime を見るため、
+  明示値を使う。値は bounded な `name|uid[:group|gid]` の 1 token に限定し、指定時だけ
+  `exec --user <value>` を使う。失敗時に既定 user や root へ fallback しない。
+- `container_user` は実行 user だけを選ぶ。`HOME` / `MOZYO_BRIDGE_HOME` などの environment を
+  推測・上書きする契約ではない。対象 container は、指定 user の通常環境から正しい Herdr runtime
+  を解決できるよう構成する。追加の environment override が必要な場合は別の明示的契約として扱う。
 
 ### argv 形状 (arbitrary remote shell を作らない)
 
@@ -84,7 +93,7 @@ remote command 1 箇所だけで、そこは token ごとに `shlex.quote` す�
 | --- | --- |
 | `local` | in-process 観測 (subprocess を作らない) |
 | `ssh` | `ssh -o BatchMode=yes -o ConnectTimeout=<n> -T -- <target> '<quoted command>'` |
-| `container` | `<docker\|podman> exec <container> mozyo-bridge ...` |
+| `container` | `<docker\|podman> exec [--user <name\|uid[:group\|gid]>] <container> mozyo-bridge ...` |
 | `container` + `via: <ssh>` | 上記 exec argv を ssh remote command として 1 hop nest |
 
 `BatchMode=yes` は必須である。到達不能・未認証の host が password prompt で block すると
