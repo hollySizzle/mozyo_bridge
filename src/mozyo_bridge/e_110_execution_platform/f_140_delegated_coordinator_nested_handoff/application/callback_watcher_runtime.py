@@ -39,7 +39,8 @@ class WatcherConfig:
     ``source_issue`` — the Redmine issue the watcher re-reads for handoff-worthy gate markers.
     ``workspace_id`` — the workspace whose callback outbox / route this watcher owns (its sends and
     claims are pinned here, not to ambient cwd/env — R2-F5). ``wake_target`` — the stable Herdr
-    assigned-name the watcher blocks on via ``wait agent-status`` (a hint; Redmine stays authority).
+    assigned-name the watcher blocks on via ``agent wait TARGET --until STATUS --timeout MS``
+    (a hint; Redmine stays authority).
     ``sender_attested`` — whether the launch-time sender identity was attested; an un-attested
     watcher is recorded so its downstream sends fail-closed rather than routing on ambient env.
     """

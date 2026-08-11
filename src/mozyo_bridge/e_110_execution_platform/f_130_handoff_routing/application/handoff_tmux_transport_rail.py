@@ -116,6 +116,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.han
     HerdrQueueEnterSession,
     LiveHerdrQueueEnterOpsMixin,
     QueueEnterEffectFenceRefused,
+    QueueEnterRetryProbeFailed,
     QueueEnterResendGate,
     retry_values_are_supported,
 )
@@ -441,7 +442,9 @@ class TmuxTransportRailUseCase:
         # failed primitive comes from `_step`, never from the exception's adapter-authored message.
         try:
             return self._execute(request)
-        except TerminalTransportError:
+        except TerminalTransportError as exc:
+            if isinstance(exc, QueueEnterRetryProbeFailed):
+                self._current_step = STEP_READ_PANE_RETRY_PROBE
             self._fail_transport(request, self._current_step)
             raise AssertionError("unreachable")
 
@@ -655,14 +658,11 @@ class TmuxTransportRailUseCase:
                 ops.press_enter(request.target)
                 enter_attempts += 1
 
-        # Herdr queue-enter never runs the tmux marker loop. The extracted session
-        # owns its causal waits, strict live rechecks, and one absolute deadline;
-        # it has no body-injection primitive in reach.
+        # Herdr queue-enter skips the tmux marker loop; this session owns waits and deadline.
         if queue_session is not None and first_enter_armed:
             def _press_extra_enter() -> None:
                 self._current_step = STEP_SEND_KEYS_ENTER_RETRY
                 ops.press_enter(request.target)
-
             self._current_step = STEP_READ_PANE_RETRY_PROBE  # retry authorization reads
             queue_session.complete_after_first_enter(
                 press_extra_enter=_press_extra_enter

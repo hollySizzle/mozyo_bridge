@@ -1407,7 +1407,7 @@ allowlist:
       it lands in the JSON so the #12656 ledger reads it, not the reused wire reason),
       the `_herdr_turn_start_token` helper, and herdr-discriminating branches in
       `next_action_for` / `_outcome_narrative` / `_receiver_contract_line` (a herdr
-      `delivered_not_started` describes a herdr `wait agent-status` event-wait timeout;
+      `delivered_not_started` describes a herdr `agent wait --until` event-wait timeout;
       the `receiver_blocked` wording no longer falsely claims "no re-send" since the
       rail can bounded-resend Enter). The tmux/capture path (`turn_start_outcome=None`)
       keeps its pre-#13255 wording byte-for-byte. The rail telemetry model stays in the

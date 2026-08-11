@@ -25,14 +25,14 @@ completion, and a rendered pane is never the source of truth). Redmine #13166
 hardened the tmux compat rail against exactly this false-positive — a busy /
 redrawing composer that absorbs the Enter while the rail still reports ``sent`` —
 with a read-only, pane-capture *turn-start observation*. This module is the herdr
-analogue of that guard, built on herdr's **event** surface (``wait agent-status``)
+analogue of that guard, built on herdr's **event** surface (``agent wait --until``)
 instead of pane-capture heuristics, and it is proven equivalent-or-stronger to the
 #13166 guard in the design doc (``## Implemented Terminal Runtime Turn-Start Rail
 (Redmine #13248)``, the equivalence table).
 
 The check-then-wait ordering (PoC E9 / E12, j#72258 — enforced in code)
 -----------------------------------------------------------------------
-``wait agent-status`` waits for a *change into* a state and does **not** return
+``agent wait TARGET --until STATUS --timeout MS`` waits for a *change into* a state and does **not** return
 when the pane is already in it (E9 c2): so a wait alone can neither read the
 current state nor be armed after a transition without racing it. The rail
 therefore follows a fixed order, and :meth:`HerdrTurnStartRail.drive_turn_start`
@@ -129,7 +129,7 @@ Scope (staged seam — kept explicit so it does not drift)
   resend gate's closed skip vocabulary and pure predicates live in the leaf
   ``domain/turn_start_resend_gate``, re-exported here so importers are unchanged.
   All exercised by the fake-driven 4-case + 2-precondition + Enter-resend harness.
-- **Out of scope (later US's):** the concrete herdr ``wait agent-status``
+- **Out of scope (later US's):** the concrete herdr ``agent wait --until``
   subprocess wait primitive lives in the sibling ``infrastructure/herdr_turn_start``
   (still a staged seam, no live binary in its tests); wiring this rail into the
   live handoff send path is **#13253**; the installer / pin config is **#13249**;
@@ -198,7 +198,7 @@ class TurnStartRailError(TerminalTransportError):
 
 # --- wait-primitive result vocabulary (core-owned, closed set) ---------------
 # The four ways the injected wait primitive can resolve. The primitive arms a
-# ``wait agent-status <target> --status working`` and reports one of these; the
+# ``agent wait <target> --until working --timeout <ms>`` and reports one of these; the
 # rail maps them (plus a re-snapshot) onto the turn-start outcomes. Core-owned so
 # a provider cannot invent a wait result a caller has not planned for.
 WAIT_CHANGED = "changed"  # the awaited status transition was observed (event + exit 0) — E12/E14
@@ -220,7 +220,7 @@ RESENDABLE_WAIT_KINDS: frozenset[str] = frozenset({WAIT_TIMEOUT, WAIT_ERROR})
 
 @dataclass(frozen=True)
 class WaitResult:
-    """The structured outcome of one armed ``wait agent-status`` collection.
+    """The structured outcome of one armed ``agent wait --until`` collection.
 
     ``kind`` is the sole authority and is always a member of
     :data:`WAIT_RESULT_KINDS`; ``detail`` is a short, credential-free, path-free
@@ -278,7 +278,7 @@ class ArmedWait(Protocol):
 
 @runtime_checkable
 class TurnStartWaitPort(Protocol):
-    """The injected wait primitive: arm a ``wait agent-status`` for a target.
+    """The injected wait primitive: arm an ``agent wait --until`` for a target.
 
     A built-in provider only (no dynamic loading). :meth:`arm` starts a
     non-blocking wait for the ``working`` transition on ``target`` and returns an
@@ -467,7 +467,7 @@ class TurnStartResult:
 #: The default raw key token submitted after the text (herdr ``pane send-keys``).
 DEFAULT_ENTER_KEYS = "enter"
 
-#: The default ``wait agent-status --timeout`` window, in milliseconds. Aligned
+#: The default ``agent wait --timeout`` window, in milliseconds. Aligned
 #: with the #13166 codex-standard-rail landing window (8.0s) so the herdr rail
 #: waits about as long as the tmux guard it is equivalent to.
 DEFAULT_WAIT_TIMEOUT_MS = 8000
@@ -480,7 +480,7 @@ DEFAULT_WAIT_TIMEOUT_MS = 8000
 #: sequence cannot spend it twice.
 DEFAULT_MAX_ENTER_RESENDS = 1
 
-#: The default ``wait agent-status --timeout`` window for the re-wait after a
+#: The default ``agent wait --timeout`` window for the re-wait after a
 #: WAIT_ERROR-armed Enter resend, in milliseconds (Redmine #15202). Longer than
 #: :data:`DEFAULT_WAIT_TIMEOUT_MS` on purpose: the first wait *failed* rather than
 #: timing out, so it produced no evidence about how long a start takes on this

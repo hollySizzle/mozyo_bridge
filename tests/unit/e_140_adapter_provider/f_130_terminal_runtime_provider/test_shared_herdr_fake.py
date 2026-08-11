@@ -659,6 +659,7 @@ class WaitChangeSemanticsTest(unittest.TestCase):
             [*exact[:4], "--status", *exact[5:]],
             [*exact, "--json"],
             [*exact[:-1], "not-a-number"],
+            [*exact[:5], "definitely_not_a_status", *exact[6:]],
         )
         for argv in invalid:
             with self.subTest(argv=argv):

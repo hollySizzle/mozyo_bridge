@@ -109,6 +109,9 @@ STATUS_IDLE = "idle"
 STATUS_WORKING = "working"
 STATUS_BLOCKED = "blocked"
 STATUS_DONE = "done"
+_AGENT_WAIT_STATUSES = frozenset(
+    {STATUS_IDLE, STATUS_WORKING, STATUS_BLOCKED, STATUS_DONE, "unknown"}
+)
 
 #: Default status a freshly launched agent snapshots at (booted but not yet
 #: driven): idle. A ``wait`` for a *change into* another status is what advances
@@ -458,7 +461,7 @@ class FakeHerdr:
             or rest[:2] != ["agent", "wait"]
             or not rest[2]
             or rest[3] != "--until"
-            or not rest[4]
+            or rest[4] not in _AGENT_WAIT_STATUSES
             or rest[5] != "--timeout"
             or not rest[6].isdigit()
         ):
