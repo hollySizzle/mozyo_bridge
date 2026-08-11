@@ -465,20 +465,26 @@ class LiveOfflineRolloutExecutionPort:
         repo = Path(paths[action["plan"]["current_workspace_id"]])
         return read_herdr_inventory(repo, env=self.env)
 
-    def _supervisor_stop(self, _phase, _action, _directory):
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd import (  # noqa: E501
-            service_status_pair,
-            uninstall_pair,
+    def _supervisor_stop(self, phase, _action, _directory):
+        # Routed through the platform-resolving backend rather than the launchd module directly
+        # (#15192 retired the `*_pair` verbs): the backend normalizes either host adapter into the
+        # same one-row `agents` roster this check reads, so the step stops being macOS-only.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            supervisor_service_backend,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_offline_rollout_supervisor_stop import (  # noqa: E501
+            supervisor_stop_refusal,
         )
 
-        result = uninstall_pair()
-        status = service_status_pair(mozyo_home=self.home)
-        stopped = all(
-            not row.get("installed") and not row.get("loaded")
-            for row in status.get("agents", ())
+        result = supervisor_service_backend.uninstall()
+        status = supervisor_service_backend.service_status(mozyo_home=self.home)
+        labels = phase.get("supervisor_labels") if isinstance(phase, Mapping) else None
+        expected_label = labels[0] if isinstance(labels, list) and len(labels) == 1 else None
+        refusal = supervisor_stop_refusal(
+            result, status, expected_label=expected_label
         )
-        if not result.get("performed") or not stopped:
-            return _fail("supervisor_stop_unverified", str(result.get("reason") or ""))
+        if refusal:
+            return _fail("supervisor_stop_unverified", refusal)
         return _ok(supervisors_stopped=True)
 
     def _ensure_wip_snapshots(
@@ -904,8 +910,8 @@ class LiveOfflineRolloutExecutionPort:
         return _ok(live_names_verified=True)
 
     def _supervisor_install(self, _phase, action, _directory):
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd import (  # noqa: E501
-            install_pair,
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            supervisor_service_backend,
         )
 
         target_cli = self._bindings(action)["target_cli"]
@@ -913,16 +919,18 @@ class LiveOfflineRolloutExecutionPort:
         def which(name):
             return target_cli if name == "mozyo-bridge" else shutil.which(name)
 
-        result = install_pair(mozyo_home=self.home, which=which)
+        result = supervisor_service_backend.install(mozyo_home=self.home, which=which)
         if not result.get("performed"):
             return _fail("supervisor_install_failed", str(result.get("reason") or ""))
         return _ok(supervisors_installed=True)
 
     def _supervisor_readback(self, _phase, action, _directory):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            supervisor_service_backend,
+        )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd import (  # noqa: E501
             CREDENTIAL_READY,
             HOME_PIN_OK,
-            service_status_pair,
         )
 
         target_cli = self._bindings(action)["target_cli"]
@@ -930,9 +938,11 @@ class LiveOfflineRolloutExecutionPort:
         def which(name):
             return target_cli if name == "mozyo-bridge" else shutil.which(name)
 
-        status = service_status_pair(mozyo_home=self.home, which=which)
+        status = supervisor_service_backend.service_status(mozyo_home=self.home, which=which)
         agents = status.get("agents", ())
-        healthy = len(agents) == 2 and all(
+        # Every owned service must be healthy, and there must BE one: the count is the host's owned
+        # roster size (one since #15192), never a hard-coded pair.
+        healthy = bool(agents) and all(
             row.get("installed")
             and row.get("loaded")
             and row.get("home_pin") == HOME_PIN_OK

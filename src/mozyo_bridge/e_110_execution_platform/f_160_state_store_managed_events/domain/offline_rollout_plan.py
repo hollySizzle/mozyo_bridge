@@ -15,12 +15,11 @@ from dataclasses import dataclass, field
 from typing import Mapping, Optional, Sequence
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (  # noqa: E501
-    DEFAULT_SUPERVISOR_DRAIN_SERVICE_LABEL,
     DEFAULT_SUPERVISOR_SERVICE_LABEL,
 )
 
 
-OFFLINE_ROLLOUT_PLAN_SCHEMA_VERSION = 1
+OFFLINE_ROLLOUT_PLAN_SCHEMA_VERSION = 3
 
 PLAN_READY = "planned"
 PLAN_REFUSED = "refused"
@@ -59,12 +58,28 @@ _SCOPES = frozenset({SCOPE_TARGET_PROJECT, SCOPE_UNRELATED_PROJECT})
 _SHA40 = re.compile(r"[0-9a-f]{40}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _ORIGIN_HEAD_REF = re.compile(r"refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]*")
-OWNED_SUPERVISOR_LABELS = frozenset(
-    {
-        DEFAULT_SUPERVISOR_SERVICE_LABEL,
-        DEFAULT_SUPERVISOR_DRAIN_SERVICE_LABEL,
-    }
+#: The owned supervisor registrations a valid capture must show — exactly ONE per host since
+#: Redmine #15192 retired the second macOS (`--drain-only`) LaunchAgent. This is the *plan-side*
+#: half of that contract: the capture side reads the platform-resolving backend's one-row roster, so
+#: requiring the retired pair here refused every post-migration capture with
+#: `owned_supervisor_pair_required` (review j#102151 Finding 2). A capture that still shows the
+#: retired drain label comes from an old two-row projection and is refused as an invalid supervisor
+#: set.  The current one-row projection separately preserves the retired path's state as
+#: ``legacy_drain`` so owner approval and action-time readback do not confuse it with absence.
+OWNED_SUPERVISOR_LABELS = frozenset({DEFAULT_SUPERVISOR_SERVICE_LABEL})
+SUPERVISOR_BACKEND_LAUNCHD = "launchd"
+SUPERVISOR_BACKEND_SYSTEMD = "systemd_user"
+SUPERVISOR_LEGACY_DRAIN_NOT_APPLICABLE = "not_applicable"
+_SUPERVISOR_BACKENDS = frozenset(
+    {SUPERVISOR_BACKEND_LAUNCHD, SUPERVISOR_BACKEND_SYSTEMD}
 )
+_LAUNCHD_LEGACY_DRAIN_STATES = frozenset(
+    {"absent", "owned", "foreign", "unreadable"}
+)
+# A missing plist proves only that the registration file is absent.  A launchd job that was
+# already bootstrapped may remain alive after that file is removed, so only an owned plist can
+# mint a plan: its later successful bootout is the positive manager-stop evidence.
+_LAUNCHD_PLANNABLE_LEGACY_DRAIN_STATES = frozenset({"owned"})
 
 
 def _exact_nonempty(value: object) -> bool:
@@ -236,6 +251,8 @@ class SupervisorAgentSnapshot:
     home_pin: str
     executable_matches: bool
     credential_readiness: str
+    backend: str
+    legacy_drain: str
 
     def to_record(self) -> dict:
         return {
@@ -246,6 +263,8 @@ class SupervisorAgentSnapshot:
             "home_pin": self.home_pin,
             "executable_matches": self.executable_matches,
             "credential_readiness": self.credential_readiness,
+            "backend": self.backend,
+            "legacy_drain": self.legacy_drain,
         }
 
 
@@ -500,7 +519,17 @@ def _validate_capture(capture: OfflineRolloutCapture) -> Optional[OfflineRollout
         or not all(_exact_nonempty(label) for label in labels)
         or set(labels) != OWNED_SUPERVISOR_LABELS
     ):
-        return refused(REASON_SUPERVISOR_SET_INVALID, "owned_supervisor_pair_required")
+        return refused(REASON_SUPERVISOR_SET_INVALID, "owned_supervisor_set_required")
+    for supervisor in capture.supervisors:
+        if supervisor.backend not in _SUPERVISOR_BACKENDS:
+            return refused(REASON_SUPERVISOR_SET_INVALID, "backend_invalid")
+        if supervisor.backend == SUPERVISOR_BACKEND_LAUNCHD:
+            if supervisor.legacy_drain not in _LAUNCHD_LEGACY_DRAIN_STATES:
+                return refused(REASON_SUPERVISOR_SET_INVALID, "legacy_drain_invalid")
+            if supervisor.legacy_drain not in _LAUNCHD_PLANNABLE_LEGACY_DRAIN_STATES:
+                return refused(REASON_SUPERVISOR_SET_INVALID, "legacy_drain_not_plannable")
+        elif supervisor.legacy_drain != SUPERVISOR_LEGACY_DRAIN_NOT_APPLICABLE:
+            return refused(REASON_SUPERVISOR_SET_INVALID, "legacy_drain_not_applicable")
     return None
 
 
@@ -576,7 +605,7 @@ def build_offline_rollout_plan(
             {
                 "phase": "supervisor_stop",
                 "supervisor_labels": supervisor_labels,
-                "required_readback": "all_not_installed_and_not_loaded",
+                "required_readback": "current_stopped_and_legacy_absent",
             },
             {"phase": "non_top_workspace_stop", "assigned_names": non_top},
             {"phase": "top_workspace_stop", "assigned_names": [top_name]},

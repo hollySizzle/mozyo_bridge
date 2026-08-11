@@ -5,8 +5,8 @@ contract — service-status is a redacted projection + secret-free definition (e
 install / restart / uninstall drive the owned scheduler pair and fail-closed (exit non-zero, zero
 mutation) when the host cannot run it.
 
-Redmine #15183: the same four verbs now dispatch by platform — the macOS LaunchAgent pair on darwin,
-the systemd **user** service+timer pair on Linux, a typed refusal anywhere else — so every service
+Redmine #15192: the same four verbs now dispatch by platform — one macOS LaunchAgent on darwin,
+one systemd **user** service+timer pair on Linux, a typed refusal anywhere else — so every service
 test below pins the backend it means to exercise instead of inheriting the runner's OS. Real
 ``launchctl`` / ``systemctl`` are never invoked here (patched), and both the OS user home and
 ``XDG_CONFIG_HOME`` are isolated so a projection never reads or writes the host's real
@@ -19,6 +19,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -80,9 +81,11 @@ class _ServiceCliCase(unittest.TestCase):
     @contextlib.contextmanager
     def _isolated_host(self, platform: str, *, run=_fake_run):
         """Pin the dispatched backend AND isolate every host root it would touch."""
-        module = sl if platform == "darwin" else ss
+        # Patch `subprocess.run` itself rather than one adapter module's binding: both adapters use
+        # the same module object, and the macOS side now spawns from a sibling leaf module, so a
+        # per-module patch would silently stop covering it.
         with patch.object(sys, "platform", platform), patch.object(
-            module.subprocess, "run", side_effect=run
+            subprocess, "run", side_effect=run
         ), patch("pathlib.Path.home", return_value=self.os_home), patch.dict(
             os.environ, {"XDG_CONFIG_HOME": str(self.os_home / ".config")}, clear=False
         ):
@@ -96,30 +99,28 @@ class _ServiceCliCase(unittest.TestCase):
 
 
 class CliServiceStatusLaunchdTest(_ServiceCliCase):
-    """The darwin dispatch: the owned LaunchAgent pair answers ``--service-status``."""
+    """The darwin dispatch: the ONE owned LaunchAgent answers ``--service-status`` (#15192)."""
 
     def test_service_status_reports_projection_and_definition_exit_zero(self) -> None:
         rc, out = self._service_status("darwin")
         self.assertEqual(rc, 0)
         payload = json.loads(out)
         self.assertEqual(payload["backend"], sb.BACKEND_LAUNCHD)
-        # Redmine #14150: the projection is the owned PAIR (reconcile + drain agents).
+        # Redmine #15192: ONE owned agent, so the roster is one row — the same shape as Linux.
         agents = payload["agents"]
-        self.assertEqual(len(agents), 2)
-        reconcile, drain = agents
-        self.assertFalse(reconcile["installed"])
-        self.assertFalse(reconcile["loaded"])
-        self.assertFalse(drain["installed"])
+        self.assertEqual(len(agents), 1)
+        (supervisor,) = agents
+        self.assertFalse(supervisor["installed"])
+        self.assertFalse(supervisor["loaded"])
         self.assertEqual(payload["phase"], "B1")
-        self.assertFalse(reconcile["keep_alive_present"])
+        self.assertFalse(supervisor["keep_alive_present"])
         self.assertEqual(payload["definition"]["command"][-1], "--run-once")
-        self.assertEqual(payload["drain_definition"]["command"][-1], "--drain-only")
         self.assertFalse(payload["definition"]["keep_alive"])
-        # macOS keeps its own two-row shape; #15183 does not reorganize it.
-        self.assertEqual(len(agents), 2)
-        # The two agents are distinct owned labels.
-        self.assertNotEqual(reconcile["label"], drain["label"])
-        # Secret-free and path-free.
+        self.assertEqual(supervisor["label"], sl.SUPERVISOR_AGENT.label)
+        # The owned roster matches the owned agents 1:1 — no drain service is advertised.
+        self.assertEqual(len(payload["definitions"]), 1)
+        self.assertEqual(payload["definitions"][0]["command"][-1], "--run-once")
+        # Secret-free. Nothing is installed here, so no argv (and no home path) is projected.
         self.assertNotIn("api_key", out.lower())
         self.assertNotIn(self.home, out)
 
@@ -127,29 +128,35 @@ class CliServiceStatusLaunchdTest(_ServiceCliCase):
         # Positive verdict held deterministic by the same OS-home seam: an owned
         # plist under the isolated home is reported installed, proving the
         # projection reflects the controlled home rather than being always-false.
-        target = sl.plist_path(self.os_home)  # default agent = reconcile
+        target = sl.plist_path(self.os_home)  # the single owned agent
         target.parent.mkdir(parents=True, exist_ok=True)
-        argv = ["/opt/bin/mozyo-bridge", "workflow", "supervisor", "--run-once", "--home", self.home]
+        argv = sl.resolve_supervisor_command(mozyo_home=Path(self.home))
+        self.assertIsNotNone(argv)
         target.write_bytes(sl.render_plist(argv, interval_seconds=300, os_home=self.os_home))
         rc, out = self._service_status("darwin")
         self.assertEqual(rc, 0)
         payload = json.loads(out)
-        reconcile = payload["agents"][0]
-        self.assertTrue(reconcile["installed"])  # the reconcile agent's owned plist is present
-        self.assertTrue(reconcile["plist_exists"])
-        # The drain agent was NOT installed, so the pair projection distinguishes them.
-        self.assertFalse(payload["agents"][1]["installed"])
+        self.assertEqual(len(payload["agents"]), 1)
+        (supervisor,) = payload["agents"]
+        self.assertTrue(supervisor["installed"])  # the owned plist under the isolated home
+        self.assertTrue(supervisor["plist_exists"])
+        self.assertEqual(supervisor["installed_command"], argv)
+        # No retired drain registration exists on this host, so none is reported as pending.
+        self.assertEqual(supervisor["legacy_drain"], sl.LEGACY_DRAIN_ABSENT)
 
     def test_mutating_verbs_fail_closed_zero_mutation_when_launchd_refuses(self) -> None:
         with patch.object(sl, "_running_on_darwin", return_value=False), patch.object(
             sys, "platform", "darwin"
-        ), patch.object(sl.subprocess, "run", side_effect=AssertionError("launchctl must not run")):
+        ), patch.object(
+            subprocess, "run", side_effect=AssertionError("launchctl must not run")
+        ):
             for verb in ("--install", "--restart", "--uninstall"):
                 rc, out = _run(["workflow", "supervisor", verb, "--home", self.home, "--json"])
                 payload = json.loads(out)
                 self.assertEqual(rc, 1, verb)
                 self.assertFalse(payload["performed"], verb)
                 self.assertEqual(payload["reason"], sl.REASON_UNSUPPORTED_PLATFORM, verb)
+                self.assertEqual(payload["effect_state"], sb.EFFECT_NONE, verb)
 
 
 class CliServiceStatusSystemdTest(_ServiceCliCase):
@@ -185,10 +192,10 @@ class CliServiceStatusSystemdTest(_ServiceCliCase):
         unit = ss.SUPERVISOR_UNIT
         path = ss.service_unit_path(self.os_home)
         path.parent.mkdir(parents=True, exist_ok=True)
+        argv = ss.resolve_supervisor_command(mozyo_home=Path(self.home))
+        self.assertIsNotNone(argv)
         path.write_text(
-            ss.render_service_unit(
-                ["/opt/bin/mozyo-bridge", *unit.argv_tail, "--home", self.home]
-            ),
+            ss.render_service_unit(argv),
             encoding="utf-8",
         )
         ss.timer_unit_path(self.os_home).write_text(
@@ -198,7 +205,9 @@ class CliServiceStatusSystemdTest(_ServiceCliCase):
         self.assertEqual(rc, 0)
         payload = json.loads(out)
         self.assertTrue(payload["agents"][0]["installed"])
-        self.assertEqual(payload["agents"][0]["scheduled_interval_seconds"], 60)
+        self.assertEqual(
+            payload["agents"][0]["scheduled_interval_seconds"], unit.default_interval_seconds
+        )
         self.assertEqual(payload["agents"][0]["installed_command"][-1], self.home)
 
     def test_mutating_verbs_fail_closed_zero_mutation_with_no_user_manager(self) -> None:
@@ -215,6 +224,7 @@ class CliServiceStatusSystemdTest(_ServiceCliCase):
             self.assertFalse(payload["performed"], verb)
             self.assertEqual(payload["reason"], ss.REASON_USER_MANAGER_UNAVAILABLE, verb)
             self.assertEqual(payload["backend"], sb.BACKEND_SYSTEMD, verb)
+            self.assertEqual(payload["effect_state"], sb.EFFECT_NONE, verb)
         self.assertFalse(ss.unit_dir(self.os_home).exists())
 
 
@@ -258,6 +268,17 @@ class CliServiceStatusTextPathTest(_ServiceCliCase):
         self.assertIn("next_elapse: 4w 1d 5h 2min 6.063752s (basis: monotonic)", text)
         self.assertIn("last_trigger: Sun 2026-08-09 22:50:24 JST", text)
 
+    def test_mutation_text_does_not_hide_an_uncertain_effect(self) -> None:
+        result = {
+            "action": "restart", "performed": False, "reason": "restart_failed",
+            "backend": sb.BACKEND_LAUNCHD, "effect_state": sb.EFFECT_UNCERTAIN,
+            "agents": [],
+        }
+        with patch.object(sb, "restart", return_value=result):
+            rc, out = _run(["workflow", "supervisor", "--restart", "--home", self.home])
+        self.assertEqual(rc, 1)
+        self.assertIn("effect_state: uncertain", out)
+
 
 class CliServiceDefinitionRosterTest(_ServiceCliCase):
     """Declarative definitions must describe what the backend actually owns (review j#102053 F6)."""
@@ -275,8 +296,11 @@ class CliServiceDefinitionRosterTest(_ServiceCliCase):
         self.assertEqual(payload["backend"], sb.BACKEND_SYSTEMD)
         self.assertEqual(len(payload["agents"]), 1)
         # The Linux host installs ONE `--run-once` timer, so advertising a `--drain-only`
-        # definition told the reader a service exists that does not.
-        self.assertNotIn("drain_definition", payload)
+        # definition told the reader a service exists that does not. The key itself survives for
+        # compatibility (j#102151 Finding 3), but only as a retired marker that makes no such claim
+        # — what F6 forbade is the CLAIM, not the key, and `registered: False` is not a claim.
+        self.assertFalse(payload["drain_definition"]["registered"])
+        self.assertNotIn("command", payload["drain_definition"])
         self.assertEqual(len(payload["definitions"]), 1)
         self.assertEqual(payload["definitions"][0]["command"][-1], "--run-once")
 
@@ -296,16 +320,69 @@ class CliServiceDefinitionRosterTest(_ServiceCliCase):
         self.assertEqual(payload["backend"], sb.BACKEND_UNSUPPORTED)
         self.assertEqual(payload["agents"], [])
         self.assertEqual(payload["definitions"], [])
-        self.assertNotIn("drain_definition", payload)
+        # Nothing is owned here, and the retired marker says exactly that too.
+        self.assertFalse(payload["drain_definition"]["registered"])
         # The would-be primary definition stays available to readers that predate the roster; it is
         # not a claim that anything is installed.
         self.assertEqual(payload["definition"]["command"][-1], "--run-once")
 
-    def test_macos_keeps_its_drain_definition_key(self) -> None:
-        payload = self._json_status("darwin")
-        self.assertEqual(payload["backend"], sb.BACKEND_LAUNCHD)
-        self.assertEqual(payload["drain_definition"]["command"][-1], "--drain-only")
-        self.assertEqual(len(payload["definitions"]), 2)
+    def test_no_host_declares_a_drain_service_it_does_not_own(self) -> None:
+        # #15192: neither host registers a `--drain-only` service any more, so neither declares one
+        # in the owned roster. Emitting a definition for a service nobody owns is the defect review
+        # j#102053 Finding 6 removed for Linux; the rule now has no host left to exempt.
+        for platform in ("darwin", "linux"):
+            payload = self._json_status(platform)
+            self.assertEqual(len(payload["definitions"]), 1, platform)
+            self.assertEqual(payload["definitions"][0]["command"][-1], "--run-once", platform)
+            self.assertNotIn(
+                "--drain-only", [d["command"][-1] for d in payload["definitions"]], platform
+            )
+
+    def test_the_drain_definition_key_survives_as_an_honest_retired_marker(self) -> None:
+        # Compatibility (j#102151 Finding 3) without re-asserting the removed claim: the key stays
+        # for readers that index it, but says it is retired and registered nowhere rather than
+        # describing a service no host owns.
+        for platform in ("darwin", "linux"):
+            drain = self._json_status(platform)["drain_definition"]
+            self.assertTrue(drain["retired"], platform)
+            self.assertFalse(drain["registered"], platform)
+            self.assertNotIn("command", drain, platform)
+
+
+class CliDeprecatedIntervalFlagsTest(_ServiceCliCase):
+    """j#102151 Finding 3: a minor feature keeps the previous release's parser surface working."""
+
+    def _status_with(self, *extra) -> dict:
+        with self._isolated_host("linux"):
+            rc, out = _run(
+                ["workflow", "supervisor", "--service-status", "--home", self.home, "--json", *extra]
+            )
+        self.assertEqual(rc, 0)
+        return json.loads(out)
+
+    def test_the_previous_release_flags_still_parse(self) -> None:
+        # The regression this closes: both flags exited 2 with `unrecognized arguments`.
+        payload = self._status_with("--drain-interval", "60", "--reconciliation-interval", "240")
+        self.assertEqual(len(payload["deprecations"]), 2)
+
+    def test_reconciliation_interval_is_folded_onto_the_one_cadence_knob(self) -> None:
+        # It set the definition's interval on the previous release, so ignoring it would silently
+        # change what an existing invocation configures.
+        payload = self._status_with("--reconciliation-interval", "240")
+        self.assertEqual(payload["definition"]["reconciliation_interval_seconds"], 240)
+        self.assertEqual(payload["agents"][0]["scheduled_interval_seconds"], 240)
+
+    def test_an_explicit_tick_interval_wins_over_the_deprecated_synonym(self) -> None:
+        payload = self._status_with("--reconciliation-interval", "240", "--tick-interval", "90")
+        self.assertEqual(payload["definition"]["reconciliation_interval_seconds"], 90)
+
+    def test_drain_interval_is_accepted_but_inert_and_says_so(self) -> None:
+        payload = self._status_with("--drain-interval", "60")
+        self.assertEqual(payload["definition"]["reconciliation_interval_seconds"], 180)
+        self.assertIn("ignored", " ".join(payload["deprecations"]))
+
+    def test_no_deprecation_noise_when_the_flags_are_not_used(self) -> None:
+        self.assertNotIn("deprecations", self._status_with())
 
 
 class CliServiceHelpContractTest(unittest.TestCase):
@@ -331,21 +408,28 @@ class CliServiceHelpContractTest(unittest.TestCase):
         self.assertNotIn("service+timer pair", text)
         self.assertNotIn("Atomic-or-nothing;", text)
 
-    def test_help_states_the_linux_single_timer(self) -> None:
+    def test_help_states_one_registration_per_host(self) -> None:
         text = self._supervisor_help()
-        self.assertIn("ONE systemd user service + ONE timer", text)
-        self.assertIn("every 60s", text)
+        self.assertIn("ONE macOS LaunchAgent, or ONE Linux systemd user service + timer", text)
+        self.assertIn("every --tick-interval seconds", text)
+        # The retired two-agent macOS shape must not be advertised anywhere in help.
+        self.assertNotIn("LaunchAgent pair", text)
 
-    def test_help_states_that_an_unconfigured_redmine_does_not_block_linux_install(self) -> None:
+    def test_help_states_the_non_gating_install_as_a_host_common_fact(self) -> None:
+        # Previously this was stated as a Linux-only property. Since j#102151 Finding 4 it is the
+        # contract on both hosts, and help must not re-split it.
         text = self._supervisor_help()
-        self.assertIn("unconfigured Redmine does NOT block it", text)
+        self.assertIn("An unconfigured Redmine blocks the install on neither host", text)
         self.assertIn("readiness is reported, not gated", text)
+        self.assertNotIn("does not block installing the Linux timer", text)
 
-    def test_help_still_states_the_macos_atomic_credential_gate(self) -> None:
-        # The macOS behaviour is unchanged, so help must keep describing it accurately.
+    def test_help_states_the_credential_contract_as_host_common(self) -> None:
+        # j#102151 Finding 4 removed the macOS-only credential gate, so help must no longer describe
+        # one — an install-time difference is operator-visible, which is what #15192 unifies.
         text = self._supervisor_help()
-        self.assertIn("LaunchAgent pair, installed atomic-or-nothing", text)
-        self.assertIn("fail-closed on a non-ready credential", text)
+        self.assertIn("On NEITHER host does an unconfigured Redmine block the install", text)
+        self.assertIn("readiness is reported, not gated", text)
+        self.assertNotIn("macOS refuses on a non-ready credential", text)
 
 
 class CliServiceUnsupportedHostTest(_ServiceCliCase):
@@ -359,6 +443,7 @@ class CliServiceUnsupportedHostTest(_ServiceCliCase):
             self.assertEqual(rc, 1, verb)
             self.assertFalse(payload["performed"], verb)
             self.assertEqual(payload["reason"], sb.REASON_NO_BACKEND, verb)
+            self.assertEqual(payload["effect_state"], sb.EFFECT_NONE, verb)
             self.assertEqual(payload["backend"], sb.BACKEND_UNSUPPORTED, verb)
 
     def test_service_status_still_exits_zero_and_mutates_nothing(self) -> None:
