@@ -269,7 +269,8 @@ def project_herdr_turn_start(result: TurnStartResult) -> Tuple[str, str]:
 # It is kept structurally distinct from the event rail's ``turn_start_outcome``
 # telemetry on purpose (j#72759 answer 3): a post-hoc snapshot does not prove
 # causality (it cannot attribute an observed ``busy`` to *this* send the way an
-# armed ``wait agent-status`` transition does), so mapping ``busy`` onto the rail's
+# armed ``agent wait TARGET --until STATUS --timeout MS`` transition does), so
+# mapping ``busy`` onto the rail's
 # ``started`` token would let the #12656 ledger / an auditor misread it as an
 # event-observed turn start. The telemetry therefore carries its own
 # ``observation_kind`` / ``source`` provenance and its own field name

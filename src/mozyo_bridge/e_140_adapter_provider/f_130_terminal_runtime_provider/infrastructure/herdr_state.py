@@ -25,7 +25,8 @@ Snapshot, not wait (staged seam)
 :meth:`HerdrCliAgentStateReader.read_agent_state` is a **snapshot** read: it
 reports the pane's current runtime state at the moment it is called. It is the
 ``current-state snapshot`` half of the ``check-then-wait`` rail the PoC
-established (E9 / E12–E14): ``wait agent-status`` waits for a *change* into a
+established (E9 / E12–E14):
+``agent wait TARGET --until STATUS --timeout MS`` waits for a *change* into a
 state and (E9 c2) does not return when already in it, so a caller must read a
 snapshot before arming a wait. The wait rail itself — arming a wait, the Codex
 Enter-resend, and the subscribe-time event behaviour observed in E14 — is
