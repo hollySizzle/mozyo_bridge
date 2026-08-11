@@ -110,6 +110,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.han
     STEP_SEND_KEYS_ROLLBACK,
     STEP_SEND_TEXT_BODY,
     close_transport_failure,
+    transport_failure_telemetry,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_herdr_queue_enter_rail import (
     HerdrQueueEnterSession,
@@ -318,10 +319,11 @@ class TmuxTransportRailOps(Protocol):
         ...
 
     def record_ledger(
-        self,
-        outcome: DeliveryOutcome,
-        *,
+        self, outcome: DeliveryOutcome, *,
         retry_outcome: Optional[QueueEnterRetryOutcome],
+        backend: Optional[str] = None,
+        rail: Optional[str] = None,
+        disposition: Optional[str] = None,
     ) -> None:
         """Persist the #13296 herdr delivery-ledger entry for a herdr queue-enter send (#13300)."""
         ...
@@ -372,15 +374,12 @@ class TmuxTransportRailUseCase:
         status: str,
         reason: str,
         queue_enter_turn_start_observation: Optional[dict[str, Any]] = None,
+        transport_failure: Optional[dict[str, Any]] = None,
     ) -> DeliveryOutcome:
         """Assemble a terminal :class:`DeliveryOutcome` from the request context.
 
-        The context threading (receiver / target / anchor / mode / kind / marker / envelope
-        value objects / ticketless payloads) is identical across the pending / marker_timeout /
-        turn_start_unconfirmed / sent terminals; only ``status`` / ``reason`` and the additive
-        herdr queue-enter snapshot differ. ``status`` / ``reason`` are the wire-literal constants
-        the call sites pass, re-narrowed to the ``Status`` / ``Reason`` wire enums by
-        :func:`make_outcome`'s signature.
+        Context threading stays identical across every terminal; only the
+        terminal fields and additive Herdr telemetry differ.
         """
         return make_outcome(
             status=status,  # type: ignore[arg-type]
@@ -399,6 +398,7 @@ class TmuxTransportRailUseCase:
             ticketless_consultation=request.ticketless_consultation,
             ticketless_work_intake=request.ticketless_work_intake,
             queue_enter_turn_start_observation=queue_enter_turn_start_observation,
+            transport_failure=transport_failure,
         )
 
     def _submit_lines(
@@ -413,13 +413,18 @@ class TmuxTransportRailUseCase:
     def _fail_transport(
         self, request: TmuxTransportRailRequest, primitive: str
     ) -> "None":
-        """Close a raised transport primitive into a typed terminal outcome (Redmine #14232).
-
-        Defect, classification, and secret-safety posture: ``handoff_transport_failure_gate``.
-        """
+        """Close a raised transport primitive into a typed terminal outcome (#14232)."""
         outcome = self._outcome(
-            request, status="blocked", reason=REASON_TRANSPORT_ERROR
+            request,
+            status="blocked",
+            reason=REASON_TRANSPORT_ERROR,
+            transport_failure=transport_failure_telemetry(primitive),
         )
+        if request.herdr_send and request.mode == MODE_QUEUE_ENTER:
+            self._ops.record_ledger(
+                outcome, retry_outcome=None, backend="herdr", rail="queue_enter_rail",
+                disposition=primitive,
+            )
         close_transport_failure(
             outcome=outcome, primitive=primitive,
             target=request.target, marker=request.marker,
@@ -543,10 +548,12 @@ class TmuxTransportRailUseCase:
 
         landing_timeout = float(request.landing_timeout or 8.0)
         landing_lines = max(request.read_lines, 200)
-        self._current_step = STEP_READ_PANE_LANDING_WAIT
-        marker_observed = ops.wait_for_marker(
-            request.target, request.marker, landing_lines, landing_timeout
-        )
+        marker_observed = False
+        if not herdr_queue_enter:
+            self._current_step = STEP_READ_PANE_LANDING_WAIT
+            marker_observed = ops.wait_for_marker(
+                request.target, request.marker, landing_lines, landing_timeout
+            )
 
         if not marker_observed and request.mode != MODE_QUEUE_ENTER:
             # C-u rollback is allowed ONLY here: a strict (non queue-enter) send whose marker
@@ -933,14 +940,18 @@ class LiveTmuxTransportRailOps(LiveHerdrQueueEnterOpsMixin):
         )
 
     def record_ledger(
-        self,
-        outcome: DeliveryOutcome,
-        *,
+        self, outcome: DeliveryOutcome, *,
         retry_outcome: Optional[QueueEnterRetryOutcome],
+        backend: Optional[str] = None,
+        rail: Optional[str] = None,
+        disposition: Optional[str] = None,
     ) -> None:
         from mozyo_bridge.application import commands as _commands
 
-        _commands._record_herdr_send_ledger(outcome, retry_outcome=retry_outcome)
+        _commands._record_herdr_send_ledger(
+            outcome, retry_outcome=retry_outcome, backend=backend, rail=rail,
+            disposition=disposition,
+        )
 
     def restore_previous_active(
         self,

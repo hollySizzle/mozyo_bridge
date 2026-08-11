@@ -174,7 +174,7 @@ class _RaisingOps:
     events: List[str] = field(default_factory=list)
     emitted: List[DeliveryOutcome] = field(default_factory=list)
     persisted: List[DeliveryOutcome] = field(default_factory=list)
-    ledgered: List[DeliveryOutcome] = field(default_factory=list)
+    ledgered: List[tuple] = field(default_factory=list)
     enter_presses: int = 0
     injected: List[tuple] = field(default_factory=list)
     rollbacks: int = 0
@@ -309,10 +309,18 @@ class _RaisingOps:
         self.persisted.append(outcome)
 
     def record_ledger(
-        self, outcome: DeliveryOutcome, *, retry_outcome: Optional[QueueEnterRetryOutcome]
+        self,
+        outcome: DeliveryOutcome,
+        *,
+        retry_outcome: Optional[QueueEnterRetryOutcome],
+        backend: Optional[str] = None,
+        rail: Optional[str] = None,
+        disposition: Optional[str] = None,
     ) -> None:
         self.events.append("ledger")
-        self.ledgered.append(outcome)
+        self.ledgered.append(
+            (outcome, retry_outcome, backend, rail, disposition)
+        )
 
     def restore_previous_active(
         self,
@@ -386,6 +394,12 @@ class HerdrTransportExceptionClosesToTypedOutcomeTest(unittest.TestCase):
         self.assertEqual(outcome.status, "blocked")
         self.assertEqual(outcome.reason, "transport_error")
         self.assertTrue(ops.died, "the send must terminate through die(), not a traceback")
+        self.assertEqual(len(ops.ledgered), 1)
+        self.assertEqual(ops.ledgered[0][0], outcome)
+        self.assertEqual(ops.ledgered[0][2:4], ("herdr", "queue_enter_rail"))
+        self.assertEqual(
+            ops.ledgered[0][4], outcome.transport_failure["primitive"]
+        )
         # Secret-safe: the typed outcome carries fixed tokens, never the adapter's raw text.
         self.assertNotIn("herdr command timed out", ops.died[0])
         return outcome
@@ -411,13 +425,13 @@ class HerdrTransportExceptionClosesToTypedOutcomeTest(unittest.TestCase):
         self.assertEqual(outcome.injection_stage["stage"], STAGE_UNCERTAIN_PARTIAL)
         self.assertEqual(ops.enter_presses, 0, "no Enter after a failed injection")
 
-    def test_landing_wait_read_timeout_closes_to_typed_outcome(self):
-        """The landing-marker wait's ``read_pane`` timed out (turn-start read/wait)."""
+    def test_herdr_queue_enter_skips_the_tmux_landing_wait(self):
+        """Herdr arms its causal wait without performing the tmux landing poll."""
         ops = _RaisingOps(raise_on="wait")
         with self.assertRaises(_FakeDie):
             TmuxTransportRailUseCase(ops).execute(_request())
-        self._assert_typed_transport_block(ops)
-        self.assertEqual(ops.enter_presses, 0)
+        self.assertNotIn("wait", ops.events)
+        self.assertEqual(ops.enter_presses, 1)
 
     def test_enter_only_retry_probe_read_timeout_closes_to_typed_outcome(self):
         """The queue-enter strict resend gate's pane read timed out."""

@@ -43,7 +43,7 @@ class _StubSupervisor:
 
 
 class BuildEventPumpSeamsTest(unittest.TestCase):
-    """review R6-F1: the wait seam spawns the resolved herdr `wait agent-status`, not mozyo-bridge."""
+    """review R6-F1: the wait seam spawns resolved Herdr ``agent wait``, not mozyo-bridge."""
 
     def test_wait_argv_uses_resolved_herdr_binary_and_turn_ended_status(self):
         captured = {}
@@ -64,8 +64,8 @@ class BuildEventPumpSeamsTest(unittest.TestCase):
         self.assertEqual(
             captured["argv"],
             [
-                "/trusted/bin/herdr", "wait", "agent-status", "mzb1_ws1_claude_la",
-                "--status", HERDR_STATUS_TURN_ENDED, "--timeout", "1234",
+                "/trusted/bin/herdr", "agent", "wait", "mzb1_ws1_claude_la",
+                "--until", HERDR_STATUS_TURN_ENDED, "--timeout", "1234",
             ],
         )
         self.assertEqual(HERDR_STATUS_TURN_ENDED, "done")  # the turn_ended raw status, not `working`

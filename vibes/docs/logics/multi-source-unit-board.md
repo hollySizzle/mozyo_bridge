@@ -259,8 +259,10 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   （gateway version 間で選択を決定的にするため。値の出所は共有既定であり、既定の第二の見解を作らない）。
 - **queue-enter の本文は 1 回だけ渡す。** client は結果に関わらず gateway command を **ちょうど 1 回**
   実行し、再実行しない（再実行は Enter の再送ではなく本文の再入力になる）。対象 host が Herdr の場合、
-  host 側 rail は body exactly once / first Enter zero-or-one を維持する。post-body generation 再確認、first
-  wait arm、deadline check が成功した場合だけ first Enter を発行し、失敗時は `enter_attempts=0` の
+  host 側 rail は body exactly once / first Enter zero-or-one を維持し、tmux compatibility 用の
+  landing-marker wait は実行しない。post-body generation 再確認、Herdr 0.8 の
+  `agent wait TARGET --until working --timeout MS` の arm、deadline check が成功した場合だけ
+  first Enter を発行し、失敗時は `enter_attempts=0` の
   `blocked` / `turn_start_unconfirmed` に閉じる。causal turn start 未確認時だけ、同一
   target identity、collision-free launch generation、現在の composer tail にある full marker+body
   （hard-wrap whitespace のみ正規化）、startup / modal / trust / login / selection screen の非該当、runtime
@@ -284,8 +286,12 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   明示した action は基礎 deadline のままとする。
 - **配送成否は exit code で判定しない。** 対象 gateway の **構造化 outcome** を読み、共有 authority
   (`injection_stage_for`) の判定に従う。
-  **構造化 outcome は判定にのみ使い、client の表示は固定の public-safe 文言とする**（remote の値を
-  一切反映しない。これが本項の唯一の契約である）。
+  **構造化 outcome は判定と、閉じた transport-failure 診断にのみ使う。** client の通常表示は固定の
+  public-safe 文言とし、remote の任意値を反映しない。唯一の追加透過は、outcome が
+  `blocked` / `transport_error` で `transport_failure.primitive` が `TRANSPORT_STEPS` の固定 token に
+  exact 一致するときの `gateway_status=blocked` / `gateway_reason=transport_error` /
+  `transport_primitive=<同 token>` である。raw stderr、exception、absolute / remote path、任意 detail は
+  outcome からも subprocess 結果からも転記しない。欠落・未知 token は空の診断に倒し、配送 stage を変えない。
   出力形状は決定的にする: gateway 呼び出しで `--record-format json` を明示し、読み取りは
   documented scrape target である **末尾の JSON-looking line** を読む。`record_format` の既定は
   `both`（人間可読 record → 空行 → 単一行 JSON）であり、stdout 全体を 1 つの JSON として
@@ -333,6 +339,8 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   | `uncertain_partial` | `uncertain` | `delivery_uncertain` | 3 |
 
   result payload は `injection_stage` と `blind_retry_prohibited` を共有 authority から公開する。
+  post-injection transport failure に限り、上記の fixed-field projection
+  (`gateway_status` / `gateway_reason` / `transport_primitive`) を additive に公開する。
   exit 3 を 1 へ畳むと、本文が既に receiver に届いている可能性がある時点で automated caller に
   「retry は無償」と伝えることになる。
 - `--summary` は **public-safe projection を素通りする文字列だけを受け付ける**。preview は
@@ -374,6 +382,9 @@ read-only observation + 1 本の routed な preview-first action に限る。
   exit code 0 / 1 / 3 の区別と `blind_retry_prohibited` の公開を CLI level で固定する
 - gateway command が結果に関わらず **ちょうど 1 回**しか実行されないことの unit test（本文の
   重複送信を client 側から起こさない）
+- Herdr 0.8 の wait argv が `agent wait TARGET --until STATUS --timeout MS` であり、旧
+  `wait agent-status ... --status ...` を production fake が受理しないこと。body 後に tmux 由来の
+  landing-marker wait を行わず generation recheck → wait arm → Enter の順であること
 - Herdr queue-enter が body / gateway command を再入力せず、first Enter zero-or-one、各実発行 Enter 前の arm、
   各 extra Enter 前の fresh strict recheck を行うこと。timeout-only 系列は policy/deadline まで反復でき、
   wait error は次の Enter を許可せず即時停止すること。identity / collision-free launch generation drift、historical transcript
@@ -386,6 +397,10 @@ read-only observation + 1 本の routed な preview-first action に限る。
   Enter を無効にすること
 - uncertain result が `blind_retry_prohibited` のまま client retry を起こさず、queue-specific telemetry /
   delivery-ledger rail を維持すること。tmux queue-enter、Herdr standard、pending の回帰がないこと
+- post-injection transport failure が `backend=herdr` / `rail=queue_enter_rail` /
+  `disposition=<TRANSPORT_STEPS token>` の ledger row を exactly one 残すこと。Unit Board result は
+  `gateway_status=blocked` / `gateway_reason=transport_error` / `transport_primitive=<同 token>` だけを
+  透過し、raw stderr / exception / path / detail を含まないこと
 - 多 source runtime と action rail の injected-runner tests (live host を使わない)
 - local-only 不変の regression pin (`tests/regressions/test_issue_15138_local_only_unit_board_preserved.py`)
 - local / remote host / remote Dev Container を使った軽量実機確認は #15140 が所有する

@@ -35,11 +35,13 @@ import argparse
 import contextlib
 import io
 import unittest
+from unittest.mock import patch
 
 from mozyo_bridge.application.handoff_delivery_command import (
     DeliveryRecordUseCase,
     marker_timeout_guidance_lines,
     record_command_from_args,
+    record_herdr_send_ledger,
     submit_lines_for,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery_record_sink import (
@@ -345,6 +347,28 @@ class CommandsReExportTest(unittest.TestCase):
         self.assertIs(commands._record_format_from_args, hdc.record_format_from_args)
         self.assertIs(commands._record_command_from_args, hdc.record_command_from_args)
         self.assertIs(commands._submit_lines_for, hdc.submit_lines_for)
+
+
+class HerdrLedgerWrapperTest(unittest.TestCase):
+    def test_forwards_explicit_transport_failure_classification(self) -> None:
+        outcome = _outcome(status="blocked")
+        with patch(
+            "mozyo_bridge.application.handoff_delivery_command.record_herdr_delivery"
+        ) as recorder:
+            record_herdr_send_ledger(
+                outcome,
+                backend="herdr",
+                rail="queue_enter_rail",
+                disposition="send_keys(enter) (submit)",
+            )
+
+        recorder.assert_called_once_with(
+            outcome,
+            retry=None,
+            backend="herdr",
+            rail="queue_enter_rail",
+            disposition="send_keys(enter) (submit)",
+        )
 
 
 class MarkerTimeoutGuidanceTest(unittest.TestCase):

@@ -266,9 +266,14 @@ class _FakeOps:
         outcome: DeliveryOutcome,
         *,
         retry_outcome: Optional[QueueEnterRetryOutcome],
+        backend: Optional[str] = None,
+        rail: Optional[str] = None,
+        disposition: Optional[str] = None,
     ) -> None:
         self.events.append("ledger")
-        self.ledgered.append((outcome, retry_outcome))
+        self.ledgered.append(
+            (outcome, retry_outcome, backend, rail, disposition)
+        )
 
     def restore_previous_active(
         self,
@@ -580,6 +585,9 @@ class TmuxTransportRailQueueEnterTest(unittest.TestCase):
         code, died = _run(ops, _request(mode=_MODE_QUEUE_ENTER, herdr_send=True))
         self.assertIsNone(died)
         self.assertEqual(code, 0)
+        self.assertNotIn(
+            "wait", ops.events, "Herdr must not run the tmux landing-marker poll"
+        )
         # herdr queue-enter: the #13292 snapshot is observed and the #13300 ledger is recorded.
         self.assertIn("observe_qe", ops.events)
         self.assertIn("ledger", ops.events)
@@ -597,6 +605,7 @@ class TmuxTransportRailQueueEnterTest(unittest.TestCase):
         ops = _FakeOps(marker_observed=True)
         code, _died = _run(ops, _request(mode=_MODE_QUEUE_ENTER, herdr_send=False))
         self.assertEqual(code, 0)
+        self.assertIn("wait", ops.events, "the tmux compatibility rail is unchanged")
         self.assertNotIn("ledger", ops.events)
         self.assertNotIn("observe_qe", ops.events)
         self.assertIsNone(ops.emitted[0].outcome.queue_enter_turn_start_observation)
@@ -916,6 +925,17 @@ class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
         outcome = ops.emitted[0].outcome
         self.assertEqual((outcome.status, outcome.reason), ("blocked", "transport_error"))
         self.assertEqual(outcome.injection_stage["stage"], STAGE_UNCERTAIN_PARTIAL)
+        self.assertEqual(
+            outcome.transport_failure,
+            {"primitive": "send_keys(enter) (submit)"},
+        )
+        self.assertEqual(len(ops.ledgered), 1)
+        self.assertEqual(ops.ledgered[0][0], outcome)
+        self.assertIsNone(ops.ledgered[0][1])
+        self.assertEqual(ops.ledgered[0][2], "herdr")
+        self.assertEqual(ops.ledgered[0][3], "queue_enter_rail")
+        self.assertEqual(ops.ledgered[0][4], "send_keys(enter) (submit)")
+        self.assertLess(ops.events.index("ledger"), ops.events.index("emit"))
         self.assertNotIn("adapter-private", died.message)
 
     def test_zero_window_disables_the_extra_enter_but_keeps_the_initial_observation(self) -> None:

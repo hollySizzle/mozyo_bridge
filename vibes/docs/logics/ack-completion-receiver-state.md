@@ -160,8 +160,10 @@ Redmine #15242 (既定 queue-enter の turn-start 補完) は、同じ偽陽性�
 layer 0 hardening である。ただし queue-enter は `busy` な receiver にも request を queue する rail なので、
 idle だけを許す standard `drive_turn_start` を流用しない。
 
-- marker + body は exactly once。first Enter は zero-or-one であり、body 注入後の pinned generation 再確認と
-  working-transition wait の arm が成功し、absolute deadline 内にある場合だけ発行する。失敗時は
+- marker + body は exactly once。Herdr queue-enter は body 注入後に tmux compatibility 由来の
+  landing-marker wait を行わない。pinned generation を再確認し、Herdr 0.8 の
+  `agent wait TARGET --until working --timeout MS` を arm でき、absolute deadline 内にある場合だけ
+  first Enter を発行する。失敗時は
   `enter_attempts=0` のまま `blocked` / `turn_start_unconfirmed` に閉じる。実際に発行する first / extra Enter は
   すべて事前に wait を arm する。causal start が未確認なら、同一 target identity、collision-free launch
   generation、現在の composer tail にある full marker+body（hard-wrap whitespace のみ正規化）、startup /
@@ -191,7 +193,14 @@ idle だけを許す standard `drive_turn_start` を流用しない。
 `receiver_blocked`、timeout / error / wait unarmed / drift / body-screen-state 再確認不成立は `blocked` /
 `turn_start_unconfirmed`、送信 primitive の `TerminalTransportError` は `blocked` / `transport_error` へ写し、
 いずれも非0である。未確認を legacy の `sent` / telemetry-only success に倒さない。ただし本文が届いた可能性を
-含むので injection stage は `uncertain`、blind retry 禁止となる。ここまで確認できても task completion ではない。
+含むので injection stage は `uncertain_partial`、blind retry 禁止となる。ここまで確認できても task completion ではない。
+
+post-injection transport failure は、通常の queue terminal と同じ delivery-ledger rail に **exactly one** row を
+残す。row は `backend=herdr` / `rail=queue_enter_rail` / `disposition=<TRANSPORT_STEPS の固定 token>`、
+structured outcome は `transport_failure.primitive=<同 token>` だけを持つ。adapter exception、raw stderr、
+binary / repository path、任意 detail は ACK evidence ではなく、durable record や Unit Board に出さない。
+Unit Board の診断は `gateway_status=blocked` / `gateway_reason=transport_error` /
+`transport_primitive=<同 token>` の閉じた public-safe 射影に限る。この診断を completion evidence に昇格しない。
 
 ### Minimal future runtime event vocabulary
 
@@ -365,9 +374,12 @@ doctrine としての position:
 8. **ticket-system signal は provider 境界に閉じる**。Redmine / Asana の status、journal、approval record を読む場合は ticket provider adapter / governed workflow の layer 3 record として扱い、terminal runtime adapter や sidecar の ACK state に混ぜない。
 9. **Herdr queue-enter の確認不能を外側の自動再送へ読み替えない**。本文が既に composer にある可能性が
    あるため、causal event + coherent generation が欠ける結果は precise `blocked` reason / non-zero かつ
-   injection stage `uncertain` とし、同じ gateway command や本文を再実行しない。rail 内だけは body を再入力せず、
+   injection stage `uncertain_partial` とし、同じ gateway command や本文を再実行しない。rail 内だけは body を再入力せず、
    各 Enter より先の wait と fresh strict gate、public absolute budget の下で Enter-only retry できる。
    timeout-only 系列は policy 上限まで反復できるが、wait error は次の Enter を許可せず即時停止する。
+10. **Herdr の wait command と tmux の marker wait を混同しない**。現行 Herdr 0.8 の event wait は
+    `agent wait TARGET --until STATUS --timeout MS` である。Herdr queue-enter は body 後に landing-marker
+    wait を挟まず、generation 再確認 → event wait arm → Enter の順で進む。
 
 ## Receiver-side recovery admission と、その保証境界 (Redmine #13910)
 

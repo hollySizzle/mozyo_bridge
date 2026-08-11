@@ -1,4 +1,4 @@
-"""Built-in herdr CLI ``wait agent-status`` wait primitive + rail resolver (Redmine #13248).
+"""Built-in herdr CLI ``agent wait`` wait primitive + rail resolver (Redmine #13248).
 
 The core seam
 (:mod:`mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_rail`)
@@ -6,7 +6,7 @@ defines the pure check-then-wait :class:`HerdrTurnStartRail`, the closed
 outcome / wait vocabularies, and the injected wait-primitive *port*
 (:class:`TurnStartWaitPort` / :class:`ArmedWait`). This module is the single
 concrete, built-in provider that fills the wait port: a subprocess wrapper over
-the herdr CLI ``wait agent-status`` surface (PoC E9 / E12–E14), plus a fail-closed
+the Herdr 0.8 CLI ``agent wait --until`` surface, plus a fail-closed
 resolver that wires the whole rail (transport #13245 + state reader #13246 + this
 wait primitive) from the same default-off backend selection and trusted-env binary
 the sibling resolvers use. Core still owns the orchestration and the vocabularies;
@@ -15,7 +15,7 @@ dependency points provider -> core.
 
 Why a two-phase arm / collect (not a single blocking call)
 ----------------------------------------------------------
-``wait agent-status`` waits for a *change into* ``working`` and (E9 c2) does not
+``agent wait --until working`` waits for a *change into* ``working`` and does not
 return when the pane is already there, so the rail must **arm the wait before it
 injects** — otherwise the transition the injection triggers can land in the race
 window between a snapshot read and a (blocking) wait call. A single blocking call
@@ -62,6 +62,9 @@ import os
 import subprocess
 from typing import Callable, Mapping, Optional
 
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_agent_wait import (  # noqa: E501
+    build_herdr_agent_wait_argv,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (
     HERDR_STATUS_WORKING,
 )
@@ -124,7 +127,7 @@ _TIMEOUT_INDICATORS = (
 
 
 class _HerdrArmedWait:
-    """A herdr ``wait agent-status`` subprocess that has been armed, not yet reaped.
+    """A Herdr ``agent wait`` subprocess that has been armed, not yet reaped.
 
     Holds the live ``Popen`` (or a pre-failed sentinel result). :meth:`collect`
     blocks on it up to the outer bound and classifies the exit; :meth:`cancel`
@@ -203,7 +206,7 @@ def _classify_exit(returncode: object, stderr: object) -> WaitResult:
 
 
 class HerdrCliWaitPrimitive:
-    """A :class:`TurnStartWaitPort` over the herdr CLI ``wait agent-status``.
+    """A :class:`TurnStartWaitPort` over the Herdr CLI ``agent wait``.
 
     :meth:`arm` builds an explicit argv list (never a shell string) and starts it
     **non-blocking** through the injected ``popen`` factory, returning an
@@ -246,16 +249,12 @@ class HerdrCliWaitPrimitive:
                     f"wait timeout_ms must be a positive int, got {timeout_ms!r}"
                 ),
             )
-        argv = [
+        argv = build_herdr_agent_wait_argv(
             self._binary,
-            "wait",
-            "agent-status",
             target,
-            "--status",
-            self._status,
-            "--timeout",
-            str(timeout_ms),
-        ]
+            until=self._status,
+            timeout_ms=timeout_ms,
+        )
         outer_timeout = timeout_ms / 1000.0 + self._margin
         try:
             proc = self._popen(

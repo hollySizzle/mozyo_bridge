@@ -34,8 +34,8 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Optional, Sequence
 
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (
-    is_canonical_positive_decimal,
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_transport_failure_gate import (
+    TRANSPORT_STEPS,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     MODES,
@@ -53,6 +53,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injectio
     blind_retry_prohibited,
     injection_stage_for,
     stage_from_telemetry,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (
+    is_canonical_positive_decimal,
 )
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.herdr_unit_board import (
     MAX_PRESENTATION_TEXT,
@@ -366,6 +369,9 @@ class RemoteUnitActionResult:
     #: without running the gateway command is a genuine zero-send, so
     #: :data:`STAGE_NOT_SENT` is the honest default rather than a convenient one.
     injection_stage: str = STAGE_NOT_SENT
+    gateway_status: str = ""
+    gateway_reason: str = ""
+    transport_primitive: str = ""
 
     @property
     def delivered(self) -> bool:
@@ -392,6 +398,9 @@ class RemoteUnitActionResult:
             # local opinion about what the target gateway's outcome meant.
             "injection_stage": self.injection_stage,
             "blind_retry_prohibited": blind_retry_prohibited(self.injection_stage),
+            "gateway_status": self.gateway_status,
+            "gateway_reason": self.gateway_reason,
+            "transport_primitive": self.transport_primitive,
             "preview": self.preview.as_payload(),
         }
 
@@ -646,6 +655,12 @@ class RemoteUnitActionRail:
             result,
             expected_mode=request.effective_delivery_mode,
         )
+        gateway_status, gateway_reason, transport_primitive = (
+            _gateway_transport_failure_diagnostics(
+                result,
+                expected_mode=request.effective_delivery_mode,
+            )
+        )
         if stage == STAGE_SUBMITTED_CONFIRMED:
             return RemoteUnitActionResult(
                 ACTION_DELIVERED,
@@ -665,6 +680,9 @@ class RemoteUnitActionRail:
             _DETAIL_BY_REASON[REASON_DELIVERY_UNCERTAIN],
             preview,
             injection_stage=STAGE_UNCERTAIN_PARTIAL,
+            gateway_status=gateway_status,
+            gateway_reason=gateway_reason,
+            transport_primitive=transport_primitive,
         )
 
 
@@ -801,6 +819,35 @@ def _delivery_stage(result, *, expected_mode: str) -> str:
     if stage == STAGE_SUBMITTED_CONFIRMED and completed.returncode != 0:
         return STAGE_UNCERTAIN_PARTIAL
     return stage
+
+
+def _gateway_transport_failure_diagnostics(
+    result, *, expected_mode: str
+) -> tuple[str, str, str]:
+    """Return only the fixed transport-failure tokens from a gateway outcome.
+
+    Raw stderr and adapter detail are intentionally out of reach.  A malformed
+    mode, status, reason, telemetry object, or primitive returns empty strings;
+    diagnostics must never weaken the shared delivery-stage verdict.
+    """
+    completed = result.completed
+    if not result.ok or completed is None:
+        return "", "", ""
+    payload = _delivery_outcome_record(completed.stdout)
+    if payload is None or payload.get("mode") != expected_mode:
+        return "", "", ""
+    if (
+        payload.get("status") != "blocked"
+        or payload.get("reason") != "transport_error"
+    ):
+        return "", "", ""
+    telemetry = payload.get("transport_failure")
+    if not isinstance(telemetry, dict):
+        return "", "", ""
+    primitive = telemetry.get("primitive")
+    if type(primitive) is not str or primitive not in TRANSPORT_STEPS:
+        return "", "", ""
+    return "blocked", "transport_error", primitive
 
 
 def render_preview(preview: RemoteUnitActionPreview) -> Sequence[str]:

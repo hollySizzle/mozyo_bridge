@@ -610,7 +610,7 @@ class PaneSendTest(unittest.TestCase):
 
 class WaitChangeSemanticsTest(unittest.TestCase):
     def _wait_argv(self, target, status):
-        return [BINARY, "wait", "agent-status", target, "--status", status, "--timeout", "45000"]
+        return [BINARY, "agent", "wait", target, "--until", status, "--timeout", "45000"]
 
     def test_armed_transition_returns_changed_and_advances_status(self) -> None:
         fake = FakeHerdr()

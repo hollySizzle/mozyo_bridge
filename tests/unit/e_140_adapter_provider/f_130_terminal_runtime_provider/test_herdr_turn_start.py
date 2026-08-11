@@ -1,6 +1,6 @@
 """Built-in herdr CLI wait-primitive + rail resolver tests (Redmine #13248).
 
-Pins the herdr ``wait agent-status`` wait primitive and the fully wired rail
+Pins the Herdr ``agent wait --until`` wait primitive and the fully wired rail
 resolver *without a live herdr binary*: argv construction and the two-phase
 arm/collect are verified through an injected ``Popen`` factory that simulates
 exit-0 / non-zero / hang without spawning herdr, the non-zero exit classification
@@ -109,7 +109,7 @@ class ArmArgvTests(unittest.TestCase):
         argv, kwargs = popen.calls[0]
         self.assertEqual(
             argv,
-            [BIN, "wait", "agent-status", TARGET, "--status", HERDR_STATUS_WORKING, "--timeout", "8000"],
+            [BIN, "agent", "wait", TARGET, "--until", HERDR_STATUS_WORKING, "--timeout", "8000"],
         )
         self.assertEqual(kwargs.get("stdout"), subprocess.PIPE)
         self.assertEqual(kwargs.get("stderr"), subprocess.PIPE)
