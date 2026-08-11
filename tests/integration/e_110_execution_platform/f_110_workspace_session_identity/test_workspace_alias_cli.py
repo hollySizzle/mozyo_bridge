@@ -31,6 +31,7 @@ from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.doma
     REASON_ALIAS_CYCLE,
     REASON_CONCURRENT_CHANGE,
     REASON_DURABILITY_FAILED,
+    REASON_GIT_BINDING_UNAVAILABLE,
     REASON_CROSS_REPOSITORY,
     REASON_DECLARATION_INVALID,
     REASON_DECLARATION_UNREADABLE,
@@ -47,6 +48,7 @@ from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.doma
 )
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.infrastructure import (  # noqa: E501
     workspace_alias_store as store,
+    workspace_git_probe as git_probe,
 )
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.infrastructure.workspace_alias_store import (  # noqa: E501
     alias_path,
@@ -259,6 +261,33 @@ class WorkspaceAliasCliTestCase(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(payload["reason"], REASON_CROSS_REPOSITORY)
         self.assertFalse(alias_path(inner_nested).exists())
+
+    def test_set_refuses_unavailable_git_probe_without_writing(self) -> None:
+        with mock.patch.object(git_probe.shutil, "which", return_value=None):
+            code, payload = self.run_cli(
+                "workspace", "alias", "set",
+                "--repo", str(self.nested), "--to", str(self.canonical),
+            )
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["reason"], REASON_GIT_BINDING_UNAVAILABLE)
+        self.assertEqual(payload["launch_root"], "")
+        self.assertFalse(alias_path(self.nested).exists())
+
+    def test_show_preserves_existing_declaration_on_unavailable_git_probe(self) -> None:
+        code, _ = self.run_cli(
+            "workspace", "alias", "set",
+            "--repo", str(self.nested), "--to", str(self.canonical),
+        )
+        self.assertEqual(code, 0)
+        before = alias_path(self.nested).read_bytes()
+        with mock.patch.object(git_probe.shutil, "which", return_value=None):
+            code, payload = self.run_cli(
+                "workspace", "alias", "show", "--repo", str(self.nested)
+            )
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["reason"], REASON_GIT_BINDING_UNAVAILABLE)
+        self.assertEqual(payload["launch_root"], "")
+        self.assertEqual(alias_path(self.nested).read_bytes(), before)
 
     def test_set_refuses_an_alias_chain(self) -> None:
         self.run_cli(

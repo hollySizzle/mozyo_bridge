@@ -21,14 +21,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from mozyo_bridge.core.state.workspace_registry import (
-    _checkout_git_dirs,
-    resolve_canonical_session,
-)
+from mozyo_bridge.core.state.workspace_registry import resolve_canonical_session
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.workspace_alias import (  # noqa: E501
     GIT_BINDING_DIFFERENT,
     GIT_BINDING_NOT_MEASURABLE,
     GIT_BINDING_SAME,
+    GIT_BINDING_UNAVAILABLE,
     STATE_NO_DECLARATION,
     AliasResolution,
     AliasTargetObservation,
@@ -38,6 +36,11 @@ from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.doma
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.infrastructure.workspace_alias_store import (  # noqa: E501
     declaration_exists,
     read_declaration,
+)
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.infrastructure.workspace_git_probe import (  # noqa: E501
+    GIT_PROBE_GIT,
+    GIT_PROBE_NON_GIT,
+    probe_workspace_git,
 )
 
 
@@ -52,16 +55,26 @@ def git_binding(source_root: Path, target_root: Path) -> str:
     been the wrong test — it is true for a submodule that must NOT be aliased
     into its superproject.
 
-    A root that is not a git checkout at all is measurable only against another
-    non-git root; a git/non-git pair is reported as different so it fails closed.
+    A root that is positively observed not to be a git checkout is measurable
+    only against another positively non-git root; a git/non-git pair is reported
+    as different.  A missing executable, timeout, unexpected Git error, malformed
+    output, or unsafe discovery marker is ``unavailable`` and always fails closed.
     """
-    source_dirs = _checkout_git_dirs(source_root)
-    target_dirs = _checkout_git_dirs(target_root)
-    if source_dirs is None and target_dirs is None:
+    source = probe_workspace_git(source_root)
+    target = probe_workspace_git(target_root)
+    if source.state not in {GIT_PROBE_GIT, GIT_PROBE_NON_GIT}:
+        return GIT_BINDING_UNAVAILABLE
+    if target.state not in {GIT_PROBE_GIT, GIT_PROBE_NON_GIT}:
+        return GIT_BINDING_UNAVAILABLE
+    if source.state == GIT_PROBE_NON_GIT and target.state == GIT_PROBE_NON_GIT:
         return GIT_BINDING_NOT_MEASURABLE
-    if source_dirs is None or target_dirs is None:
+    if source.state != target.state:
         return GIT_BINDING_DIFFERENT
-    return GIT_BINDING_SAME if source_dirs[1] == target_dirs[1] else GIT_BINDING_DIFFERENT
+    return (
+        GIT_BINDING_SAME
+        if source.common_dir == target.common_dir
+        else GIT_BINDING_DIFFERENT
+    )
 
 
 def _is_strict_ancestor(candidate: Path, descendant: Path) -> bool:

@@ -25,10 +25,14 @@ from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.appl
     git_binding,
     resolve_launch_root,
 )
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application import (  # noqa: E501
+    workspace_alias as alias_application,
+)
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.workspace_alias import (  # noqa: E501
     GIT_BINDING_DIFFERENT,
     GIT_BINDING_NOT_MEASURABLE,
     GIT_BINDING_SAME,
+    GIT_BINDING_UNAVAILABLE,
     MODE_ALIAS,
     MODE_DISABLED,
     REASON_ALIAS_CYCLE,
@@ -36,6 +40,7 @@ from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.doma
     REASON_DECLARATION_MUTATION_IN_PROGRESS,
     REASON_DECLARATION_UNREADABLE,
     REASON_DURABILITY_FAILED,
+    REASON_GIT_BINDING_UNAVAILABLE,
     REASON_LOCK_FAILED,
     REASON_PARENT_DRIFT,
     REASON_REMOVE_FAILED,
@@ -50,6 +55,13 @@ from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.doma
 )
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.infrastructure import (  # noqa: E501
     workspace_alias_store as store,
+    workspace_git_probe as git_probe,
+)
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.infrastructure.workspace_git_probe import (  # noqa: E501
+    GIT_PROBE_GIT,
+    GIT_PROBE_NON_GIT,
+    GIT_PROBE_UNAVAILABLE,
+    WorkspaceGitProbe,
 )
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.infrastructure.workspace_alias_store import (  # noqa: E501
     CLEAR_ABSENT,
@@ -290,6 +302,133 @@ class GitBindingTests(AliasFixtureTestCase):
         self.assertEqual(
             git_binding(plain_child, plain_parent), GIT_BINDING_NOT_MEASURABLE
         )
+
+    def test_git_and_non_git_roots_are_different(self) -> None:
+        plain = self.base / "plain"
+        plain.mkdir()
+        self.assertEqual(
+            git_binding(self.canonical, plain),
+            GIT_BINDING_DIFFERENT,
+        )
+
+    def test_missing_git_executable_is_unavailable(self) -> None:
+        with mock.patch.object(git_probe.shutil, "which", return_value=None):
+            self.assertEqual(
+                git_binding(self.nested, self.canonical),
+                GIT_BINDING_UNAVAILABLE,
+            )
+
+    def test_git_timeout_is_unavailable(self) -> None:
+        with mock.patch.object(
+            git_probe.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(cmd="git", timeout=5),
+        ):
+            self.assertEqual(
+                git_binding(self.nested, self.canonical),
+                GIT_BINDING_UNAVAILABLE,
+            )
+
+    def test_unexpected_git_error_is_unavailable(self) -> None:
+        failed = subprocess.CompletedProcess(
+            args=["git"],
+            returncode=128,
+            stdout="",
+            stderr="fatal: detected dubious ownership in repository\n",
+        )
+        with mock.patch.object(git_probe.subprocess, "run", return_value=failed):
+            self.assertEqual(
+                git_binding(self.nested, self.canonical),
+                GIT_BINDING_UNAVAILABLE,
+            )
+
+    def test_malformed_successful_git_output_is_unavailable(self) -> None:
+        malformed = subprocess.CompletedProcess(
+            args=["git"], returncode=0, stdout=".git\n", stderr=""
+        )
+        with mock.patch.object(git_probe.subprocess, "run", return_value=malformed):
+            self.assertEqual(
+                git_binding(self.nested, self.canonical),
+                GIT_BINDING_UNAVAILABLE,
+            )
+
+    def test_non_repository_message_with_visible_marker_is_unavailable(self) -> None:
+        plain_parent = self.base / "plain-with-marker"
+        plain_child = plain_parent / "child"
+        plain_child.mkdir(parents=True)
+        (plain_parent / ".git").mkdir()
+        not_repo = subprocess.CompletedProcess(
+            args=["git"],
+            returncode=128,
+            stdout="",
+            stderr=(
+                "fatal: not a git repository (or any of the parent "
+                "directories): .git\n"
+            ),
+        )
+        with mock.patch.object(git_probe.subprocess, "run", return_value=not_repo):
+            self.assertEqual(
+                git_binding(plain_child, plain_parent),
+                GIT_BINDING_UNAVAILABLE,
+            )
+
+    def test_non_repository_marker_stat_error_is_unavailable(self) -> None:
+        not_repo = subprocess.CompletedProcess(
+            args=["git"],
+            returncode=128,
+            stdout="",
+            stderr=(
+                "fatal: not a git repository (or any of the parent "
+                "directories): .git\n"
+            ),
+        )
+        executable = git_probe._git_executable()
+        self.assertIsNotNone(executable)
+        with mock.patch.object(
+            git_probe, "_resolved_directory", return_value=self.nested
+        ), mock.patch.object(
+            git_probe, "_git_executable", return_value=executable
+        ), mock.patch.object(
+            git_probe.subprocess, "run", return_value=not_repo
+        ) as runner, mock.patch.object(
+            git_probe.os, "lstat", side_effect=PermissionError("refused")
+        ):
+            observation = git_probe.probe_workspace_git(self.nested)
+        runner.assert_called_once()
+        self.assertEqual(observation.state, GIT_PROBE_UNAVAILABLE)
+
+    def test_one_sided_unavailable_never_degrades(self) -> None:
+        measurable = (
+            WorkspaceGitProbe(state=GIT_PROBE_NON_GIT),
+            WorkspaceGitProbe(
+                state=GIT_PROBE_GIT,
+                git_dir=str(self.canonical / ".git"),
+                common_dir=str(self.canonical / ".git"),
+            ),
+        )
+        for other in measurable:
+            with self.subTest(other=other.state), mock.patch.object(
+                alias_application,
+                "probe_workspace_git",
+                side_effect=(
+                    WorkspaceGitProbe(state=GIT_PROBE_UNAVAILABLE),
+                    other,
+                ),
+            ):
+                self.assertEqual(
+                    git_binding(self.nested, self.canonical),
+                    GIT_BINDING_UNAVAILABLE,
+                )
+
+
+class GitProbeRefusalTests(AliasFixtureTestCase):
+    def test_existing_alias_refuses_launch_when_git_probe_is_unavailable(self) -> None:
+        self._declare_alias()
+        with mock.patch.object(git_probe.shutil, "which", return_value=None):
+            resolution = resolve_launch_root(self.nested, home=self.home)
+        self.assertEqual(resolution.state, STATE_REFUSED)
+        self.assertEqual(resolution.reason, REASON_GIT_BINDING_UNAVAILABLE)
+        self.assertEqual(resolution.launch_root, "")
 
 
 class StoreTests(AliasFixtureTestCase):
