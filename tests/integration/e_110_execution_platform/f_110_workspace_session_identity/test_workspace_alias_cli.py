@@ -1272,12 +1272,13 @@ class WorkspaceAliasR6FindingTests(WorkspaceAliasCliTestCase):
         fresh = self.base / "fresh-workspace"
         fresh.mkdir()
         real_fsync = os.fsync
-        synced: list = []
+        synced: list[tuple[int, int]] = []
 
         def track(fd):
             try:
-                if stat.S_ISDIR(os.fstat(fd).st_mode):
-                    synced.append(os.readlink(f"/proc/self/fd/{fd}"))
+                observed = os.fstat(fd)
+                if stat.S_ISDIR(observed.st_mode):
+                    synced.append((observed.st_dev, observed.st_ino))
             except OSError:  # pragma: no cover - defensive
                 pass
             return real_fsync(fd)
@@ -1287,8 +1288,9 @@ class WorkspaceAliasR6FindingTests(WorkspaceAliasCliTestCase):
                 fresh,
                 store.WorkspaceAliasDeclaration(mode="disabled"),
             )
+        fresh_stat = fresh.stat()
         self.assertIn(
-            str(fresh), synced,
+            (fresh_stat.st_dev, fresh_stat.st_ino), synced,
             "a newly created .mozyo-bridge was not persisted in the repo root",
         )
 
@@ -1296,16 +1298,18 @@ class WorkspaceAliasR6FindingTests(WorkspaceAliasCliTestCase):
         """The repo-root sync is only owed when the parent was just created."""
         self.run_cli("workspace", "alias", "disable", "--repo", str(self.nested))
         real_fsync = os.fsync
-        synced: list = []
+        synced: list[tuple[int, int]] = []
 
         def track(fd):
             try:
-                if stat.S_ISDIR(os.fstat(fd).st_mode):
-                    synced.append(os.readlink(f"/proc/self/fd/{fd}"))
+                observed = os.fstat(fd)
+                if stat.S_ISDIR(observed.st_mode):
+                    synced.append((observed.st_dev, observed.st_ino))
             except OSError:  # pragma: no cover - defensive
                 pass
             return real_fsync(fd)
 
         with mock.patch.object(store.os, "fsync", track):
             self.run_cli("workspace", "alias", "disable", "--repo", str(self.nested))
-        self.assertNotIn(str(self.nested), synced)
+        nested_stat = self.nested.stat()
+        self.assertNotIn((nested_stat.st_dev, nested_stat.st_ino), synced)
