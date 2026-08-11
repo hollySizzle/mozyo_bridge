@@ -328,10 +328,10 @@ def classify_composer_residue(
 
     Redmine #14232 (j#84877 required correction 2): this branch used to special-case
     ``marker_timeout`` alone and fold **every other** ``blocked`` onto ``not_typed``. That
-    misread the whole post-injection family as "nothing reached the receiver" — most
-    visibly the herdr ``delivered_not_started`` projection (``blocked`` /
-    ``turn_start_unconfirmed``), where body **and** Enter were injected before the event
-    wait timed out, and the new ``transport_error``, where a primitive raised mid-send.
+    misread the whole post-admission family as "nothing reached the receiver" — most
+    visibly the Herdr ``delivered_not_started`` projection (``blocked`` /
+    ``turn_start_unconfirmed``), where the body or an Enter may already have been injected,
+    and ``transport_error``, where a primitive raised at an unknown point in the send.
     Deriving the split from the shared authority instead of a local literal is what keeps
     the residue read and the retry decision from disagreeing again: a residue of
     ``not_typed`` invites exactly the blind retry the injection stage prohibits.

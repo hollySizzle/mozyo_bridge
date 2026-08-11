@@ -156,11 +156,10 @@ class _ScenarioRunner:
         self.fake = fake
         self.herdr_bin = herdr_bin
         #: The per-target composer text accumulated from ``pane send-text`` injections,
-        #: served back on ``agent read`` so the queue-enter landing observation
-        #: (``wait_for_text`` over the herdr ``capture_pane``) sees the marker it just
-        #: typed — exactly as a live composer echoes it (instant), instead of polling a
-        #: fixed fake read to its wall-clock deadline. Scenario-level fidelity; the US-A
-        #: shared fake stays a fixed-text read model.
+        #: served back on ``agent read`` so the Herdr queue-enter body/screen gates see
+        #: the exact text they just typed instead of polling a fixed fake read to the
+        #: wall-clock deadline. Scenario-level fidelity; the US-A shared fake stays a
+        #: fixed-text read model.
         self._composer: dict = {}
 
     def run(self, argv, **kwargs):
@@ -194,10 +193,9 @@ class _ScenarioRunner:
         raise AssertionError(f"unexpected subprocess call in scenario: {list(argv)!r}")
 
     def popen(self, argv, **kwargs):
-        # The queue-enter worker-dispatch rail is submit-complete with no event wait
-        # (design §3.2 ACK hop), so a ``wait`` popen is not expected. Delegate to the
-        # fake (which models ``wait agent-status``) so a stray wait surfaces its
-        # change-semantics outcome rather than a fabricated success.
+        # Herdr queue-enter arms an event wait before each admitted Enter.  Delegate to
+        # the fake's ``wait agent-status`` model so this scenario exercises the real
+        # causal turn-start rail rather than fabricating success from a marker echo.
         return self.fake.popen(argv, **kwargs)
 
 

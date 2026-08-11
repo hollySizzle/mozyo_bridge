@@ -394,8 +394,9 @@ def configure_handoff_parser(
         default=QUEUE_ENTER_RETRY_WINDOW_SECONDS,
         help=(
             "Absolute queue-enter retry budget in seconds (default "
-            f"{QUEUE_ENTER_RETRY_WINDOW_SECONDS:g}); the body is always typed "
-            "once. Herdr includes the first pre-armed causal wait, all minimum-"
+            f"{QUEUE_ENTER_RETRY_WINDOW_SECONDS:g}); after admission the body is typed "
+            "at most once. Herdr first Enter is zero-or-one and includes its pre-armed "
+            "causal wait, all minimum-"
             "interval delays, and every re-armed wait in this one budget. A "
             "timeout may repeat an Enter-only retry after a fresh strict gate "
             "until the deadline; a wait error stops the sequence immediately "
@@ -513,10 +514,12 @@ def register_message(
             "Operator/debug fallback: type the message but do not press Enter, "
             "leaving the input pending at the target prompt for an operator to "
             "submit. NOT the standard handoff path — standard same-lane dispatch "
-            "/ handoff/reply submit-completes (`mozyo-bridge handoff send` on the "
-            "default queue-enter rail, or marker-observed `--mode standard`). "
-            "Sanctioned only as the per-preset `--no-submit` marker_timeout retry "
-            "path or explicit operator debugging (Redmine #12207)."
+            "/ handoff/reply uses the governed high-level send; tmux preserves its "
+            "compatibility outcome while Herdr reports success only after causal "
+            "turn-start confirmation. "
+            "Sanctioned only after an explicit `not_sent` refusal when the preset "
+            "directs this operator path, or for explicit operator debugging. A "
+            "successful pending send is not retry authority (Redmine #12207)."
         ),
     )
     message.add_argument(

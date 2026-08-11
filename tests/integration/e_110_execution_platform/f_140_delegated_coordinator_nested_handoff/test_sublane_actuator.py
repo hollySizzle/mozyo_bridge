@@ -1285,17 +1285,19 @@ class GatewayReadinessContractTests(unittest.TestCase):
         self.assertTrue(outcome.gateway_ready)
         self.assertEqual(slept, [0.5, 0.5])
 
-    def test_never_ready_degrades_but_still_dispatches(self):
-        # The rail is never hard-blocked: an unconfirmed readiness dispatches anyway.
+    def test_never_ready_degrades_but_still_runs_governed_dispatch(self):
+        # Gateway readiness is an observation, not delivery authority: a miss is
+        # recorded, then the governed handoff rail independently admits or blocks the
+        # actual send. This fake models the admitted/successful transport case.
         ops = FakeActuatorOps(git=True, lanes=[None, _lane()], gateway_ready=False)
         slept = []
         outcome = SublaneActuateUseCase(
             ops, gateway_ready_probes=3, sleep=slept.append
         ).run(_req(), execute=True)
-        self.assertEqual(outcome.status, ACTUATE_EXECUTED)  # NOT blocked
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
         self.assertFalse(outcome.gateway_ready)
         self.assertEqual(outcome.dispatch_result, DISPATCH_GATEWAY_NOTIFIED)
-        self.assertIn("dispatch", ops._names())  # dispatch still happened
+        self.assertIn("dispatch", ops._names())
         # probed the full window (3 probes, 2 back-offs) then degraded
         self.assertEqual(slept, [0.5, 0.5])
         readiness = _step(outcome, "confirm gateway readiness")

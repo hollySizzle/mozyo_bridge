@@ -711,13 +711,14 @@ def _gateway_injection_stage(
 ) -> str:
     """The shared stage token for the target gateway's own outcome.
 
-    A zero exit code is **not** proof of delivery — ``delivery_outcome_gate``
-    documents the two rc-0 shapes that never reached a receiver (a ``pending``
-    send that parks the body in the composer, and a marker-unobserved
-    ``queue-enter``).  So the structured outcome is read through the shared
-    :func:`injection_stage_for` and :func:`stage_from_telemetry` authorities
-    rather than through a private status/reason table: #14232 records what
-    happened when three places answered "was it delivered?" independently.
+    A zero exit code is **not** proof of causally confirmed delivery — a
+    ``pending`` send intentionally parks the body in the receiver composer, and
+    the tmux-compatibility ``queue-enter`` rail can report a practical queued
+    submission without causal turn-start evidence.  So the structured outcome
+    is read through the shared :func:`injection_stage_for` and
+    :func:`stage_from_telemetry` authorities rather than through a private
+    status/reason table: #14232 records what happened when three places answered
+    "was it delivered?" independently.
 
     The host boundary is not allowed to turn a stale producer's partial record
     into current delivery proof.  The response therefore must carry the exact

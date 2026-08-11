@@ -272,12 +272,12 @@ class ExecuteTests(unittest.TestCase):
 
 
 class WorkerReadinessWaitTests(unittest.TestCase):
-    """#13301: bounded, non-fatal pre-forward worker readiness wait.
+    """#13301: bounded, fail-closed pre-forward worker readiness wait.
 
     Mirrors the #13293 gateway readiness wait on the worker (Claude) pane: the
     execute drive polls the worker pane until it is booted before the queue-enter
-    forward, but NEVER hard-blocks — an unconfirmed readiness records
-    ``worker_ready=false`` and forwards anyway.
+    forward. An unconfirmed readiness records ``worker_ready=false`` and blocks
+    before dispatch, because worker liveness is part of action-time admission.
     """
 
     def _use_case(self, ops, *, probes=20, sleeps=None):

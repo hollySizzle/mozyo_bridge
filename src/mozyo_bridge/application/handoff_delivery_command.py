@@ -157,9 +157,10 @@ def submit_lines_for(
         reason=outcome.reason,
         intent=intent,
         delivery_id=delivery_id,
-        # Review j#95333 F1: the residue classification needs the rail and its turn-start
-        # telemetry, not just the two wire tokens — `sent`/`ok` means "submitted" on the
-        # standard rail and only "typed + Enter pressed" on queue-enter.
+        # Review j#95333 F1: the residue classification needs the rail and its causal
+        # telemetry, not just the two wire tokens.  Herdr queue-enter confirms a turn
+        # before success, while tmux queue-enter remains a compatibility-level queued
+        # submission; the mode-specific evidence distinguishes those meanings.
         mode=outcome.mode,
         queue_enter_turn_start_observation=outcome.queue_enter_turn_start_observation,
         turn_start_outcome=outcome.turn_start_outcome,

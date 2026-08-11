@@ -813,10 +813,9 @@ class ApplyDeliveryTests(unittest.TestCase):
         self.assertEqual(result.reason, REASON_UNIT_UNRESOLVED)
 
     def test_a_zero_exit_with_a_non_delivered_outcome_is_not_delivered(self) -> None:
-        # rc 0 is not proof of delivery: a parked composer and a
-        # marker-unobserved queue-enter both exit 0 without reaching a receiver.
-        # None of them is a zero-send either — the body was typed — so each is
-        # `uncertain`, and the operator is told not to blind-retry.
+        # rc 0 is not causal delivery proof. A pending body is parked in the receiver
+        # composer and a tmux-compatible queue-enter may be only practically queued.
+        # Neither is zero-send, so each is `uncertain` and must not be blind-retried.
         for label, outcome in (
             ("blocked", delivery_record(status="blocked", reason="turn_start_unconfirmed")),
             ("pending_input", delivery_record(status="pending_input", reason="ok")),
