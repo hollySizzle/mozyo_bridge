@@ -651,6 +651,20 @@ class WaitChangeSemanticsTest(unittest.TestCase):
         # The armed event is spent; a second identical wait times out.
         self.assertEqual(fake.popen(self._wait_argv(loc, STATUS_WORKING)).returncode, 1)
 
+    def test_wait_argv_fails_closed_outside_the_exact_herdr_08_grammar(self) -> None:
+        fake = FakeHerdr()
+        exact = self._wait_argv("w1:p1", STATUS_WORKING)
+        invalid = (
+            exact[:-2],
+            [*exact[:4], "--status", *exact[5:]],
+            [*exact, "--json"],
+            [*exact[:-1], "not-a-number"],
+        )
+        for argv in invalid:
+            with self.subTest(argv=argv):
+                with self.assertRaises(UnknownHerdrCommandError):
+                    fake.popen(argv)
+
 
 # -- fail-closed on unmodelled argv (design §2.3) ------------------------------
 

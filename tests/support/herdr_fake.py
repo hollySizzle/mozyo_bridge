@@ -453,10 +453,18 @@ class FakeHerdr:
         """
         rest = list(argv[1:])
         self.calls.append(rest)
-        if rest[:2] != ["agent", "wait"]:
+        if (
+            len(rest) != 7
+            or rest[:2] != ["agent", "wait"]
+            or not rest[2]
+            or rest[3] != "--until"
+            or not rest[4]
+            or rest[5] != "--timeout"
+            or not rest[6].isdigit()
+        ):
             raise UnknownHerdrCommandError(f"unmodelled herdr popen: {list(argv)!r}")
-        target = rest[2] if len(rest) > 2 else ""
-        want = _flag_value(rest, "--until")
+        target = rest[2]
+        want = rest[4]
         return self._resolve_wait(target, want)
 
     # -- command handlers -----------------------------------------------------

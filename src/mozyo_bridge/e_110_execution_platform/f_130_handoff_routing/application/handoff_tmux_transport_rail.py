@@ -663,6 +663,7 @@ class TmuxTransportRailUseCase:
                 self._current_step = STEP_SEND_KEYS_ENTER_RETRY
                 ops.press_enter(request.target)
 
+            self._current_step = STEP_READ_PANE_RETRY_PROBE  # retry authorization reads
             queue_session.complete_after_first_enter(
                 press_extra_enter=_press_extra_enter
             )

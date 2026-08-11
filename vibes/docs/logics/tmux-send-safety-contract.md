@@ -875,7 +875,7 @@ busy snapshot は submission proof ではなく、standard rail 用 `turn_start_
 delivery-ledger は queue rail のまま保たれる。causal event + coherent generation が揃えば `sent` / `ok`、
 揃わなければ precise reason (`turn_start_absent` / `receiver_blocked` / `turn_start_unconfirmed` /
 `transport_error`) を伴う `blocked` / non-zero である。後者は本文が届いた可能性を持つので injection stage は
-`uncertain`、blind retry 禁止のままになる。ここで確認するのは turn start までであり、task completion や
+`uncertain_partial`、blind retry 禁止のままになる。ここで確認するのは turn start までであり、task completion や
 ticket gate を確認するものではない。
 
 Herdr queue-enterの公開window/intervalはfiniteかつ各3600秒以下に限り、範囲外は本文入力前に

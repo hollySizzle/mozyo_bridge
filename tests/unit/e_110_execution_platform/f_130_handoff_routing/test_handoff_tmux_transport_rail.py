@@ -39,6 +39,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.han
     TmuxTransportRailRequest,
     TmuxTransportRailUseCase,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_transport_failure_gate import (
+    STEP_READ_PANE_RETRY_PROBE,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_resend_gate import (
     RESEND_SKIP_BODY_ABSENT,
     RESEND_SKIP_BUDGET_EXHAUSTED,
@@ -927,14 +930,14 @@ class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
         self.assertEqual(outcome.injection_stage["stage"], STAGE_UNCERTAIN_PARTIAL)
         self.assertEqual(
             outcome.transport_failure,
-            {"primitive": "send_keys(enter) (submit)"},
+            {"primitive": STEP_READ_PANE_RETRY_PROBE},
         )
         self.assertEqual(len(ops.ledgered), 1)
         self.assertEqual(ops.ledgered[0][0], outcome)
         self.assertIsNone(ops.ledgered[0][1])
         self.assertEqual(ops.ledgered[0][2], "herdr")
         self.assertEqual(ops.ledgered[0][3], "queue_enter_rail")
-        self.assertEqual(ops.ledgered[0][4], "send_keys(enter) (submit)")
+        self.assertEqual(ops.ledgered[0][4], STEP_READ_PANE_RETRY_PROBE)
         self.assertLess(ops.events.index("ledger"), ops.events.index("emit"))
         self.assertNotIn("adapter-private", died.message)
 
