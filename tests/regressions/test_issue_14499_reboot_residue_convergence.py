@@ -1575,6 +1575,10 @@ class CurrentGenerationResidueCallerMatrix(unittest.TestCase):
             "attestation_store_lock", return_value=contextlib.nullcontext()
         ), mock.patch.object(
             herdr_pane_lifecycle, "_close_base_pane", return_value=close_result
+        ), mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_session_start._resolve_binary_or_die",
+            return_value="/test/herdr",
         ):
             return run_residue_close(args, Path("/repo"), execute=execute)
 

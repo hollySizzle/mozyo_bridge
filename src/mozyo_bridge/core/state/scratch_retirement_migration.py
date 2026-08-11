@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import json
 import os
 import secrets
 import sqlite3
 import stat
+import sys
 from pathlib import Path
 
 from mozyo_bridge.core.state.scratch_retirement_attempt_codec import (
@@ -295,17 +298,76 @@ def _publish_pinned_link(source: Path, pin: tuple[int, int], target: Path) -> No
             raise ScratchRetirementMigrationError(
                 "scratch retirement staging artifact changed before publish"
             )
-        fd_root = Path("/proc/self/fd")
-        if not fd_root.is_dir():
-            fd_root = Path("/dev/fd")
-        if not fd_root.is_dir():
-            raise ScratchRetirementMigrationError(
-                "this platform cannot publish a pinned retirement backup inode"
-            )
-        os.link(fd_root / str(fd), target, follow_symlinks=True)
+        if not _link_open_inode(fd, target):
+            # Some non-Linux platforms expose no fd-to-link primitive.  The private
+            # 0700 staging directory is still under the durable control marker, so a
+            # path hardlink is safe only as a no-clobber publication attempt.  Recheck
+            # both names afterwards; any same-UID replacement is retained as damaged
+            # evidence rather than unlinked or stamped into the v2 authority.
+            _require_pinned_artifact(source, pin)
+            os.link(source, target, follow_symlinks=False)
     finally:
         os.close(fd)
+    _require_pinned_artifact(source, pin)
     _require_pinned_artifact(target, pin)
+
+
+def _link_open_inode(fd: int, target: Path) -> bool:
+    """Hardlink the exact opened inode when the platform exposes a safe primitive.
+
+    Linux ``linkat(AT_EMPTY_PATH)`` binds the destination to ``fd`` itself.  Going via
+    ``/proc/self/fd`` looks equivalent but crosses a procfs/bind-mount boundary under
+    common sandbox runners and can fail with ``EXDEV`` even when staging and backup are
+    on the same filesystem.  Other platforms retain the fd pseudo-filesystem attempt;
+    callers use a checked, fail-closed private-path fallback when neither works.
+    """
+    unavailable = {
+        errno.EACCES,
+        errno.EINVAL,
+        errno.ENOENT,
+        errno.ENOSYS,
+        errno.EPERM,
+        errno.EXDEV,
+    }
+    if hasattr(errno, "ENOTSUP"):
+        unavailable.add(errno.ENOTSUP)
+    if hasattr(errno, "EOPNOTSUPP"):
+        unavailable.add(errno.EOPNOTSUPP)
+
+    if sys.platform.startswith("linux"):
+        linkat = getattr(ctypes.CDLL(None, use_errno=True), "linkat", None)
+        if linkat is not None:
+            linkat.argtypes = (
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+            )
+            linkat.restype = ctypes.c_int
+            if linkat(
+                fd,
+                ctypes.c_char_p(b""),
+                -100,  # AT_FDCWD
+                ctypes.c_char_p(os.fsencode(os.path.abspath(target))),
+                0x1000,  # AT_EMPTY_PATH
+            ) == 0:
+                return True
+            error = ctypes.get_errno()
+            if error not in unavailable:
+                raise OSError(error, os.strerror(error), target)
+
+    for fd_root in (Path("/proc/self/fd"), Path("/dev/fd")):
+        if not fd_root.is_dir():
+            continue
+        try:
+            os.link(fd_root / str(fd), target, follow_symlinks=True)
+        except OSError as exc:
+            if exc.errno not in unavailable:
+                raise
+            continue
+        return True
+    return False
 
 
 def _truncate_pinned(path: Path, pin: tuple[int, int]) -> None:

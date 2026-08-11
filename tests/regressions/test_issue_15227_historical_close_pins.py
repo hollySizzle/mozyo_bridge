@@ -234,6 +234,95 @@ class ScratchMigrationTest(unittest.TestCase):
                 self.fence.migrate_v1_backup_first()
         self.assertEqual(self.fence.migrate_v1_backup_first(), 2)
 
+    def test_pinned_publish_falls_back_without_fd_pseudo_filesystem(self):
+        self._v1()
+        from mozyo_bridge.core.state import scratch_retirement_migration as migration
+
+        with patch.object(migration, "_link_open_inode", return_value=False):
+            self.assertEqual(self.fence.migrate_v1_backup_first(), 2)
+        self.assertEqual(self.fence.store_shape().state, "present")
+
+    def test_open_inode_link_falls_back_only_for_capability_errors(self):
+        import errno
+
+        from mozyo_bridge.core.state import scratch_retirement_migration as migration
+
+        source = self.home / "open-inode-source"
+        target = self.home / "open-inode-target"
+        source.write_bytes(b"source")
+        fd = os.open(source, os.O_RDONLY)
+
+        class FakeLinkAt:
+            def __init__(self, error):
+                self.error = error
+
+            def __call__(self, *_args):
+                migration.ctypes.set_errno(self.error)
+                return -1
+
+        try:
+            for error in (errno.EPERM, errno.EXDEV):
+                fake = SimpleNamespace(linkat=FakeLinkAt(error))
+                with self.subTest(error=error), patch.object(
+                    migration.ctypes, "CDLL", return_value=fake
+                ), patch.object(
+                    migration.sys, "platform", "linux"
+                ), patch.object(migration.Path, "is_dir", return_value=False):
+                    self.assertFalse(migration._link_open_inode(fd, target))
+
+            for error in (errno.EEXIST, errno.EIO):
+                fake = SimpleNamespace(linkat=FakeLinkAt(error))
+                with self.subTest(error=error), patch.object(
+                    migration.ctypes, "CDLL", return_value=fake
+                ), patch.object(
+                    migration.sys, "platform", "linux"
+                ), patch.object(migration.Path, "is_dir", return_value=False):
+                    with self.assertRaises(OSError) as raised:
+                        migration._link_open_inode(fd, target)
+                    self.assertEqual(raised.exception.errno, error)
+        finally:
+            os.close(fd)
+
+    def test_path_fallback_never_stamps_a_replaced_staging_inode(self):
+        self._v1()
+        from mozyo_bridge.core.state import scratch_retirement_migration as migration
+
+        real_link = migration.os.link
+        captured = {}
+        backup = self.fence.path.with_name(self.fence.path.name + ".v1.backup")
+        control = backup.with_name(backup.name + ".migration")
+
+        def replace_during_link(source, target, *args, **kwargs):
+            source_path = Path(source)
+            if source_path.name == "store.sqlite3":
+                foreign = source_path.with_name("foreign-during-publish")
+                foreign.write_bytes(b"same-user-foreign-during-publish")
+                os.chmod(foreign, 0o600)
+                os.replace(foreign, source_path)
+                captured["source"] = source_path
+            return real_link(source, target, *args, **kwargs)
+
+        with patch.object(
+            migration, "_link_open_inode", return_value=False
+        ), patch.object(migration.os, "link", side_effect=replace_during_link):
+            with self.assertRaises(ScratchRetirementFenceError):
+                self.fence.migrate_v1_backup_first()
+        self.assertEqual(
+            captured["source"].read_bytes(), b"same-user-foreign-during-publish"
+        )
+        self.assertEqual(backup.read_bytes(), b"same-user-foreign-during-publish")
+        self.assertEqual(
+            (backup.stat().st_dev, backup.stat().st_ino),
+            (captured["source"].stat().st_dev, captured["source"].stat().st_ino),
+        )
+        self.assertTrue(control.exists())
+        self.assertEqual(self.fence.store_shape().state, "damaged")
+        with self.assertRaises(ScratchRetirementFenceError):
+            self.fence.migrate_v1_backup_first()
+        self.assertEqual(backup.read_bytes(), b"same-user-foreign-during-publish")
+        with sqlite3.connect(self.fence.path) as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+
     def test_db_only_backup_with_partial_staging_seal_replays(self):
         self._v1()
         backup = self.fence.path.with_name(self.fence.path.name + ".v1.backup")
