@@ -10,11 +10,13 @@ from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.doma
     GIT_BINDING_DIFFERENT,
     GIT_BINDING_NOT_MEASURABLE,
     GIT_BINDING_SAME,
+    GIT_BINDING_UNAVAILABLE,
     MODE_ALIAS,
     MODE_DISABLED,
     REASON_ALIAS_CYCLE,
     REASON_CROSS_REPOSITORY,
     REASON_DECLARATION_INVALID,
+    REASON_GIT_BINDING_UNAVAILABLE,
     REASON_TARGET_IDENTITY_MISMATCH,
     REASON_TARGET_IDENTITY_UNRESOLVED,
     REASON_TARGET_MISSING,
@@ -136,6 +138,12 @@ class FailClosedTests(unittest.TestCase):
         self._assert_refused(
             _resolve(target=_target(git_binding=GIT_BINDING_DIFFERENT)),
             REASON_CROSS_REPOSITORY,
+        )
+
+    def test_unavailable_git_binding_is_its_own_typed_refusal(self) -> None:
+        self._assert_refused(
+            _resolve(target=_target(git_binding=GIT_BINDING_UNAVAILABLE)),
+            REASON_GIT_BINDING_UNAVAILABLE,
         )
 
     def test_target_that_does_not_contain_the_source(self) -> None:
