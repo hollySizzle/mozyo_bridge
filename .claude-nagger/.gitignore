@@ -1,7 +1,22 @@
-# Generated artifacts and runtime cache live next to the config files
+# Generated artifacts and runtime state live next to the config files
 # but should never be committed. The catalog is the source of truth;
-# any `file_conventions.generated.yaml` here is derived output, and
-# any `vault/` content is local runtime state.
+# any `file_conventions.generated.yaml` here is derived output.
 file_conventions.generated.yaml
+
+# Claude Nagger keeps its session state in a SQLite database inside this
+# directory. `state.db-wal` / `state.db-shm` are the WAL sidecars, and
+# `state.db-journal` is the rollback sidecar SQLite falls back to when
+# WAL is unavailable. `suggested_rules/` is the rule-proposal drop box
+# the session-startup hook writes and archives. All of it is local
+# runtime state, so `git add -A` must never pick it up.
+state.db
+state.db-wal
+state.db-shm
+state.db-journal
+suggested_rules/
+
+# `vault/` content and hook logs are local runtime state as well. The
+# shipped skeleton (`*.yaml.example`), this `.gitignore`, and the
+# conventions a project activates by hand stay tracked.
 vault/
 *.log
