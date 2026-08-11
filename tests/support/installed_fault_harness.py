@@ -319,8 +319,9 @@ class InstalledFaultHarness:
 
         # A readable-but-EMPTY composer read (a rendered prompt line ``> `` with no body): a
         # fresh idle launch has nothing typed, so a rollback's "pending input cannot be ruled
-        # out" guard clears (a blank read would instead read as *unreadable*) and the fresh pane
-        # is closeable.
+        # out" guard clears (a blank read would instead read as *unreadable*). The fixture still
+        # exercises the live public ops, which preserve this present pane when the selected Herdr
+        # runtime has no server-side conditional close for its observed generation.
         self.fake = FakeHerdr(read_text="idle\n> ")
         self._ws = self.fake.seed_workspace(cwd=str(self.repo_root))
         self._runner = _HerdrRunner(self.fake, self.herdr_bin, subprocess.run, subprocess.Popen)
@@ -597,11 +598,13 @@ class InstalledFaultHarness:
         """Reserve a startup action + record a fresh unhealthy launch that owes a rollback.
 
         Returns ``(action_id, {role: locator})``. Each recorded participant is also placed live
-        in the fake inventory so the public ``herdr session-rollback`` preflight finds it as a
-        closeable fresh launch of THIS action. ``busy=True`` seeds the fresh slot as an in-flight
-        turn instead (a rollback must refuse to interrupt it). This is the safe isolated fixture
-        rail: the home-scoped :class:`StartupTransactionFence` public API — the same store the
-        public rollback command reads — never a raw fence mutation.
+        in the fake inventory so the public ``herdr session-rollback`` preflight finds the exact
+        fresh launch of THIS action and exercises its identity/content fences. Current live Herdr
+        ops then report ``conditional_close_unavailable`` and preserve the pane because the
+        runtime cannot atomically close that observed generation. ``busy=True`` seeds the fresh
+        slot as an in-flight turn instead (a rollback must refuse to interrupt it). This is the
+        safe isolated fixture rail: the home-scoped :class:`StartupTransactionFence` public API —
+        the same store the public rollback command reads — never a raw fence mutation.
         """
         from mozyo_bridge.core.state.startup_transaction_fence import (
             Participant,
@@ -618,8 +621,9 @@ class InstalledFaultHarness:
         fence = StartupTransactionFence(home=self.home)
         unit = StartupUnit(workspace_id=self.workspace_id, lane_id=lane_id, providers=providers)
         action = fence.reserve(unit, nonce)
-        # A fresh launch that did NOT come up healthy sits idle (never attested), the closeable
-        # rollback candidate; a busy slot is an in-flight turn a rollback always refuses.
+        # A fresh launch that did NOT come up healthy sits idle (never attested), satisfying the
+        # rollback's identity/content candidate fences. The live public adapter still preserves a
+        # present pane without conditional-close capability; a busy slot is always refused too.
         status = STATUS_WORKING if busy else DEFAULT_START_STATUS
         locators: dict[str, str] = {}
         for role in providers:
