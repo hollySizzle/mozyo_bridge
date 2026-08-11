@@ -1623,7 +1623,12 @@ class SublaneHibernateToctouFenceTest(unittest.TestCase):
             store = self._store(tmp)
             self._declare(store)
             running = LaneActivityObservation(readable=True, worker_busy=True)
-            ops = _FakeOps(rows=self._rows(), activities=[running])
+            # Redmine #15193: the preflight now takes its OWN T0 activity observation, so the
+            # script leads with a quiescent one. That keeps this test on the TOCTOU case it
+            # is for — quiescent at T0, non-quiescent at T1 — rather than a condition that
+            # was already true before the release began (covered separately by the preflight
+            # parity tests).
+            ops = _FakeOps(rows=self._rows(), activities=[_QUIESCENT_ACTIVITY, running])
             outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
                 _request(), execute=True
             )
@@ -1638,7 +1643,11 @@ class SublaneHibernateToctouFenceTest(unittest.TestCase):
                 store.get(LaneLifecycleKey(WS, LANE)).lane_disposition,
                 DISPOSITION_ACTIVE,
             )
-            self.assertEqual(ops.activity_reads, 1)  # the fence actually observed activity
+            # Redmine #15193: two activity reads, and BOTH are load-bearing — the T0
+            # preflight parity probe and the T1 boundary re-read. The boundary's must stay
+            # FRESH (an input appearing during the release window is exactly what the #13843
+            # fence catches), so it can never be collapsed into the preflight's.
+            self.assertEqual(ops.activity_reads, 2)
 
     def test_boundary_pending_composer_blocks(self) -> None:
         # F2: a live pending composer observed at the boundary blocks with zero mutation.
@@ -1646,7 +1655,9 @@ class SublaneHibernateToctouFenceTest(unittest.TestCase):
             store = self._store(tmp)
             self._declare(store)
             composer = LaneActivityObservation(readable=True, composer_pending=True)
-            ops = _FakeOps(rows=self._rows(), activities=[composer])
+            # Quiescent at T0 (see the worker-busy sibling): this is the TOCTOU case, where
+            # the input appears DURING the release window.
+            ops = _FakeOps(rows=self._rows(), activities=[_QUIESCENT_ACTIVITY, composer])
             outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
                 _request(), execute=True
             )
@@ -1668,7 +1679,7 @@ class SublaneHibernateToctouFenceTest(unittest.TestCase):
             ghost = LaneActivityObservation(
                 readable=True, composer_pending=False, composer_ghost_observed=True
             )
-            ops = _FakeOps(rows=self._rows(), activities=[ghost])
+            ops = _FakeOps(rows=self._rows(), activities=[_QUIESCENT_ACTIVITY, ghost])
             outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
                 _request(), execute=True
             )
@@ -1684,7 +1695,9 @@ class SublaneHibernateToctouFenceTest(unittest.TestCase):
             self._declare(store)
             ops = _FakeOps(
                 rows=self._rows(),
-                activities=[LaneActivityObservation(readable=False)],
+                # Readable at T0 (so the preflight's own probe passes and does not shadow
+                # this), unreadable at T1 — the boundary is what must fail closed here.
+                activities=[_QUIESCENT_ACTIVITY, LaneActivityObservation(readable=False)],
             )
             outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
                 _request(), execute=True
@@ -1948,7 +1961,7 @@ class ReleaseBoundaryNextActionsTest(unittest.TestCase):
             running = LaneActivityObservation(readable=True, worker_busy=True)
             ops = _FakeOps(
                 rows=[_row("codex", LANE, f"{WS}:p2"), _row("claude", LANE, f"{WS}:p3")],
-                activities=[running],
+                activities=[_QUIESCENT_ACTIVITY, running],
             )
             outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
                 _request(), execute=True
@@ -2323,6 +2336,9 @@ _TRANSPORT = (
     ".herdr_transport.HerdrCliTransport"
 )
 _OBSERVE = (
+    # The hibernate boundary resolves this by a CALL-TIME
+    # `from ...sublane_quarantine import observe_composer_text`, so the re-exported alias
+    # there is the correct seam — unchanged by the Redmine #15193 split.
     "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff"
     ".application.sublane_quarantine.observe_composer_text"
 )

@@ -643,7 +643,8 @@ class RemoteUnitActionRail:
             ),
         )
         stage = _delivery_stage(
-            result, expected_mode=request.effective_delivery_mode
+            result,
+            expected_mode=request.effective_delivery_mode,
         )
         if stage == STAGE_SUBMITTED_CONFIRMED:
             return RemoteUnitActionResult(
@@ -727,7 +728,9 @@ def _gateway_injection_stage(
     re-derivation deliberately ignores the standard rail's
     ``turn_start_outcome``: only the canonical causal-v2 queue observation can
     confirm this mode.  A missing/mismatched mode, legacy queue evidence, or a
-    contradictory carried stage is uncertain, never success or zero-send.
+    contradictory carried stage is uncertain, never success or zero-send.  The
+    carried stage is only a cross-check, not authority in isolation (review
+    j#103034, UBRA-RESULT-001).
 
     Everything unreadable — absent output, no JSON line, a non-object — resolves
     to :data:`STAGE_UNCERTAIN_PARTIAL`, the same direction the authority itself
@@ -792,7 +795,8 @@ def _delivery_stage(result, *, expected_mode: str) -> str:
         # its receiver before the transport gave up is exactly what nobody knows.
         return STAGE_UNCERTAIN_PARTIAL
     stage = _gateway_injection_stage(
-        completed.stdout, expected_mode=expected_mode
+        completed.stdout,
+        expected_mode=expected_mode,
     )
     if stage == STAGE_SUBMITTED_CONFIRMED and completed.returncode != 0:
         return STAGE_UNCERTAIN_PARTIAL

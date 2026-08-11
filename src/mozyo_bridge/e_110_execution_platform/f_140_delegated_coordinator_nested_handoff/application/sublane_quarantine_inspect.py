@@ -77,9 +77,29 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     decide_approval_readiness,
     render_approval_template,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.generation_mismatch_disposition import (  # noqa: E501
+    DISPOSITION_DUPLICATE_RECEIVER,
+    DISPOSITION_INVENTORY_UNREADABLE,
+    DISPOSITION_LIFECYCLE_ABSENT,
+    DISPOSITION_LIFECYCLE_PINS_INVALID,
+    DISPOSITION_LIFECYCLE_UNREADABLE,
+    DISPOSITION_READY,
+    DISPOSITION_RECEIVER_ABSENT,
+    DISPOSITION_WORKSPACE_UNRESOLVED,
+    PENDING_EFFECT_DISCARDED_ON_REPLACE,
+    DispositionFacts,
+    decide_disposition_readiness,
+    disposition_command,
+    pending_identity,
+    render_disposition_template,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_pending_composer import (  # noqa: E501
     INVENTORY_UNREADABLE,
     PendingComposerClassification,
+    agent_state_is_working,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine_disposition import (  # noqa: E501
+    disposition_agent_state_settled,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
     HerdrSessionStartError,
@@ -95,7 +115,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     TRANSPORT_FAILURE_REASONS,
     TerminalTransportError,
 )
-
 #: The synthetic request fields the inspection uses to drive the #13763 inspector. The inspector
 #: needs a request shaped for the *approval* path; an inspection has no approval yet. These are
 #: inert placeholders, never emitted and never compared: the action generation is recomputed from
@@ -173,6 +192,17 @@ def classify_inventory_read_failure(exc: BaseException) -> str:
     return INVENTORY_READ_INTERNAL_ERROR
 
 
+#: A discovery-stage refusal happens BEFORE either rail is decided, so both must report it
+#: (Redmine #15193). The mapping keeps the two closed vocabularies aligned rather than leaving
+#: the disposition reason empty, which a reader could mistake for "not evaluated".
+_REFUSAL_TO_DISPOSITION: Mapping[str, str] = {
+    APPROVAL_WORKSPACE_UNRESOLVED: DISPOSITION_WORKSPACE_UNRESOLVED,
+    APPROVAL_INVENTORY_UNREADABLE: DISPOSITION_INVENTORY_UNREADABLE,
+    APPROVAL_DUPLICATE_RECEIVER: DISPOSITION_DUPLICATE_RECEIVER,
+    APPROVAL_RECEIVER_ABSENT: DISPOSITION_RECEIVER_ABSENT,
+}
+
+
 @dataclass(frozen=True)
 class QuarantineInspectRequest:
     """What the operator must supply: the durable lane coordinates, nothing exact."""
@@ -193,15 +223,33 @@ class QuarantineInspectOutcome:
     receiver_present: Optional[bool] = None
     inspection_detail: str = ""
     approval_template: str = ""
+    #: Redmine #15193: the generation-mismatch disposition arm. Populated on EVERY inspection
+    #: so a refusal names both rails' verdicts, but only rendered into a template when the
+    #: disposition itself is ready.
+    disposition_facts: DispositionFacts = field(default_factory=DispositionFacts)
+    disposition_reason: str = ""
+    disposition_template: str = ""
 
     @property
     def approval_ready(self) -> bool:
         return self.approval_reason == APPROVAL_READY
 
     @property
+    def disposition_ready(self) -> bool:
+        return self.disposition_reason == DISPOSITION_READY
+
+    @property
     def is_blocked(self) -> bool:
-        """A non-ready inspection exits non-zero so a script cannot read a refusal as success."""
-        return not self.approval_ready
+        """Non-zero exit unless SOME rail converged, so a refusal never reads as success.
+
+        Redmine #15193 widened this from "the quarantine approval is ready" to "either rail
+        is ready". That is the whole fix: the #15110 / #15140 / #15195 receivers are not
+        quarantine candidates and never will be, so under the old predicate the command could
+        only ever exit non-zero on them — reporting the tool's own missing rail as if it were
+        the operator's problem. A ready disposition is a real, actionable convergence and is
+        reported as one.
+        """
+        return not (self.approval_ready or self.disposition_ready)
 
     def as_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -220,6 +268,17 @@ class QuarantineInspectOutcome:
         payload["approval_command"] = (
             list(approval_command(self.facts)) if self.approval_ready else None
         )
+        payload["disposition"] = {
+            **self.disposition_facts.as_payload(),
+            "disposition_ready": self.disposition_ready,
+            "disposition_reason": self.disposition_reason,
+            "disposition_template": self.disposition_template or None,
+            "disposition_command": (
+                list(disposition_command(self.disposition_facts))
+                if self.disposition_ready
+                else None
+            ),
+        }
         return payload
 
 
@@ -264,6 +323,43 @@ class SublaneQuarantineInspectUseCase:
     #: surfaces cannot disagree about whether the inventory is readable (Redmine #14259). Never
     #: ``None``: the shared reader takes a ``Mapping`` and dereferences it directly.
     env: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
+    #: Injected ``(workspace_id, lane) -> (lane_generation, lifecycle_revision)`` reader for
+    #: the disposition's lane-scoped binding (Redmine #15193 requirement 3). Defaults to the
+    #: live lifecycle store. Unreadable, absent, and invalid authority remain distinct typed
+    #: refusals; none may mint an approval with an unpinned incarnation.
+    lifecycle_reader: Any = None
+
+    def _lane_pins(self, workspace_id: str, lane: str) -> tuple[int, int, str]:
+        if self.lifecycle_reader is not None:
+            try:
+                record = self.lifecycle_reader(workspace_id, lane)
+            except Exception:  # noqa: BLE001 - fixed typed refusal, never a guessed pin
+                return -1, -1, DISPOSITION_LIFECYCLE_UNREADABLE
+            if record is None:
+                return -1, -1, DISPOSITION_LIFECYCLE_ABSENT
+            try:
+                generation, revision = record
+            except (TypeError, ValueError):
+                return -1, -1, DISPOSITION_LIFECYCLE_PINS_INVALID
+        else:
+            try:
+                # NON-migrating and NON-creating: inspection cannot mutate shared authority.
+                from mozyo_bridge.core.state.lane_lifecycle_model import LaneLifecycleKey
+                from mozyo_bridge.core.state.lane_lifecycle_readonly import LaneLifecycleReader
+
+                record = LaneLifecycleReader().get(LaneLifecycleKey(workspace_id, lane))
+            except Exception:  # noqa: BLE001 - fixed typed refusal, never a guessed pin
+                return -1, -1, DISPOSITION_LIFECYCLE_UNREADABLE
+            if record is None:
+                return -1, -1, DISPOSITION_LIFECYCLE_ABSENT
+            generation = getattr(record, "lane_generation", None)
+            revision = getattr(record, "revision", None)
+        if not all(
+            isinstance(value, int) and not isinstance(value, bool) and value > 0
+            for value in (generation, revision)
+        ):
+            return -1, -1, DISPOSITION_LIFECYCLE_PINS_INVALID
+        return generation, revision, ""
 
     def _rows(self) -> Sequence[Mapping[str, object]]:
         if self.rows_reader is not None:
@@ -297,6 +393,10 @@ class SublaneQuarantineInspectUseCase:
             approval_reason=reason,
             receiver_present=receiver_present,
             inspection_detail=detail,
+            # Never a template: a discovery refusal proves nothing about either rail.
+            disposition_reason=_REFUSAL_TO_DISPOSITION.get(
+                reason, DISPOSITION_INVENTORY_UNREADABLE
+            ),
         )
 
     def run(self, request: QuarantineInspectRequest) -> QuarantineInspectOutcome:
@@ -394,6 +494,9 @@ class SublaneQuarantineInspectUseCase:
             composer_readable=bool(inspection.signal.inventory_readable),
             duplicate_receiver=False,
         )
+        disposition_facts, disposition_reason = self._disposition(
+            facts=facts, classification=classification, inspection=inspection
+        )
         return QuarantineInspectOutcome(
             request=request,
             facts=facts,
@@ -404,7 +507,75 @@ class SublaneQuarantineInspectUseCase:
             approval_template=(
                 render_approval_template(facts) if reason == APPROVAL_READY else ""
             ),
+            disposition_facts=disposition_facts,
+            disposition_reason=disposition_reason,
+            disposition_template=(
+                render_disposition_template(disposition_facts)
+                if disposition_reason == DISPOSITION_READY
+                else ""
+            ),
         )
+
+    def _disposition(
+        self,
+        *,
+        facts: ApprovalFacts,
+        classification: PendingComposerClassification,
+        inspection: QuarantineInspection,
+    ) -> tuple[DispositionFacts, str]:
+        """The generation-mismatch disposition arm of the same single observation (#15193).
+
+        Built from the SAME snapshot the quarantine approval was decided on — never a second
+        read — so the two rails cannot disagree about what is live. The lane pins are the one
+        extra read, and they are lane-scoped rather than receiver-scoped, so they cannot
+        reintroduce receiver drift between the two verdicts.
+
+        ``pending_effect`` is always :data:`PENDING_EFFECT_DISCARDED_ON_REPLACE` for a ready
+        disposition: the actuation replaces the receiver, so the unsent input it holds IS
+        lost. Naming that effect on the approval is the acceptance criterion — the operator
+        approves a discard explicitly or not at all.
+        """
+        lane_generation, lifecycle_revision, lifecycle_reason = self._lane_pins(
+            facts.workspace_id, facts.lane
+        )
+        signal = inspection.signal
+        disposition_facts = DispositionFacts(
+            issue=facts.issue,
+            lane=facts.lane,
+            role=facts.role,
+            workspace_id=facts.workspace_id,
+            assigned_name=facts.assigned_name,
+            locator=facts.locator,
+            agent_revision=facts.agent_revision,
+            lane_generation=lane_generation,
+            lifecycle_revision=lifecycle_revision,
+            attested_at=facts.attested_at,
+            action_generation=facts.action_generation,
+            generation_axes=classification.generation_axes,
+            pending_identity=pending_identity(
+                pending_observed=classification.pending_observed,
+                correlated_marker_ids=signal.correlated_marker_ids,
+                provider_generation=inspection.composer_generation,
+            ),
+            pending_effect=PENDING_EFFECT_DISCARDED_ON_REPLACE,
+            observed_at=facts.observed_at,
+        )
+        reason = decide_disposition_readiness(
+            facts=disposition_facts,
+            classification=classification,
+            receiver_present=inspection.receiver_present,
+            inventory_readable=True,
+            composer_readable=bool(signal.inventory_readable),
+            # From the RAW agent state, not the label: `generation_mismatch` outranks
+            # `agent_working` in the classifier precedence, so a mid-turn worker on a
+            # mismatched receiver never carries the `agent_working` label and would
+            # otherwise be handed a disposition template while it is still running.
+            agent_working=agent_state_is_working(signal.agent_state),
+            agent_settled=disposition_agent_state_settled(signal.agent_state),
+            duplicate_receiver=False,
+            lifecycle_reason=lifecycle_reason,
+        )
+        return disposition_facts, reason
 
     def _inspect(
         self,
@@ -451,18 +622,36 @@ def format_inspect_text(outcome: QuarantineInspectOutcome) -> str:
         f"action_generation: {facts.action_generation or '-'}",
         f"observed_at: {facts.observed_at}",
         f"classification: {outcome.classification.label}",
+        f"generation_axes: {','.join(outcome.classification.generation_axes) or '-'}",
+        f"pending_observed: {outcome.classification.pending_observed}",
         f"q_enter_recommended: {outcome.classification.q_enter_recommended}",
         f"receiver_present: {outcome.receiver_present}",
         f"inspection_detail: {outcome.inspection_detail or '-'}",
         f"approval_ready: {outcome.approval_ready}",
         f"approval_reason: {outcome.approval_reason}",
+        f"disposition_ready: {outcome.disposition_ready}",
+        f"disposition_reason: {outcome.disposition_reason or '-'}",
     ]
     if outcome.approval_ready:
         lines += ["", "--- paste into the approval journal ---", outcome.approval_template]
+    elif outcome.disposition_ready:
+        # The #15193 convergence: quarantine is genuinely not applicable to this receiver,
+        # but the disposition rail is — so the operator gets an actionable template instead
+        # of the `not_quarantine_candidate` dead end that stalled #15110 / #15140 / #15195.
+        lines += [
+            "",
+            f"quarantine approval is not applicable ({outcome.approval_reason}); this "
+            "receiver converges through the generation-mismatch disposition rail instead.",
+            "",
+            "--- paste into the approval journal ---",
+            outcome.disposition_template,
+        ]
     else:
         lines += [
             "",
             f"positive owner approval cannot be built: {outcome.approval_reason}",
+            f"generation-mismatch disposition is also unavailable: "
+            f"{outcome.disposition_reason or '-'}",
         ]
     return "\n".join(lines)
 
@@ -486,10 +675,15 @@ def register_sublane_quarantine_inspect_parser(sublane_sub: Any) -> None:
     parser = sublane_sub.add_parser(
         "quarantine-inspect",
         help=(
-            "Redmine #14234: read-only. Report the exact assigned name / locator / agent "
-            "revision / attested generation / quarantine action id for one lane role, and "
-            "render the pasteable generation-bound owner approval when the observation "
-            "supports one. Emits no composer body, hash, length, path or credential."
+            "Redmine #14234 / #15193: read-only. Report the exact assigned name / locator / "
+            "agent revision / attested generation / quarantine action id / generation "
+            "mismatch axes for one lane role, and render the pasteable generation-bound "
+            "owner approval when the observation supports one. When the receiver carries a "
+            "generation mismatch AND a real pending composer input — the state where "
+            "quarantine reports not_quarantine_candidate while hibernate blocks on "
+            "composer_pending_real — it renders the generation-mismatch disposition "
+            "approval instead, which names what becomes of the pending input. Emits no "
+            "composer body, hash, length, path or credential."
         ),
     )
     for flag, dest, help_text in (

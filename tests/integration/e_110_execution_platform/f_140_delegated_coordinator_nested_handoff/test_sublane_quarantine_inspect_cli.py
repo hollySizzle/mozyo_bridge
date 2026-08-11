@@ -75,7 +75,7 @@ def _inspection(**kw) -> QuarantineInspection:
     signal = PendingComposerSignal(
         inventory_readable=True,
         has_pending=True,
-        agent_state="idle",
+        agent_state="awaiting_input",
         identity_attested=True,
         generation_matches=True,
     )
@@ -85,6 +85,7 @@ def _inspection(**kw) -> QuarantineInspection:
         row_revision=REVISION,
         attested_at=ATTESTED_AT,
         receiver_present=True,
+        composer_generation="opaque-provider-draft-generation-1",
         detail="classified_without_persisting_composer_body",
     )
     base.update(kw)
@@ -92,7 +93,7 @@ def _inspection(**kw) -> QuarantineInspection:
 
 
 @contextlib.contextmanager
-def _live(rows=None, inspection=None):
+def _live(rows=None, inspection=None, lifecycle=(1, 9)):
     """Patch only the two live seams: the workspace scope and the use case's collaborators."""
     rows = [{"name": NAME, "pane_id": LOCATOR, "revision": REVISION}] if rows is None else rows
     real_init = inspect_module.SublaneQuarantineInspectUseCase.__init__
@@ -100,6 +101,7 @@ def _live(rows=None, inspection=None):
     def _init(self, **kw):
         kw.setdefault("rows_reader", lambda: rows)
         kw.setdefault("ops_factory", lambda _rows: _FakeOps(inspection or _inspection()))
+        kw.setdefault("lifecycle_reader", lambda _workspace, _lane: lifecycle)
         real_init(self, **kw)
 
     with mock.patch.object(inspect_module, "repo_scope_workspace_id", return_value=WS), \
@@ -193,6 +195,24 @@ class ApprovalRoundTripTest(unittest.TestCase):
         self.assertEqual(parsed.issue, ISSUE)
         self.assertEqual(parsed.lane, LANE)
         self.assertEqual(parsed.role, ROLE)
+
+    def test_disposition_round_trip_carries_both_lifecycle_pins(self):
+        mismatch = PendingComposerSignal(
+            inventory_readable=True,
+            has_pending=True,
+            agent_state="awaiting_input",
+            identity_attested=True,
+            generation_matches=False,
+            generation_axes=("pair",),
+        )
+        with _live(inspection=_inspection(signal=mismatch), lifecycle=(3, 11)):
+            _, out = _run(ARGV + ["--json"])
+        rendered = json.loads(out)["disposition"]["disposition_command"][1:]
+        rendered[rendered.index("--journal") + 1] = "103052"
+        parsed = build_parser().parse_args(rendered)
+        self.assertEqual(parsed.approved_lane_generation, 3)
+        self.assertEqual(parsed.approved_lifecycle_revision, 11)
+        self.assertTrue(parsed.execute)
 
     def test_every_required_execute_flag_is_supplied_by_the_template(self):
         with _live():

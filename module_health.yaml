@@ -1466,6 +1466,80 @@ allowlist:
     resolution_version: "v0.12.0 (Version #301 ワークフロー単一ステップ実行入口整備枠)"
     expires: "2027-10-08"
 
+  - path: src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_quarantine.py
+    lines: 1222
+    reason: >-
+      Already at 986 lines before #15193 — 14 under the threshold, so any material
+      addition crosses it. #15193 adds the generation-mismatch disposition rail that
+      breaks the #15110 / #15140 / #15195 deadlock (a stopped receiver carrying BOTH a
+      generation mismatch and a real pending composer could be converged by no supported
+      rail: hibernate blocked on `composer_pending_real` and pointed at quarantine, which
+      answered `not_quarantine_candidate`). Everything separable was separated rather
+      than parked here: the pure decision vocabulary lives in
+      `domain/generation_mismatch_disposition.py`, and the action-time drift
+      re-verification plus the CLI token registration live in the new sibling
+      `sublane_quarantine_disposition.py`. What remains in this module is only what
+      cannot leave it — the five `QuarantineRequest` approval fields, the four-axis
+      decomposition of `generation_ok` inside the live inspector (it needs `_cwd_matches`
+      / `_pair_ok`), and the single `_approval_stale_reason` branch that routes to the
+      disposition gate. The accepted High correction in #15193 j#103051-j#103053 also
+      requires the shared lifecycle incarnation to be re-read at every effect boundary:
+      before opening the replacement CAS, an owed close, a partial replay launch, and its
+      completion CAS. The typed pin policy and CLI registration remain in the existing
+      `sublane_quarantine_disposition.py` split; only the orchestration-site returns remain
+      here because moving them would duplicate or bypass the existing replacement state
+      machine.
+      Follow-up #15244 owns the concrete remaining decomposition: extracting
+      `LiveSublaneQuarantineOps`
+      (~300 lines) into its own adapter module, per the adapter-boundary policy. That was
+      attempted during this issue and REVERTED: the class owns the provider globals that
+      `mock.patch` targets across several suites, and retargeting them reached
+      `tests/regressions/test_issue_14539_review_exemption_projection.py`, which is on
+      #15166's active changed-path list — an overlap j#102219 forbids editing without a
+      recorded design consultation. Deferring the split is the scope-boundary-respecting
+      choice, not an unbounded one: it is a mechanical move plus patch-target updates once
+      #15166 has integrated.
+    owner_issue: "#15244"
+    resolution_version: "v0.12.0 (Version #276 OOP-first architecture and static typing)"
+    expires: "2027-11-15"
+
+  - path: src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_session_start.py
+    lines: 1018
+    reason: >-
+      Re-added by Redmine #15190 (nested-workspace alias / launch-disable).
+      The file was at EXACTLY 1000 — the threshold itself — before this change, so
+      it had zero headroom and any addition at all crosses it. #15190 needs the
+      rail on BOTH launch entries: `prepare_session` (the public one, where the
+      refusal must land ahead of the home lock, binary resolution and the
+      capability probe so a decline is zero-side-effect) and
+      `_prepare_session_locked` (the one every launch actually reaches — the v1
+      replacement driver calls it directly with `admission_lock_held=True` to
+      avoid re-entering the lock wrapper, so a rail only on the public entry is
+      bypassed by exactly the live replacement path; review j#102107 Finding 4).
+      Re-applying is idempotent: a canonical root declares nothing, so an
+      already-folded root resolves to itself. The addition is two import lines
+      and two call lines, plus the action-time identity binding the alias decision
+      owes its launch (#15190 review j#102641 F1) and the public-to-private hand-off
+      of that binding (review j#102710 r6f1 — the canonical root declares nothing,
+      so the private entry cannot re-derive it), plus the docstring paragraph recording why the
+      duplication is deliberate — without it a later reader would "clean up" the
+      second call and silently restore the bypass. The decision body, its typed
+      refusals and its operator guidance all live in the new cohesive sibling
+      `e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_session_start_alias.py`,
+      and the pure model / store / use case live under
+      `e_110_execution_platform/f_110_workspace_session_identity/`.
+      A reduction is deliberately NOT bundled here: the two candidates measured
+      were `_resolve_binary_or_die` (imported by ~10 modules and monkeypatched by
+      name in 5 test modules — high blast radius) and `_coordinator_launch_lock`
+      (cohesive with `herdr_pane_lifecycle.py`, but that sibling is already 951
+      lines and would land at ~985, leaving it no headroom of its own).
+      Refactoring launch-critical code inside a Bug lane, mid review cycle, is
+      disproportionate risk for a +2-line fix; the reduction is deferred to a
+      follow-up under this issue's Version.
+    owner_issue: "#15190"
+    resolution_version: "v0.12.0 (Version #301 ワークフロー単一ステップ実行入口整備枠)"
+    expires: "2027-10-08"
+
 
 # sublane_actuator_herdr_ops.py was allowlisted at a 1029-line baseline (owner_issue
 # #13847). Redmine #14258 removed the entry by carrying out a reduction rather than

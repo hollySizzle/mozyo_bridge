@@ -152,7 +152,9 @@ class ClassificationTest(unittest.TestCase):
 class BodyFenceTest(unittest.TestCase):
     def test_signal_carries_no_composer_body_field(self) -> None:
         # Contract 8: the pure classifier boundary exposes fixed classification facts
-        # only — no body, hash, length, or excerpt field exists to persist.
+        # only — no body, hash, length, or excerpt field exists to persist. Redmine #15193
+        # adds `generation_axes`, a tuple drawn from a closed axis vocabulary, which keeps
+        # the fence: it names WHICH generation check failed, never any observed value.
         fields = {f.name for f in dataclasses.fields(PendingComposerSignal)}
         self.assertEqual(
             fields,
@@ -164,6 +166,7 @@ class BodyFenceTest(unittest.TestCase):
                 "generation_matches",
                 "correlated_marker_ids",
                 "correlation_ambiguous",
+                "generation_axes",
             },
         )
 
@@ -179,10 +182,130 @@ class BodyFenceTest(unittest.TestCase):
                 "q_enter_recommended",
                 "quarantine_candidate",
                 "blocked",
+                "pending_observed",
+                "generation_axes",
+                "generation_mismatch_with_pending",
             },
         )
         # The only free-form value is a delivery-marker identity we already own.
         self.assertEqual(payload["correlated_marker_id"], MARKER)
+
+
+class CoObservedFactsTest(unittest.TestCase):
+    """Redmine #15193: a losing precedence branch must stop discarding what it observed."""
+
+    def test_generation_mismatch_still_reports_the_pending_fact(self) -> None:
+        # THE #15193 defect: this receiver holds a real unsent input, but the collapsed
+        # label said only `generation_mismatch`, so quarantine-inspect reported
+        # `not_quarantine_candidate` while hibernate blocked on `composer_pending_real`.
+        result = classify_pending_composer(
+            _signal(generation_matches=False, has_pending=True, generation_axes=("pair",))
+        )
+        self.assertEqual(result.label, GENERATION_MISMATCH)
+        # The verdict is unchanged — no candidacy is widened.
+        self.assertFalse(result.quarantine_candidate)
+        # ...but the co-observed facts now survive.
+        self.assertTrue(result.pending_observed)
+        self.assertEqual(result.generation_axes, ("pair",))
+        self.assertTrue(result.generation_mismatch_with_pending)
+
+    def test_generation_mismatch_preserves_one_known_marker_for_q_enter(self) -> None:
+        result = classify_pending_composer(
+            _signal(
+                generation_matches=False,
+                correlated_marker_ids=(MARKER,),
+                generation_axes=("pair",),
+            )
+        )
+        # The historical precedence label remains stable, but the losing marker branch is an
+        # authority fact: this input belongs to q-enter and can never become a discard candidate.
+        self.assertEqual(result.label, GENERATION_MISMATCH)
+        self.assertEqual(result.correlated_marker_id, MARKER)
+        self.assertTrue(result.q_enter_recommended)
+        self.assertFalse(result.generation_mismatch_with_pending)
+        self.assertFalse(result.blocked)
+
+    def test_generation_mismatch_with_ambiguous_markers_stays_blocked(self) -> None:
+        signals = (
+            _signal(
+                generation_matches=False,
+                correlated_marker_ids=(MARKER, OTHER_MARKER),
+                generation_axes=("pair",),
+            ),
+            _signal(
+                generation_matches=False,
+                correlated_marker_ids=(MARKER,),
+                correlation_ambiguous=True,
+                generation_axes=("pair",),
+            ),
+        )
+        for signal in signals:
+            with self.subTest(signal=signal):
+                result = classify_pending_composer(signal)
+                self.assertEqual(result.label, GENERATION_MISMATCH)
+                self.assertEqual(result.correlated_marker_id, "")
+                self.assertFalse(result.q_enter_recommended)
+                self.assertFalse(result.generation_mismatch_with_pending)
+                self.assertTrue(result.blocked)
+
+    def test_generation_mismatch_never_q_enters_a_marker_without_positive_pending(self) -> None:
+        for has_pending in (False, None):
+            with self.subTest(has_pending=has_pending):
+                result = classify_pending_composer(
+                    _signal(
+                        generation_matches=False,
+                        has_pending=has_pending,
+                        correlated_marker_ids=(MARKER,),
+                        generation_axes=("pair",),
+                    )
+                )
+                self.assertEqual(result.label, GENERATION_MISMATCH)
+                self.assertEqual(result.correlated_marker_id, "")
+                self.assertFalse(result.q_enter_recommended)
+                self.assertFalse(result.generation_mismatch_with_pending)
+                self.assertTrue(result.blocked)
+
+    def test_generation_mismatch_without_pending_is_not_the_disposition_shape(self) -> None:
+        result = classify_pending_composer(
+            _signal(generation_matches=False, has_pending=False, generation_axes=("identity",))
+        )
+        self.assertEqual(result.label, GENERATION_MISMATCH)
+        self.assertFalse(result.generation_mismatch_with_pending)
+
+    def test_unreadable_composer_is_never_the_disposition_shape(self) -> None:
+        # An unprovable pending fact must not open a path that could discard it.
+        result = classify_pending_composer(
+            _signal(generation_matches=False, has_pending=None, generation_axes=("pair",))
+        )
+        self.assertEqual(result.label, GENERATION_MISMATCH)
+        self.assertIsNone(result.pending_observed)
+        self.assertFalse(result.generation_mismatch_with_pending)
+
+    def test_axes_are_canonically_ordered_and_unknown_tokens_dropped(self) -> None:
+        result = classify_pending_composer(
+            _signal(
+                generation_matches=False,
+                generation_axes=("pair", "identity", "not_a_real_axis"),
+            )
+        )
+        self.assertEqual(result.generation_axes, ("identity", "pair"))
+
+    def test_axes_are_not_reported_on_a_label_they_did_not_decide(self) -> None:
+        # The generation matched, so any axis tuple the adapter passed describes nothing
+        # live; reporting it would invite reading a spent observation as evidence.
+        result = classify_pending_composer(
+            _signal(generation_matches=True, generation_axes=("pair",))
+        )
+        self.assertEqual(result.label, UNCORRELATED)
+        self.assertEqual(result.generation_axes, ())
+
+    def test_inventory_unreadable_outranks_the_mismatch_and_reports_no_axes(self) -> None:
+        result = classify_pending_composer(
+            _signal(inventory_readable=False, generation_matches=False, generation_axes=("pair",))
+        )
+        self.assertEqual(result.label, INVENTORY_UNREADABLE)
+        self.assertEqual(result.generation_axes, ())
+        self.assertFalse(result.generation_mismatch_with_pending)
 
 
 if __name__ == "__main__":

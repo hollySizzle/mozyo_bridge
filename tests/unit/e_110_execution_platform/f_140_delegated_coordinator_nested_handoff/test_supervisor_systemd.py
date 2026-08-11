@@ -6,15 +6,15 @@ subprocess call goes through an injected fake runner, and temp roots stand in fo
 kept **distinct**. These pin the Linux adapter's contract as the updated issue body defines it
 (scope correction j#101996, review findings j#102000) —
 
-- **one** owned service + **one** owned timer, ticking ``--run-once`` every 60s. There is no second
-  cadence, no ``--drain-only`` unit, and no atomic pair install: those were removed from the
-  acceptance contract, and a test here fails if they come back;
-- a 60s tick is not a 60s Redmine poll — the provider cadence stays the supervisor body's own ~300s
+- **one** owned service + **one** owned timer, ticking ``--run-once`` on the shared portable OS
+  cadence (#15192). There is no second cadence, no ``--drain-only`` unit, and no atomic pair
+  install: those were removed from the acceptance contract, and a test here fails if they come back;
+- the OS tick is not a Redmine poll — the provider cadence stays the supervisor body's own ~300s
   watermark, which this adapter surfaces but never sets;
 - unit structure: ``Type=oneshot`` with **no** ``Restart=`` / ``RemainAfterExit=`` (the KeepAlive
   equivalent is structurally absent), **no** ``Environment=`` / ``EnvironmentFile=``, no
   ``[Install]`` on the service (only the timer is enabled), and ``OnActiveSec=0s`` +
-  ``OnUnitActiveSec=60s`` as the run-at-load + fixed-interval pair;
+  ``OnUnitActiveSec=<portable default>s`` as the run-at-load + fixed-interval pair;
 - ``ExecStart`` is the exact PATH-resolved absolute executable argv with the resolved mozyo home
   pinned as ``--home``, systemd-quoted per token and round-tripping back to the same argv;
 - **an unconfigured / incomplete / unsafe Redmine credential does NOT block installing the timer**
@@ -31,7 +31,10 @@ Live systemd operation is recorded as a separate installed-artifact smoke on the
 
 from __future__ import annotations
 
+import contextlib
 import inspect
+import io
+import json
 import os
 import sys
 import tempfile
@@ -42,11 +45,15 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mozyo_bridge.application.cli import build_parser
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
     supervisor_service_backend as sb,
     supervisor_systemd as ss,
+    supervisor_systemd_fs as systemd_fs,
+    supervisor_systemd_manager as systemd_manager,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
+    DEFAULT_OS_TICK_INTERVAL_SECONDS,
     DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
 )
 from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_context import (
@@ -88,15 +95,22 @@ class FakeRunner:
     non-zero result for a given systemctl verb. Everything else succeeds.
     """
 
-    def __init__(self, *, show_map=None, fail_verbs=(), manager_available=True) -> None:
+    def __init__(
+        self, *, os_home=None, show_map=None, fail_verbs=(), manager_available=True,
+        manager_overrides=None,
+    ) -> None:
         self.calls: list[list[str]] = []
+        self._os_home = os_home
         self._show_map = show_map or {}
         self._fail_verbs = set(fail_verbs)
         self._manager_available = manager_available
+        self._manager_overrides = manager_overrides or {}
 
     def __call__(self, argv):
         argv = list(argv)
         self.calls.append(argv)
+        if argv and argv[0] == "busctl":
+            return self._busctl(argv)
         verb = argv[2] if len(argv) > 2 else ""  # argv is ["systemctl", "--user", <verb>, ...]
         if verb == "show":
             if any(a.startswith("--property=Version") for a in argv):
@@ -106,9 +120,70 @@ class FakeRunner:
             return _result(1, stderr="redacted")
         return _result(0)
 
+    @staticmethod
+    def _json(signature, data):
+        return _result(0, json.dumps({"type": signature, "data": data}))
+
+    def _busctl(self, argv):
+        if not self._manager_available:
+            return _result(1)
+        operation = argv[3] if len(argv) > 3 else ""
+        if operation == "call":
+            unit = argv[-1]
+            escaped = unit.replace("-", "_2d").replace(".", "_2e")
+            return self._json("o", [f"/org/freedesktop/systemd1/unit/{escaped}"])
+        prop = argv[-1]
+        if prop in self._manager_overrides:
+            signature, data = self._manager_overrides[prop]
+            return self._json(signature, data)
+        if prop == "Version":
+            return self._json("s", "test-systemd")
+        units = ss._read_units(self._os_home)
+        service_argv = ss._installed_command(ss._parse_unit_keys(units.service_payload)) or []
+        interval = ss._installed_interval_seconds(ss._parse_unit_keys(units.timer_payload)) or 0
+        service_path = os.path.abspath(os.fspath(ss.service_unit_path(self._os_home)))
+        timer_path = os.path.abspath(os.fspath(ss.timer_unit_path(self._os_home)))
+        empty_exec = (systemd_manager._EXEC_SIGNATURE, [])
+        properties = {
+            "FragmentPath": (
+                "s", service_path if "service" in argv[5] else timer_path
+            ),
+            "DropInPaths": ("as", []),
+            "NeedDaemonReload": ("b", False),
+            "Type": ("s", "oneshot"),
+            "RemainAfterExit": ("b", False),
+            "Restart": ("s", "no"),
+            "Environment": ("as", []),
+            "EnvironmentFiles": ("a(sb)", []),
+            "PassEnvironment": ("as", []),
+            "UnsetEnvironment": ("as", list(ss.MASKED_MANAGER_ENVIRONMENT)),
+            "ExecStart": (
+                systemd_manager._EXEC_SIGNATURE,
+                [[service_argv[0], service_argv, False, *([0] * 7)]] if service_argv else [],
+            ),
+            "ExecCondition": empty_exec,
+            "ExecStartPre": empty_exec,
+            "ExecStartPost": empty_exec,
+            "ExecReload": empty_exec,
+            "ExecReloadPost": empty_exec,
+            "ExecStop": empty_exec,
+            "ExecStopPost": empty_exec,
+            "Unit": ("s", ss.SERVICE_UNIT_NAME),
+            "TimersMonotonic": (
+                "a(stt)",
+                [["OnActiveUSec", 0, 0], ["OnUnitActiveUSec", interval * 1_000_000, 0]],
+            ),
+            "TimersCalendar": ("a(sst)", []),
+            "Persistent": ("b", False),
+            "RandomizedDelayUSec": ("t", 0),
+            "OnClockChange": ("b", False),
+            "OnTimezoneChange": ("b", False),
+        }
+        return self._json(*properties[prop]) if prop in properties else _result(1)
+
     @property
     def verbs(self) -> list[str]:
-        return [c[2] for c in self.calls if len(c) > 2]
+        return [c[2] for c in self.calls if len(c) > 2 and c[0] == "systemctl"]
 
 
 def _timer_show(
@@ -172,11 +247,12 @@ class _LinuxCase(unittest.TestCase):
 
     def _runner(self, **kwargs) -> FakeRunner:
         """A runner whose owned timer reports active+enabled (the installed-and-scheduled case)."""
+        os_home = kwargs.pop("os_home", self.os_home)
         show_map = kwargs.pop("show_map", None) or {
             ss.SUPERVISOR_UNIT.timer_unit: _timer_show(),
             ss.SUPERVISOR_UNIT.service_unit: _service_show(),
         }
-        return FakeRunner(show_map=show_map, **kwargs)
+        return FakeRunner(os_home=os_home, show_map=show_map, **kwargs)
 
     def _install(self, *, runner=None, interval=None, credential=True) -> dict:
         if credential:
@@ -224,7 +300,10 @@ class SingleOwnedUnitTest(_LinuxCase):
 
     def test_installing_writes_exactly_two_files(self) -> None:
         self._install()
-        written = sorted(p.name for p in ss.unit_dir(self.os_home).iterdir())
+        written = sorted(
+            p.name for p in ss.unit_dir(self.os_home).iterdir()
+            if p.name.endswith((".service", ".timer"))
+        )
         self.assertEqual(written, sorted([ss.SERVICE_UNIT_NAME, ss.TIMER_UNIT_NAME]))
 
     def test_the_scheduled_command_is_run_once(self) -> None:
@@ -232,19 +311,26 @@ class SingleOwnedUnitTest(_LinuxCase):
 
 
 # ---------------------------------------------------------------------------
-# Cadence: a 60s OS tick, with the Redmine cadence left to the supervisor body.
+# Cadence: the shared portable OS tick, with the Redmine cadence left to the supervisor body.
 # ---------------------------------------------------------------------------
 
 
 class TickCadenceTest(_LinuxCase):
-    def test_the_default_os_tick_is_sixty_seconds(self) -> None:
-        self.assertEqual(ss.DEFAULT_TICK_INTERVAL_SECONDS, 60)
-        self.assertIn("OnUnitActiveSec=60s", ss.render_timer_unit())
+    def test_the_default_os_tick_is_the_shared_portable_default(self) -> None:
+        # 180 is the measured portable default (#15192), and it is the SAME value the macOS adapter
+        # registers at — one operator-facing cadence knob, not a per-OS number. The literal is
+        # pinned here so a silent drift back to a private value fails.
+        self.assertEqual(ss.DEFAULT_TICK_INTERVAL_SECONDS, DEFAULT_OS_TICK_INTERVAL_SECONDS)
+        self.assertEqual(DEFAULT_OS_TICK_INTERVAL_SECONDS, 180)
+        self.assertIn("OnUnitActiveSec=180s", ss.render_timer_unit())
 
     def test_the_tick_cadence_is_not_the_redmine_cadence(self) -> None:
-        # The acceptance contract: tick every 60s, but read Redmine on the existing ~300s cadence.
-        # This adapter must not conflate them by scheduling the provider interval on the timer.
+        # The acceptance contract: tick on the OS cadence, but read Redmine on the existing ~300s
+        # cadence. This adapter must not conflate them by scheduling the provider interval on the
+        # timer, and the tick must stay strictly finer so a due watermark is never made to wait a
+        # whole extra period for an aligned tick.
         self.assertNotEqual(ss.DEFAULT_TICK_INTERVAL_SECONDS, DEFAULT_RECONCILIATION_INTERVAL_SECONDS)
+        self.assertLess(ss.DEFAULT_TICK_INTERVAL_SECONDS, DEFAULT_RECONCILIATION_INTERVAL_SECONDS)
         self.assertEqual(DEFAULT_RECONCILIATION_INTERVAL_SECONDS, 300)
 
     def test_the_adapter_does_not_set_or_enforce_the_provider_cadence(self) -> None:
@@ -299,8 +385,78 @@ class UnitRenderingTest(_LinuxCase):
 
     def test_the_service_unit_carries_no_environment_block(self) -> None:
         text = self._service_text()
-        self.assertNotIn("Environment=", text)
-        self.assertNotIn("EnvironmentFile=", text)
+        lines = text.splitlines()
+        self.assertFalse(any(line.startswith("Environment=") for line in lines))
+        self.assertFalse(any(line.startswith("EnvironmentFile=") for line in lines))
+        self.assertIn(
+            f"UnsetEnvironment={' '.join(ss.MASKED_MANAGER_ENVIRONMENT)}", text
+        )
+
+    def test_manager_global_redmine_environment_is_masked_without_value_exposure(self) -> None:
+        self.assertEqual(
+            ss.MASKED_MANAGER_ENVIRONMENT,
+            ("MOZYO_REDMINE_API_KEY", "MOZYO_REDMINE_URL"),
+        )
+        self.assertNotIn("MOZYO_REDMINE_DELIVERY_WRITE", ss.MASKED_MANAGER_ENVIRONMENT)
+        secret = "manager-global-secret-sentinel"
+        manager_environment = {
+            name: f"{secret}-{index}"
+            for index, name in enumerate(ss.MASKED_MANAGER_ENVIRONMENT)
+        }
+        with patch.dict(os.environ, manager_environment, clear=False):
+            text = self._service_text()
+            readiness = ss.classify_credential_readiness(mozyo_home=self.mozyo_home)
+        self.assertEqual(readiness, ss.CREDENTIAL_MISSING)
+        self.assertIn(
+            f"UnsetEnvironment={' '.join(ss.MASKED_MANAGER_ENVIRONMENT)}", text
+        )
+        self.assertNotIn(secret, repr({"unit": text, "readiness": readiness}))
+
+    def test_manager_global_secret_never_reaches_status_or_cli_text_and_json(self) -> None:
+        secret = "manager-global-secret-sentinel"
+        manager_environment = {
+            API_KEY_ENV: f"{secret}-key",
+            BASE_URL_ENV: f"https://{secret}.invalid",
+        }
+        runner = self._runner()
+        installed = self._install(runner=runner, credential=False)
+        self.assertTrue(installed["performed"], installed)
+
+        def backend_status(*, mozyo_home=None, **_kwargs):
+            row = ss.service_status(
+                os_home=self.os_home,
+                mozyo_home=mozyo_home,
+                runner=runner,
+                which=_which_found,
+            )
+            return sb._envelope("service_status", sb.BACKEND_SYSTEMD, row)  # noqa: SLF001
+
+        with patch.dict(os.environ, manager_environment, clear=False):
+            status = backend_status(mozyo_home=self.mozyo_home)
+            outputs = []
+            for as_json in (False, True):
+                argv = [
+                    "workflow",
+                    "supervisor",
+                    "--service-status",
+                    "--home",
+                    str(self.mozyo_home),
+                ]
+                if as_json:
+                    argv.append("--json")
+                args = build_parser().parse_args(argv)
+                buffer = io.StringIO()
+                with patch.object(
+                    sb, "service_status", side_effect=backend_status
+                ), contextlib.redirect_stdout(buffer):
+                    self.assertEqual(int(args.func(args) or 0), 0)
+                outputs.append(buffer.getvalue())
+
+        self.assertEqual(status["agents"][0]["credential_readiness"], ss.CREDENTIAL_MISSING)
+        self.assertNotIn(secret, repr(status))
+        self.assertNotIn(secret, json.dumps(status))
+        for output in outputs:
+            self.assertNotIn(secret, output)
 
     def test_the_service_unit_has_no_install_section(self) -> None:
         # Only the TIMER is enabled. A directly enabled service would run once at login and never
@@ -416,6 +572,206 @@ class UnitDirectoryTest(_LinuxCase):
         # A relative XDG value is not something the user manager resolves from our cwd.
         with patch.dict(os.environ, {"XDG_CONFIG_HOME": "relative/cfg"}, clear=False):
             self.assertEqual(ss.unit_dir(), Path.home() / ".config/systemd/user")
+
+    def test_the_xdg_value_is_read_exactly_as_set(self) -> None:
+        # Review j#102378 finding r7f3. The value was trimmed before the absolute test, which broke
+        # the XDG Base Directory Specification in both directions at once: a value that is NOT
+        # absolute (and which the spec says to treat as invalid and ignore) was promoted to a valid
+        # root, and an absolute path naming a directory whose name ends in a space was redirected to
+        # a different directory. This is not cosmetic — `install` writes the unit files into what
+        # this returns and `uninstall` unlinks from it.
+        cases = (
+            (" /tmp/mozyo-xdg", Path.home() / ".config/systemd/user", "leading space: not absolute"),
+            ("\t/tmp/mozyo-xdg", Path.home() / ".config/systemd/user", "leading tab: not absolute"),
+            ("   ", Path.home() / ".config/systemd/user", "whitespace only: not absolute"),
+            ("/tmp/mozyo-xdg ", Path("/tmp/mozyo-xdg /systemd/user"), "trailing space is part of it"),
+            ("/tmp/mozyo-xdg", Path("/tmp/mozyo-xdg/systemd/user"), "the ordinary absolute case"),
+        )
+        for raw, expected, why in cases:
+            with patch.dict(os.environ, {"XDG_CONFIG_HOME": raw}, clear=False):
+                self.assertEqual(ss.unit_dir(), expected, why)
+
+    def test_an_empty_or_unset_xdg_config_home_selects_the_default(self) -> None:
+        # The spec's only two triggers for the default. Empty must not be confused with invalid:
+        # both land on the default here, but for different documented reasons.
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": ""}, clear=False):
+            self.assertEqual(ss.unit_dir(), Path.home() / ".config/systemd/user")
+        env = dict(os.environ)
+        env.pop("XDG_CONFIG_HOME", None)
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(ss.unit_dir(), Path.home() / ".config/systemd/user")
+
+    def test_install_and_uninstall_touch_only_the_raw_authority_path(self) -> None:
+        # The end-to-end consequence: a padded XDG value must not make install create units in — or
+        # uninstall delete units from — a directory the raw value never named. `Path.home` is
+        # redirected to a temp root so the ignored-value fallback stays inside the fixture.
+        ignored = self.os_home / "cfg"
+        fallback_home = self.os_home / "home"
+        # The filesystem boundary deliberately takes the user home itself as its trusted root.
+        # A real Path.home() exists; make the synthetic root equally truthful before pinning the
+        # components below it no-follow.
+        fallback_home.mkdir()
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": f" {ignored}"}, clear=False), \
+                patch.object(Path, "home", return_value=fallback_home):
+            result = ss.install(
+                mozyo_home=self.mozyo_home, runner=self._runner(os_home=fallback_home),
+                which=_which_found
+            )
+            self.assertTrue(result["performed"], result)
+            self.assertFalse(
+                (ignored / "systemd/user").exists(),
+                "a non-absolute XDG value must be ignored, not trimmed into a write target",
+            )
+            self.assertTrue((fallback_home / ".config/systemd/user" / ss.SERVICE_UNIT_NAME).exists())
+            ss.uninstall(runner=self._runner())
+            self.assertFalse(
+                (fallback_home / ".config/systemd/user" / ss.SERVICE_UNIT_NAME).exists()
+            )
+
+
+class PinnedUnitFilesystemTest(_LinuxCase):
+    """Systemd unit operations never escape or mutate an unidentified artifact (r15f1)."""
+
+    _MUTATING_VERBS = {
+        "daemon-reload", "enable", "disable", "stop", "restart", "reset-failed",
+    }
+
+    def _assert_no_manager_mutation(self, runner: FakeRunner) -> None:
+        self.assertEqual([], [verb for verb in runner.verbs if verb in self._MUTATING_VERBS])
+
+    def test_install_refuses_a_symlinked_ancestor_without_writing_beyond_it(self) -> None:
+        with tempfile.TemporaryDirectory() as outside_raw:
+            outside = Path(outside_raw)
+            (self.os_home / ".config").mkdir()
+            (self.os_home / ".config" / "systemd").symlink_to(
+                outside, target_is_directory=True
+            )
+            runner = self._runner()
+
+            result = ss.install(
+                os_home=self.os_home, mozyo_home=self.mozyo_home,
+                runner=runner, which=_which_found,
+            )
+
+            self.assertFalse(result["performed"])
+            self.assertEqual(ss.REASON_LIFECYCLE_LOCK_UNREADABLE, result["reason"])
+            self._assert_no_manager_mutation(runner)
+            self.assertEqual([], list(outside.iterdir()))
+
+    def test_install_refuses_a_service_symlink_and_preserves_its_victim(self) -> None:
+        with tempfile.TemporaryDirectory() as outside_raw:
+            outside = Path(outside_raw)
+            victim = outside / "victim.service"
+            sentinel = b"UNIT-SYMLINK-VICTIM-SENTINEL"
+            victim.write_bytes(sentinel)
+            unit_dir = ss.unit_dir(self.os_home)
+            unit_dir.mkdir(parents=True)
+            ss.service_unit_path(self.os_home).symlink_to(victim)
+            runner = self._runner()
+
+            result = ss.install(
+                os_home=self.os_home, mozyo_home=self.mozyo_home,
+                runner=runner, which=_which_found,
+            )
+
+            self.assertFalse(result["performed"])
+            self.assertEqual(ss.REASON_UNIT_UNREADABLE, result["reason"])
+            self._assert_no_manager_mutation(runner)
+            self.assertEqual(sentinel, victim.read_bytes())
+            self.assertFalse(ss.timer_unit_path(self.os_home).exists())
+
+    def test_install_refuses_a_hard_linked_timer_and_preserves_the_other_name(self) -> None:
+        with tempfile.TemporaryDirectory() as outside_raw:
+            outside = Path(outside_raw)
+            victim = outside / "victim.timer"
+            sentinel = b"UNIT-HARDLINK-VICTIM-SENTINEL"
+            victim.write_bytes(sentinel)
+            unit_dir = ss.unit_dir(self.os_home)
+            unit_dir.mkdir(parents=True)
+            os.link(victim, ss.timer_unit_path(self.os_home))
+            runner = self._runner()
+
+            result = ss.install(
+                os_home=self.os_home, mozyo_home=self.mozyo_home,
+                runner=runner, which=_which_found,
+            )
+
+            self.assertFalse(result["performed"])
+            self.assertEqual(ss.REASON_UNIT_UNREADABLE, result["reason"])
+            self._assert_no_manager_mutation(runner)
+            self.assertEqual(sentinel, victim.read_bytes())
+            self.assertFalse(ss.service_unit_path(self.os_home).exists())
+
+    def test_writer_revalidates_a_leaf_changed_after_lifecycle_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as outside_raw:
+            victim = Path(outside_raw) / "late-victim.service"
+            sentinel = b"ACTION-TIME-SYMLINK-VICTIM-SENTINEL"
+            victim.write_bytes(sentinel)
+            real_write_units = ss._write_units
+
+            def swap_then_write(service_payload, timer_payload, os_home):
+                ss.unit_dir(self.os_home).mkdir(parents=True, exist_ok=True)
+                ss.service_unit_path(self.os_home).symlink_to(victim)
+                return real_write_units(service_payload, timer_payload, os_home)
+
+            runner = self._runner(
+                show_map={
+                    ss.TIMER_UNIT_NAME: _timer_show(active="inactive"),
+                    ss.SERVICE_UNIT_NAME: _service_show(),
+                }
+            )
+            with patch.object(ss, "_write_units", swap_then_write):
+                result = ss.install(
+                    os_home=self.os_home, mozyo_home=self.mozyo_home,
+                    runner=runner, which=_which_found,
+                )
+
+            self.assertFalse(result["performed"])
+            self.assertEqual(ss.REASON_UNIT_UNREADABLE, result["reason"])
+            self._assert_no_manager_mutation(runner)
+            self.assertEqual(sentinel, victim.read_bytes())
+            self.assertTrue(ss.service_unit_path(self.os_home).is_symlink())
+            self.assertFalse(ss.timer_unit_path(self.os_home).exists())
+
+    def test_uninstall_refuses_an_unsafe_leaf_before_manager_mutation(self) -> None:
+        self._install()
+        with tempfile.TemporaryDirectory() as outside_raw:
+            victim = Path(outside_raw) / "victim.service"
+            sentinel = b"UNINSTALL-SYMLINK-VICTIM-SENTINEL"
+            victim.write_bytes(sentinel)
+            target = ss.service_unit_path(self.os_home)
+            target.unlink()
+            target.symlink_to(victim)
+            runner = self._runner()
+
+            result = ss.uninstall(os_home=self.os_home, runner=runner)
+
+            self.assertFalse(result["performed"])
+            self.assertEqual(ss.REASON_UNIT_UNREADABLE, result["reason"])
+            self.assertFalse(result["removed"])
+            self._assert_no_manager_mutation(runner)
+            self.assertEqual(sentinel, victim.read_bytes())
+            self.assertTrue(target.is_symlink())
+
+    def test_status_never_reads_bytes_through_an_unsafe_leaf(self) -> None:
+        with tempfile.TemporaryDirectory() as outside_raw:
+            sentinel = "STATUS-SYMLINK-SECRET-SENTINEL"
+            victim = Path(outside_raw) / "victim.service"
+            victim.write_text(sentinel, encoding="utf-8")
+            ss.unit_dir(self.os_home).mkdir(parents=True)
+            ss.service_unit_path(self.os_home).symlink_to(victim)
+            runner = self._runner()
+
+            status = ss.service_status(
+                os_home=self.os_home, mozyo_home=self.mozyo_home,
+                runner=runner, which=_which_found,
+            )
+
+            self.assertEqual(systemd_fs.UNIT_UNREADABLE, status["service_unit_state"])
+            self.assertEqual([], status["installed_command"])
+            self.assertNotIn(sentinel, repr(status))
+            self.assertNotIn(sentinel, json.dumps(status))
+            self._assert_no_manager_mutation(runner)
 
 
 # ---------------------------------------------------------------------------
@@ -573,12 +929,14 @@ class InstallSuccessTest(_LinuxCase):
         runner = self._runner()
         result = self._install(runner=runner)
         self.assertTrue(result["performed"], result)
-        self.assertEqual(result["scheduled_interval_seconds"], 60)
+        self.assertEqual(result["scheduled_interval_seconds"], DEFAULT_OS_TICK_INTERVAL_SECONDS)
         self.assertEqual(
-            [c for c in runner.calls if c[2] != "show"],
+            [c for c in runner.calls if c[0] == "systemctl" and c[2] != "show"],
             [
+                ["systemctl", "--user", "stop", ss.TIMER_UNIT_NAME],
+                ["systemctl", "--user", "enable", "--no-reload", ss.TIMER_UNIT_NAME],
                 ["systemctl", "--user", "daemon-reload"],
-                ["systemctl", "--user", "enable", "--now", ss.TIMER_UNIT_NAME],
+                ["systemctl", "--user", "start", ss.TIMER_UNIT_NAME],
             ],
         )
 
@@ -587,6 +945,65 @@ class InstallSuccessTest(_LinuxCase):
         first = ss.service_unit_path(self.os_home).read_text(encoding="utf-8")
         self._install()
         self.assertEqual(ss.service_unit_path(self.os_home).read_text(encoding="utf-8"), first)
+
+    def test_confirmed_inactive_timer_is_not_stopped_before_install(self) -> None:
+        runner = self._runner(
+            show_map={
+                ss.TIMER_UNIT_NAME: _timer_show(active="inactive"),
+                ss.SERVICE_UNIT_NAME: _service_show(),
+            }
+        )
+        result = self._install(runner=runner)
+        self.assertTrue(result["performed"], result)
+        self.assertNotIn("stop", runner.verbs)
+
+    def test_unreadable_timer_state_refuses_before_unit_write_or_manager_effect(self) -> None:
+        runner = self._runner(
+            show_map={ss.TIMER_UNIT_NAME: "", ss.SERVICE_UNIT_NAME: _service_show()}
+        )
+        result = self._install(runner=runner)
+        self.assertFalse(result["performed"])
+        self.assertEqual(ss.REASON_SERVICE_STATE_UNREADABLE, result["reason"])
+        self.assertEqual(ss.EFFECT_NONE, result["effect_state"])
+        self.assertFalse(ss.service_unit_path(self.os_home).exists())
+        self.assertEqual([], [v for v in runner.verbs if v != "show"])
+
+    def test_active_timer_is_stopped_before_the_first_unit_write(self) -> None:
+        runner = self._runner()
+        active = {"value": True}
+        original_runner = runner.__call__
+
+        def ordered_runner(argv):
+            result = original_runner(argv)
+            if list(argv)[0] == "systemctl" and list(argv)[2] == "stop":
+                active["value"] = False
+            return result
+
+        real_write = ss._write_units
+
+        def guarded_write(*args):
+            self.assertFalse(active["value"], "active timer survived until unit replacement")
+            return real_write(*args)
+
+        with patch.object(ss, "_write_units", guarded_write):
+            result = self._install(runner=ordered_runner)
+        self.assertTrue(result["performed"], result)
+
+    def test_stop_failure_preserves_old_units_and_reports_uncertain_effect(self) -> None:
+        self._install()
+        service_before = ss.service_unit_path(self.os_home).read_bytes()
+        timer_before = ss.timer_unit_path(self.os_home).read_bytes()
+        runner = self._runner(fail_verbs=("stop",))
+        result = ss.install(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            interval_seconds=91, runner=runner, which=_which_found,
+        )
+        self.assertFalse(result["performed"])
+        self.assertEqual(ss.REASON_STOP_FAILED, result["reason"])
+        self.assertEqual(ss.EFFECT_UNCERTAIN, result["effect_state"])
+        self.assertEqual(service_before, ss.service_unit_path(self.os_home).read_bytes())
+        self.assertEqual(timer_before, ss.timer_unit_path(self.os_home).read_bytes())
+        self.assertNotIn("enable", runner.verbs)
 
     def test_the_installed_unit_pins_the_absolute_canonical_mozyo_home(self) -> None:
         self._install()
@@ -614,13 +1031,75 @@ class InstallSuccessTest(_LinuxCase):
         result = self._install(runner=runner)
         self.assertFalse(result["performed"])
         self.assertEqual(result["reason"], ss.REASON_DAEMON_RELOAD_FAILED)
-        self.assertNotIn("enable", runner.verbs)
+        self.assertNotIn("start", runner.verbs)
+
+    def test_install_refuses_command_drift_during_reload_before_enable(self) -> None:
+        calls = []
+        manager = self._runner()
+
+        def runner(argv):
+            argv = list(argv)
+            calls.append(argv)
+            if argv[0] == "busctl":
+                return manager(argv)
+            verb = argv[2]
+            if verb == "show":
+                return _result(0, "ActiveState=inactive\n")
+            if verb == "daemon-reload":
+                ss.service_unit_path(self.os_home).write_text(
+                    ss.render_service_unit(
+                        [
+                            "/tmp/unapproved",
+                            "workflow",
+                            "supervisor",
+                            "--run-once",
+                            "--home",
+                            str(self.mozyo_home.resolve()),
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+            return _result()
+
+        result = self._install(runner=runner)
+
+        self.assertFalse(result["performed"])
+        self.assertEqual(result["reason"], ss.REASON_INSTALLED_COMMAND_DRIFT)
+        self.assertNotIn("start", [call[2] for call in calls if call[0] == "systemctl"])
 
     def test_a_failed_enable_reports_a_redacted_token(self) -> None:
         runner = self._runner(fail_verbs=("enable",))
         result = self._install(runner=runner)
         self.assertFalse(result["performed"])
         self.assertEqual(result["reason"], ss.REASON_ENABLE_FAILED)
+        self.assertEqual(ss.EFFECT_PARTIAL, result["effect_state"])
+
+    def test_manager_effective_hook_drift_blocks_start_after_reload(self) -> None:
+        hook = [["/tmp/hook", ["/tmp/hook"], False, *([0] * 7)]]
+        runner = self._runner(
+            manager_overrides={"ExecStop": (systemd_manager._EXEC_SIGNATURE, hook)}
+        )
+        result = self._install(runner=runner)
+        self.assertFalse(result["performed"])
+        self.assertEqual(ss.REASON_MANAGER_DEFINITION_DRIFT, result["reason"])
+        self.assertEqual(ss.EFFECT_PARTIAL, result["effect_state"])
+        self.assertNotIn("start", runner.verbs)
+
+    def test_untyped_manager_capability_refuses_before_files_or_effects(self) -> None:
+        runner = self._runner(manager_overrides={"Version": ("as", ["test-systemd"])})
+        result = self._install(runner=runner)
+        self.assertFalse(result["performed"])
+        self.assertEqual(ss.REASON_MANAGER_DEFINITION_UNREADABLE, result["reason"])
+        self.assertEqual(ss.EFFECT_NONE, result["effect_state"])
+        self.assertFalse(ss.unit_dir(self.os_home).exists())
+        self.assertEqual([], [v for v in runner.verbs if v != "show"])
+
+    def test_start_failure_is_uncertain_not_zero_effect(self) -> None:
+        runner = self._runner(fail_verbs=("start",))
+        result = self._install(runner=runner)
+        self.assertFalse(result["performed"])
+        self.assertEqual(ss.REASON_START_FAILED, result["reason"])
+        self.assertEqual(ss.EFFECT_UNCERTAIN, result["effect_state"])
 
 
 # ---------------------------------------------------------------------------
@@ -637,6 +1116,99 @@ class RestartTest(_LinuxCase):
         )
         self.assertTrue(result["performed"], result)
         self.assertIn(["systemctl", "--user", "restart", ss.SERVICE_UNIT_NAME], runner.calls)
+
+    def test_manager_effective_argv_drift_blocks_restart(self) -> None:
+        self._install()
+        drifted = [
+            "/tmp/unapproved", "workflow", "supervisor", "--run-once", "--home",
+            str(self.mozyo_home.resolve()),
+        ]
+        loaded = [[drifted[0], drifted, False, *([0] * 7)]]
+        runner = self._runner(
+            manager_overrides={"ExecStart": (systemd_manager._EXEC_SIGNATURE, loaded)}
+        )
+        result = ss.restart(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            runner=runner, which=_which_found,
+        )
+        self.assertFalse(result["performed"])
+        self.assertEqual(ss.REASON_MANAGER_DEFINITION_DRIFT, result["reason"])
+        self.assertEqual(ss.EFFECT_NONE, result["effect_state"])
+        self.assertNotIn("restart", runner.verbs)
+
+    def test_disk_environment_drift_blocks_restart_before_manager_effect(self) -> None:
+        self._install()
+        target = ss.service_unit_path(self.os_home)
+        target.write_text(
+            target.read_text(encoding="utf-8") + "Environment=FOO=bar\n",
+            encoding="utf-8",
+        )
+        runner = self._runner()
+
+        result = ss.restart(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            runner=runner, which=_which_found,
+        )
+
+        self.assertFalse(result["performed"])
+        self.assertEqual(ss.REASON_INSTALLED_COMMAND_DRIFT, result["reason"])
+        self.assertEqual(ss.EFFECT_NONE, result["effect_state"])
+        self.assertNotIn("restart", runner.verbs)
+
+    def test_manager_effective_environment_drift_blocks_restart(self) -> None:
+        self._install()
+        runner = self._runner(manager_overrides={"Environment": ("as", ["FOO=bar"])})
+
+        result = ss.restart(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            runner=runner, which=_which_found,
+        )
+
+        self.assertFalse(result["performed"])
+        self.assertEqual(ss.REASON_MANAGER_DEFINITION_DRIFT, result["reason"])
+        self.assertEqual(ss.EFFECT_NONE, result["effect_state"])
+        self.assertNotIn("restart", runner.verbs)
+
+    def test_restart_refuses_command_drift_during_show_before_restart(self) -> None:
+        self._install()
+        calls = []
+        manager = self._runner()
+
+        def runner(argv):
+            argv = list(argv)
+            calls.append(argv)
+            if argv[0] == "busctl":
+                return manager(argv)
+            verb = argv[2]
+            if verb == "show" and any(a.startswith("--property=Version") for a in argv):
+                return _result()
+            if verb == "show":
+                ss.service_unit_path(self.os_home).write_text(
+                    ss.render_service_unit(
+                        [
+                            "/tmp/unapproved",
+                            "workflow",
+                            "supervisor",
+                            "--run-once",
+                            "--home",
+                            str(self.mozyo_home.resolve()),
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                return _result(0, _timer_show())
+            return _result()
+
+        result = ss.restart(
+            os_home=self.os_home,
+            mozyo_home=self.mozyo_home,
+            runner=runner,
+            which=_which_found,
+        )
+
+        self.assertFalse(result["performed"])
+        self.assertEqual(result["reason"], ss.REASON_INSTALLED_COMMAND_DRIFT)
+        self.assertNotIn("restart", [call[2] for call in calls if call[0] == "systemctl"])
 
     def test_restart_works_without_a_configured_credential(self) -> None:
         # Same reason install does: a non-ready Redmine must not stop local-safe work.
@@ -664,6 +1236,39 @@ class RestartTest(_LinuxCase):
         )
         self.assertEqual(result["reason"], ss.REASON_SERVICE_NOT_LOADED)
         self.assertNotIn("restart", runner.verbs)
+
+    def test_restart_and_status_classify_one_manager_answer_the_same_way(self) -> None:
+        # Review j#102327 finding r6f2. `restart` compared the raw value to `active` while `status`
+        # ran the same reply through the closed vocabulary, so one `ActiveState=reloading` timer was
+        # `loaded` to status and `service_not_loaded` to restart — two answers about one state
+        # machine. Both verbs now read the same classification.
+        self._install()
+        for active in ("active", "reloading", "inactive", "failed", "activating",
+                       "deactivating", "maintenance", "ACTIVE", "RELOADING", "INACTIVE", "",
+                       " active ", "active ", "\tinactive", "  failed  "):
+            show_map = {ss.SUPERVISOR_UNIT.timer_unit: _timer_show(active=active)}
+            status = ss.service_status(
+                os_home=self.os_home, mozyo_home=self.mozyo_home,
+                runner=self._runner(show_map=show_map), which=_which_found,
+            )
+            runner = self._runner(show_map=show_map)
+            result = ss.restart(
+                os_home=self.os_home, mozyo_home=self.mozyo_home,
+                runner=runner, which=_which_found,
+            )
+            self.assertEqual(result["performed"], status["loaded"], active)
+            self.assertEqual("restart" in runner.verbs, status["loaded"], active)
+            if not status["loaded"]:
+                # The r6f2 invariant is that both verbs read ONE classification — which now also
+                # means the refusal names which fact refused: a confirmed stop and an unreadable
+                # state are different answers (review j#102383 finding r8f2), and status already
+                # distinguishes them via `probe_state`.
+                expected = (
+                    ss.REASON_SERVICE_NOT_LOADED
+                    if status["probe_state"] == ss.PROBE_CONFIRMED_ABSENT
+                    else ss.REASON_SERVICE_STATE_UNREADABLE
+                )
+                self.assertEqual(result["reason"], expected, active)
 
     def test_restart_refuses_an_unreadable_service_unit(self) -> None:
         self._install()
@@ -808,6 +1413,70 @@ class UninstallTest(_LinuxCase):
         verbs = [c[2] for c in runner.calls if c[2] != "show"]
         self.assertLess(verbs.index("daemon-reload"), verbs.index("reset-failed"))
 
+    def test_disable_failure_keeps_units_and_stops_the_sequence(self) -> None:
+        self._install()
+        runner = self._runner(fail_verbs=("disable",))
+
+        result = ss.uninstall(os_home=self.os_home, runner=runner)
+
+        self.assertFalse(result["performed"])
+        self.assertEqual(ss.REASON_DISABLE_FAILED, result["reason"])
+        self.assertEqual(ss.EFFECT_UNCERTAIN, result["effect_state"])
+        self.assertFalse(result["removed"])
+        self.assertTrue(ss.service_unit_path(self.os_home).exists())
+        self.assertTrue(ss.timer_unit_path(self.os_home).exists())
+        self.assertEqual(["disable"], [verb for verb in runner.verbs if verb != "show"])
+
+    def test_service_stop_failure_keeps_units_and_stops_the_sequence(self) -> None:
+        self._install()
+        runner = self._runner(fail_verbs=("stop",))
+
+        result = ss.uninstall(os_home=self.os_home, runner=runner)
+
+        self.assertFalse(result["performed"])
+        self.assertEqual(ss.REASON_STOP_FAILED, result["reason"])
+        self.assertEqual(ss.EFFECT_UNCERTAIN, result["effect_state"])
+        self.assertFalse(result["removed"])
+        self.assertTrue(ss.service_unit_path(self.os_home).exists())
+        self.assertTrue(ss.timer_unit_path(self.os_home).exists())
+        self.assertEqual(
+            ["disable", "stop"], [verb for verb in runner.verbs if verb != "show"]
+        )
+
+    def test_daemon_reload_failure_reports_removed_units_as_partial(self) -> None:
+        self._install()
+        runner = self._runner(fail_verbs=("daemon-reload",))
+
+        result = ss.uninstall(os_home=self.os_home, runner=runner)
+
+        self.assertFalse(result["performed"])
+        self.assertEqual(ss.REASON_DAEMON_RELOAD_FAILED, result["reason"])
+        self.assertEqual(ss.EFFECT_PARTIAL, result["effect_state"])
+        self.assertTrue(result["removed"])
+        self.assertFalse(ss.service_unit_path(self.os_home).exists())
+        self.assertFalse(ss.timer_unit_path(self.os_home).exists())
+        self.assertEqual(
+            ["disable", "stop", "daemon-reload"],
+            [verb for verb in runner.verbs if verb != "show"],
+        )
+
+    def test_reset_failure_reports_removed_units_as_partial(self) -> None:
+        self._install()
+        runner = self._runner(fail_verbs=("reset-failed",))
+
+        result = ss.uninstall(os_home=self.os_home, runner=runner)
+
+        self.assertFalse(result["performed"])
+        self.assertEqual(ss.REASON_RESET_FAILED, result["reason"])
+        self.assertEqual(ss.EFFECT_PARTIAL, result["effect_state"])
+        self.assertTrue(result["removed"])
+        self.assertFalse(ss.service_unit_path(self.os_home).exists())
+        self.assertFalse(ss.timer_unit_path(self.os_home).exists())
+        self.assertEqual(
+            ["disable", "stop", "daemon-reload", "reset-failed"],
+            [verb for verb in runner.verbs if verb != "show"],
+        )
+
     def test_uninstall_works_with_no_credential_at_all(self) -> None:
         result = ss.uninstall(os_home=self.os_home, runner=self._runner())
         self.assertTrue(result["performed"])
@@ -822,6 +1491,86 @@ class UninstallTest(_LinuxCase):
 # ---------------------------------------------------------------------------
 # Finding 3: status must show next run, last exit result, and the installed command.
 # ---------------------------------------------------------------------------
+
+
+class ShowDuplicatePropertyTest(_LinuxCase):
+    """Review j#102383 finding r8f2: a reply that answers one property twice, differently.
+
+    ``_show`` assigned into a dict, so the last line silently won. The same contradictory reply then
+    produced OPPOSITE confirmed facts depending on line order — and the winning value went on to
+    authorize a real ``systemctl restart``. Nothing makes either line authoritative, so the read is
+    discarded rather than resolved.
+    """
+
+    def _shown(self, stdout: str) -> dict:
+        return ss._show(lambda _cmd: _result(0, stdout), "x.timer", ("ActiveState",))
+
+    def test_conflicting_duplicates_discard_the_read_in_either_order(self) -> None:
+        for stdout, why in (
+            ("ActiveState=inactive\nActiveState=active\n", "absent then loaded"),
+            ("ActiveState=active\nActiveState=inactive\n", "loaded then absent"),
+        ):
+            self.assertEqual(self._shown(stdout), {}, why)
+            self.assertEqual(
+                ss._probe_state(self._shown(stdout), manager_available=True),
+                ss.PROBE_UNREADABLE,
+                why,
+            )
+
+    def test_a_conflict_on_any_requested_property_discards_the_read(self) -> None:
+        # Not just the one the classifier happens to read: an unresolvable reply is unresolvable.
+        stdout = "UnitFileState=enabled\nActiveState=active\nUnitFileState=disabled\n"
+        self.assertEqual(self._shown(stdout), {})
+
+    def test_a_repeated_property_with_the_SAME_value_is_not_a_conflict(self) -> None:
+        # Stated and pinned deliberately: the rule is about contradiction, not repetition. Refusing
+        # identical repeats would be an over-refusal with nothing behind it.
+        self.assertEqual(
+            self._shown("ActiveState=active\nActiveState=active\n"), {"ActiveState": "active"}
+        )
+
+    def test_a_single_answer_and_a_missing_key_are_unchanged(self) -> None:
+        self.assertEqual(self._shown("ActiveState=active\n"), {"ActiveState": "active"})
+        self.assertEqual(self._shown("SomethingElse=x\n"), {"SomethingElse": "x"})
+        self.assertEqual(
+            ss._probe_state(self._shown("SomethingElse=x\n"), manager_available=True),
+            ss.PROBE_UNREADABLE,
+        )
+
+    def test_restart_makes_zero_mutation_on_a_conflicting_reply(self) -> None:
+        # The consumer the finding turned on: the last-wins value reached `systemctl restart`.
+        runner = self._runner(
+            show_map={
+                ss.TIMER_UNIT_NAME: "ActiveState=inactive\nActiveState=active\n",
+                ss.SERVICE_UNIT_NAME: _service_show(),
+            }
+        )
+        self._install()
+        runner.calls.clear()
+        result = ss.restart(
+            os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found
+        )
+        self.assertFalse(result["performed"])
+        self.assertNotIn("restart", runner.verbs)
+        # And it says WHICH fact refused: unreadable is not "the timer is stopped".
+        self.assertEqual(result["reason"], ss.REASON_SERVICE_STATE_UNREADABLE)
+        self.assertEqual(result["probe_state"], ss.PROBE_UNREADABLE)
+
+    def test_restart_still_refuses_a_genuinely_stopped_timer_with_its_own_reason(self) -> None:
+        runner = self._runner(
+            show_map={
+                ss.TIMER_UNIT_NAME: "ActiveState=inactive\n",
+                ss.SERVICE_UNIT_NAME: _service_show(),
+            }
+        )
+        self._install(runner=runner)
+        runner.calls.clear()
+        result = ss.restart(
+            os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found
+        )
+        self.assertFalse(result["performed"])
+        self.assertEqual(result["reason"], ss.REASON_SERVICE_NOT_LOADED)
+        self.assertNotIn("restart", runner.verbs)
 
 
 class ServiceStatusTest(_LinuxCase):
@@ -927,6 +1676,26 @@ class ServiceStatusTest(_LinuxCase):
             ],
         )
 
+    def test_drifted_installed_argv_is_absent_from_repr_and_json(self) -> None:
+        self._install()
+        sentinel = "SYSTEMD-DRIFT-SECRET-SENTINEL"
+        drifted = [
+            "/opt/bin/mozyo-bridge", "workflow", "supervisor", "--run-once",
+            "--home", str(self.mozyo_home.resolve()), "--token", sentinel,
+        ]
+        ss.service_unit_path(self.os_home).write_text(
+            ss.render_service_unit(drifted), encoding="utf-8"
+        )
+
+        status = ss.service_status(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            runner=self._runner(), which=_which_found,
+        )
+        self.assertFalse(status["executable_matches"])
+        self.assertEqual([], status["installed_command"])
+        self.assertNotIn(sentinel, repr(status))
+        self.assertNotIn(sentinel, json.dumps(status))
+
     def test_status_projects_the_installed_and_scheduled_service(self) -> None:
         self._install()
         runner = self._runner(
@@ -942,7 +1711,7 @@ class ServiceStatusTest(_LinuxCase):
         self.assertTrue(status["loaded"])
         self.assertTrue(status["timer_enabled"])
         self.assertEqual(status["pid"], 4321)
-        self.assertEqual(status["scheduled_interval_seconds"], 60)
+        self.assertEqual(status["scheduled_interval_seconds"], DEFAULT_OS_TICK_INTERVAL_SECONDS)
         self.assertTrue(status["run_at_load"])
         self.assertFalse(status["keep_alive_present"])
         self.assertTrue(status["no_environment_block"])
@@ -976,7 +1745,9 @@ class ServiceStatusTest(_LinuxCase):
         self.assertFalse(status["installed"])
         self.assertEqual(status["home_pin"], ss.HOME_PIN_NOT_INSTALLED)
         self.assertEqual(status["credential_readiness"], ss.CREDENTIAL_MISSING)
-        self.assertEqual(status["scheduled_interval_seconds"], 60)  # the hint
+        self.assertEqual(
+            status["scheduled_interval_seconds"], DEFAULT_OS_TICK_INTERVAL_SECONDS
+        )  # the hint
         self.assertEqual(status["installed_command"], [])
 
     def test_a_present_but_unreadable_unit_is_distinct_from_absence(self) -> None:
@@ -1023,7 +1794,9 @@ class ServiceStatusTest(_LinuxCase):
         self._install()
         target = ss.timer_unit_path(self.os_home)
         target.write_text(
-            target.read_text(encoding="utf-8").replace("OnUnitActiveSec=60s", "OnUnitActiveSec=5min"),
+            target.read_text(encoding="utf-8").replace(
+                f"OnUnitActiveSec={DEFAULT_OS_TICK_INTERVAL_SECONDS}s", "OnUnitActiveSec=5min"
+            ),
             encoding="utf-8",
         )
         status = ss.service_status(
@@ -1073,15 +1846,20 @@ class BackendSelectionTest(unittest.TestCase):
         )
         self.assertIsNone(sb.resolve_backend("win32")[1])
 
-    def test_the_macos_adapter_keeps_its_own_dual_agent_shape(self) -> None:
-        # #15183 must not reorganize macOS: its pair verbs stay exactly where they were.
+    def test_both_adapters_expose_the_same_single_service_verbs(self) -> None:
+        # #15192 retired the macOS pair, so there is no per-backend call shape left: the dispatcher
+        # can call one set of verb names on either adapter. A pair verb coming back would silently
+        # reintroduce a second registration on one host only.
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
             supervisor_launchd,
         )
 
-        for verb in ("install_pair", "restart_pair", "uninstall_pair", "service_status_pair"):
+        for verb in ("install", "restart", "uninstall", "service_status"):
             self.assertTrue(hasattr(supervisor_launchd, verb), verb)
-        self.assertEqual(len(supervisor_launchd.SUPERVISOR_AGENTS), 2)
+            self.assertTrue(hasattr(ss, verb), verb)
+        for retired in ("install_pair", "restart_pair", "uninstall_pair", "service_status_pair"):
+            self.assertFalse(hasattr(supervisor_launchd, retired), retired)
+        self.assertEqual(len(supervisor_launchd.SUPERVISOR_AGENTS), 1)
 
     def test_a_linux_result_is_normalized_to_a_single_row_roster(self) -> None:
         def fake_install(**kwargs):
@@ -1093,32 +1871,40 @@ class BackendSelectionTest(unittest.TestCase):
         self.assertEqual(len(result["agents"]), 1)
         self.assertTrue(result["performed"])
 
-    def test_a_macos_result_keeps_its_two_row_roster(self) -> None:
-        def fake_install_pair(**kwargs):
-            return {"action": "install", "performed": True, "reason": "",
-                    "agents": [{"label": "a"}, {"label": "b"}]}
+    def test_a_macos_result_is_normalized_to_a_single_row_roster(self) -> None:
+        def fake_install(**kwargs):
+            return {"action": "install", "performed": True, "reason": "", "label": "L"}
 
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
             supervisor_launchd,
         )
 
         with patch.object(sys, "platform", "darwin"), patch.object(
-            supervisor_launchd, "install_pair", fake_install_pair
+            supervisor_launchd, "install", fake_install
         ):
             result = sb.install()
         self.assertEqual(result["backend"], sb.BACKEND_LAUNCHD)
-        self.assertEqual(len(result["agents"]), 2)
+        self.assertEqual(len(result["agents"]), 1)
 
-    def test_the_tick_interval_reaches_only_the_linux_adapter(self) -> None:
-        seen = {}
+    def test_the_tick_interval_reaches_both_adapters(self) -> None:
+        # One cadence knob, one meaning: `--tick-interval` sets the single owned registration's
+        # interval on either host. It used to be silently dropped on macOS (#15192).
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            supervisor_launchd,
+        )
 
-        def fake_install(**kwargs):
-            seen.update(kwargs)
-            return {"action": "install", "performed": True, "reason": ""}
+        for platform, adapter in (("linux", ss), ("darwin", supervisor_launchd)):
+            seen = {}
 
-        with patch.object(sys, "platform", "linux"), patch.object(ss, "install", fake_install):
-            sb.install(interval_seconds=90)
-        self.assertEqual(seen["interval_seconds"], 90)
+            def fake_install(**kwargs):
+                seen.update(kwargs)
+                return {"action": "install", "performed": True, "reason": ""}
+
+            with patch.object(sys, "platform", platform), patch.object(
+                adapter, "install", fake_install
+            ):
+                sb.install(interval_seconds=90)
+            self.assertEqual(seen["interval_seconds"], 90, platform)
 
     def test_an_unsupported_host_gets_a_typed_zero_mutation_refusal(self) -> None:
         with patch.object(sys, "platform", "win32"):

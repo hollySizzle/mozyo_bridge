@@ -54,8 +54,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_lane_topology import (  # noqa: E501
     bind_lane_worktree,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd import (  # noqa: E501
-    service_status_pair,
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_service_backend import (  # noqa: E501
+    service_status as read_supervisor_status,
 )
 from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.domain.offline_rollout_plan import (  # noqa: E501
     AgentSnapshot,
@@ -389,9 +389,12 @@ def _store_snapshots(home: Path) -> tuple[StoreSnapshot, ...]:
 
 
 def _supervisor_snapshots(home: Path, reader) -> tuple[SupervisorAgentSnapshot, ...]:
-    pair = reader(mozyo_home=home)
+    # The platform-resolving backend, not a host adapter: it normalizes whichever OS scheduler owns
+    # this host into the same `agents` roster (#15192 retired the launchd-only `*_pair` verbs).
+    projection = reader(mozyo_home=home)
+    backend = str(projection.get("backend") or "")
     snapshots = []
-    for row in pair.get("agents", ()):  # public projection is already secret-safe
+    for row in projection.get("agents", ()):  # public projection is already secret-safe
         pid = row.get("pid")
         snapshots.append(
             SupervisorAgentSnapshot(
@@ -402,6 +405,12 @@ def _supervisor_snapshots(home: Path, reader) -> tuple[SupervisorAgentSnapshot, 
                 home_pin=str(row.get("home_pin") or ""),
                 executable_matches=bool(row.get("executable_matches")),
                 credential_readiness=str(row.get("credential_readiness") or ""),
+                backend=backend,
+                legacy_drain=(
+                    str(row.get("legacy_drain") or "")
+                    if backend == "launchd"
+                    else "not_applicable"
+                ),
             )
         )
     return tuple(snapshots)
@@ -425,7 +434,7 @@ def capture_offline_rollout_snapshot(
     workspace_reader: Callable = list_workspaces,
     worktree_reader: Callable = read_live_worktree_fingerprint,
     store_reader: Callable = _store_snapshots,
-    supervisor_reader: Callable = service_status_pair,
+    supervisor_reader: Callable = read_supervisor_status,
     lifecycle_records_reader: Optional[Callable] = None,
     lane_worktree_binder: Callable = bind_lane_worktree,
 ) -> OfflineRolloutCapture | OfflineRolloutPlanResult:

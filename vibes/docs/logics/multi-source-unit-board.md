@@ -149,8 +149,8 @@ Unit identity は `host_id + workspace_id + lane_id` である。
 - **source からの出力は byte 上限で bound する**（共有 subprocess seam）。unit 件数・agent 数は
   decode 後の bound であり、それだけでは到達可能な source が decode 前に client の memory を
   枯渇させられる。上限は**読み取り時点**で効かせ（超過分を読まない）、超過時は board / registry を
-  `reload_required`、配送を `delivery_failed` の固定結果にする。**「到達不能」とは区別する** —
-  上限超過は source が応答した結果であり、connection failure ではない。
+  `reload_required`、配送を `uncertain / delivery_uncertain / uncertain_partial` の固定結果にする。
+  **「到達不能」とは区別する** — 上限超過は source が応答した結果であり、connection failure ではない。
 - **byte 上限と timeout は同時に成り立たせる。** 上限までの単一 blocking read は、上限未満のまま
   stdout を開き続ける source に対して**永久に待つ**（timeout はその後ろにあり到達しない）。
   読み取りは **deadline-aware な incremental read** とし、期限超過時は kill / wait / stream close
@@ -274,7 +274,7 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   を timeout にしないための待機 budget である。`standard` / `pending` を
   明示した action は基礎 deadline のままとする。
 - **配送成否は exit code で判定しない。** 対象 gateway の **構造化 outcome** を読み、共有 authority
-  (`injection_stage_for_outcome`) の判定に従う。
+  (`injection_stage_for`) の判定に従う。
   **構造化 outcome は判定にのみ使い、client の表示は固定の public-safe 文言とする**（remote の値を
   一切反映しない。これが本項の唯一の契約である）。
   出力形状は決定的にする: gateway 呼び出しで `--record-format json` を明示し、読み取りは
@@ -304,8 +304,9 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
 - **gateway record は producer が導出した `injection_stage` を運ぶが、client は無条件には信頼しない。**
   単一行 JSON は `asdict(DeliveryOutcome)` であり、`mode` と producer が **full context** で導出した
   `injection_stage` を含む。host 境界では request の mode と response の `mode` が byte-exact に一致することを
-  必須とし、欠落・別modeは command 実行済みの `uncertain_partial` とする。さらに carried stage を現在の
-  wire fieldから共有 `injection_stage` authorityで再導出した stageと照合し、矛盾も `uncertain_partial` に落とす。
+  必須とし、欠落・別modeは command 実行済みの `uncertain_partial` とする。さらに carried stage は authority
+  そのものではなく照合値として扱い、現在の wire fieldから共有 `injection_stage_for` authorityで再導出した
+  stageと完全一致しなければ `uncertain_partial` に落とす。
   queue-enter の confirmation は canonical causal-v2 `queue_enter_turn_start_observation` だけを使い、standard
   `turn_start_outcome` を借りない。これにより旧host・途中version・壊れたrecordが carried
   `submitted_confirmed` だけで成功へ昇格しない。host は queue 専用 observation / delivery-ledger rail を保ち、

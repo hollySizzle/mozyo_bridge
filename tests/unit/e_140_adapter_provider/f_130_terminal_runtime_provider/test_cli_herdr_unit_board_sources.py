@@ -393,6 +393,27 @@ class ActionTests(unittest.TestCase):
         )
         self.assertIn("--mode standard", command)
 
+    def test_an_explicit_pending_rail_exits_as_uncertain(self) -> None:
+        wiring = _Wiring(
+            answer_map=answers(
+                {
+                    GATEWAY_ARGS: delivery_record(
+                        mode="pending", status="pending_input", reason="ok"
+                    )
+                }
+            )
+        )
+        with wiring:
+            code, out, _ = self._apply(wiring, "--delivery-mode", "pending")
+
+        self.assertEqual(code, 3)
+        self.assertIn("uncertain", out)
+        self.assertIn("uncertain_partial", out)
+        command = next(
+            argv[-1] for argv in wiring.runner.argvs if "project-gateway" in argv[-1]
+        )
+        self.assertIn("--mode pending", command)
+
     def test_an_unconfirmed_submission_exits_distinctly_from_a_refusal(self) -> None:
         # The exit code is the only thing an automated caller sees. Reusing 1
         # here would tell it a retry is free while the body may already be at

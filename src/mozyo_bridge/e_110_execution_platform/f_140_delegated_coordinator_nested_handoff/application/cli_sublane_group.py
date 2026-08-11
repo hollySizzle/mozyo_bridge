@@ -33,6 +33,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_dispatcher import (
     cmd_sublane_dispatch_worker,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_audit_failure_terminal_decision import (  # noqa: E501
+    register_audit_failure_terminal_decision,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_sublane_retire import (
     register_sublane_retire,
 )
@@ -594,6 +597,11 @@ def register_sublane_group(
         add_repo_option=add_repo_option,
         add_lifecycle_json=add_lifecycle_json,
     )
+
+    # Redmine #15166: the coordinator decision the audit-failure terminal requires, registered by
+    # the same convention. Recording a decision retires nothing; it is the writer half of a route
+    # whose reader is `sublane retire --superseded-audit-failure-terminal`.
+    register_audit_failure_terminal_decision(sublane_sub, add_repo_option=add_repo_option)
 
     sublane_supersede = sublane_sub.add_parser(
         "supersede",

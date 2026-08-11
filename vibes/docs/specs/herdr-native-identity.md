@@ -114,13 +114,15 @@ resolver はこれを fail-closed に読む。
   attestation を置換しない**: startup record は TUI process env の boot 時観測であり、tool-exec
   subprocess への伝播を証明しないため、send 直前の `resolve_sender_identity(os.environ, ...)` は hard
   gate のまま残る (env-less shell は依然 `missing_sender_env` で fail-closed)。record 不在/世代不一致
-  (stale)/`missing`/`conflict` の adopt は fail-closed し、**owner 承認の close + same-slot relaunch** を
-  next action として返す (自動 destructive repair を行わない)。active issue-owned sublane の
-  gateway/worker pair については `sublane recover-restored-pair` がその公開 rail であり、startup
-  attestation が green でも live inventory の CWD が canonical worktree と違えば同じ repair
-  対象になる。これは startup record が tool-exec subprocess の CWD/env 伝播を証明しないためで
-  ある。正確な preflight/approval/replay 契約は `vibes/docs/tasks/herdr-lane-operations.md`
-  「再起動復元後の active sublane pair を作り直す」を正本とする。真の暗号学的 attestation
+  (stale)/`missing`/`conflict` の adopt は fail-closed する。active issue-owned sublane の
+  gateway/worker pairについては `sublane recover-restored-pair` がCWD/startup-attestation不整合を
+  結合する**公開read-only診断**である。Herdr 0.8 / protocol 19のclose mutationは`pane_id`しか
+  消費せず、観測したterminal generationを原子的に条件化できないため、owner承認close + same-slot
+  relaunchの実行railは未実装である。startup attestation が green でも live inventory の CWD が
+  canonical worktree と違えば診断対象になる。これは startup record が tool-exec subprocess の
+  CWD/env 伝播を証明しないためである。正確なblockerとconditional-close先行要件は
+  `vibes/docs/tasks/herdr-lane-operations.md`
+  「再起動復元後の active sublane pair を診断する」を正本とする。真の暗号学的 attestation
   (nonce / challenge-response) の導入は別 US 判断であり本節の範囲外。
 
 - **startup attestation は lane epoch へ bind する (Redmine #14756)。** #13637 の record は
@@ -539,7 +541,8 @@ flow:
    ただし adopt は live name-match だけでは足りず、その live locator に **generation-bind した
    `present` startup self-attestation record** (§2 / #13637) が必要である。record 不在 (legacy /
    pre-feature slot) / stale (locator 世代不一致) / `missing` / `conflict` は blind-adopt せず read-only
-   の **`unattested`** として exact reason + owner 承認 close+relaunch next action で surface する
+   の **`unattested`** として exact reasonをsurfaceする。owner承認close+relaunchを実行可能なnext
+   actionとしては返さず、active sublaneではHerdr conditional-close導入待ちを明示する
    (自動 close/relaunch はしない)。slot に別 locator の同名 agent が複数ある (duplicate) → fail-closed。
 6. slot-uniqueness (要求側、#13261 j#72532): 要求された `(provider, lane)` slot が重複する場合は
    **いかなる side effect (binary 解決 / registration / inventory snapshot / launch) より前に**
