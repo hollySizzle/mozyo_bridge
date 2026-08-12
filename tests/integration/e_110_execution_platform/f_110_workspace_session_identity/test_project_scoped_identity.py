@@ -323,6 +323,48 @@ class FilesystemScanTests(unittest.TestCase):
             sum(c.scope == "giken-cloud-drive-management" for c in candidates), 1
         )
 
+    def test_canonical_tool_namespace_spelling_is_discovered(self):
+        # Owner decision (Redmine #15140, 2026-08-12): the canonical descriptor
+        # location is `<project-dir>/.mozyo-bridge/project.env`. The walk prunes
+        # dot-directories, so this spelling must be probed explicitly.
+        proj = self.repo / "projects" / "nested-spelling"
+        (proj / ".mozyo-bridge").mkdir(parents=True)
+        (proj / ".mozyo-bridge" / "project.env").write_text(
+            _ENABLED_DOC.replace(
+                "giken-cloud-drive-management", "giken-nested-spelling"
+            ),
+            encoding="utf-8",
+        )
+        candidates = pd.discover_project_candidates(str(self.repo))
+        nested = [c for c in candidates if c.scope == "giken-nested-spelling"]
+        self.assertEqual(len(nested), 1)
+        # The candidate's path is the PROJECT directory, not the tool subdir —
+        # cwd containment and cache keys stay spelling-independent.
+        self.assertEqual(nested[0].path, "projects/nested-spelling")
+        self.assertEqual(
+            nested[0].source, "projects/nested-spelling/.mozyo-bridge/project.env"
+        )
+
+    def test_both_spellings_in_one_directory_yield_no_candidate(self):
+        # Ambiguity is refused, never resolved by preference: a directory that
+        # declares itself twice contributes nothing, so the strict project gate
+        # downstream fails closed rather than guessing.
+        proj = self.repo / "projects" / "double-spelling"
+        (proj / ".mozyo-bridge").mkdir(parents=True)
+        doubled = _ENABLED_DOC.replace(
+            "giken-cloud-drive-management", "giken-double-spelling"
+        )
+        (proj / "project.env").write_text(doubled, encoding="utf-8")
+        (proj / ".mozyo-bridge" / "project.env").write_text(doubled, encoding="utf-8")
+        candidates = pd.discover_project_candidates(str(self.repo))
+        self.assertEqual(
+            [c for c in candidates if c.scope == "giken-double-spelling"], []
+        )
+        # The legacy root-spelling neighbours are unaffected.
+        self.assertIn(
+            "giken-cloud-drive-management", {c.scope for c in candidates}
+        )
+
     def test_only_enabled_marker_is_adopted(self):
         adopted, drift = pd.resolve_project_scopes(str(self.repo))
         self.assertEqual([s.scope for s in adopted], ["giken-cloud-drive-management"])
